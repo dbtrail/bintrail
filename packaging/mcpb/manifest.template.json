@@ -1,0 +1,68 @@
+{
+  "manifest_version": "0.4",
+  "name": "dbtrail",
+  "display_name": "dbtrail",
+  "version": "__MCPB_VERSION__",
+  "description": "Ask your database change history anything: search indexed row changes, generate recovery SQL, and check index status on a self-hosted bintrail deployment.",
+  "long_description": "Connects Claude Desktop to a self-hosted bintrail deployment through its MCP endpoint (a bintrail console `/mcp` URL or a `bintrail-mcp --http` server). The bundled binary runs locally as a stdio↔HTTP bridge, so a LAN/VPN/tunneled deployment works without public exposure. All tools are read-only: recovery SQL is generated, never executed.",
+  "author": {
+    "name": "dbtrail",
+    "url": "https://github.com/dbtrail/dbtrail"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dbtrail/dbtrail"
+  },
+  "homepage": "https://github.com/dbtrail/dbtrail",
+  "license": "Apache-2.0",
+  "keywords": ["mysql", "postgresql", "binlog", "recovery", "time-travel", "database"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/bintrail-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/server/bintrail-mcp",
+      "args": [
+        "--connect",
+        "${user_config.console_url}",
+        "--token",
+        "${user_config.token}"
+      ]
+    }
+  },
+  "tools": [
+    {
+      "name": "query",
+      "description": "Search indexed row changes (before/after images) with filters"
+    },
+    {
+      "name": "recover",
+      "description": "Generate reversal SQL for matching events (never executes it)"
+    },
+    {
+      "name": "status",
+      "description": "Show index status: files, partitions, continuity, summary"
+    },
+    {
+      "name": "list_schema_changes",
+      "description": "List recorded DDL changes with statements and binlog coordinates"
+    }
+  ],
+  "compatibility": {
+    "platforms": ["__MCPB_PLATFORM__"]
+  },
+  "user_config": {
+    "console_url": {
+      "type": "string",
+      "title": "Console / MCP endpoint URL",
+      "description": "URL of your bintrail console MCP endpoint or a bintrail-mcp --http server, e.g. http://localhost:8090/mcp",
+      "required": true
+    },
+    "token": {
+      "type": "string",
+      "title": "Access token",
+      "description": "The console access token; sent as an Authorization: Bearer header",
+      "required": true,
+      "sensitive": true
+    }
+  }
+}

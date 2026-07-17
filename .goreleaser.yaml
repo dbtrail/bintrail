@@ -51,6 +51,15 @@ builds:
     ldflags:
       - -s -w
       - -X main.mcpVersion={{.Version}}
+    # Package each bintrail-mcp binary as an MCP Bundle (.mcpb) — the Claude
+    # Desktop one-click install format (#1040): a zip of manifest.json +
+    # server/bintrail-mcp whose config form asks for the console URL + token
+    # and runs the binary in `--connect` bridge mode. The script validates the
+    # produced bundle (manifest fields, entry binary), so a malformed bundle
+    # fails the release. Published via release.extra_files below.
+    hooks:
+      post:
+        - cmd: bash scripts/build-mcpb.sh "{{ .Path }}" "{{ .Os }}" "{{ .Arch }}" "{{ .Version }}"
 
   # bintrail-console links DuckDB (console → query → parquetquery), so it is
   # CGO like the core binary — and uses the SAME main.* ldflags var names, so
@@ -131,12 +140,20 @@ archives:
 
 checksum:
   name_template: "checksums.txt"
+  # Include the .mcpb bundles (built by the bintrail-mcp post hook, published
+  # via release.extra_files) in checksums.txt.
+  extra_files:
+    - glob: dist/mcpb/*.mcpb
 
 # Auto-detect prereleases from the tag (e.g. v0.7.12-rc1) and mark the
 # GitHub release "prerelease" so an RC never claims the "Latest" badge.
 # Pairs with skip_push: auto on the :latest Docker manifest below.
 release:
   prerelease: auto
+  # .mcpb MCP Bundles (Claude Desktop one-click install) — produced by the
+  # bintrail-mcp build post hook, one per platform in the build matrix.
+  extra_files:
+    - glob: dist/mcpb/*.mcpb
 
 # ── Linux packages (deb/rpm) ───────────────────────────────
 # Attached to the GitHub release as downloadable assets. No external

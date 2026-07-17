@@ -29,6 +29,10 @@ You need two things on the machine where Claude runs:
 2. **Your index DSN** — the same `BINTRAIL_INDEX_DSN` your dbtrail stack uses,
    e.g. `user:pass@tcp(127.0.0.1:3306)/binlog_index`.
 
+Using the [one-click bundle](#claude-desktop-one-click) or
+[bridge mode](#bridge-mode---connect)? Skip both — you only need the remote
+endpoint's URL and token; the DSN stays on the server side.
+
 ---
 
 ## Connect Claude
@@ -59,6 +63,56 @@ tools appear — now ask: *"What changed in the orders table in the last hour?"*
 > `"command": "go", "args": ["run", "./cmd/bintrail-mcp"]` instead — no separate
 > install needed.
 
+### Claude Desktop (one-click)
+
+Every release publishes **MCP Bundle** artifacts — `dbtrail-<os>-<arch>.mcpb`
+files on the [releases page](https://github.com/dbtrail/dbtrail/releases) —
+that Claude Desktop installs without any JSON editing:
+
+1. Download the `.mcpb` matching the machine where Claude Desktop runs.
+2. Double-click it (or Claude Desktop → **Settings → Extensions**, drop the
+   file in).
+3. Fill in the two-field form:
+   - **Console / MCP endpoint URL** — your bintrail MCP endpoint, e.g.
+     `http://localhost:8090/mcp` (a `bintrail-mcp --http` server; keep the
+     `/mcp` path)
+   - **Access token** — sent as an `Authorization: Bearer` header; stored by
+     Claude Desktop as a sensitive value
+
+Under the hood the bundle runs the bundled `bintrail-mcp` in bridge mode
+(`--connect`, next section), so it works against a LAN/VPN/tunneled deployment
+— the endpoint never needs to be publicly exposed. No DSN appears anywhere:
+the remote endpoint owns the database connection.
+
+Release bundles currently cover the release build matrix (Linux amd64/arm64).
+On macOS or Windows, build a host-native bundle from source with `make mcpb`
+(output in `dist/mcpb/`), or configure bridge mode by hand as shown below.
+
+### Bridge mode (`--connect`)
+
+`bintrail-mcp --connect <url>` is what the bundle runs, and you can use it
+directly with any stdio MCP client: the process serves MCP over stdio locally
+and proxies every request to a remote bintrail Streamable-HTTP MCP endpoint,
+forwarding the remote's tools verbatim.
+
+```json
+{
+  "mcpServers": {
+    "bintrail": {
+      "command": "bintrail-mcp",
+      "args": ["--connect", "http://192.168.1.10:8080/mcp", "--token", "YOUR-TOKEN"]
+    }
+  }
+}
+```
+
+`--token` is optional (a plain `bintrail-mcp --http` server today has no
+auth); when set, it is sent as `Authorization: Bearer`. `--connect` cannot be
+combined with `--http` or `--tenant-dsns`, and no DSN is needed — the remote
+end resolves it. If the endpoint is unreachable or the token is rejected, the
+bridge exits non-zero with a one-line error (visible in Claude Desktop's MCP
+logs) instead of hanging.
+
 ### Claude Desktop (local index)
 
 Same idea, in Claude Desktop's config file
@@ -86,7 +140,10 @@ BINTRAIL_INDEX_DSN='user:pass@tcp(127.0.0.1:3306)/binlog_index' \
   bintrail-mcp --http :8080
 ```
 
-Then bridge Claude Desktop to it from your laptop with `proxy.py` — see
+Then connect from your laptop with the one-click bundle or
+[bridge mode](#bridge-mode---connect) above (`--connect
+http://192.168.1.10:8080/mcp`). If you'd rather not install a binary locally,
+the Python `proxy.py` does the same job — see
 [proxy.py (remote bridge)](#proxypy-remote-bridge) below.
 
 ### claude.ai and Claude mobile

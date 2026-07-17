@@ -9,6 +9,12 @@
 //	bintrail-mcp                   # stdio (default)
 //	bintrail-mcp --http :8080      # HTTP on all interfaces, port 8080
 //
+// Bridge mode (stdio ↔ Streamable HTTP): serve MCP over stdio locally and
+// proxy every request to a remote bintrail MCP endpoint. This is what the
+// released .mcpb bundle runs under Claude Desktop:
+//
+//	bintrail-mcp --connect http://host:8090/mcp --token <token>
+//
 // Multi-tenant mode (for shared backends behind mcp-gateway):
 //
 //	bintrail-mcp --http :8080 --tenant-dsns tenant-dsns.json
@@ -149,7 +155,29 @@ func newServerWithDSN(dsnOverride string) *mcp.Server {
 func main() {
 	httpAddr := flag.String("http", "", "HTTP listen address (e.g. :8080); omit to use stdio")
 	tenantDSNsFile := flag.String("tenant-dsns", "", "JSON file mapping tenant IDs to index DSNs (multi-tenant mode)")
+	connectURL := flag.String("connect", "", "Bridge mode: serve MCP over stdio and proxy to a remote bintrail Streamable-HTTP MCP endpoint (e.g. http://host:8090/mcp)")
+	connectToken := flag.String("token", "", "Bearer token sent to the --connect endpoint (Authorization: Bearer)")
 	flag.Parse()
+
+	if err := validateBridgeFlags(*connectURL, *httpAddr, *tenantDSNsFile, *connectToken); err != nil {
+		fmt.Fprintf(os.Stderr, "bintrail-mcp: %v\n", err)
+		os.Exit(2)
+	}
+
+	if *connectURL != "" {
+		err := runBridge(context.Background(), *connectURL, *connectToken)
+		if err == nil {
+			return
+		}
+		if isClientDisconnect(err) {
+			// Same clean-shutdown classification as plain stdio mode (#473).
+			slog.Info("MCP client disconnected; shutting down", "cause", err)
+			return
+		}
+		// One clear line on stderr: Claude Desktop surfaces this in its logs.
+		fmt.Fprintf(os.Stderr, "bintrail-mcp: bridge failed: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Load tenant DSN map if provided.
 	if *tenantDSNsFile != "" {
