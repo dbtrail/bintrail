@@ -95,8 +95,9 @@ Reaching your index from the web app or your phone needs an OAuth **gateway** in
 front — an **advanced, optional** path. Most people use Claude Code or Claude
 Desktop above instead. Two ways to get a gateway:
 
-- **Self-host it (open source).** Build `cmd/mcp-gateway` and run it behind HTTPS
-  on your own infrastructure and public domain.
+- **Bring your own gateway.** Front `bintrail-mcp` (run with `--tenant-dsns`)
+  with any OAuth 2.1 gateway that terminates HTTPS on your own domain and
+  forwards the `X-Bintrail-Tenant` header.
 - **dbtrail's hosted gateway (managed-service customers).** dbtrail operates one
   at `https://mcp.dbtrail.com/mcp` and provisions your tenant — this requires a
   dbtrail account; the open-source repo does not give you access to it.

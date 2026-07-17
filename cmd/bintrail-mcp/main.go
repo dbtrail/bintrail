@@ -9,7 +9,7 @@
 //	bintrail-mcp                   # stdio (default)
 //	bintrail-mcp --http :8080      # HTTP on all interfaces, port 8080
 //
-// Multi-tenant mode (for shared backends behind mcp-gateway):
+// Multi-tenant mode (for shared backends behind an OAuth/routing gateway):
 //
 //	bintrail-mcp --http :8080 --tenant-dsns tenant-dsns.json
 //
