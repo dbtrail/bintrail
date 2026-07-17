@@ -88,7 +88,12 @@ func seedMCPConsole(t *testing.T) (*Server, *sql.DB, string) {
 func TestIntegrationMCPEndpoint(t *testing.T) {
 	srv, _, _ := seedMCPConsole(t)
 	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
+	// Cleanup, not defer: the streamable client holds a standalone SSE GET open
+	// for the session lifetime, and httptest Close blocks until every
+	// connection drains. Registering ts.Close BEFORE the session connects makes
+	// the LIFO cleanup order close the session (registered later, inside
+	// mcpConnect) first.
+	t.Cleanup(ts.Close)
 	ctx := context.Background()
 
 	session := mcpConnect(t, ts.URL+"/mcp", intToken)
@@ -186,7 +191,12 @@ func TestIntegrationMCPEndpoint(t *testing.T) {
 func TestIntegrationMCPWrongTokenRefused(t *testing.T) {
 	srv, _, _ := seedMCPConsole(t)
 	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
+	// Cleanup, not defer: the streamable client holds a standalone SSE GET open
+	// for the session lifetime, and httptest Close blocks until every
+	// connection drains. Registering ts.Close BEFORE the session connects makes
+	// the LIFO cleanup order close the session (registered later, inside
+	// mcpConnect) first.
+	t.Cleanup(ts.Close)
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "it", Version: "1"}, nil)
 	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{
@@ -212,7 +222,12 @@ func TestIntegrationMCPRoutesByServerName(t *testing.T) {
 	srv.cm.reg = reg
 
 	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
+	// Cleanup, not defer: the streamable client holds a standalone SSE GET open
+	// for the session lifetime, and httptest Close blocks until every
+	// connection drains. Registering ts.Close BEFORE the session connects makes
+	// the LIFO cleanup order close the session (registered later, inside
+	// mcpConnect) first.
+	t.Cleanup(ts.Close)
 	ctx := context.Background()
 
 	session := mcpConnect(t, ts.URL+"/mcp/reg-target", intToken)
