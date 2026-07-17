@@ -18,6 +18,15 @@ type ConsoleQueryContext struct {
 	// DB is the selected server's index connection. It is owned by the console
 	// (pooled and lazily opened per server); the provider must NOT close it, and
 	// must not assume it outlives the request.
+	//
+	// DB is NIL when the index cannot be opened (a dead entry, or a per-source
+	// index that does not exist yet) but the selected server DOES have a source
+	// configured — so a source-only view (one that reads only the live source,
+	// never the index) still resolves and runs during an index outage. An
+	// index-backed view MUST nil-check DB (or rely on Fetch, below) rather than
+	// dereference it. When the index opened successfully, DB is non-nil; when no
+	// source is configured AND the index cannot be opened, the resolve func
+	// returns an error instead of this struct.
 	DB *sql.DB
 	// Fetch runs the console's own cross-source read pipeline (live MySQL
 	// partitions plus Parquet archives, merged, sorted, gap-aware) already bound
@@ -25,12 +34,20 @@ type ConsoleQueryContext struct {
 	// started with, so a provider that fetches through it inherits the operator's
 	// profile rather than having to reimplement redaction. Prefer it over
 	// querying DB directly whenever archive coverage or redaction matters.
+	//
+	// Fetch is always non-nil (never call it on a nil value), but when DB is nil
+	// — the index-unreachable-but-source-configured case above — Fetch returns
+	// the underlying index error on every call. An index-backed view thus
+	// degrades with a real error instead of a nil-pointer panic or a false empty
+	// result.
 	Fetch func(ctx context.Context, opts indexquery.Options) ([]indexquery.ResultRow, *indexquery.QueryPlan, error)
 	// SourceDSN is the captured-source DSN of the selected registry entry, when
 	// one is configured — a provider that needs to reach the live source (not
 	// just the index) can use it. Empty for the boot/command-line entry and for a
 	// selection with no source configured; treat empty as "no source available",
-	// not an error.
+	// not an error. It is read from the registry WITHOUT opening the index, so it
+	// is populated even when the index is unreachable (the DB-nil case above) —
+	// that is what keeps a source-only view working during an index outage.
 	SourceDSN string
 }
 

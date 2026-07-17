@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/ext"
@@ -224,6 +225,70 @@ func TestExtensionViewInvalidIDSkipped(t *testing.T) {
 	}
 	if rec := getPath(t, s, "127.0.0.1:8090", "/ext/Example/view.js", ""); rec.Code != http.StatusNotFound {
 		t.Errorf("static route for an invalid-id provider = %d, want 404 (not mounted)", rec.Code)
+	}
+}
+
+// (h) consoleQueryContext degrades gracefully when the selected server's index
+// cannot be opened but a SOURCE is configured: it returns a usable context (nil
+// DB, populated SourceDSN, a Fetch that surfaces the index error) rather than
+// failing outright — so a provider's source-only endpoints keep working during
+// an index outage (source up, index down — the incident a source-only view exists for).
+func TestConsoleQueryContextSourceOnlyWhenIndexDown(t *testing.T) {
+	reg, err := LoadRegistry("")
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	// Index DSN parses but refuses fast (port 1); the source DSN is what a
+	// source-only endpoint needs and must survive the failed index open.
+	entry, err := reg.Add(ServerEntry{
+		Name:      "prod",
+		DSN:       "u:p@tcp(127.0.0.1:1)/idx_missing",
+		SourceDSN: "r:p@tcp(src.example:3306)/",
+	})
+	if err != nil {
+		t.Fatalf("reg.Add: %v", err)
+	}
+	s := &Server{token: "t", cm: newConnManager(reg, false)}
+
+	r := httptest.NewRequest(http.MethodGet, "/api/ext/example/source-info", nil)
+	r.Header.Set(serverHeader, entry.ID)
+
+	qc, err := s.consoleQueryContext(r)
+	if err != nil {
+		t.Fatalf("consoleQueryContext returned an error for a configured source with a down index: %v", err)
+	}
+	if qc.DB != nil {
+		t.Error("DB must be nil when the index could not be opened")
+	}
+	if qc.SourceDSN != entry.SourceDSN {
+		t.Errorf("SourceDSN = %q, want %q (must survive the failed index open)", qc.SourceDSN, entry.SourceDSN)
+	}
+	if qc.Fetch == nil {
+		t.Fatal("Fetch must be non-nil even when the index is down (an index-backed view calls it unconditionally)")
+	}
+	if _, _, ferr := qc.Fetch(r.Context(), query.Options{}); ferr == nil {
+		t.Error("Fetch must return the index error when DB is nil, not a false empty result")
+	}
+}
+
+// (h2) with NO source configured, a failed index open is a genuine error — there
+// is nothing to serve, so the resolve func surfaces the (DSN-scrubbed) error.
+func TestConsoleQueryContextErrorsWhenIndexDownAndNoSource(t *testing.T) {
+	reg, err := LoadRegistry("")
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	entry, err := reg.Add(ServerEntry{Name: "idx-only", DSN: "u:p@tcp(127.0.0.1:1)/idx_missing"})
+	if err != nil {
+		t.Fatalf("reg.Add: %v", err)
+	}
+	s := &Server{token: "t", cm: newConnManager(reg, false)}
+
+	r := httptest.NewRequest(http.MethodGet, "/api/ext/example/index-info", nil)
+	r.Header.Set(serverHeader, entry.ID)
+
+	if _, err := s.consoleQueryContext(r); err == nil {
+		t.Fatal("consoleQueryContext must error when the index is down and no source is configured")
 	}
 }
 

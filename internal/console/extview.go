@@ -15,15 +15,38 @@ import (
 // default). The returned error is already DSN-scrubbed by the resolver, so it is
 // safe for the provider to surface to the client.
 func (s *Server) consoleQueryContext(r *http.Request) (ext.ConsoleQueryContext, error) {
-	b, err := s.resolve(r)
-	if err != nil {
-		return ext.ConsoleQueryContext{}, err
-	}
-	// SourceDSN is a registry-only hint (the boot entry has none); "not found"
-	// is not an error — the provider treats an empty DSN as "no source".
+	// Read the selected registry entry's source DSN FIRST — a pure registry
+	// lookup (selectedEntry) that never opens or pings the index. This ordering
+	// is load-bearing: a provider view with source-only endpoints (ones that read
+	// only the live source — never the index) must stay usable during the exact
+	// incident such a view exists for — the source is up but the per-source
+	// index is unreachable or not yet created. "not found" is not an error: an
+	// empty DSN means "no source", which the provider treats as not-configured.
 	sourceDSN := ""
 	if e, ok := s.selectedEntry(r); ok {
 		sourceDSN = e.SourceDSN
+	}
+
+	b, err := s.resolve(r)
+	if err != nil {
+		// The index could not be opened (dead entry, or a per-source index that
+		// does not exist yet). When a source IS configured, still hand the
+		// provider a usable context so its source-only endpoints work off
+		// SourceDSN: DB is nil and Fetch returns the resolve error (so
+		// index-backed endpoints degrade with a real error rather than silently
+		// pretending success), but SourceDSN is populated. With no source
+		// configured there is nothing to serve, so surface the (already
+		// DSN-scrubbed) resolve error unchanged.
+		if sourceDSN == "" {
+			return ext.ConsoleQueryContext{}, err
+		}
+		return ext.ConsoleQueryContext{
+			DB: nil,
+			Fetch: func(context.Context, query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
+				return nil, nil, err
+			},
+			SourceDSN: sourceDSN,
+		}, nil
 	}
 	return ext.ConsoleQueryContext{
 		DB:        b.db,

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A source-only console extension view (one whose data endpoints read only the live source, never the index) now stays usable while the selected server's index is unreachable or not yet created. `ext.ConsoleQueryContext` resolves the source DSN from the registry **without** opening the index, and on a failed index open with a source configured it hands the provider a usable context (`DB` nil, a `Fetch` that surfaces the index error, `SourceDSN` populated) instead of failing the whole request — so source-only investigation keeps working during an index outage. An index-backed view must nil-check `DB` or read through `Fetch`; the contract is documented on the type. With no source configured, a failed index open stays an error.
+
 ## [0.36.0] - 2026-07-17
 
 ### Added
