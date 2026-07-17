@@ -513,14 +513,19 @@ A running server accepts it on the next login — no restart needed.
 
 ### External login providers
 
-Embedding distributions — builds that import the OSS core — may install an
-external login flow (e.g. OIDC single sign-on) through the `ext.ConsoleAuth`
-seam. When one is installed, the sign-in screen adds a **"Continue with
-\<name\>"** button, and a successful external login mints the same in-memory
-session a password login does (same lifetime, logout, and revocation). The
-standalone `bintrail-console` binary has no provider installed: the button
-never appears, and the provider routes (`/api/auth/ext/*`) simply require a
-normal credential like any other `/api` path.
+Embedding distributions — builds that construct their console binary from the
+importable `consoleapp` package (`cmd/bintrail-console` is a thin `main()`
+over `consoleapp.Main`) — may install an external login flow (e.g. OIDC
+single sign-on) through the `ext.ConsoleAuth` seam: call `ext.SetConsoleAuth`
+once from `main()` before `consoleapp.Main`, like `ext.SetAuditSink`. When a
+provider is installed, the sign-in screen adds a **"Continue with \<name\>"**
+button, and a successful external login mints the same in-memory session a
+password login does (same lifetime, logout, and revocation). An installed
+provider also counts as a valid sole credential for a non-loopback bind —
+first-run browser setup stays loopback-gated regardless. The standalone
+`bintrail-console` binary has no provider installed: the button never
+appears, and the provider routes (`/api/auth/ext/*`) simply require a normal
+credential like any other `/api` path.
 
 ## Security model
 

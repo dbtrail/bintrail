@@ -54,6 +54,7 @@ jobs:
             console:
               - 'internal/console/**'
               - 'cmd/bintrail-console/**'
+              - 'consoleapp/**'
 
   unit:
     needs: changes

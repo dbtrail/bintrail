@@ -177,8 +177,31 @@ func TestNonLoopbackBindAllowedWithProviderOnly(t *testing.T) {
 		t.Fatal("New() accepted a credential-less non-loopback bind without a provider")
 	}
 	installFakeProvider(t)
-	if _, err := New(cfg); err != nil {
+	srv, err := New(cfg)
+	if err != nil {
 		t.Fatalf("New() with a provider installed = %v, want success", err)
+	}
+	// The lifted refusal must NOT leak into first-run setup: a provider is a
+	// credential path, not a trust assertion about who can reach the port, so
+	// on this credential-less non-loopback bind the unauthenticated
+	// POST /api/auth/setup stays closed — were it open, the first stranger to
+	// reach the port could create the console password and own the console.
+	// This pins the "It does NOT change willSetup/setupAllowed" invariant
+	// stated in New(); without it, merging the provider check into
+	// setupAllowed() would pass the whole suite.
+	if rec := postJSON(t, srv, "/api/auth/setup", "", `{"username":"admin","password":"long-enough-pass"}`); rec.Code != http.StatusForbidden {
+		t.Errorf("POST /api/auth/setup on a provider-only non-loopback bind = %d body = %s, want 403", rec.Code, rec.Body.String())
+	}
+	rec := getPath(t, srv, "127.0.0.1:8090", "/api/auth", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/auth = %d", rec.Code)
+	}
+	var info map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := info["setup"].(bool); !ok || got {
+		t.Errorf("/api/auth setup = %v on a provider-only non-loopback bind, want false", info["setup"])
 	}
 }
 
