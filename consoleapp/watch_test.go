@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/rotation"
@@ -579,5 +580,29 @@ func TestRunBaselinePruneCycle(t *testing.T) {
 		if c.Retain != 7*24*time.Hour {
 			t.Errorf("Retain = %v, want 7d", c.Retain)
 		}
+	}
+}
+
+// TestMainSourceJobInfo covers the pure flavor-resolution + SourceJobInfo
+// construction for watch's main source (the wiring in runUpStreamWithConsole
+// that fires ext.RunSourceJobs for the daemon's --source-dsn stream). The
+// live-daemon firing itself is covered in monitor_integration_test.go for the
+// supervised path; this pins the main-source construction without a daemon.
+func TestMainSourceJobInfo(t *testing.T) {
+	// Empty stream flavor (watchStreamConfig leaves Flavor unset; streamrun.One
+	// normalizes it to mysql) → the canonical non-empty "mysql", matching the
+	// value `bintrail up` supplies.
+	got := mainSourceJobInfo("user:pass@tcp(h:3306)/db", "idx-dsn", "")
+	want := ext.SourceJobInfo{SourceDSN: "user:pass@tcp(h:3306)/db", IndexDSN: "idx-dsn", Flavor: "mysql"}
+	if got != want {
+		t.Errorf("empty flavor: got %+v, want %+v", got, want)
+	}
+
+	// A non-empty stream flavor is carried through verbatim, so if watch ever
+	// grows a --source-flavor for its main source the job sees it unchanged.
+	got = mainSourceJobInfo("src", "idx", "mariadb")
+	want = ext.SourceJobInfo{SourceDSN: "src", IndexDSN: "idx", Flavor: "mariadb"}
+	if got != want {
+		t.Errorf("mariadb flavor: got %+v, want %+v", got, want)
 	}
 }

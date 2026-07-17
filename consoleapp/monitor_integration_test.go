@@ -10,10 +10,181 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/pgstreamrun"
+	"github.com/dbtrail/dbtrail/internal/streamrun"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
+
+// probeSourceJob registers an ext source job that captures the SourceJobInfo and
+// the bound context of every firing whose IndexDSN contains sentinel — the gate
+// keeps a Start elsewhere in the suite from misattributing a firing to this
+// test. The ext registry is process-global with no public deregister, so
+// ext.ResetForTest clears it both before registering (no prior bleed) and in
+// t.Cleanup (no bleed into later tests). Buffered so a fired job never blocks on
+// its own goroutine.
+func probeSourceJob(t *testing.T, sentinel string) (<-chan ext.SourceJobInfo, <-chan context.Context) {
+	t.Helper()
+	ext.ResetForTest()
+	t.Cleanup(ext.ResetForTest)
+	infoCh := make(chan ext.SourceJobInfo, 4)
+	ctxCh := make(chan context.Context, 4)
+	ext.RegisterSourceJob(func(jobCtx context.Context, src ext.SourceJobInfo) {
+		if !strings.Contains(src.IndexDSN, sentinel) {
+			return
+		}
+		infoCh <- src
+		ctxCh <- jobCtx
+	})
+	return infoCh, ctxCh
+}
+
+// TestIntegrationMonitorRunsExtSourceJob proves the monitor supervisor runs
+// registered ext source jobs alongside a supervised stream, bound to the
+// per-source lifecycle context. Start reaches the ext wiring (monitor.go, after
+// index-DB provisioning + the advisory lock) only against real MySQL, but the
+// stream itself is stubbed to block on its context, so no reachable source is
+// needed. Asserts: (a) the job fires ONCE with the entry's DSNs and resolved
+// flavor, (c) an idempotent Start for an already-running entry does not fire a
+// duplicate, and (b) THE LEAK CONTRACT — after Stop, the job's bound context is
+// Done, proving the job is torn down with the source and not merely with the
+// outer daemon context.
+func TestIntegrationMonitorRunsExtSourceJob(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, bootName := testutil.CreateTestDB(t)
+	bootDSN := testutil.IntegrationDSN(bootName)
+
+	sup := newMonitorSupervisor(ctx, bootDSN, nil, 0)
+	// Block until the job's lifecycle context is cancelled: this lets Start reach
+	// the ext wiring with only provisioning + the advisory lock done (real
+	// MySQL), never a reachable source, and keeps the stored state at "pending"
+	// so the idempotency assertion below has a running entry to collide with.
+	sup.streamFn = func(c context.Context, _ streamrun.Config) error { <-c.Done(); return c.Err() }
+
+	sentinel := fmt.Sprintf("extjob%d", time.Now().UnixNano()%1e9)
+	infoCh, ctxCh := probeSourceJob(t, sentinel)
+
+	entry := console.ServerEntry{
+		ID:        sentinel,
+		Name:      "ext-source-job",
+		SourceDSN: testutil.BaseDSN() + "/",
+	}
+	derived, err := sup.DeriveIndexDSN(entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.DSN = derived
+	t.Cleanup(func() {
+		if db, err := sql.Open("mysql", bootDSN); err == nil {
+			_, _ = db.Exec("DROP DATABASE IF EXISTS bintrail_idx_" + entry.ID)
+			_ = db.Close()
+		}
+	})
+
+	if err := sup.Start(ctx, entry); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop(context.Background(), entry.ID) })
+
+	// (a) One firing, carrying the entry's source/index DSNs and the resolved
+	// (default → mysql) flavor.
+	var jobCtx context.Context
+	select {
+	case got := <-infoCh:
+		want := ext.SourceJobInfo{SourceDSN: entry.SourceDSN, IndexDSN: entry.DSN, Flavor: console.FlavorMySQL}
+		if got != want {
+			t.Fatalf("source job info = %+v, want %+v", got, want)
+		}
+		jobCtx = <-ctxCh
+	case <-time.After(15 * time.Second):
+		t.Fatal("ext source job never fired for the started source")
+	}
+
+	// (c) An idempotent Start (the entry is still "pending" — the stub never
+	// progressed it to running, and both are running-variants that early-return)
+	// must NOT re-provision or fire a second job.
+	if err := sup.Start(ctx, entry); err != nil {
+		t.Fatalf("idempotent Start: %v", err)
+	}
+	select {
+	case got := <-infoCh:
+		t.Fatalf("idempotent Start fired a duplicate source job: %+v", got)
+	case <-time.After(2 * time.Second):
+	}
+
+	// (b) The leak contract: Stop tears down the source; the job's bound context
+	// must become Done. The outer daemon ctx is still live (only deferred), so
+	// this proves per-source jobCtx binding, not daemon-ctx binding.
+	if err := sup.Stop(ctx, entry.ID); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-jobCtx.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("source job context still live after Stop — job not bound to the source lifecycle")
+	}
+}
+
+// TestIntegrationMonitorExtSourceJobPGFlavor proves a PostgreSQL source carries
+// Flavor="postgres" into the ext source job. The PG stream is stubbed (no
+// reachable PostgreSQL needed); provisioning still runs against the real MySQL
+// index (the shared index schema for every source family).
+func TestIntegrationMonitorExtSourceJobPGFlavor(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, bootName := testutil.CreateTestDB(t)
+	bootDSN := testutil.IntegrationDSN(bootName)
+
+	sup := newMonitorSupervisor(ctx, bootDSN, nil, 0)
+	sup.pgStreamFn = func(c context.Context, _ pgstreamrun.Config) error { <-c.Done(); return c.Err() }
+
+	sentinel := fmt.Sprintf("extjobpg%d", time.Now().UnixNano()%1e9)
+	infoCh, _ := probeSourceJob(t, sentinel)
+
+	entry := console.ServerEntry{
+		ID:                sentinel,
+		Name:              "ext-source-job-pg",
+		SourceDSN:         "postgres://repl:secret@pg:5432/appdb",
+		SourceSlot:        "bintrail_slot",
+		SourcePublication: "bintrail_pub",
+		Flavor:            console.FlavorPostgres,
+	}
+	derived, err := sup.DeriveIndexDSN(entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.DSN = derived
+	t.Cleanup(func() {
+		if db, err := sql.Open("mysql", bootDSN); err == nil {
+			_, _ = db.Exec("DROP DATABASE IF EXISTS bintrail_idx_" + entry.ID)
+			_ = db.Close()
+		}
+	})
+
+	if err := sup.Start(ctx, entry); err != nil {
+		t.Fatalf("Start (postgres): %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop(context.Background(), entry.ID) })
+
+	select {
+	case got := <-infoCh:
+		want := ext.SourceJobInfo{SourceDSN: entry.SourceDSN, IndexDSN: entry.DSN, Flavor: console.FlavorPostgres}
+		if got != want {
+			t.Fatalf("pg source job info = %+v, want %+v", got, want)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("ext source job never fired for the started PostgreSQL source")
+	}
+}
 
 // waitStreamLive proves the supervised stream is attached and past its
 // auto-discovered start position before the test writes the rows it intends

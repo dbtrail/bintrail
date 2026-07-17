@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/doctor"
@@ -434,6 +435,16 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 		cfg.Hooks = job.streamHooks()
 		runOnce = func(c context.Context) error { return m.streamFn(c, cfg) }
 	}
+
+	// Extension source jobs (ext.RegisterSourceJob) run alongside the supervised
+	// stream, bound to jobCtx — the per-source lifecycle context, created once per
+	// (re)start and cancelled on Stop or daemon shutdown. Placing this here (after
+	// index-DB provisioning and the advisory lock, before the stream goroutine)
+	// ties one set of jobs to each monitored source's lifetime: not per
+	// stream-reconnect (m.run reuses jobCtx, so no per-retry goroutine leak), and
+	// only for a source this daemon actually streams (the advisory lock holder).
+	// No-op in the stock binary.
+	ext.RunSourceJobs(jobCtx, ext.SourceJobInfo{SourceDSN: e.SourceDSN, IndexDSN: e.DSN, Flavor: flavor})
 
 	m.wg.Add(1)
 	go m.run(jobCtx, job, e, flavor, runOnce)

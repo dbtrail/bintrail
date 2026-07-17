@@ -17,6 +17,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
@@ -612,7 +613,18 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// stream_state checkpoint.
 	go supervisor.Reconcile(registry)
 
-	streamErr := streamrun.One(ctx, watchStreamConfig(serverID))
+	// Extension source jobs (ext.RegisterSourceJob) for the daemon's MAIN source
+	// run alongside its stream on the daemon context (ctx) — the same secondary,
+	// never-fatal, daemon-scoped contract as `bintrail up` (cliapp/up.go) and the
+	// built-in rotation loop above. The supervised registry sources get their own
+	// jobs from the monitor supervisor (consoleapp/monitor.go); this call covers
+	// only the single main source `watch --source-dsn` streams. Flavor is the
+	// value the main stream below actually runs with (streamCfg.Flavor). No-op in
+	// the stock binary.
+	streamCfg := watchStreamConfig(serverID)
+	ext.RunSourceJobs(ctx, mainSourceJobInfo(upSourceDSN, upIndexDSN, streamCfg.Flavor))
+
+	streamErr := streamrun.One(ctx, streamCfg)
 	stop()                // drain the console even if the stream returned without a signal
 	<-consoleDone         // order the console goroutine's exit before the deferred db.Close()
 	stopFlashback()       // drain the flashback port before the deferred db.Close()
@@ -654,6 +666,21 @@ func watchStreamConfig(serverID uint32) streamrun.Config {
 		MetricsScrapeInterval: upMetricsScrapeInterval,
 		Deps:                  streamdeps.Default(),
 	}
+}
+
+// mainSourceJobInfo builds the ext.SourceJobInfo for `watch`'s main (non-registry)
+// source. Extracted from runUpStreamWithConsole so the flavor resolution is
+// unit-testable without a live daemon. streamFlavor is watchStreamConfig's
+// Flavor: `watch` exposes no --source-flavor for its main source, so it is empty
+// and streamrun.One normalizes it to "mysql" internally; we default it to the
+// same canonical value here so a registered job sees the non-empty flavor
+// `bintrail up` supplies (never "").
+func mainSourceJobInfo(sourceDSN, indexDSN, streamFlavor string) ext.SourceJobInfo {
+	flavor := streamFlavor
+	if flavor == "" {
+		flavor = console.FlavorMySQL
+	}
+	return ext.SourceJobInfo{SourceDSN: sourceDSN, IndexDSN: indexDSN, Flavor: flavor}
 }
 
 // resolveUpConsoleEnv applies the console-specific env vars to the upConsole*
