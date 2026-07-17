@@ -54,6 +54,7 @@ chmod 0755 "$STAGE/server/$ENTRY"
 
 sed -e "s/__MCPB_VERSION__/$VERSION/" \
     -e "s/__MCPB_PLATFORM__/$PLATFORM/" \
+    -e "s/__MCPB_ENTRY__/$ENTRY/" \
     "$TEMPLATE" > "$STAGE/manifest.json"
 
 mkdir -p "$OUT_DIR"

@@ -18,9 +18,9 @@
   "keywords": ["mysql", "postgresql", "binlog", "recovery", "time-travel", "database"],
   "server": {
     "type": "binary",
-    "entry_point": "server/bintrail-mcp",
+    "entry_point": "server/__MCPB_ENTRY__",
     "mcp_config": {
-      "command": "${__dirname}/server/bintrail-mcp",
+      "command": "${__dirname}/server/__MCPB_ENTRY__",
       "args": [
         "--connect",
         "${user_config.console_url}",

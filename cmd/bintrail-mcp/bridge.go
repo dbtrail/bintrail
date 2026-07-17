@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -55,14 +56,21 @@ func validateBridgeFlags(connectURL, httpAddr, tenantDSNsFile, token string) err
 	return nil
 }
 
-// bearerTransport injects an Authorization: Bearer header on every request to
-// the remote endpoint.
+// bearerTransport injects an Authorization: Bearer header on requests to the
+// configured endpoint host. Scoping by host matters: header stripping on
+// cross-host redirects happens in http.Client above the Transport layer, so a
+// transport that stamped the token unconditionally would re-attach it to a
+// redirect aimed at a different host.
 type bearerTransport struct {
 	token string
+	host  string
 	base  http.RoundTripper
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host != t.host {
+		return t.base.RoundTrip(req)
+	}
 	// Per RoundTripper contract the request must not be mutated; clone first.
 	r := req.Clone(req.Context())
 	r.Header.Set("Authorization", "Bearer "+t.token)
@@ -86,7 +94,11 @@ type bridge struct {
 func newBridge(ctx context.Context, endpoint, token string) (*bridge, error) {
 	httpClient := http.DefaultClient
 	if token != "" {
-		httpClient = &http.Client{Transport: &bearerTransport{token: token, base: http.DefaultTransport}}
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --connect URL %q: %w", endpoint, err)
+		}
+		httpClient = &http.Client{Transport: &bearerTransport{token: token, host: u.Host, base: http.DefaultTransport}}
 	}
 	transport := &mcp.StreamableClientTransport{
 		Endpoint:   endpoint,
@@ -158,10 +170,15 @@ func (b *bridge) resync(ctx context.Context) error {
 
 	seen := map[string]bool{}
 	for _, tool := range remote {
+		// AddTool panics on a non-object input schema — and on a present,
+		// non-object output schema; a malformed remote tool must not take the
+		// whole bridge down.
 		if !isObjectSchema(tool.InputSchema) {
-			// AddTool panics on a non-object input schema; a malformed remote
-			// tool must not take the whole bridge down.
 			slog.Warn("bridge: skipping remote tool with non-object input schema", "tool", tool.Name)
+			continue
+		}
+		if tool.OutputSchema != nil && !isObjectSchema(tool.OutputSchema) {
+			slog.Warn("bridge: skipping remote tool with non-object output schema", "tool", tool.Name)
 			continue
 		}
 		b.server.AddTool(tool, b.forward(tool.Name))
