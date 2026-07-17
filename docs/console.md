@@ -527,6 +527,29 @@ first-run browser setup stays loopback-gated regardless. The standalone
 appears, and the provider routes (`/api/auth/ext/*`) simply require a normal
 credential like any other `/api` path.
 
+### Extension views
+
+Embedding distributions — builds that construct their console binary from the
+importable `consoleapp` package — may add one additional view to the console
+through the `ext.ConsoleView` seam: call `ext.SetConsoleView` once from
+`main()` before `consoleapp.Main`, like `ext.SetConsoleAuth`. An installed view
+contributes a nav item, a frontend module, and its own authenticated data API;
+the console reveals the nav item, routes to it, and loads the module in the same
+page (same origin, not an iframe).
+
+The view's static assets are served **unauthenticated** at `/ext/<id>/` (the
+code always ships, like the console's own `app.js`), while its data routes at
+`/api/ext/<id>/` require the same bearer credential as every other `/api` path
+and are **refused while an access-control profile is active** (the console can't
+guarantee a third-party handler honors table-deny / column-redaction rules, so
+it withholds the whole surface under a profile). Each data route reads the index
+of the server currently selected in the switcher, with the operator's profile
+applied.
+
+The standalone `bintrail-console` binary ships **no extension views**: no nav
+item appears, `/api/capabilities` advertises none, and `/ext/*` and
+`/api/ext/*` are absent from the router entirely.
+
 ## Security model
 
 The binary has no Supabase/RBAC backend to lean on, so the console defends

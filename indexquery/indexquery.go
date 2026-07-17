@@ -17,9 +17,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/duckdbtuning"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -129,18 +129,18 @@ func WrapSchemaMigrationErr(err error) error { return indexer.WrapSchemaMigratio
 // AddDuckDBTuningFlags registers the shared DuckDB resource flags
 // (--ultrafast, --duckdb-threads, --duckdb-memory-limit) on an offline
 // read command.
-func AddDuckDBTuningFlags(cmd *cobra.Command) { cli.AddDuckDBTuningFlags(cmd) }
+func AddDuckDBTuningFlags(cmd *cobra.Command) { duckdbtuning.AddDuckDBTuningFlags(cmd) }
 
 // DuckDBTuningFromFlags resolves the effective DuckDB tuning for a command
 // carrying the flags registered by AddDuckDBTuningFlags. An invalid
 // --duckdb-memory-limit is a hard error.
 func DuckDBTuningFromFlags(cmd *cobra.Command) (Tuning, error) {
-	return cli.DuckDBTuningFromFlags(cmd)
+	return duckdbtuning.DuckDBTuningFromFlags(cmd)
 }
 
 // TunedArchiveFetcher adapts a DuckDB Tuning into an ArchiveFetcher suitable
 // for FetchMergedOptions.ArchiveFetcher.
-func TunedArchiveFetcher(t Tuning) ArchiveFetcher { return cli.TunedArchiveFetcher(t) }
+func TunedArchiveFetcher(t Tuning) ArchiveFetcher { return duckdbtuning.TunedArchiveFetcher(t) }
 
 // OutputJSON writes v to stdout as indented JSON.
 func OutputJSON(v any) error { return cliutil.OutputJSON(v) }

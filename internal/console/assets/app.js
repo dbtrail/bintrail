@@ -54,6 +54,7 @@ const ICONS = {
   file: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path><path d="M14 3v5h5"></path></svg>`,
   warn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
   calendar: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg>`,
+  ext: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>`,
 };
 
 // ── module state ─────────────────────────────────────────────────────────────
@@ -63,6 +64,7 @@ let currentServer = "";       // X-Bintrail-Server target ("" = backend default)
 let defaultServerId = "";
 let serverGen = 0;            // bumped on every server switch (staleness guard)
 let capsCache = {};           // last /api/capabilities for the selected server
+let extViews = [];            // extension views advertised for the selected server (embedding builds)
 let lastSQL = "";             // last generated undo SQL (for copy/download)
 let lastEvents = [];          // last rendered (filtered, capped) event page
 let pendingRecover = null;    // event context carried into Recover via "Undo"
@@ -584,13 +586,22 @@ function viewEnter() { const v = VIEW(); v.classList.remove("view-enter"); void 
 
 // ── router ─────────────────────────────────────────────────────────────────
 
+// isKnownRoute accepts the built-in ROUTES plus any live extension-view route
+// ("ext-<id>" advertised in the current server's capabilities). An "ext-" route
+// for a view the selected server does not expose is treated as unknown (the
+// caller redirects to overview), the same gating Time-travel/Storage get.
+function isKnownRoute(route) {
+  if (ROUTES.includes(route)) return true;
+  return route.startsWith("ext-") && extViews.some((v) => "ext-" + v.id === route);
+}
+
 function routeFromLocation() {
   const path = location.pathname.replace(/^\//, "").split("/")[0] || "overview";
-  return ROUTES.includes(path) ? path : "overview";
+  return isKnownRoute(path) ? path : "overview";
 }
 
 function navigate(route, params, push = true) {
-  if (!ROUTES.includes(route)) route = "overview";
+  if (!isKnownRoute(route)) route = "overview";
   // Reconstruct surface is gated; never navigate to a disabled Time-travel.
   if (route === "timetravel" && !capsCache.reconstruct) route = "overview";
   // Storage is a watch-daemon surface (rotation + archiving live there).
@@ -610,6 +621,13 @@ function renderRoute() {
   setActiveNav(route);
   cursorIdx = -1;
   const params = Object.fromEntries(new URLSearchParams(location.search));
+  // Extension views (embedding builds): "ext-<id>" dispatches to the provider's
+  // frontend module. routeFromLocation already redirected an unknown/ungated
+  // ext route to overview, so a match here is always a live view.
+  if (route.startsWith("ext-")) {
+    const view = extViews.find((v) => "ext-" + v.id === route);
+    return view ? renderExtensionView(view) : renderOverview();
+  }
   switch (route) {
     case "overview": return renderOverview();
     case "events": return renderEvents(params);
@@ -2403,9 +2421,72 @@ async function gateCapabilities() {
   }
   if (gen !== serverGen) return;
   capsCache = caps || {};
+  // Extension views advertised for this server (embedding builds; empty in the
+  // stock binary and under an active RBAC profile). Rebuild the nav before the
+  // route renders so a deep-linked ext route resolves.
+  extViews = Array.isArray(capsCache.extension_views) ? capsCache.extension_views : [];
+  syncExtNav();
   $all("[data-capability]").forEach((node) => node.classList.toggle("cap-on", !!capsCache[node.dataset.capability]));
   applyAuthGate();
   updateSrvNote(); // capsCache.monitor may have just changed
+}
+
+// syncExtNav rebuilds the extension-view nav group from extViews. Idempotent
+// across server switches: it drops the previously-injected group first, so a
+// server that exposes fewer (or no) extension views cannot leave stale items
+// behind. The group is anchored right after the built-in Monitor group (the one
+// holding Status). el()/textContent only — a view label is never markup.
+function syncExtNav() {
+  const prev = document.getElementById("ext-nav-group");
+  if (prev) prev.remove();
+  if (!extViews.length) return;
+  const nav = document.getElementById("nav");
+  if (!nav) return;
+  const group = el("div", { class: "nav-group", id: "ext-nav-group", "data-ext-nav": "1" });
+  group.append(el("div", { class: "nav-label", text: "Extensions" }));
+  for (const v of extViews) {
+    const route = "ext-" + v.id;
+    const item = el("a", {
+      class: "nav-item",
+      "data-ext-nav": "1",
+      "data-route": route,
+      href: "/" + route,
+      onclick: (e) => { e.preventDefault(); pendingRecover = null; navigate(route); },
+    }, icon("ext", "ni-icon"), el("span", { text: v.label }));
+    group.append(item);
+  }
+  const statusItem = $('.nav-item[data-route="status"]');
+  const anchor = statusItem ? statusItem.closest(".nav-group") : null;
+  if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(group, anchor.nextSibling);
+  else nav.append(group);
+}
+
+// renderExtensionView loads a provider's ES module and hands it a mount node and
+// a small context: apiBase ("/api/ext/<id>/") and the console's own authed fetch
+// primitive (api), so the module reads its data routes with the operator's
+// bearer credential and selected-server header already applied. serverGen is
+// captured before the dynamic import and re-checked after: a server switch
+// mid-import abandons the render (no cross-server paint), matching every other
+// async view here.
+async function renderExtensionView(view) {
+  const gen = serverGen;
+  const v = VIEW();
+  clear(v);
+  v.append(pageHead(view.label, null));
+  const mount = el("div", { class: "ext-view-mount" });
+  v.append(mount);
+  try {
+    const mod = await import(view.script);
+    if (gen !== serverGen) return;
+    if (!mod || typeof mod.render !== "function") {
+      renderError(mount, "This extension view did not export a render() function.");
+      return;
+    }
+    mod.render(mount, { apiBase: "/api/ext/" + view.id + "/", api });
+  } catch (err) {
+    if (gen !== serverGen) return;
+    renderError(mount, err);
+  }
 }
 
 // ── server registry: switcher + modal CRUD ──────────────────────────────────

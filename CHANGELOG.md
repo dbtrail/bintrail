@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`ext.ConsoleView`: a pluggable extension-view seam for the web console.** Embedding distributions — builds that construct their console binary from the importable `consoleapp` package — can inject one additional console view (a nav item, a frontend ES module, and an authenticated data API) with `ext.SetConsoleView`, same startup-only contract as `ext.SetConsoleAuth`: call once from `main()` before `consoleapp.Main`. The view's static assets mount **unauthenticated** at `/ext/<id>/` (code always ships, like the console's own `app.js`); its data routes mount at `/api/ext/<id>/` behind the console's bearer-token middleware and are refused with 403 while an RBAC access-control profile is active (the console cannot guarantee a third-party handler honors table-deny / column-redaction rules). The data handler receives a per-request, per-selected-server index context — the selected server's index connection, the console's own cross-source (live + archive, gap-aware, RBAC-applied) fetch pipeline, and the selected registry entry's source DSN. `/api/capabilities` advertises the installed view (`extension_views`), and the SPA reveals a nav item + `ext-<id>` route that dynamically imports the module and calls its `render(mount, {apiBase, api})`. The provider id is constrained to `^[a-z0-9-]+$` and validated at mount time — an invalid id is skipped (logged, not mounted) rather than producing a broken route. The stock binary has no view: no nav item, `extension_views` omitted, and `/ext/*` / `/api/ext/*` are absent from the router.
+
+### Changed
+- The shared DuckDB resource-tuning helpers (`--ultrafast` / `--duckdb-threads` / `--duckdb-memory-limit` flag registration, resolution, and the archive-fetcher adapter) moved from `internal/cli` into a dedicated leaf package `internal/duckdbtuning`, so the public read-plane facade (`indexquery`) exposes them without importing the command layer. `indexquery`'s public API is unchanged (`AddDuckDBTuningFlags` / `DuckDBTuningFromFlags` / `TunedArchiveFetcher` remain, repointed); `internal/cli` keeps thin forwarders so its command layer is untouched.
+
 ## [0.35.0] - 2026-07-17
 
 ### Added

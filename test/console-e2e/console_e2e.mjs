@@ -305,6 +305,76 @@ try {
   cred.rawRowCount === 4 ? ok("aws-creds: all four raw signal rows still render") : bad("aws-creds: all four raw signal rows still render", `rawRowCount=${cred.rawRowCount}`);
 
 
+  // Scenario 10 — extension views (embedding builds). The stock binary ships no
+  // ConsoleViewProvider, so this fixture-drives the pure client wiring (like
+  // scenarios 7-9): inject an advertised view into capsCache, then assert the
+  // nav item appears, the route "ext-<id>" mounts the module and calls its
+  // render(mount, {apiBase, api}), and a server switch both drops the nav item
+  // and abandons an in-flight render (serverGen staleness). Script() is stubbed
+  // with a blob-URL ES module — a same-document dynamic import, which works only
+  // because the console sets no Content-Security-Policy (the invariant documented
+  // on ext.ConsoleViewProvider.Script; a script-src CSP without 'self'/blob:
+  // would break this and every real extension view).
+  const extv = await page.evaluate(async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const modURL = (marker) => URL.createObjectURL(new Blob(
+      [`export function render(mount, ctx){ window.${marker} = !!(mount && ctx && typeof ctx.api === "function" && ctx.apiBase); mount.append(document.createTextNode("ext-content")); }`],
+      { type: "text/javascript" },
+    ));
+
+    // 1) Advertise one view and sync the nav (mirrors gateCapabilities).
+    const script = modURL("__ext1");
+    capsCache = { ...capsCache, extension_views: [{ id: "demo", label: "Demo View", script }] };
+    extViews = capsCache.extension_views;
+    window.__ext1 = undefined;
+    syncExtNav();
+    const navItem = document.querySelector('.nav-item[data-route="ext-demo"]');
+    const navText = navItem ? navItem.textContent.trim() : null;
+    const known = isKnownRoute("ext-demo");
+
+    // 2) Navigate → the module mounts and render() runs with apiBase + api.
+    navigate("ext-demo");
+    await sleep(400);
+    const onRoute = location.pathname === "/ext-demo";
+    const mount = document.querySelector(".ext-view-mount");
+    const mountedText = mount ? mount.textContent : "";
+    const rendered = window.__ext1;
+    const navActive = navItem ? navItem.classList.contains("active") : false;
+
+    // 3) Server switch → the nav item is dropped and the now-unknown ext route
+    //    redirects to overview (unmount across a switch).
+    serverGen++;
+    extViews = [];
+    capsCache = { ...capsCache, extension_views: [] };
+    syncExtNav();
+    const navGone = !document.querySelector('.nav-item[data-route="ext-demo"]');
+    const redirected = routeFromLocation() === "overview";
+
+    // 4) Mid-import staleness: start a render, bump serverGen synchronously
+    //    (before the dynamic import resolves), and assert render() never runs.
+    extViews = [{ id: "demo2", label: "Demo Two", script: modURL("__ext2") }];
+    window.__ext2 = undefined;
+    const p = renderExtensionView(extViews[0]); // captures gen synchronously
+    serverGen++;                                // switch before the import settles
+    await p;
+    const staleAborted = window.__ext2 === undefined;
+
+    // Leave the UI on a known-good route for the final no-errors assertion.
+    navigate("overview");
+    return { navText, known, onRoute, mounted: !!mount, mountedText, rendered, navActive, navGone, redirected, staleAborted };
+  });
+  extv.navText === "Demo View" ? ok("ext-view: nav item injected with the provider label") : bad("ext-view: nav item injected with the provider label", `navText=${extv.navText}`);
+  extv.known ? ok("ext-view: isKnownRoute accepts a live ext-<id> route") : bad("ext-view: isKnownRoute accepts a live ext-<id> route", "ext-demo not known");
+  extv.onRoute ? ok("ext-view: navigate routes to /ext-<id>") : bad("ext-view: navigate routes to /ext-<id>", "wrong route");
+  extv.mounted ? ok("ext-view: a mount node is created") : bad("ext-view: a mount node is created", "no .ext-view-mount");
+  extv.rendered ? ok("ext-view: the module render() runs with {apiBase, api}") : bad("ext-view: the module render() runs with {apiBase, api}", `rendered=${extv.rendered}`);
+  /ext-content/.test(extv.mountedText) ? ok("ext-view: module content lands in the mount") : bad("ext-view: module content lands in the mount", `mountedText=${extv.mountedText}`);
+  extv.navActive ? ok("ext-view: the nav item is marked active on its route") : bad("ext-view: the nav item is marked active on its route", "not .active");
+  extv.navGone ? ok("ext-view: server switch removes the ext nav item (idempotent)") : bad("ext-view: server switch removes the ext nav item (idempotent)", "stale nav item remained");
+  extv.redirected ? ok("ext-view: an ext route the new server lacks redirects to overview") : bad("ext-view: an ext route the new server lacks redirects to overview", "did not redirect");
+  extv.staleAborted ? ok("ext-view: a server switch mid-import abandons the render (serverGen staleness)") : bad("ext-view: a server switch mid-import abandons the render (serverGen staleness)", "render ran after the switch");
+
+
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
 } catch (err) {

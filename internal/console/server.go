@@ -430,6 +430,25 @@ func (s *Server) buildHandler() http.Handler {
 	if p := ext.ConsoleAuth(); p != nil {
 		root.Handle(extAuthPrefix, p.Handler(extAuthPrefix, s.extSessionIssuer()))
 	}
+	// Extension view (ext seam): an embedding distribution can contribute one
+	// additional console view. Its static assets mount UNAUTHENTICATED on root at
+	// /ext/<id>/ (behind hostGuard + securityHeaders only — code always ships,
+	// only data is gated), and its data routes mount on the inner api mux at
+	// /api/ext/<id>/ so they inherit tokenMiddleware, wrapped in rbacViewGuard so
+	// the whole surface is refused (403) while an RBAC profile is active. The id
+	// flows into both URL paths and a DOM route, so an invalid one is skipped
+	// (logged, not mounted) rather than producing a broken/injectable route.
+	if p := ext.ConsoleView(); p != nil {
+		id := p.ID()
+		if !ext.ValidConsoleViewID(id) {
+			slog.Error("console: ignoring extension view with an invalid id (must match ^[a-z0-9-]+$)", "id", id)
+		} else {
+			staticPrefix := "/ext/" + id + "/"
+			dataPrefix := "/api/ext/" + id + "/"
+			root.Handle(staticPrefix, p.StaticHandler(staticPrefix))
+			api.Handle(dataPrefix, s.rbacViewGuard(p.DataHandler(dataPrefix, s.consoleQueryContext)))
+		}
+	}
 	root.Handle("/api/", s.tokenMiddleware(api)) // credential on all other /api/*
 	root.Handle("/", assetHandler())             // static shell + assets
 

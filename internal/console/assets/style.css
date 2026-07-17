@@ -1383,3 +1383,8 @@ button { font-family: inherit; }
 
 .dt-foot { display: flex; gap: 8px; }
 .dt-foot .btn-primary { margin-left: auto; }
+
+/* Extension views (embedding builds) render their frontend module into this
+   mount; reserve a minimum height so an empty/slow module doesn't collapse the
+   view region to a bare page head. */
+.ext-view-mount { min-height: 240px; }

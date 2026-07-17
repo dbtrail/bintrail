@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -76,8 +77,16 @@ type capabilitiesResponse struct {
 	Verify bool `json:"verify"`
 	// VerifyLiveSource: live-source verify is additionally usable — the
 	// selected server also has a source DSN configured. Per-server.
-	VerifyLiveSource bool         `json:"verify_live_source"`
-	Auth             authCapsInfo `json:"auth"`
+	VerifyLiveSource bool `json:"verify_live_source"`
+	// ExtensionViews lists console views contributed by an installed
+	// extension-view provider (an embedding distribution — a build that wraps the
+	// OSS core). Omitted in the stock binary (no provider) and whenever an RBAC
+	// profile is active (the provider's data routes are refused then, so the SPA
+	// must not advertise a nav item that would 403). The SPA reveals one nav item
+	// + route ("ext-<id>") per entry. Generic by construction — the core names no
+	// specific view.
+	ExtensionViews []extensionViewDTO `json:"extension_views,omitempty"`
+	Auth           authCapsInfo       `json:"auth"`
 	// Source names the selected server's source database family — "postgresql"
 	// or "mysql" — derived per-server from stream_state.flavor (the same field
 	// DialectForIndex reads). It drives source-aware PRESENTATION only: the
@@ -97,6 +106,16 @@ type capabilitiesResponse struct {
 type authCapsInfo struct {
 	PasswordSet bool   `json:"password_set"`
 	AuthKind    string `json:"auth_kind"` // "token" | "session"
+}
+
+// extensionViewDTO is the wire view of one console view contributed by an
+// installed ext.ConsoleViewProvider. id keys the nav item, the SPA route
+// ("ext-"+id), and the "/api/ext/<id>/" data mount; script is the ES module the
+// SPA import()s and calls render(mount, {apiBase, api}) on.
+type extensionViewDTO struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Script string `json:"script"`
 }
 
 // handleCapabilities reports which optional console surfaces are enabled.
@@ -155,6 +174,14 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// strip Time-travel from the UI, so leave an operator trace. Mirrors
 		// the Debug/Warn split in connManager.Resolve.
 		slog.Warn("console: capabilities resolve failed; reporting reconstruct=false", "error", err)
+	}
+	// Extension views (ext seam): advertise an installed provider's view so the
+	// SPA can reveal its nav item + route. Process-global, like Monitor. Suppressed
+	// under an active RBAC profile — the data routes are refused there (rbacViewGuard),
+	// so a nav item would only lead to a 403 — and for an invalid id, which
+	// buildHandler declined to mount (advertising it would 404 the data route).
+	if p := ext.ConsoleView(); p != nil && !s.rbacActive() && ext.ValidConsoleViewID(p.ID()) {
+		resp.ExtensionViews = []extensionViewDTO{{ID: p.ID(), Label: p.Label(), Script: p.Script()}}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
