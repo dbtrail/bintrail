@@ -332,8 +332,15 @@ try {
     const realFetch = window.fetch;
     window.fetch = (path, opts) => {
       if (typeof path === "string" && path.startsWith("/api/capabilities")) {
+        // A realistic caps shape (incl. the always-present `auth` object) so the
+        // whole gateCapabilities() tail — applyAuthGate/updateSrvNote — runs as it
+        // would against the real backend, not just the extension_views read.
         return Promise.resolve(new Response(
-          JSON.stringify({ monitor: true, extension_views: [{ id: "gated", label: "Gated View", script: modURL("__extgate") }] }),
+          JSON.stringify({
+            monitor: true,
+            auth: { password_set: false, auth_kind: "token" },
+            extension_views: [{ id: "gated", label: "Gated View", script: modURL("__extgate") }],
+          }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         ));
       }
