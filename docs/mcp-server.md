@@ -14,6 +14,10 @@ It exposes four **read-only** tools — `query`, `recover` (generates reversal S
 never runs it), `status`, and `list_schema_changes` — and never writes to your
 database.
 
+> **First time?** If you run the web console, the shortest path is the
+> [5-minute Connect-AI guide](connect-ai.md) — console URL + token + a
+> one-click bundle, no JSON and no DSN. This page is the full reference.
+
 ---
 
 ## Before you start

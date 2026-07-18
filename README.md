@@ -32,7 +32,7 @@ before/after images in a searchable index:
 - **Who changed this?** — session attribution (database user, host, and client program behind a change) is available in the commercial distribution (dbtrail EE)
 - **Prove the safety net holds** — `bintrail verify` checks (off-line, drift-free) that a recovery would actually reproduce the source, and `bintrail status` flags any gap in the captured stream — so you find out *before* you need it — see [Verify](docs/verify.md)
 - **Web console** — browse, recover, and add servers to monitor, all in the UI
-- **[MCP server](docs/mcp-server.md)** — Claude or any MCP client can search history and draft recoveries
+- **Ask it in plain English** — connect Claude Desktop to your console in one click (an `.mcpb` bundle and a copy-paste URL: [5-minute guide](docs/connect-ai.md)); any MCP client works — see the [MCP server](docs/mcp-server.md) reference
 
 Works with **MySQL**, **Percona Server for MySQL**, **Amazon RDS for MySQL**,
 and **Amazon Aurora MySQL** (verified); **Google Cloud SQL for MySQL** is
@@ -82,7 +82,7 @@ See [the demo image](docs/demo.md).
 | [DBA guide](docs/guide.md) | [Time-Travel SQL](docs/time-travel-sql.md) · [Verify recoveries](docs/verify.md) | [Docker](docs/docker.md) |
 | [30-second demo](docs/demo.md) | [Streaming](docs/streaming.md) · [Indexing](docs/indexing.md) | [Upload to S3](docs/upload.md) · [S3 IAM policy](docs/s3-iam-policy.md) · [Upgrading](docs/upgrade.md) |
 | | [MariaDB source (alpha)](docs/mariadb.md) · [PostgreSQL source (beta)](docs/postgres.md) | [Server identity](docs/server-identity.md) |
-| | [MCP server](docs/mcp-server.md) | [Parquet debugging](docs/parquet-debugging.md) |
+| | [Connect an AI assistant](docs/connect-ai.md) · [MCP server](docs/mcp-server.md) | [Parquet debugging](docs/parquet-debugging.md) |
 | | [Dump & Baseline](docs/dump-and-baseline.md) · [DDL tracking](docs/ddl-tracking.md) | |
 
 ## License

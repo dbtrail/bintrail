@@ -1,0 +1,151 @@
+# Connect an AI assistant in 5 minutes
+
+You run dbtrail. You'd like to ask your database's change history questions in
+plain English — from **Claude Desktop**, claude.ai, or any MCP-capable client:
+
+> "What got deleted from `orders` in the last hour?"
+>
+> "Generate the SQL to bring customer 42's row back."
+>
+> "Did anyone ALTER a table this week?"
+
+This page is the shortest path there. No JSON files, no DSNs, no SSH gymnastics.
+(If you want every option and knob instead, that's [mcp-server.md](mcp-server.md).)
+
+**What the AI can and cannot do, up front:** it gets four **read-only** tools —
+search changes, draft reversal SQL, show index status, list schema changes. It
+sees exactly what the web console shows you, with the same result caps and the
+same redactions. It **never executes SQL** and never connects to your source
+database — recovery SQL is text you review and run yourself.
+
+---
+
+## Step 0 — you need the console with a token
+
+The AI connects to your **web console**, which serves an MCP endpoint at
+`/mcp`. If you already run `bintrail-console` (standalone `serve`, `watch`, or
+the Docker stack), you're nearly done — just make sure it has an **access
+token** configured:
+
+```sh
+# standalone
+bintrail-console serve --index-dsn '<your index DSN>' --token 'pick-something-long'
+
+# or via environment (works for watch and the compose stack too)
+export BINTRAIL_CONSOLE_TOKEN='pick-something-long'
+```
+
+The token is the AI client's credential. Password login (the browser kind)
+does **not** work for MCP clients — if your console is password-only, add a
+token. The console tells you about this too: open **Settings → Connect AI** in
+the sidebar and it either shows you everything ready to copy, or explains
+what's missing.
+
+> **No console yet?** The [quickstart](quickstart.md) gets a full stack up in a
+> few minutes. Come back to this page after.
+
+---
+
+## Step 1 — copy your MCP URL
+
+Open the console in your browser → **Settings → Connect AI**. Copy the URL it
+shows, e.g.:
+
+```
+http://your-host:8090/mcp
+```
+
+Two things worth knowing (the page handles both for you):
+
+- **Multiple servers?** `/mcp` targets the console's default server;
+  `/mcp/{name}` targets a specific one. The card shows the URL for whichever
+  server you have selected in the sidebar.
+- The URL only needs to be reachable **from the machine where the AI client
+  runs** — LAN, VPN, or an SSH/SSM port-forward are all fine. Nothing needs to
+  be on the public internet.
+
+## Step 2 — install the bundle in Claude Desktop
+
+1. Grab the `.mcpb` file from the **Connect AI** page's download button (or the
+   [releases page](https://github.com/dbtrail/dbtrail/releases)) — pick the one
+   matching the machine where Claude Desktop runs.
+2. **Double-click it.** Claude Desktop opens an install dialog.
+3. Fill in the two fields:
+   - **Console / MCP endpoint URL** — the URL from step 1
+   - **Access token** — your console token (Claude Desktop stores it as a
+     sensitive value)
+
+That's it. No config files were harmed.
+
+> **macOS / Windows note:** published bundles currently cover Linux (the
+> release build matrix). On a Mac, build a native bundle from source with
+> `make mcpb` (output in `dist/mcpb/`), or use the raw-config fallback on the
+> Connect AI page — same two values, five lines of JSON.
+
+## Step 3 — ask something
+
+Open a new Claude Desktop conversation. The `query`, `recover`, `status`, and
+`list_schema_changes` tools are now available. Try:
+
+> "Show me the last 20 changes in the `wordpress` schema."
+>
+> "Someone fat-fingered an UPDATE on `users` around 3pm — what did it change,
+> and write me the SQL to undo it."
+>
+> "Is the capture stream healthy? Any gaps I should worry about?"
+
+Claude searches the **index** — the source database is never touched.
+
+---
+
+## Variants
+
+**claude.ai (web) as a custom connector.** If your console is reachable over
+public **HTTPS**, the same `/mcp` URL works directly: claude.ai → Settings →
+Connectors → add custom connector. No bundle, no local install. (Not public?
+Keep using Desktop + the bundle — it works over private networks.)
+
+**Any other MCP client** (Claude Code, Cursor, …). Anything that launches stdio
+MCP servers can use the bridge; the Connect AI page has a copy-paste snippet:
+
+```json
+{
+  "mcpServers": {
+    "dbtrail": {
+      "command": "bintrail-mcp",
+      "args": ["--connect", "http://your-host:8090/mcp", "--token", "YOUR_CONSOLE_TOKEN"]
+    }
+  }
+}
+```
+
+**No console at all** (CLI-only setups): `bintrail-mcp` can talk to the index
+directly with a DSN — see [mcp-server.md](mcp-server.md).
+
+---
+
+## When something doesn't work
+
+| Symptom | Likely cause, in order of likelihood |
+|---|---|
+| **401 unauthorized** | Wrong token; or you're not talking to the console you think you are — a port-forward pointing at a stale process, another console on the same port. Check with `curl -H "Authorization: Bearer $TOKEN" http://host:8090/api/capabilities` — it should return JSON with `"mcp": true`. |
+| **403 "no token configured"** | The console runs without `--token` / `BINTRAIL_CONSOLE_TOKEN`. Add one and restart (step 0). |
+| **Connection refused / timeout** | The URL isn't reachable from the AI client's machine. `curl http://host:8090/api/healthz` from that machine; if you tunnel, remember tunnels can idle out — re-establish and retry. |
+| **Bundle download 404s** | That release predates the bundles. Take the latest release, or build with `make mcpb`. |
+| **Tools don't appear in Claude Desktop** | Check Desktop's MCP logs (Settings → Extensions): the bridge exits with a one-line reason — bad URL and rejected token are spelled out, it never hangs silently. |
+| **Results look incomplete** | The MCP surface has the console's result caps (1,000 events / 10,000 recover statements per call). Ask Claude to narrow the time range or filter — that's the intended workflow, not a bug. |
+
+---
+
+## Security model, honestly
+
+- The endpoint requires the console token on **every** request; unknown hosts
+  are rejected by the same host-header allowlist as the rest of the console.
+- The four tools are read-only and annotated as such (`ReadOnlyHint`); the AI
+  cannot write to the index, the source, or anywhere else through them.
+- Responses carry the console's field redactions — e.g. captured SQL statement
+  text is withheld, same as the console UI.
+- The token is worth protecting: anyone holding it can *read* your change
+  history (row images included). Treat it like a database credential — prefer
+  HTTPS or private networks, rotate it if leaked.
+- Recovery SQL is **always** a draft for a human. Read it before you run it.
