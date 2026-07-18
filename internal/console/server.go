@@ -106,6 +106,11 @@ type Config struct {
 	// DefaultAuthPath(). A missing file means password login is not
 	// configured; a corrupt one fails New loudly.
 	AuthPath string
+	// MCPTokenPath locates the managed MCP token file (SHA-256 only, written
+	// by the Settings → Connect AI generate flow — #1052). Empty means
+	// DefaultMCPTokenPath(). A missing file means no managed token; a corrupt
+	// one fails New loudly, like AuthPath.
+	MCPTokenPath string
 	// TLSCert / TLSKey serve the console over HTTPS (both-or-neither). Static
 	// files only — rotation is a restart; ACME is out of scope.
 	TLSCert string
@@ -182,6 +187,11 @@ type Server struct {
 	sessions     *sessionStore
 	loginLimiter *loginLimiter
 	tlsConf      *tls.Config
+	// Managed MCP token (#1052): mcpTokenPath is the on-disk hash file;
+	// managedTok is the live credential, swapped in place by the
+	// generate/rotate/revoke handlers so changes apply without a restart.
+	mcpTokenPath string
+	managedTok   managedMCPToken
 }
 
 // serverHeader selects the target server per request. Selection is stateless —
@@ -217,6 +227,20 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	passwordCfg := authFile != nil
+
+	// Managed MCP token (#1052): loaded like the auth file — missing is the
+	// normal not-configured state, corrupt fails loud. It is an ADDITIONAL
+	// automation credential; it deliberately plays no part in the bind/setup
+	// policy below (it can only ever have been minted by an already-
+	// authenticated operator, and first-run setup semantics stay unchanged).
+	mcpTokenPath := cfg.MCPTokenPath
+	if mcpTokenPath == "" {
+		mcpTokenPath = DefaultMCPTokenPath()
+	}
+	mcpTokFile, err := LoadMCPTokenFile(mcpTokenPath)
+	if err != nil {
+		return nil, err
+	}
 
 	// Bind/credential policy. Password login is the primary path; the static
 	// token is an opt-in automation credential (set explicitly, never
@@ -305,7 +329,9 @@ func New(cfg Config) (*Server, error) {
 		sessions:         newSessionStore(),
 		loginLimiter:     newLoginLimiter(),
 		tlsConf:          tlsConf,
+		mcpTokenPath:     mcpTokenPath,
 	}
+	s.managedTok.set(mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot
 
 	// Seed the ephemeral boot bundle when the caller supplied a command-line
@@ -420,6 +446,12 @@ func (s *Server) buildHandler() http.Handler {
 	// keeps them under the tokenMiddleware-wrapped /api/ catch-all).
 	api.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	api.HandleFunc("POST /api/auth/password", s.handlePasswordChange)
+	// Managed MCP token (#1052): status / generate-or-rotate / revoke, all
+	// behind the same credential as every /api route. Values never serialize
+	// except the one-time plaintext in the generate response.
+	api.HandleFunc("GET /api/mcp-token", s.handleMCPTokenGet)
+	api.HandleFunc("POST /api/mcp-token", s.handleMCPTokenGenerate)
+	api.HandleFunc("DELETE /api/mcp-token", s.handleMCPTokenRevoke)
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /api/healthz", s.handleHealthz) // unauthenticated liveness

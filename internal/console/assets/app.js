@@ -2414,6 +2414,11 @@ function updateSrvNote() {
 // the endpoint's only accepted credential — and the token VALUE is never
 // rendered anywhere in this view.
 
+// mcpMintedOnce holds a just-generated token for exactly one render of the
+// Connect AI view (#1052) — consumed and cleared by renderConnect so a later
+// navigation back to the view can never re-display it.
+let mcpMintedOnce = null;
+
 async function renderConnect() {
   const gen = serverGen;
   viewLoading();
@@ -2422,9 +2427,15 @@ async function renderConnect() {
   // default-server URL instead of blanking the page.
   let servers = [];
   try { servers = (await api("/api/servers")).servers || []; } catch (_) {}
+  // Token status (#1052): presence/provenance only, never a value. null on
+  // failure — the card degrades to a reload hint instead of blanking the page.
+  let tokStatus = null;
+  try { tokStatus = await api("/api/mcp-token"); } catch (_) {}
   if (gen !== serverGen) return;
+  const minted = mcpMintedOnce;
+  mcpMintedOnce = null;
   try {
-    buildConnect(servers);
+    buildConnect(servers, tokStatus, minted);
   } catch (err) {
     const v = VIEW(); clear(v); v.append(pageHead("Connect AI", null)); renderError(v, err);
   }
@@ -2457,19 +2468,89 @@ function copyText(text, what) {
   navigator.clipboard.writeText(text).then(() => toast(what + " copied to clipboard"), () => toast("Copy failed."));
 }
 
-function buildConnect(servers) {
+function buildConnect(servers, tokStatus, minted) {
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
     "Let an AI assistant query this console — the same read-only tools and result caps as this UI. ",
-    el("b", { text: "Your token is never shown here." }));
+    el("b", { text: "A token is only ever shown once, at the moment you generate it." }));
   v.append(pageHead("Connect AI", sub));
 
   const cards = el("div", { class: "cards" });
+  cards.append(mcpTokenCard(tokStatus, minted));
   cards.append(mcpEndpointCard(servers));
   cards.append(bundleCard());
   v.append(cards);
   if (capsCache.mcp) v.append(otherClientsPanel(servers));
   viewEnter();
+}
+
+// mintMCPToken generates (or rotates) the managed token, refreshes the
+// capability gate (the endpoint may have just become usable), and re-renders
+// the view with the plaintext displayed once.
+async function mintMCPToken(rotate) {
+  if (rotate && !window.confirm("Rotate the MCP token? The current value stops working immediately and every connected AI client will need the new one.")) return;
+  try {
+    const res = await api("/api/mcp-token", { method: "POST" });
+    mcpMintedOnce = (res && res.token) || null;
+    await gateCapabilities();
+    renderConnect();
+  } catch (err) {
+    toast("Token generation failed: " + (err.message || err));
+  }
+}
+
+async function revokeMCPToken() {
+  if (!window.confirm("Revoke the managed MCP token? Connected AI clients stop working immediately.")) return;
+  try {
+    await api("/api/mcp-token", { method: "DELETE" });
+    await gateCapabilities();
+    renderConnect();
+    toast("Managed MCP token revoked");
+  } catch (err) {
+    toast("Revoke failed: " + (err.message || err));
+  }
+}
+
+// mcpTokenCard (#1052): generate, rotate, and revoke the managed MCP token
+// without leaving the UI. The token value renders exactly once — right after
+// generation — and is otherwise represented only by its creation date.
+function mcpTokenCard(tok, minted) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Access token" }));
+  if (!tok) {
+    card.append(el("p", { class: "stg-hint", text: "Token status unavailable — reload the page to retry." }));
+    return card;
+  }
+  if (minted) {
+    card.append(el("p", { class: "stg-hint", text: "Token generated. Copy it now — it is not stored and will never be shown again:" }));
+    card.append(el("div", { class: "cn-urlrow" },
+      el("code", { class: "stg-code cn-url", text: minted }),
+      el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(minted, "MCP token") })));
+  }
+  if (tok.managed) {
+    if (!minted) {
+      card.append(el("p", { class: "stg-hint", text:
+        "A managed token is active" + (tok.created_at ? " (created " + tok.created_at + ")" : "") +
+        ". Its value is not stored and cannot be re-displayed — rotate to get a fresh one." }));
+    }
+    if (tok.read_only) {
+      card.append(el("p", { class: "form-hint", text:
+        "The token file was written by a newer bintrail — the token works, but rotate/revoke are unavailable from this build." }));
+    } else {
+      card.append(el("div", { class: "cn-links" },
+        el("button", { class: "btn btn-sm", type: "button", text: "Rotate token", onclick: () => mintMCPToken(true) }),
+        el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Revoke", onclick: revokeMCPToken })));
+    }
+  } else if (!minted) {
+    card.append(el("p", { class: "stg-hint", text:
+      "AI clients authenticate with a token (password login is a browser credential and cannot be used by them). Generate one here — no flags, no environment variables, no restart." }));
+    card.append(el("div", { class: "cn-links" },
+      el("button", { class: "btn btn-sm", type: "button", text: "Generate token", onclick: () => mintMCPToken(false) })));
+  }
+  if (tok.static) {
+    card.append(el("p", { class: "form-hint", text:
+      "A static token from --token / BINTRAIL_CONSOLE_TOKEN is also configured. It keeps working, but it is environment-owned and cannot be managed here." }));
+  }
+  return card;
 }
 
 // mcpEndpointCard: the ready-to-copy URL when the endpoint is usable, or the
@@ -2479,9 +2560,7 @@ function mcpEndpointCard(servers) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "MCP endpoint" }));
   if (!capsCache.mcp) {
     card.append(el("p", { class: "stg-hint", text:
-      "MCP is not available: this console has no access token configured. The MCP endpoint authenticates with the console's static token — password login is a browser credential and cannot be used by an MCP client." }));
-    card.append(el("p", { class: "form-hint", text:
-      "To enable it, start the console with --token (or the BINTRAIL_CONSOLE_TOKEN environment variable; TOKEN in the compose stack) and reload this page." }));
+      "MCP is not available yet: this console has no access token configured. Generate one in the Access token card above and this card becomes a ready-to-copy URL." }));
     return card;
   }
   const url = mcpURL(servers);
@@ -2493,7 +2572,7 @@ function mcpEndpointCard(servers) {
       "This URL targets the server selected in the sidebar; the bare /mcp targets the console's default server. Switch servers to get each one's URL." }));
   }
   card.append(el("p", { class: "form-hint", text:
-    "The credential is the console access token, sent as an Authorization: Bearer header — the same value set with --token / BINTRAIL_CONSOLE_TOKEN. It is never displayed here." }));
+    "The credential is the console access token from the card above (or --token / BINTRAIL_CONSOLE_TOKEN), sent as an Authorization: Bearer header." }));
   return card;
 }
 

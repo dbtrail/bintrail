@@ -150,9 +150,10 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// only by the RBAC profile (which would make synthesis leak redacted data).
 		RecoverCascade: !s.rbacActive(),
 		Auth:           authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
-		// The MCP endpoint accepts only the static token (mcp.go refuses with
-		// 403 when none is configured), so token presence IS the capability.
-		MCP:     s.token != "",
+		// The MCP endpoint accepts the static token or the UI-managed one
+		// (mcp.go refuses with 403 when neither is configured), so token
+		// presence IS the capability.
+		MCP:     s.token != "" || s.managedTok.configured(),
 		Version: s.version,
 		// Default until the bundle resolves: a degraded console renders MySQL
 		// vocabulary (the common case), never a blank source.

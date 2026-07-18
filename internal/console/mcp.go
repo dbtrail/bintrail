@@ -48,17 +48,19 @@ func (s *Server) mcpHandler() http.Handler {
 		nil,
 	)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.token == "" {
-			// Mirror the flashback-port precedent: no static token configured
-			// means MCP clients have no credential that could authenticate
-			// them — refuse with the remediation, never serve open.
+		if s.token == "" && !s.managedTok.configured() {
+			// Mirror the flashback-port precedent: no token configured means
+			// MCP clients have no credential that could authenticate them —
+			// refuse with the remediation, never serve open.
 			writeJSONError(w, http.StatusForbidden,
-				"the MCP endpoint requires a static console token: start with --token / BINTRAIL_CONSOLE_TOKEN "+
+				"the MCP endpoint requires a console token: generate one in Settings → Connect AI, "+
+					"or start with --token / BINTRAIL_CONSOLE_TOKEN "+
 					"(password login is a browser credential and cannot authenticate MCP clients)")
 			return
 		}
 		got := bearerToken(r)
-		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
+		staticOK := got != "" && s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
+		if !staticOK && !s.managedTok.matches(got) {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
 			return
 		}
