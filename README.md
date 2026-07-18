@@ -85,6 +85,13 @@ See [the demo image](docs/demo.md).
 | | [Connect an AI assistant](docs/connect-ai.md) · [MCP server](docs/mcp-server.md) | [Parquet debugging](docs/parquet-debugging.md) |
 | | [Dump & Baseline](docs/dump-and-baseline.md) · [DDL tracking](docs/ddl-tracking.md) | |
 
+## Privacy Policy
+
+bintrail runs entirely in your infrastructure and collects nothing — no
+telemetry, no analytics, no phone-home. The [privacy policy](PRIVACY.md)
+covers the Claude Desktop extension (`.mcpb`) and how data moves when an AI
+client queries your deployment.
+
 ## License
 
 [Apache-2.0](LICENSE) — free for any use, including commercial and production.

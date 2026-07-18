@@ -15,6 +15,7 @@
   },
   "homepage": "https://github.com/dbtrail/dbtrail",
   "license": "Apache-2.0",
+  "privacy_policies": ["https://github.com/dbtrail/dbtrail/blob/main/PRIVACY.md"],
   "keywords": ["mysql", "postgresql", "binlog", "recovery", "time-travel", "database"],
   "server": {
     "type": "binary",
