@@ -228,18 +228,23 @@ func New(cfg Config) (*Server, error) {
 	}
 	passwordCfg := authFile != nil
 
-	// Managed MCP token (#1052): loaded like the auth file — missing is the
-	// normal not-configured state, corrupt fails loud. It is an ADDITIONAL
-	// automation credential; it deliberately plays no part in the bind/setup
-	// policy below (it can only ever have been minted by an already-
-	// authenticated operator, and first-run setup semantics stay unchanged).
+	// Managed MCP token (#1052): an /mcp-ONLY credential minted from the UI.
+	// Missing file = the normal not-configured state; an unreadable file is
+	// logged loudly but never blocks startup — this daemon may be the stream
+	// supervisor, and capture must not die over a UI-convenience credential
+	// (regenerating from Settings → Connect AI overwrites the bad file). It
+	// deliberately plays no part in the bind/setup policy below and is NOT
+	// accepted by tokenMiddleware: its advertised scope is the read-only MCP
+	// tools, so it must not unlock the browser API (registry CRUD, monitor
+	// verbs, its own rotation).
 	mcpTokenPath := cfg.MCPTokenPath
 	if mcpTokenPath == "" {
 		mcpTokenPath = DefaultMCPTokenPath()
 	}
 	mcpTokFile, err := LoadMCPTokenFile(mcpTokenPath)
 	if err != nil {
-		return nil, err
+		slog.Error("console: MCP token file unreadable; managed MCP token disabled until regenerated from Settings → Connect AI", "path", mcpTokenPath, "error", err)
+		mcpTokFile = nil
 	}
 
 	// Bind/credential policy. Password login is the primary path; the static
@@ -331,7 +336,7 @@ func New(cfg Config) (*Server, error) {
 		tlsConf:          tlsConf,
 		mcpTokenPath:     mcpTokenPath,
 	}
-	s.managedTok.set(mcpTokFile)
+	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot
 
 	// Seed the ephemeral boot bundle when the caller supplied a command-line

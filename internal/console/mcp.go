@@ -21,11 +21,15 @@ import (
 // in the URL path — mirroring how the flashback port routes by connection
 // username — instead of the X-Bintrail-Server header the browser API uses.
 //
-// Auth: the static console token as a Bearer credential, compared in constant
-// time. Like the flashback port, the endpoint requires a token to be
-// CONFIGURED — login sessions are a browser credential and the bcrypt
-// password store cannot authenticate a headless MCP client — so under
-// password-only or no auth the endpoint refuses with an actionable error.
+// Auth: a console token as a Bearer credential, compared in constant time —
+// either the static --token / BINTRAIL_CONSOLE_TOKEN or the UI-managed MCP
+// token (#1052). The managed token authenticates HERE ONLY: its advertised
+// scope is the read-only MCP tools, so tokenMiddleware does not accept it and
+// it cannot drive the browser API. Like the flashback port, the endpoint
+// requires a token to be CONFIGURED — login sessions are a browser credential
+// and the bcrypt password store cannot authenticate a headless MCP client —
+// so under password-only or no auth the endpoint refuses with an actionable
+// error.
 // The host-header allowlist and security headers apply like every route
 // (the handler is mounted on the guarded root mux).
 //

@@ -69,16 +69,18 @@ func TestMCPTokenFile_GenerateLoadRotateRevoke(t *testing.T) {
 	}
 }
 
+// TestMCPTokenFile_NewerVersionReadOnly pins the forward-compat contract: a
+// newer file loads read-only WITHOUT payload validation (a v2 digest this
+// binary can't read must degrade, not error), and every write path refuses.
 func TestMCPTokenFile_NewerVersionReadOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "mcp-token.yaml")
-	sum := sha256.Sum256([]byte("bmt_future"))
-	content := "version: 99\ntoken_sha256: " + hex.EncodeToString(sum[:]) + "\ncreated_at: 2030-01-01T00:00:00Z\nfuture_field: kept\n"
+	content := "version: 99\ntoken_sha256: some-future-format\ncreated_at: 2030-01-01T00:00:00Z\nfuture_field: kept\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f, err := LoadMCPTokenFile(path)
 	if err != nil || !f.ReadOnly() {
-		t.Fatalf("newer-version file: f=%+v err=%v, want read-only", f, err)
+		t.Fatalf("newer-version file: f=%+v err=%v, want read-only load with no error", f, err)
 	}
 	if _, _, err := GenerateMCPToken(path); !errors.Is(err, ErrMCPTokenFileReadOnly) {
 		t.Errorf("generate on newer-version file: %v, want ErrMCPTokenFileReadOnly", err)
@@ -94,7 +96,14 @@ func TestMCPTokenFile_MalformedShaFailsLoud(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := LoadMCPTokenFile(path); err == nil {
-		t.Fatal("malformed token_sha256 must fail loud, got nil error")
+		t.Fatal("malformed v1 token_sha256 must fail loud, got nil error")
+	}
+	// The documented self-heal: Generate replaces the corrupt file.
+	if _, _, err := GenerateMCPToken(path); err != nil {
+		t.Fatalf("generate over corrupt v1 file must self-heal, got %v", err)
+	}
+	if _, err := LoadMCPTokenFile(path); err != nil {
+		t.Fatalf("file after self-heal still unreadable: %v", err)
 	}
 }
 
@@ -120,6 +129,7 @@ func newManagedServer(t *testing.T, staticToken string) *Server {
 		sessions:     newSessionStore(),
 		loginLimiter: newLoginLimiter(),
 	}
+	s.managedTok.initFromDisk(s.mcpTokenPath, nil)
 	s.cm.boot = &bundle{db: db, engine: query.New(db), noArchive: true}
 	s.mux = s.buildHandler()
 	return s
@@ -138,8 +148,7 @@ func doJSON(t *testing.T, s *Server, method, path, bearer string) *httptest.Resp
 
 // TestManagedToken_APILifecycle drives generate → authenticate → rotate →
 // revoke through the HTTP surface, asserting the minted value works
-// immediately (no restart) on both /api and /mcp, and stops working after
-// rotate/revoke.
+// immediately (no restart) on /mcp and stops working after rotate/revoke.
 func TestManagedToken_APILifecycle(t *testing.T) {
 	s := newManagedServer(t, "static-tok")
 
@@ -161,15 +170,12 @@ func TestManagedToken_APILifecycle(t *testing.T) {
 		t.Fatalf("generate response %q: %v", rec.Body.String(), err)
 	}
 
-	// The managed token authenticates the API and /mcp immediately.
-	if rec := doJSON(t, s, "GET", "/api/mcp-token", minted.Token); rec.Code != 200 {
-		t.Fatalf("managed token on /api = %d", rec.Code)
-	}
+	// The managed token authenticates /mcp immediately.
 	if rec := doMCP(t, s, "/mcp", minted.Token); rec.Code != 200 {
 		t.Fatalf("managed token on /mcp = %d: %s", rec.Code, rec.Body.String())
 	}
-	// Capabilities reflect it.
-	if rec := doJSON(t, s, "GET", "/api/capabilities", minted.Token); !strings.Contains(rec.Body.String(), `"mcp":true`) {
+	// Capabilities (via the static token) reflect it.
+	if rec := doJSON(t, s, "GET", "/api/capabilities", "static-tok"); !strings.Contains(rec.Body.String(), `"mcp":true`) {
 		t.Fatalf("capabilities.mcp should be true: %s", rec.Body.String())
 	}
 
@@ -178,8 +184,8 @@ func TestManagedToken_APILifecycle(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("rotate = %d", rec.Code)
 	}
-	if rec := doJSON(t, s, "GET", "/api/mcp-token", minted.Token); rec.Code != 401 {
-		t.Fatalf("pre-rotation token still accepted: %d", rec.Code)
+	if rec := doMCP(t, s, "/mcp", minted.Token); rec.Code != 401 {
+		t.Fatalf("pre-rotation token still accepted on /mcp: %d", rec.Code)
 	}
 
 	// Revoke drops the managed credential; the static one is untouched.
@@ -188,6 +194,39 @@ func TestManagedToken_APILifecycle(t *testing.T) {
 	}
 	if rec := doJSON(t, s, "GET", "/api/mcp-token", "static-tok"); !strings.Contains(rec.Body.String(), `"managed":false`) {
 		t.Fatalf("post-revoke status: %s", rec.Body.String())
+	}
+}
+
+// TestManagedToken_ScopedToMCPOnly pins the credential boundary: the managed
+// token is an /mcp-only credential — the browser/API surface (including the
+// password-change route and the token-management routes themselves) must
+// reject it, because its advertised scope is the read-only MCP tools.
+func TestManagedToken_ScopedToMCPOnly(t *testing.T) {
+	s := newManagedServer(t, "static-tok")
+	rec := doJSON(t, s, "POST", "/api/mcp-token", "static-tok")
+	if rec.Code != 200 {
+		t.Fatalf("generate = %d", rec.Code)
+	}
+	var minted struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &minted); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, probe := range []struct{ method, path string }{
+		{"GET", "/api/mcp-token"},
+		{"POST", "/api/mcp-token"},
+		{"GET", "/api/capabilities"},
+		{"GET", "/api/servers"},
+		{"POST", "/api/auth/password"},
+	} {
+		if rec := doJSON(t, s, probe.method, probe.path, minted.Token); rec.Code != 401 {
+			t.Errorf("managed token on %s %s = %d, want 401 (scope leak)", probe.method, probe.path, rec.Code)
+		}
+	}
+	if rec := doMCP(t, s, "/mcp", minted.Token); rec.Code != 200 {
+		t.Errorf("managed token on /mcp = %d, want 200", rec.Code)
 	}
 }
 
@@ -208,7 +247,7 @@ func TestManagedToken_MCPWithoutStaticToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.managedTok.set(f)
+	s.managedTok.reload(f)
 
 	if rec := doMCP(t, s, "/mcp", token); rec.Code != 200 {
 		t.Fatalf("managed-only /mcp = %d: %s", rec.Code, rec.Body.String())
@@ -218,38 +257,37 @@ func TestManagedToken_MCPWithoutStaticToken(t *testing.T) {
 	}
 }
 
-// TestManagedToken_CannotClaimFirstPassword pins the bootstrap-trust-root
-// invariant: only the STATIC token may set the first password; the managed
-// token (authKindManaged) is refused.
-func TestManagedToken_CannotClaimFirstPassword(t *testing.T) {
-	s := newManagedServer(t, "static-tok")
-	s.authPath = filepath.Join(t.TempDir(), "auth.yaml") // no password set
-
-	_, f, err := GenerateMCPToken(s.mcpTokenPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.managedTok.set(f)
-	token := regenerateManagedPlaintext(t, s)
-
-	req := httptest.NewRequest("POST", "http://127.0.0.1:8090/api/auth/password", strings.NewReader(`{"new_password":"hunter22aa"}`))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	s.mux.ServeHTTP(rec, req)
-	if rec.Code != 403 {
-		t.Fatalf("managed token claiming first password = %d, want 403; body: %s", rec.Code, rec.Body.String())
-	}
-}
-
-// regenerateManagedPlaintext rotates the managed token and returns the fresh
-// plaintext, keeping the server's in-memory credential in sync.
-func regenerateManagedPlaintext(t *testing.T, s *Server) string {
-	t.Helper()
+// TestManagedToken_CrossProcessRevokeAndRotate pins the staleness discipline:
+// a rotate or revoke performed by ANOTHER process (simulated by mutating the
+// file directly) takes effect on this server's /mcp gate without a restart.
+func TestManagedToken_CrossProcessRevokeAndRotate(t *testing.T) {
+	s := newManagedServer(t, "")
 	token, f, err := GenerateMCPToken(s.mcpTokenPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.managedTok.set(f)
-	return token
+	s.managedTok.reload(f)
+	if rec := doMCP(t, s, "/mcp", token); rec.Code != 200 {
+		t.Fatalf("sanity: managed token = %d", rec.Code)
+	}
+
+	// Another process rotates: the file changes on disk.
+	token2, _, err := GenerateMCPToken(s.mcpTokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := doMCP(t, s, "/mcp", token2); rec.Code != 200 {
+		t.Fatalf("token rotated on disk not picked up: %d", rec.Code)
+	}
+	if rec := doMCP(t, s, "/mcp", token); rec.Code != 401 {
+		t.Fatalf("stale pre-rotation token still accepted: %d", rec.Code)
+	}
+
+	// Another process revokes: the file disappears.
+	if err := os.Remove(s.mcpTokenPath); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doMCP(t, s, "/mcp", token2); rec.Code == 200 {
+		t.Fatal("revoked-on-disk token still accepted")
+	}
 }

@@ -24,22 +24,24 @@ database — recovery SQL is text you review and run yourself.
 
 The AI connects to your **web console**, which serves an MCP endpoint at
 `/mcp`. If you already run `bintrail-console` (standalone `serve`, `watch`, or
-the Docker stack), you're nearly done — just make sure it has an **access
-token** configured:
+the Docker stack), you're nearly done — the AI client just needs an **access
+token**, and you mint one without leaving the browser:
 
-```sh
-# standalone
-bintrail-console serve --index-dsn '<your index DSN>' --token 'pick-something-long'
+Open **Settings → Connect AI** in the sidebar. If no token is configured yet,
+the **Access token** card has a **Generate token** button — click it, copy the
+value it shows (it appears exactly once and is never stored), and you're done.
+No flags, no environment variables, no restart. The same card rotates or
+revokes the token later. The generated token is scoped to the MCP tools only —
+it cannot administer the console.
 
-# or via environment (works for watch and the compose stack too)
-export BINTRAIL_CONSOLE_TOKEN='pick-something-long'
-```
+Password login (the browser kind) does **not** work for MCP clients — the
+token is their credential.
 
-The token is the AI client's credential. Password login (the browser kind)
-does **not** work for MCP clients — if your console is password-only, add a
-token. The console tells you about this too: open **Settings → Connect AI** in
-the sidebar and it either shows you everything ready to copy, or explains
-what's missing.
+> **Prefer configuration-managed credentials?** A static token via `--token`
+> or the `BINTRAIL_CONSOLE_TOKEN` environment variable (set where the console
+> process starts, then restart it) also works, and is reported on the Connect
+> AI page as environment-owned.
+
 
 > **No console yet?** The [quickstart](quickstart.md) gets a full stack up in a
 > few minutes. Come back to this page after.
@@ -129,7 +131,7 @@ directly with a DSN — see [mcp-server.md](mcp-server.md).
 | Symptom | Likely cause, in order of likelihood |
 |---|---|
 | **401 unauthorized** | Wrong token; or you're not talking to the console you think you are — a port-forward pointing at a stale process, another console on the same port. Check with `curl -H "Authorization: Bearer $TOKEN" http://host:8090/api/capabilities` — it should return JSON with `"mcp": true`. |
-| **403 "no token configured"** | The console runs without `--token` / `BINTRAIL_CONSOLE_TOKEN`. Add one and restart (step 0). |
+| **403 "no token configured"** | No token exists yet. Open **Settings → Connect AI** and click **Generate token** (step 0) — no restart needed. (Or set `--token` / `BINTRAIL_CONSOLE_TOKEN` and restart.) |
 | **Connection refused / timeout** | The URL isn't reachable from the AI client's machine. `curl http://host:8090/api/healthz` from that machine; if you tunnel, remember tunnels can idle out — re-establish and retry. |
 | **Bundle download 404s** | That release predates the bundles. Take the latest release, or build with `make mcpb`. |
 | **Tools don't appear in Claude Desktop** | Check Desktop's MCP logs (Settings → Extensions): the bridge exits with a one-line reason — bad URL and rejected token are spelled out, it never hangs silently. |

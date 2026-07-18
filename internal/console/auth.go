@@ -47,11 +47,6 @@ const (
 	authKindNone authKind = iota
 	authKindToken
 	authKindSession
-	// authKindManaged is the UI-generated MCP token (#1052). Deliberately a
-	// DISTINCT kind from the static token: the first-password-set branch
-	// accepts only authKindToken (the bootstrap trust root), and a managed
-	// token must not inherit that claim.
-	authKindManaged
 )
 
 type authKindCtxKey struct{}
@@ -89,14 +84,6 @@ func (s *Server) tokenMiddleware(next http.Handler) http.Handler {
 		}
 		if s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1 {
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authKindCtxKey{}, authKindToken)))
-			return
-		}
-		// The managed MCP token (#1052) is a first-class automation
-		// credential on the whole API, not just /mcp — matches() is a
-		// constant-time compare of SHA-256 digests and is safely false when
-		// no managed token is configured.
-		if s.managedTok.matches(got) {
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authKindCtxKey{}, authKindManaged)))
 			return
 		}
 		if s.sessions.Validate(got) {

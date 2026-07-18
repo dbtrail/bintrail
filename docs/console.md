@@ -181,7 +181,10 @@ Security notes specific to the registry:
   registry index that predates the `connection_id` column returns an
   actionable `422` (run a writer command against it once) instead of being
   silently ALTERed.
-- The registry file is the only thing the console ever writes. Its write
+- The registry file, the [auth file](#password-login) (written by
+  set-password), and the [managed MCP token file](#mcp-endpoint)
+  (`~/.config/bintrail/console-mcp-token.yaml`, SHA-256 only) are the only
+  things the console ever writes. Their write
   endpoints sit behind the same bearer token and Host-header guard as
   everything else.
 
@@ -664,10 +667,19 @@ Bearer credential:
 
 Rules that differ from the standalone `bintrail-mcp` server:
 
-- **A static token is required.** Like the time-travel port, `/mcp` needs
-  `--token` / `BINTRAIL_CONSOLE_TOKEN`: password login is a browser credential
-  and cannot authenticate a headless MCP client. Without a configured token
-  the endpoint refuses every request with an actionable error.
+- **A token is required.** Password login is a browser credential and cannot
+  authenticate a headless MCP client, so `/mcp` needs either the static
+  `--token` / `BINTRAIL_CONSOLE_TOKEN` **or a managed MCP token generated
+  from Settings → Connect AI** (#1052) — one click from an authenticated
+  browser session, no flags, no restart. The managed token is persisted as a
+  SHA-256 hash only (`~/.config/bintrail/console-mcp-token.yaml`, `0600`,
+  atomic write, versioned envelope with the registry's read-only-if-newer
+  contract), its plaintext is shown exactly once at generation, and it is
+  **scoped to `/mcp` alone** — it cannot drive the browser API (registry
+  CRUD, monitor verbs, or its own rotation). Rotate/revoke from the same
+  card apply immediately, including to sibling console processes sharing the
+  file. Without any configured token the endpoint refuses every request with
+  an actionable error.
 - **`index_dsn` and `profile` tool parameters are rejected.** Connections are
   managed in the console (registry + path routing), and the RBAC posture is
   fixed by the console process — an authenticated MCP client cannot point the
@@ -683,10 +695,11 @@ route.
 The UI's **Settings → Connect AI** page assembles all of this for you: the
 ready-to-copy `/mcp` URL for the selected server (the per-server form when
 more than one server is registered), the `.mcpb` bundle download for the
-running version, and the raw-config fallback above. When no token is
-configured it explains how to set one instead — the token value itself is
-never displayed. For the start-to-finish walkthrough (bundle install included),
-see [Connect an AI assistant](connect-ai.md).
+running version, and the raw-config fallback above. Its **Access token** card
+generates, rotates, and revokes the managed MCP token; the plaintext is
+displayed exactly once, at generation, and never stored. For the
+start-to-finish walkthrough (bundle install included), see
+[Connect an AI assistant](connect-ai.md).
 
 ## API
 

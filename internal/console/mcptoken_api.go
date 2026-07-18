@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 )
 
 // mcpTokenStatusDTO is the wire view of the MCP-token configuration. Values
@@ -37,15 +38,24 @@ func (s *Server) handleMCPTokenGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.mcpTokenStatus())
 }
 
+// mcpTokenMutateMu serializes the persist+swap pair in the generate and
+// revoke handlers, so the in-memory credential can never disagree with the
+// file under concurrent requests (persist A / persist B / swap B / swap A
+// would otherwise leave memory=A while disk=B until the next stat refresh).
+var mcpTokenMutateMu sync.Mutex
+
 // handleMCPTokenGenerate mints (or rotates) the managed MCP token: persists
 // its SHA-256 to the token file and swaps the in-memory credential so the new
 // value authenticates immediately, no restart. The response is the ONE place
 // the plaintext ever appears — it is not stored and cannot be re-displayed.
 //
 // Any authenticated caller may generate/rotate: reaching this handler already
-// required the static token, the managed token, or a login session, and the
-// minted credential grants the same read-only class — no escalation.
+// required the static token or a login session (the managed token itself is
+// /mcp-only and cannot reach this route), and the minted credential grants
+// strictly less — the read-only MCP tools — so there is no escalation.
 func (s *Server) handleMCPTokenGenerate(w http.ResponseWriter, r *http.Request) {
+	mcpTokenMutateMu.Lock()
+	defer mcpTokenMutateMu.Unlock()
 	token, f, err := GenerateMCPToken(s.mcpTokenPath)
 	if err != nil {
 		if errors.Is(err, ErrMCPTokenFileReadOnly) {
@@ -55,7 +65,7 @@ func (s *Server) handleMCPTokenGenerate(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.managedTok.set(f)
+	s.managedTok.reload(f)
 	slog.Info("console: managed MCP token generated", "path", s.mcpTokenPath)
 	writeJSON(w, http.StatusOK, struct {
 		Token     string `json:"token"`
@@ -66,6 +76,8 @@ func (s *Server) handleMCPTokenGenerate(w http.ResponseWriter, r *http.Request) 
 // handleMCPTokenRevoke deletes the managed token (file and in-memory). The
 // static environment token, if any, is untouched — it is not ours to revoke.
 func (s *Server) handleMCPTokenRevoke(w http.ResponseWriter, r *http.Request) {
+	mcpTokenMutateMu.Lock()
+	defer mcpTokenMutateMu.Unlock()
 	if err := RevokeMCPToken(s.mcpTokenPath); err != nil {
 		if errors.Is(err, ErrMCPTokenFileReadOnly) {
 			writeJSONError(w, http.StatusConflict, err.Error())
@@ -74,7 +86,7 @@ func (s *Server) handleMCPTokenRevoke(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.managedTok.set(nil)
+	s.managedTok.reload(nil)
 	slog.Info("console: managed MCP token revoked", "path", s.mcpTokenPath)
 	writeJSON(w, http.StatusOK, s.mcpTokenStatus())
 }

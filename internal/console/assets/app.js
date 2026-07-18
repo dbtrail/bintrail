@@ -2421,6 +2421,11 @@ let mcpMintedOnce = null;
 
 async function renderConnect() {
   const gen = serverGen;
+  // Consume the one-time plaintext FIRST — before any await or early return —
+  // so a server-switch mid-load can never leave it parked in the module
+  // global to be re-displayed (stale) on a later visit.
+  const minted = mcpMintedOnce;
+  mcpMintedOnce = null;
   viewLoading();
   // The server list only picks between /mcp and /mcp/{id-or-name}; a failure
   // (or the registry-only 404 on an empty console) degrades to the bare
@@ -2432,8 +2437,6 @@ async function renderConnect() {
   let tokStatus = null;
   try { tokStatus = await api("/api/mcp-token"); } catch (_) {}
   if (gen !== serverGen) return;
-  const minted = mcpMintedOnce;
-  mcpMintedOnce = null;
   try {
     buildConnect(servers, tokStatus, minted);
   } catch (err) {
@@ -2516,15 +2519,18 @@ async function revokeMCPToken() {
 // generation — and is otherwise represented only by its creation date.
 function mcpTokenCard(tok, minted) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Access token" }));
-  if (!tok) {
-    card.append(el("p", { class: "stg-hint", text: "Token status unavailable — reload the page to retry." }));
-    return card;
-  }
+  // The one-time plaintext renders UNCONDITIONALLY — a failed status fetch
+  // must never swallow a token that was just minted (after a rotate, it is
+  // the only valid credential and cannot be re-displayed).
   if (minted) {
     card.append(el("p", { class: "stg-hint", text: "Token generated. Copy it now — it is not stored and will never be shown again:" }));
     card.append(el("div", { class: "cn-urlrow" },
       el("code", { class: "stg-code cn-url", text: minted }),
       el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(minted, "MCP token") })));
+  }
+  if (!tok) {
+    card.append(el("p", { class: "stg-hint", text: "Token status unavailable — reload the page to retry." }));
+    return card;
   }
   if (tok.managed) {
     if (!minted) {
@@ -2542,7 +2548,7 @@ function mcpTokenCard(tok, minted) {
     }
   } else if (!minted) {
     card.append(el("p", { class: "stg-hint", text:
-      "AI clients authenticate with a token (password login is a browser credential and cannot be used by them). Generate one here — no flags, no environment variables, no restart." }));
+      "AI clients authenticate with a token (password login is a browser credential and cannot be used by them). Generate one here — no flags, no environment variables, no restart. The token only grants the read-only MCP tools; it cannot manage this console." }));
     card.append(el("div", { class: "cn-links" },
       el("button", { class: "btn btn-sm", type: "button", text: "Generate token", onclick: () => mintMCPToken(false) })));
   }
