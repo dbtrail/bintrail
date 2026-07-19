@@ -170,9 +170,19 @@ func TestManagedToken_APILifecycle(t *testing.T) {
 		t.Fatalf("generate response %q: %v", rec.Body.String(), err)
 	}
 
-	// The managed token authenticates /mcp immediately.
+	// The managed token authenticates /mcp immediately — and the STATIC token
+	// keeps working alongside it (generating must never lock out existing
+	// static-token MCP clients).
 	if rec := doMCP(t, s, "/mcp", minted.Token); rec.Code != 200 {
 		t.Fatalf("managed token on /mcp = %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec := doMCP(t, s, "/mcp", "static-tok"); rec.Code != 200 {
+		t.Fatalf("static token on /mcp with managed configured = %d", rec.Code)
+	}
+	// Status now reports the managed credential (the fields the UI card renders).
+	rec = doJSON(t, s, "GET", "/api/mcp-token", "static-tok")
+	if !strings.Contains(rec.Body.String(), `"managed":true`) || !strings.Contains(rec.Body.String(), `"created_at":"`) {
+		t.Fatalf("configured status: %s", rec.Body.String())
 	}
 	// Capabilities (via the static token) reflect it.
 	if rec := doJSON(t, s, "GET", "/api/capabilities", "static-tok"); !strings.Contains(rec.Body.String(), `"mcp":true`) {
@@ -184,6 +194,12 @@ func TestManagedToken_APILifecycle(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("rotate = %d", rec.Code)
 	}
+	var rotated struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &rotated); err != nil {
+		t.Fatal(err)
+	}
 	if rec := doMCP(t, s, "/mcp", minted.Token); rec.Code != 401 {
 		t.Fatalf("pre-rotation token still accepted on /mcp: %d", rec.Code)
 	}
@@ -194,6 +210,89 @@ func TestManagedToken_APILifecycle(t *testing.T) {
 	}
 	if rec := doJSON(t, s, "GET", "/api/mcp-token", "static-tok"); !strings.Contains(rec.Body.String(), `"managed":false`) {
 		t.Fatalf("post-revoke status: %s", rec.Body.String())
+	}
+	if rec := doMCP(t, s, "/mcp", rotated.Token); rec.Code != 401 {
+		t.Fatalf("revoked token still accepted on /mcp: %d", rec.Code)
+	}
+	if rec := doMCP(t, s, "/mcp", "static-tok"); rec.Code != 200 {
+		t.Fatalf("static token on /mcp after revoke = %d", rec.Code)
+	}
+}
+
+// TestManagedToken_CapabilitiesManagedOnly pins the zero-config headline:
+// with NO static token, capabilities.mcp flips false→true when a managed
+// token is generated (a regression to static-only would hide the Connect AI
+// ready state for exactly the users the feature exists for).
+func TestManagedToken_CapabilitiesManagedOnly(t *testing.T) {
+	s := newManagedServer(t, "")
+	caps := func() capabilitiesResponse {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.handleCapabilities(rec, httptest.NewRequest("GET", "/api/capabilities", nil))
+		if rec.Code != 200 {
+			t.Fatalf("capabilities = %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp capabilitiesResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	if caps().MCP {
+		t.Fatal("capabilities.mcp true with no token configured")
+	}
+	_, f, err := GenerateMCPToken(s.mcpTokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.managedTok.reload(f)
+	if !caps().MCP {
+		t.Fatal("capabilities.mcp false with a managed token configured")
+	}
+}
+
+// TestManagedToken_ReadOnlyFileOverHTTP pins the newer-version surface end to
+// end: status reports read_only (and not managed — the digest is unreadable),
+// and generate/rotate/revoke map ErrMCPTokenFileReadOnly to 409.
+func TestManagedToken_ReadOnlyFileOverHTTP(t *testing.T) {
+	s := newManagedServer(t, "static-tok")
+	content := "version: 99\ntoken_sha256: future-format\ncreated_at: 2030-01-01T00:00:00Z\n"
+	if err := os.WriteFile(s.mcpTokenPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := doJSON(t, s, "GET", "/api/mcp-token", "static-tok")
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"read_only":true`) || !strings.Contains(rec.Body.String(), `"managed":false`) {
+		t.Fatalf("read-only status = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doJSON(t, s, "POST", "/api/mcp-token", "static-tok"); rec.Code != 409 {
+		t.Fatalf("generate on read-only file = %d, want 409", rec.Code)
+	}
+	if rec := doJSON(t, s, "DELETE", "/api/mcp-token", "static-tok"); rec.Code != 409 {
+		t.Fatalf("revoke on read-only file = %d, want 409", rec.Code)
+	}
+}
+
+// TestManagedToken_CorruptFileNeverBlocksStartup pins the degrade contract:
+// New() must survive a junk token file (this daemon may be the stream
+// supervisor — capture must not die over a UI-convenience credential), with
+// the managed token simply absent.
+func TestManagedToken_CorruptFileNeverBlocksStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mcp-token.yaml")
+	if err := os.WriteFile(path, []byte(":\tnot yaml at all"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		Listen:       "127.0.0.1:8090",
+		Token:        "t",
+		AuthPath:     filepath.Join(t.TempDir(), "auth.yaml"),
+		MCPTokenPath: path,
+	})
+	if err != nil {
+		t.Fatalf("New with corrupt MCP token file must degrade, got: %v", err)
+	}
+	rec := doJSON(t, srv, "GET", "/api/mcp-token", "t")
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"managed":false`) {
+		t.Fatalf("degraded status = %d %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -254,6 +353,9 @@ func TestManagedToken_MCPWithoutStaticToken(t *testing.T) {
 	}
 	if rec := doMCP(t, s, "/mcp", "wrong"); rec.Code != 401 {
 		t.Fatalf("wrong token = %d, want 401", rec.Code)
+	}
+	if rec := doMCP(t, s, "/mcp", ""); rec.Code != 401 {
+		t.Fatalf("empty bearer = %d, want 401", rec.Code)
 	}
 }
 

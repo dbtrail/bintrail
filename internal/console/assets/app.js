@@ -2406,13 +2406,14 @@ function updateSrvNote() {
   if (n) n.hidden = !(serversEmpty && capsCache.monitor);
 }
 
-// ── Connect AI client (#1041) ────────────────────────────────────────────────
+// ── Connect AI client (#1041, managed token #1052) ───────────────────────────
 //
 // Settings view for wiring an MCP client (Claude Desktop, claude.ai custom
 // connectors, any Streamable-HTTP client) to this console's /mcp endpoint.
-// Availability comes from capabilities.mcp — a static token is configured,
-// the endpoint's only accepted credential — and the token VALUE is never
-// rendered anywhere in this view.
+// Availability comes from capabilities.mcp — a static or UI-managed token is
+// configured. Token VALUES are never rendered here, with one deliberate
+// exception: the just-minted plaintext (mcpMintedOnce), displayed exactly
+// once right after generation and never re-displayable.
 
 // mcpMintedOnce holds a just-generated token for exactly one render of the
 // Connect AI view (#1052) — consumed and cleared by renderConnect so a later
@@ -2436,10 +2437,16 @@ async function renderConnect() {
   // failure — the card degrades to a reload hint instead of blanking the page.
   let tokStatus = null;
   try { tokStatus = await api("/api/mcp-token"); } catch (_) {}
-  if (gen !== serverGen) return;
+  if (gen !== serverGen) {
+    // The consumed plaintext cannot be re-shown; say so instead of losing it
+    // silently (the user must rotate to get a usable value).
+    if (minted) toast("Token display interrupted — rotate to get a fresh value");
+    return;
+  }
   try {
     buildConnect(servers, tokStatus, minted);
   } catch (err) {
+    if (minted) toast("Token display interrupted — rotate to get a fresh value");
     const v = VIEW(); clear(v); v.append(pageHead("Connect AI", null)); renderError(v, err);
   }
 }
@@ -2492,26 +2499,32 @@ function buildConnect(servers, tokStatus, minted) {
 // the view with the plaintext displayed once.
 async function mintMCPToken(rotate) {
   if (rotate && !window.confirm("Rotate the MCP token? The current value stops working immediately and every connected AI client will need the new one.")) return;
+  // Only the mutation itself may report failure — once the POST succeeded the
+  // token EXISTS (and on rotate the old one is already dead), so a failing
+  // follow-up refresh must never toast "generation failed".
+  let res;
   try {
-    const res = await api("/api/mcp-token", { method: "POST" });
-    mcpMintedOnce = (res && res.token) || null;
-    await gateCapabilities();
-    renderConnect();
+    res = await api("/api/mcp-token", { method: "POST" });
   } catch (err) {
     toast("Token generation failed: " + (err.message || err));
+    return;
   }
+  mcpMintedOnce = (res && res.token) || null;
+  try { await gateCapabilities(); } catch (_) {} // 401 already raised the sign-in gate
+  renderConnect();
 }
 
 async function revokeMCPToken() {
   if (!window.confirm("Revoke the managed MCP token? Connected AI clients stop working immediately.")) return;
   try {
     await api("/api/mcp-token", { method: "DELETE" });
-    await gateCapabilities();
-    renderConnect();
-    toast("Managed MCP token revoked");
   } catch (err) {
     toast("Revoke failed: " + (err.message || err));
+    return;
   }
+  toast("Managed MCP token revoked");
+  try { await gateCapabilities(); } catch (_) {}
+  renderConnect();
 }
 
 // mcpTokenCard (#1052): generate, rotate, and revoke the managed MCP token

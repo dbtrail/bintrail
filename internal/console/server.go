@@ -109,7 +109,9 @@ type Config struct {
 	// MCPTokenPath locates the managed MCP token file (SHA-256 only, written
 	// by the Settings → Connect AI generate flow — #1052). Empty means
 	// DefaultMCPTokenPath(). A missing file means no managed token; a corrupt
-	// one fails New loudly, like AuthPath.
+	// one is logged loudly and disables the managed token until regenerated —
+	// unlike AuthPath, it deliberately never fails New (the daemon may be the
+	// stream supervisor).
 	MCPTokenPath string
 	// TLSCert / TLSKey serve the console over HTTPS (both-or-neither). Static
 	// files only — rotation is a restart; ACME is out of scope.
@@ -496,9 +498,10 @@ func (s *Server) buildHandler() http.Handler {
 	}
 	root.Handle("/api/", s.tokenMiddleware(api)) // credential on all other /api/*
 	// MCP endpoint (#1039): the four read-only tools over Streamable HTTP,
-	// static-token-authenticated, routed per server by URL path. Carries its
-	// own auth check (token-only — see mcp.go) instead of tokenMiddleware,
-	// and sits on root so it inherits hostGuard + securityHeaders.
+	// token-authenticated (static or UI-managed — #1052), routed per server
+	// by URL path. Carries its own auth check (tokens only, no sessions —
+	// see mcp.go) instead of tokenMiddleware, and sits on root so it
+	// inherits hostGuard + securityHeaders.
 	mcpH := s.mcpHandler()
 	root.Handle("/mcp", mcpH)
 	root.Handle("/mcp/{server}", mcpH)
@@ -510,7 +513,8 @@ func (s *Server) buildHandler() http.Handler {
 // Handler returns the fully assembled HTTP handler. Exposed for tests.
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// Token returns the active access token (supplied or generated). Empty in
+// Token returns the static automation token — never the UI-managed MCP
+// token (the flashback port depends on that distinction). Empty in
 // password-only mode.
 func (s *Server) Token() string { return s.token }
 

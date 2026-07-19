@@ -87,10 +87,11 @@ type capabilitiesResponse struct {
 	// per entry. Generic by construction — the core names no specific view.
 	ExtensionViews []extensionViewDTO `json:"extension_views,omitempty"`
 	Auth           authCapsInfo       `json:"auth"`
-	// MCP: the /mcp endpoint is usable — a static console token is configured
-	// (the endpoint's only accepted credential; see mcp.go). Process-global,
-	// like Monitor. The frontend's "Connect AI client" card keys its
-	// ready-vs-explain state on this instead of ever probing /mcp itself.
+	// MCP: the /mcp endpoint is usable — a static console token or a
+	// UI-managed MCP token is configured (the endpoint's only accepted
+	// credentials; see mcp.go). Process-global, like Monitor. The frontend's
+	// "Connect AI client" card keys its ready-vs-explain state on this
+	// instead of ever probing /mcp itself.
 	MCP bool `json:"mcp"`
 	// Version is the running build's version string ("0.36.0"; "dev" or empty
 	// on unversioned builds). Presentation-only: the Connect AI client card

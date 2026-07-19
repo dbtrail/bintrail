@@ -39,9 +39,10 @@ func (s *Server) handleMCPTokenGet(w http.ResponseWriter, r *http.Request) {
 }
 
 // mcpTokenMutateMu serializes the persist+swap pair in the generate and
-// revoke handlers, so the in-memory credential can never disagree with the
-// file under concurrent requests (persist A / persist B / swap B / swap A
-// would otherwise leave memory=A while disk=B until the next stat refresh).
+// revoke handlers, so a caller's response always describes the final
+// persisted state (persist A / persist B / swap B / swap A would otherwise
+// briefly leave memory=A while disk=B; the per-check re-read heals that on
+// the next request, but the interleaved responses would still lie).
 var mcpTokenMutateMu sync.Mutex
 
 // handleMCPTokenGenerate mints (or rotates) the managed MCP token: persists

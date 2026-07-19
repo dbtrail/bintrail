@@ -31,11 +31,20 @@ const mcpTokenPrefix = "bmt_"
 // written by a newer bintrail (version > mcpTokenFileVersion).
 var ErrMCPTokenFileReadOnly = errors.New("MCP token file was written by a newer bintrail; changes are refused")
 
+// errMCPTokenFileMalformed marks load failures that mean the CONTENT is junk
+// (unparseable YAML, bad digest in a version we own) — the class the
+// generate/revoke self-heal is allowed to replace or remove. Read errors
+// (EACCES, EIO) deliberately do NOT carry this mark: an unreadable file might
+// be a newer binary's perfectly valid credential, and destroying what we
+// could not inspect would bypass the read-only contract.
+var errMCPTokenFileMalformed = errors.New("malformed MCP token file")
+
 // MCPTokenFile is the on-disk managed MCP token: only the SHA-256 of the
 // token is persisted (API-key pattern — the plaintext is shown once at
 // generation and never stored), so a read of the file does not yield a usable
 // credential. The versioned envelope and Extra leave room for additive fields
-// without a format break (authfile.go precedent).
+// without a format break (authfile.go precedent). Construct only via
+// LoadMCPTokenFile / GenerateMCPToken — readOnly is set at load time.
 type MCPTokenFile struct {
 	Version     int    `yaml:"version"`
 	TokenSHA256 string `yaml:"token_sha256"`
@@ -64,10 +73,11 @@ func DefaultMCPTokenPath() string {
 
 // LoadMCPTokenFile reads the managed-token file at path. A missing file
 // returns (nil, nil): no managed token configured. An unparseable file, or a
-// malformed digest in a file THIS version owns, is an error. A NEWER-version
-// file is never an error for its payload: it loads read-only, and a digest
-// this binary can't read simply never authenticates — a newer format must
-// degrade, not brick startup or demand deletion (the readOnly contract).
+// malformed digest in a file THIS version owns, errors with
+// errMCPTokenFileMalformed. A NEWER-version file is never an error for its
+// payload: it loads read-only, and a digest this binary can't read simply
+// never authenticates — a newer format must degrade, not brick startup or
+// demand deletion (the readOnly contract).
 func LoadMCPTokenFile(path string) (*MCPTokenFile, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -78,14 +88,14 @@ func LoadMCPTokenFile(path string) (*MCPTokenFile, error) {
 	}
 	var f MCPTokenFile
 	if err := yaml.Unmarshal(data, &f); err != nil {
-		return nil, fmt.Errorf("parse console MCP token file %s: %w", path, err)
+		return nil, fmt.Errorf("%w: parse %s: %v", errMCPTokenFileMalformed, path, err)
 	}
 	if f.Version > mcpTokenFileVersion {
 		f.readOnly = true
 		return &f, nil
 	}
 	if _, err := f.digest(); err != nil {
-		return nil, fmt.Errorf("console MCP token file %s has a malformed token_sha256; delete it and generate a new token from Settings → Connect AI", path)
+		return nil, fmt.Errorf("%w: %s has a malformed token_sha256 — delete it or generate a new token from Settings → Connect AI", errMCPTokenFileMalformed, path)
 	}
 	return &f, nil
 }
@@ -108,16 +118,20 @@ func (f *MCPTokenFile) digest() ([]byte, error) {
 
 // GenerateMCPToken mints a new managed token, persists its SHA-256 at path
 // (atomic, 0600), and returns the plaintext and the stored record. A
-// pre-existing file is replaced (rotate); a corrupt v1 file is replaced too
-// (the UI's Generate button is the documented self-heal); only a
-// newer-version file refuses, with ErrMCPTokenFileReadOnly.
+// pre-existing file is replaced (rotate); a MALFORMED file is replaced too
+// (the UI's Generate button is the documented self-heal); an unreadable file
+// or a newer-version file refuses — what could not be inspected must not be
+// destroyed.
 func GenerateMCPToken(path string) (string, *MCPTokenFile, error) {
 	mcpTokenFileMu.Lock()
 	defer mcpTokenFileMu.Unlock()
 
 	existing, err := LoadMCPTokenFile(path)
 	if err != nil {
-		slog.Warn("console: replacing unreadable MCP token file", "path", path, "error", err)
+		if !errors.Is(err, errMCPTokenFileMalformed) {
+			return "", nil, err
+		}
+		slog.Warn("console: replacing malformed MCP token file", "path", path, "error", err)
 		existing = nil
 	}
 	if existing.ReadOnly() {
@@ -146,17 +160,23 @@ func GenerateMCPToken(path string) (string, *MCPTokenFile, error) {
 }
 
 // RevokeMCPToken removes the managed-token file. A missing file is a no-op, a
-// corrupt v1 file is removed (revoking junk is still revoking), and a
-// newer-version file refuses with ErrMCPTokenFileReadOnly.
+// MALFORMED file is removed with a warning (revoking junk is still revoking),
+// an unreadable file or a newer-version file refuses — deleting requires only
+// directory permission, so an unreadable file could otherwise be destroyed
+// without ever checking the read-only contract.
 func RevokeMCPToken(path string) error {
 	mcpTokenFileMu.Lock()
 	defer mcpTokenFileMu.Unlock()
 
 	existing, err := LoadMCPTokenFile(path)
-	if err == nil && existing == nil {
+	switch {
+	case err != nil && errors.Is(err, errMCPTokenFileMalformed):
+		slog.Warn("console: revoking malformed MCP token file", "path", path, "error", err)
+	case err != nil:
+		return fmt.Errorf("revoke MCP token: %w", err)
+	case existing == nil:
 		return nil
-	}
-	if existing.ReadOnly() {
+	case existing.ReadOnly():
 		return fmt.Errorf("%s: %w", path, ErrMCPTokenFileReadOnly)
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -203,13 +223,15 @@ func saveMCPTokenFile(path string, f *MCPTokenFile) error {
 	return nil
 }
 
-// managedMCPToken is the server's live view of the managed token. It re-reads
-// the file when its mtime/size changes, so a rotate or revoke performed by
-// ANOTHER console process sharing the same path takes effect here without a
-// restart — a revoke that reports success must actually revoke everywhere
-// (the same staleness discipline as LoadAuthFile-per-login). The stat runs
-// only on /mcp authentication and the Connect AI status endpoint — never on
-// the general /api hot path, which does not accept this credential.
+// managedMCPToken is the server's live view of the managed token. Every check
+// re-reads the ~100-byte file, so a rotate or revoke performed by ANOTHER
+// console process sharing the path takes effect here immediately — a revoke
+// that reports success must actually revoke everywhere, with no
+// mtime-granularity window (the same staleness discipline as
+// LoadAuthFile-per-login). The read runs on /mcp authentication, the Connect
+// AI status endpoint, and the capabilities probe — never on the general /api
+// data path, which does not accept this credential; at that request rate a
+// tiny file read is noise.
 type managedMCPToken struct {
 	mu   sync.Mutex
 	path string
@@ -218,9 +240,9 @@ type managedMCPToken struct {
 	createdAt string
 	readOnly  bool
 
-	statOK bool
-	mtime  time.Time
-	size   int64
+	// loadWarned de-duplicates the unreadable-file warning: once per broken
+	// state, not once per request (re-armed by a successful load).
+	loadWarned bool
 }
 
 // initFromDisk seeds the state at New() time. Load errors degrade to
@@ -230,12 +252,12 @@ func (m *managedMCPToken) initFromDisk(path string, f *MCPTokenFile) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.path = path
-	m.apply(f)
-	m.recordStat()
+	m.applyLocked(f)
 }
 
-// apply projects a loaded file (or nil) into the live fields. Callers hold mu.
-func (m *managedMCPToken) apply(f *MCPTokenFile) {
+// applyLocked projects a loaded file (or nil) into the live fields. Callers
+// hold mu.
+func (m *managedMCPToken) applyLocked(f *MCPTokenFile) {
 	if f == nil {
 		m.digest, m.createdAt, m.readOnly = nil, "", false
 		return
@@ -250,64 +272,46 @@ func (m *managedMCPToken) apply(f *MCPTokenFile) {
 	m.digest, m.createdAt, m.readOnly = d, f.CreatedAt, f.readOnly
 }
 
-// recordStat snapshots the file's identity for change detection. Callers hold mu.
-func (m *managedMCPToken) recordStat() {
-	fi, err := os.Stat(m.path)
-	if err != nil {
-		m.statOK, m.mtime, m.size = false, time.Time{}, 0
-		return
-	}
-	m.statOK, m.mtime, m.size = true, fi.ModTime(), fi.Size()
-}
-
-// refresh re-loads the file if it changed on disk since the last look.
-// Callers hold mu. A file that became unreadable degrades to not-configured
-// (deny) with a warning — never a panic, never a stale accept.
-func (m *managedMCPToken) refresh() {
+// refreshLocked re-reads the file. A file that became unreadable or malformed
+// degrades to not-configured (deny, warned once per broken state) — never a
+// panic, never a stale accept. Callers hold mu.
+func (m *managedMCPToken) refreshLocked() {
 	if m.path == "" {
 		return
 	}
-	fi, err := os.Stat(m.path)
-	switch {
-	case err != nil:
-		if m.statOK || m.digest != nil {
-			// Present before, gone now: revoked (possibly by another process).
-			m.apply(nil)
-		}
-		m.statOK, m.mtime, m.size = false, time.Time{}, 0
-		return
-	case m.statOK && fi.ModTime().Equal(m.mtime) && fi.Size() == m.size:
-		return // unchanged
-	}
 	f, err := LoadMCPTokenFile(m.path)
 	if err != nil {
-		slog.Warn("console: MCP token file became unreadable; managed token disabled until regenerated", "path", m.path, "error", err)
-		f = nil
+		if !m.loadWarned {
+			slog.Warn("console: MCP token file unreadable; managed token disabled until regenerated", "path", m.path, "error", err)
+			m.loadWarned = true
+		}
+		m.applyLocked(nil)
+		return
 	}
-	m.apply(f)
-	m.statOK, m.mtime, m.size = true, fi.ModTime(), fi.Size()
+	m.loadWarned = false
+	m.applyLocked(f)
 }
 
 // reload force-applies freshly persisted state (the generate/revoke handlers
-// call it right after writing, sidestepping mtime granularity).
+// call it right after writing).
 func (m *managedMCPToken) reload(f *MCPTokenFile) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.apply(f)
-	m.recordStat()
+	m.loadWarned = false
+	m.applyLocked(f)
 }
 
 func (m *managedMCPToken) configured() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.refresh()
+	m.refreshLocked()
 	return m.digest != nil
 }
 
 func (m *managedMCPToken) info() (createdAt string, readOnly bool, configured bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.refresh()
+	m.refreshLocked()
 	return m.createdAt, m.readOnly, m.digest != nil
 }
 
@@ -320,7 +324,7 @@ func (m *managedMCPToken) matches(got string) bool {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.refresh()
+	m.refreshLocked()
 	if m.digest == nil {
 		return false
 	}

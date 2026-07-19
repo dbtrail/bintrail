@@ -150,9 +150,9 @@ func TestMCP_hiddenBootStillBacksDefault(t *testing.T) {
 }
 
 // TestMCP_capabilityGatedOnToken: /api/capabilities advertises mcp iff a
-// static token is configured (the endpoint's only accepted credential — the
-// same condition mcpHandler refuses on), plus the running build version the
-// Connect AI card derives release links from.
+// token is configured (static here; the managed-token half of the condition
+// is pinned by TestManagedToken_CapabilitiesManagedOnly), plus the running
+// build version the Connect AI card derives release links from.
 func TestMCP_capabilityGatedOnToken(t *testing.T) {
 	db, _, closer := newSQLMock(t)
 	defer closer()
