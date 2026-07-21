@@ -926,6 +926,9 @@ func readAll(r *http.Request) ([]byte, error) {
 func spooledLines(t *testing.T, spoolDir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(spoolDir)
+	if os.IsNotExist(err) {
+		return nil // never spooled anything: zero events, not a failure
+	}
 	if err != nil {
 		t.Fatalf("read spool dir: %v", err)
 	}

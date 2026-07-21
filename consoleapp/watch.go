@@ -390,6 +390,10 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Usage telemetry for a months-lived process: Init's drain runs once, so
+	// without this loop a daemon's beacons would spool and age out undelivered.
+	go tel.Client().RunDaemon(ctx, cmd.Name())
+
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
 	if upConsoleBaselineTrigger {
@@ -535,6 +539,9 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// See runUpConsoleOnly: the daemon telemetry loop, off the stream path.
+	go tel.Client().RunDaemon(ctx, cmd.Name())
 
 	// The control-plane supervisor: "+ Add server" in the console starts real
 	// monitoring through it. Streams live on the daemon context (ctx), not on

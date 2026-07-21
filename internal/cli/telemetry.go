@@ -76,6 +76,11 @@ func uninstrumented(cmd *cobra.Command) bool {
 		strings.HasPrefix(name, "__") // __complete, __completeNoDesc
 }
 
+// Client exposes the resolved client, for long-running commands that need the
+// daemon loop (telemetry.Client.RunDaemon). Nil when the command is exempt or
+// Start was never called; every Client method tolerates that.
+func (h *TelemetryHook) Client() *telemetry.Client { return h.client }
+
 // Execute runs the command tree and records how it ended.
 //
 // A panic is recorded as an internal error and then re-raised: the panic value

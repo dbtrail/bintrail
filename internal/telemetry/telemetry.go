@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"runtime"
@@ -235,11 +236,75 @@ func (c *Client) drainAsync() {
 			debugf("drain panicked")
 		}
 	}()
+	c.drainOnce()
+}
+
+// drainOnce delivers spooled events synchronously, bounded by drainDeadline.
+// Callers are responsible for being off the hot path already.
+func (c *Client) drainOnce() {
 	ctx, cancel := context.WithTimeout(context.Background(), drainDeadline)
 	defer cancel()
 	drain(c.spoolDir, c.now(), func(body []byte) error {
 		return postNDJSON(ctx, c.http, c.endpoint, body)
 	})
+}
+
+// daemonTick is how often a daemon revisits its beacon and delivers what has
+// accumulated. Beacons are capped at one per UTC day regardless, so this
+// governs delivery latency rather than beacon frequency.
+//
+// A var rather than a const so tests can shorten it; nothing in production
+// writes it.
+var daemonTick = time.Hour
+
+// RunDaemon keeps telemetry alive for a long-running process. Run it in its own
+// goroutine; it returns when ctx is done.
+//
+// Daemons need it because Init's drain runs ONCE, at startup. A process that
+// lives for months would append beacons to a spool that nothing ever delivers,
+// and they would age out after maxSpoolAge — the liveness signal, which is the
+// entire point of a beacon, would silently never work.
+//
+// The first beacon is emitted after a full tick rather than at startup. That is
+// deliberate: the per-day cap is process-local, so a crash-looping daemon that
+// beaconed on start would emit one per restart, bounded only by the spool cap.
+// Waiting an hour means a crash loop never beacons at all, and "alive for at
+// least an hour" is the more honest liveness signal anyway.
+func (c *Client) RunDaemon(ctx context.Context, daemon string) {
+	if !c.Enabled() {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			debugf("daemon telemetry loop panicked")
+		}
+	}()
+
+	c.logDaemonNotice()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(daemonTick):
+		}
+		c.Beacon(daemon)
+		c.drainOnce()
+	}
+}
+
+// logDaemonNotice is a daemon's one disclosure. Daemons are not interactive, so
+// they never see the first-run notice; this is their equivalent.
+//
+// It carries the cloned-image warning because that is the realistic way a
+// daemon ends up reporting without anyone on this host having chosen it: one
+// operator's opt-in baked into an AMI or a container layer becomes a whole
+// fleet's, and the machine it runs on may belong to someone who never saw the
+// prompt.
+func (c *Client) logDaemonNotice() {
+	slog.Info("usage telemetry is on; sending metadata only (command name, version, OS/arch, error class) — never your data, schemas, DSNs or hostnames",
+		"disable", "BINTRAIL_TELEMETRY=off, DO_NOT_TRACK=1, or `bintrail telemetry off`",
+		"cloned_hosts", "an image-baked setting travels with the image; see TELEMETRY.md")
 }
 
 // Enabled reports whether this client will record anything.

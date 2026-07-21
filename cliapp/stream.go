@@ -145,6 +145,12 @@ func runStream(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
+	// Usage telemetry for a process that may live for months: Init's drain runs
+	// once, at startup, so without this loop a daemon's beacons would spool and
+	// age out undelivered. Own goroutine — never on the replication path. Also
+	// covers `up`, which delegates here.
+	go tel.Client().RunDaemon(ctx, cmd.Name())
+
 	// Graceful shutdown on SIGINT/SIGTERM: cancel the context so streamrun.One
 	// flushes its batch and writes a final checkpoint. (Installed before
 	// startup rather than after StartSync as it historically was — a signal

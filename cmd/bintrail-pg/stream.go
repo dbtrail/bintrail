@@ -199,6 +199,11 @@ func runPGStream(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
+	// Usage telemetry for a months-lived process: Init's drain runs once, so
+	// without this loop a daemon's beacons would never be delivered. Own
+	// goroutine — never on the replication path.
+	go tel.Client().RunDaemon(ctx, cmd.Name())
+
 	// Graceful shutdown on SIGINT/SIGTERM: cancel the context so pgstreamrun.One
 	// flushes its batch and writes a final checkpoint before returning.
 	sigCh := make(chan os.Signal, 1)

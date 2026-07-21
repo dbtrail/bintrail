@@ -289,6 +289,10 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
+	// See runStream: a long-lived process needs its own drain, off the
+	// heartbeat and reconnect paths.
+	go tel.Client().RunDaemon(ctx, cmd.Name())
+
 	var flushState *flushPipelineState
 
 	if byosMode {
