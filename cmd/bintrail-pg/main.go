@@ -29,6 +29,10 @@ var (
 	logFormat string
 )
 
+// tel records one usage event per invocation, wired at the root like the core
+// binary's.
+var tel cli.TelemetryHook
+
 // Build-time variables injected via -ldflags. These are the SAME names the core
 // bintrail binary uses (main.Version/CommitSHA/BuildDate), so the Makefile's
 // BINTRAIL_LDFLAGS applies to this binary verbatim — exactly as bintrail-console
@@ -53,6 +57,7 @@ before-image (and de-TOASTed unchanged values) is present in the WAL. See
 'bintrail-pg stream --help'.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		observe.Setup(os.Stderr, logFormat, logLevel)
+		tel.Start(cmd)
 		return nil
 	},
 	SilenceErrors: true, // we handle error output ourselves in main()
@@ -80,7 +85,7 @@ func init() {
 }
 
 func main() {
-	err := rootCmd.Execute()
+	err := tel.Execute(rootCmd)
 	if err == nil {
 		return
 	}

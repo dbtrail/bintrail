@@ -43,6 +43,10 @@ var (
 // the running build (rootCmd.Version carries the human-formatted variant).
 var appVersion = "dev"
 
+// tel records one usage event per invocation, wired at the root like the core
+// binary's.
+var tel cli.TelemetryHook
+
 var rootCmd = &cobra.Command{
 	Use:   "bintrail-console",
 	Short: "Read-only web console over the Bintrail binlog index",
@@ -56,6 +60,7 @@ console NEVER executes SQL; recover produces a script you review and apply
 yourself.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		observe.Setup(os.Stderr, logFormat, logLevel)
+		tel.Start(cmd)
 		return nil
 	},
 	SilenceErrors: true, // we handle error output ourselves in Main()
@@ -78,7 +83,7 @@ func Main(version, commitSHA, buildDate string) int {
 	appVersion = version
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", version, commitSHA, buildDate)
 	telemetry.SetVersion(version)
-	if err := rootCmd.Execute(); err != nil {
+	if err := tel.Execute(rootCmd); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}

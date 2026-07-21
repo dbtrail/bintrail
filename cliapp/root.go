@@ -20,6 +20,10 @@ var (
 	logFormat string
 )
 
+// tel records one usage event per invocation. Wired at the root so every
+// command — including ones added later — is covered without touching them.
+var tel cli.TelemetryHook
+
 // Build metadata, set by Main from the caller's -ldflags-injected values.
 // Package-level because commands (e.g. the agent's hello frame) read them
 // at runtime.
@@ -38,6 +42,7 @@ capabilities. The index is self-contained — recovery does not depend on
 binlog files still existing on disk.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		observe.Setup(os.Stderr, logFormat, logLevel)
+		tel.Start(cmd)
 		return nil
 	},
 	SilenceErrors: true, // we handle error output ourselves in main()
@@ -80,7 +85,7 @@ func Main(version, commitSHA, buildDate string) int {
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", Version, CommitSHA, BuildDate)
 	telemetry.SetVersion(version)
 
-	err := rootCmd.Execute()
+	err := tel.Execute(rootCmd)
 	if err == nil {
 		return 0
 	}

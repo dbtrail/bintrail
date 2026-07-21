@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -17,6 +18,107 @@ var telFormat string
 // one the operator happens to have on PATH.
 func AddTelemetryCommand(root *cobra.Command) {
 	root.AddCommand(telemetryCmd)
+}
+
+// TelemetryHook wires usage telemetry into one binary's root command: a binary
+// declares one, starts a span from its root PersistentPreRunE, and runs its
+// command tree through Execute.
+//
+// This is deliberately the ONLY instrumentation point. Cobra funnels every
+// subcommand through the root's PersistentPreRunE, so a new command needs no
+// telemetry code at all. The flip side: cobra runs only the CLOSEST hook, so a
+// subcommand that defined its own PersistentPreRunE would silently
+// un-instrument its whole subtree. A CI guard for that is tracked in #1061 —
+// until it lands, nothing but review catches it.
+type TelemetryHook struct {
+	client *telemetry.Client
+	span   *telemetry.Span
+}
+
+// Start resolves consent and begins recording the command about to run, unless
+// the command is one of the exempt trees (see uninstrumented).
+func (h *TelemetryHook) Start(cmd *cobra.Command) {
+	if uninstrumented(cmd) {
+		return
+	}
+	h.client = telemetry.Init(telemetry.Config{Flag: telemetryFlagValue(cmd)})
+	h.span = h.client.RecordCommand(commandPath(cmd))
+}
+
+// uninstrumented reports whether cmd belongs to a tree that must not be
+// recorded. Two kinds:
+//
+// The `telemetry` subtree — initialising there would drain and deliver the
+// spooled backlog moments before `telemetry off` discards it, so an operator
+// opting out would watch the tool phone home on its way out.
+//
+// Cobra's completion machinery, which is not user work. `__complete` is an
+// ordinary child of root, so the root hook fires for it: every TAB press in a
+// shell with completion installed would spool an event, attempt a POST, and pay
+// up to shutdownGrace of latency on a keystroke. It would also poison the
+// aggregates — sanitizeCommand rejects underscores, so `__complete` lands in
+// "other", which would then be the largest bucket in the dataset on any
+// developer's machine with nothing to distinguish it from a real unknown
+// command.
+func uninstrumented(cmd *cobra.Command) bool {
+	// Walk to the top-level command (the direct child of root).
+	top := cmd
+	for top.HasParent() && top.Parent().HasParent() {
+		top = top.Parent()
+	}
+	if !top.HasParent() {
+		return false // the root itself
+	}
+	name := top.Name()
+	return name == telemetryCmd.Name() ||
+		name == "help" ||
+		name == "completion" ||
+		strings.HasPrefix(name, "__") // __complete, __completeNoDesc
+}
+
+// Execute runs the command tree and records how it ended.
+//
+// A panic is recorded as an internal error and then re-raised: the panic value
+// and the exit status are unchanged and the original frames are preserved,
+// though Go marks the trace "[recovered, repanicked]" and prepends this
+// function's own two frames. The panic VALUE is never recorded — panic messages
+// routinely carry DSNs, table names and file paths.
+func (h *TelemetryHook) Execute(root *cobra.Command) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			h.span.SetError(telemetry.ClassInternal)
+			h.span.Finish()
+			h.client.Shutdown()
+			panic(r)
+		}
+	}()
+	err = root.Execute()
+	if err != nil {
+		h.span.SetError(telemetry.ClassifyError(err))
+	}
+	h.span.Finish()
+	// Give any in-flight delivery of EARLIER runs' events a bounded moment to
+	// land. Without it a short command's process exits before its own detached
+	// drain can finish, and telemetry never delivers at all for anyone whose
+	// commands are quick. Costs nothing when there is no backlog.
+	h.client.Shutdown()
+	return err
+}
+
+// commandPath renders the invoked command as a hyphenated path — "archive
+// reconcile" becomes "archive-reconcile" — so sibling subcommands stay
+// distinguishable in the aggregates. It is built from cobra command NAMES,
+// which are compile-time constants, and so can never carry an argument or a
+// flag value.
+func commandPath(cmd *cobra.Command) string {
+	var parts []string
+	for c := cmd; c != nil && c.HasParent(); c = c.Parent() {
+		parts = append([]string{c.Name()}, parts...)
+	}
+	if len(parts) == 0 {
+		return "root"
+	}
+	return strings.Join(parts, "-")
 }
 
 var telemetryCmd = &cobra.Command{
