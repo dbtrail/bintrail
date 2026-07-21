@@ -44,12 +44,12 @@ func TestRunDaemonStopsOnContextCancel(t *testing.T) {
 // TestRunDaemonDoesNotBeaconBeforeFirstTick pins the crash-loop protection: the
 // per-day cap is process-local, so a daemon that beaconed at startup would emit
 // one per restart. Waiting a full tick means a crash loop never beacons.
-func TestRunDaemonDoesNotBeaconBeforeFirstTick(t *testing.T) {
-	clearEnv(t)
-	withDaemonTick(t, 400*time.Millisecond)
-
-	// Count what arrives rather than what is on disk: each tick beacons AND
-	// drains, so the spool is empty again moments later either way.
+// deliveryCounter is a receiving endpoint that tallies NDJSON lines.
+//
+// Counting what arrives beats inspecting the spool: each tick beacons AND
+// drains, so the file is gone again moments later either way.
+func deliveryCounter(t *testing.T) (url string, count func() int) {
+	t.Helper()
 	var mu sync.Mutex
 	var delivered int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -59,42 +59,79 @@ func TestRunDaemonDoesNotBeaconBeforeFirstTick(t *testing.T) {
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer srv.Close()
-	count := func() int { mu.Lock(); defer mu.Unlock(); return delivered }
+	t.Cleanup(srv.Close)
+	return srv.URL, func() int { mu.Lock(); defer mu.Unlock(); return delivered }
+}
 
-	dir := t.TempDir()
-	c := initDrained(t, Config{
-		Dir: dir, Endpoint: srv.URL,
-		Stderr: &bytes.Buffer{}, Interactive: boolPtr(false),
-	})
+// startDaemon runs the loop and stops it during cleanup.
+//
+// The cleanup is registered AFTER withDaemonTick's, and cleanups are LIFO, so
+// the loop is always finished before the tick is restored — including on the
+// assertion-failure path, where a Fatal would otherwise leave the goroutine
+// reading daemonTick while the restore writes it.
+func startDaemon(t *testing.T, c *Client) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-
 	done := make(chan struct{})
 	go func() { defer close(done); c.RunDaemon(ctx, "stream") }()
-	// Registered after withDaemonTick so it runs BEFORE the tick is restored
-	// (cleanups are LIFO): the loop must be finished before anything writes
-	// daemonTick, including on the assertion-failure path.
 	t.Cleanup(func() { cancel(); <-done })
+}
 
-	// Well inside the first tick: a daemon that dies here (a crash loop) must
-	// have produced nothing at all — neither spooled nor sent.
-	time.Sleep(80 * time.Millisecond)
+// TestRunDaemonDoesNotBeaconBeforeFirstTick pins the crash-loop protection: the
+// per-day cap is process-local, so a daemon that beaconed at startup would emit
+// one per restart. Waiting a full tick means a crash loop never beacons.
+//
+// The tick is deliberately far longer than the observation window. Contention
+// can only make the loop LATE, never early, so a wide margin cannot produce a
+// false failure in either direction.
+func TestRunDaemonDoesNotBeaconBeforeFirstTick(t *testing.T) {
+	clearEnv(t)
+	withDaemonTick(t, 30*time.Second)
+
+	url, count := deliveryCounter(t)
+	dir := t.TempDir()
+	c := initDrained(t, Config{
+		Dir: dir, Endpoint: url, Stderr: &bytes.Buffer{}, Interactive: boolPtr(false),
+	})
+	startDaemon(t, c)
+
+	// A daemon that dies here — a crash loop — must have produced nothing.
+	time.Sleep(250 * time.Millisecond)
 	if n := countSpooledEvents(t, SpoolDir(dir)); n != 0 {
-		t.Fatalf("spooled %d events before the first tick", n)
+		t.Errorf("spooled %d events before the first tick", n)
 	}
 	if n := count(); n != 0 {
-		t.Fatalf("delivered %d events before the first tick", n)
+		t.Errorf("delivered %d events before the first tick", n)
 	}
+}
 
-	// Past the first tick, exactly one beacon.
-	time.Sleep(600 * time.Millisecond)
+// TestRunDaemonBeaconsOncePerDay covers the other half: after a tick a beacon
+// is delivered, and further ticks the same UTC day add nothing — so a daemon
+// cannot emit a fine-grained uptime trace.
+func TestRunDaemonBeaconsOncePerDay(t *testing.T) {
+	clearEnv(t)
+	withDaemonTick(t, 50*time.Millisecond)
+
+	url, count := deliveryCounter(t)
+	c := initDrained(t, Config{
+		Dir: t.TempDir(), Endpoint: url, Stderr: &bytes.Buffer{}, Interactive: boolPtr(false),
+	})
+	startDaemon(t, c)
+
+	// Poll rather than sleep a fixed span: under load the tick, the POST and
+	// the handler are all late, and a fixed budget for them is what makes a
+	// test like this flake on a busy CI runner.
+	deadline := time.Now().Add(10 * time.Second)
+	for count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if n := count(); n != 1 {
-		t.Errorf("after one tick: %d events delivered, want 1", n)
+		t.Fatalf("after the first tick: %d events delivered, want 1", n)
 	}
 
-	// Later ticks the same UTC day add nothing — the per-day cap holds inside
-	// the loop, so a daemon cannot beat out a fine-grained uptime trace.
-	time.Sleep(900 * time.Millisecond)
+	// Many more ticks' worth of time. Contention only means FEWER ticks fire,
+	// so this can fail only if the per-day cap is genuinely broken.
+	time.Sleep(500 * time.Millisecond)
 	if n := count(); n != 1 {
 		t.Errorf("repeated ticks delivered %d events, want 1 (the per-day cap)", n)
 	}
@@ -123,14 +160,9 @@ func TestRunDaemonDelivers(t *testing.T) {
 		Dir: dir, Endpoint: srv.URL,
 		Stderr: &bytes.Buffer{}, Interactive: boolPtr(false),
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	startDaemon(t, c)
 
-	done := make(chan struct{})
-	go func() { defer close(done); c.RunDaemon(ctx, "stream") }()
-	t.Cleanup(func() { cancel(); <-done })
-
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		n := len(got)
@@ -138,10 +170,8 @@ func TestRunDaemonDelivers(t *testing.T) {
 		if n > 0 {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
-	cancel()
-	<-done
 
 	mu.Lock()
 	defer mu.Unlock()

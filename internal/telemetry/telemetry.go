@@ -301,8 +301,14 @@ func (c *Client) RunDaemon(ctx context.Context, daemon string) {
 // operator's opt-in baked into an AMI or a container layer becomes a whole
 // fleet's, and the machine it runs on may belong to someone who never saw the
 // prompt.
+// Logged at WARN, not INFO. This is the ONLY disclosure a daemon ever makes,
+// and the host most likely to need it — one cloned from an image, where nobody
+// present chose this — is also the host most likely to be running
+// --log-level warn on a fleet. An INFO line would be silenced exactly where it
+// matters most. It stays a structured slog record rather than a raw stderr
+// write so it cannot corrupt a JSON log stream.
 func (c *Client) logDaemonNotice() {
-	slog.Info("usage telemetry is on; sending metadata only (command name, version, OS/arch, error class) — never your data, schemas, DSNs or hostnames",
+	slog.Warn("usage telemetry is on; sending metadata only (command name, version, OS/arch, error class) — never your data, schemas, DSNs or hostnames",
 		"disable", "BINTRAIL_TELEMETRY=off, DO_NOT_TRACK=1, or `bintrail telemetry off`",
 		"cloned_hosts", "an image-baked setting travels with the image; see TELEMETRY.md")
 }
