@@ -664,3 +664,91 @@ func contains(s []string, v string) bool {
 	}
 	return false
 }
+
+// TestIntegrationSchemasAPIArchiveOnly is the #1065 repro against a real index:
+// rotate has archived every partition, so binlog_events is empty while the
+// schema snapshot remains. /api/schemas must still list the schema — the UI's
+// schema picker is a <select> with no free-text fallback, so returning
+// {"schemas":[]} here left the recover page unable to target archived data.
+func TestIntegrationSchemasAPIArchiveOnly(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// A snapshot exists (taken at stream start) but every event has since been
+	// rotated out to Parquet/S3 — binlog_events is left empty on purpose.
+	testutil.InsertSnapshot(t, db, 1, "2026-06-01 11:00:00",
+		"app", "users", "id", 1, "PRI", "int", "NO")
+
+	// NoArchive stays FALSE: this is the reported configuration, where the
+	// archives are exactly what still answers /api/events and /api/recover.
+	// (handleSchemas never calls FetchMerged, so this opens the gate without
+	// touching archive I/O.)
+	srv, err := New(Config{
+		DB:     db,
+		DBName: dbName,
+		Listen: "127.0.0.1:8090",
+		Token:  intToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, body := doReq(t, srv, "GET", "/api/schemas", "")
+	if rec.Code != 200 {
+		t.Fatalf("schemas code = %d, body = %s", rec.Code, body)
+	}
+	var sr schemasResponse
+	if err := json.Unmarshal(body, &sr); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(sr.Schemas, "app") {
+		t.Fatalf("archive-only schemas = %v, want to include app (#1065)", sr.Schemas)
+	}
+
+	// The tables cascade must resolve from the snapshot too, or the picker
+	// dead-ends one level down.
+	_, body = doReq(t, srv, "GET", "/api/schemas?schema=app", "")
+	var tr tablesResponse
+	if err := json.Unmarshal(body, &tr); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(tr.Tables, "users") {
+		t.Errorf("archive-only tables = %v, want to include users", tr.Tables)
+	}
+}
+
+// TestIntegrationSchemasAPINoArchiveKeepsLiveOnly pins the other half of the
+// #1065 gate: when archives are NOT reachable for this server (--no-archive, or
+// any active RBAC profile) a snapshot-only schema is unreachable by
+// construction, so it must NOT be advertised. binlog_events is left empty to
+// isolate the snapshot path — a schema with live events would be listed either
+// way and would not exercise the gate.
+func TestIntegrationSchemasAPINoArchiveKeepsLiveOnly(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	testutil.InsertSnapshot(t, db, 1, "2026-06-01 11:00:00",
+		"app", "users", "id", 1, "PRI", "int", "NO")
+
+	srv, err := New(Config{
+		DB:        db,
+		DBName:    dbName,
+		Listen:    "127.0.0.1:8090",
+		Token:     intToken,
+		NoArchive: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, body := doReq(t, srv, "GET", "/api/schemas", "")
+	if rec.Code != 200 {
+		t.Fatalf("schemas code = %d, body = %s", rec.Code, body)
+	}
+	var sr schemasResponse
+	if err := json.Unmarshal(body, &sr); err != nil {
+		t.Fatal(err)
+	}
+	if len(sr.Schemas) != 0 {
+		t.Errorf("--no-archive schemas = %v, want none: archives are unreachable, so a snapshot-only schema must not be offered", sr.Schemas)
+	}
+}

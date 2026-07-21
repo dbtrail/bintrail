@@ -10,12 +10,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
@@ -426,14 +428,85 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// distinctSchemas lists the schemas observed in this server's binlog_events.
+// distinctSchemas lists the schemas this server can be queried for: those
+// observed in the live binlog_events UNION those in the latest schema snapshot.
+//
+// The snapshot half is load-bearing, not a nicety: once rotate archives the
+// partitions to Parquet/S3, binlog_events is empty while /api/events and
+// /api/recover still answer from the archives via query.FetchMerged. Listing
+// only the live table left the schema dropdown empty — and it is a <select>
+// with no free-text fallback, so the recover page became unusable against
+// archive-only data (#1065). schema_snapshots is never partitioned and rotate
+// never touches it, so it outlives the events it describes.
+//
+// UNION rather than tablesForSchema's prefer-then-fallback: a schema dropped
+// from the source is absent from the latest snapshot, yet its archived events
+// are still recoverable and must stay listed.
+//
+// The snapshot half is gated on archives being reachable (see below), so this
+// is strictly additive: a server that cannot read archives keeps the exact
+// pre-#1065 listing.
+//
+// Two residual gaps, both out of scope and both the same shape — this endpoint
+// answers "which schemas does this index know of", NOT "which schemas have
+// retrievable data in a given window":
+//   - a fresh index pointed at foreign archives with no local snapshot still
+//     lists nothing; enumerating schemas from the Parquet itself would mean
+//     scanning every archive file on each dropdown load.
+//   - `rotate --retain` WITHOUT `--archive-dir` drops partitions and writes no
+//     Parquet, so a listed schema may have no data anywhere. The designed
+//     signal for that is status's continuity verdict and its EVENTS
+//     PERMANENTLY LOST banner (#649) — an empty dropdown was only ever an
+//     accidental proxy for it, and an empty dropdown on a healthy archived
+//     index is the very bug being fixed here.
+//
+// The resolver is loaded once when the bundle opens (manager.go, server.go), so
+// a snapshot taken after the console started is not picked up until restart.
 func (b *bundle) distinctSchemas(ctx context.Context) ([]string, error) {
 	rows, err := b.db.QueryContext(ctx, "SELECT DISTINCT schema_name FROM binlog_events ORDER BY schema_name")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanStrings(rows)
+	live, err := scanStrings(rows)
+	if err != nil {
+		return nil, err
+	}
+	if b.noArchive {
+		// Archives are never consulted for this server (--no-archive, or ANY
+		// active RBAC profile — see newBundleDerived), so a schema that survives
+		// only in the snapshot is unreachable BY CONSTRUCTION: the union's whole
+		// justification is that the archives still answer. Advertising it would
+		// offer the operator a target this server provably cannot return a row
+		// for. Live-only here is byte-identical to the pre-#1065 behaviour.
+		return live, nil
+	}
+	return mergeSchemaNames(live, b.resolver), nil
+}
+
+// mergeSchemaNames folds the snapshot's schemas into the observed ones,
+// deduplicated and sorted. A nil resolver (no snapshot loaded) returns the
+// observed names unchanged, so the pre-snapshot behaviour is preserved.
+func mergeSchemaNames(live []string, r *metadata.Resolver) []string {
+	if r == nil {
+		return live
+	}
+	seen := make(map[string]bool, len(live))
+	out := make([]string, 0, len(live))
+	for _, s := range live {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, t := range r.AllTables() {
+		if !seen[t.Schema] {
+			seen[t.Schema] = true
+			out = append(out, t.Schema)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // tablesForSchema lists the tables of one schema. It prefers the latest schema

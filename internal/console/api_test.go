@@ -1,6 +1,7 @@
 package console
 
 import (
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -266,5 +268,92 @@ func TestRecoverRequiresSchema(t *testing.T) {
 	s.handleRecover(rec, req)
 	if rec.Code != 400 {
 		t.Errorf("recover without schema: code = %d, want 400", rec.Code)
+	}
+}
+
+// TestDistinctSchemasUnionsSnapshot is the #1065 repro at unit tier: once
+// rotate has archived every partition to Parquet/S3 the live binlog_events is
+// empty, yet /api/events and /api/recover still answer from the archives. The
+// schema dropdown is a <select> with no free-text fallback, so an empty list
+// makes the recover page unusable against archive-only data. The schema
+// snapshot outlives the events (schema_snapshots is never partitioned and
+// rotate never touches it), so it must fill the gap.
+func TestDistinctSchemasUnionsSnapshot(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	// Archive-only index: no live rows at all.
+	mock.ExpectQuery("SELECT DISTINCT schema_name FROM binlog_events").
+		WillReturnRows(sqlmock.NewRows([]string{"schema_name"}))
+
+	b := &bundle{db: db, resolver: metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"app.orders":    {Schema: "app", Table: "orders"},
+		"app.customers": {Schema: "app", Table: "customers"},
+		"shop.items":    {Schema: "shop", Table: "items"},
+	})}
+	got, err := b.distinctSchemas(context.Background())
+	if err != nil {
+		t.Fatalf("distinctSchemas: %v", err)
+	}
+	if want := []string{"app", "shop"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("archive-only schemas = %v, want %v", got, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestMergeSchemaNames pins the merge itself: dedup across the two sources, a
+// sorted result, a live-only schema kept even when it is absent from the latest
+// snapshot (dropped from the source but still recoverable from archives), and
+// an untouched passthrough when no snapshot is loaded.
+func TestMergeSchemaNames(t *testing.T) {
+	snap := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"app.orders": {Schema: "app", Table: "orders"},
+		"shop.items": {Schema: "shop", Table: "items"},
+	})
+	cases := []struct {
+		name string
+		live []string
+		res  *metadata.Resolver
+		want []string
+	}{
+		{"nil resolver passes live through", []string{"b", "a"}, nil, []string{"b", "a"}},
+		{"snapshot only", []string{}, snap, []string{"app", "shop"}},
+		{"dedup and sort", []string{"shop", "app"}, snap, []string{"app", "shop"}},
+		{"live-only schema survives", []string{"legacy"}, snap, []string{"app", "legacy", "shop"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := mergeSchemaNames(c.live, c.res); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("mergeSchemaNames(%v) = %v, want %v", c.live, got, c.want)
+			}
+		})
+	}
+}
+
+// TestDistinctSchemasNoArchiveKeepsLiveOnly pins the gate: with archives
+// unreachable (--no-archive, or any active RBAC profile) the snapshot half is
+// skipped, so behaviour is byte-identical to pre-#1065.
+func TestDistinctSchemasNoArchiveKeepsLiveOnly(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT DISTINCT schema_name FROM binlog_events").
+		WillReturnRows(sqlmock.NewRows([]string{"schema_name"}).AddRow("live"))
+
+	b := &bundle{db: db, noArchive: true, resolver: metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"archived.orders": {Schema: "archived", Table: "orders"},
+	})}
+	got, err := b.distinctSchemas(context.Background())
+	if err != nil {
+		t.Fatalf("distinctSchemas: %v", err)
+	}
+	if want := []string{"live"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("--no-archive schemas = %v, want %v (snapshot-only schema is unreachable)", got, want)
 	}
 }
