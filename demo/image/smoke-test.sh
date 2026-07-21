@@ -70,20 +70,24 @@ sleep 70
 # no check. DO_NOT_TRACK=1 in the environ of every bintrail process is
 # deterministic and catches the realistic regression (the export moved
 # below a child's start, or a child spawned with a scrubbed env).
+# Processes are identified by their executable (/proc/PID/exe), NOT by a
+# substring of their command line: this scanning shell's own argv contains
+# the script text below, so a cmdline match would count the scanner itself
+# and the "no bintrail process found" assertion could never fire. Matching
+# the exe also skips transient `mysql ... bintrail_index` clients.
 log "Asserting the telemetry guard on live processes..."
 GUARD=$(docker exec "$NAME" sh -c '
     total=0; guarded=0
     for d in /proc/[0-9]*; do
-        [ -r "$d/cmdline" ] || continue
-        case "$(tr "\0" " " < "$d/cmdline")" in
-            *bintrail*) total=$((total+1)) ;;
+        case "$(readlink "$d/exe" 2>/dev/null)" in
+            */bintrail) total=$((total+1)) ;;
             *) continue ;;
         esac
         if tr "\0" "\n" < "$d/environ" 2>/dev/null | grep -qx "DO_NOT_TRACK=1"; then
             guarded=$((guarded+1))
         fi
     done
-    echo "$total $guarded"')
+    echo "$total $guarded"') || { log "FAIL: could not inspect processes in the container"; exit 1; }
 read -r TOTAL GUARDED <<<"$GUARD"
 log "bintrail processes: ${TOTAL:-0}, of them with DO_NOT_TRACK=1: ${GUARDED:-0}"
 [ "${TOTAL:-0}" -ge 1 ] \
