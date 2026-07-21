@@ -17,6 +17,13 @@
 
 set -euo pipefail
 
+# No usage telemetry from the demo image, ever — whatever the binary's
+# default is, and even if the Dockerfile's DO_NOT_TRACK ENV was
+# overridden with `docker run -e`. Must stay ABOVE every process this
+# script starts: exported after a child boots, it would not reach it.
+# smoke-test.sh asserts this on the live process environments.
+export DO_NOT_TRACK=1
+
 log() { echo "[demo image] $(date '+%H:%M:%S') $*"; }
 
 BINTRAIL_DSN='bintrail:bintrail@tcp(127.0.0.1:3306)'
