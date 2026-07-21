@@ -21,6 +21,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
 var (
@@ -72,6 +73,9 @@ func init() {
 	// the same index DSN (#951). `bintrail-pg stream` additionally runs the
 	// built-in rotation loop for safe-by-default retention.
 	cli.AddMaintenanceCommands(rootCmd)
+	// Usage telemetry control surface, same set as the core binary.
+	cli.AddTelemetryCommand(rootCmd)
+	telemetry.SetVersion(Version)
 }
 
 func main() {

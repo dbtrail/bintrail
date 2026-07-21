@@ -1,0 +1,355 @@
+package telemetry
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"golang.org/x/term"
+)
+
+// endpoint is the ingestion URL, injected at build time:
+//
+//	-ldflags "-X github.com/dbtrail/dbtrail/internal/telemetry.endpoint=https://telemetry.dbtrail.io/v1/events"
+//
+// It is EMPTY by default, which makes telemetry inert by construction: a
+// plain `go build`, `go test`, or a distribution packager's build produces a
+// binary with no endpoint to send to and therefore no network path at all.
+// Only official release builds set it. This is the one-line assertion a distro
+// packager or a skeptical reviewer can check, and it is why the test suite —
+// including the E2E test that builds and runs the real binary — can never
+// emit telemetry.
+var endpoint string
+
+// buildVersion is the binary's version, set once at startup by each binary's
+// Main. Startup-only contract, like the ext package's setters: not safe for
+// concurrent use with command execution.
+var buildVersion = "dev"
+
+// SetVersion records the -ldflags version for telemetry. Call once from Main
+// before executing commands.
+func SetVersion(v string) {
+	if v != "" {
+		buildVersion = v
+	}
+}
+
+// Endpoint reports the compiled-in ingestion URL ("" when this build cannot
+// send). Exposed so `bintrail telemetry status` can tell an operator whether
+// the binary is even capable of reporting.
+func Endpoint() string { return endpoint }
+
+// drainDeadline bounds the startup drain. It runs concurrently with the
+// command body and never blocks it; if the endpoint is slow or unreachable
+// the attempt is abandoned and the events wait for a later run.
+const drainDeadline = 2 * time.Second
+
+// Config parameterises Init. Every field has a sane zero value; tests override
+// the endpoint, directory, clock and TTY detection.
+type Config struct {
+	// Flag is the resolved --telemetry value ("on", "off" or "" for unset).
+	Flag string
+	// Version overrides the package-level build version.
+	Version string
+	// Dir overrides the config directory (default ~/.config/bintrail).
+	Dir string
+	// Endpoint overrides the build-time endpoint. Tests only — production
+	// builds must go through -ldflags so an inert build stays provably inert.
+	Endpoint string
+	// Stderr receives the first-run notice (default os.Stderr).
+	Stderr io.Writer
+	// Interactive overrides TTY detection.
+	Interactive *bool
+	// Now overrides the clock.
+	Now func() time.Time
+}
+
+// Client records usage events. The zero value and a nil *Client are both safe
+// and inert, so callers never need a nil check.
+type Client struct {
+	enabled     bool
+	decision    Decision
+	isCI        bool
+	dir         string
+	spoolDir    string
+	endpoint    string
+	version     string
+	interactive bool
+	runID       string
+	now         func() time.Time
+	http        *http.Client
+
+	mu         sync.Mutex
+	lastBeacon time.Time
+}
+
+// Init resolves consent, shows the first-run notice when warranted, and kicks
+// off an asynchronous drain of events spooled by earlier runs.
+//
+// It never fails and never blocks: any panic below is swallowed and yields an
+// inert client. Telemetry must not be able to change a command's behaviour,
+// output, or exit code — that is worth more than any event it might record.
+func Init(cfg Config) (c *Client) {
+	c = &Client{decision: Decision{Enabled: false, Source: SourceDefault}}
+	defer func() {
+		if r := recover(); r != nil {
+			c = &Client{decision: Decision{Enabled: false, Source: SourceDefault}}
+		}
+	}()
+
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
+	version := cfg.Version
+	if version == "" {
+		version = buildVersion
+	}
+	ep := cfg.Endpoint
+	if ep == "" {
+		ep = endpoint
+	}
+	dir := cfg.Dir
+	if dir == "" {
+		// No home directory (distroless, systemd DynamicUser, scrubbed env):
+		// disable everything silently rather than warning about a subsystem the
+		// operator did not ask about.
+		if d, err := ConfigDir(); err == nil {
+			dir = d
+		}
+	}
+	stderr := cfg.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	interactive := isInteractive(stderr)
+	if cfg.Interactive != nil {
+		interactive = *cfg.Interactive
+	}
+
+	decision := Resolve(cfg.Flag, dir)
+	isCI := IsCI()
+
+	c = &Client{
+		// A CI run is nobody deciding anything, and an empty endpoint or missing
+		// config dir means there is nowhere to send or spool. All three suppress
+		// only — they can never turn telemetry ON.
+		enabled:     decision.Enabled && !isCI && ep != "" && dir != "",
+		decision:    decision,
+		isCI:        isCI,
+		dir:         dir,
+		spoolDir:    SpoolDir(dir),
+		endpoint:    ep,
+		version:     version,
+		interactive: interactive,
+		runID:       uuid.NewString(),
+		now:         now,
+		http:        &http.Client{Timeout: drainDeadline},
+	}
+
+	if !c.enabled {
+		return c
+	}
+	c.maybeShowNotice(stderr)
+	go c.drainAsync()
+	return c
+}
+
+// maybeShowNotice prints the first-run disclosure once, on an interactive
+// terminal, and only while telemetry is running on the DEFAULT — an operator
+// who has already chosen has nothing to be told. The sentinel is recorded
+// best-effort: if it cannot be persisted the notice simply shows again, which
+// is the harmless direction to fail in.
+func (c *Client) maybeShowNotice(w io.Writer) {
+	if !c.interactive || c.decision.Source != SourceDefault {
+		return
+	}
+	s := loadState(c.dir)
+	if s.NoticeShown {
+		return
+	}
+	if _, err := io.WriteString(w, "\n"+Notice+"\n"); err != nil {
+		return
+	}
+	s.NoticeShown = true
+	_ = saveState(c.dir, s)
+}
+
+// drainAsync delivers previously spooled events. It runs detached from the
+// command body and is bounded by drainDeadline; if the process exits first,
+// the in-flight file is picked up by a later run (see drain's claim
+// reclamation). Sub-100ms commands therefore deliver their own events on the
+// NEXT invocation — the same model the Go toolchain uses, and the price of
+// keeping the network entirely off the request path.
+func (c *Client) drainAsync() {
+	defer func() { _ = recover() }()
+	ctx, cancel := context.WithTimeout(context.Background(), drainDeadline)
+	defer cancel()
+	drain(c.spoolDir, c.now(), func(body []byte) error {
+		return postNDJSON(ctx, c.http, c.endpoint, body)
+	})
+}
+
+// Enabled reports whether this client will record anything.
+func (c *Client) Enabled() bool { return c != nil && c.enabled }
+
+// Decision reports the resolved consent state and what decided it.
+func (c *Client) Decision() Decision {
+	if c == nil {
+		return Decision{Enabled: false, Source: SourceDefault}
+	}
+	return c.decision
+}
+
+// baseEvent fills the fields common to every event type.
+func (c *Client) baseEvent() Event {
+	return Event{
+		SchemaVersion: SchemaVersion,
+		Version:       minorVersion(c.version),
+		IsRelease:     isReleaseVersion(c.version),
+		OS:            runtime.GOOS,
+		Arch:          coarseArch(runtime.GOARCH),
+		IsCI:          c.isCI,
+		IsInteractive: c.interactive,
+	}
+}
+
+// SampleEvent returns a representative event for `bintrail telemetry show`.
+// The host-derived fields (version, os, arch, ci, tty) carry this machine's
+// REAL values rather than placeholders, so an operator inspecting the payload
+// sees what their box would actually transmit — not a sanitised illustration.
+func SampleEvent() Event {
+	return Event{
+		SchemaVersion:  SchemaVersion,
+		EventType:      EventCommandRun,
+		Command:        "status",
+		Outcome:        OutcomeOK,
+		DurationBucket: "100ms-1s",
+		Version:        minorVersion(buildVersion),
+		IsRelease:      isReleaseVersion(buildVersion),
+		OS:             runtime.GOOS,
+		Arch:           coarseArch(runtime.GOARCH),
+		IsCI:           IsCI(),
+		IsInteractive:  isInteractive(os.Stderr),
+		RunID:          uuid.NewString(),
+	}
+}
+
+// Span measures one command invocation. A nil *Span is safe and inert.
+type Span struct {
+	c       *Client
+	command string
+	start   time.Time
+	class   string
+}
+
+// RecordCommand starts a span for a command. Returns nil when telemetry is
+// off; every Span method tolerates a nil receiver, so callers need no branch.
+func (c *Client) RecordCommand(command string) *Span {
+	if !c.Enabled() {
+		return nil
+	}
+	return &Span{c: c, command: sanitizeCommand(command), start: c.now()}
+}
+
+// SetError marks the span as failed with a bounded class. Anything outside the
+// taxonomy is coerced to "unknown" rather than trusted onto the wire.
+func (s *Span) SetError(class string) {
+	if s == nil {
+		return
+	}
+	s.class = normalizeClass(class)
+}
+
+// Finish records the span to the local spool. It NEVER touches the network —
+// that is what makes it safe to call on every command's exit path.
+func (s *Span) Finish() {
+	if s == nil || !s.c.Enabled() {
+		return
+	}
+	defer func() { _ = recover() }()
+
+	e := s.c.baseEvent()
+	e.Command = s.command
+	e.RunID = s.c.runID
+	e.DurationBucket = durationBucket(s.c.now().Sub(s.start))
+	if s.class == "" {
+		e.EventType, e.Outcome = EventCommandRun, OutcomeOK
+	} else {
+		e.EventType, e.Outcome, e.ErrorClass = EventCommandError, OutcomeError, s.class
+	}
+	_ = appendEvent(s.c.spoolDir, e, s.c.now())
+}
+
+// Beacon records that a long-running daemon is alive, at most once per UTC
+// day. The cadence is deliberately coarse: a finer beat would reconstruct a
+// daemon's uptime and maintenance windows.
+//
+// Beacons carry NO run_id. A months-lived process's run_id would be a
+// longitudinal key — exactly the persistent identifier this design refuses to
+// create.
+//
+// The original design had Beacon spawn its own goroutine so a POST could never
+// land on a daemon's event loop or heartbeat tick. The spool model makes that
+// unnecessary: this only appends a line to a local file, so it is safe to call
+// directly from a ticker.
+func (c *Client) Beacon(daemon string) {
+	if !c.Enabled() {
+		return
+	}
+	defer func() { _ = recover() }()
+
+	now := c.now().UTC()
+	c.mu.Lock()
+	if !c.lastBeacon.IsZero() && sameUTCDay(c.lastBeacon, now) {
+		c.mu.Unlock()
+		return
+	}
+	c.lastBeacon = now
+	c.mu.Unlock()
+
+	e := c.baseEvent()
+	e.EventType = EventDaemonBeacon
+	e.Command = sanitizeCommand(daemon)
+	e.Outcome = OutcomeOK
+	_ = appendEvent(c.spoolDir, e, now)
+}
+
+func sameUTCDay(a, b time.Time) bool {
+	ay, am, ad := a.UTC().Date()
+	by, bm, bd := b.UTC().Date()
+	return ay == by && am == bm && ad == bd
+}
+
+// sanitizeCommand bounds what can reach the `command` field. In practice the
+// value is a cobra command name — a compile-time constant — but constraining
+// it here means no future caller can turn this field into a channel for
+// arbitrary text, without anyone having to maintain a hand-written list of
+// every command bintrail will ever have.
+func sanitizeCommand(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" || len(name) > 32 {
+		return "other"
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return "other"
+		}
+	}
+	return name
+}
+
+// isInteractive reports whether w is a terminal.
+func isInteractive(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	return term.IsTerminal(int(f.Fd()))
+}

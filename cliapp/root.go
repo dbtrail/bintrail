@@ -12,6 +12,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/agent"
 	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
 var (
@@ -54,6 +55,10 @@ func init() {
 	// package and self-registered via init(); they moved to internal/cli so both
 	// binaries expose them.
 	cli.AddMaintenanceCommands(rootCmd)
+	// Usage telemetry control surface (status/show/on/off). Registered on every
+	// binary that can report, so `telemetry off` works from whichever one the
+	// operator has on PATH.
+	cli.AddTelemetryCommand(rootCmd)
 }
 
 // AddCommands registers additional top-level commands on the bintrail root
@@ -72,6 +77,7 @@ func AddCommands(cmds ...*cobra.Command) {
 func Main(version, commitSHA, buildDate string) int {
 	Version, CommitSHA, BuildDate = version, commitSHA, buildDate
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", Version, CommitSHA, BuildDate)
+	telemetry.SetVersion(version)
 
 	err := rootCmd.Execute()
 	if err == nil {

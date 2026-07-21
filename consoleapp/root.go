@@ -24,6 +24,9 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/dbtrail/dbtrail/internal/cli"
+	"github.com/dbtrail/dbtrail/internal/telemetry"
+
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/observe"
@@ -62,6 +65,8 @@ yourself.`,
 func init() {
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log format: text or json")
+	// Usage telemetry control surface, same set as the core binary.
+	cli.AddTelemetryCommand(rootCmd)
 }
 
 // Main configures build metadata and runs the bintrail-console root command,
@@ -71,6 +76,7 @@ func init() {
 func Main(version, commitSHA, buildDate string) int {
 	appVersion = version
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", version, commitSHA, buildDate)
+	telemetry.SetVersion(version)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
