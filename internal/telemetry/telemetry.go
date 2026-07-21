@@ -99,6 +99,7 @@ func Init(cfg Config) (c *Client) {
 	c = &Client{decision: Decision{Enabled: false, Source: SourceDefault}}
 	defer func() {
 		if r := recover(); r != nil {
+			debugf("init panicked, telemetry disabled for this run")
 			c = &Client{decision: Decision{Enabled: false, Source: SourceDefault}}
 		}
 	}()
@@ -178,7 +179,10 @@ func (c *Client) maybeShowNotice(w io.Writer) {
 		return
 	}
 	s.NoticeShown = true
-	_ = saveState(c.dir, s)
+	if err := saveState(c.dir, s); err != nil {
+		// Harmless direction to fail in: the notice simply shows again.
+		debugf("could not record that the notice was shown: %v", err)
+	}
 }
 
 // drainAsync delivers previously spooled events. It runs detached from the
@@ -188,7 +192,14 @@ func (c *Client) maybeShowNotice(w io.Writer) {
 // NEXT invocation — the same model the Go toolchain uses, and the price of
 // keeping the network entirely off the request path.
 func (c *Client) drainAsync() {
-	defer func() { _ = recover() }()
+	// Required, not decorative: an unhandled panic in a detached goroutine
+	// takes the whole process down, which is the one thing telemetry must
+	// never do to a command.
+	defer func() {
+		if r := recover(); r != nil {
+			debugf("drain panicked")
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), drainDeadline)
 	defer cancel()
 	drain(c.spoolDir, c.now(), func(body []byte) error {
@@ -284,7 +295,9 @@ func (s *Span) Finish() {
 	} else {
 		e.EventType, e.Outcome, e.ErrorClass = EventCommandError, OutcomeError, s.class
 	}
-	_ = appendEvent(s.c.spoolDir, e, s.c.now())
+	if err := appendEvent(s.c.spoolDir, e, s.c.now()); err != nil {
+		debugf("could not spool command event: %v", err)
+	}
 }
 
 // Beacon records that a long-running daemon is alive, at most once per UTC
@@ -318,7 +331,9 @@ func (c *Client) Beacon(daemon string) {
 	e.EventType = EventDaemonBeacon
 	e.Command = sanitizeCommand(daemon)
 	e.Outcome = OutcomeOK
-	_ = appendEvent(c.spoolDir, e, now)
+	if err := appendEvent(c.spoolDir, e, now); err != nil {
+		debugf("could not spool beacon: %v", err)
+	}
 }
 
 func sameUTCDay(a, b time.Time) bool {

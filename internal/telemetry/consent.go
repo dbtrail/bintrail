@@ -160,7 +160,7 @@ func parseOnOff(v string) (enabled, ok bool) {
 // Resolve determines the telemetry state. Highest control wins:
 //
 //  1. DO_NOT_TRACK  — hard off, checked before any file I/O
-//  2. flagValue     — --telemetry=on|off / --no-telemetry
+//  2. flagValue     — --telemetry=on|off
 //  3. BINTRAIL_TELEMETRY
 //  4. the consent file
 //  5. default: ON

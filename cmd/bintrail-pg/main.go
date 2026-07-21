@@ -63,6 +63,7 @@ func init() {
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", Version, CommitSHA, BuildDate)
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log format: text or json")
+	rootCmd.PersistentFlags().String("telemetry", "", "Usage telemetry: on or off (overrides BINTRAIL_TELEMETRY; DO_NOT_TRACK=1 overrides everything)")
 	// The source-agnostic read plane (status/query/recover/reconstruct/shim),
 	// shared verbatim with the core binary. The PostgreSQL capture command
 	// (stream) is registered in stream.go's init().

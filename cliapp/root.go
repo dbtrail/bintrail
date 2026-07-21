@@ -47,6 +47,7 @@ binlog files still existing on disk.`,
 func init() {
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log format: text or json")
+	rootCmd.PersistentFlags().String("telemetry", "", "Usage telemetry: on or off (overrides BINTRAIL_TELEMETRY; DO_NOT_TRACK=1 overrides everything)")
 	// Register the source-agnostic read commands that have moved to internal/cli
 	// (#529) so a future bintrail-pg can register the same set. Today: status.
 	cli.AddReadCommands(rootCmd)

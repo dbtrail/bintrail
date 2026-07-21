@@ -65,6 +65,7 @@ yourself.`,
 func init() {
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log format: text or json")
+	rootCmd.PersistentFlags().String("telemetry", "", "Usage telemetry: on or off (overrides BINTRAIL_TELEMETRY; DO_NOT_TRACK=1 overrides everything)")
 	// Usage telemetry control surface, same set as the core binary.
 	cli.AddTelemetryCommand(rootCmd)
 }

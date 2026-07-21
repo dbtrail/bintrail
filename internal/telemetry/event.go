@@ -13,9 +13,13 @@
 //     survives a careless future contributor, which a field allowlist alone
 //     does not (an allowlist is blind to where a value came from).
 //
-// No identifier is ever written to disk. RunID is per-process and in-memory,
-// exists only so the ingestion side can dedup a re-sent spool file, and is
-// absent from daemon beacons entirely.
+// There is no PERSISTENT identifier: nothing that survives the process or
+// identifies the install is created, and the only file telemetry writes
+// outside the spool is the consent record, which carries no id. RunID is
+// generated per process, lives in the spooled event until that batch is
+// delivered or aged out (so ingestion can dedup a re-sent file), and never
+// appears in a daemon beacon — a months-lived process's run_id would be
+// exactly the longitudinal key this design refuses to produce.
 package telemetry
 
 import (

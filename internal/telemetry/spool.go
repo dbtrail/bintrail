@@ -2,9 +2,12 @@ package telemetry
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,17 +25,32 @@ const (
 	// maxSpoolAge bounds how long an undelivered event lingers on disk.
 	maxSpoolAge = 7 * 24 * time.Hour
 
-	// claimReclaimAfter is how long a claimed file may sit untouched before a
-	// later run adopts it. It only ever fires for a drainer that died
-	// mid-flight — which is the COMMON case, not an exotic one: a sub-100ms
-	// command's process exits while its detached drain goroutine is still in
-	// its HTTP call. Comfortably longer than drainDeadline, so it can never
-	// steal a file from a drainer that is genuinely still working.
+	// claimReclaimAfter is how long a claim may sit before another run adopts
+	// it. It exists for a drainer that died mid-flight — which is the COMMON
+	// case, not an exotic one: a sub-100ms command's process exits while its
+	// detached drain goroutine is still in its HTTP call. Comfortably longer
+	// than drainDeadline, so it can never steal from a drainer still working.
 	claimReclaimAfter = 5 * time.Minute
 )
 
 // SpoolDir returns the spool directory inside dir.
 func SpoolDir(dir string) string { return filepath.Join(dir, spoolDirName) }
+
+// PurgeSpool removes every locally spooled event.
+//
+// Needed because drain runs ONLY while telemetry is enabled: without this, an
+// operator who runs `telemetry off` would leave whatever was spooled before
+// their decision sitting on disk indefinitely — never sent, never aged out —
+// belonging to precisely the person who asked for none.
+func PurgeSpool(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if err := os.RemoveAll(SpoolDir(dir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove telemetry spool: %w", err)
+	}
+	return nil
+}
 
 // appendEvent writes one NDJSON line. Plain O_APPEND with no fsync: this runs
 // at the end of every command, and an fsync per invocation is exactly the kind
@@ -52,7 +70,8 @@ func appendEvent(spoolDir string, e Event, now time.Time) error {
 	path := filepath.Join(spoolDir, now.UTC().Format("2006-01-02")+spoolSuffix)
 
 	if fi, err := os.Stat(path); err == nil && fi.Size() >= maxSpoolFileBytes {
-		return nil // over cap: drop rather than grow
+		debugf("spool file at cap, dropping event")
+		return nil
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -65,14 +84,52 @@ func appendEvent(spoolDir string, e Event, now time.Time) error {
 	return nil
 }
 
-// drain delivers every spooled file and removes it, whether or not the send
-// succeeded.
+// claimName builds a claim path for base, stamped with this process and
+// instant so the name itself records when the claim was taken.
+func claimName(spoolDir, base string, now time.Time) string {
+	return filepath.Join(spoolDir, base+claimedMark+strconv.Itoa(os.Getpid())+"-"+strconv.FormatInt(now.UnixNano(), 10))
+}
+
+// unclaimedBase strips any claim suffix, so re-claiming a file does not append
+// suffix after suffix.
+func unclaimedBase(name string) string {
+	if i := strings.Index(name, claimedMark); i >= 0 {
+		return name[:i]
+	}
+	return name
+}
+
+// claimStamp recovers when a claim was taken, from the claim's own name.
 //
-// Concurrency is handled by claim-by-rename: the drainer atomically renames a
-// spool file to a unique name and works on that immutable snapshot. Two
-// drainers racing (a cron run and a human run sharing $HOME) cannot both claim
-// the same file, so no event is sent twice and none is lost to a
-// read-then-truncate window. No lock is held across network I/O.
+// The claim time canNOT be read from the file's mtime: os.Rename preserves it,
+// so a freshly claimed file still carries the time of its last APPEND. For any
+// prior-day spool file — the normal drain target — that is hours or days ago,
+// which would mark a just-created claim as abandoned instantly and let a second
+// drainer adopt and re-send a batch that is still in flight.
+func claimStamp(name string) (time.Time, bool) {
+	i := strings.LastIndex(name, claimedMark)
+	if i < 0 {
+		return time.Time{}, false
+	}
+	suffix := name[i+len(claimedMark):]
+	j := strings.LastIndex(suffix, "-")
+	if j < 0 {
+		return time.Time{}, false
+	}
+	nanos, err := strconv.ParseInt(suffix[j+1:], 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, nanos), true
+}
+
+// drain delivers every spooled batch and removes it.
+//
+// Exclusion is by claim-by-rename: a drainer atomically renames a file to a
+// unique claim and works on that immutable snapshot. rename(2) fails once the
+// source is gone, so of two racing drainers exactly one wins — including when
+// the file being claimed is itself an abandoned claim being adopted, which is
+// why adoption re-renames rather than working in place.
 //
 // Delivery failures drop the batch rather than retrying: an offline box must
 // not accumulate a backlog it will one day flush all at once, and losing
@@ -88,33 +145,36 @@ func drain(spoolDir string, now time.Time, send func([]byte) error) {
 		}
 		name := entry.Name()
 		path := filepath.Join(spoolDir, name)
+		isClaim := strings.Contains(name, claimedMark)
+		if !isClaim && !strings.HasSuffix(name, spoolSuffix) {
+			continue
+		}
 		info, err := entry.Info()
 		if err != nil {
 			continue
 		}
-		if now.Sub(info.ModTime()) > maxSpoolAge {
+
+		// Age a claim from when it was claimed and a spool file from its last
+		// append. A claim whose name predates this scheme falls back to mtime,
+		// which only delays its expiry.
+		stamp, haveStamp := claimStamp(name)
+		age := now.Sub(info.ModTime())
+		if isClaim && haveStamp {
+			age = now.Sub(stamp)
+		}
+		if age > maxSpoolAge {
+			debugf("dropping spool file older than %s: %s", maxSpoolAge, name)
 			os.Remove(path)
 			continue
 		}
-
-		var claimed string
-		switch {
-		case strings.Contains(name, claimedMark):
-			// Left behind by a drainer that died mid-flight. Adopt it once it is
-			// old enough that no live drainer could still be working on it.
-			if now.Sub(info.ModTime()) < claimReclaimAfter {
-				continue
-			}
-			claimed = path
-		case strings.HasSuffix(name, spoolSuffix):
-			claimed = path + claimedMark + fmt.Sprintf("%d-%d", os.Getpid(), now.UnixNano())
-			if err := os.Rename(path, claimed); err != nil {
-				continue // another drainer claimed it first
-			}
-		default:
-			continue
+		if isClaim && (!haveStamp || now.Sub(stamp) < claimReclaimAfter) {
+			continue // a live drainer may still hold this
 		}
 
+		claimed := claimName(spoolDir, unclaimedBase(name), now)
+		if err := os.Rename(path, claimed); err != nil {
+			continue // another drainer claimed it first
+		}
 		data, readErr := os.ReadFile(claimed)
 		if readErr != nil || len(data) == 0 {
 			os.Remove(claimed)
@@ -126,9 +186,7 @@ func drain(spoolDir string, now time.Time, send func([]byte) error) {
 		// events vanishing into a delete that already happened.
 		os.Remove(claimed)
 		if sendErr != nil {
-			// Drop-on-fail by design — no retry queue, so an offline box never
-			// builds a backlog it flushes all at once. Stop here rather than
-			// hammering an endpoint that just refused us.
+			debugf("send failed, dropping batch and stopping: %v", sendErr)
 			return
 		}
 	}

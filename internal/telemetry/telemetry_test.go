@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -436,14 +437,7 @@ func TestDrainReclaimsAbandonedClaim(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	abandoned := filepath.Join(dir, "2026-07-20"+spoolSuffix+claimedMark+"999-1")
-	if err := os.WriteFile(abandoned, []byte(`{"command":"status"}`+"\n"), 0o600); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	old := time.Now().Add(-10 * time.Minute)
-	if err := os.Chtimes(abandoned, old, old); err != nil {
-		t.Fatalf("chtimes: %v", err)
-	}
+	abandoned := writeClaim(t, dir, "2026-07-20", time.Now().Add(-10*time.Minute))
 
 	var received [][]byte
 	drain(dir, time.Now(), func(b []byte) error {
@@ -460,15 +454,23 @@ func TestDrainReclaimsAbandonedClaim(t *testing.T) {
 
 // TestDrainLeavesFreshClaimAlone: a claim younger than claimReclaimAfter may
 // still belong to a live drainer, so stealing it would send the batch twice.
+//
+// The file's mtime is deliberately set an hour into the past. A real claim
+// always looks like this — os.Rename preserves mtime, so a claim of yesterday's
+// spool file carries yesterday's timestamp — and an implementation that judges
+// claim age by mtime instead of by the stamp in the claim's name passes every
+// other test in this file while failing this one.
 func TestDrainLeavesFreshClaimAlone(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	fresh := filepath.Join(dir, "2026-07-20"+spoolSuffix+claimedMark+"111-2")
-	if err := os.WriteFile(fresh, []byte("{}\n"), 0o600); err != nil {
-		t.Fatalf("write: %v", err)
+	fresh := writeClaim(t, dir, "2026-07-20", time.Now())
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(fresh, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
 	}
+
 	called := 0
 	drain(dir, time.Now(), func([]byte) error { called++; return nil })
 	if called != 0 {
@@ -477,6 +479,89 @@ func TestDrainLeavesFreshClaimAlone(t *testing.T) {
 	if _, err := os.Stat(fresh); err != nil {
 		t.Errorf("fresh claim was removed: %v", err)
 	}
+}
+
+func TestClaimStamp(t *testing.T) {
+	want := time.Unix(0, 1753084800123456789)
+	name := "2026-07-21" + spoolSuffix + claimedMark + "4211-" + strconv.FormatInt(want.UnixNano(), 10)
+	got, ok := claimStamp(name)
+	if !ok || !got.Equal(want) {
+		t.Errorf("claimStamp(%q) = %v, %v; want %v, true", name, got, ok, want)
+	}
+	if _, ok := claimStamp("2026-07-21" + spoolSuffix); ok {
+		t.Error("a plain spool name should not yield a claim stamp")
+	}
+	if _, ok := claimStamp("2026-07-21" + spoolSuffix + claimedMark + "garbage"); ok {
+		t.Error("an unparseable claim suffix should not yield a stamp")
+	}
+}
+
+// TestDrainDropsBatchOnSendFailure covers the documented drop-on-fail
+// behaviour AND that a refusing endpoint is not hammered: the loop stops after
+// the first failure rather than working through every remaining file.
+func TestDrainDropsBatchOnSendFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, day := range []string{"2026-07-18", "2026-07-19"} {
+		if err := os.WriteFile(filepath.Join(dir, day+spoolSuffix), []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	calls := 0
+	drain(dir, time.Now(), func([]byte) error {
+		calls++
+		return errors.New("endpoint refused")
+	})
+	if calls != 1 {
+		t.Errorf("kept sending to a refusing endpoint: %d calls, want 1", calls)
+	}
+	// The attempted batch is dropped rather than requeued (no backlog to flush
+	// later), and the file the loop never reached is still there for a later
+	// run — so exactly one of the two remains.
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	if len(left) != 1 {
+		t.Fatalf("want 1 file left (the unattempted one), got %d: %v", len(left), left)
+	}
+	if left[0].Name() != "2026-07-19"+spoolSuffix {
+		t.Errorf("the failed batch was requeued instead of dropped: %s remains", left[0].Name())
+	}
+}
+
+func TestPurgeSpool(t *testing.T) {
+	dir := t.TempDir()
+	if err := appendEvent(SpoolDir(dir), Event{Command: "status"}, time.Now()); err != nil {
+		t.Fatalf("appendEvent: %v", err)
+	}
+	if err := PurgeSpool(dir); err != nil {
+		t.Fatalf("PurgeSpool: %v", err)
+	}
+	if _, err := os.Stat(SpoolDir(dir)); !os.IsNotExist(err) {
+		t.Error("spool directory survived the purge")
+	}
+	// Purging an already-absent spool is not an error — `telemetry off` must
+	// work on a machine that has never spooled anything.
+	if err := PurgeSpool(dir); err != nil {
+		t.Errorf("purging an absent spool errored: %v", err)
+	}
+	if err := PurgeSpool(""); err != nil {
+		t.Errorf("purging with no config dir errored: %v", err)
+	}
+}
+
+// writeClaim creates a claim file whose name carries stamp, the way drain
+// names its own claims.
+func writeClaim(t *testing.T, dir, day string, stamp time.Time) string {
+	t.Helper()
+	path := filepath.Join(dir, day+spoolSuffix+claimedMark+"999-"+strconv.FormatInt(stamp.UnixNano(), 10))
+	if err := os.WriteFile(path, []byte(`{"command":"status"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write claim: %v", err)
+	}
+	return path
 }
 
 // TestDrainExpiresAncientSpool: undelivered events must not linger forever.
@@ -513,20 +598,40 @@ func TestConcurrentDrainSendsEachBatchOnce(t *testing.T) {
 			t.Fatalf("appendEvent: %v", err)
 		}
 	}
+	// Age the spool file before the drainers run. This is what an ordinary
+	// prior-day spool file looks like, and it is what makes this test capable
+	// of failing: rename preserves mtime, so an implementation that ages claims
+	// by mtime sees every claim of this file as instantly abandoned and lets a
+	// second drainer adopt and re-send a batch that is still in flight.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	old := now.Add(-30 * time.Minute)
+	for _, e := range entries {
+		if err := os.Chtimes(filepath.Join(dir, e.Name()), old, old); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+
 	var mu sync.Mutex
 	var lines int
 	var wg sync.WaitGroup
-	for range 4 {
+	for i := range 4 {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
+			// Stagger, so later drainers scan while an earlier claim is live
+			// rather than all racing on the pre-claim name.
+			time.Sleep(time.Duration(i) * 50 * time.Millisecond)
 			drain(dir, time.Now(), func(b []byte) error {
+				time.Sleep(150 * time.Millisecond) // hold the claim, like a real POST
 				mu.Lock()
 				defer mu.Unlock()
 				lines += strings.Count(string(b), "\n")
 				return nil
 			})
-		}()
+		}(i)
 	}
 	wg.Wait()
 	if lines != 5 {

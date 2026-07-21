@@ -29,8 +29,8 @@ error class. No identifier is stored or sent, and never your data, schemas,
 tables, DSNs, hostnames, IPs or file paths. Run "telemetry show" to see the
 exact bytes that would be sent.
 
-Precedence, highest first: DO_NOT_TRACK, --telemetry, BINTRAIL_TELEMETRY,
-the config file, then the default (on).`,
+Precedence, highest first: DO_NOT_TRACK, --telemetry=on|off,
+BINTRAIL_TELEMETRY, the config file, then the default (on).`,
 }
 
 var telemetryStatusCmd = &cobra.Command{
@@ -50,6 +50,12 @@ var telemetryStatusCmd = &cobra.Command{
 		reporting := decision.Enabled && !isCI && ep != "" && dirErr == nil
 
 		if telFormat == "json" {
+			// With no home directory there is no spool; emit empty rather than
+			// a bare relative path that looks like a real location.
+			spool := ""
+			if dirErr == nil {
+				spool = telemetry.SpoolDir(dir)
+			}
 			return cliutil.OutputJSON(map[string]any{
 				"reporting":      reporting,
 				"consent":        decision.Enabled,
@@ -57,7 +63,7 @@ var telemetryStatusCmd = &cobra.Command{
 				"endpoint_set":   ep != "",
 				"ci_detected":    isCI,
 				"config_dir":     dir,
-				"spool_dir":      telemetry.SpoolDir(dir),
+				"spool_dir":      spool,
 				"schema_version": telemetry.SchemaVersion,
 			})
 		}
@@ -126,11 +132,23 @@ func setTelemetry(cmd *cobra.Command, enabled bool) error {
 	if err := telemetry.SetEnabled(dir, enabled); err != nil {
 		return err
 	}
+	if !enabled {
+		// Events spooled before this decision would otherwise sit on disk
+		// forever: the drain only ever runs while telemetry is ENABLED, so
+		// nothing would ever send them or age them out. Reported as an error
+		// rather than swallowed — telling an operator "nothing will be sent"
+		// while their events are still on disk is the kind of half-truth this
+		// whole feature cannot afford.
+		if err := telemetry.PurgeSpool(dir); err != nil {
+			return fmt.Errorf("telemetry is now off, but discarding already-spooled events failed: %w", err)
+		}
+	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Telemetry %s (recorded in %s).\n",
 		onOff(enabled), telemetry.StatePath(dir))
 	if !enabled {
 		fmt.Fprintln(cmd.OutOrStdout(),
-			"Nothing further will be recorded or sent from this account.\n"+
+			"Nothing further will be recorded or sent, and anything already\n"+
+				"spooled locally has been discarded.\n"+
 				"To disable telemetry for every tool on this machine, set DO_NOT_TRACK=1.")
 	}
 	return nil
