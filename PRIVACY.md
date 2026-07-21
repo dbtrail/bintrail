@@ -1,6 +1,6 @@
 # Privacy Policy — dbtrail Claude Desktop extension (`dbtrail.mcpb`)
 
-*Last updated: 2026-07-18*
+*Last updated: 2026-07-21*
 
 This policy covers the **dbtrail desktop extension** — the `.mcpb` bundle that
 connects Claude Desktop to a self-hosted bintrail/dbtrail deployment — and the
@@ -13,6 +13,18 @@ The extension is a local bridge to **your own infrastructure**. dbtrail (the
 project and its maintainers) operates no servers in this flow, and **collects
 nothing**: no telemetry, no analytics, no crash reports, no account, no
 phone-home of any kind.
+
+That is a hard exclusion, not a default. The `bintrail-mcp` bridge is invoked
+by an AI client rather than by a person, so there is nobody present to consent
+and no terminal on which a notice could appear; it is therefore built so that
+it *cannot* report — a CI test (`TestMCPServerIsTelemetryFree`) fails the build
+if the binary ever links the telemetry package at all.
+
+The bintrail **command-line tools** are a separate matter: official release
+builds send metadata-only usage statistics (command names, version, platform,
+error class — never your data), on by default and disableable in one line. That
+is documented in full, including how to turn it off, in
+[TELEMETRY.md](TELEMETRY.md). It does not apply to this extension.
 
 ## What the extension does with data
 

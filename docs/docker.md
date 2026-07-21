@@ -497,3 +497,20 @@ dbtrail depends on DuckDB (`duckdb-go`) for querying Parquet archives. DuckDB's 
 ## Full demo
 
 For a complete demo stack with traffic generation, Prometheus, and Grafana dashboards, see `demo/compose.yml` and `demo/README.md`.
+
+## Usage telemetry
+
+Official release images report metadata-only usage statistics (command name,
+version, OS/arch, error class — never your data). Disable it for a stack in
+`docker-compose.yml`:
+
+```yaml
+services:
+  bintrail:
+    environment:
+      BINTRAIL_TELEMETRY: "off"     # or DO_NOT_TRACK=1
+```
+
+The **demo image** (`ghcr.io/dbtrail/bintrail-demo`) never reports, regardless
+of configuration — it is hard-disabled in the image and asserted by its smoke
+test. See [TELEMETRY.md](../TELEMETRY.md).

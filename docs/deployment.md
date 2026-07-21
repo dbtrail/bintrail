@@ -585,3 +585,25 @@ If you see GTID-related errors:
 - Ensure `--server-id` is unique across all MySQL replication clients connected to the source
 - Do not use server IDs in the range the source MySQL uses (check `SHOW VARIABLES LIKE 'server_id'` on source)
 - For RDS/Aurora: use server IDs > 1000000 to avoid conflicts with AWS-managed replicas
+
+## Usage telemetry
+
+Official release builds report metadata-only usage statistics (command name,
+version, OS/arch, error class — never your data). Long-running units send at
+most one beacon per UTC day and log one line at startup when reporting is on.
+
+To disable it across a deployment, set it in the unit file rather than per
+host:
+
+```ini
+[Service]
+Environment=BINTRAIL_TELEMETRY=off
+```
+
+Note that telemetry state otherwise lives in a home directory, so **a setting
+baked into a golden image travels with the image** — every host cloned from it
+inherits the choice made on the machine the image was built from. Setting the
+environment variable in the unit is what makes that explicit.
+
+A binary you build yourself has no reporting address compiled in and cannot
+send anything at all. See [TELEMETRY.md](../TELEMETRY.md).

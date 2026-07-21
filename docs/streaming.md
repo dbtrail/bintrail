@@ -325,3 +325,23 @@ The metrics HTTP server shuts down gracefully (5-second timeout) on command exit
 | **Suitable for systemd** | `Type=oneshot` | `Type=simple`, `Restart=always` |
 
 For managed MySQL, `stream` is the only option. For self-managed MySQL, both work — `index` is simpler for batch backfill, `stream` is better for continuous real-time indexing.
+
+## Usage telemetry
+
+`stream` reports metadata-only usage statistics in official release builds: at
+most one "still running" beacon per UTC day, plus the command's own outcome.
+Never your rows, schemas, table names, hostnames, DSNs, or binlog positions.
+
+It never runs on the replication path — events are appended to a local file and
+delivered by a background goroutine — so it cannot introduce replication lag.
+
+The daemon logs one line at startup when reporting is on. Disable it for a host
+or a fleet with either of:
+
+```sh
+BINTRAIL_TELEMETRY=off
+DO_NOT_TRACK=1
+```
+
+Full details, including every field and the tests that enforce them:
+[TELEMETRY.md](../TELEMETRY.md).

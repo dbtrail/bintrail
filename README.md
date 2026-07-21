@@ -85,12 +85,30 @@ See [the demo image](docs/demo.md).
 | | [Connect an AI assistant](docs/connect-ai.md) · [MCP server](docs/mcp-server.md) | [Parquet debugging](docs/parquet-debugging.md) |
 | | [Dump & Baseline](docs/dump-and-baseline.md) · [DDL tracking](docs/ddl-tracking.md) | |
 
-## Privacy Policy
+## Privacy
 
-bintrail runs entirely in your infrastructure and collects nothing — no
-telemetry, no analytics, no phone-home. The [privacy policy](PRIVACY.md)
-covers the Claude Desktop extension (`.mcpb`) and how data moves when an AI
-client queries your deployment.
+bintrail runs entirely in your infrastructure. **Your database data never
+leaves it** — not your rows, schemas, table names, queries, hostnames, DSNs, or
+file paths.
+
+Official release builds do report **metadata-only usage statistics**: which
+command ran, whether it succeeded, a coarse error class, and your version and
+platform. It is on by default and off in one line:
+
+```sh
+bintrail telemetry off      # or: DO_NOT_TRACK=1, BINTRAIL_TELEMETRY=off
+bintrail telemetry show     # see exactly what would be sent — sends nothing
+```
+
+No identifier of any kind is stored or transmitted, so there is nothing tying
+those statistics to you or your machine. A binary you build yourself has no
+reporting address compiled in and is incapable of sending anything.
+[TELEMETRY.md](TELEMETRY.md) documents every field, every control, and the CI
+tests that enforce both.
+
+The [privacy policy](PRIVACY.md) covers the Claude Desktop extension (`.mcpb`)
+— which reports nothing at all — and how data moves when an AI client queries
+your deployment.
 
 ## License
 
