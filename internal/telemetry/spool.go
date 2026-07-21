@@ -28,9 +28,13 @@ const (
 	// claimReclaimAfter is how long a claim may sit before another run adopts
 	// it. It exists for a drainer that died mid-flight — which is the COMMON
 	// case, not an exotic one: a sub-100ms command's process exits while its
-	// detached drain goroutine is still in its HTTP call. Comfortably longer
-	// than drainDeadline, so it can never steal from a drainer still working.
-	claimReclaimAfter = 5 * time.Minute
+	// detached drain goroutine is still in its HTTP call.
+	//
+	// It must exceed drainDeadline so it can never steal from a drainer that is
+	// genuinely still working; 30x that leaves ample margin while keeping
+	// recovery quick enough that an abandoned batch is not stranded for an
+	// afternoon.
+	claimReclaimAfter = time.Minute
 )
 
 // SpoolDir returns the spool directory inside dir.

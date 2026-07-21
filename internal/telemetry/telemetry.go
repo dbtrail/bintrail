@@ -50,6 +50,16 @@ func Endpoint() string { return endpoint }
 // the attempt is abandoned and the events wait for a later run.
 const drainDeadline = 2 * time.Second
 
+// shutdownGrace bounds how long a caller waits at exit for an in-flight drain.
+//
+// Without such a wait telemetry effectively never delivers for short commands:
+// the process exits microseconds after the drain goroutine starts, killing it
+// mid-POST and leaving a claim that the next fast run cannot adopt either.
+//
+// The cost is bounded and usually zero — a drain over an empty spool returns
+// at once, so a caller with nothing pending waits not at all.
+const shutdownGrace = 250 * time.Millisecond
+
 // Config parameterises Init. Every field has a sane zero value; tests override
 // the endpoint, directory, clock and TTY detection.
 type Config struct {
@@ -84,6 +94,9 @@ type Client struct {
 	runID       string
 	now         func() time.Time
 	http        *http.Client
+
+	// drained closes when the startup drain finishes; Shutdown waits on it.
+	drained chan struct{}
 
 	mu         sync.Mutex
 	lastBeacon time.Time
@@ -158,8 +171,30 @@ func Init(cfg Config) (c *Client) {
 		return c
 	}
 	c.maybeShowNotice(stderr)
-	go c.drainAsync()
+	c.drained = make(chan struct{})
+	go func() {
+		defer close(c.drained)
+		c.drainAsync()
+	}()
 	return c
+}
+
+// Shutdown gives an in-flight drain a brief chance to finish. Callers run it on
+// their exit path; it is safe to call more than once, and on a nil or disabled
+// client.
+//
+// It waits at most shutdownGrace and never returns an error: a drain that does
+// not make it is abandoned, its claim is adopted by a later run, and the
+// caller's exit is unaffected either way.
+func (c *Client) Shutdown() {
+	if !c.Enabled() || c.drained == nil {
+		return
+	}
+	select {
+	case <-c.drained:
+	case <-time.After(shutdownGrace):
+		debugf("drain still running at exit; leaving it for a later run")
+	}
 }
 
 // maybeShowNotice prints the first-run disclosure once, on an interactive

@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -553,6 +554,45 @@ func TestPurgeSpool(t *testing.T) {
 	}
 }
 
+// initDrained builds a client whose startup drain has already run to
+// completion.
+//
+// Necessary for any test that writes events and then inspects the spool: the
+// drain is a background goroutine, and if it scans AFTER the test has appended,
+// it legitimately claims that file, fails to deliver it to the dead endpoint,
+// and drops it — leaving the test reading an empty spool. Waiting costs nothing
+// here, since a drain over an empty spool returns immediately.
+func initDrained(t *testing.T, cfg Config) *Client {
+	t.Helper()
+	c := Init(cfg)
+	c.Shutdown()
+	return c
+}
+
+func TestShutdownIsSafeOnEveryClient(t *testing.T) {
+	clearEnv(t)
+	var nilClient *Client
+	nilClient.Shutdown() // must not panic
+
+	// Disabled client: no goroutine was ever started, so there is nothing to
+	// wait for and Shutdown must return at once rather than block for the grace
+	// period.
+	disabled := Init(Config{Dir: t.TempDir(), Stderr: &bytes.Buffer{}, Interactive: boolPtr(false)})
+	start := time.Now()
+	disabled.Shutdown()
+	disabled.Shutdown() // idempotent
+	if elapsed := time.Since(start); elapsed > shutdownGrace {
+		t.Errorf("Shutdown on a disabled client blocked for %v", elapsed)
+	}
+
+	enabled := Init(Config{
+		Dir: t.TempDir(), Endpoint: "http://127.0.0.1:1",
+		Stderr: &bytes.Buffer{}, Interactive: boolPtr(false),
+	})
+	enabled.Shutdown()
+	enabled.Shutdown()
+}
+
 // writeClaim creates a claim file whose name carries stamp, the way drain
 // names its own claims.
 func writeClaim(t *testing.T, dir, day string, stamp time.Time) string {
@@ -695,7 +735,7 @@ func TestCISuppressesReporting(t *testing.T) {
 func TestSpanRecordsToSpool(t *testing.T) {
 	clearEnv(t)
 	dir := t.TempDir()
-	c := Init(Config{
+	c := initDrained(t, Config{
 		Dir: dir, Endpoint: "http://127.0.0.1:1", Version: "0.40.0",
 		Stderr: &bytes.Buffer{}, Interactive: boolPtr(false),
 	})
@@ -726,7 +766,7 @@ func TestSpanRecordsToSpool(t *testing.T) {
 func TestBeaconCarriesNoRunID(t *testing.T) {
 	clearEnv(t)
 	dir := t.TempDir()
-	c := Init(Config{Dir: dir, Endpoint: "http://127.0.0.1:1", Stderr: &bytes.Buffer{}, Interactive: boolPtr(false)})
+	c := initDrained(t, Config{Dir: dir, Endpoint: "http://127.0.0.1:1", Stderr: &bytes.Buffer{}, Interactive: boolPtr(false)})
 	c.Beacon("stream")
 
 	e := readOneSpooledEvent(t, SpoolDir(dir))
@@ -743,10 +783,17 @@ func TestBeaconCarriesNoRunID(t *testing.T) {
 func TestBeaconAtMostOncePerUTCDay(t *testing.T) {
 	clearEnv(t)
 	dir := t.TempDir()
-	now := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
-	c := Init(Config{
+	base := time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC)
+
+	// The clock is atomic because Config.Now is called from the background drain
+	// goroutine as well as from this test — a plain variable is a data race that
+	// only -race reports, and CI runs with it.
+	var clock atomic.Int64
+	clock.Store(base.UnixNano())
+	c := initDrained(t, Config{
 		Dir: dir, Endpoint: "http://127.0.0.1:1", Stderr: &bytes.Buffer{},
-		Interactive: boolPtr(false), Now: func() time.Time { return now },
+		Interactive: boolPtr(false),
+		Now:         func() time.Time { return time.Unix(0, clock.Load()).UTC() },
 	})
 	for range 50 {
 		c.Beacon("stream")
@@ -755,7 +802,7 @@ func TestBeaconAtMostOncePerUTCDay(t *testing.T) {
 		t.Fatalf("same-day beacons recorded %d events, want 1", n)
 	}
 
-	now = now.Add(24 * time.Hour)
+	clock.Store(base.Add(24 * time.Hour).UnixNano())
 	c.Beacon("stream")
 	if n := countSpooledEvents(t, SpoolDir(dir)); n != 2 {
 		t.Errorf("next-day beacon recorded %d events total, want 2", n)
