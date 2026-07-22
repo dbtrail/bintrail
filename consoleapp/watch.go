@@ -417,6 +417,9 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		return err
 	}
 
+	// Wire the live telemetry client so the console's opt-out toggle stops this
+	// running daemon's beacons immediately, not just on the next start.
+	cfg.Telemetry = tel.Client()
 	srv, err := console.New(cfg)
 	if err != nil {
 		return err
@@ -581,6 +584,9 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		defer stopMetrics()
 	}
 
+	// Wire the live telemetry client so the console's opt-out toggle reaches
+	// this running daemon (see the other console.New site).
+	cfg.Telemetry = tel.Client()
 	srv, err := console.New(cfg)
 	if err != nil {
 		return err

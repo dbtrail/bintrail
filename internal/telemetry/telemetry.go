@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -84,7 +85,7 @@ type Config struct {
 // Client records usage events. The zero value and a nil *Client are both safe
 // and inert, so callers never need a nil check.
 type Client struct {
-	enabled     bool
+	enabled     atomic.Bool
 	decision    Decision
 	isCI        bool
 	dir         string
@@ -152,10 +153,6 @@ func Init(cfg Config) (c *Client) {
 	isCI := IsCI()
 
 	c = &Client{
-		// A CI run is nobody deciding anything, and an empty endpoint or missing
-		// config dir means there is nowhere to send or spool. All three suppress
-		// only — they can never turn telemetry ON.
-		enabled:     decision.Enabled && !isCI && ep != "" && dir != "",
 		decision:    decision,
 		isCI:        isCI,
 		dir:         dir,
@@ -167,8 +164,14 @@ func Init(cfg Config) (c *Client) {
 		now:         now,
 		http:        &http.Client{Timeout: drainDeadline},
 	}
+	// A CI run is nobody deciding anything, and an empty endpoint or missing
+	// config dir means there is nowhere to send or spool. All three suppress
+	// only — they can never turn telemetry ON. Stored atomically because a
+	// long-running daemon can flip consent at runtime (SetRuntimeConsent) while
+	// the beacon goroutine reads it.
+	c.enabled.Store(decision.Enabled && !isCI && ep != "" && dir != "")
 
-	if !c.enabled {
+	if !c.enabled.Load() {
 		return c
 	}
 	c.maybeShowNotice(stderr)
@@ -314,7 +317,20 @@ func (c *Client) logDaemonNotice() {
 }
 
 // Enabled reports whether this client will record anything.
-func (c *Client) Enabled() bool { return c != nil && c.enabled }
+func (c *Client) Enabled() bool { return c != nil && c.enabled.Load() }
+
+// SetRuntimeConsent flips THIS process's live reporting decision without a
+// restart — the console UI's opt-out toggle calls it so a long-running daemon
+// stops (or resumes) beaconing immediately instead of only on the next start.
+// It can never turn reporting ON where Init suppressed it (CI, no endpoint, no
+// config dir): those gates are re-applied. Persisting the choice across
+// restarts is the caller's job (SetEnabled); this only affects memory.
+func (c *Client) SetRuntimeConsent(enabled bool) {
+	if c == nil {
+		return
+	}
+	c.enabled.Store(enabled && !c.isCI && c.endpoint != "" && c.dir != "")
+}
 
 // Decision reports the resolved consent state and what decided it.
 func (c *Client) Decision() Decision {

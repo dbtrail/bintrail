@@ -1810,23 +1810,24 @@ async function renderStorage() {
   // instead of one error wiping the whole page. (A 401 inside api() raises the
   // sign-in gate and bumps serverGen, so the stale-render guard below bails.)
   const asErr = (err) => ({ error: (err && err.message) || String(err) });
-  const [serversRes, rotation, storage, baselines] = await Promise.all([
+  const [serversRes, rotation, storage, baselines, telemetry] = await Promise.all([
     api("/api/servers").catch(asErr),
     api("/api/rotation").catch(asErr),
     api("/api/storage").catch(asErr),
     api("/api/baselines").catch(asErr),
+    api("/api/telemetry").catch(asErr),
   ]);
   if (gen !== serverGen) return;
   // Same guard as renderOverview: a throw inside the build must show an
   // error, never leave the "Loading…" skeleton up forever.
   try {
-    buildStorage(serversRes, rotation, storage, baselines);
+    buildStorage(serversRes, rotation, storage, baselines, telemetry);
   } catch (err) {
     const v = VIEW(); clear(v); v.append(pageHead("Storage", null)); renderError(v, err);
   }
 }
 
-function buildStorage(serversRes, rotation, storage, baselines) {
+function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
   // serversRes is the raw /api/servers payload or {error} — archivingPanel
   // must be able to tell "failed to load" from "genuinely no sources", or a
   // transient 500 would render the affirmative "No monitored sources yet" lie.
@@ -1842,6 +1843,7 @@ function buildStorage(serversRes, rotation, storage, baselines) {
   const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
   cards.append(rotationCard(rotation));
   cards.append(credentialsCard(storage));
+  cards.append(telemetryCard(telemetry));
   cards.append(baselineSummaryCard(baselines, cur));
   v.append(cards);
 
@@ -1899,6 +1901,49 @@ function credentialsCard(storage) {
   card.append(adv);
   card.append(el("p", { class: "form-hint", text: "Note: an IAM role can still be active even if none of the signals above show as set." }));
   return card;
+}
+
+// telemetryCard shows the machine-wide usage-telemetry state and an opt-out
+// toggle. Turning it off here stops THIS running daemon's beacons immediately
+// (the daemon wired its live client) and persists the choice for every bintrail
+// process on the machine.
+function telemetryCard(t) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Usage telemetry" }));
+  if (!t || t.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not read telemetry state" + (t && t.error ? ": " + t.error : ".") }));
+    return card;
+  }
+  if (!t.endpoint_set) {
+    card.append(el("p", { class: "stg-hint", text: "This build sends no telemetry — no endpoint is compiled in." }));
+    return card;
+  }
+  card.append(el("p", { class: "stg-hint", text: t.reporting
+    ? "Sending metadata-only usage stats (command names, version, OS/arch, a bounded error class) to help prioritize the roadmap. Never your data, schemas, tables, DSNs, IPs, or any identifier."
+    : "Not sending any usage telemetry." }));
+  kvRow(card, "status", (t.reporting ? "On" : "Off") + (t.ci_detected ? " (suppressed: CI detected)" : ""));
+  if (t.overridden) {
+    const by = t.decided_by === "DO_NOT_TRACK" ? "the DO_NOT_TRACK environment variable"
+      : t.decided_by === "BINTRAIL_TELEMETRY" ? "the BINTRAIL_TELEMETRY environment variable"
+      : "the --telemetry flag";
+    card.append(el("p", { class: "form-hint", text: "Set by " + by + " on the daemon, which overrides this toggle — change it there." }));
+    return card;
+  }
+  card.append(el("div", { class: "stg-cardfoot" },
+    el("button", { class: "btn btn-sm", type: "button",
+      text: t.consent ? "Turn telemetry off" : "Turn telemetry on",
+      onclick: () => setTelemetry(!t.consent) })));
+  return card;
+}
+
+async function setTelemetry(enabled) {
+  try {
+    await api("/api/telemetry", { method: "POST", body: JSON.stringify({ enabled: enabled }) });
+  } catch (e) {
+    toast("Could not change telemetry: " + ((e && e.message) || e));
+    return;
+  }
+  toast(enabled ? "Telemetry turned on." : "Telemetry turned off — this daemon stops beaconing now.");
+  renderStorage();
 }
 
 function baselineSummaryCard(b, cur) {

@@ -95,6 +95,11 @@ type Config struct {
 	// where the trigger endpoint refuses with 403 and /api/capabilities reports
 	// verify_trigger:false. Set together with MonitorCtrl (both control-plane).
 	VerifyCtrl VerifyController
+	// Telemetry is the live usage-telemetry client, wired in by
+	// `bintrail-console watch` so the UI opt-out toggle stops the running
+	// daemon's beacons immediately. nil on the read-only console (serve), where
+	// the toggle still persists the machine-wide choice to the consent file.
+	Telemetry TelemetryController
 	// BaselineDir / BaselineS3 enable point-in-time reconstruct (Phase 2) on
 	// the boot entry. When either is set (and no RBAC profile is active), the
 	// "Reconstruct" surface is exposed. BaselineDir takes precedence;
@@ -173,6 +178,9 @@ type Server struct {
 	// verifyCtrl: non-nil only when the watch daemon opted into in-process
 	// verify runs (see Config.VerifyCtrl).
 	verifyCtrl VerifyController
+	// telemetry: non-nil only when a long-running console wired its live
+	// telemetry client (see Config.Telemetry), so the UI opt-out reaches it.
+	telemetry TelemetryController
 	// rotationDefaults are the daemon's --rotate-* values, the fallback GET
 	// /api/rotation reports when no console override is saved.
 	rotationDefaults RotationDefaults
@@ -327,6 +335,7 @@ func New(cfg Config) (*Server, error) {
 		monitorCtrl:      cfg.MonitorCtrl,
 		baselineCtrl:     cfg.BaselineCtrl,
 		verifyCtrl:       cfg.VerifyCtrl,
+		telemetry:        cfg.Telemetry,
 		rotationDefaults: cfg.RotationDefaults,
 		version:          cfg.Version,
 		cm:               newConnManager(cfg.Registry, profileActive),
@@ -420,6 +429,11 @@ func (s *Server) buildHandler() http.Handler {
 	// booleans and non-secret names — never values).
 	api.HandleFunc("GET /api/baselines", s.handleBaselines)
 	api.HandleFunc("GET /api/storage", s.handleStorageInfo)
+	// Usage-telemetry opt-out: read the machine-wide state, and toggle it (a
+	// local config write, not a data write). Available on any console; the UI
+	// surfaces it on the watch daemon that actually beacons.
+	api.HandleFunc("GET /api/telemetry", s.handleTelemetryGet)
+	api.HandleFunc("POST /api/telemetry", s.handleTelemetrySet)
 	// Server management: CRUD over the local registry file (never a DB write)
 	// plus a write-free test-connection probe. Same token + host guard as the
 	// data endpoints.
