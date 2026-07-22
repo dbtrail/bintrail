@@ -119,7 +119,8 @@ and searching events:
    was detected. Both fire for any source family. See
    [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
 6. **Settings** (under `watch` only) — **Storage** (rotation policy,
-   per-source S3 archiving, baseline snapshots, AWS credential signals — see
+   per-source S3 archiving, baseline snapshots, AWS credential signals, and a
+   usage-telemetry opt-out — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
    rotation dialog).
 
@@ -319,6 +320,12 @@ across the rotation dialog and the per-server edit form):
   start from. The empty states explain how to produce a first baseline
   (`bintrail dump` → `bintrail baseline`). When the **Create baseline** button
   is enabled (see below) it sits in this panel's header.
+- **Usage telemetry** — the current state of dbtrail's metadata-only usage
+  telemetry and a one-click opt-out. Turning it off stops this `watch` daemon's
+  beacons immediately (no restart) and records the machine-wide choice, exactly
+  like `bintrail telemetry off`. When an environment variable (`DO_NOT_TRACK`,
+  `BINTRAIL_TELEMETRY`) or the `--telemetry` flag already controls it, the card
+  says so and defers to that. See [TELEMETRY.md](../TELEMETRY.md).
 
 #### Creating a baseline from the console
 

@@ -108,6 +108,24 @@ func TestHandleTelemetrySetWithoutLiveClient(t *testing.T) {
 	}
 }
 
+// A write under a higher-precedence control must be refused server-side (409),
+// never persisted, so a hand-crafted request can't flip the daemon past the
+// DO_NOT_TRACK / flag / env floor.
+func TestHandleTelemetrySetRefusesWhenOverridden(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DO_NOT_TRACK", "1")
+	s := &Server{} // no live client → Resolve sees DO_NOT_TRACK → overridden
+	rec := httptest.NewRecorder()
+	s.handleTelemetrySet(rec, httptest.NewRequest("POST", "/api/telemetry", strings.NewReader(`{"enabled":true}`)))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status %d, want 409 Conflict", rec.Code)
+	}
+	dir, _ := telemetry.ConfigDir()
+	if telemetry.Resolve("", dir).Source == telemetry.SourceConfig {
+		t.Error("wrote the config file despite a higher-precedence override")
+	}
+}
+
 // An env override must be reported so the UI can disable the toggle and explain.
 func TestHandleTelemetryGetOverriddenByEnv(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

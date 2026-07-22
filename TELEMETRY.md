@@ -13,6 +13,11 @@ BINTRAIL_TELEMETRY=off      # this environment, e.g. in a systemd unit
 bintrail --telemetry=off …  # this one invocation
 ```
 
+Or, if you run the web console (`bintrail-console watch`): open **Storage →
+Usage telemetry** and click the toggle. It stops the running daemon's beacons
+immediately (no restart) and records the same machine-wide choice as
+`bintrail telemetry off`.
+
 To see exactly what would be sent, byte for byte, without sending anything:
 
 ```sh
@@ -175,8 +180,14 @@ one did.
 | `DO_NOT_TRACK=1` | Off. Checked before any file is read or written |
 | `--telemetry=on\|off` | Off (or on) for this invocation |
 | `BINTRAIL_TELEMETRY=on\|off` | Off (or on) for this environment |
-| `~/.config/bintrail/telemetry.json` | Written by `bintrail telemetry on\|off` |
+| `~/.config/bintrail/telemetry.json` | Written by `bintrail telemetry on\|off`, or by the web console's **Storage → Usage telemetry** toggle |
 | *(nothing set)* | **On** |
+
+The console toggle writes that same file (so every bintrail process on the
+machine honours it from its next run) *and* flips the running `watch` daemon's
+live decision, so its beacons stop the moment you opt out. When a
+higher-precedence control above is in charge, the console shows that and defers
+to it rather than pretending to override it.
 
 `bintrail telemetry off` also deletes anything already spooled locally, so
 opting out does not leave earlier events sitting on your disk waiting for a

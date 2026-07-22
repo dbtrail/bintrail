@@ -89,6 +89,16 @@ func (s *Server) handleTelemetrySet(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+	// A higher-precedence control (DO_NOT_TRACK, --telemetry, or
+	// BINTRAIL_TELEMETRY) owns the decision: a config-file write here cannot
+	// change the outcome, and flipping the live client past that floor would
+	// break the precedence contract. Refuse — the UI already hides the toggle,
+	// this enforces it server-side.
+	if s.telemetryState().Overridden {
+		writeJSONError(w, http.StatusConflict,
+			"telemetry is controlled by an environment variable or launch flag on the daemon; change it there")
+		return
+	}
 	dir, err := telemetry.ConfigDir()
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "no config directory to record the choice")
