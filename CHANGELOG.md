@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Usage telemetry is now active in official release builds** (#1577). The ingestion endpoint (`internal/telemetry.endpoint`) is set via `-ldflags` for the `bintrail`, `bintrail-console`, and `bintrail-pg` release binaries — `bintrail-mcp` stays uninstrumented. Delivery goes to `https://telemetry.dbtrail.com`, a metadata-only ingestion host separate from the authenticated API: the request carries no credential and no account identifier, source IPs are stripped at the edge before any storage, and nothing beyond the closed 13-field allowlist (documented in `TELEMETRY.md`) is ever transmitted. A plain `go build` and the entire test suite remain inert (`telemetry status` → `not compiled in`). Opt out at any time with `bintrail telemetry off`, `DO_NOT_TRACK=1`, `BINTRAIL_TELEMETRY=off`, or `--telemetry=off`; run `bintrail telemetry show` to print the exact bytes that would be sent.
+
 ## [0.41.0] - 2026-07-21
 
 ### Added

@@ -30,6 +30,10 @@ builds:
       - -X main.Version={{.Version}}
       - -X main.CommitSHA={{.Commit}}
       - -X main.BuildDate={{.Date}}
+      # Telemetry ingestion endpoint (nethalo/dbtrail#1577). Empty in a plain
+      # `go build`; official release binaries point at the metadata-only
+      # ingestion host. bintrail-mcp is deliberately NOT instrumented.
+      - -X github.com/dbtrail/dbtrail/internal/telemetry.endpoint=https://telemetry.dbtrail.com/
 
   - id: bintrail-mcp
     binary: bintrail-mcp
@@ -88,6 +92,10 @@ builds:
       - -X main.Version={{.Version}}
       - -X main.CommitSHA={{.Commit}}
       - -X main.BuildDate={{.Date}}
+      # Telemetry ingestion endpoint (nethalo/dbtrail#1577). Empty in a plain
+      # `go build`; official release binaries point at the metadata-only
+      # ingestion host. bintrail-mcp is deliberately NOT instrumented.
+      - -X github.com/dbtrail/dbtrail/internal/telemetry.endpoint=https://telemetry.dbtrail.com/
 
   # bintrail-pg: the PostgreSQL-source binary (#534). Build-identical to
   # bintrail-console — it links DuckDB via the shared read plane (CGO) plus the
@@ -117,6 +125,10 @@ builds:
       - -X main.Version={{.Version}}
       - -X main.CommitSHA={{.Commit}}
       - -X main.BuildDate={{.Date}}
+      # Telemetry ingestion endpoint (nethalo/dbtrail#1577). Empty in a plain
+      # `go build`; official release binaries point at the metadata-only
+      # ingestion host. bintrail-mcp is deliberately NOT instrumented.
+      - -X github.com/dbtrail/dbtrail/internal/telemetry.endpoint=https://telemetry.dbtrail.com/
 
 archives:
   - formats:

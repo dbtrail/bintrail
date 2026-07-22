@@ -17,7 +17,7 @@ import (
 
 // endpoint is the ingestion URL, injected at build time:
 //
-//	-ldflags "-X github.com/dbtrail/dbtrail/internal/telemetry.endpoint=https://telemetry.dbtrail.io/v1/events"
+//	-ldflags "-X github.com/dbtrail/dbtrail/internal/telemetry.endpoint=https://telemetry.dbtrail.com/"
 //
 // It is EMPTY by default, which makes telemetry inert by construction: a
 // plain `go build`, `go test`, or a distribution packager's build produces a

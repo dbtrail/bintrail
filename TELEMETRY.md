@@ -147,7 +147,7 @@ appends one line to a local file. Delivery happens on a *later* run.
 - When several bintrail processes share a home directory, each batch is claimed
   by an atomic rename, so a batch is never sent twice or lost between them.
 
-Delivery goes to `https://telemetry.dbtrail.io` — a host separate from the
+Delivery goes to `https://telemetry.dbtrail.com` — a host separate from the
 authenticated dbtrail API, so telemetry traffic cannot be correlated with an
 account at the network layer. The request carries **no `Authorization` header,
 no cookie, and no account identifier**.
