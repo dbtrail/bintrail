@@ -275,8 +275,13 @@ func New(cfg Config) (*Server, error) {
 	// does — so it also lifts the non-loopback refusal. It does NOT change
 	// willSetup/setupAllowed: browser first-run password setup stays gated on
 	// loopback (or the explicit AllowSetup assertion) exactly as before.
+	// An installed credential backend (ext.ConsoleCredential) likewise is
+	// a credential path: it serves the login form, so it is folded into
+	// noCredential — a backend makes the bind legal AND closes first-run setup
+	// (a stray password file must not be creatable when a backend already holds
+	// the credentials), matching passwordLoginEnabled().
 	token := cfg.Token
-	noCredential := token == "" && !passwordCfg
+	noCredential := token == "" && !passwordCfg && ext.ConsoleCredential() == nil
 	willSetup := noCredential && (isLoopbackAddr(listen) || cfg.AllowSetup)
 	if noCredential && !willSetup && ext.ConsoleAuth() == nil {
 		return nil, fmt.Errorf("authentication is required when binding to a non-loopback address %q: set a console password with `bintrail-console user set-password`, set --token / BINTRAIL_CONSOLE_TOKEN for automation, or pass --allow-setup if this bind is access-controlled (e.g. published only on the host's loopback)", listen)

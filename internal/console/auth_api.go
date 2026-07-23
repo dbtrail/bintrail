@@ -83,6 +83,12 @@ func (s *Server) extSessionIssuer() ext.ConsoleSessionIssuer {
 // reads as enabled: login attempts against it fail loud (LoadAuthFile error)
 // rather than silently downgrading the console to token-only auth.
 func (s *Server) passwordLoginEnabled() bool {
+	// An installed credential backend serves the login form on its own — it
+	// supersedes the auth file, so its presence alone enables password login
+	// (and, via setupAllowed, closes first-run setup: a backend is a credential).
+	if ext.ConsoleCredential() != nil {
+		return true
+	}
 	if s.authPath == "" {
 		return false
 	}
@@ -195,6 +201,38 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusRequestEntityTooLarge
 		}
 		writeJSONError(w, status, "invalid JSON body")
+		return
+	}
+
+	// An installed credential backend (ext seam) SUPERSEDES the built-in auth
+	// file for login: the file is not consulted. The rate limiter, body cap, and
+	// content-type gate above already ran, and the backend owns the constant-time
+	// verify (its own dummy-hash-equivalent cost) — so the console only trades a
+	// non-nil result for a session, and renders one uniform 401 for a nil one.
+	if backend := ext.ConsoleCredential(); backend != nil {
+		cred := backend.Verify(req.Username, req.Password)
+		if cred == nil {
+			s.loginLimiter.Fail(ip)
+			// Uniform body, and the attempted username is NEVER logged (as with
+			// the built-in path — a password often lands in the username field).
+			slog.Warn("console login failed", "remote", ip)
+			writeJSONError(w, http.StatusUnauthorized, "invalid username or password")
+			return
+		}
+		s.loginLimiter.Success(ip)
+		token, expires, err := s.sessions.IssueWithPolicy(cred.Policy)
+		if err != nil {
+			slog.Error("console session issue failed", "error", err)
+			writeJSONError(w, http.StatusInternalServerError, "something went wrong signing you in — try again")
+			return
+		}
+		// The verified identity is the operator's audit trail (like the external
+		// auth issuer); logged only on SUCCESS, where it is a real identity.
+		slog.Info("console login", "remote", ip, "identity", cred.Identity)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"token":      token,
+			"expires_at": expires.UTC().Format(time.RFC3339),
+		})
 		return
 	}
 
