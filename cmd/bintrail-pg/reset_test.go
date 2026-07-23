@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 )
@@ -98,8 +100,8 @@ func TestPGResetConfig_IndexOnlySkipsQuerySlot(t *testing.T) {
 // ─── resetPlan orchestration (seam-injected; no live DBs) ───────────────────────
 
 // okClear is a clearFn that records invocation and reports n rows cleared.
-func recordingClear(n int64, called *bool) func(context.Context) (int64, bool, error) {
-	return func(context.Context) (int64, bool, error) { *called = true; return n, false, nil }
+func recordingClear(n int64, called *bool) func(context.Context) (clearOutcome, error) {
+	return func(context.Context) (clearOutcome, error) { *called = true; return clearOutcome{rows: n}, nil }
 }
 
 // TestResetPlan_DropFailureLeavesCheckpoint is the load-bearing ordering guarantee
@@ -166,7 +168,7 @@ func TestResetPlan_AbsentSlot(t *testing.T) {
 func TestResetPlan_TableMissingNamesAmbiguity(t *testing.T) {
 	var out bytes.Buffer
 	dropFn := func(context.Context) (bool, error) { return true, nil }
-	clearFn := func(context.Context) (int64, bool, error) { return 0, true, nil } // 1146
+	clearFn := func(context.Context) (clearOutcome, error) { return clearOutcome{tableMissing: true}, nil } // 1146
 	if err := resetPlan(context.Background(), false, "s", &out, dropFn, clearFn); err != nil {
 		t.Fatalf("resetPlan: %v", err)
 	}
@@ -178,10 +180,126 @@ func TestResetPlan_TableMissingNamesAmbiguity(t *testing.T) {
 
 func TestResetPlan_ClearFailsAfterDropMentionsIndexOnly(t *testing.T) {
 	dropFn := func(context.Context) (bool, error) { return true, nil }
-	clearFn := func(context.Context) (int64, bool, error) { return 0, false, errors.New("index unreachable") }
+	clearFn := func(context.Context) (clearOutcome, error) { return clearOutcome{}, errors.New("index unreachable") }
 	err := resetPlan(context.Background(), false, "s", &bytes.Buffer{}, dropFn, clearFn)
 	if err == nil || !strings.Contains(err.Error(), "--index-only") {
 		t.Fatalf("a clear failure after a successful drop must hint --index-only, got %v", err)
+	}
+}
+
+// TestResetPlan_LossDetailSurfacesInOutput: when the clear stamped a continuity
+// loss, the operator-facing output must say so and carry the detail — a silent
+// stamp would leave the operator to discover the status banner by surprise.
+func TestResetPlan_LossDetailSurfacesInOutput(t *testing.T) {
+	var out bytes.Buffer
+	dropFn := func(context.Context) (bool, error) { return true, nil }
+	clearFn := func(context.Context) (clearOutcome, error) {
+		return clearOutcome{rows: 1, lossDetail: "was LSN 0/1A2B3C4"}, nil
+	}
+	if err := resetPlan(context.Background(), false, "s", &out, dropFn, clearFn); err != nil {
+		t.Fatalf("resetPlan: %v", err)
+	}
+	for _, want := range []string{"permanent continuity loss", "was LSN 0/1A2B3C4", "bintrail status"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output missing %q: %s", want, out.String())
+		}
+	}
+}
+
+// ─── clearCheckpoint (sqlmock; #1082 stamp-don't-DELETE contract) ───────────────
+
+// TestClearCheckpoint_RealCheckpointStampsLoss: discarding a real checkpoint must
+// stamp gap_lost_* IN the same UPDATE that clears the cursor (a single atomic
+// statement — stamp and clear can never be torn apart) and report the discarded
+// LSN in the loss detail.
+func TestClearCheckpoint_RealCheckpointStampsLoss(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT binlog_position FROM stream_state").
+		WillReturnRows(sqlmock.NewRows([]string{"binlog_position"}).AddRow(uint64(0x1A2B3C4)))
+	mock.ExpectExec(`UPDATE stream_state SET\s+gap_lost_at\s+= UTC_TIMESTAMP\(\)`).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	res, err := clearCheckpoint(context.Background(), db)
+	if err != nil || res.tableMissing || res.rows != 1 {
+		t.Fatalf("clearCheckpoint = (%+v, %v), want rows=1", res, err)
+	}
+	for _, want := range []string{"0/1A2B3C4", "bintrail-pg reset", "permanently lost"} {
+		if !strings.Contains(res.lossDetail, want) {
+			t.Errorf("lossDetail %q missing %q", res.lossDetail, want)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a real checkpoint must be stamped as lost while clearing: %v", err)
+	}
+}
+
+// TestClearCheckpoint_NoCheckpointPreservesPriorLoss: a row without a durable
+// checkpoint (position 0 — a lost-slot stamp, a pre-commit health snapshot, or an
+// earlier reset) discards nothing: the clear must NOT touch gap_lost_* (the
+// expected UPDATE starts at binlog_file; a stamping UPDATE would go unmatched)
+// and no loss is reported.
+func TestClearCheckpoint_NoCheckpointPreservesPriorLoss(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT binlog_position FROM stream_state").
+		WillReturnRows(sqlmock.NewRows([]string{"binlog_position"}).AddRow(0))
+	mock.ExpectExec(`UPDATE stream_state SET\s+binlog_file`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	res, err := clearCheckpoint(context.Background(), db)
+	if err != nil || res.rows != 1 || res.lossDetail != "" {
+		t.Fatalf("clearCheckpoint = (%+v, %v), want rows=1 and no loss detail", res, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a no-checkpoint clear must leave gap_lost_* untouched: %v", err)
+	}
+}
+
+// TestClearCheckpoint_NoRow: never streamed → nothing to clear, nothing to stamp
+// (sqlmock would error on any unexpected UPDATE).
+func TestClearCheckpoint_NoRow(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT binlog_position FROM stream_state").WillReturnError(sql.ErrNoRows)
+
+	res, err := clearCheckpoint(context.Background(), db)
+	if err != nil || res.rows != 0 || res.tableMissing || res.lossDetail != "" {
+		t.Fatalf("clearCheckpoint = (%+v, %v), want the zero outcome", res, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("no row must mean no writes: %v", err)
+	}
+}
+
+// TestClearCheckpoint_TableMissing: MySQL 1146 on the load reports tableMissing
+// rather than erroring, matching the old DELETE behavior.
+func TestClearCheckpoint_TableMissing(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SELECT binlog_position FROM stream_state").
+		WillReturnError(&mysql.MySQLError{Number: 1146})
+
+	res, err := clearCheckpoint(context.Background(), db)
+	if err != nil || !res.tableMissing {
+		t.Fatalf("clearCheckpoint = (%+v, %v), want tableMissing", res, err)
 	}
 }
 

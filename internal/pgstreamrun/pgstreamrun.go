@@ -550,6 +550,17 @@ func loadStreamStatePG(db *sql.DB) (*pgStreamState, error) {
 	if flavor != pgFlavor {
 		return nil, fmt.Errorf("pgstreamrun: index database holds a %q checkpoint, not %q — refusing to stream a PostgreSQL source into a non-PostgreSQL index", flavor, pgFlavor)
 	}
+	if lsn == 0 {
+		// A row without a durable LSN cursor is NOT a resumable checkpoint.
+		// saveCheckpointPG never writes position 0 (the loop skips lastCommitLSN==0,
+		// and 0/0 is not a valid PostgreSQL LSN), so a zero-position row was seeded
+		// by persistSlotLostPG/saveSourceHealth before any commit, or is the cleared
+		// row `bintrail-pg reset` leaves behind (#1082: reset preserves the row so a
+		// gap_lost_* continuity-loss record survives it). Treat it as first-run —
+		// the capturer creates a fresh slot instead of demanding the one reset just
+		// dropped — and leave the loss record untouched for `status` to surface.
+		return nil, nil
+	}
 	return &pgStreamState{lsn: lsn, eventsIndexed: eventsIndexed, serverID: serverID, lastEventTime: lastEventTime}, nil
 }
 

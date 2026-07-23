@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/jackc/pglogrepl"
 
 	"github.com/dbtrail/dbtrail/internal/pgcapture"
@@ -112,6 +114,70 @@ func TestBuildProbeErrorJSON(t *testing.T) {
 	}
 	if _, present := gm["probe_error"]; present {
 		t.Errorf("a healthy snapshot must omit probe_error, got %v", gm["probe_error"])
+	}
+}
+
+// ─── loadStreamStatePG (sqlmock; the #1082 fresh-start contract) ────────────────
+
+func mockStateRows(flavor string, lsn uint64) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"flavor", "binlog_position", "events_indexed", "server_id", "last_event_time"}).
+		AddRow(flavor, lsn, 12, 9, nil)
+}
+
+// TestLoadStreamStatePG_ZeroPositionIsFresh (#1082): a stream_state row without a
+// durable LSN cursor — seeded by a lost-slot stamp or a pre-commit health snapshot,
+// or the cleared row `bintrail-pg reset` leaves behind so gap_lost_* survives — must
+// read as "no checkpoint" (nil), so the capturer creates a fresh slot instead of
+// demanding the one reset just dropped (ExpectExistingSlot stays false).
+func TestLoadStreamStatePG_ZeroPositionIsFresh(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT flavor, binlog_position").WillReturnRows(mockStateRows("postgres", 0))
+
+	saved, err := loadStreamStatePG(db)
+	if err != nil {
+		t.Fatalf("loadStreamStatePG: %v", err)
+	}
+	if saved != nil {
+		t.Fatalf("a zero-position row must read as first-run (nil), got %+v", saved)
+	}
+}
+
+// TestLoadStreamStatePG_RealCheckpointResumes: the ordinary resume path is untouched
+// by the #1082 change — a non-zero cursor loads as a resumable checkpoint.
+func TestLoadStreamStatePG_RealCheckpointResumes(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT flavor, binlog_position").WillReturnRows(mockStateRows("postgres", 27439044))
+
+	saved, err := loadStreamStatePG(db)
+	if err != nil || saved == nil {
+		t.Fatalf("loadStreamStatePG = (%+v, %v), want a checkpoint", saved, err)
+	}
+	if saved.lsn != 27439044 || saved.eventsIndexed != 12 || saved.serverID != 9 {
+		t.Errorf("checkpoint misloaded: %+v", saved)
+	}
+}
+
+// TestLoadStreamStatePG_FlavorGuardBeatsZeroPosition: the flavor guard stays FIRST —
+// even a zero-position row of another flavor refuses loud (a cleared MySQL checkpoint
+// still marks a MySQL index; treating it as PG-fresh would clobber a foreign index).
+func TestLoadStreamStatePG_FlavorGuardBeatsZeroPosition(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT flavor, binlog_position").WillReturnRows(mockStateRows("mysql", 0))
+
+	if _, err := loadStreamStatePG(db); err == nil || !strings.Contains(err.Error(), `"mysql"`) {
+		t.Fatalf("a non-postgres row must refuse loud even at position 0, got %v", err)
 	}
 }
 
