@@ -140,6 +140,9 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	}
 	// #775: in position mode this persists the last safe boundary, not the
 	// per-event offset (see checkpointPosition).
+	// mode is in the UPDATE arm for the cross-mode --reset path (#1079): the
+	// reset no longer DELETEs the row, so the mode switch must land through
+	// this upsert. For every other caller mode is invariant across the run.
 	file, pos := checkpointPosition(state)
 	// #959: bound the checkpoint write with a deadline (see indexer.WriteTimeout)
 	// so a mid-statement network stall fails fast instead of freezing the daemon
@@ -152,6 +155,7 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 		     events_indexed, last_event_time, last_checkpoint, server_id, bintrail_id)
 		VALUES (1, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?, ?)
 		ON DUPLICATE KEY UPDATE
+		    mode            = VALUES(mode),
 		    binlog_file     = VALUES(binlog_file),
 		    binlog_position = VALUES(binlog_position),
 		    gtid_set        = VALUES(gtid_set),
@@ -273,8 +277,8 @@ func deleteEventsSinceCheckpointGTID(db *sql.DB, file string, pos uint64, savedS
 // loud; a failed stamp aborts startup with the OLD checkpoint intact, so the gap
 // is re-detected and re-recorded on the next start. saveCheckpoint's upsert does
 // not touch the gap_lost_* columns, so the stamp survives it. Cleared by an
-// explicit monitor Stop; --reset re-stamps it with the discarded range (#1079)
-// instead of clearing.
+// explicit monitor Stop; a jumping --reset re-stamps it with the discarded
+// range (#1079) and a same-position --reset leaves it intact.
 func persistGapAutoAdvance(db *sql.DB, advanced *streamState, gapMessage string) error {
 	if _, err := db.Exec(`UPDATE stream_state
 		SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ?
@@ -290,17 +294,27 @@ func persistGapAutoAdvance(db *sql.DB, advanced *streamState, gapMessage string)
 // resetJumpDetail classifies a --reset checkpoint discard. It returns
 // noop=true when the new start position equals the discarded checkpoint —
 // nothing was skipped. Otherwise it returns a human-readable description of
-// the jumped-over range, suitable for gap_lost_detail. Cross-mode discards
-// (position→gtid or the reverse) have no comparable coordinates and are
-// conservatively treated as a jump.
-func resetJumpDetail(old *streamState, mode, file string, pos uint32, gtidSet string) (noop bool, detail string) {
+// the jumped-over range, suitable for gap_lost_detail. The check is
+// deliberately conservative in three ways: cross-mode discards (position→gtid
+// or the reverse) have no comparable coordinates and are treated as a jump;
+// direction is not inferred, so a reset to an EARLIER position also records a
+// loss verdict; and equality is coordinates-only — after a source rebuild
+// (RESET MASTER + restore) the same coordinates can name a different history,
+// which no checkpoint comparison can see. GTID sets are compared structurally
+// with the parser for flavor (MySQL UUID sets vs MariaDB domain-server-seq),
+// so formatting differences never fake a jump on either flavor.
+func resetJumpDetail(old *streamState, flavor, mode, file string, pos uint32, gtidSet string) (noop bool, detail string) {
 	switch {
 	case old.mode == "position" && mode == "position":
 		if old.binlogFile == file && old.binlogPos == uint64(pos) {
 			return true, ""
 		}
 	case old.mode == "gtid" && mode == "gtid":
-		if gtidSetsEqual(old.gtidSet, gtidSet) {
+		equal := gtidSetsEqual
+		if flavor == gomysql.MariaDBFlavor {
+			equal = mariadbGTIDSetsEqual
+		}
+		if equal(old.gtidSet, gtidSet) {
 			return true, ""
 		}
 	}
@@ -308,6 +322,34 @@ func resetJumpDetail(old *streamState, mode, file string, pos uint32, gtidSet st
 		"checkpoint discarded via --reset: was %s, restarting at %s; events in between were skipped and are permanently lost",
 		describeCheckpoint(old.mode, old.binlogFile, old.binlogPos, old.gtidSet),
 		describeCheckpoint(mode, file, uint64(pos), gtidSet))
+}
+
+// persistResetDiscard durably persists a --reset checkpoint discard once the
+// new start position is resolved. A jump is recorded exactly like an
+// unfillable-gap auto-advance: gap_lost stamp FIRST, then the fresh
+// checkpoint (the #402 ordering invariant, via persistGapAutoAdvance),
+// user-visible output and the supervisor hook only after the record is
+// durable. A no-op discard skipped nothing, so only the fresh checkpoint is
+// written and any prior gap_lost record is left untouched; a jump replaces a
+// prior record's detail with the reset detail (the loss flag itself never
+// clears here — monitor Stop remains the acknowledgment path).
+func persistResetDiscard(db *sql.DB, fresh *streamState, noop bool, detail string, hooks *Hooks) error {
+	if noop {
+		if err := saveCheckpoint(db, fresh); err != nil {
+			return fmt.Errorf("failed to persist reset checkpoint: %w", err)
+		}
+		slog.Info("--reset discarded a checkpoint at the same position; nothing was skipped")
+		return nil
+	}
+	slog.Warn("--reset is skipping binlog history", "detail", detail)
+	if err := persistGapAutoAdvance(db, fresh, detail); err != nil {
+		return err
+	}
+	fmt.Printf("Reset: %s\n", detail)
+	if hooks != nil && hooks.OnGapAutoAdvance != nil {
+		hooks.OnGapAutoAdvance(detail)
+	}
+	return nil
 }
 
 // describeCheckpoint renders a checkpoint's coordinates for human-readable
@@ -1700,41 +1742,26 @@ func One(ctx context.Context, cfg Config) error {
 	}
 
 	// Persist the --reset discard now that the new start position is known
-	// (#1079). A real jump is durably recorded exactly like an unfillable-gap
-	// auto-advance — gap_lost stamp FIRST, then the fresh checkpoint (the #402
-	// ordering invariant), plus the supervisor hook so the console reflects
-	// the loss. A no-op reset (new start equals the discarded checkpoint)
-	// skipped nothing, so only the fresh checkpoint is written; prior
-	// gap_lost history is preserved either way (monitor Stop remains the
-	// acknowledgment path — reset no longer erases loss records).
+	// (#1079) — see persistResetDiscard for the jump/no-op semantics. The
+	// counters restart with the stream: the in-memory streaming state below
+	// starts from zero when saved is nil, so eventsIndexed/lastEventTime are
+	// deliberately NOT carried from the discarded checkpoint (the first
+	// checkpoint tick would overwrite a carried value anyway).
 	if resetDiscarded != nil {
 		fresh := &streamState{
-			mode:          mode,
-			binlogFile:    startFile,
-			binlogPos:     uint64(startPos),
-			safeFile:      startFile,
-			safePos:       uint64(startPos),
-			gtidSet:       startGTIDStr,
-			flavor:        cfg.Flavor,
-			serverID:      cfg.ServerID,
-			bintrailID:    bintrailID,
-			eventsIndexed: resetDiscarded.eventsIndexed,
-			lastEventTime: resetDiscarded.lastEventTime,
+			mode:       mode,
+			binlogFile: startFile,
+			binlogPos:  uint64(startPos),
+			safeFile:   startFile,
+			safePos:    uint64(startPos),
+			gtidSet:    startGTIDStr,
+			flavor:     cfg.Flavor,
+			serverID:   cfg.ServerID,
+			bintrailID: bintrailID,
 		}
-		if noop, detail := resetJumpDetail(resetDiscarded, mode, startFile, startPos, startGTIDStr); noop {
-			if err := saveCheckpoint(indexDB, fresh); err != nil {
-				return fmt.Errorf("failed to persist reset checkpoint: %w", err)
-			}
-			slog.Info("--reset discarded a checkpoint at the same position; nothing was skipped")
-		} else {
-			slog.Warn("--reset is skipping binlog history", "detail", detail)
-			fmt.Printf("Reset: %s\n", detail)
-			if err := persistGapAutoAdvance(indexDB, fresh, detail); err != nil {
-				return err
-			}
-			if cfg.Hooks != nil && cfg.Hooks.OnGapAutoAdvance != nil {
-				cfg.Hooks.OnGapAutoAdvance(detail)
-			}
+		noop, detail := resetJumpDetail(resetDiscarded, cfg.Flavor, mode, startFile, startPos, startGTIDStr)
+		if err := persistResetDiscard(indexDB, fresh, noop, detail, cfg.Hooks); err != nil {
+			return err
 		}
 	}
 

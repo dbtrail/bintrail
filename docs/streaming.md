@@ -114,9 +114,9 @@ bintrail stream \
   --reset
 ```
 
-`--reset` clears the saved checkpoint in `stream_state` before starting, forcing the command to use the `--start-file`/`--start-gtid` flags from the command line. Without `--reset`, the saved checkpoint always takes precedence.
+`--reset` discards the saved checkpoint in `stream_state` and replaces it once the new start position is resolved, forcing the command to use the `--start-file`/`--start-gtid` flags from the command line. Without `--reset`, the saved checkpoint always takes precedence.
 
-**`--reset` skips history permanently.** Every event between the discarded checkpoint and the new start position is never indexed. When the discard actually jumps over binlog history, the skipped range is durably recorded as a continuity loss (`gap_lost_at` / `gap_lost_detail` in `stream_state`) — `bintrail status` shows the `EVENTS PERMANENTLY LOST` banner and `status --fail-on-gap` exits non-zero, exactly as after an unfillable-gap auto-advance. A reset that lands on the same position it discarded records nothing (nothing was skipped).
+**`--reset` skips history permanently.** Every event between the discarded checkpoint and the new start position is never indexed. A reset that lands anywhere other than the discarded checkpoint's exact coordinates — including an *earlier* position (direction is not inferred) — is durably recorded as a continuity loss (`gap_lost_at` / `gap_lost_detail` in `stream_state`): `bintrail status` shows the `EVENTS PERMANENTLY LOST` banner and `status --fail-on-gap` exits non-zero, exactly as after an unfillable-gap auto-advance. Such a reset also replaces the detail text of any earlier, still-unacknowledged loss record. A reset that lands on the same coordinates it discarded records nothing and leaves any prior loss record untouched — note the check is coordinates-only: after a source rebuild (`RESET MASTER` + restore) the same coordinates can name a different history.
 
 **When to use `--reset`:**
 - Switching from position mode to GTID mode (or vice versa)

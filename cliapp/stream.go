@@ -36,8 +36,9 @@ Use --reset to clear the saved checkpoint and force a new start position:
   bintrail stream --reset --start-file mysql-bin.000500 ...
 
 Without --reset, the checkpoint always wins (idempotent behavior is preserved).
-Resetting past a saved checkpoint permanently skips every event between the
-discarded checkpoint and the new start position; the skipped range is durably
+Resetting to any position other than the saved checkpoint — later or earlier;
+direction is not inferred — permanently skips every event between the discarded
+checkpoint and the new start position, and the skipped range is durably
 recorded as lost (surfaced by 'bintrail status' and its --fail-on-gap flag).
 
 Gap detection: on restart, bintrail checks whether the source still has the
