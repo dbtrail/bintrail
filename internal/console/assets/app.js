@@ -2720,8 +2720,21 @@ async function gateCapabilities() {
   extViews = Array.isArray(capsCache.extension_views) ? capsCache.extension_views : [];
   syncExtNav();
   $all("[data-capability]").forEach((node) => node.classList.toggle("cap-on", !!capsCache[node.dataset.capability]));
+  gatePermissions();
   applyAuthGate();
   updateSrvNote(); // capsCache.monitor may have just changed
+}
+
+// gatePermissions hides a [data-perm] surface when the session's policy denies
+// that permission (per-session RBAC, #1074). Default is VISIBLE: a policy-less
+// session — the static token, the password login, every OSS session — reports
+// every permission true, so nothing is hidden and the UI is unchanged. A missing
+// permissions map (a degraded {} capabilities response) also leaves everything
+// visible: only an explicit `false` hides. The server's 403 is the real gate;
+// this just spares a scoped user a tab that would only error.
+function gatePermissions() {
+  const perms = capsCache.permissions || {};
+  $all("[data-perm]").forEach((node) => node.classList.toggle("perm-off", perms[node.dataset.perm] === false));
 }
 
 // syncExtNav rebuilds the extension-view nav group from extViews. Idempotent

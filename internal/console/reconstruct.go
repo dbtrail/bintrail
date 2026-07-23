@@ -87,6 +87,12 @@ type capabilitiesResponse struct {
 	// per entry. Generic by construction — the core names no specific view.
 	ExtensionViews []extensionViewDTO `json:"extension_views,omitempty"`
 	Auth           authCapsInfo       `json:"auth"`
+	// Permissions is this session's effective grant of every permission the core
+	// defines, for the SPA to gate its UI (hide tabs/buttons a scoped session
+	// cannot use). All-true for a policy-less session — the static token, the
+	// password login, and every OSS session — so the UI hides nothing there.
+	// Server-side 403 (authzMiddleware) is the real gate; this only tidies the UI.
+	Permissions map[string]bool `json:"permissions"`
 	// MCP: the /mcp endpoint is usable — a static console token or a
 	// UI-managed MCP token is configured (the endpoint's only accepted
 	// credentials; see mcp.go). Process-global, like Monitor. The frontend's
@@ -151,6 +157,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// only by the RBAC profile (which would make synthesis leak redacted data).
 		RecoverCascade: !s.rbacActive(),
 		Auth:           authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
+		Permissions:    permissionsForPolicy(policyFrom(r.Context())),
 		// The MCP endpoint accepts the static token or the UI-managed one
 		// (mcp.go refuses with 403 when neither is configured), so token
 		// presence IS the capability.

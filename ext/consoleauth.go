@@ -11,7 +11,16 @@ import (
 // bearer credential the browser presents on every /api call — the same
 // in-memory session a password login mints, with the same lifetime and
 // revocation behavior.
-type ConsoleSessionIssuer func(identity string) (token string, expiresAt time.Time, err error)
+//
+// policy scopes what the minted session may do (see AccessPolicy). Pass nil for
+// a full-access session — identical to what the built-in password login and the
+// static token mint. Only an EE build that maps roles onto permissions passes a
+// non-nil policy; the OSS core never does, so its sessions stay full-access.
+//
+// The policy parameter was added when per-session authorization landed. There is
+// no in-repo implementor of this seam, so the signature break is absorbed in one
+// release by the sole external caller (the SSO provider in the EE build).
+type ConsoleSessionIssuer func(identity string, policy *AccessPolicy) (token string, expiresAt time.Time, err error)
 
 // ConsoleAuthProvider plugs an external authentication flow (e.g. OIDC
 // single sign-on) into the web console's login surface. The console stays

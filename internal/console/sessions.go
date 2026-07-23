@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"sync"
 	"time"
+
+	"github.com/dbtrail/dbtrail/ext"
 )
 
 // Session lifetime policy. Unexported constants on purpose — no knobs in v1
@@ -30,6 +32,10 @@ const sessionPrefix = "bcs_"
 type session struct {
 	createdAt time.Time
 	lastSeen  time.Time
+	// policy is the session's access scope, or nil for a full-access session
+	// (what the password login and the static token mint). Set only when an
+	// external auth provider passed one to IssueWithPolicy — i.e. an EE build.
+	policy *ext.AccessPolicy
 }
 
 // sessionStore holds the in-memory login sessions. Keys are
@@ -56,10 +62,17 @@ func newSessionStore() *sessionStore {
 // raw token out of the map means a heap dump yields hashes, not credentials.
 func sessionKey(token string) [32]byte { return sha256.Sum256([]byte(token)) }
 
-// Issue mints a new session token: sessionPrefix + 64 hex chars (256 bits of
-// crypto/rand entropy). It sweeps expired entries and, if the store is still
-// at capacity, evicts the earliest-expiring session.
+// Issue mints a new full-access (policy-less) session — what the password login
+// and the static token mint. See IssueWithPolicy for the scoped variant.
 func (s *sessionStore) Issue() (token string, expiresAt time.Time, err error) {
+	return s.IssueWithPolicy(nil)
+}
+
+// IssueWithPolicy mints a new session token: sessionPrefix + 64 hex chars (256
+// bits of crypto/rand entropy), carrying policy as its access scope (nil = full
+// access). It sweeps expired entries and, if the store is still at capacity,
+// evicts the earliest-expiring session.
+func (s *sessionStore) IssueWithPolicy(policy *ext.AccessPolicy) (token string, expiresAt time.Time, err error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", time.Time{}, err
@@ -73,15 +86,24 @@ func (s *sessionStore) Issue() (token string, expiresAt time.Time, err error) {
 	if len(s.m) >= maxSessions {
 		s.evictEarliestLocked()
 	}
-	s.m[sessionKey(token)] = &session{createdAt: now, lastSeen: now}
+	s.m[sessionKey(token)] = &session{createdAt: now, lastSeen: now, policy: policy}
 	return token, now.Add(sessionAbsoluteTTL), nil
 }
 
 // Validate reports whether the presented token is a live session, refreshing
 // its idle timer (coarsely) on success. Expired entries are deleted lazily.
 func (s *sessionStore) Validate(token string) bool {
+	_, ok := s.Lookup(token)
+	return ok
+}
+
+// Lookup validates the presented token and, on success, returns its access
+// policy (nil for a full-access session). It refreshes the idle timer (coarsely)
+// and deletes an expired entry lazily — the same behavior Validate had; Validate
+// is now a thin wrapper. Nil-receiver-safe and fail-closed.
+func (s *sessionStore) Lookup(token string) (*ext.AccessPolicy, bool) {
 	if s == nil || token == "" {
-		return false
+		return nil, false
 	}
 	key := sessionKey(token)
 	now := s.now()
@@ -90,16 +112,16 @@ func (s *sessionStore) Validate(token string) bool {
 	defer s.mu.Unlock()
 	sess, ok := s.m[key]
 	if !ok {
-		return false
+		return nil, false
 	}
 	if s.expiredLocked(sess, now) {
 		delete(s.m, key)
-		return false
+		return nil, false
 	}
 	if now.Sub(sess.lastSeen) > lastSeenGranularity {
 		sess.lastSeen = now
 	}
-	return true
+	return sess.policy, true
 }
 
 // Revoke deletes the presented session, if any. Idempotent.

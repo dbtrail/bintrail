@@ -1112,6 +1112,14 @@ button { font-family: inherit; }
    .cap-on. The :not() + !important hides by default and restores the
    element's own display once gated on — no flash, no per-element value. */
 [data-capability]:not(.cap-on) { display: none !important; }
+/* Permission gating (per-session RBAC, #1074): a [data-perm] surface stays
+   VISIBLE by default and is hidden only when gatePermissions() marks it
+   .perm-off because the session's policy denies that permission. Opposite
+   default from capability gating on purpose: a policy-less session (the static
+   token, the password login, every OSS session) reports all permissions, so
+   nothing is ever marked .perm-off and the UI is unchanged. Server-side 403 is
+   the real gate; this only tidies the UI for a scoped EE session. */
+[data-perm].perm-off { display: none !important; }
 /* Source-family gating: a [data-flavor] form field is hidden until applyFlavor
    marks it .flavor-on for the selected source type. Same :not() + !important
    default-hide as capability gating — a class toggle, never a [hidden] toggle. */

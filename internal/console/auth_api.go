@@ -69,8 +69,8 @@ func (s *Server) handleAuthInfo(w http.ResponseWriter, r *http.Request) {
 // the returned token is a normal console session (same TTLs, same revocation).
 // The identity is logged for the operator's audit trail and never stored.
 func (s *Server) extSessionIssuer() ext.ConsoleSessionIssuer {
-	return func(identity string) (string, time.Time, error) {
-		token, expires, err := s.sessions.Issue()
+	return func(identity string, policy *ext.AccessPolicy) (string, time.Time, error) {
+		token, expires, err := s.sessions.IssueWithPolicy(policy)
 		if err != nil {
 			return "", time.Time{}, err
 		}

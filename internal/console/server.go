@@ -510,7 +510,11 @@ func (s *Server) buildHandler() http.Handler {
 			api.Handle(dataPrefix, s.rbacViewGuard(p.DataHandler(dataPrefix, s.consoleQueryContext)))
 		}
 	}
-	root.Handle("/api/", s.tokenMiddleware(api)) // credential on all other /api/*
+	// credential on all other /api/* (tokenMiddleware), then per-session
+	// authorization (authzMiddleware). authz is inert for policy-less sessions —
+	// the static token, the password login, and every OSS session — so this only
+	// enforces when an EE build attaches a policy via the session-issuer seam.
+	root.Handle("/api/", s.tokenMiddleware(s.authzMiddleware(api)))
 	// MCP endpoint (#1039): the four read-only tools over Streamable HTTP,
 	// token-authenticated (static or UI-managed — #1052), routed per server
 	// by URL path. Carries its own auth check (tokens only, no sessions —
