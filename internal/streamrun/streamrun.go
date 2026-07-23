@@ -300,8 +300,12 @@ func deleteEventsSinceCheckpointGTID(db *sql.DB, file string, pos uint64, savedS
 // checkpoint advanced, loss unrecorded. The existing-row arm updates ONLY the
 // gap_lost_* columns — the checkpoint advance still lands exclusively in the
 // second statement, preserving the stamp-before-advance ordering; the
-// missing-row arm seeds the advanced state and the stamp atomically, so the
-// advance cannot land without the stamp. Deliberately no RowsAffected check:
+// missing-row arm seeds the advanced state and the stamp atomically, so on that
+// arm the advance cannot land without the stamp. That guarantee is per-arm, not
+// per-pair: a row DELETEd between an existing-row stamp and saveCheckpoint is
+// re-seeded by saveCheckpoint's INSERT arm without gap_lost_* — a residual
+// milliseconds-wide window (vs the minutes-wide one this closes) that only a
+// single combined stamp+advance statement would eliminate. Deliberately no RowsAffected check:
 // go-sql-driver reports CHANGED rows, not matched, so an identical re-stamp
 // within the same UTC_TIMESTAMP() second (supervisor crash-loop) would report 0
 // and abort a healthy startup.
