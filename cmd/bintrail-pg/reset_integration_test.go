@@ -32,7 +32,7 @@ func TestClearCheckpoint_Integration(t *testing.T) {
 		INSERT INTO stream_state
 			(id, mode, flavor, binlog_file, binlog_position, gtid_set,
 			 events_indexed, server_id, last_checkpoint, gap_lost_at, gap_lost_detail)
-		VALUES (1, 'gtid', 'postgres', '0/1A2B3C4', 27439044, '0/1A2B3C4',
+		VALUES (1, 'gtid', 'postgres', '0/1A2B3C4', 27440068, '0/1A2B3C4',
 			 42, 9, UTC_TIMESTAMP(), UTC_TIMESTAMP(), 'prior slot loss')`); err != nil {
 		t.Fatalf("seed checkpoint: %v", err)
 	}
