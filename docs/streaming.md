@@ -116,6 +116,8 @@ bintrail stream \
 
 `--reset` clears the saved checkpoint in `stream_state` before starting, forcing the command to use the `--start-file`/`--start-gtid` flags from the command line. Without `--reset`, the saved checkpoint always takes precedence.
 
+**`--reset` skips history permanently.** Every event between the discarded checkpoint and the new start position is never indexed. When the discard actually jumps over binlog history, the skipped range is durably recorded as a continuity loss (`gap_lost_at` / `gap_lost_detail` in `stream_state`) — `bintrail status` shows the `EVENTS PERMANENTLY LOST` banner and `status --fail-on-gap` exits non-zero, exactly as after an unfillable-gap auto-advance. A reset that lands on the same position it discarded records nothing (nothing was skipped).
+
 **When to use `--reset`:**
 - Switching from position mode to GTID mode (or vice versa)
 - Forcing a restart from a known position after a disaster recovery

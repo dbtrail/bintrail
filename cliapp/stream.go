@@ -36,6 +36,9 @@ Use --reset to clear the saved checkpoint and force a new start position:
   bintrail stream --reset --start-file mysql-bin.000500 ...
 
 Without --reset, the checkpoint always wins (idempotent behavior is preserved).
+Resetting past a saved checkpoint permanently skips every event between the
+discarded checkpoint and the new start position; the skipped range is durably
+recorded as lost (surfaced by 'bintrail status' and its --fail-on-gap flag).
 
 Gap detection: on restart, bintrail checks whether the source still has the
 binlogs needed to resume from the checkpoint. If binlogs have been purged, it
@@ -93,7 +96,7 @@ func init() {
 	streamCmd.Flags().StringVar(&strmSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmFormat, "format", "text", "Output format: text or json")
-	streamCmd.Flags().BoolVar(&strmReset, "reset", false, "Clear saved checkpoint before starting (forces use of --start-file/--start-gtid)")
+	streamCmd.Flags().BoolVar(&strmReset, "reset", false, "Clear saved checkpoint before starting (forces use of --start-file/--start-gtid); the skipped range is recorded as permanently lost")
 	streamCmd.Flags().BoolVar(&strmNoGapFill, "no-gap-fill", false, "Refuse to start if an unfillable binlog gap is detected (instead of auto-advancing past purged data)")
 	streamCmd.Flags().IntVar(&strmGapTimeout, "gap-timeout", 30, "Timeout in seconds for the one-shot gap-detection queries run at startup (SHOW BINARY LOGS plus @@gtid_purged/@@gtid_executed on MySQL or BINLOG_GTID_POS/@@gtid_binlog_pos on MariaDB); raise on managed servers with many binlog files")
 	streamCmd.Flags().DurationVar(&indexer.WriteTimeout, "write-timeout", indexer.DefaultWriteTimeout, "Deadline for each index write (batch INSERT, checkpoint, digest lookup). A mid-statement network stall surfaces as an error within this window instead of freezing the stream on kernel TCP retransmission (~13-16 min). Raise for very large batches over a slow link")

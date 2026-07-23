@@ -273,7 +273,8 @@ func deleteEventsSinceCheckpointGTID(db *sql.DB, file string, pos uint64, savedS
 // loud; a failed stamp aborts startup with the OLD checkpoint intact, so the gap
 // is re-detected and re-recorded on the next start. saveCheckpoint's upsert does
 // not touch the gap_lost_* columns, so the stamp survives it. Cleared by an
-// explicit monitor Stop or --reset.
+// explicit monitor Stop; --reset re-stamps it with the discarded range (#1079)
+// instead of clearing.
 func persistGapAutoAdvance(db *sql.DB, advanced *streamState, gapMessage string) error {
 	if _, err := db.Exec(`UPDATE stream_state
 		SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ?
@@ -284,6 +285,38 @@ func persistGapAutoAdvance(db *sql.DB, advanced *streamState, gapMessage string)
 		return fmt.Errorf("failed to save advanced checkpoint: %w", err)
 	}
 	return nil
+}
+
+// resetJumpDetail classifies a --reset checkpoint discard. It returns
+// noop=true when the new start position equals the discarded checkpoint —
+// nothing was skipped. Otherwise it returns a human-readable description of
+// the jumped-over range, suitable for gap_lost_detail. Cross-mode discards
+// (position→gtid or the reverse) have no comparable coordinates and are
+// conservatively treated as a jump.
+func resetJumpDetail(old *streamState, mode, file string, pos uint32, gtidSet string) (noop bool, detail string) {
+	switch {
+	case old.mode == "position" && mode == "position":
+		if old.binlogFile == file && old.binlogPos == uint64(pos) {
+			return true, ""
+		}
+	case old.mode == "gtid" && mode == "gtid":
+		if gtidSetsEqual(old.gtidSet, gtidSet) {
+			return true, ""
+		}
+	}
+	return false, fmt.Sprintf(
+		"checkpoint discarded via --reset: was %s, restarting at %s; events in between were skipped and are permanently lost",
+		describeCheckpoint(old.mode, old.binlogFile, old.binlogPos, old.gtidSet),
+		describeCheckpoint(mode, file, uint64(pos), gtidSet))
+}
+
+// describeCheckpoint renders a checkpoint's coordinates for human-readable
+// loss records: "file:pos" in position mode, "gtid_set <set>" in GTID mode.
+func describeCheckpoint(mode, file string, pos uint64, gtidSet string) string {
+	if mode == "gtid" {
+		return fmt.Sprintf("gtid_set %s", gtidSet)
+	}
+	return fmt.Sprintf("%s:%d", file, pos)
 }
 
 // ─── TLS configuration ───────────────────────────────────────────────────────────────
@@ -1635,12 +1668,17 @@ func One(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to load stream state: %w", err)
 	}
 
+	// --reset discards the saved checkpoint so start resolution runs as a
+	// first run. The old state is kept aside instead of DELETEd here (#1079):
+	// the discard is persisted only after the new start position is known, so
+	// the jumped-over binlog range can be stamped as lost FIRST — and a
+	// startup failure in between leaves the old checkpoint (and any prior
+	// gap_lost record) intact.
+	var resetDiscarded *streamState
 	if cfg.Reset {
 		if saved != nil {
-			if _, err := indexDB.Exec(`DELETE FROM stream_state WHERE id = 1`); err != nil {
-				return fmt.Errorf("failed to reset stream state: %w", err)
-			}
-			slog.Warn("cleared saved checkpoint (--reset)", "old_mode", saved.mode,
+			resetDiscarded = saved
+			slog.Warn("discarding saved checkpoint (--reset)", "old_mode", saved.mode,
 				"old_file", saved.binlogFile, "old_pos", saved.binlogPos)
 			saved = nil
 		} else {
@@ -1659,6 +1697,45 @@ func One(ctx context.Context, cfg Config) error {
 	if saved == nil && cfg.StartFile == "" && cfg.StartGTID == "" && mode == "position" {
 		slog.Info("auto-discovered current binlog position", "file", startFile, "pos", startPos)
 		fmt.Printf("Start position: auto-discovered %s:%d ✓\n", startFile, startPos)
+	}
+
+	// Persist the --reset discard now that the new start position is known
+	// (#1079). A real jump is durably recorded exactly like an unfillable-gap
+	// auto-advance — gap_lost stamp FIRST, then the fresh checkpoint (the #402
+	// ordering invariant), plus the supervisor hook so the console reflects
+	// the loss. A no-op reset (new start equals the discarded checkpoint)
+	// skipped nothing, so only the fresh checkpoint is written; prior
+	// gap_lost history is preserved either way (monitor Stop remains the
+	// acknowledgment path — reset no longer erases loss records).
+	if resetDiscarded != nil {
+		fresh := &streamState{
+			mode:          mode,
+			binlogFile:    startFile,
+			binlogPos:     uint64(startPos),
+			safeFile:      startFile,
+			safePos:       uint64(startPos),
+			gtidSet:       startGTIDStr,
+			flavor:        cfg.Flavor,
+			serverID:      cfg.ServerID,
+			bintrailID:    bintrailID,
+			eventsIndexed: resetDiscarded.eventsIndexed,
+			lastEventTime: resetDiscarded.lastEventTime,
+		}
+		if noop, detail := resetJumpDetail(resetDiscarded, mode, startFile, startPos, startGTIDStr); noop {
+			if err := saveCheckpoint(indexDB, fresh); err != nil {
+				return fmt.Errorf("failed to persist reset checkpoint: %w", err)
+			}
+			slog.Info("--reset discarded a checkpoint at the same position; nothing was skipped")
+		} else {
+			slog.Warn("--reset is skipping binlog history", "detail", detail)
+			fmt.Printf("Reset: %s\n", detail)
+			if err := persistGapAutoAdvance(indexDB, fresh, detail); err != nil {
+				return err
+			}
+			if cfg.Hooks != nil && cfg.Hooks.OnGapAutoAdvance != nil {
+				cfg.Hooks.OnGapAutoAdvance(detail)
+			}
+		}
 	}
 
 	// ── 6b. Detect binlog gap ────────────────────────────────────────────
