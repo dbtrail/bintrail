@@ -155,7 +155,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		VerifyTrigger:   s.verifyCtrl != nil,
 		// recover-cascade is the free tier (like recover) and process-global, gated
 		// only by the RBAC profile (which would make synthesis leak redacted data).
-		RecoverCascade: !s.rbacActive(),
+		RecoverCascade: !s.rbacActiveFor(r),
 		Auth:           authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
 		Permissions:    permissionsForPolicy(policyFrom(r.Context())),
 		// The MCP endpoint accepts the static token or the UI-managed one
@@ -168,11 +168,15 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		Source: sourceMySQL,
 	}
 	if b, err := s.resolve(r); err == nil {
-		resp.Reconstruct = b.baselineConfigured
+		// A per-session data profile refuses reconstruct/cascade (baseline reads
+		// bypass redaction; cascade synthesis can't redact), so the advertised
+		// capabilities must go false for a profiled session too (#1075).
+		restricted := sessionRestricted(r)
+		resp.Reconstruct = b.baselineConfigured && !restricted
 		// Match the recover-cascade handler's Phase-2 gate exactly so the advertised
 		// capability can't over-promise (handler builds the provider only when both
 		// a baseline source and a resolver are present).
-		resp.RecoverCascadeBaseline = b.baselineConfigured && b.resolver != nil
+		resp.RecoverCascadeBaseline = b.baselineConfigured && b.resolver != nil && !restricted
 		// Verify's engine (baseline-anchored and live-source alike) carries no RBAC
 		// redaction — see verify_trigger.go — so this reuses baselineConfigured
 		// verbatim (not just b.baselineSrc != ""): that field already folds in
@@ -180,7 +184,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// too, so a no-archive server would otherwise advertise verify:true and
 		// then reliably fail with a coverage-gap error on any window touching a
 		// rotated-out hour — worse than just hiding it, like Reconstruct does.
-		if s.verifyCtrl != nil && !s.rbacActive() {
+		if s.verifyCtrl != nil && !s.rbacActiveFor(r) {
 			resp.Verify = b.baselineConfigured
 			if e, ok := s.selectedEntry(r); ok {
 				resp.VerifyLiveSource = e.SourceDSN != ""
@@ -204,7 +208,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	// (advertising a nav item that only 403s would be a lie) — and for an invalid
 	// id, which buildHandler declined to mount (advertising it would 404 the data
 	// route).
-	if p := ext.ConsoleView(); p != nil && !s.profileActive && ext.ValidConsoleViewID(p.ID()) {
+	if p := ext.ConsoleView(); p != nil && !s.profileActiveFor(r) && ext.ValidConsoleViewID(p.ID()) {
 		resp.ExtensionViews = []extensionViewDTO{{ID: p.ID(), Label: p.Label(), Script: p.Script()}}
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -254,6 +258,15 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	// bundle's baselineConfigured; see newBundleDerived for why archive access
 	// is required). Per-server enforcement matters: baseline reads bypass RBAC
 	// redaction, so the gate must not leak from one server's config to another.
+	// A session carrying a data profile is refused: reconstruct reads the
+	// baseline snapshot, which bypasses RBAC redaction (#1075). The per-bundle
+	// baselineConfigured already folds in the STARTUP profile; this adds the
+	// per-session one.
+	if sessionRestricted(r) {
+		writeJSONError(w, http.StatusForbidden,
+			"time-travel is unavailable while an access-control profile is active — baseline reads aren't redacted")
+		return
+	}
 	if !b.baselineConfigured {
 		writeJSONError(w, http.StatusNotFound,
 			"time-travel isn't available for this server (no baseline is set up, an access-control profile is active, or archive access is disabled)")

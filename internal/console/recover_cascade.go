@@ -82,7 +82,7 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 	// synthesis (#585), refuse cascade recovery whenever a profile is active. The
 	// capability gate is intended to hide the tab once the frontend lands (#580);
 	// this guard is the actual enforcement / defense-in-depth backstop.
-	if s.rbacActive() {
+	if s.rbacActiveFor(r) {
 		writeJSONError(w, http.StatusForbidden,
 			"recover-cascade is unavailable while an RBAC redaction profile is active "+
 				"(cascade victim synthesis cannot yet honor column redaction / table deny)")

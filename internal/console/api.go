@@ -201,7 +201,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rows, plan, err := s.fetch(r.Context(), b, opts)
+	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
+	if err != nil {
+		writeSessionProfileError(w, err)
+		return
+	}
+	rows, plan, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -244,6 +249,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
+	if err != nil {
+		writeSessionProfileError(w, err)
+		return
+	}
 	// Refuse to generate an undo script for the entire index; a recovery must
 	// be scoped to at least one schema.
 	if opts.Schema == "" {
@@ -267,7 +277,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// Coverage gaps come back in plan.GapHours and are surfaced as warnings
 	// below — the recover UI renders them, so an incomplete-coverage undo is
 	// flagged to the operator rather than silently presented as complete.
-	rows, plan, err := s.fetch(r.Context(), b, opts)
+	rows, plan, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -312,10 +322,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 			warnings = append([]string{
 				"Could not check whether this table is a foreign-key parent (detection failed: " + derr.Error() + "). If it is, any cascade-deleted child rows are NOT included in the script below — retry, or use recover-cascade to reconstruct them.",
 			}, warnings...)
-		case isParent && s.rbacActive():
+		case isParent && s.rbacActiveFor(r):
 			// Synthesis can't honor redaction (it would leak denied/redacted child
-			// rows), so it stays disabled under a profile — but SAY so, so a
-			// parent-only script is never silently presented as a full restore.
+			// rows), so it stays disabled under a profile — startup OR per-session
+			// (#1075) — but SAY so, so a parent-only script is never silently
+			// presented as a full restore.
 			warnings = append([]string{
 				"This table has ON DELETE CASCADE / SET NULL children, but cascade synthesis is disabled while an RBAC redaction profile is active — the script below re-creates the parent only; cascade-deleted child rows are NOT included.",
 			}, warnings...)

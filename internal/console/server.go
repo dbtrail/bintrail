@@ -202,6 +202,10 @@ type Server struct {
 	// generate/rotate/revoke handlers so changes apply without a restart.
 	mcpTokenPath string
 	managedTok   managedMCPToken
+	// sessionProfiles caches per-(server, profile) RBAC rules for per-session
+	// data-profile enforcement (#1075). Inert in OSS (no session ever carries a
+	// profile); populated lazily on the first profiled request.
+	sessionProfiles *profileRuleCache
 }
 
 // serverHeader selects the target server per request. Selection is stateless —
@@ -346,6 +350,7 @@ func New(cfg Config) (*Server, error) {
 		loginLimiter:     newLoginLimiter(),
 		tlsConf:          tlsConf,
 		mcpTokenPath:     mcpTokenPath,
+		sessionProfiles:  newProfileRuleCache(),
 	}
 	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot

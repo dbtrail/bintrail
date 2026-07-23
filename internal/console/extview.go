@@ -91,7 +91,7 @@ func (s *Server) consoleFetch(b *bundle) func(ctx context.Context, opts query.Op
 // because capabilities omit the view under a profile.
 func (s *Server) rbacViewGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.profileActive {
+		if s.profileActiveFor(r) {
 			writeJSONError(w, http.StatusForbidden,
 				"this view is unavailable while an access-control profile is active")
 			return

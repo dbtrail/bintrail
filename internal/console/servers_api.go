@@ -346,7 +346,8 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if dsn != old.DSN {
-		s.cm.evict(id) // connection points at the old DSN; close and reopen lazily
+		s.cm.evict(id)                    // connection points at the old DSN; close and reopen lazily
+		s.sessionProfiles.invalidate(id) // its cached profile rules were resolved against the old index (#1075)
 	} else {
 		s.cm.rebuildDerived(entry) // keep the db, recompute baseline/no-archive gates
 	}
@@ -369,6 +370,7 @@ func (s *Server) handleServersDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cm.evict(id)
+	s.sessionProfiles.invalidate(id) // purge its cached profile rules (#1075)
 	w.WriteHeader(http.StatusNoContent)
 }
 
