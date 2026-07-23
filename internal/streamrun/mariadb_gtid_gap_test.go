@@ -400,11 +400,18 @@ func advancedTestState() *streamState {
 	return &streamState{mode: "gtid", binlogFile: "mariadb-bin.000005", gtidSet: "0-2-71", flavor: gomysql.MariaDBFlavor, serverID: 99}
 }
 
+// Both persistGapAutoAdvance statements are INSERT INTO stream_state upserts
+// since #1081, so sqlmock expectations distinguish them by shape: the stamp
+// carries gap_lost_at, the checkpoint's UPDATE arm starts with mode.
+const (
+	stampStmtRE      = `(?s)INSERT INTO stream_state.*gap_lost_at`
+	checkpointStmtRE = `(?s)INSERT INTO stream_state.*ON DUPLICATE KEY UPDATE\s+mode\s+= VALUES\(mode\)`
+)
+
 // TestPersistGapAutoAdvance_stampsBeforeAdvance pins the data-loss-safety ordering
-// invariant: the gap_lost_at stamp (UPDATE) must be written BEFORE the advanced
-// checkpoint (the INSERT...ON DUPLICATE KEY upsert). sqlmock matches expectations
-// in order by default, so declaring UPDATE-then-INSERT fails if the code advances
-// the checkpoint first.
+// invariant: the gap_lost_at stamp must be written BEFORE the advanced checkpoint
+// (saveCheckpoint's upsert). sqlmock matches expectations in order by default, so
+// declaring stamp-then-checkpoint fails if the code advances the checkpoint first.
 func TestPersistGapAutoAdvance_stampsBeforeAdvance(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -412,10 +419,9 @@ func TestPersistGapAutoAdvance_stampsBeforeAdvance(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectExec("UPDATE stream_state").
-		WithArgs("events lost").
+	mock.ExpectExec(stampStmtRE).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO stream_state").
+	mock.ExpectExec(checkpointStmtRE).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := persistGapAutoAdvance(db, advancedTestState(), "events lost"); err != nil {
@@ -426,11 +432,42 @@ func TestPersistGapAutoAdvance_stampsBeforeAdvance(t *testing.T) {
 	}
 }
 
+// TestPersistGapAutoAdvance_stampIsUpsert pins the #1081 fix: the stamp must be
+// an INSERT…ON DUPLICATE KEY UPDATE so a missing stream_state row still gets the
+// loss record (a bare UPDATE would match zero rows and the subsequent checkpoint
+// upsert would seed a fresh row with NULL gap_lost_* columns). The end-anchored
+// regex also pins that the existing-row arm touches ONLY the gap_lost_* columns
+// — the checkpoint advance must land exclusively in the second statement.
+func TestPersistGapAutoAdvance_stampIsUpsert(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectExec(`(?s)INSERT INTO stream_state\s+\(id, mode,.*gap_lost_at, gap_lost_detail\)` +
+		`.*ON DUPLICATE KEY UPDATE\s+` +
+		`gap_lost_at\s+= UTC_TIMESTAMP\(\),\s+gap_lost_detail = VALUES\(gap_lost_detail\)\s*$`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), "events lost").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(checkpointStmtRE).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := persistGapAutoAdvance(db, advancedTestState(), "events lost"); err != nil {
+		t.Fatalf("persistGapAutoAdvance: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("stamp must be an upsert whose UPDATE arm touches only gap_lost_*: %v", err)
+	}
+}
+
 // TestPersistGapAutoAdvance_abortsOnStampFailure is the core of the #402 fix: if
 // the gap_lost_at stamp fails, the function must return an error and must NOT
 // advance the checkpoint — otherwise the next restart would see no gap with no
-// durable trace of the loss. The INSERT is deliberately NOT expected; sqlmock
-// errors if the code issues it after the failed UPDATE.
+// durable trace of the loss. The checkpoint upsert is deliberately NOT expected;
+// sqlmock errors if the code issues it after the failed stamp.
 func TestPersistGapAutoAdvance_abortsOnStampFailure(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -438,9 +475,9 @@ func TestPersistGapAutoAdvance_abortsOnStampFailure(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectExec("UPDATE stream_state").
+	mock.ExpectExec(stampStmtRE).
 		WillReturnError(errors.New("index DB transient error"))
-	// No ExpectExec for the INSERT — the checkpoint must not be advanced.
+	// No ExpectExec for the checkpoint upsert — the checkpoint must not be advanced.
 
 	if err := persistGapAutoAdvance(db, advancedTestState(), "events lost"); err == nil {
 		t.Fatal("expected an error when the gap-loss stamp fails (checkpoint must not advance)")

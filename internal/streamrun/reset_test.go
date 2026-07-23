@@ -103,9 +103,9 @@ func freshResetState() *streamState {
 }
 
 // TestPersistResetDiscard_jumpStampsBeforeCheckpoint pins the branch wiring:
-// a jump must go through the gap_lost stamp (UPDATE) BEFORE the fresh
-// checkpoint (INSERT upsert) — sqlmock matches in order — and must fire the
-// supervisor hook only after both writes succeeded.
+// a jump must go through the gap_lost stamp (the gap_lost_at upsert, #1081)
+// BEFORE the fresh checkpoint (saveCheckpoint's upsert) — sqlmock matches in
+// order — and must fire the supervisor hook only after both writes succeeded.
 func TestPersistResetDiscard_jumpStampsBeforeCheckpoint(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -113,10 +113,12 @@ func TestPersistResetDiscard_jumpStampsBeforeCheckpoint(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectExec("UPDATE stream_state").
-		WithArgs("events lost via reset").
+	mock.ExpectExec(stampStmtRE).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), "events lost via reset").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec("INSERT INTO stream_state").
+	mock.ExpectExec(checkpointStmtRE).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	var hooked string
@@ -133,8 +135,9 @@ func TestPersistResetDiscard_jumpStampsBeforeCheckpoint(t *testing.T) {
 }
 
 // TestPersistResetDiscard_noopWritesOnlyCheckpoint: a no-op discard must not
-// stamp gap_lost (no UPDATE — sqlmock errors on unexpected statements) and
-// must not fire the loss hook.
+// stamp gap_lost and must not fire the loss hook. The single expectation is
+// pinned to saveCheckpoint's upsert shape — a wrongly-issued stamp (also an
+// INSERT since #1081) would not match it and sqlmock errors on order.
 func TestPersistResetDiscard_noopWritesOnlyCheckpoint(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -142,7 +145,7 @@ func TestPersistResetDiscard_noopWritesOnlyCheckpoint(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectExec("INSERT INTO stream_state").
+	mock.ExpectExec(checkpointStmtRE).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	hooks := &Hooks{OnGapAutoAdvance: func(string) { t.Error("loss hook must not fire on a no-op reset") }}
@@ -164,7 +167,7 @@ func TestPersistResetDiscard_hookSkippedOnPersistFailure(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectExec("UPDATE stream_state").
+	mock.ExpectExec(stampStmtRE).
 		WillReturnError(errors.New("index DB down"))
 
 	hooks := &Hooks{OnGapAutoAdvance: func(string) { t.Error("loss hook must not fire when the durable record failed") }}

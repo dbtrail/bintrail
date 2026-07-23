@@ -118,8 +118,15 @@ func isPositionCheckpointBoundary(ev parser.Event) bool {
 	return ev.StmtEnd
 }
 
-// saveCheckpoint persists the current stream state to the stream_state table.
-func saveCheckpoint(db *sql.DB, state *streamState) error {
+// checkpointInsertArgs builds the placeholder arguments for the shared
+// stream_state INSERT column list (id=1, mode, binlog_file, binlog_position,
+// gtid_set, flavor, events_indexed, last_event_time, last_checkpoint=UTC_TIMESTAMP(),
+// server_id, bintrail_id) used by saveCheckpoint and the persistGapAutoAdvance
+// stamp: NULLs for empty gtid_set/last_event_time/bintrail_id, the flavor
+// canonicalized (empty→mysql; an invalid flavor fails loud rather than
+// persisting garbage into the NOT NULL column), and the #775 safe-boundary
+// position (see checkpointPosition).
+func checkpointInsertArgs(state *streamState) ([]any, error) {
 	var gtidSet any
 	if state.gtidSet != "" {
 		gtidSet = state.gtidSet
@@ -132,18 +139,24 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	if state.bintrailID != "" {
 		bintrailIDArg = state.bintrailID
 	}
-	// Canonicalize the flavor (empty→mysql) so the NOT NULL column never receives
-	// an empty string; an invalid flavor fails loud rather than persisting garbage.
 	flavor, err := normalizeFlavor(state.flavor)
+	if err != nil {
+		return nil, err
+	}
+	file, pos := checkpointPosition(state)
+	return []any{state.mode, file, pos, gtidSet, flavor,
+		state.eventsIndexed, lastEventTime, state.serverID, bintrailIDArg}, nil
+}
+
+// saveCheckpoint persists the current stream state to the stream_state table.
+func saveCheckpoint(db *sql.DB, state *streamState) error {
+	args, err := checkpointInsertArgs(state)
 	if err != nil {
 		return err
 	}
-	// #775: in position mode this persists the last safe boundary, not the
-	// per-event offset (see checkpointPosition).
 	// mode is in the UPDATE arm for the cross-mode --reset path (#1079): the
 	// reset no longer DELETEs the row, so the mode switch must land through
 	// this upsert. For every other caller mode is invariant across the run.
-	file, pos := checkpointPosition(state)
 	// #959: bound the checkpoint write with a deadline (see indexer.WriteTimeout)
 	// so a mid-statement network stall fails fast instead of freezing the daemon
 	// on kernel TCP retransmission — invisible to the supervisor.
@@ -165,8 +178,7 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 		    last_checkpoint = UTC_TIMESTAMP(),
 		    server_id       = VALUES(server_id),
 		    bintrail_id     = VALUES(bintrail_id)`,
-		state.mode, file, pos, gtidSet, flavor,
-		state.eventsIndexed, lastEventTime, state.serverID, bintrailIDArg)
+		args...)
 	return err
 }
 
@@ -279,10 +291,37 @@ func deleteEventsSinceCheckpointGTID(db *sql.DB, file string, pos uint64, savedS
 // not touch the gap_lost_* columns, so the stamp survives it. Cleared by an
 // explicit monitor Stop; a jumping --reset re-stamps it with the discarded
 // range (#1079) and a same-position --reset leaves it intact.
+//
+// The stamp is an INSERT…ON DUPLICATE KEY UPDATE, not a bare UPDATE (#1081): the
+// stream_state row can vanish between loadStreamState and this stamp (operator
+// DELETE, a concurrent pre-#1079 --reset, a concurrent bintrail-pg reset on a
+// shared index) — a bare UPDATE would match zero rows without error and the
+// subsequent saveCheckpoint would seed a fresh row with NULL gap_lost_* columns:
+// checkpoint advanced, loss unrecorded. The existing-row arm updates ONLY the
+// gap_lost_* columns — the checkpoint advance still lands exclusively in the
+// second statement, preserving the stamp-before-advance ordering; the
+// missing-row arm seeds the advanced state and the stamp atomically, so the
+// advance cannot land without the stamp. Deliberately no RowsAffected check:
+// go-sql-driver reports CHANGED rows, not matched, so an identical re-stamp
+// within the same UTC_TIMESTAMP() second (supervisor crash-loop) would report 0
+// and abort a healthy startup.
 func persistGapAutoAdvance(db *sql.DB, advanced *streamState, gapMessage string) error {
-	if _, err := db.Exec(`UPDATE stream_state
-		SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ?
-		WHERE id = 1`, gapMessage); err != nil {
+	args, err := checkpointInsertArgs(advanced)
+	if err != nil {
+		return fmt.Errorf("failed to persist gap-loss record before auto-advance: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), indexer.WriteTimeout)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO stream_state
+		    (id, mode, binlog_file, binlog_position, gtid_set, flavor,
+		     events_indexed, last_event_time, last_checkpoint, server_id, bintrail_id,
+		     gap_lost_at, gap_lost_detail)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?, ?, UTC_TIMESTAMP(), ?)
+		ON DUPLICATE KEY UPDATE
+		    gap_lost_at     = UTC_TIMESTAMP(),
+		    gap_lost_detail = VALUES(gap_lost_detail)`,
+		append(args, gapMessage)...); err != nil {
 		return fmt.Errorf("failed to persist gap-loss record before auto-advance: %w", err)
 	}
 	if err := saveCheckpoint(db, advanced); err != nil {
