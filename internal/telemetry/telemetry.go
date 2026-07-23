@@ -201,6 +201,23 @@ func (c *Client) Shutdown() {
 	}
 }
 
+// WaitStartupDrain blocks until the startup drain kicked off by Init has
+// finished. It returns at once on a nil, disabled, or never-drained client,
+// and it cannot hang: the drain itself is bounded by drainDeadline.
+//
+// It exists for tests that append events and then read the spool back. The
+// startup drain runs on its own goroutine, and if the scheduler runs it AFTER
+// the test has appended, it legitimately claims the fresh spool file, fails to
+// deliver it to the test's dead endpoint, and drops it — the reader then finds
+// the file renamed or already gone. Shutdown is not a substitute: it gives up
+// after shutdownGrace, which turns that race into "rare" instead of "never".
+func (c *Client) WaitStartupDrain() {
+	if c == nil || c.drained == nil {
+		return
+	}
+	<-c.drained
+}
+
 // maybeShowNotice prints the first-run disclosure once, on an interactive
 // terminal, and only while telemetry is running on the DEFAULT — an operator
 // who has already chosen has nothing to be told. The sentinel is recorded

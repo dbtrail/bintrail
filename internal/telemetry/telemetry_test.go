@@ -561,11 +561,13 @@ func TestPurgeSpool(t *testing.T) {
 // drain is a background goroutine, and if it scans AFTER the test has appended,
 // it legitimately claims that file, fails to deliver it to the dead endpoint,
 // and drops it — leaving the test reading an empty spool. Waiting costs nothing
-// here, since a drain over an empty spool returns immediately.
+// here, since a drain over an empty spool returns immediately. Wait without a
+// deadline (not Shutdown, which abandons the drain after shutdownGrace) so the
+// race stays impossible rather than merely rare under scheduler load.
 func initDrained(t *testing.T, cfg Config) *Client {
 	t.Helper()
 	c := Init(cfg)
-	c.Shutdown()
+	c.WaitStartupDrain()
 	return c
 }
 

@@ -34,6 +34,11 @@ func enableRealTelemetry(t *testing.T) (*telemetry.Client, string) {
 	if !c.Enabled() {
 		t.Fatalf("telemetry client not enabled after clearing env; decision=%+v", c.Decision())
 	}
+	// Init kicks off an async drain of the spool dir. If it runs after this
+	// test appends an event, it claims the fresh file, fails to deliver it to
+	// the dead endpoint, and drops it — readSpooledEvents then finds the file
+	// renamed or gone. Wait it out; over an empty spool it returns immediately.
+	c.WaitStartupDrain()
 	return c, dir
 }
 
