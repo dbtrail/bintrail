@@ -595,6 +595,38 @@ func TestShutdownIsSafeOnEveryClient(t *testing.T) {
 	enabled.Shutdown()
 }
 
+// TestWaitStartupDrainIsSafeOnEveryClient mirrors TestShutdownIsSafeOnEveryClient
+// for the sync primitive #1084's fix added, and pins its DELIBERATE guard
+// divergence from Shutdown: WaitStartupDrain gates on c.drained (was a drain
+// goroutine ever started?), NOT on Enabled() (runtime consent). Harmonizing it
+// to Shutdown's Enabled() guard would return early on a client opted out at
+// runtime while its startup drain is still live — reintroducing the spool race
+// as "rare" for exactly the tests the method exists to serve.
+func TestWaitStartupDrainIsSafeOnEveryClient(t *testing.T) {
+	clearEnv(t)
+	var nilClient *Client
+	nilClient.WaitStartupDrain() // must not panic
+
+	// Disabled client: no drain goroutine was ever started; must return at once.
+	disabled := Init(Config{Dir: t.TempDir(), Stderr: &bytes.Buffer{}, Interactive: boolPtr(false)})
+	start := time.Now()
+	disabled.WaitStartupDrain()
+	disabled.WaitStartupDrain() // idempotent
+	if elapsed := time.Since(start); elapsed > shutdownGrace {
+		t.Errorf("WaitStartupDrain on a disabled client blocked for %v", elapsed)
+	}
+
+	// Opt-out AFTER Init: the drain goroutine is already live, so the wait must
+	// still wait on it rather than early-return through an Enabled() check.
+	enabled := Init(Config{
+		Dir: t.TempDir(), Endpoint: "http://127.0.0.1:1",
+		Stderr: &bytes.Buffer{}, Interactive: boolPtr(false),
+	})
+	enabled.SetRuntimeConsent(false)
+	enabled.WaitStartupDrain()
+	enabled.WaitStartupDrain() // idempotent after completion
+}
+
 // writeClaim creates a claim file whose name carries stamp, the way drain
 // names its own claims.
 func writeClaim(t *testing.T, dir, day string, stamp time.Time) string {
