@@ -52,8 +52,9 @@ position — --start-lsn cannot rewind to an earlier point (the older WAL may ha
 been reclaimed). To force a fresh start, run 'bintrail-pg reset' (drops the slot
 and clears the stream_state checkpoint columns), then re-run. Discarding a real
 checkpoint that way is durably recorded as a permanent continuity loss — the
-recreated slot skips whatever the old one had not yet streamed — and any prior
-loss record survives the reset.
+recreated slot skips whatever the old one had not yet streamed — and a prior
+loss record is never erased by a reset (a real-checkpoint reset replaces its
+detail with the reset's own).
 
 Graceful shutdown: send SIGINT or SIGTERM to flush the current batch and write a
 final checkpoint before exiting.`,

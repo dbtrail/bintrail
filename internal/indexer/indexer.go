@@ -593,7 +593,7 @@ func EnsureSchema(db *sql.DB) error {
 	// the only trace of the permanently lost events would be an in-memory
 	// flag that a daemon restart silently discards.
 	if err := ensureColumn(db, "stream_state", "gap_lost_at",
-		`ALTER TABLE stream_state ADD COLUMN gap_lost_at DATETIME DEFAULT NULL COMMENT 'when an unfillable binlog gap forced an auto-advance (events permanently lost); cleared by an explicit monitor Stop or --reset' AFTER bintrail_id`,
+		`ALTER TABLE stream_state ADD COLUMN gap_lost_at DATETIME DEFAULT NULL COMMENT 'when an unfillable binlog gap forced an auto-advance (events permanently lost); cleared only by an explicit monitor Stop; --reset re-stamps or preserves it' AFTER bintrail_id`,
 	); err != nil {
 		return err
 	}

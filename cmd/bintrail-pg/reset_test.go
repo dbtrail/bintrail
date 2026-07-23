@@ -219,11 +219,13 @@ func TestClearCheckpoint_RealCheckpointStampsLoss(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery("SELECT binlog_position FROM stream_state").
-		WillReturnRows(sqlmock.NewRows([]string{"binlog_position"}).AddRow(uint64(0x1A2B3C4)))
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT flavor, binlog_position FROM stream_state.*FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"flavor", "binlog_position"}).AddRow("postgres", uint64(0x1A2B3C4)))
 	mock.ExpectExec(`UPDATE stream_state SET\s+gap_lost_at\s+= UTC_TIMESTAMP\(\)`).
 		WithArgs(sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	res, err := clearCheckpoint(context.Background(), db)
 	if err != nil || res.tableMissing || res.rows != 1 {
@@ -251,10 +253,12 @@ func TestClearCheckpoint_NoCheckpointPreservesPriorLoss(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery("SELECT binlog_position FROM stream_state").
-		WillReturnRows(sqlmock.NewRows([]string{"binlog_position"}).AddRow(0))
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT flavor, binlog_position FROM stream_state.*FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"flavor", "binlog_position"}).AddRow("postgres", 0))
 	mock.ExpectExec(`UPDATE stream_state SET\s+binlog_file`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	res, err := clearCheckpoint(context.Background(), db)
 	if err != nil || res.rows != 1 || res.lossDetail != "" {
@@ -274,7 +278,9 @@ func TestClearCheckpoint_NoRow(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery("SELECT binlog_position FROM stream_state").WillReturnError(sql.ErrNoRows)
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT flavor, binlog_position FROM stream_state").WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
 
 	res, err := clearCheckpoint(context.Background(), db)
 	if err != nil || res.rows != 0 || res.tableMissing || res.lossDetail != "" {
@@ -294,12 +300,40 @@ func TestClearCheckpoint_TableMissing(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectQuery("SELECT binlog_position FROM stream_state").
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT flavor, binlog_position FROM stream_state").
 		WillReturnError(&mysql.MySQLError{Number: 1146})
+	mock.ExpectRollback()
 
 	res, err := clearCheckpoint(context.Background(), db)
 	if err != nil || !res.tableMissing {
 		t.Fatalf("clearCheckpoint = (%+v, %v), want tableMissing", res, err)
+	}
+}
+
+// TestClearCheckpoint_FlavorGuardRefusesForeignIndex: --index-dsn pointed at a
+// MySQL/MariaDB-source index (the wrong-database mistake) must refuse loud —
+// clearing a foreign checkpoint would stamp a MySQL byte offset rendered as a
+// PG LSN onto a live stream's state. No UPDATE may be issued (sqlmock errors
+// on unexpected statements).
+func TestClearCheckpoint_FlavorGuardRefusesForeignIndex(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT flavor, binlog_position FROM stream_state.*FOR UPDATE").
+		WillReturnRows(sqlmock.NewRows([]string{"flavor", "binlog_position"}).AddRow("mysql", uint64(193)))
+	mock.ExpectRollback()
+
+	_, err = clearCheckpoint(context.Background(), db)
+	if err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("expected a loud flavor refusal, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("no write may touch a foreign-flavor index: %v", err)
 	}
 }
 

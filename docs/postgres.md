@@ -328,9 +328,11 @@ bintrail-pg reset --index-dsn "$IDX" --index-only --force
 This removes only capture-resume state; the index's recovery data is untouched.
 Under the hood it is the two-system teardown that otherwise has to be done by hand
 (`SELECT pg_drop_replication_slot('bintrail_shop')` on the source + clearing the
-position columns of the `stream_state` row on the index — the row is never
-DELETEd, so a recorded `gap_lost_at`/`gap_lost_detail` continuity-loss record
-always survives the reset).
+position/counter columns of the `stream_state` row on the index — the row is
+never DELETEd, so a recorded `gap_lost_at`/`gap_lost_detail` continuity-loss
+record is never erased by a reset; a real-checkpoint reset replaces the
+record's detail with the reset's own, a no-checkpoint reset preserves it
+verbatim).
 
 **A reset that discards a real checkpoint is itself recorded as a permanent
 continuity loss**: dropping and recreating the slot skips whatever the old slot

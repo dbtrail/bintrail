@@ -28,16 +28,18 @@ It performs the two-system teardown that otherwise has to be done by hand:
 
   1. drops the replication slot on the SOURCE (--query-dsn) — a slot left behind
      keeps pinning WAL and can fill the source disk;
-  2. clears the durable checkpoint in the INDEX (--index-dsn): the position
-     columns of the stream_state row are cleared (the row is never DELETEd), so
-     the next 'bintrail-pg stream' starts from a fresh slot.
+  2. clears the durable checkpoint in the INDEX (--index-dsn): the position and
+     counter columns of the stream_state row are cleared (the row is never
+     DELETEd), so the next 'bintrail-pg stream' starts from a fresh slot.
 
 Continuity: dropping and recreating a slot inherently skips whatever the old
 slot had not yet streamed, so discarding a real checkpoint is durably recorded
 as a permanent continuity loss (gap_lost_at/gap_lost_detail in stream_state,
 naming the discarded LSN) — 'bintrail status' shows the EVENTS PERMANENTLY LOST
-banner and 'status --fail-on-gap' exits non-zero. A previously recorded,
-still-unacknowledged loss record always survives the reset.
+banner and 'status --fail-on-gap' exits non-zero. The loss always remains
+recorded: a real-checkpoint reset replaces a prior unacknowledged record's
+detail with its own; only a no-checkpoint reset preserves a prior record
+verbatim. Run reset with the stream stopped.
 
 The slot is dropped first: if the run is interrupted between the two steps, the
 safe state is "slot gone, checkpoint stale" (the next stream fails loud) rather
@@ -198,13 +200,26 @@ type clearOutcome struct {
 //
 //   - real checkpoint: dropping and recreating the slot skips whatever the old slot had
 //     not yet streamed past that LSN, so the discard is stamped as a permanent loss IN
-//     THE SAME STATEMENT that clears the cursor — stamp and clear can never be torn
-//     apart (the stamp-then-advance ordering invariant from PR #1080's MySQL --reset).
-//     A prior unacknowledged record's detail is replaced by the reset detail (#1080
-//     jump semantics); the loss flag itself is never cleared here.
+//     THE SAME STATEMENT that clears the cursor — one atomic write, which satisfies the
+//     safety property PR #1080's MySQL --reset enforces by ordering (stamp before
+//     advance): the clear can never become durable without the stamp. A prior
+//     unacknowledged record's detail is replaced by the reset detail (#1080 jump
+//     semantics); the loss flag itself is never cleared here.
 //   - no checkpoint (row seeded by a lost-slot stamp or a pre-commit health snapshot,
 //     or an earlier reset): nothing is discarded — clear only the position/counter
 //     columns and leave any prior gap_lost_* record untouched (#1080's no-op path).
+//     Residual by design: a crash inside the first checkpoint interval can leave
+//     indexed events with pos still 0; a reset then discards the surviving slot's
+//     un-streamed WAL without a stamp — softened by "re-seed the baseline" being the
+//     documented post-reset contract.
+//
+// The load and the write run in one transaction with the row locked (FOR UPDATE): the
+// branch decision is made on the read, and saveCheckpointPG's upsert landing a FIRST
+// checkpoint between a bare read and the write would get cleared UN-stamped — the exact
+// laundering this function exists to prevent. The lock serializes against every
+// stream_state writer and guarantees the row still exists at write time, which is what
+// makes the rows:1 report honest (RowsAffected is no substitute: the driver reports
+// CHANGED rows, so an identical same-second re-clear would read as 0).
 //
 // Either way the cleared row reads as first-run to the stream (loadStreamStatePG
 // treats a zero-position row as no checkpoint), so a fresh slot is created on the next
@@ -212,8 +227,17 @@ type clearOutcome struct {
 // exist (MySQL 1146) — a never-streamed index, or an --index-dsn pointing at the wrong
 // database.
 func clearCheckpoint(ctx context.Context, db *sql.DB) (clearOutcome, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return clearOutcome{}, err
+	}
+	defer tx.Rollback()
+
+	var flavor string
 	var pos uint64
-	err := db.QueryRowContext(ctx, "SELECT binlog_position FROM stream_state WHERE id = 1").Scan(&pos)
+	err = tx.QueryRowContext(ctx,
+		"SELECT flavor, binlog_position FROM stream_state WHERE id = 1 FOR UPDATE").
+		Scan(&flavor, &pos)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return clearOutcome{}, nil
@@ -222,9 +246,18 @@ func clearCheckpoint(ctx context.Context, db *sql.DB) (clearOutcome, error) {
 	case err != nil:
 		return clearOutcome{}, err
 	}
+	// Mirror loadStreamStatePG's flavor guard ("postgres" = pgstreamrun's pgFlavor):
+	// --index-dsn pointed at a MySQL/MariaDB-source index is the same wrong-database
+	// mistake the 1146 message calls out, and clearing a foreign checkpoint here would
+	// stamp a MySQL byte offset rendered as a PG LSN — a durable forensic lie on a
+	// live stream's index.
+	if flavor != "postgres" {
+		return clearOutcome{}, fmt.Errorf(
+			"index holds a %q checkpoint, not \"postgres\" — refusing to reset a non-PostgreSQL stream's state (is --index-dsn pointing at the right database?)", flavor)
+	}
 
 	if pos == 0 {
-		if _, err := db.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE stream_state SET
 				binlog_file     = '',
 				binlog_position = 0,
@@ -235,13 +268,16 @@ func clearCheckpoint(ctx context.Context, db *sql.DB) (clearOutcome, error) {
 			WHERE id = 1`); err != nil {
 			return clearOutcome{}, err
 		}
+		if err := tx.Commit(); err != nil {
+			return clearOutcome{}, err
+		}
 		return clearOutcome{rows: 1}, nil
 	}
 
 	detail := fmt.Sprintf(
-		"checkpoint discarded via `bintrail-pg reset`: was LSN %s; the replication slot is dropped and recreated, so events past that LSN not yet streamed by the old slot are permanently lost",
+		"checkpoint discarded via `bintrail-pg reset`: was LSN %s; the replication slot is (or was already) dropped and will be recreated, so events past that LSN not yet streamed by the old slot are permanently lost",
 		pglogrepl.LSN(pos))
-	if _, err := db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE stream_state SET
 			gap_lost_at     = UTC_TIMESTAMP(),
 			gap_lost_detail = ?,
@@ -252,6 +288,9 @@ func clearCheckpoint(ctx context.Context, db *sql.DB) (clearOutcome, error) {
 			last_event_time = NULL,
 			last_checkpoint = UTC_TIMESTAMP()
 		WHERE id = 1`, detail); err != nil {
+		return clearOutcome{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return clearOutcome{}, err
 	}
 	return clearOutcome{rows: 1, lossDetail: detail}, nil
