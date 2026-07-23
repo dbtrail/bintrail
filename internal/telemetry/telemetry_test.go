@@ -778,6 +778,37 @@ func TestBeaconCarriesNoRunID(t *testing.T) {
 	}
 }
 
+// TestRecordDaemonCommandOmitsRunID: an action inside a long-running daemon (a
+// console request under `watch`) shares the daemon's months-lived run_id, so
+// stamping it on every action would reconstruct a per-install activity timeline.
+// The daemon-command span must drop run_id exactly like a beacon, while still
+// recording the command name, outcome, error class, and duration bucket.
+func TestRecordDaemonCommandOmitsRunID(t *testing.T) {
+	clearEnv(t)
+	dir := t.TempDir()
+	c := initDrained(t, Config{
+		Dir: dir, Endpoint: "http://127.0.0.1:1", Version: "0.42.0",
+		Stderr: &bytes.Buffer{}, Interactive: boolPtr(false),
+	})
+	if !c.Enabled() {
+		t.Fatal("client not enabled")
+	}
+	s := c.RecordDaemonCommand("console-recover")
+	s.SetError(ClassInternal)
+	s.Finish()
+
+	e := readOneSpooledEvent(t, SpoolDir(dir))
+	if e.Command != "console-recover" {
+		t.Errorf("command = %q, want console-recover", e.Command)
+	}
+	if e.RunID != "" {
+		t.Errorf("daemon command carries run_id %q; a months-lived run_id is a longitudinal key", e.RunID)
+	}
+	if e.EventType != EventCommandError || e.Outcome != OutcomeError || e.ErrorClass != ClassInternal {
+		t.Errorf("unexpected event: %+v", e)
+	}
+}
+
 // TestBeaconAtMostOncePerUTCDay: a finer beat would reconstruct a daemon's
 // uptime and maintenance windows.
 func TestBeaconAtMostOncePerUTCDay(t *testing.T) {

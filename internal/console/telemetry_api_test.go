@@ -2,23 +2,85 @@ package console
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
+func boolPtr(b bool) *bool { return &b }
+
+// enableRealTelemetry builds a live telemetry client writing to a temp spool,
+// with every consent/CI env var cleared so it reports even under CI (where the
+// test suite itself runs). Returns the client and its config dir.
+func enableRealTelemetry(t *testing.T) (*telemetry.Client, string) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DO_NOT_TRACK", "")
+	t.Setenv("BINTRAIL_TELEMETRY", "")
+	for _, v := range []string{"CI", "GITHUB_ACTIONS", "TF_BUILD", "TRAVIS", "CIRCLECI", "JENKINS_URL", "BUILDKITE", "GITLAB_CI"} {
+		t.Setenv(v, "")
+	}
+	dir := t.TempDir()
+	c := telemetry.Init(telemetry.Config{
+		Dir: dir, Endpoint: "http://127.0.0.1:1", Version: "0.42.0",
+		Stderr: io.Discard, Interactive: boolPtr(false),
+	})
+	if !c.Enabled() {
+		t.Fatalf("telemetry client not enabled after clearing env; decision=%+v", c.Decision())
+	}
+	return c, dir
+}
+
+// readSpooledEvents parses every NDJSON event under the client's spool dir.
+func readSpooledEvents(t *testing.T, dir string) []map[string]any {
+	t.Helper()
+	entries, err := os.ReadDir(telemetry.SpoolDir(dir))
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	var out []map[string]any
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ndjson") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(telemetry.SpoolDir(dir), e.Name()))
+		if err != nil {
+			t.Fatalf("read spool file: %v", err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+			if line == "" {
+				continue
+			}
+			var m map[string]any
+			if err := json.Unmarshal([]byte(line), &m); err != nil {
+				t.Fatalf("bad spooled JSON %q: %v", line, err)
+			}
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 type fakeTelemetry struct {
 	enabled  bool
 	decision telemetry.Decision
 	setCalls []bool
+	recorded []string // command names passed to RecordDaemonCommand
 }
 
 func (f *fakeTelemetry) Enabled() bool                  { return f.enabled }
 func (f *fakeTelemetry) Decision() telemetry.Decision   { return f.decision }
 func (f *fakeTelemetry) SetRuntimeConsent(enabled bool) { f.enabled = enabled; f.setCalls = append(f.setCalls, enabled) }
+func (f *fakeTelemetry) RecordDaemonCommand(cmd string) *telemetry.Span {
+	f.recorded = append(f.recorded, cmd)
+	return nil // a nil Span is inert; the spool/run_id path is covered by a real-client test
+}
 
 func decodeTelemetry(t *testing.T, rec *httptest.ResponseRecorder) telemetryStateDTO {
 	t.Helper()
@@ -139,5 +201,79 @@ func TestHandleTelemetryGetOverriddenByEnv(t *testing.T) {
 	}
 	if dto.DecidedBy != string(telemetry.SourceDoNotTrack) {
 		t.Errorf("decided_by = %q, want DO_NOT_TRACK", dto.DecidedBy)
+	}
+}
+
+// TestRecordActionUsesFixedName: the recorded command is the compile-time
+// constant the route passes ("console-recover"), NEVER derived from the request
+// path, query, or body — so no operator data (schemas, tables, PKs) can leak
+// into telemetry. Two very different requests must record the identical name.
+func TestRecordActionUsesFixedName(t *testing.T) {
+	ft := &fakeTelemetry{enabled: true}
+	s := &Server{telemetry: ft}
+
+	called := 0
+	h := s.recordAction("recover", func(w http.ResponseWriter, r *http.Request) {
+		called++
+		w.WriteHeader(http.StatusOK)
+	})
+	h(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/recover?schema=payroll&table=salaries",
+		strings.NewReader(`{"pk":"42","table":"secret"}`)))
+	h(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/recover?schema=other&table=x", nil))
+
+	if called != 2 {
+		t.Fatalf("handler ran %d times, want 2", called)
+	}
+	if len(ft.recorded) != 2 || ft.recorded[0] != "console-recover" || ft.recorded[1] != "console-recover" {
+		t.Fatalf("recorded = %v, want two identical console-recover (never request-derived)", ft.recorded)
+	}
+}
+
+// TestRecordActionNilTelemetryPassesThrough: the read-only `serve` binary wires
+// no telemetry client — the wrapped handler must still run, untouched.
+func TestRecordActionNilTelemetryPassesThrough(t *testing.T) {
+	s := &Server{} // telemetry == nil
+	called := false
+	h := s.recordAction("reconstruct", func(w http.ResponseWriter, r *http.Request) { called = true })
+	h(httptest.NewRecorder(), httptest.NewRequest("GET", "/api/reconstruct", nil))
+	if !called {
+		t.Fatal("handler must run even with no telemetry client")
+	}
+}
+
+// TestRecordActionSpoolsRunIDFreeEvent drives the whole chain against a real
+// client: a console action spools a run_id-FREE event (the daemon holds one
+// run_id for months — stamping it per action would be a per-install timeline),
+// and a 5xx maps to an internal-error event.
+func TestRecordActionSpoolsRunIDFreeEvent(t *testing.T) {
+	c, dir := enableRealTelemetry(t)
+	s := &Server{telemetry: c}
+
+	// A 200 action → command_run/ok.
+	okH := s.recordAction("reconstruct", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	okH(httptest.NewRecorder(), httptest.NewRequest("GET", "/api/reconstruct", nil))
+	// A 500 action → command_error/internal.
+	errH := s.recordAction("recover", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
+	errH(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/recover", nil))
+
+	events := readSpooledEvents(t, dir)
+	if len(events) != 2 {
+		t.Fatalf("spooled %d events, want 2: %+v", len(events), events)
+	}
+	byCmd := map[string]map[string]any{}
+	for _, e := range events {
+		cmd, _ := e["command"].(string)
+		byCmd[cmd] = e
+		if _, hasRunID := e["run_id"]; hasRunID {
+			t.Errorf("console event %q carries run_id — a months-lived daemon run_id is a longitudinal key: %+v", cmd, e)
+		}
+	}
+	ok := byCmd["console-reconstruct"]
+	if ok == nil || ok["event_type"] != "command_run" || ok["outcome"] != "ok" {
+		t.Errorf("console-reconstruct event wrong: %+v", ok)
+	}
+	bad := byCmd["console-recover"]
+	if bad == nil || bad["event_type"] != "command_error" || bad["outcome"] != "error" || bad["error_class"] != "internal" {
+		t.Errorf("console-recover error event wrong: %+v", bad)
 	}
 }

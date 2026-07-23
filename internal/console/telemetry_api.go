@@ -18,6 +18,50 @@ type TelemetryController interface {
 	Enabled() bool
 	Decision() telemetry.Decision
 	SetRuntimeConsent(enabled bool)
+	// RecordDaemonCommand starts a span for one console action. The daemon
+	// variant is mandatory here: the console shares the daemon's months-lived
+	// run_id, so a plain command span would turn per-action events into a
+	// per-install activity timeline. Returns nil when telemetry is off.
+	RecordDaemonCommand(command string) *telemetry.Span
+}
+
+// recordAction wraps a console handler so a deliberate user action is counted in
+// usage telemetry. The action name is a COMPILE-TIME CONSTANT the caller passes
+// ("recover", "reconstruct", …) — never derived from the request, path params,
+// query, or body — so nothing about the operator's data (schemas, tables, PKs,
+// row values) can reach the wire. A 5xx becomes an internal-error event; every
+// other status is a plain run. No telemetry client (the read-only `serve`
+// binary) means the handler is called untouched.
+func (s *Server) recordAction(action string, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.telemetry == nil {
+			h(w, r)
+			return
+		}
+		span := s.telemetry.RecordDaemonCommand("console-" + action)
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		h(rec, r)
+		if rec.status >= 500 {
+			span.SetError(telemetry.ClassInternal)
+		}
+		span.Finish()
+	}
+}
+
+// statusRecorder captures the response status so recordAction can classify the
+// outcome without changing what the wrapped handler writes.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if !r.wroteHeader {
+		r.status = code
+		r.wroteHeader = true
+	}
+	r.ResponseWriter.WriteHeader(code)
 }
 
 // telemetryStateDTO reports machine-wide usage-telemetry state to the UI.

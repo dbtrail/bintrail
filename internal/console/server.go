@@ -420,10 +420,10 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/status", s.handleStatus)
 	api.HandleFunc("GET /api/schemas", s.handleSchemas)
 	api.HandleFunc("GET /api/events", s.handleEvents)
-	api.HandleFunc("POST /api/recover", s.handleRecover)
-	api.HandleFunc("POST /api/recover-cascade", s.handleRecoverCascade)
+	api.HandleFunc("POST /api/recover", s.recordAction("recover", s.handleRecover))
+	api.HandleFunc("POST /api/recover-cascade", s.recordAction("recover-cascade", s.handleRecoverCascade))
 	api.HandleFunc("GET /api/capabilities", s.handleCapabilities)
-	api.HandleFunc("GET /api/reconstruct", s.handleReconstruct)
+	api.HandleFunc("GET /api/reconstruct", s.recordAction("reconstruct", s.handleReconstruct))
 	// Storage surfaces (read-only): the selected server's baseline snapshot
 	// listing, and the process's ambient AWS credential signals (presence
 	// booleans and non-secret names — never values).
@@ -452,9 +452,9 @@ func (s *Server) buildHandler() http.Handler {
 	// Baseline trigger: enqueue an in-process baseline (dump→convert→upload) for
 	// a monitored server. 403 unless the watch daemon opted in
 	// (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1). GET polls the running/last state.
-	api.HandleFunc("POST /api/servers/{id}/baseline", s.handleBaselineTrigger)
+	api.HandleFunc("POST /api/servers/{id}/baseline", s.recordAction("baseline", s.handleBaselineTrigger))
 	api.HandleFunc("GET /api/servers/{id}/baseline", s.handleBaselineStatus)
-	api.HandleFunc("POST /api/servers/{id}/verify", s.handleVerifyTrigger)
+	api.HandleFunc("POST /api/servers/{id}/verify", s.recordAction("verify", s.handleVerifyTrigger))
 	api.HandleFunc("GET /api/servers/{id}/verify", s.handleVerifyStatus)
 	api.HandleFunc("GET /api/servers/{id}/verify/explain", s.handleVerifyExplain)
 	// Global built-in-rotation policy: read the effective settings; PUT an

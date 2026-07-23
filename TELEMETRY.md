@@ -240,11 +240,29 @@ binary — cannot emit telemetry.
 | Surface | Reports? | |
 |---|---|---|
 | `bintrail`, `bintrail-pg` commands | Yes, by default | |
-| Daemons (`stream`, `agent`, `up`, `watch`) | Yes, one beacon per day | |
+| Daemons (`stream`, `agent`, `up`, `watch`) | Yes, one beacon per day | `watch` also records the console actions below |
 | `bintrail-console serve`, `bintrail shim` | Command events only | They record like any command; they do not beacon |
 | **Demo image** (`ghcr.io/dbtrail/bintrail-demo`) | **Never** | Hard-disabled in the image and in its entrypoint, and asserted by its smoke test. An evaluation image must not phone home from a laptop |
 | **MCP server** (`bintrail-mcp`) | **Never** | Invoked by an AI agent inside an editor or chat session — no human is present to consent and no terminal exists for a notice. It cannot link the telemetry package at all |
-| **Web console UI** | **Never** | No JavaScript beacon, ever. The console frontend has no third-party dependencies and makes no outbound requests |
+| **Web console UI** (under `watch`) | A deliberate-action event, server-side | See below. No JavaScript beacon, ever — the frontend has no third-party dependencies and makes no telemetry request; the event is recorded by the server it already talks to |
+
+### Web console actions
+
+When the console runs inside a reporting `watch` daemon, a **deliberate** UI
+action records one usage event so we can see which console features are used —
+the same signal a CLI `recover` gives. Only these intent surfaces are counted:
+`console-recover`, `console-recover-cascade`, `console-reconstruct` (time
+travel), `console-verify`, `console-baseline`. Passive browsing (listing events,
+paging, status polling, capability checks) records nothing.
+
+The action name is a **compile-time constant** on the route — never derived from
+the request path, query, or body — so no schema, table, primary key, or row
+value can reach the wire; the closed allowlist still applies. Crucially, because
+the console lives in a months-long daemon that holds a single `run_id`, these
+events are recorded **without any `run_id`** (like beacons), so they cannot be
+stitched into a per-install activity timeline. They are day-granularity usage
+counts, nothing more. The read-only `bintrail-console serve` wires no telemetry
+client and records no console actions.
 
 ## Cloned machines — the honest caveat
 
@@ -329,6 +347,8 @@ statements of fact rather than intent.
 | `TestMCPServerIsTelemetryFree` | The MCP server cannot link the telemetry package |
 | `TestRunDaemonDoesNotBeaconBeforeFirstTick` | A crash-looping daemon emits nothing |
 | `TestBeaconCarriesNoRunID` | Daemon beacons carry no identifier |
+| `TestRecordDaemonCommandOmitsRunID` | A console action inside a daemon records no `run_id` — no per-install timeline |
+| `TestRecordActionUsesFixedName` | The console action name is a fixed constant, never derived from the request |
 | Demo image smoke test | The demo image's telemetry guard is present and applies to every process in the container |
 
 The most load-bearing of these is the first. A field allowlist alone cannot

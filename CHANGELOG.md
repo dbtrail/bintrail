@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Web-console usage telemetry** (metadata-only, opt-out). When the console runs inside a reporting `watch` daemon, a **deliberate** UI action — `console-recover`, `console-recover-cascade`, `console-reconstruct` (time travel), `console-verify`, `console-baseline` — records one usage event so we can see which console features are used, the same signal a CLI command gives. Passive browsing (listing events, paging, status polling) records nothing. The action name is a **compile-time constant** on the route (never derived from the request), so no schema, table, primary key, or row value can reach the wire. Because the console lives in a months-long daemon holding a single `run_id`, these events are recorded **without any `run_id`** (like daemon beacons, via the new `Client.RecordDaemonCommand`), so console usage can never be stitched into a per-install timeline — they are day-granularity counts. No JavaScript beacon; the read-only `bintrail-console serve` records nothing. Honors every existing opt-out.
+
 ## [0.42.0] - 2026-07-22
 
 ### Added

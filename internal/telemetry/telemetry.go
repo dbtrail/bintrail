@@ -404,6 +404,13 @@ type Span struct {
 	command string
 	start   time.Time
 	class   string
+	// noRunID drops the run_id from the recorded event. A CLI command is a fresh
+	// short-lived process, so its run_id links nothing and is kept for
+	// ingestion-side dedup. An action inside a long-running daemon (the console
+	// in `watch`) shares ONE run_id for the daemon's whole life, which would make
+	// it a per-install longitudinal key across every action — exactly what
+	// beacons drop it to avoid. Daemon-originated spans set this.
+	noRunID bool
 }
 
 // RecordCommand starts a span for a command. Returns nil when telemetry is
@@ -413,6 +420,19 @@ func (c *Client) RecordCommand(command string) *Span {
 		return nil
 	}
 	return &Span{c: c, command: sanitizeCommand(command), start: c.now()}
+}
+
+// RecordDaemonCommand is RecordCommand for an action taken inside a long-running
+// daemon (e.g. a console request under `watch`). It is identical EXCEPT the
+// recorded event carries no run_id: the daemon holds one run_id for months, so
+// stamping it on every action would reconstruct a per-install activity timeline.
+// Dropping it makes these events privacy-equivalent to run_id-free beacons —
+// day-granularity usage counts, not a session trace.
+func (c *Client) RecordDaemonCommand(command string) *Span {
+	if !c.Enabled() {
+		return nil
+	}
+	return &Span{c: c, command: sanitizeCommand(command), start: c.now(), noRunID: true}
 }
 
 // SetError marks the span as failed with a bounded class. Anything outside the
@@ -434,7 +454,9 @@ func (s *Span) Finish() {
 
 	e := s.c.baseEvent()
 	e.Command = s.command
-	e.RunID = s.c.runID
+	if !s.noRunID {
+		e.RunID = s.c.runID
+	}
 	e.DurationBucket = durationBucket(s.c.now().Sub(s.start))
 	if s.class == "" {
 		e.EventType, e.Outcome = EventCommandRun, OutcomeOK
