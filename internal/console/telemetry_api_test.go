@@ -74,9 +74,12 @@ type fakeTelemetry struct {
 	recorded []string // command names passed to RecordDaemonCommand
 }
 
-func (f *fakeTelemetry) Enabled() bool                  { return f.enabled }
-func (f *fakeTelemetry) Decision() telemetry.Decision   { return f.decision }
-func (f *fakeTelemetry) SetRuntimeConsent(enabled bool) { f.enabled = enabled; f.setCalls = append(f.setCalls, enabled) }
+func (f *fakeTelemetry) Enabled() bool                { return f.enabled }
+func (f *fakeTelemetry) Decision() telemetry.Decision { return f.decision }
+func (f *fakeTelemetry) SetRuntimeConsent(enabled bool) {
+	f.enabled = enabled
+	f.setCalls = append(f.setCalls, enabled)
+}
 func (f *fakeTelemetry) RecordDaemonCommand(cmd string) *telemetry.Span {
 	f.recorded = append(f.recorded, cmd)
 	return nil // a nil Span is inert; the spool/run_id path is covered by a real-client test
@@ -275,5 +278,72 @@ func TestRecordActionSpoolsRunIDFreeEvent(t *testing.T) {
 	bad := byCmd["console-recover"]
 	if bad == nil || bad["event_type"] != "command_error" || bad["outcome"] != "error" || bad["error_class"] != "internal" {
 		t.Errorf("console-recover error event wrong: %+v", bad)
+	}
+}
+
+// TestRecordActionNilSpanOn5xxDoesNotPanic: when telemetry is configured but
+// disabled (opt-out — a common state since it's default-on), RecordDaemonCommand
+// returns a nil *Span, and a 5xx then calls SetError on that nil. SetError has
+// no recover(), so a dropped nil-guard would panic the request goroutine on
+// every failed console action for opt-out users. Pin that it stays a no-op.
+func TestRecordActionNilSpanOn5xxDoesNotPanic(t *testing.T) {
+	ft := &fakeTelemetry{enabled: true} // RecordDaemonCommand returns nil
+	s := &Server{telemetry: ft}
+	called := false
+	h := s.recordAction("recover", func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest("POST", "/api/recover", nil)) // must not panic
+	if !called {
+		t.Fatal("handler must run")
+	}
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("client saw %d, want 500 unchanged", rec.Code)
+	}
+	if len(ft.recorded) != 1 || ft.recorded[0] != "console-recover" {
+		t.Fatalf("recorded = %v", ft.recorded)
+	}
+}
+
+// TestRecordActionStatusClassification pins the outcome-classification edges of
+// recordAction/statusRecorder against a real spool: only 5xx is an error; every
+// other status (incl. the 4xx validation rejections real handlers emit heavily)
+// is a plain run; and a superfluous second WriteHeader must not reclassify a
+// success the client already saw.
+func TestRecordActionStatusClassification(t *testing.T) {
+	cases := []struct {
+		name    string
+		handler func(http.ResponseWriter, *http.Request)
+		wantEvt string // event_type
+		wantOut string // outcome
+	}{
+		{"ok200", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }, "command_run", "ok"},
+		{"writeOnlyDefaults200", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("{}")) }, "command_run", "ok"},
+		{"notFound404", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) }, "command_run", "ok"},
+		{"validation422", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(422) }, "command_run", "ok"},
+		{"internal500", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }, "command_error", "error"},
+		{"firstWriteHeaderWins", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200); w.WriteHeader(500) }, "command_run", "ok"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, dir := enableRealTelemetry(t)
+			s := &Server{telemetry: c}
+			s.recordAction("verify", tc.handler)(httptest.NewRecorder(),
+				httptest.NewRequest("POST", "/api/servers/x/verify", nil))
+			events := readSpooledEvents(t, dir)
+			if len(events) != 1 {
+				t.Fatalf("spooled %d events, want 1: %+v", len(events), events)
+			}
+			e := events[0]
+			if e["command"] != "console-verify" || e["event_type"] != tc.wantEvt || e["outcome"] != tc.wantOut {
+				t.Errorf("got event_type=%v outcome=%v, want %s/%s: %+v",
+					e["event_type"], e["outcome"], tc.wantEvt, tc.wantOut, e)
+			}
+			if _, hasRunID := e["run_id"]; hasRunID {
+				t.Errorf("console event carries run_id: %+v", e)
+			}
+		})
 	}
 }

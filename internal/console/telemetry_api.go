@@ -64,6 +64,13 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the underlying writer's optional
+// interfaces (Flusher, Hijacker, deadlines). Embedding only http.ResponseWriter
+// would otherwise mask them, silently breaking a future streaming handler that
+// someone wraps here. The console's current wrapped routes all buffer JSON, so
+// this is defense-in-depth, not a fix for a live path.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 // telemetryStateDTO reports machine-wide usage-telemetry state to the UI.
 //
 // Writing the telemetry consent file is not a data write: it is LOCAL MACHINE

@@ -404,13 +404,15 @@ type Span struct {
 	command string
 	start   time.Time
 	class   string
-	// noRunID drops the run_id from the recorded event. A CLI command is a fresh
-	// short-lived process, so its run_id links nothing and is kept for
-	// ingestion-side dedup. An action inside a long-running daemon (the console
-	// in `watch`) shares ONE run_id for the daemon's whole life, which would make
-	// it a per-install longitudinal key across every action — exactly what
-	// beacons drop it to avoid. Daemon-originated spans set this.
-	noRunID bool
+	// includeRunID stamps the process run_id onto the recorded event. It is
+	// OFF by default so the run_id-free state is the zero value and any new or
+	// miswired span path fails CLOSED (no identifier) rather than silently
+	// leaking one. Only RecordCommand — a fresh short-lived CLI process whose
+	// run_id links nothing and is wanted for ingestion-side dedup — opts in.
+	// A daemon-originated span (the console in `watch`) leaves it off: the
+	// daemon holds ONE run_id for months, so stamping it on every action would
+	// be a per-install longitudinal key, exactly what beacons drop it to avoid.
+	includeRunID bool
 }
 
 // RecordCommand starts a span for a command. Returns nil when telemetry is
@@ -419,7 +421,7 @@ func (c *Client) RecordCommand(command string) *Span {
 	if !c.Enabled() {
 		return nil
 	}
-	return &Span{c: c, command: sanitizeCommand(command), start: c.now()}
+	return &Span{c: c, command: sanitizeCommand(command), start: c.now(), includeRunID: true}
 }
 
 // RecordDaemonCommand is RecordCommand for an action taken inside a long-running
@@ -432,7 +434,7 @@ func (c *Client) RecordDaemonCommand(command string) *Span {
 	if !c.Enabled() {
 		return nil
 	}
-	return &Span{c: c, command: sanitizeCommand(command), start: c.now(), noRunID: true}
+	return &Span{c: c, command: sanitizeCommand(command), start: c.now()}
 }
 
 // SetError marks the span as failed with a bounded class. Anything outside the
@@ -454,7 +456,7 @@ func (s *Span) Finish() {
 
 	e := s.c.baseEvent()
 	e.Command = s.command
-	if !s.noRunID {
+	if s.includeRunID {
 		e.RunID = s.c.runID
 	}
 	e.DurationBucket = durationBucket(s.c.now().Sub(s.start))
