@@ -350,6 +350,25 @@ straight from the Storage page, and it only runs on the `watch` daemon:
   discarded; for a local `baseline_dir` it is written there. Region and
   credentials come from the daemon's ambient AWS chain, like every other S3
   access. When it finishes the new snapshot appears in the listing.
+- **For MySQL/MariaDB sources, this button's dump is *not* point-consistent
+  across tables by default** — see
+  [Cross-table consistency](dump-and-baseline.md#cross-table-consistency).
+  Each mydumper worker opens its own snapshot independently, so on a
+  write-heavy source a multi-table reconstruct (e.g. a parent/child FK pair)
+  can read mutually inconsistent state, and the daemon logs a warning when a
+  dump spans more than one table under the default mode. Set
+  `BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT=1` to opt into a single
+  point-in-time snapshot across all **transactional** tables instead (a
+  non-transactional/MyISAM table makes mydumper refuse to dump at all, rather
+  than silently skip consistency for it). It requires **both** the
+  `BACKUP_ADMIN` and the `RELOAD` (or `FLUSH_TABLES`) privilege on the source —
+  the console verifies both are present *before* invoking mydumper and refuses
+  with a clear error if either is missing, rather than silently falling back to
+  the default. This preflight isn't just extra caution: granting `BACKUP_ADMIN`
+  without `RELOAD`/`FLUSH_TABLES` doesn't make mydumper fail cleanly on its
+  own — it makes the pinned build (`v1.0.3-1`) **crash**. PostgreSQL baselines
+  are unaffected — `pgbaseline` always anchors on the replication slot's own
+  consistent-point LSN.
 
 The button is hidden on the read-only `serve` console and whenever the trigger
 is disabled — the CLI/compose recipe in the empty state remains the
@@ -444,6 +463,21 @@ results a `verify` cron/CI run produced elsewhere:
   [docker.md](docker.md) — `BASELINE_TRIGGER=0` in `.env` opts out there).
 - `BINTRAIL_CONSOLE_BASELINE_STAGING` (`watch` only) — local staging dir for
   S3-destined baselines created by that button (default a temp subdir).
+- `BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT` (`watch` only) — `1`/`true`
+  makes the **Create baseline** button dump MySQL/MariaDB sources with
+  mydumper's `FTWRL` sync mode instead of the default `NO_LOCK`, giving a
+  single point-in-time snapshot across all **transactional** tables instead of
+  a per-table one (see
+  [Cross-table consistency](dump-and-baseline.md#cross-table-consistency)).
+  Off by default — the default trades this away for needing no elevated
+  privilege. Requires the source user to have **both** `BACKUP_ADMIN` and
+  `RELOAD` (or `FLUSH_TABLES`); the console checks for both before invoking
+  mydumper and refuses with a clear error if either is missing — never
+  silently falling back to `NO_LOCK`, and never letting mydumper attempt the
+  dump with only one of the two (that combination doesn't fail cleanly, it
+  crashes the pinned mydumper build). No effect unless
+  `BINTRAIL_CONSOLE_BASELINE_TRIGGER` is also on, and no effect on PostgreSQL
+  sources.
 - `BINTRAIL_CONSOLE_VERIFY_TRIGGER` (`watch` only) — `1`/`true` enables the
   Storage page's **Verification** panel (runs `bintrail verify` in-process;
   see [Running verification from the console](#running-verification-from-the-console)).

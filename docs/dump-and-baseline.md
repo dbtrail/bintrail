@@ -13,7 +13,7 @@ dbtrail's binlog index captures every change (INSERT, UPDATE, DELETE) but not th
 mydumper is used instead of `mysqldump` because it:
 
 - Dumps tables in parallel (configurable thread count)
-- Produces consistent snapshots using `FTWRL` or `--trx-consistency-only`
+- Produces a lightweight, lock-minimizing snapshot by default (`--sync-thread-lock-mode NO_LOCK --trx-tables`), so a least-privilege replication user can dump without `BACKUP_ADMIN`/`RELOAD` — see [Cross-table consistency](#cross-table-consistency) for what that trades away
 - Outputs per-table files that `bintrail baseline` can process independently
 - Supports both SQL INSERT and TSV (`*.dat`) output formats
 
@@ -164,6 +164,19 @@ dbtrail always passes these flags to mydumper:
 | `--complete-insert` | Generate `INSERT INTO table (col1, col2, ...) VALUES (...)` with column names — required for `bintrail baseline` to parse the output correctly |
 
 The source password never appears on mydumper's command line, so it is not visible in `ps aux` or (Docker mode) `docker inspect`. With a local mydumper binary it is delivered via `MYSQL_PWD` in the child process environment; in Docker mode it is written to a temporary `0600` MySQL option file bind-mounted read-only into the container, which mydumper reads via `--defaults-file`.
+
+### Cross-table consistency
+
+By default (`--sync-thread-lock-mode NO_LOCK --trx-tables`), every mydumper worker thread opens its own transactional snapshot **independently, with no synchronization barrier between threads**. Each table's snapshot is therefore anchored at *that thread's* instant, not at one shared instant for the whole dump. On a quiet source the skew between threads is negligible; on a write-heavy source it can be milliseconds to a few seconds. Two consequences follow:
+
+- **The dump's recorded binlog coordinates don't correspond exactly to any single thread's actual snapshot instant** — they're an approximation across however many threads ran.
+- **A reconstruct that spans multiple tables (e.g. a parent/child pair joined by a foreign key) can read mutually inconsistent state** — the parent table's snapshot may be a few rows ahead of or behind the child table's.
+
+In practice this skew is almost always absorbed by dbtrail's idempotent delta replay and the baseline's second-granularity anchor, but it is a real gap, not a rounding error. It is also worse on non-transactional tables (MyISAM), which get no consistency guarantee at all under `NO_LOCK` — every row can be mid-write when read.
+
+This is the trade for needing no elevated privilege: a replication user with only `SELECT` + `REPLICATION CLIENT` (no `BACKUP_ADMIN`/`RELOAD`) can run a `NO_LOCK` dump. Both `bintrail dump` (CLI) and the console's **Create baseline** button use this mode by default, and neither downgrades silently — if you need every table anchored at the exact same instant, use the console's opt-in point-consistent mode instead of a `NO_LOCK` dump: see [Creating a baseline from the console](console.md#creating-a-baseline-from-the-console) and the `BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT` environment variable in [console.md](console.md). It runs mydumper's built-in `FTWRL` sync mode (`--sync-thread-lock-mode FTWRL --trx-tables`) — one global read lock held just long enough for every worker to open its snapshot at the same instant.
+
+`FTWRL` mode covers **transactional tables only** — the same `--trx-tables` assumption as the default mode. A source with a non-transactional (MyISAM) table isn't silently under-covered: mydumper detects it and refuses to dump at all ("Non transactional table found ... Restart backup using --trx-tables=0"), which the console propagates as the run's error. It needs **two** privileges, verified against the pinned mydumper build (`v1.0.3-1`) against a real MySQL 8.0 source: `BACKUP_ADMIN` (for `LOCK INSTANCE FOR BACKUP`) **and** `RELOAD` or the `FLUSH_TABLES` dynamic privilege (for `FLUSH TABLES WITH READ LOCK`). The console checks for both **before** invoking mydumper and refuses with a clear, actionable error if either is missing — this is not just belt-and-suspenders: granting `BACKUP_ADMIN` **without** `RELOAD`/`FLUSH_TABLES` does not make mydumper fail cleanly, it makes the pinned build **crash** (a segfault, reproduced on both amd64 and arm64), so the console's own preflight check exists specifically to turn that crash into a clean error instead of ever letting mydumper attempt it half-privileged. Point-consistent mode never silently falls back to `NO_LOCK`. There is currently no CLI (`bintrail dump`) equivalent of this opt-in — it exists only on the console's in-process baseline pipeline.
 
 ### Concurrency protection
 

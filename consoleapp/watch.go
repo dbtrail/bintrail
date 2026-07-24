@@ -98,6 +98,14 @@ var (
 	// upBaselineStageDir is the local staging base for S3-destined baselines
 	// (BINTRAIL_CONSOLE_BASELINE_STAGING); default a temp subdir.
 	upBaselineStageDir string
+	// upConsoleBaselinePointConsistent opts a console-triggered MySQL/MariaDB
+	// baseline into mydumper's FTWRL sync mode instead of the NO_LOCK default,
+	// trading the least-privilege requirement (no BACKUP_ADMIN/RELOAD needed) for
+	// a single point-in-time snapshot across every transactional table (#800).
+	// Env-only (BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT=1) — off by default,
+	// same shape as upConsoleBaselineTrigger; has no effect unless baseline-trigger
+	// is also on.
+	upConsoleBaselinePointConsistent bool
 	// upConsoleVerifyTrigger opts into in-process bintrail verify runs from the
 	// console (#677). Env-only (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1) — off by
 	// default for a bare `watch` invocation; unlike baseline-trigger it starts
@@ -397,7 +405,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
 	if upConsoleBaselineTrigger {
-		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir())
+		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
 	}
 	if upConsoleVerifyTrigger {
 		cfg.VerifyCtrl = newVerifySupervisor(ctx)
@@ -552,7 +560,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
 	if upConsoleBaselineTrigger {
-		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir())
+		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
 	}
 	if upConsoleVerifyTrigger {
 		cfg.VerifyCtrl = newVerifySupervisor(ctx)
@@ -774,6 +782,9 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 	}
 	if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_STAGING"); v != "" {
 		upBaselineStageDir = v
+	}
+	if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT"); v == "1" || v == "true" {
+		upConsoleBaselinePointConsistent = true
 	}
 	// Verify trigger is env-only (no flag), same shape as baseline trigger.
 	if v := os.Getenv("BINTRAIL_CONSOLE_VERIFY_TRIGGER"); v == "1" || v == "true" {
