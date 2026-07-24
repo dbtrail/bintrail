@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -126,9 +127,21 @@ var driverDefaultMaxAllowedPacket = mysql.NewConfig().MaxAllowedPacket
 // into time.Time), Loc=UTC, a default connect timeout, and aligning the
 // client's max_allowed_packet with the server's.
 func buildDSN(dsn string) (string, error) {
+	cfg, err := normalizeDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	return cfg.FormatDSN(), nil
+}
+
+// normalizeDSN parses a user DSN and applies the same invariants as buildDSN,
+// returning the *mysql.Config so callers that need to attach a programmatic
+// *tls.Config (ConnectWithTLS) share the exact invariants without a DSN-string
+// round-trip.
+func normalizeDSN(dsn string) (*mysql.Config, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
-		return "", fmt.Errorf("invalid DSN: %w", err)
+		return nil, fmt.Errorf("invalid DSN: %w", err)
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.UTC
@@ -158,7 +171,84 @@ func buildDSN(dsn string) (string, error) {
 	if cfg.MaxAllowedPacket == driverDefaultMaxAllowedPacket {
 		cfg.MaxAllowedPacket = 0
 	}
-	return cfg.FormatDSN(), nil
+	return cfg, nil
+}
+
+// ConnectWithTLS opens and verifies a MySQL connection like Connect, but also
+// attaches a programmatic TLS configuration to the connection. tlsCfg == nil
+// means no TLS (plaintext), identical to Connect.
+//
+// For the programmatic tlsCfg path the connection FAILS (it never silently falls
+// back to plaintext) if the server cannot satisfy the requested TLS — this
+// function never sets the driver's own AllowFallbackToPlaintext. A caller that
+// wants an opportunistic fallback must detect the failure and retry with a nil
+// tlsCfg itself, so any cleartext downgrade is an explicit, loggable decision
+// (#946/#947). (An operator who puts tls=preferred in the DSN itself opts into
+// the driver's own silent fallback — the DSN-precedence rule below hands that
+// case to the driver by design.)
+//
+// An explicit tls= parameter already present in the DSN takes precedence: if the
+// parsed config already carries any TLS setting, tlsCfg is ignored so an
+// operator's own DSN choice always wins.
+//
+// Used by the stream path (internal/streamrun) so --ssl-mode protects the index
+// write connection (full row images = PII, plus index credentials) and the
+// source helper connection, not only the binlog replication stream (#946).
+func ConnectWithTLS(dsn string, tlsCfg *tls.Config) (*sql.DB, error) {
+	cfg, err := normalizeDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	applyTLS(cfg, tlsCfg)
+
+	connector, err := mysql.NewConnector(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create MySQL connector: %w", err)
+	}
+	db := sql.OpenDB(connector)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping MySQL: %w", err)
+	}
+	return db, nil
+}
+
+// applyTLS attaches tlsCfg to cfg unless the DSN already specified TLS (either a
+// *tls.Config or a tls= name/mode), in which case the operator's choice wins.
+// Split out so the precedence rule is unit-testable without a live server.
+func applyTLS(cfg *mysql.Config, tlsCfg *tls.Config) {
+	if tlsCfg == nil || cfg.TLS != nil || cfg.TLSConfig != "" {
+		return
+	}
+	cfg.TLS = tlsCfg
+}
+
+// DSNHost returns the TCP host of a MySQL DSN, for use as a TLS ServerName
+// (verify-identity only). It is best-effort and never errors: an unparseable
+// DSN or a unix-socket DSN yields "" (hostname verification is meaningless over
+// a socket), and the subsequent connect surfaces any real DSN error with proper
+// context. Unlike ParseSourceDSN it imposes no TCP/port requirement, so it is
+// safe to call on an index DSN that may legitimately use a socket.
+func DSNHost(dsn string) string {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil || strings.EqualFold(cfg.Net, "unix") {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(cfg.Addr); err == nil {
+		return h
+	}
+	return cfg.Addr
+}
+
+// DSNHasExplicitTLS reports whether the DSN sets its own tls= parameter (any
+// value). Used to warn when a DSN's own TLS choice silently overrides a stronger
+// --ssl-mode on the same connection (#946).
+func DSNHasExplicitTLS(dsn string) bool {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return false
+	}
+	return cfg.TLSConfig != "" || cfg.TLS != nil
 }
 
 // ParseSourceDSN decomposes a go-sql-driver DSN into host, port, user, and

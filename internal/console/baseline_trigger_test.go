@@ -204,6 +204,58 @@ func TestBaselineStatus_returnsControllerState(t *testing.T) {
 }
 
 // TestSplitSchemas covers the comma-separated parse used to build the request.
+// addPGBaselineEntry adds a PostgreSQL registry entry (source + slot/publication
+// + a local baseline destination) and returns its generated id.
+func addPGBaselineEntry(t *testing.T, srv *Server, slot, publication string) string {
+	t.Helper()
+	e, err := srv.cm.reg.Add(ServerEntry{
+		Name:              "pgwp",
+		DSN:               "idx:idxpw@tcp(127.0.0.1:3306)/binlog_index",
+		SourceDSN:         "postgres://repl:secret@pg:5432/appdb",
+		BaselineDir:       t.TempDir(),
+		Flavor:            FlavorPostgres,
+		SourceSlot:        slot,
+		SourcePublication: publication,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e.ID
+}
+
+// TestBaselineTrigger_postgresHappy: a PG entry with a slot + publication triggers
+// a baseline whose request carries the flavor/slot/publication the PG producer needs.
+func TestBaselineTrigger_postgresHappy(t *testing.T) {
+	srv, ctrl := newBaselineTriggerServer(t)
+	id := addPGBaselineEntry(t, srv, "bintrail_slot", "bintrail_pub")
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline", "")
+	if rec.Code != 202 {
+		t.Fatalf("pg happy: code=%d, want 202", rec.Code)
+	}
+	if len(ctrl.triggered) != 1 {
+		t.Fatalf("want 1 triggered request, got %d", len(ctrl.triggered))
+	}
+	got := ctrl.triggered[0]
+	if got.Flavor != FlavorPostgres || got.Slot != "bintrail_slot" || got.Publication != "bintrail_pub" {
+		t.Errorf("PG baseline request missing flavor/slot/publication: %+v", got)
+	}
+}
+
+// TestBaselineTrigger_postgresRequiresSlot: a PG entry with no slot/publication
+// cannot be baselined — a clear 400 (not a mydumper "no source" mislabel), and
+// the controller is never triggered.
+func TestBaselineTrigger_postgresRequiresSlot(t *testing.T) {
+	srv, ctrl := newBaselineTriggerServer(t)
+	id := addPGBaselineEntry(t, srv, "", "bintrail_pub")
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline", "")
+	if rec.Code != 400 {
+		t.Fatalf("pg without slot: code=%d, want 400", rec.Code)
+	}
+	if len(ctrl.triggered) != 0 {
+		t.Fatal("controller must not be triggered for a PG entry without a slot")
+	}
+}
+
 func TestSplitSchemas(t *testing.T) {
 	cases := map[string][]string{
 		"":              nil,

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pglogrepl"
+
+	"github.com/dbtrail/dbtrail/internal/rotation"
 )
 
 // resetPGFlags restores the stream command's package-global flag vars to their
@@ -195,6 +198,9 @@ func TestPGStreamCmd_defaults(t *testing.T) {
 		{"batch-size", "1000"},
 		{"checkpoint", "5"},
 		{"partitions", "48"},
+		{"rotate-retain", "30d"},
+		{"rotate-interval", "1h"},
+		{"rotate-add-future", "3"},
 	}
 	for _, tc := range cases {
 		f := streamCmd.Flag(tc.flag)
@@ -205,6 +211,104 @@ func TestPGStreamCmd_defaults(t *testing.T) {
 		if f.DefValue != tc.want {
 			t.Errorf("flag --%s: expected default %q, got %q", tc.flag, tc.want, f.DefValue)
 		}
+	}
+}
+
+// TestPGStreamCmd_rotationDefaultsEnableRetention pins the load-bearing #951
+// contract: the registered --rotate-* flag defaults must parse into an ENABLED
+// 30d rotation, so a fresh `bintrail-pg stream` bounds its own index without any
+// operator action (a PG install has no `up` command — stream is its only
+// daemon). explicit=false (running on the built-in default, not operator-set)
+// arms the upgrade guard that protects a pre-existing index's deep history.
+func TestPGStreamCmd_rotationDefaultsEnableRetention(t *testing.T) {
+	retain := streamCmd.Flag("rotate-retain").DefValue
+	interval := streamCmd.Flag("rotate-interval").DefValue
+	addFuture, err := strconv.Atoi(streamCmd.Flag("rotate-add-future").DefValue)
+	if err != nil {
+		t.Fatalf("rotate-add-future default not an int: %v", err)
+	}
+	s, err := rotation.ParseSettings(retain, interval, addFuture, false)
+	if err != nil {
+		t.Fatalf("the registered rotation defaults must parse: %v", err)
+	}
+	if !s.Enabled {
+		t.Error("built-in rotation must be enabled by default (safe-by-default retention, #951)")
+	}
+	if s.Retain != 30*24*time.Hour {
+		t.Errorf("default retain = %v, want 720h (30d)", s.Retain)
+	}
+	if s.AddFuture != 3 {
+		t.Errorf("default add-future = %d, want 3", s.AddFuture)
+	}
+	if s.Explicit {
+		t.Error("Explicit must be false for the built-in default so the upgrade guard stays armed")
+	}
+}
+
+// TestPGStreamCmd_rotationOffDisables confirms `--rotate-retain off` fully
+// disables the built-in loop, the documented opt-out for operators who run
+// retention separately (e.g. a standalone `bintrail-pg rotate` daemon).
+func TestPGStreamCmd_rotationOffDisables(t *testing.T) {
+	s, err := rotation.ParseSettings("off", "1h", 3, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.Enabled {
+		t.Error(`--rotate-retain "off" must disable the built-in rotation loop`)
+	}
+}
+
+// TestMaintenanceCommandsRegisteredOnRoot pins the #951 contract on the REAL
+// bintrail-pg root: a PostgreSQL-only install must expose both `rotate` and
+// `archive` so it can bound its index without the core MySQL binary. This walks
+// the actual rootCmd (populated by main.go's init → cli.AddMaintenanceCommands),
+// not a throwaway command, so dropping the registration call — or one of the two
+// commands from it — fails here.
+func TestMaintenanceCommandsRegisteredOnRoot(t *testing.T) {
+	got := map[string]bool{}
+	for _, c := range rootCmd.Commands() {
+		got[c.Name()] = true
+	}
+	for _, want := range []string{"rotate", "archive"} {
+		if !got[want] {
+			t.Errorf("bintrail-pg root is missing the %q command (cli.AddMaintenanceCommands not wired?)", want)
+		}
+	}
+}
+
+// TestPGStreamCmd_rotateRetainExplicitWiring pins the flag `runPGStream` reads to
+// arm the upgrade guard. Setting --rotate-retain on streamCmd must flip
+// Changed("rotate-retain") to true, which is exactly the `explicit` argument
+// passed to rotation.ParseSettings — a wrong flag name there would engage the
+// guard even when the operator DID choose a retention, silently refusing drops.
+// Mirrors cliapp/up_rotation_test.go's TestRunUp_explicitRetentionWiring.
+func TestPGStreamCmd_rotateRetainExplicitWiring(t *testing.T) {
+	flag := streamCmd.Flags().Lookup("rotate-retain")
+	if flag == nil {
+		t.Fatal("--rotate-retain not registered on streamCmd")
+	}
+	savedChanged, savedValue := flag.Changed, flag.Value.String()
+	t.Cleanup(func() {
+		flag.Changed = savedChanged
+		_ = flag.Value.Set(savedValue)
+	})
+
+	// Never set → not explicit (guard armed, protects deep history).
+	flag.Changed = false
+	if s, _ := rotation.ParseSettings(flag.Value.String(), "1h", 3, streamCmd.Flags().Changed("rotate-retain")); s.Explicit {
+		t.Error("Explicit must be false when --rotate-retain was never set")
+	}
+
+	// Set through the flag set, exactly like CLI/env (BindCommandEnv) would.
+	if err := streamCmd.Flags().Set("rotate-retain", "7d"); err != nil {
+		t.Fatalf("Set(rotate-retain): %v", err)
+	}
+	s, err := rotation.ParseSettings(flag.Value.String(), "1h", 3, streamCmd.Flags().Changed("rotate-retain"))
+	if err != nil {
+		t.Fatalf("ParseSettings: %v", err)
+	}
+	if !s.Explicit {
+		t.Error(`Explicit must be true once --rotate-retain is set — the Changed("rotate-retain") call site is broken`)
 	}
 }
 

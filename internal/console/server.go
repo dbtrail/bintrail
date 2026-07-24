@@ -2,12 +2,10 @@
 // bintrail index. It is the MCP server with a web face: the same query,
 // recovery, status, and metadata engines, reached over HTTP from a browser.
 //
-// The console serves event browsing, recovery-SQL generation, and — since the
-// Forensics view — session attribution via /api/forensics/*. The events API
-// includes connection_id but never query_text/query_hash (see dto.go); the
-// originating statement is served only through the forensics endpoints, which
-// refuse under an active RBAC profile. No endpoint ever executes SQL; recover
-// generates a script for the operator to review and apply by hand.
+// The console serves event browsing, recovery-SQL generation, status, and
+// point-in-time reconstruction. The events API includes connection_id but
+// never query_text/query_hash (see dto.go). No endpoint ever executes SQL;
+// recover generates a script for the operator to review and apply by hand.
 package console
 
 import (
@@ -22,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -96,6 +95,11 @@ type Config struct {
 	// where the trigger endpoint refuses with 403 and /api/capabilities reports
 	// verify_trigger:false. Set together with MonitorCtrl (both control-plane).
 	VerifyCtrl VerifyController
+	// Telemetry is the live usage-telemetry client, wired in by
+	// `bintrail-console watch` so the UI opt-out toggle stops the running
+	// daemon's beacons immediately. nil on the read-only console (serve), where
+	// the toggle still persists the machine-wide choice to the consent file.
+	Telemetry TelemetryController
 	// BaselineDir / BaselineS3 enable point-in-time reconstruct (Phase 2) on
 	// the boot entry. When either is set (and no RBAC profile is active), the
 	// "Reconstruct" surface is exposed. BaselineDir takes precedence;
@@ -107,6 +111,13 @@ type Config struct {
 	// DefaultAuthPath(). A missing file means password login is not
 	// configured; a corrupt one fails New loudly.
 	AuthPath string
+	// MCPTokenPath locates the managed MCP token file (SHA-256 only, written
+	// by the Settings → Connect AI generate flow — #1052). Empty means
+	// DefaultMCPTokenPath(). A missing file means no managed token; a corrupt
+	// one is logged loudly and disables the managed token until regenerated —
+	// unlike AuthPath, it deliberately never fails New (the daemon may be the
+	// stream supervisor).
+	MCPTokenPath string
 	// TLSCert / TLSKey serve the console over HTTPS (both-or-neither). Static
 	// files only — rotation is a restart; ACME is out of scope.
 	TLSCert string
@@ -125,6 +136,11 @@ type Config struct {
 	// daemon; zero on the standalone serve (which runs no rotation loop and
 	// hides the panel).
 	RotationDefaults RotationDefaults
+	// Version is the running build's version string ("0.36.0", or "dev" on
+	// unversioned builds), reported in /api/capabilities so the frontend can
+	// link release artifacts (the .mcpb bundle) matching the running binary.
+	// Optional; empty reads as an unversioned build.
+	Version string
 }
 
 // RotationDefaults is the daemon-side built-in-rotation policy, surfaced to the
@@ -162,10 +178,15 @@ type Server struct {
 	// verifyCtrl: non-nil only when the watch daemon opted into in-process
 	// verify runs (see Config.VerifyCtrl).
 	verifyCtrl VerifyController
+	// telemetry: non-nil only when a long-running console wired its live
+	// telemetry client (see Config.Telemetry), so the UI opt-out reaches it.
+	telemetry TelemetryController
 	// rotationDefaults are the daemon's --rotate-* values, the fallback GET
 	// /api/rotation reports when no console override is saved.
 	rotationDefaults RotationDefaults
-	cm               *connManager
+	// version is the running build's version string (Config.Version).
+	version string
+	cm      *connManager
 	mux              http.Handler
 	// Password login: authPath is the credential file (re-read per login so a
 	// live `user set-password` applies without restart); passwordCfg is its
@@ -176,6 +197,15 @@ type Server struct {
 	sessions     *sessionStore
 	loginLimiter *loginLimiter
 	tlsConf      *tls.Config
+	// Managed MCP token (#1052): mcpTokenPath is the on-disk hash file;
+	// managedTok is the live credential, swapped in place by the
+	// generate/rotate/revoke handlers so changes apply without a restart.
+	mcpTokenPath string
+	managedTok   managedMCPToken
+	// sessionProfiles caches per-(server, profile) RBAC rules for per-session
+	// data-profile enforcement (#1075). Inert in OSS (no session ever carries a
+	// profile); populated lazily on the first profiled request.
+	sessionProfiles *profileRuleCache
 }
 
 // serverHeader selects the target server per request. Selection is stateless —
@@ -183,6 +213,12 @@ type Server struct {
 // different server without fighting. As a custom header it is also CSRF-safe
 // for the same reason Authorization is: a cross-site form POST cannot set it.
 const serverHeader = "X-Bintrail-Server"
+
+// extAuthPrefix is where an installed ext.ConsoleAuthProvider is mounted.
+// The provider's login-initiation endpoint lives at extAuthPrefix + "start"
+// (the login screen links there); see ext.ConsoleAuthProvider.Handler for
+// the mount contract.
+const extAuthPrefix = "/api/auth/ext/"
 
 // New validates the config, seeds the boot connection bundle, and assembles
 // the middleware/route tree. It does no network I/O — call Run to listen.
@@ -206,6 +242,25 @@ func New(cfg Config) (*Server, error) {
 	}
 	passwordCfg := authFile != nil
 
+	// Managed MCP token (#1052): an /mcp-ONLY credential minted from the UI.
+	// Missing file = the normal not-configured state; an unreadable file is
+	// logged loudly but never blocks startup — this daemon may be the stream
+	// supervisor, and capture must not die over a UI-convenience credential
+	// (regenerating from Settings → Connect AI overwrites the bad file). It
+	// deliberately plays no part in the bind/setup policy below and is NOT
+	// accepted by tokenMiddleware: its advertised scope is the read-only MCP
+	// tools, so it must not unlock the browser API (registry CRUD, monitor
+	// verbs, its own rotation).
+	mcpTokenPath := cfg.MCPTokenPath
+	if mcpTokenPath == "" {
+		mcpTokenPath = DefaultMCPTokenPath()
+	}
+	mcpTokFile, err := LoadMCPTokenFile(mcpTokenPath)
+	if err != nil {
+		slog.Error("console: MCP token file unreadable; managed MCP token disabled until regenerated from Settings → Connect AI", "path", mcpTokenPath, "error", err)
+		mcpTokFile = nil
+	}
+
 	// Bind/credential policy. Password login is the primary path; the static
 	// token is an opt-in automation credential (set explicitly, never
 	// generated). With neither a token nor a password:
@@ -219,10 +274,20 @@ func New(cfg Config) (*Server, error) {
 	// non-loopback binds legal. A non-loopback bind with no credential is
 	// refused UNLESS the operator asserts the bind is access-controlled
 	// (AllowSetup) — then it enters setup like a loopback bind would.
+	// An installed external auth provider (ext.ConsoleAuth) is a valid sole
+	// credential path — its login flow mints the same sessions password login
+	// does — so it also lifts the non-loopback refusal. It does NOT change
+	// willSetup/setupAllowed: browser first-run password setup stays gated on
+	// loopback (or the explicit AllowSetup assertion) exactly as before.
+	// An installed credential backend (ext.ConsoleCredential) likewise is
+	// a credential path: it serves the login form, so it is folded into
+	// noCredential — a backend makes the bind legal AND closes first-run setup
+	// (a stray password file must not be creatable when a backend already holds
+	// the credentials), matching passwordLoginEnabled().
 	token := cfg.Token
-	noCredential := token == "" && !passwordCfg
+	noCredential := token == "" && !passwordCfg && ext.ConsoleCredential() == nil
 	willSetup := noCredential && (isLoopbackAddr(listen) || cfg.AllowSetup)
-	if noCredential && !willSetup {
+	if noCredential && !willSetup && ext.ConsoleAuth() == nil {
 		return nil, fmt.Errorf("authentication is required when binding to a non-loopback address %q: set a console password with `bintrail-console user set-password`, set --token / BINTRAIL_CONSOLE_TOKEN for automation, or pass --allow-setup if this bind is access-controlled (e.g. published only on the host's loopback)", listen)
 	}
 	// A missing auth file is the EXPECTED first-run state (browser setup creates
@@ -279,7 +344,9 @@ func New(cfg Config) (*Server, error) {
 		monitorCtrl:      cfg.MonitorCtrl,
 		baselineCtrl:     cfg.BaselineCtrl,
 		verifyCtrl:       cfg.VerifyCtrl,
+		telemetry:        cfg.Telemetry,
 		rotationDefaults: cfg.RotationDefaults,
+		version:          cfg.Version,
 		cm:               newConnManager(cfg.Registry, profileActive),
 		authPath:         authPath,
 		passwordCfg:      passwordCfg,
@@ -287,7 +354,10 @@ func New(cfg Config) (*Server, error) {
 		sessions:         newSessionStore(),
 		loginLimiter:     newLoginLimiter(),
 		tlsConf:          tlsConf,
+		mcpTokenPath:     mcpTokenPath,
+		sessionProfiles:  newProfileRuleCache(),
 	}
+	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot
 
 	// Seed the ephemeral boot bundle when the caller supplied a command-line
@@ -360,25 +430,20 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/status", s.handleStatus)
 	api.HandleFunc("GET /api/schemas", s.handleSchemas)
 	api.HandleFunc("GET /api/events", s.handleEvents)
-	api.HandleFunc("POST /api/recover", s.handleRecover)
-	api.HandleFunc("POST /api/recover-cascade", s.handleRecoverCascade)
+	api.HandleFunc("POST /api/recover", s.recordAction("recover", s.handleRecover))
+	api.HandleFunc("POST /api/recover-cascade", s.recordAction("recover-cascade", s.handleRecoverCascade))
 	api.HandleFunc("GET /api/capabilities", s.handleCapabilities)
-	api.HandleFunc("GET /api/reconstruct", s.handleReconstruct)
-	// Forensics investigation surface (epic #701): who changed a row, and the
-	// three general activity queries. Selected-server-scoped via the same
-	// X-Bintrail-Server header as /api/events, not the /api/servers/{id}/...
-	// path convention — forensics is a passive investigative tab bound to
-	// whichever server the UI has selected, like Events/Explorer, not an
-	// explicitly-targeted background action like verify/baseline.
-	api.HandleFunc("GET /api/forensics/capabilities", s.handleForensicsCapabilities)
-	api.HandleFunc("GET /api/forensics/users", s.handleForensicsUsers)
-	api.HandleFunc("POST /api/forensics/who-changed", s.handleForensicsWhoChanged)
-	api.HandleFunc("POST /api/forensics/activity", s.handleForensicsActivity)
+	api.HandleFunc("GET /api/reconstruct", s.recordAction("reconstruct", s.handleReconstruct))
 	// Storage surfaces (read-only): the selected server's baseline snapshot
 	// listing, and the process's ambient AWS credential signals (presence
 	// booleans and non-secret names — never values).
 	api.HandleFunc("GET /api/baselines", s.handleBaselines)
 	api.HandleFunc("GET /api/storage", s.handleStorageInfo)
+	// Usage-telemetry opt-out: read the machine-wide state, and toggle it (a
+	// local config write, not a data write). Available on any console; the UI
+	// surfaces it on the watch daemon that actually beacons.
+	api.HandleFunc("GET /api/telemetry", s.handleTelemetryGet)
+	api.HandleFunc("POST /api/telemetry", s.handleTelemetrySet)
 	// Server management: CRUD over the local registry file (never a DB write)
 	// plus a write-free test-connection probe. Same token + host guard as the
 	// data endpoints.
@@ -397,9 +462,9 @@ func (s *Server) buildHandler() http.Handler {
 	// Baseline trigger: enqueue an in-process baseline (dump→convert→upload) for
 	// a monitored server. 403 unless the watch daemon opted in
 	// (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1). GET polls the running/last state.
-	api.HandleFunc("POST /api/servers/{id}/baseline", s.handleBaselineTrigger)
+	api.HandleFunc("POST /api/servers/{id}/baseline", s.recordAction("baseline", s.handleBaselineTrigger))
 	api.HandleFunc("GET /api/servers/{id}/baseline", s.handleBaselineStatus)
-	api.HandleFunc("POST /api/servers/{id}/verify", s.handleVerifyTrigger)
+	api.HandleFunc("POST /api/servers/{id}/verify", s.recordAction("verify", s.handleVerifyTrigger))
 	api.HandleFunc("GET /api/servers/{id}/verify", s.handleVerifyStatus)
 	api.HandleFunc("GET /api/servers/{id}/verify/explain", s.handleVerifyExplain)
 	// Global built-in-rotation policy: read the effective settings; PUT an
@@ -412,6 +477,12 @@ func (s *Server) buildHandler() http.Handler {
 	// keeps them under the tokenMiddleware-wrapped /api/ catch-all).
 	api.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	api.HandleFunc("POST /api/auth/password", s.handlePasswordChange)
+	// Managed MCP token (#1052): status / generate-or-rotate / revoke, all
+	// behind the same credential as every /api route. Values never serialize
+	// except the one-time plaintext in the generate response.
+	api.HandleFunc("GET /api/mcp-token", s.handleMCPTokenGet)
+	api.HandleFunc("POST /api/mcp-token", s.handleMCPTokenGenerate)
+	api.HandleFunc("DELETE /api/mcp-token", s.handleMCPTokenRevoke)
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /api/healthz", s.handleHealthz) // unauthenticated liveness
@@ -420,8 +491,49 @@ func (s *Server) buildHandler() http.Handler {
 	root.HandleFunc("GET /api/auth", s.handleAuthInfo)
 	root.HandleFunc("POST /api/auth/login", s.handleLogin)
 	root.HandleFunc("POST /api/auth/setup", s.handleSetup) // first-run, loopback-only, self-disables
-	root.Handle("/api/", s.tokenMiddleware(api))           // credential on all other /api/*
-	root.Handle("/", assetHandler())                       // static shell + assets
+	// External auth provider (ext seam): mounted UNAUTHENTICATED at
+	// extAuthPrefix, behind hostGuard and securityHeaders only. The provider
+	// owns its own CSRF/state protection, and the console's login rate
+	// limiter does not cover these routes. ServeMux specificity keeps this
+	// subtree more specific than the tokenMiddleware-wrapped "/api/"
+	// catch-all; with no provider installed the path falls into that
+	// catch-all and 401s — the desired behavior for the stock binary.
+	if p := ext.ConsoleAuth(); p != nil {
+		root.Handle(extAuthPrefix, p.Handler(extAuthPrefix, s.extSessionIssuer()))
+	}
+	// Extension view (ext seam): an embedding distribution can contribute one
+	// additional console view. Its static assets mount UNAUTHENTICATED on root at
+	// /ext/<id>/ (behind hostGuard + securityHeaders only — code always ships,
+	// only data is gated), and its data routes mount on the inner api mux at
+	// /api/ext/<id>/ so they inherit tokenMiddleware, wrapped in rbacViewGuard so
+	// the whole surface is refused (403) while an RBAC profile is active. The id
+	// flows into both URL paths and a DOM route, so an invalid one is skipped
+	// (logged, not mounted) rather than producing a broken/injectable route.
+	if p := ext.ConsoleView(); p != nil {
+		id := p.ID()
+		if !ext.ValidConsoleViewID(id) {
+			slog.Error("console: ignoring extension view with an invalid id (must match ^[a-z0-9-]+$)", "id", id)
+		} else {
+			staticPrefix := "/ext/" + id + "/"
+			dataPrefix := "/api/ext/" + id + "/"
+			root.Handle(staticPrefix, p.StaticHandler(staticPrefix))
+			api.Handle(dataPrefix, s.rbacViewGuard(p.DataHandler(dataPrefix, s.consoleQueryContext)))
+		}
+	}
+	// credential on all other /api/* (tokenMiddleware), then per-session
+	// authorization (authzMiddleware). authz is inert for policy-less sessions —
+	// the static token, the password login, and every OSS session — so this only
+	// enforces when an EE build attaches a policy via the session-issuer seam.
+	root.Handle("/api/", s.tokenMiddleware(s.authzMiddleware(api)))
+	// MCP endpoint (#1039): the four read-only tools over Streamable HTTP,
+	// token-authenticated (static or UI-managed — #1052), routed per server
+	// by URL path. Carries its own auth check (tokens only, no sessions —
+	// see mcp.go) instead of tokenMiddleware, and sits on root so it
+	// inherits hostGuard + securityHeaders.
+	mcpH := s.mcpHandler()
+	root.Handle("/mcp", mcpH)
+	root.Handle("/mcp/{server}", mcpH)
+	root.Handle("/", assetHandler()) // static shell + assets
 
 	return s.hostGuard(securityHeaders(root))
 }
@@ -429,7 +541,8 @@ func (s *Server) buildHandler() http.Handler {
 // Handler returns the fully assembled HTTP handler. Exposed for tests.
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// Token returns the active access token (supplied or generated). Empty in
+// Token returns the static automation token — never the UI-managed MCP
+// token (the flashback port depends on that distinction). Empty in
 // password-only mode.
 func (s *Server) Token() string { return s.token }
 

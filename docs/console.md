@@ -69,6 +69,19 @@ accepts `--ssl-mode` / `--ssl-ca` / `--ssl-cert` / `--ssl-key` (env
 The default stays `--ssl-mode preferred` (opportunistic, no certificate
 verification).
 
+> **Scope of `--ssl-mode` under `watch`.** The flag encrypts `watch`'s embedded
+> **stream** connections — the source replication and the index *write*. It does
+> **not** currently cover the console's own index *reads* (the connections the
+> multi-server manager opens to serve the web UI) or the index reads behind the
+> embedded flashback port (`--flashback-listen`). Encrypt those index
+> connections by adding a `tls=` parameter to their DSN (`...?tls=true`, or
+> `?tls=skip-verify` for self-signed dev certs) — the same knob the offline read
+> commands use. (The flashback port's *inbound* MySQL-protocol listener — the
+> client→port leg — has no TLS option in this release; `tls=` only covers its
+> backend index reads.) If your index MySQL is reached over loopback or a
+> private network this is moot; over an untrusted network, set `tls=` on the
+> index DSN in addition to `--ssl-mode`.
+
 Open that URL in a browser. A left **sidebar** groups the views (Time-travel
 appears only when a baseline is configured), with a **server switcher** at the
 top (see [Managing servers](#managing-servers)) and a **⌘K command palette**
@@ -84,22 +97,14 @@ and searching events:
    in place to a before→after diff; `j`/`k` move the cursor, `↵` expands, `u`
    jumps to Recover. Results carry **JSON / CSV** export — client-side over the
    rows already on screen, so it stays within the result caps. Rows and exports
-   include `connection_id` (the thread number Forensics resolves to a name) but
-   never `query_text`/`query_hash` — the originating statement is served only
-   through the Forensics view.
+   include `connection_id` (the transaction's originating thread number) but
+   never `query_text`/`query_hash`.
 3. **Time-travel** — single-row point-in-time reconstruct, drawn as a timeline
    (baseline snapshot → each change, with a **Restore to this state** jump to
    Recover). Appears **only when a baseline is configured**
    (`--baseline-dir`/`--baseline-s3`); otherwise it is hidden, never shown
    empty. See [Time-travel](#time-travel-reconstruct).
-4. **Forensics** — "who changed this?": attribute indexed changes to database
-   sessions (user, host, client program) through the audit-log / live-session /
-   identity-cache cascade, plus the investigation queries (user activity,
-   connection history), a capabilities check of the source, and a
-   tailored setup guide. Refuses to answer while an RBAC access profile is
-   active — forensic output contains unredacted SQL and session identity. See
-   [Forensics](forensics.md).
-5. **Recover** — filter schema / table / PK / time, preview the affected rows
+4. **Recover** — filter schema / table / PK / time, preview the affected rows
    with before→after diffs, then **Generate undo SQL** and copy/download the
    script. Arriving via an **Undo** action scopes it to that row and shows a
    context banner. When you undo a `DELETE` on a foreign-key **parent** whose
@@ -107,14 +112,15 @@ and searching events:
    Recover **auto-detects** it and folds the invisible children into the same
    script — no separate tab, no extra step. **Nothing is ever executed.** See
    [Recover and cascade](#cascade-recovery).
-6. **Status** — index health: partitions, coverage, stream lag, archives, and a
+5. **Status** — index health: partitions, coverage, stream lag, archives, and a
    first-class **stream-continuity** signal — a green "✓ No gaps in captured
    stream" badge when the captured range is contiguous, or a red "⚠ Events
    permanently lost" record when an unfillable gap (or a lost PostgreSQL slot)
    was detected. Both fire for any source family. See
    [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
-7. **Settings** (under `watch` only) — **Storage** (rotation policy,
-   per-source S3 archiving, baseline snapshots, AWS credential signals — see
+6. **Settings** (under `watch` only) — **Storage** (rotation policy,
+   per-source S3 archiving, baseline snapshots, AWS credential signals, and a
+   usage-telemetry opt-out — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
    rotation dialog).
 
@@ -176,7 +182,10 @@ Security notes specific to the registry:
   registry index that predates the `connection_id` column returns an
   actionable `422` (run a writer command against it once) instead of being
   silently ALTERed.
-- The registry file is the only thing the console ever writes. Its write
+- The registry file, the [auth file](#password-login) (written by
+  set-password), and the [managed MCP token file](#mcp-endpoint)
+  (`~/.config/bintrail/console-mcp-token.yaml`, SHA-256 only) are the only
+  things the console ever writes. Their write
   endpoints sit behind the same bearer token and Host-header guard as
   everything else.
 
@@ -311,6 +320,12 @@ across the rotation dialog and the per-server edit form):
   start from. The empty states explain how to produce a first baseline
   (`bintrail dump` → `bintrail baseline`). When the **Create baseline** button
   is enabled (see below) it sits in this panel's header.
+- **Usage telemetry** — the current state of dbtrail's metadata-only usage
+  telemetry and a one-click opt-out. Turning it off stops this `watch` daemon's
+  beacons immediately (no restart) and records the machine-wide choice, exactly
+  like `bintrail telemetry off`. When an environment variable (`DO_NOT_TRACK`,
+  `BINTRAIL_TELEMETRY`) or the `--telemetry` flag already controls it, the card
+  says so and defers to that. See [TELEMETRY.md](../TELEMETRY.md).
 
 #### Creating a baseline from the console
 
@@ -435,6 +450,10 @@ results a `verify` cron/CI run produced elsewhere:
   Off by default for a bare `watch` invocation; the bundled compose stack sets
   this on by default (see [docker.md](docker.md) — `VERIFY_TRIGGER=0` in
   `.env` opts out there).
+- `BINTRAIL_CONSOLE_FLASHBACK_LISTEN` (`watch` only) — same as `--flashback-listen`
+  (e.g. `127.0.0.1:3308`): serve an embedded MySQL-protocol time-travel port for
+  every monitored server, routed by the connection username. Off by default;
+  requires a console token. See [Time-travel over the MySQL protocol](#time-travel-over-the-mysql-protocol-flashback-port).
 
 There is deliberately **no** environment variable for the password itself —
 env vars leak through `docker inspect`, `ps e`, and `/proc`; the password is
@@ -502,6 +521,45 @@ A running server accepts it on the next login — no restart needed.
   use `--tls-cert`/`--tls-key` or terminate TLS at a reverse proxy (with
   `--allowed-hosts`).
 
+### External login providers
+
+Embedding distributions — builds that construct their console binary from the
+importable `consoleapp` package (`cmd/bintrail-console` is a thin `main()`
+over `consoleapp.Main`) — may install an external login flow (e.g. OIDC
+single sign-on) through the `ext.ConsoleAuth` seam: call `ext.SetConsoleAuth`
+once from `main()` before `consoleapp.Main`, like `ext.SetAuditSink`. When a
+provider is installed, the sign-in screen adds a **"Continue with \<name\>"**
+button, and a successful external login mints the same in-memory session a
+password login does (same lifetime, logout, and revocation). An installed
+provider also counts as a valid sole credential for a non-loopback bind —
+first-run browser setup stays loopback-gated regardless. The standalone
+`bintrail-console` binary has no provider installed: the button never
+appears, and the provider routes (`/api/auth/ext/*`) simply require a normal
+credential like any other `/api` path.
+
+### Extension views
+
+Embedding distributions — builds that construct their console binary from the
+importable `consoleapp` package — may add one additional view to the console
+through the `ext.ConsoleView` seam: call `ext.SetConsoleView` once from
+`main()` before `consoleapp.Main`, like `ext.SetConsoleAuth`. An installed view
+contributes a nav item, a frontend module, and its own authenticated data API;
+the console reveals the nav item, routes to it, and loads the module in the same
+page (same origin, not an iframe).
+
+The view's static assets are served **unauthenticated** at `/ext/<id>/` (the
+code always ships, like the console's own `app.js`), while its data routes at
+`/api/ext/<id>/` require the same bearer credential as every other `/api` path
+and are **refused while an access-control profile is active** (the console can't
+guarantee a third-party handler honors table-deny / column-redaction rules, so
+it withholds the whole surface under a profile). Each data route reads the index
+of the server currently selected in the switcher, with the operator's profile
+applied.
+
+The standalone `bintrail-console` binary ships **no extension views**: no nav
+item appears, `/api/capabilities` advertises none, and `/ext/*` and
+`/api/ext/*` are absent from the router entirely.
+
 ## Security model
 
 The binary has no Supabase/RBAC backend to lean on, so the console defends
@@ -548,21 +606,6 @@ itself:
   `POST /api/auth/setup`. Everything else needs a Bearer
   credential.
 
-## Forensics and the events API
-
-The console ships the full **forensics** surface (see
-[Forensics](forensics.md)): the Forensics view and its `/api/forensics/*`
-endpoints serve who-changed attribution, the activity queries, capabilities,
-and the setup guide. Two boundaries remain:
-
-- The **events** API and its exports include `connection_id` (the thread
-  number Forensics resolves to a name) but never `query_text`/`query_hash` —
-  the originating SQL statement is served only through the forensics
-  endpoints.
-- The forensics endpoints **refuse while an RBAC access profile is active**:
-  forensic output contains unredacted SQL and session identity that the
-  redaction pipeline cannot cover.
-
 ## PostgreSQL sources
 
 The console reads only the **index**, never the source database, so it works
@@ -580,10 +623,10 @@ per server as `source` in [`/api/capabilities`](#api), derived from
   (`stream_state.gap_lost_at`) — for PostgreSQL, an invalidated/lost replication
   slot; for MySQL, an unfillable binlog gap. The index is valid only up to that
   point and capture must be re-baselined to resume.
-- **Forensics note.** PostgreSQL logical replication (`pgoutput`) carries no
-  backend connection id, so actor attribution (who-changed) is unavailable
-  *upstream* — no console or capture setting can add it. The Events page says
-  so for PostgreSQL sources rather than leaving it an unexplained gap.
+- **Connection-id note.** PostgreSQL logical replication (`pgoutput`) carries
+  no backend connection id, so `connection_id` is empty for PostgreSQL sources
+  — no console or capture setting can add it. The Events page says so for
+  PostgreSQL sources rather than leaving it an unexplained gap.
 - **Replication-health panel.** The Status page shows the replication slot's
   WAL-retention state (`wal_status`, retained WAL, the safe margin before
   invalidation) and whether every published table is at `REPLICA IDENTITY FULL`.
@@ -597,6 +640,73 @@ per server as `source` in [`/api/capabilities`](#api), derived from
   standby, where the slot-retention metrics are unavailable), the panel shows
   **probe failing** with the reason rather than disappearing. For an on-demand,
   always-live check, use `bintrail-pg doctor`.
+
+## MCP endpoint
+
+The console serves the same four read-only MCP tools as
+[`bintrail-mcp`](mcp-server.md) — `query`, `recover`, `status`,
+`list_schema_changes` — over **Streamable HTTP**, on both `bintrail-console
+serve` and `bintrail-console watch`:
+
+| URL | Target |
+|---|---|
+| `/mcp` | The console's **default server** (same selection rules as the browser UI). |
+| `/mcp/{id-or-name}` | A named server from the registry (`default` = the command-line entry). Unknown → `404`. |
+
+MCP clients cannot reliably send custom headers, so the server choice lives in
+the URL path (mirroring how the [time-travel port](time-travel-sql.md) routes
+by username) instead of the `X-Bintrail-Server` header.
+
+Point any Streamable-HTTP-capable MCP client at it with the console token as a
+Bearer credential:
+
+```json
+{
+  "mcpServers": {
+    "bintrail-console": {
+      "type": "http",
+      "url": "http://127.0.0.1:8090/mcp",
+      "headers": { "Authorization": "Bearer <console token>" }
+    }
+  }
+}
+```
+
+Rules that differ from the standalone `bintrail-mcp` server:
+
+- **A token is required.** Password login is a browser credential and cannot
+  authenticate a headless MCP client, so `/mcp` needs either the static
+  `--token` / `BINTRAIL_CONSOLE_TOKEN` **or a managed MCP token generated
+  from Settings → Connect AI** (#1052) — one click from an authenticated
+  browser session, no flags, no restart. The managed token is persisted as a
+  SHA-256 hash only (`~/.config/bintrail/console-mcp-token.yaml`, `0600`,
+  atomic write, versioned envelope with the registry's read-only-if-newer
+  contract), its plaintext is shown exactly once at generation, and it is
+  **scoped to `/mcp` alone** — it cannot drive the browser API (registry
+  CRUD, monitor verbs, or its own rotation). Rotate/revoke from the same
+  card apply immediately, including to sibling console processes sharing the
+  file. Without any configured token the endpoint refuses every request with
+  an actionable error.
+- **`index_dsn` and `profile` tool parameters are rejected.** Connections are
+  managed in the console (registry + path routing), and the RBAC posture is
+  fixed by the console process — an authenticated MCP client cannot point the
+  console at an arbitrary DSN or change redaction rules.
+- **The console's read boundary applies.** Result caps match the API (events
+  100 default / 1000 max, recover 1000 / 10000), each server's archive and
+  baseline posture is honored, and `query_text` / `query_hash` are withheld
+  from query results exactly as on the events API.
+
+The host-header allowlist (`--allowed-hosts`) covers `/mcp` like every other
+route.
+
+The UI's **Settings → Connect AI** page assembles all of this for you: the
+ready-to-copy `/mcp` URL for the selected server (the per-server form when
+more than one server is registered), the `.mcpb` bundle download for the
+running version, and the raw-config fallback above. Its **Access token** card
+generates, rotates, and revokes the managed MCP token; the plaintext is
+displayed exactly once, at generation, and never stored. For the
+start-to-finish walkthrough (bundle install included), see
+[Connect an AI assistant](connect-ai.md).
 
 ## API
 
@@ -612,15 +722,11 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `POST /api/auth/logout` | Revoke the presented session (static token → 204 no-op). |
 | `POST /api/auth/password` | Set (first time; requires static-token auth) or rotate (`current_password` verified) the console password. Revokes all sessions and returns a fresh one. |
 | `GET /api/status` | Index status (same payload as `bintrail status --format json`). |
-| `GET /api/schemas` | Distinct schemas. `?schema=<name>` → that schema's tables. |
+| `GET /api/schemas` | Schemas known to the index: those observed in `binlog_events` **plus** those in the latest schema snapshot, so a schema whose partitions have all been rotated out to Parquet/S3 is still listed (the archives still answer `/api/events` and `/api/recover`). The snapshot half is skipped under `--no-archive` or an active `--profile`, where archived data is unreachable anyway. Note this answers *which schemas this index knows of*, not *which have data in a given window* — for that, see `bintrail status`'s continuity verdict. `?schema=<name>` → that schema's tables. |
 | `GET /api/events` | Event browser. Query params: `schema, table, pk, event_type, gtid, since, until, changed_column, order, limit`. |
 | `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`; an `order` field is accepted but ignored — recover always processes oldest-first). Returns `{sql, statement_count, row_count, warnings}`. When the target is a foreign-key **parent** whose `DELETE` cascaded below the binlog (MySQL/MariaDB index only), cascade victims are **auto-detected** and folded into the same script; the response then also carries `{cascade_detected, victim_count, set_null_count}` (see [Recover and cascade](#cascade-recovery)). |
 | `POST /api/recover-cascade` | Cascade-recovery SQL generation (reverse FK `ON DELETE CASCADE` / `SET NULL` side effects). JSON body: `schema, table` (the **parent**), `pk, pks, since, until, lookback, max_depth, allow_incomplete`. Returns `{sql, statement_count, victim_count, set_null_count, complete, incomplete}` — text only, never executed. Returns `403` under an active RBAC redaction profile (see [Cascade recovery](#cascade-recovery)). |
-| `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true, "recover_cascade": true, "recover_cascade_baseline": false, "source": "mysql", "auth": {"password_set": true, "auth_kind": "session"}}`. The frontend uses it to show/hide gated tabs on every switch (`reconstruct` → Time-travel, `forensics` → Forensics) and to gate the logout affordance (`auth_kind` says how this request authenticated). `recover_cascade` reports whether cascade synthesis is available (false under an RBAC redaction profile) — it gates the standalone `POST /api/recover-cascade` endpoint; the **Recover** tab's auto-detection follows the same server-side rule. `source` (`"mysql"` or `"postgresql"`, read from the index's `stream_state.flavor`) drives **source-aware presentation** only — never a gate; see [PostgreSQL sources](#postgresql-sources). |
-| `GET /api/forensics/capabilities` | Forensic data sources available on the **selected server's** source (performance_schema state, audit plugin variant/config, server info) plus a tailored `setup_guide`. Needs a source connection; `403` under an active RBAC profile. |
-| `GET /api/forensics/users` | Known MySQL users on the source (for the who-changed/activity form dropdowns). Same gating. |
-| `POST /api/forensics/who-changed` | Attribute indexed changes to sessions. JSON body: `schema, table` (required), `pk, since, until, limit, order`. Returns events with per-event `attribution` (`user, host, client_program, source, confidence`) and the honest `notes`. Same gating. |
-| `POST /api/forensics/activity` | The investigation queries: `query_type` = `user_activity` \| `connection_history` plus their filters. Same gating. |
+| `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true, "recover_cascade": true, "recover_cascade_baseline": false, "source": "mysql", "auth": {"password_set": true, "auth_kind": "session"}}`. The frontend uses it to show/hide gated tabs on every switch (`reconstruct` → Time-travel) and to gate the logout affordance (`auth_kind` says how this request authenticated). `recover_cascade` reports whether cascade synthesis is available (false under an RBAC redaction profile) — it gates the standalone `POST /api/recover-cascade` endpoint; the **Recover** tab's auto-detection follows the same server-side rule. `source` (`"mysql"` or `"postgresql"`, read from the index's `stream_state.flavor`) drives **source-aware presentation** only — never a gate; see [PostgreSQL sources](#postgresql-sources). |
 | `GET /api/reconstruct` | Single-row point-in-time reconstruct (baseline-gated **per server**; 404 when not configured). Query params: `schema, table, pk, at, history, allow_gaps`. Returns `{found, deleted, state, history, baseline_time, event_count, warnings}`. |
 | `GET /api/servers` | List servers (masked: parsed host/port/user/dbname + `has_password`, never a DSN or password) plus `default_id`. |
 | `POST /api/servers` | Add a server to the registry (validates, does not connect; never runs DDL). |
@@ -720,6 +826,20 @@ truncated prefix.
 > aborts the strict-mode (`allow_gaps=false`) fetch — the request returns 500
 > naming the failed source — instead of folding an incomplete delta set into a
 > 200. Pass `allow_gaps=true` to fall back to warn-and-continue.
+
+### Time-travel over the MySQL protocol (flashback port)
+
+The reconstruct tab above is HTTP/browser-oriented. For a `mysql` client or an
+application that speaks `AS OF` SQL, `bintrail-console watch --flashback-listen
+<addr>` opens an embedded MySQL-protocol port that serves the `_flashback` /
+`_snapshot` / `_diff` virtual schemas for **every monitored server** — routed by
+the connection username (the server's registry id or display name), authenticated
+with the console token. It replaces running a separate `bintrail shim` per
+per-source index: the daemon already resolves each server's `bintrail_idx_<id>`
+and baseline, so one port covers them all. A token is required (`--console-token`
+/ `BINTRAIL_CONSOLE_TOKEN`) because MySQL-protocol auth cannot use the console's
+password store. Full setup, routing, and the `_snapshot` baseline-parity edge:
+[docs/time-travel-sql.md → the embedded port](time-travel-sql.md#the-embedded-port-multi-source).
 
 ### Coverage gaps and incomplete data
 

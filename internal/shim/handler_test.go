@@ -433,7 +433,7 @@ func TestWrapFetchErrorClassifiesGapAsTyped(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := wrapFetchError(TypeFlashback, tc.in)
+			out := wrapFetchError(context.Background(), TypeFlashback, tc.in, slog.Default())
 			var myErr *gomysql.MyError
 			gotTyped := errors.As(out, &myErr)
 			if gotTyped != tc.isTyped {
@@ -592,95 +592,14 @@ func TestOrderColumnsEdgeCases(t *testing.T) {
 // non-DELETE events, or that reintroduces the row_before fallback for
 // DELETE (issue #287 regression), would silently return wrong row
 // state to the customer. The "delete_*" cases are the tripwires.
-func TestSelectImage(t *testing.T) {
-	after := map[string]any{"id": int64(1), "name": "after"}
-	before := map[string]any{"id": int64(1), "name": "before"}
-
-	cases := []struct {
-		name string
-		rows []query.ResultRow
-		want map[string]any
-	}{
-		{
-			name: "empty_input",
-			rows: nil,
-			want: nil,
-		},
-		{
-			name: "insert_returns_row_after",
-			rows: []query.ResultRow{{
-				EventType: parser.EventInsert,
-				RowAfter:  after,
-			}},
-			want: after,
-		},
-		{
-			name: "update_prefers_row_after",
-			rows: []query.ResultRow{{
-				EventType: parser.EventUpdate,
-				RowBefore: before,
-				RowAfter:  after,
-			}},
-			want: after,
-		},
-		{
-			// #287: a DELETE means the row did not exist at AsOf.
-			// Returning RowBefore here would resurrect the row for
-			// any AS OF after the deletion — the bug the issue
-			// describes. The Oracle AS OF semantic the docs already
-			// advertise (docs/time-travel-sql.md:242) demands nil.
-			name: "delete_returns_nil",
-			rows: []query.ResultRow{{
-				EventType: parser.EventDelete,
-				RowBefore: before,
-			}},
-			want: nil,
-		},
-		{
-			// Pin the len() > 0 vs != nil distinction on the
-			// non-DELETE fallback path. A future refactor that
-			// swapped len() for a nil-check would silently regress
-			// UPDATE handling if the indexer ever emitted an empty
-			// non-nil RowAfter (defensive map allocation upstream,
-			// redaction blanking every column, etc.). The DELETE
-			// cases don't cover this anymore — they short-circuit
-			// before reaching the image-presence checks.
-			name: "update_row_after_empty_map_falls_back_to_row_before",
-			rows: []query.ResultRow{{
-				EventType: parser.EventUpdate,
-				RowAfter:  map[string]any{},
-				RowBefore: before,
-			}},
-			want: before,
-		},
-		{
-			name: "both_empty_returns_nil",
-			rows: []query.ResultRow{{
-				EventType: parser.EventUpdate,
-				RowBefore: map[string]any{},
-				RowAfter:  map[string]any{},
-			}},
-			want: nil,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := selectImage(tc.rows)
-			if !equalMaps(got, tc.want) {
-				t.Errorf("selectImage = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestExtractFullTableImages pins the two skip rules of the
 // full-table reconstruction path (#276): DELETE events are dropped
 // (the row did not exist at AS OF) and INSERTs with a nil row_after
 // are dropped (corrupted index — emitting an all-null phantom row
-// would overstate the table's row count). selectImage shares the
-// DELETE-skip rule since #287; that convergence is asserted by
-// TestSelectImage's delete_returns_nil case.
+// would overstate the table's row count). The single-row _flashback
+// path shares the DELETE-skip rule through reconstruct.ApplyAt (a
+// DELETE folds to a nil state, #988), replacing the old selectImage
+// helper.
 func TestExtractFullTableImages(t *testing.T) {
 	deleteRow := query.ResultRow{
 		EventType: parser.EventDelete,
@@ -1685,6 +1604,111 @@ func TestRunFullTableEnforcesCostCap(t *testing.T) {
 	}
 }
 
+// TestRunFullTable_Limit exercises the #997 LIMIT interaction on the binlog-only
+// full-table _flashback path (runFullTable), which is distinct code from the
+// _snapshot buffered LIMIT: a LIMIT at or below the cap bounds the fetch so the
+// query SUCCEEDS instead of tripping the cap, and a LIMIT above the cap keeps the
+// cap+1 overflow probe (a LIMIT never raises the cap). sqlmock returns exactly
+// what the real fetch would for the given Limit, since it doesn't honour the SQL
+// LIMIT clause itself.
+func TestRunFullTable_Limit(t *testing.T) {
+	run := func(t *testing.T, cap, limit, nRows int) (*gomysql.Result, error) {
+		t.Helper()
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		mock.MatchExpectationsInOrder(false)
+		mock.ExpectQuery("information_schema.PARTITIONS").
+			WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME", "PARTITION_DESCRIPTION"}))
+		rows := sqlmock.NewRows(binlogEventsColumns())
+		now := time.Now().UTC()
+		for i := 0; i < nRows; i++ {
+			rows.AddRow(
+				int64(i+1), "binlog.000001", int64(100), int64(200), now,
+				nil, nil, "myapp", "orders", parser.EventInsert,
+				fmt.Sprintf("%d", i+1), nil, nil,
+				fmt.Sprintf(`{"id":%d,"sku":"X"}`, i+1), 0, nil, nil,
+			)
+		}
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
+		h := &Handler{
+			indexDB: db,
+			cfg: Config{AllowGaps: true, IndexDBName: "bintrail_index",
+				NoArchive: true, FullTableRowCap: cap},
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			archiveFetcher: func(ctx context.Context, _ query.Options, _ string) ([]query.ResultRow, error) {
+				return nil, nil
+			},
+		}
+		h.UseDB("myapp")
+		return h.runFullTable(TimeTravelQuery{
+			Type: TypeFlashback, Schema: "myapp", Table: "orders", AsOf: now, Limit: limit,
+		})
+	}
+
+	t.Run("under_cap_succeeds", func(t *testing.T) {
+		res, err := run(t, 3, 2, 2) // LIMIT 2 <= cap 3 → fetch bounds to 2, no cap error
+		if err != nil {
+			t.Fatalf("LIMIT under cap should succeed, got %v", err)
+		}
+		if n := len(res.Resultset.RowDatas); n != 2 {
+			t.Errorf("rows = %d, want 2", n)
+		}
+	})
+	t.Run("at_cap_succeeds", func(t *testing.T) {
+		res, err := run(t, 3, 3, 3) // LIMIT == cap boundary → capped=false path
+		if err != nil {
+			t.Fatalf("LIMIT == cap should succeed, got %v", err)
+		}
+		if n := len(res.Resultset.RowDatas); n != 3 {
+			t.Errorf("rows = %d, want 3", n)
+		}
+	})
+	t.Run("above_cap_trips_cap", func(t *testing.T) {
+		_, err := run(t, 3, 5, 4) // LIMIT 5 > cap 3 → probe cap+1=4 → overflow
+		var myErr *gomysql.MyError
+		if !errors.As(err, &myErr) || myErr.Code != gomysql.ER_TOO_BIG_SELECT {
+			t.Fatalf("LIMIT above cap must trip ER_TOO_BIG_SELECT (a LIMIT never raises the cap); got %v", err)
+		}
+	})
+}
+
+// TestWarnCorruptImageDrop pins warnCorruptImageDrop's guard both directions: a
+// non-DELETE tail folding to an empty state (corrupt/partial image) Warns so the
+// silent drop is operator-visible, while the legitimate empty cases (DELETE tail,
+// no events at all) stay silent — a false Warn on every "row deleted before AsOf"
+// query would be noise. A refactor that flips the guard passes CI silently
+// without this.
+func TestWarnCorruptImageDrop(t *testing.T) {
+	newH := func() (*Handler, *recordingHandler) {
+		rec := newRecordingHandler()
+		return &Handler{logger: slog.New(rec)}, rec
+	}
+	t.Run("non_delete_tail_warns", func(t *testing.T) {
+		h, rec := newH()
+		h.warnCorruptImageDrop("s", "t", []query.ResultRow{{EventType: parser.EventInsert, EventID: 3}})
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 1 {
+			t.Errorf("Warn count = %d, want 1 (non-DELETE tail folded to empty)", got)
+		}
+	})
+	t.Run("delete_tail_silent", func(t *testing.T) {
+		h, rec := newH()
+		h.warnCorruptImageDrop("s", "t", []query.ResultRow{{EventType: parser.EventDelete, EventID: 3}})
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 0 {
+			t.Errorf("Warn count = %d, want 0 (legit DELETE tail = row absent at AsOf)", got)
+		}
+	})
+	t.Run("no_events_silent", func(t *testing.T) {
+		h, rec := newH()
+		h.warnCorruptImageDrop("s", "t", nil)
+		if got := len(rec.atLevel(slog.LevelWarn)); got != 0 {
+			t.Errorf("Warn count = %d, want 0 (never existed = no events)", got)
+		}
+	})
+}
+
 // TestNewHandlerDefaultIsStrict pins the library-side counterpart of the
 // CLI default-pin in cmd/bintrail/shim_test.go: NewHandler must return a
 // Handler configured with AllowGaps=false. The CLI builds Config directly
@@ -1972,25 +1996,6 @@ func driveClient(addr, user, password string) error {
 	return nil
 }
 
-// equalMaps compares two map[string]any by length and value identity
-// (==). Sufficient for the selectImage tests because they intentionally
-// pass the same map literal as both input and expected output, so a
-// pointer-equal value comparison detects "did selectImage return the
-// expected source map?". Returning a *different* map with equal contents
-// would fail this check — which is the correct outcome, since the
-// helper's contract is to hand back the input image unchanged, not a
-// copy.
-func equalMaps(a, b map[string]any) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, va := range a {
-		if vb, ok := b[k]; !ok || va != vb {
-			return false
-		}
-	}
-	return true
-}
 
 // recordingHandler is a minimal slog.Handler that captures every
 // emitted record into an in-memory slice. Used by tests that need

@@ -5,15 +5,39 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
+
+// snapshotSincePos reads the baseline's exact recorded binlog position so a
+// _snapshot delta fetch can anchor its lower bound there instead of the
+// imprecise snapshotTime DATETIME (#797): a transaction whose statement
+// executed just before snapshotTime but committed (and got logged) just after
+// it would otherwise fall through both the dump's MVCC snapshot AND a
+// Since-only fetch, silently missing from the result. Best-effort: a read
+// failure or an older baseline that never recorded a position (BinlogFile==""
+// or BinlogPos==0) just means nil — callers fall back to the pre-#797
+// Since-only fetch.
+func snapshotSincePos(ctx context.Context, baselinePath string, logger *slog.Logger, schema, table string) *query.BinlogPos {
+	bmeta, err := baseline.ReadParquetMetadataAny(ctx, baselinePath)
+	if err != nil {
+		logger.Warn("shim: could not read baseline metadata for position-anchored delta fetch; falling back to timestamp-only Since",
+			"schema", schema, "table", table, "path", baselinePath, "error", err)
+		return nil
+	}
+	if bmeta.BinlogFile == "" || bmeta.BinlogPos <= 0 {
+		return nil
+	}
+	return &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
+}
 
 // runSnapshot resolves a _snapshot query. _snapshot is the
 // baseline-aware sibling of _flashback (#355): on top of the
@@ -49,6 +73,13 @@ func (h *Handler) baselineSource() string {
 // resultset would exceed the row cap. It never escapes runSnapshotFullTable —
 // it is converted to ER_TOO_BIG_SELECT, mirroring runFullTable's cap path.
 var errFullTableCapExceeded = errors.New("full-table snapshot row cap exceeded")
+
+// errLimitReached short-circuits the buffered full-table merge once a user's
+// LIMIT (#997) has been satisfied. Like errFullTableCapExceeded it never
+// escapes runSnapshotFullTable — but it is a SUCCESS signal (the images slice
+// is already truncated to the LIMIT), distinct from the cap error, so it must
+// be checked before the cap-error translation.
+var errLimitReached = errors.New("full-table snapshot LIMIT reached")
 
 // runSnapshotFullTable resolves a full-table (no-WHERE) _snapshot query by
 // merging the baseline snapshot at-or-before AsOf with the post-snapshot
@@ -118,8 +149,19 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
+
+	// Bound concurrent full-table reconstructions (#823). Taken here —
+	// AFTER the src=="" fallback above, which delegates to runFullTable
+	// (that path acquires the gate itself; acquiring before the branch
+	// would deadlock a cap-1 gate) and after the cheap fail-fast PK
+	// refusals — so the slot is held only for the heavy part:
+	// FindBaseline, the delta fetch, and the DuckDB baseline merge.
+	if err := h.cfg.FullTableGate.Acquire(ctx); err != nil {
+		return nil, h.fullTableGateError(q.Type, err)
+	}
+	defer h.cfg.FullTableGate.Release()
 
 	// Shim handling of the stale-fallback warning (#466) is intentionally
 	// minimal: FindBaseline already logs it server-side and an in-band MySQL
@@ -165,6 +207,7 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 			Schema:     q.Schema,
 			Table:      q.Table,
 			Since:      &snapshotTime,
+			SincePos:   snapshotSincePos(ctx, baselinePath, h.logger, q.Schema, q.Table),
 			Until:      &q.AsOf,
 			LimitPerPK: 1,
 		},
@@ -174,7 +217,7 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
 	// BEFORE the merge: the merged rowMap reaching the callback below has
@@ -186,6 +229,41 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	changes := make(map[string]*query.ResultRow, len(rows))
 	for i := range rows {
 		changes[rows[i].PKValues] = &rows[i]
+	}
+
+	input := reconstruct.SnapshotFullTableInput{
+		BaselinePath: baselinePath,
+		Schema:       q.Schema,
+		Table:        q.Table,
+		PKCols:       pkCols,
+		Changes:      changes,
+		// rows was fetched LimitPerPK=1, so it is already collapsed to the latest
+		// event per PK; hand it to the #782 guard anyway (authoritative over what
+		// was fetched), bounded by that fetch (see pkChangingUpdateInEvents).
+		Events: rows,
+	}
+
+	// #998: with a bound connection and no LIMIT, stream the merged rows straight
+	// to the wire. The baseline (potentially millions of rows) flows through the
+	// DuckDB merge cursor one row at a time, so peak shim memory is O(post-baseline
+	// changes) — the `changes` map above — not O(table size), and the
+	// FullTableRowCap ceiling is lifted. A LIMIT keeps the bounded buffered path
+	// below (cheap browse); an unbound handler (unit tests, embedders that never
+	// call BindConn) also stays buffered.
+	//
+	// The streamed column set is fixed before the first row (the header must
+	// precede any row): the user's explicit projection verbatim when given (#313,
+	// matching the buffered imagesToResultVerbatim — a projected full-table query
+	// streams too, since a projection doesn't change the row count), else the
+	// table's newest-snapshot order. When neither is resolvable (empty projection
+	// is impossible; nil snapshot), fall through to the buffered path, which
+	// derives columns from the images it has.
+	streamCols := q.Columns
+	if streamCols == nil {
+		streamCols = h.columnOrderFor(q.Schema, q.Table)
+	}
+	if h.conn != nil && q.Limit == 0 && len(streamCols) > 0 {
+		return h.streamSnapshotFullTable(ctx, q, input, streamCols)
 	}
 
 	rowCap := h.cfg.FullTableRowCap
@@ -209,39 +287,117 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	// widens — "0.10000000149011612" vs the event side's "0.1"), and a baseline
 	// BIGINT UNSIGNED > 2^63 can't round-trip (baseline stores bigint as signed
 	// Int64). Stop at cap+1 so overflow is detectable.
+	// Residual unchanged-TOAST markers (#592) are caught upstream by
+	// SnapshotFullTableImages' checkChangesToast on the delta events (baseline
+	// rows can't carry a marker), NOT by buildImagesResult below: fullTableTextCell
+	// coerces every cell to text first, so a marker would already be a []byte by
+	// the time buildImagesResult's IsUnchangedToastMarker check runs and never
+	// match. Keep the upstream guard — the streaming sibling (projectCell) checks
+	// the raw value instead, which is the pattern to prefer.
 	images := make([]map[string]any, 0)
-	err = reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
-		BaselinePath: baselinePath,
-		Schema:       q.Schema,
-		Table:        q.Table,
-		PKCols:       pkCols,
-		Changes:      changes,
-		// rows was fetched LimitPerPK=1, so it is already collapsed to the latest
-		// event per PK; hand it to the #782 guard anyway (authoritative over what
-		// was fetched), bounded by that fetch (see pkChangingUpdateInEvents).
-		Events: rows,
-	}, func(rowMap map[string]any) error {
+	err = reconstruct.SnapshotFullTableImages(ctx, input, func(rowMap map[string]any) error {
 		img := make(map[string]any, len(rowMap))
 		for k, v := range rowMap {
 			img[k] = h.fullTableTextCell(q.Schema, q.Table, k, v)
 		}
 		images = append(images, img)
+		// Cap FIRST — a LIMIT never RAISES the cap (#997): overflow past rowCap
+		// aborts, and only then does a LIMIT at or below rowCap stop the merge
+		// early via the success sentinel, so the browse succeeds instead of
+		// tripping the cap.
 		if len(images) > rowCap {
 			return errFullTableCapExceeded
 		}
+		if q.Limit > 0 && len(images) >= q.Limit {
+			return errLimitReached
+		}
 		return nil
 	})
-	if err != nil {
+	// Keep the errLimitReached SUCCESS sentinel filtered out FIRST: images is
+	// already truncated to the LIMIT. A future refactor into sequential
+	// `if errors.Is(...)` branches must preserve this ordering, or a legit LIMIT
+	// success would be mistranslated into a wire error.
+	if err != nil && !errors.Is(err, errLimitReached) {
 		if errors.Is(err, errFullTableCapExceeded) {
 			return nil, mysql.NewError(mysql.ER_TOO_BIG_SELECT, fmt.Sprintf(
-				"resolve %s: %s.%s at %s would return more than %d rows; narrow the AS OF range or filter by PK",
-				q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), rowCap,
+				"resolve %s: %s.%s at %s would return more than %d rows; add a LIMIT (e.g. LIMIT %d) to browse, narrow the AS OF range or filter by PK",
+				q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), rowCap, rowCap,
 			))
 		}
 		return nil, err
 	}
 
 	return h.fullTableResult(q, images)
+}
+
+// streamSnapshotFullTable streams a full-table _snapshot resultset row-by-row
+// over the bound connection (#998), lifting the FullTableRowCap for the
+// baseline-merge path. It projects every merged row onto cols — a FIXED column
+// set decided before the first row (the streaming header must be written before
+// any row is seen): the user's explicit projection when given (verbatim, like
+// imagesToResultVerbatim), else the table's newest-snapshot order. Keys missing
+// from a row render as NULL.
+//
+// SELECT * caveat: for the newest-snapshot column set, a column dropped between
+// AS OF and now (present in a row image but absent from the current snapshot —
+// the #600 case) is NOT surfaced on the streaming path, because the fixed set
+// can't append per-row image-only keys the way the buffered fullTableColumns
+// does; a LIMIT'd (buffered) SELECT * still surfaces it. An explicit projection
+// is unaffected — imagesToResultVerbatim never appends image-only keys either.
+//
+// Errors: reconstruct.SnapshotFullTableImages runs its TOAST / PK-changing-
+// UPDATE guards before materialising the baseline and emits nothing until the
+// merge starts, so a setup failure returns before any wire write (a clean
+// first-packet ERR). A failure once rows are already on the wire returns an
+// error that go-mysql renders as an ERR packet mid-resultset — the client sees
+// no terminating EOF and reads it as an unambiguous failure (see streamWriter).
+func (h *Handler) streamSnapshotFullTable(ctx context.Context, q TimeTravelQuery, input reconstruct.SnapshotFullTableInput, cols []string) (*mysql.Result, error) {
+	sw := newStreamWriter(h.conn, cols)
+	cells := make([]any, len(cols)) // reused per row; writeRow encodes synchronously
+
+	// SELECT * degrades LOUDLY, not silently, for the #600 dropped-column case.
+	// The streamed header is fixed before the first row, so — unlike the buffered
+	// fullTableColumns — it can't append a per-row image-only key (a column
+	// present at AS OF but dropped from the current schema since). Rather than
+	// omit it silently (the shim Warns before degrading everywhere else —
+	// fullTableTextCell, tableMetaFor), Warn ONCE per query naming the column and
+	// pointing at the LIMIT'd buffered path that surfaces it. Only for SELECT *; a
+	// verbatim projection (q.Columns != nil) intentionally excludes unrequested
+	// columns. A full union header would need the baseline Parquet schema up
+	// front, i.e. a second full materialization of an S3 baseline — deferred.
+	var known map[string]struct{}
+	if q.Columns == nil {
+		known = make(map[string]struct{}, len(cols))
+		for _, c := range cols {
+			known[c] = struct{}{}
+		}
+	}
+	warnedDrop := false
+
+	err := reconstruct.SnapshotFullTableImages(ctx, input, func(rowMap map[string]any) error {
+		if known != nil && !warnedDrop {
+			for k := range rowMap {
+				if _, ok := known[k]; !ok {
+					h.logger.Warn("shim: streaming full-table _snapshot SELECT * omits a column present at AS OF but dropped from the current schema (the streamed column set is fixed before the first row) — re-run with a LIMIT to use the buffered path that surfaces it",
+						"schema", q.Schema, "table", q.Table, "omitted_column", k)
+					warnedDrop = true
+					break
+				}
+			}
+		}
+		for i, c := range cols {
+			v, cerr := h.projectCell(q.Schema, q.Table, c, rowMap[c])
+			if cerr != nil {
+				return cerr
+			}
+			cells[i] = v
+		}
+		return sw.writeRow(cells)
+	})
+	if err != nil {
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
+	}
+	return sw.finish()
 }
 
 // pkColumnMetas returns the primary-key column metas of schema.table from its
@@ -339,7 +495,9 @@ func (h *Handler) fullTableTextCell(schema, table, column string, v any) any {
 // canonicalization in the offline merge), so it is kept as a separate
 // matcher: a future change to one path's type support must not silently
 // move the other. Types reconstruct rejects outright (FLOAT, BLOB, BIT,
-// JSON, …) are not listed and therefore fall back to the binlog-only path.
+// JSON, …) are not listed and therefore fall back to the binlog-only path —
+// for MySQL-family sources. A PostgreSQL source bypasses this matcher entirely
+// (its data_type is "" and its baseline is raw text — see runSnapshotPointInTime).
 func baselinePKStringMatchable(dataType string) bool {
 	switch strings.ToLower(strings.TrimSpace(dataType)) {
 	case "int", "integer", "smallint", "tinyint", "mediumint", "bigint",
@@ -363,8 +521,10 @@ func baselinePKStringMatchable(dataType string) bool {
 // It falls back to the binlog-only point-lookup (runPointInTime) — with
 // a log line so the degradation is visible — in four cases:
 //   - no baseline source configured (the pre-#355 default),
-//   - the PK column's type isn't one the baseline matcher supports
-//     (a typed WHERE would silently miss the row),
+//   - the PK column's type isn't one the baseline matcher supports AND the
+//     source isn't PostgreSQL (a PG source carries an empty data_type but its
+//     raw-text baseline makes every PK a string-identity match — see the flavor
+//     bypass below; a typed WHERE would otherwise silently miss the row),
 //   - the schema resolver is unavailable (can't determine the PK type),
 //   - no baseline exists for this table at-or-before AsOf.
 //
@@ -373,123 +533,20 @@ func baselinePKStringMatchable(dataType string) bool {
 // the never-touched-since-before-the-window row, which is exactly what
 // the baseline lookup recovers when it is available.
 func (h *Handler) runSnapshotPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
-	src := h.baselineSource()
-	if src == "" {
-		h.logger.Debug("shim: _snapshot has no baseline source configured; using binlog-only path",
-			"schema", q.Schema, "table", q.Table)
-		return h.runPointInTime(q)
-	}
-
-	// Guard the PK type before attempting a baseline match. ReadBaselineRow
-	// matches `pkColumn = ?` against the *typed* Parquet column binding
-	// q.PKValue as a string and relying on DuckDB's implicit coercion — it
-	// does NOT canonicalize the way the full-table path does. Only types
-	// whose Parquet representation coerces cleanly from a string literal are
-	// safe here (see baselinePKStringMatchable); for the rest the comparison
-	// silently finds nothing and we would wrongly conclude the row never
-	// existed, so we fall back to the binlog-only path with a signal.
-	// validatePKColumn already confirmed q.PKColumn IS the table's
-	// single-column PK (or was permissive because the resolver was
-	// unavailable), so here we only need its type.
-	dataType, ok := h.pkDataType(q.Schema, q.Table, q.PKColumn)
-	if !ok {
-		h.logger.Debug("shim: _snapshot cannot resolve PK type; using binlog-only path",
-			"schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn)
-		return h.runPointInTime(q)
-	}
-	if !baselinePKStringMatchable(dataType) {
-		h.logger.Warn("shim: _snapshot PK type not safe for baseline lookup; using binlog-only path",
-			"schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn, "pk_type", dataType)
-		return h.runPointInTime(q)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
 
-	// Stale-fallback warning (#466) discarded here — see the full-table path.
-	baselinePath, snapshotTime, _, err := reconstruct.FindBaseline(ctx, src, q.Schema, q.Table, q.AsOf)
+	// The baseline lookup, the #1007 PostgreSQL flavor bypass, the fetch, the
+	// ENUM/SET epoch map, and the ApplyAt fold now live in the wire-neutral
+	// ResolveSnapshotRow (#1008, resolve.go), shared with the pgwire front-end.
+	// A nil state means the row did not exist at AsOf; a fetch/coverage failure
+	// is a *ResolveError; a baseline/ApplyAt data-fault is raw. mysqlRenderErr
+	// keeps this byte-identical to the pre-#1008 inline path.
+	state, err := h.ResolveSnapshotRow(ctx, q)
 	if err != nil {
-		if errors.Is(err, reconstruct.ErrNoBaseline) {
-			h.logger.Debug("shim: _snapshot found no baseline at-or-before AsOf; using binlog-only path",
-				"schema", q.Schema, "table", q.Table,
-				"as_of", q.AsOf.UTC().Format(time.RFC3339))
-			return h.runPointInTime(q)
-		}
-		// A real baseline-source failure (unreadable dir, S3 outage) is a
-		// server-side fault: plain error → ER_UNKNOWN_ERROR (1105), the same
-		// user-vs-server split runPointInTime preserves for fetch failures.
-		return nil, err
-	}
-
-	// Refuse if a TRUNCATE/DROP/RENAME hit this table in the window: same
-	// blind spot as the full-table path — no row events to invalidate the
-	// baseline image, so the row would silently resolve as if it still
-	// existed after being truncated away (#764).
-	if err := reconstruct.CheckDestructiveDDL(ctx, h.indexDB, q.Schema, q.Table, snapshotTime, q.AsOf); err != nil {
-		return nil, err
-	}
-
-	baselineRow, err := reconstruct.ReadBaselineRow(ctx, baselinePath, map[string]string{q.PKColumn: q.PKValue})
-	if err != nil {
-		return nil, err
-	}
-
-	// Fetch every event for this PK from the snapshot instant up to AsOf.
-	// Unlike the binlog-only path (LimitPerPK=1), we want the full ordered
-	// sequence so ApplyAt folds them onto the baseline image in commit order
-	// — matching `bintrail reconstruct`'s single-row semantics. Since=
-	// snapshotTime drops pre-baseline events the baseline already supersedes,
-	// making this strictly more correct than the binlog-only path for a row
-	// whose only events predate the snapshot.
-	//
-	// PK filter: q.PKValue may legitimately be the empty string (e.g.
-	// `WHERE name = ''` against a NOT-NULL string PK — the shape
-	// runPointInTime documents). buildQuery DISABLES the PK filter entirely
-	// when Options.PKValues == "", which would fold every event for the whole
-	// table onto the single baseline row — a silent wrong answer. Route the
-	// empty case through PKValuesIn, which emits `pk_values IN (?)` and keeps
-	// the fetch scoped to the one row; keep the pk_hash fast path for the
-	// common non-empty case.
-	opts := query.Options{
-		Schema: q.Schema,
-		Table:  q.Table,
-		Since:  &snapshotTime,
-		Until:  &q.AsOf,
-	}
-	if q.PKValue != "" {
-		opts.PKValues = q.PKValue
-	} else {
-		opts.PKValuesIn = []string{q.PKValue}
-	}
-	engine := query.New(h.indexDB)
-	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
-		Opts:           opts,
-		DBName:         h.cfg.IndexDBName,
-		NoArchive:      h.cfg.NoArchive,
-		AllowGaps:      h.cfg.AllowGaps,
-		ArchiveFetcher: h.archiveFetcher,
-	})
-	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
-	}
-
-	// ENUM/SET ordinals → labels per event's snapshot epoch (#472/#475),
-	// BEFORE the fold: ApplyAt replaces the image wholesale per event, so
-	// pre-mapped events make the final state carry labels. Only deltas
-	// need this — the baseline image already carries labels (mydumper
-	// dumps strings) and string values pass through the mapper untouched.
-	h.mapEventImages(q.Schema, q.Table, rows)
-	state, err := reconstruct.ApplyAt(baselineRow, rows, q.AsOf)
-	if err != nil {
-		// A residual unchanged-TOAST marker (#592) — a capture-invariant
-		// violation, i.e. a server-side data fault: plain error →
-		// ER_UNKNOWN_ERROR (1105), same as a baseline-source failure above.
-		// Refusing beats serving the marker's JSON as the column value.
-		return nil, err
+		return nil, mysqlRenderErr(err)
 	}
 	if state == nil {
-		// Either the row never existed at AsOf (no baseline image and no
-		// INSERT in the window) or its latest event was a DELETE.
 		return emptyResult(), nil
 	}
 

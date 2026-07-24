@@ -281,6 +281,59 @@ func TestVerifyTrigger_unknownServer(t *testing.T) {
 	}
 }
 
+// addVerifyEntryPG adds a PostgreSQL registry entry (source + baseline set) so
+// the flavor-scoped verify branches can be exercised without a live PG.
+func addVerifyEntryPG(t *testing.T, srv *Server) string {
+	t.Helper()
+	e, err := srv.cm.reg.Add(ServerEntry{
+		Name:       "pg",
+		DSN:        "idx:idxpw@tcp(127.0.0.1:3306)/binlog_index",
+		Flavor:     FlavorPostgres,
+		SourceDSN:  "postgres://repl:p@pg.prod:5432/appdb",
+		BaselineS3: "s3://b/baselines/",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e.ID
+}
+
+// TestVerifyTrigger_postgresRefusesLiveSource: live-source verify fingerprints
+// the source with MySQL-only SQL, so a PostgreSQL source is refused with a hard
+// 400 (deferred to #1024) — a clear message, never a misleading inconclusive,
+// and the controller is never triggered. A baseline destination is set so this
+// branch (not the earlier baseline gate) is what fires. No live PG needed.
+func TestVerifyTrigger_postgresRefusesLiveSource(t *testing.T) {
+	srv, ctrl := newVerifyTriggerServer(t)
+	id := addVerifyEntryPG(t, srv)
+	rec, body := doServersReq(t, srv, "POST", "/api/servers/"+id+"/verify", `{"mode":"live-source"}`)
+	if rec.Code != 400 {
+		t.Fatalf("PG live-source: code=%d, want 400 (body=%s)", rec.Code, body)
+	}
+	if !strings.Contains(string(body), "not supported for PostgreSQL") {
+		t.Errorf("want the clear PG-refusal message, got: %s", body)
+	}
+	if len(ctrl.triggered) != 0 {
+		t.Fatal("controller must never be triggered for a PG live-source request")
+	}
+}
+
+// TestVerifyTrigger_postgresAllowsBaselineAnchored: the refusal above is scoped
+// to live-source ONLY. The default mode (baseline-anchored) reads the index, not
+// the live source, so it IS supported for PG and reaches the controller — this
+// is the parity the refusal must not overreach and break.
+func TestVerifyTrigger_postgresAllowsBaselineAnchored(t *testing.T) {
+	srv, ctrl := newVerifyTriggerServer(t)
+	id := addVerifyEntryPG(t, srv)
+	rec, body := doServersReq(t, srv, "POST", "/api/servers/"+id+"/verify", "")
+	if rec.Code != 202 {
+		t.Fatalf("PG baseline-anchored: code=%d, want 202 (body=%s)", rec.Code, body)
+	}
+	if len(ctrl.triggered) != 1 {
+		t.Fatalf("baseline-anchored PG verify must trigger the controller, got %d", len(ctrl.triggered))
+	}
+}
+
 // TestVerifyTrigger_happy: a fully-configured entry triggers a default
 // (baseline-anchored) run (202), the controller receives the index DSN and
 // baseline destination, and the HTTP response never leaks the index password.

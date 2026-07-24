@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/dbtrail/dbtrail/internal/archive"
 )
 
 // ─── cobra command wiring ─────────────────────────────────────────────────────
@@ -210,7 +212,7 @@ func TestParseArchivePath(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotID, gotPart := parseArchivePath(tc.path)
+			gotID, gotPart := archive.ParseArchivePath(tc.path)
 			if gotID != tc.wantID {
 				t.Errorf("bintrailID = %q, want %q", gotID, tc.wantID)
 			}

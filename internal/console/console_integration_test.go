@@ -7,12 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
 	"github.com/dbtrail/dbtrail/internal/testutil"
@@ -67,9 +65,7 @@ func TestIntegrationEventsAPI(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("events code = %d, body = %s", rec.Code, body)
 	}
-	// #701 D1: connection_id is no longer a redacted field on the events API —
-	// the entitlement seam moved to forensics.Enabled, checked at surface entry
-	// points, not per-field here.
+	// connection_id is a regular indexed column on the events API (#701 D1).
 	if !strings.Contains(string(body), "connection_id") {
 		t.Errorf("events response must contain connection_id (#701 D1): %s", body)
 	}
@@ -79,115 +75,6 @@ func TestIntegrationEventsAPI(t *testing.T) {
 	}
 	if resp.Count != 2 {
 		t.Errorf("event count = %d, want 2", resp.Count)
-	}
-}
-
-// TestIntegrationForensicsCapabilitiesAndUsers_realSource drives GET
-// /api/forensics/capabilities and /api/forensics/users against a server whose
-// SourceDSN points at the real test MySQL — the "source configured and
-// reachable" success path forensics_api_test.go's sqlmock-based tests can't
-// reach (config.Connect opens a real DSN, not an injectable seam). Without
-// this, breaking openForensicsSource so it always reports "not configured"
-// would pass every existing test.
-func TestIntegrationForensicsCapabilitiesAndUsers_realSource(t *testing.T) {
-	srv, _ := seedConsoleData(t)
-	_, idxDBName := testutil.CreateTestDB(t)
-
-	rec, body := doReq(t, srv, "POST", "/api/servers", `{
-		"name":"fx-src",
-		"host":"127.0.0.1","port":"13306","user":"root","password":"testroot","dbname":"`+idxDBName+`",
-		"source_host":"127.0.0.1","source_port":"13306","source_user":"root","source_password":"testroot"
-	}`)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create server: status = %d, body = %s", rec.Code, body)
-	}
-	var created struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(body, &created); err != nil {
-		t.Fatal(err)
-	}
-
-	rec, body = doReqOn(t, srv, created.ID, "GET", "/api/forensics/capabilities", "")
-	if rec.Code != 200 {
-		t.Fatalf("capabilities: status = %d, body = %s", rec.Code, body)
-	}
-	var caps forensicsCapabilitiesResponse
-	if err := json.Unmarshal(body, &caps); err != nil {
-		t.Fatal(err)
-	}
-	if !caps.SourceConfigured {
-		t.Errorf("source_configured should be true for a server with a real, reachable source: %s", body)
-	}
-	if caps.ServerInfo.Version == "" {
-		t.Errorf("expected a real server_info.version detected from a live MySQL connection: %s", body)
-	}
-
-	rec, body = doReqOn(t, srv, created.ID, "GET", "/api/forensics/users", "")
-	if rec.Code != 200 {
-		t.Fatalf("users: status = %d, body = %s", rec.Code, body)
-	}
-	var usersResp forensicsUsersResponse
-	if err := json.Unmarshal(body, &usersResp); err != nil {
-		t.Fatal(err)
-	}
-	if len(usersResp.Users) == 0 {
-		t.Errorf("expected at least one real MySQL user account (root) from mysql.user: %s", body)
-	}
-}
-
-// TestIntegrationForensicsWhoChanged_UnreachableSource covers who-changed's
-// "configured but unreachable" behavior specifically — resolveOr and
-// openForensicsSource both key off the SAME selected server, so unlike the
-// other three forensics handlers (whose sqlmock unit tests can freely mix a
-// fake index with a fake source entry — see
-// TestForensicsHandlers_SourceConfiguredButUnreachable in
-// forensics_api_test.go) this needs a REAL, working index paired with a
-// genuinely unreachable source on the one registry entry. Without this, a
-// regression that silently swallowed the unreachable-source note (or dropped
-// back to erroring instead of degrading) would pass every sqlmock test.
-func TestIntegrationForensicsWhoChanged_UnreachableSource(t *testing.T) {
-	srv, _ := seedConsoleData(t)
-	idxDB, idxDBName := testutil.CreateTestDB(t)
-	testutil.InitIndexTables(t, idxDB)
-	testutil.InsertEvent(t, idxDB, "bin.000001", 4, 40, "2026-06-01 12:00:00", nil,
-		"app", "users", 2 /*UPDATE*/, "1", nil, nil, []byte(`{"id":1,"name":"alicia"}`))
-
-	rec, body := doReq(t, srv, "POST", "/api/servers", `{
-		"name":"fx-dead-src",
-		"host":"127.0.0.1","port":"13306","user":"root","password":"testroot","dbname":"`+idxDBName+`",
-		"source_host":"127.0.0.1","source_port":"1","source_user":"root","source_password":"testroot"
-	}`)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create server: status = %d, body = %s", rec.Code, body)
-	}
-	var created struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(body, &created); err != nil {
-		t.Fatal(err)
-	}
-
-	rec, body = doReqOn(t, srv, created.ID, "POST", "/api/forensics/who-changed",
-		`{"schema":"app","table":"users","since":"2000-01-01 00:00:00"}`)
-	if rec.Code != 200 {
-		t.Fatalf("who-changed: status = %d, want 200 (unreachable source degrades, it doesn't error): %s", rec.Code, body)
-	}
-	var res forensics.WhoChangedResult
-	if err := json.Unmarshal(body, &res); err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Events) != 1 {
-		t.Fatalf("expected the one seeded event from the real index, got %d: %s", len(res.Events), body)
-	}
-	found := false
-	for _, n := range res.Notes {
-		if strings.Contains(n, "could not be reached") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("Notes should record the unreachable source, got: %v", res.Notes)
 	}
 }
 
@@ -256,9 +143,20 @@ func TestIntegrationRecoverMatchesGenerator(t *testing.T) {
 		t.Errorf("second undo statement should reverse the INSERT event, got: %s", stmts[1])
 	}
 
-	// Equivalence with the generator. Recovery always fetches oldest-first
-	// (ASC, the zero value), which is exactly what the console forces for the
-	// recover path — so the two scripts must match statement-for-statement.
+	// Equivalence with the generator. The console now fetches DESC (newest
+	// first) so a LIMIT truncation keeps the most recent events (#981), then
+	// re-sorts ASC before generation — whereas the generator call below fetches
+	// ASC (oldest-first, the zero value) under the same limit. Those two
+	// orderings diverge once the match set exceeds the limit: ASC-then-cap
+	// keeps the OLDEST rows, DESC-then-cap keeps the NEWEST. They agree here
+	// only because this fixture's 2 events sit far under recoverDefaultLimit,
+	// so nothing is actually truncated on either side — this is a same-input
+	// sanity check, not a general proof of equivalence. Guard that assumption
+	// explicitly so a future larger fixture doesn't silently start comparing
+	// two different truncation windows.
+	if len(stmts) >= recoverDefaultLimit {
+		t.Fatalf("fixture has grown to %d events, at/above recoverDefaultLimit (%d); the ASC/DESC equivalence below no longer holds — rewrite this check against the console's actual DESC-then-resort behavior", len(stmts), recoverDefaultLimit)
+	}
 	var buf bytes.Buffer
 	opts := query.Options{Schema: "app", Table: "users", Order: "", Limit: recoverDefaultLimit}
 	if _, err := recovery.New(srv.cm.boot.db, srv.cm.boot.resolver).GenerateSQL(context.Background(), opts, &buf); err != nil {
@@ -306,7 +204,7 @@ func TestIntegrationRecoverPGDialect(t *testing.T) {
 // TestIntegrationCapabilitiesSourcePostgres proves /api/capabilities reports the
 // source family per-server from stream_state.flavor (#595). The shared console
 // reads only the index, so this is the signal the frontend uses to present PG
-// vocabulary (LSN vs binlog file/pos/GTID) and the forensics-degraded note —
+// vocabulary (LSN vs binlog file/pos/GTID) and the connection-id availability note —
 // without ever probing the source database. A fresh/legacy index (no flavor row)
 // reads as "mysql" (the safe default); a PG-flavored index as "postgresql".
 func TestIntegrationCapabilitiesSourcePostgres(t *testing.T) {
@@ -765,4 +663,92 @@ func contains(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// TestIntegrationSchemasAPIArchiveOnly is the #1065 repro against a real index:
+// rotate has archived every partition, so binlog_events is empty while the
+// schema snapshot remains. /api/schemas must still list the schema — the UI's
+// schema picker is a <select> with no free-text fallback, so returning
+// {"schemas":[]} here left the recover page unable to target archived data.
+func TestIntegrationSchemasAPIArchiveOnly(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// A snapshot exists (taken at stream start) but every event has since been
+	// rotated out to Parquet/S3 — binlog_events is left empty on purpose.
+	testutil.InsertSnapshot(t, db, 1, "2026-06-01 11:00:00",
+		"app", "users", "id", 1, "PRI", "int", "NO")
+
+	// NoArchive stays FALSE: this is the reported configuration, where the
+	// archives are exactly what still answers /api/events and /api/recover.
+	// (handleSchemas never calls FetchMerged, so this opens the gate without
+	// touching archive I/O.)
+	srv, err := New(Config{
+		DB:     db,
+		DBName: dbName,
+		Listen: "127.0.0.1:8090",
+		Token:  intToken,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, body := doReq(t, srv, "GET", "/api/schemas", "")
+	if rec.Code != 200 {
+		t.Fatalf("schemas code = %d, body = %s", rec.Code, body)
+	}
+	var sr schemasResponse
+	if err := json.Unmarshal(body, &sr); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(sr.Schemas, "app") {
+		t.Fatalf("archive-only schemas = %v, want to include app (#1065)", sr.Schemas)
+	}
+
+	// The tables cascade must resolve from the snapshot too, or the picker
+	// dead-ends one level down.
+	_, body = doReq(t, srv, "GET", "/api/schemas?schema=app", "")
+	var tr tablesResponse
+	if err := json.Unmarshal(body, &tr); err != nil {
+		t.Fatal(err)
+	}
+	if !contains(tr.Tables, "users") {
+		t.Errorf("archive-only tables = %v, want to include users", tr.Tables)
+	}
+}
+
+// TestIntegrationSchemasAPINoArchiveKeepsLiveOnly pins the other half of the
+// #1065 gate: when archives are NOT reachable for this server (--no-archive, or
+// any active RBAC profile) a snapshot-only schema is unreachable by
+// construction, so it must NOT be advertised. binlog_events is left empty to
+// isolate the snapshot path — a schema with live events would be listed either
+// way and would not exercise the gate.
+func TestIntegrationSchemasAPINoArchiveKeepsLiveOnly(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	testutil.InsertSnapshot(t, db, 1, "2026-06-01 11:00:00",
+		"app", "users", "id", 1, "PRI", "int", "NO")
+
+	srv, err := New(Config{
+		DB:        db,
+		DBName:    dbName,
+		Listen:    "127.0.0.1:8090",
+		Token:     intToken,
+		NoArchive: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, body := doReq(t, srv, "GET", "/api/schemas", "")
+	if rec.Code != 200 {
+		t.Fatalf("schemas code = %d, body = %s", rec.Code, body)
+	}
+	var sr schemasResponse
+	if err := json.Unmarshal(body, &sr); err != nil {
+		t.Fatal(err)
+	}
+	if len(sr.Schemas) != 0 {
+		t.Errorf("--no-archive schemas = %v, want none: archives are unreachable, so a snapshot-only schema must not be offered", sr.Schemas)
+	}
 }

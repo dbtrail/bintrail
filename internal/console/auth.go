@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+
+	"github.com/dbtrail/dbtrail/ext"
 )
 
 // isLoopbackAddr reports whether a listen address binds only to the loopback
@@ -56,6 +58,18 @@ func authKindFrom(ctx context.Context) authKind {
 	return k
 }
 
+// policyCtxKey carries the authenticated session's access policy (from
+// sessionStore.Lookup) into the request. It is nil for the static token, the
+// password login, and any OSS session — a nil policy means full access, so the
+// authz middleware and capabilities report everything, preserving OSS behavior.
+// Only an EE build attaches a non-nil policy via the ext session issuer.
+type policyCtxKey struct{}
+
+func policyFrom(ctx context.Context) *ext.AccessPolicy {
+	p, _ := ctx.Value(policyCtxKey{}).(*ext.AccessPolicy)
+	return p
+}
+
 // tokenMiddleware requires a valid bearer credential on every wrapped
 // request: either the static access token or a login session. Both checks
 // run on the same path with no prefix branching, so response shape never
@@ -86,8 +100,10 @@ func (s *Server) tokenMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authKindCtxKey{}, authKindToken)))
 			return
 		}
-		if s.sessions.Validate(got) {
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authKindCtxKey{}, authKindSession)))
+		if policy, ok := s.sessions.Lookup(got); ok {
+			ctx := context.WithValue(r.Context(), authKindCtxKey{}, authKindSession)
+			ctx = context.WithValue(ctx, policyCtxKey{}, policy)
+			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")

@@ -6,7 +6,7 @@
 //
 // Why a separate binary rather than a subcommand of bintrail: the PostgreSQL
 // capture path links jackc/pgx + pglogrepl, which the core MySQL binary must
-// stay free of (cmd/bintrail/pgfree_test.go enforces this). Splitting the
+// stay free of (cliapp/pgfree_test.go enforces this). Splitting the
 // capture plane per source keeps each binary's dependency surface honest while
 // the read plane is shared code. The user wants a distinct `bintrail-pg` as the
 // recognizable artifact for the Postgres-recovery niche (#534).
@@ -21,12 +21,17 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
 var (
 	logLevel  string
 	logFormat string
 )
+
+// tel records one usage event per invocation, wired at the root like the core
+// binary's.
+var tel cli.TelemetryHook
 
 // Build-time variables injected via -ldflags. These are the SAME names the core
 // bintrail binary uses (main.Version/CommitSHA/BuildDate), so the Makefile's
@@ -52,6 +57,7 @@ before-image (and de-TOASTed unchanged values) is present in the WAL. See
 'bintrail-pg stream --help'.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		observe.Setup(os.Stderr, logFormat, logLevel)
+		tel.Start(cmd)
 		return nil
 	},
 	SilenceErrors: true, // we handle error output ourselves in main()
@@ -62,14 +68,24 @@ func init() {
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", Version, CommitSHA, BuildDate)
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	rootCmd.PersistentFlags().StringVar(&logFormat, "log-format", "text", "Log format: text or json")
+	rootCmd.PersistentFlags().String("telemetry", "", "Usage telemetry: on or off (overrides BINTRAIL_TELEMETRY; DO_NOT_TRACK=1 overrides everything)")
 	// The source-agnostic read plane (status/query/recover/reconstruct/shim),
 	// shared verbatim with the core binary. The PostgreSQL capture command
 	// (stream) is registered in stream.go's init().
 	cli.AddReadCommands(rootCmd)
+	// The index-side maintenance plane (rotate, archive reconcile) — also
+	// source-agnostic, so a PostgreSQL-only install can bound its index growth
+	// with `bintrail-pg rotate` instead of needing the core MySQL binary against
+	// the same index DSN (#951). `bintrail-pg stream` additionally runs the
+	// built-in rotation loop for safe-by-default retention.
+	cli.AddMaintenanceCommands(rootCmd)
+	// Usage telemetry control surface, same set as the core binary.
+	cli.AddTelemetryCommand(rootCmd)
+	telemetry.SetVersion(Version)
 }
 
 func main() {
-	err := rootCmd.Execute()
+	err := tel.Execute(rootCmd)
 	if err == nil {
 		return
 	}

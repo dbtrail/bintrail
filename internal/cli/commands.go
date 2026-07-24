@@ -24,18 +24,17 @@ func AddReadCommands(root *cobra.Command) {
 	root.AddCommand(shimCmd)
 }
 
-// AddForensicsCommands registers the forensics read commands: who-changed,
-// user-activity, and connection-history (#706).
-//
-// Deliberately NOT part of AddReadCommands: these commands interrogate
-// MySQL-family sources (performance_schema, the audit-plugin family, binlog
-// connection ids), so registering them on the shared read plane would expose
-// dead commands on bintrail-pg. Only cmd/bintrail calls this — the same
-// scoping rule that keeps the MySQL-only doctor out of the shared set. Each
-// command's RunE checks forensics.Enabled() at entry (the entitlement seam,
-// epic #701 D1); the library underneath stays mechanism-only.
-func AddForensicsCommands(root *cobra.Command) {
-	root.AddCommand(whoChangedCmd)
-	root.AddCommand(userActivityCmd)
-	root.AddCommand(connectionHistoryCmd)
+// AddMaintenanceCommands registers the index-side maintenance commands: rotate
+// and archive reconcile. Both operate purely on the shared MySQL index
+// (partition rotation, archive_state reconciliation) and are source-agnostic,
+// so every capture binary registers them — the core bintrail AND bintrail-pg
+// (#951). Without this, a PostgreSQL-only install has no way to bound index
+// growth: its named partitions fill within ~2 days and every later event piles
+// into p_future unbounded, the disk-full mode #406/#420 closed for MySQL. The
+// long-running daemons (up, watch, and now bintrail-pg stream) additionally run
+// the built-in rotation loop; these standalone commands cover offline/manual
+// maintenance and the archive-then-drop retention path the loop does not.
+func AddMaintenanceCommands(root *cobra.Command) {
+	root.AddCommand(rotateCmd)
+	root.AddCommand(archiveCmd)
 }

@@ -1397,3 +1397,155 @@ func TestVerifyBaselinePair_StaleZeroDateVsGenuineNull_AcceptedRisk(t *testing.T
 		t.Fatalf("status = %q (%s); this test pins the accepted-risk behavior — if this now fails, the zero-date normalization's blast radius changed and this comment/test pair needs re-evaluating, not just updating the assertion", got.Status, got.Detail)
 	}
 }
+
+// TestVerifyBaselinePair_EnumBitCarriedUnchanged_IsAMatch is the #769 repro +
+// regression test. With row_image=FULL an UPDATE's row_after carries EVERY
+// column, so an event that touched only a non-deferred column still carries
+// the ENUM as its ordinal (json.Number) and the BIT as its integer — while
+// both baselines carry the label string and the raw ceil(M/8) bytes. Before
+// the fix the event side was never label-mapped (MapEventEnumLabels had zero
+// call sites in this package) and BIT rendered as decimal text, so this exact
+// scenario — a genuine, faithful recovery — read as a conclusive false
+// MISMATCH in the DEFAULT verify mode (the old ChangedColumns-based gate did
+// not fire because the deferred columns were not listed as changed).
+func TestVerifyBaselinePair_EnumBitCarriedUnchanged_IsAMatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"state", "", "enum", "enum('active','inactive')", 2},
+		{"amount", "", "int", "int", 3},
+		{"flags", "", "bit", "bit(12)", 4},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `state` ENUM('active','inactive'),\n  `amount` INT,\n  `flags` BIT(12),\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "state", MySQLType: "enum", ParquetType: baseline.MysqlToParquetNode("enum")},
+		{Name: "amount", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "flags", MySQLType: "bit", ParquetType: baseline.MysqlToParquetNode("bit")},
+	}
+	// Both baselines carry the ENUM as its label and BIT(12) as its raw
+	// 2-byte big-endian form (value 5 → 0x00 0x05) — exactly what mydumper
+	// dumps. Only `amount` changes between them.
+	writeTestBaseline(t, baseDir, prevTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "active", "10", "\x00\x05"},
+	}, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "active", "11", "\x00\x05"},
+	}, "binlog.000001", 500)
+
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+	ets := prevTS.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	// The UPDATE touched only `amount`; the FULL row image still carries the
+	// ENUM ordinal (1 = 'active') and the BIT integer (5).
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ets, nil, dbName, "orders", 2 /*UPDATE*/, "1", nil,
+		[]byte(`{"id":1,"state":1,"amount":10,"flags":5}`),
+		[]byte(`{"id":1,"state":1,"amount":11,"flags":5}`))
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	ctx := context.Background()
+	pairs, _, _, err := FindBaselinePair(ctx, baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+
+	got, err := VerifyBaselinePair(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); want match — a carried-but-unchanged ENUM/BIT must not read as divergence\n  new   =%s rows=%d\n  recon =%s rows=%d",
+			got.Status, got.Detail, got.SourceDigest, got.SourceRows, got.ReconstructDigest, got.ReconstructRows)
+	}
+}
+
+// TestVerifyBaselinePair_UnmappableEnumOrdinal_Inconclusive pins the residual
+// safety of the #769 fix: an ENUM ordinal the label mapper cannot resolve
+// (out of range for the snapshot's definition — the enum drifted) renders as
+// its raw number, which cannot be compared faithfully against the baseline's
+// label, so a content difference must degrade to Inconclusive — never a
+// conclusive false MISMATCH.
+func TestVerifyBaselinePair_UnmappableEnumOrdinal_Inconclusive(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	for _, c := range []struct {
+		name, key, dt, colType string
+		ord                    int
+	}{
+		{"id", "PRI", "int", "int", 1},
+		{"state", "", "enum", "enum('active','inactive')", 2},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := prevTS.Add(time.Hour)
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `state` ENUM('active','inactive'),\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "state", MySQLType: "enum", ParquetType: baseline.MysqlToParquetNode("enum")},
+	}
+	writeTestBaseline(t, baseDir, prevTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "active"},
+	}, "binlog.000001", 200)
+	writeTestBaseline(t, baseDir, newTS, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "inactive"},
+	}, "binlog.000001", 500)
+
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{prevTS, newTS, now.Truncate(time.Hour)})
+	ets := prevTS.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	// Ordinal 9 is out of range for the 2-member definition: the mapper passes
+	// it through as a number rather than guessing a label.
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ets, nil, dbName, "orders", 2 /*UPDATE*/, "1", nil,
+		[]byte(`{"id":1,"state":1}`),
+		[]byte(`{"id":1,"state":9}`))
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := BaselineConfig{IndexDB: db, Resolver: resolver, IndexDBName: dbName, NoArchive: true}
+	ctx := context.Background()
+	pairs, _, _, err := FindBaselinePair(ctx, baseDir)
+	if err != nil || len(pairs) != 1 {
+		t.Fatalf("FindBaselinePair: %v (pairs=%d)", err, len(pairs))
+	}
+
+	got, err := VerifyBaselinePair(ctx, cfg, pairs[0])
+	if err != nil {
+		t.Fatalf("VerifyBaselinePair: %v", err)
+	}
+	if got.Status != StatusInconclusive {
+		t.Fatalf("status = %q (%s); want inconclusive — an unmappable ordinal is a representation gap, not proof of divergence", got.Status, got.Detail)
+	}
+}

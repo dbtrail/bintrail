@@ -137,6 +137,10 @@ silently become the write key for every server. Two caveats:
 - **File-based `bintrail index`** over MariaDB binlog files.
 - All row events (INSERT/UPDATE/DELETE) with before/after images, including
   `UNSIGNED`, `DECIMAL`, and DDL detection / auto-snapshot.
+- **Compressed row events** (`log_bin_compress = ON`): MariaDB's
+  `WRITE/UPDATE/DELETE_ROWS_COMPRESSED_V1` events are decompressed and indexed
+  exactly like their uncompressed siblings, on both the streaming and
+  file-based paths.
 - **Statement capture** (`query_text`/`query_hash`): MariaDB's `Annotate_rows`
   event carries the originating SQL statement and is captured like MySQL's
   `ROWS_QUERY_EVENT`. `binlog_annotate_row_events` is ON by default since
@@ -157,10 +161,6 @@ silently become the write key for every server. Two caveats:
 - **The source flavor is fixed per checkpoint.** Resuming a saved MariaDB
   checkpoint requires the same `--source-flavor mariadb`. A mismatch is rejected
   with an actionable error; use `--reset` to start fresh.
-- **Compressed row events are skipped.** With `log_bin_compress = ON`, MariaDB's
-  compressed row events are not yet decoded — bintrail logs a loud warning
-  (`rows_skipped`) rather than indexing them. Leave `log_bin_compress = OFF` on
-  the source for now.
 - **Mid-capture primary failover is untested.** Gap detection compares GTID
   sequences per domain (correct for single-server and multi-domain topologies),
   but a primary failover that changes the `server_id` *within* a domain mid-stream

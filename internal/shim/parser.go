@@ -4,8 +4,8 @@
 //
 // Three virtual-schema statement shapes are recognised:
 //
-//	SELECT * FROM _flashback.<table> AS OF [TIMESTAMP] '<ts>'           [WHERE <col> = <value>]
-//	SELECT * FROM _snapshot.<table>  AS OF [TIMESTAMP] '<ts>'           [WHERE <col> = <value>]
+//	SELECT * FROM _flashback.<table> AS OF [TIMESTAMP] '<ts>'           [WHERE <col> = <value>] [LIMIT <n>]
+//	SELECT * FROM _snapshot.<table>  AS OF [TIMESTAMP] '<ts>'           [WHERE <col> = <value>] [LIMIT <n>]
 //	SELECT * FROM _diff.<table>      BETWEEN '<t1>' AND '<t2>'          WHERE <col> = <value>
 //
 // On the AS OF shapes, `*` may be replaced with a comma-separated list
@@ -108,6 +108,15 @@ type TimeTravelQuery struct {
 	PKColumn string
 	PKValue  string
 	Columns  []string // nil = SELECT *; otherwise user-listed projection
+	// Limit is the optional trailing `LIMIT <n>` bound (#997), 0 meaning no
+	// LIMIT clause was supplied. Only TypeFlashback / TypeSnapshot parse it;
+	// TypeDiff and the hint / bare-real-table forms keep the LIMIT-less shape.
+	// A positive value caps the returned rows and — crucially for full-table
+	// AS OF — a LIMIT at or below the full-table row cap lets the query succeed
+	// instead of tripping ER_TOO_BIG_SELECT (the "add a LIMIT to browse" path).
+	// LIMIT never RAISES the cap. LIMIT 0 is rejected at parse time so 0 stays
+	// an unambiguous "no clause" sentinel.
+	Limit int
 }
 
 var (
@@ -215,9 +224,12 @@ var (
 //	    a non-capturing group, #314)
 //	4 = WHERE column (or empty)
 //	5 = WHERE value (or empty)
+//	6 = LIMIT row bound digits (or empty — no LIMIT clause, #997)
 //
-// The trailing WHERE clause is in an optional non-capturing group so the
-// PK-filtered fast path and the full-table path go through the same matcher.
+// The trailing WHERE and LIMIT clauses are in optional non-capturing groups so
+// the PK-filtered fast path, the full-table path, and their LIMIT'd variants
+// all go through the same matcher. LIMIT is END-anchored (it must be the last
+// clause) to keep the matcher unambiguous.
 //
 // The column-list pattern only accepts bare identifiers separated by
 // commas (e.g. `id, email, name`) — backticked, schema-qualified, and
@@ -230,6 +242,7 @@ func mustCompileAsOf(schemaPrefix string) *regexp.Regexp {
 			schemaPrefix + `\.([A-Za-z_][A-Za-z0-9_]*)` +
 			`\s+AS\s+OF\s+(?:TIMESTAMP\s+)?'([^']+)'` +
 			`(?:\s+WHERE\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*('[^']*'|-?\d+))?` +
+			`(?:\s+LIMIT\s+(\d+))?` +
 			`\s*;?\s*$`,
 	)
 }
@@ -321,22 +334,27 @@ func Parse(sql, defaultSchema string) (TimeTravelQuery, error) {
 
 	return TimeTravelQuery{}, fmt.Errorf(
 		"malformed time-travel query; expected one of:\n" +
-			"  SELECT (* | <col>[, <col>...]) FROM _flashback.<table> AS OF [TIMESTAMP] '<ts>' [WHERE <col> = <value>]\n" +
-			"  SELECT (* | <col>[, <col>...]) FROM _snapshot.<table>  AS OF [TIMESTAMP] '<ts>' [WHERE <col> = <value>]\n" +
+			"  SELECT (* | <col>[, <col>...]) FROM _flashback.<table> AS OF [TIMESTAMP] '<ts>' [WHERE <col> = <value>] [LIMIT <n>]\n" +
+			"  SELECT (* | <col>[, <col>...]) FROM _snapshot.<table>  AS OF [TIMESTAMP] '<ts>' [WHERE <col> = <value>] [LIMIT <n>]\n" +
 			"  SELECT * FROM _diff.<table>      BETWEEN '<t1>' AND '<t2>' WHERE <col> = <value>\n" +
 			"\n" +
-			"Notes: the TIMESTAMP keyword is optional. Column lists in the SELECT\n" +
-			"clause are supported on _flashback / _snapshot (bare identifiers only;\n" +
-			"backticks, schema.column, and aliases are not yet parsed).",
+			"Notes: the TIMESTAMP keyword is optional, and LIMIT (a positive integer)\n" +
+			"must be the last clause. Column lists in the SELECT clause are supported\n" +
+			"on _flashback / _snapshot (bare identifiers only; backticks, schema.column,\n" +
+			"and aliases are not yet parsed).",
 	)
 }
 
-// parseAsOfMatch fills a TimeTravelQuery for the _flashback / _snapshot
-// shapes (capture groups: 1 projection, 2 table, 3 timestamp, 4 col, 5 value).
+// parseAsOfMatch fills a TimeTravelQuery for the _flashback / _snapshot shapes
+// (capture groups: 1 projection, 2 table, 3 timestamp, 4 col, 5 value, 6 LIMIT).
 func parseAsOfMatch(m []string, t QueryType, schema string) (TimeTravelQuery, error) {
 	asOf, err := parseTimeLiteral(m[3])
 	if err != nil {
 		return TimeTravelQuery{}, fmt.Errorf("invalid AS OF timestamp %q: %w", m[3], err)
+	}
+	limit, err := parseLimitGroup(m[6])
+	if err != nil {
+		return TimeTravelQuery{}, err
 	}
 	return TimeTravelQuery{
 		Type:     t,
@@ -346,7 +364,27 @@ func parseAsOfMatch(m []string, t QueryType, schema string) (TimeTravelQuery, er
 		PKColumn: m[4],
 		PKValue:  stripQuotes(m[5]),
 		Columns:  parseColumnList(m[1]),
+		Limit:    limit,
 	}, nil
+}
+
+// parseLimitGroup converts the optional LIMIT capture group into a positive row
+// bound. Empty → 0 (no LIMIT clause). "0" and out-of-int-range values are
+// rejected so the Limit==0 sentinel unambiguously means "no clause supplied": a
+// `LIMIT 0` silently treated as unlimited would be a surprising wrong answer,
+// and a huge \d+ that overflowed int would wrap rather than fail loud.
+func parseLimitGroup(s string) (int, error) {
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("LIMIT value %q out of range", s)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("LIMIT must be a positive integer, got %d", n)
+	}
+	return n, nil
 }
 
 // parseColumnList converts the regex-captured projection group into a
@@ -438,11 +476,72 @@ func parseTimeLiteral(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("must be one of: %s (zone-less forms are interpreted as UTC), or a relative literal like '5 minutes ago'", strings.Join(timeFormats, ", "))
 }
 
+// stripQuotes converts a regex-captured WHERE value into the raw bytes
+// matched against pk_values. Quoted string literals get standard MySQL
+// escape semantics (#826): without unescaping, a backslash-containing
+// PK — `WHERE path = 'C:\\temp\\new'` escaped MySQL-style — would
+// search for the literal escaped bytes, miss, and return an empty
+// resultset, which the documented AS OF semantics read as "the row
+// didn't exist at that instant" — a false forensic conclusion.
+// Unquoted (numeric) values pass through unchanged.
 func stripQuotes(s string) string {
 	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
-		return s[1 : len(s)-1]
+		return unescapeStringLiteral(s[1 : len(s)-1])
 	}
 	return s
+}
+
+// unescapeStringLiteral interprets the escape sequences MySQL recognises
+// inside a single-quoted string literal (String Literals, MySQL 8.0
+// reference §9.1.1): \0 \b \n \r \t \Z \\ \' \" translate to their
+// character; \% and \_ keep the backslash (they are only special in
+// LIKE patterns); a backslash before any other character is dropped
+// (escapes are case-sensitive: \Z is Ctrl+Z, \z is z); a doubled quote
+// ('') collapses to a single quote.
+//
+// Note the value regexes ('[^']*') cannot capture a literal containing
+// a quote character — such statements miss the full matcher and keep
+// the fail-loud 1064 path — so the \' and '' branches are for MySQL-
+// semantics completeness, not reachable through Parse today.
+func unescapeStringLiteral(s string) string {
+	if !strings.ContainsAny(s, `\'`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '\\' && i+1 < len(s):
+			i++
+			switch s[i] {
+			case '0':
+				b.WriteByte(0)
+			case 'b':
+				b.WriteByte('\b')
+			case 'n':
+				b.WriteByte('\n')
+			case 'r':
+				b.WriteByte('\r')
+			case 't':
+				b.WriteByte('\t')
+			case 'Z':
+				b.WriteByte(0x1A)
+			case '%', '_':
+				b.WriteByte('\\')
+				b.WriteByte(s[i])
+			default:
+				// \\ \' \" and any other \x → x.
+				b.WriteByte(s[i])
+			}
+		case c == '\'' && i+1 < len(s) && s[i+1] == '\'':
+			b.WriteByte('\'')
+			i++
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // parseAsOfRealTable handles the bare time-travel form on a real table

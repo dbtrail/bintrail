@@ -1,6 +1,7 @@
 package baseline
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -109,6 +110,12 @@ func NewWriter(path string, cols []Column, cfg WriterConfig) (*Writer, error) {
 // WriteRow converts a row of string values (in MySQL column order) into a
 // Parquet row and writes it to the file.
 func (w *Writer) WriteRow(values []string, nulls []bool) error {
+	// #503 item 4 (value/column-count desync): every WriteRow caller must supply
+	// exactly len(cols) values. That invariant is enforced UPSTREAM — the mydumper
+	// path fails loud on a strict len(values) != len(cols) at baseline.go (issue
+	// #767, test-pinned), and the remaining callers build fixed-arity value slices
+	// by construction — so WriteRow does not re-check here; it keeps only its
+	// defensive NULL-pad for a short row (a bounds check, not a supported layout).
 	row := make(parquet.Row, len(w.parquetCols))
 	for parquetIdx, col := range w.parquetCols {
 		mysqlIdx := w.mysqlOrder[parquetIdx]
@@ -292,13 +299,54 @@ func convertValue(col Column, raw string) (parquet.Value, error) {
 		}
 		return parquet.Int32Value(int32(n)), nil
 
-	case "binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob", "bit":
-		return parquet.ByteArrayValue([]byte(raw)), nil
+	case "binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob", "bit",
+		// GEOMETRY and its subtypes carry WKB (binary) bytes; route them through
+		// the binary path so a --hex-blob dump decodes and the value is stored as
+		// bytes, not UTF-8 text (#503 item 2). NOTE: the exact form mydumper emits
+		// for spatial columns is not verified end-to-end here (mydumper unavailable
+		// in the unit env); the type mapping is the safe floor.
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection", "geomcollection": // MySQL 8.0 canonicalizes the former to the latter
+		return parquet.ByteArrayValue(decodeBinaryLiteral(raw)), nil
 
 	default:
 		// String types and fallback.
 		return parquet.ByteArrayValue([]byte(raw)), nil
 	}
+}
+
+// decodeBinaryLiteral converts a mydumper/mysqldump binary-column literal into the
+// raw column bytes. A --hex-blob dump renders binary columns as 0x<hex>; this
+// decodes them to the real bytes. Any other input — the escaped _binary "…" form,
+// which the reader has already unescaped to raw bytes — is returned verbatim.
+//
+// Applied ONLY to binary-family columns (its callers). A --hex-blob dump emits
+// binary values exclusively as 0x<hex>, and a non-hex-blob dump emits them as
+// _binary "…" (never a bare 0x…), so a 0x<hex> reaching a binary column is
+// unambiguously a hex-blob value.
+//
+// Two accepted residuals, both requiring provenance the caller has already
+// discarded (the reader hands convertValue a plain string; baseline.go hashes
+// that same string for the #633 source-fidelity digest, so the value text must
+// stay verbatim and provenance can't be threaded through it):
+//   - A binary value whose actual bytes are the ASCII text "0x<even-hex>", dumped
+//     WITHOUT --hex-blob (so it arrived via _binary "…"), is indistinguishable
+//     from a hex-blob literal and would be decoded.
+//   - An odd-length / non-hex 0x… token (hex.DecodeString errors) falls back to
+//     verbatim rather than failing loud. From a bare 0x… literal that shape means
+//     a malformed/non-mydumper dump (a real --hex-blob value is always valid even
+//     hex) and could justify a loud abort — but the same raw string can also be a
+//     legit _binary "0x1" value, so a naive fail-loud here would false-abort a
+//     real baseline. Both are strictly better than the pre-#503 behavior (which
+//     never decoded at all); a provenance-flag fix is deferred.
+func decodeBinaryLiteral(raw string) []byte {
+	if len(raw) > 2 && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X') {
+		if b, err := hex.DecodeString(raw[2:]); err == nil {
+			return b
+		}
+	}
+	return []byte(raw)
 }
 
 // isZeroDate reports whether raw is MySQL's all-zero date pseudo-NULL sentinel:

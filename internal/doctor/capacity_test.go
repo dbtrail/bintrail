@@ -217,11 +217,14 @@ func TestDoctorReportErrExcluding(t *testing.T) {
 	}
 }
 
-func TestCapacityVerdict_freeUnknownPassesWithGuidance(t *testing.T) {
+func TestCapacityVerdict_freeUnknownSkipsWithGuidance(t *testing.T) {
 	p := capacityProjection{eventsPerDay: 24000, bytesPerEvent: 1000, projectedBytes: 720_000_000}
 	r := capacityVerdict(p, 30*24*time.Hour, 0, false)
-	if r.Status != StatusPass {
-		t.Fatalf("status = %s, want pass when free space is unknown", r.Status)
+	// #948: an unmeasurable volume (separate host/container — e.g. the compose
+	// stack) must SKIP, not PASS, so the check does not read green when its
+	// FAIL/WARN thresholds could never fire.
+	if r.Status != StatusSkip {
+		t.Fatalf("status = %s, want skip when free space is unknown", r.Status)
 	}
 	if !strings.Contains(r.Detail, "not measurable") || !strings.Contains(r.Detail, "headroom") {
 		t.Errorf("detail must carry the projection plus headroom guidance, got: %s", r.Detail)

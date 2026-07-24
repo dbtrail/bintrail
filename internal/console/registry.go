@@ -67,6 +67,19 @@ type ServerEntry struct {
 	// Schemas is the optional comma-separated schema filter for monitoring.
 	Schemas string `yaml:"schemas,omitempty"`
 
+	// ── Source family (#1019) ──
+	// Flavor selects the capture engine: "" or "mysql" (MySQL), "mariadb"
+	// (MySQL DSN, MariaDB GTID at stream), "postgres" (pgstreamrun). Empty →
+	// mysql keeps every pre-#1019 entry working (mirrors an empty SSLMode).
+	// This is the generic "which source family" field #623 (MariaDB) also
+	// needs — one implementation, not two. Accessed via SourceFlavor().
+	Flavor string `yaml:"flavor,omitempty"`
+	// SourceSlot / SourcePublication configure PostgreSQL logical replication
+	// (postgres flavor only): the operator-created publication and the
+	// replication slot the capturer streams from. Empty for MySQL/MariaDB.
+	SourceSlot        string `yaml:"source_slot,omitempty"`
+	SourcePublication string `yaml:"source_publication,omitempty"`
+
 	// ── Source TLS (#879) ──
 	// SSLMode/SSLCA/SSLCert/SSLKey configure the TLS the supervisor uses when
 	// connecting to the SOURCE MySQL. Empty SSLMode = the daemon default

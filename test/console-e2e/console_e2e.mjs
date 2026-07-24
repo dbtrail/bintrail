@@ -151,113 +151,6 @@ try {
     ? ok("form: advanced section expanded for a BYO-index entry")
     : bad("form: advanced section expanded for a BYO-index entry", "collapsed — the byoIndex open-arm regressed");
 
-  // Scenario 5b — Forensics (#708): the "byo-idx" server just created has NO
-  // source configured but points at a real, schema-migrated index carrying
-  // one row run.sh seeded directly — covering both required states in one
-  // fixture: the no-source setup prompt, and the who-changed happy path.
-  //
-  // Bumps serverGen and clears schemaCache/tablesCache by hand rather than
-  // calling switchServer(): switchServer's own renderRoute() re-renders
-  // whatever route is CURRENT (still whatever scenario 4 left it on) before
-  // this scenario's navigate("forensics") fires — two renders racing under
-  // the SAME just-bumped serverGen (navigate() doesn't bump it further), so
-  // if the first (stale-route) render's fetch resolves after forensics has
-  // already painted, its own serverGen check still passes and it clobbers
-  // #view out from under this scenario. Bumping/clearing without triggering
-  // a render, then navigating exactly once, avoids the race while still
-  // fixing the cache-poisoning switchServer would have fixed.
-  await page.evaluate(() => closeServersModal());
-  // Let scenario 5's editServer() open/populate-form fetches (if any) fully
-  // settle before switching server + route — an in-flight one resolving
-  // after navigate("forensics") could otherwise touch shared state
-  // (capsCache, tablesCache) at the wrong moment.
-  await page.waitForLoadState("networkidle");
-  await page.evaluate((id) => { setCurrentServer(id); serverGen++; schemaCache = null; tablesCache.clear(); }, byoId);
-  await page.evaluate(() => navigate("forensics"));
-  await page.waitForSelector("#fx-caps", { timeout: 5000 });
-  await page.waitForFunction(
-    () => !document.getElementById("fx-caps").querySelector(".view-loading"),
-    { timeout: 8000 },
-  );
-  const capsGate = await page.evaluate(() => ({
-    navVisible: (() => {
-      const n = document.querySelector('.nav-item[data-route="forensics"]');
-      return !!n && getComputedStyle(n).display !== "none";
-    })(),
-    noSourcePrompt: /No source connection configured/.test(document.getElementById("fx-caps").textContent),
-  }));
-  capsGate.navVisible
-    ? ok("forensics: nav item visible (capsCache.forensics gate)")
-    : bad("forensics: nav item visible (capsCache.forensics gate)", "hidden — forensics capability not advertised");
-  capsGate.noSourcePrompt
-    ? ok("forensics: no-source-configured setup prompt renders")
-    : bad("forensics: no-source-configured setup prompt renders", "expected copy missing from #fx-caps");
-
-  await page.waitForFunction(
-    () => { const s = document.querySelector('#fx-form [name="schema"]'); return s && [...s.options].some((o) => o.value === "fx_e2e"); },
-    { timeout: 8000 },
-  );
-  await page.evaluate(() => {
-    const form = document.getElementById("fx-form");
-    form.elements.schema.value = "fx_e2e";
-    form.elements.schema.dispatchEvent(new Event("change", { bubbles: true }));
-  });
-  // loadTables() (fired by the change event above) is async and its latency
-  // depends on whether byo-idx's bundle is already open (single-flighted lazy
-  // connect) — poll for the real "probe" option instead of a fixed sleep, so
-  // this doesn't flake under load.
-  await page.waitForFunction(
-    () => { const s = document.querySelector('#fx-form [name="table"]'); return s && [...s.options].some((o) => o.value === "probe"); },
-    { timeout: 8000 },
-  );
-  await page.evaluate(() => {
-    const form = document.getElementById("fx-form");
-    form.elements.table.value = "probe";
-    form.elements.since.value = "2000-01-01 00:00:00";
-    form.requestSubmit();
-  });
-  // The query itself is async (index fetch, possibly a lazy bundle open) —
-  // poll for any outcome (timeline rendered, the "no changes found" empty
-  // state, or a rendered error) rather than a fixed sleep. Matches the
-  // actual classes renderError()/buildWhoChangedTimeline() use — NOT a
-  // generic ".error"/".empty" name, which doesn't exist in this file.
-  await page.waitForFunction(
-    () => !!document.getElementById("fx-timeline") || !!document.querySelector("#fx-out .error-box, #fx-out .ev-empty"),
-    { timeout: 8000 },
-  );
-  const who = await page.evaluate(() => {
-    const timeline = document.getElementById("fx-timeline");
-    return {
-      rendered: !!timeline,
-      hasBadge: !!timeline && !!timeline.querySelector(".badge.b-update"),
-      hasPK: !!timeline && /PK: 1/.test(timeline.textContent),
-      fallbackPanel: !!document.querySelector(".fx-fallback"),
-    };
-  });
-  who.rendered
-    ? ok("forensics: who-changed happy path renders the timeline")
-    : bad("forensics: who-changed happy path renders the timeline", "no #fx-timeline");
-  who.hasBadge
-    ? ok("forensics: who-changed event shows its UPDATE badge")
-    : bad("forensics: who-changed event shows its UPDATE badge", "no .b-update badge");
-  who.hasPK
-    ? ok("forensics: who-changed event shows its PK")
-    : bad("forensics: who-changed event shows its PK", "PK: 1 not found in timeline");
-  who.fallbackPanel
-    ? ok("forensics: fallback SQL panel renders for an unattributed event")
-    : bad("forensics: fallback SQL panel renders for an unattributed event", "no .fx-fallback");
-
-  // Restore the default server selection and invalidate the caches byo-idx's
-  // populateSchemas call wrote into (same reasoning as the switch above: a
-  // bare setCurrentServer("") would restore the selection but leave
-  // schemaCache/tablesCache holding byo-idx's data). Bump/clear by hand
-  // rather than calling switchServer(), which would also fire its own
-  // renderRoute() — an extra, redundant re-render of the current (forensics)
-  // route racing scenario 6's very next navigate() under the same
-  // just-bumped serverGen, for the exact reason explained at the switch-in
-  // above. No render is needed here at all: scenario 6's navigate() builds
-  // whatever view it needs from a clean, cache-invalidated state.
-  await page.evaluate(() => { setCurrentServer(""); serverGen++; schemaCache = null; tablesCache.clear(); });
 
   // Scenario 6 — Recover/Cascade merge. Cascade recovery is no longer a separate
   // tab: it is auto-detected inside the single Recover flow (the backend routes by
@@ -411,73 +304,110 @@ try {
   cred.hasToggle ? ok("aws-creds: disclosure uses the app's toggle style") : bad("aws-creds: disclosure uses the app's toggle style", "missing summary.form-adv-summary");
   cred.rawRowCount === 4 ? ok("aws-creds: all four raw signal rows still render") : bad("aws-creds: all four raw signal rows still render", `rawRowCount=${cred.rawRowCount}`);
 
-  // Scenario 10 — Forensics setup-guide panel (#708). buildFxCapsBanner is pure
-  // (like pgHealthCard/continuityBox/credentialsCard): the only live-browser
-  // forensics scenario (5b) uses byo-idx, which has no source connection
-  // configured at all — handleForensicsCapabilities short-circuits before ever
-  // calling DetectCapabilities/BuildSetupGuide, so neither the fully-capable
-  // nor the degraded-with-recommendations state ever renders in a real browser.
-  // (Even a source-configured probe against the stock test MySQL would show
-  // recommendations, not the fully-capable state — events_statements_history_long
-  // and the audit plugin are both off by default — so there's no live fixture
-  // that reaches this UI path either way.) Feeds buildFxCapsBanner synthetic
-  // capability payloads directly, mirroring the no-source, fully-capable, and
-  // degraded-with-recommendations states.
-  const fxGuide = await page.evaluate(() => {
-    const noSource = buildFxCapsBanner({ source_configured: false });
-    const fullyCapable = buildFxCapsBanner({
-      source_configured: true,
-      performance_schema: { enabled: true, consumers: { events_statements_history_long: true }, threads_accessible: true },
-      audit_log: { installed: true, variant: "MariaDB" },
-    });
-    const degraded = buildFxCapsBanner({
-      source_configured: true,
-      performance_schema: { enabled: false, consumers: {}, threads_accessible: false },
-      audit_log: { installed: false },
-      setup_guide: {
-        summary: "Enable performance_schema consumers to unlock full attribution.",
-        recommendations: [
-          {
-            priority: "high",
-            category: "performance_schema",
-            title: "Enable events_statements_history_long",
-            description: "Without this consumer, statement text cannot be correlated to row changes.",
-            runtime_sql: ["UPDATE performance_schema.setup_consumers SET enabled='YES' WHERE name='events_statements_history_long';"],
-            mycnf_snippet: "[mysqld]\nperformance-schema-consumer-events-statements-history-long=ON",
-          },
-        ],
-      },
-    });
-    document.body.appendChild(degraded);
-    const toggle = degraded.querySelector(".fx-guide-toggle");
-    const contentBeforeClick = degraded.querySelector(".fx-guide-content");
-    const hiddenBeforeClick = contentBeforeClick ? contentBeforeClick.hidden : null;
-    toggle && toggle.click();
-    const hiddenAfterClick = contentBeforeClick ? contentBeforeClick.hidden : null;
-    const copyBtn = degraded.querySelector(".fx-sql-block .btn");
-    const result = {
-      noSourcePrompt: !!noSource && /No source connection configured/.test(noSource.textContent),
-      fullyCapableNoGuide: !!fullyCapable && !fullyCapable.querySelector(".fx-guide"),
-      degradedHasGuide: !!degraded.querySelector(".fx-guide"),
-      guideCollapsedByDefault: hiddenBeforeClick === true,
-      guideExpandsOnClick: hiddenAfterClick === false,
-      hasPriorityBadge: !!degraded.querySelector(".fx-priority-high"),
-      hasRuntimeSqlBlock: Array.from(degraded.querySelectorAll(".fx-sql")).some((n) => /events_statements_history_long/.test(n.textContent)),
-      hasMycnfBlock: Array.from(degraded.querySelectorAll(".fx-sql")).some((n) => /performance-schema-consumer/.test(n.textContent)),
-      hasCopyButton: !!copyBtn && copyBtn.textContent.trim() === "Copy",
+
+  // Scenario 10 — extension views (embedding builds). The stock binary ships no
+  // ConsoleViewProvider, so this fixture-drives the pure client wiring (like
+  // scenarios 7-9): inject an advertised view into capsCache, then assert the
+  // nav item appears, the route "ext-<id>" mounts the module and calls its
+  // render(mount, {apiBase, api}), and a server switch both drops the nav item
+  // and abandons an in-flight render (serverGen staleness). Script() is stubbed
+  // with a blob-URL ES module — a same-document dynamic import, which works only
+  // because the console sets no Content-Security-Policy (the invariant documented
+  // on ext.ConsoleViewProvider.Script; a script-src CSP without 'self'/blob:
+  // would break this and every real extension view).
+  const extv = await page.evaluate(async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const modURL = (marker) => URL.createObjectURL(new Blob(
+      [`export function render(mount, ctx){ window.${marker} = !!(mount && ctx && typeof ctx.api === "function" && ctx.apiBase); mount.append(document.createTextNode("ext-content")); }`],
+      { type: "text/javascript" },
+    ));
+
+    // 0) Exercise gateCapabilities END-TO-END: the manual steps below fixture-drive
+    //    capsCache/extViews directly, which BYPASSES the one real backend→frontend
+    //    wiring line (extViews = capsCache.extension_views inside gateCapabilities).
+    //    Stub /api/capabilities so it advertises an extension view, call the real
+    //    gateCapabilities(), and assert extViews + the nav were populated FROM the
+    //    parsed response — so a one-sided read of a different property (or a rename)
+    //    fails a test instead of silently disabling the feature.
+    const realFetch = window.fetch;
+    window.fetch = (path, opts) => {
+      if (typeof path === "string" && path.startsWith("/api/capabilities")) {
+        // A realistic caps shape (incl. the always-present `auth` object) so the
+        // whole gateCapabilities() tail — applyAuthGate/updateSrvNote — runs as it
+        // would against the real backend, not just the extension_views read.
+        return Promise.resolve(new Response(
+          JSON.stringify({
+            monitor: true,
+            auth: { password_set: false, auth_kind: "token" },
+            extension_views: [{ id: "gated", label: "Gated View", script: modURL("__extgate") }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ));
+      }
+      return realFetch(path, opts);
     };
-    degraded.remove();
-    return result;
+    await gateCapabilities();
+    window.fetch = realFetch;
+    const gatedFromCaps = extViews.length === 1 && extViews[0].id === "gated";
+    const gatedNav = !!document.querySelector('.nav-item[data-route="ext-gated"]');
+
+    // 1) Advertise one view and sync the nav (mirrors gateCapabilities).
+    const script = modURL("__ext1");
+    capsCache = { ...capsCache, extension_views: [{ id: "demo", label: "Demo View", script }] };
+    extViews = capsCache.extension_views;
+    window.__ext1 = undefined;
+    syncExtNav();
+    const navItem = document.querySelector('.nav-item[data-route="ext-demo"]');
+    const navText = navItem ? navItem.textContent.trim() : null;
+    const known = isKnownRoute("ext-demo");
+
+    // 2) Navigate → the module mounts and render() runs with apiBase + api.
+    navigate("ext-demo");
+    await sleep(400);
+    const onRoute = location.pathname === "/ext-demo";
+    const mount = document.querySelector(".ext-view-mount");
+    const mountedText = mount ? mount.textContent : "";
+    const rendered = window.__ext1;
+    const navActive = navItem ? navItem.classList.contains("active") : false;
+
+    // 3) Server switch → the nav item is dropped and the now-unknown ext route
+    //    redirects to overview (unmount across a switch).
+    serverGen++;
+    extViews = [];
+    capsCache = { ...capsCache, extension_views: [] };
+    syncExtNav();
+    const navGone = !document.querySelector('.nav-item[data-route="ext-demo"]');
+    const redirected = routeFromLocation() === "overview";
+
+    // 4) Mid-import staleness: start a render, bump serverGen synchronously
+    //    (before the dynamic import resolves), and assert render() never runs.
+    extViews = [{ id: "demo2", label: "Demo Two", script: modURL("__ext2") }];
+    window.__ext2 = undefined;
+    const p = renderExtensionView(extViews[0]); // captures gen synchronously
+    serverGen++;                                // switch before the import settles
+    await p;
+    const staleAborted = window.__ext2 === undefined;
+
+    // Restore the console's REAL capabilities (the stock binary ships no provider,
+    // so this clears the stubbed ext nav) and leave the UI on a known-good route
+    // for the final no-errors assertion.
+    await gateCapabilities();
+    navigate("overview");
+    return { gatedFromCaps, gatedNav, navText, known, onRoute, mounted: !!mount, mountedText, rendered, navActive, navGone, redirected, staleAborted };
   });
-  fxGuide.noSourcePrompt ? ok("forensics: no-source state shows the setup prompt") : bad("forensics: no-source state shows the setup prompt", "prompt text missing");
-  fxGuide.fullyCapableNoGuide ? ok("forensics: fully-capable source renders no guide panel") : bad("forensics: fully-capable source renders no guide panel", "guide rendered with no recommendations");
-  fxGuide.degradedHasGuide ? ok("forensics: degraded capabilities render the setup-guide panel") : bad("forensics: degraded capabilities render the setup-guide panel", "no .fx-guide");
-  fxGuide.guideCollapsedByDefault ? ok("forensics: setup guide is collapsed by default") : bad("forensics: setup guide is collapsed by default", "rendered expanded");
-  fxGuide.guideExpandsOnClick ? ok("forensics: setup guide expands on toggle click") : bad("forensics: setup guide expands on toggle click", "stayed collapsed");
-  fxGuide.hasPriorityBadge ? ok("forensics: recommendation shows its priority badge") : bad("forensics: recommendation shows its priority badge", "no .fx-priority-high");
-  fxGuide.hasRuntimeSqlBlock ? ok("forensics: runtime SQL snippet renders") : bad("forensics: runtime SQL snippet renders", "missing runtime SQL text");
-  fxGuide.hasMycnfBlock ? ok("forensics: my.cnf snippet renders") : bad("forensics: my.cnf snippet renders", "missing my.cnf text");
-  fxGuide.hasCopyButton ? ok("forensics: copy-to-clipboard button renders") : bad("forensics: copy-to-clipboard button renders", "no Copy button");
+  extv.gatedFromCaps ? ok("ext-view: gateCapabilities populates extViews from /api/capabilities.extension_views") : bad("ext-view: gateCapabilities populates extViews from /api/capabilities.extension_views", "extViews not set from the parsed caps response");
+  extv.gatedNav ? ok("ext-view: gateCapabilities injects the nav item from the fetched caps") : bad("ext-view: gateCapabilities injects the nav item from the fetched caps", "no ext-gated nav item after gateCapabilities");
+  extv.navText === "Demo View" ? ok("ext-view: nav item injected with the provider label") : bad("ext-view: nav item injected with the provider label", `navText=${extv.navText}`);
+  extv.known ? ok("ext-view: isKnownRoute accepts a live ext-<id> route") : bad("ext-view: isKnownRoute accepts a live ext-<id> route", "ext-demo not known");
+  extv.onRoute ? ok("ext-view: navigate routes to /ext-<id>") : bad("ext-view: navigate routes to /ext-<id>", "wrong route");
+  extv.mounted ? ok("ext-view: a mount node is created") : bad("ext-view: a mount node is created", "no .ext-view-mount");
+  extv.rendered ? ok("ext-view: the module render() runs with {apiBase, api}") : bad("ext-view: the module render() runs with {apiBase, api}", `rendered=${extv.rendered}`);
+  /ext-content/.test(extv.mountedText) ? ok("ext-view: module content lands in the mount") : bad("ext-view: module content lands in the mount", `mountedText=${extv.mountedText}`);
+  extv.navActive ? ok("ext-view: the nav item is marked active on its route") : bad("ext-view: the nav item is marked active on its route", "not .active");
+  extv.navGone ? ok("ext-view: server switch removes the ext nav item (idempotent)") : bad("ext-view: server switch removes the ext nav item (idempotent)", "stale nav item remained");
+  extv.redirected ? ok("ext-view: an ext route the new server lacks redirects to overview") : bad("ext-view: an ext route the new server lacks redirects to overview", "did not redirect");
+  extv.staleAborted ? ok("ext-view: a server switch mid-import abandons the render (serverGen staleness)") : bad("ext-view: a server switch mid-import abandons the render (serverGen staleness)", "render ran after the switch");
+
 
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));

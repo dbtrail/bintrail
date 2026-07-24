@@ -1,0 +1,196 @@
+package console
+
+import (
+	"log/slog"
+	"net/http"
+	"strings"
+
+	"github.com/dbtrail/dbtrail/ext"
+)
+
+// This file is the per-session authorization layer (issue #1074). It is inert in
+// the OSS build: the built-in credentials mint policy-less (nil) sessions, and a
+// nil policy is full access — so authzMiddleware waves every request through and
+// the reported permission set is complete. Only an EE build that attaches an
+// ext.AccessPolicy to a session (via the session-issuer seam) makes any of this
+// bite. Enforcement is by PERMISSION, never by role: the core has no role
+// vocabulary; an embedding build maps its roles onto these permission strings.
+
+// permAny marks a route that any authenticated session may call regardless of
+// its policy — the capabilities oracle the SPA needs to gate its own UI, and the
+// session's own auth self-management (logout, change-password). It is the empty
+// permission on purpose: a route MUST be listed either with a real permission or
+// with permAny, never omitted (an omitted route is refused for policy sessions —
+// see authzMiddleware).
+const permAny ext.Permission = ""
+
+// routePerm binds one authenticated /api route to the permission it requires.
+// method is the HTTP method; pattern is the route's path with "{}" standing in
+// for a single path segment (an id). Matching is segment-based with an exact
+// segment-count requirement, so a pattern with a placeholder can never match a
+// path of a different depth — a sibling route never silently inherits a parent's
+// permission via prefix matching.
+type routePerm struct {
+	method  string
+	pattern string
+	perm    ext.Permission
+}
+
+// apiRoutePerms is the authoritative route→permission table, consulted on every
+// policy-carrying /api request. ORDER MATTERS: matching is first-match-wins, so
+// a route with a literal segment where another has a placeholder must be listed
+// FIRST (e.g. POST /api/servers/test before a hypothetical POST /api/servers/{}).
+// TestRouteTableCompleteness pins that every registered /api route appears here;
+// TestRoutePermFirstMatchWins pins the ordering invariant. The /api/ext/ subtree
+// is NOT here — it is matched by prefix in permForRoute (its depth is unbounded).
+//
+// Permission tiers (an EE build's roles map onto these): status:read and
+// servers:read are the read-only floor; query/reconstruct read data; recover and
+// baseline are operator actions; servers:write/delete and settings:read are the
+// administrative surface.
+var apiRoutePerms = []routePerm{
+	// Status + data reads.
+	{"GET", "/api/status", ext.PermStatusRead},
+	{"GET", "/api/events", ext.PermQueryExecute},
+	{"GET", "/api/schemas", ext.PermQueryExecute},
+	{"GET", "/api/reconstruct", ext.PermReconstructExecute},
+
+	// Recovery (reversal-SQL generation; never executes).
+	{"POST", "/api/recover", ext.PermRecoverExecute},
+	{"POST", "/api/recover-cascade", ext.PermRecoverExecute},
+
+	// Operator maintenance actions on a specific server. verify has no dedicated
+	// permission; it is an operator integrity action, tiered with baseline:create.
+	{"POST", "/api/servers/{}/baseline", ext.PermBaselineCreate},
+	{"POST", "/api/servers/{}/verify", ext.PermBaselineCreate},
+
+	// Server registry + control-plane. List/get/status/verify-read and the
+	// write-free test probe are reads; create/update/delete/monitor are writes.
+	// Literal-segment routes precede the {} ones at the same depth.
+	{"POST", "/api/servers/test", ext.PermServersRead},
+	{"GET", "/api/servers/{}/monitor", ext.PermServersRead},
+	{"POST", "/api/servers/{}/monitor/start", ext.PermServersWrite},
+	{"POST", "/api/servers/{}/monitor/stop", ext.PermServersWrite},
+	{"GET", "/api/servers/{}/baseline", ext.PermServersRead},
+	{"GET", "/api/servers/{}/verify", ext.PermServersRead},
+	{"GET", "/api/servers/{}/verify/explain", ext.PermServersRead},
+	{"POST", "/api/servers/{}/test", ext.PermServersRead},
+	{"GET", "/api/servers/{}", ext.PermServersRead},
+	{"PUT", "/api/servers/{}", ext.PermServersWrite},
+	{"DELETE", "/api/servers/{}", ext.PermServersDelete},
+	{"GET", "/api/servers", ext.PermServersRead},
+	{"POST", "/api/servers", ext.PermServersWrite},
+
+	// Settings / administration. rotation PUT is a control-plane config write;
+	// the storage/baseline listings, telemetry opt-out, and managed MCP token are
+	// the settings surface.
+	{"GET", "/api/rotation", ext.PermSettingsRead},
+	{"PUT", "/api/rotation", ext.PermServersWrite},
+	{"GET", "/api/baselines", ext.PermSettingsRead},
+	{"GET", "/api/storage", ext.PermSettingsRead},
+	{"GET", "/api/telemetry", ext.PermSettingsRead},
+	{"POST", "/api/telemetry", ext.PermSettingsRead},
+	{"GET", "/api/mcp-token", ext.PermSettingsRead},
+	{"POST", "/api/mcp-token", ext.PermSettingsRead},
+	{"DELETE", "/api/mcp-token", ext.PermSettingsRead},
+
+	// The capabilities oracle and the session's own auth self-management: any
+	// authenticated session, regardless of policy.
+	{"GET", "/api/capabilities", permAny},
+	{"POST", "/api/auth/logout", permAny},
+	{"POST", "/api/auth/password", permAny},
+}
+
+// extAPIPrefix is the mount prefix for an installed extension view's data routes
+// (see ext.ConsoleViewProvider). The whole subtree requires PermExtViewRead; its
+// depth is unbounded, so it is matched by prefix rather than an apiRoutePerms
+// row. rbacViewGuard additionally refuses it under an active data profile.
+const extAPIPrefix = "/api/ext/"
+
+// permForRoute returns the permission a (method, path) requires and whether the
+// route is classified at all. An unclassified route (classified=false) is a
+// programming error — every registered /api route must appear in apiRoutePerms
+// or under the ext prefix — and authzMiddleware fails it CLOSED for a policy
+// session rather than granting it.
+func permForRoute(method, path string) (perm ext.Permission, classified bool) {
+	if strings.HasPrefix(path, extAPIPrefix) {
+		return ext.PermExtViewRead, true
+	}
+	segs := strings.Split(strings.Trim(path, "/"), "/")
+	for _, rp := range apiRoutePerms {
+		if rp.method == method && segmentsMatch(rp.pattern, segs) {
+			return rp.perm, true
+		}
+	}
+	return permAny, false
+}
+
+// segmentsMatch reports whether path segments segs match a pattern, where a "{}"
+// pattern segment matches any single non-empty segment and every other segment
+// must be equal. The segment counts must be identical — the exact-depth rule that
+// stops a placeholder pattern from matching a longer or shorter sibling path.
+func segmentsMatch(pattern string, segs []string) bool {
+	ps := strings.Split(strings.Trim(pattern, "/"), "/")
+	if len(ps) != len(segs) {
+		return false
+	}
+	for i, p := range ps {
+		if p == "{}" {
+			if segs[i] == "" {
+				return false
+			}
+			continue
+		}
+		if p != segs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// authzMiddleware enforces the session's access policy on every wrapped /api
+// request. It runs INSIDE tokenMiddleware, so the request is already
+// authenticated and any policy is already on the context.
+//
+//   - No policy (nil) → full access: the static token, the password login, and
+//     every OSS session land here, so OSS behavior is unchanged.
+//   - A policy-carrying session → the route's permission is looked up; a route
+//     with no classification is refused (fail closed), a permAny route is always
+//     allowed, and otherwise the policy must grant the permission or the request
+//     gets a 403 that names the missing permission (never a silent empty result).
+func (s *Server) authzMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pol := policyFrom(r.Context())
+		if pol == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		perm, classified := permForRoute(r.Method, r.URL.Path)
+		if !classified {
+			// Every /api route must be classified; an omission must not silently
+			// grant a scoped session access it was never evaluated for.
+			slog.Error("console: unclassified /api route refused for a scoped session (fail closed)", "method", r.Method, "path", r.URL.Path)
+			writeJSONError(w, http.StatusForbidden, "forbidden: this route has no authorization policy")
+			return
+		}
+		if perm == permAny || pol.Allows(perm) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		slog.Warn("console: request denied by session policy", "method", r.Method, "path", r.URL.Path, "missing_permission", string(perm))
+		writeJSONError(w, http.StatusForbidden, "forbidden: your role lacks the "+string(perm)+" permission")
+	})
+}
+
+// permissionsForPolicy reports the session's effective grant of every permission
+// the core defines, for the SPA to gate its UI. A nil policy (OSS, or any
+// full-access session) grants everything, so the map is all-true and the UI hides
+// nothing — the same UI the console has always shown.
+func permissionsForPolicy(pol *ext.AccessPolicy) map[string]bool {
+	perms := ext.AllPermissions()
+	m := make(map[string]bool, len(perms))
+	for _, p := range perms {
+		m[string(p)] = pol.Allows(p)
+	}
+	return m
+}

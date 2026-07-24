@@ -16,20 +16,15 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/dbtrail/dbtrail/internal/forensics"
+	"github.com/dbtrail/dbtrail/ext"
 )
 
 // ─── dispatch tests ──────────────────────────────────────────────────────────
 
 type stubHandler struct {
-	resolvePK    func(context.Context, ResolvePKRequest) ([]PKResult, error)
-	recover      func(context.Context, RecoverRequest) (string, error)
-	forensics    func(context.Context, ForensicsQueryRequest) (*ForensicsResult, error)
-	capabilities func(context.Context) (forensics.Capabilities, error)
-	enrich       func(context.Context, ForensicsEnrichRequest) (forensics.EnrichResult, error)
-	activity     func(context.Context, ForensicsActivityRequest) (forensics.ActivityResult, error)
-	users        func(context.Context) (ForensicsUsersResult, error)
-	auditLog     func(context.Context, ForensicsAuditLogRequest) (forensics.AuditReadResult, error)
+	resolvePK func(context.Context, ResolvePKRequest) ([]PKResult, error)
+	recover   func(context.Context, RecoverRequest) (string, error)
+	forensics func(context.Context, ForensicsQueryRequest) (*ForensicsResult, error)
 }
 
 func (s *stubHandler) HandleResolvePK(ctx context.Context, req ResolvePKRequest) ([]PKResult, error) {
@@ -41,21 +36,6 @@ func (s *stubHandler) HandleRecover(ctx context.Context, req RecoverRequest) (st
 func (s *stubHandler) HandleForensicsQuery(ctx context.Context, req ForensicsQueryRequest) (*ForensicsResult, error) {
 	return s.forensics(ctx, req)
 }
-func (s *stubHandler) HandleForensicsCapabilities(ctx context.Context) (forensics.Capabilities, error) {
-	return s.capabilities(ctx)
-}
-func (s *stubHandler) HandleForensicsEnrich(ctx context.Context, req ForensicsEnrichRequest) (forensics.EnrichResult, error) {
-	return s.enrich(ctx, req)
-}
-func (s *stubHandler) HandleForensicsActivity(ctx context.Context, req ForensicsActivityRequest) (forensics.ActivityResult, error) {
-	return s.activity(ctx, req)
-}
-func (s *stubHandler) HandleForensicsUsers(ctx context.Context) (ForensicsUsersResult, error) {
-	return s.users(ctx)
-}
-func (s *stubHandler) HandleForensicsAuditLog(ctx context.Context, req ForensicsAuditLogRequest) (forensics.AuditReadResult, error) {
-	return s.auditLog(ctx, req)
-}
 
 func TestDispatch_resolvePK(t *testing.T) {
 	h := &stubHandler{
@@ -66,7 +46,7 @@ func TestDispatch_resolvePK(t *testing.T) {
 	data, _ := json.Marshal(ResolvePKRequest{Items: []PKItem{{PKHash: "abc", Schema: "db", Table: "t"}}})
 	cmd := Command{ID: "1", Type: "resolve_pk", Data: data}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if resp.ID != "1" {
 		t.Errorf("ID = %q, want %q", resp.ID, "1")
@@ -92,7 +72,7 @@ func TestDispatch_recover(t *testing.T) {
 	data, _ := json.Marshal(RecoverRequest{Schema: "db", Table: "t", TimeStart: time.Now(), TimeEnd: time.Now()})
 	cmd := Command{ID: "2", Type: "recover", Data: data}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -111,7 +91,7 @@ func TestDispatch_forensicsQuery(t *testing.T) {
 	data, _ := json.Marshal(ForensicsQueryRequest{Query: "recent_queries"})
 	cmd := Command{ID: "3", Type: "forensics_query", Data: data}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if resp.Error != "" {
 		t.Fatalf("unexpected error: %s", resp.Error)
@@ -122,7 +102,7 @@ func TestDispatch_unknownType(t *testing.T) {
 	h := &stubHandler{}
 	cmd := Command{ID: "4", Type: "nope", Data: json.RawMessage(`{}`)}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if !strings.Contains(resp.Error, "unknown command type") {
 		t.Errorf("error = %q, want 'unknown command type'", resp.Error)
@@ -133,7 +113,7 @@ func TestDispatch_invalidPayload(t *testing.T) {
 	h := &stubHandler{}
 	cmd := Command{ID: "5", Type: "resolve_pk", Data: json.RawMessage(`{invalid`)}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if !strings.Contains(resp.Error, "invalid resolve_pk payload") {
 		t.Errorf("error = %q, want 'invalid resolve_pk payload'", resp.Error)
@@ -521,7 +501,7 @@ func TestDispatch_handlerError(t *testing.T) {
 	data, _ := json.Marshal(ResolvePKRequest{Items: []PKItem{{PKHash: "abc", Schema: "db", Table: "t"}}})
 	cmd := Command{ID: "err-1", Type: "resolve_pk", Data: data}
 
-	resp := dispatch(context.Background(), h, cmd)
+	resp := dispatch(context.Background(), h, cmd, ext.AgentDeps{})
 
 	if resp.ID != "err-1" {
 		t.Errorf("ID = %q, want %q", resp.ID, "err-1")

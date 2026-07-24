@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/streamdeps"
 	"github.com/dbtrail/dbtrail/internal/streamrun"
 )
@@ -35,6 +36,10 @@ Use --reset to clear the saved checkpoint and force a new start position:
   bintrail stream --reset --start-file mysql-bin.000500 ...
 
 Without --reset, the checkpoint always wins (idempotent behavior is preserved).
+Resetting to any position other than the saved checkpoint — later or earlier;
+direction is not inferred — permanently skips every event between the discarded
+checkpoint and the new start position, and the skipped range is durably
+recorded as lost (surfaced by 'bintrail status' and its --fail-on-gap flag).
 
 Gap detection: on restart, bintrail checks whether the source still has the
 binlogs needed to resume from the checkpoint. If binlogs have been purged, it
@@ -87,14 +92,15 @@ func init() {
 	streamCmd.Flags().IntVar(&strmCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
 	streamCmd.Flags().StringVar(&strmMetricsAddr, "metrics-addr", "", "Address to expose Prometheus metrics (e.g. :9090); empty = disabled")
 	streamCmd.Flags().IntVar(&strmMetricsScrapeInterval, "metrics-scrape-interval", 60, "How often (seconds) to refresh the bintrail_index_* gauges from a status snapshot")
-	streamCmd.Flags().StringVar(&strmSSLMode, "ssl-mode", "preferred", "TLS mode: disabled, preferred, required, verify-ca, verify-identity")
+	streamCmd.Flags().StringVar(&strmSSLMode, "ssl-mode", "preferred", "TLS mode for the source AND index connections: disabled, preferred, required, verify-ca, verify-identity")
 	streamCmd.Flags().StringVar(&strmSSLCA, "ssl-ca", "", "Path to CA certificate file for TLS verification (omit to use system CAs)")
 	streamCmd.Flags().StringVar(&strmSSLCert, "ssl-cert", "", "Path to client certificate file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmSSLKey, "ssl-key", "", "Path to client private key file for mutual TLS")
 	streamCmd.Flags().StringVar(&strmFormat, "format", "text", "Output format: text or json")
-	streamCmd.Flags().BoolVar(&strmReset, "reset", false, "Clear saved checkpoint before starting (forces use of --start-file/--start-gtid)")
+	streamCmd.Flags().BoolVar(&strmReset, "reset", false, "Clear saved checkpoint before starting (forces use of --start-file/--start-gtid); the skipped range is recorded as permanently lost")
 	streamCmd.Flags().BoolVar(&strmNoGapFill, "no-gap-fill", false, "Refuse to start if an unfillable binlog gap is detected (instead of auto-advancing past purged data)")
 	streamCmd.Flags().IntVar(&strmGapTimeout, "gap-timeout", 30, "Timeout in seconds for the one-shot gap-detection queries run at startup (SHOW BINARY LOGS plus @@gtid_purged/@@gtid_executed on MySQL or BINLOG_GTID_POS/@@gtid_binlog_pos on MariaDB); raise on managed servers with many binlog files")
+	streamCmd.Flags().DurationVar(&indexer.WriteTimeout, "write-timeout", indexer.DefaultWriteTimeout, "Deadline for each index write (batch INSERT, checkpoint, digest lookup). A mid-statement network stall surfaces as an error within this window instead of freezing the stream on kernel TCP retransmission (~13-16 min). Raise for very large batches over a slow link")
 	_ = streamCmd.MarkFlagRequired("index-dsn")
 	_ = streamCmd.MarkFlagRequired("source-dsn")
 	_ = streamCmd.MarkFlagRequired("server-id")
@@ -142,6 +148,12 @@ func streamConfigFromFlags() streamrun.Config {
 func runStream(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
+
+	// Usage telemetry for a process that may live for months: Init's drain runs
+	// once, at startup, so without this loop a daemon's beacons would spool and
+	// age out undelivered. Own goroutine — never on the replication path. Also
+	// covers `up`, which delegates here.
+	go tel.Client().RunDaemon(ctx, cmd.Name())
 
 	// Graceful shutdown on SIGINT/SIGTERM: cancel the context so streamrun.One
 	// flushes its batch and writes a final checkpoint. (Installed before

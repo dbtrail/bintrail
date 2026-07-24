@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
+	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
@@ -138,13 +140,22 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	}
 	// #775: in position mode this persists the last safe boundary, not the
 	// per-event offset (see checkpointPosition).
+	// mode is in the UPDATE arm for the cross-mode --reset path (#1079): the
+	// reset no longer DELETEs the row, so the mode switch must land through
+	// this upsert. For every other caller mode is invariant across the run.
 	file, pos := checkpointPosition(state)
-	_, err = db.Exec(`
+	// #959: bound the checkpoint write with a deadline (see indexer.WriteTimeout)
+	// so a mid-statement network stall fails fast instead of freezing the daemon
+	// on kernel TCP retransmission — invisible to the supervisor.
+	ctx, cancel := context.WithTimeout(context.Background(), indexer.WriteTimeout)
+	defer cancel()
+	_, err = db.ExecContext(ctx, `
 		INSERT INTO stream_state
 		    (id, mode, binlog_file, binlog_position, gtid_set, flavor,
 		     events_indexed, last_event_time, last_checkpoint, server_id, bintrail_id)
 		VALUES (1, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?, ?)
 		ON DUPLICATE KEY UPDATE
+		    mode            = VALUES(mode),
 		    binlog_file     = VALUES(binlog_file),
 		    binlog_position = VALUES(binlog_position),
 		    gtid_set        = VALUES(gtid_set),
@@ -161,10 +172,14 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 
 // deleteEventsSinceCheckpoint removes rows at or beyond (file, pos) from
 // binlog_events — the resume-time dedup for #759 (see the call site in One).
-// file == "" (no prior checkpoint) is a no-op. The `binlog_file > ?` half of
-// the WHERE clause relies on lexicographic filename ordering matching
-// chronological ordering, which holds for MySQL/MariaDB's default
-// fixed-width zero-padded sequence numbers (e.g. mysql-bin.000001).
+// file == "" (no prior checkpoint) is a no-op. "Later file" is
+// length-then-lexicographic (mirrors buildQuery's UntilPos cut in
+// internal/query/query.go, #840): MySQL pads the numeric suffix to a fixed
+// width, so after mysql-bin.999999 comes mysql-bin.1000000 and plain
+// `binlog_file > ?` would invert — a straight lexicographic compare puts the
+// pre-rollover file "greater" and wrongly deletes already-indexed rows on
+// every resume that straddles a rollover. Equal-length names — the same
+// padded width — keep the plain string comparison as the fast path.
 // binlog_events is partitioned by event_timestamp, not binlog_file, so this
 // is a full scan on every resume.
 func deleteEventsSinceCheckpoint(db *sql.DB, file string, pos uint64) (int64, error) {
@@ -173,8 +188,10 @@ func deleteEventsSinceCheckpoint(db *sql.DB, file string, pos uint64) (int64, er
 	}
 	res, err := db.Exec(`
 		DELETE FROM binlog_events
-		WHERE binlog_file > ? OR (binlog_file = ? AND start_pos >= ?)`,
-		file, file, pos)
+		WHERE (CHAR_LENGTH(binlog_file) > CHAR_LENGTH(?)
+		    OR (CHAR_LENGTH(binlog_file) = CHAR_LENGTH(?) AND binlog_file > ?))
+		    OR (binlog_file = ? AND start_pos >= ?)`,
+		file, file, file, file, pos)
 	if err != nil {
 		return 0, fmt.Errorf("delete events since checkpoint %s:%d: %w", file, pos, err)
 	}
@@ -260,7 +277,8 @@ func deleteEventsSinceCheckpointGTID(db *sql.DB, file string, pos uint64, savedS
 // loud; a failed stamp aborts startup with the OLD checkpoint intact, so the gap
 // is re-detected and re-recorded on the next start. saveCheckpoint's upsert does
 // not touch the gap_lost_* columns, so the stamp survives it. Cleared by an
-// explicit monitor Stop or --reset.
+// explicit monitor Stop; a jumping --reset re-stamps it with the discarded
+// range (#1079) and a same-position --reset leaves it intact.
 func persistGapAutoAdvance(db *sql.DB, advanced *streamState, gapMessage string) error {
 	if _, err := db.Exec(`UPDATE stream_state
 		SET gap_lost_at = UTC_TIMESTAMP(), gap_lost_detail = ?
@@ -271,6 +289,76 @@ func persistGapAutoAdvance(db *sql.DB, advanced *streamState, gapMessage string)
 		return fmt.Errorf("failed to save advanced checkpoint: %w", err)
 	}
 	return nil
+}
+
+// resetJumpDetail classifies a --reset checkpoint discard. It returns
+// noop=true when the new start position equals the discarded checkpoint —
+// nothing was skipped. Otherwise it returns a human-readable description of
+// the jumped-over range, suitable for gap_lost_detail. The check is
+// deliberately conservative in three ways: cross-mode discards (position→gtid
+// or the reverse) have no comparable coordinates and are treated as a jump;
+// direction is not inferred, so a reset to an EARLIER position also records a
+// loss verdict; and equality is coordinates-only — after a source rebuild
+// (RESET MASTER + restore) the same coordinates can name a different history,
+// which no checkpoint comparison can see. GTID sets are compared structurally
+// with the parser for flavor (MySQL UUID sets vs MariaDB domain-server-seq),
+// so formatting differences never fake a jump on either flavor.
+func resetJumpDetail(old *streamState, flavor, mode, file string, pos uint32, gtidSet string) (noop bool, detail string) {
+	switch {
+	case old.mode == "position" && mode == "position":
+		if old.binlogFile == file && old.binlogPos == uint64(pos) {
+			return true, ""
+		}
+	case old.mode == "gtid" && mode == "gtid":
+		equal := gtidSetsEqual
+		if flavor == gomysql.MariaDBFlavor {
+			equal = mariadbGTIDSetsEqual
+		}
+		if equal(old.gtidSet, gtidSet) {
+			return true, ""
+		}
+	}
+	return false, fmt.Sprintf(
+		"checkpoint discarded via --reset: was %s, restarting at %s; events in between were skipped and are permanently lost",
+		describeCheckpoint(old.mode, old.binlogFile, old.binlogPos, old.gtidSet),
+		describeCheckpoint(mode, file, uint64(pos), gtidSet))
+}
+
+// persistResetDiscard durably persists a --reset checkpoint discard once the
+// new start position is resolved. A jump is recorded exactly like an
+// unfillable-gap auto-advance: gap_lost stamp FIRST, then the fresh
+// checkpoint (the #402 ordering invariant, via persistGapAutoAdvance),
+// user-visible output and the supervisor hook only after the record is
+// durable. A no-op discard skipped nothing, so only the fresh checkpoint is
+// written and any prior gap_lost record is left untouched; a jump replaces a
+// prior record's detail with the reset detail (the loss flag itself never
+// clears here — monitor Stop remains the acknowledgment path).
+func persistResetDiscard(db *sql.DB, fresh *streamState, noop bool, detail string, hooks *Hooks) error {
+	if noop {
+		if err := saveCheckpoint(db, fresh); err != nil {
+			return fmt.Errorf("failed to persist reset checkpoint: %w", err)
+		}
+		slog.Info("--reset discarded a checkpoint at the same position; nothing was skipped")
+		return nil
+	}
+	slog.Warn("--reset is skipping binlog history", "detail", detail)
+	if err := persistGapAutoAdvance(db, fresh, detail); err != nil {
+		return err
+	}
+	fmt.Printf("Reset: %s\n", detail)
+	if hooks != nil && hooks.OnGapAutoAdvance != nil {
+		hooks.OnGapAutoAdvance(detail)
+	}
+	return nil
+}
+
+// describeCheckpoint renders a checkpoint's coordinates for human-readable
+// loss records: "file:pos" in position mode, "gtid_set <set>" in GTID mode.
+func describeCheckpoint(mode, file string, pos uint64, gtidSet string) string {
+	if mode == "gtid" {
+		return fmt.Sprintf("gtid_set %s", gtidSet)
+	}
+	return fmt.Sprintf("%s:%d", file, pos)
 }
 
 // ─── TLS configuration ───────────────────────────────────────────────────────────────
@@ -342,6 +430,91 @@ func buildTLSConfig(mode, ca, cert, key, serverName string) (*tls.Config, error)
 	}
 
 	return cfg, nil
+}
+
+// connectHelper opens an index or source helper connection (config.ConnectWithTLS)
+// honoring --ssl-mode, mirroring the binlog syncer's TLS via the same
+// buildTLSConfig. These connections carry full row images (PII) and credentials,
+// so --ssl-mode must protect them too — not only the replication stream (#946).
+// label names the connection in log/error messages.
+//
+// Under "preferred" it does the SAME explicit two-step as the syncer: try TLS,
+// and only if the server genuinely lacks TLS log a loud warning and retry in
+// cleartext — never the driver's OWN silent AllowFallbackToPlaintext, so every
+// connection that may send data unencrypted warns identically. required/verify-*
+// never retry: a TLS-incapable server fails closed with an actionable hint.
+func connectHelper(dsn, label, mode, ca, cert, key string) (*sql.DB, error) {
+	tlsCfg, err := buildTLSConfig(mode, ca, cert, key, config.DSNHost(dsn))
+	if err != nil {
+		return nil, err
+	}
+	// A tls= in the DSN wins (operator override) — but under a mandatory
+	// --ssl-mode that override can silently WEAKEN the connection (e.g. a stale
+	// tls=skip-verify under --ssl-mode=verify-identity → encrypted but
+	// unauthenticated). Surface the precedence so it is a conscious choice. The
+	// message stays neutral: the DSN's own tls= may also be *stronger* than the
+	// mode, and we can't tell which here (#946).
+	if tlsHint(mode) != "" && config.DSNHasExplicitTLS(dsn) {
+		slog.Warn("this connection's DSN sets its own tls= parameter, which takes "+
+			"precedence over --ssl-mode; verify it meets your security requirement",
+			"connection", label, "ssl_mode", mode)
+	}
+
+	db, err := config.ConnectWithTLS(dsn, tlsCfg)
+	if err == nil {
+		return db, nil
+	}
+	// preferred: retry in cleartext ONLY when the server genuinely lacks TLS, and
+	// log it loudly (never the driver's silent AllowFallbackToPlaintext). An
+	// explicit tls= in the DSN survives this nil retry (applyTLS keeps it), so the
+	// retry re-attempts the same config and fails closed rather than downgrading.
+	if mode == "preferred" && isTLSUnsupportedError(err) {
+		slog.Warn("server does not support TLS; connecting WITHOUT encryption "+
+			"(--ssl-mode preferred) — credentials and data will be sent in cleartext",
+			"connection", label, "error", err)
+		db, err = config.ConnectWithTLS(dsn, nil)
+		if err != nil {
+			return nil, fmt.Errorf("connect %s (cleartext retry): %w", label, err)
+		}
+		return db, nil
+	}
+	return nil, fmt.Errorf("connect %s%s: %w", label, tlsHint(mode), err)
+}
+
+// tlsHint returns a parenthetical remediation appended to a helper-connection
+// error when --ssl-mode mandates TLS, so a server that lacks TLS fails with an
+// actionable message instead of a bare handshake error (#946).
+func tlsHint(mode string) string {
+	switch mode {
+	case "required", "verify-ca", "verify-identity":
+		return fmt.Sprintf(" (--ssl-mode=%s requires TLS; enable TLS on the server, "+
+			"or use --ssl-mode=preferred to fall back to an unencrypted connection)", mode)
+	default:
+		return ""
+	}
+}
+
+// isTLSUnsupportedError reports whether err means the server does not support
+// TLS at all — the ONLY condition under which --ssl-mode=preferred may retry in
+// cleartext. The go-sql-driver helper connections return the sentinel
+// drivermysql.ErrNoTLS; the go-mysql binlog syncer returns a fixed message when
+// the server omits the CLIENT_SSL capability (client/auth.go); a mid-handshake
+// plaintext reply surfaces as tls.RecordHeaderError. Every other failure (auth
+// denied, unreachable host, bad binlog position) must NOT trigger a downgrade,
+// or credentials and data would be resent unencrypted on an unrelated error
+// (#947).
+func isTLSUnsupportedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, drivermysql.ErrNoTLS) {
+		return true
+	}
+	var rhe tls.RecordHeaderError
+	if errors.As(err, &rhe) {
+		return true
+	}
+	return strings.Contains(err.Error(), "the MySQL Server does not support TLS")
 }
 
 // ─── Start position resolution ───────────────────────────────────────────────
@@ -504,6 +677,30 @@ func resolveStartForFlavor(
 				return "", "", "", 0, nil, fmt.Errorf("invalid saved gtid_set %q: %w", saved.gtidSet, parseErr)
 			}
 			return "gtid", "", normalized, 0, gs, nil
+		}
+		// stream_state.binlog_position is BIGINT UNSIGNED but COM_BINLOG_DUMP
+		// carries the offset as uint32, so a checkpoint past 4GiB (a single
+		// transaction larger than max_binlog_size delays rotation until commit)
+		// cannot be addressed in position mode. Casting would silently wrap to
+		// an arbitrary earlier offset and re-index history; fail loud instead.
+		//
+		// NOTE (#845): every current writer of binlogPos derives it from
+		// replication.EventHeader.LogPos, itself a uint32 wire field, so
+		// saved.binlogPos can in practice never exceed math.MaxUint32 through
+		// this codebase's own capture path — the wraparound happens upstream,
+		// at the source, before this value is ever read here. The guard that
+		// actually catches the wrap is in parser.StreamParser.Run
+		// (internal/parser/stream.go): it detects a same-file LogPos going
+		// backward with no intervening RotateEvent and fails loud LIVE, during
+		// streaming, before a corrupt checkpoint can ever be persisted. This
+		// check is kept as cheap defensive insurance (a hand-edited
+		// stream_state row, or a future writer that stops deriving from
+		// LogPos) — it must not be relied on as the primary fix.
+		if saved.binlogPos > math.MaxUint32 {
+			return "", "", "", 0, nil, fmt.Errorf(
+				"saved binlog position %d in %q exceeds 4GiB, the COM_BINLOG_DUMP protocol limit for position-mode resume; "+
+					"switch to GTID mode, which has no such limit: pass --start-gtid with the source's current executed GTID set (%s)",
+				saved.binlogPos, saved.binlogFile, parser.GTIDExecutedHint(flavor))
 		}
 		slog.Info("resuming from position", "file", saved.binlogFile, "pos", saved.binlogPos)
 		return "position", saved.binlogFile, "", uint32(saved.binlogPos), nil, nil
@@ -1403,6 +1600,12 @@ func One(ctx context.Context, cfg Config) error {
 	if cfg.GapTimeout <= 0 {
 		return fmt.Errorf("invalid --gap-timeout %d: must be a positive number of seconds", cfg.GapTimeout)
 	}
+	// A non-positive --write-timeout would make every index write's
+	// context.WithTimeout fire immediately, turning each write into an instant
+	// failure instead of bounding a genuine stall (#959).
+	if indexer.WriteTimeout <= 0 {
+		return fmt.Errorf("invalid --write-timeout %s: must be a positive duration", indexer.WriteTimeout)
+	}
 	// Fail fast on an unwired dependency (named field) before opening any
 	// connection, rather than nil-panicking on first use further down.
 	if err := cfg.Deps.validate(); err != nil {
@@ -1425,9 +1628,12 @@ func One(ctx context.Context, cfg Config) error {
 	defer cancel()
 
 	// ── 1. Connect to index database ─────────────────────────────────────────
-	indexDB, err := config.Connect(cfg.IndexDSN)
+	// #946: the index write connection carries full row images (PII) and the
+	// index credentials, so --ssl-mode must encrypt it too — not only the binlog
+	// syncer.
+	indexDB, err := connectHelper(cfg.IndexDSN, "index database", cfg.SSLMode, cfg.SSLCA, cfg.SSLCert, cfg.SSLKey)
 	if err != nil {
-		return fmt.Errorf("failed to connect to index database: %w", err)
+		return err
 	}
 	defer indexDB.Close()
 
@@ -1436,9 +1642,11 @@ func One(ctx context.Context, cfg Config) error {
 	}
 
 	// ── 2. Connect to source database: validate binlog_row_image ─────────────
-	sourceDB, err := config.Connect(cfg.SourceDSN)
+	// #946: same --ssl-mode TLS for the source helper connection (schema reads +
+	// source credentials) as for the binlog syncer built below.
+	sourceDB, err := connectHelper(cfg.SourceDSN, "source MySQL", cfg.SSLMode, cfg.SSLCA, cfg.SSLCert, cfg.SSLKey)
 	if err != nil {
-		return fmt.Errorf("failed to connect to source MySQL: %w", err)
+		return err
 	}
 	defer sourceDB.Close()
 
@@ -1502,12 +1710,17 @@ func One(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("failed to load stream state: %w", err)
 	}
 
+	// --reset discards the saved checkpoint so start resolution runs as a
+	// first run. The old state is kept aside instead of DELETEd here (#1079):
+	// the discard is persisted only after the new start position is known, so
+	// the jumped-over binlog range can be stamped as lost FIRST — and a
+	// startup failure in between leaves the old checkpoint (and any prior
+	// gap_lost record) intact.
+	var resetDiscarded *streamState
 	if cfg.Reset {
 		if saved != nil {
-			if _, err := indexDB.Exec(`DELETE FROM stream_state WHERE id = 1`); err != nil {
-				return fmt.Errorf("failed to reset stream state: %w", err)
-			}
-			slog.Warn("cleared saved checkpoint (--reset)", "old_mode", saved.mode,
+			resetDiscarded = saved
+			slog.Warn("discarding saved checkpoint (--reset)", "old_mode", saved.mode,
 				"old_file", saved.binlogFile, "old_pos", saved.binlogPos)
 			saved = nil
 		} else {
@@ -1526,6 +1739,30 @@ func One(ctx context.Context, cfg Config) error {
 	if saved == nil && cfg.StartFile == "" && cfg.StartGTID == "" && mode == "position" {
 		slog.Info("auto-discovered current binlog position", "file", startFile, "pos", startPos)
 		fmt.Printf("Start position: auto-discovered %s:%d ✓\n", startFile, startPos)
+	}
+
+	// Persist the --reset discard now that the new start position is known
+	// (#1079) — see persistResetDiscard for the jump/no-op semantics. The
+	// counters restart with the stream: the in-memory streaming state below
+	// starts from zero when saved is nil, so eventsIndexed/lastEventTime are
+	// deliberately NOT carried from the discarded checkpoint (the first
+	// checkpoint tick would overwrite a carried value anyway).
+	if resetDiscarded != nil {
+		fresh := &streamState{
+			mode:       mode,
+			binlogFile: startFile,
+			binlogPos:  uint64(startPos),
+			safeFile:   startFile,
+			safePos:    uint64(startPos),
+			gtidSet:    startGTIDStr,
+			flavor:     cfg.Flavor,
+			serverID:   cfg.ServerID,
+			bintrailID: bintrailID,
+		}
+		noop, detail := resetJumpDetail(resetDiscarded, cfg.Flavor, mode, startFile, startPos, startGTIDStr)
+		if err := persistResetDiscard(indexDB, fresh, noop, detail, cfg.Hooks); err != nil {
+			return err
+		}
 	}
 
 	// ── 6b. Detect binlog gap ────────────────────────────────────────────
@@ -1804,17 +2041,21 @@ func One(ctx context.Context, cfg Config) error {
 
 	// ── 8. Start sync ───────────────────────────────────────────────────────────────
 	streamer, startErr := startStreamer()
-	if startErr != nil && cfg.SSLMode == "preferred" {
-		// preferred: TLS attempt failed — retry without TLS.
-		slog.Warn("initial connection failed; retrying without TLS (--ssl-mode preferred)", "error", startErr)
+	if startErr != nil && cfg.SSLMode == "preferred" && isTLSUnsupportedError(startErr) {
+		// #947: downgrade to plaintext ONLY when the server genuinely does not
+		// support TLS. Any other failure (auth denied, unreachable host, bad
+		// binlog position) must NOT retry unencrypted — that would resend the
+		// source credentials in the clear on an error unrelated to TLS. This
+		// path DOES transmit credentials unencrypted, so warn loudly.
+		slog.Warn("source does not support TLS; retrying WITHOUT encryption "+
+			"(--ssl-mode preferred) — credentials and data will be sent in cleartext",
+			"error", startErr)
 		syncer.Close()
 		syncerCfg.TLSConfig = nil
 		syncer = replication.NewBinlogSyncer(syncerCfg)
 		streamer, startErr = startStreamer()
-		if startErr != nil {
-			return startErr
-		}
-	} else if startErr != nil {
+	}
+	if startErr != nil {
 		return startErr
 	}
 
@@ -1860,6 +2101,11 @@ func One(ctx context.Context, cfg Config) error {
 
 	// ── 10. StreamParser + its synchronous DDL hook ──────────────────────────
 	sp := parser.NewStreamParser(resolver, filters, nil)
+	// cfg.Flavor is normalized (empty→"mysql") by this point (step 1 above) —
+	// wires the source flavor into the live position-wraparound guard inside
+	// Run (internal/parser/stream.go) so its GTID-mode remediation names the
+	// right system variable (#845).
+	sp.SetFlavor(cfg.Flavor)
 	idx := indexer.New(indexDB, cfg.BatchSize)
 
 	// ── 11. DDL auto-snapshot hook — registered BEFORE Run starts so even a

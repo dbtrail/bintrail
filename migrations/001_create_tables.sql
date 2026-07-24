@@ -148,20 +148,16 @@ CREATE TABLE IF NOT EXISTS index_state (
 ) ENGINE=InnoDB;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Forensics: connection identity cache (#703)
--- Persists session identity (user/host/db/program) captured from the source's
--- performance_schema so forensic attribution of a binlog event's connection_id
--- survives disconnects — performance_schema rows vanish the moment a session
--- ends. Populated by the poller in internal/forensics; rows unseen for
--- --attribution-retention (default 24h) are swept hourly.
+-- Snapshot ID allocator (#844)
+-- Dedicated AUTO_INCREMENT counter for schema_snapshots.snapshot_id. InnoDB's
+-- AUTO_INCREMENT allocation is a lightweight, statement-duration lock (not a
+-- row/gap lock held for a transaction's lifetime), so concurrent snapshot
+-- writers (the watch daemon's DDL hook, a manual `bintrail snapshot`, and the
+-- console baseline trigger) allocate distinct ids without ever deadlocking —
+-- unlike an earlier `SELECT MAX(snapshot_id)+1 ... FOR UPDATE` design, which
+-- reliably deadlocked under 3+ concurrent writers. One row is inserted, never
+-- deleted, per snapshot ever allocated; see internal/metadata.DDLSnapshotIDSeq.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS connection_cache (
-    connection_id         BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-    user                  VARCHAR(128),
-    host                  VARCHAR(255),
-    db                    VARCHAR(128),
-    command               VARCHAR(64),
-    connection_attributes JSON,
-    cached_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_seen             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS snapshot_id_seq (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY
 ) ENGINE=InnoDB;

@@ -155,7 +155,7 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1")
 		return
 	}
-	if s.rbacActive() {
+	if s.rbacActiveFor(r) {
 		writeJSONError(w, http.StatusForbidden,
 			"verification isn't available while an access-control profile is active — baseline and live-source reads aren't redacted")
 		return
@@ -201,6 +201,15 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "this server has no source configured; set the source connection first")
 		return
 	}
+	// Live-source verify fingerprints the source with MySQL-only SQL. For a PG
+	// source, baseline-anchored verify (the default) is the supported path; a
+	// live-source request is refused with a clear message, not a misleading
+	// inconclusive (#1009). The engine backstops this in cmd/bintrail-console.
+	if mode == VerifyModeLiveSource && e.IsPostgres() {
+		writeJSONError(w, http.StatusBadRequest,
+			"live-source verify is not supported for PostgreSQL sources; use baseline-anchored (the default) instead")
+		return
+	}
 
 	req := VerifyRequest{
 		ServerID: e.ID, ServerName: e.Name, Mode: mode, Tables: body.Tables,
@@ -242,7 +251,7 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1")
 		return
 	}
-	if s.rbacActive() {
+	if s.rbacActiveFor(r) {
 		writeJSONError(w, http.StatusForbidden,
 			"verification isn't available while an access-control profile is active — baseline reads aren't redacted")
 		return

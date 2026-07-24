@@ -122,18 +122,17 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 		orderedCols = append(orderedCols, cm)
 	}
 
-	// Latest event per PK in (prev snapshot, new anchor] — the same window
-	// VerifyBaselinePair reconstructs the recovery side over.
+	// Latest event per PK in (prev anchor, new anchor] — the same window
+	// VerifyBaselinePair reconstructs the recovery side over (#797: PrevAnchor,
+	// when recorded, replaces the imprecise PrevSnapshot DATETIME lower bound —
+	// see VerifyBaselinePair's comment).
+	pg := cfg.SourceFlavor == flavorPostgres
 	engine := query.New(cfg.IndexDB)
+	// Same window as VerifyBaselinePair (time-bounded, position cut for MySQL
+	// only) so the drill-down sees exactly the rows the verdict's digest saw.
+	fetchOpts := baselineFetchOptions(p, pg)
 	rows, _, err := query.FetchMerged(ctx, cfg.IndexDB, engine, query.FetchMergedOptions{
-		Opts: query.Options{
-			Schema:     p.Schema,
-			Table:      p.Table,
-			Since:      &p.PrevSnapshot,
-			Until:      &p.NewSnapshot,
-			UntilPos:   &p.NewAnchor,
-			LimitPerPK: 1,
-		},
+		Opts:           fetchOpts,
 		DBName:         cfg.IndexDBName,
 		NoArchive:      cfg.NoArchive,
 		ArchiveFetcher: cfg.ArchiveFetcher,
@@ -141,8 +140,11 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 	if err != nil {
 		return nil, fmt.Errorf("fetch changes %s.%s: %w", p.Schema, p.Table, err)
 	}
-	// BLOB/TEXT base64 → real value, epoch-aware (#672). See verify.go's
-	// VerifyTable for the same wiring and its rationale.
+	// The SAME normalization passes VerifyBaselinePair ran before its digest
+	// (ENUM/SET labels #769, BLOB/TEXT base64 #672): without them this
+	// drill-down's row stream would differ from the one the digest hashed and
+	// the diff could disagree with the verdict.
+	reconstruct.MapEventEnumLabels(cfg.IndexDB, cfg.Resolver, p.Schema, p.Table, rows)
 	reconstruct.DecodeEventBinaries(cfg.IndexDB, p.Schema, p.Table, rows)
 	changes := make(map[string]*query.ResultRow, len(rows))
 	for i := range rows {
@@ -151,14 +153,14 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 
 	// Truth side held fully (the new baseline as-is); recovery streamed against it
 	// so only one side is materialized in memory at a time.
-	truth, err := collectRowsByPK(ctx, p.NewPath, p.Schema, p.Table, pkCols, orderedCols, map[string]*query.ResultRow{})
+	truth, err := collectRowsByPK(ctx, p.NewPath, p.Schema, p.Table, pkCols, orderedCols, map[string]*query.ResultRow{}, pg)
 	if err != nil {
 		return nil, fmt.Errorf("read new baseline %s.%s: %w", p.Schema, p.Table, err)
 	}
 
-	ex := &MismatchExplanation{Schema: p.Schema, Table: p.Table, Anchor: fmt.Sprintf("%s:%d", p.NewAnchor.File, p.NewAnchor.Pos)}
+	ex := &MismatchExplanation{Schema: p.Schema, Table: p.Table, Anchor: anchorLabel(pg, p)}
 	seen := make(map[string]bool, len(truth))
-	err = streamRowsByPK(ctx, p.PrevPath, p.Schema, p.Table, pkCols, orderedCols, changes, rows, func(key string, rec rowCells) error {
+	err = streamRowsByPK(ctx, p.PrevPath, p.Schema, p.Table, pkCols, orderedCols, changes, rows, pg, func(key string, rec rowCells) error {
 		seen[key] = true
 		t, ok := truth[key]
 		if !ok {
@@ -213,7 +215,7 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 // the SAME renderCellNormalized reconstructDigest's baseline-anchored callers
 // use, so a row this drill-down shows as differing is exactly a row the digest
 // that flagged the mismatch also saw as differing (cellEqual's invariant).
-func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, emit func(key string, r rowCells) error) error {
+func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, pgTextPK bool, emit func(key string, r rowCells) error) error {
 	return reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
 		BaselinePath: baselinePath,
 		Schema:       schema,
@@ -221,6 +223,7 @@ func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkC
 		PKCols:       pkCols,
 		Changes:      changes,
 		Events:       events,
+		PGTextPK:     pgTextPK,
 	}, func(rowMap map[string]any) error {
 		key, pk := pkKeyAndDisplay(rowMap, pkCols)
 		cells := make(map[string][]byte, len(orderedCols))
@@ -231,9 +234,9 @@ func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkC
 	})
 }
 
-func collectRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow) (map[string]rowCells, error) {
+func collectRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, pgTextPK bool) (map[string]rowCells, error) {
 	out := make(map[string]rowCells)
-	err := streamRowsByPK(ctx, baselinePath, schema, table, pkCols, orderedCols, changes, nil, func(key string, r rowCells) error {
+	err := streamRowsByPK(ctx, baselinePath, schema, table, pkCols, orderedCols, changes, nil, pgTextPK, func(key string, r rowCells) error {
 		out[key] = r
 		return nil
 	})
@@ -272,7 +275,7 @@ func displayCell(b []byte) string {
 // cellEqual compares two canonical cell renderings with the SAME NULL-vs-empty
 // distinction the content digest uses (rowHasher tags a nil/NULL differently from
 // a zero-length value). bytes.Equal alone treats nil and []byte("") as equal,
-// which would make the drill-down miss a NULL↔'' divergence the digest flagged —
+// which would make the drill-down miss a NULL↔” divergence the digest flagged —
 // breaking the "the diff agrees with the verdict" invariant.
 func cellEqual(a, b []byte) bool {
 	if (a == nil) != (b == nil) {

@@ -309,6 +309,15 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 	MustExec(t, db, serverid.DDLBintrailServers)
 	MustExec(t, db, serverid.DDLBintrailServerChanges)
 
+	// snapshot_id_seq (#844): dedicated AUTO_INCREMENT counter for
+	// schema_snapshots.snapshot_id allocation. Hand-inlined rather than
+	// imported from internal/metadata.DDLSnapshotIDSeq — that package's own
+	// _test.go files import this package, so importing metadata here would
+	// be an import cycle in the test build.
+	MustExec(t, db, `CREATE TABLE IF NOT EXISTS snapshot_id_seq (
+		id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY
+	) ENGINE=InnoDB`)
+
 	MustExec(t, db, `CREATE TABLE IF NOT EXISTS table_flags (
 		id          INT UNSIGNED  AUTO_INCREMENT PRIMARY KEY,
 		schema_name VARCHAR(64)   NOT NULL,
@@ -379,17 +388,6 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		ddl_query       TEXT NOT NULL,
 		snapshot_id     INT UNSIGNED DEFAULT NULL,
 		INDEX idx_detected_at (detected_at)
-	) ENGINE=InnoDB`)
-
-	MustExec(t, db, `CREATE TABLE IF NOT EXISTS connection_cache (
-		connection_id         BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-		user                  VARCHAR(128),
-		host                  VARCHAR(255),
-		db                    VARCHAR(128),
-		command               VARCHAR(64),
-		connection_attributes JSON,
-		cached_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		last_seen             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	) ENGINE=InnoDB`)
 }
 

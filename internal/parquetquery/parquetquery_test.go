@@ -179,9 +179,10 @@ func TestBuildQueryFromFiles_untilPos(t *testing.T) {
 	opts := query.Options{Schema: "mydb", Table: "orders",
 		UntilPos: &query.BinlogPos{File: "binlog.000007", Pos: 4242}, Limit: 10}
 	q, args := buildQueryFromFiles(files, opts, map[string]bool{"connection_id": true})
+	assertContains(t, q, "length(binlog_file) < length(?)")
 	assertContains(t, q, "binlog_file < ?")
 	assertContains(t, q, "end_pos <= ?")
-	// schema, table, file, file, pos, limit
+	// schema, table, file x4, pos, limit
 	var files2, hasPos int
 	for _, a := range args {
 		switch a {
@@ -191,8 +192,8 @@ func TestBuildQueryFromFiles_untilPos(t *testing.T) {
 			hasPos++
 		}
 	}
-	if files2 != 2 || hasPos != 1 {
-		t.Errorf("expected file x2 + pos x1 in args, got files=%d pos=%d (%v)", files2, hasPos, args)
+	if files2 != 4 || hasPos != 1 {
+		t.Errorf("expected file x4 + pos x1 in args, got files=%d pos=%d (%v)", files2, hasPos, args)
 	}
 }
 

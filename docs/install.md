@@ -18,6 +18,12 @@ it's the first section — the same four lines as the README.
   and `SELECT`.
 - An **index MySQL 8.0+** database for dbtrail's data (the Compose stack
   bundles one).
+- **Other sources:** besides MySQL, dbtrail can also capture from **MariaDB**
+  ([alpha](./mariadb.md) — 10.6+, 11.4 is the CI-tested target) and
+  **PostgreSQL** ([beta](./postgres.md) — 14+). Both are first-class sources in
+  the web console (**+ Add server** → pick the source type); PostgreSQL also
+  ships a standalone `bintrail-pg` binary for headless/CLI deployments. Each has
+  its own prerequisites; see the linked guide.
 - Go 1.25+ (the module targets `go 1.25.11`) — only when building from source. The default `GOTOOLCHAIN=auto` fetches the right toolchain for you.
 
 ## Docker Compose (the bundled default)
@@ -56,11 +62,13 @@ First run — open the URL and create your console username and password.
 ```
 
 Open it and use **+ Add server** (the Servers screen opens itself on a
-fresh install): paste the MySQL to watch — host, user, password, optional
-schema filter (`host.docker.internal` reaches a MySQL on this same machine
-from inside Docker). dbtrail runs the preflight (failures come back as
-remediation cards), provisions a dedicated index for that source, and starts
-streaming. Repeat per server; everything you add resumes automatically when
+fresh install): pick the **source type** (MySQL, MariaDB, or PostgreSQL) and
+paste the database to watch — host, user, password, optional schema filter
+(`host.docker.internal` reaches a database on this same machine from inside
+Docker; a PostgreSQL source adds database/slot/publication fields —
+see [postgres.md](./postgres.md)). dbtrail runs the preflight (failures come
+back as remediation cards), provisions a dedicated index for that source, and
+starts streaming. Repeat per server; everything you add resumes automatically when
 the container restarts.
 
 Prefer to start streaming one source immediately at boot? Set `SOURCE_DSN`
@@ -228,10 +236,14 @@ For cron, systemd units, and Ansible recipes, see [deployment.md](./deployment.m
 | `snapshot` | Capture table and column metadata from the source server |
 | `index` | Parse binlog files from disk and write row events to the index |
 | `stream` | Connect as a replica and index row events in real-time |
+| `agent` | Connect to dbtrail and listen for commands |
 | `query` | Search the index with flexible filters (schema, table, PK, time range, GTID) |
 | `recover` | Generate reversal SQL for matching events |
+| `recover-cascade` | Generate reversal SQL for rows hit by a foreign-key ON DELETE CASCADE / SET NULL |
 | `reconstruct` | Rebuild row state at a point in time from baselines + binlog events |
+| `verify` | Verify that a recovery would reproduce the source |
 | `rotate` | Drop old partitions, add new ones, optionally archive to Parquet |
+| `archive reconcile` | Re-sync archive_state with the Parquet files actually on disk / in S3 |
 | `status` | Show indexed files, partition sizes, and event counts |
 | `dump` | Invoke mydumper to create a logical dump of the source server |
 | `baseline` | Convert mydumper output to Parquet snapshots |

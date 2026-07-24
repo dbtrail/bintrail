@@ -388,6 +388,18 @@ func (cm *connManager) bootHidden() bool {
 	return cm.hideBoot && cm.boot != nil
 }
 
+// bootSelectable reports whether the boot entry may be picked as a flashback
+// target: it exists AND is not hidden. Mirrors what the console's server
+// switcher lists, so `USE`-by-username on the flashback port only reaches the
+// same servers the operator sees in the UI (a hidden boot is the empty
+// control-plane anchor of a source-less watch — never a useful time-travel
+// source).
+func (cm *connManager) bootSelectable() bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.boot != nil && !cm.hideBoot
+}
+
 // CloseAll closes every cached registry connection. The boot entry's db is
 // NOT closed here — the cmd layer opened it and owns its defer Close().
 func (cm *connManager) CloseAll() {
