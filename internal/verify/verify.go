@@ -15,6 +15,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/consistency"
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -62,6 +63,14 @@ type Config struct {
 	IndexDBName    string
 	NoArchive      bool
 	ArchiveFetcher query.ArchiveFetcher
+	// DuckDBTuning is the resource budget for the baseline-merge DuckDB
+	// sessions VerifyTable's reconstruct step opens (#842) — the same
+	// resolved --ultrafast/--duckdb-* tuning the CLI already hands
+	// ArchiveFetcher above. Zero value falls back to the container-safe
+	// default (reconstruct.effectiveDuckDBTuning); verify is an offline
+	// command that carries these flags, so leaving this unset would silently
+	// cap the reconstruct-heavy half of a --ultrafast run at 2 threads/4GB.
+	DuckDBTuning duckdbutil.Tuning
 }
 
 // VerifyTable verifies one table: fingerprint the live source at a consistent
@@ -215,7 +224,7 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 
 	// Live-source verify is MySQL-only (PostgreSQL is refused upstream), so the
 	// PK canonicalizer always applies here — pgTextPK is false.
-	reconDigest, reconCount, emitErr := reconstructDigest(ctx, baselinePath, schema, table, pkCols, changes, rows, orderedCols, false, renderCellNormalized)
+	reconDigest, reconCount, emitErr := reconstructDigest(ctx, baselinePath, schema, table, pkCols, changes, rows, orderedCols, false, renderCellNormalized, cfg.DuckDBTuning)
 	if emitErr != nil {
 		return res, fmt.Errorf("reconstruct %s.%s: %w", schema, table, emitErr)
 	}
@@ -273,7 +282,7 @@ func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int
 // side of its own comparison): both sides of any one comparison must be
 // produced with the SAME render func so the digests are byte-comparable by
 // construction.
-func reconstructDigest(ctx context.Context, baselinePath, schema, table string, pkCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, orderedCols []metadata.ColumnMeta, pgTextPK bool, render func(any, metadata.ColumnMeta) []byte) (string, int64, error) {
+func reconstructDigest(ctx context.Context, baselinePath, schema, table string, pkCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, orderedCols []metadata.ColumnMeta, pgTextPK bool, render func(any, metadata.ColumnMeta) []byte, tuning duckdbutil.Tuning) (string, int64, error) {
 	hasher := consistency.NewHasher()
 	err := reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
 		BaselinePath: baselinePath,
@@ -283,6 +292,7 @@ func reconstructDigest(ctx context.Context, baselinePath, schema, table string, 
 		Changes:      changes,
 		Events:       events,
 		PGTextPK:     pgTextPK,
+		DuckDBTuning: tuning,
 	}, func(rowMap map[string]any) error {
 		cells := make([][]byte, len(orderedCols))
 		for i, c := range orderedCols {

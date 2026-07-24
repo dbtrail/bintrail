@@ -122,6 +122,17 @@ func effectiveDuckDBTuning(t duckdbutil.Tuning) duckdbutil.Tuning {
 	return t
 }
 
+// applyDuckDBTuning normalizes t via effectiveDuckDBTuning and applies it to a
+// freshly opened DuckDB session, ALWAYS paired with
+// duckdbutil.SetTempDirectory: a memory_limit cap with nowhere to spill is
+// worse than no cap at all (see duckdbutil.Tuning.Apply's doc comment). Every
+// DuckDB session this package opens for the merge/baseline path goes through
+// this single call so the pairing can't be forgotten at a future call site.
+func applyDuckDBTuning(ctx context.Context, db *sql.DB, t duckdbutil.Tuning) {
+	effectiveDuckDBTuning(t).Apply(ctx, db)
+	duckdbutil.SetTempDirectory(ctx, db)
+}
+
 // TableReport carries the per-table outcome stats that the CLI summary prints.
 type TableReport struct {
 	Schema, Table  string
@@ -366,17 +377,32 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 				if merr == nil {
 					if err := WriteMetadataFile(cfg.OutputDir, cfg.At,
 						bmeta.GTIDSet, bmeta.BinlogFile, bmeta.BinlogPos); err != nil {
-						slog.Warn("could not write metadata file", "error", err)
+						// FATAL to the run's completeness, not just a slog.Warn (#842):
+						// #842 itself calls the absent metadata file "the only hint" that
+						// an otherwise-complete-looking output dir is missing something —
+						// a dir marked _SUCCESS but missing `metadata` is a smaller
+						// instance of the exact silent-partial the completeness marker
+						// exists to close. Fold into errs so finalizeCompletenessMarker
+						// leaves _INCOMPLETE in place and the error surfaces to the CLI,
+						// even though every individual table converted cleanly.
+						slog.Error("could not write metadata file; run will not be marked complete", "error", err)
+						errs = append(errs, fmt.Errorf("write metadata file: %w", err))
 					}
 				} else {
-					slog.Warn("could not read baseline metadata for metadata file",
+					slog.Error("could not read baseline metadata for metadata file; run will not be marked complete",
 						"table", tableName, "error", merr)
+					errs = append(errs, fmt.Errorf("read baseline metadata for metadata file (table %s): %w", tableName, merr))
 				}
 			} else {
-				slog.Warn("could not find baseline for metadata file",
+				slog.Error("could not find baseline for metadata file; run will not be marked complete",
 					"table", tableName, "error", perr)
+				errs = append(errs, fmt.Errorf("find baseline for metadata file (table %s): %w", tableName, perr))
 			}
 		} else {
+			// NOT an error: every reconstructed table is legitimately baseline-less
+			// (e.g. a single-table run that hit the #766 binlog-only fallback) — the
+			// metadata file's absence is correctly documented behavior here, not a
+			// silent gap, so this must not block _SUCCESS.
 			slog.Warn("no reconstructed table has a real baseline (all empty or binlog-only); metadata file not written")
 		}
 	}
@@ -397,9 +423,15 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 // this removal a stale _SUCCESS from run 1 would keep masking run 2 as
 // complete even after run 2 gets OOM-killed mid-way — the exact silent-partial
 // this marker exists to close, still open on the single most ordinary re-run
-// path. The removal is best-effort (logged, not fatal): a failure to remove a
-// stale marker is degraded observability, not data loss, and must not block a
-// run whose crash-safety marker (_INCOMPLETE) writes successfully afterward.
+// path.
+//
+// The removal is FATAL (see the code below): a surviving _SUCCESS means the
+// crash-safety net for THIS run did not deploy — SnapshotComplete would keep
+// reading this run as complete even after an interrupted, partial retry —
+// which is exactly as much a failed-to-deploy net as a missing _INCOMPLETE
+// write would be. Proceeding anyway risks the silent-partial this whole
+// marker exists to close, so this stays fatal like the _INCOMPLETE write
+// immediately below it; do not soften it to a log-and-continue.
 func markRunIncomplete(outputDir string) error {
 	// FATAL, same stance as the _INCOMPLETE write below: SnapshotComplete
 	// checks _SUCCESS FIRST, so a stale one left in place is just as much a
@@ -416,25 +448,35 @@ func markRunIncomplete(outputDir string) error {
 // marker for a ReconstructTables run's output dir: _SUCCESS when the run
 // finished with no per-table errors and was not cancelled, otherwise the
 // _INCOMPLETE marker ReconstructTables wrote before the run started is left in
-// place (this function writes nothing in that branch) and the triggering error
-// is returned unchanged. Split out from ReconstructTables so the marker
+// place (this function writes nothing in that branch) and the triggering
+// error(s) are returned joined. Split out from ReconstructTables so the marker
 // decision is unit-testable without a live index DB.
 //
 //   - cancelErr must be ctx.Err(): a cancelled run's per-table goroutines
 //     return early WITHOUT recording an error (see the ctx.Err() check inside
 //     the per-table goroutine in ReconstructTables), so an empty tableErrs
-//     alone is not proof every table converted — checked first, same order as
-//     baseline.go's own marker discipline.
-//   - tableErrs is every per-table failure collected by ReconstructTables;
-//     errors.Join surfaces all of them (not just the first) so operators
-//     running with --log-level error see the full picture — the returned
-//     error is what the CLI wraps into its exit status.
+//     alone is not proof every table converted.
+//   - tableErrs is every per-table failure collected by ReconstructTables.
+//   - Both are joined into one returned error (via errors.Join, which
+//     surfaces every wrapped error, not just the first) rather than cancelErr
+//     alone winning: a table that genuinely failed before a Ctrl-C landed
+//     must stay visible on the returned error / CLI exit status, not just in
+//     the logs each per-table failure already went to individually.
+//
+// (Before this function existed, a cancelled run with an EMPTY tableErrs
+// silently returned nil — success — even though the run never finished; that
+// was a real pre-existing bug this refactor also fixes, not just the marker
+// itself.)
 func finalizeCompletenessMarker(outputDir string, cancelErr error, tableErrs []error) error {
-	if cancelErr != nil {
-		return cancelErr
-	}
-	if len(tableErrs) > 0 {
-		return errors.Join(tableErrs...)
+	// errors.Join discards nil inputs and returns nil only when EVERY input is
+	// nil, so this single call covers all three cases: cancelled-only,
+	// per-table-errors-only, both (a table failed before the cancellation was
+	// observed — those failures must not go invisible, log-only, behind the
+	// cancellation error), and neither (falls through to the _SUCCESS write
+	// below). errors.Is/As on the result still finds cancelErr and each
+	// individual tableErrs entry.
+	if joined := errors.Join(cancelErr, errors.Join(tableErrs...)); joined != nil {
+		return joined
 	}
 	if err := baseline.WriteSuccessMarker(outputDir); err != nil {
 		// The dump is complete on disk but unmarked; without _SUCCESS (and
@@ -931,7 +973,7 @@ func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string
 		return stats, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer ddb.Close()
-	effectiveDuckDBTuning(in.DuckDBTuning).Apply(ctx, ddb)
+	applyDuckDBTuning(ctx, ddb, in.DuckDBTuning)
 
 	safePath := strings.ReplaceAll(in.LocalBaselinePath, "'", "''")
 	q := fmt.Sprintf("SELECT * FROM parquet_scan('%s')", safePath)
@@ -1521,7 +1563,7 @@ func materializeBaselineLocal(ctx context.Context, path string, tuning duckdbuti
 		return "", nil, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
-	effectiveDuckDBTuning(tuning).Apply(ctx, db)
+	applyDuckDBTuning(ctx, db, tuning)
 
 	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		os.RemoveAll(tmpDir)
@@ -1547,16 +1589,19 @@ func materializeBaselineLocal(ctx context.Context, path string, tuning duckdbuti
 // schema is exactly the set to hash — deriving it from a schema snapshot's
 // is_generated flag instead would wrongly drop DEFAULT_GENERATED columns (the
 // trap consistency.ConsistentTableChecksum documents) and silently under-verify them.
-func ReadBaselineColumns(ctx context.Context, path string) ([]string, error) {
-	// Zero-value Tuning: no caller of this exported helper has a resolved
-	// operator budget to hand in, so it always gets the container-safe
-	// default via effectiveDuckDBTuning (#842).
-	localPath, cleanup, err := materializeBaselineLocal(ctx, path, duckdbutil.Tuning{})
+//
+// tuning sets the DuckDB session's resource budget (#842); zero value falls
+// back to the container-safe default (effectiveDuckDBTuning). Callers that
+// resolve an operator-supplied --ultrafast/--duckdb-* tuning (verify) should
+// pass it through here so it's honored on this path too, not just archive
+// fetches.
+func ReadBaselineColumns(ctx context.Context, path string, tuning duckdbutil.Tuning) ([]string, error) {
+	localPath, cleanup, err := materializeBaselineLocal(ctx, path, tuning)
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
-	return readBaselineColumns(ctx, localPath, duckdbutil.Tuning{})
+	return readBaselineColumns(ctx, localPath, tuning)
 }
 
 // readBaselineColumns opens the local Parquet file with DuckDB and returns
@@ -1569,7 +1614,7 @@ func readBaselineColumns(ctx context.Context, localPath string, tuning duckdbuti
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
 	defer db.Close()
-	effectiveDuckDBTuning(tuning).Apply(ctx, db)
+	applyDuckDBTuning(ctx, db, tuning)
 
 	safePath := strings.ReplaceAll(localPath, "'", "''")
 	q := fmt.Sprintf("SELECT * FROM parquet_scan('%s') LIMIT 0", safePath)

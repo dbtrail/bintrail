@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -29,6 +30,10 @@ type BaselineConfig struct {
 	// window; "" / "mysql" / "mariadb" keep the MySQL path). Set once per run by
 	// the caller from the index, never the registry field — the index is truth.
 	SourceFlavor string
+	// DuckDBTuning is the resource budget for the baseline-merge DuckDB
+	// sessions this path opens (#842) — see verify.Config.DuckDBTuning's doc
+	// comment (the same rationale applies here).
+	DuckDBTuning duckdbutil.Tuning
 }
 
 // flavorPostgres is the stream_state.flavor value for a PostgreSQL-source index
@@ -166,7 +171,7 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	// the DEFAULT_GENERATED trap (consistency.ConsistentTableChecksum's comment)
 	// and silently drop those real columns from the fingerprint — under-verifying
 	// them on BOTH sides, a false-match exposure.
-	colNames, err := reconstruct.ReadBaselineColumns(ctx, p.NewPath)
+	colNames, err := reconstruct.ReadBaselineColumns(ctx, p.NewPath, cfg.DuckDBTuning)
 	if err != nil {
 		return res, fmt.Errorf("read new baseline columns %s.%s: %w", p.Schema, p.Table, err)
 	}
@@ -240,12 +245,12 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	// way on both sides closes the false-mismatch gap a TEXT/JSON column's
 	// event-image round-trip can otherwise open (see its doc comment) without
 	// risking the live-source comparison, which this function is not used for.
-	reconDigest, reconCount, err := reconstructDigest(ctx, p.PrevPath, p.Schema, p.Table, pkCols, changes, rows, orderedCols, pg, renderCellNormalized)
+	reconDigest, reconCount, err := reconstructDigest(ctx, p.PrevPath, p.Schema, p.Table, pkCols, changes, rows, orderedCols, pg, renderCellNormalized, cfg.DuckDBTuning)
 	if err != nil {
 		return res, fmt.Errorf("reconstruct prev %s.%s: %w", p.Schema, p.Table, err)
 	}
 	// Truth side: the new baseline as-is (no events), via the same path.
-	newDigest, newCount, err := reconstructDigest(ctx, p.NewPath, p.Schema, p.Table, pkCols, map[string]*query.ResultRow{}, nil, orderedCols, pg, renderCellNormalized)
+	newDigest, newCount, err := reconstructDigest(ctx, p.NewPath, p.Schema, p.Table, pkCols, map[string]*query.ResultRow{}, nil, orderedCols, pg, renderCellNormalized, cfg.DuckDBTuning)
 	if err != nil {
 		return res, fmt.Errorf("read new baseline %s.%s: %w", p.Schema, p.Table, err)
 	}

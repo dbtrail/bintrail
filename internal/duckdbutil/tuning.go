@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 )
 
@@ -29,7 +30,8 @@ import (
 // temp_directory and preserve_insertion_order are deliberately NOT in this
 // struct: they are not memory-for-speed trade-offs (the former is the spill
 // backstop, the latter is a win-win that is safe under our explicit ORDER BY),
-// so parquetquery sets them unconditionally regardless of Tuning.
+// so every caller sets them unconditionally regardless of Tuning — see
+// SetTempDirectory, which every Apply call MUST be paired with (below).
 type Tuning struct {
 	// Threads is the DuckDB thread count (SET threads = N). 0 leaves it unset,
 	// so DuckDB defaults to one thread per CPU core.
@@ -64,6 +66,12 @@ func Ultrafast() Tuning { return Tuning{S3Direct: true} }
 // matching the rest of duckdbutil: a failed SET is logged at WARN and the
 // session falls back to DuckDB's default for that knob rather than aborting the
 // query. Call it on a freshly opened DuckDB session.
+//
+// MUST be paired with a SetTempDirectory call on the same session (before or
+// after — order doesn't matter). Apply's memory_limit is a hard cap with
+// nowhere to spill on its own; without the temp_directory backstop, a query
+// that exceeds the cap fails outright instead of spilling to disk, which is
+// WORSE than leaving memory_limit unset entirely. See SetTempDirectory.
 func (t Tuning) Apply(ctx context.Context, db *sql.DB) {
 	if t.Threads > 0 {
 		applyTuningStmt(ctx, db, fmt.Sprintf("SET threads = %d", t.Threads))
@@ -73,6 +81,25 @@ func (t Tuning) Apply(ctx context.Context, db *sql.DB) {
 		// quotes so an operator-supplied value can't break out of the literal.
 		applyTuningStmt(ctx, db, "SET memory_limit = '"+strings.ReplaceAll(t.MemoryLimit, "'", "''")+"'")
 	}
+}
+
+// SetTempDirectory points a DuckDB session's temp_directory at the OS temp
+// directory, unconditionally — it is the spill backstop for Apply's
+// memory_limit (see Apply's doc comment: the two MUST be paired on every
+// session), not a memory-for-speed trade-off, so it stays on even under
+// Ultrafast.
+//
+// DuckDB's own default is a ".tmp" directory relative to the process's
+// CURRENT WORKING DIRECTORY, not the OS temp dir — which fails outright in a
+// container with a read-only rootfs and CWD "/": DuckDB can't create the
+// spill directory, so a query that exceeds memory_limit dies instead of
+// spilling. Call this on every freshly opened DuckDB session that also calls
+// Apply (previously only parquetquery.FetchWithTuning did this; every other
+// Tuning.Apply call site must call this too — see the #842 fix that
+// extracted this from parquetquery into this shared home, one definition
+// instead of duplicated copies).
+func SetTempDirectory(ctx context.Context, db *sql.DB) {
+	applyTuningStmt(ctx, db, "SET temp_directory = '"+strings.ReplaceAll(os.TempDir(), "'", "''")+"'")
 }
 
 func applyTuningStmt(ctx context.Context, db *sql.DB, stmt string) {

@@ -3,6 +3,8 @@ package duckdbutil
 import (
 	"context"
 	"database/sql"
+	"os"
+	"strings"
 	"testing"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -71,6 +73,27 @@ func TestTuningApplyExplicitOverride(t *testing.T) {
 	}
 	if mem := currentSetting(t, db, "memory_limit"); mem != "2.0 GiB" {
 		t.Fatalf("memory_limit after override = %q, want \"2.0 GiB\"", mem)
+	}
+	assertUsable(t, db)
+}
+
+// TestSetTempDirectory pins the #842 regression this function exists to close:
+// every Tuning.Apply call site must be paired with SetTempDirectory (Apply's
+// memory_limit is a hard cap with nowhere to spill without it — see Apply's
+// doc comment). DuckDB's own default is a ".tmp" dir relative to the process
+// CWD, not the OS temp dir; this proves the session actually ends up pointed
+// at os.TempDir() rather than that CWD-relative default.
+func TestSetTempDirectory(t *testing.T) {
+	db := openDuckDB(t)
+	SetTempDirectory(context.Background(), db)
+
+	got := currentSetting(t, db, "temp_directory")
+	want := os.TempDir()
+	if got != want && !strings.HasPrefix(got, want) {
+		t.Fatalf("temp_directory after SetTempDirectory = %q, want it based on os.TempDir() (%q)", got, want)
+	}
+	if got == "" || got == ".tmp" {
+		t.Fatalf("temp_directory after SetTempDirectory = %q, want it NOT DuckDB's CWD-relative default", got)
 	}
 	assertUsable(t, db)
 }

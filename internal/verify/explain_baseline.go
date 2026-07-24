@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -105,7 +106,7 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 
 	// Same column set as the digest: exactly what the baseline Parquet holds, via
 	// ReadBaselineColumns (not the is_generated flag — see VerifyBaselinePair).
-	colNames, err := reconstruct.ReadBaselineColumns(ctx, p.NewPath)
+	colNames, err := reconstruct.ReadBaselineColumns(ctx, p.NewPath, cfg.DuckDBTuning)
 	if err != nil {
 		return nil, fmt.Errorf("read new baseline columns %s.%s: %w", p.Schema, p.Table, err)
 	}
@@ -153,14 +154,14 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 
 	// Truth side held fully (the new baseline as-is); recovery streamed against it
 	// so only one side is materialized in memory at a time.
-	truth, err := collectRowsByPK(ctx, p.NewPath, p.Schema, p.Table, pkCols, orderedCols, map[string]*query.ResultRow{}, pg)
+	truth, err := collectRowsByPK(ctx, p.NewPath, p.Schema, p.Table, pkCols, orderedCols, map[string]*query.ResultRow{}, pg, cfg.DuckDBTuning)
 	if err != nil {
 		return nil, fmt.Errorf("read new baseline %s.%s: %w", p.Schema, p.Table, err)
 	}
 
 	ex := &MismatchExplanation{Schema: p.Schema, Table: p.Table, Anchor: anchorLabel(pg, p)}
 	seen := make(map[string]bool, len(truth))
-	err = streamRowsByPK(ctx, p.PrevPath, p.Schema, p.Table, pkCols, orderedCols, changes, rows, pg, func(key string, rec rowCells) error {
+	err = streamRowsByPK(ctx, p.PrevPath, p.Schema, p.Table, pkCols, orderedCols, changes, rows, pg, cfg.DuckDBTuning, func(key string, rec rowCells) error {
 		seen[key] = true
 		t, ok := truth[key]
 		if !ok {
@@ -215,7 +216,7 @@ func ExplainBaselinePairMismatch(ctx context.Context, cfg BaselineConfig, p Base
 // the SAME renderCellNormalized reconstructDigest's baseline-anchored callers
 // use, so a row this drill-down shows as differing is exactly a row the digest
 // that flagged the mismatch also saw as differing (cellEqual's invariant).
-func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, pgTextPK bool, emit func(key string, r rowCells) error) error {
+func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, events []query.ResultRow, pgTextPK bool, tuning duckdbutil.Tuning, emit func(key string, r rowCells) error) error {
 	return reconstruct.SnapshotFullTableImages(ctx, reconstruct.SnapshotFullTableInput{
 		BaselinePath: baselinePath,
 		Schema:       schema,
@@ -224,6 +225,7 @@ func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkC
 		Changes:      changes,
 		Events:       events,
 		PGTextPK:     pgTextPK,
+		DuckDBTuning: tuning,
 	}, func(rowMap map[string]any) error {
 		key, pk := pkKeyAndDisplay(rowMap, pkCols)
 		cells := make(map[string][]byte, len(orderedCols))
@@ -234,9 +236,9 @@ func streamRowsByPK(ctx context.Context, baselinePath, schema, table string, pkC
 	})
 }
 
-func collectRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, pgTextPK bool) (map[string]rowCells, error) {
+func collectRowsByPK(ctx context.Context, baselinePath, schema, table string, pkCols, orderedCols []metadata.ColumnMeta, changes map[string]*query.ResultRow, pgTextPK bool, tuning duckdbutil.Tuning) (map[string]rowCells, error) {
 	out := make(map[string]rowCells)
-	err := streamRowsByPK(ctx, baselinePath, schema, table, pkCols, orderedCols, changes, nil, pgTextPK, func(key string, r rowCells) error {
+	err := streamRowsByPK(ctx, baselinePath, schema, table, pkCols, orderedCols, changes, nil, pgTextPK, tuning, func(key string, r rowCells) error {
 		out[key] = r
 		return nil
 	})

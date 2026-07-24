@@ -170,6 +170,10 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 		NoArchive:      vfyNoArchive,
 		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
 		SourceFlavor:   flavor,
+		// Same resolved --ultrafast/--duckdb-* budget as ArchiveFetcher above,
+		// but for the baseline-merge DuckDB sessions this path opens directly
+		// (#842) — those previously ignored these flags entirely.
+		DuckDBTuning: duckTuning,
 	}
 
 	results := make([]verify.TableResult, 0, len(pairs)+len(unpaired))
@@ -325,6 +329,11 @@ func runVerifyLive(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resol
 		IndexDBName:    indexDBName,
 		NoArchive:      vfyNoArchive,
 		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
+		// Same resolved --ultrafast/--duckdb-* budget as ArchiveFetcher above,
+		// but for the baseline-merge DuckDB session VerifyTable's reconstruct
+		// step opens directly (#842) — that previously ignored these flags
+		// entirely.
+		DuckDBTuning: duckTuning,
 	}
 
 	results := make([]verify.TableResult, 0, len(tables))

@@ -200,8 +200,8 @@ Rather than ship a silently duplicated, resurrected, or row-dropping dump, the f
 
 To close this, `reconstruct --output-format mydumper` writes a completeness marker into `--output-dir`, reusing the exact `_SUCCESS` / `_INCOMPLETE` convention `bintrail baseline` established for the same failure mode ([#467](https://github.com/dbtrail/dbtrail/issues/467)) rather than inventing a second one ([#842](https://github.com/dbtrail/dbtrail/issues/842)):
 
-- `_INCOMPLETE` is written before any table is converted, and any stale `_SUCCESS` left by a prior run into the same (reused) directory is removed at that point too.
-- `_SUCCESS` replaces it only when every requested table converts without error and the run was not cancelled.
+- `_INCOMPLETE` is written before any table is converted, and any stale `_SUCCESS` left by a prior run into the same (reused) directory is removed at that point too — that removal is itself fatal (aborts the run) rather than best-effort, since a surviving stale `_SUCCESS` would defeat the marker for the whole run.
+- `_SUCCESS` replaces it only when every requested table converts without error, the run was not cancelled, **and** the shared `metadata` file (binlog coordinates for the baseline anchor) was written successfully — a dump with every table's data but no `metadata` file is a smaller instance of the same incompleteness this marker exists to signal, so it is never marked `_SUCCESS` either.
 
 A directory with neither marker (pre-#842 output, or any other mydumper-shaped dump) is treated as complete by convention — only an explicit `_INCOMPLETE` (with no `_SUCCESS`) signals a genuinely partial run. Re-run `reconstruct` into a fresh directory, or the same one, to retry.
 
@@ -216,7 +216,7 @@ When `query`, `recover`, or `reconstruct` scan Parquet archives, DuckDB runs und
 
 Equivalent env vars: `BINTRAIL_ULTRAFAST=1`, `BINTRAIL_DUCKDB_THREADS`, `BINTRAIL_DUCKDB_MEMORY_LIMIT`. These flags affect only the offline CLI commands; the long-lived `shim` and `bintrail-console` daemons always use the safe default.
 
-For `reconstruct --output-format mydumper`, this budget also covers the merge/baseline DuckDB sessions the full-table path opens directly (streaming the baseline Parquet, downloading an S3 baseline) — not just the archive-fetch session ([#842](https://github.com/dbtrail/dbtrail/issues/842)). Before this, those sessions ignored `--ultrafast`/`--duckdb-*` entirely and always defaulted to DuckDB's native host-greedy budget (~80% of RAM, one thread per core), regardless of what you configured for archive reads.
+For `reconstruct --output-format mydumper` and `verify`, this budget also covers the merge/baseline DuckDB sessions each command opens directly (streaming the baseline Parquet, downloading an S3 baseline) — not just the archive-fetch session ([#842](https://github.com/dbtrail/dbtrail/issues/842)). Before this, those sessions ignored `--ultrafast`/`--duckdb-*` entirely and always defaulted to DuckDB's native host-greedy budget (~80% of RAM, one thread per core), regardless of what you configured for archive reads — every such session is also paired with a `temp_directory` spill backstop pointed at the OS temp directory, so a query that exceeds an explicit `--duckdb-memory-limit` spills to disk instead of failing outright (DuckDB's own default temp directory is relative to the process's working directory, which is read-only in many containers).
 
 ### S3 Prerequisites
 

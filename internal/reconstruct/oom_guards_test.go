@@ -208,4 +208,25 @@ func TestFinalizeCompletenessMarker(t *testing.T) {
 			t.Errorf("%s marker must remain after a table failure: %v", baseline.IncompleteMarker, err)
 		}
 	})
+
+	t.Run("cancellation AND a per-table error are both surfaced, not just the cancellation", func(t *testing.T) {
+		// Regression guard: a table that genuinely failed before a Ctrl-C
+		// landed must not go invisible behind the cancellation error — both
+		// must be recoverable off the returned error.
+		dir := t.TempDir()
+		if err := baseline.WriteIncompleteMarker(dir); err != nil {
+			t.Fatalf("seed _INCOMPLETE: %v", err)
+		}
+		tableErr := errors.New("schema.t1: boom")
+		err := finalizeCompletenessMarker(dir, context.Canceled, []error{tableErr})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected the cancellation error recoverable, got %v", err)
+		}
+		if !errors.Is(err, tableErr) {
+			t.Fatalf("expected the per-table error recoverable alongside the cancellation, got %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, baseline.SuccessMarker)); !os.IsNotExist(err) {
+			t.Errorf("%s marker must not be written", baseline.SuccessMarker)
+		}
+	})
 }

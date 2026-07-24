@@ -58,10 +58,10 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 	// the working directory (often /) is read-only. Set unconditionally: it is
 	// the spill backstop, not a memory-for-speed knob, so it stays on even
 	// under ultrafast — exceeding the memory budget spills here instead of
-	// inviting the OOM-killer.
-	if _, err := db.ExecContext(ctx, "SET temp_directory = '"+os.TempDir()+"'"); err != nil {
-		slog.Warn("could not set DuckDB temp_directory", "error", err)
-	}
+	// inviting the OOM-killer. Shared with every other Tuning.Apply call site
+	// (internal/duckdbutil.SetTempDirectory) so there is one definition, not a
+	// duplicated copy.
+	duckdbutil.SetTempDirectory(ctx, db)
 
 	// preserve_insertion_order is safe to disable because our queries have
 	// explicit ORDER BY; disabling it lets DuckDB stream without buffering the
