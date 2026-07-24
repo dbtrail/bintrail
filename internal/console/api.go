@@ -32,6 +32,42 @@ const (
 	eventsMaxLimit      = 1000
 	recoverDefaultLimit = 1000
 	recoverMaxLimit     = 10000
+
+	// recoverMaxScriptBytes caps the estimated row payload (recovery's
+	// EstimateScriptBytes: resident row_before/row_after bytes plus the PK,
+	// across every matched row) that POST /api/recover — and its cascade
+	// auto-detection and POST /api/recover-cascade siblings — may hold before
+	// the console refuses to generate a reversal script (#849, follow-up to
+	// #654/#652).
+	//
+	// recoverMaxLimit already bounds ROW COUNT (10,000), not bytes: a wide
+	// table with megabyte BLOB/TEXT columns blows past any sane heap budget
+	// well under 10,000 rows — 10k rows at a few MB each is tens of GB. Under
+	// `bintrail-console watch` the console shares the process with the
+	// capture stream, so an OOM-kill here also kills capture (event loss
+	// until the supervisor restarts it).
+	//
+	// recovery.Generator already refuses BEFORE rendering anything
+	// (GenerateSQLFromRows calls CheckScriptBudget/EstimateScriptBytes first,
+	// so a refusal never touches the output buffer — see internal/recovery's
+	// #654 guard) — but its zero-config default, DefaultMaxScriptBytes, is
+	// 2 GiB: sized for an operator-run CLI process, not a long-lived daemon
+	// that must keep serving the events browser, status, and (in `watch`)
+	// capture at the same time. A 2 GiB reversal script is also useless in a
+	// browser tab: it will never render in a <textarea> or survive a JSON
+	// round-trip through the tab's own JS heap. 32 MiB keeps an ordinary
+	// wide-row recovery (KBs to low MBs of SQL) comfortably in budget while
+	// failing fast — well before the CLI's headroom — on the pathological
+	// BLOB/TEXT-heavy window this issue is about.
+	//
+	// No console flag or env var exposes this: unlike the CLI's
+	// --max-script-bytes (a per-run operator choice on a process that exits
+	// when it's done), this is a shared-daemon OOM guardrail. The escape
+	// hatch for a genuinely large recovery is the one the refusal error
+	// message gives — narrow the filter, or run `bintrail recover` (which
+	// already has --max-script-bytes / BINTRAIL_RECOVER_MAX_BYTES) outside
+	// the daemon.
+	recoverMaxScriptBytes = 32 << 20
 )
 
 // filterParams is the source-agnostic set of query filters parsed from either
@@ -374,9 +410,16 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
 	// Per-bundle dialect (read above): a PG-flavored index → PostgreSQL reversal SQL.
 	// DialectForIndex defaults to MySQL on any read failure (#533/#573).
-	n, err := recovery.NewForDialect(b.db, b.resolver, dialect).GenerateSQLFromRows(rows, &buf)
+	gen := recovery.NewForDialect(b.db, b.resolver, dialect)
+	// #849: tighten the CLI-sized 2 GiB zero-config default
+	// (recovery.DefaultMaxScriptBytes) down to recoverMaxScriptBytes. The
+	// generator's CheckScriptBudget runs BEFORE any byte is written to buf, so
+	// a refusal never materializes the oversized script in the shared daemon
+	// heap — see the recoverMaxScriptBytes doc comment above.
+	gen.SetMaxScriptBytes(recoverMaxScriptBytes)
+	n, err := gen.GenerateSQLFromRows(rows, &buf)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeRecoverError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, recoverResponse{
@@ -612,6 +655,36 @@ func writeFetchError(w http.ResponseWriter, err error) {
 		writeJSONError(w, http.StatusUnprocessableEntity,
 			"this index predates the "+col+" column, and the console never migrates servers added in the UI; "+
 				"run a writer command against it once (bintrail index / stream / agent), or start a console with --index-dsn pointing at it")
+		return
+	}
+	writeJSONError(w, http.StatusInternalServerError, err.Error())
+}
+
+// writeRecoverError maps a reversal-script generation failure onto the right
+// HTTP response. A *recovery.ScriptBudgetError — the pre-render refusal
+// GenerateSQLFromRows/CheckScriptBudget return when the estimated row payload
+// exceeds the configured budget (#654), tightened for the console by
+// recoverMaxScriptBytes (#849) — gets an actionable 422 telling the operator
+// how to get an answer instead of a bare 500: narrow the filter, or reach for
+// the CLI, which runs outside the console's shared process and can raise or
+// disable the budget entirely.
+//
+// This builds its own message from the typed error's fields rather than
+// reusing ScriptBudgetError.Error() verbatim: that message ends with "raise/
+// disable the budget (0 = unlimited)", which is CLI-flag advice
+// (--max-script-bytes) that does not apply here — the console exposes no such
+// knob (see recoverMaxScriptBytes's doc comment for why), and repeating it
+// would send the operator looking for a setting that does not exist.
+func writeRecoverError(w http.ResponseWriter, err error) {
+	var be *recovery.ScriptBudgetError
+	if errors.As(err, &be) {
+		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf(
+			"refusing to generate the reversal script — the matched events hold ~%.1f MiB of row data, "+
+				"over the console's %.0f MiB budget for a single recovery. Narrow the recovery filter "+
+				"(schema/table/pk/time range) to shrink the window, or use `bintrail recover` from the CLI "+
+				"for large recoveries — it runs outside the console's shared process and supports "+
+				"--max-script-bytes to raise or disable this budget.",
+			float64(be.EstimatedBytes)/(1<<20), float64(be.Budget)/(1<<20)))
 		return
 	}
 	writeJSONError(w, http.StatusInternalServerError, err.Error())

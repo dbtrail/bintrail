@@ -3,6 +3,7 @@ package console
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"reflect"
 	"strings"
@@ -257,6 +258,122 @@ func TestRecoverIsReadOnly(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("read-only invariant violated — unexpected DB interaction: %v", err)
+	}
+}
+
+// TestRecoverUnderByteBudget is TestRecoverIsReadOnly's sibling, added for
+// #849: an ordinary small recovery must sail through the new
+// recoverMaxScriptBytes guard unaffected — a 200 with generated SQL, not an
+// accidental refusal from an overzealous budget.
+func TestRecoverUnderByteBudget(t *testing.T) {
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+
+	cols := []string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+	}
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	resultRows := sqlmock.NewRows(cols).AddRow(
+		int64(1), "bin.000001", int64(4), int64(40), ts,
+		nil, nil, "app", "users", int64(parser.EventInsert), "42",
+		nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0),
+		nil, nil,
+	)
+	mock.ExpectQuery("FROM binlog_events").WillReturnRows(resultRows)
+
+	s := newBootServer(db)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(`{"schema":"app","table":"users"}`))
+	s.handleRecover(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("recover status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v (body=%s)", err, rec.Body.String())
+	}
+	if resp.StatementCount != 1 {
+		t.Errorf("StatementCount = %d, want 1", resp.StatementCount)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestRecoverOverByteBudget is the #849 repro: MANY moderately wide rows —
+// not one pathological giant row — whose COMBINED decoded row_after payload
+// exceeds recoverMaxScriptBytes must refuse with an actionable 422, not a 200
+// carrying a giant script and not a bare 500. #849's actual complaint was that
+// recoverMaxLimit (10,000) bounds row COUNT while row SIZE stayed unbounded —
+// a many-rows-of-a-few-MB shape is exactly what that gap allowed through, so
+// the repro uses 40 x 1 MiB rows (well under the 10,000-row cap) rather than a
+// single oversized row, to prove the estimate is summed ACROSS rows and not
+// just checked per-row. The refusal happens INSIDE GenerateSQLFromRows before
+// any byte reaches the response buffer (recovery's pre-render
+// CheckScriptBudget, #654), so this also guards that the console actually
+// wired the tightened budget through (SetMaxScriptBytes) rather than relying
+// on the CLI-sized 2 GiB default.
+func TestRecoverOverByteBudget(t *testing.T) {
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+
+	cols := []string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+	}
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	const (
+		numRows    = 40
+		rowBlobLen = 1 << 20 // 1 MiB each; 40 MiB total, over the 32 MiB budget
+	)
+	blob := strings.Repeat("x", rowBlobLen)
+	resultRows := sqlmock.NewRows(cols)
+	for i := 0; i < numRows; i++ {
+		rowAfter, err := json.Marshal(map[string]any{"id": i, "blob": blob})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resultRows.AddRow(
+			int64(i+1), "bin.000001", int64(4), int64(40), ts,
+			nil, nil, "app", "users", int64(parser.EventInsert), fmt.Sprintf("%d", i),
+			nil, nil, rowAfter, int64(0),
+			nil, nil,
+		)
+	}
+	mock.ExpectQuery("FROM binlog_events").WillReturnRows(resultRows)
+
+	s := newBootServer(db)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(`{"schema":"app","table":"users"}`))
+	s.handleRecover(rec, req)
+
+	if rec.Code != 422 {
+		t.Fatalf("recover over budget: code = %d, want 422, body = %s", rec.Code, rec.Body.String())
+	}
+	var errBody map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("decode error body: %v (body=%s)", err, rec.Body.String())
+	}
+	msg := errBody["error"]
+	for _, want := range []string{"MiB budget", "Narrow the recovery filter", "bintrail recover"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message missing %q: %s", want, msg)
+		}
+	}
+	// The message must not point the operator at a knob the console doesn't
+	// expose — the CLI-only escape hatch (--max-script-bytes) is offered
+	// explicitly above, not the bare "0 = unlimited" phrasing from
+	// ScriptBudgetError.Error(), which reads as a console setting that
+	// doesn't exist.
+	if strings.Contains(msg, "0 = unlimited") {
+		t.Errorf("error message must not reference the CLI's raw '0 = unlimited' phrasing: %s", msg)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
 	}
 }
 

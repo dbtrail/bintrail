@@ -172,6 +172,9 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 	// only flavor cascade recovery supports — this is byte-identical to the CLI's
 	// recovery.New(MySQL).
 	gen := recovery.NewForDialect(b.db, b.resolver, recovery.DialectForIndex(b.db))
+	// #849: same shared-daemon budget as handleRecover (see recoverMaxScriptBytes
+	// in api.go) — EmitSQL calls gen.CheckScriptBudget before writing a byte.
+	gen.SetMaxScriptBytes(recoverMaxScriptBytes)
 	n, err := cascaderecover.EmitSQL(&buf, gen, rows, synth.SetNullRows, b.resolver, cascaderecover.Header{
 		Schema:         body.Schema,
 		Table:          body.Table,
@@ -182,7 +185,7 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		BaselineActive: synth.BaselineActive,
 	})
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		writeRecoverError(w, err)
 		return
 	}
 
@@ -492,6 +495,10 @@ func (s *Server) cascadeRecover(ctx context.Context, b *bundle, body recoverRequ
 	rows := append(append([]query.ResultRow{}, baseRows...), synth.Victims...)
 	var buf bytes.Buffer
 	gen := recovery.NewForDialect(b.db, b.resolver, recovery.DialectForIndex(b.db))
+	// #849: same shared-daemon budget as handleRecover (see recoverMaxScriptBytes
+	// in api.go). A refusal here is caught by handleRecover's caller, which
+	// degrades to the plain (non-cascade) recovery below its own budget check.
+	gen.SetMaxScriptBytes(recoverMaxScriptBytes)
 	n, err := cascaderecover.EmitSQL(&buf, gen, rows, setNull, b.resolver, cascaderecover.Header{
 		Schema:         body.Schema,
 		Table:          body.Table,
