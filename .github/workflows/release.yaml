@@ -24,6 +24,23 @@ jobs:
   # full matrix regardless of which files changed) and run on the exact commit
   # the tag points at. The `release` job below `needs:` all three, so a red
   # integration run blocks GoReleaser from publishing.
+  #
+  # !!! KEEP IN SYNC WITH ci.yml !!!
+  # This is a hand-maintained COPY, not a shared definition (a workflow_call
+  # refactor was evaluated for #950 and rejected: reusable-workflow job names
+  # are reported as "<caller job> / <called job>", which would rename the
+  # `integration (8.0)` / `integration (8.4)` / etc. required-status-check
+  # contexts that branch protection on `main` currently pins by exact string —
+  # only a repo-admin settings change can accommodate that, so it was punted).
+  # Concretely: the readiness probes below MUST use host-TCP + a real query
+  # with 3 consecutive successes (NOT `docker exec ... mysqladmin/mariadb-admin
+  # ping`, which answers over the container's local socket and can return
+  # ready while the real server on the mapped host port is still starting or
+  # mid-restart during first-init — see #949, commit 95bd02e, and the matching
+  # comments in ci.yml's `integration` / `integration-mariadb-source` /
+  # `integration-postgres-source` jobs for the full story). If ci.yml's
+  # integration jobs change (readiness probes, env guards, tripwire test
+  # names, matrix versions), port the change here too.
   integration-mysql:
     runs-on: ubuntu-22.04
     # Job-level permissions override the workflow-level grant (contents:write,
@@ -42,6 +59,10 @@ jobs:
 
     env:
       BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
+      # A MySQL server is guaranteed present in this job, so a dial/ping
+      # failure must FAIL the run, not silently skip (#949). Mirrors
+      # BINTRAIL_REQUIRE_MARIADB / BINTRAIL_REQUIRE_POSTGRES below.
+      BINTRAIL_REQUIRE_MYSQL: "1"
 
     steps:
       - uses: actions/checkout@v5
@@ -61,10 +82,20 @@ jobs:
             --log-bin=binlog \
             --server-id=1
           echo "Waiting for MySQL to accept connections..."
+          # Host-TCP probe with a real query, 3 consecutive successes — NOT
+          # `docker exec ... mysqladmin ping` (socket-local; can false-ready
+          # against the temporary first-init mysqld). See #949 / ci.yml.
+          consecutive=0
           for i in $(seq 1 60); do
-            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
-              echo "MySQL is ready."
-              exit 0
+            if docker run --rm --network host "mysql:${{ matrix.mysql }}" \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              if [ "$consecutive" -ge 3 ]; then
+                echo "MySQL is ready (3 consecutive successful probes)."
+                exit 0
+              fi
+            else
+              consecutive=0
             fi
             sleep 2
           done
@@ -74,8 +105,16 @@ jobs:
 
       # -p 1 serializes package execution — see ci.yml's `integration` job for
       # the full rationale (shared single binlog, exact-count assertions).
+      # False-green tripwire mirrors ci.yml: assert the flagship end-to-end
+      # and caching_sha2 auth-seam tests genuinely ran (#949).
       - name: Integration tests (-tags=integration)
-        run: go test -tags=integration -race -p 1 -count=1 ./...
+        run: |
+          set -o pipefail
+          go test -tags=integration -race -p 1 -count=1 -v ./... 2>&1 | tee /tmp/mysql-it.out
+          grep -q -- '--- PASS: TestEndToEnd_fullPipeline' /tmp/mysql-it.out \
+            || { echo "FATAL: MySQL end-to-end integration test did not run — false-green tripwire" >&2; exit 1; }
+          grep -q -- '--- PASS: TestCachingSha2ColdAuthSeam' /tmp/mysql-it.out \
+            || { echo "FATAL: caching_sha2 cold-auth seam test did not run — false-green tripwire" >&2; exit 1; }
 
   integration-mariadb-source:
     # Mirrors ci.yml's `integration-mariadb-source` job. See that job's
@@ -104,9 +143,16 @@ jobs:
             -p 13306:3306 \
             mysql:8.4 \
             --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          # Host-TCP probe, 3 consecutive successes — see the integration-mysql
+          # job above / #949 for why `docker exec ... mysqladmin ping` races.
+          consecutive=0
           for i in $(seq 1 60); do
-            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
-              echo "MySQL index is ready."; exit 0
+            if docker run --rm --network host mysql:8.4 \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MySQL index is ready."; exit 0; }
+            else
+              consecutive=0
             fi
             sleep 2
           done
@@ -122,9 +168,16 @@ jobs:
             mariadb:11.4 \
             --log-bin=mariadb-bin --binlog-format=ROW --binlog-row-image=FULL \
             --server-id=2 --gtid-strict-mode=ON
+          # Same socket-vs-TCP readiness race as the MySQL-start step (#949):
+          # host-TCP probe with a real query, 3 consecutive successes.
+          consecutive=0
           for i in $(seq 1 60); do
-            if docker exec bintrail-test-mariadb mariadb-admin ping -u root -ptestroot --silent 2>/dev/null; then
-              echo "MariaDB source is ready."; exit 0
+            if docker run --rm --network host mariadb:11.4 \
+                 mariadb --protocol=TCP -h 127.0.0.1 -P 13307 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MariaDB source is ready."; exit 0; }
+            else
+              consecutive=0
             fi
             sleep 2
           done
@@ -167,9 +220,16 @@ jobs:
             -p 13306:3306 \
             mysql:8.4 \
             --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          # Host-TCP probe, 3 consecutive successes — see integration-mysql
+          # job above / #949 for why `docker exec ... mysqladmin ping` races.
+          consecutive=0
           for i in $(seq 1 60); do
-            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
-              echo "MySQL index is ready."; exit 0
+            if docker run --rm --network host mysql:8.4 \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MySQL index is ready."; exit 0; }
+            else
+              consecutive=0
             fi
             sleep 2
           done
