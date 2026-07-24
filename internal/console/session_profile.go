@@ -84,14 +84,22 @@ func (s *Server) selectedID(r *http.Request) string {
 // nonexistent profile is a 403 with an actionable message (the session's profile
 // is misconfigured — never silently enforce nothing); anything else is a logged
 // 500.
-func writeSessionProfileError(w http.ResponseWriter, err error) {
+func writeSessionProfileError(w http.ResponseWriter, r *http.Request, err error) {
 	var nf *profileNotFoundError
 	if errors.As(err, &nf) {
+		recordConsoleDeny(r, "profile.denied", "", map[string]string{"reason": "profile_not_found", "profile": nf.profile})
 		writeJSONError(w, http.StatusForbidden, nf.Error())
 		return
 	}
 	slog.Error("console: session profile enforcement failed", "error", err)
 	writeJSONError(w, http.StatusInternalServerError, "couldn't apply your access profile — check the server log")
+}
+
+// recordProfileGateDeny audits a raw/baseline-data surface refused because the
+// session carries a data profile (reconstruct, baselines, recover-cascade,
+// verify, extension views). No-op with no sink installed.
+func recordProfileGateDeny(r *http.Request, surface string) {
+	recordConsoleDeny(r, "profile.denied", "", map[string]string{"reason": "unredactable_surface", "surface_gate": surface})
 }
 
 // profileNotFoundError signals that a session's data profile does not exist on

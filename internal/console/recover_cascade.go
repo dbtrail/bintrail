@@ -83,6 +83,9 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 	// capability gate is intended to hide the tab once the frontend lands (#580);
 	// this guard is the actual enforcement / defense-in-depth backstop.
 	if s.rbacActiveFor(r) {
+		if sessionRestricted(r) {
+			recordProfileGateDeny(r, "recover-cascade")
+		}
 		writeJSONError(w, http.StatusForbidden,
 			"recover-cascade is unavailable while an RBAC redaction profile is active "+
 				"(cascade victim synthesis cannot yet honor column redaction / table deny)")

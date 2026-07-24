@@ -77,13 +77,13 @@ func TestApplySessionProfileNoOp(t *testing.T) {
 func TestWriteSessionProfileError(t *testing.T) {
 	// A nonexistent profile → 403.
 	rec := httptest.NewRecorder()
-	writeSessionProfileError(rec, &profileNotFoundError{"ghost"})
+	writeSessionProfileError(rec, httptest.NewRequest("GET", "/api/events", nil), &profileNotFoundError{"ghost"})
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("profileNotFoundError → %d, want 403", rec.Code)
 	}
 	// Any other error → 500.
 	rec = httptest.NewRecorder()
-	writeSessionProfileError(rec, errors.New("db down"))
+	writeSessionProfileError(rec, httptest.NewRequest("GET", "/api/events", nil), errors.New("db down"))
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("generic error → %d, want 500", rec.Code)
 	}
@@ -120,7 +120,7 @@ func scopedServer(t *testing.T, profile string) (*Server, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok, _, err := srv.sessions.IssueWithPolicy(&ext.AccessPolicy{Permissions: ext.AllPermissions(), Profile: profile})
+	tok, _, err := srv.sessions.IssueWithPolicy("test-user", &ext.AccessPolicy{Permissions: ext.AllPermissions(), Profile: profile})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -70,7 +70,7 @@ func (s *Server) handleAuthInfo(w http.ResponseWriter, r *http.Request) {
 // The identity is logged for the operator's audit trail and never stored.
 func (s *Server) extSessionIssuer() ext.ConsoleSessionIssuer {
 	return func(identity string, policy *ext.AccessPolicy) (string, time.Time, error) {
-		token, expires, err := s.sessions.IssueWithPolicy(policy)
+		token, expires, err := s.sessions.IssueWithPolicy(identity, policy)
 		if err != nil {
 			return "", time.Time{}, err
 		}
@@ -160,7 +160,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	// counters for parity with login/change-password (Allow() above only
 	// throttles when Fail() has populated the per-IP windows).
 	s.loginLimiter.Success(ip)
-	token, expires, err := s.sessions.Issue()
+	token, expires, err := s.sessions.IssueWithPolicy(req.Username, nil)
 	if err != nil {
 		slog.Error("console session issue failed after setup", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, "password set, but couldn't sign you in automatically — please sign in")
@@ -220,7 +220,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.loginLimiter.Success(ip)
-		token, expires, err := s.sessions.IssueWithPolicy(cred.Policy)
+		token, expires, err := s.sessions.IssueWithPolicy(cred.Identity, cred.Policy)
 		if err != nil {
 			slog.Error("console session issue failed", "error", err)
 			writeJSONError(w, http.StatusInternalServerError, "something went wrong signing you in — try again")
@@ -257,7 +257,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.loginLimiter.Success(ip)
-	token, expires, err := s.sessions.Issue()
+	token, expires, err := s.sessions.IssueWithPolicy(a.Username, nil)
 	if err != nil {
 		slog.Error("console session issue failed", "error", err)
 		writeJSONError(w, http.StatusInternalServerError, "something went wrong signing you in — try again")

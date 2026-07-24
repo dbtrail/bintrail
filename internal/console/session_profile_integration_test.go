@@ -48,7 +48,7 @@ func newProfileIndexServer(t *testing.T) *Server {
 // never masks the data-profile gate) plus the given data profile.
 func scopedBearer(t *testing.T, srv *Server, profile string) string {
 	t.Helper()
-	tok, _, err := srv.sessions.IssueWithPolicy(&ext.AccessPolicy{Permissions: ext.AllPermissions(), Profile: profile})
+	tok, _, err := srv.sessions.IssueWithPolicy("test-user", &ext.AccessPolicy{Permissions: ext.AllPermissions(), Profile: profile})
 	if err != nil {
 		t.Fatal(err)
 	}

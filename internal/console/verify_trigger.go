@@ -156,6 +156,9 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.rbacActiveFor(r) {
+		if sessionRestricted(r) {
+			recordProfileGateDeny(r, "verify")
+		}
 		writeJSONError(w, http.StatusForbidden,
 			"verification isn't available while an access-control profile is active — baseline and live-source reads aren't redacted")
 		return
@@ -252,6 +255,9 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.rbacActiveFor(r) {
+		if sessionRestricted(r) {
+			recordProfileGateDeny(r, "verify-explain")
+		}
 		writeJSONError(w, http.StatusForbidden,
 			"verification isn't available while an access-control profile is active — baseline reads aren't redacted")
 		return

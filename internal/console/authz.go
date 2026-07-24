@@ -170,6 +170,7 @@ func (s *Server) authzMiddleware(next http.Handler) http.Handler {
 			// Every /api route must be classified; an omission must not silently
 			// grant a scoped session access it was never evaluated for.
 			slog.Error("console: unclassified /api route refused for a scoped session (fail closed)", "method", r.Method, "path", r.URL.Path)
+			recordConsoleDeny(r, "authz.denied", "", map[string]string{"reason": "unclassified_route"})
 			writeJSONError(w, http.StatusForbidden, "forbidden: this route has no authorization policy")
 			return
 		}
@@ -178,7 +179,29 @@ func (s *Server) authzMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		slog.Warn("console: request denied by session policy", "method", r.Method, "path", r.URL.Path, "missing_permission", string(perm))
+		recordConsoleDeny(r, "authz.denied", string(perm), nil)
 		writeJSONError(w, http.StatusForbidden, "forbidden: your role lacks the "+string(perm)+" permission")
+	})
+}
+
+// recordConsoleDeny emits an authorization denial on the audit seam (a no-op
+// with no sink installed — the OSS default). Actor is the session's verified
+// login identity when known; Detail carries the route and, for a permission
+// denial, the missing permission. Never blocks the response path (the sink
+// contract) and never carries request bodies or row data.
+func recordConsoleDeny(r *http.Request, action, missingPermission string, extra map[string]string) {
+	detail := map[string]string{"method": r.Method, "path": r.URL.Path}
+	if missingPermission != "" {
+		detail["missing_permission"] = missingPermission
+	}
+	for k, v := range extra {
+		detail[k] = v
+	}
+	ext.Record(r.Context(), ext.AuditEvent{
+		Surface: "console",
+		Action:  action,
+		Actor:   identityFrom(r.Context()),
+		Detail:  detail,
 	})
 }
 

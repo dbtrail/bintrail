@@ -274,7 +274,7 @@ func TestScopedSessionEnforcedEndToEnd(t *testing.T) {
 	}
 
 	viewer := &ext.AccessPolicy{Permissions: []ext.Permission{ext.PermStatusRead, ext.PermServersRead}}
-	scoped, _, err := srv.sessions.IssueWithPolicy(viewer)
+	scoped, _, err := srv.sessions.IssueWithPolicy("test-viewer", viewer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestCapabilitiesReportsScopedPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 	viewer := &ext.AccessPolicy{Permissions: []ext.Permission{ext.PermStatusRead, ext.PermServersRead}}
-	scoped, _, _ := srv.sessions.IssueWithPolicy(viewer)
+	scoped, _, _ := srv.sessions.IssueWithPolicy("test-viewer", viewer)
 
 	rec := getPath(t, srv, "127.0.0.1:8090", "/api/capabilities", scoped)
 	if rec.Code != http.StatusOK {

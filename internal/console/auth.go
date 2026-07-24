@@ -70,6 +70,16 @@ func policyFrom(ctx context.Context) *ext.AccessPolicy {
 	return p
 }
 
+// identityCtxKey carries the session's verified login identity ("" for the
+// static token and for sessions minted with no identity). Display/audit only —
+// authorization decisions key on the policy, never on this string.
+type identityCtxKey struct{}
+
+func identityFrom(ctx context.Context) string {
+	s, _ := ctx.Value(identityCtxKey{}).(string)
+	return s
+}
+
 // tokenMiddleware requires a valid bearer credential on every wrapped
 // request: either the static access token or a login session. Both checks
 // run on the same path with no prefix branching, so response shape never
@@ -100,9 +110,10 @@ func (s *Server) tokenMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authKindCtxKey{}, authKindToken)))
 			return
 		}
-		if policy, ok := s.sessions.Lookup(got); ok {
+		if identity, policy, ok := s.sessions.Lookup(got); ok {
 			ctx := context.WithValue(r.Context(), authKindCtxKey{}, authKindSession)
 			ctx = context.WithValue(ctx, policyCtxKey{}, policy)
+			ctx = context.WithValue(ctx, identityCtxKey{}, identity)
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}

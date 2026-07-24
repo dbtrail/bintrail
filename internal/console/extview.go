@@ -92,6 +92,9 @@ func (s *Server) consoleFetch(b *bundle) func(ctx context.Context, opts query.Op
 func (s *Server) rbacViewGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.profileActiveFor(r) {
+			if sessionRestricted(r) {
+				recordProfileGateDeny(r, "extension-view")
+			}
 			writeJSONError(w, http.StatusForbidden,
 				"this view is unavailable while an access-control profile is active")
 			return

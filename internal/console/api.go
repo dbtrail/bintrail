@@ -203,7 +203,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
 	if err != nil {
-		writeSessionProfileError(w, err)
+		writeSessionProfileError(w, r, err)
 		return
 	}
 	rows, plan, err := s.fetchRestricted(r.Context(), r, b, opts)
@@ -251,7 +251,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	}
 	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
 	if err != nil {
-		writeSessionProfileError(w, err)
+		writeSessionProfileError(w, r, err)
 		return
 	}
 	// Refuse to generate an undo script for the entire index; a recovery must

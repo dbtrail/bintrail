@@ -58,6 +58,7 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	// profile is refused the listing (#1075) — the same invariant that gates
 	// reconstruct. A startup profile already forced baselineConfigured false.
 	if sessionRestricted(r) {
+		recordProfileGateDeny(r, "baselines")
 		writeJSONError(w, http.StatusForbidden,
 			"baseline listings are unavailable while an access-control profile is active — baseline reads aren't redacted")
 		return

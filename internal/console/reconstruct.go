@@ -208,7 +208,12 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	// (advertising a nav item that only 403s would be a lie) — and for an invalid
 	// id, which buildHandler declined to mount (advertising it would 404 the data
 	// route).
-	if p := ext.ConsoleView(); p != nil && !s.profileActiveFor(r) && ext.ValidConsoleViewID(p.ID()) {
+	// Also suppressed when the session's policy lacks extview:read: the data
+	// routes would 403 (authzMiddleware), so advertising the nav item to such
+	// a session would be a lie. Allows is nil-safe (nil policy = full access),
+	// so OSS sessions are unaffected.
+	if p := ext.ConsoleView(); p != nil && !s.profileActiveFor(r) &&
+		policyFrom(r.Context()).Allows(ext.PermExtViewRead) && ext.ValidConsoleViewID(p.ID()) {
 		resp.ExtensionViews = []extensionViewDTO{{ID: p.ID(), Label: p.Label(), Script: p.Script()}}
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -263,6 +268,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	// baselineConfigured already folds in the STARTUP profile; this adds the
 	// per-session one.
 	if sessionRestricted(r) {
+		recordProfileGateDeny(r, "reconstruct")
 		writeJSONError(w, http.StatusForbidden,
 			"time-travel is unavailable while an access-control profile is active — baseline reads aren't redacted")
 		return
