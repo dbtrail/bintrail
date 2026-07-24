@@ -111,6 +111,12 @@ jobs:
       # Matches internal/testutil.DefaultDSN — set explicitly to mirror the
       # SaaS repo's `agent/` job and make the wiring obvious in logs.
       BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
+      # A MySQL server is guaranteed present in this job (started below), so
+      # SkipIfNoMySQL must FAIL (not silently skip) on a dial/ping failure —
+      # otherwise a DSN or build-tag drift would exit 0 green with ZERO
+      # coverage of the flagship capture->index->query->recover pipeline.
+      # Mirrors BINTRAIL_REQUIRE_MARIADB / BINTRAIL_REQUIRE_POSTGRES (#949).
+      BINTRAIL_REQUIRE_MYSQL: "1"
 
     steps:
       # Step-level (not job-level) `if:` — see the note on the `changes` job.
@@ -163,9 +169,23 @@ jobs:
       # lets one package's DDL/DML leak into another's binlog window (the binlog
       # parser tests assert exact event counts). Serializing keeps each package
       # the sole writer during its run.
+      #
+      # BINTRAIL_REQUIRE_MYSQL=1 (above) only catches a dial/ping failure INSIDE
+      # a test that actually runs — a build-tag or path drift that silently
+      # dropped the integration tests from this run would still exit 0 green
+      # with ZERO MySQL coverage. Close that false-green the same way the
+      # PostgreSQL-source job does: assert the flagship end-to-end and
+      # caching_sha2 auth-seam tests genuinely ran, not merely that `go test`
+      # exited 0. pipefail keeps the go-test exit code through the tee.
       - name: Integration tests (-tags=integration)
         if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
-        run: go test -tags=integration -race -p 1 -count=1 ./...
+        run: |
+          set -o pipefail
+          go test -tags=integration -race -p 1 -count=1 -v ./... 2>&1 | tee /tmp/mysql-it.out
+          grep -q -- '--- PASS: TestEndToEnd_fullPipeline' /tmp/mysql-it.out \
+            || { echo "FATAL: MySQL end-to-end integration test did not run — false-green tripwire" >&2; exit 1; }
+          grep -q -- '--- PASS: TestCachingSha2ColdAuthSeam' /tmp/mysql-it.out \
+            || { echo "FATAL: caching_sha2 cold-auth seam test did not run — false-green tripwire" >&2; exit 1; }
 
   integration-mariadb-source:
     # MariaDB-as-source alpha. A MariaDB-source test pairs a NEW MariaDB SOURCE

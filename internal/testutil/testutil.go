@@ -37,18 +37,44 @@ func IntegrationDSN(dbName string) string {
 	return BaseDSN() + "/" + dbName + "?parseTime=true"
 }
 
-// SkipIfNoMySQL pings the MySQL server and calls t.Skip if unreachable.
-// This provides graceful degradation when no Docker container is running.
+// MySQLRequired reports whether MySQL integration tests must RUN (and fail
+// rather than skip) when the server is unreachable. The dedicated 8.0/8.4
+// integration matrix jobs set BINTRAIL_REQUIRE_MYSQL=1, where a MySQL server
+// is guaranteed present — so a silent skip there would be a false green that
+// hides a real regression in the flagship capture->index->query->recover
+// pipeline. Unset on developer machines, where graceful skipping is right.
+// Mirrors MariaDBRequired / PostgresRequired.
+func MySQLRequired() bool {
+	return os.Getenv("BINTRAIL_REQUIRE_MYSQL") == "1"
+}
+
+// SkipIfNoMySQL pings the MySQL server and calls t.Skip if unreachable, or
+// t.Fatal when MySQLRequired() — so a dial/ping failure never silently
+// passes as green in the CI job that guarantees a live MySQL server. This
+// provides graceful degradation when no Docker container is running.
 func SkipIfNoMySQL(t *testing.T) {
 	t.Helper()
 	db, err := sql.Open("mysql", BaseDSN()+"/?parseTime=true")
 	if err != nil {
-		t.Skipf("skipping: cannot open MySQL connection: %v", err)
+		skipOrFailMySQL(t, "cannot open MySQL connection: %v", err)
+		return
 	}
 	defer db.Close()
 	if err := db.Ping(); err != nil {
-		t.Skipf("skipping: MySQL not reachable: %v", err)
+		skipOrFailMySQL(t, "MySQL not reachable: %v", err)
 	}
+}
+
+// skipOrFailMySQL fails the test when MySQLRequired(), otherwise skips it.
+// Scoped to connectivity failures only (dial/ping) — callers must not use
+// this for other skip reasons (e.g. a version-gated feature), which must
+// stay t.Skip regardless of MySQLRequired().
+func skipOrFailMySQL(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if MySQLRequired() {
+		t.Fatalf(format+" (BINTRAIL_REQUIRE_MYSQL=1 — the integration matrix job must provide a live MySQL server)", args...)
+	}
+	t.Skipf("skipping: "+format, args...)
 }
 
 // CreateTestDB creates a unique database for the calling test, returning
