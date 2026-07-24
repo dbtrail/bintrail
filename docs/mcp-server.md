@@ -152,21 +152,30 @@ the Python `proxy.py` does the same job — see
 
 ### claude.ai and Claude mobile
 
-Reaching your index from the web app or your phone needs an OAuth **gateway** in
-front — an **advanced, optional** path. Most people use Claude Code or Claude
-Desktop above instead. Two ways to get a gateway:
+claude.ai and the mobile apps connect **outbound** to a public HTTPS URL and
+authenticate with OAuth. Neither `bintrail-mcp` nor `bintrail-console` speaks
+OAuth, so this path needs an OAuth-capable gateway in front — an **advanced,
+optional** setup. Most people use Claude Code or Claude Desktop above instead;
+those reach a private index over stdio or bridge mode and need no public
+endpoint at all.
 
-- **Self-host it (open source).** Build `cmd/mcp-gateway` and run it behind HTTPS
-  on your own infrastructure and public domain.
 - **dbtrail's hosted gateway (managed-service customers).** dbtrail operates one
-  at `https://mcp.dbtrail.com/mcp` and provisions your tenant — this requires a
-  dbtrail account; the open-source repo does not give you access to it.
+  at `https://mcp.dbtrail.com/mcp` and provisions your tenant. This requires a
+  dbtrail account — it is a managed service, not part of this repository.
+- **Your own gateway.** This repository does not ship one. The binaries here are
+  `bintrail`, `bintrail-console`, `bintrail-mcp`, and `bintrail-pg` — none of
+  them terminate OAuth. If you want the claude.ai path on your own
+  infrastructure, put an OAuth-capable reverse proxy (any of the usual
+  identity-aware proxies) in front of `bintrail-mcp --http` or the console's
+  `/mcp` endpoint, and have it forward the authenticated request. For a shared
+  backend serving several indexes, `bintrail-mcp --tenant-dsns` resolves a
+  per-tenant DSN from an `X-Bintrail-Tenant` request header your proxy sets.
 
-Once a gateway is reachable at a public URL: in **claude.ai → Settings →
+Once such a gateway is reachable at a public URL: in **claude.ai → Settings →
 Integrations → Add custom integration**, enter the gateway URL (your domain, or
-`https://mcp.dbtrail.com/mcp` for managed customers), complete the OAuth login
-with your **tenant ID**, and the four tools appear. Works from web, Desktop, and
-mobile; tokens refresh automatically.
+`https://mcp.dbtrail.com/mcp` for managed customers), complete the OAuth login,
+and the four tools appear. Works from web, Desktop, and mobile; tokens refresh
+automatically.
 
 ---
 

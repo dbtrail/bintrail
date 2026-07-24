@@ -7,7 +7,6 @@ deploy/.env
 # Build artifacts
 /bintrail
 /bintrail-mcp
-/mcp-gateway
 /bintrail-console
 /dist/
 

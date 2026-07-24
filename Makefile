@@ -1,6 +1,5 @@
 BINARY_NAME=bintrail
 MCP_BINARY=bintrail-mcp
-GATEWAY_BINARY=mcp-gateway
 CONSOLE_BINARY=bintrail-console
 PG_BINARY=bintrail-pg
 VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -9,22 +8,18 @@ BUILD_DATE=$(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 BINTRAIL_LDFLAGS=-ldflags "-X main.Version=$(VERSION) -X main.CommitSHA=$(COMMIT) -X main.BuildDate=$(BUILD_DATE)"
 MCP_LDFLAGS=-ldflags "-X main.mcpVersion=$(VERSION)"
-GATEWAY_LDFLAGS=-ldflags "-X main.gatewayVersion=$(VERSION)"
 # bintrail-console and bintrail-pg both reuse BINTRAIL_LDFLAGS: they inject the
 # same main.Version/CommitSHA/BuildDate vars as the core binary.
 
-.PHONY: all build build-mcp build-gateway build-console build-pg clean test console-e2e lint install build-all tidy deps notices check-notices mcpb validate-mcpb
+.PHONY: all build build-mcp build-console build-pg clean test console-e2e lint install build-all tidy deps notices check-notices mcpb validate-mcpb
 
-all: build build-mcp build-gateway build-console build-pg
+all: build build-mcp build-console build-pg
 
 build:
 	go build $(BINTRAIL_LDFLAGS) -o $(BINARY_NAME) ./cmd/bintrail
 
 build-mcp:
 	go build $(MCP_LDFLAGS) -o $(MCP_BINARY) ./cmd/bintrail-mcp
-
-build-gateway:
-	go build $(GATEWAY_LDFLAGS) -o $(GATEWAY_BINARY) ./cmd/mcp-gateway
 
 # bintrail-console links DuckDB (console → query → parquetquery), so it
 # requires CGO_ENABLED=1 like the core bintrail binary.
@@ -40,12 +35,11 @@ build-pg:
 install:
 	go install $(BINTRAIL_LDFLAGS) ./cmd/bintrail
 	go install $(MCP_LDFLAGS) ./cmd/bintrail-mcp
-	go install $(GATEWAY_LDFLAGS) ./cmd/mcp-gateway
 	go install $(BINTRAIL_LDFLAGS) ./cmd/bintrail-console
 	go install $(BINTRAIL_LDFLAGS) ./cmd/bintrail-pg
 
 clean:
-	rm -f $(BINARY_NAME) $(MCP_BINARY) $(GATEWAY_BINARY) $(CONSOLE_BINARY) $(PG_BINARY)
+	rm -f $(BINARY_NAME) $(MCP_BINARY) $(CONSOLE_BINARY) $(PG_BINARY)
 	go clean
 
 test:
@@ -80,10 +74,6 @@ build-all:
 	GOOS=linux   GOARCH=arm64 CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc go build $(BINTRAIL_LDFLAGS) -o dist/$(PG_BINARY)-linux-arm64 ./cmd/bintrail-pg
 	GOOS=darwin  GOARCH=amd64 CGO_ENABLED=1 go build $(BINTRAIL_LDFLAGS) -o dist/$(PG_BINARY)-darwin-amd64 ./cmd/bintrail-pg
 	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=1 go build $(BINTRAIL_LDFLAGS) -o dist/$(PG_BINARY)-darwin-arm64 ./cmd/bintrail-pg
-	GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-linux-amd64 ./cmd/mcp-gateway
-	GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-linux-arm64 ./cmd/mcp-gateway
-	GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-darwin-amd64 ./cmd/mcp-gateway
-	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-darwin-arm64 ./cmd/mcp-gateway
 
 # Build + validate an .mcpb MCP Bundle (the Claude Desktop one-click install
 # format) for the HOST platform, e.g. dist/mcpb/dbtrail-darwin-arm64.mcpb on

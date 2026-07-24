@@ -15,12 +15,13 @@
 //
 //	bintrail-mcp --connect http://host:8090/mcp --token <token>
 //
-// Multi-tenant mode (for shared backends behind mcp-gateway):
+// Multi-tenant mode (one backend serving several indexes, behind a proxy
+// that authenticates callers and tags them):
 //
 //	bintrail-mcp --http :8080 --tenant-dsns tenant-dsns.json
 //
-// The gateway sends X-Bintrail-Tenant headers; the server resolves the
-// tenant's index DSN from the provided JSON map file.
+// The fronting proxy sends an X-Bintrail-Tenant header; the server resolves
+// that tenant's index DSN from the provided JSON map file.
 //
 // Configuration:
 //
