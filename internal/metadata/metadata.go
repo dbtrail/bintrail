@@ -200,6 +200,7 @@ func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (snapshotSca
 	var stats snapshotScanStats
 	tableSawColumnType := make(map[string]bool)
 	tableSawDataType := make(map[string]bool)
+	dupRows := make(map[string]int) // "schema.table" → identical duplicate rows dropped
 
 	for rows.Next() {
 		var schemaName, tableName, columnName, columnKey, dataType, columnType, characterSet string
@@ -227,6 +228,21 @@ func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (snapshotSca
 			IsIdentityAlways: isIdentityAlways,
 			CharacterSet:     characterSet,
 		}
+		// Duplicate (schema, table, ordinal_position) rows within one snapshot:
+		// pre-#844 concurrent snapshot writers could share a snapshot_id and
+		// double-insert every column. Loading them verbatim inflates the column
+		// count, and the #700 drift guard then skips 100% of row events until
+		// an operator re-snapshots (#1033). Rows arrive ordered by ordinal, so
+		// duplicates are adjacent to the last kept column.
+		if n := len(tm.Columns); n > 0 && tm.Columns[n-1].OrdinalPosition == ordinalPosition {
+			if tm.Columns[n-1] == col {
+				dupRows[key]++
+				continue
+			}
+			return stats, fmt.Errorf("snapshot is corrupt: %s has two different columns at ordinal_position %d (%q vs %q) — re-run `bintrail snapshot` to write a clean snapshot",
+				key, ordinalPosition, tm.Columns[n-1].Name, columnName)
+		}
+
 		if columnType != "" {
 			stats.sawColumnType = true
 			tableSawColumnType[key] = true
@@ -251,6 +267,25 @@ func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (snapshotSca
 		}
 	}
 	sort.Strings(stats.pre212Tables)
+
+	if len(dupRows) > 0 {
+		names := make([]string, 0, len(dupRows))
+		total := 0
+		for k, n := range dupRows {
+			names = append(names, k)
+			total += n
+		}
+		sort.Strings(names)
+		const nameCap = 20
+		if len(names) > nameCap {
+			names = names[:nameCap]
+		}
+		slog.Warn("snapshot contains duplicated column rows (pre-#844 concurrent snapshot writers); "+
+			"loaded deduplicated — re-run `bintrail snapshot` to write a clean snapshot",
+			"duplicate_rows", total,
+			"table_count", len(dupRows),
+			"tables", strings.Join(names, ", "))
+	}
 
 	return stats, nil
 }

@@ -1108,3 +1108,74 @@ func TestTakeSnapshot_concurrentAllocatorSerialized(t *testing.T) {
 		}
 	}
 }
+
+// ─── #1033: corrupt snapshot with duplicated column rows ─────────────────────
+
+func TestNewResolver_dedupesDuplicatedSnapshotRows(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	// Pre-#844 concurrent writers sharing one snapshot_id: every column
+	// double-inserted. The resolver must report the real column count, or the
+	// #700 guard skips 100% of row events (#1033).
+	for range 2 {
+		testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "wp_options", "option_id", 1, "PRI", "bigint", "NO")
+		testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "wp_options", "option_name", 2, "", "varchar", "NO")
+		testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "wp_options", "option_value", 3, "", "longtext", "NO")
+		testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "wp_options", "autoload", 4, "", "varchar", "NO")
+	}
+
+	resolver, err := NewResolver(indexDB, 0)
+	if err != nil {
+		t.Fatalf("NewResolver failed: %v", err)
+	}
+	tm, err := resolver.Resolve("mydb", "wp_options")
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if len(tm.Columns) != 4 {
+		t.Errorf("expected 4 deduplicated columns, got %d", len(tm.Columns))
+	}
+	if len(tm.PKColumns) != 1 {
+		t.Errorf("expected 1 PK column, got %v", tm.PKColumns)
+	}
+}
+
+func TestNewLatestPerTableResolver_dedupesDuplicatedSnapshotRows(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	for range 2 {
+		testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "wp_options", "option_id", 1, "PRI", "bigint", "NO")
+		testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "wp_options", "option_name", 2, "", "varchar", "NO")
+	}
+
+	resolver, err := NewLatestPerTableResolver(indexDB)
+	if err != nil {
+		t.Fatalf("NewLatestPerTableResolver failed: %v", err)
+	}
+	tm, err := resolver.Resolve("mydb", "wp_options")
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if len(tm.Columns) != 2 {
+		t.Errorf("expected 2 deduplicated columns, got %d", len(tm.Columns))
+	}
+}
+
+func TestNewResolver_conflictingDuplicateRowsFailLoudIntegration(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "orders", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "orders", "name", 2, "", "varchar", "NO")
+	testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "orders", "renamed", 2, "", "varchar", "NO")
+
+	_, err := NewResolver(indexDB, 0)
+	if err == nil {
+		t.Fatal("expected error for conflicting duplicate ordinal rows, got nil")
+	}
+	if !strings.Contains(err.Error(), "corrupt") {
+		t.Errorf("error should say the snapshot is corrupt, got: %v", err)
+	}
+}
