@@ -762,17 +762,30 @@ func TestRunReconstruct_rejectsRemainingUnsupportedPKTypes(t *testing.T) {
 			}
 
 			// No output files should be written — the reconstruct bailed
-			// out before any mydumper writer was opened.
+			// out before any mydumper writer was opened. The #842 completeness
+			// marker IS expected here: ReconstructTables stamps _INCOMPLETE
+			// before any per-table work starts (and this run never reaches
+			// _SUCCESS, since the PK-type rejection is a per-table error), so
+			// filter it out rather than requiring a byte-for-byte empty dir.
 			entries, readErr := os.ReadDir(outputDir)
 			if readErr != nil {
 				t.Fatalf("read output dir: %v", readErr)
 			}
-			if len(entries) != 0 {
-				var names []string
-				for _, e := range entries {
-					names = append(names, e.Name())
+			var unexpected []string
+			for _, e := range entries {
+				if e.Name() == baseline.IncompleteMarker || e.Name() == baseline.SuccessMarker {
+					continue
 				}
-				t.Errorf("output dir should be empty on PK-type rejection, got: %v", names)
+				unexpected = append(unexpected, e.Name())
+			}
+			if len(unexpected) != 0 {
+				t.Errorf("output dir should have no data/schema files on PK-type rejection, got: %v", unexpected)
+			}
+			if _, statErr := os.Stat(filepath.Join(outputDir, baseline.IncompleteMarker)); statErr != nil {
+				t.Errorf("expected %s marker after a failed run: %v", baseline.IncompleteMarker, statErr)
+			}
+			if _, statErr := os.Stat(filepath.Join(outputDir, baseline.SuccessMarker)); statErr == nil {
+				t.Errorf("%s marker must not exist after a failed run", baseline.SuccessMarker)
 			}
 		})
 	}

@@ -133,7 +133,7 @@ func init() {
 	reconstructCmd.Flags().StringVar(&recTables, "tables", "", "Comma-separated schema.table list for --output-format=mydumper (e.g. mydb.orders,mydb.users)")
 	reconstructCmd.Flags().StringVar(&recChunkSize, "chunk-size", "256MB", "Max size per SQL chunk file in full-table mode (e.g. 64MB, 1GB)")
 	reconstructCmd.Flags().IntVar(&recParallelism, "parallelism", 0, "Max tables to reconstruct concurrently in full-table mode (default: runtime.NumCPU())")
-	reconstructCmd.Flags().Int64Var(&recWarnEvents, "warn-event-threshold", 5_000_000, "Full-table mode: log a memory warning when a table's reconstruct window exceeds this many events (full-table reconstruct holds them all in RAM, #654; 0 disables)")
+	reconstructCmd.Flags().Int64Var(&recWarnEvents, "warn-event-threshold", 5_000_000, "Full-table mode: log a memory warning when a table's reconstruct window exceeds this many events (full-table reconstruct holds them all in RAM, #654; this threshold is divided by --parallelism, capped to the number of --tables, so it reflects the total concurrent RAM across tables reconstructing at once, #842; 0 disables)")
 	AddDuckDBTuningFlags(reconstructCmd)
 	BindCommandEnv(reconstructCmd)
 
@@ -633,6 +633,11 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 		AllowGaps:          recAllowGaps,
 		WarnEventThreshold: recWarnEvents,
 		ArchiveFetcher:     TunedArchiveFetcher(duckTuning),
+		// Same resolved --ultrafast/--duckdb-* budget as ArchiveFetcher above,
+		// but for the merge/baseline DuckDB sessions ReconstructTables opens
+		// directly (#842) — those previously ignored these flags entirely and
+		// defaulted to ~80% of host RAM regardless of what the operator set.
+		DuckDBTuning: duckTuning,
 	}
 	reports, err := reconstruct.ReconstructTables(cmd.Context(), cfg)
 	if err != nil {

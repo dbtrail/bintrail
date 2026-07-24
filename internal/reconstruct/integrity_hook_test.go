@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 )
 
 // TestMaterializeBaselineLocal_validatesIntegrity pins the #636 read hook: the
@@ -29,7 +30,7 @@ func TestMaterializeBaselineLocal_validatesIntegrity(t *testing.T) {
 	}
 
 	// Clean → passes through unchanged.
-	got, cleanup, err := materializeBaselineLocal(context.Background(), p)
+	got, cleanup, err := materializeBaselineLocal(context.Background(), p, duckdbutil.Tuning{})
 	if err != nil {
 		t.Fatalf("clean baseline must materialize, got %v", err)
 	}
@@ -42,7 +43,7 @@ func TestMaterializeBaselineLocal_validatesIntegrity(t *testing.T) {
 	if err := os.WriteFile(p, []byte("CORRUPTED bytes — pretend bit-rot flipped these here"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := materializeBaselineLocal(context.Background(), p); !errors.Is(err, baselineintegrity.ErrIntegrity) {
+	if _, _, err := materializeBaselineLocal(context.Background(), p, duckdbutil.Tuning{}); !errors.Is(err, baselineintegrity.ErrIntegrity) {
 		t.Errorf("a corrupt baseline must fail loud with ErrIntegrity, got %v", err)
 	}
 
@@ -54,7 +55,7 @@ func TestMaterializeBaselineLocal_validatesIntegrity(t *testing.T) {
 	if err := os.WriteFile(legacy, []byte("legacy baseline, no manifest"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := materializeBaselineLocal(context.Background(), legacy); err != nil {
+	if _, _, err := materializeBaselineLocal(context.Background(), legacy, duckdbutil.Tuning{}); err != nil {
 		t.Errorf("a legacy baseline with no manifest must still materialize, got %v", err)
 	}
 }
