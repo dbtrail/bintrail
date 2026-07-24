@@ -436,19 +436,19 @@ func TestIntegrationRecover_autoCascade_gtidScoped(t *testing.T) {
 //
 // Seeded on table "parent", in this exact chronological order, with the
 // recover request's limit set to 3:
-//  1. DELETE id=1         (rank 1 of ALL events, rank 1 of DELETEs)
-//  2. INSERT id=99, noise (rank 2 of ALL events)
-//  3. INSERT id=98, noise (rank 3 of ALL events)
-//  4. DELETE id=2         (rank 4 of ALL events — excluded by baseRows'
-//     Limit=3 cutoff — but rank 2 of DELETEs, well within a DELETE-only
-//     fetch's own Limit=3)
+//  1. DELETE id=1         (oldest — excluded by baseRows' Limit=3 cutoff,
+//     since #981 fetches DESC and keeps the NEWEST 3 of the 4 events)
+//  2. INSERT id=99, noise
+//  3. INSERT id=98, noise
+//  4. DELETE id=2         (newest — kept)
 //
-// baseRows (Limit=3, ASC, all event types) therefore contains only
-// [DELETE id=1, noise, noise] — it never sees id=2's DELETE. A DELETE-only
-// re-fetch with the same Limit=3 returns BOTH deletes. The combined recover
-// must synthesize victims ONLY for id=1's children: id=2's parent is never
-// re-created by this recover (it's outside baseRows), so synthesizing its
-// children would orphan them once FOREIGN_KEY_CHECKS is re-enabled.
+// baseRows (Limit=3, effectively newest-first under #981, all event types)
+// therefore contains only [noise, noise, DELETE id=2] — it never sees id=1's
+// DELETE. A DELETE-only re-fetch with the same Limit=3 returns BOTH deletes.
+// The combined recover must synthesize victims ONLY for id=2's children:
+// id=1's parent is never re-created by this recover (it's outside baseRows),
+// so synthesizing its children would orphan them once FOREIGN_KEY_CHECKS is
+// re-enabled.
 func TestIntegrationRecover_autoCascade_limitTruncated(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
@@ -500,8 +500,9 @@ func TestIntegrationRecover_autoCascade_limitTruncated(t *testing.T) {
 	}
 
 	// Recover the whole table's history, capped at limit=3 — the exact numeric
-	// Limit that (pre-fix) let the internal DELETE-only parent-fetch see id=2's
-	// DELETE while baseRows' own Limit=3 cutoff never reached it.
+	// Limit that (pre-#772-fix) let the internal DELETE-only parent-fetch see
+	// id=1's DELETE even though baseRows' own Limit=3 cutoff (newest-first,
+	// #981) never reaches it.
 	rec, body := doReq(t, srv, "POST", "/api/recover",
 		`{"schema":"`+dbName+`","table":"parent","limit":3}`)
 	if rec.Code != 200 {
@@ -512,28 +513,28 @@ func TestIntegrationRecover_autoCascade_limitTruncated(t *testing.T) {
 		t.Fatalf("decode: %v (body=%s)", err, body)
 	}
 	if !resp.CascadeDetected {
-		t.Errorf("cascade_detected should be true (baseRows contains id=1's DELETE)")
+		t.Errorf("cascade_detected should be true (baseRows contains id=2's DELETE)")
 	}
 	if resp.VictimCount != 2 {
-		t.Errorf("victim_count = %d, want 2 (only id=1's children); a pre-fix regression would report 4 "+
-			"(id=2's children too, even though id=2's own parent is never re-inserted)\n---\n%s", resp.VictimCount, resp.SQL)
+		t.Errorf("victim_count = %d, want 2 (only id=2's children); a pre-fix regression would report 4 "+
+			"(id=1's children too, even though id=1's own parent is never re-inserted)\n---\n%s", resp.VictimCount, resp.SQL)
 	}
-	for _, want := range []string{"VALUES (10, 1)", "VALUES (11, 1)"} {
+	for _, want := range []string{"VALUES (20, 2)", "VALUES (21, 2)"} {
 		if !strings.Contains(resp.SQL, want) {
-			t.Errorf("SQL missing %q (id=1's own child)\n---\n%s", want, resp.SQL)
+			t.Errorf("SQL missing %q (id=2's own child)\n---\n%s", want, resp.SQL)
 		}
 	}
-	for _, notWant := range []string{"VALUES (20, 2)", "VALUES (21, 2)"} {
+	for _, notWant := range []string{"VALUES (10, 1)", "VALUES (11, 1)"} {
 		if strings.Contains(resp.SQL, notWant) {
-			t.Errorf("SQL must NOT include %q — id=2's parent fell outside baseRows' Limit-truncated "+
+			t.Errorf("SQL must NOT include %q — id=1's parent fell outside baseRows' Limit-truncated "+
 				"scope, so its children would be orphaned\n---\n%s", notWant, resp.SQL)
 		}
 	}
-	if strings.Contains(resp.SQL, "INSERT INTO `"+dbName+"`.`parent` (`id`) VALUES (2)") {
-		t.Errorf("SQL must NOT re-insert parent id=2 — it is outside this recover's Limit-truncated scope\n---\n%s", resp.SQL)
+	if strings.Contains(resp.SQL, "INSERT INTO `"+dbName+"`.`parent` (`id`) VALUES (1)") {
+		t.Errorf("SQL must NOT re-insert parent id=1 — it is outside this recover's Limit-truncated scope\n---\n%s", resp.SQL)
 	}
 	if c := strings.Count(resp.SQL, "`"+dbName+"`.`child`"); c != 2 {
-		t.Errorf("want exactly 2 child INSERTs (id=1's own), got %d\n---\n%s", c, resp.SQL)
+		t.Errorf("want exactly 2 child INSERTs (id=2's own), got %d\n---\n%s", c, resp.SQL)
 	}
 }
 

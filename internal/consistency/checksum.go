@@ -181,10 +181,14 @@ func consistentTableChecksum(ctx context.Context, db *sql.DB, schema, table stri
 	}
 
 	// Scan every row, hashing as we stream — no full-table buffering.
+	//
+	// promoteFloat is scoped to the normalize != nil (cross-renderer) callers
+	// only — see selectExpr's FLOAT case for why.
+	promoteFloat := normalize != nil
 	selectList := make([]string, len(cols))
 	res.Columns = make([]string, len(cols))
 	for i, c := range cols {
-		selectList[i] = selectExpr(c)
+		selectList[i] = selectExpr(c, promoteFloat)
 		res.Columns[i] = c.name
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s.%s",
@@ -349,11 +353,35 @@ func tableColumns(ctx context.Context, conn *sql.Conn, schema, table string) ([]
 // which is NOT what mydumper dumps or the binlog carries — so the digest would
 // not match a baseline. The CAST makes the canonical form parseTime-independent.
 // Other types (including TIME and YEAR, which the driver never parses) are read
-// as-is.
-func selectExpr(c column) string {
-	switch c.dataType {
-	case "date", "datetime", "timestamp":
+// as-is, EXCEPT FLOAT when promoteFloat is set (see below).
+//
+// promoteFloat controls a FLOAT-only widening: bare `SELECT f` renders through
+// MySQL's my_gcvt truncated to ~6 significant digits (FLT_DIG) — lossy
+// relative to the underlying binary float32 for any value that needs more
+// precision to round-trip (#795). `f+0e0` promotes the read to DOUBLE
+// arithmetic, so my_gcvt renders the value's full double-precision decimal
+// expansion (enough digits to identify the exact float32), which
+// canonicalFloatText(_, 32) then folds back to the same shortest float32
+// text a Go-side renderer produces for the identical stored value — closing
+// the gap without touching the recon side (see internal/verify/render.go's
+// canonicalFloatText doc).
+//
+// Scoped to promoteFloat (wired to normalize != nil, i.e. only
+// ConsistentTableChecksumNormalized's live-source verify caller) rather than
+// applied unconditionally: ConsistentTableChecksum's un-normalized digest must
+// stay byte-identical to mydumper's own FLOAT text (both MySQL's ordinary
+// my_gcvt truncation, matching today) so the baseline-dump-time fidelity
+// check (internal/baseline, #633) keeps comparing like renderings — widening
+// unconditionally would turn THAT comparison into a false MISMATCH instead
+// of fixing this one. `f+0e0` (not CAST(f AS DOUBLE), which needs MySQL
+// 8.0.17+) is plain arithmetic promotion, safe on the whole MySQL 8.0+ floor
+// and on MariaDB.
+func selectExpr(c column, promoteFloat bool) string {
+	switch {
+	case c.dataType == "date" || c.dataType == "datetime" || c.dataType == "timestamp":
 		return "CAST(" + quoteIdent(c.name) + " AS CHAR)"
+	case c.dataType == "float" && promoteFloat:
+		return quoteIdent(c.name) + "+0e0"
 	default:
 		return quoteIdent(c.name)
 	}

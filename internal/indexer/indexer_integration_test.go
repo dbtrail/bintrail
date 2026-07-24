@@ -5,6 +5,7 @@ package indexer
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -166,5 +167,43 @@ func TestRun_contextCancellation(t *testing.T) {
 	_, err := idx.Run(ctx, events)
 	if err == nil {
 		t.Error("expected context cancellation error, got nil")
+	}
+}
+
+// TestInsertBatch_oversizedPKValues verifies the #944 hard guard: a batch
+// containing one event whose PK encoding exceeds pk_values' VARCHAR(512)
+// capacity fails the WHOLE batch with a descriptive error, rather than
+// letting MySQL truncate pk_values and silently corrupt the generated
+// pk_hash (or hard-fail with an unhelpful Error 1406 under strict sql_mode).
+func TestInsertBatch_oversizedPKValues(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	idx := New(db, 1000)
+	ts := time.Date(2026, 2, 19, 12, 0, 0, 0, time.UTC)
+	oversized := strings.Repeat("a", 513)
+	batch := []parser.Event{
+		{
+			BinlogFile: "binlog.000001", StartPos: 100, EndPos: 200,
+			Timestamp: ts, Schema: "mydb", Table: "wide_pk",
+			EventType: parser.EventInsert, PKValues: oversized,
+			RowAfter: map[string]any{"id": oversized},
+		},
+	}
+
+	_, err := idx.InsertBatch(batch)
+	if err == nil {
+		t.Fatal("expected error for oversized PK values, got nil")
+	}
+	if !strings.Contains(err.Error(), "mydb") || !strings.Contains(err.Error(), "wide_pk") {
+		t.Errorf("expected error to name schema/table, got: %v", err)
+	}
+
+	var n int
+	if scanErr := db.QueryRow("SELECT COUNT(*) FROM binlog_events").Scan(&n); scanErr != nil {
+		t.Fatalf("query failed: %v", scanErr)
+	}
+	if n != 0 {
+		t.Errorf("expected no rows inserted (whole batch aborted before INSERT), got %d", n)
 	}
 }

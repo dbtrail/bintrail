@@ -93,4 +93,13 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/traffic.sh
 # 6033 = ProxySQL (Time Travel SQL entry point), 3306 = raw MySQL.
 EXPOSE 6033 3306
 
+# The demo image never reports usage telemetry, whatever the binary's
+# default is. Two layers, covering different holes: this ENV reaches ANY
+# process in the container (including `docker exec` and `--entrypoint
+# bash` pokes by an evaluator), while entrypoint.sh re-exports it so the
+# demo stack itself stays covered even if the ENV is overridden with
+# `docker run -e`. An evaluation image phoning home from someone's
+# laptop is the worst failure mode this project has.
+ENV DO_NOT_TRACK=1
+
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/dbtrail/dbtrail/ext"
 )
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -91,6 +93,12 @@ type Channel struct {
 	startAt        time.Time
 	logger         *slog.Logger
 	statusProvider func() *FlushStatus
+
+	// ExtDeps carries the connection handles handed to extension-registered
+	// commands (ext.RegisterAgentCommand) at dispatch time. Set once by the
+	// agent runner before Run — the same startup-only contract as the ext
+	// setters. The zero value is valid: registry handlers must nil-check.
+	ExtDeps ext.AgentDeps
 }
 
 // FlushStatus holds the current state of the BYOS flush pipeline,
@@ -309,7 +317,7 @@ func (ch *Channel) listenLoop(ctx context.Context, conn *websocket.Conn) error {
 			"command_id", cmd.ID,
 			"type", cmd.Type)
 
-		resp := dispatch(ctx, ch.handler, cmd)
+		resp := dispatch(ctx, ch.handler, cmd, ch.ExtDeps)
 
 		if err := writeJSON(ctx, conn, resp); err != nil {
 			return fmt.Errorf("write response: %w", err)

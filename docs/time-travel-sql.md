@@ -19,21 +19,75 @@ The query is answered by `bintrail shim`, an in-process MySQL-protocol server (a
                                 └──────────┘                   └────────────┘
 ```
 
-## Two ways to run time-travel SQL
+## Three ways to run time-travel SQL
 
-There are two ways to put `AS OF` SQL in front of your data; they differ only in
-*how the client connects*:
+There are three ways to put `AS OF` SQL in front of your data; they differ only
+in *how the client connects*:
 
-1. **A dedicated terminal — point `mysql` straight at the shim (no ProxySQL).**
-   Simplest. The shim already speaks the MySQL protocol, so an analyst connects
-   a `mysql` client directly to it and runs `_flashback` / `_snapshot` / `_diff`
-   queries. Trade-off: that connection answers *only* time-travel queries (a
-   normal `SELECT` against a real table returns `ER_NOT_SUPPORTED_YET`, 1235).
-   Use it when a person or tool just needs to read historical state.
-2. **Transparent routing — ProxySQL in front (the rest of this guide).** Needed
+1. **Embedded in `bintrail-console watch` — one port for every monitored server
+   (multi-source).** If you already run the daemon, add `--flashback-listen`
+   and it serves `_flashback` / `_snapshot` / `_diff` for *every* server in the
+   console, routed by the connection username. No separate `bintrail shim`
+   process, no hand-built index DSN. See [the embedded port](#the-embedded-port-multi-source)
+   below. Start here if you run `watch`.
+2. **A dedicated terminal — point `mysql` straight at a standalone shim (no
+   ProxySQL).** Simplest for a single index. The shim already speaks the MySQL
+   protocol, so an analyst connects a `mysql` client directly to it and runs
+   `_flashback` / `_snapshot` / `_diff` queries. Trade-off: that connection
+   answers *only* time-travel queries (a normal `SELECT` against a real table
+   returns `ER_NOT_SUPPORTED_YET`, 1235). Use it when a person or tool just needs
+   to read historical state from one index.
+3. **Transparent routing — ProxySQL in front (the rest of this guide).** Needed
    only when an application's *normal* connection must mix live queries and
    `AS OF` queries on the same endpoint. ProxySQL routes virtual-schema queries
    to the shim and everything else to your real MySQL.
+
+All three speak the **MySQL** protocol. A **PostgreSQL** operator can instead run
+single-row `AS OF` over the **PostgreSQL wire protocol** from `psql` with
+`bintrail-pg flashback` — same grammar, no MySQL client required. See
+[Interactive `AS OF` from `psql`](postgres.md#interactive-as-of-from-psql).
+
+### The embedded port (multi-source)
+
+`bintrail-console watch` already holds the time-travel engine and, through its
+control plane, a resolved connection to every monitored server's *own* per-source
+index (`bintrail_idx_<id>`). `--flashback-listen` exposes a MySQL-protocol port
+wired to that same map, so one endpoint time-travels any server you monitor —
+no `bintrail shim` container, no `--profile flashback`, no per-source DSN to
+discover:
+
+```sh
+bintrail-console watch \
+  --index-dsn 'root:pw@tcp(127.0.0.1:3306)/bintrail_index' \
+  --console-token "$BINTRAIL_CONSOLE_TOKEN" \
+  --flashback-listen 127.0.0.1:3308            # or env BINTRAIL_CONSOLE_FLASHBACK_LISTEN
+```
+
+**Routing is by username, auth is the console token.** Connect as the target
+server — its registry **ID** (robust; the `X-Bintrail-Server` value shown in the
+console) or its display **name** — with the console token as the password:
+
+```sh
+# the console shows each server's id/name in the switcher
+mysql -h 127.0.0.1 -P 3308 -u 7f4d577430b48821 -p"$BINTRAIL_CONSOLE_TOKEN"
+mysql> USE myapp;   -- optional: seeded from the server's source DSN when known
+mysql> SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 12345;
+```
+
+Servers added in the console mid-session are reachable immediately (the registry
+is read live). A token is **required** — MySQL-protocol auth cannot use the
+console's password store — so set `--console-token` / `BINTRAIL_CONSOLE_TOKEN`;
+`watch` refuses to open the port otherwise. The default `127.0.0.1` bind keeps
+it host-local; do not expose it to untrusted networks.
+
+`_snapshot.*` parity: each server reads the baseline configured on its registry
+entry (or the daemon's `--baseline-dir` / `--baseline-s3`), exactly as the
+console's Time-travel tab does — with one edge: a server configured with *both*
+a local `--baseline-dir` **and** an `--baseline-s3` copy reads `_snapshot` only
+from the local dir on this port. If local baselines have been pruned (retention)
+while a durable S3 copy remains, use the console's Time-travel tab or a standalone
+shim pointed at the S3 prefix for those tables. Single-source baseline configs —
+the common case — have full parity.
 
 ### The dedicated terminal
 
@@ -257,6 +311,16 @@ journalctl -u bintrail-shim -f
 
 The shim should report `shim listening addr=127.0.0.1:3308 tenants=N` once it has loaded `shim.yaml`.
 
+### Resource limits
+
+The shim is a long-running daemon shared by every forensic session, so heavy or abandoned queries are bounded by three flags (all opt-out; the defaults are safe for a typical deployment):
+
+- **`--query-timeout`** (default `5m`, env `BINTRAIL_SHIM_QUERY_TIMEOUT`) — per-query deadline covering the index fetch, the archive/DuckDB fetch, and the wait for a full-table slot. A query that exceeds it fails with MySQL error **1317** (`ER_QUERY_INTERRUPTED`). `0` disables the deadline.
+- **`--max-connections`** (default `100`, env `BINTRAIL_SHIM_MAX_CONNECTIONS`) — concurrent client connections; a connection past the cap is refused with MySQL error **1040** (`Too many connections`), exactly like a real mysqld. `0` removes the cap.
+- **`--max-fulltable-queries`** (default `4`, env `BINTRAIL_SHIM_MAX_FULLTABLE_QUERIES`) — concurrent full-table reconstructions (the heaviest path — a buffered `_flashback` or `LIMIT`ed query holds up to the 100,000-row cap; an uncapped streaming `_snapshot` holds only one row plus the changed-since-baseline set). Excess full-table queries wait for a slot; a waiter that outlives `--query-timeout` fails with MySQL error **1203** (`ER_TOO_MANY_USER_CONNECTIONS`). `0` removes the cap. PK point-lookups and `_diff` are never gated.
+
+A client that disconnects mid-query (an ORM timeout, Ctrl+C in the mysql CLI) cancels the in-flight fetch immediately — the shim stops the index/S3 work instead of finishing a resultset nobody will read.
+
 ---
 
 ## Step 5 — Point your application at ProxySQL
@@ -307,9 +371,35 @@ SELECT /*+ DBTRAIL_AT='2026-05-02 10:00:00' */ * FROM orders WHERE id = 12345;
 SELECT * FROM _snapshot.orders  AS OF '2026-05-02 10:00:00';
 SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00';
 
+-- Browse the first N rows of a full-table reconstruction. LIMIT lets a
+-- full-table query succeed under the row cap; results come back in the
+-- merge's order (no implicit ORDER BY):
+SELECT * FROM _snapshot.orders AS OF '2026-05-02 10:00:00' LIMIT 100;
+
 -- All events for one row in a time window:
 SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id = 12345;
 ```
+
+> **The hint form is the only one that degrades silently.** `/*+ DBTRAIL_AT=... */`
+> is 100% valid vanilla MySQL (an unknown optimizer hint raises a warning, not an
+> error), so if the query never reaches the shim — the client points at MySQL's
+> port instead of ProxySQL's `:6033`, rules 990001-990006 are missing (e.g.
+> ProxySQL restarted without `SAVE MYSQL QUERY RULES TO DISK`), or a
+> lower-`rule_id` operator rule intercepts first — MySQL executes it against the
+> live table and returns **present-day data with no error**. You believe you are
+> reading the past; you are reading the present. The other shapes fail loud on
+> the same misroute (`_flashback.*` → `ER_BAD_DB` 1049; bare `AS OF` → 1064), so
+> prefer them whenever the client can emit them — reserve the hint form for
+> ORM/query-builder paths that reject `AS OF` syntax, and verify routing after
+> any ProxySQL change:
+>
+> ```sh
+> bintrail doctor --source-dsn "$SRC" --proxysql-admin 'admin:<pass>@tcp(127.0.0.1:6032)/'
+> ```
+>
+> The check confirms all six dbtrail rules are live in
+> `runtime_mysql_query_rules` (advisory `WARN` when they aren't — it never
+> changes doctor's exit code).
 
 Every quoted time literal — in `AS OF`, `DBTRAIL_AT`, and the `BETWEEN` bounds — accepts four absolute formats (`'2026-05-02 10:00:00'`, RFC 3339 `'2026-05-02T10:00:00Z'`, zone-less `'2026-05-02T10:00:00'`, and date-only `'2026-05-02'`), plus `'now'` and relative forms `'<n> seconds|minutes|hours|days ago'` (e.g. `AS OF '5 minutes ago'`), resolved against the wall clock at parse time. Larger units (weeks, months) are deliberately not parsed — spell them as days.
 
@@ -327,9 +417,11 @@ SELECT id, email, name FROM _flashback.users AS OF TIMESTAMP '2026-05-02 10:00:0
 
 The column list accepts bare identifiers only; backticks, schema-qualified columns (`users.id`), and aliases (`id AS user_id`) are not yet parsed and surface as `ER_PARSE_ERROR`. Columns the row image is missing (e.g. dropped post-event) come back as `NULL` — matching MySQL's behaviour after an `ALTER TABLE DROP COLUMN`.
 
-For a **full-table** `SELECT *` (no column list), dbtrail unions the columns present across the reconstructed rows, so a column that existed at the queried time but was **dropped afterward** still appears — with its historical values — rather than being silently hidden by the current (narrower) schema.
+For a **full-table** `SELECT *` (no column list), dbtrail unions the columns present across the reconstructed rows, so a column that existed at the queried time but was **dropped afterward** still appears — with its historical values — rather than being silently hidden by the current (narrower) schema. (The one exception is the uncapped streaming `_snapshot` path described below: it fixes the column set from the table's *current* schema before the first row is sent, so a since-dropped column is not surfaced there — the shim logs a warning naming the omitted column, and adding a `LIMIT` forces the buffered path that surfaces it.)
 
 The WHERE column must match the table's primary key. A WHERE on a non-PK column is rejected with a parser error rather than silently returning the wrong row.
+
+Single-row `_flashback` / `_snapshot` point-lookups cut at the **transaction boundary**, not the individual event: if the row's most recent change belongs to a multi-statement transaction whose other statements commit *after* the AS OF instant, that whole transaction is excluded and the row resolves to its state *before* it — never a half-applied image that never existed at any real instant. (Full-table `AS OF` still cuts per row; see the transaction-boundary note in `query-and-recovery.md`.)
 
 `SHOW TABLES FROM _flashback / _diff / _snapshot` returns every table in the current schema that dbtrail has schema knowledge of (the newest snapshot per table, so PostgreSQL-source indexes — which record one table per snapshot — list all their tables too). A table that was since dropped at the source still appears: its indexed history remains queryable with `AS OF`. This lets an interactive `mysql>` session explore the virtual schemas:
 
@@ -340,7 +432,11 @@ SHOW TABLES FROM _flashback;
 
 `_diff` returns the full per-PK event history within the requested window — there is no implicit row cap. If a single hot row produced thousands of events, you'll get all of them in one response; if that's too much for one query, narrow the `BETWEEN` range.
 
-Full-table `_flashback` / `_snapshot` queries are buffered and capped at 100,000 rows; exceeding the cap surfaces as `ER_TOO_BIG_SELECT` (code 1104) with a hint to narrow the AS OF range or add a PK filter. DELETE events are correctly suppressed — rows that did not exist at the AS OF instant don't appear in the resultset (same semantic as Oracle's `AS OF`). For ad-hoc filtering, joins, or aggregations, pipe the resultset to `duckdb`, `pandas`, or any tool that consumes a `SELECT *` stream — the shim deliberately stays a forensic point-lookup + full-table tool, not a SQL planner.
+`LIMIT <n>` bounds a full-table `AS OF` resultset (`SELECT * FROM _snapshot.orders AS OF '…' LIMIT 100`). It composes with a `WHERE` clause and a column list, and it is the quickest way to *browse* a large table: a `LIMIT` at or below the row cap lets the query succeed instead of tripping the cap. Rows come back in the merge's internal order (roughly primary-key order for `_snapshot`), **not** a sorted order — add your own `ORDER BY` downstream if you need one — and a `LIMIT n` can return fewer than `n` rows when some of the first `n` were deleted by the AS OF instant. A `LIMIT` never *raises* the cap.
+
+Full-table `_snapshot` with **no** `LIMIT`, run over a live shim (`bintrail shim`, or `bintrail-console watch --flashback-listen`), **streams** its resultset row-by-row over the wire and is **not** row-capped: the baseline flows through the merge cursor one row at a time, so peak memory is proportional to the rows *changed* since the baseline, not the table size — a multi-million-row table dumps without `ER_TOO_BIG_SELECT`. If the merge fails mid-stream, the connection receives an error packet in place of the next row (no clean end-of-result), so a failed dump is never mistaken for a complete one. The 100,000-row cap still applies to the binlog-only full-table `_flashback` path (whose fetch is buffered) and to any `LIMIT`ed query; exceeding it surfaces as `ER_TOO_BIG_SELECT` (code 1104) with a hint to add a `LIMIT`, narrow the AS OF range, or add a PK filter.
+
+DELETE events are correctly suppressed — rows that did not exist at the AS OF instant don't appear in the resultset (same semantic as Oracle's `AS OF`). For ad-hoc filtering, joins, or aggregations, pipe the resultset to `duckdb`, `pandas`, or any tool that consumes a `SELECT *` stream — the shim deliberately stays a forensic point-lookup + full-table tool, not a SQL planner.
 
 The shim resolves the row by replaying the relevant binlog events from your dbtrail MySQL index. If the timestamp falls outside the index's retention (because hourly partitions have been rotated to S3), the shim auto-discovers the Parquet archives via `archive_state` and merges results from both sources — same machinery `bintrail query` and `bintrail recover` already use.
 
@@ -369,7 +465,9 @@ mysql -u admin -p -h 127.0.0.1 -P 6032 \
   -e "SELECT rule_id, match_pattern, destination_hostgroup FROM runtime_mysql_query_rules WHERE rule_id BETWEEN 990001 AND 990006;"
 ```
 
-You should see six rows targeting hostgroup 991 (one each for `_flashback.*`, `_diff.*`, `_snapshot.*`, the `/*+ DBTRAIL_AT=... */` hint-comment shape, `SHOW TABLES FROM` the virtual schemas, and the end-anchored bare `... AS OF '<ts>'` shape). If they're missing, re-apply `proxysql-setup.sql`. If they're present but the query still goes to MySQL, double-check that no operator rule with a smaller `rule_id` is intercepting `_flashback.*` first (ProxySQL evaluates rules in `rule_id` order).
+You should see six rows targeting hostgroup 991 (one each for `_flashback.*`, `_diff.*`, `_snapshot.*`, the `/*+ DBTRAIL_AT=... */` hint-comment shape, `SHOW TABLES FROM` the virtual schemas, and the end-anchored bare `... AS OF '<ts>'` shape). If they're missing, re-apply `proxysql-setup.sql`. If they're present but the query still goes to MySQL, double-check that no operator rule with a smaller `rule_id` is intercepting `_flashback.*` first (ProxySQL evaluates rules in `rule_id` order). `bintrail doctor --proxysql-admin '<admin-dsn>'` runs the six-rules check for you (advisory `WARN` when any is missing or inactive).
+
+Note this failure mode is only *visible* for the `_flashback.*`/`_diff.*`/`_snapshot.*` and bare `AS OF` shapes, which error out when misrouted to MySQL. The `/*+ DBTRAIL_AT */` hint form produces **no error at all** on the same misroute — MySQL treats the hint as unknown-and-ignorable and returns current data (see the warning under Step 6). If time-travel results ever look suspiciously like the present, check the rules above before trusting them.
 
 ### `connection refused` on the shim's port
 
@@ -390,6 +488,9 @@ The shim emits typed wire codes so ORMs and monitoring can distinguish *user inp
 - **1235 `ER_NOT_SUPPORTED_YET`** — a non-virtual-schema query reached the shim (typically a direct connection to `:3308` bypassing ProxySQL). Hostgroup routing is misconfigured.
 - **1526 `ER_NO_PARTITION_FOR_GIVEN_VALUE`** — two causes, distinguished by the message. Either the AS OF or BETWEEN range falls outside what this index retains (rotated out of MySQL with no archive coverage) — narrow the time range or check `archive_state` and the shim's `--allow-gaps` flag. Or a **full-table `_snapshot`** query found the configured baseline unusable (no baseline snapshot at-or-before the AS OF instant, or a primary key the baseline merge can't canonicalize) and refused rather than return a partial table — create or re-run `bintrail baseline` so a snapshot covers the AS OF, or query `_flashback` for a binlog-only view.
 - **1045 `ER_ACCESS_DENIED_ERROR`** — credential mismatch (see the section above).
+- **1317 `ER_QUERY_INTERRUPTED`** — the query exceeded `--query-timeout` (message names the flag), or its client disconnected / the shim shut down mid-query. Narrow the AS OF range, filter by PK, or raise the timeout.
+- **1203 `ER_TOO_MANY_USER_CONNECTIONS`** — too many concurrent full-table time-travel queries; the query waited for a slot until `--query-timeout`. Retry later or raise `--max-fulltable-queries`.
+- **1040 `ER_CON_COUNT_ERROR`** — the `--max-connections` cap was reached; the connection was refused before the handshake.
 - **1104 `ER_TOO_BIG_SELECT`** — full-table `_flashback` / `_snapshot` returned more than 100,000 rows. Narrow the AS OF or add a `WHERE <pk> = <value>` to fall back to the point-lookup path.
 - **1105 `ER_UNKNOWN_ERROR`** — real internal failure (DB timeout, archive S3 outage, build-resultset bug). This is the catch-all "the server is broken, retry" signal; persistent 1105s warrant inspecting the shim log.
 

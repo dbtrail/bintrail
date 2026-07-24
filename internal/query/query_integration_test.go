@@ -110,6 +110,39 @@ func TestFetch_untilPos(t *testing.T) {
 	}
 }
 
+// TestFetch_untilPosRollover pins the #840 fix on real MySQL: after
+// mysql-bin.999999 the server continues with mysql-bin.1000000, and plain
+// lexicographic binlog_file comparison inverts ('1000000' < '999999'). An
+// anchor in the post-rollover file must keep every pre-rollover event and
+// still cut exactly inside the anchor file.
+func TestFetch_untilPosRollover(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	ts := "2026-02-19 14:00:00"
+	testutil.InsertEvent(t, db, "mysql-bin.999999", 100, 200, ts, nil, "mydb", "orders", 1, "1", nil, nil, []byte(`{"id":1}`))   // pre-rollover (included; excluded pre-fix)
+	testutil.InsertEvent(t, db, "mysql-bin.1000000", 100, 200, ts, nil, "mydb", "orders", 1, "2", nil, nil, []byte(`{"id":2}`)) // anchor file, ≤ pos (included)
+	testutil.InsertEvent(t, db, "mysql-bin.1000000", 200, 400, ts, nil, "mydb", "orders", 1, "3", nil, nil, []byte(`{"id":3}`)) // anchor file, > pos (excluded)
+	testutil.InsertEvent(t, db, "mysql-bin.1000001", 100, 200, ts, nil, "mydb", "orders", 1, "4", nil, nil, []byte(`{"id":4}`)) // later file (excluded)
+
+	e := New(db)
+	rows, err := e.Fetch(context.Background(), Options{
+		Schema: "mydb", Table: "orders",
+		UntilPos: &BinlogPos{File: "mysql-bin.1000000", Pos: 300},
+		Limit:    100,
+	})
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	got := map[string]bool{}
+	for _, r := range rows {
+		got[r.PKValues] = true
+	}
+	if len(rows) != 2 || !got["1"] || !got["2"] {
+		t.Fatalf("expected exactly pks {1,2} at-or-before the rollover anchor, got %v", got)
+	}
+}
+
 func TestFetch_gtidFilter(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)

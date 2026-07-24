@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/doctor"
 )
@@ -30,16 +33,18 @@ the exit code so 'doctor' is safe to run in CI as a smoke test.
 Examples:
 
   bintrail doctor --source-dsn "user:pass@tcp(source:3306)/"
-  bintrail doctor --source-dsn "$SRC" --index-dsn "$IDX" --schemas mydb`,
+  bintrail doctor --source-dsn "$SRC" --index-dsn "$IDX" --schemas mydb
+  bintrail doctor --source-dsn "$SRC" --proxysql-admin "admin:admin@tcp(127.0.0.1:6032)/"`,
 	RunE: runDoctor,
 }
 
 var (
-	docSourceDSN string
-	docIndexDSN  string
-	docSchemas   string
-	docFormat    string
-	docRetain    string
+	docSourceDSN     string
+	docIndexDSN      string
+	docSchemas       string
+	docFormat        string
+	docRetain        string
+	docProxySQLAdmin string
 )
 
 func init() {
@@ -48,6 +53,7 @@ func init() {
 	doctorCmd.Flags().StringVar(&docSchemas, "schemas", "", "Comma-separated schemas to check (default: all user schemas)")
 	doctorCmd.Flags().StringVar(&docFormat, "format", "text", "Output format: text or json")
 	doctorCmd.Flags().StringVar(&docRetain, "retain", "30d", "Retention window assumed by the index capacity projection (Nd/Nh; \"off\" if you don't rotate)")
+	doctorCmd.Flags().StringVar(&docProxySQLAdmin, "proxysql-admin", "", "ProxySQL admin DSN, e.g. admin:pass@tcp(127.0.0.1:6032)/ (optional; verifies the dbtrail time-travel routing rules are live — advisory WARN only)")
 	_ = doctorCmd.MarkFlagRequired("source-dsn")
 	bindCommandEnv(doctorCmd)
 	rootCmd.AddCommand(doctorCmd)
@@ -61,7 +67,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	return runDoctorTo(cmd.Context(), os.Stdout, docFormat, docSourceDSN, docIndexDSN, docSchemas, retain)
+	return runDoctorTo(cmd.Context(), os.Stdout, docFormat, docSourceDSN, docIndexDSN, docSchemas, retain, docProxySQLAdmin)
 }
 
 // parseDocRetain maps doctor's --retain value to the capacity projection's
@@ -83,13 +89,86 @@ func parseDocRetain(s string) (time.Duration, error) {
 // against sourceDSN (and optionally indexDSN), renders the report to w using
 // format ("text" or "json"), and returns a non-nil error iff any required
 // check failed. indexRetain is the rotation window the capacity projection
-// assumes (0 = no rotation). Callers wanting to route output (e.g. `bintrail
+// assumes (0 = no rotation). proxysqlAdminDSN, when non-empty, appends the
+// opt-in ProxySQL routing-rules check (#820; advisory, never affects the exit
+// code). Callers wanting to route output (e.g. `bintrail
 // up` sending preflight output to stderr to keep stdout clean for streaming)
 // pass their own writer here instead of going through the cobra entry point.
-func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDSN, schemasCSV string, indexRetain time.Duration) error {
+func runDoctorTo(parent context.Context, w io.Writer, format, sourceDSN, indexDSN, schemasCSV string, indexRetain time.Duration, proxysqlAdminDSN string) error {
 	report := doctor.Build(parent, sourceDSN, indexDSN, schemasCSV, indexRetain)
+	if proxysqlAdminDSN != "" {
+		report.Add(doctor.CheckProxySQLRules(parent, proxysqlAdminDSN))
+	}
+	appendExtDoctorChecks(parent, report, sourceDSN, indexDSN)
 	if err := report.Write(w, format); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}
 	return report.Err()
+}
+
+// extDoctorBudget bounds all registered extension checks together, matching
+// doctor.Build's internal 30-second budget for the built-in checks — a
+// hanging registered check must not stall the report indefinitely.
+const extDoctorBudget = 30 * time.Second
+
+// appendExtDoctorChecks appends the checks contributed by registered
+// extension check functions (ext.RegisterDoctorCheck) to report. No-op in
+// the stock binary, where nothing is registered. Both preflight surfaces —
+// `bintrail doctor` (runDoctorTo) and `bintrail up` phase 1 — call it, so a
+// registered check appears wherever the built-in checks do, with the same
+// FAIL-blocks-boot semantics.
+//
+// The registered checks run under a 30s timeout (extDoctorBudget), and a
+// panicking check function is converted into a FAIL entry on the report —
+// the already-computed built-in checks must still render either way.
+func appendExtDoctorChecks(ctx context.Context, report *doctor.Report, sourceDSN, indexDSN string) {
+	ctx, cancel := context.WithTimeout(ctx, extDoctorBudget)
+	defer cancel()
+	checks, panicked := runExtDoctorChecks(ctx, sourceDSN, indexDSN)
+	for _, c := range checks {
+		report.Add(extCheckResult(c))
+	}
+	if panicked != nil {
+		report.Add(doctor.CheckResult{
+			Name:   "extension doctor checks",
+			Status: doctor.StatusFail,
+			Detail: fmt.Sprintf("registered check panicked: %v", panicked),
+		})
+	}
+}
+
+// runExtDoctorChecks runs the registered extension check functions,
+// converting a panic into a returned value instead of letting it unwind
+// through the caller's report rendering. On panic the returned checks slice
+// is nil (the in-flight concatenation is lost); the report keeps its
+// built-in checks either way and gains a FAIL entry naming the battery.
+func runExtDoctorChecks(ctx context.Context, sourceDSN, indexDSN string) (checks []ext.DoctorCheck, panicked any) {
+	defer func() {
+		if p := recover(); p != nil {
+			panicked = p
+		}
+	}()
+	return ext.RunDoctorChecks(ctx, sourceDSN, indexDSN), nil
+}
+
+// extCheckResult converts an ext.DoctorCheck (Status as a plain string) to a
+// doctor.CheckResult. The status is normalized (trimmed, lowercased) before
+// matching, so "PASS" / " Fail " count as their canonical forms. A truly
+// unknown status string is coerced to WARN with a note appended to Detail —
+// Report.Add would otherwise log the malformed entry and leave it out of
+// every counter, silently weakening the report — and logged so the downgrade
+// is greppable.
+func extCheckResult(c ext.DoctorCheck) doctor.CheckResult {
+	status := doctor.CheckStatus(strings.ToLower(strings.TrimSpace(c.Status)))
+	detail := c.Detail
+	switch status {
+	case doctor.StatusPass, doctor.StatusFail, doctor.StatusWarn, doctor.StatusSkip:
+	default:
+		note := fmt.Sprintf("registered check reported unknown status %q; treated as warn", c.Status)
+		detail = strings.TrimSpace(detail + " (" + note + ")")
+		status = doctor.StatusWarn
+		slog.Warn("ext: doctor check reported unknown status",
+			"check", c.Name, "status", c.Status)
+	}
+	return doctor.CheckResult{Name: c.Name, Status: status, Detail: detail, Remediation: c.Remediation}
 }

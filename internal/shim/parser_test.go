@@ -2,6 +2,7 @@ package shim
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,66 @@ func TestParseFlashbackFullTable(t *testing.T) {
 			if q.PKColumn != "" || q.PKValue != "" {
 				t.Errorf("PKColumn/PKValue must be empty for full-table shape; got col=%q val=%q",
 					q.PKColumn, q.PKValue)
+			}
+		})
+	}
+}
+
+// TestParseAsOfLimit covers the optional trailing LIMIT clause on the
+// _flashback / _snapshot AS OF grammar (#997): it composes with the full-table,
+// PK-filtered, and column-list shapes; a missing clause is Limit 0; LIMIT 0,
+// negative, and out-of-range values are rejected as parse errors (not the
+// ErrNotTimeTravel sentinel); and _diff does not accept LIMIT.
+func TestParseAsOfLimit(t *testing.T) {
+	ok := []struct {
+		name      string
+		sql       string
+		wantType  QueryType
+		wantLimit int
+		wantPKCol string
+		wantCols  []string
+	}{
+		{"flashback_fulltable", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 100", TypeFlashback, 100, "", nil},
+		{"snapshot_fulltable", "SELECT * FROM _snapshot.orders AS OF '2026-05-02 10:00:00' LIMIT 5", TypeSnapshot, 5, "", nil},
+		{"with_where", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' WHERE id = 3 LIMIT 10", TypeFlashback, 10, "id", nil},
+		{"with_columns", "SELECT id, name FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 2", TypeFlashback, 2, "", []string{"id", "name"}},
+		{"case_insensitive", "select * from _snapshot.orders as of '2026-05-02 10:00:00' limit 7", TypeSnapshot, 7, "", nil},
+		{"trailing_semicolon", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 9;", TypeFlashback, 9, "", nil},
+		{"no_limit_is_zero", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00'", TypeFlashback, 0, "", nil},
+	}
+	for _, tc := range ok {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if q.Type != tc.wantType || q.Limit != tc.wantLimit || q.PKColumn != tc.wantPKCol {
+				t.Errorf("got type=%v limit=%d pkcol=%q; want type=%v limit=%d pkcol=%q",
+					q.Type, q.Limit, q.PKColumn, tc.wantType, tc.wantLimit, tc.wantPKCol)
+			}
+			if !slices.Equal(q.Columns, tc.wantCols) {
+				t.Errorf("Columns = %v, want %v", q.Columns, tc.wantCols)
+			}
+		})
+	}
+
+	bad := []struct {
+		name string
+		sql  string
+	}{
+		{"limit_zero", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 0"},
+		{"limit_negative", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT -1"},
+		{"limit_overflow", "SELECT * FROM _flashback.orders AS OF '2026-05-02 10:00:00' LIMIT 99999999999999999999"},
+		{"diff_rejects_limit", "SELECT * FROM _diff.orders BETWEEN '2026-05-01' AND '2026-05-02' WHERE id = 1 LIMIT 5"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.sql, "myapp")
+			if err == nil {
+				t.Fatalf("expected a parse error, got nil")
+			}
+			if errors.Is(err, ErrNotTimeTravel) {
+				t.Errorf("want a malformed-query error (non-sentinel), got ErrNotTimeTravel")
 			}
 		})
 	}
@@ -180,6 +241,137 @@ func TestParseStringPK(t *testing.T) {
 	}
 	if q.PKValue != "abc-123" {
 		t.Errorf("PKValue = %q, want abc-123", q.PKValue)
+	}
+}
+
+// TestParseStringPKEscapes pins MySQL escape semantics inside string
+// literals (#826): the captured bytes must be the value MySQL would
+// store, not the escaped source text, or a backslash-containing PK
+// misses pk_values and AS OF falsely reports "the row didn't exist".
+func TestParseStringPKEscapes(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			"backslash path",
+			`SELECT * FROM _flashback.files AS OF '2026-05-02' WHERE path = 'C:\\temp\\new'`,
+			`C:\temp\new`,
+		},
+		{
+			"newline and tab",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'a\nb\tc'`,
+			"a\nb\tc",
+		},
+		{
+			"cr nul backspace ctrlZ",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'a\rb\0c\bd\Ze'`,
+			"a\rb\x00c\bd\x1ae",
+		},
+		{
+			"escaped double quote",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'a\"b'`,
+			`a"b`,
+		},
+		{
+			"LIKE escapes keep backslash",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = '100\%\_x'`,
+			`100\%\_x`,
+		},
+		{
+			"backslash before ordinary char dropped, case-sensitive z",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = '\a\z'`,
+			"az",
+		},
+		{
+			"no escapes untouched",
+			`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'plain value'`,
+			"plain value",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if q.PKValue != tc.want {
+				t.Errorf("PKValue = %q, want %q", q.PKValue, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseStringPKEscapesAllForms proves every stripQuotes call site —
+// _diff, the hint-comment form, and the bare AS OF form — unescapes,
+// not just the _flashback/_snapshot matcher.
+func TestParseStringPKEscapesAllForms(t *testing.T) {
+	const want = `C:\temp`
+	cases := []struct {
+		name string
+		sql  string
+	}{
+		{
+			"_diff",
+			`SELECT * FROM _diff.files BETWEEN '2026-05-01' AND '2026-05-02' WHERE path = 'C:\\temp'`,
+		},
+		{
+			"hint form",
+			`SELECT /*+ DBTRAIL_AT='2026-05-02' */ * FROM files WHERE path = 'C:\\temp'`,
+		},
+		{
+			"bare AS OF real table",
+			`SELECT * FROM files WHERE path = 'C:\\temp' AS OF '2026-05-02'`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q, err := Parse(tc.sql, "myapp")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if q.PKValue != want {
+				t.Errorf("PKValue = %q, want %q", q.PKValue, want)
+			}
+		})
+	}
+}
+
+// TestUnescapeStringLiteral covers branches unreachable through Parse
+// (the value regexes cannot capture a quote character): doubled quotes
+// and \' must still collapse per MySQL semantics, and a trailing lone
+// backslash must not be lost or panic.
+func TestUnescapeStringLiteral(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{`O''Brien`, `O'Brien`},
+		{`O\'Brien`, `O'Brien`},
+		{`trailing\`, `trailing\`},
+		{``, ``},
+	}
+	for _, tc := range cases {
+		if got := unescapeStringLiteral(tc.in); got != tc.want {
+			t.Errorf("unescapeStringLiteral(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestParseQuoteInStringPKStaysFailLoud pins that a literal containing
+// a quote character still misses the matcher and errors (1064 path) —
+// #826 must not silently change the fail-loud behavior into a
+// partial-parse.
+func TestParseQuoteInStringPKStaysFailLoud(t *testing.T) {
+	_, err := Parse(
+		`SELECT * FROM _flashback.t AS OF '2026-05-02' WHERE k = 'O\'Brien'`,
+		"myapp",
+	)
+	if err == nil {
+		t.Fatal("expected error for quote-containing literal, got nil")
+	}
+	if errors.Is(err, ErrNotTimeTravel) {
+		t.Fatalf("want malformed-query error (1064 path), got ErrNotTimeTravel")
 	}
 }
 

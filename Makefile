@@ -13,7 +13,7 @@ GATEWAY_LDFLAGS=-ldflags "-X main.gatewayVersion=$(VERSION)"
 # bintrail-console and bintrail-pg both reuse BINTRAIL_LDFLAGS: they inject the
 # same main.Version/CommitSHA/BuildDate vars as the core binary.
 
-.PHONY: all build build-mcp build-gateway build-console build-pg clean test console-e2e lint install build-all tidy deps notices check-notices
+.PHONY: all build build-mcp build-gateway build-console build-pg clean test console-e2e lint install build-all tidy deps notices check-notices mcpb validate-mcpb
 
 all: build build-mcp build-gateway build-console build-pg
 
@@ -84,6 +84,18 @@ build-all:
 	GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-linux-arm64 ./cmd/mcp-gateway
 	GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-darwin-amd64 ./cmd/mcp-gateway
 	GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build $(GATEWAY_LDFLAGS) -o dist/$(GATEWAY_BINARY)-darwin-arm64 ./cmd/mcp-gateway
+
+# Build + validate an .mcpb MCP Bundle (the Claude Desktop one-click install
+# format) for the HOST platform, e.g. dist/mcpb/dbtrail-darwin-arm64.mcpb on
+# an Apple Silicon Mac. Release bundles are produced per release-matrix
+# platform by GoReleaser (scripts/build-mcpb.sh runs as a bintrail-mcp
+# post-build hook and validates each bundle).
+mcpb: build-mcp
+	bash scripts/build-mcpb.sh $(MCP_BINARY) $(shell go env GOOS) $(shell go env GOARCH) $(VERSION)
+
+# Re-validate already-built bundles (unzip + manifest + entry-binary checks).
+validate-mcpb:
+	bash scripts/validate-mcpb.sh dist/mcpb/*.mcpb
 
 tidy:
 	go mod tidy

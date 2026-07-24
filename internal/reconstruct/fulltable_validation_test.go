@@ -140,9 +140,11 @@ func TestZipMap_pairsAcrossColumns(t *testing.T) {
 	}
 }
 
-// TestRowAfterOrdered_missingColumnBecomesNull verifies the schema-drift
-// fallback: a column present in the baseline but absent from the event's
-// row_after image is filled with nil and warned about.
+// TestRowAfterOrdered_missingColumnBecomesNull verifies the NULL-fill
+// fallback kept for the binlog-only path (writeBinlogOnlyChanges): a column
+// in colNames but absent from the event's row_after image is filled with nil
+// and warned about. On the baseline merge path this is unreachable — both
+// drift directions are refused up front (#602/#843).
 func TestRowAfterOrdered_missingColumnBecomesNull(t *testing.T) {
 	cols := []string{"id", "status", "added_later"}
 	rowAfter := map[string]any{"id": float64(1), "status": "ok"} // added_later missing

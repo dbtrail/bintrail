@@ -44,6 +44,7 @@ func TestReadLayerDoesNotLinkGoMySQL(t *testing.T) {
 		"github.com/dbtrail/dbtrail/internal/archive",
 		"github.com/dbtrail/dbtrail/internal/agent",
 		"github.com/dbtrail/dbtrail/internal/status",
+		"github.com/dbtrail/dbtrail/internal/mcptools",
 	}
 	for _, pkg := range readPkgs {
 		out, err := exec.Command("go", "list", "-deps", pkg).CombinedOutput()

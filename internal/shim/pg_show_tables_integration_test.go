@@ -3,6 +3,7 @@
 package shim
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"slices"
@@ -48,7 +49,7 @@ func TestShowTablesFromVirtual_PGPerTableSnapshots(t *testing.T) {
 	// Three relations arrive on the stream, each becoming its own
 	// snapshot_id (1, 2, 3). "items" is the last one that saw DML.
 	for _, tbl := range []string{"users", "orders", "items"} {
-		if _, err := metadata.WritePGSnapshot(db, pgRelation("public", tbl, "payload")); err != nil {
+		if _, err := metadata.WritePGSnapshot(context.Background(), db, pgRelation("public", tbl, "payload")); err != nil {
 			t.Fatalf("WritePGSnapshot(%s): %v", tbl, err)
 		}
 	}
@@ -85,10 +86,10 @@ func TestColumnOrderFor_PGNonLatestTable(t *testing.T) {
 	testutil.InitIndexTables(t, db)
 
 	// users is snapshot 1; orders (snapshot 2) is the latest.
-	if _, err := metadata.WritePGSnapshot(db, pgRelation("public", "users", "zz_email", "aa_name")); err != nil {
+	if _, err := metadata.WritePGSnapshot(context.Background(), db, pgRelation("public", "users", "zz_email", "aa_name")); err != nil {
 		t.Fatalf("WritePGSnapshot(users): %v", err)
 	}
-	if _, err := metadata.WritePGSnapshot(db, pgRelation("public", "orders", "total")); err != nil {
+	if _, err := metadata.WritePGSnapshot(context.Background(), db, pgRelation("public", "orders", "total")); err != nil {
 		t.Fatalf("WritePGSnapshot(orders): %v", err)
 	}
 

@@ -6,8 +6,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -446,6 +448,60 @@ func TestRecoverTool_statementCount(t *testing.T) {
 	text := callToolText(t, result)
 	if !strings.Contains(text, "3 reversal statement(s)") {
 		t.Errorf("expected '3 reversal statement(s)' in output, got: %s", text)
+	}
+}
+
+// TestRecoverTool_limitKeepsNewestEvents pins #982 (the MCP recover tool's
+// mirror of #785/#927): when --limit truncates the matched window, the
+// reversal script must undo the most RECENT events, not the oldest prefix
+// that the missing Order="DESC" used to leave behind. Seeds 4 chained
+// UPDATEs on one row (v0→v1→v2→v3→v4) at one-minute intervals, so a
+// truncating limit=2 has an unambiguous newest-suffix (v2→v3, v3→v4) versus
+// oldest-prefix (v0→v1, v1→v2); v0/v1 appear ONLY in the oldest two events.
+func TestRecoverTool_limitKeepsNewestEvents(t *testing.T) {
+	db, _, dsn := setupTestDB(t)
+	ctx := context.Background()
+
+	base := "2026-02-19 10:00:00"
+	baseTime, err := time.Parse("2006-01-02 15:04:05", base)
+	if err != nil {
+		t.Fatalf("parse base time: %v", err)
+	}
+	for i := 1; i <= 4; i++ {
+		ts := baseTime.Add(time.Duration(i) * time.Minute).Format("2006-01-02 15:04:05")
+		before := fmt.Sprintf(`{"id":1,"v":"v%d"}`, i-1)
+		after := fmt.Sprintf(`{"id":1,"v":"v%d"}`, i)
+		testutil.InsertEvent(t, db, "mysql-bin.000001", uint64(i*100), uint64(i*100+50), ts, nil,
+			"mydb", "orders", 2 /* UPDATE */, "1",
+			[]byte(`["v"]`), []byte(before), []byte(after))
+	}
+
+	session := connectMCP(t)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "recover",
+		Arguments: map[string]any{
+			"index_dsn": dsn,
+			"schema":    "mydb",
+			"table":     "orders",
+			"limit":     2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("tool error: %s", callToolText(t, result))
+	}
+
+	text := callToolText(t, result)
+	// Newest two events are v2→v3 and v3→v4; their reversals reference v2..v4.
+	if !strings.Contains(text, `'v3'`) || !strings.Contains(text, `'v2'`) {
+		t.Errorf("expected reversals of the two NEWEST updates (v2→v3, v3→v4), got:\n%s", text)
+	}
+	// v0/v1 exist only in the oldest two events — any occurrence means the
+	// truncation kept the oldest prefix (the #982/#785 bug).
+	if strings.Contains(text, `'v0'`) || strings.Contains(text, `'v1'`) {
+		t.Errorf("script reversed the OLDEST events; --limit must keep the newest suffix of the window:\n%s", text)
 	}
 }
 

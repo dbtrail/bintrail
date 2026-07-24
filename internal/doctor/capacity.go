@@ -132,10 +132,15 @@ func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, fr
 		humanBytes(p.projectedBytes), retain, p.eventsPerDay, humanBytes(p.bytesPerEvent), humanBytes(float64(p.currentBytes)))
 
 	if !freeKnown {
+		// #948: the index is on a separate host/container (the docker-compose
+		// stack, or a managed/remote index), so statfs can't reach its volume and
+		// the FAIL/WARN thresholds below are unreachable. Report SKIP, not PASS —
+		// an unmeasurable check must not read green. Rotation still bounds the
+		// volume (#420); the operator monitors the index disk externally.
 		return CheckResult{
 			Name:   CapacityCheckName,
-			Status: StatusPass,
-			Detail: projected + " — free space not measurable from this host; ensure the index volume keeps >=30% headroom above the projection (docs/capacity.md)",
+			Status: StatusSkip,
+			Detail: projected + " — free space is not measurable from this host (the index runs on a separate host/container), so the disk-capacity thresholds are skipped, not passed; monitor the index volume externally and keep >=30% headroom above the projection (docs/capacity.md)",
 		}
 	}
 

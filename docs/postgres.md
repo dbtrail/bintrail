@@ -41,6 +41,39 @@ The index MySQL has the same requirements as for any source — see
 
 ## Install
 
+The console captures PostgreSQL as a **first-class source** — the same
+`bintrail-console watch` stack the [Compose quickstart](install.md) stands up.
+There are two ways in: the **web console** (recommended — zero binaries to place)
+or the standalone **`bintrail-pg`** binary (for an existing index or a headless
+CLI deployment).
+
+### The web console — "+ Add server" (recommended)
+
+If you brought up the [Docker Compose stack](install.md) — the *same*
+`install.sh` MySQL uses — you already have everything. Do the [source-side
+setup](#postgresql-side-setup) below first, then:
+
+1. Open the console (**http://127.0.0.1:8090**) and sign in.
+2. **+ Add server** → set **Source type** to **PostgreSQL**. The PostgreSQL-only
+   fields appear: **Database**, **Replication slot**, and **Publication**.
+3. Fill in host, port, user, password, the database, the slot name (created for
+   you on first run), and the publication (the one you created above).
+   Optionally restrict **Schemas**.
+4. **Save.** dbtrail provisions a dedicated MySQL index for that source and
+   starts capturing **in-process** (the console runs the same PostgreSQL
+   preflight as `bintrail-pg doctor` — `wal_level`, publication coverage,
+   `REPLICA IDENTITY FULL`, slot health — and surfaces any failure as a
+   remediation card). Capture resumes automatically on restart.
+
+The **index stays MySQL**; only the *source* is PostgreSQL. The source type is
+fixed once saved — to change a server's capture engine, delete and re-create it.
+The form lives in `bintrail-console watch` (the Compose default); the read-only
+`serve` console browses an existing PostgreSQL-sourced index but does not add
+sources.
+
+### Standalone binary / image
+
+Prefer a headless deployment, or capturing into an index you already run?
 `bintrail-pg` ships as its own artifact alongside the core `bintrail` binary.
 
 **Docker image:**
@@ -260,6 +293,9 @@ a final checkpoint).
 | `--batch-size` | no | Events per batch insert (default 1000). |
 | `--checkpoint` | no | Checkpoint interval in seconds (default 5). |
 | `--partitions` | no | Index partitions for the one-time bootstrap (default 48). |
+| `--rotate-retain` | no | Built-in rotation: drop index partitions older than this (`Nd`/`Nh`; `off` disables). Default `30d` (env `BINTRAIL_ROTATE_RETAIN`). |
+| `--rotate-interval` | no | Built-in rotation: how often a rotation cycle runs (default `1h`, env `BINTRAIL_ROTATE_INTERVAL`). |
+| `--rotate-add-future` | no | Built-in rotation: keep at least N future hourly partitions ready (default `3`, env `BINTRAIL_ROTATE_ADD_FUTURE`). |
 
 Every flag has a `BINTRAIL_*` environment equivalent and can be set in a
 `.bintrail.env` file (see [the env-file convention](install.md)).
@@ -295,6 +331,49 @@ Under the hood it is the two-system teardown that otherwise has to be done by ha
 `DELETE FROM stream_state WHERE id = 1` on the index). After a reset, re-seed the
 baseline and re-run `bintrail-pg stream`.
 
+### Index rotation and retention
+
+The index table `binlog_events` is split into **hourly partitions**. New hours
+need new partitions or every event eventually lands in the catch-all `p_future`
+partition, which can never be dropped — so without rotation the index grows until
+the disk fills.
+
+`bintrail-pg stream` runs a **built-in rotation loop** so this is handled for you:
+by default it drops partitions older than **30 days** and keeps a few future
+partitions ready, running one cycle at startup and then every hour. Tune it with
+`--rotate-retain` / `--rotate-interval` / `--rotate-add-future` (or the
+`BINTRAIL_ROTATE_*` env vars), or turn it off with `--rotate-retain off` if you
+prefer to run retention separately.
+
+The built-in loop is **drop-only** — it does not archive partitions to S3 before
+dropping them. For an archive-then-drop retention policy, or for manual/offline
+maintenance, run the standalone command against the same index (it is the same
+index-side command the core `bintrail` binary exposes, now available on
+`bintrail-pg` too):
+
+```bash
+# One-off: drop partitions older than 7 days
+bintrail-pg rotate --index-dsn "$IDX" --retain 7d
+
+# Daemon: archive each expired partition to S3, then drop it
+bintrail-pg rotate --index-dsn "$IDX" --retain 30d --daemon \
+  --archive-dir /var/lib/bintrail/archives --archive-s3 s3://my-bucket/archives/
+
+# Re-sync the archive registry with the files actually on disk / in S3
+bintrail-pg archive reconcile --index-dsn "$IDX" \
+  --archive-dir /var/lib/bintrail/archives --archive-s3 s3://my-bucket/archives/
+```
+
+> **Upgrading an existing PostgreSQL install that predates built-in rotation.**
+> If you ran `bintrail-pg stream` before this feature, its index has no future
+> partitions and everything has piled into `p_future`. No data is lost — the loop
+> refuses to drop deep history until you choose a retention explicitly, and it
+> back-fills the missing partitions — but the first catch-up can be slow because
+> each cycle rewrites the large `p_future`. To catch up in one pass instead, run a
+> standalone rotation with enough headroom before (or alongside) the stream, e.g.
+> `bintrail-pg rotate --index-dsn "$IDX" --add-future <hours-since-first-event>`,
+> then set `--rotate-retain` explicitly (e.g. `30d`) so the loop begins pruning.
+
 ---
 
 ## Adding more servers
@@ -306,8 +385,8 @@ shared daemon for PostgreSQL sources in this release — one process per source
 
 You can **view and recover** PostgreSQL-captured data in the read-only web
 console (`bintrail-console`), which reads the shared index. The console presents
-PostgreSQL sources natively — LSN/slot vocabulary, a lost-slot badge, a forensics
-note, and a live replication-health panel (slot WAL-retention, lag, RI-FULL); see
+PostgreSQL sources natively — LSN/slot vocabulary, a lost-slot badge, a
+connection-id note, and a live replication-health panel (slot WAL-retention, lag, RI-FULL); see
 [PostgreSQL sources](console.md#postgresql-sources). What it does **not** drive is
 *capture*: the "+ Add server" / `watch` control plane is MySQL-oriented, so run
 `bintrail-pg stream` for the capture and use the console (or the `query`/`recover`
@@ -367,6 +446,61 @@ directly.
 > required) are the fully-supported recovery surface for PostgreSQL in this
 > release — see [Beta limitations](#beta-limitations) for the complete
 > picture.
+
+### Interactive `AS OF` from `psql`
+
+The `_flashback` / `_snapshot` / `AS OF` time-travel grammar is also available
+over the **PostgreSQL wire protocol**, so you can run single-row time-travel
+straight from `psql` (or any PostgreSQL driver) rather than the MySQL-wire shim:
+
+```bash
+bintrail-pg flashback \
+  --index-dsn 'root:…@tcp(127.0.0.1:3306)/bintrail_index' \
+  --shim-config shim.yaml \
+  --baseline-dir ./baselines      # optional; enables _snapshot
+  # --listen 127.0.0.1:5433 is the default
+```
+
+Then connect and query. **Set `dbname` to your PostgreSQL schema** (e.g.
+`public`); choose flashback-vs-snapshot with the `_flashback.` / `_snapshot.`
+table prefix in the query, exactly like the MySQL shim:
+
+```
+psql "host=127.0.0.1 port=5433 user=<tenant> dbname=public"
+
+-- binlog-only view of one row at a past instant:
+SELECT * FROM _flashback.orders AS OF '5 minutes ago' WHERE id = 42;
+
+-- baseline-aware view (also resolves rows untouched in the retained window):
+SELECT * FROM _snapshot.orders  AS OF '2026-07-01 09:00:00' WHERE id = 42;
+
+-- the bare form on the real table works too:
+SELECT * FROM orders AS OF '5 minutes ago' WHERE id = 42;
+```
+
+Scope and behaviour track PostgreSQL's current time-travel maturity:
+
+- **Single-row `AS OF` only** — a `WHERE <primary-key> = <value>` predicate.
+  Full-table `AS OF` is refused with remediation: a PG baseline does not carry
+  the `CREATE TABLE` metadata full-table reconstruct needs (the same limit as
+  `reconstruct --output-format mydumper` and baseline-anchored `verify`).
+- Columns render as **text** (the conservative first cut): read each one as a
+  string, or let your driver text-parse it into a typed target. One caveat: a
+  binary/`bytea` value containing a `0x00` byte truncates at the first NUL in
+  `psql`/libpq (their text protocol uses NUL-terminated C strings); a driver that
+  reads the raw value (e.g. `pgx` scanning into `[]byte`) round-trips it intact.
+  Per-column type OIDs (so `bytea` arrives as `bytea`) are a follow-up.
+- Use the **simple query protocol** — `psql` does this by default; a `pgx`
+  client sets `QueryExecModeSimpleProtocol`. The extended (prepared-statement)
+  protocol is not yet implemented.
+- **Auth** mirrors the shim: a cleartext password per tenant from
+  `--shim-config` (`shim.yaml`). The default listen address is loopback; for a
+  non-loopback bind, front a TLS terminator — the same posture as the MySQL
+  shim behind ProxySQL.
+
+`bintrail-pg` still ships the MySQL-wire `shim` command as well, if you prefer
+to reach the index from MySQL tooling. See
+[Time-Travel SQL Setup](time-travel-sql.md) for the full grammar.
 
 ---
 
@@ -583,9 +717,9 @@ coerce, but verify your own round-trip.
   `recover-cascade` work unconditionally, with no baseline needed; cascades
   are captured as ordinary row changes — see
   [Querying and recovering](#querying-and-recovering).)
-- **No connection/forensics attribution.** `pgoutput` does not carry the backend
-  PID, so the per-connection forensics surface (available for MySQL) is empty
-  for PostgreSQL.
+- **No connection attribution.** `pgoutput` does not carry the backend PID, so
+  the `connection_id` column is empty for PostgreSQL sources — nothing upstream
+  can add it.
 - **One database per slot.** A logical slot is scoped to a single database; to
   capture multiple databases on one cluster, run one `bintrail-pg stream` (and
   slot/publication) per database.

@@ -183,7 +183,7 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	// at the library boundary here means library callers (not just the CLI)
 	// also get the migration automatically.
 	if err := indexer.EnsureSchema(db); err != nil {
-		return nil, fmt.Errorf("ensure index schema: %w", err)
+		return nil, indexer.WrapSchemaMigrationErr(err)
 	}
 
 	// Derive DBName for the query planner.
@@ -442,6 +442,17 @@ func ReconstructTable(
 		Until:  &cfg.At,
 		// No PKValues filter — we want every event for this table.
 	}
+	// Anchor the delta window's lower bound on the baseline's exact recorded
+	// binlog position instead of its imprecise dump-start DATETIME (#797): a
+	// transaction whose statement executed just before snapshotTime but
+	// committed just after it would otherwise fall through both the dump's
+	// MVCC snapshot AND a Since-only fetch, silently missing from the
+	// reconstruction. Older baselines that never recorded a position
+	// (BinlogFile=="" or BinlogPos==0, the established "absent" convention —
+	// see baseline.DumpMetadata) fall back to the plain Since-only fetch.
+	if bmeta.BinlogFile != "" && bmeta.BinlogPos > 0 {
+		fetchOpts.SincePos = &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
+	}
 	// nil ArchiveFetcher → the container-safe parquetquery.Fetch. Resolved here
 	// at the point of use so both ReconstructTables and any direct
 	// ReconstructTable caller get the default (#510).
@@ -623,6 +634,28 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 			in.Schema, in.Table, strings.Join(extra, ", "))
 	}
 
+	// Fail loud on a baseline column DROPPED after the baseline (#843), the
+	// symmetric direction of the #602 guard above: post-drop delta events stop
+	// carrying the column in row_after, so projecting them onto the baseline
+	// columns would NULL-fill it while never-touched pass-through rows keep
+	// the pre-drop value — one dump mixing two schema epochs (a state that
+	// never existed) under a CREATE TABLE header that still declares the
+	// column. Column ABSENCE from the image is the signal
+	// (binlog_row_image=FULL is a hard requirement, so an after-image always
+	// carries every column live at event time); a genuinely-NULL value is
+	// present in the map with a nil value and passes through untouched.
+	// Detected up front, aggregated over the whole change map — not the old
+	// per-row×column slog.Warn — and before the writer opens, so no partial
+	// chunk files are left on disk.
+	if missing := droppedBaselineColumns(in.Changes, colNames); len(missing) > 0 {
+		return fmt.Errorf(
+			"full-table reconstruct: %s.%s has baseline column(s) %s absent from delta-event row images "+
+				"(dropped from the source table after the baseline snapshot); emitting would mix schema epochs — "+
+				"rows touched after the drop would carry NULL while never-touched rows keep the pre-drop value — "+
+				"re-run `bintrail baseline` to capture a snapshot of the current schema",
+			in.Schema, in.Table, strings.Join(missing, ", "))
+	}
+
 	mw, err := NewMydumperWriter(in.OutputDir, in.Schema, in.Table, colNames, in.ChunkSize)
 	if err != nil {
 		return fmt.Errorf("open mydumper writer: %w", err)
@@ -651,8 +684,8 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 	// order the writer was constructed with. For baseline pass-through rows
 	// the map is keyed by exactly those columns (so rowAfterOrdered is an
 	// order-preserving identity); for event after-images it aligns the
-	// event's row_after to the baseline schema, filling drift columns with
-	// NULL — identical to the pre-refactor behaviour.
+	// event's row_after to the baseline schema — drift in either direction
+	// was already refused up front (#602/#843), so the alignment is total.
 	stats, err := mergeBaselineImages(ctx, mergeCore{
 		LocalBaselinePath: in.LocalBaselinePath,
 		Schema:            in.Schema,
@@ -687,6 +720,9 @@ type mergeCore struct {
 	Table             string
 	PKCols            []metadata.ColumnMeta
 	Changes           map[string]*query.ResultRow
+	// PGTextPK skips the MySQL PK canonicalizer for a PostgreSQL source (text
+	// PK on both baseline and delta sides). See SnapshotFullTableInput.PGTextPK.
+	PGTextPK bool
 }
 
 // mergeStats counts what mergeBaselineImages did, for the offline
@@ -774,9 +810,17 @@ func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string
 		// go-mysql-formatted string (#212). canonicalizePKMap does not
 		// mutate rowMap, so the emitted pass-through row keeps its original
 		// values.
-		pkMap, err := canonicalizePKMap(rowMap, in.PKCols)
-		if err != nil {
-			return stats, fmt.Errorf("canonicalize baseline PK for %s.%s: %w", in.Schema, in.Table, err)
+		// PostgreSQL: baseline COPY text and delta pgoutput text are the same
+		// bytes, so the PK match is string-identity — skip the MySQL DATA_TYPE
+		// canonicalizer, which errors on PG's empty DATA_TYPE token. MySQL still
+		// canonicalizes (DuckDB returns time.Time for a DATETIME/TIMESTAMP PK,
+		// which must become the indexer's stored string, #212).
+		pkMap := rowMap
+		if !in.PGTextPK {
+			var err error
+			if pkMap, err = canonicalizePKMap(rowMap, in.PKCols); err != nil {
+				return stats, fmt.Errorf("canonicalize baseline PK for %s.%s: %w", in.Schema, in.Table, err)
+			}
 		}
 		pk := event.BuildPKValues(in.PKCols, pkMap)
 
@@ -860,6 +904,13 @@ type SnapshotFullTableInput struct {
 	// per PK by the query, so their detection is bounded by that fetch; nil
 	// falls back to the map-only backstop (pkChangingUpdate).
 	Events []query.ResultRow
+	// PGTextPK marks a PostgreSQL source: the baseline Parquet and the delta
+	// pk_values BOTH store every column as raw text (pgbaseline COPY text ==
+	// pgoutput text), so the PK match is string-identity — skip the MySQL
+	// DATA_TYPE canonicalizer, which errors on PG's empty DATA_TYPE token. A
+	// caller that sets this must have skipped the SupportedPKType precondition
+	// accordingly. Zero value (false) preserves the MySQL path verbatim.
+	PGTextPK bool
 }
 
 // SnapshotFullTableImages reconstructs the full row state of a table at the
@@ -908,6 +959,7 @@ func SnapshotFullTableImages(ctx context.Context, in SnapshotFullTableInput, emi
 		Table:             in.Table,
 		PKCols:            in.PKCols,
 		Changes:           in.Changes,
+		PGTextPK:          in.PGTextPK,
 	}, emit)
 	return err
 }
@@ -1400,6 +1452,59 @@ func postBaselineColumns(changes map[string]*query.ResultRow, colNames []string)
 	return out
 }
 
+// droppedBaselineColumns is the symmetric counterpart of postBaselineColumns:
+// it returns, sorted and de-duplicated, the baseline column names ABSENT (key
+// missing — not value NULL) from some event's row image, i.e. columns DROPPED
+// from the source table after the baseline snapshot. binlog_row_image=FULL
+// (validated at index time) guarantees a complete image, so key absence means
+// the column no longer existed at event time; a genuinely-NULL value is
+// present in the map as a nil value and is never flagged. mergeBaselineIntoWriter
+// calls this up front to refuse the run instead of letting rowAfterOrdered
+// NULL-fill the column row by row (#843).
+//
+// Both row_after AND row_before are scanned (#843 follow-up): a window whose
+// last event for a post-drop-touched PK is a DELETE carries no row_after, but
+// its row_before is itself a post-drop image (the row as it existed just
+// before deletion) and so still lacks the dropped column — checking only
+// row_after let such a window sail through with zero warning, silently
+// re-emitting the stale pre-drop value on every untouched pass-through row.
+// Per-PK this collapsed-map scan is sufficient: changes is keyed by PK with
+// the chronologically LAST event surviving, and time only moves forward, so
+// if any event for a PK is post-drop then so is that surviving one — there is
+// no ordering in which an earlier post-drop event's signal is lost behind a
+// later pre-drop entry for the same key. A PK with zero post-drop activity in
+// the window remains undetectable by construction (no image ever samples the
+// post-drop schema for it) and is out of scope here.
+func droppedBaselineColumns(changes map[string]*query.ResultRow, colNames []string) []string {
+	dropped := make(map[string]struct{})
+	scan := func(img map[string]any) {
+		if img == nil {
+			return
+		}
+		for _, col := range colNames {
+			if _, ok := img[col]; !ok {
+				dropped[col] = struct{}{}
+			}
+		}
+	}
+	for _, ev := range changes {
+		if ev == nil {
+			continue
+		}
+		scan(ev.RowAfter)
+		scan(ev.RowBefore)
+	}
+	if len(dropped) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(dropped))
+	for col := range dropped {
+		out = append(out, col)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // These helpers reverse the storage-side base64 encoding of BLOB/TEXT
 // delta-event values for the mydumper reconstruct path (#653/#660). go-mysql
 // delivers BLOB and TEXT (both MYSQL_TYPE_BLOB) as []byte, which marshalRow
@@ -1512,13 +1617,15 @@ func binaryColsFromTableMeta(tm *metadata.TableMeta) map[string]bool {
 
 // rowAfterOrdered walks colNames and looks up each name in rowAfter (a
 // map[string]any from a binlog event's row_after image), returning a slice
-// of values aligned to the baseline Parquet column order. A baseline column
-// absent from this event's row_after becomes nil (SQL NULL) with an slog.Warn
-// — e.g. a column DROPPED after the baseline (newer events stop carrying it)
-// or a partial image. The opposite direction — a column ADDED after the
-// baseline, present in row_after but not in colNames — is handled up front by
-// the postBaselineColumns guard in mergeBaselineIntoWriter, which refuses the
-// run rather than letting this function drop the value silently (#602).
+// of values aligned to the baseline Parquet column order. On the baseline
+// merge path both schema-drift directions are refused up front by
+// mergeBaselineIntoWriter — a column ADDED after the baseline by the
+// postBaselineColumns guard (#602), a column DROPPED after the baseline by
+// the droppedBaselineColumns guard (#843) — so a missing key here is
+// unreachable there. The NULL-fill-with-warn below remains as
+// defense-in-depth and for the binlog-only fallback path
+// (writeBinlogOnlyChanges), whose colNames come from a resolver snapshot
+// rather than a baseline.
 //
 // Both baseline pass-through rows and delta-event after-images flow through
 // here, so it must NOT base64-decode BLOB/TEXT values: a baseline TEXT value is

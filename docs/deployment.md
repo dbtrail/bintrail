@@ -455,7 +455,7 @@ INDEX_DSN="bintrail:password@tcp(index-mysql:3306)/bintrail_index?tls=true"
 SOURCE_DSN="bintrail:password@tcp(source-mysql:3306)/?tls=true"
 ```
 
-For richer **source** TLS on `bintrail stream` — CA verification or mutual TLS — use the dedicated `--ssl-mode`/`--ssl-ca`/`--ssl-cert`/`--ssl-key` flags instead of the DSN parameter; see [streaming.md → TLS/SSL for managed MySQL](streaming.md#tlsssl-for-managed-mysql-rds-aurora-cloud-sql).
+For richer TLS on the streaming daemon (`bintrail stream`/`up`/`bintrail-console watch`) — CA verification or mutual TLS on **both** the source and index connections — use the dedicated `--ssl-mode`/`--ssl-ca`/`--ssl-cert`/`--ssl-key` flags; `--ssl-mode required` (or stricter) makes TLS mandatory on both. The DSN `?tls=` parameter above still works, takes precedence when set, and is the only TLS knob for the offline read commands (`query`/`recover`/`reconstruct`/`verify`/`shim`), which have no `--ssl-mode`. See [streaming.md → TLS/SSL for managed MySQL](streaming.md#tlsssl-for-managed-mysql-rds-aurora-cloud-sql).
 
 ### Metrics endpoint security
 
@@ -585,3 +585,25 @@ If you see GTID-related errors:
 - Ensure `--server-id` is unique across all MySQL replication clients connected to the source
 - Do not use server IDs in the range the source MySQL uses (check `SHOW VARIABLES LIKE 'server_id'` on source)
 - For RDS/Aurora: use server IDs > 1000000 to avoid conflicts with AWS-managed replicas
+
+## Usage telemetry
+
+Official release builds report metadata-only usage statistics (command name,
+version, OS/arch, error class — never your data). Long-running units send at
+most one beacon per UTC day and log one line at startup when reporting is on.
+
+To disable it across a deployment, set it in the unit file rather than per
+host:
+
+```ini
+[Service]
+Environment=BINTRAIL_TELEMETRY=off
+```
+
+Note that telemetry state otherwise lives in a home directory, so **a setting
+baked into a golden image travels with the image** — every host cloned from it
+inherits the choice made on the machine the image was built from. Setting the
+environment variable in the unit is what makes that explicit.
+
+A binary you build yourself has no reporting address compiled in and cannot
+send anything at all. See [TELEMETRY.md](../TELEMETRY.md).

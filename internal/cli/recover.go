@@ -18,6 +18,7 @@ import (
 	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -179,6 +180,15 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		Flag:       rFlag,
 		Limit:      rLimit,
 		LimitPerPK: rLimitPerPK,
+		// When --limit truncates the window it must keep the most RECENT
+		// events (#785): reversing a newest-suffix rolls the data back to a
+		// consistent intermediate point, whereas the ASC default would keep
+		// the OLDEST prefix — undoing old events underneath later un-reverted
+		// ones maps to no state that ever existed (the reverse UPDATE's
+		// row_after WHERE no longer matches, or the reverse DELETE removes a
+		// row a later event rewrote). The rows are re-sorted ascending after
+		// the fetch, before generation.
+		Order: "DESC",
 	}
 
 	// ── Connect to index database ─────────────────────────────────────────────
@@ -189,7 +199,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	if err := indexer.EnsureSchema(db); err != nil {
-		return fmt.Errorf("schema migration: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
 	}
 
 	// Plain recover cannot reconstruct rows deleted by an FK ON DELETE CASCADE:
@@ -258,6 +268,40 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		resolver = nil
 	}
 
+	// ── Re-encode --pk/--pks against the at-rest pk_values form ────────────────
+	// (#957) binlog_events.pk_values is stored PIPE/BACKSLASH-ESCAPED
+	// (event.BuildPKValues escapes each PK component before joining with "|"),
+	// but --pk/--pks bind the raw flag value straight through. A value
+	// containing a literal "|"/"\" is ambiguous without knowing the live
+	// table's actual PK column count: it could be the user-typed delimiter
+	// between components of a composite PK (see the documented
+	// "--pk '12345|2'" usage — the raw, unescaped form is what's stored), or
+	// a literal character inside a single-column PK (the escaped form is
+	// what's stored). An earlier revision of this fix resolved that
+	// ambiguity from the schema resolver above, but its snapshot can be stale
+	// relative to the live table (e.g. an ALTER TABLE widened/narrowed the PK
+	// and no `bintrail snapshot` re-run happened yet since) — trusting it can
+	// silently corrupt a previously-correct composite lookup. Instead, match
+	// BOTH candidate encodings whenever escaping would actually change the
+	// value: event.EscapePKValue is a no-op unless the value contains "|" or
+	// "\", so the overwhelming common case (plain numeric/text PKs) emits the
+	// exact same query as before this feature existed.
+	if opts.PKValues != "" {
+		if esc := event.EscapePKValue(opts.PKValues); esc != opts.PKValues {
+			opts.PKValuesAlt = esc
+		}
+	}
+	if len(opts.PKValuesIn) > 0 {
+		expanded := make([]string, 0, len(opts.PKValuesIn))
+		for _, v := range opts.PKValuesIn {
+			expanded = append(expanded, v)
+			if esc := event.EscapePKValue(v); esc != v {
+				expanded = append(expanded, esc)
+			}
+		}
+		opts.PKValuesIn = expanded
+	}
+
 	// ── Fetch events (live + archives) ────────────────────────────────────────
 	// Archive auto-discovery, planner-based routing, and MergeResults are all
 	// delegated to query.FetchMerged so recover, reconstruct (#209), and
@@ -300,6 +344,18 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// The fetch above ran Order=DESC so --limit kept the newest suffix of the
+	// window (#785). Detect truncation on the FETCHED row count — before
+	// generation, so the warning fires even when generation later refuses —
+	// then restore ascending order: GenerateSQLFromRows expects ASC input and
+	// reverses it internally to undo most-recent first.
+	truncated := rLimit > 0 && len(rows) >= rLimit
+	if truncated {
+		slog.Warn("matched events truncated at --limit; only the most recent events of the window are reversed",
+			"limit", rLimit)
+	}
+	rows = query.MergeResults(rows, 0, "ASC")
+
 	// ── Generate recovery SQL ─────────────────────────────────────────────────
 	// Select the SQL dialect from the source flavor recorded in the index
 	// (single-source per stream_state) — PostgreSQL needs double-quoted identifiers
@@ -326,8 +382,9 @@ func runRecover(cmd *cobra.Command, args []string) error {
 			return cliutil.OutputJSON(struct {
 				Statements int    `json:"statements"`
 				DryRun     bool   `json:"dry_run"`
+				Truncated  bool   `json:"truncated"`
 				SQL        string `json:"sql"`
-			}{Statements: n, DryRun: true, SQL: buf.String()})
+			}{Statements: n, DryRun: true, Truncated: truncated, SQL: buf.String()})
 		}
 
 		n, err := gen.GenerateSQLFromRows(rows, os.Stdout)
@@ -341,8 +398,8 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		if n > 0 {
 			fmt.Fprintf(os.Stderr, "\n%d reversal statement(s) generated.\n", n)
 		}
-		if n >= rLimit {
-			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", rLimit)
+		if truncated {
+			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d events; only the most recent events of the window are reversed. Use a narrower time range or --limit to adjust.\n", rLimit)
 		}
 		return nil
 	}
@@ -372,8 +429,9 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		return cliutil.OutputJSON(struct {
 			Statements int    `json:"statements"`
 			DryRun     bool   `json:"dry_run"`
+			Truncated  bool   `json:"truncated"`
 			Output     string `json:"output"`
-		}{Statements: n, DryRun: false, Output: rOutput})
+		}{Statements: n, DryRun: false, Truncated: truncated, Output: rOutput})
 	}
 
 	if n == 0 {
@@ -381,8 +439,8 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "%d reversal statement(s) written to %s\n", n, rOutput)
 	}
-	if n >= rLimit {
-		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", rLimit)
+	if truncated {
+		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d events; only the most recent events of the window are reversed. Use a narrower time range or --limit to adjust.\n", rLimit)
 	}
 	return nil
 }

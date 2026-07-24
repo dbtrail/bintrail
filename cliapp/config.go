@@ -181,17 +181,19 @@ var envSections = []envSection{
 		},
 	},
 	{
+		Header: "Shim limits (used by bintrail shim; see docs/time-travel-sql.md)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_SHIM_QUERY_TIMEOUT", "5m"},
+			{"BINTRAIL_SHIM_MAX_CONNECTIONS", "100"},
+			{"BINTRAIL_SHIM_MAX_FULLTABLE_QUERIES", "4"},
+		},
+	},
+	{
 		Header: "Built-in rotation (used by bintrail up)",
 		Bindings: []envTemplateEntry{
 			{"BINTRAIL_ROTATE_RETAIN", "30d"},
 			{"BINTRAIL_ROTATE_INTERVAL", "1h"},
 			{"BINTRAIL_ROTATE_ADD_FUTURE", "3"},
-		},
-	},
-	{
-		Header: "Forensics attribution (used by bintrail up / bintrail-console watch; 0 disables the session-identity poller)",
-		Bindings: []envTemplateEntry{
-			{"BINTRAIL_ATTRIBUTION_RETENTION", "24h"},
 		},
 	},
 	{

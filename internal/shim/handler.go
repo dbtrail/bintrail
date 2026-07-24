@@ -52,9 +52,14 @@ var showTablesFromVirtualRE = regexp.MustCompile(
 // monitoring can distinguish it from a real shim crash, and operators
 // narrow the AS OF range or fall back to PK-filtered queries.
 //
-// Streaming the resultset (Conn.WriteFieldList + WriteRow per row,
-// removing the cap) is deferred per the scoping comment on #276;
-// cap+buffered is the bounded substitute for the MVP.
+// This cap governs the BUFFERED full-table paths: the binlog-only
+// `_flashback` full-table reconstruction (whose FetchMerged fetch is
+// itself buffered) and any LIMIT'd query. Full-table `_snapshot` with
+// no LIMIT now STREAMS row-by-row over a bound connection and is NOT
+// capped (#998, streamSnapshotFullTable) — the baseline flows through
+// the merge cursor, so peak memory is O(rows changed since the
+// baseline), not O(table size). The originally-deferred streaming path
+// (#276's scoping comment) shipped in #998.
 //
 // Per-Handler override lives on Config.FullTableRowCap (zero =
 // inherit this default) so unit tests can lower it without mutating
@@ -124,6 +129,20 @@ type Handler struct {
 	epochListMu     sync.Mutex
 	epochList       []metadata.SnapshotEpoch
 	epochListLoaded time.Time
+
+	// baseCtx is the per-connection context set by BindConnContext
+	// (#823). Every query context derives from it, so a client
+	// disconnect or daemon shutdown aborts in-flight fetches. nil means
+	// context.Background() (unit tests, pre-#823 embedders).
+	baseCtx context.Context
+
+	// conn, when non-nil, lets the full-table _snapshot path stream its
+	// resultset row-by-row over the wire instead of buffering it and tripping
+	// FullTableRowCap (#998). Bound by BindConn after the server.Conn is
+	// constructed (per connection). nil — unit tests, or any embedder that
+	// never calls BindConn — keeps the bounded buffered+cap path, so streaming
+	// is strictly opt-in and cannot change behaviour for an unbound handler.
+	conn packetWriter
 
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
@@ -292,6 +311,20 @@ type Config struct {
 	// _flashback).
 	BaselineDir string
 	BaselineS3  string
+	// QueryTimeout bounds each time-travel query end-to-end — planner,
+	// index fetch, archive/DuckDB fetch, and (for full-table queries)
+	// the wait for a FullTableGate slot (#823). Zero disables the
+	// deadline (pre-#823 behaviour). On expiry the client sees
+	// ER_QUERY_INTERRUPTED (1317).
+	QueryTimeout time.Duration
+	// FullTableGate caps concurrent full-table reconstructions
+	// (_flashback / _snapshot with no WHERE) across every connection of
+	// this shim process — the heaviest queries, each buffering up to
+	// FullTableRowCap rows post-merge (#823). nil admits everything
+	// (pre-#823 behaviour). Config is copied per connection, so wire ONE
+	// shared *Gate here at startup — a per-Handler gate would cap
+	// nothing.
+	FullTableGate *Gate
 }
 
 // NewHandler constructs a Handler bound to a bintrail index DSN with
@@ -313,6 +346,52 @@ func NewHandlerWithConfig(indexDB *sql.DB, cfg Config, logger *slog.Logger) *Han
 		archiveFetcher: parquetquery.Fetch,
 		resolverFn:     func() (*metadata.Resolver, error) { return metadata.NewLatestPerTableResolver(indexDB) },
 	}
+}
+
+// BindConnContext ties every subsequent query on this Handler to ctx —
+// the per-connection context the serving layer derives from the TCP
+// connection (#823): when the client disconnects or the daemon shuts
+// down, ctx is canceled and any in-flight FetchMerged aborts instead of
+// running to completion for a client that is gone. Call once before
+// serving commands; the Handler is per-connection and commands are
+// dispatched from the same goroutine, so no lock is needed. Handlers
+// without a bound context keep the pre-#823 context.Background()
+// behaviour.
+func (h *Handler) BindConnContext(ctx context.Context) {
+	h.baseCtx = ctx
+}
+
+// BindConn ties this Handler to the MySQL connection it serves so the
+// full-table _snapshot path can stream its resultset row-by-row (#998) rather
+// than buffering it into a *mysql.Result and tripping FullTableRowCap. Call
+// once, right after the server.Conn is constructed and before serving commands
+// (the Handler is per-connection, dispatched from one goroutine, so no lock is
+// needed). Handlers that never bind a conn keep the bounded buffered+cap path.
+func (h *Handler) BindConn(conn packetWriter) {
+	h.conn = conn
+}
+
+// queryContext derives the context every run* entry point uses for one
+// query (#823): rooted at the connection context (BindConnContext) so
+// client disconnect / shutdown cancels it, with cfg.QueryTimeout as the
+// deadline when configured. The returned cancel must be deferred.
+func (h *Handler) queryContext() (context.Context, context.CancelFunc) {
+	base := h.baseCtx
+	if base == nil {
+		base = context.Background()
+	}
+	if h.cfg.QueryTimeout > 0 {
+		return context.WithTimeout(base, h.cfg.QueryTimeout)
+	}
+	return context.WithCancel(base)
+}
+
+// QueryContext exposes queryContext so a second wire front-end (the pgwire
+// server in internal/pgshim, #1008) roots each resolve at the same
+// per-connection context + QueryTimeout deadline the MySQL command loop uses.
+// The returned cancel must be deferred.
+func (h *Handler) QueryContext() (context.Context, context.CancelFunc) {
+	return h.queryContext()
 }
 
 // UseDB stores the schema the client selected. _flashback queries
@@ -404,22 +483,57 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 // Both branches prefix qType so an operator with multiple concurrent
 // shim sessions can attribute the error to a _flashback / _diff /
 // _snapshot query without correlating logs.
-func wrapFetchError(qType QueryType, err error) error {
-	var gapErr *query.GapError
-	if errors.As(err, &gapErr) {
-		return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE,
-			fmt.Sprintf("resolve %s: %s", qType, gapErr.Error()))
+// Context errors (#823) get ER_QUERY_INTERRUPTED (1317) — MySQL's own
+// "Query execution was interrupted" — so monitoring can tell a reaped
+// query (deadline, client disconnect, shutdown) from a genuine server
+// fault (1105) or a user-input problem (1526/1064). ctx is the query
+// context the fetch ran under: when it is already dead, its error takes
+// over regardless of what the driver surfaced — go-sql-driver wraps
+// ctx.Err() but sqlmock and the DuckDB archive path return their own
+// cancellation sentinels, and the wire code must reflect WHY the query
+// died, not which driver noticed first. Pass context.Background() (or
+// any live ctx) to keep the pure error-classification behaviour.
+//
+// The override discards whatever FetchMerged actually returned — which
+// can be a genuine failure (S3 AccessDenied, a DuckDB error, an index-DB
+// outage) that merely lost the race with the context deadline/cancel.
+// logger records that discarded error (Warn) before it's overwritten so
+// an operator can still find the real cause in the shim's own log even
+// though the client only sees "query interrupted"; nil logger is a no-op
+// for tests that don't care about log output.
+func wrapFetchError(ctx context.Context, qType QueryType, err error, logger *slog.Logger) error {
+	// Delegates to the wire-neutral classifier (#1008, resolve.go) so the MySQL
+	// and pgwire front-ends draw the SAME gap/deadline/cancel/fault split; the
+	// mysqlResolveError mapping keeps this byte-identical to the pre-#1008 form
+	// for every existing caller (runFullTable / runDiff / runSnapshotFullTable).
+	return mysqlResolveError(classifyFetchError(ctx, qType, err, logger))
+}
+
+// fullTableGateError converts a FullTableGate.Acquire failure into the
+// wire error the client sees (#823). Saturation-until-deadline maps to
+// ER_TOO_MANY_USER_CONNECTIONS (1203) — distinct from the 1317 a slow
+// query's own fetch gets, so an operator can tell "the gate is full"
+// from "queries are slow".
+func (h *Handler) fullTableGateError(qType QueryType, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return mysql.NewError(mysql.ER_TOO_MANY_USER_CONNECTIONS, fmt.Sprintf(
+			"resolve %s: too many concurrent full-table time-travel queries (cap %d); retry later, filter by PK, or raise --max-fulltable-queries",
+			qType, h.cfg.FullTableGate.Cap()))
 	}
-	return fmt.Errorf("resolve %s: %w", qType, err)
+	return mysql.NewError(mysql.ER_QUERY_INTERRUPTED, fmt.Sprintf(
+		"resolve %s: query canceled while waiting for a full-table slot (client disconnected or shim shutting down)", qType))
 }
 
 // runPointInTime resolves a _flashback query (binlog-only) against the
 // bintrail index + archives and reconstructs the row's state at q.AsOf.
 //
 // Two shapes are recognised, sharing this entry point:
-//   - q.PKColumn != "": single-row point-lookup. Returns the latest
-//     INSERT/UPDATE post-image, or an empty resultset when the latest
-//     event at-or-before AsOf is a DELETE.
+//   - q.PKColumn != "": single-row point-lookup. Folds the PK's event
+//     sequence up to AsOf onto its state, returning the row's image at AsOf
+//     (or an empty resultset when the latest surviving event is a DELETE).
+//     The cut is at the TRANSACTION boundary, not the row (#988): a
+//     multi-statement transaction straddling AsOf is excluded whole rather
+//     than half-applied — the same #783 fix the single-row _snapshot path uses.
 //   - q.PKColumn == "": full-table reconstruction (issue #276).
 //     Dispatches to runFullTable.
 //
@@ -442,38 +556,19 @@ func (h *Handler) runPointInTime(q TimeTravelQuery) (*mysql.Result, error) {
 		return h.runFullTable(q)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
 
-	// LimitPerPK=1 (not Limit=1) is the right knob: query.Engine emits
-	// the global result-set in ASC order by (event_timestamp, event_id),
-	// so a plain Limit=1 would return the *earliest* event in the
-	// time window, not the latest. LimitPerPK uses an inner
-	// ROW_NUMBER OVER (PARTITION BY pk_values ORDER BY event_timestamp
-	// DESC, event_id DESC) so the kept event for each PK is the most
-	// recent one — exactly what _flashback "row state at AsOf" needs.
-	engine := query.New(h.indexDB)
-	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
-		Opts: query.Options{
-			Schema:     q.Schema,
-			Table:      q.Table,
-			PKValues:   q.PKValue,
-			Until:      &q.AsOf,
-			LimitPerPK: 1,
-		},
-		DBName:         h.cfg.IndexDBName,
-		NoArchive:      h.cfg.NoArchive,
-		AllowGaps:      h.cfg.AllowGaps,
-		ArchiveFetcher: h.archiveFetcher,
-	})
+	// The single-row fetch → ENUM/SET epoch map → transaction-atomic ApplyAt
+	// fold now lives in the wire-neutral ResolveFlashbackRow (#1008, resolve.go),
+	// shared with the pgwire front-end. A nil image means the row did not exist
+	// at AsOf (never created, or a DELETE tail); a fetch/coverage failure is a
+	// *ResolveError; an ApplyAt data-fault is raw. mysqlRenderErr maps both to
+	// the same wire codes the pre-#1008 inline path produced.
+	image, err := h.ResolveFlashbackRow(ctx, q)
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, mysqlRenderErr(err)
 	}
-
-	// ENUM/SET ordinals → labels (#472/#475), so the historical row
-	// renders the way the live table did when the event happened.
-	h.mapEventImages(q.Schema, q.Table, rows)
-	image := selectImage(rows)
 	if image == nil {
 		return emptyResult(), nil
 	}
@@ -627,12 +722,36 @@ func (h *Handler) runShowTablesFromVirtual(currentDB, virtualSchema string) (*my
 // those columns dropped — same behaviour as a regular MySQL
 // `SELECT *` after an ALTER TABLE that removed a column.
 func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
+
+	// Bound concurrent full-table reconstructions (#823). Acquire
+	// respects the query context, so an abandoned waiter is reaped at
+	// --query-timeout (or on client disconnect) instead of queuing
+	// forever behind the cap.
+	if err := h.cfg.FullTableGate.Acquire(ctx); err != nil {
+		return nil, h.fullTableGateError(q.Type, err)
+	}
+	defer h.cfg.FullTableGate.Release()
 
 	cap := h.cfg.FullTableRowCap
 	if cap <= 0 {
 		cap = defaultFullTableRowCap
+	}
+
+	// #997: a LIMIT at or below the cap bounds the fetch directly, so the query
+	// SUCCEEDS instead of tripping the cap — the "add a LIMIT to browse" remedy
+	// the cap error suggests. A LIMIT never RAISES the cap (conservative
+	// default): a LIMIT above the cap keeps the cap+1 overflow probe, so the
+	// binlog full-table path can never buffer more than the cap. This path
+	// stays buffered (unlike the streaming _snapshot path, #998) because
+	// query.FetchMerged materialises the whole fetch regardless — streaming the
+	// wire without a cursor-based fetch would only relocate the OOM.
+	fetchLimit := cap + 1
+	capped := true
+	if q.Limit > 0 && q.Limit <= cap {
+		fetchLimit = q.Limit
+		capped = false
 	}
 
 	engine := query.New(h.indexDB)
@@ -642,7 +761,7 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 			Table:      q.Table,
 			Until:      &q.AsOf,
 			LimitPerPK: 1,
-			Limit:      cap + 1,
+			Limit:      fetchLimit,
 		},
 		DBName:         h.cfg.IndexDBName,
 		NoArchive:      h.cfg.NoArchive,
@@ -650,13 +769,13 @@ func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
-	if len(rows) > cap {
+	if capped && len(rows) > cap {
 		return nil, mysql.NewError(mysql.ER_TOO_BIG_SELECT, fmt.Sprintf(
-			"resolve %s: %s.%s at %s would return more than %d rows; narrow the AS OF range or filter by PK",
-			q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), cap,
+			"resolve %s: %s.%s at %s would return more than %d rows; add a LIMIT (e.g. LIMIT %d) to browse, narrow the AS OF range, or filter by PK",
+			q.Type, q.Schema, q.Table, q.AsOf.Format("2006-01-02 15:04:05"), cap, cap,
 		))
 	}
 
@@ -872,63 +991,12 @@ func fullTableColumns(images []map[string]any, ddlOrder []string) []string {
 //   - single-column PK that does NOT match → 1064 with an actionable
 //     message naming both the expected and the user-supplied column.
 func (h *Handler) validatePKColumn(q TimeTravelQuery) error {
-	if q.PKColumn == "" {
-		return nil
-	}
-	if h.resolverFn == nil {
-		return nil
-	}
-	r, err := h.resolverCache.get(time.Now, resolverCacheTTL, h.resolverFn, h.logger)
-	if err != nil {
-		// Cannot confirm q.PKColumn is the table's PK. A
-		// column-qualified WHERE is guaranteed here (the full-table
-		// shape returned above), so fail loud rather than join the
-		// literal against pk_values and risk the wrong row (#821).
-		// ErrNoSnapshots (benign first-install state) still can't
-		// verify the PK, so it rejects too — only the no-WHERE
-		// full-table path is exempt. Was Debug/skip; raised to Warn.
-		reason := "schema_snapshots lookup failed"
-		if errors.Is(err, metadata.ErrNoSnapshots) {
-			reason = "no schema snapshots available yet"
-		}
-		h.logger.Warn("shim: cannot verify PK column; rejecting column-qualified WHERE",
-			"err", err, "reason", reason, "schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn)
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"cannot verify WHERE column %s is the primary key of %s.%s (%s); refusing to run so a non-PK WHERE cannot silently return the wrong row",
-			q.PKColumn, q.Schema, q.Table, reason,
-		))
-	}
-	tm, err := r.Resolve(q.Schema, q.Table)
-	if err != nil {
-		// Table absent from every snapshot (created after the newest
-		// snapshot, or not yet seen on the stream). Can't verify the
-		// PK, so a column-qualified WHERE rejects rather than answer
-		// against pk_values and return a different row (#821). Re-run
-		// `bintrail snapshot`; the no-WHERE full-table path still works.
-		h.logger.Warn("shim: table not in any snapshot; rejecting column-qualified WHERE",
-			"err", err, "schema", q.Schema, "table", q.Table, "pk_column", q.PKColumn)
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"cannot verify WHERE column %s is the primary key of %s.%s (table not present in any indexed snapshot); refusing to run so a non-PK WHERE cannot silently return the wrong row",
-			q.PKColumn, q.Schema, q.Table,
-		))
-	}
-	if len(tm.PKColumns) == 0 {
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"%s.%s has no primary key declared in the indexed snapshot; cannot resolve %s by PK",
-			q.Schema, q.Table, q.Type,
-		))
-	}
-	if len(tm.PKColumns) > 1 {
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"%s.%s has a composite primary key (%s); WHERE %s = <value> shape supports only single-column PKs",
-			q.Schema, q.Table, strings.Join(tm.PKColumns, ", "), q.PKColumn,
-		))
-	}
-	if q.PKColumn != tm.PKColumns[0] {
-		return mysql.NewError(mysql.ER_PARSE_ERROR, fmt.Sprintf(
-			"WHERE column must be the primary key of %s.%s (expected %s, got %s)",
-			q.Schema, q.Table, tm.PKColumns[0], q.PKColumn,
-		))
+	// The check itself is wire-neutral (#1008): PKColumnCheck returns the reason
+	// string, shared with the pgwire front-end (which wraps it in SQLSTATE
+	// 42601). Here we keep the historical ER_PARSE_ERROR (1064) wrapping and the
+	// exact message text, so MySQL behaviour is unchanged.
+	if msg, reject := h.PKColumnCheck(q); reject {
+		return mysql.NewError(mysql.ER_PARSE_ERROR, msg)
 	}
 	return nil
 }
@@ -1311,52 +1379,23 @@ func (h *Handler) epochResolver(id int) (*metadata.Resolver, error) {
 	return r, nil
 }
 
-// selectImage picks the row image that represents the row's state at
-// the queried point in time, given the LimitPerPK=1 result of a
-// _flashback / _snapshot fetch.
-//
-// The caller passes whatever FetchMerged returned. Because we issue
-// the fetch with LimitPerPK=1 and a single PKValues filter, at most
-// one row reaches this helper — but selectImage tolerates an empty
-// or larger slice and only ever inspects rows[0], so a future caller
-// that loosens the limit cannot accidentally pick the wrong event.
-//
-// Returns nil — meaning the caller responds with an empty resultset —
-// in three cases: (1) no rows, (2) the latest event is a DELETE
-// (the row did not exist at AsOf; matches docs/time-travel-sql.md's
-// Oracle AS OF semantic and the full-table path), (3) both images
-// are empty on an INSERT/UPDATE (corrupted index — treated as "no
-// answer" rather than fabricating one).
-//
-// For non-DELETE events, row_after wins when present (the post-image
-// is the row's state at the event — true for INSERT, UPDATE, and the
-// EventSnapshot baseline rows _snapshot will surface in a future
-// iteration). row_before is the fallback used only when row_after is
-// missing — a path the regular indexer pipeline doesn't exercise for
-// INSERT/UPDATE since marshalRow always emits row_after, but kept
-// defensively.
-//
-// Extracted as a pure helper specifically so the rule can be
-// unit-tested without spinning up a real MySQL: a future refactor
-// that reintroduced the row_before fallback for DELETE would silently
-// return stale data on every "what does this row look like AS OF
-// after its deletion?" query, with the regression invisible to any
-// test that doesn't exercise this exact branch.
-func selectImage(rows []query.ResultRow) map[string]any {
-	if len(rows) == 0 {
-		return nil
+// warnCorruptImageDrop logs when a single-row time-travel fold collapsed to an
+// empty state even though the latest surviving event for the PK was NOT a
+// DELETE — i.e. a non-DELETE event carried an empty row image (corrupt/partial
+// index, or a non-FULL binlog_row_image capture that `index` should have
+// refused). Without this the row is silently returned as "did not exist at
+// AsOf," indistinguishable from a real DELETE. Mirrors the sibling signals in
+// reconstruct.applyEvent (NULL event_type) and mergeBaselineImages (nil
+// RowAfter on INSERT/UPDATE). No-op for the legitimate empty cases: no events
+// at all, or a DELETE tail.
+func (h *Handler) warnCorruptImageDrop(schema, table string, rows []query.ResultRow) {
+	n := len(rows)
+	if n == 0 || rows[n-1].EventType == event.EventDelete {
+		return
 	}
-	latest := rows[0]
-	if latest.EventType == event.EventDelete {
-		return nil
-	}
-	if len(latest.RowAfter) > 0 {
-		return latest.RowAfter
-	}
-	if len(latest.RowBefore) > 0 {
-		return latest.RowBefore
-	}
-	return nil
+	h.logger.Warn("shim: single-row time-travel folded to an empty state though the latest event was not a DELETE (corrupt or partial row image?) — returning an empty resultset",
+		"schema", schema, "table", table,
+		"event_type", rows[n-1].EventType, "event_id", rows[n-1].EventID)
 }
 
 // runDiff resolves a _diff query: every event for the given PK
@@ -1368,7 +1407,7 @@ func selectImage(rows []query.ResultRow) map[string]any {
 // they need an audit-style view of "what changed to this row in this
 // time window".
 func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := h.queryContext()
 	defer cancel()
 
 	// No row cap: a _diff query is already PK-scoped + time-windowed, so the
@@ -1377,12 +1416,15 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 	// hand the customer a partial audit history with no signal — worse than
 	// the rare cost of a few thousand rows for an unusually hot row.
 	// Customers needing pagination can narrow the BETWEEN range.
+	// See the matching comment in runPointInTime: q.PKValue is raw/unescaped
+	// (#826); binlog_events.pk_values is BuildPKValues-encoded, so re-encode
+	// before matching.
 	engine := query.New(h.indexDB)
 	rows, _, err := query.FetchMerged(ctx, h.indexDB, engine, query.FetchMergedOptions{
 		Opts: query.Options{
 			Schema:   q.Schema,
 			Table:    q.Table,
-			PKValues: q.PKValue,
+			PKValues: event.EscapePKValue(q.PKValue),
 			Since:    &q.Since,
 			Until:    &q.Until,
 		},
@@ -1392,7 +1434,7 @@ func (h *Handler) runDiff(q TimeTravelQuery) (*mysql.Result, error) {
 		ArchiveFetcher: h.archiveFetcher,
 	})
 	if err != nil {
-		return nil, wrapFetchError(q.Type, err)
+		return nil, wrapFetchError(ctx, q.Type, err, h.logger)
 	}
 
 	// Compute the source-table column order once per query so the

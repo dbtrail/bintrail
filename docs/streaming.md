@@ -114,7 +114,9 @@ bintrail stream \
   --reset
 ```
 
-`--reset` clears the saved checkpoint in `stream_state` before starting, forcing the command to use the `--start-file`/`--start-gtid` flags from the command line. Without `--reset`, the saved checkpoint always takes precedence.
+`--reset` discards the saved checkpoint in `stream_state` and replaces it once the new start position is resolved, forcing the command to use the `--start-file`/`--start-gtid` flags from the command line. Without `--reset`, the saved checkpoint always takes precedence.
+
+**`--reset` skips history permanently.** Every event between the discarded checkpoint and the new start position is never indexed. A reset that lands anywhere other than the discarded checkpoint's exact coordinates — including an *earlier* position (direction is not inferred) — is durably recorded as a continuity loss (`gap_lost_at` / `gap_lost_detail` in `stream_state`): `bintrail status` shows the `EVENTS PERMANENTLY LOST` banner and `status --fail-on-gap` exits non-zero, exactly as after an unfillable-gap auto-advance. Such a reset also replaces the detail text of any earlier, still-unacknowledged loss record. A reset that lands on the same coordinates it discarded records nothing and leaves any prior loss record untouched — note the check is coordinates-only: after a source rebuild (`RESET MASTER` + restore) the same coordinates can name a different history.
 
 **When to use `--reset`:**
 - Switching from position mode to GTID mode (or vice versa)
@@ -237,7 +239,7 @@ RDS caps `binlog retention hours` at **720 (30 days)**. Values above the ceiling
 
 ### TLS/SSL for managed MySQL (RDS, Aurora, Cloud SQL)
 
-Managed MySQL services often require TLS. Use `--ssl-mode` to control the connection security:
+Managed MySQL services often require TLS. `--ssl-mode` controls the security of **both** connections the streaming daemon opens — the source replication stream **and** the index write connection, which carries full before/after row images (PII) plus the index credentials:
 
 | Mode | Behavior |
 |------|----------|
@@ -246,6 +248,8 @@ Managed MySQL services often require TLS. Use `--ssl-mode` to control the connec
 | `required` | TLS mandatory (no certificate verification), fail if unavailable |
 | `verify-ca` | Validate server certificate against CA (no hostname check) |
 | `verify-identity` | Full verification (certificate + hostname) |
+
+> **Scope.** `--ssl-mode` covers the streaming daemon (`stream`, `up`, `bintrail-console watch`) only. `required`/`verify-*` make TLS mandatory on both connections, so a server with TLS disabled fails fast with an actionable error rather than silently sending data in cleartext. The offline read commands (`query`, `recover`, `reconstruct`, `verify`, `shim`) have no `--ssl-mode` flag — encrypt their index connection with a DSN parameter instead (`...?tls=true`, or `?tls=skip-verify` for self-signed dev certs). An explicit `tls=` in a DSN takes precedence over `--ssl-mode` for the connections that honor it (the index write + source helper); the source **binlog replication stream** always uses `--ssl-mode` and ignores a `tls=` set on the source DSN.
 
 **Amazon RDS example** (download the [RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) first):
 
@@ -323,3 +327,23 @@ The metrics HTTP server shuts down gracefully (5-second timeout) on command exit
 | **Suitable for systemd** | `Type=oneshot` | `Type=simple`, `Restart=always` |
 
 For managed MySQL, `stream` is the only option. For self-managed MySQL, both work — `index` is simpler for batch backfill, `stream` is better for continuous real-time indexing.
+
+## Usage telemetry
+
+`stream` reports metadata-only usage statistics in official release builds: at
+most one "still running" beacon per UTC day, plus the command's own outcome.
+Never your rows, schemas, table names, hostnames, DSNs, or binlog positions.
+
+It never runs on the replication path — events are appended to a local file and
+delivered by a background goroutine — so it cannot introduce replication lag.
+
+The daemon logs one line at startup when reporting is on. Disable it for a host
+or a fleet with either of:
+
+```sh
+BINTRAIL_TELEMETRY=off
+DO_NOT_TRACK=1
+```
+
+Full details, including every field and the tests that enforce them:
+[TELEMETRY.md](../TELEMETRY.md).

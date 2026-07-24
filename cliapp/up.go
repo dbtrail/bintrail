@@ -5,13 +5,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/doctor"
-	"github.com/dbtrail/dbtrail/internal/forensics"
+	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/rotation"
 	"github.com/dbtrail/dbtrail/internal/serverid"
 )
@@ -59,8 +59,6 @@ var (
 	upRotateInterval  string
 	upRotateAddFuture int
 
-	upAttributionRetention time.Duration
-
 	// upRotationCfg holds the parsed built-in-rotation settings from runUp's
 	// validation, read at the phase-3 start site (the cobra-accumulator
 	// pattern; the parsing and the loop itself live in internal/rotation).
@@ -74,6 +72,7 @@ func init() {
 	upCmd.Flags().StringVar(&upSchemas, "schemas", "", "Comma-separated schemas to index (default: all user schemas)")
 	upCmd.Flags().StringVar(&upTables, "tables", "", "Comma-separated tables to index (default: all)")
 	upCmd.Flags().IntVar(&upBatchSize, "batch-size", 1000, "Events per batch INSERT")
+	upCmd.Flags().DurationVar(&indexer.WriteTimeout, "write-timeout", indexer.DefaultWriteTimeout, "Deadline for each index write (batch INSERT, checkpoint, digest lookup). A mid-statement network stall surfaces as an error within this window instead of freezing the daemon on kernel TCP retransmission (~13-16 min). Raise for very large batches over a slow link")
 	upCmd.Flags().IntVar(&upCheckpoint, "checkpoint", 10, "Checkpoint interval in seconds")
 	upCmd.Flags().StringVar(&upMetricsAddr, "metrics-addr", "", "Address to expose Prometheus metrics (e.g. :9090); empty = disabled")
 	upCmd.Flags().IntVar(&upPartitions, "partitions", 48, "Hourly partitions to create on first init")
@@ -82,7 +81,6 @@ func init() {
 	upCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
 	upCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
 	upCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
-	upCmd.Flags().DurationVar(&upAttributionRetention, "attribution-retention", forensics.DefaultRetention, "Forensics: keep disconnected-session identity (connection_cache) for this long; 0 disables the poller")
 	// --source-dsn is validated in runUp instead of MarkFlagRequired so the
 	// rotation settings parse first (fail-fast on a typo before any phase
 	// runs) — see TestRunUp_explicitRetentionWiring, which relies on that
@@ -122,6 +120,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		// there is still room). Standalone `doctor` keeps full FAIL
 		// semantics for CI.
 		preflight := doctor.Build(cmd.Context(), upSourceDSN, upIndexDSN, upSchemas, upRotationCfg.Retain)
+		appendExtDoctorChecks(cmd.Context(), preflight, upSourceDSN, upIndexDSN)
 		if err := preflight.Write(os.Stderr, "text"); err != nil {
 			return fmt.Errorf("write preflight report: %w", err)
 		}
@@ -204,18 +203,15 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 	rotation.StartLoop(rotCtx, func() rotation.Settings { return upRotationCfg }, func() []rotation.RotateTarget {
 		return []rotation.RotateTarget{{DSN: upIndexDSN}}
 	})
-	// Forensics: cache live session identity (user/host/program per
-	// connection_id) into the index so attribution survives disconnects.
-	// Same lifecycle and contract as rotation: a secondary job that is never
-	// fatal to the stream. Gate-checked at the surface (#701 D1);
-	// --attribution-retention 0 disables it inside StartConnCachePoller.
-	if forensics.Enabled() {
-		forensics.StartConnCachePoller(rotCtx, forensics.ConnCacheConfig{
-			SourceDSN: upSourceDSN,
-			IndexDSN:  upIndexDSN,
-			Retention: upAttributionRetention,
-		})
-	}
+	// Extension source jobs (ext.RegisterSourceJob) share the same lifecycle
+	// and contract as rotation: secondary daemon-scoped
+	// work that must never be fatal to the stream. No-op in the stock binary.
+	// Flavor is the value the stream below actually runs with: `up` has no
+	// --source-flavor flag of its own, so strmFlavor holds streamCmd's default
+	// ("mysql") or the BINTRAIL_SOURCE_FLAVOR override, which bindCommandEnv
+	// (streamCmd) applied at flag-binding time; populateStreamFlags above
+	// deliberately leaves it untouched.
+	ext.RunSourceJobs(rotCtx, ext.SourceJobInfo{SourceDSN: upSourceDSN, IndexDSN: upIndexDSN, Flavor: strmFlavor})
 	return runStream(cmd, args)
 }
 

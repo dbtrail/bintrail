@@ -39,7 +39,7 @@ const EVENT_CSV_COLUMNS = [
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "forensics", "timetravel", "recover", "status", "storage"];
+const ROUTES = ["overview", "events", "timetravel", "recover", "status", "storage", "connect"];
 
 const MON_STATE_TITLES = {
   failed: "connection is failing and retrying automatically; press Start for details",
@@ -54,6 +54,7 @@ const ICONS = {
   file: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"></path><path d="M14 3v5h5"></path></svg>`,
   warn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
   calendar: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg>`,
+  ext: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>`,
 };
 
 // ── module state ─────────────────────────────────────────────────────────────
@@ -63,6 +64,7 @@ let currentServer = "";       // X-Bintrail-Server target ("" = backend default)
 let defaultServerId = "";
 let serverGen = 0;            // bumped on every server switch (staleness guard)
 let capsCache = {};           // last /api/capabilities for the selected server
+let extViews = [];            // extension views advertised for the selected server (embedding builds)
 let lastSQL = "";             // last generated undo SQL (for copy/download)
 let lastEvents = [];          // last rendered (filtered, capped) event page
 let pendingRecover = null;    // event context carried into Recover via "Undo"
@@ -210,11 +212,14 @@ async function handleUnauthorized() {
   let auth = {};
   try { auth = await fetchAuthInfo(); } catch (_) {}
   // After a `user remove` the console can be back in first-run setup.
-  if (auth.setup) { showLoginOverlay({ setup: true }); return; }
+  if (auth.setup) { showLoginOverlay({ setup: true, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
   // Token mode has no session to expire and no form to "sign in" to — say what
-  // actually happened (the stored token is no longer accepted).
-  const msg = auth.password_login ? "Session expired — sign in again." : "This access token is no longer valid.";
-  showLoginOverlay({ passwordLogin: !!auth.password_login, message: msg });
+  // actually happened (the stored token is no longer accepted). An advertised
+  // external provider also mints real sessions, so with one present the
+  // session-expired copy is the accurate one (SSO-only deployments never had
+  // an access token at all).
+  const msg = auth.password_login || auth.sso_start ? "Session expired — sign in again." : "This access token is no longer valid.";
+  showLoginOverlay({ passwordLogin: !!auth.password_login, message: msg, ssoName: auth.sso_name, ssoStart: auth.sso_start });
 }
 
 // clearAuthState drops every credential-scoped cache on sign-out. capsCache
@@ -270,6 +275,7 @@ function showLoginOverlay(opts) {
     form.append(msg);
     form.addEventListener("submit", (e) => { e.preventDefault(); submitSetup(form, msg); });
     panel.append(form);
+    appendSSOEntry(panel, opts);
     scrim.append(panel);
     mount.replaceChildren(scrim);
     form.elements.password.focus();
@@ -277,8 +283,18 @@ function showLoginOverlay(opts) {
   }
 
   if (!opts.passwordLogin) {
-    panel.append(el("p", { class: "modal-desc", text: opts.message || "" }));
-    panel.append(el("p", { class: "modal-desc", text: "Open the link printed when bintrail-console started — it has the access token this page needs." }));
+    if (opts.message) panel.append(el("p", { class: "modal-desc", text: opts.message }));
+    // The printed-?token=-link hint only fits token mode. When the probe
+    // advertises an external provider, that provider may be the SOLE
+    // credential (no token, no password — the server allows it), so pointing
+    // at a nonexistent token link would be false guidance; the SSO entry
+    // below is the sign-in path.
+    if (opts.ssoStart) {
+      panel.append(el("p", { class: "modal-desc", text: "Sign in with the provider below to continue." }));
+    } else {
+      panel.append(el("p", { class: "modal-desc", text: "Open the link printed when bintrail-console started — it has the access token this page needs." }));
+    }
+    appendSSOEntry(panel, opts);
     scrim.append(panel);
     mount.replaceChildren(scrim);
     return;
@@ -301,9 +317,21 @@ function showLoginOverlay(opts) {
   form.append(msg);
   form.addEventListener("submit", (e) => { e.preventDefault(); submitLogin(form, msg); });
   panel.append(form);
+  appendSSOEntry(panel, opts);
   scrim.append(panel);
   mount.replaceChildren(scrim);
   form.elements.password.focus();
+}
+
+// appendSSOEntry adds the external-login entry ("Continue with <name>") under
+// whatever the gate mode rendered, when the /api/auth probe advertised a
+// provider (sso_start/sso_name → opts.ssoStart/opts.ssoName). A plain <a> on
+// purpose — full navigation, never fetch: the provider owns the whole flow
+// and lands back on /?token=<session>, reusing the existing token bootstrap.
+function appendSSOEntry(panel, opts) {
+  if (!opts.ssoStart) return;
+  panel.append(el("div", { class: "login-divider", text: "or" }));
+  panel.append(el("a", { class: "btn login-sso", href: opts.ssoStart, text: "Continue with " + (opts.ssoName || "single sign-on") }));
 }
 
 // submitSetup posts the first-run credential to /api/auth/setup (raw fetch:
@@ -325,9 +353,9 @@ async function submitSetup(form, msg) {
     // a CLI set it first). Unlike login, the setup endpoint self-disables —
     // re-probe and switch the gate to the sign-in form instead of leaving the
     // operator stuck re-posting to a now-closed endpoint.
-    let pw = false;
-    try { pw = !!(await fetchAuthInfo()).password_login; } catch (_) {}
-    showLoginOverlay({ passwordLogin: pw, message: "A password was already created — sign in." });
+    let auth = {};
+    try { auth = await fetchAuthInfo(); } catch (_) {}
+    showLoginOverlay({ passwordLogin: !!auth.password_login, message: "A password was already created — sign in.", ssoName: auth.sso_name, ssoStart: auth.sso_start });
     return;
   }
   if (!res.ok) {
@@ -399,8 +427,16 @@ async function doLogout() {
   try { await api("/api/auth/logout", { method: "POST" }); } catch (_) { /* dead session = already out */ }
   clearAuthState();
   unauthorizedHandled = false;
-  // Logout is only reachable for session auth, which implies password login.
-  showLoginOverlay({ passwordLogin: true, message: "Signed out." });
+  // Session auth no longer implies password login: an external provider mints
+  // normal sessions too, so re-probe the gate mode like handleUnauthorized
+  // does — an SSO-only deployment must get its SSO entry back (not a password
+  // form every submit 401s), and after a `user remove` the console can be in
+  // first-run setup again. Probe failure falls back to the password form.
+  let auth = null;
+  try { auth = await fetchAuthInfo(); } catch (_) {}
+  if (!auth) { showLoginOverlay({ passwordLogin: true, message: "Signed out." }); return; }
+  if (auth.setup) { showLoginOverlay({ setup: true, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
+  showLoginOverlay({ passwordLogin: !!auth.password_login, message: "Signed out.", ssoName: auth.sso_name, ssoStart: auth.sso_start });
 }
 
 // applyAuthGate mirrors the [data-capability]/.cap-on pattern for auth-kind
@@ -550,13 +586,22 @@ function viewEnter() { const v = VIEW(); v.classList.remove("view-enter"); void 
 
 // ── router ─────────────────────────────────────────────────────────────────
 
+// isKnownRoute accepts the built-in ROUTES plus any live extension-view route
+// ("ext-<id>" advertised in the current server's capabilities). An "ext-" route
+// for a view the selected server does not expose is treated as unknown (the
+// caller redirects to overview), the same gating Time-travel/Storage get.
+function isKnownRoute(route) {
+  if (ROUTES.includes(route)) return true;
+  return route.startsWith("ext-") && extViews.some((v) => "ext-" + v.id === route);
+}
+
 function routeFromLocation() {
   const path = location.pathname.replace(/^\//, "").split("/")[0] || "overview";
-  return ROUTES.includes(path) ? path : "overview";
+  return isKnownRoute(path) ? path : "overview";
 }
 
 function navigate(route, params, push = true) {
-  if (!ROUTES.includes(route)) route = "overview";
+  if (!isKnownRoute(route)) route = "overview";
   // Reconstruct surface is gated; never navigate to a disabled Time-travel.
   if (route === "timetravel" && !capsCache.reconstruct) route = "overview";
   // Storage is a watch-daemon surface (rotation + archiving live there).
@@ -576,14 +621,21 @@ function renderRoute() {
   setActiveNav(route);
   cursorIdx = -1;
   const params = Object.fromEntries(new URLSearchParams(location.search));
+  // Extension views (embedding builds): "ext-<id>" dispatches to the provider's
+  // frontend module. routeFromLocation already redirected an unknown/ungated
+  // ext route to overview, so a match here is always a live view.
+  if (route.startsWith("ext-")) {
+    const view = extViews.find((v) => "ext-" + v.id === route);
+    return view ? renderExtensionView(view) : renderOverview();
+  }
   switch (route) {
     case "overview": return renderOverview();
     case "events": return renderEvents(params);
-    case "forensics": return renderForensics(params);
     case "timetravel": return renderTimetravel(params);
     case "recover": return renderRecover(params);
     case "status": return renderStatus();
     case "storage": return renderStorage();
+    case "connect": return renderConnect();
     default: return renderOverview();
   }
 }
@@ -741,12 +793,11 @@ function renderEvents(params) {
   const v = VIEW(); clear(v);
   v.append(pageHead("Events", el("p", { class: "page-sub", text: "Browse indexed row events with full before / after images." })));
 
-  // Forensics-degraded note (#595): PostgreSQL logical replication (pgoutput)
-  // carries no backend connection id, so actor attribution ("who changed this")
-  // is unavailable for PG sources — unlike MySQL, it cannot be recovered
-  // upstream at all, so say so here on the Events page rather than leave the
-  // missing attribution an unexplained gap. capsCache.source is resolved
-  // before this paints.
+  // Connection-id availability note (#595): PostgreSQL logical replication
+  // (pgoutput) carries no backend connection id, so the connection_id column
+  // stays empty for PG sources — unlike MySQL, it cannot be recovered upstream
+  // at all, so say so here on the Events page rather than leave the empty
+  // column an unexplained gap. capsCache.source is resolved before this paints.
   if (capsCache.source === "postgresql") {
     v.append(el("div", { class: "warn-item" }, icon("warn"),
       el("span", { text: "Who made each change isn't available for PostgreSQL sources — Postgres's replication stream doesn't include that information." })));
@@ -876,7 +927,7 @@ function closeDatePicker() {
 
 // Setting .value programmatically doesn't fire native input/change events.
 // The Events view's debounced auto-search relies on them (form listeners at
-// runEventsQuery's call site); Forensics/Recover/Time-travel are submit-only
+// runEventsQuery's call site); Recover/Time-travel are submit-only
 // and ignore them, so the dispatch is a harmless no-op there — kept for
 // consistency rather than because every caller needs it.
 function applyDTValue(input, y, mo, d, h, mi) {
@@ -1212,325 +1263,6 @@ function downloadEventsCSV(events) {
   downloadBlob("dbtrail-events.csv", lines.join("\r\n"), "text/csv");
 }
 
-// ── Forensics ────────────────────────────────────────────────────────────────
-// Who changed a row, and two general investigation queries (user activity,
-// connection history) against the SOURCE server's
-// performance_schema / audit log (epic #701). Unlike Events (index-only),
-// these hit /api/forensics/*. Capabilities and who-changed degrade to a setup
-// prompt / index-only attribution when the selected server has no source
-// connection configured — but user-activity and connection-history have no
-// index-side fallback and error instead (handled the same way any other
-// query error is: renderError in the results panel).
-
-const FX_MODES = [
-  { id: "who_changed", label: "Who changed", desc: "Trace who modified rows in a table (schema and table required, PK optional)." },
-  { id: "user_activity", label: "User activity", desc: "Recent statements by a MySQL user." },
-  { id: "connection_history", label: "Connections", desc: "Current/recent connections from a user or host." },
-];
-
-const FX_ACTIVITY_COLS = {
-  user_activity: [["user", "User"], ["host", "Host"], ["sql_text", "SQL"], ["duration_ms", "Duration (ms)"], ["rows_affected", "Rows affected"], ["connection_id", "Conn ID"]],
-  connection_history: [["user", "User"], ["host", "Host"], ["current_db", "Database"], ["command", "Command"], ["time_seconds", "Time (s)"], ["connection_id", "Conn ID"]],
-};
-
-function renderForensics(params) {
-  // Landed on /forensics but the feature is gated off (direct URL, Back, or a
-  // stale bookmark) — same redirect-then-redispatch shape as Time-travel.
-  if (!capsCache.forensics) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
-  const v = VIEW(); clear(v);
-  v.append(pageHead("Forensics", el("p", { class: "page-sub", text:
-    "Investigate who changed a row, or what a user, connection, or schema did — reads your source database's performance_schema and audit log directly." })));
-
-  v.append(el("div", { class: "fx-caps", id: "fx-caps" }, el("div", { class: "view-loading", text: "Detecting forensic sources…" })));
-
-  const mode = (params && FX_MODES.some((m) => m.id === params.mode)) ? params.mode : "who_changed";
-  const tabs = el("div", { class: "fx-modes" });
-  FX_MODES.forEach((m) => tabs.append(el("button", {
-    type: "button", class: "fx-mode-tab" + (m.id === mode ? " on" : ""),
-    onclick: () => navigate("forensics", { mode: m.id }, true), text: m.label,
-  })));
-  v.append(tabs);
-  v.append(el("p", { class: "fx-mode-desc", text: (FX_MODES.find((m) => m.id === mode) || FX_MODES[0]).desc }));
-
-  const form = el("form", { class: "filters", id: "fx-form" });
-  if (mode === "who_changed") {
-    form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —", true));
-    form.append(fieldSelect("Table", "table", "md", false, true, null, null, true));
-    form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
-  }
-  if (mode === "user_activity" || mode === "connection_history") {
-    form.append(fieldInput("User", "user", "md", "app_rw", mode === "user_activity"));
-  }
-  if (mode === "connection_history") {
-    form.append(fieldInput("Host", "host", "md", "10.0.1.%"));
-  }
-  form.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
-  form.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
-  form.append(fieldSelect("Limit", "limit", "sm", false, false, ["50", "100", "500"], null));
-  form.append(fieldSelect("Order", "order", "sm", false, false, ["DESC", "ASC"], null));
-  const actions = el("div", { class: "filter-actions" });
-  actions.append(el("button", { class: "btn btn-primary", type: "submit", text: "Investigate" }));
-  form.append(actions);
-  v.append(form);
-
-  v.append(el("div", { id: "fx-warnings", class: "warnings" }));
-  const out = el("div", { id: "fx-out" });
-  out.append(el("div", { class: "ev-empty", text: "Set the filters above and run an investigation." }));
-  v.append(out);
-
-  form.addEventListener("submit", (e) => { e.preventDefault(); runForensicsQuery(mode, form); });
-  if (mode === "who_changed") { wireSchemaCascade(form); populateSchemas(form); }
-
-  fxLoadCapabilities();
-  viewEnter();
-}
-
-async function fxLoadCapabilities() {
-  const gen = serverGen;
-  const box = $("#fx-caps", VIEW());
-  if (!box) return;
-  try {
-    // api() returns null for an empty-body 200 (a real shape on some other
-    // endpoints, e.g. DELETE) — this endpoint always serializes a full
-    // struct, but build the banner from {} rather than trust that forever.
-    const caps = (await api("/api/forensics/capabilities")) || {};
-    if (gen !== serverGen) return;
-    clear(box);
-    box.append(buildFxCapsBanner(caps));
-  } catch (err) {
-    if (gen !== serverGen) return;
-    clear(box); renderError(box, err);
-  }
-}
-
-function buildFxCapsBanner(caps) {
-  const wrap = el("div", { class: "fx-caps-banner" });
-  if (!caps.source_configured) {
-    wrap.append(el("div", { class: "stg-empty" },
-      el("p", { class: "stg-empty-lead", text: "No source connection configured for this server." }),
-      el("p", { class: "stg-empty-sub", text:
-        "Who-changed still works from the index alone (connection_cache and binlog-only attribution), but user activity " +
-        "and connection history read the source directly. Add a source connection from Manage servers → Edit to unlock them." })));
-    return wrap;
-  }
-  const ps = caps.performance_schema || {};
-  const al = caps.audit_log || {};
-  const row = el("div", { class: "fx-caps-row" });
-  row.append(el("div", { class: "fx-caps-item" },
-    el("span", { class: "fx-caps-dot" + (ps.enabled ? " on" : "") }),
-    el("span", { class: "fx-caps-label", text: "performance_schema" }),
-    ps.enabled ? el("span", { class: "fx-caps-detail", text: fxPerfSchemaDetail(ps) }) : null));
-  row.append(el("div", { class: "fx-caps-item" },
-    el("span", { class: "fx-caps-dot" + (al.installed ? " on" : "") }),
-    el("span", { class: "fx-caps-label", text: "audit log" }),
-    (al.installed && al.variant) ? el("span", { class: "fx-caps-detail", text: al.variant }) : null));
-  wrap.append(row);
-  if (!ps.enabled && !al.installed) {
-    wrap.append(el("div", { class: "warn-item" }, icon("warn"),
-      el("span", { text: "No forensic sources detected on this server — results fall back to index-only attribution and fallback SQL." })));
-  }
-  if (caps.setup_guide && caps.setup_guide.recommendations && caps.setup_guide.recommendations.length) {
-    wrap.append(buildFxGuide(caps.setup_guide));
-  }
-  return wrap;
-}
-
-function fxPerfSchemaDetail(ps) {
-  const c = ps.consumers || {};
-  return [
-    c.events_statements_history_long ? "history_long" : null,
-    c.events_statements_history ? "history" : null,
-    ps.threads_accessible ? "threads" : null,
-  ].filter(Boolean).join(" + ");
-}
-
-function buildFxGuide(guide) {
-  const panel = el("div", { class: "fx-guide" });
-  const toggle = el("button", { class: "fx-guide-toggle", type: "button" },
-    el("span", { text: "Improve forensics data" }),
-    el("span", { class: "fx-guide-count", text: guide.recommendations.length + " recommendation" + (guide.recommendations.length === 1 ? "" : "s") }),
-    icon("caret", "ev-caret fx-guide-caret"));
-  const content = el("div", { class: "fx-guide-content", hidden: true });
-  content.append(el("p", { class: "stg-empty-sub", text: guide.summary }));
-  guide.recommendations.forEach((rec) => {
-    const card = el("div", { class: "fx-guide-rec" });
-    card.append(el("div", { class: "fx-guide-rec-head" },
-      el("span", { class: "fx-priority fx-priority-" + rec.priority, text: rec.priority }),
-      el("b", { text: rec.title }),
-      el("span", { class: "fx-caps-detail", text: rec.category.replace("_", " ") })));
-    card.append(el("p", { class: "stg-empty-sub", text: rec.description }));
-    if (rec.runtime_sql && rec.runtime_sql.length) {
-      card.append(buildFxCopyBlock("Runtime SQL (temporary, until restart)", rec.runtime_sql.join("\n\n")));
-    }
-    if (rec.mycnf_snippet) {
-      card.append(buildFxCopyBlock("my.cnf (persistent, survives restart)", rec.mycnf_snippet));
-    }
-    content.append(card);
-  });
-  toggle.addEventListener("click", () => {
-    const open = toggle.classList.toggle("on");
-    content.hidden = !open;
-  });
-  panel.append(toggle, content);
-  return panel;
-}
-
-function buildFxCopyBlock(label, text) {
-  const block = el("div", { class: "fx-sql-block" });
-  const copyBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Copy" });
-  copyBtn.addEventListener("click", () => navigator.clipboard.writeText(text).then(
-    () => { copyBtn.textContent = "Copied"; setTimeout(() => { copyBtn.textContent = "Copy"; }, 1500); },
-    () => toast("Copy failed.")));
-  block.append(el("div", { class: "fx-sql-block-head" }, el("span", { class: "form-hint", text: label }), copyBtn));
-  block.append(el("pre", { class: "fx-sql", text }));
-  return block;
-}
-
-async function runForensicsQuery(mode, form) {
-  const gen = serverGen;
-  const warns = $("#fx-warnings", VIEW());
-  const out = $("#fx-out", VIEW());
-  if (!out) return;
-  const f = Object.fromEntries(new FormData(form).entries());
-
-  if (mode === "who_changed" && (!f.schema || !f.table)) {
-    clear(warns); renderError(out, "Schema and table are required for who-changed."); return;
-  }
-  if (mode === "user_activity" && !f.user) {
-    clear(warns); renderError(out, "A user is required for user activity."); return;
-  }
-  if (mode === "connection_history" && !f.user && !f.host) {
-    clear(warns); renderError(out, "A user or host is required for connection history."); return;
-  }
-
-  clear(warns);
-  clear(out);
-  out.append(el("div", { class: "view-loading", text: "Investigating…" }));
-
-  try {
-    let data;
-    if (mode === "who_changed") {
-      data = await api("/api/forensics/who-changed", { method: "POST", body: {
-        schema: f.schema, table: f.table, pk: f.pk || undefined,
-        since: f.since || undefined, until: f.until || undefined,
-        limit: f.limit ? Number(f.limit) : undefined, order: f.order || undefined,
-      } });
-    } else {
-      data = await api("/api/forensics/activity", { method: "POST", body: {
-        query_type: mode, user: f.user || undefined, host: f.host || undefined,
-        since: f.since || undefined, until: f.until || undefined,
-        limit: f.limit ? Number(f.limit) : undefined, order: f.order || undefined,
-      } });
-    }
-    if (gen !== serverGen) return;
-    clear(out);
-    if (data.notes && data.notes.length) renderWarnings(warns, data.notes);
-    if (mode === "who_changed") buildWhoChangedTimeline(out, data);
-    else buildActivityTable(out, mode, data);
-    buildFallbackPanel(out, data.fallback_queries);
-  } catch (err) {
-    if (gen !== serverGen) return;
-    clear(out); renderError(out, err);
-  }
-}
-
-function buildWhoChangedTimeline(container, data) {
-  const events = data.events || [];
-  const bar = el("div", { class: "result-bar" });
-  bar.append(el("span", { class: "result-count" },
-    el("b", { text: String(data.total_count != null ? data.total_count : events.length) }), " change(s) found"));
-  if (data.applied_default_window) {
-    bar.append(el("span", { class: "fx-note-inline", text: "showing the last 24 hours (no time range given)" }));
-  }
-  container.append(bar);
-
-  if (!events.length) {
-    container.append(el("div", { class: "ev-empty", text: "No changes found. Try widening the time range or filters." }));
-    return;
-  }
-
-  const list = el("div", { class: "fx-timeline", id: "fx-timeline" });
-  events.forEach((e, i) => {
-    const a = e.attribution;
-    const summary = el("div", { class: "fx-timeline-summary", "data-fx-ev": i, tabindex: "0" },
-      badge(e.event_type),
-      el("span", { class: "ev-time", text: e.timestamp }),
-      el("span", { class: "ev-table", text: e.schema + "." + e.table }),
-      el("span", { class: "ev-pk", text: "PK: " + e.pk_values }),
-      a ? el("span", { class: "fx-who", text: a.user + (a.host ? "@" + a.host : "") })
-        : el("span", { class: "fx-who fx-who-unknown", text: "unattributed" }),
-      icon("caret", "ev-caret"));
-    const detail = el("div", { class: "fx-timeline-detail", hidden: true });
-    let built = false;
-    summary.addEventListener("click", () => {
-      const open = summary.classList.toggle("open");
-      detail.hidden = !open;
-      if (open && !built) { detail.append(buildFxWhoChangedDetail(e)); built = true; }
-    });
-    list.append(el("div", { class: "fx-timeline-item" },
-      el("div", { class: "fx-timeline-marker" }, el("span", { class: "fx-timeline-dot" })),
-      el("div", { class: "fx-timeline-content" }, summary, detail)));
-  });
-  container.append(list);
-}
-
-function buildFxWhoChangedDetail(e) {
-  const wrap = el("div", { class: "fx-detail" });
-  const a = e.attribution;
-  if (a) {
-    wrap.append(healthKV("User", el("span", { class: "kv-v", text: a.user || "—" })));
-    if (a.host) wrap.append(healthKV("Host", el("span", { class: "kv-v", text: a.host })));
-    if (e.connection_id != null) wrap.append(healthKV("Connection ID", el("span", { class: "kv-v", text: String(e.connection_id) })));
-    if (a.client_program) wrap.append(healthKV("Client", el("span", { class: "kv-v", text: a.client_program })));
-    wrap.append(healthKV("Source", el("span", { class: "kv-v", text: a.source })));
-    wrap.append(healthKV("Confidence", el("span", { class: "kv-v", text: a.confidence })));
-    if (a.audit_sql) wrap.append(buildFxCopyBlock("Matching audit-log record", a.audit_sql));
-  } else {
-    wrap.append(el("p", { class: "stg-empty-sub", text: "No forensic attribution available for this event." }));
-  }
-  if (e.query_text) wrap.append(buildFxCopyBlock("Captured statement (ROWS_QUERY / ANNOTATE_ROWS)", e.query_text));
-  return wrap;
-}
-
-function buildActivityTable(container, mode, data) {
-  const rows = (mode === "connection_history" ? data.connections : data.events) || [];
-  const bar = el("div", { class: "result-bar" });
-  bar.append(el("span", { class: "result-count" }, el("b", { text: String(data.count != null ? data.count : rows.length) }), " result(s)"));
-  if (data.source) bar.append(el("span", { class: "chip chip-mon", text: data.source }));
-  container.append(bar);
-  if (data.note) container.append(el("div", { class: "warn-item" }, icon("warn"), el("span", { text: data.note })));
-
-  if (!rows.length) {
-    container.append(el("div", { class: "ev-empty", text: "No results. Try widening the time range or filters." }));
-    return;
-  }
-  const cols = FX_ACTIVITY_COLS[mode] || FX_ACTIVITY_COLS.user_activity;
-  const table = el("table", { class: "fx-table" });
-  const headRow = el("tr");
-  cols.forEach(([, label]) => headRow.append(el("th", { text: label })));
-  const tbody = el("tbody");
-  rows.forEach((r) => {
-    const tr = el("tr");
-    cols.forEach(([key]) => {
-      let v = r[key];
-      if (key === "sql_text" && typeof v === "string" && v.length > 100) v = v.slice(0, 100) + "…";
-      tr.append(el("td", { text: v == null || v === "" ? "—" : String(v) }));
-    });
-    tbody.append(tr);
-  });
-  table.append(el("thead", {}, headRow), tbody);
-  container.append(el("div", { class: "fx-table-wrap" }, table));
-}
-
-function buildFallbackPanel(container, queries) {
-  if (!queries || !queries.length) return;
-  const panel = el("div", { class: "fx-fallback" });
-  panel.append(el("div", { class: "ov-panel-title", text: "Fallback SQL queries" }),
-    el("p", { class: "stg-empty-sub", text: "Run these manually against your source database to investigate further." }));
-  queries.forEach((fq) => panel.append(buildFxCopyBlock(fq.description, fq.sql)));
-  container.append(panel);
-}
-
 // ── Recover ────────────────────────────────────────────────────────────────
 
 function renderRecover(params) {
@@ -1617,9 +1349,16 @@ function setSelectWhenReady(form, name, value, cb) {
 async function previewRecover(form) {
   const gen = serverGen;
   const container = $("#recover-preview", VIEW());
+  const warns = $("#recover-warnings", VIEW());
   const f = Object.fromEntries(new FormData(form).entries());
   const params = {};
   ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) params[k] = f[k].trim(); });
+  // Mirror /api/recover's EFFECTIVE fetch window (#967) so the preview shows
+  // the same events the undo script will actually reverse: newest-first, same
+  // limit as recoverDefaultLimit in internal/console/api.go. Hardcoded here —
+  // there is no Go-to-JS constant-sharing mechanism in this codebase.
+  params.limit = "1000";
+  params.order = "desc";
   try {
     const data = await api("/api/events?" + new URLSearchParams(params).toString());
     if (gen !== serverGen) return;
@@ -1633,6 +1372,16 @@ async function previewRecover(form) {
     buildEventRows(rows, data.events || []);
     list.append(rows);
     container.append(list);
+    // Truncation warning (#967): more matches than the preview's limit means
+    // the actual undo script (same limit, applied server-side) may cover more
+    // events than are shown here.
+    if (data.count >= data.limit) {
+      renderWarnings(warns, [
+        "Only the newest " + data.limit + " events are shown. The actual undo script may include more if you increase the limit."
+      ]);
+    } else {
+      clear(warns);
+    }
   } catch (err) {
     if (gen !== serverGen) return;
     renderError(container, err);
@@ -2061,23 +1810,24 @@ async function renderStorage() {
   // instead of one error wiping the whole page. (A 401 inside api() raises the
   // sign-in gate and bumps serverGen, so the stale-render guard below bails.)
   const asErr = (err) => ({ error: (err && err.message) || String(err) });
-  const [serversRes, rotation, storage, baselines] = await Promise.all([
+  const [serversRes, rotation, storage, baselines, telemetry] = await Promise.all([
     api("/api/servers").catch(asErr),
     api("/api/rotation").catch(asErr),
     api("/api/storage").catch(asErr),
     api("/api/baselines").catch(asErr),
+    api("/api/telemetry").catch(asErr),
   ]);
   if (gen !== serverGen) return;
   // Same guard as renderOverview: a throw inside the build must show an
   // error, never leave the "Loading…" skeleton up forever.
   try {
-    buildStorage(serversRes, rotation, storage, baselines);
+    buildStorage(serversRes, rotation, storage, baselines, telemetry);
   } catch (err) {
     const v = VIEW(); clear(v); v.append(pageHead("Storage", null)); renderError(v, err);
   }
 }
 
-function buildStorage(serversRes, rotation, storage, baselines) {
+function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
   // serversRes is the raw /api/servers payload or {error} — archivingPanel
   // must be able to tell "failed to load" from "genuinely no sources", or a
   // transient 500 would render the affirmative "No monitored sources yet" lie.
@@ -2093,6 +1843,7 @@ function buildStorage(serversRes, rotation, storage, baselines) {
   const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
   cards.append(rotationCard(rotation));
   cards.append(credentialsCard(storage));
+  cards.append(telemetryCard(telemetry));
   cards.append(baselineSummaryCard(baselines, cur));
   v.append(cards);
 
@@ -2150,6 +1901,49 @@ function credentialsCard(storage) {
   card.append(adv);
   card.append(el("p", { class: "form-hint", text: "Note: an IAM role can still be active even if none of the signals above show as set." }));
   return card;
+}
+
+// telemetryCard shows the machine-wide usage-telemetry state and an opt-out
+// toggle. Turning it off here stops THIS running daemon's beacons immediately
+// (the daemon wired its live client) and persists the choice for every bintrail
+// process on the machine.
+function telemetryCard(t) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Usage telemetry" }));
+  if (!t || t.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not read telemetry state" + (t && t.error ? ": " + t.error : ".") }));
+    return card;
+  }
+  if (!t.endpoint_set) {
+    card.append(el("p", { class: "stg-hint", text: "This build sends no telemetry — no endpoint is compiled in." }));
+    return card;
+  }
+  card.append(el("p", { class: "stg-hint", text: t.reporting
+    ? "Sending metadata-only usage stats (command names, version, OS/arch, a bounded error class) to help prioritize the roadmap. Never your data, schemas, tables, DSNs, IPs, or any identifier."
+    : "Not sending any usage telemetry." }));
+  kvRow(card, "status", (t.reporting ? "On" : "Off") + (t.ci_detected ? " (suppressed: CI detected)" : ""));
+  if (t.overridden) {
+    const by = t.decided_by === "DO_NOT_TRACK" ? "the DO_NOT_TRACK environment variable"
+      : t.decided_by === "BINTRAIL_TELEMETRY" ? "the BINTRAIL_TELEMETRY environment variable"
+      : "the --telemetry flag";
+    card.append(el("p", { class: "form-hint", text: "Set by " + by + " on the daemon, which overrides this toggle — change it there." }));
+    return card;
+  }
+  card.append(el("div", { class: "stg-cardfoot" },
+    el("button", { class: "btn btn-sm", type: "button",
+      text: t.consent ? "Turn telemetry off" : "Turn telemetry on",
+      onclick: () => setTelemetry(!t.consent) })));
+  return card;
+}
+
+async function setTelemetry(enabled) {
+  try {
+    await api("/api/telemetry", { method: "POST", body: JSON.stringify({ enabled: enabled }) });
+  } catch (e) {
+    toast("Could not change telemetry: " + ((e && e.message) || e));
+    return;
+  }
+  toast(enabled ? "Telemetry turned on." : "Telemetry turned off — this daemon stops beaconing now.");
+  renderStorage();
 }
 
 function baselineSummaryCard(b, cur) {
@@ -2657,6 +2451,253 @@ function updateSrvNote() {
   if (n) n.hidden = !(serversEmpty && capsCache.monitor);
 }
 
+// ── Connect AI client (#1041, managed token #1052) ───────────────────────────
+//
+// Settings view for wiring an MCP client (Claude Desktop, claude.ai custom
+// connectors, any Streamable-HTTP client) to this console's /mcp endpoint.
+// Availability comes from capabilities.mcp — a static or UI-managed token is
+// configured. Token VALUES are never rendered here, with one deliberate
+// exception: the just-minted plaintext (mcpMintedOnce), displayed exactly
+// once right after generation and never re-displayable.
+
+// mcpMintedOnce holds a just-generated token for exactly one render of the
+// Connect AI view (#1052) — consumed and cleared by renderConnect so a later
+// navigation back to the view can never re-display it.
+let mcpMintedOnce = null;
+
+async function renderConnect() {
+  const gen = serverGen;
+  // Consume the one-time plaintext FIRST — before any await or early return —
+  // so a server-switch mid-load can never leave it parked in the module
+  // global to be re-displayed (stale) on a later visit.
+  const minted = mcpMintedOnce;
+  mcpMintedOnce = null;
+  viewLoading();
+  // The server list only picks between /mcp and /mcp/{id-or-name}; a failure
+  // (or the registry-only 404 on an empty console) degrades to the bare
+  // default-server URL instead of blanking the page.
+  let servers = [];
+  try { servers = (await api("/api/servers")).servers || []; } catch (_) {}
+  // Token status (#1052): presence/provenance only, never a value. null on
+  // failure — the card degrades to a reload hint instead of blanking the page.
+  let tokStatus = null;
+  try { tokStatus = await api("/api/mcp-token"); } catch (_) {}
+  if (gen !== serverGen) {
+    // The consumed plaintext cannot be re-shown; say so instead of losing it
+    // silently (the user must rotate to get a usable value).
+    if (minted) toast("Token display interrupted — rotate to get a fresh value");
+    return;
+  }
+  try {
+    buildConnect(servers, tokStatus, minted);
+  } catch (err) {
+    if (minted) toast("Token display interrupted — rotate to get a fresh value");
+    const v = VIEW(); clear(v); v.append(pageHead("Connect AI", null)); renderError(v, err);
+  }
+}
+
+// mcpSelector maps a server entry to its /mcp/{id-or-name} path selector: the
+// registry display name when set (readable), the id otherwise, and the
+// reserved "default" selector for the ephemeral boot (cli) entry.
+function mcpSelector(entry) {
+  if (!entry) return "";
+  if (entry.kind === "ephemeral") return "default";
+  return entry.name || entry.id || "";
+}
+
+// mcpURL builds the ready-to-copy endpoint URL from the BROWSER's origin, so
+// it is correct behind a reverse proxy for the common case. With one listed
+// server the bare /mcp (the console's default server) is enough; with several,
+// the per-server form pins the server currently selected in the sidebar.
+function mcpURL(servers) {
+  let path = "/mcp";
+  if ((servers || []).length > 1) {
+    const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
+    const sel = mcpSelector(cur);
+    if (sel) path += "/" + encodeURIComponent(sel);
+  }
+  return location.origin + path;
+}
+
+function copyText(text, what) {
+  navigator.clipboard.writeText(text).then(() => toast(what + " copied to clipboard"), () => toast("Copy failed."));
+}
+
+function buildConnect(servers, tokStatus, minted) {
+  const v = VIEW(); clear(v);
+  const sub = el("p", { class: "page-sub" },
+    "Let an AI assistant query this console — the same read-only tools and result caps as this UI. ",
+    el("b", { text: "A token is only ever shown once, at the moment you generate it." }));
+  v.append(pageHead("Connect AI", sub));
+
+  const cards = el("div", { class: "cards" });
+  cards.append(mcpTokenCard(tokStatus, minted));
+  cards.append(mcpEndpointCard(servers));
+  cards.append(bundleCard());
+  v.append(cards);
+  if (capsCache.mcp) v.append(otherClientsPanel(servers));
+  viewEnter();
+}
+
+// mintMCPToken generates (or rotates) the managed token, refreshes the
+// capability gate (the endpoint may have just become usable), and re-renders
+// the view with the plaintext displayed once.
+async function mintMCPToken(rotate) {
+  if (rotate && !window.confirm("Rotate the MCP token? The current value stops working immediately and every connected AI client will need the new one.")) return;
+  // Only the mutation itself may report failure — once the POST succeeded the
+  // token EXISTS (and on rotate the old one is already dead), so a failing
+  // follow-up refresh must never toast "generation failed".
+  let res;
+  try {
+    res = await api("/api/mcp-token", { method: "POST" });
+  } catch (err) {
+    toast("Token generation failed: " + (err.message || err));
+    return;
+  }
+  mcpMintedOnce = (res && res.token) || null;
+  try { await gateCapabilities(); } catch (_) {} // 401 already raised the sign-in gate
+  renderConnect();
+}
+
+async function revokeMCPToken() {
+  if (!window.confirm("Revoke the managed MCP token? Connected AI clients stop working immediately.")) return;
+  try {
+    await api("/api/mcp-token", { method: "DELETE" });
+  } catch (err) {
+    toast("Revoke failed: " + (err.message || err));
+    return;
+  }
+  toast("Managed MCP token revoked");
+  try { await gateCapabilities(); } catch (_) {}
+  renderConnect();
+}
+
+// mcpTokenCard (#1052): generate, rotate, and revoke the managed MCP token
+// without leaving the UI. The token value renders exactly once — right after
+// generation — and is otherwise represented only by its creation date.
+function mcpTokenCard(tok, minted) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Access token" }));
+  // The one-time plaintext renders UNCONDITIONALLY — a failed status fetch
+  // must never swallow a token that was just minted (after a rotate, it is
+  // the only valid credential and cannot be re-displayed).
+  if (minted) {
+    card.append(el("p", { class: "stg-hint", text: "Token generated. Copy it now — it is not stored and will never be shown again:" }));
+    card.append(el("div", { class: "cn-urlrow" },
+      el("code", { class: "stg-code cn-url", text: minted }),
+      el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(minted, "MCP token") })));
+  }
+  if (!tok) {
+    card.append(el("p", { class: "stg-hint", text: "Token status unavailable — reload the page to retry." }));
+    return card;
+  }
+  if (tok.managed) {
+    if (!minted) {
+      card.append(el("p", { class: "stg-hint", text:
+        "A managed token is active" + (tok.created_at ? " (created " + tok.created_at + ")" : "") +
+        ". Its value is not stored and cannot be re-displayed — rotate to get a fresh one." }));
+    }
+    if (tok.read_only) {
+      card.append(el("p", { class: "form-hint", text:
+        "The token file was written by a newer bintrail — the token works, but rotate/revoke are unavailable from this build." }));
+    } else {
+      card.append(el("div", { class: "cn-links" },
+        el("button", { class: "btn btn-sm", type: "button", text: "Rotate token", onclick: () => mintMCPToken(true) }),
+        el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Revoke", onclick: revokeMCPToken })));
+    }
+  } else if (!minted) {
+    card.append(el("p", { class: "stg-hint", text:
+      "AI clients authenticate with a token (password login is a browser credential and cannot be used by them). Generate one here — no flags, no environment variables, no restart. The token only grants the read-only MCP tools; it cannot manage this console." }));
+    card.append(el("div", { class: "cn-links" },
+      el("button", { class: "btn btn-sm", type: "button", text: "Generate token", onclick: () => mintMCPToken(false) })));
+  }
+  if (tok.static) {
+    card.append(el("p", { class: "form-hint", text:
+      "A static token from --token / BINTRAIL_CONSOLE_TOKEN is also configured. It keeps working, but it is environment-owned and cannot be managed here." }));
+  }
+  return card;
+}
+
+// mcpEndpointCard: the ready-to-copy URL when the endpoint is usable, or the
+// how-to-enable explanation when no token is configured (capabilities.mcp) —
+// never a URL presented as ready that would only ever answer 403.
+function mcpEndpointCard(servers) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "MCP endpoint" }));
+  if (!capsCache.mcp) {
+    card.append(el("p", { class: "stg-hint", text:
+      "MCP is not available yet: this console has no access token configured. Generate one in the Access token card above and this card becomes a ready-to-copy URL." }));
+    return card;
+  }
+  const url = mcpURL(servers);
+  card.append(el("div", { class: "cn-urlrow" },
+    el("code", { class: "stg-code cn-url", text: url }),
+    el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(url, "MCP URL") })));
+  if ((servers || []).length > 1) {
+    card.append(el("p", { class: "form-hint", text:
+      "This URL targets the server selected in the sidebar; the bare /mcp targets the console's default server. Switch servers to get each one's URL." }));
+  }
+  card.append(el("p", { class: "form-hint", text:
+    "The credential is the console access token from the card above (or --token / BINTRAIL_CONSOLE_TOKEN), sent as an Authorization: Bearer header." }));
+  return card;
+}
+
+// bundleCard links the .mcpb bundle (one-click Claude Desktop install) for the
+// RUNNING version. Best-effort: a release that predates the bundle artifact
+// 404s the direct link, so a releases-page path is always offered too.
+function bundleCard() {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Claude Desktop bundle" }));
+  const ver = String(capsCache.version || "").replace(/^v/, "");
+  const released = /^\d+\.\d+\.\d+$/.test(ver);
+  card.append(el("p", { class: "stg-hint", text:
+    "Install the bundle in Claude Desktop (double-click), then paste the URL above and your console token — no config files to edit." }));
+  if (released) {
+    const asset = "dbtrail-" + guessPlatform() + ".mcpb";
+    card.append(el("div", { class: "cn-links" },
+      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/download/v" + ver + "/" + asset, text: "Download " + asset }),
+      el("a", { class: "btn btn-sm btn-ghost", href: "https://github.com/dbtrail/dbtrail/releases/tag/v" + ver, target: "_blank", rel: "noopener", text: "All downloads for v" + ver })));
+    card.append(el("p", { class: "form-hint", text:
+      "The link matches this console's version (v" + ver + "). Older releases don't carry the bundle — if the download 404s, pick a newer release from the releases page." }));
+  } else {
+    card.append(el("div", { class: "cn-links" },
+      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases", target: "_blank", rel: "noopener", text: "Open the releases page" })));
+    card.append(el("p", { class: "form-hint", text:
+      "This console is an unversioned build, so no exact bundle link can be derived — pick the bundle matching your platform from the latest release." }));
+  }
+  return card;
+}
+
+// guessPlatform maps the browser's environment to a release-artifact os-arch
+// pair. Best-effort presentation only (Apple Silicon is assumed on macOS); the
+// all-downloads link covers every other combination.
+function guessPlatform() {
+  const ua = navigator.userAgent || "";
+  if (/Windows/i.test(ua)) return "windows-amd64";
+  if (/Mac/i.test(ua)) return "darwin-arm64";
+  return "linux-amd64";
+}
+
+// otherClientsPanel: collapsed raw-config fallback for MCP clients that don't
+// install .mcpb bundles. The snippet carries a PLACEHOLDER for the token — the
+// real value is never rendered.
+function otherClientsPanel(servers) {
+  const url = mcpURL(servers);
+  const snippet = JSON.stringify({
+    mcpServers: {
+      dbtrail: { command: "bintrail-mcp", args: ["--connect", url, "--token", "YOUR_CONSOLE_TOKEN"] },
+    },
+  }, null, 2);
+  const panel = el("section", { class: "ov-panel cn-other", style: "margin-top:18px" });
+  const adv = el("details", { class: "form-advanced", style: "margin-top:0" },
+    el("summary", { class: "form-adv-summary", text: "Other clients (raw config)" }));
+  adv.append(el("p", { class: "form-hint", text:
+    "For claude_desktop_config.json — or any client that launches stdio MCP servers — bintrail-mcp bridges stdio to this console. Replace the placeholder with your console token:" }));
+  adv.append(el("pre", { class: "stg-code cn-snippet", text: snippet }));
+  adv.append(el("button", { class: "btn btn-sm", type: "button", text: "Copy snippet", onclick: () => copyText(snippet, "Config snippet") }));
+  adv.append(el("p", { class: "form-hint", text:
+    "If this console is reachable over public HTTPS, the same URL also works directly as a claude.ai custom connector — no bridge needed." }));
+  panel.append(adv);
+  return panel;
+}
+
 // ── capabilities gating ────────────────────────────────────────────────────
 
 async function gateCapabilities() {
@@ -2673,9 +2714,85 @@ async function gateCapabilities() {
   }
   if (gen !== serverGen) return;
   capsCache = caps || {};
+  // Extension views advertised for this server (embedding builds; empty in the
+  // stock binary and under any active profile — the backend omits them there).
+  // Rebuild the nav before the route renders so a deep-linked ext route resolves.
+  extViews = Array.isArray(capsCache.extension_views) ? capsCache.extension_views : [];
+  syncExtNav();
   $all("[data-capability]").forEach((node) => node.classList.toggle("cap-on", !!capsCache[node.dataset.capability]));
+  gatePermissions();
   applyAuthGate();
   updateSrvNote(); // capsCache.monitor may have just changed
+}
+
+// gatePermissions hides a [data-perm] surface when the session's policy denies
+// that permission (per-session RBAC, #1074). Default is VISIBLE: a policy-less
+// session — the static token, the password login, every OSS session — reports
+// every permission true, so nothing is hidden and the UI is unchanged. A missing
+// permissions map (a degraded {} capabilities response) also leaves everything
+// visible: only an explicit `false` hides. The server's 403 is the real gate;
+// this just spares a scoped user a tab that would only error.
+function gatePermissions() {
+  const perms = capsCache.permissions || {};
+  $all("[data-perm]").forEach((node) => node.classList.toggle("perm-off", perms[node.dataset.perm] === false));
+}
+
+// syncExtNav rebuilds the extension-view nav group from extViews. Idempotent
+// across server switches: it drops the previously-injected group first, so a
+// server that exposes fewer (or no) extension views cannot leave stale items
+// behind. The group is anchored right after the built-in Monitor group (the one
+// holding Status). el()/textContent only — a view label is never markup.
+function syncExtNav() {
+  const prev = document.getElementById("ext-nav-group");
+  if (prev) prev.remove();
+  if (!extViews.length) return;
+  const nav = document.getElementById("nav");
+  if (!nav) return;
+  const group = el("div", { class: "nav-group", id: "ext-nav-group", "data-ext-nav": "1" });
+  group.append(el("div", { class: "nav-label", text: "Extensions" }));
+  for (const v of extViews) {
+    const route = "ext-" + v.id;
+    const item = el("a", {
+      class: "nav-item",
+      "data-ext-nav": "1",
+      "data-route": route,
+      href: "/" + route,
+      onclick: (e) => { e.preventDefault(); pendingRecover = null; navigate(route); },
+    }, icon("ext", "ni-icon"), el("span", { text: v.label }));
+    group.append(item);
+  }
+  const statusItem = $('.nav-item[data-route="status"]');
+  const anchor = statusItem ? statusItem.closest(".nav-group") : null;
+  if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(group, anchor.nextSibling);
+  else nav.append(group);
+}
+
+// renderExtensionView loads a provider's ES module and hands it a mount node and
+// a small context: apiBase ("/api/ext/<id>/") and the console's own authed fetch
+// primitive (api), so the module reads its data routes with the operator's
+// bearer credential and selected-server header already applied. serverGen is
+// captured before the dynamic import and re-checked after: a server switch
+// mid-import abandons the render (no cross-server paint), matching every other
+// async view here.
+async function renderExtensionView(view) {
+  const gen = serverGen;
+  const v = VIEW();
+  clear(v);
+  v.append(pageHead(view.label, null));
+  const mount = el("div", { class: "ext-view-mount" });
+  v.append(mount);
+  try {
+    const mod = await import(view.script);
+    if (gen !== serverGen) return;
+    if (!mod || typeof mod.render !== "function") {
+      renderError(mount, "This extension view did not export a render() function.");
+      return;
+    }
+    mod.render(mount, { apiBase: "/api/ext/" + view.id + "/", api });
+  } catch (err) {
+    if (gen !== serverGen) return;
+    renderError(mount, err);
+  }
 }
 
 // ── server registry: switcher + modal CRUD ──────────────────────────────────
@@ -2712,7 +2829,7 @@ async function loadServers() {
       const ordered = servers.filter((s) => s.kind !== "ephemeral")
         .concat(servers.filter((s) => s.kind === "ephemeral"));
       ordered.forEach((s) => {
-        const o = opt(s.id, serverLabel(s));
+        const o = opt(s.id, serverLabel(s) + (s.flavor && s.flavor !== "mysql" ? " · " + (s.flavor === "postgres" ? "PG" : "MariaDB") : ""));
         if (s.kind === "ephemeral") o.title = "The daemon's own index database (set with --index-dsn on the command line)";
         sel.append(o);
       });
@@ -2874,9 +2991,10 @@ function serverRow(s) {
   if (s.kind === "ephemeral") item.append(el("span", { class: "chip chip-cli", text: "CLI", title: "Set from the command line with --index-dsn" }));
   if (s.reconstruct) item.append(el("span", { class: "chip chip-tt", text: "TT", title: "Baseline configured: Time-travel available" }));
   if (s.monitor_state) item.append(el("span", { class: "chip chip-mon", text: s.monitor_state.replace("_", " ").toUpperCase(), title: MON_STATE_TITLES[s.monitor_state] || ("monitoring " + s.monitor_state) }));
+  if (s.flavor && s.flavor !== "mysql") item.append(el("span", { class: "chip", text: s.flavor === "postgres" ? "PG" : s.flavor.toUpperCase(), title: "Source type: " + s.flavor }));
 
   let desc;
-  if (s.has_source && s.source_host) desc = "watching " + s.source_user + "@" + s.source_host + ":" + (s.source_port || "3306") + (s.schemas ? " [" + s.schemas + "]" : "");
+  if (s.has_source && s.source_host) desc = "watching " + s.source_user + "@" + s.source_host + ":" + (s.source_port || (s.flavor === "postgres" ? "5432" : "3306")) + (s.source_database ? "/" + s.source_database : "") + (s.schemas ? " [" + s.schemas + "]" : "");
   else if (s.host) desc = s.user + "@" + s.host + ":" + (s.port || "3306") + "/" + s.dbname;
   else desc = s.dbname || "";
   item.append(el("span", { class: "srv-desc conn", text: desc }));
@@ -2907,6 +3025,20 @@ function srvField(label, name, opts) {
     el("input", { class: "input", name, type: opts.type || "text", placeholder: opts.placeholder || "", autocomplete: opts.autocomplete }));
 }
 
+// tagFlavor marks a form node visible only for the given space-separated source
+// families (e.g. "postgres" or "mysql mariadb"); applyFlavor toggles .flavor-on.
+function tagFlavor(node, families) { node.setAttribute("data-flavor", families); return node; }
+
+// applyFlavor reveals the [data-flavor] nodes matching the selected source
+// family, mirroring the capability cap-on gating EXACTLY — a class toggle over a
+// CSS :not() default-hide, never a [hidden]/style="display:none" toggle (the
+// documented display-bug class this codebase already hit).
+function applyFlavor(form) {
+  const f = (form.elements.flavor && form.elements.flavor.value) || "mysql";
+  $all("[data-flavor]", form).forEach((n) =>
+    n.classList.toggle("flavor-on", n.dataset.flavor.split(" ").includes(f)));
+}
+
 function buildServerForm() {
   const form = el("form", { class: "filters", id: "server-form", style: "display:block;margin-top:18px" });
   form.append(el("input", { type: "hidden", name: "id" }));
@@ -2918,27 +3050,51 @@ function buildServerForm() {
   form.append(top);
 
   const mon = el("fieldset", { class: "form-section", "data-capability": "monitor" });
-  mon.append(el("legend", { class: "form-legend", text: "Monitor a source MySQL" }));
+  mon.append(el("legend", { class: "form-legend", text: "Monitor a source database" }));
   mon.append(el("p", { class: "form-hint", text: "Paste the server you want to watch — dbtrail checks that it's ready, creates an index database for it automatically, and starts capturing changes. Nothing else to fill in beyond a name." }));
   const monGrid = el("div", { class: "form-grid" });
+  // Source family selector — reveals the PostgreSQL-only fields below.
+  monGrid.append(el("label", { class: "field" },
+    el("span", { class: "field-label", text: "Source type" }),
+    el("select", { class: "input", name: "flavor" },
+      opt("mysql", "MySQL"), opt("postgres", "PostgreSQL"), opt("mariadb", "MariaDB"))));
   monGrid.append(srvField("Source host", "source_host", { placeholder: "db.example.com" }));
   monGrid.append(srvField("Source port", "source_port", { placeholder: "3306" }));
   monGrid.append(srvField("Source user", "source_user", { placeholder: "repl" }));
   monGrid.append(srvField("Source password", "source_password", { type: "password", autocomplete: "new-password" }));
+  // PostgreSQL-only: a logical-replication connection is per-database, and the
+  // slot/publication are operator-created (validate-don't-create).
+  monGrid.append(tagFlavor(srvField("Database", "source_database", { placeholder: "appdb" }), "postgres"));
+  monGrid.append(tagFlavor(srvField("Replication slot", "source_slot", { placeholder: "bintrail_slot" }), "postgres"));
+  monGrid.append(tagFlavor(srvField("Publication", "source_publication", { placeholder: "bintrail_pub" }), "postgres"));
   monGrid.append(srvField("Schemas", "schemas", { placeholder: "(optional) shop,billing" }));
   monGrid.append(srvField("Archive to S3", "archive_s3", { placeholder: "(optional) s3://bucket/prefix/" }));
   mon.append(monGrid);
   // The source user is the #1 friction point — spell out the grant inline,
   // never behind a <details>. REPLICATION SLAVE/CLIENT drive the stream;
   // SELECT covers the information_schema snapshot of columns/PKs/FKs.
-  const grantHint = el("p", { class: "form-hint", style: "margin-top:10px" });
+  const grantHint = tagFlavor(el("p", { class: "form-hint", style: "margin-top:10px" }), "mysql mariadb");
   grantHint.append("Source user needs ");
   grantHint.append(el("code", { text: "REPLICATION SLAVE, REPLICATION CLIENT, SELECT" }));
   grantHint.append(". Create one on the source MySQL — copy and run:");
   mon.append(grantHint);
-  mon.append(el("pre", { class: "form-code", text:
+  mon.append(tagFlavor(el("pre", { class: "form-code", text:
     "CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';\n" +
-    "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';" }));
+    "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';" }), "mysql mariadb"));
+  // PostgreSQL prerequisites — the console reads them, it never runs CREATE
+  // PUBLICATION / ALTER SYSTEM (validate-don't-create; capture is pgoutput-only).
+  const pgHint = tagFlavor(el("p", { class: "form-hint", style: "margin-top:10px" }), "postgres");
+  pgHint.append("PostgreSQL source needs ");
+  pgHint.append(el("code", { text: "wal_level=logical" }));
+  pgHint.append(", a role with the ");
+  pgHint.append(el("code", { text: "REPLICATION" }));
+  pgHint.append(" attribute, a publication you create, and ");
+  pgHint.append(el("code", { text: "REPLICA IDENTITY FULL" }));
+  pgHint.append(" on replicated tables — copy and run on the source:");
+  mon.append(pgHint);
+  mon.append(tagFlavor(el("pre", { class: "form-code", text:
+    "CREATE PUBLICATION bintrail_pub FOR ALL TABLES;\n" +
+    "ALTER TABLE your_table REPLICA IDENTITY FULL;" }), "postgres"));
   mon.append(el("p", { class: "form-hint", style: "margin-top:10px", text: "Archive to S3: old data is uploaded here before it's deleted locally, so your history is kept and can still be searched. Needs AWS credentials set up on the daemon (environment variables or an IAM role)." }));
   form.append(mon);
 
@@ -2982,6 +3138,7 @@ function showServerForm(prefill) {
   $("#server-cancel", form).addEventListener("click", hideServerForm);
   $("#server-test", form).addEventListener("click", () => testServerForm(form));
   form.addEventListener("submit", (e) => { e.preventDefault(); saveServer(form); });
+  form.elements.flavor.addEventListener("change", () => applyFlavor(form));
 
   // Where the index connection is the whole form (serve-only process: no
   // monitor capability), or the entry being edited carries index fields,
@@ -3004,13 +3161,18 @@ function showServerForm(prefill) {
 
   if (prefill) {
     form.elements.id.value = prefill.id || "";
-    ["name", "host", "port", "user", "dbname", "baseline_dir", "baseline_s3", "archive_s3", "source_host", "source_port", "source_user", "schemas"].forEach((k) => {
+    ["name", "host", "port", "user", "dbname", "baseline_dir", "baseline_s3", "archive_s3", "source_host", "source_port", "source_user", "schemas", "source_database", "source_slot", "source_publication"].forEach((k) => {
       if (form.elements[k] && prefill[k] != null) form.elements[k].value = prefill[k];
     });
     if (form.elements.no_archive) form.elements.no_archive.checked = !!prefill.no_archive;
     form.elements.password.placeholder = prefill.has_password ? "(unchanged — leave blank to keep)" : "(none)";
     form.elements.source_password.placeholder = prefill.has_source_password ? "(unchanged — leave blank to keep)" : "";
   }
+  // Flavor init runs for both add and edit; it's immutable after create (the
+  // backend rejects a change on PUT), so disable the selector when editing.
+  form.elements.flavor.value = (prefill && prefill.flavor) || "mysql";
+  if (prefill && prefill.id) form.elements.flavor.disabled = true;
+  applyFlavor(form);
   form.elements.name.focus();
 }
 function hideServerForm() {
@@ -3031,12 +3193,15 @@ function serverFormBody(form) {
   const f = form.elements;
   const body = {
     name: f.name.value.trim(),
+    flavor: f.flavor.value,
     host: f.host.value.trim(), port: f.port.value.trim(), user: f.user.value.trim(), dbname: f.dbname.value.trim(),
     baseline_dir: f.baseline_dir.value.trim(), baseline_s3: f.baseline_s3.value.trim(),
     no_archive: !!f.no_archive.checked,
     archive_s3: f.archive_s3.value.trim(),
     source_host: f.source_host.value.trim(), source_port: f.source_port.value.trim(),
     source_user: f.source_user.value.trim(), schemas: f.schemas.value.trim(),
+    source_database: f.source_database.value.trim(),
+    source_slot: f.source_slot.value.trim(), source_publication: f.source_publication.value.trim(),
   };
   if (f.password.value !== "") body.password = f.password.value;
   if (f.source_password.value !== "") body.source_password = f.source_password.value;
@@ -3181,6 +3346,7 @@ function cmdkCommands() {
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Storage", run: () => navigate("storage") });
+  cmds.push({ group: "Navigate", label: "Connect AI", run: () => navigate("connect") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });
   if (capsCache.monitor) cmds.push({ group: "Actions", label: "Configure rotation…", run: () => { closeCmdk(); showRotationDialog(); } });
   if (capsCache.auth) {
@@ -3326,8 +3492,12 @@ async function init() {
   if (!TOKEN) {
     let auth = {};
     try { auth = await fetchAuthInfo(); } catch (_) { /* server down — fall through, the view will surface it */ }
-    if (auth.setup) { showLoginOverlay({ setup: true }); return; }
-    if (auth.password_login) { showLoginOverlay({ passwordLogin: true }); return; }
+    if (auth.setup) { showLoginOverlay({ setup: true, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
+    if (auth.password_login) { showLoginOverlay({ passwordLogin: true, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
+    // An external provider can be the sole credential (no token, no
+    // password): raise the gate with the SSO entry instead of toasting about
+    // a printed token link that never existed in that deployment.
+    if (auth.sso_start) { showLoginOverlay({ passwordLogin: false, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
     toast("No token in URL — open the link printed by `bintrail-console`.");
   }
 

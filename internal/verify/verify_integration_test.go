@@ -776,3 +776,268 @@ func TestVerifyTable_StaleZeroDateVsGenuineNull_AcceptedRisk(t *testing.T) {
 		t.Fatalf("status = %q (%s); this test pins the accepted-risk behavior — if this now fails, the zero-date normalization's blast radius changed and this comment/test pair needs re-evaluating, not just updating the assertion", got.Status, got.Detail)
 	}
 }
+
+// TestVerifyTable_DeferredColumnsResolved_RealDivergenceStaysMismatch is the
+// #791 repro + regression test for live-source mode. The old gate
+// (hasDeferredRepr(orderedCols) && len(changes) > 0) degraded EVERY content
+// difference to Inconclusive as soon as the table merely CONTAINED an
+// ENUM/SET/JSON/binary/BIT column and any event existed in the window — so an
+// in-place corruption of a plain INT/VARCHAR column (the sql_log_bin=0 drift
+// class live mode exists to catch) exited 0. With the event side normalized
+// at the root (ENUM labels, BIT raw bytes, canonical JSON), the same window:
+//
+//  1. genuinely MATCHes against the real MySQL text protocol (phase 1 —
+//     proving the normalization agrees with a live source, not just Parquet), and
+//  2. reports a conclusive MISMATCH once a non-deferred column is corrupted
+//     directly on the source (phase 2 — the finding's masked scenario).
+func TestVerifyTable_DeferredColumnsResolved_RealDivergenceStaysMismatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	for _, c := range []struct {
+		name             string
+		ord              int
+		key, dt, colType string
+	}{
+		{"id", 1, "PRI", "int", "int"},
+		{"status", 2, "", "varchar", "varchar(64)"},
+		{"state", 3, "", "enum", "enum('active','inactive')"},
+		{"flags", 4, "", "bit", "bit(12)"},
+		{"meta", 5, "", "json", "json"},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'orders', ?, ?, ?, ?, ?, 'YES', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	// Live SOURCE at the FINAL (post-event) state. flags = b'101' (5) in a
+	// BIT(12): the text protocol returns ceil(12/8) = 2 raw bytes 0x00 0x05 —
+	// the empirical check that renderBitBytes' width/padding matches MySQL.
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"CREATE TABLE `%s`.`orders` (`id` INT PRIMARY KEY, `status` VARCHAR(64),"+
+			" `state` ENUM('active','inactive'), `flags` BIT(12), `meta` JSON)", dbName))
+	testutil.MustExec(t, db, fmt.Sprintf("INSERT INTO `%s`.`orders` VALUES"+
+		"(1,'a','active',b'101','{\"tags\": [\"x\"]}'),"+
+		"(2,'shipped','inactive',b'101','{\"tags\": [\"y\"]}')", dbName))
+
+	// Baseline Parquet at the INITIAL state: labels as strings, BIT as the raw
+	// 2-byte form, JSON as MySQL's text — what mydumper dumps.
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64),\n  `state` ENUM('active','inactive'),\n  `flags` BIT(12),\n  `meta` JSON,\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+		{Name: "state", MySQLType: "enum", ParquetType: baseline.MysqlToParquetNode("enum")},
+		{Name: "flags", MySQLType: "bit", ParquetType: baseline.MysqlToParquetNode("bit")},
+		{Name: "meta", MySQLType: "json", ParquetType: baseline.MysqlToParquetNode("json")},
+	}
+	baselineDir := t.TempDir()
+	now := time.Now().UTC()
+	h1 := now.Truncate(time.Hour).Add(-time.Hour)
+	writeTestBaseline(t, baselineDir, h1, dbName, "orders", createSQL, cols, [][]string{
+		{"1", "a", "active", "\x00\x05", `{"tags": ["x"]}`},
+		{"2", "b", "inactive", "\x00\x05", `{"tags": ["y"]}`},
+	}, "", 0)
+
+	// One in-window UPDATE (id=2, status b→shipped). row_image=FULL: the
+	// row_after carries the untouched ENUM as its ordinal (2 = 'inactive'),
+	// the BIT as its integer (5), and the JSON document.
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, now.Truncate(time.Hour)})
+	ts1 := now.Add(-2 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, dbName, "orders", 2 /*UPDATE*/, "2", nil,
+		[]byte(`{"id":2,"status":"b","state":2,"flags":5,"meta":{"tags":["y"]}}`),
+		[]byte(`{"id":2,"status":"shipped","state":2,"flags":5,"meta":{"tags":["y"]}}`))
+
+	var uuid string
+	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 1)`, uuid+":1-1000000")
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := Config{
+		SourceDB: db, IndexDB: db, Resolver: resolver,
+		BaselineSource: baselineDir, IndexDBName: dbName, NoArchive: true,
+	}
+	ctx := context.Background()
+
+	// Phase 1: a faithful recovery genuinely MATCHes — mapped labels, BIT
+	// bytes and canonical JSON line up against MySQL's real text protocol.
+	got, err := VerifyTable(ctx, cfg, dbName, "orders")
+	if err != nil {
+		t.Fatalf("VerifyTable: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); want match\n  source=%s rows=%d\n  recon =%s rows=%d",
+			got.Status, got.Detail, got.SourceDigest, got.SourceRows, got.ReconstructDigest, got.ReconstructRows)
+	}
+
+	// Phase 2: corrupt a NON-deferred column directly on the source. Before
+	// the fix this read Inconclusive (deferred columns present + a change in
+	// the window) and a cron run exited 0 with real divergence present.
+	testutil.MustExec(t, db, fmt.Sprintf("UPDATE `%s`.`orders` SET status='TAMPERED' WHERE id=1", dbName))
+	got2, err := VerifyTable(ctx, cfg, dbName, "orders")
+	if err != nil {
+		t.Fatalf("VerifyTable (2): %v", err)
+	}
+	if got2.Status != StatusMismatch {
+		t.Errorf("after tampering status = %q (%s); want mismatch — a real divergence on a non-deferred column must not be masked by the table containing deferred columns", got2.Status, got2.Detail)
+	}
+}
+
+// TestVerifyTable_TimeFspAndFloatText_IsAMatch is the live-source regression
+// for #794 + #795 through the real ConsistentTableChecksumNormalized scan:
+//
+//   - #794: an in-window event image carries go-mysql's integer-second TIME
+//     text ("11:00:00" — timeFormat omits the fractional suffix when the
+//     microsecond part is zero) while MySQL's text protocol pads to the
+//     declared fsp ("11:00:00.000" for TIME(3)).
+//   - #795: a baseline-origin DOUBLE holding 1e16 renders "1e+16" through Go's
+//     strconv on the recon side but "1e16" through my_gcvt on the live scan.
+//   - #795 (FLOAT): a baseline-origin FLOAT holding 1.234567 (needing 7
+//     significant digits) is truncated by a bare `SELECT gauge` to "1.23457"
+//     (my_gcvt's ~6-sig-fig default) — lossy, not just differently
+//     formatted, so canonicalFloatText's parse+reformat alone cannot recover
+//     it. This exercises internal/consistency's selectExpr promoteFloat
+//     widening (`gauge+0e0`) end-to-end through the real live-source scan.
+//
+// Both were conclusive false MISMATCHes (neither type is in the deferred
+// set). After normalization the table must MATCH — and a genuinely different
+// float value must still MISMATCH (the normalization is representation-only,
+// never a masking path).
+func TestVerifyTable_TimeFspAndFloatText_IsAMatch(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	for _, c := range []struct {
+		name             string
+		ord              int
+		key, dt, colType string
+	}{
+		{"id", 1, "PRI", "int", "int"},
+		{"start", 2, "", "time", "time(3)"},
+		{"factor", 3, "", "double", "double"},
+		{"gauge", 4, "", "float", "float"},
+	} {
+		testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+			(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+			 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+			VALUES (1, UTC_TIMESTAMP(), ?, 'appointments', ?, ?, ?, ?, ?, 'NO', 0)`,
+			dbName, c.name, c.ord, c.key, c.dt, c.colType)
+	}
+
+	// Live SOURCE at the final state: row 1 untouched since the baseline (its
+	// DOUBLE exercises #795), row 2 updated in-window to an integer-second
+	// TIME (exercises #794).
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"CREATE TABLE `%s`.`appointments` (`id` INT PRIMARY KEY, `start` TIME(3), `factor` DOUBLE, `gauge` FLOAT)", dbName))
+	// Row 1's gauge (2.25) needs no more than 6 significant digits, so it
+	// renders identically whether or not the SELECT is promoted — it is a
+	// control value, not an exercise of the fix. Row 2's gauge (1.234567)
+	// needs 7 — its final state comes from the in-window event below, not
+	// from the baseline, so it exercises the #795 FLOAT fix against an
+	// event-sourced value (the scenario the fix actually targets) without
+	// conflating it with mydumper's own separate, orthogonal FLOAT capture
+	// precision at dump time (see the baseline WriteRow comment below).
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"INSERT INTO `%s`.`appointments` VALUES (1,'09:30:00.250',1e16,2.25),(2,'11:00:00',2.25,1.234567)", dbName))
+
+	// Baseline Parquet at the initial state, in mydumper's text forms: TIME
+	// padded to the declared fsp, DOUBLE/FLOAT as MySQL renders them.
+	baselineDir := t.TempDir()
+	now := time.Now().UTC()
+	curHour := now.Truncate(time.Hour)
+	h1 := curHour.Add(-time.Hour)
+	h2 := curHour
+	snapshotTS := h1
+	tsDir := strings.ReplaceAll(snapshotTS.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, tsDir, dbName)
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	createSQL := "CREATE TABLE `appointments` (\n  `id` INT NOT NULL,\n  `start` TIME(3),\n  `factor` DOUBLE,\n  `gauge` FLOAT,\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "start", MySQLType: "time", ParquetType: baseline.MysqlToParquetNode("time")},
+		{Name: "factor", MySQLType: "double", ParquetType: baseline.MysqlToParquetNode("double")},
+		{Name: "gauge", MySQLType: "float", ParquetType: baseline.MysqlToParquetNode("float")},
+	}
+	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "appointments.parquet"), cols,
+		baseline.WriterConfig{Compression: "zstd", RowGroupSize: 100,
+			Metadata: map[string]string{baseline.MetaKeyCreateTableSQL: createSQL}})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	// Row 2's baseline gauge (2.25, mydumper text) is superseded by the
+	// in-window event's row_after below (last-write-wins) — its exact value
+	// here is irrelevant to the final reconstructed state.
+	for _, row := range [][]string{
+		{"1", "09:30:00.250", "1e16", "2.25"},
+		{"2", "10:30:00.000", "2.25", "2.25"},
+	} {
+		if err := bw.WriteRow(row, []bool{false, false, false, false}); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("baseline close: %v", err)
+	}
+
+	// In-window UPDATE on row 2. The TIME texts are go-mysql's timeFormat
+	// output: integer-second values carry NO fractional suffix.
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	ts1 := now.Add(-2 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil, dbName, "appointments", 2 /*UPDATE*/, "2", nil,
+		[]byte(`{"id":2,"start":"10:30:00","factor":2.25,"gauge":2.25}`),
+		[]byte(`{"id":2,"start":"11:00:00","factor":2.25,"gauge":1.234567}`))
+
+	var uuid string
+	if err := db.QueryRow("SELECT @@server_uuid").Scan(&uuid); err != nil {
+		t.Fatalf("server_uuid: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO stream_state
+		(id, mode, gtid_set, last_checkpoint, server_id)
+		VALUES (1, 'gtid', ?, UTC_TIMESTAMP(), 1)`, uuid+":1-1000000")
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	cfg := Config{
+		SourceDB: db, IndexDB: db, Resolver: resolver,
+		BaselineSource: baselineDir, IndexDBName: dbName, NoArchive: true,
+	}
+	ctx := context.Background()
+
+	got, err := VerifyTable(ctx, cfg, dbName, "appointments")
+	if err != nil {
+		t.Fatalf("VerifyTable: %v", err)
+	}
+	if got.Status != StatusMatch {
+		t.Fatalf("status = %q (%s); want match\n  source=%s rows=%d\n  recon =%s rows=%d",
+			got.Status, got.Detail, got.SourceDigest, got.SourceRows, got.ReconstructDigest, got.ReconstructRows)
+	}
+
+	// A genuinely different DOUBLE (one ulp away at 1e16) must still surface.
+	testutil.MustExec(t, db, fmt.Sprintf(
+		"UPDATE `%s`.`appointments` SET factor=1.0000000000000002e16 WHERE id=1", dbName))
+	got2, err := VerifyTable(ctx, cfg, dbName, "appointments")
+	if err != nil {
+		t.Fatalf("VerifyTable (2): %v", err)
+	}
+	if got2.Status != StatusMismatch {
+		t.Errorf("after float tampering status = %q (%s); want mismatch", got2.Status, got2.Detail)
+	}
+}

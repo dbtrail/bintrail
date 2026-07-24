@@ -14,6 +14,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/verify"
 )
 
@@ -105,14 +106,14 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 	// an index last written by an older binary would otherwise fail with
 	// MySQL error 1054 — a false drift alert.
 	if err := indexer.EnsureSchema(indexDB); err != nil {
-		return fmt.Errorf("ensure index schema: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
 	}
 
 	var indexDBName string
 	if cfg, parseErr := mysqldriver.ParseDSN(vfyIndexDSN); parseErr == nil {
 		indexDBName = cfg.DBName
 	}
-	resolver, err := metadata.NewResolver(indexDB, 0)
+	resolver, err := verify.ResolverFor(indexDB)
 	if err != nil {
 		return fmt.Errorf("load schema snapshot from index: %w", err)
 	}
@@ -121,15 +122,21 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	flavor := query.SourceFlavor(indexDB)
 	if vfySourceDSN != "" {
+		// Live-source verify fingerprints the source with MySQL-only SQL; refuse
+		// a PG source up front rather than reach a misleading inconclusive.
+		if flavor == "postgres" {
+			return fmt.Errorf("live-source verify (--source-dsn) is not supported for PostgreSQL sources; omit it to run baseline-anchored verify")
+		}
 		return runVerifyLive(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning)
 	}
-	return runVerifyBaselinePair(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning)
+	return runVerifyBaselinePair(cmd, indexDB, resolver, indexDBName, baselineSrc, duckTuning, flavor)
 }
 
 // runVerifyBaselinePair is the default, drift-free mode: compare the two most
 // recent baselines (#642). It reads no live source.
-func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName, baselineSrc string, duckTuning duckdbutil.Tuning) error {
+func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName, baselineSrc string, duckTuning duckdbutil.Tuning, flavor string) error {
 	pairs, unpaired, prevOnly, err := verify.FindBaselinePair(cmd.Context(), baselineSrc)
 	if err != nil {
 		return fmt.Errorf("discover baseline pair: %w", err)
@@ -162,6 +169,7 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 		IndexDBName:    indexDBName,
 		NoArchive:      vfyNoArchive,
 		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
+		SourceFlavor:   flavor,
 	}
 
 	results := make([]verify.TableResult, 0, len(pairs)+len(unpaired))
@@ -202,12 +210,62 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 			Detail: "present in the previous baseline but absent from the newest snapshot (dropped, or the newest baseline was run with --tables); not verified",
 		})
 	}
-	// A table named in --tables that is absent from BOTH the paired and unpaired
-	// sets was never iterated above, so it would silently vanish from the report
-	// while the run still exited 0 on the other tables' matches — the exact
-	// silent-omission this command exists to prevent (and asymmetric with live
-	// mode, where a bogus --tables entry reaches VerifyTable and gates the exit).
-	// Surface each unseen request as an error so it appears and fails the run.
+	// Tables in the latest schema snapshot that appear in NEITHER baseline
+	// snapshot — the baseline job never covered them (scoped with --database/
+	// --tables, or the table was created after the job was configured). Without
+	// this pass they produced no row at all and a default run exited 0 "N match"
+	// — false assurance over precisely the tables reconstruct cannot materialize
+	// either (no baseline = no never-touched rows). Reported inconclusive, like
+	// prevOnly: visible, but not by itself a failure (#770).
+	covered := make(map[string]bool, len(pairs)+len(unpaired)+len(prevOnly))
+	for _, p := range pairs {
+		covered[p.Schema+"."+p.Table] = true
+	}
+	for _, u := range unpaired {
+		covered[u.Schema+"."+u.Table] = true
+	}
+	for _, d := range prevOnly {
+		covered[d.Schema+"."+d.Table] = true
+	}
+	var uncovered []*metadata.TableMeta
+	for _, tm := range resolver.AllTables() {
+		key := tm.Schema + "." + tm.Table
+		if covered[key] || (want != nil && !want[key]) {
+			continue
+		}
+		uncovered = append(uncovered, tm)
+	}
+	if len(uncovered) > 0 {
+		// A table can be absent from the two most recent snapshots yet still
+		// have an older one on disk/S3 — reconstruct.FindBaseline's
+		// stale-fallback path will still find and use it (with a
+		// StaleWarning), so it's recoverable, just not verifiable against
+		// the current top-2 window. Distinguish that from a table with zero
+		// baselines ever, which reconstruct genuinely cannot serve, so the
+		// message doesn't send an operator into unnecessary re-baselining
+		// panic for a table that's actually fine (just stale).
+		everBaselined, err := verify.EverBaselinedTables(cmd.Context(), baselineSrc)
+		if err != nil {
+			return fmt.Errorf("list baselines: %w", err)
+		}
+		for _, tm := range uncovered {
+			detail := "never baselined; unrecoverable via reconstruct (extend the baseline job to cover this table)"
+			if everBaselined[tm.Schema+"."+tm.Table] {
+				detail = "not covered by the two most recent baselines; reconstruct will fall back to an older snapshot (stale)"
+			}
+			results = append(results, verify.TableResult{
+				Schema: tm.Schema, Table: tm.Table, Status: verify.StatusInconclusive,
+				Detail: detail,
+			})
+		}
+	}
+	// A table named in --tables that is absent from the paired and unpaired
+	// sets AND the schema snapshot was never iterated above, so it would
+	// silently vanish from the report while the run still exited 0 on the other
+	// tables' matches — the exact silent-omission this command exists to prevent
+	// (and asymmetric with live mode, where a bogus --tables entry reaches
+	// VerifyTable and gates the exit). Surface each unseen request as an error
+	// so it appears and fails the run.
 	if want != nil {
 		seen := make(map[string]bool, len(results))
 		for _, r := range results {
@@ -220,7 +278,7 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 			schema, table, _ := strings.Cut(key, ".")
 			results = append(results, verify.TableResult{
 				Schema: schema, Table: table, Status: verify.StatusError,
-				Detail: "requested via --tables but not present in the latest baseline pair",
+				Detail: "requested via --tables but not present in the latest baseline pair or the latest schema snapshot",
 			})
 		}
 	}

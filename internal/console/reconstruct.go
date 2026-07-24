@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
-	"github.com/dbtrail/dbtrail/internal/forensics"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
@@ -53,16 +53,6 @@ type capabilitiesResponse struct {
 	// profile cascade victim synthesis cannot honor redaction, so the endpoint
 	// refuses (see handleRecoverCascade). Process-global, like Monitor.
 	RecoverCascade bool `json:"recover_cascade"`
-	// Forensics: the who-changed/user-activity/connection-history
-	// investigation surface is available (epic #701). Gated by the single
-	// entitlement seam (forensics.Enabled) and, like RecoverCascade, refused
-	// while an RBAC redaction profile is active — forensic output includes
-	// unredacted SQL text and session identity. Process-global: it never needs
-	// the selected server's bundle — per-server "no source configured" is a
-	// property of the SELECTED server, handled inside the forensics endpoints
-	// themselves (who-changed degrades to index-only attribution; the other
-	// two modes have no fallback and error), not this process-wide flag.
-	Forensics bool `json:"forensics"`
 	// RecoverCascadeBaseline: cascade recovery's Phase-2 (recover children
 	// untouched within the window) is active for this server. Per-server, and gated
 	// EXACTLY like the handler builds its provider — a baseline source AND a schema
@@ -87,13 +77,37 @@ type capabilitiesResponse struct {
 	Verify bool `json:"verify"`
 	// VerifyLiveSource: live-source verify is additionally usable — the
 	// selected server also has a source DSN configured. Per-server.
-	VerifyLiveSource bool         `json:"verify_live_source"`
-	Auth             authCapsInfo `json:"auth"`
+	VerifyLiveSource bool `json:"verify_live_source"`
+	// ExtensionViews lists console views contributed by an installed
+	// extension-view provider (an embedding distribution — a build that wraps the
+	// OSS core). Omitted in the stock binary (no provider) and whenever any named
+	// profile is active — even a zero-rule one (the provider's data routes are
+	// refused then via rbacViewGuard/profileActive, so the SPA must not advertise a
+	// nav item that would 403). The SPA reveals one nav item + route ("ext-<id>")
+	// per entry. Generic by construction — the core names no specific view.
+	ExtensionViews []extensionViewDTO `json:"extension_views,omitempty"`
+	Auth           authCapsInfo       `json:"auth"`
+	// Permissions is this session's effective grant of every permission the core
+	// defines, for the SPA to gate its UI (hide tabs/buttons a scoped session
+	// cannot use). All-true for a policy-less session — the static token, the
+	// password login, and every OSS session — so the UI hides nothing there.
+	// Server-side 403 (authzMiddleware) is the real gate; this only tidies the UI.
+	Permissions map[string]bool `json:"permissions"`
+	// MCP: the /mcp endpoint is usable — a static console token or a
+	// UI-managed MCP token is configured (the endpoint's only accepted
+	// credentials; see mcp.go). Process-global, like Monitor. The frontend's
+	// "Connect AI client" card keys its ready-vs-explain state on this
+	// instead of ever probing /mcp itself.
+	MCP bool `json:"mcp"`
+	// Version is the running build's version string ("0.36.0"; "dev" or empty
+	// on unversioned builds). Presentation-only: the Connect AI client card
+	// derives the release-asset download link for the RUNNING version from it.
+	Version string `json:"version,omitempty"`
 	// Source names the selected server's source database family — "postgresql"
 	// or "mysql" — derived per-server from stream_state.flavor (the same field
 	// DialectForIndex reads). It drives source-aware PRESENTATION only: the
 	// frontend relabels stream vocabulary (LSN vs binlog file/pos/GTID) and shows
-	// a forensics-degraded note for PostgreSQL, whose pgoutput stream carries no
+	// a connection-id availability note for PostgreSQL, whose pgoutput stream carries no
 	// backend connection id. NOT a capability gate — it never hides a surface,
 	// only renames or annotates what one shows. Defaults to "mysql" when the
 	// bundle can't be resolved, so a degraded console reads as the common case.
@@ -108,6 +122,16 @@ type capabilitiesResponse struct {
 type authCapsInfo struct {
 	PasswordSet bool   `json:"password_set"`
 	AuthKind    string `json:"auth_kind"` // "token" | "session"
+}
+
+// extensionViewDTO is the wire view of one console view contributed by an
+// installed ext.ConsoleViewProvider. id keys the nav item, the SPA route
+// ("ext-"+id), and the "/api/ext/<id>/" data mount; script is the ES module the
+// SPA import()s and calls render(mount, {apiBase, api}) on.
+type extensionViewDTO struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Script string `json:"script"`
 }
 
 // handleCapabilities reports which optional console surfaces are enabled.
@@ -131,19 +155,28 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		VerifyTrigger:   s.verifyCtrl != nil,
 		// recover-cascade is the free tier (like recover) and process-global, gated
 		// only by the RBAC profile (which would make synthesis leak redacted data).
-		RecoverCascade: !s.rbacActive(),
-		Forensics:      forensics.Enabled() && !s.rbacActive(),
+		RecoverCascade: !s.rbacActiveFor(r),
 		Auth:           authCapsInfo{PasswordSet: s.passwordLoginEnabled(), AuthKind: kind},
+		Permissions:    permissionsForPolicy(policyFrom(r.Context())),
+		// The MCP endpoint accepts the static token or the UI-managed one
+		// (mcp.go refuses with 403 when neither is configured), so token
+		// presence IS the capability.
+		MCP:     s.token != "" || s.managedTok.configured(),
+		Version: s.version,
 		// Default until the bundle resolves: a degraded console renders MySQL
 		// vocabulary (the common case), never a blank source.
 		Source: sourceMySQL,
 	}
 	if b, err := s.resolve(r); err == nil {
-		resp.Reconstruct = b.baselineConfigured
+		// A per-session data profile refuses reconstruct/cascade (baseline reads
+		// bypass redaction; cascade synthesis can't redact), so the advertised
+		// capabilities must go false for a profiled session too (#1075).
+		restricted := sessionRestricted(r)
+		resp.Reconstruct = b.baselineConfigured && !restricted
 		// Match the recover-cascade handler's Phase-2 gate exactly so the advertised
 		// capability can't over-promise (handler builds the provider only when both
 		// a baseline source and a resolver are present).
-		resp.RecoverCascadeBaseline = b.baselineConfigured && b.resolver != nil
+		resp.RecoverCascadeBaseline = b.baselineConfigured && b.resolver != nil && !restricted
 		// Verify's engine (baseline-anchored and live-source alike) carries no RBAC
 		// redaction — see verify_trigger.go — so this reuses baselineConfigured
 		// verbatim (not just b.baselineSrc != ""): that field already folds in
@@ -151,7 +184,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// too, so a no-archive server would otherwise advertise verify:true and
 		// then reliably fail with a coverage-gap error on any window touching a
 		// rotated-out hour — worse than just hiding it, like Reconstruct does.
-		if s.verifyCtrl != nil && !s.rbacActive() {
+		if s.verifyCtrl != nil && !s.rbacActiveFor(r) {
 			resp.Verify = b.baselineConfigured
 			if e, ok := s.selectedEntry(r); ok {
 				resp.VerifyLiveSource = e.SourceDSN != ""
@@ -167,6 +200,16 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// strip Time-travel from the UI, so leave an operator trace. Mirrors
 		// the Debug/Warn split in connManager.Resolve.
 		slog.Warn("console: capabilities resolve failed; reporting reconstruct=false", "error", err)
+	}
+	// Extension views (ext seam): advertise an installed provider's view so the
+	// SPA can reveal its nav item + route. Process-global, like Monitor. Suppressed
+	// under an active profile — keyed on s.profileActive (any named profile, even a
+	// zero-rule one) to match rbacViewGuard, which refuses the data routes there
+	// (advertising a nav item that only 403s would be a lie) — and for an invalid
+	// id, which buildHandler declined to mount (advertising it would 404 the data
+	// route).
+	if p := ext.ConsoleView(); p != nil && !s.profileActiveFor(r) && ext.ValidConsoleViewID(p.ID()) {
+		resp.ExtensionViews = []extensionViewDTO{{ID: p.ID(), Label: p.Label(), Script: p.Script()}}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -215,6 +258,15 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	// bundle's baselineConfigured; see newBundleDerived for why archive access
 	// is required). Per-server enforcement matters: baseline reads bypass RBAC
 	// redaction, so the gate must not leak from one server's config to another.
+	// A session carrying a data profile is refused: reconstruct reads the
+	// baseline snapshot, which bypasses RBAC redaction (#1075). The per-bundle
+	// baselineConfigured already folds in the STARTUP profile; this adds the
+	// per-session one.
+	if sessionRestricted(r) {
+		writeJSONError(w, http.StatusForbidden,
+			"time-travel is unavailable while an access-control profile is active — baseline reads aren't redacted")
+		return
+	}
 	if !b.baselineConfigured {
 		writeJSONError(w, http.StatusNotFound,
 			"time-travel isn't available for this server (no baseline is set up, an access-control profile is active, or archive access is disabled)")
@@ -289,13 +341,14 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		Order:    "", // ASC: ApplyAt/BuildHistory require chronological input.
 		Limit:    reconstructMaxEvents + 1,
 	}
-	rows, plan, err := query.FetchMerged(ctx, b.db, b.engine, query.FetchMergedOptions{
+	fmOpts := query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         b.dbName,
 		NoArchive:      b.noArchive,
 		AllowGaps:      allowGaps,
 		ArchiveFetcher: parquetquery.Fetch,
-	})
+	}
+	rows, plan, err := query.FetchMerged(ctx, b.db, b.engine, fmOpts)
 	if err != nil {
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {
@@ -309,6 +362,15 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	if len(rows) > reconstructMaxEvents {
 		writeJSONError(w, http.StatusUnprocessableEntity,
 			fmt.Sprintf("too many events (>%d) for this row between the baseline and the target time to reconstruct safely; narrow the time or use the offline `bintrail reconstruct`", reconstructMaxEvents))
+		return
+	}
+	// Trim a trailing PARTIAL transaction AFTER the overflow check above, not
+	// before: trimming reduces len(rows), and running it first would let a
+	// window that's genuinely over the cap slip through the >reconstructMaxEvents
+	// check (#783).
+	rows, err = reconstruct.TrimPartialTailTransaction(ctx, b.db, b.engine, fmOpts, rows, atTime)
+	if err != nil {
+		writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 

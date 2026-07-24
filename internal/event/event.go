@@ -133,13 +133,41 @@ func (f *Filters) Matches(schema, table string) bool {
 func BuildPKValues(pkColumns []metadata.ColumnMeta, row map[string]any) string {
 	parts := make([]string, 0, len(pkColumns))
 	for _, col := range pkColumns {
-		val := formatPKValue(row[col.Name])
-		val = strings.ReplaceAll(val, `\`, `\\`)
-		val = strings.ReplaceAll(val, `|`, `\|`)
-		parts = append(parts, val)
+		parts = append(parts, EscapePKValue(formatPKValue(row[col.Name])))
 	}
 	return strings.Join(parts, "|")
 }
+
+// EscapePKValue applies the pipe/backslash escaping BuildPKValues uses for
+// each individual PK column value. Exported so callers holding a raw,
+// already-decoded single-column PK value (e.g. internal/shim, after
+// MySQL-unescaping a SQL string literal) can re-encode it into the same
+// at-rest form stored in binlog_events.pk_values before using it as a match
+// filter — the string-literal unescaping and this pipe-delimiter escaping
+// are two unrelated encodings, and neither implies the other.
+func EscapePKValue(val string) string {
+	val = strings.ReplaceAll(val, `\`, `\\`)
+	val = strings.ReplaceAll(val, `|`, `\|`)
+	return val
+}
+
+// MaxPKValuesLen is the character-count ceiling of binlog_events.pk_values
+// (VARCHAR(512)). Measured in RUNES, not bytes: a multibyte utf8mb4 PK value
+// (e.g. a CJK VARCHAR primary key) occupies one VARCHAR(512) character per
+// rune regardless of how many UTF-8 bytes that rune takes, so a byte-length
+// check would false-trip on perfectly legal values that fit the column.
+//
+// Deliberately NOT enforced inside BuildPKValues — see internal/indexer's
+// insertBatch guard instead. BuildPKValues is also called by the BYOS
+// Parquet path (internal/byos), which writes pk_values to customer-owned
+// Parquet storage with no 512-character ceiling at all; a length check here
+// would wrongly reject valid BYOS rows that the indexed-MySQL path never
+// sees. The column is deliberately NOT widened either (see #944): moving
+// VARCHAR(512) to VARCHAR(3072)+ crosses MySQL's 1-byte/2-byte
+// length-prefix boundary, which is a full table rebuild, not an instant
+// DDL — unacceptable to trigger silently on a routine CLI invocation
+// against a large production binlog_events table.
+const MaxPKValuesLen = 512
 
 // formatPKValue renders a single PK value for BuildPKValues. []byte needs its
 // own case: since #756, metadata.MapRow hands back a BINARY/VARBINARY value as

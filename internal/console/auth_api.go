@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dbtrail/dbtrail/ext"
 )
 
 // maxLoginBody bounds the login/change-password request bodies; both are a
@@ -47,16 +49,46 @@ func requireJSONBody(w http.ResponseWriter, r *http.Request) bool {
 // The file is statted per request so `user set-password` against a live server
 // lights the login form up without a restart.
 func (s *Server) handleAuthInfo(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{
+	info := map[string]any{
 		"password_login": s.passwordLoginEnabled(),
 		"setup":          s.setupAllowed(),
-	})
+	}
+	// An installed external auth provider adds the login screen's
+	// "Continue with <name>" entry: its label and the initiation URL
+	// (extAuthPrefix + "start" by the ext.ConsoleAuthProvider contract).
+	// Both fields are absent when no provider is installed.
+	if p := ext.ConsoleAuth(); p != nil {
+		info["sso_name"] = p.DisplayName()
+		info["sso_start"] = extAuthPrefix + "start"
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+// extSessionIssuer adapts the session store to the ext.ConsoleSessionIssuer
+// contract: the installed provider calls it after verifying an identity, and
+// the returned token is a normal console session (same TTLs, same revocation).
+// The identity is logged for the operator's audit trail and never stored.
+func (s *Server) extSessionIssuer() ext.ConsoleSessionIssuer {
+	return func(identity string, policy *ext.AccessPolicy) (string, time.Time, error) {
+		token, expires, err := s.sessions.IssueWithPolicy(policy)
+		if err != nil {
+			return "", time.Time{}, err
+		}
+		slog.Info("console external-auth login", "identity", identity)
+		return token, expires, nil
+	}
 }
 
 // passwordLoginEnabled re-checks the auth file at call time. A corrupt file
 // reads as enabled: login attempts against it fail loud (LoadAuthFile error)
 // rather than silently downgrading the console to token-only auth.
 func (s *Server) passwordLoginEnabled() bool {
+	// An installed credential backend serves the login form on its own — it
+	// supersedes the auth file, so its presence alone enables password login
+	// (and, via setupAllowed, closes first-run setup: a backend is a credential).
+	if ext.ConsoleCredential() != nil {
+		return true
+	}
 	if s.authPath == "" {
 		return false
 	}
@@ -169,6 +201,38 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusRequestEntityTooLarge
 		}
 		writeJSONError(w, status, "invalid JSON body")
+		return
+	}
+
+	// An installed credential backend (ext seam) SUPERSEDES the built-in auth
+	// file for login: the file is not consulted. The rate limiter, body cap, and
+	// content-type gate above already ran, and the backend owns the constant-time
+	// verify (its own dummy-hash-equivalent cost) — so the console only trades a
+	// non-nil result for a session, and renders one uniform 401 for a nil one.
+	if backend := ext.ConsoleCredential(); backend != nil {
+		cred := backend.Verify(req.Username, req.Password)
+		if cred == nil {
+			s.loginLimiter.Fail(ip)
+			// Uniform body, and the attempted username is NEVER logged (as with
+			// the built-in path — a password often lands in the username field).
+			slog.Warn("console login failed", "remote", ip)
+			writeJSONError(w, http.StatusUnauthorized, "invalid username or password")
+			return
+		}
+		s.loginLimiter.Success(ip)
+		token, expires, err := s.sessions.IssueWithPolicy(cred.Policy)
+		if err != nil {
+			slog.Error("console session issue failed", "error", err)
+			writeJSONError(w, http.StatusInternalServerError, "something went wrong signing you in — try again")
+			return
+		}
+		// The verified identity is the operator's audit trail (like the external
+		// auth issuer); logged only on SUCCESS, where it is a real identity.
+		slog.Info("console login", "remote", ip, "identity", cred.Identity)
+		writeJSON(w, http.StatusOK, map[string]string{
+			"token":      token,
+			"expires_at": expires.UTC().Format(time.RFC3339),
+		})
 		return
 	}
 

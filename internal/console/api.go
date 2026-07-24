@@ -10,12 +10,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/recovery"
@@ -58,8 +60,9 @@ type recoverRequest struct {
 	Until         string `json:"until"`
 	ChangedColumn string `json:"changed_column"`
 	// Order is accepted for request symmetry with /api/events but IGNORED by
-	// recover: handleRecover forces oldest-first (ASC) input, which the undo
-	// generator requires. A client-supplied value has no effect.
+	// recover: handleRecover forces newest-first (DESC) input so a LIMIT
+	// truncation keeps the newest suffix of the window (#981); rows are
+	// re-sorted ASC before generation. A client-supplied value has no effect.
 	Order string `json:"order"`
 	Limit int    `json:"limit"`
 }
@@ -198,7 +201,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rows, plan, err := s.fetch(r.Context(), b, opts)
+	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
+	if err != nil {
+		writeSessionProfileError(w, err)
+		return
+	}
+	rows, plan, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -241,6 +249,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
+	if err != nil {
+		writeSessionProfileError(w, err)
+		return
+	}
 	// Refuse to generate an undo script for the entire index; a recovery must
 	// be scoped to at least one schema.
 	if opts.Schema == "" {
@@ -248,21 +261,39 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Recovery requires chronological (oldest-first) input: GenerateSQLFromRows
-	// reverses internally so the most-recent event is undone first. The browsing
-	// default (DESC) would invert the undo order for a PK touched multiple times.
-	// Forcing ASC here also makes the LIMIT select the oldest N, matching the CLI.
-	opts.Order = ""
+	// When --limit truncates the window it must keep the most RECENT events
+	// (#981, mirroring the CLI's #785 fix in internal/cli/recover.go): fetching
+	// DESC means a LIMIT truncation keeps the newest suffix, rolling the data
+	// back to a consistent intermediate point. The ASC default would instead
+	// keep the OLDEST prefix — undoing old events underneath later
+	// un-reverted ones maps to no state that ever existed (the reverse
+	// UPDATE's row_after WHERE no longer matches, or the reverse DELETE
+	// removes a row a later event rewrote). Rows are re-sorted ascending
+	// below, before generation: GenerateSQLFromRows expects chronological
+	// (ASC) input and reverses internally so the most-recent event is undone
+	// first.
+	opts.Order = "DESC"
 
 	// Coverage gaps come back in plan.GapHours and are surfaced as warnings
 	// below — the recover UI renders them, so an incomplete-coverage undo is
 	// flagged to the operator rather than silently presented as complete.
-	rows, plan, err := s.fetch(r.Context(), b, opts)
+	rows, plan, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
 	}
 	warnings := gapWarnings(plan)
+
+	// The fetch above ran Order=DESC so the limit kept the newest suffix of
+	// the window (#981). Detect truncation on the FETCHED row count — before
+	// generation, so the warning fires even when generation later refuses —
+	// then restore ascending order for GenerateSQLFromRows and the
+	// cascade-detection logic below, both of which expect chronological input.
+	if opts.Limit > 0 && len(rows) >= opts.Limit {
+		warnings = append(warnings,
+			fmt.Sprintf("Matched events were truncated at the limit (%d); only the most recent events of the window are being reversed.", opts.Limit))
+	}
+	rows = query.MergeResults(rows, 0, "ASC")
 
 	// Per-bundle dialect (the console is multi-server): MySQLDialect covers MySQL +
 	// MariaDB, PostgresDialect a PG-flavored index. Read once and reused below.
@@ -291,10 +322,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 			warnings = append([]string{
 				"Could not check whether this table is a foreign-key parent (detection failed: " + derr.Error() + "). If it is, any cascade-deleted child rows are NOT included in the script below — retry, or use recover-cascade to reconstruct them.",
 			}, warnings...)
-		case isParent && s.rbacActive():
+		case isParent && s.rbacActiveFor(r):
 			// Synthesis can't honor redaction (it would leak denied/redacted child
-			// rows), so it stays disabled under a profile — but SAY so, so a
-			// parent-only script is never silently presented as a full restore.
+			// rows), so it stays disabled under a profile — startup OR per-session
+			// (#1075) — but SAY so, so a parent-only script is never silently
+			// presented as a full restore.
 			warnings = append([]string{
 				"This table has ON DELETE CASCADE / SET NULL children, but cascade synthesis is disabled while an RBAC redaction profile is active — the script below re-creates the parent only; cascade-deleted child rows are NOT included.",
 			}, warnings...)
@@ -407,14 +439,85 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// distinctSchemas lists the schemas observed in this server's binlog_events.
+// distinctSchemas lists the schemas this server can be queried for: those
+// observed in the live binlog_events UNION those in the latest schema snapshot.
+//
+// The snapshot half is load-bearing, not a nicety: once rotate archives the
+// partitions to Parquet/S3, binlog_events is empty while /api/events and
+// /api/recover still answer from the archives via query.FetchMerged. Listing
+// only the live table left the schema dropdown empty — and it is a <select>
+// with no free-text fallback, so the recover page became unusable against
+// archive-only data (#1065). schema_snapshots is never partitioned and rotate
+// never touches it, so it outlives the events it describes.
+//
+// UNION rather than tablesForSchema's prefer-then-fallback: a schema dropped
+// from the source is absent from the latest snapshot, yet its archived events
+// are still recoverable and must stay listed.
+//
+// The snapshot half is gated on archives being reachable (see below), so this
+// is strictly additive: a server that cannot read archives keeps the exact
+// pre-#1065 listing.
+//
+// Two residual gaps, both out of scope and both the same shape — this endpoint
+// answers "which schemas does this index know of", NOT "which schemas have
+// retrievable data in a given window":
+//   - a fresh index pointed at foreign archives with no local snapshot still
+//     lists nothing; enumerating schemas from the Parquet itself would mean
+//     scanning every archive file on each dropdown load.
+//   - `rotate --retain` WITHOUT `--archive-dir` drops partitions and writes no
+//     Parquet, so a listed schema may have no data anywhere. The designed
+//     signal for that is status's continuity verdict and its EVENTS
+//     PERMANENTLY LOST banner (#649) — an empty dropdown was only ever an
+//     accidental proxy for it, and an empty dropdown on a healthy archived
+//     index is the very bug being fixed here.
+//
+// The resolver is loaded once when the bundle opens (manager.go, server.go), so
+// a snapshot taken after the console started is not picked up until restart.
 func (b *bundle) distinctSchemas(ctx context.Context) ([]string, error) {
 	rows, err := b.db.QueryContext(ctx, "SELECT DISTINCT schema_name FROM binlog_events ORDER BY schema_name")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanStrings(rows)
+	live, err := scanStrings(rows)
+	if err != nil {
+		return nil, err
+	}
+	if b.noArchive {
+		// Archives are never consulted for this server (--no-archive, or ANY
+		// active RBAC profile — see newBundleDerived), so a schema that survives
+		// only in the snapshot is unreachable BY CONSTRUCTION: the union's whole
+		// justification is that the archives still answer. Advertising it would
+		// offer the operator a target this server provably cannot return a row
+		// for. Live-only here is byte-identical to the pre-#1065 behaviour.
+		return live, nil
+	}
+	return mergeSchemaNames(live, b.resolver), nil
+}
+
+// mergeSchemaNames folds the snapshot's schemas into the observed ones,
+// deduplicated and sorted. A nil resolver (no snapshot loaded) returns the
+// observed names unchanged, so the pre-snapshot behaviour is preserved.
+func mergeSchemaNames(live []string, r *metadata.Resolver) []string {
+	if r == nil {
+		return live
+	}
+	seen := make(map[string]bool, len(live))
+	out := make([]string, 0, len(live))
+	for _, s := range live {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, t := range r.AllTables() {
+		if !seen[t.Schema] {
+			seen[t.Schema] = true
+			out = append(out, t.Schema)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // tablesForSchema lists the tables of one schema. It prefers the latest schema

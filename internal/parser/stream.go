@@ -30,6 +30,12 @@ type StreamParser struct {
 	// decoded. See SetSyncDDLHook for why this must not move off the parse
 	// path, and why the ordering (hook, then emit) is load-bearing for #760.
 	onDDL atomic.Pointer[func(Event) error]
+	// flavor is the source flavor ("mysql" or "mariadb"; see SetFlavor), used
+	// only to word remediation text (GTIDExecutedHint) in the position-
+	// wraparound error inside Run. Never consulted for parsing decisions —
+	// MySQL vs MariaDB event types (GTIDEvent vs MariadbGTIDEvent) already
+	// disambiguate that.
+	flavor string
 }
 
 // NewStreamParser creates a StreamParser that resolves column names via
@@ -53,6 +59,30 @@ func NewStreamParser(resolver *metadata.Resolver, filters Filters, logger *slog.
 func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
 	sp.schemaVersion.Store(uint32(r.SnapshotID()))
 	sp.resolver.Store(r)
+}
+
+// SetFlavor sets the source flavor ("mysql" or "mariadb", matching
+// gomysql.MySQLFlavor/MariaDBFlavor) used to word the position-wraparound
+// error (see Run) flavor-appropriately. Must be called before the goroutine
+// that runs Run is spawned — Run reads it without synchronization, relying
+// on the happens-before edge from the spawning statement (mirrors how
+// resolver/filters are fixed before Run begins). Empty (never called)
+// defaults to MySQL wording.
+func (sp *StreamParser) SetFlavor(flavor string) {
+	sp.flavor = flavor
+}
+
+// GTIDExecutedHint returns the flavor-appropriate system variable an
+// operator should read to obtain the source's current executed GTID set, for
+// remediation messages that direct the operator to --start-gtid. MySQL has
+// gtid_executed; MariaDB has no such variable — its analog is
+// gtid_binlog_pos (see detectMariaDBGTIDGap in internal/streamrun, which
+// queries the same variable for gap detection).
+func GTIDExecutedHint(flavor string) string {
+	if flavor == "mariadb" {
+		return "SELECT @@gtid_binlog_pos"
+	}
+	return "SELECT @@GLOBAL.gtid_executed"
 }
 
 // SetSyncDDLHook registers fn to run synchronously inside Run, for each DDL
@@ -105,6 +135,10 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	var currentFile string
 	var currentGTID string
 	var currentConnectionID uint32 // pseudo_thread_id from most recent QueryEvent
+	// lastLogPos tracks the highest EventHeader.LogPos seen since the last
+	// RotateEvent, to detect a same-file position wraparound (#845) live,
+	// during streaming — see the check at the top of handleEvent below.
+	var lastLogPos uint32
 	// currentQueryText holds the original SQL statement from the most recent
 	// ROWS_QUERY_EVENT (MySQL, binlog_rows_query_log_events=ON) or
 	// ANNOTATE_ROWS event (MariaDB, binlog_annotate_row_events=ON; the syncer
@@ -171,6 +205,43 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	// a graceful nil.
 	var handleEvent func(binlogEv *replication.BinlogEvent) error
 	handleEvent = func(binlogEv *replication.BinlogEvent) error {
+		// EventHeader.LogPos is a uint32 wire field (4 bytes, the SAME
+		// COM_BINLOG_DUMP format limit resolveStartForFlavor guards on resume,
+		// internal/streamrun/streamrun.go) — the position immediately after
+		// this event within the CURRENT file. A single oversized transaction
+		// can delay rotation past 4GiB (max_binlog_size is only checked
+		// between transactions); once the true file offset crosses 2^32,
+		// MySQL/MariaDB itself wraps end_log_pos on the wire before bintrail
+		// ever sees it — there is no uncorrupted 64-bit value anywhere on the
+		// wire to recover (RotateEvent.Position is 8 bytes but only
+		// meaningful at rotation, and COM_BINLOG_DUMP resume is itself capped
+		// at 4 bytes, so even a true running offset tracked internally could
+		// never be used to resume position-mode past this point). The
+		// unmistakable signature of this happening is the position going
+		// BACKWARD within the same file with no RotateEvent in between —
+		// legitimate binlog position is strictly increasing within a file.
+		// Catching it here, before this event's rows are captured or any
+		// checkpoint advances past it, prevents both a corrupt checkpoint and
+		// silent re-indexing/duplication under the wrapped offset — the
+		// resume-time guard in resolveStartForFlavor is provably unreachable
+		// for this bug (every writer of the saved position already derives
+		// from this same uint32 field, so it can never itself exceed
+		// math.MaxUint32; the wrap happens here, upstream, at the source).
+		if _, isRotate := binlogEv.Event.(*replication.RotateEvent); isRotate {
+			lastLogPos = 0 // new file (real or fake-resume rotate): positions restart
+		} else if hdr := binlogEv.Header; lastLogPos != 0 && hdr.LogPos != 0 && hdr.LogPos < lastLogPos {
+			return fmt.Errorf(
+				"binlog position wraparound detected in %q: position went from %d back to %d with no intervening "+
+					"file rotation — this file has grown past the 4GiB wire-format limit for a single binlog position "+
+					"(typically one oversized transaction delaying rotation), and the source is truncating end_log_pos "+
+					"on the wire; position-mode streaming cannot safely continue past this point. Switch to GTID mode, "+
+					"which has no positional limit: restart with --start-gtid using the source's current executed "+
+					"GTID set (%s)",
+				currentFile, lastLogPos, hdr.LogPos, GTIDExecutedHint(sp.flavor))
+		} else if hdr.LogPos > lastLogPos {
+			lastLogPos = hdr.LogPos
+		}
+
 		switch ev := binlogEv.Event.(type) {
 		case *replication.RotateEvent:
 			currentFile = string(ev.NextLogName)

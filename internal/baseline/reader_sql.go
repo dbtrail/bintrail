@@ -259,12 +259,12 @@ func parseSQLValue(s string, pos int) (string, bool, int, error) {
 		return parseDefaultValue(s, pos)
 
 	case s[pos] == '0' && pos+1 < len(s) && (s[pos+1] == 'x' || s[pos+1] == 'X'):
-		// Hex literal: 0x...
-		end := pos + 2
-		for end < len(s) && isHexDigit(s[end]) {
-			end++
+		// Hex literal: 0x... Returned as the literal token; convertValue does the
+		// type-aware decode to bytes for binary-family columns (#503 item 1).
+		if end, ok := scanHexLiteral(s, pos); ok {
+			return s[pos:end], false, end, nil
 		}
-		return s[pos:end], false, end, nil
+		return parseDefaultValue(s, pos)
 
 	default:
 		return parseDefaultValue(s, pos)
@@ -321,8 +321,33 @@ func parseIntroducedString(s string, pos int) (val string, end int, ok bool, err
 		v, e, perr := parseSQLDoubleString(s, i+1)
 		return v, e, true, perr
 	default:
+		// _binary 0x<hex> — an introducer before a --hex-blob literal. Return the
+		// 0x… token undecoded so convertValue does the type-aware hex decode
+		// (#503 item 1). Without this the whole "_binary 0x…" string was captured
+		// as the column value.
+		if end, ok := scanHexLiteral(s, i); ok {
+			return s[i:end], end, true, nil
+		}
 		return "", pos, false, nil
 	}
+}
+
+// scanHexLiteral reports whether s[pos:] begins with a 0x<hex-digits> literal and
+// returns the offset just past it. A bare "0x" with no following hex digit is not
+// a literal (ok=false). mydumper/mysqldump --hex-blob renders binary columns as
+// exactly this form.
+func scanHexLiteral(s string, pos int) (int, bool) {
+	if pos+2 > len(s) || s[pos] != '0' || (s[pos+1] != 'x' && s[pos+1] != 'X') {
+		return pos, false
+	}
+	end := pos + 2
+	for end < len(s) && isHexDigit(s[end]) {
+		end++
+	}
+	if end == pos+2 {
+		return pos, false
+	}
+	return end, true
 }
 
 // parseConvertExpr handles mydumper's JSON encoding CONVERT("<json>" USING

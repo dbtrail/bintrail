@@ -19,6 +19,7 @@ import (
 	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -238,7 +239,46 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	if err := indexer.EnsureSchema(db); err != nil {
-		return fmt.Errorf("schema migration: %w", err)
+		return indexer.WrapSchemaMigrationErr(err)
+	}
+
+	// ── Re-encode --pk/--pks against the at-rest pk_values form ────────────────
+	// (#957) binlog_events.pk_values is stored PIPE/BACKSLASH-ESCAPED
+	// (event.BuildPKValues escapes each PK component before joining with "|"),
+	// but --pk/--pks bind the raw flag value straight through. A value
+	// containing a literal "|"/"\" is ambiguous without knowing the live
+	// table's actual PK column count: it could be the user-typed delimiter
+	// between components of a composite PK (see the documented
+	// "--pk '12345|2'" usage — the raw, unescaped form is what's stored), or
+	// a literal character inside a single-column PK (the escaped form is
+	// what's stored). An earlier revision of this fix resolved that
+	// ambiguity from a schema_snapshots resolve, but a snapshot can be stale
+	// relative to the live table (e.g. an ALTER TABLE widened/narrowed the PK
+	// and no `bintrail snapshot` re-run happened yet since) — trusting it can
+	// silently corrupt a previously-correct composite lookup. Instead, match
+	// BOTH candidate encodings whenever escaping would actually change the
+	// value: event.EscapePKValue is a no-op unless the value contains "|" or
+	// "\", so the overwhelming common case (plain numeric/text PKs) emits the
+	// exact same query as before this feature existed — no snapshot lookup,
+	// no extra WHERE clause, and the pk_hash-indexed fast path stays intact.
+	// qPKs (the --pks labels) are deliberately left as the user's literal
+	// input: writeGroupedJSON matches each label against both its raw and
+	// escaped forms, so the "pk" field in grouped JSON output always echoes
+	// back what the user typed.
+	if opts.PKValues != "" {
+		if esc := event.EscapePKValue(opts.PKValues); esc != opts.PKValues {
+			opts.PKValuesAlt = esc
+		}
+	}
+	if len(opts.PKValuesIn) > 0 {
+		expanded := make([]string, 0, len(opts.PKValuesIn))
+		for _, v := range opts.PKValuesIn {
+			expanded = append(expanded, v)
+			if esc := event.EscapePKValue(v); esc != v {
+				expanded = append(expanded, esc)
+			}
+		}
+		opts.PKValuesIn = expanded
 	}
 
 	if qProfile != "" {
@@ -582,9 +622,14 @@ func writeGroupedJSON(pks []string, rows []query.ResultRow, w io.Writer) (int, e
 	groups := make([]group, 0, len(pks))
 	total := 0
 	for _, pk := range pks {
-		evs := byPK[pk]
-		if evs == nil {
-			evs = []groupedEvent{}
+		// A row's stored pk_values may be the raw label (composite PK, or a
+		// single-column PK whose value needs no escaping) or its
+		// event.EscapePKValue form (single-column PK with a literal "|"/"\",
+		// #957) — match both, but always report the group under the user's
+		// literal --pks input.
+		evs := append([]groupedEvent{}, byPK[pk]...)
+		if esc := event.EscapePKValue(pk); esc != pk {
+			evs = append(evs, byPK[esc]...)
 		}
 		groups = append(groups, group{PK: pk, Events: evs})
 		total += len(evs)

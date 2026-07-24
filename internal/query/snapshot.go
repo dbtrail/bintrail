@@ -91,7 +91,13 @@ func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow,
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	if opts.Limit > 0 {
-		q += fmt.Sprintf(" LIMIT %d", opts.Limit)
+		// ORDER BY ALL pins WHICH rows the LIMIT keeps: without it, DuckDB's
+		// top-N over parquet_scan depends on row-group layout and scan
+		// parallelism, so repeated runs return different baseline subsets
+		// (#839). Ties under ORDER BY ALL are byte-identical rows, so both the
+		// selected set and the synthetic EventID assignment below (which
+		// MergeAndTrim tie-breaks on) are deterministic.
+		q += fmt.Sprintf(" ORDER BY ALL LIMIT %d", opts.Limit)
 	}
 
 	rows, err := db.QueryContext(ctx, q, args...)
