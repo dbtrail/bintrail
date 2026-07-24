@@ -663,3 +663,31 @@ func TestNewResolver_conflictingDuplicateRowsFailLoud(t *testing.T) {
 		t.Errorf("error should name the corruption and table, got: %v", err)
 	}
 }
+
+func TestNewResolver_sameNameDifferentTypeDuplicateFailsLoud(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// The realistic pre-#844 conflict: two writers straddling a DDL capture
+	// the SAME column name at the same ordinal with different type metadata.
+	// Pins the full-struct comparison — a name-only dedupe would silently
+	// load the wrong signedness/charset.
+	rows := sqlmock.NewRows(snapshotCols).
+		AddRow("mydb", "orders", "id", 1, "PRI", "int", "int", false, false, "").
+		AddRow("mydb", "orders", "qty", 2, "", "int", "int", false, false, "").
+		AddRow("mydb", "orders", "qty", 2, "", "int", "int unsigned", false, false, "")
+	mock.ExpectQuery("SELECT schema_name, table_name").WithArgs(14).WillReturnRows(rows)
+	mock.ExpectQuery(`SELECT MIN\(snapshot_time\)`).WithArgs(14).
+		WillReturnRows(sqlmock.NewRows([]string{"MIN(snapshot_time)"}).AddRow(time.Date(2026, 7, 4, 15, 2, 39, 0, time.UTC)))
+
+	_, err = NewResolver(db, 14)
+	if err == nil {
+		t.Fatal("expected error for same-name different-type duplicate, got nil")
+	}
+	if !strings.Contains(err.Error(), "corrupt") || !strings.Contains(err.Error(), "int unsigned") {
+		t.Errorf("error should name the corruption and the diverging column types, got: %v", err)
+	}
+}

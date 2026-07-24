@@ -1117,7 +1117,7 @@ func TestNewResolver_dedupesDuplicatedSnapshotRows(t *testing.T) {
 
 	// Pre-#844 concurrent writers sharing one snapshot_id: every column
 	// double-inserted. The resolver must report the real column count, or the
-	// #700 guard skips 100% of row events (#1033).
+	// parser's column-count guard skips 100% of row events (#1033).
 	for range 2 {
 		testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "wp_options", "option_id", 1, "PRI", "bigint", "NO")
 		testutil.InsertSnapshot(t, indexDB, 12, "2026-07-04 15:02:39", "mydb", "wp_options", "option_name", 2, "", "varchar", "NO")

@@ -230,17 +230,20 @@ func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (snapshotSca
 		}
 		// Duplicate (schema, table, ordinal_position) rows within one snapshot:
 		// pre-#844 concurrent snapshot writers could share a snapshot_id and
-		// double-insert every column. Loading them verbatim inflates the column
-		// count, and the #700 drift guard then skips 100% of row events until
-		// an operator re-snapshots (#1033). Rows arrive ordered by ordinal, so
-		// duplicates are adjacent to the last kept column.
+		// re-insert every column (doubled or worse). Loading them verbatim
+		// inflates the column count, and the parser's column-count guard then
+		// skips every row event for the table ("column count mismatch") until
+		// an operator re-snapshots (#1033). Rows arrive ordered by ordinal
+		// (both callers' SELECTs ORDER BY ends with ordinal_position — any new
+		// caller must preserve that), so duplicates are adjacent to the last
+		// kept column.
 		if n := len(tm.Columns); n > 0 && tm.Columns[n-1].OrdinalPosition == ordinalPosition {
 			if tm.Columns[n-1] == col {
 				dupRows[key]++
 				continue
 			}
-			return stats, fmt.Errorf("snapshot is corrupt: %s has two different columns at ordinal_position %d (%q vs %q) — re-run `bintrail snapshot` to write a clean snapshot",
-				key, ordinalPosition, tm.Columns[n-1].Name, columnName)
+			return stats, fmt.Errorf("snapshot is corrupt: %s has two different columns at ordinal_position %d (%q %s vs %q %s) — re-run `bintrail snapshot` to write a clean snapshot; if the table no longer exists at the source, delete that snapshot's rows from schema_snapshots instead",
+				key, ordinalPosition, tm.Columns[n-1].Name, tm.Columns[n-1].ColumnType, columnName, columnType)
 		}
 
 		if columnType != "" {
@@ -280,7 +283,7 @@ func scanSnapshotRows(rows *sql.Rows, tables map[string]*TableMeta) (snapshotSca
 		if len(names) > nameCap {
 			names = names[:nameCap]
 		}
-		slog.Warn("snapshot contains duplicated column rows (pre-#844 concurrent snapshot writers); "+
+		slog.Warn("snapshot contains duplicated column rows (typically pre-#844 concurrent snapshot writers); "+
 			"loaded deduplicated — re-run `bintrail snapshot` to write a clean snapshot",
 			"duplicate_rows", total,
 			"table_count", len(dupRows),
