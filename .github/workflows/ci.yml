@@ -153,10 +153,33 @@ jobs:
             --log-bin=binlog \
             --server-id=1
           echo "Waiting for MySQL to accept connections..."
+          # Probe over the SAME path the tests use — host TCP 127.0.0.1:13306
+          # with full auth and a real query — NOT `docker exec ... mysqladmin
+          # ping`, which answers over the container's local socket. The
+          # official mysql image runs a TEMPORARY mysqld during first-init
+          # (to create the root user / run init scripts), then shuts it down
+          # and starts the real one; a socket-local ping can succeed against
+          # that temporary server and exit this loop while the real server on
+          # the mapped host port is still starting or mid-restart — the
+          # readiness race behind #949's `integration (8.0)` failure
+          # (TestEndToEnd_fullPipeline: "unexpected EOF" / "invalid
+          # connection" dialing 127.0.0.1:13306). Requiring THREE consecutive
+          # successful probes (not just one) rules out a probe that landed on
+          # the temporary server moments before the restart. The probe runs
+          # from a short-lived container on the SAME image tag as the server
+          # so it doesn't depend on whatever mysql client (if any) happens to
+          # be preinstalled on the runner.
+          consecutive=0
           for i in $(seq 1 60); do
-            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
-              echo "MySQL is ready."
-              exit 0
+            if docker run --rm --network host "mysql:${{ matrix.mysql }}" \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              if [ "$consecutive" -ge 3 ]; then
+                echo "MySQL is ready (3 consecutive successful probes)."
+                exit 0
+              fi
+            else
+              consecutive=0
             fi
             sleep 2
           done
@@ -223,9 +246,17 @@ jobs:
             -p 13306:3306 \
             mysql:8.4 \
             --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          # See the "integration" job's MySQL-start step for why this probes
+          # host TCP with full auth + a real query, requiring 3 consecutive
+          # successes, instead of `docker exec ... mysqladmin ping` (#949).
+          consecutive=0
           for i in $(seq 1 60); do
-            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
-              echo "MySQL index is ready."; exit 0
+            if docker run --rm --network host mysql:8.4 \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MySQL index is ready."; exit 0; }
+            else
+              consecutive=0
             fi
             sleep 2
           done
@@ -241,9 +272,17 @@ jobs:
             mariadb:11.4 \
             --log-bin=mariadb-bin --binlog-format=ROW --binlog-row-image=FULL \
             --server-id=2 --gtid-strict-mode=ON
+          # Same socket-vs-TCP readiness race as the MySQL-start steps (#949):
+          # probe host TCP with full auth + a real query, 3 consecutive
+          # successes, instead of `docker exec ... mariadb-admin ping`.
+          consecutive=0
           for i in $(seq 1 60); do
-            if docker exec bintrail-test-mariadb mariadb-admin ping -u root -ptestroot --silent 2>/dev/null; then
-              echo "MariaDB source is ready."; exit 0
+            if docker run --rm --network host mariadb:11.4 \
+                 mariadb --protocol=TCP -h 127.0.0.1 -P 13307 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MariaDB source is ready."; exit 0; }
+            else
+              consecutive=0
             fi
             sleep 2
           done
@@ -308,9 +347,17 @@ jobs:
             -p 13306:3306 \
             mysql:8.4 \
             --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          # See the "integration" job's MySQL-start step for why this probes
+          # host TCP with full auth + a real query, requiring 3 consecutive
+          # successes, instead of `docker exec ... mysqladmin ping` (#949).
+          consecutive=0
           for i in $(seq 1 60); do
-            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
-              echo "MySQL index is ready."; exit 0
+            if docker run --rm --network host mysql:8.4 \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MySQL index is ready."; exit 0; }
+            else
+              consecutive=0
             fi
             sleep 2
           done
@@ -394,9 +441,17 @@ jobs:
             -p 13306:3306 \
             mysql:8.4 \
             --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          # See the "integration" job's MySQL-start step for why this probes
+          # host TCP with full auth + a real query, requiring 3 consecutive
+          # successes, instead of `docker exec ... mysqladmin ping` (#949).
+          consecutive=0
           for i in $(seq 1 60); do
-            if docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent 2>/dev/null; then
-              echo "MySQL is ready."; exit 0
+            if docker run --rm --network host mysql:8.4 \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MySQL is ready."; exit 0; }
+            else
+              consecutive=0
             fi
             sleep 2
           done

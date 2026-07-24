@@ -112,8 +112,21 @@ docker run -d --name bintrail-test-mysql \
   --log-bin=binlog \
   --server-id=1
 
-# Wait for MySQL to be ready
-until docker exec bintrail-test-mysql mysqladmin ping -u root -ptestroot --silent; do sleep 1; done
+# Wait for MySQL to be ready. Probe host TCP (the same path the tests use),
+# not `docker exec ... mysqladmin ping` — that answers over the container's
+# local socket, which can succeed against the mysql image's TEMPORARY
+# first-init server before the real one is listening on the mapped port
+# (see .github/workflows/ci.yml's MySQL-start steps and issue #949).
+consecutive=0
+until [ "$consecutive" -ge 3 ]; do
+  if docker run --rm --network host mysql:8.0 \
+       mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+    consecutive=$((consecutive + 1))
+  else
+    consecutive=0
+  fi
+  sleep 1
+done
 
 # Initialise the index
 bintrail init --index-dsn "root:testroot@tcp(127.0.0.1:13306)/binlog_index"
