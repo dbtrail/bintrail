@@ -38,6 +38,25 @@ const DefaultWriteTimeout = 3 * time.Minute
 // a shared global).
 var WriteTimeout = DefaultWriteTimeout
 
+const (
+	// insertColumnCount is the number of columns (= placeholders per row) in
+	// insertBatch's multi-row INSERT.
+	insertColumnCount = 16
+	// maxPreparedStmtParams is MySQL's hard cap on placeholders in one
+	// prepared statement (ER_PS_MANY_PARAM, error 1390).
+	maxPreparedStmtParams = 65535
+	// MaxBatchSize is the largest batch whose INSERT stays under the
+	// placeholder cap. Derived from insertColumnCount so adding a column to
+	// the INSERT lowers the limit instead of silently re-breaking large
+	// batches (#956).
+	MaxBatchSize = maxPreparedStmtParams / insertColumnCount
+)
+
+// rowPlaceholders is one row's "(?,...,?)" tuple, derived from
+// insertColumnCount so the placeholder count and MaxBatchSize stay in
+// lockstep.
+var rowPlaceholders = "(" + strings.TrimSuffix(strings.Repeat("?,", insertColumnCount), ",") + ")"
+
 // Indexer consumes event.Events from a channel and batch-inserts them into
 // the binlog_events table.
 type Indexer struct {
@@ -65,6 +84,11 @@ type Indexer struct {
 func New(db *sql.DB, batchSize int) *Indexer {
 	if batchSize <= 0 {
 		batchSize = 1000
+	}
+	if batchSize > MaxBatchSize {
+		slog.Warn("batch size exceeds MySQL's prepared-statement placeholder cap, clamping",
+			"requested", batchSize, "max", MaxBatchSize)
+		batchSize = MaxBatchSize
 	}
 	return &Indexer{db: db, batchSize: batchSize}
 }
@@ -142,8 +166,7 @@ func (idx *Indexer) BatchSize() int {
 // event_id and pk_hash are omitted — they are AUTO_INCREMENT and STORED
 // generated respectively, so MySQL computes them on write.
 func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
-	// 16 placeholders per row
-	valClause := strings.TrimRight(strings.Repeat("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?),", len(batch)), ",")
+	valClause := strings.TrimRight(strings.Repeat(rowPlaceholders+",", len(batch)), ",")
 	insertSQL := `INSERT INTO binlog_events ` +
 		`(binlog_file, start_pos, end_pos, event_timestamp, gtid, connection_id, ` +
 		`schema_name, table_name, event_type, pk_values, ` +
@@ -167,7 +190,7 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 	}
 	digests := idx.digestStatements(distinct)
 
-	args := make([]any, 0, len(batch)*16)
+	args := make([]any, 0, len(batch)*insertColumnCount)
 	for i := range batch {
 		ev := &batch[i]
 

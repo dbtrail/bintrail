@@ -31,6 +31,33 @@ func TestNew_customBatchSize(t *testing.T) {
 	}
 }
 
+func TestNew_clampsBatchSizeOverMax(t *testing.T) {
+	idx := New(nil, MaxBatchSize+1)
+	if idx.batchSize != MaxBatchSize {
+		t.Errorf("expected batchSize clamped to %d, got %d", MaxBatchSize, idx.batchSize)
+	}
+}
+
+func TestNew_maxBatchSizeAccepted(t *testing.T) {
+	idx := New(nil, MaxBatchSize)
+	if idx.batchSize != MaxBatchSize {
+		t.Errorf("expected batchSize %d kept as-is, got %d", MaxBatchSize, idx.batchSize)
+	}
+}
+
+func TestMaxBatchSize_derivedFromPlaceholders(t *testing.T) {
+	if got := strings.Count(rowPlaceholders, "?"); got != insertColumnCount {
+		t.Errorf("rowPlaceholders has %d placeholders, want insertColumnCount=%d", got, insertColumnCount)
+	}
+	if MaxBatchSize*insertColumnCount > maxPreparedStmtParams {
+		t.Errorf("MaxBatchSize %d x %d columns exceeds the %d placeholder cap",
+			MaxBatchSize, insertColumnCount, maxPreparedStmtParams)
+	}
+	if (MaxBatchSize+1)*insertColumnCount <= maxPreparedStmtParams {
+		t.Errorf("MaxBatchSize %d is not tight against the %d placeholder cap", MaxBatchSize, maxPreparedStmtParams)
+	}
+}
+
 // ─── marshalRow ──────────────────────────────────────────────────────────────
 
 func TestMarshalRow_nil(t *testing.T) {
