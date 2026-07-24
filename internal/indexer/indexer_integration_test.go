@@ -207,3 +207,30 @@ func TestInsertBatch_oversizedPKValues(t *testing.T) {
 		t.Errorf("expected no rows inserted (whole batch aborted before INSERT), got %d", n)
 	}
 }
+
+func TestInsertBatch_maxBatchSize(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	idx := New(db, MaxBatchSize)
+	ts := time.Date(2026, 2, 19, 12, 0, 0, 0, time.UTC)
+	batch := make([]parser.Event, MaxBatchSize)
+	for i := range batch {
+		batch[i] = parser.Event{
+			BinlogFile: "binlog.000001", StartPos: uint64(i * 100), EndPos: uint64((i + 1) * 100),
+			Timestamp: ts, Schema: "mydb", Table: "orders",
+			EventType: parser.EventInsert, PKValues: string(rune('0' + i%10)),
+			RowAfter: map[string]any{"id": float64(i)},
+		}
+	}
+
+	// The largest allowed batch must fit MySQL's 65535 prepared-statement
+	// placeholder cap in one multi-row INSERT (#956).
+	count, err := idx.InsertBatch(batch)
+	if err != nil {
+		t.Fatalf("InsertBatch at MaxBatchSize (%d rows) failed: %v", MaxBatchSize, err)
+	}
+	if count != int64(MaxBatchSize) {
+		t.Errorf("expected %d rows inserted, got %d", MaxBatchSize, count)
+	}
+}

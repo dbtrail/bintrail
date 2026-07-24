@@ -38,6 +38,12 @@ const DefaultWriteTimeout = 3 * time.Minute
 // a shared global).
 var WriteTimeout = DefaultWriteTimeout
 
+// insertColumnsSQL is the column list of insertBatch's multi-row INSERT.
+// insertColumnCount must equal its column count — pinned by a unit test.
+const insertColumnsSQL = `binlog_file, start_pos, end_pos, event_timestamp, gtid, connection_id, ` +
+	`schema_name, table_name, event_type, pk_values, ` +
+	`changed_columns, row_before, row_after, schema_version, query_text, query_hash`
+
 const (
 	// insertColumnCount is the number of columns (= placeholders per row) in
 	// insertBatch's multi-row INSERT.
@@ -167,10 +173,7 @@ func (idx *Indexer) BatchSize() int {
 // generated respectively, so MySQL computes them on write.
 func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 	valClause := strings.TrimRight(strings.Repeat(rowPlaceholders+",", len(batch)), ",")
-	insertSQL := `INSERT INTO binlog_events ` +
-		`(binlog_file, start_pos, end_pos, event_timestamp, gtid, connection_id, ` +
-		`schema_name, table_name, event_type, pk_values, ` +
-		`changed_columns, row_before, row_after, schema_version, query_text, query_hash) VALUES ` + valClause
+	insertSQL := `INSERT INTO binlog_events (` + insertColumnsSQL + `) VALUES ` + valClause
 
 	// Sanitize each event's captured statement text, then resolve the batch's
 	// DISTINCT texts to STATEMENT_DIGEST hashes in one round trip (#699).

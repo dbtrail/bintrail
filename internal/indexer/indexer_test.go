@@ -46,6 +46,9 @@ func TestNew_maxBatchSizeAccepted(t *testing.T) {
 }
 
 func TestMaxBatchSize_derivedFromPlaceholders(t *testing.T) {
+	if got := strings.Count(insertColumnsSQL, ",") + 1; got != insertColumnCount {
+		t.Errorf("insertColumnsSQL lists %d columns, want insertColumnCount=%d — bump the constant when adding a column", got, insertColumnCount)
+	}
 	if got := strings.Count(rowPlaceholders, "?"); got != insertColumnCount {
 		t.Errorf("rowPlaceholders has %d placeholders, want insertColumnCount=%d", got, insertColumnCount)
 	}
