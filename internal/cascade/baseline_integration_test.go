@@ -24,6 +24,7 @@ type fakeBaseline struct {
 	trunc bool
 	err   error
 	calls int
+	stale string // #618: canned StaleMessage, mirrors reconstruct.StaleWarning.Message
 }
 
 func (f *fakeBaseline) BaselineChildren(_ context.Context, _, _, _, _ string, _ time.Time, _ int) (cascade.BaselineLookup, bool, error) {
@@ -31,7 +32,7 @@ func (f *fakeBaseline) BaselineChildren(_ context.Context, _, _, _, _ string, _ 
 	if f.err != nil {
 		return cascade.BaselineLookup{}, false, f.err
 	}
-	return cascade.BaselineLookup{SnapshotTime: f.snap, Rows: f.rows, Truncated: f.trunc}, f.ok, nil
+	return cascade.BaselineLookup{SnapshotTime: f.snap, Rows: f.rows, Truncated: f.trunc, StaleMessage: f.stale}, f.ok, nil
 }
 
 func cascadeFK(schema string) []cascade.CascadeFK {
@@ -207,6 +208,81 @@ func TestPhase2_noBaselineCoverageFlagged(t *testing.T) {
 	}
 	if res2.Complete() || !strings.Contains(strings.Join(res2.Incomplete, " "), "baseline lookup failed") {
 		t.Errorf("baseline lookup error must flag incompleteness; Incomplete=%v", res2.Incomplete)
+	}
+}
+
+// TestPhase2_staleBaselinePropagatesIncomplete pins #618: a provider that
+// covers the child table but fell back to an older snapshot (StaleMessage
+// non-empty, mirroring reconstruct.StaleWarning.Message on a #466 fallback)
+// must surface that as a "baseline-stale:<schema>.<table>" caveat in
+// Result.Incomplete — the console/CLI reconstruct tabs already surface the
+// identical signal via appendStaleWarning; before this fix the cascade
+// Phase-2 path silently discarded it (a fully covered, non-truncated result
+// reported Complete() even though it read a stale snapshot). A non-stale
+// lookup (empty StaleMessage) must NOT add the caveat. Two parent roots are
+// used to pin the dedup the issue asked for (addIncomplete keyed on
+// "baseline-stale:<schema>.<table>", not per-parent): BaselineChildren is
+// called once per root, but the caveat must appear exactly once.
+func TestPhase2_staleBaselinePropagatesIncomplete(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+	T := time.Now().UTC()
+
+	twoParents := append(parentDelete(dbName, T), query.ResultRow{
+		SchemaName: dbName, TableName: "parent", EventType: 3, /* DELETE */
+		PKValues: "2", RowBefore: map[string]any{"id": json.Number("2")}, EventTimestamp: T,
+	})
+
+	staleMsg := "baseline for " + dbName + ".child is stale: the table is absent from the newest snapshot"
+	stale := &fakeBaseline{
+		ok:    true,
+		snap:  T.Add(-2 * time.Hour),
+		rows:  []cascade.BaselineRow{{PKValues: "10", Row: map[string]any{"id": int64(10), "pid": int64(1), "payload": "keep"}}},
+		stale: staleMsg,
+	}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, cascadeFK(dbName), twoParents,
+		cascade.Options{Baseline: stale})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if stale.calls != 2 {
+		t.Fatalf("BaselineChildren calls = %d, want 2 (one per parent root) for the dedup below to be meaningful", stale.calls)
+	}
+	// The stale-fallback caveat must not suppress the recovered victim itself —
+	// staleness is a transparency signal, not a coverage gap (see the issue's
+	// "why it's not urgent" analysis: no rows are lost, only the advisory).
+	if k := victimKeys(res.Victims); !k["child:10"] {
+		t.Fatalf("stale baseline lookup should still recover child:10, got %v", res.Victims)
+	}
+	if res.Complete() {
+		t.Fatalf("a stale baseline fallback must be reported as Incomplete, got Complete()=true")
+	}
+	count := 0
+	for _, msg := range res.Incomplete {
+		if msg == staleMsg {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("want the stale-baseline caveat deduped to exactly 1 entry despite %d BaselineChildren calls, got %d occurrences in Incomplete=%v",
+			stale.calls, count, res.Incomplete)
+	}
+
+	// A non-stale lookup (empty StaleMessage) must not add the caveat.
+	fresh := &fakeBaseline{
+		ok:   true,
+		snap: T.Add(-2 * time.Hour),
+		rows: []cascade.BaselineRow{{PKValues: "10", Row: map[string]any{"id": int64(10), "pid": int64(1), "payload": "keep"}}},
+	}
+	res2, err := cascade.SynthesizeVictims(context.Background(), eng, cascadeFK(dbName), parentDelete(dbName, T),
+		cascade.Options{Baseline: fresh})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if !res2.Complete() {
+		t.Fatalf("a non-stale, fully-covered baseline cascade should stay Complete; got Incomplete=%v", res2.Incomplete)
 	}
 }
 

@@ -81,6 +81,14 @@ type BaselineLookup struct {
 	// baselines that never recorded a position; callers then fall back to
 	// SnapshotTime alone, same as before #797.
 	SincePos *query.BinlogPos
+	// StaleMessage carries reconstruct.StaleWarning.Message (#466) when the
+	// provider fell back to an older baseline snapshot because the child table
+	// is absent from the newest one (dump-filter change, lost SELECT privilege,
+	// rename). Empty means the snapshot used IS the newest eligible one — not
+	// stale. The engine folds a non-empty StaleMessage into Result.Incomplete
+	// (#618) so the console's reconstruct-tab staleness signal (appendStaleWarning)
+	// has a Phase-2 cascade counterpart instead of being silently dropped.
+	StaleMessage string
 }
 
 // BaselineProvider supplies Phase-2 baseline fallback: the child rows that
@@ -400,6 +408,14 @@ func SynthesizeVictims(
 						baseCovered, baseSnap, baseRows, baseTrunc = true, bl.SnapshotTime, bl.Rows, bl.Truncated
 						since = bl.SnapshotTime
 						baseSincePos = bl.SincePos
+						if bl.StaleMessage != "" {
+							// #618: the reconstruct tab surfaces this exact signal via
+							// appendStaleWarning ("stale_baseline: …"); the cascade
+							// Phase-2 fallback silently used the same stale snapshot
+							// with no caveat until now. Deduped per (schema, table) —
+							// every parent that hits this child reuses the same key.
+							addIncomplete("baseline-stale:"+fk.Schema+"."+fk.Table, bl.StaleMessage)
+						}
 					default:
 						addIncomplete("nobaseline:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
 							"no baseline covers %s.%s; children untouched within the lookback window are not reconstructed", fk.Schema, fk.Table))

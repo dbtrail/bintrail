@@ -37,7 +37,7 @@ type cascadeBaselineProvider struct {
 }
 
 func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, table, fkCol, parentPK string, at time.Time, limit int) (cascade.BaselineLookup, bool, error) {
-	path, snap, _, err := reconstruct.FindBaseline(ctx, p.source, schema, table, at)
+	path, snap, stale, err := reconstruct.FindBaseline(ctx, p.source, schema, table, at)
 	if err != nil {
 		if errors.Is(err, reconstruct.ErrNoBaseline) {
 			return cascade.BaselineLookup{}, false, nil // table not covered → Phase-1 only
@@ -100,7 +100,7 @@ func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, 
 			Row:      r,
 		})
 	}
-	return cascade.BaselineLookup{SnapshotTime: snap, Rows: out, Truncated: trunc, SincePos: sincePos}, true, nil
+	return cascade.BaselineLookup{SnapshotTime: snap, Rows: out, Truncated: trunc, SincePos: sincePos, StaleMessage: stale.Message}, true, nil
 }
 
 func columnDataType(tm *metadata.TableMeta, name string) string {
