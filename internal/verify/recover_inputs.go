@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/status"
 )
 
 // ─── Recover-input verification (#1001) ───────────────────────────────────────
@@ -65,7 +67,9 @@ type RecoverInputsConfig struct {
 // It fetches the window in ASCENDING time order with NO LimitPerPK — every
 // superseded intermediate event is visited, which is precisely the class the
 // content-comparison modes skip. Coverage gaps abort as INCONCLUSIVE (a chain
-// with an interior hole cannot be asserted against), never as a mismatch.
+// with an interior hole cannot be asserted against), never as a mismatch — and
+// so does a permanent loss stamped in stream_state.gap_lost_at, which the
+// partition-existence coverage check upstream cannot see.
 func VerifyRecoverInputs(ctx context.Context, cfg RecoverInputsConfig, schema, table string) (TableResult, error) {
 	res := TableResult{Schema: schema, Table: table}
 
@@ -86,6 +90,24 @@ func VerifyRecoverInputs(ctx context.Context, cfg RecoverInputsConfig, schema, t
 	// without the index database name.
 	if cfg.IndexDBName == "" {
 		return inconclusive(res, "index database name unavailable; coverage-gap detection cannot run, and an undetected gap would read as a false mismatch"), nil
+	}
+
+	// The coverage-gap guard below (query.FetchMerged's strict-mode GapError) is
+	// PARTITION-EXISTENCE based: query.buildPlan marks an hour covered iff a
+	// p_YYYYMMDDHH partition exists, never whether that partition received the
+	// events. A hole INSIDE a live partition is therefore invisible to it, and
+	// once the chain is walked a hole is indistinguishable from a corrupt
+	// before-image. stream_state.gap_lost_at (#765) is the one durable record of
+	// events this index KNOWS it lost permanently, so consult it before
+	// asserting anything — and treat an index that cannot answer as unknown,
+	// never as "no gap".
+	switch verdict, why := captureGapInWindow(ctx, cfg.IndexDB, cfg.Since, cfg.Until); verdict {
+	case captureGapStamped:
+		return inconclusive(res, "the index permanently lost events inside this window ("+why+
+			"); the chains here have a hole that no stored image can be asserted across"), nil
+	case captureGapUnknown:
+		return inconclusive(res, "the capture-continuity record could not be evaluated ("+why+
+			"), so a permanent loss inside the window could not be ruled out and would read as a false mismatch"), nil
 	}
 
 	maxEvents := cfg.MaxEvents
@@ -180,6 +202,72 @@ func recoverInputsFetchOptions(schema, table string, since, until time.Time, max
 	}
 }
 
+// ─── Stamped capture gaps ─────────────────────────────────────────────────────
+
+// captureGapVerdict is what stream_state can say about events this index lost
+// PERMANENTLY (not merely rotated out of MySQL — those are recoverable from an
+// archive and are what query.GapError covers) inside the walk window.
+type captureGapVerdict int
+
+const (
+	// captureGapNoneStamped: the record was readable and holds no permanent
+	// loss inside the window. NOTE this is NOT proof the window is whole — the
+	// common hole shapes (a table skipped after an un-re-snapshotted ALTER, a
+	// mid-history --tables/--schemas filter change, a `stream --reset`, a
+	// daemon outage shorter than the pre-created partition horizon) stamp
+	// nothing at all. That is why the mismatch detail this mode emits must
+	// never assert corruption as the cause.
+	captureGapNoneStamped captureGapVerdict = iota
+	// captureGapStamped: a permanent loss is recorded inside the window.
+	captureGapStamped
+	// captureGapUnknown: the record could not be evaluated (a legacy index
+	// predating the gap_lost_* columns, or an unreadable stream_state). Unknown
+	// is NOT "no gap".
+	captureGapUnknown
+)
+
+// captureGapInWindow consults stream_state's permanent-loss stamp for the walk
+// window. The classification is split out (classifyCaptureGap) so the boundary
+// and legacy-index rules are testable without a database.
+func captureGapInWindow(ctx context.Context, db *sql.DB, since, until time.Time) (captureGapVerdict, string) {
+	ss, err := status.LoadStreamState(ctx, db)
+	return classifyCaptureGap(ss, err, since, until)
+}
+
+// classifyCaptureGap is the pure half of captureGapInWindow.
+func classifyCaptureGap(ss *status.StreamStateInfo, loadErr error, since, until time.Time) (captureGapVerdict, string) {
+	switch {
+	case loadErr != nil:
+		// A read failure leaves the loss record unknown. Failing the table
+		// closed (inconclusive) rather than walking on is the same fail-safe
+		// choice the missing-IndexDBName branch makes.
+		return captureGapUnknown, fmt.Sprintf("stream_state could not be read: %v", loadErr)
+	case ss == nil:
+		// No stream_state row at all: no streaming daemon ever checkpointed
+		// against this index (a file-mode `bintrail index`), so there is no
+		// stamped loss to find. That is knowledge, unlike a legacy index whose
+		// record exists but cannot be read.
+		return captureGapNoneStamped, ""
+	case !ss.GapColumnsPresent:
+		return captureGapUnknown, "this index predates the stream_state.gap_lost_at/gap_lost_detail columns, so a recorded permanent loss cannot be ruled out"
+	case !ss.GapLostAt.Valid:
+		return captureGapNoneStamped, ""
+	}
+
+	at := ss.GapLostAt.Time
+	// Inclusive on BOTH ends, unlike reconstruct.gapInWindow's (since, until]:
+	// a loss stamped exactly at Since still means the events at the window's
+	// oldest edge are gone, and this gate is fail-safe by construction.
+	if at.Before(since) || at.After(until) {
+		return captureGapNoneStamped, ""
+	}
+	msg := fmt.Sprintf("stream_state.gap_lost_at is stamped %s, inside the walk window", at.UTC().Format(time.RFC3339))
+	if d := strings.TrimSpace(ss.GapLostDetail.String); d != "" {
+		msg += ": " + d
+	}
+	return captureGapStamped, msg
+}
+
 // dropSnapshotRows filters out EventSnapshot rows in place-ish (a fresh slice
 // is only allocated when at least one is present, the overwhelmingly common
 // case being none).
@@ -234,6 +322,10 @@ type recoverChainOutcome struct {
 	// Assertions is how many before-image comparisons were actually made:
 	// the real measure of what this run proved.
 	Assertions int
+	// UnwalkableEvents counts events that carry no primary key (drift rows,
+	// see the PKValues=="" guard in checkRecoverChains). They belong to no
+	// chain and are counted as unproven, never folded together.
+	UnwalkableEvents int
 }
 
 // chainState is one PK's reconstructed state between events.
@@ -285,6 +377,20 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 
 	for i := range in.Events {
 		ev := &in.Events[i]
+
+		// A row with an EMPTY pk_values is a DRIFT row: the indexer's defensive
+		// scan of NULL pk_values (#318) delivers those as "". They carry no
+		// chain identity, so keying them by pk_values would fold every
+		// unrelated drift row in the table into ONE chain and compare one row's
+		// row_before against another row's row_after — a guaranteed MISMATCH on
+		// any index that merely CONTAINS drift rows. internal/query/merge.go's
+		// LimitPerPK already gives each its own \x00drift:<event_id> bucket for
+		// exactly this reason; here the honest answer is that they are
+		// unwalkable, so they are skipped and counted as unproven.
+		if ev.PKValues == "" {
+			out.UnwalkableEvents++
+			continue
+		}
 
 		st, seen := states[ev.PKValues]
 		if !seen {
@@ -372,6 +478,20 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 // recoverChainVerdict collapses the walk's findings into a status + detail. Kept
 // separate (and pure) so the precedence between "found something wrong" and
 // "could not check everything" is stated in exactly one place.
+//
+// The rule for PARTIAL coverage is deliberate and documented in docs/verify.md:
+// a table is proven as soon as ONE before-image comparison was conclusive, and
+// everything that stayed unproven is carried as a NOTE on that verdict rather
+// than erasing it. A chain beginning mid-history, a value whose representation
+// could not be normalized, and a drift row with no primary key are all "this
+// part could not be checked" — none of them is evidence against the parts that
+// WERE checked, and collapsing the whole table on one of them would turn a
+// single unresolvable JSON value into a permanently red CI gate over an index
+// with hundreds of thousands of clean assertions.
+//
+// Truncation is the one exception that still collapses the table: there the
+// unchecked part is not a handful of values but the entire TAIL of the window,
+// which was never loaded at all.
 func recoverChainVerdict(out recoverChainOutcome, mismatches []string, unresolved int, firstUnresolved string, truncated bool) (Status, string) {
 	scope := fmt.Sprintf("%d event(s), %d chain(s), %d before-image assertion(s)", out.Events, out.Chains, out.Assertions)
 
@@ -387,15 +507,28 @@ func recoverChainVerdict(out recoverChainOutcome, mismatches []string, unresolve
 	if truncated {
 		return StatusInconclusive, fmt.Sprintf("checked %s with no inconsistency, but the window exceeded the event budget and only its oldest events were walked; narrow --since/--lookback or raise --max-events to verify it whole", scope)
 	}
-	if unresolved > 0 {
-		return StatusInconclusive, fmt.Sprintf("checked %s; %d before-image comparison(s) were not conclusive because a value's representation could not be normalized: %s", scope, unresolved, firstUnresolved)
+
+	var notes []string
+	if out.ChainsNoPredecessor > 0 {
+		notes = append(notes, fmt.Sprintf("%d chain(s) began mid-history and were not asserted", out.ChainsNoPredecessor))
 	}
+	if unresolved > 0 {
+		notes = append(notes, fmt.Sprintf("%d before-image comparison(s) were not conclusive because a value's representation could not be normalized: %s", unresolved, firstUnresolved))
+	}
+	if out.UnwalkableEvents > 0 {
+		notes = append(notes, fmt.Sprintf("%d event(s) carry no primary key (drift rows) and belong to no chain, so they were not walked", out.UnwalkableEvents))
+	}
+
 	if out.Assertions == 0 {
-		return StatusInconclusive, fmt.Sprintf("walked %s: no chain had a verifiable predecessor state in this window (every chain begins mid-history), so nothing was proven", scope)
+		detail := fmt.Sprintf("walked %s: nothing was proven — no before-image comparison in this window was conclusive", scope)
+		if len(notes) > 0 {
+			detail += "; " + strings.Join(notes, "; ")
+		}
+		return StatusInconclusive, detail
 	}
 	detail := fmt.Sprintf("checked %s", scope)
-	if out.ChainsNoPredecessor > 0 {
-		detail += fmt.Sprintf("; %d chain(s) began mid-history and were not asserted", out.ChainsNoPredecessor)
+	if len(notes) > 0 {
+		detail += "; " + strings.Join(notes, "; ")
 	}
 	return StatusMatch, detail
 }
@@ -426,8 +559,8 @@ func assertBeforeImage(ev *query.ResultRow, st *chainState, in recoverChainInput
 		// event carries a before-image for it. That is the chaining
 		// assertion failing in its starkest form: recover would re-INSERT or
 		// reverse-UPDATE a row the chain says did not exist.
-		return chainMismatch, fmt.Sprintf("event %d (pk=%s, %s): row_before is present but the chain established this row was deleted by an earlier event; recover would reverse it against state that does not exist",
-			ev.EventID, ev.PKValues, eventTypeLabel(ev.EventType))
+		return chainMismatch, fmt.Sprintf("event %d (pk=%s, %s): row_before is present but the chain established this row was deleted by an earlier event — either the re-INSERT in between was never captured, or the images are inconsistent; %s",
+			ev.EventID, ev.PKValues, eventTypeLabel(ev.EventType), chainBreakGuidance)
 	}
 	equal, unresolvedCol, diffCol := compareImages(st.row, ev.RowBefore, st.schemaVersion, ev.SchemaVersion, in)
 	switch {
@@ -437,10 +570,27 @@ func assertBeforeImage(ev *query.ResultRow, st *chainState, in recoverChainInput
 		return chainUnresolved, fmt.Sprintf("event %d (pk=%s) column %q holds an ENUM/SET, JSON, binary, BIT or spatial value whose representation could not be normalized",
 			ev.EventID, ev.PKValues, unresolvedCol)
 	default:
-		return chainMismatch, fmt.Sprintf("event %d (pk=%s, %s): row_before does not match the state the previous event on this primary key left (column %s); recover would generate reversal SQL from a stale or corrupt before-image",
-			ev.EventID, ev.PKValues, eventTypeLabel(ev.EventType), diffCol)
+		return chainMismatch, fmt.Sprintf("event %d (pk=%s, %s): row_before does not match the state the previous event on this primary key left (column %s) — either the events in between were never captured, or the stored before-image is stale or corrupt; %s",
+			ev.EventID, ev.PKValues, eventTypeLabel(ev.EventType), diffCol, chainBreakGuidance)
 	}
 }
+
+// chainBreakGuidance is the tail every chain-break finding carries.
+//
+// The walk sees a break in the chain; it CANNOT see why. A missing-events hole
+// and a corrupt image produce byte-identical evidence, and a hole is at least as
+// likely: the partition-existence coverage check upstream cannot see one that
+// falls INSIDE a live partition, which is what every common hole shape looks
+// like — a table whose events the indexer skipped after an ALTER with no
+// re-snapshot ("Column count mismatch: indexer logs warning and skips table's
+// events"), a mid-history --tables/--schemas filter change, a `stream --reset`,
+// or a daemon outage shorter than the pre-created future-partition horizon. An
+// earlier version of this string asserted "stale or corrupt before-image" as the
+// cause, which ruled out the more likely explanation and sent operators hunting
+// for corruption that was not there.
+const chainBreakGuidance = "recover would build reversal SQL from a before-image the chain cannot confirm. " +
+	"To tell the two apart: check `bintrail status` continuity and the indexer/stream logs for skipped tables, " +
+	"filter changes, resets or downtime covering this window, and compare against the source's own binlog history"
 
 // compareImages reports whether two event images hold the same data.
 //

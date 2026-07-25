@@ -1,7 +1,9 @@
 package verify
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/status"
 )
 
 // ─── fixtures ─────────────────────────────────────────────────────────────────
@@ -520,6 +523,224 @@ func TestDropSnapshotRows(t *testing.T) {
 	clean := rows[:1]
 	if len(dropSnapshotRows(clean)) != 1 {
 		t.Error("a snapshot-free slice must pass through unchanged")
+	}
+}
+
+// ─── capture gaps: a hole is not corruption ──────────────────────────────────
+
+// The gate that keeps a PERMANENT capture loss from reading as a corrupt
+// before-image. The partition-existence coverage check upstream cannot see a
+// hole inside a partition that exists, so stream_state's stamp is the only
+// durable record — and an index that cannot answer must read as UNKNOWN, never
+// as "no gap".
+func TestClassifyCaptureGap(t *testing.T) {
+	since := riBase
+	until := riBase.Add(2 * time.Hour)
+	stamped := func(at time.Time, colsPresent bool) *status.StreamStateInfo {
+		return &status.StreamStateInfo{
+			GapColumnsPresent: colsPresent,
+			GapLostAt:         sql.NullTime{Time: at, Valid: true},
+			GapLostDetail:     sql.NullString{String: "unfillable binlog gap; auto-advanced", Valid: true},
+		}
+	}
+	tests := []struct {
+		name      string
+		ss        *status.StreamStateInfo
+		loadErr   error
+		want      captureGapVerdict
+		wantWhy   string // substring, "" = don't care
+		wantNoWhy bool
+	}{
+		{name: "no stream_state row at all (file-mode index): nothing was ever stamped",
+			ss: nil, want: captureGapNoneStamped, wantNoWhy: true},
+		{name: "unreadable stream_state is unknown, not ok",
+			loadErr: errors.New("boom"), want: captureGapUnknown, wantWhy: "could not be read"},
+		{name: "legacy index without the gap columns cannot conclude no gap",
+			ss: &status.StreamStateInfo{GapColumnsPresent: false}, want: captureGapUnknown, wantWhy: "predates"},
+		{name: "migrated index with no stamp",
+			ss: &status.StreamStateInfo{GapColumnsPresent: true}, want: captureGapNoneStamped, wantNoWhy: true},
+		{name: "stamped inside the window",
+			ss: stamped(since.Add(time.Hour), true), want: captureGapStamped, wantWhy: "gap_lost_at is stamped"},
+		{name: "stamped detail is carried through",
+			ss: stamped(since.Add(time.Hour), true), want: captureGapStamped, wantWhy: "auto-advanced"},
+		{name: "stamped before the window is out of scope",
+			ss: stamped(since.Add(-time.Second), true), want: captureGapNoneStamped, wantNoWhy: true},
+		{name: "stamped after the window is out of scope",
+			ss: stamped(until.Add(time.Second), true), want: captureGapNoneStamped, wantNoWhy: true},
+		{name: "stamped exactly at Since is in scope (both ends inclusive)",
+			ss: stamped(since, true), want: captureGapStamped, wantWhy: "gap_lost_at is stamped"},
+		{name: "stamped exactly at Until is in scope",
+			ss: stamped(until, true), want: captureGapStamped, wantWhy: "gap_lost_at is stamped"},
+		// A legacy index that somehow carries a stamp still reads as unknown:
+		// GapColumnsPresent=false means the columns were never READ, so the
+		// zero-valued fields say nothing.
+		{name: "legacy index wins over an unread stamp",
+			ss:   &status.StreamStateInfo{GapColumnsPresent: false, GapLostAt: sql.NullTime{Time: since.Add(time.Hour), Valid: true}},
+			want: captureGapUnknown, wantWhy: "predates"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, why := classifyCaptureGap(tc.ss, tc.loadErr, since, until)
+			if got != tc.want {
+				t.Fatalf("verdict = %d, want %d (why=%q)", got, tc.want, why)
+			}
+			if tc.wantWhy != "" && !strings.Contains(why, tc.wantWhy) {
+				t.Errorf("reason %q should contain %q", why, tc.wantWhy)
+			}
+			if tc.wantNoWhy && why != "" {
+				t.Errorf("a no-gap verdict must carry no reason, got %q", why)
+			}
+		})
+	}
+}
+
+// The detail a chain break emits must NOT assert corruption as the cause.
+//
+// A hole in capture and a corrupt image produce byte-identical evidence, and a
+// hole is at least as likely: the coverage check upstream is partition-existence
+// based, so every hole that falls inside a live partition (a table skipped after
+// an un-re-snapshotted ALTER, a --tables filter change, `stream --reset`, a
+// short outage) is invisible to it. This project has a real instance on record —
+// a 10-hour capture gap where 301 deletes and 37 inserts were lost and every
+// stored image was intact. Naming only "stale or corrupt" would rule out the
+// true cause and send the operator hunting for corruption that is not there.
+func TestCheckRecoverChains_ChainBreakDetailDoesNotAssertCorruption(t *testing.T) {
+	// A chain with a HOLE: the updates that took qty 1 → 99 were never captured.
+	// The images are perfectly intact; only the events between them are missing.
+	holed := checkRecoverChains(riInput([]query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, riRow(7, "widget", 1)),
+		riEvent(2, event.EventUpdate, "7", riRow(7, "widget", 99), riRow(7, "widget", 100)),
+	}))
+	// A DELETE against a key the chain says is gone: the re-INSERT went missing.
+	deleted := checkRecoverChains(riInput([]query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, riRow(7, "widget", 1)),
+		riEvent(2, event.EventDelete, "7", riRow(7, "widget", 1), nil),
+		riEvent(3, event.EventDelete, "7", riRow(7, "widget", 2), nil),
+	}))
+
+	for _, tc := range []struct{ name, detail string }{
+		{"before-image break", holed.Detail},
+		{"event after a delete", deleted.Detail},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !strings.Contains(tc.detail, "never captured") {
+				t.Errorf("detail must name the missing-events explanation, got: %s", tc.detail)
+			}
+			// The old wording asserted the cause outright.
+			if strings.Contains(tc.detail, "from a stale or corrupt before-image") {
+				t.Errorf("detail must not assert corruption as THE cause, got: %s", tc.detail)
+			}
+			if !strings.Contains(tc.detail, "bintrail status") {
+				t.Errorf("detail must point at what would distinguish the two, got: %s", tc.detail)
+			}
+		})
+	}
+}
+
+// ─── drift rows ──────────────────────────────────────────────────────────────
+
+// Drift rows (pk_values NULL in the index, delivered as "" — #318) carry no
+// chain identity. Keying them by pk_values folds every unrelated one into a
+// single chain and compares one row's row_before against another's row_after —
+// a guaranteed MISMATCH on any index that merely CONTAINS drift rows.
+// internal/query/merge.go's LimitPerPK already buckets them per event for the
+// same reason.
+func TestCheckRecoverChains_DriftRowsAreNotFoldedIntoOneChain(t *testing.T) {
+	out := checkRecoverChains(riInput([]query.ResultRow{
+		// Two unrelated drift rows. Under a shared "" chain, event 2's
+		// row_before (name="b") would be compared against event 1's row_after
+		// (name="a") and reported as a divergence.
+		riEvent(1, event.EventUpdate, "", riRow(1, "a", 1), riRow(1, "a", 2)),
+		riEvent(2, event.EventUpdate, "", riRow(2, "b", 1), riRow(2, "b", 2)),
+		riEvent(3, event.EventDelete, "", riRow(3, "c", 1), nil),
+	}))
+
+	if out.Status == StatusMismatch {
+		t.Fatalf("drift rows must never manufacture a mismatch: %s", out.Detail)
+	}
+	if out.Chains != 0 {
+		t.Errorf("a drift row belongs to no chain, got %d chain(s)", out.Chains)
+	}
+	if out.Assertions != 0 {
+		t.Errorf("nothing can be asserted about a drift row, got %d assertion(s)", out.Assertions)
+	}
+	if out.UnwalkableEvents != 3 {
+		t.Errorf("want 3 unwalkable drift events, got %d", out.UnwalkableEvents)
+	}
+	if out.Status != StatusInconclusive {
+		t.Fatalf("a table with only drift rows proves nothing: got %s (%s)", out.Status, out.Detail)
+	}
+	if !strings.Contains(out.Detail, "no primary key") {
+		t.Errorf("detail should explain drift rows were not walked, got: %s", out.Detail)
+	}
+}
+
+// Drift rows must not contaminate the real chains either: a clean keyed chain
+// alongside them still proves the table.
+func TestCheckRecoverChains_DriftRowsDoNotContaminateRealChains(t *testing.T) {
+	out := checkRecoverChains(riInput([]query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, riRow(7, "widget", 1)),
+		riEvent(2, event.EventUpdate, "", riRow(1, "a", 1), riRow(1, "a", 2)),
+		riEvent(3, event.EventUpdate, "7", riRow(7, "widget", 1), riRow(7, "widget", 5)),
+	}))
+	if out.Status != StatusMatch {
+		t.Fatalf("a clean chain beside a drift row must still pass: got %s (%s)", out.Status, out.Detail)
+	}
+	if out.Chains != 1 || out.Assertions != 1 || out.UnwalkableEvents != 1 {
+		t.Errorf("want 1 chain / 1 assertion / 1 unwalkable, got %d / %d / %d",
+			out.Chains, out.Assertions, out.UnwalkableEvents)
+	}
+}
+
+// ─── proportionate verdicts ──────────────────────────────────────────────────
+
+// One value whose representation could not be normalized must not erase the
+// conclusive assertions made on the SAME table. deferredValueUnresolved's json
+// case rejects any document holding a numeric literal, so collapsing the table
+// on the first one turns a clean index into a permanently red CI gate.
+func TestCheckRecoverChains_UnresolvedValueDoesNotEraseConclusiveAssertions(t *testing.T) {
+	events := []query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, riDeferredRow(7, "hello", "raw", "new")),
+		riEvent(2, event.EventUpdate, "7",
+			riDeferredRow(7, "hello", "raw", "new"),
+			riDeferredRow(7, "second", "raw", "new")),
+		riEvent(3, event.EventUpdate, "7",
+			riDeferredRow(7, "second", "raw", "new"),
+			riDeferredRow(7, "third", "raw", "new")),
+		// One unresolvable ENUM representation among otherwise clean events.
+		riEvent(4, event.EventUpdate, "7",
+			map[string]any{"id": json.Number("7"), "body": "third", "blob_col": "raw", "state": json.Number("1")},
+			riDeferredRow(7, "fourth", "raw", "done")),
+	}
+	out := checkRecoverChains(riDeferredInput(events))
+
+	if out.Status != StatusMatch {
+		t.Fatalf("2 conclusive assertions must survive 1 unresolvable value: got %s (%s)", out.Status, out.Detail)
+	}
+	if out.Assertions != 2 {
+		t.Errorf("want 2 conclusive assertions, got %d", out.Assertions)
+	}
+	// The unproven part is still reported — it is a note on the verdict, not a
+	// silent omission.
+	if !strings.Contains(out.Detail, "not conclusive") {
+		t.Errorf("the unresolved comparison must still be reported, got: %s", out.Detail)
+	}
+}
+
+// The flip side of the rule above: a table where NOTHING was conclusive is
+// still inconclusive, and still says why.
+func TestCheckRecoverChains_OnlyUnresolvedValuesStaysInconclusive(t *testing.T) {
+	out := checkRecoverChains(riDeferredInput([]query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, riDeferredRow(7, "hello", "raw", "new")),
+		riEvent(2, event.EventUpdate, "7",
+			map[string]any{"id": json.Number("7"), "body": "hello", "blob_col": "raw", "state": json.Number("1")},
+			riDeferredRow(7, "hello", "raw", "done")),
+	}))
+	if out.Status != StatusInconclusive {
+		t.Fatalf("got %s (%s), want %s", out.Status, out.Detail, StatusInconclusive)
+	}
+	if !strings.Contains(out.Detail, "nothing was proven") || !strings.Contains(out.Detail, "not conclusive") {
+		t.Errorf("detail should say nothing was proven AND why, got: %s", out.Detail)
 	}
 }
 

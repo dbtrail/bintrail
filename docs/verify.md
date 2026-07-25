@@ -139,12 +139,54 @@ that is the normal case for any retention window, not corruption. Later events
 on the same key *are* asserted, so a table is still proven as long as at least
 one comparison was made; a table where *none* was reports `inconclusive`.
 
-Two other conditions also report `inconclusive` rather than risk a false alarm:
-a **coverage gap** in the window (a chain with an interior hole cannot be
-asserted against), and a window that **exceeded `--max-events`** — only its
-oldest events were walked, so a clean result would be a partial check. A
-mismatch found inside a truncated window *is* still conclusive: the events that
-were walked are real.
+Three other conditions also report `inconclusive` rather than risk a false alarm:
+
+- a **coverage gap** in the window (a chain with an interior hole cannot be
+  asserted against);
+- a **recorded permanent loss** inside the window — `bintrail status` shows it
+  as `GAP LOST`, and it is stamped in `stream_state.gap_lost_at`. Those events
+  are gone from live MySQL *and* from every archive, so the chains that cross
+  the loss have a hole nothing can be asserted across. An index whose
+  continuity record cannot be read at all (one predating those columns) reports
+  `inconclusive` for the same reason: *unknown* is not *no gap*;
+- a window that **exceeded `--max-events`** — only its oldest events were
+  walked, so a clean result would be a partial check. A mismatch found inside a
+  truncated window *is* still conclusive: the events that were walked are real.
+
+**A chain break tells you the chain broke, not why.** A `mismatch` here means
+`row_before` did not match the state the previous event on that key left. Two
+explanations produce byte-identical evidence, and the check cannot choose
+between them:
+
+1. **The events in between were never captured.** Coverage detection is
+   *partition-existence* based, so a hole *inside* an hour whose partition
+   exists is invisible to it — an `ALTER` without a re-`snapshot` (the indexer
+   logs a column-count warning and *skips that table's events*), a mid-history
+   `--tables`/`--schemas` filter change, a `stream --reset`, or an outage
+   shorter than the pre-created partition horizon.
+2. **The stored before-image is stale or corrupt.**
+
+To tell them apart, check `bintrail status` continuity and the indexer/stream
+logs for skipped tables, filter changes, resets or downtime covering the
+window, and compare against the source's own binlog history. Do not start from
+the assumption that the images are corrupt — a capture hole is at least as
+likely.
+
+**Partial coverage annotates a verdict, it does not erase it.** A table is
+proven as soon as *one* before-image comparison was conclusive; everything that
+stayed unproven is carried as a note on that verdict (visible in `reason`)
+rather than collapsing the table:
+
+| Not checked | Effect |
+|---|---|
+| chains beginning mid-history | noted |
+| a value whose representation could not be normalized (an unmapped `ENUM` ordinal, a JSON document the event image cannot render faithfully) | noted |
+| **drift rows** — events the index holds with no primary key (`pk_values` NULL) | noted; they belong to no chain and are never walked |
+| the entire tail of the window (`--max-events` exceeded) | **collapses** the table to `inconclusive` |
+
+Only a table where *nothing* was conclusive reports `inconclusive`. This
+matters for CI: one unresolvable JSON value in a 200,000-event window used to
+discard every clean assertion beside it and fail the gate on a healthy index.
 
 > **The `30d` default assumes your window is actually covered.** If partitions
 > older than your retention were rotated out of MySQL and never archived to
@@ -168,7 +210,8 @@ Results are **per table**, one of:
 - **inconclusive** — verify could not prove the table either way, and this is
   **never reported as a failure**. Causes include: no predecessor baseline yet,
   the index is behind the baseline anchor, an unsupported primary key, a coverage
-  gap, a digest-contract skew between a pre-pin baseline and the current scan
+  gap, a recorded permanent loss (`gap_lost_at`) inside the window, a
+  digest-contract skew between a pre-pin baseline and the current scan
   (regenerate the baseline — see below), or a value class this version cannot yet
   compare.
 
