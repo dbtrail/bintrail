@@ -118,12 +118,12 @@ func TestMergeBaseline_passthroughOnly(t *testing.T) {
 // test (TestSnapshotFullTableImages_unresolvedToastMarker below) — its map is
 // built by a different caller and still carries before-images.
 func TestFoldPage_unresolvedToastMarker(t *testing.T) {
-	changes := make(map[string]*query.ResultRow)
+	res := &foldResult{Changes: map[string]*query.ResultRow{}}
 	err := foldPage([]query.ResultRow{{
 		EventType:  event.EventUpdate,
 		SchemaName: "mydb", TableName: "orders", PKValues: pkStrForInt(2),
 		RowAfter: map[string]any{"id": "2", "status": toastMarker()},
-	}}, "mydb", "orders", pkColsIntID(), changes)
+	}}, "mydb", "orders", pkColsIntID(), res)
 	if err == nil {
 		t.Fatal("expected a loud error for a marker-carrying change")
 	}
@@ -132,8 +132,8 @@ func TestFoldPage_unresolvedToastMarker(t *testing.T) {
 			t.Errorf("error missing %q:\n%s", want, err)
 		}
 	}
-	if len(changes) != 0 {
-		t.Errorf("a refused event must not be folded into the change map, got %d entries", len(changes))
+	if len(res.Changes) != 0 {
+		t.Errorf("a refused event must not be folded into the change map, got %d entries", len(res.Changes))
 	}
 }
 

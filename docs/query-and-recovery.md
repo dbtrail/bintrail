@@ -193,7 +193,7 @@ They are now walked in pages ([#1097](https://github.com/dbtrail/dbtrail/issues/
 re-fetches of a given hour's file ≈ events in that hour ÷ --fetch-batch-size
 ```
 
-At the default `100000`, an hour holding 100k events costs ~1 fetch (no amplification); an hour holding 1M events costs ~10. DuckDB's row-group statistics prune the *scan*, not the *download*. If your busiest hours are far above the batch size and the window is mostly archived, raise `--fetch-batch-size` toward your peak hourly event count — memory permitting — before reaching for anything else.
+At the default `100000`, an hour holding 100k events costs ~1 fetch (no amplification); an hour holding 1M events costs ~10. **Budget about double that**: file pruning keeps a file when its hour *ends* at-or-after the bound, so the hour before the cursor is re-fetched alongside the current one and yields nothing. DuckDB's row-group statistics prune the *scan*, not the *download*. If your busiest hours are far above the batch size and the window is mostly archived, raise `--fetch-batch-size` toward your peak hourly event count — memory permitting — before reaching for anything else.
 
 **What this does not bound.** The change map holds one entry per **distinct row touched** in the window, and paging the fetch does not shrink it: the merge scans the baseline once and needs each row's final image at the moment it reaches that row. A window touching tens of millions of distinct rows is still dominated by the map. That half is tracked separately in [#1107](https://github.com/dbtrail/dbtrail/issues/1107). Narrowing the window — a fresher baseline, an earlier `--at`, or fewer `--tables` per run — is what reduces it today.
 

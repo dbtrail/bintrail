@@ -97,6 +97,12 @@ func DecodeEventBinaries(db *sql.DB, schema, table string, events []query.Result
 // functions above wrap a throwaway instance, preserving their contract for
 // callers that fetch in a single call (verify, single-row reconstruct, the
 // console).
+//
+// NOT SAFE FOR CONCURRENT USE — one decoder per table run. This matters because
+// the surrounding machinery is concurrent: ReconstructTables runs up to
+// --parallelism table goroutines. It is safe today because each goroutine's
+// foldEventWindow constructs its own decoder and never shares it, and the page
+// callback runs sequentially on that goroutine.
 type eventDecoder struct {
 	db      *sql.DB
 	schema  string

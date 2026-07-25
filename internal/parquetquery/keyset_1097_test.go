@@ -82,10 +82,25 @@ func TestSinceLowerBoundHint_cursorNeverOverridesSincePosMargin(t *testing.T) {
 	}
 
 	// A cursor still inside the margin must not pull the floor forward past it.
+	// 05:30 floors to 05:00, i.e. exactly the widened bound — so this pins that
+	// the margin is not LOST, and nothing more.
 	inside := time.Date(2026, 7, 25, 5, 30, 0, 0, time.UTC)
 	opts.AfterEvent = &query.EventCursor{Timestamp: inside, EventID: 1}
 	if got := sinceLowerBoundHint(opts); got == nil || !got.Equal(widened) {
 		t.Errorf("a cursor inside the #797 margin must not tighten the floor: got %v, want %v", got, widened)
+	}
+
+	// The case that actually discriminates: once the sweep has moved PAST the
+	// margin, the cursor must win. Correct because every unreturned row sorts
+	// at-or-after the cursor, so no row the margin was protecting is still
+	// pending. A "fix" that made the SincePos margin unconditionally win would
+	// keep re-listing the whole window on every page and would pass the
+	// assertion above — this one catches it.
+	beyond := time.Date(2026, 7, 25, 6, 15, 0, 0, time.UTC)
+	beyondHour := time.Date(2026, 7, 25, 6, 0, 0, 0, time.UTC)
+	opts.AfterEvent = &query.EventCursor{Timestamp: beyond, EventID: 9}
+	if got := sinceLowerBoundHint(opts); got == nil || !got.Equal(beyondHour) {
+		t.Errorf("a cursor past the #797 margin must tighten the floor: got %v, want %v", got, beyondHour)
 	}
 }
 

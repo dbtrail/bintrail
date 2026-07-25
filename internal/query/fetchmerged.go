@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 )
 
@@ -168,7 +169,7 @@ func FetchMerged(
 	if err != nil {
 		return nil, src.plan, err
 	}
-	rows, _, err := fetchPage(ctx, engine, o, src)
+	rows, _, _, err := fetchPage(ctx, engine, o, src)
 	if err != nil {
 		return nil, src.plan, err
 	}
@@ -194,10 +195,10 @@ const DefaultStreamBatchSize = 100_000
 // and archive file scoping advances with the cursor (see
 // parquetquery.sinceLowerBoundHint) rather than re-listing the whole window.
 //
-// The page handed to fn is only valid for the duration of the call: the next
-// page reuses nothing, but callers that retain individual rows past their page
-// must copy them, because holding a *ResultRow into the page's backing array
-// pins the ENTIRE page in memory — which would defeat the point of paging.
+// Rows in the page stay valid indefinitely — nothing is reused between pages —
+// but retaining one pins the ENTIRE page's backing array for as long as the
+// reference lives, which defeats the point of paging. Callers that keep rows
+// past their page must copy out the fields they need.
 //
 // fn returning an error stops the walk and propagates that error unchanged.
 //
@@ -240,13 +241,46 @@ func FetchMergedStream(
 	pageOpts.Opts.Limit = batchSize
 	var cursor *EventCursor
 
+	var skippedAll []string
+
 	for {
 		pageOpts.Opts.AfterEvent = cursor
-		rows, skipped, err := fetchPage(ctx, engine, pageOpts, src)
+		rows, skipped, exhausted, err := fetchPage(ctx, engine, pageOpts, src)
 		if err != nil {
 			return src.plan, err
 		}
+		// Retire the sources that came back empty BEFORE deciding whether to
+		// stop. A source behind the cursor answers every later page with the
+		// same empty result, so re-querying it is pure cost — and on S3 an
+		// empty date-scoped listing also triggers a full-prefix stale-
+		// registration probe plus its warning (#383), once per page.
+		if len(exhausted) > 0 {
+			src.archSources = withoutSources(src.archSources, exhausted)
+		}
+		// A source that FAILED is a different matter: it proves nothing about
+		// what remains. Retire it too — losing that source's contribution is
+		// what AllowGaps already means, and it is exactly what a single
+		// unpaginated FetchMerged would have done — but record it, and never
+		// let it end the walk for the sources that are still healthy.
+		if len(skipped) > 0 {
+			src.archSources = withoutSources(src.archSources, skipped)
+			skippedAll = append(skippedAll, skipped...)
+		}
+
 		if len(rows) == 0 {
+			// An empty page ends the walk ONLY once nothing was skipped on it.
+			// Without that condition a failing archive source plus a MySQL side
+			// that has already run dry — the normal topology, since MySQL holds
+			// the recent partitions and archives the old ones — returns success
+			// having delivered nothing, and the caller reconstructs a table
+			// from the baseline alone: post-baseline DELETEs resurrected,
+			// INSERTs missing, UPDATEs stale. The retirement above guarantees
+			// this terminates: each pass either delivers rows or shrinks the
+			// source set.
+			if len(skipped) > 0 {
+				continue
+			}
+			warnSkippedSources(skippedAll)
 			return src.plan, nil
 		}
 
@@ -274,11 +308,43 @@ func FetchMergedStream(
 		// only) — that also shortens the page without proving exhaustion, and
 		// stopping there would drop the remaining events of every other source
 		// as well. In that case keep paging until a page comes back empty.
-		if len(rows) < batchSize && !skipped {
+		if len(rows) < batchSize && len(skipped) == 0 {
+			warnSkippedSources(skippedAll)
 			return src.plan, nil
 		}
 		cursor = &next
 	}
+}
+
+// withoutSources returns srcs with every entry in drop removed, preserving
+// order. Both slices are tiny (one entry per registered bintrail_id), so the
+// nested scan is cheaper than building a set.
+func withoutSources(srcs, drop []string) []string {
+	out := srcs[:0:0]
+	for _, s := range srcs {
+		if !slices.Contains(drop, s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// warnSkippedSources emits ONE summary at the end of a walk naming every
+// archive source that failed and was passed over.
+//
+// The per-page warning inside fetchPage is not enough on its own: it is emitted
+// once per page, so a long walk buries it, and it never states the consequence.
+// This one does, because under AllowGaps the result the caller is about to act
+// on is knowingly missing whatever those sources held — for a reconstruct, that
+// is a dump that loads cleanly and is incomplete.
+func warnSkippedSources(skipped []string) {
+	if len(skipped) == 0 {
+		return
+	}
+	slices.Sort(skipped)
+	slog.Warn("archive sources failed and were skipped; the result is INCOMPLETE — "+
+		"events held only by these sources are missing",
+		"sources", slices.Compact(skipped), "allow_gaps", true)
 }
 
 // mergeSources is what the one-time prologue of a merged fetch resolves: the
@@ -346,26 +412,27 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 // source and returns the merged rows. It performs no discovery, planning or gap
 // enforcement — resolveMergeSources did all of that once, up front.
 //
-// skippedSource reports whether any archive source failed and was skipped,
-// which only happens under AllowGaps=true. Paginating callers need to know:
-// a short page normally proves every source is exhausted, but a skipped source
-// can also shorten a page, and treating that as end-of-stream would drop the
-// remaining events of every OTHER source too.
+// skipped names the archive sources that FAILED and were passed over, which
+// only happens under AllowGaps=true. exhausted names the ones that succeeded
+// and returned nothing. Paginating callers need both, for opposite reasons: a
+// skipped source shortens a page without proving anything (so a short or empty
+// page must not be read as end-of-stream), while an exhausted one can be
+// retired from the walk entirely.
 func fetchPage(
 	ctx context.Context,
 	engine *Engine,
 	o FetchMergedOptions,
 	src mergeSources,
-) (rows []ResultRow, skippedSource bool, err error) {
+) (rows []ResultRow, skipped, exhausted []string, err error) {
 	// Fast path: no archives → single fetch from MySQL, no merge. engine.Fetch
 	// already applied ORDER BY and LIMIT in SQL, so MergeAndTrim would be a
 	// no-op over a single source.
 	if len(src.archSources) == 0 {
 		r, ferr := engine.Fetch(ctx, o.Opts)
 		if ferr != nil {
-			return nil, false, ferr
+			return nil, nil, nil, ferr
 		}
-		return r, false, nil
+		return r, nil, nil, nil
 	}
 
 	// Archives present: fetch from MySQL unless the planner says we can skip
@@ -375,13 +442,23 @@ func fetchPage(
 	} else {
 		r, ferr := engine.Fetch(ctx, o.Opts)
 		if ferr != nil {
-			return nil, false, ferr
+			return nil, nil, nil, ferr
 		}
 		rows = r
 	}
 
 	for _, s := range src.archSources {
 		ar, aerr := o.ArchiveFetcher(ctx, o.Opts, s)
+		if aerr == nil && len(ar) == 0 {
+			// This source has nothing left for the walk. Sound to retire it:
+			// the cursor only ever moves forward, so every later page applies a
+			// strictly tighter filter and its result set is a subset of this
+			// empty one. Retiring it is what keeps a long walk from re-listing
+			// (and, on S3, re-downloading and re-probing) an archive that is
+			// already behind the cursor, once per page — see #383's
+			// stale-registration probe, which fires on every empty listing.
+			exhausted = append(exhausted, s)
+		}
 		if aerr != nil {
 			// In strict mode any broken archive source is fatal: each source
 			// is a distinct bintrail_id whose deltas no other source carries,
@@ -389,16 +466,16 @@ func fetchPage(
 			// fetch — so skipping the source would return an incomplete
 			// result the caller has no way to detect (#377).
 			if !o.AllowGaps {
-				return nil, false, fmt.Errorf("archive source %s failed under strict mode, cannot verify coverage: %w", s, aerr)
+				return nil, nil, nil, fmt.Errorf("archive source %s failed under strict mode, cannot verify coverage: %w", s, aerr)
 			}
 			// Permissive mode: a broken archive must not block the entire
 			// query. Log and move on.
 			slog.Warn("archive query failed, skipping", "source", s, "error", aerr)
-			skippedSource = true
+			skipped = append(skipped, s)
 			continue
 		}
 		rows = append(rows, ar...)
 	}
 
-	return MergeAndTrim(rows, o.Opts.Limit, o.Opts.LimitPerPK, o.Opts.Order), skippedSource, nil
+	return MergeAndTrim(rows, o.Opts.Limit, o.Opts.LimitPerPK, o.Opts.Order), skipped, exhausted, nil
 }

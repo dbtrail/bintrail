@@ -2,7 +2,6 @@ package reconstruct
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 
@@ -162,8 +161,8 @@ func TestFoldPage_pkChangingUpdateRefused_scenarioB(t *testing.T) {
 // is called at all, so a refusal happens before the writer can exist.
 func assertPKChangeRefusal(t *testing.T, page []query.ResultRow) {
 	t.Helper()
-	changes := make(map[string]*query.ResultRow)
-	err := foldPage(page, "mydb", "orders", pkColsIntID(), changes)
+	res := &foldResult{Changes: map[string]*query.ResultRow{}}
+	err := foldPage(page, "mydb", "orders", pkColsIntID(), res)
 	if err == nil {
 		t.Fatal("expected a fail-loud error for a PK-changing UPDATE, got nil")
 	}
@@ -231,10 +230,10 @@ func TestFoldPage_pkChangingUpdate_reinsertPermutation(t *testing.T) {
 		{"split across a page boundary", [][]query.ResultRow{events[:1], events[1:]}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			changes := make(map[string]*query.ResultRow)
+			res := &foldResult{Changes: map[string]*query.ResultRow{}}
 			var err error
 			for _, page := range tc.pages {
-				if err = foldPage(page, "mydb", "orders", pkColsIntID(), changes); err != nil {
+				if err = foldPage(page, "mydb", "orders", pkColsIntID(), res); err != nil {
 					break
 				}
 			}
@@ -263,12 +262,13 @@ func TestFoldPage_lastWriteWinsAcrossPages(t *testing.T) {
 		{{EventType: event.EventUpdate, PKValues: pkStrForInt(7), RowBefore: map[string]any{"id": float64(7), "status": "first"}, RowAfter: map[string]any{"id": float64(7), "status": "last"}}},
 	}
 
-	changes := make(map[string]*query.ResultRow)
+	res := &foldResult{Changes: map[string]*query.ResultRow{}}
 	for i, page := range pages {
-		if err := foldPage(page, "mydb", "orders", pkColsIntID(), changes); err != nil {
+		if err := foldPage(page, "mydb", "orders", pkColsIntID(), res); err != nil {
 			t.Fatalf("foldPage(page %d): %v", i, err)
 		}
 	}
+	changes := res.Changes
 
 	got := changes[pkStrForInt(7)]
 	if got == nil {
@@ -276,6 +276,13 @@ func TestFoldPage_lastWriteWinsAcrossPages(t *testing.T) {
 	}
 	if status := got.RowAfter["status"]; status != "last" {
 		t.Errorf("pk 7 resolved to %q, want %q — a later page must win over an earlier one", status, "last")
+	}
+	// foldPage must store retainEvent's trimmed COPY, not the event itself.
+	// Without this assertion, reverting the fold to `changes[pk] = ev` keeps the
+	// whole suite green while re-pinning every page's backing array in memory —
+	// silently undoing the entire point of paging.
+	if got.RowBefore != nil {
+		t.Error("change-map entry kept its before-image; foldPage must store retainEvent's trimmed copy")
 	}
 	if len(changes) != 2 {
 		t.Errorf("change map has %d entries, want 2 (one per distinct touched PK)", len(changes))
@@ -346,34 +353,6 @@ func TestSnapshotFullTableImages_pkChangingUpdate_reinsertPermutation(t *testing
 	}
 	if emitted != 0 {
 		t.Errorf("refusal must emit no rows, emitted %d", emitted)
-	}
-}
-
-// TestWriteBinlogOnlyChanges_noPartialOutputOnRefusal pins that the
-// no-baseline fallback still leaves nothing on disk when the run is refused.
-// The refusal itself now comes from foldPage, upstream of this function (the
-// binlog-only path streams its window too since #1097), so this asserts the
-// contract that matters at this layer: a caller that never reaches
-// writeBinlogOnlyChanges leaves an empty output directory behind.
-func TestWriteBinlogOnlyChanges_noPartialOutputOnRefusal(t *testing.T) {
-	outDir := t.TempDir()
-	events, _ := reinsertEventsAndMap(t)
-
-	changes := make(map[string]*query.ResultRow)
-	err := foldPage(events, "mydb", "orders", pkColsIntID(), changes)
-	if err == nil {
-		t.Fatal("expected a fail-loud error for the reinsert PK-changing UPDATE, got nil")
-	}
-	if !strings.Contains(err.Error(), "PK-changing UPDATE") {
-		t.Errorf("error should name the PK-changing UPDATE, got: %v", err)
-	}
-
-	entries, derr := os.ReadDir(outDir)
-	if derr != nil {
-		t.Fatalf("read output dir: %v", derr)
-	}
-	if len(entries) != 0 {
-		t.Errorf("refusal left output on disk: %d entries", len(entries))
 	}
 }
 

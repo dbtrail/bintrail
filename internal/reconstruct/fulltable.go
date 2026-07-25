@@ -179,8 +179,8 @@ func shouldWarnEvents(n, threshold int64) bool {
 // scaledEventThreshold divides threshold by parallelism so a per-table
 // warning threshold reflects the RAM footprint of parallelism tables
 // reconstructing CONCURRENTLY, not just one (#842): ReconstructTables runs up
-// to Parallelism table goroutines at a time, each holding its own event
-// window + change map in memory, so a per-table threshold alone lets N tables
+// to Parallelism table goroutines at a time, each holding its own page +
+// change map in memory, so a per-table threshold alone lets N tables
 // each just under the limit pass silently while the process holds N times
 // that much. threshold<=0 (disabled) and parallelism<=1 (no concurrency to
 // account for) pass through unchanged. The division floors, with a minimum of
@@ -732,6 +732,8 @@ func ReconstructTable(
 		Table:             table,
 		PKCols:            pkCols,
 		Changes:           changes,
+		ImageColumns:      fold.ImageColumns,
+		SawImage:          fold.SawImage,
 		OutputDir:         cfg.OutputDir,
 		ChunkSize:         cfg.ChunkSize,
 		DuckDBTuning:      cfg.DuckDBTuning,
@@ -763,9 +765,13 @@ type mergeInput struct {
 	// foldEventWindow. Its entries are TRIMMED (retainEvent blanks RowBefore
 	// and the query-text fields), which is why no guard reading a before-image
 	// may run against this map — see the note above mergeBaselineIntoWriter.
-	Changes   map[string]*query.ResultRow
-	OutputDir string
-	ChunkSize int64
+	Changes map[string]*query.ResultRow
+	// ImageColumns/SawImage come from foldResult and carry the #843 signal the
+	// trimmed Changes map can no longer provide (see droppedBaselineColumns).
+	ImageColumns map[string]struct{}
+	SawImage     bool
+	OutputDir    string
+	ChunkSize    int64
 	// DuckDBTuning sets the resource budget for the DuckDB sessions this
 	// function opens (readBaselineColumns, mergeBaselineImages) (#842). Zero
 	// value → the container-safe default; see effectiveDuckDBTuning.
@@ -842,7 +848,7 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 	// Detected up front, aggregated over the whole change map — not the old
 	// per-row×column slog.Warn — and before the writer opens, so no partial
 	// chunk files are left on disk.
-	if missing := droppedBaselineColumns(in.Changes, colNames); len(missing) > 0 {
+	if missing := droppedBaselineColumns(in.ImageColumns, in.SawImage, colNames); len(missing) > 0 {
 		return fmt.Errorf(
 			"full-table reconstruct: %s.%s has baseline column(s) %s absent from delta-event row images "+
 				"(dropped from the source table after the baseline snapshot); emitting would mix schema epochs — "+
@@ -1674,44 +1680,35 @@ func postBaselineColumns(changes map[string]*query.ResultRow, colNames []string)
 // calls this up front to refuse the run instead of letting rowAfterOrdered
 // NULL-fill the column row by row (#843).
 //
-// Both row_after AND row_before are scanned (#843 follow-up): a window whose
-// last event for a post-drop-touched PK is a DELETE carries no row_after, but
-// its row_before is itself a post-drop image (the row as it existed just
-// before deletion) and so still lacks the dropped column — checking only
-// row_after let such a window sail through with zero warning, silently
-// re-emitting the stale pre-drop value on every untouched pass-through row.
-// Per-PK this collapsed-map scan is sufficient: changes is keyed by PK with
-// the chronologically LAST event surviving, and time only moves forward, so
-// if any event for a PK is post-drop then so is that surviving one — there is
-// no ordering in which an earlier post-drop event's signal is lost behind a
-// later pre-drop entry for the same key. A PK with zero post-drop activity in
-// the window remains undetectable by construction (no image ever samples the
-// post-drop schema for it) and is out of scope here.
-func droppedBaselineColumns(changes map[string]*query.ResultRow, colNames []string) []string {
-	dropped := make(map[string]struct{})
-	scan := func(img map[string]any) {
-		if img == nil {
-			return
-		}
-		for _, col := range colNames {
-			if _, ok := img[col]; !ok {
-				dropped[col] = struct{}{}
-			}
-		}
-	}
-	for _, ev := range changes {
-		if ev == nil {
-			continue
-		}
-		scan(ev.RowAfter)
-		scan(ev.RowBefore)
-	}
-	if len(dropped) == 0 {
+// The signal is computed during the FOLD, not here (#1097): a window whose
+// last event for a post-drop-touched PK is a DELETE carries no row_after, and
+// its row_before — itself a post-drop image, and the only evidence — is
+// discarded by retainEvent before the change map ever reaches this function.
+// foldResult.observeImages therefore narrows an intersection over BOTH images
+// of every event while they are still intact, and this function does the part
+// that needs colNames, which is not known until the baseline is materialized.
+// A column absent from the intersection is a column some image lacked, which
+// is exactly what the old per-map scan flagged.
+//
+// sawImage guards the degenerate case: an intersection over zero images is
+// empty, which would otherwise read as "every baseline column was dropped" and
+// refuse every run with no events at all.
+//
+// A PK with zero post-drop activity in the window remains undetectable by
+// construction (no image ever samples the post-drop schema for it) and is out
+// of scope here.
+func droppedBaselineColumns(imageCols map[string]struct{}, sawImage bool, colNames []string) []string {
+	if !sawImage {
 		return nil
 	}
-	out := make([]string, 0, len(dropped))
-	for col := range dropped {
-		out = append(out, col)
+	var out []string
+	for _, col := range colNames {
+		if _, ok := imageCols[col]; !ok {
+			out = append(out, col)
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	sort.Strings(out)
 	return out

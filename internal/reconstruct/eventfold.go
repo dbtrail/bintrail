@@ -37,12 +37,17 @@ import (
 //
 // Fields dropped, and why it is safe to drop them:
 //
-//   - RowBefore: mergeBaselineImages emits row_after only, and both guards that
-//     read the before-image (#592 unresolved-TOAST, #782 PK-changing UPDATE)
-//     have already run on the FULL event in foldEventWindow, per event, before
-//     this call. Moving those checks upstream of the trim is precisely what
-//     makes dropping it safe — they must never be re-expressed against the map,
-//     where they would read a nil before-image and silently pass.
+//   - RowBefore: mergeBaselineImages emits row_after only, and the THREE
+//     consumers that read a before-image have all been served before this call
+//     — #592 unresolved-TOAST and #782 PK-changing UPDATE run per event in
+//     foldPage, and the #843 dropped-column guard gets what it needs from
+//     foldResult.observeImages. Serving them upstream of the trim is precisely
+//     what makes dropping it safe; none of them may be re-expressed against the
+//     map, where they would read a nil before-image and silently pass.
+//     Enumerating them is not decoration: the #843 reader was missed on the
+//     first pass and its guard went dead while its test stayed green, because
+//     the test built the map by hand. Before adding any consumer of this map,
+//     check what it reads.
 //   - QueryText/QueryHash: forensic capture (#699), capped at 16 KiB per event.
 //     No merge stage reads them, and retaining them would let a
 //     statement-logging source dominate the map.
@@ -93,7 +98,7 @@ func foldPage(
 	page []query.ResultRow,
 	schema, table string,
 	pkCols []metadata.ColumnMeta,
-	changes map[string]*query.ResultRow,
+	res *foldResult,
 ) error {
 	for i := range page {
 		ev := &page[i]
@@ -103,9 +108,46 @@ func foldPage(
 		if before, after, ok := pkChangedInEvent(ev, pkCols); ok {
 			return pkChangingUpdateErr(schema, table, before, after)
 		}
-		changes[ev.PKValues] = retainEvent(ev)
+		// Sample both images for the #843 guard BEFORE the trim discards the
+		// before-image. Order matters: retainEvent must be the last thing that
+		// touches this event.
+		res.observeImages(ev)
+		res.Changes[ev.PKValues] = retainEvent(ev)
 	}
 	return nil
+}
+
+// observeImages narrows ImageColumns to the intersection with each of ev's
+// non-nil row images.
+//
+// One deliberate difference from the collapsed-map scan this replaces: it sees
+// EVERY event, not just the surviving last-event-per-PK. That makes it strictly
+// more sensitive — a baseline column dropped and later re-added inside the same
+// window is now flagged, where the map scan stayed quiet because the surviving
+// image had the column back. Refusing there is defensible (the dump really
+// would mix schema epochs: pass-through rows carry the pre-drop value while
+// touched rows carry the post-re-add one) and it is the safe direction for a
+// data-correctness guard, but it IS a behavior change — see the table cases in
+// schema_drift_843_test.go.
+func (r *foldResult) observeImages(ev *query.ResultRow) {
+	for _, img := range []map[string]any{ev.RowAfter, ev.RowBefore} {
+		if img == nil {
+			continue
+		}
+		if !r.SawImage {
+			r.SawImage = true
+			r.ImageColumns = make(map[string]struct{}, len(img))
+			for col := range img {
+				r.ImageColumns[col] = struct{}{}
+			}
+			continue
+		}
+		for col := range r.ImageColumns {
+			if _, ok := img[col]; !ok {
+				delete(r.ImageColumns, col)
+			}
+		}
+	}
 }
 
 // foldConfig drives foldEventWindow.
@@ -119,12 +161,17 @@ type foldConfig struct {
 	Table  string
 	PKCols []metadata.ColumnMeta
 
-	// Opts is the event filter for the window. Limit/LimitPerPK/Order/AfterEvent
+	// Opts is the event filter for the window. Limit, LimitPerPK and AfterEvent
 	// must be unset — the stream owns paging and rejects a caller that presets
-	// them.
+	// any of them. Order must not be "DESC" (ascending is the only direction a
+	// forward cursor can walk); leaving it empty is the norm.
 	Opts query.Options
 
-	AllowGaps      bool
+	AllowGaps bool
+	// ArchiveFetcher is REQUIRED, not optional: FetchMergedOptions.validate
+	// rejects a nil fetcher whenever NoArchive is false, and this fold always
+	// passes NoArchive=false. Callers resolve the default
+	// (parquetquery.Fetch, #510) themselves at their point of use.
 	ArchiveFetcher query.ArchiveFetcher
 
 	// BatchSize is the fetch page size; 0 → query.DefaultStreamBatchSize.
@@ -153,6 +200,24 @@ type foldResult struct {
 	// window was empty. Kept because the baseline-vs-first-event gap warning
 	// (#781) needs it and the page it came from is long gone by then.
 	First *query.ResultRow
+
+	// ImageColumns is the INTERSECTION of the column key-sets of every non-nil
+	// row image seen in the window, and SawImage reports whether any image was
+	// seen at all (an intersection over nothing is not "everything").
+	//
+	// This exists because the #843 dropped-column guard reads BEFORE-images,
+	// which retainEvent throws away — the guard's signal for a PK whose last
+	// event is a DELETE is precisely that DELETE's before-image. Since the
+	// guard also needs the baseline column list, which is not known until the
+	// baseline is materialized (well after the fold), the fold cannot run the
+	// check itself. So it carries out the only part that needs the untrimmed
+	// event, in bounded form: a column is "missing from some image" exactly
+	// when it is absent from this intersection, which is all
+	// droppedBaselineColumns ever asked.
+	//
+	// Bounded by the table's column count, not by events or PKs.
+	ImageColumns map[string]struct{}
+	SawImage     bool
 }
 
 // foldEventWindow streams the event window described by fc and folds it into a
@@ -177,6 +242,10 @@ type foldResult struct {
 func foldEventWindow(ctx context.Context, fc foldConfig) (*foldResult, error) {
 	res := &foldResult{Changes: make(map[string]*query.ResultRow)}
 	warned := false
+	// Captured so the error path can tell a refusal from the fold apart from a
+	// fetch failure; FetchMergedStream returns fn's error verbatim, which makes
+	// the two indistinguishable at the call site otherwise.
+	var foldErr error
 	// Built ONCE for the whole window, not per page: both decoding passes need
 	// the snapshot-epoch list and a resolver per epoch touched, and rebuilding
 	// that state per page would turn one schema_snapshots query into one per
@@ -184,12 +253,10 @@ func foldEventWindow(ctx context.Context, fc foldConfig) (*foldResult, error) {
 	dec := newEventDecoder(fc.DB, fc.Schema, fc.Table, fc.Resolver)
 
 	_, err := query.FetchMergedStream(ctx, fc.DB, fc.Engine, query.FetchMergedOptions{
-		Opts:      fc.Opts,
-		DBName:    fc.DBName,
-		NoArchive: false,
-		AllowGaps: fc.AllowGaps,
-		// nil ArchiveFetcher → the container-safe parquetquery.Fetch, resolved
-		// by the caller at the point of use (#510).
+		Opts:           fc.Opts,
+		DBName:         fc.DBName,
+		NoArchive:      false,
+		AllowGaps:      fc.AllowGaps,
 		ArchiveFetcher: fc.ArchiveFetcher,
 	}, fc.BatchSize, func(page []query.ResultRow) error {
 		if len(page) == 0 {
@@ -203,7 +270,8 @@ func foldEventWindow(ctx context.Context, fc foldConfig) (*foldResult, error) {
 			res.First = &first
 		}
 
-		if err := foldPage(page, fc.Schema, fc.Table, fc.PKCols, res.Changes); err != nil {
+		if err := foldPage(page, fc.Schema, fc.Table, fc.PKCols, res); err != nil {
+			foldErr = err
 			return err
 		}
 
@@ -219,7 +287,25 @@ func foldEventWindow(ctx context.Context, fc foldConfig) (*foldResult, error) {
 		return nil
 	})
 	if err != nil {
+		// Only a TRANSPORT failure gets the "fetch events" label. fn's errors
+		// are the #592/#782 refusals, which FetchMergedStream propagates
+		// unchanged — prefixing those sends the operator to check DB/S3
+		// connectivity instead of reading the actionable message underneath.
+		if foldErr != nil {
+			return nil, foldErr
+		}
 		return nil, fmt.Errorf("fetch events: %w", err)
+	}
+
+	// The decoder degrades to leaving BLOB/TEXT as stored base64 when no
+	// snapshot epoch covers an event or its resolver won't load. Until now that
+	// was a Debug line and the verdict was discarded, so a dump could carry
+	// base64 in place of real values with nothing above Debug to say so.
+	if !dec.typed {
+		slog.Warn("reconstruct: BLOB/TEXT values could not be typed against any schema snapshot and are "+
+			"left BASE64-ENCODED in the output — the dump will not round-trip those columns",
+			"schema", fc.Schema, "table", fc.Table,
+			"hint", "run `bintrail snapshot` so the window's events resolve against a schema snapshot")
 	}
 
 	slog.Debug("event window folded",

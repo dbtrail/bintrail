@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,6 +32,23 @@ const mysqlToSecondsConst = int64(62167219200)
 // t is normalised to UTC, so callers do not need to convert in advance.
 func mysqlToSeconds(t time.Time) int64 {
 	return t.UTC().Unix() + mysqlToSecondsConst
+}
+
+// validateCursor rejects the one option pairing the keyset predicate cannot
+// serve: a cursor with a DESCENDING order (#1097). The two together page AWAY
+// from the unread remainder, silently returning the wrong half of the window.
+//
+// It lives at the ENGINE entry points rather than only inside
+// FetchMergedStream, which is the sole legitimate setter today: Options is
+// exported and consumed by several fetch surfaces, so enforcing it where the
+// predicate is actually emitted means the next paged surface inherits the
+// check instead of having to remember it. buildQuery/buildFilters cannot host
+// it — both return (string, []any) with no error path.
+func (o Options) validateCursor() error {
+	if o.AfterEvent != nil && OrderDirection(o.Order) == "DESC" {
+		return errors.New("query: AfterEvent is a forward keyset cursor and cannot be combined with Order=DESC")
+	}
+	return nil
 }
 
 // EventCursor is a position in the (event_timestamp, event_id) ascending sort
@@ -300,6 +318,9 @@ func New(db *sql.DB) *Engine { return &Engine{db: db} }
 // Fetch executes the query and returns raw result rows.
 // This is the shared entry point used by both the query and recover commands.
 func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
+	if err := opts.validateCursor(); err != nil {
+		return nil, err
+	}
 	q, args := buildQuery(opts)
 	rows, err := e.db.QueryContext(ctx, q, args...)
 	if err != nil {

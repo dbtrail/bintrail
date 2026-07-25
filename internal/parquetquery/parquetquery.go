@@ -40,6 +40,12 @@ import (
 // use this. The offline CLI commands that can afford more resources call
 // FetchWithTuning to lift the cap (#510).
 func Fetch(ctx context.Context, opts query.Options, source string) ([]query.ResultRow, error) {
+	// Mirror internal/query's engine-side check so the keyset cursor is rejected
+	// with DESC wherever the predicate can be emitted, not just on the paged
+	// path that sets it today (#1097).
+	if opts.AfterEvent != nil && query.OrderDirection(opts.Order) == "DESC" {
+		return nil, errors.New("parquetquery: AfterEvent is a forward keyset cursor and cannot be combined with Order=DESC")
+	}
 	return FetchWithTuning(ctx, opts, source, duckdbutil.DefaultTuning())
 }
 
