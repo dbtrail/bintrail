@@ -94,7 +94,6 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 	if !cliutil.IsValidOutputFormat(vfyFormat) {
 		return fmt.Errorf("invalid --format %q; must be text or json", vfyFormat)
 	}
-	vfyFormat = strings.ToLower(vfyFormat)
 	if vfyIndexDSN == "" {
 		return fmt.Errorf("--index-dsn is required")
 	}
@@ -168,7 +167,7 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 			return fmt.Errorf("no baselines found under %q; nothing to verify (check --baseline-dir/--baseline-s3 and that the baseline job is producing complete snapshots)", baselineSrc)
 		}
 		const msg = "only one baseline under the source; nothing to verify yet (no predecessor to compare against)"
-		if vfyFormat == "json" {
+		if verifyWantsJSON() {
 			// The one prose line on this path still needs a machine-readable
 			// form, or a --format json consumer would get bare text on stdout
 			// (and no way to tell this benign exit-0 apart from a verified run).
@@ -310,7 +309,7 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 	}
 	rep := verify.NewReport(verify.ModeBaselinePair, results)
 	rep.BaselineSource = baselineSrc
-	if vfyFormat == "json" {
+	if verifyWantsJSON() {
 		// JSON is one document, so the drill-downs must be computed BEFORE it is
 		// written (the text path below keeps its stream order: verdict first,
 		// per-row detail after). A drill-down failure stays non-fatal in both —
@@ -439,12 +438,20 @@ func verifyTargetTables(cmd *cobra.Command, indexDB *sql.DB) ([]schemaTable, err
 	return out, rows.Err()
 }
 
+// verifyWantsJSON reports whether --format selected JSON. Case-insensitive and
+// read-only: normalizing the flag global in place would leak one invocation's
+// value into the next in any in-process caller (tests today, a /api/verify-style
+// embedder tomorrow), since these command globals are never reset.
+func verifyWantsJSON() bool {
+	return strings.EqualFold(vfyFormat, "json")
+}
+
 // emitVerifyReport writes the report in the requested format and returns the
 // run's exit status. Both formats take their verdict from the SAME
 // Report.ExitError, so --format json cannot drift from --format text: fail on
 // any mismatch or hard error, and fail when nothing was proven.
 func emitVerifyReport(cmd *cobra.Command, rep *verify.Report) error {
-	if vfyFormat == "json" {
+	if verifyWantsJSON() {
 		if err := cliutil.OutputJSON(rep); err != nil {
 			return err
 		}
