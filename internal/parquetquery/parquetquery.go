@@ -40,6 +40,12 @@ import (
 // use this. The offline CLI commands that can afford more resources call
 // FetchWithTuning to lift the cap (#510).
 func Fetch(ctx context.Context, opts query.Options, source string) ([]query.ResultRow, error) {
+	// Mirror internal/query's engine-side check so the keyset cursor is rejected
+	// with DESC wherever the predicate can be emitted, not just on the paged
+	// path that sets it today (#1097).
+	if opts.AfterEvent != nil && query.OrderDirection(opts.Order) == "DESC" {
+		return nil, errors.New("parquetquery: AfterEvent is a forward keyset cursor and cannot be combined with Order=DESC")
+	}
 	return FetchWithTuning(ctx, opts, source, duckdbutil.DefaultTuning())
 }
 
@@ -401,12 +407,28 @@ func isBucketLocationAccessDenied(err error) bool {
 // gained its binlog position) after it can be filed under an earlier
 // date/hour than the anchor's own. Returns opts.Since unchanged when SincePos
 // is nil (nothing to widen for) or Since itself is nil.
+// A keyset cursor (opts.AfterEvent, #1097) tightens the hint: every row still
+// to be returned sorts at-or-after the cursor, so its event_timestamp is >= the
+// cursor's, and no file whose hour ends before the cursor's hour can hold one.
+// This is what keeps paginated archive reads near-linear instead of quadratic —
+// without it every page would re-list and re-download the whole window's files
+// and rely on the row-level filter to discard them, once per page.
 func sinceLowerBoundHint(opts query.Options) *time.Time {
-	if opts.Since == nil || opts.SincePos == nil {
-		return opts.Since
+	hint := opts.Since
+	if opts.Since != nil && opts.SincePos != nil {
+		t := opts.Since.Truncate(time.Hour).Add(-time.Hour)
+		hint = &t
 	}
-	t := opts.Since.Truncate(time.Hour).Add(-time.Hour)
-	return &t
+	if opts.AfterEvent != nil {
+		// Floor to the hour: archive files are Hive-partitioned by
+		// event_date/event_hour, so an hour-granular bound is the finest one
+		// file scoping can act on, and flooring can only over-include.
+		cur := opts.AfterEvent.Timestamp.Truncate(time.Hour)
+		if hint == nil || cur.After(*hint) {
+			hint = &cur
+		}
+	}
+	return hint
 }
 
 // maxScopedDays is the maximum number of days for prefix-scoped S3 listing.
@@ -955,6 +977,16 @@ func buildFilters(opts query.Options) ([]string, []any) {
 			" OR (length(binlog_file) = length(?) AND binlog_file < ?)"+
 			" OR (binlog_file = ? AND end_pos <= ?))")
 		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
+	}
+	if opts.AfterEvent != nil {
+		// Keyset cut on the composite sort key, mirroring internal/query's
+		// buildQuery (#1097). No separate coarse hint is emitted here: the
+		// archive side's equivalent of MySQL partition pruning is file/date
+		// scoping, which sinceLowerBoundHint already advances with the cursor
+		// before this filter is ever built. DuckDB additionally prunes Parquet
+		// row groups from this predicate via their event_timestamp statistics.
+		where = append(where, "(event_timestamp > ? OR (event_timestamp = ? AND event_id > ?))")
+		args = append(args, opts.AfterEvent.Timestamp, opts.AfterEvent.Timestamp, opts.AfterEvent.EventID)
 	}
 	if opts.ChangedColumn != "" {
 		needle, _ := json.Marshal(opts.ChangedColumn)

@@ -223,3 +223,36 @@ func TestEnableS3CredentialChainRegion(t *testing.T) {
 		t.Fatalf("chain secret does not carry the pinned region; got secret_string=%q", secretStr)
 	}
 }
+
+// TestDuckDBEngineOnLTSLine pins the engine to the DuckDB 1.4 "Andium" LTS
+// line. The rationale lives in go.mod above the duckdb-go require; this is the
+// part that can actually fail a build, because a comment cannot: `go get -u`
+// rewrites the version and leaves the surrounding comment byte-identical, so
+// the pin would otherwise be an argument the repo makes against itself.
+//
+// It also catches a bindings-only bump, which moves the engine without
+// touching the duckdb-go line at all.
+//
+// This test SHOULD fail the day we deliberately move off 1.4 (LTS support ends
+// 2026-09-16). That is the point: the move becomes an explicit edit here rather
+// than a silent side effect of a dependency update.
+func TestDuckDBEngineOnLTSLine(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open in-memory duckdb: %v", err)
+	}
+	defer db.Close()
+
+	var got string
+	if err := db.QueryRow("SELECT version()").Scan(&got); err != nil {
+		t.Fatalf("SELECT version(): %v", err)
+	}
+	const wantLine = "v1.4."
+	if !strings.HasPrefix(got, wantLine) {
+		t.Fatalf("DuckDB engine is %s, want the %sx LTS line.\n"+
+			"If this is a deliberate move off Andium, update this test AND the pin "+
+			"rationale in go.mod together — and run the off-line pre-flight it lists "+
+			"(real-S3 --ultrafast scan, cross-region read, IAM role without "+
+			"GetBucketLocation).", got, wantLine)
+	}
+}
