@@ -89,7 +89,7 @@ func TestVerifySupervisor_Trigger_collision(t *testing.T) {
 // TestVerifySupervisor_appendResult_accumulatesSummary: results grow in
 // call order and each status bucket (including an unrecognized status
 // falling through to Error, mirroring the CLI's anti-false-assurance
-// classification in printVerifyReport) is tallied correctly — this is the
+// classification in verify.normalizeStatus) is tallied correctly — this is the
 // exact bookkeeping "as they land" polling depends on.
 func TestVerifySupervisor_appendResult_accumulatesSummary(t *testing.T) {
 	s := newVerifySupervisor(context.Background())

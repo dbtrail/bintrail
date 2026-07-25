@@ -27,7 +27,7 @@ before/after images in a searchable index:
 
 - **See every change** — what changed and when, for every row, with before → after diffs
 - **Undo precisely** — generate exact reversal SQL for just the damaged rows
-- **Undo cascade deletes** — reconstruct child rows an `ON DELETE CASCADE` wiped out (and restore FKs an `ON DELETE SET NULL` cleared) that InnoDB removes *below* the binlog and most tools can't see — see [Query & Recovery](docs/query-and-recovery.md)
+- **Undo foreign-key cascades** — reconstruct child rows an `ON DELETE CASCADE` wiped out, and restore the foreign keys an `ON DELETE SET NULL` cleared or an `ON UPDATE CASCADE`/`SET NULL` re-pointed when a parent's key changed — all of which InnoDB applies *below* the binlog, where most tools can't see them — see [Query & Recovery](docs/query-and-recovery.md)
 - **Time-travel** — query any row (or table) as it was at any moment, from the web console or the `reconstruct` CLI; the live SQL `AS OF` interface additionally needs ProxySQL — see [Time-Travel SQL](docs/time-travel-sql.md)
 - **Who changed this?** — session attribution (database user, host, and client program behind a change) is available in the commercial distribution (dbtrail EE)
 - **Prove the safety net holds** — `bintrail verify` checks (off-line, drift-free) that a recovery would actually reproduce the source, and `bintrail status` flags any gap in the captured stream — so you find out *before* you need it — see [Verify](docs/verify.md)

@@ -28,14 +28,12 @@ func TestReconstruct843_columnDroppedAfterBaselineFailsLoud(t *testing.T) {
 
 	// id=2 is UPDATEd after the `status` column was DROPped. The event
 	// row_after carries only id. status ∈ baseline columns (id, status).
-	changes := map[string]*query.ResultRow{
-		pkStrForInt(2): {
-			EventType: parser.EventUpdate,
-			PKValues:  pkStrForInt(2),
-			RowBefore: map[string]any{"id": float64(2)},
-			RowAfter:  map[string]any{"id": float64(2)},
-		},
-	}
+	folded := foldForTest(t, []query.ResultRow{{
+		EventType: parser.EventUpdate,
+		PKValues:  pkStrForInt(2),
+		RowBefore: map[string]any{"id": float64(2)},
+		RowAfter:  map[string]any{"id": float64(2)},
+	}})
 
 	rep := &TableReport{}
 	err := mergeBaselineIntoWriter(context.Background(), mergeInput{
@@ -44,7 +42,9 @@ func TestReconstruct843_columnDroppedAfterBaselineFailsLoud(t *testing.T) {
 		Schema:            "mydb",
 		Table:             "orders",
 		PKCols:            pkColsIntID(),
-		Changes:           changes,
+		Changes:           folded.Changes,
+		ImageColumns:      folded.ImageColumns,
+		SawImage:          folded.SawImage,
 		OutputDir:         outDir,
 		ChunkSize:         0,
 	}, rep)
@@ -90,13 +90,11 @@ func TestReconstruct843_columnDroppedDeleteOnlyFailsLoud(t *testing.T) {
 
 	// id=2 is DELETEd after the `status` column was DROPped. The event
 	// row_before (post-drop image) carries only id — no row_after at all.
-	changes := map[string]*query.ResultRow{
-		pkStrForInt(2): {
-			EventType: parser.EventDelete,
-			PKValues:  pkStrForInt(2),
-			RowBefore: map[string]any{"id": float64(2)},
-		},
-	}
+	folded := foldForTest(t, []query.ResultRow{{
+		EventType: parser.EventDelete,
+		PKValues:  pkStrForInt(2),
+		RowBefore: map[string]any{"id": float64(2)},
+	}})
 
 	rep := &TableReport{}
 	err := mergeBaselineIntoWriter(context.Background(), mergeInput{
@@ -105,7 +103,9 @@ func TestReconstruct843_columnDroppedDeleteOnlyFailsLoud(t *testing.T) {
 		Schema:            "mydb",
 		Table:             "orders",
 		PKCols:            pkColsIntID(),
-		Changes:           changes,
+		Changes:           folded.Changes,
+		ImageColumns:      folded.ImageColumns,
+		SawImage:          folded.SawImage,
 		OutputDir:         outDir,
 		ChunkSize:         0,
 	}, rep)
@@ -139,14 +139,12 @@ func TestReconstruct843_nullValueIsNotADrop(t *testing.T) {
 	})
 	outDir := t.TempDir()
 
-	changes := map[string]*query.ResultRow{
-		pkStrForInt(2): {
-			EventType: parser.EventUpdate,
-			PKValues:  pkStrForInt(2),
-			RowBefore: map[string]any{"id": float64(2), "status": "paid"},
-			RowAfter:  map[string]any{"id": float64(2), "status": nil},
-		},
-	}
+	folded := foldForTest(t, []query.ResultRow{{
+		EventType: parser.EventUpdate,
+		PKValues:  pkStrForInt(2),
+		RowBefore: map[string]any{"id": float64(2), "status": "paid"},
+		RowAfter:  map[string]any{"id": float64(2), "status": nil},
+	}})
 
 	rep := &TableReport{}
 	err := mergeBaselineIntoWriter(context.Background(), mergeInput{
@@ -155,7 +153,9 @@ func TestReconstruct843_nullValueIsNotADrop(t *testing.T) {
 		Schema:            "mydb",
 		Table:             "orders",
 		PKCols:            pkColsIntID(),
-		Changes:           changes,
+		Changes:           folded.Changes,
+		ImageColumns:      folded.ImageColumns,
+		SawImage:          folded.SawImage,
 		OutputDir:         outDir,
 		ChunkSize:         0,
 	}, rep)
@@ -180,78 +180,74 @@ func TestDroppedBaselineColumns(t *testing.T) {
 	baseCols := []string{"id", "status"}
 
 	cases := []struct {
-		name    string
-		changes map[string]*query.ResultRow
-		want    []string
+		name   string
+		events []query.ResultRow
+		want   []string
 	}{
 		{
-			name:    "no events",
-			changes: map[string]*query.ResultRow{},
-			want:    nil,
+			name:   "no events",
+			events: nil,
+			want:   nil,
 		},
 		{
 			name: "no drift",
-			changes: map[string]*query.ResultRow{
-				"2": {EventType: event.EventUpdate, RowAfter: map[string]any{"id": 2, "status": "x"}},
+			events: []query.ResultRow{
+				{EventType: event.EventUpdate, RowAfter: map[string]any{"id": 2, "status": "x"}},
 			},
 			want: nil,
 		},
 		{
 			name: "NULL value is not a drop",
-			changes: map[string]*query.ResultRow{
-				"2": {EventType: event.EventUpdate, RowAfter: map[string]any{"id": 2, "status": nil}},
+			events: []query.ResultRow{
+				{EventType: event.EventUpdate, RowAfter: map[string]any{"id": 2, "status": nil}},
 			},
 			want: nil,
 		},
 		{
 			name: "one dropped column",
-			changes: map[string]*query.ResultRow{
-				"2": {EventType: event.EventUpdate, RowAfter: map[string]any{"id": 2}},
+			events: []query.ResultRow{
+				{EventType: event.EventUpdate, RowAfter: map[string]any{"id": 2}},
 			},
 			want: []string{"status"},
 		},
 		{
 			name: "multiple dropped columns sorted and deduped across events",
-			changes: map[string]*query.ResultRow{
-				"2": {EventType: event.EventUpdate, RowAfter: map[string]any{}},
-				"3": {EventType: event.EventInsert, RowAfter: map[string]any{"status": "x"}},
+			events: []query.ResultRow{
+				{EventType: event.EventUpdate, RowAfter: map[string]any{}},
+				{EventType: event.EventInsert, RowAfter: map[string]any{"status": "x"}},
 			},
 			want: []string{"id", "status"},
 		},
 		{
 			name: "DELETE row_before still detects a drop (#843 follow-up)",
-			changes: map[string]*query.ResultRow{
-				"2": {EventType: event.EventDelete, RowBefore: map[string]any{"id": 2}},
+			events: []query.ResultRow{
+				{EventType: event.EventDelete, RowBefore: map[string]any{"id": 2}},
 			},
 			want: []string{"status"},
 		},
 		{
 			name: "DELETE row_before with no drift is not flagged",
-			changes: map[string]*query.ResultRow{
-				"2": {EventType: event.EventDelete, RowBefore: map[string]any{"id": 2, "status": "paid"}},
+			events: []query.ResultRow{
+				{EventType: event.EventDelete, RowBefore: map[string]any{"id": 2, "status": "paid"}},
 			},
 			want: nil,
 		},
 		{
-			name: "nil row_after and row_before ignored (INSERT with empty after somehow)",
-			changes: map[string]*query.ResultRow{
-				"2": {EventType: event.EventInsert, RowAfter: nil},
+			// An event carrying no image at all contributes nothing, and if it
+			// is the ONLY event the window saw no image — which must read as
+			// "no evidence", not "every column dropped".
+			name: "event with no images at all is not evidence of a drop",
+			events: []query.ResultRow{
+				{EventType: event.EventInsert, RowAfter: nil},
 			},
 			want: nil,
-		},
-		{
-			name: "nil event entry ignored",
-			changes: map[string]*query.ResultRow{
-				"2": nil,
-				"3": {EventType: event.EventUpdate, RowAfter: map[string]any{"id": 3}},
-			},
-			want: []string{"status"},
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := droppedBaselineColumns(c.changes, baseCols)
+			folded := foldForTest(t, c.events)
+			got := droppedBaselineColumns(folded.ImageColumns, folded.SawImage, baseCols)
 			if len(got) != len(c.want) {
 				t.Fatalf("droppedBaselineColumns = %v, want %v", got, c.want)
 			}
@@ -262,4 +258,20 @@ func TestDroppedBaselineColumns(t *testing.T) {
 			}
 		})
 	}
+}
+
+// foldForTest runs an event page through the REAL fold, so the #843 assertions
+// below exercise the map shape production actually produces.
+//
+// This is the whole point of the helper: before #1097 these tests hand-built
+// the change map with before-images intact, and kept passing after retainEvent
+// started blanking them — the guard was dead and its own regression test could
+// not see it. Anything asserting on the change map must come through here.
+func foldForTest(t *testing.T, events []query.ResultRow) *foldResult {
+	t.Helper()
+	res := &foldResult{Changes: map[string]*query.ResultRow{}}
+	if err := foldPage(events, "mydb", "orders", pkColsIntID(), res); err != nil {
+		t.Fatalf("foldPage: %v", err)
+	}
+	return res
 }

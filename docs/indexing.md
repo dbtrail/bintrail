@@ -73,8 +73,8 @@ bintrail index \
 `binlog_row_image=FULL`, both required; `ON DELETE/UPDATE CASCADE` foreign keys
 are allowed but warned — InnoDB executes cascades below the binlog, so the
 cascaded child row changes are not captured and plain `recover` cannot reverse
-them. `bintrail recover-cascade` reconstructs **`ON DELETE CASCADE`/`SET NULL`**
-only — an `ON UPDATE CASCADE`/`SET NULL` is not synthesized (see
+them. `bintrail recover-cascade` reconstructs them: **`ON DELETE CASCADE`/`SET
+NULL`** *and* **`ON UPDATE CASCADE`/`SET NULL`** (see
 [`recover-cascade` limitations](query-and-recovery.md#recover-cascade-limitations)
 in [Query & Recovery](query-and-recovery.md))
 and auto-snapshot if no snapshot exists yet. It is **required**

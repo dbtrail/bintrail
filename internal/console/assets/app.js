@@ -1403,20 +1403,34 @@ async function generateUndo(form) {
     lastSQL = data.sql || "";
     clear(out);
     // When the target is auto-detected as a foreign-key parent, the script also
-    // re-creates the child rows InnoDB cascade-deleted below the binlog — surface
-    // it so the larger script isn't a surprise (coverage caveats, if any, are in
-    // the warnings above).
+    // repairs the child rows InnoDB changed below the binlog: rows a delete
+    // cascade removed, references it cleared, and references an ON UPDATE
+    // cascade re-pointed. Surface all three so the larger script isn't a
+    // surprise — and so a script that is ENTIRELY reference repairs never shows
+    // a bare "0 child row(s)" (coverage caveats, if any, are in the warnings
+    // above).
+    //
+    // cascade_detected implies at least one repair: the server falls back to the
+    // plain script/response when the synthesis produced nothing (an UPDATE undo
+    // that turned out not to have moved a referenced key), so `parts` is never
+    // empty here and there is no "nothing was repaired" branch to render.
     if (data.cascade_detected) {
+      const victims = data.victim_count || 0;
+      const setNulls = data.set_null_count || 0;
+      const keyRestores = data.key_restore_count || 0;
+      const parts = [];
+      if (victims) parts.push("restores " + victims + " related row(s) that MySQL deleted automatically");
+      if (setNulls) parts.push("fixes " + setNulls + " reference(s) that were cleared automatically");
+      if (keyRestores) parts.push("fixes " + keyRestores + " reference(s) that MySQL re-pointed automatically");
       out.append(el("div", { class: "ctx-banner" },
         el("span", { class: "badge b-baseline", text: "CASCADE" }),
         el("div", { class: "ctx-main" },
-          el("span", { class: "ctx-eyebrow", text: "Also restoring rows that were deleted automatically along with this one" }),
-          el("span", { class: "ctx-detail", text:
-            "this script also restores " + (data.victim_count || 0) + " related row(s) that MySQL deleted automatically" +
-            (data.set_null_count ? " and fixes " + data.set_null_count + " reference(s) that were cleared automatically" : "") }))));
+          el("span", { class: "ctx-eyebrow", text: "Also repairing rows MySQL changed automatically along with this one" }),
+          el("span", { class: "ctx-detail", text: "this script also " + parts.join(", ") + "." }))));
     }
     const meta = data.cascade_detected
-      ? data.statement_count + " statement(s) · " + (data.victim_count || 0) + " cascade child row(s) · " + (data.set_null_count || 0) + " SET NULL restore(s)"
+      ? data.statement_count + " statement(s) · " + (data.victim_count || 0) + " cascade child row(s) · " +
+        (data.set_null_count || 0) + " SET NULL restore(s) · " + (data.key_restore_count || 0) + " FK restore(s)"
       : data.statement_count + " statement(s) from " + data.row_count + " event(s)";
     out.append(codePanel(lastSQL, meta));
   } catch (err) {

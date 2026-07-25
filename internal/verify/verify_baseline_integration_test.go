@@ -541,6 +541,62 @@ func TestFindBaselinePair_UnpairedAndSelection(t *testing.T) {
 	}
 }
 
+// TestFindBaselinePair_PairsSorted pins that FindBaselinePair returns `pairs`
+// ordered by schema.table, not in map-iteration order. Everything downstream
+// inherits this order — the sequence VerifyBaselinePair runs in, and the
+// `explain[]` array of `verify --explain --format json`, which appends one
+// entry per mismatched pair — while `tables[]` is sorted independently in
+// NewReport, so an unsorted `pairs` shows up as two arrays in the same JSON
+// document disagreeing about order between identical runs.
+//
+// FindBaselinePair is called repeatedly because Go randomizes map iteration
+// per range: one unsorted call over these six tables would still come back
+// sorted by luck about 1 time in 720.
+func TestFindBaselinePair_PairsSorted(t *testing.T) {
+	baseDir := t.TempDir()
+	now := time.Now().UTC()
+	createSQL := "CREATE TABLE `t` (\n  `id` INT NOT NULL,\n  PRIMARY KEY (`id`)\n);\n"
+	cols := []baseline.Column{{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")}}
+	rows := [][]string{{"1"}}
+	prevTS := now.Truncate(time.Hour).Add(-2 * time.Hour)
+	newTS := now.Truncate(time.Hour).Add(-1 * time.Hour)
+
+	// Written in an order that is neither sorted nor reverse-sorted, across two
+	// schemas, so neither the map's nor the writer's order can pass by accident.
+	type st struct{ schema, table string }
+	tables := []st{
+		{"shop", "orders"}, {"analytics", "sessions"}, {"shop", "audit"},
+		{"analytics", "events"}, {"shop", "customers"}, {"analytics", "hits"},
+	}
+	for _, x := range tables {
+		writeTestBaseline(t, baseDir, prevTS, x.schema, x.table, createSQL, cols, rows, "binlog.000001", 200)
+		writeTestBaseline(t, baseDir, newTS, x.schema, x.table, createSQL, cols, rows, "binlog.000001", 300)
+	}
+
+	want := []string{
+		"analytics.events", "analytics.hits", "analytics.sessions",
+		"shop.audit", "shop.customers", "shop.orders",
+	}
+	for attempt := range 5 {
+		pairs, _, _, err := FindBaselinePair(context.Background(), baseDir)
+		if err != nil {
+			t.Fatalf("FindBaselinePair (attempt %d): %v", attempt, err)
+		}
+		var got []string
+		for _, p := range pairs {
+			got = append(got, p.Schema+"."+p.Table)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("attempt %d: got %d pairs %v, want %d", attempt, len(got), got, len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("attempt %d: pairs order = %v, want %v", attempt, got, want)
+			}
+		}
+	}
+}
+
 // TestFindBaselinePair_PrevOnly locks the symmetric reverse of the unpaired
 // case: a table present in the previous snapshot but absent from the newest one
 // (a drop, or a subset "--tables" re-baseline) must surface in prevOnly, never

@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/dbtrail/dbtrail/internal/cascade"
@@ -36,7 +37,11 @@ import (
 // count is NOT carried here — EmitSQL derives it from len(setNullRows) so a
 // caller can never desync the header count from the statements emitted.
 type Header struct {
-	Schema, Table     string
+	Schema, Table string
+	// Parents is the number of PARENT rows whose own change is reversed in this
+	// script — deleted parents plus the parent-key UPDATEs that actually cascaded
+	// (cascade.Result.KeyUpdateParents). Children is the cascade-deleted child
+	// count.
 	Parents, Children int
 	// Caveats are reasons the recovery is PROVABLY PARTIAL (cascade.Result.
 	// Incomplete) — rendered under the "!!! INCOMPLETE RECOVERY" banner below.
@@ -58,11 +63,12 @@ type Header struct {
 }
 
 // EmitSQL writes the documented preamble, the FK-checks-off wrapper, the CASCADE
-// reversal statements (DELETE→INSERT via the generator), and the SET NULL FK
-// restorations (idempotent guarded UPDATEs). Returns the total statement count.
-// resolver supplies child PK columns for the SET NULL WHERE clauses; gen must be
-// built from the same (or an equivalent) resolver (recovery.New(db, resolver)).
-func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNullRows []cascade.SetNullRestore, resolver *metadata.Resolver, hdr Header) (int, error) {
+// reversal statements (DELETE→INSERT via the generator), the ON DELETE SET NULL
+// FK restorations and the ON UPDATE CASCADE / SET NULL key restorations (both
+// idempotent guarded UPDATEs). Returns the total statement count. resolver
+// supplies child PK columns for the restore WHERE clauses; gen must be built
+// from the same (or an equivalent) resolver (recovery.New(db, resolver)).
+func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNullRows []cascade.SetNullRestore, keyUpdates []cascade.FKKeyRestore, resolver *metadata.Resolver, hdr Header) (int, error) {
 	// Enforce the recover script-size budget first (#654). GenerateSQLFromRows
 	// re-checks it before rendering, but checking here keeps the refusal
 	// precedence stable (budget outranks a SET NULL build error below) and also
@@ -81,27 +87,38 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 		}
 	}
 
-	// Build every SET NULL restoration BEFORE writing a byte (all-or-nothing): a
-	// missing resolver, an unresolvable table, or an absent PK column must abort
-	// the whole emit cleanly — returning mid-script would leave the parent/child
-	// INSERTs written but drop the closing `SET FOREIGN_KEY_CHECKS=1`, handing the
-	// operator a script that re-enables nothing.
+	// Build every FK restoration — the ON DELETE SET NULL ones and the ON UPDATE
+	// key ones — BEFORE writing a byte (all-or-nothing): a missing resolver, an
+	// unresolvable table, or an absent PK column must abort the whole emit
+	// cleanly. Returning mid-script would leave the parent/child INSERTs written
+	// but drop the closing `SET FOREIGN_KEY_CHECKS=1`, handing the operator a
+	// script that re-enables nothing.
+	if resolver == nil && (len(setNullRows) > 0 || len(keyUpdates) > 0) {
+		return 0, fmt.Errorf("a schema snapshot is required to restore foreign keys an InnoDB cascade nulled or rewrote (run `bintrail snapshot`)")
+	}
 	var setNullStmts []string
-	if len(setNullRows) > 0 {
-		if resolver == nil {
-			return 0, fmt.Errorf("a schema snapshot is required to restore SET NULL foreign keys (run `bintrail snapshot`)")
+	for _, sr := range setNullRows {
+		tm, terr := resolver.Resolve(sr.Schema, sr.Table)
+		if terr != nil {
+			return 0, fmt.Errorf("resolve %s.%s for SET NULL restore: %w", sr.Schema, sr.Table, terr)
 		}
-		for _, sr := range setNullRows {
-			tm, terr := resolver.Resolve(sr.Schema, sr.Table)
-			if terr != nil {
-				return 0, fmt.Errorf("resolve %s.%s for SET NULL restore: %w", sr.Schema, sr.Table, terr)
-			}
-			stmt, ferr := recovery.FormatSetNullRestore(sr.Schema, sr.Table, sr.Column, sr.Value, tm.PKColumnMetas(), sr.Row)
-			if ferr != nil {
-				return 0, ferr
-			}
-			setNullStmts = append(setNullStmts, stmt)
+		stmt, ferr := recovery.FormatSetNullRestore(sr.Schema, sr.Table, sr.Column, sr.Value, tm.PKColumnMetas(), sr.Row)
+		if ferr != nil {
+			return 0, ferr
 		}
+		setNullStmts = append(setNullStmts, stmt)
+	}
+	var keyUpdateStmts []string
+	for _, kr := range keyUpdates {
+		tm, terr := resolver.Resolve(kr.Schema, kr.Table)
+		if terr != nil {
+			return 0, fmt.Errorf("resolve %s.%s for ON UPDATE cascade restore: %w", kr.Schema, kr.Table, terr)
+		}
+		stmt, ferr := recovery.FormatFKCascadeRestore(kr.Schema, kr.Table, kr.Column, kr.OldValue, kr.NewValue, tm.PKColumnMetas(), kr.Row)
+		if ferr != nil {
+			return 0, ferr
+		}
+		keyUpdateStmts = append(keyUpdateStmts, stmt)
 	}
 
 	// Render the CASCADE reversal statements into a buffer BEFORE the preamble
@@ -128,14 +145,17 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 
 	var b strings.Builder
 	if hdr.Combined {
-		fmt.Fprintf(&b, "-- bintrail recover (cascade-aware): undo %s.%s, including the foreign-key ON DELETE\n", hdr.Schema, hdr.Table)
-		b.WriteString("-- CASCADE / SET NULL side effects InnoDB ran below the binlog (MySQL Bug #32506).\n")
-		fmt.Fprintf(&b, "-- Re-creates %d cascade-deleted child row(s) and restores %d SET NULL'd FK(s) alongside\n", hdr.Children, len(setNullRows))
-		b.WriteString("-- the reversal of the selected change(s). NEVER auto-applied.\n")
+		fmt.Fprintf(&b, "-- bintrail recover (cascade-aware): undo %s.%s, including the foreign-key\n", hdr.Schema, hdr.Table)
+		b.WriteString("-- ON DELETE / ON UPDATE CASCADE / SET NULL side effects InnoDB ran below the\n")
+		b.WriteString("-- binlog (MySQL Bug #32506).\n")
+		fmt.Fprintf(&b, "-- Re-creates %d cascade-deleted child row(s), restores %d SET NULL'd FK(s) and %d\n", hdr.Children, len(setNullRows), len(keyUpdates))
+		b.WriteString("-- cascade-rewritten FK(s) alongside the reversal of the selected change(s).\n")
+		b.WriteString("-- NEVER auto-applied.\n")
 	} else {
-		fmt.Fprintf(&b, "-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on %s.%s\n", hdr.Schema, hdr.Table)
-		fmt.Fprintf(&b, "-- Re-inserts %d deleted parent row(s) and %d cascade-deleted child row(s); restores %d SET NULL'd FK(s)\n", hdr.Parents, hdr.Children, len(setNullRows))
-		b.WriteString("-- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.\n")
+		fmt.Fprintf(&b, "-- bintrail recover-cascade: reverse ON DELETE / ON UPDATE CASCADE / SET NULL side effects on %s.%s\n", hdr.Schema, hdr.Table)
+		fmt.Fprintf(&b, "-- Reverses %d parent row change(s) and re-inserts %d cascade-deleted child row(s); restores\n", hdr.Parents, hdr.Children)
+		fmt.Fprintf(&b, "-- %d SET NULL'd FK(s) and %d cascade-rewritten FK(s) that InnoDB removed/nulled/rewrote\n", len(setNullRows), len(keyUpdates))
+		b.WriteString("-- below the binlog (MySQL Bug #32506). NEVER auto-applied.\n")
 	}
 	b.WriteString("--\n")
 	if hdr.BaselineActive {
@@ -190,8 +210,52 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 		}
 	}
 
+	// ON UPDATE cascade restorations: same idempotent shape as the SET NULL block
+	// above, but guarded on the value the cascade actually left behind (the
+	// parent's NEW key under ON UPDATE CASCADE, NULL under ON UPDATE SET NULL) —
+	// so a child re-pointed after the cascade is never clobbered either.
+	if len(keyUpdateStmts) > 0 {
+		if _, err := io.WriteString(w, "\n-- ON UPDATE cascade FK restorations (idempotent: only rows whose FK still holds the cascaded value):\n"); err != nil {
+			return n, err
+		}
+		for _, stmt := range keyUpdateStmts {
+			if _, werr := io.WriteString(w, stmt+";\n"); werr != nil {
+				return n, werr
+			}
+			n++
+		}
+	}
+
 	if _, err := io.WriteString(w, "\nSET FOREIGN_KEY_CHECKS=1;\n"); err != nil {
 		return n, err
 	}
 	return n, nil
+}
+
+// MergeParentRoots combines the parent DELETE roots with the parent key-UPDATE
+// roots into ONE chronological list, which is what EmitSQL's generator requires.
+//
+// recovery.GenerateSQLFromRows does not sort: it trusts the caller's order and
+// reverses it, so the most recent change is undone first. Concatenating the two
+// root sets — DELETEs, then UPDATEs — throws that away. A parent key-UPDATEd at
+// t1 and DELETEd at t2 (both in the window) would emit the UPDATE-undo first,
+// against a row the later-emitted INSERT has not re-created yet: it matches 0
+// rows, and the INSERT then restores the POST-update image. The parent is left
+// silently wrong.
+//
+// sort.SliceStable over the concatenation, rather than a two-list merge, so the
+// result is correct even if a caller ever hands over a set that is not itself
+// ascending; ties keep DELETEs before UPDATEs of the same (timestamp, id), which
+// only synthetic rows without a real EventID can produce.
+func MergeParentRoots(deletes, keyUpdates []query.ResultRow) []query.ResultRow {
+	out := make([]query.ResultRow, 0, len(deletes)+len(keyUpdates))
+	out = append(out, deletes...)
+	out = append(out, keyUpdates...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].EventTimestamp.Equal(out[j].EventTimestamp) {
+			return out[i].EventTimestamp.Before(out[j].EventTimestamp)
+		}
+		return out[i].EventID < out[j].EventID
+	})
+	return out
 }

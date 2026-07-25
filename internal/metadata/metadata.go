@@ -1389,7 +1389,7 @@ func CascadeConstraintsInIndex(indexDB *sql.DB, schemas []string) ([]FKCascadeEd
 	query := `SELECT schema_name, table_name, column_name, referenced_table_name, delete_rule, update_rule
 		FROM fk_constraints
 		WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)
-		  AND (delete_rule IN ('CASCADE', 'SET NULL') OR update_rule = 'CASCADE')`
+		  AND (delete_rule IN ('CASCADE', 'SET NULL') OR update_rule IN ('CASCADE', 'SET NULL'))`
 	var args []any
 	if len(schemas) > 0 {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
@@ -1430,26 +1430,47 @@ func CascadeConstraintsInIndex(indexDB *sql.DB, schemas []string) ([]FKCascadeEd
 //
 // Returns false (not an error) when fk_constraints is absent (index predates it).
 func IsCascadeParentInIndex(indexDB *sql.DB, schema, table string) (bool, error) {
+	onDelete, _, err := CascadeParentRulesInIndex(indexDB, schema, table)
+	return onDelete, err
+}
+
+// CascadeParentRulesInIndex is IsCascadeParentInIndex split by referential
+// ACTION: onDelete reports an ON DELETE CASCADE / SET NULL child, onUpdate an
+// ON UPDATE CASCADE / SET NULL one. The two must stay separate at every
+// detection site (#1002): a DELETE only cascades through delete_rule and a
+// referenced-key UPDATE only through update_rule, so routing a DELETE recover
+// into cascade synthesis on the strength of an ON UPDATE edge (or vice versa)
+// would surface a misleading "0 victims" and, worse, teach the operator the
+// signal is noise.
+//
+// Both flags include cross-schema children (matching on referenced_schema_name +
+// referenced_table_name, #833). Returns false/false (not an error) when
+// fk_constraints is absent (index predates it).
+func CascadeParentRulesInIndex(indexDB *sql.DB, schema, table string) (onDelete, onUpdate bool, err error) {
 	var exists bool
 	if err := indexDB.QueryRow(
 		"SELECT COUNT(*) > 0 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fk_constraints'",
 	).Scan(&exists); err != nil {
-		return false, fmt.Errorf("failed to check fk_constraints table: %w", err)
+		return false, false, fmt.Errorf("failed to check fk_constraints table: %w", err)
 	}
 	if !exists {
-		return false, nil
+		return false, false, nil
 	}
-	var isParent bool
 	if err := indexDB.QueryRow(
-		`SELECT COUNT(*) > 0 FROM fk_constraints
+		// COALESCE, not a bare SUM(...)>0: with no matching rows the aggregate is
+		// NULL, which fails the bool Scan outright instead of reporting "not a
+		// cascade parent".
+		`SELECT
+			COALESCE(SUM(delete_rule IN ('CASCADE', 'SET NULL')) > 0, 0),
+			COALESCE(SUM(update_rule IN ('CASCADE', 'SET NULL')) > 0, 0)
+		 FROM fk_constraints
 			WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM fk_constraints)
-			  AND referenced_schema_name = ? AND referenced_table_name = ?
-			  AND delete_rule IN ('CASCADE', 'SET NULL')`,
+			  AND referenced_schema_name = ? AND referenced_table_name = ?`,
 		schema, table,
-	).Scan(&isParent); err != nil {
-		return false, fmt.Errorf("failed to query cascade parent constraints: %w", err)
+	).Scan(&onDelete, &onUpdate); err != nil {
+		return false, false, fmt.Errorf("failed to query cascade parent constraints: %w", err)
 	}
-	return isParent, nil
+	return onDelete, onUpdate, nil
 }
 
 // EnsureResolver returns a Resolver loaded from the latest snapshot, taking a

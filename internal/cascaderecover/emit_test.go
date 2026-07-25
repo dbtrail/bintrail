@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/cascade"
 	"github.com/dbtrail/dbtrail/internal/cascaderecover"
@@ -22,7 +23,7 @@ import (
 func emit(t *testing.T, hdr cascaderecover.Header, rows []query.ResultRow, setNull []cascade.SetNullRestore, resolver *metadata.Resolver) (string, int, error) {
 	t.Helper()
 	var buf bytes.Buffer
-	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, resolver), rows, setNull, resolver, hdr)
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, resolver), rows, setNull, nil, resolver, hdr)
 	return buf.String(), n, err
 }
 
@@ -43,7 +44,7 @@ func TestEmitSQL_scriptBudgetRefusesCleanly(t *testing.T) {
 	gen.SetMaxScriptBytes(1024) // tiny budget → the 1 MiB row trips it
 
 	var buf bytes.Buffer
-	n, err := cascaderecover.EmitSQL(&buf, gen, rows, nil, nil, hdr)
+	n, err := cascaderecover.EmitSQL(&buf, gen, rows, nil, nil, nil, hdr)
 
 	var be *recovery.ScriptBudgetError
 	if !errors.As(err, &be) {
@@ -72,7 +73,7 @@ func TestEmitSQL_unresolvedToastMarkerRefusesCleanly(t *testing.T) {
 	}}
 
 	var buf bytes.Buffer
-	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, nil), rows, nil, nil, hdr)
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, nil), rows, nil, nil, nil, hdr)
 	if err == nil {
 		t.Fatalf("expected a loud error, got n=%d output:\n%s", n, buf.String())
 	}
@@ -114,7 +115,7 @@ func TestEmitSQL_generationFailureRefusesCleanly(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, nil), rows, nil, nil, hdr)
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, nil), rows, nil, nil, nil, hdr)
 	if err == nil {
 		t.Fatalf("expected a loud error, got n=%d output:\n%s", n, buf.String())
 	}
@@ -178,9 +179,10 @@ func TestEmitSQL_goldenPhase1(t *testing.T) {
 		Parents: 1, Children: 2,
 		BaselineActive: false,
 	}
-	const want = `-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on shop.orders
--- Re-inserts 1 deleted parent row(s) and 2 cascade-deleted child row(s); restores 0 SET NULL'd FK(s)
--- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.
+	const want = `-- bintrail recover-cascade: reverse ON DELETE / ON UPDATE CASCADE / SET NULL side effects on shop.orders
+-- Reverses 1 parent row change(s) and re-inserts 2 cascade-deleted child row(s); restores
+-- 0 SET NULL'd FK(s) and 0 cascade-rewritten FK(s) that InnoDB removed/nulled/rewrote
+-- below the binlog (MySQL Bug #32506). NEVER auto-applied.
 --
 -- Phase-1 (binlog-window) recovery: a child untouched within --lookback and not
 -- in a baseline is NOT reconstructed — pass --baseline-dir/--baseline-s3 to enable
@@ -215,9 +217,10 @@ func TestEmitSQL_goldenPhase2Active(t *testing.T) {
 		Parents: 3, Children: 5,
 		BaselineActive: true,
 	}
-	const want = `-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on shop.orders
--- Re-inserts 3 deleted parent row(s) and 5 cascade-deleted child row(s); restores 0 SET NULL'd FK(s)
--- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.
+	const want = `-- bintrail recover-cascade: reverse ON DELETE / ON UPDATE CASCADE / SET NULL side effects on shop.orders
+-- Reverses 3 parent row change(s) and re-inserts 5 cascade-deleted child row(s); restores
+-- 0 SET NULL'd FK(s) and 0 cascade-rewritten FK(s) that InnoDB removed/nulled/rewrote
+-- below the binlog (MySQL Bug #32506). NEVER auto-applied.
 --
 -- Phase-2 baseline fallback ACTIVE: children present in a covered baseline are
 -- reconstructed even if untouched within the window. Tables NOT covered by a
@@ -253,9 +256,10 @@ func TestEmitSQL_goldenCaveats(t *testing.T) {
 			"per-parent overflow at --limit",
 		},
 	}
-	const want = `-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on shop.orders
--- Re-inserts 1 deleted parent row(s) and 0 cascade-deleted child row(s); restores 0 SET NULL'd FK(s)
--- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.
+	const want = `-- bintrail recover-cascade: reverse ON DELETE / ON UPDATE CASCADE / SET NULL side effects on shop.orders
+-- Reverses 1 parent row change(s) and re-inserts 0 cascade-deleted child row(s); restores
+-- 0 SET NULL'd FK(s) and 0 cascade-rewritten FK(s) that InnoDB removed/nulled/rewrote
+-- below the binlog (MySQL Bug #32506). NEVER auto-applied.
 --
 -- Phase-1 (binlog-window) recovery: a child untouched within --lookback and not
 -- in a baseline is NOT reconstructed — pass --baseline-dir/--baseline-s3 to enable
@@ -296,9 +300,10 @@ func TestEmitSQL_goldenWarnings(t *testing.T) {
 			"baseline for shop.orders is stale: the table is absent from the newest snapshot (2026-02-01T00:00:00Z); reconstructing from an older snapshot (2026-01-01T00:00:00Z) — re-dump to refresh it",
 		},
 	}
-	const want = `-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on shop.orders
--- Re-inserts 1 deleted parent row(s) and 0 cascade-deleted child row(s); restores 0 SET NULL'd FK(s)
--- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.
+	const want = `-- bintrail recover-cascade: reverse ON DELETE / ON UPDATE CASCADE / SET NULL side effects on shop.orders
+-- Reverses 1 parent row change(s) and re-inserts 0 cascade-deleted child row(s); restores
+-- 0 SET NULL'd FK(s) and 0 cascade-rewritten FK(s) that InnoDB removed/nulled/rewrote
+-- below the binlog (MySQL Bug #32506). NEVER auto-applied.
 --
 -- Phase-2 baseline fallback ACTIVE: children present in a covered baseline are
 -- reconstructed even if untouched within the window. Tables NOT covered by a
@@ -390,9 +395,10 @@ func TestEmitSQL_goldenSetNull(t *testing.T) {
 	// here (a double-quoted literal — a backtick raw string cannot contain the
 	// backtick identifier quoting).
 	const update = "UPDATE `shop`.`orders` SET `customer_id` = 42 WHERE `id` = 7 AND `customer_id` IS NULL"
-	want := `-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on shop.orders
--- Re-inserts 1 deleted parent row(s) and 0 cascade-deleted child row(s); restores 1 SET NULL'd FK(s)
--- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.
+	want := `-- bintrail recover-cascade: reverse ON DELETE / ON UPDATE CASCADE / SET NULL side effects on shop.orders
+-- Reverses 1 parent row change(s) and re-inserts 0 cascade-deleted child row(s); restores
+-- 1 SET NULL'd FK(s) and 0 cascade-rewritten FK(s) that InnoDB removed/nulled/rewrote
+-- below the binlog (MySQL Bug #32506). NEVER auto-applied.
 --
 -- Phase-1 (binlog-window) recovery: a child untouched within --lookback and not
 -- in a baseline is NOT reconstructed — pass --baseline-dir/--baseline-s3 to enable
@@ -436,7 +442,7 @@ func TestEmitSQL_setNullNilResolverIsAllOrNothing(t *testing.T) {
 		Value: 42, PKValues: "7", Row: map[string]any{"id": 7},
 	}}
 	var buf bytes.Buffer
-	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, nil), nil, setNull, nil, hdr)
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, nil), nil, setNull, nil, nil, hdr)
 	if err == nil {
 		t.Fatal("expected an error when SET NULL rows exist with a nil resolver")
 	}
@@ -458,7 +464,7 @@ func TestEmitSQL_setNullUnresolvableTableIsAllOrNothing(t *testing.T) {
 		Value: 42, PKValues: "7", Row: map[string]any{"id": 7},
 	}}
 	var buf bytes.Buffer
-	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, orderResolver()), nil, setNull, orderResolver(), hdr)
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, orderResolver()), nil, setNull, nil, orderResolver(), hdr)
 	if err == nil {
 		t.Fatal("expected an error when the SET NULL table is absent from the resolver")
 	}
@@ -482,7 +488,7 @@ func TestEmitSQL_setNullAbsentPKColumnIsAllOrNothing(t *testing.T) {
 		Row: map[string]any{"customer_id": nil}, // PK column "id" absent
 	}}
 	var buf bytes.Buffer
-	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, orderResolver()), nil, setNull, orderResolver(), hdr)
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, orderResolver()), nil, setNull, nil, orderResolver(), hdr)
 	if err == nil {
 		t.Fatal("expected an error when the SET NULL row is missing a PK column")
 	}
@@ -511,9 +517,10 @@ func TestEmitSQL_goldenSetNullMultiRow(t *testing.T) {
 	}
 	const update1 = "UPDATE `shop`.`orders` SET `customer_id` = 42 WHERE `id` = 7 AND `customer_id` IS NULL"
 	const update2 = "UPDATE `shop`.`orders` SET `customer_id` = 99 WHERE `id` = 8 AND `customer_id` IS NULL"
-	want := `-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on shop.orders
--- Re-inserts 1 deleted parent row(s) and 0 cascade-deleted child row(s); restores 2 SET NULL'd FK(s)
--- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.
+	want := `-- bintrail recover-cascade: reverse ON DELETE / ON UPDATE CASCADE / SET NULL side effects on shop.orders
+-- Reverses 1 parent row change(s) and re-inserts 0 cascade-deleted child row(s); restores
+-- 2 SET NULL'd FK(s) and 0 cascade-rewritten FK(s) that InnoDB removed/nulled/rewrote
+-- below the binlog (MySQL Bug #32506). NEVER auto-applied.
 --
 -- Phase-1 (binlog-window) recovery: a child untouched within --lookback and not
 -- in a baseline is NOT reconstructed — pass --baseline-dir/--baseline-s3 to enable
@@ -545,5 +552,103 @@ SET FOREIGN_KEY_CHECKS=1;
 	}
 	if n != 2 {
 		t.Errorf("statement count = %d, want 2 (0 rows + 2 SET NULL)", n)
+	}
+}
+
+// TestEmitSQL_goldenKeyUpdate pins the ON UPDATE cascade section (#1002): its
+// own header (distinct from the SET NULL one, because the guard is a VALUE
+// comparison rather than IS NULL), the guarded UPDATE produced by
+// recovery.FormatFKCascadeRestore, the per-statement semicolon, the incremented
+// statement count, and the closing FK-checks re-enable landing after it.
+func TestEmitSQL_goldenKeyUpdate(t *testing.T) {
+	hdr := cascaderecover.Header{Schema: "shop", Table: "orders", Parents: 1}
+	keyUpdates := []cascade.FKKeyRestore{{
+		Schema: "shop", Table: "orders", Column: "customer_id",
+		OldValue: 42, NewValue: 77, PKValues: "7", Row: map[string]any{"id": 7},
+	}}
+	var buf bytes.Buffer
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, orderResolver()), nil, nil, keyUpdates, orderResolver(), hdr)
+	if err != nil {
+		t.Fatalf("EmitSQL: %v", err)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "-- ON UPDATE cascade FK restorations (idempotent: only rows whose FK still holds the cascaded value):\n") {
+		t.Errorf("missing the ON UPDATE restoration section header:\n%s", got)
+	}
+	want := "UPDATE `shop`.`orders` SET `customer_id` = 42 WHERE `id` = 7 AND `customer_id` = 77;\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("missing the guarded restore %q in:\n%s", want, got)
+	}
+	if n != 1 {
+		t.Errorf("statement count = %d, want 1 (the restore)", n)
+	}
+	if idx, end := strings.Index(got, want), strings.Index(got, "SET FOREIGN_KEY_CHECKS=1;"); idx < 0 || end < idx {
+		t.Errorf("the restore must be emitted INSIDE the FK-checks-off wrapper:\n%s", got)
+	}
+	if !strings.Contains(got, "1 cascade-rewritten FK(s)") {
+		t.Errorf("the preamble must count the key restores:\n%s", got)
+	}
+}
+
+// TestEmitSQL_keyUpdateNilResolverIsAllOrNothing mirrors the SET NULL guard: the
+// ON UPDATE restores need PK columns too, so a nil resolver must abort BEFORE a
+// single byte — never a script whose closing SET FOREIGN_KEY_CHECKS=1 is missing.
+func TestEmitSQL_keyUpdateNilResolverIsAllOrNothing(t *testing.T) {
+	hdr := cascaderecover.Header{Schema: "shop", Table: "orders"}
+	keyUpdates := []cascade.FKKeyRestore{{
+		Schema: "shop", Table: "orders", Column: "customer_id",
+		OldValue: 42, NewValue: 77, PKValues: "7", Row: map[string]any{"id": 7},
+	}}
+	var buf bytes.Buffer
+	n, err := cascaderecover.EmitSQL(&buf, recovery.New(nil, nil), nil, nil, keyUpdates, nil, hdr)
+	if err == nil {
+		t.Fatal("expected an error when ON UPDATE restores exist with a nil resolver")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("all-or-nothing violated: %d bytes written before abort:\n%q", buf.Len(), buf.String())
+	}
+	if n != 0 {
+		t.Errorf("statement count = %d, want 0 on abort", n)
+	}
+}
+
+// TestMergeParentRoots_interleavesChronologically is the ordering guard behind
+// the mixed-root script. recovery.GenerateSQLFromRows does not sort — it
+// reverses the caller's order — so concatenating "all DELETEs, then all UPDATEs"
+// emits the undo of a parent key UPDATE at t1 BEFORE the re-INSERT of the same
+// parent DELETEd at t2. The UPDATE-undo then matches 0 rows and the INSERT
+// restores the post-update image: the parent is left silently wrong.
+func TestMergeParentRoots_interleavesChronologically(t *testing.T) {
+	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	upd := []query.ResultRow{
+		{EventID: 1, EventTimestamp: base, EventType: event.EventUpdate, PKValues: "u1"},
+		{EventID: 4, EventTimestamp: base.Add(3 * time.Second), EventType: event.EventUpdate, PKValues: "u2"},
+	}
+	del := []query.ResultRow{
+		{EventID: 2, EventTimestamp: base.Add(1 * time.Second), EventType: event.EventDelete, PKValues: "d1"},
+		{EventID: 3, EventTimestamp: base.Add(2 * time.Second), EventType: event.EventDelete, PKValues: "d2"},
+	}
+	got := cascaderecover.MergeParentRoots(del, upd)
+	var order []string
+	for _, r := range got {
+		order = append(order, r.PKValues)
+	}
+	want := []string{"u1", "d1", "d2", "u2"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Errorf("roots are not chronological: got %v, want %v", order, want)
+	}
+}
+
+// TestMergeParentRoots_tiesBreakOnEventID pins the second sort key: two roots
+// can share a whole-second event_timestamp (binlog DATETIMEs have no fractional
+// part), so the auto-increment EventID is what keeps the order deterministic.
+func TestMergeParentRoots_tiesBreakOnEventID(t *testing.T) {
+	ts := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	got := cascaderecover.MergeParentRoots(
+		[]query.ResultRow{{EventID: 7, EventTimestamp: ts, PKValues: "d"}},
+		[]query.ResultRow{{EventID: 5, EventTimestamp: ts, PKValues: "u"}},
+	)
+	if len(got) != 2 || got[0].PKValues != "u" || got[1].PKValues != "d" {
+		t.Errorf("same-second roots must order by EventID, got %+v", got)
 	}
 }

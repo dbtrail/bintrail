@@ -1500,6 +1500,107 @@ func TestGenerateMySQL_PinsSQLMode(t *testing.T) {
 	}
 }
 
+// ─── FormatFKCascadeRestore (ON UPDATE cascades, #1002) ──────────────────────
+
+// TestFormatFKCascadeRestore_guardsOnCascadedValue pins the ON UPDATE CASCADE
+// shape: the FK goes back to the OLD parent key, guarded on the NEW one InnoDB
+// wrote there — so a child re-pointed after the cascade is never clobbered.
+func TestFormatFKCascadeRestore_guardsOnCascadedValue(t *testing.T) {
+	pk := []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}
+	row := map[string]any{"id": json.Number("10"), "pid": json.Number("99")}
+	got, err := FormatFKCascadeRestore("app", "child", "pid", json.Number("1"), json.Number("99"), pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "UPDATE `app`.`child` SET `pid` = 1 WHERE `id` = 10 AND `pid` = 99"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
+// TestFormatFKCascadeRestore_nilCascadedValueIsNullGuard covers ON UPDATE SET
+// NULL (and an ON UPDATE CASCADE to a NULL key): the guard degrades to IS NULL,
+// which is exactly FormatSetNullRestore's rendering — a `= NULL` comparison
+// would silently match no row.
+func TestFormatFKCascadeRestore_nilCascadedValueIsNullGuard(t *testing.T) {
+	pk := []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}
+	row := map[string]any{"id": json.Number("10"), "pid": nil}
+	got, err := FormatFKCascadeRestore("app", "child", "pid", json.Number("1"), nil, pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "UPDATE `app`.`child` SET `pid` = 1 WHERE `id` = 10 AND `pid` IS NULL"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+	same, err := FormatSetNullRestore("app", "child", "pid", json.Number("1"), pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if same != got {
+		t.Errorf("FormatSetNullRestore must stay byte-identical to the nil-cascadedValue form:\n got  %q\n want %q", same, got)
+	}
+}
+
+// TestFormatFKCascadeRestore_stringKeysQuoted checks a CHAR/VARCHAR referenced
+// key: both the restored value and the guard must be quoted + escaped.
+func TestFormatFKCascadeRestore_stringKeysQuoted(t *testing.T) {
+	pk := []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}
+	row := map[string]any{"id": json.Number("10"), "code": "n'ew"}
+	got, err := FormatFKCascadeRestore("app", "child", "code", "o'ld", "n'ew", pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(got, "SET `code` = 'o\\'ld'") || !strings.Contains(got, "AND `code` = 'n\\'ew'") {
+		t.Errorf("string key not quoted/escaped on both sides: %q", got)
+	}
+}
+
+// TestFormatFKCascadeRestore_fkInsidePK is the identifying-relationship case:
+// the FK column is part of the child's PRIMARY KEY, so the ON UPDATE CASCADE
+// moved the child's PK too. Building the PK predicate from the pre-cascade image
+// AND appending the guard would name `pid` twice with contradictory values
+// (`pid = 1 AND seq = 1 AND pid = 99`) — a predicate no row satisfies, so the
+// restore would silently touch nothing while reporting success. The FK's PK term
+// must carry the POST-cascade value and double as the guard.
+func TestFormatFKCascadeRestore_fkInsidePK(t *testing.T) {
+	pk := []metadata.ColumnMeta{
+		{Name: "pid", IsPK: true, DataType: "int"},
+		{Name: "seq", IsPK: true, DataType: "int"},
+	}
+	row := map[string]any{"pid": json.Number("1"), "seq": json.Number("1")} // pre-cascade image
+	got, err := FormatFKCascadeRestore("app", "line", "pid", json.Number("1"), json.Number("99"), pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "UPDATE `app`.`line` SET `pid` = 1 WHERE `pid` = 99 AND `seq` = 1"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+	if strings.Count(got, "`pid` =") != 2 { // once in SET, once in WHERE — never twice in WHERE
+		t.Errorf("the FK column must appear exactly once in the WHERE clause: %q", got)
+	}
+}
+
+// TestFormatFKCascadeRestore_fkInsidePKNullCascadedRefuses: a PK column cannot
+// be NULL, so "the cascade nulled a PK column" means the snapshot's PK no longer
+// matches the live table. Emitting `pid IS NULL` would be a guaranteed no-op
+// dressed as a recovery, so the formatter refuses instead.
+func TestFormatFKCascadeRestore_fkInsidePKNullCascadedRefuses(t *testing.T) {
+	pk := []metadata.ColumnMeta{
+		{Name: "pid", IsPK: true, DataType: "int"},
+		{Name: "seq", IsPK: true, DataType: "int"},
+	}
+	row := map[string]any{"pid": json.Number("1"), "seq": json.Number("1")}
+	_, err := FormatFKCascadeRestore("app", "line", "pid", json.Number("1"), nil, pk, row)
+	if err == nil {
+		t.Fatal("want an error when the cascade nulled a column the snapshot calls part of the PK")
+	}
+	if !strings.Contains(err.Error(), "PRIMARY KEY") {
+		t.Errorf("the error must name the drift it detected, got %q", err)
+	}
+}
+
 // ─── FormatSetNullRestore ────────────────────────────────────────────────────
 
 func TestFormatSetNullRestore_singlePKIntValue(t *testing.T) {

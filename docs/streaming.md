@@ -154,6 +154,40 @@ When binlogs have been purged and the gap cannot be filled:
 3. The stream resumes from the earliest available position.
 4. **The loss is recorded durably** — it is not just a log line that scrolls away. The gap is stamped in `stream_state` (`gap_lost_at` / `gap_lost_detail`), so `bintrail status` reports `Continuity: ⚠ GAP LOST` and a loud `=== ⚠ EVENTS PERMANENTLY LOST ===` banner from then on (and `stream.continuity.status: "gap_lost"` under `--format json`), even after the capture process has exited. The index up to the gap stays valid for recovery; resuming capture cleanly requires a re-baseline. To alert on this in CI/cron, run `bintrail status --fail-on-gap` (exits non-zero, fails closed). See [Rotation & Status](rotation-and-status.md#stream-continuity-no-data-lost).
 
+#### Known and accepted: duplicate rows after a GTID-mode auto-advance
+
+An unfillable-gap auto-advance in **GTID mode** is the one case where the
+resume-time dedup described under [Checkpointing and `stream_state`](#checkpointing-and-stream_state)
+is deliberately **skipped**. The stream logs it explicitly:
+
+```
+WARN skipping dedup-on-resume after GTID gap auto-advance; re-received events in this
+window may be duplicated — this is a known, accepted trade-off (deleting on the
+pre-advance coordinates would destroy already-captured rows below the purge floor)
+```
+
+If any events in the advanced-over window had already been indexed before the
+crash, MySQL may re-send some of them and they will be inserted a second time
+under new `event_id`s. Recovery SQL generated across such a window can therefore
+replay the same row change twice.
+
+**Why it is not closed.** The dedup deletes everything at or beyond the position
+the stream will actually replay from. After an auto-advance, that new start
+point is expressed as a *GTID set* — the purge floor — and there is no
+equivalent `(binlog_file, position)` cut for it. Deleting on the stale
+checkpoint's coordinates instead would destroy rows the source has already
+purged and can never re-send: the only surviving copy. The trade-off is
+deliberately asymmetric — a duplicate is visible and repairable, a deleted
+pre-floor row is gone for good. Position mode has no such problem: its advance
+*does* produce a new `(file, pos)`, so the delete is keyed on the advanced
+position and the dedup still runs.
+
+**What to do about it.** An auto-advance is already a permanent-data-loss event
+that is stamped durably in `stream_state` and surfaced by `bintrail status`
+(above) — a re-baseline is the documented way back to a clean index, and that
+also clears the duplicate window. Running with `--no-gap-fill` prevents the
+situation from arising at all, at the cost of refusing to start.
+
 ### The `--no-gap-fill` flag
 
 By default, dbtrail auto-advances past unfillable gaps. If you want the stream to **refuse to start** when a gap is detected (so you can investigate and decide how to proceed), use:

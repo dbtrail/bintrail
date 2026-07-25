@@ -1,6 +1,8 @@
 // Package cascade reconstructs the side effects of an InnoDB foreign-key
-// ON DELETE CASCADE (deleted child rows) or ON DELETE SET NULL (nulled child
-// FKs) that InnoDB applied but never wrote to the binary log.
+// cascade that InnoDB applied but never wrote to the binary log — ON DELETE
+// CASCADE (deleted child rows), ON DELETE SET NULL (nulled child FKs), and
+// their ON UPDATE siblings (child FKs rewritten to the parent's new key, or
+// nulled, when the parent's referenced key is UPDATEd; #1002).
 //
 // On MySQL ≤ 8.x (and all MariaDB) InnoDB enforces FK cascades inside the
 // storage engine, below the SQL layer that writes the binlog — only the parent
@@ -25,6 +27,15 @@
 // window; Phase-2 (a BaselineProvider) additionally recovers children present in
 // a baseline snapshot but untouched since. Design:
 // drafts/cascade-recovery-port-2026-06-21.md.
+//
+// The ON UPDATE cascades (#1002) reuse the identical inference — "which child
+// rows pointed at the parent's OLD key in their last known row_after just before
+// the parent UPDATE?" — but emit a different repair: the child row still exists,
+// only its FK column was rewritten (to the parent's NEW key under ON UPDATE
+// CASCADE) or nulled (ON UPDATE SET NULL), so the reversal is an idempotent
+// FK-restoring UPDATE (FKKeyRestore). The two referential actions are gated
+// SEPARATELY and never conflated: a parent DELETE consults delete_rule only, a
+// parent key UPDATE update_rule only.
 package cascade
 
 import (
@@ -33,6 +44,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -194,8 +206,21 @@ func (o Options) withDefaults() Options {
 type Result struct {
 	Victims     []query.ResultRow
 	SetNullRows []SetNullRestore
-	Incomplete  []string
-	Warnings    []string
+	// KeyUpdates are the ON UPDATE CASCADE / SET NULL repairs (#1002): child rows
+	// whose FK column InnoDB rewrote (or nulled) below the binlog when a parent's
+	// referenced key was UPDATEd. Like SetNullRows they are idempotent UPDATEs,
+	// not INSERTs — the child row was never deleted.
+	KeyUpdates []FKKeyRestore
+	// KeyUpdateParents are the ROOT parent UPDATE events (a subset of the
+	// parentEvents passed in) that actually changed a referenced key protected by
+	// an ON UPDATE CASCADE / SET NULL edge — i.e. the ones whose reversal is what
+	// the KeyUpdates above are the child half of. Callers that build their own
+	// reversal row set from a parent fetch use this to include ONLY the parent
+	// UPDATEs that genuinely cascaded; reverting every UPDATE in the window would
+	// undo unrelated column changes the operator never asked to touch.
+	KeyUpdateParents []query.ResultRow
+	Incomplete       []string
+	Warnings         []string
 }
 
 // SetNullRestore describes a child whose foreign key an ON DELETE SET NULL
@@ -210,12 +235,67 @@ type SetNullRestore struct {
 	Row                   map[string]any // last-known child row (for the PK WHERE)
 }
 
+// FKKeyRestore describes a child whose foreign key an ON UPDATE CASCADE or
+// ON UPDATE SET NULL cascade rewrote when the parent's referenced key was
+// UPDATEd (MySQL ≤8.x never logs those child updates either). The row still
+// EXISTS — only its FK column changed — so, exactly like SetNullRestore, the
+// reversal is an idempotent guarded UPDATE, never an INSERT:
+//
+//	ON UPDATE CASCADE  → the FK now holds the parent's NEW key; restore OldValue
+//	                     guarded by "AND fk = <NewValue>".
+//	ON UPDATE SET NULL → the FK is now NULL; restore OldValue guarded by
+//	                     "AND fk IS NULL" (NewValue is nil).
+//
+// NewValue nil therefore means "the cascade left the column NULL" — which also
+// covers the exotic ON UPDATE CASCADE whose parent key was set to NULL. The
+// command renders it via recovery.FormatFKCascadeRestore.
+type FKKeyRestore struct {
+	Schema, Table, Column string
+	OldValue              any            // the parent's PRE-update key — what the FK must go back to
+	NewValue              any            // what the cascade left in the FK column; nil = NULL
+	PKValues              string         // dedup key (matches binlog pk_values)
+	Row                   map[string]any // last-known child row (for the PK WHERE)
+}
+
 // Complete reports whether the reconstruction covered everything it could find.
 func (r Result) Complete() bool { return len(r.Incomplete) == 0 }
 
-// SynthesizeVictims reconstructs the cascade-deleted children for a set of
-// parent DELETE events. It returns synthetic DELETE rows (RowBefore = each
-// child's last known state) ready to feed recovery.GenerateSQLFromRows.
+// keyChainProbeLimit bounds the "was this parent key updated more than once in
+// the window?" probe (see the checkKeyChain closure). A handful of the newest
+// prior UPDATEs on the same parent row is enough to detect a chain; the probe
+// runs at most once per (root, FK referenced column).
+const keyChainProbeLimit = 8
+
+// refKeyChanged reports whether an UPDATE actually moved a referenced key
+// column, which is the ONLY thing that makes InnoDB run an ON UPDATE cascade.
+// An UPDATE of unrelated columns must synthesize nothing, so this — not "the
+// event is an UPDATE" — is the gate.
+//
+// It compares NULL-ness first and only then the rendered values: valToString
+// maps both nil and "" to "", so a NULL→” change would otherwise read as
+// unchanged. Comparing the images beats trusting changed_columns: the column
+// list is advisory metadata (nil on archived/older rows and for some sources),
+// while before/after are the authority the whole index is built on.
+func refKeyChanged(oldVal, newVal any) bool {
+	if (oldVal == nil) != (newVal == nil) {
+		return true
+	}
+	if oldVal == nil {
+		return false
+	}
+	return valToString(oldVal) != valToString(newVal)
+}
+
+// SynthesizeVictims reconstructs the invisible child-side effects of a set of
+// parent events: the cascade-deleted children of a parent DELETE (synthetic
+// DELETE rows, RowBefore = each child's last known state, ready to feed
+// recovery.GenerateSQLFromRows) and the FK rewrites of a parent key UPDATE
+// (Result.KeyUpdates, #1002).
+//
+// Each root is dispatched on its own EventType: a DELETE runs the delete_rule
+// path, an UPDATE the update_rule path. The two rules are NEVER conflated — a
+// DELETE on a table whose children are ON UPDATE CASCADE only synthesizes
+// nothing, and vice versa.
 //
 // It recurses: synthetic victims become the next layer's parents, so a
 // parent→child→grandchild cascade is fully reconstructed, bounded by MaxDepth
@@ -235,17 +315,19 @@ func SynthesizeVictims(
 	ctx context.Context,
 	eng *query.Engine,
 	fks []CascadeFK,
-	parentDeletes []query.ResultRow,
+	parentEvents []query.ResultRow,
 	opts Options,
 ) (Result, error) {
 	opts = opts.withDefaults()
 
 	var (
-		victims     []query.ResultRow
-		setNullRows []SetNullRestore
-		incomplete  []string
-		warnings    []string
-		errs        []error
+		victims          []query.ResultRow
+		setNullRows      []SetNullRestore
+		keyUpdates       []FKKeyRestore
+		keyUpdateParents []query.ResultRow
+		incomplete       []string
+		warnings         []string
+		errs             []error
 	)
 	// setNullSeen dedups SET NULL restores per (schema.table.column, pk) with
 	// NEWEST-WINS replacement: a child whose FK was nulled by one root, then
@@ -267,6 +349,21 @@ func SynthesizeVictims(
 		}
 		setNullSeen[key] = setNullSlot{idx: len(setNullRows), ts: ts}
 		setNullRows = append(setNullRows, sr)
+	}
+	// keyUpdateSeen is addSetNull's ON UPDATE twin, with the same per-COLUMN key
+	// and newest-wins replacement: a child whose FK two different parent-key
+	// updates rewrote must restore from its LATEST pre-cascade image.
+	keyUpdateSeen := map[string]setNullSlot{}
+	addKeyUpdate := func(key string, ts time.Time, kr FKKeyRestore) {
+		if slot, ok := keyUpdateSeen[key]; ok {
+			if ts.After(slot.ts) {
+				keyUpdates[slot.idx] = kr
+				keyUpdateSeen[key] = setNullSlot{idx: slot.idx, ts: ts}
+			}
+			return
+		}
+		keyUpdateSeen[key] = setNullSlot{idx: len(keyUpdates), ts: ts}
+		keyUpdates = append(keyUpdates, kr)
 	}
 	// addIncomplete records a coverage caveat once per distinct key, so a wide
 	// cascade (many parent×FK iterations) cannot flood the list with near-
@@ -300,26 +397,36 @@ func SynthesizeVictims(
 		colsPerConstraint[fk.Schema+"."+fk.Table+"."+fk.ConstraintName]++
 	}
 
-	// Index CASCADE and SET NULL edges by the parent (referenced) table they
-	// protect. Gate on the DELETE rule ONLY: dbtrail conflates delete_rule/
-	// update_rule (data_plane_router.py:2793), which runs synthesis on ON UPDATE
-	// CASCADE edges — a bug we deliberately do not port. The emit branch (per
-	// edge) turns CASCADE into a DELETE→INSERT victim and SET NULL into an
-	// idempotent FK-restoring UPDATE.
-	byParent := map[string][]CascadeFK{}
+	// Index the cascading edges by the parent (referenced) table they protect, in
+	// TWO SEPARATE maps — one per referential action, consulted by the matching
+	// root event type only. dbtrail conflates delete_rule/update_rule
+	// (data_plane_router.py:2793) and runs DELETE synthesis on an ON UPDATE
+	// CASCADE edge; that bug is still deliberately not ported. #1002 adds a
+	// DISTINCT update path instead of merging the two: byParentDelete drives
+	// DELETE→INSERT victims + SET NULL restores, byParentUpdate drives the
+	// FK-rewrite restores.
+	byParentDelete := map[string][]CascadeFK{}
+	byParentUpdate := map[string][]CascadeFK{}
 	for _, fk := range fks {
-		if fk.DeleteRule != "CASCADE" && fk.DeleteRule != "SET NULL" {
+		delCascades := fk.DeleteRule == "CASCADE" || fk.DeleteRule == "SET NULL"
+		updCascades := fk.UpdateRule == "CASCADE" || fk.UpdateRule == "SET NULL"
+		if !delCascades && !updCascades {
 			continue
 		}
 		ckey := fk.Schema + "." + fk.Table + "." + fk.ConstraintName
 		if colsPerConstraint[ckey] > 1 {
 			addIncomplete("composite:"+ckey, fmt.Sprintf(
-				"composite FK %q on %s.%s not supported; its cascade-deleted rows were NOT reconstructed",
+				"composite FK %q on %s.%s not supported; the rows its cascade touched were NOT reconstructed",
 				fk.ConstraintName, fk.Schema, fk.Table))
 			continue
 		}
-		byParent[fk.ReferencedSchema+"."+fk.ReferencedTable] = append(
-			byParent[fk.ReferencedSchema+"."+fk.ReferencedTable], fk)
+		pk := fk.ReferencedSchema + "." + fk.ReferencedTable
+		if delCascades {
+			byParentDelete[pk] = append(byParentDelete[pk], fk)
+		}
+		if updCascades {
+			byParentUpdate[pk] = append(byParentUpdate[pk], fk)
+		}
 	}
 
 	// visited/emitted are keyed PER ROOT (the |rootTS suffix): the same parent
@@ -337,6 +444,271 @@ func SynthesizeVictims(
 	// empty-window probe stays unmemoized so a later parent's window can detect
 	// skew (see the len(cands)==0 branch below).
 	skewChecked := map[string]bool{} // "schema.table.column" → skew probe already conclusive
+	// keyChainChecked memoizes the repeated-parent-key-update probe per
+	// (root, FK referenced column) — see the checkKeyChain closure below.
+	keyChainChecked := map[string]bool{}
+
+	// ── Shared child scan ─────────────────────────────────────────────────────
+	// childScan is what BOTH referential paths need before they can emit anything:
+	// the candidate children that referenced parentKey in the window, plus whether
+	// Phase-2 baseline augmentation may safely run over baseRows. Only what is
+	// EMITTED per candidate differs between ON DELETE and ON UPDATE — never how
+	// candidates are found — so the discovery (and every coverage caveat it
+	// raises) lives here exactly once and cannot drift between the two paths.
+	type childScan struct {
+		cands    []query.ResultRow
+		baseRows []BaselineRow
+		baseSnap time.Time
+		augment  bool // baseline augmentation may safely run over baseRows
+		failed   bool // operational failure — the caller must skip this edge
+	}
+	scanChildren := func(fk CascadeFK, parentKey string, rootTS time.Time) childScan {
+		until := rootTS
+		// Phase-1 window; widened to the baseline snapshot below.
+		since := rootTS.Add(-opts.Lookback)
+
+		// Phase-2: look up the child rows that referenced this parent at the
+		// baseline snapshot. Widen the binlog window to the snapshot time so the
+		// scan catches every child touched SINCE the baseline; the untouched ones
+		// are added by the caller after the scan.
+		var (
+			baseRows     []BaselineRow
+			baseSnap     time.Time
+			baseTrunc    bool
+			baseCovered  bool
+			baseSincePos *query.BinlogPos
+			baseStaleMsg string // reconstruct.StaleWarning.Message, if the provider fell back to an older snapshot (#618)
+		)
+		if opts.Baseline != nil {
+			bl, covered, berr := opts.Baseline.BaselineChildren(ctx, fk.Schema, fk.Table, fk.Column, parentKey, rootTS, opts.CandidateLimit)
+			switch {
+			case berr != nil:
+				addIncomplete("baselinefail:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+					"baseline lookup failed for %s.%s (recovery may be partial): %v", fk.Schema, fk.Table, berr))
+			case covered:
+				baseCovered, baseSnap, baseRows, baseTrunc = true, bl.SnapshotTime, bl.Rows, bl.Truncated
+				since = bl.SnapshotTime
+				baseSincePos = bl.SincePos
+				// #618: captured here but NOT reported yet — it is only meaningful
+				// once we know baseline augmentation actually ran (see the
+				// "default:" branch of the augmentation gate at the end).
+				baseStaleMsg = bl.StaleMessage
+			default:
+				addIncomplete("nobaseline:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+					"no baseline covers %s.%s; children untouched within the lookback window are not reconstructed", fk.Schema, fk.Table))
+			}
+		}
+
+		// Latest event per child PK that referenced this parent within the
+		// window. LimitPerPK=1 keeps the timestamp-latest event per pk_values.
+		// Fetch one MORE than CandidateLimit so an overflow is observable — with
+		// LimitPerPK=1 a plain LIMIT=CandidateLimit caps at exactly the limit and
+		// hides truncation.
+		//
+		// baseSincePos, when the baseline recorded one (#797), anchors the lower
+		// bound on the baseline's exact binlog position instead of its imprecise
+		// SnapshotTime DATETIME — see BaselineLookup.SincePos.
+		cands, qerr := eng.Fetch(ctx, query.Options{
+			Schema:     fk.Schema,
+			Table:      fk.Table,
+			ColumnEq:   []query.ColumnEq{{Column: fk.Column, Value: parentKey}},
+			Since:      &since,
+			SincePos:   baseSincePos,
+			Until:      &until,
+			Order:      "DESC",
+			LimitPerPK: 1,
+			Limit:      opts.CandidateLimit + 1,
+		})
+		if qerr != nil {
+			// Operational failure: we never learned whether children existed, so
+			// the result is provably partial. Record it AND surface a non-nil
+			// error so the caller cannot apply a partial recovery as if complete.
+			// Accumulate, don't abort the batch.
+			errs = append(errs, fmt.Errorf("victim query failed for %s.%s via %s=%s: %w",
+				fk.Schema, fk.Table, fk.Column, parentKey, qerr))
+			addIncomplete("queryfail:"+fk.Schema+"."+fk.Table+"."+fk.Column, fmt.Sprintf(
+				"victim query for %s.%s failed (recovery is partial): %v", fk.Schema, fk.Table, qerr))
+			return childScan{failed: true}
+		}
+		binlogTrunc := false
+		if len(cands) > opts.CandidateLimit {
+			binlogTrunc = true
+			addIncomplete("truncate:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+				"%s.%s has more than %d cascade-affected children for one parent; the excess (and their descendants) were NOT reconstructed",
+				fk.Schema, fk.Table, opts.CandidateLimit))
+			cands = cands[:opts.CandidateLimit]
+		}
+
+		// Child-side DDL-skew guard. A zero-candidate scan is ambiguous: either no
+		// child referenced this parent (normal — leave silent), or the child FK
+		// column was renamed since the FK snapshot so the ColumnEq
+		// JSON_EXTRACT('$.<snapshot-name>') never matched the old row-images (the
+		// column name in effect at event time differs). In the latter case
+		// synthesis would report 0 children + Complete — indistinguishable from
+		// "no children existed". Mirror the parent-side "noref" caveat: sample the
+		// child images in the window WITHOUT the FK filter; if fk.Column is absent
+		// from every sampled image, the graph's column name doesn't exist here →
+		// flag, so a false-negative zero is never presented as a clean Complete.
+		if len(cands) == 0 {
+			skewKey := fk.Schema + "." + fk.Table + "." + fk.Column
+			if !skewChecked[skewKey] {
+				sample, serr := eng.Fetch(ctx, query.Options{
+					Schema: fk.Schema,
+					Table:  fk.Table,
+					Since:  &since,
+					Until:  &until,
+					Order:  "DESC",
+					Limit:  skewSampleLimit,
+				})
+				switch {
+				case serr != nil:
+					// Probe failure: the primary candidate scan already succeeded
+					// (0 rows), so this is not an operational error — only a caveat
+					// that we could not rule out skew here.
+					skewChecked[skewKey] = true
+					addIncomplete("skewprobe:"+skewKey, fmt.Sprintf(
+						"could not probe %s.%s for a renamed FK column %q (its zero-child result is unverified): %v",
+						fk.Schema, fk.Table, fk.Column, serr))
+				case len(sample) == 0:
+					// No child events in this window: inconclusive. Leave
+					// unmemoized so another parent's window can still detect skew.
+				case fkColumnAbsentFromAll(fk.Column, sample):
+					skewChecked[skewKey] = true
+					addIncomplete("childskew:"+skewKey, fmt.Sprintf(
+						"FK column %q is absent from every sampled %s.%s row-image in the window "+
+							"(schema changed since the FK snapshot); its cascade-affected rows could NOT be "+
+							"matched, so a zero-child result here may be a false negative — NOT confirmation "+
+							"that no children existed",
+						fk.Column, fk.Schema, fk.Table))
+				default:
+					// fk.Column present under its snapshot name → not skewed.
+					skewChecked[skewKey] = true
+				}
+			}
+		}
+
+		scan := childScan{cands: cands, baseRows: baseRows, baseSnap: baseSnap}
+		if baseCovered && len(baseRows) > 0 {
+			switch {
+			case binlogTrunc:
+				addIncomplete("baseline-skip:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+					"binlog scan truncated for %s.%s; skipped baseline augmentation to avoid resurrecting stale rows",
+					fk.Schema, fk.Table))
+			case opts.ArchivesPresent:
+				// The widened [snapshot, T] window may include archived partitions
+				// the live scan cannot see, so `touched` may be incomplete — a child
+				// re-parented/deleted in an archived gap would be wrongly resurrected
+				// from its stale baseline row. Skip, like the truncated-binlog case.
+				addIncomplete("baseline-skip-archived:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+					"index has archived partitions that may gap the [snapshot, T] window for %s.%s; "+
+						"skipped baseline augmentation to avoid resurrecting rows whose deletion/re-parent was archived",
+					fk.Schema, fk.Table))
+			default:
+				// #618: the stale-baseline advisory belongs HERE — this is the only
+				// branch where a baseline row actually reaches the output. Firing it
+				// earlier flagged runs where the baseline never influenced anything,
+				// and — the more serious defect — routed it through addIncomplete,
+				// which both renderers interpret as "data may be missing". It is
+				// not, so this is Warnings-only and never affects Complete().
+				if baseStaleMsg != "" {
+					addWarning("baseline-stale:"+fk.Schema+"."+fk.Table, baseStaleMsg)
+				}
+				if baseTrunc {
+					addIncomplete("baseline-truncate:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+						"more than %d baseline children for %s.%s; some untouched children were NOT reconstructed",
+						opts.CandidateLimit, fk.Schema, fk.Table))
+				}
+				scan.augment = true
+			}
+		}
+		return scan
+	}
+
+	// checkKeyChain flags the ONE case the "children's last logged image still
+	// carries the old key" inference cannot see: an EARLIER UPDATE inside the
+	// window that moved this referenced key INTO the parent (A→B before the
+	// root's B→C). That earlier cascade rewrote the children below the binlog
+	// too, so their last INDEXED image carries the pre-chain key — the ColumnEq
+	// scan for this root's old key then matches nothing and would report a clean
+	// zero-child Complete. Never silent (#618).
+	//
+	// Probed for ROOT updates only (depth 0): deeper items are synthesized here,
+	// with the correct pre-cascade image by construction, so a "prior update"
+	// found for them would be about the child's own logged history, not a hidden
+	// cascade chain. The root's own event is skipped by EventID.
+	upd := event.EventUpdate
+	checkKeyChain := func(fk CascadeFK, pev query.ResultRow, parentOldKey string, rootTS time.Time, rootKey string) {
+		memo := pev.SchemaName + "." + pev.TableName + "|" + fk.ReferencedColumn + "|" + parentOldKey + "|" + rootKey
+		if keyChainChecked[memo] {
+			return
+		}
+		keyChainChecked[memo] = true
+		// The probe is scoped by the referenced column's VALUE, never by the
+		// parent's pk_values. The indexer writes pk_values from the BEFORE image
+		// (parser.BuildPKValues over row_before), so when the referenced column
+		// IS the parent's PK — `REFERENCES parent(id)`, the common shape — a
+		// chain id: A→B then B→C lands under pk_values "A" and "B" respectively.
+		// A pk_values-scoped probe queries the root's "B" and never sees the
+		// first link: 0 restores, Complete, no caveat — precisely the silent zero
+		// this probe exists to prevent (#1116 review). Asking "did this key
+		// ARRIVE here from somewhere else inside the window?" is immune to where
+		// pk_values happens to point.
+		if !query.IsSafeColumnName(fk.ReferencedColumn) {
+			// buildQuery turns a rejected column name into a `1=0` predicate, so
+			// the probe would come back empty and read as "no chain" — the same
+			// silent zero by another route. Refuse to conclude instead.
+			addIncomplete("keychainprobe:"+fk.ReferencedSchema+"."+fk.ReferencedTable+"."+fk.ReferencedColumn, fmt.Sprintf(
+				"cannot check %s.%s for an earlier update of referenced column %q (name is not a plain identifier, so it "+
+					"cannot be used as a JSON path); an earlier cascade would hide children, so a zero result is not proof of none",
+				pev.SchemaName, pev.TableName, fk.ReferencedColumn))
+			return
+		}
+		since := rootTS.Add(-opts.Lookback)
+		// ASC, not DESC: the arrival (`before=A, after=B`) is the OLDEST event
+		// matching this value in the window — every later match is the row
+		// sitting on the key (unrelated-column updates) or leaving it (the root).
+		// Newest-first + Limit would let a churny parent push the one event that
+		// matters out of the probe's budget.
+		prior, perr := eng.Fetch(ctx, query.Options{
+			Schema:    pev.SchemaName,
+			Table:     pev.TableName,
+			ColumnEq:  []query.ColumnEq{{Column: fk.ReferencedColumn, Value: parentOldKey}},
+			EventType: &upd,
+			Since:     &since,
+			Until:     &rootTS,
+			Order:     "ASC",
+			Limit:     keyChainProbeLimit,
+		})
+		if perr != nil {
+			addIncomplete("keychainprobe:"+pev.SchemaName+"."+pev.TableName+"."+fk.ReferencedColumn, fmt.Sprintf(
+				"could not check %s.%s for earlier updates of referenced column %q into %s (an earlier cascade would hide children): %v",
+				pev.SchemaName, pev.TableName, fk.ReferencedColumn, parentOldKey, perr))
+			return
+		}
+		for _, r := range prior {
+			if r.EventID == pev.EventID {
+				continue // the root itself
+			}
+			if r.RowBefore == nil || r.RowAfter == nil {
+				continue
+			}
+			// "This key ARRIVED here from somewhere else inside the window":
+			// after == the root's old key, before != it. The root itself moves
+			// the key AWAY (after != old key) and so never matches.
+			if valToString(r.RowAfter[fk.ReferencedColumn]) != parentOldKey {
+				continue
+			}
+			if !refKeyChanged(r.RowBefore[fk.ReferencedColumn], r.RowAfter[fk.ReferencedColumn]) {
+				continue
+			}
+			addIncomplete("keychain:"+pev.SchemaName+"."+pev.TableName+"."+fk.ReferencedColumn, fmt.Sprintf(
+				"%s.%s had an EARLIER update of referenced column %q INTO %s inside the window; that cascade rewrote its "+
+					"children below the binlog too, so their last indexed image no longer carries this update's old key — "+
+					"some ON UPDATE cascade children may NOT be reconstructed (a zero result here is not proof of none)",
+				pev.SchemaName, pev.TableName, fk.ReferencedColumn, parentOldKey))
+			return
+		}
+	}
 
 	// The cascade fires atomically at the ROOT delete's timestamp T, so every
 	// descendant existed at T and the lookback window must end at T for EVERY
@@ -360,8 +732,30 @@ func SynthesizeVictims(
 		rootTS time.Time
 		rootID uint64
 	}
-	layer := make([]layerItem, 0, len(parentDeletes))
-	for _, pd := range parentDeletes {
+	// nextKeyUpdateItem builds the recursion item for an ON UPDATE CASCADE child:
+	// its FK column now carries the parent's NEW key, so if that column is itself
+	// referenced by a deeper FK the cascade continues one level down. Returns nil
+	// when the cascade stops here — ON UPDATE SET NULL (cascadedVal nil) leaves
+	// the column NULL, which no child FK can reference.
+	nextKeyUpdateItem := func(fk CascadeFK, pkValues string, row map[string]any, ts time.Time, cascadedVal any, item layerItem) *layerItem {
+		if cascadedVal == nil || row == nil {
+			return nil
+		}
+		after := maps.Clone(row)
+		after[fk.Column] = cascadedVal
+		return &layerItem{ev: query.ResultRow{
+			EventTimestamp: ts,
+			SchemaName:     fk.Schema,
+			TableName:      fk.Table,
+			EventType:      event.EventUpdate,
+			PKValues:       pkValues,
+			RowBefore:      row,
+			RowAfter:       after,
+		}, rootTS: item.rootTS, rootID: item.rootID}
+	}
+
+	layer := make([]layerItem, 0, len(parentEvents))
+	for _, pd := range parentEvents {
 		layer = append(layer, layerItem{ev: pd, rootTS: pd.EventTimestamp, rootID: pd.EventID})
 	}
 
@@ -369,6 +763,11 @@ func SynthesizeVictims(
 		var next []layerItem
 		for _, item := range layer {
 			pev := item.ev
+			if pev.EventType != event.EventDelete && pev.EventType != event.EventUpdate {
+				// Only a DELETE (delete_rule) or an UPDATE of a referenced key
+				// (update_rule) can make InnoDB cascade; an INSERT never does.
+				continue
+			}
 			// Keyed by BOTH rootID and rootTS (not either alone): rootID
 			// disambiguates two real, distinct rows that share a stored
 			// second (EventID is the DB's auto-increment PK, always unique
@@ -384,6 +783,122 @@ func SynthesizeVictims(
 			}
 			visited[pkey] = true
 
+			if pev.EventType == event.EventUpdate {
+				// ── ON UPDATE CASCADE / SET NULL (#1002) ──────────────────────
+				// The parent row survives; only its referenced key moved. InnoDB
+				// rewrote every child FK that pointed at the OLD key — below the
+				// binlog, exactly like the delete cascades — so reverting the
+				// parent UPDATE without this leaves those child FKs dangling on
+				// the new value.
+				before, after := pev.RowBefore, pev.RowAfter
+				if before == nil || after == nil {
+					// An UPDATE always carries both images under
+					// binlog_row_image=FULL, so a nil here is an index/parser
+					// anomaly. Never silent.
+					addIncomplete("noupdateimage:"+pev.SchemaName+"."+pev.TableName, fmt.Sprintf(
+						"parent UPDATE on %s.%s pk=%s is missing a before- or after-image; its ON UPDATE cascade was NOT reconstructed",
+						pev.SchemaName, pev.TableName, pev.PKValues))
+					continue
+				}
+				cascadedHere := false
+				for _, fk := range byParentUpdate[pev.SchemaName+"."+pev.TableName] {
+					oldVal, okBefore := before[fk.ReferencedColumn]
+					newVal, okAfter := after[fk.ReferencedColumn]
+					if !okBefore || !okAfter {
+						// The FK graph (snapshot) names a referenced column absent
+						// from this parent's images — the DDL-skew limitation made
+						// real. Drop, but never silent (mirrors the delete path).
+						addIncomplete("norefupd:"+fk.Schema+"."+fk.Table+"."+fk.ConstraintName, fmt.Sprintf(
+							"FK %q references column %q absent from %s.%s row images (schema changed since snapshot); its ON UPDATE cascade was NOT reconstructed",
+							fk.ConstraintName, fk.ReferencedColumn, fk.ReferencedSchema, fk.ReferencedTable))
+						continue
+					}
+					// THE gate: an UPDATE of unrelated columns never cascades, so
+					// it must synthesize nothing at all.
+					if !refKeyChanged(oldVal, newVal) {
+						continue
+					}
+					if oldVal == nil {
+						// No child row can reference a NULL key, so nothing was
+						// cascaded even though the key "changed" (NULL → value).
+						continue
+					}
+					parentOldKey := valToString(oldVal)
+					cascadedHere = true
+					if depth == 0 {
+						checkKeyChain(fk, pev, parentOldKey, item.rootTS, rootKey)
+					}
+
+					scan := scanChildren(fk, parentOldKey, item.rootTS)
+					if scan.failed {
+						continue
+					}
+					// What the cascade LEFT in the child column, which is also the
+					// idempotency guard: the parent's new key under CASCADE, NULL
+					// under SET NULL.
+					var cascadedVal any
+					if fk.UpdateRule != "SET NULL" {
+						cascadedVal = newVal
+					}
+
+					touched := make(map[string]bool, len(scan.cands))
+					for _, cev := range scan.cands {
+						touched[cev.PKValues] = true
+						switch {
+						case cev.EventType == event.EventDelete:
+							// Already gone before the parent key moved.
+							continue
+						case cev.RowAfter == nil:
+							addIncomplete("noafter:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+								"%s.%s has events with no post-image (index anomaly); some cascade-rewritten FKs may not be restored",
+								fk.Schema, fk.Table))
+							continue
+						case valToString(cev.RowAfter[fk.Column]) != parentOldKey:
+							// Re-parented before the update → InnoDB did not touch it.
+							continue
+						}
+						addKeyUpdate(fk.Schema+"."+fk.Table+"."+fk.Column+"|"+cev.PKValues,
+							cev.EventTimestamp, FKKeyRestore{
+								Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
+								OldValue: oldVal, NewValue: cascadedVal,
+								PKValues: cev.PKValues, Row: cev.RowAfter,
+							})
+						if n := nextKeyUpdateItem(fk, cev.PKValues, cev.RowAfter, cev.EventTimestamp, cascadedVal, item); n != nil {
+							next = append(next, *n)
+						}
+					}
+
+					// Phase-2 augmentation: children present in the baseline that
+					// had NO event in the window (untouched since the snapshot).
+					// Their state at T is the baseline row verbatim.
+					if scan.augment {
+						for _, br := range scan.baseRows {
+							if touched[br.PKValues] {
+								continue // touched since baseline → handled above
+							}
+							addKeyUpdate(fk.Schema+"."+fk.Table+"."+fk.Column+"|"+br.PKValues,
+								scan.baseSnap, FKKeyRestore{
+									Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
+									OldValue: oldVal, NewValue: cascadedVal,
+									PKValues: br.PKValues, Row: br.Row,
+								})
+							if n := nextKeyUpdateItem(fk, br.PKValues, br.Row, scan.baseSnap, cascadedVal, item); n != nil {
+								next = append(next, *n)
+							}
+						}
+					}
+				}
+				if cascadedHere && depth == 0 {
+					// A ROOT update whose referenced key genuinely moved under a
+					// cascading edge: the caller needs it so the parent half of
+					// the reversal is emitted alongside the child half — and, just
+					// as importantly, so UPDATEs that did NOT cascade stay out.
+					keyUpdateParents = append(keyUpdateParents, pev)
+				}
+				continue
+			}
+
+			// ── ON DELETE CASCADE / SET NULL ──────────────────────────────────
 			// The deleted parent's image. Synthetic victims carry their last
 			// row_after here too, which is what makes the recursion work.
 			parentRow := pev.RowBefore
@@ -397,9 +912,7 @@ func SynthesizeVictims(
 				continue
 			}
 
-			until := item.rootTS
-
-			for _, fk := range byParent[pev.SchemaName+"."+pev.TableName] {
+			for _, fk := range byParentDelete[pev.SchemaName+"."+pev.TableName] {
 				refVal, ok := parentRow[fk.ReferencedColumn]
 				if !ok {
 					// The FK graph (latest snapshot) names a referenced column
@@ -412,131 +925,9 @@ func SynthesizeVictims(
 				}
 				parentPK := valToString(refVal)
 
-				// Phase-1 window; widened to the baseline snapshot below.
-				since := item.rootTS.Add(-opts.Lookback)
-
-				// Phase-2: look up the child rows that referenced this parent at
-				// the baseline snapshot. Widen the binlog window to the snapshot
-				// time so the scan catches every child touched SINCE the baseline;
-				// the untouched ones are added after the scan.
-				var (
-					baseRows     []BaselineRow
-					baseSnap     time.Time
-					baseTrunc    bool
-					baseCovered  bool
-					baseSincePos *query.BinlogPos
-					baseStaleMsg string // reconstruct.StaleWarning.Message, if the provider fell back to an older snapshot (#618)
-				)
-				if opts.Baseline != nil {
-					bl, covered, berr := opts.Baseline.BaselineChildren(ctx, fk.Schema, fk.Table, fk.Column, parentPK, item.rootTS, opts.CandidateLimit)
-					switch {
-					case berr != nil:
-						addIncomplete("baselinefail:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-							"baseline lookup failed for %s.%s (recovery may be partial): %v", fk.Schema, fk.Table, berr))
-					case covered:
-						baseCovered, baseSnap, baseRows, baseTrunc = true, bl.SnapshotTime, bl.Rows, bl.Truncated
-						since = bl.SnapshotTime
-						baseSincePos = bl.SincePos
-						// #618: reconstruct.StaleWarning.Message, when the provider fell
-						// back to an older snapshot. Captured here but NOT reported yet —
-						// it is only meaningful once we know baseline augmentation
-						// actually ran (baseCovered && len(baseRows) > 0, AND neither the
-						// binlog-truncation nor archives-present skip fired below); see
-						// the "default:" branch of that gate.
-						baseStaleMsg = bl.StaleMessage
-					default:
-						addIncomplete("nobaseline:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-							"no baseline covers %s.%s; children untouched within the lookback window are not reconstructed", fk.Schema, fk.Table))
-					}
-				}
-
-				// Latest event per child PK that referenced this parent within the
-				// window. LimitPerPK=1 keeps the timestamp-latest event per
-				// pk_values. Fetch one MORE than CandidateLimit so an overflow is
-				// observable — with LimitPerPK=1 a plain LIMIT=CandidateLimit caps
-				// at exactly the limit and hides truncation.
-				//
-				// baseSincePos, when the baseline recorded one (#797), anchors the
-				// lower bound on the baseline's exact binlog position instead of
-				// its imprecise SnapshotTime DATETIME — see BaselineLookup.SincePos.
-				cands, qerr := eng.Fetch(ctx, query.Options{
-					Schema:     fk.Schema,
-					Table:      fk.Table,
-					ColumnEq:   []query.ColumnEq{{Column: fk.Column, Value: parentPK}},
-					Since:      &since,
-					SincePos:   baseSincePos,
-					Until:      &until,
-					Order:      "DESC",
-					LimitPerPK: 1,
-					Limit:      opts.CandidateLimit + 1,
-				})
-				if qerr != nil {
-					// Operational failure: we never learned whether victims
-					// existed, so the result is provably partial. Record it AND
-					// return a non-nil error so the caller cannot apply a partial
-					// recovery as if complete. Accumulate, don't abort the batch.
-					errs = append(errs, fmt.Errorf("victim query failed for %s.%s via %s=%s: %w",
-						fk.Schema, fk.Table, fk.Column, parentPK, qerr))
-					addIncomplete("queryfail:"+fk.Schema+"."+fk.Table+"."+fk.Column, fmt.Sprintf(
-						"victim query for %s.%s failed (recovery is partial): %v", fk.Schema, fk.Table, qerr))
+				scan := scanChildren(fk, parentPK, item.rootTS)
+				if scan.failed {
 					continue
-				}
-				binlogTrunc := false
-				if len(cands) > opts.CandidateLimit {
-					binlogTrunc = true
-					addIncomplete("truncate:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-						"%s.%s has more than %d cascade victims for one parent; the excess (and their descendants) were NOT reconstructed",
-						fk.Schema, fk.Table, opts.CandidateLimit))
-					cands = cands[:opts.CandidateLimit]
-				}
-
-				// Child-side DDL-skew guard. A zero-candidate scan is ambiguous:
-				// either no child referenced this parent (normal — leave silent), or
-				// the child FK column was renamed since the FK snapshot so the
-				// ColumnEq JSON_EXTRACT('$.<snapshot-name>') never matched the old
-				// row-images (the column name in effect at event time differs). In
-				// the latter case synthesis would report 0 victims + Complete —
-				// indistinguishable from "no children existed". Mirror the parent-side
-				// "noref" caveat: sample the child images in the window WITHOUT the FK
-				// filter; if fk.Column is absent from every sampled image, the graph's
-				// column name doesn't exist here → flag, so a false-negative zero is
-				// never presented as a clean Complete.
-				if len(cands) == 0 {
-					skewKey := fk.Schema + "." + fk.Table + "." + fk.Column
-					if !skewChecked[skewKey] {
-						sample, serr := eng.Fetch(ctx, query.Options{
-							Schema: fk.Schema,
-							Table:  fk.Table,
-							Since:  &since,
-							Until:  &until,
-							Order:  "DESC",
-							Limit:  skewSampleLimit,
-						})
-						switch {
-						case serr != nil:
-							// Probe failure: the primary candidate scan already
-							// succeeded (0 rows), so this is not an operational error —
-							// only a caveat that we could not rule out skew here.
-							skewChecked[skewKey] = true
-							addIncomplete("skewprobe:"+skewKey, fmt.Sprintf(
-								"could not probe %s.%s for a renamed FK column %q (its zero-victim result is unverified): %v",
-								fk.Schema, fk.Table, fk.Column, serr))
-						case len(sample) == 0:
-							// No child events in this window: inconclusive. Leave
-							// unmemoized so another parent's window can still detect skew.
-						case fkColumnAbsentFromAll(fk.Column, sample):
-							skewChecked[skewKey] = true
-							addIncomplete("childskew:"+skewKey, fmt.Sprintf(
-								"FK column %q is absent from every sampled %s.%s row-image in the window "+
-									"(schema changed since the FK snapshot); its cascade-deleted rows could NOT be "+
-									"matched, so a zero-victim result here may be a false negative — NOT confirmation "+
-									"that no children existed",
-								fk.Column, fk.Schema, fk.Table))
-						default:
-							// fk.Column present under its snapshot name → not skewed.
-							skewChecked[skewKey] = true
-						}
-					}
 				}
 
 				// touched = every child PK with an event matching fk=parentPK in
@@ -544,8 +935,8 @@ func SynthesizeVictims(
 				// a touched child is fully handled by the binlog path (emitted, or
 				// correctly filtered as re-parented/deleted) — so a re-parented
 				// child is not resurrected from its stale baseline state.
-				touched := make(map[string]bool, len(cands))
-				for _, cev := range cands {
+				touched := make(map[string]bool, len(scan.cands))
+				for _, cev := range scan.cands {
 					touched[cev.PKValues] = true
 					switch {
 					case cev.EventType == event.EventDelete:
@@ -606,86 +997,54 @@ func SynthesizeVictims(
 				// snapshot). Their state at T is the baseline row verbatim — a child
 				// with any post-baseline event would appear in `touched` (its first
 				// event carries before=parentPK and matches the fk scan), so
-				// ∉touched means zero deltas. Skip entirely when the binlog scan
-				// truncated: `touched` is then incomplete and a truncated-out
-				// re-parented/deleted child would be wrongly resurrected.
-				if baseCovered && len(baseRows) > 0 {
-					switch {
-					case binlogTrunc:
-						addIncomplete("baseline-skip:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-							"binlog scan truncated for %s.%s; skipped baseline augmentation to avoid resurrecting stale rows",
-							fk.Schema, fk.Table))
-					case opts.ArchivesPresent:
-						// The widened [snapshot, T] window may include archived partitions the
-						// live scan cannot see, so `touched` may be incomplete — a child
-						// re-parented/deleted in an archived gap would be wrongly resurrected
-						// from its stale baseline row. Skip, like the truncated-binlog case.
-						addIncomplete("baseline-skip-archived:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-							"index has archived partitions that may gap the [snapshot, T] window for %s.%s; "+
-								"skipped baseline augmentation to avoid resurrecting rows whose deletion/re-parent was archived",
-							fk.Schema, fk.Table))
-					default:
-						// #618: the stale-baseline advisory belongs HERE, not at the
-						// BaselineChildren call site above — this is the only branch
-						// where a baseline row actually reaches the output (the
-						// binlogTrunc/ArchivesPresent branches above skip augmentation
-						// entirely, and the outer `len(baseRows) > 0` gate already
-						// excludes an empty baseline read). Firing it earlier flagged
-						// runs where the baseline never influenced anything, and — the
-						// more serious defect — routed it through addIncomplete, which
-						// both renderers (cascaderecover.EmitSQL, console api.go)
-						// interpret as "data may be missing". It is not: #618's own
-						// analysis is that a stale-fallback window still reconstructs
-						// correctly, so this is Warnings-only and never affects
-						// Complete() or a caller's exit code.
-						if baseStaleMsg != "" {
-							addWarning("baseline-stale:"+fk.Schema+"."+fk.Table, baseStaleMsg)
+				// ∉touched means zero deltas.
+				if scan.augment {
+					for _, br := range scan.baseRows {
+						if touched[br.PKValues] {
+							continue // touched since baseline → handled by the binlog path
 						}
-						if baseTrunc {
-							addIncomplete("baseline-truncate:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-								"more than %d baseline children for %s.%s; some untouched children were NOT reconstructed",
-								opts.CandidateLimit, fk.Schema, fk.Table))
+						if fk.DeleteRule == "SET NULL" {
+							// Per-COLUMN key (see the Phase-1 branch above).
+							addSetNull(fk.Schema+"."+fk.Table+"."+fk.Column+"|"+br.PKValues,
+								scan.baseSnap, SetNullRestore{
+									Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
+									Value: refVal, PKValues: br.PKValues, Row: br.Row,
+								})
+							continue
 						}
-						for _, br := range baseRows {
-							if touched[br.PKValues] {
-								continue // touched since baseline → handled by the binlog path
-							}
-							if fk.DeleteRule == "SET NULL" {
-								// Per-COLUMN key (see the Phase-1 branch above).
-								addSetNull(fk.Schema+"."+fk.Table+"."+fk.Column+"|"+br.PKValues,
-									baseSnap, SetNullRestore{
-										Schema: fk.Schema, Table: fk.Table, Column: fk.Column,
-										Value: refVal, PKValues: br.PKValues, Row: br.Row,
-									})
-								continue
-							}
-							vkey := fk.Schema + "." + fk.Table + "|" + br.PKValues + "|" + rootKey
-							if emitted[vkey] {
-								continue
-							}
-							emitted[vkey] = true
-							victim := query.ResultRow{
-								EventTimestamp: baseSnap, // baseline rows have no event of their own
-								SchemaName:     fk.Schema,
-								TableName:      fk.Table,
-								EventType:      event.EventDelete,
-								PKValues:       br.PKValues,
-								RowBefore:      br.Row,
-							}
-							victims = append(victims, victim)
-							next = append(next, layerItem{ev: victim, rootTS: item.rootTS, rootID: item.rootID})
+						vkey := fk.Schema + "." + fk.Table + "|" + br.PKValues + "|" + rootKey
+						if emitted[vkey] {
+							continue
 						}
+						emitted[vkey] = true
+						victim := query.ResultRow{
+							EventTimestamp: scan.baseSnap, // baseline rows have no event of their own
+							SchemaName:     fk.Schema,
+							TableName:      fk.Table,
+							EventType:      event.EventDelete,
+							PKValues:       br.PKValues,
+							RowBefore:      br.Row,
+						}
+						victims = append(victims, victim)
+						next = append(next, layerItem{ev: victim, rootTS: item.rootTS, rootID: item.rootID})
 					}
 				}
 			}
 		}
 		if depth == opts.MaxDepth-1 && len(next) > 0 {
 			addIncomplete("depth", fmt.Sprintf(
-				"recursion hit MaxDepth=%d; deeper cascade victims were NOT reconstructed", opts.MaxDepth))
+				"recursion hit MaxDepth=%d; deeper cascade-affected rows were NOT reconstructed", opts.MaxDepth))
 		}
 		layer = next
 	}
-	return Result{Victims: dedupVictimsNewest(victims), SetNullRows: setNullRows, Incomplete: incomplete, Warnings: warnings}, errors.Join(errs...)
+	return Result{
+		Victims:          dedupVictimsNewest(victims),
+		SetNullRows:      setNullRows,
+		KeyUpdates:       keyUpdates,
+		KeyUpdateParents: keyUpdateParents,
+		Incomplete:       incomplete,
+		Warnings:         warnings,
+	}, errors.Join(errs...)
 }
 
 // dedupVictimsNewest collapses victims of the same (schema, table, pk) emitted
@@ -850,12 +1209,23 @@ func MergeResults(results ...Result) Result {
 	var victims []query.ResultRow
 	var incomplete []string
 	var warnings []string
+	var keyUpdateParents []query.ResultRow
 	seenIncomplete := map[string]bool{}
 	seenWarning := map[string]bool{}
+	seenKeyParent := map[string]bool{}
 	setNullByKey := map[string]SetNullRestore{}
 	var setNullOrder []string
+	keyUpdateByKey := map[string]FKKeyRestore{}
+	var keyUpdateOrder []string
 	for _, r := range results {
 		victims = append(victims, r.Victims...)
+		for _, p := range r.KeyUpdateParents {
+			k := p.SchemaName + "." + p.TableName + "|" + p.PKValues + "|" + strconv.FormatUint(p.EventID, 10)
+			if !seenKeyParent[k] {
+				seenKeyParent[k] = true
+				keyUpdateParents = append(keyUpdateParents, p)
+			}
+		}
 		for _, msg := range r.Incomplete {
 			if !seenIncomplete[msg] {
 				seenIncomplete[msg] = true
@@ -880,16 +1250,32 @@ func MergeResults(results ...Result) Result {
 			}
 			setNullByKey[key] = sr // later result (newer group) wins
 		}
+		// Same last-result-wins rule as the SET NULL restores above, for the same
+		// reason: FKKeyRestore carries no timestamp MergeResults can compare, so
+		// the caller's ascending root-time ordering IS the tiebreak.
+		for _, kr := range r.KeyUpdates {
+			key := kr.Schema + "." + kr.Table + "." + kr.Column + "|" + kr.PKValues
+			if _, ok := keyUpdateByKey[key]; !ok {
+				keyUpdateOrder = append(keyUpdateOrder, key)
+			}
+			keyUpdateByKey[key] = kr
+		}
 	}
 	setNullRows := make([]SetNullRestore, 0, len(setNullOrder))
 	for _, key := range setNullOrder {
 		setNullRows = append(setNullRows, setNullByKey[key])
 	}
+	keyUpdates := make([]FKKeyRestore, 0, len(keyUpdateOrder))
+	for _, key := range keyUpdateOrder {
+		keyUpdates = append(keyUpdates, keyUpdateByKey[key])
+	}
 	return Result{
-		Victims:     dedupVictimsNewest(victims),
-		SetNullRows: setNullRows,
-		Incomplete:  incomplete,
-		Warnings:    warnings,
+		Victims:          dedupVictimsNewest(victims),
+		SetNullRows:      setNullRows,
+		KeyUpdates:       keyUpdates,
+		KeyUpdateParents: keyUpdateParents,
+		Incomplete:       incomplete,
+		Warnings:         warnings,
 	}
 }
 
@@ -1035,9 +1421,13 @@ func loadCascadeClosure(ctx context.Context, parentSchema string, load reference
 				seenEdge[ek] = true
 				out = append(out, fk)
 			}
-			// Only a CASCADE/SET NULL child can itself be deleted and cascade
-			// further, so only its schema widens the frontier.
-			if (fk.DeleteRule == "CASCADE" || fk.DeleteRule == "SET NULL") && !scoped[fk.Schema] {
+			// Only a cascading child can itself be deleted (delete_rule) or have
+			// its key rewritten (update_rule) and cascade further, so only its
+			// schema widens the frontier. BOTH rules count (#1002): scoping on
+			// delete_rule alone would drop a multi-level cross-schema ON UPDATE
+			// cascade — the #833 silent-data-loss class, one rule over.
+			if (fk.DeleteRule == "CASCADE" || fk.DeleteRule == "SET NULL" ||
+				fk.UpdateRule == "CASCADE" || fk.UpdateRule == "SET NULL") && !scoped[fk.Schema] {
 				scoped[fk.Schema] = true
 				next = append(next, fk.Schema)
 			}

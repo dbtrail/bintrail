@@ -31,7 +31,7 @@ func TestMaybeWarnEventVolume(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			t.Cleanup(func() { slog.SetDefault(prev) })
 
-			maybeWarnEventVolume("db", "orders", tc.n, tc.threshold, 1)
+			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, 1)
 			out := buf.String()
 
 			if !tc.wantWarn {
@@ -83,7 +83,7 @@ func TestMaybeWarnEventVolume_scaledByParallelism(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			t.Cleanup(func() { slog.SetDefault(prev) })
 
-			maybeWarnEventVolume("db", "orders", tc.n, tc.threshold, tc.parallelism)
+			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, tc.parallelism)
 			out := buf.String()
 
 			if !tc.wantWarn {

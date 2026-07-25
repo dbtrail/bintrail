@@ -11,6 +11,38 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
+// TestRefKeyChanged pins THE gate of the ON UPDATE cascade path (#1002): only an
+// UPDATE that actually moved a referenced key can have cascaded, so an UPDATE of
+// unrelated columns must synthesize nothing. NULL-ness is compared before the
+// rendered values because valToString maps both nil and "" to "" — without the
+// nil check a NULL → empty-string change (a real key move) would read as
+// unchanged and silently skip its cascade.
+func TestRefKeyChanged(t *testing.T) {
+	cases := []struct {
+		name           string
+		oldVal, newVal any
+		want           bool
+	}{
+		{"identical numbers", json.Number("1"), json.Number("1"), false},
+		{"moved number", json.Number("1"), json.Number("99"), true},
+		{"number across encodings", json.Number("1"), float64(1), false},
+		{"identical strings", "A", "A", false},
+		{"moved string", "A", "B", true},
+		{"both NULL", nil, nil, false},
+		{"NULL to value", nil, "A", true},
+		{"value to NULL", "A", nil, true},
+		{"NULL to empty string is a real move", nil, "", true},
+		{"empty string to NULL is a real move", "", nil, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := refKeyChanged(c.oldVal, c.newVal); got != c.want {
+				t.Errorf("refKeyChanged(%#v, %#v) = %v, want %v", c.oldVal, c.newVal, got, c.want)
+			}
+		})
+	}
+}
+
 // TestLoadCascadeClosure pins the cross-schema FK loader (#833). Scoping the FK
 // graph by the child's own schema silently dropped a child living in a different
 // schema, so its cascade victims were never synthesized and the run exited 0
@@ -113,6 +145,43 @@ func TestLoadCascadeClosure(t *testing.T) {
 				t.Fatalf("%s: got edges %v, want %v", c.name, keys, want)
 			}
 		}
+	}
+}
+
+// TestLoadCascadeClosure_updateRuleWidensFrontier is #833 one rule over (#1002):
+// an ON UPDATE CASCADE child can itself have its key rewritten and cascade
+// further, so its schema must widen the referenced-schema frontier exactly like
+// an ON DELETE one. Scoping the walk on delete_rule alone left a multi-level
+// cross-schema ON UPDATE cascade unloaded — the same silent under-recovery.
+func TestLoadCascadeClosure_updateRuleWidensFrontier(t *testing.T) {
+	edge := func(childSchema, childTable, parentSchema, parentTable, delRule, updRule string) CascadeFK {
+		return CascadeFK{
+			Schema: childSchema, Table: childTable, ConstraintName: "fk_" + childTable, Column: "pid",
+			ReferencedSchema: parentSchema, ReferencedTable: parentTable, ReferencedColumn: "id",
+			DeleteRule: delRule, UpdateRule: updRule,
+		}
+	}
+	graph := map[string][]CascadeFK{
+		// b.reports cascades ONLY on update; c.lines hangs off it.
+		"a": {edge("b", "reports", "a", "orders", "RESTRICT", "CASCADE")},
+		"b": {edge("c", "lines", "b", "reports", "RESTRICT", "SET NULL")},
+	}
+	load := func(_ context.Context, refSchemas []string) ([]CascadeFK, error) {
+		var out []CascadeFK
+		for _, s := range refSchemas {
+			out = append(out, graph[s]...)
+		}
+		return out, nil
+	}
+	got, err := loadCascadeClosure(context.Background(), "a", load)
+	if err != nil {
+		t.Fatalf("loadCascadeClosure: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("an ON UPDATE cascading child must widen the frontier to its schema; got %d edges: %+v", len(got), got)
+	}
+	if got[1].Schema != "c" || got[1].Table != "lines" {
+		t.Errorf("the second-level ON UPDATE edge was not loaded: %+v", got)
 	}
 }
 

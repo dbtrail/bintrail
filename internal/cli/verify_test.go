@@ -9,6 +9,11 @@ import (
 	"github.com/dbtrail/dbtrail/internal/verify"
 )
 
+// TestPrintVerifyReport_ExitCodes locks the exit contract, and locks it
+// IDENTICALLY for both output formats (#954): --format json is a rendering
+// choice, never a semantics change. A JSON consumer that trusted the exit code
+// less (or more) than a text one would silently re-open the false-assurance
+// hole this command exists to close.
 func TestPrintVerifyReport_ExitCodes(t *testing.T) {
 	r := func(status verify.Status) verify.TableResult {
 		return verify.TableResult{Schema: "db", Table: "t", Status: status}
@@ -26,17 +31,23 @@ func TestPrintVerifyReport_ExitCodes(t *testing.T) {
 		{"unknown status counts as error", []verify.TableResult{r(verify.StatusMatch), r(verify.Status("bogus"))}, true},
 		{"empty/zero status counts as error", []verify.TableResult{r(verify.StatusMatch), r(verify.Status(""))}, true},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cmd := &cobra.Command{}
-			cmd.SetOut(&bytes.Buffer{})
-			err := printVerifyReport(cmd, tc.results)
-			if tc.wantErr && err == nil {
-				t.Errorf("want non-zero exit (error), got nil")
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("want exit 0 (nil), got %v", err)
-			}
-		})
+	for _, format := range []string{"text", "json"} {
+		for _, tc := range cases {
+			t.Run(format+"/"+tc.name, func(t *testing.T) {
+				setVerifyFormat(t, format)
+				cmd := &cobra.Command{}
+				cmd.SetOut(&bytes.Buffer{})
+				var err error
+				captureVerifyStdout(t, func() {
+					err = emitVerifyReport(cmd, verify.NewReport(verify.ModeBaselinePair, tc.results))
+				})
+				if tc.wantErr && err == nil {
+					t.Errorf("want non-zero exit (error), got nil")
+				}
+				if !tc.wantErr && err != nil {
+					t.Errorf("want exit 0 (nil), got %v", err)
+				}
+			})
+		}
 	}
 }

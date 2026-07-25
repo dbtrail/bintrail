@@ -172,9 +172,30 @@ Three offline commands hold their working set in memory, so a BLOB/TEXT-heavy or
 
 - **`query --limit 0`** removes the row cap entirely — an unbounded scan into memory. It still works (some pipelines rely on it), but the command now prints a stderr warning; prefer a real `--limit N` or a tight `--since`/`--until` for large tables.
 - **`recover`** buffers the whole reversal script in memory before writing (it must, to refuse cleanly on schema drift), roughly doubling peak on top of the already-loaded events. `--max-script-bytes` (default `2GB`; env `BINTRAIL_RECOVER_MAX_BYTES`; `0` = unlimited) makes it **refuse** rather than render a multi-gigabyte script — see [Recovery](#recovery). The bound is on the rendered script, not the initial fetch, which stays `--limit`-bounded.
-- **`reconstruct --output-format mydumper`** holds every event in the baseline→target window plus a per-touched-row change map, *per table*, and reconstructs up to `--parallelism` tables (default `runtime.NumCPU()`) concurrently — so the process can hold several tables' windows in memory at once, not just one. `--warn-event-threshold` (default `5000000`; env `BINTRAIL_RECONSTRUCT_WARN_EVENTS`; `0` disables) logs a loud warning when a table's event count exceeds an **effective, per-table threshold scaled down by concurrency**: the configured threshold divided by `min(--parallelism, number of --tables)` ([#842](https://github.com/dbtrail/dbtrail/issues/842)) — so 8 tables reconstructing concurrently at 4M events each now warn even though each is individually under the raw 5M default, while a single-table run is never penalized just because `--parallelism` defaults high. It only warns — it never refuses. The merge/baseline DuckDB sessions this mode opens also get the same container-safe budget (2 threads/4GB by default, or your `--ultrafast`/`--duckdb-threads`/`--duckdb-memory-limit` choice) as the archive-fetch DuckDB session, instead of defaulting to ~80% of host RAM ([#842](https://github.com/dbtrail/dbtrail/issues/842)). If a run is killed mid-way (OOM-killer included), the output directory is left flagged incomplete — see [Completeness marker](#completeness-marker) below.
+- **`reconstruct --output-format mydumper`** keeps a per-touched-row change map *per table*, and reconstructs up to `--parallelism` tables (default `runtime.NumCPU()`) concurrently — so the process can hold several tables' maps at once, not just one. It no longer holds the event window itself: since [#1097](https://github.com/dbtrail/dbtrail/issues/1097) each table's window is **fetched a page at a time** and folded into the change map incrementally, so peak memory scales with *rows touched*, not *events fetched*. See [Streaming the event window](#streaming-the-event-window) below for the knob and its trade-off. `--warn-event-threshold` (default `5000000`; env `BINTRAIL_RECONSTRUCT_WARN_EVENTS`; `0` disables) logs a loud warning when a table's event count exceeds an **effective, per-table threshold scaled down by concurrency**: the configured threshold divided by `min(--parallelism, number of --tables)` ([#842](https://github.com/dbtrail/dbtrail/issues/842)) — so 8 tables reconstructing concurrently at 4M events each warn even though each is individually under the raw 5M default, while a single-table run is never penalized just because `--parallelism` defaults high. It only warns — it never refuses. The merge/baseline DuckDB sessions this mode opens also get the same container-safe budget (2 threads/4GB by default, or your `--ultrafast`/`--duckdb-threads`/`--duckdb-memory-limit` choice) as the archive-fetch DuckDB session, instead of defaulting to ~80% of host RAM ([#842](https://github.com/dbtrail/dbtrail/issues/842)). If a run is killed mid-way (OOM-killer included), the output directory is left flagged incomplete — see [Completeness marker](#completeness-marker) below.
 
 The MCP server applies its own agent-facing row ceiling on the `query` tool — see [the MCP tool reference](mcp-server.md#tool-parameters-and-behavior-reference).
+
+#### Streaming the event window
+
+Full-table `reconstruct` rebuilds a table by merging a baseline snapshot with every binlog event since it. Those events used to be fetched in one call and held whole — including each event's *before* image, which the merge never reads.
+
+They are now walked in pages ([#1097](https://github.com/dbtrail/dbtrail/issues/1097)). Each page is folded into the change map ("last event per row") and released, so the raw window never exists in full. `--fetch-batch-size` (default `100000`; env `BINTRAIL_RECONSTRUCT_FETCH_BATCH`; `0` = default) sets the page size:
+
+| | Lower it | Raise it |
+|---|---|---|
+| **Peak memory** | Less resident per table — each page carries roughly 1–2 KB per event on a narrow table | More |
+| **Round trips** | More: each page costs one index query **plus one scan per archive source** | Fewer |
+
+**The archived-window cost is worth doing the arithmetic on.** For local archives DuckDB scans the files in place, but for **S3** archives each file is *downloaded* to disk, scanned, and deleted — per page. Page scoping advances with the cursor, so pages do not re-read the whole window; but it advances at **hour** granularity, and archive partitions are hourly. So the file for the hour a page lands in is re-fetched by every page that lands in that hour:
+
+```
+re-fetches of a given hour's file ≈ events in that hour ÷ --fetch-batch-size
+```
+
+At the default `100000`, an hour holding 100k events costs ~1 fetch (no amplification); an hour holding 1M events costs ~10. **Budget about double that**: file pruning keeps a file when its hour *ends* at-or-after the bound, so the hour before the cursor is re-fetched alongside the current one and yields nothing. DuckDB's row-group statistics prune the *scan*, not the *download*. If your busiest hours are far above the batch size and the window is mostly archived, raise `--fetch-batch-size` toward your peak hourly event count — memory permitting — before reaching for anything else.
+
+**What this does not bound.** The change map holds one entry per **distinct row touched** in the window, and paging the fetch does not shrink it: the merge scans the baseline once and needs each row's final image at the moment it reaches that row. A window touching tens of millions of distinct rows is still dominated by the map. That half is tracked separately in [#1107](https://github.com/dbtrail/dbtrail/issues/1107). Narrowing the window — a fresher baseline, an earlier `--at`, or fewer `--tables` per run — is what reduces it today.
 
 ### TRUNCATE / DROP / RENAME in the reconstruction window
 
@@ -263,17 +284,18 @@ Reversed: undo the 14:03 UPDATE first, then the 14:02 UPDATE, then the 14:01 INS
 > topological reordering across tables, and the generated script never emits
 > `SET FOREIGN_KEY_CHECKS`. Tables with `ON DELETE/UPDATE CASCADE` produce
 > side-effect row changes (InnoDB runs cascades below the binlog, MySQL Bug
-> #32506, so cascaded child deletes are never captured) that plain `recover`
+> #32506, so neither the cascaded child deletes nor the child FK rewrites an
+> `ON UPDATE` cascade performs are ever captured) that plain `recover`
 > cannot reliably undo. `bintrail doctor`, and `stream`/`watch`/`index --source-dsn`,
 > warn about them and proceed (cascade schemas index normally). To reconstruct
-> cascade-deleted rows, use **`bintrail recover-cascade`** (see below).
+> those rows, use **`bintrail recover-cascade`** (see below).
 
-### `recover-cascade`: reverse FK ON DELETE CASCADE / SET NULL
+### `recover-cascade`: reverse FK ON DELETE / ON UPDATE CASCADE / SET NULL
 
-`bintrail recover-cascade` reconstructs the side effects of an InnoDB
-`ON DELETE CASCADE` or `ON DELETE SET NULL` that were never binlogged. It finds
-the deleted parent rows in the index, infers which child rows referenced them in
-their last indexed state, and emits reversal SQL:
+`bintrail recover-cascade` reconstructs the side effects of an InnoDB foreign-key
+cascade that were never binlogged. It finds the changed parent rows in the index,
+infers which child rows referenced them in their last indexed state, and emits
+reversal SQL:
 
 - **ON DELETE CASCADE** → re-inserts **both** the parents and their
   cascade-deleted descendants (recursing through multi-level cascades).
@@ -281,6 +303,17 @@ their last indexed state, and emits reversal SQL:
   guarded by `... AND fk IS NULL` so a re-run, a manual fix, or a later re-point
   of the child is never clobbered (the child row survives — only its FK was
   nulled — so it is not re-inserted).
+- **ON UPDATE CASCADE** → for a parent whose **referenced key** was `UPDATE`d,
+  InnoDB rewrote every child FK that pointed at the old key. The reversal is an
+  idempotent `UPDATE` putting each child FK back, guarded by
+  `... AND fk = <new key>` — again so a child re-pointed after the cascade is
+  never clobbered. The parent `UPDATE` itself is reversed alongside it.
+- **ON UPDATE SET NULL** → same, except the children were nulled rather than
+  re-pointed, so the guard is `... AND fk IS NULL`.
+
+Only parent `UPDATE`s that actually **moved a referenced key** are considered: an
+`UPDATE` of unrelated columns cannot have cascaded, so it synthesizes nothing and
+its own reversal is **not** emitted either.
 
 All wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. Like `recover`, it only generates
 SQL — review before applying.
@@ -290,8 +323,8 @@ bintrail recover-cascade --index-dsn "..." \
   --schema shop --table orders --pk '42' --dry-run
 ```
 
-- `--table` is the **parent** table whose delete cascaded; `--pk`/`--pks`,
-  `--since`/`--until` narrow which deleted parents to process.
+- `--table` is the **parent** table whose delete or key update cascaded;
+  `--pk`/`--pks`, `--since`/`--until` narrow which parents to process.
 - `--lookback` (default `30d`) bounds how far back the last child state is
   searched; `--max-depth` (default 5) bounds cascade recursion.
 - **Phase-2 baseline fallback** (`--baseline-dir` or `--baseline-s3`): without a
@@ -312,13 +345,20 @@ bintrail recover-cascade --index-dsn "..." \
 
 #### `recover-cascade` limitations
 
-- **Only `ON DELETE CASCADE` / `ON DELETE SET NULL`.** `ON UPDATE CASCADE` /
-  `ON UPDATE SET NULL` (InnoDB rewrites a child's FK when the parent's
-  referenced key is `UPDATE`d) are not synthesized — reverting such a parent
-  `UPDATE` leaves the child FK pointing at the new value with no warning. The
-  gate is deliberate (it does not port a rule-conflation bug from the dbtrail
-  SaaS), but the result is real: `bintrail doctor`'s cascade check and this
-  page both cover `ON DELETE` only.
+- **`delete_rule` and `update_rule` are never conflated.** A parent `DELETE`
+  routes through the `ON DELETE` rule only, and a parent key `UPDATE` through
+  the `ON UPDATE` rule only. So a `DELETE` on a table whose children are
+  `ON UPDATE CASCADE`-only reconstructs nothing (correctly — InnoDB cascaded
+  nothing), and vice versa.
+- **A repeated parent-key `UPDATE` inside the window under-recovers, and says
+  so.** If the same referenced key moved twice (`A → B`, then `B → A`), the
+  first cascade rewrote the children below the binlog too, so their last
+  *indexed* image still carries `A` and the scan for the second update's old key
+  (`B`) matches nothing. That run is flagged `INCOMPLETE RECOVERY` — a
+  zero-child result there is not proof there were no children. The chain is
+  detected by asking whether the key *arrived* at the parent from somewhere else
+  inside the window, so the flag holds whether the referenced column is the
+  parent's primary key (`REFERENCES parent(id)`) or a secondary unique key.
 - **Composite (multi-column) FKs are skipped, not reconstructed.** A
   single-column victim match would mis-reconstruct a multi-column key, so a
   composite FK is dropped and flagged in the output rather than silently
@@ -432,14 +472,16 @@ Key properties:
 - Comments before each statement showing the original event ID, type, table, PK, timestamp, and GTID.
 - **Per-event generation errors refuse the whole script.** If any event cannot be reversed — e.g. a malformed or truncated stored row image leaves `row_before`/`row_after` `NULL` — `recover` fails loud: it writes nothing and exits non-zero (with `--output`, the target file is left empty), and the error names every un-generatable event. It does **not** emit the rest as a runnable script with the failed events demoted to `-- ERROR ...` comments — a SQL comment has no apply-time effect, so a partial script would commit clean under `BEGIN`/`COMMIT` and silently deliver an *incomplete* reversal. **Schema drift** is the same: if a statement references a column dropped or renamed after the event, `recover` refuses up front rather than emitting SQL that would fail at apply time. Always check the exit code before applying a generated file.
 - **Never auto-executed**: dbtrail only generates the file. Applying it is always a manual step.
-- `bintrail` (MySQL) pins the apply session before the reversal statements: `SET time_zone = '+00:00'` (TIMESTAMP/DATETIME literals in the script are rendered from the captured UTC value with no explicit zone marker — without the pin, a target session in a non-UTC `time_zone` would reinterpret them and reintroduce a shift) and `SET sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'` — permissive where the script's own encoding needs it (no `NO_BACKSLASH_ESCAPES`, so the backslash-escaped string literals parse as written; no zero-date rules, so captured `0000-00-00` values apply verbatim) while keeping strict truncation/out-of-range checks, so a captured value that no longer fits a since-narrowed column fails loud instead of being silently coerced. `bintrail-pg` (PostgreSQL) pins `standard_conforming_strings = on` for the same reason (its string-escaping assumes it). Beyond these, nothing else about the apply session is pinned — see [Restore limitations](#restore-limitations-mysql) below for what is **not** pinned or restored.
+- `bintrail` (MySQL) pins the apply session before the reversal statements: `SET time_zone = '+00:00'` (TIMESTAMP/DATETIME literals in the script are rendered from the captured UTC value with no explicit zone marker — without the pin, a target session in a non-UTC `time_zone` would reinterpret them and reintroduce a shift) and `SET sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION'` — permissive where the script's own encoding needs it (no `NO_BACKSLASH_ESCAPES`, so the backslash-escaped string literals parse as written; no zero-date rules, so captured `0000-00-00` values apply verbatim) while keeping strict truncation/out-of-range checks, so a captured value that no longer fits a since-narrowed column fails loud instead of being silently coerced. `bintrail-pg` (PostgreSQL) pins `standard_conforming_strings = on` for the same reason (its string-escaping assumes it). Beyond these, nothing else about the apply session is pinned *by default* — one more pin is available opt-in on the PostgreSQL path (`--suppress-triggers`, below), and see [Restore limitations](#restore-limitations-mysql) for what is **not** pinned or restored.
+- **`--suppress-triggers` (PostgreSQL sources only).** Adds `SET LOCAL session_replication_role = replica;` to the preamble, inside the script's own transaction, so the reversal does **not** re-fire the target's triggers (see [Triggers re-fire on apply](#restore-limitations-mysql) below for why that matters). It is opt-in, not the default, for two reasons: setting that parameter requires superuser (PostgreSQL ≤ 14) or an explicit `GRANT SET ON PARAMETER session_replication_role TO <role>` (15+), so emitting it unconditionally would break every apply performed by an ordinary role; and `replica` **also disables `FOREIGN KEY` constraint triggers**, so referential integrity is not enforced while the reversal applies. `SET LOCAL` is transaction-scoped — the applying session's setting is restored at `COMMIT`/`ROLLBACK`. The flag has no effect on a MySQL/MariaDB index (`recover` warns if you pass it there); MySQL has no equivalent toggle.
+- **`--restore-auto-increment` (MySQL sources only).** Appends an `AUTO_INCREMENT` restore checklist **after** `COMMIT` — one `SELECT` + `ALTER TABLE ... AUTO_INCREMENT = <N>` pair per table the reversal writes. The statements are emitted **commented out**: the correct `N` is not derivable from the index (the schema snapshot does not record which column is `AUTO_INCREMENT`, and the right value depends on whether you want to reuse the ids the reversal freed), so the block hands over an exact recipe instead of guessing. It sits after `COMMIT` because `ALTER TABLE` is DDL and implicitly commits in MySQL — inside the reversal transaction it would break that transaction's atomicity. No effect on a PostgreSQL index (`recover` warns if you pass it there).
 
 ## Restore limitations (MySQL)
 
 A `bintrail recover` script is applied as ordinary SQL by a normal client connection, so it inherits several effects that are easy to miss when treating "the script ran with no errors" as "the data is back exactly as it was":
 
-- **Triggers re-fire on apply.** Restoring a `DELETE` via `INSERT`, or reverting an `UPDATE`, fires the target table's `AFTER INSERT`/`AFTER UPDATE` triggers just like any other statement — producing **new** side effects (audit rows, counters, denormalized columns). Since the trigger's original side effects were themselves row-logged and are reverted as their own separate events in the same script, a table with side-effecting triggers can have those effects double-applied. MySQL has no session-level toggle to suppress triggers during an apply (this is a fundamental limitation for MySQL, unlike PostgreSQL's `session_replication_role`).
-- **`AUTO_INCREMENT` is not restored.** Reverting an `INSERT` deletes the row but does not decrement the table's `AUTO_INCREMENT` counter; reverting a `DELETE` re-inserts the row with its original (now possibly out-of-sequence) id, which can bump the counter further. The row data ends up identical to before, but the *next* auto-generated id may differ from what it would have been. If this matters, follow up with an explicit `ALTER TABLE ... AUTO_INCREMENT = N` once you know the correct value.
+- **Triggers re-fire on apply.** Restoring a `DELETE` via `INSERT`, or reverting an `UPDATE`, fires the target table's `AFTER INSERT`/`AFTER UPDATE` triggers just like any other statement — producing **new** side effects (audit rows, counters, denormalized columns). Since the trigger's original side effects were themselves row-logged and are reverted as their own separate events in the same script, a table with side-effecting triggers can have those effects double-applied. MySQL has no session-level toggle to suppress triggers during an apply (this is a fundamental limitation for MySQL, unlike PostgreSQL's `session_replication_role` — which `bintrail-pg recover --suppress-triggers` can pin for the reversal transaction; there is no MySQL counterpart and `--suppress-triggers` is inert there).
+- **`AUTO_INCREMENT` is not restored.** Reverting an `INSERT` deletes the row but does not decrement the table's `AUTO_INCREMENT` counter; reverting a `DELETE` re-inserts the row with its original (now possibly out-of-sequence) id, which can bump the counter further. The row data ends up identical to before, but the *next* auto-generated id may differ from what it would have been. If this matters, follow up with an explicit `ALTER TABLE ... AUTO_INCREMENT = N` once you know the correct value — `recover --restore-auto-increment` appends that step (commented out, one pair of statements per written table, after `COMMIT`) so you do not have to assemble it by hand; the script still never picks `N` for you.
 - **`TRUNCATE TABLE` / `DROP TABLE` / `RENAME TABLE` cannot be undone by `recover`.** These emit no row-level binlog events (only an audit entry in `schema_changes`), so there is nothing for `recover` to reverse. The only path back is `bintrail baseline` + `bintrail reconstruct` to a point in time *before* the DDL — see [TRUNCATE / DROP / RENAME in the reconstruction window](#truncate--drop--rename-in-the-reconstruction-window) above, which is enforced (refuse, not silent) on every baseline-merging read path.
 - **A crash-tail loss on the source is invisible to `recover` and `reconstruct` alike.** If the source runs with `sync_binlog` other than `1`, an OS crash can drop committed transactions from the binlog tail before dbtrail ever sees them — there is nothing in the index to recover because the data never reached the binlog. `bintrail doctor` warns when the source isn't `sync_binlog=1`; `bintrail verify` is the only way to later notice the gap (as a MISMATCH).
 - **`reconstruct --at` and the shim's single-row `_flashback` / `_snapshot` cut at the transaction boundary, using the indexed GTID, not a raw per-statement timestamp** ([#783](https://github.com/dbtrail/dbtrail/issues/783), [#988](https://github.com/dbtrail/dbtrail/issues/988)). Two statements inside the same transaction can carry different `event_timestamp` values (down to the second); a naive per-row cut between them would half-apply the transaction — a state that never existed. Single-row `reconstruct`, `_flashback`, and `_snapshot` instead group row events by GTID (one binlog transaction is always a contiguous run of one GTID) and include or exclude each transaction as a whole: if any of its statements fall after `--at`, the entire transaction is dropped, never partially applied. (Single-row `_flashback` gained this in [#988](https://github.com/dbtrail/dbtrail/issues/988) — it now folds the PK's surviving events with `ApplyAt` instead of taking the latest event verbatim.) Two residual limits remain, both rooted in the index persisting `event_timestamp` as `DATETIME(0)` (one-second resolution) with no true commit-time column: (1) sub-second ordering *within* the surviving events cannot be resolved any better than before; (2) a transaction whose statements **all** execute before `--at` but which **commits** after it is still included whole — indistinguishable, at one-second resolution, from one that legitimately committed earlier. The **full-table** `AS OF` paths do not yet apply this transaction-boundary cut and still cut per row (tracked separately): `reconstruct --output-format mydumper`, and full-table `_flashback` / `_snapshot` over the shim.

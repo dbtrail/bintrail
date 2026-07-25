@@ -399,9 +399,27 @@ func FindBaselinePair(ctx context.Context, source string) (pairs []BaselinePair,
 		}
 		prevOnly = append(prevOnly, query.SchemaTable{Schema: pf.Schema, Table: pf.Table})
 	}
+	sortBaselinePairs(pairs)
 	sortSchemaTables(unpaired)
 	sortSchemaTables(prevOnly)
 	return pairs, unpaired, prevOnly, nil
+}
+
+// sortBaselinePairs orders pairs by schema.table, in place.
+//
+// FindBaselinePair accumulates pairs by ranging a map, and Go randomizes map
+// iteration order per run, so without this everything downstream inherits that
+// nondeterminism: the order VerifyBaselinePair is called in, and — visibly —
+// the `explain[]` array of `verify --explain --format json`, which appends one
+// entry per mismatched pair in this order. Two identical runs could swap
+// explain[0] and explain[1] while `tables[]` (sorted in NewReport) stayed put.
+func sortBaselinePairs(p []BaselinePair) {
+	sort.Slice(p, func(i, j int) bool {
+		if p[i].Schema != p[j].Schema {
+			return p[i].Schema < p[j].Schema
+		}
+		return p[i].Table < p[j].Table
+	})
 }
 
 func sortSchemaTables(s []query.SchemaTable) {
