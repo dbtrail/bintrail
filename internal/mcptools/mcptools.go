@@ -1,6 +1,6 @@
-// Package mcptools implements the four read-only Bintrail MCP tools —
-// query, recover, status, and list_schema_changes — decoupled from how the
-// index connection is obtained.
+// Package mcptools implements the read-only Bintrail MCP tools — query,
+// recover, status, list_schema_changes, and the opt-in reconstruct (#953) —
+// decoupled from how the index connection is obtained.
 //
 // Two surfaces consume it:
 //
@@ -104,6 +104,19 @@ type Target struct {
 	// content as the console events API (whose eventDTO omits statement text,
 	// #699). Set by the console surface only.
 	RedactStatementText bool
+	// FindBaseline is the reconstruct tool's baseline lookup on surfaces that
+	// own baseline routing (the console binds its bundle's findBaseline, which
+	// carries the #766 local→S3 fallback). Left nil on the standalone surface,
+	// which binds a source from the tool parameters or the environment instead
+	// — see resolveBaselineLookup.
+	FindBaseline FindBaselineFunc
+	// BaselineConfigured gates the reconstruct tool for THIS target on surfaces
+	// that own baseline routing: the console's per-server signal, which already
+	// folds in "a baseline location is set" AND "archives are enabled" AND "no
+	// RBAC profile is active" (see internal/console's newBundleDerived). Unused
+	// on the standalone surface, whose gate is whether a baseline source
+	// resolved at all.
+	BaselineConfigured bool
 }
 
 // release closes the connection when this call owns it.
@@ -141,7 +154,7 @@ func (t *Target) archiveSources(ctx context.Context) []string {
 // that reject it) to the Target the call runs against.
 type ResolveTarget func(ctx context.Context, argDSN string) (*Target, error)
 
-// Config assembles an MCP server over the four read-only tools.
+// Config assembles an MCP server over the read-only tools.
 type Config struct {
 	// Version is the reported mcp.Implementation version.
 	Version string
@@ -157,6 +170,18 @@ type Config struct {
 	// (standalone). When false it is rejected — the surface's RBAC posture
 	// is fixed at process start (console).
 	AllowProfileParam bool
+	// Reconstruct registers the reconstruct (time-travel) tool. Opt-in per
+	// surface rather than unconditional in NewServer: a surface that cannot
+	// supply a baseline lookup (neither Target.FindBaseline nor the
+	// baseline_dir/baseline_s3 parameters) would otherwise advertise a tool
+	// that can only ever error.
+	Reconstruct bool
+	// AllowBaselineParams accepts the reconstruct tool's baseline_dir /
+	// baseline_s3 parameters, with BINTRAIL_BASELINE_DIR / BINTRAIL_BASELINE_S3
+	// as the fallback (standalone). When false they are rejected exactly like
+	// index_dsn is, and the lookup comes from Target.FindBaseline instead — the
+	// serving surface owns baseline routing (console).
+	AllowBaselineParams bool
 	// QueryMaxLimit returns the hard row ceiling for the query tool. nil
 	// means EnvQueryMaxLimit (the standalone default, #654).
 	QueryMaxLimit func() int
@@ -217,8 +242,9 @@ func (c Config) scriptBudgetOverride() (int64, bool) {
 	return 0, false
 }
 
-// NewServer builds an MCP server exposing the four read-only tools bound to
-// cfg. All tools are annotated read-only + idempotent.
+// NewServer builds an MCP server exposing the read-only tools bound to cfg:
+// query, recover, status and list_schema_changes always, plus reconstruct when
+// cfg.Reconstruct is set. All tools are annotated read-only + idempotent.
 func NewServer(cfg Config) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "bintrail",
@@ -275,6 +301,24 @@ func NewServer(cfg Config) *mcp.Server {
 			IdempotentHint: true,
 		},
 	}, MakeSchemaChangesTool(cfg))
+
+	// Opt-in (#953): only surfaces that can supply a baseline lookup advertise
+	// it — see Config.Reconstruct.
+	if cfg.Reconstruct {
+		mcp.AddTool(server, &mcp.Tool{
+			Name: "reconstruct",
+			Description: "Reconstruct a single row's full state at a point in time (time travel). " +
+				"Folds a baseline snapshot with the indexed events after it, so columns never touched " +
+				"in the retained window resolve correctly — unlike `recover`, which only reverses events it has. " +
+				"Use history=true for every state transition up to that time. " +
+				"Requires a baseline snapshot produced by `bintrail baseline`.",
+			Annotations: &mcp.ToolAnnotations{
+				Title:          "Reconstruct row state at a point in time",
+				ReadOnlyHint:   true,
+				IdempotentHint: true,
+			},
+		}, MakeReconstructTool(cfg))
+	}
 
 	return server
 }

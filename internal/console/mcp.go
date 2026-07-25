@@ -10,8 +10,8 @@ import (
 	"github.com/dbtrail/dbtrail/internal/mcptools"
 )
 
-// The console serves the four read-only MCP tools (query, recover, status,
-// list_schema_changes) over Streamable HTTP (#1039):
+// The console serves the read-only MCP tools (query, recover, status,
+// list_schema_changes, reconstruct) over Streamable HTTP (#1039, #953):
 //
 //	/mcp                → the default server (same selection rules as the
 //	                      rest of the console, including HideBoot semantics)
@@ -39,8 +39,11 @@ import (
 // process-global deny/redact rules, and the console result caps (events
 // 100/1000, recover 1000/10000). query_text/query_hash are withheld from
 // query results to match the events API's eventDTO, and the index_dsn /
-// profile tool parameters are rejected: an authenticated MCP client must not
-// point the console at an arbitrary DSN or vary the process's RBAC posture.
+// profile / baseline_dir / baseline_s3 tool parameters are rejected: an
+// authenticated MCP client must not point the console at an arbitrary DSN or
+// baseline location, nor vary the process's RBAC posture. The reconstruct tool
+// is gated per server on the bundle's baselineConfigured, exactly like
+// /api/reconstruct.
 func (s *Server) mcpHandler() http.Handler {
 	streamable := mcp.NewStreamableHTTPHandler(
 		func(r *http.Request) *mcp.Server {
@@ -107,7 +110,8 @@ func (s *Server) newMCPServer(id string) *mcp.Server {
 	return mcptools.NewServer(mcptools.Config{
 		Version: "console",
 		Instructions: "Bintrail console MCP endpoint for querying indexed binlog events, " +
-			"generating recovery SQL, and viewing index status. " +
+			"generating recovery SQL, reconstructing a row's state at a point in time, " +
+			"and viewing index status. " +
 			"The target server is chosen by URL path: /mcp for the console's default server, " +
 			"/mcp/{id-or-name} for a named server from the console registry.",
 		Resolve: func(ctx context.Context, _ string) (*mcptools.Target, error) {
@@ -118,6 +122,19 @@ func (s *Server) newMCPServer(id string) *mcp.Server {
 			return &mcptools.Target{
 				DB:     b.db,
 				DBName: b.dbName,
+				// Time travel (#953): the bundle's own lookup, NOT
+				// reconstruct.FindBaseline — the method carries the #766
+				// local→S3 fallback, and binding the package function directly
+				// is exactly the regression #1102 fixed for cascade recovery.
+				// The gate is the same per-server signal /api/reconstruct
+				// enforces (a baseline location AND archives AND no startup RBAC
+				// profile). /api/reconstruct additionally refuses a session
+				// carrying a data profile (#1075); that has no analogue here
+				// because login sessions cannot authenticate to /mcp at all —
+				// this endpoint accepts only the static or UI-managed token, so
+				// no session policy ever reaches these handlers.
+				FindBaseline:       b.findBaseline,
+				BaselineConfigured: b.baselineConfigured,
 				// The connection is owned by the connManager; never closed
 				// per call, never schema-migrated (registry servers are
 				// deliberately not EnsureSchema'd — the console's read-only
@@ -136,8 +153,15 @@ func (s *Server) newMCPServer(id string) *mcp.Server {
 		},
 		AllowDSNParam:     false,
 		AllowProfileParam: false,
-		QueryMaxLimit:     func() int { return eventsMaxLimit },
-		RecoverMaxLimit:   recoverMaxLimit,
+		// The reconstruct tool is served, but the baseline location is the
+		// console's per-server configuration — the baseline_dir/baseline_s3
+		// parameters are rejected for the same reason index_dsn is: an
+		// authenticated MCP client must not point the console at arbitrary
+		// storage.
+		Reconstruct:         true,
+		AllowBaselineParams: false,
+		QueryMaxLimit:       func() int { return eventsMaxLimit },
+		RecoverMaxLimit:     recoverMaxLimit,
 		// #849: the console's /mcp recover tool renders the same reversal
 		// script as /api/recover, in the same shared daemon process — it must
 		// not be left at the Generator's CLI-sized 2 GiB default just because
