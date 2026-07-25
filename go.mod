@@ -11,7 +11,39 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.2
 	github.com/aws/smithy-go v1.24.1
 	github.com/coder/websocket v1.8.14
-	github.com/duckdb/duckdb-go/v2 v2.5.5
+	// PINNED to the DuckDB 1.4 "Andium" LTS line. v2.5.6 == DuckDB 1.4.5.
+	// Patch bumps WITHIN the line (v2.5.7, ...) are expected and welcome — they
+	// are where LTS fixes land. What is forbidden is any v2.1xxxx.x, which is
+	// DuckDB >= 1.5: duckdb-go changed versioning at 1.5 and now encodes the
+	// engine version in the minor component (DuckDB 1.5.5 => v2.10505.0), so
+	// under semver v2.10505.0 > v2.5.6 and a plain `go get -u` (or Dependabot,
+	// if it is ever enabled here) walks the build off LTS with no import-path
+	// change to notice. The six duckdb-go-bindings/lib/* modules use the same
+	// encoding and move with this one.
+	//
+	// This comment cannot enforce itself — `go get -u` rewrites the version and
+	// leaves the text byte-identical. The guard that actually fails is
+	// TestDuckDBEngineOnLTSLine in internal/duckdbutil; it also carries the
+	// pre-flight checklist for the day we do move off.
+	//
+	// Nothing in 1.5 is reachable from here. Our surface is read-side only:
+	// parquet_scan (hive_partitioning/union_by_name), glob, parquet metadata
+	// functions, one COPY TO PARQUET, INSTALL/LOAD httpfs+aws, CREATE SECRET
+	// credential_chain, and SET threads/memory_limit/temp_directory/s3_region/
+	// home_directory. Every handle is in-memory (sql.Open("duckdb", "")) and our
+	// durable format is Parquet written by parquet-go, not DuckDB, so 1.5's
+	// storage and type headliners cannot reach us. What 1.5 DOES change is
+	// httpfs's backend, httplib -> curl, landing on the S3-direct scan (#511),
+	// credential_chain secrets, cross-region resolution and the $HOME/.duckdb
+	// extension dir (#610) — none of which CI exercises against real S3.
+	//
+	// 1.4 LTS support ENDS 2026-09-16. Past that date this pin is a known
+	// liability rather than a preference: either move to the next LTS or record
+	// an explicit decision to run an unsupported engine. There is no 1.6 on the
+	// release calendar and DuckDB's stated policy is "every other release is
+	// LTS", so the next LTS is EXPECTED to be 2.0.0 (Fall 2026, tentative) —
+	// but 2.0.0 carries no LTS marker yet, so confirm before relying on it.
+	github.com/duckdb/duckdb-go/v2 v2.5.6
 	github.com/go-mysql-org/go-mysql v1.13.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/google/uuid v1.6.0
@@ -48,12 +80,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.7 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/duckdb/duckdb-go-bindings v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/windows-amd64 v0.3.3 // indirect
+	github.com/duckdb/duckdb-go-bindings v0.3.5 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.3.5 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.3.5 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 v0.3.5 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 v0.3.5 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/windows-amd64 v0.3.5 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
