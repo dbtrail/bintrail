@@ -94,11 +94,15 @@ type FullTableConfig struct {
 	//
 	// It trades resident memory against round trips: a page holds both decoded
 	// JSON row images per event (roughly 1-2 KB per event on a narrow table),
-	// while each page costs one MySQL query plus one scan per archive source.
-	// Archive file scoping advances with the cursor, so a smaller page re-lists
-	// and re-reads progressively less of the window rather than all of it — but
-	// the boundary file is still re-read once per page, so shrinking this
-	// without bound is not free.
+	// while each page costs one MySQL query plus one read per archive source.
+	//
+	// The archive cost is not uniform, and the arithmetic matters for S3, where
+	// parquetquery downloads each file rather than scanning it in place. Cursor
+	// scoping advances at HOUR granularity and archive partitions are hourly,
+	// so a given hour's file is re-fetched roughly (events in that hour /
+	// FetchBatchSize) times — ~1x at the default for an hour holding 100k
+	// events, ~10x for one holding 1M. Shrinking this is therefore free only up
+	// to the point where a page stops spanning a whole busy hour.
 	FetchBatchSize int
 
 	// ArchiveFetcher fetches archived binlog events for a table. nil →

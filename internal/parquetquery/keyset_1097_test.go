@@ -1,9 +1,12 @@
 package parquetquery
 
 import (
+	"context"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/archive"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -83,5 +86,75 @@ func TestSinceLowerBoundHint_cursorNeverOverridesSincePosMargin(t *testing.T) {
 	opts.AfterEvent = &query.EventCursor{Timestamp: inside, EventID: 1}
 	if got := sinceLowerBoundHint(opts); got == nil || !got.Equal(widened) {
 		t.Errorf("a cursor inside the #797 margin must not tighten the floor: got %v, want %v", got, widened)
+	}
+}
+
+// TestFetch_afterEventKeysetPagesIdentically executes the DuckDB keyset
+// predicate against a real Parquet file (#1097). Everything else in the suite
+// asserts the SQL is *built* correctly; this asserts DuckDB *evaluates* it
+// correctly — the timestamp binding, and above all the tie handling.
+//
+// The fixture deliberately puts four events in the SAME second. That is the
+// case a timestamp-only cursor gets wrong in one of two silent ways: it either
+// re-returns the whole second on the next page (duplicates) or skips its
+// remainder (data loss). Paging through it in pages of two and comparing
+// against the unpaged read is what proves the composite (timestamp, event_id)
+// cut is exact.
+func TestFetch_afterEventKeysetPagesIdentically(t *testing.T) {
+	if os.Getenv("CGO_ENABLED") == "0" {
+		t.Skip("DuckDB requires CGO")
+	}
+	mkRow := func(id, ts, pk string) [2][]string {
+		return [2][]string{
+			{id, "mysql-bin.000001", "100", "200", ts, "", "", "mydb", "orders", "1", pk, "", "", `{"id":` + pk + `}`, "0", "", ""},
+			{"0", "0", "0", "0", "0", "1", "1", "0", "0", "0", "0", "1", "1", "0", "0", "1", "1"},
+		}
+	}
+	// ids 2..5 share one second; 1 and 6 bracket it.
+	dir := writeArchiveFixture(t, archive.BinlogEventColumns, [][2][]string{
+		mkRow("1", "2026-02-19 14:00:00", "1"),
+		mkRow("2", "2026-02-19 14:00:01", "2"),
+		mkRow("3", "2026-02-19 14:00:01", "3"),
+		mkRow("4", "2026-02-19 14:00:01", "4"),
+		mkRow("5", "2026-02-19 14:00:01", "5"),
+		mkRow("6", "2026-02-19 14:00:02", "6"),
+	})
+	base := query.Options{Schema: "mydb", Table: "orders"}
+
+	unpaged, err := Fetch(context.Background(), base, dir)
+	if err != nil {
+		t.Fatalf("unpaged Fetch: %v", err)
+	}
+	if len(unpaged) != 6 {
+		t.Fatalf("fixture read back %d rows, want 6", len(unpaged))
+	}
+
+	var paged []query.ResultRow
+	var cursor *query.EventCursor
+	for range 10 { // bounded so a non-advancing cursor fails the test, not the CI job
+		opts := base
+		opts.Limit = 2
+		opts.AfterEvent = cursor
+		page, ferr := Fetch(context.Background(), opts, dir)
+		if ferr != nil {
+			t.Fatalf("paged Fetch: %v", ferr)
+		}
+		if len(page) == 0 {
+			break
+		}
+		paged = append(paged, page...)
+		last := page[len(page)-1]
+		cursor = &query.EventCursor{Timestamp: last.EventTimestamp, EventID: last.EventID}
+	}
+
+	if len(paged) != len(unpaged) {
+		t.Fatalf("paged read %d rows, unpaged read %d — the keyset cut duplicated or dropped rows",
+			len(paged), len(unpaged))
+	}
+	for i := range unpaged {
+		if paged[i].EventID != unpaged[i].EventID {
+			t.Fatalf("row %d: paged event_id %d, unpaged %d — paging changed the result",
+				i, paged[i].EventID, unpaged[i].EventID)
+		}
 	}
 }

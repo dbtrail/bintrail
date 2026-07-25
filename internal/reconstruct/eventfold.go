@@ -71,6 +71,14 @@ func retainEvent(ev *query.ResultRow) *query.ResultRow {
 //
 //   - #592: a residual unchanged-TOAST marker would be written into the
 //     reconstructed dump as the marker's own JSON — silent corruption.
+//     NOTE this is stricter than the map-level check it replaced: that one
+//     only saw the surviving last event per PK, this sees every event,
+//     including ones a later event overwrote. Harmless today because the
+//     marker is a PostgreSQL concept and full-table reconstruct refuses PG
+//     sources outright (#597, gated in ReconstructTable) — so it cannot fire
+//     on a MySQL window at all. If that PG gate is ever lifted, revisit this:
+//     an overwritten event carrying a marker would then refuse a run whose
+//     OUTPUT would have been clean.
 //   - #782: the change map is keyed by the BEFORE-image PK, so folding an
 //     UPDATE whose PK changed would duplicate, resurrect, or silently drop rows.
 //     Checking per event rather than over the finished map catches the
@@ -169,6 +177,11 @@ type foldResult struct {
 func foldEventWindow(ctx context.Context, fc foldConfig) (*foldResult, error) {
 	res := &foldResult{Changes: make(map[string]*query.ResultRow)}
 	warned := false
+	// Built ONCE for the whole window, not per page: both decoding passes need
+	// the snapshot-epoch list and a resolver per epoch touched, and rebuilding
+	// that state per page would turn one schema_snapshots query into one per
+	// page. Its typed-ness accumulates across pages for the same reason.
+	dec := newEventDecoder(fc.DB, fc.Schema, fc.Table, fc.Resolver)
 
 	_, err := query.FetchMergedStream(ctx, fc.DB, fc.Engine, query.FetchMergedOptions{
 		Opts:      fc.Opts,
@@ -182,8 +195,8 @@ func foldEventWindow(ctx context.Context, fc foldConfig) (*foldResult, error) {
 		if len(page) == 0 {
 			return nil
 		}
-		MapEventEnumLabels(fc.DB, fc.Resolver, fc.Schema, fc.Table, page)
-		DecodeEventBinaries(fc.DB, fc.Schema, fc.Table, page)
+		dec.mapEnums(page)
+		dec.decodeBinaries(page)
 
 		if res.First == nil {
 			first := page[0]

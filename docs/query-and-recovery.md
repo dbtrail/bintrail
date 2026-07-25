@@ -187,7 +187,13 @@ They are now walked in pages ([#1097](https://github.com/dbtrail/dbtrail/issues/
 | **Peak memory** | Less resident per table — each page carries roughly 1–2 KB per event on a narrow table | More |
 | **Round trips** | More: each page costs one index query **plus one scan per archive source** | Fewer |
 
-The trade-off matters most when the window spans **archived** partitions. Archive files are listed and read per page, so a very small page size over a large archived window means many passes. Page scoping does advance with the cursor — later pages list and read progressively fewer files rather than re-reading the whole window — but the file at the page boundary is read again on each page. If a restore from a mostly-archived window feels slow, raise this before anything else.
+**The archived-window cost is worth doing the arithmetic on.** For local archives DuckDB scans the files in place, but for **S3** archives each file is *downloaded* to disk, scanned, and deleted — per page. Page scoping advances with the cursor, so pages do not re-read the whole window; but it advances at **hour** granularity, and archive partitions are hourly. So the file for the hour a page lands in is re-fetched by every page that lands in that hour:
+
+```
+re-fetches of a given hour's file ≈ events in that hour ÷ --fetch-batch-size
+```
+
+At the default `100000`, an hour holding 100k events costs ~1 fetch (no amplification); an hour holding 1M events costs ~10. DuckDB's row-group statistics prune the *scan*, not the *download*. If your busiest hours are far above the batch size and the window is mostly archived, raise `--fetch-batch-size` toward your peak hourly event count — memory permitting — before reaching for anything else.
 
 **What this does not bound.** The change map holds one entry per **distinct row touched** in the window, and paging the fetch does not shrink it: the merge scans the baseline once and needs each row's final image at the moment it reaches that row. A window touching tens of millions of distinct rows is still dominated by the map. That half is tracked separately in [#1107](https://github.com/dbtrail/dbtrail/issues/1107). Narrowing the window — a fresher baseline, an earlier `--at`, or fewer `--tables` per run — is what reduces it today.
 
