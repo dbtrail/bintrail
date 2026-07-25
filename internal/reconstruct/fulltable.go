@@ -88,6 +88,23 @@ type FullTableConfig struct {
 	// defaults it to 5,000,000 via --warn-event-threshold.
 	WarnEventThreshold int64
 
+	// FetchBatchSize is the page size used to stream a table's event window
+	// (#1097). 0 → query.DefaultStreamBatchSize, the zero-value convention this
+	// struct already uses for ArchiveFetcher/WarnEventThreshold/DuckDBTuning.
+	//
+	// It trades resident memory against round trips: a page holds both decoded
+	// JSON row images per event (roughly 1-2 KB per event on a narrow table),
+	// while each page costs one MySQL query plus one read per archive source.
+	//
+	// The archive cost is not uniform, and the arithmetic matters for S3, where
+	// parquetquery downloads each file rather than scanning it in place. Cursor
+	// scoping advances at HOUR granularity and archive partitions are hourly,
+	// so a given hour's file is re-fetched roughly (events in that hour /
+	// FetchBatchSize) times — ~1x at the default for an hour holding 100k
+	// events, ~10x for one holding 1M. Shrinking this is therefore free only up
+	// to the point where a page stops spanning a whole busy hour.
+	FetchBatchSize int
+
 	// ArchiveFetcher fetches archived binlog events for a table. nil →
 	// parquetquery.Fetch (the container-safe DuckDB budget). The CLI sets it
 	// to a tuned fetcher under --ultrafast so the flag is honored on the
@@ -162,8 +179,8 @@ func shouldWarnEvents(n, threshold int64) bool {
 // scaledEventThreshold divides threshold by parallelism so a per-table
 // warning threshold reflects the RAM footprint of parallelism tables
 // reconstructing CONCURRENTLY, not just one (#842): ReconstructTables runs up
-// to Parallelism table goroutines at a time, each holding its own event
-// window + change map in memory, so a per-table threshold alone lets N tables
+// to Parallelism table goroutines at a time, each holding its own page +
+// change map in memory, so a per-table threshold alone lets N tables
 // each just under the limit pass silently while the process holds N times
 // that much. threshold<=0 (disabled) and parallelism<=1 (no concurrency to
 // account for) pass through unchanged. The division floors, with a minimum of
@@ -207,13 +224,18 @@ func effectiveParallelism(cfg FullTableConfig) int {
 // warning reflects the total concurrent RAM footprint across every table
 // ReconstructTables may run at once, not just this one. Extracted from
 // ReconstructTable so the emission — not just the predicate — is unit-testable.
-func maybeWarnEventVolume(schema, table string, n int, threshold int64, parallelism int) {
+func maybeWarnEventVolume(schema, table string, n int64, threshold int64, parallelism int) {
 	effThreshold := scaledEventThreshold(threshold, parallelism)
-	if !shouldWarnEvents(int64(n), effThreshold) {
+	if !shouldWarnEvents(n, effThreshold) {
 		return
 	}
-	slog.Warn("reconstruct: very large event window — full-table reconstruct holds every event "+
-		"plus one change-map entry per touched row in memory and may exhaust RAM",
+	// The event window itself is streamed a page at a time since #1097, so the
+	// resident cost this warns about is the change map — one entry per DISTINCT
+	// touched row, which paging does not bound (that is #1107). The event count
+	// stays the trigger because it is what the fetch knows; a window this large
+	// is the reliable predictor of a map large enough to matter.
+	slog.Warn("reconstruct: very large event window — full-table reconstruct holds one change-map "+
+		"entry per touched row in memory and may exhaust RAM",
 		"schema", schema, "table", table,
 		"events", n, "threshold", effThreshold, "raw_threshold", threshold, "parallelism", parallelism,
 		"hint", "narrow the window with a later --at or a fresher baseline snapshot, lower --parallelism, or raise/silence "+
@@ -650,62 +672,48 @@ func ReconstructTable(
 	if fetcher == nil {
 		fetcher = parquetquery.Fetch
 	}
-	// Pass NoArchive=false unconditionally and let query.FetchMerged decide
-	// whether to query archives — it already handles the empty-archive case
-	// in its fast path. The previous `len(archSources)==0` gate was wrong:
-	// it disabled archive routing entirely even when FetchMerged could have
-	// resolved sources through its own code path.
-	events, _, err := query.FetchMerged(ctx, db, engine, query.FetchMergedOptions{
-		Opts:           fetchOpts,
-		DBName:         dbName,
-		NoArchive:      false,
-		AllowGaps:      cfg.AllowGaps,
-		ArchiveFetcher: fetcher,
+	// ── 5. Stream the window and fold it into the change map ──────────────
+	// Paged, not materialized (#1097): the window is walked in ascending
+	// (event_timestamp, event_id) order and folded page by page, so the raw
+	// event slice never exists in full. foldEventWindow also runs the per-event
+	// ENUM/base64 decoding (#475/#476/#668) and the #592/#782 guards on each
+	// page before trimming it into the map — see its doc comment for why those
+	// guards MUST live there and not on the finished map.
+	//
+	// NoArchive is passed false unconditionally and the stream decides whether
+	// to query archives — it already handles the empty-archive case in its fast
+	// path. The pre-#1097 `len(archSources)==0` gate was wrong: it disabled
+	// archive routing even when the fetch could have resolved sources itself.
+	fold, err := foldEventWindow(ctx, foldConfig{
+		DB:                 db,
+		Engine:             engine,
+		DBName:             dbName,
+		Resolver:           resolver,
+		Schema:             schema,
+		Table:              table,
+		PKCols:             pkCols,
+		Opts:               fetchOpts,
+		AllowGaps:          cfg.AllowGaps,
+		ArchiveFetcher:     fetcher,
+		BatchSize:          cfg.FetchBatchSize,
+		WarnEventThreshold: cfg.WarnEventThreshold,
+		Parallelism:        effectiveParallelism(cfg),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch events: %w", err)
+		return nil, err
 	}
-	rep.EventsApplied = int64(len(events))
-
-	// Large-window memory warning (#654). len(events) is the real, archive-inclusive
-	// count (FetchMerged already merged live + Parquet), so no separate COUNT is
-	// needed. Advisory only: it fires before the change-map build below and tells
-	// the operator to narrow the next run; it cannot shrink the already-resident
-	// slice (reconstruct warns, never refuses — the OOM at scale is unreproduced).
-	maybeWarnEventVolume(schema, table, len(events), cfg.WarnEventThreshold, effectiveParallelism(cfg))
+	rep.EventsApplied = fold.Total
+	changes := fold.Changes
 
 	// Warn on a gap between the baseline anchor and the first indexed event.
 	// The single-row path already does this (cli/reconstruct.go); the full-table
 	// path previously emitted a dump silently missing that gap with no signal
 	// (#781). Same call/semantics as single-row: warn-only, --allow-gaps governs
 	// the coverage-gap fetch above and CheckCaptureGap, not this
-	// baseline-vs-first-event visibility warning. bmeta was read in step 2.
-	if len(events) > 0 {
-		WarnBaselineFirstEventGap(query.SourceFlavor(db), bmeta, events[0], schema, table)
-	}
-
-	// ENUM/SET ordinals → labels (#476), each delta decoded with the
-	// snapshot in effect at its event time (#475). Must run before the
-	// merge so the mydumper output writes labels — the same form the
-	// baseline rows and a real mydumper dump carry — instead of numeric
-	// ordinals.
-	MapEventEnumLabels(db, resolver, schema, table, events)
-
-	// BLOB/TEXT base64 → real value, each delta decoded with the snapshot in
-	// effect at its event time (#668; same epoch-aware approach as the ENUM/SET
-	// pass above and the single-row reconstruct path, #666). Must run before
-	// the merge map is built below so changes' RowAfter images carry decoded
-	// values for free — typing the decode columns from a single latest-snapshot
-	// resolve (the pre-#668 behavior) corrupts a column captured as VARCHAR at
-	// an old epoch and widened to TEXT later.
-	DecodeEventBinaries(db, schema, table, events)
-
-	// ── 5. Build the change map: PK string → last event for that PK ───────
-	// events is already sorted by (event_timestamp, event_id) via
-	// query.MergeResults, so the last write wins naturally.
-	changes := make(map[string]*query.ResultRow, len(events))
-	for i := range events {
-		changes[events[i].PKValues] = &events[i]
+	// baseline-vs-first-event visibility warning. bmeta was read in step 2; the
+	// first event is carried out of the fold because its page is gone by now.
+	if fold.First != nil {
+		WarnBaselineFirstEventGap(query.SourceFlavor(db), bmeta, *fold.First, schema, table)
 	}
 
 	// ── 6. Materialize the baseline locally for DuckDB streaming ───────────
@@ -724,12 +732,11 @@ func ReconstructTable(
 		Table:             table,
 		PKCols:            pkCols,
 		Changes:           changes,
-		// Full-window fetch (no LimitPerPK) → hand the raw slice to the #782
-		// guard so a PK-changing UPDATE overwritten in the map is still caught.
-		Events:       events,
-		OutputDir:    cfg.OutputDir,
-		ChunkSize:    cfg.ChunkSize,
-		DuckDBTuning: cfg.DuckDBTuning,
+		ImageColumns:      fold.ImageColumns,
+		SawImage:          fold.SawImage,
+		OutputDir:         cfg.OutputDir,
+		ChunkSize:         cfg.ChunkSize,
+		DuckDBTuning:      cfg.DuckDBTuning,
 	}, rep); err != nil {
 		return nil, err
 	}
@@ -754,13 +761,17 @@ type mergeInput struct {
 	Schema            string
 	Table             string
 	PKCols            []metadata.ColumnMeta
-	Changes           map[string]*query.ResultRow
-	// Events is the RAW, pre-collapse event slice (before it was folded into
-	// Changes). Set by full-window callers so the #782 PK-change guard is
-	// window-complete; nil falls back to the map-only backstop (pkChangingUpdate).
-	Events    []query.ResultRow
-	OutputDir string
-	ChunkSize int64
+	// Changes is the completed build side of the merge, as produced by
+	// foldEventWindow. Its entries are TRIMMED (retainEvent blanks RowBefore
+	// and the query-text fields), which is why no guard reading a before-image
+	// may run against this map — see the note above mergeBaselineIntoWriter.
+	Changes map[string]*query.ResultRow
+	// ImageColumns/SawImage come from foldResult and carry the #843 signal the
+	// trimmed Changes map can no longer provide (see droppedBaselineColumns).
+	ImageColumns map[string]struct{}
+	SawImage     bool
+	OutputDir    string
+	ChunkSize    int64
 	// DuckDBTuning sets the resource budget for the DuckDB sessions this
 	// function opens (readBaselineColumns, mergeBaselineImages) (#842). Zero
 	// value → the container-safe default; see effectiveDuckDBTuning.
@@ -782,30 +793,25 @@ type mergeInput struct {
 // The writer's Close() is deferred as a fallback: on any early return it
 // still runs and unlinks half-written chunk files, so callers never observe
 // stray partial output on disk.
+// GUARD PLACEMENT (#1097) — read before adding a check here.
+//
+// The two guards that inspect an event's BEFORE-image — #592 (residual
+// unresolved-TOAST marker) and #782 (PK-changing UPDATE) — used to run at the
+// top of this function, against in.Changes. They do not, and must not, any
+// more: the map handed in by ReconstructTable is trimmed (retainEvent blanks
+// RowBefore so a streamed page can be released), so a before-image check
+// against it would find nothing to look at, return "clean" on every input, and
+// still read like a guard at the call site. That is a worse state than having
+// no guard at all.
+//
+// Both now run per event inside foldEventWindow, on the untrimmed event, before
+// it is ever folded — which is also strictly stronger for #782: the map only
+// held the surviving last event per PK, so a PK-changing UPDATE whose old key a
+// later event reused was invisible to a map scan. The map-level helpers
+// (checkChangesToast, pkChangingUpdate) still exist for the two callers whose
+// maps DO carry before-images (the shim's _snapshot path and the binlog-only
+// fallback); they are simply not applicable to this one.
 func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableReport) (retErr error) {
-	// Fail loud on a residual unchanged-TOAST marker (#592), before the writer
-	// opens (same up-front stance as the #602 refusal below): every change in
-	// the map is destined for the output, so a marker anywhere in it would be
-	// written into the reconstructed dump as the marker's JSON — silent
-	// corruption.
-	if err := checkChangesToast(in.Changes); err != nil {
-		return err
-	}
-
-	// Fail loud on a PK-changing UPDATE (#782), before the writer opens: the
-	// change map is keyed by the before-image PK, so folding an UPDATE whose PK
-	// changed would duplicate, resurrect, or silently drop rows in the dump.
-	// Same up-front stance as the #592/#602 refusals. Scan the RAW event slice
-	// first (authoritative, window-complete — catches a PK-changing UPDATE whose
-	// old key a later event reused and thus overwrote in the map); the map scan
-	// is a backstop for any caller that didn't supply Events.
-	if b, a, ok := pkChangingUpdateInEvents(in.Events, in.PKCols); ok {
-		return pkChangingUpdateErr(in.Schema, in.Table, b, a)
-	}
-	if b, a, ok := pkChangingUpdate(in.Changes, in.PKCols); ok {
-		return pkChangingUpdateErr(in.Schema, in.Table, b, a)
-	}
-
 	colNames, err := readBaselineColumns(ctx, in.LocalBaselinePath, in.DuckDBTuning)
 	if err != nil {
 		return fmt.Errorf("read baseline columns: %w", err)
@@ -842,7 +848,7 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 	// Detected up front, aggregated over the whole change map — not the old
 	// per-row×column slog.Warn — and before the writer opens, so no partial
 	// chunk files are left on disk.
-	if missing := droppedBaselineColumns(in.Changes, colNames); len(missing) > 0 {
+	if missing := droppedBaselineColumns(in.ImageColumns, in.SawImage, colNames); len(missing) > 0 {
 		return fmt.Errorf(
 			"full-table reconstruct: %s.%s has baseline column(s) %s absent from delta-event row images "+
 				"(dropped from the source table after the baseline snapshot); emitting would mix schema epochs — "+
@@ -1333,7 +1339,18 @@ func reconstructBinlogOnly(
 	if fetcher == nil {
 		fetcher = parquetquery.Fetch
 	}
-	events, _, err := query.FetchMerged(ctx, db, engine, query.FetchMergedOptions{
+	// Streamed and folded page by page, same as the baseline path (#1097):
+	// this fallback has no baseline to bound the window, so it is if anything
+	// the more exposed of the two — it fetches the WHOLE retained binlog
+	// history for the table.
+	fold, err := foldEventWindow(ctx, foldConfig{
+		DB:       db,
+		Engine:   engine,
+		DBName:   dbName,
+		Resolver: resolver,
+		Schema:   schema,
+		Table:    table,
+		PKCols:   tm.PKColumnMetas(),
 		Opts: query.Options{
 			Schema: schema,
 			Table:  table,
@@ -1341,26 +1358,17 @@ func reconstructBinlogOnly(
 			// No Since — there is no baseline instant to anchor from; fetch
 			// the whole retained binlog-only window up to cfg.At.
 		},
-		DBName:         dbName,
-		NoArchive:      false,
-		AllowGaps:      cfg.AllowGaps,
-		ArchiveFetcher: fetcher,
+		AllowGaps:          cfg.AllowGaps,
+		ArchiveFetcher:     fetcher,
+		BatchSize:          cfg.FetchBatchSize,
+		WarnEventThreshold: cfg.WarnEventThreshold,
+		Parallelism:        effectiveParallelism(cfg),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch events: %w", err)
+		return nil, err
 	}
-	rep.EventsApplied = int64(len(events))
-	maybeWarnEventVolume(schema, table, len(events), cfg.WarnEventThreshold, effectiveParallelism(cfg))
-
-	MapEventEnumLabels(db, resolver, schema, table, events)
-	DecodeEventBinaries(db, schema, table, events)
-
-	// Latest event per PK; events is already sorted by (event_timestamp,
-	// event_id) via query.MergeResults, so the last write wins naturally.
-	changes := make(map[string]*query.ResultRow, len(events))
-	for i := range events {
-		changes[events[i].PKValues] = &events[i]
-	}
+	rep.EventsApplied = fold.Total
+	changes := fold.Changes
 
 	// A table that only ever existed after the last baseline was very likely
 	// CREATEd during the retained binlog window, and the schema-drift guard
@@ -1388,7 +1396,7 @@ func reconstructBinlogOnly(
 	}
 
 	rep.BinlogOnly = true
-	if err := writeBinlogOnlyChanges(cfg.OutputDir, schema, table, tm.PKColumnMetas(), colNames, cfg.ChunkSize, createSQL, changes, events, rep); err != nil {
+	if err := writeBinlogOnlyChanges(cfg.OutputDir, schema, table, tm.PKColumnMetas(), colNames, cfg.ChunkSize, createSQL, changes, rep); err != nil {
 		return nil, err
 	}
 	rep.Duration = time.Since(start)
@@ -1451,26 +1459,15 @@ func writeBinlogOnlyChanges(
 	chunkSize int64,
 	createSQL string,
 	changes map[string]*query.ResultRow,
-	events []query.ResultRow,
 	rep *TableReport,
 ) error {
-	if err := checkChangesToast(changes); err != nil {
-		return err
-	}
-
-	// PK-changing UPDATE (#782): even without a baseline, the change map is
-	// keyed by the before-image PK, so an UPDATE whose PK changed emits its
-	// after-image under the OLD key and duplicates a row when another event
-	// targets the new key (or is dropped when its old key is reused). Refuse up
-	// front rather than ship a corrupt dump. Authoritative raw-slice scan first
-	// (this path fetches the full window), map backstop second.
-	if b, a, ok := pkChangingUpdateInEvents(events, pkCols); ok {
-		return pkChangingUpdateErr(schema, table, b, a)
-	}
-	if b, a, ok := pkChangingUpdate(changes, pkCols); ok {
-		return pkChangingUpdateErr(schema, table, b, a)
-	}
-
+	// The #592 (unresolved-TOAST) and #782 (PK-changing UPDATE) guards are NOT
+	// here: like the baseline path, this one now streams its window through
+	// foldEventWindow, which runs both per event on the untrimmed event before
+	// folding it. Re-adding a before-image check against `changes` would be a
+	// no-op that reads as a guard — retainEvent has blanked RowBefore by the
+	// time the map reaches this function. See the note above
+	// mergeBaselineIntoWriter.
 	mw, err := NewMydumperWriter(outputDir, schema, table, colNames, chunkSize)
 	if err != nil {
 		return fmt.Errorf("open mydumper writer: %w", err)
@@ -1683,44 +1680,35 @@ func postBaselineColumns(changes map[string]*query.ResultRow, colNames []string)
 // calls this up front to refuse the run instead of letting rowAfterOrdered
 // NULL-fill the column row by row (#843).
 //
-// Both row_after AND row_before are scanned (#843 follow-up): a window whose
-// last event for a post-drop-touched PK is a DELETE carries no row_after, but
-// its row_before is itself a post-drop image (the row as it existed just
-// before deletion) and so still lacks the dropped column — checking only
-// row_after let such a window sail through with zero warning, silently
-// re-emitting the stale pre-drop value on every untouched pass-through row.
-// Per-PK this collapsed-map scan is sufficient: changes is keyed by PK with
-// the chronologically LAST event surviving, and time only moves forward, so
-// if any event for a PK is post-drop then so is that surviving one — there is
-// no ordering in which an earlier post-drop event's signal is lost behind a
-// later pre-drop entry for the same key. A PK with zero post-drop activity in
-// the window remains undetectable by construction (no image ever samples the
-// post-drop schema for it) and is out of scope here.
-func droppedBaselineColumns(changes map[string]*query.ResultRow, colNames []string) []string {
-	dropped := make(map[string]struct{})
-	scan := func(img map[string]any) {
-		if img == nil {
-			return
-		}
-		for _, col := range colNames {
-			if _, ok := img[col]; !ok {
-				dropped[col] = struct{}{}
-			}
-		}
-	}
-	for _, ev := range changes {
-		if ev == nil {
-			continue
-		}
-		scan(ev.RowAfter)
-		scan(ev.RowBefore)
-	}
-	if len(dropped) == 0 {
+// The signal is computed during the FOLD, not here (#1097): a window whose
+// last event for a post-drop-touched PK is a DELETE carries no row_after, and
+// its row_before — itself a post-drop image, and the only evidence — is
+// discarded by retainEvent before the change map ever reaches this function.
+// foldResult.observeImages therefore narrows an intersection over BOTH images
+// of every event while they are still intact, and this function does the part
+// that needs colNames, which is not known until the baseline is materialized.
+// A column absent from the intersection is a column some image lacked, which
+// is exactly what the old per-map scan flagged.
+//
+// sawImage guards the degenerate case: an intersection over zero images is
+// empty, which would otherwise read as "every baseline column was dropped" and
+// refuse every run with no events at all.
+//
+// A PK with zero post-drop activity in the window remains undetectable by
+// construction (no image ever samples the post-drop schema for it) and is out
+// of scope here.
+func droppedBaselineColumns(imageCols map[string]struct{}, sawImage bool, colNames []string) []string {
+	if !sawImage {
 		return nil
 	}
-	out := make([]string, 0, len(dropped))
-	for col := range dropped {
-		out = append(out, col)
+	var out []string
+	for _, col := range colNames {
+		if _, ok := imageCols[col]; !ok {
+			out = append(out, col)
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	sort.Strings(out)
 	return out
