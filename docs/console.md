@@ -108,7 +108,9 @@ and searching events:
    with before→after diffs, then **Generate undo SQL** and copy/download the
    script. Arriving via an **Undo** action scopes it to that row and shows a
    context banner. When you undo a `DELETE` on a foreign-key **parent** whose
-   children InnoDB cascade-deleted *below* the binlog (MySQL ≤ 8.x / MariaDB),
+   children InnoDB cascade-deleted *below* the binlog (MySQL ≤ 8.x / MariaDB) —
+   or an `UPDATE` of a referenced key whose `ON UPDATE` cascade rewrote them just
+   as invisibly —
    Recover **auto-detects** it and folds the invisible children into the same
    script — no separate tab, no extra step. **Nothing is ever executed.** See
    [Recover and cascade](#cascade-recovery).
@@ -795,19 +797,26 @@ On MySQL 8.x and earlier (and all MariaDB), InnoDB enforces a foreign-key `ON
 DELETE CASCADE` / `ON DELETE SET NULL` *below* the binary log — only the parent
 `DELETE` is logged, so the cascaded child deletes and SET-NULL updates are never
 recorded as events. A plain undo of the parent `DELETE` would re-create the
-parent but leave those children gone.
+parent but leave those children gone. The `ON UPDATE` cascades have the same
+blind spot: only the parent `UPDATE` is logged, so undoing it alone would leave
+every child foreign key pointing at the key the cascade wrote.
 
 **Recover handles this automatically — there is no separate tab.** When you
-generate undo SQL for a `DELETE` on a table that is a foreign-key **parent**, the
-console detects it (one index lookup of the recorded FK graph) and folds the
-invisible children into the **same** script: `INSERT`s for the cascade-deleted
-children and idempotent guarded `UPDATE`s (`… AND fk IS NULL`) for SET-NULL'd
-foreign keys, all wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. A **CASCADE detected**
-banner above the result reports how many children and SET-NULL restores were
-included. Copy or download it; **nothing is ever executed.** Detection only fires
+generate undo SQL for a `DELETE` — or for an `UPDATE` of a referenced key — on a
+table that is a foreign-key **parent**, the console detects it (one index lookup
+of the recorded FK graph, matched to the referential action the reversed events
+can actually trigger) and folds the invisible children into the **same** script:
+`INSERT`s for the cascade-deleted children, idempotent guarded `UPDATE`s
+(`… AND fk IS NULL`) for SET-NULL'd foreign keys, and guarded `UPDATE`s
+(`… AND fk = <new key>`) for the foreign keys an `ON UPDATE CASCADE` rewrote, all
+wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. A **CASCADE detected**
+banner above the result reports how many children, SET-NULL restores and FK
+restores were included. Copy or download it; **nothing is ever executed.**
+Detection only fires
 for a MySQL/MariaDB index (PostgreSQL logical replication captures cascade
 deletes as real events — no blind spot to reconstruct) and only when the matched
-rows actually contain a `DELETE` on the target table. The same engine is exposed
+rows actually contain an event on the target table that its FK rules say could
+have cascaded. The same engine is exposed
 for scripting as `bintrail recover-cascade` and `POST /api/recover-cascade` (with
 explicit `lookback` / `max-depth` knobs) — see
 [query-and-recovery.md](query-and-recovery.md) for the full mechanism, the

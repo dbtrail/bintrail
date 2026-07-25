@@ -263,17 +263,18 @@ Reversed: undo the 14:03 UPDATE first, then the 14:02 UPDATE, then the 14:01 INS
 > topological reordering across tables, and the generated script never emits
 > `SET FOREIGN_KEY_CHECKS`. Tables with `ON DELETE/UPDATE CASCADE` produce
 > side-effect row changes (InnoDB runs cascades below the binlog, MySQL Bug
-> #32506, so cascaded child deletes are never captured) that plain `recover`
+> #32506, so neither the cascaded child deletes nor the child FK rewrites an
+> `ON UPDATE` cascade performs are ever captured) that plain `recover`
 > cannot reliably undo. `bintrail doctor`, and `stream`/`watch`/`index --source-dsn`,
 > warn about them and proceed (cascade schemas index normally). To reconstruct
-> cascade-deleted rows, use **`bintrail recover-cascade`** (see below).
+> those rows, use **`bintrail recover-cascade`** (see below).
 
-### `recover-cascade`: reverse FK ON DELETE CASCADE / SET NULL
+### `recover-cascade`: reverse FK ON DELETE / ON UPDATE CASCADE / SET NULL
 
-`bintrail recover-cascade` reconstructs the side effects of an InnoDB
-`ON DELETE CASCADE` or `ON DELETE SET NULL` that were never binlogged. It finds
-the deleted parent rows in the index, infers which child rows referenced them in
-their last indexed state, and emits reversal SQL:
+`bintrail recover-cascade` reconstructs the side effects of an InnoDB foreign-key
+cascade that were never binlogged. It finds the changed parent rows in the index,
+infers which child rows referenced them in their last indexed state, and emits
+reversal SQL:
 
 - **ON DELETE CASCADE** → re-inserts **both** the parents and their
   cascade-deleted descendants (recursing through multi-level cascades).
@@ -281,6 +282,17 @@ their last indexed state, and emits reversal SQL:
   guarded by `... AND fk IS NULL` so a re-run, a manual fix, or a later re-point
   of the child is never clobbered (the child row survives — only its FK was
   nulled — so it is not re-inserted).
+- **ON UPDATE CASCADE** → for a parent whose **referenced key** was `UPDATE`d,
+  InnoDB rewrote every child FK that pointed at the old key. The reversal is an
+  idempotent `UPDATE` putting each child FK back, guarded by
+  `... AND fk = <new key>` — again so a child re-pointed after the cascade is
+  never clobbered. The parent `UPDATE` itself is reversed alongside it.
+- **ON UPDATE SET NULL** → same, except the children were nulled rather than
+  re-pointed, so the guard is `... AND fk IS NULL`.
+
+Only parent `UPDATE`s that actually **moved a referenced key** are considered: an
+`UPDATE` of unrelated columns cannot have cascaded, so it synthesizes nothing and
+its own reversal is **not** emitted either.
 
 All wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. Like `recover`, it only generates
 SQL — review before applying.
@@ -290,8 +302,8 @@ bintrail recover-cascade --index-dsn "..." \
   --schema shop --table orders --pk '42' --dry-run
 ```
 
-- `--table` is the **parent** table whose delete cascaded; `--pk`/`--pks`,
-  `--since`/`--until` narrow which deleted parents to process.
+- `--table` is the **parent** table whose delete or key update cascaded;
+  `--pk`/`--pks`, `--since`/`--until` narrow which parents to process.
 - `--lookback` (default `30d`) bounds how far back the last child state is
   searched; `--max-depth` (default 5) bounds cascade recursion.
 - **Phase-2 baseline fallback** (`--baseline-dir` or `--baseline-s3`): without a
@@ -312,13 +324,17 @@ bintrail recover-cascade --index-dsn "..." \
 
 #### `recover-cascade` limitations
 
-- **Only `ON DELETE CASCADE` / `ON DELETE SET NULL`.** `ON UPDATE CASCADE` /
-  `ON UPDATE SET NULL` (InnoDB rewrites a child's FK when the parent's
-  referenced key is `UPDATE`d) are not synthesized — reverting such a parent
-  `UPDATE` leaves the child FK pointing at the new value with no warning. The
-  gate is deliberate (it does not port a rule-conflation bug from the dbtrail
-  SaaS), but the result is real: `bintrail doctor`'s cascade check and this
-  page both cover `ON DELETE` only.
+- **`delete_rule` and `update_rule` are never conflated.** A parent `DELETE`
+  routes through the `ON DELETE` rule only, and a parent key `UPDATE` through
+  the `ON UPDATE` rule only. So a `DELETE` on a table whose children are
+  `ON UPDATE CASCADE`-only reconstructs nothing (correctly — InnoDB cascaded
+  nothing), and vice versa.
+- **A repeated parent-key `UPDATE` inside the window under-recovers, and says
+  so.** If the same referenced key moved twice (`A → B`, then `B → A`), the
+  first cascade rewrote the children below the binlog too, so their last
+  *indexed* image still carries `A` and the scan for the second update's old key
+  (`B`) matches nothing. That run is flagged `INCOMPLETE RECOVERY` — a
+  zero-child result there is not proof there were no children.
 - **Composite (multi-column) FKs are skipped, not reconstructed.** A
   single-column victim match would mis-reconstruct a multi-column key, so a
   composite FK is dropped and flagged in the output rather than silently

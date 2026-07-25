@@ -1500,6 +1500,62 @@ func TestGenerateMySQL_PinsSQLMode(t *testing.T) {
 	}
 }
 
+// ─── FormatFKCascadeRestore (ON UPDATE cascades, #1002) ──────────────────────
+
+// TestFormatFKCascadeRestore_guardsOnCascadedValue pins the ON UPDATE CASCADE
+// shape: the FK goes back to the OLD parent key, guarded on the NEW one InnoDB
+// wrote there — so a child re-pointed after the cascade is never clobbered.
+func TestFormatFKCascadeRestore_guardsOnCascadedValue(t *testing.T) {
+	pk := []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}
+	row := map[string]any{"id": json.Number("10"), "pid": json.Number("99")}
+	got, err := FormatFKCascadeRestore("app", "child", "pid", json.Number("1"), json.Number("99"), pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "UPDATE `app`.`child` SET `pid` = 1 WHERE `id` = 10 AND `pid` = 99"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+}
+
+// TestFormatFKCascadeRestore_nilCascadedValueIsNullGuard covers ON UPDATE SET
+// NULL (and an ON UPDATE CASCADE to a NULL key): the guard degrades to IS NULL,
+// which is exactly FormatSetNullRestore's rendering — a `= NULL` comparison
+// would silently match no row.
+func TestFormatFKCascadeRestore_nilCascadedValueIsNullGuard(t *testing.T) {
+	pk := []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}
+	row := map[string]any{"id": json.Number("10"), "pid": nil}
+	got, err := FormatFKCascadeRestore("app", "child", "pid", json.Number("1"), nil, pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "UPDATE `app`.`child` SET `pid` = 1 WHERE `id` = 10 AND `pid` IS NULL"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+	same, err := FormatSetNullRestore("app", "child", "pid", json.Number("1"), pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if same != got {
+		t.Errorf("FormatSetNullRestore must stay byte-identical to the nil-cascadedValue form:\n got  %q\n want %q", same, got)
+	}
+}
+
+// TestFormatFKCascadeRestore_stringKeysQuoted checks a CHAR/VARCHAR referenced
+// key: both the restored value and the guard must be quoted + escaped.
+func TestFormatFKCascadeRestore_stringKeysQuoted(t *testing.T) {
+	pk := []metadata.ColumnMeta{{Name: "id", IsPK: true, DataType: "int"}}
+	row := map[string]any{"id": json.Number("10"), "code": "n'ew"}
+	got, err := FormatFKCascadeRestore("app", "child", "code", "o'ld", "n'ew", pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(got, "SET `code` = 'o\\'ld'") || !strings.Contains(got, "AND `code` = 'n\\'ew'") {
+		t.Errorf("string key not quoted/escaped on both sides: %q", got)
+	}
+}
+
 // ─── FormatSetNullRestore ────────────────────────────────────────────────────
 
 func TestFormatSetNullRestore_singlePKIntValue(t *testing.T) {

@@ -233,19 +233,27 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	// uses to auto-route (metadata.IsCascadeParentInIndex, matching
 	// referenced_schema_name + referenced_table_name), so a plain recover of a
 	// cross-schema cascade parent still gets nudged to `recover-cascade`.
+	// Reported per referential ACTION (#1002) so the nudge names the blind spot
+	// the operator actually has: reversing a DELETE needs the ON DELETE half,
+	// reversing a parent-key UPDATE the ON UPDATE half. `recover` cannot see
+	// which event types the filter will match, so both are surfaced when present.
+	var parentOnDelete, parentOnUpdate bool
 	if rSchema != "" && rTable != "" {
-		if isParent, perr := metadata.IsCascadeParentInIndex(db, rSchema, rTable); perr != nil {
+		var perr error
+		if parentOnDelete, parentOnUpdate, perr = metadata.CascadeParentRulesInIndex(db, rSchema, rTable); perr != nil {
 			slog.Warn("could not check the index for cross-schema FK cascade parents", "error", perr)
-		} else if isParent {
+		} else if parentOnDelete || parentOnUpdate {
 			warnCascade = true
 		}
 	}
 	if warnCascade {
-		slog.Warn("target has FK ON DELETE CASCADE/SET NULL (or ON UPDATE CASCADE) "+
+		slog.Warn("target has FK ON DELETE and/or ON UPDATE CASCADE/SET NULL "+
 			"constraints (including cross-schema children); plain `recover` cannot "+
-			"reconstruct cascade-deleted child rows or SET NULL'd FKs (they are never "+
-			"binlogged, MySQL Bug #32506); use `bintrail recover-cascade` to reconstruct them",
-			"cascade_child_tables", strings.Join(childTables, ", "))
+			"reconstruct cascade-deleted child rows, SET NULL'd FKs or FKs a parent-key "+
+			"UPDATE rewrote (none are ever binlogged, MySQL Bug #32506); use "+
+			"`bintrail recover-cascade` to reconstruct them",
+			"cascade_child_tables", strings.Join(childTables, ", "),
+			"parent_on_delete", parentOnDelete, "parent_on_update", parentOnUpdate)
 	}
 
 	if rProfile != "" {

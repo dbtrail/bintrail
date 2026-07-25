@@ -12,23 +12,56 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
-// TestRowsContainDeleteOn locks the auto-cascade gate's delete precondition: a
-// recover only routes to cascade synthesis when the matched rows actually contain
-// a DELETE on the target table (an INSERT/UPDATE undo never cascades).
-func TestRowsContainDeleteOn(t *testing.T) {
+// TestRowsContainCascadeTriggerOn locks the auto-cascade gate's precondition,
+// which is matched PER REFERENTIAL ACTION (#1002): a DELETE undo routes to
+// synthesis only on an ON DELETE cascade parent, an UPDATE undo only on an
+// ON UPDATE one, and an INSERT undo never routes at all. Crossing the two would
+// surface a misleading "0 victims" and teach the operator the signal is noise.
+func TestRowsContainCascadeTriggerOn(t *testing.T) {
+	ins := query.ResultRow{TableName: "orders", EventType: event.EventInsert}
+	upd := query.ResultRow{TableName: "orders", EventType: event.EventUpdate}
+	del := query.ResultRow{TableName: "orders", EventType: event.EventDelete}
+
+	cases := []struct {
+		name               string
+		rows               []query.ResultRow
+		table              string
+		onDelete, onUpdate bool
+		want               bool
+	}{
+		{"insert only never cascades", []query.ResultRow{ins}, "orders", true, true, false},
+		{"delete on an ON DELETE parent", []query.ResultRow{ins, del}, "orders", true, false, true},
+		{"delete on an ON UPDATE-only parent", []query.ResultRow{ins, del}, "orders", false, true, false},
+		{"update on an ON UPDATE parent", []query.ResultRow{ins, upd}, "orders", false, true, true},
+		{"update on an ON DELETE-only parent", []query.ResultRow{ins, upd}, "orders", true, false, false},
+		{"other table", []query.ResultRow{del, upd}, "customers", true, true, false},
+		{"not a cascade parent at all", []query.ResultRow{del, upd}, "orders", false, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := rowsContainCascadeTriggerOn(c.rows, c.table, c.onDelete, c.onUpdate); got != c.want {
+				t.Errorf("rowsContainCascadeTriggerOn = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestCascadeRootsOnTable pins that the auto-detect path derives its parent set
+// from baseRows (never a re-fetch, #772) and now carries UPDATEs alongside
+// DELETEs — an INSERT can never be a cascade root.
+func TestCascadeRootsOnTable(t *testing.T) {
 	rows := []query.ResultRow{
-		{TableName: "orders", EventType: event.EventInsert},
-		{TableName: "orders", EventType: event.EventUpdate},
+		{TableName: "orders", EventType: event.EventInsert, PKValues: "1"},
+		{TableName: "orders", EventType: event.EventUpdate, PKValues: "2"},
+		{TableName: "orders", EventType: event.EventDelete, PKValues: "3"},
+		{TableName: "customers", EventType: event.EventDelete, PKValues: "4"},
 	}
-	if rowsContainDeleteOn(rows, "orders") {
-		t.Error("no DELETE present → want false")
+	got := cascadeRootsOnTable(rows, "orders")
+	if len(got) != 2 {
+		t.Fatalf("want 2 roots (the UPDATE and the DELETE on orders), got %d: %+v", len(got), got)
 	}
-	rows = append(rows, query.ResultRow{TableName: "orders", EventType: event.EventDelete})
-	if !rowsContainDeleteOn(rows, "orders") {
-		t.Error("a DELETE on orders → want true")
-	}
-	if rowsContainDeleteOn(rows, "customers") {
-		t.Error("the DELETE is on orders, not customers → want false")
+	if got[0].PKValues != "2" || got[1].PKValues != "3" {
+		t.Errorf("want roots pk 2 (UPDATE) and 3 (DELETE), got %q and %q", got[0].PKValues, got[1].PKValues)
 	}
 }
 

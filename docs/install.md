@@ -239,7 +239,7 @@ For cron, systemd units, and Ansible recipes, see [deployment.md](./deployment.m
 | `agent` | Connect to dbtrail and listen for commands |
 | `query` | Search the index with flexible filters (schema, table, PK, time range, GTID) |
 | `recover` | Generate reversal SQL for matching events |
-| `recover-cascade` | Generate reversal SQL for rows hit by a foreign-key ON DELETE CASCADE / SET NULL |
+| `recover-cascade` | Generate reversal SQL for rows hit by a foreign-key ON DELETE / ON UPDATE CASCADE / SET NULL |
 | `reconstruct` | Rebuild row state at a point in time from baselines + binlog events |
 | `verify` | Verify that a recovery would reproduce the source |
 | `rotate` | Drop old partitions, add new ones, optionally archive to Parquet |

@@ -438,6 +438,8 @@ bintrail recover-cascade \
 
 The output re-INSERTs the parent and every cascade-deleted descendant — recursing through multi-level cascades (orders → line_items → …) — wrapped in `SET FOREIGN_KEY_CHECKS=0/1`. For an `ON DELETE SET NULL` foreign key the child row survived and only its FK was cleared, so you get an idempotent `UPDATE ... SET fk = <parent> WHERE pk = ... AND fk IS NULL` instead — safe to re-run, and it never clobbers a child you have since re-pointed.
 
+The same command also reverses the **`ON UPDATE`** cascades: when a parent’s *referenced key* was `UPDATE`d, InnoDB silently rewrote (or nulled) every child FK that pointed at the old key, so reversing the parent alone would leave them dangling. You get the parent’s own undo plus an idempotent `UPDATE ... SET fk = <old key> WHERE pk = ... AND fk = <new key>` per child. A parent `UPDATE` that never touched a referenced key cannot have cascaded, so it is ignored entirely.
+
 Process several deleted parents at once with `--pks '42,43,44'`, or a whole window with `--since`/`--until`.
 
 **Mind the coverage line.** recover-cascade rebuilds a child from its **last indexed state**, so it can only see children that have a binlog event within `--lookback` (default `30d`). An insert-once child that has not changed in months falls outside that window — it cannot be reconstructed from the binlog alone, and the command says so instead of silently dropping it:

@@ -34,20 +34,24 @@ func cascadeBaselineProviderFor(src string, resolver *metadata.Resolver) *cascad
 
 var recoverCascadeCmd = &cobra.Command{
 	Use:   "recover-cascade",
-	Short: "Generate reversal SQL for rows hit by a foreign-key ON DELETE CASCADE / SET NULL",
-	Long: `Reconstruct the side effects of an InnoDB foreign-key ON DELETE CASCADE or
-ON DELETE SET NULL that were never written to the binary log.
+	Short: "Generate reversal SQL for rows hit by a foreign-key ON DELETE / ON UPDATE CASCADE / SET NULL",
+	Long: `Reconstruct the side effects of an InnoDB foreign-key cascade that were never
+written to the binary log.
 
 On MySQL <= 8.x and MariaDB, InnoDB runs FK cascades below the binlog (fixed in
-MySQL 9.6), so only the parent DELETE is logged — the cascaded child deletes (and
-SET NULL FK-nullings) are invisible to plain
-` + "`recover`" + ` (MySQL Bug #32506). This command finds the deleted parent rows in
+MySQL 9.6), so only the parent change is logged — the cascaded child deletes,
+SET NULL FK-nullings and ON UPDATE FK rewrites are invisible to plain
+` + "`recover`" + ` (MySQL Bug #32506). This command finds the changed parent rows in
 the index, infers which child rows referenced them in their last indexed state,
 and emits reversal SQL:
   - ON DELETE CASCADE: re-INSERT the parent rows and their cascade-deleted
     descendants (recursing through multi-level cascades).
   - ON DELETE SET NULL: an idempotent UPDATE restoring each nulled FK, guarded by
     "... AND fk IS NULL" so a re-run or a later re-point is never clobbered.
+  - ON UPDATE CASCADE / SET NULL: for a parent whose REFERENCED KEY was updated,
+    an idempotent UPDATE putting each child FK back to the old key, guarded on
+    the value the cascade left there. Parent UPDATEs that did not touch a
+    referenced key are ignored entirely.
 All wrapped in SET FOREIGN_KEY_CHECKS=0/1.
 
 It NEVER executes SQL — review the dry-run/output before applying.
@@ -95,18 +99,18 @@ var (
 func init() {
 	f := recoverCascadeCmd.Flags()
 	f.StringVar(&rcIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
-	f.StringVar(&rcSchema, "schema", "", "Schema of the parent table whose delete cascaded (required)")
-	f.StringVar(&rcTable, "table", "", "Parent table whose ON DELETE CASCADE removed children (required)")
-	f.StringVar(&rcPK, "pk", "", "Restrict to a single deleted parent PK (pipe-delimited for composite PKs)")
-	f.StringSliceVar(&rcPKs, "pks", nil, "Restrict to multiple deleted parent PKs (comma-separated or repeated); mutually exclusive with --pk")
-	f.StringVar(&rcSince, "since", "", "Only parent deletes at or after this time (2006-01-02 15:04:05, interpreted as UTC; use RFC3339 with an explicit offset, e.g. 2006-01-02T15:04:05-05:00, for another zone)")
-	f.StringVar(&rcUntil, "until", "", "Only parent deletes at or before this time (2006-01-02 15:04:05, interpreted as UTC; use RFC3339 with an explicit offset, e.g. 2006-01-02T15:04:05-05:00, for another zone)")
+	f.StringVar(&rcSchema, "schema", "", "Schema of the parent table whose change cascaded (required)")
+	f.StringVar(&rcTable, "table", "", "Parent table whose ON DELETE / ON UPDATE cascade touched children (required)")
+	f.StringVar(&rcPK, "pk", "", "Restrict to a single changed parent PK (pipe-delimited for composite PKs)")
+	f.StringSliceVar(&rcPKs, "pks", nil, "Restrict to multiple changed parent PKs (comma-separated or repeated); mutually exclusive with --pk")
+	f.StringVar(&rcSince, "since", "", "Only parent changes at or after this time (2006-01-02 15:04:05, interpreted as UTC; use RFC3339 with an explicit offset, e.g. 2006-01-02T15:04:05-05:00, for another zone)")
+	f.StringVar(&rcUntil, "until", "", "Only parent changes at or before this time (2006-01-02 15:04:05, interpreted as UTC; use RFC3339 with an explicit offset, e.g. 2006-01-02T15:04:05-05:00, for another zone)")
 	f.StringVar(&rcOutput, "output", "", "Write recovery SQL to this file (required unless --dry-run)")
 	f.BoolVar(&rcDryRun, "dry-run", false, "Print recovery SQL to stdout instead of writing a file")
 	f.StringVar(&rcFormat, "format", "text", "Output format: text or json")
 	f.StringVar(&rcLookback, "lookback", "30d", "How far before each parent delete to search for child state (e.g. 30d, 24h)")
 	f.IntVar(&rcMaxDepth, "max-depth", 5, "Maximum cascade recursion depth (parent -> child -> grandchild ...)")
-	f.IntVar(&rcLimit, "limit", 1000, "Maximum number of parent DELETE events to process")
+	f.IntVar(&rcLimit, "limit", 1000, "Maximum number of parent events to process, applied SEPARATELY to the DELETE and the UPDATE scan")
 	f.BoolVar(&rcAllowIncomplete, "allow-incomplete", false, "Exit 0 even when the reconstruction is provably partial (coverage gaps only; an operational failure still exits non-zero)")
 	f.StringVar(&rcBaselineDir, "baseline-dir", "", "Local baseline-snapshot directory for Phase-2 fallback (also recovers children present in the snapshot but untouched since it)")
 	f.StringVar(&rcBaselineS3, "baseline-s3", "", "S3 baseline-snapshot prefix (s3://bucket/prefix) for Phase-2 fallback; alternative to --baseline-dir")
@@ -175,8 +179,15 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 
 	eng := query.New(db)
 	del := event.EventDelete
+	upd := event.EventUpdate
 
-	// ── Fetch the parent DELETE events (live index only) ──────────────────────
+	// ── Fetch the parent events (live index only) ─────────────────────────────
+	// TWO fetches, not one un-filtered one: query.Options.EventType is a single
+	// type, and an all-types fetch would let INSERTs (which never cascade) eat
+	// the --limit budget the DELETE/UPDATE roots need. Both root sets are owned
+	// end-to-end by this command and both are emitted, so there is no subset
+	// invariant to preserve between them (unlike the console's auto-detect path,
+	// which must derive its parents from the rows the recover already returned).
 	parentDeletes, err := eng.Fetch(cmd.Context(), query.Options{
 		Schema:     rcSchema,
 		Table:      rcTable,
@@ -191,15 +202,35 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("fetch parent deletes: %w", err)
 	}
+	// Parent UPDATEs are CANDIDATES only: the synthesis keeps just the ones that
+	// actually moved a referenced key protected by an ON UPDATE CASCADE / SET
+	// NULL edge (cascade.Result.KeyUpdateParents). An UPDATE of unrelated columns
+	// is never reversed here — that would undo a change the operator never asked
+	// about.
+	parentUpdates, err := eng.Fetch(cmd.Context(), query.Options{
+		Schema:     rcSchema,
+		Table:      rcTable,
+		PKValues:   rcPK,
+		PKValuesIn: rcPKs,
+		EventType:  &upd,
+		Since:      since,
+		Until:      until,
+		Order:      "ASC",
+		Limit:      rcLimit,
+	})
+	if err != nil {
+		return fmt.Errorf("fetch parent updates: %w", err)
+	}
+	parentEvents := append(append([]query.ResultRow{}, parentDeletes...), parentUpdates...)
 
 	// Coverage caveats accumulate here (detectable gaps that gate exit); the
 	// always-on Phase-1 scope note is separate and printed unconditionally.
 	var caveats []string
 
 	// A plain empty match is legitimately "complete", but the operator must not
-	// read silence as "nothing was deleted" — it could be a wrong filter.
-	if len(parentDeletes) == 0 {
-		slog.Warn("no parent DELETE events matched in the live index; verify --schema/--table/--pk/--since/--until")
+	// read silence as "nothing was changed" — it could be a wrong filter.
+	if len(parentEvents) == 0 {
+		slog.Warn("no parent DELETE or UPDATE events matched in the live index; verify --schema/--table/--pk/--since/--until")
 	}
 
 	// Live-only trap: cascade recovery searches the LIVE index only.
@@ -216,8 +247,8 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		caveats = append(caveats, "could not determine whether archived partitions exist (probe failed: "+aerr.Error()+"); coverage is unknown")
 	} else if len(archives) > 0 {
 		archivesExist = true
-		if len(parentDeletes) == 0 {
-			caveats = append(caveats, "no parent DELETE matched in the live index, but the index has archived partitions (cascade recovery does NOT search them); the deleted parent may be archived")
+		if len(parentEvents) == 0 {
+			caveats = append(caveats, "no parent DELETE or UPDATE matched in the live index, but the index has archived partitions (cascade recovery does NOT search them); the changed parent may be archived")
 		} else {
 			slog.Warn("index has archived partitions, which cascade recovery does NOT search (live index only); a child whose events were archived may be missed")
 		}
@@ -225,6 +256,9 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 
 	if len(parentDeletes) >= rcLimit {
 		caveats = append(caveats, fmt.Sprintf("parent DELETE events were capped at --limit=%d; narrow --pk/--since/--until or raise --limit", rcLimit))
+	}
+	if len(parentUpdates) >= rcLimit {
+		caveats = append(caveats, fmt.Sprintf("parent UPDATE events were capped at --limit=%d; narrow --pk/--since/--until or raise --limit", rcLimit))
 	}
 
 	// Phase-2 baseline fallback provider — enabled when --baseline-dir or
@@ -246,12 +280,12 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	// ── Synthesize the cascade victims ────────────────────────────────────────
 	var res cascade.Result
 	var synthErr error
-	if len(parentDeletes) > 0 {
+	if len(parentEvents) > 0 {
 		// FK graph resolved PER ROOT, not batch-anchored on the earliest root:
 		// a --pks/--since/--until batch can span an FK topology change, and a
 		// single earliest-anchored graph would silently mis-recover a later
 		// root (#834 applied per-root, not once for the whole batch).
-		groups, fkCaveats, lerr := cascade.GroupParentDeletesByFKGraph(cmd.Context(), db, rcSchema, parentDeletes)
+		groups, fkCaveats, lerr := cascade.GroupParentDeletesByFKGraph(cmd.Context(), db, rcSchema, parentEvents)
 		if lerr != nil {
 			return fmt.Errorf("load FK graph: %w", lerr)
 		}
@@ -280,13 +314,17 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	// cascadeExit's exit-code gate below.
 	warnings := res.Warnings
 
-	rows := append(append([]query.ResultRow{}, parentDeletes...), res.Victims...)
+	// Only the parent UPDATEs the synthesis confirmed as cascading are reversed
+	// (KeyUpdateParents ⊆ parentUpdates); the rest of the UPDATE fetch was
+	// candidate material for that decision and never reaches the script.
+	parents := append(append([]query.ResultRow{}, parentDeletes...), res.KeyUpdateParents...)
+	rows := append(append([]query.ResultRow{}, parents...), res.Victims...)
 
 	// ── Emit ──────────────────────────────────────────────────────────────────
 	hdr := cascaderecover.Header{
 		Schema:         rcSchema,
 		Table:          rcTable,
-		Parents:        len(parentDeletes),
+		Parents:        len(parents),
 		Children:       len(res.Victims),
 		Caveats:        caveats,
 		Warnings:       warnings,
@@ -295,7 +333,7 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 
 	if rcFormat == "json" {
 		var buf bytes.Buffer
-		n, gerr := cascaderecover.EmitSQL(&buf, recovery.New(db, resolver), rows, res.SetNullRows, resolver, hdr)
+		n, gerr := cascaderecover.EmitSQL(&buf, recovery.New(db, resolver), rows, res.SetNullRows, res.KeyUpdates, resolver, hdr)
 		if gerr != nil {
 			return gerr
 		}
@@ -305,9 +343,15 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 			}
 		}
 		out := struct {
-			Parents          int      `json:"parents"`
-			Children         int      `json:"children"`
-			SetNullRestores  int      `json:"set_null_restores"`
+			Parents         int `json:"parents"`
+			ParentDeletes   int `json:"parent_deletes"`
+			ParentKeyUpdate int `json:"parent_key_updates"`
+			Children        int `json:"children"`
+			SetNullRestores int `json:"set_null_restores"`
+			// KeyRestores is the ON UPDATE CASCADE / SET NULL half (#1002) —
+			// reported separately so a script full of FK restorations is never
+			// read as "0 rows recovered" off the victim count alone.
+			KeyRestores      int      `json:"key_restores"`
 			Statements       int      `json:"statements"`
 			Complete         bool     `json:"complete"`
 			OperationalError bool     `json:"operational_error,omitempty"`
@@ -318,8 +362,10 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 			Output   string   `json:"output,omitempty"`
 			SQL      string   `json:"sql,omitempty"`
 		}{
-			Parents: len(parentDeletes), Children: len(res.Victims), SetNullRestores: len(res.SetNullRows), Statements: n,
-			Complete: len(caveats) == 0 && synthErr == nil, OperationalError: synthErr != nil,
+			Parents: len(parents), ParentDeletes: len(parentDeletes), ParentKeyUpdate: len(res.KeyUpdateParents),
+			Children: len(res.Victims), SetNullRestores: len(res.SetNullRows), KeyRestores: len(res.KeyUpdates),
+			Statements: n,
+			Complete:   len(caveats) == 0 && synthErr == nil, OperationalError: synthErr != nil,
 			Incomplete: caveats, Warnings: warnings, Output: rcOutput,
 		}
 		if rcOutput == "" {
@@ -355,7 +401,7 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 			return f.Close()
 		}
 	}
-	n, gerr := cascaderecover.EmitSQL(w, recovery.New(db, resolver), rows, res.SetNullRows, resolver, hdr)
+	n, gerr := cascaderecover.EmitSQL(w, recovery.New(db, resolver), rows, res.SetNullRows, res.KeyUpdates, resolver, hdr)
 	if gerr != nil {
 		if closeFn != nil {
 			_ = closeFn() // best-effort: gerr is the real failure, don't mask it (and don't leak the fd)
@@ -381,7 +427,10 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		slog.Warn("cascade recovery advisory", "note", wmsg)
 	}
 	slog.Info("cascade recovery SQL generated",
-		"parents", len(parentDeletes), "children", len(res.Victims), "statements", n,
+		"parents", len(parents), "parent_deletes", len(parentDeletes),
+		"parent_key_updates", len(res.KeyUpdateParents),
+		"children", len(res.Victims), "set_null_restores", len(res.SetNullRows),
+		"key_restores", len(res.KeyUpdates), "statements", n,
 		"complete", len(caveats) == 0 && synthErr == nil,
 		"output", dest, "duration_ms", time.Since(start).Milliseconds())
 

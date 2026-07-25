@@ -1294,20 +1294,45 @@ func formatValuePG(v any) string {
 // PK predicate; value is the parent key (typed, so it renders as a numeric
 // literal for an integer FK rather than a quoted string).
 func FormatSetNullRestore(schema, table, fkCol string, value any, pkCols []metadata.ColumnMeta, row map[string]any) (string, error) {
+	return FormatFKCascadeRestore(schema, table, fkCol, value, nil, pkCols, row)
+}
+
+// FormatFKCascadeRestore is the general form behind FormatSetNullRestore: it
+// emits the idempotent UPDATE that puts a foreign-key column an InnoDB cascade
+// rewrote below the binlog back to oldValue, guarded so it only touches rows
+// still carrying what the cascade left there.
+//
+// cascadedValue is that residue and therefore the guard:
+//
+//	nil          → "AND fk IS NULL"  (ON DELETE SET NULL, ON UPDATE SET NULL, and
+//	                                  the exotic ON UPDATE CASCADE to a NULL key)
+//	non-nil      → "AND fk = <value>" (ON UPDATE CASCADE: the parent's new key)
+//
+// The guard is what makes a re-run, a manual fix, or a later re-point of the
+// child safe: synthesis cannot tell a re-pointed child from an untouched one
+// (the re-point event doesn't match the fk=old-key scan that found the
+// candidate), so the statement must decline rather than clobber. pkCols + row
+// supply the PK predicate; the values are typed, so an integer FK renders as a
+// numeric literal rather than a quoted string.
+func FormatFKCascadeRestore(schema, table, fkCol string, oldValue, cascadedValue any, pkCols []metadata.ColumnMeta, row map[string]any) (string, error) {
 	if len(pkCols) == 0 {
-		return "", fmt.Errorf("no PK columns for %s.%s SET NULL restore", schema, table)
+		return "", fmt.Errorf("no PK columns for %s.%s foreign-key cascade restore", schema, table)
 	}
 	where := make([]string, 0, len(pkCols)+1)
 	for _, c := range pkCols {
 		v, ok := row[c.Name]
 		if !ok {
-			return "", fmt.Errorf("PK column %q absent from %s.%s row for SET NULL restore", c.Name, schema, table)
+			return "", fmt.Errorf("PK column %q absent from %s.%s row for foreign-key cascade restore", c.Name, schema, table)
 		}
 		where = append(where, QuoteName(c.Name)+" = "+FormatSQLValue(v))
 	}
-	where = append(where, QuoteName(fkCol)+" IS NULL")
+	if cascadedValue == nil {
+		where = append(where, QuoteName(fkCol)+" IS NULL")
+	} else {
+		where = append(where, QuoteName(fkCol)+" = "+FormatSQLValue(cascadedValue))
+	}
 	return fmt.Sprintf("UPDATE %s.%s SET %s = %s WHERE %s",
-		QuoteName(schema), QuoteName(table), QuoteName(fkCol), FormatSQLValue(value),
+		QuoteName(schema), QuoteName(table), QuoteName(fkCol), FormatSQLValue(oldValue),
 		strings.Join(where, " AND ")), nil
 }
 
