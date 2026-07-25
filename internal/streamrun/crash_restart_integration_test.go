@@ -9,10 +9,10 @@
 //  1. A real kill-mid-stream test: stream into the partitioned binlog_events,
 //     stop the process WITHOUT letting the checkpoint become durable, restart
 //     through One(), and assert no duplicate AND no lost rows. POSITION mode
-//     gets the full cycle; GTID mode gets mode selection + dedup + the
-//     dedup-before-StartSync ordering against a real database, but not the
-//     re-stream — see TestIntegrationResumeGTIDDedupsBeforeStartSync for why
-//     no GTID-capable source is reachable from this suite.
+//     gets the full cycle; GTID mode gets mode selection + dedup against a real
+//     database, but not the re-stream (and not the dedup/StartSync ordering) —
+//     see TestIntegrationResumeGTIDDedupsBeforeStartSync for why no
+//     GTID-capable source is reachable from this suite.
 //  2. The `start_pos >= pos` boundary, constructed against a real DB instead of
 //     reasoned by inspection.
 //
@@ -196,6 +196,13 @@ func indexedPKs(t *testing.T, db *sql.DB, schema, table string) map[string]int {
 
 // assertExactlyOnce fails when any expected PK is missing (data LOST) or
 // present more than once (data DUPLICATED), or when an unexpected PK appears.
+//
+// PRECONDITION: it groups by pk_values alone, so "exactly one indexed row per
+// PK" is the right invariant only while every source row is INSERT-only and
+// touched exactly once — which is what these tests' fixtures do. A fixture that
+// UPDATEs or DELETEs a row would legitimately produce a second event for that
+// PK, and this helper would report it as DUPLICATED. Any such fixture needs the
+// counts keyed by (pk_values, event_id) or filtered by event_type instead.
 func assertExactlyOnce(t *testing.T, counts map[string]int, wantPKs []string) {
 	t.Helper()
 	for _, pk := range wantPKs {
@@ -318,17 +325,6 @@ func TestIntegrationCrashRestartExactlyOnce_position(t *testing.T) {
 			durable.mode)
 	}
 	assertExactlyOnce(t, indexedPKs(t, indexDB, sourceName, "orders"), pkRange(1, 5))
-	{
-		t.Logf("DEBUG durable checkpoint: file=%q pos=%d gtid=%q mode=%q", durable.binlogFile, durable.binlogPos, durable.gtidSet, durable.mode)
-		rs, _ := indexDB.Query(`SELECT pk_values, binlog_file, start_pos, end_pos, IFNULL(gtid,'-') FROM binlog_events WHERE schema_name=? ORDER BY event_id`, sourceName)
-		for rs.Next() {
-			var pk, bf, g string
-			var sp, ep uint64
-			rs.Scan(&pk, &bf, &sp, &ep, &g)
-			t.Logf("DEBUG row pk=%s file=%s start=%d end=%d gtid=%s", pk, bf, sp, ep, g)
-		}
-		rs.Close()
-	}
 
 	// ── run 2: the crash ──────────────────────────────────────────────────
 	restart := blockCheckpoints(t, indexDB)
@@ -396,10 +392,28 @@ func TestIntegrationCrashRestartExactlyOnce_position(t *testing.T) {
 //     --start-gtid flag ⇒ the GTID branch, not the position branch),
 //   - the real deleteEventsSinceCheckpointGTID against the real partitioned
 //     binlog_events: the position cut, the open-transaction GTID sweep, and the
-//     rows that must SURVIVE both,
-//   - the ORDERING: dedup runs BEFORE StartSyncGTID. With gtid_mode=OFF the sync
-//     attempt fails, and the rows are already gone when it does — which is only
-//     possible if the delete preceded it.
+//     rows that must SURVIVE both.
+//
+// The SURVIVING-ROW SET is what proves the GTID branch was taken. Had One gone
+// down the position branch, deleteEventsSinceCheckpoint(binlog.000042, 5000)
+// would have removed "beyond-checkpoint" (start_pos 5000 >= 5000) and left
+// "open-transaction" (start_pos 3000) alive, because only the GTID sibling's
+// second pass sweeps a below-offset row whose GTID the saved set lacks. The
+// assertion at the bottom would then fail with three survivors instead of two.
+//
+// What this test does NOT prove, despite its name, is the ORDER of the dedup
+// relative to StartSyncGTID. "BeforeStartSync" names where the dedup sits in
+// One(), not something observed here: the assertion runs after One has fully
+// returned, so either order would leave the same rows behind. In particular
+// StartSyncGTID SUCCEEDS against this gtid_mode=OFF source — go-mysql writes
+// COM_BINLOG_DUMP_GTID and hands back a streamer without reading the reply, so
+// the 1236 arrives asynchronously on the first GetEvent and One surfaces it
+// from the streaming loop, well past syncer setup. A run log shows exactly
+// that: "deleted events at or beyond the saved checkpoint ... rows_deleted=2",
+// then "begin to sync binlog from GTID set", "Connected to server
+// flavor=mysql", "Streaming started", then streamLoop's own ticker logging
+// `checkpoint saved file="" pos=0`. The ordering itself is pinned by One's
+// source and by the sqlmock tests in streamrun_test.go.
 func TestIntegrationResumeGTIDDedupsBeforeStartSync(t *testing.T) {
 	indexDB, indexName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, indexDB)
@@ -463,11 +477,15 @@ func TestIntegrationResumeGTIDDedupsBeforeStartSync(t *testing.T) {
 	// gtid_mode=OFF ⇒ the server refuses the GTID (AUTO_POSITION) dump:
 	//   ERROR 1236 ... cannot start in AUTO_POSITION mode: this server has
 	//   GTID_MODE = OFF instead of ON
-	// Reaching a GTID-specific failure at all proves One took the GTID branch
-	// and got as far as the sync attempt; the surviving-row assertion below
-	// then proves the dedup had already run by then. The message is matched
-	// loosely (any GTID-flavoured error) so a server-side wording change
-	// doesn't turn this into a false red.
+	// This is corroboration, not the proof: it establishes only that the run
+	// went down a GTID-exclusive path and then stopped, NOT how far it got.
+	// detectGTIDGap runs BEFORE the dedup and has GTID-flavoured error returns
+	// of its own ("parse checkpoint GTID set", "query @@gtid_purged",
+	// "checkpoint GTID set is empty"), any of which would satisfy this check
+	// without a single row having been deleted. The surviving-row assertion
+	// below is what actually pins the branch and the dedup. The message is
+	// matched loosely (any GTID-flavoured error) so a server-side wording
+	// change doesn't turn this into a false red.
 	var gtidMode string
 	_ = sourceDB.QueryRow("SELECT @@gtid_mode").Scan(&gtidMode)
 	if gtidMode != "ON" {
@@ -484,7 +502,7 @@ func TestIntegrationResumeGTIDDedupsBeforeStartSync(t *testing.T) {
 	// below the offset whose GTID the set DOES contain, and the row on an
 	// EARLIER binlog file, must both survive — deleting either would destroy
 	// data the source will never re-send.
-	assertPKs(t, survivingPKs(t, indexDB), []string{"committed", "earlier-file"},
+	assertPKs(t, survivingPKs(t, indexDB, sourceName), []string{"committed", "earlier-file"},
 		"GTID resume must delete only what StartSyncGTID will re-send")
 }
 
@@ -503,9 +521,18 @@ func seedBoundaryEvents(t *testing.T, db *sql.DB, gtid1, gtid2 *string) {
 	testutil.InsertEvent(t, db, "binlog.000007", 200, 300, ts, gtid2, "mydb", "orders", 1, "2", nil, nil, []byte(`{"id":2}`))
 }
 
-func survivingPKs(t *testing.T, db *sql.DB) []string {
+// survivingPKs lists the pk_values still in binlog_events for one schema.
+//
+// The schema scope is load-bearing, not cosmetic. Its GTID caller runs a real
+// One() against this same index DB: StartSyncGTID SUCCEEDS even on a
+// gtid_mode=OFF source (see TestIntegrationResumeGTIDDedupsBeforeStartSync), so
+// a live stream is attached and indexing for as long as that call runs. Nothing
+// lands today only because the source is freshly created and no DML runs
+// against it; an unscoped SELECT would turn any future fixture that writes to
+// the source into a flaky "unexpected surviving pk".
+func survivingPKs(t *testing.T, db *sql.DB, schema string) []string {
 	t.Helper()
-	rows, err := db.Query("SELECT pk_values FROM binlog_events ORDER BY pk_values")
+	rows, err := db.Query("SELECT pk_values FROM binlog_events WHERE schema_name = ? ORDER BY pk_values", schema)
 	if err != nil {
 		t.Fatalf("query survivors: %v", err)
 	}
@@ -574,7 +601,7 @@ func TestIntegrationDedupBoundaryIsEventStart(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("rows deleted = %d, want exactly 1 (only the event STARTING at the checkpoint)", n)
 		}
-		assertPKs(t, survivingPKs(t, db), []string{"1"},
+		assertPKs(t, survivingPKs(t, db, "mydb"), []string{"1"},
 			"the event ENDING at the checkpoint is not re-sent by StartSync and must survive")
 	})
 
@@ -587,7 +614,7 @@ func TestIntegrationDedupBoundaryIsEventStart(t *testing.T) {
 		if n != 0 {
 			t.Fatalf("rows deleted = %d, want 0 (nothing is re-sent from offset 300)", n)
 		}
-		assertPKs(t, survivingPKs(t, db), []string{"1", "2"}, "checkpoint past both events")
+		assertPKs(t, survivingPKs(t, db, "mydb"), []string{"1", "2"}, "checkpoint past both events")
 	})
 
 	t.Run("checkpoint at the first event's start deletes both", func(t *testing.T) {
@@ -599,7 +626,7 @@ func TestIntegrationDedupBoundaryIsEventStart(t *testing.T) {
 		if n != 2 {
 			t.Fatalf("rows deleted = %d, want 2 (StartSync from 100 re-sends both)", n)
 		}
-		assertPKs(t, survivingPKs(t, db), nil, "checkpoint at the first event's start")
+		assertPKs(t, survivingPKs(t, db, "mydb"), nil, "checkpoint at the first event's start")
 	})
 }
 
@@ -632,7 +659,7 @@ func TestIntegrationDedupBoundaryIsEventStartGTID(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("rows deleted = %d, want exactly 1 (only the event starting at the checkpoint)", n)
 		}
-		assertPKs(t, survivingPKs(t, db), []string{"1"},
+		assertPKs(t, survivingPKs(t, db, "mydb"), []string{"1"},
 			"a transaction the saved GTID set already contains is not replayed and must survive")
 	})
 
@@ -648,6 +675,6 @@ func TestIntegrationDedupBoundaryIsEventStartGTID(t *testing.T) {
 		if n != 2 {
 			t.Fatalf("rows deleted = %d, want 2 (the at-checkpoint row plus the open-transaction straggler)", n)
 		}
-		assertPKs(t, survivingPKs(t, db), nil, "open-transaction rows must not survive the resume")
+		assertPKs(t, survivingPKs(t, db, "mydb"), nil, "open-transaction rows must not survive the resume")
 	})
 }
