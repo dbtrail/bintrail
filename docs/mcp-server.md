@@ -62,8 +62,8 @@ everywhere):
 }
 ```
 
-Restart Claude Code. The `query`, `recover`, `status`, and `list_schema_changes`
-tools appear — now ask: *"What changed in the orders table in the last hour?"*
+Restart Claude Code. The `query`, `recover`, `status`, `list_schema_changes`,
+and `reconstruct` tools appear — now ask: *"What changed in the orders table in the last hour?"*
 
 > Working inside the dbtrail **source repo**? Use
 > `"command": "go", "args": ["run", "./cmd/bintrail-mcp"]` instead — no separate
@@ -273,9 +273,21 @@ arbitrary storage.
 captured history makes a reconstruction *silently wrong* (a state that never
 existed), not merely incomplete, so the tool aborts with an actionable error and
 you opt in explicitly. It also refuses outright — no override — when a
-`TRUNCATE`/`DROP`/`RENAME` hit the table inside the window, or when the stream
-recorded events permanently lost at the source: no archive can refill either, and
-the fold would resurrect rows that are gone.
+`TRUNCATE`/`DROP`/`RENAME` hit the table inside the window: no archive can refill
+that, and the fold would resurrect rows that are gone.
+
+The same `allow_gaps: false` default covers two further refusals, both of which
+`allow_gaps: true` overrides — and when you override one, the reason comes back
+as a `capture_gap:` entry in `warnings`, so a known-incomplete result is never
+returned as a clean one:
+
+- the stream recorded events **permanently lost at the source** inside the
+  window (`gap_lost_at`, shown as `GAP LOST` by
+  [`bintrail status`](rotation-and-status.md)) — no archive can refill those;
+- the index is too old to answer the question: its `stream_state` predates the
+  gap-tracking columns, so a permanent loss cannot be ruled out. Migrating the
+  index schema (any indexing or streaming command does it) enables the real
+  check.
 
 Archive sources come from `archive_state` (not the `BINTRAIL_ARCHIVE_S3` env
 pair), because gap detection reads the same registry — run

@@ -88,8 +88,8 @@ That's it. No config files were harmed.
 
 ## Step 3 — ask something
 
-Open a new Claude Desktop conversation. The `query`, `recover`, `status`, and
-`list_schema_changes` tools are now available. Try:
+Open a new Claude Desktop conversation. The `query`, `recover`, `status`,
+`list_schema_changes`, and `reconstruct` tools are now available. Try:
 
 > "Show me the last 20 changes in the `wordpress` schema."
 >

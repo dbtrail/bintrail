@@ -46,6 +46,10 @@
     {
       "name": "list_schema_changes",
       "description": "List recorded DDL changes with statements and binlog coordinates"
+    },
+    {
+      "name": "reconstruct",
+      "description": "Reconstruct one row's full state (or its history) as of a point in time"
     }
   ],
   "compatibility": {

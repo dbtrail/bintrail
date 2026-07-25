@@ -291,3 +291,123 @@ func TestIntegrationReconstructToolEventCapRefused(t *testing.T) {
 		t.Errorf("over-cap error text = %q", text)
 	}
 }
+
+// stampCaptureGap records a PERMANENT capture loss (#765) in stream_state — the
+// state `bintrail status` renders as "GAP LOST": events that no longer exist in
+// live MySQL, in an archive, or anywhere else.
+func stampCaptureGap(t *testing.T, db *sql.DB, at, detail string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO stream_state
+		(id, mode, binlog_file, binlog_position, last_checkpoint, server_id, gap_lost_at, gap_lost_detail)
+		VALUES (1, 'position', 'bin.000001', 120, '2026-06-01 15:00:00', 1, ?, ?)`, at, detail); err != nil {
+		t.Fatalf("stamp capture gap: %v", err)
+	}
+}
+
+// TestIntegrationReconstructToolCaptureGapRefusedByDefault pins the refusal an
+// MCP client gets over a permanently-lost window: it must name the tool
+// parameter that overrides it, never the CLI's `--allow-gaps`, which is the
+// only wording the shared reconstruct helper knows.
+func TestIntegrationReconstructToolCaptureGapRefusedByDefault(t *testing.T) {
+	db, dbName, baseDir := seedReconstructIndex(t)
+	stampCaptureGap(t, db, "2026-06-01 12:30:00", "binlogs purged before the stream caught up")
+	cs := reconstructSession(t, db, dbName)
+
+	res := callReconstructTool(t, cs, map[string]any{
+		"schema": "app", "table": "users", "pk": "1",
+		"at": "2026-06-01 13:30:00", "baseline_dir": baseDir,
+	})
+	if !res.IsError {
+		t.Fatalf("expected a capture-gap refusal, got: %s", resultText(res))
+	}
+	text := resultText(res)
+	if !strings.Contains(text, "capture gap") {
+		t.Errorf("the refusal should say what it refused on; got %q", text)
+	}
+	if !strings.Contains(text, "allow_gaps: true") {
+		t.Errorf("the refusal must name the tool parameter that overrides it; got %q", text)
+	}
+	if strings.Contains(text, "--") {
+		t.Errorf("the refusal must not hand an MCP client a CLI flag; got %q", text)
+	}
+}
+
+// TestIntegrationReconstructToolCaptureGapOverrideWarns is the other half, and
+// the one that was actually broken: with allow_gaps the fold proceeds, and the
+// permanent loss it folded over MUST come back in the payload. The CLI's
+// operator sees the equivalent slog.Warn on stderr; an MCP client sees only
+// this JSON, so a missing warning reports a known-incomplete state as clean.
+func TestIntegrationReconstructToolCaptureGapOverrideWarns(t *testing.T) {
+	db, dbName, baseDir := seedReconstructIndex(t)
+	stampCaptureGap(t, db, "2026-06-01 12:30:00", "binlogs purged before the stream caught up")
+	cs := reconstructSession(t, db, dbName)
+
+	res := callReconstructTool(t, cs, map[string]any{
+		"schema": "app", "table": "users", "pk": "1",
+		"at": "2026-06-01 13:30:00", "baseline_dir": baseDir, "allow_gaps": true,
+	})
+	out := decodeReconstruct(t, res)
+	if !out.Found {
+		t.Fatalf("expected the fold to proceed under allow_gaps, got: %+v", out)
+	}
+	var captureWarning string
+	for _, w := range out.Warnings {
+		if strings.HasPrefix(w, "capture_gap: ") {
+			captureWarning = w
+		}
+	}
+	if captureWarning == "" {
+		t.Fatalf("an overridden capture gap must surface as a capture_gap warning, got warnings: %v", out.Warnings)
+	}
+	if !strings.Contains(captureWarning, "2026-06-01T12:30:00Z") {
+		t.Errorf("the warning must say when capture was lost; got %q", captureWarning)
+	}
+	if !strings.Contains(captureWarning, "binlogs purged") {
+		t.Errorf("the warning must carry the recorded detail; got %q", captureWarning)
+	}
+}
+
+// TestIntegrationReconstructToolLegacyIndexGapUnevaluable covers the index the
+// console actually serves: registry servers are never migrated (EnsureSchema is
+// false there), so an index predating the gap_lost_* columns reaches this tool
+// with gap state that was never evaluated. Reading that as "no gap" made the
+// guard inert on precisely those servers; it must refuse instead, and say why.
+func TestIntegrationReconstructToolLegacyIndexGapUnevaluable(t *testing.T) {
+	db, dbName, baseDir := seedReconstructIndex(t)
+	if _, err := db.Exec(`ALTER TABLE stream_state DROP COLUMN gap_lost_at, DROP COLUMN gap_lost_detail`); err != nil {
+		t.Fatalf("simulate a legacy index: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO stream_state
+		(id, mode, binlog_file, binlog_position, last_checkpoint, server_id)
+		VALUES (1, 'position', 'bin.000001', 120, '2026-06-01 15:00:00', 1)`); err != nil {
+		t.Fatalf("seed legacy stream_state: %v", err)
+	}
+	cs := reconstructSession(t, db, dbName)
+
+	res := callReconstructTool(t, cs, map[string]any{
+		"schema": "app", "table": "users", "pk": "1",
+		"at": "2026-06-01 13:30:00", "baseline_dir": baseDir,
+	})
+	if !res.IsError {
+		t.Fatalf("expected a refusal when gap state is not evaluable, got: %s", resultText(res))
+	}
+	if text := resultText(res); !strings.Contains(text, "NOT EVALUABLE") {
+		t.Errorf("the refusal must say the gap state could not be evaluated; got %q", text)
+	}
+
+	// The override still works, and still reports what it overrode.
+	res = callReconstructTool(t, cs, map[string]any{
+		"schema": "app", "table": "users", "pk": "1",
+		"at": "2026-06-01 13:30:00", "baseline_dir": baseDir, "allow_gaps": true,
+	})
+	out := decodeReconstruct(t, res)
+	var found bool
+	for _, w := range out.Warnings {
+		if strings.HasPrefix(w, "capture_gap: ") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("an overridden unevaluable verdict must still warn, got warnings: %v", out.Warnings)
+	}
+}

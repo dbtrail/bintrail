@@ -278,18 +278,18 @@ func TestBuildPKFilterArity(t *testing.T) {
 func TestReconstructWarnings(t *testing.T) {
 	stale := reconstruct.StaleWarning{Message: "using an older snapshot"}
 
-	if w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil); len(w) != 0 {
+	if w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, nil); len(w) != 0 {
 		t.Errorf("a clean reconstruction must carry no warnings, got %v", w)
 	}
 
-	w := reconstructWarnings(nil, stale, map[string]any{"id": 1}, nil)
+	w := reconstructWarnings(nil, stale, map[string]any{"id": 1}, nil, nil)
 	if len(w) != 1 || !strings.HasPrefix(w[0], "stale_baseline: ") {
 		t.Errorf("stale fallback must surface as stale_baseline, got %v", w)
 	}
 
 	// No baseline row + an UPDATE first: PK-change suspicion.
 	updateFirst := []query.ResultRow{{EventID: 1, EventType: event.EventUpdate}}
-	w = reconstructWarnings(nil, reconstruct.StaleWarning{}, nil, updateFirst)
+	w = reconstructWarnings(nil, reconstruct.StaleWarning{}, nil, updateFirst, nil)
 	if len(w) != 1 || !strings.HasPrefix(w[0], "pk_change_suspected: ") {
 		t.Errorf("expected a pk_change_suspected warning, got %v", w)
 	}
@@ -297,7 +297,72 @@ func TestReconstructWarnings(t *testing.T) {
 	// No baseline row + an INSERT first: the legitimate created-after-the-baseline
 	// case, which must NOT warn.
 	insertFirst := []query.ResultRow{{EventID: 1, EventType: event.EventInsert}}
-	if w := reconstructWarnings(nil, reconstruct.StaleWarning{}, nil, insertFirst); len(w) != 0 {
+	if w := reconstructWarnings(nil, reconstruct.StaleWarning{}, nil, insertFirst, nil); len(w) != 0 {
 		t.Errorf("a row created after the baseline must not warn, got %v", w)
+	}
+}
+
+// TestReconstructWarningsCaptureGap covers the half of the #765 override that
+// the shared CheckCaptureGap helper cannot do: when the caller sets allow_gaps
+// over a PERMANENT capture loss, the finding has to travel back in the payload.
+// The CLI's operator reads the slog.Warn on stderr; an MCP client reads nothing
+// but this JSON, so a silent override would render a known-incomplete fold as a
+// clean one.
+func TestReconstructWarningsCaptureGap(t *testing.T) {
+	since := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC)
+
+	stamped := &reconstruct.CaptureGap{
+		At:     since.Add(24 * time.Hour),
+		Detail: "binlogs purged before stream caught up",
+		Since:  since, Until: until,
+	}
+	w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, stamped)
+	if len(w) != 1 || !strings.HasPrefix(w[0], "capture_gap: ") {
+		t.Fatalf("an overridden capture gap must surface as one capture_gap warning, got %v", w)
+	}
+	if !strings.Contains(w[0], "2026-06-02T00:00:00Z") || !strings.Contains(w[0], "binlogs purged") {
+		t.Errorf("the warning must carry when the loss happened and why, got: %s", w[0])
+	}
+
+	unevaluable := &reconstruct.CaptureGap{Unevaluable: true, Since: since, Until: until}
+	w = reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, unevaluable)
+	if len(w) != 1 || !strings.HasPrefix(w[0], "capture_gap: ") {
+		t.Fatalf("an overridden unevaluable verdict must surface as a capture_gap warning, got %v", w)
+	}
+
+	// The capture-gap warning stacks with the others rather than replacing them.
+	w = reconstructWarnings(nil, reconstruct.StaleWarning{Message: "using an older snapshot"},
+		map[string]any{"id": 1}, nil, stamped)
+	if len(w) != 2 {
+		t.Errorf("expected the capture gap alongside the stale-baseline warning, got %v", w)
+	}
+}
+
+// TestReconstructCaptureGapErrorNamesToolParam guards the CLI-flag leak: the
+// refusal an MCP client receives must name the tool parameter it actually has
+// (allow_gaps: true), never `--allow-gaps`, which an agent can only translate
+// by guessing. It must still name SOME override — a refusal with no way
+// forward would be a different failure, not a fix.
+func TestReconstructCaptureGapErrorNamesToolParam(t *testing.T) {
+	since := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC)
+	gaps := map[string]*reconstruct.CaptureGap{
+		"stamped":     {At: since.Add(time.Hour), Detail: "gap", Since: since, Until: until},
+		"unevaluable": {Unevaluable: true, Since: since, Until: until},
+	}
+	for name, gap := range gaps {
+		t.Run(name, func(t *testing.T) {
+			msg := reconstructCaptureGapError(gap, "app", "users").Error()
+			if strings.Contains(msg, "--") {
+				t.Errorf("the MCP refusal must not hand the client a CLI flag, got: %s", msg)
+			}
+			if !strings.Contains(msg, "allow_gaps: true") {
+				t.Errorf("the refusal must name the tool parameter that overrides it, got: %s", msg)
+			}
+			if !strings.Contains(msg, "app.users") {
+				t.Errorf("the refusal must name the table, got: %s", msg)
+			}
+		})
 	}
 }

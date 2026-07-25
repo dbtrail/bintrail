@@ -73,7 +73,7 @@ type ReconstructArgs struct {
 	History     bool   `json:"history,omitempty" jsonschema:"Return every state transition from the baseline up to the target time instead of a single point-in-time state"`
 	BaselineDir string `json:"baseline_dir,omitempty" jsonschema:"Local directory of baseline Parquet snapshots produced by bintrail baseline. Overrides BINTRAIL_BASELINE_DIR env var. Rejected on servers that configure the baseline themselves (the console /mcp endpoint)."`
 	BaselineS3  string `json:"baseline_s3,omitempty" jsonschema:"S3 prefix of baseline Parquet snapshots (s3://bucket/prefix). Overrides BINTRAIL_BASELINE_S3 env var. Used only when baseline_dir is unset. Rejected on servers that configure the baseline themselves."`
-	AllowGaps   bool   `json:"allow_gaps,omitempty" jsonschema:"Proceed even when part of the window is missing from the captured history. Defaults to false: a coverage gap aborts the reconstruction rather than returning a silently wrong row state."`
+	AllowGaps   bool   `json:"allow_gaps,omitempty" jsonschema:"Proceed even when part of the window is missing from the captured history. Defaults to false: a coverage gap, or a permanent capture loss recorded by the stream, aborts the reconstruction rather than returning a silently wrong row state. When set, what was overridden is reported back in warnings."`
 }
 
 // reconstructStateEntry is one transition in history mode — the wire shape of a
@@ -203,7 +203,7 @@ func buildPKFilter(cols []string, pk string) (map[string]string, error) {
 //
 // It is strictly read-only and deliberately STRICTER than the console's
 // /api/reconstruct endpoint: it additionally runs
-// reconstruct.CheckDestructiveDDL (#764) and reconstruct.CheckCaptureGap
+// reconstruct.CheckDestructiveDDL (#764) and reconstruct.CaptureGapStatus
 // (#765). Those guards exist on the `bintrail reconstruct` CLI path and catch
 // two ways a fold can be silently wrong that the coverage-gap check cannot
 // see. An agent cannot eyeball a suspicious result the way a human reading CLI
@@ -304,8 +304,16 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 		if err := reconstruct.CheckDestructiveDDL(ctx, t.DB, args.Schema, args.Table, snapshotTime, atTime); err != nil {
 			return ErrorResult(err), nil, nil
 		}
-		if err := reconstruct.CheckCaptureGap(ctx, t.DB, args.Schema, args.Table, snapshotTime, atTime, args.AllowGaps); err != nil {
+		//      CaptureGapStatus rather than CheckCaptureGap: the shared helper
+		//      swallows the finding entirely under allowGaps (it logs to stderr,
+		//      which no MCP client reads) and its refusal names a CLI flag. Here
+		//      the finding must survive the override as a payload warning.
+		captureGap, err := reconstruct.CaptureGapStatus(ctx, t.DB, snapshotTime, atTime)
+		if err != nil {
 			return ErrorResult(err), nil, nil
+		}
+		if captureGap != nil && !args.AllowGaps {
+			return ErrorResult(reconstructCaptureGapError(captureGap, args.Schema, args.Table)), nil, nil
 		}
 
 		// 3. Fetch this PK's deltas in [baseline, at], oldest-first.
@@ -373,7 +381,7 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 			At:           atTime.Format(reconstructTSFormat),
 			BaselineTime: snapshotTime.Format(reconstructTSFormat),
 			EventCount:   len(rows),
-			Warnings:     reconstructWarnings(plan, stale, baselineRow, rows),
+			Warnings:     reconstructWarnings(plan, stale, baselineRow, rows, captureGap),
 		}
 
 		// 4. Fold baseline + deltas. baselineRow may be nil. "existed" = the row
@@ -446,11 +454,31 @@ func reconstructFetchError(err error) error {
 	return fmt.Errorf("fetch binlog events: %w", err)
 }
 
+// reconstructCaptureGapError rewrites a permanent-capture-loss finding (#765)
+// as an MCP refusal. Same job as reconstructFetchError: the shared helper's
+// message advises `--allow-gaps`, a flag no MCP client has, and an agent
+// reading it can only guess at the tool parameter that means the same thing —
+// so it is named explicitly here instead.
+func reconstructCaptureGapError(gap *reconstruct.CaptureGap, schema, table string) error {
+	return fmt.Errorf("%s for %s.%s; the reconstruction would be silently incomplete. "+
+		"Re-run with allow_gaps: true to accept a known-incomplete result (it is reported back in `warnings`), "+
+		"or narrow `at` to a window before the loss", gap.Reason(), schema, table)
+}
+
 // reconstructWarnings assembles the non-fatal caveats attached to a successful
 // result: coverage gaps the caller opted into with allow_gaps, a stale-baseline
-// fallback (#466), and the PK-change suspicion below.
-func reconstructWarnings(plan *query.QueryPlan, stale reconstruct.StaleWarning, baselineRow map[string]any, rows []query.ResultRow) []string {
+// fallback (#466), the PK-change suspicion below, and a permanent capture loss
+// (#765) the caller overrode. captureGap is non-nil ONLY when the caller passed
+// allow_gaps — the refusal above is unconditional otherwise — and it MUST be
+// carried into the payload: unlike the CLI, whose operator sees the slog.Warn
+// on stderr, an MCP client sees nothing but this JSON, so an overridden gap
+// with no warning reads as a clean, complete reconstruction.
+func reconstructWarnings(plan *query.QueryPlan, stale reconstruct.StaleWarning, baselineRow map[string]any, rows []query.ResultRow, captureGap *reconstruct.CaptureGap) []string {
 	var warnings []string
+	if captureGap != nil {
+		warnings = append(warnings, "capture_gap: "+captureGap.Reason()+
+			" — proceeding because allow_gaps was set; the state below may omit changes that no longer exist anywhere")
+	}
 	if plan != nil && len(plan.GapHours) > 0 {
 		warnings = append(warnings, query.FormatGapWarning(plan.GapHours))
 	}

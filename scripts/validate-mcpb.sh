@@ -64,6 +64,18 @@ for required_arg in ("--connect", "${user_config.console_url}", "--token", "${us
     if required_arg not in args:
         sys.exit(f"mcp_config.args missing {required_arg!r}: {args}")
 
+# The declared tool list must at least be well-formed. Whether it MATCHES the
+# server's registered tools is asserted by TestMCPBManifestToolsMatchServer in
+# cmd/bintrail-mcp (a Go unit test): the bundled binary is the stdio<->HTTP
+# BRIDGE, so enumerating tools from here would mean standing up a live server
+# and index inside the release pipeline.
+tools = m.get("tools")
+if not isinstance(tools, list) or not tools:
+    sys.exit("manifest.json must declare a non-empty tools list")
+for i, t in enumerate(tools):
+    if not isinstance(t, dict) or not t.get("name") or not t.get("description"):
+        sys.exit(f"tools[{i}] must have a non-empty name and description: {t!r}")
+
 uc = m.get("user_config", {})
 for key in ("console_url", "token"):
     if key not in uc:

@@ -367,7 +367,7 @@ bintrail up \
 
 **Situation:** You want to investigate database changes in natural language from Claude — Claude Code, Claude Desktop, or claude.ai — instead of typing CLI commands.
 
-dbtrail ships an MCP server that exposes `query`, `recover`, `status`, and `list_schema_changes` as AI tools. Once connected, you can ask:
+dbtrail ships an MCP server that exposes `query`, `recover`, `status`, `list_schema_changes`, and `reconstruct` as AI tools. Once connected, you can ask:
 
 ```
 "What tables had deletions in the last hour?"
