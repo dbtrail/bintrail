@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/doctor"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -203,15 +202,15 @@ func runUpStream(cmd *cobra.Command, args []string) error {
 	rotation.StartLoop(rotCtx, func() rotation.Settings { return upRotationCfg }, func() []rotation.RotateTarget {
 		return []rotation.RotateTarget{{DSN: upIndexDSN}}
 	})
-	// Extension source jobs (ext.RegisterSourceJob) share the same lifecycle
-	// and contract as rotation: secondary daemon-scoped
-	// work that must never be fatal to the stream. No-op in the stock binary.
-	// Flavor is the value the stream below actually runs with: `up` has no
-	// --source-flavor flag of its own, so strmFlavor holds streamCmd's default
-	// ("mysql") or the BINTRAIL_SOURCE_FLAVOR override, which bindCommandEnv
-	// (streamCmd) applied at flag-binding time; populateStreamFlags above
-	// deliberately leaves it untouched.
-	ext.RunSourceJobs(rotCtx, ext.SourceJobInfo{SourceDSN: upSourceDSN, IndexDSN: upIndexDSN, Flavor: strmFlavor})
+	// Extension source jobs (ext.RegisterSourceJob) are NOT started here: they
+	// share the stream's lifecycle, so runStream owns the one call site for
+	// both `up` and plain `stream` (starting them here too would run every
+	// registered job twice under `up`). populateStreamFlags above has already
+	// copied up's DSNs into the strm* globals runStream reads, and flavor is
+	// the value the stream actually runs with — `up` has no --source-flavor
+	// flag of its own, so strmFlavor holds streamCmd's default ("mysql") or
+	// the BINTRAIL_SOURCE_FLAVOR override that bindCommandEnv(streamCmd)
+	// applied at flag-binding time.
 	return runStream(cmd, args)
 }
 

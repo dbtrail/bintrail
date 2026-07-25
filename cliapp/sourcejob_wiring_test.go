@@ -1,0 +1,129 @@
+package cliapp
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"strings"
+	"testing"
+)
+
+// The extension source-job seam (ext.RegisterSourceJob) exists so an
+// embedding distribution can run per-source background work — identity
+// capture, sidecar collectors — for as long as a capture daemon lives.
+// These tests pin the two properties the wiring must have: every long-lived
+// capture command reaches the seam, and it reaches it exactly once.
+
+func TestStreamSourceJobInfoCarriesTheStreamsSource(t *testing.T) {
+	// The seam gets what the stream actually runs with, including the values
+	// `up` copies in via populateStreamFlags.
+	origSource, origIndex, origFlavor := strmSourceDSN, strmIndexDSN, strmFlavor
+	t.Cleanup(func() { strmSourceDSN, strmIndexDSN, strmFlavor = origSource, origIndex, origFlavor })
+
+	strmSourceDSN = "u:p@tcp(src:3306)/"
+	strmIndexDSN = "u:p@tcp(idx:3306)/bintrail_index"
+	strmFlavor = "mariadb"
+
+	got := streamSourceJobInfo()
+	if got.SourceDSN != strmSourceDSN || got.IndexDSN != strmIndexDSN || got.Flavor != "mariadb" {
+		t.Errorf("streamSourceJobInfo() = %+v, want the strm* stream configuration", got)
+	}
+}
+
+func TestAgentSourceJobInfoRequiresSourceAndIndex(t *testing.T) {
+	origSource, origIndex := agtSourceDSN, agtIndexDSN
+	t.Cleanup(func() { agtSourceDSN, agtIndexDSN = origSource, origIndex })
+
+	tests := []struct {
+		name             string
+		source, index    string
+		wantOK           bool
+		wantSrc, wantIdx string
+	}{
+		{name: "both set", source: "u:p@tcp(src:3306)/", index: "u:p@tcp(idx:3306)/bintrail_index",
+			wantOK: true, wantSrc: "u:p@tcp(src:3306)/", wantIdx: "u:p@tcp(idx:3306)/bintrail_index"},
+		// Stateless BYOS: a live source, but nowhere to persist an
+		// observation — jobs must not start and then fail on an empty DSN.
+		{name: "no index", source: "u:p@tcp(src:3306)/", index: "", wantOK: false},
+		// Query-only agent: no live source to observe at all.
+		{name: "no source", source: "", index: "u:p@tcp(idx:3306)/bintrail_index", wantOK: false},
+		{name: "neither", source: "", index: "", wantOK: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			agtSourceDSN, agtIndexDSN = tc.source, tc.index
+			got, ok := agentSourceJobInfo()
+			if ok != tc.wantOK {
+				t.Fatalf("agentSourceJobInfo() ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if got.SourceDSN != tc.wantSrc || got.IndexDSN != tc.wantIdx {
+				t.Errorf("agentSourceJobInfo() = %+v, want the agent's DSNs", got)
+			}
+			if got.Flavor != "mysql" {
+				t.Errorf("agentSourceJobInfo().Flavor = %q, want \"mysql\" (the agent streams MySQL binlogs and has no flavor flag)", got.Flavor)
+			}
+		})
+	}
+}
+
+// TestSourceJobsStartOncePerDaemon is the double-fire guard. `up` delegates to
+// runStream, so a second ext.RunSourceJobs call in runUpStream — the shape the
+// wiring had before stream/agent adopted the seam — would run every registered
+// job TWICE under `up`: two identity pollers on one source, each writing the
+// same intervals. Exactly two call sites are correct: runStream (stream + up)
+// and runAgent (BYOS).
+func TestSourceJobsStartOncePerDaemon(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read cliapp dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	callers := map[string]int{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			ast.Inspect(fn, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "RunSourceJobs" {
+					return true
+				}
+				if ident, ok := sel.X.(*ast.Ident); !ok || ident.Name != "ext" {
+					return true
+				}
+				callers[fn.Name.Name]++
+				return true
+			})
+		}
+	}
+	want := map[string]int{"runStream": 1, "runAgent": 1}
+	for fn, n := range want {
+		if callers[fn] != n {
+			t.Errorf("ext.RunSourceJobs called %d time(s) in %s, want %d", callers[fn], fn, n)
+		}
+	}
+	for fn, n := range callers {
+		if _, expected := want[fn]; !expected {
+			t.Errorf("unexpected ext.RunSourceJobs call in %s (%d): source jobs share the stream's lifecycle — "+
+				"a caller that delegates to runStream must not start them again", fn, n)
+		}
+	}
+}

@@ -7,8 +7,10 @@ import (
 
 // SourceJobInfo describes one capture source at daemon startup, handed to
 // every registered source job. Flavor names the source family; core wiring
-// currently only ever carries "mysql" or "mariadb" (the flavor `bintrail up`
-// streams with).
+// currently only ever carries "mysql" or "mariadb" (the flavor the daemon
+// streams with; `bintrail agent` has no flavor flag and always reports
+// "mysql"). Both DSNs are populated by every core wiring point: a job that
+// needs somewhere to persist what it observes can rely on IndexDSN being set.
 type SourceJobInfo struct {
 	SourceDSN string
 	IndexDSN  string
@@ -19,8 +21,10 @@ type SourceJobInfo struct {
 var sourceJobs []func(ctx context.Context, src SourceJobInfo)
 
 // RegisterSourceJob registers a background job to run alongside the daemon
-// lifecycle. Today the only core wiring point is the `bintrail up` daemon;
-// other daemons may adopt it in the future. Same startup-only contract as the
+// lifecycle. Core wiring points: `bintrail stream` (which `bintrail up`
+// delegates to), `bintrail agent` in BYOS mode, and the console daemon's
+// `watch` main source plus every monitor-supervised source. Same
+// startup-only contract as the
 // other seams: call from main() before command dispatch; not safe for
 // concurrent use with command execution. Registering a nil job panics
 // immediately so the misuse fails at startup, not at daemon boot.
@@ -32,8 +36,9 @@ func RegisterSourceJob(job func(ctx context.Context, src SourceJobInfo)) {
 }
 
 // RunSourceJobs launches every registered source job, each on its own
-// goroutine, and returns immediately. Called by the core at `bintrail up`
-// startup, with a context bound to the daemon lifetime — the passed ctx
+// goroutine, and returns immediately. Called by the core once per capture
+// source at daemon startup, with a context bound to the daemon lifetime —
+// the passed ctx
 // bounds the jobs' lifetime. Jobs are secondary and must never be fatal to
 // the daemon; the core enforces that here: a panicking job is recovered and
 // logged, never propagated to the stream, and a slow job cannot block

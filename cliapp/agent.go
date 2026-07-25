@@ -378,6 +378,16 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		identPtr := &atomic.Pointer[byos.SourceIdentity]{}
 		identPtr.Store(&sourceIdent)
 
+		// Extension source jobs (ext.RegisterSourceJob) run alongside the BYOS
+		// stream, same contract as under `stream`/`up`: daemon-scoped
+		// secondary work, never fatal to capture, no-op in the stock binary.
+		// Only in BYOS mode — without --source-dsn there is no live source to
+		// observe — and only with an index, since a source job's persistence
+		// target is the index database (stateless BYOS keeps nothing local).
+		if src, ok := agentSourceJobInfo(); ok {
+			ext.RunSourceJobs(ctx, src)
+		}
+
 		streamErrCh := make(chan error, 1)
 		go func() {
 			streamErrCh <- runBYOSStream(ctx, handler.SourceDB, buf, &byosFlushConfig{
@@ -613,6 +623,27 @@ func (s *flushPipelineState) toFlushStatus() *agent.FlushStatus {
 		PayloadLostEvents:   s.payloadLostEvents,
 		PayloadLostBatches:  s.payloadLostBatches,
 	}
+}
+
+// agentSourceJobInfo describes the agent's capture source for the extension
+// source-job seam, and reports whether jobs should run at all. Extracted from
+// runAgent so the decision is unit-testable without a daemon (mirrors
+// streamSourceJobInfo).
+//
+// Both DSNs are required: --source-dsn is the live server a job observes, and
+// the index is the only place a job can persist what it observes — a stateless
+// BYOS agent (no --index-dsn) has neither a local destination nor a schema to
+// write into. Flavor is always MySQL: the agent carries no --source-flavor
+// flag, and its BYOS stream is the MySQL binlog reader.
+func agentSourceJobInfo() (ext.SourceJobInfo, bool) {
+	if agtSourceDSN == "" || agtIndexDSN == "" {
+		return ext.SourceJobInfo{}, false
+	}
+	return ext.SourceJobInfo{
+		SourceDSN: agtSourceDSN,
+		IndexDSN:  agtIndexDSN,
+		Flavor:    "mysql",
+	}, true
 }
 
 // ─── BYOS streaming ────────────────────────────────────────────────────────

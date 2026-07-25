@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/streamdeps"
 	"github.com/dbtrail/dbtrail/internal/streamrun"
@@ -171,5 +172,26 @@ func runStream(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	// Extension source jobs (ext.RegisterSourceJob) run alongside the stream
+	// for its whole lifetime: same contract as rotation under `up` —
+	// daemon-scoped secondary work, never fatal to capture, no-op in the stock
+	// binary. This is the single wiring point for every daemon that ends up
+	// here, `bintrail stream` itself and `bintrail up` (which delegates to
+	// runStream after populateStreamFlags has copied its DSNs into the strm*
+	// globals). ctx is the signal-bound child installed above, so the jobs
+	// stop draining when the stream does.
+	ext.RunSourceJobs(ctx, streamSourceJobInfo())
+
 	return streamrun.One(ctx, streamConfigFromFlags())
+}
+
+// streamSourceJobInfo describes the stream's capture source for the extension
+// source-job seam. Extracted from runStream so the mapping is unit-testable
+// without starting a daemon (mirrors consoleapp's mainSourceJobInfo).
+func streamSourceJobInfo() ext.SourceJobInfo {
+	return ext.SourceJobInfo{
+		SourceDSN: strmSourceDSN,
+		IndexDSN:  strmIndexDSN,
+		Flavor:    strmFlavor,
+	}
 }
