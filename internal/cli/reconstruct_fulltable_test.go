@@ -53,6 +53,24 @@ func resetMydumperFlags(t *testing.T) {
 	recTables = "mydb.orders"
 	recChunkSize = "256MB"
 	recParallelism = 1
+	recFetchBatch = 0
+}
+
+// TestRunReconstructFullTable_rejectsNegativeFetchBatch pins the validation on
+// --fetch-batch-size (#1097). 0 is legal and means "use the default"; a
+// negative value is a typo that FetchMergedStream would silently absorb into
+// the same default, so the CLI refuses it rather than run a page size the
+// operator did not ask for.
+func TestRunReconstructFullTable_rejectsNegativeFetchBatch(t *testing.T) {
+	resetMydumperFlags(t)
+	recFetchBatch = -1
+	err := runReconstruct(reconstructCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when --fetch-batch-size is negative")
+	}
+	if !strings.Contains(err.Error(), "--fetch-batch-size") {
+		t.Errorf("unexpected error: %v", err)
+	}
 }
 
 func TestRunReconstructFullTable_rejectsPK(t *testing.T) {

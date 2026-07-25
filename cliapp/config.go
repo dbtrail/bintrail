@@ -217,6 +217,9 @@ var envSections = []envSection{
 			{"BINTRAIL_RECOVER_MAX_BYTES", "2GB"},
 			// reconstruct: warn when a full-table window exceeds this many events (0 disables).
 			{"BINTRAIL_RECONSTRUCT_WARN_EVENTS", "5000000"},
+			// reconstruct: events fetched per page when streaming a full-table
+			// window (0 = built-in default). Trades peak memory against round trips.
+			{"BINTRAIL_RECONSTRUCT_FETCH_BATCH", ""},
 		},
 	},
 	// The BINTRAIL_CONSOLE_* vars moved with the web console to the standalone

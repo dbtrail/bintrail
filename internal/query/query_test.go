@@ -915,3 +915,50 @@ func TestApplyRedaction_wrongTable(t *testing.T) {
 		t.Errorf("expected RowAfter[amount]=60, got %v", rows[0].RowAfter["amount"])
 	}
 }
+
+// TestBuildQuery_afterEventKeyset covers the keyset cursor predicate (#1097).
+// Two things must be present, and they are not interchangeable: the exact
+// composite cut on (event_timestamp, event_id), and the hour-floored TO_SECONDS
+// literal MySQL needs to prune partitions — a parameterised datetime comparison
+// prunes nothing, so without the literal a late page would scan every partition
+// in the window instead of the ones still ahead of the cursor.
+func TestBuildQuery_afterEventKeyset(t *testing.T) {
+	cur := time.Date(2026, 7, 25, 14, 37, 5, 0, time.UTC)
+	q, args := buildQuery(Options{
+		Schema:     "mydb",
+		Table:      "orders",
+		AfterEvent: &EventCursor{Timestamp: cur, EventID: 4242},
+	})
+
+	if !strings.Contains(q, "(event_timestamp > ? OR (event_timestamp = ? AND event_id > ?))") {
+		t.Errorf("missing the composite keyset cut; a timestamp-only cursor would skip or re-return the boundary second:\n%s", q)
+	}
+	// TO_SECONDS('2026-07-25 14:00:00') — floored to the hour, never to the
+	// cursor's own second: flooring can only over-include, which is the safe
+	// direction for a pruning hint.
+	wantHint := fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", mysqlToSeconds(cur.Truncate(time.Hour)))
+	if !strings.Contains(q, wantHint) {
+		t.Errorf("missing partition-pruning hint %q:\n%s", wantHint, q)
+	}
+
+	// The cursor contributes exactly three args, after schema+table.
+	if len(args) != 5 {
+		t.Fatalf("args = %v, want 5 (schema, table, ts, ts, event_id)", args)
+	}
+	if args[2] != cur || args[3] != cur {
+		t.Errorf("timestamp args = %v/%v, want %v twice", args[2], args[3], cur)
+	}
+	if args[4] != uint64(4242) {
+		t.Errorf("event_id arg = %v, want 4242", args[4])
+	}
+}
+
+// TestBuildQuery_noAfterEventNoKeyset pins that the predicate is absent when no
+// cursor is set — every non-paginated caller must generate exactly the SQL it
+// did before #1097.
+func TestBuildQuery_noAfterEventNoKeyset(t *testing.T) {
+	q, _ := buildQuery(Options{Schema: "mydb", Table: "orders"})
+	if strings.Contains(q, "event_id >") {
+		t.Errorf("keyset predicate leaked into a cursor-less query:\n%s", q)
+	}
+}
