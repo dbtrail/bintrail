@@ -165,8 +165,13 @@ func TestPhase2_truncationSkipsBaseline(t *testing.T) {
 	testutil.InsertEvent(t, db, "b.000001", 10, 20, ts, nil, dbName, "child", 1, "10", nil, nil, []byte(`{"id":10,"pid":1}`))
 	testutil.InsertEvent(t, db, "b.000001", 20, 30, ts, nil, dbName, "child", 1, "11", nil, nil, []byte(`{"id":11,"pid":1}`))
 
+	// stale is set here too (#618 review finding, mirrored from
+	// TestPhase2_archivesSkipBaseline): the binlog-truncation skip means
+	// augmentation never ran, so the stale-baseline warning must not fire
+	// either — asserted below.
 	fb := &fakeBaseline{ok: true, snap: h.Add(-time.Hour),
-		rows: []cascade.BaselineRow{{PKValues: "12", Row: map[string]any{"id": int64(12), "pid": int64(1)}}}}
+		rows:  []cascade.BaselineRow{{PKValues: "12", Row: map[string]any{"id": int64(12), "pid": int64(1)}}},
+		stale: "baseline for " + dbName + ".child is stale: the table is absent from the newest snapshot"}
 	res, err := cascade.SynthesizeVictims(context.Background(), eng, cascadeFK(dbName), parentDelete(dbName, T),
 		cascade.Options{Baseline: fb, CandidateLimit: 1})
 	if err != nil {
@@ -174,6 +179,9 @@ func TestPhase2_truncationSkipsBaseline(t *testing.T) {
 	}
 	if res.Complete() || !strings.Contains(strings.Join(res.Incomplete, " "), "baseline augmentation") {
 		t.Errorf("binlog truncation must skip+flag baseline augmentation; Incomplete=%v", res.Incomplete)
+	}
+	if len(res.Warnings) != 0 {
+		t.Errorf("the stale-baseline warning must NOT fire when binlog truncation skipped augmentation entirely; got Warnings=%v", res.Warnings)
 	}
 	// The baseline child 12 must NOT have been added under truncation.
 	if victimKeys(res.Victims)["child:12"] {
@@ -211,19 +219,21 @@ func TestPhase2_noBaselineCoverageFlagged(t *testing.T) {
 	}
 }
 
-// TestPhase2_staleBaselinePropagatesIncomplete pins #618: a provider that
-// covers the child table but fell back to an older snapshot (StaleMessage
-// non-empty, mirroring reconstruct.StaleWarning.Message on a #466 fallback)
-// must surface that as a "baseline-stale:<schema>.<table>" caveat in
-// Result.Incomplete — the console/CLI reconstruct tabs already surface the
-// identical signal via appendStaleWarning; before this fix the cascade
-// Phase-2 path silently discarded it (a fully covered, non-truncated result
-// reported Complete() even though it read a stale snapshot). A non-stale
-// lookup (empty StaleMessage) must NOT add the caveat. Two parent roots are
-// used to pin the dedup the issue asked for (addIncomplete keyed on
-// "baseline-stale:<schema>.<table>", not per-parent): BaselineChildren is
-// called once per root, but the caveat must appear exactly once.
-func TestPhase2_staleBaselinePropagatesIncomplete(t *testing.T) {
+// TestPhase2_staleBaselineWarnsButStaysComplete pins #618's CORRECTED design
+// (a review of the original #618 PR found the engine had routed this signal
+// through Result.Incomplete, which both renderers treat as data loss — but
+// the issue's own "why it's not urgent" analysis says no rows are lost in
+// this scenario, only the advisory itself): a provider that covers the child
+// table but fell back to an older snapshot (StaleMessage non-empty,
+// mirroring reconstruct.StaleWarning.Message on a #466 fallback) must surface
+// that as a "baseline-stale:<schema>.<table>" entry in Result.WARNINGS —
+// never Incomplete — so Complete() stays true and a caller's exit code is
+// unaffected. A non-stale lookup (empty StaleMessage) must not add the
+// warning. Two parent roots pin the dedup the issue asked for (addWarning
+// keyed on "baseline-stale:<schema>.<table>", not per-parent):
+// BaselineChildren is called once per root, but the warning must appear
+// exactly once.
+func TestPhase2_staleBaselineWarnsButStaysComplete(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
@@ -250,27 +260,31 @@ func TestPhase2_staleBaselinePropagatesIncomplete(t *testing.T) {
 	if stale.calls != 2 {
 		t.Fatalf("BaselineChildren calls = %d, want 2 (one per parent root) for the dedup below to be meaningful", stale.calls)
 	}
-	// The stale-fallback caveat must not suppress the recovered victim itself —
+	// The stale-fallback warning must not suppress the recovered victim itself —
 	// staleness is a transparency signal, not a coverage gap (see the issue's
 	// "why it's not urgent" analysis: no rows are lost, only the advisory).
 	if k := victimKeys(res.Victims); !k["child:10"] {
 		t.Fatalf("stale baseline lookup should still recover child:10, got %v", res.Victims)
 	}
-	if res.Complete() {
-		t.Fatalf("a stale baseline fallback must be reported as Incomplete, got Complete()=true")
+	// The core correction: this is COMPLETE, not Incomplete.
+	if !res.Complete() {
+		t.Fatalf("a stale-but-fully-augmented baseline fallback must stay Complete (staleness is advisory, not data loss); got Incomplete=%v", res.Incomplete)
+	}
+	if len(res.Incomplete) != 0 {
+		t.Fatalf("the stale-baseline signal must NEVER appear in Incomplete, got %v", res.Incomplete)
 	}
 	count := 0
-	for _, msg := range res.Incomplete {
+	for _, msg := range res.Warnings {
 		if msg == staleMsg {
 			count++
 		}
 	}
 	if count != 1 {
-		t.Fatalf("want the stale-baseline caveat deduped to exactly 1 entry despite %d BaselineChildren calls, got %d occurrences in Incomplete=%v",
-			stale.calls, count, res.Incomplete)
+		t.Fatalf("want the stale-baseline warning deduped to exactly 1 entry despite %d BaselineChildren calls, got %d occurrences in Warnings=%v",
+			stale.calls, count, res.Warnings)
 	}
 
-	// A non-stale lookup (empty StaleMessage) must not add the caveat.
+	// A non-stale lookup (empty StaleMessage) must not add the warning.
 	fresh := &fakeBaseline{
 		ok:   true,
 		snap: T.Add(-2 * time.Hour),
@@ -284,12 +298,51 @@ func TestPhase2_staleBaselinePropagatesIncomplete(t *testing.T) {
 	if !res2.Complete() {
 		t.Fatalf("a non-stale, fully-covered baseline cascade should stay Complete; got Incomplete=%v", res2.Incomplete)
 	}
+	if len(res2.Warnings) != 0 {
+		t.Fatalf("a non-stale lookup must not add a warning, got Warnings=%v", res2.Warnings)
+	}
+}
+
+// TestPhase2_staleBaselineSuppressedWhenNoRowsMatched pins the "gate" half of
+// #618's correction: the review's second defect was that the stale-fallback
+// signal fired even when the baseline provider covered the table but
+// returned ZERO rows for this parent — i.e. the baseline never influenced the
+// output at all. StaleMessage must be ignored in that case (no Warnings
+// entry), same as it is ignored when augmentation is skipped for truncation
+// or archives (see TestPhase2_truncationSkipsBaseline /
+// TestPhase2_archivesSkipBaseline).
+func TestPhase2_staleBaselineSuppressedWhenNoRowsMatched(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	eng := query.New(db)
+	T := time.Now().UTC()
+
+	stale := &fakeBaseline{ok: true, snap: T.Add(-2 * time.Hour), stale: "baseline for " + dbName + ".child is stale"}
+	res, err := cascade.SynthesizeVictims(context.Background(), eng, cascadeFK(dbName), parentDelete(dbName, T),
+		cascade.Options{Baseline: stale})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.Warnings) != 0 {
+		t.Errorf("a covered-but-empty baseline lookup must not surface the stale warning (it never influenced the output), got Warnings=%v", res.Warnings)
+	}
+	if !res.Complete() {
+		t.Errorf("an empty baseline lookup with no binlog events is trivially complete; got Incomplete=%v", res.Incomplete)
+	}
 }
 
 // TestPhase2_archivesSkipBaseline pins the archive-gap guard (the #569 critical):
 // when the index has archived partitions, the live [snapshot,T] scan may be
 // gapped, so baseline augmentation is SKIPPED (a child re-parented/deleted in an
 // archived partition must not be resurrected from its stale baseline row).
+//
+// The fake provider ALSO carries a non-empty StaleMessage here (a #618 review
+// finding: this test previously passed only because StaleMessage happened to
+// be empty, leaving the archives-present + stale-baseline interaction
+// untested in both directions). Augmentation being skipped means the baseline
+// never influenced the output, so the stale-fallback warning must NOT fire
+// either — only the pre-existing "archived" Incomplete caveat should.
 func TestPhase2_archivesSkipBaseline(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	db, dbName := testutil.CreateTestDB(t)
@@ -298,7 +351,8 @@ func TestPhase2_archivesSkipBaseline(t *testing.T) {
 	T := time.Now().UTC()
 
 	fb := &fakeBaseline{ok: true, snap: T.Add(-2 * time.Hour),
-		rows: []cascade.BaselineRow{{PKValues: "10", Row: map[string]any{"id": int64(10), "pid": int64(1)}}}}
+		rows:  []cascade.BaselineRow{{PKValues: "10", Row: map[string]any{"id": int64(10), "pid": int64(1)}}},
+		stale: "baseline for " + dbName + ".child is stale: the table is absent from the newest snapshot"}
 	res, err := cascade.SynthesizeVictims(context.Background(), eng, cascadeFK(dbName), parentDelete(dbName, T),
 		cascade.Options{Baseline: fb, ArchivesPresent: true})
 	if err != nil {
@@ -309,6 +363,9 @@ func TestPhase2_archivesSkipBaseline(t *testing.T) {
 	}
 	if res.Complete() || !strings.Contains(strings.Join(res.Incomplete, " "), "archived") {
 		t.Errorf("archive-gap skip must flag incompleteness; Incomplete=%v", res.Incomplete)
+	}
+	if len(res.Warnings) != 0 {
+		t.Errorf("the stale-baseline warning must NOT fire when archives-present skipped augmentation entirely (the baseline never influenced the output); got Warnings=%v", res.Warnings)
 	}
 }
 

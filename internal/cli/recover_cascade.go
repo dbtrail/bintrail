@@ -369,6 +369,10 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	if synthErr != nil {
 		caveats = append(caveats, "an index query failed mid-synthesis; the result is partial: "+synthErr.Error())
 	}
+	// warnings are advisory-only (cascade.Result.Warnings, #618): the recovery
+	// is COMPLETE despite them, so they are kept OUT of caveats and never reach
+	// cascadeExit's exit-code gate below.
+	warnings := res.Warnings
 
 	rows := append(append([]query.ResultRow{}, parentDeletes...), res.Victims...)
 
@@ -379,6 +383,7 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		Parents:        len(parentDeletes),
 		Children:       len(res.Victims),
 		Caveats:        caveats,
+		Warnings:       warnings,
 		BaselineActive: baselineProvider != nil,
 	}
 
@@ -401,12 +406,15 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 			Complete         bool     `json:"complete"`
 			OperationalError bool     `json:"operational_error,omitempty"`
 			Incomplete       []string `json:"incomplete,omitempty"`
-			Output           string   `json:"output,omitempty"`
-			SQL              string   `json:"sql,omitempty"`
+			// Warnings are advisory-only (#618): unlike Incomplete, they never
+			// affect Complete or the process exit code.
+			Warnings []string `json:"warnings,omitempty"`
+			Output   string   `json:"output,omitempty"`
+			SQL      string   `json:"sql,omitempty"`
 		}{
 			Parents: len(parentDeletes), Children: len(res.Victims), SetNullRestores: len(res.SetNullRows), Statements: n,
 			Complete: len(caveats) == 0 && synthErr == nil, OperationalError: synthErr != nil,
-			Incomplete: caveats, Output: rcOutput,
+			Incomplete: caveats, Warnings: warnings, Output: rcOutput,
 		}
 		if rcOutput == "" {
 			out.SQL = buf.String()
@@ -460,6 +468,11 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	}
 	for _, c := range caveats {
 		slog.Warn("cascade recovery incomplete", "reason", c)
+	}
+	// Advisory-only (#618): logged distinctly from the Incomplete loop above —
+	// these do NOT mean the recovery is partial.
+	for _, wmsg := range warnings {
+		slog.Warn("cascade recovery advisory", "note", wmsg)
 	}
 	slog.Info("cascade recovery SQL generated",
 		"parents", len(parentDeletes), "children", len(res.Victims), "statements", n,

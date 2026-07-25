@@ -315,6 +315,92 @@ func TestRecoverCascade_phase2BaselineRecoversUntouchedChild(t *testing.T) {
 	}
 }
 
+// TestRecoverCascade_phase2StaleBaselineWarnsExitZero pins the #618 CORRECTION
+// end to end: when Phase-2 falls back to an older baseline snapshot because
+// the child table is absent from the newest one, the command must (a) still
+// print the SQL, (b) still recover the untouched baseline children, (c) print
+// the advisory under the distinct "NOTE — advisory" banner rather than
+// "!!! INCOMPLETE RECOVERY", and — the concrete, load-bearing assertion — (d)
+// EXIT ZERO without --allow-incomplete. A review of the original #618 PR found
+// it had wired this through Result.Incomplete, which made recover-cascade
+// exit non-zero on every run against a deployment whose baseline had gone
+// stale, even though the issue's own analysis says no data is missing.
+func TestRecoverCascade_phase2StaleBaselineWarnsExitZero(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	snapTs := "2026-06-01 00:00:00"
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "pid", 2, "", "int", "YES")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "payload", 3, "", "varchar", "YES")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "created_at", 4, "", "datetime", "YES")
+
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (1, 'fk', ?, 'child', 'pid', 1, ?, 'parent', 'id', 'CASCADE', 'RESTRICT')`, dbName, dbName)
+
+	// Parent DELETE in the binlog; the children have NO binlog events — they
+	// live only in the baseline (Phase-1 blind spot, forces real Phase-2
+	// augmentation so the gate at cascade.go's `baseCovered && len(baseRows) >
+	// 0` is satisfied and the stale warning has a chance to fire).
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	parentTs := h.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "b.000001", 10, 20, parentTs, nil, dbName, "parent", 3 /*DELETE*/, "1", nil, []byte(`{"id":1}`), nil)
+
+	// TWO baseline generations: the older one has shop.child (2026-06-01), the
+	// newer one (2026-06-15, still before the parent delete above) does NOT —
+	// this is exactly the #466/#618 stale-fallback trigger.
+	baselineDir := t.TempDir()
+	olderDir := filepath.Join(baselineDir, "2026-06-01T00-00-00Z")
+	writeChildBaseline(t, filepath.Join(olderDir, dbName, "child.parquet"))
+	if err := baseline.WriteSuccessMarker(olderDir); err != nil {
+		t.Fatalf("write success marker (older): %v", err)
+	}
+	newerDir := filepath.Join(baselineDir, "2026-06-15T00-00-00Z")
+	if err := os.MkdirAll(newerDir, 0o755); err != nil {
+		t.Fatalf("mkdir newer snapshot dir: %v", err)
+	}
+	if err := baseline.WriteSuccessMarker(newerDir); err != nil {
+		t.Fatalf("write success marker (newer): %v", err)
+	}
+
+	out := filepath.Join(t.TempDir(), "cascade.sql")
+	cleanCascadeFlags(testutil.IntegrationDSN(dbName), dbName, out)
+	rcPK = "1"
+	rcBaselineDir = baselineDir
+	defer func() { rcBaselineDir = "" }()
+
+	// The concrete assertion: exit code 0, WITHOUT --allow-incomplete.
+	if err := runCascadeCmd(t); err != nil {
+		t.Fatalf("a stale-but-complete baseline recovery must exit 0 without --allow-incomplete, got: %v", err)
+	}
+
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	sql := string(b)
+	for _, want := range []string{
+		"keep10", "keep11", // baseline children still recovered
+		"NOTE — advisory, recovery below is COMPLETE",
+		"is stale", // reconstruct.staleFallback's message text
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("output missing %q\n---\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "INCOMPLETE RECOVERY") {
+		t.Errorf("a stale-but-complete baseline fallback must NOT render the INCOMPLETE banner\n---\n%s", sql)
+	}
+}
+
 // writeCompositeChildBaseline writes a `child` snapshot with a composite PK (a,b).
 func writeCompositeChildBaseline(t *testing.T, parquetPath string) {
 	t.Helper()

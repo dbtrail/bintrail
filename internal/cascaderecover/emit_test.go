@@ -283,6 +283,79 @@ SET FOREIGN_KEY_CHECKS=1;
 	}
 }
 
+// TestEmitSQL_goldenWarnings pins #618's correction: an advisory-only note
+// (cascade.Result.Warnings, e.g. a stale Phase-2 baseline fallback) renders
+// under its OWN "NOTE — advisory" banner, distinct from the
+// "!!! INCOMPLETE RECOVERY" banner Caveats gets — never implying data loss.
+func TestEmitSQL_goldenWarnings(t *testing.T) {
+	hdr := cascaderecover.Header{
+		Schema: "shop", Table: "orders",
+		Parents: 1, Children: 0,
+		BaselineActive: true,
+		Warnings: []string{
+			"baseline for shop.orders is stale: the table is absent from the newest snapshot (2026-02-01T00:00:00Z); reconstructing from an older snapshot (2026-01-01T00:00:00Z) — re-dump to refresh it",
+		},
+	}
+	const want = `-- bintrail recover-cascade: reverse ON DELETE CASCADE / SET NULL side effects on shop.orders
+-- Re-inserts 1 deleted parent row(s) and 0 cascade-deleted child row(s); restores 0 SET NULL'd FK(s)
+-- that InnoDB removed/nulled below the binlog (MySQL Bug #32506). NEVER auto-applied.
+--
+-- Phase-2 baseline fallback ACTIVE: children present in a covered baseline are
+-- reconstructed even if untouched within the window. Tables NOT covered by a
+-- baseline are flagged above. "Complete" means everything DETECTABLE was recovered.
+--
+-- If you have already re-created a deleted parent, delete its INSERT below:
+-- SET FOREIGN_KEY_CHECKS=0 does NOT suppress PRIMARY KEY violations.
+--
+-- NOTE — advisory, recovery below is COMPLETE (nothing is missing):
+--   - baseline for shop.orders is stale: the table is absent from the newest snapshot (2026-02-01T00:00:00Z); reconstructing from an older snapshot (2026-01-01T00:00:00Z) — re-dump to refresh it
+
+SET FOREIGN_KEY_CHECKS=0;
+
+-- No events matched the specified criteria.
+
+SET FOREIGN_KEY_CHECKS=1;
+`
+	got, _, err := emit(t, hdr, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("EmitSQL: %v", err)
+	}
+	if got != want {
+		t.Errorf("byte-identity drift.\n--- got ---\n%q\n--- want ---\n%q", got, want)
+	}
+	if strings.Contains(got, "INCOMPLETE") {
+		t.Errorf("a Warnings-only header must NEVER render the INCOMPLETE banner, got:\n%s", got)
+	}
+}
+
+// TestEmitSQL_caveatsAndWarningsRenderAsSeparateBlocks proves Caveats and
+// Warnings never merge into one list even when both are present — each keeps
+// its own banner, so a reader (or a script grepping for "!!! INCOMPLETE")
+// cannot mistake an advisory note for a data-loss caveat or vice versa.
+func TestEmitSQL_caveatsAndWarningsRenderAsSeparateBlocks(t *testing.T) {
+	hdr := cascaderecover.Header{
+		Schema: "shop", Table: "orders",
+		Parents: 1, Children: 0,
+		Caveats:  []string{"archived partitions exist; coverage unknown"},
+		Warnings: []string{"baseline for shop.orders is stale: re-dump to refresh it"},
+	}
+	got, _, err := emit(t, hdr, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("EmitSQL: %v", err)
+	}
+	incompleteIdx := strings.Index(got, "!!! INCOMPLETE RECOVERY")
+	noteIdx := strings.Index(got, "NOTE — advisory")
+	if incompleteIdx < 0 || noteIdx < 0 {
+		t.Fatalf("want both banners present, got:\n%s", got)
+	}
+	if strings.Contains(got, "!!! INCOMPLETE RECOVERY") && strings.Contains(got[incompleteIdx:noteIdx], hdr.Warnings[0]) {
+		t.Errorf("a Warnings message leaked into the Caveats/INCOMPLETE block:\n%s", got)
+	}
+	if !strings.Contains(got, "archived partitions exist; coverage unknown") || !strings.Contains(got, "baseline for shop.orders is stale") {
+		t.Fatalf("both a caveat and a warning must be present, got:\n%s", got)
+	}
+}
+
 // orderResolver builds a DB-free resolver for shop.orders with PK `id` and a
 // nullable FK `customer_id`, used to exercise the SET NULL restoration path.
 func orderResolver() *metadata.Resolver {

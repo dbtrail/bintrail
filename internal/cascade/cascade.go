@@ -172,17 +172,30 @@ func (o Options) withDefaults() Options {
 }
 
 // Result is the outcome of cascade synthesis. Victims are the synthetic DELETE
-// rows to feed recovery.GenerateSQLFromRows. Incomplete lists every reason the
-// reconstruction may be partial (composite FKs skipped, depth/candidate caps
-// hit, index anomalies, DDL-skew). For a recovery tool the caller MUST treat a
-// non-empty Incomplete as "this recovery is provably partial" and surface it —
-// never apply it as if complete. A non-nil error from SynthesizeVictims is an
-// operational failure (e.g. an index query failed) that ALSO leaves Victims
-// partial; it is reported in Incomplete too, so checking either suffices.
+// rows to feed recovery.GenerateSQLFromRows.
+//
+// Incomplete and Warnings are two DELIBERATELY separate channels — this
+// distinction is the whole point of #618's correction, so it is worth stating
+// plainly:
+//
+//   - Incomplete lists every reason the recovery is provably PARTIAL: data may
+//     be missing from Victims/SetNullRows.
+//   - Warnings lists advisory notes about a COMPLETE recovery: nothing is
+//     missing, but something about the inputs deserves the operator's
+//     attention.
+//
+// For a recovery tool the caller MUST treat a non-empty Incomplete as "this
+// recovery is provably partial" and surface it — never apply it as if
+// complete. A non-nil error from SynthesizeVictims is an operational failure
+// (e.g. an index query failed) that ALSO leaves Victims partial; it is
+// reported in Incomplete too, so checking either suffices. Warnings, by
+// contrast, must NEVER gate a caller's exit code or "complete" flag — only
+// Incomplete does that (see Complete()).
 type Result struct {
 	Victims     []query.ResultRow
 	SetNullRows []SetNullRestore
 	Incomplete  []string
+	Warnings    []string
 }
 
 // SetNullRestore describes a child whose foreign key an ON DELETE SET NULL
@@ -214,7 +227,10 @@ func (r Result) Complete() bool { return len(r.Incomplete) == 0 }
 //
 // Coverage is best-effort: every gap is recorded in Result.Incomplete, and an
 // operational query failure additionally returns a non-nil error. The caller
-// must not present a partial Result as a complete recovery.
+// must not present a partial Result as a complete recovery. Advisory notes
+// that do NOT mean data is missing (e.g. a Phase-2 baseline that fell back to
+// an older snapshot, #618) go in Result.Warnings instead — see the Result doc
+// comment for why the two channels are kept separate.
 func SynthesizeVictims(
 	ctx context.Context,
 	eng *query.Engine,
@@ -228,6 +244,7 @@ func SynthesizeVictims(
 		victims     []query.ResultRow
 		setNullRows []SetNullRestore
 		incomplete  []string
+		warnings    []string
 		errs        []error
 	)
 	// setNullSeen dedups SET NULL restores per (schema.table.column, pk) with
@@ -261,6 +278,17 @@ func SynthesizeVictims(
 		}
 		reported[key] = true
 		incomplete = append(incomplete, msg)
+	}
+	// addWarning is addIncomplete's advisory sibling: same once-per-key dedup,
+	// but appends to Warnings, never Incomplete — it must never make a complete
+	// recovery look partial (#618's correction; see the Result doc comment).
+	warned := map[string]bool{}
+	addWarning := func(key, msg string) {
+		if warned[key] {
+			return
+		}
+		warned[key] = true
+		warnings = append(warnings, msg)
 	}
 
 	// Count columns per constraint so composite (multi-column) FKs can be
@@ -397,6 +425,7 @@ func SynthesizeVictims(
 					baseTrunc    bool
 					baseCovered  bool
 					baseSincePos *query.BinlogPos
+					baseStaleMsg string // reconstruct.StaleWarning.Message, if the provider fell back to an older snapshot (#618)
 				)
 				if opts.Baseline != nil {
 					bl, covered, berr := opts.Baseline.BaselineChildren(ctx, fk.Schema, fk.Table, fk.Column, parentPK, item.rootTS, opts.CandidateLimit)
@@ -408,14 +437,13 @@ func SynthesizeVictims(
 						baseCovered, baseSnap, baseRows, baseTrunc = true, bl.SnapshotTime, bl.Rows, bl.Truncated
 						since = bl.SnapshotTime
 						baseSincePos = bl.SincePos
-						if bl.StaleMessage != "" {
-							// #618: the reconstruct tab surfaces this exact signal via
-							// appendStaleWarning ("stale_baseline: …"); the cascade
-							// Phase-2 fallback silently used the same stale snapshot
-							// with no caveat until now. Deduped per (schema, table) —
-							// every parent that hits this child reuses the same key.
-							addIncomplete("baseline-stale:"+fk.Schema+"."+fk.Table, bl.StaleMessage)
-						}
+						// #618: reconstruct.StaleWarning.Message, when the provider fell
+						// back to an older snapshot. Captured here but NOT reported yet —
+						// it is only meaningful once we know baseline augmentation
+						// actually ran (baseCovered && len(baseRows) > 0, AND neither the
+						// binlog-truncation nor archives-present skip fired below); see
+						// the "default:" branch of that gate.
+						baseStaleMsg = bl.StaleMessage
 					default:
 						addIncomplete("nobaseline:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
 							"no baseline covers %s.%s; children untouched within the lookback window are not reconstructed", fk.Schema, fk.Table))
@@ -597,6 +625,22 @@ func SynthesizeVictims(
 								"skipped baseline augmentation to avoid resurrecting rows whose deletion/re-parent was archived",
 							fk.Schema, fk.Table))
 					default:
+						// #618: the stale-baseline advisory belongs HERE, not at the
+						// BaselineChildren call site above — this is the only branch
+						// where a baseline row actually reaches the output (the
+						// binlogTrunc/ArchivesPresent branches above skip augmentation
+						// entirely, and the outer `len(baseRows) > 0` gate already
+						// excludes an empty baseline read). Firing it earlier flagged
+						// runs where the baseline never influenced anything, and — the
+						// more serious defect — routed it through addIncomplete, which
+						// both renderers (cascaderecover.EmitSQL, console api.go)
+						// interpret as "data may be missing". It is not: #618's own
+						// analysis is that a stale-fallback window still reconstructs
+						// correctly, so this is Warnings-only and never affects
+						// Complete() or a caller's exit code.
+						if baseStaleMsg != "" {
+							addWarning("baseline-stale:"+fk.Schema+"."+fk.Table, baseStaleMsg)
+						}
 						if baseTrunc {
 							addIncomplete("baseline-truncate:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
 								"more than %d baseline children for %s.%s; some untouched children were NOT reconstructed",
@@ -641,7 +685,7 @@ func SynthesizeVictims(
 		}
 		layer = next
 	}
-	return Result{Victims: dedupVictimsNewest(victims), SetNullRows: setNullRows, Incomplete: incomplete}, errors.Join(errs...)
+	return Result{Victims: dedupVictimsNewest(victims), SetNullRows: setNullRows, Incomplete: incomplete, Warnings: warnings}, errors.Join(errs...)
 }
 
 // dedupVictimsNewest collapses victims of the same (schema, table, pk) emitted
@@ -805,7 +849,9 @@ func MergeResults(results ...Result) Result {
 	}
 	var victims []query.ResultRow
 	var incomplete []string
+	var warnings []string
 	seenIncomplete := map[string]bool{}
+	seenWarning := map[string]bool{}
 	setNullByKey := map[string]SetNullRestore{}
 	var setNullOrder []string
 	for _, r := range results {
@@ -814,6 +860,17 @@ func MergeResults(results ...Result) Result {
 			if !seenIncomplete[msg] {
 				seenIncomplete[msg] = true
 				incomplete = append(incomplete, msg)
+			}
+		}
+		// Same once-per-message dedup as Incomplete above, kept as a SEPARATE
+		// map: a stale-baseline Warning and an Incomplete caveat must never
+		// collide on the same seen-set just because both happen to be plain
+		// strings (they never share text today, but the channels are
+		// independent by design — see the Result doc comment).
+		for _, msg := range r.Warnings {
+			if !seenWarning[msg] {
+				seenWarning[msg] = true
+				warnings = append(warnings, msg)
 			}
 		}
 		for _, sr := range r.SetNullRows {
@@ -832,6 +889,7 @@ func MergeResults(results ...Result) Result {
 		Victims:     dedupVictimsNewest(victims),
 		SetNullRows: setNullRows,
 		Incomplete:  incomplete,
+		Warnings:    warnings,
 	}
 }
 

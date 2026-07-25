@@ -351,6 +351,13 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 				}, cres.Caveats...)
 				cw = append(cw, warnings...)
 			}
+			// cres.Warnings are advisory-only (#618, e.g. a Phase-2 baseline that
+			// fell back to an older snapshot) — appended unconditionally, same
+			// treatment the reconstruct tab gives an identical stale-baseline
+			// signal (appendStaleWarning in reconstruct.go): visible in the
+			// response's Warnings list, but never framed as "provably partial"
+			// and never gating CascadeDetected/complete-ness above.
+			cw = append(cw, cres.Warnings...)
 			writeJSON(w, http.StatusOK, recoverResponse{
 				SQL:             cres.SQL,
 				StatementCount:  cres.StatementCount,

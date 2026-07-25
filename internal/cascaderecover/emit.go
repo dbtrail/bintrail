@@ -38,8 +38,16 @@ import (
 type Header struct {
 	Schema, Table     string
 	Parents, Children int
-	Caveats           []string
-	BaselineActive    bool
+	// Caveats are reasons the recovery is PROVABLY PARTIAL (cascade.Result.
+	// Incomplete) — rendered under the "!!! INCOMPLETE RECOVERY" banner below.
+	// Never put an advisory-only note here; use Warnings instead (#618).
+	Caveats []string
+	// Warnings are advisory notes about an otherwise-COMPLETE recovery
+	// (cascade.Result.Warnings — e.g. a Phase-2 baseline that fell back to an
+	// older snapshot). Rendered visibly but WITHOUT the data-loss framing:
+	// nothing here means a row is missing.
+	Warnings       []string
+	BaselineActive bool
 	// Combined switches the preamble to the cascade-AWARE recover wording used
 	// when the console auto-detects a cascade parent inside a normal recover: the
 	// base reversal of the selected change(s) is composed with the synthesized
@@ -146,6 +154,15 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 		b.WriteString("--\n-- !!! INCOMPLETE RECOVERY — the result is provably partial:\n")
 		for _, c := range hdr.Caveats {
 			fmt.Fprintf(&b, "--   - %s\n", c)
+		}
+	}
+	// Warnings are deliberately NOT folded into the block above (#618): they are
+	// advisory notes about a recovery that is otherwise COMPLETE, so they get a
+	// distinct banner without the "INCOMPLETE" / "provably partial" language.
+	if len(hdr.Warnings) > 0 {
+		b.WriteString("--\n-- NOTE — advisory, recovery below is COMPLETE (nothing is missing):\n")
+		for _, note := range hdr.Warnings {
+			fmt.Fprintf(&b, "--   - %s\n", note)
 		}
 	}
 	b.WriteString("\nSET FOREIGN_KEY_CHECKS=0;\n\n")
