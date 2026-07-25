@@ -33,6 +33,26 @@ func mysqlToSeconds(t time.Time) int64 {
 	return t.UTC().Unix() + mysqlToSecondsConst
 }
 
+// EventCursor is a position in the (event_timestamp, event_id) ascending sort
+// order, used as a keyset pagination cursor (see Options.AfterEvent, #1097).
+// It is always built from a row the caller actually received, never invented:
+// that is what guarantees the next page resumes without a gap.
+type EventCursor struct {
+	Timestamp time.Time
+	EventID   uint64
+}
+
+// After reports whether c is strictly after other in the sort order. Used to
+// assert forward progress between pages — a cursor that fails to advance means
+// the engine returned rows at-or-before the previous cursor, which would loop
+// forever if the caller kept paging.
+func (c EventCursor) After(other EventCursor) bool {
+	if !c.Timestamp.Equal(other.Timestamp) {
+		return c.Timestamp.After(other.Timestamp)
+	}
+	return c.EventID > other.EventID
+}
+
 // ─── RBAC types ───────────────────────────────────────────────────────────────
 
 // SchemaTable identifies a schema+table pair used in RBAC deny rules.
@@ -182,7 +202,28 @@ type Options struct {
 	// recover. The exact correctness gate is the position comparison alone.
 	// nil = no position bound; older baselines that never recorded one fall back
 	// to the plain Since time filter.
-	SincePos      *BinlogPos
+	SincePos *BinlogPos
+	// AfterEvent, when set, restricts results to events strictly AFTER this
+	// point in the (event_timestamp, event_id) sort order — the keyset cursor
+	// that makes a windowed fetch pageable without OFFSET (#1097).
+	//
+	// It filters on the SORT KEY, not on a correctness bound, which is what
+	// makes it composable with every other filter here: whatever set Since /
+	// SincePos / Until / UntilPos admit, this pages through that set in the
+	// engine's ascending order without changing its membership. Both key
+	// components are needed because event_timestamp has one-second resolution
+	// and collides heavily — a timestamp-only cursor would either re-return or
+	// skip the events sharing the boundary second. event_id breaks every tie,
+	// so the composite key is total and each page resumes exactly where the
+	// previous one stopped.
+	//
+	// ASCENDING ORDER ONLY. With Order="DESC" the predicate below would page
+	// the wrong way (it would walk away from the unread remainder); callers
+	// must not combine the two, and FetchMergedStream refuses the pairing
+	// rather than returning a silently truncated stream.
+	//
+	// nil = no cursor (fetch from the start of the window).
+	AfterEvent    *EventCursor
 	ChangedColumn string     // column name; matched via JSON_CONTAINS
 	ColumnEq      []ColumnEq // match against values inside row_after / row_before
 	Flag          string     // return events from tables/columns carrying this flag
@@ -440,6 +481,22 @@ func buildQuery(opts Options) (string, []any) {
 			" OR (CHAR_LENGTH(binlog_file) = CHAR_LENGTH(?) AND binlog_file < ?)"+
 			" OR (binlog_file = ? AND end_pos <= ?))")
 		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
+	}
+	if opts.AfterEvent != nil {
+		// Hour-aligned TO_SECONDS literal so MySQL can prune partitions at parse
+		// time, exactly like the Since/Until hints above — a parameterised
+		// datetime comparison alone prunes nothing. Safe by construction: every
+		// row still to be returned sorts at-or-after the cursor, so its
+		// event_timestamp is >= the cursor's, and flooring to the hour only
+		// widens that. As the cursor advances across pages this hint tightens
+		// with it, so later pages scan fewer partitions rather than more.
+		outerAfter := mysqlToSeconds(opts.AfterEvent.Timestamp.Truncate(time.Hour))
+		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", outerAfter))
+		// The exact keyset cut on the composite sort key. Kept as a separate
+		// predicate from the pruning hint above: the hint is hour-granular and
+		// deliberately over-inclusive, this is the precise boundary.
+		where = append(where, "(event_timestamp > ? OR (event_timestamp = ? AND event_id > ?))")
+		args = append(args, opts.AfterEvent.Timestamp, opts.AfterEvent.Timestamp, opts.AfterEvent.EventID)
 	}
 	if opts.ChangedColumn != "" {
 		// json.Marshal produces the JSON string representation (with quotes),
