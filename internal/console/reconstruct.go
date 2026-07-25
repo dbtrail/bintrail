@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -433,6 +434,16 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+	mode := "row"
+	if history {
+		mode = "history"
+	}
+	recordConsoleAccess(r, "reconstruct.run", schema, table, map[string]string{
+		"mode":   mode,
+		"at":     atTime.UTC().Format(time.RFC3339),
+		"events": strconv.Itoa(len(rows)),
+		"found":  strconv.FormatBool(resp.Found),
+	})
 }
 
 // pkColumns returns the primary-key column names for schema.table from the

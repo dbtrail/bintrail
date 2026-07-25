@@ -9,6 +9,38 @@ import (
 // SQL against a user database, so events fall into two classes:
 // historical data access (query, shim time-travel, reconstruct) and
 // mutation-artifact generation (recover producing a reversal script).
+//
+// The wiring is pinned by contract tests (internal/audittest holds the
+// canonical list; one table-driven test per surface exercises the real
+// code path with a recording sink), so an emission site cannot be
+// dropped in a refactor with CI green. Every surface below emits:
+//
+//   - "cli"     — query.run, recover.generate, recover.cascade,
+//     reconstruct.run, verify.explain. bintrail-pg shares
+//     these command implementations (internal/cli) and so
+//     reports the same "cli" surface; there is no "pg" surface.
+//   - "mcp"     — query.run, recover.generate (internal/mcptools; the
+//     console's /mcp endpoint reuses the same handlers with
+//     Surface "console").
+//   - "shim"    — timetravel.query, for every virtual schema that returns
+//     row images (_flashback, _snapshot, _diff), from the
+//     standalone `bintrail shim` AND the console's embedded
+//     flashback port. Actor is the authenticated MySQL user.
+//   - "console" — query.run, recover.generate, recover.cascade,
+//     reconstruct.run, verify.explain, plus authz.denied
+//     (an authorization refusal, not a data read).
+//
+// Deliberately NOT audited, so the contract and the wiring agree:
+//
+//   - metadata-only reads that return no row images: the shim's
+//     SHOW TABLES FROM <virtual schema>, and the console's
+//     status/schemas/capabilities/storage/baselines endpoints.
+//   - `verify` without --explain: it compares fingerprints and reports
+//     match/mismatch per table; only the --explain drill-down surfaces
+//     row-level data, and that is what emits verify.explain.
+//   - the capture plane (index, snapshot, stream, agent, rotate,
+//     archive): those write or maintain the index, they do not read
+//     historical row data back out.
 type AuditEvent struct {
 	Time    time.Time         // stamped by Record when zero
 	Surface string            // "cli", "mcp", "shim", "console"
@@ -35,8 +67,22 @@ func SetAuditSink(s AuditSink) {
 	sink = s
 }
 
+// Auditing reports whether a sink is installed. Call it before BUILDING
+// an AuditEvent on a hot path (the shim serves one time-travel query per
+// client round trip): Record itself is a nil check, but the Detail map
+// its callers assemble is a real allocation the OSS build would pay for
+// nothing. Off the hot path, just call Record.
+func Auditing() bool {
+	return sink != nil
+}
+
 // Record forwards an event to the installed sink, stamping Time when
 // unset. Safe to call with no sink installed.
+//
+// Recording is a side channel: Record returns nothing and AuditSink.Record
+// returns nothing, so a sink cannot fail a user's query by construction.
+// Call it on the success path, after the artifact the operator asked for
+// has been produced.
 func Record(ctx context.Context, ev AuditEvent) {
 	if sink == nil {
 		return

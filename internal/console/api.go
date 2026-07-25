@@ -253,6 +253,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		Limit:    opts.Limit,
 		Warnings: gapWarnings(plan),
 	})
+	recordConsoleAccess(r, "query.run", opts.Schema, opts.Table, map[string]string{
+		"results": strconv.Itoa(len(rows)),
+		"format":  "json",
+	})
 }
 
 // handleRecover serves POST /api/recover — generates undo SQL. It NEVER
@@ -423,6 +427,15 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 				VictimCount:     cres.VictimCount,
 				SetNullCount:    cres.SetNullCount,
 			})
+			// Still recover.generate (this IS /api/recover), with cascade=true:
+			// the explicit /api/recover-cascade endpoint is what emits
+			// recover.cascade, so the two are distinguishable in the trail.
+			recordConsoleAccess(r, "recover.generate", body.Schema, body.Table, map[string]string{
+				"statements": strconv.Itoa(cres.StatementCount),
+				"rows":       strconv.Itoa(len(rows)),
+				"cascade":    "true",
+				"victims":    strconv.Itoa(cres.VictimCount),
+			})
 			return
 		}
 	}
@@ -447,6 +460,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		StatementCount: n,
 		RowCount:       len(rows),
 		Warnings:       warnings,
+	})
+	recordConsoleAccess(r, "recover.generate", opts.Schema, opts.Table, map[string]string{
+		"statements": strconv.Itoa(n),
+		"rows":       strconv.Itoa(len(rows)),
+		"cascade":    "false",
 	})
 }
 

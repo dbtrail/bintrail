@@ -1,17 +1,20 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
@@ -471,6 +474,17 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	mode := "row"
+	if recHistory {
+		mode = "history"
+	}
+	auditReconstruct(cmd.Context(), mode, recSchema, recTable, map[string]string{
+		"pk":     recPK,
+		"at":     at.UTC().Format(time.RFC3339),
+		"events": strconv.Itoa(len(events)),
+		"format": recFormat,
+	})
+
 	slog.Info("reconstruct complete",
 		"schema", recSchema, "table", recTable, "pk", recPK,
 		"at", at.UTC().Format(time.RFC3339),
@@ -507,6 +521,11 @@ func runReconstructSQL(cmd *cobra.Command, start time.Time) error {
 			return err
 		}
 	}
+	auditReconstruct(cmd.Context(), "sql", recSchema, recTable, map[string]string{
+		"rows":   strconv.Itoa(len(results)),
+		"format": recFormat,
+	})
+
 	slog.Info("reconstruct SQL complete",
 		"rows", len(results),
 		"duration_ms", time.Since(start).Milliseconds())
@@ -666,6 +685,18 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 			"files", len(rep.Files),
 			"duration_ms", rep.Duration.Milliseconds())
 	}
+	// One event per reconstructed TABLE, not one per run: the audit trail's
+	// unit is "who read which table's historical rows", and a --tables run
+	// materializes each of them in full.
+	for _, rep := range reports {
+		auditReconstruct(cmd.Context(), "full-table", rep.Schema, rep.Table, map[string]string{
+			"at":         recAt,
+			"rows":       strconv.FormatInt(rep.BaselineRows+rep.UpdatesApplied+rep.InsertsEmitted, 10),
+			"events":     strconv.FormatInt(rep.EventsApplied, 10),
+			"output_dir": recOutputDir,
+		})
+	}
+
 	slog.Info("full-table reconstruct complete",
 		"tables", len(reports),
 		"total_rows", totalRows,
@@ -673,6 +704,32 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 		"output_dir", recOutputDir,
 		"duration_ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// auditReconstruct reports a completed point-in-time reconstruction to the
+// audit seam. reconstruct reads a baseline snapshot's row images and folds
+// binlog deltas onto them — historical data access in the same class as
+// query/shim time-travel, which is exactly what ext/audit.go's contract
+// names. ext.Record is a no-op unless an embedding distribution installed a
+// sink, and it cannot fail the command (see ext/audit.go).
+//
+// mode distinguishes the four shapes the one command serves: "row"
+// (single-row AS OF), "history" (--history), "full-table" (--output-format
+// mydumper) and "sql" (--sql, a direct read of the baseline Parquet).
+// reconstruct has no --profile flag, so the actor carries no RBAC profile.
+func auditReconstruct(ctx context.Context, mode, schema, table string, detail map[string]string) {
+	if detail == nil {
+		detail = map[string]string{}
+	}
+	detail["mode"] = mode
+	ext.Record(ctx, ext.AuditEvent{
+		Surface: "cli",
+		Action:  "reconstruct.run",
+		Actor:   ext.ProcessActor(""),
+		Schema:  schema,
+		Table:   table,
+		Detail:  detail,
+	})
 }
 
 // splitAndTrim splits s on sep and strips whitespace from each entry,

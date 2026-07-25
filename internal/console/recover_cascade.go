@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/cascade"
@@ -196,6 +197,14 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		Complete:       len(synth.Caveats) == 0 && synth.SynthErr == nil,
 		Incomplete:     synth.Caveats,
 		Warnings:       synth.Warnings,
+	})
+	// An incomplete synthesis still produced a script, so it is still recorded
+	// (matching the CLI's emit-before-cascadeExit placement).
+	recordConsoleAccess(r, "recover.cascade", body.Schema, body.Table, map[string]string{
+		"statements": strconv.Itoa(n),
+		"parents":    strconv.Itoa(len(synth.ParentDeletes)),
+		"children":   strconv.Itoa(len(synth.Victims)),
+		"complete":   strconv.FormatBool(len(synth.Caveats) == 0 && synth.SynthErr == nil),
 	})
 }
 

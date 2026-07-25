@@ -200,7 +200,7 @@ func recordConsoleDeny(r *http.Request, action, missingPermission string, extra 
 	ext.Record(r.Context(), ext.AuditEvent{
 		Surface: "console",
 		Action:  action,
-		Actor:   identityFrom(r.Context()),
+		Actor:   consoleActor(r),
 		Detail:  detail,
 	})
 }

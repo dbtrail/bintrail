@@ -19,6 +19,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
@@ -144,9 +145,25 @@ type Handler struct {
 	// is strictly opt-in and cannot change behaviour for an unbound handler.
 	conn packetWriter
 
+	// actor is the authenticated MySQL user this connection handshook as,
+	// set by BindActor. It is the audit identity for every time-travel
+	// query on this connection (ext.AuditEvent.Actor) — the shim is a
+	// NETWORK surface with real per-tenant authentication, so it records
+	// its authenticated user rather than the process owner
+	// (ext.ProcessActor, which is what the local CLI/MCP surfaces use).
+	// Unbound handlers report unboundActor rather than "", so a serving
+	// layer that forgot to call BindActor is visible in the audit trail
+	// instead of indistinguishable from a real event.
+	actor string
+
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
 }
+
+// unboundActor is the audit identity of a Handler nobody called
+// BindActor on (unit tests, or a serving layer that forgot). Deliberately
+// not "" — an empty Actor reads like a normal event with a missing field.
+const unboundActor = "mysql:unbound"
 
 // resolverCache memoises the latest metadata.Resolver across shim
 // queries. The zero value is ready to use.
@@ -371,6 +388,21 @@ func (h *Handler) BindConn(conn packetWriter) {
 	h.conn = conn
 }
 
+// BindActor records the authenticated MySQL user this connection handshook
+// as, so every time-travel query it serves is attributed to that tenant on
+// the audit seam (ext.AuditEvent.Actor). Call once, right after the
+// server.Conn is constructed (GetUser is only meaningful post-handshake)
+// and before serving commands — same lifecycle as BindConn, same
+// no-lock-needed reasoning.
+//
+// Both serving layers must call it: the standalone shim
+// (internal/cli/shim.go) and the console's embedded flashback port
+// (consoleapp/flashback.go), which routes BY username. A handler nobody
+// bound reports unboundActor.
+func (h *Handler) BindActor(user string) {
+	h.actor = user
+}
+
 // queryContext derives the context every run* entry point uses for one
 // query (#823): rooted at the connection context (BindConnContext) so
 // client disconnect / shutdown cancels it, with cfg.QueryTimeout as the
@@ -435,16 +467,24 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 		if verr := h.validatePKColumn(q); verr != nil {
 			return nil, verr
 		}
+		var (
+			res  *mysql.Result
+			rerr error
+		)
 		switch q.Type {
 		case TypeFlashback:
-			return h.runPointInTime(q)
+			res, rerr = h.runPointInTime(q)
 		case TypeSnapshot:
-			return h.runSnapshot(q)
+			res, rerr = h.runSnapshot(q)
 		case TypeDiff:
-			return h.runDiff(q)
+			res, rerr = h.runDiff(q)
 		default:
 			return nil, fmt.Errorf("unsupported query type: %s", q.Type)
 		}
+		if rerr == nil {
+			h.auditTimeTravel(q, res)
+		}
+		return res, rerr
 	}
 	if !errors.Is(perr, ErrNotTimeTravel) {
 		// Parser recognised a virtual-schema query but rejected its shape
@@ -467,6 +507,59 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 		"this server only handles _flashback / _snapshot / _diff virtual-schema queries; got: %s",
 		strings.TrimSpace(qstr),
 	))
+}
+
+// auditTimeTravel reports one served time-travel query to the audit seam.
+// Called only on the success path, after the resultset is built: a
+// refused or failed query produced no row images to record, and
+// ext.Record has no way to fail the client's query anyway (see ext/audit.go).
+//
+// Guarded by ext.Auditing() because this IS the shim's hot path — one call
+// per client round trip on a long-lived network daemon. With no sink
+// installed (the OSS default) the whole function is one nil check and the
+// Detail map below is never allocated.
+//
+// res may be nil: the streaming full-table _snapshot path (#998) writes
+// rows straight to the wire, so there is no buffered resultset to count.
+// The row count is then omitted rather than reported as zero.
+func (h *Handler) auditTimeTravel(q TimeTravelQuery, res *mysql.Result) {
+	if !ext.Auditing() {
+		return
+	}
+	actor := h.actor
+	if actor == "" {
+		actor = unboundActor
+	}
+	// q.Type.String() is the virtual schema name (_flashback / _snapshot /
+	// _diff) — the vocabulary an operator reading the trail already knows.
+	detail := map[string]string{"query_type": q.Type.String()}
+	switch q.Type {
+	case TypeDiff:
+		detail["since"] = q.Since.UTC().Format(time.RFC3339)
+		detail["until"] = q.Until.UTC().Format(time.RFC3339)
+	default:
+		detail["as_of"] = q.AsOf.UTC().Format(time.RFC3339)
+	}
+	if q.PKColumn == "" {
+		detail["scope"] = "full_table"
+	} else {
+		detail["scope"] = "single_row"
+	}
+	if res != nil && res.Resultset != nil {
+		detail["rows"] = strconv.Itoa(len(res.Resultset.Values))
+	}
+	ctx := h.baseCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ext.Record(ctx, ext.AuditEvent{
+		Surface: "shim",
+		Action:  "timetravel.query",
+		Actor:   actor,
+		Schema:  q.Schema,
+		Table:   q.Table,
+		Detail:  detail,
+	})
 }
 
 // wrapFetchError translates an error from query.FetchMerged into the

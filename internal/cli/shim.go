@@ -721,6 +721,11 @@ func handleConn(ctx context.Context, c net.Conn, db *sql.DB, srv *server.Server,
 	// Let the full-table _snapshot path stream its resultset over this
 	// connection instead of buffering it and tripping FullTableRowCap (#998).
 	handler.BindConn(mysqlConn)
+	// Attribute every time-travel query on this connection to the tenant that
+	// authenticated (ext.AuditEvent.Actor) — the shim is a network surface with
+	// real per-tenant credentials, so it records its authenticated user rather
+	// than the process owner. Post-handshake: GetUser is only meaningful here.
+	handler.BindActor(mysqlConn.GetUser())
 	if schema, ok := userSchemas[mysqlConn.GetUser()]; ok && schema != "" {
 		_ = handler.UseDB(schema)
 	}

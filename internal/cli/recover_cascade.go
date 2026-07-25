@@ -3,15 +3,18 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/cascade"
 	"github.com/dbtrail/dbtrail/internal/cascadebaseline"
 	"github.com/dbtrail/dbtrail/internal/cascaderecover"
@@ -336,6 +339,7 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		if rcOutput != "" {
 			dest = rcOutput
 		}
+		auditRecoverCascade(cmd.Context(), n, len(parentDeletes), len(res.Victims), dest)
 		return cascadeExit(dest, synthErr, caveats, rcAllowIncomplete)
 	}
 
@@ -385,7 +389,32 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 		"complete", len(caveats) == 0 && synthErr == nil,
 		"output", dest, "duration_ms", time.Since(start).Milliseconds())
 
+	auditRecoverCascade(cmd.Context(), n, len(parentDeletes), len(res.Victims), dest)
 	return cascadeExit(dest, synthErr, caveats, rcAllowIncomplete)
+}
+
+// auditRecoverCascade reports a generated cascade-reversal script to the audit
+// seam — the same mutation-artifact class as `recover`, and then some: the
+// script re-creates child rows this command SYNTHESIZED from state the binlog
+// never recorded. Emitted from both output modes (text and JSON) once the
+// script is durable, before cascadeExit decides the exit code: the artifact
+// exists whether or not the recovery is provably complete, so an incomplete
+// run must still be recorded. recover-cascade has no --profile flag.
+func auditRecoverCascade(ctx context.Context, statements, parents, children int, dest string) {
+	ext.Record(ctx, ext.AuditEvent{
+		Surface: "cli",
+		Action:  "recover.cascade",
+		Actor:   ext.ProcessActor(""),
+		Schema:  rcSchema,
+		Table:   rcTable,
+		Detail: map[string]string{
+			"statements": strconv.Itoa(statements),
+			"parents":    strconv.Itoa(parents),
+			"children":   strconv.Itoa(children),
+			"dry_run":    strconv.FormatBool(rcDryRun),
+			"output":     dest,
+		},
+	})
 }
 
 // cascadeExit returns the error the command should end with, shared by text and

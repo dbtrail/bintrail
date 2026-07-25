@@ -244,6 +244,11 @@ func bindFlashbackHandler(ctx context.Context, srv *console.Server, proxy *routi
 	// the INNER handler (routingHandler forwards HandleQuery to it), so its
 	// streamed rows and go-mysql's trailing EOF share one packet sequence.
 	h.BindConn(mysqlConn)
+	// The flashback port routes BY username, so the same value that selected the
+	// target server is also this connection's audit identity — without this bind
+	// every audit event from the console's flashback port would carry the
+	// unbound-actor sentinel (mirrors internal/cli/shim.go's standalone bind).
+	h.BindActor(user)
 	// Seed the source schema so fully qualified `_flashback.<table>` queries
 	// work without a prior `USE <db>` (mirrors the standalone shim's #263
 	// behaviour). Best-effort: the boot entry has no registry SourceDSN.

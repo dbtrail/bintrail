@@ -10,6 +10,7 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -300,6 +301,19 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 			continue
 		}
 		ex.Write(cmd.OutOrStdout())
+		// --explain is the one verify surface that prints ROW-LEVEL data (the
+		// differing rows of a mismatch); the summary report itself is
+		// fingerprint comparison and is deliberately not audited (see
+		// ext/audit.go). One event per drilled-down table, emitted after the
+		// rows reach the operator.
+		ext.Record(cmd.Context(), ext.AuditEvent{
+			Surface: "cli",
+			Action:  "verify.explain",
+			Actor:   ext.ProcessActor(""),
+			Schema:  p.Schema,
+			Table:   p.Table,
+			Detail:  map[string]string{"mode": "baseline-anchored"},
+		})
 	}
 	return reportErr
 }

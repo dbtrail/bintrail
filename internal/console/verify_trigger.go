@@ -282,4 +282,10 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"explain": ex})
+	// The drill-down is the one verify surface that returns ROW-LEVEL data;
+	// the verify summary (trigger/status) reports per-table verdicts only and
+	// is deliberately not audited (see ext/audit.go).
+	recordConsoleAccess(r, "verify.explain", schema, table, map[string]string{
+		"mode": "baseline-anchored",
+	})
 }
