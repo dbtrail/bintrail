@@ -803,3 +803,70 @@ func TestIntegrationRecover_autoCascade_overByteBudget(t *testing.T) {
 		t.Errorf("a budget refusal after successful synthesis must not be misdiagnosed as a synthesis failure: %v", resp.Warnings)
 	}
 }
+
+// TestIntegrationRecover_autoCascade_noopUpdateFallsBackToPlain pins the
+// auto-detect fallback. rowsContainCascadeTriggerOn's UPDATE arm is deliberately
+// coarse — it cannot tell whether an UPDATE moved a referenced key without the
+// FK graph — so ANY update undo on a table with an ON UPDATE child routes
+// through the cascade path. When the synthesis then (correctly) rejects it, the
+// response must NOT claim CASCADE with all counts zero, and above all must not
+// hand back an ordinary reversal silently wrapped in SET FOREIGN_KEY_CHECKS=0/1:
+// the operator asked for a plain recover and would get FK validation disabled
+// without ever being told.
+func TestIntegrationRecover_autoCascade_noopUpdateFallsBackToPlain(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h})
+	childTs := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
+	parentTs := h.Add(20 * time.Minute).Format("2006-01-02 15:04:05")
+
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, childTs, nil,
+		dbName, "child", 1 /*INSERT*/, "10", nil, nil, []byte(`{"id":10,"pid":1}`))
+	// The parent UPDATE touches `name` only — the referenced key (id) never moved,
+	// so InnoDB cascaded nothing.
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, parentTs, nil,
+		dbName, "parent", 2 /*UPDATE*/, "1", nil,
+		[]byte(`{"id":1,"name":"before"}`), []byte(`{"id":1,"name":"after"}`))
+
+	// An ON UPDATE CASCADE edge: the table IS a cascade parent, which is what
+	// makes the coarse arm route the undo through synthesis in the first place.
+	testutil.MustExec(t, db, `INSERT INTO fk_constraints
+		(snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position,
+		 referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule)
+		VALUES (1, 'fk_child', ?, 'child', 'pid', 1, ?, 'parent', 'id', 'RESTRICT', 'CASCADE')`,
+		dbName, dbName)
+
+	snapTs := h.Format("2006-01-02 15:04:05")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "parent", "name", 2, "", "varchar", "YES")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "id", 1, "PRI", "int", "NO")
+	testutil.InsertSnapshot(t, db, 1, snapTs, dbName, "child", "pid", 2, "", "int", "YES")
+
+	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, NoArchive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, body := doReq(t, srv, "POST", "/api/recover", `{"schema":"`+dbName+`","table":"parent"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, body)
+	}
+	var resp recoverResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, body)
+	}
+	if resp.CascadeDetected {
+		t.Errorf("nothing cascaded (the UPDATE never moved the referenced key), so the response must not claim CASCADE: "+
+			"victims=%d set_null=%d key_restores=%d", resp.VictimCount, resp.SetNullCount, resp.KeyRestoreCount)
+	}
+	if strings.Contains(resp.SQL, "FOREIGN_KEY_CHECKS") {
+		t.Errorf("a plain UPDATE undo must not be wrapped in SET FOREIGN_KEY_CHECKS=0/1\n---\n%s", resp.SQL)
+	}
+	// The plain reversal itself must still be there.
+	if !strings.Contains(resp.SQL, "`name` = 'before'") {
+		t.Errorf("the plain UPDATE reversal is missing\n---\n%s", resp.SQL)
+	}
+}

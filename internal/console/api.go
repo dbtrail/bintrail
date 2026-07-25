@@ -410,6 +410,26 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 				}, warnings...)
 				break // out of the switch → plain recover below
 			}
+			if cres.VictimCount+cres.SetNullCount+cres.KeyRestoreCount == 0 {
+				// Nothing actually cascaded. rowsContainCascadeTriggerOn's UPDATE
+				// arm is deliberately coarse (it cannot check whether a referenced
+				// key moved without the FK graph), so ANY update undo on a table
+				// with an ON UPDATE child lands here; the synthesis then correctly
+				// rejects it. Reporting cascade_detected with all counts zero told
+				// the operator "CASCADE — no related rows needed repairing" and,
+				// worse, handed back an ordinary reversal silently wrapped in
+				// SET FOREIGN_KEY_CHECKS=0/1 — FK validation disabled on a script
+				// they expected checked. Fall back to the plain script and the
+				// plain response, carrying the synthesis's own notes across so a
+				// coverage caveat is never dropped on the way out.
+				if len(cres.Caveats) > 0 {
+					warnings = append(append([]string{
+						"Checked whether MySQL changed other rows automatically alongside these: none were found, but that check is provably partial — review the notes below.",
+					}, cres.Caveats...), warnings...)
+				}
+				warnings = append(warnings, cres.Warnings...)
+				break // out of the switch → plain recover below
+			}
 			cw := warnings
 			if len(cres.Caveats) > 0 {
 				cw = append([]string{

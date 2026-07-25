@@ -1556,6 +1556,51 @@ func TestFormatFKCascadeRestore_stringKeysQuoted(t *testing.T) {
 	}
 }
 
+// TestFormatFKCascadeRestore_fkInsidePK is the identifying-relationship case:
+// the FK column is part of the child's PRIMARY KEY, so the ON UPDATE CASCADE
+// moved the child's PK too. Building the PK predicate from the pre-cascade image
+// AND appending the guard would name `pid` twice with contradictory values
+// (`pid = 1 AND seq = 1 AND pid = 99`) — a predicate no row satisfies, so the
+// restore would silently touch nothing while reporting success. The FK's PK term
+// must carry the POST-cascade value and double as the guard.
+func TestFormatFKCascadeRestore_fkInsidePK(t *testing.T) {
+	pk := []metadata.ColumnMeta{
+		{Name: "pid", IsPK: true, DataType: "int"},
+		{Name: "seq", IsPK: true, DataType: "int"},
+	}
+	row := map[string]any{"pid": json.Number("1"), "seq": json.Number("1")} // pre-cascade image
+	got, err := FormatFKCascadeRestore("app", "line", "pid", json.Number("1"), json.Number("99"), pk, row)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "UPDATE `app`.`line` SET `pid` = 1 WHERE `pid` = 99 AND `seq` = 1"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+	if strings.Count(got, "`pid` =") != 2 { // once in SET, once in WHERE — never twice in WHERE
+		t.Errorf("the FK column must appear exactly once in the WHERE clause: %q", got)
+	}
+}
+
+// TestFormatFKCascadeRestore_fkInsidePKNullCascadedRefuses: a PK column cannot
+// be NULL, so "the cascade nulled a PK column" means the snapshot's PK no longer
+// matches the live table. Emitting `pid IS NULL` would be a guaranteed no-op
+// dressed as a recovery, so the formatter refuses instead.
+func TestFormatFKCascadeRestore_fkInsidePKNullCascadedRefuses(t *testing.T) {
+	pk := []metadata.ColumnMeta{
+		{Name: "pid", IsPK: true, DataType: "int"},
+		{Name: "seq", IsPK: true, DataType: "int"},
+	}
+	row := map[string]any{"pid": json.Number("1"), "seq": json.Number("1")}
+	_, err := FormatFKCascadeRestore("app", "line", "pid", json.Number("1"), nil, pk, row)
+	if err == nil {
+		t.Fatal("want an error when the cascade nulled a column the snapshot calls part of the PK")
+	}
+	if !strings.Contains(err.Error(), "PRIMARY KEY") {
+		t.Errorf("the error must name the drift it detected, got %q", err)
+	}
+}
+
 // ─── FormatSetNullRestore ────────────────────────────────────────────────────
 
 func TestFormatSetNullRestore_singlePKIntValue(t *testing.T) {

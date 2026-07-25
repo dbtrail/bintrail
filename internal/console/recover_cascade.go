@@ -170,8 +170,10 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 	// victims are children-only, so the parent is re-inserted exactly once. Only
 	// the parent UPDATEs the synthesis confirmed as cascading join the DELETEs —
 	// the rest of the UPDATE fetch was candidate material and never reaches the
-	// script (#1002).
-	parents := append(append([]query.ResultRow{}, synth.ParentDeletes...), synth.KeyUpdateParents...)
+	// script (#1002). Merged chronologically, NOT concatenated: the generator
+	// reverses the input order, so DELETEs-then-UPDATEs would undo a key UPDATE
+	// before re-inserting the parent it belongs to (see MergeParentRoots).
+	parents := cascaderecover.MergeParentRoots(synth.ParentDeletes, synth.KeyUpdateParents)
 	rows := append(append([]query.ResultRow{}, parents...), synth.Victims...)
 
 	var buf bytes.Buffer

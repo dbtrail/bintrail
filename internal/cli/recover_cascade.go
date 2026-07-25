@@ -317,7 +317,11 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 	// Only the parent UPDATEs the synthesis confirmed as cascading are reversed
 	// (KeyUpdateParents ⊆ parentUpdates); the rest of the UPDATE fetch was
 	// candidate material for that decision and never reaches the script.
-	parents := append(append([]query.ResultRow{}, parentDeletes...), res.KeyUpdateParents...)
+	//
+	// Merged chronologically, NOT concatenated: the generator reverses the input
+	// order, so DELETEs-then-UPDATEs would undo a key UPDATE before re-inserting
+	// the parent that UPDATE's row belongs to (see MergeParentRoots).
+	parents := cascaderecover.MergeParentRoots(parentDeletes, res.KeyUpdateParents)
 	rows := append(append([]query.ResultRow{}, parents...), res.Victims...)
 
 	// ── Emit ──────────────────────────────────────────────────────────────────

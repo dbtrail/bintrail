@@ -334,7 +334,10 @@ bintrail recover-cascade --index-dsn "..." \
   first cascade rewrote the children below the binlog too, so their last
   *indexed* image still carries `A` and the scan for the second update's old key
   (`B`) matches nothing. That run is flagged `INCOMPLETE RECOVERY` — a
-  zero-child result there is not proof there were no children.
+  zero-child result there is not proof there were no children. The chain is
+  detected by asking whether the key *arrived* at the parent from somewhere else
+  inside the window, so the flag holds whether the referenced column is the
+  parent's primary key (`REFERENCES parent(id)`) or a secondary unique key.
 - **Composite (multi-column) FKs are skipped, not reconstructed.** A
   single-column victim match would mis-reconstruct a multi-column key, so a
   composite FK is dropped and flagged in the output rather than silently

@@ -625,38 +625,64 @@ func SynthesizeVictims(
 	}
 
 	// checkKeyChain flags the ONE case the "children's last logged image still
-	// carries the old key" inference cannot see: an EARLIER key-changing UPDATE
-	// of the SAME parent row inside the window. That earlier cascade rewrote the
-	// children below the binlog too, so their last INDEXED image carries the
-	// pre-chain key — the ColumnEq scan for this root's old key then matches
-	// nothing and would report a clean zero-child Complete. Never silent (#618).
+	// carries the old key" inference cannot see: an EARLIER UPDATE inside the
+	// window that moved this referenced key INTO the parent (A→B before the
+	// root's B→C). That earlier cascade rewrote the children below the binlog
+	// too, so their last INDEXED image carries the pre-chain key — the ColumnEq
+	// scan for this root's old key then matches nothing and would report a clean
+	// zero-child Complete. Never silent (#618).
 	//
 	// Probed for ROOT updates only (depth 0): deeper items are synthesized here,
 	// with the correct pre-cascade image by construction, so a "prior update"
 	// found for them would be about the child's own logged history, not a hidden
 	// cascade chain. The root's own event is skipped by EventID.
 	upd := event.EventUpdate
-	checkKeyChain := func(fk CascadeFK, pev query.ResultRow, rootTS time.Time, rootKey string) {
-		memo := pev.SchemaName + "." + pev.TableName + "|" + pev.PKValues + "|" + fk.ReferencedColumn + "|" + rootKey
+	checkKeyChain := func(fk CascadeFK, pev query.ResultRow, parentOldKey string, rootTS time.Time, rootKey string) {
+		memo := pev.SchemaName + "." + pev.TableName + "|" + fk.ReferencedColumn + "|" + parentOldKey + "|" + rootKey
 		if keyChainChecked[memo] {
 			return
 		}
 		keyChainChecked[memo] = true
+		// The probe is scoped by the referenced column's VALUE, never by the
+		// parent's pk_values. The indexer writes pk_values from the BEFORE image
+		// (parser.BuildPKValues over row_before), so when the referenced column
+		// IS the parent's PK — `REFERENCES parent(id)`, the common shape — a
+		// chain id: A→B then B→C lands under pk_values "A" and "B" respectively.
+		// A pk_values-scoped probe queries the root's "B" and never sees the
+		// first link: 0 restores, Complete, no caveat — precisely the silent zero
+		// this probe exists to prevent (#1116 review). Asking "did this key
+		// ARRIVE here from somewhere else inside the window?" is immune to where
+		// pk_values happens to point.
+		if !query.IsSafeColumnName(fk.ReferencedColumn) {
+			// buildQuery turns a rejected column name into a `1=0` predicate, so
+			// the probe would come back empty and read as "no chain" — the same
+			// silent zero by another route. Refuse to conclude instead.
+			addIncomplete("keychainprobe:"+fk.ReferencedSchema+"."+fk.ReferencedTable+"."+fk.ReferencedColumn, fmt.Sprintf(
+				"cannot check %s.%s for an earlier update of referenced column %q (name is not a plain identifier, so it "+
+					"cannot be used as a JSON path); an earlier cascade would hide children, so a zero result is not proof of none",
+				pev.SchemaName, pev.TableName, fk.ReferencedColumn))
+			return
+		}
 		since := rootTS.Add(-opts.Lookback)
+		// ASC, not DESC: the arrival (`before=A, after=B`) is the OLDEST event
+		// matching this value in the window — every later match is the row
+		// sitting on the key (unrelated-column updates) or leaving it (the root).
+		// Newest-first + Limit would let a churny parent push the one event that
+		// matters out of the probe's budget.
 		prior, perr := eng.Fetch(ctx, query.Options{
 			Schema:    pev.SchemaName,
 			Table:     pev.TableName,
-			PKValues:  pev.PKValues,
+			ColumnEq:  []query.ColumnEq{{Column: fk.ReferencedColumn, Value: parentOldKey}},
 			EventType: &upd,
 			Since:     &since,
 			Until:     &rootTS,
-			Order:     "DESC",
+			Order:     "ASC",
 			Limit:     keyChainProbeLimit,
 		})
 		if perr != nil {
 			addIncomplete("keychainprobe:"+pev.SchemaName+"."+pev.TableName+"."+fk.ReferencedColumn, fmt.Sprintf(
-				"could not check %s.%s pk=%s for earlier updates of referenced column %q (an earlier cascade would hide children): %v",
-				pev.SchemaName, pev.TableName, pev.PKValues, fk.ReferencedColumn, perr))
+				"could not check %s.%s for earlier updates of referenced column %q into %s (an earlier cascade would hide children): %v",
+				pev.SchemaName, pev.TableName, fk.ReferencedColumn, parentOldKey, perr))
 			return
 		}
 		for _, r := range prior {
@@ -666,14 +692,20 @@ func SynthesizeVictims(
 			if r.RowBefore == nil || r.RowAfter == nil {
 				continue
 			}
+			// "This key ARRIVED here from somewhere else inside the window":
+			// after == the root's old key, before != it. The root itself moves
+			// the key AWAY (after != old key) and so never matches.
+			if valToString(r.RowAfter[fk.ReferencedColumn]) != parentOldKey {
+				continue
+			}
 			if !refKeyChanged(r.RowBefore[fk.ReferencedColumn], r.RowAfter[fk.ReferencedColumn]) {
 				continue
 			}
 			addIncomplete("keychain:"+pev.SchemaName+"."+pev.TableName+"."+fk.ReferencedColumn, fmt.Sprintf(
-				"%s.%s pk=%s had an EARLIER update of referenced column %q inside the window; that cascade rewrote its "+
+				"%s.%s had an EARLIER update of referenced column %q INTO %s inside the window; that cascade rewrote its "+
 					"children below the binlog too, so their last indexed image no longer carries this update's old key — "+
 					"some ON UPDATE cascade children may NOT be reconstructed (a zero result here is not proof of none)",
-				pev.SchemaName, pev.TableName, pev.PKValues, fk.ReferencedColumn))
+				pev.SchemaName, pev.TableName, fk.ReferencedColumn, parentOldKey))
 			return
 		}
 	}
@@ -794,7 +826,7 @@ func SynthesizeVictims(
 					parentOldKey := valToString(oldVal)
 					cascadedHere = true
 					if depth == 0 {
-						checkKeyChain(fk, pev, item.rootTS, rootKey)
+						checkKeyChain(fk, pev, parentOldKey, item.rootTS, rootKey)
 					}
 
 					scan := scanChildren(fk, parentOldKey, item.rootTS)

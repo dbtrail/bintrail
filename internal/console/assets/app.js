@@ -1409,6 +1409,11 @@ async function generateUndo(form) {
     // surprise — and so a script that is ENTIRELY reference repairs never shows
     // a bare "0 child row(s)" (coverage caveats, if any, are in the warnings
     // above).
+    //
+    // cascade_detected implies at least one repair: the server falls back to the
+    // plain script/response when the synthesis produced nothing (an UPDATE undo
+    // that turned out not to have moved a referenced key), so `parts` is never
+    // empty here and there is no "nothing was repaired" branch to render.
     if (data.cascade_detected) {
       const victims = data.victim_count || 0;
       const setNulls = data.set_null_count || 0;
@@ -1421,8 +1426,7 @@ async function generateUndo(form) {
         el("span", { class: "badge b-baseline", text: "CASCADE" }),
         el("div", { class: "ctx-main" },
           el("span", { class: "ctx-eyebrow", text: "Also repairing rows MySQL changed automatically along with this one" }),
-          el("span", { class: "ctx-detail", text:
-            parts.length ? "this script also " + parts.join(", ") + "." : "no related rows needed repairing." }))));
+          el("span", { class: "ctx-detail", text: "this script also " + parts.join(", ") + "." }))));
     }
     const meta = data.cascade_detected
       ? data.statement_count + " statement(s) · " + (data.victim_count || 0) + " cascade child row(s) · " +

@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/dbtrail/dbtrail/internal/cascade"
@@ -229,4 +230,32 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 		return n, err
 	}
 	return n, nil
+}
+
+// MergeParentRoots combines the parent DELETE roots with the parent key-UPDATE
+// roots into ONE chronological list, which is what EmitSQL's generator requires.
+//
+// recovery.GenerateSQLFromRows does not sort: it trusts the caller's order and
+// reverses it, so the most recent change is undone first. Concatenating the two
+// root sets — DELETEs, then UPDATEs — throws that away. A parent key-UPDATEd at
+// t1 and DELETEd at t2 (both in the window) would emit the UPDATE-undo first,
+// against a row the later-emitted INSERT has not re-created yet: it matches 0
+// rows, and the INSERT then restores the POST-update image. The parent is left
+// silently wrong.
+//
+// sort.SliceStable over the concatenation, rather than a two-list merge, so the
+// result is correct even if a caller ever hands over a set that is not itself
+// ascending; ties keep DELETEs before UPDATEs of the same (timestamp, id), which
+// only synthetic rows without a real EventID can produce.
+func MergeParentRoots(deletes, keyUpdates []query.ResultRow) []query.ResultRow {
+	out := make([]query.ResultRow, 0, len(deletes)+len(keyUpdates))
+	out = append(out, deletes...)
+	out = append(out, keyUpdates...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].EventTimestamp.Equal(out[j].EventTimestamp) {
+			return out[i].EventTimestamp.Before(out[j].EventTimestamp)
+		}
+		return out[i].EventID < out[j].EventID
+	})
+	return out
 }

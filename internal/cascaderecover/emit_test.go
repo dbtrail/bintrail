@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/cascade"
 	"github.com/dbtrail/dbtrail/internal/cascaderecover"
@@ -608,5 +609,46 @@ func TestEmitSQL_keyUpdateNilResolverIsAllOrNothing(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("statement count = %d, want 0 on abort", n)
+	}
+}
+
+// TestMergeParentRoots_interleavesChronologically is the ordering guard behind
+// the mixed-root script. recovery.GenerateSQLFromRows does not sort — it
+// reverses the caller's order — so concatenating "all DELETEs, then all UPDATEs"
+// emits the undo of a parent key UPDATE at t1 BEFORE the re-INSERT of the same
+// parent DELETEd at t2. The UPDATE-undo then matches 0 rows and the INSERT
+// restores the post-update image: the parent is left silently wrong.
+func TestMergeParentRoots_interleavesChronologically(t *testing.T) {
+	base := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	upd := []query.ResultRow{
+		{EventID: 1, EventTimestamp: base, EventType: event.EventUpdate, PKValues: "u1"},
+		{EventID: 4, EventTimestamp: base.Add(3 * time.Second), EventType: event.EventUpdate, PKValues: "u2"},
+	}
+	del := []query.ResultRow{
+		{EventID: 2, EventTimestamp: base.Add(1 * time.Second), EventType: event.EventDelete, PKValues: "d1"},
+		{EventID: 3, EventTimestamp: base.Add(2 * time.Second), EventType: event.EventDelete, PKValues: "d2"},
+	}
+	got := cascaderecover.MergeParentRoots(del, upd)
+	var order []string
+	for _, r := range got {
+		order = append(order, r.PKValues)
+	}
+	want := []string{"u1", "d1", "d2", "u2"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Errorf("roots are not chronological: got %v, want %v", order, want)
+	}
+}
+
+// TestMergeParentRoots_tiesBreakOnEventID pins the second sort key: two roots
+// can share a whole-second event_timestamp (binlog DATETIMEs have no fractional
+// part), so the auto-increment EventID is what keeps the order deterministic.
+func TestMergeParentRoots_tiesBreakOnEventID(t *testing.T) {
+	ts := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	got := cascaderecover.MergeParentRoots(
+		[]query.ResultRow{{EventID: 7, EventTimestamp: ts, PKValues: "d"}},
+		[]query.ResultRow{{EventID: 5, EventTimestamp: ts, PKValues: "u"}},
+	)
+	if len(got) != 2 || got[0].PKValues != "u" || got[1].PKValues != "d" {
+		t.Errorf("same-second roots must order by EventID, got %+v", got)
 	}
 }

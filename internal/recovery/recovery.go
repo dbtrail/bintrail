@@ -1314,21 +1314,58 @@ func FormatSetNullRestore(schema, table, fkCol string, value any, pkCols []metad
 // candidate), so the statement must decline rather than clobber. pkCols + row
 // supply the PK predicate; the values are typed, so an integer FK renders as a
 // numeric literal rather than a quoted string.
+//
+// IDENTIFYING RELATIONSHIPS: when fkCol is itself part of the child's PRIMARY
+// KEY (`PRIMARY KEY (pid, seq)` with pid REFERENCES parent(id) ON UPDATE
+// CASCADE — one of the main reasons to declare the rule at all), the cascade
+// moved the child's PK too. row is the child's PRE-cascade image, so naming
+// that column from row AND appending the guard would emit the same column twice
+// with contradictory values (`WHERE pid = 1 AND seq = 1 AND pid = 99`) — a
+// predicate no row can satisfy, silently touching nothing while the caller
+// reports a completed recovery. The PK predicate is therefore built from the
+// POST-cascade identity: fkCol's PK term takes cascadedValue and doubles as the
+// guard, so the single term `pid = 99` both identifies the row and keeps the
+// statement idempotent. Substituting here rather than pre-substituting into row
+// keeps row and the caller's pk_values (which the indexer also writes from the
+// BEFORE image) consistent with each other.
 func FormatFKCascadeRestore(schema, table, fkCol string, oldValue, cascadedValue any, pkCols []metadata.ColumnMeta, row map[string]any) (string, error) {
 	if len(pkCols) == 0 {
 		return "", fmt.Errorf("no PK columns for %s.%s foreign-key cascade restore", schema, table)
 	}
+	fkInPK := false
 	where := make([]string, 0, len(pkCols)+1)
 	for _, c := range pkCols {
+		if c.Name == fkCol {
+			if cascadedValue == nil {
+				// The cascade would have had to NULL a PRIMARY KEY column, which
+				// InnoDB cannot do (PK columns are NOT NULL) — so this is schema
+				// drift between the snapshot's PK and the live table, the same
+				// class the cascade engine flags as noref/norefupd. A `pk IS NULL`
+				// predicate would match nothing and hand back a silent no-op, so
+				// refuse instead: EmitSQL is all-or-nothing and the operator must
+				// see why.
+				return "", fmt.Errorf(
+					"%s.%s: foreign-key column %q is part of the snapshot's PRIMARY KEY but the cascade left it NULL "+
+						"(a PK column cannot be NULL — the snapshot's PK likely no longer matches the live table); "+
+						"re-run `bintrail snapshot` and retry",
+					schema, table, fkCol)
+			}
+			fkInPK = true
+			where = append(where, QuoteName(c.Name)+" = "+FormatSQLValue(cascadedValue))
+			continue
+		}
 		v, ok := row[c.Name]
 		if !ok {
 			return "", fmt.Errorf("PK column %q absent from %s.%s row for foreign-key cascade restore", c.Name, schema, table)
 		}
 		where = append(where, QuoteName(c.Name)+" = "+FormatSQLValue(v))
 	}
-	if cascadedValue == nil {
+	switch {
+	case fkInPK:
+		// Already emitted above as the PK term; a second copy would be redundant.
+	case cascadedValue == nil:
 		where = append(where, QuoteName(fkCol)+" IS NULL")
-	} else {
+	default:
 		where = append(where, QuoteName(fkCol)+" = "+FormatSQLValue(cascadedValue))
 	}
 	return fmt.Sprintf("UPDATE %s.%s SET %s = %s WHERE %s",

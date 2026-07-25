@@ -50,9 +50,19 @@ func newUpdEnv(t *testing.T) updEnv {
 
 // parentKeyUpdate is the ON UPDATE analog of parentDelete: a root UPDATE on
 // parent pk=1 moving the referenced column `col` from oldVal to newVal.
-func parentKeyUpdate(schema, col string, oldVal, newVal any, at time.Time) []query.ResultRow {
+//
+// pkValues overrides the event's pk_values, which the indexer writes from the
+// BEFORE image (parser.BuildPKValues over row_before). When the referenced
+// column IS the parent's PK, a chain of key updates therefore lands under a
+// DIFFERENT pk_values per link, which is precisely what the key-chain probe
+// must not depend on.
+func parentKeyUpdate(schema, col string, oldVal, newVal any, at time.Time, pkValues ...string) []query.ResultRow {
+	pk := "1"
+	if len(pkValues) > 0 {
+		pk = pkValues[0]
+	}
 	return []query.ResultRow{{
-		SchemaName: schema, TableName: "parent", EventType: 2 /* UPDATE */, PKValues: "1",
+		SchemaName: schema, TableName: "parent", EventType: 2 /* UPDATE */, PKValues: pk,
 		RowBefore:      map[string]any{"id": json.Number("1"), col: oldVal},
 		RowAfter:       map[string]any{"id": json.Number("1"), col: newVal},
 		EventTimestamp: at,
@@ -307,6 +317,46 @@ func TestSynthesizeKeyUpdate_repeatedKeyUpdateFlagged(t *testing.T) {
 	}
 }
 
+// TestSynthesizeKeyUpdate_repeatedKeyUpdateFlagged_referencedPK is the same
+// chain as above with the ONE difference that matters in practice: the
+// referenced column IS the parent's primary key (`REFERENCES parent(id)`, the
+// overwhelmingly common shape), not a secondary unique column.
+//
+// The indexer writes pk_values from the BEFORE image, so the two links of the
+// chain land under DIFFERENT pk_values ("1" for 1→99, "99" for the root 99→100).
+// A probe scoped by the root's own pk_values therefore cannot see the earlier
+// link at all, and the run reports 0 restores + Complete — the silent zero the
+// key-chain probe exists to prevent. The probe must key off the referenced
+// column's VALUE, not the parent's pk_values.
+func TestSynthesizeKeyUpdate_repeatedKeyUpdateFlagged_referencedPK(t *testing.T) {
+	e := newUpdEnv(t)
+	// The child's last logged image predates BOTH parent updates: pid = 1.
+	testutil.InsertEvent(t, e.db, "b.000001", 10, 20, e.ts, nil, e.dbName, "child", 1, "10", nil, nil, []byte(`{"id":10,"pid":1}`))
+	// The EARLIER parent key update (id 1 → 99). Its pk_values is the BEFORE
+	// image's PK ("1"), not the root's ("99").
+	testutil.InsertEvent(t, e.db, "b.000001", 20, 30, e.ts, nil, e.dbName, "parent", 2, "1",
+		nil, []byte(`{"id":1}`), []byte(`{"id":99}`))
+
+	fks := []cascade.CascadeFK{{
+		Schema: e.dbName, Table: "child", ConstraintName: "fk", Column: "pid",
+		ReferencedSchema: e.dbName, ReferencedTable: "parent", ReferencedColumn: "id",
+		DeleteRule: "RESTRICT", UpdateRule: "CASCADE",
+	}}
+	// The ROOT is the later update 99 → 100, indexed under pk_values "99".
+	roots := parentKeyUpdate(e.dbName, "id", json.Number("99"), json.Number("100"), e.T, "99")
+	res, err := cascade.SynthesizeVictims(context.Background(), e.eng, fks, roots, cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if len(res.KeyUpdates) != 0 {
+		t.Fatalf("the child's indexed image still says pid=1, so nothing matches 99; got %+v", res.KeyUpdates)
+	}
+	if res.Complete() || !strings.Contains(strings.Join(res.Incomplete, " "), "EARLIER update of referenced column") {
+		t.Errorf("a chained parent-key update on the PRIMARY KEY hides children just as much as on a "+
+			"secondary key, and MUST be flagged; Incomplete=%v", res.Incomplete)
+	}
+}
+
 // TestSynthesizeKeyUpdate_singleKeyUpdateNotFlagged is the control for the probe
 // above: an earlier UPDATE of the SAME parent row that left the referenced
 // column alone is not a chain, so it must not manufacture a false caveat.
@@ -445,5 +495,117 @@ func TestKeyUpdateCascade_endToEnd(t *testing.T) {
 	}
 	if got := checksum(t, sourceDB, "child"); got != beforeChild {
 		t.Errorf("child checksum after recovery = %d, want %d (pre-update state) — the ON UPDATE cascade was not fully reversed", got, beforeChild)
+	}
+}
+
+// TestKeyUpdateCascade_endToEnd_fkInChildPK is the identifying-relationship
+// variant of the test above, and the one shape where an `ON UPDATE CASCADE`
+// restore can be self-contradictory: the child's FK column is itself part of
+// its PRIMARY KEY (`PRIMARY KEY (pid, seq)` with `pid` REFERENCES parent(id)).
+//
+// The cascade moves the child's PK too, so a restore whose WHERE clause is
+// built from the child's PRE-cascade image names `pid` twice with two different
+// values (`WHERE pid = 1 AND seq = 1 AND pid = 99`) — a predicate no row can
+// satisfy. It touches nothing while the synthesis reports a complete recovery,
+// which is exactly the silent-no-op class this package refuses elsewhere.
+// The checksum gate is what catches it.
+func TestKeyUpdateCascade_endToEnd_fkInChildPK(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE parent (
+		id   INT PRIMARY KEY,
+		name VARCHAR(64)
+	) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE line (
+		pid     INT NOT NULL,
+		seq     INT NOT NULL,
+		payload VARCHAR(64),
+		PRIMARY KEY (pid, seq),
+		CONSTRAINT fk_line FOREIGN KEY (pid) REFERENCES parent(id) ON UPDATE CASCADE
+	) ENGINE=InnoDB`)
+
+	stats, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+	resolver, err := metadata.NewResolver(indexDB, stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	var beforeParent, beforeLine int64
+	captureAndIndex(t, sourceDB, indexDB, resolver, sourceName, func() {
+		testutil.MustExec(t, sourceDB, "INSERT INTO parent VALUES (1,'p1'),(2,'p2')")
+		testutil.MustExec(t, sourceDB, "INSERT INTO line VALUES (1,1,'a'),(1,2,'b'),(2,1,'c')")
+		// Second-granular binlog timestamps: keep the root strictly later so the
+		// Until=rootTS window cleanly contains the setup above.
+		time.Sleep(1100 * time.Millisecond)
+		beforeParent = checksum(t, sourceDB, "parent")
+		beforeLine = checksum(t, sourceDB, "line")
+		// THE cascade: lines (1,1) and (1,2) silently become (99,1) and (99,2),
+		// with no binlog event — and their PRIMARY KEY moved with them.
+		testutil.MustExec(t, sourceDB, "UPDATE parent SET id=99 WHERE id=1")
+	})
+
+	// Sanity: the source really did cascade the PK, and really did not log it.
+	var moved int
+	if err := sourceDB.QueryRow("SELECT COUNT(*) FROM line WHERE pid=99").Scan(&moved); err != nil {
+		t.Fatalf("count moved lines: %v", err)
+	}
+	if moved != 2 {
+		t.Fatalf("InnoDB did not cascade the key update into the child PK (%d lines at pid=99, want 2); the premise of this test is gone", moved)
+	}
+	eng := query.New(indexDB)
+	upd := event.EventUpdate
+	lineEvents, err := eng.Fetch(ctx, query.Options{Schema: sourceName, Table: "line", EventType: &upd, Limit: 10})
+	if err != nil {
+		t.Fatalf("fetch line events: %v", err)
+	}
+	if len(lineEvents) != 0 {
+		t.Fatalf("the cascade must be INVISIBLE in the binlog; got %d line UPDATE events: %+v", len(lineEvents), lineEvents)
+	}
+
+	roots, err := eng.Fetch(ctx, query.Options{Schema: sourceName, Table: "parent", EventType: &upd, Order: "ASC", Limit: 10})
+	if err != nil {
+		t.Fatalf("fetch parent updates: %v", err)
+	}
+	if len(roots) != 1 {
+		t.Fatalf("want exactly the one parent key UPDATE, got %d: %+v", len(roots), roots)
+	}
+
+	fks, _, _, err := cascade.LoadCascadeFKsForParent(ctx, indexDB, sourceName, roots[0].EventTimestamp)
+	if err != nil {
+		t.Fatalf("LoadCascadeFKsForParent: %v", err)
+	}
+	res, err := cascade.SynthesizeVictims(ctx, eng, fks, roots, cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if !res.Complete() {
+		t.Fatalf("want a complete reconstruction, got Incomplete=%v", res.Incomplete)
+	}
+	if len(res.KeyUpdates) != 2 {
+		t.Fatalf("want two FK restores, one per line under parent 1 (line (2,1) is another parent's); got %+v", res.KeyUpdates)
+	}
+
+	var script strings.Builder
+	if _, err := cascaderecover.EmitSQL(&script, recoveryNew(t, indexDB, resolver),
+		res.KeyUpdateParents, nil, res.KeyUpdates, resolver,
+		cascaderecover.Header{Schema: sourceName, Table: "parent", Parents: len(res.KeyUpdateParents)}); err != nil {
+		t.Fatalf("EmitSQL: %v", err)
+	}
+	applyFKOff(t, sourceName, script.String())
+
+	if got := checksum(t, sourceDB, "parent"); got != beforeParent {
+		t.Errorf("parent checksum after recovery = %d, want %d (pre-update state)", got, beforeParent)
+	}
+	if got := checksum(t, sourceDB, "line"); got != beforeLine {
+		t.Errorf("line checksum after recovery = %d, want %d (pre-update state) — the restore's WHERE clause "+
+			"named the FK column twice with contradictory values and touched nothing\n---\n%s", got, beforeLine, script.String())
 	}
 }
