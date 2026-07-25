@@ -31,6 +31,37 @@ func TestStreamSourceJobInfoCarriesTheStreamsSource(t *testing.T) {
 	}
 }
 
+// TestUpReachesTheSeamWithItsOwnConfiguration walks the delegation path `up`
+// now depends on: runUpStream copies its flags into the strm* globals, and
+// runStream (the only call site) builds SourceJobInfo from those. Flavor is
+// the fragile half — populateStreamFlags deliberately does NOT copy it, so it
+// carries whatever streamCmd's own default/env binding left behind. An empty
+// flavor here would make every flavor-gated source job skip silently: no
+// error, no log, capture simply does not happen. That is the exact failure
+// class this wiring exists to fix.
+func TestUpReachesTheSeamWithItsOwnConfiguration(t *testing.T) {
+	origUpSource, origUpIndex := upSourceDSN, upIndexDSN
+	origSource, origIndex, origFlavor := strmSourceDSN, strmIndexDSN, strmFlavor
+	t.Cleanup(func() {
+		upSourceDSN, upIndexDSN = origUpSource, origUpIndex
+		strmSourceDSN, strmIndexDSN, strmFlavor = origSource, origIndex, origFlavor
+	})
+
+	upSourceDSN = "u:p@tcp(up-src:3306)/"
+	upIndexDSN = "u:p@tcp(up-idx:3306)/bintrail_index"
+	strmSourceDSN, strmIndexDSN = "", ""
+
+	populateStreamFlags(12345)
+
+	got := streamSourceJobInfo()
+	if got.SourceDSN != upSourceDSN || got.IndexDSN != upIndexDSN {
+		t.Errorf("after populateStreamFlags, streamSourceJobInfo() = %+v, want up's DSNs", got)
+	}
+	if got.Flavor == "" {
+		t.Error("Flavor is empty on the `up` path: a flavor-gated source job would skip with no signal")
+	}
+}
+
 func TestAgentSourceJobInfoRequiresSourceAndIndex(t *testing.T) {
 	origSource, origIndex := agtSourceDSN, agtIndexDSN
 	t.Cleanup(func() { agtSourceDSN, agtIndexDSN = origSource, origIndex })

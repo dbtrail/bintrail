@@ -105,37 +105,25 @@ func TestMergeBaseline_passthroughOnly(t *testing.T) {
 	}
 }
 
-// TestMergeBaseline_unresolvedToastMarker is the #592 guard on the full-table
-// mydumper path: a change-map event carrying the residual unchanged-TOAST
-// marker must refuse the whole table BEFORE any output exists — writing the
-// marker's JSON into a reconstructed dump is silent corruption. The
-// checkChangesToast scan runs at the top of mergeBaselineIntoWriter, before the
-// writer opens; the shim's full-table _snapshot entry point has its own call
-// (TestSnapshotFullTableImages_unresolvedToastMarker below).
-func TestMergeBaseline_unresolvedToastMarker(t *testing.T) {
-	baselinePath := writeTestBaseline(t, [][]string{
-		{"1", "new"},
-		{"2", "paid"},
-	})
-	outDir := t.TempDir()
-
-	rep := &TableReport{Schema: "mydb", Table: "orders"}
-	err := mergeBaselineIntoWriter(context.Background(), mergeInput{
-		LocalBaselinePath: baselinePath,
-		CreateTableSQL:    "-- test",
-		Schema:            "mydb",
-		Table:             "orders",
-		PKCols:            pkColsIntID(),
-		Changes: map[string]*query.ResultRow{
-			pkStrForInt(2): {
-				EventType:  event.EventUpdate,
-				SchemaName: "mydb", TableName: "orders", PKValues: pkStrForInt(2),
-				RowAfter: map[string]any{"id": "2", "status": toastMarker()},
-			},
-		},
-		OutputDir: outDir,
-		ChunkSize: 0,
-	}, rep)
+// TestFoldPage_unresolvedToastMarker is the #592 guard on the full-table
+// mydumper path: an event carrying the residual unchanged-TOAST marker must
+// refuse the whole table BEFORE any output exists — writing the marker's JSON
+// into a reconstructed dump is silent corruption.
+//
+// The check runs per event in foldPage since the window became paged (#1097),
+// upstream of both merge entry points, which is why it is asserted there and
+// not against a finished change map: retainEvent blanks the before-image, so a
+// map-level TOAST check would have nothing left to inspect. The shim's
+// full-table _snapshot entry point keeps its own map-level call and its own
+// test (TestSnapshotFullTableImages_unresolvedToastMarker below) — its map is
+// built by a different caller and still carries before-images.
+func TestFoldPage_unresolvedToastMarker(t *testing.T) {
+	res := &foldResult{Changes: map[string]*query.ResultRow{}}
+	err := foldPage([]query.ResultRow{{
+		EventType:  event.EventUpdate,
+		SchemaName: "mydb", TableName: "orders", PKValues: pkStrForInt(2),
+		RowAfter: map[string]any{"id": "2", "status": toastMarker()},
+	}}, "mydb", "orders", pkColsIntID(), res)
 	if err == nil {
 		t.Fatal("expected a loud error for a marker-carrying change")
 	}
@@ -144,29 +132,11 @@ func TestMergeBaseline_unresolvedToastMarker(t *testing.T) {
 			t.Errorf("error missing %q:\n%s", want, err)
 		}
 	}
-	// The scan runs BEFORE the writer opens, so the refusal must leave nothing
-	// behind — not even the schema header file.
-	entries, rerr := os.ReadDir(outDir)
-	if rerr != nil {
-		t.Fatal(rerr)
-	}
-	if len(entries) != 0 {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
-		}
-		t.Errorf("refusal left partial output in outDir: %v", names)
+	if len(res.Changes) != 0 {
+		t.Errorf("a refused event must not be folded into the change map, got %d entries", len(res.Changes))
 	}
 }
 
-// TestSnapshotFullTableImages_unresolvedToastMarker pins the #592 guard on the
-// shim's full-table _snapshot entry point INDEPENDENTLY of the mydumper path: a
-// refactor that dropped the checkChangesToast call from SnapshotFullTableImages
-// (leaving only mergeBaselineIntoWriter's) would stay green everywhere else.
-// The BaselinePath deliberately points nowhere and the emit callback records
-// invocations: the refusal must happen BEFORE baseline materialization (no
-// "materialize baseline" error; in production that step can be an S3 download)
-// and before a single row is emitted.
 func TestSnapshotFullTableImages_unresolvedToastMarker(t *testing.T) {
 	emitted := 0
 	err := SnapshotFullTableImages(context.Background(), SnapshotFullTableInput{
@@ -588,7 +558,7 @@ func TestWriteBinlogOnlyChanges_insertsSkipsDeletes(t *testing.T) {
 
 	rep := &TableReport{Schema: "mydb", Table: "orders"}
 	if err := writeBinlogOnlyChanges(outDir, "mydb", "orders", pkColsIntID(), colNames, 0,
-		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, nil, rep); err != nil {
+		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, rep); err != nil {
 		t.Fatalf("writeBinlogOnlyChanges: %v", err)
 	}
 
@@ -640,7 +610,7 @@ func TestWriteBinlogOnlyChanges_nilRowAfterSkipped(t *testing.T) {
 
 	rep := &TableReport{Schema: "mydb", Table: "orders"}
 	if err := writeBinlogOnlyChanges(outDir, "mydb", "orders", pkColsIntID(), colNames, 0,
-		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, nil, rep); err != nil {
+		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, rep); err != nil {
 		t.Fatalf("writeBinlogOnlyChanges: %v", err)
 	}
 	if rep.InsertsEmitted != 0 {

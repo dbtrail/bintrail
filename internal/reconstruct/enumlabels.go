@@ -28,27 +28,7 @@ import (
 // remaining degradation is pass-through — raw ordinals, never a guessed
 // label).
 func MapEventEnumLabels(db *sql.DB, latest *metadata.Resolver, schema, table string, events []query.ResultRow) {
-	if len(events) == 0 || db == nil {
-		return
-	}
-	epochs, err := metadata.LoadSnapshotEpochs(db)
-	if err != nil {
-		slog.Debug("snapshot epoch lookup failed; decoding ENUM/SET with the latest snapshot",
-			"schema", schema, "table", table, "err", err)
-		epochs = nil
-	}
-	src := metadata.EnumMapperSource{
-		Epochs: epochs,
-		ResolverFor: func(id int) (*metadata.Resolver, error) {
-			return metadata.NewResolver(db, id)
-		},
-		Fallback: latest,
-	}
-	for i := range events {
-		m := src.MapperAt(schema, table, events[i].EventTimestamp)
-		m.MapImage(events[i].RowBefore)
-		m.MapImage(events[i].RowAfter)
-	}
+	newEventDecoder(db, schema, table, latest).mapEnums(events)
 }
 
 // DecodeEventBinaries reverses the storage-side base64 of BLOB/TEXT columns in
@@ -100,51 +80,125 @@ func DecodeEventBinaries(db *sql.DB, schema, table string, events []query.Result
 	if db == nil {
 		return false
 	}
-	typed := true
+	d := newEventDecoder(db, schema, table, nil)
+	d.decodeBinaries(events)
+	return d.typed
+}
+
+// eventDecoder holds the epoch-aware decoding state for ONE table: the snapshot
+// epoch list and the per-epoch resolver/column memos both decoding passes need.
+//
+// It exists because the full-table window is fetched in pages (#1097). Both
+// passes used to build this state from scratch on each call, which was free
+// when a call meant "the whole window" and is not when it means "one page":
+// each rebuild costs a schema_snapshots query plus a resolver load per epoch
+// touched, so a 400-page window would pay it 400 times. Constructed once per
+// table by foldEventWindow and reused across pages; the one-shot exported
+// functions above wrap a throwaway instance, preserving their contract for
+// callers that fetch in a single call (verify, single-row reconstruct, the
+// console).
+//
+// NOT SAFE FOR CONCURRENT USE — one decoder per table run. This matters because
+// the surrounding machinery is concurrent: ReconstructTables runs up to
+// --parallelism table goroutines. It is safe today because each goroutine's
+// foldEventWindow constructs its own decoder and never shares it, and the page
+// callback runs sequentially on that goroutine.
+type eventDecoder struct {
+	db      *sql.DB
+	schema  string
+	table   string
+	epochs  []metadata.SnapshotEpoch
+	enum    metadata.EnumMapperSource
+	binMemo map[int]binMemo
+	// typed reports whether every event seen so far could be typed against a
+	// real snapshot. It only ever goes false — a single untypable epoch means
+	// the run cannot claim its BLOB/TEXT values were decoded. Accumulates
+	// across pages, which is what makes it correct for a paged caller.
+	typed bool
+}
+
+// binMemo caches one epoch's BLOB/TEXT column set. cols may be nil with ok
+// true: that is "this epoch resolved fine and the table has no BLOB/TEXT
+// columns", which is different from "the epoch could not be resolved".
+type binMemo struct {
+	cols map[string]bool
+	ok   bool
+}
+
+func newEventDecoder(db *sql.DB, schema, table string, latest *metadata.Resolver) *eventDecoder {
+	d := &eventDecoder{db: db, schema: schema, table: table, binMemo: map[int]binMemo{}, typed: true}
+	if db == nil {
+		d.typed = false
+		return d
+	}
 	epochs, err := metadata.LoadSnapshotEpochs(db)
 	if err != nil {
-		slog.Debug("snapshot epoch lookup failed; leaving BLOB/TEXT as stored base64",
+		slog.Debug("snapshot epoch lookup failed; decoding ENUM/SET with the latest snapshot and leaving BLOB/TEXT as stored base64",
 			"schema", schema, "table", table, "err", err)
 		epochs = nil
 	}
-	// The per-epoch BLOB/TEXT column map is memoized; the check sits before
-	// NewResolver so a snapshot whose resolver fails to load is probed at most
-	// once, not once per row.
-	type binMemo struct {
-		cols map[string]bool
-		ok   bool // the epoch's resolver + table lookup succeeded (cols may still be nil: no BLOB/TEXT columns)
+	d.epochs = epochs
+	d.enum = metadata.EnumMapperSource{
+		Epochs:      epochs,
+		ResolverFor: func(id int) (*metadata.Resolver, error) { return metadata.NewResolver(db, id) },
+		Fallback:    latest,
 	}
-	memo := make(map[int]binMemo)
-	binColsAt := func(t time.Time) map[string]bool {
-		id, ok := metadata.EpochAt(epochs, t)
-		if !ok {
-			typed = false
-			return nil // no snapshots → no safe typing → leave values as base64
-		}
-		if m, seen := memo[id]; seen {
-			if !m.ok {
-				typed = false
-			}
-			return m.cols
-		}
-		var m binMemo
-		if r, nerr := metadata.NewResolver(db, id); nerr == nil && r != nil {
-			if tm, rerr := r.Resolve(schema, table); rerr == nil {
-				m = binMemo{cols: binaryColsFromTableMeta(tm), ok: true}
-			}
-		}
-		memo[id] = m
-		if !m.ok {
-			typed = false
-		}
-		return m.cols
+	return d
+}
+
+// mapEnums rewrites ENUM/SET ordinals to labels in place, per event, using the
+// snapshot in effect at that event's own timestamp.
+func (d *eventDecoder) mapEnums(events []query.ResultRow) {
+	if len(events) == 0 || d.db == nil {
+		return
 	}
 	for i := range events {
-		binCols := binColsAt(events[i].EventTimestamp)
+		m := d.enum.MapperAt(d.schema, d.table, events[i].EventTimestamp)
+		m.MapImage(events[i].RowBefore)
+		m.MapImage(events[i].RowAfter)
+	}
+}
+
+// decodeBinaries reverses the storage-side base64 of BLOB/TEXT columns in
+// place. Not idempotent — call it exactly once per event.
+func (d *eventDecoder) decodeBinaries(events []query.ResultRow) {
+	if len(events) == 0 || d.db == nil {
+		return
+	}
+	for i := range events {
+		binCols := d.binColsAt(events[i].EventTimestamp)
 		decodeImageBinaries(events[i].RowBefore, binCols)
 		decodeImageBinaries(events[i].RowAfter, binCols)
 	}
-	return typed
+}
+
+// binColsAt returns the BLOB/TEXT column set for the snapshot epoch covering t.
+// The memo check sits before NewResolver so a snapshot whose resolver fails to
+// load is probed at most once, not once per row — and, since #1097, at most
+// once for the whole window rather than once per page.
+func (d *eventDecoder) binColsAt(t time.Time) map[string]bool {
+	id, ok := metadata.EpochAt(d.epochs, t)
+	if !ok {
+		d.typed = false
+		return nil // no snapshots → no safe typing → leave values as base64
+	}
+	if m, seen := d.binMemo[id]; seen {
+		if !m.ok {
+			d.typed = false
+		}
+		return m.cols
+	}
+	var m binMemo
+	if r, nerr := metadata.NewResolver(d.db, id); nerr == nil && r != nil {
+		if tm, rerr := r.Resolve(d.schema, d.table); rerr == nil {
+			m = binMemo{cols: binaryColsFromTableMeta(tm), ok: true}
+		}
+	}
+	d.binMemo[id] = m
+	if !m.ok {
+		d.typed = false
+	}
+	return m.cols
 }
 
 // decodeImageBinaries decodes the storage-side base64 of every BLOB/TEXT column
