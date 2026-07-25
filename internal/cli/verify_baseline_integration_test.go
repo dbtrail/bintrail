@@ -110,7 +110,7 @@ func TestRunVerifyBaselinePair_EndToEnd(t *testing.T) {
 // Same setup as _EndToEnd, but the indexed UPDATE's after-image ("cancelled")
 // disagrees with the new baseline's row ("shipped"), so reconstruct(prev→anchor)
 // differs from the new baseline. The assertion checks the mismatch-specific
-// signal ("1 mismatch"), NOT merely err != nil: printVerifyReport also errors on
+// signal ("1 mismatch"), NOT merely err != nil: emitVerifyReport also errors on
 // the all-inconclusive (match==0) path, so an err-only check would pass even if
 // the comparison silently degraded to inconclusive instead of detecting the
 // divergence. The divergence is built from a disagreeing after-image, not an

@@ -438,12 +438,19 @@ func verifyTargetTables(cmd *cobra.Command, indexDB *sql.DB) ([]schemaTable, err
 	return out, rows.Err()
 }
 
-// verifyWantsJSON reports whether --format selected JSON. Case-insensitive and
-// read-only: normalizing the flag global in place would leak one invocation's
-// value into the next in any in-process caller (tests today, a /api/verify-style
-// embedder tomorrow), since these command globals are never reset.
+// verifyWantsJSON reports whether --format selected JSON.
+//
+// The compare is EXACT and the flag global is left untouched. Exact is what
+// every sibling does (status.go:118, query, recover, rotate, recover-cascade,
+// telemetry) and — load-bearing — what BOTH error shims do: cliapp/root.go's
+// and cmd/bintrail-pg/main.go's wantsJSON decide between {"error":...} and bare
+// text with `f.Value.String() == "json"`. A case-insensitive read here would
+// split the contract in half, emitting a JSON report on stdout under
+// `--format JSON` while the error still went out as plain text on stderr.
+// Read-only because these command globals are never reset, so normalizing in
+// place would leak one invocation's value into the next in-process caller.
 func verifyWantsJSON() bool {
-	return strings.EqualFold(vfyFormat, "json")
+	return vfyFormat == "json"
 }
 
 // emitVerifyReport writes the report in the requested format and returns the

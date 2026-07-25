@@ -229,6 +229,62 @@ func TestVerifyTextFormatUnchanged(t *testing.T) {
 	}
 }
 
+// TestVerifyFormatIsCaseSensitive: `--format JSON` renders TEXT, exactly like
+// every other --format command in the repo (status.go:118, query, recover,
+// rotate, recover-cascade, telemetry all compare exactly) — and, load-bearing,
+// exactly like the two error shims. cliapp/root.go's and cmd/bintrail-pg/
+// main.go's wantsJSON decide between {"error":...} and bare text on stderr with
+// `f.Value.String() == "json"`, reading the SAME flag value. If verify matched
+// case-insensitively it would be the only command where `--format JSON` yields
+// JSON at all, and it would yield it only half-way: a JSON report on stdout
+// with a bare-text error on stderr.
+//
+// (IsValidOutputFormat is case-insensitive, so "JSON" is accepted, not
+// rejected — this is about what it then renders, not about validation.)
+func TestVerifyFormatIsCaseSensitive(t *testing.T) {
+	for _, format := range []string{"JSON", "Json", "jSoN"} {
+		t.Run(format, func(t *testing.T) {
+			setVerifyFormat(t, format)
+
+			// The predicate both roots' wantsJSON shims apply to this same flag.
+			if err := verifyCmd.Flags().Set("format", format); err != nil {
+				t.Fatalf("set --format %q: %v", format, err)
+			}
+			t.Cleanup(func() { _ = verifyCmd.Flags().Set("format", "text") })
+			shimWantsJSON := verifyCmd.Flags().Lookup("format").Value.String() == "json"
+			if shimWantsJSON {
+				t.Fatalf("root shim would treat --format %q as JSON; test premise is wrong", format)
+			}
+			if got := verifyWantsJSON(); got != shimWantsJSON {
+				t.Errorf("verifyWantsJSON() = %v for --format %q, but the root wantsJSON shim says %v — "+
+					"the report and the error would take different shapes on one invocation",
+					got, format, shimWantsJSON)
+			}
+
+			// And the rendering follows: text on cmd.OutOrStdout(), nothing on
+			// os.Stdout (where cliutil.OutputJSON would have written).
+			cmd := &cobra.Command{}
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			rep := verify.NewReport(verify.ModeBaselinePair, []verify.TableResult{
+				{Schema: "mydb", Table: "orders", Status: verify.StatusMatch, SourceRows: 5, ReconstructRows: 5},
+			})
+			var reportErr error
+			stdout := captureVerifyStdout(t, func() { reportErr = emitVerifyReport(cmd, rep) })
+			if reportErr != nil {
+				t.Fatalf("emitVerifyReport: %v", reportErr)
+			}
+			if strings.TrimSpace(stdout) != "" {
+				t.Errorf("--format %q wrote a JSON document to stdout:\n%s", format, stdout)
+			}
+			if !strings.Contains(out.String(), "mydb.orders") ||
+				!strings.Contains(out.String(), "1 match, 0 mismatch, 0 inconclusive, 0 error") {
+				t.Errorf("--format %q did not render the text report:\n%s", format, out.String())
+			}
+		})
+	}
+}
+
 // TestVerifyInvalidFormat: an unsupported --format is rejected up front, before
 // any database connection is attempted.
 func TestVerifyInvalidFormat(t *testing.T) {

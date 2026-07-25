@@ -34,10 +34,17 @@ const (
 // verdicts, run-level verdict and summary counts the text report prints, plus
 // the per-table Anchor the text table has no column for.
 //
-// It is the payload of `bintrail verify --format json` and is deliberately
-// built here rather than in the command layer so a future console /api/verify
-// (#677) can serialize the identical shape server-side — NewReport is pure (no
-// IO, no flags, no stdout), and the CLI owns only the encoding.
+// It is the payload of `bintrail verify --format json`, and ONLY that. The
+// console's verify surface (#677) already shipped with a wire shape of its own
+// — console.VerifyTableResult/VerifySummary/VerifyStatus, fed by consoleapp's
+// verifySupervisor, which classifies statuses into buckets itself (including
+// the same default→Error rule normalizeStatus owns here). The two shapes are
+// deliberately NOT unified today; unifying them is follow-up work, not an
+// assumption anything here may rely on.
+//
+// It is still built in this package rather than in the command layer so the
+// construction stays pure — NewReport does no IO, reads no flags, writes no
+// stdout — and the CLI owns only the encoding.
 //
 // It carries no stream-continuity signal: verify never reads stream_state, and
 // asserting continuity it did not check would be exactly the false assurance
