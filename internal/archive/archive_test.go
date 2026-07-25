@@ -15,8 +15,8 @@ import (
 )
 
 func TestBinlogEventColumns_count(t *testing.T) {
-	if len(BinlogEventColumns) != 17 {
-		t.Errorf("expected 17 columns, got %d", len(BinlogEventColumns))
+	if len(BinlogEventColumns) != 18 {
+		t.Errorf("expected 18 columns, got %d", len(BinlogEventColumns))
 	}
 }
 
@@ -25,7 +25,7 @@ func TestBinlogEventColumns_names(t *testing.T) {
 		"event_id", "binlog_file", "start_pos", "end_pos",
 		"event_timestamp", "gtid", "connection_id", "schema_name", "table_name",
 		"event_type", "pk_values", "changed_columns", "row_before", "row_after",
-		"schema_version", "query_text", "query_hash",
+		"schema_version", "query_text", "query_hash", "commit_ts_us",
 	}
 	for i, want := range wantNames {
 		if i >= len(BinlogEventColumns) {

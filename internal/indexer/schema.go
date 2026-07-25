@@ -124,6 +124,7 @@ func buildBinlogEventsDDL(parts []string, encrypt bool) string {
     schema_version  INT UNSIGNED     NOT NULL DEFAULT 0 COMMENT 'snapshot_id from schema_snapshots at index time; enables per-row resolver lookup for recovery',
     query_text      MEDIUMTEXT       DEFAULT NULL COMMENT 'original SQL statement from ROWS_QUERY/ANNOTATE_ROWS; NULL unless binlog_rows_query_log_events (MySQL) / binlog_annotate_row_events (MariaDB) is ON at the source (#699)',
     query_hash      CHAR(64)         DEFAULT NULL COMMENT 'STATEMENT_DIGEST(query_text) computed on the index connection at index time; groups statements by normalized shape (#699)',
+    commit_ts_us    BIGINT UNSIGNED  DEFAULT NULL COMMENT 'transaction commit time in microseconds since epoch, from the GTID event immediate_commit_timestamp (MySQL 8.0.1+, anonymous GTID events included); NULL on MariaDB and pre-8.0.1 MySQL',
     PRIMARY KEY (event_id, event_timestamp),
     INDEX idx_row_lookup (schema_name, table_name, event_timestamp),
     INDEX idx_pk_hash    (schema_name, table_name, pk_hash, event_timestamp),

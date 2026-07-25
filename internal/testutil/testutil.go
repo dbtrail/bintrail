@@ -270,6 +270,7 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		schema_version  INT UNSIGNED     NOT NULL DEFAULT 0,
 		query_text      MEDIUMTEXT       DEFAULT NULL,
 		query_hash      CHAR(64)         DEFAULT NULL,
+		commit_ts_us    BIGINT UNSIGNED  DEFAULT NULL,
 		PRIMARY KEY (event_id, event_timestamp),
 		INDEX idx_row_lookup (schema_name, table_name, event_timestamp),
 		INDEX idx_pk_hash    (schema_name, table_name, pk_hash, event_timestamp),

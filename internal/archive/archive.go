@@ -45,6 +45,10 @@ var BinlogEventColumns = []baseline.Column{
 	{Name: "schema_version", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
 	{Name: "query_text", MySQLType: "text", ParquetType: baseline.MysqlToParquetNode("text")},
 	{Name: "query_hash", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	// commit_ts_us is BIGINT UNSIGNED microseconds since epoch (#18); the Int64
+	// Parquet node it maps to holds it losslessly (epoch µs stays far below
+	// 2^63 — year 294247).
+	{Name: "commit_ts_us", MySQLType: "bigint", Unsigned: true, ParquetType: baseline.MysqlToParquetNode2("bigint", true)},
 }
 
 // ArchivePartition writes all rows from the named partition of binlog_events
@@ -89,7 +93,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 	q := fmt.Sprintf(
 		"SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp,"+
 			" gtid, connection_id, schema_name, table_name, event_type, pk_values,"+
-			" changed_columns, row_before, row_after, schema_version, query_text, query_hash"+
+			" changed_columns, row_before, row_after, schema_version, query_text, query_hash, commit_ts_us"+
 			" FROM `%s`.`binlog_events` PARTITION (`%s`) ORDER BY event_id",
 		dbName, partition,
 	)
@@ -125,11 +129,13 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			schemaVersion  sql.NullInt32
 			queryText      sql.NullString
 			queryHash      sql.NullString
+			commitTsUS     sql.NullInt64
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
 			&gtid, &connID, &schemaName, &tableName, &eventType, &pkValues,
 			&changedColumns, &rowBefore, &rowAfter, &schemaVersion, &queryText, &queryHash,
+			&commitTsUS,
 		); err != nil {
 			return rowCount, fmt.Errorf("scan row: %w", err)
 		}
@@ -137,6 +143,10 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		connIDStr := ""
 		if connID.Valid {
 			connIDStr = strconv.FormatInt(connID.Int64, 10)
+		}
+		commitTsStr := ""
+		if commitTsUS.Valid {
+			commitTsStr = strconv.FormatInt(commitTsUS.Int64, 10)
 		}
 		eventTimestampStr := ""
 		if eventTimestamp.Valid {
@@ -161,6 +171,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			strconv.FormatInt(int64(schemaVersion.Int32), 10),
 			queryText.String,
 			queryHash.String,
+			commitTsStr,
 		}
 		nulls := []bool{
 			false, // event_id (AUTO_INCREMENT, cannot be NULL)
@@ -180,6 +191,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			!schemaVersion.Valid,
 			!queryText.Valid,
 			!queryHash.Valid,
+			!commitTsUS.Valid,
 		}
 
 		if err := w.WriteRow(values, nulls); err != nil {

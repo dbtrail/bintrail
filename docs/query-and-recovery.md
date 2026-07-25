@@ -87,6 +87,21 @@ Notes:
 - Under an active `--profile`, `query_text` and `query_hash` are withheld on **every** row, not just rows of flagged tables — a single statement can touch several tables, so its text can embed values of a column your profile redacts even when the row itself belongs to another table.
 - The web console never shows these fields (same boundary as `connection_id`).
 
+### Commit time: `commit_ts_us`
+
+Every event carries an `event_timestamp` with **one-second** resolution — that is all the binlog's common event header holds. A busy server commits many transactions inside one second, so within that second you can see event *order* but not event *time*.
+
+MySQL 8.0.1 and later also write the transaction's commit instant in **microseconds** into the GTID event, and `bintrail` stores it as `commit_ts_us` (microseconds since the Unix epoch, shown in the `json` and `csv` output):
+
+```
+"event_timestamp": "2026-02-19 14:00:00",
+"commit_ts_us": 1771509600123456
+```
+
+It is captured with no configuration: GTIDs do **not** have to be enabled, because MySQL stamps the value on the anonymous GTID event it writes with `gtid_mode=OFF` too. `commit_ts_us` is `NULL` for events indexed before the column existed, on MariaDB (its GTID event carries no commit timestamp), and on MySQL older than 8.0.1 — treat `NULL` as "only the one-second timestamp is known for this event", never as a tie.
+
+Two things it makes possible that the second-resolution timestamp does not: ordering two changes that landed in the same second, and lining an indexed change up with any other microsecond-stamped record — an audit-log entry, an application trace, a slow-query log line.
+
 ---
 
 ## Parquet Archive Queries

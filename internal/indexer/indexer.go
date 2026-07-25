@@ -42,12 +42,12 @@ var WriteTimeout = DefaultWriteTimeout
 // insertColumnCount must equal its column count — pinned by a unit test.
 const insertColumnsSQL = `binlog_file, start_pos, end_pos, event_timestamp, gtid, connection_id, ` +
 	`schema_name, table_name, event_type, pk_values, ` +
-	`changed_columns, row_before, row_after, schema_version, query_text, query_hash`
+	`changed_columns, row_before, row_after, schema_version, query_text, query_hash, commit_ts_us`
 
 const (
 	// insertColumnCount is the number of columns (= placeholders per row) in
 	// insertBatch's multi-row INSERT.
-	insertColumnCount = 16
+	insertColumnCount = 17
 	// maxPreparedStmtParams is MySQL's hard cap on placeholders in one
 	// prepared statement (ER_PS_MANY_PARAM, error 1390).
 	maxPreparedStmtParams = 65535
@@ -231,6 +231,7 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 			ev.SchemaVersion,
 			nullOrString(sanitized[i]),
 			nullOrString(digests[sanitized[i]]),
+			nullOrUint64(ev.CommitTsUS),
 		)
 	}
 
@@ -523,6 +524,16 @@ func nullOrUint32(v uint32) any {
 	return v
 }
 
+// nullOrUint64 mirrors nullOrUint32 for the microsecond commit timestamp: zero
+// is the parser's "the source wrote none" value (MariaDB, pre-8.0.1 MySQL), and
+// it must reach the column as NULL rather than as the epoch.
+func nullOrUint64(v uint64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
 // EnsureSchema adds any columns introduced after the initial schema to
 // binlog_events, schema_snapshots, and stream_state. It is idempotent — safe
 // to call on every startup.
@@ -611,6 +622,15 @@ func EnsureSchema(db *sql.DB) error {
 	}
 	if err := ensureColumn(db, "binlog_events", "query_hash",
 		`ALTER TABLE binlog_events ADD COLUMN query_hash CHAR(64) DEFAULT NULL COMMENT 'STATEMENT_DIGEST(query_text) computed on the index connection at index time; groups statements by normalized shape (#699)' AFTER query_text`,
+	); err != nil {
+		return err
+	}
+	// commit_ts_us carries the transaction's microsecond commit timestamp from
+	// the GTID event (#18). Nullable and additive: rows indexed before this
+	// column existed keep NULL, and so do rows from sources that never write
+	// the value (MariaDB, MySQL < 8.0.1).
+	if err := ensureColumn(db, "binlog_events", "commit_ts_us",
+		`ALTER TABLE binlog_events ADD COLUMN commit_ts_us BIGINT UNSIGNED DEFAULT NULL COMMENT 'transaction commit time in microseconds since epoch, from the GTID event immediate_commit_timestamp (MySQL 8.0.1+, anonymous GTID events included); NULL on MariaDB and pre-8.0.1 MySQL' AFTER query_hash`,
 	); err != nil {
 		return err
 	}

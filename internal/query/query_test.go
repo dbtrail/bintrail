@@ -509,13 +509,18 @@ func TestWriteCSV_headersAndRow(t *testing.T) {
 	if !strings.Contains(lines[1], "DELETE") {
 		t.Errorf("expected DELETE in data row, got: %s", lines[1])
 	}
-	// #699: the two appended columns must stay in lockstep between csvHeaders
+	// #699/#18: every appended column must stay in lockstep between csvHeaders
 	// and the record slice — a one-sided append silently shifts CSV columns.
-	if !strings.HasSuffix(lines[0], ",query_text,query_hash") {
-		t.Errorf("expected header to end with query_text,query_hash, got: %s", lines[0])
+	// commit_ts_us is last and empty for this row (no GTID event behind it), so
+	// the data row ends with the hash followed by that empty field.
+	if !strings.HasSuffix(lines[0], ",query_text,query_hash,commit_ts_us") {
+		t.Errorf("expected header to end with query_text,query_hash,commit_ts_us, got: %s", lines[0])
 	}
-	if !strings.Contains(lines[1], qText) || !strings.HasSuffix(lines[1], ","+qHash) {
+	if !strings.Contains(lines[1], qText) || !strings.HasSuffix(lines[1], ","+qHash+",") {
 		t.Errorf("expected statement text and trailing hash in data row, got: %s", lines[1])
+	}
+	if got, want := len(strings.Split(lines[0], ",")), len(strings.Split(lines[1], ",")); got != want {
+		t.Errorf("header has %d fields, data row %d — csvHeaders and the record slice diverged", got, want)
 	}
 }
 

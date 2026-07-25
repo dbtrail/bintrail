@@ -95,6 +95,11 @@ func (b *Buffer) Insert(events []event.Event) {
 		}
 
 		var queryText *string
+		var commitTsUS *uint64
+		if ev.CommitTsUS != 0 {
+			v := ev.CommitTsUS
+			commitTsUS = &v
+		}
 		if ev.QueryText != "" {
 			s := ev.QueryText
 			queryText = &s
@@ -116,6 +121,7 @@ func (b *Buffer) Insert(events []event.Event) {
 			RowAfter:       ev.RowAfter,
 			SchemaVersion:  ev.SchemaVersion,
 			QueryText:      queryText,
+			CommitTsUS:     commitTsUS,
 			// QueryHash stays nil: the digest is an index-side enrichment
 			// (STATEMENT_DIGEST on the index connection) and the BYOS buffer
 			// has no index database.

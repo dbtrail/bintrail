@@ -148,13 +148,14 @@ func TestEventsHandlerIncludesConnectionID(t *testing.T) {
 		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
 		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	rows := sqlmock.NewRows(cols).AddRow(
 		int64(1), "bin.000001", int64(4), int64(40), ts,
 		nil, int64(4242), "app", "users", int64(parser.EventUpdate), "7",
 		[]byte(`["email"]`), []byte(`{"email":"a@x"}`), []byte(`{"email":"b@x"}`), int64(0),
-		"UPDATE users SET email='b@x'", "cafe0000",
+		"UPDATE users SET email='b@x'", "cafe0000", int64(1767322445000123),
 	)
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
 
@@ -219,6 +220,7 @@ func TestRecoverIsReadOnly(t *testing.T) {
 		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
 		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	// An INSERT event (event_type=1); its reversal is a DELETE built from
@@ -228,7 +230,7 @@ func TestRecoverIsReadOnly(t *testing.T) {
 		int64(1), "bin.000001", int64(4), int64(40), ts,
 		nil, nil, "app", "users", int64(parser.EventInsert), "42",
 		nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0),
-		nil, nil,
+		nil, nil, nil,
 	)
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(resultRows)
 
@@ -273,13 +275,14 @@ func TestRecoverUnderByteBudget(t *testing.T) {
 		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
 		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	resultRows := sqlmock.NewRows(cols).AddRow(
 		int64(1), "bin.000001", int64(4), int64(40), ts,
 		nil, nil, "app", "users", int64(parser.EventInsert), "42",
 		nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0),
-		nil, nil,
+		nil, nil, nil,
 	)
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(resultRows)
 
@@ -333,6 +336,7 @@ func TestRecoverOverByteBudget(t *testing.T) {
 		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
 		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	const (
@@ -350,7 +354,7 @@ func TestRecoverOverByteBudget(t *testing.T) {
 			int64(i+1), "bin.000001", int64(4), int64(40), ts,
 			nil, nil, "app", "users", int64(parser.EventInsert), fmt.Sprintf("%d", i),
 			nil, nil, rowAfter, int64(0),
-			nil, nil,
+			nil, nil, nil,
 		)
 	}
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(resultRows)

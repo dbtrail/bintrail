@@ -23,13 +23,14 @@ func TestFetch_profileActiveBlanksQueryText(t *testing.T) {
 		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
 		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
 		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	rows := sqlmock.NewRows(cols).AddRow(
 		int64(1), "bin.000001", int64(4), int64(40), ts,
 		nil, nil, "app", "users", int64(2), "7",
 		nil, []byte(`{"ssn":"123-45-6789"}`), []byte(`{"ssn":"999"}`), int64(0),
-		"UPDATE app.users SET ssn='999' WHERE id=7", "cafe0000",
+		"UPDATE app.users SET ssn='999' WHERE id=7", "cafe0000", int64(1767322445000123),
 	)
 	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
 

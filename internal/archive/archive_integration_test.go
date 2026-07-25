@@ -203,3 +203,65 @@ func TestArchivePartition_queryTextRoundTrip(t *testing.T) {
 			row[0][textIdx], row[0][hashIdx])
 	}
 }
+
+// TestArchivePartition_commitTsRoundTrip pins the #18 write half against a real
+// index: the microsecond stamp reaches the Parquet file EXACTLY, and an event
+// without one is written as a real Parquet NULL rather than a zero (which would
+// read back as the epoch). The scan/values/nulls triple in ArchivePartition is
+// positional — this is what catches a column added to the SELECT and forgotten
+// in one of the other two.
+func TestArchivePartition_commitTsRoundTrip(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	const stamped = uint64(1771509600123456)
+	ts := "2026-02-19 14:00:00"
+	if _, err := db.Exec(`INSERT INTO binlog_events
+		(binlog_file, start_pos, end_pos, event_timestamp,
+		 schema_name, table_name, event_type, pk_values, row_after, commit_ts_us)
+		VALUES (?, 100, 200, ?, 'mydb', 'orders', 2, '1', '{"id":1}', ?)`,
+		"binlog.000001", ts, stamped,
+	); err != nil {
+		t.Fatalf("insert row with commit_ts_us failed: %v", err)
+	}
+	// Second row: no commit timestamp (MariaDB, or pre-8.0.1 MySQL).
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ts, nil, "mydb", "orders", 1, "2",
+		nil, nil, []byte(`{"id":2}`))
+
+	outPath := filepath.Join(t.TempDir(), "p_future.parquet")
+	n, err := ArchivePartition(context.Background(), db, dbName, "p_future", outPath, "none")
+	if err != nil {
+		t.Fatalf("ArchivePartition failed: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("rowCount = %d, want 2", n)
+	}
+
+	rf, err := os.Open(outPath)
+	if err != nil {
+		t.Fatalf("open archived parquet: %v", err)
+	}
+	defer rf.Close()
+	info, _ := rf.Stat()
+	pf, err := parquet.OpenFile(rf, info.Size())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	idx := parquetColumnIndex(t, pf, "commit_ts_us")
+	reader := parquet.NewReader(pf)
+	defer reader.Close()
+
+	row := make([]parquet.Row, 1)
+	if _, err := reader.ReadRows(row); err != nil {
+		t.Fatalf("ReadRows row 0: %v", err)
+	}
+	if got := row[0][idx].Int64(); uint64(got) != stamped {
+		t.Errorf("row 0 commit_ts_us = %d, want %d", got, stamped)
+	}
+	if _, err := reader.ReadRows(row); err != nil {
+		t.Fatalf("ReadRows row 1: %v", err)
+	}
+	if !row[0][idx].IsNull() {
+		t.Errorf("row 1 commit_ts_us must be a real Parquet NULL, got %v", row[0][idx])
+	}
+}

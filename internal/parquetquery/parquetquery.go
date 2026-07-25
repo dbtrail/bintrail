@@ -795,6 +795,7 @@ func buildQueryFromFiles(files []string, opts query.Options, cols map[string]boo
 		" gtid, " + optionalCol(cols, "connection_id", "INT32") + ", schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version," +
 		" " + optionalCol(cols, "query_text", "VARCHAR") + ", " + optionalCol(cols, "query_hash", "VARCHAR") +
+		", " + optionalCol(cols, "commit_ts_us", "BIGINT") +
 		" FROM parquet_scan(" + fileArrayLiteral(files) + ", hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -834,7 +835,7 @@ func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
-		" changed_columns, row_before, row_after, schema_version, query_text, query_hash" +
+		" changed_columns, row_before, row_after, schema_version, query_text, query_hash, commit_ts_us" +
 		" FROM parquet_scan('" + safePath + "', union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -858,7 +859,7 @@ func buildQuery(glob string, opts query.Options) (string, []any) {
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, connection_id, schema_name, table_name, event_type, pk_values," +
-		" changed_columns, row_before, row_after, schema_version, query_text, query_hash" +
+		" changed_columns, row_before, row_after, schema_version, query_text, query_hash, commit_ts_us" +
 		" FROM parquet_scan('" + safeGlob + "', hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -1036,6 +1037,7 @@ func buildQueryForFile(path string, opts query.Options, cols map[string]bool) (s
 		" gtid, " + optionalCol(cols, "connection_id", "INT32") + ", schema_name, table_name, event_type, pk_values," +
 		" changed_columns, row_before, row_after, schema_version," +
 		" " + optionalCol(cols, "query_text", "VARCHAR") + ", " + optionalCol(cols, "query_hash", "VARCHAR") +
+		", " + optionalCol(cols, "commit_ts_us", "BIGINT") +
 		" FROM parquet_scan('" + safePath + "', hive_partitioning=true, union_by_name=true)"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -1129,11 +1131,13 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 			schemaVersion  sql.NullInt32
 			queryText      sql.NullString
 			queryHash      sql.NullString
+			commitTsUS     sql.NullInt64
 		)
 		if err := rows.Scan(
 			&eventID, &binlogFile, &startPos, &endPos, &eventTimestamp,
 			&gtid, &connID, &schemaName, &tableName, &eventType, &pkValues,
 			&changedCols, &rowBefore, &rowAfter, &schemaVersion, &queryText, &queryHash,
+			&commitTsUS,
 		); err != nil {
 			return nil, fmt.Errorf("scan parquet result: %w", err)
 		}
@@ -1162,6 +1166,14 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 		}
 		if queryHash.Valid {
 			r.QueryHash = &queryHash.String
+		}
+		// Archives written before #18 have no commit_ts_us at all: optionalCol
+		// substitutes a typed NULL, which lands here as invalid and leaves the
+		// pointer nil — the same "only the one-second timestamp is known"
+		// signal a live row from a MariaDB source carries.
+		if commitTsUS.Valid && commitTsUS.Int64 > 0 {
+			v := uint64(commitTsUS.Int64)
+			r.CommitTsUS = &v
 		}
 		if changedCols.Valid && changedCols.String != "" {
 			_ = json.Unmarshal([]byte(changedCols.String), &r.ChangedColumns)

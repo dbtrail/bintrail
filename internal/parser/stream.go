@@ -135,6 +135,11 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	var currentFile string
 	var currentGTID string
 	var currentConnectionID uint32 // pseudo_thread_id from most recent QueryEvent
+	// currentCommitTsUS is the microsecond commit timestamp of the transaction
+	// in flight, from its GTID event. Transaction-scoped like currentGTID; zero
+	// when the source writes none (MariaDB, or MySQL < 8.0.1). gtid_mode=OFF
+	// still yields a value: 8.0 stamps the ANONYMOUS_GTID_EVENT too.
+	var currentCommitTsUS uint64
 	// lastLogPos tracks the highest EventHeader.LogPos seen since the last
 	// RotateEvent, to detect a same-file position wraparound (#845) live,
 	// during streaming — see the check at the top of handleEvent below.
@@ -269,6 +274,9 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			}
 			currentGTID = formatGTID(binlogEv.Header.EventType, ev.SID, ev.GNO)
 			currentQueryText = "" // transaction boundary — statement text never crosses it
+			// immediate_commit_timestamp (µs since epoch), MySQL 8.0.1+; zero
+			// on older servers — the "unknown" value Event.CommitTsUS documents.
+			currentCommitTsUS = ev.ImmediateCommitTimestamp
 			if err := emitGTIDTracking(binlogEv.Header); err != nil {
 				return err
 			}
@@ -285,6 +293,10 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			}
 			currentGTID = ev.GTID.String()
 			currentQueryText = ""
+			// MariaDB's GTID event has no commit timestamp: reset rather than
+			// carry the previous transaction's value forward — a stale
+			// microsecond stamp reads as precise and would be worse than none.
+			currentCommitTsUS = 0
 			if err := emitGTIDTracking(binlogEv.Header); err != nil {
 				return err
 			}
@@ -368,7 +380,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			// nil gapTracker: the stream keeps its warn-and-continue skip
 			// behavior (the synchronous DDL hook, SetSyncDDLHook, is the
 			// stream's post-DDL correctness mechanism, not file-level failure).
-			err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentQueryText, sp.schemaVersion.Load(), out, nil)
+			err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, sp.schemaVersion.Load(), out, nil)
 			// Statement boundary — see the file parser's RowsEvent case: the
 			// STMT_END_F clear prevents a ROWS_QUERY-less later statement in
 			// the same transaction from inheriting this statement's text.
@@ -384,6 +396,20 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 					return err
 				}
 			}
+
+		default:
+			// Unnamed event types are dropped. Say so at debug level: this
+			// switch's silence is how ROWS_QUERY_EVENT stayed invisible for
+			// years — nothing reported that the stream was seeing an event
+			// kind with no case. Debug, not info: the common unnamed types
+			// (FORMAT_DESCRIPTION, PREVIOUS_GTIDS, STOP, HEARTBEAT…) are
+			// uninteresting and frequent, so a louder level would be noise;
+			// the point is that the answer EXISTS when someone asks why some
+			// source metadata never appears in the index.
+			sp.logger.Debug("binlog event type not handled by the stream parser",
+				"file", currentFile,
+				"pos", binlogEv.Header.LogPos,
+				"event_type", binlogEv.Header.EventType.String())
 		}
 		return nil
 	}

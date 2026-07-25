@@ -82,8 +82,27 @@ type Event struct {
 	// capture is opt-in on the source (#699). Statement-scoped: a multi-statement
 	// transaction stamps each statement's own text onto its rows.
 	QueryText string
-	Schema    string
-	Table     string
+	// CommitTsUS is the transaction's commit time in MICROSECONDS since the
+	// Unix epoch, read from the GTID event's immediate_commit_timestamp
+	// (MySQL 8.0.1+). Zero when unavailable: a MariaDB source (neither its GTID
+	// event nor its ANNOTATE_ROWS event carries one) or a MySQL older than
+	// 8.0.1. GTIDs do NOT have to be enabled — 8.0 stamps the value on the
+	// ANONYMOUS_GTID_EVENT it writes under gtid_mode=OFF as well, which the
+	// integration test in internal/parser pins against a live server.
+	//
+	// The common-header timestamp every event already carries resolves to one
+	// SECOND, which is far coarser than the rate at which a busy server
+	// commits — inside one second, event order is knowable but event TIME is
+	// not. Capturing the microsecond value keeps the fidelity the source
+	// wrote down instead of discarding it at the parser; correlating an
+	// indexed change against any other microsecond-stamped record (audit
+	// logs, application traces) is impossible after it is lost.
+	//
+	// Transaction-scoped, exactly like ConnectionID: set from the GTID event
+	// that opens the transaction and stamped on every row event inside it.
+	CommitTsUS uint64
+	Schema     string
+	Table      string
 	// EventType numeric values are a PERSISTENCE CONTRACT: stored as a number in
 	// binlog_events.event_type and filtered by it. Never renumber existing values.
 	EventType     EventType
