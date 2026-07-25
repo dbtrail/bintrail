@@ -146,6 +146,14 @@ oldest events were walked, so a clean result would be a partial check. A
 mismatch found inside a truncated window *is* still conclusive: the events that
 were walked are real.
 
+> **The `30d` default assumes your window is actually covered.** If partitions
+> older than your retention were rotated out of MySQL and never archived to
+> Parquet, a 30-day lookback covers hours that no longer exist, and *every*
+> table reports `inconclusive` with a coverage-gap reason. That is correct
+> behavior, not a bug — but the fix is to **shorten `--lookback`** to your real
+> retention (or enable archiving), not to ignore the result. Since an
+> all-inconclusive run exits non-zero, a cron gate will tell you immediately.
+
 Memory bound: the walk loads at most `--max-events` events per table (default
 200,000) plus one row of state per distinct primary key seen. The cap is a
 **row count, not a byte budget** — a BLOB/TEXT-heavy table is still large at a

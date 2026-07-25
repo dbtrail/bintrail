@@ -388,6 +388,102 @@ func TestCompareImages_JSONKeyOrderIsNotADivergence(t *testing.T) {
 	}
 }
 
+// riDeferredInput is a table carrying the value classes whose EVENT-IMAGE
+// representation differs from their at-rest one: TEXT and BLOB (stored base64),
+// and ENUM (stored as an ordinal).
+func riDeferredInput(events []query.ResultRow) recoverChainInput {
+	cols := []metadata.ColumnMeta{
+		{Name: "id", DataType: "int", ColumnType: "int", IsPK: true},
+		{Name: "body", DataType: "text", ColumnType: "text"},
+		{Name: "blob_col", DataType: "blob", ColumnType: "blob"},
+		{Name: "state", DataType: "enum", ColumnType: "enum('new','done')"},
+	}
+	byName := make(map[string]metadata.ColumnMeta, len(cols))
+	for _, c := range cols {
+		byName[c.Name] = c
+	}
+	return recoverChainInput{
+		Schema: "shop", Table: "notes",
+		Events:        events,
+		PKCols:        cols[:1],
+		ColByName:     byName,
+		BinariesTyped: true,
+	}
+}
+
+func riDeferredRow(id int, body, blobVal, state string) map[string]any {
+	return map[string]any{
+		"id":       json.Number(itoa(id)),
+		"body":     body,
+		"blob_col": blobVal,
+		"state":    state,
+	}
+}
+
+// This mode is the FIRST consumer to compare a previous event's row_after
+// against the next event's row_before, so the normalization passes it runs
+// (MapEventEnumLabels / DecodeEventBinaries) must touch BOTH images. They do —
+// and if that ever regressed to row_after-only, every table with a TEXT column
+// would report a conclusive MISMATCH on every event (TEXT is deliberately NOT
+// in the deferred set, so nothing would downgrade it to inconclusive). This
+// test walks a clean chain over exactly those value classes so the regression
+// cannot land silently.
+func TestCheckRecoverChains_DeferredTypeColumnsCleanChainPasses(t *testing.T) {
+	out := checkRecoverChains(riDeferredInput([]query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, riDeferredRow(7, "hello", "\x00\x01raw", "new")),
+		riEvent(2, event.EventUpdate, "7",
+			riDeferredRow(7, "hello", "\x00\x01raw", "new"),
+			riDeferredRow(7, "goodbye", "\x00\x01raw", "done")),
+		riEvent(3, event.EventDelete, "7", riDeferredRow(7, "goodbye", "\x00\x01raw", "done"), nil),
+	}))
+	if out.Status != StatusMatch {
+		t.Fatalf("clean chain over TEXT/BLOB/ENUM columns: got %s (%s), want %s", out.Status, out.Detail, StatusMatch)
+	}
+	if out.Assertions != 2 {
+		t.Errorf("want 2 assertions, got %d", out.Assertions)
+	}
+}
+
+// TEXT is deliberately outside the deferred set, so a genuine TEXT divergence
+// in a before-image must stay a CONCLUSIVE mismatch — not be masked as
+// inconclusive just because the table also holds BLOB and ENUM columns.
+func TestCheckRecoverChains_TextDivergenceIsNotMaskedByDeferredNeighbours(t *testing.T) {
+	out := checkRecoverChains(riDeferredInput([]query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, riDeferredRow(7, "hello", "\x00\x01raw", "new")),
+		riEvent(2, event.EventUpdate, "7",
+			riDeferredRow(7, "WRONG", "\x00\x01raw", "new"),
+			riDeferredRow(7, "goodbye", "\x00\x01raw", "done")),
+	}))
+	if out.Status != StatusMismatch {
+		t.Fatalf("a real TEXT divergence must stay conclusive: got %s (%s)", out.Status, out.Detail)
+	}
+	if !strings.Contains(out.Detail, `"body"`) {
+		t.Errorf("detail should name the TEXT column, got: %s", out.Detail)
+	}
+}
+
+// An ENUM value the epoch-aware label mapping could NOT resolve (still a bare
+// ordinal) must degrade a difference to inconclusive rather than fire a false
+// mismatch — the deferred gate the content modes already apply.
+func TestCheckRecoverChains_UnresolvedEnumOrdinalIsInconclusiveNotMismatch(t *testing.T) {
+	out := checkRecoverChains(riDeferredInput([]query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, riDeferredRow(7, "hello", "raw", "new")),
+		riEvent(2, event.EventUpdate, "7",
+			// state came back as an unmapped ordinal, not the label "new".
+			map[string]any{"id": json.Number("7"), "body": "hello", "blob_col": "raw", "state": json.Number("1")},
+			riDeferredRow(7, "hello", "raw", "done")),
+	}))
+	if out.Status == StatusMismatch {
+		t.Fatalf("an unresolvable ENUM representation must not be a mismatch: %s", out.Detail)
+	}
+	if out.Status != StatusInconclusive {
+		t.Fatalf("got %s (%s), want %s", out.Status, out.Detail, StatusInconclusive)
+	}
+	if !strings.Contains(out.Detail, "not conclusive") {
+		t.Errorf("detail should explain why, got: %s", out.Detail)
+	}
+}
+
 // A column set that differs across a schema-version boundary is DDL, not
 // corruption; the same difference within one version is a real divergence.
 func TestCompareImages_ColumnSetDifference(t *testing.T) {
