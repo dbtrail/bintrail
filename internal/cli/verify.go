@@ -3,13 +3,14 @@ package cli
 import (
 	"database/sql"
 	"fmt"
-	"sort"
+	"io"
 	"strings"
 	"text/tabwriter"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -26,6 +27,7 @@ var (
 	vfyTables      string
 	vfyNoArchive   bool
 	vfyExplain     bool
+	vfyFormat      string
 )
 
 var verifyCmd = &cobra.Command{
@@ -58,6 +60,11 @@ the differing columns with the reconstructed value vs the new baseline's. It
 re-runs the same reconstruction the verdict came from (byte-identical by
 construction) — no live source, scratch database, or external tool.
 
+--format json emits the same run as a machine-readable document (per-table
+verdicts with their anchor and reason, summary counts, and the --explain
+drill-downs), for cron/CI consumers that need to know WHICH table diverged
+rather than only the exit code. Exit codes are identical in both formats.
+
 Examples:
   # Baseline-anchored (drift-free), all tables
   bintrail verify --index-dsn "..." --baseline-dir /data/baselines
@@ -79,10 +86,15 @@ func init() {
 	verifyCmd.Flags().StringVar(&vfyTables, "tables", "", "Comma-separated schema.table list (default: all tables in the latest schema snapshot)")
 	verifyCmd.Flags().BoolVar(&vfyNoArchive, "no-archive", false, "Query live MySQL partitions only; skip Parquet archive discovery")
 	verifyCmd.Flags().BoolVar(&vfyExplain, "explain", false, "On a baseline-anchored mismatch, print a row-level drill-down (which primary keys diverged and how) below the report")
+	verifyCmd.Flags().StringVar(&vfyFormat, "format", "text", "Output format: text or json")
 	AddDuckDBTuningFlags(verifyCmd)
 }
 
 func runVerify(cmd *cobra.Command, _ []string) error {
+	if !cliutil.IsValidOutputFormat(vfyFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", vfyFormat)
+	}
+	vfyFormat = strings.ToLower(vfyFormat)
 	if vfyIndexDSN == "" {
 		return fmt.Errorf("--index-dsn is required")
 	}
@@ -155,7 +167,14 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 		if !any {
 			return fmt.Errorf("no baselines found under %q; nothing to verify (check --baseline-dir/--baseline-s3 and that the baseline job is producing complete snapshots)", baselineSrc)
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), "only one baseline under the source; nothing to verify yet (no predecessor to compare against)")
+		const msg = "only one baseline under the source; nothing to verify yet (no predecessor to compare against)"
+		if vfyFormat == "json" {
+			// The one prose line on this path still needs a machine-readable
+			// form, or a --format json consumer would get bare text on stdout
+			// (and no way to tell this benign exit-0 apart from a verified run).
+			return emitVerifyReport(cmd, verify.NewNoPredecessorReport(verify.ModeBaselinePair, baselineSrc, msg))
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), msg)
 		return nil
 	}
 
@@ -289,10 +308,28 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 	if len(results) == 0 {
 		return fmt.Errorf("no tables matched --tables in the baseline pair")
 	}
-	reportErr := printVerifyReport(cmd, results)
+	rep := verify.NewReport(verify.ModeBaselinePair, results)
+	rep.BaselineSource = baselineSrc
+	if vfyFormat == "json" {
+		// JSON is one document, so the drill-downs must be computed BEFORE it is
+		// written (the text path below keeps its stream order: verdict first,
+		// per-row detail after). A drill-down failure stays non-fatal in both —
+		// it must not mask the report's own (mismatch) exit status.
+		for _, p := range toExplain {
+			ex, err := verify.ExplainBaselinePairMismatch(cmd.Context(), cfg, p)
+			if err != nil {
+				rep.Explain = append(rep.Explain, verify.ExplainReport{
+					Schema: p.Schema, Table: p.Table, Unavailable: err.Error(),
+				})
+				continue
+			}
+			rep.Explain = append(rep.Explain, ex.ReportEntry())
+		}
+		return emitVerifyReport(cmd, rep)
+	}
+	reportErr := emitVerifyReport(cmd, rep)
 	// Drill-downs print AFTER the summary table so the verdict reads first, then
-	// the per-row detail for each mismatch. A drill-down failure is non-fatal — it
-	// must not mask the report's own (mismatch) exit status.
+	// the per-row detail for each mismatch.
 	for _, p := range toExplain {
 		ex, err := verify.ExplainBaselinePairMismatch(cmd.Context(), cfg, p)
 		if err != nil {
@@ -346,7 +383,9 @@ func runVerifyLive(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resol
 		}
 		results = append(results, res)
 	}
-	return printVerifyReport(cmd, results)
+	rep := verify.NewReport(verify.ModeLive, results)
+	rep.BaselineSource = baselineSrc
+	return emitVerifyReport(cmd, rep)
 }
 
 // verifyTableFilter parses --tables into a "schema.table" set, or nil for all.
@@ -400,52 +439,34 @@ func verifyTargetTables(cmd *cobra.Command, indexDB *sql.DB) ([]schemaTable, err
 	return out, rows.Err()
 }
 
-// printVerifyReport writes a per-table table and a summary, and returns a
-// non-nil error (non-zero exit) when any table mismatched.
-func printVerifyReport(cmd *cobra.Command, results []verify.TableResult) error {
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Schema != results[j].Schema {
-			return results[i].Schema < results[j].Schema
+// emitVerifyReport writes the report in the requested format and returns the
+// run's exit status. Both formats take their verdict from the SAME
+// Report.ExitError, so --format json cannot drift from --format text: fail on
+// any mismatch or hard error, and fail when nothing was proven.
+func emitVerifyReport(cmd *cobra.Command, rep *verify.Report) error {
+	if vfyFormat == "json" {
+		if err := cliutil.OutputJSON(rep); err != nil {
+			return err
 		}
-		return results[i].Table < results[j].Table
-	})
+		return rep.ExitError()
+	}
+	writeVerifyText(cmd.OutOrStdout(), rep)
+	return rep.ExitError()
+}
 
-	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
+// writeVerifyText renders the per-table table and the summary line.
+func writeVerifyText(out io.Writer, rep *verify.Report) {
+	if rep.Verdict == verify.VerdictNoPredecessor {
+		fmt.Fprintln(out, rep.Message)
+		return
+	}
+	w := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(w, "TABLE\tSTATUS\tROWS(src/recon)\tDETAIL")
-	var match, mismatch, inconclusive, errored int
-	for _, r := range results {
-		switch r.Status {
-		case verify.StatusMatch:
-			match++
-		case verify.StatusMismatch:
-			mismatch++
-		case verify.StatusError:
-			errored++
-		case verify.StatusInconclusive:
-			inconclusive++
-		default:
-			// An unrecognized status (incl. the zero value) must not be filed
-			// under the benign inconclusive bucket — a verify tool's job is to
-			// not hand out false assurance. Count it as an error.
-			errored++
-		}
+	for _, r := range rep.Tables {
 		fmt.Fprintf(w, "%s.%s\t%s\t%d/%d\t%s\n",
-			r.Schema, r.Table, r.Status, r.SourceRows, r.ReconstructRows, r.Detail)
+			r.Schema, r.Table, r.Status, r.SourceRows, r.ReconstructRows, r.Reason)
 	}
 	w.Flush()
-	fmt.Fprintf(cmd.OutOrStdout(), "\n%d match, %d mismatch, %d inconclusive, %d error\n",
-		match, mismatch, inconclusive, errored)
-
-	// Fail the run on any divergence or hard error. Also fail when nothing was
-	// proven (zero matches) — an all-inconclusive run must not read as success
-	// ("recovery verified") to an operator or CI gate.
-	switch {
-	case mismatch > 0:
-		return fmt.Errorf("%d table(s) diverged from the source", mismatch)
-	case errored > 0:
-		return fmt.Errorf("%d table(s) could not be verified due to errors", errored)
-	case match == 0:
-		return fmt.Errorf("no tables were verified (%d inconclusive); nothing proven", inconclusive)
-	}
-	return nil
+	fmt.Fprintf(out, "\n%d match, %d mismatch, %d inconclusive, %d error\n",
+		rep.Summary.Match, rep.Summary.Mismatch, rep.Summary.Inconclusive, rep.Summary.Error)
 }

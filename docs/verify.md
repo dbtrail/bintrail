@@ -90,6 +90,62 @@ Results are **per table**, one of:
   (regenerate the baseline — see below), or a value class this version cannot yet
   compare.
 
+## Machine-readable output (`--format json`)
+
+`--format json` (default `text`) emits the whole run as one JSON document, so a
+scheduled consumer can tell **which** table diverged — and whether the run was
+all-inconclusive — instead of scraping the text columns. The exit code is
+identical in both formats.
+
+```sh
+bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines --format json
+```
+
+```json
+{
+  "mode": "baseline-anchored",
+  "baseline_source": "/data/baselines",
+  "verdict": "mismatch",
+  "tables": [
+    {
+      "schema": "mydb",
+      "table": "orders",
+      "status": "mismatch",
+      "source_rows": 1042,
+      "reconstruct_rows": 1041,
+      "source_digest": "v2:…",
+      "reconstruct_digest": "v2:…",
+      "anchor": "binlog.000007:4711",
+      "reason": "content digest differs"
+    }
+  ],
+  "summary": { "match": 8, "mismatch": 1, "inconclusive": 2, "error": 0, "total": 11 }
+}
+```
+
+- `mode` — `baseline-anchored` or `live-source`.
+- `verdict` — the run outcome, matching the exit code: `verified` (exit 0),
+  `mismatch`, `error`, `unproven` (tables reported, none proven — exit non-zero),
+  or `no_predecessor` (only one baseline; reported, exit 0, with a `message`).
+- `tables[].status` — `match` / `mismatch` / `inconclusive` / `error`, the same
+  bucket counted in `summary`. `anchor` is the point the comparison was anchored
+  to (a GTID set in live-source mode, a `file:pos` binlog coordinate in
+  baseline-anchored mode); `reason` is the detail behind the verdict.
+- `explain[]` — present only with `--explain`: per mismatched table, the capped
+  list of differing rows (`pk`, `kind`, and per-column `recovery` vs `baseline`
+  values), `total_differing_rows`, `overflow_by_kind` for the rows beyond the
+  cap, and `deferred_type_note`. A drill-down that could not be produced appears
+  as an `unavailable` string instead of failing the run.
+
+Errors follow the CLI-wide convention: with `--format json`, the message is
+written to **stderr** as `{"error":"…"}`.
+
+The report carries **no stream-continuity signal** — `verify` never reads
+`stream_state`, and reporting a continuity verdict it did not check would be
+false assurance. That signal is `continuity.status` in
+[`bintrail status --format json`](rotation-and-status.md#stream-continuity-no-data-lost);
+a thorough cron gate runs both.
+
 ## Exit codes (for cron / CI)
 
 - **Non-zero** on any **mismatch** or error, **or** when comparable tables
@@ -123,6 +179,7 @@ diff tool involved.
 | `--tables` | *(all)* | Comma-separated `schema.table` list (default: all tables in the latest schema snapshot; in baseline-anchored mode, snapshot tables with no baseline report `inconclusive` — "never baselined") |
 | `--no-archive` | `false` | Query live MySQL partitions only; skip Parquet archive discovery |
 | `--explain` | `false` | On a baseline-anchored mismatch, print a per-row drill-down |
+| `--format` | `text` | Output format: `text` or `json` (see [Machine-readable output](#machine-readable-output---format-json)) |
 
 One of `--baseline-dir` or `--baseline-s3` is **required** — `verify` always reads baselines, in both modes.
 
