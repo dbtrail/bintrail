@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
@@ -28,6 +29,17 @@ var (
 	vfyNoArchive   bool
 	vfyExplain     bool
 	vfyFormat      string
+	vfyCheck       string
+	vfyLookback    string
+	vfyMaxEvents   int
+)
+
+// The --check values. checkContent is the historical behavior (reconstructed
+// full-table content vs a baseline or the live source); checkRecover is the
+// recover-input chain walk (#1001).
+const (
+	checkContent = "content"
+	checkRecover = "recover"
 )
 
 var verifyCmd = &cobra.Command{
@@ -54,6 +66,18 @@ on any mismatch or error, or when comparable tables existed but none could be
 proven (all inconclusive). A source with only one baseline — no predecessor yet
 — is reported and exits zero.
 
+Both of the above compare full-table CONTENT, reconstructed from the latest
+event per primary key. That cannot exercise the data "bintrail recover" reads
+to build reversal SQL — before-images, DELETE pre-images, and events a newer
+event on the same key superseded. Pass --check recover for that:
+
+  Recover-input — --check recover. Walks each primary key's event chain in time
+  order and asserts the images are internally consistent (every UPDATE/DELETE
+  before-image equals the state the previous event on that key left). Reads the
+  index ONLY: no baseline, no live source. A chain that begins mid-window has
+  no predecessor and is reported inconclusive, never as a mismatch. Bound the
+  window with --lookback and the per-table event budget with --max-events.
+
 Add --explain (baseline-anchored mode) to print, below the report, a row-level
 drill-down of each mismatch: which primary keys diverged and, for changed rows,
 the differing columns with the reconstructed value vs the new baseline's. It
@@ -74,7 +98,10 @@ Examples:
 
   # Live-source, specific tables, S3 baselines
   bintrail verify --source-dsn "..." --index-dsn "..." \
-    --baseline-s3 s3://bucket/baselines --tables mydb.orders,mydb.users`,
+    --baseline-s3 s3://bucket/baselines --tables mydb.orders,mydb.users
+
+  # Recover-input check over the last 7 days (no baseline needed)
+  bintrail verify --index-dsn "..." --check recover --lookback 7d`,
 	RunE: runVerify,
 }
 
@@ -87,6 +114,9 @@ func init() {
 	verifyCmd.Flags().BoolVar(&vfyNoArchive, "no-archive", false, "Query live MySQL partitions only; skip Parquet archive discovery")
 	verifyCmd.Flags().BoolVar(&vfyExplain, "explain", false, "On a baseline-anchored mismatch, print a row-level drill-down (which primary keys diverged and how) below the report")
 	verifyCmd.Flags().StringVar(&vfyFormat, "format", "text", "Output format: text or json")
+	verifyCmd.Flags().StringVar(&vfyCheck, "check", checkContent, "What to verify: content (reconstructed table content vs a baseline or the live source) or recover (recover's before/after image inputs, index-only)")
+	verifyCmd.Flags().StringVar(&vfyLookback, "lookback", "30d", "--check recover only: how far back to walk each primary key's event chain (e.g. 30d, 24h)")
+	verifyCmd.Flags().IntVar(&vfyMaxEvents, "max-events", verify.DefaultRecoverInputsMaxEvents, "--check recover only: per-table cap on events loaded for the chain walk; exceeding it reports inconclusive rather than a partial check")
 	AddDuckDBTuningFlags(verifyCmd)
 }
 
@@ -97,11 +127,24 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 	if vfyIndexDSN == "" {
 		return fmt.Errorf("--index-dsn is required")
 	}
+	switch vfyCheck {
+	case checkContent, checkRecover:
+	default:
+		return fmt.Errorf("invalid --check %q; must be %s or %s", vfyCheck, checkContent, checkRecover)
+	}
 	baselineSrc := vfyBaselineDir
 	if baselineSrc == "" {
 		baselineSrc = vfyBaselineS3
 	}
-	if baselineSrc == "" {
+	// The recover-input check reads binlog_events and nothing else, so
+	// requiring a baseline it never opens would refuse a perfectly runnable
+	// verification. --source-dsn is likewise unused there: accepting it
+	// silently would imply the live source was consulted when it was not.
+	if vfyCheck == checkRecover {
+		if vfySourceDSN != "" {
+			return fmt.Errorf("--source-dsn is not used by --check recover (it verifies recover's inputs from the index alone); omit it")
+		}
+	} else if baselineSrc == "" {
 		return fmt.Errorf("one of --baseline-dir or --baseline-s3 is required")
 	}
 
@@ -131,6 +174,12 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 	duckTuning, err := DuckDBTuningFromFlags(cmd)
 	if err != nil {
 		return err
+	}
+
+	if vfyCheck == checkRecover {
+		// Index-only, source-family agnostic: it walks stored event images,
+		// so it needs neither the source flavor nor a baseline.
+		return runVerifyRecoverInputs(cmd, indexDB, resolver, indexDBName, duckTuning)
 	}
 
 	flavor := query.SourceFlavor(indexDB)
@@ -385,6 +434,55 @@ func runVerifyLive(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resol
 	rep := verify.NewReport(verify.ModeLive, results)
 	rep.BaselineSource = baselineSrc
 	return emitVerifyReport(cmd, rep)
+}
+
+// runVerifyRecoverInputs is the recover-input check (#1001): for each table,
+// walk the per-PK event chains and assert the before/after images `recover`
+// consumes are internally consistent.
+//
+// It shares the report, the renderer and — critically — Report.ExitError with
+// the content modes, so a recover-input mismatch fails a CI/cron gate exactly
+// like any other mismatch instead of going through a second exit path.
+func runVerifyRecoverInputs(cmd *cobra.Command, indexDB *sql.DB, resolver *metadata.Resolver, indexDBName string, duckTuning duckdbutil.Tuning) error {
+	lookback, err := cliutil.ParseRetain(vfyLookback)
+	if err != nil {
+		return fmt.Errorf("--lookback: %w", err)
+	}
+	if vfyMaxEvents < 0 {
+		return fmt.Errorf("--max-events must be >= 0 (0 uses the default of %d)", verify.DefaultRecoverInputsMaxEvents)
+	}
+
+	tables, err := verifyTargetTables(cmd, indexDB)
+	if err != nil {
+		return err
+	}
+	if len(tables) == 0 {
+		return fmt.Errorf("no tables to verify (empty --tables and no schema snapshot)")
+	}
+
+	until := time.Now().UTC()
+	cfg := verify.RecoverInputsConfig{
+		IndexDB:        indexDB,
+		Resolver:       resolver,
+		IndexDBName:    indexDBName,
+		NoArchive:      vfyNoArchive,
+		ArchiveFetcher: TunedArchiveFetcher(duckTuning),
+		Since:          until.Add(-lookback),
+		Until:          until,
+		MaxEvents:      vfyMaxEvents,
+	}
+
+	results := make([]verify.TableResult, 0, len(tables))
+	for _, st := range tables {
+		res, err := verify.VerifyRecoverInputs(cmd.Context(), cfg, st.schema, st.table)
+		if err != nil {
+			// One table's hard error must not abort the run and hide the
+			// other tables' results (including real mismatches).
+			res = verify.TableResult{Schema: st.schema, Table: st.table, Status: verify.StatusError, Detail: err.Error()}
+		}
+		results = append(results, res)
+	}
+	return emitVerifyReport(cmd, verify.NewReport(verify.ModeRecoverInputs, results))
 }
 
 // verifyTableFilter parses --tables into a "schema.table" set, or nil for all.
