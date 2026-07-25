@@ -194,6 +194,13 @@ automatically.
 All five are read-only — annotated `ReadOnlyHint: true` and `IdempotentHint: true`,
 so the client knows they're safe to call repeatedly and never modify state.
 
+If your client lists tools beyond these five, you are running a build that
+registers extras through the extension seam (`ext/mcpext`) — a distribution
+that wraps this core, not the stock binary. Such tools resolve their index
+through the same routing as the built-in five, so they read the server you
+selected and inherit its posture, including the console's refusal of a
+tool-level `index_dsn`.
+
 The same five tools are also served by the web console at `/mcp` (Streamable
 HTTP, console-token auth, per-server routing by URL path) — if you already run
 `bintrail-console`, you may not need this binary at all; see

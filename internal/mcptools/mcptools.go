@@ -38,6 +38,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/dbtrail/dbtrail/ext"
+	"github.com/dbtrail/dbtrail/ext/mcpext"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -66,6 +67,11 @@ type Target struct {
 	// the standalone surface when the DSN carries no database name — the
 	// status tool then refuses with an actionable error.
 	DBName string
+	// SourceDSN is the captured source's DSN when the serving surface knows
+	// one. The built-in tools never use it — they read the index only — but
+	// it is handed to extension tools (ext/mcpext), which may need the live
+	// source. Empty means "no source available", not an error.
+	SourceDSN string
 	// CloseDB is true when the connection was opened for this call and the
 	// handler must close it (standalone). False when the connection is owned
 	// by a long-lived pool (console connManager bundles).
@@ -320,7 +326,52 @@ func NewServer(cfg Config) *mcp.Server {
 		}, MakeReconstructTool(cfg))
 	}
 
+	// Extension tools (mcpext.Register) are added AFTER the built-ins, so a
+	// provider that reuses a core tool name collides visibly instead of
+	// silently replacing it. They resolve their target through the same
+	// Config.Resolve this surface uses, which is what keeps an extension tool
+	// reading the index the operator selected rather than one of its own
+	// choosing. No-op in the stock binaries.
+	mcpext.RunProviders(server, extToolContext(cfg))
+
 	return server
+}
+
+// extToolContext adapts this surface's ResolveTarget into the seam's resolver.
+// Two things are deliberately preserved across the adaptation: the schema
+// migration the surface would run for its own tools (so an extension tool sees
+// the same columns), and connection OWNERSHIP — Close closes a per-call
+// standalone connection and does nothing for a console-pooled one, so a
+// provider has one correct thing to call either way.
+func extToolContext(cfg Config) mcpext.ToolContextFunc {
+	return func(ctx context.Context, argDSN string) (mcpext.ToolContext, error) {
+		if !cfg.AllowDSNParam {
+			// The console rejects DSN parameters on its own tools for the same
+			// reason: an authenticated MCP client must not be able to point the
+			// daemon at an arbitrary database. Extension tools inherit that.
+			argDSN = ""
+		}
+		t, err := cfg.Resolve(ctx, argDSN)
+		if err != nil {
+			return mcpext.ToolContext{}, err
+		}
+		closeFn := func() {}
+		if t.CloseDB {
+			closeFn = func() { t.DB.Close() }
+		}
+		if t.EnsureSchema {
+			if err := indexer.EnsureSchema(t.DB); err != nil {
+				closeFn()
+				return mcpext.ToolContext{}, fmt.Errorf("schema migration: %w", err)
+			}
+		}
+		return mcpext.ToolContext{
+			DB:        t.DB,
+			DBName:    t.DBName,
+			SourceDSN: t.SourceDSN,
+			Close:     closeFn,
+		}, nil
+	}
 }
 
 // DSNTarget adapts a DSN resolution function (override > tool arg > env var,
@@ -342,8 +393,14 @@ func DSNTarget(resolve func(argDSN string) (string, error)) ResolveTarget {
 			return nil, err
 		}
 		return &Target{
-			DB:                  db,
-			DBName:              cfg.DBName,
+			DB:     db,
+			DBName: cfg.DBName,
+			// The standalone server has no per-request server selection, so
+			// its source — when the operator configured one — is the process
+			// environment's. Only extension tools read it; the built-in tools
+			// never touch the source (reconstruct included — it folds a
+			// baseline snapshot with indexed events, never the live server).
+			SourceDSN:           os.Getenv("BINTRAIL_SOURCE_DSN"),
 			CloseDB:             true,
 			EnsureSchema:        true,
 			EnvArchiveDiscovery: true,

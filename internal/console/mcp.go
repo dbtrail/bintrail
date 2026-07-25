@@ -119,9 +119,19 @@ func (s *Server) newMCPServer(id string) *mcp.Server {
 			if err != nil {
 				return nil, err
 			}
+			// The selected entry's source DSN, when it has one: extension
+			// tools (ext/mcpext) may need the live source, and this is the
+			// same value the extension VIEW seam hands a provider. Read from
+			// the registry, never from a tool argument. Empty for the boot
+			// entry and for a selection with no source configured.
+			sourceDSN := ""
+			if e, ok := s.cm.reg.Get(id); ok {
+				sourceDSN = e.SourceDSN
+			}
 			return &mcptools.Target{
-				DB:     b.db,
-				DBName: b.dbName,
+				DB:        b.db,
+				DBName:    b.dbName,
+				SourceDSN: sourceDSN,
 				// Time travel (#953): the bundle's own lookup, NOT
 				// reconstruct.FindBaseline — the method carries the #766
 				// local→S3 fallback, and binding the package function directly
