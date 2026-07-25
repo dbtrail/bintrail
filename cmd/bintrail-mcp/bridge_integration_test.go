@@ -94,7 +94,9 @@ func TestIntegrationBridgePassthrough(t *testing.T) {
 		}
 	}
 	sort.Strings(names)
-	want := []string{"list_schema_changes", "query", "recover", "status"}
+	// reconstruct (#953) is part of the standalone posture, so the bridge must
+	// mirror it like every other tool.
+	want := []string{"list_schema_changes", "query", "reconstruct", "recover", "status"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("mirrored tools = %v, want %v", names, want)
 	}

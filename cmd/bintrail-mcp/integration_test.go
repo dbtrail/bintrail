@@ -76,13 +76,16 @@ func TestListTools(t *testing.T) {
 		names[tool.Name] = true
 	}
 
-	for _, want := range []string{"query", "recover", "status", "list_schema_changes"} {
+	// reconstruct (#953) is opted into by the standalone posture on top of the
+	// four always-on tools — its baseline source is resolved per call, so it is
+	// advertised whether or not one is configured.
+	for _, want := range []string{"query", "recover", "status", "list_schema_changes", "reconstruct"} {
 		if !names[want] {
 			t.Errorf("tool %q not found; got: %v", want, names)
 		}
 	}
-	if len(result.Tools) != 4 {
-		t.Errorf("expected 4 tools, got %d", len(result.Tools))
+	if len(result.Tools) != 5 {
+		t.Errorf("expected 5 tools, got %d", len(result.Tools))
 	}
 }
 
