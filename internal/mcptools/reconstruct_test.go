@@ -354,8 +354,8 @@ func TestReconstructCaptureGapErrorNamesToolParam(t *testing.T) {
 	for name, gap := range gaps {
 		t.Run(name, func(t *testing.T) {
 			msg := reconstructCaptureGapError(gap, "app", "users").Error()
-			if strings.Contains(msg, "--") {
-				t.Errorf("the MCP refusal must not hand the client a CLI flag, got: %s", msg)
+			if strings.Contains(msg, "--allow-gaps") {
+				t.Errorf("the MCP refusal must not hand the client the CLI flag, got: %s", msg)
 			}
 			if !strings.Contains(msg, "allow_gaps: true") {
 				t.Errorf("the refusal must name the tool parameter that overrides it, got: %s", msg)

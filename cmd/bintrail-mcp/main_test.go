@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 
@@ -487,8 +486,8 @@ func TestMCPBManifestToolsMatchServer(t *testing.T) {
 		}
 		manifestNames = append(manifestNames, tool.Name)
 	}
-	sort.Strings(serverNames)
-	sort.Strings(manifestNames)
+	slices.Sort(serverNames)
+	slices.Sort(manifestNames)
 	if !slices.Equal(serverNames, manifestNames) {
 		t.Errorf("packaging/mcpb/manifest.template.json is out of sync with the server:\n  manifest: %v\n  server:   %v",
 			manifestNames, serverNames)

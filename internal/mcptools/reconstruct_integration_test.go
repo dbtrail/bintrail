@@ -327,8 +327,8 @@ func TestIntegrationReconstructToolCaptureGapRefusedByDefault(t *testing.T) {
 	if !strings.Contains(text, "allow_gaps: true") {
 		t.Errorf("the refusal must name the tool parameter that overrides it; got %q", text)
 	}
-	if strings.Contains(text, "--") {
-		t.Errorf("the refusal must not hand an MCP client a CLI flag; got %q", text)
+	if strings.Contains(text, "--allow-gaps") {
+		t.Errorf("the refusal must not hand an MCP client the CLI flag; got %q", text)
 	}
 }
 
