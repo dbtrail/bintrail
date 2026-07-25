@@ -83,6 +83,9 @@ var (
 	rColumnEq       []string
 	rMaxScriptBytes string
 	rAllowGaps      bool
+
+	rSuppressTriggers     bool
+	rRestoreAutoIncrement bool
 )
 
 func init() {
@@ -106,6 +109,10 @@ func init() {
 	recoverCmd.Flags().BoolVar(&rNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only results)")
 	recoverCmd.Flags().StringVar(&rMaxScriptBytes, "max-script-bytes", "2GB", "Refuse to generate a reversal script whose estimated row payload exceeds this size (e.g. 512MB, 4GB; 0 = unlimited). Bounds the rendered-script memory spike on BLOB/TEXT-heavy recoveries (#654).")
 	recoverCmd.Flags().BoolVar(&rAllowGaps, "allow-gaps", false, "Proceed even when the event index has coverage gaps (hours rotated out of MySQL with no archive) or an archive source fails (may produce an incomplete reversal script)")
+	recoverCmd.Flags().BoolVar(&rSuppressTriggers, "suppress-triggers", false,
+		"PostgreSQL sources only: pin 'SET LOCAL session_replication_role = replica' in the script so the apply does not re-fire the target's triggers (which would double-apply side effects the original triggers already logged as their own reversed events). Requires superuser (PG <= 14) or GRANT SET ON PARAMETER (15+) on the applying role, and also disables FOREIGN KEY constraint triggers for the transaction. No effect on a MySQL/MariaDB index — MySQL has no equivalent session toggle.")
+	recoverCmd.Flags().BoolVar(&rRestoreAutoIncrement, "restore-auto-increment", false,
+		"MySQL sources only: append an AUTO_INCREMENT restore checklist after COMMIT for every table the reversal writes. The statements are emitted commented out (the correct value is not derivable from the index — see the block's inline reasoning). No effect on a PostgreSQL index.")
 	AddDuckDBTuningFlags(recoverCmd)
 	_ = recoverCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(recoverCmd)
@@ -361,7 +368,22 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	// (single-source per stream_state) — PostgreSQL needs double-quoted identifiers
 	// and standard-conforming-string escaping; MySQL/MariaDB keep the default. The
 	// read is best-effort and defaults to MySQL (see recovery.DialectForIndex).
-	gen := recovery.NewForDialect(db, resolver, recovery.DialectForIndex(db))
+	dialect := recovery.DialectForIndex(db)
+	gen := recovery.NewForDialect(db, resolver, dialect)
+	// Apply-side codegen switches (#1003). Each is a no-op on the other dialect,
+	// so warn rather than silently ignore: this command is shared by `bintrail`
+	// and `bintrail-pg`, so both flags are visible on both binaries and the
+	// operator's mental model ("triggers won't fire") must not be wrong.
+	gen.SetSuppressTriggers(rSuppressTriggers)
+	if rSuppressTriggers && dialect != recovery.PostgresDialect {
+		slog.Warn("--suppress-triggers has no effect on a MySQL/MariaDB index: MySQL has no session-level toggle " +
+			"to suppress triggers during an apply, so the target's triggers WILL fire on this script")
+	}
+	gen.SetRestoreAutoIncrement(rRestoreAutoIncrement)
+	if rRestoreAutoIncrement && dialect != recovery.MySQLDialect {
+		slog.Warn("--restore-auto-increment has no effect on a PostgreSQL index: it emits a MySQL " +
+			"ALTER TABLE ... AUTO_INCREMENT checklist, which has no PostgreSQL equivalent here")
+	}
 	// Bound the in-memory reversal script (#654): refuse before rendering when
 	// the matched events would render past the budget, rather than buffering a
 	// multi-GB script. 0 (from --max-script-bytes 0) disables the guard.
