@@ -133,7 +133,12 @@ var Required = []Requirement{
 	{
 		Pair:  Pair{Surface: "console", Action: "authz.denied"},
 		Owner: OwnerConsoleUnit,
-		Why:   "an authorization refusal — the one console event that is not a data read",
+		Why:   "an authorization refusal — one of the two console events that are not data reads",
+	},
+	{
+		Pair:  Pair{Surface: "console", Action: "profile.denied"},
+		Owner: OwnerConsoleUnit,
+		Why:   "a data-profile refusal: an unknown profile, or a surface that cannot honor redaction",
 	},
 	{
 		Pair:  Pair{Surface: "console", Action: "reconstruct.run"},

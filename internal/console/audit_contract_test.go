@@ -131,6 +131,32 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:      "profile gate denial",
+			action:    "profile.denied",
+			wantActor: "sam@example.com",
+			call: func(t *testing.T) {
+				srv, err := New(Config{
+					Listen: "127.0.0.1:8090", Token: "static-tok",
+					AuthPath: filepath.Join(t.TempDir(), "auth.yaml"),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				// A session carrying a data profile: cascade synthesis cannot
+				// honor redaction, so its gate refuses before the request ever
+				// reaches an index — no fixture needed.
+				tok, _, err := srv.sessions.IssueWithPolicy("sam@example.com",
+					&ext.AccessPolicy{Permissions: ext.AllPermissions(), Profile: "sensitive"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				w := postJSON(t, srv, "/api/recover-cascade", tok, `{"schema":"app","table":"t","pk":"1"}`)
+				if w.Code != http.StatusForbidden {
+					t.Fatalf("profiled POST /api/recover-cascade = %d, want 403", w.Code)
+				}
+			},
+		},
 	}
 
 	var observed []audittest.Pair

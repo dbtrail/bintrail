@@ -27,8 +27,10 @@ import (
 //     standalone `bintrail shim` AND the console's embedded
 //     flashback port. Actor is the authenticated MySQL user.
 //   - "console" — query.run, recover.generate, recover.cascade,
-//     reconstruct.run, verify.explain, plus authz.denied
-//     (an authorization refusal, not a data read).
+//     reconstruct.run, verify.explain, plus two refusals that
+//     are not data reads: authz.denied (the session's policy
+//     lacks a permission) and profile.denied (an unknown data
+//     profile, or a surface that cannot honor redaction).
 //
 // Deliberately NOT audited, so the contract and the wiring agree:
 //
