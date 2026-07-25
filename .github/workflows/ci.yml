@@ -209,6 +209,8 @@ jobs:
             || { echo "FATAL: MySQL end-to-end integration test did not run — false-green tripwire" >&2; exit 1; }
           grep -q -- '--- PASS: TestCachingSha2ColdAuthSeam' /tmp/mysql-it.out \
             || { echo "FATAL: caching_sha2 cold-auth seam test did not run — false-green tripwire" >&2; exit 1; }
+          grep -q -- '--- PASS: TestIntegrationCrashRestartExactlyOnce_position' /tmp/mysql-it.out \
+            || { echo "FATAL: crash→restart exactly-once test did not run — false-green tripwire" >&2; exit 1; }
 
   integration-mariadb-source:
     # MariaDB-as-source alpha. A MariaDB-source test pairs a NEW MariaDB SOURCE

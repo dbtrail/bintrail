@@ -1963,6 +1963,16 @@ func One(ctx context.Context, cfg Config) error {
 	// the delete rather than risk deleting captured pre-floor rows; the
 	// trade-off is a rare residual duplicate instead of destroyed data.
 	//
+	// That skip is a KNOWN AND ACCEPTED duplicate window, not an oversight
+	// (#500): re-received events in the advanced-over range may be indexed
+	// twice. Closing it would mean deleting on the stale checkpoint's
+	// coordinates, which sit BELOW the purge floor — destroying rows the source
+	// has already purged and can never re-send. A duplicate is visible and
+	// repairable; a deleted pre-floor row is the only surviving copy. The
+	// window is documented for operators in docs/streaming.md ("Known and
+	// accepted: duplicate rows after a GTID-mode auto-advance") and announced
+	// at runtime by the slog.Warn below — it is never silent.
+	//
 	// Guarded to same-mode resumes only (saved.mode == mode): an explicit
 	// --start-file/--start-gtid mode switch is a deliberate one-off operator
 	// action, not the crash-replay case this fix targets, and the saved
@@ -1977,7 +1987,9 @@ func One(ctx context.Context, cfg Config) error {
 	} else if saved != nil && saved.mode == mode && mode == "gtid" {
 		if gtidAdvanced {
 			slog.Warn("skipping dedup-on-resume after GTID gap auto-advance; " +
-				"re-received events in this window may be duplicated")
+				"re-received events in this window may be duplicated — this is a known, " +
+				"accepted trade-off (deleting on the pre-advance coordinates would destroy " +
+				"already-captured rows below the purge floor); see docs/streaming.md")
 		} else if n, err := deleteEventsSinceCheckpointGTID(indexDB, saved.binlogFile, saved.binlogPos, accGTID, cfg.Flavor); err != nil {
 			return fmt.Errorf("failed to dedup events since checkpoint: %w", err)
 		} else if n > 0 {
