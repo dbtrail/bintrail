@@ -2,13 +2,44 @@ package mcptools
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
+
+// recoverToolMockCols is the binlog_events SELECT column list the recover
+// tool's fetch expects — matches the console's own recover fixtures
+// (internal/console/api_test.go) so a mocked row scans cleanly through
+// query.Fetch.
+var recoverToolMockCols = []string{
+	"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+	"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+	"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+}
+
+// newRecoverToolTarget builds a Config+Target pair around a sqlmock DB,
+// bypassing DSN routing and schema migration (NoArchive/ResolverLoaded mirror
+// the console's own posture in internal/console/mcp.go) so MakeRecoverTool
+// exercises the real fetch → GenerateSQLFromRows path.
+func newRecoverToolTarget(db *sql.DB, maxScriptBytes int64) Config {
+	return Config{
+		Resolve: func(ctx context.Context, _ string) (*Target, error) {
+			return &Target{
+				DB:             db,
+				NoArchive:      true,
+				ResolverLoaded: true, // Resolver stays nil: all-column WHERE fallback, no metadata query
+			}, nil
+		},
+		MaxScriptBytes: maxScriptBytes,
+	}
+}
 
 // resultText extracts the text of a tool result's first content item.
 func resultText(res *mcp.CallToolResult) string {
@@ -123,6 +154,84 @@ func TestNewServerRegistersTools(t *testing.T) {
 	s := NewServer(Config{Version: "test"})
 	if s == nil {
 		t.Fatal("NewServer returned nil")
+	}
+}
+
+// TestRecoverToolMaxScriptBytesEnforced is the #849 (item 1) repro: the
+// console's /mcp recover tool is a FOURTH script-rendering code path (besides
+// /api/recover, its auto-cascade branch, and /api/recover-cascade) that a
+// code review found still left at recovery.DefaultMaxScriptBytes (2 GiB)
+// despite already sharing the console's row-count cap (RecoverMaxLimit). A
+// small cfg.MaxScriptBytes must make the tool refuse over-budget rows with a
+// *recovery.ScriptBudgetError surfaced as an MCP tool error — proving
+// mcptools.go actually calls gen.SetMaxScriptBytes(cfg.MaxScriptBytes) rather
+// than leaving the Generator's own default in place.
+func TestRecoverToolMaxScriptBytesEnforced(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	rowAfter := []byte(`{"id":42,"blob":"` + strings.Repeat("x", 4096) + `"}`) // well over a 1024-byte budget
+	rows := sqlmock.NewRows(recoverToolMockCols).AddRow(
+		int64(1), "bin.000001", int64(4), int64(40), ts,
+		nil, nil, "app", "users", int64(parser.EventInsert), "42",
+		nil, nil, rowAfter, int64(0), nil, nil,
+	)
+	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
+
+	cfg := newRecoverToolTarget(db, 1024) // tighter than the 4 KB+ row payload
+	res, _, _ := MakeRecoverTool(cfg)(context.Background(), nil, RecoverArgs{Schema: "app", Table: "users"})
+
+	if !res.IsError {
+		t.Fatalf("expected the tool to refuse over budget, got: %s", resultText(res))
+	}
+	if !strings.Contains(resultText(res), "script-size budget") {
+		t.Errorf("error text should surface the ScriptBudgetError, got: %s", resultText(res))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestRecoverToolMaxScriptBytesZeroKeepsDefault proves the OTHER half of the
+// #849 fix: standalone bintrail-mcp (which never sets Config.MaxScriptBytes,
+// so it stays the zero value) must render EXACTLY as it did before this
+// field existed — the Generator's own DefaultMaxScriptBytes (2 GiB), not some
+// small implicit console-shaped budget. The row here is ordinary-sized, so
+// the assertion is simply that it succeeds; TestRecoverToolMaxScriptBytesEnforced
+// above already proves a small explicit budget DOES refuse, so together they
+// pin that 0 truly means "don't touch the Generator's default" rather than
+// "budget of zero bytes" (which SetMaxScriptBytes treats as disabling the
+// guard, not the same as never calling it).
+func TestRecoverToolMaxScriptBytesZeroKeepsDefault(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	rows := sqlmock.NewRows(recoverToolMockCols).AddRow(
+		int64(1), "bin.000001", int64(4), int64(40), ts,
+		nil, nil, "app", "users", int64(parser.EventInsert), "42",
+		nil, nil, []byte(`{"id":42,"email":"a@x"}`), int64(0), nil, nil,
+	)
+	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
+
+	cfg := newRecoverToolTarget(db, 0) // standalone posture: field left unset
+	res, _, _ := MakeRecoverTool(cfg)(context.Background(), nil, RecoverArgs{Schema: "app", Table: "users"})
+
+	if res.IsError {
+		t.Fatalf("standalone posture (MaxScriptBytes=0) must not refuse an ordinary recovery: %s", resultText(res))
+	}
+	if !strings.Contains(resultText(res), "DELETE FROM") {
+		t.Errorf("expected a DELETE in the undo SQL, got:\n%s", resultText(res))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
 	}
 }
 

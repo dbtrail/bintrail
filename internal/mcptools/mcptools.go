@@ -163,6 +163,16 @@ type Config struct {
 	// RecoverMaxLimit caps the recover tool's limit; 0 means uncapped
 	// (standalone behavior — the CLI is the bounded-review path there).
 	RecoverMaxLimit int
+	// MaxScriptBytes overrides the reversal-script payload budget
+	// (recovery.Generator.SetMaxScriptBytes) the recover tool enforces before
+	// rendering. 0 means "leave it alone" — the Generator already defaults to
+	// recovery.DefaultMaxScriptBytes (2 GiB, #654) on its own, so standalone
+	// bintrail-mcp's behavior is unchanged whether or not this field is set.
+	// The console sets it to its own tighter, shared-daemon budget (#849,
+	// internal/console's recoverMaxScriptBytes) — the console's /mcp endpoint
+	// is the same 2 GiB-by-default gap #849 closed for /api/recover, reached
+	// by the SAME row-count cap (RecoverMaxLimit) without a byte cap.
+	MaxScriptBytes int64
 	// AuditSurface tags ext.Record audit events; "" means "mcp".
 	AuditSurface string
 }
@@ -584,6 +594,13 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		rows = query.MergeResults(rows, 0, "ASC")
 
 		gen := recovery.NewForDialect(t.DB, resolver, recovery.DialectForIndex(t.DB))
+		// #849: the console sets cfg.MaxScriptBytes to its own shared-daemon
+		// budget; standalone bintrail-mcp leaves it 0, so the Generator keeps
+		// its own DefaultMaxScriptBytes (2 GiB) exactly as before this field
+		// existed.
+		if cfg.MaxScriptBytes > 0 {
+			gen.SetMaxScriptBytes(cfg.MaxScriptBytes)
+		}
 		var buf bytes.Buffer
 		n, err := gen.GenerateSQLFromRows(rows, &buf)
 		if err != nil {

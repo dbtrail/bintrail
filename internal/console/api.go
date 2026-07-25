@@ -369,6 +369,26 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		case isParent:
 			cres, cerr := s.cascadeRecover(r.Context(), b, body, opts, rows)
 			if cerr != nil {
+				// A *recovery.ScriptBudgetError here means synthesis SUCCEEDED —
+				// only the combined (parent + synthesized children) script exceeded
+				// the console's budget at render time (recoverMaxScriptBytes, #849).
+				// That is a distinct condition from a synthesis failure below: say so
+				// precisely (a misdiagnosis as "synthesis failed" would send an
+				// operator debugging the wrong thing), and give the same actionable
+				// console guidance as the plain-path 422 (writeRecoverError) rather
+				// than leaking ScriptBudgetError.Error()'s CLI-only "raise/disable the
+				// budget (0 = unlimited)" phrasing — a console setting that doesn't
+				// exist.
+				var be *recovery.ScriptBudgetError
+				if errors.As(cerr, &be) {
+					slog.Warn("console: cascade recovery over the script-size budget; falling back to plain recover", "error", cerr)
+					warnings = append([]string{
+						fmt.Sprintf(
+							"Cascade recovery synthesized the deleted rows, but the combined script would hold ~%.1f MiB of row data — over the console's %.0f MiB budget for a single recovery. The script below re-creates the parent only; cascade-deleted child rows are NOT included. Narrow the recovery filter (schema/table/pk/time range) to shrink the window, or use `bintrail recover-cascade` from the CLI for large cascades.",
+							float64(be.EstimatedBytes)/(1<<20), float64(be.Budget)/(1<<20)),
+					}, warnings...)
+					break // out of the switch → plain recover below
+				}
 				// Cascade synthesis is an ENHANCEMENT of the plain recover, not a
 				// precondition — the base rows were already fetched. A synthesis
 				// failure must not deny the recover the operator can still get;

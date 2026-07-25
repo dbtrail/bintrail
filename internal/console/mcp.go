@@ -138,6 +138,11 @@ func (s *Server) newMCPServer(id string) *mcp.Server {
 		AllowProfileParam: false,
 		QueryMaxLimit:     func() int { return eventsMaxLimit },
 		RecoverMaxLimit:   recoverMaxLimit,
-		AuditSurface:      "console-mcp",
+		// #849: the console's /mcp recover tool renders the same reversal
+		// script as /api/recover, in the same shared daemon process — it must
+		// not be left at the Generator's CLI-sized 2 GiB default just because
+		// RecoverMaxLimit already bounds row count.
+		MaxScriptBytes: recoverMaxScriptBytes,
+		AuditSurface:   "console-mcp",
 	})
 }

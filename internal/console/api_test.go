@@ -298,6 +298,15 @@ func TestRecoverUnderByteBudget(t *testing.T) {
 	if resp.StatementCount != 1 {
 		t.Errorf("StatementCount = %d, want 1", resp.StatementCount)
 	}
+	// Strengthened per code review (#849 item 3): StatementCount alone doesn't
+	// prove the budget guard left the actual SQL generation untouched — inspect
+	// the rendered script the way TestRecoverIsReadOnly does.
+	if !strings.Contains(resp.SQL, "DELETE FROM") {
+		t.Errorf("expected a DELETE in the undo SQL, got:\n%s", resp.SQL)
+	}
+	if !strings.Contains(resp.SQL, "BEGIN;") || !strings.Contains(resp.SQL, "COMMIT;") {
+		t.Errorf("expected a transaction-wrapped script, got:\n%s", resp.SQL)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
 	}

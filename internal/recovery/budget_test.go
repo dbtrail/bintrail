@@ -81,10 +81,22 @@ func TestEstimateScriptBytes(t *testing.T) {
 }
 
 // TestNewDefaultsBudget pins the zero-config guard (#654): New / NewForDialect
-// must seed maxScriptBytes with DefaultMaxScriptBytes. The MCP recover tool, the
-// console, and recover-cascade never call SetMaxScriptBytes, so if a constructor
-// stopped defaulting the field (zero value = unlimited) the guard would silently
-// vanish for them while every SetMaxScriptBytes-using test still passed.
+// must seed maxScriptBytes with DefaultMaxScriptBytes. This is load-bearing
+// for standalone `bintrail-mcp` recover (mcptools.Config.MaxScriptBytes left
+// at its zero value) — if a constructor stopped defaulting the field (zero
+// value = unlimited) the guard would silently vanish there while every
+// SetMaxScriptBytes-using test still passed. Every OTHER caller now sets an
+// explicit budget before rendering: the CLI recover command
+// (--max-script-bytes), the console's /api/recover and /api/recover-cascade
+// (recoverMaxScriptBytes, #849), the console's own /mcp recover tool
+// (mcptools.Config.MaxScriptBytes wired from recoverMaxScriptBytes, #849),
+// and recover-cascade's CLI/console emitters (CheckScriptBudget called
+// explicitly by cascaderecover.EmitSQL). #849's console-MCP gap — the
+// console setting Config.MaxScriptBytes nowhere, so its /mcp recover tool
+// kept the CLI-sized 2 GiB default despite already row-capping via
+// RecoverMaxLimit — is exactly the class of regression this comment used to
+// describe as "expected" and is why it's now spelled out per caller instead
+// of as one blanket "never call" statement.
 func TestNewDefaultsBudget(t *testing.T) {
 	if got := New(nil, nil).maxScriptBytes; got != DefaultMaxScriptBytes {
 		t.Errorf("New() maxScriptBytes = %d, want DefaultMaxScriptBytes (%d)", got, DefaultMaxScriptBytes)
