@@ -9,16 +9,15 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/cascade"
+	"github.com/dbtrail/dbtrail/internal/cascadebaseline"
 	"github.com/dbtrail/dbtrail/internal/cascaderecover"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
-	"github.com/dbtrail/dbtrail/internal/reconstruct"
 	"github.com/dbtrail/dbtrail/internal/recovery"
 )
 
@@ -341,7 +340,7 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 	// resolver is available to encode each baseline row's PK to match pk_values.
 	var baselineProvider cascade.BaselineProvider
 	if b.baselineConfigured && b.resolver != nil {
-		baselineProvider = &cascadeBaselineProvider{source: b.baselineSrc, resolver: b.resolver}
+		baselineProvider = cascadeProviderFor(b)
 	} else if b.baselineConfigured {
 		// Baseline source set but no schema snapshot — degrade to Phase-1 rather than
 		// silently, mirroring the CLI. The capability already reports this as false.
@@ -521,95 +520,12 @@ func (s *Server) cascadeRecover(ctx context.Context, b *bundle, body recoverRequ
 	}, nil
 }
 
-// cascadeBaselineProvider implements cascade.BaselineProvider over
-// internal/reconstruct: it finds the child table's baseline snapshot, scans it
-// for rows referencing the deleted parent, and encodes each row's PK to match
-// binlog_events.pk_values so the cascade engine can dedup against Phase-1.
-//
-// Ported from internal/cli/recover_cascade.go (internal/cli is not importable
-// from the console binary). Unifying the two copies — and threading RBAC through
-// SynthesizeVictims so the profile guard above can be lifted — is tracked as a
-// follow-up.
-type cascadeBaselineProvider struct {
-	source   string             // local dir or s3:// prefix
-	resolver *metadata.Resolver // for child PK columns
-}
-
-func (p *cascadeBaselineProvider) BaselineChildren(ctx context.Context, schema, table, fkCol, parentPK string, at time.Time, limit int) (cascade.BaselineLookup, bool, error) {
-	path, snap, stale, err := reconstruct.FindBaseline(ctx, p.source, schema, table, at)
-	if err != nil {
-		if errors.Is(err, reconstruct.ErrNoBaseline) {
-			return cascade.BaselineLookup{}, false, nil // table not covered → Phase-1 only
-		}
-		return cascade.BaselineLookup{}, false, err
-	}
-
-	tm, err := p.resolver.Resolve(schema, table)
-	if err != nil {
-		return cascade.BaselineLookup{}, false, fmt.Errorf("resolve %s.%s for baseline: %w", schema, table, err)
-	}
-	// The FK filter binds parentPK as a STRING against the baseline column.
-	// DuckDB coerces it exactly for integer/string FK columns, but for
-	// DATETIME/DECIMAL/DATE the string form may not match the stored value and
-	// would silently zero-match. Refuse those (flagged as a coverage gap) rather
-	// than under-recover silently.
-	if !fkFilterSafe(columnDataType(tm, fkCol)) {
-		return cascade.BaselineLookup{}, false, fmt.Errorf(
-			"baseline scan of %s.%s by FK column %q (type %q) is unsupported (string match may not coerce); baseline augmentation skipped",
-			schema, table, fkCol, columnDataType(tm, fkCol))
-	}
-
-	// Fetch one more than the cap so truncation is observable.
-	fetch := 0
-	if limit > 0 {
-		fetch = limit + 1
-	}
-	rows, err := reconstruct.ReadBaselineRows(ctx, path, map[string]string{fkCol: parentPK}, fetch)
-	if err != nil {
-		return cascade.BaselineLookup{}, false, err
-	}
-	trunc := false
-	if limit > 0 && len(rows) > limit {
-		trunc = true
-		rows = rows[:limit]
-	}
-
-	pkCols := tm.PKColumnMetas()
-	out := make([]cascade.BaselineRow, 0, len(rows))
-	for _, rrow := range rows {
-		// Canonicalize PK values the same way the indexer encoded pk_values, so
-		// the dedup key matches a Phase-1 victim's PKValues exactly.
-		canon, cerr := reconstruct.CanonicalizePKMap(rrow, pkCols)
-		if cerr != nil {
-			return cascade.BaselineLookup{}, false, fmt.Errorf("canonicalize baseline PK for %s.%s: %w", schema, table, cerr)
-		}
-		out = append(out, cascade.BaselineRow{
-			PKValues: event.BuildPKValues(pkCols, canon),
-			Row:      rrow,
-		})
-	}
-	return cascade.BaselineLookup{SnapshotTime: snap, Rows: out, Truncated: trunc, StaleMessage: stale.Message}, true, nil
-}
-
-func columnDataType(tm *metadata.TableMeta, name string) string {
-	for _, c := range tm.Columns {
-		if c.Name == name {
-			return c.DataType
-		}
-	}
-	return ""
-}
-
-// fkFilterSafe reports whether a string-bound equality filter on a column of
-// this DATA_TYPE coerces exactly in DuckDB (integer + string families). Types
-// where the string form may diverge from the stored value (datetime, decimal,
-// date, …) are excluded so the baseline FK scan never silently zero-matches.
-func fkFilterSafe(dataType string) bool {
-	switch strings.ToLower(strings.TrimSpace(dataType)) {
-	case "int", "integer", "smallint", "tinyint", "mediumint", "bigint",
-		"char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum", "set":
-		return true
-	default:
-		return false
-	}
+// cascadeProviderFor builds the cascade Phase-2 baseline provider for b, wiring
+// the BUNDLE's findBaseline rather than a raw source string: that is what makes
+// cascade Phase-2 compose with the #766 local→S3 fallback the rest of the
+// console already gets (#1102). The provider implementation itself is shared
+// with the CLI (internal/cascadebaseline) so the two surfaces cannot drift
+// apart again (#1101).
+func cascadeProviderFor(b *bundle) *cascadebaseline.Provider {
+	return cascadebaseline.New(b.findBaseline, b.resolver)
 }
