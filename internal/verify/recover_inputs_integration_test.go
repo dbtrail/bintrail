@@ -123,4 +123,16 @@ func TestVerifyRecoverInputs_StampedCaptureGapIsInconclusiveNotMismatch(t *testi
 	if res = run(t); res.Status != StatusMismatch {
 		t.Fatalf("a loss stamped OUTSIDE the window must not suppress the finding, got %s (%s)", res.Status, res.Detail)
 	}
+
+	// ── Phase 4: the record cannot be READ ────────────────────────────────────
+	// A failed read says nothing about continuity, so it must surface as a hard
+	// error (the CLI renders it as this table's StatusError and keeps going) —
+	// NOT as an inconclusive verdict about data that was never consulted, which
+	// would be a second door to the all-inconclusive non-zero exit.
+	testutil.MustExec(t, db, "DROP TABLE stream_state")
+	if _, err := VerifyRecoverInputs(context.Background(), cfg, dbName, "orders"); err == nil {
+		t.Fatal("an unreadable capture-continuity record must surface as an error, not a verdict")
+	} else if !strings.Contains(err.Error(), "capture-continuity record") {
+		t.Errorf("error should name what could not be read, got: %v", err)
+	}
 }

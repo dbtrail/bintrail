@@ -3,7 +3,6 @@ package verify
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -546,15 +545,12 @@ func TestClassifyCaptureGap(t *testing.T) {
 	tests := []struct {
 		name      string
 		ss        *status.StreamStateInfo
-		loadErr   error
 		want      captureGapVerdict
 		wantWhy   string // substring, "" = don't care
 		wantNoWhy bool
 	}{
 		{name: "no stream_state row at all (file-mode index): nothing was ever stamped",
 			ss: nil, want: captureGapNoneStamped, wantNoWhy: true},
-		{name: "unreadable stream_state is unknown, not ok",
-			loadErr: errors.New("boom"), want: captureGapUnknown, wantWhy: "could not be read"},
 		{name: "legacy index without the gap columns cannot conclude no gap",
 			ss: &status.StreamStateInfo{GapColumnsPresent: false}, want: captureGapUnknown, wantWhy: "predates"},
 		{name: "migrated index with no stamp",
@@ -580,7 +576,7 @@ func TestClassifyCaptureGap(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, why := classifyCaptureGap(tc.ss, tc.loadErr, since, until)
+			got, why := classifyCaptureGap(tc.ss, since, until)
 			if got != tc.want {
 				t.Fatalf("verdict = %d, want %d (why=%q)", got, tc.want, why)
 			}

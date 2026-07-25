@@ -101,7 +101,16 @@ func VerifyRecoverInputs(ctx context.Context, cfg RecoverInputsConfig, schema, t
 	// events this index KNOWS it lost permanently, so consult it before
 	// asserting anything — and treat an index that cannot answer as unknown,
 	// never as "no gap".
-	switch verdict, why := captureGapInWindow(ctx, cfg.IndexDB, cfg.Since, cfg.Until); verdict {
+	verdict, why, err := captureGapInWindow(ctx, cfg.IndexDB, cfg.Since, cfg.Until)
+	if err != nil {
+		// A failed READ is not a statement about continuity, so it must not be
+		// dressed up as an inconclusive verdict about data never consulted —
+		// that would be a second door to the all-inconclusive non-zero exit
+		// this change exists to close. Surface it: the CLI turns one table's
+		// hard error into StatusError and keeps verifying the rest.
+		return res, fmt.Errorf("check the capture-continuity record for %s.%s: %w", schema, table, err)
+	}
+	switch verdict {
 	case captureGapStamped:
 		return inconclusive(res, "the index permanently lost events inside this window ("+why+
 			"); the chains here have a hole that no stored image can be asserted across"), nil
@@ -220,28 +229,31 @@ const (
 	captureGapNoneStamped captureGapVerdict = iota
 	// captureGapStamped: a permanent loss is recorded inside the window.
 	captureGapStamped
-	// captureGapUnknown: the record could not be evaluated (a legacy index
-	// predating the gap_lost_* columns, or an unreadable stream_state). Unknown
-	// is NOT "no gap".
+	// captureGapUnknown: a legacy index predating the gap_lost_* columns, whose
+	// loss record is STRUCTURALLY absent. Unknown is NOT "no gap". A failed
+	// read is deliberately NOT this verdict — see captureGapInWindow.
 	captureGapUnknown
 )
 
 // captureGapInWindow consults stream_state's permanent-loss stamp for the walk
 // window. The classification is split out (classifyCaptureGap) so the boundary
 // and legacy-index rules are testable without a database.
-func captureGapInWindow(ctx context.Context, db *sql.DB, since, until time.Time) (captureGapVerdict, string) {
+//
+// A read failure comes back as an ERROR, not as captureGapUnknown: it says
+// nothing about continuity, and turning it into a verdict would let a transient
+// fault read as a statement about the data.
+func captureGapInWindow(ctx context.Context, db *sql.DB, since, until time.Time) (captureGapVerdict, string, error) {
 	ss, err := status.LoadStreamState(ctx, db)
-	return classifyCaptureGap(ss, err, since, until)
+	if err != nil {
+		return captureGapUnknown, "", fmt.Errorf("read stream_state: %w", err)
+	}
+	v, why := classifyCaptureGap(ss, since, until)
+	return v, why, nil
 }
 
 // classifyCaptureGap is the pure half of captureGapInWindow.
-func classifyCaptureGap(ss *status.StreamStateInfo, loadErr error, since, until time.Time) (captureGapVerdict, string) {
+func classifyCaptureGap(ss *status.StreamStateInfo, since, until time.Time) (captureGapVerdict, string) {
 	switch {
-	case loadErr != nil:
-		// A read failure leaves the loss record unknown. Failing the table
-		// closed (inconclusive) rather than walking on is the same fail-safe
-		// choice the missing-IndexDBName branch makes.
-		return captureGapUnknown, fmt.Sprintf("stream_state could not be read: %v", loadErr)
 	case ss == nil:
 		// No stream_state row at all: no streaming daemon ever checkpointed
 		// against this index (a file-mode `bintrail index`), so there is no
@@ -470,6 +482,10 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 		}
 	}
 
+	// Events counts what the walk VISITED (report.go's events_checked), so the
+	// drift rows skipped above do not inflate it — a table of nothing but drift
+	// rows must not report events "checked" that were never walked.
+	out.Events = len(in.Events) - out.UnwalkableEvents
 	out.ChainsNoPredecessor = len(noPredecessor)
 	out.Status, out.Detail = recoverChainVerdict(out, mismatches, unresolved, firstUnresolved, in.Truncated)
 	return out

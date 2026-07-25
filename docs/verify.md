@@ -150,8 +150,10 @@ Three other conditions also report `inconclusive` rather than risk a false alarm
   continuity record cannot be read at all (one predating those columns) reports
   `inconclusive` for the same reason: *unknown* is not *no gap*;
 - a window that **exceeded `--max-events`** — only its oldest events were
-  walked, so a clean result would be a partial check. A mismatch found inside a
-  truncated window *is* still conclusive: the events that were walked are real.
+  walked, so a clean result would be a partial check.
+
+A mismatch found inside a truncated window *is* still conclusive: the events
+that were walked are real.
 
 **A chain break tells you the chain broke, not why.** A `mismatch` here means
 `row_before` did not match the state the previous event on that key left. Two
