@@ -2,7 +2,6 @@ package reconstruct
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 
@@ -109,76 +108,61 @@ func TestPKChangingUpdate(t *testing.T) {
 	}
 }
 
-// TestMergeBaseline_pkChangingUpdateRefused_scenarioA is #782 scenario A
+// TestFoldPage_pkChangingUpdateRefused_scenarioA is #782 scenario A
 // (resurrection): `UPDATE pk 1→2; DELETE pk=2`. The change map is keyed by the
 // before-image PK, so without the guard the baseline row pk=1 would match the
 // UPDATE and emit pk=2 — a row the DELETE actually removed. The guard must
-// refuse loudly, naming both PKs, before any chunk file is written.
-func TestMergeBaseline_pkChangingUpdateRefused_scenarioA(t *testing.T) {
-	outDir := t.TempDir()
-
-	changes := map[string]*query.ResultRow{
-		pkStrForInt(1): {
+// refuse loudly, naming both PKs, before the fold ever reaches the writer.
+func TestFoldPage_pkChangingUpdateRefused_scenarioA(t *testing.T) {
+	assertPKChangeRefusal(t, []query.ResultRow{
+		{
 			EventType: event.EventUpdate,
 			PKValues:  pkStrForInt(1),
 			RowBefore: map[string]any{"id": float64(1), "status": "new"},
 			RowAfter:  map[string]any{"id": float64(2), "status": "moved"},
 		},
-		pkStrForInt(2): {
+		{
 			EventType: event.EventDelete,
 			PKValues:  pkStrForInt(2),
 			RowBefore: map[string]any{"id": float64(2), "status": "moved"},
 		},
-	}
-
-	assertPKChangeRefusal(t, outDir, changes)
+	})
 }
 
-// TestMergeBaseline_pkChangingUpdateRefused_scenarioB is #782 scenario B
+// TestFoldPage_pkChangingUpdateRefused_scenarioB is #782 scenario B
 // (duplication): `UPDATE pk 1→2; UPDATE pk=2`. pk=2 would be emitted twice (as
 // the first UPDATE's after-image under key 1, and by the second UPDATE under
 // key 2), a 1062 that only surfaces at restore time.
-func TestMergeBaseline_pkChangingUpdateRefused_scenarioB(t *testing.T) {
-	outDir := t.TempDir()
-
-	changes := map[string]*query.ResultRow{
-		pkStrForInt(1): {
+func TestFoldPage_pkChangingUpdateRefused_scenarioB(t *testing.T) {
+	assertPKChangeRefusal(t, []query.ResultRow{
+		{
 			EventType: event.EventUpdate,
 			PKValues:  pkStrForInt(1),
 			RowBefore: map[string]any{"id": float64(1), "status": "new"},
 			RowAfter:  map[string]any{"id": float64(2), "status": "renamed"},
 		},
-		pkStrForInt(2): {
+		{
 			EventType: event.EventUpdate,
 			PKValues:  pkStrForInt(2),
 			RowBefore: map[string]any{"id": float64(2), "status": "renamed"},
 			RowAfter:  map[string]any{"id": float64(2), "status": "final"},
 		},
-	}
-
-	assertPKChangeRefusal(t, outDir, changes)
+	})
 }
 
-// assertPKChangeRefusal runs mergeBaselineIntoWriter with the given change map
-// and asserts the #782 refusal: a loud error naming the schema.table and the
-// PK transition, and no partial output left on disk (the guard fires before the
-// writer opens).
-func assertPKChangeRefusal(t *testing.T, outDir string, changes map[string]*query.ResultRow) {
+// assertPKChangeRefusal folds the given event page and asserts the #782
+// refusal: a loud error naming the schema.table and the PK transition.
+//
+// The guard moved from the merge entry points to foldPage when the window
+// became paged (#1097), so this asserts it where it now runs — one event at a
+// time, before the event is ever folded into the change map. The
+// "no partial output on disk" half of the old assertion is now structural
+// rather than checked here: the fold completes before mergeBaselineIntoWriter
+// is called at all, so a refusal happens before the writer can exist.
+func assertPKChangeRefusal(t *testing.T, page []query.ResultRow) {
 	t.Helper()
-	baselinePath := writeTestBaseline(t, [][]string{{"1", "new"}})
-
-	rep := &TableReport{}
-	err := mergeBaselineIntoWriter(context.Background(), mergeInput{
-		LocalBaselinePath: baselinePath,
-		CreateTableSQL:    "-- test",
-		Schema:            "mydb",
-		Table:             "orders",
-		PKCols:            pkColsIntID(),
-		Changes:           changes,
-		OutputDir:         outDir,
-		ChunkSize:         0,
-	}, rep)
-
+	res := &foldResult{Changes: map[string]*query.ResultRow{}}
+	err := foldPage(page, "mydb", "orders", pkColsIntID(), res)
 	if err == nil {
 		t.Fatal("expected a fail-loud error for a PK-changing UPDATE, got nil")
 	}
@@ -186,17 +170,6 @@ func assertPKChangeRefusal(t *testing.T, outDir string, changes map[string]*quer
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error missing %q:\n%s", want, err)
 		}
-	}
-	entries, derr := os.ReadDir(outDir)
-	if derr != nil {
-		t.Fatalf("read output dir: %v", derr)
-	}
-	if len(entries) != 0 {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
-		}
-		t.Errorf("refusal left partial output on disk: %v", names)
 	}
 }
 
@@ -236,42 +209,118 @@ func reinsertEventsAndMap(t *testing.T) ([]query.ResultRow, map[string]*query.Re
 	return events, changes
 }
 
-// TestMergeBaseline_pkChangingUpdate_reinsertPermutation is the #782 review
+// TestFoldPage_pkChangingUpdate_reinsertPermutation is the #782 review
 // permutation: `UPDATE pk 1→2; INSERT pk=1`. The map-only guard misses it (the
-// INSERT overwrites the UPDATE under key "1"), so without the raw-slice scan the
-// merge would silently DROP the moved row (pk=2). Passing the raw Events slice
-// must trigger the same fail-loud refusal, with no partial output on disk.
-func TestMergeBaseline_pkChangingUpdate_reinsertPermutation(t *testing.T) {
-	outDir := t.TempDir()
-	events, changes := reinsertEventsAndMap(t)
-	baselinePath := writeTestBaseline(t, [][]string{{"1", "orig"}})
+// INSERT overwrites the UPDATE under key "1"), so a guard that ran over the
+// collapsed map would let the merge silently DROP the moved row (pk=2).
+//
+// Since #1097 the window is paged and the guard runs per event inside foldPage,
+// so this asserts the refusal there — and, crucially, asserts it BOTH when the
+// two events land on the same page and when a page boundary falls between them.
+// The split case is the one that a whole-slice scan could never get wrong and a
+// paged fold could: it is the regression this test exists to catch.
+func TestFoldPage_pkChangingUpdate_reinsertPermutation(t *testing.T) {
+	events, _ := reinsertEventsAndMap(t)
 
-	rep := &TableReport{}
-	err := mergeBaselineIntoWriter(context.Background(), mergeInput{
-		LocalBaselinePath: baselinePath,
-		CreateTableSQL:    "-- test",
-		Schema:            "mydb",
-		Table:             "orders",
-		PKCols:            pkColsIntID(),
-		Changes:           changes,
-		Events:            events,
-		OutputDir:         outDir,
-		ChunkSize:         0,
-	}, rep)
-	if err == nil {
-		t.Fatal("expected a fail-loud error for the reinsert PK-changing UPDATE, got nil")
+	for _, tc := range []struct {
+		name  string
+		pages [][]query.ResultRow
+	}{
+		{"single page", [][]query.ResultRow{events}},
+		{"split across a page boundary", [][]query.ResultRow{events[:1], events[1:]}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := &foldResult{Changes: map[string]*query.ResultRow{}}
+			var err error
+			for _, page := range tc.pages {
+				if err = foldPage(page, "mydb", "orders", pkColsIntID(), res); err != nil {
+					break
+				}
+			}
+			if err == nil {
+				t.Fatal("expected a fail-loud error for the reinsert PK-changing UPDATE, got nil")
+			}
+			for _, want := range []string{"PK-changing UPDATE", "mydb.orders", `"1"`, `"2"`} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error missing %q:\n%s", want, err)
+				}
+			}
+		})
 	}
-	for _, want := range []string{"PK-changing UPDATE", "mydb.orders", `"1"`, `"2"`} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error missing %q:\n%s", want, err)
+}
+
+// TestFoldPage_lastWriteWinsAcrossPages pins the property paging could most
+// plausibly break: a PK touched on an early page and again on a later one must
+// resolve to the LATER image. Pages arrive in ascending (event_timestamp,
+// event_id) order and are folded in order, so the same last-write-wins result a
+// single-slice fold produced still holds — but nothing else in the suite would
+// notice if that ordering assumption were violated.
+func TestFoldPage_lastWriteWinsAcrossPages(t *testing.T) {
+	pages := [][]query.ResultRow{
+		{{EventType: event.EventInsert, PKValues: pkStrForInt(7), RowAfter: map[string]any{"id": float64(7), "status": "first"}}},
+		{{EventType: event.EventUpdate, PKValues: pkStrForInt(9), RowBefore: map[string]any{"id": float64(9), "status": "x"}, RowAfter: map[string]any{"id": float64(9), "status": "y"}}},
+		{{EventType: event.EventUpdate, PKValues: pkStrForInt(7), RowBefore: map[string]any{"id": float64(7), "status": "first"}, RowAfter: map[string]any{"id": float64(7), "status": "last"}}},
+	}
+
+	res := &foldResult{Changes: map[string]*query.ResultRow{}}
+	for i, page := range pages {
+		if err := foldPage(page, "mydb", "orders", pkColsIntID(), res); err != nil {
+			t.Fatalf("foldPage(page %d): %v", i, err)
 		}
 	}
-	entries, derr := os.ReadDir(outDir)
-	if derr != nil {
-		t.Fatalf("read output dir: %v", derr)
+	changes := res.Changes
+
+	got := changes[pkStrForInt(7)]
+	if got == nil {
+		t.Fatal("pk 7 missing from the change map")
 	}
-	if len(entries) != 0 {
-		t.Errorf("refusal left partial output on disk: %d entries", len(entries))
+	if status := got.RowAfter["status"]; status != "last" {
+		t.Errorf("pk 7 resolved to %q, want %q — a later page must win over an earlier one", status, "last")
+	}
+	// foldPage must store retainEvent's trimmed COPY, not the event itself.
+	// Without this assertion, reverting the fold to `changes[pk] = ev` keeps the
+	// whole suite green while re-pinning every page's backing array in memory —
+	// silently undoing the entire point of paging.
+	if got.RowBefore != nil {
+		t.Error("change-map entry kept its before-image; foldPage must store retainEvent's trimmed copy")
+	}
+	if len(changes) != 2 {
+		t.Errorf("change map has %d entries, want 2 (one per distinct touched PK)", len(changes))
+	}
+}
+
+// TestRetainEvent_dropsBeforeImage pins the memory contract retainEvent exists
+// for: the retained copy must not alias the page it came from, and must not
+// carry the fields no merge stage reads. If someone later restores RowBefore
+// here "just in case", the change map silently doubles in size again — and if
+// someone moves a before-image guard back onto the map, it reads nil.
+func TestRetainEvent_dropsBeforeImage(t *testing.T) {
+	qt, qh := "UPDATE orders SET status='x'", "deadbeef"
+	page := []query.ResultRow{{
+		EventType: event.EventUpdate,
+		PKValues:  pkStrForInt(1),
+		RowBefore: map[string]any{"id": float64(1), "status": "old"},
+		RowAfter:  map[string]any{"id": float64(1), "status": "new"},
+		QueryText: &qt,
+		QueryHash: &qh,
+	}}
+
+	kept := retainEvent(&page[0])
+
+	if kept == &page[0] {
+		t.Fatal("retainEvent returned a pointer INTO the page; that pins the whole page in memory")
+	}
+	if kept.RowBefore != nil {
+		t.Error("RowBefore must be dropped: nothing downstream reads it, and the guards that do run before the trim")
+	}
+	if kept.QueryText != nil || kept.QueryHash != nil {
+		t.Error("QueryText/QueryHash must be dropped: no merge stage reads them and they are capped at 16 KiB each")
+	}
+	if kept.RowAfter == nil || kept.RowAfter["status"] != "new" {
+		t.Errorf("RowAfter must survive intact, got %#v", kept.RowAfter)
+	}
+	if kept.EventType != event.EventUpdate || kept.PKValues != pkStrForInt(1) {
+		t.Error("event identity fields must survive the trim")
 	}
 }
 
@@ -304,31 +353,6 @@ func TestSnapshotFullTableImages_pkChangingUpdate_reinsertPermutation(t *testing
 	}
 	if emitted != 0 {
 		t.Errorf("refusal must emit no rows, emitted %d", emitted)
-	}
-}
-
-// TestWriteBinlogOnlyChanges_pkChangingUpdate_reinsertPermutation covers the
-// no-baseline fallback for the same reinsert permutation via the raw Events
-// slice.
-func TestWriteBinlogOnlyChanges_pkChangingUpdate_reinsertPermutation(t *testing.T) {
-	outDir := t.TempDir()
-	events, changes := reinsertEventsAndMap(t)
-
-	rep := &TableReport{Schema: "mydb", Table: "orders"}
-	err := writeBinlogOnlyChanges(outDir, "mydb", "orders", pkColsIntID(), []string{"id", "status"}, 0,
-		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, events, rep)
-	if err == nil {
-		t.Fatal("expected a fail-loud error for the reinsert PK-changing UPDATE, got nil")
-	}
-	if !strings.Contains(err.Error(), "PK-changing UPDATE") {
-		t.Errorf("error should name the PK-changing UPDATE, got: %v", err)
-	}
-	entries, derr := os.ReadDir(outDir)
-	if derr != nil {
-		t.Fatalf("read output dir: %v", derr)
-	}
-	if len(entries) != 0 {
-		t.Errorf("refusal left partial output on disk: %d entries", len(entries))
 	}
 }
 
@@ -423,43 +447,17 @@ func TestSnapshotFullTableImages_pkChangingUpdateRefused(t *testing.T) {
 	}
 }
 
-// TestWriteBinlogOnlyChanges_pkChangingUpdateRefused covers the binlog-only
-// fallback path (no baseline, #766): the change map is still keyed by the
-// before-image PK, so a PK-changing UPDATE duplicates a row. Refuse loudly with
-// no partial output.
-func TestWriteBinlogOnlyChanges_pkChangingUpdateRefused(t *testing.T) {
-	outDir := t.TempDir()
-	colNames := []string{"id", "status"}
-
-	changes := map[string]*query.ResultRow{
-		pkStrForInt(1): {
-			EventType: event.EventUpdate,
-			PKValues:  pkStrForInt(1),
-			RowBefore: map[string]any{"id": float64(1), "status": "new"},
-			RowAfter:  map[string]any{"id": float64(2), "status": "moved"},
-		},
-	}
-
-	rep := &TableReport{Schema: "mydb", Table: "orders"}
-	// events=nil exercises the map-only backstop: the PK-changing UPDATE here is
-	// the surviving entry for its old key, so the collapsed-map scan still fires.
-	err := writeBinlogOnlyChanges(outDir, "mydb", "orders", pkColsIntID(), colNames, 0,
-		binlogOnlySchemaPlaceholder("mydb", "orders"), changes, nil, rep)
-	if err == nil {
-		t.Fatal("expected a fail-loud error for a PK-changing UPDATE, got nil")
-	}
-	if !strings.Contains(err.Error(), "PK-changing UPDATE") {
-		t.Errorf("error should name the PK-changing UPDATE, got: %v", err)
-	}
-	entries, derr := os.ReadDir(outDir)
-	if derr != nil {
-		t.Fatalf("read output dir: %v", derr)
-	}
-	if len(entries) != 0 {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
-		}
-		t.Errorf("refusal left partial output on disk: %v", names)
-	}
+// TestFoldPage_pkChangingUpdateRefused_binlogOnlyShape covers the no-baseline
+// fallback (#766) for a PK-changing UPDATE. That path streams and folds its
+// window through the same foldPage as the baseline path since #1097, so the
+// refusal is asserted there; what makes it worth keeping as a distinct case is
+// that the binlog-only path has NO baseline to bound the window, so it is the
+// path most likely to see a long history containing one.
+func TestFoldPage_pkChangingUpdateRefused_binlogOnlyShape(t *testing.T) {
+	assertPKChangeRefusal(t, []query.ResultRow{{
+		EventType: event.EventUpdate,
+		PKValues:  pkStrForInt(1),
+		RowBefore: map[string]any{"id": float64(1), "status": "new"},
+		RowAfter:  map[string]any{"id": float64(2), "status": "moved"},
+	}})
 }

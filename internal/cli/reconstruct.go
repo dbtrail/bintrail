@@ -110,6 +110,7 @@ var (
 	recChunkSize    string
 	recParallelism  int
 	recWarnEvents   int64
+	recFetchBatch   int
 )
 
 func init() {
@@ -133,7 +134,8 @@ func init() {
 	reconstructCmd.Flags().StringVar(&recTables, "tables", "", "Comma-separated schema.table list for --output-format=mydumper (e.g. mydb.orders,mydb.users)")
 	reconstructCmd.Flags().StringVar(&recChunkSize, "chunk-size", "256MB", "Max size per SQL chunk file in full-table mode (e.g. 64MB, 1GB)")
 	reconstructCmd.Flags().IntVar(&recParallelism, "parallelism", 0, "Max tables to reconstruct concurrently in full-table mode (default: runtime.NumCPU())")
-	reconstructCmd.Flags().Int64Var(&recWarnEvents, "warn-event-threshold", 5_000_000, "Full-table mode: log a memory warning when a table's reconstruct window exceeds this many events (full-table reconstruct holds them all in RAM, #654; this threshold is divided by --parallelism, capped to the number of --tables, so it reflects the total concurrent RAM across tables reconstructing at once, #842; 0 disables)")
+	reconstructCmd.Flags().Int64Var(&recWarnEvents, "warn-event-threshold", 5_000_000, "Full-table mode: log a memory warning when a table's reconstruct window exceeds this many events (#654; this threshold is divided by --parallelism, capped to the number of --tables, so it reflects the total concurrent RAM across tables reconstructing at once, #842; 0 disables)")
+	reconstructCmd.Flags().IntVar(&recFetchBatch, "fetch-batch-size", 0, "Full-table mode: number of events fetched per page when streaming a table's event window (#1097). 0 uses the built-in default (100000). Lower it to cut peak memory on a small box; raise it to cut archive round trips — with S3 archives an hour's parquet file is re-fetched about (events in that hour / this value) times, and roughly double that counting the preceding hour's file, which pruning keeps, so a value well below your peak hourly event count multiplies downloads")
 	AddDuckDBTuningFlags(reconstructCmd)
 	BindCommandEnv(reconstructCmd)
 
@@ -595,6 +597,9 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 	if err != nil {
 		return fmt.Errorf("--chunk-size: %w", err)
 	}
+	if recFetchBatch < 0 {
+		return fmt.Errorf("--fetch-batch-size must be >= 0 (0 uses the default)")
+	}
 	if recWarnEvents < 0 {
 		return fmt.Errorf("--warn-event-threshold must be >= 0 (0 disables)")
 	}
@@ -632,6 +637,7 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 		Parallelism:        recParallelism,
 		AllowGaps:          recAllowGaps,
 		WarnEventThreshold: recWarnEvents,
+		FetchBatchSize:     recFetchBatch,
 		ArchiveFetcher:     TunedArchiveFetcher(duckTuning),
 		// Same resolved --ultrafast/--duckdb-* budget as ArchiveFetcher above,
 		// but for the merge/baseline DuckDB sessions ReconstructTables opens
