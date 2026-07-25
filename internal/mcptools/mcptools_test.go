@@ -165,7 +165,12 @@ func TestNewServerRegistersTools(t *testing.T) {
 // small cfg.MaxScriptBytes must make the tool refuse over-budget rows with a
 // *recovery.ScriptBudgetError surfaced as an MCP tool error — proving
 // mcptools.go actually calls gen.SetMaxScriptBytes(cfg.MaxScriptBytes) rather
-// than leaving the Generator's own default in place.
+// than leaving the Generator's own default in place. It also pins the code
+// review's follow-up on this same tool: the surfaced message must not leak
+// ScriptBudgetError.Error()'s raw "raise/disable the budget (0 = unlimited)"
+// phrasing — advice aimed at a Go caller of SetMaxScriptBytes, not an MCP
+// client — and must instead point at the `bintrail recover` CLI escape hatch
+// (mirroring internal/console/api.go's writeRecoverError for the HTTP paths).
 func TestRecoverToolMaxScriptBytesEnforced(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -188,24 +193,33 @@ func TestRecoverToolMaxScriptBytesEnforced(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("expected the tool to refuse over budget, got: %s", resultText(res))
 	}
-	if !strings.Contains(resultText(res), "script-size budget") {
-		t.Errorf("error text should surface the ScriptBudgetError, got: %s", resultText(res))
+	text := resultText(res)
+	for _, want := range []string{"refusing to generate the reversal script", "bintrail recover"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("error text missing %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "0 = unlimited") {
+		t.Errorf("error text must not leak the CLI-only '0 = unlimited' phrasing: %s", text)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
 	}
 }
 
-// TestRecoverToolMaxScriptBytesZeroKeepsDefault proves the OTHER half of the
-// #849 fix: standalone bintrail-mcp (which never sets Config.MaxScriptBytes,
-// so it stays the zero value) must render EXACTLY as it did before this
-// field existed — the Generator's own DefaultMaxScriptBytes (2 GiB), not some
-// small implicit console-shaped budget. The row here is ordinary-sized, so
-// the assertion is simply that it succeeds; TestRecoverToolMaxScriptBytesEnforced
-// above already proves a small explicit budget DOES refuse, so together they
-// pin that 0 truly means "don't touch the Generator's default" rather than
-// "budget of zero bytes" (which SetMaxScriptBytes treats as disabling the
-// guard, not the same as never calling it).
+// TestRecoverToolMaxScriptBytesZeroKeepsDefault is a sanity check that the
+// standalone posture (Config.MaxScriptBytes left at its zero value) does not
+// spuriously refuse an ORDINARY recovery. It does NOT by itself distinguish
+// "the code never called SetMaxScriptBytes, so the Generator kept its 2 GiB
+// constructor default" from "the code called SetMaxScriptBytes(0), which
+// explicitly DISABLES the budget guard (unlimited)" — an ordinary small row
+// succeeds either way, and reproducing the actual >2 GiB payload needed to
+// tell them apart end-to-end is impractical in a unit test. That distinction
+// is what actually matters (a silent regression from "2 GiB default" to
+// "unlimited" would defeat #654's guard for every standalone caller) and is
+// pinned directly, without a giant payload, by TestConfigScriptBudgetOverride
+// below, which asserts on the decision function itself
+// (Config.scriptBudgetOverride) rather than its rendering side effect.
 func TestRecoverToolMaxScriptBytesZeroKeepsDefault(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -232,6 +246,39 @@ func TestRecoverToolMaxScriptBytesZeroKeepsDefault(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
+	}
+}
+
+// TestConfigScriptBudgetOverride directly pins the #849 code-review follow-up:
+// Config.MaxScriptBytes <= 0 (the standalone bintrail-mcp posture, which
+// never sets the field) must report ok=false — "leave the Generator's own
+// default alone" — never (0, true), which the recover tool would turn into
+// gen.SetMaxScriptBytes(0), and SetMaxScriptBytes treats n<=0 as "disable the
+// guard" (unlimited), not "no override." A future edit that collapsed
+// scriptBudgetOverride's `if MaxScriptBytes > 0` into always returning
+// (c.MaxScriptBytes, true) would flip standalone bintrail-mcp from a 2 GiB
+// budget to no budget at all, and this test — unlike
+// TestRecoverToolMaxScriptBytesZeroKeepsDefault, which only observes an
+// ordinary-sized row succeeding either way — would catch it immediately.
+func TestConfigScriptBudgetOverride(t *testing.T) {
+	cases := []struct {
+		name      string
+		maxBytes  int64
+		wantValue int64
+		wantOK    bool
+	}{
+		{"unset (standalone posture)", 0, 0, false},
+		{"negative", -1, 0, false},
+		{"explicit positive (console posture)", 32 << 20, 32 << 20, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{MaxScriptBytes: tc.maxBytes}
+			v, ok := cfg.scriptBudgetOverride()
+			if ok != tc.wantOK || v != tc.wantValue {
+				t.Errorf("scriptBudgetOverride() = (%d, %v), want (%d, %v)", v, ok, tc.wantValue, tc.wantOK)
+			}
+		})
 	}
 }
 

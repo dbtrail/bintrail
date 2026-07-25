@@ -3,7 +3,6 @@
 package console
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -663,78 +662,38 @@ func TestIntegrationRecoverCascade_refusedUnderProfile(t *testing.T) {
 	}
 }
 
-// withLargeSortBuffer raises the test MySQL instance's GLOBAL sort_buffer_size
-// and max_sort_length for the duration of the test, restoring both via
-// t.Cleanup. The default sort_buffer_size (256 KB, MySQL 8's default) is far
-// below the ~40 MiB row images seedCascadeConsoleOversized writes: the
-// cascade engine's victim lookup (internal/cascade/cascade.go's eng.Fetch
-// with LimitPerPK) filters on a JSON_EXTRACT predicate combined with a
-// ROW_NUMBER() OVER (PARTITION BY ...) window, and MySQL 8's window-function
-// materialization needs the GLOBAL (not per-session — a session var is
-// snapshotted at connect, so it must be set before the pool opens) sort
-// buffer to comfortably exceed the widest row, or the query itself dies with
-// ER_OUT_OF_SORTMEMORY (1038) before cascade synthesis — and therefore the
-// #849 byte-budget check — ever runs. This is the same MySQL behavior
-// documented in internal/query/query.go's late-materialization comment
-// (narrow-key sort + join-back keeps ORDINARY queries safe regardless of row
-// width); the cascade engine's WHERE-filtered window query doesn't benefit
-// from that fix, so the fixture needs the server-side floor instead. Global,
-// not per-connection: testutil.CreateTestDB opens a NEW connection pool,
-// which snapshots sort_buffer_size from the GLOBAL default at connect time.
-func withLargeSortBuffer(t *testing.T, bytes int64) {
-	t.Helper()
-	root, err := sql.Open("mysql", testutil.BaseDSN()+"/?parseTime=true")
-	if err != nil {
-		t.Fatalf("connect for sort_buffer_size bump: %v", err)
-	}
-	defer root.Close()
-
-	var origSort, origMaxSort int64
-	if err := root.QueryRow("SELECT @@GLOBAL.sort_buffer_size").Scan(&origSort); err != nil {
-		t.Fatalf("read GLOBAL sort_buffer_size: %v", err)
-	}
-	if err := root.QueryRow("SELECT @@GLOBAL.max_sort_length").Scan(&origMaxSort); err != nil {
-		t.Fatalf("read GLOBAL max_sort_length: %v", err)
-	}
-	if _, err := root.Exec(fmt.Sprintf("SET GLOBAL sort_buffer_size = %d", bytes)); err != nil {
-		t.Fatalf("raise GLOBAL sort_buffer_size: %v", err)
-	}
-	if _, err := root.Exec(fmt.Sprintf("SET GLOBAL max_sort_length = %d", bytes)); err != nil {
-		t.Fatalf("raise GLOBAL max_sort_length: %v", err)
-	}
-	t.Cleanup(func() {
-		restore, err := sql.Open("mysql", testutil.BaseDSN()+"/?parseTime=true")
-		if err != nil {
-			t.Logf("sort_buffer_size restore: connect failed: %v", err)
-			return
-		}
-		defer restore.Close()
-		if _, err := restore.Exec(fmt.Sprintf("SET GLOBAL sort_buffer_size = %d", origSort)); err != nil {
-			t.Logf("sort_buffer_size restore failed: %v", err)
-		}
-		if _, err := restore.Exec(fmt.Sprintf("SET GLOBAL max_sort_length = %d", origMaxSort)); err != nil {
-			t.Logf("max_sort_length restore failed: %v", err)
-		}
-	})
-}
-
 // seedCascadeConsoleOversized is seedCascadeConsole's #849 sibling: the same
-// parent-DELETE + two-child-INSERT + FK-CASCADE shape, except child id=10
-// carries a ~40 MiB row_after blob. The cascade engine copies an INSERT's
-// row_after into the synthesized victim's RowBefore (internal/cascade/
-// cascade.go:553, "last known state → INSERT target"), so this blob flows
-// straight into cascade victim payload EstimateScriptBytes sums — pushing
-// the COMBINED (parent + victims) script over recoverMaxScriptBytes (32 MiB)
-// while the parent DELETE alone (`{"id":1}`) stays tiny. That combination is
-// exactly what pins the two console cascade code paths' budget wiring
-// (recover_cascade.go's handleRecoverCascade and cascadeRecover Generator
-// construction, #849 item 3): deleting either call's
-// gen.SetMaxScriptBytes(recoverMaxScriptBytes) would let this fixture render
-// fine at the CLI-sized 2 GiB default, and the corresponding test below would
-// start failing (expecting a refusal, getting a clean 200).
+// parent-DELETE + child-INSERT + FK-CASCADE shape, except the child table
+// carries MANY moderate-sized rows (oversizedChildCount rows of
+// oversizedChildBlobBytes each, all referencing parent id=1) instead of a
+// couple of small ones. The cascade engine copies each INSERT's row_after
+// into the synthesized victim's RowBefore (internal/cascade/cascade.go:553,
+// "last known state → INSERT target"), so this flows straight into cascade
+// victim payload EstimateScriptBytes sums — pushing the COMBINED (parent +
+// victims) script over recoverMaxScriptBytes (32 MiB) while the parent DELETE
+// alone (`{"id":1}`) stays tiny.
+//
+// Deliberately MANY moderate rows, not one giant row: a single row wider than
+// MySQL's default sort_buffer_size (256 KB) makes the cascade engine's own
+// victim-lookup query — a JSON_EXTRACT filter combined with a
+// ROW_NUMBER() OVER (PARTITION BY ...) window (eng.Fetch with LimitPerPK) —
+// die with ER_OUT_OF_SORTMEMORY (1038) before cascade synthesis ever runs, an
+// early version of this fixture hit exactly that. internal/query/query.go's
+// late-materialization fix (narrow-key sort + join-back) doesn't cover the
+// cascade engine's own query, so the fixture works around the cliff by
+// staying under it — oversizedChildBlobBytes is comfortably below 256 KB —
+// rather than raising a GLOBAL MySQL setting that would leak into whatever
+// else shares this test server (concurrent packages, other tests) and
+// silently mask the class of bug internal/query/query.go's fix addresses if
+// left too high. All oversizedChildCount rows stay far under
+// cascade.CandidateLimit (1000, the per-FK victim query LIMIT).
+const (
+	oversizedChildCount     = 260
+	oversizedChildBlobBytes = 160 << 10 // 160 KiB/row: 260 * 160 KiB ≈ 40.6 MiB combined, over the 32 MiB budget; each row well under MySQL's default 256 KiB sort_buffer_size
+)
+
 func seedCascadeConsoleOversized(t *testing.T) (*Server, string) {
 	t.Helper()
-	withLargeSortBuffer(t, 64<<20) // must be set before the pool below opens
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
 
@@ -743,14 +702,14 @@ func seedCascadeConsoleOversized(t *testing.T) (*Server, string) {
 	childTs := h.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
 	parentTs := h.Add(20 * time.Minute).Format("2006-01-02 15:04:05")
 
-	bigBlob := strings.Repeat("x", recoverMaxScriptBytes+(8<<20)) // budget + 8 MiB headroom
-	child10 := []byte(`{"id":10,"pid":1,"blob":"` + bigBlob + `"}`)
-
-	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, childTs, nil,
-		dbName, "child", 1 /*INSERT*/, "10", nil, nil, child10)
-	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, childTs, nil,
-		dbName, "child", 1 /*INSERT*/, "11", nil, nil, []byte(`{"id":11,"pid":1}`))
-	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, parentTs, nil,
+	blob := strings.Repeat("x", oversizedChildBlobBytes)
+	for i := 0; i < oversizedChildCount; i++ {
+		childID := 100 + i
+		rowAfter := []byte(fmt.Sprintf(`{"id":%d,"pid":1,"blob":"%s"}`, childID, blob))
+		testutil.InsertEvent(t, db, "binlog.000001", uint64(100+i*10), uint64(100+i*10+5), childTs, nil,
+			dbName, "child", 1 /*INSERT*/, fmt.Sprintf("%d", childID), nil, nil, rowAfter)
+	}
+	testutil.InsertEvent(t, db, "binlog.000001", 100000, 100100, parentTs, nil,
 		dbName, "parent", 3 /*DELETE*/, "1", nil, []byte(`{"id":1}`), nil)
 
 	testutil.MustExec(t, db, `INSERT INTO fk_constraints

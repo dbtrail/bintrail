@@ -191,6 +191,32 @@ func (c Config) auditSurface() string {
 	return c.AuditSurface
 }
 
+// scriptBudgetOverride reports whether the recover tool should call
+// Generator.SetMaxScriptBytes, and with what value. ok is false when
+// c.MaxScriptBytes is unset (<= 0) — the caller must then leave the
+// Generator's own constructor default (recovery.DefaultMaxScriptBytes, 2 GiB)
+// untouched, which is what standalone bintrail-mcp relies on.
+//
+// This is deliberately its own method, not an inline `if cfg.MaxScriptBytes >
+// 0 { gen.SetMaxScriptBytes(...) }` at the call site (#849 code review): "0 =
+// don't touch it" and "0 = call SetMaxScriptBytes(0)" are NOT the same thing
+// — SetMaxScriptBytes(0) explicitly DISABLES the budget guard
+// (recovery.Generator.SetMaxScriptBytes: "n <= 0 disables the guard
+// (unlimited)"). A future refactor that simplified the call site to
+// `gen.SetMaxScriptBytes(cfg.MaxScriptBytes)` unconditionally would silently
+// make the standalone posture (MaxScriptBytes never set) render with NO
+// budget at all, re-opening the exact class of bug #654/#849 close. Isolating
+// the decision here lets TestConfigScriptBudgetOverride pin it directly
+// (Config{}.scriptBudgetOverride() must be (0, false)) without needing an
+// impractical multi-gigabyte test payload to observe the difference
+// end-to-end.
+func (c Config) scriptBudgetOverride() (int64, bool) {
+	if c.MaxScriptBytes > 0 {
+		return c.MaxScriptBytes, true
+	}
+	return 0, false
+}
+
 // NewServer builds an MCP server exposing the four read-only tools bound to
 // cfg. All tools are annotated read-only + idempotent.
 func NewServer(cfg Config) *mcp.Server {
@@ -597,13 +623,33 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		// #849: the console sets cfg.MaxScriptBytes to its own shared-daemon
 		// budget; standalone bintrail-mcp leaves it 0, so the Generator keeps
 		// its own DefaultMaxScriptBytes (2 GiB) exactly as before this field
-		// existed.
-		if cfg.MaxScriptBytes > 0 {
-			gen.SetMaxScriptBytes(cfg.MaxScriptBytes)
+		// existed. See Config.scriptBudgetOverride for why this must stay an
+		// "only call when set" gate rather than an unconditional
+		// SetMaxScriptBytes(cfg.MaxScriptBytes).
+		if v, ok := cfg.scriptBudgetOverride(); ok {
+			gen.SetMaxScriptBytes(v)
 		}
 		var buf bytes.Buffer
 		n, err := gen.GenerateSQLFromRows(rows, &buf)
 		if err != nil {
+			// A *recovery.ScriptBudgetError gets a message built from its typed
+			// fields rather than its own Error() verbatim — that text ends with
+			// "raise/disable the budget (0 = unlimited)", advice that presumes a
+			// Go caller of SetMaxScriptBytes, not an MCP client. Point at the one
+			// escape hatch that's actually reachable from here on EITHER surface
+			// (console or standalone): `bintrail recover` from the CLI, which does
+			// expose --max-script-bytes (#849 code review: writeRecoverError in
+			// internal/console/api.go does the equivalent for the HTTP endpoints;
+			// this is the MCP-tool sibling of that fix).
+			var be *recovery.ScriptBudgetError
+			if errors.As(err, &be) {
+				return ErrorResult(fmt.Errorf(
+					"refusing to generate the reversal script — the matched events hold ~%.1f MiB of row data, "+
+						"over the %.0f MiB budget for a single recovery. Narrow the recovery filter "+
+						"(schema/table/pk/time range) to shrink the window, or use `bintrail recover` from the CLI "+
+						"for large recoveries (it supports --max-script-bytes to raise or disable this budget)",
+					float64(be.EstimatedBytes)/(1<<20), float64(be.Budget)/(1<<20))), nil, nil
+			}
 			return ErrorResult(err), nil, nil
 		}
 
