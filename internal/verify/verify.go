@@ -52,6 +52,13 @@ type TableResult struct {
 	ReconstructRows   int64
 	Anchor            string // the point the comparison is anchored to: a GTID set (live-source path) or a binlog coordinate file:pos (baseline-pair path)
 	Detail            string // reason for inconclusive/mismatch, or a note carried on a match (e.g. coverage-unverified)
+
+	// Set only by the recover-input check (VerifyRecoverInputs, #1001), which
+	// compares no table content and so leaves the row counts and digests above
+	// zero. See TableReport for what each counts.
+	EventsChecked      int
+	ChainsChecked      int
+	ChainsInconclusive int
 }
 
 // Config wires the three data sources verify needs.

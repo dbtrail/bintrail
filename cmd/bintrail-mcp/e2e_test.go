@@ -104,8 +104,11 @@ func TestMCPE2E(t *testing.T) {
 		t.Fatalf("tools/list: expected result object, got: %v", listResp)
 	}
 	tools, _ := listResult["tools"].([]any)
-	if len(tools) != 4 {
-		t.Errorf("tools/list: expected 4 tools, got %d", len(tools))
+	// The standalone server opts into reconstruct (#953) on top of the four
+	// always-on tools; its baseline source is per-call, so it is advertised
+	// regardless of whether a baseline is configured.
+	if len(tools) != 5 {
+		t.Errorf("tools/list: expected 5 tools, got %d", len(tools))
 	}
 
 	toolNames := make(map[string]bool)
@@ -114,7 +117,7 @@ func TestMCPE2E(t *testing.T) {
 			toolNames[m["name"].(string)] = true
 		}
 	}
-	for _, want := range []string{"query", "recover", "status", "list_schema_changes"} {
+	for _, want := range []string{"query", "recover", "status", "list_schema_changes", "reconstruct"} {
 		if !toolNames[want] {
 			t.Errorf("tool %q not found in list", want)
 		}

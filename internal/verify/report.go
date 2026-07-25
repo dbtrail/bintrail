@@ -11,6 +11,11 @@ import (
 const (
 	ModeBaselinePair = "baseline-anchored"
 	ModeLive         = "live-source"
+	// ModeRecoverInputs is the recover-input check (#1001): a per-PK walk of
+	// the event chain asserting the before/after images `recover` consumes are
+	// internally consistent. It compares no table content, so its per-table
+	// rows carry the chain counts below instead of row counts and digests.
+	ModeRecoverInputs = "recover-inputs"
 )
 
 // Verdict is the run-level outcome — the exit code's reason, as a value.
@@ -84,6 +89,22 @@ type TableReport struct {
 	// Reason is the detail behind an inconclusive/mismatch/error verdict, or a
 	// note carried on a match.
 	Reason string `json:"reason,omitempty"`
+
+	// The three fields below are populated only by ModeRecoverInputs. They are
+	// separate from SourceRows/ReconstructRows on purpose: those two mean
+	// "rows in a table", and overloading them with event/chain counts would
+	// silently break every consumer already reading them.
+	//
+	// EventsChecked is how many binlog events the chain walk visited —
+	// including events a newer event on the same PK superseded, which the
+	// content-comparison modes never look at.
+	EventsChecked int `json:"events_checked,omitempty"`
+	// ChainsChecked is the number of distinct primary keys walked.
+	ChainsChecked int `json:"chains_checked,omitempty"`
+	// ChainsInconclusive counts chains whose first event in the window was not
+	// an INSERT — no predecessor state exists, so they are legitimately
+	// unverifiable rather than divergent.
+	ChainsInconclusive int `json:"chains_inconclusive,omitempty"`
 }
 
 // Summary is the run's per-status counts.
@@ -169,6 +190,10 @@ func NewReport(mode string, results []TableResult) *Report {
 			ReconstructDigest: r.ReconstructDigest,
 			Anchor:            r.Anchor,
 			Reason:            reason,
+
+			EventsChecked:      r.EventsChecked,
+			ChainsChecked:      r.ChainsChecked,
+			ChainsInconclusive: r.ChainsInconclusive,
 		})
 	}
 	rep.Summary.Total = len(rep.Tables)

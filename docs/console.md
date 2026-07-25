@@ -686,8 +686,8 @@ per server as `source` in [`/api/capabilities`](#api), derived from
 
 ## MCP endpoint
 
-The console serves the same four read-only MCP tools as
-[`bintrail-mcp`](mcp-server.md) — `query`, `recover`, `status`,
+The console serves the same five read-only MCP tools as
+[`bintrail-mcp`](mcp-server.md) — `query`, `recover`, `reconstruct`, `status`,
 `list_schema_changes` — over **Streamable HTTP**, on both `bintrail-console
 serve` and `bintrail-console watch`:
 
@@ -730,10 +730,14 @@ Rules that differ from the standalone `bintrail-mcp` server:
   card apply immediately, including to sibling console processes sharing the
   file. Without any configured token the endpoint refuses every request with
   an actionable error.
-- **`index_dsn` and `profile` tool parameters are rejected.** Connections are
-  managed in the console (registry + path routing), and the RBAC posture is
-  fixed by the console process — an authenticated MCP client cannot point the
-  console at an arbitrary DSN or change redaction rules.
+- **`index_dsn`, `profile`, `baseline_dir` and `baseline_s3` tool parameters are
+  rejected.** Connections, the baseline location and the RBAC posture are all
+  managed by the console process — an authenticated MCP client cannot point the
+  console at an arbitrary DSN or storage prefix, nor change redaction rules.
+- **`reconstruct` is gated per server**, on the same signal as the Time-travel
+  tab and `/api/reconstruct`: that server needs a baseline location configured,
+  with archives enabled and no access-control profile active (baseline reads
+  aren't redacted). Otherwise the tool refuses with that explanation.
 - **The console's read boundary applies.** Result caps match the API (events
   100 default / 1000 max, recover 1000 / 10000), each server's archive and
   baseline posture is honored, and `query_text` / `query_hash` are withheld

@@ -525,7 +525,7 @@ func (s *Server) buildHandler() http.Handler {
 	// the static token, the password login, and every OSS session — so this only
 	// enforces when an EE build attaches a policy via the session-issuer seam.
 	root.Handle("/api/", s.tokenMiddleware(s.authzMiddleware(api)))
-	// MCP endpoint (#1039): the four read-only tools over Streamable HTTP,
+	// MCP endpoint (#1039): the read-only tools over Streamable HTTP,
 	// token-authenticated (static or UI-managed — #1052), routed per server
 	// by URL path. Carries its own auth check (tokens only, no sessions —
 	// see mcp.go) instead of tokenMiddleware, and sits on root so it

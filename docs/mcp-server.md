@@ -8,11 +8,13 @@ recoveries in plain English. Once connected, you can ask:
 >
 > "Generate the SQL to bring back customer 42."
 >
+> "What did customer 42's row look like at 3pm yesterday?"
+>
 > "What schema changes happened this week?"
 
-It exposes four **read-only** tools — `query`, `recover` (generates reversal SQL,
-never runs it), `status`, and `list_schema_changes` — and never writes to your
-database.
+It exposes five **read-only** tools — `query`, `recover` (generates reversal SQL,
+never runs it), `reconstruct` (a row's state at a point in time), `status`, and
+`list_schema_changes` — and never writes to your database.
 
 > **First time?** If you run the web console, the shortest path is the
 > [5-minute Connect-AI guide](connect-ai.md) — console URL + token + a
@@ -60,8 +62,8 @@ everywhere):
 }
 ```
 
-Restart Claude Code. The `query`, `recover`, `status`, and `list_schema_changes`
-tools appear — now ask: *"What changed in the orders table in the last hour?"*
+Restart Claude Code. The `query`, `recover`, `status`, `list_schema_changes`,
+and `reconstruct` tools appear — now ask: *"What changed in the orders table in the last hour?"*
 
 > Working inside the dbtrail **source repo**? Use
 > `"command": "go", "args": ["run", "./cmd/bintrail-mcp"]` instead — no separate
@@ -174,24 +176,25 @@ endpoint at all.
 Once such a gateway is reachable at a public URL: in **claude.ai → Settings →
 Integrations → Add custom integration**, enter the gateway URL (your domain, or
 `https://mcp.dbtrail.com/mcp` for managed customers), complete the OAuth login,
-and the four tools appear. Works from web, Desktop, and mobile; tokens refresh
+and the five tools appear. Works from web, Desktop, and mobile; tokens refresh
 automatically.
 
 ---
 
-## The four tools
+## The five tools
 
 | Tool | CLI equivalent | What it does |
 |---|---|---|
 | `query` | `bintrail query` | Search indexed row changes with filters |
 | `recover` | `bintrail recover --dry-run` | Generate reversal SQL (never executes it) |
+| `reconstruct` | `bintrail reconstruct` | A single row's full state at a point in time (needs a baseline) |
 | `status` | `bintrail status` | Indexed files, partitions, and summary |
 | `list_schema_changes` | reads `schema_changes` (see [DDL tracking](./ddl-tracking.md)) | DDL changes recorded while indexing/streaming, with the full statement and binlog coordinates |
 
-All four are read-only — annotated `ReadOnlyHint: true` and `IdempotentHint: true`,
+All five are read-only — annotated `ReadOnlyHint: true` and `IdempotentHint: true`,
 so the client knows they're safe to call repeatedly and never modify state.
 
-The same four tools are also served by the web console at `/mcp` (Streamable
+The same five tools are also served by the web console at `/mcp` (Streamable
 HTTP, console-token auth, per-server routing by URL path) — if you already run
 `bintrail-console`, you may not need this binary at all; see
 [console.md](console.md#mcp-endpoint).
@@ -245,6 +248,55 @@ generation. Pass `no_archive` to disable this.
 environment variable (set once at startup) or the per-call `index_dsn` parameter,
 which overrides the env var. Set the env var at startup so callers don't repeat
 it on every call.
+
+### `reconstruct` (time travel)
+
+`recover` is **delta-only**: it reverses events it actually has, so it can't
+answer "what did this row look like at 3pm" for a row nobody touched in the
+retained window. `reconstruct` folds a **baseline snapshot** (from
+[`bintrail baseline`](dump-and-baseline.md)) with the events after it, so every
+column resolves — the same engine behind `bintrail reconstruct` and the console's
+Time-travel tab.
+
+Parameters: `schema`, `table` and `pk` (required; pipe-delimited for composite
+keys), `at` (defaults to now), `history` (every transition instead of one state),
+and `allow_gaps`.
+
+Baseline location: `baseline_dir` (a local directory) or `baseline_s3`
+(`s3://bucket/prefix`) per call, falling back to the `BINTRAIL_BASELINE_DIR` /
+`BINTRAIL_BASELINE_S3` env vars — set those at startup, like the index DSN. When
+the console serves `/mcp` these parameters are **rejected**: the baseline is that
+server's own configuration, and an MCP client must not point the console at
+arbitrary storage.
+
+**`allow_gaps` defaults to `false`, unlike `query`/`recover`.** A hole in the
+captured history makes a reconstruction *silently wrong* (a state that never
+existed), not merely incomplete, so the tool aborts with an actionable error and
+you opt in explicitly. It also refuses outright — no override — when a
+`TRUNCATE`/`DROP`/`RENAME` hit the table inside the window: no archive can refill
+that, and the fold would resurrect rows that are gone.
+
+The same `allow_gaps: false` default covers two further refusals, both of which
+`allow_gaps: true` overrides — and when you override one, the reason comes back
+as a `capture_gap:` entry in `warnings`, so a known-incomplete result is never
+returned as a clean one:
+
+- the stream recorded events **permanently lost at the source** inside the
+  window (`gap_lost_at`, shown as `GAP LOST` by
+  [`bintrail status`](rotation-and-status.md)) — no archive can refill those;
+- the index is too old to answer the question: its `stream_state` predates the
+  gap-tracking columns, so a permanent loss cannot be ruled out. Migrating the
+  index schema (any indexing or streaming command does it) enables the real
+  check.
+
+Archive sources come from `archive_state` (not the `BINTRAIL_ARCHIVE_S3` env
+pair), because gap detection reads the same registry — run
+[`bintrail archive reconcile`](rotation-and-status.md) if a source drifted.
+
+Returns JSON: `state` (or `history`), `found`, `deleted`, `baseline_time`,
+`event_count`, and any `warnings` (a coverage gap you allowed, a
+[stale-baseline fallback](query-and-recovery.md), or a suspected PK-changing
+UPDATE the fold can't follow).
 
 ---
 

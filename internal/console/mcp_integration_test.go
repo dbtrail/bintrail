@@ -98,7 +98,9 @@ func TestIntegrationMCPEndpoint(t *testing.T) {
 
 	session := mcpConnect(t, ts.URL+"/mcp", intToken)
 
-	// Tool listing: exactly the four read-only tools.
+	// Tool listing: exactly the read-only tools, including reconstruct (#953 —
+	// registered whenever the console serves MCP; the per-server baseline gate
+	// is enforced on the CALL, mirroring /api/reconstruct's 404).
 	tools, err := session.ListTools(ctx, nil)
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
@@ -107,13 +109,30 @@ func TestIntegrationMCPEndpoint(t *testing.T) {
 	for _, tool := range tools.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"query", "recover", "status", "list_schema_changes"} {
+	for _, want := range []string{"query", "recover", "status", "list_schema_changes", "reconstruct"} {
 		if !names[want] {
 			t.Errorf("tool %q not listed; got %v", want, names)
 		}
 	}
-	if len(tools.Tools) != 4 {
-		t.Errorf("expected 4 tools, got %d", len(tools.Tools))
+	if len(tools.Tools) != 5 {
+		t.Errorf("expected 5 tools, got %d", len(tools.Tools))
+	}
+
+	// This console was seeded with NoArchive (no baseline), so the per-server
+	// gate must refuse — and the parameters that would let a client point the
+	// console at arbitrary storage must be refused too.
+	for name, args := range map[string]map[string]any{
+		"ungated": {"schema": "app", "table": "users", "pk": "1"},
+		"baseline_dir param": {"schema": "app", "table": "users", "pk": "1",
+			"baseline_dir": t.TempDir()},
+	} {
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "reconstruct", Arguments: args})
+		if err != nil {
+			t.Fatalf("CallTool reconstruct (%s): %v", name, err)
+		}
+		if !res.IsError {
+			t.Errorf("reconstruct (%s): expected a tool error, got %s", name, mcpToolText(t, res))
+		}
 	}
 
 	// Query round-trip: both events come back, statement text does not.

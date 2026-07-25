@@ -1,6 +1,6 @@
 // bintrail-mcp is an MCP (Model Context Protocol) server that exposes
-// read-only Bintrail operations as tools: query, recover, status, and
-// list_schema_changes.
+// read-only Bintrail operations as tools: query, recover, reconstruct,
+// status, and list_schema_changes.
 //
 // By default it communicates over stdio (for use as a subprocess by Claude
 // Code, Cursor, etc.). Pass --http <addr> to start an HTTP server instead,
@@ -27,6 +27,11 @@
 //
 //	Set BINTRAIL_INDEX_DSN to the MySQL DSN for the index database,
 //	or pass index_dsn as a parameter on each tool call.
+//
+//	The reconstruct tool additionally needs a baseline snapshot location:
+//	BINTRAIL_BASELINE_DIR (a local directory) or BINTRAIL_BASELINE_S3 (an
+//	s3://bucket/prefix), or the per-call baseline_dir / baseline_s3
+//	parameters.
 //
 // The tool implementations live in internal/mcptools, shared with the
 // console's /mcp endpoint; this binary binds them to the standalone posture
@@ -80,17 +85,26 @@ func newServerWithDSN(dsnOverride string) *mcp.Server {
 	return mcptools.NewServer(standaloneConfig(mcptools.DSNTarget(resolveFn)))
 }
 
-// standaloneConfig is the standalone-server tool posture: DSN and profile
-// parameters accepted, env-tunable query ceiling, uncapped recover limit.
+// standaloneConfig is the standalone-server tool posture: DSN, profile and
+// baseline parameters accepted, env-tunable query ceiling, uncapped recover
+// limit.
 func standaloneConfig(resolve mcptools.ResolveTarget) mcptools.Config {
 	return mcptools.Config{
 		Version: mcpVersion,
 		Instructions: "Bintrail MCP server for querying indexed MySQL binlog events, " +
-			"generating recovery SQL, and viewing index status. " +
+			"generating recovery SQL, reconstructing a row's state at a point in time, " +
+			"and viewing index status. " +
 			"Set BINTRAIL_INDEX_DSN environment variable or pass index_dsn on each tool call.",
 		Resolve:           resolve,
 		AllowDSNParam:     true,
 		AllowProfileParam: true,
+		// Time travel (#953). The baseline source is per-call here — the tool's
+		// baseline_dir/baseline_s3 parameters, falling back to
+		// BINTRAIL_BASELINE_DIR / BINTRAIL_BASELINE_S3 — exactly like index_dsn
+		// falls back to BINTRAIL_INDEX_DSN, because this server owns no
+		// long-lived per-server configuration.
+		Reconstruct:         true,
+		AllowBaselineParams: true,
 	}
 }
 

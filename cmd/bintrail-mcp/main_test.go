@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -419,5 +424,72 @@ func TestIsClientDisconnect(t *testing.T) {
 				t.Errorf("isClientDisconnect(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+// ─── .mcpb bundle manifest ───────────────────────────────────────────────────
+
+// TestMCPBManifestToolsMatchServer pins packaging/mcpb/manifest.template.json
+// against the tools the standalone server actually registers. The Claude
+// Desktop bundle advertises its tool list in that manifest, and nothing else
+// checks it: scripts/validate-mcpb.sh inspects the BUILT bundle, whose binary
+// is the stdio<->HTTP bridge, so it cannot enumerate a server's tools without
+// standing one up. Adding a tool and forgetting the manifest (as happened with
+// reconstruct, #953) is therefore invisible until a user reads stale metadata.
+func TestMCPBManifestToolsMatchServer(t *testing.T) {
+	// `go test` runs with the working directory set to the package directory,
+	// so the template is reachable relatively from cmd/bintrail-mcp. Keep it
+	// that way — an absolute path would only work on the machine that wrote it.
+	raw, err := os.ReadFile(filepath.Join("..", "..", "packaging", "mcpb", "manifest.template.json"))
+	if err != nil {
+		t.Fatalf("read mcpb manifest template: %v", err)
+	}
+	// The file is a template (__MCPB_VERSION__ and friends), but every
+	// placeholder sits inside a JSON string, so it parses as-is. Nothing here
+	// asserts on the substituted fields.
+	var manifest struct {
+		Tools []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("parse mcpb manifest template: %v", err)
+	}
+
+	ctx := context.Background()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	serverSession, err := newServer().Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := mcp.NewClient(&mcp.Implementation{Name: "manifest-check", Version: "test"}, nil).
+		Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	listed, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+
+	var serverNames, manifestNames []string
+	for _, tool := range listed.Tools {
+		serverNames = append(serverNames, tool.Name)
+	}
+	for _, tool := range manifest.Tools {
+		if tool.Description == "" {
+			t.Errorf("manifest tool %q has no description", tool.Name)
+		}
+		manifestNames = append(manifestNames, tool.Name)
+	}
+	slices.Sort(serverNames)
+	slices.Sort(manifestNames)
+	if !slices.Equal(serverNames, manifestNames) {
+		t.Errorf("packaging/mcpb/manifest.template.json is out of sync with the server:\n  manifest: %v\n  server:   %v",
+			manifestNames, serverNames)
 	}
 }

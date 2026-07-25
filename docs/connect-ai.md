@@ -12,11 +12,13 @@ plain English — from **Claude Desktop**, claude.ai, or any MCP-capable client:
 This page is the shortest path there. No JSON files, no DSNs, no SSH gymnastics.
 (If you want every option and knob instead, that's [mcp-server.md](mcp-server.md).)
 
-**What the AI can and cannot do, up front:** it gets four **read-only** tools —
-search changes, draft reversal SQL, show index status, list schema changes. It
-sees exactly what the web console shows you, with the same result caps and the
-same redactions. It **never executes SQL** and never connects to your source
-database — recovery SQL is text you review and run yourself.
+**What the AI can and cannot do, up front:** it gets five **read-only** tools —
+search changes, draft reversal SQL, reconstruct a row's state at a point in time,
+show index status, list schema changes. It sees exactly what the web console
+shows you, with the same result caps and the same redactions. It **never executes
+SQL** and never connects to your source database — recovery SQL is text you review
+and run yourself. (Time travel needs a baseline snapshot configured for that
+server, exactly like the console's Time-travel tab; without one the tool says so.)
 
 ---
 
@@ -86,8 +88,8 @@ That's it. No config files were harmed.
 
 ## Step 3 — ask something
 
-Open a new Claude Desktop conversation. The `query`, `recover`, `status`, and
-`list_schema_changes` tools are now available. Try:
+Open a new Claude Desktop conversation. The `query`, `recover`, `status`,
+`list_schema_changes`, and `reconstruct` tools are now available. Try:
 
 > "Show me the last 20 changes in the `wordpress` schema."
 >
@@ -143,7 +145,7 @@ directly with a DSN — see [mcp-server.md](mcp-server.md).
 
 - The endpoint requires the console token on **every** request; unknown hosts
   are rejected by the same host-header allowlist as the rest of the console.
-- The four tools are read-only and annotated as such (`ReadOnlyHint`); the AI
+- The five tools are read-only and annotated as such (`ReadOnlyHint`); the AI
   cannot write to the index, the source, or anywhere else through them.
 - Responses carry the console's field redactions — e.g. captured SQL statement
   text is withheld, same as the console UI.

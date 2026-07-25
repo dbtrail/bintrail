@@ -19,14 +19,28 @@ It is read-only and never writes to your source or your index.
   to write rows to the table being compared. A MATCH is strong evidence the
   capture-and-reconstruct pipeline works; it is not tamper-evident or
   forensic-grade proof.
-- **It does not exercise the `recover` path.** `verify` reconstructs full-table
-  state from the *latest* event per PK (`row_after`, `LimitPerPK=1`).
-  `recover`'s reversal SQL additionally depends on `row_before` images,
-  DELETE row images, and intermediate events later superseded by a newer event
-  on the same PK — none of which a table-content match touches. A corrupt
-  `row_before`, a corrupt DELETE image, or a corrupt superseded intermediate
-  event can all pass `verify` cleanly while still producing a wrong `recover`
-  reversal from that same data.
+- **The default (content) check does not exercise the `recover` path.** With
+  `--check content` — the default — `verify` reconstructs full-table state from
+  the *latest* event per PK (`row_after`, `LimitPerPK=1`). `recover`'s reversal
+  SQL additionally depends on `row_before` images, DELETE row images, and
+  intermediate events later superseded by a newer event on the same PK — none
+  of which a table-content match touches. A corrupt `row_before`, a corrupt
+  DELETE image, or a corrupt superseded intermediate event can all pass a
+  content check cleanly while still producing a wrong `recover` reversal from
+  that same data.
+
+  **`--check recover` closes exactly that hole** — see
+  [Recover-input](#recover-input---check-recover) below. It is a *separate
+  run*: a clean `--check content` still proves nothing about `recover`'s
+  inputs, and a clean `--check recover` proves nothing about full-table
+  content. Run both to cover both.
+- **`--check recover` proves internal consistency, not external truth.** It
+  asserts the stored images agree *with each other* along each primary key's
+  chain. It has no independent ground truth, so a chain that was captured
+  self-consistently but wrongly (e.g. every image for a row derived from the
+  same bad source read) still passes. It also cannot prove the reversal SQL
+  *applies* to today's schema — a column dropped after capture makes `recover`
+  refuse at generation time, which is a schema-drift concern, not an image one.
 - **It does not exercise point-in-time reconstruction to an arbitrary instant
   between two anchors.** Baseline-anchored mode compares two baseline anchors
   (or a baseline vs. the live source at scan time); there is no independent
@@ -43,7 +57,16 @@ It is read-only and never writes to your source or your index.
   reconstruction itself is correct — the live table simply kept moving during
   the read.
 
-## The two modes
+## The modes
+
+`--check` selects **what** is verified; within the default `--check content`,
+passing or omitting `--source-dsn` selects **what it is compared against**.
+
+| | Reads | Answers |
+|---|---|---|
+| `--check content` (default), no `--source-dsn` | two baselines + index | does the reconstruction match the next baseline? |
+| `--check content` + `--source-dsn` | baseline + index + live source | does the reconstruction match the live table? |
+| `--check recover` | index only | are the before/after images `recover` consumes internally consistent? |
 
 ### Baseline-anchored (default, drift-free)
 
@@ -77,6 +100,109 @@ bintrail verify --source-dsn "$SRC" --index-dsn "$IDX" \
   --baseline-s3 s3://bucket/baselines --tables mydb.orders,mydb.users
 ```
 
+### Recover-input (`--check recover`)
+
+Pass `--check recover`. Instead of comparing table content, `verify` walks each
+primary key's **event chain** in time order and asserts the images are
+internally consistent — the data `bintrail recover` actually reads to build
+reversal SQL:
+
+| `recover` reverses | by reading |
+|---|---|
+| `DELETE` → `INSERT` | `row_before` (the deleted row) |
+| `UPDATE` → reverse `UPDATE` | `row_before` (the `SET`) **and** `row_after` (the `WHERE`) |
+| `INSERT` → `DELETE` | `row_after` (the `WHERE`) |
+
+So per event it checks that every image `recover` dereferences is present, that
+no unchanged-TOAST marker survived capture, and — the core assertion — that
+each `UPDATE`/`DELETE` **`row_before` equals the state the previous event on
+that same key left behind**. Events superseded by a newer event on the same key
+are walked too; that is precisely the class `--check content` skips.
+
+It reads **the index only** — no baseline, no live source — so
+`--baseline-dir`/`--baseline-s3` are not required and `--source-dsn` is
+rejected.
+
+```sh
+# Walk the last 7 days of chains for every table in the schema snapshot
+bintrail verify --index-dsn "$IDX" --check recover --lookback 7d
+
+# One table, machine-readable, for a CI gate
+bintrail verify --index-dsn "$IDX" --check recover \
+  --tables mydb.orders --format json
+```
+
+**A window that begins mid-history is `inconclusive`, never `mismatch`.** The
+first event on a key inside `--lookback` usually has no predecessor in the
+window (the row already existed), so there is nothing to assert against it —
+that is the normal case for any retention window, not corruption. Later events
+on the same key *are* asserted, so a table is still proven as long as at least
+one comparison was made; a table where *none* was reports `inconclusive`.
+
+Three other conditions also report `inconclusive` rather than risk a false alarm:
+
+- a **coverage gap** in the window (a chain with an interior hole cannot be
+  asserted against);
+- a **recorded permanent loss** inside the window — `bintrail status` shows it
+  as `GAP LOST`, and it is stamped in `stream_state.gap_lost_at`. Those events
+  are gone from live MySQL *and* from every archive, so the chains that cross
+  the loss have a hole nothing can be asserted across. An index whose
+  continuity record cannot be read at all (one predating those columns) reports
+  `inconclusive` for the same reason: *unknown* is not *no gap*;
+- a window that **exceeded `--max-events`** — only its oldest events were
+  walked, so a clean result would be a partial check.
+
+A mismatch found inside a truncated window *is* still conclusive: the events
+that were walked are real.
+
+**A chain break tells you the chain broke, not why.** A `mismatch` here means
+`row_before` did not match the state the previous event on that key left. Two
+explanations produce byte-identical evidence, and the check cannot choose
+between them:
+
+1. **The events in between were never captured.** Coverage detection is
+   *partition-existence* based, so a hole *inside* an hour whose partition
+   exists is invisible to it — an `ALTER` without a re-`snapshot` (the indexer
+   logs a column-count warning and *skips that table's events*), a mid-history
+   `--tables`/`--schemas` filter change, a `stream --reset`, or an outage
+   shorter than the pre-created partition horizon.
+2. **The stored before-image is stale or corrupt.**
+
+To tell them apart, check `bintrail status` continuity and the indexer/stream
+logs for skipped tables, filter changes, resets or downtime covering the
+window, and compare against the source's own binlog history. Do not start from
+the assumption that the images are corrupt — a capture hole is at least as
+likely.
+
+**Partial coverage annotates a verdict, it does not erase it.** A table is
+proven as soon as *one* before-image comparison was conclusive; everything that
+stayed unproven is carried as a note on that verdict (visible in `reason`)
+rather than collapsing the table:
+
+| Not checked | Effect |
+|---|---|
+| chains beginning mid-history | noted |
+| a value whose representation could not be normalized (an unmapped `ENUM` ordinal, a JSON document the event image cannot render faithfully) | noted |
+| **drift rows** — events the index holds with no primary key (`pk_values` NULL) | noted; they belong to no chain and are never walked |
+| the entire tail of the window (`--max-events` exceeded) | **collapses** the table to `inconclusive` |
+
+Only a table where *nothing* was conclusive reports `inconclusive`. This
+matters for CI: one unresolvable JSON value in a 200,000-event window used to
+discard every clean assertion beside it and fail the gate on a healthy index.
+
+> **The `30d` default assumes your window is actually covered.** If partitions
+> older than your retention were rotated out of MySQL and never archived to
+> Parquet, a 30-day lookback covers hours that no longer exist, and *every*
+> table reports `inconclusive` with a coverage-gap reason. That is correct
+> behavior, not a bug — but the fix is to **shorten `--lookback`** to your real
+> retention (or enable archiving), not to ignore the result. Since an
+> all-inconclusive run exits non-zero, a cron gate will tell you immediately.
+
+Memory bound: the walk loads at most `--max-events` events per table (default
+200,000) plus one row of state per distinct primary key seen. The cap is a
+**row count, not a byte budget** — a BLOB/TEXT-heavy table is still large at a
+given event count, so lower `--max-events` or narrow `--lookback` for those.
+
 ## What it reports
 
 Results are **per table**, one of:
@@ -86,7 +212,8 @@ Results are **per table**, one of:
 - **inconclusive** — verify could not prove the table either way, and this is
   **never reported as a failure**. Causes include: no predecessor baseline yet,
   the index is behind the baseline anchor, an unsupported primary key, a coverage
-  gap, a digest-contract skew between a pre-pin baseline and the current scan
+  gap, a recorded permanent loss (`gap_lost_at`) inside the window, a
+  digest-contract skew between a pre-pin baseline and the current scan
   (regenerate the baseline — see below), or a value class this version cannot yet
   compare.
 
@@ -123,7 +250,7 @@ bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines --format json
 }
 ```
 
-- `mode` — `baseline-anchored` or `live-source`.
+- `mode` — `baseline-anchored`, `live-source`, or `recover-inputs`.
 - `verdict` — the run outcome, matching the exit code: `verified` (exit 0),
   `mismatch`, `error`, `unproven` (tables reported, none proven — exit non-zero),
   or `no_predecessor` (only one baseline; reported, exit 0, with a `message`).
@@ -131,6 +258,12 @@ bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines --format json
   bucket counted in `summary`. `anchor` is the point the comparison was anchored
   to (a GTID set in live-source mode, a `file:pos` binlog coordinate in
   baseline-anchored mode); `reason` is the detail behind the verdict.
+- `tables[].events_checked` / `chains_checked` / `chains_inconclusive` —
+  present only under `--check recover` (omitted entirely otherwise, so a
+  content-mode document is unchanged): how many events the chain walk visited,
+  how many distinct primary keys it walked, and how many of those began
+  mid-window with no predecessor to assert against. The row-count and digest
+  fields stay absent in this mode — it compares no table content.
 - `explain[]` — present only with `--explain`: per mismatched table, the capped
   list of differing rows (`pk`, `kind`, and per-column `recovery` vs `baseline`
   values), `total_differing_rows`, `overflow_by_kind` for the rows beyond the
@@ -180,8 +313,13 @@ diff tool involved.
 | `--no-archive` | `false` | Query live MySQL partitions only; skip Parquet archive discovery |
 | `--explain` | `false` | On a baseline-anchored mismatch, print a per-row drill-down |
 | `--format` | `text` | Output format: `text` or `json` (see [Machine-readable output](#machine-readable-output---format-json)) |
+| `--check` | `content` | What to verify: `content` (reconstructed table content) or `recover` (`recover`'s before/after image inputs, index-only) |
+| `--lookback` | `30d` | `--check recover` only: how far back to walk each key's event chain (e.g. `30d`, `24h`) |
+| `--max-events` | `200000` | `--check recover` only: per-table cap on events loaded; exceeding it reports `inconclusive` rather than a partial check |
 
-One of `--baseline-dir` or `--baseline-s3` is **required** — `verify` always reads baselines, in both modes.
+One of `--baseline-dir` or `--baseline-s3` is **required** for `--check content`
+(both of its modes read baselines). `--check recover` reads the index only, so
+it requires neither — and rejects `--source-dsn`, which it would not use.
 
 It also accepts the shared DuckDB tuning flags (`--ultrafast`,
 `--duckdb-threads`, `--duckdb-memory-limit`) — see the DuckDB resource tuning
@@ -193,9 +331,12 @@ section in [Query & Recovery](query-and-recovery.md).
   (delta-only).
 - **`reconstruct`** materializes a *full table or row* at a point in time
   (baseline + deltas).
-- **`verify`** doesn't recover anything — it *checks* that the `reconstruct`
-  chain is sound, so you find out your recoveries are trustworthy **before** you
-  need them.
+- **`verify`** doesn't recover anything — it *checks* that these are sound, so
+  you find out your recoveries are trustworthy **before** you need them.
+  `--check content` checks the `reconstruct` chain (baseline + deltas → full
+  state); `--check recover` checks the images `recover` itself consumes
+  (`row_before`, DELETE pre-images, superseded events). They cover different
+  data and neither implies the other.
 
 See also: the stream-continuity "no data lost" signal in
 [`bintrail status`](rotation-and-status.md#stream-continuity-no-data-lost), which
