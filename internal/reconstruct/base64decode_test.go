@@ -89,3 +89,23 @@ func TestBase64StoredKind_binaryVarbinary(t *testing.T) {
 		}
 	}
 }
+
+// TestBase64StoredKind_spatialAndVector pins the #1136 entries: the spatial
+// family and VECTOR are delivered by go-mysql as []byte (SRID+WKB / packed
+// floats) and stored base64 like BLOB, so they must decode as binary here.
+// This guards against drift between this copy and the deliberately-untouched
+// sibling copies (internal/recovery, internal/shim) without needing Docker.
+func TestBase64StoredKind_spatialAndVector(t *testing.T) {
+	for _, dt := range []string{
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection", "geomcollection",
+		"vector",
+		"GEOMETRY", "Point", // case-insensitive
+	} {
+		binary, ok := base64StoredKind(dt)
+		if !ok || !binary {
+			t.Errorf("base64StoredKind(%q) = (%v,%v), want (true,true)", dt, binary, ok)
+		}
+	}
+}

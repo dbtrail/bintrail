@@ -359,11 +359,17 @@ func deferredReprUnresolved(cols []metadata.ColumnMeta, changes map[string]*quer
 	if len(deferredCols) == 0 {
 		return metadata.ColumnMeta{}, false
 	}
-	for _, ev := range changes {
-		if ev.EventType != event.EventInsert && ev.EventType != event.EventUpdate {
-			continue
-		}
-		for _, c := range deferredCols {
+	// Column-outer iteration (not changes-outer): changes is a map, whose
+	// iteration order varies run to run, so with more than one unresolved
+	// column a map-outer walk would name a different column on each run —
+	// making the Inconclusive Detail (and verify --format json) non-
+	// reproducible. Walking deferredCols first pins the named column to the
+	// source column order the caller passed in.
+	for _, c := range deferredCols {
+		for _, ev := range changes {
+			if ev.EventType != event.EventInsert && ev.EventType != event.EventUpdate {
+				continue
+			}
 			v, present := ev.RowAfter[c.Name]
 			if !present || v == nil {
 				continue // absent/NULL renders identically on both sides
@@ -444,15 +450,16 @@ func deferredValueUnresolved(v any, c metadata.ColumnMeta, binariesTyped bool) b
 			return true // #736 mis-promotion leftover the decode pass could not restore
 		}
 	case "varbinary", "blob", "tinyblob", "mediumblob", "longblob",
-		// Spatial family + VECTOR: binary in the event image (4-byte SRID +
-		// WKB / packed floats), decoded by the same DecodeEventBinaries pass
-		// as BLOB since #1136. Once decoded, the raw bytes are exactly what
-		// the source SELECT and the mydumper baseline carry — no padding
-		// concern (spatial values have no fixed declared width), so they
-		// resolve like BLOB.
+		// Spatial family: binary in the event image (4-byte SRID + WKB),
+		// decoded by the same DecodeEventBinaries pass as BLOB since #1136.
+		// Once decoded, the raw bytes are exactly what the source SELECT and
+		// the mydumper baseline carry — internal/baseline routes the spatial
+		// family through its binary/decodeBinaryLiteral path, so baseline
+		// bytes == decoded event bytes. No padding concern (spatial values
+		// have no fixed declared width), so they resolve like BLOB.
 		"geometry", "point", "linestring", "polygon",
 		"multipoint", "multilinestring", "multipolygon",
-		"geometrycollection", "geomcollection", "vector":
+		"geometrycollection", "geomcollection":
 		if !binariesTyped {
 			return true // may still be stored base64 — DecodeEventBinaries degraded
 		}
@@ -462,6 +469,18 @@ func deferredValueUnresolved(v any, c metadata.ColumnMeta, binariesTyped bool) b
 		default:
 			return true // #736 mis-promotion leftover the decode pass could not restore
 		}
+	case "vector":
+		// VECTOR (MySQL 9.0+) is decoded by DecodeEventBinaries like BLOB
+		// (base64StoredKind), but it stays UNRESOLVED here because of a
+		// baseline-side asymmetry the spatial family does not have:
+		// internal/baseline's binary column list (mysqlToParquetNode's
+		// ByteArray case and the writer's decodeBinaryLiteral routing) covers
+		// geometry and its subtypes but NOT "vector", so a VECTOR baseline
+		// column stores the literal dump token (e.g. the ASCII "0x…" text of
+		// a --hex-blob dump), not the raw packed-float bytes. Resolving the
+		// event side would turn today's honest Inconclusive into a conclusive
+		// false MISMATCH on identical data.
+		return true
 	default:
 		// isDeferredType enumerates every deferred type in the cases above;
 		// anything else reaching here is unknown — unsure means unresolved.
@@ -516,10 +535,12 @@ func isASCII(s string) bool {
 // isDeferredType reports whether a column's event-image representation can differ
 // from how the baseline/source renders it in a way this version doesn't yet
 // normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), binary
-// families (base64 in the event image vs raw bytes), BIT, and the spatial and
-// VECTOR types — binary (SRID+WKB / packed floats) in the event image, decoded
-// by DecodeEventBinaries like BLOB since #1136 but still gated here for when
-// the epoch-typed decode degrades (binariesTyped=false), same as BLOB.
+// families (base64 in the event image vs raw bytes), BIT, the spatial family —
+// binary (SRID+WKB) in the event image, decoded by DecodeEventBinaries like
+// BLOB since #1136 but still gated here for when the epoch-typed decode
+// degrades (binariesTyped=false) — and VECTOR, which additionally stays
+// permanently unresolved (see deferredValueUnresolved's vector case: the
+// baseline side does not store its raw bytes).
 //
 // TEXT is deliberately NOT here, despite being decoded by the same
 // DecodeEventBinaries call as BLOB (#672): once decoded, a TEXT value is just
@@ -537,8 +558,9 @@ func isDeferredType(dataType string) bool {
 		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit",
 		// Spatial family (DATA_TYPE as reported by information_schema.COLUMNS)
 		// plus MySQL 9.0+ VECTOR: binary in the event image, decoded by
-		// DecodeEventBinaries like BLOB (#1136) — still deferred for the
-		// binariesTyped=false degradation, same as the binary families above.
+		// DecodeEventBinaries like BLOB (#1136). Spatial defers only for the
+		// binariesTyped=false degradation; VECTOR is permanently unresolved
+		// (see deferredValueUnresolved's vector case).
 		"geometry", "point", "linestring", "polygon",
 		"multipoint", "multilinestring", "multipolygon",
 		// MySQL 8.0.11+ (WL#2388) reports a GEOMETRYCOLLECTION column's DATA_TYPE

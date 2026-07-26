@@ -19,8 +19,10 @@ func TestIsDeferredType(t *testing.T) {
 		"enum", "set", "json",
 		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit",
 		// #793/#1136: spatial family + VECTOR — binary (SRID+WKB / packed
-		// floats) in the event image, decoded by DecodeEventBinaries like BLOB
-		// but still deferred for when the epoch-typed decode degrades.
+		// floats) in the event image, decoded by DecodeEventBinaries like
+		// BLOB. Spatial defers for when the epoch-typed decode degrades;
+		// VECTOR stays permanently unresolved (the baseline side does not
+		// store its raw bytes — see deferredValueUnresolved).
 		"geometry", "point", "linestring", "polygon",
 		"multipoint", "multilinestring", "multipolygon",
 		"geometrycollection", "geomcollection", // MySQL 8.0.11+ reports the latter
@@ -60,6 +62,7 @@ func TestDeferredReprUnresolved(t *testing.T) {
 	blobCol := metadata.ColumnMeta{Name: "payload", DataType: "blob"}
 	geoCol := metadata.ColumnMeta{Name: "loc", DataType: "geometry"}
 	pointCol := metadata.ColumnMeta{Name: "loc", DataType: "point", ColumnType: "point"}
+	vectorCol := metadata.ColumnMeta{Name: "emb", DataType: "vector", ColumnType: "vector(4)"}
 	binCol := metadata.ColumnMeta{Name: "v", DataType: "binary", ColumnType: "binary(16)"}
 	binNoWidth := metadata.ColumnMeta{Name: "v", DataType: "binary"} // pre-#212 snapshot
 	varbinCol := metadata.ColumnMeta{Name: "v", DataType: "varbinary"}
@@ -152,6 +155,14 @@ func TestDeferredReprUnresolved(t *testing.T) {
 			ch(upd(map[string]any{"loc": "AAAA"})), true, false},
 		{"geometry with typing unavailable", []metadata.ColumnMeta{geoCol},
 			ch(upd(map[string]any{"loc": "AAAA"})), false, true},
+
+		// VECTOR: unresolved even when decoded — the baseline side stores the
+		// literal dump token, not the raw packed-float bytes, so a decoded
+		// event value can never be byte-faithful to the baseline rendering.
+		{"vector decoded stays unresolved", []metadata.ColumnMeta{vectorCol},
+			ch(upd(map[string]any{"emb": []byte{0, 0, 128, 63}})), true, true},
+		{"vector with typing unavailable", []metadata.ColumnMeta{vectorCol},
+			ch(upd(map[string]any{"emb": "AACAPw=="})), false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

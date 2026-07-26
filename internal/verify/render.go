@@ -206,6 +206,14 @@ func renderBitBytes(v any, col metadata.ColumnMeta) ([]byte, bool) {
 // instead of a false MISMATCH. A value at or beyond the declared width is
 // NEVER truncated: it returns at its natural length, so a genuinely divergent
 // longer value still differs.
+//
+// Unlike the adjacent BIT branch — which converts only numeric (i.e.
+// event-origin) values, leaving baseline-origin []byte untouched — this
+// padding is origin-blind: a baseline value that is short for some
+// non-padding reason would be silently padded too. Accepted because MySQL
+// only ever strips trailing 0x00 from a stored fixed BINARY(n) value, so
+// re-padding a short value reproduces the stored value exactly regardless of
+// which side produced it.
 func padFixedBinary(b []byte, col metadata.ColumnMeta) []byte {
 	width := fixedBinaryWidth(col.ColumnType)
 	if width == 0 || len(b) >= width {
