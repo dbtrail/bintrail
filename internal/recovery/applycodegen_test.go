@@ -125,6 +125,73 @@ func TestRestoreAutoIncrement_MySQLOnlyAfterCommit(t *testing.T) {
 	}
 }
 
+// ─── Comment-injection defense (#1120) ────────────────────────────────────────
+
+// TestCommentInjection_PKNewlineCannotEscapeTheHeaderComment pins the vector
+// that ships today: a newline inside a VARCHAR primary key is ordinary data, and
+// the per-event header comment interpolated it raw. Because a "--" comment ends
+// at the first newline, everything after it became executable SQL INSIDE the
+// script's BEGIN/COMMIT.
+//
+// PKValues is the right probe for a whole-script assertion: it reaches the
+// header comment ONLY — the reversal's WHERE/VALUES clauses are rebuilt from the
+// row image — so the executable statements stay byte-identical to an ordinary
+// script and every remaining line must be a comment or one of them. That is what
+// makes this catch an unsanitized site anywhere in the body, not just the one
+// line the fix touched.
+func TestCommentInjection_PKNewlineCannotEscapeTheHeaderComment(t *testing.T) {
+	row := applyCodegenRow("db", "orders")
+	row.PKValues = "1\nDROP TABLE users;"
+
+	out := mustGenerate(t, New(nil, nil), []query.ResultRow{row})
+
+	// Every statement an ordinary MySQL reversal script is allowed to contain.
+	allowed := map[string]bool{
+		"BEGIN;":                    true,
+		"SET time_zone = '+00:00';": true,
+		"SET sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';": true,
+		"COMMIT;": true,
+		"INSERT INTO `db`.`orders` (`id`) VALUES ('1');": true,
+	}
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "--") || allowed[trimmed] {
+			continue
+		}
+		t.Errorf("line escaped its comment and would execute: %q\nfull script:\n%s", line, out)
+	}
+}
+
+// TestCommentInjection_TableNewlineCannotEscapeTheAutoIncrementBlock covers the
+// sharpest case (#1110's opt-in block): there the "--" prefix is the ENTIRE
+// safety mechanism, and the block sits after COMMIT, so anything that breaks out
+// runs standalone rather than inside the transaction. MySQL permits any BMP
+// character except U+0000 in a backtick-quoted identifier, newline included.
+//
+// The assertion is over the whole post-COMMIT REGION — which is comment-only by
+// design — so a site in that block left unsanitized fails here even though the
+// fix never touched its Fprintf.
+func TestCommentInjection_TableNewlineCannotEscapeTheAutoIncrementBlock(t *testing.T) {
+	g := New(nil, nil)
+	g.SetRestoreAutoIncrement(true)
+	out := mustGenerate(t, g, []query.ResultRow{applyCodegenRow("db", "or\nders")})
+
+	_, after, found := strings.Cut(out, "\nCOMMIT;\n")
+	if !found {
+		t.Fatalf("script has no COMMIT to anchor the AUTO_INCREMENT block:\n%s", out)
+	}
+	if !strings.Contains(after, autoIncSection) {
+		t.Fatalf("opted-in script must emit the AUTO_INCREMENT block after COMMIT, got:\n%s", after)
+	}
+	for _, line := range strings.Split(after, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		t.Errorf("post-COMMIT line is not commented and would execute: %q\nblock:\n%s", line, after)
+	}
+}
+
 // TestRestoreAutoIncrement_NoRowsEmitsNothing: with no matched events there is
 // no table whose counter could need restoring, and the early return must stay a
 // bare "no events" line rather than growing a checklist for an empty reversal.

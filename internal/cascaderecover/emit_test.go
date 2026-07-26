@@ -652,3 +652,38 @@ func TestMergeParentRoots_tiesBreakOnEventID(t *testing.T) {
 		t.Errorf("same-second roots must order by EventID, got %+v", got)
 	}
 }
+
+// TestEmitSQL_commentInjectionCannotEscapeThePreamble pins #1120 on the cascade
+// path. Everything the preamble emits before `SET FOREIGN_KEY_CHECKS=0;` is a
+// "--" comment by design, so asserting over that whole REGION catches any
+// unsanitized interpolation in it — not merely the two the fix touched.
+//
+// Both untrusted channels are exercised at once: the header identifiers, and a
+// caveat string (caveats are built in internal/cascade from schema/table names
+// and error text, and are sanitized here at the comment boundary rather than at
+// their ~10 construction sites, because the same strings are also served as JSON
+// by the console, where a newline is harmless).
+func TestEmitSQL_commentInjectionCannotEscapeThePreamble(t *testing.T) {
+	hdr := cascaderecover.Header{
+		Schema: "shop", Table: "or\nders",
+		Parents: 1, Children: 0,
+		Caveats:  []string{"child shop.au\ndit was not covered"},
+		Warnings: []string{"baseline for shop.li\nnes is stale"},
+	}
+	got, _, err := emit(t, hdr, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("EmitSQL: %v", err)
+	}
+
+	preamble, _, found := strings.Cut(got, "\nSET FOREIGN_KEY_CHECKS=0;")
+	if !found {
+		t.Fatalf("no SET FOREIGN_KEY_CHECKS=0 to anchor the preamble:\n%s", got)
+	}
+	for _, line := range strings.Split(preamble, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		t.Errorf("preamble line escaped its comment and would execute: %q\npreamble:\n%s", line, preamble)
+	}
+}

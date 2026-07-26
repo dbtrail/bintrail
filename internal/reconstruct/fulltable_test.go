@@ -718,3 +718,16 @@ func mustReadOnlyChunk(t *testing.T, dir string) string {
 	}
 	return string(b)
 }
+
+// TestBinlogOnlySchemaPlaceholder_commentInjection pins #1120 for the
+// binlog-only schema file: its entire contents are a "--" comment block, and it
+// is written for the operator to apply as-is, so a newline in either identifier
+// would leave the rest of the name executing as SQL.
+func TestBinlogOnlySchemaPlaceholder_commentInjection(t *testing.T) {
+	out := binlogOnlySchemaPlaceholder("my\ndb", "or\nders")
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if !strings.HasPrefix(line, "--") {
+			t.Errorf("placeholder line is not a comment and would execute: %q\nfull text:\n%s", line, out)
+		}
+	}
+}

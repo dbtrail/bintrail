@@ -283,13 +283,16 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 
 		gtidSuffix := ""
 		if row.GTID != nil {
-			gtidSuffix = " gtid=" + *row.GTID
+			gtidSuffix = " gtid=" + SanitizeForComment(*row.GTID)
 		}
+		// Every interpolated value is sanitized (#1120): a newline in the table
+		// name or the PK would end this comment and turn the rest of the line
+		// into executable SQL sitting inside the BEGIN/COMMIT below.
 		fmt.Fprintf(&body, "-- [%d] reverse %s on %s.%s pk=%s at %s%s\n",
 			row.EventID,
 			eventTypeName(row.EventType),
-			row.SchemaName, row.TableName,
-			row.PKValues,
+			SanitizeForComment(row.SchemaName), SanitizeForComment(row.TableName),
+			SanitizeForComment(row.PKValues),
 			row.EventTimestamp.Format("2006-01-02 15:04:05"),
 			gtidSuffix,
 		)
@@ -304,7 +307,8 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 			// clean under BEGIN/COMMIT and the operator never learns an event
 			// was skipped. Same fail-loud stance as the schema-drift (#601) and
 			// script-budget (#654) refusals — refuse up front, write nothing.
-			fmt.Fprintf(&body, "-- ERROR generating reversal for event %d: %v\n", row.EventID, err)
+			fmt.Fprintf(&body, "-- ERROR generating reversal for event %d: %s\n",
+				row.EventID, SanitizeForComment(err.Error()))
 			genFailures = append(genFailures, genFailure{
 				eventID:    row.EventID,
 				schemaName: row.SchemaName,
@@ -464,7 +468,11 @@ func (g *Generator) writeAutoIncrementSection(w io.Writer, touched map[string]bo
 	fmt.Fprintln(w, "-- no-op, never data loss.")
 	for _, k := range keys {
 		schema, table, _ := strings.Cut(k, "\x00")
-		qualified := QuoteName(schema) + "." + QuoteName(table)
+		// Sanitized once here (#1120) because all three uses below are comment
+		// lines: this block's ENTIRE safety mechanism is the "--" prefix, and it
+		// sits after COMMIT, so a newline-bearing identifier would run whatever
+		// followed it as a standalone statement.
+		qualified := SanitizeForComment(QuoteName(schema) + "." + QuoteName(table))
 		fmt.Fprintln(w, "--")
 		fmt.Fprintf(w, "-- %s:\n", qualified)
 		fmt.Fprintf(w, "--   SELECT IFNULL(MAX(%s), 0) + 1 FROM %s;\n", QuoteName("<auto_increment_column>"), qualified)
@@ -1334,6 +1342,29 @@ func EscapeString(s string) string {
 // escaping any backticks in the name itself.
 func QuoteName(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
+}
+
+// SanitizeForComment makes s safe to interpolate into a "--" SQL comment line
+// (#1120). A "--" comment ends at the first newline, so a value carrying one
+// closes the comment and hands whatever follows to the parser as executable SQL.
+// No existing escaper defends against this: event.EscapePKValue escapes only
+// `\` and `|`, and QuoteName only the backtick — a newline is perfectly legal inside
+// a backtick-quoted MySQL identifier, and inside a VARCHAR primary key it is
+// ordinary data.
+//
+// The substitution is LOSSY on purpose, and only the annotation loses. Comments
+// carry an identifier or PK for the operator to read; the executable statement
+// beside them renders the same value through QuoteName/EscapeString, which keep
+// every byte. Refusing outright would instead deny recovery to a table that is
+// merely oddly named. Callers therefore apply this at the point a value meets a
+// "--", never to the value itself.
+//
+// Both ReplaceAll calls return s untouched (no allocation) when it holds no
+// line break, which is every ordinary name.
+func SanitizeForComment(s string) string {
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return s
 }
 
 // ─── Dialect dispatch (#533) ───────────────────────────────────────────────────

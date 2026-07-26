@@ -29,6 +29,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/recovery"
 )
 
 // FullTableConfig drives ReconstructTables — the full-table merge-on-read
@@ -1414,7 +1415,12 @@ func reconstructBinlogOnly(
 // binlogOnlySchemaPlaceholder is the schema-file text used when no captured
 // CREATE TABLE DDL is available: fabricating one from column metadata risks
 // silently shipping a wrong PK/engine/charset/index definition as fact.
+//
+// The whole return value is a "--" comment block, so the names are sanitized
+// (#1120): a newline in either would end the comment and leave the remainder of
+// the identifier as executable SQL in a schema file meant to be applied as-is.
 func binlogOnlySchemaPlaceholder(schema, table string) string {
+	schema, table = recovery.SanitizeForComment(schema), recovery.SanitizeForComment(table)
 	return fmt.Sprintf(
 		"-- bintrail: no baseline snapshot exists for %s.%s (table created after the last\n"+
 			"-- `bintrail baseline` run, or never baselined), and no CREATE TABLE statement for\n"+
