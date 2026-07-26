@@ -30,6 +30,14 @@ type StreamParser struct {
 	// decoded. See SetSyncDDLHook for why this must not move off the parse
 	// path, and why the ordering (hook, then emit) is load-bearing for #760.
 	onDDL atomic.Pointer[func(Event) error]
+	// skips, when set, tallies capture-time discards (#1034): every event Run
+	// reads and drops (column-count mismatch, table not in snapshot,
+	// statement-format DML, ...) is counted per reason so the stream consumer
+	// can persist the counters with its checkpoint and `status` can surface a
+	// Capture health verdict. Set via SetSkipCounters BEFORE Run starts (same
+	// happens-before contract as SetFlavor); nil = no counting (file parser,
+	// tests).
+	skips *SkipCounters
 	// flavor is the source flavor ("mysql" or "mariadb"; see SetFlavor), used
 	// only to word remediation text (GTIDExecutedHint) in the position-
 	// wraparound error inside Run. Never consulted for parsing decisions —
@@ -70,6 +78,14 @@ func (sp *StreamParser) SwapResolver(r *metadata.Resolver) {
 // defaults to MySQL wording.
 func (sp *StreamParser) SetFlavor(flavor string) {
 	sp.flavor = flavor
+}
+
+// SetSkipCounters wires the capture-skip tally (#1034) Run records discards
+// into. Must be called before the goroutine that runs Run is spawned — Run
+// reads it without synchronization, relying on the happens-before edge from
+// the spawning statement (the SetFlavor contract). nil disables counting.
+func (sp *StreamParser) SetSkipCounters(c *SkipCounters) {
+	sp.skips = c
 }
 
 // GTIDExecutedHint returns the flavor-appropriate system variable an
@@ -352,6 +368,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 					"statement_type", kw,
 					"connection_id", ev.SlaveProxyID)
 				observe.StatementDMLDropped()
+				sp.skips.RecordSkip(SkipStatementFormatDML)
 			}
 
 		case *replication.XIDEvent:
@@ -380,7 +397,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			// nil gapTracker: the stream keeps its warn-and-continue skip
 			// behavior (the synchronous DDL hook, SetSyncDDLHook, is the
 			// stream's post-DDL correctness mechanism, not file-level failure).
-			err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, sp.schemaVersion.Load(), out, nil)
+			err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, sp.schemaVersion.Load(), out, nil, sp.skips)
 			// Statement boundary — see the file parser's RowsEvent case: the
 			// STMT_END_F clear prevents a ROWS_QUERY-less later statement in
 			// the same transaction from inheriting this statement's text.

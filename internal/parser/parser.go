@@ -222,7 +222,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.RowsEvent:
-			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, p.schemaVersion.Load(), events, &gaps)
+			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, p.schemaVersion.Load(), events, &gaps, nil)
 			// The LAST rows event of a statement carries STMT_END_F — the
 			// actual statement boundary. Clearing here keeps one statement's
 			// text alive across its chained/split rows events, while a later
@@ -384,6 +384,13 @@ func isSnapshotExcludedSchema(schema string) bool {
 // the event is at-or-after the snapshot time (a stale snapshot), the skip is
 // recorded so ParseFile can fail the whole file rather than complete it with an
 // undetected gap (#778). The stream path passes nil.
+//
+// skips is the inverse split (#1034): non-nil only on the STREAM path, whose
+// warn-and-continue skips would otherwise be invisible to `status` — every
+// warn-and-skip return below records a per-reason counter, and every event
+// that clears the guards records a capture (breaking the consecutive-skip run
+// that escalates to one ERROR). The file path passes nil: its stale-snapshot
+// skips already fail the whole file via gapTracker.
 func handleRows(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -398,6 +405,7 @@ func handleRows(
 	schemaVersion uint32,
 	out chan<- Event,
 	gapTracker *schemaGapTracker,
+	skips *SkipCounters,
 ) error {
 	schema := string(rowsEv.Table.Schema)
 	table := string(rowsEv.Table.Table)
@@ -410,6 +418,7 @@ func handleRows(
 		logger.Warn("no resolver available — skipping event",
 			"file", filename, "pos", binlogEv.Header.LogPos,
 			"schema", schema, "table", table)
+		skips.RecordSkip(SkipNoResolver)
 		return nil
 	}
 
@@ -431,6 +440,12 @@ func handleRows(
 				logger.Error("schema gap: skipping rows for a table absent from the snapshot at-or-after snapshot time — the snapshot is stale; this file will be marked failed (run `bintrail snapshot`, then re-index)",
 					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)
 			}
+		}
+		// Stream path (#1034): count the discard so `status` can show it —
+		// except for snapshot-excluded system schemas (e.g. mysql.rds_heartbeat2),
+		// a routine permanent skip that must never mark capture degraded.
+		if !isSnapshotExcludedSchema(schema) {
+			skips.RecordSkip(SkipTableNotInSnapshot)
 		}
 		return nil
 	}
@@ -457,6 +472,7 @@ func handleRows(
 					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)
 			}
 		}
+		skips.RecordSkip(SkipColumnCountMismatch)
 		return nil
 	}
 
@@ -573,18 +589,21 @@ func handleRows(
 		replication.WRITE_ROWS_EVENTv1,
 		replication.WRITE_ROWS_EVENTv2,
 		replication.MARIADB_WRITE_ROWS_COMPRESSED_EVENT_V1:
+		skips.RecordCaptured()
 		return emitInserts(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, commitTsUS, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	case replication.DELETE_ROWS_EVENTv0,
 		replication.DELETE_ROWS_EVENTv1,
 		replication.DELETE_ROWS_EVENTv2,
 		replication.MARIADB_DELETE_ROWS_COMPRESSED_EVENT_V1:
+		skips.RecordCaptured()
 		return emitDeletes(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, commitTsUS, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	case replication.UPDATE_ROWS_EVENTv0,
 		replication.UPDATE_ROWS_EVENTv1,
 		replication.UPDATE_ROWS_EVENTv2,
 		replication.MARIADB_UPDATE_ROWS_COMPRESSED_EVENT_V1:
+		skips.RecordCaptured()
 		return emitUpdates(ctx, logger, resolver, rowsEv.Rows, schema, table, filename, currentGTID, connectionID, commitTsUS, queryText, startPos, endPos, ts, pkCols, schemaVersion, stmtEnd, out)
 
 	default:
@@ -601,6 +620,7 @@ func handleRows(
 			"table", table,
 			"event_type", binlogEv.Header.EventType,
 			"rows_skipped", len(rowsEv.Rows))
+		skips.RecordSkip(SkipUnhandledRowEvent)
 	}
 
 	return nil

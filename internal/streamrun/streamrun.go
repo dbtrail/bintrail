@@ -55,6 +55,15 @@ type streamState struct {
 	serverID      uint32
 	bintrailID    string // resolved server identity (empty = unknown, stored as NULL)
 
+	// skips is the shared capture-skip tally (#1034): the StreamParser records
+	// every event it read and dropped (column-count mismatch, statement-format
+	// DML, ...) and saveCheckpoint persists the counters to
+	// stream_state.capture_skips alongside the position, so `status` can render
+	// the Capture health verdict. nil (external/test callers, --reset's fresh
+	// state, the gap auto-advance stamp) persists NULL, which the upsert's
+	// COALESCE turns into "preserve whatever is already there".
+	skips *parser.SkipCounters
+
 	// accGTID is the in-memory accumulated GTID set (GTID mode only).
 	// It is serialized to gtidSet on checkpoint. Typed as the gomysql.GTIDSet
 	// interface so it can hold either a *MysqlGTIDSet or, for a MariaDB source,
@@ -149,11 +158,26 @@ func checkpointInsertArgs(state *streamState) ([]any, error) {
 }
 
 // saveCheckpoint persists the current stream state to the stream_state table.
+//
+// capture_skips (#1034) rides every checkpoint — it is the only writer of that
+// column. A nil state.skips serializes to NULL and the update arm's COALESCE
+// preserves the existing value, so the checkpoint-shaped writers that build a
+// bare streamState (--reset's fresh state, the gap auto-advance stamp, tests)
+// never wipe the monotonic counters a daemon persisted.
 func saveCheckpoint(db *sql.DB, state *streamState) error {
 	args, err := checkpointInsertArgs(state)
 	if err != nil {
 		return err
 	}
+	var captureSkips any
+	if state.skips != nil {
+		snap, err := state.skips.Snapshot()
+		if err != nil {
+			return fmt.Errorf("serialize capture-skip counters: %w", err)
+		}
+		captureSkips = snap
+	}
+	args = append(args, captureSkips)
 	// mode is in the UPDATE arm for the cross-mode --reset path (#1079): the
 	// reset no longer DELETEs the row, so the mode switch must land through
 	// this upsert. For every other caller mode is invariant across the run.
@@ -165,8 +189,9 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO stream_state
 		    (id, mode, binlog_file, binlog_position, gtid_set, flavor,
-		     events_indexed, last_event_time, last_checkpoint, server_id, bintrail_id)
-		VALUES (1, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?, ?)
+		     events_indexed, last_event_time, last_checkpoint, server_id, bintrail_id,
+		     capture_skips)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
 		    mode            = VALUES(mode),
 		    binlog_file     = VALUES(binlog_file),
@@ -177,9 +202,26 @@ func saveCheckpoint(db *sql.DB, state *streamState) error {
 		    last_event_time = VALUES(last_event_time),
 		    last_checkpoint = UTC_TIMESTAMP(),
 		    server_id       = VALUES(server_id),
-		    bintrail_id     = VALUES(bintrail_id)`,
+		    bintrail_id     = VALUES(bintrail_id),
+		    capture_skips   = COALESCE(VALUES(capture_skips), capture_skips)`,
 		args...)
 	return err
+}
+
+// loadCaptureSkips reads the persisted capture-skip counters (#1034) so a
+// restarting daemon resumes the monotonic tallies instead of zeroing the
+// DEGRADED verdict. Runs after EnsureSchema (One's step order), so the column
+// exists; an empty table returns "" (nothing persisted yet).
+func loadCaptureSkips(db *sql.DB) (string, error) {
+	var raw sql.NullString
+	err := db.QueryRow(`SELECT capture_skips FROM stream_state WHERE id = 1`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return raw.String, nil
 }
 
 // deleteEventsSinceCheckpoint removes rows at or beyond (file, pos) from
@@ -2118,6 +2160,20 @@ func One(ctx context.Context, cfg Config) error {
 		state.gtidSet = startGTIDStr
 	}
 
+	// Capture-skip counters (#1034): shared between the StreamParser (which
+	// records each discarded event) and saveCheckpoint (which persists them).
+	// Re-seeded from the previous run's persisted document so a restart never
+	// silently zeroes the DEGRADED verdict `status` renders from them. A
+	// failed load/parse degrades to fresh counters with a warning — never a
+	// startup abort — since the tallies are observability, not correctness.
+	skips := parser.NewSkipCounters(nil)
+	if raw, err := loadCaptureSkips(indexDB); err != nil {
+		slog.Warn("could not load persisted capture-skip counters; starting from zero", "error", err)
+	} else if err := skips.Seed(raw); err != nil {
+		slog.Warn("could not parse persisted capture-skip counters; starting from zero", "error", err)
+	}
+	state.skips = skips
+
 	// ── 7. Parse source DSN for BinlogSyncer ─────────────────────────────
 	host, port, user, password, err := cfg.Deps.ParseSourceDSN(cfg.SourceDSN)
 	if err != nil {
@@ -2252,6 +2308,9 @@ func One(ctx context.Context, cfg Config) error {
 
 	// ── 10. StreamParser + its synchronous DDL hook ──────────────────────────
 	sp := parser.NewStreamParser(resolver, filters, nil)
+	// Wire the shared capture-skip tally (#1034) before Run's goroutine spawns
+	// (the SetFlavor happens-before contract).
+	sp.SetSkipCounters(state.skips)
 	// cfg.Flavor is normalized (empty→"mysql") by this point (step 1 above) —
 	// wires the source flavor into the live position-wraparound guard inside
 	// Run (internal/parser/stream.go) so its GTID-mode remediation names the

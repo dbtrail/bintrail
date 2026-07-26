@@ -1676,6 +1676,12 @@ async function renderStatus() {
   // permanent-loss alarm, or the affirmative all-clear, is the first thing read.
   const continuity = continuityBox(stream, pg);
   if (continuity) v.append(continuity);
+  // Capture-health surface (#1034): the continuity box's sibling for in-stream
+  // discards — events the daemon read and chose to drop. Only the degraded
+  // state renders (below the continuity box, above the cards); "ok" adds no
+  // second green box.
+  const captureHealth = captureHealthBox(stream);
+  if (captureHealth) v.append(captureHealth);
   v.append(cards);
   viewEnter();
 }
@@ -1721,6 +1727,26 @@ function continuityBox(stream, pg) {
     return ok;
   }
   return null;
+}
+
+// captureHealthBox renders the capture-health surface (#1034), or null when
+// there is nothing to warn about. It keys on stream.capture_health.status ===
+// "degraded" (newer backends only): the daemon READ these events off the
+// stream and chose to DROP them — e.g. the column-count guard rejecting every
+// row against a stale schema snapshot — so the stream can look "active" (fresh
+// checkpoint, green continuity) while indexing nothing. "ok", "unknown"
+// (missing field) and no stream all render nothing; the continuity box remains
+// the affirmative/loss surface. Pure and fixture-drivable like continuityBox.
+function captureHealthBox(stream) {
+  if (!stream || !stream.capture_health || stream.capture_health.status !== "degraded") return null;
+  const h = stream.capture_health;
+  const box = el("div", { class: "warn-box" });
+  box.append(el("b", { text: "⚠ Capture degraded — events are being skipped" }));
+  const reasons = Object.keys(h.skipped || {}).sort().join(", ");
+  box.append(el("div", { text: h.total_skipped + " event(s) were read from the stream but not indexed" +
+    (reasons ? " (" + reasons + ")" : "") + (h.last_skip_at ? "; last " + h.last_skip_at : "") + "." }));
+  box.append(el("div", { text: "Changes in those events are missing from the index. Most often the schema snapshot is stale — take a fresh snapshot on the source, then check the capture log." }));
+  return box;
 }
 
 // PG_HEALTH_STALE_SEC: a source_health snapshot older than this reads as STALE. The

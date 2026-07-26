@@ -675,6 +675,19 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
+	// capture_skips counts events the streaming daemon READ and chose to DROP
+	// (#1034): per-reason monotonic counters ({"<reason>":{"count":N,
+	// "last_at":"RFC3339"}}), persisted with every checkpoint so the DEGRADED
+	// verdict survives daemon restarts and `status` can render Capture health.
+	// "{}" is the affirmative evaluated-and-clean marker; NULL (legacy index,
+	// or one no skip-aware daemon has written) means the verdict is unknown
+	// and status omits the line rather than asserting OK from absent data —
+	// the same never-a-false-ok philosophy as the gap_lost_* columns above.
+	if err := ensureColumn(db, "stream_state", "capture_skips",
+		`ALTER TABLE stream_state ADD COLUMN capture_skips JSON DEFAULT NULL COMMENT 'per-reason monotonic counters of events the daemon read and chose to drop (#1034): {"<reason>":{"count":N,"last_at":"RFC3339"}}; {} = evaluated and clean; NULL = no skip-aware daemon has written yet' AFTER source_health`,
+	); err != nil {
+		return err
+	}
 	// flavor records the source database flavor (mysql/mariadb) so a resume
 	// parses the saved gtid_set with the correct GTID parser. NOT NULL DEFAULT
 	// 'mysql' means existing rows read back as mysql with no data migration,

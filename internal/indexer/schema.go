@@ -187,6 +187,7 @@ const ddlStreamState = `CREATE TABLE IF NOT EXISTS stream_state (
     gap_lost_at      DATETIME        DEFAULT NULL COMMENT 'when an unfillable binlog gap forced an auto-advance (events permanently lost); cleared only by an explicit monitor Stop; --reset re-stamps or preserves it',
     gap_lost_detail  TEXT            DEFAULT NULL COMMENT 'human-readable description of the lost gap',
     source_health    JSON            DEFAULT NULL COMMENT 'latest source-side health snapshot (PostgreSQL: replication-slot wal_status/lag + REPLICA IDENTITY coverage) with an embedded checked_at; serialized payload, source-agnostic column',
+    capture_skips    JSON            DEFAULT NULL COMMENT 'per-reason monotonic counters of events the daemon read and chose to drop (#1034): {"<reason>":{"count":N,"last_at":"RFC3339"}}; {} = evaluated and clean; NULL = no skip-aware daemon has written yet',
     CONSTRAINT single_row CHECK (id = 1)
 ) ENGINE=InnoDB`
 

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -104,6 +105,41 @@ type StreamStateInfo struct {
 	// the console renders it and computes staleness from checked_at. Invalid on a legacy
 	// index without the column or an index no daemon has polled.
 	SourceHealth sql.NullString
+	// CaptureSkips is the raw capture_skips JSON (#1034): per-reason monotonic
+	// counters of events the streaming daemon READ and chose to DROP (e.g. the
+	// column-count guard rejecting rows against a stale snapshot), shaped
+	// {"<reason>":{"count":N,"last_at":"RFC3339"}}. "{}" is the affirmative
+	// evaluated-and-clean marker written by a skip-aware daemon. Invalid on a
+	// legacy index without the column or one no such daemon has written — the
+	// Capture health verdict is then unknown and the line is omitted rather
+	// than asserting OK from absent data (the GapColumnsPresent philosophy).
+	CaptureSkips sql.NullString
+}
+
+// CaptureSkipStat is one reason's tally decoded from CaptureSkips. The JSON
+// field names mirror the persistence format written by the capture daemon
+// (parser.SkipStat) — kept as an independent decl so this display package does
+// not import the binlog parser.
+type CaptureSkipStat struct {
+	Count  int64     `json:"count"`
+	LastAt time.Time `json:"last_at"`
+}
+
+// ParseCaptureSkips decodes the persisted capture_skips document. ok is false
+// when the verdict is not evaluable (no column / no skip-aware daemon /
+// unparseable payload) — callers must then omit the Capture health verdict
+// entirely, never render OK. An empty map with ok=true is the affirmative
+// "evaluated, nothing skipped".
+func (s *StreamStateInfo) ParseCaptureSkips() (skips map[string]CaptureSkipStat, ok bool) {
+	if !s.CaptureSkips.Valid || strings.TrimSpace(s.CaptureSkips.String) == "" {
+		return nil, false
+	}
+	m := map[string]CaptureSkipStat{}
+	if err := json.Unmarshal([]byte(s.CaptureSkips.String), &m); err != nil {
+		slog.Warn("could not parse capture_skips; capture health shown as unknown", "error", err)
+		return nil, false
+	}
+	return m, true
 }
 
 // CoverageInfo summarizes the restore coverage of the index.
@@ -340,6 +376,12 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 	if err := loadSourceHealth(ctx, db, s); err != nil {
 		slog.Warn("could not load source_health; keeping stream state without it", "error", err)
 	}
+	// capture_skips (#1034) follows the same separate best-effort pattern (and
+	// the same rationale) as source_health above: newer than both, so folding
+	// it into either SELECT would drag older indexes down a fallback tier.
+	if err := loadCaptureSkips(ctx, db, s); err != nil {
+		slog.Warn("could not load capture_skips; keeping stream state without it", "error", err)
+	}
 	return s, nil
 }
 
@@ -378,6 +420,18 @@ func loadStreamStateCore(ctx context.Context, db *sql.DB) (*StreamStateInfo, err
 // error is returned, so a genuine fault is not silently hidden behind a blank panel.
 func loadSourceHealth(ctx context.Context, db *sql.DB, s *StreamStateInfo) error {
 	err := db.QueryRowContext(ctx, `SELECT source_health FROM stream_state WHERE id = 1`).Scan(&s.SourceHealth)
+	if isUnknownColumnErr(err) || errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return err
+}
+
+// loadCaptureSkips augments an already-loaded StreamStateInfo with the
+// capture_skips column (#1034) — same tolerance contract as loadSourceHealth:
+// only the unknown-column error (legacy index) and an empty row leave
+// CaptureSkips invalid (verdict unknown); any other error is returned.
+func loadCaptureSkips(ctx context.Context, db *sql.DB, s *StreamStateInfo) error {
+	err := db.QueryRowContext(ctx, `SELECT capture_skips FROM stream_state WHERE id = 1`).Scan(&s.CaptureSkips)
 	if isUnknownColumnErr(err) || errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -608,6 +662,24 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		default:
 			fmt.Fprintln(w, "  Continuity:      no gaps in the captured range (not a liveness check)")
 		}
+		// Capture health (#1034) — the continuity verdict's sibling for
+		// IN-STREAM discards: events the daemon read and chose to drop (e.g.
+		// the column-count guard rejecting every row against a stale snapshot)
+		// while the checkpoint stayed fresh and continuity honestly said "no
+		// gaps". Omitted (not asserted OK) when no skip-aware daemon has
+		// written the counters — same never-a-false-ok stance as Continuity's
+		// "not evaluated".
+		if skips, ok := stream.ParseCaptureSkips(); ok {
+			if total := totalCaptureSkips(skips); total > 0 {
+				fmt.Fprintf(w, "  Capture health:  ⚠ DEGRADED — %s events skipped (%s), last %s\n",
+					commaGroup(total), captureSkipReasons(skips), lastCaptureSkip(skips).Format(TSFmt))
+				fmt.Fprintln(w, "  Skipped events were read from the stream but NOT indexed — a restore window")
+				fmt.Fprintln(w, "  over them is incomplete. Most often the schema snapshot is stale or corrupt:")
+				fmt.Fprintln(w, "  run `bintrail snapshot` against the source, then check the daemon log.")
+			} else {
+				fmt.Fprintln(w, "  Capture health:  OK — no events skipped")
+			}
+		}
 		fmt.Fprintln(w)
 
 		// Loud, unmissable banner when the stream permanently lost data (an unfillable
@@ -802,6 +874,68 @@ func formatBytes(b int64) string {
 	}
 }
 
+// totalCaptureSkips sums the per-reason capture-skip counts.
+func totalCaptureSkips(skips map[string]CaptureSkipStat) int64 {
+	var n int64
+	for _, st := range skips {
+		n += st.Count
+	}
+	return n
+}
+
+// lastCaptureSkip returns the most recent per-reason last_at.
+func lastCaptureSkip(skips map[string]CaptureSkipStat) time.Time {
+	var last time.Time
+	for _, st := range skips {
+		if st.LastAt.After(last) {
+			last = st.LastAt
+		}
+	}
+	return last
+}
+
+// captureSkipReasons renders the non-zero reasons for the DEGRADED line: the
+// bare reason when there is one ("column_count_mismatch", the #1034 wording),
+// else "reason: count" pairs sorted by count descending (ties alphabetical).
+func captureSkipReasons(skips map[string]CaptureSkipStat) string {
+	var reasons []string
+	for r, st := range skips {
+		if st.Count > 0 {
+			reasons = append(reasons, r)
+		}
+	}
+	if len(reasons) == 1 {
+		return reasons[0]
+	}
+	sort.Slice(reasons, func(i, j int) bool {
+		if skips[reasons[i]].Count != skips[reasons[j]].Count {
+			return skips[reasons[i]].Count > skips[reasons[j]].Count
+		}
+		return reasons[i] < reasons[j]
+	})
+	parts := make([]string, len(reasons))
+	for i, r := range reasons {
+		parts[i] = fmt.Sprintf("%s: %s", r, commaGroup(skips[r].Count))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// commaGroup formats n with thousands separators ("41203" → "41,203").
+func commaGroup(n int64) string {
+	s := strconv.FormatInt(n, 10)
+	neg := strings.HasPrefix(s, "-")
+	if neg {
+		s = s[1:]
+	}
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	if neg {
+		s = "-" + s
+	}
+	return s
+}
+
 // Truncate shortens s to at most n bytes, appending "…" if truncated.
 func Truncate(s string, n int) string {
 	if len(s) <= n {
@@ -877,6 +1011,21 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 	type jsonContinuity struct {
 		Status string `json:"status"`
 	}
+	// jsonCaptureHealth is the machine-readable Capture health verdict (#1034)
+	// — the continuity verdict's sibling for in-stream discards. Present only
+	// when a skip-aware daemon has persisted the counters ("unknown" is an
+	// omitted key, never a false "ok"). status is "ok" or "degraded"; skipped
+	// carries the per-reason monotonic tallies.
+	type jsonSkipStat struct {
+		Count  int64  `json:"count"`
+		LastAt string `json:"last_at"`
+	}
+	type jsonCaptureHealth struct {
+		Status       string                  `json:"status"`
+		TotalSkipped int64                   `json:"total_skipped"`
+		LastSkipAt   string                  `json:"last_skip_at,omitempty"`
+		Skipped      map[string]jsonSkipStat `json:"skipped,omitempty"`
+	}
 	type jsonStream struct {
 		BintrailID     *string        `json:"bintrail_id"`
 		Mode           string         `json:"mode"`
@@ -892,7 +1041,8 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		// SourceHealth is the raw source_health JSON passed through verbatim (#599):
 		// the console knows its shape (slot wal_status/lag, replica_identity_not_full,
 		// checked_at), this layer does not. Omitted when no daemon has polled.
-		SourceHealth json.RawMessage `json:"source_health,omitempty"`
+		SourceHealth  json.RawMessage    `json:"source_health,omitempty"`
+		CaptureHealth *jsonCaptureHealth `json:"capture_health,omitempty"`
 	}
 	type jsonBaseline struct {
 		SnapshotTime string  `json:"snapshot_time"`
@@ -1006,6 +1156,21 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		}
 		if stream.SourceHealth.Valid && stream.SourceHealth.String != "" {
 			jstr.SourceHealth = json.RawMessage(stream.SourceHealth.String)
+		}
+		if skips, ok := stream.ParseCaptureSkips(); ok {
+			ch := &jsonCaptureHealth{Status: "ok"}
+			if total := totalCaptureSkips(skips); total > 0 {
+				ch.Status = "degraded"
+				ch.TotalSkipped = total
+				ch.LastSkipAt = lastCaptureSkip(skips).Format(TSFmt)
+				ch.Skipped = make(map[string]jsonSkipStat, len(skips))
+				for r, st := range skips {
+					if st.Count > 0 {
+						ch.Skipped[r] = jsonSkipStat{Count: st.Count, LastAt: st.LastAt.Format(TSFmt)}
+					}
+				}
+			}
+			jstr.CaptureHealth = ch
 		}
 		out.Stream = jstr
 	} else if streamErr != nil {

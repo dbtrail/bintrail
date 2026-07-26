@@ -330,6 +330,7 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		gap_lost_at      DATETIME        DEFAULT NULL,
 		gap_lost_detail  TEXT            DEFAULT NULL,
 		source_health    JSON            DEFAULT NULL,
+		capture_skips    JSON            DEFAULT NULL,
 		CONSTRAINT single_row CHECK (id = 1)
 	) ENGINE=InnoDB`)
 

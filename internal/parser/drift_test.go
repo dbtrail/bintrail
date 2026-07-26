@@ -67,7 +67,7 @@ func runHandleRowsWith(t *testing.T, resolver *metadata.Resolver, binlogEv *repl
 	t.Helper()
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 	out := make(chan Event, 4)
-	err := handleRows(context.Background(), newTestLogger(logBuf), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, out, nil)
+	err := handleRows(context.Background(), newTestLogger(logBuf), resolver, &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, out, nil, nil)
 	close(out)
 	var evs []Event
 	for ev := range out {
@@ -397,7 +397,7 @@ func TestHandleRows_schemaGapTrackerFileMode(t *testing.T) {
 			rowsEv := tc.ev.Event.(*replication.RowsEvent)
 			out := make(chan Event, 4)
 			err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), timedOrdersResolver(snapT),
-				&Filters{}, tc.ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, out, tracker)
+				&Filters{}, tc.ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, out, tracker, nil)
 			close(out)
 			// A skip is never a hard error at the handleRows layer — the
 			// file-level failure is decided by ParseFile from the tracker.

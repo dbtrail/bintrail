@@ -285,6 +285,7 @@ about gap-**contiguity** of the captured range; it is **not** a liveness/lag che
   Last checkpoint: 2026-02-19 10:01:12
   Server ID:       100
   Continuity:      no gaps in the captured range (not a liveness check)
+  Capture health:  OK — no events skipped
 ```
 
 The verdict is one of four states:
@@ -331,6 +332,50 @@ top-level `stream_error` object — a **sibling** of `stream`, never a fake
 `stream` — shaped `{"continuity": {"status": "unavailable"}, "error": "..."}`.
 The jq check above stays fail-closed in this state: `.stream.continuity.status`
 is `null` because `stream` is absent.
+
+### Capture health (in-stream discards)
+
+The continuity verdict answers "did the stream **lose** events it never
+received?". Its sibling, the **`Capture health`** line right below it, answers
+"did the stream **discard** events it *did* receive?" — events the daemon read
+off the binlog and chose to skip, most often because the schema snapshot went
+stale or corrupt and the column-count guard rejected every row. That failure
+used to be invisible: the checkpoint stayed fresh and continuity honestly said
+"no gaps" while 100% of rows were being dropped.
+
+The daemon counts every skip by reason (monotonic, persisted with each
+checkpoint, surviving restarts) and `status` renders the verdict:
+
+```
+  Continuity:      no gaps in the captured range (not a liveness check)
+  Capture health:  ⚠ DEGRADED — 41,203 events skipped (column_count_mismatch), last 2026-07-17 12:24:12
+  Skipped events were read from the stream but NOT indexed — a restore window
+  over them is incomplete. Most often the schema snapshot is stale or corrupt:
+  run `bintrail snapshot` against the source, then check the daemon log.
+```
+
+| Text | Meaning |
+|---|---|
+| `OK — no events skipped` | A skip-aware daemon has evaluated the stream and dropped nothing |
+| `⚠ DEGRADED — N events skipped (<reasons>), last <ts>` | N events were read and discarded; the reasons and the most recent skip time follow |
+| *(line absent)* | Unknown — a legacy index, or one no skip-aware daemon has written; `OK` is never asserted from absent data |
+
+Skip reasons include `column_count_mismatch` (stale/corrupt snapshot),
+`table_not_in_snapshot`, `no_resolver`, `unhandled_row_event`, and
+`statement_format_dml` (a STATEMENT/MIXED-format DML whose row image is not in
+the binlog — requires `binlog_format=ROW`). Routine skips of system schemas
+the snapshot deliberately excludes (e.g. RDS's `mysql.rds_heartbeat2`) are
+**not** counted.
+
+In the daemon log, each skip still emits its per-event `WARN`; after 100
+**consecutive** skipped events one `ERROR` with remediation is emitted (once
+per degraded episode — it re-arms when an event is captured again).
+
+Under `--format json` the verdict is `stream.capture_health`:
+`{"status": "ok"}` or `{"status": "degraded", "total_skipped": N,
+"last_skip_at": "...", "skipped": {"<reason>": {"count": N, "last_at": "..."}}}`;
+the key is omitted when the verdict is unknown. The [web console](console.md)
+Overview shows an orange "Capture degraded" box in the same states.
 
 ### Sections in detail
 
