@@ -359,6 +359,13 @@ func New(cfg Config) (*Server, error) {
 	}
 	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot
+	// Registry entries with no baseline of their own (every UI/API-added
+	// server — the add form has no baseline field) fall back to the process
+	// flags, so a daemon started with --baseline-dir/--baseline-s3 enables
+	// Time-travel/reconstruct/verify for them too, not just the boot entry
+	// (#1010).
+	s.cm.defaultBaselineDir = cfg.BaselineDir
+	s.cm.defaultBaselineS3 = cfg.BaselineS3
 
 	// Seed the ephemeral boot bundle when the caller supplied a command-line
 	// connection (or baseline config for it). Its derived state — noArchive

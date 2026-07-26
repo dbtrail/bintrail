@@ -227,6 +227,34 @@ func TestVerifyTrigger_requiresBaselineDestination(t *testing.T) {
 	}
 }
 
+// TestVerifyTrigger_processBaselineFallback (#1010): an entry with no
+// baseline of its own inherits the process-wide --baseline-dir — the trigger
+// accepts (matching the Verify capability the UI was shown) and the
+// VerifyRequest carries the fallback dir.
+func TestVerifyTrigger_processBaselineFallback(t *testing.T) {
+	reg, _ := LoadRegistry(t.TempDir() + "/console-servers.yaml")
+	ctrl := &stubVerifyCtrl{status: VerifyStatus{State: "idle"}}
+	srv, err := New(Config{
+		Listen: "127.0.0.1:8090", Token: "t", Registry: reg,
+		MonitorCtrl: &stubMonitorCtrl{}, VerifyCtrl: ctrl,
+		BaselineDir: "/var/bintrail/baselines",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := addVerifyEntry(t, srv, "u:p@tcp(127.0.0.1:3306)/", "", "")
+	rec, body := doServersReq(t, srv, "POST", "/api/servers/"+id+"/verify", "")
+	if rec.Code != 202 {
+		t.Fatalf("process baseline fallback: code=%d body=%s, want 202", rec.Code, body)
+	}
+	if len(ctrl.triggered) != 1 {
+		t.Fatalf("triggered %d runs, want 1", len(ctrl.triggered))
+	}
+	if got := ctrl.triggered[0].BaselineDir; got != "/var/bintrail/baselines" {
+		t.Errorf("VerifyRequest.BaselineDir=%q, want the process --baseline-dir", got)
+	}
+}
+
 // TestVerifyTrigger_requiresSourceForLiveSource: live-source mode needs a
 // source DSN — 400 without one, even with a baseline destination configured.
 func TestVerifyTrigger_requiresSourceForLiveSource(t *testing.T) {

@@ -71,6 +71,17 @@ type connManager struct {
 	// nor baseline reads apply RBAC redaction.
 	profileActive bool
 
+	// defaultBaselineDir / defaultBaselineS3 are the process-wide
+	// --baseline-dir / --baseline-s3 flags, used as the baseline source for
+	// registry entries that carry none of their own (#1010). Without this
+	// fallback, a server added from the UI (whose add form has no baseline
+	// field) could never enable Time-travel/reconstruct/verify even though the
+	// daemon was started with a usable --baseline-dir — the common
+	// single-baseline-dir deployment. Written once before serving
+	// (console.New), like profileActive; read-only afterwards.
+	defaultBaselineDir string
+	defaultBaselineS3  string
+
 	// hideBoot removes the boot entry from the UI entirely. Set by
 	// source-less `bintrail-console watch`: its boot index is only the
 	// control plane's anchor database — no stream ever writes to it — so a
@@ -187,7 +198,7 @@ func (cm *connManager) Resolve(ctx context.Context, id string) (*bundle, error) 
 			// Derive the published gates from the CURRENT entry: a
 			// baseline/no-archive-only edit during the open keeps this db but
 			// must not publish the stale entry's reconstruct gate.
-			nb := newBundleDerived(b.db, b.dbName, cur, cm.profileActive)
+			nb := newBundleDerived(b.db, b.dbName, cm.withBaselineDefaults(cur), cm.profileActive)
 			nb.resolver = b.resolver
 			nb.resolverUnavailable = b.resolverUnavailable
 			cm.bundles[id] = nb
@@ -223,9 +234,24 @@ func (cm *connManager) buildBundle(entry ServerEntry) (*bundle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("server %q: %s", entry.Name, scrubDSNError(err, entry.DSN))
 	}
-	b := newBundleDerived(db, cfg.DBName, entry, cm.profileActive)
+	b := newBundleDerived(db, cfg.DBName, cm.withBaselineDefaults(entry), cm.profileActive)
 	b.resolver, b.resolverUnavailable = loadResolver(db)
 	return b, nil
+}
+
+// withBaselineDefaults returns the entry with the process-wide
+// --baseline-dir / --baseline-s3 filled in when it carries no baseline source
+// of its own (#1010). The fallback is all-or-nothing: an entry with its OWN
+// dir or S3 configured chose its baseline location explicitly, and mixing a
+// per-entry S3 with the process dir (or vice versa) would make findBaseline's
+// dir-over-S3 preference and #766 S3 retry read from a location the operator
+// never associated with that server.
+func (cm *connManager) withBaselineDefaults(entry ServerEntry) ServerEntry {
+	if entry.BaselineDir == "" && entry.BaselineS3 == "" {
+		entry.BaselineDir = cm.defaultBaselineDir
+		entry.BaselineS3 = cm.defaultBaselineS3
+	}
+	return entry
 }
 
 // newBundleDerived computes the pure-config per-server state shared by lazy
@@ -337,7 +363,7 @@ func (cm *connManager) rebuildDerived(entry ServerEntry) {
 	if !ok {
 		return
 	}
-	nb := newBundleDerived(old.db, old.dbName, entry, cm.profileActive)
+	nb := newBundleDerived(old.db, old.dbName, cm.withBaselineDefaults(entry), cm.profileActive)
 	nb.engine = old.engine
 	nb.resolver = old.resolver
 	nb.resolverUnavailable = old.resolverUnavailable
@@ -355,6 +381,7 @@ func (cm *connManager) cached(id string) bool {
 // capability reports the reconstruct gate for a registry entry as pure config —
 // no connection is opened, so /api/servers can label every entry instantly.
 func (cm *connManager) capability(entry ServerEntry) bool {
+	entry = cm.withBaselineDefaults(entry)
 	src := entry.BaselineDir
 	if src == "" {
 		src = entry.BaselineS3

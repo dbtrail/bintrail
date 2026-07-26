@@ -586,6 +586,57 @@ func TestIntegrationEvictOnDSNEdit(t *testing.T) {
 	}
 }
 
+// TestIntegrationRegistryServerInheritsProcessBaseline (#1010): a server
+// added through POST /api/servers (no baseline field) under a daemon started
+// with --baseline-dir must come up Time-travel-enabled through the REAL
+// lazy-open path: /api/capabilities on the new server reports
+// reconstruct:true. The same add under a daemon without a process baseline
+// stays gated off.
+func TestIntegrationRegistryServerInheritsProcessBaseline(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	dbName2 := seedSecondIndex(t)
+
+	for _, procBaseline := range []bool{true, false} {
+		cfg := Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken}
+		if procBaseline {
+			cfg.BaselineDir = t.TempDir()
+		}
+		srv, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(srv.cm.CloseAll)
+
+		rec, body := doReq(t, srv, "POST", "/api/servers",
+			`{"name":"second","dsn":"`+testutil.IntegrationDSN(dbName2)+`"}`)
+		if rec.Code/100 != 2 {
+			t.Fatalf("procBaseline=%v: create code=%d body=%s", procBaseline, rec.Code, body)
+		}
+		var created serverDTO
+		if err := json.Unmarshal(body, &created); err != nil {
+			t.Fatal(err)
+		}
+		if created.Reconstruct != procBaseline {
+			t.Errorf("procBaseline=%v: created DTO reconstruct=%v, want %v",
+				procBaseline, created.Reconstruct, procBaseline)
+		}
+
+		rec, body = doReqOn(t, srv, created.ID, "GET", "/api/capabilities", "")
+		if rec.Code != 200 {
+			t.Fatalf("procBaseline=%v: capabilities code=%d body=%s", procBaseline, rec.Code, body)
+		}
+		var caps capabilitiesResponse
+		if err := json.Unmarshal(body, &caps); err != nil {
+			t.Fatal(err)
+		}
+		if caps.Reconstruct != procBaseline {
+			t.Errorf("procBaseline=%v: lazy-opened registry server reconstruct=%v, want %v",
+				procBaseline, caps.Reconstruct, procBaseline)
+		}
+	}
+}
+
 // TestIntegrationRegistryOnlyConsole: no --index-dsn at all — the first saved
 // server is the default and serves every surface.
 func TestIntegrationRegistryOnlyConsole(t *testing.T) {

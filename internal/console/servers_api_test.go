@@ -891,24 +891,129 @@ func TestBuildDSNRejectsRawDSNPlusPassword(t *testing.T) {
 }
 
 // TestCapabilityMatrix: the pure-config reconstruct gate over
-// baseline × no_archive × profile.
+// baseline × no_archive × profile × process-wide baseline fallback (#1010).
 func TestCapabilityMatrix(t *testing.T) {
 	cases := []struct {
-		name    string
-		entry   ServerEntry
-		profile bool
-		want    bool
+		name       string
+		entry      ServerEntry
+		profile    bool
+		defaultDir string
+		want       bool
 	}{
-		{"baseline dir", ServerEntry{BaselineDir: "/b"}, false, true},
-		{"baseline s3", ServerEntry{BaselineS3: "s3://b/"}, false, true},
-		{"no baseline", ServerEntry{}, false, false},
-		{"no_archive kills it", ServerEntry{BaselineDir: "/b", NoArchive: true}, false, false},
-		{"profile kills it", ServerEntry{BaselineDir: "/b"}, true, false},
+		{"baseline dir", ServerEntry{BaselineDir: "/b"}, false, "", true},
+		{"baseline s3", ServerEntry{BaselineS3: "s3://b/"}, false, "", true},
+		{"no baseline", ServerEntry{}, false, "", false},
+		{"no_archive kills it", ServerEntry{BaselineDir: "/b", NoArchive: true}, false, "", false},
+		{"profile kills it", ServerEntry{BaselineDir: "/b"}, true, "", false},
+		// #1010: an entry with no baseline of its own inherits the process-wide
+		// --baseline-dir; no_archive and an active profile still gate it off.
+		{"process fallback", ServerEntry{}, false, "/proc/b", true},
+		{"fallback + no_archive", ServerEntry{NoArchive: true}, false, "/proc/b", false},
+		{"fallback + profile", ServerEntry{}, true, "/proc/b", false},
 	}
 	for _, tc := range cases {
 		cm := newConnManager(nil, tc.profile)
+		cm.defaultBaselineDir = tc.defaultDir
 		if got := cm.capability(tc.entry); got != tc.want {
 			t.Errorf("%s: capability = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestRegistryBaselineFallbackAPI (#1010): a server added through the real
+// POST /api/servers path — which has no baseline field — must inherit the
+// process-wide --baseline-dir: its DTO reports reconstruct:true, and the
+// derived bundle (rebuildDerived shares newBundleDerived with the lazy open)
+// turns on both Reconstruct and Verify in /api/capabilities. Without a
+// process baseline dir, both stay off. The DTO's baseline_dir must stay the
+// entry's OWN (empty) value — echoing the default into the edit form would
+// persist it as per-server config on the next save.
+func TestRegistryBaselineFallbackAPI(t *testing.T) {
+	for _, procBaseline := range []bool{true, false} {
+		reg, err := LoadRegistry(t.TempDir() + "/console-servers.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := Config{
+			Listen: "127.0.0.1:8090", Token: "t", Registry: reg,
+			MonitorCtrl: &stubMonitorCtrl{}, VerifyCtrl: &stubVerifyCtrl{},
+		}
+		if procBaseline {
+			cfg.BaselineDir = "/var/bintrail/baselines"
+		}
+		srv, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rec, body := doServersReq(t, srv, "POST", "/api/servers",
+			`{"name":"orders","dsn":"u:p@tcp(10.0.0.5:3306)/idx"}`)
+		if rec.Code/100 != 2 {
+			t.Fatalf("procBaseline=%v: create code=%d body=%s", procBaseline, rec.Code, body)
+		}
+		var created serverDTO
+		if err := json.Unmarshal(body, &created); err != nil {
+			t.Fatal(err)
+		}
+		if created.Reconstruct != procBaseline {
+			t.Errorf("procBaseline=%v: created DTO reconstruct=%v, want %v",
+				procBaseline, created.Reconstruct, procBaseline)
+		}
+		if created.BaselineDir != "" || created.BaselineS3 != "" {
+			t.Errorf("procBaseline=%v: DTO must report the entry's OWN baseline (empty), got dir=%q s3=%q",
+				procBaseline, created.BaselineDir, created.BaselineS3)
+		}
+
+		// Publish the entry's derived bundle the way the manager does (the
+		// unit suite can't dial the fake DSN a lazy open would need).
+		entry, ok := srv.cm.reg.Get(created.ID)
+		if !ok {
+			t.Fatal("created entry missing from registry")
+		}
+		srv.cm.bundles[created.ID] = &bundle{}
+		srv.cm.rebuildDerived(entry)
+
+		rec, body = doServersReqHeader(t, srv, "GET", "/api/capabilities", "", created.ID)
+		if rec.Code != 200 {
+			t.Fatalf("procBaseline=%v: capabilities code=%d body=%s", procBaseline, rec.Code, body)
+		}
+		var caps capabilitiesResponse
+		if err := json.Unmarshal(body, &caps); err != nil {
+			t.Fatal(err)
+		}
+		if caps.Reconstruct != procBaseline {
+			t.Errorf("procBaseline=%v: capabilities reconstruct=%v, want %v",
+				procBaseline, caps.Reconstruct, procBaseline)
+		}
+		if caps.Verify != procBaseline {
+			t.Errorf("procBaseline=%v: capabilities verify=%v, want %v",
+				procBaseline, caps.Verify, procBaseline)
+		}
+		if b := srv.cm.bundles[created.ID]; procBaseline && b.baselineSrc != "/var/bintrail/baselines" {
+			t.Errorf("bundle baselineSrc=%q, want the process --baseline-dir", b.baselineSrc)
+		}
+	}
+}
+
+// TestWithBaselineDefaultsAllOrNothing (#1010): the process fallback applies
+// only when the entry carries NO baseline of its own — an entry with its own
+// dir or S3 chose its location explicitly, and mixing in the process default
+// would make findBaseline read a location never associated with that server.
+func TestWithBaselineDefaultsAllOrNothing(t *testing.T) {
+	cm := newConnManager(nil, false)
+	cm.defaultBaselineDir = "/proc/b"
+	cm.defaultBaselineS3 = "s3://proc/"
+
+	got := cm.withBaselineDefaults(ServerEntry{})
+	if got.BaselineDir != "/proc/b" || got.BaselineS3 != "s3://proc/" {
+		t.Errorf("empty entry must inherit both defaults, got dir=%q s3=%q", got.BaselineDir, got.BaselineS3)
+	}
+	got = cm.withBaselineDefaults(ServerEntry{BaselineS3: "s3://own/"})
+	if got.BaselineDir != "" || got.BaselineS3 != "s3://own/" {
+		t.Errorf("own S3 must suppress BOTH defaults, got dir=%q s3=%q", got.BaselineDir, got.BaselineS3)
+	}
+	got = cm.withBaselineDefaults(ServerEntry{BaselineDir: "/own"})
+	if got.BaselineDir != "/own" || got.BaselineS3 != "" {
+		t.Errorf("own dir must suppress BOTH defaults, got dir=%q s3=%q", got.BaselineDir, got.BaselineS3)
 	}
 }

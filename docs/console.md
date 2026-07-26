@@ -166,7 +166,10 @@ How it behaves:
   server" — so two browser tabs can watch two different servers.
 - **Per-server Time-travel.** The reconstruct gate (baseline configured, no
   RBAC profile, archives enabled) is evaluated per server; the Time-travel view
-  appears and disappears as you switch.
+  appears and disappears as you switch. A server whose registry entry has no
+  baseline of its own inherits the process-wide `--baseline-dir`/`--baseline-s3`
+  (when set), so servers added from the UI get Time-travel and verify under a
+  single-baseline-dir deployment without extra configuration.
 - **Test connection.** Each server (saved or being typed) has a write-free
   probe: ping, MySQL version, latency, whether the database looks like a
   dbtrail index, and whether its schema is current.
