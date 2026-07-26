@@ -237,7 +237,11 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	// that old gate: a FULL row image carries every column, so what matters is
 	// whether a deferred value an event CARRIED is still unmappable — not
 	// whether the column was listed as changed.
-	deferredRepr := deferredReprUnresolved(orderedCols, changes, binariesTyped)
+	deferredCol, deferredRepr := deferredReprUnresolved(orderedCols, changes, binariesTyped)
+	var deferredDetail string
+	if deferredRepr {
+		deferredDetail = deferredReprDetail(deferredCol)
+	}
 
 	// Recovery side: reconstruct the previous baseline forward to the anchor.
 	// renderCellNormalized (not plain renderCell): both operands here come
@@ -260,7 +264,7 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	res.ReconstructDigest = reconDigest
 	res.ReconstructRows = reconCount
 
-	res.Status, res.Detail = classify(newDigest, newCount, reconDigest, reconCount, deferredRepr)
+	res.Status, res.Detail = classify(newDigest, newCount, reconDigest, reconCount, deferredDetail)
 	return res, nil
 }
 

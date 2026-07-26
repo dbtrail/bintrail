@@ -68,6 +68,25 @@ func renderCell(v any, col metadata.ColumnMeta) []byte {
 			return b
 		}
 	}
+	// A fixed BINARY(n) value from a binlog event image arrives STRIPPED of
+	// its trailing 0x00 padding: MySQL's ROW image length-prefixes
+	// MYSQL_TYPE_STRING with the ACTUAL stored length (go-mysql decodeString
+	// reads exactly that), while the baseline Parquet (mydumper) and the live
+	// source's protocol both carry the full padded n bytes. Right-pad to the
+	// declared width so a value that merely ends in 0x00 doesn't render
+	// shorter than the identical source value — every such row was a
+	// conclusive false MISMATCH (#1135). Baseline-origin values are already
+	// full width, so padding is a no-op there; on the live-scan side
+	// (normalizeRenderedBytes) the source value is always exactly n bytes, so
+	// the transform is identity by construction and needs no hook.
+	if strings.EqualFold(strings.TrimSpace(col.DataType), "binary") {
+		switch x := v.(type) {
+		case []byte:
+			return padFixedBinary(x, col)
+		case string:
+			return padFixedBinary([]byte(x), col)
+		}
+	}
 	switch x := v.(type) {
 	case json.Number:
 		// Binlog event integers/decimals are JSON-decoded as json.Number, whose
@@ -178,6 +197,32 @@ func renderBitBytes(v any, col metadata.ColumnMeta) ([]byte, bool) {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], u)
 	return buf[8-width:], true
+}
+
+// padFixedBinary right-pads b with 0x00 up to the declared width of a fixed
+// BINARY(n) column. When the width is unavailable (pre-#212 snapshot with an
+// empty ColumnType) b returns untouched — deferredValueUnresolved reports such
+// a value unresolved, so the comparison degrades to an honest Inconclusive
+// instead of a false MISMATCH. A value at or beyond the declared width is
+// NEVER truncated: it returns at its natural length, so a genuinely divergent
+// longer value still differs.
+func padFixedBinary(b []byte, col metadata.ColumnMeta) []byte {
+	width := fixedBinaryWidth(col.ColumnType)
+	if width == 0 || len(b) >= width {
+		return b
+	}
+	out := make([]byte, width) // zero-filled; copy leaves the 0x00 tail
+	copy(out, b)
+	return out
+}
+
+// fixedBinaryWidth returns the declared byte width of a "binary(N)"
+// column-type declaration, 0 when unavailable. Reuses temporalPrecision's
+// parenthesized-integer extraction — same "(N)" shape (cf. bitByteWidth).
+// BINARY(0) is legal but reported as unavailable; its only value is the empty
+// string, which renders identically on both sides anyway.
+func fixedBinaryWidth(columnType string) int {
+	return temporalPrecision(columnType)
 }
 
 // bitByteWidth returns ceil(M/8) for a "bit(M)" column-type declaration, 0

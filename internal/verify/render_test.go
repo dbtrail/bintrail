@@ -14,6 +14,67 @@ func col(dataType, columnType string) metadata.ColumnMeta {
 	return metadata.ColumnMeta{Name: "c", DataType: dataType, ColumnType: columnType}
 }
 
+// TestRenderCell_FixedBinaryPadding pins the #1135 fix: MySQL's ROW image
+// strips trailing 0x00 padding from a fixed BINARY(n) value (length-prefixed
+// with the actual stored length — empirically confirmed against MySQL 8.0),
+// while the baseline Parquet and the live source both carry the full n bytes.
+// renderCell must right-pad an event-origin value back to the declared width,
+// and must never truncate.
+func TestRenderCell_FixedBinaryPadding(t *testing.T) {
+	full := bytes.Repeat([]byte{0xab}, 16)
+	stripped := full[:15] // as captured when the 16th byte is 0x00
+	padded := append(bytes.Repeat([]byte{0xab}, 15), 0x00)
+
+	cases := []struct {
+		name string
+		v    any
+		col  metadata.ColumnMeta
+		want []byte
+	}{
+		{"short []byte padded to width", stripped, col("binary", "binary(16)"), padded},
+		{"short string padded to width", string(stripped), col("binary", "binary(16)"), padded},
+		{"full-width value is a no-op", full, col("binary", "binary(16)"), full},
+		{"longer value never truncated", bytes.Repeat([]byte{0xcd}, 20), col("binary", "binary(16)"), bytes.Repeat([]byte{0xcd}, 20)},
+		{"empty value padded to all-zero", []byte{}, col("binary", "binary(4)"), []byte{0, 0, 0, 0}},
+		{"unparseable ColumnType left untouched", stripped, col("binary", ""), stripped},
+		{"varbinary never padded", stripped, col("varbinary", "varbinary(16)"), stripped},
+		{"blob never padded", stripped, col("blob", "blob"), stripped},
+		{"NULL stays NULL", nil, col("binary", "binary(16)"), nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := renderCell(tc.v, tc.col); !bytes.Equal(got, tc.want) {
+				t.Errorf("renderCell = %x, want %x", got, tc.want)
+			}
+		})
+	}
+
+	// The normalized renderer (both verify modes and --explain render through
+	// it) must inherit the padding.
+	if got := renderCellNormalized(stripped, col("binary", "binary(16)")); !bytes.Equal(got, padded) {
+		t.Errorf("renderCellNormalized = %x, want %x", got, padded)
+	}
+}
+
+func TestFixedBinaryWidth(t *testing.T) {
+	cases := []struct {
+		columnType string
+		want       int
+	}{
+		{"binary(16)", 16},
+		{"binary(1)", 1},
+		{"binary", 0},
+		{"", 0},
+		{"binary()", 0},
+		{"binary(x)", 0},
+	}
+	for _, tc := range cases {
+		if got := fixedBinaryWidth(tc.columnType); got != tc.want {
+			t.Errorf("fixedBinaryWidth(%q) = %d, want %d", tc.columnType, got, tc.want)
+		}
+	}
+}
+
 func TestRenderCell_MatchesTextProtocolForm(t *testing.T) {
 	ts := time.Date(2021, 1, 1, 0, 0, 0, 123456000, time.UTC) // .123456
 	dt0 := time.Date(2022, 6, 15, 12, 30, 45, 0, time.UTC)

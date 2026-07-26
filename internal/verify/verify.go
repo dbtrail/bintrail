@@ -227,7 +227,11 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	// divergence on an unrelated non-deferred column as Inconclusive whenever
 	// any event existed in the window. A row-count difference is always
 	// conclusive (real loss/gain) and is never masked by this.
-	deferredRepr := deferredReprUnresolved(orderedCols, changes, binariesTyped)
+	deferredCol, deferredRepr := deferredReprUnresolved(orderedCols, changes, binariesTyped)
+	var deferredDetail string
+	if deferredRepr {
+		deferredDetail = deferredReprDetail(deferredCol)
+	}
 
 	// Live-source verify is MySQL-only (PostgreSQL is refused upstream), so the
 	// PK canonicalizer always applies here — pgTextPK is false.
@@ -242,7 +246,7 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	}
 
 	// 6. Compare.
-	status, detail := classify(res.SourceDigest, res.SourceRows, res.ReconstructDigest, res.ReconstructRows, deferredRepr)
+	status, detail := classify(res.SourceDigest, res.SourceRows, res.ReconstructDigest, res.ReconstructRows, deferredDetail)
 	res.Status = status
 	if detail != "" {
 		res.Detail = detail // a real reason overrides the coverage note
@@ -252,12 +256,13 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 
 // classify is the pure comparison core. Row count is checked first: a difference
 // is always a conclusive mismatch (real row loss/gain) and is NEVER downgraded by
-// deferredRepr — that ordering is the guard against masking data loss on a table
+// deferredDetail — that ordering is the guard against masking data loss on a table
 // that merely contains an ENUM/SET/JSON/binary column. At equal row count a
-// content difference is a mismatch, except when deferredRepr is set (a deferred
-// column may have changed and its event image isn't normalized yet), where it is
-// inconclusive rather than a false alarm.
-func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int64, deferredRepr bool) (Status, string) {
+// content difference is a mismatch, except when deferredDetail is non-empty (a
+// deferred column carried a value the normalization passes could not resolve —
+// see deferredReprDetail, which names the column), where it is inconclusive
+// rather than a false alarm and deferredDetail is the reported reason.
+func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int64, deferredDetail string) (Status, string) {
 	if reconRows != srcRows {
 		return StatusMismatch, fmt.Sprintf("row count differs: source=%d reconstructed=%d", srcRows, reconRows)
 	}
@@ -274,8 +279,8 @@ func classify(srcDigest string, srcRows int64, reconDigest string, reconRows int
 	if reconDigest == srcDigest {
 		return StatusMatch, ""
 	}
-	if deferredRepr {
-		return StatusInconclusive, "an event carried an ENUM/SET, JSON, binary or BIT value that could not be normalized to the baseline/source representation, so this content difference is not conclusive"
+	if deferredDetail != "" {
+		return StatusInconclusive, deferredDetail
 	}
 	return StatusMismatch, "content digest differs at equal row count (in-place value divergence)"
 }
@@ -340,7 +345,11 @@ func inconclusive(res TableResult, detail string) TableResult {
 // DecodeEventBinaries' report — false means some event's BLOB/BINARY values
 // may still be stored base64 (epoch typing unavailable), so any non-nil
 // binary-family value stays unresolved.
-func deferredReprUnresolved(cols []metadata.ColumnMeta, changes map[string]*query.ResultRow, binariesTyped bool) bool {
+//
+// On unresolved=true, col is the first unresolved column found — so the
+// Inconclusive reason can name the actual column and type instead of a generic
+// type list that may name none of the table's columns (#1136).
+func deferredReprUnresolved(cols []metadata.ColumnMeta, changes map[string]*query.ResultRow, binariesTyped bool) (col metadata.ColumnMeta, unresolved bool) {
 	var deferredCols []metadata.ColumnMeta
 	for _, c := range cols {
 		if isDeferredType(c.DataType) {
@@ -348,7 +357,7 @@ func deferredReprUnresolved(cols []metadata.ColumnMeta, changes map[string]*quer
 		}
 	}
 	if len(deferredCols) == 0 {
-		return false
+		return metadata.ColumnMeta{}, false
 	}
 	for _, ev := range changes {
 		if ev.EventType != event.EventInsert && ev.EventType != event.EventUpdate {
@@ -360,11 +369,22 @@ func deferredReprUnresolved(cols []metadata.ColumnMeta, changes map[string]*quer
 				continue // absent/NULL renders identically on both sides
 			}
 			if deferredValueUnresolved(v, c, binariesTyped) {
-				return true
+				return c, true
 			}
 		}
 	}
-	return false
+	return metadata.ColumnMeta{}, false
+}
+
+// deferredReprDetail is the Inconclusive reason for an unresolved
+// deferred-representation value, naming the specific column and its type. The
+// static list this replaced ("an ENUM/SET, JSON, binary or BIT value") was
+// actively misleading on a table whose unresolved column is none of those —
+// e.g. a POINT column (#1136) sent the reader hunting for an ENUM that does
+// not exist.
+func deferredReprDetail(c metadata.ColumnMeta) string {
+	return fmt.Sprintf("an event carried a value for column %q (%s) that could not be normalized to the baseline/source representation, so this content difference is not conclusive",
+		c.Name, strings.ToLower(strings.TrimSpace(c.DataType)))
 }
 
 // deferredValueUnresolved reports whether one deferred-typed value is still in
@@ -405,7 +425,34 @@ func deferredValueUnresolved(v any, c metadata.ColumnMeta, binariesTyped bool) b
 		// source/baseline text keeps "1.0" — and after the round-trip the
 		// integer form is indistinguishable from a genuine integer.
 		return !jsonRenderConclusive(renderCell(v, c))
-	case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
+	case "binary":
+		// Fixed BINARY(n): the event image strips trailing 0x00 padding
+		// (MySQL length-prefixes MYSQL_TYPE_STRING with the actual stored
+		// length), which renderCell reverses by right-padding to the declared
+		// width (#1135). Resolvable only when the decode pass had epoch
+		// typing AND the width is known: an empty/unparseable ColumnType
+		// (pre-#212 snapshot) leaves the pad width unknown, so the value
+		// stays unresolved — an honest Inconclusive instead of a false
+		// MISMATCH on any value that merely ends in 0x00.
+		if !binariesTyped {
+			return true // may still be stored base64 — DecodeEventBinaries degraded
+		}
+		switch v.(type) {
+		case string, []byte:
+			return fixedBinaryWidth(c.ColumnType) == 0
+		default:
+			return true // #736 mis-promotion leftover the decode pass could not restore
+		}
+	case "varbinary", "blob", "tinyblob", "mediumblob", "longblob",
+		// Spatial family + VECTOR: binary in the event image (4-byte SRID +
+		// WKB / packed floats), decoded by the same DecodeEventBinaries pass
+		// as BLOB since #1136. Once decoded, the raw bytes are exactly what
+		// the source SELECT and the mydumper baseline carry — no padding
+		// concern (spatial values have no fixed declared width), so they
+		// resolve like BLOB.
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection", "geomcollection", "vector":
 		if !binariesTyped {
 			return true // may still be stored base64 — DecodeEventBinaries degraded
 		}
@@ -416,8 +463,8 @@ func deferredValueUnresolved(v any, c metadata.ColumnMeta, binariesTyped bool) b
 			return true // #736 mis-promotion leftover the decode pass could not restore
 		}
 	default:
-		// Spatial family + VECTOR: []byte (WKB / packed floats) → stored
-		// base64, and no event-side decode exists for them yet (#793).
+		// isDeferredType enumerates every deferred type in the cases above;
+		// anything else reaching here is unknown — unsure means unresolved.
 		return true
 	}
 }
@@ -470,8 +517,9 @@ func isASCII(s string) bool {
 // from how the baseline/source renders it in a way this version doesn't yet
 // normalize: ENUM/SET (ordinal vs label), JSON (MySQL-canonical text), binary
 // families (base64 in the event image vs raw bytes), BIT, and the spatial and
-// VECTOR types — whose values are binary (WKB / packed floats) in the event
-// image and so carry the same base64-vs-raw representation gap as BLOB (#793).
+// VECTOR types — binary (SRID+WKB / packed floats) in the event image, decoded
+// by DecodeEventBinaries like BLOB since #1136 but still gated here for when
+// the epoch-typed decode degrades (binariesTyped=false), same as BLOB.
 //
 // TEXT is deliberately NOT here, despite being decoded by the same
 // DecodeEventBinaries call as BLOB (#672): once decoded, a TEXT value is just
@@ -488,7 +536,9 @@ func isDeferredType(dataType string) bool {
 	case "enum", "set", "json",
 		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit",
 		// Spatial family (DATA_TYPE as reported by information_schema.COLUMNS)
-		// plus MySQL 9.0+ VECTOR: binary in the event image, no normalization yet.
+		// plus MySQL 9.0+ VECTOR: binary in the event image, decoded by
+		// DecodeEventBinaries like BLOB (#1136) — still deferred for the
+		// binariesTyped=false degradation, same as the binary families above.
 		"geometry", "point", "linestring", "polygon",
 		"multipoint", "multilinestring", "multipolygon",
 		// MySQL 8.0.11+ (WL#2388) reports a GEOMETRYCOLLECTION column's DATA_TYPE

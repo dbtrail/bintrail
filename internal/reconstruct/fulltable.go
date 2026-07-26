@@ -1767,9 +1767,24 @@ func droppedBaselineColumns(imageCols map[string]struct{}, sawImage bool, colNam
 // wrong bytes with no error — astronomically unlikely for random binary
 // content, but plausible for a VARBINARY column storing ASCII-like data. See
 // the fuller rationale on the sibling copy in internal/recovery/recovery.go.
+// The spatial family + VECTOR are included (binary) since #1136: go-mysql
+// delivers them via decodeBlob as []byte — a geometry is MySQL's internal
+// 4-byte SRID + WKB, a VECTOR is packed floats — so they take the same
+// []byte-to-base64 storage path as BLOB and must be decoded the same way.
+// Decoding restores exactly the bytes a raw source SELECT and a mydumper
+// baseline carry, which is what makes them comparable (verify) and
+// restorable (reconstruct --output-format mydumper). The retroactive-
+// reclassification risk above does NOT apply to them: like BLOB they were
+// []byte-and-base64 from the day they were first captured.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
-	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary":
+	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary",
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		// MySQL 8.0.11+ reports a GEOMETRYCOLLECTION column's DATA_TYPE as
+		// "geomcollection"; MariaDB and pre-8.0.11 report "geometrycollection".
+		"geometrycollection", "geomcollection",
+		"vector":
 		return true, true
 	case "text", "tinytext", "mediumtext", "longtext", "json":
 		return false, true
