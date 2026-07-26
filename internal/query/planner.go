@@ -28,6 +28,15 @@ type QueryPlan struct {
 	// GapHours are hours where data has been rotated out of MySQL and no
 	// archive exists. Callers should emit a warning for these.
 	GapHours []time.Time
+
+	// OldestKnownHour is the earliest hour this index has ever held — the
+	// oldest live partition or archived hour the planner saw (post-noArchive
+	// filtering, so under --no-archive it is the oldest LIVE partition only).
+	// Zero when no partitions exist at all. It lets a caller tell a gap hour
+	// that ROTATED away from one that predates the index's existence — on an
+	// index younger than the queried window, every pre-install hour is a
+	// "gap" that was never captured in the first place (#1126).
+	OldestKnownHour time.Time
 }
 
 // Plan builds a QueryPlan for the given time range by inspecting live partition
@@ -152,6 +161,16 @@ func buildPlan(liveHours, archivedHours []time.Time, rangeStart, rangeEnd time.T
 	}
 
 	plan := &QueryPlan{GapHours: gaps}
+	for _, h := range liveHours {
+		if plan.OldestKnownHour.IsZero() || h.Before(plan.OldestKnownHour) {
+			plan.OldestKnownHour = h
+		}
+	}
+	for _, h := range archivedHours {
+		if plan.OldestKnownHour.IsZero() || h.Before(plan.OldestKnownHour) {
+			plan.OldestKnownHour = h
+		}
+	}
 
 	if needMySQL {
 		plan.MySQLRanges = buildContiguousRanges(liveHours, rangeStart, rangeEnd)

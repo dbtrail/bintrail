@@ -134,7 +134,7 @@ func VerifyRecoverInputs(ctx context.Context, cfg RecoverInputsConfig, schema, t
 	if err != nil {
 		var gap *query.GapError
 		if errors.As(err, &gap) {
-			return inconclusive(res, "coverage gap in the window: "+gap.Error()+"; a chain with an interior hole cannot be asserted against"), nil
+			return inconclusive(res, recoverGapDetail(gap, cfg.NoArchive)), nil
 		}
 		return res, fmt.Errorf("fetch events %s.%s: %w", schema, table, err)
 	}
@@ -209,6 +209,51 @@ func recoverInputsFetchOptions(schema, table string, since, until time.Time, max
 		Order:  "ASC",
 		Limit:  maxEvents + 1,
 	}
+}
+
+// recoverGapDetail words a coverage-gap abort for the operator. The generic
+// GapError text says the missing hours were "rotated and not archived" — false
+// for hours before the index's FIRST partition ever existed. Partitions are
+// created from install time forward, so on an index younger than --lookback
+// every pre-install hour is such a "gap"; claiming rotation would send the
+// operator hunting for a retention loss that never happened, and the standard
+// remedy (shorten --lookback) would read as unactionable when it is exactly
+// right (#1126). The planner stamps the oldest hour it has ever seen into the
+// GapError so the two cases can be told apart here.
+func recoverGapDetail(gap *query.GapError, noArchive bool) string {
+	generic := "coverage gap in the window: " + gap.Error() + "; a chain with an interior hole cannot be asserted against"
+	oldest := gap.OldestKnownHour
+	if oldest.IsZero() {
+		return generic
+	}
+	var preHistory, holes []time.Time
+	for _, h := range gap.GapHours {
+		if h.Before(oldest) {
+			preHistory = append(preHistory, h)
+		} else {
+			holes = append(holes, h)
+		}
+	}
+	if len(preHistory) == 0 {
+		return generic
+	}
+	const hourFmt = "2006-01-02 15:00"
+	var msg string
+	if noArchive {
+		// Under --no-archive the planner never reads archive_state, so
+		// "oldest" is the oldest LIVE partition — archived history older than
+		// it may exist but is excluded from this walk. Claiming the index has
+		// no history there would assert more than was checked.
+		msg = fmt.Sprintf("the window reaches back to %s but the oldest live partition holds %s; the hours before it are not available to this walk (--no-archive also excludes any archived history) — shorten --lookback, or drop --no-archive if archives cover them",
+			preHistory[0].UTC().Format(hourFmt), oldest.UTC().Format(hourFmt))
+	} else {
+		msg = fmt.Sprintf("the window reaches back to %s but the oldest hour this index has ever held (live or archived) is %s; the hours before it predate the index's history — nothing rotated away, the index did not exist yet — so shorten --lookback to the index's age or less",
+			preHistory[0].UTC().Format(hourFmt), oldest.UTC().Format(hourFmt))
+	}
+	if len(holes) > 0 {
+		msg += "; separately, " + query.FormatGapWarning(holes) + " — a chain with an interior hole cannot be asserted against"
+	}
+	return msg
 }
 
 // ─── Stamped capture gaps ─────────────────────────────────────────────────────
@@ -327,8 +372,10 @@ type recoverChainOutcome struct {
 	Events, Chains int
 	// ChainsNoPredecessor counts DISTINCT primary keys that held at least one
 	// event with no predecessor state to assert against — the window opened
-	// mid-history, or a PK-changing UPDATE moved the row out from under the
-	// key. Legitimately unverifiable, never a mismatch. Counted per key, not
+	// mid-history, a PK-changing UPDATE moved the row out from under the
+	// key, or the chain was restarted after a nil-image/unresolved-TOAST/
+	// unknown-type finding (the state after such an event is not knowable).
+	// Legitimately unverifiable, never a mismatch. Counted per key, not
 	// per event, so it can never exceed Chains.
 	ChainsNoPredecessor int
 	// Assertions is how many before-image comparisons were actually made:
@@ -382,7 +429,18 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 	out := recoverChainOutcome{Events: len(in.Events)}
 	states := make(map[string]*chainState)
 
-	var mismatches []string
+	// Only the FIRST mismatch detail and the total are ever reported
+	// (recoverChainVerdict), so keeping every formatted string would be an
+	// unbounded memory term on a systemically broken table — up to MaxEvents
+	// retained strings for no output anyone sees (#1126).
+	var mismatchCount int
+	var firstMismatch string
+	recordMismatch := func(detail string) {
+		if mismatchCount == 0 {
+			firstMismatch = detail
+		}
+		mismatchCount++
+	}
 	var unresolved int
 	var firstUnresolved string
 	noPredecessor := make(map[string]struct{})
@@ -415,7 +473,7 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 		// buildInsert/buildUpdate/buildDelete. An INSERT with a nil
 		// row_before is NORMAL (there is no prior row) and is not flagged.
 		if detail, bad := checkImagesPresent(ev); bad {
-			mismatches = append(mismatches, detail)
+			recordMismatch(detail)
 			// The chain's state after an event whose images are broken is
 			// not knowable; restart rather than cascade one defect into
 			// every later event on this PK.
@@ -425,7 +483,7 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 
 		// (2) The same unchanged-TOAST refusal recovery performs up front.
 		if err := event.CheckUnresolvedToast(ev.SchemaName, ev.TableName, ev.PKValues, ev.RowBefore, ev.RowAfter); err != nil {
-			mismatches = append(mismatches, fmt.Sprintf("event %d (pk=%s): %v", ev.EventID, ev.PKValues, err))
+			recordMismatch(fmt.Sprintf("event %d (pk=%s): %v", ev.EventID, ev.PKValues, err))
 			*st = chainState{}
 			continue
 		}
@@ -443,7 +501,7 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 			verdict, detail := assertBeforeImage(ev, st, in)
 			switch verdict {
 			case chainMismatch:
-				mismatches = append(mismatches, detail)
+				recordMismatch(detail)
 			case chainUnresolved:
 				unresolved++
 				if firstUnresolved == "" {
@@ -476,7 +534,7 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 			// A type recovery has no reversal for (it errors with "unknown
 			// event type"). Not silently skipped — an unwalkable event means
 			// the chain past it is not knowable.
-			mismatches = append(mismatches, fmt.Sprintf("event %d (pk=%s): unknown event type %d; recover cannot reverse it",
+			recordMismatch(fmt.Sprintf("event %d (pk=%s): unknown event type %d; recover cannot reverse it",
 				ev.EventID, ev.PKValues, ev.EventType))
 			*st = chainState{}
 		}
@@ -487,7 +545,7 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 	// rows must not report events "checked" that were never walked.
 	out.Events = len(in.Events) - out.UnwalkableEvents
 	out.ChainsNoPredecessor = len(noPredecessor)
-	out.Status, out.Detail = recoverChainVerdict(out, mismatches, unresolved, firstUnresolved, in.Truncated)
+	out.Status, out.Detail = recoverChainVerdict(out, mismatchCount, firstMismatch, unresolved, firstUnresolved, in.Truncated)
 	return out
 }
 
@@ -508,15 +566,15 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 // Truncation is the one exception that still collapses the table: there the
 // unchecked part is not a handful of values but the entire TAIL of the window,
 // which was never loaded at all.
-func recoverChainVerdict(out recoverChainOutcome, mismatches []string, unresolved int, firstUnresolved string, truncated bool) (Status, string) {
+func recoverChainVerdict(out recoverChainOutcome, mismatchCount int, firstMismatch string, unresolved int, firstUnresolved string, truncated bool) (Status, string) {
 	scope := fmt.Sprintf("%d event(s), %d chain(s), %d before-image assertion(s)", out.Events, out.Chains, out.Assertions)
 
 	// A mismatch is conclusive regardless of what else could not be checked:
 	// the events that WERE walked are real, and recover would consume them.
-	if len(mismatches) > 0 {
-		detail := fmt.Sprintf("%d recover-input inconsistency(ies) in %s: %s", len(mismatches), scope, mismatches[0])
-		if len(mismatches) > 1 {
-			detail += fmt.Sprintf(" (and %d more)", len(mismatches)-1)
+	if mismatchCount > 0 {
+		detail := fmt.Sprintf("%d recover-input inconsistency(ies) in %s: %s", mismatchCount, scope, firstMismatch)
+		if mismatchCount > 1 {
+			detail += fmt.Sprintf(" (and %d more)", mismatchCount-1)
 		}
 		return StatusMismatch, detail
 	}
@@ -529,7 +587,7 @@ func recoverChainVerdict(out recoverChainOutcome, mismatches []string, unresolve
 		notes = append(notes, fmt.Sprintf("%d chain(s) began mid-history and were not asserted", out.ChainsNoPredecessor))
 	}
 	if unresolved > 0 {
-		notes = append(notes, fmt.Sprintf("%d before-image comparison(s) were not conclusive because a value's representation could not be normalized: %s", unresolved, firstUnresolved))
+		notes = append(notes, fmt.Sprintf("%d before-image comparison(s) were not conclusive (a value representation or schema epoch that could not be resolved): %s", unresolved, firstUnresolved))
 	}
 	if out.UnwalkableEvents > 0 {
 		notes = append(notes, fmt.Sprintf("%d event(s) carry no primary key (drift rows) and belong to no chain, so they were not walked", out.UnwalkableEvents))
@@ -548,6 +606,12 @@ func recoverChainVerdict(out recoverChainOutcome, mismatches []string, unresolve
 	}
 	return StatusMatch, detail
 }
+
+// emptyImagePairMarker is compareImages' out-of-band signal that BOTH images
+// were empty — nothing to compare, so nothing was proven. It contains a NUL
+// byte, which no real MySQL column name can, so it can never collide with an
+// actual unresolved column.
+const emptyImagePairMarker = "\x00empty-images"
 
 // chainVerdict is one event's before-image assertion outcome.
 type chainVerdict int
@@ -582,8 +646,11 @@ func assertBeforeImage(ev *query.ResultRow, st *chainState, in recoverChainInput
 	switch {
 	case equal:
 		return chainAsserted, ""
+	case unresolvedCol == emptyImagePairMarker:
+		return chainUnresolved, fmt.Sprintf("event %d (pk=%s): both row images are empty, so their equality cannot be proven",
+			ev.EventID, ev.PKValues)
 	case unresolvedCol != "":
-		return chainUnresolved, fmt.Sprintf("event %d (pk=%s) column %q holds an ENUM/SET, JSON, binary, BIT or spatial value whose representation could not be normalized",
+		return chainUnresolved, fmt.Sprintf("event %d (pk=%s) column %q could not be compared conclusively (a value representation that could not be normalized, or a column-set difference whose schema epoch differs or is unknown)",
 			ev.EventID, ev.PKValues, unresolvedCol)
 	default:
 		return chainMismatch, fmt.Sprintf("event %d (pk=%s, %s): row_before does not match the state the previous event on this primary key left (column %s) — either the events in between were never captured, or the stored before-image is stale or corrupt; %s",
@@ -621,6 +688,14 @@ const chainBreakGuidance = "recover would build reversal SQL from a before-image
 // value whose event representation provably cannot be made byte-faithful, the
 // same gate deferredReprUnresolved applies in the content modes.
 func compareImages(prev, cur map[string]any, prevVer, curVer uint32, in recoverChainInput) (equal bool, unresolvedCol, diffCol string) {
+	// Two images with NO columns at all prove nothing about each other, so
+	// "equal" — a proven assertion — must not be reachable from emptiness.
+	// Unreachable in practice (#493's partial-row-image guard hard-errors on
+	// non-FULL binlog_row_image before such events could be indexed), but
+	// cheap to pin (#1126).
+	if len(prev) == 0 && len(cur) == 0 {
+		return false, emptyImagePairMarker, ""
+	}
 	cols := unionKeys(prev, cur)
 	for _, name := range cols {
 		_, inPrev := prev[name]
@@ -628,8 +703,16 @@ func compareImages(prev, cur map[string]any, prevVer, curVer uint32, in recoverC
 		if inPrev != inCur {
 			// The two images disagree on which columns exist. Across a schema
 			// version boundary that is DDL, not corruption; within one
-			// version it is a genuine structural divergence.
-			if prevVer != curVer {
+			// version it is a genuine structural divergence. A version of 0
+			// is NOT a version: query.ResultRow.SchemaVersion is documented
+			// as "0 for pre-migration data", so on a legacy index every event
+			// carries 0 and prevVer == curVer holds across a real DDL — which
+			// would turn an ADD/DROP COLUMN inside the window into a
+			// conclusive MISMATCH on a healthy index (#1126). Zero on either
+			// side means the epoch is unknown, and an unknown epoch cannot
+			// prove corruption, so it degrades to unresolved like the
+			// version-skew case.
+			if prevVer != curVer || prevVer == 0 || curVer == 0 {
 				return false, name, ""
 			}
 			return false, "", fmt.Sprintf("%q is present in one image and absent from the other", name)

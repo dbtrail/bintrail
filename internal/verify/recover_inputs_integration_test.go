@@ -10,6 +10,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -134,5 +135,63 @@ func TestVerifyRecoverInputs_StampedCaptureGapIsInconclusiveNotMismatch(t *testi
 		t.Fatal("an unreadable capture-continuity record must surface as an error, not a verdict")
 	} else if !strings.Contains(err.Error(), "capture-continuity record") {
 		t.Errorf("error should name what could not be read, got: %v", err)
+	}
+}
+
+// TestVerifyRecoverInputs_WindowPredatingIndexHistorySaysSo pins the gap
+// wording for an index YOUNGER than the walk window (#1126). Partitions are
+// created from install time forward, so every hour before the index's first
+// partition is a planner "gap" — but nothing rotated away: the index did not
+// exist. The old reason ("rotated and not archived") sent operators hunting a
+// retention loss that never happened, and made the documented remedy (shorten
+// --lookback) read as unactionable when it was exactly right.
+func TestVerifyRecoverInputs_WindowPredatingIndexHistorySaysSo(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), ?, 'orders', 'id', 1, 'PRI', 'int', 'int', 'NO', 0)`, dbName)
+
+	now := time.Now().UTC()
+	curHour := now.Truncate(time.Hour)
+	// The index's entire history: two partitions, created this hour and last.
+	h1, h2 := curHour.Add(-time.Hour), curHour
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	res, err := VerifyRecoverInputs(context.Background(), RecoverInputsConfig{
+		IndexDB:     db,
+		Resolver:    resolver,
+		IndexDBName: dbName,
+		// Archives honored (none registered): the production default path.
+		ArchiveFetcher: func(context.Context, query.Options, string) ([]query.ResultRow, error) {
+			return nil, nil
+		},
+		// A lookback longer than the index has existed.
+		Since: h1.Add(-3 * time.Hour),
+		Until: now,
+	}, dbName, "orders")
+	if err != nil {
+		t.Fatalf("VerifyRecoverInputs: %v", err)
+	}
+
+	if res.Status != StatusInconclusive {
+		t.Fatalf("a window the index cannot cover is inconclusive, got %s (%s)", res.Status, res.Detail)
+	}
+	if strings.Contains(res.Detail, "rotated and not archived") {
+		t.Errorf("hours before the index existed never rotated, got: %s", res.Detail)
+	}
+	if !strings.Contains(res.Detail, "predate the index's history") {
+		t.Errorf("detail should say the window predates the index, got: %s", res.Detail)
+	}
+	if !strings.Contains(res.Detail, "--lookback") {
+		t.Errorf("detail should carry the actionable remedy, got: %s", res.Detail)
 	}
 }

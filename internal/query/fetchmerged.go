@@ -28,6 +28,12 @@ type ArchiveFetcher func(ctx context.Context, opts Options, source string) ([]Re
 // re-wrap at the call site.
 type GapError struct {
 	GapHours []time.Time
+
+	// OldestKnownHour is QueryPlan.OldestKnownHour: the earliest hour the
+	// index has ever held (zero when unknown). Callers can use it to word a
+	// gap honestly — a gap hour before it never rotated away, the index
+	// simply did not exist yet (#1126).
+	OldestKnownHour time.Time
 }
 
 func (e *GapError) Error() string {
@@ -401,7 +407,7 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 	// Gap enforcement runs before any fetch so we fail fast in strict mode.
 	if src.plan != nil && len(src.plan.GapHours) > 0 {
 		if !o.AllowGaps {
-			return src, &GapError{GapHours: src.plan.GapHours}
+			return src, &GapError{GapHours: src.plan.GapHours, OldestKnownHour: src.plan.OldestKnownHour}
 		}
 		slog.Warn(FormatGapWarning(src.plan.GapHours))
 	}

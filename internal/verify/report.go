@@ -101,8 +101,11 @@ type TableReport struct {
 	EventsChecked int `json:"events_checked,omitempty"`
 	// ChainsChecked is the number of distinct primary keys walked.
 	ChainsChecked int `json:"chains_checked,omitempty"`
-	// ChainsInconclusive counts chains whose first event in the window was not
-	// an INSERT — no predecessor state exists, so they are legitimately
+	// ChainsInconclusive counts chains that held at least one event with no
+	// predecessor state to assert against: the window opened mid-history
+	// (first event on the key was not an INSERT), a PK-changing UPDATE moved
+	// the row out from under the key, or the chain was restarted after a
+	// nil-image/unresolved-TOAST/unknown-type finding. All are legitimately
 	// unverifiable rather than divergent.
 	ChainsInconclusive int `json:"chains_inconclusive,omitempty"`
 }

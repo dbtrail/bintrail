@@ -780,3 +780,173 @@ func TestNewReport_RecoverInputsCarriesChainCountsAndExits(t *testing.T) {
 		}
 	}
 }
+
+// ─── #1126: verdicts must not assert more than the data supports ─────────────
+
+// On a LEGACY index every event carries SchemaVersion 0 ("0 for pre-migration
+// data"), so prevVer == curVer holds across a real DDL and the column-set
+// escape hatch never fired: an ADD COLUMN inside the window read as a
+// conclusive MISMATCH on a healthy index. Zero on either side is an unknown
+// epoch and must degrade to unresolved (inconclusive), exactly like the
+// version-skew case.
+func TestCheckRecoverChains_LegacyIndexDDLIsInconclusiveNotMismatch(t *testing.T) {
+	// riEvent leaves SchemaVersion at its zero value — the legacy-index shape.
+	// The qty column appears between event 1's after-image and event 2's
+	// before-image: a real historical ADD COLUMN.
+	events := []query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, map[string]any{"id": json.Number("7"), "name": "widget"}),
+		riEvent(2, event.EventUpdate, "7", riRow(7, "widget", 1), riRow(7, "widget", 2)),
+	}
+	out := checkRecoverChains(riInput(events))
+	if out.Status == StatusMismatch {
+		t.Fatalf("a column-set difference on a legacy (SchemaVersion 0) index must not be a conclusive mismatch: %s", out.Detail)
+	}
+	if out.Status != StatusInconclusive {
+		t.Fatalf("got %s (%s), want %s", out.Status, out.Detail, StatusInconclusive)
+	}
+	if !strings.Contains(out.Detail, `"qty"`) {
+		t.Errorf("detail should still name the column it could not compare, got: %s", out.Detail)
+	}
+
+	// Control: the SAME events on a post-migration index (both epochs known
+	// and equal) are a genuine structural divergence — the gate is
+	// content-gated on 0, not a blanket downgrade of column-set differences.
+	events[0].SchemaVersion = 1
+	events[1].SchemaVersion = 1
+	out = checkRecoverChains(riInput(events))
+	if out.Status != StatusMismatch {
+		t.Fatalf("within one KNOWN schema epoch a column-set difference stays conclusive: got %s (%s)", out.Status, out.Detail)
+	}
+}
+
+// The pure-comparison view of the rule above: 0 on either side (or both) is an
+// unknown epoch, never proof of corruption.
+func TestCompareImages_UnknownEpochColumnSetDifference(t *testing.T) {
+	in := riInput(nil)
+	prev := riRow(7, "widget", 1)
+	cur := map[string]any{"id": json.Number("7"), "name": "widget"} // qty absent
+
+	for _, vers := range [][2]uint32{{0, 0}, {0, 2}, {1, 0}} {
+		equal, unresolved, diff := compareImages(prev, cur, vers[0], vers[1], in)
+		if equal || unresolved != "qty" || diff != "" {
+			t.Errorf("versions %v: an unknown epoch must be inconclusive, got equal=%v unresolved=%q diff=%q",
+				vers, equal, unresolved, diff)
+		}
+	}
+}
+
+// Two non-nil-but-EMPTY images hold zero evidence, so they must never count as
+// a proven "equal". Unreachable in production today (the #493 guard refuses
+// non-FULL binlog_row_image), but "proven" must not be reachable from
+// emptiness.
+func TestCompareImages_EmptyImagesAreNotProvenEqual(t *testing.T) {
+	equal, unresolved, diff := compareImages(map[string]any{}, map[string]any{}, 1, 1, riInput(nil))
+	if equal {
+		t.Fatal("two empty images must not compare as proven equal")
+	}
+	if unresolved == "" || diff != "" {
+		t.Errorf("empty images must be inconclusive, not a mismatch: unresolved=%q diff=%q", unresolved, diff)
+	}
+}
+
+// The walk-level form: a chain of empty images asserts nothing, so the table
+// reports inconclusive — not a match it never earned, and not a mismatch.
+func TestCheckRecoverChains_EmptyImagesAssertNothing(t *testing.T) {
+	out := checkRecoverChains(riInput([]query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, map[string]any{}),
+		riEvent(2, event.EventDelete, "7", map[string]any{}, nil),
+	}))
+	if out.Status == StatusMatch {
+		t.Fatalf("empty images must not prove a table: %s", out.Detail)
+	}
+	if out.Status != StatusInconclusive || out.Assertions != 0 {
+		t.Fatalf("got %s (%s) with %d assertion(s), want %s with 0", out.Status, out.Detail, out.Assertions, StatusInconclusive)
+	}
+	if !strings.Contains(out.Detail, "empty") {
+		t.Errorf("detail should say the images were empty, got: %s", out.Detail)
+	}
+}
+
+// Only the FIRST mismatch detail and the total are ever reported, so the walk
+// must not retain every formatted string (up to MaxEvents of them on a
+// systemically broken table). This pins the reported shape: first detail,
+// full count, and the rest summarized.
+func TestCheckRecoverChains_MismatchDetailKeepsFirstAndCountsRest(t *testing.T) {
+	out := checkRecoverChains(riInput([]query.ResultRow{
+		riEvent(1, event.EventInsert, "7", nil, riRow(7, "widget", 1)),
+		riEvent(2, event.EventUpdate, "7", riRow(7, "widget", 99), riRow(7, "widget", 100)),
+		riEvent(3, event.EventUpdate, "7", riRow(7, "widget", 55), riRow(7, "widget", 56)),
+		riEvent(4, event.EventUpdate, "7", riRow(7, "widget", 42), riRow(7, "widget", 43)),
+	}))
+	if out.Status != StatusMismatch {
+		t.Fatalf("got %s (%s), want %s", out.Status, out.Detail, StatusMismatch)
+	}
+	if !strings.Contains(out.Detail, "3 recover-input inconsistency(ies)") {
+		t.Errorf("detail must carry the full count, got: %s", out.Detail)
+	}
+	if !strings.Contains(out.Detail, "event 2") {
+		t.Errorf("detail must carry the FIRST finding, got: %s", out.Detail)
+	}
+	if strings.Contains(out.Detail, "event 3") || strings.Contains(out.Detail, "event 4") {
+		t.Errorf("later findings are summarized, not listed, got: %s", out.Detail)
+	}
+	if !strings.Contains(out.Detail, "(and 2 more)") {
+		t.Errorf("detail must summarize the rest, got: %s", out.Detail)
+	}
+}
+
+// A coverage gap on an index YOUNGER than the window is not rotation: the
+// hours before the index's first-ever partition were never captured at all,
+// and the wording must say so — with the remedy that actually works (shorten
+// --lookback below the index's age) instead of implying a retention loss.
+func TestRecoverGapDetail(t *testing.T) {
+	oldest := time.Date(2026, 7, 20, 10, 0, 0, 0, time.UTC)
+	pre := []time.Time{oldest.Add(-3 * time.Hour), oldest.Add(-2 * time.Hour), oldest.Add(-time.Hour)}
+	hole := oldest.Add(2 * time.Hour)
+
+	t.Run("window predates the index's history", func(t *testing.T) {
+		got := recoverGapDetail(&query.GapError{GapHours: pre, OldestKnownHour: oldest}, false)
+		if strings.Contains(got, "rotated and not archived") {
+			t.Errorf("pre-history hours never rotated, got: %s", got)
+		}
+		for _, want := range []string{"predate the index's history", "--lookback", "2026-07-20 10:00", "2026-07-20 07:00"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("detail should contain %q, got: %s", want, got)
+			}
+		}
+	})
+
+	t.Run("a real interior hole keeps the rotation wording", func(t *testing.T) {
+		got := recoverGapDetail(&query.GapError{GapHours: []time.Time{hole}, OldestKnownHour: oldest}, false)
+		if !strings.Contains(got, "rotated and not archived") || strings.Contains(got, "predate") {
+			t.Errorf("an in-history gap IS rotated-and-not-archived, got: %s", got)
+		}
+	})
+
+	t.Run("mixed gaps report both, honestly", func(t *testing.T) {
+		got := recoverGapDetail(&query.GapError{GapHours: append(append([]time.Time{}, pre...), hole), OldestKnownHour: oldest}, false)
+		if !strings.Contains(got, "predate the index's history") || !strings.Contains(got, "rotated and not archived") {
+			t.Errorf("mixed gaps must name both causes, got: %s", got)
+		}
+	})
+
+	t.Run("unknown oldest hour falls back to the generic wording", func(t *testing.T) {
+		got := recoverGapDetail(&query.GapError{GapHours: pre}, false)
+		if !strings.Contains(got, "coverage gap in the window") {
+			t.Errorf("with no oldest-hour knowledge the wording must not claim a young index, got: %s", got)
+		}
+	})
+
+	t.Run("no-archive does not claim the index has no history", func(t *testing.T) {
+		// Under --no-archive the planner never saw archive_state, so archived
+		// history older than the oldest LIVE partition may exist — the
+		// wording must not assert the index did not exist.
+		got := recoverGapDetail(&query.GapError{GapHours: pre, OldestKnownHour: oldest}, true)
+		if strings.Contains(got, "predate the index's history") {
+			t.Errorf("--no-archive cannot prove the index had no history, got: %s", got)
+		}
+		if !strings.Contains(got, "--no-archive") || !strings.Contains(got, "--lookback") {
+			t.Errorf("detail should name the exclusion and the remedy, got: %s", got)
+		}
+	})
+}

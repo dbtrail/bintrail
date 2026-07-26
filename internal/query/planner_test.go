@@ -178,6 +178,25 @@ func TestPlan_noTimeRange(t *testing.T) {
 
 // ─── buildPlan tests (core routing logic) ─────────────────────────────────────
 
+// OldestKnownHour lets GapError consumers tell a rotated hour from one that
+// predates the index's existence (#1126). It must reflect exactly the hours
+// the plan honours: under noArchive, archived history is excluded from the
+// fetch, so the oldest LIVE hour is the oldest this plan can vouch for.
+func TestBuildPlan_StampsOldestKnownHour(t *testing.T) {
+	live := []time.Time{h(6, 10), h(6, 11)}
+	archived := []time.Time{h(5, 3), h(5, 4)}
+
+	if plan := buildPlan(live, archived, h(5, 0), h(6, 12), false); !plan.OldestKnownHour.Equal(h(5, 3)) {
+		t.Errorf("archives honored: OldestKnownHour = %v, want %v", plan.OldestKnownHour, h(5, 3))
+	}
+	if plan := buildPlan(live, archived, h(5, 0), h(6, 12), true); !plan.OldestKnownHour.Equal(h(6, 10)) {
+		t.Errorf("noArchive: OldestKnownHour = %v, want oldest LIVE hour %v", plan.OldestKnownHour, h(6, 10))
+	}
+	if plan := buildPlan(nil, nil, h(5, 0), h(5, 2), false); !plan.OldestKnownHour.IsZero() {
+		t.Errorf("no partitions at all: OldestKnownHour must stay zero (unknown), got %v", plan.OldestKnownHour)
+	}
+}
+
 func h(day, hour int) time.Time {
 	return time.Date(2026, 1, day, hour, 0, 0, 0, time.UTC)
 }

@@ -120,8 +120,8 @@ that same key left behind**. Events superseded by a newer event on the same key
 are walked too; that is precisely the class `--check content` skips.
 
 It reads **the index only** — no baseline, no live source — so
-`--baseline-dir`/`--baseline-s3` are not required and `--source-dsn` is
-rejected.
+`--baseline-dir`/`--baseline-s3` are not required, and `--source-dsn` and
+`--explain` (a content-mode drill-down it could never print) are rejected.
 
 ```sh
 # Walk the last 7 days of chains for every table in the schema snapshot
@@ -197,6 +197,10 @@ discard every clean assertion beside it and fail the gate on a healthy index.
 > behavior, not a bug — but the fix is to **shorten `--lookback`** to your real
 > retention (or enable archiving), not to ignore the result. Since an
 > all-inconclusive run exits non-zero, a cron gate will tell you immediately.
+> An index **younger** than the lookback is called out explicitly: the reason
+> says the missing hours *predate the index's history* (nothing rotated away —
+> the index did not exist yet), and the remedy is the same — shorten
+> `--lookback` to the index's age or less.
 
 Memory bound: the walk loads at most `--max-events` events per table (default
 200,000) plus one row of state per distinct primary key seen. The cap is a
@@ -261,8 +265,11 @@ bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines --format json
 - `tables[].events_checked` / `chains_checked` / `chains_inconclusive` —
   present only under `--check recover` (omitted entirely otherwise, so a
   content-mode document is unchanged): how many events the chain walk visited,
-  how many distinct primary keys it walked, and how many of those began
-  mid-window with no predecessor to assert against. The row-count and digest
+  how many distinct primary keys it walked, and how many of those held at
+  least one event with no predecessor state to assert against — the chain
+  began mid-window, a PK-changing `UPDATE` moved the row off the key, or the
+  chain was restarted after a nil-image or unresolved-TOAST finding (the state
+  after such an event is unknowable). The row-count and digest
   fields stay absent in this mode — it compares no table content.
 - `explain[]` — present only with `--explain`: per mismatched table, the capped
   list of differing rows (`pk`, `kind`, and per-column `recovery` vs `baseline`
@@ -311,15 +318,18 @@ diff tool involved.
 | `--baseline-s3` | *(empty)* | S3 URL prefix of baseline snapshots (e.g. `s3://bucket/baselines/`) |
 | `--tables` | *(all)* | Comma-separated `schema.table` list (default: all tables in the latest schema snapshot; in baseline-anchored mode, snapshot tables with no baseline report `inconclusive` — "never baselined") |
 | `--no-archive` | `false` | Query live MySQL partitions only; skip Parquet archive discovery |
-| `--explain` | `false` | On a baseline-anchored mismatch, print a per-row drill-down |
+| `--explain` | `false` | On a baseline-anchored mismatch, print a per-row drill-down. Rejected under `--check recover` |
 | `--format` | `text` | Output format: `text` or `json` (see [Machine-readable output](#machine-readable-output---format-json)) |
 | `--check` | `content` | What to verify: `content` (reconstructed table content) or `recover` (`recover`'s before/after image inputs, index-only) |
-| `--lookback` | `30d` | `--check recover` only: how far back to walk each key's event chain (e.g. `30d`, `24h`) |
-| `--max-events` | `200000` | `--check recover` only: per-table cap on events loaded; exceeding it reports `inconclusive` rather than a partial check |
+| `--lookback` | `30d` | `--check recover` only: how far back to walk each key's event chain (e.g. `30d`, `24h`). Rejected under `--check content` |
+| `--max-events` | `200000` | `--check recover` only: per-table cap on events loaded; exceeding it reports `inconclusive` rather than a partial check. Rejected under `--check content` |
 
 One of `--baseline-dir` or `--baseline-s3` is **required** for `--check content`
 (both of its modes read baselines). `--check recover` reads the index only, so
-it requires neither — and rejects `--source-dsn`, which it would not use.
+it requires neither — and rejects `--source-dsn` and `--explain`, which it
+would not honour. Symmetrically, `--check content` rejects `--lookback` and
+`--max-events`, which only the recover-input walk reads: a flag that is
+accepted must be a flag that was honoured.
 
 It also accepts the shared DuckDB tuning flags (`--ultrafast`,
 `--duckdb-threads`, `--duckdb-memory-limit`) — see the DuckDB resource tuning

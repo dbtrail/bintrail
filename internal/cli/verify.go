@@ -133,19 +133,18 @@ func runVerify(cmd *cobra.Command, _ []string) error {
 	default:
 		return fmt.Errorf("invalid --check %q; must be %s or %s", vfyCheck, checkContent, checkRecover)
 	}
+	if err := checkVerifyFlagScope(vfyCheck, vfySourceDSN, vfyExplain,
+		cmd.Flags().Changed("lookback"), cmd.Flags().Changed("max-events")); err != nil {
+		return err
+	}
 	baselineSrc := vfyBaselineDir
 	if baselineSrc == "" {
 		baselineSrc = vfyBaselineS3
 	}
 	// The recover-input check reads binlog_events and nothing else, so
 	// requiring a baseline it never opens would refuse a perfectly runnable
-	// verification. --source-dsn is likewise unused there: accepting it
-	// silently would imply the live source was consulted when it was not.
-	if vfyCheck == checkRecover {
-		if vfySourceDSN != "" {
-			return fmt.Errorf("--source-dsn is not used by --check recover (it verifies recover's inputs from the index alone); omit it")
-		}
-	} else if baselineSrc == "" {
+	// verification.
+	if vfyCheck != checkRecover && baselineSrc == "" {
 		return fmt.Errorf("one of --baseline-dir or --baseline-s3 is required")
 	}
 
@@ -497,6 +496,35 @@ func runVerifyRecoverInputs(cmd *cobra.Command, indexDB *sql.DB, resolver *metad
 		results = append(results, res)
 	}
 	return emitVerifyReport(cmd, verify.NewReport(verify.ModeRecoverInputs, results))
+}
+
+// checkVerifyFlagScope rejects flags the selected --check would silently
+// ignore. Accepting a flag implies it was honoured: --explain under --check
+// recover would promise a row-level drill-down that never prints, and
+// --lookback/--max-events under --check content would promise a window and an
+// event budget that content comparison does not have — the same reasoning
+// behind rejecting --source-dsn, which --check recover never opens (#1126).
+//
+// lookbackSet/maxEventsSet are pflag Changed() bits, not value comparisons,
+// because both flags carry non-zero defaults an operator could legitimately
+// re-state.
+func checkVerifyFlagScope(check, sourceDSN string, explain, lookbackSet, maxEventsSet bool) error {
+	if check == checkRecover {
+		if sourceDSN != "" {
+			return fmt.Errorf("--source-dsn is not used by --check recover (it verifies recover's inputs from the index alone); omit it")
+		}
+		if explain {
+			return fmt.Errorf("--explain is not used by --check recover (the row-level drill-down exists only for baseline-anchored content mismatches); omit it")
+		}
+		return nil
+	}
+	if lookbackSet {
+		return fmt.Errorf("--lookback is only used by --check recover; --check content always compares full reconstructed content, so omit it")
+	}
+	if maxEventsSet {
+		return fmt.Errorf("--max-events is only used by --check recover; --check content always compares full reconstructed content, so omit it")
+	}
+	return nil
 }
 
 // verifyTableFilter parses --tables into a "schema.table" set, or nil for all.
