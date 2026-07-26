@@ -234,3 +234,50 @@ func TestInsertBatch_maxBatchSize(t *testing.T) {
 		t.Errorf("expected %d rows inserted, got %d", MaxBatchSize, count)
 	}
 }
+
+// TestInsertBatch_subSecondTimestampFloors pins #1025: a sub-second event time
+// must FLOOR into event_timestamp's DATETIME(0), not round. MySQL's default
+// sql_mode rounds .900 up to the next second, which would store the event ~0.1s
+// AHEAD of when it happened — and `AS OF 'now'` (a fractional time.Now()) would
+// then evaluate `event_timestamp <= now` as false and omit a row that already
+// exists. The .900 fraction is load-bearing: with a fraction below .500 MySQL
+// already truncates and the test would pass with or without the fix.
+func TestInsertBatch_subSecondTimestampFloors(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	idx := New(db, 1000)
+	commit := time.Date(2026, 2, 19, 12, 0, 6, 900_000_000, time.UTC)
+	batch := []parser.Event{
+		{
+			BinlogFile: "binlog.000001", StartPos: 100, EndPos: 200,
+			Timestamp: commit, Schema: "mydb", Table: "orders",
+			EventType: parser.EventInsert, PKValues: "1",
+			RowAfter: map[string]any{"id": float64(1)},
+		},
+	}
+
+	if _, err := idx.InsertBatch(batch); err != nil {
+		t.Fatalf("InsertBatch failed: %v", err)
+	}
+
+	var stored time.Time
+	if err := db.QueryRow("SELECT event_timestamp FROM binlog_events").Scan(&stored); err != nil {
+		t.Fatalf("query event_timestamp failed: %v", err)
+	}
+	want := commit.Truncate(time.Second)
+	if !stored.Equal(want) {
+		t.Errorf("event_timestamp = %s, want %s (floored, not rounded)", stored.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+
+	// The symptom itself: the `event_timestamp <= at` predicate every AS OF
+	// path uses must find the row at its own commit instant.
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM binlog_events WHERE event_timestamp <= ?", commit).Scan(&n); err != nil {
+		t.Fatalf("query with AS OF upper bound failed: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("row committed at %s is invisible to `event_timestamp <= %s`: got %d rows, want 1",
+			commit.Format(time.RFC3339Nano), commit.Format(time.RFC3339Nano), n)
+	}
+}

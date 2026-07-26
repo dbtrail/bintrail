@@ -218,7 +218,17 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 			ev.BinlogFile,
 			ev.StartPos,
 			ev.EndPos,
-			ev.Timestamp,
+			// FLOOR, never round, into event_timestamp's DATETIME(0) (#1025).
+			// MySQL's default sql_mode ROUNDS a bound sub-second fraction, so an
+			// event committed at …06.885 would be stored as …07 — up to a second
+			// AHEAD of its true time, and `AS OF 'now'` (fractional) would then
+			// evaluate `07 <= …06.885` as false and omit a row that already
+			// exists. Truncating here keeps the invariant every
+			// `event_timestamp <= X` comparison in the query path assumes:
+			// stored <= true event time < stored + 1s. No-op for MySQL/MariaDB
+			// sources (binlog event headers are whole seconds already); it is
+			// the Postgres capturer's microsecond commit time that this bites.
+			ev.Timestamp.Truncate(time.Second),
 			nullOrString(ev.GTID),
 			nullOrUint32(ev.ConnectionID),
 			ev.Schema,
