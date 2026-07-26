@@ -24,9 +24,35 @@ func TestBuildPKValues(t *testing.T) {
 		// []byte prints Go's bracketed decimal representation
 		// (e.g. "[222 173]"), not the raw bytes — BuildPKValues must special-
 		// case it so pk_values/pk_hash stay exactly what they were when the
-		// same bytes arrived as a string.
+		// same bytes arrived as a string. UNCHANGED by #1132: {0xDE,0xAD} is a
+		// well-formed 2-byte UTF-8 sequence (U+07AD), so utf8mb4 accepts it and
+		// the verbatim spelling — and therefore the pk_hash — must stay exactly
+		// as it was. This is the regression guard for "hex-encoding only ever
+		// touches values that could not be stored at all".
 		{"binary PK bytes preserved raw", []metadata.ColumnMeta{{Name: "id"}},
 			map[string]any{"id": []byte{0xDE, 0xAD}}, string([]byte{0xDE, 0xAD})},
+		// #1132: 0xB2 is a UTF-8 continuation byte, so it can never lead a
+		// sequence — these bytes are unstorable in the utf8mb4 pk_values
+		// column. Written verbatim, MySQL rejected the whole batch INSERT with
+		// error 1366 and, batch failures being fail-loud by contract, killed
+		// the stream daemon for EVERY table in the source. Hex-encoded, the row
+		// is storable.
+		{"binary PK bytes hex-encoded when not valid UTF-8", []metadata.ColumnMeta{{Name: "id"}},
+			map[string]any{"id": []byte{0xB2, 0x81}}, "0xB281"},
+		// A full BINARY(16) PK — the shape reported in #1132 (MD5/binary UUID).
+		// 0x5C is a literal backslash and 0x7C would be a pipe: hex-encoding
+		// runs BEFORE EscapePKValue, so the delimiter escaping is a no-op on a
+		// hex component. (The issue's error message shows the "\\" escape
+		// working on the raw form — the destination charset was the problem,
+		// not the escaping.)
+		{"binary(16) PK hex-encoded", []metadata.ColumnMeta{{Name: "k"}},
+			map[string]any{"k": []byte{
+				0xB2, 0x81, 0x5C, 0xC3, 0xC2, 0x00, 0xFF, 0x7C,
+				0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x80}},
+			"0xB2815CC3C200FF7C0102030405060780"},
+		// A composite PK mixing an int with unstorable bytes still joins on "|".
+		{"composite with binary component", []metadata.ColumnMeta{{Name: "a"}, {Name: "b"}},
+			map[string]any{"a": 7, "b": []byte{0xFF, 0xFE}}, "7|0xFFFE"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

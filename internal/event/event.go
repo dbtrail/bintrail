@@ -11,6 +11,7 @@
 package event
 
 import (
+	"encoding/hex"
 	"fmt"
 	"reflect"
 	"sort"
@@ -169,6 +170,20 @@ func EscapePKValue(val string) string {
 // against a large production binlog_events table.
 const MaxPKValuesLen = 512
 
+// hexPKPrefix marks a PK component that formatPKValue hex-encoded because its
+// raw bytes are not storable in binlog_events.pk_values (#1132). "0x" is the
+// spelling MySQL itself uses for a binary literal, so the stored form is
+// reproducible from the source with SELECT CONCAT('0x', HEX(<pk_col>)) and can
+// be pasted straight into `--pk`.
+//
+// Note that hex DOUBLES the component's length against the MaxPKValuesLen
+// ceiling: a BINARY(16) UUID PK lands at 34 characters (fine), but a wide
+// VARBINARY or a wide composite binary PK can now exceed 512 and trip
+// indexer.checkPKValuesLength instead. That is the pre-existing wide-PK limit
+// (#944), not a new failure introduced here — it is just reachable by a
+// narrower set of PKs than the utf8mb4 rejection was.
+const hexPKPrefix = "0x"
+
 // formatPKValue renders a single PK value for BuildPKValues. []byte needs its
 // own case: since #756, metadata.MapRow hands back a BINARY/VARBINARY value as
 // []byte (routing it through marshalRow's base64-safe path instead of a raw Go
@@ -178,8 +193,41 @@ const MaxPKValuesLen = 512
 // raw bytes, which would silently change pk_hash/pk_values for every row with
 // such a PK. string(b) reproduces exactly what "%v" printed for that same
 // value before #756 (when it was still a raw Go string of the same bytes).
+//
+// #1132: raw bytes that are not valid UTF-8 cannot be stored at all —
+// binlog_events.pk_values is VARCHAR(512) CHARACTER SET utf8mb4, so MySQL
+// rejects the whole multi-row INSERT with error 1366 and, because a batch
+// failure is fail-loud by contract (see internal/streamrun's flush, #652),
+// ONE table with a BINARY/VARBINARY PK takes the entire stream daemon down
+// and capture stops for every table in the source. Those bytes are therefore
+// hex-encoded (hexPKPrefix + uppercase hex, i.e. exactly what MySQL's own
+// CONCAT('0x', HEX(col)) produces, so an operator can reproduce a stored
+// pk_values straight from the source table and feed it back to --pk).
+//
+// The check is on CONTENT, not on the column's declared type, and that is
+// what makes this change strictly additive for the indexed-MySQL path: a
+// pk_values already in binlog_events is necessarily valid UTF-8 (invalid
+// bytes could never have been written), so no existing row's pk_values —
+// and therefore no existing pk_hash — changes spelling. Only values that
+// today kill the daemon get a new representation. (A non-strict sql_mode
+// index server would instead have stored a silently TRUNCATED prefix, whose
+// pk_hash never matched the full value anyway — see checkPKValuesLength's
+// comment; those rows were already unrecoverable, not working.)
+//
+// Residual, accepted ambiguity, same class as coerceTextEncoding's
+// latin1-that-is-coincidentally-valid-UTF-8 case and marshalRow's
+// looksLikeJSONContainer gate: a VARBINARY PK holding the literal ASCII text
+// "0xDEAD" is valid UTF-8, so it is stored verbatim and collides with the
+// encoding of the two raw bytes {0xDE,0xAD}. Distinguishing them would need a
+// type-gated rule (always hex a BINARY/VARBINARY column), which would change
+// the spelling of PK values that store and query correctly today — a real
+// regression traded for a contrived collision. Content-gating is the narrower
+// change and is the one taken.
 func formatPKValue(v any) string {
 	if b, ok := v.([]byte); ok {
+		if !utf8.Valid(b) {
+			return hexPKPrefix + strings.ToUpper(hex.EncodeToString(b))
+		}
 		return string(b)
 	}
 	return fmt.Sprintf("%v", v)
