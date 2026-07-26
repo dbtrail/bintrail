@@ -205,10 +205,10 @@ func (r *Recorder) Reset() {
 // Install registers a Recorder as the process-wide audit sink and removes it
 // when the test ends.
 //
-// The sink is a package-level variable in ext, so a test that installs one
-// must NOT call t.Parallel() — and neither may it drive a surface from
-// another goroutine (stand up handlers in-process rather than behind a
-// listener) or the swap races the reader under -race.
+// The sink is process-wide, so a test that installs one must NOT call
+// t.Parallel() — two parallel tests would observe each other's events. The
+// swap itself is atomic (ext keeps the sink behind an atomic.Pointer), so
+// driving a surface from another goroutine is race-safe.
 func Install(t *testing.T) *Recorder {
 	t.Helper()
 	rec := &Recorder{}

@@ -45,6 +45,42 @@ func TestRecordStampsTimeAndForwards(t *testing.T) {
 	}
 }
 
+type panicSink struct{}
+
+func (panicSink) Record(context.Context, AuditEvent) { panic("third-party sink exploded") }
+
+// TestRecordRecoversSinkPanic pins the docstring's claim: a sink cannot fail
+// a user's query. A panic in third-party sink code must be swallowed by
+// Record, never unwound into a caller whose artifact was already produced.
+func TestRecordRecoversSinkPanic(t *testing.T) {
+	SetAuditSink(panicSink{})
+	t.Cleanup(func() { SetAuditSink(nil) })
+
+	// Must not panic.
+	Record(context.Background(), AuditEvent{Surface: "cli", Action: "query.run"})
+}
+
+// TestAuditSinkSwapIsRaceSafe drives Record/Auditing concurrently with
+// SetAuditSink swaps — the audittest.Install pattern with a surface served on
+// another goroutine. Meaningful under -race (CI always runs it): the old
+// unsynchronized package var failed here.
+func TestAuditSinkSwapIsRaceSafe(t *testing.T) {
+	t.Cleanup(func() { SetAuditSink(nil) })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			Auditing()
+			Record(context.Background(), AuditEvent{Surface: "cli", Action: "query.run"})
+		}
+	}()
+	for range 1000 {
+		SetAuditSink(&captureSink{})
+		SetAuditSink(nil)
+	}
+	<-done
+}
+
 func TestProcessActor(t *testing.T) {
 	a := ProcessActor("")
 	if !strings.HasPrefix(a, "os:") || a == "os:" {

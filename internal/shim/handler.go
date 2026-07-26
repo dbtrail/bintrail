@@ -548,9 +548,13 @@ func (h *Handler) auditTimeTravel(q TimeTravelQuery, res *mysql.Result) {
 	if res != nil && res.Resultset != nil {
 		detail["rows"] = strconv.Itoa(len(res.Resultset.Values))
 	}
-	ctx := h.baseCtx
-	if ctx == nil {
-		ctx = context.Background()
+	// WithoutCancel: the resultset is already built by the time this runs,
+	// but baseCtx is the per-connection context, canceled on client
+	// disconnect and SIGTERM — a ctx-aware sink would drop exactly the
+	// records for reads aborted mid-response. Context values survive.
+	ctx := context.Background()
+	if h.baseCtx != nil {
+		ctx = context.WithoutCancel(h.baseCtx)
 	}
 	ext.Record(ctx, ext.AuditEvent{
 		Surface: "shim",

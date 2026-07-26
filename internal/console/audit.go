@@ -1,6 +1,7 @@
 package console
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/dbtrail/dbtrail/ext"
@@ -13,16 +14,28 @@ import (
 // reads like a session whose identity went missing.
 const tokenActor = "token"
 
-// consoleActor is the audit identity of one HTTP request: the session's
-// verified login identity when the request carries a session, otherwise
-// tokenActor. The console is a network surface with real authentication, so —
-// like the shim — it records its authenticated user, never ext.ProcessActor
-// (the daemon's OS owner says nothing about who made the request).
+// sessionUnidentifiedActor is the audit identity of a session-authenticated
+// request whose issuer minted the session with no identity (identityFrom
+// returns ""). Recording it as tokenActor would claim the shared automation
+// token was used when it was not; this sentinel is honest about not knowing,
+// mirroring the shim's "mysql:unbound".
+const sessionUnidentifiedActor = "session:unidentified"
+
+// consoleActor is the audit identity of one HTTP request, decided by which
+// credential authenticated it (authKindFrom, stamped by tokenMiddleware): a
+// session records its verified login identity (or sessionUnidentifiedActor
+// when the session carries none), anything else records tokenActor. The
+// console is a network surface with real authentication, so — like the shim —
+// it records its authenticated user, never ext.ProcessActor (the daemon's OS
+// owner says nothing about who made the request).
 func consoleActor(r *http.Request) string {
+	if authKindFrom(r.Context()) != authKindSession {
+		return tokenActor
+	}
 	if id := identityFrom(r.Context()); id != "" {
 		return id
 	}
-	return tokenActor
+	return sessionUnidentifiedActor
 }
 
 // recordConsoleAccess emits one historical-data-access or
@@ -47,7 +60,12 @@ func recordConsoleAccess(r *http.Request, action, schema, table string, detail m
 	if id := r.Header.Get(serverHeader); id != "" {
 		detail["server"] = id
 	}
-	ext.Record(r.Context(), ext.AuditEvent{
+	// WithoutCancel: by the time this runs the rows were already read and
+	// the response produced, but r.Context() dies with the client — a
+	// disconnect mid-flush would make a ctx-aware sink drop exactly the
+	// aborted-mid-response reads an auditor most wants to see. Context
+	// VALUES (trace IDs, tenant) are preserved.
+	ext.Record(context.WithoutCancel(r.Context()), ext.AuditEvent{
 		Surface: "console",
 		Action:  action,
 		Actor:   consoleActor(r),

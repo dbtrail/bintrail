@@ -2,6 +2,8 @@ package ext
 
 import (
 	"context"
+	"log/slog"
+	"sync/atomic"
 	"time"
 )
 
@@ -60,13 +62,22 @@ type AuditSink interface {
 	Record(ctx context.Context, ev AuditEvent)
 }
 
-// sink is nil in the OSS build — auditing is a no-op.
-var sink AuditSink
+// sink holds the installed AuditSink; unset in the OSS build — auditing is
+// a no-op. Atomic because the shim reads it once per client round trip from
+// every connection goroutine while audittest.Install swaps it at test time;
+// the atomic load costs nothing on that hot path.
+var sink atomic.Pointer[AuditSink]
 
 // SetAuditSink installs the process-wide audit sink. Call once from
-// main() before command dispatch.
+// main() before command dispatch. The swap is atomic, so a test that
+// installs a sink may drive a surface from another goroutine without
+// racing concurrent Auditing/Record readers.
 func SetAuditSink(s AuditSink) {
-	sink = s
+	if s == nil {
+		sink.Store(nil)
+		return
+	}
+	sink.Store(&s)
 }
 
 // Auditing reports whether a sink is installed. Call it before BUILDING
@@ -75,22 +86,31 @@ func SetAuditSink(s AuditSink) {
 // its callers assemble is a real allocation the OSS build would pay for
 // nothing. Off the hot path, just call Record.
 func Auditing() bool {
-	return sink != nil
+	return sink.Load() != nil
 }
 
 // Record forwards an event to the installed sink, stamping Time when
 // unset. Safe to call with no sink installed.
 //
 // Recording is a side channel: Record returns nothing and AuditSink.Record
-// returns nothing, so a sink cannot fail a user's query by construction.
-// Call it on the success path, after the artifact the operator asked for
-// has been produced.
+// returns nothing, so a sink cannot fail a user's query by construction —
+// and a panicking sink is recovered here (logged at debug, event dropped),
+// so third-party sink code cannot unwind into a caller whose artifact was
+// already produced. Call it on the success path, after the artifact the
+// operator asked for has been produced.
 func Record(ctx context.Context, ev AuditEvent) {
-	if sink == nil {
+	s := sink.Load()
+	if s == nil {
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Debug("ext: audit sink panicked; event dropped",
+				"panic", r, "surface", ev.Surface, "action", ev.Action)
+		}
+	}()
 	if ev.Time.IsZero() {
 		ev.Time = time.Now().UTC()
 	}
-	sink.Record(ctx, ev)
+	(*s).Record(ctx, ev)
 }

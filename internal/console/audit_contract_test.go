@@ -206,16 +206,119 @@ func TestAuditContract_ConsoleSilentOnRefusal(t *testing.T) {
 	}
 }
 
-// TestAuditContract_ConsoleActorFallsBackToToken documents the identity
-// vocabulary: a session request records its verified login, a static-token
-// request records the token sentinel — never "".
-func TestAuditContract_ConsoleActorFallsBackToToken(t *testing.T) {
-	r := httptest.NewRequest("GET", "/api/events", nil)
-	if got := consoleActor(r); got != tokenActor {
-		t.Errorf("consoleActor(no session) = %q, want %q", got, tokenActor)
+// TestAuditContract_ConsoleActorAttribution documents the identity
+// vocabulary, driven through the real tokenMiddleware (the production code
+// that stamps authKind/identity into the context): a static-token request
+// records the token sentinel, a session records its verified login, and a
+// session minted with NO identity records the session-unidentified sentinel —
+// never "" and never "token", which would claim the shared automation token
+// was used when it was not (#1122).
+func TestAuditContract_ConsoleActorAttribution(t *testing.T) {
+	srv, err := New(Config{
+		Listen: "127.0.0.1:8090", Token: "static-tok",
+		AuthPath: filepath.Join(t.TempDir(), "auth.yaml"),
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	withID := r.WithContext(context.WithValue(r.Context(), identityCtxKey{}, "ana@example.com"))
-	if got := consoleActor(withID); got != "ana@example.com" {
-		t.Errorf("consoleActor(session) = %q, want the verified identity", got)
+	full := &ext.AccessPolicy{Permissions: ext.AllPermissions()}
+	withID, _, err := srv.sessions.IssueWithPolicy("ana@example.com", full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noID, _, err := srv.sessions.IssueWithPolicy("", full)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		bearer string
+		want   string
+	}{
+		{"static token", "static-tok", tokenActor},
+		{"session with identity", withID, "ana@example.com"},
+		{"session without identity", noID, sessionUnidentifiedActor},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := "(handler never reached)"
+			probe := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = consoleActor(r)
+			})
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest("GET", "/api/events", nil)
+			r.Header.Set("Authorization", "Bearer "+tc.bearer)
+			srv.tokenMiddleware(probe).ServeHTTP(w, r)
+			if w.Code != http.StatusOK {
+				t.Fatalf("middleware refused the request: code=%d body=%s", w.Code, w.Body.String())
+			}
+			if got != tc.want {
+				t.Errorf("consoleActor = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// panickingSink is third-party (EE) sink code at its worst.
+type panickingSink struct{}
+
+func (panickingSink) Record(context.Context, ext.AuditEvent) { panic("EE sink exploded") }
+
+// TestAuditContract_ConsoleSinkPanicCannotFailRequest drives the real events
+// handler with a sink that panics: the response the operator asked for was
+// already produced, so the panic must die inside ext.Record — the request
+// still completes with a 200 and the full body (#1122).
+func TestAuditContract_ConsoleSinkPanicCannotFailRequest(t *testing.T) {
+	ext.SetAuditSink(panickingSink{})
+	t.Cleanup(func() { ext.SetAuditSink(nil) })
+
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+	mock.ExpectQuery("FROM binlog_events").WillReturnRows(auditEventRow(t))
+	s := newBootServer(db)
+	w := httptest.NewRecorder()
+	s.handleEvents(w, httptest.NewRequest("GET", "/api/events?schema=app&table=users", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("a panicking audit sink failed the request: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"users"`) {
+		t.Errorf("response body truncated by the sink panic: %s", w.Body.String())
+	}
+}
+
+// ctxObservingSink records whether the context handed to the sink was
+// already dead — what a realistic ctx-aware EE sink (HTTP POST, DB insert)
+// keys its I/O on.
+type ctxObservingSink struct {
+	events  int
+	ctxErrs []error
+}
+
+func (s *ctxObservingSink) Record(ctx context.Context, _ ext.AuditEvent) {
+	s.events++
+	s.ctxErrs = append(s.ctxErrs, ctx.Err())
+}
+
+// TestAuditContract_ConsoleRecordSurvivesCanceledRequest pins fix #2 of
+// #1122: recordConsoleAccess fires after the rows were already read, so a
+// client disconnect (r.Context() canceled) must not hand the sink a dead
+// context — those aborted-mid-response reads are exactly the population an
+// auditor wants recorded.
+func TestAuditContract_ConsoleRecordSurvivesCanceledRequest(t *testing.T) {
+	sink := &ctxObservingSink{}
+	ext.SetAuditSink(sink)
+	t.Cleanup(func() { ext.SetAuditSink(nil) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the client is gone before the emission fires
+	r := httptest.NewRequest("GET", "/api/events?schema=app&table=users", nil).WithContext(ctx)
+	recordConsoleAccess(r, "query.run", "app", "users", nil)
+
+	if sink.events != 1 {
+		t.Fatalf("recorded %d events, want 1", sink.events)
+	}
+	if sink.ctxErrs[0] != nil {
+		t.Errorf("sink saw a canceled context (%v); a ctx-aware sink would drop the record", sink.ctxErrs[0])
 	}
 }

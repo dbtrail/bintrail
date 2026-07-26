@@ -7,6 +7,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/audittest"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -176,6 +177,45 @@ func TestAuditContract_ShimSilentOnRefusal(t *testing.T) {
 	}
 	if evs := rec.Events(); len(evs) != 0 {
 		t.Errorf("a refused query recorded %d audit events, want 0: %+v", len(evs), evs)
+	}
+}
+
+// disconnectObservingSink records whether the context handed to the sink was
+// already dead — what a ctx-aware EE sink (HTTP POST, DB insert) keys on.
+type disconnectObservingSink struct {
+	events  int
+	ctxErrs []error
+}
+
+func (s *disconnectObservingSink) Record(ctx context.Context, _ ext.AuditEvent) {
+	s.events++
+	s.ctxErrs = append(s.ctxErrs, ctx.Err())
+}
+
+// TestAuditContract_ShimRecordSurvivesDisconnect pins fix #2 of #1122: the
+// emission fires after the resultset was built, so a canceled per-connection
+// context (client disconnect / SIGTERM, see BindConnContext) must not hand
+// the sink a dead context — those aborted-mid-response reads are exactly the
+// records an auditor wants.
+func TestAuditContract_ShimRecordSurvivesDisconnect(t *testing.T) {
+	sink := &disconnectObservingSink{}
+	ext.SetAuditSink(sink)
+	t.Cleanup(func() { ext.SetAuditSink(nil) })
+
+	h := auditHandler(t)
+	h.BindActor("tenant_a")
+	ctx, cancel := context.WithCancel(context.Background())
+	h.BindConnContext(ctx)
+	cancel() // the client disconnected after the resultset was built
+
+	q := TimeTravelQuery{Type: TypeFlashback, Schema: "myapp", Table: "orders", PKColumn: "id", PKValue: "1"}
+	h.auditTimeTravel(q, nil)
+
+	if sink.events != 1 {
+		t.Fatalf("recorded %d events, want 1", sink.events)
+	}
+	if sink.ctxErrs[0] != nil {
+		t.Errorf("sink saw a canceled context (%v); a ctx-aware sink would drop the record", sink.ctxErrs[0])
 	}
 }
 
