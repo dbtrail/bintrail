@@ -117,20 +117,22 @@ func TestPGWire_PostgresSourceRoundTrip(t *testing.T) {
 	qctx, qcancel := context.WithTimeout(ctx, 10*time.Second)
 	defer qcancel()
 
-	// Anchor AS OF to the row's OWN stored event_timestamp, NOT 'now'. The index
-	// persists event_timestamp as DATETIME(0), so MySQL ROUNDS a row event's
-	// sub-second commit time to the nearest second (e.g. …06.885 → …07) — the
-	// stored value can sit up to a second AHEAD of the true commit instant. The
-	// reconstruct bounds the window at `event_timestamp <= AsOf`, so `AS OF 'now'`
-	// (time.Now(), fractional) excludes the just-committed row for the sub-second
-	// window before the wall clock crosses that rounded second — a timing flake on
-	// this immediate write-then-read (reproduces ~75% of the time on a fast host,
-	// as "pgwire query returned no row"). A far-future AS OF would dodge that but
-	// trips gap-detection (an AS OF past the retained history is rejected). Using
-	// the stored timestamp itself is inside coverage AND >= the event by
-	// construction, so it includes the row deterministically while exercising the
-	// identical capture → index → pgwire → reconstruct path. (Whether `AS OF 'now'`
-	// should exclude a row that exists "now" is a separate product question, #1025.)
+	// Anchor AS OF to the row's OWN stored event_timestamp, NOT 'now'. This began
+	// as a workaround for #1025: event_timestamp is DATETIME(0) and MySQL used to
+	// ROUND a row event's sub-second commit time UP (…06.885 → …07), so the stored
+	// value could sit up to a second AHEAD of the true commit instant. Reconstruct
+	// bounds the window at `event_timestamp <= AsOf`, so `AS OF 'now'` (time.Now(),
+	// fractional) excluded the just-committed row until the wall clock crossed that
+	// rounded second — a ~75% flake on a fast host, as "pgwire query returned no
+	// row". #1025 fixed that at the WRITE side: the indexer now floors instead of
+	// letting MySQL round (indexer.insertBatch, guarded by
+	// TestInsertBatch_subSecondTimestampFloors), so stored <= true commit time and
+	// that exclusion can no longer happen. The anchor stays because it is
+	// deterministic irrespective of capture timing: the stored timestamp is inside
+	// coverage AND >= the event by construction, and it exercises the identical
+	// capture → index → pgwire → reconstruct path. (A far-future AS OF would also
+	// have dodged the original flake, but trips gap-detection — an AS OF past the
+	// retained history is rejected.)
 	var asOf string
 	if err := indexDB.QueryRow("SELECT MAX(event_timestamp) FROM binlog_events WHERE table_name = ?", tbl).Scan(&asOf); err != nil {
 		t.Fatalf("read latest event_timestamp: %v", err)

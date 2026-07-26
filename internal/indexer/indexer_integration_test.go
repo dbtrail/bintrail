@@ -236,12 +236,10 @@ func TestInsertBatch_maxBatchSize(t *testing.T) {
 }
 
 // TestInsertBatch_subSecondTimestampFloors pins #1025: a sub-second event time
-// must FLOOR into event_timestamp's DATETIME(0), not round. MySQL's default
-// sql_mode rounds .900 up to the next second, which would store the event ~0.1s
-// AHEAD of when it happened — and `AS OF 'now'` (a fractional time.Now()) would
-// then evaluate `event_timestamp <= now` as false and omit a row that already
-// exists. The .900 fraction is load-bearing: with a fraction below .500 MySQL
-// already truncates and the test would pass with or without the fix.
+// must FLOOR into event_timestamp's DATETIME(0), not round — see the bind site
+// in insertBatch for why. The .900 fraction is load-bearing: MySQL rounds to the
+// NEAREST second, so any fraction below .500 rounds DOWN, landing on the same
+// value the fix produces, and the test would pass with or without it.
 func TestInsertBatch_subSecondTimestampFloors(t *testing.T) {
 	db, _ := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)

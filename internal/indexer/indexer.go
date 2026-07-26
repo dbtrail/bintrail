@@ -218,15 +218,22 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 			ev.BinlogFile,
 			ev.StartPos,
 			ev.EndPos,
-			// FLOOR, never round, into event_timestamp's DATETIME(0) (#1025).
-			// MySQL's default sql_mode ROUNDS a bound sub-second fraction, so an
-			// event committed at …06.885 would be stored as …07 — up to a second
-			// AHEAD of its true time, and `AS OF 'now'` (fractional) would then
-			// evaluate `07 <= …06.885` as false and omit a row that already
-			// exists. Truncating here keeps the invariant every
-			// `event_timestamp <= X` comparison in the query path assumes:
-			// stored <= true event time < stored + 1s. No-op for MySQL/MariaDB
-			// sources (binlog event headers are whole seconds already); it is
+			// FLOOR into event_timestamp's DATETIME(0) — never let MySQL round
+			// (#1025). The default sql_mode rounds a bound sub-second fraction to
+			// the NEAREST second, so an event committed at …06.885 was stored as
+			// …07 (up to 0.5s AHEAD of its true time, approached as the fraction
+			// nears .500) and `AS OF 'now'` (fractional) then evaluated
+			// `07 <= …06.885` as false, omitting a row that already existed.
+			// Flooring gives stored <= true event time < stored + 1s. The cost is
+			// the mirror image, bounded by that same second: the event now also
+			// answers `event_timestamp <= …06.500`, and a `Since` of …06.885 no
+			// longer sees it. Rounding already did exactly that to every fraction
+			// below .500 — flooring makes the skew uniform instead of half-and-half,
+			// and the Since/Until bounds the query path actually receives (baseline
+			// anchors, the keyset cursor, shim literals) are second-granular.
+			// Correct ONLY while the column is DATETIME(0) (see schema.go):
+			// widening it makes this line silent data loss. No-op for MySQL and
+			// MariaDB, whose parsers build Timestamp from time.Unix(sec, 0); it is
 			// the Postgres capturer's microsecond commit time that this bites.
 			ev.Timestamp.Truncate(time.Second),
 			nullOrString(ev.GTID),
