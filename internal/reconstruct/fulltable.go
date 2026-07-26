@@ -1421,8 +1421,13 @@ func reconstructBinlogOnly(
 // of the identifier executing as SQL. That matters despite the body telling the
 // operator to create the table themselves — this text occupies the
 // <db>.<table>-schema.sql slot that myloader applies, so ANY non-comment line in
-// it runs. As at the AUTO_INCREMENT block, there is no executable sibling here
-// carrying the exact bytes; the comment is the whole artifact.
+// it runs.
+//
+// There is no executable sibling here carrying the exact bytes: the comment is
+// the whole artifact, and the operator's task is precisely to read the name off
+// it. That is why SanitizeForComment renders losslessly rather than flattening —
+// the name a break-bearing table shows up under stays recoverable from the text,
+// instead of silently becoming a different, plausible-looking one.
 func binlogOnlySchemaPlaceholder(schema, table string) string {
 	schema, table = recovery.SanitizeForComment(schema), recovery.SanitizeForComment(table)
 	return fmt.Sprintf(

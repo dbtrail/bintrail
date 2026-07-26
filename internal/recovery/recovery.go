@@ -483,12 +483,10 @@ func (g *Generator) writeAutoIncrementSection(w io.Writer, touched map[string]bo
 		//
 		// Unlike the header above, this block has no executable sibling carrying
 		// the exact bytes — the two commented statements ARE the deliverable, and
-		// the operator is told to uncomment and run them. A flattened identifier
-		// therefore reaches an ALTER the operator may execute; it fails loud there
-		// (ERROR 1146) instead of hitting the intended table, which is why
-		// flattening still beats leaving the injection open. MySQL has no escape
-		// for a line break inside a backtick identifier, so no rendering here is
-		// both single-line and runnable.
+		// the operator is told to uncomment and run them. For such a table the
+		// quoted rendering is not runnable as written, which is the intended
+		// outcome: it stops at a syntax error the operator must read, rather than
+		// naming a different table that might exist. See SanitizeForComment.
 		qualified := SanitizeForComment(QuoteName(schema) + "." + QuoteName(table))
 		fmt.Fprintln(w, "--")
 		fmt.Fprintf(w, "-- %s:\n", qualified)
@@ -1376,25 +1374,35 @@ func QuoteName(name string) string {
 // line break is legal inside a quoted identifier in either dialect, while inside
 // a VARCHAR primary key it is ordinary data.
 //
-// The substitution is LOSSY, and refusing outright would instead deny recovery to
-// a table that is merely oddly named. How much is lost varies BY SITE, so do not
-// read this as a blanket "only the annotation degrades" guarantee:
+// A value holding a break is rendered with strconv.Quote, which is LOSSLESS
+// (reversible via strconv.Unquote) and provably single-line — it escapes every
+// non-printable, U+2028/U+2029 included. Flattening the break to a space is the
+// obvious alternative and is worse: it makes "a\nb" and the perfectly ordinary
+// value "a b" indistinguishable, so an operator who copies a mangled PK into a
+// follow-up WHERE gets zero rows — and mid-incident, zero rows reads as "the row
+// is already gone", the opposite of the truth. The surrounding quotes are
+// themselves the signal that the rendering is escaped, so no separate marker is
+// needed. Refusing outright would instead deny recovery to a table that is merely
+// oddly named.
 //
-//   - Per-event header, cascade preamble: an executable statement rendered from
-//     the same value sits beside the comment and keeps every byte (quoteName /
-//     EscapeString are untouched by this). Only the annotation degrades.
-//   - AUTO_INCREMENT block, reconstruct's binlog-only schema placeholder: there
-//     is NO executable sibling — the commented text is itself the artifact. A
-//     flattened identifier there fails loud when applied (MySQL ERROR 1146,
-//     "table doesn't exist") rather than silently acting on the intended table.
+// A value with no break is returned unchanged, so ordinary scripts stay
+// byte-identical and every golden-output test in this package still holds;
+// TestSanitizeForComment_lineBreakForms pins that identity case.
+//
+// The quoted form is deliberately NOT valid SQL to uncomment. At the two sites
+// where the commented text is itself the artifact — the AUTO_INCREMENT block
+// below and reconstruct's binlog-only schema placeholder — that is the safer
+// failure. MySQL has no escape for a line break inside a backtick identifier, so
+// no rendering there can be both faithful and runnable, and a syntax error the
+// operator must look at beats an identifier that silently reads as a different,
+// possibly existing, table.
 //
 // Callers apply this where a value meets a "--", never to the value itself.
-// TestSanitizeForComment_lineBreakForms pins the identity case, on which every
-// golden-output test in this package depends.
 func SanitizeForComment(s string) string {
-	s = strings.ReplaceAll(s, "\r", " ")
-	s = strings.ReplaceAll(s, "\n", " ")
-	return s
+	if !strings.ContainsAny(s, "\r\n") {
+		return s
+	}
+	return strconv.Quote(s)
 }
 
 // ─── Dialect dispatch (#533) ───────────────────────────────────────────────────

@@ -689,8 +689,8 @@ func TestEmitSQL_commentInjectionCannotEscapeThePreamble(t *testing.T) {
 		// Positive anchor: the flattened identifier must actually be in the
 		// preamble, or an empty/identifier-free preamble would satisfy the
 		// comment-only loop below without exercising anything.
-		if !strings.Contains(preamble, "shop.or ders") {
-			t.Errorf("combined=%v: preamble must name the table, space-substituted, got:\n%s", combined, preamble)
+		if !strings.Contains(preamble, `shop."or\nders"`) {
+			t.Errorf("combined=%v: preamble must name the table, losslessly escaped, got:\n%s", combined, preamble)
 		}
 		for _, line := range strings.Split(preamble, "\n") {
 			trimmed := strings.TrimSpace(line)

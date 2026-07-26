@@ -151,8 +151,8 @@ func TestCommentInjection_PKNewlineCannotEscapeTheHeaderComment(t *testing.T) {
 	// exercises the vector would report success. Asserting the SANITIZED form
 	// also pins the other half of the contract: the value is still there, only
 	// flattened.
-	if !strings.Contains(out, "pk=1 DROP TABLE users; at ") {
-		t.Fatalf("header must still carry the PK, space-substituted, got:\n%s", out)
+	if !strings.Contains(out, `pk="1\nDROP TABLE users;" at `) {
+		t.Fatalf("header must still carry the PK, losslessly escaped, got:\n%s", out)
 	}
 
 	// Every statement an ordinary MySQL reversal script is allowed to contain.
@@ -210,12 +210,12 @@ func TestCommentInjection_HeaderLineSurvivesLineBreaksInEveryField(t *testing.T)
 		t.Fatalf("the header must render as exactly 1 line, got %d:\n%s", len(headers), out)
 	}
 	for _, want := range []string{
-		"on d b.or ders pk=",
-		"pk=1 DROP TABLE users; at ",
-		"gtid=3e11fa47-71ca-11e1-9e33-c80aa9429562:1 DROP TABLE audit;",
+		`on "d\rb"."or\nders" pk=`,
+		`pk="1\nDROP TABLE users;" at `,
+		`gtid="3e11fa47-71ca-11e1-9e33-c80aa9429562:1\nDROP TABLE audit;"`,
 	} {
 		if !strings.Contains(headers[0], want) {
-			t.Errorf("header line must contain %q (space-substituted), got:\n%s", want, headers[0])
+			t.Errorf("header line must contain %q (losslessly escaped), got:\n%s", want, headers[0])
 		}
 	}
 }
@@ -226,10 +226,16 @@ func TestCommentInjection_HeaderLineSurvivesLineBreaksInEveryField(t *testing.T)
 // (the property the existing golden-output tests rely on).
 func TestSanitizeForComment_lineBreakForms(t *testing.T) {
 	for _, tc := range []struct{ name, in, want string }{
-		{"lf", "a\nb", "a b"},
-		{"cr", "a\rb", "a b"},
-		{"crlf", "a\r\nb", "a  b"}, // two breaks -> two spaces; never rejoined
-		{"none", "orders", "orders"},
+		{"lf", "a\nb", `"a\nb"`},
+		{"cr", "a\rb", `"a\rb"`},
+		{"crlf", "a\r\nb", `"a\r\nb"`},
+		// U+2028 ALONE is left untouched deliberately: it terminates a "--"
+		// comment in neither lexer, so quoting it would churn legitimate data.
+		// Once a real terminator makes the helper fire, strconv.Quote escapes it
+		// too — the emitted line is then single-line under any definition.
+		{"line separator alone", "a\u2028b", "a\u2028b"},
+		{"line separator with lf", "a\u2028\nb", `"a\u2028\nb"`},
+		{"none", "orders", "orders"}, // identity: golden output depends on this
 		{"empty", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
