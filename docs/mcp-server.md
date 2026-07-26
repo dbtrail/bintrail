@@ -232,6 +232,10 @@ both accept:
 - `profile` — RBAC table-deny + column-redaction
 - `no_archive` — disable Parquet archive auto-routing (see below)
 
+The `pk` parameter takes the stored `pk_values` spelling — for a binary PK
+whose bytes are not valid UTF-8 that is `0x` + uppercase hex, see
+[Binary primary keys](query-and-recovery.md#binary-primary-keys-the-0x-hex-spelling).
+
 `query` additionally takes `format` (`json`, `table`, or `csv`). Time values
 (`since` / `until`) accept MySQL datetime (`2006-01-02 15:04:05`), RFC 3339, or
 date-only (`2006-01-02`) — the same formats as the CLI.

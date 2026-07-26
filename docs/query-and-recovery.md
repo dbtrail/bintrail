@@ -17,7 +17,47 @@ Filters: `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`,
 `--column-eq` (events where a column has a given value — see below), and
 `--flag` (tables/columns labeled via [RBAC flags](server-identity.md)). A
 `--pk` lookup is fast and collision-safe — it matches a hash of the PK values
-plus the exact values.
+plus the exact values. Binary primary keys need a special spelling — see
+[the `0x` hex spelling](#binary-primary-keys-the-0x-hex-spelling) below.
+
+### Binary primary keys: the `0x` hex spelling
+
+A primary-key value whose bytes are **not valid UTF-8** — the typical case is
+a `BINARY`/`VARBINARY` PK such as a binary UUID, but a `BLOB` or latin1 `TEXT`
+prefix PK can land here too — is stored in `pk_values` as `0x` followed by
+**uppercase** hex. To look such a row up, pass that exact form to `--pk` (or
+`--pks`); the plain bytes will not match. This applies to `query`, `recover`,
+and `recover-cascade`.
+
+The spelling is deliberately identical to MySQL's own binary-literal syntax,
+so you can produce it straight from the source table:
+
+```sql
+SELECT CONCAT('0x', HEX(pk_col)) FROM app.t_pk_binary WHERE ...;
+```
+
+```sh
+bintrail recover --index-dsn "..." \
+  --schema app --table t_pk_binary \
+  --pk 0xB2815CC3C200FF7C0102030405060780 --dry-run
+```
+
+Three things to know:
+
+- **The `0x` form is content-dependent, not type-dependent.** A binary column
+  whose bytes happen to be valid UTF-8 (e.g. one holding ASCII text) is stored
+  **verbatim**, not hexed — so the `HEX()` recipe above is only right when the
+  raw bytes were unstorable. When in doubt, run `bintrail query` on the table
+  and copy the row's `pk_values` exactly as displayed; the stored spelling is
+  always the one that matches.
+- **Uppercase matters, especially with `--pks`.** The stored form is uppercase
+  hex, and the `--pks` filter (like the Parquet archive path) matches the
+  stored string byte-for-byte with no hash-based guard — `0xab...` will not
+  find a row stored as `0xAB...`. Type the hex exactly as `HEX()` prints it.
+- **Baseline-anchored `verify` and `reconstruct` do not support these PK
+  types** (binary/BLOB PKs are outside `reconstruct`'s supported PK set), so
+  the `0x` spelling helps with `query`/`recover`/`recover-cascade` but does
+  not unlock point-in-time reconstruction for such tables.
 
 ### `--column-eq` Filter
 
@@ -390,6 +430,8 @@ To reverse a specific set of primary keys, pass `--pks` (comma-separated) instea
 of a single `--pk`, and cap how many events are undone per key with
 `--limit-per-pk`. These compose with the shared event filters
 (`--schema`/`--table`/`--event-type`/`--since`/`--until`/`--column-eq`/`--gtid`/`--flag`).
+For binary primary keys, each entry must use the stored `0x` uppercase-hex
+spelling — see [the `0x` hex spelling](#binary-primary-keys-the-0x-hex-spelling).
 
 **PostgreSQL sources:** when the source is PostgreSQL, `recover` emits
 PostgreSQL-dialect reversal SQL (double-quoted identifiers and string/boolean literals) rather than

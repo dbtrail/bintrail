@@ -267,6 +267,11 @@ bintrail query \
   --pk        '12345|2'
 ```
 
+For a `BINARY`/`VARBINARY` primary key whose bytes are not valid UTF-8, pass
+the stored `0x` + uppercase-hex spelling (reproducible from the source with
+`SELECT CONCAT('0x', HEX(pk_col))`) — see
+[Binary primary keys](query-and-recovery.md#binary-primary-keys-the-0x-hex-spelling).
+
 Results are in chronological order — you can trace the full lifecycle of the row from INSERT through every UPDATE to the final state (or DELETE).
 
 **Export a full audit record:**
