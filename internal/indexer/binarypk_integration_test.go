@@ -3,6 +3,7 @@
 package indexer
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -99,16 +100,59 @@ func TestInsertBatch_binaryPrimaryKey(t *testing.T) {
 		t.Errorf("stored pk_values = %q, want %q", got, wantPK)
 	}
 
-	// The stored form must be reproducible from the source table, which is the
+	// The stored form must be reproducible FROM THE SOURCE TABLE, which is the
 	// whole reason for the "0x" + uppercase-HEX spelling: an operator can run
 	// SELECT CONCAT('0x', HEX(k)) on the source and paste the result into --pk.
-	var mysqlSpelling string
-	if err := db.QueryRow(`SELECT CONCAT('0x', HEX(?))`, keyBytes).Scan(&mysqlSpelling); err != nil {
-		t.Fatalf("HEX() probe: %v", err)
+	//
+	// HEX() must be applied to a real BINARY(16) COLUMN, not to a placeholder
+	// parameter: `SELECT CONCAT('0x', HEX(?))` hexes whatever the driver
+	// transmits under whatever charset the server types the expression as,
+	// which is a different code path from the operator affordance being
+	// claimed here — it could pass for a reason unrelated to the claim.
+	testutil.MustExec(t, db, `CREATE TABLE t_pk_binary_src (k BINARY(16) NOT NULL PRIMARY KEY)`)
+	testutil.MustExec(t, db, `INSERT INTO t_pk_binary_src (k) VALUES (?)`, keyBytes)
+	var sourceSpelling string
+	if err := db.QueryRow(`SELECT CONCAT('0x', HEX(k)) FROM t_pk_binary_src`).Scan(&sourceSpelling); err != nil {
+		t.Fatalf("HEX() probe on a real BINARY(16) column: %v", err)
 	}
-	if mysqlSpelling != wantPK {
-		t.Errorf("stored pk_values %q does not match MySQL's own CONCAT('0x', HEX(k)) = %q",
-			wantPK, mysqlSpelling)
+	if sourceSpelling != wantPK {
+		t.Errorf("stored pk_values %q does not match the source table's CONCAT('0x', HEX(k)) = %q "+
+			"— an operator could not reproduce the stored key to feed it back to --pk", wantPK, sourceSpelling)
+	}
+
+	// pk_values is utf8mb4 with a case-INSENSITIVE collation, so "0xAB…" and
+	// "0xab…" compare EQUAL on that column alone. The uppercase spelling is
+	// therefore load-bearing, and the pk_hash half of the predicate is what
+	// actually disambiguates (SHA2 is byte-exact). Insert the lowercase
+	// spelling as a second row and pin that the AND-predicate still resolves
+	// to exactly the uppercase one — if a future change ever let a second
+	// producer emit lowercase hex, this is the silent wrong-row/zero-row
+	// failure it would cause.
+	lower := "0x" + strings.ToLower(wantPK[2:])
+	if _, err := idx.InsertBatch([]event.Event{{
+		BinlogFile: "binlog.000001", StartPos: 300, EndPos: 400,
+		Timestamp: ts, Schema: "mydb", Table: "t_pk_binary",
+		EventType: event.EventDelete, PKValues: lower,
+		RowBefore: map[string]any{"k": lower},
+	}}); err != nil {
+		t.Fatalf("InsertBatch of the lowercase spelling: %v", err)
+	}
+	var matched int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM binlog_events WHERE pk_values = ?`, pkValues).Scan(&matched); err != nil {
+		t.Fatalf("collation probe: %v", err)
+	}
+	if matched != 2 {
+		t.Fatalf("pk_values = ? matched %d rows, want 2 — the premise of this check is that the "+
+			"column's collation is case-insensitive; if it is not, the pk_hash guard below is untested", matched)
+	}
+	if err := db.QueryRow(
+		`SELECT pk_values FROM binlog_events WHERE pk_hash = SHA2(?, 256) AND pk_values = ?`,
+		pkValues, pkValues).Scan(&got); err != nil {
+		t.Fatalf("pk_hash failed to disambiguate two case-variant pk_values: %v", err)
+	}
+	if got != wantPK {
+		t.Errorf("AND-predicate resolved to %q, want the uppercase %q", got, wantPK)
 	}
 }
 
