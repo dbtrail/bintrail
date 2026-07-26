@@ -104,6 +104,9 @@ func loadEnvFile() {
 // Variables already set in the environment are not overwritten.
 func parseAndSetEnv(data string) {
 	scanner := bufio.NewScanner(strings.NewReader(data))
+	// Allow long values (base64 keys, DSN lists): the default 64KiB token
+	// limit would abort the scan silently. See scanner.Err() check below.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || line[0] == '#' {
@@ -129,6 +132,9 @@ func parseAndSetEnv(data string) {
 		if _, exists := os.LookupEnv(key); !exists {
 			os.Setenv(key, val)
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: stopped reading env file (%v): variables after this point were NOT loaded\n", err)
 	}
 }
 
