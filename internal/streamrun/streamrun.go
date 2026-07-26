@@ -367,6 +367,43 @@ func resetJumpDetail(old *streamState, flavor, mode, file string, pos uint32, gt
 		describeCheckpoint(mode, file, uint64(pos), gtidSet))
 }
 
+// classifyResetDiscard wraps resetJumpDetail with one refinement: a --reset
+// that discarded a POSITION-mode checkpoint and restarted in AUTO-DISCOVERED
+// GTID mode (the #1131 first-run path on a gtid_mode=ON source) always lands
+// in resetJumpDetail's cross-mode arm, which cannot compare coordinates and
+// so reports a jump — stamping gap_lost_at and printing "permanently lost"
+// even when the old checkpoint sits exactly at the source's current position,
+// i.e. nothing was skipped. That stamp is sticky: it permanently fails
+// `status --fail-on-gap` and degrades `verify --check recover` to
+// inconclusive, a false-alarm class worse than the noise it prevents.
+//
+// For exactly that combination (old.mode=="position", new mode=="gtid",
+// start point auto-discovered, not operator-specified) the source's current
+// binlog position is consulted: old == current ⇒ no-op, no stamp. On any
+// discovery error or coordinate inequality the conservative jump
+// classification stands — over-reporting a gap is recoverable review noise;
+// under-reporting one is silent data loss.
+func classifyResetDiscard(old *streamState, flavor, mode, file string, pos uint32, gtidSet string,
+	autoDiscovered bool, currentPosition func() (string, uint32, error),
+) (noop bool, detail string) {
+	noop, detail = resetJumpDetail(old, flavor, mode, file, pos, gtidSet)
+	if noop || !autoDiscovered || old.mode != "position" || mode != "gtid" || currentPosition == nil {
+		return noop, detail
+	}
+	curFile, curPos, err := currentPosition()
+	if err != nil {
+		slog.Warn("could not read the source's current binlog position to refine the reset classification; keeping the conservative gap record",
+			"error", err)
+		return noop, detail
+	}
+	if old.binlogFile == curFile && old.binlogPos == uint64(curPos) {
+		slog.Info("reset switched position→GTID mode at the source's current coordinates; no events were skipped",
+			"file", curFile, "pos", curPos)
+		return true, ""
+	}
+	return noop, detail
+}
+
 // persistResetDiscard durably persists a --reset checkpoint discard once the
 // new start position is resolved. A jump is recorded exactly like an
 // unfillable-gap auto-advance: gap_lost stamp FIRST, then the fresh
@@ -1859,7 +1896,9 @@ func One(ctx context.Context, cfg Config) error {
 			serverID:   cfg.ServerID,
 			bintrailID: bintrailID,
 		}
-		noop, detail := resetJumpDetail(resetDiscarded, cfg.Flavor, mode, startFile, startPos, startGTIDStr)
+		noop, detail := classifyResetDiscard(resetDiscarded, cfg.Flavor, mode, startFile, startPos, startGTIDStr,
+			cfg.StartFile == "" && cfg.StartGTID == "",
+			func() (string, uint32, error) { return config.CurrentBinlogPosition(sourceDB) })
 		if err := persistResetDiscard(indexDB, fresh, noop, detail, cfg.Hooks); err != nil {
 			return err
 		}

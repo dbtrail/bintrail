@@ -1587,6 +1587,92 @@ func TestResolveStartWithAutoDiscover_gtidSkippedWhenSavedExists(t *testing.T) {
 	}
 }
 
+// ─── classifyResetDiscard ────────────────────────────────────────────────────
+
+// TestClassifyResetDiscard_positionToGTIDAtCurrentIsNoop verifies the
+// spurious-loss fix: --reset on a gtid_mode=ON source whose old checkpoint was
+// position mode, landing (via auto-discovery) exactly at the source's current
+// coordinates, is a NO-OP — no gap_lost stamp, no "permanently lost" banner.
+func TestClassifyResetDiscard_positionToGTIDAtCurrentIsNoop(t *testing.T) {
+	old := &streamState{mode: "position", binlogFile: "mysql-bin.000003", binlogPos: 2410667}
+	noop, detail := classifyResetDiscard(old, gomysql.MySQLFlavor,
+		"gtid", "", 0, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-77",
+		true,
+		func() (string, uint32, error) { return "mysql-bin.000003", 2410667, nil })
+	if !noop {
+		t.Errorf("expected noop=true when the old position checkpoint equals the source's current coordinates; detail=%q", detail)
+	}
+	if detail != "" {
+		t.Errorf("expected empty detail for a no-op, got %q", detail)
+	}
+}
+
+// TestClassifyResetDiscard_positionToGTIDGenuineJumpStamps verifies a real
+// jump (old checkpoint behind the source's current position) keeps the
+// conservative gap record.
+func TestClassifyResetDiscard_positionToGTIDGenuineJumpStamps(t *testing.T) {
+	old := &streamState{mode: "position", binlogFile: "mysql-bin.000002", binlogPos: 1000}
+	noop, detail := classifyResetDiscard(old, gomysql.MySQLFlavor,
+		"gtid", "", 0, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-77",
+		true,
+		func() (string, uint32, error) { return "mysql-bin.000003", 2410667, nil })
+	if noop {
+		t.Error("expected noop=false for a genuine position→GTID jump")
+	}
+	if !strings.Contains(detail, "permanently lost") {
+		t.Errorf("expected the permanent-loss detail, got %q", detail)
+	}
+}
+
+// TestClassifyResetDiscard_discoveryErrorKeepsConservativeStamp verifies that
+// when the source's current position cannot be read, the classification stays
+// conservative (stamp) rather than assuming a no-op.
+func TestClassifyResetDiscard_discoveryErrorKeepsConservativeStamp(t *testing.T) {
+	old := &streamState{mode: "position", binlogFile: "mysql-bin.000003", binlogPos: 2410667}
+	noop, _ := classifyResetDiscard(old, gomysql.MySQLFlavor,
+		"gtid", "", 0, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-77",
+		true,
+		func() (string, uint32, error) { return "", 0, errors.New("source unreachable") })
+	if noop {
+		t.Error("expected noop=false when the current position cannot be confirmed")
+	}
+}
+
+// TestClassifyResetDiscard_explicitStartGTIDNotRefined verifies an
+// operator-specified --start-gtid (autoDiscovered=false) never consults the
+// source: the operator chose the start point, so the cross-mode jump keeps
+// resetJumpDetail's conservative classification untouched.
+func TestClassifyResetDiscard_explicitStartGTIDNotRefined(t *testing.T) {
+	old := &streamState{mode: "position", binlogFile: "mysql-bin.000003", binlogPos: 2410667}
+	noop, _ := classifyResetDiscard(old, gomysql.MySQLFlavor,
+		"gtid", "", 0, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-77",
+		false,
+		func() (string, uint32, error) {
+			t.Error("currentPosition must not be consulted for an explicit --start-gtid")
+			return "", 0, nil
+		})
+	if noop {
+		t.Error("expected noop=false for an explicit cross-mode reset")
+	}
+}
+
+// TestClassifyResetDiscard_sameModeNoopUnchanged verifies the refinement does
+// not disturb resetJumpDetail's existing same-mode no-op arm (and never
+// consults the source there).
+func TestClassifyResetDiscard_sameModeNoopUnchanged(t *testing.T) {
+	old := &streamState{mode: "position", binlogFile: "mysql-bin.000003", binlogPos: 2410667}
+	noop, detail := classifyResetDiscard(old, gomysql.MySQLFlavor,
+		"position", "mysql-bin.000003", 2410667, "",
+		true,
+		func() (string, uint32, error) {
+			t.Error("currentPosition must not be consulted when resetJumpDetail already classified a no-op")
+			return "", 0, nil
+		})
+	if !noop || detail != "" {
+		t.Errorf("expected same-position no-op to pass through, got noop=%v detail=%q", noop, detail)
+	}
+}
+
 // TestDeleteEventsSinceCheckpoint_noPriorCheckpointIsNoop verifies the
 // dedup-on-resume helper (#759) skips the DELETE entirely (and never touches
 // db) when there is no prior checkpoint file — the first-run case where

@@ -71,6 +71,8 @@ When MySQL runs as primary in a replication setup, replicas connect using the `C
 - **Position mode** (`--start-file`, `--start-pos`): The traditional approach — a filename and byte offset. Simple but tied to a specific server instance.
 - **GTID mode** (`--start-gtid`): Each transaction gets a globally unique ID (`server-uuid:sequence-number`). MySQL tracks which GTIDs have been executed and resumes from the right point even after a failover. Use GTID mode on any setup where GTID replication is enabled (which is most managed MySQL services).
 
+**First-run auto-discovery**: with no `--start-file`/`--start-gtid` and no saved checkpoint, `bintrail stream` (and `bintrail up` / `bintrail-console watch`, which take no start flags) discovers the start point from the source. On a MySQL source with `gtid_mode=ON` it reads `@@GLOBAL.gtid_executed` and starts in **GTID mode** — which is what makes live-source `bintrail verify --source-dsn` work without any flags. Otherwise it falls back to the current binlog file/position and starts in position mode: when GTIDs are off, when the executed set is empty (a fresh server with zero transactions — starting from an empty set would replay the binlog from the beginning instead of from now), or on a MariaDB source (MariaDB keeps position-only auto-discovery; pass `--start-gtid` explicitly for MariaDB GTID mode).
+
 ---
 
 ## Checkpointing and `stream_state`
@@ -116,7 +118,7 @@ bintrail stream \
 
 `--reset` discards the saved checkpoint in `stream_state` and replaces it once the new start position is resolved, forcing the command to use the `--start-file`/`--start-gtid` flags from the command line. Without `--reset`, the saved checkpoint always takes precedence.
 
-**`--reset` skips history permanently.** Every event between the discarded checkpoint and the new start position is never indexed. A reset that lands anywhere other than the discarded checkpoint's exact coordinates — including an *earlier* position (direction is not inferred) — is durably recorded as a continuity loss (`gap_lost_at` / `gap_lost_detail` in `stream_state`): `bintrail status` shows the `EVENTS PERMANENTLY LOST` banner and `status --fail-on-gap` exits non-zero, exactly as after an unfillable-gap auto-advance. Such a reset also replaces the detail text of any earlier, still-unacknowledged loss record. A reset that lands on the same coordinates it discarded records nothing and leaves any prior loss record untouched — note the check is coordinates-only: after a source rebuild (`RESET MASTER` + restore) the same coordinates can name a different history.
+**`--reset` skips history permanently.** Every event between the discarded checkpoint and the new start position is never indexed. A reset that lands anywhere other than the discarded checkpoint's exact coordinates — including an *earlier* position (direction is not inferred) — is durably recorded as a continuity loss (`gap_lost_at` / `gap_lost_detail` in `stream_state`): `bintrail status` shows the `EVENTS PERMANENTLY LOST` banner and `status --fail-on-gap` exits non-zero, exactly as after an unfillable-gap auto-advance. Such a reset also replaces the detail text of any earlier, still-unacknowledged loss record. A reset that lands on the same coordinates it discarded records nothing and leaves any prior loss record untouched — note the check is coordinates-only: after a source rebuild (`RESET MASTER` + restore) the same coordinates can name a different history. One cross-mode refinement: a reset that discards a **position**-mode checkpoint and restarts in **auto-discovered GTID mode** (the source has `gtid_mode=ON` and no start flags were given) compares the discarded checkpoint against the source's *current* binlog coordinates — equal means nothing was skipped and no loss is recorded; unequal, or the source unreadable, records the loss conservatively.
 
 **When to use `--reset`:**
 - Switching from position mode to GTID mode (or vice versa)
@@ -169,7 +171,9 @@ pre-advance coordinates would destroy already-captured rows below the purge floo
 If any events in the advanced-over window had already been indexed before the
 crash, MySQL may re-send some of them and they will be inserted a second time
 under new `event_id`s. Recovery SQL generated across such a window can therefore
-replay the same row change twice.
+replay the same row change twice. Because fresh streams on a `gtid_mode=ON`
+source now select GTID mode automatically, this window applies to default
+(no-flags) deployments too — not only to operators who passed `--start-gtid`.
 
 **Why it is not closed.** The dedup deletes everything at or beyond the position
 the stream will actually replay from. After an auto-advance, that new start

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -110,11 +111,23 @@ func scanBinlogStatus(db *sql.DB, stmt string) (file string, pos uint32, err err
 //
 // MySQL formats gtid_executed with '\n' between UUID blocks; all whitespace
 // is stripped so the value is usable as a replication start set as-is.
-// The query targets MySQL system variables; MariaDB sources must not call it
-// (streamrun gates the call on the mysql flavor).
+//
+// A server without the gtid_mode variable at all — Error 1193
+// ER_UNKNOWN_SYSTEM_VARIABLE, which is what MariaDB returns — also yields
+// ("", nil): such a server structurally cannot supply a MySQL GTID set, so
+// falling back to position discovery is correct. This matters because a
+// MariaDB source can reach this call under the DEFAULT mysql flavor
+// (streamrun gates on the configured flavor, and e.g. `bintrail-console
+// watch` exposes no --source-flavor for its main source); a hard failure
+// here would crash-loop that daemon at startup. Genuine connection/query
+// failures remain errors — the caller treats them as fatal by design.
 func CurrentGTIDExecuted(db *sql.DB) (string, error) {
 	var gtidMode string
 	if err := db.QueryRow("SELECT @@GLOBAL.gtid_mode").Scan(&gtidMode); err != nil {
+		var mysqlErr *mysql.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1193 { // ER_UNKNOWN_SYSTEM_VARIABLE
+			return "", nil
+		}
 		return "", fmt.Errorf("SELECT @@GLOBAL.gtid_mode: %w", err)
 	}
 	if !strings.EqualFold(gtidMode, "ON") {
@@ -126,7 +139,15 @@ func CurrentGTIDExecuted(db *sql.DB) (string, error) {
 	}
 	// strings.Fields splits on any whitespace (spaces, '\n', tabs); joining
 	// with "" removes it all.
-	return strings.Join(strings.Fields(executed), ""), nil
+	set := strings.Join(strings.Fields(executed), "")
+	if set == "" {
+		// The "" return sends the caller down position-mode discovery; on a
+		// GTID-enabled source that has a user-visible consequence worth naming.
+		slog.Warn("source is gtid_mode=ON but @@GLOBAL.gtid_executed is empty; " +
+			"starting in position mode — live-source verify will stay inconclusive " +
+			"until the stream is restarted with --start-gtid")
+	}
+	return set, nil
 }
 
 // defaultTimeout is the TCP connect timeout applied when the DSN does not

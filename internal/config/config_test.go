@@ -544,6 +544,35 @@ func TestCurrentGTIDExecuted_emptyExecutedSet(t *testing.T) {
 	}
 }
 
+// TestCurrentGTIDExecuted_unknownVariableIsNotAnError covers a server without
+// the gtid_mode variable at all — Error 1193 ER_UNKNOWN_SYSTEM_VARIABLE, which
+// is what MariaDB returns. Such a server structurally cannot supply a MySQL
+// GTID set, so the result is ("", nil): position fallback, not a fatal error.
+// This is reachable in production because a MariaDB source can sit behind the
+// DEFAULT mysql flavor (e.g. `bintrail-console watch` exposes no
+// --source-flavor for its main source); a hard failure here would crash-loop
+// that daemon at startup.
+func TestCurrentGTIDExecuted_unknownVariableIsNotAnError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT @@GLOBAL.gtid_mode`).WillReturnError(&mysql.MySQLError{
+		Number:  1193,
+		Message: "Unknown system variable 'gtid_mode'",
+	})
+
+	got, err := CurrentGTIDExecuted(db)
+	if err != nil {
+		t.Fatalf("expected 1193 to map to a clean position fallback, got error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("got %q, want empty for a server without gtid_mode", got)
+	}
+}
+
 // TestCurrentGTIDExecuted_queryErrorPropagates verifies a query failure is a
 // real error (the streamrun caller treats it as fatal — it must not silently
 // degrade a GTID source to position mode).

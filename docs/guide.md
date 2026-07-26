@@ -351,7 +351,7 @@ bintrail baseline --input /path/to/mydumper-output --output /tmp/baselines \
 
 **Situation:** continuous real-time indexing from a managed service with no binlog file access.
 
-Grant `REPLICATION SLAVE, REPLICATION CLIENT` (plus `SELECT` for schema snapshots) on the source — see [the source user](quickstart.md#prerequisites) — then start streaming. `bintrail up` (or `stream`) auto-discovers the current binlog position on first run and resumes from its checkpoint afterward:
+Grant `REPLICATION SLAVE, REPLICATION CLIENT` (plus `SELECT` for schema snapshots) on the source — see [the source user](quickstart.md#prerequisites) — then start streaming. `bintrail up` (or `stream`) auto-discovers the start point on first run — GTID mode when the source reports `gtid_mode=ON` (so live-source `verify` works out of the box), the current binlog position otherwise — and resumes from its checkpoint afterward:
 
 ```sh
 bintrail up \
