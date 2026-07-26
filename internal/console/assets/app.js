@@ -768,7 +768,7 @@ function ovEventRow(e) {
   tbl.append(el("span", { class: "ov-ev-pk", text: "#" + e.pk_values }));
   row.append(tbl);
   row.append(el("span", { class: "ov-ev-cols" }, ...colsSummary(e.changed_columns, false)));
-  const undo = el("a", { class: "btn btn-sm ov-ev-undo", text: "Undo",
+  const undo = el("button", { class: "btn btn-sm ov-ev-undo", type: "button", text: "Undo",
     onclick: (ev) => { ev.stopPropagation(); undoEvent(e); } });
   row.append(undo);
   return row;
@@ -832,7 +832,7 @@ function renderEvents(params) {
 
   // result bar
   const bar = el("div", { class: "result-bar" });
-  bar.append(el("span", { class: "result-count" }, el("b", { id: "ev-count", text: "…" }), " event(s)"));
+  bar.append(el("span", { class: "result-count" }, el("b", { id: "ev-count", text: "…" }), el("span", { id: "ev-count-note", text: " event(s)" })));
   bar.append(el("span", { class: "spacer" }));
   bar.append(el("span", { class: "kbd-hint" },
     el("b", { text: "j" }), "/", el("b", { text: "k" }), " move · ",
@@ -1161,22 +1161,35 @@ async function runEventsQuery(form) {
   }
 
   lastEvents = events;
+  // Honest scope (#966): free terms / unscoped pk are refined client-side over
+  // ONE fetched page. When that page is full (count === limit) older matches
+  // can exist beyond it, so qualify the count instead of presenting it as
+  // index-wide truth. A refine over a non-full page saw every matching event,
+  // so its count needs no qualifier.
+  const refining = refine.length > 0;
+  const pageFull = data.limit > 0 && data.count === data.limit;
+  const scopeNote = pageFull
+    ? " in the newest " + data.limit + " events — narrow with schema/table or a time range"
+    : "";
   if (countEl) countEl.textContent = String(events.length);
-  buildEventRows(rowsEl, events);
+  const noteEl = $("#ev-count-note", VIEW());
+  if (noteEl) noteEl.textContent = (refining ? " match(es)" : " event(s)") + scopeNote;
+  buildEventRows(rowsEl, events, scopeNote);
 }
 
-function buildEventRows(container, events) {
+function buildEventRows(container, events, scopeNote) {
   clear(container);
   if (!events.length) {
-    const empty = el("div", { class: "ev-empty" }, "No changes match your search. ",
-      el("b", { text: "Clear it", style: "cursor:pointer",
+    const empty = el("div", { class: "ev-empty" },
+      scopeNote ? "No changes match your search" + scopeNote + ", or " : "No changes match your search. ",
+      el("b", { text: scopeNote ? "clear it" : "Clear it", style: "cursor:pointer",
         onclick: () => { const s = $("#ev-search", VIEW()); if (s) { s.value = ""; runEventsQuery($("#ev-form", VIEW())); } } }),
       " to see everything.");
     container.append(empty);
     return;
   }
   events.forEach((e, i) => {
-    const row = el("div", { class: "ev-row", "data-ev": i, tabindex: "0" });
+    const row = el("div", { class: "ev-row", "data-ev": i, tabindex: "0", role: "button", "aria-expanded": "false" });
     row.append(icon("caret", "ev-caret"));
     row.append(el("span", { class: "ev-time", text: e.event_timestamp }));
     row.append(el("span", { class: "ev-table", text: e.schema_name + "." + e.table_name }));
@@ -1187,7 +1200,13 @@ function buildEventRows(container, events) {
     let loaded = false;
     row.addEventListener("click", () => {
       const open = row.classList.toggle("open");
+      row.setAttribute("aria-expanded", open ? "true" : "false");
       if (open && !loaded) { clear(wrap); wrap.append(renderDiff(e)); loaded = true; }
+    });
+    // Keyboard activation (#968): the row is a focusable expando, so Enter and
+    // Space must toggle it like a real button would.
+    row.addEventListener("keydown", (ke) => {
+      if (ke.key === "Enter" || ke.key === " ") { ke.preventDefault(); row.click(); }
     });
     container.append(row);
     container.append(wrap);
@@ -1222,7 +1241,7 @@ function renderDiff(ev) {
   const foot = el("div", { class: "diff-foot" });
   foot.append(el("span", { class: "diff-foot-note", text: "Generates reversal SQL — nothing runs automatically." }));
   const label = ev.event_type === "DELETE" ? "Restore this row" : ev.event_type === "INSERT" ? "Undo this insert" : "Undo this change";
-  foot.append(el("a", { class: "btn btn-sm btn-primary", text: label, onclick: () => undoEvent(ev) }));
+  foot.append(el("button", { class: "btn btn-sm btn-primary", type: "button", text: label, onclick: () => undoEvent(ev) }));
 
   return el("div", { class: "diff" }, grid, foot);
 }
@@ -1283,7 +1302,7 @@ function renderRecover(params) {
       el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " · pk " + ctx.pk }),
       el("span", { class: "ctx-detail", text: "undoing changes up to " + ctx.type + " at " + ctx.time })));
     banner.append(el("span", { class: "spacer" }));
-    banner.append(el("a", { class: "btn btn-sm btn-ghost", text: "Clear",
+    banner.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear",
       onclick: () => { pendingRecover = null; navigate("recover"); } }));
     v.append(banner);
   }
@@ -1581,7 +1600,7 @@ function renderTimeline(container, data) {
 
     if (e.source !== "baseline") {
       const acts = el("div", { class: "tl-actions" });
-      acts.append(el("a", { class: "btn btn-sm tl-restore", text: "Restore to this state",
+      acts.append(el("button", { class: "btn btn-sm tl-restore", type: "button", text: "Restore to this state",
         onclick: () => undoEvent({ schema_name: data.schema, table_name: data.table, pk_values: data.pk, event_type: e.source, event_timestamp: e.time }) }));
       node.append(acts);
     }
@@ -2003,7 +2022,7 @@ function archivingPanel(servers, serversErr) {
   const panel = el("section", { class: "ov-panel" });
   panel.append(el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "S3 archiving per source" }),
-    el("a", { class: "btn btn-sm btn-ghost", text: "Manage servers ›", onclick: openServersModal })));
+    el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Manage servers ›", onclick: openServersModal })));
   const list = el("div", { class: "stg-list" });
   const sources = servers.filter((s) => s.has_source);
   if (serversErr) {
@@ -2334,9 +2353,19 @@ async function openVerifyExplain(id, schema, table) {
   scrim.append(modal);
   scrim.addEventListener("click", (e) => { if (e.target === scrim) closeVerifyExplain(); });
   mount.replaceChildren(scrim);
+  focusModal(scrim);
 }
 
 function closeVerifyExplain() { document.getElementById("modal").replaceChildren(); }
+
+// focusModal moves keyboard focus into a freshly-opened dialog (#968): the
+// first form field when there is one, else the first button (usually the ✕
+// close). Escape-to-close lives in globalKeydown, keyed off the shared #modal
+// slot — no per-dialog wiring needed.
+function focusModal(scrim) {
+  const f = scrim.querySelector("input, select, textarea") || scrim.querySelector("button");
+  if (f) f.focus();
+}
 
 const VFY_KIND_LABEL = {
   changed: "Value differs",
@@ -2904,6 +2933,7 @@ function openServersModal() {
   mount.append(buildServersModal());
   // re-apply capability gating to the freshly-mounted [data-capability] nodes
   $all("[data-capability]", mount).forEach((n) => n.classList.toggle("cap-on", !!capsCache[n.dataset.capability]));
+  focusModal(mount);
   refreshServersList();
 }
 function closeServersModal() { document.getElementById("modal").replaceChildren(); }
@@ -2954,21 +2984,37 @@ async function showRotationDialog() {
   foot.append(el("button", { class: "btn btn-ghost", type: "button", text: "Cancel", onclick: closeRotationDialog }));
   form.append(foot);
   form.append(msg);
-  form.addEventListener("submit", (e) => { e.preventDefault(); submitRotation(form, msg, cur.enabled); });
+  form.addEventListener("submit", (e) => { e.preventDefault(); submitRotation(form, msg, cur); });
   modal.append(form);
 
   scrim.append(modal);
   scrim.addEventListener("click", (e) => { if (e.target === scrim) closeRotationDialog(); });
   mount.replaceChildren(scrim);
+  focusModal(scrim);
 }
 
 function closeRotationDialog() { document.getElementById("modal").replaceChildren(); }
 
-async function submitRotation(form, msg, wasEnabled) {
+async function submitRotation(form, msg, cur) {
+  // Future partitions (#969): blank keeps the current value — the field came
+  // prefilled, so an accidental clear must not silently save 0. Non-integer
+  // input is rejected inline (mirroring the server's retain/interval 400s);
+  // an explicit "0" stays valid (external partition management).
+  const rawFuture = form.elements.add_future.value.trim();
+  let addFuture;
+  if (rawFuture === "") {
+    addFuture = cur.add_future != null ? cur.add_future : 0;
+  } else if (/^\d+$/.test(rawFuture)) {
+    addFuture = parseInt(rawFuture, 10);
+  } else {
+    msg.textContent = "Future partitions must be a whole number (e.g. 3).";
+    msg.className = "form-msg err";
+    return;
+  }
   const body = {
     retain: form.elements.retain.value.trim(),
     interval: form.elements.interval.value.trim(),
-    add_future: parseInt(form.elements.add_future.value, 10) || 0,
+    add_future: addFuture,
   };
   try {
     await api("/api/rotation", { method: "PUT", body });
@@ -2980,7 +3026,7 @@ async function submitRotation(form, msg, wasEnabled) {
   closeRotationDialog();
   // When the daemon booted with rotation off the loop isn't running, so the
   // save is inert until a restart — say so rather than implying it took effect.
-  toast(wasEnabled ? "Rotation settings saved" : "Saved — rotation is off, so this won't take effect until the daemon restarts");
+  toast(cur.enabled ? "Rotation settings saved" : "Saved — rotation is off, so this won't take effect until the daemon restarts");
 }
 
 async function refreshServersList() {
@@ -3440,6 +3486,16 @@ function cmdkKeydown(e) {
 function globalKeydown(e) {
   // The sign-in gate is modal: no shortcuts reach the workspace behind it.
   if (loginGateRaised) return;
+  // Escape closes whatever dialog occupies the shared #modal slot (#968). The
+  // ⌘K palette lives in its own mount and closes itself; the sign-in gate is
+  // unreachable here (guard above), so it stays un-dismissable by design.
+  if (e.key === "Escape") {
+    const cmdk = document.getElementById("cmdk-mount");
+    if (cmdk && cmdk.firstChild) return;
+    const modalMount = document.getElementById("modal");
+    if (modalMount && modalMount.firstChild) { e.preventDefault(); modalMount.replaceChildren(); }
+    return;
+  }
   // ⌘K / Ctrl+K opens the palette anywhere.
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openCmdk(); return; }
   // j/k/↵/u row nav — only on Events, only when not typing in a field.
@@ -3448,7 +3504,13 @@ function globalKeydown(e) {
   const rows = $all(".ev-row", VIEW());
   if (e.key === "j") { e.preventDefault(); moveCursor(1); }
   else if (e.key === "k") { e.preventDefault(); moveCursor(-1); }
-  else if (e.key === "Enter") { if (cursorIdx >= 0 && rows[cursorIdx]) { e.preventDefault(); rows[cursorIdx].click(); } }
+  else if (e.key === "Enter") {
+    // A focused interactive element handles its own Enter (buttons, links,
+    // expandable rows) — only drive the j/k cursor row otherwise (#968).
+    const a = document.activeElement;
+    if (a && (a.classList.contains("ev-row") || /^(BUTTON|A|SUMMARY)$/.test(a.tagName))) return;
+    if (cursorIdx >= 0 && rows[cursorIdx]) { e.preventDefault(); rows[cursorIdx].click(); }
+  }
   else if (e.key === "u") { if (cursorIdx >= 0 && lastEvents[cursorIdx]) { e.preventDefault(); undoEvent(lastEvents[cursorIdx]); } }
 }
 
