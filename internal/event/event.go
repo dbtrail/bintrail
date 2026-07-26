@@ -222,10 +222,25 @@ const hexPKPrefix = "0x"
 //     (invalid bytes could never have been written), so no existing row's
 //     pk_values — and therefore no existing pk_hash — changes spelling. Only
 //     values that today stop capture get a new representation. A non-strict
-//     sql_mode index server would instead have stored a silently TRUNCATED
-//     prefix — the same pk_hash-over-a-truncated-value mechanic that
+//     sql_mode index server would instead have stored the value with its
+//     invalid bytes replaced — the same pk_hash-over-a-mangled-value mechanic
 //     checkPKValuesLength's comment documents for the LENGTH case (#944) — so
 //     those rows were already unrecoverable, not working.
+//
+// BYOS IS OUTSIDE THAT INVARIANT, and deliberately so — the same index-vs-BYOS
+// split MaxPKValuesLen's comment already draws. internal/byos and
+// internal/buffer call BuildPKValues too, but write pk_values to customer-owned
+// Parquet with no utf8mb4 column anywhere in the path, so a pure-BYOS agent
+// (cliapp/agent.go permits BYOS with no --index-dsn) has been durably
+// persisting the RAW spelling for binary PKs and never saw error 1366. For
+// those keys the spelling — and therefore byos.PKHash, the metadata↔payload
+// correlation key — changes at this boundary, so pre-fix payload Parquet stops
+// correlating with post-fix metadata. Within a single event both sides are
+// still stamped from the same value, so live correlation is unaffected; it is
+// the cross-boundary lookups (internal/agent/handler.go's resolve_pk,
+// buffer.ResolvePK) that silently miss rather than error. Tracked separately —
+// hex pk_values beats a dead daemon, and this PR's reported bug is the MySQL
+// path.
 //
 // Both halves are pinned at runtime by TestInsertBatch_binaryPrimaryKey, which
 // checks the utf8mb4 premise against information_schema and asserts the raw
