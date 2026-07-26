@@ -1253,7 +1253,10 @@ func DetectFlavor(db *sql.DB) string {
 }
 
 // buildFKCascadeQuery returns the REFERENTIAL_CONSTRAINTS query (and its args)
-// used to find CASCADE foreign keys. When schemas is non-empty the scan is
+// used to find cascading foreign keys — a DELETE_RULE or UPDATE_RULE of CASCADE
+// or SET NULL, the four referential actions whose child-side effects InnoDB
+// applies below the binlog and recover-cascade synthesizes (aligned with
+// CascadeConstraintsInIndex, #1125). When schemas is non-empty the scan is
 // scoped to exactly those schemas — the operator explicitly asked us to index
 // them, so we police them as named. When schemas is empty we scan every schema
 // except (a) MySQL's own system schemas and (b) bintrail's own index schemas.
@@ -1269,7 +1272,7 @@ func DetectFlavor(db *sql.DB) string {
 func buildFKCascadeQuery(schemas []string) (string, []any) {
 	query := `SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, DELETE_RULE, UPDATE_RULE
 		FROM information_schema.REFERENTIAL_CONSTRAINTS
-		WHERE (DELETE_RULE = 'CASCADE' OR UPDATE_RULE = 'CASCADE')`
+		WHERE (DELETE_RULE IN ('CASCADE', 'SET NULL') OR UPDATE_RULE IN ('CASCADE', 'SET NULL'))`
 
 	var args []any
 	if len(schemas) > 0 {
@@ -1304,7 +1307,8 @@ func buildFKCascadeQuery(schemas []string) (string, []any) {
 var ErrFKCascadesFound = errors.New("FK cascade constraints present on source")
 
 // ValidateNoFKCascades checks that none of the targeted schemas contain foreign
-// key constraints with CASCADE rules. When schemas is empty, all non-system,
+// key constraints with cascading (CASCADE / SET NULL) referential rules, on
+// either the DELETE or the UPDATE action. When schemas is empty, all non-system,
 // non-bintrail-internal schemas are checked (see buildFKCascadeQuery). FK
 // cascades produce invisible side-effect row changes that make reversal SQL
 // unreliable. A cascade finding is returned wrapped in ErrFKCascadesFound; any
@@ -1423,10 +1427,10 @@ func CascadeConstraintsInIndex(indexDB *sql.DB, schemas []string) ([]FKCascadeEd
 // schema.table is legal in MySQL, #833). It matches on referenced_schema_name +
 // referenced_table_name, so it is not fooled by a same-named table in another
 // schema, and it is not scoped to the parent's own schema the way the child-scoped
-// CascadeConstraintsInIndex is. Used by the console to decide whether a DELETE on
-// schema.table should auto-route through cascade synthesis: a parent whose only
-// cascade children are cross-schema would otherwise report false and silently fall
-// back to plain recover, missing the cascade victims.
+// CascadeConstraintsInIndex is. It is the ON DELETE half only — a convenience
+// wrapper for callers that care about that single action; the console and CLI
+// auto-routing consult CascadeParentRulesInIndex directly, which reports the
+// ON UPDATE side too (#1002).
 //
 // Returns false (not an error) when fk_constraints is absent (index predates it).
 func IsCascadeParentInIndex(indexDB *sql.DB, schema, table string) (bool, error) {

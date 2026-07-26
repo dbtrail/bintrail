@@ -23,9 +23,11 @@ import (
 )
 
 // recoverCascadeRequest is the JSON body accepted by POST /api/recover-cascade.
-// Schema/Table identify the PARENT table whose delete cascaded; the handler
-// synthesizes the invisible child victims (ON DELETE CASCADE / SET NULL that
-// InnoDB ran below the binlog) and returns reversal SQL — never executing it.
+// Schema/Table identify the PARENT table whose delete or referenced-key update
+// cascaded; the handler synthesizes the invisible child-side effects InnoDB ran
+// below the binlog (ON DELETE CASCADE / SET NULL victims and nulled FKs, plus
+// ON UPDATE CASCADE / SET NULL FK rewrites, #1002) and returns reversal SQL —
+// never executing it.
 type recoverCascadeRequest struct {
 	Schema   string   `json:"schema"`
 	Table    string   `json:"table"`
@@ -76,8 +78,9 @@ func (s *Server) rbacActive() bool {
 }
 
 // handleRecoverCascade serves POST /api/recover-cascade — generates reversal SQL
-// for rows hit by a foreign-key ON DELETE CASCADE / SET NULL that InnoDB ran
-// below the binlog (MySQL Bug #32506). Like /api/recover it NEVER executes the
+// for rows hit by a foreign-key cascade that InnoDB ran below the binlog (MySQL
+// Bug #32506): ON DELETE CASCADE / SET NULL child deletions and nulled FKs, and
+// ON UPDATE CASCADE / SET NULL FK rewrites (#1002). Like /api/recover it NEVER executes the
 // SQL: it synthesizes the invisible victims from the index, builds the script in
 // a buffer, and returns it as text for the operator to review.
 func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {

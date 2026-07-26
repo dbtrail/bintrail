@@ -480,6 +480,22 @@ func TestBuildFKCascadeQuery_withSchemas(t *testing.T) {
 	}
 }
 
+// The pre-flight must match every cascading referential action recover-cascade
+// synthesizes — SET NULL included, on BOTH rules (#1125). Matching CASCADE only
+// silently under-reports schemas whose FKs use ON DELETE / ON UPDATE SET NULL.
+func TestBuildFKCascadeQuery_matchesSetNull(t *testing.T) {
+	query, _ := buildFKCascadeQuery(nil)
+
+	for _, want := range []string{
+		"DELETE_RULE IN ('CASCADE', 'SET NULL')",
+		"UPDATE_RULE IN ('CASCADE', 'SET NULL')",
+	} {
+		if !strings.Contains(query, want) {
+			t.Errorf("expected query to match %s, got query:\n%s", want, query)
+		}
+	}
+}
+
 // With no schemas filter the scan excludes MySQL system schemas AND bintrail's
 // own index schemas. The latter are recognised structurally — a schema is
 // bintrail-internal only if it holds all of binlog_events, schema_snapshots and

@@ -657,6 +657,47 @@ func TestValidateNoFKCascades_cascade(t *testing.T) {
 	}
 }
 
+// ON DELETE SET NULL and ON UPDATE SET NULL are cascading actions bintrail's
+// recover-cascade synthesizes, so the doctor/pre-flight must report them too
+// (#1125) — matching CASCADE alone silently under-reported these schemas.
+func TestValidateNoFKCascades_setNull(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+
+	testutil.MustExec(t, db, `CREATE TABLE users (
+		id INT PRIMARY KEY AUTO_INCREMENT
+	)`)
+	testutil.MustExec(t, db, `CREATE TABLE posts (
+		id      INT PRIMARY KEY AUTO_INCREMENT,
+		user_id INT,
+		CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+	)`)
+
+	err := ValidateNoFKCascades(db, []string{dbName})
+	if err == nil {
+		t.Fatal("expected error for schema with ON DELETE SET NULL, got nil")
+	}
+	if !errors.Is(err, ErrFKCascadesFound) {
+		t.Errorf("SET NULL finding must wrap ErrFKCascadesFound, got: %v", err)
+	}
+}
+
+func TestValidateNoFKCascades_updateSetNull(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+
+	testutil.MustExec(t, db, `CREATE TABLE tags (
+		id INT PRIMARY KEY AUTO_INCREMENT
+	)`)
+	testutil.MustExec(t, db, `CREATE TABLE tagged (
+		id     INT PRIMARY KEY AUTO_INCREMENT,
+		tag_id INT,
+		CONSTRAINT fk_tag FOREIGN KEY (tag_id) REFERENCES tags(id) ON UPDATE SET NULL
+	)`)
+
+	if err := ValidateNoFKCascades(db, []string{dbName}); err == nil {
+		t.Fatal("expected error for schema with ON UPDATE SET NULL, got nil")
+	}
+}
+
 func TestValidateNoFKCascades_updateCascade(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 

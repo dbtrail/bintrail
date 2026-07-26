@@ -627,17 +627,26 @@ func SynthesizeVictims(
 	// checkKeyChain flags the ONE case the "children's last logged image still
 	// carries the old key" inference cannot see: an EARLIER UPDATE inside the
 	// window that moved this referenced key INTO the parent (A→B before the
-	// root's B→C). That earlier cascade rewrote the children below the binlog
-	// too, so their last INDEXED image carries the pre-chain key — the ColumnEq
-	// scan for this root's old key then matches nothing and would report a clean
-	// zero-child Complete. Never silent (#618).
+	// root's B→C, or before the root DELETE of the row holding B). That earlier
+	// cascade rewrote the children below the binlog too, so their last INDEXED
+	// image carries the pre-chain key — the ColumnEq scan for this root's key
+	// then matches nothing and would report a clean zero-child Complete. Never
+	// silent (#618).
 	//
-	// Probed for ROOT updates only (depth 0): deeper items are synthesized here,
+	// Both root kinds consult it (#1125): an UPDATE root probes its OLD key
+	// (what the children were scanned by), and a DELETE root probes the deleted
+	// row's key when the edge is ON UPDATE CASCADE — the only rule under which
+	// an earlier key move dragged the children along invisibly, leaving the
+	// delete-cascade scan with nothing to match. `consequence` names what a
+	// hidden chain means for that root kind, so the caveat reads correctly in
+	// both.
+	//
+	// Probed for ROOTS only (depth 0): deeper items are synthesized here,
 	// with the correct pre-cascade image by construction, so a "prior update"
 	// found for them would be about the child's own logged history, not a hidden
 	// cascade chain. The root's own event is skipped by EventID.
 	upd := event.EventUpdate
-	checkKeyChain := func(fk CascadeFK, pev query.ResultRow, parentOldKey string, rootTS time.Time, rootKey string) {
+	checkKeyChain := func(fk CascadeFK, pev query.ResultRow, parentOldKey string, rootTS time.Time, rootKey, consequence string) {
 		memo := pev.SchemaName + "." + pev.TableName + "|" + fk.ReferencedColumn + "|" + parentOldKey + "|" + rootKey
 		if keyChainChecked[memo] {
 			return
@@ -703,10 +712,23 @@ func SynthesizeVictims(
 			}
 			addIncomplete("keychain:"+pev.SchemaName+"."+pev.TableName+"."+fk.ReferencedColumn, fmt.Sprintf(
 				"%s.%s had an EARLIER update of referenced column %q INTO %s inside the window; that cascade rewrote its "+
-					"children below the binlog too, so their last indexed image no longer carries this update's old key — "+
-					"some ON UPDATE cascade children may NOT be reconstructed (a zero result here is not proof of none)",
-				pev.SchemaName, pev.TableName, fk.ReferencedColumn, parentOldKey))
+					"children below the binlog too, so their last indexed image no longer carries the key this root was "+
+					"scanned by — %s (a zero result here is not proof of none)",
+				pev.SchemaName, pev.TableName, fk.ReferencedColumn, parentOldKey, consequence))
 			return
+		}
+		// #1125: a bounded probe must not support an unbounded conclusion. The
+		// fetch was capped at keyChainProbeLimit and none of the returned events
+		// was the arrival — but with a FULL page the arrival may sit beyond the
+		// cap (e.g. a row parked on the key accumulating unrelated-column
+		// updates ahead of it in ASC order). That is "could not rule a chain
+		// out", never "no chain" — the same shape the skewSampleLimit probe
+		// avoids by leaving an empty sample unmemoized.
+		if len(prior) == keyChainProbeLimit {
+			addIncomplete("keychaintrunc:"+pev.SchemaName+"."+pev.TableName+"."+fk.ReferencedColumn, fmt.Sprintf(
+				"%s.%s had at least %d updates matching referenced column %q = %s in the window — the key-chain probe's "+
+					"cap — so an earlier key move into %s could not be ruled out; %s (a zero result here is not proof of none)",
+				pev.SchemaName, pev.TableName, keyChainProbeLimit, fk.ReferencedColumn, parentOldKey, parentOldKey, consequence))
 		}
 	}
 
@@ -826,7 +848,8 @@ func SynthesizeVictims(
 					parentOldKey := valToString(oldVal)
 					cascadedHere = true
 					if depth == 0 {
-						checkKeyChain(fk, pev, parentOldKey, item.rootTS, rootKey)
+						checkKeyChain(fk, pev, parentOldKey, item.rootTS, rootKey,
+							"some ON UPDATE cascade children may NOT be reconstructed")
 					}
 
 					scan := scanChildren(fk, parentOldKey, item.rootTS)
@@ -924,6 +947,21 @@ func SynthesizeVictims(
 					continue
 				}
 				parentPK := valToString(refVal)
+				if depth == 0 && fk.UpdateRule == "CASCADE" {
+					// #1125: the delete-path analog of the key-chain blind spot.
+					// If an earlier UPDATE moved the referenced key INTO the value
+					// this row carried at delete time, the ON UPDATE CASCADE that
+					// ran then rewrote the children below the binlog — their last
+					// indexed image carries the PRE-move key, so the scan by
+					// parentPK below finds none of them and would claim a clean
+					// Complete while every child stays orphaned. Only an ON UPDATE
+					// CASCADE edge drags children along a key move invisibly
+					// (SET NULL leaves them NULL, genuinely untouched by the later
+					// delete; RESTRICT/NO ACTION blocks the move while children
+					// exist), hence the rule gate.
+					checkKeyChain(fk, pev, parentPK, item.rootTS, rootKey,
+						"some cascade-deleted children may NOT be reconstructed")
+				}
 
 				scan := scanChildren(fk, parentPK, item.rootTS)
 				if scan.failed {
