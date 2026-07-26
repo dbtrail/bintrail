@@ -11,6 +11,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/buffer"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -199,6 +200,18 @@ func (h *DefaultHandler) resolvePKFromArchive(ctx context.Context, item PKItem, 
 			if _, seen := idx[hash]; !seen { // first match wins, as the pre-memoization scan did
 				idx[hash] = r.PKValues
 			}
+			// #1137 compat: a row persisted before the #1132 hex fix stores
+			// the RAW spelling of a binary PK, whose hash can never match a
+			// control-plane PKHash computed over the post-fix hex spelling.
+			// Index the canonical spelling's hash too, still resolving to the
+			// stored value. No second hash is computed when the spellings
+			// already match (the common case).
+			if canon := event.CanonicalPKValues(r.PKValues); canon != r.PKValues {
+				canonHash := byosPKHash(canon)
+				if _, seen := idx[canonHash]; !seen {
+					idx[canonHash] = r.PKValues
+				}
+			}
 		}
 		cache[key] = idx
 	}
@@ -302,8 +315,17 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 		}
 		filtered := rows[:0]
 		for _, r := range rows {
-			hash := byosPKHash(r.PKValues)
-			if _, ok := wanted[hash]; ok {
+			_, ok := wanted[byosPKHash(r.PKValues)]
+			if !ok {
+				// #1137 compat: an archive row persisted before the #1132 hex
+				// fix stores the RAW spelling of a binary PK; the caller's
+				// pk_hash is computed over the post-fix hex spelling. When the
+				// spellings differ, also try the canonical spelling's hash.
+				if canon := event.CanonicalPKValues(r.PKValues); canon != r.PKValues {
+					_, ok = wanted[byosPKHash(canon)]
+				}
+			}
+			if ok {
 				filtered = append(filtered, r)
 			}
 		}

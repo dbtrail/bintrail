@@ -238,9 +238,10 @@ const hexPKPrefix = "0x"
 // correlating with post-fix metadata. Within a single event both sides are
 // still stamped from the same value, so live correlation is unaffected; it is
 // the cross-boundary lookups (internal/agent/handler.go's resolve_pk,
-// buffer.ResolvePK) that silently miss rather than error. Tracked separately —
-// hex pk_values beats a dead daemon, and this PR's reported bug is the MySQL
-// path.
+// buffer.ResolvePK) that silently miss rather than error. The compat read
+// path is CanonicalPKValues (#1137): those lookups re-spell the stored value
+// and also try the canonical spelling's hash, so pre-fix raw-spelling rows
+// correlate with post-fix hashes again.
 //
 // Both halves are pinned at runtime by TestInsertBatch_binaryPrimaryKey, which
 // checks the utf8mb4 premise against information_schema and asserts the raw
@@ -264,6 +265,74 @@ func formatPKValue(v any) string {
 		return string(b)
 	}
 	return fmt.Sprintf("%v", v)
+}
+
+// splitPKValues splits a pipe-delimited pk_values string into its raw
+// (unescaped) components — the exact inverse of the per-part EscapePKValue +
+// "|" join that BuildPKValues performs. Byte-oriented on purpose: the
+// delimiter and escape characters are ASCII, so they can never appear inside
+// a multi-byte UTF-8 sequence, and a component's bytes come back exactly as
+// formatPKValue produced them (including bytes that are not valid UTF-8).
+// A trailing lone backslash (which EscapePKValue never produces) is kept
+// literally rather than dropped.
+func splitPKValues(s string) []string {
+	parts := make([]string, 0, strings.Count(s, "|")+1)
+	var cur strings.Builder
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '\\':
+			if i+1 < len(s) {
+				i++
+				cur.WriteByte(s[i])
+			} else {
+				cur.WriteByte(c)
+			}
+		case '|':
+			parts = append(parts, cur.String())
+			cur.Reset()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	return append(parts, cur.String())
+}
+
+// CanonicalPKValues rewrites a pk_values string into the spelling
+// BuildPKValues produces today for the same key: any component whose raw
+// bytes are not valid UTF-8 is re-spelled as hexPKPrefix + uppercase hex,
+// exactly as formatPKValue does since #1132; every other component is left
+// untouched.
+//
+// This is the #1137 compat read path. Before #1132 the BYOS pipeline
+// (internal/byos, internal/buffer) durably persisted the RAW spelling for a
+// binary PK — customer-owned Parquet has no utf8mb4 column to reject it — so
+// a hash over a pre-fix stored value no longer matches a hash computed over
+// the post-fix spelling of the same key. The cross-boundary lookups (agent
+// resolve_pk, buffer.ResolvePK, the recover pk_hash filter) call this on the
+// stored value and, only when the spelling differs, also try the canonical
+// spelling's hash.
+//
+// Properties callers rely on:
+//   - Already-canonical input (the common case) is returned unchanged — the
+//     SAME string, no allocation. The fast path is exact, not approximate:
+//     escaping only inserts/removes an ASCII backslash adjacent to another
+//     ASCII byte ('\' or '|'), and ASCII bytes can never sit inside a
+//     multi-byte UTF-8 sequence, so the joined escaped string is valid UTF-8
+//     if and only if every raw component is.
+//   - Idempotent by construction: a hex spelling is ASCII, hence valid
+//     UTF-8, and passes through untouched.
+func CanonicalPKValues(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	parts := splitPKValues(s)
+	for i, p := range parts {
+		if !utf8.ValidString(p) {
+			p = hexPKPrefix + strings.ToUpper(hex.EncodeToString([]byte(p)))
+		}
+		parts[i] = EscapePKValue(p)
+	}
+	return strings.Join(parts, "|")
 }
 
 // ChangedColumns returns the sorted list of column names whose values differ

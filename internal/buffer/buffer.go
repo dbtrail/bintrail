@@ -185,7 +185,18 @@ func (b *Buffer) ResolvePK(hash, schema, table string) (string, bool) {
 
 	for i := range b.events {
 		e := &b.events[i]
-		if e.pkHash == hash && e.row.SchemaName == schema && e.row.TableName == table {
+		if e.row.SchemaName != schema || e.row.TableName != table {
+			continue
+		}
+		if e.pkHash == hash {
+			return e.row.PKValues, true
+		}
+		// #1137 compat: an entry carrying the pre-#1132 RAW spelling of a
+		// binary PK hashes differently from a control-plane hash computed
+		// over the post-fix hex spelling of the same key. When the spellings
+		// differ, also match the canonical spelling's hash. No second hash
+		// is computed for already-canonical entries (the common case).
+		if canon := event.CanonicalPKValues(e.row.PKValues); canon != e.row.PKValues && pkHash(canon) == hash {
 			return e.row.PKValues, true
 		}
 	}
