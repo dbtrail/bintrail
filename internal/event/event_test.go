@@ -34,9 +34,9 @@ func TestBuildPKValues(t *testing.T) {
 		// #1132: 0xB2 is a UTF-8 continuation byte, so it can never lead a
 		// sequence — these bytes are unstorable in the utf8mb4 pk_values
 		// column. Written verbatim, MySQL rejected the whole batch INSERT with
-		// error 1366 and, batch failures being fail-loud by contract, killed
-		// the stream daemon for EVERY table in the source. Hex-encoded, the row
-		// is storable.
+		// error 1366 and, batch failures being fail-loud by contract, stopped
+		// capture for EVERY table in that source. Hex-encoded, the row is
+		// storable.
 		{"binary PK bytes hex-encoded when not valid UTF-8", []metadata.ColumnMeta{{Name: "id"}},
 			map[string]any{"id": []byte{0xB2, 0x81}}, "0xB281"},
 		// A full BINARY(16) PK — the shape reported in #1132 (MD5/binary UUID).
@@ -53,6 +53,13 @@ func TestBuildPKValues(t *testing.T) {
 		// A composite PK mixing an int with unstorable bytes still joins on "|".
 		{"composite with binary component", []metadata.ColumnMeta{{Name: "a"}, {Name: "b"}},
 			map[string]any{"a": 7, "b": []byte{0xFF, 0xFE}}, "7|0xFFFE"},
+		// A []byte that IS valid UTF-8 takes the verbatim path and therefore
+		// still goes through EscapePKValue — the delimiter escaping must not
+		// be skipped just because the value arrived as bytes. (Only the hex
+		// path is escape-free, and only because hex digits contain neither
+		// character.)
+		{"valid-UTF-8 bytes still get delimiter-escaped", []metadata.ColumnMeta{{Name: "k"}},
+			map[string]any{"k": []byte(`x|y\z`)}, `x\|y\\z`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

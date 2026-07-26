@@ -194,25 +194,43 @@ const hexPKPrefix = "0x"
 // such a PK. string(b) reproduces exactly what "%v" printed for that same
 // value before #756 (when it was still a raw Go string of the same bytes).
 //
-// #1132: raw bytes that are not valid UTF-8 cannot be stored at all —
-// binlog_events.pk_values is VARCHAR(512) CHARACTER SET utf8mb4, so MySQL
-// rejects the whole multi-row INSERT with error 1366 and, because a batch
-// failure is fail-loud by contract (see internal/streamrun's flush, #652),
-// ONE table with a BINARY/VARBINARY PK takes the entire stream daemon down
-// and capture stops for every table in the source. Those bytes are therefore
-// hex-encoded (hexPKPrefix + uppercase hex, i.e. exactly what MySQL's own
-// CONCAT('0x', HEX(col)) produces, so an operator can reproduce a stored
-// pk_values straight from the source table and feed it back to --pk).
+// #1132: raw bytes that are not valid UTF-8 cannot be stored at all.
+// binlog_events.pk_values is VARCHAR(512) with NO declared CHARACTER SET
+// (internal/indexer/schema.go) — it inherits utf8mb4 from the MySQL 8.0+
+// server default, and config.Connect sets no charset DSN parameter either, so
+// the driver's utf8mb4 handshake collation applies on every index connection.
+// MySQL therefore rejects the whole multi-row INSERT with error 1366, and
+// because a batch flush failure is fail-loud by contract (internal/streamrun's
+// flush, #652) ONE table with a BINARY/VARBINARY PK stops capture for every
+// table in that source, not just the offending one: `bintrail stream` exits
+// the process outright, while under `bintrail-console watch` that source
+// crash-loops on backoff and then goes permanently failed (consoleapp/
+// monitor.go). Those bytes are therefore hex-encoded (hexPKPrefix + uppercase
+// hex, i.e. exactly what MySQL's own CONCAT('0x', HEX(col)) produces, so an
+// operator can reproduce a stored pk_values straight from the source table
+// and feed it back to --pk).
 //
-// The check is on CONTENT, not on the column's declared type, and that is
-// what makes this change strictly additive for the indexed-MySQL path: a
-// pk_values already in binlog_events is necessarily valid UTF-8 (invalid
-// bytes could never have been written), so no existing row's pk_values —
-// and therefore no existing pk_hash — changes spelling. Only values that
-// today kill the daemon get a new representation. (A non-strict sql_mode
-// index server would instead have stored a silently TRUNCATED prefix, whose
-// pk_hash never matched the full value anyway — see checkPKValuesLength's
-// comment; those rows were already unrecoverable, not working.)
+// The check is on CONTENT, not on the column's declared type. Two consequences
+// worth being explicit about:
+//
+//   - It is BROADER than BINARY/VARBINARY. go-mysql delivers TEXT/BLOB as
+//     []byte and coerceTextEncoding passes those through untouched, so a
+//     latin1 TEXT prefix PK or a BLOB prefix PK lands here too — and also
+//     stops killing capture. BINARY/VARBINARY is just the reported shape.
+//   - It is what makes the change strictly additive for the indexed-MySQL
+//     path: a pk_values already in binlog_events is necessarily valid UTF-8
+//     (invalid bytes could never have been written), so no existing row's
+//     pk_values — and therefore no existing pk_hash — changes spelling. Only
+//     values that today stop capture get a new representation. A non-strict
+//     sql_mode index server would instead have stored a silently TRUNCATED
+//     prefix — the same pk_hash-over-a-truncated-value mechanic that
+//     checkPKValuesLength's comment documents for the LENGTH case (#944) — so
+//     those rows were already unrecoverable, not working.
+//
+// Both halves are pinned at runtime by TestInsertBatch_binaryPrimaryKey, which
+// checks the utf8mb4 premise against information_schema and asserts the raw
+// form is still rejected. The charset is inherited, not declared, so it is not
+// safe to assume.
 //
 // Residual, accepted ambiguity, same class as coerceTextEncoding's
 // latin1-that-is-coincidentally-valid-UTF-8 case and marshalRow's
