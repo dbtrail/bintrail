@@ -2751,11 +2751,16 @@ func TestMapEventImagesDecodesBlobText(t *testing.T) {
 					{Name: "id", OrdinalPosition: 1, DataType: "int", IsPK: true},
 					{Name: "body", OrdinalPosition: 2, DataType: "text"},
 					{Name: "payload", OrdinalPosition: 3, DataType: "blob"},
+					{Name: "location", OrdinalPosition: 4, DataType: "point"},
+					{Name: "embedding", OrdinalPosition: 5, DataType: "vector"},
 				}},
 			}), nil
 		},
 	}
 	rawBlob := "\x00\xff\x7f\x80" // arbitrary non-UTF-8 bytes must survive
+	// MySQL's internal geometry form: 4-byte little-endian SRID + WKB.
+	rawGeom := "\x02\x00\x00\x00\x01\x01\x00\x00\x00\xde\xad\xbe\xef"
+	rawVec := "\x00\x00\x80\x3f\x00\x00\x00\x40" // packed float32 LE [1,2]
 	rows := []query.ResultRow{{
 		SchemaName:     "appdb",
 		TableName:      "docs",
@@ -2765,6 +2770,7 @@ func TestMapEventImagesDecodesBlobText(t *testing.T) {
 		},
 		RowAfter: map[string]any{
 			"id": json.Number("1"), "body": b64("hello world"), "payload": b64(rawBlob),
+			"location": b64(rawGeom), "embedding": b64(rawVec),
 		},
 	}}
 	h.mapEventImages("appdb", "docs", rows)
@@ -2779,6 +2785,16 @@ func TestMapEventImagesDecodesBlobText(t *testing.T) {
 	// BLOB family → decoded raw []byte, arbitrary bytes intact.
 	if got, ok := rows[0].RowAfter["payload"].([]byte); !ok || string(got) != rawBlob {
 		t.Errorf("RowAfter payload = %#v, want decoded []byte %q", rows[0].RowAfter["payload"], rawBlob)
+	}
+	// Spatial family (#1144) → decoded raw []byte (SRID+WKB), what a real
+	// server serves over the wire — not the stored base64 text.
+	if got, ok := rows[0].RowAfter["location"].([]byte); !ok || string(got) != rawGeom {
+		t.Errorf("RowAfter location = %#v, want decoded []byte %q (raw SRID+WKB)", rows[0].RowAfter["location"], rawGeom)
+	}
+	// VECTOR stays deliberately excluded (baseline asymmetry — see the
+	// base64StoredKind comment): the stored base64 string is left untouched.
+	if got := rows[0].RowAfter["embedding"]; got != b64(rawVec) {
+		t.Errorf("RowAfter embedding = %#v, want untouched base64 string %q", got, b64(rawVec))
 	}
 	// Non-BLOB/TEXT column untouched.
 	if got := rows[0].RowAfter["id"]; got != json.Number("1") {
@@ -2832,7 +2848,14 @@ func TestMapEventImagesDecodeEdgeCases(t *testing.T) {
 // TestBase64StoredKind and TestBase64Cols pin the pure type predicates the
 // #661 decode is gated on.
 func TestBase64StoredKind(t *testing.T) {
-	binaryFamily := []string{"blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary"}
+	binaryFamily := []string{
+		"blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary",
+		// Spatial family decodes to raw SRID+WKB bytes since #1144, mirroring
+		// internal/reconstruct (#1136/#1143).
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geometrycollection", "geomcollection",
+	}
 	textFamily := []string{"text", "tinytext", "mediumtext", "longtext"}
 	for _, dt := range binaryFamily {
 		if binary, ok := base64StoredKind(dt); !ok || !binary {
@@ -2844,12 +2867,16 @@ func TestBase64StoredKind(t *testing.T) {
 			t.Errorf("base64StoredKind(%q) = (%v,%v), want (false,true)", dt, binary, ok)
 		}
 	}
-	// Case-insensitive, and unrelated types are not decoded (incl. the
-	// deliberately-excluded geometry/vector families).
+	// Case-insensitive, and unrelated types are not decoded. VECTOR stays
+	// deliberately excluded: internal/baseline does not route "vector"
+	// through its binary path, so a _snapshot baseline-seeded row carries the
+	// literal dump token — decoding only the event side would serve two
+	// representations of the same column within one result set (same
+	// asymmetry that keeps VECTOR unresolved in internal/verify, PR #1143).
 	if binary, ok := base64StoredKind("LONGTEXT"); !ok || binary {
 		t.Errorf("base64StoredKind is not case-insensitive: got (%v,%v)", binary, ok)
 	}
-	for _, dt := range []string{"int", "varchar", "geometry", "datetime", ""} {
+	for _, dt := range []string{"int", "varchar", "vector", "datetime", ""} {
 		if _, ok := base64StoredKind(dt); ok {
 			t.Errorf("base64StoredKind(%q) reported a decodable column, want none", dt)
 		}

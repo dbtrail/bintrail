@@ -1278,8 +1278,19 @@ func (h *Handler) mapEventImages(schema, table string, rows []query.ResultRow) {
 // reconstruct (#663); duplicated because those copies are unexported (#661 is
 // the third consumer — a future refactor may hoist one shared copy).
 //
-// GEOMETRY/VECTOR are also delivered as []byte but deliberately out of scope
-// here, matching the recover/reconstruct fixes.
+// The spatial family is included (binary) since #1144, mirroring
+// internal/reconstruct (#1136/#1143): go-mysql delivers a geometry via
+// decodeBlob as []byte of MySQL's internal 4-byte SRID + WKB form, so decoding
+// the stored base64 back to those raw bytes serves exactly what a real server
+// serves for a geometry column over the MySQL protocol.
+//
+// VECTOR stays deliberately EXCLUDED here despite also arriving as []byte
+// (packed floats): internal/baseline does not route "vector" through its
+// binary path, so a baseline-seeded row's VECTOR value is the literal dump
+// token, not bytes. _snapshot merges baseline rows with event images —
+// decoding only the event side would serve two different representations of
+// the same column within one result set. Same asymmetry that keeps VECTOR
+// unresolved in internal/verify (see PR #1143).
 //
 // "json" is included (non-binary) as a defense-in-depth companion to #736:
 // marshalRow now only promotes a []byte to raw JSON when it looks like a
@@ -1303,7 +1314,12 @@ func (h *Handler) mapEventImages(schema, table string, rows []query.ResultRow) {
 // the fuller rationale on the sibling copy in internal/recovery/recovery.go.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
-	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary":
+	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary",
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		// MySQL 8.0.11+ reports a GEOMETRYCOLLECTION column's DATA_TYPE as
+		// "geomcollection"; MariaDB and pre-8.0.11 report "geometrycollection".
+		"geometrycollection", "geomcollection":
 		return true, true
 	case "text", "tinytext", "mediumtext", "longtext", "json":
 		return false, true

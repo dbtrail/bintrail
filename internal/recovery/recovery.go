@@ -882,13 +882,18 @@ func (g *Generator) formatColumnValue(col string, v any, geom, b64 map[string]bo
 // base64StoredKind reports whether a column's DataType is in the BLOB or TEXT
 // family — the ones go-mysql delivers as []byte so marshalRow base64-encodes them
 // in storage — and if so whether it is binary (true → emit X'hex') or text
-// (false → emit a string literal). go-mysql also delivers GEOMETRY/VECTOR as
-// []byte, but they are NOT in this set: a bare X'hex'/string literal can't load
-// them. GEOMETRY is handled on its own path (geometryLiteral →
+// (false → emit a string literal). go-mysql also delivers GEOMETRY as []byte, but
+// it is NOT in this set: a bare X'hex' literal can't load a geometry column, so
+// GEOMETRY is handled on its own path (geometryLiteral →
 // ST_GeomFromWKB(X'<wkb>', <srid>), #788) because its at-rest form is SRID+WKB.
-// VECTOR is still left as-is (its base64 fails loud at apply time against a real
-// VECTOR column) pending a verified STRING_TO_VECTOR decode of its packed-float
-// at-rest form — see the #788 PR note.
+//
+// "vector" is included (binary) since #1144: go-mysql delivers VECTOR via
+// decodeBlob as the at-rest packed little-endian float32 bytes, and MySQL 9
+// accepts exactly those bytes back as a hex literal — verified empirically
+// against MySQL 9.7 that INSERT/UPDATE with X'<HEX(v)>' round-trips
+// byte-identically into a VECTOR column, while a quoted string literal is
+// rejected (ER 6136), which is why the pre-#1144 base64 emission failed the
+// whole BEGIN/COMMIT script at apply time.
 //
 // "json" is included (non-binary) as a defense-in-depth companion to #736:
 // marshalRow now only promotes a []byte to raw JSON when it looks like a
@@ -919,7 +924,8 @@ func (g *Generator) formatColumnValue(col string, v any, geom, b64 map[string]bo
 // documented historical-data ambiguity as the #736 nil-case gap below.
 func base64StoredKind(dataType string) (binary, ok bool) {
 	switch strings.ToLower(dataType) {
-	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary":
+	case "blob", "tinyblob", "mediumblob", "longblob", "binary", "varbinary",
+		"vector":
 		return true, true
 	case "text", "tinytext", "mediumtext", "longtext", "json":
 		return false, true

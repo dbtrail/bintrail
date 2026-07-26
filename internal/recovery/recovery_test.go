@@ -2133,3 +2133,86 @@ func TestBuildUpdate_geometryEmitsSTGeomFromWKB(t *testing.T) {
 		t.Errorf("geometry SET must emit %q, got:\n%s", wantLit, stmt)
 	}
 }
+
+// TestBase64StoredKind_vector pins #1144: VECTOR is decodable and binary, so a
+// reversal emits its packed-float bytes as X'hex' instead of the stored base64
+// as a quoted string (which a VECTOR column rejects, ER 6136, failing the whole
+// BEGIN/COMMIT script at apply time).
+func TestBase64StoredKind_vector(t *testing.T) {
+	for _, dt := range []string{"vector", "VECTOR"} {
+		binary, ok := base64StoredKind(dt)
+		if !ok || !binary {
+			t.Errorf("base64StoredKind(%q) = (%v,%v), want (true,true)", dt, binary, ok)
+		}
+	}
+}
+
+// TestBuildInsert_vectorEmitsHexLiteral is the #1144 acceptance for the VECTOR
+// half: a reverse INSERT for a table with a VECTOR column emits the at-rest
+// packed little-endian float32 bytes as X'hex' — verified against MySQL 9.7
+// that X'<HEX(v)>' round-trips byte-identically into a VECTOR column — instead
+// of the stored base64 as a string literal, which VECTOR cannot load.
+func TestBuildInsert_vectorEmitsHexLiteral(t *testing.T) {
+	// STRING_TO_VECTOR('[1,2,3]') at rest: float32 LE 1.0, 2.0, 3.0.
+	packed := []byte{
+		0x00, 0x00, 0x80, 0x3f,
+		0x00, 0x00, 0x00, 0x40,
+		0x00, 0x00, 0x40, 0x40,
+	}
+	stored := base64.StdEncoding.EncodeToString(packed)
+	g := New(nil, resolverWith(map[string]*metadata.TableMeta{
+		"db.items": {
+			Schema: "db", Table: "items",
+			Columns: []metadata.ColumnMeta{
+				{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+				{Name: "embedding", OrdinalPosition: 2, DataType: "vector"},
+			},
+			PKColumns: []string{"id"},
+		},
+	}))
+	row := query.ResultRow{
+		EventID: 3, SchemaName: "db", TableName: "items",
+		EventType: parser.EventDelete,
+		RowBefore: map[string]any{"id": "1", "embedding": stored},
+	}
+	stmt, err := g.generateInsert(row)
+	if err != nil {
+		t.Fatalf("generateInsert: %v", err)
+	}
+	if want := "X'0000803f0000004000004040'"; !strings.Contains(stmt, want) {
+		t.Errorf("vector column must emit %q, got:\n%s", want, stmt)
+	}
+	if strings.Contains(stmt, "'"+stored+"'") {
+		t.Errorf("vector column must NOT emit the base64 string literal %q, got:\n%s", stored, stmt)
+	}
+}
+
+// TestBuildUpdate_vectorEmitsHexLiteral covers the reverse-UPDATE SET clause
+// for a VECTOR column (#1144).
+func TestBuildUpdate_vectorEmitsHexLiteral(t *testing.T) {
+	packed := []byte{0xcd, 0xcc, 0xcc, 0x3d} // float32 LE 0.1
+	stored := base64.StdEncoding.EncodeToString(packed)
+	g := New(nil, resolverWith(map[string]*metadata.TableMeta{
+		"db.items": {
+			Schema: "db", Table: "items",
+			Columns: []metadata.ColumnMeta{
+				{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+				{Name: "embedding", OrdinalPosition: 2, DataType: "vector"},
+			},
+			PKColumns: []string{"id"},
+		},
+	}))
+	row := query.ResultRow{
+		EventID: 4, SchemaName: "db", TableName: "items",
+		EventType: parser.EventUpdate,
+		RowBefore: map[string]any{"id": "1", "embedding": stored},
+		RowAfter:  map[string]any{"id": "1", "embedding": base64.StdEncoding.EncodeToString([]byte{0, 0, 0, 0})},
+	}
+	stmt, err := g.generateUpdate(row)
+	if err != nil {
+		t.Fatalf("generateUpdate: %v", err)
+	}
+	if want := "`embedding` = X'cdcccc3d'"; !strings.Contains(stmt, want) {
+		t.Errorf("vector SET must emit %q, got:\n%s", want, stmt)
+	}
+}
