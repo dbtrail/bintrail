@@ -195,6 +195,8 @@ WARN query covers hours with no data (rotated and not archived): 2026-02-10 00:0
 
 The planner also optimizes routing: if the entire queried time range is covered by archives (no live MySQL partitions needed), the MySQL query is skipped entirely.
 
+Archive coverage is **content-derived, not label-derived**: each `archive_state` row records the `MIN`/`MAX(event_timestamp)` of the rows actually archived, and the planner counts every hour in that range as covered. This matters for backfills — events replayed after a capture stall land in the *oldest live partition* and get archived under its hour label, so the file's `event_date=`/`event_hour=` path can be days newer than the rows inside it. The planner reports such mislabeled files to the archive fetcher, which then includes them in date-scoped S3 listings and Hive-path pruning even though their labels fall outside the queried window (row-level time filters still bound the result). Archives written before `min_event_ts`/`max_event_ts` existed fall back to label-only coverage. See [Backfilled events and the hour label](rotation-and-status.md#backfilled-events-and-the-hour-label).
+
 ### How merged results are deduplicated
 
 When archives are in play, live MySQL and archive (Parquet) results are combined, deduplicated by `event_id` (the live MySQL row wins on a duplicate), sorted chronologically, and **`--limit` is applied once after the merge** — so no events are dropped before deduplication.

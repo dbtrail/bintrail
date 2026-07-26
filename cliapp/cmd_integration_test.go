@@ -299,8 +299,8 @@ func TestArchivePartition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ArchivePartition: %v", err)
 	}
-	if n != 2 {
-		t.Errorf("expected 2 rows archived, got %d", n)
+	if n.Rows != 2 {
+		t.Errorf("expected 2 rows archived, got %d", n.Rows)
 	}
 
 	// Verify the file exists.
@@ -343,8 +343,8 @@ func TestArchivePartition_empty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ArchivePartition on empty partition: %v", err)
 	}
-	if n != 0 {
-		t.Errorf("expected 0 rows for empty partition, got %d", n)
+	if n.Rows != 0 {
+		t.Errorf("expected 0 rows for empty partition, got %d", n.Rows)
 	}
 
 	// File should still be created (valid empty Parquet).

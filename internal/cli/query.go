@@ -377,6 +377,12 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	// the helper. The helper's doc comment documents its own half of this
 	// contract.
 	if len(archSources) > 0 {
+		if plan != nil {
+			// Misfiled archives (#1037): files whose hour label lies outside
+			// the window but whose content overlaps it must survive the
+			// fetcher's date/file pruning.
+			fetchOpts.ExtraArchiveHours = plan.MisfiledArchiveHours
+		}
 		archResults, err := queryArchiveSources(
 			cmd.Context(),
 			archSources,

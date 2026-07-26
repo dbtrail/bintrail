@@ -375,3 +375,37 @@ func TestHiveArchivePath_invalidPartition(t *testing.T) {
 		t.Fatal("expected error for p_future, got nil")
 	}
 }
+
+// ─── content range vs hour label (#1037) ─────────────────────────────────────
+
+// TestEscapesLabelHour pins the trigger for the backfill warning and the
+// content-range recording: a partition whose archived rows' [min, max]
+// event_timestamp range extends outside its p_YYYYMMDDHH label hour holds
+// backfilled events, which label-based archive pruning would lose.
+func TestEscapesLabelHour(t *testing.T) {
+	label := time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)
+	name := "p_" + label.Format("2006010215")
+
+	cases := []struct {
+		name     string
+		min, max time.Time
+		want     bool
+	}{
+		{"content inside label hour", label.Add(time.Minute), label.Add(59 * time.Minute), false},
+		{"backfilled: min two days early", label.Add(-48 * time.Hour), label.Add(30 * time.Minute), true},
+		{"max spills into next hour", label, label.Add(time.Hour), true},
+		{"empty partition (zero range)", time.Time{}, time.Time{}, false},
+		{"exact hour boundaries", label, label.Add(59*time.Minute + 59*time.Second), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := escapesLabelHour(name, tc.min, tc.max); got != tc.want {
+				t.Errorf("escapesLabelHour(%s, %v, %v) = %v, want %v", name, tc.min, tc.max, got, tc.want)
+			}
+		})
+	}
+
+	if escapesLabelHour("p_future", label.Add(-time.Hour), label) {
+		t.Error("p_future has no hour label; must never report an escape")
+	}
+}

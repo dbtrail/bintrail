@@ -623,7 +623,7 @@ func TestFilterFilesByTimeRange(t *testing.T) {
 
 	since := time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC)
 	until := time.Date(2026, 3, 9, 12, 0, 0, 0, time.UTC)
-	got := filterFilesByTimeRange(files, &since, &until)
+	got := filterFilesByTimeRange(files, &since, &until, nil)
 	// hour=10 ends at 11:00 which is not Before 11:00 → included
 	// hour=11 overlaps → included
 	// hour=12 starts at 12:00 which is not After 12:00 → included
@@ -633,20 +633,20 @@ func TestFilterFilesByTimeRange(t *testing.T) {
 	}
 
 	// Since only
-	got = filterFilesByTimeRange(files, &since, nil)
+	got = filterFilesByTimeRange(files, &since, nil, nil)
 	if len(got) != 4 { // hour=10 ends at 11:00 (not before since), all included
 		t.Errorf("since-only: expected 4, got %d", len(got))
 	}
 
 	// Until only — until=10:30 should include hour=10 only
 	until1030 := time.Date(2026, 3, 9, 10, 30, 0, 0, time.UTC)
-	got = filterFilesByTimeRange(files, nil, &until1030)
+	got = filterFilesByTimeRange(files, nil, &until1030, nil)
 	if len(got) != 1 {
 		t.Errorf("until-only 10:30: expected 1, got %d: %v", len(got), got)
 	}
 
 	// No filters
-	got = filterFilesByTimeRange(files, nil, nil)
+	got = filterFilesByTimeRange(files, nil, nil, nil)
 	if len(got) != 4 {
 		t.Errorf("no filters: expected 4, got %d", len(got))
 	}
@@ -664,7 +664,7 @@ func TestFilterFilesByTimeRange_untilOnlyKeepsVeryOldFiles(t *testing.T) {
 		"s3://b/event_date=2020-01-15/event_hour=10/e.parquet", // ~6 years before "now"
 	}
 	until := time.Date(2026, 5, 20, 0, 0, 0, 0, time.UTC)
-	got := filterFilesByTimeRange(files, nil, &until)
+	got := filterFilesByTimeRange(files, nil, &until, nil)
 	if len(got) != 1 {
 		t.Errorf("until-only should keep a file far older than 31 days when it satisfies until, got %d: %v", len(got), got)
 	}
@@ -673,7 +673,7 @@ func TestFilterFilesByTimeRange_untilOnlyKeepsVeryOldFiles(t *testing.T) {
 func TestFilterFilesByTimeRangeUnparseable(t *testing.T) {
 	files := []string{"s3://bucket/no-hive/events.parquet"}
 	since := time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC)
-	got := filterFilesByTimeRange(files, &since, nil)
+	got := filterFilesByTimeRange(files, &since, nil, nil)
 	if len(got) != 1 {
 		t.Errorf("unparseable files should be kept, got %d", len(got))
 	}
@@ -687,7 +687,7 @@ func TestGenerateDatePrefixes(t *testing.T) {
 	t.Run("both bounds same day", func(t *testing.T) {
 		since := time.Date(2026, 4, 12, 10, 0, 0, 0, time.UTC)
 		until := time.Date(2026, 4, 12, 22, 0, 0, 0, time.UTC)
-		got := generateDatePrefixes(base, &since, &until)
+		got := generateDatePrefixes(base, &since, &until, nil)
 		if len(got) != 1 {
 			t.Fatalf("expected 1 prefix, got %d: %v", len(got), got)
 		}
@@ -699,7 +699,7 @@ func TestGenerateDatePrefixes(t *testing.T) {
 	t.Run("two day span", func(t *testing.T) {
 		since := time.Date(2026, 4, 12, 23, 0, 0, 0, time.UTC)
 		until := time.Date(2026, 4, 13, 1, 0, 0, 0, time.UTC)
-		got := generateDatePrefixes(base, &since, &until)
+		got := generateDatePrefixes(base, &since, &until, nil)
 		if len(got) != 2 {
 			t.Fatalf("expected 2 prefixes, got %d: %v", len(got), got)
 		}
@@ -714,7 +714,7 @@ func TestGenerateDatePrefixes(t *testing.T) {
 	t.Run("cross month boundary", func(t *testing.T) {
 		since := time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)
 		until := time.Date(2026, 4, 1, 23, 0, 0, 0, time.UTC)
-		got := generateDatePrefixes(base, &since, &until)
+		got := generateDatePrefixes(base, &since, &until, nil)
 		if len(got) != 2 {
 			t.Fatalf("expected 2 prefixes, got %d: %v", len(got), got)
 		}
@@ -729,7 +729,7 @@ func TestGenerateDatePrefixes(t *testing.T) {
 	t.Run("exactly 31 days returns prefixes", func(t *testing.T) {
 		since := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
 		until := time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC)
-		got := generateDatePrefixes(base, &since, &until)
+		got := generateDatePrefixes(base, &since, &until, nil)
 		if got == nil {
 			t.Fatal("expected prefixes for exactly 31 days, got nil")
 		}
@@ -741,7 +741,7 @@ func TestGenerateDatePrefixes(t *testing.T) {
 	t.Run("exceeds max days returns nil", func(t *testing.T) {
 		since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 		until := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
-		got := generateDatePrefixes(base, &since, &until)
+		got := generateDatePrefixes(base, &since, &until, nil)
 		if got != nil {
 			t.Errorf("expected nil for wide range, got %d prefixes", len(got))
 		}
@@ -751,7 +751,7 @@ func TestGenerateDatePrefixes(t *testing.T) {
 		// Use yesterday as since — should produce 2 prefixes (yesterday + today).
 		yesterday := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -1)
 		since := yesterday.Add(10 * time.Hour) // yesterday 10:00
-		got := generateDatePrefixes(base, &since, nil)
+		got := generateDatePrefixes(base, &since, nil, nil)
 		if got == nil {
 			t.Fatal("expected prefixes for since-only, got nil")
 		}
@@ -770,7 +770,7 @@ func TestGenerateDatePrefixes(t *testing.T) {
 	// (filterFilesByTimeRange).
 	t.Run("until only, until within 31 days returns nil (no invented start, #774)", func(t *testing.T) {
 		fiveDaysAgo := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -5)
-		got := generateDatePrefixes(base, nil, &fiveDaysAgo)
+		got := generateDatePrefixes(base, nil, &fiveDaysAgo, nil)
 		if got != nil {
 			t.Errorf("expected nil for until-only (recent), got %d prefixes: %v", len(got), got)
 		}
@@ -778,14 +778,14 @@ func TestGenerateDatePrefixes(t *testing.T) {
 
 	t.Run("until only, until older than 31 days returns nil, not a bogus single-day clamp (#774)", func(t *testing.T) {
 		old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-		got := generateDatePrefixes(base, nil, &old)
+		got := generateDatePrefixes(base, nil, &old, nil)
 		if got != nil {
 			t.Errorf("expected nil for until-only (old), got %d prefixes: %v", len(got), got)
 		}
 	})
 
 	t.Run("no bounds returns nil", func(t *testing.T) {
-		got := generateDatePrefixes(base, nil, nil)
+		got := generateDatePrefixes(base, nil, nil, nil)
 		if got != nil {
 			t.Errorf("expected nil for no bounds, got %d prefixes", len(got))
 		}
@@ -868,7 +868,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 45, 0, 0, time.UTC), 3),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if !canTerminateEarly(results, remaining, 3, "") {
+		if !canTerminateEarly(results, remaining, 3, "", nil) {
 			t.Error("expected early termination: next hour=11 is after all results in hour=10")
 		}
 	})
@@ -887,11 +887,11 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 45, 0, 0, time.UTC), 3),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if canTerminateEarly(results, remaining, 3, "DESC") {
+		if canTerminateEarly(results, remaining, 3, "DESC", nil) {
 			t.Error("DESC must never terminate early: the newest hour (11) hasn't been read yet")
 		}
 		// Case-insensitivity mirrors query.OrderDirection elsewhere in this package.
-		if canTerminateEarly(results, remaining, 3, "desc") {
+		if canTerminateEarly(results, remaining, 3, "desc", nil) {
 			t.Error("DESC check must be case-insensitive (lowercase \"desc\")")
 		}
 	})
@@ -903,7 +903,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 11, 45, 0, 0, time.UTC), 3),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if canTerminateEarly(results, remaining, 2, "") {
+		if canTerminateEarly(results, remaining, 2, "", nil) {
 			t.Error("should not terminate: limit-th result is at 11:30, next hour starts at 11:00")
 		}
 	})
@@ -913,7 +913,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 15, 0, 0, time.UTC), 1),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=12/e.parquet"}
-		if canTerminateEarly(results, remaining, 5, "") {
+		if canTerminateEarly(results, remaining, 5, "", nil) {
 			t.Error("should not terminate: not enough results")
 		}
 	})
@@ -923,7 +923,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 15, 0, 0, time.UTC), 1),
 		}
 		remaining := []string{"s3://b/no-hive/events.parquet"}
-		if canTerminateEarly(results, remaining, 1, "") {
+		if canTerminateEarly(results, remaining, 1, "", nil) {
 			t.Error("should not terminate: can't parse remaining file's hour")
 		}
 	})
@@ -937,7 +937,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 30, 0, 0, time.UTC), 3),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if !canTerminateEarly(results, remaining, 2, "") {
+		if !canTerminateEarly(results, remaining, 2, "", nil) {
 			t.Error("expected early termination: sorted 2nd result (10:30) is before hour=11")
 		}
 	})
@@ -949,7 +949,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 11, 0, 0, 0, time.UTC), 1),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if canTerminateEarly(results, remaining, 1, "") {
+		if canTerminateEarly(results, remaining, 1, "", nil) {
 			t.Error("should not terminate: cutoff is exactly at next hour start")
 		}
 	})
@@ -958,7 +958,7 @@ func TestCanTerminateEarly(t *testing.T) {
 		results := []query.ResultRow{
 			mkRow(time.Date(2026, 3, 9, 10, 15, 0, 0, time.UTC), 1),
 		}
-		if canTerminateEarly(results, nil, 1, "") {
+		if canTerminateEarly(results, nil, 1, "", nil) {
 			t.Error("should not terminate: no remaining files")
 		}
 	})
@@ -976,7 +976,7 @@ func TestCanTerminateEarly(t *testing.T) {
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
 		// limit=3 means we'd need 3 real-timestamp rows to ground a cutoff,
 		// but we only have 1. Must not terminate.
-		if canTerminateEarly(results, remaining, 3, "") {
+		if canTerminateEarly(results, remaining, 3, "", nil) {
 			t.Error("should not terminate: only 1 non-drift row, cannot ground cutoff")
 		}
 	})
@@ -993,7 +993,7 @@ func TestCanTerminateEarly(t *testing.T) {
 			mkRow(time.Date(2026, 3, 9, 10, 45, 0, 0, time.UTC), 3),
 		}
 		remaining := []string{"s3://b/event_date=2026-03-09/event_hour=11/e.parquet"}
-		if !canTerminateEarly(results, remaining, 2, "") {
+		if !canTerminateEarly(results, remaining, 2, "", nil) {
 			t.Error("expected early termination: 2nd real row (10:30) is before hour=11, drift rows filtered out")
 		}
 	})
@@ -1399,7 +1399,7 @@ func TestClassifyEmptyS3Listing(t *testing.T) {
 	})
 
 	// TestClassifyEmptyS3Listing/until-only (post-review fix to #774, #876
-	// review): generateDatePrefixes(prefix, nil, old) now unconditionally
+	// review): generateDatePrefixes(prefix, nil, old, nil) now unconditionally
 	// returns nil for since==nil (correctly makes listS3ParquetScoped list
 	// the FULL prefix rather than inventing a bogus window). But that nil-ness
 	// is no longer the right signal for whether classifyEmptyS3Listing should
@@ -1469,4 +1469,84 @@ func TestClassifyEmptyS3Listing(t *testing.T) {
 			t.Errorf("got rows=%v err=%v, want nil/nil (healthy empty range, real data exists elsewhere)", rows, err)
 		}
 	})
+}
+
+// ─── misfiled-archive file scoping (#1037) ──────────────────────────────────
+
+func TestFilterFilesByTimeRange_extraHoursKeepMisfiledFile(t *testing.T) {
+	// A backfill scenario: the queried window is 2026-07-20, but the rows
+	// live in a file archived under the oldest live partition's label two
+	// days later (event_date=2026-07-22/event_hour=01).
+	misfiled := "s3://b/x/bintrail_id=u/event_date=2026-07-22/event_hour=01/events.parquet"
+	inRange := "s3://b/x/bintrail_id=u/event_date=2026-07-20/event_hour=10/events.parquet"
+	outOfRange := "s3://b/x/bintrail_id=u/event_date=2026-07-23/event_hour=05/events.parquet"
+	files := []string{inRange, misfiled, outOfRange}
+
+	since := time.Date(2026, 7, 20, 9, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 7, 20, 23, 0, 0, 0, time.UTC)
+
+	// Without the hint the misfiled file is pruned — the pre-#1037 hole.
+	got := filterFilesByTimeRange(files, &since, &until, nil)
+	if len(got) != 1 || got[0] != inRange {
+		t.Fatalf("without extra hours: got %v, want [%s]", got, inRange)
+	}
+
+	// With the hint (its label hour) it must survive; unrelated out-of-range
+	// files must still be pruned.
+	extra := []time.Time{time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)}
+	got = filterFilesByTimeRange(files, &since, &until, extra)
+	if len(got) != 2 || got[0] != inRange || got[1] != misfiled {
+		t.Fatalf("with extra hours: got %v, want [%s %s]", got, inRange, misfiled)
+	}
+}
+
+func TestGenerateDatePrefixes_extraHoursAppendDates(t *testing.T) {
+	base := "archives/bintrail_id=u/"
+	since := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 7, 20, 23, 0, 0, 0, time.UTC)
+	extra := []time.Time{
+		time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC),  // misfiled label, new day
+		time.Date(2026, 7, 20, 15, 0, 0, 0, time.UTC), // same day as window: no dup
+	}
+	got := generateDatePrefixes(base, &since, &until, extra)
+	want := []string{
+		base + "event_date=2026-07-20/",
+		base + "event_date=2026-07-22/",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("generateDatePrefixes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("prefix[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestGenerateDatePrefixes_extraHoursIrrelevantWhenUnscoped(t *testing.T) {
+	extra := []time.Time{time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)}
+	// No since → unscoped listing: everything is listed anyway.
+	if got := generateDatePrefixes("base/", nil, nil, extra); got != nil {
+		t.Fatalf("expected nil (unscoped) even with extra hours, got %v", got)
+	}
+}
+
+func TestCanTerminateEarly_disabledWithExtraHours(t *testing.T) {
+	// Enough early results to satisfy the limit, and the next file's LABEL
+	// hour is after the cutoff — without extra hours this would terminate.
+	results := []query.ResultRow{
+		{EventID: 1, EventTimestamp: time.Date(2026, 7, 20, 10, 5, 0, 0, time.UTC)},
+		{EventID: 2, EventTimestamp: time.Date(2026, 7, 20, 10, 6, 0, 0, time.UTC)},
+	}
+	remaining := []string{"bintrail_id=u/event_date=2026-07-22/event_hour=01/events.parquet"}
+
+	if !canTerminateEarly(results, remaining, 2, "", nil) {
+		t.Fatal("sanity: expected early termination without extra hours")
+	}
+	// A misfiled file may hold the window's EARLIEST rows despite its late
+	// label — label-order termination is unsound while any hint is present.
+	extra := []time.Time{time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)}
+	if canTerminateEarly(results, remaining, 2, "", extra) {
+		t.Fatal("early termination must be disabled while misfiled-archive hints are present")
+	}
 }

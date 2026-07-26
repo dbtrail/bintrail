@@ -363,6 +363,10 @@ func warnSkippedSources(skipped []string) {
 type mergeSources struct {
 	archSources []string
 	plan        *QueryPlan
+	// misfiledHours is plan.MisfiledArchiveHours, kept separately so fetchPage
+	// can forward it to every archive fetch (as Options.ExtraArchiveHours)
+	// even on paginated walks where per-page Options are rebuilt (#1037).
+	misfiledHours []time.Time
 }
 
 // resolveMergeSources discovers archive sources, runs the coverage planner and
@@ -401,6 +405,13 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 			slog.Warn("query planner failed; coverage gaps may not be detected", "error", err)
 		} else {
 			src.plan = p
+			if p != nil {
+				// Archives whose content escapes their hour label but overlaps
+				// the window (#1037): every archive fetch below must be told to
+				// include these files despite their out-of-range labels, or a
+				// date-pruned S3 read silently skips the backfilled rows.
+				src.misfiledHours = p.MisfiledArchiveHours
+			}
 		}
 	}
 
@@ -453,8 +464,13 @@ func fetchPage(
 		rows = r
 	}
 
+	// Archive fetches get the misfiled-archive file-scoping hint (#1037); the
+	// MySQL fetch above deliberately does not (partition pruning there reads
+	// live partition boundaries, which are always label-accurate).
+	archOpts := o.Opts
+	archOpts.ExtraArchiveHours = src.misfiledHours
 	for _, s := range src.archSources {
-		ar, aerr := o.ArchiveFetcher(ctx, o.Opts, s)
+		ar, aerr := o.ArchiveFetcher(ctx, archOpts, s)
 		if aerr == nil && len(ar) == 0 {
 			// This source has nothing left for the walk. Sound to retire it:
 			// the cursor only ever moves forward, so every later page applies a

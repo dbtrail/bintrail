@@ -141,6 +141,7 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 						return Result{}, fmt.Errorf("create archive directory for %s: %w", name, err)
 					}
 					var n int64
+					var minTS, maxTS time.Time
 					skipped := false
 					if opts.Retry && fileExists(outPath) {
 						// A file existing at outPath with size>0 is NOT sufficient
@@ -172,9 +173,23 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 							fmt.Fprintf(os.Stdout, "skipped partition %s (already archived) → %s\n", name, outPath)
 						}
 					} else {
-						n, err = archive.ArchivePartition(ctx, db, dbName, name, outPath, opts.ArchiveCompression)
-						if err != nil {
-							return Result{}, fmt.Errorf("archive partition %s: %w", name, err)
+						st, aerr := archive.ArchivePartition(ctx, db, dbName, name, outPath, opts.ArchiveCompression)
+						if aerr != nil {
+							return Result{}, fmt.Errorf("archive partition %s: %w", name, aerr)
+						}
+						n, minTS, maxTS = st.Rows, st.MinEventTS, st.MaxEventTS
+						// A partition whose CONTENT escapes its hour label holds
+						// backfilled events (#1037): old rows replayed after a
+						// capture stall land in the oldest live RANGE partition.
+						// The true range is recorded in archive_state below so
+						// time-scoped reads still find these rows; the warning
+						// gives the operator the same fact for pre-existing
+						// misfiled archives and monitoring.
+						if escapesLabelHour(name, minTS, maxTS) {
+							slog.Warn("archived partition contains events outside its hour label (backfilled rows); recording true content time range so time-scoped archive reads still find them",
+								"partition", name,
+								"min_event_ts", minTS.UTC().Format(time.RFC3339),
+								"max_event_ts", maxTS.UTC().Format(time.RFC3339))
 						}
 						if opts.Format != "json" {
 							fmt.Fprintf(os.Stdout, "archived partition %s (%d rows) → %s\n", name, n, outPath)
@@ -207,17 +222,29 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 							insertBucket = s3Bucket
 							insertKey = s3Key
 						}
+						// min/max_event_ts: the content-derived range of the
+						// archived rows (#1037). NULL for an empty partition —
+						// the planner then falls back to the hour label.
+						var insertMin, insertMax any
+						if !minTS.IsZero() {
+							insertMin = minTS.UTC()
+						}
+						if !maxTS.IsZero() {
+							insertMax = maxTS.UTC()
+						}
 						if _, err := db.ExecContext(ctx,
 							`INSERT INTO archive_state
-								(partition_name, bintrail_id, local_path, file_size_bytes, row_count, s3_bucket, s3_key)
-							VALUES (?, ?, ?, ?, ?, ?, ?)
+								(partition_name, bintrail_id, local_path, file_size_bytes, row_count, s3_bucket, s3_key, min_event_ts, max_event_ts)
+							VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 							ON DUPLICATE KEY UPDATE
 								local_path = VALUES(local_path),
 								file_size_bytes = VALUES(file_size_bytes),
 								row_count = VALUES(row_count),
 								s3_bucket = COALESCE(VALUES(s3_bucket), s3_bucket),
-								s3_key = COALESCE(VALUES(s3_key), s3_key)`,
-							name, opts.BintrailID, outPath, fileSize, n, insertBucket, insertKey,
+								s3_key = COALESCE(VALUES(s3_key), s3_key),
+								min_event_ts = VALUES(min_event_ts),
+								max_event_ts = VALUES(max_event_ts)`,
+							name, opts.BintrailID, outPath, fileSize, n, insertBucket, insertKey, insertMin, insertMax,
 						); err != nil {
 							return Result{}, fmt.Errorf("record archive state for %s: %w", name, err)
 						}
@@ -562,6 +589,20 @@ func partitionRowCount(ctx context.Context, db *sql.DB, dbName, partition string
 // be lost by the drop; an unknown archived count is never safe.
 func archivedPartitionUnchanged(archived sql.NullInt64, live int64) bool {
 	return archived.Valid && archived.Int64 == live
+}
+
+// escapesLabelHour reports whether an archived partition's content-derived
+// event_timestamp range [minTS, maxTS] extends outside the hour its name
+// labels (#1037). False when the range is unknown (zero — empty partition) or
+// the name is not an hourly partition.
+func escapesLabelHour(partitionName string, minTS, maxTS time.Time) bool {
+	label, ok := indexer.PartitionDate(partitionName)
+	if !ok || minTS.IsZero() || maxTS.IsZero() {
+		return false
+	}
+	labelStart := label.UTC()
+	labelEnd := labelStart.Add(time.Hour)
+	return minTS.UTC().Before(labelStart) || !maxTS.UTC().Before(labelEnd)
 }
 
 // fileExists reports whether a file exists and has a size greater than zero.

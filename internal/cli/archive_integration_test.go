@@ -50,8 +50,8 @@ func TestArchiveReconcileRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ArchivePartition: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("expected 1 archived row, got %d", n)
+	if n.Rows != 1 {
+		t.Fatalf("expected 1 archived row, got %d", n.Rows)
 	}
 
 	// The registry is LOST (index rebuilt): archive_state is empty.

@@ -3,10 +3,14 @@ package query
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // TimeRange represents a contiguous UTC time range at hour granularity.
@@ -37,6 +41,17 @@ type QueryPlan struct {
 	// index younger than the queried window, every pre-install hour is a
 	// "gap" that was never captured in the first place (#1126).
 	OldestKnownHour time.Time
+
+	// MisfiledArchiveHours are the hour LABELS of archived partitions whose
+	// content-derived time range (archive_state.min/max_event_ts, #1037)
+	// escapes the label hour AND overlaps the queried range. Backfilled
+	// events land in the oldest live RANGE partition and get archived under
+	// its hour label, so a time-scoped read that prunes archive files by
+	// label alone would skip the very file holding those rows. Callers must
+	// copy this into Options.ExtraArchiveHours for their archive fetches so
+	// file/date scoping still opens those files; row-level time filters keep
+	// the result set correct.
+	MisfiledArchiveHours []time.Time
 }
 
 // Plan builds a QueryPlan for the given time range by inspecting live partition
@@ -85,16 +100,20 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 	// Skipped entirely when noArchive: those archives are excluded from the
 	// fetch, so reading their coverage here would only mislabel rotated hours as
 	// covered. Leaving archivedHours nil makes buildPlan classify them as gaps.
-	var archivedHours []time.Time
+	var cov []archiveCoverage
 	if !noArchive {
-		archivedHours, err = loadArchivedHours(ctx, db)
+		cov, err = loadArchiveCoverage(ctx, db)
 		if err != nil {
 			slog.Debug("archive_state not available for planning", "error", err)
-			archivedHours = nil
+			cov = nil
 		}
 	}
 
-	return buildPlan(liveHours, archivedHours, rangeStart, rangeEnd, noArchive), nil
+	plan := buildPlan(liveHours, expandArchiveHours(cov), rangeStart, rangeEnd, noArchive)
+	if plan != nil && !noArchive {
+		plan.MisfiledArchiveHours = misfiledHours(cov, rangeStart, rangeEnd)
+	}
+	return plan, nil
 }
 
 // buildPlan is the pure-logic core of the planner. It classifies each hour in
@@ -280,9 +299,64 @@ func loadLivePartitionHours(ctx context.Context, db *sql.DB, dbName string) ([]t
 	return hours, rows.Err()
 }
 
-// loadArchivedHours returns the sorted set of hours that have been archived
-// to Parquet (from archive_state partition names).
-func loadArchivedHours(ctx context.Context, db *sql.DB) ([]time.Time, error) {
+// archiveCoverage describes one archive_state row's time coverage: the hour
+// parsed from its partition_name label plus the content-derived
+// min/max_event_ts range of the archived rows (#1037). Min/Max are the zero
+// time when unknown — rows written before the columns existed, or registered
+// by upload/reconcile, which never scan row contents.
+type archiveCoverage struct {
+	Label    time.Time
+	Min, Max time.Time
+}
+
+// maxCoverageSpan bounds how far a single archive's content range may expand
+// its claimed hour coverage. A corrupt/zero-date min_event_ts would otherwise
+// make expandArchiveHours enumerate millions of hours. Rows exceeding it fall
+// back to label-only coverage (the pre-#1037 behavior).
+const maxCoverageSpan = 20 * 366 * 24 * time.Hour
+
+// loadArchiveCoverage returns per-row archive coverage from archive_state.
+// On an index whose archive_state predates the min/max_event_ts columns
+// (error 1054 — the migration only runs where EnsureSchema does, e.g. rotate),
+// it falls back to label-only coverage so planning keeps working unchanged.
+func loadArchiveCoverage(ctx context.Context, db *sql.DB) ([]archiveCoverage, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT partition_name, min_event_ts, max_event_ts
+		FROM archive_state
+		ORDER BY partition_name`)
+	if err != nil {
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1054 {
+			return loadArchiveCoverageLegacy(ctx, db)
+		}
+		return nil, err
+	}
+	defer rows.Close()
+
+	var cov []archiveCoverage
+	for rows.Next() {
+		var name string
+		var minTS, maxTS sql.NullTime
+		if err := rows.Scan(&name, &minTS, &maxTS); err != nil {
+			return nil, err
+		}
+		t, ok := ParsePartitionName(name)
+		if !ok {
+			continue
+		}
+		c := archiveCoverage{Label: t}
+		if minTS.Valid && maxTS.Valid {
+			c.Min = minTS.Time.UTC()
+			c.Max = maxTS.Time.UTC()
+		}
+		cov = append(cov, c)
+	}
+	return cov, rows.Err()
+}
+
+// loadArchiveCoverageLegacy is loadArchiveCoverage for pre-#1037 archive_state
+// schemas: partition names only, no content range.
+func loadArchiveCoverageLegacy(ctx context.Context, db *sql.DB) ([]archiveCoverage, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT DISTINCT partition_name
 		FROM archive_state
@@ -292,17 +366,108 @@ func loadArchivedHours(ctx context.Context, db *sql.DB) ([]time.Time, error) {
 	}
 	defer rows.Close()
 
-	var hours []time.Time
+	var cov []archiveCoverage
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return nil, err
 		}
 		if t, ok := ParsePartitionName(name); ok {
-			hours = append(hours, t)
+			cov = append(cov, archiveCoverage{Label: t})
 		}
 	}
-	return hours, rows.Err()
+	return cov, rows.Err()
+}
+
+// expandArchiveHours converts archive coverage rows into the sorted, deduped
+// set of hours the archives actually hold data for: each row's label hour,
+// widened to every hour in its content range [Min, Max] when known (#1037).
+// The widening is sound for gap classification: RANGE partitioning routes any
+// captured event older than a partition's upper bound into the oldest live
+// partition, so events inside a misfiled archive's content range have no
+// other place they could live — an hour in that span with no events anywhere
+// is exactly as empty as an unlabeled hour today.
+func expandArchiveHours(cov []archiveCoverage) []time.Time {
+	seen := make(map[time.Time]bool, len(cov))
+	var hours []time.Time
+	add := func(h time.Time) {
+		if !seen[h] {
+			seen[h] = true
+			hours = append(hours, h)
+		}
+	}
+	for _, c := range cov {
+		add(c.Label)
+		if c.Min.IsZero() || c.Max.IsZero() || c.Max.Before(c.Min) {
+			continue
+		}
+		if c.Max.Sub(c.Min) > maxCoverageSpan {
+			slog.Debug("archive content range implausibly wide; using label-only coverage",
+				"partition_hour", c.Label, "min_event_ts", c.Min, "max_event_ts", c.Max)
+			continue
+		}
+		for h := c.Min.Truncate(time.Hour); !h.After(c.Max); h = h.Add(time.Hour) {
+			add(h)
+		}
+	}
+	slices.SortFunc(hours, func(a, b time.Time) int { return a.Compare(b) })
+	return hours
+}
+
+// misfiledHours returns the sorted, deduped hour LABELS of archives whose
+// content range escapes their label hour AND overlaps [rangeStart, rangeEnd)
+// (#1037). Zero rangeStart/rangeEnd mean an open bound. These are the files a
+// label-pruning archive fetch would wrongly skip for this range, so callers
+// forward them as Options.ExtraArchiveHours.
+func misfiledHours(cov []archiveCoverage, rangeStart, rangeEnd time.Time) []time.Time {
+	seen := make(map[time.Time]bool)
+	var hours []time.Time
+	for _, c := range cov {
+		if c.Min.IsZero() || c.Max.IsZero() || c.Max.Before(c.Min) {
+			continue
+		}
+		// Content within the label hour → the label already prunes correctly.
+		if !c.Min.Before(c.Label) && c.Max.Before(c.Label.Add(time.Hour)) {
+			continue
+		}
+		// Content range must overlap the queried range.
+		if !rangeEnd.IsZero() && !c.Min.Before(rangeEnd) {
+			continue
+		}
+		if !rangeStart.IsZero() && c.Max.Before(rangeStart) {
+			continue
+		}
+		if !seen[c.Label] {
+			seen[c.Label] = true
+			hours = append(hours, c.Label)
+		}
+	}
+	slices.SortFunc(hours, func(a, b time.Time) int { return a.Compare(b) })
+	return hours
+}
+
+// MisfiledArchiveHours is the standalone form of QueryPlan.MisfiledArchiveHours
+// for callers that fetch archives without running the full planner (e.g. the
+// MCP query/recover tools). It reads archive_state coverage and returns the
+// hour labels of misfiled archives overlapping [since, until]; nil bounds are
+// open. Returns (nil, nil) when db is nil or no time bound is set (no pruning
+// happens then, so nothing can be missed).
+func MisfiledArchiveHours(ctx context.Context, db *sql.DB, since, until *time.Time) ([]time.Time, error) {
+	if db == nil || (since == nil && until == nil) {
+		return nil, nil
+	}
+	cov, err := loadArchiveCoverage(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	var rangeStart, rangeEnd time.Time
+	if since != nil {
+		rangeStart = since.Truncate(time.Hour)
+	}
+	if until != nil {
+		rangeEnd = until.Truncate(time.Hour).Add(time.Hour)
+	}
+	return misfiledHours(cov, rangeStart, rangeEnd), nil
 }
 
 // ParsePartitionName converts a partition name like "p_2026021914" to the

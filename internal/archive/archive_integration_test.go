@@ -46,8 +46,8 @@ func TestArchivePartition_nullBinlogFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ArchivePartition failed: %v", err)
 	}
-	if n != 2 {
-		t.Errorf("rowCount = %d, want 2", n)
+	if n.Rows != 2 {
+		t.Errorf("rowCount = %d, want 2", n.Rows)
 	}
 
 	// Verify NULL semantics at the Parquet layer: row 0 (the non-NULL row,
@@ -164,8 +164,8 @@ func TestArchivePartition_queryTextRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ArchivePartition failed: %v", err)
 	}
-	if n != 2 {
-		t.Fatalf("rowCount = %d, want 2", n)
+	if n.Rows != 2 {
+		t.Fatalf("rowCount = %d, want 2", n.Rows)
 	}
 
 	rf, err := os.Open(outPath)
@@ -233,8 +233,8 @@ func TestArchivePartition_commitTsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ArchivePartition failed: %v", err)
 	}
-	if n != 2 {
-		t.Fatalf("rowCount = %d, want 2", n)
+	if n.Rows != 2 {
+		t.Fatalf("rowCount = %d, want 2", n.Rows)
 	}
 
 	rf, err := os.Open(outPath)

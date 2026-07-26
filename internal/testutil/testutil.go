@@ -384,6 +384,8 @@ func InitIndexTables(t *testing.T, db *sql.DB) {
 		s3_bucket       VARCHAR(255),
 		s3_key          VARCHAR(1024),
 		s3_uploaded_at  DATETIME,
+		min_event_ts    DATETIME DEFAULT NULL,
+		max_event_ts    DATETIME DEFAULT NULL,
 		archived_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE KEY uq_partition (partition_name, bintrail_id)
 	) ENGINE=InnoDB`)

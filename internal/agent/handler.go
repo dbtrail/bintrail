@@ -296,6 +296,19 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 		}
 		rows = append(rows, r...)
 	}
+	if len(h.ArchiveSources) > 0 && h.IndexDB != nil {
+		// Misfiled archives (#1037): archives whose content-derived range
+		// (archive_state.min/max_event_ts) overlaps the window despite an
+		// out-of-range hour label must survive date/file pruning. Best-effort:
+		// without an index DB (archive-only handlers) this stays nil and
+		// pruning falls back to labels.
+		hours, mErr := query.MisfiledArchiveHours(ctx, h.IndexDB, opts.Since, opts.Until)
+		if mErr != nil {
+			h.logger().Warn("could not check archive_state for misfiled archives", "error", mErr)
+		} else {
+			opts.ExtraArchiveHours = hours
+		}
+	}
 	for _, src := range h.ArchiveSources {
 		r, err := parquetquery.Fetch(ctx, opts, src)
 		if err != nil {

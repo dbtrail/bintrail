@@ -51,10 +51,26 @@ var BinlogEventColumns = []baseline.Column{
 	{Name: "commit_ts_us", MySQLType: "bigint", Unsigned: true, ParquetType: baseline.MysqlToParquetNode2("bigint", true)},
 }
 
+// Stats summarizes what ArchivePartition wrote: the row count and the
+// content-derived event_timestamp range of the archived rows. MinEventTS and
+// MaxEventTS are the zero time when the partition had no rows (or none with a
+// non-NULL event_timestamp). They exist because a partition's NAME is not a
+// reliable statement of what it holds (#1037): backfilled events older than
+// the oldest live RANGE partition boundary land in that oldest partition, so
+// the file archived under its hour label can contain rows from much earlier
+// hours. Callers record this true range in archive_state so time-scoped
+// pruning consults content, not just the label.
+type Stats struct {
+	Rows       int64
+	MinEventTS time.Time
+	MaxEventTS time.Time
+}
+
 // ArchivePartition writes all rows from the named partition of binlog_events
 // to a Parquet file at outputPath. The db must have been opened with
 // parseTime=true (i.e. via config.Connect) so DATETIME columns scan as
-// time.Time. Returns the number of rows written.
+// time.Time. Returns Stats for the rows written (count + content min/max
+// event_timestamp).
 //
 // The file is written to outputPath+".tmp" and atomically renamed into place
 // only after the write completes and the writer is closed (issue #802): a
@@ -65,7 +81,7 @@ var BinlogEventColumns = []baseline.Column{
 // truncates it) and is otherwise ignored — nothing ever reads from it.
 //
 // On error the partial .tmp output file is removed before returning.
-func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, outputPath, compression string) (int64, error) {
+func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, outputPath, compression string) (Stats, error) {
 	tmpPath := outputPath + ".tmp"
 	cfg := baseline.WriterConfig{
 		Compression:  compression,
@@ -79,7 +95,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 
 	w, err := baseline.NewWriter(tmpPath, BinlogEventColumns, cfg)
 	if err != nil {
-		return 0, fmt.Errorf("create parquet writer: %w", err)
+		return Stats{}, fmt.Errorf("create parquet writer: %w", err)
 	}
 
 	var closed bool
@@ -99,11 +115,11 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 	)
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
-		return 0, fmt.Errorf("query partition %s: %w", partition, err)
+		return Stats{}, fmt.Errorf("query partition %s: %w", partition, err)
 	}
 	defer rows.Close()
 
-	var rowCount int64
+	var stats Stats
 	for rows.Next() {
 		// Every NOT NULL column is scanned defensively and its
 		// Valid bit is propagated into the nulls[] slice so the Parquet
@@ -137,7 +153,7 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 			&changedColumns, &rowBefore, &rowAfter, &schemaVersion, &queryText, &queryHash,
 			&commitTsUS,
 		); err != nil {
-			return rowCount, fmt.Errorf("scan row: %w", err)
+			return stats, fmt.Errorf("scan row: %w", err)
 		}
 
 		connIDStr := ""
@@ -150,7 +166,17 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		}
 		eventTimestampStr := ""
 		if eventTimestamp.Valid {
-			eventTimestampStr = eventTimestamp.Time.UTC().Format("2006-01-02 15:04:05")
+			ts := eventTimestamp.Time.UTC()
+			eventTimestampStr = ts.Format("2006-01-02 15:04:05")
+			// Content-derived time range of the file (#1037). Tracked from the
+			// exact rows written — not a separate MIN()/MAX() query — so the
+			// recorded range can never disagree with the file's contents.
+			if stats.MinEventTS.IsZero() || ts.Before(stats.MinEventTS) {
+				stats.MinEventTS = ts
+			}
+			if stats.MaxEventTS.IsZero() || ts.After(stats.MaxEventTS) {
+				stats.MaxEventTS = ts
+			}
 		}
 
 		values := []string{
@@ -195,24 +221,24 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		}
 
 		if err := w.WriteRow(values, nulls); err != nil {
-			return rowCount, fmt.Errorf("write row: %w", err)
+			return stats, fmt.Errorf("write row: %w", err)
 		}
-		rowCount++
+		stats.Rows++
 	}
 	if err := rows.Err(); err != nil {
-		return rowCount, fmt.Errorf("iterate rows: %w", err)
+		return stats, fmt.Errorf("iterate rows: %w", err)
 	}
 
 	closed = true
 	if err := w.Close(); err != nil {
 		os.Remove(tmpPath) //nolint
-		return rowCount, fmt.Errorf("close writer: %w", err)
+		return stats, fmt.Errorf("close writer: %w", err)
 	}
 	if err := os.Rename(tmpPath, outputPath); err != nil {
 		os.Remove(tmpPath) //nolint
-		return rowCount, fmt.Errorf("rename %s into place: %w", tmpPath, err)
+		return stats, fmt.Errorf("rename %s into place: %w", tmpPath, err)
 	}
-	return rowCount, nil
+	return stats, nil
 }
 
 // ValidateArchiveFile opens the Parquet file at path just far enough to read

@@ -80,8 +80,8 @@ func TestFetchMerged_archiveAware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ArchivePartition: %v", err)
 	}
-	if archivedRows != 1 {
-		t.Fatalf("expected 1 archived row, got %d", archivedRows)
+	if archivedRows.Rows != 1 {
+		t.Fatalf("expected 1 archived row, got %d", archivedRows.Rows)
 	}
 
 	// Register the archive in archive_state so ResolveArchiveSources can find it.

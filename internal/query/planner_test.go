@@ -378,3 +378,128 @@ func TestBuildPlan_noBoundsReturnsNil(t *testing.T) {
 		t.Errorf("expected nil for zero-value bounds, got %+v", plan)
 	}
 }
+
+// ─── archive content coverage (#1037) ───────────────────────────────────────
+
+func TestExpandArchiveHours_contentRangeWidensCoverage(t *testing.T) {
+	label := time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)
+	// Backfilled partition: content starts 3 hours before the label hour.
+	cov := []archiveCoverage{{
+		Label: label,
+		Min:   label.Add(-3 * time.Hour).Add(10 * time.Minute),
+		Max:   label.Add(45 * time.Minute),
+	}}
+	got := expandArchiveHours(cov)
+	want := []time.Time{
+		label.Add(-3 * time.Hour),
+		label.Add(-2 * time.Hour),
+		label.Add(-time.Hour),
+		label,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expandArchiveHours = %v, want %v", got, want)
+	}
+	for i := range want {
+		if !got[i].Equal(want[i]) {
+			t.Errorf("hour[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestExpandArchiveHours_labelOnlyFallbacks(t *testing.T) {
+	label := time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		cov  archiveCoverage
+	}{
+		{"zero min/max (pre-#1037 row)", archiveCoverage{Label: label}},
+		{"inverted range", archiveCoverage{Label: label, Min: label.Add(time.Hour), Max: label}},
+		{"implausibly wide range", archiveCoverage{
+			Label: label,
+			Min:   label.Add(-maxCoverageSpan - time.Hour),
+			Max:   label,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := expandArchiveHours([]archiveCoverage{tc.cov})
+			if len(got) != 1 || !got[0].Equal(label) {
+				t.Errorf("expandArchiveHours = %v, want just the label hour %v", got, label)
+			}
+		})
+	}
+}
+
+func TestExpandArchiveHours_dedupesAcrossRows(t *testing.T) {
+	l1 := time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)
+	l2 := l1.Add(time.Hour)
+	cov := []archiveCoverage{
+		{Label: l1, Min: l1, Max: l2.Add(30 * time.Minute)}, // spills into l2
+		{Label: l2, Min: l2, Max: l2.Add(59 * time.Minute)},
+	}
+	got := expandArchiveHours(cov)
+	if len(got) != 2 || !got[0].Equal(l1) || !got[1].Equal(l2) {
+		t.Errorf("expandArchiveHours = %v, want [%v %v]", got, l1, l2)
+	}
+}
+
+func TestMisfiledHours(t *testing.T) {
+	label := time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)
+	// Misfiled: content spans two days before the label (the #1037 backfill).
+	misfiled := archiveCoverage{
+		Label: label,
+		Min:   label.Add(-48 * time.Hour),
+		Max:   label.Add(30 * time.Minute),
+	}
+	// Well-filed: content inside its own label hour.
+	wellFiled := archiveCoverage{
+		Label: label.Add(time.Hour),
+		Min:   label.Add(time.Hour),
+		Max:   label.Add(time.Hour + 59*time.Minute),
+	}
+	// Unknown content (pre-#1037 row): never reported misfiled.
+	unknown := archiveCoverage{Label: label.Add(2 * time.Hour)}
+	cov := []archiveCoverage{misfiled, wellFiled, unknown}
+
+	t.Run("window over backfilled hours returns the misfiled label", func(t *testing.T) {
+		start := label.Add(-40 * time.Hour)
+		end := label.Add(-39 * time.Hour)
+		got := misfiledHours(cov, start, end)
+		if len(got) != 1 || !got[0].Equal(label) {
+			t.Fatalf("misfiledHours = %v, want [%v]", got, label)
+		}
+	})
+
+	t.Run("window not overlapping content returns nothing", func(t *testing.T) {
+		start := label.Add(-80 * time.Hour)
+		end := label.Add(-72 * time.Hour)
+		if got := misfiledHours(cov, start, end); len(got) != 0 {
+			t.Fatalf("misfiledHours = %v, want empty", got)
+		}
+	})
+
+	t.Run("open start bound", func(t *testing.T) {
+		got := misfiledHours(cov, time.Time{}, label.Add(-39*time.Hour))
+		if len(got) != 1 || !got[0].Equal(label) {
+			t.Fatalf("misfiledHours = %v, want [%v]", got, label)
+		}
+	})
+
+	t.Run("open end bound", func(t *testing.T) {
+		got := misfiledHours(cov, label.Add(-40*time.Hour), time.Time{})
+		if len(got) != 1 || !got[0].Equal(label) {
+			t.Fatalf("misfiledHours = %v, want [%v]", got, label)
+		}
+	})
+
+	t.Run("well-filed archives never reported", func(t *testing.T) {
+		// Window covering exactly the well-filed hour — past the misfiled
+		// archive's content max, so only wellFiled/unknown are candidates,
+		// and neither may be reported.
+		start := wellFiled.Min
+		end := wellFiled.Min.Add(time.Hour)
+		if got := misfiledHours(cov, start, end); len(got) != 0 {
+			t.Fatalf("misfiledHours = %v, want empty (content within label hour)", got)
+		}
+	})
+}

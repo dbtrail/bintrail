@@ -215,6 +215,8 @@ const ddlArchiveState = `CREATE TABLE IF NOT EXISTS archive_state (
     s3_bucket       VARCHAR(255),
     s3_key          VARCHAR(1024),
     s3_uploaded_at  DATETIME,
+    min_event_ts    DATETIME DEFAULT NULL COMMENT 'MIN(event_timestamp) of the archived rows; NULL for archives written before #1037 or registered by upload/reconcile. Content-derived pruning: may precede the partition hour label when backfilled events landed in the partition',
+    max_event_ts    DATETIME DEFAULT NULL COMMENT 'MAX(event_timestamp) of the archived rows; see min_event_ts (#1037)',
     archived_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_partition (partition_name, bintrail_id)
 ) ENGINE=InnoDB`

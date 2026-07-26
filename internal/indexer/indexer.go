@@ -651,6 +651,28 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
+	// min_event_ts/max_event_ts record the content-derived event_timestamp
+	// range of each archived partition (#1037). A backfill after a capture
+	// stall lands old events in the OLDEST live RANGE partition, so the
+	// Parquet file archived under that partition's hour label can hold rows
+	// from much earlier hours; any pruning that trusts the label alone
+	// (planner hour mapping, date-scoped S3 listings) then silently skips
+	// them. The planner reads these columns to expand archive coverage and to
+	// tell the archive fetcher which mislabeled files a time-scoped read must
+	// still open. NULL on rows written before this column existed (or by
+	// upload/reconcile, which do not scan row contents): the planner falls
+	// back to label-only pruning for those rows, exactly the pre-#1037
+	// behavior.
+	if err := ensureColumn(db, "archive_state", "min_event_ts",
+		`ALTER TABLE archive_state ADD COLUMN min_event_ts DATETIME DEFAULT NULL COMMENT 'MIN(event_timestamp) of the archived rows; NULL for archives written before #1037 or registered by upload/reconcile. Content-derived pruning: may precede the partition hour label when backfilled events landed in the partition' AFTER s3_uploaded_at`,
+	); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "archive_state", "max_event_ts",
+		`ALTER TABLE archive_state ADD COLUMN max_event_ts DATETIME DEFAULT NULL COMMENT 'MAX(event_timestamp) of the archived rows; see min_event_ts (#1037)' AFTER min_event_ts`,
+	); err != nil {
+		return err
+	}
 	// gap_lost_at/_detail record an unfillable-gap auto-advance durably
 	// (#402): the advanced checkpoint is persisted, so without these columns
 	// the only trace of the permanently lost events would be an in-memory

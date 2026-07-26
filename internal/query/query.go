@@ -241,11 +241,22 @@ type Options struct {
 	// rather than returning a silently truncated stream.
 	//
 	// nil = no cursor (fetch from the start of the window).
-	AfterEvent    *EventCursor
-	ChangedColumn string     // column name; matched via JSON_CONTAINS
-	ColumnEq      []ColumnEq // match against values inside row_after / row_before
-	Flag          string     // return events from tables/columns carrying this flag
-	Limit         int        // 0 → no limit (no LIMIT clause emitted)
+	AfterEvent *EventCursor
+	// ExtraArchiveHours lists the hour LABELS of archive files whose CONTENT
+	// time range overlaps the query window even though their partition/Hive
+	// path label does not (#1037: backfilled events archived under the oldest
+	// live partition's label). It is a FILE-SCOPING hint consumed only by the
+	// archive fetcher (parquetquery): date-scoped S3 listings and Hive-path
+	// pruning include these labels' files, and label-order early termination
+	// is disabled while any are present. It is NEVER a row filter — Since /
+	// Until / SincePos / UntilPos still bound the returned events — and the
+	// MySQL engine ignores it. Populated from QueryPlan.MisfiledArchiveHours
+	// (or query.MisfiledArchiveHours) by callers that prune archives by time.
+	ExtraArchiveHours []time.Time
+	ChangedColumn     string     // column name; matched via JSON_CONTAINS
+	ColumnEq          []ColumnEq // match against values inside row_after / row_before
+	Flag              string     // return events from tables/columns carrying this flag
+	Limit             int        // 0 → no limit (no LIMIT clause emitted)
 	// LimitPerPK caps the number of latest events returned per pk_values value.
 	// 0 = unlimited. Applied via ROW_NUMBER OVER (PARTITION BY pk_values
 	// ORDER BY event_timestamp DESC, event_id DESC) so the kept events are

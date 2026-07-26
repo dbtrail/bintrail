@@ -230,3 +230,43 @@ func TestFetchMergedResolverFailure(t *testing.T) {
 		}
 	})
 }
+
+// ─── misfiled-archive hint threading (#1037) ────────────────────────────────
+
+// TestFetchPage_forwardsMisfiledHoursToArchiveFetcher pins the seam that makes
+// content-derived pruning reach the archive fetcher: the misfiled hour labels
+// resolved once per walk (mergeSources.misfiledHours, from
+// QueryPlan.MisfiledArchiveHours) must arrive on every archive fetch as
+// Options.ExtraArchiveHours. Losing this hop silently reopens #1037 — the
+// date-scoped S3 listing would prune the very file holding backfilled rows.
+func TestFetchPage_forwardsMisfiledHoursToArchiveFetcher(t *testing.T) {
+	misfiled := []time.Time{time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)}
+	var got [][]time.Time
+	fetcher := func(ctx context.Context, opts Options, source string) ([]ResultRow, error) {
+		got = append(got, opts.ExtraArchiveHours)
+		return []ResultRow{{EventID: 1}}, nil
+	}
+	src := mergeSources{
+		archSources:   []string{"srcA", "srcB"},
+		misfiledHours: misfiled,
+		// Empty plan: SkipMySQL()==true, so the nil engine is never touched.
+		plan: &QueryPlan{},
+	}
+	o := FetchMergedOptions{Opts: Options{}, AllowGaps: true, ArchiveFetcher: fetcher}
+
+	rows, skipped, exhausted, err := fetchPage(context.Background(), nil, o, src)
+	if err != nil {
+		t.Fatalf("fetchPage: %v", err)
+	}
+	if len(rows) == 0 || len(skipped) != 0 || len(exhausted) != 0 {
+		t.Fatalf("unexpected fetch outcome: rows=%d skipped=%v exhausted=%v", len(rows), skipped, exhausted)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 archive fetches, got %d", len(got))
+	}
+	for i, hours := range got {
+		if len(hours) != 1 || !hours[0].Equal(misfiled[0]) {
+			t.Errorf("fetch %d: ExtraArchiveHours = %v, want %v", i, hours, misfiled)
+		}
+	}
+}

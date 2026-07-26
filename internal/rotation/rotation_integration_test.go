@@ -17,6 +17,8 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/archive"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/parquetquery"
+	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -945,5 +947,101 @@ func TestPerformRotation_LocalOnlyArchiveNotPruned(t *testing.T) {
 	}
 	if _, err := os.Stat(outPath); err != nil {
 		t.Errorf("local-only archive %s must survive (it is the durable copy); stat err = %v", outPath, err)
+	}
+}
+
+// ─── backfill archived under the wrong hour label (#1037) ────────────────────
+
+// TestPerformRotation_BackfilledPartitionStaysTimeQueryable reproduces #1037
+// end-to-end: a capture stall is recovered by replaying two-day-old events,
+// which RANGE partitioning files into the OLDEST live partition; rotation then
+// archives that partition under its own hour label. Before the fix any
+// time-scoped read for the backfilled window missed those rows — the planner
+// classified the hours as gaps (label-only archive coverage → strict mode
+// aborted with a GapError) and label-pruned S3 listings skipped the file.
+//
+// With content-derived pruning, rotation records the archive's true
+// MIN/MAX(event_timestamp) in archive_state; the planner counts the spanned
+// hours as covered and reports the misfiled label so the fetch opens the file.
+func TestPerformRotation_BackfilledPartitionStaysTimeQueryable(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Oldest (and only named) live partition, already past retention.
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1})
+
+	// Backfilled events carry their ORIGINAL binlog timestamps, two days and
+	// one day before h1 — far older than the partition's hour label. The
+	// native event belongs to h1's own hour.
+	backfillOld := h1.Add(-48 * time.Hour).Add(10 * time.Minute)
+	backfillMid := h1.Add(-24 * time.Hour).Add(20 * time.Minute)
+	native := h1.Add(30 * time.Minute)
+	const tsFmt = "2006-01-02 15:04:05"
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, backfillOld.Format(tsFmt), nil, "testdb", "users", 1, "1", nil, nil, []byte(`{"id":1}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, backfillMid.Format(tsFmt), nil, "testdb", "users", 1, "2", nil, nil, []byte(`{"id":2}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, native.Format(tsFmt), nil, "testdb", "users", 1, "3", nil, nil, []byte(`{"id":3}`))
+
+	archiveDir := t.TempDir()
+	bintrailID := "test-uuid-1037"
+	res, err := Perform(context.Background(), db, dbName, Options{
+		RetainDur:          24 * time.Hour,
+		ArchiveDir:         archiveDir,
+		BintrailID:         bintrailID,
+		ArchiveCompression: "none",
+		Format:             "text",
+		NoReplace:          true,
+	})
+	if err != nil {
+		t.Fatalf("Perform: %v", err)
+	}
+	if res.Dropped != 1 {
+		t.Fatalf("expected 1 partition dropped, got %d", res.Dropped)
+	}
+
+	// archive_state must record the CONTENT time range, not the label hour.
+	var minTS, maxTS sql.NullTime
+	if err := db.QueryRow(
+		`SELECT min_event_ts, max_event_ts FROM archive_state WHERE partition_name = ? AND bintrail_id = ?`,
+		indexer.PartitionName(h1), bintrailID,
+	).Scan(&minTS, &maxTS); err != nil {
+		t.Fatalf("read archive_state content range: %v", err)
+	}
+	if !minTS.Valid || !minTS.Time.UTC().Equal(backfillOld) {
+		t.Errorf("min_event_ts = %v (valid=%v), want %v", minTS.Time, minTS.Valid, backfillOld)
+	}
+	if !maxTS.Valid || !maxTS.Time.UTC().Equal(native) {
+		t.Errorf("max_event_ts = %v (valid=%v), want %v", maxTS.Time, maxTS.Valid, native)
+	}
+
+	// The mutation-killer: a STRICT time-scoped read of the backfilled
+	// window must find the replayed event. On pre-#1037 main this failed
+	// twice over — FetchMerged returned a GapError (the hours counted as
+	// uncovered) and label-based file pruning skipped the archive.
+	since := backfillOld.Add(-time.Minute)
+	until := backfillOld.Add(time.Hour)
+	rows, plan, err := query.FetchMerged(context.Background(), db, query.New(db), query.FetchMergedOptions{
+		Opts:           query.Options{Schema: "testdb", Table: "users", Since: &since, Until: &until},
+		DBName:         dbName,
+		AllowGaps:      false,
+		ArchiveFetcher: parquetquery.Fetch,
+	})
+	if err != nil {
+		t.Fatalf("strict FetchMerged over the backfilled window: %v", err)
+	}
+	if len(rows) != 1 || rows[0].PKValues != "1" {
+		t.Fatalf("expected exactly the backfilled event (pk=1), got %d rows: %+v", len(rows), rows)
+	}
+	if plan == nil {
+		t.Fatal("expected a query plan")
+	}
+	foundLabel := false
+	for _, h := range plan.MisfiledArchiveHours {
+		if h.Equal(h1) {
+			foundLabel = true
+		}
+	}
+	if !foundLabel {
+		t.Errorf("plan.MisfiledArchiveHours = %v, want to include the misfiled label hour %v", plan.MisfiledArchiveHours, h1)
 	}
 }

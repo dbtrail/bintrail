@@ -92,13 +92,15 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 		// away the very file a position-anchored fetch needs (see
 		// sinceLowerBoundHint).
 		sinceHint := sinceLowerBoundHint(opts)
-		files, maxSize, region, s3Client, err := listS3ParquetScoped(ctx, source, sinceHint, opts.Until)
+		files, maxSize, region, s3Client, err := listS3ParquetScoped(ctx, source, sinceHint, opts.Until, opts.ExtraArchiveHours)
 		if err != nil {
 			return nil, fmt.Errorf("list S3 archive files: %w", err)
 		}
 		// Pre-filter files by Hive partition values (event_date/event_hour)
 		// to avoid downloading parquet files outside the requested time range.
-		files = filterFilesByTimeRange(files, sinceHint, opts.Until)
+		// ExtraArchiveHours (#1037) exempts misfiled files — archives whose
+		// label hour lies outside the range but whose content overlaps it.
+		files = filterFilesByTimeRange(files, sinceHint, opts.Until, opts.ExtraArchiveHours)
 		// Sort chronologically so we can terminate early when --limit is satisfied.
 		files = sortFilesByHour(files)
 		slog.Debug("files after time-range pruning", "count", len(files))
@@ -157,7 +159,7 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 			// Per-file early termination: stop as soon as no remaining file
 			// can produce a row earlier than what we already have.
 			if opts.Limit > 0 && len(results) >= opts.Limit && i+1 < len(files) {
-				if canTerminateEarly(results, files[i+1:], opts.Limit, opts.Order) {
+				if canTerminateEarly(results, files[i+1:], opts.Limit, opts.Order, opts.ExtraArchiveHours) {
 					slog.Debug("early termination: collected enough results",
 						"collected", len(results), "limit", opts.Limit,
 						"remaining_files", len(files)-i-1)
@@ -288,7 +290,7 @@ func parquetColumnsFromFiles(ctx context.Context, db *sql.DB, files []string) (m
 // This avoids listing all files in the archive when only a narrow time range is needed.
 // It returns the S3 client configured for the bucket's region so callers can reuse
 // it for downloads without loading the AWS config again.
-func listS3ParquetScoped(ctx context.Context, source string, since, until *time.Time) (files []string, maxSize int64, region string, client *s3.Client, err error) {
+func listS3ParquetScoped(ctx context.Context, source string, since, until *time.Time, extraHours []time.Time) (files []string, maxSize int64, region string, client *s3.Client, err error) {
 	bucket, prefix, err := parseS3Source(source)
 	if err != nil {
 		return nil, 0, "", nil, err
@@ -336,7 +338,7 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 
 	// Generate date-scoped prefixes when time range is narrow enough.
 	// This avoids listing thousands of irrelevant files for large archives.
-	datePrefixes := generateDatePrefixes(prefix, since, until)
+	datePrefixes := generateDatePrefixes(prefix, since, until, extraHours)
 	if datePrefixes == nil {
 		// Wide range or no time bounds — list everything under the base prefix.
 		datePrefixes = []string{prefix}
@@ -457,7 +459,12 @@ const maxScopedDays = 31
 // HandleRecover, which is TimeEnd-only). The real tradeoff: this trades some
 // S3 listing performance on that reachable path for correctness — no
 // listing scope narrower than "everything" is safe without a lower bound.
-func generateDatePrefixes(basePrefix string, since, until *time.Time) []string {
+// extraHours (#1037) are misfiled-archive hour labels whose files must be
+// findable even though those labels fall outside [since, until]: their DATE
+// prefixes are appended to the scoped listing so the files get listed at all.
+// They never shrink the listing — with scoping disabled (nil return)
+// everything is listed and no extra prefixes are needed.
+func generateDatePrefixes(basePrefix string, since, until *time.Time, extraHours []time.Time) []string {
 	if since == nil {
 		return nil
 	}
@@ -478,10 +485,19 @@ func generateDatePrefixes(basePrefix string, since, until *time.Time) []string {
 		return nil
 	}
 
-	prefixes := make([]string, 0, days)
+	seen := make(map[string]bool, days+len(extraHours))
+	prefixes := make([]string, 0, days+len(extraHours))
+	add := func(day string) {
+		if !seen[day] {
+			seen[day] = true
+			prefixes = append(prefixes, basePrefix+"event_date="+day+"/")
+		}
+	}
 	for d := range days {
-		day := start.AddDate(0, 0, d)
-		prefixes = append(prefixes, basePrefix+"event_date="+day.Format("2006-01-02")+"/")
+		add(start.AddDate(0, 0, d).Format("2006-01-02"))
+	}
+	for _, h := range extraHours {
+		add(h.UTC().Format("2006-01-02"))
 	}
 	return prefixes
 }
@@ -739,7 +755,14 @@ func sortFilesByHour(files []string) []string {
 // and the desired row order are inverted, so DESC simply never terminates
 // early — every candidate file is read and the final global sort+limit
 // (query.MergeAndTrim) picks the true newest rows. Correctness over speed.
-func canTerminateEarly(results []query.ResultRow, remainingFiles []string, limit int, order string) bool {
+// extraHours (#1037) disables early termination entirely: a misfiled archive
+// file sorts by its LABEL hour (late) yet can hold the window's EARLIEST rows,
+// so a label-ordered cutoff would wrongly stop before reading it. Misfiled
+// archives only exist after a backfill, so the cost is confined to that case.
+func canTerminateEarly(results []query.ResultRow, remainingFiles []string, limit int, order string, extraHours []time.Time) bool {
+	if len(extraHours) > 0 {
+		return false
+	}
 	if query.OrderDirection(order) == "DESC" {
 		return false
 	}
@@ -1090,16 +1113,27 @@ func buildQueryForFile(path string, opts query.Options, cols map[string]bool) (s
 // filterFilesByTimeRange prunes the file list based on Hive partition values
 // (event_date=YYYY-MM-DD/event_hour=HH) extracted from the paths. Files whose
 // hour does not overlap with [since, until] are excluded. Files without
-// parseable partition values are kept (safe fallback).
-func filterFilesByTimeRange(files []string, since, until *time.Time) []string {
+// parseable partition values are kept (safe fallback). Files whose hour label
+// appears in extraHours are always kept (#1037): those are misfiled archives
+// whose CONTENT overlaps the range even though the label does not — the
+// row-level time filters downstream still bound what they contribute.
+func filterFilesByTimeRange(files []string, since, until *time.Time, extraHours []time.Time) []string {
 	if since == nil && until == nil {
 		return files
+	}
+	extra := make(map[time.Time]bool, len(extraHours))
+	for _, h := range extraHours {
+		extra[h.UTC().Truncate(time.Hour)] = true
 	}
 	var filtered []string
 	for _, f := range files {
 		hourStart, ok := parseFileHour(f)
 		if !ok {
 			filtered = append(filtered, f) // can't determine; include to be safe
+			continue
+		}
+		if extra[hourStart] {
+			filtered = append(filtered, f) // misfiled archive: content overlaps
 			continue
 		}
 		hourEnd := hourStart.Add(time.Hour)

@@ -574,6 +574,9 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 			// Fetch from live index (+ archives when present), merge, redact,
 			// then format.
 			fetchOpts := opts
+			if len(archSources) > 0 {
+				fetchOpts.ExtraArchiveHours = misfiledArchiveHoursOrWarn(ctx, t.DB, opts.Since, opts.Until)
+			}
 			results, err := engine.Fetch(ctx, fetchOpts)
 			if err != nil {
 				return ErrorResult(err), nil, nil
@@ -694,6 +697,7 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		var rows []query.ResultRow
 		if len(archSources) > 0 {
 			fetchOpts := opts
+			fetchOpts.ExtraArchiveHours = misfiledArchiveHoursOrWarn(ctx, t.DB, opts.Since, opts.Until)
 			rows, err = engine.Fetch(ctx, fetchOpts)
 			if err != nil {
 				return ErrorResult(err), nil, nil
@@ -973,6 +977,19 @@ func EnvArchiveSources(ctx context.Context, db *sql.DB) []string {
 			"BINTRAIL_ARCHIVE_S3", archiveS3, "BINTRAIL_ID", bintrailID)
 	}
 	return stateArchiveSources(ctx, db)
+}
+
+// misfiledArchiveHoursOrWarn wraps query.MisfiledArchiveHours (#1037) with the
+// MCP tools' warn-and-continue posture: on a registry read failure the fetch
+// proceeds with label-only pruning (the pre-#1037 behavior) rather than
+// failing the whole tool call.
+func misfiledArchiveHoursOrWarn(ctx context.Context, db *sql.DB, since, until *time.Time) []time.Time {
+	hours, err := query.MisfiledArchiveHours(ctx, db, since, until)
+	if err != nil {
+		slog.Warn("could not check archive_state for misfiled archives (backfilled events); time-scoped archive pruning may skip them", "error", err)
+		return nil
+	}
+	return hours
 }
 
 // stateArchiveSources auto-discovers archive sources from archive_state,

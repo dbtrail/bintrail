@@ -146,9 +146,42 @@ Each archived partition is recorded in the `archive_state` table (created by `bi
 | `s3_bucket` | S3 bucket (when uploaded) |
 | `s3_key` | S3 object key (when uploaded) |
 | `s3_uploaded_at` | When the S3 upload completed |
+| `min_event_ts` / `max_event_ts` | Content-derived `MIN`/`MAX(event_timestamp)` of the archived rows (NULL on archives written before this column existed, or registered by `upload`/`archive reconcile`) |
 | `archived_at` | When the archive was created |
 
 The `--retry` flag on rotate uses this table to determine which S3 uploads can be skipped.
+
+#### Backfilled events and the hour label
+
+A partition's *name* is not a reliable statement of what it holds. When a
+stream backfills events whose hourly partitions were already rotated away
+(e.g. resuming from an old checkpoint after a multi-day capture stall, with
+`--retain` shorter than the stall), MySQL's RANGE partitioning files those
+old rows into the **oldest live partition** — and rotation then archives that
+partition under its own hour label, so the Parquet file's
+`event_date=`/`event_hour=` path disagrees with the timestamps of the rows
+inside it.
+
+That is why rotation records `min_event_ts`/`max_event_ts` at archive time:
+the query planner counts every hour in that content range as archive-covered,
+and time-scoped reads are told to open the mislabeled file even when its hour
+label falls outside the queried window (date-scoped S3 listings included).
+Row-level time filters still bound what the file contributes.
+
+When a partition's content range escapes its hour label, rotation also logs:
+
+```
+WARN archived partition contains events outside its hour label (backfilled rows);
+     recording true content time range so time-scoped archive reads still find them
+     partition=p_2026072401 min_event_ts=2026-07-22T19:10:00Z max_event_ts=2026-07-24T01:30:00Z
+```
+
+Archives created **before** this column existed have NULL ranges and keep the
+old label-only pruning; if such an archive is known to contain backfilled
+rows, re-populate the columns manually (`UPDATE archive_state SET
+min_event_ts=..., max_event_ts=... WHERE partition_name=...`) using the
+Parquet file's own footer statistics (see [Parquet
+debugging](parquet-debugging.md)).
 
 ### Archiving directly to S3
 
