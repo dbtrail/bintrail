@@ -172,11 +172,14 @@ func EmitSQL(w io.Writer, gen *recovery.Generator, rows []query.ResultRow, setNu
 	b.WriteString("--\n")
 	b.WriteString("-- If you have already re-created a deleted parent, delete its INSERT below:\n")
 	b.WriteString("-- SET FOREIGN_KEY_CHECKS=0 does NOT suppress PRIMARY KEY violations.\n")
-	// Caveats and warnings are sanitized HERE rather than at their construction
-	// sites in internal/cascade (#1120): they are built from schema/table names
-	// and error text, and the same strings are also served as JSON by the
-	// console, where a newline is harmless. Sanitizing where a string meets the
-	// "--" keeps that path untouched and cannot be bypassed by a future caveat.
+	// Caveats and warnings are sanitized HERE, at the comment boundary, rather
+	// than at their construction sites (#1120) — of which there are many, spread
+	// across internal/cascade, internal/cli and internal/console, several
+	// formatting in a schema/table name or an error string. Two reasons: the same
+	// strings are also served as JSON by the console, where a line break is
+	// harmless, so the boundary is the only place the constraint actually
+	// applies; and a fix here cannot be bypassed by a future caveat added
+	// anywhere upstream.
 	if len(hdr.Caveats) > 0 {
 		b.WriteString("--\n-- !!! INCOMPLETE RECOVERY — the result is provably partial:\n")
 		for _, c := range hdr.Caveats {

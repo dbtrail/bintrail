@@ -1417,8 +1417,12 @@ func reconstructBinlogOnly(
 // silently shipping a wrong PK/engine/charset/index definition as fact.
 //
 // The whole return value is a "--" comment block, so the names are sanitized
-// (#1120): a newline in either would end the comment and leave the remainder of
-// the identifier as executable SQL in a schema file meant to be applied as-is.
+// (#1120): a line break in either would end the comment and leave the remainder
+// of the identifier executing as SQL. That matters despite the body telling the
+// operator to create the table themselves — this text occupies the
+// <db>.<table>-schema.sql slot that myloader applies, so ANY non-comment line in
+// it runs. As at the AUTO_INCREMENT block, there is no executable sibling here
+// carrying the exact bytes; the comment is the whole artifact.
 func binlogOnlySchemaPlaceholder(schema, table string) string {
 	schema, table = recovery.SanitizeForComment(schema), recovery.SanitizeForComment(table)
 	return fmt.Sprintf(

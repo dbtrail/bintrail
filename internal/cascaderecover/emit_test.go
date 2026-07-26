@@ -659,31 +659,46 @@ func TestMergeParentRoots_tiesBreakOnEventID(t *testing.T) {
 // unsanitized interpolation in it — not merely the two the fix touched.
 //
 // Both untrusted channels are exercised at once: the header identifiers, and a
-// caveat string (caveats are built in internal/cascade from schema/table names
-// and error text, and are sanitized here at the comment boundary rather than at
-// their ~10 construction sites, because the same strings are also served as JSON
-// by the console, where a newline is harmless).
+// caveat/warning string (those are built from schema/table names and error text
+// at many sites across internal/cascade, internal/cli and internal/console, and
+// are sanitized at the comment boundary instead — the same strings are also
+// served as JSON by the console, where a line break is harmless).
+// Both Combined branches are exercised. Combined:true has its OWN header
+// Fprintf, and no test in this repo had ever set it — its production caller is
+// the console's combined recover (internal/console/recover_cascade.go), a real
+// shipping path, so a sanitization reverted only on that branch would otherwise
+// ship green.
 func TestEmitSQL_commentInjectionCannotEscapeThePreamble(t *testing.T) {
-	hdr := cascaderecover.Header{
-		Schema: "shop", Table: "or\nders",
-		Parents: 1, Children: 0,
-		Caveats:  []string{"child shop.au\ndit was not covered"},
-		Warnings: []string{"baseline for shop.li\nnes is stale"},
-	}
-	got, _, err := emit(t, hdr, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("EmitSQL: %v", err)
-	}
-
-	preamble, _, found := strings.Cut(got, "\nSET FOREIGN_KEY_CHECKS=0;")
-	if !found {
-		t.Fatalf("no SET FOREIGN_KEY_CHECKS=0 to anchor the preamble:\n%s", got)
-	}
-	for _, line := range strings.Split(preamble, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "--") {
-			continue
+	for _, combined := range []bool{false, true} {
+		hdr := cascaderecover.Header{
+			Schema: "shop", Table: "or\nders",
+			Parents: 1, Children: 0,
+			Combined: combined,
+			Caveats:  []string{"child shop.au\ndit was not covered"},
+			Warnings: []string{"baseline for shop.li\nnes is stale"},
 		}
-		t.Errorf("preamble line escaped its comment and would execute: %q\npreamble:\n%s", line, preamble)
+		got, _, err := emit(t, hdr, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("combined=%v: EmitSQL: %v", combined, err)
+		}
+
+		preamble, _, found := strings.Cut(got, "\nSET FOREIGN_KEY_CHECKS=0;")
+		if !found {
+			t.Fatalf("combined=%v: no SET FOREIGN_KEY_CHECKS=0 to anchor the preamble:\n%s", combined, got)
+		}
+		// Positive anchor: the flattened identifier must actually be in the
+		// preamble, or an empty/identifier-free preamble would satisfy the
+		// comment-only loop below without exercising anything.
+		if !strings.Contains(preamble, "shop.or ders") {
+			t.Errorf("combined=%v: preamble must name the table, space-substituted, got:\n%s", combined, preamble)
+		}
+		for _, line := range strings.Split(preamble, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "--") {
+				continue
+			}
+			t.Errorf("combined=%v: preamble line escaped its comment and would execute: %q\npreamble:\n%s",
+				combined, line, preamble)
+		}
 	}
 }

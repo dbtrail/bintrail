@@ -145,7 +145,22 @@ func TestCommentInjection_PKNewlineCannotEscapeTheHeaderComment(t *testing.T) {
 
 	out := mustGenerate(t, New(nil, nil), []query.ResultRow{row})
 
+	// Positive anchor FIRST: without it this test passes vacuously if the header
+	// ever stops rendering the PK — the payload would simply never appear, the
+	// loop below would find nothing to reject, and a script that no longer
+	// exercises the vector would report success. Asserting the SANITIZED form
+	// also pins the other half of the contract: the value is still there, only
+	// flattened.
+	if !strings.Contains(out, "pk=1 DROP TABLE users; at ") {
+		t.Fatalf("header must still carry the PK, space-substituted, got:\n%s", out)
+	}
+
 	// Every statement an ordinary MySQL reversal script is allowed to contain.
+	// Exact-string equality, so it can never ADMIT injected SQL. It is coupled to
+	// the MySQL preamble and to applyCodegenRow's single-column DELETE shape, so
+	// a new preamble statement or a different row shape makes it fail loud —
+	// brittle in the safe direction, but read a failure here as possible
+	// formatting drift, not only as an injection regression.
 	allowed := map[string]bool{
 		"BEGIN;":                    true,
 		"SET time_zone = '+00:00';": true,
@@ -159,6 +174,69 @@ func TestCommentInjection_PKNewlineCannotEscapeTheHeaderComment(t *testing.T) {
 			continue
 		}
 		t.Errorf("line escaped its comment and would execute: %q\nfull script:\n%s", line, out)
+	}
+}
+
+// TestCommentInjection_HeaderLineSurvivesLineBreaksInEveryField covers the
+// per-event header field-by-field. The whole-script test above cannot: it needs
+// a CLEAN table name, because a newline inside a backtick-quoted identifier is
+// legal MySQL and makes the executable INSERT legitimately span two lines, which
+// no "every line is a comment or a known statement" rule can accept.
+//
+// So this asserts the narrower, sharper invariant instead — the header renders
+// as EXACTLY ONE line, carrying every field flattened. Schema, table, PK and
+// GTID all reach this comment and nowhere else in the script, so reverting the
+// sanitization on any one of them breaks it here.
+//
+// The schema uses \r rather than \n on purpose: both collapse to the same space,
+// so the expectations are unchanged, and it buys carriage-return coverage
+// through the real production path — load-bearing because PostgreSQL's lexer
+// ends a "--" comment at a bare CR, where MySQL's does not.
+func TestCommentInjection_HeaderLineSurvivesLineBreaksInEveryField(t *testing.T) {
+	gtid := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1\nDROP TABLE audit;"
+	row := applyCodegenRow("d\rb", "or\nders")
+	row.PKValues = "1\nDROP TABLE users;"
+	row.GTID = &gtid
+
+	out := mustGenerate(t, New(nil, nil), []query.ResultRow{row})
+
+	var headers []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "-- [") {
+			headers = append(headers, line)
+		}
+	}
+	if len(headers) != 1 {
+		t.Fatalf("the header must render as exactly 1 line, got %d:\n%s", len(headers), out)
+	}
+	for _, want := range []string{
+		"on d b.or ders pk=",
+		"pk=1 DROP TABLE users; at ",
+		"gtid=3e11fa47-71ca-11e1-9e33-c80aa9429562:1 DROP TABLE audit;",
+	} {
+		if !strings.Contains(headers[0], want) {
+			t.Errorf("header line must contain %q (space-substituted), got:\n%s", want, headers[0])
+		}
+	}
+}
+
+// TestSanitizeForComment_lineBreakForms pins the helper's own contract, which the
+// production-path tests above cannot reach exhaustively: the \r-only and \r\n
+// forms, and the identity case that keeps every ordinary name byte-identical
+// (the property the existing golden-output tests rely on).
+func TestSanitizeForComment_lineBreakForms(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"lf", "a\nb", "a b"},
+		{"cr", "a\rb", "a b"},
+		{"crlf", "a\r\nb", "a  b"}, // two breaks -> two spaces; never rejoined
+		{"none", "orders", "orders"},
+		{"empty", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SanitizeForComment(tc.in); got != tc.want {
+				t.Errorf("SanitizeForComment(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 

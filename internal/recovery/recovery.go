@@ -285,9 +285,10 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 		if row.GTID != nil {
 			gtidSuffix = " gtid=" + SanitizeForComment(*row.GTID)
 		}
-		// Every interpolated value is sanitized (#1120): a newline in the table
-		// name or the PK would end this comment and turn the rest of the line
-		// into executable SQL sitting inside the BEGIN/COMMIT below.
+		// Every interpolated value is sanitized (#1120): a line break in the table
+		// name or the PK would end this comment, and the remainder would begin a
+		// new line executing inside the BEGIN/COMMIT below. This is the site that
+		// ships today — a newline in a VARCHAR primary key is ordinary data.
 		fmt.Fprintf(&body, "-- [%d] reverse %s on %s.%s pk=%s at %s%s\n",
 			row.EventID,
 			eventTypeName(row.EventType),
@@ -299,9 +300,16 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 
 		stmt, cols, err := g.buildStatement(row)
 		if err != nil {
-			// Record the failure and keep the "-- ERROR ..." comment in the
-			// buffered body so the diagnosis lists EVERY un-generatable event,
-			// then refuse the whole script below (#784). Demoting the error to a
+			// Record the failure, then refuse the whole script below (#784).
+			//
+			// The "-- ERROR ..." line goes into the buffered body, which the
+			// refusal below DISCARDS before anything reaches w — the diagnosis is
+			// built from genFailures, not from this text, so this line can never
+			// reach an operator. It is kept for readability while debugging a
+			// rendered body, and sanitized (#1120) only as defense in depth: it
+			// is not a live injection vector the way the header above is.
+			//
+			// Demoting the error to a
 			// comment and returning success is a silent incomplete recovery: a
 			// SQL comment has no apply-time effect, so a partial script commits
 			// clean under BEGIN/COMMIT and the operator never learns an event
@@ -470,8 +478,17 @@ func (g *Generator) writeAutoIncrementSection(w io.Writer, touched map[string]bo
 		schema, table, _ := strings.Cut(k, "\x00")
 		// Sanitized once here (#1120) because all three uses below are comment
 		// lines: this block's ENTIRE safety mechanism is the "--" prefix, and it
-		// sits after COMMIT, so a newline-bearing identifier would run whatever
+		// sits after COMMIT, so a line-break-bearing identifier would run whatever
 		// followed it as a standalone statement.
+		//
+		// Unlike the header above, this block has no executable sibling carrying
+		// the exact bytes — the two commented statements ARE the deliverable, and
+		// the operator is told to uncomment and run them. A flattened identifier
+		// therefore reaches an ALTER the operator may execute; it fails loud there
+		// (ERROR 1146) instead of hitting the intended table, which is why
+		// flattening still beats leaving the injection open. MySQL has no escape
+		// for a line break inside a backtick identifier, so no rendering here is
+		// both single-line and runnable.
 		qualified := SanitizeForComment(QuoteName(schema) + "." + QuoteName(table))
 		fmt.Fprintln(w, "--")
 		fmt.Fprintf(w, "-- %s:\n", qualified)
@@ -1345,22 +1362,35 @@ func QuoteName(name string) string {
 }
 
 // SanitizeForComment makes s safe to interpolate into a "--" SQL comment line
-// (#1120). A "--" comment ends at the first newline, so a value carrying one
-// closes the comment and hands whatever follows to the parser as executable SQL.
-// No existing escaper defends against this: event.EscapePKValue escapes only
-// `\` and `|`, and QuoteName only the backtick — a newline is perfectly legal inside
-// a backtick-quoted MySQL identifier, and inside a VARCHAR primary key it is
-// ordinary data.
+// (#1120). A "--" comment ends at the first line break; a value carrying one
+// closes the comment, and what follows begins a NEW line that the parser reads
+// as executable SQL.
 //
-// The substitution is LOSSY on purpose, and only the annotation loses. Comments
-// carry an identifier or PK for the operator to read; the executable statement
-// beside them renders the same value through QuoteName/EscapeString, which keep
-// every byte. Refusing outright would instead deny recovery to a table that is
-// merely oddly named. Callers therefore apply this at the point a value meets a
-// "--", never to the value itself.
+// Both terminators are handled because this serves both dialects: MySQL ends the
+// comment at LF only, PostgreSQL at LF *or* a bare CR (its lexer defines the
+// comment body as [^\n\r]*). Nothing else terminates one — U+2028/U+2029 are not
+// line breaks to either lexer.
 //
-// Both ReplaceAll calls return s untouched (no allocation) when it holds no
-// line break, which is every ordinary name.
+// No existing escaper defends against this: event.EscapePKValue escapes only `\`
+// and `|`, QuoteName only the backtick, quoteNamePG only the double quote — and a
+// line break is legal inside a quoted identifier in either dialect, while inside
+// a VARCHAR primary key it is ordinary data.
+//
+// The substitution is LOSSY, and refusing outright would instead deny recovery to
+// a table that is merely oddly named. How much is lost varies BY SITE, so do not
+// read this as a blanket "only the annotation degrades" guarantee:
+//
+//   - Per-event header, cascade preamble: an executable statement rendered from
+//     the same value sits beside the comment and keeps every byte (quoteName /
+//     EscapeString are untouched by this). Only the annotation degrades.
+//   - AUTO_INCREMENT block, reconstruct's binlog-only schema placeholder: there
+//     is NO executable sibling — the commented text is itself the artifact. A
+//     flattened identifier there fails loud when applied (MySQL ERROR 1146,
+//     "table doesn't exist") rather than silently acting on the intended table.
+//
+// Callers apply this where a value meets a "--", never to the value itself.
+// TestSanitizeForComment_lineBreakForms pins the identity case, on which every
+// golden-output test in this package depends.
 func SanitizeForComment(s string) string {
 	s = strings.ReplaceAll(s, "\r", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
