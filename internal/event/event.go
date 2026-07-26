@@ -321,6 +321,15 @@ func splitPKValues(s string) []string {
 //     if and only if every raw component is.
 //   - Idempotent by construction: a hex spelling is ASCII, hence valid
 //     UTF-8, and passes through untouched.
+//
+// Direction limitation: this closes only the stored-raw → post-fix-hash
+// direction — a pre-#1132 stored spelling matched by a hash computed over the
+// post-fix spelling. The symmetric case, a hash the control plane persisted
+// PRE-fix over the raw spelling used to look up POST-fix rows, still silently
+// misses: for a post-fix row canon == stored, so no alias is ever generated.
+// The hex spelling is invertible, so a legacy de-canonicalization pass could
+// close that direction too if it ever matters; it is deliberately not
+// implemented.
 func CanonicalPKValues(s string) string {
 	if utf8.ValidString(s) {
 		return s

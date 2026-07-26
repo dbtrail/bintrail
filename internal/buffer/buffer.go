@@ -179,24 +179,20 @@ func (b *Buffer) Fetch(_ context.Context, opts query.Options) []query.ResultRow 
 
 // ResolvePK looks up pk_values for the given pk_hash, schema, and table.
 // Returns the pk_values string and true if found.
+//
+// Deliberately NOT wired with the #1137 CanonicalPKValues compat fallback:
+// the buffer is in-memory and process-lifetime, fed only by the live
+// (post-#1132) parser via Insert, and is never rehydrated from Parquet — so
+// no entry can carry the pre-fix raw spelling of a binary PK. The durable
+// pre-fix spellings live in payload/archive Parquet, which the agent
+// handler's archive path covers.
 func (b *Buffer) ResolvePK(hash, schema, table string) (string, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	for i := range b.events {
 		e := &b.events[i]
-		if e.row.SchemaName != schema || e.row.TableName != table {
-			continue
-		}
-		if e.pkHash == hash {
-			return e.row.PKValues, true
-		}
-		// #1137 compat: an entry carrying the pre-#1132 RAW spelling of a
-		// binary PK hashes differently from a control-plane hash computed
-		// over the post-fix hex spelling of the same key. When the spellings
-		// differ, also match the canonical spelling's hash. No second hash
-		// is computed for already-canonical entries (the common case).
-		if canon := event.CanonicalPKValues(e.row.PKValues); canon != e.row.PKValues && pkHash(canon) == hash {
+		if e.pkHash == hash && e.row.SchemaName == schema && e.row.TableName == table {
 			return e.row.PKValues, true
 		}
 	}

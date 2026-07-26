@@ -200,12 +200,17 @@ func (h *DefaultHandler) resolvePKFromArchive(ctx context.Context, item PKItem, 
 			if _, seen := idx[hash]; !seen { // first match wins, as the pre-memoization scan did
 				idx[hash] = r.PKValues
 			}
-			// #1137 compat: a row persisted before the #1132 hex fix stores
-			// the RAW spelling of a binary PK, whose hash can never match a
-			// control-plane PKHash computed over the post-fix hex spelling.
-			// Index the canonical spelling's hash too, still resolving to the
-			// stored value. No second hash is computed when the spellings
-			// already match (the common case).
+		}
+		// #1137 compat, second pass: a row persisted before the #1132 hex fix
+		// stores the RAW spelling of a binary PK, whose hash can never match a
+		// control-plane PKHash computed over the post-fix hex spelling. Index
+		// the canonical spelling's hash as an ALIAS too, still resolving to
+		// the stored value. Aliases are added only after every exact
+		// stored-spelling hash is in, so an exact match always beats an alias
+		// regardless of scan order (a raw row's alias could otherwise shadow
+		// another row literally storing that hex text). No second hash is
+		// computed when the spellings already match (the common case).
+		for _, r := range rows {
 			if canon := event.CanonicalPKValues(r.PKValues); canon != r.PKValues {
 				canonHash := byosPKHash(canon)
 				if _, seen := idx[canonHash]; !seen {
@@ -321,6 +326,12 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 				// fix stores the RAW spelling of a binary PK; the caller's
 				// pk_hash is computed over the post-fix hex spelling. When the
 				// spellings differ, also try the canonical spelling's hash.
+				// In the residual collision formatPKValue's doc already
+				// accepts (a VARBINARY PK literally holding the ASCII text of
+				// another key's hex spelling), this OR of both hashes selects
+				// BOTH rows, so the reversal can include a row the caller did
+				// not name — that accepted ambiguity is made reachable here
+				// for pre-fix raw-spelling rows.
 				if canon := event.CanonicalPKValues(r.PKValues); canon != r.PKValues {
 					_, ok = wanted[byosPKHash(canon)]
 				}

@@ -48,6 +48,48 @@ func TestHandleResolvePK_archivePreFixRawSpelling(t *testing.T) {
 	}
 }
 
+// TestHandleResolvePK_archiveExactBeatsCanonicalAlias: collision precedence
+// must not depend on scan order. Row A stores the pre-#1132 RAW spelling of
+// bytes {0xFF,0xFE} (canonicalizes to "0xFFFE"); row B is a VARBINARY PK
+// literally holding the ASCII text "0xFFFE" (valid UTF-8, stored verbatim).
+// A hash over "0xFFFE" is B's EXACT stored-spelling hash and only A's alias —
+// B must win in both insertion orders, and A must stay resolvable via its own
+// exact hash.
+func TestHandleResolvePK_archiveExactBeatsCanonicalAlias(t *testing.T) {
+	rawA := string([]byte{0xFF, 0xFE})
+	const literalB = "0xFFFE"
+
+	orders := map[string][]query.ResultRow{
+		"raw first":     {{PKValues: rawA}, {PKValues: literalB}},
+		"literal first": {{PKValues: literalB}, {PKValues: rawA}},
+	}
+	for name, rows := range orders {
+		t.Run(name, func(t *testing.T) {
+			h := &DefaultHandler{
+				ArchiveSources: []string{"srcA"},
+				ArchiveFetcher: func(ctx context.Context, opts query.Options, source string) ([]query.ResultRow, error) {
+					return rows, nil
+				},
+			}
+			req := ResolvePKRequest{Items: []PKItem{
+				{PKHash: byosPKHash(literalB), Schema: "shop", Table: "orders"},
+				{PKHash: byosPKHash(rawA), Schema: "shop", Table: "orders"},
+			}}
+			results, err := h.HandleResolvePK(context.Background(), req)
+			if err != nil {
+				t.Fatalf("HandleResolvePK: %v", err)
+			}
+			if !results[0].Found || results[0].PKValues != literalB {
+				t.Errorf("hash of %q resolved to %+v, want the EXACT-spelling row %q (alias must not shadow it)",
+					literalB, results[0], literalB)
+			}
+			if !results[1].Found || results[1].PKValues != rawA {
+				t.Errorf("hash of the raw spelling resolved to %+v, want %q", results[1], rawA)
+			}
+		})
+	}
+}
+
 // TestHandleRecover_pkHashesPreFixRawSpelling: the recover pk_hash filter —
 // a pre-#1132 raw-spelling row must be selected by a hash computed over the
 // post-fix hex spelling, and a hash for a different key must select nothing.
