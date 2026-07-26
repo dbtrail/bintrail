@@ -370,7 +370,7 @@ func New(cfg Config) (*Server, error) {
 			BaselineDir: cfg.BaselineDir,
 			BaselineS3:  cfg.BaselineS3,
 		}, profileActive)
-		boot.resolver = loadResolver(cfg.DB)
+		boot.resolver, boot.resolverUnavailable = loadResolver(cfg.DB)
 		s.cm.seedBoot(boot, cfg.BootDSN)
 	}
 

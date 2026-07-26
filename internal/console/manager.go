@@ -29,6 +29,12 @@ type bundle struct {
 	dbName   string
 	engine   *query.Engine
 	resolver *metadata.Resolver
+	// resolverUnavailable records that loadResolver failed for a reason OTHER
+	// than ErrNoSnapshots (permissions, un-migrated index, transient error at
+	// open). resolver is nil either way; this distinguishes "no snapshots
+	// exist" from "the snapshot half was silently skipped", which /api/schemas
+	// reports as snapshot_unavailable (#1071).
+	resolverUnavailable bool
 	// noArchive disables Parquet archive auto-discovery for this server. It is
 	// the entry's own flag OR'd with the process-global profileActive: archives
 	// do not enforce RBAC, so an active profile forces it on every server.
@@ -183,6 +189,7 @@ func (cm *connManager) Resolve(ctx context.Context, id string) (*bundle, error) 
 			// must not publish the stale entry's reconstruct gate.
 			nb := newBundleDerived(b.db, b.dbName, cur, cm.profileActive)
 			nb.resolver = b.resolver
+			nb.resolverUnavailable = b.resolverUnavailable
 			cm.bundles[id] = nb
 			cm.mu.Unlock()
 			return nb, nil
@@ -217,7 +224,7 @@ func (cm *connManager) buildBundle(entry ServerEntry) (*bundle, error) {
 		return nil, fmt.Errorf("server %q: %s", entry.Name, scrubDSNError(err, entry.DSN))
 	}
 	b := newBundleDerived(db, cfg.DBName, entry, cm.profileActive)
-	b.resolver = loadResolver(db)
+	b.resolver, b.resolverUnavailable = loadResolver(db)
 	return b, nil
 }
 
@@ -264,20 +271,25 @@ func (b *bundle) findBaseline(ctx context.Context, schema, table string, at time
 
 // loadResolver loads the latest schema snapshot, best-effort: a missing
 // snapshot just means recovery falls back to all-column WHERE clauses.
-func loadResolver(db *sql.DB) *metadata.Resolver {
+// unavailable reports a failure OTHER than "no snapshots exist" — permissions
+// on schema_snapshots, an un-migrated index, a transient error at open — so
+// /api/schemas can flag that its snapshot half was skipped instead of
+// answering an indistinguishable empty list (#1071).
+func loadResolver(db *sql.DB) (r *metadata.Resolver, unavailable bool) {
 	if db == nil {
-		return nil
+		return nil, false
 	}
 	r, err := metadata.NewResolver(db, 0)
 	switch {
 	case err == nil:
-		return r
+		return r, false
 	case errors.Is(err, metadata.ErrNoSnapshots):
 		slog.Debug("console: no schema snapshots; recovery will use all-column WHERE clauses")
+		return nil, false
 	default:
 		slog.Warn("console: failed to load schema resolver; recovery will use all-column WHERE clauses", "error", err)
+		return nil, true
 	}
-	return nil
 }
 
 // seedBoot registers the ephemeral command-line bundle. The cmd layer built it
@@ -328,6 +340,7 @@ func (cm *connManager) rebuildDerived(entry ServerEntry) {
 	nb := newBundleDerived(old.db, old.dbName, entry, cm.profileActive)
 	nb.engine = old.engine
 	nb.resolver = old.resolver
+	nb.resolverUnavailable = old.resolverUnavailable
 	cm.bundles[entry.ID] = nb
 }
 

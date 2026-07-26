@@ -2395,20 +2395,28 @@ async function loadSchemas() {
   if (schemaCache) return schemaCache;
   const gen = serverGen;
   const data = await api("/api/schemas");
-  const schemas = data.schemas || [];
+  // snapshot_only marks schemas listed via the schema snapshot with no live
+  // events observed; snapshot_unavailable means the snapshot half was skipped
+  // because the resolver failed to load (#1071). Both are provenance for the
+  // pickers — `schemas` stays the full selectable union.
+  const result = {
+    schemas: data.schemas || [],
+    snapshotOnly: data.snapshot_only || [],
+    snapshotUnavailable: !!data.snapshot_unavailable,
+  };
   // Guard the cache WRITE, not just the render: a response in flight when the
   // operator switches servers must not poison the freshly-cleared cache with
   // the previous server's schemas.
-  if (gen === serverGen) schemaCache = schemas;
-  return schemas;
+  if (gen === serverGen) schemaCache = result;
+  return result;
 }
 
 async function populateSchemas(root) {
   const gen = serverGen;
   const selects = $all(".schema-select", root || document);
   if (!selects.length) return;
-  let schemas;
-  try { schemas = await loadSchemas(); }
+  let data;
+  try { data = await loadSchemas(); }
   catch (err) {
     if (gen !== serverGen) return;
     selects.forEach((sel) => { const keep = sel.value; clear(sel); sel.append(opt("", "(error: " + ((err && err.message) || err) + ")")); sel.value = keep; });
@@ -2419,7 +2427,19 @@ async function populateSchemas(root) {
     const keep = sel.value;
     clear(sel);
     sel.append(opt("", "— select —"));
-    schemas.forEach((s) => sel.append(opt(s, s)));
+    data.schemas.forEach((s) => {
+      const snapOnly = data.snapshotOnly.includes(s);
+      const o = opt(s, snapOnly ? s + " — snapshot only" : s);
+      if (snapOnly) o.title = "Listed by the schema snapshot only — no live events indexed; queries may return nothing.";
+      sel.append(o);
+    });
+    if (data.snapshotUnavailable) {
+      // Otherwise an empty (or truncated) picker is indistinguishable from a
+      // healthy index with no schemas — the very ambiguity #1065 fixed.
+      const note = opt("", "(schema snapshot unreadable — archive-only schemas may be missing; see server log)");
+      note.disabled = true;
+      sel.append(note);
+    }
     if (keep) sel.value = keep;
   });
 }

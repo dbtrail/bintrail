@@ -419,12 +419,15 @@ func TestDistinctSchemasUnionsSnapshot(t *testing.T) {
 		"app.customers": {Schema: "app", Table: "customers"},
 		"shop.items":    {Schema: "shop", Table: "items"},
 	})}
-	got, err := b.distinctSchemas(context.Background())
+	got, snapOnly, err := b.distinctSchemas(context.Background())
 	if err != nil {
 		t.Fatalf("distinctSchemas: %v", err)
 	}
 	if want := []string{"app", "shop"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("archive-only schemas = %v, want %v", got, want)
+	}
+	if want := []string{"app", "shop"}; !reflect.DeepEqual(snapOnly, want) {
+		t.Errorf("snapshot-only schemas = %v, want %v (no live events at all)", snapOnly, want)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
@@ -441,20 +444,25 @@ func TestMergeSchemaNames(t *testing.T) {
 		"shop.items": {Schema: "shop", Table: "items"},
 	})
 	cases := []struct {
-		name string
-		live []string
-		res  *metadata.Resolver
-		want []string
+		name     string
+		live     []string
+		res      *metadata.Resolver
+		want     []string
+		wantSnap []string
 	}{
-		{"nil resolver passes live through", []string{"b", "a"}, nil, []string{"b", "a"}},
-		{"snapshot only", []string{}, snap, []string{"app", "shop"}},
-		{"dedup and sort", []string{"shop", "app"}, snap, []string{"app", "shop"}},
-		{"live-only schema survives", []string{"legacy"}, snap, []string{"app", "legacy", "shop"}},
+		{"nil resolver passes live through", []string{"b", "a"}, nil, []string{"b", "a"}, nil},
+		{"snapshot only", []string{}, snap, []string{"app", "shop"}, []string{"app", "shop"}},
+		{"dedup and sort", []string{"shop", "app"}, snap, []string{"app", "shop"}, nil},
+		{"live-only schema survives", []string{"legacy"}, snap, []string{"app", "legacy", "shop"}, []string{"app", "shop"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := mergeSchemaNames(c.live, c.res); !reflect.DeepEqual(got, c.want) {
+			got, gotSnap := mergeSchemaNames(c.live, c.res)
+			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("mergeSchemaNames(%v) = %v, want %v", c.live, got, c.want)
+			}
+			if !reflect.DeepEqual(gotSnap, c.wantSnap) {
+				t.Errorf("mergeSchemaNames(%v) snapshot-only = %v, want %v", c.live, gotSnap, c.wantSnap)
 			}
 		})
 	}
@@ -475,11 +483,133 @@ func TestDistinctSchemasNoArchiveKeepsLiveOnly(t *testing.T) {
 	b := &bundle{db: db, noArchive: true, resolver: metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
 		"archived.orders": {Schema: "archived", Table: "orders"},
 	})}
-	got, err := b.distinctSchemas(context.Background())
+	got, snapOnly, err := b.distinctSchemas(context.Background())
 	if err != nil {
 		t.Fatalf("distinctSchemas: %v", err)
 	}
 	if want := []string{"live"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("--no-archive schemas = %v, want %v (snapshot-only schema is unreachable)", got, want)
 	}
+	if len(snapOnly) != 0 {
+		t.Errorf("--no-archive snapshot-only = %v, want none (snapshot half skipped)", snapOnly)
+	}
+}
+
+// TestHandleSchemasProvenance drives GET /api/schemas through the real handler
+// and pins the #1071 contract: `schemas` stays the full union — clients that
+// ignore the new fields see the pre-#1071 list unchanged — while
+// `snapshot_only` carries the subset with no live events, so the picker can
+// label entries that may dead-end on an empty result.
+func TestHandleSchemasProvenance(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT DISTINCT schema_name FROM binlog_events").
+		WillReturnRows(sqlmock.NewRows([]string{"schema_name"}).AddRow("app"))
+
+	s := newBootServer(db)
+	s.cm.boot.noArchive = false
+	s.cm.boot.resolver = metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"app.orders": {Schema: "app", Table: "orders"},
+		"shop.items": {Schema: "shop", Table: "items"},
+	})
+	rec := httptest.NewRecorder()
+	s.handleSchemas(rec, httptest.NewRequest("GET", "/api/schemas", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var sr schemasResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &sr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if want := []string{"app", "shop"}; !reflect.DeepEqual(sr.Schemas, want) {
+		t.Errorf("schemas = %v, want %v", sr.Schemas, want)
+	}
+	if want := []string{"shop"}; !reflect.DeepEqual(sr.SnapshotOnly, want) {
+		t.Errorf("snapshot_only = %v, want %v", sr.SnapshotOnly, want)
+	}
+	if sr.SnapshotUnavailable {
+		t.Error("snapshot_unavailable = true, want false (resolver loaded fine)")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestHandleSchemasSnapshotUnavailable pins the diagnosable-empty state
+// (#1071): when the resolver failed to load for a reason other than
+// ErrNoSnapshots, the response says the snapshot half was skipped instead of
+// answering an empty list indistinguishable from the #1065 bug. Under
+// --no-archive that half is skipped by design, so the flag stays off there.
+func TestHandleSchemasSnapshotUnavailable(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		noArchive bool
+		want      bool
+	}{
+		{"archives reachable flags the skip", false, true},
+		{"no-archive suppresses the flag", true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+			mock.ExpectQuery("SELECT DISTINCT schema_name FROM binlog_events").
+				WillReturnRows(sqlmock.NewRows([]string{"schema_name"}))
+
+			s := newBootServer(db)
+			s.cm.boot.noArchive = c.noArchive
+			s.cm.boot.resolverUnavailable = true // loadResolver's Warn path: nil resolver, real failure
+			rec := httptest.NewRecorder()
+			s.handleSchemas(rec, httptest.NewRequest("GET", "/api/schemas", nil))
+			if rec.Code != 200 {
+				t.Fatalf("code = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+			}
+			var sr schemasResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &sr); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if sr.SnapshotUnavailable != c.want {
+				t.Errorf("snapshot_unavailable = %v, want %v", sr.SnapshotUnavailable, c.want)
+			}
+			if len(sr.Schemas) != 0 || len(sr.SnapshotOnly) != 0 {
+				t.Errorf("schemas = %v, snapshot_only = %v, want both empty", sr.Schemas, sr.SnapshotOnly)
+			}
+		})
+	}
+}
+
+// TestLoadResolverUnavailable pins where the snapshot_unavailable signal is
+// born: a resolver load that fails outright reports unavailable=true, while
+// the benign "no snapshots yet" state does not.
+func TestLoadResolverUnavailable(t *testing.T) {
+	t.Run("query failure is unavailable", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+		mock.ExpectQuery("schema_snapshots").WillReturnError(fmt.Errorf("Table 'idx.schema_snapshots' doesn't exist"))
+		r, unavailable := loadResolver(db)
+		if r != nil || !unavailable {
+			t.Errorf("loadResolver = (%v, %v), want (nil, true)", r, unavailable)
+		}
+	})
+	t.Run("no snapshots is not unavailable", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+		mock.ExpectQuery("schema_snapshots").
+			WillReturnRows(sqlmock.NewRows([]string{"snapshot_id"}).AddRow(0))
+		r, unavailable := loadResolver(db)
+		if r != nil || unavailable {
+			t.Errorf("loadResolver = (%v, %v), want (nil, false)", r, unavailable)
+		}
+	})
 }

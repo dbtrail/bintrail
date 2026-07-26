@@ -128,7 +128,19 @@ type recoverResponse struct {
 }
 
 type schemasResponse struct {
+	// Schemas is every schema this server can be queried for — the union of
+	// live-observed and snapshot-listed names, exactly as before #1071 grew the
+	// fields below. Clients that ignore them see an unchanged contract.
 	Schemas []string `json:"schemas"`
+	// SnapshotOnly is the subset of Schemas with no live events observed: listed
+	// via the latest schema snapshot only. The picker labels these so an empty
+	// query result reads as expected rather than as a malfunction (#1071).
+	SnapshotOnly []string `json:"snapshot_only,omitempty"`
+	// SnapshotUnavailable reports that the snapshot half of the union was
+	// skipped because the schema resolver failed to load for a reason OTHER
+	// than "no snapshots exist" (permissions, un-migrated index, ...). Without
+	// it an empty listing is indistinguishable from the #1065 bug.
+	SnapshotUnavailable bool `json:"snapshot_unavailable,omitempty"`
 }
 
 type tablesResponse struct {
@@ -537,12 +549,19 @@ func (s *Server) handleSchemas(w http.ResponseWriter, r *http.Request) {
 	}
 	schema := r.URL.Query().Get("schema")
 	if schema == "" {
-		names, err := b.distinctSchemas(r.Context())
+		names, snapshotOnly, err := b.distinctSchemas(r.Context())
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, schemasResponse{Schemas: names})
+		writeJSON(w, http.StatusOK, schemasResponse{
+			Schemas:      names,
+			SnapshotOnly: snapshotOnly,
+			// Suppressed under noArchive: there the snapshot half is skipped by
+			// design (archives unreachable), so a broken resolver changes nothing
+			// about this listing and the flag would only read as noise.
+			SnapshotUnavailable: b.resolverUnavailable && !b.noArchive,
+		})
 		return
 	}
 	tables, err := b.tablesForSchema(r.Context(), schema)
@@ -577,30 +596,27 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // is strictly additive: a server that cannot read archives keeps the exact
 // pre-#1065 listing.
 //
-// Two residual gaps, both out of scope and both the same shape — this endpoint
-// answers "which schemas does this index know of", NOT "which schemas have
-// retrievable data in a given window":
-//   - a fresh index pointed at foreign archives with no local snapshot still
-//     lists nothing; enumerating schemas from the Parquet itself would mean
-//     scanning every archive file on each dropdown load.
-//   - `rotate --retain` WITHOUT `--archive-dir` drops partitions and writes no
-//     Parquet, so a listed schema may have no data anywhere. The designed
-//     signal for that is status's continuity verdict and its EVENTS
-//     PERMANENTLY LOST banner (#649) — an empty dropdown was only ever an
-//     accidental proxy for it, and an empty dropdown on a healthy archived
-//     index is the very bug being fixed here.
+// One residual gap, out of scope — this endpoint answers "which schemas does
+// this index know of", NOT "which schemas have retrievable data in a given
+// window": a fresh index pointed at foreign archives with no local snapshot
+// still lists nothing; enumerating schemas from the Parquet itself would mean
+// scanning every archive file on each dropdown load. Provenance for the rest —
+// snapshot-only schemas whose data may be gone (`rotate --retain` without
+// `--archive-dir`) or never indexed — travels to the client in the second
+// return value (#1071); the designed signal for actual data loss remains
+// status's continuity verdict and its EVENTS PERMANENTLY LOST banner (#649).
 //
 // The resolver is loaded once when the bundle opens (manager.go, server.go), so
 // a snapshot taken after the console started is not picked up until restart.
-func (b *bundle) distinctSchemas(ctx context.Context) ([]string, error) {
+func (b *bundle) distinctSchemas(ctx context.Context) (schemas, snapshotOnly []string, err error) {
 	rows, err := b.db.QueryContext(ctx, "SELECT DISTINCT schema_name FROM binlog_events ORDER BY schema_name")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer rows.Close()
 	live, err := scanStrings(rows)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if b.noArchive {
 		// Archives are never consulted for this server (--no-archive, or ANY
@@ -609,17 +625,20 @@ func (b *bundle) distinctSchemas(ctx context.Context) ([]string, error) {
 		// justification is that the archives still answer. Advertising it would
 		// offer the operator a target this server provably cannot return a row
 		// for. Live-only here is byte-identical to the pre-#1065 behaviour.
-		return live, nil
+		return live, nil, nil
 	}
-	return mergeSchemaNames(live, b.resolver), nil
+	schemas, snapshotOnly = mergeSchemaNames(live, b.resolver)
+	return schemas, snapshotOnly, nil
 }
 
 // mergeSchemaNames folds the snapshot's schemas into the observed ones,
-// deduplicated and sorted. A nil resolver (no snapshot loaded) returns the
-// observed names unchanged, so the pre-snapshot behaviour is preserved.
-func mergeSchemaNames(live []string, r *metadata.Resolver) []string {
+// deduplicated and sorted, and separately reports which of them are
+// snapshot-only (no live events observed) so the client can label them (#1071).
+// A nil resolver (no snapshot loaded) returns the observed names unchanged, so
+// the pre-snapshot behaviour is preserved.
+func mergeSchemaNames(live []string, r *metadata.Resolver) (all, snapshotOnly []string) {
 	if r == nil {
-		return live
+		return live, nil
 	}
 	seen := make(map[string]bool, len(live))
 	out := make([]string, 0, len(live))
@@ -633,10 +652,12 @@ func mergeSchemaNames(live []string, r *metadata.Resolver) []string {
 		if !seen[t.Schema] {
 			seen[t.Schema] = true
 			out = append(out, t.Schema)
+			snapshotOnly = append(snapshotOnly, t.Schema)
 		}
 	}
 	sort.Strings(out)
-	return out
+	sort.Strings(snapshotOnly)
+	return out, snapshotOnly
 }
 
 // tablesForSchema lists the tables of one schema. It prefers the latest schema
