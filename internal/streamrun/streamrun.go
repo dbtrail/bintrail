@@ -785,18 +785,37 @@ func resolveStartWithAutoDiscover(
 	startFile, startGTID string, startPos uint32,
 	saved *streamState,
 	autoDiscover func() (string, uint32, error),
+	gtidAutoDiscover func() (string, error),
 ) (mode, file, gtidStr string, pos uint32, accGTID gomysql.GTIDSet, err error) {
-	return resolveStartWithAutoDiscoverForFlavor(startFile, startGTID, startPos, saved, gomysql.MySQLFlavor, autoDiscover)
+	return resolveStartWithAutoDiscoverForFlavor(startFile, startGTID, startPos, saved, gomysql.MySQLFlavor, autoDiscover, gtidAutoDiscover)
 }
 
 // resolveStartWithAutoDiscoverForFlavor is the flavor-aware variant of
 // resolveStartWithAutoDiscover; see that function for the contract. flavor is
 // threaded into resolveStartForFlavor so saved/flag GTID sets parse with the
 // right flavor.
+//
+// gtidAutoDiscover is tried BEFORE the position callback, and only for the
+// MySQL flavor: a non-empty executed set selects GTID mode (parsed with the
+// same flavor-aware parser as the --start-gtid branch), so a fresh stream on a
+// gtid_mode=ON source checkpoints in GTID mode and live-source verify works
+// out of the box (#1131). An empty set — gtid_mode not ON, or a fresh server
+// with zero transactions — falls back to the position callback unchanged
+// (starting GTID replication from an empty set would replay the binlog from
+// the beginning, not "start from now"). A gtidAutoDiscover ERROR is fatal, not
+// a fallback: an operator on a GTID source must not silently end up in
+// position mode.
+//
+// MariaDB deliberately keeps position-only auto-discovery: its GTID
+// coordinates (domain-server-seq, @@gtid_current_pos) have different discovery
+// semantics, and the live-source verify coverage check that motivates GTID
+// mode only consumes MySQL GTID sets — auto-selecting GTID mode there would be
+// an untested behavior change with no consumer.
 func resolveStartWithAutoDiscoverForFlavor(
 	startFile, startGTID string, startPos uint32,
 	saved *streamState, flavor string,
 	autoDiscover func() (string, uint32, error),
+	gtidAutoDiscover func() (string, error),
 ) (mode, file, gtidStr string, pos uint32, accGTID gomysql.GTIDSet, err error) {
 	mode, file, gtidStr, pos, accGTID, err = resolveStartForFlavor(startFile, startGTID, startPos, saved, flavor)
 	if err == nil {
@@ -806,14 +825,42 @@ func resolveStartWithAutoDiscoverForFlavor(
 	// "no start position" case (saved == nil and no flags). Other errors
 	// (mutually-exclusive flags, invalid GTID, corrupt saved state) must
 	// propagate so the operator sees the real problem.
-	if autoDiscover == nil || saved != nil || startFile != "" || startGTID != "" {
+	if saved != nil || startFile != "" || startGTID != "" {
 		return
+	}
+	if gtidAutoDiscover != nil && flavor == gomysql.MySQLFlavor {
+		set, dErr := gtidAutoDiscover()
+		if dErr != nil {
+			return "", "", "", 0, nil, fmt.Errorf("auto-discover executed GTID set: %w", dErr)
+		}
+		if set != "" {
+			set = normalizeGTIDForFlavor(flavor, set)
+			gs, parseErr := parseGTIDSetForFlavor(flavor, set)
+			if parseErr != nil {
+				return "", "", "", 0, nil, fmt.Errorf("auto-discovered gtid_executed %q is unparseable: %w", set, parseErr)
+			}
+			return "gtid", "", set, 0, gs, nil
+		}
+		// Empty set: fall through to position discovery below.
+	}
+	if autoDiscover == nil {
+		return // the original "no start position" error
 	}
 	af, ap, dErr := autoDiscover()
 	if dErr != nil {
 		return "", "", "", 0, nil, fmt.Errorf("auto-discover binlog position: %w", dErr)
 	}
 	return "position", af, "", ap, nil, nil
+}
+
+// truncateForDisplay shortens s for a single terminal line. GTID sets are
+// ASCII, so byte slicing cannot split a rune. Callers log the full value via
+// slog before printing the truncated form.
+func truncateForDisplay(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "… (truncated; full set in the log)"
 }
 
 // ─── Gap detection ──────────────────────────────────────────────────────────────
@@ -1773,15 +1820,25 @@ func One(ctx context.Context, cfg Config) error {
 
 	mode, startFile, startGTIDStr, startPos, accGTID, err := resolveStartWithAutoDiscoverForFlavor(
 		cfg.StartFile, cfg.StartGTID, cfg.StartPos, saved, cfg.Flavor,
-		func() (string, uint32, error) { return config.CurrentBinlogPosition(sourceDB) })
+		func() (string, uint32, error) { return config.CurrentBinlogPosition(sourceDB) },
+		func() (string, error) { return config.CurrentGTIDExecuted(sourceDB) })
 	if err != nil {
 		return err
 	}
-	// Surface the auto-discovered position when this was a first-run, no-flags
-	// invocation. Mirrors the agent BYOS startup checkmark style.
-	if saved == nil && cfg.StartFile == "" && cfg.StartGTID == "" && mode == "position" {
-		slog.Info("auto-discovered current binlog position", "file", startFile, "pos", startPos)
-		fmt.Printf("Start position: auto-discovered %s:%d ✓\n", startFile, startPos)
+	// Surface the auto-discovered start point when this was a first-run,
+	// no-flags invocation. Mirrors the agent BYOS startup checkmark style.
+	if saved == nil && cfg.StartFile == "" && cfg.StartGTID == "" {
+		switch mode {
+		case "position":
+			slog.Info("auto-discovered current binlog position", "file", startFile, "pos", startPos)
+			fmt.Printf("Start position: auto-discovered %s:%d ✓\n", startFile, startPos)
+		case "gtid":
+			// The full set goes to the structured log; the terminal line is
+			// truncated (a long-lived multi-source server's gtid_executed can
+			// span many UUID blocks).
+			slog.Info("auto-discovered executed GTID set (gtid_mode=ON)", "gtid_set", startGTIDStr)
+			fmt.Printf("Start position: auto-discovered GTID set %s ✓\n", truncateForDisplay(startGTIDStr, 120))
+		}
 	}
 
 	// Persist the --reset discard now that the new start position is known

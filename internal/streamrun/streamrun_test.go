@@ -1296,7 +1296,7 @@ func TestResolveStartWithAutoDiscover_firesOnFirstRun(t *testing.T) {
 		func() (string, uint32, error) {
 			called = true
 			return "mysql-bin.000042", 1234, nil
-		})
+		}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1317,7 +1317,7 @@ func TestResolveStartWithAutoDiscover_skippedWhenFlagSet(t *testing.T) {
 		func() (string, uint32, error) {
 			called = true
 			return "should-not-be-used", 999, nil
-		})
+		}, gtidDiscoverMustNotBeCalled(t))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1343,7 +1343,7 @@ func TestResolveStartWithAutoDiscover_skippedWhenGTIDFlagSet(t *testing.T) {
 		func() (string, uint32, error) {
 			called = true
 			return "should-not-be-used", 999, nil
-		})
+		}, gtidDiscoverMustNotBeCalled(t))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1372,7 +1372,7 @@ func TestResolveStartWithAutoDiscover_skippedWhenSavedExists(t *testing.T) {
 		func() (string, uint32, error) {
 			called = true
 			return "should-not-be-used", 999, nil
-		})
+		}, gtidDiscoverMustNotBeCalled(t))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1389,7 +1389,7 @@ func TestResolveStartWithAutoDiscover_skippedWhenSavedExists(t *testing.T) {
 // that when no callback is wired and no flags/saved exist, the original
 // "no start position" error still surfaces (back-compat).
 func TestResolveStartWithAutoDiscover_nilCallbackPreservesOriginalError(t *testing.T) {
-	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil, nil)
+	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when nil callback and no flags/saved, got nil")
 	}
@@ -1405,7 +1405,7 @@ func TestResolveStartWithAutoDiscover_discoveryErrorWrapped(t *testing.T) {
 	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
 		func() (string, uint32, error) {
 			return "", 0, stubErr
-		})
+		}, nil)
 	if err == nil {
 		t.Fatal("expected discovery error to surface, got nil")
 	}
@@ -1426,7 +1426,7 @@ func TestResolveStartWithAutoDiscover_mutuallyExclusiveFlagsErrorPropagates(t *t
 		func() (string, uint32, error) {
 			called = true
 			return "", 0, nil
-		})
+		}, gtidDiscoverMustNotBeCalled(t))
 	if err == nil {
 		t.Fatal("expected mutually-exclusive error, got nil")
 	}
@@ -1435,6 +1435,155 @@ func TestResolveStartWithAutoDiscover_mutuallyExclusiveFlagsErrorPropagates(t *t
 	}
 	if !strings.Contains(err.Error(), "mutually exclusive") {
 		t.Errorf("expected mutually-exclusive error, got: %v", err)
+	}
+}
+
+// gtidDiscoverMustNotBeCalled returns a GTID auto-discover stub that fails the
+// test if invoked. Used on paths (saved checkpoint, explicit flags, MariaDB
+// flavor, non-discovery errors) where GTID discovery must never fire.
+func gtidDiscoverMustNotBeCalled(t *testing.T) func() (string, error) {
+	t.Helper()
+	return func() (string, error) {
+		t.Error("gtid auto-discover must not be called on this path")
+		return "", nil
+	}
+}
+
+// TestResolveStartWithAutoDiscover_gtidDiscoveredSelectsGTIDMode verifies the
+// #1131 fix: on a first run with no flags, a non-empty executed GTID set from
+// the GTID callback selects GTID mode, and the position callback is never
+// consulted.
+func TestResolveStartWithAutoDiscover_gtidDiscoveredSelectsGTIDMode(t *testing.T) {
+	const set = "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-77"
+	posCalled := false
+	mode, file, gtidStr, _, accGTID, err := resolveStartWithAutoDiscover("", "", 4, nil,
+		func() (string, uint32, error) {
+			posCalled = true
+			return "should-not-be-used", 999, nil
+		},
+		func() (string, error) { return set, nil })
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if posCalled {
+		t.Error("position auto-discover must not be called when a GTID set was discovered")
+	}
+	if mode != "gtid" {
+		t.Errorf("mode = %q, want gtid", mode)
+	}
+	if gtidStr != set {
+		t.Errorf("gtidStr = %q, want %q", gtidStr, set)
+	}
+	if file != "" {
+		t.Errorf("file = %q, want empty in gtid mode", file)
+	}
+	if accGTID == nil {
+		t.Error("expected non-nil pre-parsed accGTID in gtid mode")
+	}
+}
+
+// TestResolveStartWithAutoDiscover_gtidEmptyFallsBackToPosition verifies that
+// an empty executed set (gtid_mode not ON, or a fresh server with zero
+// transactions) falls back to position auto-discovery — starting GTID
+// replication from an empty set would replay the binlog from the beginning
+// instead of "starting from now".
+func TestResolveStartWithAutoDiscover_gtidEmptyFallsBackToPosition(t *testing.T) {
+	gtidCalled := false
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+		func() (string, uint32, error) { return "mysql-bin.000042", 1234, nil },
+		func() (string, error) {
+			gtidCalled = true
+			return "", nil
+		})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !gtidCalled {
+		t.Error("expected the GTID callback to be tried first")
+	}
+	if mode != "position" || file != "mysql-bin.000042" || pos != 1234 {
+		t.Errorf("got mode=%q file=%q pos=%d, want position/mysql-bin.000042/1234",
+			mode, file, pos)
+	}
+}
+
+// TestResolveStartWithAutoDiscover_gtidErrorIsFatal verifies that a GTID
+// discovery FAILURE is a hard error, not a silent fallback to position mode —
+// an operator on a GTID source must not silently end up with an index that
+// live-source verify calls inconclusive (the exact dead end of #1131).
+func TestResolveStartWithAutoDiscover_gtidErrorIsFatal(t *testing.T) {
+	stubErr := errors.New("SELECT @@GLOBAL.gtid_mode: connection reset")
+	posCalled := false
+	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+		func() (string, uint32, error) {
+			posCalled = true
+			return "mysql-bin.000042", 1234, nil
+		},
+		func() (string, error) { return "", stubErr })
+	if err == nil {
+		t.Fatal("expected GTID discovery error to surface, got nil")
+	}
+	if !errors.Is(err, stubErr) {
+		t.Errorf("expected wrapped stubErr via errors.Is, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "auto-discover executed GTID set") {
+		t.Errorf("expected GTID-discovery wrap prefix, got: %v", err)
+	}
+	if posCalled {
+		t.Error("position auto-discover must not run after a GTID discovery failure")
+	}
+}
+
+// TestResolveStartWithAutoDiscover_gtidUnparseableIsFatal verifies that a
+// discovered set the flavor parser rejects fails loud instead of degrading to
+// position mode.
+func TestResolveStartWithAutoDiscover_gtidUnparseableIsFatal(t *testing.T) {
+	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+		func() (string, uint32, error) { return "mysql-bin.000042", 1234, nil },
+		func() (string, error) { return "not-a-gtid-set", nil })
+	if err == nil {
+		t.Fatal("expected parse error for unparseable discovered set, got nil")
+	}
+	if !strings.Contains(err.Error(), "unparseable") {
+		t.Errorf("expected unparseable-set error, got: %v", err)
+	}
+}
+
+// TestResolveStartWithAutoDiscoverForFlavor_mariadbSkipsGTIDDiscovery verifies
+// MariaDB keeps today's position-only auto-discovery: the GTID callback is
+// never invoked for the mariadb flavor (its GTID coordinates have different
+// discovery semantics, and live-source verify only consumes MySQL GTID sets).
+func TestResolveStartWithAutoDiscoverForFlavor_mariadbSkipsGTIDDiscovery(t *testing.T) {
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, nil,
+		gomysql.MariaDBFlavor,
+		func() (string, uint32, error) { return "mariadb-bin.000002", 1483, nil },
+		gtidDiscoverMustNotBeCalled(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "position" || file != "mariadb-bin.000002" || pos != 1483 {
+		t.Errorf("got mode=%q file=%q pos=%d, want position/mariadb-bin.000002/1483",
+			mode, file, pos)
+	}
+}
+
+// TestResolveStartWithAutoDiscover_gtidSkippedWhenSavedExists verifies a saved
+// checkpoint bypasses BOTH discovery callbacks — resuming must never
+// re-discover.
+func TestResolveStartWithAutoDiscover_gtidSkippedWhenSavedExists(t *testing.T) {
+	saved := &streamState{mode: "position", binlogFile: "saved.000007", binlogPos: 500}
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("", "", 4, saved,
+		func() (string, uint32, error) {
+			t.Error("position auto-discover must not be called with a saved checkpoint")
+			return "", 0, nil
+		},
+		gtidDiscoverMustNotBeCalled(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != "position" || file != "saved.000007" || pos != 500 {
+		t.Errorf("got mode=%q file=%q pos=%d, want position/saved.000007/500",
+			mode, file, pos)
 	}
 }
 

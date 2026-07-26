@@ -530,7 +530,7 @@ func indexCovers(ctx context.Context, indexDB *sql.DB, srcGTID string) (bool, st
 		return false, "could not read index coverage: " + err.Error()
 	}
 	if !idxGTID.Valid || strings.TrimSpace(idxGTID.String) == "" {
-		return false, "index has not checkpointed any GTID yet"
+		return false, "index has not checkpointed any GTID yet (the stream is checkpointing in position mode; restart it with --start-gtid \"$(mysql -N -e 'SELECT @@GLOBAL.gtid_executed')\" to enable live-source verify — fresh streams on a GTID-enabled source now select GTID mode automatically)"
 	}
 	idxSet, err := gomysql.ParseMysqlGTIDSet(idxGTID.String)
 	if err != nil {

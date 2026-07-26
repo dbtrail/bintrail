@@ -307,7 +307,11 @@ func TestIntegrationCrashRestartExactlyOnce_position(t *testing.T) {
 
 	// ── run 1: clean, establishes the durable checkpoint ──────────────────
 	// No --start-file/--start-gtid and no checkpoint: One auto-discovers the
-	// source's current binlog position and runs in POSITION mode.
+	// start point. GTID discovery is tried first (#1131), but this suite's
+	// MySQL runs gtid_mode=OFF, so CurrentGTIDExecuted returns "" and One
+	// falls back to position discovery and runs in POSITION mode. (On a
+	// gtid_mode=ON source a fresh run would checkpoint in GTID mode instead —
+	// covered by unit tests with stubbed discovery callbacks.)
 	cfg1 := baseCfg(serverIDBase)
 	if err := runOneUntil(t, cfg1, true, insert(1, 5), indexedThrough(5)); err != nil {
 		t.Fatalf("run 1 (clean): %v", err)

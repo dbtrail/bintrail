@@ -91,6 +91,44 @@ func scanBinlogStatus(db *sql.DB, stmt string) (file string, pos uint32, err err
 	return file, pos, nil
 }
 
+// CurrentGTIDExecuted returns the source server's executed GTID set
+// (@@GLOBAL.gtid_executed) when GTID mode is fully enabled, for first-run
+// start-position auto-discovery (the GTID sibling of CurrentBinlogPosition).
+//
+// It returns "" (no error) in two cases the caller must fall back to
+// position-based discovery for:
+//
+//   - @@GLOBAL.gtid_mode is anything other than "ON" (OFF, OFF_PERMISSIVE,
+//     ON_PERMISSIVE): the executed set is absent or may not cover every
+//     transaction, so it cannot anchor GTID replication. Note gtid_executed
+//     can be non-empty even with gtid_mode=OFF (a server that once ran with
+//     GTIDs on), which is why gtid_mode gates the read.
+//   - the executed set is empty (fresh server, zero transactions): starting
+//     GTID replication from an empty set replays the binlog from the very
+//     beginning, which is NOT the "start from now" contract of first-run
+//     auto-discovery.
+//
+// MySQL formats gtid_executed with '\n' between UUID blocks; all whitespace
+// is stripped so the value is usable as a replication start set as-is.
+// The query targets MySQL system variables; MariaDB sources must not call it
+// (streamrun gates the call on the mysql flavor).
+func CurrentGTIDExecuted(db *sql.DB) (string, error) {
+	var gtidMode string
+	if err := db.QueryRow("SELECT @@GLOBAL.gtid_mode").Scan(&gtidMode); err != nil {
+		return "", fmt.Errorf("SELECT @@GLOBAL.gtid_mode: %w", err)
+	}
+	if !strings.EqualFold(gtidMode, "ON") {
+		return "", nil
+	}
+	var executed string
+	if err := db.QueryRow("SELECT @@GLOBAL.gtid_executed").Scan(&executed); err != nil {
+		return "", fmt.Errorf("SELECT @@GLOBAL.gtid_executed: %w", err)
+	}
+	// strings.Fields splits on any whitespace (spaces, '\n', tabs); joining
+	// with "" removes it all.
+	return strings.Join(strings.Fields(executed), ""), nil
+}
+
 // defaultTimeout is the TCP connect timeout applied when the DSN does not
 // specify one. Prevents indefinite hangs when MySQL is unreachable.
 const defaultTimeout = 10 * time.Second

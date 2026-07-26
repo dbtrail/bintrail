@@ -455,3 +455,109 @@ func TestParseSourceDSN_portOutOfRange(t *testing.T) {
 		t.Errorf("expected 'port' in error message, got: %v", err)
 	}
 }
+
+// ─── CurrentGTIDExecuted ────────────────────────────────────────────────────
+
+// TestCurrentGTIDExecuted_onStripsWhitespace verifies the happy path:
+// gtid_mode=ON returns @@GLOBAL.gtid_executed with ALL whitespace stripped —
+// MySQL formats the variable with '\n' between UUID blocks, and the value
+// must be usable as a replication start set as-is.
+func TestCurrentGTIDExecuted_onStripsWhitespace(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT @@GLOBAL.gtid_mode`).WillReturnRows(
+		sqlmock.NewRows([]string{"@@GLOBAL.gtid_mode"}).AddRow("ON"))
+	mock.ExpectQuery(`SELECT @@GLOBAL.gtid_executed`).WillReturnRows(
+		sqlmock.NewRows([]string{"@@GLOBAL.gtid_executed"}).
+			AddRow("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-77,\n8f9e146f-0000-1111-2222-333344445555:1-5"))
+
+	got, err := CurrentGTIDExecuted(db)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-77,8f9e146f-0000-1111-2222-333344445555:1-5"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestCurrentGTIDExecuted_gtidModeNotOn verifies every non-ON gtid_mode
+// (OFF, OFF_PERMISSIVE, ON_PERMISSIVE) returns "" with NO error and never
+// queries gtid_executed. gtid_executed can be non-empty even with
+// gtid_mode=OFF (a server that once ran with GTIDs on), so gating on
+// gtid_mode — not on the set being non-empty — is load-bearing.
+func TestCurrentGTIDExecuted_gtidModeNotOn(t *testing.T) {
+	for _, modeVal := range []string{"OFF", "OFF_PERMISSIVE", "ON_PERMISSIVE"} {
+		t.Run(modeVal, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+
+			mock.ExpectQuery(`SELECT @@GLOBAL.gtid_mode`).WillReturnRows(
+				sqlmock.NewRows([]string{"@@GLOBAL.gtid_mode"}).AddRow(modeVal))
+
+			got, err := CurrentGTIDExecuted(db)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != "" {
+				t.Errorf("got %q, want empty for gtid_mode=%s", got, modeVal)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("gtid_executed must not be queried when gtid_mode is not ON: %v", err)
+			}
+		})
+	}
+}
+
+// TestCurrentGTIDExecuted_emptyExecutedSet verifies a fresh server
+// (gtid_mode=ON, zero transactions) returns "" with no error, so the caller
+// falls back to position discovery instead of replaying the binlog from the
+// beginning.
+func TestCurrentGTIDExecuted_emptyExecutedSet(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT @@GLOBAL.gtid_mode`).WillReturnRows(
+		sqlmock.NewRows([]string{"@@GLOBAL.gtid_mode"}).AddRow("ON"))
+	mock.ExpectQuery(`SELECT @@GLOBAL.gtid_executed`).WillReturnRows(
+		sqlmock.NewRows([]string{"@@GLOBAL.gtid_executed"}).AddRow(""))
+
+	got, err := CurrentGTIDExecuted(db)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("got %q, want empty for an empty executed set", got)
+	}
+}
+
+// TestCurrentGTIDExecuted_queryErrorPropagates verifies a query failure is a
+// real error (the streamrun caller treats it as fatal — it must not silently
+// degrade a GTID source to position mode).
+func TestCurrentGTIDExecuted_queryErrorPropagates(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT @@GLOBAL.gtid_mode`).WillReturnError(
+		errors.New("connection reset"))
+
+	if _, err := CurrentGTIDExecuted(db); err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
