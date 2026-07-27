@@ -159,4 +159,97 @@ func TestUnsupportedPKType(t *testing.T) {
 	if c := unsupportedPKType(nil); c != nil {
 		t.Errorf("unsupportedPKType(nil) = %v, want nil — no metadata means no verdict, not a bad verdict", c)
 	}
+
+	// A PostgreSQL snapshot leaves data_type AND column_type empty (#533), and
+	// single-row reconstruct runs generically for a PG source. Flagging that as
+	// "unsupported" would tell every PG operator their schema does not work
+	// when it does — worse than the #782 misdiagnosis this branch replaces.
+	pg := []metadata.ColumnMeta{{Name: "id", DataType: "", ColumnType: ""}}
+	if c := unsupportedPKType(pg); c != nil {
+		t.Errorf("unsupportedPKType flagged an empty DataType (%q) — that is the PostgreSQL snapshot signature, not an unsupported type", c.Name)
+	}
+}
+
+// TestIndexPKSpelling covers the OTHER direction of the #1155 asymmetry: the
+// event fetch matches binlog_events.pk_values, which holds the ROW image's
+// spelling. An operator who produces the full-width key with
+// `SELECT CONCAT('0x', HEX(k))` would otherwise resolve the baseline row and
+// fetch ZERO events — rendering baseline-era state as the state at --at, with
+// no error. That is a fail-loud-to-fail-silent regression, so it is pinned.
+func TestIndexPKSpelling(t *testing.T) {
+	binary16 := metadata.ColumnMeta{Name: "k", DataType: "binary", ColumnType: "binary(16)", IsPK: true}
+
+	cases := []struct {
+		name  string
+		in    string
+		metas []metadata.ColumnMeta
+		want  string
+	}{
+		{
+			name:  "full-width key is trimmed to the stored spelling",
+			in:    "0x11223344556677889900AABB00000000",
+			metas: []metadata.ColumnMeta{binary16},
+			want:  "0x11223344556677889900AABB",
+		},
+		{
+			name:  "lowercase hex is uppercased to match pk_values",
+			in:    "0xb2815cc3c200ff7c0102030405060780",
+			metas: []metadata.ColumnMeta{binary16},
+			want:  "0xB2815CC3C200FF7C0102030405060780",
+		},
+		{
+			// formatPKValue is content-gated: once trimmed, printable ASCII is
+			// stored VERBATIM with no 0x prefix. Re-spelling it as hex would
+			// miss every event.
+			name:  "printable-ASCII payload becomes the verbatim spelling",
+			in:    "0x41420000000000000000000000000000",
+			metas: []metadata.ColumnMeta{binary16},
+			want:  "AB",
+		},
+		{
+			name:  "already-stored spelling is untouched",
+			in:    "0x11223344556677889900AABB",
+			metas: []metadata.ColumnMeta{binary16},
+			want:  "0x11223344556677889900AABB",
+		},
+		{
+			name:  "varbinary is never trimmed",
+			in:    "0xAABB0000",
+			metas: []metadata.ColumnMeta{{Name: "k", DataType: "varbinary", ColumnType: "varbinary(16)"}},
+			want:  "0xAABB0000",
+		},
+		{
+			name:  "non-binary PK is untouched",
+			in:    "12345",
+			metas: []metadata.ColumnMeta{{Name: "id", DataType: "int"}},
+			want:  "12345",
+		},
+		{
+			name:  "no metadata is a no-op",
+			in:    "0x11223344556677889900AABB00000000",
+			metas: nil,
+			want:  "0x11223344556677889900AABB00000000",
+		},
+		{
+			// The composite component that is NOT binary must survive verbatim,
+			// including a value that merely looks hex-ish.
+			name:  "composite key re-spells only the binary component",
+			in:    "77|0x11223344556677889900AABB00000000",
+			metas: []metadata.ColumnMeta{{Name: "tenant", DataType: "int"}, binary16},
+			want:  "77|0x11223344556677889900AABB",
+		},
+		{
+			name:  "arity mismatch leaves the value alone",
+			in:    "0x11223344556677889900AABB00000000",
+			metas: []metadata.ColumnMeta{{Name: "tenant", DataType: "int"}, binary16},
+			want:  "0x11223344556677889900AABB00000000",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := indexPKSpelling(tc.in, tc.metas); got != tc.want {
+				t.Errorf("indexPKSpelling(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
 }

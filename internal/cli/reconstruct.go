@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
@@ -61,13 +62,75 @@ func resolvePKMetas(db *sql.DB, schema, table string) []metadata.ColumnMeta {
 
 // unsupportedPKType returns the first primary-key column whose type the
 // baseline canonicalizer cannot handle, or nil when every column is supported.
+//
+// An EMPTY DataType is not a verdict. It is the PostgreSQL snapshot signature —
+// metadata.WritePGSnapshot leaves both data_type and column_type empty (#533),
+// and single-row reconstruct deliberately runs generically for a PG source
+// (whose raw-text baseline makes every PK a string-identity match, so it never
+// needs the MySQL canonicalizer). Treating it as unsupported would tell every
+// PostgreSQL operator their schema is unsupported when it works.
 func unsupportedPKType(pkMetas []metadata.ColumnMeta) *metadata.ColumnMeta {
 	for i, c := range pkMetas {
+		if strings.TrimSpace(c.DataType) == "" {
+			continue
+		}
 		if !reconstruct.SupportedPKType(c.DataType) {
 			return &pkMetas[i]
 		}
 	}
 	return nil
+}
+
+// indexPKSpelling rewrites a --pk value into the spelling the indexer stored in
+// binlog_events.pk_values, so the event fetch matches what the operator typed.
+//
+// Only fixed-width BINARY(n) components are touched, and this is the INVERSE of
+// padFixedBinaryFilter — the two run in opposite directions on purpose, because
+// they target different stores. Reproducing event.formatPKValue exactly:
+// trailing 0x00 padding is stripped (the ROW image never carries it), and the
+// hex is uppercased, but ONLY when the trimmed bytes are not valid UTF-8 —
+// formatPKValue is content-gated, so a binary key whose bytes are printable
+// ASCII is stored verbatim and must stay that way.
+//
+// Everything else — every other column type, and every component that is
+// already in the stored spelling — is returned untouched, so this cannot
+// disturb a lookup that resolves today.
+func indexPKSpelling(pk string, pkMetas []metadata.ColumnMeta) string {
+	if pk == "" || len(pkMetas) == 0 {
+		return pk
+	}
+	parts := strings.Split(pk, "|")
+	if len(parts) != len(pkMetas) {
+		// --pk/--pk-columns arity is validated against the operator's
+		// --pk-columns, not against the snapshot; if the two disagree, leave
+		// the value alone rather than re-spell the wrong component.
+		return pk
+	}
+	changed := false
+	for i, c := range pkMetas {
+		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
+			continue
+		}
+		raw, isHex := decodeHexPKValue(parts[i])
+		if !isHex {
+			continue // already the verbatim/stored spelling
+		}
+		trimmed := reconstruct.TrimFixedBinaryPad(raw)
+		var spelled string
+		if utf8.Valid(trimmed) {
+			spelled = string(trimmed)
+		} else {
+			spelled = "0x" + strings.ToUpper(hex.EncodeToString(trimmed))
+		}
+		if spelled != parts[i] {
+			parts[i] = spelled
+			changed = true
+		}
+	}
+	if !changed {
+		return pk
+	}
+	return strings.Join(parts, "|")
 }
 
 // padFixedBinaryFilter re-spells a fixed-width BINARY(n) filter value back to
@@ -97,9 +160,9 @@ func padFixedBinaryFilter(pkFilter map[string]string, pkMetas []metadata.ColumnM
 		}
 		// --pk-columns is operator-typed and MySQL column names are
 		// case-insensitive, so an exact-only match would silently skip the
-		// retry for `--pk-columns K` against column `k` (the exact baseline
-		// lookup, which goes through DuckDB, is case-insensitive too and would
-		// have resolved).
+		// retry for `--pk-columns K` against column `k`. (The lookup underneath
+		// is case-insensitive on both links since #1155: DuckDB resolves the
+		// quoted identifier, and parquetBlobColumns is keyed lowercase.)
 		key, ok := filterKeyFor(out, c.Name)
 		if !ok {
 			continue
@@ -472,10 +535,24 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		dbName = cfg.DBName
 	}
 
+	// PK column metadata from the schema snapshot, resolved before BOTH lookups
+	// that need it: the event fetch just below (which matches
+	// binlog_events.pk_values) and the baseline retry further down (which
+	// matches the Parquet column). The two want the key spelled DIFFERENTLY —
+	// see indexPKSpelling and padFixedBinaryFilter (#1155).
+	pkMetas := resolvePKMetas(db, recSchema, recTable)
+
 	opts := query.Options{
-		Schema:   recSchema,
-		Table:    recTable,
-		PKValues: recPK,
+		Schema: recSchema,
+		Table:  recTable,
+		// A fixed BINARY(n) key is stored in pk_values with its trailing 0x00
+		// padding stripped and its hex uppercased, so the full-width or
+		// lowercase spelling an operator can legitimately produce
+		// (`SELECT CONCAT('0x', HEX(k))`) matches NO event. Left uncorrected
+		// that is silent and wrong rather than loud: the baseline lookup above
+		// resolves such a key, the fetch returns zero events, and ApplyAt then
+		// renders baseline-era state as the state at --at.
+		PKValues: indexPKSpelling(recPK, pkMetas),
 		Since:    &snapshotTime,
 		Until:    &at,
 	}
@@ -508,13 +585,6 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("fetch binlog events: %w", err)
 	}
 	slog.Debug("fetched binlog events", "count", len(events))
-
-	// PK column metadata from the schema snapshot: needed both to re-spell a
-	// fixed BINARY(n) key at the baseline's storage width and to tell a PK type
-	// the canonicalizer cannot handle apart from a genuinely-absent row (#1155).
-	// Resolved here, where db is already open, so the read path above keeps its
-	// order (and --baseline-only, which never opens db, keeps working).
-	pkMetas := resolvePKMetas(db, recSchema, recTable)
 
 	// A fixed BINARY(n) key copied out of binlog_events.pk_values carries the
 	// ROW image's trailing-0x00-stripped spelling, which is SHORTER than the

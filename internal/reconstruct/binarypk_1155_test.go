@@ -257,4 +257,79 @@ func TestReadBaselineRow_binaryPKHexSpelling(t *testing.T) {
 	if row != nil {
 		t.Errorf("absent binary PK matched a row: %v", row)
 	}
+
+	// Column names are case-insensitive everywhere else in the chain — DuckDB
+	// resolves the quoted identifier regardless of case — so the BLOB probe
+	// must be too. Keyed exactly, a differently-cased --pk-columns binds the
+	// hex as text against a BLOB and silently misses: the one link that cares
+	// about case, on the one PK type this change added.
+	row, err = ReadBaselineRow(ctx, path, map[string]string{"K": "0xB2815CC3C200FF7C0102030405060780"})
+	if err != nil {
+		t.Fatalf("ReadBaselineRow (mixed-case column): %v", err)
+	}
+	if row == nil {
+		t.Error("a differently-cased column name did not resolve a binary PK, while every other type resolves it")
+	}
+}
+
+// TestReadBaselineRow_binaryHexTextSymmetry pins the property that makes the
+// filter's type-gated decode safe, and it lives in ANOTHER package, which is
+// why it needs a test rather than a comment.
+//
+// The decode looks asymmetric with the encoder: event.formatPKValue gates on
+// CONTENT (valid UTF-8 → stored verbatim), the filter gates on the COLUMN
+// TYPE. That reads as though a binary column whose bytes are the ASCII text
+// "0x<even-hex>" would be stranded — stored as text, searched for as bytes.
+//
+// It is not, because internal/baseline's decodeBinaryLiteral decodes the same
+// literal on the way IN. The baseline therefore cannot hold those characters
+// as characters, and the ambiguity resolves the same way at both ends. If a
+// future change made the writer preserve the text (say, by threading dump
+// provenance through), this test fails and the filter needs the matching
+// fallback — which is the signal it exists to give.
+func TestReadBaselineRow_binaryHexTextSymmetry(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	cols := []baseline.Column{
+		{Name: "k", MySQLType: "varbinary", ParquetType: baseline.MysqlToParquetNode("varbinary")},
+		{Name: "v", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	path := filepath.Join(dir, "vb.parquet")
+	w, err := baseline.NewWriter(path, cols, baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	if err := w.WriteRow([]string{"0xDEADBEEF", "hit"}, []bool{false, false}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	rows, err := ReadBaselineRows(ctx, path, nil, 0)
+	if err != nil {
+		t.Fatalf("ReadBaselineRows: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("wrote 1 row, read %d", len(rows))
+	}
+	stored, ok := rows[0]["k"].([]byte)
+	if !ok {
+		t.Fatalf("binary column scanned as %T, want []byte", rows[0]["k"])
+	}
+	if len(stored) != 4 {
+		t.Fatalf("the writer stored %d bytes (%X) for the literal \"0xDEADBEEF\", want the 4 DECODED bytes — "+
+			"if the writer now preserves the text, bindFilterArgs must gain a text-binding fallback or such a "+
+			"key becomes unfindable", len(stored), stored)
+	}
+
+	// And the round trip closes: the same spelling an operator types resolves.
+	row, err := ReadBaselineRow(ctx, path, map[string]string{"k": "0xDEADBEEF"})
+	if err != nil {
+		t.Fatalf("ReadBaselineRow: %v", err)
+	}
+	if row == nil || row["v"] != "hit" {
+		t.Errorf("0x… spelling did not resolve the row the writer produced from that same literal: %v", row)
+	}
 }

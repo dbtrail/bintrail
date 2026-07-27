@@ -113,7 +113,11 @@ func ReadBaselineRows(ctx context.Context, path string, filter map[string]string
 	if err != nil {
 		return nil, err
 	}
+	return runBaselineQuery(ctx, db, q, args)
+}
 
+// runBaselineQuery executes a built baseline query and materializes its rows.
+func runBaselineQuery(ctx context.Context, db *sql.DB, q string, args []any) ([]map[string]any, error) {
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("baseline query: %w", err)
@@ -709,12 +713,26 @@ type colCond struct {
 // primary key could not be reconstructed at all (#1155). For those, decode
 // the hex and bind the BYTES.
 //
-// Gated twice so nothing that works today changes shape: the type probe only
-// runs when some value actually carries the 0x-hex spelling, and the decoded
-// bytes are only bound when that column really is a Parquet BYTE_ARRAY (BLOB).
-// A VARCHAR column whose value happens to read "0xAB" therefore keeps binding
-// as the literal text — the same residual ambiguity formatPKValue documents at
-// the encoding end, resolved the same way (content is not type).
+// The decode is gated on the value's shape AND on the column really being a
+// Parquet BYTE_ARRAY (BLOB), so a VARCHAR column whose value happens to read
+// "0xAB" keeps binding as literal text.
+//
+// Worth being precise about what the type gate does and does not buy, because
+// this is NOT the rule formatPKValue applies when PRODUCING the spelling —
+// that one is gated purely on content (valid UTF-8 → stored verbatim), this
+// one on content AND type. The asymmetry looks like it should strand a binary
+// column whose bytes are literally the ASCII text "0x<even-hex>": pk_values
+// holds that text, and decoding it would look for entirely different bytes.
+//
+// It does not, and the reason is that the WRITE side decodes identically.
+// internal/baseline's decodeBinaryLiteral is applied to every binary-family
+// column, and its doc records the same residual from the other end: a binary
+// value whose actual bytes are the ASCII text "0x…" is indistinguishable from
+// a --hex-blob literal and IS decoded on the way into the Parquet. So the
+// baseline never stores those characters as characters, and the two ends of
+// the ambiguity resolve the same way by construction rather than by agreement.
+// TestReadBaselineRow_binaryHexTextSymmetry pins that, because it is the
+// property this gate leans on and it lives in another package.
 func bindFilterArgs(ctx context.Context, db *sql.DB, safePath string, conds []colCond) ([]any, error) {
 	args := make([]any, len(conds))
 	decoded := make([][]byte, len(conds))
@@ -732,15 +750,28 @@ func bindFilterArgs(ctx context.Context, db *sql.DB, safePath string, conds []co
 
 	blobCols, err := parquetBlobColumns(ctx, db, safePath)
 	if err != nil {
-		// Non-fatal: fall back to the pre-#1155 string binding rather than
-		// failing a lookup that may not involve a binary column at all.
-		slog.Debug("could not probe baseline column types; binding filter values as text", "error", err)
+		// The probe only runs once a value already carries the 0x-hex spelling,
+		// which cannot match a BLOB column bound as text — so this fallback is
+		// a guaranteed miss for exactly the lookup the probe exists to serve,
+		// not graceful degradation. Warn (not Debug): downstream a miss is
+		// indistinguishable from a genuinely absent row.
+		slog.Warn("could not probe baseline column types; binding a 0x-hex filter value as text, which will not match a binary column",
+			"error", err)
 		return args, nil
 	}
 	for i, c := range conds {
-		if decoded[i] != nil && blobCols[c.col] {
-			args[i] = decoded[i]
+		if decoded[i] == nil {
+			continue
 		}
+		// Case-insensitive: DuckDB resolves the quoted identifier in the WHERE
+		// clause case-insensitively, so an exact-only match here would bind a
+		// differently-cased operator-typed column name as text against a BLOB
+		// and silently miss — making this the ONE link in the chain that cares
+		// about case.
+		if !blobCols[strings.ToLower(c.col)] {
+			continue
+		}
+		args[i] = decoded[i]
 	}
 	return args, nil
 }
@@ -773,10 +804,12 @@ func parquetBlobColumns(ctx context.Context, db *sql.DB, safePath string) (map[s
 	if err != nil {
 		return nil, err
 	}
+	// Keyed lowercase: the caller looks up an operator-typed column name and
+	// DuckDB itself resolves identifiers case-insensitively.
 	out := make(map[string]bool, len(types))
 	for _, t := range types {
 		if strings.EqualFold(t.DatabaseTypeName(), "BLOB") {
-			out[t.Name()] = true
+			out[strings.ToLower(t.Name())] = true
 		}
 	}
 	return out, rows.Err()

@@ -490,12 +490,17 @@ func (h *Handler) fullTableTextCell(schema, table, column string, v any) any {
 //     hosts; its prior exclusion was over-conservative, and the #359 UTC pin is
 //     a harmless no-op for it.
 //
-// This set is intentionally identical to reconstruct.supportedPKType, but
-// reached by a different mechanism (DuckDB string-cast here vs. Go-side
-// canonicalization in the offline merge), so it is kept as a separate
-// matcher: a future change to one path's type support must not silently
-// move the other. Types reconstruct rejects outright (FLOAT, BLOB, BIT,
-// JSON, …) are not listed and therefore fall back to the binlog-only path —
+// This set is a strict SUBSET of reconstruct.SupportedPKType, reached by a
+// different mechanism (DuckDB string-cast here vs. Go-side canonicalization in
+// the offline merge) — which is exactly why it is a separate matcher: a change
+// to one path's type support must not silently move the other.
+//
+// The two diverged deliberately in #1155. Reconstruct gained the
+// BINARY/VARBINARY/BLOB family because its Go-side canonicalizer can undo a
+// fixed BINARY(n)'s trailing-0x00 storage padding; this matcher cannot (a
+// string-bound WHERE has no width to pad to), so binary keys stay out and keep
+// falling back to the binlog-only path. Types reconstruct rejects outright
+// (FLOAT, BIT, JSON, spatial) are likewise not listed and fall back too —
 // for MySQL-family sources. A PostgreSQL source bypasses this matcher entirely
 // (its data_type is "" and its baseline is raw text — see runSnapshotPointInTime).
 func baselinePKStringMatchable(dataType string) bool {

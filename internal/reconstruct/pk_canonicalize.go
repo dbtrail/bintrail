@@ -70,9 +70,12 @@ import (
 // real work happens, but this path is the defense-in-depth check.
 //
 // The binary family (#1155). Both sides now speak raw bytes, so there is no
-// spelling to reconcile here: baseline.parseSQLValue decodes mydumper's
-// 0x… literal (#503) and stores the bytes in a Parquet BYTE_ARRAY column
-// (internal/baseline/schema.go), DuckDB scans that back as []byte, and
+// spelling to reconcile here: internal/baseline decodes BOTH mydumper
+// spellings — the --hex-blob `0x…` literal, which parseSQLValue passes through
+// as a token for convertValue→decodeBinaryLiteral to decode by column type
+// (#503), and the default `_binary "…"` form, which parseSQLValue unescapes
+// directly — and stores raw bytes in a Parquet BYTE_ARRAY column
+// (internal/baseline/schema.go). DuckDB scans that back as []byte, and
 // event.BuildPKValues → formatPKValue applies the SAME content-gated
 // hex/UTF-8 rule the indexer applied at capture (#1132). Handing the bytes
 // through unchanged is what makes the two sides one encoder rather than two
@@ -85,10 +88,14 @@ import (
 //   - The baseline (and the live source) carry the full n bytes, because
 //     MySQL right-pads a short BINARY(n) value with 0x00 on storage.
 //   - The binlog ROW image carries the value with EVERY trailing 0x00 byte
-//     stripped (verified against MySQL 8.0.46: a 16-byte key ending in four
-//     zero bytes arrives as 12 bytes), which is the same stripping #1135
-//     documents and renderCell reverses by re-padding. So pk_values — what
-//     this canonicalization has to match — holds the STRIPPED spelling.
+//     stripped, because MySQL length-prefixes MYSQL_TYPE_STRING with the
+//     ACTUAL stored length and go-mysql's decodeString reads exactly that —
+//     the mechanism internal/verify/render.go documents for #1135 and reverses
+//     by re-padding. So pk_values — what this canonicalization has to match —
+//     holds the STRIPPED spelling. Corroborated against MySQL 8.0.46 (a
+//     16-byte key ending in four zero bytes arrives as 12) and pinned at
+//     runtime by assertPaddingStripped. MariaDB is covered by the same
+//     mechanism, not by a separate observation.
 //
 // Hence: trim for "binary", never for varbinary/blob. VARBINARY and the BLOB
 // family preserve trailing 0x00 in the ROW image (same run), so trimming them
