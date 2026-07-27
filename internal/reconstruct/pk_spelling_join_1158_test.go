@@ -55,12 +55,20 @@ func binaryPKCols() []metadata.ColumnMeta {
 //   - UPDATE: the stale row is emitted and the event is appended, producing a
 //     duplicate key that a restore rejects with 1062 — loud, but late.
 //
-// Note what this does NOT do, because it is the trap in the issue's own
-// suggested fix: a `seen` set over emitted PK strings cannot detect either
-// case. The two rows carry DIFFERENT key strings — that is precisely why the
-// join failed — and in the DELETE case only ONE row is emitted, so there is no
-// duplicate to count. The guard has to compare the two possible spellings of
-// the same key, not the strings actually emitted.
+// Note what the issue's own suggested fix — a `seen` set over emitted PKs —
+// can and cannot do, since the difference is what shaped this guard:
+//
+//   - the UPDATE case it CAN catch, if keyed on each emitted row's
+//     CANONICALIZED pk rather than on the change-map key (both rows canonicalize
+//     to the stripped spelling), and it would catch a broader class of
+//     canonicalization disagreements than fixed-binary padding;
+//   - the DELETE case it CANNOT catch at all: only ONE row is emitted, so
+//     there is no duplicate to count.
+//
+// The DELETE case is the one that corrupts output silently, and a `seen` set
+// over emitted rows costs O(table) memory — which is what #1097 and #1107 exist
+// to remove from this path. Hence comparing the two possible SPELLINGS of a
+// key, at O(1), instead of the strings actually emitted.
 func TestMergeBaselineImages_pkSpellingJoinRefused(t *testing.T) {
 	const (
 		paddedKey   = "11223344556677889900AABB00000000" // as stored / as dumped
@@ -72,7 +80,7 @@ func TestMergeBaselineImages_pkSpellingJoinRefused(t *testing.T) {
 		evType     event.EventType
 		wantInText string
 	}{
-		{"deleted row would be resurrected", event.EventDelete, "resurrected after its DELETE"},
+		{"deleted row would be resurrected", event.EventDelete, "kept alive past its DELETE"},
 		{"updated row would be emitted twice", event.EventUpdate, "emitted twice"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -99,7 +107,7 @@ func TestMergeBaselineImages_pkSpellingJoinRefused(t *testing.T) {
 				t.Fatalf("merge succeeded and emitted %d row(s); it must refuse — the baseline row and its "+
 					"%v event are keyed differently, so the output would be wrong", len(emitted), tc.evType)
 			}
-			for _, want := range []string{"db.bp", "full-table reconstruct", tc.wantInText, strippedKey} {
+			for _, want := range []string{"db.bp", "baseline merge", tc.wantInText, strippedKey} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("error missing %q:\n%s", want, err)
 				}
@@ -162,6 +170,7 @@ func TestAltFixedBinaryPK_noFalseCollisions(t *testing.T) {
 	}
 	canonical := map[string]string{}
 	alternate := map[string]string{}
+	withAlt := 0
 	for _, k := range keys {
 		raw := mustDecodeHex(t, k)
 		pkMap, err := canonicalizePKMap(map[string]any{"k": raw}, pkCols)
@@ -175,6 +184,7 @@ func TestAltFixedBinaryPK_noFalseCollisions(t *testing.T) {
 		canonical[c] = k
 
 		if a, ok := altFixedBinaryPK(pkCols, pkMap); ok {
+			withAlt++
 			if prev, dup := alternate[a]; dup {
 				t.Errorf("two distinct keys produce the same ALTERNATE spelling: %s and %s → %q", prev, k, a)
 			}
@@ -191,6 +201,220 @@ func TestAltFixedBinaryPK_noFalseCollisions(t *testing.T) {
 			}
 		}
 	}
+	// Positive anchor. Every discriminating assertion above sits inside the
+	// `ok` branch, so an altFixedBinaryPK that returned false for everything
+	// would skip them all and this test would pass having checked nothing.
+	if want := 4; withAlt != want {
+		t.Errorf("%d of %d keys produced an alternate spelling, want %d — if this dropped to 0 every "+
+			"assertion above became vacuous", withAlt, len(keys), want)
+	}
+}
+
+// TestMergeBaselineImages_healthyTableWithPendingEvents is the false-positive
+// control that TestMergeBaselineImages_correctSpellingStillMerges cannot be.
+//
+// The guard only fires against an UNDRAINED change-map entry, and the scan
+// drains as it goes — so a one-row/one-event fixture has an empty map by the
+// time it matters, and a guard that mis-fired against OTHER rows' pending
+// events would pass it green. This drives many keys through the real merge
+// with events pending for only a subset, which is the only configuration in
+// which a false refusal is possible.
+func TestMergeBaselineImages_healthyTableWithPendingEvents(t *testing.T) {
+	pkCols := binaryPKCols()
+
+	// Keys spanning every trailing-zero count 0..15 plus interior zeros, so
+	// both the "has an alternate" and "single spelling" populations are large.
+	rows := map[string]string{}
+	var keys []string
+	for i := range 16 {
+		k := strings.Repeat("A7", 16-i) + strings.Repeat("00", i)
+		rows[k] = "baseline"
+		keys = append(keys, k)
+	}
+	for i := range 8 {
+		k := "5C00" + strings.Repeat("B3", 13-i) + strings.Repeat("00", i+1)
+		k = k[:32]
+		rows[k] = "baseline"
+		keys = append(keys, k)
+	}
+	path := binaryPKBaseline(t, t.TempDir(), rows)
+
+	// Events for every third key, correctly spelled (stripped), so the map is
+	// still populated while later rows are being scanned.
+	changes := map[string]*query.ResultRow{}
+	updated := map[string]bool{}
+	for i, k := range keys {
+		if i%3 != 0 {
+			continue
+		}
+		stripped := event.BuildPKValues(pkCols, mustCanonicalize(t, pkCols, mustDecodeHex(t, k)))
+		changes[stripped] = &query.ResultRow{
+			EventType: event.EventUpdate, SchemaName: "db", TableName: "bp",
+			PKValues: stripped,
+			RowAfter: map[string]any{"k": mustDecodeHex(t, k), "val": "updated"},
+		}
+		updated[k] = true
+	}
+	wantUpdated := len(changes)
+	if wantUpdated < 5 {
+		t.Fatalf("fixture built only %d pending events; too few to leave the map populated across the scan", wantUpdated)
+	}
+
+	var gotBaseline, gotUpdated int
+	err := SnapshotFullTableImages(context.Background(), SnapshotFullTableInput{
+		BaselinePath: path, Schema: "db", Table: "bp", PKCols: pkCols,
+		Changes: changes,
+	}, func(r map[string]any) error {
+		switch r["val"] {
+		case "baseline":
+			gotBaseline++
+		case "updated":
+			gotUpdated++
+		default:
+			t.Errorf("unexpected emitted value %v", r["val"])
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("the guard refused a healthy table — a false refusal is worse than the bug it cures: %v", err)
+	}
+	// NOTE: read before the merge — mergeBaselineImages DRAINS in.Changes.
+	if gotUpdated != wantUpdated {
+		t.Errorf("emitted %d updated rows, want %d", gotUpdated, wantUpdated)
+	}
+	if want := len(keys) - wantUpdated; gotBaseline != want {
+		t.Errorf("emitted %d pass-through rows, want %d", gotBaseline, want)
+	}
+}
+
+// TestMergeBaselineImages_compositeBinaryPK covers a PK with two fixed-binary
+// components, one padded and one full-width. It pins that the alternate is
+// built over ALL PK columns in ordinal order (a regression that toggled only
+// the first, or that aliased the source map instead of copying it, is
+// otherwise invisible), and that the healthy version still merges.
+func TestMergeBaselineImages_compositeBinaryPK(t *testing.T) {
+	pkCols := []metadata.ColumnMeta{
+		{Name: "a", DataType: "binary", ColumnType: "binary(16)", IsPK: true, OrdinalPosition: 1},
+		{Name: "b", DataType: "binary", ColumnType: "binary(4)", IsPK: true, OrdinalPosition: 2},
+	}
+	const (
+		aPadded = "11223344556677889900AABB00000000" // has padding
+		bFull   = "DEADBEEF"                         // no padding
+	)
+
+	writeComposite := func(t *testing.T) string {
+		t.Helper()
+		cols := []baseline.Column{
+			{Name: "a", MySQLType: "binary", ParquetType: baseline.MysqlToParquetNode("binary")},
+			{Name: "b", MySQLType: "binary", ParquetType: baseline.MysqlToParquetNode("binary")},
+			{Name: "val", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+		}
+		path := filepath.Join(t.TempDir(), "cp.parquet")
+		w, err := baseline.NewWriter(path, cols, baseline.WriterConfig{Compression: "none", RowGroupSize: 10})
+		if err != nil {
+			t.Fatalf("NewWriter: %v", err)
+		}
+		if err := w.WriteRow([]string{"0x" + aPadded, "0x" + bFull, "baseline"}, []bool{false, false, false}); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		return path
+	}
+
+	canonicalPK := event.BuildPKValues(pkCols, mustCanonicalizeMulti(t, pkCols,
+		map[string]any{"a": mustDecodeHex(t, aPadded), "b": mustDecodeHex(t, bFull)}))
+
+	t.Run("mis-keyed on the padded component refuses", func(t *testing.T) {
+		misKeyed := "0x" + aPadded + "|0x" + bFull
+		var emitted int
+		err := SnapshotFullTableImages(context.Background(), SnapshotFullTableInput{
+			BaselinePath: writeComposite(t), Schema: "db", Table: "cp", PKCols: pkCols,
+			Changes: map[string]*query.ResultRow{misKeyed: {
+				EventType: event.EventDelete, SchemaName: "db", TableName: "cp", PKValues: misKeyed,
+			}},
+		}, func(map[string]any) error { emitted++; return nil })
+		if err == nil {
+			t.Fatalf("merge succeeded, emitting %d row(s); the composite key's padded component is mis-spelled "+
+				"and the DELETE would be lost", emitted)
+		}
+		// The alternate must carry BOTH components, the toggled one and the
+		// untouched one, joined in ordinal order.
+		if !strings.Contains(err.Error(), misKeyed) {
+			t.Errorf("error does not name the full composite alternate %q:\n%s", misKeyed, err)
+		}
+	})
+
+	t.Run("correctly keyed still merges", func(t *testing.T) {
+		var emitted []map[string]any
+		err := SnapshotFullTableImages(context.Background(), SnapshotFullTableInput{
+			BaselinePath: writeComposite(t), Schema: "db", Table: "cp", PKCols: pkCols,
+			Changes: map[string]*query.ResultRow{canonicalPK: {
+				EventType: event.EventUpdate, SchemaName: "db", TableName: "cp", PKValues: canonicalPK,
+				RowAfter: map[string]any{"a": mustDecodeHex(t, aPadded), "b": mustDecodeHex(t, bFull), "val": "updated"},
+			}},
+		}, func(r map[string]any) error { emitted = append(emitted, r); return nil })
+		if err != nil {
+			t.Fatalf("a correctly-keyed composite PK must not trip the guard: %v", err)
+		}
+		if len(emitted) != 1 || emitted[0]["val"] != "updated" {
+			t.Errorf("emitted %v, want one updated row", emitted)
+		}
+	})
+}
+
+// TestMergeBaselineImages_guardCoversClaimedRow pins the reason the check sits
+// ABOVE the claimed/unclaimed branch rather than inside the unclaimed one.
+//
+// in.Changes is keyed by string, so two spellings of one row are two
+// independent entries. With an entry under the canonical spelling the row takes
+// the CLAIMED branch; a sibling entry under the alternate spelling would then
+// survive the scan and reach the leftover tail, where a DELETE is dropped
+// without a word — the row outlives its own DELETE with the guard in the room.
+func TestMergeBaselineImages_guardCoversClaimedRow(t *testing.T) {
+	const paddedKey = "11223344556677889900AABB00000000"
+	pkCols := binaryPKCols()
+	path := binaryPKBaseline(t, t.TempDir(), map[string]string{paddedKey: "baseline"})
+
+	stripped := event.BuildPKValues(pkCols, mustCanonicalize(t, pkCols, mustDecodeHex(t, paddedKey)))
+	changes := map[string]*query.ResultRow{
+		// Claims the row, so without hoisting the guard never runs.
+		stripped: {
+			EventType: event.EventUpdate, SchemaName: "db", TableName: "bp", PKValues: stripped,
+			RowAfter: map[string]any{"k": mustDecodeHex(t, "11223344556677889900AABB"), "val": "updated"},
+		},
+		// The sibling entry that would be silently dropped.
+		"0x" + paddedKey: {
+			EventType: event.EventDelete, SchemaName: "db", TableName: "bp", PKValues: "0x" + paddedKey,
+		},
+	}
+
+	var emitted []map[string]any
+	err := SnapshotFullTableImages(context.Background(), SnapshotFullTableInput{
+		BaselinePath: path, Schema: "db", Table: "bp", PKCols: pkCols, Changes: changes,
+	}, func(r map[string]any) error { emitted = append(emitted, r); return nil })
+	if err == nil {
+		t.Fatalf("merge succeeded and emitted %v — an undrained DELETE keyed under the alternate spelling "+
+			"was dropped in the leftover tail while the guard sat on the unclaimed branch only", emitted)
+	}
+	if !strings.Contains(err.Error(), "DELETE") {
+		t.Errorf("error should name the undrained DELETE:\n%s", err)
+	}
+}
+
+func mustCanonicalize(t *testing.T, pkCols []metadata.ColumnMeta, k []byte) map[string]any {
+	t.Helper()
+	return mustCanonicalizeMulti(t, pkCols, map[string]any{"k": k})
+}
+
+func mustCanonicalizeMulti(t *testing.T, pkCols []metadata.ColumnMeta, row map[string]any) map[string]any {
+	t.Helper()
+	m, err := canonicalizePKMap(row, pkCols)
+	if err != nil {
+		t.Fatalf("canonicalizePKMap: %v", err)
+	}
+	return m
 }
 
 // TestAltFixedBinaryPK_inertWithoutFixedBinary keeps the guard free for every

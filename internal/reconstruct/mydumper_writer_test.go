@@ -176,14 +176,14 @@ func TestMydumperWriter_valueTypeMatrix(t *testing.T) {
 	content := string(b)
 
 	wants := []string{
-		"42",                             // int64
-		`'O\'Brien\\path'`,               // string with escapes
-		"NULL",                           // nil
-		"3.14",                           // float64
-		"'2026-04-11 14:30:45.500000'",   // time.Time
-		"X'deadbeef'",                    // []byte
-		`'{"k":"v"}'`,                    // map[string]any (JSON column)
-		"18446744073709551615",           // json.Number: bare numeric literal, exact
+		"42",                           // int64
+		`'O\'Brien\\path'`,             // string with escapes
+		"NULL",                         // nil
+		"3.14",                         // float64
+		"'2026-04-11 14:30:45.500000'", // time.Time
+		"X'deadbeef'",                  // []byte
+		`'{"k":"v"}'`,                  // map[string]any (JSON column)
+		"18446744073709551615",         // json.Number: bare numeric literal, exact
 	}
 	for _, want := range wants {
 		if !strings.Contains(content, want) {

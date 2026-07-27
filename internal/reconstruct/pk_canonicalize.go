@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -190,29 +189,55 @@ func pkValueBytes(raw any) ([]byte, bool) {
 // altFixedBinaryPK returns the ONE alternative spelling a baseline row's
 // primary key could carry, or ok=false when there is none.
 //
-// A fixed BINARY(n) key exists in exactly two forms: the padded n bytes MySQL
+// A fixed BINARY(n) key has at most two byte-forms: the padded n bytes MySQL
 // stores, and the trailing-0x00-stripped bytes the binlog ROW image carries
-// (see canonicalizePKValue's binary-family note). canonicalizePKValue produces
-// the stripped one so it matches binlog_events.pk_values, so if the change map
-// holds an entry under the PADDED spelling instead, the two sides are keyed
-// differently and the join silently fails (#1158).
+// (see canonicalizePKValue's binary-family note). A value with no trailing zero
+// byte — most BINARY(16) UUIDs — has only ONE, which is why the loop below
+// skips it. canonicalizePKValue produces the stripped form so it matches
+// binlog_events.pk_values; an entry in the change map under the PADDED spelling
+// means the two sides are keyed differently and the join silently fails (#1158).
 //
-// That is the whole search space, which is why this needs no index and no extra
-// memory — the caller does one more lookup in the map it already has. With
-// several fixed-binary components every component is toggled together rather
-// than enumerating 2^k combinations: a canonicalization that disagrees does so
-// uniformly, and a partial disagreement is not a shape this can produce.
+// Both byte-forms render under the same rule, so there is no third spelling to
+// search: formatPKValue is content-gated (valid UTF-8 → stored verbatim, no 0x
+// prefix), and padding with 0x00 cannot change UTF-8 validity in either
+// direction — appending NUL keeps valid input valid, and NUL is never a
+// continuation byte so it cannot repair invalid input.
 //
-// It cannot fire on a healthy table. pk_values only ever holds the stripped
-// spelling, so no legitimate event is keyed under the padded one; a hit means
-// the two sides genuinely disagree. And the toggle is injective over what a
-// BINARY(n) column can hold — every stored value is exactly n bytes, so two
-// distinct keys cannot toggle onto each other — so it cannot invent a
-// collision between two real rows either.
+// Direction, precisely: at the only production call site the input has already
+// been stripped by canonicalizePKMap, so this always runs strip→pad. The
+// pad→strip half is defensive for a caller handing over an uncanonicalized map
+// — mergeBaselineImages already does under PGTextPK, inert there only because
+// PostgreSQL column metas carry an empty DataType.
 //
-// Returns false when no PK column is a fixed BINARY(n) with a known width (a
-// pre-#212 snapshot has no width to pad to), which is also the common case:
-// for every other table this costs one type check per row and nothing else.
+// Cost: one DataType check per PK column per row, and nothing else, for every
+// table without a fixed-binary key. When a key DOES carry padding — the
+// population this exists for — each row also allocates a PK-sized map and the
+// toggled key string. That is accepted: the alternative is an unbounded wrong
+// answer. No index, no per-row state that outlives the row.
+//
+// It cannot fire on a healthy table: pk_values only ever holds the stripped
+// spelling, so no legitimate event is keyed under the padded one. And it cannot
+// invent a collision between two real rows — but the reason is about the
+// STRINGS, not the bytes, since formatPKValue maps two byte domains into one
+// string space. An alternate can never equal some other key's canonical
+// spelling because (a) in the hex branch a colliding verbatim key would have to
+// be the ASCII text "0x"+2n hex characters, i.e. 2n+2 bytes in an n-byte
+// column, which cannot be stored; and (b) in the verbatim branch the alternate
+// ends in a literal 0x00 byte, which a stripped canonical spelling never
+// carries.
+//
+// Returns false when no PK column is a fixed BINARY(n) with a known width. Note
+// what that means for a pre-#212 snapshot with no COLUMN_TYPE: the CANONICAL
+// key is still correct (canonicalizePKValue trims unconditionally and never
+// reads the width) — it is only this detector that goes quiet, which is why
+// mergeBaselineImages warns once per table rather than letting it pass unsaid.
+//
+// Scope limit, stated rather than wished away: with several fixed-binary
+// components every togglable component is flipped together instead of
+// enumerating 2^k combinations. That detects a UNIFORM disagreement — a
+// canonicalization regression flips a rule, not one column — and misses a
+// partial one, including the partial toggle this function itself produces when
+// one component's width is unknown.
 func altFixedBinaryPK(pkCols []metadata.ColumnMeta, pkMap map[string]any) (string, bool) {
 	var alt map[string]any
 	for _, c := range pkCols {
@@ -238,8 +263,14 @@ func altFixedBinaryPK(pkCols []metadata.ColumnMeta, pkMap map[string]any) (strin
 			continue // no padding either way: one spelling only
 		}
 		if alt == nil {
-			alt = make(map[string]any, len(pkMap))
-			maps.Copy(alt, pkMap)
+			// PK columns only. canonicalizePKMap hands back a copy of the
+			// WHOLE row, and copying that per row would scale this with the
+			// table's column count for no benefit — BuildPKValues reads
+			// nothing but pkCols.
+			alt = make(map[string]any, len(pkCols))
+			for _, p := range pkCols {
+				alt[p.Name] = pkMap[p.Name]
+			}
 		}
 		alt[c.Name] = flipped
 	}
@@ -251,6 +282,12 @@ func altFixedBinaryPK(pkCols []metadata.ColumnMeta, pkMap map[string]any) (strin
 
 // FixedBinaryWidth extracts n from a "binary(n)" COLUMN_TYPE, returning 0 when
 // it is absent or unparseable (a pre-#212 snapshot carries no COLUMN_TYPE).
+//
+// Exported because internal/cli's padFixedBinaryFilter must agree with
+// altFixedBinaryPK about the pad width — a `--pk` filter and a merge join that
+// disagreed would resolve the same key differently. internal/verify/render.go
+// keeps its own equivalent for the #1135 render padding; the two must stay in
+// agreement, so change them together.
 func FixedBinaryWidth(columnType string) int {
 	s := strings.ToLower(strings.TrimSpace(columnType))
 	if !strings.HasPrefix(s, "binary(") || !strings.HasSuffix(s, ")") {

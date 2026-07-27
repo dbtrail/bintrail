@@ -201,10 +201,10 @@ func TestParseDatetimePrecision(t *testing.T) {
 		{"timestamp(6)", 6, true},
 		{"TIMESTAMP(3)", 3, true},
 		{"  datetime(6)  ", 6, true},
-		{"", 0, false}, // pre-#212 snapshot
-		{"datetime(7)", 0, false}, // out of range
+		{"", 0, false},              // pre-#212 snapshot
+		{"datetime(7)", 0, false},   // out of range
 		{"datetime(abc)", 0, false}, // unparseable
-		{"varchar(64)", 0, false}, // wrong prefix
+		{"varchar(64)", 0, false},   // wrong prefix
 	}
 	for _, c := range cases {
 		t.Run(c.in, func(t *testing.T) {

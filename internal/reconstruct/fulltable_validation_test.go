@@ -18,9 +18,9 @@ import (
 // test runs without Docker/MySQL.
 func TestReconstructTables_validationErrors(t *testing.T) {
 	cases := []struct {
-		name     string
-		cfg      FullTableConfig
-		wantSub  string
+		name    string
+		cfg     FullTableConfig
+		wantSub string
 	}{
 		{
 			name: "missing IndexDSN",

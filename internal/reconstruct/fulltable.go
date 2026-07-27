@@ -791,9 +791,15 @@ type mergeInput struct {
 // it owns the MydumperWriter and turns each emitted row map into an ordered
 // tuple the writer expects.
 //
-// The writer's Close() is deferred as a fallback: on any early return it
-// still runs and unlinks half-written chunk files, so callers never observe
-// stray partial output on disk.
+// The writer's Close() is deferred so an early return always releases the
+// file handles. It does NOT undo the run: Close finalizes the current chunk
+// (terminating semicolon, flush) and only unlinks it when that write itself
+// fails, so an early return after rows have been written leaves a complete,
+// loadable chunk holding a PREFIX of the table, plus the schema file. The
+// run-level _INCOMPLETE marker is what tells a consumer not to trust the
+// directory; there is no in-file signal (#1162). The guards that predate the
+// writer opening — #602, #843 — sidestep this by refusing before any file
+// exists; a per-row guard like #1158 cannot.
 // GUARD PLACEMENT (#1097) — read before adding a check here.
 //
 // The two guards that inspect an event's BEFORE-image — #592 (residual
@@ -995,6 +1001,8 @@ func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string
 		return stats, fmt.Errorf("duckdb columns: %w", err)
 	}
 
+	warnUndetectableBinaryPK(in.Schema, in.Table, in.PKCols)
+
 	scan := make([]any, len(dcols))
 	ptrs := make([]any, len(dcols))
 	for i := range scan {
@@ -1032,6 +1040,22 @@ func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string
 		}
 		pk := event.BuildPKValues(in.PKCols, pkMap)
 
+		// Before deciding what claims this row, check the ONE other spelling
+		// its key could carry (#1158) — see altFixedBinaryPK.
+		//
+		// Hoisted above the branch on purpose. in.Changes is keyed by STRING,
+		// so two spellings of one logical row are two INDEPENDENT entries: an
+		// entry under the canonical spelling would send this row down the
+		// claimed branch while a sibling entry under the alternate one
+		// survives the scan and lands in the leftover tail, where a DELETE is
+		// dropped without a word. Checking only the unclaimed branch would
+		// leave exactly the resurrection this guard exists to stop.
+		if alt, ok := altFixedBinaryPK(in.PKCols, pkMap); ok {
+			if ev, pending := in.Changes[alt]; pending {
+				return stats, pkSpellingJoinErr(in.Schema, in.Table, pk, alt, ev.EventType)
+			}
+		}
+
 		if ev, ok := in.Changes[pk]; ok {
 			delete(in.Changes, pk)
 			switch ev.EventType {
@@ -1054,14 +1078,6 @@ func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string
 				stats.UpdatesApplied++
 			}
 		} else {
-			// This baseline row is about to be emitted verbatim because no
-			// event claimed it. Before trusting that, check the ONE other
-			// spelling its key could carry (#1158) — see altFixedBinaryPK.
-			if alt, ok := altFixedBinaryPK(in.PKCols, pkMap); ok {
-				if ev, pending := in.Changes[alt]; pending {
-					return stats, pkSpellingJoinErr(in.Schema, in.Table, pk, alt, ev.EventType)
-				}
-			}
 			if err := emit(rowMap); err != nil {
 				return stats, err
 			}
@@ -1318,14 +1334,38 @@ func pkChangingUpdateErr(schema, table, before, after string) error {
 func pkSpellingJoinErr(schema, table, canonical, alternate string, evType event.EventType) error {
 	kind, outcome := "UPDATE/INSERT", "emitted twice"
 	if evType == event.EventDelete {
-		kind, outcome = "DELETE", "resurrected after its DELETE"
+		kind, outcome = "DELETE", "kept alive past its DELETE"
 	}
 	return fmt.Errorf(
-		"full-table reconstruct: %s.%s has a baseline row keyed %q while an undrained %s event for the same row "+
+		"baseline merge: %s.%s has a baseline row keyed %q while an undrained %s event for the same row "+
 			"is keyed %q — the two spellings of a fixed BINARY(n) key (padded on storage, trailing-0x00-stripped in "+
-			"the binlog row image) are not being reconciled, so this row would be %s in the output. This is a bintrail "+
-			"canonicalization fault, not a problem with your data; please report it with the table's PK definition",
+			"the binlog row image) are not being reconciled, so this row would be %s in the reconstructed row set. "+
+			"First check that the schema snapshot matches the live column type (`bintrail snapshot`): a snapshot "+
+			"saying BINARY(n) for a column since ALTERed to VARBINARY(n) produces this same disagreement and is "+
+			"fixed by re-snapshotting. Otherwise this is a bintrail canonicalization fault — please report it with "+
+			"the table's PK definition",
 		schema, table, canonical, kind, alternate, outcome)
+}
+
+// warnUndetectableBinaryPK reports, once per table, that a fixed-binary PK
+// column carries no declared width so the #1158 key-spelling guard cannot run
+// for it. The CANONICAL key is unaffected — canonicalizePKValue trims without
+// reading the width — so this is not a correctness warning about the output; it
+// says the detector is off, which matters because the failure it detects is the
+// silent one. Mirrors the pre-#212 DATETIME-precision warning above.
+func warnUndetectableBinaryPK(schema, table string, pkCols []metadata.ColumnMeta) {
+	for _, c := range pkCols {
+		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
+			continue
+		}
+		if FixedBinaryWidth(c.ColumnType) != 0 {
+			continue
+		}
+		slog.Warn("BINARY primary-key column has no column_type in the schema snapshot; the key-spelling guard (#1158) "+
+			"is disabled for this table — a baseline row and its event keyed under different spellings would go "+
+			"undetected. Re-run `bintrail snapshot` to capture column_type",
+			"schema", schema, "table", table, "column", c.Name)
+	}
 }
 
 // reconstructBinlogOnly is the ErrNoBaseline fallback for full-table
