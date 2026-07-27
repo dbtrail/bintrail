@@ -152,7 +152,7 @@ func padFixedBinaryFilter(pkFilter map[string]string, pkMetas []metadata.ColumnM
 		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
 			continue
 		}
-		width := fixedBinaryWidth(c.ColumnType)
+		width := reconstruct.FixedBinaryWidth(c.ColumnType)
 		if width == 0 {
 			// Pre-#212 snapshot with no COLUMN_TYPE: the pad width is
 			// unknowable, so leave the value alone rather than guess.
@@ -209,20 +209,6 @@ func decodeHexPKValue(s string) ([]byte, bool) {
 		return nil, false
 	}
 	return b, true
-}
-
-// fixedBinaryWidth extracts n from a "binary(n)" COLUMN_TYPE, returning 0 when
-// it is absent or unparseable.
-func fixedBinaryWidth(columnType string) int {
-	s := strings.ToLower(strings.TrimSpace(columnType))
-	if !strings.HasPrefix(s, "binary(") || !strings.HasSuffix(s, ")") {
-		return 0
-	}
-	n, err := strconv.Atoi(s[len("binary(") : len(s)-1])
-	if err != nil || n <= 0 {
-		return 0
-	}
-	return n
 }
 
 var reconstructCmd = &cobra.Command{

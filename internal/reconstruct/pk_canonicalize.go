@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
@@ -183,6 +185,82 @@ func pkValueBytes(raw any) ([]byte, bool) {
 	default:
 		return nil, false
 	}
+}
+
+// altFixedBinaryPK returns the ONE alternative spelling a baseline row's
+// primary key could carry, or ok=false when there is none.
+//
+// A fixed BINARY(n) key exists in exactly two forms: the padded n bytes MySQL
+// stores, and the trailing-0x00-stripped bytes the binlog ROW image carries
+// (see canonicalizePKValue's binary-family note). canonicalizePKValue produces
+// the stripped one so it matches binlog_events.pk_values, so if the change map
+// holds an entry under the PADDED spelling instead, the two sides are keyed
+// differently and the join silently fails (#1158).
+//
+// That is the whole search space, which is why this needs no index and no extra
+// memory — the caller does one more lookup in the map it already has. With
+// several fixed-binary components every component is toggled together rather
+// than enumerating 2^k combinations: a canonicalization that disagrees does so
+// uniformly, and a partial disagreement is not a shape this can produce.
+//
+// It cannot fire on a healthy table. pk_values only ever holds the stripped
+// spelling, so no legitimate event is keyed under the padded one; a hit means
+// the two sides genuinely disagree. And the toggle is injective over what a
+// BINARY(n) column can hold — every stored value is exactly n bytes, so two
+// distinct keys cannot toggle onto each other — so it cannot invent a
+// collision between two real rows either.
+//
+// Returns false when no PK column is a fixed BINARY(n) with a known width (a
+// pre-#212 snapshot has no width to pad to), which is also the common case:
+// for every other table this costs one type check per row and nothing else.
+func altFixedBinaryPK(pkCols []metadata.ColumnMeta, pkMap map[string]any) (string, bool) {
+	var alt map[string]any
+	for _, c := range pkCols {
+		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
+			continue
+		}
+		width := FixedBinaryWidth(c.ColumnType)
+		if width == 0 {
+			continue
+		}
+		v, ok := pkMap[c.Name].([]byte)
+		if !ok {
+			continue
+		}
+		var flipped []byte
+		if len(v) < width {
+			flipped = make([]byte, width)
+			copy(flipped, v)
+		} else {
+			flipped = TrimFixedBinaryPad(v)
+		}
+		if bytes.Equal(flipped, v) {
+			continue // no padding either way: one spelling only
+		}
+		if alt == nil {
+			alt = make(map[string]any, len(pkMap))
+			maps.Copy(alt, pkMap)
+		}
+		alt[c.Name] = flipped
+	}
+	if alt == nil {
+		return "", false
+	}
+	return event.BuildPKValues(pkCols, alt), true
+}
+
+// FixedBinaryWidth extracts n from a "binary(n)" COLUMN_TYPE, returning 0 when
+// it is absent or unparseable (a pre-#212 snapshot carries no COLUMN_TYPE).
+func FixedBinaryWidth(columnType string) int {
+	s := strings.ToLower(strings.TrimSpace(columnType))
+	if !strings.HasPrefix(s, "binary(") || !strings.HasSuffix(s, ")") {
+		return 0
+	}
+	n, err := strconv.Atoi(s[len("binary(") : len(s)-1])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // TrimFixedBinaryPad strips the trailing 0x00 bytes MySQL adds when storing a

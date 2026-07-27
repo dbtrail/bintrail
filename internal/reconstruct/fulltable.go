@@ -1054,6 +1054,14 @@ func mergeBaselineImages(ctx context.Context, in mergeCore, emit func(map[string
 				stats.UpdatesApplied++
 			}
 		} else {
+			// This baseline row is about to be emitted verbatim because no
+			// event claimed it. Before trusting that, check the ONE other
+			// spelling its key could carry (#1158) — see altFixedBinaryPK.
+			if alt, ok := altFixedBinaryPK(in.PKCols, pkMap); ok {
+				if ev, pending := in.Changes[alt]; pending {
+					return stats, pkSpellingJoinErr(in.Schema, in.Table, pk, alt, ev.EventType)
+				}
+			}
 			if err := emit(rowMap); err != nil {
 				return stats, err
 			}
@@ -1289,6 +1297,35 @@ func pkChangingUpdateErr(schema, table, before, after string) error {
 			"would duplicate or resurrect rows in the output. Re-run `bintrail baseline` "+
 			"to capture a snapshot at or after the PK change, then reconstruct from there",
 		schema, table, before, after)
+}
+
+// pkSpellingJoinErr reports a baseline row and a pending event that denote the
+// same row under two different key spellings (#1158).
+//
+// This is a fail-loud guard, not a diagnosis of a data problem: it means
+// bintrail's own canonicalization and the spelling in binlog_events.pk_values
+// disagree, so the merge is about to emit the baseline row while the event that
+// supersedes it sits undrained. The consequences are asymmetric and the DELETE
+// one is why this refuses rather than warns:
+//
+//   - UPDATE/INSERT — the stale baseline row is emitted AND the event is
+//     appended as a new PK. A duplicate key, which a restore rejects with
+//     error 1062: loud, but only once the dump is being loaded.
+//   - DELETE — the event is skipped and the stale baseline row was already
+//     emitted, so a row deleted before the target instant is RESURRECTED into
+//     the output. Nothing downstream catches that: the dump restores cleanly
+//     and is simply wrong.
+func pkSpellingJoinErr(schema, table, canonical, alternate string, evType event.EventType) error {
+	kind, outcome := "UPDATE/INSERT", "emitted twice"
+	if evType == event.EventDelete {
+		kind, outcome = "DELETE", "resurrected after its DELETE"
+	}
+	return fmt.Errorf(
+		"full-table reconstruct: %s.%s has a baseline row keyed %q while an undrained %s event for the same row "+
+			"is keyed %q — the two spellings of a fixed BINARY(n) key (padded on storage, trailing-0x00-stripped in "+
+			"the binlog row image) are not being reconciled, so this row would be %s in the output. This is a bintrail "+
+			"canonicalization fault, not a problem with your data; please report it with the table's PK definition",
+		schema, table, canonical, kind, alternate, outcome)
 }
 
 // reconstructBinlogOnly is the ErrNoBaseline fallback for full-table

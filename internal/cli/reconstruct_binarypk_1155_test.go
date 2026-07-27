@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 func TestFixedBinaryWidth(t *testing.T) {
@@ -21,8 +22,8 @@ func TestFixedBinaryWidth(t *testing.T) {
 		{"", 0},
 	}
 	for _, tc := range cases {
-		if got := fixedBinaryWidth(tc.columnType); got != tc.want {
-			t.Errorf("fixedBinaryWidth(%q) = %d, want %d", tc.columnType, got, tc.want)
+		if got := reconstruct.FixedBinaryWidth(tc.columnType); got != tc.want {
+			t.Errorf("FixedBinaryWidth(%q) = %d, want %d", tc.columnType, got, tc.want)
 		}
 	}
 }
