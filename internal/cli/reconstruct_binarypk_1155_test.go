@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
@@ -77,6 +78,19 @@ func TestPadFixedBinaryFilter(t *testing.T) {
 		_, changed := padFixedBinaryFilter(map[string]string{"k": "0xAABB"}, []metadata.ColumnMeta{noWidth})
 		if changed {
 			t.Error("padded a BINARY column with no declared width — the pad length would be a guess")
+		}
+	})
+
+	t.Run("column name matching is case-insensitive", func(t *testing.T) {
+		// --pk-columns is operator-typed; MySQL column names are
+		// case-insensitive and so is the DuckDB lookup that already ran, so
+		// the retry must not be the one link that cares about case.
+		got, changed := padFixedBinaryFilter(map[string]string{"K": "0xAABB"}, []metadata.ColumnMeta{binary16})
+		if !changed {
+			t.Fatal("padFixedBinaryFilter skipped a differently-cased column name")
+		}
+		if got["K"] != "0xAABB"+strings.Repeat("00", 14) {
+			t.Errorf("padded key = %q", got["K"])
 		}
 	})
 

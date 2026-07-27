@@ -95,10 +95,16 @@ func padFixedBinaryFilter(pkFilter map[string]string, pkMetas []metadata.ColumnM
 			// unknowable, so leave the value alone rather than guess.
 			continue
 		}
-		val, ok := out[c.Name]
+		// --pk-columns is operator-typed and MySQL column names are
+		// case-insensitive, so an exact-only match would silently skip the
+		// retry for `--pk-columns K` against column `k` (the exact baseline
+		// lookup, which goes through DuckDB, is case-insensitive too and would
+		// have resolved).
+		key, ok := filterKeyFor(out, c.Name)
 		if !ok {
 			continue
 		}
+		val := out[key]
 		raw, isHex := decodeHexPKValue(val)
 		if !isHex {
 			raw = []byte(val)
@@ -108,10 +114,24 @@ func padFixedBinaryFilter(pkFilter map[string]string, pkMetas []metadata.ColumnM
 		}
 		padded := make([]byte, width)
 		copy(padded, raw)
-		out[c.Name] = "0x" + strings.ToUpper(hex.EncodeToString(padded))
+		out[key] = "0x" + strings.ToUpper(hex.EncodeToString(padded))
 		changed = true
 	}
 	return out, changed
+}
+
+// filterKeyFor finds the filter entry naming column col, preferring an exact
+// match and falling back to a case-insensitive one.
+func filterKeyFor(filter map[string]string, col string) (string, bool) {
+	if _, ok := filter[col]; ok {
+		return col, true
+	}
+	for k := range filter {
+		if strings.EqualFold(k, col) {
+			return k, true
+		}
+	}
+	return "", false
 }
 
 // decodeHexPKValue decodes the "0x"+hex spelling event.formatPKValue produces
