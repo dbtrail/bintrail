@@ -1,6 +1,7 @@
 package reconstruct
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
@@ -47,6 +48,11 @@ import (
 //   - date: time.Time → "2006-01-02"
 //   - year: pass-through (go-mysql int, DuckDB int32 — both stringify the
 //     same via %v)
+//   - binary, varbinary, tinyblob, blob, mediumblob, longblob (#1155):
+//     []byte → []byte, letting event.BuildPKValues' own formatPKValue apply
+//     the content-gated "0x"+uppercase-hex spelling it introduced in #1132.
+//     See the binary-family note below for the one asymmetry this branch
+//     has to undo.
 //   - decimal, numeric: pass-through string (#214). go-mysql v1.13.0's
 //     decodeDecimal returns a pre-formatted string when useDecimal is
 //     false — and bintrail never sets useDecimal, so every DECIMAL PK
@@ -63,17 +69,35 @@ import (
 // supportedPKType upstream to catch these at reconstruct-start before any
 // real work happens, but this path is the defense-in-depth check.
 //
-// Why BINARY/VARBINARY/BLOB/BIT/JSON are NOT supported here: the indexer
-// and baseline-writer representations diverge on the disk level, not just
-// at the Go-type level, so no canonicalizer can reconcile them without
-// touching one of those upstream code paths. BINARY/VARBINARY go through
-// go-mysql's decodeString → Go string of raw bytes, while mydumper emits
-// them as 0x... hex literals that baseline.parseSQLValue returns as literal
-// ASCII (reader_sql.go:134-140 does not decode hex). BLOB variants and BIT
-// have similar upstream mismatches. Fixing those requires modifying
-// parser.BuildPKValues or internal/baseline/reader_sql.go, both of which
-// are non-additive changes to data already on disk. Tracked as follow-up
-// issues.
+// The binary family (#1155). Both sides now speak raw bytes, so there is no
+// spelling to reconcile here: baseline.parseSQLValue decodes mydumper's
+// 0x… literal (#503) and stores the bytes in a Parquet BYTE_ARRAY column
+// (internal/baseline/schema.go), DuckDB scans that back as []byte, and
+// event.BuildPKValues → formatPKValue applies the SAME content-gated
+// hex/UTF-8 rule the indexer applied at capture (#1132). Handing the bytes
+// through unchanged is what makes the two sides one encoder rather than two
+// that have to agree.
+//
+// The ONE asymmetry is fixed-width BINARY(n), and it runs the opposite way
+// from the filter path in ReadBaselineRows — do not "fix" one to match the
+// other:
+//
+//   - The baseline (and the live source) carry the full n bytes, because
+//     MySQL right-pads a short BINARY(n) value with 0x00 on storage.
+//   - The binlog ROW image carries the value with EVERY trailing 0x00 byte
+//     stripped (verified against MySQL 8.0.46: a 16-byte key ending in four
+//     zero bytes arrives as 12 bytes), which is the same stripping #1135
+//     documents and renderCell reverses by re-padding. So pk_values — what
+//     this canonicalization has to match — holds the STRIPPED spelling.
+//
+// Hence: trim for "binary", never for varbinary/blob. VARBINARY and the BLOB
+// family preserve trailing 0x00 in the ROW image (same run), so trimming them
+// would collapse two distinct keys that differ only in a trailing NUL into
+// one — a false match on a primary-key lookup, which is strictly worse than
+// the miss it would be curing.
+//
+// BIT, JSON and the spatial family remain unsupported: they are not part of
+// #1155's shape and each has its own upstream representation question.
 func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("canonicalizePKValue: nil PK value for column %q (MySQL forbids NULL in PK columns; baseline row may be missing the column after schema drift)", col.Name)
@@ -109,14 +133,62 @@ func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 		}
 		return raw, nil
 
+	case "binary":
+		// Fixed width: strip the storage padding the ROW image does not
+		// carry, so this matches pk_values. See the binary-family note above.
+		b, ok := pkValueBytes(raw)
+		if !ok {
+			return nil, fmt.Errorf("canonicalizePKValue: %s column %q: expected []byte or string, got %T", dt, col.Name, raw)
+		}
+		return TrimFixedBinaryPad(b), nil
+
+	case "varbinary", "tinyblob", "blob", "mediumblob", "longblob":
+		// Variable width: trailing 0x00 is data, not padding — pass through.
+		b, ok := pkValueBytes(raw)
+		if !ok {
+			return nil, fmt.Errorf("canonicalizePKValue: %s column %q: expected []byte or string, got %T", dt, col.Name, raw)
+		}
+		return b, nil
+
 	case "datetime", "timestamp":
 		return canonicalizeDatetime(raw, col)
 	case "date":
 		return canonicalizeDate(raw, col)
 
 	default:
-		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q (BINARY/VARBINARY/BLOB/BIT/JSON/spatial PK types are not supported because the indexer and baseline-writer representations diverge on disk; file a follow-up issue if you need one)", col.Name, col.DataType)
+		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q (BIT/JSON/spatial PK types are not supported because the indexer and baseline-writer representations diverge on disk; file a follow-up issue if you need one)", col.Name, col.DataType)
 	}
+}
+
+// pkValueBytes normalizes a binary-family PK value scanned from a baseline
+// Parquet column into bytes. DuckDB returns a BYTE_ARRAY column as []byte;
+// string is accepted because a caller may hand back a value that already went
+// through a text round-trip. Returning bytes (rather than a pre-rendered
+// string) is the point: event.BuildPKValues' formatPKValue then applies the
+// same content-gated hex/UTF-8 rule it applied at capture, so both sides go
+// through ONE encoder.
+func pkValueBytes(raw any) ([]byte, bool) {
+	switch v := raw.(type) {
+	case []byte:
+		return v, true
+	case string:
+		return []byte(v), true
+	default:
+		return nil, false
+	}
+}
+
+// TrimFixedBinaryPad strips the trailing 0x00 bytes MySQL adds when storing a
+// short value in a fixed-width BINARY(n) column, reproducing what the binlog
+// ROW image carries for that value (and therefore what the indexer stored in
+// binlog_events.pk_values). Values with no trailing zero byte — the common
+// case, e.g. most BINARY(16) UUIDs — come back untouched.
+//
+// Exported for the CLI, which needs the INVERSE (pad a pk_values spelling back
+// to the baseline's full width) and must agree with this function about which
+// bytes are padding.
+func TrimFixedBinaryPad(b []byte) []byte {
+	return bytes.TrimRight(b, "\x00")
 }
 
 // canonicalizeDatetime converts a time.Time (typical DuckDB scan output for
@@ -290,7 +362,12 @@ func supportedPKType(dataType string) bool {
 		"enum", "set",
 		"datetime", "timestamp", "date",
 		"year",
-		"decimal", "numeric":
+		"decimal", "numeric",
+		// #1155. BLOB-family PKs reach here as prefix keys (MySQL requires a
+		// prefix length on a BLOB/TEXT index), which does not change the
+		// canonicalization: both the index and the baseline carry the FULL
+		// column value, and only the index definition is truncated.
+		"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob":
 		return true
 	default:
 		return false

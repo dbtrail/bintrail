@@ -2,10 +2,13 @@ package cli
 
 import (
 	"context"
+	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"strconv"
 	"strings"
@@ -20,6 +23,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
@@ -34,6 +38,108 @@ import (
 // has no such row. events must be sorted ascending (FetchMerged guarantees it).
 func pkChangeSuspected(events []query.ResultRow) bool {
 	return len(events) > 0 && events[0].EventType != event.EventInsert
+}
+
+// resolvePKMetas loads the searched table's primary-key column metadata from
+// the latest schema snapshot. Best-effort by design: every caller below only
+// uses it to IMPROVE a lookup or an error message, so a missing/unreadable
+// snapshot degrades to the pre-#1155 behaviour instead of failing a
+// reconstruct that would otherwise have worked.
+func resolvePKMetas(db *sql.DB, schema, table string) []metadata.ColumnMeta {
+	res, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		slog.Debug("could not load schema snapshot for PK metadata", "error", err)
+		return nil
+	}
+	tm, err := res.Resolve(schema, table)
+	if err != nil {
+		slog.Debug("could not resolve table for PK metadata", "error", err)
+		return nil
+	}
+	return tm.PKColumnMetas()
+}
+
+// unsupportedPKType returns the first primary-key column whose type the
+// baseline canonicalizer cannot handle, or nil when every column is supported.
+func unsupportedPKType(pkMetas []metadata.ColumnMeta) *metadata.ColumnMeta {
+	for i, c := range pkMetas {
+		if !reconstruct.SupportedPKType(c.DataType) {
+			return &pkMetas[i]
+		}
+	}
+	return nil
+}
+
+// padFixedBinaryFilter re-spells a fixed-width BINARY(n) filter value back to
+// the width the baseline stores, returning false when nothing needs re-spelling.
+//
+// This is the INVERSE of reconstruct.TrimFixedBinaryPad, and the direction is
+// deliberate: pk_values holds the binlog ROW image's spelling, which has every
+// trailing 0x00 stripped, while the baseline Parquet holds the full n bytes
+// MySQL padded on storage. An operator who copies a key out of the index — the
+// workflow #1155 reports — therefore hands us a value SHORTER than the one to
+// match. Re-padding it is exact (MySQL only ever pads a BINARY(n) with 0x00),
+// and it is only ever attempted after an exact lookup already came back empty,
+// so it cannot turn a correct hit into a different row.
+func padFixedBinaryFilter(pkFilter map[string]string, pkMetas []metadata.ColumnMeta) (map[string]string, bool) {
+	out := make(map[string]string, len(pkFilter))
+	maps.Copy(out, pkFilter)
+	changed := false
+	for _, c := range pkMetas {
+		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
+			continue
+		}
+		width := fixedBinaryWidth(c.ColumnType)
+		if width == 0 {
+			// Pre-#212 snapshot with no COLUMN_TYPE: the pad width is
+			// unknowable, so leave the value alone rather than guess.
+			continue
+		}
+		val, ok := out[c.Name]
+		if !ok {
+			continue
+		}
+		raw, isHex := decodeHexPKValue(val)
+		if !isHex {
+			raw = []byte(val)
+		}
+		if len(raw) >= width {
+			continue
+		}
+		padded := make([]byte, width)
+		copy(padded, raw)
+		out[c.Name] = "0x" + strings.ToUpper(hex.EncodeToString(padded))
+		changed = true
+	}
+	return out, changed
+}
+
+// decodeHexPKValue decodes the "0x"+hex spelling event.formatPKValue produces
+// for non-UTF-8 PK bytes (#1132). A value that is not in that shape is not
+// hex-encoded — it is the raw key text — and is reported as such.
+func decodeHexPKValue(s string) ([]byte, bool) {
+	if len(s) < 4 || len(s)%2 != 0 || !strings.HasPrefix(s, "0x") {
+		return nil, false
+	}
+	b, err := hex.DecodeString(s[2:])
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// fixedBinaryWidth extracts n from a "binary(n)" COLUMN_TYPE, returning 0 when
+// it is absent or unparseable.
+func fixedBinaryWidth(columnType string) int {
+	s := strings.ToLower(strings.TrimSpace(columnType))
+	if !strings.HasPrefix(s, "binary(") || !strings.HasSuffix(s, ")") {
+		return 0
+	}
+	n, err := strconv.Atoi(s[len("binary(") : len(s)-1])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 var reconstructCmd = &cobra.Command{
@@ -383,12 +489,46 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 	slog.Debug("fetched binlog events", "count", len(events))
 
-	// No baseline row for this PK. Refuse — but tell a genuinely-absent row apart
-	// from one whose existence traces to a PK-changing UPDATE the change map
-	// can't fold (#782): such an UPDATE is stored under its BEFORE-image PK, so a
-	// fetch by the (new) searched PK never retrieves it and the row looks absent.
-	// The earliest fetched event for the PK is the tell (see pkChangeSuspected).
+	// PK column metadata from the schema snapshot: needed both to re-spell a
+	// fixed BINARY(n) key at the baseline's storage width and to tell a PK type
+	// the canonicalizer cannot handle apart from a genuinely-absent row (#1155).
+	// Resolved here, where db is already open, so the read path above keeps its
+	// order (and --baseline-only, which never opens db, keeps working).
+	pkMetas := resolvePKMetas(db, recSchema, recTable)
+
+	// A fixed BINARY(n) key copied out of binlog_events.pk_values carries the
+	// ROW image's trailing-0x00-stripped spelling, which is SHORTER than the
+	// padded value the baseline stores. Retry once at the storage width — only
+	// after the exact lookup came back empty, so a hit is never overridden.
 	if baselineRow == nil {
+		if padded, ok := padFixedBinaryFilter(pkFilter, pkMetas); ok {
+			slog.Debug("retrying baseline lookup with the fixed BINARY(n) storage padding", "pk_filter", padded)
+			baselineRow, err = reconstruct.ReadBaselineRow(cmd.Context(), baselinePath, padded)
+			if err != nil {
+				return fmt.Errorf("read baseline: %w", err)
+			}
+		}
+	}
+
+	// Still no baseline row for this PK. Refuse — but tell a genuinely-absent
+	// row apart from one whose existence traces to a PK-changing UPDATE the
+	// change map can't fold (#782): such an UPDATE is stored under its
+	// BEFORE-image PK, so a fetch by the (new) searched PK never retrieves it
+	// and the row looks absent. The earliest fetched event for the PK is the
+	// tell (see pkChangeSuspected).
+	if baselineRow == nil {
+		// The PK-changing-UPDATE explanation below presumes the lookup itself
+		// was capable of resolving this key. When the PK type is outside the
+		// baseline canonicalizer's set, the lookup could never have matched, so
+		// blaming a schema event that may never have happened sends the
+		// operator after a remedy (re-run `bintrail baseline`) that cannot
+		// help. Report the same reason `verify` reports (#1155).
+		if c := unsupportedPKType(pkMetas); c != nil {
+			return fmt.Errorf(
+				"reconstruct: no baseline row for %s.%s pk %q — primary-key column %q has type %q unsupported by the baseline canonicalizer, "+
+					"so this row cannot be located in the snapshot regardless of whether it exists",
+				recSchema, recTable, recPK, c.Name, c.DataType)
+		}
 		if pkChangeSuspected(events) {
 			return fmt.Errorf(
 				"reconstruct: no baseline row for %s.%s pk %q, yet the earliest indexed event for it is not an INSERT — "+

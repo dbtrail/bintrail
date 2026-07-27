@@ -644,29 +644,25 @@ func TestRunReconstruct_fullTableRoundTrip_decimalPK(t *testing.T) {
 }
 
 // TestRunReconstruct_rejectsRemainingUnsupportedPKTypes pins the hard-error
-// path at ReconstructTable entry for the PK types that #214 did NOT land:
-// BINARY/VARBINARY/BLOB variants, BIT, JSON. Each of these has a real
-// on-disk representation mismatch between the indexer's pk_values format
-// and the baseline Parquet column (see pk_canonicalize.go doc comment).
-// Fixing them requires a non-additive change to either parser.BuildPKValues
-// or internal/baseline/reader_sql.go::parseSQLValue, which is out of scope.
+// path at ReconstructTable entry for the PK types that #214 did NOT land and
+// #1155 did not either: BIT and JSON. Each has a real on-disk representation
+// mismatch between the indexer's pk_values format and the baseline Parquet
+// column (see pk_canonicalize.go doc comment).
 //
 // This test is the regression guard against a future drive-by "add one
 // more type to supportedPKType" PR that would silently produce wrong
 // output. A future PR that actually fixes one of these must also land a
 // round-trip integration test and remove the type from this negative list.
+//
+// The BINARY/VARBINARY/BLOB family left this list in #1155 under exactly that
+// rule — see reconstruct.TestBinaryPKBaselineJoin_endToEnd, which drives a real
+// ROW binlog through the parser, the indexer and the baseline merge.
 func TestRunReconstruct_rejectsRemainingUnsupportedPKTypes(t *testing.T) {
 	cases := []struct {
 		name     string
 		dataType string
 		colType  string
 	}{
-		{"binary", "binary", "binary(16)"},
-		{"varbinary", "varbinary", "varbinary(32)"},
-		{"blob", "blob", "blob"},
-		{"tinyblob", "tinyblob", "tinyblob"},
-		{"mediumblob", "mediumblob", "mediumblob"},
-		{"longblob", "longblob", "longblob"},
 		{"bit", "bit", "bit(8)"},
 		{"json", "json", "json"},
 	}

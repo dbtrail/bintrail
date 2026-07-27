@@ -3,6 +3,7 @@ package reconstruct
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -108,9 +109,9 @@ func ReadBaselineRows(ctx context.Context, path string, filter map[string]string
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
 
-	args := make([]any, len(conds))
-	for i, c := range conds {
-		args[i] = c.value
+	args, err := bindFilterArgs(ctx, db, safePath, conds)
+	if err != nil {
+		return nil, err
 	}
 
 	rows, err := db.QueryContext(ctx, q, args...)
@@ -690,6 +691,95 @@ func pinDuckDBSessionUTC(ctx context.Context, db *sql.DB) error {
 type colCond struct {
 	col   string
 	value string
+}
+
+// bindFilterArgs turns the filter conditions into DuckDB bind arguments.
+//
+// Every value arrives as a string (that is the at-rest spelling of a
+// binlog_events.pk_values component, which is what callers hand us), and
+// binding it verbatim is correct for every column type DuckDB can cast a
+// VARCHAR into — including a BLOB column holding printable bytes, where
+// DuckDB's implicit VARCHAR→BLOB cast compares the raw characters and
+// matches.
+//
+// The one spelling that cast CANNOT resolve is the "0x"+hex form
+// event.formatPKValue produces for PK bytes that are not valid UTF-8 (#1132):
+// bound as a VARCHAR it compares the six literal characters "0xB281" against
+// the two bytes {0xB2,0x81} and silently matches nothing — a BINARY(16) UUID
+// primary key could not be reconstructed at all (#1155). For those, decode
+// the hex and bind the BYTES.
+//
+// Gated twice so nothing that works today changes shape: the type probe only
+// runs when some value actually carries the 0x-hex spelling, and the decoded
+// bytes are only bound when that column really is a Parquet BYTE_ARRAY (BLOB).
+// A VARCHAR column whose value happens to read "0xAB" therefore keeps binding
+// as the literal text — the same residual ambiguity formatPKValue documents at
+// the encoding end, resolved the same way (content is not type).
+func bindFilterArgs(ctx context.Context, db *sql.DB, safePath string, conds []colCond) ([]any, error) {
+	args := make([]any, len(conds))
+	decoded := make([][]byte, len(conds))
+	anyHex := false
+	for i, c := range conds {
+		args[i] = c.value
+		if b, ok := decodeHexPKLiteral(c.value); ok {
+			decoded[i] = b
+			anyHex = true
+		}
+	}
+	if !anyHex {
+		return args, nil
+	}
+
+	blobCols, err := parquetBlobColumns(ctx, db, safePath)
+	if err != nil {
+		// Non-fatal: fall back to the pre-#1155 string binding rather than
+		// failing a lookup that may not involve a binary column at all.
+		slog.Debug("could not probe baseline column types; binding filter values as text", "error", err)
+		return args, nil
+	}
+	for i, c := range conds {
+		if decoded[i] != nil && blobCols[c.col] {
+			args[i] = decoded[i]
+		}
+	}
+	return args, nil
+}
+
+// decodeHexPKLiteral decodes the "0x"+uppercase-hex spelling
+// event.formatPKValue produces for non-UTF-8 PK bytes. Case-insensitive on
+// the hex digits so an operator who pasted a lowercase key still resolves;
+// an odd digit count is not a valid byte string and is rejected.
+func decodeHexPKLiteral(s string) ([]byte, bool) {
+	if len(s) < 4 || len(s)%2 != 0 || !strings.HasPrefix(s, "0x") {
+		return nil, false
+	}
+	b, err := hex.DecodeString(s[2:])
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// parquetBlobColumns reports which columns of the baseline file are stored as
+// a Parquet BYTE_ARRAY (DuckDB BLOB) — the binary/spatial family per
+// internal/baseline/schema.go. The LIMIT 0 query reads footer metadata only.
+func parquetBlobColumns(ctx context.Context, db *sql.DB, safePath string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, "SELECT * FROM parquet_scan('"+safePath+"') LIMIT 0")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(types))
+	for _, t := range types {
+		if strings.EqualFold(t.DatabaseTypeName(), "BLOB") {
+			out[t.Name()] = true
+		}
+	}
+	return out, rows.Err()
 }
 
 // buildCondsList returns sorted column conditions for deterministic SQL + arg order.

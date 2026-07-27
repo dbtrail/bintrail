@@ -284,7 +284,11 @@ func TestCanonicalizePKValue_nilErrors(t *testing.T) {
 }
 
 func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
-	for _, dt := range []string{"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob", "bit", "json", "point", "geometry", "float", "double"} {
+	// The binary family left this list in #1155; see
+	// TestCanonicalizePKValue_binaryFamilyMatchesIndexerSpelling. It still
+	// rejects a NON-bytes value for those types —
+	// TestCanonicalizePKValue_binaryFamilyRejectsNonBytes covers that arm.
+	for _, dt := range []string{"bit", "json", "point", "geometry", "float", "double"} {
 		col := colMeta("x", dt, dt)
 		_, err := canonicalizePKValue("whatever", col)
 		if err == nil {
@@ -459,6 +463,8 @@ func TestSupportedPKType(t *testing.T) {
 		"enum", "set",
 		"datetime", "timestamp", "date", "year",
 		"decimal", "numeric", // #214
+		// #1155 — see the round-trip guard this list demands below.
+		"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob",
 	}
 	for _, dt := range supported {
 		if !supportedPKType(dt) {
@@ -471,10 +477,15 @@ func TestSupportedPKType(t *testing.T) {
 	// to the allow-list without fixing the upstream representation, a
 	// round-trip will silently produce wrong output. Don't loosen this
 	// without a matching round-trip integration test like the one for
-	// DECIMAL in cmd/bintrail/reconstruct_pk_types_integration_test.go.
+	// DECIMAL in internal/cli/reconstruct_pk_types_integration_test.go.
+	//
+	// The binary family moved to the supported list in #1155 under exactly
+	// that rule: TestBinaryPKBaselineJoin_endToEnd drives a real ROW binlog
+	// through the parser, the indexer and the baseline merge, including the
+	// trailing-0x00 keys that are the only inputs able to distinguish a
+	// correct canonicalization from an inverted one.
 	unsupported := []string{
 		"float", "double",
-		"binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob",
 		"bit", "json",
 		"point", "linestring", "polygon", "geometry",
 		"", "unknown-type",
