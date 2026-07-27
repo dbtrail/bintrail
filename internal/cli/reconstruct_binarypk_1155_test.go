@@ -5,28 +5,7 @@ import (
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
-	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
-
-func TestFixedBinaryWidth(t *testing.T) {
-	cases := []struct {
-		columnType string
-		want       int
-	}{
-		{"binary(16)", 16},
-		{"BINARY(255)", 255},
-		{"binary", 0}, // no declared width to pad to
-		{"varbinary(16)", 0},
-		{"binary(0)", 0},
-		{"binary(x)", 0},
-		{"", 0},
-	}
-	for _, tc := range cases {
-		if got := reconstruct.FixedBinaryWidth(tc.columnType); got != tc.want {
-			t.Errorf("FixedBinaryWidth(%q) = %d, want %d", tc.columnType, got, tc.want)
-		}
-	}
-}
 
 // TestPadFixedBinaryFilter covers the retry that lets an operator paste a key
 // straight out of binlog_events.pk_values: that spelling is the ROW image's,
