@@ -387,17 +387,32 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			} else if kw, isDML := statementDML(string(ev.Query)); isDML {
 				// STATEMENT/MIXED-format DML (or a session flip off ROW): the row
 				// image is not in the binlog, so this change cannot be captured.
-				// Fail LOUD + metric, symmetric to the partial-image guard (#493).
+				// Fail LOUD + metric + skip ledger, symmetric to the partial-image
+				// guard (#493) — but only when the statement's schema is in capture
+				// scope; an out-of-scope drop (system schema, or excluded by the
+				// configured filters) is not a coverage gap and must not raise the
+				// alarm, mark Capture health DEGRADED, or feed the consecutive-skip
+				// escalation (#1000: RDS's rdsadmin writes mysql.* heartbeats in
+				// STATEMENT format — a constant false alarm otherwise).
 				// NOTE: never log the statement text — a DML statement embeds row
 				// VALUES; keyword + file/pos + connection_id locate it without
 				// leaking data into operator logs.
-				sp.logger.Warn("statement-format DML in binlog — event NOT captured (bintrail requires binlog_format=ROW; a STATEMENT/MIXED format or a session-level override produced this)",
-					"file", currentFile,
-					"pos", binlogEv.Header.LogPos,
-					"statement_type", kw,
-					"connection_id", ev.SlaveProxyID)
-				observe.StatementDMLDropped()
-				sp.skips.RecordSkip(SkipStatementFormatDML)
+				if schema := string(ev.Schema); !statementDMLInScope(schema, &sp.filters) {
+					sp.logger.Debug("statement-format DML for out-of-scope schema — not captured, not a coverage gap",
+						"file", currentFile,
+						"pos", binlogEv.Header.LogPos,
+						"schema", schema,
+						"statement_type", kw,
+						"connection_id", ev.SlaveProxyID)
+				} else {
+					sp.logger.Warn("statement-format DML in binlog — event NOT captured (bintrail requires binlog_format=ROW; a STATEMENT/MIXED format or a session-level override produced this)",
+						"file", currentFile,
+						"pos", binlogEv.Header.LogPos,
+						"statement_type", kw,
+						"connection_id", ev.SlaveProxyID)
+					observe.StatementDMLDropped()
+					sp.skips.RecordSkip(SkipStatementFormatDML)
+				}
 			}
 
 		case *replication.XIDEvent:
