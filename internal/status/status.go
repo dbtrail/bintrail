@@ -148,7 +148,13 @@ type CoverageInfo struct {
 	LatestEvent   sql.NullTime
 	TotalEvents   int64
 	SchemaChanges int
-	UncoveredDDLs int // DDLs without a snapshot (file mode, or failed auto-snapshot in stream mode)
+	// UncoveredDDLs counts schema_changes rows with snapshot_id IS NULL whose
+	// DDL type NEEDS a snapshot — i.e. file-mode indexing without --source-dsn,
+	// or a failed auto-snapshot (any mode). TRUNCATE TABLE rows are excluded:
+	// they record snapshot_id = NULL by design (no structure change, so both
+	// the stream DDL hook and the file-mode handler deliberately skip the
+	// snapshot), and counting them would permanently inflate the warning.
+	UncoveredDDLs int
 
 	// Archive-derived fields (from archive_state partition names and row counts).
 	ArchiveEarliestHour sql.NullTime // earliest hour derived from MIN(partition_name)
@@ -271,8 +277,12 @@ func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 		return nil, fmt.Errorf("query schema_changes count: %w", err)
 	}
 
+	// TRUNCATE TABLE is excluded: it does not change table structure, so every
+	// capture path records it with snapshot_id = NULL on purpose ("DDL detected
+	// (no snapshot needed)") — a NULL there is not a coverage gap.
 	err = db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM schema_changes WHERE snapshot_id IS NULL`).Scan(&c.UncoveredDDLs)
+		`SELECT COUNT(*) FROM schema_changes
+		 WHERE snapshot_id IS NULL AND ddl_type <> 'TRUNCATE TABLE'`).Scan(&c.UncoveredDDLs)
 	if err != nil {
 		return nil, fmt.Errorf("query uncovered DDLs: %w", err)
 	}
@@ -799,7 +809,7 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		}
 		fmt.Fprintf(w, "  Schema changes: %d\n", coverage.SchemaChanges)
 		if coverage.UncoveredDDLs > 0 {
-			fmt.Fprintf(w, "  Warning: %d DDL(s) detected without auto-snapshot (file mode) — recovery across these DDLs may require manual snapshot\n",
+			fmt.Fprintf(w, "  Warning: %d DDL(s) detected without auto-snapshot (file-mode indexing without --source-dsn, or a failed auto-snapshot) — recovery across these DDLs may require manual snapshot\n",
 				coverage.UncoveredDDLs)
 		}
 	}

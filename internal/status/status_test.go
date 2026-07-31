@@ -574,6 +574,13 @@ func TestWriteStatus_withCoverage(t *testing.T) {
 	assertContains(t, out, "42000")
 	assertContains(t, out, "3")
 	assertContains(t, out, "Warning")
+	// The warning must name both origins of a missing snapshot (#1049) —
+	// the old text hardcoded "(file mode)", mislabeling stream-mode
+	// auto-snapshot failures.
+	assertContains(t, out, "file-mode indexing without --source-dsn, or a failed auto-snapshot")
+	if strings.Contains(out, "(file mode)") {
+		t.Errorf("warning still carries the misleading '(file mode)' label:\n%s", out)
+	}
 }
 
 func TestWriteStatus_nilCoverage_omitsSection(t *testing.T) {
