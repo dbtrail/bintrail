@@ -139,12 +139,14 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 	// MySQL's PK canonicalizer only handles a known type surface. PostgreSQL
 	// stores every PK column as raw text on BOTH the baseline (COPY text) and
 	// delta (pgoutput text) sides, so the match is string-identity — the
-	// canonicalizer, and this type gate, are bypassed. A genuinely unhandled PG
-	// type is #1009's message concern, not a false inconclusive here.
+	// canonicalizer, and this type gate, are bypassed. A PostgreSQL-shaped
+	// snapshot that still reaches this MySQL-path gate (flavor did not read
+	// "postgres") gets the honest wrong-path verdict from pkTypeGateReason,
+	// never the misleading per-table PK-type one (#1009).
 	if !pg {
 		for _, c := range pkCols {
 			if !reconstruct.SupportedPKType(c.DataType) {
-				return inconclusive(res, fmt.Sprintf("primary-key column %q has type %q unsupported by the baseline canonicalizer", c.Name, c.DataType)), nil
+				return inconclusive(res, pkTypeGateReason(c)), nil
 			}
 		}
 	}

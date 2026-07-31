@@ -110,7 +110,7 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	}
 	for _, c := range pkCols {
 		if !reconstruct.SupportedPKType(c.DataType) {
-			return inconclusive(res, fmt.Sprintf("primary-key column %q has type %q unsupported by the baseline canonicalizer", c.Name, c.DataType)), nil
+			return inconclusive(res, pkTypeGateReason(c)), nil
 		}
 	}
 
@@ -323,6 +323,33 @@ func inconclusive(res TableResult, detail string) TableResult {
 	res.Status = StatusInconclusive
 	res.Detail = detail
 	return res
+}
+
+// pkTypeGateReason renders the inconclusive detail for a primary-key column
+// the MySQL-path type gate rejected. Two physically different causes reach it,
+// and they must not share a message (#1009):
+//
+//   - A real MySQL DATA_TYPE token the baseline canonicalizer does not handle
+//     (float, bit, ...): a genuine per-table limitation the operator can
+//     reason about, reported as such.
+//   - An EMPTY DataType: MySQL's information_schema always records a
+//     DATA_TYPE, so an empty token is the PostgreSQL snapshot shape
+//     (WritePGSnapshot stores pg_type_oid, never a MySQL type token).
+//     Reaching the MySQL-path gate with it means the run selected the MySQL
+//     path for a PostgreSQL-shaped index — the source flavor recorded in
+//     stream_state did not read "postgres" (unreadable stream_state, or the
+//     wrong index database). Blaming the PK type there sends the operator
+//     chasing a fixable-looking column problem that nothing they do to the
+//     table can fix; the honest verdict names the wrong-path cause.
+//
+// Shared by VerifyTable (live-source) and VerifyBaselinePair (baseline-
+// anchored) so the two modes cannot drift. No CLI flag names in the text: the
+// console's verify engine emits it too.
+func pkTypeGateReason(c metadata.ColumnMeta) string {
+	if c.DataType == "" {
+		return fmt.Sprintf("schema snapshot records no MySQL type for primary-key column %q — this is the PostgreSQL snapshot shape, but the index's stream_state flavor did not read \"postgres\", so verify took its MySQL path, which cannot verify a PostgreSQL-sourced table; check that the index database is the one the PostgreSQL stream writes", c.Name)
+	}
+	return fmt.Sprintf("primary-key column %q has type %q unsupported by the baseline canonicalizer", c.Name, c.DataType)
 }
 
 // deferredReprUnresolved reports whether some change's row image carries a
