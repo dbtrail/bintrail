@@ -229,7 +229,7 @@ func TestCompositeIntBinaryPKBaselineJoin_endToEnd(t *testing.T) {
 			{"8", "a8"},
 		} {
 			row, err := reconstruct.ReadBaselineRow(ctx, baselinePath,
-				map[string]string{"tenant": tc.tenant, "k": "0x" + kZHex})
+				map[string]string{"tenant": tc.tenant, "k": "0x" + kZHex}, nil)
 			if err != nil {
 				t.Fatalf("ReadBaselineRow(tenant=%s): %v", tc.tenant, err)
 			}
@@ -242,11 +242,13 @@ func TestCompositeIntBinaryPKBaselineJoin_endToEnd(t *testing.T) {
 		}
 
 		// The stripped (pk_values) spelling of the binary component does not
-		// match the padded Parquet bytes — that documented miss is exactly why
-		// the CLI retries at the storage width (covered at command level by
-		// internal/cli's TestRunReconstruct_singleRow_compositeIntBinaryPK).
+		// match the padded Parquet bytes when no PK metas are supplied (nil
+		// disables the width retry) — that documented miss is exactly why
+		// callers pass the metas so ReadBaselineRow retries at the storage
+		// width (covered at command level by internal/cli's
+		// TestRunReconstruct_singleRow_compositeIntBinaryPK).
 		row, err := reconstruct.ReadBaselineRow(ctx, baselinePath,
-			map[string]string{"tenant": "7", "k": "0x11223344556677889900AABB"})
+			map[string]string{"tenant": "7", "k": "0x11223344556677889900AABB"}, nil)
 		if err != nil {
 			t.Fatalf("ReadBaselineRow (stripped): %v", err)
 		}
