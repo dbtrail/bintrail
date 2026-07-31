@@ -36,23 +36,3 @@ func SourceFlavor(db *sql.DB) string {
 	}
 	return flavor
 }
-
-// StreamGTIDSet returns the index's checkpointed GTID coverage
-// (stream_state.gtid_set) — the accumulated executed set the streaming daemon
-// durably reached. Best-effort, mirroring SourceFlavor: a nil db, a missing
-// row (file-indexed index), a NULL column (position-mode stream), or any read
-// failure returns "". Unlike SourceFlavor, failures log at Debug only: an
-// empty result merely degrades the baseline↔first-event gap check to its
-// conservative position heuristic (reconstruct.DecideBaselineGap), it never
-// selects a SQL dialect.
-func StreamGTIDSet(db *sql.DB) string {
-	if db == nil {
-		return ""
-	}
-	var gtidSet sql.NullString
-	if err := db.QueryRow("SELECT gtid_set FROM stream_state WHERE id = 1").Scan(&gtidSet); err != nil {
-		slog.Debug("indexed GTID coverage unavailable — gap checks fall back to position comparison", "error", err)
-		return ""
-	}
-	return gtidSet.String
-}

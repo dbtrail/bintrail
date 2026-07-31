@@ -5,17 +5,17 @@ import "testing"
 // SourceFlavor is best-effort: a nil handle must map to "" (MySQL-family
 // default at every caller) rather than panic — mirrors the nil guard contract
 // of recovery.DialectForIndex, which now delegates here.
-func TestSourceFlavorNilDB(t *testing.T) {
-	if got := SourceFlavor(nil); got != "" {
-		t.Errorf("SourceFlavor(nil) = %q, want empty", got)
+// OldestIndexedEvent shares the best-effort contract: a nil handle must map
+// to (zero, false) — which degrades the baseline↔first-event gap check to its
+// hedged unproven verdict — rather than panic.
+func TestOldestIndexedEventNilDB(t *testing.T) {
+	if s, ok := OldestIndexedEvent(nil); ok || s.BinlogFile != "" || s.StartPos != 0 {
+		t.Errorf("OldestIndexedEvent(nil) = (%+v, %v), want (zero, false)", s, ok)
 	}
 }
 
-// StreamGTIDSet shares the best-effort contract: a nil handle must map to ""
-// (which degrades the baseline↔first-event gap check to its position
-// heuristic) rather than panic.
-func TestStreamGTIDSetNilDB(t *testing.T) {
-	if got := StreamGTIDSet(nil); got != "" {
-		t.Errorf("StreamGTIDSet(nil) = %q, want empty", got)
+func TestSourceFlavorNilDB(t *testing.T) {
+	if got := SourceFlavor(nil); got != "" {
+		t.Errorf("SourceFlavor(nil) = %q, want empty", got)
 	}
 }

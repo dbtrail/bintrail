@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
@@ -529,41 +528,24 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 				"baseline_lsn", bmeta.LSN,
 				"flavor", flavor)
 		default:
-			// Both anchors are present. GTID-set containment is consulted
-			// before the position heuristic (#1163): on a healthy GTID run
-			// the first event after the baseline is EXPECTED to sit at a
-			// later position, so file/pos ordering alone cries wolf, while
-			// stream_state.gtid_set containing the baseline's set proves
-			// the index covers everything from the baseline point onward.
-			indexedGTID := query.StreamGTIDSet(db)
-			containment := gtidContainment(flavor, bmeta.GTIDSet, indexedGTID)
-			switch reconstruct.DecideBaselineGap(containment, flavor, bmeta, first) {
-			case reconstruct.GapVerdictGTID:
-				slog.Warn("gap between baseline and indexed events — the indexed GTID coverage does not contain the baseline GTID set; reconstruction may be incomplete",
-					"baseline_gtid", bmeta.GTIDSet,
-					"indexed_gtid", indexedGTID,
+			// Both anchors are present. The per-table first event alone
+			// cannot decide the question — on a healthy run it is EXPECTED
+			// to sit past the anchor (it is simply the table's next write),
+			// so file/pos ordering alone cries wolf (#1163). The index's
+			// earliest surviving event is the evidence that can: at-or-before
+			// the anchor proves capture was already running when the baseline
+			// was taken. See reconstruct.DecideBaselineGap.
+			start, startOK := query.OldestIndexedEvent(db)
+			if reconstruct.DecideBaselineGap(flavor, bmeta, first, start, startOK) == reconstruct.GapVerdictUnproven {
+				slog.Warn("possible gap between baseline and first indexed event — the index's earliest surviving event also starts past the baseline anchor, so coverage of the window between them cannot be proven (capture may have started after the baseline, or older events may have been rotated out)",
 					"baseline_file", bmeta.BinlogFile,
 					"baseline_pos", bmeta.BinlogPos,
-					"first_event_file", first.BinlogFile,
-					"first_event_pos", first.StartPos,
-					"flavor", flavor)
-			case reconstruct.GapVerdictUnproven:
-				slog.Warn("possible gap between baseline and first indexed event — baseline↔index GTID containment could not be evaluated, and position ordering alone cannot distinguish the next event from a missing one",
-					"baseline_gtid", bmeta.GTIDSet,
-					"indexed_gtid", indexedGTID,
-					"baseline_file", bmeta.BinlogFile,
-					"baseline_pos", bmeta.BinlogPos,
-					"first_event_file", first.BinlogFile,
-					"first_event_pos", first.StartPos,
-					"flavor", flavor)
-			case reconstruct.GapVerdictPosition:
-				slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
-					"baseline_file", bmeta.BinlogFile,
-					"baseline_pos", bmeta.BinlogPos,
-					"baseline_gtid", bmeta.GTIDSet,
 					"baseline_lsn", bmeta.LSN,
 					"first_event_file", first.BinlogFile,
 					"first_event_pos", first.StartPos,
+					"oldest_indexed_file", start.BinlogFile,
+					"oldest_indexed_pos", start.StartPos,
+					"oldest_indexed_known", startOK,
 					"flavor", flavor)
 			}
 		}
@@ -755,11 +737,7 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 		AllowGaps:          recAllowGaps,
 		WarnEventThreshold: recWarnEvents,
 		FetchBatchSize:     recFetchBatch,
-		// go-mysql-backed GTID containment for the baseline↔first-event gap
-		// warning (#1163) — injected because the #528 depguard keeps
-		// internal/reconstruct free of capture libraries.
-		GTIDContainment: gtidContainment,
-		ArchiveFetcher:  TunedArchiveFetcher(duckTuning),
+		ArchiveFetcher:     TunedArchiveFetcher(duckTuning),
 		// Same resolved --ultrafast/--duckdb-* budget as ArchiveFetcher above,
 		// but for the merge/baseline DuckDB sessions ReconstructTables opens
 		// directly (#842) — those previously ignored these flags entirely and
@@ -884,49 +862,6 @@ func resolveGapCheck(flavor string, bmeta baseline.DumpMetadata, firstFile strin
 		eventPosMissing = firstStartPos == 0
 	}
 	return flavor, lineageGuard, anchorPresent, eventPosMissing
-}
-
-// gtidContainment is the go-mysql-backed reconstruct.GTIDContainmentFunc: it
-// reports whether the indexed GTID coverage (stream_state.gtid_set) contains
-// the baseline's GTID set (#1163). It lives here rather than in
-// internal/reconstruct because the #528 depguard keeps the read layer free of
-// capture libraries; this command layer already links go-mysql (the shim).
-//
-// Only the two flavors with GTID-set semantics are evaluated ("mysql",
-// "mariadb" — each selecting its own parser via gomysql.ParseGTIDSet);
-// anything else, an empty set on either side, or a parse failure returns
-// GTIDUnknown so the caller falls back to the position heuristic — never a
-// panic or an error, this only gates a warning on the recovery path. The
-// emptiness guard is load-bearing: go-mysql parses "" into an EMPTY set
-// without error, so an empty indexed set would otherwise read as a false
-// disproof and an empty baseline set as a false proof. The Contain type
-// assertions cannot mismatch because both sets come from the same flavor's
-// parser.
-func gtidContainment(flavor, baselineGTID, indexedGTID string) reconstruct.GTIDContainment {
-	if flavor != gomysql.MySQLFlavor && flavor != gomysql.MariaDBFlavor {
-		return reconstruct.GTIDUnknown
-	}
-	b := strings.TrimSpace(baselineGTID)
-	idx := strings.TrimSpace(indexedGTID)
-	if b == "" || idx == "" {
-		return reconstruct.GTIDUnknown
-	}
-	bset, err := gomysql.ParseGTIDSet(flavor, b)
-	if err != nil {
-		slog.Debug("baseline GTID set unparseable — gap check falls back to position comparison",
-			"baseline_gtid", baselineGTID, "flavor", flavor, "error", err)
-		return reconstruct.GTIDUnknown
-	}
-	iset, err := gomysql.ParseGTIDSet(flavor, idx)
-	if err != nil {
-		slog.Debug("indexed GTID set unparseable — gap check falls back to position comparison",
-			"indexed_gtid", indexedGTID, "flavor", flavor, "error", err)
-		return reconstruct.GTIDUnknown
-	}
-	if iset.Contain(bset) {
-		return reconstruct.GTIDContained
-	}
-	return reconstruct.GTIDNotContained
 }
 
 // pgReconstructBeta reports whether a single-row reconstruct is running against
