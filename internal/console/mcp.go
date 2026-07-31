@@ -173,6 +173,7 @@ var mcpToolPerms = map[string]ext.Permission{
 	"query":               ext.PermQueryExecute,
 	"list_schema_changes": ext.PermQueryExecute,
 	"recover":             ext.PermRecoverExecute,
+	"recover_cascade":     ext.PermRecoverExecute,
 	"reconstruct":         ext.PermReconstructExecute,
 	"status":              ext.PermStatusRead,
 }

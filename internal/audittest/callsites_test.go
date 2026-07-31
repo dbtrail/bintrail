@@ -35,6 +35,7 @@ var recordCallSites = map[string]int{
 	"internal/cli/verify.go":               1, // cli/verify.explain
 	"internal/console/audit.go":            1, // console data reads (recordConsoleAudit helper)
 	"internal/console/authz.go":            1, // console/authz.denied + console/profile.denied
+	"internal/console/mcp.go":              1, // console/authz.denied for /mcp tool-permission denials (#1124)
 	"internal/mcptools/mcptools.go":        2, // mcp|console query.run + recover.generate
 	"internal/mcptools/reconstruct.go":     1, // mcp|console reconstruct.row
 	"internal/mcptools/recover_cascade.go": 1, // mcp|console recover.cascade
