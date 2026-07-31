@@ -301,3 +301,86 @@ func TestStripStatementText(t *testing.T) {
 		}
 	}
 }
+
+// ─── list_schema_changes: snapshot_id coverage (#1050) ───────────────────────
+
+// schemaChangesMockCols matches the tool's schema_changes SELECT column list.
+var schemaChangesMockCols = []string{
+	"id", "detected_at", "schema_name", "table_name", "ddl_type", "ddl_query",
+	"binlog_file", "binlog_pos", "gtid", "snapshot_id",
+}
+
+// newSchemaChangesTarget builds a Config around a sqlmock DB so
+// MakeSchemaChangesTool exercises its real SELECT → scan → JSON path.
+func newSchemaChangesTarget(db *sql.DB) Config {
+	return Config{
+		Resolve: func(ctx context.Context, _ string) (*Target, error) {
+			return &Target{DB: db}, nil
+		},
+	}
+}
+
+func TestSchemaChangesTool_snapshotIDRoundTrip(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	detected := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	mock.ExpectQuery("FROM schema_changes WHERE 1=1 ORDER BY detected_at DESC").
+		WillReturnRows(sqlmock.NewRows(schemaChangesMockCols).
+			// Covered DDL: auto-snapshot 7 was taken after it.
+			AddRow(1, detected, "shop", "orders", "ALTER TABLE",
+				"ALTER TABLE orders ADD COLUMN note TEXT", "binlog.000001", 4, "uuid:1", 7).
+			// Uncovered DDL: snapshot_id is NULL — must surface as explicit null.
+			AddRow(2, detected, "shop", "orders", "TRUNCATE TABLE",
+				"TRUNCATE TABLE orders", "binlog.000001", 900, nil, nil))
+
+	res, _, err := MakeSchemaChangesTool(newSchemaChangesTarget(db))(context.Background(), nil, SchemaChangesArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected tool error: %s", resultText(res))
+	}
+	text := resultText(res)
+	if !strings.Contains(text, `"snapshot_id": 7`) {
+		t.Errorf("covered DDL must carry its snapshot_id, got:\n%s", text)
+	}
+	if !strings.Contains(text, `"snapshot_id": null`) {
+		t.Errorf("uncovered DDL must carry an explicit null snapshot_id, got:\n%s", text)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestSchemaChangesTool_uncoveredOnlyFilter(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	detected := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	// The expectation only matches when the SQL carries the IS NULL predicate.
+	mock.ExpectQuery("FROM schema_changes WHERE 1=1 AND snapshot_id IS NULL ORDER BY detected_at DESC").
+		WillReturnRows(sqlmock.NewRows(schemaChangesMockCols).
+			AddRow(2, detected, "shop", "orders", "TRUNCATE TABLE",
+				"TRUNCATE TABLE orders", "binlog.000001", 900, nil, nil))
+
+	res, _, err := MakeSchemaChangesTool(newSchemaChangesTarget(db))(context.Background(), nil, SchemaChangesArgs{UncoveredOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected tool error: %s", resultText(res))
+	}
+	if !strings.Contains(resultText(res), `"snapshot_id": null`) {
+		t.Errorf("uncovered row must round-trip a null snapshot_id, got:\n%s", resultText(res))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}

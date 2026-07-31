@@ -191,7 +191,7 @@ automatically.
 | `recover_cascade` | `bintrail recover-cascade --dry-run` | Generate reversal SQL for foreign-key `ON DELETE`/`ON UPDATE` cascade side effects InnoDB ran below the binlog — the child rows plain `recover` cannot see. Fails with the reasons when the synthesis is provably partial, unless `allow_incomplete` is set |
 | `reconstruct` | `bintrail reconstruct` | A single row's full state at a point in time (needs a baseline) |
 | `status` | `bintrail status` | Indexed files, partitions, and summary |
-| `list_schema_changes` | reads `schema_changes` (see [DDL tracking](./ddl-tracking.md)) | DDL changes recorded while indexing/streaming, with the full statement and binlog coordinates |
+| `list_schema_changes` | reads `schema_changes` (see [DDL tracking](./ddl-tracking.md)) | DDL changes recorded while indexing/streaming, with the full statement, binlog coordinates, and the covering `snapshot_id` (`null` = no auto-snapshot) |
 
 All six are read-only — annotated `ReadOnlyHint: true` and `IdempotentHint: true`,
 so the client knows they're safe to call repeatedly and never modify state.
@@ -209,7 +209,9 @@ HTTP, console-token auth, per-server routing by URL path) — if you already run
 [console.md](console.md#mcp-endpoint).
 `list_schema_changes` accepts `schema`, `table`, `ddl_type`
 (`CREATE`/`ALTER`/`DROP`/`RENAME`/`TRUNCATE`, prefix-matched so `ALTER` matches
-`ALTER TABLE`), `since`, `until`, and `limit` (default 100); results come back
+`ALTER TABLE`), `since`, `until`, `limit` (default 100), and `uncovered_only`
+(only changes whose `snapshot_id` is `null` — the rows behind the `status`
+tool's "DDL(s) detected without auto-snapshot" warning); results come back
 newest-first.
 
 Prompts that work well:
