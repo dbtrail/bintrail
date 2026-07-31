@@ -2,6 +2,7 @@ package reconstruct
 
 import (
 	"log/slog"
+	"strings"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -54,6 +55,99 @@ func GapDetected(flavor string, eventFile string, eventStartPos uint64, baseline
 		(eventFile == baselineFile && eventStartPos > uint64(baselinePos))
 }
 
+// GTIDContainment is the three-state answer to "does the indexed GTID
+// coverage (stream_state.gtid_set) contain the baseline's GTID set?" —
+// consulted by DecideBaselineGap before the position heuristic (#1163), and
+// "not evaluable" must stay distinct from "disproven" so it can fall back
+// instead of warning.
+//
+// The evaluation itself is INJECTED (GTIDContainmentFunc): parsing GTID sets
+// takes go-mysql, which the #528 depguard bans from this read-layer package,
+// so the go-mysql-backed evaluator lives in the command layer
+// (internal/cli's gtidContainment) and reaches the full-table path through
+// FullTableConfig.GTIDContainment.
+type GTIDContainment int
+
+const (
+	// GTIDUnknown means containment could not be evaluated: a set missing on
+	// either side, a parse failure, a flavor without GTID-set semantics, or
+	// no evaluator injected. Callers fall back to the position heuristic.
+	GTIDUnknown GTIDContainment = iota
+	// GTIDContained means both sets parsed and the indexed coverage contains
+	// the baseline's set — the index covers everything from the baseline
+	// point onward.
+	GTIDContained
+	// GTIDNotContained means both sets parsed and containment FAILED —
+	// transactions the baseline reflects never entered the index's lineage.
+	GTIDNotContained
+)
+
+// GTIDContainmentFunc evaluates GTIDContainment for a (flavor, baseline set,
+// indexed set) triple. Implementations must be conservative: any input they
+// cannot parse maps to GTIDUnknown, never a panic or an error — the result
+// only gates a warning on the recovery path.
+type GTIDContainmentFunc func(flavor, baselineGTID, indexedGTID string) GTIDContainment
+
+// GapVerdict classifies the baseline↔first-event gap decision once both sides
+// carry a comparable position anchor (the skip cases — missing baseline
+// anchor, missing event position — are decided before this, see
+// WarnBaselineFirstEventGap and the single-row switch in cli/reconstruct.go).
+// Produced by DecideBaselineGap; each emitter maps a verdict to its log line.
+type GapVerdict int
+
+const (
+	// GapVerdictNone means stay quiet: either GTID-set containment proved the
+	// indexed coverage includes everything the baseline holds (#1163), or no
+	// GTID containment was evaluable and the position heuristic found the
+	// first event at-or-before the baseline anchor.
+	GapVerdictNone GapVerdict = iota
+	// GapVerdictGTID means GTID-set containment was disproven: the indexed
+	// GTID coverage does not contain the baseline's set, so transactions the
+	// baseline reflects never entered the index's lineage — a real gap,
+	// regardless of what position ordering says.
+	GapVerdictGTID
+	// GapVerdictPosition is the pre-#1163 heuristic verdict: the baseline
+	// carries no GTID set, and the first event sits strictly past the
+	// baseline anchor (file/pos, or the numeric LSN for PostgreSQL).
+	GapVerdictPosition
+	// GapVerdictUnproven means the baseline carries a GTID set but containment
+	// could not be evaluated (GTIDUnknown) and the position heuristic fired.
+	// The warning for this verdict says what could NOT be proven instead of
+	// asserting incompleteness: position ordering alone cannot distinguish
+	// the next event from a missing one (#1163).
+	GapVerdictUnproven
+)
+
+// DecideBaselineGap decides the baseline↔first-event gap question, preferring
+// GTID-set containment over the position heuristic when it was evaluable
+// (#1163). On a healthy GTID run the first indexed event after the baseline
+// is EXPECTED to sit at a later position — the position compare cannot tell
+// that apart from a hole and cries wolf on every run — while set containment
+// can prove coverage: it is the same model verify's indexCovers uses, where
+// stream_state.gtid_set containing a snapshot's @@gtid_executed means the
+// index has indexed everything that snapshot reflects.
+//
+// containment is the (injected) GTID evaluation for this baseline↔index
+// pair; GTIDUnknown degrades to the position heuristic rather than erroring —
+// this decision only gates a warning, and the recovery path must never fail
+// on a GTID string it cannot parse. Sources with no GTID on either side keep
+// the position heuristic unchanged.
+func DecideBaselineGap(containment GTIDContainment, flavor string, bmeta baseline.DumpMetadata, first query.ResultRow) GapVerdict {
+	switch containment {
+	case GTIDContained:
+		return GapVerdictNone
+	case GTIDNotContained:
+		return GapVerdictGTID
+	}
+	if !GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN) {
+		return GapVerdictNone
+	}
+	if strings.TrimSpace(bmeta.GTIDSet) != "" {
+		return GapVerdictUnproven
+	}
+	return GapVerdictPosition
+}
+
 // WarnBaselineFirstEventGap emits the baseline↔first-event gap warning for
 // callers that live in this package — the full-table reconstruct path (#781),
 // which previously produced a dump silently missing that gap while single-row
@@ -67,11 +161,14 @@ func GapDetected(flavor string, eventFile string, eventStartPos uint64, baseline
 // it governs the coverage-gap fetch (query.FetchMerged) and CheckCaptureGap,
 // which run separately, not this baseline-vs-first-event visibility warning.
 //
-// flavor is query.SourceFlavor(db). first is the earliest fetched event
+// flavor is query.SourceFlavor(db); indexedGTID is query.StreamGTIDSet(db) —
+// the index's checkpointed GTID coverage — and containment their (injected)
+// GTID-set evaluation against bmeta.GTIDSet, consulted before the position
+// heuristic (DecideBaselineGap, #1163). first is the earliest fetched event
 // (events sorted by (event_timestamp, event_id)). schema/table are added to
 // every record so the warning is attributable when several tables reconstruct
 // concurrently.
-func WarnBaselineFirstEventGap(flavor string, bmeta baseline.DumpMetadata, first query.ResultRow, schema, table string) {
+func WarnBaselineFirstEventGap(flavor, indexedGTID string, containment GTIDContainment, bmeta baseline.DumpMetadata, first query.ResultRow, schema, table string) {
 	// Mirror of cli.resolveGapCheck: force PG semantics when the flavor read
 	// came back empty but the baseline carries an LSN anchor (its lineage is
 	// provably PostgreSQL — LSN text must never be compared lexically), then
@@ -107,15 +204,38 @@ func WarnBaselineFirstEventGap(flavor string, bmeta baseline.DumpMetadata, first
 			"baseline_pos", bmeta.BinlogPos,
 			"baseline_lsn", bmeta.LSN,
 			"flavor", flavor)
-	case GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN):
-		slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
-			"schema", schema, "table", table,
-			"baseline_file", bmeta.BinlogFile,
-			"baseline_pos", bmeta.BinlogPos,
-			"baseline_gtid", bmeta.GTIDSet,
-			"baseline_lsn", bmeta.LSN,
-			"first_event_file", first.BinlogFile,
-			"first_event_pos", first.StartPos,
-			"flavor", flavor)
+	default:
+		switch DecideBaselineGap(containment, flavor, bmeta, first) {
+		case GapVerdictGTID:
+			slog.Warn("gap between baseline and indexed events — the indexed GTID coverage does not contain the baseline GTID set; reconstruction may be incomplete",
+				"schema", schema, "table", table,
+				"baseline_gtid", bmeta.GTIDSet,
+				"indexed_gtid", indexedGTID,
+				"baseline_file", bmeta.BinlogFile,
+				"baseline_pos", bmeta.BinlogPos,
+				"first_event_file", first.BinlogFile,
+				"first_event_pos", first.StartPos,
+				"flavor", flavor)
+		case GapVerdictUnproven:
+			slog.Warn("possible gap between baseline and first indexed event — baseline↔index GTID containment could not be evaluated, and position ordering alone cannot distinguish the next event from a missing one",
+				"schema", schema, "table", table,
+				"baseline_gtid", bmeta.GTIDSet,
+				"indexed_gtid", indexedGTID,
+				"baseline_file", bmeta.BinlogFile,
+				"baseline_pos", bmeta.BinlogPos,
+				"first_event_file", first.BinlogFile,
+				"first_event_pos", first.StartPos,
+				"flavor", flavor)
+		case GapVerdictPosition:
+			slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
+				"schema", schema, "table", table,
+				"baseline_file", bmeta.BinlogFile,
+				"baseline_pos", bmeta.BinlogPos,
+				"baseline_gtid", bmeta.GTIDSet,
+				"baseline_lsn", bmeta.LSN,
+				"first_event_file", first.BinlogFile,
+				"first_event_pos", first.StartPos,
+				"flavor", flavor)
+		}
 	}
 }

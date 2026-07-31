@@ -106,6 +106,15 @@ type FullTableConfig struct {
 	// to the point where a page stops spanning a whole busy hour.
 	FetchBatchSize int
 
+	// GTIDContainment evaluates baseline↔index GTID-set containment for the
+	// baseline↔first-event gap warning (#1163): a proven containment keeps a
+	// healthy run quiet where position ordering alone would cry wolf. It is
+	// injected because the evaluation links go-mysql, which the #528 depguard
+	// bans from this package; nil means containment is never evaluable
+	// (GTIDUnknown) and the warning falls back to the position heuristic. The
+	// CLI wires its gtidContainment.
+	GTIDContainment GTIDContainmentFunc
+
 	// ArchiveFetcher fetches archived binlog events for a table. nil →
 	// parquetquery.Fetch (the container-safe DuckDB budget). The CLI sets it
 	// to a tuned fetcher under --ultrafast so the flag is honored on the
@@ -714,7 +723,13 @@ func ReconstructTable(
 	// baseline-vs-first-event visibility warning. bmeta was read in step 2; the
 	// first event is carried out of the fold because its page is gone by now.
 	if fold.First != nil {
-		WarnBaselineFirstEventGap(query.SourceFlavor(db), bmeta, *fold.First, schema, table)
+		flavor := query.SourceFlavor(db)
+		indexedGTID := query.StreamGTIDSet(db)
+		containment := GTIDUnknown
+		if cfg.GTIDContainment != nil {
+			containment = cfg.GTIDContainment(flavor, bmeta.GTIDSet, indexedGTID)
+		}
+		WarnBaselineFirstEventGap(flavor, indexedGTID, containment, bmeta, *fold.First, schema, table)
 	}
 
 	// ── 6. Materialize the baseline locally for DuckDB streaming ───────────
