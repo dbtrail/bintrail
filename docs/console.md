@@ -730,9 +730,15 @@ Rules that differ from the standalone `bintrail-mcp` server:
   contract), its plaintext is shown exactly once at generation, and it is
   **scoped to `/mcp` alone** — it cannot drive the browser API (registry
   CRUD, monitor verbs, or its own rotation). Rotate/revoke from the same
-  card apply immediately, including to sibling console processes sharing the
-  file. Without any configured token the endpoint refuses every request with
-  an actionable error.
+  card take effect on the next request, including for sibling console
+  processes sharing the file: every `/mcp` request re-validates the
+  credential, so a rotated-away or revoked token stops authenticating
+  immediately. An MCP *session* is additionally bound to the credential that
+  created it — no other token can continue it, so a session opened by a
+  since-rotated token is orphaned outright (its already-open stream can idle
+  out but never be driven again) and is discarded after the idle timeout:
+  sessions with no request for **30 minutes** are closed (clients keep a
+  session alive with pings, or transparently re-initialize).
 - **A managed token carries the grants of the session that minted it.** Each
   tool call requires the same permission as its `/api` counterpart — `query`
   and `list_schema_changes` need `query:execute`, `recover` needs

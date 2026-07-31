@@ -2,11 +2,16 @@ package console
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
+	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/dbtrail/dbtrail/ext"
@@ -51,23 +56,83 @@ import (
 // baseline location, nor vary the process's RBAC posture. The reconstruct tool
 // is gated per server on the bundle's baselineConfigured, exactly like
 // /api/reconstruct.
+// mcpSessionIdleTimeout closes MCP sessions that receive no HTTP request for
+// this long. A finite timeout is load-bearing for credential hygiene, not
+// just memory: a session created by a since-rotated or revoked token can no
+// longer be CONTINUED by anyone (each request re-authenticates, and the
+// session is bound to the creating credential's identity — see the verifier),
+// but only expiry actually discards it and its pinned grants. The SDK pauses
+// the idle timer during in-flight POSTs but not for a hanging SSE GET;
+// long-lived MCP clients keep sessions alive with pings (the SDK's documented
+// expectation) or transparently re-initialize after an idle gap.
+const mcpSessionIdleTimeout = 30 * time.Minute
+
+// mcpPolicyExtraKey indexes the credential's grant cap inside
+// auth.TokenInfo.Extra, from the verifier to the session factory.
+const mcpPolicyExtraKey = "bintrail.mcp_policy"
+
 func (s *Server) mcpHandler() http.Handler {
 	streamable := mcp.NewStreamableHTTPHandler(
 		func(r *http.Request) *mcp.Server {
 			// The selector was validated before delegation; a race with a
 			// registry delete surfaces as ErrUnknownServer on the tool call.
-			// The grants of the credential that authenticated THIS request
-			// were stashed on the context by the auth wrapper below; this
-			// factory only runs when a new MCP session is being created, so
-			// the session's tool-dispatch cap is fixed by the credential that
-			// initialized it (every subsequent request still has to present a
-			// valid token, and continuing an existing session requires its
-			// unguessable Mcp-Session-Id).
+			// This factory only runs when a new MCP session is being created,
+			// so the session's tool-dispatch cap is fixed by the credential
+			// that initialized it. That is sound because the SDK binds the
+			// session to the creating credential's TokenInfo.UserID and
+			// refuses continuation under any other credential (the
+			// session-hijack guard) — a scoped token can only ever create,
+			// and only ever continue, sessions carrying its own cap.
 			id, _ := s.mcpServerID(r.PathValue("server"))
 			return s.newMCPServer(id, mcpPolicyFrom(r.Context()))
 		},
-		nil,
+		&mcp.StreamableHTTPOptions{SessionTimeout: mcpSessionIdleTimeout},
 	)
+	// The bearer credential is verified through the SDK's auth seam rather
+	// than a hand-rolled header check so that the resulting auth.TokenInfo
+	// reaches the streamable handler: its UserID is what arms the SDK's
+	// session-continuation guard (a session may only be continued by the
+	// credential that created it — without a populated TokenInfo that guard
+	// is inert), and its Extra carries the credential's grant cap (#1124) to
+	// the session factory above.
+	verifier := func(_ context.Context, got string, _ *http.Request) (*auth.TokenInfo, error) {
+		// Expiration only has to be non-zero and in the future: the SDK
+		// refuses a zero value, and the credential itself is re-verified on
+		// every request, so this instant-of-use stamp carries no lifetime
+		// semantics (session lifetime is mcpSessionIdleTimeout).
+		exp := time.Now().Add(time.Hour)
+		if s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1 {
+			// The static token is environment-owned and full-access: no grant
+			// cap. Its identity is a constant — every static-token request
+			// may continue any static-token session, exactly the pre-#1052
+			// trust model.
+			return &auth.TokenInfo{UserID: "static", Expiration: exp}, nil
+		}
+		ok, pol := s.managedTok.matches(got)
+		if !ok {
+			return nil, auth.ErrInvalidToken
+		}
+		// The managed credential's identity is the digest of its VALUE, so a
+		// rotation (always a new value) orphans every session the old value
+		// created: the old token no longer authenticates, and no other valid
+		// credential matches the session's UserID. The hash adds no secrecy
+		// (the store already keeps only the SHA-256); it is an identity, not
+		// a credential.
+		sum := sha256.Sum256([]byte(got))
+		ti := &auth.TokenInfo{UserID: "managed:" + hex.EncodeToString(sum[:]), Expiration: exp}
+		if pol != nil {
+			ti.Extra = map[string]any{mcpPolicyExtraKey: pol}
+		}
+		return ti, nil
+	}
+	authed := auth.RequireBearerToken(verifier, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := s.mcpServerID(r.PathValue("server")); !ok {
+			writeJSONError(w, http.StatusNotFound,
+				"unknown server: use /mcp for the default server, or /mcp/{id-or-name} for a server from the console registry")
+			return
+		}
+		streamable.ServeHTTP(w, r)
+	}))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.token == "" && !s.managedTok.configured() {
 			// Mirror the flashback-port precedent: no token configured means
@@ -79,43 +144,21 @@ func (s *Server) mcpHandler() http.Handler {
 					"(password login is a browser credential and cannot authenticate MCP clients)")
 			return
 		}
-		got := bearerToken(r)
-		staticOK := got != "" && s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
-		// pol is the authenticated credential's grant cap: nil for the static
-		// token (environment-owned, full access) and for a managed token
-		// minted by a full-access session; a permission set recorded at mint
-		// time otherwise (#1124).
-		var pol *ext.AccessPolicy
-		if !staticOK {
-			ok, managedPol := s.managedTok.matches(got)
-			if !ok {
-				writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
-				return
-			}
-			pol = managedPol
-		}
-		if _, ok := s.mcpServerID(r.PathValue("server")); !ok {
-			writeJSONError(w, http.StatusNotFound,
-				"unknown server: use /mcp for the default server, or /mcp/{id-or-name} for a server from the console registry")
-			return
-		}
-		if pol != nil {
-			r = r.WithContext(context.WithValue(r.Context(), mcpPolicyCtxKey{}, pol))
-		}
-		streamable.ServeHTTP(w, r)
+		authed.ServeHTTP(w, r)
 	})
 }
 
-// mcpPolicyCtxKey carries the /mcp credential's grant cap from the auth
-// wrapper to the session factory. Deliberately distinct from policyCtxKey:
-// that one is a browser SESSION's policy set by tokenMiddleware, this one is
-// the recorded mint-time grants of a managed MCP token. Absent (or nil) means
-// full access, matching policyFrom's semantics.
-type mcpPolicyCtxKey struct{}
-
+// mcpPolicyFrom returns the authenticated /mcp credential's grant cap from
+// the auth.TokenInfo the verifier attached: nil means full access (the static
+// token, or a managed token minted by a full-access session), matching
+// policyFrom's semantics for browser sessions.
 func mcpPolicyFrom(ctx context.Context) *ext.AccessPolicy {
-	p, _ := ctx.Value(mcpPolicyCtxKey{}).(*ext.AccessPolicy)
-	return p
+	ti := auth.TokenInfoFromContext(ctx)
+	if ti == nil {
+		return nil
+	}
+	pol, _ := ti.Extra[mcpPolicyExtraKey].(*ext.AccessPolicy)
+	return pol
 }
 
 // mcpToolPerms maps each core MCP tool to the permission its nearest /api
@@ -133,50 +176,82 @@ var mcpToolPerms = map[string]ext.Permission{
 	"status":              ext.PermStatusRead,
 }
 
+// mcpMetaMethods are the protocol exchanges any authenticated session may
+// perform regardless of its grant cap — the MCP analogue of the permAny
+// routes: handshake, liveness, and listings, none of which serve stored
+// content. Every method NOT here (and not a client→server notification) is
+// treated as content-bearing and gated: tools/call per tool via mcpToolPerms,
+// and everything else — resources/read, prompts/get, completions, whatever a
+// future SDK adds — behind PermExtViewRead, because only an extension
+// provider can register such content on the console's server (the core
+// registers tools only) and /api classifies extension data routes the same
+// way. Deny-by-default: an unknown method never bypasses the cap.
+var mcpMetaMethods = map[string]bool{
+	"initialize":               true,
+	"ping":                     true,
+	"tools/list":               true,
+	"prompts/list":             true,
+	"resources/list":           true,
+	"resources/templates/list": true,
+	"logging/setLevel":         true,
+}
+
 // mcpAuthzMiddleware enforces a managed token's recorded grants on every
-// tools/call, the MCP analogue of authzMiddleware. Only tool calls are
-// gated — initialize, tools/list, ping and the other metadata exchanges
-// reveal no row data, like the permAny routes. The denial is a tool-level
-// error result (not a protocol error) so an LLM client sees WHY and can
-// report it, and it is audited like every console authorization refusal.
+// incoming MCP method, the analogue of authzMiddleware. Metadata exchanges
+// pass; tools/call is checked against the per-tool permission; every other
+// method is content-bearing (or unknown) and requires extview:read. A denied
+// tool call is a tool-level error result (not a protocol error) so an LLM
+// client sees WHY and can report it; other methods deny with a protocol
+// error carrying the same wording. Every denial is audited like every
+// console authorization refusal.
 func mcpAuthzMiddleware(pol *ext.AccessPolicy) mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
-			if method != "tools/call" {
+			if mcpMetaMethods[method] || strings.HasPrefix(method, "notifications/") {
 				return next(ctx, method, req)
 			}
-			call, ok := req.(*mcp.CallToolRequest)
-			if !ok {
-				// Unreachable with the current SDK; refuse rather than wave
-				// an unidentifiable tool call past the grant check.
-				return nil, fmt.Errorf("unexpected tools/call request type %T", req)
-			}
-			perm, known := mcpToolPerms[call.Params.Name]
-			if !known {
-				perm = ext.PermExtViewRead
+			perm := ext.PermExtViewRead
+			tool := ""
+			if method == "tools/call" {
+				call, ok := req.(*mcp.CallToolRequest)
+				if !ok {
+					// Unreachable with the current SDK; refuse rather than
+					// wave an unidentifiable tool call past the grant check.
+					return nil, fmt.Errorf("unexpected tools/call request type %T", req)
+				}
+				tool = call.Params.Name
+				if p, known := mcpToolPerms[tool]; known {
+					perm = p
+				}
 			}
 			if pol.Allows(perm) {
 				return next(ctx, method, req)
 			}
-			slog.Warn("console: MCP tool call denied by token grants", "tool", call.Params.Name, "missing_permission", string(perm))
+			slog.Warn("console: MCP request denied by token grants", "method", method, "tool", tool, "missing_permission", string(perm))
+			detail := map[string]string{
+				"transport":          "mcp",
+				"method":             method,
+				"missing_permission": string(perm),
+			}
+			if tool != "" {
+				detail["tool"] = tool
+			}
 			ext.Record(ctx, ext.AuditEvent{
 				Surface: "console",
 				Action:  "authz.denied",
 				Actor:   "mcp-token",
-				Detail: map[string]string{
-					"transport":          "mcp",
-					"tool":               call.Params.Name,
-					"missing_permission": string(perm),
-				},
+				Detail:  detail,
 			})
-			return &mcp.CallToolResult{
-				IsError: true,
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: "forbidden: this MCP token lacks the " + string(perm) + " permission " +
-						"(a managed token carries the grants of the console session that minted it; " +
-						"re-generate the token from a session holding that permission)",
-				}},
-			}, nil
+			msg := "forbidden: this MCP token lacks the " + string(perm) + " permission " +
+				"(a managed token carries the grants of the console session that minted it; " +
+				"re-generate the token from a session holding that permission)"
+			if method == "tools/call" {
+				return &mcp.CallToolResult{
+					IsError: true,
+					Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+				}, nil
+			}
+			return nil, fmt.Errorf("%s", msg)
 		}
 	}
 }

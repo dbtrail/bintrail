@@ -234,3 +234,160 @@ func TestManagedTokenGrants_FileRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// doMCPRaw posts one raw JSON-RPC message to path, optionally continuing an
+// existing MCP session via its Mcp-Session-Id, and returns the recorder. Raw
+// on purpose: the session-riding and non-tool-method tests need to send
+// exactly the header/body combinations a well-behaved SDK client would not.
+func doMCPRaw(t *testing.T, s *Server, path, token, sessionID, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("POST", "http://127.0.0.1:8090"+path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", sessionID)
+	}
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+	return rec
+}
+
+const (
+	mcpRawInitialize  = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`
+	mcpRawInitialized = `{"jsonrpc":"2.0","method":"notifications/initialized"}`
+	mcpRawPing        = `{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}`
+)
+
+// TestMCPSessionBoundToCreatingCredential pins the session-continuation
+// guard: an MCP session's grants are fixed at creation, so a session must
+// only ever be continuable by the credential that created it — otherwise any
+// holder of any valid token who learns a stronger session's Mcp-Session-Id
+// would inherit its grants. The guard is the SDK's userID check, armed by
+// the TokenInfo our verifier now populates.
+func TestMCPSessionBoundToCreatingCredential(t *testing.T) {
+	s := newManagedServer(t, "static-tok")
+
+	// Managed token (full cap — irrelevant here; identity is what's tested).
+	rec := doJSON(t, s, "POST", "/api/mcp-token", "static-tok")
+	if rec.Code != 200 {
+		t.Fatalf("mint = %d: %s", rec.Code, rec.Body.String())
+	}
+	var minted struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &minted); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a session with the managed token.
+	rec = doMCPRaw(t, s, "/mcp", minted.Token, "", mcpRawInitialize)
+	if rec.Code != 200 {
+		t.Fatalf("initialize with managed token = %d: %s", rec.Code, rec.Body.String())
+	}
+	sess := rec.Header().Get("Mcp-Session-Id")
+	if sess == "" {
+		t.Fatal("initialize response carries no Mcp-Session-Id")
+	}
+
+	// The static token is a VALID credential — but not the one that created
+	// this session: continuation must be refused, not inherited.
+	if rec := doMCPRaw(t, s, "/mcp", "static-tok", sess, mcpRawPing); rec.Code != http.StatusForbidden {
+		t.Fatalf("session created by managed token continued by static token = %d, want 403 (session riding)", rec.Code)
+	}
+	// Positive control: the creating credential continues its own session.
+	if rec := doMCPRaw(t, s, "/mcp", minted.Token, sess, mcpRawPing); rec.Code != 200 {
+		t.Fatalf("creating credential refused its own session: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Rotation mints a new value = a new identity: the old session is
+	// orphaned — the old token no longer authenticates at all, and the new
+	// token must not be able to ride the session the old one created.
+	rec = doJSON(t, s, "POST", "/api/mcp-token", "static-tok")
+	if rec.Code != 200 {
+		t.Fatalf("rotate = %d", rec.Code)
+	}
+	var rotated struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &rotated); err != nil {
+		t.Fatal(err)
+	}
+	if rec := doMCPRaw(t, s, "/mcp", minted.Token, sess, mcpRawPing); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("rotated-away token still authenticates: %d", rec.Code)
+	}
+	if rec := doMCPRaw(t, s, "/mcp", rotated.Token, sess, mcpRawPing); rec.Code != http.StatusForbidden {
+		t.Fatalf("rotated token continued the pre-rotation session = %d, want 403", rec.Code)
+	}
+	// And the new token creates its own session normally.
+	if rec := doMCPRaw(t, s, "/mcp", rotated.Token, "", mcpRawInitialize); rec.Code != 200 {
+		t.Fatalf("rotated token cannot initialize: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestMCPScopedTokenNonToolMethodsDenied pins deny-by-default beyond
+// tools/call: content-bearing methods (resources/read, prompts/get — only an
+// extension provider could register such content) require extview:read from
+// a scoped token, while the handshake/listing metadata methods pass. A
+// full-access credential is not gated (it fails later, in the SDK, for lack
+// of registered content — never with the permission error).
+func TestMCPScopedTokenNonToolMethodsDenied(t *testing.T) {
+	s := newManagedServer(t, "static-tok")
+
+	viewer, _, err := s.sessions.IssueWithPolicy("settings-viewer",
+		&ext.AccessPolicy{Permissions: []ext.Permission{ext.PermSettingsRead}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := doJSON(t, s, "POST", "/api/mcp-token", viewer)
+	if rec.Code != 200 {
+		t.Fatalf("mint = %d: %s", rec.Code, rec.Body.String())
+	}
+	var minted struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &minted); err != nil {
+		t.Fatal(err)
+	}
+
+	openSession := func(token string) string {
+		t.Helper()
+		rec := doMCPRaw(t, s, "/mcp", token, "", mcpRawInitialize)
+		if rec.Code != 200 {
+			t.Fatalf("initialize = %d: %s", rec.Code, rec.Body.String())
+		}
+		sess := rec.Header().Get("Mcp-Session-Id")
+		if rec := doMCPRaw(t, s, "/mcp", token, sess, mcpRawInitialized); rec.Code >= 300 {
+			t.Fatalf("notifications/initialized = %d: %s", rec.Code, rec.Body.String())
+		}
+		return sess
+	}
+
+	sess := openSession(minted.Token)
+	for name, body := range map[string]string{
+		"resources/read": `{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"file:///x"}}`,
+		"prompts/get":    `{"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"p"}}`,
+	} {
+		rec := doMCPRaw(t, s, "/mcp", minted.Token, sess, body)
+		if !strings.Contains(rec.Body.String(), string(ext.PermExtViewRead)) {
+			t.Errorf("%s with a settings:read-only token: want a denial naming %s, got %d %s", name, ext.PermExtViewRead, rec.Code, rec.Body.String())
+		}
+	}
+	// Metadata listing still passes the grant gate for the scoped token.
+	rec = doMCPRaw(t, s, "/mcp", minted.Token, sess,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{}}`)
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), "forbidden") {
+		t.Errorf("tools/list with a scoped token = %d %s, want ungated metadata", rec.Code, rec.Body.String())
+	}
+
+	// The static (full-access) credential is not gated: whatever the SDK
+	// answers for unregistered content, it is not the permission denial.
+	staticSess := openSession("static-tok")
+	rec = doMCPRaw(t, s, "/mcp", "static-tok", staticSess,
+		`{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"file:///x"}}`)
+	if strings.Contains(rec.Body.String(), string(ext.PermExtViewRead)) {
+		t.Errorf("full-access resources/read must not hit the grant gate, got: %s", rec.Body.String())
+	}
+}
