@@ -250,6 +250,20 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 		// math.MaxUint32; the wrap happens here, upstream, at the source).
 		if _, isRotate := binlogEv.Event.(*replication.RotateEvent); isRotate {
 			lastLogPos = 0 // new file (real or fake-resume rotate): positions restart
+		} else if _, isFDE := binlogEv.Event.(*replication.FormatDescriptionEvent); isFDE {
+			// A FORMAT_DESCRIPTION event neither trips the guard nor advances
+			// lastLogPos. At a mid-file (re)connect the server re-sends the
+			// file's FDE with LogPos zeroed on the wire (its physical offset is
+			// near the file START, not the resume point, so a real value would
+			// be wrong either way). Under FillZeroLogPos (#1117, MariaDB 11.4+)
+			// go-mysql fills that zero to resumePos+EventSize — a synthetic
+			// value that OVERSHOOTS the next transaction's real positions
+			// (verified live: resume at 938 → FDE filled to 1190 → next GTID
+			// event real 980), which read here as a backward jump and
+			// false-tripped the wraparound guard. Skipping the FDE costs no
+			// detection power: a genuine 4GiB wrap can never first manifest on
+			// an FDE — in-file FDEs sit at offset 4, immediately after a
+			// RotateEvent already reset lastLogPos to 0.
 		} else if hdr := binlogEv.Header; lastLogPos != 0 && hdr.LogPos != 0 && hdr.LogPos < lastLogPos {
 			return fmt.Errorf(
 				"binlog position wraparound detected in %q: position went from %d back to %d with no intervening "+

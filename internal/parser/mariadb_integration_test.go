@@ -101,4 +101,26 @@ func TestParseFile_realBinlog_mariadb(t *testing.T) {
 			t.Fatalf("indexed GTID %q is not MariaDB domain-server-seq form", ev.GTID)
 		}
 	}
+
+	// #1117: MariaDB 11.4+ writes cache-buffered events (TABLE_MAP, rows,
+	// ANNOTATE) with end_log_pos=0 IN THE FILE ITSELF — the running-offset fill
+	// in ParseFile must reconstruct real positions, never emit the underflowed
+	// start_pos = 2^64-EventSize / end_pos = 0 shape. Positions must also be
+	// monotonic within the (single) file.
+	var lastStart uint64
+	for i, ev := range dml {
+		if ev.EndPos == 0 {
+			t.Errorf("dml[%d]: end_pos = 0 (zero-LogPos fill not applied)", i)
+		}
+		if ev.StartPos >= ev.EndPos {
+			t.Errorf("dml[%d]: start_pos %d >= end_pos %d", i, ev.StartPos, ev.EndPos)
+		}
+		if ev.StartPos > uint64(^uint32(0)) {
+			t.Errorf("dml[%d]: start_pos %d exceeds the uint32 wire-format range (underflow)", i, ev.StartPos)
+		}
+		if ev.StartPos < lastStart {
+			t.Errorf("dml[%d]: start_pos %d went backward from %d", i, ev.StartPos, lastStart)
+		}
+		lastStart = ev.StartPos
+	}
 }
