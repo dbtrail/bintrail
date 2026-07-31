@@ -379,9 +379,12 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	// query.SourceFlavor); the flavor is read here, not via DialectForIndex, so the
 	// flag warnings below can tell "known MySQL/MariaDB" apart from "unknown" and
 	// stay honest about which one they are asserting (#1121).
-	flavor := query.SourceFlavor(db)
+	flavor, noStream := query.SourceFlavorDetail(db)
 	dialect := recovery.DialectForFlavor(flavor)
-	dialectUnknown := flavor == ""
+	// A missing stream_state row is NOT an unknown dialect: file-indexed
+	// databases hold MySQL/MariaDB binlogs by construction, and a PostgreSQL
+	// stream always stamps its flavor — so only a failed read hedges (#1121).
+	dialectUnknown := flavor == "" && !noStream
 	gen := recovery.NewForDialect(db, resolver, dialect)
 	// Apply-side codegen switches (#1003). Each is a no-op on the other dialect,
 	// so warn rather than silently ignore: this command is shared by `bintrail`

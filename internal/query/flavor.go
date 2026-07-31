@@ -21,18 +21,30 @@ import (
 // on the recover path "" selects the MySQL dialect, so a silent flatten is a
 // latent wrong-SQL vector. Those log at Warn.
 func SourceFlavor(db *sql.DB) string {
+	flavor, _ := SourceFlavorDetail(db)
+	return flavor
+}
+
+// SourceFlavorDetail is SourceFlavor with the "why is it empty" discriminated:
+// noStream is true when the emptiness is a MISSING stream_state row — the
+// expected shape of a file-indexed / pre-stream index, where the source is
+// provably MySQL-family (`bintrail index` parses MySQL/MariaDB binlog files by
+// construction, and every PostgreSQL stream stamps flavor='postgres'). An
+// empty flavor with noStream=false means the read genuinely failed and the
+// dialect is unknown. Callers that warn about dialect assumptions should
+// hedge only in the second case (#1121).
+func SourceFlavorDetail(db *sql.DB) (flavor string, noStream bool) {
 	if db == nil {
-		return ""
+		return "", false
 	}
-	var flavor string
 	if err := db.QueryRow("SELECT flavor FROM stream_state WHERE id = 1").Scan(&flavor); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			slog.Debug("source flavor unavailable — no stream_state row (file-indexed or pre-stream index); defaulting to MySQL-family semantics")
-		} else {
-			slog.Warn("source flavor read failed — defaulting to MySQL-family semantics; recovery SQL dialect and gap-check semantics may be wrong for a non-MySQL source",
-				"error", err)
+			return "", true
 		}
-		return ""
+		slog.Warn("source flavor read failed — defaulting to MySQL-family semantics; recovery SQL dialect and gap-check semantics may be wrong for a non-MySQL source",
+			"error", err)
+		return "", false
 	}
-	return flavor
+	return flavor, false
 }
