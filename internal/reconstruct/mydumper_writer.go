@@ -51,6 +51,16 @@ type MydumperWriter struct {
 	chunkIdx        int
 	firstRowInChunk bool
 	closed          bool // true after Close; WriteRow becomes ErrWriterClosed
+	// finalized is true only after a Close whose finishChunk succeeded: the
+	// output is complete on disk and structurally undeletable — Discard
+	// becomes a no-op. Without it, "Discard only runs before a successful
+	// Close" would be a property of statement ORDERING at the call sites
+	// (Close being the last fallible statement before return), and any future
+	// fallible step added between Close and the caller's return would fire
+	// the deferred Discard and delete a completed table's output. A FAILED
+	// Close leaves finalized false so its rotated chunks are still discarded
+	// (a partial table must leave nothing behind).
+	finalized bool
 }
 
 // NewMydumperWriter creates a writer for a single table. The directory must
@@ -94,10 +104,18 @@ func (w *MydumperWriter) WriteSchema(createSQL string) error {
 	}
 	name := fmt.Sprintf("%s.%s-schema.sql", w.schema, w.table)
 	path := filepath.Join(w.outputDir, name)
+	// Track the name BEFORE writing (same order as openChunk): os.WriteFile
+	// opens with O_CREATE|O_TRUNC, so a failure mid-write (ENOSPC, EIO) has
+	// already created the file — appending only on success would leave an
+	// untracked, possibly truncated schema file that Discard walks past.
+	// Failure-at-open just leaves a tracked name whose os.Remove is a
+	// tolerated IsNotExist. (No portable fault injection exists for the
+	// created-then-failed shape, so this ordering is pinned by comment and
+	// review rather than a test.)
+	w.files = append(w.files, name)
 	if err := os.WriteFile(path, []byte(createSQL), 0o644); err != nil {
 		return fmt.Errorf("write schema file %s: %w", path, err)
 	}
-	w.files = append(w.files, name)
 	return nil
 }
 
@@ -166,6 +184,12 @@ func (w *MydumperWriter) Close() error {
 		err = w.finishChunk()
 	}
 	w.closed = true
+	// Only a fully successful Close finalizes the output; see the finalized
+	// field's comment. A Close with no open chunk (nothing was ever written,
+	// or the last chunk already rotated cleanly) counts as success too.
+	if err == nil {
+		w.finalized = true
+	}
 	return err
 }
 
@@ -192,7 +216,15 @@ func (w *MydumperWriter) Files() []string {
 // caller can log it WITHOUT shadowing the original error that triggered the
 // abort. Marks the writer terminal (subsequent WriteRow returns
 // ErrWriterClosed); idempotent, and a no-op after a Discard that already ran.
+//
+// After a SUCCESSFUL Close, Discard is a structural no-op: the finalized flag
+// makes a completed table's output undeletable regardless of what a caller's
+// deferred error path does afterwards. A FAILED Close does not finalize, so
+// its rotated chunks and schema file are still removed here.
 func (w *MydumperWriter) Discard() error {
+	if w.finalized {
+		return nil
+	}
 	if w.curFile != nil {
 		// Drop buffered bytes on the floor and release the handle; the file
 		// itself is unlinked below, so a close error changes nothing.

@@ -840,7 +840,10 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 	}
 
 	// ── Parse --tables (comma-separated schema.table list) ────────────────
-	tables := splitAndTrim(recTables, ",")
+	// De-duplicated: a repeated entry would run two concurrent writers over
+	// the same chunk/schema filenames, and with the #1162 error-path discard
+	// one copy failing would unlink the files its twin just wrote.
+	tables := dedupePreservingOrder(splitAndTrim(recTables, ","))
 	if len(tables) == 0 {
 		return fmt.Errorf("--tables: no entries after trimming")
 	}
@@ -952,6 +955,22 @@ func auditReconstruct(ctx context.Context, mode, schema, table string, detail ma
 		Table:   table,
 		Detail:  detail,
 	})
+}
+
+// dedupePreservingOrder drops repeated entries, keeping the first occurrence's
+// position. Used on the --tables list: ReconstructTables spawns one writer per
+// entry into a shared output dir, so duplicates race on the same filenames.
+func dedupePreservingOrder(entries []string) []string {
+	seen := make(map[string]struct{}, len(entries))
+	out := entries[:0]
+	for _, e := range entries {
+		if _, dup := seen[e]; dup {
+			continue
+		}
+		seen[e] = struct{}{}
+		out = append(out, e)
+	}
+	return out
 }
 
 // splitAndTrim splits s on sep and strips whitespace from each entry,

@@ -267,3 +267,34 @@ func TestRunReconstructFullTable_rejectsInvalidAt(t *testing.T) {
 
 // Silence unused-imports if a future refactor deletes a case.
 var _ = time.Time{}
+
+// TestDedupePreservingOrder pins the --tables de-duplication (#1162): a
+// repeated entry would spawn two concurrent writers over the same
+// chunk/schema filenames in the shared output dir, and with the error-path
+// discard one copy failing would unlink the files its twin just wrote.
+func TestDedupePreservingOrder(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"nil", nil, nil},
+		{"no duplicates", []string{"db.a", "db.b"}, []string{"db.a", "db.b"}},
+		{"adjacent duplicate", []string{"db.a", "db.a", "db.b"}, []string{"db.a", "db.b"}},
+		{"non-adjacent duplicate keeps first position", []string{"db.a", "db.b", "db.a"}, []string{"db.a", "db.b"}},
+		{"all duplicates", []string{"db.a", "db.a", "db.a"}, []string{"db.a"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dedupePreservingOrder(append([]string(nil), tc.in...))
+			if len(got) != len(tc.want) {
+				t.Fatalf("dedupePreservingOrder(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("dedupePreservingOrder(%v) = %v, want %v", tc.in, got, tc.want)
+				}
+			}
+		})
+	}
+}

@@ -267,3 +267,42 @@ func TestWriteBinlogOnlyChanges_errorLeavesNoArtifacts(t *testing.T) {
 		t.Errorf("rep.Files must stay empty on failure, got %v", rep.Files)
 	}
 }
+
+// TestMydumperWriter_discardAfterSuccessfulCloseIsNoOp pins the finalized
+// flag: once Close has fully succeeded the table's output is complete, and a
+// later Discard — e.g. a caller's deferred error path firing because some
+// step AFTER the writer finalized failed — must remove nothing. Without this,
+// "Discard only runs before a successful Close" is a property of statement
+// ordering at the call sites, not of the writer.
+func TestMydumperWriter_discardAfterSuccessfulCloseIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewMydumperWriter(dir, "mydb", "orders", []string{"id"}, 0)
+	if err != nil {
+		t.Fatalf("NewMydumperWriter: %v", err)
+	}
+	if err := w.WriteSchema("-- schema"); err != nil {
+		t.Fatalf("WriteSchema: %v", err)
+	}
+	if err := w.WriteRow([]any{int64(1)}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wantFiles := append([]string(nil), w.Files()...)
+	if len(wantFiles) != 2 {
+		t.Fatalf("fixture expected schema + 1 chunk, got %v", wantFiles)
+	}
+
+	if err := w.Discard(); err != nil {
+		t.Fatalf("Discard after successful Close: %v", err)
+	}
+	for _, name := range wantFiles {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("Discard after successful Close removed %s: %v", name, err)
+		}
+	}
+	if got := w.Files(); len(got) != len(wantFiles) {
+		t.Errorf("Files() after no-op Discard = %v, want %v", got, wantFiles)
+	}
+}
