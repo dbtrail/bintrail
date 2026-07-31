@@ -14,7 +14,7 @@ DDL tracking solves three problems:
 
 1. **Detection**: The parser identifies DDL statements (`ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE TABLE`) and emits them as events instead of just logging warnings.
 2. **Auto-snapshot**: When a DDL is detected and a source database connection is available, dbtrail automatically takes a new snapshot and hot-swaps the resolver — no manual intervention needed. This works in both stream mode (always has source connection) and file mode (when `--source-dsn` is provided).
-3. **Restore coverage**: The `status` command shows the time range of indexed events and warns about DDLs that weren't followed by a snapshot (file mode), so you know where recovery gaps might exist.
+3. **Restore coverage**: The `status` command shows the time range of indexed events and warns about DDLs that weren't followed by a snapshot — whether from file-mode indexing without `--source-dsn` or from a failed auto-snapshot — so you know where recovery gaps might exist.
 
 ---
 
@@ -85,7 +85,7 @@ Key fields:
 |---|---|
 | `ddl_type` | One of `ALTER TABLE`, `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE`, `TRUNCATE TABLE` |
 | `ddl_query` | The full DDL statement from the binlog |
-| `snapshot_id` | The snapshot taken after this DDL, or NULL if no source connection was available |
+| `snapshot_id` | The snapshot taken after this DDL. NULL when none was taken: file mode without `--source-dsn`, a failed auto-snapshot, or `TRUNCATE TABLE` (which changes no table structure, so no snapshot is needed — by design, in every mode) |
 
 This table is created by `bintrail init` and must exist in the index database. Older index databases (created before this feature) won't have it — the status command handles this gracefully by treating a missing table as zero schema changes.
 
@@ -112,10 +112,10 @@ The `status` command includes a "Restore Coverage" section that answers the ques
   Latest event:       2026-03-02 09:45:00 UTC
   Total events:       1,284,567
   Schema changes:     3 detected
-  Warning: 1 DDL(s) detected without snapshot — recovery across these DDLs may be incomplete
+  Warning: 1 DDL(s) detected without auto-snapshot (file-mode indexing without --source-dsn, or a failed auto-snapshot) — recovery across these DDLs may require manual snapshot
 ```
 
-The warning appears when any `schema_changes` rows have `snapshot_id = NULL` — meaning a DDL was detected in file mode without a subsequent snapshot. Recovery SQL generated for events spanning such a DDL boundary may use incorrect column names.
+The warning appears when `schema_changes` rows have `snapshot_id = NULL` for a DDL type that needs a snapshot — either a DDL detected in file mode without `--source-dsn`, or an auto-snapshot that failed (in any mode). `TRUNCATE TABLE` rows are excluded from the count: they record `snapshot_id = NULL` by design (a truncate changes no table structure, so no snapshot is taken) and are not a coverage gap. Recovery SQL generated for events spanning a genuinely uncovered DDL boundary may use incorrect column names.
 
 ### JSON output
 
@@ -142,3 +142,5 @@ The warning appears when any `schema_changes` rows have `snapshot_id = NULL` —
 | schema_changes record | Yes, with `snapshot_id` | Yes, with `snapshot_id` | Yes, with `snapshot_id = NULL` |
 | User action needed | None | None | Run `bintrail snapshot` after DDL |
 | Restore coverage warning | No (snapshot covers the DDL) | No (snapshot covers the DDL) | Yes (warns about uncovered DDLs) |
+
+Two cases sit outside this happy-path table: a **failed auto-snapshot** (any mode) records the DDL with `snapshot_id = NULL` and counts toward the restore coverage warning; a **`TRUNCATE TABLE`** records `snapshot_id = NULL` by design in every mode and is excluded from the warning.
