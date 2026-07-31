@@ -63,8 +63,8 @@ everywhere):
 }
 ```
 
-Restart Claude Code. The `query`, `recover`, `status`, `list_schema_changes`,
-and `reconstruct` tools appear — now ask: *"What changed in the orders table in the last hour?"*
+Restart Claude Code. The `query`, `recover`, `recover_cascade`, `status`,
+`list_schema_changes`, and `reconstruct` tools appear — now ask: *"What changed in the orders table in the last hour?"*
 
 > Working inside the dbtrail **source repo**? Use
 > `"command": "go", "args": ["run", "./cmd/bintrail-mcp"]` instead — no separate
