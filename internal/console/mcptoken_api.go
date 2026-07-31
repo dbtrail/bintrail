@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+
+	"github.com/dbtrail/dbtrail/ext"
 )
 
 // mcpTokenStatusDTO is the wire view of the MCP-token configuration. Values
@@ -53,11 +55,25 @@ var mcpTokenMutateMu sync.Mutex
 // Any authenticated caller may generate/rotate: reaching this handler already
 // required the static token or a login session (the managed token itself is
 // /mcp-only and cannot reach this route), and the minted credential grants
-// strictly less — the read-only MCP tools — so there is no escalation.
+// strictly less — the read-only MCP tools, capped at the minter's own
+// permission grants (#1124): the minting session's policy is recorded into
+// the token file and re-checked per tool on /mcp dispatch, so a session that
+// could not call /api/events, /api/recover or /api/reconstruct cannot mint a
+// token that reaches the same data through the MCP door. A full-access
+// minter (nil policy — the static token, a password login, every OSS
+// session) records no cap.
 func (s *Server) handleMCPTokenGenerate(w http.ResponseWriter, r *http.Request) {
 	mcpTokenMutateMu.Lock()
 	defer mcpTokenMutateMu.Unlock()
-	token, f, err := GenerateMCPToken(s.mcpTokenPath)
+	var grants []ext.Permission
+	if pol := policyFrom(r.Context()); pol != nil {
+		// Non-nil even when the policy holds zero permissions: an empty
+		// recorded list grants nothing, which is exactly what an empty policy
+		// could do itself.
+		grants = make([]ext.Permission, 0, len(pol.Permissions))
+		grants = append(grants, pol.Permissions...)
+	}
+	token, f, err := GenerateMCPToken(s.mcpTokenPath, grants)
 	if err != nil {
 		if errors.Is(err, ErrMCPTokenFileReadOnly) {
 			writeJSONError(w, http.StatusConflict, err.Error())

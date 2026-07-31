@@ -10,10 +10,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"go.yaml.in/yaml/v2"
+
+	"github.com/dbtrail/dbtrail/ext"
 )
 
 // mcpTokenFileVersion is the managed-MCP-token file schema version this binary
@@ -49,6 +52,15 @@ type MCPTokenFile struct {
 	Version     int    `yaml:"version"`
 	TokenSHA256 string `yaml:"token_sha256"`
 	CreatedAt   string `yaml:"created_at"`
+	// Permissions is the grant set recorded at mint time (#1124): the minting
+	// session's permissions, so a token can never exceed what its minter could
+	// do through the browser API. A nil (absent) field means the FULL read
+	// surface — both the file a full-access minter writes (every OSS session,
+	// the static token, a password login) and every file minted before grants
+	// were recorded, which were all minted by full-access sessions in OSS
+	// builds. A present-but-empty list grants nothing; the pointer keeps
+	// "absent" and "empty" distinguishable across the YAML round trip.
+	Permissions *[]string `yaml:"permissions,omitempty"`
 	// Extra preserves unknown top-level fields a newer binary wrote, across
 	// this binary's load→save cycle.
 	Extra map[string]any `yaml:",inline"`
@@ -122,7 +134,13 @@ func (f *MCPTokenFile) digest() ([]byte, error) {
 // (the UI's Generate button is the documented self-heal); an unreadable file
 // or a newer-version file refuses — what could not be inspected must not be
 // destroyed.
-func GenerateMCPToken(path string) (string, *MCPTokenFile, error) {
+//
+// grants is the permission set the token will carry on /mcp tool dispatch
+// (#1124): nil records no permissions field — the full read surface, the
+// full-access-minter case — while a non-nil slice (even empty) is recorded
+// verbatim and caps the token at exactly those permissions. A rotate always
+// re-records from the CURRENT minter, never from the replaced file.
+func GenerateMCPToken(path string, grants []ext.Permission) (string, *MCPTokenFile, error) {
 	mcpTokenFileMu.Lock()
 	defer mcpTokenFileMu.Unlock()
 
@@ -149,6 +167,13 @@ func GenerateMCPToken(path string) (string, *MCPTokenFile, error) {
 		Version:     mcpTokenFileVersion,
 		TokenSHA256: hex.EncodeToString(sum[:]),
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if grants != nil {
+		gs := make([]string, 0, len(grants))
+		for _, g := range grants {
+			gs = append(gs, string(g))
+		}
+		f.Permissions = &gs
 	}
 	if existing != nil {
 		f.Extra = existing.Extra
@@ -239,6 +264,11 @@ type managedMCPToken struct {
 	digest    []byte // raw SHA-256; nil = no managed token usable
 	createdAt string
 	readOnly  bool
+	// perms is the token's recorded grant set (#1124); nil means the full
+	// read surface (a full-access mint, or a file from before grants were
+	// recorded). Projected from MCPTokenFile.Permissions on every refresh, so
+	// a rotate by another process swaps digest and grants atomically here.
+	perms []ext.Permission
 
 	// loadWarned de-duplicates the unreadable-file warning: once per broken
 	// state, not once per request (re-armed by a successful load).
@@ -259,7 +289,7 @@ func (m *managedMCPToken) initFromDisk(path string, f *MCPTokenFile) {
 // hold mu.
 func (m *managedMCPToken) applyLocked(f *MCPTokenFile) {
 	if f == nil {
-		m.digest, m.createdAt, m.readOnly = nil, "", false
+		m.digest, m.createdAt, m.readOnly, m.perms = nil, "", false, nil
 		return
 	}
 	d, err := f.digest()
@@ -269,7 +299,14 @@ func (m *managedMCPToken) applyLocked(f *MCPTokenFile) {
 		// it. readOnly is still reported so the UI can explain.
 		d = nil
 	}
-	m.digest, m.createdAt, m.readOnly = d, f.CreatedAt, f.readOnly
+	var perms []ext.Permission
+	if f.Permissions != nil {
+		perms = make([]ext.Permission, 0, len(*f.Permissions))
+		for _, p := range *f.Permissions {
+			perms = append(perms, ext.Permission(p))
+		}
+	}
+	m.digest, m.createdAt, m.readOnly, m.perms = d, f.CreatedAt, f.readOnly, perms
 }
 
 // refreshLocked re-reads the file. A file that became unreadable or malformed
@@ -318,16 +355,27 @@ func (m *managedMCPToken) info() (createdAt string, readOnly bool, configured bo
 // matches reports whether got is the managed token, comparing raw SHA-256
 // digests in constant time (hashing the presented value also equalizes the
 // compared length, so nothing about the stored credential's shape leaks).
-func (m *managedMCPToken) matches(got string) bool {
+// On a match it also returns the token's recorded grants as an access policy
+// (#1124): nil for the full read surface, a policy capping tool dispatch at
+// the minter's permissions otherwise. Match and grants come from the same
+// locked refresh, so a concurrent rotate can never pair the old digest with
+// the new grant set.
+func (m *managedMCPToken) matches(got string) (bool, *ext.AccessPolicy) {
 	if got == "" {
-		return false
+		return false, nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.refreshLocked()
 	if m.digest == nil {
-		return false
+		return false, nil
 	}
 	sum := sha256.Sum256([]byte(got))
-	return subtle.ConstantTimeCompare(sum[:], m.digest) == 1
+	if subtle.ConstantTimeCompare(sum[:], m.digest) != 1 {
+		return false, nil
+	}
+	if m.perms == nil {
+		return true, nil
+	}
+	return true, &ext.AccessPolicy{Permissions: slices.Clone(m.perms)}
 }

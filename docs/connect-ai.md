@@ -34,7 +34,10 @@ the **Access token** card has a **Generate token** button — click it, copy the
 value it shows (it appears exactly once and is never stored), and you're done.
 No flags, no environment variables, no restart. The same card rotates or
 revokes the token later. The generated token is scoped to the MCP tools only —
-it cannot administer the console.
+it cannot administer the console — and it carries the permission grants of the
+session that minted it, so each MCP tool works only if your session could use
+the matching console surface directly (details in
+[console.md → MCP endpoint](console.md#mcp-endpoint)).
 
 Password login (the browser kind) does **not** work for MCP clients — the
 token is their credential.

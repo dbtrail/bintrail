@@ -3,10 +3,13 @@ package console
 import (
 	"context"
 	"crypto/subtle"
+	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/mcptools"
 )
 
@@ -25,7 +28,11 @@ import (
 // either the static --token / BINTRAIL_CONSOLE_TOKEN or the UI-managed MCP
 // token (#1052). The managed token authenticates HERE ONLY: its advertised
 // scope is the read-only MCP tools, so tokenMiddleware does not accept it and
-// it cannot drive the browser API. Like the flashback port, the endpoint
+// it cannot drive the browser API. A managed token additionally carries the
+// permission grants of the session that minted it (#1124), enforced per tool
+// call by mcpAuthzMiddleware — so a session that /api would refuse cannot
+// reach the same data by minting itself an MCP token. Like the flashback
+// port, the endpoint
 // requires a token to be CONFIGURED — login sessions are a browser credential
 // and the bcrypt password store cannot authenticate a headless MCP client —
 // so under password-only or no auth the endpoint refuses with an actionable
@@ -49,8 +56,15 @@ func (s *Server) mcpHandler() http.Handler {
 		func(r *http.Request) *mcp.Server {
 			// The selector was validated before delegation; a race with a
 			// registry delete surfaces as ErrUnknownServer on the tool call.
+			// The grants of the credential that authenticated THIS request
+			// were stashed on the context by the auth wrapper below; this
+			// factory only runs when a new MCP session is being created, so
+			// the session's tool-dispatch cap is fixed by the credential that
+			// initialized it (every subsequent request still has to present a
+			// valid token, and continuing an existing session requires its
+			// unguessable Mcp-Session-Id).
 			id, _ := s.mcpServerID(r.PathValue("server"))
-			return s.newMCPServer(id)
+			return s.newMCPServer(id, mcpPolicyFrom(r.Context()))
 		},
 		nil,
 	)
@@ -67,17 +81,104 @@ func (s *Server) mcpHandler() http.Handler {
 		}
 		got := bearerToken(r)
 		staticOK := got != "" && s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
-		if !staticOK && !s.managedTok.matches(got) {
-			writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
-			return
+		// pol is the authenticated credential's grant cap: nil for the static
+		// token (environment-owned, full access) and for a managed token
+		// minted by a full-access session; a permission set recorded at mint
+		// time otherwise (#1124).
+		var pol *ext.AccessPolicy
+		if !staticOK {
+			ok, managedPol := s.managedTok.matches(got)
+			if !ok {
+				writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
+				return
+			}
+			pol = managedPol
 		}
 		if _, ok := s.mcpServerID(r.PathValue("server")); !ok {
 			writeJSONError(w, http.StatusNotFound,
 				"unknown server: use /mcp for the default server, or /mcp/{id-or-name} for a server from the console registry")
 			return
 		}
+		if pol != nil {
+			r = r.WithContext(context.WithValue(r.Context(), mcpPolicyCtxKey{}, pol))
+		}
 		streamable.ServeHTTP(w, r)
 	})
+}
+
+// mcpPolicyCtxKey carries the /mcp credential's grant cap from the auth
+// wrapper to the session factory. Deliberately distinct from policyCtxKey:
+// that one is a browser SESSION's policy set by tokenMiddleware, this one is
+// the recorded mint-time grants of a managed MCP token. Absent (or nil) means
+// full access, matching policyFrom's semantics.
+type mcpPolicyCtxKey struct{}
+
+func mcpPolicyFrom(ctx context.Context) *ext.AccessPolicy {
+	p, _ := ctx.Value(mcpPolicyCtxKey{}).(*ext.AccessPolicy)
+	return p
+}
+
+// mcpToolPerms maps each core MCP tool to the permission its nearest /api
+// route requires (see apiRoutePerms): the two doors to the same data must
+// agree on the permission model (#1124). A tool NOT in this map is an
+// extension-registered tool and requires PermExtViewRead, mirroring how the
+// /api/ext/ subtree is classified by prefix. TestMCPToolPermsCoverCoreTools
+// pins that every core tool is listed here, so a new core tool cannot
+// silently land in the extension bucket.
+var mcpToolPerms = map[string]ext.Permission{
+	"query":               ext.PermQueryExecute,
+	"list_schema_changes": ext.PermQueryExecute,
+	"recover":             ext.PermRecoverExecute,
+	"reconstruct":         ext.PermReconstructExecute,
+	"status":              ext.PermStatusRead,
+}
+
+// mcpAuthzMiddleware enforces a managed token's recorded grants on every
+// tools/call, the MCP analogue of authzMiddleware. Only tool calls are
+// gated — initialize, tools/list, ping and the other metadata exchanges
+// reveal no row data, like the permAny routes. The denial is a tool-level
+// error result (not a protocol error) so an LLM client sees WHY and can
+// report it, and it is audited like every console authorization refusal.
+func mcpAuthzMiddleware(pol *ext.AccessPolicy) mcp.Middleware {
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			if method != "tools/call" {
+				return next(ctx, method, req)
+			}
+			call, ok := req.(*mcp.CallToolRequest)
+			if !ok {
+				// Unreachable with the current SDK; refuse rather than wave
+				// an unidentifiable tool call past the grant check.
+				return nil, fmt.Errorf("unexpected tools/call request type %T", req)
+			}
+			perm, known := mcpToolPerms[call.Params.Name]
+			if !known {
+				perm = ext.PermExtViewRead
+			}
+			if pol.Allows(perm) {
+				return next(ctx, method, req)
+			}
+			slog.Warn("console: MCP tool call denied by token grants", "tool", call.Params.Name, "missing_permission", string(perm))
+			ext.Record(ctx, ext.AuditEvent{
+				Surface: "console",
+				Action:  "authz.denied",
+				Actor:   "mcp-token",
+				Detail: map[string]string{
+					"transport":          "mcp",
+					"tool":               call.Params.Name,
+					"missing_permission": string(perm),
+				},
+			})
+			return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{&mcp.TextContent{
+					Text: "forbidden: this MCP token lacks the " + string(perm) + " permission " +
+						"(a managed token carries the grants of the console session that minted it; " +
+						"re-generate the token from a session holding that permission)",
+				}},
+			}, nil
+		}
+	}
 }
 
 // mcpServerID maps the /mcp/{server} path selector to the canonical
@@ -105,9 +206,12 @@ func (s *Server) mcpServerID(selector string) (string, bool) {
 // newMCPServer builds the per-session MCP server bound to one console server
 // selection. The bundle is resolved per tool call (lazily opening registry
 // connections, exactly like the API), so a server edited or added mid-session
-// behaves the same as on every other console surface.
-func (s *Server) newMCPServer(id string) *mcp.Server {
-	return mcptools.NewServer(mcptools.Config{
+// behaves the same as on every other console surface. pol is the
+// authenticating credential's grant cap (#1124): nil for full access, a
+// mint-time permission set for a scoped managed token — enforced per
+// tools/call by mcpAuthzMiddleware.
+func (s *Server) newMCPServer(id string, pol *ext.AccessPolicy) *mcp.Server {
+	srv := mcptools.NewServer(mcptools.Config{
 		Version: "console",
 		Instructions: "Bintrail console MCP endpoint for querying indexed binlog events, " +
 			"generating recovery SQL, reconstructing a row's state at a point in time, " +
@@ -179,4 +283,8 @@ func (s *Server) newMCPServer(id string) *mcp.Server {
 		MaxScriptBytes: recoverMaxScriptBytes,
 		AuditSurface:   "console-mcp",
 	})
+	if pol != nil {
+		srv.AddReceivingMiddleware(mcpAuthzMiddleware(pol))
+	}
+	return srv
 }

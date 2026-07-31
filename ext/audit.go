@@ -30,7 +30,8 @@ import (
 //     flashback port. Actor is the authenticated MySQL user.
 //   - "console" — query.run, recover.generate, recover.cascade,
 //     reconstruct.run, verify.explain, plus two refusals that
-//     are not data reads: authz.denied (the session's policy
+//     are not data reads: authz.denied (the session's policy —
+//     or a managed MCP token's recorded mint-time grants —
 //     lacks a permission) and profile.denied (an unknown data
 //     profile, or a surface that cannot honor redaction).
 //

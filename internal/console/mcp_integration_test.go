@@ -5,13 +5,17 @@ package console
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -78,6 +82,9 @@ func seedMCPConsole(t *testing.T) (*Server, *sql.DB, string) {
 		Listen:    "127.0.0.1:8090",
 		Token:     intToken,
 		NoArchive: true,
+		// Keep the managed-token file inside the test dir: the grant tests
+		// mint through the real handler, which must never write to $HOME.
+		MCPTokenPath: filepath.Join(t.TempDir(), "mcp-token.yaml"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -262,5 +269,132 @@ func TestIntegrationMCPRoutesByServerName(t *testing.T) {
 	}
 	if !strings.Contains(mcpToolText(t, res), "alicia") {
 		t.Errorf("named-server query missing row data: %s", mcpToolText(t, res))
+	}
+}
+
+// mintManagedMCPToken POSTs /api/mcp-token over real HTTP with bearer and
+// returns the minted plaintext.
+func mintManagedMCPToken(t *testing.T, ts *httptest.Server, bearer string) string {
+	t.Helper()
+	req, err := http.NewRequest("POST", ts.URL+"/api/mcp-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("mint MCP token: %v", err)
+	}
+	defer resp.Body.Close()
+	var minted struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&minted); err != nil || resp.StatusCode != 200 || minted.Token == "" {
+		t.Fatalf("mint MCP token = %d (decode err %v)", resp.StatusCode, err)
+	}
+	return minted.Token
+}
+
+// TestIntegrationMCPTokenGrants pins #1124 end to end over the real HTTP /mcp
+// endpoint: a managed token is capped at the permission grants of the session
+// that minted it, so the MCP door and the /api door to the same data enforce
+// the same permission model. A full-access mint (and, byte-identically, a
+// token file from before grants were recorded) keeps the full read surface.
+func TestIntegrationMCPTokenGrants(t *testing.T) {
+	srv, _, _ := seedMCPConsole(t)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	ctx := context.Background()
+
+	// A session holding ONLY settings:read may still mint (the mint gate is
+	// unchanged) — but the minted token must be refused every core tool,
+	// exactly as /api would refuse the minter itself.
+	viewer, _, err := srv.sessions.IssueWithPolicy("settings-viewer",
+		&ext.AccessPolicy{Permissions: []ext.Permission{ext.PermSettingsRead}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokA := mintManagedMCPToken(t, ts, viewer)
+	sA := mcpConnect(t, ts.URL+"/mcp", tokA)
+	for tool, perm := range map[string]string{
+		"query":               "query:execute",
+		"list_schema_changes": "query:execute",
+		"recover":             "recover:execute",
+		"reconstruct":         "reconstruct:execute",
+		"status":              "status:read",
+	} {
+		res, err := sA.CallTool(ctx, &mcp.CallToolParams{
+			Name:      tool,
+			Arguments: map[string]any{"schema": "app", "table": "users", "pk": "1"},
+		})
+		if err != nil {
+			t.Fatalf("CallTool %s (scoped token): %v", tool, err)
+		}
+		text := mcpToolText(t, res)
+		if !res.IsError || !strings.Contains(text, perm) || !strings.Contains(text, "forbidden") {
+			t.Errorf("%s with a settings:read-only token: want a forbidden error naming %s, got IsError=%v %q", tool, perm, res.IsError, text)
+		}
+	}
+
+	// A minter holding query:execute mints a token that CAN query — and still
+	// cannot reconstruct or recover (the per-tool cap, not all-or-nothing).
+	// This rotate also invalidates tokA, so its assertions ran above.
+	analyst, _, err := srv.sessions.IssueWithPolicy("analyst",
+		&ext.AccessPolicy{Permissions: []ext.Permission{ext.PermSettingsRead, ext.PermQueryExecute}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokB := mintManagedMCPToken(t, ts, analyst)
+	sB := mcpConnect(t, ts.URL+"/mcp", tokB)
+	res, err := sB.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "query",
+		Arguments: map[string]any{"schema": "app", "table": "users"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool query (analyst token): %v", err)
+	}
+	if res.IsError || !strings.Contains(mcpToolText(t, res), "alicia") {
+		t.Errorf("analyst token query: want row data, got IsError=%v %q", res.IsError, mcpToolText(t, res))
+	}
+	res, err = sB.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "recover",
+		Arguments: map[string]any{"schema": "app", "table": "users", "pk": "1"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool recover (analyst token): %v", err)
+	}
+	if !res.IsError || !strings.Contains(mcpToolText(t, res), "recover:execute") {
+		t.Errorf("analyst token recover: want forbidden recover:execute, got IsError=%v %q", res.IsError, mcpToolText(t, res))
+	}
+
+	// A full-access mint (the static token has no session policy) records no
+	// permission cap — the file has NO permissions field, which is exactly
+	// the shape a pre-grants binary wrote (the legacy-token compatibility
+	// contract: absent grants = full read surface).
+	tokC := mintManagedMCPToken(t, ts, intToken)
+	onDisk, err := os.ReadFile(srv.mcpTokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(onDisk), "permissions") {
+		t.Fatalf("full-access mint must not record a permissions field (legacy shape), got: %s", onDisk)
+	}
+	sC := mcpConnect(t, ts.URL+"/mcp", tokC)
+	res, err = sC.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "query",
+		Arguments: map[string]any{"schema": "app", "table": "users"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool query (full token): %v", err)
+	}
+	if res.IsError || !strings.Contains(mcpToolText(t, res), "alicia") {
+		t.Errorf("full-access token query: want row data, got IsError=%v %q", res.IsError, mcpToolText(t, res))
+	}
+	res, err = sC.CallTool(ctx, &mcp.CallToolParams{Name: "status", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("CallTool status (full token): %v", err)
+	}
+	if res.IsError {
+		t.Errorf("full-access token status IsError: %s", mcpToolText(t, res))
 	}
 }

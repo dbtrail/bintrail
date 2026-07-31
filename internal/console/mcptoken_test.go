@@ -23,7 +23,7 @@ func TestMCPTokenFile_GenerateLoadRotateRevoke(t *testing.T) {
 		t.Fatalf("missing file: got (%v, %v), want (nil, nil)", f, err)
 	}
 
-	token, f, err := GenerateMCPToken(path)
+	token, f, err := GenerateMCPToken(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestMCPTokenFile_GenerateLoadRotateRevoke(t *testing.T) {
 	}
 
 	// Rotate replaces the hash.
-	token2, f2, err := GenerateMCPToken(path)
+	token2, f2, err := GenerateMCPToken(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestMCPTokenFile_NewerVersionReadOnly(t *testing.T) {
 	if err != nil || !f.ReadOnly() {
 		t.Fatalf("newer-version file: f=%+v err=%v, want read-only load with no error", f, err)
 	}
-	if _, _, err := GenerateMCPToken(path); !errors.Is(err, ErrMCPTokenFileReadOnly) {
+	if _, _, err := GenerateMCPToken(path, nil); !errors.Is(err, ErrMCPTokenFileReadOnly) {
 		t.Errorf("generate on newer-version file: %v, want ErrMCPTokenFileReadOnly", err)
 	}
 	if err := RevokeMCPToken(path); !errors.Is(err, ErrMCPTokenFileReadOnly) {
@@ -99,7 +99,7 @@ func TestMCPTokenFile_MalformedShaFailsLoud(t *testing.T) {
 		t.Fatal("malformed v1 token_sha256 must fail loud, got nil error")
 	}
 	// The documented self-heal: Generate replaces the corrupt file.
-	if _, _, err := GenerateMCPToken(path); err != nil {
+	if _, _, err := GenerateMCPToken(path, nil); err != nil {
 		t.Fatalf("generate over corrupt v1 file must self-heal, got %v", err)
 	}
 	if _, err := LoadMCPTokenFile(path); err != nil {
@@ -241,7 +241,7 @@ func TestManagedToken_CapabilitiesManagedOnly(t *testing.T) {
 	if caps().MCP {
 		t.Fatal("capabilities.mcp true with no token configured")
 	}
-	_, f, err := GenerateMCPToken(s.mcpTokenPath)
+	_, f, err := GenerateMCPToken(s.mcpTokenPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,7 @@ func TestManagedToken_MCPWithoutStaticToken(t *testing.T) {
 		t.Fatalf("token-less /mcp = %d %s, want 403 naming Settings → Connect AI", rec.Code, rec.Body.String())
 	}
 
-	token, f, err := GenerateMCPToken(s.mcpTokenPath)
+	token, f, err := GenerateMCPToken(s.mcpTokenPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestManagedToken_MCPWithoutStaticToken(t *testing.T) {
 // file directly) takes effect on this server's /mcp gate without a restart.
 func TestManagedToken_CrossProcessRevokeAndRotate(t *testing.T) {
 	s := newManagedServer(t, "")
-	token, f, err := GenerateMCPToken(s.mcpTokenPath)
+	token, f, err := GenerateMCPToken(s.mcpTokenPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestManagedToken_CrossProcessRevokeAndRotate(t *testing.T) {
 	}
 
 	// Another process rotates: the file changes on disk.
-	token2, _, err := GenerateMCPToken(s.mcpTokenPath)
+	token2, _, err := GenerateMCPToken(s.mcpTokenPath, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
