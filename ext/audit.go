@@ -21,9 +21,9 @@ import (
 //     reconstruct.run, verify.explain. bintrail-pg shares
 //     these command implementations (internal/cli) and so
 //     reports the same "cli" surface; there is no "pg" surface.
-//   - "mcp"     — query.run, recover.generate, reconstruct.row
-//     (internal/mcptools; the console's /mcp endpoint reuses the
-//     same handlers with Surface "console").
+//   - "mcp"     — query.run, recover.generate, recover.cascade,
+//     reconstruct.row (internal/mcptools; the console's /mcp
+//     endpoint reuses the same handlers with Surface "console").
 //   - "shim"    — timetravel.query, for every virtual schema that returns
 //     row images (_flashback, _snapshot, _diff), from all THREE
 //     serving layers: the standalone `bintrail shim`, the

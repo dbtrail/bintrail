@@ -34,9 +34,9 @@ import (
 // local dir has no baseline for the table (#766). Binding
 // reconstruct.FindBaseline directly on the console surface would silently lose
 // that fallback — the exact regression #1102 fixed for cascade recovery, whose
-// cascadebaseline.FindBaselineFunc this mirrors. The type is redeclared here
-// rather than imported so mcptools does not pull the cascade engine into its
-// import graph.
+// cascadebaseline.FindBaselineFunc this mirrors (the recover_cascade tool
+// converts between the two identical signatures where it builds its Phase-2
+// provider).
 type FindBaselineFunc func(ctx context.Context, schema, table string, at time.Time) (string, time.Time, reconstruct.StaleWarning, error)
 
 // BaselineSource binds a single baseline source (a local directory or an s3://
