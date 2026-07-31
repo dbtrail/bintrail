@@ -111,7 +111,11 @@ func (s *session) resolve(qstr string) (cols []string, rows [][][]byte, tag stri
 		cols = s.h.ColumnsFor(image, q)
 		if image == nil {
 			// Row did not exist at AsOf (never created, or a DELETE tail): a real
-			// resultset with the table's columns and zero rows.
+			// resultset with the table's columns and zero rows. Still a served
+			// time-travel read, so it is audited like the MySQL front-end's
+			// empty resultsets (side channel on the success path, see
+			// ext/audit.go; a refusal above emits nothing).
+			s.h.AuditResolve(q, 0)
 			return cols, nil, "SELECT 0", nil
 		}
 		cells, cerr := imageCells(image, cols)
@@ -120,6 +124,7 @@ func (s *session) resolve(qstr string) (cols []string, rows [][][]byte, tag stri
 			// the marker's JSON as a value.
 			return nil, nil, "", &pgErr{"XX000", cerr.Error()}
 		}
+		s.h.AuditResolve(q, 1)
 		return cols, [][][]byte{cells}, "SELECT 1", nil
 	default:
 		return nil, nil, "", &pgErr{"XX000", fmt.Sprintf("unsupported query type: %s", q.Type)}

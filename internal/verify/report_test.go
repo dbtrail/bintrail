@@ -65,6 +65,41 @@ func TestNewReportUnknownStatus(t *testing.T) {
 	}
 }
 
+// TestNormalizeStatusBuckets pins the single status→bucket decision (#1127)
+// shared by the CLI report and the console wire path: every canonical status
+// passes through unchanged, and anything else — including the zero value —
+// lands in Error, never in a benign bucket.
+func TestNormalizeStatusBuckets(t *testing.T) {
+	for _, s := range []Status{StatusMatch, StatusMismatch, StatusInconclusive, StatusError} {
+		got, reason := NormalizeStatus(s, "note")
+		if got != s || reason != "note" {
+			t.Errorf("NormalizeStatus(%q) = (%q, %q), want passed through unchanged", s, got, reason)
+		}
+	}
+	for _, raw := range []Status{"", "bogus", "MATCH"} {
+		got, reason := NormalizeStatus(raw, "ctx")
+		if got != StatusError {
+			t.Errorf("NormalizeStatus(%q) = %q, want %q", raw, got, StatusError)
+		}
+		if !strings.Contains(reason, "unrecognized verify status") || !strings.Contains(reason, "ctx") {
+			t.Errorf("NormalizeStatus(%q) reason = %q, want the raw value and detail kept", raw, reason)
+		}
+	}
+}
+
+// TestSummaryCount: Count normalizes before tallying, so a caller feeding it
+// raw wire strings (the console supervisor) can never file an unknown status
+// outside Error, and Total always equals the number of Count calls.
+func TestSummaryCount(t *testing.T) {
+	var s Summary
+	for _, st := range []Status{StatusMatch, StatusMismatch, StatusInconclusive, StatusError, "", "bogus"} {
+		s.Count(st)
+	}
+	if s != (Summary{Match: 1, Mismatch: 1, Inconclusive: 1, Error: 3, Total: 6}) {
+		t.Errorf("summary = %+v, want 1/1/1/3 with total 6", s)
+	}
+}
+
 // TestReportExitError locks the exit contract and its precedence.
 func TestReportExitError(t *testing.T) {
 	r := func(s Status) TableResult { return TableResult{Schema: "db", Table: "t", Status: s} }

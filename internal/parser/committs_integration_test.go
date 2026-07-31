@@ -106,11 +106,20 @@ func TestParseFile_commitTimestampCapture(t *testing.T) {
 				i, ev.CommitTsUS, before, after)
 		}
 		// The whole point of the column: sub-second resolution the
-		// one-second common header cannot express.
-		if sec := uint64(ev.Timestamp.Unix()); ev.CommitTsUS/1_000_000 != sec {
+		// one-second common header cannot express — so both values must be
+		// readings of the same clock. Exact same-second equality is too
+		// strict: the header timestamp is stamped at statement execution
+		// and the commit timestamp at commit, so a transaction that
+		// straddles a second boundary legitimately truncates to a later
+		// second (observed on a loaded CI runner: commit second N+1 vs
+		// header second N, #1164). Allow a small forward-only skew; a unit
+		// error (ms/ns) misses by orders of magnitude and is already
+		// pinned by the [before, after] window above.
+		sec := uint64(ev.Timestamp.Unix())
+		if commitSec := ev.CommitTsUS / 1_000_000; commitSec < sec || commitSec-sec > 5 {
 			t.Errorf("event[%d]: CommitTsUS %d truncates to epoch second %d, but the event's own "+
 				"timestamp is %d — the two clocks disagree",
-				i, ev.CommitTsUS, ev.CommitTsUS/1_000_000, sec)
+				i, ev.CommitTsUS, commitSec, sec)
 		}
 	}
 

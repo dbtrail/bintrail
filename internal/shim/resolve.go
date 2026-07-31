@@ -270,8 +270,11 @@ func (h *Handler) ResolveSnapshotRow(ctx context.Context, q TimeTravelQuery) (ma
 
 	// q.PKValue is passed RAW here — Parquet baseline rows store actual column
 	// values, not event.BuildPKValues-encoded pk_values, so this seam must NOT
-	// apply event.EscapePKValue (unlike the delta fetch below).
-	baselineRow, err := reconstruct.ReadBaselineRow(ctx, baselinePath, map[string]string{q.PKColumn: q.PKValue})
+	// apply event.EscapePKValue (unlike the delta fetch below). pkMetas nil:
+	// binary-family PKs never reach this call (baselinePKStringMatchable routed
+	// them to the binlog-only path above), so ReadBaselineRow's fixed BINARY(n)
+	// pad-and-retry (#1157) has nothing to reconcile on this path.
+	baselineRow, err := reconstruct.ReadBaselineRow(ctx, baselinePath, map[string]string{q.PKColumn: q.PKValue}, nil)
 	if err != nil {
 		return nil, err
 	}

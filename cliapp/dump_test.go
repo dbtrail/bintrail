@@ -580,6 +580,16 @@ exit 1
 	dmpFormat = "text"
 	stubPingSource(t)
 
+	// runDump reaches acquireDumpLock, which without this override uses the
+	// REAL os.TempDir() lockfile — machine-global, shared with every other
+	// bintrail test process. A second suite running concurrently on the same
+	// machine turns this test's assertions into "another dump is already
+	// running" failures (#1164). Same pattern as
+	// TestRunDump_localDeliversPasswordViaEnvNotArgv.
+	savedLock := dumpLockDir
+	dumpLockDir = func() string { return dir }
+	t.Cleanup(func() { dumpLockDir = savedLock })
+
 	dumpCmd.SetContext(context.Background())
 	err := runDump(dumpCmd, nil)
 	if err == nil {

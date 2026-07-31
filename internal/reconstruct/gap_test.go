@@ -10,230 +10,237 @@ import (
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
-const gapReportedMsg = "gap between baseline and first indexed event"
+// The one gap message WarnBaselineFirstEventGap can emit since the #1163
+// redesign, keyed by a substring unique to it. The pre-#1163 assertive
+// per-table message is gone: a per-table first event past the anchor is the
+// EXPECTED healthy shape, so it can never carry an assertion by itself; the
+// verdict is decided against the index's earliest surviving event and the
+// unprovable case is worded as exactly that.
+const msgUnproven = "cannot be proven"
 
-// TestWarnBaselineFirstEventGap exercises the #781 full-table gap warning: the
-// baseline↔first-event check ported from the single-row path. It captures slog
-// output and asserts the "gap between baseline and first indexed event" warning
-// fires exactly when GapDetected would, honoring the same flavor-dependent
-// anchor/position skip cases as the single-row switch. Not parallel: it swaps
-// the process-global default logger (safe only in the sequential test phase).
-func TestWarnBaselineFirstEventGap(t *testing.T) {
+// TestDecideBaselineGap pins the #1163 decision matrix: the per-table first
+// event alone never proves a gap; the index's earliest surviving event either
+// proves coverage (quiet) or leaves it unproven (hedged warning). The
+// discriminating regression case is the START-SEEDED one: capture began AFTER
+// the baseline (oldest indexed event past the anchor) — the GTID-containment
+// design this replaces silenced it, because stream_state.gtid_set is seeded
+// with the stream's start set and therefore "contains" the baseline's set in
+// that exact scenario.
+func TestDecideBaselineGap(t *testing.T) {
+	// Coordinates from the #1163 report's healthy repro: baseline at
+	// (mysql-bin.000003, 1160964), first per-table event 332 bytes later.
+	bmeta := baseline.DumpMetadata{BinlogFile: "mysql-bin.000003", BinlogPos: 1160964}
+	firstPast := query.ResultRow{BinlogFile: "mysql-bin.000003", StartPos: 1161296}
+
 	cases := []struct {
-		name            string
-		flavor          string
-		bmeta           baseline.DumpMetadata
-		first           query.ResultRow
-		wantGapReported bool
+		name    string
+		flavor  string
+		bmeta   baseline.DumpMetadata
+		first   query.ResultRow
+		start   query.IndexStart
+		startOK bool
+		want    GapVerdict
 	}{
 		{
-			// The core #781 case: baseline pos precedes the first event by a gap.
-			name:   "mysql same file, first event past baseline pos = gap reported",
-			flavor: "mysql",
-			bmeta:  baseline.DumpMetadata{BinlogFile: "binlog.000042", BinlogPos: 1000},
-			first:  query.ResultRow{BinlogFile: "binlog.000042", StartPos: 5000, EventID: 7},
-
-			wantGapReported: true,
+			// The #1163 healthy repro: stream started before the baseline, so
+			// the oldest surviving event precedes the anchor — proven, quiet,
+			// even though this table's first event sits past the anchor.
+			name:    "healthy: oldest indexed event precedes the anchor = quiet",
+			flavor:  "mysql",
+			bmeta:   bmeta,
+			first:   firstPast,
+			start:   query.IndexStart{BinlogFile: "mysql-bin.000001", StartPos: 4},
+			startOK: true,
+			want:    GapVerdictNone,
 		},
 		{
-			name:   "mysql later first-event file = gap reported",
-			flavor: "mysql",
-			bmeta:  baseline.DumpMetadata{BinlogFile: "binlog.000042", BinlogPos: 99999},
-			first:  query.ResultRow{BinlogFile: "binlog.000043", StartPos: 4, EventID: 8},
-
-			wantGapReported: true,
+			// THE regression case: capture started after the baseline (#781).
+			// Oldest surviving event is past the anchor → coverage unprovable
+			// → warn. The replaced GTID-containment design silenced this.
+			name:    "capture started after the baseline = unproven, warns",
+			flavor:  "mysql",
+			bmeta:   bmeta,
+			first:   firstPast,
+			start:   query.IndexStart{BinlogFile: "mysql-bin.000003", StartPos: 1161296},
+			startOK: true,
+			want:    GapVerdictUnproven,
 		},
 		{
-			name:   "mysql first event at baseline pos = no gap",
-			flavor: "mysql",
-			bmeta:  baseline.DumpMetadata{BinlogFile: "binlog.000042", BinlogPos: 5000},
-			first:  query.ResultRow{BinlogFile: "binlog.000042", StartPos: 5000, EventID: 7},
-
-			wantGapReported: false,
+			name:    "first event at the anchor = quiet regardless of index start",
+			flavor:  "mysql",
+			bmeta:   bmeta,
+			first:   query.ResultRow{BinlogFile: "mysql-bin.000003", StartPos: 1160964},
+			start:   query.IndexStart{BinlogFile: "mysql-bin.000004", StartPos: 4},
+			startOK: true,
+			want:    GapVerdictNone,
 		},
 		{
-			// Anchor absent → the check is skipped (info), never a gap report.
-			name:   "mysql baseline lacks anchor = skipped, no gap reported",
-			flavor: "mysql",
-			bmeta:  baseline.DumpMetadata{},
-			first:  query.ResultRow{BinlogFile: "binlog.000042", StartPos: 5000, EventID: 7},
-
-			wantGapReported: false,
+			name:    "oldest event unavailable (empty table / read failed) = unproven",
+			flavor:  "mysql",
+			bmeta:   bmeta,
+			first:   firstPast,
+			startOK: false,
+			want:    GapVerdictUnproven,
 		},
 		{
-			// First event lacks a comparable position (#318) → skipped, not a gap.
-			name:   "mysql first event NULL binlog_file = skipped, no gap reported",
-			flavor: "mysql",
-			bmeta:  baseline.DumpMetadata{BinlogFile: "binlog.000042", BinlogPos: 1000},
-			first:  query.ResultRow{BinlogFile: "", StartPos: 0, EventID: 7},
-
-			wantGapReported: false,
+			// #318 shape: a positionless oldest row must never silently read
+			// as "at-or-before the anchor" (empty string sorts before every
+			// file name lexically — that would be a free false proof).
+			name:    "positionless oldest event is not a proof = unproven",
+			flavor:  "mysql",
+			bmeta:   bmeta,
+			first:   firstPast,
+			start:   query.IndexStart{BinlogFile: "", StartPos: 0},
+			startOK: true,
+			want:    GapVerdictUnproven,
 		},
 		{
-			// PG numeric LSN compare: event past the baseline floor = gap.
-			name:   "postgres first event past baseline LSN = gap reported",
-			flavor: "postgres",
-			bmeta:  baseline.DumpMetadata{LSN: 0x1000},
-			first:  query.ResultRow{BinlogFile: "0/2000", StartPos: 0x2000, EventID: 9},
-
-			wantGapReported: true,
+			name:    "mariadb: same semantics, oldest precedes anchor = quiet",
+			flavor:  "mariadb",
+			bmeta:   baseline.DumpMetadata{BinlogFile: "mariadb-bin.000213", BinlogPos: 11149},
+			first:   query.ResultRow{BinlogFile: "mariadb-bin.000214", StartPos: 400},
+			start:   query.IndexStart{BinlogFile: "mariadb-bin.000210", StartPos: 4},
+			startOK: true,
+			want:    GapVerdictNone,
 		},
 		{
-			// PG lineage forced by the LSN anchor even with an empty flavor read.
-			name:   "empty flavor but baseline LSN proves PG lineage, event past floor = gap reported",
-			flavor: "",
-			bmeta:  baseline.DumpMetadata{LSN: 0x9},
-			first:  query.ResultRow{BinlogFile: "0/10", StartPos: 0x10, EventID: 9},
-
-			wantGapReported: true,
+			// PostgreSQL compares numeric LSNs in StartPos; a start LSN
+			// at-or-below the baseline floor proves coverage.
+			name:    "postgres: oldest LSN at the baseline floor = quiet",
+			flavor:  "postgres",
+			bmeta:   baseline.DumpMetadata{LSN: 5000},
+			first:   query.ResultRow{BinlogFile: "0/1A2B", StartPos: 9000},
+			start:   query.IndexStart{BinlogFile: "0/1388", StartPos: 5000},
+			startOK: true,
+			want:    GapVerdictNone,
+		},
+		{
+			name:    "postgres: oldest LSN past the floor = unproven",
+			flavor:  "postgres",
+			bmeta:   baseline.DumpMetadata{LSN: 5000},
+			first:   query.ResultRow{BinlogFile: "0/1A2B", StartPos: 9000},
+			start:   query.IndexStart{BinlogFile: "0/1B00", StartPos: 6912},
+			startOK: true,
+			want:    GapVerdictUnproven,
+		},
+		{
+			// A zero start LSN is the PG positionless shape — not a proof.
+			name:    "postgres: zero oldest LSN is not a proof = unproven",
+			flavor:  "postgres",
+			bmeta:   baseline.DumpMetadata{LSN: 5000},
+			first:   query.ResultRow{BinlogFile: "0/1A2B", StartPos: 9000},
+			start:   query.IndexStart{StartPos: 0},
+			startOK: true,
+			want:    GapVerdictUnproven,
 		},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-			defer slog.SetDefault(prev)
-
-			WarnBaselineFirstEventGap(tc.flavor, tc.bmeta, tc.first, "mydb", "orders")
-
-			out := buf.String()
-			reported := strings.Contains(out, gapReportedMsg)
-			if reported != tc.wantGapReported {
-				t.Errorf("gap reported = %v, want %v; log output:\n%s", reported, tc.wantGapReported, out)
-			}
-			if tc.wantGapReported && !strings.Contains(out, "level=WARN") {
-				t.Errorf("expected the gap report at WARN level; log output:\n%s", out)
+			got := DecideBaselineGap(tc.flavor, tc.bmeta, tc.first, tc.start, tc.startOK)
+			if got != tc.want {
+				t.Errorf("DecideBaselineGap = %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestGapDetected(t *testing.T) {
-	cases := []struct {
-		name          string
-		flavor        string
-		eventFile     string
-		eventStartPos uint64
-		baselineFile  string
-		baselinePos   int64
-		baselineLSN   uint64
-		want          bool
-	}{
-		// ── MySQL two-key compare ───────────────────────────────────────────
-		{
-			name:      "mysql same file, event past baseline pos = gap",
-			flavor:    "mysql",
-			eventFile: "binlog.000042", eventStartPos: 5000,
-			baselineFile: "binlog.000042", baselinePos: 1000,
-			want: true,
-		},
-		{
-			name:      "mysql same file, event at baseline pos = no gap",
-			flavor:    "mysql",
-			eventFile: "binlog.000042", eventStartPos: 1000,
-			baselineFile: "binlog.000042", baselinePos: 1000,
-			want: false,
-		},
-		{
-			name:      "mysql later file = gap",
-			flavor:    "mysql",
-			eventFile: "binlog.000043", eventStartPos: 4,
-			baselineFile: "binlog.000042", baselinePos: 99999,
-			want: true, // later file always wins regardless of pos
-		},
-		{
-			name:      "mysql earlier file = no gap",
-			flavor:    "mysql",
-			eventFile: "binlog.000041", eventStartPos: 99999,
-			baselineFile: "binlog.000042", baselinePos: 4,
-			want: false,
-		},
-		{
-			name:      "mariadb uses mysql semantics",
-			flavor:    "mariadb",
-			eventFile: "mariadb-bin.000007", eventStartPos: 900,
-			baselineFile: "mariadb-bin.000007", baselinePos: 100,
-			want: true,
-		},
-		{
-			name:      "empty flavor falls back to mysql semantics",
-			flavor:    "",
-			eventFile: "binlog.000042", eventStartPos: 5000,
-			baselineFile: "binlog.000042", baselinePos: 1000,
-			want: true,
-		},
-		{
-			name:      "empty flavor, MySQL baselineLSN is ignored",
-			flavor:    "",
-			eventFile: "binlog.000041", eventStartPos: 1,
-			baselineFile: "binlog.000042", baselinePos: 1000,
-			baselineLSN: 999, // must not be consulted outside the postgres branch
-			want:        false,
-		},
+// TestWarnBaselineFirstEventGap exercises the #781 full-table gap warning: the
+// baseline↔first-event check ported from the single-row path, with the #1163
+// earliest-surviving-event proof. It captures slog output and asserts whether
+// the hedged gap message fires, honoring the same flavor-dependent
+// anchor/position skip cases as the single-row switch. Not parallel: it swaps
+// the process-global default logger (safe only in the sequential test phase).
+func TestWarnBaselineFirstEventGap(t *testing.T) {
+	bmeta := baseline.DumpMetadata{BinlogFile: "binlog.000042", BinlogPos: 1000}
+	firstPast := query.ResultRow{BinlogFile: "binlog.000042", StartPos: 5000, EventID: 7}
+	startBefore := query.IndexStart{BinlogFile: "binlog.000041", StartPos: 4}
+	startAfter := query.IndexStart{BinlogFile: "binlog.000042", StartPos: 5000}
 
-		// ── PostgreSQL numeric LSN compare ──────────────────────────────────
+	cases := []struct {
+		name     string
+		flavor   string
+		bmeta    baseline.DumpMetadata
+		first    query.ResultRow
+		start    query.IndexStart
+		startOK  bool
+		wantWarn bool
+	}{
 		{
-			name:      "pg event past baseline LSN = gap",
-			flavor:    "postgres",
-			eventFile: "0/2000", eventStartPos: 0x2000,
-			baselineLSN: 0x1000,
-			want:        true,
+			name:     "proven coverage stays quiet",
+			flavor:   "mysql",
+			bmeta:    bmeta,
+			first:    firstPast,
+			start:    startBefore,
+			startOK:  true,
+			wantWarn: false,
 		},
 		{
-			name:      "pg event at baseline LSN = no gap",
-			flavor:    "postgres",
-			eventFile: "0/1000", eventStartPos: 0x1000,
-			baselineLSN: 0x1000,
-			want:        false,
+			name:     "unprovable coverage warns hedged",
+			flavor:   "mysql",
+			bmeta:    bmeta,
+			first:    firstPast,
+			start:    startAfter,
+			startOK:  true,
+			wantWarn: true,
 		},
 		{
-			name:      "pg event before baseline LSN = no gap",
-			flavor:    "postgres",
-			eventFile: "0/800", eventStartPos: 0x800,
-			baselineLSN: 0x1000,
-			want:        false,
+			name:     "no index-start evidence warns hedged",
+			flavor:   "mysql",
+			bmeta:    bmeta,
+			first:    firstPast,
+			startOK:  false,
+			wantWarn: true,
 		},
 		{
-			// The lexical trap: "0/10" > "0/9" numerically (0x10=16 > 0x9=9)
-			// but "0/10" < "0/9" lexically. A file-text compare would report
-			// NO gap here; the numeric compare correctly reports one.
-			name:      "pg lexical trap: 0/10 event after 0/9 baseline = gap",
-			flavor:    "postgres",
-			eventFile: "0/10", eventStartPos: 0x10,
-			baselineFile: "0/9", baselinePos: 0, // file text present but must be ignored
-			baselineLSN: 0x9,
-			want:        true,
+			// Anchor absent → the check is skipped (info), never a gap report.
+			name:     "baseline lacks anchor = skipped",
+			flavor:   "mysql",
+			bmeta:    baseline.DumpMetadata{},
+			first:    firstPast,
+			startOK:  false,
+			wantWarn: false,
 		},
 		{
-			// Mirror of the trap: "0/9" event vs "0/10" baseline. Lexical
-			// compare on file text would FLAG a gap ("0/9" > "0/10"); the
-			// numeric compare correctly reports none.
-			name:      "pg lexical trap mirror: 0/9 event before 0/10 baseline = no gap",
-			flavor:    "postgres",
-			eventFile: "0/9", eventStartPos: 0x9,
-			baselineFile: "0/10", baselinePos: 0,
-			baselineLSN: 0x10,
-			want:        false,
+			// First event lacks a comparable position (#318) → skipped.
+			name:     "first event positionless = skipped",
+			flavor:   "mysql",
+			bmeta:    bmeta,
+			first:    query.ResultRow{EventID: 9},
+			start:    startAfter,
+			startOK:  true,
+			wantWarn: false,
 		},
 		{
-			// Pre-slice-A PG baseline: no LSN key → anchor unknown → never
-			// flag a gap (the check gates a warning only; callers log the skip).
-			name:      "pg baselineLSN zero = unknown anchor, no gap",
-			flavor:    "postgres",
-			eventFile: "0/2000", eventStartPos: 0x2000,
-			baselineLSN: 0,
-			want:        false,
+			name:     "postgres proven by LSN floor stays quiet",
+			flavor:   "postgres",
+			bmeta:    baseline.DumpMetadata{LSN: 5000},
+			first:    query.ResultRow{BinlogFile: "0/1A2B", StartPos: 9000, EventID: 3},
+			start:    query.IndexStart{BinlogFile: "0/0FA0", StartPos: 4000},
+			startOK:  true,
+			wantWarn: false,
+		},
+		{
+			name:     "postgres unprovable warns hedged",
+			flavor:   "postgres",
+			bmeta:    baseline.DumpMetadata{LSN: 5000},
+			first:    query.ResultRow{BinlogFile: "0/1A2B", StartPos: 9000, EventID: 3},
+			start:    query.IndexStart{BinlogFile: "0/1B00", StartPos: 6912},
+			startOK:  true,
+			wantWarn: true,
 		},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := GapDetected(tc.flavor, tc.eventFile, tc.eventStartPos, tc.baselineFile, tc.baselinePos, tc.baselineLSN)
-			if got != tc.want {
-				t.Errorf("GapDetected(%q, %q, %d, %q, %d, %d) = %v, want %v",
-					tc.flavor, tc.eventFile, tc.eventStartPos, tc.baselineFile, tc.baselinePos, tc.baselineLSN, got, tc.want)
+			var buf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			defer slog.SetDefault(prev)
+
+			WarnBaselineFirstEventGap(tc.flavor, tc.bmeta, tc.first, tc.start, tc.startOK, "s", "t")
+
+			got := strings.Contains(buf.String(), msgUnproven)
+			if got != tc.wantWarn {
+				t.Errorf("gap warning emitted = %v, want %v; log output:\n%s", got, tc.wantWarn, buf.String())
 			}
 		})
 	}

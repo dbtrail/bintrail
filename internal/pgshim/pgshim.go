@@ -205,6 +205,11 @@ func handleConn(ctx context.Context, c net.Conn, cfg Config, logger *slog.Logger
 
 	h := shim.NewHandlerWithConfig(cfg.IndexDB, cfg.ShimConfig, logger)
 	h.BindConnContext(connCtx)
+	// This front-end authenticates a real per-tenant credential (shim.yaml),
+	// so — exactly like the standalone MySQL shim (internal/cli/shim.go) —
+	// the audit identity for every time-travel query on this connection is
+	// that tenant. Post-auth: user is only trustworthy here.
+	h.BindActor(user)
 	// currentDB = the connect database param (the bintrail schema). Empty is
 	// allowed: queries must then schema-qualify the table (<schema>.<table>).
 	_ = h.UseDB(database)

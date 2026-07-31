@@ -104,18 +104,28 @@ func (g *Generator) SetMaxScriptBytes(n int64) { g.maxScriptBytes = n }
 
 // SetSuppressTriggers turns on the PostgreSQL apply-side trigger suppression
 // (#1003): the script pins `SET LOCAL session_replication_role = replica` right
-// after BEGIN, so the reversal does not re-fire the target's own triggers and
-// double-apply side effects the original triggers already logged as their own
-// (separately reversed) events. The recover CLI wires it from
+// after BEGIN, so the reversal does not re-fire the target's ordinary (ENABLE)
+// triggers and double-apply side effects the original triggers already logged as
+// their own events. That rationale only holds when those sibling events are in
+// the reversal's scope (#1121): under --table/--pk filters the trigger's derived
+// rows were never fetched, so suppressing leaves the derived tables holding the
+// bad state — neither re-fired nor reverted. The recover CLI wires it from
 // --suppress-triggers.
+//
+// Precision on what `replica` guarantees (#1121): it skips ordinary (ENABLE)
+// triggers only. ENABLE ALWAYS triggers still fire, and ENABLE REPLICA triggers
+// fire ONLY under replica — the flag can cause trigger side effects a normal
+// apply would not.
 //
 // It is OPT-IN, not the default, for two reasons. (1) Privilege: setting
 // session_replication_role requires superuser (PostgreSQL ≤14) or an explicit
 // GRANT SET ON PARAMETER (15+), so emitting it unconditionally would break every
 // apply performed by an ordinary role — a regression on the default path, hit at
-// the worst possible moment. (2) Semantics: `replica` also disables FOREIGN KEY
-// constraint triggers, so referential integrity is not enforced while the
-// reversal applies — a real behavior change the operator should choose.
+// the worst possible moment. (2) Semantics: `replica` also skips FOREIGN KEY
+// constraint triggers, and a skipped check is never re-run — there is no
+// deferred re-validation at COMMIT, so rows written in violation stay violating
+// permanently while the constraint remains marked valid. A real behavior change
+// the operator should choose.
 //
 // Inert on the MySQL path: MySQL has no session-level toggle to suppress
 // triggers during an apply (a fundamental limitation, documented in
@@ -357,17 +367,31 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 	fmt.Fprintf(w, "-- Events to reverse: %d\n", len(rows))
 	fmt.Fprintln(w, "-- IMPORTANT: Review carefully before applying to production.")
 	if g.dialect == PostgresDialect && g.suppressTriggers {
-		// The trigger caveat below does not hold when the script suppresses them,
+		// The trigger caveat below changes shape when the script suppresses them,
 		// and the FK side effect of session_replication_role must not be silent.
-		fmt.Fprintln(w, "-- NOTE: this script pins session_replication_role = replica for its transaction, so the")
-		fmt.Fprintln(w, "--       target's own triggers do NOT fire while it applies (--suppress-triggers). That")
-		fmt.Fprintln(w, "--       setting also disables FOREIGN KEY constraint triggers: referential integrity is")
-		fmt.Fprintln(w, "--       NOT enforced during the apply. Sequences are NOT restored by this script.")
+		// Precision matters here (#1121): `replica` skips ordinary (ENABLE)
+		// triggers only — ENABLE ALWAYS triggers still fire, and ENABLE REPLICA
+		// triggers fire ONLY in this mode, so the flag can CAUSE trigger side
+		// effects a normal apply would not. And a skipped FK constraint trigger is
+		// never re-run: there is no deferred re-validation at COMMIT.
+		fmt.Fprintln(w, "-- NOTE: this script pins session_replication_role = replica for its transaction")
+		fmt.Fprintln(w, "--       (--suppress-triggers). Under replica, ordinary (ENABLE) triggers are skipped,")
+		fmt.Fprintln(w, "--       but ENABLE ALWAYS triggers still fire, and ENABLE REPLICA triggers fire ONLY in")
+		fmt.Fprintln(w, "--       this mode: the flag can cause trigger side effects a normal apply would not.")
+		fmt.Fprintln(w, "--       FOREIGN KEY constraint triggers are also skipped, with NO re-validation at COMMIT:")
+		fmt.Fprintln(w, "--       rows written in violation stay violating permanently while the constraint remains")
+		fmt.Fprintln(w, "--       marked valid. Suppressing only helps when this script's scope also covers the")
+		fmt.Fprintln(w, "--       tables the skipped triggers write; a --table/--pk-filtered reversal leaves their")
+		fmt.Fprintln(w, "--       derived rows (audit rows, counters) unreverted either way. Sequences are NOT")
+		fmt.Fprintln(w, "--       restored by this script. Apply this file as a whole, in one session (e.g. psql -f):")
+		fmt.Fprintln(w, "--       outside a transaction block, SET LOCAL warns and does nothing; triggers would")
+		fmt.Fprintln(w, "--       fire while appearing suppressed.")
 		fmt.Fprintln(w, "--       See docs/query-and-recovery.md -> Restore limitations.")
 	} else {
 		fmt.Fprintln(w, "-- NOTE: applying this script fires the target's own triggers (e.g. AFTER INSERT/UPDATE),")
 		fmt.Fprintln(w, "--       which can double-apply side effects the original triggers already logged as their")
-		fmt.Fprintln(w, "--       own events above. AUTO_INCREMENT/serial counters are NOT restored by this script.")
+		fmt.Fprintln(w, "--       own events (reversed above only if this script's filters cover the tables those")
+		fmt.Fprintln(w, "--       triggers write). AUTO_INCREMENT/serial counters are NOT restored by this script.")
 		fmt.Fprintln(w, "--       See docs/query-and-recovery.md -> Restore limitations.")
 	}
 	if g.dialect == MySQLDialect && g.restoreAutoIncrement {
@@ -403,18 +427,21 @@ func (g *Generator) GenerateSQLFromRows(rows []query.ResultRow, w io.Writer) (in
 		// script defends its own escaping regardless of the target session's setting.
 		fmt.Fprintln(w, "SET LOCAL standard_conforming_strings = on;")
 		if g.suppressTriggers {
-			// Suppress the target's own triggers for this apply (#1003). Placed
+			// Suppress the target's ordinary (ENABLE) triggers for this apply
+			// (#1003; matrix precision in #1121). Placed
 			// inside the BEGIN/COMMIT the whole script already is: SET LOCAL is
 			// transaction-scoped, so the applying session's setting is restored at
 			// COMMIT/ROLLBACK and never leaks past the reversal. It is the FIRST
 			// data-affecting-session statement, so a role without the privilege to
 			// set it fails here with nothing written yet — the remedy (apply as a
 			// superuser, or drop --suppress-triggers) is in the comment below.
-			fmt.Fprintln(w, "-- Suppress the target's own triggers for this apply (--suppress-triggers).")
+			fmt.Fprintln(w, "-- Suppress the target's ordinary (ENABLE) triggers for this apply (--suppress-triggers);")
+			fmt.Fprintln(w, "-- ENABLE ALWAYS triggers still fire, and ENABLE REPLICA triggers fire only in this mode.")
 			fmt.Fprintln(w, "-- Requires superuser (PostgreSQL <= 14) or GRANT SET ON PARAMETER session_replication_role")
 			fmt.Fprintln(w, "-- TO <role> (15+); without it this statement errors and the transaction applies nothing.")
-			fmt.Fprintln(w, "-- It also disables FOREIGN KEY constraint triggers: referential integrity is not enforced")
-			fmt.Fprintln(w, "-- while this transaction applies.")
+			fmt.Fprintln(w, "-- It also skips FOREIGN KEY constraint triggers, and skipped checks are never re-run:")
+			fmt.Fprintln(w, "-- rows this transaction writes in violation of a foreign key are NOT re-validated at")
+			fmt.Fprintln(w, "-- COMMIT; they stay violating permanently while the constraint remains marked valid.")
 			fmt.Fprintln(w, "SET LOCAL session_replication_role = replica;")
 		}
 	}

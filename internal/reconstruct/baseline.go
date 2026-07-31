@@ -18,6 +18,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // ErrNoBaseline is returned by FindBaseline when no baseline snapshot exists
@@ -58,8 +59,30 @@ func FindBaseline(ctx context.Context, source, schema, table string, at time.Tim
 // ReadBaselineRow opens the Parquet file at path using DuckDB and returns the
 // first row matching pkFilter (column name → value string). Returns nil when
 // no row matches. Loads the httpfs extension automatically for s3:// paths.
-func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]string) (map[string]any, error) {
+//
+// pkMetas, when non-empty, are the searched table's primary-key column metas
+// (see ResolvePKMetasAt) and enable the fixed BINARY(n) reconciliation
+// (#1155/#1157): a key copied out of binlog_events.pk_values carries the ROW
+// image's trailing-0x00-stripped spelling, which is SHORTER than the padded
+// value the baseline stores, so after an exact miss the lookup is retried once
+// with every fixed BINARY(n) component re-padded to its declared width. The
+// retry runs only on a miss, so it can never override a correct hit. Callers
+// with no index open — and therefore no declared column widths — pass nil and
+// keep the exact-match-only behavior.
+func ReadBaselineRow(ctx context.Context, path string, pkFilter map[string]string, pkMetas []metadata.ColumnMeta) (map[string]any, error) {
 	rows, err := ReadBaselineRows(ctx, path, pkFilter, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) > 0 {
+		return rows[0], nil
+	}
+	padded, changed := padFixedBinaryFilter(pkFilter, pkMetas)
+	if !changed {
+		return nil, nil
+	}
+	slog.Debug("retrying baseline lookup with the fixed BINARY(n) storage padding", "pk_filter", padded)
+	rows, err = ReadBaselineRows(ctx, path, padded, 1)
 	if err != nil || len(rows) == 0 {
 		return nil, err
 	}

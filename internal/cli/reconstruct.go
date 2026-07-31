@@ -2,18 +2,14 @@ package cli
 
 import (
 	"context"
-	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"os"
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
@@ -41,25 +37,6 @@ func pkChangeSuspected(events []query.ResultRow) bool {
 	return len(events) > 0 && events[0].EventType != event.EventInsert
 }
 
-// resolvePKMetas loads the searched table's primary-key column metadata from
-// the latest schema snapshot. Best-effort by design: every caller below only
-// uses it to IMPROVE a lookup or an error message, so a missing/unreadable
-// snapshot degrades to the pre-#1155 behaviour instead of failing a
-// reconstruct that would otherwise have worked.
-func resolvePKMetas(db *sql.DB, schema, table string) []metadata.ColumnMeta {
-	res, err := metadata.NewResolver(db, 0)
-	if err != nil {
-		slog.Debug("could not load schema snapshot for PK metadata", "error", err)
-		return nil
-	}
-	tm, err := res.Resolve(schema, table)
-	if err != nil {
-		slog.Debug("could not resolve table for PK metadata", "error", err)
-		return nil
-	}
-	return tm.PKColumnMetas()
-}
-
 // unsupportedPKType returns the first primary-key column whose type the
 // baseline canonicalizer cannot handle, or nil when every column is supported.
 //
@@ -79,136 +56,6 @@ func unsupportedPKType(pkMetas []metadata.ColumnMeta) *metadata.ColumnMeta {
 		}
 	}
 	return nil
-}
-
-// indexPKSpelling rewrites a --pk value into the spelling the indexer stored in
-// binlog_events.pk_values, so the event fetch matches what the operator typed.
-//
-// Only fixed-width BINARY(n) components are touched, and this is the INVERSE of
-// padFixedBinaryFilter — the two run in opposite directions on purpose, because
-// they target different stores. Reproducing event.formatPKValue exactly:
-// trailing 0x00 padding is stripped (the ROW image never carries it), and the
-// hex is uppercased, but ONLY when the trimmed bytes are not valid UTF-8 —
-// formatPKValue is content-gated, so a binary key whose bytes are printable
-// ASCII is stored verbatim and must stay that way.
-//
-// Everything else — every other column type, and every component that is
-// already in the stored spelling — is returned untouched, so this cannot
-// disturb a lookup that resolves today.
-func indexPKSpelling(pk string, pkMetas []metadata.ColumnMeta) string {
-	if pk == "" || len(pkMetas) == 0 {
-		return pk
-	}
-	parts := strings.Split(pk, "|")
-	if len(parts) != len(pkMetas) {
-		// --pk/--pk-columns arity is validated against the operator's
-		// --pk-columns, not against the snapshot; if the two disagree, leave
-		// the value alone rather than re-spell the wrong component.
-		return pk
-	}
-	changed := false
-	for i, c := range pkMetas {
-		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
-			continue
-		}
-		raw, isHex := decodeHexPKValue(parts[i])
-		if !isHex {
-			continue // already the verbatim/stored spelling
-		}
-		trimmed := reconstruct.TrimFixedBinaryPad(raw)
-		var spelled string
-		if utf8.Valid(trimmed) {
-			spelled = string(trimmed)
-		} else {
-			spelled = "0x" + strings.ToUpper(hex.EncodeToString(trimmed))
-		}
-		if spelled != parts[i] {
-			parts[i] = spelled
-			changed = true
-		}
-	}
-	if !changed {
-		return pk
-	}
-	return strings.Join(parts, "|")
-}
-
-// padFixedBinaryFilter re-spells a fixed-width BINARY(n) filter value back to
-// the width the baseline stores, returning false when nothing needs re-spelling.
-//
-// This is the INVERSE of reconstruct.TrimFixedBinaryPad, and the direction is
-// deliberate: pk_values holds the binlog ROW image's spelling, which has every
-// trailing 0x00 stripped, while the baseline Parquet holds the full n bytes
-// MySQL padded on storage. An operator who copies a key out of the index — the
-// workflow #1155 reports — therefore hands us a value SHORTER than the one to
-// match. Re-padding it is exact (MySQL only ever pads a BINARY(n) with 0x00),
-// and it is only ever attempted after an exact lookup already came back empty,
-// so it cannot turn a correct hit into a different row.
-func padFixedBinaryFilter(pkFilter map[string]string, pkMetas []metadata.ColumnMeta) (map[string]string, bool) {
-	out := make(map[string]string, len(pkFilter))
-	maps.Copy(out, pkFilter)
-	changed := false
-	for _, c := range pkMetas {
-		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
-			continue
-		}
-		width := reconstruct.FixedBinaryWidth(c.ColumnType)
-		if width == 0 {
-			// Pre-#212 snapshot with no COLUMN_TYPE: the pad width is
-			// unknowable, so leave the value alone rather than guess.
-			continue
-		}
-		// --pk-columns is operator-typed and MySQL column names are
-		// case-insensitive, so an exact-only match would silently skip the
-		// retry for `--pk-columns K` against column `k`. (The lookup underneath
-		// is case-insensitive on both links since #1155: DuckDB resolves the
-		// quoted identifier, and parquetBlobColumns is keyed lowercase.)
-		key, ok := filterKeyFor(out, c.Name)
-		if !ok {
-			continue
-		}
-		val := out[key]
-		raw, isHex := decodeHexPKValue(val)
-		if !isHex {
-			raw = []byte(val)
-		}
-		if len(raw) >= width {
-			continue
-		}
-		padded := make([]byte, width)
-		copy(padded, raw)
-		out[key] = "0x" + strings.ToUpper(hex.EncodeToString(padded))
-		changed = true
-	}
-	return out, changed
-}
-
-// filterKeyFor finds the filter entry naming column col, preferring an exact
-// match and falling back to a case-insensitive one.
-func filterKeyFor(filter map[string]string, col string) (string, bool) {
-	if _, ok := filter[col]; ok {
-		return col, true
-	}
-	for k := range filter {
-		if strings.EqualFold(k, col) {
-			return k, true
-		}
-	}
-	return "", false
-}
-
-// decodeHexPKValue decodes the "0x"+hex spelling event.formatPKValue produces
-// for non-UTF-8 PK bytes (#1132). A value that is not in that shape is not
-// hex-encoded — it is the raw key text — and is reported as such.
-func decodeHexPKValue(s string) ([]byte, bool) {
-	if len(s) < 4 || len(s)%2 != 0 || !strings.HasPrefix(s, "0x") {
-		return nil, false
-	}
-	b, err := hex.DecodeString(s[2:])
-	if err != nil {
-		return nil, false
-	}
-	return b, true
 }
 
 var reconstructCmd = &cobra.Command{
@@ -420,23 +267,30 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	baselineRow, err := reconstruct.ReadBaselineRow(cmd.Context(), baselinePath, pkFilter)
-	if err != nil {
-		return fmt.Errorf("read baseline: %w", err)
-	}
-	// A nil baselineRow (this PK absent from the snapshot) is NOT resolved here
-	// anymore: it flows past the event fetch below so the "no row found" error
-	// can be told apart from a PK-changing UPDATE that stored the row under a
-	// different (before-image) PK (#782). Baseline-only mode has no events to
-	// consult, so it keeps the original error immediately.
+	// ── Baseline-only mode ─────────────────────────────────────────────────────
+	// The index is never opened here, so no declared column widths are
+	// available and the fixed BINARY(n) pad-and-retry inside ReadBaselineRow
+	// is structurally excluded (nil metas): pass the full-width
+	// `SELECT CONCAT('0x', HEX(pk_col))` spelling (documented in
+	// docs/query-and-recovery.md). Unlike the full path below, a nil row is
+	// final immediately — there are no events to consult for the #782
+	// PK-changing-UPDATE diagnosis.
 	if recBaselineOnly {
+		baselineRow, err := reconstruct.ReadBaselineRow(cmd.Context(), baselinePath, pkFilter, nil)
+		if err != nil {
+			return fmt.Errorf("read baseline: %w", err)
+		}
 		if baselineRow == nil {
 			return fmt.Errorf("no row found in baseline %q matching pk filter %v", baselinePath, pkFilter)
 		}
-		// ── Baseline-only mode ───────────────────────────────────────────────────
 		if err := writeReconstructOutput(baselineRow, nil, snapshotTime, at, false, recFormat, os.Stdout); err != nil {
 			return err
 		}
+		auditReconstruct(cmd.Context(), "baseline-only", recSchema, recTable, map[string]string{
+			"pk":     recPK,
+			"at":     at.UTC().Format(time.RFC3339),
+			"format": recFormat,
+		})
 		slog.Info("reconstruct complete",
 			"mode", "baseline-only",
 			"snapshot", snapshotTime.UTC().Format(time.RFC3339),
@@ -521,12 +375,23 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		dbName = cfg.DBName
 	}
 
-	// PK column metadata from the schema snapshot, resolved before BOTH lookups
-	// that need it: the event fetch just below (which matches
-	// binlog_events.pk_values) and the baseline retry further down (which
+	// PK column metadata from the schema snapshot in effect when the BASELINE
+	// was taken (#1159, metadata.EpochAt — not the latest snapshot, whose
+	// declared width is wrong after a PK-widening ALTER), resolved before BOTH
+	// lookups that need it: the event fetch just below (which matches
+	// binlog_events.pk_values) and the baseline read (whose internal retry
 	// matches the Parquet column). The two want the key spelled DIFFERENTLY —
-	// see indexPKSpelling and padFixedBinaryFilter (#1155).
-	pkMetas := resolvePKMetas(db, recSchema, recTable)
+	// see reconstruct.IndexPKSpelling and ReadBaselineRow (#1155/#1157).
+	pkMetas := reconstruct.ResolvePKMetasAt(db, recSchema, recTable, snapshotTime)
+
+	// A nil baselineRow (this PK absent from the snapshot) is NOT resolved here:
+	// it flows past the event fetch below so the "no row found" error can be
+	// told apart from a PK-changing UPDATE that stored the row under a
+	// different (before-image) PK (#782).
+	baselineRow, err := reconstruct.ReadBaselineRow(cmd.Context(), baselinePath, pkFilter, pkMetas)
+	if err != nil {
+		return fmt.Errorf("read baseline: %w", err)
+	}
 
 	opts := query.Options{
 		Schema: recSchema,
@@ -538,7 +403,7 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		// that is silent and wrong rather than loud: the baseline lookup above
 		// resolves such a key, the fetch returns zero events, and ApplyAt then
 		// renders baseline-era state as the state at --at.
-		PKValues: indexPKSpelling(recPK, pkMetas),
+		PKValues: reconstruct.IndexPKSpelling(recPK, pkMetas),
 		Since:    &snapshotTime,
 		Until:    &at,
 	}
@@ -572,21 +437,8 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 	}
 	slog.Debug("fetched binlog events", "count", len(events))
 
-	// A fixed BINARY(n) key copied out of binlog_events.pk_values carries the
-	// ROW image's trailing-0x00-stripped spelling, which is SHORTER than the
-	// padded value the baseline stores. Retry once at the storage width — only
-	// after the exact lookup came back empty, so a hit is never overridden.
-	if baselineRow == nil {
-		if padded, ok := padFixedBinaryFilter(pkFilter, pkMetas); ok {
-			slog.Debug("retrying baseline lookup with the fixed BINARY(n) storage padding", "pk_filter", padded)
-			baselineRow, err = reconstruct.ReadBaselineRow(cmd.Context(), baselinePath, padded)
-			if err != nil {
-				return fmt.Errorf("read baseline: %w", err)
-			}
-		}
-	}
-
-	// Still no baseline row for this PK. Refuse — but tell a genuinely-absent
+	// No baseline row for this PK (the fixed BINARY(n) pad-and-retry already
+	// ran inside ReadBaselineRow). Refuse — but tell a genuinely-absent
 	// row apart from one whose existence traces to a PK-changing UPDATE the
 	// change map can't fold (#782): such an UPDATE is stored under its
 	// BEFORE-image PK, so a fetch by the (new) searched PK never retrieves it
@@ -675,15 +527,27 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 				"baseline_pos", bmeta.BinlogPos,
 				"baseline_lsn", bmeta.LSN,
 				"flavor", flavor)
-		case reconstruct.GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN):
-			slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
-				"baseline_file", bmeta.BinlogFile,
-				"baseline_pos", bmeta.BinlogPos,
-				"baseline_gtid", bmeta.GTIDSet,
-				"baseline_lsn", bmeta.LSN,
-				"first_event_file", first.BinlogFile,
-				"first_event_pos", first.StartPos,
-				"flavor", flavor)
+		default:
+			// Both anchors are present. The per-table first event alone
+			// cannot decide the question — on a healthy run it is EXPECTED
+			// to sit past the anchor (it is simply the table's next write),
+			// so file/pos ordering alone cries wolf (#1163). The index's
+			// earliest surviving event is the evidence that can: at-or-before
+			// the anchor proves capture was already running when the baseline
+			// was taken. See reconstruct.DecideBaselineGap.
+			start, startOK := query.OldestIndexedEvent(db)
+			if reconstruct.DecideBaselineGap(flavor, bmeta, first, start, startOK) == reconstruct.GapVerdictUnproven {
+				slog.Warn("possible gap between baseline and first indexed event — the index's earliest surviving event also starts past the baseline anchor, so coverage of the window between them cannot be proven (capture may have started after the baseline, or older events may have been rotated out)",
+					"baseline_file", bmeta.BinlogFile,
+					"baseline_pos", bmeta.BinlogPos,
+					"baseline_lsn", bmeta.LSN,
+					"first_event_file", first.BinlogFile,
+					"first_event_pos", first.StartPos,
+					"oldest_indexed_file", start.BinlogFile,
+					"oldest_indexed_pos", start.StartPos,
+					"oldest_indexed_known", startOK,
+					"flavor", flavor)
+			}
 		}
 	}
 
@@ -938,9 +802,13 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 // names. ext.Record is a no-op unless an embedding distribution installed a
 // sink, and it cannot fail the command (see ext/audit.go).
 //
-// mode distinguishes the four shapes the one command serves: "row"
-// (single-row AS OF), "history" (--history), "full-table" (--output-format
-// mydumper) and "sql" (--sql, a direct read of the baseline Parquet).
+// mode distinguishes the five shapes the one command serves: "row"
+// (single-row AS OF), "history" (--history), "baseline-only"
+// (--baseline-only: the raw baseline row, no deltas applied — it prints a
+// row image straight out of the Parquet snapshot, so it is audited like
+// the others; it was the unaudited fifth mode of #1123), "full-table"
+// (--output-format mydumper) and "sql" (--sql, a direct read of the
+// baseline Parquet).
 // reconstruct has no --profile flag, so the actor carries no RBAC profile.
 func auditReconstruct(ctx context.Context, mode, schema, table string, detail map[string]string) {
 	if detail == nil {

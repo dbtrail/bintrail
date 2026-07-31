@@ -4,6 +4,7 @@ package console
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -395,5 +396,106 @@ func TestIntegrationReconstructBlobText(t *testing.T) {
 	}
 	if fmt.Sprint(r.History[1].State["body"]) != "updated bio ☃" {
 		t.Errorf("history[1] body = %v, want decoded 'updated bio ☃'", r.History[1].State["body"])
+	}
+}
+
+// TestIntegrationReconstructBinaryPK pins #1157 on the console surface: a fixed
+// BINARY(16) key whose stored value ends in 0x00 must resolve from the baseline
+// by its trailing-0x00-stripped pk_values spelling — the spelling the events
+// view displays and an operator copies. Before the fix the pad-and-retry lived
+// only in the CLI, so this endpoint proceeded with baselineRow==nil into
+// ApplyAt(nil, deltas, at) and answered found=false ("the row did not exist at
+// that time") while `bintrail reconstruct` answered correctly.
+//
+// The delta half is the sharper edge: the event fetch matches pk_values, which
+// wants the key spelled the OPPOSITE way from the baseline (stripped+uppercase
+// vs padded). A lowercase or full-width hex key that resolves the baseline but
+// fetches zero events would silently present baseline-era state as the state
+// at `at` — so those spellings are asserted against the DELTA-applied value,
+// which only comes back when both lookups resolve.
+func TestIntegrationReconstructBinaryPK(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Typed snapshot rows: the declared binary(16) width is what the
+	// pad-and-retry pads to (testutil.InsertSnapshot predates column_type).
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable)
+		VALUES (1, '2026-06-01 00:00:00', 'app', 'vault', 'k',   1, 'PRI', 'binary',  'binary(16)',  'NO'),
+		       (1, '2026-06-01 00:00:00', 'app', 'vault', 'val', 2, '',    'varchar', 'varchar(32)', 'YES')`)
+
+	// Post-baseline UPDATE, keyed and imaged exactly as the indexer stores a
+	// binary PK: pk_values carries the stripped+uppercased 0x spelling, the
+	// row images carry the []byte value base64-encoded (marshalRow).
+	kStripped, err := hex.DecodeString("11223344556677889900AABB")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kB64 := base64.StdEncoding.EncodeToString(kStripped)
+	testutil.InsertEvent(t, db, "bin.000001", 4, 40, "2026-06-01 12:00:00", nil, "app", "vault", 2,
+		"0x11223344556677889900AABB",
+		[]byte(`["val"]`),
+		[]byte(`{"k":"`+kB64+`","val":"sealed"}`),
+		[]byte(`{"k":"`+kB64+`","val":"resealed"}`))
+
+	// Baseline: the FULL storage width, padding included — what mydumper
+	// --hex-blob dumps for a BINARY(16) column (the writer decodes the 0x
+	// literal to raw bytes).
+	baseDir := t.TempDir()
+	tsDir := strings.ReplaceAll(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339), ":", "-")
+	dir := filepath.Join(baseDir, tsDir, "app")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cols := []baseline.Column{
+		{Name: "k", MySQLType: "binary", ParquetType: baseline.MysqlToParquetNode("binary")},
+		{Name: "val", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	w, err := baseline.NewWriter(filepath.Join(dir, "vault.parquet"), cols,
+		baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteRow([]string{"0x11223344556677889900AABB00000000", "sealed"}, []bool{false, false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, BaselineDir: baseDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Before the delta, by the stored (stripped, uppercase) spelling: the
+	// baseline value, via the pad-and-retry.
+	r := reconstructAt(t, srv, "schema=app&table=vault&pk=0x11223344556677889900AABB&at=2026-06-01%2011:00:00&allow_gaps=true")
+	if !r.Found || r.Deleted {
+		t.Fatalf("stripped BINARY(16) spelling: found=%v deleted=%v, want the baseline row (#1157)", r.Found, r.Deleted)
+	}
+	if got := fmt.Sprint(r.State["val"]); got != "sealed" {
+		t.Errorf("at 11:00: val=%v, want the baseline value sealed", got)
+	}
+
+	// After the delta, every legitimate spelling of the same key must return
+	// the DELTA-applied state. "sealed" here means the baseline resolved but
+	// the event fetch matched nothing — the silent fail-loud-to-fail-silent
+	// regression this test exists to catch: both lookups must respell, each in
+	// its own direction.
+	for name, pk := range map[string]string{
+		"stored spelling":     "0x11223344556677889900AABB",
+		"lowercase spelling":  "0x11223344556677889900aabb",
+		"full-width spelling": "0x11223344556677889900AABB00000000",
+	} {
+		r := reconstructAt(t, srv, "schema=app&table=vault&pk="+pk+"&at=2026-06-01%2013:00:00&allow_gaps=true")
+		if !r.Found || r.Deleted {
+			t.Errorf("%s at 13:00: found=%v deleted=%v, want the row", name, r.Found, r.Deleted)
+			continue
+		}
+		if got := fmt.Sprint(r.State["val"]); got != "resealed" {
+			t.Errorf("%s at 13:00: val=%v, want the delta-applied resealed (a baseline-era answer means the event fetch silently matched nothing)", name, got)
+		}
 	}
 }

@@ -148,6 +148,19 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	// UTC at rest (#757).
 	bp.SetTimestampStringLocation(time.UTC)
 
+	// lastEnd tracks the end offset of the previous event, to reconstruct the
+	// positions MariaDB 11.4+ leaves out of the file itself (#1117): events
+	// written through the transaction or statement cache (TABLE_MAP, row
+	// events, ANNOTATE) are copied into the binlog with end_log_pos=0 — only
+	// directly-written events (GTID, XID) carry a real value. Binlog files are
+	// contiguous, so a zero-LogPos event's true end is exactly the previous
+	// event's end plus its own EventSize — the same computation go-mysql's
+	// FillZeroLogPos performs for the replication stream. Without this, every
+	// such row is stored with start_pos = 2^64-EventSize (underflow) and
+	// end_pos = 0. Parsing always begins at the file start (offset 4, after
+	// the magic), so the running offset is exact from the first event.
+	lastEnd := uint32(4)
+
 	// handleEvent processes one binlog event. It is recursive: with
 	// binlog_transaction_compression=ON the source wraps each transaction's
 	// events (BEGIN + TABLE_MAP + rows + XID) in a single zstd-compressed
@@ -157,6 +170,17 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	handleEvent = func(binlogEv *replication.BinlogEvent) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		// Zero-LogPos fill (see lastEnd above). Transaction_payload inner
+		// events never take this branch: rewriteInnerHeader has already
+		// stamped them with the outer event's (non-zero) coordinates by the
+		// time they recurse through here.
+		if hdr := binlogEv.Header; hdr.LogPos == 0 && hdr.Flags&replication.LOG_EVENT_ARTIFICIAL_F == 0 {
+			hdr.LogPos = lastEnd + hdr.EventSize
+		}
+		if binlogEv.Header.LogPos > 0 {
+			lastEnd = binlogEv.Header.LogPos
 		}
 
 		switch ev := binlogEv.Event.(type) {
@@ -567,7 +591,22 @@ func handleRows(
 			len(firstSkipped), firstSkipped)
 	}
 
-	// LogPos points to the byte AFTER the event. Subtract EventSize to get start.
+	// LogPos points to the byte AFTER the event. Subtract EventSize to get
+	// start. A LogPos below EventSize would underflow into a ~2^64 start_pos —
+	// the corruption that made the resume-time dedup (start_pos >= checkpoint)
+	// delete every already-indexed row (#1117). Both producers now guarantee a
+	// real position (FillZeroLogPos on the MariaDB stream syncers; the running-
+	// offset fill in ParseFile), so this is a fail-loud belt: refuse to index a
+	// row whose position could not be established rather than store a value
+	// that later reads as "beyond every checkpoint".
+	if uint64(binlogEv.Header.LogPos) < uint64(binlogEv.Header.EventSize) {
+		return fmt.Errorf(
+			"row event at %s has end position %d smaller than its size %d (%s.%s) — the binlog position for "+
+				"this event could not be established (MariaDB 11.4+ writes cache-buffered events with end_log_pos=0; "+
+				"the zero-LogPos fill should have replaced it before this point); refusing to index the row with an "+
+				"underflowed start_pos, which the resume-time dedup would treat as beyond every checkpoint",
+			filename, binlogEv.Header.LogPos, binlogEv.Header.EventSize, schema, table)
+	}
 	startPos := uint64(binlogEv.Header.LogPos) - uint64(binlogEv.Header.EventSize)
 	endPos := uint64(binlogEv.Header.LogPos)
 	ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()

@@ -73,9 +73,18 @@ type VerifyRequest struct {
 
 // VerifyTableResult is the wire view of one table's verify.TableResult.
 type VerifyTableResult struct {
-	Schema          string `json:"schema"`
-	Table           string `json:"table"`
-	Status          string `json:"status"` // match | mismatch | inconclusive | error
+	Schema string `json:"schema"`
+	Table  string `json:"table"`
+	// Status is normalized through verify.NormalizeStatus before it reaches
+	// the wire — the same status→bucket decision the CLI's JSON report uses,
+	// so an unrecognized engine status surfaces as "error", never as a benign
+	// value (#1127).
+	Status string `json:"status"` // match | mismatch | inconclusive | error
+	// Reason is the detail behind the verdict — the same datum, under the same
+	// name, as the CLI's `verify --format json` per-table `reason`.
+	Reason string `json:"reason,omitempty"`
+	// Detail is the legacy alias for Reason, kept for consumers of the
+	// original #677 wire shape. Always carries the same value as Reason.
 	Detail          string `json:"detail,omitempty"`
 	SourceRows      int64  `json:"source_rows,omitempty"`
 	ReconstructRows int64  `json:"reconstruct_rows,omitempty"`
@@ -87,11 +96,24 @@ type VerifyTableResult struct {
 }
 
 // VerifySummary tallies VerifyStatus.Results by status, for a run's headline.
+// Its fields mirror verify.Summary EXACTLY — same names, types and order —
+// because consoleapp's supervisor tallies through verify.Summary.Count (the
+// one bucket classification, #1127) and publishes here via a struct
+// conversion. The compiler rejects that conversion when field names, order,
+// or types drift; struct TAGS are ignored by conversion identity, so a JSON
+// tag rename on either side would NOT be caught — keep the tags in sync by
+// hand.
+// It stays a distinct type only because this package must not import
+// internal/verify (the read layer must not link the capture library —
+// see internal/event's dep guard).
 type VerifySummary struct {
 	Match        int `json:"match"`
 	Mismatch     int `json:"mismatch"`
 	Inconclusive int `json:"inconclusive"`
 	Error        int `json:"error"`
+	// Total is the number of results tallied — the same `total` the CLI's
+	// `verify --format json` summary carries.
+	Total int `json:"total"`
 }
 
 // VerifyStatus is the pollable state of a server's most recent verify run.
