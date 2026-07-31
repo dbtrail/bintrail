@@ -288,7 +288,14 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 			}
 			return ErrorResult(fmt.Errorf("find baseline: %w", err)), nil, nil
 		}
-		baselineRow, err := reconstruct.ReadBaselineRow(ctx, path, pkFilter)
+		// PK column metadata from the snapshot in effect when the baseline was
+		// taken (#1159), enabling the fixed BINARY(n) pad-and-retry inside
+		// ReadBaselineRow (#1155/#1157): the pk an agent copies out of the
+		// query tool carries the trailing-0x00-stripped pk_values spelling,
+		// while the baseline stores the padded width. Best-effort: nil metas
+		// keep the exact-match behavior.
+		pkMetas := reconstruct.ResolvePKMetasAt(t.DB, args.Schema, args.Table, snapshotTime)
+		baselineRow, err := reconstruct.ReadBaselineRow(ctx, path, pkFilter, pkMetas)
 		if err != nil {
 			return ErrorResult(fmt.Errorf("read baseline: %w", err)), nil, nil
 		}

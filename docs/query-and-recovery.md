@@ -60,15 +60,21 @@ Three things to know:
   instead of reporting them `inconclusive`. One wrinkle is handled for you: a
   fixed `BINARY(n)` column is padded with `0x00` on storage but the binlog row
   image drops that padding, so the two stores want the key spelled differently.
-  `bintrail reconstruct` reconciles both directions for you — it re-pads to the
-  declared width for the baseline lookup and trims back for the event fetch —
-  so either spelling resolves. Three surfaces do **not** have that reconciler
-  and need the exact spelling: `--baseline-only` (never opens the index, so
-  there is no column width to pad to — pass the full-width
-  `SELECT CONCAT('0x', HEX(pk_col))` form), and the console `/api/reconstruct`
-  and MCP `reconstruct` tool (which call the baseline reader directly — pass
-  the full-width form there too). `FLOAT`/`DOUBLE`, `BIT`, `JSON` and spatial
-  primary keys remain unsupported.
+  The baseline reader re-pads the key to its declared width when the exact
+  lookup misses, so the stripped `pk_values` spelling — the one `bintrail
+  query`, the console events view, and the MCP `query` tool display — resolves
+  on every surface that reads the index: `reconstruct --pk`, the console
+  `/api/reconstruct`, and the MCP `reconstruct` tool
+  ([#1157](https://github.com/dbtrail/dbtrail/issues/1157)). The CLI
+  additionally trims a full-width `SELECT CONCAT('0x', HEX(pk_col))` key back
+  to the stored spelling for its event fetch, so either form works there. The
+  declared width is read from the schema snapshot in effect when the baseline
+  was taken, so widening the key with a later `ALTER` does not break lookups
+  against older baselines
+  ([#1159](https://github.com/dbtrail/dbtrail/issues/1159)). The one surface
+  without the reconciler is `--baseline-only`, which never opens the index and
+  so has no declared width to pad to — pass the full-width `HEX()` form there.
+  `FLOAT`/`DOUBLE`, `BIT`, `JSON` and spatial primary keys remain unsupported.
 
 ### `--column-eq` Filter
 

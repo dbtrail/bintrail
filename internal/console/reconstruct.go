@@ -325,7 +325,15 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "find baseline: "+err.Error())
 		return
 	}
-	baselineRow, err := reconstruct.ReadBaselineRow(ctx, path, pkFilter)
+	// PK column metadata from the snapshot in effect when the baseline was
+	// taken (#1159), enabling the fixed BINARY(n) pad-and-retry inside
+	// ReadBaselineRow (#1155/#1157): a key copied out of the events view
+	// carries the trailing-0x00-stripped pk_values spelling, while the
+	// baseline stores the padded width — without the retry this endpoint
+	// answered "the row did not exist" for such a key while the CLI answered
+	// correctly. Best-effort: nil metas keep the exact-match behavior.
+	pkMetas := reconstruct.ResolvePKMetasAt(b.db, schema, table, snapshotTime)
+	baselineRow, err := reconstruct.ReadBaselineRow(ctx, path, pkFilter, pkMetas)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "read baseline: "+err.Error())
 		return

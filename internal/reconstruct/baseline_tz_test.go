@@ -76,7 +76,7 @@ func runTemporalPKBaselineChild(t *testing.T) {
 			t.Fatalf("%s Close: %v", tc.name, err)
 		}
 
-		row, err := ReadBaselineRow(ctx, path, map[string]string{"k": tc.pkVal})
+		row, err := ReadBaselineRow(ctx, path, map[string]string{"k": tc.pkVal}, nil)
 		if err != nil {
 			t.Fatalf("%s ReadBaselineRow: %v", tc.name, err)
 		}

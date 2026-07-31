@@ -397,3 +397,63 @@ func TestIntegrationReconstructBlobText(t *testing.T) {
 		t.Errorf("history[1] body = %v, want decoded 'updated bio ☃'", r.History[1].State["body"])
 	}
 }
+
+// TestIntegrationReconstructBinaryPK pins #1157 on the console surface: a fixed
+// BINARY(16) key whose stored value ends in 0x00, with NO deltas in the window,
+// must resolve from the baseline by its trailing-0x00-stripped pk_values
+// spelling — the spelling the events view displays and an operator copies.
+// Before the fix the pad-and-retry lived only in the CLI, so this endpoint
+// proceeded with baselineRow==nil into ApplyAt(nil, no deltas, at) and answered
+// found=false ("the row did not exist at that time") while `bintrail
+// reconstruct` answered correctly for the identical key.
+func TestIntegrationReconstructBinaryPK(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	// Typed snapshot rows: the declared binary(16) width is what the
+	// pad-and-retry pads to (testutil.InsertSnapshot predates column_type).
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable)
+		VALUES (1, '2026-06-01 00:00:00', 'app', 'vault', 'k',   1, 'PRI', 'binary',  'binary(16)',  'NO'),
+		       (1, '2026-06-01 00:00:00', 'app', 'vault', 'val', 2, '',    'varchar', 'varchar(32)', 'YES')`)
+
+	// Baseline: the FULL storage width, padding included — what mydumper
+	// --hex-blob dumps for a BINARY(16) column (the writer decodes the 0x
+	// literal to raw bytes).
+	baseDir := t.TempDir()
+	tsDir := strings.ReplaceAll(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339), ":", "-")
+	dir := filepath.Join(baseDir, tsDir, "app")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cols := []baseline.Column{
+		{Name: "k", MySQLType: "binary", ParquetType: baseline.MysqlToParquetNode("binary")},
+		{Name: "val", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	w, err := baseline.NewWriter(filepath.Join(dir, "vault.parquet"), cols,
+		baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteRow([]string{"0x11223344556677889900AABB00000000", "sealed"}, []bool{false, false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, BaselineDir: baseDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The stripped pk_values spelling — 12 bytes of a 16-byte key.
+	r := reconstructAt(t, srv, "schema=app&table=vault&pk=0x11223344556677889900AABB&at=2026-06-01%2012:00:00&allow_gaps=true")
+	if !r.Found || r.Deleted {
+		t.Fatalf("stripped BINARY(16) spelling: found=%v deleted=%v, want the baseline row (#1157)", r.Found, r.Deleted)
+	}
+	if got := fmt.Sprint(r.State["val"]); got != "sealed" {
+		t.Errorf("state val=%v, want sealed", got)
+	}
+}
