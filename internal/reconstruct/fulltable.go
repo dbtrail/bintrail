@@ -791,15 +791,19 @@ type mergeInput struct {
 // it owns the MydumperWriter and turns each emitted row map into an ordered
 // tuple the writer expects.
 //
-// The writer's Close() is deferred so an early return always releases the
-// file handles. It does NOT undo the run: Close finalizes the current chunk
-// (terminating semicolon, flush) and only unlinks it when that write itself
-// fails, so an early return after rows have been written leaves a complete,
-// loadable chunk holding a PREFIX of the table, plus the schema file. The
-// run-level _INCOMPLETE marker is what tells a consumer not to trust the
-// directory; there is no in-file signal (#1162). The guards that predate the
-// writer opening — #602, #843 — sidestep this by refusing before any file
-// exists; a per-row guard like #1158 cannot.
+// Error-path cleanup (#1162): on a non-nil return the deferred Discard
+// unlinks everything this table's writer created — the in-progress chunk,
+// already-rotated chunks, and the schema file — so a failed table leaves no
+// artifacts on disk. Close would instead FINALIZE the current chunk
+// (terminating semicolon, flush, keep the file), leaving a syntactically
+// valid, loadable chunk holding a PREFIX of the table, with the run-level
+// _INCOMPLETE marker as the only signal — one that myloader and
+// `cat out/*.sql | mysql` never read. The guards that predate the writer
+// opening — #602, #843 — refuse before any file exists; a per-row guard like
+// #1158 fires mid-scan and cannot, which is what makes the discard necessary.
+// The writer tracks only its own table's files, so sibling tables' completed
+// output in the same OutputDir is never touched.
+//
 // GUARD PLACEMENT (#1097) — read before adding a check here.
 //
 // The two guards that inspect an event's BEFORE-image — #592 (residual
@@ -868,12 +872,20 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 	if err != nil {
 		return fmt.Errorf("open mydumper writer: %w", err)
 	}
-	// Defer Close so every error path cleans up the current chunk file.
-	// Close is idempotent; the success path below also calls it explicitly
-	// before capturing rep.Files.
+	// Success finalizes via the explicit Close below (before capturing
+	// rep.Files); ANY error return instead discards every file this writer
+	// wrote — see the #1162 note in the function comment. The discard also
+	// covers a failed explicit Close: its rotated chunks are complete files,
+	// but the table as a whole is not, and a partial table must leave nothing
+	// behind. A removal failure is logged, never returned — it must not
+	// shadow the error that triggered the abort.
 	defer func() {
-		if cerr := mw.Close(); cerr != nil && retErr == nil {
-			retErr = fmt.Errorf("close mydumper writer: %w", cerr)
+		if retErr == nil {
+			return
+		}
+		if derr := mw.Discard(); derr != nil {
+			slog.Warn("could not remove partial mydumper output for failed table",
+				"schema", in.Schema, "table", in.Table, "error", derr)
 		}
 	}()
 
@@ -1552,7 +1564,7 @@ func writeBinlogOnlyChanges(
 	createSQL string,
 	changes map[string]*query.ResultRow,
 	rep *TableReport,
-) error {
+) (retErr error) {
 	// The #592 (unresolved-TOAST) and #782 (PK-changing UPDATE) guards are NOT
 	// here: like the baseline path, this one now streams its window through
 	// foldEventWindow, which runs both per event on the untrimmed event before
@@ -1564,7 +1576,18 @@ func writeBinlogOnlyChanges(
 	if err != nil {
 		return fmt.Errorf("open mydumper writer: %w", err)
 	}
-	defer func() { _ = mw.Close() }() // no-op after the explicit Close below on the happy path
+	// Same #1162 error-path discard as mergeBaselineIntoWriter: this path has
+	// no pre-writer guards at all, so any mid-write failure would otherwise
+	// finalize a loadable, silently-truncated chunk plus the schema file.
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if derr := mw.Discard(); derr != nil {
+			slog.Warn("could not remove partial mydumper output for failed table",
+				"schema", schema, "table", table, "error", derr)
+		}
+	}()
 
 	if err := mw.WriteSchema(createSQL); err != nil {
 		return err

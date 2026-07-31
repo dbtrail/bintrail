@@ -175,6 +175,43 @@ func (w *MydumperWriter) Files() []string {
 	return w.files
 }
 
+// Discard aborts the writer on a caller-side failure: it closes the current
+// chunk file WITHOUT finalizing it and unlinks every file this writer created
+// — the in-progress chunk, already-rotated chunks, and the schema file — so a
+// failed table leaves no artifacts on disk (#1162). This is the counterpart
+// Close cannot be: Close FINALIZES the current chunk (terminating ";\n",
+// flush, keep the file), so calling it on an error path leaves a
+// syntactically valid, loadable chunk holding a PREFIX of the table next to
+// its schema file, with no in-file signal that it is truncated — and the
+// mydumper-output consumers (myloader, `cat *.sql | mysql`) never read the
+// directory-level _INCOMPLETE marker.
+//
+// The writer tracks only its own table's files, so in a multi-table run
+// Discard cannot touch a sibling table's completed output. Removal is
+// per-file best-effort: every failure is collected and returned joined so the
+// caller can log it WITHOUT shadowing the original error that triggered the
+// abort. Marks the writer terminal (subsequent WriteRow returns
+// ErrWriterClosed); idempotent, and a no-op after a Discard that already ran.
+func (w *MydumperWriter) Discard() error {
+	if w.curFile != nil {
+		// Drop buffered bytes on the floor and release the handle; the file
+		// itself is unlinked below, so a close error changes nothing.
+		_ = w.curFile.Close()
+		w.curFile = nil
+		w.curBuf = nil
+	}
+	var errs []error
+	for _, name := range w.files {
+		path := filepath.Join(w.outputDir, name)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	w.files = nil
+	w.closed = true
+	return errors.Join(errs...)
+}
+
 // openChunk creates the next <db>.<table>.NNNNN.sql file and writes the
 // INSERT prefix. Called on first WriteRow and after each rotation.
 func (w *MydumperWriter) openChunk() error {
