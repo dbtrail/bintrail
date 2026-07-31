@@ -60,14 +60,15 @@ Three things to know:
   instead of reporting them `inconclusive`. One wrinkle is handled for you: a
   fixed `BINARY(n)` column is padded with `0x00` on storage but the binlog row
   image drops that padding, so the two stores want the key spelled differently.
-  The baseline reader re-pads the key to its declared width when the exact
-  lookup misses, so the stripped `pk_values` spelling — the one `bintrail
-  query`, the console events view, and the MCP `query` tool display — resolves
-  on every surface that reads the index: `reconstruct --pk`, the console
-  `/api/reconstruct`, and the MCP `reconstruct` tool
-  ([#1157](https://github.com/dbtrail/dbtrail/issues/1157)). The CLI
-  additionally trims a full-width `SELECT CONCAT('0x', HEX(pk_col))` key back
-  to the stored spelling for its event fetch, so either form works there. The
+  All three index-reading surfaces — `reconstruct --pk`, the console
+  `/api/reconstruct`, and the MCP `reconstruct` tool — reconcile both
+  directions ([#1157](https://github.com/dbtrail/dbtrail/issues/1157)): the
+  baseline reader re-pads the key to its declared width when the exact lookup
+  misses, and the event fetch re-spells it back to the stored `pk_values` form
+  (stripped, uppercase). So the stripped spelling the events views display, a
+  lowercase paste of it, and the full-width
+  `SELECT CONCAT('0x', HEX(pk_col))` form all resolve — and all fold the
+  post-baseline deltas, never silently answering with baseline-era state. The
   declared width is read from the schema snapshot in effect when the baseline
   was taken, so widening the key with a later `ALTER` does not break lookups
   against older baselines

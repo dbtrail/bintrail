@@ -348,9 +348,17 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	//    deltas, at) reconstructs it correctly. Reporting found=false before
 	//    fetching would mislabel that common case as "never existed".
 	opts := query.Options{
-		Schema:   schema,
-		Table:    table,
-		PKValues: pk,
+		Schema: schema,
+		Table:  table,
+		// The event fetch matches binlog_events.pk_values, which stores a
+		// fixed BINARY(n) key stripped of its 0x00 padding and uppercased —
+		// while the baseline lookup above reconciles the OTHER direction
+		// (re-pad). Without this respell, a lowercase or full-width hex key
+		// resolves the baseline but fetches ZERO events, and the fold silently
+		// presents baseline-era state as the state at `at` — a fail-loud to
+		// fail-silent regression (#1155's indexPKSpelling hazard, same as the
+		// CLI).
+		PKValues: reconstruct.IndexPKSpelling(pk, pkMetas),
 		Since:    &snapshotTime,
 		Until:    &atTime,
 		Order:    "", // ASC: ApplyAt/BuildHistory require chronological input.

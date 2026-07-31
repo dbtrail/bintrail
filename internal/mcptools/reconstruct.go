@@ -335,9 +335,18 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 		//    "never existed".
 		fmOpts := query.FetchMergedOptions{
 			Opts: query.Options{
-				Schema:   args.Schema,
-				Table:    args.Table,
-				PKValues: args.PK,
+				Schema: args.Schema,
+				Table:  args.Table,
+				// The event fetch matches binlog_events.pk_values, which
+				// stores a fixed BINARY(n) key stripped of its 0x00 padding
+				// and uppercased — while the baseline lookup above reconciles
+				// the OTHER direction (re-pad). Without this respell, a
+				// lowercase or full-width hex key resolves the baseline but
+				// fetches ZERO events, and the fold silently presents
+				// baseline-era state as the state at `at` — a fail-loud to
+				// fail-silent regression (#1155's indexPKSpelling hazard,
+				// same as the CLI).
+				PKValues: reconstruct.IndexPKSpelling(args.PK, pkMetas),
 				Since:    &snapshotTime,
 				Until:    &atTime,
 				Order:    "", // ASC: ApplyAt/BuildHistory require chronological input.
