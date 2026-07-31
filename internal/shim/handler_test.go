@@ -1929,7 +1929,12 @@ func runHandshakeTest(t *testing.T, serverUser, serverPass, clientUser, clientPa
 	// Server side: accept one connection, perform handshake, then loop
 	// HandleCommand until the client disconnects. SetReadDeadline
 	// guarantees the loop unblocks even if the client's TCP close does
-	// not propagate immediately, so the test can never hang.
+	// not propagate immediately, so the test can never hang. It is a
+	// BACKSTOP only — the normal exit is the EOF from the client's close —
+	// but it also covers every read of the handshake itself, so it must be
+	// generous: at 3s a loaded machine could stall the multi-round-trip
+	// auth past the deadline, aborting the handshake server-side and
+	// handing the client an I/O error instead of "Access denied" (#1164).
 	serverErr := make(chan error, 1)
 	go func() {
 		c, err := listener.Accept()
@@ -1938,7 +1943,7 @@ func runHandshakeTest(t *testing.T, serverUser, serverPass, clientUser, clientPa
 			return
 		}
 		defer c.Close()
-		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		c.SetReadDeadline(time.Now().Add(30 * time.Second))
 		h := NewHandler(nil, nil)
 		h.UseDB("myapp")
 		srv := server.NewDefaultServer()
@@ -1965,17 +1970,21 @@ func runHandshakeTest(t *testing.T, serverUser, serverPass, clientUser, clientPa
 		clientErr <- driveClient(host+":"+port, clientUser, clientPass)
 	}()
 
+	// Both waits are failure detectors, not paced waits: on the green path
+	// the channels are signalled as soon as the handshake resolves. Keep
+	// them generous (30s) so a loaded machine cannot turn scheduling delay
+	// into a spurious failure (#1164).
 	var pingErr error
 	select {
 	case pingErr = <-clientErr:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("client timed out")
 	}
 
 	listener.Close()
 	select {
 	case <-serverErr:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("server goroutine did not exit")
 	}
 	return pingErr

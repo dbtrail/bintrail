@@ -72,6 +72,32 @@ func TestAuditContract_MCP(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:   "recover_cascade tool",
+			action: "recover.cascade",
+			call: func(t *testing.T) {
+				db, mock, err := sqlmock.New()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				// The handler's real call sequence over an empty window: the
+				// parent DELETE fetch, the parent UPDATE fetch, then the
+				// archive-coverage probe (which must succeed and be empty, or
+				// the coverage-unknown caveat makes the call refuse and no
+				// script — hence no emission — is served).
+				mock.ExpectQuery("FROM binlog_events").WillReturnRows(sqlmock.NewRows(recoverToolMockCols))
+				mock.ExpectQuery("FROM binlog_events").WillReturnRows(sqlmock.NewRows(recoverToolMockCols))
+				mock.ExpectQuery("FROM archive_state").WillReturnRows(
+					sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}))
+				cfg := newRecoverToolTarget(db, 0)
+				cfg.RecoverCascade = true
+				res, _, _ := MakeRecoverCascadeTool(cfg)(ctx, nil, RecoverCascadeArgs{Schema: "app", Table: "users"})
+				if res.IsError {
+					t.Fatalf("recover_cascade tool failed: %s", resultText(res))
+				}
+			},
+		},
 	}
 
 	var observed []audittest.Pair

@@ -40,6 +40,10 @@
       "description": "Generate reversal SQL for matching events (never executes it)"
     },
     {
+      "name": "recover_cascade",
+      "description": "Generate reversal SQL for foreign-key ON DELETE / ON UPDATE cascade side effects (never executes it)"
+    },
+    {
       "name": "status",
       "description": "Show index status: files, partitions, continuity, summary"
     },

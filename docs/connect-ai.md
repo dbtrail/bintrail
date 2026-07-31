@@ -12,9 +12,10 @@ plain English — from **Claude Desktop**, claude.ai, or any MCP-capable client:
 This page is the shortest path there. No JSON files, no DSNs, no SSH gymnastics.
 (If you want every option and knob instead, that's [mcp-server.md](mcp-server.md).)
 
-**What the AI can and cannot do, up front:** it gets five **read-only** tools —
-search changes, draft reversal SQL, reconstruct a row's state at a point in time,
-show index status, list schema changes. It sees exactly what the web console
+**What the AI can and cannot do, up front:** it gets six **read-only** tools —
+search changes, draft reversal SQL (including for foreign-key cascade side
+effects), reconstruct a row's state at a point in time, show index status, list
+schema changes. It sees exactly what the web console
 shows you, with the same result caps and the same redactions. It **never executes
 SQL** and never connects to your source database — recovery SQL is text you review
 and run yourself. (Time travel needs a baseline snapshot configured for that
@@ -88,8 +89,8 @@ That's it. No config files were harmed.
 
 ## Step 3 — ask something
 
-Open a new Claude Desktop conversation. The `query`, `recover`, `status`,
-`list_schema_changes`, and `reconstruct` tools are now available. Try:
+Open a new Claude Desktop conversation. The `query`, `recover`, `recover_cascade`,
+`status`, `list_schema_changes`, and `reconstruct` tools are now available. Try:
 
 > "Show me the last 20 changes in the `wordpress` schema."
 >
@@ -145,7 +146,7 @@ directly with a DSN — see [mcp-server.md](mcp-server.md).
 
 - The endpoint requires the console token on **every** request; unknown hosts
   are rejected by the same host-header allowlist as the rest of the console.
-- The five tools are read-only and annotated as such (`ReadOnlyHint`); the AI
+- The six tools are read-only and annotated as such (`ReadOnlyHint`); the AI
   cannot write to the index, the source, or anywhere else through them.
 - Responses carry the console's field redactions — e.g. captured SQL statement
   text is withheld, same as the console UI.

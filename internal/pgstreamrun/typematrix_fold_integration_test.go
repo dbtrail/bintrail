@@ -338,7 +338,7 @@ func TestOne_PGTypeMatrixThroughReconstructFold(t *testing.T) {
 
 			fold := func(id string, wantEvents int) string {
 				t.Helper()
-				row, err := reconstruct.ReadBaselineRow(ctx, path, map[string]string{"id": id})
+				row, err := reconstruct.ReadBaselineRow(ctx, path, map[string]string{"id": id}, nil)
 				if err != nil {
 					t.Fatalf("ReadBaselineRow id=%s: %v", id, err)
 				}

@@ -714,7 +714,9 @@ func ReconstructTable(
 	// baseline-vs-first-event visibility warning. bmeta was read in step 2; the
 	// first event is carried out of the fold because its page is gone by now.
 	if fold.First != nil {
-		WarnBaselineFirstEventGap(query.SourceFlavor(db), bmeta, *fold.First, schema, table)
+		flavor := query.SourceFlavor(db)
+		start, startOK := query.OldestIndexedEvent(db)
+		WarnBaselineFirstEventGap(flavor, bmeta, *fold.First, start, startOK, schema, table)
 	}
 
 	// ── 6. Materialize the baseline locally for DuckDB streaming ───────────

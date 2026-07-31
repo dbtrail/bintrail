@@ -40,12 +40,15 @@ const (
 // the per-table Anchor the text table has no column for.
 //
 // It is the payload of `bintrail verify --format json`, and ONLY that. The
-// console's verify surface (#677) already shipped with a wire shape of its own
-// — console.VerifyTableResult/VerifySummary/VerifyStatus, fed by consoleapp's
-// verifySupervisor, which classifies statuses into buckets itself (including
-// the same default→Error rule normalizeStatus owns here). The two shapes are
-// deliberately NOT unified today; unifying them is follow-up work, not an
-// assumption anything here may rely on.
+// console's verify surface (#677) shipped with a per-table wire shape of its
+// own — console.VerifyTableResult/VerifyStatus, fed by consoleapp's
+// verifySupervisor — but both surfaces share this package's classification:
+// NormalizeStatus decides every table's bucket and Summary.Count tallies it,
+// so the CLI and the console can never disagree on whether a status counts as
+// a pass, a failure, or "couldn't tell" (#1127). The console's summary mirrors
+// this package's Summary field-for-field (console cannot import this package —
+// it must not link the capture library — so consoleapp publishes the tally via
+// a compile-checked struct conversion).
 //
 // It is still built in this package rather than in the command layer so the
 // construction stays pure — NewReport does no IO, reads no flags, writes no
@@ -110,13 +113,34 @@ type TableReport struct {
 	ChainsInconclusive int `json:"chains_inconclusive,omitempty"`
 }
 
-// Summary is the run's per-status counts.
+// Summary is the run's per-status counts. The console's VerifySummary mirrors
+// it field-for-field (enforced by a struct conversion in consoleapp), so both
+// machine-readable surfaces tally with the same buckets and field names.
 type Summary struct {
 	Match        int `json:"match"`
 	Mismatch     int `json:"mismatch"`
 	Inconclusive int `json:"inconclusive"`
 	Error        int `json:"error"`
 	Total        int `json:"total"`
+}
+
+// Count files one table's status under its summary bucket and bumps Total.
+// The status is normalized first, so an unrecognized value lands in Error —
+// every summary, CLI or console, applies the default-to-failure rule from the
+// one place that owns it (NormalizeStatus) instead of re-deciding it locally.
+func (s *Summary) Count(status Status) {
+	normalized, _ := NormalizeStatus(status, "")
+	switch normalized {
+	case StatusMatch:
+		s.Match++
+	case StatusMismatch:
+		s.Mismatch++
+	case StatusInconclusive:
+		s.Inconclusive++
+	case StatusError:
+		s.Error++
+	}
+	s.Total++
 }
 
 // ExplainReport is the JSON-facing form of a MismatchExplanation. The internal
@@ -172,17 +196,8 @@ func NewReport(mode string, results []TableResult) *Report {
 
 	rep := &Report{Mode: mode, Tables: make([]TableReport, 0, len(sorted))}
 	for _, r := range sorted {
-		status, reason := normalizeStatus(r.Status, r.Detail)
-		switch status {
-		case StatusMatch:
-			rep.Summary.Match++
-		case StatusMismatch:
-			rep.Summary.Mismatch++
-		case StatusInconclusive:
-			rep.Summary.Inconclusive++
-		default:
-			rep.Summary.Error++
-		}
+		status, reason := NormalizeStatus(r.Status, r.Detail)
+		rep.Summary.Count(status)
 		rep.Tables = append(rep.Tables, TableReport{
 			Schema:            r.Schema,
 			Table:             r.Table,
@@ -199,7 +214,6 @@ func NewReport(mode string, results []TableResult) *Report {
 			ChainsInconclusive: r.ChainsInconclusive,
 		})
 	}
-	rep.Summary.Total = len(rep.Tables)
 	rep.Verdict = verdictOf(rep.Summary)
 	return rep
 }
@@ -217,12 +231,14 @@ func NewNoPredecessorReport(mode, baselineSource, message string) *Report {
 	}
 }
 
-// normalizeStatus maps a TableResult status onto the canonical status a
-// consumer sees. An unrecognized status (including the zero value) is reported
-// as an error, never filed under the benign inconclusive bucket — a verify
-// tool's job is to not hand out false assurance — and the raw value is kept in
-// the reason so the cause is not lost.
-func normalizeStatus(s Status, detail string) (Status, string) {
+// NormalizeStatus maps a TableResult status onto the canonical status a
+// consumer sees — the ONE status→bucket decision every verify surface uses
+// (the CLI report here, the console wire path in consoleapp; #1127). An
+// unrecognized status (including the zero value) is reported as an error,
+// never filed under the benign inconclusive bucket — a verify tool's job is
+// to not hand out false assurance — and the raw value is kept in the reason
+// so the cause is not lost.
+func NormalizeStatus(s Status, detail string) (Status, string) {
 	switch s {
 	case StatusMatch, StatusMismatch, StatusInconclusive, StatusError:
 		return s, detail

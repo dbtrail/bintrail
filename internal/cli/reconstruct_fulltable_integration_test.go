@@ -3,8 +3,11 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +32,15 @@ import (
 // Passing this test means: the dump directory is restorable with a plain
 // mysql client, the merge semantics are correct, and the archive fetch
 // path actually provides events that were dropped from live MySQL.
+//
+// #1129: the reconstruct is run three times, at --fetch-batch-size 0
+// (the 100000 default = one page over this fixture), 1, and 2, and the
+// emitted dumps must be byte-identical across all three. Batch size 1 puts
+// a page boundary after every event — including between the two same-second
+// event pairs — so keyset tie-handling, cross-page last-write-wins, the
+// decoder state reused across pages, and the #843 image-column intersection
+// accumulating across pages are all exercised on every event. Any paging
+// off-by-one (skipped or duplicated event) produces a dump diff.
 func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
@@ -87,7 +99,8 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	}
 
 	// ── 3. Set up partitions and insert events ──────────────────────────
-	// Event matrix:
+	// Event matrix (4 events; the pairs at ts1 and ts2 share a second, so
+	// keyset paging at batch size 1 must break the tie on event_id):
 	//   id=2 UPDATE (h1) start-2 → paid   (will be in archive)
 	//   id=3 DELETE (h1)         start-3  (will be in archive)
 	//   id=4 INSERT (h2) new-4            (live; not in baseline)
@@ -112,6 +125,7 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 		"testdb", "orders", 2 /* UPDATE */, "2", nil,
 		[]byte(`{"id":2,"status":"paid"}`),
 		[]byte(`{"id":2,"status":"shipped"}`))
+	const wantEventsApplied = 4
 
 	// ── 4. Archive h1 and drop it from live MySQL ────────────────────────
 	archiveDir := t.TempDir()
@@ -139,29 +153,29 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	orig := captureRecFlags()
 	t.Cleanup(func() { applyRecFlags(orig) })
 
-	// #187 uses a separate set of flag variables, all of which we must reset
-	// after the test. Save them explicitly.
+	// #187/#1097 use a separate set of flag variables, all of which we must
+	// reset after the test. Save them explicitly.
 	savedOutputFormat := recOutputFormat
 	savedOutputDir := recOutputDir
 	savedTables := recTables
 	savedChunkSize := recChunkSize
 	savedParallelism := recParallelism
+	savedFetchBatch := recFetchBatch
 	t.Cleanup(func() {
 		recOutputFormat = savedOutputFormat
 		recOutputDir = savedOutputDir
 		recTables = savedTables
 		recChunkSize = savedChunkSize
 		recParallelism = savedParallelism
+		recFetchBatch = savedFetchBatch
 	})
 
-	outputDir := t.TempDir()
 	recIndexDSN = testutil.SnapshotDSN(dbName)
 	recBaselineDir = baselineDir
 	recBaselineS3 = ""
 	recAllowGaps = false
 	recNoArchive = false
 	recOutputFormat = "mydumper"
-	recOutputDir = outputDir
 	recTables = "testdb.orders"
 	recChunkSize = "256MB"
 	recParallelism = 1
@@ -172,11 +186,77 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	reconstructCmd.SetContext(context.Background())
 	t.Cleanup(func() { reconstructCmd.SetContext(nil) })
 
-	if err := runReconstruct(reconstructCmd, nil); err != nil {
-		t.Fatalf("runReconstruct: %v", err)
+	// #1129: run the identical reconstruct at three page sizes into three
+	// output directories. Batch size 0 is the 100000 default (one page over
+	// this fixture — the pre-#1129 coverage); 1 and 2 force multi-page runs
+	// over both the archive and live sources.
+	batchSizes := []int{0, 1, 2}
+	outDirs := make([]string, len(batchSizes))
+	eventsApplied := make([]int64, len(batchSizes))
+	for i, bs := range batchSizes {
+		outDirs[i] = t.TempDir()
+		recOutputDir = outDirs[i]
+		recFetchBatch = bs
+
+		// runReconstruct returns only an error; the per-table report reaches
+		// the CLI layer as the "table dump complete" slog summary, so capture
+		// logs to assert EventsApplied. slog.SetDefault mutates process-global
+		// state — do not t.Parallel() this test.
+		var logBuf bytes.Buffer
+		prevLogger := slog.Default()
+		t.Cleanup(func() { slog.SetDefault(prevLogger) })
+		slog.SetDefault(slog.New(slog.NewJSONHandler(&logBuf, nil)))
+		err := runReconstruct(reconstructCmd, nil)
+		slog.SetDefault(prevLogger)
+		if err != nil {
+			t.Fatalf("runReconstruct (fetch-batch-size=%d): %v", bs, err)
+		}
+		eventsApplied[i] = eventsAppliedFromLogs(t, logBuf.Bytes(), bs)
 	}
 
-	// ── 6. Inspect the output directory ──────────────────────────────────
+	// Every page size must observe exactly the four indexed events — a paging
+	// bug that skips or duplicates an event shows up here even if the dump
+	// happens to come out right (e.g. a duplicated no-op re-apply).
+	for i, bs := range batchSizes {
+		if eventsApplied[i] != wantEventsApplied {
+			t.Errorf("fetch-batch-size=%d: events_applied = %d, want %d",
+				bs, eventsApplied[i], wantEventsApplied)
+		}
+	}
+
+	// ── 6. The emitted dumps must be byte-identical across page sizes ────
+	// The only nondeterministic content in the output directory is the
+	// "# Started dump at:" wall-clock line in the metadata file
+	// (WriteMetadataFile); readDumpDir strips exactly that line and the rest
+	// is compared byte-for-byte.
+	refDump := readDumpDir(t, outDirs[0])
+	if len(refDump) == 0 {
+		t.Fatal("reference run emitted no output files; byte-identity below would compare nothing")
+	}
+	for i := 1; i < len(batchSizes); i++ {
+		gotDump := readDumpDir(t, outDirs[i])
+		for name := range refDump {
+			if _, ok := gotDump[name]; !ok {
+				t.Errorf("fetch-batch-size=%d: missing output file %s", batchSizes[i], name)
+			}
+		}
+		for name, got := range gotDump {
+			want, ok := refDump[name]
+			if !ok {
+				t.Errorf("fetch-batch-size=%d: unexpected output file %s", batchSizes[i], name)
+				continue
+			}
+			if got != want {
+				t.Errorf("fetch-batch-size=%d: %s differs from fetch-batch-size=%d\n--- batch %d ---\n%s\n--- batch %d ---\n%s",
+					batchSizes[i], name, batchSizes[0], batchSizes[0], want, batchSizes[i], got)
+			}
+		}
+	}
+
+	// ── 7. Inspect one output directory ──────────────────────────────────
+	// Byte-identity above makes the choice of directory immaterial; use the
+	// default-batch run for the restore.
+	outputDir := outDirs[0]
 	schemaFile := filepath.Join(outputDir, "testdb.orders-schema.sql")
 	if _, err := os.Stat(schemaFile); err != nil {
 		t.Fatalf("expected schema file at %s: %v", schemaFile, err)
@@ -190,7 +270,7 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 		t.Fatalf("expected metadata file at %s: %v", metadataFile, err)
 	}
 
-	// ── 7. Apply the dump to a fresh destination within the same DB ──────
+	// ── 8. Apply the dump to a fresh destination within the same DB ──────
 	// Create a second database for restore so we don't clash with the
 	// bintrail index tables. The SQL chunk references `testdb.orders`, so
 	// we use testdb as the restore DB name.
@@ -217,7 +297,7 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	// (`testdb`.`orders`) so they work regardless of the current database.
 	testutil.MustExec(t, db, string(chunkSQL))
 
-	// ── 8. Read the restored rows and assert the merged state ───────────
+	// ── 9. Read the restored rows and assert the merged state ───────────
 	rows, err := db.Query("SELECT id, status FROM `testdb`.`orders` ORDER BY id")
 	if err != nil {
 		t.Fatalf("select restored: %v", err)
@@ -258,4 +338,75 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 			t.Errorf("row %d: got %+v, want %+v", i, got[i], w)
 		}
 	}
+}
+
+// eventsAppliedFromLogs extracts events_applied from the "table dump
+// complete" summary line runReconstructFullTable emits per table. The
+// fixture reconstructs exactly one table, so exactly one such line must
+// exist per run.
+func eventsAppliedFromLogs(t *testing.T, logs []byte, batchSize int) int64 {
+	t.Helper()
+	var found bool
+	var events int64
+	for line := range strings.SplitSeq(string(logs), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("fetch-batch-size=%d: unparseable log line %q: %v", batchSize, line, err)
+		}
+		if rec["msg"] != "table dump complete" {
+			continue
+		}
+		if found {
+			t.Fatalf("fetch-batch-size=%d: more than one 'table dump complete' log line", batchSize)
+		}
+		found = true
+		v, ok := rec["events_applied"].(float64)
+		if !ok {
+			t.Fatalf("fetch-batch-size=%d: 'table dump complete' line lacks numeric events_applied: %q", batchSize, line)
+		}
+		events = int64(v)
+	}
+	if !found {
+		t.Fatalf("fetch-batch-size=%d: no 'table dump complete' log line found in:\n%s", batchSize, logs)
+	}
+	return events
+}
+
+// readDumpDir reads every file in a reconstruct output directory into a
+// name → content map. The metadata file's "# Started dump at:" line is the
+// one wall-clock-dependent byte sequence in the whole output (see
+// WriteMetadataFile), so it is stripped before comparison; everything else
+// is compared verbatim.
+func readDumpDir(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dump dir %s: %v", dir, err)
+	}
+	out := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			t.Fatalf("unexpected subdirectory %s in dump dir %s", e.Name(), dir)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatalf("read dump file %s: %v", e.Name(), err)
+		}
+		content := string(data)
+		if e.Name() == "metadata" {
+			var kept []string
+			for line := range strings.SplitSeq(content, "\n") {
+				if strings.HasPrefix(line, "# Started dump at:") {
+					continue
+				}
+				kept = append(kept, line)
+			}
+			content = strings.Join(kept, "\n")
+		}
+		out[e.Name()] = content
+	}
+	return out
 }

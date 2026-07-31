@@ -1,6 +1,6 @@
 // bintrail-mcp is an MCP (Model Context Protocol) server that exposes
-// read-only Bintrail operations as tools: query, recover, reconstruct,
-// status, and list_schema_changes.
+// read-only Bintrail operations as tools: query, recover, recover_cascade,
+// reconstruct, status, and list_schema_changes.
 //
 // By default it communicates over stdio (for use as a subprocess by Claude
 // Code, Cursor, etc.). Pass --http <addr> to start an HTTP server instead,
@@ -92,8 +92,8 @@ func standaloneConfig(resolve mcptools.ResolveTarget) mcptools.Config {
 	return mcptools.Config{
 		Version: mcpVersion,
 		Instructions: "Bintrail MCP server for querying indexed MySQL binlog events, " +
-			"generating recovery SQL, reconstructing a row's state at a point in time, " +
-			"and viewing index status. " +
+			"generating recovery SQL (including reversal of foreign-key cascade side effects), " +
+			"reconstructing a row's state at a point in time, and viewing index status. " +
 			"Set BINTRAIL_INDEX_DSN environment variable or pass index_dsn on each tool call.",
 		Resolve:           resolve,
 		AllowDSNParam:     true,
@@ -105,6 +105,11 @@ func standaloneConfig(resolve mcptools.ResolveTarget) mcptools.Config {
 		// long-lived per-server configuration.
 		Reconstruct:         true,
 		AllowBaselineParams: true,
+		// FK-cascade recovery (#1128). Registered unconditionally — unlike
+		// reconstruct it needs no baseline (Phase-1 window-only synthesis);
+		// the tool's baseline_dir/baseline_s3 parameters (or the env vars
+		// above) merely enable the Phase-2 fallback per call.
+		RecoverCascade: true,
 	}
 }
 

@@ -1,0 +1,184 @@
+package reconstruct
+
+import (
+	"database/sql"
+	"encoding/hex"
+	"log/slog"
+	"maps"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/dbtrail/dbtrail/internal/metadata"
+)
+
+// This file holds the two reconcilers for the one spelling asymmetry a fixed
+// BINARY(n) primary key has (#1155), plus the metadata resolution they need.
+// They moved here from internal/cli (#1157) so every ReadBaselineRow caller —
+// the CLI, the console's /api/reconstruct, and the MCP reconstruct tool —
+// resolves such a key instead of only the CLI.
+//
+// The two run in OPPOSITE directions on purpose, because they target different
+// stores — do not "unify" them:
+//
+//   - IndexPKSpelling TRIMS: binlog_events.pk_values holds the ROW image's
+//     spelling, with every trailing 0x00 stripped.
+//   - padFixedBinaryFilter RE-PADS: the baseline Parquet holds the full n
+//     bytes MySQL padded on storage.
+
+// ResolvePKMetasAt loads schema.table's primary-key column metadata from the
+// schema snapshot in effect at `at` — metadata.EpochAt over the snapshot
+// history, the same per-instant rule the ENUM/SET decode path uses (#475) —
+// rather than from the latest snapshot (#1159). The metas' declared widths
+// drive padFixedBinaryFilter, so the anchor should be the instant whose schema
+// produced the bytes being matched: callers pass the BASELINE snapshot time,
+// because the pad must reach the width the baseline file actually stores. A
+// latest-snapshot width is wrong whenever the column was widened after that
+// instant (BINARY(16) → BINARY(32)): the retry would pad to 32 against a
+// 16-byte stored value and miss silently.
+//
+// When the instant predates every snapshot, EpochAt answers the FIRST epoch —
+// the closest available description; with no epoch history at all, the latest
+// snapshot is used.
+//
+// Best-effort by design: every caller only uses the result to IMPROVE a lookup
+// or an error message, so a missing/unreadable snapshot degrades to nil (no
+// reconciliation — the pre-#1155 behavior) instead of failing a reconstruct
+// that would otherwise have worked.
+func ResolvePKMetasAt(db *sql.DB, schema, table string, at time.Time) []metadata.ColumnMeta {
+	snapshotID := 0 // latest, when the epoch history is unavailable
+	if epochs, err := metadata.LoadSnapshotEpochs(db); err != nil {
+		slog.Debug("could not load schema snapshot epochs for PK metadata; using the latest snapshot", "error", err)
+	} else if id, ok := metadata.EpochAt(epochs, at); ok {
+		snapshotID = id
+	}
+	res, err := metadata.NewResolver(db, snapshotID)
+	if err != nil {
+		slog.Debug("could not load schema snapshot for PK metadata", "error", err)
+		return nil
+	}
+	tm, err := res.Resolve(schema, table)
+	if err != nil {
+		slog.Debug("could not resolve table for PK metadata", "error", err)
+		return nil
+	}
+	return tm.PKColumnMetas()
+}
+
+// IndexPKSpelling rewrites a user-supplied PK value into the spelling the
+// indexer stored in binlog_events.pk_values, so an event fetch matches what
+// the operator typed.
+//
+// Only fixed-width BINARY(n) components are touched, and this is the INVERSE
+// of padFixedBinaryFilter — the two run in opposite directions on purpose,
+// because they target different stores. Reproducing event.formatPKValue
+// exactly: trailing 0x00 padding is stripped (the ROW image never carries it),
+// and the hex is uppercased, but ONLY when the trimmed bytes are not valid
+// UTF-8 — formatPKValue is content-gated, so a binary key whose bytes are
+// printable ASCII is stored verbatim and must stay that way.
+//
+// Everything else — every other column type, and every component that is
+// already in the stored spelling — is returned untouched, so this cannot
+// disturb a lookup that resolves today.
+func IndexPKSpelling(pk string, pkMetas []metadata.ColumnMeta) string {
+	if pk == "" || len(pkMetas) == 0 {
+		return pk
+	}
+	parts := strings.Split(pk, "|")
+	if len(parts) != len(pkMetas) {
+		// The pk/pk-columns arity is validated against the caller's column
+		// list, not against the snapshot; if the two disagree, leave the
+		// value alone rather than re-spell the wrong component.
+		return pk
+	}
+	changed := false
+	for i, c := range pkMetas {
+		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
+			continue
+		}
+		raw, isHex := decodeHexPKLiteral(parts[i])
+		if !isHex {
+			continue // already the verbatim/stored spelling
+		}
+		trimmed := TrimFixedBinaryPad(raw)
+		var spelled string
+		if utf8.Valid(trimmed) {
+			spelled = string(trimmed)
+		} else {
+			spelled = "0x" + strings.ToUpper(hex.EncodeToString(trimmed))
+		}
+		if spelled != parts[i] {
+			parts[i] = spelled
+			changed = true
+		}
+	}
+	if !changed {
+		return pk
+	}
+	return strings.Join(parts, "|")
+}
+
+// padFixedBinaryFilter re-spells a fixed-width BINARY(n) filter value back to
+// the width the baseline stores, returning false when nothing needs re-spelling.
+//
+// This is the INVERSE of TrimFixedBinaryPad, and the direction is deliberate:
+// pk_values holds the binlog ROW image's spelling, which has every trailing
+// 0x00 stripped, while the baseline Parquet holds the full n bytes MySQL
+// padded on storage. An operator who copies a key out of the index — the
+// workflow #1155 reports — therefore hands us a value SHORTER than the one to
+// match. Re-padding it is exact (MySQL only ever pads a BINARY(n) with 0x00),
+// and ReadBaselineRow only ever attempts it after an exact lookup already came
+// back empty, so it cannot turn a correct hit into a different row.
+func padFixedBinaryFilter(pkFilter map[string]string, pkMetas []metadata.ColumnMeta) (map[string]string, bool) {
+	out := make(map[string]string, len(pkFilter))
+	maps.Copy(out, pkFilter)
+	changed := false
+	for _, c := range pkMetas {
+		if !strings.EqualFold(strings.TrimSpace(c.DataType), "binary") {
+			continue
+		}
+		width := FixedBinaryWidth(c.ColumnType)
+		if width == 0 {
+			// Pre-#212 snapshot with no COLUMN_TYPE: the pad width is
+			// unknowable, so leave the value alone rather than guess.
+			continue
+		}
+		// Filter keys are operator-typed and MySQL column names are
+		// case-insensitive, so an exact-only match would silently skip the
+		// retry for column name `K` against snapshot column `k`. (The lookup
+		// underneath is case-insensitive on both links since #1155: DuckDB
+		// resolves the quoted identifier, and parquetBlobColumns is keyed
+		// lowercase.)
+		key, ok := filterKeyFor(out, c.Name)
+		if !ok {
+			continue
+		}
+		val := out[key]
+		raw, isHex := decodeHexPKLiteral(val)
+		if !isHex {
+			raw = []byte(val)
+		}
+		if len(raw) >= width {
+			continue
+		}
+		padded := make([]byte, width)
+		copy(padded, raw)
+		out[key] = "0x" + strings.ToUpper(hex.EncodeToString(padded))
+		changed = true
+	}
+	return out, changed
+}
+
+// filterKeyFor finds the filter entry naming column col, preferring an exact
+// match and falling back to a case-insensitive one.
+func filterKeyFor(filter map[string]string, col string) (string, bool) {
+	if _, ok := filter[col]; ok {
+		return col, true
+	}
+	for k := range filter {
+		if strings.EqualFold(k, col) {
+			return k, true
+		}
+	}
+	return "", false
+}

@@ -2208,6 +2208,19 @@ func One(ctx context.Context, cfg Config) error {
 		// when binlog_annotate_row_events=ON wrote them to the binlog (#699).
 		// Harmless when the source has annotation off: no events, no cost.
 		syncerCfg.DumpCommandFlag |= replication.BINLOG_SEND_ANNOTATE_ROWS_EVENT
+		// MariaDB 11.4+ writes events that pass through the transaction or
+		// statement cache (TABLE_MAP, row events, ANNOTATE) with LogPos=0 in
+		// the binlog itself — only directly-written events (GTID, XID) carry a
+		// real end position. Without this, every captured row stores
+		// start_pos = 2^64-EventSize (underflow) and end_pos = 0, and the
+		// resume-time dedup (deleteEventsSinceCheckpoint's start_pos >= pos
+		// cut) then deletes every already-indexed row in the checkpoint's file
+		// on every restart (#1117). FillZeroLogPos makes go-mysql recompute
+		// LogPos for those events from the running position (exact, because it
+		// also forces BINLOG_SEND_ANNOTATE_ROWS_EVENT so no in-file event is
+		// missing from the wire). The option is library-gated to the MariaDB
+		// flavor and inert elsewhere.
+		syncerCfg.FillZeroLogPos = true
 	}
 
 	// Use a closure defer so the active syncer is always closed on exit,

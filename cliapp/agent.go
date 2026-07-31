@@ -691,6 +691,12 @@ func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer, fc
 		HeartbeatPeriod:         30 * time.Second,
 		MaxReconnectAttempts:    0,
 		TimestampStringLocation: time.UTC, // see internal/parser/parser.go (#757)
+		// MariaDB 11.4+ zero-LogPos compensation (#1117; see the syncer in
+		// internal/streamrun for the full rationale). Library-gated to the
+		// MariaDB flavor, so it is inert under this syncer's fixed "mysql"
+		// flavor today — set so the site stays correct if the agent ever
+		// grows a flavor flag.
+		FillZeroLogPos: true,
 	}
 	syncer := replication.NewBinlogSyncer(syncerCfg)
 	defer syncer.Close()

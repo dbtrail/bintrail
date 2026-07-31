@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-mysql-org/go-mysql/replication"
+
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
@@ -99,6 +101,49 @@ func TestParseFile_realBinlog_mariadb(t *testing.T) {
 		}
 		if strings.Count(ev.GTID, "-") != 2 || strings.Contains(ev.GTID, ":") {
 			t.Fatalf("indexed GTID %q is not MariaDB domain-server-seq form", ev.GTID)
+		}
+	}
+
+	// #1117: MariaDB 11.4+ writes cache-buffered events (TABLE_MAP, rows,
+	// ANNOTATE) with end_log_pos=0 IN THE FILE ITSELF — the running-offset fill
+	// in ParseFile must reconstruct real positions, never emit the underflowed
+	// start_pos = 2^64-EventSize / end_pos = 0 shape.
+	//
+	// The assertion is EXACT, not merely sane/monotonic: true offsets are
+	// reconstructed independently with a raw go-mysql parser by accumulating
+	// EventSize (a binlog file is contiguous), and every genuine stored
+	// end_log_pos in the file must agree with the accumulation — the
+	// fill-chain → directly-written junction check that catches any
+	// constant-offset inflation a monotonicity check would miss.
+	type span struct{ start, end uint64 }
+	var want []span
+	acc := uint32(4)
+	raw := replication.NewBinlogParser()
+	rawErr := raw.ParseFile(filepath.Join(tmpDir, currentBinlog), 0, func(e *replication.BinlogEvent) error {
+		prev := acc
+		acc += e.Header.EventSize
+		if e.Header.LogPos != 0 && e.Header.LogPos != acc {
+			t.Errorf("accumulated offset %d disagrees with the genuine stored end_log_pos %d of %s — junction mismatch",
+				acc, e.Header.LogPos, e.Header.EventType)
+		}
+		switch e.Header.EventType {
+		case replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2,
+			replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2,
+			replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2:
+			want = append(want, span{uint64(prev), uint64(acc)})
+		}
+		return nil
+	})
+	if rawErr != nil {
+		t.Fatalf("raw ground-truth parse: %v", rawErr)
+	}
+	if len(want) != len(dml) {
+		t.Fatalf("ground truth found %d row events, bintrail emitted %d DML events", len(want), len(dml))
+	}
+	for i, ev := range dml {
+		if ev.StartPos != want[i].start || ev.EndPos != want[i].end {
+			t.Errorf("dml[%d]: positions [%d, %d], want exactly [%d, %d]",
+				i, ev.StartPos, ev.EndPos, want[i].start, want[i].end)
 		}
 	}
 }
