@@ -28,16 +28,17 @@ import (
 // (reconstruct --baseline-only's original bug). That class has no
 // mechanical guard — adding a mode means adding the emission by hand.
 var recordCallSites = map[string]int{
-	"internal/cli/query.go":            1, // cli/query.run
-	"internal/cli/recover.go":          1, // cli/recover.generate
-	"internal/cli/recover_cascade.go":  1, // cli/recover.cascade
-	"internal/cli/reconstruct.go":      1, // cli/reconstruct.run (auditReconstruct — all five modes)
-	"internal/cli/verify.go":           1, // cli/verify.explain
-	"internal/console/audit.go":        1, // console data reads (recordConsoleAudit helper)
-	"internal/console/authz.go":        1, // console/authz.denied + console/profile.denied
-	"internal/mcptools/mcptools.go":    2, // mcp|console query.run + recover.generate
-	"internal/mcptools/reconstruct.go": 1, // mcp|console reconstruct.row
-	"internal/shim/handler.go":         1, // shim/timetravel.query (recordTimeTravel — all three serving layers)
+	"internal/cli/query.go":                1, // cli/query.run
+	"internal/cli/recover.go":              1, // cli/recover.generate
+	"internal/cli/recover_cascade.go":      1, // cli/recover.cascade
+	"internal/cli/reconstruct.go":          1, // cli/reconstruct.run (auditReconstruct — all five modes)
+	"internal/cli/verify.go":               1, // cli/verify.explain
+	"internal/console/audit.go":            1, // console data reads (recordConsoleAudit helper)
+	"internal/console/authz.go":            1, // console/authz.denied + console/profile.denied
+	"internal/mcptools/mcptools.go":        2, // mcp|console query.run + recover.generate
+	"internal/mcptools/reconstruct.go":     1, // mcp|console reconstruct.row
+	"internal/mcptools/recover_cascade.go": 1, // mcp|console recover.cascade
+	"internal/shim/handler.go":             1, // shim/timetravel.query (recordTimeTravel — all three serving layers)
 }
 
 // TestAuditRecordCallSitesAccounted walks the module source tree and asserts
