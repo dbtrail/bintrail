@@ -272,10 +272,10 @@ func (s *verifySupervisor) runBaselineAnchored(req console.VerifyRequest, baseli
 			continue
 		}
 		delete(seen, key)
-		s.appendResult(req.ServerID, console.VerifyTableResult{
-			Schema: st.Schema, Table: st.Table, Status: string(verify.StatusInconclusive),
+		s.appendResult(req.ServerID, toWireResult(verify.TableResult{
+			Schema: st.Schema, Table: st.Table, Status: verify.StatusInconclusive,
 			Detail: "new since the previous baseline — no predecessor image to reconstruct from",
-		})
+		}, false))
 	}
 	for _, st := range prevOnly {
 		key := st.Schema + "." + st.Table
@@ -283,17 +283,17 @@ func (s *verifySupervisor) runBaselineAnchored(req console.VerifyRequest, baseli
 			continue
 		}
 		delete(seen, key)
-		s.appendResult(req.ServerID, console.VerifyTableResult{
-			Schema: st.Schema, Table: st.Table, Status: string(verify.StatusInconclusive),
+		s.appendResult(req.ServerID, toWireResult(verify.TableResult{
+			Schema: st.Schema, Table: st.Table, Status: verify.StatusInconclusive,
 			Detail: "absent from the newest baseline (dropped, or the newest baseline was a --tables subset)",
-		})
+		}, false))
 	}
 	for key := range seen {
 		schema, table, _ := strings.Cut(key, ".")
-		s.appendResult(req.ServerID, console.VerifyTableResult{
-			Schema: schema, Table: table, Status: string(verify.StatusError),
+		s.appendResult(req.ServerID, toWireResult(verify.TableResult{
+			Schema: schema, Table: table, Status: verify.StatusError,
 			Detail: "requested via the tables filter but not present in the latest baseline pair",
-		})
+		}, false))
 	}
 	return nil
 }
@@ -390,9 +390,17 @@ func tableFilter(tables []string) (filter map[string]bool, seen map[string]bool)
 	return filter, seen
 }
 
+// toWireResult maps the engine's TableResult onto the console DTO. Every
+// result — engine-produced or synthesized by the run loop — funnels through
+// here, so the status is always normalized by the one classification the CLI
+// report also uses (verify.NormalizeStatus; #1127). Reason and Detail carry
+// the same value: Reason matches the CLI JSON field name, Detail is the
+// legacy #677 alias.
 func toWireResult(res verify.TableResult, explainable bool) console.VerifyTableResult {
+	status, reason := verify.NormalizeStatus(res.Status, res.Detail)
 	return console.VerifyTableResult{
-		Schema: res.Schema, Table: res.Table, Status: string(res.Status), Detail: res.Detail,
+		Schema: res.Schema, Table: res.Table, Status: string(status),
+		Reason: reason, Detail: reason,
 		SourceRows: res.SourceRows, ReconstructRows: res.ReconstructRows, Anchor: res.Anchor,
 		Explainable: explainable,
 	}
@@ -409,16 +417,13 @@ func (s *verifySupervisor) appendResult(serverID string, tr console.VerifyTableR
 		return // job was cleared out from under us; drop (defensive, shouldn't happen)
 	}
 	j.status.Results = append(j.status.Results, tr)
-	switch verify.Status(tr.Status) {
-	case verify.StatusMatch:
-		j.status.Summary.Match++
-	case verify.StatusMismatch:
-		j.status.Summary.Mismatch++
-	case verify.StatusInconclusive:
-		j.status.Summary.Inconclusive++
-	default:
-		j.status.Summary.Error++
-	}
+	// One classification for every surface: verify.Summary.Count applies the
+	// same buckets (and unknown→Error rule) the CLI's JSON report uses (#1127).
+	// The round-trip struct conversion is the drift guard: it stops compiling
+	// the moment console.VerifySummary and verify.Summary diverge.
+	sum := verify.Summary(j.status.Summary)
+	sum.Count(verify.Status(tr.Status))
+	j.status.Summary = console.VerifySummary(sum)
 }
 
 // cachePair records the BaselinePair behind a mismatched table for a later

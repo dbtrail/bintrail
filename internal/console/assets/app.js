@@ -2315,11 +2315,13 @@ function renderVerifyResults(container, status, id) {
 
   const cards = el("div", { class: "doctor-cards" });
   (status.results || []).forEach((r) => {
-    const cls = VFY_STATUS_CLASS[r.status] || "warn";
+    // Statuses are normalized server-side (verify.NormalizeStatus), so only
+    // the four keys above can arrive; if that ever breaks, fail — never reassure.
+    const cls = VFY_STATUS_CLASS[r.status] || "fail";
     const card = el("div", { class: "doctor-card " + cls });
     card.append(el("span", { class: "dc-mark", text: VFY_STATUS_MARK[cls] || "?" }));
     const body = el("div", { class: "dc-body" },
-      el("div", { class: "dc-name", text: r.schema + "." + r.table + " — " + r.status + (r.detail ? " — " + r.detail : "") }));
+      el("div", { class: "dc-name", text: r.schema + "." + r.table + " — " + r.status + (r.reason ? " — " + r.reason : "") }));
     if (r.explainable) {
       const explainBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Explain" });
       explainBtn.onclick = () => openVerifyExplain(id, r.schema, r.table);

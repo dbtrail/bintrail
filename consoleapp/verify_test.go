@@ -3,6 +3,7 @@ package consoleapp
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/console"
@@ -37,7 +38,8 @@ func TestToWireResult(t *testing.T) {
 	}
 	got := toWireResult(res, true)
 	want := console.VerifyTableResult{
-		Schema: "wp", Table: "posts", Status: "mismatch", Detail: "row count differs",
+		Schema: "wp", Table: "posts", Status: "mismatch",
+		Reason: "row count differs", Detail: "row count differs",
 		SourceRows: 10, ReconstructRows: 9, Anchor: "mysql-bin.000123:456", Explainable: true,
 	}
 	if got != want {
@@ -45,6 +47,21 @@ func TestToWireResult(t *testing.T) {
 	}
 	if got := toWireResult(res, false); got.Explainable {
 		t.Error("explainable must be exactly what the caller passed, not re-derived from Status")
+	}
+
+	// An unrecognized engine status is normalized BEFORE it reaches the wire —
+	// the same verify.NormalizeStatus decision the CLI's JSON report applies,
+	// so the console can never serialize a status a consumer's switch would
+	// fall through (#1127).
+	bad := toWireResult(verify.TableResult{Schema: "wp", Table: "x", Status: "bogus", Detail: "who knows"}, false)
+	if bad.Status != string(verify.StatusError) {
+		t.Errorf("unknown status serialized as %q, want %q", bad.Status, verify.StatusError)
+	}
+	if !strings.Contains(bad.Reason, "unrecognized verify status") || !strings.Contains(bad.Reason, "who knows") {
+		t.Errorf("unknown status reason lost the cause: %q", bad.Reason)
+	}
+	if bad.Detail != bad.Reason {
+		t.Errorf("detail (legacy alias) = %q, must equal reason %q", bad.Detail, bad.Reason)
 	}
 }
 
@@ -88,9 +105,9 @@ func TestVerifySupervisor_Trigger_collision(t *testing.T) {
 
 // TestVerifySupervisor_appendResult_accumulatesSummary: results grow in
 // call order and each status bucket (including an unrecognized status
-// falling through to Error, mirroring the CLI's anti-false-assurance
-// classification in verify.normalizeStatus) is tallied correctly — this is the
-// exact bookkeeping "as they land" polling depends on.
+// falling through to Error — the tally goes through verify.Summary.Count,
+// the same classification the CLI's JSON report uses) is tallied correctly —
+// this is the exact bookkeeping "as they land" polling depends on.
 func TestVerifySupervisor_appendResult_accumulatesSummary(t *testing.T) {
 	s := newVerifySupervisor(context.Background())
 	s.jobs["srv1"] = &verifyJob{status: console.VerifyStatus{State: "running"}}
@@ -104,7 +121,7 @@ func TestVerifySupervisor_appendResult_accumulatesSummary(t *testing.T) {
 	if len(got.Results) != 4 || got.Results[0].Table != "posts" || got.Results[3].Table != "bad" {
 		t.Fatalf("Results = %+v, want 4 entries in append order", got.Results)
 	}
-	want := console.VerifySummary{Match: 1, Mismatch: 1, Inconclusive: 1, Error: 1}
+	want := console.VerifySummary{Match: 1, Mismatch: 1, Inconclusive: 1, Error: 1, Total: 4}
 	if got.Summary != want {
 		t.Errorf("Summary = %+v, want %+v (an unrecognized status must fall through to Error)", got.Summary, want)
 	}
