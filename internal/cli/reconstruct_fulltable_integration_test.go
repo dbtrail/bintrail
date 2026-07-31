@@ -204,6 +204,7 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 		// state — do not t.Parallel() this test.
 		var logBuf bytes.Buffer
 		prevLogger := slog.Default()
+		t.Cleanup(func() { slog.SetDefault(prevLogger) })
 		slog.SetDefault(slog.New(slog.NewJSONHandler(&logBuf, nil)))
 		err := runReconstruct(reconstructCmd, nil)
 		slog.SetDefault(prevLogger)
@@ -229,6 +230,9 @@ func TestRunReconstruct_fullTableRoundTrip(t *testing.T) {
 	// (WriteMetadataFile); readDumpDir strips exactly that line and the rest
 	// is compared byte-for-byte.
 	refDump := readDumpDir(t, outDirs[0])
+	if len(refDump) == 0 {
+		t.Fatal("reference run emitted no output files; byte-identity below would compare nothing")
+	}
 	for i := 1; i < len(batchSizes); i++ {
 		gotDump := readDumpDir(t, outDirs[i])
 		for name := range refDump {
