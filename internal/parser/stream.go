@@ -160,6 +160,12 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	// RotateEvent, to detect a same-file position wraparound (#845) live,
 	// during streaming — see the check at the top of handleEvent below.
 	var lastLogPos uint32
+	// fillCorr undoes the post-reconnect position overshoot FillZeroLogPos
+	// introduces when a resume lands mid-transaction on a MariaDB 11.4+
+	// source (#1117) — see resumeFillCorrector. It runs BEFORE the
+	// wraparound guard below so the guard (and everything downstream) only
+	// ever sees true file offsets.
+	var fillCorr resumeFillCorrector
 	// currentQueryText holds the original SQL statement from the most recent
 	// ROWS_QUERY_EVENT (MySQL, binlog_rows_query_log_events=ON) or
 	// ANNOTATE_ROWS event (MariaDB, binlog_annotate_row_events=ON; the syncer
@@ -226,6 +232,15 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	// a graceful nil.
 	var handleEvent func(binlogEv *replication.BinlogEvent) error
 	handleEvent = func(binlogEv *replication.BinlogEvent) error {
+		// Post-reconnect fill correction (#1117) — must run before the
+		// wraparound guard so both the guard and the emitted events see true
+		// file offsets, not FillZeroLogPos's ghost-FDE overshoot.
+		if fillCorr.Observe(binlogEv) {
+			sp.logger.Debug("corrected a dynamically-filled binlog position inflated by the post-reconnect FDE overshoot",
+				"file", currentFile,
+				"event_type", binlogEv.Header.EventType.String(),
+				"pos", binlogEv.Header.LogPos)
+		}
 		// EventHeader.LogPos is a uint32 wire field (4 bytes, the SAME
 		// COM_BINLOG_DUMP format limit resolveStartForFlavor guards on resume,
 		// internal/streamrun/streamrun.go) — the position immediately after

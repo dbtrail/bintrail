@@ -510,6 +510,144 @@ func TestStreamLoop_mariadbResumeDedupDoesNotDeleteIndexedRows(t *testing.T) {
 	}
 }
 
+// TestStreamParser_mariadbMidTransactionResumeExactPositions is the #1117
+// review acceptance: a position-mode resume landing MID-TRANSACTION (a legal
+// #775 statement-boundary checkpoint) on MariaDB 11.4+. The server honors the
+// offset and re-sends the file's FDE with LogPos zeroed; FillZeroLogPos fills
+// that ghost to resumePos+len(FDE), and the transaction tail's cache-buffered
+// events inherit the overshoot until the genuine XID snaps back — so before
+// the resumeFillCorrector, the tail rows were stored inflated by exactly
+// len(FDE) (positions that are not event boundaries — a checkpoint persisting
+// one is a fatal 1236 on the next restart) and the snap-back tripped the
+// wraparound guard, killing the stream on every such resume.
+//
+// The test streams a 3-statement transaction twice: pass 1 from a
+// transaction boundary (known-good positions), pass 2 resuming from the
+// SECOND statement's end (mid-transaction). The tail row's positions in pass
+// 2 must EXACTLY equal pass 1's — the exactness anchor that catches any
+// constant-offset inflation a sane/monotonic check would miss.
+func TestStreamParser_mariadbMidTransactionResumeExactPositions(t *testing.T) {
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	sourceDB, sourceName := testutil.CreateTestMariaDB(t)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (
+		id INT PRIMARY KEY AUTO_INCREMENT, amount DECIMAL(10,2) NOT NULL)`)
+	if _, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName}); err != nil {
+		t.Fatalf("TakeSnapshot: %v", err)
+	}
+	resolver, err := metadata.NewResolver(indexDB, 0)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	binlogFile, binlogPos, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition: %v", err)
+	}
+
+	// One transaction, three statements — each statement is its own
+	// ANNOTATE/TABLE_MAP/rows(STMT_END_F) group in the binlog.
+	tx, err := sourceDB.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	for i := range 3 {
+		if _, err := tx.Exec("INSERT INTO orders (amount) VALUES (?)", float64(i+1)*10.0); err != nil {
+			t.Fatalf("tx insert %d: %v", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	mc, err := drivermysql.ParseDSN(testutil.MariaDBBaseDSN() + "/" + sourceName + "?parseTime=true")
+	if err != nil {
+		t.Fatalf("ParseDSN: %v", err)
+	}
+	hostStr, portStr, _ := net.SplitHostPort(mc.Addr)
+	portN, _ := strconv.ParseUint(portStr, 10, 16)
+
+	// capture streams from (file, pos) with the production syncer config and
+	// returns the parsed events for this test's schema.
+	capture := func(serverID uint32, file string, pos uint32) []parser.Event {
+		t.Helper()
+		syncer := replication.NewBinlogSyncer(replication.BinlogSyncerConfig{
+			ServerID: serverID, Flavor: gomysql.MariaDBFlavor,
+			Host: hostStr, Port: uint16(portN), User: mc.User, Password: mc.Passwd,
+			FillZeroLogPos: true, // #1117 — mirrors the production syncer
+		})
+		defer syncer.Close()
+
+		streamer, syncErr := syncer.StartSync(gomysql.Position{Name: file, Pos: pos})
+		if syncErr != nil {
+			testutil.SkipOrFailMariaDB(t, "StartSync against MariaDB failed: %v", syncErr)
+		}
+
+		sp := parser.NewStreamParser(resolver, parser.Filters{Schemas: map[string]bool{sourceName: true}}, nil)
+		sp.SetFlavor(gomysql.MariaDBFlavor)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		events := make(chan parser.Event, 100)
+		parseErrCh := make(chan error, 1)
+		go func() {
+			defer close(events)
+			parseErrCh <- sp.Run(ctx, streamer, events)
+		}()
+		var got []parser.Event
+		for ev := range events {
+			got = append(got, ev)
+		}
+		if parseErr := <-parseErrCh; parseErr != nil &&
+			!errors.Is(parseErr, context.DeadlineExceeded) &&
+			!errors.Is(parseErr, context.Canceled) {
+			// Before the corrector, the mid-transaction pass died here with
+			// the wraparound false-trip.
+			t.Fatalf("StreamParser error: %v", parseErr)
+		}
+		return got
+	}
+
+	inserts := func(evs []parser.Event) []parser.Event {
+		var rows []parser.Event
+		for _, ev := range evs {
+			if ev.EventType == parser.EventInsert {
+				rows = append(rows, ev)
+			}
+		}
+		return rows
+	}
+
+	// Pass 1: from the pre-transaction boundary — known-good positions.
+	pass1 := inserts(capture(99993, binlogFile, binlogPos))
+	if len(pass1) != 3 {
+		t.Fatalf("pass 1: expected the 3 transaction rows, got %d", len(pass1))
+	}
+	for i := 1; i < 3; i++ {
+		if pass1[i].StartPos < pass1[i-1].EndPos {
+			t.Fatalf("pass 1 rows not contiguous/increasing: %+v", pass1)
+		}
+	}
+
+	// Pass 2: resume from the SECOND statement's end — mid-transaction.
+	midPos := uint32(pass1[1].EndPos)
+	pass2 := inserts(capture(99992, pass1[1].BinlogFile, midPos))
+	if len(pass2) != 1 {
+		t.Fatalf("pass 2 (mid-transaction resume): expected exactly the tail row, got %d rows", len(pass2))
+	}
+	// THE exactness anchor: the tail row's positions after a mid-transaction
+	// resume must byte-for-byte equal the positions a boundary start produced.
+	if pass2[0].StartPos != pass1[2].StartPos || pass2[0].EndPos != pass1[2].EndPos {
+		t.Errorf("mid-transaction resume stored tail row at [%d, %d], want exactly [%d, %d] (constant-offset inflation)",
+			pass2[0].StartPos, pass2[0].EndPos, pass1[2].StartPos, pass1[2].EndPos)
+	}
+	if pass2[0].PKValues != pass1[2].PKValues {
+		t.Errorf("mid-transaction resume replayed pk %q, want %q", pass2[0].PKValues, pass1[2].PKValues)
+	}
+}
+
 // TestDetectMariaDBGTIDGap_livePurge is the discriminator for real MariaDB GTID
 // gap detection. The sqlmock unit tests pin the decision tree; this proves the
 // three live queries (SHOW BINARY LOGS, BINLOG_GTID_POS, @@gtid_binlog_pos)
