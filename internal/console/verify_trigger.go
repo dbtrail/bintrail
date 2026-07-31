@@ -99,7 +99,10 @@ type VerifyTableResult struct {
 // Its fields mirror verify.Summary EXACTLY — same names, types and order —
 // because consoleapp's supervisor tallies through verify.Summary.Count (the
 // one bucket classification, #1127) and publishes here via a struct
-// conversion, which the compiler rejects the moment the two shapes drift.
+// conversion. The compiler rejects that conversion when field names, order,
+// or types drift; struct TAGS are ignored by conversion identity, so a JSON
+// tag rename on either side would NOT be caught — keep the tags in sync by
+// hand.
 // It stays a distinct type only because this package must not import
 // internal/verify (the read layer must not link the capture library —
 // see internal/event's dep guard).
