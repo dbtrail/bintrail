@@ -119,8 +119,16 @@ func TestSnapshotBaseline_FullTableMerge_BinaryPK(t *testing.T) {
 
 	// Key each emitted row by the uppercase hex of its k cell. The wire cell
 	// carries the raw bytes verbatim (fullTableTextCell passes []byte through).
+	rawRows := rowCells(t, res.Resultset)
+	// Count the RAW resultset before deduplicating into the map: a merge that
+	// emits the same row twice (padded baseline row + stripped event row that
+	// collapse to one key, or a byte-identical duplicate) must fail here, not
+	// vanish into the map fold below.
+	if len(rawRows) != 3 {
+		t.Fatalf("full-table _snapshot emitted %d raw rows, want 3: %v", len(rawRows), rawRows)
+	}
 	got := map[string]string{}
-	for _, cells := range rowCells(t, res.Resultset) {
+	for _, cells := range rawRows {
 		if len(cells) != 2 {
 			t.Fatalf("expected 2 columns per row, got %v", cells)
 		}
