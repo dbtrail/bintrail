@@ -14,6 +14,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"github.com/dbtrail/dbtrail/internal/audittest"
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -91,14 +92,30 @@ func TestIntegrationFlashbackRoutesByServer(t *testing.T) {
 	asOf := now.Add(10 * time.Minute).Format("2006-01-02 15:04:05")
 	q := fmt.Sprintf("SELECT * FROM _flashback.users AS OF '%s' WHERE id = 1", asOf)
 
-	for _, tc := range []struct{ user, want string }{
+	// Recording audit sink: the flashback port authenticates on the shared
+	// console token and its username is a server-ROUTING key, so the audit
+	// Actor must be the prefixed "server:<name>" sentinel — never the bare
+	// username, which a sink would misread as a person (#1123).
+	rec := audittest.Install(t)
+
+	routeCases := []struct{ user, want string }{
 		{entA.ID, "alice"},
 		{entB.ID, "bob"},
 		{"srva", "alice"}, // by display name too
 		{"srvb", "bob"},
-	} {
+	}
+	for _, tc := range routeCases {
 		if got := queryFlashbackName(t, ln.Addr().String(), tc.user, "tok", "", q); got != tc.want {
 			t.Errorf("user %q: name = %q, want %q (routed to the wrong index?)", tc.user, got, tc.want)
+		}
+	}
+	auditEvs := rec.Events()
+	if len(auditEvs) != len(routeCases) {
+		t.Fatalf("recorded %d audit events, want %d (one per served query): %+v", len(auditEvs), len(routeCases), auditEvs)
+	}
+	for i, tc := range routeCases {
+		if want := "server:" + tc.user; auditEvs[i].Actor != want {
+			t.Errorf("audit actor for user %q = %q, want %q", tc.user, auditEvs[i].Actor, want)
 		}
 	}
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/dbtrail/dbtrail/internal/audittest"
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/testutil"
@@ -172,6 +173,75 @@ func TestIntegrationReconstructToolPointInTime(t *testing.T) {
 	if r.Found || r.Deleted {
 		t.Errorf("pk=999: found=%v deleted=%v, want neither", r.Found, r.Deleted)
 	}
+}
+
+// TestIntegrationAuditContract_MCPReconstruct is the reconstruct tool's half
+// of the audit contract. The tool's mcp/reconstruct.row emission shipped
+// without a Required row or a contract case — live but undeclared, the exact
+// blindness #1123 documents (CheckCoverage's undeclared arm only fires on an
+// exercised path) — so this pins it, for both surface tags the one handler
+// serves: the standalone "mcp" default and the console's /mcp mount, which
+// re-tags Surface "console" via Config.AuditSurface (the same override
+// mechanism TestAuditContract_MCPSurfaceOverride pins for the query tool).
+//
+// No t.Parallel(): ext's sink is process-wide (audittest.Install).
+func TestIntegrationAuditContract_MCPReconstruct(t *testing.T) {
+	db, dbName, baseDir := seedReconstructIndex(t)
+	rec := audittest.Install(t)
+
+	resolver, err := metadata.NewResolver(db, 0)
+	if err != nil {
+		t.Fatalf("load resolver: %v", err)
+	}
+	cfg := Config{
+		Version:             "test",
+		Reconstruct:         true,
+		AllowBaselineParams: true,
+		Resolve: func(ctx context.Context, _ string) (*Target, error) {
+			return &Target{DB: db, DBName: dbName, Resolver: resolver, ResolverLoaded: true}, nil
+		},
+	}
+	args := ReconstructArgs{
+		Schema: "app", Table: "users", PK: "1",
+		At: "2026-06-01 12:30:00", BaselineDir: baseDir, AllowGaps: true,
+	}
+
+	var observed []audittest.Pair
+	for _, tc := range []struct {
+		name        string
+		surfaceTag  string // Config.AuditSurface; "" = the standalone default
+		wantSurface string
+	}{
+		{name: "standalone mcp", surfaceTag: "", wantSurface: "mcp"},
+		{name: "console /mcp mount", surfaceTag: "console", wantSurface: "console"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec.Reset()
+			c := cfg
+			c.AuditSurface = tc.surfaceTag
+			res, _, _ := MakeReconstructTool(c)(context.Background(), nil, args)
+			if res.IsError {
+				t.Fatalf("reconstruct tool failed: %s", resultText(res))
+			}
+			evs := rec.Events()
+			if len(evs) != 1 {
+				t.Fatalf("recorded %d audit events, want exactly 1: %+v", len(evs), evs)
+			}
+			ev := evs[0]
+			if ev.Surface != tc.wantSurface || ev.Action != "reconstruct.row" {
+				t.Errorf("event = %s/%s, want %s/reconstruct.row", ev.Surface, ev.Action, tc.wantSurface)
+			}
+			if ev.Schema != "app" || ev.Table != "users" {
+				t.Errorf("schema/table = %q/%q, want app/users", ev.Schema, ev.Table)
+			}
+			if ev.Actor == "" {
+				t.Error("actor must not be empty")
+			}
+			observed = append(observed, audittest.Pair{Surface: ev.Surface, Action: ev.Action})
+		})
+	}
+
+	audittest.CheckCoverage(t, audittest.OwnerMCPIntegration, observed)
 }
 
 // TestIntegrationReconstructToolHistory pins history mode: the baseline entry

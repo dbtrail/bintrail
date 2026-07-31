@@ -437,6 +437,11 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		if err := writeReconstructOutput(baselineRow, nil, snapshotTime, at, false, recFormat, os.Stdout); err != nil {
 			return err
 		}
+		auditReconstruct(cmd.Context(), "baseline-only", recSchema, recTable, map[string]string{
+			"pk":     recPK,
+			"at":     at.UTC().Format(time.RFC3339),
+			"format": recFormat,
+		})
 		slog.Info("reconstruct complete",
 			"mode", "baseline-only",
 			"snapshot", snapshotTime.UTC().Format(time.RFC3339),
@@ -935,9 +940,13 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 // names. ext.Record is a no-op unless an embedding distribution installed a
 // sink, and it cannot fail the command (see ext/audit.go).
 //
-// mode distinguishes the four shapes the one command serves: "row"
-// (single-row AS OF), "history" (--history), "full-table" (--output-format
-// mydumper) and "sql" (--sql, a direct read of the baseline Parquet).
+// mode distinguishes the five shapes the one command serves: "row"
+// (single-row AS OF), "history" (--history), "baseline-only"
+// (--baseline-only: the raw baseline row, no deltas applied — it prints a
+// row image straight out of the Parquet snapshot, so it is audited like
+// the others; it was the unaudited fifth mode of #1123), "full-table"
+// (--output-format mydumper) and "sql" (--sql, a direct read of the
+// baseline Parquet).
 // reconstruct has no --profile flag, so the actor carries no RBAC profile.
 func auditReconstruct(ctx context.Context, mode, schema, table string, detail map[string]string) {
 	if detail == nil {

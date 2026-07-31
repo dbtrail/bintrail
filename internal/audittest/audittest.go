@@ -60,6 +60,15 @@ const (
 	// OwnerMCP: internal/mcptools/audit_contract_test.go — the tool handlers
 	// over a sqlmock index.
 	OwnerMCP Owner = "internal/mcptools (unit)"
+	// OwnerMCPIntegration: internal/mcptools/reconstruct_integration_test.go —
+	// the reconstruct tool needs a real index plus a baseline Parquet, so its
+	// contract case lives in the integration tier (which CI runs on every
+	// pull request as a required check).
+	OwnerMCPIntegration Owner = "internal/mcptools (integration)"
+	// OwnerPGShim: internal/pgshim/audit_contract_integration_test.go — the
+	// PostgreSQL wire front-end drives a real pgx client against a seeded
+	// index, the same real-code-path posture as the other owners.
+	OwnerPGShim Owner = "internal/pgshim (integration)"
 )
 
 // Requirement is one emission the core must make, and where it is pinned.
@@ -70,10 +79,13 @@ type Requirement struct {
 	Why string
 }
 
-// Required is the exact set of audit emissions the core guarantees. Adding a
-// surface means adding a row here AND exercising it in that owner's contract
-// test; removing one means deleting the row and correcting the ext/audit.go
-// docstring, which enumerates the same set in prose.
+// Required is the exact set of audit emissions the core guarantees, keyed by
+// (pair, owner) — one pair may appear under two owners when two independent
+// serving layers emit it (shim/timetravel.query: the MySQL command loop and
+// the PostgreSQL front-end). Adding a surface means adding a row here AND
+// exercising it in that owner's contract test; removing one means deleting
+// the row and correcting the ext/audit.go docstring, which enumerates the
+// same set in prose.
 var Required = []Requirement{
 	{
 		Pair:  Pair{Surface: "cli", Action: "query.run"},
@@ -111,9 +123,29 @@ var Required = []Requirement{
 		Why:   "an LLM client generating a reversal script",
 	},
 	{
+		Pair:  Pair{Surface: "mcp", Action: "reconstruct.row"},
+		Owner: OwnerMCPIntegration,
+		Why:   "an LLM client reading point-in-time row state (baseline + deltas)",
+	},
+	{
+		Pair:  Pair{Surface: "console", Action: "reconstruct.row"},
+		Owner: OwnerMCPIntegration,
+		Why:   "the console's /mcp endpoint mounts the same reconstruct handler with Surface console",
+	},
+	{
 		Pair:  Pair{Surface: "shim", Action: "timetravel.query"},
 		Owner: OwnerShim,
 		Why:   "network time-travel reads (_flashback/_snapshot/_diff) by an authenticated tenant",
+	},
+	{
+		// The SAME pair again, under a second owner: bintrail-pg flashback
+		// serves the same virtual schemas through the exported resolve seam,
+		// BYPASSING Handler.HandleQuery — so the MySQL command loop's
+		// contract test proves nothing about this serving layer's emission
+		// (#1123). One pair, two independently pinned emission paths.
+		Pair:  Pair{Surface: "shim", Action: "timetravel.query"},
+		Owner: OwnerPGShim,
+		Why:   "the PostgreSQL wire front-end serves the same row images outside HandleQuery",
 	},
 	{
 		Pair:  Pair{Surface: "console", Action: "query.run"},
@@ -217,10 +249,20 @@ func Install(t *testing.T) *Recorder {
 	return rec
 }
 
-// CheckCoverage fails t unless the observed pairs are exactly the pairs owner
-// is required to emit: every requirement seen at least once (a dropped
-// emission site fails here), and nothing observed that Required does not
-// list (a NEW audited surface has to be declared, not smuggled in).
+// CheckCoverage fails t unless the observed pairs cover the pairs owner is
+// required to emit: every requirement seen at least once, and no observed
+// pair that Required does not list anywhere.
+//
+// Know exactly what that proves (#1123). At-least-once catches a DELETED
+// emission for a pair; it is structurally blind to a NEW unaudited mode of
+// a command that already has an audited one (reconstruct --baseline-only
+// slipped through exactly this way). And the undeclared arm fails only on
+// an undeclared emission FROM AN EXERCISED PATH — an emission on a handler
+// no contract case drives, or a pair declared for a different owner, is
+// invisible here. TestAuditRecordCallSitesAccounted (callsites_test.go) is
+// the source-level backstop for the call-site half of that blindness; a
+// new MODE reusing an existing call site still needs a hand-added emission
+// and contract case.
 func CheckCoverage(t *testing.T, owner Owner, observed []Pair) {
 	t.Helper()
 	want := map[Pair]bool{}

@@ -21,13 +21,20 @@ import (
 //     reconstruct.run, verify.explain. bintrail-pg shares
 //     these command implementations (internal/cli) and so
 //     reports the same "cli" surface; there is no "pg" surface.
-//   - "mcp"     — query.run, recover.generate (internal/mcptools; the
-//     console's /mcp endpoint reuses the same handlers with
-//     Surface "console").
+//   - "mcp"     — query.run, recover.generate, reconstruct.row
+//     (internal/mcptools; the console's /mcp endpoint reuses the
+//     same handlers with Surface "console").
 //   - "shim"    — timetravel.query, for every virtual schema that returns
-//     row images (_flashback, _snapshot, _diff), from the
-//     standalone `bintrail shim` AND the console's embedded
-//     flashback port. Actor is the authenticated MySQL user.
+//     row images (_flashback, _snapshot, _diff), from all THREE
+//     serving layers: the standalone `bintrail shim`, the
+//     console's embedded flashback port, and the PostgreSQL wire
+//     front-end (`bintrail-pg flashback`, internal/pgshim). Actor
+//     is the authenticated per-tenant credential on the standalone
+//     shim and the PG front-end; the console's flashback port
+//     authenticates on the shared console token and its username
+//     is a server-ROUTING key, so its Actor is "server:<name>" —
+//     the routing target, prefixed so a sink cannot mistake it for
+//     a person.
 //   - "console" — query.run, recover.generate, recover.cascade,
 //     reconstruct.run, verify.explain, plus two refusals that
 //     are not data reads: authz.denied (the session's policy
@@ -39,9 +46,11 @@ import (
 //   - metadata-only reads that return no row images: the shim's
 //     SHOW TABLES FROM <virtual schema>, and the console's
 //     status/schemas/capabilities/storage/baselines endpoints.
-//   - `verify` without --explain: it compares fingerprints and reports
-//     match/mismatch per table; only the --explain drill-down surfaces
-//     row-level data, and that is what emits verify.explain.
+//   - `verify` without --explain — including `--check recover`, which
+//     READS before/after images to compare them but reports only per-table
+//     verdicts and chain-break locators (event id, primary key, column
+//     name), never the images themselves. Only the --explain drill-down
+//     surfaces row-level data, and that is what emits verify.explain.
 //   - the capture plane (index, snapshot, stream, agent, rotate,
 //     archive): those write or maintain the index, they do not read
 //     historical row data back out.
@@ -49,7 +58,7 @@ type AuditEvent struct {
 	Time    time.Time         // stamped by Record when zero
 	Surface string            // "cli", "mcp", "shim", "console"
 	Action  string            // e.g. "query.run", "recover.generate"
-	Actor   string            // see ProcessActor; shim uses its authenticated user
+	Actor   string            // see ProcessActor; shim semantics per the Surface list above
 	Schema  string            // schema filter/target, may be empty
 	Table   string            // table filter/target, may be empty
 	Detail  map[string]string // action-specific fields (statements, dry_run, gtid, ...)
