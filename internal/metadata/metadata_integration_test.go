@@ -150,9 +150,11 @@ func TestTakeSnapshot_bothViolations(t *testing.T) {
 // holding a no-PK table and a MyISAM table, the strict TakeSnapshot must still
 // fail (crash-loop prevention lives ONLY in the hook variant), while
 // TakeSnapshotExcludingInvalid must succeed, report exactly the invalid tables
-// as excluded, keep the valid tables capturable, and keep fk_constraints
-// consistent with schema_snapshots (an excluded child's FK rows are dropped;
-// a kept child's FK rows stay).
+// as excluded, keep the valid tables capturable, and KEEP every fk_constraints
+// row — including the excluded child's CASCADE edge, which recover-cascade
+// needs to see to report an honest Incomplete instead of a silent Complete
+// (the cascade-layer half is TestSynthesizeVictims_excludedChildFlagged in
+// internal/cascade).
 func TestTakeSnapshotExcludingInvalid_degrades(t *testing.T) {
 	sourceDB, sourceName := testutil.CreateTestDB(t)
 	indexDB, _ := testutil.CreateTestDB(t)
@@ -164,8 +166,10 @@ func TestTakeSnapshotExcludingInvalid_degrades(t *testing.T) {
 		pid INT,
 		CONSTRAINT fk_ok_child FOREIGN KEY (pid) REFERENCES ok_parent(id) ON DELETE CASCADE
 	) ENGINE=InnoDB`)
-	// Invalid on two different axes — and nopk_child carries an FK, whose
-	// fk_constraints rows must vanish along with its schema_snapshots rows.
+	// Invalid on two different axes — and nopk_child carries a real CASCADE
+	// FK, whose fk_constraints rows must SURVIVE the exclusion (dropping them
+	// would erase the edge and let recover-cascade report Complete over a
+	// genuine cascade).
 	testutil.MustExec(t, sourceDB, `CREATE TABLE nopk_child (
 		pid INT,
 		CONSTRAINT fk_nopk_child FOREIGN KEY (pid) REFERENCES ok_parent(id) ON DELETE CASCADE
@@ -211,7 +215,8 @@ func TestTakeSnapshotExcludingInvalid_degrades(t *testing.T) {
 		t.Errorf("snapshot tables = %v, want [ok_child ok_parent]", snapTables)
 	}
 
-	// fk_constraints: the kept child's FK survives, the excluded child's does not.
+	// fk_constraints: BOTH children's FK rows survive — the excluded child's
+	// edge is the one recover-cascade must still see (#1051 review).
 	var fkTables []string
 	fkRows, err := indexDB.Query(
 		"SELECT DISTINCT table_name FROM fk_constraints WHERE snapshot_id = ? ORDER BY table_name",
@@ -227,11 +232,11 @@ func TestTakeSnapshotExcludingInvalid_degrades(t *testing.T) {
 		}
 		fkTables = append(fkTables, name)
 	}
-	if len(fkTables) != 1 || fkTables[0] != "ok_child" {
-		t.Errorf("fk_constraints tables = %v, want [ok_child]", fkTables)
+	if len(fkTables) != 2 || fkTables[0] != "nopk_child" || fkTables[1] != "ok_child" {
+		t.Errorf("fk_constraints tables = %v, want [nopk_child ok_child]", fkTables)
 	}
-	if stats.FKCount != 1 {
-		t.Errorf("FKCount = %d, want 1", stats.FKCount)
+	if stats.FKCount != 2 {
+		t.Errorf("FKCount = %d, want 2", stats.FKCount)
 	}
 
 	// The resolver loaded from this snapshot sees the valid tables and not the

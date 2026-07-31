@@ -69,6 +69,13 @@ type CascadeFK struct {
 	ReferencedColumn string // parent referenced column (usually its PK)
 	DeleteRule       string // CASCADE, RESTRICT, SET NULL, NO ACTION
 	UpdateRule       string // ON UPDATE rule
+	// ChildAbsentFromSnapshot marks an edge whose child table has NO rows in
+	// the schema snapshot the FK graph was loaded from — a degraded snapshot
+	// excluded it (no explicit PK / non-InnoDB, #1051). Such a child's row
+	// events were never captured, so synthesis can find nothing for it; the
+	// walk must report the recovery as provably partial instead of presenting
+	// the inevitable zero-child scan as a clean Complete.
+	ChildAbsentFromSnapshot bool
 }
 
 // BaselineRow is one child row from a baseline snapshot, with its primary key
@@ -847,6 +854,19 @@ func SynthesizeVictims(
 					}
 					parentOldKey := valToString(oldVal)
 					cascadedHere = true
+					if fk.ChildAbsentFromSnapshot {
+						// #1051: same capture gap as the delete path — the child's
+						// events were never captured, so the scan below is a
+						// guaranteed zero. cascadedHere stays true (the parent's own
+						// reversal is still real and emitted); only the child half
+						// is missing, and that must never be silent.
+						addIncomplete("childabsent:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+							"%s.%s has cascading FK %q but is absent from the schema snapshot "+
+								"(tables without an explicit primary key or not using InnoDB are excluded "+
+								"and their row events never captured); its cascade-affected rows could NOT be reconstructed",
+							fk.Schema, fk.Table, fk.ConstraintName))
+						continue
+					}
 					if depth == 0 {
 						checkKeyChain(fk, pev, parentOldKey, item.rootTS, rootKey,
 							"some ON UPDATE cascade children may NOT be reconstructed")
@@ -936,6 +956,20 @@ func SynthesizeVictims(
 			}
 
 			for _, fk := range byParentDelete[pev.SchemaName+"."+pev.TableName] {
+				if fk.ChildAbsentFromSnapshot {
+					// #1051: the FK snapshot knows this cascading edge, but its
+					// child was excluded from the schema snapshot (no PK /
+					// non-InnoDB) so its row events were never captured. The
+					// candidate scan below can only ever return zero — a capture
+					// gap, not proof of no children — so skip it and report the
+					// recovery as provably partial instead of a silent Complete.
+					addIncomplete("childabsent:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+						"%s.%s has cascading FK %q but is absent from the schema snapshot "+
+							"(tables without an explicit primary key or not using InnoDB are excluded "+
+							"and their row events never captured); its cascade-affected rows could NOT be reconstructed",
+						fk.Schema, fk.Table, fk.ConstraintName))
+					continue
+				}
 				refVal, ok := parentRow[fk.ReferencedColumn]
 				if !ok {
 					// The FK graph (latest snapshot) names a referenced column
@@ -1344,20 +1378,28 @@ func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string, at t
 	if snapID == 0 {
 		return nil, nil
 	}
-	q := `SELECT schema_name, table_name, constraint_name, column_name,
-	       referenced_schema_name, referenced_table_name, referenced_column_name,
-	       delete_rule, update_rule
-	FROM fk_constraints
-	WHERE snapshot_id = ?`
+	// child_absent: the #1051 degraded-snapshot signal — an FK edge whose
+	// child table has no schema_snapshots rows under the SAME snapshot was
+	// excluded from it (no PK / non-InnoDB), so its row events were never
+	// captured. See CascadeFK.ChildAbsentFromSnapshot.
+	q := `SELECT fk.schema_name, fk.table_name, fk.constraint_name, fk.column_name,
+	       fk.referenced_schema_name, fk.referenced_table_name, fk.referenced_column_name,
+	       fk.delete_rule, fk.update_rule,
+	       NOT EXISTS (SELECT 1 FROM schema_snapshots ss
+	                   WHERE ss.snapshot_id = fk.snapshot_id
+	                     AND ss.schema_name = fk.schema_name
+	                     AND ss.table_name = fk.table_name) AS child_absent
+	FROM fk_constraints fk
+	WHERE fk.snapshot_id = ?`
 	args := []any{snapID}
 	if len(schemas) > 0 {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
-		q += " AND schema_name IN (" + placeholders + ")"
+		q += " AND fk.schema_name IN (" + placeholders + ")"
 		for _, s := range schemas {
 			args = append(args, s)
 		}
 	}
-	q += " ORDER BY schema_name, table_name, constraint_name, ordinal_position"
+	q += " ORDER BY fk.schema_name, fk.table_name, fk.constraint_name, fk.ordinal_position"
 
 	rows, err := indexDB.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -1369,7 +1411,7 @@ func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string, at t
 		var fk CascadeFK
 		if err := rows.Scan(&fk.Schema, &fk.Table, &fk.ConstraintName, &fk.Column,
 			&fk.ReferencedSchema, &fk.ReferencedTable, &fk.ReferencedColumn,
-			&fk.DeleteRule, &fk.UpdateRule); err != nil {
+			&fk.DeleteRule, &fk.UpdateRule, &fk.ChildAbsentFromSnapshot); err != nil {
 			return nil, fmt.Errorf("scan cascade FK row: %w", err)
 		}
 		out = append(out, fk)
@@ -1485,13 +1527,18 @@ func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refS
 		return nil, nil
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(refSchemas)), ",")
-	q := `SELECT schema_name, table_name, constraint_name, column_name,
-	       referenced_schema_name, referenced_table_name, referenced_column_name,
-	       delete_rule, update_rule
-	FROM fk_constraints
-	WHERE snapshot_id = ?
-	  AND referenced_schema_name IN (` + placeholders + `)
-	ORDER BY schema_name, table_name, constraint_name, ordinal_position`
+	// child_absent: same #1051 degraded-snapshot signal as LoadCascadeFKs.
+	q := `SELECT fk.schema_name, fk.table_name, fk.constraint_name, fk.column_name,
+	       fk.referenced_schema_name, fk.referenced_table_name, fk.referenced_column_name,
+	       fk.delete_rule, fk.update_rule,
+	       NOT EXISTS (SELECT 1 FROM schema_snapshots ss
+	                   WHERE ss.snapshot_id = fk.snapshot_id
+	                     AND ss.schema_name = fk.schema_name
+	                     AND ss.table_name = fk.table_name) AS child_absent
+	FROM fk_constraints fk
+	WHERE fk.snapshot_id = ?
+	  AND fk.referenced_schema_name IN (` + placeholders + `)
+	ORDER BY fk.schema_name, fk.table_name, fk.constraint_name, fk.ordinal_position`
 	args := make([]any, 0, len(refSchemas)+1)
 	args = append(args, snapID)
 	for _, s := range refSchemas {
@@ -1507,7 +1554,7 @@ func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refS
 		var fk CascadeFK
 		if err := rows.Scan(&fk.Schema, &fk.Table, &fk.ConstraintName, &fk.Column,
 			&fk.ReferencedSchema, &fk.ReferencedTable, &fk.ReferencedColumn,
-			&fk.DeleteRule, &fk.UpdateRule); err != nil {
+			&fk.DeleteRule, &fk.UpdateRule, &fk.ChildAbsentFromSnapshot); err != nil {
 			return nil, fmt.Errorf("scan cascade FK row: %w", err)
 		}
 		out = append(out, fk)

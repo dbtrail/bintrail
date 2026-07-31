@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -833,8 +832,9 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 // TakeSnapshot used by the stream's DDL auto-snapshot hook (#1051). Where
 // TakeSnapshot rejects the whole snapshot when ANY base table in scope is not
 // InnoDB or lacks an explicit primary key, this variant EXCLUDES those tables
-// (and their FK rows) from the snapshot and reports them in
-// SnapshotStats.ExcludedTables so the caller can warn loudly. Rationale: the
+// from the snapshot (their fk_constraints rows are kept — see the comment at
+// the FK insert below) and reports them in SnapshotStats.ExcludedTables so
+// the caller can warn loudly. Rationale: the
 // parser already skips those tables' row events, so they contribute no
 // recoverable data — failing the hook snapshot over them turns any DDL into an
 // indefinite stream crash-loop (the #760 fail-loud abort keeps the checkpoint
@@ -958,22 +958,15 @@ func takeSnapshot(sourceDB, indexDB *sql.DB, schemas []string, excludeInvalid bo
 	if err != nil {
 		return SnapshotStats{}, err
 	}
-	if len(excludedTables) > 0 {
-		// Keep fk_constraints consistent with schema_snapshots: an FK row
-		// whose owning (child) table was excluded above would reference a
-		// table absent from this snapshot, and cascade synthesis would then
-		// try to rebuild rows for a table with no column metadata. FKs FROM a
-		// kept table TO an excluded parent stay — they are factual metadata
-		// about the kept table.
-		keptFKs := fkRows[:0]
-		for _, fk := range fkRows {
-			if slices.Contains(excludedTables, fk.schemaName+"."+fk.tableName) {
-				continue
-			}
-			keptFKs = append(keptFKs, fk)
-		}
-		fkRows = keptFKs
-	}
+	// Excluded tables' fk_constraints rows are deliberately KEPT (#1051
+	// review): an excluded no-PK InnoDB child can carry a real ON DELETE/
+	// UPDATE CASCADE edge, and dropping its rows would erase that edge from
+	// fk_constraints — recover-cascade would then load no edge, synthesize
+	// nothing, and report a clean Complete over a genuine cascade (and
+	// `recover` would lose its cascade-parent hint). The cascade engine
+	// instead detects that an edge's child table has no rows in the snapshot
+	// (CascadeFK.ChildAbsentFromSnapshot) and reports the recovery as
+	// provably partial.
 
 	// ── 2. Write snapshot atomically into the index database ─────────────────
 	if err := ensureSnapshotIDSeqTable(context.Background(), indexDB); err != nil {

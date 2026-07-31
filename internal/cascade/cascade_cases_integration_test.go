@@ -96,6 +96,83 @@ func TestLoadCascadeFKsFromIndex(t *testing.T) {
 	}
 }
 
+// TestSynthesizeVictims_excludedChildFlagged pins the #1051 review fix: a
+// degraded snapshot (metadata.TakeSnapshotExcludingInvalid) KEEPS the
+// fk_constraints rows of an excluded no-PK CASCADE child, the loaders mark the
+// edge ChildAbsentFromSnapshot, and synthesis over a parent DELETE reports the
+// recovery as provably partial — the child's row events were never captured,
+// so its guaranteed zero-candidate scan must never read as a clean Complete.
+// A valid sibling child on the same parent must stay unflagged.
+func TestSynthesizeVictims_excludedChildFlagged(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE parent (id INT PRIMARY KEY) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE ok_child (
+		id INT PRIMARY KEY, pid INT,
+		CONSTRAINT fk_ok FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE
+	) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE nopk_child (
+		pid INT,
+		CONSTRAINT fk_nopk FOREIGN KEY (pid) REFERENCES parent(id) ON DELETE CASCADE
+	) ENGINE=InnoDB`)
+
+	if _, err := metadata.TakeSnapshotExcludingInvalid(sourceDB, indexDB, []string{sourceName}); err != nil {
+		t.Fatalf("TakeSnapshotExcludingInvalid: %v", err)
+	}
+
+	// The production loader (CLI/console path) must still surface the excluded
+	// child's edge, marked absent; the valid child's edge stays unmarked.
+	fks, _, _, err := cascade.LoadCascadeFKsForParent(ctx, indexDB, sourceName, time.Now())
+	if err != nil {
+		t.Fatalf("LoadCascadeFKsForParent: %v", err)
+	}
+	byTable := map[string]cascade.CascadeFK{}
+	for _, fk := range fks {
+		byTable[fk.Table] = fk
+	}
+	nopk, ok := byTable["nopk_child"]
+	if !ok {
+		t.Fatal("excluded child's CASCADE edge must still load from fk_constraints")
+	}
+	if !nopk.ChildAbsentFromSnapshot {
+		t.Error("nopk_child edge must be marked ChildAbsentFromSnapshot")
+	}
+	if okc, ok := byTable["ok_child"]; !ok || okc.ChildAbsentFromSnapshot {
+		t.Errorf("ok_child edge must load unmarked, got %+v (ok=%v)", okc, ok)
+	}
+
+	eng := query.New(indexDB)
+	parentDel := query.ResultRow{
+		SchemaName: sourceName, TableName: "parent", EventType: event.EventDelete,
+		PKValues: "1", RowBefore: map[string]any{"id": float64(1)},
+		EventTimestamp: time.Now(),
+	}
+	res, err := cascade.SynthesizeVictims(ctx, eng, fks,
+		[]query.ResultRow{parentDel}, cascade.Options{})
+	if err != nil {
+		t.Fatalf("SynthesizeVictims: %v", err)
+	}
+	if res.Complete() {
+		t.Fatal("a parent with an excluded CASCADE child must NOT report Complete")
+	}
+	var flagged bool
+	for _, msg := range res.Incomplete {
+		if strings.Contains(msg, "nopk_child") {
+			flagged = true
+		}
+		if strings.Contains(msg, "ok_child") {
+			t.Errorf("valid child must not be flagged: %q", msg)
+		}
+	}
+	if !flagged {
+		t.Errorf("Incomplete must name the excluded child, got: %v", res.Incomplete)
+	}
+}
+
 // TestSynthesizeVictims_ruleGate pins the deliberate non-bug: only ON DELETE
 // CASCADE / SET NULL edges are synthesized. A pure RESTRICT edge and an
 // ON-UPDATE-CASCADE-only edge (the dbtrail conflation) must yield nothing — and,
