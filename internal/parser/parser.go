@@ -932,11 +932,14 @@ func statementDML(queryStr string) (string, bool) {
 
 // statementDMLInScope reports whether a statement-format DML with the given
 // session default database warrants the operator-facing coverage-gap signal
-// (WARN + statement_dml_dropped metric + capture-skip ledger). The statement's
-// target schema is approximated by the QUERY_EVENT's default DB (a bare
-// `INSERT INTO t ...` resolves against it) — a statement CAN qualify a
-// different schema explicitly, so this is a heuristic and the bias is
-// fail-loud: only a schema PROVABLY outside capture scope is silenced (#1000).
+// (WARN + statement_dml_dropped metric + capture-skip ledger). The gate keys
+// on the QUERY_EVENT's session default DB — the schema a bare
+// `INSERT INTO t ...` resolves against — which is a HEURISTIC, not proof: a
+// statement can qualify a different schema explicitly, so
+// `USE legacy; UPDATE shop.orders ...` is silenced under `--schemas shop`
+// even though its target is captured. That is issue #1000's accepted
+// tradeoff (the default DB is the only scope key available in the
+// QUERY_EVENT); genuine ambiguity — an empty default DB — errs loud.
 //
 //   - Empty schema (no session default DB): ambiguous → in scope, warn.
 //   - System schema (isSnapshotExcludedSchema): snapshots always exclude
