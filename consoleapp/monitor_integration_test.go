@@ -411,8 +411,15 @@ func TestIntegrationMonitorSupervisor(t *testing.T) {
 	if st := sup.Status(entry.ID); st.State != "stopped" {
 		t.Errorf("after Stop: state=%+v, want stopped", st)
 	}
+	// Stop returns once the run goroutine has closed lockDB on the client
+	// side, but mysqld releases a GET_LOCK held by a closing session only
+	// when it finishes tearing the session down — asynchronously. A
+	// zero-timeout probe raced that teardown and flaked under CI load
+	// (#1164, twice on main with this exact assertion). GET_LOCK's own
+	// timeout is the event-driven wait: it returns 1 the moment the lock
+	// frees and 0 only if the lock is genuinely still held after 10s.
 	var got int
-	if err := idxDB.QueryRow("SELECT GET_LOCK(?, 0)", "bintrail_monitor_"+entry.ID).Scan(&got); err != nil {
+	if err := idxDB.QueryRow("SELECT GET_LOCK(?, 10)", "bintrail_monitor_"+entry.ID).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
 	if got != 1 {

@@ -244,11 +244,16 @@ func bindFlashbackHandler(ctx context.Context, srv *console.Server, proxy *routi
 	// the INNER handler (routingHandler forwards HandleQuery to it), so its
 	// streamed rows and go-mysql's trailing EOF share one packet sequence.
 	h.BindConn(mysqlConn)
-	// The flashback port routes BY username, so the same value that selected the
-	// target server is also this connection's audit identity — without this bind
-	// every audit event from the console's flashback port would carry the
-	// unbound-actor sentinel (mirrors internal/cli/shim.go's standalone bind).
-	h.BindActor(user)
+	// The flashback port routes BY username: flashbackCreds accepts ANY username
+	// and authenticates on the shared console token alone, so `user` is a server
+	// selector (registry id/name, or the reserved boot id), not a person — every
+	// human holding the token connects under whatever server name they target.
+	// It is still bound as the audit identity (without it every event from this
+	// port would carry the unbound-actor sentinel), but PREFIXED so a sink
+	// treating Actor as a principal cannot attribute the read to a "person"
+	// named after a database (#1123). The standalone shim and the PG front-end
+	// bind their real per-tenant credential, unprefixed.
+	h.BindActor("server:" + user)
 	// Seed the source schema so fully qualified `_flashback.<table>` queries
 	// work without a prior `USE <db>` (mirrors the standalone shim's #263
 	// behaviour). Best-effort: the boot entry has no registry SourceDSN.

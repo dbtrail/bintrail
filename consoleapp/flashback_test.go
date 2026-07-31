@@ -119,13 +119,17 @@ func TestServeFlashbackDrainsActiveConn(t *testing.T) {
 	go func() { done <- serveFlashback(ctx, srv, ln, flashbackConfig{}) }()
 
 	// Read the server's handshake greeting to confirm the accept loop spawned an
-	// in-flight handler goroutine (wg > 0) before cancelling.
+	// in-flight handler goroutine (wg > 0) before cancelling. The deadline and
+	// the drain wait below are failure detectors only — on the green path both
+	// resolve immediately — so they are generous: at 5s a machine loaded with a
+	// full parallel suite plus build/vet starved them into spurious failures
+	// (#1164).
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	if _, err := conn.Read(make([]byte, 1)); err != nil {
 		t.Fatalf("expected a handshake greeting from the flashback port: %v", err)
 	}
@@ -133,7 +137,7 @@ func TestServeFlashbackDrainsActiveConn(t *testing.T) {
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("serveFlashback did not drain the in-flight connection on ctx cancel")
 	}
 }
@@ -217,7 +221,9 @@ func TestStartFlashbackPortBindAndDrain(t *testing.T) {
 	go func() { stop(); close(drained) }()
 	select {
 	case <-drained:
-	case <-time.After(5 * time.Second):
+	// Failure detector, not a paced wait — generous so machine load cannot
+	// starve the drain into a spurious failure (#1164).
+	case <-time.After(30 * time.Second):
 		t.Fatal("flashback drain did not return after ctx cancel (shutdown would hang)")
 	}
 }

@@ -18,8 +18,9 @@ import (
 	"github.com/dbtrail/dbtrail/internal/mcptools"
 )
 
-// The console serves the read-only MCP tools (query, recover, status,
-// list_schema_changes, reconstruct) over Streamable HTTP (#1039, #953):
+// The console serves the read-only MCP tools (query, recover, recover_cascade,
+// status, list_schema_changes, reconstruct) over Streamable HTTP (#1039, #953,
+// #1128):
 //
 //	/mcp                → the default server (same selection rules as the
 //	                      rest of the console, including HideBoot semantics)
@@ -289,8 +290,8 @@ func (s *Server) newMCPServer(id string, pol *ext.AccessPolicy) *mcp.Server {
 	srv := mcptools.NewServer(mcptools.Config{
 		Version: "console",
 		Instructions: "Bintrail console MCP endpoint for querying indexed binlog events, " +
-			"generating recovery SQL, reconstructing a row's state at a point in time, " +
-			"and viewing index status. " +
+			"generating recovery SQL (including reversal of foreign-key cascade side effects), " +
+			"reconstructing a row's state at a point in time, and viewing index status. " +
 			"The target server is chosen by URL path: /mcp for the console's default server, " +
 			"/mcp/{id-or-name} for a named server from the console registry.",
 		Resolve: func(ctx context.Context, _ string) (*mcptools.Target, error) {
@@ -349,6 +350,16 @@ func (s *Server) newMCPServer(id string, pol *ext.AccessPolicy) *mcp.Server {
 		// storage.
 		Reconstruct:         true,
 		AllowBaselineParams: false,
+		// recover_cascade (#1128) is served because the console serves
+		// recover-cascade (free tier, like recover). Its gate is NOT
+		// baselineConfigured — cascade recovery works without a baseline
+		// (Phase-1) — but the same RBAC guard as /api/recover-cascade: the
+		// tool refuses per call under an active profile/deny/redact posture
+		// (cascade synthesis cannot honor redaction). Phase-2 engages per
+		// call from the bundle's FindBaseline exactly like the handler's
+		// cascadeProviderFor(b), baseline parameters rejected like
+		// reconstruct's.
+		RecoverCascade: true,
 		QueryMaxLimit:       func() int { return eventsMaxLimit },
 		RecoverMaxLimit:     recoverMaxLimit,
 		// #849: the console's /mcp recover tool renders the same reversal

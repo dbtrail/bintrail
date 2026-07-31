@@ -215,7 +215,7 @@ func TestReadBaselineRow_binaryPKHexSpelling(t *testing.T) {
 	}
 
 	// The spelling an operator copies out of binlog_events.pk_values.
-	row, err := ReadBaselineRow(ctx, path, map[string]string{"k": "0xB2815CC3C200FF7C0102030405060780"})
+	row, err := ReadBaselineRow(ctx, path, map[string]string{"k": "0xB2815CC3C200FF7C0102030405060780"}, nil)
 	if err != nil {
 		t.Fatalf("ReadBaselineRow: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestReadBaselineRow_binaryPKHexSpelling(t *testing.T) {
 
 	// Lowercase must resolve too — an operator pasting a key from another tool
 	// should not silently get "row not found".
-	row, err = ReadBaselineRow(ctx, path, map[string]string{"k": "0xb2815cc3c200ff7c0102030405060780"})
+	row, err = ReadBaselineRow(ctx, path, map[string]string{"k": "0xb2815cc3c200ff7c0102030405060780"}, nil)
 	if err != nil {
 		t.Fatalf("ReadBaselineRow (lowercase): %v", err)
 	}
@@ -240,7 +240,7 @@ func TestReadBaselineRow_binaryPKHexSpelling(t *testing.T) {
 	// matched as literal text. Decoding by value shape alone (rather than by
 	// the column's actual Parquet type) would silently look for the two bytes
 	// {0x41,0x42} here and return the wrong answer.
-	row, err = ReadBaselineRow(ctx, path, map[string]string{"txt": "0x4142"})
+	row, err = ReadBaselineRow(ctx, path, map[string]string{"txt": "0x4142"}, nil)
 	if err != nil {
 		t.Fatalf("ReadBaselineRow (varchar control): %v", err)
 	}
@@ -250,7 +250,7 @@ func TestReadBaselineRow_binaryPKHexSpelling(t *testing.T) {
 
 	// Control: a bytes-valued key that is NOT present must still miss. Guards
 	// against a decode that accidentally widens the predicate.
-	row, err = ReadBaselineRow(ctx, path, map[string]string{"k": "0xDEADBEEF"})
+	row, err = ReadBaselineRow(ctx, path, map[string]string{"k": "0xDEADBEEF"}, nil)
 	if err != nil {
 		t.Fatalf("ReadBaselineRow (absent): %v", err)
 	}
@@ -263,7 +263,7 @@ func TestReadBaselineRow_binaryPKHexSpelling(t *testing.T) {
 	// must be too. Keyed exactly, a differently-cased --pk-columns binds the
 	// hex as text against a BLOB and silently misses: the one link that cares
 	// about case, on the one PK type this change added.
-	row, err = ReadBaselineRow(ctx, path, map[string]string{"K": "0xB2815CC3C200FF7C0102030405060780"})
+	row, err = ReadBaselineRow(ctx, path, map[string]string{"K": "0xB2815CC3C200FF7C0102030405060780"}, nil)
 	if err != nil {
 		t.Fatalf("ReadBaselineRow (mixed-case column): %v", err)
 	}
@@ -325,7 +325,7 @@ func TestReadBaselineRow_binaryHexTextSymmetry(t *testing.T) {
 	}
 
 	// And the round trip closes: the same spelling an operator types resolves.
-	row, err := ReadBaselineRow(ctx, path, map[string]string{"k": "0xDEADBEEF"})
+	row, err := ReadBaselineRow(ctx, path, map[string]string{"k": "0xDEADBEEF"}, nil)
 	if err != nil {
 		t.Fatalf("ReadBaselineRow: %v", err)
 	}

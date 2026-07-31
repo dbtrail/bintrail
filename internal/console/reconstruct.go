@@ -325,7 +325,15 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "find baseline: "+err.Error())
 		return
 	}
-	baselineRow, err := reconstruct.ReadBaselineRow(ctx, path, pkFilter)
+	// PK column metadata from the snapshot in effect when the baseline was
+	// taken (#1159), enabling the fixed BINARY(n) pad-and-retry inside
+	// ReadBaselineRow (#1155/#1157): a key copied out of the events view
+	// carries the trailing-0x00-stripped pk_values spelling, while the
+	// baseline stores the padded width — without the retry this endpoint
+	// answered "the row did not exist" for such a key while the CLI answered
+	// correctly. Best-effort: nil metas keep the exact-match behavior.
+	pkMetas := reconstruct.ResolvePKMetasAt(b.db, schema, table, snapshotTime)
+	baselineRow, err := reconstruct.ReadBaselineRow(ctx, path, pkFilter, pkMetas)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "read baseline: "+err.Error())
 		return
@@ -340,9 +348,17 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	//    deltas, at) reconstructs it correctly. Reporting found=false before
 	//    fetching would mislabel that common case as "never existed".
 	opts := query.Options{
-		Schema:   schema,
-		Table:    table,
-		PKValues: pk,
+		Schema: schema,
+		Table:  table,
+		// The event fetch matches binlog_events.pk_values, which stores a
+		// fixed BINARY(n) key stripped of its 0x00 padding and uppercased —
+		// while the baseline lookup above reconciles the OTHER direction
+		// (re-pad). Without this respell, a lowercase or full-width hex key
+		// resolves the baseline but fetches ZERO events, and the fold silently
+		// presents baseline-era state as the state at `at` — a fail-loud to
+		// fail-silent regression (#1155's indexPKSpelling hazard, same as the
+		// CLI).
+		PKValues: reconstruct.IndexPKSpelling(pk, pkMetas),
 		Since:    &snapshotTime,
 		Until:    &atTime,
 		Order:    "", // ASC: ApplyAt/BuildHistory require chronological input.

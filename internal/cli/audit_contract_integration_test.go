@@ -106,7 +106,11 @@ func TestIntegrationAuditContract_CLI(t *testing.T) {
 		name   string
 		action string
 		table  string
-		call   func(t *testing.T)
+		// wantMode, when set, pins Detail["mode"] — the per-mode contract the
+		// pair-level CheckCoverage cannot see (#1123: --baseline-only was an
+		// unaudited fifth mode behind an already-covered pair).
+		wantMode string
+		call     func(t *testing.T)
 	}{
 		{
 			name:   "query",
@@ -148,9 +152,10 @@ func TestIntegrationAuditContract_CLI(t *testing.T) {
 			},
 		},
 		{
-			name:   "reconstruct",
-			action: "reconstruct.run",
-			table:  "orders",
+			name:     "reconstruct",
+			action:   "reconstruct.run",
+			table:    "orders",
+			wantMode: "row",
 			call: func(t *testing.T) {
 				_, dbName, dsn, baseDir, snapTime := auditOrdersBaseline(t, false)
 				resetReconstructGlobals(t)
@@ -163,6 +168,24 @@ func TestIntegrationAuditContract_CLI(t *testing.T) {
 				recAt = snapTime.Add(time.Hour).Format("2006-01-02 15:04:05")
 				if err := runReconstruct(newQueryTestCmd(), nil); err != nil {
 					t.Fatalf("runReconstruct: %v", err)
+				}
+			},
+		},
+		{
+			// The fifth reconstruct mode: --baseline-only prints the raw
+			// baseline row (no deltas, no index connection) and used to return
+			// before the emission (#1123).
+			name:     "reconstruct --baseline-only",
+			action:   "reconstruct.run",
+			table:    "orders",
+			wantMode: "baseline-only",
+			call: func(t *testing.T) {
+				_, dbName, _, baseDir, _ := auditOrdersBaseline(t, false)
+				resetReconstructGlobals(t)
+				recSchema, recTable, recPK, recPKColumns = dbName, "orders", "1", "id"
+				recBaselineDir, recBaselineOnly = baseDir, true
+				if err := runReconstruct(newQueryTestCmd(), nil); err != nil {
+					t.Fatalf("runReconstruct --baseline-only: %v", err)
 				}
 			},
 		},
@@ -206,6 +229,9 @@ func TestIntegrationAuditContract_CLI(t *testing.T) {
 			}
 			if ev.Table != tc.table {
 				t.Errorf("table = %q, want %q", ev.Table, tc.table)
+			}
+			if tc.wantMode != "" && ev.Detail["mode"] != tc.wantMode {
+				t.Errorf("detail[mode] = %q, want %q", ev.Detail["mode"], tc.wantMode)
 			}
 			// A locally invoked command has no authenticated caller, so the
 			// actor is the process identity — "os:<user>" per ext.ProcessActor.

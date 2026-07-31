@@ -1,6 +1,7 @@
 // Package mcptools implements the read-only Bintrail MCP tools — query,
-// recover, status, list_schema_changes, and the opt-in reconstruct (#953) —
-// decoupled from how the index connection is obtained.
+// recover, status, list_schema_changes, and the opt-in reconstruct (#953) and
+// recover_cascade (#1128) — decoupled from how the index connection is
+// obtained.
 //
 // Two surfaces consume it:
 //
@@ -182,6 +183,15 @@ type Config struct {
 	// baseline_dir/baseline_s3 parameters) would otherwise advertise a tool
 	// that can only ever error.
 	Reconstruct bool
+	// RecoverCascade registers the recover_cascade tool (#1128). Opt-in per
+	// surface like Reconstruct, but the condition is NOT baseline presence:
+	// cascade recovery degrades meaningfully without a baseline (Phase-1
+	// window-only synthesis still recovers children with an indexed event in
+	// the lookback window), so every surface that serves recover-cascade at
+	// all registers it, and the Phase-2 baseline fallback engages per call
+	// only when a baseline is available (Target.FindBaseline on routed
+	// surfaces; the baseline parameters/environment on the standalone one).
+	RecoverCascade bool
 	// AllowBaselineParams accepts the reconstruct tool's baseline_dir /
 	// baseline_s3 parameters, with BINTRAIL_BASELINE_DIR / BINTRAIL_BASELINE_S3
 	// as the fallback (standalone). When false they are rejected exactly like
@@ -250,7 +260,8 @@ func (c Config) scriptBudgetOverride() (int64, bool) {
 
 // NewServer builds an MCP server exposing the read-only tools bound to cfg:
 // query, recover, status and list_schema_changes always, plus reconstruct when
-// cfg.Reconstruct is set. All tools are annotated read-only + idempotent.
+// cfg.Reconstruct is set and recover_cascade when cfg.RecoverCascade is set.
+// All tools are annotated read-only + idempotent.
 func NewServer(cfg Config) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "bintrail",
@@ -324,6 +335,27 @@ func NewServer(cfg Config) *mcp.Server {
 				IdempotentHint: true,
 			},
 		}, MakeReconstructTool(cfg))
+	}
+
+	// Opt-in (#1128): registered by every surface that serves recover-cascade.
+	// Unlike reconstruct this does NOT depend on a baseline — Phase-1
+	// window-only synthesis works without one — see Config.RecoverCascade.
+	if cfg.RecoverCascade {
+		mcp.AddTool(server, &mcp.Tool{
+			Name: "recover_cascade",
+			Description: "Generate reversal SQL for rows hit by a foreign-key ON DELETE / ON UPDATE " +
+				"CASCADE or SET NULL (dry-run only). InnoDB runs FK cascades below the binlog, so the plain " +
+				"`recover` tool reverses only the parent change and silently misses the cascade-deleted child " +
+				"rows and rewritten/nulled child FKs — this tool synthesizes those from the index and reverses " +
+				"them too. If the synthesis is provably partial the call fails with the reasons unless " +
+				"allow_incomplete is set; always check the `incomplete` list in the result. " +
+				"Review carefully before applying to production.",
+			Annotations: &mcp.ToolAnnotations{
+				Title:          "Generate FK-cascade recovery SQL",
+				ReadOnlyHint:   true,
+				IdempotentHint: true,
+			},
+		}, MakeRecoverCascadeTool(cfg))
 	}
 
 	// Extension tools (mcpext.Register) are added AFTER the built-ins, so a

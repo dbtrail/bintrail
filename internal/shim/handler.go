@@ -395,10 +395,13 @@ func (h *Handler) BindConn(conn packetWriter) {
 // and before serving commands — same lifecycle as BindConn, same
 // no-lock-needed reasoning.
 //
-// Both serving layers must call it: the standalone shim
-// (internal/cli/shim.go) and the console's embedded flashback port
-// (consoleapp/flashback.go), which routes BY username. A handler nobody
-// bound reports unboundActor.
+// All three serving layers must call it: the standalone shim
+// (internal/cli/shim.go), the PostgreSQL wire front-end
+// (internal/pgshim) — both binding their authenticated per-tenant user —
+// and the console's embedded flashback port (consoleapp/flashback.go),
+// which authenticates on the shared console token and routes BY username,
+// so it binds the "server:<name>" routing sentinel instead of a person.
+// A handler nobody bound reports unboundActor.
 func (h *Handler) BindActor(user string) {
 	h.actor = user
 }
@@ -526,6 +529,35 @@ func (h *Handler) auditTimeTravel(q TimeTravelQuery, res *mysql.Result) {
 	if !ext.Auditing() {
 		return
 	}
+	rows := -1
+	if res != nil && res.Resultset != nil {
+		rows = len(res.Resultset.Values)
+	}
+	h.recordTimeTravel(q, rows)
+}
+
+// AuditResolve is the emission for a wire front-end that serves time-travel
+// queries through the exported resolve seam (ResolveFlashbackRow /
+// ResolveSnapshotRow) instead of HandleQuery — today the PostgreSQL
+// front-end (internal/pgshim, #1008), whose command loop renders its own
+// wire format and so never reaches auditTimeTravel. rows is the number of
+// row images rendered to the client; negative omits the count.
+//
+// Same contract as auditTimeTravel: call it on the success path only, after
+// the reply the client asked for has been built, and never on a refusal.
+// Guarded by ext.Auditing() first, so a build with no sink installed pays
+// one nil check per query and allocates nothing.
+func (h *Handler) AuditResolve(q TimeTravelQuery, rows int) {
+	if !ext.Auditing() {
+		return
+	}
+	h.recordTimeTravel(q, rows)
+}
+
+// recordTimeTravel builds and records the shim/timetravel.query event —
+// the shared tail of auditTimeTravel and AuditResolve. Callers must have
+// checked ext.Auditing() already (the zero-allocation hot-path guard).
+func (h *Handler) recordTimeTravel(q TimeTravelQuery, rows int) {
 	actor := h.actor
 	if actor == "" {
 		actor = unboundActor
@@ -545,8 +577,8 @@ func (h *Handler) auditTimeTravel(q TimeTravelQuery, res *mysql.Result) {
 	} else {
 		detail["scope"] = "single_row"
 	}
-	if res != nil && res.Resultset != nil {
-		detail["rows"] = strconv.Itoa(len(res.Resultset.Values))
+	if rows >= 0 {
+		detail["rows"] = strconv.Itoa(rows)
 	}
 	// WithoutCancel: the resultset is already built by the time this runs,
 	// but baseCtx is the per-connection context, canceled on client

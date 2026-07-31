@@ -54,11 +54,80 @@ func GapDetected(flavor string, eventFile string, eventStartPos uint64, baseline
 		(eventFile == baselineFile && eventStartPos > uint64(baselinePos))
 }
 
+// GapVerdict classifies the baseline↔first-event gap decision once both sides
+// carry a comparable position anchor (the skip cases — missing baseline
+// anchor, missing event position — are decided before this, see
+// WarnBaselineFirstEventGap and the single-row switch in cli/reconstruct.go).
+// Produced by DecideBaselineGap; each emitter maps a verdict to its log line.
+type GapVerdict int
+
+const (
+	// GapVerdictNone means stay quiet. Either this table's first event sits
+	// at-or-before the baseline anchor, or the index's earliest surviving
+	// event does (query.OldestIndexedEvent) — which PROVES the index's
+	// coverage begins at or before the baseline, so the space between the
+	// anchor and a quiet table's first event is just "no writes to this
+	// table", not a hole (#1163: a per-table first event is EXPECTED to sit
+	// past the anchor on a healthy run, so it alone can never prove a gap).
+	GapVerdictNone GapVerdict = iota
+	// GapVerdictUnproven means coverage could NOT be proven: this table's
+	// first event sits past the anchor AND the earliest surviving indexed
+	// event also starts past the anchor (or is unavailable/positionless).
+	// That is the honest verdict for both real shapes behind it — capture
+	// genuinely started after the baseline (a real gap, #781), or older
+	// events were rotated out of the live table and coverage can no longer
+	// be established from what survives. The warning says what could not be
+	// proven instead of asserting incompleteness.
+	GapVerdictUnproven
+)
+
+// indexStartComparable reports whether the oldest-event coordinates carry a
+// position comparable under flavor semantics — the same #318 positionless
+// guard the per-table first event gets (a NULL binlog_file / zero LSN row
+// must never silently read as "at-or-before the anchor").
+func indexStartComparable(flavor string, s query.IndexStart) bool {
+	if flavor == "postgres" {
+		return s.StartPos != 0
+	}
+	return s.BinlogFile != ""
+}
+
+// DecideBaselineGap decides the baseline↔first-event gap question for one
+// table. The per-table first event alone cannot answer it: on a healthy run
+// the first event AFTER the baseline is expected to sit at a later position
+// (that is simply the table's next write), so comparing it against the anchor
+// cries wolf on every healthy run (#1163). The evidence that can answer it is
+// the index's earliest surviving event (start): if the index's coverage
+// begins at-or-before the baseline anchor, nothing between the anchor and
+// this table's first event can be missing — capture was already running when
+// the baseline was taken.
+//
+// The proof is deliberately one-directional. start comes from the LIVE
+// binlog_events table only, so rotation/archival can make it LATER than the
+// index's true coverage start; a start past the anchor therefore degrades to
+// "cannot prove" (GapVerdictUnproven, a hedged warning), never to an
+// assertive gap claim. stream_state.gtid_set is deliberately NOT consulted:
+// it is seeded with the stream's START set, so it "contains" the baseline's
+// set both when the stream started before the baseline (healthy) and when it
+// started after it (a real gap) — see query.OldestIndexedEvent.
+func DecideBaselineGap(flavor string, bmeta baseline.DumpMetadata, first query.ResultRow, start query.IndexStart, startOK bool) GapVerdict {
+	if !GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN) {
+		return GapVerdictNone
+	}
+	if startOK && indexStartComparable(flavor, start) &&
+		!GapDetected(flavor, start.BinlogFile, start.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN) {
+		// The earliest surviving indexed event starts at-or-before the
+		// anchor: coverage provably began before the baseline was taken.
+		return GapVerdictNone
+	}
+	return GapVerdictUnproven
+}
+
 // WarnBaselineFirstEventGap emits the baseline↔first-event gap warning for
 // callers that live in this package — the full-table reconstruct path (#781),
 // which previously produced a dump silently missing that gap while single-row
 // reconstruct at least warned. It is a DIRECT port of the check the single-row
-// CLI path runs (cli/reconstruct.go: resolveGapCheck + the GapDetected switch),
+// CLI path runs (cli/reconstruct.go: resolveGapCheck + the verdict switch),
 // duplicated here because that logic lives in package cli, which this package
 // cannot import (cli imports reconstruct).
 //
@@ -67,11 +136,13 @@ func GapDetected(flavor string, eventFile string, eventStartPos uint64, baseline
 // it governs the coverage-gap fetch (query.FetchMerged) and CheckCaptureGap,
 // which run separately, not this baseline-vs-first-event visibility warning.
 //
-// flavor is query.SourceFlavor(db). first is the earliest fetched event
-// (events sorted by (event_timestamp, event_id)). schema/table are added to
-// every record so the warning is attributable when several tables reconstruct
+// flavor is query.SourceFlavor(db); start/startOK are
+// query.OldestIndexedEvent(db) — the coverage-proof evidence consulted by
+// DecideBaselineGap (#1163). first is the earliest fetched event (events
+// sorted by (event_timestamp, event_id)). schema/table are added to every
+// record so the warning is attributable when several tables reconstruct
 // concurrently.
-func WarnBaselineFirstEventGap(flavor string, bmeta baseline.DumpMetadata, first query.ResultRow, schema, table string) {
+func WarnBaselineFirstEventGap(flavor string, bmeta baseline.DumpMetadata, first query.ResultRow, start query.IndexStart, startOK bool, schema, table string) {
 	// Mirror of cli.resolveGapCheck: force PG semantics when the flavor read
 	// came back empty but the baseline carries an LSN anchor (its lineage is
 	// provably PostgreSQL — LSN text must never be compared lexically), then
@@ -107,15 +178,19 @@ func WarnBaselineFirstEventGap(flavor string, bmeta baseline.DumpMetadata, first
 			"baseline_pos", bmeta.BinlogPos,
 			"baseline_lsn", bmeta.LSN,
 			"flavor", flavor)
-	case GapDetected(flavor, first.BinlogFile, first.StartPos, bmeta.BinlogFile, bmeta.BinlogPos, bmeta.LSN):
-		slog.Warn("gap between baseline and first indexed event — reconstruction may be incomplete",
-			"schema", schema, "table", table,
-			"baseline_file", bmeta.BinlogFile,
-			"baseline_pos", bmeta.BinlogPos,
-			"baseline_gtid", bmeta.GTIDSet,
-			"baseline_lsn", bmeta.LSN,
-			"first_event_file", first.BinlogFile,
-			"first_event_pos", first.StartPos,
-			"flavor", flavor)
+	default:
+		if DecideBaselineGap(flavor, bmeta, first, start, startOK) == GapVerdictUnproven {
+			slog.Warn("possible gap between baseline and this table's first indexed event — the index's earliest surviving event also starts past the baseline anchor, so coverage of the window between them cannot be proven (capture may have started after the baseline, or older events may have been rotated out)",
+				"schema", schema, "table", table,
+				"baseline_file", bmeta.BinlogFile,
+				"baseline_pos", bmeta.BinlogPos,
+				"baseline_lsn", bmeta.LSN,
+				"first_event_file", first.BinlogFile,
+				"first_event_pos", first.StartPos,
+				"oldest_indexed_file", start.BinlogFile,
+				"oldest_indexed_pos", start.StartPos,
+				"oldest_indexed_known", startOK,
+				"flavor", flavor)
+		}
 	}
 }

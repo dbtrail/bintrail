@@ -12,8 +12,9 @@ recoveries in plain English. Once connected, you can ask:
 >
 > "What schema changes happened this week?"
 
-It exposes five **read-only** tools — `query`, `recover` (generates reversal SQL,
-never runs it), `reconstruct` (a row's state at a point in time), `status`, and
+It exposes six **read-only** tools — `query`, `recover` (generates reversal SQL,
+never runs it), `recover_cascade` (reversal SQL for foreign-key cascade side
+effects), `reconstruct` (a row's state at a point in time), `status`, and
 `list_schema_changes` — and never writes to your database.
 
 > **First time?** If you run the web console, the shortest path is the
@@ -62,8 +63,8 @@ everywhere):
 }
 ```
 
-Restart Claude Code. The `query`, `recover`, `status`, `list_schema_changes`,
-and `reconstruct` tools appear — now ask: *"What changed in the orders table in the last hour?"*
+Restart Claude Code. The `query`, `recover`, `recover_cascade`, `status`,
+`list_schema_changes`, and `reconstruct` tools appear — now ask: *"What changed in the orders table in the last hour?"*
 
 > Working inside the dbtrail **source repo**? Use
 > `"command": "go", "args": ["run", "./cmd/bintrail-mcp"]` instead — no separate
@@ -176,32 +177,33 @@ endpoint at all.
 Once such a gateway is reachable at a public URL: in **claude.ai → Settings →
 Integrations → Add custom integration**, enter the gateway URL (your domain, or
 `https://mcp.dbtrail.com/mcp` for managed customers), complete the OAuth login,
-and the five tools appear. Works from web, Desktop, and mobile; tokens refresh
+and the six tools appear. Works from web, Desktop, and mobile; tokens refresh
 automatically.
 
 ---
 
-## The five tools
+## The six tools
 
 | Tool | CLI equivalent | What it does |
 |---|---|---|
 | `query` | `bintrail query` | Search indexed row changes with filters |
 | `recover` | `bintrail recover --dry-run` | Generate reversal SQL (never executes it) |
+| `recover_cascade` | `bintrail recover-cascade --dry-run` | Generate reversal SQL for foreign-key `ON DELETE`/`ON UPDATE` cascade side effects InnoDB ran below the binlog — the child rows plain `recover` cannot see. Fails with the reasons when the synthesis is provably partial, unless `allow_incomplete` is set |
 | `reconstruct` | `bintrail reconstruct` | A single row's full state at a point in time (needs a baseline) |
 | `status` | `bintrail status` | Indexed files, partitions, and summary |
 | `list_schema_changes` | reads `schema_changes` (see [DDL tracking](./ddl-tracking.md)) | DDL changes recorded while indexing/streaming, with the full statement and binlog coordinates |
 
-All five are read-only — annotated `ReadOnlyHint: true` and `IdempotentHint: true`,
+All six are read-only — annotated `ReadOnlyHint: true` and `IdempotentHint: true`,
 so the client knows they're safe to call repeatedly and never modify state.
 
-If your client lists tools beyond these five, you are running a build that
+If your client lists tools beyond these six, you are running a build that
 registers extras through the extension seam (`ext/mcpext`) — a distribution
 that wraps this core, not the stock binary. Such tools resolve their index
-through the same routing as the built-in five, so they read the server you
+through the same routing as the built-in six, so they read the server you
 selected and inherit its posture, including the console's refusal of a
 tool-level `index_dsn`.
 
-The same five tools are also served by the web console at `/mcp` (Streamable
+The same six tools are also served by the web console at `/mcp` (Streamable
 HTTP, console-token auth, per-server routing by URL path) — if you already run
 `bintrail-console`, you may not need this binary at all; see
 [console.md](console.md#mcp-endpoint).

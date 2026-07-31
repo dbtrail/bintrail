@@ -222,9 +222,15 @@ func TestBinaryPKBaselineJoin_endToEnd(t *testing.T) {
 		}
 		path := filepath.Join(baselineDir, sourceName, "bp.parquet")
 
-		// The stripped spelling cannot match the padded baseline value — that
-		// is precisely why the CLI re-pads and retries (padFixedBinaryFilter).
-		row, err := reconstruct.ReadBaselineRow(ctx, path, map[string]string{"k": stored})
+		tm, err := res.Resolve(sourceName, "bp")
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		pkMetas := tm.PKColumnMetas()
+
+		// The stripped spelling cannot match the padded baseline value exactly
+		// — with nil metas (no declared width) the lookup stays a miss.
+		row, err := reconstruct.ReadBaselineRow(ctx, path, map[string]string{"k": stored}, nil)
 		if err != nil {
 			t.Fatalf("ReadBaselineRow: %v", err)
 		}
@@ -232,14 +238,25 @@ func TestBinaryPKBaselineJoin_endToEnd(t *testing.T) {
 			t.Log("note: the stored spelling resolved directly — this key had no trailing padding")
 		}
 
-		// Padded to the storage width it must resolve. Before #1155 this
-		// failed too: the 0x… string was bound as text against a BLOB column.
+		// With the PK metas, ReadBaselineRow's own pad-and-retry (#1157) must
+		// resolve the stripped spelling — the same reconciliation every
+		// surface (CLI, console, MCP) now gets.
+		row, err = reconstruct.ReadBaselineRow(ctx, path, map[string]string{"k": stored}, pkMetas)
+		if err != nil {
+			t.Fatalf("ReadBaselineRow (metas): %v", err)
+		}
+		if row == nil {
+			t.Fatalf("no baseline row for the stored pk_values spelling %s with PK metas — the pad-and-retry did not run (#1157)", stored)
+		}
+
+		// Padded to the storage width it must resolve too. Before #1155 this
+		// failed as well: the 0x… string was bound as text against a BLOB column.
 		var padded string
 		if err := sourceDB.QueryRow(`SELECT CONCAT('0x', HEX(k)) FROM bp
 			WHERE CONCAT('0x', UPPER(HEX(k))) LIKE CONCAT(?, '%')`, stored).Scan(&padded); err != nil {
 			t.Fatalf("read padded key from source: %v", err)
 		}
-		row, err = reconstruct.ReadBaselineRow(ctx, path, map[string]string{"k": padded})
+		row, err = reconstruct.ReadBaselineRow(ctx, path, map[string]string{"k": padded}, pkMetas)
 		if err != nil {
 			t.Fatalf("ReadBaselineRow (padded): %v", err)
 		}

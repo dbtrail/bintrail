@@ -689,10 +689,10 @@ per server as `source` in [`/api/capabilities`](#api), derived from
 
 ## MCP endpoint
 
-The console serves the same five read-only MCP tools as
-[`bintrail-mcp`](mcp-server.md) — `query`, `recover`, `reconstruct`, `status`,
-`list_schema_changes` — over **Streamable HTTP**, on both `bintrail-console
-serve` and `bintrail-console watch`:
+The console serves the same six read-only MCP tools as
+[`bintrail-mcp`](mcp-server.md) — `query`, `recover`, `recover_cascade`,
+`reconstruct`, `status`, `list_schema_changes` — over **Streamable HTTP**, on
+both `bintrail-console serve` and `bintrail-console watch`:
 
 | URL | Target |
 |---|---|
