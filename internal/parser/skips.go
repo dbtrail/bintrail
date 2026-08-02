@@ -58,17 +58,20 @@ type SkipStat struct {
 	// Last-seen attribution (#999): where the most recent skip happened, enough
 	// to hunt the source without ever storing statement text (a DML statement
 	// embeds row VALUES — same reason the per-event WARN omits it). Optional —
-	// only the statement-DML site stamps these today; omitempty keeps documents
-	// persisted before this change (and reasons without attribution) unchanged.
+	// only the STREAMING statement-DML site stamps these today (file-mode
+	// `bintrail index` detects the same drops but persists no ledger at all);
+	// omitempty keeps documents persisted before this change (and reasons
+	// without attribution) unchanged.
 	LastFile          string `json:"last_file,omitempty"`
 	LastPos           uint64 `json:"last_pos,omitempty"`
 	LastStatementType string `json:"last_statement_type,omitempty"`
 	LastConnectionID  uint32 `json:"last_connection_id,omitempty"`
 }
 
-// SkipAttribution locates one skipped event: binlog file/pos plus the statement
-// keyword and connection id from the QUERY event header. Never carries the
-// statement text.
+// SkipAttribution locates one skipped event: binlog file/pos, the statement
+// keyword (derived from the statement text, which is then discarded), and the
+// connection id from the QUERY event post-header. Never carries the statement
+// text itself.
 type SkipAttribution struct {
 	File          string
 	Pos           uint64
@@ -124,7 +127,9 @@ func (c *SkipCounters) RecordSkip(reason string) {
 
 // RecordSkipAttributed is RecordSkip carrying the skipped event's location
 // (#999). A zero attribution leaves any previously stamped attribution for the
-// reason in place — an unattributed count must not erase the last useful lead.
+// reason in place — an unattributed count must not erase the last useful lead
+// (consequence: the attribution can lag last_at if a caller mixes attributed
+// and unattributed skips of one reason).
 func (c *SkipCounters) RecordSkipAttributed(reason string, attr SkipAttribution) {
 	if c == nil {
 		return

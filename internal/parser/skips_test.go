@@ -292,7 +292,9 @@ func TestStreamParser_statementDMLCountsSkip(t *testing.T) {
 	qev.Event.(*replication.QueryEvent).SlaveProxyID = 77
 
 	ctx, cancel := context.WithCancel(context.Background())
-	feedThenCancel(t, streamer, cancel, qev)
+	// The rotate precedes the drop, as on a real stream — pinning that Run
+	// plumbs currentFile into the attribution, not just pos/keyword/conn id.
+	feedThenCancel(t, streamer, cancel, makeRotate("binlog.000123"), qev)
 	if err := sp.Run(ctx, streamer, out); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -307,7 +309,7 @@ func TestStreamParser_statementDMLCountsSkip(t *testing.T) {
 		t.Fatalf("decode snapshot: %v", err)
 	}
 	st := m[SkipStatementFormatDML]
-	if st.LastPos != 4242 || st.LastStatementType != "UPDATE" || st.LastConnectionID != 77 {
+	if st.LastFile != "binlog.000123" || st.LastPos != 4242 || st.LastStatementType != "UPDATE" || st.LastConnectionID != 77 {
 		t.Fatalf("statement-DML site did not stamp attribution: %+v", st)
 	}
 	if strings.Contains(snap, "amount") {

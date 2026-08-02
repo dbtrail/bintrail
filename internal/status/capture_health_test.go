@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dbtrail/dbtrail/internal/parser"
 )
 
 // ─── Capture health verdict (#1034) ───────────────────────────────────────────
@@ -79,6 +81,37 @@ func TestWriteStatus_captureHealthAttribution(t *testing.T) {
 	WriteStatus(&buf, nil, nil, nil, nil, nil, captureStream(degradedSkips))
 	if strings.Contains(buf.String(), "Last drop") {
 		t.Errorf("unattributed ledger must omit the Last drop line:\n%s", buf.String())
+	}
+}
+
+// Partial-attribution rendering: file-only drops the keyword segment, an empty
+// file renders "?" (a drop before the first rotate — reachable in production),
+// full attribution renders both halves.
+func TestLastCaptureSkipAttribution_partial(t *testing.T) {
+	at := time.Date(2026, 7, 18, 1, 0, 0, 0, time.UTC)
+	for name, tc := range map[string]struct {
+		st   CaptureSkipStat
+		want string
+	}{
+		"full":         {CaptureSkipStat{LastAt: at, LastFile: "binlog.000042", LastPos: 99012, LastStatementType: "UPDATE", LastConnectionID: 55}, "binlog.000042:99012 (UPDATE, connection id 55)"},
+		"file-only":    {CaptureSkipStat{LastAt: at, LastFile: "binlog.000042", LastPos: 99012}, "binlog.000042:99012"},
+		"keyword-only": {CaptureSkipStat{LastAt: at, LastPos: 4242, LastStatementType: "UPDATE", LastConnectionID: 77}, "?:4242 (UPDATE, connection id 77)"},
+	} {
+		if got := lastCaptureSkipAttribution(map[string]CaptureSkipStat{"statement_format_dml": tc.st}); got != tc.want {
+			t.Errorf("%s: got %q, want %q", name, got, tc.want)
+		}
+	}
+	if got := lastCaptureSkipAttribution(map[string]CaptureSkipStat{"column_count_mismatch": {LastAt: at, Count: 5}}); got != "" {
+		t.Errorf("unattributed-only ledger must render no attribution, got %q", got)
+	}
+}
+
+// The reason key is a persistence contract shared by two deliberately
+// unlinked decls — pin the mirror so a rename in one side fails here instead
+// of silently splitting the ledger.
+func TestCaptureSkipReasonMirrorsParser(t *testing.T) {
+	if CaptureSkipReasonStatementFormatDML != parser.SkipStatementFormatDML {
+		t.Fatalf("status reason %q != parser reason %q", CaptureSkipReasonStatementFormatDML, parser.SkipStatementFormatDML)
 	}
 }
 

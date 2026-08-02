@@ -139,6 +139,39 @@ func TestRunStatus_failOnGap_exitCode(t *testing.T) {
 		}
 	})
 
+	// Drops AND a stamped gap: the gap error wins (its remediation —
+	// re-baseline — subsumes the drop one).
+	if _, err := db.ExecContext(ctx,
+		`UPDATE stream_state SET gap_lost_at=UTC_TIMESTAMP(), gap_lost_detail='unfillable binlog gap' WHERE id=1`); err != nil {
+		t.Fatalf("re-stamp gap: %v", err)
+	}
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err == nil || !strings.Contains(err.Error(), "events permanently lost") {
+			t.Errorf("with both a gap and drops, the gap error must win, got: %v", err)
+		}
+	})
+	if _, err := db.ExecContext(ctx,
+		"UPDATE stream_state SET gap_lost_at=NULL, gap_lost_detail=NULL WHERE id=1"); err != nil {
+		t.Fatalf("clear gap again: %v", err)
+	}
+
+	// A ledger that is PRESENT but unreadable (valid JSON, wrong shape) gets
+	// no grandfathering pass: a skip-aware daemon wrote it and it may hide a
+	// loss count — fail closed, like the sibling can't-confirm branches.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE stream_state SET capture_skips='{"statement_format_dml": 3}' WHERE id=1`); err != nil {
+		t.Fatalf("seed unreadable capture_skips: %v", err)
+	}
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err == nil || !strings.Contains(err.Error(), "unreadable") {
+			t.Errorf("want a fail-closed error for a present-but-unreadable ledger, got: %v", err)
+		}
+	})
+	if _, err := db.ExecContext(ctx,
+		`UPDATE stream_state SET capture_skips='{"statement_format_dml":{"count":3,"last_at":"2026-07-18T01:00:00Z","last_file":"binlog.000042","last_pos":99012,"last_statement_type":"UPDATE","last_connection_id":55}}' WHERE id=1`); err != nil {
+		t.Fatalf("restore capture_skips: %v", err)
+	}
+
 	// Flag OFF + the same drops → exit 0 (break-nothing for existing scripts).
 	stFailOnGap = false
 	captureStdout(t, func() {

@@ -348,9 +348,18 @@ code — `status` is a report. Pass `--fail-on-gap` to exit non-zero when contin
 is `gap_lost` **or** `unknown`; it **fails closed**, so an un-migrated legacy index
 or an unloadable stream state also trips it. It also exits non-zero when the
 capture ledger records in-scope `statement_format_dml` drops — those changes are
-permanently absent from the index, the same loss class as `gap_lost` (an
-*unknown* capture ledger does not trip it: the column post-dates the flag, and
-alerting on its absence would fail every pre-existing deployment):
+permanently absent from the index, the same loss class as `gap_lost`. A **NULL**
+capture ledger does not trip it (the column post-dates the flag, and alerting on
+its absence would fail every pre-existing deployment) — but a ledger that is
+*present and unreadable* does fail closed: a skip-aware daemon wrote it, and it
+may be hiding a loss count.
+
+The drop counter is **monotonic for the life of the index** — fixing
+`binlog_format` stops new drops but does not clear the count (the dropped
+changes stay lost). To acknowledge after remediation: stop the capture daemon,
+clear the ledger (`UPDATE stream_state SET capture_skips = '{}' WHERE id = 1` on
+your index), and restart — clearing it with the daemon running is ineffective,
+the next checkpoint re-persists the in-memory tallies.
 
 ```sh
 bintrail status --index-dsn "$IDX" --fail-on-gap || alert "dbtrail lost events"

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -146,21 +147,30 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 		// #999: a non-zero IN-SCOPE statement-format DML count is the same loss
 		// class as gap_lost — those changes are permanently absent from the
-		// index — so it joins the fail-closed contract. An UNKNOWN capture
-		// health (legacy index / no skip-aware daemon) deliberately does NOT
-		// alert here: unlike the gap columns above, capture_skips post-dates
-		// this flag, and failing every pre-#1034 deployment's cron would bury
-		// the signal in false alarms (the gap-column unknowns already alerted
+		// index — so it joins the fail-closed contract. A NULL/empty ledger
+		// (legacy index / no skip-aware daemon) deliberately does NOT alert
+		// here: unlike the gap columns above, capture_skips post-dates this
+		// flag, and failing every pre-#1034 deployment's cron would bury the
+		// signal in false alarms (the gap-column unknowns already alerted
 		// before capture_skips existed, so their fail-closed stance breaks no
-		// one).
+		// one). A ledger that IS present but unreadable gets no such pass —
+		// a skip-aware daemon wrote it, it may be hiding a loss count, and
+		// "couldn't check" must not read as "fine" (the sibling branches'
+		// stance).
 		if skips, ok := data.Stream.ParseCaptureSkips(); ok {
 			if st := skips[status.CaptureSkipReasonStatementFormatDML]; st.Count > 0 {
 				loc := ""
 				if st.LastFile != "" || st.LastStatementType != "" {
-					loc = fmt.Sprintf(" (last: %s at %s:%d, connection id %d)", st.LastStatementType, st.LastFile, st.LastPos, st.LastConnectionID)
+					file := st.LastFile
+					if file == "" {
+						file = "?"
+					}
+					loc = fmt.Sprintf(" (last: %s at %s:%d, connection id %d)", st.LastStatementType, file, st.LastPos, st.LastConnectionID)
 				}
-				return fmt.Errorf("capture health: %d statement-format DML event(s) permanently uncaptured%s; set binlog_format=ROW server-wide on the source; failing closed under --fail-on-gap", st.Count, loc)
+				return fmt.Errorf("capture health: %d statement-format DML event(s) permanently uncaptured%s; set binlog_format=ROW server-wide on the source, then acknowledge by clearing stream_state.capture_skips with the daemon stopped (the counter is monotonic); failing closed under --fail-on-gap", st.Count, loc)
 			}
+		} else if data.Stream.CaptureSkips.Valid && strings.TrimSpace(data.Stream.CaptureSkips.String) != "" {
+			return fmt.Errorf("capture health: capture_skips ledger present but unreadable; cannot confirm statement-format DML drops; failing closed under --fail-on-gap")
 		}
 	}
 	return nil

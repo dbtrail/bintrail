@@ -124,7 +124,8 @@ type CaptureSkipStat struct {
 	Count  int64     `json:"count"`
 	LastAt time.Time `json:"last_at"`
 	// Last-seen attribution (#999), stamped by the capture daemon for the most
-	// recent skip of this reason (today only statement-format DML carries it).
+	// recent skip of a reason — present only for reasons whose detection site
+	// stamps it (see parser.SkipStat, the single source of truth for which do).
 	LastFile          string `json:"last_file,omitempty"`
 	LastPos           uint64 `json:"last_pos,omitempty"`
 	LastStatementType string `json:"last_statement_type,omitempty"`
@@ -920,8 +921,11 @@ func lastCaptureSkip(skips map[string]CaptureSkipStat) time.Time {
 }
 
 // lastCaptureSkipAttribution formats the newest attributed skip (#999) for the
-// DEGRADED block: "file:pos (STATEMENT_TYPE, connection id N)". "" when no stat
-// carries attribution (pre-#999 ledger, or only unattributed reasons).
+// DEGRADED block: "file:pos" plus, when a statement keyword was stamped, a
+// " (STATEMENT_TYPE, connection id N)" segment. An empty file (a drop before
+// the first rotate event) renders as "?" rather than a malformed ":pos". ""
+// when no stat carries attribution (pre-#999 ledger, or only unattributed
+// reasons).
 func lastCaptureSkipAttribution(skips map[string]CaptureSkipStat) string {
 	var best CaptureSkipStat
 	found := false
@@ -936,7 +940,11 @@ func lastCaptureSkipAttribution(skips map[string]CaptureSkipStat) string {
 	if !found {
 		return ""
 	}
-	s := fmt.Sprintf("%s:%d", best.LastFile, best.LastPos)
+	file := best.LastFile
+	if file == "" {
+		file = "?"
+	}
+	s := fmt.Sprintf("%s:%d", file, best.LastPos)
 	if best.LastStatementType != "" {
 		s += fmt.Sprintf(" (%s, connection id %d)", best.LastStatementType, best.LastConnectionID)
 	}
@@ -1069,7 +1077,7 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		Count  int64  `json:"count"`
 		LastAt string `json:"last_at"`
 		// Last-seen attribution (#999); present only for reasons the capture
-		// daemon stamps (today statement_format_dml).
+		// daemon stamps (see parser.SkipStat for which do).
 		LastFile          string `json:"last_file,omitempty"`
 		LastPos           uint64 `json:"last_pos,omitempty"`
 		LastStatementType string `json:"last_statement_type,omitempty"`
