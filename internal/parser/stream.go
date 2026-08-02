@@ -411,7 +411,12 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 						"statement_type", kw,
 						"connection_id", ev.SlaveProxyID)
 					observe.StatementDMLDropped()
-					sp.skips.RecordSkip(SkipStatementFormatDML)
+					sp.skips.RecordSkipAttributed(SkipStatementFormatDML, SkipAttribution{
+						File:          currentFile,
+						Pos:           uint64(binlogEv.Header.LogPos),
+						StatementType: kw,
+						ConnectionID:  ev.SlaveProxyID,
+					})
 				}
 			}
 

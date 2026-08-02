@@ -34,6 +34,11 @@ func captureStream(captureSkips any) *StreamStateInfo {
 
 const degradedSkips = `{"column_count_mismatch":{"count":41203,"last_at":"2026-07-17T12:24:12Z"}}`
 
+// attributedSkips carries the #999 last-seen attribution the capture daemon
+// stamps for statement-format DML drops.
+const attributedSkips = `{"statement_format_dml":{"count":7,"last_at":"2026-07-18T01:00:00Z",` +
+	`"last_file":"binlog.000042","last_pos":99012,"last_statement_type":"UPDATE","last_connection_id":55}}`
+
 func TestWriteStatus_captureHealthDegraded(t *testing.T) {
 	var buf bytes.Buffer
 	WriteStatus(&buf, nil, nil, nil, nil, nil, captureStream(degradedSkips))
@@ -58,6 +63,22 @@ func TestWriteStatus_captureHealthMultipleReasons(t *testing.T) {
 	// Reasons sorted by count descending; the overall "last" is the max last_at.
 	if !strings.Contains(out, "1,207 events skipped (column_count_mismatch: 1,200, statement_format_dml: 7), last 2026-07-18 01:00:00") {
 		t.Errorf("multi-reason summary wrong:\n%s", out)
+	}
+}
+
+// #999: the DEGRADED block renders the last attributed drop; a pre-#999 ledger
+// without attribution must not render an empty "Last drop" line.
+func TestWriteStatus_captureHealthAttribution(t *testing.T) {
+	var buf bytes.Buffer
+	WriteStatus(&buf, nil, nil, nil, nil, nil, captureStream(attributedSkips))
+	if !strings.Contains(buf.String(), "Last drop:       binlog.000042:99012 (UPDATE, connection id 55)") {
+		t.Errorf("attributed degraded status missing the Last drop line:\n%s", buf.String())
+	}
+
+	buf.Reset()
+	WriteStatus(&buf, nil, nil, nil, nil, nil, captureStream(degradedSkips))
+	if strings.Contains(buf.String(), "Last drop") {
+		t.Errorf("unattributed ledger must omit the Last drop line:\n%s", buf.String())
 	}
 }
 
@@ -125,6 +146,29 @@ func TestWriteStatusJSON_captureHealthDegraded(t *testing.T) {
 	reason := skipped["column_count_mismatch"].(map[string]any)
 	if reason["count"] != float64(41203) {
 		t.Errorf("per-reason count = %v, want 41203", reason["count"])
+	}
+}
+
+// #999: the JSON per-reason stat carries the attribution fields; a ledger
+// without them omits the keys (omitempty — pre-#999 consumers see no change).
+func TestWriteStatusJSON_captureHealthAttribution(t *testing.T) {
+	out := decodeStatusJSON(t, captureStream(attributedSkips))
+	reason := out["stream"].(map[string]any)["capture_health"].(map[string]any)["skipped"].(map[string]any)["statement_format_dml"].(map[string]any)
+	for key, want := range map[string]any{
+		"last_file": "binlog.000042", "last_pos": float64(99012),
+		"last_statement_type": "UPDATE", "last_connection_id": float64(55),
+	} {
+		if reason[key] != want {
+			t.Errorf("%s = %v, want %v", key, reason[key], want)
+		}
+	}
+
+	out = decodeStatusJSON(t, captureStream(degradedSkips))
+	reason = out["stream"].(map[string]any)["capture_health"].(map[string]any)["skipped"].(map[string]any)["column_count_mismatch"].(map[string]any)
+	for _, key := range []string{"last_file", "last_pos", "last_statement_type", "last_connection_id"} {
+		if _, present := reason[key]; present {
+			t.Errorf("unattributed reason must omit %s: %v", key, reason)
+		}
 	}
 }
 

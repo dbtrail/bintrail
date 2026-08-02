@@ -346,7 +346,11 @@ PostgreSQL replication slot (#532) after the capture process has exited.
 **`--fail-on-gap` (for CI / cron).** By default a gap **never** changes the exit
 code — `status` is a report. Pass `--fail-on-gap` to exit non-zero when continuity
 is `gap_lost` **or** `unknown`; it **fails closed**, so an un-migrated legacy index
-or an unloadable stream state also trips it:
+or an unloadable stream state also trips it. It also exits non-zero when the
+capture ledger records in-scope `statement_format_dml` drops — those changes are
+permanently absent from the index, the same loss class as `gap_lost` (an
+*unknown* capture ledger does not trip it: the column post-dates the flag, and
+alerting on its absence would fail every pre-existing deployment):
 
 ```sh
 bintrail status --index-dsn "$IDX" --fail-on-gap || alert "dbtrail lost events"
@@ -400,6 +404,12 @@ the binlog — requires `binlog_format=ROW`). Routine skips of system schemas
 the snapshot deliberately excludes (e.g. RDS's `mysql.rds_heartbeat2`) are
 **not** counted.
 
+For `statement_format_dml` the daemon also stamps the most recent drop's
+**attribution** — binlog file:pos, statement keyword, and connection id, enough
+to hunt the offending client without ever storing the statement text (it embeds
+row values). The DEGRADED block then adds a `Last drop:` line, e.g.
+`Last drop:       binlog.000042:99012 (UPDATE, connection id 55)`.
+
 In the daemon log, each skip still emits its per-event `WARN`; after 100
 **consecutive** skipped events one `ERROR` with remediation is emitted (once
 per degraded episode — it re-arms when an event is captured again).
@@ -407,7 +417,9 @@ per degraded episode — it re-arms when an event is captured again).
 Under `--format json` the verdict is `stream.capture_health`:
 `{"status": "ok"}` or `{"status": "degraded", "total_skipped": N,
 "last_skip_at": "...", "skipped": {"<reason>": {"count": N, "last_at": "..."}}}`;
-the key is omitted when the verdict is unknown. The [web console](console.md)
+the key is omitted when the verdict is unknown. Attributed reasons additionally
+carry `last_file`, `last_pos`, `last_statement_type`, `last_connection_id`
+(omitted when absent). The [web console](console.md)
 Overview shows an orange "Capture degraded" box in the same states.
 
 ### Sections in detail
