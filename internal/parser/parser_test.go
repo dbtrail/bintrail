@@ -559,6 +559,54 @@ func TestStatementDML(t *testing.T) {
 	}
 }
 
+// TestStatementDMLInScope pins the #1000 scope decision: the coverage-gap
+// signal (WARN + metric + skip ledger) fires only for a schema the operator
+// actually captures. The bias is fail-loud — an empty/unknown default DB
+// warns — while system schemas and filter-excluded schemas are provably out
+// of scope and stay silent.
+func TestStatementDMLInScope(t *testing.T) {
+	shopOnly := &Filters{Schemas: map[string]bool{"shop": true}}
+	ordersOnly := &Filters{Tables: map[string]bool{"shop.orders": true}}
+	both := &Filters{Schemas: map[string]bool{"shop": true}, Tables: map[string]bool{"shop.orders": true}}
+
+	tests := []struct {
+		name    string
+		schema  string
+		filters *Filters
+		want    bool
+	}{
+		// Empty/ambiguous default DB: fail-loud.
+		{"empty schema, no filters", "", &Filters{}, true},
+		{"empty schema, filters configured", "", shopOnly, true},
+		// System schemas: never captured, never a gap — case-insensitive,
+		// matching isSnapshotExcludedSchema/TakeSnapshot.
+		{"mysql", "mysql", &Filters{}, false},
+		{"mysql uppercase", "MySQL", &Filters{}, false},
+		{"sys", "sys", &Filters{}, false},
+		{"performance_schema", "performance_schema", &Filters{}, false},
+		{"information_schema", "information_schema", &Filters{}, false},
+		{"system schema even when explicitly filtered in", "mysql", &Filters{Schemas: map[string]bool{"mysql": true}}, false},
+		// No filters: every user schema is captured.
+		{"user schema, no filters", "shop", &Filters{}, true},
+		{"user schema, nil filters", "shop", nil, true},
+		// --schemas filter.
+		{"schema in filter", "shop", shopOnly, true},
+		{"schema not in filter", "analytics", shopOnly, false},
+		// --tables filter: in scope iff some filtered table lives in the schema.
+		{"tables filter, schema hosts a filtered table", "shop", ordersOnly, true},
+		{"tables filter, schema hosts none", "reporting", ordersOnly, false},
+		{"tables filter, prefix must not cross the dot", "shopify", ordersOnly, false},
+		// Both dimensions configured.
+		{"both filters, in scope", "shop", both, true},
+		{"both filters, out of scope", "analytics", both, false},
+	}
+	for _, tt := range tests {
+		if got := statementDMLInScope(tt.schema, tt.filters); got != tt.want {
+			t.Errorf("%s: statementDMLInScope(%q) = %v, want %v", tt.name, tt.schema, got, tt.want)
+		}
+	}
+}
+
 // ─── SwapResolver + schemaVersion ──────────────────────────────────────────────
 
 func TestParser_SwapResolver_updatesSchemaVersion(t *testing.T) {

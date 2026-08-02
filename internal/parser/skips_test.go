@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // ─── Capture-skip counters (#1034) ────────────────────────────────────────────
@@ -235,7 +236,9 @@ func TestHandleRows_captureBreaksEscalationRun(t *testing.T) {
 	}
 }
 
-// The #999 statement-format DML drop site inside StreamParser.Run.
+// The #999 statement-format DML drop site inside StreamParser.Run. The event
+// carries NO session default DB (QueryEvent.Schema empty) — the ambiguous case
+// the #1000 scoping must keep fail-loud.
 func TestStreamParser_statementDMLCountsSkip(t *testing.T) {
 	skips := NewSkipCounters(newTestLogger(&bytes.Buffer{}))
 	sp := NewStreamParser(makeOrdersResolver(), Filters{}, newTestLogger(&bytes.Buffer{}))
@@ -251,6 +254,143 @@ func TestStreamParser_statementDMLCountsSkip(t *testing.T) {
 	snap, _ := skips.Snapshot()
 	if !strings.Contains(snap, SkipStatementFormatDML) || skips.Total() != 1 {
 		t.Fatalf("statement-format DML drop not counted (total=%d): %s", skips.Total(), snap)
+	}
+}
+
+// ─── Statement-DML capture scoping (#1000) ────────────────────────────────────
+//
+// The coverage-gap signal (WARN + bintrail_statement_dml_dropped_total +
+// capture-skip ledger) must fire only for schemas in capture scope. Each test
+// drives the REAL stream path: QueryEvents through StreamParser.Run.
+
+// readStatementDMLDropped reads bintrail_statement_dml_dropped_total from the
+// default Prometheus registry. It is a process-global singleton other tests
+// may touch, so callers assert before/after deltas, never absolute values.
+func readStatementDMLDropped(t *testing.T) float64 {
+	t.Helper()
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == "bintrail_statement_dml_dropped_total" {
+			return mf.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+	return 0
+}
+
+// runStatementDMLStream feeds the given QueryEvents through a real
+// StreamParser.Run and returns the recorded skips and the parser's log output.
+func runStatementDMLStream(t *testing.T, filters Filters, evs ...*replication.BinlogEvent) (*SkipCounters, string) {
+	t.Helper()
+	var logBuf bytes.Buffer
+	skips := NewSkipCounters(newTestLogger(&logBuf))
+	sp := NewStreamParser(makeOrdersResolver(), filters, newTestLogger(&logBuf))
+	sp.SetSkipCounters(skips)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel, evs...)
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return skips, logBuf.String()
+}
+
+// The rdsadmin false alarm: RDS's maintenance connection writes mysql.*
+// heartbeats in STATEMENT format with session default DB "mysql". More than
+// SkipEscalationThreshold consecutive ones — an idle overnight source — must
+// produce no WARN, no metric increment, no skip record, and no
+// "capture is effectively stopped" escalation ERROR.
+func TestStreamParser_statementDMLSystemSchemaSilent(t *testing.T) {
+	evs := make([]*replication.BinlogEvent, 0, SkipEscalationThreshold+5)
+	for i := 0; i < SkipEscalationThreshold+5; i++ {
+		evs = append(evs, makeQueryEventWithSchema("mysql",
+			"INSERT INTO mysql.rds_heartbeat2(id, value) values (1,1753921394003) ON DUPLICATE KEY UPDATE value = 1753921394003"))
+	}
+	before := readStatementDMLDropped(t)
+	skips, logs := runStatementDMLStream(t, Filters{}, evs...)
+
+	if got := skips.Total(); got != 0 {
+		t.Fatalf("system-schema statement DML must not count toward capture health, got total=%d", got)
+	}
+	if got := readStatementDMLDropped(t); got != before {
+		t.Fatalf("statement_dml_dropped_total moved %v -> %v for a system schema", before, got)
+	}
+	if strings.Contains(logs, "level=WARN") || strings.Contains(logs, "NOT captured") {
+		t.Errorf("system-schema statement DML must not WARN:\n%s", logs)
+	}
+	if strings.Contains(logs, "level=ERROR") {
+		t.Errorf("idle heartbeat traffic must never trip the consecutive-skip escalation:\n%s", logs)
+	}
+	// The Debug trace proves the events actually reached the detection branch
+	// (guards against this test passing vacuously).
+	if !strings.Contains(logs, "out-of-scope schema") {
+		t.Errorf("expected the Debug out-of-scope trace:\n%s", logs)
+	}
+}
+
+// A schema excluded by the configured --schemas filter is out of scope: the
+// operator asked not to capture it, so its statement-format DML is silent.
+func TestStreamParser_statementDMLFilteredSchemaSilent(t *testing.T) {
+	before := readStatementDMLDropped(t)
+	skips, logs := runStatementDMLStream(t,
+		Filters{Schemas: map[string]bool{"shop": true}},
+		makeQueryEventWithSchema("analytics", "INSERT INTO events VALUES (1)"))
+
+	if got := skips.Total(); got != 0 {
+		t.Fatalf("filter-excluded schema must not count, got total=%d", got)
+	}
+	if got := readStatementDMLDropped(t); got != before {
+		t.Fatalf("statement_dml_dropped_total moved %v -> %v for a filter-excluded schema", before, got)
+	}
+	if strings.Contains(logs, "level=WARN") {
+		t.Errorf("filter-excluded schema must not WARN:\n%s", logs)
+	}
+	if !strings.Contains(logs, "out-of-scope schema") {
+		t.Errorf("expected the Debug out-of-scope trace:\n%s", logs)
+	}
+}
+
+// A statement-format DML into a captured user schema is the REAL coverage gap:
+// it must still warn, increment the metric, and record the skip — unchanged.
+func TestStreamParser_statementDMLInScopeSchemaWarns(t *testing.T) {
+	before := readStatementDMLDropped(t)
+	skips, logs := runStatementDMLStream(t,
+		Filters{Schemas: map[string]bool{"shop": true}},
+		makeQueryEventWithSchema("shop", "UPDATE orders SET amount = 1"))
+
+	snap, _ := skips.Snapshot()
+	if !strings.Contains(snap, SkipStatementFormatDML) || skips.Total() != 1 {
+		t.Fatalf("in-scope statement DML not counted (total=%d): %s", skips.Total(), snap)
+	}
+	if got := readStatementDMLDropped(t); got != before+1 {
+		t.Fatalf("statement_dml_dropped_total = %v, want %v", got, before+1)
+	}
+	if !strings.Contains(logs, "level=WARN") || !strings.Contains(logs, "NOT captured") {
+		t.Errorf("in-scope statement DML must keep the operator-facing WARN:\n%s", logs)
+	}
+}
+
+// An empty session default DB is ambiguous — the statement may target a
+// captured schema via a qualified name — so the scoping errs toward warning
+// even with filters configured (fail-loud).
+func TestStreamParser_statementDMLEmptySchemaWarns(t *testing.T) {
+	before := readStatementDMLDropped(t)
+	skips, logs := runStatementDMLStream(t,
+		Filters{Schemas: map[string]bool{"shop": true}},
+		makeQueryEvent("DELETE FROM shop.orders WHERE id = 1"))
+
+	if skips.Total() != 1 {
+		t.Fatalf("empty-schema statement DML must stay fail-loud, got total=%d", skips.Total())
+	}
+	if got := readStatementDMLDropped(t); got != before+1 {
+		t.Fatalf("statement_dml_dropped_total = %v, want %v", got, before+1)
+	}
+	if !strings.Contains(logs, "level=WARN") {
+		t.Errorf("empty-schema statement DML must WARN:\n%s", logs)
 	}
 }
 
