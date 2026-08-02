@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -34,6 +35,10 @@ import (
 // loses it (mirrors BaselineStatus's "idle if never run in this process").
 type verifySupervisor struct {
 	ctx context.Context // daemon lifecycle; cancels an in-flight run on shutdown
+	// history, when non-nil, receives one VerifyRunRecord per finished run
+	// (#1191) — manual and scheduled alike, so the history is the one place
+	// "when did this last verify" is answered.
+	history *console.VerifyHistory
 
 	mu   sync.Mutex
 	jobs map[string]*verifyJob
@@ -56,6 +61,11 @@ type verifyJob struct {
 	status console.VerifyStatus
 	mode   console.VerifyMode
 
+	// serverName and trigger ("manual" | "scheduled") only feed the history
+	// record written at finish; neither is part of the pollable status.
+	serverName string
+	trigger    string
+
 	indexDSN  string
 	noArchive bool
 
@@ -66,33 +76,61 @@ type verifyJob struct {
 }
 
 // newVerifySupervisor builds a supervisor bound to the daemon context.
-func newVerifySupervisor(ctx context.Context) *verifySupervisor {
-	return &verifySupervisor{ctx: ctx, jobs: make(map[string]*verifyJob)}
+// history may be nil (runs are then not recorded).
+func newVerifySupervisor(ctx context.Context, history *console.VerifyHistory) *verifySupervisor {
+	return &verifySupervisor{ctx: ctx, history: history, jobs: make(map[string]*verifyJob)}
 }
 
 // Trigger starts a verify run in the background; returns
 // console.ErrVerifyRunning if one is already in flight for this server.
 func (s *verifySupervisor) Trigger(req console.VerifyRequest) error {
+	baselineSrc, err := s.begin(req, "manual")
+	if err != nil {
+		return err
+	}
+	go s.run(req, baselineSrc)
+	return nil
+}
+
+// RunScheduled runs one verify synchronously on the caller's goroutine — the
+// watch daemon's --verify-interval loop (#1191), which paces servers one at a
+// time so scheduled cycles never stack DuckDB work. Same admission rule as
+// Trigger: a run already in flight wins and this returns
+// console.ErrVerifyRunning for the scheduler to record as a skip.
+func (s *verifySupervisor) RunScheduled(req console.VerifyRequest) error {
+	baselineSrc, err := s.begin(req, "scheduled")
+	if err != nil {
+		return err
+	}
+	s.run(req, baselineSrc)
+	return nil
+}
+
+// begin admits a run — refusing a concurrent one per server — and publishes
+// the fresh "running" job state. Shared by the manual and scheduled paths so
+// the one-at-a-time-per-server rule cannot drift between them.
+func (s *verifySupervisor) begin(req console.VerifyRequest, trigger string) (string, error) {
 	s.mu.Lock()
 	if j, ok := s.jobs[req.ServerID]; ok && j.status.State == "running" {
 		s.mu.Unlock()
-		return console.ErrVerifyRunning
+		return "", console.ErrVerifyRunning
 	}
 	baselineSrc := req.BaselineDir
 	if baselineSrc == "" {
 		baselineSrc = req.BaselineS3
 	}
 	s.jobs[req.ServerID] = &verifyJob{
-		status:    console.VerifyStatus{State: "running", Mode: req.Mode, Since: nowStamp()},
-		mode:      req.Mode,
-		indexDSN:  req.IndexDSN,
-		noArchive: req.NoArchive,
+		status:     console.VerifyStatus{State: "running", Mode: req.Mode, Since: nowStamp()},
+		mode:       req.Mode,
+		serverName: req.ServerName,
+		trigger:    trigger,
+		indexDSN:   req.IndexDSN,
+		noArchive:  req.NoArchive,
 	}
 	s.mu.Unlock()
 
-	slog.Info("verify: starting in-process run", "server", req.ServerName, "id", req.ServerID, "mode", req.Mode)
-	go s.run(req, baselineSrc)
-	return nil
+	slog.Info("verify: starting in-process run", "server", req.ServerName, "id", req.ServerID, "mode", req.Mode, "trigger", trigger)
+	return baselineSrc, nil
 }
 
 // Status returns a copy of the latest known run state (idle if never run here).
@@ -214,6 +252,8 @@ func (s *verifySupervisor) run(req console.VerifyRequest, baselineSrc string) {
 		} else {
 			runErr = s.runLiveSource(req, db, resolver, dbName)
 		}
+	case console.VerifyModeRecoverInputs:
+		runErr = s.runRecoverInputs(req, db, resolver, dbName)
 	default:
 		runErr = s.runBaselineAnchored(req, baselineSrc, db, resolver, dbName, flavor)
 	}
@@ -326,6 +366,42 @@ func (s *verifySupervisor) runLiveSource(req console.VerifyRequest, indexDB *sql
 			res = verify.TableResult{Schema: st.Schema, Table: st.Table, Status: verify.StatusError, Detail: err.Error()}
 		}
 		// Live-source mismatches have no explain support in the engine.
+		s.appendResult(req.ServerID, toWireResult(res, false))
+	}
+	return nil
+}
+
+// recoverInputsLookback is how far back a console recover-inputs run walks
+// each primary key's event chain — the CLI's --lookback default (30d). Fixed
+// rather than configurable here: the scheduled runner is a background health
+// check, and an operator who wants a different window has the CLI.
+const recoverInputsLookback = 30 * 24 * time.Hour
+
+// runRecoverInputs is the console face of `bintrail verify --check recover`
+// (#1001): index-only — no baseline, no source read — which is why the
+// scheduled runner (#1191) falls back to it for servers with no baseline
+// configured. Window and per-table cap are the CLI's defaults; the
+// conservative archive fetcher is deliberate (this shares the daemon with the
+// stream — #510/#511 keep --ultrafast off daemons).
+func (s *verifySupervisor) runRecoverInputs(req console.VerifyRequest, indexDB *sql.DB, resolver *metadata.Resolver, dbName string) error {
+	ctx := s.ctx
+	tables, err := liveSourceTargetTables(ctx, indexDB, req.Tables)
+	if err != nil {
+		return fmt.Errorf("resolve target tables: %w", err)
+	}
+	now := time.Now().UTC()
+	cfg := verify.RecoverInputsConfig{
+		IndexDB: indexDB, Resolver: resolver, IndexDBName: dbName,
+		NoArchive: req.NoArchive, ArchiveFetcher: parquetquery.Fetch,
+		Since: now.Add(-recoverInputsLookback), Until: now,
+	}
+	for _, st := range tables {
+		res, err := verify.VerifyRecoverInputs(ctx, cfg, st.Schema, st.Table)
+		if err != nil {
+			res = verify.TableResult{Schema: st.Schema, Table: st.Table, Status: verify.StatusError, Detail: err.Error()}
+		}
+		// No explain support — the drill-down exists only for baseline-anchored
+		// content mismatches, same as the CLI's --explain scope rule.
 		s.appendResult(req.ServerID, toWireResult(res, false))
 	}
 	return nil
@@ -469,7 +545,6 @@ func (s *verifySupervisor) setNote(serverID, note string) {
 // internal/cli/verify.go's per-table error isolation.
 func (s *verifySupervisor) finish(serverID string, err error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	j, ok := s.jobs[serverID]
 	if !ok {
 		j = &verifyJob{status: console.VerifyStatus{}}
@@ -479,13 +554,32 @@ func (s *verifySupervisor) finish(serverID string, err error) {
 	if err != nil {
 		j.status.State = "failed"
 		j.status.LastError = err.Error()
-		slog.Error("verify: run failed", "server", serverID, "error", err)
-		return
+	} else {
+		j.status.State = "succeeded"
 	}
-	j.status.State = "succeeded"
-	slog.Info("verify: run complete", "server", serverID,
-		"match", j.status.Summary.Match, "mismatch", j.status.Summary.Mismatch,
-		"inconclusive", j.status.Summary.Inconclusive, "error", j.status.Summary.Error)
+	rec := console.VerifyRunRecord{
+		ServerID:     serverID,
+		ServerName:   j.serverName,
+		Trigger:      j.trigger,
+		VerifyStatus: j.status,
+	}
+	s.mu.Unlock()
+
+	if err != nil {
+		slog.Error("verify: run failed", "server", serverID, "error", err)
+	} else {
+		slog.Info("verify: run complete", "server", serverID,
+			"match", rec.Summary.Match, "mismatch", rec.Summary.Mismatch,
+			"inconclusive", rec.Summary.Inconclusive, "error", rec.Summary.Error)
+	}
+	// History is written OUTSIDE the job lock — Append does file IO, and a
+	// concurrent Status poll must never block on the disk. The run is terminal
+	// at this point, so rec's Results slice can no longer grow under it.
+	if s.history != nil {
+		if herr := s.history.Append(rec); herr != nil {
+			slog.Warn("verify: could not persist run to history", "server", serverID, "error", herr)
+		}
+	}
 }
 
 // indexDBName extracts the database name from an index DSN, mirroring

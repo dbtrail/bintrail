@@ -2200,14 +2200,19 @@ function verifyPanel(servers) {
   if (capsCache.verify_live_source) {
     modeSel.append(el("option", { value: "live-source", text: "Compare against your live database (slower)" }));
   }
+  modeSel.append(el("option", { value: "recover-inputs", text: "Check recovery inputs (no snapshot needed)" }));
   const warn = el("p", { class: "form-hint vfy-livewarn", hidden: true, text:
     "This reads your entire live table — it can take a while and adds load on your database. Best run outside busy hours." });
-  modeSel.onchange = () => { warn.hidden = modeSel.value !== "live-source"; };
 
   const results = el("div", { class: "vfy-results" });
   const btn = el("button", { class: "btn btn-sm", type: "button", text: "Run verification" });
   const configured = !!capsCache.verify;
-  btn.disabled = !configured;
+  // The snapshot-comparison modes need a baseline location; the
+  // recover-inputs check reads only the index, so it stays runnable on a
+  // server with no baseline configured.
+  const updateBtn = () => { btn.disabled = !configured && modeSel.value !== "recover-inputs"; };
+  modeSel.onchange = () => { warn.hidden = modeSel.value !== "live-source"; updateBtn(); };
+  updateBtn();
   btn.onclick = () => createVerify(cur.id, modeSel.value, btn, results);
   head.append(el("div", { class: "vfy-actions" }, modeSel, btn));
   panel.append(head);
@@ -2216,12 +2221,15 @@ function verifyPanel(servers) {
     list.append(el("div", { class: "stg-empty" },
       el("p", { class: "stg-empty-lead", text: "No baseline set up for this server yet." }),
       el("p", { class: "stg-empty-sub", text:
-        "This checks your two most recent snapshots against each other. Set a baseline location (Manage servers → Edit → Advanced) and create at least two snapshots to use it." })));
+        "Snapshot comparison checks your two most recent snapshots against each other — set a baseline location (Manage servers → Edit → Advanced) and create at least two to use it. \"Check recovery inputs\" works without one: it only reads the index." })));
   } else {
     list.append(warn);
-    renderVerifyResults(results, null, cur.id);
-    list.append(results);
   }
+  renderVerifyResults(results, null, cur.id);
+  list.append(results);
+  const history = el("div", { class: "vfy-history" });
+  list.append(history);
+  loadVerifyHistory(cur.id, history);
   panel.append(list);
   return panel;
 }
@@ -2247,6 +2255,9 @@ async function createVerify(id, mode, btn, resultsEl) {
   const done = await pollVerify(id, (st) => renderVerifyResults(resultsEl, st, id));
   restore();
   if (done) renderVerifyResults(resultsEl, done, id);
+  // The finished run is now in the persisted history too — refresh the list.
+  const histBox = document.querySelector(".vfy-history");
+  if (histBox) loadVerifyHistory(id, histBox);
   if (done && done.state === "succeeded") {
     const s = done.summary || {};
     toast(done.note || ("Verification complete: " + s.match + " match, " + s.mismatch + " mismatch, " +
@@ -2289,7 +2300,48 @@ async function pollVerify(id, onTick) {
 
 const VFY_STATUS_CLASS = { match: "pass", mismatch: "fail", error: "fail", inconclusive: "warn" };
 const VFY_STATUS_MARK = { pass: "✓", fail: "✗", warn: "!" };
-const VFY_MODE_LABEL = { "baseline-anchored": "compared two saved snapshots", "live-source": "compared against the live database" };
+const VFY_MODE_LABEL = { "baseline-anchored": "compared two saved snapshots", "live-source": "compared against the live database", "recover-inputs": "checked recovery inputs in the index" };
+
+// loadVerifyHistory renders the persisted run history into box: a "last
+// verified" headline plus one line per stored run (newest first, capped
+// server-side). Manual runs, scheduled runs and scheduled skips all appear —
+// the daemon's --verify-interval loop writes the same store. A 403 (feature
+// off) or any fetch error leaves the box empty; the trigger UI above already
+// explains how to enable verification.
+async function loadVerifyHistory(id, box) {
+  let recs;
+  try {
+    recs = (await api("/api/servers/" + encodeURIComponent(id) + "/verify/history")).history || [];
+  } catch (err) {
+    return;
+  }
+  clear(box);
+  if (!recs.length) return;
+  const latest = recs.find((r) => r.state === "succeeded" || r.state === "failed");
+  if (latest && latest.finished_at) {
+    const sec = (Date.now() - Date.parse(latest.finished_at)) / 1000;
+    const s = latest.summary || {};
+    box.append(el("div", { class: "vfy-summary" },
+      el("span", { class: "chip chip-mon", text: "LAST VERIFIED " + agoText(sec) }),
+      el("span", { class: "stg-age", text: latest.state === "failed"
+        ? "failed — " + (latest.last_error || "unknown error")
+        : s.match + "/" + s.total + " match" })));
+  }
+  recs.slice(0, 8).forEach((r) => {
+    const s = r.summary || {};
+    let outcome;
+    if (r.state === "skipped") outcome = "skipped — " + (r.skip_reason || "");
+    else if (r.state === "failed") outcome = "failed — " + (r.last_error || "unknown error");
+    else outcome = s.match + " match · " + s.mismatch + " mismatch · " + s.inconclusive + " inconclusive · " + s.error + " error";
+    const when = (r.finished_at || r.since || "").replace("T", " ").replace("Z", " UTC");
+    const row = el("div", { class: "stg-row" });
+    row.append(
+      el("span", { class: "stg-age", text: when }),
+      el("span", { text: (VFY_MODE_LABEL[r.mode] || r.mode || "") + (r.trigger === "scheduled" ? " (scheduled)" : "") }),
+      el("span", { class: "stg-age", text: outcome }));
+    box.append(row);
+  });
+}
 
 // renderVerifyResults draws the current run's summary + per-table cards into
 // container, reusing the doctor preflight card styling (pass/fail/warn) since

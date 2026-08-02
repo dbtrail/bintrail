@@ -54,6 +54,12 @@ const (
 	// the whole table off production — the console warns to run it off-peak,
 	// matching docs/verify.md.
 	VerifyModeLiveSource VerifyMode = "live-source"
+	// VerifyModeRecoverInputs walks each primary key's event chain and asserts
+	// the before/after images recover consumes are internally consistent — the
+	// console face of `bintrail verify --check recover` (#1191). Index-only:
+	// needs no baseline and no source DSN, which is why the scheduled runner
+	// falls back to it for servers with no baseline configured.
+	VerifyModeRecoverInputs VerifyMode = "recover-inputs"
 )
 
 // VerifyRequest is the in-process job description the endpoint hands the
@@ -212,18 +218,21 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 		mode = VerifyMode(body.Mode)
 	}
 	switch mode {
-	case VerifyModeBaselineAnchored, VerifyModeLiveSource:
+	case VerifyModeBaselineAnchored, VerifyModeLiveSource, VerifyModeRecoverInputs:
 	default:
-		writeJSONError(w, http.StatusBadRequest, "unknown mode (want baseline-anchored or live-source)")
+		writeJSONError(w, http.StatusBadRequest, "unknown mode (want baseline-anchored, live-source or recover-inputs)")
 		return
 	}
-	// Both modes need a baseline destination — mirrors internal/cli/verify.go,
-	// which requires --baseline-dir/--baseline-s3 before the mode split, not
-	// just for baseline-anchored. Live-source still reconstructs each table
-	// from baseline + deltas (internal/verify.VerifyTable); without one every
-	// table degrades to inconclusive AFTER a full off-peak read of the live
-	// table, which the CLI refuses up front instead of wasting that read.
-	if e.BaselineDir == "" && e.BaselineS3 == "" {
+	// Both content modes need a baseline destination — mirrors
+	// internal/cli/verify.go, which requires --baseline-dir/--baseline-s3
+	// before the mode split, not just for baseline-anchored. Live-source still
+	// reconstructs each table from baseline + deltas
+	// (internal/verify.VerifyTable); without one every table degrades to
+	// inconclusive AFTER a full off-peak read of the live table, which the CLI
+	// refuses up front instead of wasting that read. The recover-inputs check
+	// is exempt for the same reason the CLI exempts --check recover: it reads
+	// binlog_events and nothing else.
+	if mode != VerifyModeRecoverInputs && e.BaselineDir == "" && e.BaselineS3 == "" {
 		writeJSONError(w, http.StatusBadRequest,
 			"this server has no baseline location set up; set a baseline directory or S3 location first (Edit → Advanced)")
 		return
@@ -316,4 +325,21 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 	recordConsoleAccess(r, "verify.explain", schema, table, map[string]string{
 		"mode": "baseline-anchored",
 	})
+}
+
+// handleVerifyHistory serves GET /api/servers/{id}/verify/history — the
+// persisted run history for one server, newest first (#1191). Gated exactly
+// like the live status endpoint: history is only ever written by the watch
+// daemon's supervisor, so a console without VerifyCtrl has none to serve.
+func (s *Server) handleVerifyHistory(w http.ResponseWriter, r *http.Request) {
+	if s.verifyCtrl == nil || s.verifyHistory == nil {
+		writeJSONError(w, http.StatusForbidden,
+			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1")
+		return
+	}
+	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"history": s.verifyHistory.List(e.ID)})
 }

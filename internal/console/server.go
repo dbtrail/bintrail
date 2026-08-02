@@ -95,6 +95,10 @@ type Config struct {
 	// where the trigger endpoint refuses with 403 and /api/capabilities reports
 	// verify_trigger:false. Set together with MonitorCtrl (both control-plane).
 	VerifyCtrl VerifyController
+	// VerifyHistory is the persisted verify-run history store (#1191), wired
+	// in by `bintrail-console watch` together with VerifyCtrl. nil elsewhere;
+	// the history endpoint then refuses with 403 like the other verify verbs.
+	VerifyHistory *VerifyHistory
 	// Telemetry is the live usage-telemetry client, wired in by
 	// `bintrail-console watch` so the UI opt-out toggle stops the running
 	// daemon's beacons immediately. nil on the read-only console (serve), where
@@ -178,6 +182,8 @@ type Server struct {
 	// verifyCtrl: non-nil only when the watch daemon opted into in-process
 	// verify runs (see Config.VerifyCtrl).
 	verifyCtrl VerifyController
+	// verifyHistory: the persisted run history, set with verifyCtrl (#1191).
+	verifyHistory *VerifyHistory
 	// telemetry: non-nil only when a long-running console wired its live
 	// telemetry client (see Config.Telemetry), so the UI opt-out reaches it.
 	telemetry TelemetryController
@@ -344,6 +350,7 @@ func New(cfg Config) (*Server, error) {
 		monitorCtrl:      cfg.MonitorCtrl,
 		baselineCtrl:     cfg.BaselineCtrl,
 		verifyCtrl:       cfg.VerifyCtrl,
+		verifyHistory:    cfg.VerifyHistory,
 		telemetry:        cfg.Telemetry,
 		rotationDefaults: cfg.RotationDefaults,
 		version:          cfg.Version,
@@ -474,6 +481,7 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("POST /api/servers/{id}/verify", s.recordAction("verify", s.handleVerifyTrigger))
 	api.HandleFunc("GET /api/servers/{id}/verify", s.handleVerifyStatus)
 	api.HandleFunc("GET /api/servers/{id}/verify/explain", s.handleVerifyExplain)
+	api.HandleFunc("GET /api/servers/{id}/verify/history", s.handleVerifyHistory)
 	// Global built-in-rotation policy: read the effective settings; PUT an
 	// override (refused on the read-only console — only the watch daemon runs
 	// the loop that consumes it).

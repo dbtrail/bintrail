@@ -413,12 +413,33 @@ results a `verify` cron/CI run produced elsewhere:
   never-precomputed row-level drill-down (`--explain`'s console equivalent),
   re-run only when clicked. Live-source mismatches have no explain support
   (mirroring the CLI).
-- One run at a time per server (409 while one is in flight). Like baseline
-  jobs, a run's result lives only in the daemon's memory — restarting the
-  console loses it; there is no persisted run history.
+- **Check recovery inputs** is the console face of
+  [`bintrail verify --check recover`](verify.md): index-only — no baseline
+  and no source read — walking each primary key's event chain over the last
+  30 days. It is the one mode that works on a server with no baseline
+  location configured.
+- One run at a time per server (409 while one is in flight). The live,
+  pollable result is in-memory, but every finished run also lands in a
+  persisted **run history** (`console-verify-history.json` next to the server
+  registry file, last 20 runs per server, served at
+  `GET /api/servers/{id}/verify/history`) — the panel shows "last verified"
+  and the recent trend from it across restarts.
 - Verify's baseline/live-source reads carry no RBAC redaction (like Time-travel's),
   so the panel and its endpoints are unavailable whenever an RBAC profile
   (`--profile`) is active.
+
+**Scheduled verification** runs the same engine on a timer, so backups
+re-prove themselves without external cron glue: start the daemon with
+`--verify-interval 24h` (or `BINTRAIL_CONSOLE_VERIFY_INTERVAL`) and every
+cycle verifies each registry server, sequentially — baseline-anchored where a
+baseline location is configured (the server's own, or the process-wide
+`--baseline-dir`/`--baseline-s3`), the index-only recovery-inputs check
+otherwise, so no server is silently skipped. `--verify-tables a.b,c.d`
+narrows every scheduled run to those tables. Setting an interval implies the
+Verification panel (no separate `BINTRAIL_CONSOLE_VERIFY_TRIGGER` needed),
+and one cycle also runs shortly after startup. Every outcome — including
+cycles skipped because a run was already in flight — lands in the run
+history above.
 
 - **AWS credentials** — which ambient credential signals the daemon process
   can see: env keys (presence only, never values), `AWS_PROFILE`,
@@ -490,6 +511,11 @@ results a `verify` cron/CI run produced elsewhere:
   combination doesn't fail cleanly, it crashes the pinned mydumper build). No
   effect unless `BINTRAIL_CONSOLE_BASELINE_TRIGGER` is also on, and no effect
   on PostgreSQL sources.
+- `BINTRAIL_CONSOLE_VERIFY_INTERVAL` (`watch` only) — same as
+  `--verify-interval`: enables scheduled verification on that cadence
+  (e.g. `24h`, `7d`; see
+  [Running verification from the console](#running-verification-from-the-console)).
+- `BINTRAIL_CONSOLE_VERIFY_TABLES` (`watch` only) — same as `--verify-tables`.
 - `BINTRAIL_CONSOLE_VERIFY_TRIGGER` (`watch` only) — `1`/`true` enables the
   Storage page's **Verification** panel (runs `bintrail verify` in-process;
   see [Running verification from the console](#running-verification-from-the-console)).

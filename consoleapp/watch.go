@@ -112,6 +112,16 @@ var (
 	// no subprocess and reads no live source in its default (baseline-anchored)
 	// mode, so the bundled compose stack defaults it ON (see docker-compose.yml).
 	upConsoleVerifyTrigger bool
+	// upVerifyInterval enables the scheduled verification loop (#1191): every
+	// interval, each registry server is verified in-process — baseline-anchored
+	// when a baseline location is configured, the index-only recover-inputs
+	// check otherwise — and the outcome lands in the persisted history.
+	// Empty = off; setting it implies the verify supervisor (no separate
+	// BINTRAIL_CONSOLE_VERIFY_TRIGGER needed).
+	upVerifyInterval string
+	// upVerifyTables optionally narrows scheduled verification to a
+	// comma-separated schema.table list.
+	upVerifyTables string
 
 	upRotateRetain    string
 	upRotateInterval  string
@@ -205,6 +215,8 @@ func init() {
 	watchCmd.Flags().StringVar(&upArchiveStageDir, "archive-staging-dir", "", "Local staging directory for S3 archive uploads (default: OS temp dir). Rotated Parquet is written here, uploaded to a source's configured Archive S3 bucket, then pruned.")
 	watchCmd.Flags().StringVar(&upRotateRetain, "rotate-retain", "30d", "Built-in rotation: drop index partitions older than this (Nd/Nh; \"off\" disables)")
 	watchCmd.Flags().StringVar(&upRotateInterval, "rotate-interval", "1h", "Built-in rotation: how often to run a rotation cycle")
+	watchCmd.Flags().StringVar(&upVerifyInterval, "verify-interval", "", "Scheduled verification: how often to verify every registry server (e.g. 24h, 7d); empty disables")
+	watchCmd.Flags().StringVar(&upVerifyTables, "verify-tables", "", "Scheduled verification: comma-separated schema.table filter (default: all tables)")
 	watchCmd.Flags().IntVar(&upRotateAddFuture, "rotate-add-future", 3, "Built-in rotation: keep at least N future hourly partitions ready")
 	// --source-dsn is deliberately NOT required: the daemon may start
 	// source-less (zero-config install) and sources are added from the UI.
@@ -407,8 +419,8 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
 	}
-	if upConsoleVerifyTrigger {
-		cfg.VerifyCtrl = newVerifySupervisor(ctx)
+	if err := wireVerify(ctx, &cfg, registry, serversPath); err != nil {
+		return err
 	}
 
 	// Built-in rotation covers the boot index plus every per-source database
@@ -562,8 +574,8 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
 	}
-	if upConsoleVerifyTrigger {
-		cfg.VerifyCtrl = newVerifySupervisor(ctx)
+	if err := wireVerify(ctx, &cfg, registry, serversPath); err != nil {
+		return err
 	}
 
 	// Built-in rotation: boot index + every per-source database the control
@@ -790,6 +802,16 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 	if v := os.Getenv("BINTRAIL_CONSOLE_VERIFY_TRIGGER"); v == "1" || v == "true" {
 		upConsoleVerifyTrigger = true
 	}
+	if !cmd.Flags().Changed("verify-interval") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_VERIFY_INTERVAL"); v != "" {
+			upVerifyInterval = v
+		}
+	}
+	if !cmd.Flags().Changed("verify-tables") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_VERIFY_TABLES"); v != "" {
+			upVerifyTables = v
+		}
+	}
 }
 
 // baselineStagingDir resolves the local staging base for baselines destined for
@@ -801,6 +823,135 @@ func baselineStagingDir() string {
 		return upBaselineStageDir
 	}
 	return filepath.Join(os.TempDir(), "bintrail-baseline-staging")
+}
+
+// wireVerify wires the in-process verify supervisor and, when
+// --verify-interval is set, the scheduled verification loop (#1191). The
+// supervisor (and with it the manual trigger endpoints) is enabled by either
+// opt-in — BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 or a schedule: scheduling verify
+// implies wanting verify.
+func wireVerify(ctx context.Context, cfg *console.Config, registry *console.Registry, serversPath string) error {
+	var interval time.Duration
+	if upVerifyInterval != "" {
+		var err error
+		interval, err = cliutil.ParseRetain(upVerifyInterval)
+		if err != nil {
+			return fmt.Errorf("--verify-interval: %w", err)
+		}
+	}
+	if !upConsoleVerifyTrigger && interval == 0 {
+		return nil
+	}
+	history, err := console.OpenVerifyHistory(console.DefaultVerifyHistoryPath(serversPath))
+	if err != nil {
+		// Run without history rather than refusing to start the daemon — the
+		// file is an observability aid, and NOT opening a store means nothing
+		// ever overwrites the unreadable file it might still describe.
+		slog.Warn("verify history unavailable; runs will not be recorded", "error", err)
+		history = nil
+	}
+	sup := newVerifySupervisor(ctx, history)
+	cfg.VerifyCtrl = sup
+	cfg.VerifyHistory = history
+	if interval > 0 {
+		startVerifyLoop(ctx, sup, registry, history, interval, splitVerifyTables(upVerifyTables))
+	}
+	return nil
+}
+
+// splitVerifyTables parses the comma-separated --verify-tables list; empty
+// entries are dropped, an empty flag means no filter (nil).
+func splitVerifyTables(raw string) []string {
+	var out []string
+	for _, t := range strings.Split(raw, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// startVerifyLoop runs one scheduled verification cycle per interval (#1191):
+// every registry server, sequentially — one verify (one DuckDB budget) at a
+// time. Mirrors startBaselinePruneLoop's shape: recover-guarded, first cycle
+// shortly after startup, stops with the daemon context.
+func startVerifyLoop(ctx context.Context, sup *verifySupervisor, registry *console.Registry, history *console.VerifyHistory, interval time.Duration, tables []string) {
+	slog.Info("scheduled verification enabled", "interval", interval)
+	go func() {
+		runCycle := func() {
+			// A panic must NEVER take down the daemon's primary capture — this
+			// background check shares the process with the stream. Mirrors the
+			// baseline-prune loop's guard.
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("scheduled verify cycle panicked; verification continues next tick", "panic", r)
+				}
+			}()
+			var entries []console.ServerEntry
+			if registry != nil {
+				entries = registry.List()
+			}
+			for _, e := range entries {
+				if ctx.Err() != nil {
+					return
+				}
+				err := sup.RunScheduled(scheduledVerifyRequest(e, tables, upConsoleBaselineDir, upConsoleBaselineS3))
+				if errors.Is(err, console.ErrVerifyRunning) {
+					slog.Info("scheduled verify: skipped, a run is already in flight", "server", e.Name)
+					recordVerifySkip(history, e, "a verify run was already in flight when the schedule fired")
+				}
+			}
+		}
+		if ctx.Err() == nil {
+			runCycle()
+		}
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runCycle()
+			}
+		}
+	}()
+}
+
+// scheduledVerifyRequest picks the check a scheduled cycle runs for one
+// server: baseline-anchored where a baseline location is configured — the
+// entry's own, or the process-wide fallback, all-or-nothing exactly like
+// withBaselineDefaults (#1010) — and the index-only recover-inputs check
+// otherwise, so a server with no baseline is still verified rather than
+// silently skipped.
+func scheduledVerifyRequest(e console.ServerEntry, tables []string, globalDir, globalS3 string) console.VerifyRequest {
+	dir, s3 := e.BaselineDir, e.BaselineS3
+	if dir == "" && s3 == "" {
+		dir, s3 = globalDir, globalS3
+	}
+	mode := console.VerifyModeBaselineAnchored
+	if dir == "" && s3 == "" {
+		mode = console.VerifyModeRecoverInputs
+	}
+	return console.VerifyRequest{
+		ServerID: e.ID, ServerName: e.Name, Mode: mode, Tables: tables,
+		IndexDSN: e.DSN, BaselineDir: dir, BaselineS3: s3, NoArchive: e.NoArchive,
+	}
+}
+
+// recordVerifySkip persists a "skipped" record so a schedule that never gets
+// to run stays visible in the history instead of silent.
+func recordVerifySkip(history *console.VerifyHistory, e console.ServerEntry, reason string) {
+	if history == nil {
+		return
+	}
+	err := history.Append(console.VerifyRunRecord{
+		ServerID: e.ID, ServerName: e.Name, Trigger: "scheduled", SkipReason: reason,
+		VerifyStatus: console.VerifyStatus{State: "skipped", Since: nowStamp(), FinishedAt: nowStamp()},
+	})
+	if err != nil {
+		slog.Warn("scheduled verify: could not persist skip to history", "server", e.Name, "error", err)
+	}
 }
 
 // baselinePruneTarget is one (local dir, durable S3) pair the prune loop reclaims.
