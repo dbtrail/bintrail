@@ -23,9 +23,10 @@ var ErrExplainUnavailable = errors.New("no explainable mismatch for this table �
 // calls, looped over a server's tables in a background goroutine so the
 // console can poll per-table results as they land. It is wired in ONLY by
 // `bintrail-console watch` when the operator opts in
-// (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1); nil on the standalone read-only
-// console, where the endpoints refuse with 403 — mirroring how
-// BaselineController gates in-process baseline creation.
+// (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1) or schedules verification
+// (--verify-interval, #1191 — scheduling verify implies wanting verify); nil
+// on the standalone read-only console, where the endpoints refuse with 403 —
+// mirroring how BaselineController gates in-process baseline creation.
 type VerifyController interface {
 	// Trigger starts a verify run in the background and returns immediately.
 	// Returns ErrVerifyRunning if one is already running for req.ServerID.
@@ -128,7 +129,7 @@ type VerifySummary struct {
 // internal/verify has no progress callback of its own; the controller loops
 // over tables itself and appends after each one returns.
 type VerifyStatus struct {
-	State      string     `json:"state"` // idle | running | succeeded | failed
+	State      string     `json:"state"` // idle | running | succeeded | failed (history records may also carry "skipped" — see VerifyRunRecord)
 	Mode       VerifyMode `json:"mode,omitempty"`
 	Since      string     `json:"since,omitempty"`
 	FinishedAt string     `json:"finished_at,omitempty"`
@@ -180,7 +181,7 @@ type VerifyExplanation struct {
 func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 	if s.verifyCtrl == nil {
 		writeJSONError(w, http.StatusForbidden,
-			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1")
+			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 or a --verify-interval schedule")
 		return
 	}
 	if s.rbacActiveFor(r) {
@@ -272,7 +273,7 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleVerifyStatus(w http.ResponseWriter, r *http.Request) {
 	if s.verifyCtrl == nil {
 		writeJSONError(w, http.StatusForbidden,
-			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1")
+			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 or a --verify-interval schedule")
 		return
 	}
 	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
@@ -288,7 +289,7 @@ func (s *Server) handleVerifyStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 	if s.verifyCtrl == nil {
 		writeJSONError(w, http.StatusForbidden,
-			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1")
+			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 or a --verify-interval schedule")
 		return
 	}
 	if s.rbacActiveFor(r) {
@@ -328,13 +329,14 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleVerifyHistory serves GET /api/servers/{id}/verify/history — the
-// persisted run history for one server, newest first (#1191). Gated exactly
-// like the live status endpoint: history is only ever written by the watch
-// daemon's supervisor, so a console without VerifyCtrl has none to serve.
+// persisted run history for one server, newest first (#1191). Gated like the
+// trigger/explain endpoints (feature opt-in + RBAC deny — stricter than the
+// live status endpoint), plus a distinct refusal when the history store
+// failed to open.
 func (s *Server) handleVerifyHistory(w http.ResponseWriter, r *http.Request) {
 	if s.verifyCtrl == nil {
 		writeJSONError(w, http.StatusForbidden,
-			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1")
+			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 or a --verify-interval schedule")
 		return
 	}
 	if s.verifyHistory == nil {

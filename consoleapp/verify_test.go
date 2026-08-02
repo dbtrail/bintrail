@@ -80,7 +80,7 @@ func TestIndexDBName(t *testing.T) {
 // TestVerifySupervisor_Status_idleDefault: a server never triggered here
 // reports idle, never a zero-value State.
 func TestVerifySupervisor_Status_idleDefault(t *testing.T) {
-	s := newVerifySupervisor(context.Background(), nil)
+	s := newVerifySupervisor(context.Background(), nil, nil)
 	if got := s.Status("never-triggered"); got.State != "idle" {
 		t.Errorf("Status = %+v, want State=idle", got)
 	}
@@ -91,7 +91,7 @@ func TestVerifySupervisor_Status_idleDefault(t *testing.T) {
 // untouched — exercises the exact single-flight guard the whole "one run at
 // a time per server" invariant depends on.
 func TestVerifySupervisor_Trigger_collision(t *testing.T) {
-	s := newVerifySupervisor(context.Background(), nil)
+	s := newVerifySupervisor(context.Background(), nil, nil)
 	s.jobs["srv1"] = &verifyJob{status: console.VerifyStatus{State: "running", Since: "t0"}}
 
 	err := s.Trigger(console.VerifyRequest{ServerID: "srv1"})
@@ -109,7 +109,7 @@ func TestVerifySupervisor_Trigger_collision(t *testing.T) {
 // the same classification the CLI's JSON report uses) is tallied correctly —
 // this is the exact bookkeeping "as they land" polling depends on.
 func TestVerifySupervisor_appendResult_accumulatesSummary(t *testing.T) {
-	s := newVerifySupervisor(context.Background(), nil)
+	s := newVerifySupervisor(context.Background(), nil, nil)
 	s.jobs["srv1"] = &verifyJob{status: console.VerifyStatus{State: "running"}}
 
 	s.appendResult("srv1", console.VerifyTableResult{Schema: "wp", Table: "posts", Status: "match"})
@@ -137,7 +137,7 @@ func TestVerifySupervisor_appendResult_accumulatesSummary(t *testing.T) {
 // second concurrent Trigger in before the goroutine's own finish() ran,
 // which could suppress that second run's real failure.
 func TestVerifySupervisor_setNote_doesNotChangeState(t *testing.T) {
-	s := newVerifySupervisor(context.Background(), nil)
+	s := newVerifySupervisor(context.Background(), nil, nil)
 	s.jobs["srv1"] = &verifyJob{status: console.VerifyStatus{State: "running"}}
 
 	s.setNote("srv1", "only one baseline exists for this server yet — nothing to compare")
@@ -161,7 +161,7 @@ func TestVerifySupervisor_setNote_doesNotChangeState(t *testing.T) {
 // for the server, a live-source run (no explain support in the engine), and
 // a baseline-anchored run where the requested table was never a mismatch.
 func TestVerifySupervisor_Explain_preconditions(t *testing.T) {
-	s := newVerifySupervisor(context.Background(), nil)
+	s := newVerifySupervisor(context.Background(), nil, nil)
 
 	if _, err := s.Explain("no-such-server", "wp", "posts"); !errors.Is(err, console.ErrExplainUnavailable) {
 		t.Errorf("no job: err = %v, want ErrExplainUnavailable", err)

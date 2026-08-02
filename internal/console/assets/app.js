@@ -2303,11 +2303,12 @@ const VFY_STATUS_MARK = { pass: "✓", fail: "✗", warn: "!" };
 const VFY_MODE_LABEL = { "baseline-anchored": "compared two saved snapshots", "live-source": "compared against the live database", "recover-inputs": "checked recovery inputs in the index" };
 
 // loadVerifyHistory renders the persisted run history into box: a "last
-// verified" headline plus one line per stored run (newest first, capped
-// server-side). Manual runs, scheduled runs and scheduled skips all appear —
-// the daemon's --verify-interval loop writes the same store. A 403 (feature
-// off) or any fetch error leaves the box empty; the trigger UI above already
-// explains how to enable verification.
+// verified" headline plus the most recent runs (newest first; the server
+// stores up to 20 per server, this list shows up to 8). Manual runs,
+// scheduled runs and scheduled skips all appear — the daemon's
+// --verify-interval loop writes the same store. On a fetch error (including
+// the 403 feature-off case) the box keeps whatever it already shows; the
+// trigger UI above explains how to enable verification.
 async function loadVerifyHistory(id, box) {
   let recs;
   try {

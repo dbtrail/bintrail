@@ -464,7 +464,8 @@ The payload is `{event, severity, server, summary, details, timestamp}` —
 generic JSON, no per-vendor adapters: Slack, PagerDuty, ntfy etc. all accept
 it through their inbound-webhook integrations. Notifications are
 **edge-triggered**: one POST on the transition into a bad state, a reminder
-every 24 h while it persists, and one `resolved: true` event (severity
+at most every 24 h while it persists (for verify problems: on the next run
+that still finds them), and one `resolved: true` event (severity
 `info`) on recovery. Delivery is best-effort — bounded retries off the hot
 path, never blocking capture. A dead or wrong endpoint surfaces as
 rate-limited log warnings, and an event that could not be delivered is not

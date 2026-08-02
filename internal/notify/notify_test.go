@@ -98,14 +98,14 @@ func TestEdge_FireRepeatResolve(t *testing.T) {
 	e := NewEdge(time.Hour)
 	e.now = func() time.Time { return now }
 
-	if !e.Fire("k") {
+	if !e.Fire("k", "") {
 		t.Fatal("first Fire must notify (transition into the bad state)")
 	}
-	if e.Fire("k") {
+	if e.Fire("k", "") {
 		t.Fatal("second Fire inside the repeat window must stay quiet")
 	}
 	now = now.Add(2 * time.Hour)
-	if !e.Fire("k") {
+	if !e.Fire("k", "") {
 		t.Fatal("Fire past repeatEvery must re-notify a persistent condition")
 	}
 	if !e.Resolve("k") {
@@ -117,7 +117,36 @@ func TestEdge_FireRepeatResolve(t *testing.T) {
 	if e.Resolve("never-fired") {
 		t.Fatal("Resolve of a never-fired key must stay quiet")
 	}
-	if !e.Fire("k") {
+	if !e.Fire("k", "") {
 		t.Fatal("Fire after Resolve is a new transition and must notify")
+	}
+}
+
+// TestEdge_ChangedDetailBypassesWindow: a different detail under the same key
+// is a NEW condition — it fires inside the repeat window AND refreshes it.
+func TestEdge_ChangedDetailBypassesWindow(t *testing.T) {
+	now := time.Unix(1000, 0)
+	e := NewEdge(time.Hour)
+	e.now = func() time.Time { return now }
+
+	if !e.Fire("gap", "binlog file 42") {
+		t.Fatal("setup fire")
+	}
+	if e.Fire("gap", "binlog file 42") {
+		t.Fatal("same detail inside the window must stay quiet")
+	}
+	now = now.Add(30 * time.Minute)
+	if !e.Fire("gap", "binlog file 99") {
+		t.Fatal("a changed detail is a new condition and must fire inside the window")
+	}
+	// The changed-detail fire refreshed the window: 40 minutes after the
+	// ORIGINAL fire (10 after the refresh) stays quiet.
+	now = now.Add(40 * time.Minute)
+	if e.Fire("gap", "binlog file 99") {
+		t.Fatal("the changed-detail fire must refresh the repeat window")
+	}
+	// An empty detail never reads as a change (conditions without detail).
+	if e.Fire("gap", "") {
+		t.Fatal("empty detail must not read as a change")
 	}
 }

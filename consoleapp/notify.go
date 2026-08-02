@@ -34,14 +34,10 @@ type eventSender interface {
 type watchNotifier struct {
 	send eventSender
 	edge *notify.Edge
-	// lastGapDetail remembers each index's gap_lost_detail so a DIFFERENT gap
-	// arriving while the first is still active reads as a new transition.
-	// Touched only by the continuity poller goroutine — no lock.
-	lastGapDetail map[string]string
 }
 
 func newWatchNotifier(ctx context.Context, url string) *watchNotifier {
-	return &watchNotifier{send: notify.NewWebhook(ctx, url), edge: notify.NewEdge(0), lastGapDetail: make(map[string]string)}
+	return &watchNotifier{send: notify.NewWebhook(ctx, url), edge: notify.NewEdge(0)}
 }
 
 // newWatchNotifierFromFlags builds the notifier when --notify-webhook is set;
@@ -73,8 +69,23 @@ func rotationNotifyHooks(n *watchNotifier) []func(failed bool, deferred int) {
 // found mismatches (critical — the data recover would produce is wrong) or
 // could not verify cleanly (warning), and resolves once a clean run lands.
 // Skip records never notify — the skip is bookkeeping, not a health signal.
+// resolveVerify clears every severity tier of one server's verify condition,
+// reporting whether any was active. The tier enumeration lives HERE, once — a
+// tier forgotten on resolve would leave a stale active entry that suppresses
+// future alerts and never sends its recovery event.
+func (n *watchNotifier) resolveVerify(serverID string) bool {
+	resolved := n.edge.Resolve("verify:" + notify.SeverityCritical + ":" + serverID)
+	if n.edge.Resolve("verify:" + notify.SeverityWarning + ":" + serverID) {
+		resolved = true
+	}
+	return resolved
+}
+
 func (n *watchNotifier) VerifyFinished(rec console.VerifyRunRecord) {
-	if rec.State == "skipped" {
+	// Defensive only: finish() never produces skip records (they are appended
+	// straight to history by the scheduler), but a future caller must not
+	// turn one into an alert.
+	if rec.State == console.VerifyStateSkipped {
 		return
 	}
 	s := rec.Summary
@@ -87,28 +98,24 @@ func (n *watchNotifier) VerifyFinished(rec console.VerifyRunRecord) {
 	allInconclusive := s.Total > 0 && s.Inconclusive == s.Total
 	problem := rec.State == "failed" || s.Mismatch > 0 || s.Error > 0 || allInconclusive
 	clean := rec.State == "succeeded" && !problem && s.Match > 0
-	sev := "warning"
+	sev := notify.SeverityWarning
 	if s.Mismatch > 0 {
-		sev = "critical"
+		sev = notify.SeverityCritical
 	}
 	// The edge key carries the severity class so an escalation (a
 	// warning-grade run followed by a critical mismatch) is a new transition,
 	// never suppressed by the lower tier's repeat window.
 	key := "verify:" + sev + ":" + rec.ServerID
 	if clean {
-		resolved := n.edge.Resolve("verify:critical:" + rec.ServerID)
-		if n.edge.Resolve("verify:warning:" + rec.ServerID) {
-			resolved = true
-		}
-		if resolved {
+		if n.resolveVerify(rec.ServerID) {
 			n.send.Notify(notify.Event{
-				Event: "verify_problem", Severity: "info", Server: rec.ServerName, Resolved: true,
+				Event: notify.EventVerifyProblem, Severity: notify.SeverityInfo, Server: rec.ServerName, Resolved: true,
 				Summary: fmt.Sprintf("verification is clean again: %d/%d tables match", s.Match, s.Total),
 			})
 		}
 		return
 	}
-	if !problem || !n.edge.Fire(key) {
+	if !problem || !n.edge.Fire(key, "") {
 		return
 	}
 	summary := fmt.Sprintf("verification found problems: %d mismatch, %d error, %d inconclusive (%d match)",
@@ -120,7 +127,7 @@ func (n *watchNotifier) VerifyFinished(rec console.VerifyRunRecord) {
 		summary = fmt.Sprintf("verification could not verify any table: all %d inconclusive", s.Total)
 	}
 	n.send.Notify(notify.Event{
-		Event: "verify_problem", Severity: sev, Server: rec.ServerName, Summary: summary,
+		Event: notify.EventVerifyProblem, Severity: sev, Server: rec.ServerName, Summary: summary,
 		Details: map[string]string{
 			"mode": string(rec.Mode), "trigger": rec.Trigger, "state": rec.State,
 			"mismatch": strconv.Itoa(s.Mismatch), "error": strconv.Itoa(s.Error), "match": strconv.Itoa(s.Match),
@@ -136,17 +143,17 @@ func (n *watchNotifier) RotationCycle(failed bool, deferred int) {
 	if !failed && deferred == 0 {
 		if n.edge.Resolve(key) {
 			n.send.Notify(notify.Event{
-				Event: "rotation_unhealthy", Severity: "info", Resolved: true,
+				Event: notify.EventRotationUnhealthy, Severity: notify.SeverityInfo, Resolved: true,
 				Summary: "built-in rotation is healthy again",
 			})
 		}
 		return
 	}
-	if !n.edge.Fire(key) {
+	if !n.edge.Fire(key, "") {
 		return
 	}
 	n.send.Notify(notify.Event{
-		Event: "rotation_unhealthy", Severity: "warning",
+		Event: notify.EventRotationUnhealthy, Severity: notify.SeverityWarning,
 		Summary: "built-in rotation made no progress — the index keeps growing (see the daemon log)",
 		Details: map[string]string{"failed": strconv.FormatBool(failed), "deferred_partitions": strconv.Itoa(deferred)},
 	})
@@ -159,25 +166,23 @@ func (n *watchNotifier) RotationCycle(failed bool, deferred int) {
 func (n *watchNotifier) Continuity(server, edgeKey string, gapLost bool, detail string) {
 	key := "continuity:" + edgeKey
 	if !gapLost {
-		delete(n.lastGapDetail, key)
 		if n.edge.Resolve(key) {
 			n.send.Notify(notify.Event{
-				Event: "continuity_gap_lost", Severity: "info", Server: server, Resolved: true,
+				Event: notify.EventContinuityGapLost, Severity: notify.SeverityInfo, Server: server, Resolved: true,
 				Summary: "capture continuity restored (the stream was re-baselined)",
 			})
 		}
 		return
 	}
-	// A DIFFERENT gap while the first is still active (re-baseline plus a
-	// second loss inside one repeat window) is a new data-loss event, not a
-	// repeat — a changed detail bypasses the suppression window.
-	changed := detail != "" && n.lastGapDetail[key] != "" && detail != n.lastGapDetail[key]
-	n.lastGapDetail[key] = detail
-	if !n.edge.Fire(key) && !changed {
+	// The detail rides the edge: a DIFFERENT gap while the first is still
+	// active (re-baseline plus a second loss inside one repeat window) is a
+	// new data-loss event — Edge.Fire bypasses the suppression window on a
+	// changed detail.
+	if !n.edge.Fire(key, detail) {
 		return
 	}
 	ev := notify.Event{
-		Event: "continuity_gap_lost", Severity: "critical", Server: server,
+		Event: notify.EventContinuityGapLost, Severity: notify.SeverityCritical, Server: server,
 		Summary: "capture continuity lost — events in the gap are PERMANENTLY unrecoverable; re-baseline to resume trustworthy coverage",
 	}
 	if detail != "" {
@@ -213,7 +218,7 @@ func startContinuityWatch(ctx context.Context, n *watchNotifier, registry *conso
 					// Unknown is never "no gap" — and never silent either: a
 					// watcher that cannot watch is itself a coverage hole. The
 					// edge keeps this to one warning per day per index.
-					if n.edge.Fire("continuity-unknown:" + t.dsn) {
+					if n.edge.Fire("continuity-unknown:"+t.dsn, "") {
 						slog.Warn("continuity watch cannot evaluate this index (unreachable, or a legacy schema without the gap columns) — gap_lost will NOT be detected for it",
 							"server", t.name, "error", err)
 					}
@@ -239,7 +244,7 @@ func startContinuityWatch(ctx context.Context, n *watchNotifier, registry *conso
 	}()
 }
 
-// continuityTargets enumerates the boot index (when watch streams one) plus
+// continuityTargets enumerates the boot index (when watch was given one) plus
 // every registry server, deduplicated by DSN — unlike scheduled verify, the
 // continuity check is cheap enough to cover the command-line boot stream too.
 func continuityTargets(registry *console.Registry, bootDSN string) []continuityTarget {

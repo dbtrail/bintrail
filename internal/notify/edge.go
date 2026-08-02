@@ -13,13 +13,25 @@ const DefaultRepeatEvery = 24 * time.Hour
 // Edge tracks per-key condition state so callers notify on the *transition*
 // into a bad state, re-notify while it persists only after repeatEvery, and
 // notify exactly once on recovery. Keys are caller-defined, e.g.
-// "verify:<server-id>".
+// "verify:<severity>:<server-id>".
+//
+// Key identity is the caller's contract: if a key's identity churns (e.g. a
+// DSN-derived key after a credential edit), the old entry stays active until
+// resolved and the condition re-fires under the new key — a duplicate alert,
+// never a lost one.
 type Edge struct {
 	repeatEvery time.Duration
 	now         func() time.Time // injectable for tests
 
 	mu     sync.Mutex
-	active map[string]time.Time // key → last notified
+	active map[string]edgeState
+}
+
+// edgeState is one active condition: when it was last notified, and the
+// detail identifying it.
+type edgeState struct {
+	last   time.Time
+	detail string
 }
 
 // NewEdge builds an Edge; repeatEvery <= 0 uses DefaultRepeatEvery.
@@ -27,21 +39,24 @@ func NewEdge(repeatEvery time.Duration) *Edge {
 	if repeatEvery <= 0 {
 		repeatEvery = DefaultRepeatEvery
 	}
-	return &Edge{repeatEvery: repeatEvery, now: time.Now, active: make(map[string]time.Time)}
+	return &Edge{repeatEvery: repeatEvery, now: time.Now, active: make(map[string]edgeState)}
 }
 
 // Fire reports whether the caller should notify for key being in a bad state
 // now: true on the transition into it, and again each repeatEvery while it
-// persists.
-func (e *Edge) Fire(key string) bool {
+// persists. detail (optional) carries the condition's identity — a CHANGED
+// non-empty detail is a NEW condition under the same key, so it fires
+// immediately, bypassing (and refreshing) the repeat window.
+func (e *Edge) Fire(key, detail string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := e.now()
-	last, ok := e.active[key]
-	if ok && now.Sub(last) < e.repeatEvery {
+	cur, ok := e.active[key]
+	changed := ok && detail != "" && cur.detail != "" && detail != cur.detail
+	if ok && !changed && now.Sub(cur.last) < e.repeatEvery {
 		return false
 	}
-	e.active[key] = now
+	e.active[key] = edgeState{last: now, detail: detail}
 	return true
 }
 

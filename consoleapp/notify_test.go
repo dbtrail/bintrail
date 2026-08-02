@@ -14,7 +14,7 @@ func (f *fakeSender) Notify(ev notify.Event) { f.events = append(f.events, ev) }
 
 func testNotifier() (*watchNotifier, *fakeSender) {
 	f := &fakeSender{}
-	return &watchNotifier{send: f, edge: notify.NewEdge(0), lastGapDetail: make(map[string]string)}, f
+	return &watchNotifier{send: f, edge: notify.NewEdge(0)}, f
 }
 
 func TestWatchNotifier_VerifyFinished(t *testing.T) {

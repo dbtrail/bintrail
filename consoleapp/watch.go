@@ -875,10 +875,11 @@ func wireVerify(ctx context.Context, cfg *console.Config, registry *console.Regi
 		slog.Error("verify history unavailable; runs will NOT be recorded and the history endpoint will refuse — fix or move the file and restart", "error", err)
 		history = nil
 	}
-	sup := newVerifySupervisor(ctx, history)
+	var onFinish func(console.VerifyRunRecord)
 	if notifier != nil {
-		sup.onFinish = notifier.VerifyFinished
+		onFinish = notifier.VerifyFinished
 	}
+	sup := newVerifySupervisor(ctx, history, onFinish)
 	cfg.VerifyCtrl = sup
 	cfg.VerifyHistory = history
 	if interval > 0 {
@@ -906,39 +907,8 @@ func splitVerifyTables(raw string) []string {
 func startVerifyLoop(ctx context.Context, sup *verifySupervisor, registry *console.Registry, history *console.VerifyHistory, interval time.Duration, tables []string) {
 	slog.Info("scheduled verification enabled", "interval", interval)
 	go func() {
-		runCycle := func() {
-			// A panic must NEVER take down the daemon's primary capture — this
-			// background check shares the process with the stream. Mirrors the
-			// baseline-prune loop's guard.
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("scheduled verify cycle panicked; verification continues next tick", "panic", r)
-				}
-			}()
-			var entries []console.ServerEntry
-			if registry != nil {
-				entries = registry.List()
-			}
-			if len(entries) == 0 {
-				// Loud, every cycle: "loop running, verifying nothing" must not
-				// look like "verifying everything". The schedule covers registry
-				// servers; the command-line boot stream is not in the registry.
-				slog.Warn("scheduled verify: no registry servers to verify — the schedule covers servers added in the console UI; a source configured only via command-line flags/env is not covered")
-				return
-			}
-			for _, e := range entries {
-				if ctx.Err() != nil {
-					return
-				}
-				err := sup.RunScheduled(scheduledVerifyRequest(e, tables, upConsoleBaselineDir, upConsoleBaselineS3))
-				if errors.Is(err, console.ErrVerifyRunning) {
-					slog.Info("scheduled verify: skipped, a run is already in flight", "server", e.Name)
-					recordVerifySkip(history, e, "a verify run was already in flight when the schedule fired")
-				}
-			}
-		}
 		if ctx.Err() == nil {
-			runCycle()
+			runScheduledVerifyCycle(ctx, sup, registry, history, tables)
 		}
 		t := time.NewTicker(interval)
 		defer t.Stop()
@@ -947,10 +917,45 @@ func startVerifyLoop(ctx context.Context, sup *verifySupervisor, registry *conso
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				runCycle()
+				runScheduledVerifyCycle(ctx, sup, registry, history, tables)
 			}
 		}
 	}()
+}
+
+// runScheduledVerifyCycle is one pass of the scheduled verification loop —
+// package-level so a unit test can drive registry→request→run→history without
+// the goroutine/ticker plumbing.
+func runScheduledVerifyCycle(ctx context.Context, sup *verifySupervisor, registry *console.Registry, history *console.VerifyHistory, tables []string) {
+	// A panic must NEVER take down the daemon's primary capture — this
+	// background check shares the process with the stream. Mirrors the
+	// baseline-prune loop's guard.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("scheduled verify cycle panicked; verification continues next tick", "panic", r)
+		}
+	}()
+	var entries []console.ServerEntry
+	if registry != nil {
+		entries = registry.List()
+	}
+	if len(entries) == 0 {
+		// Loud, every cycle: "loop running, verifying nothing" must not
+		// look like "verifying everything". The schedule covers registry
+		// servers; the command-line boot stream is not in the registry.
+		slog.Warn("scheduled verify: no registry servers to verify — the schedule covers servers added in the console UI; a source configured only via command-line flags/env is not covered")
+		return
+	}
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		err := sup.RunScheduled(scheduledVerifyRequest(e, tables, upConsoleBaselineDir, upConsoleBaselineS3))
+		if errors.Is(err, console.ErrVerifyRunning) {
+			slog.Info("scheduled verify: skipped, a run is already in flight", "server", e.Name)
+			recordVerifySkip(history, e, "a verify run was already in flight when the schedule fired")
+		}
+	}
 }
 
 // scheduledVerifyRequest picks the check a scheduled cycle runs for one
@@ -988,8 +993,8 @@ func recordVerifySkip(history *console.VerifyHistory, e console.ServerEntry, rea
 		return
 	}
 	err := history.Append(console.VerifyRunRecord{
-		ServerID: e.ID, ServerName: e.Name, Trigger: "scheduled", SkipReason: reason,
-		VerifyStatus: console.VerifyStatus{State: "skipped", Since: nowStamp(), FinishedAt: nowStamp()},
+		ServerID: e.ID, ServerName: e.Name, Trigger: console.VerifyTriggerScheduled, SkipReason: reason,
+		VerifyStatus: console.VerifyStatus{State: console.VerifyStateSkipped, Since: nowStamp(), FinishedAt: nowStamp()},
 	})
 	if err != nil {
 		slog.Warn("scheduled verify: could not persist skip to history", "server", e.Name, "error", err)

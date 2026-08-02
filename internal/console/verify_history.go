@@ -32,6 +32,16 @@ type VerifyRunRecord struct {
 	VerifyStatus
 }
 
+// Trigger values for VerifyRunRecord, plus the history-only "skipped" state:
+// live VerifyStatus.State never carries it — only scheduled cycles that could
+// not run record it. Producers must use these consts; the literals are the
+// wire/file format.
+const (
+	VerifyTriggerManual    = "manual"
+	VerifyTriggerScheduled = "scheduled"
+	VerifyStateSkipped     = "skipped"
+)
+
 // verifyHistoryFile is the on-disk envelope: versioned like the server
 // registry so a future shape change can be detected instead of misparsed.
 type verifyHistoryFile struct {
@@ -43,8 +53,9 @@ const verifyHistoryVersion = 1
 
 // VerifyHistory is the persisted verify-run history (#1191): one JSON file,
 // capped per server, written atomically (temp file + fsync + rename, 0600)
-// like the server registry. Together with the registry it is the ONLY state
-// the console writes — keep it that way.
+// like the server registry. It is console-local state on disk — alongside
+// the registry, the auth file and the managed MCP token — not a new class of
+// console write.
 //
 // It deliberately lives in a console-local file rather than a table in the
 // index database: scheduled verify covers registry servers, and registry DSNs

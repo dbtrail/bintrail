@@ -39,6 +39,18 @@ type Event struct {
 	Timestamp string `json:"timestamp"`
 }
 
+// Stable wire identifiers. Consumers (Slack/PagerDuty routing rules) key on
+// these exact strings — producers must use the consts, never inline literals.
+const (
+	EventContinuityGapLost = "continuity_gap_lost"
+	EventVerifyProblem     = "verify_problem"
+	EventRotationUnhealthy = "rotation_unhealthy"
+
+	SeverityInfo     = "info"
+	SeverityWarning  = "warning"
+	SeverityCritical = "critical"
+)
+
 const (
 	queueSize      = 64
 	sendTimeout    = 10 * time.Second

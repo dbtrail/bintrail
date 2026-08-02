@@ -40,7 +40,7 @@ type verifySupervisor struct {
 	// "when did this last verify" is answered.
 	history *console.VerifyHistory
 	// onFinish, when non-nil, observes the same record history gets (#1192's
-	// notification hook). Assigned once at wiring time, before any run starts.
+	// notification hook). Set only at construction, so no run can race it.
 	onFinish func(console.VerifyRunRecord)
 
 	mu   sync.Mutex
@@ -79,15 +79,16 @@ type verifyJob struct {
 }
 
 // newVerifySupervisor builds a supervisor bound to the daemon context.
-// history may be nil (runs are then not recorded).
-func newVerifySupervisor(ctx context.Context, history *console.VerifyHistory) *verifySupervisor {
-	return &verifySupervisor{ctx: ctx, history: history, jobs: make(map[string]*verifyJob)}
+// history and onFinish may be nil (runs are then not recorded / not
+// observed); both are fixed at construction on purpose — see their fields.
+func newVerifySupervisor(ctx context.Context, history *console.VerifyHistory, onFinish func(console.VerifyRunRecord)) *verifySupervisor {
+	return &verifySupervisor{ctx: ctx, history: history, onFinish: onFinish, jobs: make(map[string]*verifyJob)}
 }
 
 // Trigger starts a verify run in the background; returns
 // console.ErrVerifyRunning if one is already in flight for this server.
 func (s *verifySupervisor) Trigger(req console.VerifyRequest) error {
-	baselineSrc, err := s.begin(req, "manual")
+	baselineSrc, err := s.begin(req, console.VerifyTriggerManual)
 	if err != nil {
 		return err
 	}
@@ -101,7 +102,7 @@ func (s *verifySupervisor) Trigger(req console.VerifyRequest) error {
 // Trigger: a run already in flight wins and this returns
 // console.ErrVerifyRunning for the scheduler to record as a skip.
 func (s *verifySupervisor) RunScheduled(req console.VerifyRequest) error {
-	baselineSrc, err := s.begin(req, "scheduled")
+	baselineSrc, err := s.begin(req, console.VerifyTriggerScheduled)
 	if err != nil {
 		return err
 	}
@@ -257,8 +258,14 @@ func (s *verifySupervisor) run(req console.VerifyRequest, baselineSrc string) {
 		}
 	case console.VerifyModeRecoverInputs:
 		runErr = s.runRecoverInputs(req, db, resolver, dbName)
-	default:
+	case console.VerifyModeBaselineAnchored:
 		runErr = s.runBaselineAnchored(req, baselineSrc, db, resolver, dbName, flavor)
+	default:
+		// Exhaustive on purpose: this dispatch and the handler's mode
+		// validation must move in lockstep. An unrecognized mode fails loudly
+		// — it must never silently run (and, since #1191, persist) the wrong
+		// verification.
+		runErr = fmt.Errorf("unknown verify mode %q", req.Mode)
 	}
 	s.finish(req.ServerID, runErr)
 }

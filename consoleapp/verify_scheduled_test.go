@@ -59,7 +59,7 @@ func TestVerifySupervisor_finishRecordsHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := newVerifySupervisor(context.Background(), hist)
+	s := newVerifySupervisor(context.Background(), hist, nil)
 	req := console.VerifyRequest{ServerID: "srv1", ServerName: "wp", Mode: console.VerifyModeRecoverInputs}
 	if _, err := s.begin(req, "scheduled"); err != nil {
 		t.Fatal(err)

@@ -244,6 +244,55 @@ func TestStartLoop_escalatesAfterConsecutiveFailures(t *testing.T) {
 	<-done
 }
 
+// TestStartLoop_onCycleCallbacks pins the #1192 notification seam: onCycle
+// observes every cycle with the cycle's real health, and a panicking callback
+// neither kills the loop nor suppresses the escalation Error — the callbacks
+// run inside the recover guard, AFTER the streak accounting. (With the order
+// reversed, the per-cycle panic would skip the streak increment and this
+// test's escalation wait would time out.)
+func TestStartLoop_onCycleCallbacks(t *testing.T) {
+	logs := captureSlog(t)
+	prevN := escalateAfter
+	escalateAfter = 2
+	t.Cleanup(func() { escalateAfter = prevN })
+
+	var healthy, unhealthy atomic.Int32
+	s := Settings{
+		Enabled: true, Retain: 24 * time.Hour, RetainRaw: "24h",
+		Interval: 5 * time.Millisecond, AddFuture: 0, Explicit: true,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Port 1 on loopback: every cycle fails, so every callback must see
+	// failed=true.
+	done := StartLoop(ctx, func() Settings { return s },
+		func() []RotateTarget { return []RotateTarget{{DSN: "root:x@tcp(127.0.0.1:1)/nope"}} },
+		func(failed bool, deferred int) {
+			if failed || deferred > 0 {
+				unhealthy.Add(1)
+			} else {
+				healthy.Add(1)
+			}
+			panic("callback bug")
+		})
+
+	deadline := time.After(15 * time.Second)
+	for unhealthy.Load() < 3 || !logs.has(slog.LevelError, "made no progress for consecutive cycles") {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("callbacks=%d escalated=%v — onCycle not driven per cycle, or a panicking callback suppressed the escalation",
+				unhealthy.Load(), logs.has(slog.LevelError, "made no progress for consecutive cycles"))
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	if healthy.Load() != 0 {
+		t.Fatalf("callback reported healthy cycles from an always-failing target: %d", healthy.Load())
+	}
+}
+
 // TestGuardTrips covers the pure decision behind the upgrade guard at its
 // edges: a regression flipping any of these silently disables rotation on
 // fresh installs (unbounded growth) or shreds history it promised to protect.
