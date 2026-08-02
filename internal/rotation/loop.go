@@ -143,9 +143,6 @@ func StartLoop(ctx context.Context, settings func() Settings, targets func() []R
 					}
 				}()
 				deferred, failed := runCycle(ctx, s, targets)
-				for _, cb := range onCycle {
-					cb(failed, deferred)
-				}
 				if failed || deferred > 0 {
 					unhealthyStreak++
 				} else {
@@ -156,6 +153,12 @@ func StartLoop(ctx context.Context, settings func() Settings, targets func() []R
 						"consecutive_cycles", unhealthyStreak,
 						"deferred_last_cycle", deferred,
 						"failed_last_cycle", failed)
+				}
+				// Callbacks run LAST so a panicking callback (caught by the
+				// guard above) can never skip the streak accounting or the
+				// escalation log it exists to amplify.
+				for _, cb := range onCycle {
+					cb(failed, deferred)
 				}
 			}()
 			return s.Interval

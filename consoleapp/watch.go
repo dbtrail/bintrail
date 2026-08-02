@@ -425,7 +425,10 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
 	}
-	notifier := newWatchNotifierFromFlags(ctx)
+	notifier, err := newWatchNotifierFromFlags(ctx)
+	if err != nil {
+		return err
+	}
 	if err := wireVerify(ctx, &cfg, registry, serversPath, notifier); err != nil {
 		return err
 	}
@@ -584,7 +587,10 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
 	}
-	notifier := newWatchNotifierFromFlags(ctx)
+	notifier, err := newWatchNotifierFromFlags(ctx)
+	if err != nil {
+		return err
+	}
 	if err := wireVerify(ctx, &cfg, registry, serversPath, notifier); err != nil {
 		return err
 	}

@@ -466,9 +466,14 @@ it through their inbound-webhook integrations. Notifications are
 **edge-triggered**: one POST on the transition into a bad state, a reminder
 every 24 h while it persists, and one `resolved: true` event (severity
 `info`) on recovery. Delivery is best-effort — bounded retries off the hot
-path, never blocking capture; a dead endpoint costs log warnings, nothing
-else. For pull-based alerting on the same conditions, see the Prometheus
-rules in [observability.md](observability.md).
+path, never blocking capture. A dead or wrong endpoint surfaces as
+rate-limited log warnings, and an event that could not be delivered is not
+re-queued: the next 24 h edge repeat re-sends a still-active condition. Edge
+state is in-memory — after a daemon restart a still-active condition
+re-fires (loud side errs safe), but a recovery that happened *across* the
+restart produces no `resolved` event. For pull-based alerting on the same
+conditions, see the Prometheus rules in
+[observability.md](observability.md).
 
 - **AWS credentials** — which ambient credential signals the daemon process
   can see: env keys (presence only, never values), `AWS_PROFILE`,

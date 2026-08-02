@@ -57,7 +57,7 @@ type Webhook struct {
 	backoff time.Duration // first retry delay; doubles per attempt
 
 	mu       sync.Mutex
-	lastWarn time.Time
+	lastWarn map[string]time.Time // per warn class — queue drops must not mask delivery failures
 }
 
 // NewWebhook starts the delivery worker on ctx (the daemon lifetime).
@@ -65,8 +65,9 @@ func NewWebhook(ctx context.Context, url string) *Webhook {
 	w := &Webhook{
 		url:     url,
 		client:  &http.Client{Timeout: sendTimeout},
-		ch:      make(chan Event, queueSize),
-		backoff: defaultBackoff,
+		ch:       make(chan Event, queueSize),
+		backoff:  defaultBackoff,
+		lastWarn: make(map[string]time.Time),
 	}
 	go w.run(ctx)
 	return w
@@ -80,7 +81,7 @@ func (w *Webhook) Notify(ev Event) {
 	select {
 	case w.ch <- ev:
 	default:
-		w.warn("notify: queue full, dropping event", "event", ev.Event, "server", ev.Server)
+		w.warn("drop", "notify: queue full, dropping event", "event", ev.Event, "server", ev.Server)
 	}
 }
 
@@ -91,14 +92,15 @@ func (w *Webhook) run(ctx context.Context) {
 			return
 		case ev := <-w.ch:
 			if err := w.send(ctx, ev); err != nil {
-				w.warn("notify: webhook delivery failed after retries", "event", ev.Event, "server", ev.Server, "error", err)
+				w.warn("send", "notify: webhook delivery failed after retries", "event", ev.Event, "server", ev.Server, "error", err)
 			}
 		}
 	}
 }
 
-// send posts one event with bounded retries (1s/2s/4s backoff, each attempt
-// under the client timeout). Any 2xx is success; the response body is ignored.
+// send posts one event with bounded retries (two retries, 1s then 2s backoff,
+// each attempt under the client timeout). Any 2xx is success; the response
+// body is ignored.
 func (w *Webhook) send(ctx context.Context, ev Event) error {
 	body, err := json.Marshal(ev)
 	if err != nil {
@@ -134,14 +136,15 @@ func (w *Webhook) send(ctx context.Context, ev Event) error {
 	return lastErr
 }
 
-// warn logs at most once per warnEvery — a dead webhook endpoint must not
-// turn the daemon log into a firehose.
-func (w *Webhook) warn(msg string, args ...any) {
+// warn logs at most once per warnEvery per class — a dead webhook endpoint
+// must not turn the daemon log into a firehose, and one failure class must
+// not mask the other.
+func (w *Webhook) warn(class, msg string, args ...any) {
 	w.mu.Lock()
 	now := time.Now()
-	ok := now.Sub(w.lastWarn) >= warnEvery
+	ok := now.Sub(w.lastWarn[class]) >= warnEvery
 	if ok {
-		w.lastWarn = now
+		w.lastWarn[class] = now
 	}
 	w.mu.Unlock()
 	if ok {

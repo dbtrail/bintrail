@@ -3,8 +3,10 @@ package consoleapp
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -32,20 +34,30 @@ type eventSender interface {
 type watchNotifier struct {
 	send eventSender
 	edge *notify.Edge
+	// lastGapDetail remembers each index's gap_lost_detail so a DIFFERENT gap
+	// arriving while the first is still active reads as a new transition.
+	// Touched only by the continuity poller goroutine — no lock.
+	lastGapDetail map[string]string
 }
 
 func newWatchNotifier(ctx context.Context, url string) *watchNotifier {
-	return &watchNotifier{send: notify.NewWebhook(ctx, url), edge: notify.NewEdge(0)}
+	return &watchNotifier{send: notify.NewWebhook(ctx, url), edge: notify.NewEdge(0), lastGapDetail: make(map[string]string)}
 }
 
 // newWatchNotifierFromFlags builds the notifier when --notify-webhook is set;
-// nil otherwise — every hook then stays disconnected.
-func newWatchNotifierFromFlags(ctx context.Context) *watchNotifier {
+// nil otherwise — every hook then stays disconnected. The URL is validated
+// here so a typo refuses startup instead of surfacing as a buried delivery
+// warning at the moment of the first real incident.
+func newWatchNotifierFromFlags(ctx context.Context) (*watchNotifier, error) {
 	if upNotifyWebhook == "" {
-		return nil
+		return nil, nil
+	}
+	u, err := url.Parse(upNotifyWebhook)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("--notify-webhook: %q is not a valid http(s) URL", upNotifyWebhook)
 	}
 	slog.Info("webhook notifications enabled")
-	return newWatchNotifier(ctx, upNotifyWebhook)
+	return newWatchNotifier(ctx, upNotifyWebhook), nil
 }
 
 // rotationNotifyHooks adapts an optional notifier to rotation.StartLoop's
@@ -65,11 +77,30 @@ func (n *watchNotifier) VerifyFinished(rec console.VerifyRunRecord) {
 	if rec.State == "skipped" {
 		return
 	}
-	key := "verify:" + rec.ServerID
 	s := rec.Summary
-	clean := rec.State == "succeeded" && s.Mismatch == 0 && s.Error == 0
+	// A run that verified nothing must neither alarm as a mismatch nor
+	// reassure. Two shapes land here with zero verified tables: Total == 0
+	// ("only one baseline yet", an empty tables filter) and all-inconclusive
+	// (baseline/archive unreachable). The CLI's Report.ExitError treats
+	// all-inconclusive as a failure, so it fires here too — but never as the
+	// "clean" that would auto-close a real mismatch alert.
+	allInconclusive := s.Total > 0 && s.Inconclusive == s.Total
+	problem := rec.State == "failed" || s.Mismatch > 0 || s.Error > 0 || allInconclusive
+	clean := rec.State == "succeeded" && !problem && s.Match > 0
+	sev := "warning"
+	if s.Mismatch > 0 {
+		sev = "critical"
+	}
+	// The edge key carries the severity class so an escalation (a
+	// warning-grade run followed by a critical mismatch) is a new transition,
+	// never suppressed by the lower tier's repeat window.
+	key := "verify:" + sev + ":" + rec.ServerID
 	if clean {
-		if n.edge.Resolve(key) {
+		resolved := n.edge.Resolve("verify:critical:" + rec.ServerID)
+		if n.edge.Resolve("verify:warning:" + rec.ServerID) {
+			resolved = true
+		}
+		if resolved {
 			n.send.Notify(notify.Event{
 				Event: "verify_problem", Severity: "info", Server: rec.ServerName, Resolved: true,
 				Summary: fmt.Sprintf("verification is clean again: %d/%d tables match", s.Match, s.Total),
@@ -77,17 +108,16 @@ func (n *watchNotifier) VerifyFinished(rec console.VerifyRunRecord) {
 		}
 		return
 	}
-	if !n.edge.Fire(key) {
+	if !problem || !n.edge.Fire(key) {
 		return
-	}
-	sev := "warning"
-	if s.Mismatch > 0 {
-		sev = "critical"
 	}
 	summary := fmt.Sprintf("verification found problems: %d mismatch, %d error, %d inconclusive (%d match)",
 		s.Mismatch, s.Error, s.Inconclusive, s.Match)
-	if rec.State == "failed" {
+	switch {
+	case rec.State == "failed":
 		summary = "verification run failed: " + rec.LastError
+	case allInconclusive:
+		summary = fmt.Sprintf("verification could not verify any table: all %d inconclusive", s.Total)
 	}
 	n.send.Notify(notify.Event{
 		Event: "verify_problem", Severity: sev, Server: rec.ServerName, Summary: summary,
@@ -123,10 +153,13 @@ func (n *watchNotifier) RotationCycle(failed bool, deferred int) {
 }
 
 // Continuity reports one index's stream continuity. gap_lost is critical:
-// events in the gap are permanently unrecoverable.
-func (n *watchNotifier) Continuity(server string, gapLost bool, detail string) {
-	key := "continuity:" + server
+// events in the gap are permanently unrecoverable. edgeKey identifies the
+// index (the target DSN — unique after dedup, unlike display names, which a
+// registry entry could share with the reserved boot label).
+func (n *watchNotifier) Continuity(server, edgeKey string, gapLost bool, detail string) {
+	key := "continuity:" + edgeKey
 	if !gapLost {
+		delete(n.lastGapDetail, key)
 		if n.edge.Resolve(key) {
 			n.send.Notify(notify.Event{
 				Event: "continuity_gap_lost", Severity: "info", Server: server, Resolved: true,
@@ -135,7 +168,12 @@ func (n *watchNotifier) Continuity(server string, gapLost bool, detail string) {
 		}
 		return
 	}
-	if !n.edge.Fire(key) {
+	// A DIFFERENT gap while the first is still active (re-baseline plus a
+	// second loss inside one repeat window) is a new data-loss event, not a
+	// repeat — a changed detail bypasses the suppression window.
+	changed := detail != "" && n.lastGapDetail[key] != "" && detail != n.lastGapDetail[key]
+	n.lastGapDetail[key] = detail
+	if !n.edge.Fire(key) && !changed {
 		return
 	}
 	ev := notify.Event{
@@ -170,11 +208,19 @@ func startContinuityWatch(ctx context.Context, n *watchNotifier, registry *conso
 				if ctx.Err() != nil {
 					return
 				}
-				gapLost, detail, ok := readGapLost(ctx, t.dsn)
-				if !ok {
-					continue // unreachable index or legacy schema — unknowable, never a verdict
+				gapLost, detail, err := readGapLost(ctx, t.dsn)
+				if err != nil {
+					// Unknown is never "no gap" — and never silent either: a
+					// watcher that cannot watch is itself a coverage hole. The
+					// edge keeps this to one warning per day per index.
+					if n.edge.Fire("continuity-unknown:" + t.dsn) {
+						slog.Warn("continuity watch cannot evaluate this index (unreachable, or a legacy schema without the gap columns) — gap_lost will NOT be detected for it",
+							"server", t.name, "error", err)
+					}
+					continue
 				}
-				n.Continuity(t.name, gapLost, detail)
+				n.edge.Resolve("continuity-unknown:" + t.dsn)
+				n.Continuity(t.name, t.dsn, gapLost, detail)
 			}
 		}
 		if ctx.Err() == nil {
@@ -215,14 +261,14 @@ func continuityTargets(registry *console.Registry, bootDSN string) []continuityT
 	return out
 }
 
-// readGapLost reads the gap_lost stamp from one index's stream_state.
-// ok=false means the state is unknowable right now (index unreachable, or a
-// legacy schema without the gap columns) — the caller must treat it as
-// unknown, never as "no gap".
-func readGapLost(ctx context.Context, dsn string) (gapLost bool, detail string, ok bool) {
+// readGapLost reads the gap_lost stamp from one index's stream_state. A
+// non-nil error means the state is unknowable right now (index unreachable,
+// or a legacy schema without the gap columns) — the caller must treat it as
+// unknown, never as "no gap", and must say so.
+func readGapLost(ctx context.Context, dsn string) (gapLost bool, detail string, err error) {
 	db, err := config.Connect(dsn)
 	if err != nil {
-		return false, "", false
+		return false, "", err
 	}
 	defer db.Close()
 	var lost bool
@@ -230,12 +276,12 @@ func readGapLost(ctx context.Context, dsn string) (gapLost bool, detail string, 
 	err = db.QueryRowContext(ctx,
 		"SELECT gap_lost_at IS NOT NULL, gap_lost_detail FROM stream_state WHERE id = 1").Scan(&lost, &d)
 	switch {
-	case err == sql.ErrNoRows:
+	case errors.Is(err, sql.ErrNoRows):
 		// Empty stream_state = no capture ran = genuinely no continuity to
 		// break (same rule as verify's gap evaluation).
-		return false, "", true
+		return false, "", nil
 	case err != nil:
-		return false, "", false
+		return false, "", err
 	}
-	return lost, d.String, true
+	return lost, d.String, nil
 }
