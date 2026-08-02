@@ -311,7 +311,9 @@ func NewServer(cfg Config) *mcp.Server {
 		Name: "list_schema_changes",
 		Description: "List DDL schema changes (CREATE, ALTER, DROP, RENAME, TRUNCATE) " +
 			"recorded during binlog indexing or streaming. " +
-			"Returns the full DDL statement, binlog coordinates, and timestamp for each change.",
+			"Returns the full DDL statement, binlog coordinates, timestamp, and the " +
+			"covering snapshot_id (null = no schema snapshot was taken after the DDL) " +
+			"for each change; set uncovered_only to list just the changes without a snapshot.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:          "List schema changes",
 			ReadOnlyHint:   true,
@@ -493,6 +495,10 @@ type SchemaChangesArgs struct {
 	Since    string `json:"since,omitempty" jsonschema:"Filter changes at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
 	Until    string `json:"until,omitempty" jsonschema:"Filter changes at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
 	Limit    int    `json:"limit,omitempty" jsonschema:"Maximum number of changes to return (default: 100)"`
+	// UncoveredOnly narrows results to DDLs with no covering snapshot — the
+	// rows the status tool's "N DDL(s) detected without auto-snapshot" warning
+	// counts, so an agent can go straight from that warning to the exact rows.
+	UncoveredOnly bool `json:"uncovered_only,omitempty" jsonschema:"Return only changes with no covering schema snapshot (snapshot_id is null) — the ones counted by the status tool's uncovered-DDL warning"`
 }
 
 // rejectSurfaceParams enforces the surface's parameter policy: a non-nil
@@ -891,7 +897,7 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 		}
 		defer t.release()
 
-		q := "SELECT id, detected_at, schema_name, table_name, ddl_type, ddl_query, binlog_file, binlog_pos, gtid FROM schema_changes WHERE 1=1"
+		q := "SELECT id, detected_at, schema_name, table_name, ddl_type, ddl_query, binlog_file, binlog_pos, gtid, snapshot_id FROM schema_changes WHERE 1=1"
 		var params []any
 
 		if args.Schema != "" {
@@ -915,6 +921,9 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 			q += " AND detected_at <= ?"
 			params = append(params, *untilT)
 		}
+		if args.UncoveredOnly {
+			q += " AND snapshot_id IS NULL"
+		}
 		q += " ORDER BY detected_at DESC LIMIT ?"
 		params = append(params, limit)
 
@@ -937,6 +946,10 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 			BinlogFile string `json:"binlog_file"`
 			BinlogPos  int64  `json:"binlog_pos"`
 			GTID       string `json:"gtid,omitempty"`
+			// SnapshotID is the auto-snapshot taken after this DDL. Deliberately
+			// NOT omitempty: an explicit null is the "uncovered DDL" signal the
+			// status tool's warning points at (#1050).
+			SnapshotID *int64 `json:"snapshot_id"`
 		}
 
 		var results []schemaChange
@@ -944,12 +957,16 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 			var sc schemaChange
 			var detectedAt time.Time
 			var gtid sql.NullString
-			if err := rows.Scan(&sc.ID, &detectedAt, &sc.Schema, &sc.Table, &sc.DDLType, &sc.Statement, &sc.BinlogFile, &sc.BinlogPos, &gtid); err != nil {
+			var snapshotID sql.NullInt64
+			if err := rows.Scan(&sc.ID, &detectedAt, &sc.Schema, &sc.Table, &sc.DDLType, &sc.Statement, &sc.BinlogFile, &sc.BinlogPos, &gtid, &snapshotID); err != nil {
 				return ErrorResult(fmt.Errorf("scan: %w", err)), nil, nil
 			}
 			sc.DetectedAt = detectedAt.UTC().Format("2006-01-02 15:04:05")
 			if gtid.Valid {
 				sc.GTID = gtid.String
+			}
+			if snapshotID.Valid {
+				sc.SnapshotID = &snapshotID.Int64
 			}
 			results = append(results, sc)
 		}

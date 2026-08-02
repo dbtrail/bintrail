@@ -84,6 +84,11 @@ type SnapshotStats struct {
 	TableCount  int
 	ColumnCount int
 	FKCount     int
+	// ExcludedTables lists "schema.table" names that failed validation
+	// (non-InnoDB or no explicit primary key) and were left OUT of the
+	// snapshot by TakeSnapshotExcludingInvalid (#1051). Sorted. Always nil
+	// from the strict TakeSnapshot, which errors on the same condition.
+	ExcludedTables []string
 }
 
 // ─── Resolver ────────────────────────────────────────────────────────────────
@@ -820,6 +825,32 @@ type fkRow struct {
 // merge their rows under one id (#844) — and, unlike an earlier
 // MAX(snapshot_id)+1 FOR UPDATE design, can't deadlock each other either.
 func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, error) {
+	return takeSnapshot(sourceDB, indexDB, schemas, false)
+}
+
+// TakeSnapshotExcludingInvalid is the degraded-validation variant of
+// TakeSnapshot used by the stream's DDL auto-snapshot hook (#1051). Where
+// TakeSnapshot rejects the whole snapshot when ANY base table in scope is not
+// InnoDB or lacks an explicit primary key, this variant EXCLUDES those tables
+// from the snapshot (their fk_constraints rows are kept — see the comment at
+// the FK insert below), records each exclusion in snapshot_exclusions under
+// the same snapshot_id, and reports them in SnapshotStats.ExcludedTables so
+// the caller can warn loudly. Rationale: the
+// parser already skips those tables' row events, so they contribute no
+// recoverable data — failing the hook snapshot over them turns any DDL into an
+// indefinite stream crash-loop (the #760 fail-loud abort keeps the checkpoint
+// on the DDL, the restart re-reads it, validation fails again, forever).
+//
+// Every OTHER failure — source unreachable, empty scope, index write error,
+// even "all tables in scope are invalid" — still errors, preserving the #760
+// fail-loud contract for real snapshot failures. `bintrail snapshot` and
+// initial setup keep the strict TakeSnapshot: refusing to START capture
+// against an unsupported schema is a good preflight.
+func TakeSnapshotExcludingInvalid(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, error) {
+	return takeSnapshot(sourceDB, indexDB, schemas, true)
+}
+
+func takeSnapshot(sourceDB, indexDB *sql.DB, schemas []string, excludeInvalid bool) (SnapshotStats, error) {
 	// ── 1. Query information_schema on the source server ─────────────────────
 	var (
 		query string
@@ -881,8 +912,62 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	}
 
 	// ── 1b. Validate: all tables must be InnoDB with explicit PKs ────────────
-	if err := validateTables(sourceDB, schemas, columns); err != nil {
+	nonInnoDB, noPK, err := invalidTables(sourceDB, schemas, columns)
+	if err != nil {
 		return SnapshotStats{}, err
+	}
+	var (
+		excludedTables []string
+		exclusions     []snapshotExclusion
+	)
+	if len(nonInnoDB) > 0 || len(noPK) > 0 {
+		if !excludeInvalid {
+			return SnapshotStats{}, validationError(nonInnoDB, noPK)
+		}
+		// Degraded mode (#1051): drop the offending tables from the snapshot
+		// instead of failing it. A table can be both non-InnoDB and PK-less —
+		// one exclusion entry, combined reason.
+		reasonByKey := make(map[string]string, len(nonInnoDB)+len(noPK))
+		for _, key := range nonInnoDB {
+			reasonByKey[key] = "not InnoDB"
+		}
+		for _, key := range noPK {
+			if r, ok := reasonByKey[key]; ok {
+				reasonByKey[key] = r + "; no primary key"
+			} else {
+				reasonByKey[key] = "no primary key"
+			}
+		}
+		kept := columns[:0]
+		seenExcluded := make(map[string]bool, len(reasonByKey))
+		for _, c := range columns {
+			key := c.schemaName + "." + c.tableName
+			if reason, drop := reasonByKey[key]; drop {
+				delete(seenTables, key)
+				if !seenExcluded[key] {
+					seenExcluded[key] = true
+					exclusions = append(exclusions, snapshotExclusion{
+						schema: c.schemaName, table: c.tableName, reason: reason,
+					})
+				}
+				continue
+			}
+			kept = append(kept, c)
+		}
+		columns = kept
+		if len(columns) == 0 {
+			// Nothing capturable remains — an empty snapshot would silently
+			// blind the resolver to every table, so this stays a hard error.
+			return SnapshotStats{}, fmt.Errorf(
+				"every table in scope failed validation, refusing to write an empty snapshot: %w",
+				validationError(nonInnoDB, noPK))
+		}
+		sort.Slice(exclusions, func(i, j int) bool {
+			return exclusions[i].schema+"."+exclusions[i].table < exclusions[j].schema+"."+exclusions[j].table
+		})
+		for _, e := range exclusions {
+			excludedTables = append(excludedTables, e.schema+"."+e.table)
+		}
 	}
 
 	// ── 1c. Query FK constraints from the source server ─────────────────────
@@ -890,10 +975,27 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	if err != nil {
 		return SnapshotStats{}, err
 	}
+	// Excluded tables' fk_constraints rows are deliberately KEPT (#1051
+	// review): an excluded no-PK InnoDB child can carry a real ON DELETE/
+	// UPDATE CASCADE edge, and dropping its rows would erase that edge from
+	// fk_constraints — recover-cascade would then load no edge, synthesize
+	// nothing, and report a clean Complete over a genuine cascade (and
+	// `recover` would lose its cascade-parent hint). The exclusions are
+	// instead recorded EXPLICITLY in snapshot_exclusions (written below in
+	// the same transaction); the cascade FK loaders flag edges from that
+	// record (CascadeFK.ChildExcludedFromSnapshot) and synthesis reports the
+	// recovery as provably partial.
 
 	// ── 2. Write snapshot atomically into the index database ─────────────────
 	if err := ensureSnapshotIDSeqTable(context.Background(), indexDB); err != nil {
 		return SnapshotStats{}, err
+	}
+	// DDL is an implicit commit in MySQL, so the lazy table creation must
+	// happen BEFORE the write transaction opens.
+	if len(exclusions) > 0 {
+		if err := ensureSnapshotExclusionsTable(context.Background(), indexDB); err != nil {
+			return SnapshotStats{}, err
+		}
 	}
 
 	tx, err := indexDB.Begin()
@@ -1018,15 +1120,28 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 		fkCount = len(fkRows)
 	}
 
+	// ── 2c. Record the exclusions (#1051) ───────────────────────────────────
+	// Same transaction as the snapshot rows: a snapshot that excluded tables
+	// must never commit without the record the cascade loaders flag from.
+	for _, e := range exclusions {
+		if _, err = tx.Exec(
+			"INSERT INTO snapshot_exclusions (snapshot_id, schema_name, table_name, reason) VALUES (?, ?, ?, ?)",
+			nextID, e.schema, e.table, e.reason,
+		); err != nil {
+			return SnapshotStats{}, fmt.Errorf("failed to insert snapshot exclusion: %w", err)
+		}
+	}
+
 	if err = tx.Commit(); err != nil {
 		return SnapshotStats{}, fmt.Errorf("failed to commit snapshot: %w", err)
 	}
 
 	return SnapshotStats{
-		SnapshotID:  nextID,
-		TableCount:  len(seenTables),
-		ColumnCount: len(columns),
-		FKCount:     fkCount,
+		SnapshotID:     nextID,
+		TableCount:     len(seenTables),
+		ColumnCount:    len(columns),
+		FKCount:        fkCount,
+		ExcludedTables: excludedTables,
 	}, nil
 }
 
@@ -1098,11 +1213,14 @@ func queryFKConstraints(sourceDB *sql.DB, schemas []string) ([]fkRow, error) {
 	return fks, nil
 }
 
-// validateTables checks that all base tables in scope use InnoDB and have an
+// invalidTables checks that all base tables in scope use InnoDB and have an
 // explicit primary key. Bintrail requires InnoDB for row-format binary log
 // support and needs primary keys to build pk_values for each event.
-// Returns an error listing all violations; returns nil when all tables pass.
-func validateTables(sourceDB *sql.DB, schemas []string, columns []columnRow) error {
+// Returns the sorted "schema.table" names of every violation (a table can
+// appear in both lists); both nil when all tables pass. The caller decides
+// whether violations are fatal (TakeSnapshot) or degrade to exclusion
+// (TakeSnapshotExcludingInvalid, #1051) — err is reserved for probe failures.
+func invalidTables(sourceDB *sql.DB, schemas []string, columns []columnRow) (nonInnoDBTables, noPKTables []string, err error) {
 	var (
 		tabQuery string
 		tabArgs  []any
@@ -1129,7 +1247,7 @@ func validateTables(sourceDB *sql.DB, schemas []string, columns []columnRow) err
 
 	tabRows, err := sourceDB.Query(tabQuery, tabArgs...)
 	if err != nil {
-		return fmt.Errorf("failed to query information_schema.TABLES: %w", err)
+		return nil, nil, fmt.Errorf("failed to query information_schema.TABLES: %w", err)
 	}
 	defer tabRows.Close()
 
@@ -1140,7 +1258,7 @@ func validateTables(sourceDB *sql.DB, schemas []string, columns []columnRow) err
 		var schemaName, tableName string
 		var engine sql.NullString
 		if err := tabRows.Scan(&schemaName, &tableName, &engine); err != nil {
-			return fmt.Errorf("failed to scan table row: %w", err)
+			return nil, nil, fmt.Errorf("failed to scan table row: %w", err)
 		}
 		key := schemaName + "." + tableName
 		baseTables[key] = struct{}{}
@@ -1149,7 +1267,7 @@ func validateTables(sourceDB *sql.DB, schemas []string, columns []columnRow) err
 		}
 	}
 	if err := tabRows.Err(); err != nil {
-		return fmt.Errorf("failed to iterate tables: %w", err)
+		return nil, nil, fmt.Errorf("failed to iterate tables: %w", err)
 	}
 
 	// Build the set of tables that have at least one PK column.
@@ -1170,11 +1288,12 @@ func validateTables(sourceDB *sql.DB, schemas []string, columns []columnRow) err
 
 	sort.Strings(nonInnoDB)
 	sort.Strings(noPK)
+	return nonInnoDB, noPK, nil
+}
 
-	if len(nonInnoDB) == 0 && len(noPK) == 0 {
-		return nil
-	}
-
+// validationError renders invalidTables' findings as the strict-mode snapshot
+// error. Only called when at least one list is non-empty.
+func validationError(nonInnoDB, noPK []string) error {
 	var msgs []string
 	if len(nonInnoDB) > 0 {
 		msgs = append(msgs, fmt.Sprintf("tables not using InnoDB: %s", strings.Join(nonInnoDB, ", ")))

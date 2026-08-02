@@ -64,12 +64,22 @@ func makeAnonymousGTIDEvent(gno int64) *replication.BinlogEvent {
 	}
 }
 
-// makeQueryEvent builds a BinlogEvent wrapping a QueryEvent.
+// makeQueryEvent builds a BinlogEvent wrapping a QueryEvent with no session
+// default DB (QueryEvent.Schema empty).
 func makeQueryEvent(query string) *replication.BinlogEvent {
 	return &replication.BinlogEvent{
 		Header: &replication.EventHeader{EventType: replication.QUERY_EVENT},
 		Event:  &replication.QueryEvent{Query: []byte(query)},
 	}
+}
+
+// makeQueryEventWithSchema is makeQueryEvent with the session default DB set —
+// how a real server stamps QUERY_EVENTs (e.g. rdsadmin's mysql.* housekeeping
+// arrives with Schema="mysql").
+func makeQueryEventWithSchema(schema, query string) *replication.BinlogEvent {
+	ev := makeQueryEvent(query)
+	ev.Event.(*replication.QueryEvent).Schema = []byte(schema)
+	return ev
 }
 
 // makeXIDEvent builds a BinlogEvent wrapping an XIDEvent (InnoDB commit).

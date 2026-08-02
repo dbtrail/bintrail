@@ -2352,6 +2352,17 @@ func One(ctx context.Context, cfg Config) error {
 	// exits non-zero; a supervisor restart resumes from there, re-reads this
 	// same DDL off the binlog, retries the snapshot, and only then decodes
 	// the rows that follow — with a fresh resolver.
+	//
+	// One carve-out from fail-loud (#1051): VALIDATION failures. The strict
+	// TakeSnapshot rejects the whole snapshot when any base table in scope is
+	// non-InnoDB or PK-less — but here that table still exists on restart, so
+	// the retry loop above never converges and one unrelated no-PK table turns
+	// any DDL into an indefinite crash-loop. Since such tables' row events are
+	// already skipped (they contribute no recoverable data), the hook uses
+	// TakeSnapshotExcludingInvalid, which drops them from the snapshot and
+	// reports them for the loud warning below. Real snapshot failures (source
+	// unreachable, index write error, nothing valid left to capture) still
+	// abort exactly as described above.
 	schemas := cfg.Deps.ParseSchemaList(cfg.Schemas)
 	sp.SetSyncDDLHook(func(ev parser.Event) error {
 		if ev.DDLType == parser.DDLTruncateTable {
@@ -2368,7 +2379,7 @@ func One(ctx context.Context, cfg Config) error {
 			"file", ev.BinlogFile, "pos", ev.EndPos,
 			"ddl_type", ev.DDLType, "schema", ev.Schema, "table", ev.Table)
 
-		stats, snapErr := metadata.TakeSnapshot(sourceDB, indexDB, schemas)
+		stats, snapErr := metadata.TakeSnapshotExcludingInvalid(sourceDB, indexDB, schemas)
 		if snapErr != nil {
 			// Best-effort history record of the attempt, then abort — see the
 			// fail-loud rationale above.
@@ -2376,6 +2387,16 @@ func One(ctx context.Context, cfg Config) error {
 				slog.Warn("failed to record schema change", "error", err)
 			}
 			return fmt.Errorf("auto-snapshot after DDL on %s.%s: %w", ev.Schema, ev.Table, snapErr)
+		}
+		if len(stats.ExcludedTables) > 0 {
+			// #1051: prominent, so the operator learns these tables are
+			// invisible to bintrail from the log rather than from a failed
+			// recovery attempt.
+			slog.Warn("auto-snapshot EXCLUDED tables that are not InnoDB or lack an explicit primary key — "+
+				"their row events are not captured and they are absent from this snapshot; "+
+				"add a primary key (and use InnoDB) to capture them",
+				"excluded_tables", strings.Join(stats.ExcludedTables, ", "),
+				"snapshot_id", stats.SnapshotID)
 		}
 
 		snapID := &stats.SnapshotID

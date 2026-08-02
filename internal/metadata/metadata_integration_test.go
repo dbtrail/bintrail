@@ -146,6 +146,185 @@ func TestTakeSnapshot_bothViolations(t *testing.T) {
 	}
 }
 
+// TestTakeSnapshotExcludingInvalid_degrades pins the #1051 fix: against a scope
+// holding a no-PK table and a MyISAM table, the strict TakeSnapshot must still
+// fail (crash-loop prevention lives ONLY in the hook variant), while
+// TakeSnapshotExcludingInvalid must succeed, report exactly the invalid tables
+// as excluded, keep the valid tables capturable, and KEEP every fk_constraints
+// row — including the excluded child's CASCADE edge, which recover-cascade
+// needs to see to report an honest Incomplete instead of a silent Complete
+// (the cascade-layer half is TestSynthesizeVictims_excludedChildFlagged in
+// internal/cascade).
+func TestTakeSnapshotExcludingInvalid_degrades(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE ok_parent (id INT PRIMARY KEY) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE ok_child (
+		id  INT PRIMARY KEY,
+		pid INT,
+		CONSTRAINT fk_ok_child FOREIGN KEY (pid) REFERENCES ok_parent(id) ON DELETE CASCADE
+	) ENGINE=InnoDB`)
+	// Invalid on two different axes — and nopk_child carries a real CASCADE
+	// FK, whose fk_constraints rows must SURVIVE the exclusion (dropping them
+	// would erase the edge and let recover-cascade report Complete over a
+	// genuine cascade).
+	testutil.MustExec(t, sourceDB, `CREATE TABLE nopk_child (
+		pid INT,
+		CONSTRAINT fk_nopk_child FOREIGN KEY (pid) REFERENCES ok_parent(id) ON DELETE CASCADE
+	) ENGINE=InnoDB`)
+	testutil.MustExec(t, sourceDB, `CREATE TABLE myisam_tbl (id INT PRIMARY KEY) ENGINE=MyISAM`)
+
+	// Strict mode: unchanged — the same scope still fails wholesale.
+	if _, err := TakeSnapshot(sourceDB, indexDB, []string{sourceName}); err == nil {
+		t.Fatal("strict TakeSnapshot must still fail on a scope with invalid tables")
+	}
+
+	stats, err := TakeSnapshotExcludingInvalid(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshotExcludingInvalid: %v", err)
+	}
+
+	wantExcluded := []string{sourceName + ".myisam_tbl", sourceName + ".nopk_child"}
+	if len(stats.ExcludedTables) != 2 ||
+		stats.ExcludedTables[0] != wantExcluded[0] || stats.ExcludedTables[1] != wantExcluded[1] {
+		t.Errorf("ExcludedTables = %v, want %v", stats.ExcludedTables, wantExcluded)
+	}
+	if stats.TableCount != 2 {
+		t.Errorf("TableCount = %d, want 2 (ok_parent + ok_child)", stats.TableCount)
+	}
+
+	// The snapshot rows must cover exactly the valid tables.
+	var snapTables []string
+	rows, err := indexDB.Query(
+		"SELECT DISTINCT table_name FROM schema_snapshots WHERE snapshot_id = ? ORDER BY table_name",
+		stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("query schema_snapshots: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		snapTables = append(snapTables, name)
+	}
+	if len(snapTables) != 2 || snapTables[0] != "ok_child" || snapTables[1] != "ok_parent" {
+		t.Errorf("snapshot tables = %v, want [ok_child ok_parent]", snapTables)
+	}
+
+	// fk_constraints: BOTH children's FK rows survive — the excluded child's
+	// edge is the one recover-cascade must still see (#1051 review).
+	var fkTables []string
+	fkRows, err := indexDB.Query(
+		"SELECT DISTINCT table_name FROM fk_constraints WHERE snapshot_id = ? ORDER BY table_name",
+		stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("query fk_constraints: %v", err)
+	}
+	defer fkRows.Close()
+	for fkRows.Next() {
+		var name string
+		if err := fkRows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		fkTables = append(fkTables, name)
+	}
+	if len(fkTables) != 2 || fkTables[0] != "nopk_child" || fkTables[1] != "ok_child" {
+		t.Errorf("fk_constraints tables = %v, want [nopk_child ok_child]", fkTables)
+	}
+	if stats.FKCount != 2 {
+		t.Errorf("FKCount = %d, want 2", stats.FKCount)
+	}
+
+	// The exclusions must be recorded EXPLICITLY in snapshot_exclusions under
+	// the same snapshot_id (the record the cascade FK loaders flag from —
+	// inferring exclusion from schema_snapshots absence was retired as
+	// unsound), with per-table reasons.
+	exclReasons := map[string]string{}
+	exclRows, err := indexDB.Query(
+		"SELECT table_name, reason FROM snapshot_exclusions WHERE snapshot_id = ? ORDER BY table_name",
+		stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("query snapshot_exclusions: %v", err)
+	}
+	defer exclRows.Close()
+	for exclRows.Next() {
+		var name, reason string
+		if err := exclRows.Scan(&name, &reason); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		exclReasons[name] = reason
+	}
+	if len(exclReasons) != 2 {
+		t.Errorf("snapshot_exclusions rows = %v, want 2", exclReasons)
+	}
+	if exclReasons["myisam_tbl"] != "not InnoDB" {
+		t.Errorf("myisam_tbl reason = %q, want %q", exclReasons["myisam_tbl"], "not InnoDB")
+	}
+	if exclReasons["nopk_child"] != "no primary key" {
+		t.Errorf("nopk_child reason = %q, want %q", exclReasons["nopk_child"], "no primary key")
+	}
+
+	// The resolver loaded from this snapshot sees the valid tables and not the
+	// excluded ones — the property the DDL hook actually depends on.
+	resolver, err := NewResolver(indexDB, stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	if _, err := resolver.Resolve(sourceName, "ok_parent"); err != nil {
+		t.Errorf("resolver must resolve ok_parent: %v", err)
+	}
+	if _, err := resolver.Resolve(sourceName, "nopk_child"); err == nil {
+		t.Error("resolver must NOT resolve the excluded nopk_child")
+	}
+}
+
+// TestTakeSnapshotExcludingInvalid_allInvalidStillFails: degrading must never
+// write an EMPTY snapshot — if every table in scope is invalid there is nothing
+// to capture, and that stays a hard (#760 fail-loud) error even in hook mode.
+func TestTakeSnapshotExcludingInvalid_allInvalidStillFails(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE nopk_tbl (name VARCHAR(100)) ENGINE=InnoDB`)
+
+	_, err := TakeSnapshotExcludingInvalid(sourceDB, indexDB, []string{sourceName})
+	if err == nil {
+		t.Fatal("expected error when every table in scope fails validation, got nil")
+	}
+	if !strings.Contains(err.Error(), "refusing to write an empty snapshot") {
+		t.Errorf("expected empty-snapshot refusal, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), sourceName+".nopk_tbl") {
+		t.Errorf("expected offending table name in error, got: %v", err)
+	}
+}
+
+// TestTakeSnapshotExcludingInvalid_cleanScope: with nothing to exclude the
+// variant must behave exactly like TakeSnapshot — no exclusions reported.
+func TestTakeSnapshotExcludingInvalid_cleanScope(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE orders (id INT PRIMARY KEY, status VARCHAR(20)) ENGINE=InnoDB`)
+
+	stats, err := TakeSnapshotExcludingInvalid(sourceDB, indexDB, []string{sourceName})
+	if err != nil {
+		t.Fatalf("TakeSnapshotExcludingInvalid: %v", err)
+	}
+	if len(stats.ExcludedTables) != 0 {
+		t.Errorf("ExcludedTables = %v, want none", stats.ExcludedTables)
+	}
+	if stats.TableCount != 1 || stats.ColumnCount != 2 {
+		t.Errorf("stats = %+v, want 1 table / 2 columns", stats)
+	}
+}
+
 func TestTakeSnapshot_basic(t *testing.T) {
 	// Create two databases: source (with a real table) and index (for snapshot storage).
 	sourceDB, sourceName := testutil.CreateTestDB(t)

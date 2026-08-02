@@ -2,6 +2,7 @@ package verify
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +52,11 @@ func TestVerifyBaselinePair_pgBypassesPKTypeGate(t *testing.T) {
 
 // TestVerifyBaselinePair_mysqlKeepsPKTypeGate is the contrast: the SAME
 // empty-DATA_TYPE PK on the MySQL path still trips the SupportedPKType gate, so
-// the flag — not some unrelated change — is what gates B1.
+// the flag — not some unrelated change — is what gates B1. Since #1009 the
+// gate's MESSAGE discriminates the empty-DATA_TYPE (PostgreSQL snapshot shape)
+// case: the verdict names the wrong-path cause plainly instead of blaming the
+// PK type — the misleading `has type "" unsupported by the baseline
+// canonicalizer` the issue reproduced.
 func TestVerifyBaselinePair_mysqlKeepsPKTypeGate(t *testing.T) {
 	cfg := BaselineConfig{Resolver: pgResolver(), SourceFlavor: ""} // "" == mysql
 	res, err := VerifyBaselinePair(context.Background(), cfg, BaselinePair{Schema: "app", Table: "orders"})
@@ -61,8 +66,93 @@ func TestVerifyBaselinePair_mysqlKeepsPKTypeGate(t *testing.T) {
 	if res.Status != StatusInconclusive {
 		t.Fatalf("status = %q, want inconclusive", res.Status)
 	}
-	if !strings.Contains(res.Detail, "unsupported by the baseline canonicalizer") {
-		t.Errorf("MySQL must keep the PK-type gate, got: %q", res.Detail)
+	if strings.Contains(res.Detail, "unsupported by the baseline canonicalizer") {
+		t.Errorf("empty DATA_TYPE must get the PostgreSQL-shape verdict, not the misleading PK-type one: %q", res.Detail)
+	}
+	if !strings.Contains(res.Detail, "PostgreSQL snapshot shape") {
+		t.Errorf("want the PostgreSQL-shape wrong-path reason, got: %q", res.Detail)
+	}
+}
+
+// TestVerifyBaselinePair_mysqlUnsupportedTypeKeepsHonestTypeMessage pins the
+// other half of the discrimination: a REAL MySQL type the canonicalizer does
+// not handle keeps the per-table PK-type message — that one is accurate, and
+// the #1009 fix must not blur it into the PostgreSQL verdict.
+func TestVerifyBaselinePair_mysqlUnsupportedTypeKeepsHonestTypeMessage(t *testing.T) {
+	resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"app.orders": {Schema: "app", Table: "orders", Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "float"},
+		}},
+	})
+	cfg := BaselineConfig{Resolver: resolver, SourceFlavor: ""}
+	res, err := VerifyBaselinePair(context.Background(), cfg, BaselinePair{Schema: "app", Table: "orders"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != StatusInconclusive {
+		t.Fatalf("status = %q, want inconclusive", res.Status)
+	}
+	if !strings.Contains(res.Detail, `primary-key column "id" has type "float" unsupported by the baseline canonicalizer`) {
+		t.Errorf("a real unsupported MySQL type must keep the PK-type message, got: %q", res.Detail)
+	}
+	if strings.Contains(res.Detail, "PostgreSQL") {
+		t.Errorf("a real MySQL type must not get the PostgreSQL verdict: %q", res.Detail)
+	}
+}
+
+// TestVerifyTable_pgShapedSnapshotGetsWrongPathVerdict drives the SAME
+// discrimination through the live-source mode's gate (VerifyTable shares
+// pkTypeGateReason with the baseline path). The gate fires before any DB is
+// touched, so SourceDB/IndexDB stay nil.
+func TestVerifyTable_pgShapedSnapshotGetsWrongPathVerdict(t *testing.T) {
+	res, err := VerifyTable(context.Background(), Config{Resolver: pgResolver()}, "app", "orders")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != StatusInconclusive {
+		t.Fatalf("status = %q, want inconclusive", res.Status)
+	}
+	if strings.Contains(res.Detail, "unsupported by the baseline canonicalizer") {
+		t.Errorf("live mode must also drop the misleading PK-type message: %q", res.Detail)
+	}
+	if !strings.Contains(res.Detail, "PostgreSQL snapshot shape") {
+		t.Errorf("want the PostgreSQL-shape wrong-path reason, got: %q", res.Detail)
+	}
+}
+
+// TestReport_pgShapedVerdictFailsRunInBothFormats runs the real verify path for
+// the PG-shaped/wrong-path case end to end into the report: the honest reason
+// survives into the JSON shape (TableReport.Reason via NewReport), and the run
+// FAILS via Report.ExitError — the single exit decision both the text and JSON
+// renderings share — so a cron/CI gate cannot read "nothing proven" as success
+// in either format.
+func TestReport_pgShapedVerdictFailsRunInBothFormats(t *testing.T) {
+	cfg := BaselineConfig{Resolver: pgResolver(), SourceFlavor: ""}
+	res, err := VerifyBaselinePair(context.Background(), cfg, BaselinePair{Schema: "app", Table: "orders"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	rep := NewReport(ModeBaselinePair, []TableResult{res})
+	if rep.Verdict != VerdictUnproven {
+		t.Fatalf("verdict = %q, want %q", rep.Verdict, VerdictUnproven)
+	}
+	if got := rep.Tables[0].Reason; !strings.Contains(got, "PostgreSQL snapshot shape") {
+		t.Errorf("report reason lost the honest verdict: %q", got)
+	}
+	exitErr := rep.ExitError()
+	if exitErr == nil {
+		t.Fatal("ExitError = nil; an all-inconclusive PG-shaped run must fail the run in both formats")
+	}
+	if !strings.Contains(exitErr.Error(), "nothing proven") {
+		t.Errorf("exit error = %q, want the nothing-proven contract", exitErr)
+	}
+	// The JSON document a --format json consumer reads carries the same reason.
+	b, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	if !strings.Contains(string(b), "PostgreSQL snapshot shape") {
+		t.Errorf("JSON report lost the honest verdict: %s", b)
 	}
 }
 

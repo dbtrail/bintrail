@@ -767,6 +767,21 @@ func EnsureSchema(db *sql.DB) error {
 			return fmt.Errorf("failed to create snapshot_id_seq: %w", err)
 		}
 	}
+	// snapshot_exclusions post-dates the original schema (#1051): the explicit
+	// record of tables a degraded DDL-hook snapshot excluded (no PK /
+	// non-InnoDB), which the cascade FK loaders flag from. The writer
+	// self-heals it lazily (metadata.ensureSnapshotExclusionsTable) and the
+	// readers tolerate its absence; creating it eagerly here keeps daemon
+	// startup the migration point, like snapshot_id_seq above.
+	hasSnapshotExclusions, err := tableExists(db, "snapshot_exclusions")
+	if err != nil {
+		return err
+	}
+	if !hasSnapshotExclusions {
+		if _, err := db.Exec(metadata.DDLSnapshotExclusions); err != nil {
+			return fmt.Errorf("failed to create snapshot_exclusions: %w", err)
+		}
+	}
 	return nil
 }
 

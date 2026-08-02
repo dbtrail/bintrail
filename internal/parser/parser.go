@@ -220,16 +220,29 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			} else if kw, isDML := statementDML(string(ev.Query)); isDML {
 				// STATEMENT/MIXED-format DML (or a session flip off ROW): the row
 				// image is not in the binlog, so this change cannot be captured.
-				// Fail LOUD + metric, symmetric to the partial-image guard (#493).
+				// Fail LOUD + metric, symmetric to the partial-image guard (#493) —
+				// but only when the statement's schema is in capture scope; an
+				// out-of-scope drop (system schema, or excluded by the configured
+				// filters) is not a coverage gap and must not raise the alarm
+				// (#1000: RDS's rdsadmin writes mysql.* in STATEMENT format).
 				// NOTE: never log the statement text — a DML statement embeds row
 				// VALUES; keyword + file/pos + connection_id locate it without
 				// leaking data into operator logs.
-				p.logger.Warn("statement-format DML in binlog — event NOT captured (bintrail requires binlog_format=ROW; a STATEMENT/MIXED format or a session-level override produced this)",
-					"file", filename,
-					"pos", binlogEv.Header.LogPos,
-					"statement_type", kw,
-					"connection_id", ev.SlaveProxyID)
-				observe.StatementDMLDropped()
+				if schema := string(ev.Schema); !statementDMLInScope(schema, &p.filters) {
+					p.logger.Debug("statement-format DML for out-of-scope schema — not captured, not a coverage gap",
+						"file", filename,
+						"pos", binlogEv.Header.LogPos,
+						"schema", schema,
+						"statement_type", kw,
+						"connection_id", ev.SlaveProxyID)
+				} else {
+					p.logger.Warn("statement-format DML in binlog — event NOT captured (bintrail requires binlog_format=ROW; a STATEMENT/MIXED format or a session-level override produced this)",
+						"file", filename,
+						"pos", binlogEv.Header.LogPos,
+						"statement_type", kw,
+						"connection_id", ev.SlaveProxyID)
+					observe.StatementDMLDropped()
+				}
 			}
 
 		case *replication.RowsQueryEvent:
@@ -389,7 +402,9 @@ func eventPredatesSnapshot(binlogEv *replication.BinlogEvent, resolver *metadata
 // mysql.rds_heartbeat2 UPDATEs with ~now timestamps) is a routine, permanent
 // skip with NO converging remediation — re-snapshotting still excludes them.
 // It must NOT escalate a file to 'failed' via the gap tracker (#778 regression),
-// only ever warn-and-skip. Keep this list byte-identical to the TakeSnapshot
+// only ever warn-and-skip. statementDMLInScope leans on the same fact: a
+// statement-format DML whose default DB is one of these schemas cannot be a
+// capture gap (#1000). Keep this list byte-identical to the TakeSnapshot
 // NOT IN clause.
 func isSnapshotExcludedSchema(schema string) bool {
 	switch strings.ToLower(schema) {
@@ -913,6 +928,55 @@ func statementDML(queryStr string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// statementDMLInScope reports whether a statement-format DML with the given
+// session default database warrants the operator-facing coverage-gap signal
+// (WARN + statement_dml_dropped metric + capture-skip ledger). The gate keys
+// on the QUERY_EVENT's session default DB — the schema a bare
+// `INSERT INTO t ...` resolves against — which is a HEURISTIC, not proof: a
+// statement can qualify a different schema explicitly, so
+// `USE legacy; UPDATE shop.orders ...` is silenced under `--schemas shop`
+// even though its target is captured. That is issue #1000's accepted
+// tradeoff (the default DB is the only scope key available in the
+// QUERY_EVENT); genuine ambiguity — an empty default DB — errs loud.
+//
+//   - Empty schema (no session default DB): ambiguous → in scope, warn.
+//   - System schema (isSnapshotExcludedSchema): snapshots always exclude
+//     these, so nothing capturable was lost. This is the RDS/Aurora false
+//     alarm: `rdsadmin@localhost` writes mysql.* heartbeat/bookkeeping rows
+//     in STATEMENT format as routine housekeeping on every deployment;
+//     counting those marked Capture health DEGRADED — and, on an idle
+//     source, tripped the consecutive-skip escalation ERROR — with no real
+//     gap anywhere.
+//   - Schema not in the configured --schemas filter: the operator asked not
+//     to capture it.
+//   - --tables filter configured and no filtered table lives in the schema:
+//     same reasoning per-table. When at least one filtered table IS in the
+//     schema, the statement might target it → in scope, warn.
+func statementDMLInScope(schema string, filters *Filters) bool {
+	if schema == "" {
+		return true
+	}
+	if isSnapshotExcludedSchema(schema) {
+		return false
+	}
+	if filters == nil {
+		return true
+	}
+	if filters.Schemas != nil && !filters.Schemas[schema] {
+		return false
+	}
+	if filters.Tables != nil {
+		prefix := schema + "."
+		for key := range filters.Tables {
+			if strings.HasPrefix(key, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 // stripLeadingSQLComments removes leading whitespace and SQL comments so the
