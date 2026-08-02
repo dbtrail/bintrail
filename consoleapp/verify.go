@@ -39,6 +39,9 @@ type verifySupervisor struct {
 	// (#1191) — manual and scheduled alike, so the history is the one place
 	// "when did this last verify" is answered.
 	history *console.VerifyHistory
+	// onFinish, when non-nil, observes the same record history gets (#1192's
+	// notification hook). Assigned once at wiring time, before any run starts.
+	onFinish func(console.VerifyRunRecord)
 
 	mu   sync.Mutex
 	jobs map[string]*verifyJob
@@ -594,6 +597,9 @@ func (s *verifySupervisor) finish(serverID string, err error) {
 		if herr := s.history.Append(rec); herr != nil {
 			slog.Warn("verify: could not persist run to history", "server", serverID, "error", herr)
 		}
+	}
+	if s.onFinish != nil {
+		s.onFinish(rec)
 	}
 }
 

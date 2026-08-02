@@ -97,7 +97,11 @@ type RotateTarget struct {
 // interval re-tunes the ticker. The enabled/disabled decision and the startup
 // banner are taken once from the initial read: a daemon started with rotation
 // off runs no loop (re-enabling needs a restart).
-func StartLoop(ctx context.Context, settings func() Settings, targets func() []RotateTarget) <-chan struct{} {
+// onCycle callbacks (optional) observe each cycle's health — failed reports a
+// rotation error, deferred counts unarchived partitions the cycle declined to
+// drop. They run inside the cycle's recover guard, so a panicking callback
+// cannot take down the loop.
+func StartLoop(ctx context.Context, settings func() Settings, targets func() []RotateTarget, onCycle ...func(failed bool, deferred int)) <-chan struct{} {
 	done := make(chan struct{})
 	s0 := settings()
 	if !s0.Enabled {
@@ -139,6 +143,9 @@ func StartLoop(ctx context.Context, settings func() Settings, targets func() []R
 					}
 				}()
 				deferred, failed := runCycle(ctx, s, targets)
+				for _, cb := range onCycle {
+					cb(failed, deferred)
+				}
 				if failed || deferred > 0 {
 					unhealthyStreak++
 				} else {

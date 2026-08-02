@@ -158,3 +158,42 @@ A Prometheus gauge for this state is not exposed in this release.
   the same coverage, index size, and per-table baseline size in text/JSON, plus
   the stream-continuity verdict.
 - [capacity.md](capacity.md) — sizing math and the `doctor` disk-capacity check.
+
+## Example Prometheus alert rules
+
+The push-based sibling of these metrics is the watch daemon's
+`--notify-webhook` (see [console.md](console.md#webhook-notifications)).
+For pull-based alerting, a starting rule set over the metrics above:
+
+```yaml
+groups:
+  - name: bintrail
+    rules:
+      - alert: BintrailCoverageGap
+        expr: bintrail_index_gap_hours > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "bintrail: hours rotated out of MySQL but not archived — holes in recovery coverage"
+      - alert: BintrailStreamDown
+        expr: up{job="bintrail"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "bintrail stream/metrics endpoint is down — capture may have stopped"
+      - alert: BintrailReplicationLagHigh
+        expr: bintrail_stream_replication_lag_seconds > 300
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "bintrail capture is more than 5 minutes behind the source"
+      - alert: BintrailStreamErrors
+        expr: rate(bintrail_stream_errors_total[15m]) > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "bintrail stream is logging errors — check the daemon log"
+```
+
+Tune thresholds to your write rate; on a genuinely idle source the lag gauge
+grows between writes, so widen its threshold there.
