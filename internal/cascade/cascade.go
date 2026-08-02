@@ -858,12 +858,20 @@ func SynthesizeVictims(
 						// #1051: same capture gap as the delete path — the child's
 						// events were never captured, so the scan below is a
 						// guaranteed zero. cascadedHere stays true (the parent's own
-						// reversal is still real and emitted); only the child half
-						// is missing, and that must never be silent.
-						addIncomplete("childabsent:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+						// reversal is still real and emitted), which is exactly why
+						// this caveat must say more than the delete path's: the
+						// emitted SQL reverts the parent's key (FK checks are off
+						// during apply, so nothing re-cascades), leaving the
+						// uncaptured child rows still pointing at the post-cascade
+						// key that the reversal removes. Own dedup key
+						// (childabsentupd:), so a child absent under both a delete
+						// edge and an update edge surfaces both caveats.
+						addIncomplete("childabsentupd:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
 							"%s.%s has cascading FK %q but is absent from the schema snapshot "+
 								"(tables without an explicit primary key or not using InnoDB are excluded "+
-								"and their row events never captured); its cascade-affected rows could NOT be reconstructed",
+								"and their row events never captured); its cascade-rewritten FK columns could NOT be restored, "+
+								"and the parent key reversal in the emitted SQL is still applied, leaving those uncaptured "+
+								"child rows referencing a key that no longer exists",
 							fk.Schema, fk.Table, fk.ConstraintName))
 						continue
 					}

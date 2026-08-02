@@ -61,6 +61,12 @@ func TestLoadCascadeFKsFromIndex(t *testing.T) {
 	byTable := map[string]cascade.CascadeFK{}
 	for _, fk := range fks {
 		byTable[fk.Table] = fk
+		// A strict snapshot captures every table, so no edge may carry the
+		// #1051 degraded-snapshot marker (a spurious true would fabricate
+		// "provably partial" caveats over a complete recovery).
+		if fk.ChildAbsentFromSnapshot {
+			t.Errorf("edge %s.%s must not be marked ChildAbsentFromSnapshot under a strict snapshot", fk.Schema, fk.Table)
+		}
 	}
 	if c, ok := byTable["child_c"]; !ok || c.DeleteRule != "CASCADE" ||
 		c.ReferencedTable != "parent" || c.ReferencedColumn != "id" || c.Column != "pid" {
@@ -143,6 +149,24 @@ func TestSynthesizeVictims_excludedChildFlagged(t *testing.T) {
 	}
 	if okc, ok := byTable["ok_child"]; !ok || okc.ChildAbsentFromSnapshot {
 		t.Errorf("ok_child edge must load unmarked, got %+v (ok=%v)", okc, ok)
+	}
+
+	// The schema-scoped LoadCascadeFKs hand-duplicates the child_absent SELECT
+	// (it has no other caller-driven coverage) — pin that it marks the same
+	// edge, so the two loaders cannot drift.
+	scoped, err := cascade.LoadCascadeFKs(ctx, indexDB, []string{sourceName}, time.Now())
+	if err != nil {
+		t.Fatalf("LoadCascadeFKs: %v", err)
+	}
+	scopedByTable := map[string]cascade.CascadeFK{}
+	for _, fk := range scoped {
+		scopedByTable[fk.Table] = fk
+	}
+	if n, ok := scopedByTable["nopk_child"]; !ok || !n.ChildAbsentFromSnapshot {
+		t.Errorf("LoadCascadeFKs must mark nopk_child ChildAbsentFromSnapshot, got %+v (ok=%v)", n, ok)
+	}
+	if okc, ok := scopedByTable["ok_child"]; !ok || okc.ChildAbsentFromSnapshot {
+		t.Errorf("LoadCascadeFKs must load ok_child unmarked, got %+v (ok=%v)", okc, ok)
 	}
 
 	eng := query.New(indexDB)
