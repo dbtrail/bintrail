@@ -239,6 +239,35 @@ func TestTakeSnapshotExcludingInvalid_degrades(t *testing.T) {
 		t.Errorf("FKCount = %d, want 2", stats.FKCount)
 	}
 
+	// The exclusions must be recorded EXPLICITLY in snapshot_exclusions under
+	// the same snapshot_id (the record the cascade FK loaders flag from —
+	// inferring exclusion from schema_snapshots absence was retired as
+	// unsound), with per-table reasons.
+	exclReasons := map[string]string{}
+	exclRows, err := indexDB.Query(
+		"SELECT table_name, reason FROM snapshot_exclusions WHERE snapshot_id = ? ORDER BY table_name",
+		stats.SnapshotID)
+	if err != nil {
+		t.Fatalf("query snapshot_exclusions: %v", err)
+	}
+	defer exclRows.Close()
+	for exclRows.Next() {
+		var name, reason string
+		if err := exclRows.Scan(&name, &reason); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		exclReasons[name] = reason
+	}
+	if len(exclReasons) != 2 {
+		t.Errorf("snapshot_exclusions rows = %v, want 2", exclReasons)
+	}
+	if exclReasons["myisam_tbl"] != "not InnoDB" {
+		t.Errorf("myisam_tbl reason = %q, want %q", exclReasons["myisam_tbl"], "not InnoDB")
+	}
+	if exclReasons["nopk_child"] != "no primary key" {
+		t.Errorf("nopk_child reason = %q, want %q", exclReasons["nopk_child"], "no primary key")
+	}
+
 	// The resolver loaded from this snapshot sees the valid tables and not the
 	// excluded ones — the property the DDL hook actually depends on.
 	resolver, err := NewResolver(indexDB, stats.SnapshotID)

@@ -12,7 +12,7 @@ import (
 )
 
 // These are the no-MySQL unit halves of the #1051 excluded-child guard: both
-// synthesis sites must flag a ChildAbsentFromSnapshot edge BEFORE any index
+// synthesis sites must flag a ChildExcludedFromSnapshot edge BEFORE any index
 // scan, so a nil-DB engine proves the skip happens up front (any fetch would
 // panic). Hand-built edges are acceptable here because the real
 // writer→loader→flag chain is pinned by the integration tests
@@ -27,7 +27,7 @@ func TestSynthesizeVictims_excludedChildDeleteUnit(t *testing.T) {
 		Schema: "app", Table: "child", ConstraintName: "fk_del", Column: "pid",
 		ReferencedSchema: "app", ReferencedTable: "parent", ReferencedColumn: "id",
 		DeleteRule: "CASCADE", UpdateRule: "RESTRICT",
-		ChildAbsentFromSnapshot: true,
+		ChildExcludedFromSnapshot: true,
 	}}
 	parentDel := query.ResultRow{
 		SchemaName: "app", TableName: "parent", EventType: event.EventDelete,
@@ -71,7 +71,7 @@ func TestSynthesizeVictims_excludedChildUpdateUnit(t *testing.T) {
 		Schema: "app", Table: "child", ConstraintName: "fk_upd", Column: "pid",
 		ReferencedSchema: "app", ReferencedTable: "parent", ReferencedColumn: "id",
 		DeleteRule: "RESTRICT", UpdateRule: "CASCADE",
-		ChildAbsentFromSnapshot: true,
+		ChildExcludedFromSnapshot: true,
 	}}
 	parentUpd := query.ResultRow{
 		SchemaName: "app", TableName: "parent", EventType: event.EventUpdate,

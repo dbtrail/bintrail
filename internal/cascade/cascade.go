@@ -69,13 +69,17 @@ type CascadeFK struct {
 	ReferencedColumn string // parent referenced column (usually its PK)
 	DeleteRule       string // CASCADE, RESTRICT, SET NULL, NO ACTION
 	UpdateRule       string // ON UPDATE rule
-	// ChildAbsentFromSnapshot marks an edge whose child table has NO rows in
-	// the schema snapshot the FK graph was loaded from — a degraded snapshot
-	// excluded it (no explicit PK / non-InnoDB, #1051). Such a child's row
-	// events were never captured, so synthesis can find nothing for it; the
-	// walk must report the recovery as provably partial instead of presenting
-	// the inevitable zero-child scan as a clean Complete.
-	ChildAbsentFromSnapshot bool
+	// ChildExcludedFromSnapshot marks an edge whose child table the snapshot
+	// writer EXPLICITLY excluded (snapshot_exclusions, written by a degraded
+	// DDL-hook snapshot for no-PK / non-InnoDB tables, #1051). Such a child's
+	// row events were never captured, so synthesis can find nothing for it;
+	// the walk must report the recovery as provably partial instead of
+	// presenting the inevitable zero-child scan as a clean Complete. The flag
+	// is loaded ONLY from that explicit record — never inferred from the
+	// child's absence in schema_snapshots, which a mid-snapshot CREATE TABLE
+	// race (or a hand-seeded index) can produce with nothing excluded — so it
+	// cannot fire a false "provably partial" on a complete recovery.
+	ChildExcludedFromSnapshot bool
 }
 
 // BaselineRow is one child row from a baseline snapshot, with its primary key
@@ -854,7 +858,7 @@ func SynthesizeVictims(
 					}
 					parentOldKey := valToString(oldVal)
 					cascadedHere = true
-					if fk.ChildAbsentFromSnapshot {
+					if fk.ChildExcludedFromSnapshot {
 						// #1051: same capture gap as the delete path — the child's
 						// events were never captured, so the scan below is a
 						// guaranteed zero. cascadedHere stays true (the parent's own
@@ -864,10 +868,10 @@ func SynthesizeVictims(
 						// during apply, so nothing re-cascades), leaving the
 						// uncaptured child rows still pointing at the post-cascade
 						// key that the reversal removes. Own dedup key
-						// (childabsentupd:), so a child absent under both a delete
-						// edge and an update edge surfaces both caveats.
-						addIncomplete("childabsentupd:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-							"%s.%s has cascading FK %q but is absent from the schema snapshot "+
+						// (childexcludedupd:), so a child excluded under both a
+						// delete edge and an update edge surfaces both caveats.
+						addIncomplete("childexcludedupd:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+							"%s.%s has cascading FK %q but was excluded from the schema snapshot "+
 								"(tables without an explicit primary key or not using InnoDB are excluded "+
 								"and their row events never captured); its cascade-rewritten FK columns could NOT be restored, "+
 								"and the parent key reversal in the emitted SQL is still applied, leaving those uncaptured "+
@@ -964,15 +968,15 @@ func SynthesizeVictims(
 			}
 
 			for _, fk := range byParentDelete[pev.SchemaName+"."+pev.TableName] {
-				if fk.ChildAbsentFromSnapshot {
+				if fk.ChildExcludedFromSnapshot {
 					// #1051: the FK snapshot knows this cascading edge, but its
 					// child was excluded from the schema snapshot (no PK /
 					// non-InnoDB) so its row events were never captured. The
 					// candidate scan below can only ever return zero — a capture
 					// gap, not proof of no children — so skip it and report the
 					// recovery as provably partial instead of a silent Complete.
-					addIncomplete("childabsent:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-						"%s.%s has cascading FK %q but is absent from the schema snapshot "+
+					addIncomplete("childexcluded:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+						"%s.%s has cascading FK %q but was excluded from the schema snapshot "+
 							"(tables without an explicit primary key or not using InnoDB are excluded "+
 							"and their row events never captured); its cascade-affected rows could NOT be reconstructed",
 						fk.Schema, fk.Table, fk.ConstraintName))
@@ -1386,17 +1390,14 @@ func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string, at t
 	if snapID == 0 {
 		return nil, nil
 	}
-	// child_absent: the #1051 degraded-snapshot signal — an FK edge whose
-	// child table has no schema_snapshots rows under the SAME snapshot was
-	// excluded from it (no PK / non-InnoDB), so its row events were never
-	// captured. See CascadeFK.ChildAbsentFromSnapshot.
+	hasExclusions, err := snapshotExclusionsPresent(ctx, indexDB)
+	if err != nil {
+		return nil, err
+	}
 	q := `SELECT fk.schema_name, fk.table_name, fk.constraint_name, fk.column_name,
 	       fk.referenced_schema_name, fk.referenced_table_name, fk.referenced_column_name,
 	       fk.delete_rule, fk.update_rule,
-	       NOT EXISTS (SELECT 1 FROM schema_snapshots ss
-	                   WHERE ss.snapshot_id = fk.snapshot_id
-	                     AND ss.schema_name = fk.schema_name
-	                     AND ss.table_name = fk.table_name) AS child_absent
+	       ` + childExcludedExpr(hasExclusions) + `
 	FROM fk_constraints fk
 	WHERE fk.snapshot_id = ?`
 	args := []any{snapID}
@@ -1419,12 +1420,43 @@ func LoadCascadeFKs(ctx context.Context, indexDB *sql.DB, schemas []string, at t
 		var fk CascadeFK
 		if err := rows.Scan(&fk.Schema, &fk.Table, &fk.ConstraintName, &fk.Column,
 			&fk.ReferencedSchema, &fk.ReferencedTable, &fk.ReferencedColumn,
-			&fk.DeleteRule, &fk.UpdateRule, &fk.ChildAbsentFromSnapshot); err != nil {
+			&fk.DeleteRule, &fk.UpdateRule, &fk.ChildExcludedFromSnapshot); err != nil {
 			return nil, fmt.Errorf("scan cascade FK row: %w", err)
 		}
 		out = append(out, fk)
 	}
 	return out, rows.Err()
+}
+
+// snapshotExclusionsPresent reports whether the index has the
+// snapshot_exclusions table (written by degraded snapshots, #1051). Absent —
+// a legacy index, or one no degraded snapshot ever touched — means "no
+// exclusions", never an error: same tolerance CascadeParentRulesInIndex
+// extends to a missing fk_constraints.
+func snapshotExclusionsPresent(ctx context.Context, db *sql.DB) (bool, error) {
+	var exists bool
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) > 0 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'snapshot_exclusions'",
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check snapshot_exclusions table: %w", err)
+	}
+	return exists, nil
+}
+
+// childExcludedExpr is the SELECT expression behind
+// CascadeFK.ChildExcludedFromSnapshot, shared by both FK loaders so the two
+// hand-written SELECTs cannot drift: the child appears in snapshot_exclusions
+// under the SAME snapshot_id (the explicit #1051 degraded-snapshot record).
+// When the table does not exist the expression must be a constant FALSE — a
+// reference to a missing table would fail the whole load.
+func childExcludedExpr(hasExclusions bool) string {
+	if !hasExclusions {
+		return "FALSE AS child_excluded"
+	}
+	return `EXISTS (SELECT 1 FROM snapshot_exclusions se
+	                   WHERE se.snapshot_id = fk.snapshot_id
+	                     AND se.schema_name = fk.schema_name
+	                     AND se.table_name = fk.table_name) AS child_excluded`
 }
 
 // LoadCascadeFKsForParent loads the FK edges needed to reconstruct cascades rooted
@@ -1478,8 +1510,14 @@ func LoadCascadeFKsForParent(ctx context.Context, indexDB *sql.DB, parentSchema 
 			"no FK snapshot predates the root delete (%s); used the earliest recorded FK graph, which may not reflect the FK topology in effect at delete time",
 			at.UTC().Format(time.RFC3339))
 	}
+	// Probed once per load, not once per frontier batch — the closure below
+	// may call the loader several times for multi-schema cascades.
+	hasExclusions, err := snapshotExclusionsPresent(ctx, indexDB)
+	if err != nil {
+		return nil, 0, "", err
+	}
 	fks, err = loadCascadeClosure(ctx, parentSchema, func(ctx context.Context, refSchemas []string) ([]CascadeFK, error) {
-		return loadCascadeFKsByReferencedSchema(ctx, indexDB, refSchemas, snapID)
+		return loadCascadeFKsByReferencedSchema(ctx, indexDB, refSchemas, snapID, hasExclusions)
 	})
 	return fks, snapID, caveat, err
 }
@@ -1530,19 +1568,15 @@ func loadCascadeClosure(ctx context.Context, parentSchema string, load reference
 // fkSnapshotIDAt). It mirrors LoadCascadeFKs's SELECT (all edges, rules
 // included — SynthesizeVictims gates on DeleteRule) but filters on
 // referenced_schema_name instead of schema_name.
-func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refSchemas []string, snapID uint32) ([]CascadeFK, error) {
+func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refSchemas []string, snapID uint32, exclusionsPresent bool) ([]CascadeFK, error) {
 	if len(refSchemas) == 0 {
 		return nil, nil
 	}
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(refSchemas)), ",")
-	// child_absent: same #1051 degraded-snapshot signal as LoadCascadeFKs.
 	q := `SELECT fk.schema_name, fk.table_name, fk.constraint_name, fk.column_name,
 	       fk.referenced_schema_name, fk.referenced_table_name, fk.referenced_column_name,
 	       fk.delete_rule, fk.update_rule,
-	       NOT EXISTS (SELECT 1 FROM schema_snapshots ss
-	                   WHERE ss.snapshot_id = fk.snapshot_id
-	                     AND ss.schema_name = fk.schema_name
-	                     AND ss.table_name = fk.table_name) AS child_absent
+	       ` + childExcludedExpr(exclusionsPresent) + `
 	FROM fk_constraints fk
 	WHERE fk.snapshot_id = ?
 	  AND fk.referenced_schema_name IN (` + placeholders + `)
@@ -1562,7 +1596,7 @@ func loadCascadeFKsByReferencedSchema(ctx context.Context, indexDB *sql.DB, refS
 		var fk CascadeFK
 		if err := rows.Scan(&fk.Schema, &fk.Table, &fk.ConstraintName, &fk.Column,
 			&fk.ReferencedSchema, &fk.ReferencedTable, &fk.ReferencedColumn,
-			&fk.DeleteRule, &fk.UpdateRule, &fk.ChildAbsentFromSnapshot); err != nil {
+			&fk.DeleteRule, &fk.UpdateRule, &fk.ChildExcludedFromSnapshot); err != nil {
 			return nil, fmt.Errorf("scan cascade FK row: %w", err)
 		}
 		out = append(out, fk)

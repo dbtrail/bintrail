@@ -833,7 +833,8 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 // TakeSnapshot rejects the whole snapshot when ANY base table in scope is not
 // InnoDB or lacks an explicit primary key, this variant EXCLUDES those tables
 // from the snapshot (their fk_constraints rows are kept — see the comment at
-// the FK insert below) and reports them in SnapshotStats.ExcludedTables so
+// the FK insert below), records each exclusion in snapshot_exclusions under
+// the same snapshot_id, and reports them in SnapshotStats.ExcludedTables so
 // the caller can warn loudly. Rationale: the
 // parser already skips those tables' row events, so they contribute no
 // recoverable data — failing the hook snapshot over them turns any DDL into an
@@ -915,26 +916,40 @@ func takeSnapshot(sourceDB, indexDB *sql.DB, schemas []string, excludeInvalid bo
 	if err != nil {
 		return SnapshotStats{}, err
 	}
-	var excludedTables []string
+	var (
+		excludedTables []string
+		exclusions     []snapshotExclusion
+	)
 	if len(nonInnoDB) > 0 || len(noPK) > 0 {
 		if !excludeInvalid {
 			return SnapshotStats{}, validationError(nonInnoDB, noPK)
 		}
 		// Degraded mode (#1051): drop the offending tables from the snapshot
-		// instead of failing it. Deduplicate — a table can be both non-InnoDB
-		// and PK-less.
-		excludedSet := make(map[string]struct{}, len(nonInnoDB)+len(noPK))
+		// instead of failing it. A table can be both non-InnoDB and PK-less —
+		// one exclusion entry, combined reason.
+		reasonByKey := make(map[string]string, len(nonInnoDB)+len(noPK))
 		for _, key := range nonInnoDB {
-			excludedSet[key] = struct{}{}
+			reasonByKey[key] = "not InnoDB"
 		}
 		for _, key := range noPK {
-			excludedSet[key] = struct{}{}
+			if r, ok := reasonByKey[key]; ok {
+				reasonByKey[key] = r + "; no primary key"
+			} else {
+				reasonByKey[key] = "no primary key"
+			}
 		}
 		kept := columns[:0]
+		seenExcluded := make(map[string]bool, len(reasonByKey))
 		for _, c := range columns {
 			key := c.schemaName + "." + c.tableName
-			if _, drop := excludedSet[key]; drop {
+			if reason, drop := reasonByKey[key]; drop {
 				delete(seenTables, key)
+				if !seenExcluded[key] {
+					seenExcluded[key] = true
+					exclusions = append(exclusions, snapshotExclusion{
+						schema: c.schemaName, table: c.tableName, reason: reason,
+					})
+				}
 				continue
 			}
 			kept = append(kept, c)
@@ -947,10 +962,12 @@ func takeSnapshot(sourceDB, indexDB *sql.DB, schemas []string, excludeInvalid bo
 				"every table in scope failed validation, refusing to write an empty snapshot: %w",
 				validationError(nonInnoDB, noPK))
 		}
-		for key := range excludedSet {
-			excludedTables = append(excludedTables, key)
+		sort.Slice(exclusions, func(i, j int) bool {
+			return exclusions[i].schema+"."+exclusions[i].table < exclusions[j].schema+"."+exclusions[j].table
+		})
+		for _, e := range exclusions {
+			excludedTables = append(excludedTables, e.schema+"."+e.table)
 		}
-		sort.Strings(excludedTables)
 	}
 
 	// ── 1c. Query FK constraints from the source server ─────────────────────
@@ -963,14 +980,22 @@ func takeSnapshot(sourceDB, indexDB *sql.DB, schemas []string, excludeInvalid bo
 	// UPDATE CASCADE edge, and dropping its rows would erase that edge from
 	// fk_constraints — recover-cascade would then load no edge, synthesize
 	// nothing, and report a clean Complete over a genuine cascade (and
-	// `recover` would lose its cascade-parent hint). The cascade engine
-	// instead detects that an edge's child table has no rows in the snapshot
-	// (CascadeFK.ChildAbsentFromSnapshot) and reports the recovery as
-	// provably partial.
+	// `recover` would lose its cascade-parent hint). The exclusions are
+	// instead recorded EXPLICITLY in snapshot_exclusions (written below in
+	// the same transaction); the cascade FK loaders flag edges from that
+	// record (CascadeFK.ChildExcludedFromSnapshot) and synthesis reports the
+	// recovery as provably partial.
 
 	// ── 2. Write snapshot atomically into the index database ─────────────────
 	if err := ensureSnapshotIDSeqTable(context.Background(), indexDB); err != nil {
 		return SnapshotStats{}, err
+	}
+	// DDL is an implicit commit in MySQL, so the lazy table creation must
+	// happen BEFORE the write transaction opens.
+	if len(exclusions) > 0 {
+		if err := ensureSnapshotExclusionsTable(context.Background(), indexDB); err != nil {
+			return SnapshotStats{}, err
+		}
 	}
 
 	tx, err := indexDB.Begin()
@@ -1093,6 +1118,18 @@ func takeSnapshot(sourceDB, indexDB *sql.DB, schemas []string, excludeInvalid bo
 			}
 		}
 		fkCount = len(fkRows)
+	}
+
+	// ── 2c. Record the exclusions (#1051) ───────────────────────────────────
+	// Same transaction as the snapshot rows: a snapshot that excluded tables
+	// must never commit without the record the cascade loaders flag from.
+	for _, e := range exclusions {
+		if _, err = tx.Exec(
+			"INSERT INTO snapshot_exclusions (snapshot_id, schema_name, table_name, reason) VALUES (?, ?, ?, ?)",
+			nextID, e.schema, e.table, e.reason,
+		); err != nil {
+			return SnapshotStats{}, fmt.Errorf("failed to insert snapshot exclusion: %w", err)
+		}
 	}
 
 	if err = tx.Commit(); err != nil {

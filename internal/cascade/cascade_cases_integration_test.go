@@ -64,8 +64,8 @@ func TestLoadCascadeFKsFromIndex(t *testing.T) {
 		// A strict snapshot captures every table, so no edge may carry the
 		// #1051 degraded-snapshot marker (a spurious true would fabricate
 		// "provably partial" caveats over a complete recovery).
-		if fk.ChildAbsentFromSnapshot {
-			t.Errorf("edge %s.%s must not be marked ChildAbsentFromSnapshot under a strict snapshot", fk.Schema, fk.Table)
+		if fk.ChildExcludedFromSnapshot {
+			t.Errorf("edge %s.%s must not be marked ChildExcludedFromSnapshot under a strict snapshot", fk.Schema, fk.Table)
 		}
 	}
 	if c, ok := byTable["child_c"]; !ok || c.DeleteRule != "CASCADE" ||
@@ -105,7 +105,7 @@ func TestLoadCascadeFKsFromIndex(t *testing.T) {
 // TestSynthesizeVictims_excludedChildFlagged pins the #1051 review fix: a
 // degraded snapshot (metadata.TakeSnapshotExcludingInvalid) KEEPS the
 // fk_constraints rows of an excluded no-PK CASCADE child, the loaders mark the
-// edge ChildAbsentFromSnapshot, and synthesis over a parent DELETE reports the
+// edge ChildExcludedFromSnapshot, and synthesis over a parent DELETE reports the
 // recovery as provably partial — the child's row events were never captured,
 // so its guaranteed zero-candidate scan must never read as a clean Complete.
 // A valid sibling child on the same parent must stay unflagged.
@@ -144,10 +144,10 @@ func TestSynthesizeVictims_excludedChildFlagged(t *testing.T) {
 	if !ok {
 		t.Fatal("excluded child's CASCADE edge must still load from fk_constraints")
 	}
-	if !nopk.ChildAbsentFromSnapshot {
-		t.Error("nopk_child edge must be marked ChildAbsentFromSnapshot")
+	if !nopk.ChildExcludedFromSnapshot {
+		t.Error("nopk_child edge must be marked ChildExcludedFromSnapshot")
 	}
-	if okc, ok := byTable["ok_child"]; !ok || okc.ChildAbsentFromSnapshot {
+	if okc, ok := byTable["ok_child"]; !ok || okc.ChildExcludedFromSnapshot {
 		t.Errorf("ok_child edge must load unmarked, got %+v (ok=%v)", okc, ok)
 	}
 
@@ -162,10 +162,10 @@ func TestSynthesizeVictims_excludedChildFlagged(t *testing.T) {
 	for _, fk := range scoped {
 		scopedByTable[fk.Table] = fk
 	}
-	if n, ok := scopedByTable["nopk_child"]; !ok || !n.ChildAbsentFromSnapshot {
-		t.Errorf("LoadCascadeFKs must mark nopk_child ChildAbsentFromSnapshot, got %+v (ok=%v)", n, ok)
+	if n, ok := scopedByTable["nopk_child"]; !ok || !n.ChildExcludedFromSnapshot {
+		t.Errorf("LoadCascadeFKs must mark nopk_child ChildExcludedFromSnapshot, got %+v (ok=%v)", n, ok)
 	}
-	if okc, ok := scopedByTable["ok_child"]; !ok || okc.ChildAbsentFromSnapshot {
+	if okc, ok := scopedByTable["ok_child"]; !ok || okc.ChildExcludedFromSnapshot {
 		t.Errorf("LoadCascadeFKs must load ok_child unmarked, got %+v (ok=%v)", okc, ok)
 	}
 
