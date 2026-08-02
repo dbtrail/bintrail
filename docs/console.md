@@ -472,8 +472,10 @@ rate-limited log warnings, and an event that could not be delivered is not
 re-queued: the next 24 h edge repeat re-sends a still-active condition. Edge
 state is in-memory — after a daemon restart a still-active condition
 re-fires (loud side errs safe), but a recovery that happened *across* the
-restart produces no `resolved` event. For pull-based alerting on the same
-conditions, see the Prometheus rules in
+restart produces no `resolved` event. The same three conditions are also
+exported as Prometheus gauges under `--metrics-addr`
+(`bintrail_continuity_*` / `bintrail_verify_*` / `bintrail_rotation_*`) —
+see the metrics tables and example alert rules in
 [observability.md](observability.md).
 
 - **AWS credentials** — which ambient credential signals the daemon process

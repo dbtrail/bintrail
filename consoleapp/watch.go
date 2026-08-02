@@ -24,6 +24,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/doctor"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/observe"
 	"github.com/dbtrail/dbtrail/internal/rotation"
 	"github.com/dbtrail/dbtrail/internal/serverid"
 	"github.com/dbtrail/dbtrail/internal/streamdeps"
@@ -432,7 +433,10 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if err := wireVerify(ctx, &cfg, registry, serversPath, notifier); err != nil {
 		return err
 	}
-	if notifier != nil {
+	// The continuity watch serves two channels: webhook events (notifier) and
+	// the Prometheus gauge (#1203). Either one being enabled starts it; with
+	// neither, nothing runs.
+	if notifier != nil || upMetricsAddr != "" {
 		startContinuityWatch(ctx, notifier, registry, upIndexDSN)
 	}
 
@@ -442,7 +446,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// retune retain/interval/add-future without a restart.
 	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
-	}, rotationNotifyHooks(notifier)...)
+	}, rotationCycleHooks(notifier)...)
 
 	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
 	// the global --baseline-dir plus every registry server's per-server dir.
@@ -594,7 +598,10 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	if err := wireVerify(ctx, &cfg, registry, serversPath, notifier); err != nil {
 		return err
 	}
-	if notifier != nil {
+	// The continuity watch serves two channels: webhook events (notifier) and
+	// the Prometheus gauge (#1203). Either one being enabled starts it; with
+	// neither, nothing runs.
+	if notifier != nil || upMetricsAddr != "" {
 		startContinuityWatch(ctx, notifier, registry, upIndexDSN)
 	}
 
@@ -603,7 +610,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// console can retune retain/interval/add-future without a restart.
 	rotation.StartLoop(ctx, rotationSettingsProvider(registry), func() []rotation.RotateTarget {
 		return rotateTargets(upIndexDSN, supervisor, registry, archiveStagingDir())
-	}, rotationNotifyHooks(notifier)...)
+	}, rotationCycleHooks(notifier)...)
 
 	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
 	// the global --baseline-dir plus every registry server's per-server dir.
@@ -875,17 +882,58 @@ func wireVerify(ctx context.Context, cfg *console.Config, registry *console.Regi
 		slog.Error("verify history unavailable; runs will NOT be recorded and the history endpoint will refuse — fix or move the file and restart", "error", err)
 		history = nil
 	}
-	var onFinish func(console.VerifyRunRecord)
-	if notifier != nil {
-		onFinish = notifier.VerifyFinished
-	}
-	sup := newVerifySupervisor(ctx, history, onFinish)
+	sup := newVerifySupervisor(ctx, history, verifyFinishObservers(notifier))
+	seedVerifyGauges(registry, history)
 	cfg.VerifyCtrl = sup
 	cfg.VerifyHistory = history
 	if interval > 0 {
 		startVerifyLoop(ctx, sup, registry, history, interval, splitVerifyTables(upVerifyTables))
 	}
 	return nil
+}
+
+// verifyFinishObservers composes the supervisor's finish hook: the health
+// gauges always (#1203), the webhook notifier when configured. Both observe
+// the same record history gets.
+func verifyFinishObservers(notifier *watchNotifier) func(console.VerifyRunRecord) {
+	return func(rec console.VerifyRunRecord) {
+		setVerifyGauges(rec)
+		if notifier != nil {
+			notifier.VerifyFinished(rec)
+		}
+	}
+}
+
+// setVerifyGauges publishes one finished run. Skip records are bookkeeping,
+// not runs; a record without a parseable finish stamp is not publishable.
+func setVerifyGauges(rec console.VerifyRunRecord) {
+	if rec.State == console.VerifyStateSkipped {
+		return
+	}
+	finished, err := time.Parse(time.RFC3339, rec.FinishedAt)
+	if err != nil {
+		return
+	}
+	s := rec.Summary
+	observe.SetVerifyOutcome(rec.ServerName, finished, s.Match, s.Mismatch, s.Inconclusive, s.Error)
+}
+
+// seedVerifyGauges republishes each registry server's newest persisted run at
+// startup (#1203) — the pull path survives restarts exactly like the console
+// panel does, from the same history.
+func seedVerifyGauges(registry *console.Registry, history *console.VerifyHistory) {
+	if registry == nil || history == nil {
+		return
+	}
+	for _, e := range registry.List() {
+		for _, rec := range history.List(e.ID) {
+			if rec.State == console.VerifyStateSkipped {
+				continue
+			}
+			setVerifyGauges(rec)
+			break
+		}
+	}
 }
 
 // splitVerifyTables parses the comma-separated --verify-tables list; empty

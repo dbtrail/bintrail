@@ -159,6 +159,23 @@ A Prometheus gauge for this state is not exposed in this release.
   the stream-continuity verdict.
 - [capacity.md](capacity.md) — sizing math and the `doctor` disk-capacity check.
 
+## Watch health metrics (`bintrail_continuity_*`, `bintrail_verify_*`, `bintrail_rotation_*`)
+
+The `bintrail-console watch` daemon exports its three safety-net conditions —
+the same ones the webhook channel notifies on
+([console.md](console.md#webhook-notifications)) — as gauges. Each publishes
+only while its feature is actually evaluating; an **absent series means "not
+evaluated", never "healthy"** (the continuity gauge is even unpublished for an
+index the watcher cannot reach, so unknown can never read as no-gap).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `bintrail_continuity_gap_lost{server}` | gauge | 1 = the stream stamped a permanent capture gap (events in it are unrecoverable). Runs under `--notify-webhook` and/or `--metrics-addr` |
+| `bintrail_verify_last_run_timestamp_seconds{server}` | gauge | Unix time of the newest finished verify run (manual or scheduled); re-seeded from the persisted run history at startup |
+| `bintrail_verify_tables{server,status}` | gauge | Per-status table counts (`match` / `mismatch` / `inconclusive` / `error`) of that run |
+| `bintrail_rotation_healthy` | gauge | 1 = the last built-in rotation cycle neither failed nor deferred unarchived partitions |
+| `bintrail_rotation_deferred_partitions` | gauge | Unarchived partitions the last cycle declined to drop |
+
 ## Example Prometheus alert rules
 
 The push-based sibling of these metrics is the watch daemon's
@@ -193,6 +210,28 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: "bintrail stream is logging errors — check the daemon log"
+      - alert: BintrailContinuityGapLost
+        expr: bintrail_continuity_gap_lost == 1
+        labels: {severity: critical}
+        annotations:
+          summary: "bintrail: permanent capture gap — events in it are unrecoverable; re-baseline the stream"
+      - alert: BintrailVerifyProblems
+        expr: bintrail_verify_tables{status=~"mismatch|error"} > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "bintrail: the last verify run found mismatched or erroring tables"
+      - alert: BintrailVerifyStale
+        expr: time() - bintrail_verify_last_run_timestamp_seconds > 172800
+        labels: {severity: warning}
+        annotations:
+          summary: "bintrail: no verify run finished in 2 days — scheduled verification may be broken"
+      - alert: BintrailRotationUnhealthy
+        expr: bintrail_rotation_healthy == 0
+        for: 2h
+        labels: {severity: warning}
+        annotations:
+          summary: "bintrail: built-in rotation keeps failing or deferring — the index is growing"
 ```
 
 Tune thresholds to your write rate; on a genuinely idle source the lag gauge

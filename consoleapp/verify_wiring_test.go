@@ -84,8 +84,10 @@ func TestWireVerify_wiring(t *testing.T) {
 	if !ok || cfg.VerifyHistory == nil {
 		t.Fatalf("trigger env must wire supervisor + history: %+v", cfg)
 	}
-	if sup.onFinish != nil {
-		t.Fatal("nil notifier must leave onFinish disconnected")
+	// onFinish is always wired since #1203 (health gauges observe every run,
+	// notifier or not).
+	if sup.onFinish == nil {
+		t.Fatal("onFinish must always be wired (gauges)")
 	}
 
 	// A schedule alone implies the supervisor (no separate VERIFY_TRIGGER).

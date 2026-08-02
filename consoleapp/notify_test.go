@@ -192,18 +192,34 @@ func testRegistryWithEntries(t *testing.T, entries ...console.ServerEntry) *cons
 	return reg
 }
 
-func TestRotationNotifyHooks(t *testing.T) {
-	if hooks := rotationNotifyHooks(nil); hooks != nil {
-		t.Fatalf("nil notifier must yield no hooks, got %d", len(hooks))
+func TestRotationCycleHooks(t *testing.T) {
+	// The gauge hook is always present (#1203) — it publishes only when a
+	// cycle actually runs; the notifier hook joins it when configured.
+	if hooks := rotationCycleHooks(nil); len(hooks) != 1 {
+		t.Fatalf("nil notifier must still yield the gauge hook, got %d", len(hooks))
 	}
 	n, f := testNotifier()
-	hooks := rotationNotifyHooks(n)
-	if len(hooks) != 1 {
-		t.Fatalf("want 1 hook, got %d", len(hooks))
+	hooks := rotationCycleHooks(n)
+	if len(hooks) != 2 {
+		t.Fatalf("want gauge + notifier hooks, got %d", len(hooks))
 	}
-	hooks[0](true, 0)
+	hooks[1](true, 0)
 	if len(f.events) != 1 {
-		t.Fatalf("hook is not wired to the notifier: %+v", f.events)
+		t.Fatalf("notifier hook is not wired: %+v", f.events)
+	}
+}
+
+// TestVerifyFinishObservers: gauges never panic without a notifier, and the
+// notifier still receives the record when configured.
+func TestVerifyFinishObservers(t *testing.T) {
+	rec := console.VerifyRunRecord{ServerID: "s1", ServerName: "wp",
+		VerifyStatus: console.VerifyStatus{State: "succeeded", FinishedAt: "2026-08-02T12:00:00Z",
+			Summary: console.VerifySummary{Mismatch: 1, Total: 1}}}
+	verifyFinishObservers(nil)(rec) // must not panic
+	n, f := testNotifier()
+	verifyFinishObservers(n)(rec)
+	if len(f.events) != 1 {
+		t.Fatalf("notifier must observe the record: %+v", f.events)
 	}
 }
 

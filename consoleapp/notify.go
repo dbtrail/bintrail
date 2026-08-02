@@ -13,6 +13,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/notify"
+	"github.com/dbtrail/dbtrail/internal/observe"
 )
 
 // continuityPollInterval is how often the continuity watcher re-reads each
@@ -56,13 +57,15 @@ func newWatchNotifierFromFlags(ctx context.Context) (*watchNotifier, error) {
 	return newWatchNotifier(ctx, upNotifyWebhook), nil
 }
 
-// rotationNotifyHooks adapts an optional notifier to rotation.StartLoop's
-// variadic onCycle parameter.
-func rotationNotifyHooks(n *watchNotifier) []func(failed bool, deferred int) {
-	if n == nil {
-		return nil
+// rotationCycleHooks builds rotation.StartLoop's onCycle callbacks: the
+// health gauge always (#1203 — it publishes only once a cycle actually runs),
+// plus the webhook notifier when configured.
+func rotationCycleHooks(n *watchNotifier) []func(failed bool, deferred int) {
+	hooks := []func(bool, int){observe.SetRotationHealth}
+	if n != nil {
+		hooks = append(hooks, n.RotationCycle)
 	}
-	return []func(bool, int){n.RotationCycle}
+	return hooks
 }
 
 // VerifyFinished is the verifySupervisor.onFinish hook: it fires on runs that
@@ -198,10 +201,16 @@ type continuityTarget struct {
 }
 
 // startContinuityWatch polls each index's stream_state for a stamped
-// gap_lost_at and edge-notifies transitions. Its own loop — deliberately NOT
-// piggybacked on rotation (rotation can be off) or the metrics scraper
-// (metrics can be off, and it lives in the capture plane).
+// gap_lost_at, publishes the verdict as a Prometheus gauge (#1203), and —
+// when a notifier is configured — edge-notifies transitions. Its own loop,
+// deliberately NOT piggybacked on rotation (rotation can be off) or the
+// metrics scraper (it lives in the capture plane). n may be nil: the watch
+// then serves the pull path only (started under --metrics-addr without
+// --notify-webhook).
 func startContinuityWatch(ctx context.Context, n *watchNotifier, registry *console.Registry, bootDSN string) {
+	// The unknown-warn rate limit gets its own edge so it works with a nil
+	// notifier too.
+	unknownEdge := notify.NewEdge(0)
 	go func() {
 		runCycle := func() {
 			defer func() {
@@ -217,15 +226,20 @@ func startContinuityWatch(ctx context.Context, n *watchNotifier, registry *conso
 				if err != nil {
 					// Unknown is never "no gap" — and never silent either: a
 					// watcher that cannot watch is itself a coverage hole. The
-					// edge keeps this to one warning per day per index.
-					if n.edge.Fire("continuity-unknown:"+t.dsn, "") {
+					// gauge is UNPUBLISHED (never a healthy 0) and the edge
+					// keeps the warning to one per day per index.
+					observe.ClearContinuity(t.name)
+					if unknownEdge.Fire("continuity-unknown:"+t.dsn, "") {
 						slog.Warn("continuity watch cannot evaluate this index (unreachable, or a legacy schema without the gap columns) — gap_lost will NOT be detected for it",
 							"server", t.name, "error", err)
 					}
 					continue
 				}
-				n.edge.Resolve("continuity-unknown:" + t.dsn)
-				n.Continuity(t.name, t.dsn, gapLost, detail)
+				unknownEdge.Resolve("continuity-unknown:" + t.dsn)
+				observe.SetContinuityGapLost(t.name, gapLost)
+				if n != nil {
+					n.Continuity(t.name, t.dsn, gapLost, detail)
+				}
 			}
 		}
 		if ctx.Err() == nil {
