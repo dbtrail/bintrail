@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 )
 
@@ -96,12 +97,26 @@ func OpenVerifyHistory(path string) (*VerifyHistory, error) {
 func (h *VerifyHistory) Append(rec VerifyRunRecord) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	recs := append(h.servers[rec.ServerID], rec)
+	old, hadOld := h.servers[rec.ServerID]
+	// Clone before appending: an in-place append could write into old's spare
+	// capacity, which would corrupt the rollback below.
+	recs := append(slices.Clone(old), rec)
 	if len(recs) > verifyHistoryCap {
 		recs = recs[len(recs)-verifyHistoryCap:]
 	}
 	h.servers[rec.ServerID] = recs
-	return h.save()
+	if err := h.save(); err != nil {
+		// Roll back so memory keeps matching the persisted file — otherwise
+		// List (and the API) would serve "history" that a restart silently
+		// rewinds, masking a permanent write failure behind a healthy panel.
+		if hadOld {
+			h.servers[rec.ServerID] = old
+		} else {
+			delete(h.servers, rec.ServerID)
+		}
+		return err
+	}
+	return nil
 }
 
 // List returns the recorded runs for a server, newest first. The returned

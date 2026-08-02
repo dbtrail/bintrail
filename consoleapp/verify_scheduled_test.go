@@ -108,6 +108,16 @@ func TestRecordVerifySkip(t *testing.T) {
 	if len(recs) != 1 || recs[0].State != "skipped" || recs[0].SkipReason == "" || recs[0].Trigger != "scheduled" {
 		t.Fatalf("skip not recorded: %+v", recs)
 	}
+	// Consecutive identical skips collapse into one record — a wedged run must
+	// not flood the capped history and evict the real verdicts.
+	recordVerifySkip(hist, console.ServerEntry{ID: "s1", Name: "wp"}, "a verify run was already in flight when the schedule fired")
+	if recs = hist.List("s1"); len(recs) != 1 {
+		t.Fatalf("identical consecutive skip was appended: %+v", recs)
+	}
+	recordVerifySkip(hist, console.ServerEntry{ID: "s1", Name: "wp"}, "another reason")
+	if recs = hist.List("s1"); len(recs) != 2 {
+		t.Fatalf("skip with a new reason must append: %+v", recs)
+	}
 	// nil history is a no-op, never a panic (history can be unavailable).
 	recordVerifySkip(nil, console.ServerEntry{ID: "s1"}, "x")
 }

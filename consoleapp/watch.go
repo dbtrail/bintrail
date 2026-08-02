@@ -847,7 +847,7 @@ func wireVerify(ctx context.Context, cfg *console.Config, registry *console.Regi
 		// Run without history rather than refusing to start the daemon — the
 		// file is an observability aid, and NOT opening a store means nothing
 		// ever overwrites the unreadable file it might still describe.
-		slog.Warn("verify history unavailable; runs will not be recorded", "error", err)
+		slog.Error("verify history unavailable; runs will NOT be recorded and the history endpoint will refuse — fix or move the file and restart", "error", err)
 		history = nil
 	}
 	sup := newVerifySupervisor(ctx, history)
@@ -890,6 +890,13 @@ func startVerifyLoop(ctx context.Context, sup *verifySupervisor, registry *conso
 			var entries []console.ServerEntry
 			if registry != nil {
 				entries = registry.List()
+			}
+			if len(entries) == 0 {
+				// Loud, every cycle: "loop running, verifying nothing" must not
+				// look like "verifying everything". The schedule covers registry
+				// servers; the command-line boot stream is not in the registry.
+				slog.Warn("scheduled verify: no registry servers to verify — the schedule covers servers added in the console UI; a source configured only via command-line flags/env is not covered")
+				return
 			}
 			for _, e := range entries {
 				if ctx.Err() != nil {
@@ -943,6 +950,13 @@ func scheduledVerifyRequest(e console.ServerEntry, tables []string, globalDir, g
 // to run stays visible in the history instead of silent.
 func recordVerifySkip(history *console.VerifyHistory, e console.ServerEntry, reason string) {
 	if history == nil {
+		return
+	}
+	// One consecutive skip per cause: a wedged run plus a short interval would
+	// otherwise append an identical skip every cycle, and the capped history
+	// would evict the real verdicts — erasing exactly the "when did this last
+	// actually verify" answer the history exists to keep.
+	if recs := history.List(e.ID); len(recs) > 0 && recs[0].State == "skipped" && recs[0].SkipReason == reason {
 		return
 	}
 	err := history.Append(console.VerifyRunRecord{

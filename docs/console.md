@@ -439,7 +439,10 @@ narrows every scheduled run to those tables. Setting an interval implies the
 Verification panel (no separate `BINTRAIL_CONSOLE_VERIFY_TRIGGER` needed),
 and one cycle also runs shortly after startup. Every outcome — including
 cycles skipped because a run was already in flight — lands in the run
-history above.
+history above. The schedule covers **registry servers** (added from the
+console UI); a source configured only through command-line flags/env is not
+in the registry and is not covered — the daemon warns every cycle it finds
+nothing to verify.
 
 - **AWS credentials** — which ambient credential signals the daemon process
   can see: env keys (presence only, never values), `AWS_PROFILE`,

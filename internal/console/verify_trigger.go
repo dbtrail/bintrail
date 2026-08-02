@@ -332,9 +332,29 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 // like the live status endpoint: history is only ever written by the watch
 // daemon's supervisor, so a console without VerifyCtrl has none to serve.
 func (s *Server) handleVerifyHistory(w http.ResponseWriter, r *http.Request) {
-	if s.verifyCtrl == nil || s.verifyHistory == nil {
+	if s.verifyCtrl == nil {
 		writeJSONError(w, http.StatusForbidden,
 			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1")
+		return
+	}
+	if s.verifyHistory == nil {
+		// Distinct from the disabled case: verify IS enabled but the daemon
+		// could not open the history file at startup — telling the operator to
+		// set VERIFY_TRIGGER here would send them chasing a setting that is
+		// already on.
+		writeJSONError(w, http.StatusForbidden,
+			"verify is enabled but the run-history file could not be opened at daemon startup — check the watch daemon's logs")
+		return
+	}
+	// History carries the same per-table verdicts/reasons as the live status —
+	// unavailable under an RBAC profile like the other verify verbs (and it
+	// spans restarts, so it can cover tables a profile has since withheld).
+	if s.rbacActiveFor(r) {
+		if sessionRestricted(r) {
+			recordProfileGateDeny(r, "verify-history")
+		}
+		writeJSONError(w, http.StatusForbidden,
+			"verification isn't available while an access-control profile is active — baseline and live-source reads aren't redacted")
 		return
 	}
 	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))

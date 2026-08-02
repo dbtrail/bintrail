@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"path/filepath"
 	"testing"
+
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // TestVerifyHistoryEndpoint_disabledWithoutStore: a console with the verify
@@ -60,6 +62,33 @@ func TestVerifyHistoryEndpoint_servesRecordsNewestFirst(t *testing.T) {
 	rec, _ = doServersReqHeader(t, srv, "GET", "/api/servers/nope/verify/history", "", id)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown server: got %d, want 404", rec.Code)
+	}
+}
+
+// TestVerifyHistoryEndpoint_rbacBlocked: history carries the same per-table
+// verdicts as the live status and spans restarts — unavailable under an
+// active RBAC profile like the other verify verbs.
+func TestVerifyHistoryEndpoint_rbacBlocked(t *testing.T) {
+	reg, err := LoadRegistry(filepath.Join(t.TempDir(), "console-servers.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hist, err := OpenVerifyHistory(filepath.Join(t.TempDir(), "console-verify-history.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		Listen: "127.0.0.1:8090", Token: "t", Registry: reg,
+		MonitorCtrl: &stubMonitorCtrl{}, VerifyCtrl: &stubVerifyCtrl{}, VerifyHistory: hist,
+		DenyTables: []query.SchemaTable{{Schema: "a", Table: "b"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := addVerifyEntry(t, srv, "", "s3://b/base", "")
+	rec, _ := doServersReqHeader(t, srv, "GET", "/api/servers/"+id+"/verify/history", "", id)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("history under an active RBAC profile: got %d, want 403", rec.Code)
 	}
 }
 

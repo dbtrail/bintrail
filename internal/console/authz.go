@@ -74,6 +74,7 @@ var apiRoutePerms = []routePerm{
 	{"GET", "/api/servers/{}/baseline", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify/explain", ext.PermServersRead},
+	{"GET", "/api/servers/{}/verify/history", ext.PermServersRead},
 	{"POST", "/api/servers/{}/test", ext.PermServersRead},
 	{"GET", "/api/servers/{}", ext.PermServersRead},
 	{"PUT", "/api/servers/{}", ext.PermServersWrite},

@@ -292,6 +292,13 @@ func (s *verifySupervisor) runBaselineAnchored(req console.VerifyRequest, baseli
 	}
 
 	for _, p := range pairs {
+		// A daemon shutdown mid-run must fail the run, not let the remaining
+		// tables degrade into synthetic per-table errors under a "succeeded"
+		// state — with #1191 that verdict is persisted, so the misreport would
+		// outlive the restart.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("verify interrupted: %w", err)
+		}
 		key := p.Schema + "." + p.Table
 		if filter != nil && !filter[key] {
 			continue
@@ -361,6 +368,10 @@ func (s *verifySupervisor) runLiveSource(req console.VerifyRequest, indexDB *sql
 		NoArchive: req.NoArchive, ArchiveFetcher: parquetquery.Fetch,
 	}
 	for _, st := range tables {
+		// See runBaselineAnchored: a shutdown mid-run fails the run loudly.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("verify interrupted: %w", err)
+		}
 		res, err := verify.VerifyTable(ctx, cfg, st.Schema, st.Table)
 		if err != nil {
 			res = verify.TableResult{Schema: st.Schema, Table: st.Table, Status: verify.StatusError, Detail: err.Error()}
@@ -396,6 +407,10 @@ func (s *verifySupervisor) runRecoverInputs(req console.VerifyRequest, indexDB *
 		Since: now.Add(-recoverInputsLookback), Until: now,
 	}
 	for _, st := range tables {
+		// See runBaselineAnchored: a shutdown mid-run fails the run loudly.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("verify interrupted: %w", err)
+		}
 		res, err := verify.VerifyRecoverInputs(ctx, cfg, st.Schema, st.Table)
 		if err != nil {
 			res = verify.TableResult{Schema: st.Schema, Table: st.Table, Status: verify.StatusError, Detail: err.Error()}

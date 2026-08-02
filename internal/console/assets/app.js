@@ -2325,7 +2325,9 @@ async function loadVerifyHistory(id, box) {
       el("span", { class: "chip chip-mon", text: "LAST VERIFIED " + agoText(sec) }),
       el("span", { class: "stg-age", text: latest.state === "failed"
         ? "failed — " + (latest.last_error || "unknown error")
-        : s.match + "/" + s.total + " match" })));
+        : ((s.mismatch || s.error)
+          ? s.match + " match · " + s.mismatch + " mismatch · " + s.error + " error"
+          : s.match + "/" + s.total + " match") })));
   }
   recs.slice(0, 8).forEach((r) => {
     const s = r.summary || {};

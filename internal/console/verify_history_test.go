@@ -76,6 +76,38 @@ func TestVerifyHistory_CapDropsOldest(t *testing.T) {
 	}
 }
 
+// TestVerifyHistory_AppendRollsBackOnSaveFailure: a failed save must not
+// leave the record in memory — List would then serve "history" that a restart
+// silently rewinds, masking a permanent write failure behind a healthy panel.
+func TestVerifyHistory_AppendRollsBackOnSaveFailure(t *testing.T) {
+	base := t.TempDir()
+	sub := filepath.Join(base, "sub")
+	path := filepath.Join(sub, "h.json")
+	h, err := OpenVerifyHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Append(VerifyRunRecord{ServerID: "s", VerifyStatus: VerifyStatus{State: "succeeded"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make the next save fail: replace the parent directory with a plain file
+	// so MkdirAll/CreateTemp cannot succeed.
+	if err := os.RemoveAll(sub); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sub, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Append(VerifyRunRecord{ServerID: "s", VerifyStatus: VerifyStatus{State: "failed"}}); err == nil {
+		t.Fatal("Append with an unwritable path reported success")
+	}
+	got := h.List("s")
+	if len(got) != 1 || got[0].State != "succeeded" {
+		t.Fatalf("failed Append leaked into memory: %+v", got)
+	}
+}
+
 func TestOpenVerifyHistory_RefusesCorruptAndNewer(t *testing.T) {
 	dir := t.TempDir()
 	corrupt := filepath.Join(dir, "corrupt.json")
