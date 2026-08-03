@@ -95,6 +95,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		baselines, bErr := baseline.DiscoverBaselines(stBaselineDir)
 		if bErr != nil {
 			slog.Warn("could not discover baselines", "dir", stBaselineDir, "error", bErr)
+			// A configured-but-unreadable dir must not render like "no
+			// baselines configured" in JSON — a monitor watching
+			// baseline_staleness would read absence as healthy.
+			data.BaselinesUnavailable = true
 		} else {
 			for _, b := range baselines {
 				var size int64
@@ -116,8 +120,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			}
 			// Staleness (#1193): grade every snapshot against the oldest
 			// available delta coverage — the live-partition floor (partition
-			// existence = coverage) extended backwards by archives.
-			status.AnnotateBaselineStaleness(data.Baselines, status.DeltaFloor(data.Parts, data.Coverage), time.Now().UTC())
+			// existence = coverage) extended backwards by archives. The floor
+			// comes from OldestDeltaFromDB, NOT data.Coverage: coverage is
+			// best-effort display data that swallows archive_state errors,
+			// and a floor built on it would fabricate "broken" on healthy
+			// archives whenever that one read fails. A floor error degrades
+			// every verdict to unknown.
+			floor, fErr := status.OldestDeltaFromDB(cmd.Context(), db, dbName)
+			if fErr != nil {
+				slog.Warn("could not determine the delta-coverage floor; baseline staleness is unknown", "error", fErr)
+			}
+			status.AnnotateBaselineStaleness(data.Baselines, floor, time.Now().UTC())
 		}
 	}
 

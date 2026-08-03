@@ -207,8 +207,12 @@ const bootContinuityName = "cli index"
 // bootstrap artifact; alerting on it would cry wolf — see
 // status.baselineAgingFraction's comment); the channel carries the transition
 // that means "full-table restore is impossible NOW". edgeKey identifies the
-// index (the DSN — display names can collide with the reserved boot label,
-// same rule as Continuity). brokenTables must be a STABLE identity (sorted
+// (index DSN, baseline source) PAIR — never the display name (it can collide
+// with the reserved boot label), and never the DSN alone: staleness is a
+// property of the pair, so unlike the continuity poller (which dedups by DSN
+// because gap_lost is per-index) two sources graded against one index are
+// distinct conditions and must not Fire/Resolve against each other.
+// brokenTables must be a STABLE identity (sorted
 // table list) — never a clock- or floor-derived string: the coverage floor
 // advances with every rotation cycle, and a volatile edge detail would bypass
 // the repeat window and page every hour.
@@ -326,34 +330,47 @@ func (w *stalenessWatcher) runCycle(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// The edge identity is the (dsn, source) pair — see BaselineStale's
+		// doc. \x1f as separator: a control char no DSN or path contains.
+		edgeID := t.dsn + "\x1f" + t.source
 		files, err := w.listBaselines(ctx, t.source)
 		if err != nil {
 			// A configured-but-unreadable source (broken mount, revoked S3
 			// credentials, deleted bucket) disarms this whole check — that
 			// must never be silent: a broken window would go undetected, and
 			// an active alert freezes with a dead evaluator.
-			if w.unknownEdge.Fire("staleness-source:"+t.dsn, "") {
+			if w.unknownEdge.Fire("staleness-source:"+edgeID, "") {
 				slog.Warn("baseline staleness cannot be evaluated — the baseline source is unreadable; a broken restore window would go UNDETECTED for this server",
 					"server", t.name, "source", t.source, "error", err)
 			}
 			continue
 		}
-		w.unknownEdge.Resolve("staleness-source:" + t.dsn)
+		w.unknownEdge.Resolve("staleness-source:" + edgeID)
 		if len(files) == 0 {
-			continue // no baselines yet — routine on fresh installs, nothing to grade
+			// Routine on fresh installs — but while a broken alert is ACTIVE
+			// it means the stale snapshots vanished without replacement
+			// (prune loop, lifecycle rule, emptied mount): restore is still
+			// impossible and the alert would silently freeze, so warn.
+			// Never a Resolve — nothing was fixed.
+			if w.n.edge.Active("baseline:"+edgeID) && w.unknownEdge.Fire("staleness-empty:"+edgeID, "") {
+				slog.Warn("baseline source lists NO snapshots while a baseline_stale alert is active — restore is still impossible and the alert is frozen; take a fresh baseline",
+					"server", t.name, "source", t.source)
+			}
+			continue
 		}
+		w.unknownEdge.Resolve("staleness-empty:" + edgeID)
 		oldest, err := w.oldestDelta(ctx, t.dsn)
 		if err != nil || oldest.IsZero() {
 			// Unknown floor is never a verdict — and must never RESOLVE an
 			// active broken alert either, so the target is skipped whole.
 			// Skipped, not silent: same rule as the unreadable source above.
-			if w.unknownEdge.Fire("staleness-floor:"+t.dsn, "") {
+			if w.unknownEdge.Fire("staleness-floor:"+edgeID, "") {
 				slog.Warn("baseline staleness cannot be evaluated — the delta-coverage floor is unknown (index unreachable or unpartitioned)",
 					"server", t.name, "error", err)
 			}
 			continue
 		}
-		w.unknownEdge.Resolve("staleness-floor:" + t.dsn)
+		w.unknownEdge.Resolve("staleness-floor:" + edgeID)
 		now := time.Now().UTC()
 		newest := make(map[string]time.Time, len(files))
 		for _, f := range files {
@@ -372,7 +389,7 @@ func (w *stalenessWatcher) runCycle(ctx context.Context) {
 			}
 		}
 		sort.Strings(brokenTables)
-		w.n.BaselineStale(t.name, t.dsn, len(brokenTables) > 0,
+		w.n.BaselineStale(t.name, edgeID, len(brokenTables) > 0,
 			strings.Join(brokenTables, ", "), oldest.UTC().Format(time.RFC3339))
 	}
 }

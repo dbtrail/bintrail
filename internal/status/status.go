@@ -506,6 +506,10 @@ type StatusData struct {
 	Servers   []ServerInfo
 	Stream    *StreamStateInfo
 	Baselines []BaselineInfo
+	// BaselinesUnavailable: a baseline location was configured but could not
+	// be read, so Baselines is empty for a BAD reason — JSON must report
+	// baseline_staleness "unknown", not omit it as if nothing were configured.
+	BaselinesUnavailable bool
 	// StreamErr records a failure to READ stream_state (transient timeout, revoked
 	// permission, an unexpected loadSourceHealth error) — as distinct from an empty
 	// table (Stream==nil, StreamErr==nil = no active stream). When set, the continuity
@@ -630,7 +634,7 @@ func writeStreamUnavailable(w io.Writer, err error) {
 
 // WriteJSON writes the status data as JSON to w.
 func (d *StatusData) WriteJSON(w io.Writer) error {
-	return writeStatusJSONFull(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream, d.Baselines, d.StreamErr)
+	return writeStatusJSONFull(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream, d.Baselines, d.BaselinesUnavailable, d.StreamErr)
 }
 
 // WriteStatus writes a multi-section status report (Servers, Stream, Indexed Files, Partitions, Archives, Coverage, Summary) to w.
@@ -1011,10 +1015,10 @@ func Truncate(s string, n int) string {
 
 // WriteStatusJSON writes the status data as a JSON object to w.
 func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo) error {
-	return writeStatusJSONFull(w, files, parts, archives, coverage, servers, stream, nil, nil)
+	return writeStatusJSONFull(w, files, parts, archives, coverage, servers, stream, nil, false, nil)
 }
 
-func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo, baselines []BaselineInfo, streamErr error) error {
+func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo, baselines []BaselineInfo, baselinesUnavailable bool, streamErr error) error {
 	type jsonFile struct {
 		BinlogFile    string  `json:"binlog_file"`
 		Status        string  `json:"status"`
@@ -1331,6 +1335,9 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		out.Baselines = append(out.Baselines, jb)
 	}
 	out.BaselineStaleness = string(OverallBaselineStaleness(baselines))
+	if out.BaselineStaleness == "" && baselinesUnavailable {
+		out.BaselineStaleness = string(BaselineUnknown)
+	}
 
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
@@ -1347,6 +1354,17 @@ func writeBaselines(w io.Writer, baselines []BaselineInfo) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "SNAPSHOT\tDATABASE\tTABLE\tSIZE\tBINLOG_FILE\tBINLOG_POS\tGTID\tSTALENESS")
 	fmt.Fprintln(tw, "────────\t────────\t─────\t────\t───────────\t──────────\t────\t─────────")
+	// The ⚠ glyph is reserved for rows the banner keys on — each table's
+	// NEWEST snapshot. A superseded snapshot past coverage is routine on a
+	// healthy retention cadence (the console's rule too); it still reads
+	// "broken" honestly, just not as an alarm.
+	newestOf := make(map[string]time.Time, len(baselines))
+	for _, b := range baselines {
+		k := b.Database + "." + b.Table
+		if b.SnapshotTime.After(newestOf[k]) {
+			newestOf[k] = b.SnapshotTime
+		}
+	}
 	for _, b := range baselines {
 		binlogFile := "-"
 		if b.BinlogFile != "" {
@@ -1367,7 +1385,7 @@ func writeBaselines(w io.Writer, baselines []BaselineInfo) {
 		staleness := "-"
 		if b.Staleness != "" {
 			staleness = string(b.Staleness)
-			if b.Staleness == BaselineBroken {
+			if b.Staleness == BaselineBroken && newestOf[b.Database+"."+b.Table].Equal(b.SnapshotTime) {
 				staleness = "⚠ broken"
 			}
 		}

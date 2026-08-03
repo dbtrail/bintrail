@@ -79,7 +79,7 @@ func TestStalenessWatcher_runCycle(t *testing.T) {
 
 	files := []reconstruct.BaselineFile{
 		{Schema: "shop", Table: "orders", SnapshotTime: oldest.Add(-time.Hour)}, // superseded, broken
-		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-time.Hour)},   // newest, fine
+		{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-time.Hour)},    // newest, fine
 	}
 	w := &stalenessWatcher{
 		n: n, registry: reg,
@@ -126,7 +126,9 @@ func TestStalenessWatcher_runCycle(t *testing.T) {
 
 	// Unreadable baseline source: same skip-whole rule.
 	w.oldestDelta = func(context.Context, string) (time.Time, error) { return oldestAdvanced, nil }
-	w.listBaselines = func(context.Context, string) ([]reconstruct.BaselineFile, error) { return nil, errors.New("bucket gone") }
+	w.listBaselines = func(context.Context, string) ([]reconstruct.BaselineFile, error) {
+		return nil, errors.New("bucket gone")
+	}
 	w.runCycle(context.Background())
 	if len(f.events) != 1 {
 		t.Fatalf("unreadable source must neither fire nor resolve: %+v", f.events)
@@ -141,5 +143,112 @@ func TestStalenessWatcher_runCycle(t *testing.T) {
 	w.runCycle(context.Background())
 	if len(f.events) != 2 || !f.events[1].Resolved {
 		t.Fatalf("fresh baseline must resolve the alert: %+v", f.events)
+	}
+}
+
+// TestStalenessWatcher_agingNeverFires pins the PR's core alerting decision:
+// aging is informational (a bootstrap artifact on young installs — see
+// status.baselineAgingFraction) and must never reach the webhook channel.
+func TestStalenessWatcher_agingNeverFires(t *testing.T) {
+	reg := testRegistryWithEntries(t, console.ServerEntry{Name: "wp", DSN: "d1", BaselineDir: "/b"})
+	now := time.Now().UTC()
+	oldest := now.Add(-100 * time.Hour)
+	n, f := testNotifier()
+	// Inside coverage but past 80% of the span: verdict is aging, not broken.
+	files := []reconstruct.BaselineFile{{Schema: "shop", Table: "orders", SnapshotTime: oldest.Add(10 * time.Hour)}}
+	w := &stalenessWatcher{
+		n: n, registry: reg, unknownEdge: notify.NewEdge(0),
+		listBaselines: func(context.Context, string) ([]reconstruct.BaselineFile, error) { return files, nil },
+		oldestDelta:   func(context.Context, string) (time.Time, error) { return oldest, nil },
+	}
+	w.runCycle(context.Background())
+	if len(f.events) != 0 {
+		t.Fatalf("aging must never fire the webhook: %+v", f.events)
+	}
+}
+
+// TestStalenessWatcher_targetIsolation: a failing first target must not
+// disarm checking for the rest — the skip is per-target, never per-cycle.
+func TestStalenessWatcher_targetIsolation(t *testing.T) {
+	reg := testRegistryWithEntries(t,
+		console.ServerEntry{Name: "a", DSN: "d1", BaselineDir: "/a"},
+		console.ServerEntry{Name: "b", DSN: "d2", BaselineDir: "/b"},
+	)
+	now := time.Now().UTC()
+	oldest := now.Add(-100 * time.Hour)
+	n, f := testNotifier()
+	w := &stalenessWatcher{
+		n: n, registry: reg, unknownEdge: notify.NewEdge(0),
+		listBaselines: func(_ context.Context, source string) ([]reconstruct.BaselineFile, error) {
+			if source == "/a" {
+				return nil, errors.New("bucket gone")
+			}
+			return []reconstruct.BaselineFile{{Schema: "shop", Table: "orders", SnapshotTime: oldest.Add(-time.Hour)}}, nil
+		},
+		oldestDelta: func(context.Context, string) (time.Time, error) { return oldest, nil },
+	}
+	w.runCycle(context.Background())
+	if len(f.events) != 1 || f.events[0].Server != "b" || f.events[0].Severity != "critical" {
+		t.Fatalf("second target must still be graded when the first errors: %+v", f.events)
+	}
+}
+
+// TestStalenessWatcher_sameDSNDifferentSources: two targets on ONE index with
+// different baseline locations are distinct conditions — the healthy one must
+// never Resolve (falsely all-clear) the broken one's alert.
+func TestStalenessWatcher_sameDSNDifferentSources(t *testing.T) {
+	reg := testRegistryWithEntries(t,
+		console.ServerEntry{Name: "a", DSN: "d1", BaselineDir: "/stale"},
+		console.ServerEntry{Name: "b", DSN: "d1", BaselineDir: "/fresh"},
+	)
+	now := time.Now().UTC()
+	oldest := now.Add(-100 * time.Hour)
+	n, f := testNotifier()
+	w := &stalenessWatcher{
+		n: n, registry: reg, unknownEdge: notify.NewEdge(0),
+		listBaselines: func(_ context.Context, source string) ([]reconstruct.BaselineFile, error) {
+			ts := now.Add(-time.Hour)
+			if source == "/stale" {
+				ts = oldest.Add(-time.Hour)
+			}
+			return []reconstruct.BaselineFile{{Schema: "shop", Table: "orders", SnapshotTime: ts}}, nil
+		},
+		oldestDelta: func(context.Context, string) (time.Time, error) { return oldest, nil },
+	}
+	w.runCycle(context.Background())
+	w.runCycle(context.Background())
+	if len(f.events) != 1 || f.events[0].Resolved || f.events[0].Severity != "critical" {
+		t.Fatalf("want exactly one standing critical (no cross-resolve, no flap): %+v", f.events)
+	}
+}
+
+// TestStalenessWatcher_emptyListingKeepsAlert: baselines vanishing without
+// replacement is NOT a recovery — the active alert must neither resolve nor
+// re-fire while the source lists nothing.
+func TestStalenessWatcher_emptyListingKeepsAlert(t *testing.T) {
+	reg := testRegistryWithEntries(t, console.ServerEntry{Name: "wp", DSN: "d1", BaselineDir: "/b"})
+	now := time.Now().UTC()
+	oldest := now.Add(-100 * time.Hour)
+	n, f := testNotifier()
+	files := []reconstruct.BaselineFile{{Schema: "shop", Table: "orders", SnapshotTime: oldest.Add(-time.Hour)}}
+	w := &stalenessWatcher{
+		n: n, registry: reg, unknownEdge: notify.NewEdge(0),
+		listBaselines: func(context.Context, string) ([]reconstruct.BaselineFile, error) { return files, nil },
+		oldestDelta:   func(context.Context, string) (time.Time, error) { return oldest, nil },
+	}
+	w.runCycle(context.Background())
+	if len(f.events) != 1 {
+		t.Fatalf("setup: want the broken alert active, got %+v", f.events)
+	}
+	files = nil
+	w.runCycle(context.Background())
+	if len(f.events) != 1 {
+		t.Fatalf("empty listing must neither fire nor resolve: %+v", f.events)
+	}
+	// Snapshots reappear, still broken: the edge stayed active, so no re-fire.
+	files = []reconstruct.BaselineFile{{Schema: "shop", Table: "orders", SnapshotTime: oldest.Add(-time.Hour)}}
+	w.runCycle(context.Background())
+	if len(f.events) != 1 {
+		t.Fatalf("unchanged broken condition must not re-fire after the gap: %+v", f.events)
 	}
 }

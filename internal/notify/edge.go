@@ -60,6 +60,16 @@ func (e *Edge) Fire(key, detail string) bool {
 	return true
 }
 
+// Active reports whether key has fired and not yet resolved — for callers
+// that must treat "cannot re-evaluate" differently while an alert is standing
+// (e.g. a baseline source that now lists nothing).
+func (e *Edge) Active(key string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.active[key]
+	return ok
+}
+
 // Resolve reports whether the caller should send a recovery notification:
 // true only if key was active (fired at least once and not yet resolved).
 func (e *Edge) Resolve(key string) bool {

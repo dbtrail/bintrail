@@ -31,8 +31,8 @@ type baselineSnapshotDTO struct {
 	GTIDSet    string `json:"gtid_set,omitempty"`
 	// Staleness grades this snapshot's anchor against the oldest available
 	// delta coverage of the selected server's index (#1193):
-	// ok | aging | broken | unknown. Empty when the floor query failed —
-	// never reported as ok.
+	// ok | aging | broken | unknown. "unknown" when the coverage floor could
+	// not be read — never reported as ok.
 	Staleness string `json:"staleness,omitempty"`
 }
 
@@ -100,10 +100,14 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	// fabricated verdict — an unopened bundle connection or an unreadable
 	// index yields the explicit "unknown".
 	var oldestDelta time.Time
+	serverID := r.Header.Get("X-Bintrail-Server")
+	if serverID == "" {
+		serverID = "default"
+	}
 	if b.db == nil {
-		slog.Warn("console: baseline staleness not evaluated — the server's index connection is not open")
+		slog.Warn("console: baseline staleness not evaluated — the server's index connection is not open", "server", serverID)
 	} else if od, err := status.OldestDeltaFromDB(r.Context(), b.db, b.dbName); err != nil {
-		slog.Warn("console: could not load delta-coverage floor for baseline staleness", "error", err)
+		slog.Warn("console: could not load delta-coverage floor for baseline staleness", "server", serverID, "error", err)
 	} else {
 		oldestDelta = od
 	}
@@ -139,20 +143,14 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 		}
 		cur.Tables = append(cur.Tables, f.Schema+"."+f.Table)
 	}
-	// Headline over ALL files (not just the listed page): newest per table.
-	newestPerTable := make(map[string]time.Time, len(files))
-	for _, f := range files {
-		k := f.Schema + "." + f.Table
-		if f.SnapshotTime.After(newestPerTable[k]) {
-			newestPerTable[k] = f.SnapshotTime
-		}
+	// Headline over ALL files (not just the listed page), delegated to the
+	// status package's newest-per-table rollup so the console and the CLI can
+	// never rank verdicts differently.
+	infos := make([]status.BaselineInfo, len(files))
+	for i, f := range files {
+		infos[i] = status.BaselineInfo{Database: f.Schema, Table: f.Table, SnapshotTime: f.SnapshotTime}
 	}
-	rank := map[string]int{"ok": 1, "unknown": 2, "aging": 3, "broken": 4}
-	for _, ts := range newestPerTable {
-		v := string(status.BaselineStalenessFor(ts, oldestDelta, now))
-		if rank[v] > rank[resp.Staleness] {
-			resp.Staleness = v
-		}
-	}
+	status.AnnotateBaselineStaleness(infos, oldestDelta, now)
+	resp.Staleness = string(status.OverallBaselineStaleness(infos))
 	writeJSON(w, http.StatusOK, resp)
 }

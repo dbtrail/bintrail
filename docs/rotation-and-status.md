@@ -613,8 +613,9 @@ against the oldest available delta coverage — the oldest **live partition**
 hour (partition existence is coverage, even if the hour recorded no writes)
 extended backwards by archives:
 `ok`, `aging` (the snapshot is older than 80% of the coverage span — the
-restore window is shrinking), or `broken` (the anchor predates coverage —
-full-table reconstruct through that window is impossible). A table whose
+restore window is shrinking), `broken` (the anchor predates coverage —
+full-table reconstruct through that window is impossible), or `unknown`
+(the floor could not be evaluated — never reported as a false `ok`). A table whose
 **newest** snapshot is broken trips a loud banner, and the JSON output
 carries per-baseline `staleness` plus a top-level `baseline_staleness`.
 The `watch` daemon's webhook channel sends a critical `baseline_stale`
