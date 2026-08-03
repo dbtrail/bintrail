@@ -699,8 +699,11 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 		// 2^63 (the #986/#1117 MariaDB underflow shape stored by pre-#1180
 		// builds, or any future >8EiB offset) would be a hard Scan failure
 		// through the int64 path. The mysql driver returns uint64 for
-		// unsigned BIGINT on the binary protocol and []byte on the text
-		// protocol; convertAssign handles both losslessly into uint64.
+		// unsigned BIGINT on the TEXT protocol (ParseUint in textRows) and,
+		// above 2^63, []byte on the BINARY protocol (binaryRows falls back to
+		// uint64ToString; below 2^63 it is int64) — both shapes are reachable
+		// (parameterized queries use binary, argument-free ones text);
+		// convertAssign handles all of them losslessly into uint64.
 		var (
 			binlogFile     sql.NullString
 			startPos       sql.Null[uint64]

@@ -14,7 +14,8 @@ import (
 // A minimal database/sql/driver implementation serving one canned resultset,
 // so scanRows can be exercised without a MySQL instance. Rows.Next hands back
 // driver values exactly as go-sql-driver would: uint64 for BIGINT UNSIGNED on
-// the binary protocol, []byte for everything on the text protocol.
+// the TEXT protocol (ParseUint), and on the BINARY protocol []byte above 2^63
+// (uint64ToString fallback) / int64 below it.
 
 type stubRows struct {
 	cols []string
@@ -103,14 +104,14 @@ func TestScanRows_positionAbove2to63(t *testing.T) {
 		}
 	}
 
-	t.Run("binary protocol uint64", func(t *testing.T) {
+	t.Run("text protocol uint64", func(t *testing.T) {
 		r := scanOneRow(t, base(bigStart, bigEnd))
 		if r.StartPos != bigStart || r.EndPos != bigEnd {
 			t.Errorf("positions [%d, %d], want [%d, %d]", r.StartPos, r.EndPos, bigStart, bigEnd)
 		}
 	})
 
-	t.Run("text protocol bytes", func(t *testing.T) {
+	t.Run("binary protocol bytes (>2^63)", func(t *testing.T) {
 		r := scanOneRow(t, base([]byte("9223372036854775850"), []byte("9223372036854775908")))
 		if r.StartPos != bigStart || r.EndPos != bigEnd {
 			t.Errorf("positions [%d, %d], want [%d, %d]", r.StartPos, r.EndPos, bigStart, bigEnd)
