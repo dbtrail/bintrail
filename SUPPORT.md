@@ -89,7 +89,7 @@ The boundary triage cites:
 ## Source server configuration (required for correct capture)
 
 dbtrail captures changes from your **source** database — **MySQL**, **MariaDB**
-(alpha), or **PostgreSQL** (beta); see [Supported source families](#supported-source-families)
+(alpha), or **PostgreSQL**; see [Supported source families](#supported-source-families)
 below. The requirements here cover a **MySQL** (and MariaDB) source's ROW-format
 binary logs; PostgreSQL's capture requirements (logical replication, `wal_level`,
 `REPLICA IDENTITY`) live in [docs/postgres.md](docs/postgres.md). Faithful capture
@@ -123,7 +123,7 @@ at a non-MySQL server is **not** supported.
 |---|---|---|---|
 | **MySQL** 8.0+ (incl. Percona, RDS, Aurora, Cloud SQL) | Supported | ROW-format binlog over the replication protocol | [streaming.md](docs/streaming.md) |
 | **MariaDB** (target 11.4) | Alpha | ROW-format binlog (MariaDB GTID) | [mariadb.md](docs/mariadb.md) |
-| **PostgreSQL** | Beta — via the separate `bintrail-pg` binary | Logical replication (`pgoutput`) | [postgres.md](docs/postgres.md) |
+| **PostgreSQL** | Supported — via the separate `bintrail-pg` binary | Logical replication (`pgoutput`) | [postgres.md](docs/postgres.md) |
 
 **We install nothing in your source database.** dbtrail connects as an ordinary
 read-only replication client. For PostgreSQL specifically, capture uses the

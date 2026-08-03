@@ -20,7 +20,7 @@ it's the first section — the same four lines as the README.
   bundles one).
 - **Other sources:** besides MySQL, dbtrail can also capture from **MariaDB**
   ([alpha](./mariadb.md) — 10.6+, 11.4 is the CI-tested target) and
-  **PostgreSQL** ([beta](./postgres.md) — 14+). Both are first-class sources in
+  **PostgreSQL** ([GA](./postgres.md) — 14+). Both are first-class sources in
   the web console (**+ Add server** → pick the source type); PostgreSQL also
   ships a standalone `bintrail-pg` binary for headless/CLI deployments. Each has
   its own prerequisites; see the linked guide.
@@ -123,7 +123,7 @@ to every release. The image bundles both `bintrail` and `bintrail-mcp`; the
 web console ships as its own image, `ghcr.io/dbtrail/bintrail-console`
 (`serve` = read-only console, `watch` = stream + console daemon — what the
 Compose stack runs). The PostgreSQL-source binary ships as its own image,
-`ghcr.io/dbtrail/bintrail-pg` (beta). See [docker.md](./docker.md) for signature verification,
+`ghcr.io/dbtrail/bintrail-pg`. See [docker.md](./docker.md) for signature verification,
 `docker run` recipes, and the long-running stream container.
 
 ## Linux packages
@@ -144,8 +144,8 @@ sudo rpm -i bintrail_VERSION_linux_amd64.rpm
 
 The `bintrail` package carries the core CLI + `bintrail-mcp`; the web console
 is a separate `bintrail-console` package — install it only where an operator
-wants the UI. PostgreSQL-source capture is a separate `bintrail-pg` package
-(beta) — install it only on hosts that capture from PostgreSQL.
+wants the UI. PostgreSQL-source capture is a separate `bintrail-pg`
+package — install it only on hosts that capture from PostgreSQL.
 
 ## Go install
 

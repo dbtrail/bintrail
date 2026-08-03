@@ -383,5 +383,5 @@ the contract tag differs.
 
 `verify` runs against the MySQL index, so it works for any source family whose
 baselines are wired. Baseline-anchored mode requires baselines; **PostgreSQL
-baselines are not yet wired** (see [PostgreSQL beta limitations](postgres.md#beta-limitations)),
+baselines are not yet wired** (see [PostgreSQL limitations](postgres.md#limitations)),
 so `verify` against a PostgreSQL source is not usable in this release.

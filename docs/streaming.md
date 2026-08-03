@@ -45,11 +45,11 @@ detection on resume, which now works for MariaDB in both position and GTID mode.
 The MariaDB-specific setup, version support, alpha limitations, and
 troubleshooting live on the dedicated page: **[MariaDB](mariadb.md)**.
 
-## PostgreSQL as a source (beta)
+## PostgreSQL as a source
 
-bintrail also captures from **PostgreSQL** (beta) via the separate `bintrail-pg`
+bintrail also captures from **PostgreSQL** via the separate `bintrail-pg`
 binary, over logical replication (`pgoutput`) — the index still stays MySQL.
-Setup, requirements, the slot/WAL operator boundary, type support, and beta
+Setup, requirements, the slot/WAL operator boundary, type support, and
 limitations live on the dedicated page: **[PostgreSQL](postgres.md)**.
 
 ---

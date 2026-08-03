@@ -54,7 +54,7 @@ what to do next. Then:
 1. Open **http://127.0.0.1:8090** — on first run, create a username and password (that's your login from now on).
 2. Click **+ Add server**, pick the **source type** (MySQL, MariaDB, or PostgreSQL), and paste the database you want to watch — host, user, password. dbtrail runs preflight checks, provisions an index, and starts streaming within the minute.
 
-### PostgreSQL (beta) & MariaDB (alpha) sources
+### PostgreSQL & MariaDB (alpha) sources
 
 The same one-line install — the console captures **PostgreSQL** and **MariaDB**
 sources too, not just MySQL. In **+ Add server**, choose the source type;
@@ -62,7 +62,7 @@ PostgreSQL reveals fields for the database, replication slot, and publication.
 PostgreSQL needs a one-time source-side setup first (`wal_level = logical`,
 `REPLICA IDENTITY FULL`, and a publication — dbtrail validates these and never
 runs DDL on your source). Full walkthrough, incl. managed RDS/Aurora/Cloud SQL:
-**[PostgreSQL source (beta)](docs/postgres.md)** · **[MariaDB source
+**[PostgreSQL source](docs/postgres.md)** · **[MariaDB source
 (alpha)](docs/mariadb.md)**.
 
 **Just curious?** One container, zero setup, time-travel SQL in 30 seconds:
@@ -81,7 +81,7 @@ See [the demo image](docs/demo.md).
 | [Quickstart](docs/quickstart.md) | [Web console](docs/console.md) | [Rotation & Status](docs/rotation-and-status.md) |
 | [DBA guide](docs/guide.md) | [Time-Travel SQL](docs/time-travel-sql.md) · [Verify recoveries](docs/verify.md) | [Docker](docs/docker.md) |
 | [30-second demo](docs/demo.md) | [Streaming](docs/streaming.md) · [Indexing](docs/indexing.md) | [Upload to S3](docs/upload.md) · [S3 IAM policy](docs/s3-iam-policy.md) · [Upgrading](docs/upgrade.md) |
-| | [MariaDB source (alpha)](docs/mariadb.md) · [PostgreSQL source (beta)](docs/postgres.md) | [Server identity](docs/server-identity.md) |
+| | [MariaDB source (alpha)](docs/mariadb.md) · [PostgreSQL source](docs/postgres.md) | [Server identity](docs/server-identity.md) |
 | | [Connect an AI assistant](docs/connect-ai.md) · [MCP server](docs/mcp-server.md) | [Parquet debugging](docs/parquet-debugging.md) |
 | | [Dump & Baseline](docs/dump-and-baseline.md) · [DDL tracking](docs/ddl-tracking.md) | |
 

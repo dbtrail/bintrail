@@ -38,7 +38,7 @@ Each tagged release publishes a multi-arch image (`linux/amd64` + `linux/arm64`)
 ```bash
 docker pull ghcr.io/dbtrail/bintrail:latest          # core CLI + MCP server
 docker pull ghcr.io/dbtrail/bintrail-console:latest  # web console (serve/watch)
-docker pull ghcr.io/dbtrail/bintrail-pg:latest       # PostgreSQL-source capturer (beta)
+docker pull ghcr.io/dbtrail/bintrail-pg:latest       # PostgreSQL-source capturer
 docker pull ghcr.io/dbtrail/bintrail:v0.7.12         # a specific version
 ```
 

@@ -1,12 +1,14 @@
-# PostgreSQL as a source (beta)
+# PostgreSQL as a source
 
 bintrail can capture from a **PostgreSQL** server while the index database stays
 MySQL. PostgreSQL capture lives in its own binary, **`bintrail-pg`**. This is a
-**beta** capability: the data-safety gates are closed — capture is type-faithful,
+**GA** capability: capture is type-faithful,
 `REPLICA IDENTITY FULL`-enforced, replication-slot/WAL-retention-monitored, and
-DDL-drift-safe, all verified end-to-end against real PostgreSQL (14–17 in CI). It
-still has documented limitations (below) — notably full-table `reconstruct` /
-time-travel, which is GA work — so read them before pointing it at production.
+DDL-drift-safe, all verified end-to-end against real PostgreSQL (14–17 in CI)
+and smoke-validated on managed PostgreSQL (RDS / Aurora). It still has
+documented limitations (below) — notably full-table `reconstruct` /
+time-travel, which stays out of scope for PostgreSQL — so read them before
+pointing it at production.
 
 **Scope:** PostgreSQL is supported as a **source** (the database you capture
 changes from). The **index** — where bintrail stores the indexed events — stays
@@ -227,7 +229,8 @@ bintrail-pg doctor --query-dsn "$PG" --slot bintrail_shop --publication bintrail
   (**WARN** — retaining WAL and approaching the limit; doctor still exits 0) →
   `lost` (a loud **FAIL** with the re-baseline recovery path).
 - **No UNLOGGED tables** → WARN if any captured table is `UNLOGGED` (under a
-  `FOR ALL TABLES` publication). UNLOGGED tables write no WAL, so their changes are
+  `FOR ALL TABLES` publication; a `FOR TABLES IN SCHEMA` publication is **not**
+  covered by the check). UNLOGGED tables write no WAL, so their changes are
   never captured — `ALTER TABLE <t> SET LOGGED` if you need them, or ignore if the
   data is intentionally ephemeral.
 - **FK cascade-child coverage** → WARN if a published table has a foreign-key
@@ -455,7 +458,7 @@ directly.
 > does not carry the `CREATE TABLE` metadata full-table reconstruct needs.
 > `query` and `recover` (which work from the indexed deltas alone, no baseline
 > required) are the fully-supported recovery surface for PostgreSQL in this
-> release — see [Beta limitations](#beta-limitations) for the complete
+> release — see [Limitations](#limitations) for the complete
 > picture.
 
 ### Interactive `AS OF` from `psql`
@@ -686,13 +689,16 @@ coerce, but verify your own round-trip.
 
 ---
 
-## Beta limitations
+## Limitations
 
 - **`UNLOGGED` tables are not captured.** They bypass the WAL by design, so logical
   decoding never sees them. bintrail-pg now **warns** when an UNLOGGED table is in
   capture scope (at `stream` startup and in `bintrail-pg doctor`, under a
   `FOR ALL TABLES` publication) — but the changes are still not captured, so don't
-  rely on bintrail for UNLOGGED data.
+  rely on bintrail for UNLOGGED data. The warning does **not** cover a
+  `FOR TABLES IN SCHEMA` (PostgreSQL 15+) publication: an UNLOGGED table pulled
+  into scope by a schema-scoped publication is silently uncaptured with no
+  warning — audit those schemas by hand.
 - **A cascade child must be in the publication.** A foreign-key `ON DELETE CASCADE`
   / `SET NULL` is captured (PostgreSQL performs it as ordinary row changes) **only
   if the child table is published**. If a published parent has an unpublished
@@ -723,7 +729,7 @@ coerce, but verify your own round-trip.
   the shim's single-row `_snapshot` work against a PG baseline and are
   validated end-to-end for scalar types — including the GUC-sensitive set,
   rendered under session GUCs pinned identically at capture and baseline;
-  container types remain beta (see
+  container types remain best-effort (see
   [Querying and recovering](#querying-and-recovering)). (`recover` and
   `recover-cascade` work unconditionally, with no baseline needed; cascades
   are captured as ordinary row changes — see
@@ -734,19 +740,20 @@ coerce, but verify your own round-trip.
 - **One database per slot.** A logical slot is scoped to a single database; to
   capture multiple databases on one cluster, run one `bintrail-pg stream` (and
   slot/publication) per database.
-- **Not in the console control plane / no BYOS agent.** Capture is the
-  `bintrail-pg stream` CLI only in this release.
+- **No BYOS agent.** The web console captures PostgreSQL sources (**+ Add
+  server** → PostgreSQL); `bintrail agent` (BYOS) does not support PostgreSQL.
 
-The data-safety items that gated **beta** are now closed (type fidelity,
-identity/generated recovery, slot/WAL monitoring, RI-FULL validation, DDL-drift
-handling, the silent-loss coverage guards above, and the baseline↔delta
-rendering-GUC identity with its fold-validated type matrix, #593). Source-aware
-console presentation, including the live replication-health panel, shipped in
-v0.20.1. The remaining limitation — **full-table** `reconstruct` / time-travel
-via a PostgreSQL baseline — is tracked toward **GA** in
-[#597](https://github.com/dbtrail/dbtrail/issues/597). The managed-PostgreSQL
-smoke covers RDS and Aurora — see
-[Managed PostgreSQL](#managed-postgresql).
+The gates that took PostgreSQL from beta to **GA** are closed
+([#597](https://github.com/dbtrail/dbtrail/issues/597)): the data-safety set
+(type fidelity, identity/generated recovery, slot/WAL monitoring, RI-FULL
+validation, DDL-drift handling, the silent-loss coverage guards above),
+baseline-anchored single-row `reconstruct` / time-travel with the
+baseline↔delta rendering-GUC identity and its fold-validated type matrix
+(#593), the managed-PostgreSQL smoke matrix (RDS and Aurora — see
+[Managed PostgreSQL](#managed-postgresql)), and source-aware console
+presentation including the live replication-health panel (v0.20.1).
+**Full-table** `reconstruct` and baseline-anchored `verify` remain documented
+out of scope (above).
 
 ---
 
