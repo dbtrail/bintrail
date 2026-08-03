@@ -71,17 +71,30 @@ func ReadMetaSidecar(path string) (*MetaSidecar, error) {
 	return &m, nil
 }
 
-// RestoreMetaSidecar inserts the sidecar's rows into the (fresh) index.
-// Row keys are filtered against the target table's actual columns, so a
-// sidecar written by a different binary version degrades to the shared
-// columns instead of erroring on a renamed one.
+// RestoreMetaSidecar inserts the sidecar's rows into the (fresh) index,
+// atomically: a mid-restore failure must leave ZERO rows — a partially
+// restored snapshot group would let the resolver decode row images against
+// an incomplete table set. Row keys are filtered against the target table's
+// actual columns, so a sidecar written by a different binary version
+// degrades to the shared columns instead of erroring on a renamed one.
 func RestoreMetaSidecar(ctx context.Context, db *sql.DB, m *MetaSidecar) (snapshots, servers int64, err error) {
-	snapshots, err = restoreRows(ctx, db, "schema_snapshots", m.SchemaSnapshots)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return snapshots, 0, err
+		return 0, 0, err
 	}
-	servers, err = restoreRows(ctx, db, "bintrail_servers", m.BintrailServers)
-	return snapshots, servers, err
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+	snapshots, err = restoreRows(ctx, tx, "schema_snapshots", m.SchemaSnapshots)
+	if err != nil {
+		return 0, 0, err
+	}
+	servers, err = restoreRows(ctx, tx, "bintrail_servers", m.BintrailServers)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return snapshots, servers, nil
 }
 
 func dumpTable(ctx context.Context, db *sql.DB, table string) ([]map[string]any, error) {
@@ -117,26 +130,32 @@ func dumpTable(ctx context.Context, db *sql.DB, table string) ([]map[string]any,
 	return out, rows.Err()
 }
 
-func restoreRows(ctx context.Context, db *sql.DB, table string, rowsIn []map[string]any) (int64, error) {
+func restoreRows(ctx context.Context, tx *sql.Tx, table string, rowsIn []map[string]any) (int64, error) {
 	if len(rowsIn) == 0 {
 		return 0, nil
 	}
-	// Insertable columns of the target table (generated columns excluded —
-	// they must never be inserted).
-	colRows, err := db.QueryContext(ctx, `
-		SELECT COLUMN_NAME FROM information_schema.COLUMNS
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND EXTRA NOT LIKE '%GENERATED%'`, table)
+	// Insertable columns of the target table, with their types. Generated
+	// columns are excluded via GENERATION_EXPRESSION, NOT `EXTRA LIKE
+	// '%GENERATED%'` — EXTRA also reports DEFAULT_GENERATED for ordinary
+	// expression-default columns (bintrail_servers' created_at/updated_at),
+	// and the substring match would silently drop those real data columns
+	// (the trap consistency/checksum.go and reconstruct/fulltable.go both
+	// document).
+	colRows, err := tx.QueryContext(ctx, `
+		SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+		  AND (GENERATION_EXPRESSION IS NULL OR GENERATION_EXPRESSION = '')`, table)
 	if err != nil {
 		return 0, fmt.Errorf("introspect %s: %w", table, err)
 	}
 	defer colRows.Close()
-	target := map[string]bool{}
+	target := map[string]string{}
 	for colRows.Next() {
-		var name string
-		if err := colRows.Scan(&name); err != nil {
+		var name, dataType string
+		if err := colRows.Scan(&name, &dataType); err != nil {
 			return 0, err
 		}
-		target[name] = true
+		target[name] = strings.ToLower(dataType)
 	}
 	if err := colRows.Err(); err != nil {
 		return 0, err
@@ -147,14 +166,19 @@ func restoreRows(ctx context.Context, db *sql.DB, table string, rowsIn []map[str
 		var cols []string
 		var args []any
 		for k, v := range row {
-			if !target[k] {
+			dataType, ok := target[k]
+			if !ok {
 				continue
 			}
 			// time.Time values were JSON-marshaled as RFC3339; MySQL's
-			// DATETIME parser rejects the T/Z form, so convert back.
-			if s, ok := v.(string); ok {
-				if ts, err := time.Parse(time.RFC3339, s); err == nil {
-					v = ts.UTC().Format("2006-01-02 15:04:05")
+			// DATETIME parser rejects the T/Z form. Conversion is driven by
+			// the COLUMN type — probing every string would silently rewrite
+			// a VARCHAR whose content merely looks like a timestamp.
+			if dataType == "datetime" || dataType == "timestamp" {
+				if s, ok := v.(string); ok {
+					if ts, err := time.Parse(time.RFC3339, s); err == nil {
+						v = ts.UTC().Format("2006-01-02 15:04:05")
+					}
 				}
 			}
 			cols = append(cols, "`"+k+"`")
@@ -165,7 +189,7 @@ func restoreRows(ctx context.Context, db *sql.DB, table string, rowsIn []map[str
 		}
 		stmt := "INSERT INTO `" + table + "` (" + strings.Join(cols, ", ") + ") VALUES (" +
 			strings.TrimSuffix(strings.Repeat("?,", len(cols)), ",") + ")"
-		if _, err := db.ExecContext(ctx, stmt, args...); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
 			return n, fmt.Errorf("restore %s row: %w", table, err)
 		}
 		n++

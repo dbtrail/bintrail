@@ -16,8 +16,14 @@ import (
 // values). pk_hash is a stored generated column and is never inserted.
 // Returns the number of rows loaded.
 func RestorePartition(ctx context.Context, db *sql.DB, localPath string, batchSize int) (int64, error) {
-	if batchSize <= 0 {
-		batchSize = 5000
+	// MySQL prepared statements cap at 65,535 placeholders (uint16) — the
+	// #956 class the indexer already guards with a derived MaxBatchSize. 18
+	// columns × 5,000 rows = 90,000 placeholders = ER 1390 on every thin-row
+	// archive, so the clamp is derived from the column slice (a 19th column
+	// must not silently re-break it).
+	maxTuples := 65535 / len(BinlogEventColumns)
+	if batchSize <= 0 || batchSize > maxTuples {
+		batchSize = maxTuples
 	}
 	duck, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -25,23 +31,36 @@ func RestorePartition(ctx context.Context, db *sql.DB, localPath string, batchSi
 	}
 	defer duck.Close()
 
-	cols := make([]string, len(BinlogEventColumns))
+	pathLit := "'" + strings.ReplaceAll(localPath, "'", "''") + "'"
+	// Column presence is introspected so archives written before a column
+	// existed (connection_id, #699 query_text/query_hash, commit_ts_us)
+	// restore with NULLs instead of being locked out — the same tolerance
+	// parquetquery applies when reading them. The SELECT stays BY NAME, so
+	// positional misalignment is impossible either way; a missing CORE
+	// column still fails loud at the MySQL insert (NOT NULL).
+	present, err := parquetColumns(ctx, duck, pathLit)
+	if err != nil {
+		return 0, fmt.Errorf("inspect archive %s: %w", localPath, err)
+	}
+	sel := make([]string, len(BinlogEventColumns))
 	quoted := make([]string, len(BinlogEventColumns))
 	for i, c := range BinlogEventColumns {
-		cols[i] = c.Name
+		if present[c.Name] {
+			sel[i] = c.Name
+		} else {
+			sel[i] = "NULL AS " + c.Name
+		}
 		quoted[i] = "`" + c.Name + "`"
 	}
-	// The column list is read EXPLICITLY (not SELECT *) so an older archive
-	// missing later columns fails loud here rather than loading misaligned.
 	rows, err := duck.QueryContext(ctx,
-		"SELECT "+strings.Join(cols, ", ")+" FROM parquet_scan('"+strings.ReplaceAll(localPath, "'", "''")+"')")
+		"SELECT "+strings.Join(sel, ", ")+" FROM parquet_scan("+pathLit+")")
 	if err != nil {
 		return 0, fmt.Errorf("scan archive %s: %w", localPath, err)
 	}
 	defer rows.Close()
 
 	insertPrefix := "INSERT INTO binlog_events (" + strings.Join(quoted, ", ") + ") VALUES "
-	tuple := "(" + strings.TrimSuffix(strings.Repeat("?,", len(cols)), ",") + ")"
+	tuple := "(" + strings.TrimSuffix(strings.Repeat("?,", len(quoted)), ",") + ")"
 
 	// Flush on row count OR approximate payload size: binlog_events rows
 	// carry full before/after JSON images, so a count-only batch of fat rows
@@ -65,8 +84,8 @@ func RestorePartition(ctx context.Context, db *sql.DB, localPath string, batchSi
 		return nil
 	}
 
-	scan := make([]any, len(cols))
-	ptrs := make([]any, len(cols))
+	scan := make([]any, len(quoted))
+	ptrs := make([]any, len(quoted))
 	for i := range scan {
 		ptrs[i] = &scan[i]
 	}
@@ -99,4 +118,22 @@ func RestorePartition(ctx context.Context, db *sql.DB, localPath string, batchSi
 		return total, err
 	}
 	return total, nil
+}
+
+// parquetColumns lists the column names present in a Parquet file.
+func parquetColumns(ctx context.Context, duck *sql.DB, pathLit string) (map[string]bool, error) {
+	rows, err := duck.QueryContext(ctx, "SELECT * FROM parquet_scan("+pathLit+") LIMIT 0")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	names, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = true
+	}
+	return out, nil
 }

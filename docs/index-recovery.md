@@ -7,11 +7,18 @@ archives back into a working index.
 
 ## Partial availability first
 
-Before rebuilding anything: **`query` and `reconstruct` can read archives
-directly without a live index** (`--archive-dir` / `--archive-s3` on
-`query`; baselines plus archives for `reconstruct`). If you are
-mid-incident, you can answer "what changed" and produce recovery SQL from
-the archive tier alone while the index rebuild runs.
+Mid-incident, before the rebuild finishes, two things still work:
+
+- **DuckDB directly on the Parquet files** — no bintrail index needed at
+  all; see [parquet-debugging.md](parquet-debugging.md) for ready-made
+  queries over the archive layout.
+- **`bintrail query --archive-s3 ... --bintrail-id ...` against the fresh
+  index as soon as step 2 below has created its schema** — the explicit
+  archive flags don't depend on `archive_state`, so "what changed?" is
+  answerable while the bulk load is still running. (`query`, `recover` and
+  `reconstruct` all need a reachable index MySQL to run — the flags
+  supplement an index, they don't replace it. `reconstruct --baseline-only`
+  is the one truly index-less read: baseline state, no deltas.)
 
 ## Rebuilding the index
 
@@ -23,13 +30,17 @@ bintrail restore-index \
 
 What it does, in order:
 
-1. **Refuses a non-empty index.** restore-index rebuilds a *fresh* index —
-   point it at a new, empty database. Mixing a partial restore into a live
-   index creates states nothing can reason about.
-2. Creates the index schema (same DDL as `bintrail init`) and re-partitions
-   `binlog_events` to cover exactly the archived hours plus a forward
-   horizon — a single `ALTER` on the empty table, instant.
-3. Scans the Hive layout and bulk-loads every archived partition back,
+1. **Refuses an index that already holds state** (events, a stream
+   position, or schema snapshots). restore-index rebuilds a *fresh* index —
+   point it at a new, empty database. A surviving `stream_state` row is the
+   dangerous case: the restarted stream would resume a stale position and
+   fake continuity across the hole.
+2. Creates the index schema (the same table set as `bintrail init`; pass
+   `--encrypt` if the lost index was encrypted — parity is **not**
+   inferred).
+3. Scans the Hive layout, re-partitions `binlog_events` to cover exactly
+   the archived hours plus a forward horizon (a single `ALTER` on the
+   empty table, instant), then bulk-loads every archived partition back,
    preserving `event_id` identity, and rebuilds `archive_state` from the
    scan (it is a rebuildable cache by design).
 4. Restores `schema_snapshots` and server identity from the **index-meta
@@ -40,24 +51,34 @@ What it does, in order:
    the next steps. `--format json` for automation; exit non-zero if any
    file failed to load.
 
+**If a file fails mid-load, the index is PARTIAL**: batches already flushed
+stay loaded (the report counts them), and a re-run is refused by the
+fresh-index guard. To retry, drop and recreate the database, then run
+restore-index again.
+
 ## What does NOT come back — by design
 
 - **`stream_state`** (the replication position). A position that survived
   an index loss is stale; resuming from it would *fake* continuity across
   a hole. Restart the stream cleanly (`bintrail stream` /
-  `bintrail-console watch`): the continuity verdict then reports the
-  capture seam honestly.
+  `bintrail-console watch`): the hole then shows up honestly as **missing
+  restore coverage** (the continuity verdict describes the new capture
+  range — it does not stamp a `gap_lost` for the pre-restore window).
 - **`index_state`** (the per-file indexing ledger) — historical bookkeeping
   for binlog files that may no longer exist.
 - Events that were **never archived**: anything in live partitions that had
-  not been rotated to Parquet yet is gone with the index. The gap between
-  the newest archive and the stream restart is a real capture gap —
-  `status` and the coverage card will show it, not paper over it.
+  not been rotated to Parquet yet is gone with the index. The window
+  between the newest archive and the stream restart is a real hole — it
+  appears as missing restore coverage, not papered over.
+- **Archives older than the current schema restore with NULLs** in the
+  later columns (`connection_id`, `query_text`/`query_hash`,
+  `commit_ts_us`) — same tolerance queries already apply when reading
+  them.
 
 ## After the rebuild
 
 ```bash
-bintrail archive reconcile --index-dsn ...   # cross-check archive_state
+bintrail archive reconcile --index-dsn ... --archive-s3 s3://...   # cross-check archive_state
 bintrail snapshot --source-dsn ... --index-dsn ...   # if no sidecar was found
 bintrail status --index-dsn ...              # coverage + continuity sanity
 ```

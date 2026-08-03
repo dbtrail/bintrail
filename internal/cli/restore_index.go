@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
@@ -29,18 +30,25 @@ var restoreIndexCmd = &cobra.Command{
 	Long: `Turns the archive tier back into a working index — the recovery story
 for the one stateful component that had none ("who backs up the backup"):
 
-  1. Refuses an index that already holds events (restore-index is for a
-     FRESH index — mixing a partial restore into a live one creates states
-     nothing can reason about).
-  2. Creates the index schema (same DDL as 'bintrail init') and
+  1. Refuses an index that already holds state (events, a stream position,
+     or schema snapshots) — restore-index is for a FRESH index: mixing a
+     partial restore into surviving state creates positions nothing can
+     reason about (a surviving stream_state row would make the restarted
+     stream resume a stale position and fake continuity across the hole).
+  2. Creates the index schema (the same table set as 'bintrail init';
+     pass --encrypt if the lost index was encrypted — parity is NOT
+     inferred).
+  3. Scans the Hive archive layout (--archive-dir or --archive-s3), then
      re-partitions binlog_events to cover exactly the archived hours plus
-     a forward horizon (one ALTER on the empty table — instant).
-  3. Scans the Hive archive layout (--archive-dir or --archive-s3), bulk-
-     loads every archived partition back into binlog_events, and rebuilds
-     archive_state from the scan (it is a rebuildable cache by design).
+     a forward horizon (one ALTER on the empty table — instant), and
+     bulk-loads every archived partition back, rebuilding archive_state
+     from the scan (it is a rebuildable cache by design).
   4. Restores schema_snapshots and server identity from the index-meta
-     sidecar that rotation persists alongside the archives — when present.
-  5. Reports what was and was NOT recovered, and the next steps.
+     sidecar that rotation persists alongside the archives — when present
+     and readable.
+  5. Reports what was and was NOT recovered, and the next steps. A failed
+     file leaves the index PARTIAL: the report says so, and a retry needs
+     a fresh (dropped and recreated) database.
 
 Deliberately NOT recovered (and never persisted): stream_state and
 index_state — a replication position that survived an index loss is stale,
@@ -61,6 +69,7 @@ var (
 	riRegion     string
 	riBatch      int
 	riPartitions int
+	riEncrypt    bool
 	riFormat     string
 )
 
@@ -72,6 +81,7 @@ func init() {
 	f.StringVar(&riRegion, "region", "", "AWS region for --archive-s3")
 	f.IntVar(&riBatch, "batch-size", 5000, "Rows per INSERT batch while loading")
 	f.IntVar(&riPartitions, "partitions", 48, "Forward partition horizon to create beyond the archived hours (same default as init)")
+	f.BoolVar(&riEncrypt, "encrypt", false, "Create binlog_events with InnoDB tablespace encryption (pass it if the lost index was encrypted — parity is not inferred)")
 	f.StringVar(&riFormat, "format", "text", "Output format: text or json")
 	_ = restoreIndexCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(restoreIndexCmd)
@@ -80,26 +90,55 @@ func init() {
 // restoreIndexReport is the honest inventory of a rebuild: what came back,
 // what could not, and what the operator must do next.
 type restoreIndexReport struct {
-	EventsLoaded      int64    `json:"events_loaded"`
-	FilesLoaded       int      `json:"files_loaded"`
-	FailedFiles       []string `json:"failed_files,omitempty"`
-	PartitionsCreated int      `json:"partitions_created"`
-	ArchiveStateRows  int      `json:"archive_state_rows"`
+	EventsLoaded int64    `json:"events_loaded"`
+	FilesLoaded  int      `json:"files_loaded"`
+	FailedFiles  []string `json:"failed_files,omitempty"`
+	// PartialRows counts rows that ARE in binlog_events from files that then
+	// FAILED mid-load (each batch commits independently) — the inventory
+	// must not undercount actual index contents, and their presence is what
+	// makes a retry need a fresh database.
+	PartialRows       int64 `json:"partial_rows_from_failed_files,omitempty"`
+	PartitionsCreated int   `json:"partitions_created"`
+	ArchiveStateRows  int   `json:"archive_state_rows"`
+	// StateRowFailures: the events LOADED but the archive_state row could
+	// not be recorded — a rebuildable-cache failure `archive reconcile
+	// --repair` fixes, kept apart from FailedFiles so the exit message
+	// cannot claim data "failed to load" when it fully did.
+	StateRowFailures  []string `json:"archive_state_failures,omitempty"`
 	SnapshotsRestored int64    `json:"snapshots_restored"`
 	ServersRestored   int64    `json:"servers_restored"`
 	SidecarFound      bool     `json:"sidecar_found"`
+	// SidecarWarnings surfaces unreadable/undownloadable sidecars in the
+	// machine-readable report — a stderr-only warning is invisible to the
+	// JSON automation path, and a swallowed one would let the report assert
+	// a false cause ("archives predate #1196").
+	SidecarWarnings []string `json:"sidecar_warnings,omitempty"`
 	// NotRecovered lists state this rebuild cannot bring back — absence of
 	// an entry is a recovery claim, so unknowns are listed, never omitted.
 	NotRecovered []string `json:"not_recovered"`
 	NextSteps    []string `json:"next_steps"`
 }
 
-// ExitError is the single exit decision for both output formats.
+// ExitError is the single exit decision for both output formats. Load
+// failures and archive_state failures are named separately — the latter is
+// repairable in place and must not read as lost data.
 func (r *restoreIndexReport) ExitError() error {
-	if len(r.FailedFiles) == 0 {
+	if len(r.FailedFiles) == 0 && len(r.StateRowFailures) == 0 {
 		return nil
 	}
-	return fmt.Errorf("restore-index: %d archive file(s) failed to load: %s", len(r.FailedFiles), strings.Join(r.FailedFiles, ", "))
+	var parts []string
+	if len(r.FailedFiles) > 0 {
+		msg := fmt.Sprintf("%d archive file(s) failed to load (%s)", len(r.FailedFiles), strings.Join(r.FailedFiles, ", "))
+		if r.PartialRows > 0 {
+			msg += fmt.Sprintf("; %d partially-loaded row(s) remain — retry needs a fresh database", r.PartialRows)
+		}
+		parts = append(parts, msg)
+	}
+	if len(r.StateRowFailures) > 0 {
+		parts = append(parts, fmt.Sprintf("%d archive_state row(s) not recorded (events ARE loaded; run `bintrail archive reconcile --repair`): %s",
+			len(r.StateRowFailures), strings.Join(r.StateRowFailures, ", ")))
+	}
+	return fmt.Errorf("restore-index: %s", strings.Join(parts, "; "))
 }
 
 func runRestoreIndex(cmd *cobra.Command, args []string) error {
@@ -127,8 +166,15 @@ func runRestoreIndex(cmd *cobra.Command, args []string) error {
 	if err := restoreIndexTargetEmpty(ctx, db, dbName); err != nil {
 		return err
 	}
-	if err := indexer.CreateIndexTables(ctx, db, riPartitions, false, nil); err != nil {
+	if err := indexer.CreateIndexTables(ctx, db, riPartitions, riEncrypt, nil); err != nil {
 		return err
+	}
+	// EnsureSchema covers the one guard hole CreateIndexTables leaves: a
+	// database initialized by an OLDER `bintrail init` (empty of state, so
+	// the guard passes) whose CREATE IF NOT EXISTS no-ops against the old
+	// definition — without the migration every 18-column INSERT would fail.
+	if err := indexer.EnsureSchema(db); err != nil {
+		return fmt.Errorf("migrate index schema: %w", err)
 	}
 
 	// ── Scan the archive layout ────────────────────────────────────────────
@@ -153,6 +199,11 @@ func runRestoreIndex(cmd *cobra.Command, args []string) error {
 		if d, ok := indexer.PartitionDate(f.PartitionName); ok {
 			hours[d] = true
 		}
+	}
+	// MySQL caps a table at 8,192 partitions — ~341 days of hourly archives.
+	// Fail actionably up front rather than mid-ALTER with ER 1499.
+	if len(hours)+riPartitions+1 > 8192 {
+		return fmt.Errorf("the archive tier spans %d hourly partitions; with the +%d horizon that exceeds MySQL's 8192-partition limit — restore a bounded window by pointing --archive-dir/--archive-s3 at a subset, or restore in stages", len(hours), riPartitions)
 	}
 	partSQL, partCount := buildRestorePartitionSQL(dbName, hours, time.Now().UTC(), riPartitions)
 	if _, err := db.ExecContext(ctx, partSQL); err != nil {
@@ -182,13 +233,19 @@ func runRestoreIndex(cmd *cobra.Command, args []string) error {
 			os.Remove(path)
 		}
 		if lerr != nil {
-			report.FailedFiles = append(report.FailedFiles, f.PartitionName+": "+lerr.Error())
+			// Batches already flushed ARE in binlog_events: count them, name
+			// them — an inventory that undercounts actual index contents is
+			// the overclaim invariant inverted, and those rows are why a
+			// retry needs a fresh database.
+			report.PartialRows += n
+			report.FailedFiles = append(report.FailedFiles,
+				fmt.Sprintf("%s: %v (after %d row(s) already inserted)", f.PartitionName, lerr, n))
 			continue
 		}
 		report.EventsLoaded += n
 		report.FilesLoaded++
 		if err := recordRestoredArchive(ctx, db, f, n); err != nil {
-			report.FailedFiles = append(report.FailedFiles, f.PartitionName+" (archive_state): "+err.Error())
+			report.StateRowFailures = append(report.StateRowFailures, f.PartitionName+": "+err.Error())
 			continue
 		}
 		report.ArchiveStateRows++
@@ -198,26 +255,41 @@ func runRestoreIndex(cmd *cobra.Command, args []string) error {
 	}
 
 	// ── Sidecar: schema snapshots + server identity ────────────────────────
-	if m := newestSidecar(ctx, s3c, ids); m != nil {
+	var sidecarErr error
+	m, sidecarWarnings := newestSidecar(ctx, s3c, ids)
+	report.SidecarWarnings = sidecarWarnings
+	if m != nil {
 		report.SidecarFound = true
-		snaps, servers, serr := archive.RestoreMetaSidecar(ctx, db, m)
+		var snaps, servers int64
+		snaps, servers, sidecarErr = archive.RestoreMetaSidecar(ctx, db, m)
 		report.SnapshotsRestored, report.ServersRestored = snaps, servers
-		if serr != nil {
-			report.FailedFiles = append(report.FailedFiles, "index-meta sidecar: "+serr.Error())
+		if sidecarErr != nil {
+			report.FailedFiles = append(report.FailedFiles, "index-meta sidecar: "+sidecarErr.Error())
 		}
 	}
 
 	report.NotRecovered = append(report.NotRecovered,
 		"stream_state (replication position — deliberately never persisted: resuming a stale position would fake continuity)",
 		"index_state (per-file indexing ledger)")
-	if !report.SidecarFound {
+	// Gated on the RESTORE succeeding, not just the sidecar existing —
+	// "absence of an entry is a recovery claim", and a found-but-failed
+	// sidecar recovered nothing (the restore is transactional).
+	if !report.SidecarFound || sidecarErr != nil {
+		reason := "no index-meta sidecar found — archives predate #1196, or the sidecar was unreadable (see sidecar_warnings)"
+		if sidecarErr != nil {
+			reason = "the sidecar restore failed (see failed_files)"
+		}
 		report.NotRecovered = append(report.NotRecovered,
-			"schema_snapshots + server identity (no index-meta sidecar found — archives predate #1196)")
+			"schema_snapshots + server identity ("+reason+")")
 		report.NextSteps = append(report.NextSteps, "run `bintrail snapshot` against the source to re-capture table schemas")
 	}
+	if len(report.FailedFiles) > 0 {
+		report.NextSteps = append(report.NextSteps,
+			"this index is PARTIAL (failed files above; already-flushed batches remain loaded) — to retry, drop and recreate the database, then re-run restore-index")
+	}
 	report.NextSteps = append(report.NextSteps,
-		"restart the stream (`bintrail stream` / `bintrail-console watch`) from a fresh position — the continuity verdict will honestly report the capture seam",
-		"run `bintrail archive reconcile` to double-check archive_state against the layout")
+		"restart the stream (`bintrail stream` / `bintrail-console watch`) from a fresh position — restarting cleanly avoids FAKING continuity across the hole; the missing window shows up as missing restore coverage, not as a gap_lost verdict",
+		"run `bintrail archive reconcile --archive-dir/--archive-s3 ...` to double-check archive_state against the layout")
 
 	exitErr := report.ExitError()
 	if riFormat == "json" {
@@ -233,28 +305,36 @@ func runRestoreIndex(cmd *cobra.Command, args []string) error {
 	return exitErr
 }
 
-// restoreIndexTargetEmpty refuses an index that already holds events —
-// restore-index is for a fresh index only (the drill guard's sibling).
+// restoreIndexTargetEmpty refuses an index that already holds STATE — not
+// just events (the drill guard's sibling). A surviving stream_state row is
+// the dangerous one: partitions can rotate away leaving binlog_events empty
+// while the position survives, and a restarted stream would then RESUME the
+// pre-loss position and fake continuity across the hole — the exact thing
+// this command's report promises cannot happen. Surviving schema_snapshots
+// would collide with the sidecar restore. Absent tables are fine (a truly
+// fresh database).
 func restoreIndexTargetEmpty(ctx context.Context, db *sql.DB, dbName string) error {
-	var exists int
-	if err := db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM information_schema.TABLES
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events'`, dbName).Scan(&exists); err != nil {
-		return fmt.Errorf("probe index: %w", err)
+	for _, table := range []string{"binlog_events", "stream_state", "schema_snapshots"} {
+		var exists int
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM information_schema.TABLES
+			WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`, dbName, table).Scan(&exists); err != nil {
+			return fmt.Errorf("probe index: %w", err)
+		}
+		if exists == 0 {
+			continue
+		}
+		var one int
+		err := db.QueryRowContext(ctx, "SELECT 1 FROM `"+table+"` LIMIT 1").Scan(&one)
+		switch {
+		case err == sql.ErrNoRows:
+		case err != nil:
+			return fmt.Errorf("probe %s: %w", table, err)
+		default:
+			return fmt.Errorf("the index already holds state (%s is not empty) — restore-index only rebuilds a FRESH index; point --index-dsn at a new, empty database (a previous failed restore also leaves state: drop and recreate the database to retry)", table)
+		}
 	}
-	if exists == 0 {
-		return nil
-	}
-	var one int
-	err := db.QueryRowContext(ctx, "SELECT 1 FROM binlog_events LIMIT 1").Scan(&one)
-	switch {
-	case err == sql.ErrNoRows:
-		return nil
-	case err != nil:
-		return fmt.Errorf("probe binlog_events: %w", err)
-	default:
-		return fmt.Errorf("the index already holds events — restore-index only rebuilds a FRESH index; point --index-dsn at a new, empty database")
-	}
+	return nil
 }
 
 // buildRestorePartitionSQL builds the single ALTER that re-partitions the
@@ -288,12 +368,13 @@ func buildRestorePartitionSQL(dbName string, archiveHours map[time.Time]bool, no
 }
 
 // recordRestoredArchive rebuilds this file's archive_state row (a rebuildable
-// cache, #392) — same upsert shape as rotation's, with s3_uploaded_at stamped
-// whenever the S3 object was just confirmed by the scan (the reconcile
-// invariant: a confirmed object must be stamped or rotate refuses drops
-// forever). min/max_event_ts stay NULL — the scan does not read row content;
-// the planner falls back to the hour label, and `archive reconcile --deep`
-// can refine later.
+// cache, #392) — rotation's sibling upsert (NOT the same shape: rotation
+// stamps s3_uploaded_at in a separate post-upload UPDATE and records
+// min/max_event_ts), plus the s3_uploaded_at stamp the reconcile invariant
+// requires: a confirmed S3 object must be stamped or rotate refuses drops
+// forever. min/max_event_ts stay NULL permanently — the scan does not read
+// row content, and no current command backfills them; the planner falls
+// back to the hour label.
 func recordRestoredArchive(ctx context.Context, db *sql.DB, f archive.ScannedFile, rows int64) error {
 	var localPath, bucket, key, uploadedAt any
 	if f.Backend == archive.BackendS3 {
@@ -338,9 +419,28 @@ func downloadS3ToTemp(ctx context.Context, client *s3.Client, bucket, key string
 
 // newestSidecar finds the newest index-meta sidecar across the scanned
 // bintrail_ids (each source directory carries its own; the sidecar holds a
-// FULL table dump, so restoring more than one would duplicate rows).
-func newestSidecar(ctx context.Context, s3c *s3.Client, ids map[string]bool) *archive.MetaSidecar {
+// FULL table dump, so restoring more than one would duplicate rows). Only a
+// genuinely ABSENT sidecar is silent (the routine pre-#1196 case); an
+// unreadable or undownloadable one is returned as a warning — swallowing it
+// would let the report assert a false cause, and a newer-but-broken sidecar
+// silently losing to an older one must at least be visible.
+func newestSidecar(ctx context.Context, s3c *s3.Client, ids map[string]bool) (*archive.MetaSidecar, []string) {
 	var newest *archive.MetaSidecar
+	var warnings []string
+	warn := func(format string, a ...any) {
+		msg := fmt.Sprintf(format, a...)
+		warnings = append(warnings, msg)
+		fmt.Fprintln(os.Stderr, "warning: "+msg)
+	}
+	var bucket, prefix string
+	if riArchiveDir == "" {
+		var err error
+		bucket, prefix, err = storage.ParseS3URL(riArchiveS3)
+		if err != nil {
+			warn("cannot parse --archive-s3 for sidecar lookup: %v", err)
+			return nil, warnings
+		}
+	}
 	for id := range ids {
 		var m *archive.MetaSidecar
 		if riArchiveDir != "" {
@@ -348,16 +448,12 @@ func newestSidecar(ctx context.Context, s3c *s3.Client, ids map[string]bool) *ar
 			got, err := archive.ReadMetaSidecar(path)
 			if err != nil {
 				if !os.IsNotExist(err) {
-					fmt.Fprintf(os.Stderr, "warning: unreadable sidecar %s: %v\n", path, err)
+					warn("unreadable sidecar %s: %v", path, err)
 				}
 				continue
 			}
 			m = got
 		} else {
-			bucket, prefix, err := storage.ParseS3URL(riArchiveS3)
-			if err != nil {
-				continue
-			}
 			key := strings.TrimSuffix(prefix, "/")
 			if key != "" {
 				key += "/"
@@ -365,12 +461,20 @@ func newestSidecar(ctx context.Context, s3c *s3.Client, ids map[string]bool) *ar
 			key += "bintrail_id=" + id + "/" + archive.MetaSidecarName
 			path, err := downloadS3ToTemp(ctx, s3c, bucket, key)
 			if err != nil {
-				continue // absent sidecar is the routine pre-#1196 case
+				// Only NoSuchKey/NotFound is the routine absent case; an
+				// AccessDenied/throttle/network error hides a sidecar that
+				// may exist.
+				var noKey *s3types.NoSuchKey
+				var notFound *s3types.NotFound
+				if !errors.As(err, &noKey) && !errors.As(err, &notFound) {
+					warn("could not download sidecar s3://%s/%s: %v", bucket, key, err)
+				}
+				continue
 			}
 			got, rerr := archive.ReadMetaSidecar(path)
 			os.Remove(path)
 			if rerr != nil {
-				fmt.Fprintf(os.Stderr, "warning: unreadable sidecar s3://%s/%s: %v\n", bucket, key, rerr)
+				warn("unreadable sidecar s3://%s/%s: %v", bucket, key, rerr)
 				continue
 			}
 			m = got
@@ -379,7 +483,7 @@ func newestSidecar(ctx context.Context, s3c *s3.Client, ids map[string]bool) *ar
 			newest = m
 		}
 	}
-	return newest
+	return newest, warnings
 }
 
 func writeRestoreIndexText(r *restoreIndexReport) {
