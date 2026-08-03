@@ -450,12 +450,15 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		// baseline canonicalizer's set, the lookup could never have matched, so
 		// blaming a schema event that may never have happened sends the
 		// operator after a remedy (re-run `bintrail baseline`) that cannot
-		// help. Report the same reason `verify` reports (#1155).
+		// help. Report the same reason `verify` reports (#1155), through the
+		// shared discriminator (#1198): unsupportedPKType never flags an empty
+		// DataType today, but if that ever changes the PG-shaped column gets
+		// the honest wrong-path verdict instead of `has type ""` blame.
 		if c := unsupportedPKType(pkMetas); c != nil {
 			return fmt.Errorf(
-				"reconstruct: no baseline row for %s.%s pk %q — primary-key column %q has type %q unsupported by the baseline canonicalizer, "+
+				"reconstruct: no baseline row for %s.%s pk %q — %s, "+
 					"so this row cannot be located in the snapshot regardless of whether it exists",
-				recSchema, recTable, recPK, c.Name, c.DataType)
+				recSchema, recTable, recPK, reconstruct.PKTypeGateReason(*c, "reconstruct", "reconstruct"))
 		}
 		if pkChangeSuspected(events) {
 			return fmt.Errorf(

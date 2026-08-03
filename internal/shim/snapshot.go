@@ -137,6 +137,26 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 	}
 	for _, c := range pkCols {
 		if !reconstruct.SupportedPKType(c.DataType) {
+			// An empty DataType is not a canonicalizer verdict: it is the
+			// PostgreSQL snapshot shape (#1198 — the #533 invariant: MySQL
+			// snapshot writers always store a non-empty DATA_TYPE token, only
+			// WritePGSnapshot writes ""). Blaming the PK type would send the
+			// operator chasing a column problem nothing they do to the table
+			// can fix. Discriminate: a resolved postgres flavor means the real
+			// limitation is #597 (no PG full-table _snapshot); an unresolved
+			// flavor means the MySQL path was taken for a PG-shaped index and
+			// the shared wrong-path verdict applies.
+			if strings.TrimSpace(c.DataType) == "" {
+				if query.SourceFlavor(h.indexDB) == "postgres" {
+					return nil, mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
+						"resolve %s: full-table _snapshot is not yet supported for PostgreSQL sources (#597) — "+
+							"use a single-row _snapshot lookup or _flashback for a binlog-only view",
+						q.Type))
+				}
+				return nil, mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
+					"resolve %s: %s — use _flashback for a binlog-only view",
+					q.Type, reconstruct.PKTypeGateReason(c, "full-table _snapshot", "materialize")))
+			}
 			// Baseline configured but this PK type can't be canonicalized for the
 			// merge — same fail-loud reasoning as the unresolved-PK branch (#822):
 			// silently returning binlog-only rows would be a partial table the

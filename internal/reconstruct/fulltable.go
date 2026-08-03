@@ -607,10 +607,7 @@ func ReconstructTable(
 	// their type to be added.
 	for _, pkCol := range pkCols {
 		if !supportedPKType(pkCol.DataType) {
-			return nil, fmt.Errorf(
-				"full-table reconstruct: %s.%s PK column %q has type %q which is not in the supported PK type set; "+
-					"file a follow-up issue if you need this type",
-				schema, table, pkCol.Name, pkCol.DataType)
+			return nil, fullTablePKTypeRefusal(schema, table, pkCol)
 		}
 	}
 
