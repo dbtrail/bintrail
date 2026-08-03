@@ -32,12 +32,12 @@ func TestContinuityStatus(t *testing.T) {
 }
 
 // Query shapes shared by the CollectCoverageSummary tests. The summary hits,
-// in order: partition listing (floor) → archive_state MIN/MAX → partition
+// in order: partition listing (floor) → archive_state MIN/MAX/sources → partition
 // listing (walk) → per-partition MAX probes (newest first, p_future first) →
 // stream_state.
 var (
 	covPartsQ  = regexp.QuoteMeta("SELECT PARTITION_NAME FROM information_schema.PARTITIONS")
-	covArchQ   = regexp.QuoteMeta("SELECT MIN(partition_name), MAX(partition_name) FROM archive_state")
+	covArchQ   = regexp.QuoteMeta("SELECT MIN(partition_name), MAX(partition_name), COUNT(DISTINCT bintrail_id) FROM archive_state")
 	covProbeQ  = `MAX\(event_timestamp\) FROM binlog_events PARTITION`
 	covStreamQ = "FROM stream_state"
 )
@@ -74,7 +74,7 @@ func TestCollectCoverageSummary(t *testing.T) {
 	// then p_2026080110 (holds latest).
 	expectWindow := func(mock sqlmock.Sqlmock) {
 		mock.ExpectQuery(covPartsQ).WillReturnRows(covPartRows("p_2026080110", "p_future"))
-		mock.ExpectQuery(covArchQ).WillReturnRows(sqlmock.NewRows([]string{"min", "max"}).AddRow(nil, nil))
+		mock.ExpectQuery(covArchQ).WillReturnRows(sqlmock.NewRows([]string{"min", "max", "sources"}).AddRow(nil, nil, 0))
 		mock.ExpectQuery(covPartsQ).WillReturnRows(covPartRows("p_2026080110", "p_future"))
 		mock.ExpectQuery(covProbeQ).WillReturnRows(covProbeRow(nil)) // p_future first, empty
 		mock.ExpectQuery(covProbeQ).WillReturnRows(covProbeRow(latest))
@@ -137,7 +137,7 @@ func TestCollectCoverageSummary(t *testing.T) {
 	t.Run("empty index with a live stream: no window edge, no fabricated lag", func(t *testing.T) {
 		db, mock := newDB(t)
 		mock.ExpectQuery(covPartsQ).WillReturnRows(covPartRows("p_2026080110", "p_future"))
-		mock.ExpectQuery(covArchQ).WillReturnRows(sqlmock.NewRows([]string{"min", "max"}).AddRow(nil, nil))
+		mock.ExpectQuery(covArchQ).WillReturnRows(sqlmock.NewRows([]string{"min", "max", "sources"}).AddRow(nil, nil, 0))
 		mock.ExpectQuery(covPartsQ).WillReturnRows(covPartRows("p_2026080110", "p_future"))
 		mock.ExpectQuery(covProbeQ).WillReturnRows(covProbeRow(nil)) // p_future empty
 		mock.ExpectQuery(covProbeQ).WillReturnRows(covProbeRow(nil)) // dated empty too
@@ -171,7 +171,7 @@ func TestCollectCoverageSummary(t *testing.T) {
 	t.Run("newest-event probe failure is fatal", func(t *testing.T) {
 		db, mock := newDB(t)
 		mock.ExpectQuery(covPartsQ).WillReturnRows(covPartRows("p_2026080110"))
-		mock.ExpectQuery(covArchQ).WillReturnRows(sqlmock.NewRows([]string{"min", "max"}).AddRow(nil, nil))
+		mock.ExpectQuery(covArchQ).WillReturnRows(sqlmock.NewRows([]string{"min", "max", "sources"}).AddRow(nil, nil, 0))
 		mock.ExpectQuery(covPartsQ).WillReturnRows(covPartRows("p_2026080110"))
 		mock.ExpectQuery(covProbeQ).WillReturnError(errors.New("boom"))
 		if _, err := CollectCoverageSummary(context.Background(), db, "binlog_index", now); err == nil {

@@ -29,7 +29,7 @@ func TestBaselinesAPI_staleness(t *testing.T) {
 	mock.ExpectQuery("PARTITION_NAME FROM information_schema.PARTITIONS").
 		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME"}).AddRow(now.Add(-100 * time.Hour).Format("p_2006010215")))
 	mock.ExpectQuery(`MIN\(partition_name\)`).
-		WillReturnRows(sqlmock.NewRows([]string{"min", "max"}).AddRow(nil, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"min", "max", "sources"}).AddRow(nil, nil, 0))
 
 	srv := newBaselineServer(t, dir, true)
 	srv.cm.boot.db = db

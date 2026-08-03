@@ -45,7 +45,10 @@ func ContinuityStatus(stream *StreamStateInfo, streamErr error) string {
 // every server switch; CollectStatus stays the full report.
 type CoverageSummary struct {
 	// DeltaFrom is the delta-coverage floor (OldestDeltaFromDB — the #1213
-	// strict rule). Zero = unknown, never assumed.
+	// strict rule). Zero = unknown, never assumed. On a multi-source index
+	// this is the LIVE-partition floor: archives are per-source and cannot be
+	// attributed here (#1219), so the window shown is the one every source
+	// provably has, never a union that would overstate it.
 	DeltaFrom time.Time
 	// DeltaTo is the newest INDEXED event — never the wall clock: claiming
 	// restorability "up to now" while the stream is down would be unearned
@@ -60,9 +63,6 @@ type CoverageSummary struct {
 	// folded into this summary — they are a capture-plane verdict with their
 	// own surface (status Capture health, --fail-on-gap). The delta window
 	// here is about what the index CONTAINS.
-	//
-	// Multi-source caveat: like the staleness floor, the window is not
-	// scoped per bintrail_id (#1219).
 }
 
 // CollectCoverageSummary computes the summary against one index. The floor
@@ -75,7 +75,7 @@ func CollectCoverageSummary(ctx context.Context, db *sql.DB, dbName string, now 
 	if floor, err := OldestDeltaFromDB(ctx, db, dbName); err != nil {
 		slog.Warn("could not determine the delta-coverage floor; coverage window start is unknown", "db", dbName, "error", err)
 	} else {
-		sum.DeltaFrom = floor
+		sum.DeltaFrom = floor.Hour
 	}
 	latest, err := newestIndexedEvent(ctx, db, dbName)
 	if err != nil {

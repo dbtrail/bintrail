@@ -9,7 +9,71 @@ import (
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/notify"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/status"
 )
+
+// TestStalenessWatcher_unattributableFloorNeverResolves is the load-bearing
+// half of #1219: on a multi-source index a snapshot older than the live
+// window grades UNKNOWN, and an unknown verdict must never travel the
+// broken=false path — that call RESOLVES. Without the skip, adding a second
+// source to an index would silently clear a standing broken-baseline alert
+// while the restore window is just as broken as before.
+func TestStalenessWatcher_unattributableFloorNeverResolves(t *testing.T) {
+	reg := testRegistryWithEntries(t, console.ServerEntry{Name: "wp", DSN: "d1", BaselineDir: "/b"})
+	now := time.Now().UTC()
+	oldest := now.Add(-100 * time.Hour)
+	n, f := testNotifier()
+	files := []reconstruct.BaselineFile{{Schema: "shop", Table: "orders", SnapshotTime: oldest.Add(-time.Hour)}}
+	floor := status.DeltaFloor{Hour: oldest}
+	w := &stalenessWatcher{
+		n: n, registry: reg, unknownEdge: notify.NewEdge(0),
+		listBaselines: func(context.Context, string) ([]reconstruct.BaselineFile, error) { return files, nil },
+		oldestDelta:   func(context.Context, string) (status.DeltaFloor, error) { return floor, nil },
+	}
+	w.runCycle(context.Background())
+	if len(f.events) != 1 || f.events[0].Resolved {
+		t.Fatalf("setup: want the broken alert active, got %+v", f.events)
+	}
+
+	// A second source appears: the archive floor is no longer attributable.
+	floor.BelowIsUnknown = true
+	w.runCycle(context.Background())
+	if len(f.events) != 1 {
+		t.Fatalf("an unattributable floor must neither resolve nor re-fire: %+v", f.events)
+	}
+
+	// Attribution is restored and the baseline is still broken: the edge was
+	// never resolved, so the standing alert must not re-fire either.
+	floor.BelowIsUnknown = false
+	w.runCycle(context.Background())
+	if len(f.events) != 1 {
+		t.Fatalf("unchanged broken condition must not re-fire: %+v", f.events)
+	}
+}
+
+// TestStalenessWatcher_unattributableStillGradesInWindow: ambiguity only
+// disarms grading BELOW the live floor. Snapshots inside the live window need
+// no attribution (every source writes the same partitions), so a healthy
+// multi-source index still gets a real verdict instead of a permanent
+// cannot-evaluate.
+func TestStalenessWatcher_unattributableStillGradesInWindow(t *testing.T) {
+	reg := testRegistryWithEntries(t, console.ServerEntry{Name: "wp", DSN: "d1", BaselineDir: "/b"})
+	now := time.Now().UTC()
+	oldest := now.Add(-100 * time.Hour)
+	n, f := testNotifier()
+	files := []reconstruct.BaselineFile{{Schema: "shop", Table: "orders", SnapshotTime: now.Add(-time.Hour)}}
+	w := &stalenessWatcher{
+		n: n, registry: reg, unknownEdge: notify.NewEdge(0),
+		listBaselines: func(context.Context, string) ([]reconstruct.BaselineFile, error) { return files, nil },
+		oldestDelta: func(context.Context, string) (status.DeltaFloor, error) {
+			return status.DeltaFloor{Hour: oldest, BelowIsUnknown: true}, nil
+		},
+	}
+	w.runCycle(context.Background())
+	if len(f.events) != 0 {
+		t.Fatalf("a fresh baseline on a multi-source index must grade clean: %+v", f.events)
+	}
+}
 
 func TestWatchNotifier_BaselineStale(t *testing.T) {
 	n, f := testNotifier()
@@ -85,7 +149,7 @@ func TestStalenessWatcher_runCycle(t *testing.T) {
 		n: n, registry: reg,
 		unknownEdge:   notify.NewEdge(0),
 		listBaselines: func(context.Context, string) ([]reconstruct.BaselineFile, error) { return files, nil },
-		oldestDelta:   func(context.Context, string) (time.Time, error) { return oldest, nil },
+		oldestDelta:   func(context.Context, string) (status.DeltaFloor, error) { return status.DeltaFloor{Hour: oldest}, nil },
 	}
 
 	// Newest per table is fine: no event.
@@ -110,7 +174,9 @@ func TestStalenessWatcher_runCycle(t *testing.T) {
 
 	// Same broken set on the next cycle, floor advanced by rotation: silent.
 	oldestAdvanced := oldest.Add(time.Hour)
-	w.oldestDelta = func(context.Context, string) (time.Time, error) { return oldestAdvanced, nil }
+	w.oldestDelta = func(context.Context, string) (status.DeltaFloor, error) {
+		return status.DeltaFloor{Hour: oldestAdvanced}, nil
+	}
 	w.runCycle(context.Background())
 	if len(f.events) != 1 {
 		t.Fatalf("unchanged broken set with an advanced floor must not re-fire: %+v", f.events)
@@ -118,14 +184,18 @@ func TestStalenessWatcher_runCycle(t *testing.T) {
 
 	// Unknown floor: the target is skipped whole — no fire, and crucially NO
 	// resolve of the active alert.
-	w.oldestDelta = func(context.Context, string) (time.Time, error) { return time.Time{}, errors.New("index down") }
+	w.oldestDelta = func(context.Context, string) (status.DeltaFloor, error) {
+		return status.DeltaFloor{}, errors.New("index down")
+	}
 	w.runCycle(context.Background())
 	if len(f.events) != 1 {
 		t.Fatalf("unknown floor must neither fire nor resolve: %+v", f.events)
 	}
 
 	// Unreadable baseline source: same skip-whole rule.
-	w.oldestDelta = func(context.Context, string) (time.Time, error) { return oldestAdvanced, nil }
+	w.oldestDelta = func(context.Context, string) (status.DeltaFloor, error) {
+		return status.DeltaFloor{Hour: oldestAdvanced}, nil
+	}
 	w.listBaselines = func(context.Context, string) ([]reconstruct.BaselineFile, error) {
 		return nil, errors.New("bucket gone")
 	}
@@ -159,7 +229,7 @@ func TestStalenessWatcher_agingNeverFires(t *testing.T) {
 	w := &stalenessWatcher{
 		n: n, registry: reg, unknownEdge: notify.NewEdge(0),
 		listBaselines: func(context.Context, string) ([]reconstruct.BaselineFile, error) { return files, nil },
-		oldestDelta:   func(context.Context, string) (time.Time, error) { return oldest, nil },
+		oldestDelta:   func(context.Context, string) (status.DeltaFloor, error) { return status.DeltaFloor{Hour: oldest}, nil },
 	}
 	w.runCycle(context.Background())
 	if len(f.events) != 0 {
@@ -185,7 +255,7 @@ func TestStalenessWatcher_targetIsolation(t *testing.T) {
 			}
 			return []reconstruct.BaselineFile{{Schema: "shop", Table: "orders", SnapshotTime: oldest.Add(-time.Hour)}}, nil
 		},
-		oldestDelta: func(context.Context, string) (time.Time, error) { return oldest, nil },
+		oldestDelta: func(context.Context, string) (status.DeltaFloor, error) { return status.DeltaFloor{Hour: oldest}, nil },
 	}
 	w.runCycle(context.Background())
 	if len(f.events) != 1 || f.events[0].Server != "b" || f.events[0].Severity != "critical" {
@@ -213,7 +283,7 @@ func TestStalenessWatcher_sameDSNDifferentSources(t *testing.T) {
 			}
 			return []reconstruct.BaselineFile{{Schema: "shop", Table: "orders", SnapshotTime: ts}}, nil
 		},
-		oldestDelta: func(context.Context, string) (time.Time, error) { return oldest, nil },
+		oldestDelta: func(context.Context, string) (status.DeltaFloor, error) { return status.DeltaFloor{Hour: oldest}, nil },
 	}
 	w.runCycle(context.Background())
 	w.runCycle(context.Background())
@@ -234,7 +304,7 @@ func TestStalenessWatcher_emptyListingKeepsAlert(t *testing.T) {
 	w := &stalenessWatcher{
 		n: n, registry: reg, unknownEdge: notify.NewEdge(0),
 		listBaselines: func(context.Context, string) ([]reconstruct.BaselineFile, error) { return files, nil },
-		oldestDelta:   func(context.Context, string) (time.Time, error) { return oldest, nil },
+		oldestDelta:   func(context.Context, string) (status.DeltaFloor, error) { return status.DeltaFloor{Hour: oldest}, nil },
 	}
 	w.runCycle(context.Background())
 	if len(f.events) != 1 {

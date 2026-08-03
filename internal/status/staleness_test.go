@@ -57,9 +57,31 @@ func TestOldestLivePartitionHour(t *testing.T) {
 	}
 }
 
+func TestDeltaFloorGrade(t *testing.T) {
+	now := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	live := now.Add(-10 * time.Hour)
+	older := live.Add(-time.Hour)
+
+	// Attributable floor: below it is broken, the verdict callers act on.
+	if got := (DeltaFloor{Hour: live}).Grade(older, now); got != BaselineBroken {
+		t.Fatalf("attributable floor: got %s, want broken", got)
+	}
+	// Unattributable floor: the same snapshot may still be covered by its own
+	// source's archives, so it is unknown — reporting broken would cry wolf.
+	if got := (DeltaFloor{Hour: live, BelowIsUnknown: true}).Grade(older, now); got != BaselineUnknown {
+		t.Fatalf("unattributable floor: got %s, want unknown", got)
+	}
+	// Above the floor the ambiguity is irrelevant: the live partitions are
+	// shared by every source, so those verdicts need no attribution.
+	if got := (DeltaFloor{Hour: live, BelowIsUnknown: true}).Grade(now.Add(-time.Hour), now); got != BaselineOK {
+		t.Fatalf("in-window snapshot: got %s, want ok", got)
+	}
+}
+
 func TestOldestDeltaFromDB(t *testing.T) {
 	partsQ := regexp.QuoteMeta("SELECT PARTITION_NAME FROM information_schema.PARTITIONS")
-	archQ := regexp.QuoteMeta("SELECT MIN(partition_name), MAX(partition_name) FROM archive_state")
+	archQ := regexp.QuoteMeta("SELECT MIN(partition_name), MAX(partition_name), COUNT(DISTINCT bintrail_id) FROM archive_state")
+	srvQ := regexp.QuoteMeta("SELECT COUNT(*) FROM bintrail_servers")
 	partRows := func(names ...string) *sqlmock.Rows {
 		r := sqlmock.NewRows([]string{"PARTITION_NAME"})
 		for _, n := range names {
@@ -67,27 +89,40 @@ func TestOldestDeltaFromDB(t *testing.T) {
 		}
 		return r
 	}
+	// ExpectationsWereMet on every subtest pins the QUERY SET, not just the
+	// result: the single-source path must keep costing exactly two queries
+	// (plus the sources probe), and an extra round trip in the common case
+	// would fail here.
 	newDB := func(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 		t.Helper()
 		db, mock, err := sqlmock.New()
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { db.Close() })
+		t.Cleanup(func() {
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Errorf("unmet or unexpected queries: %v", err)
+			}
+			db.Close()
+		})
 		return db, mock
 	}
 
-	archRows := func(min, max any) *sqlmock.Rows {
-		return sqlmock.NewRows([]string{"min", "max"}).AddRow(min, max)
+	archRows := func(min, max any, sources int) *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"min", "max", "sources"}).AddRow(min, max, sources)
+	}
+	srvRows := func(n int) *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"n"}).AddRow(n)
 	}
 
 	t.Run("contiguous archive floor wins when earlier", func(t *testing.T) {
 		db, mock := newDB(t)
 		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110", "p_future"))
-		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080103", "p_2026080109"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080103", "p_2026080109", 1))
+		mock.ExpectQuery(srvQ).WillReturnRows(srvRows(1))
 		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
-		if err != nil || !got.Equal(time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)) {
-			t.Fatalf("got %v, %v", got, err)
+		if err != nil || !got.Hour.Equal(time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)) || got.BelowIsUnknown {
+			t.Fatalf("got %+v, %v", got, err)
 		}
 	})
 
@@ -98,20 +133,77 @@ func TestOldestDeltaFromDB(t *testing.T) {
 		// unearned "ok".
 		db, mock := newDB(t)
 		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
-		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080101", "p_2026080105"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080101", "p_2026080105", 1))
+		mock.ExpectQuery(srvQ).WillReturnRows(srvRows(1))
 		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
-		if err != nil || !got.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) {
-			t.Fatalf("got %v, %v — want the live floor, not the archive one", got, err)
+		if err != nil || !got.Hour.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) {
+			t.Fatalf("got %+v, %v — want the live floor, not the archive one", got, err)
 		}
 	})
 
 	t.Run("archive-only coverage counts when no live partitions exist", func(t *testing.T) {
 		db, mock := newDB(t)
 		mock.ExpectQuery(partsQ).WillReturnRows(partRows())
-		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080103", "p_2026080105"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080103", "p_2026080105", 1))
+		mock.ExpectQuery(srvQ).WillReturnRows(srvRows(1))
 		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
-		if err != nil || !got.Equal(time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)) {
-			t.Fatalf("got %v, %v", got, err)
+		if err != nil || !got.Hour.Equal(time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)) {
+			t.Fatalf("got %+v, %v", got, err)
+		}
+	})
+
+	t.Run("archives from several sources never extend the floor", func(t *testing.T) {
+		// #1219: archive_state rows are per-source. Source A archived back to
+		// 01:00; a baseline of a table that lives on source B must not inherit
+		// A's coverage. The live floor stands and everything below it is
+		// unknowable — not "ok" (missed alarm) and not "broken" (false alarm).
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080101", "p_2026080109", 2))
+		// No bintrail_servers probe: the archive rows already answered it.
+		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Hour.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) || !got.BelowIsUnknown {
+			t.Fatalf("got %+v — want the live floor with BelowIsUnknown", got)
+		}
+	})
+
+	t.Run("one archived source but several known ones is still unattributable", func(t *testing.T) {
+		// The half the archive rows cannot see: source B exists and simply has
+		// not archived yet, so a B baseline would inherit A's floor.
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080101", "p_2026080109", 1))
+		mock.ExpectQuery(srvQ).WillReturnRows(srvRows(2))
+		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Hour.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) || !got.BelowIsUnknown {
+			t.Fatalf("got %+v — want the live floor with BelowIsUnknown", got)
+		}
+	})
+
+	t.Run("missing bintrail_servers table is tolerated (legacy/file-mode index)", func(t *testing.T) {
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080103", "p_2026080109", 1))
+		mock.ExpectQuery(srvQ).WillReturnError(&mysql.MySQLError{Number: 1146, Message: "Table 'binlog_index.bintrail_servers' doesn't exist"})
+		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
+		if err != nil || !got.Hour.Equal(time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)) || got.BelowIsUnknown {
+			t.Fatalf("got %+v, %v — a legacy index keeps single-source semantics", got, err)
+		}
+	})
+
+	t.Run("any other bintrail_servers error propagates", func(t *testing.T) {
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080103", "p_2026080109", 1))
+		mock.ExpectQuery(srvQ).WillReturnError(&mysql.MySQLError{Number: 1045, Message: "access denied"})
+		if _, err := OldestDeltaFromDB(context.Background(), db, "binlog_index"); err == nil {
+			t.Fatal("an unreadable source registry must propagate: it decides whether the floor is attributable")
 		}
 	})
 
@@ -120,15 +212,15 @@ func TestOldestDeltaFromDB(t *testing.T) {
 		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
 		mock.ExpectQuery(archQ).WillReturnError(&mysql.MySQLError{Number: 1146, Message: "Table 'binlog_index.archive_state' doesn't exist"})
 		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
-		if err != nil || !got.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) {
-			t.Fatalf("got %v, %v", got, err)
+		if err != nil || !got.Hour.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) {
+			t.Fatalf("got %+v, %v", got, err)
 		}
 	})
 
 	t.Run("unparseable archive MAX propagates", func(t *testing.T) {
 		db, mock := newDB(t)
 		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
-		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080103", "weird"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080103", "weird", 1))
 		if _, err := OldestDeltaFromDB(context.Background(), db, "binlog_index"); err == nil {
 			t.Fatal("unparseable MAX must propagate — contiguity cannot be judged")
 		}
@@ -149,7 +241,7 @@ func TestOldestDeltaFromDB(t *testing.T) {
 	t.Run("unparseable archive MIN propagates", func(t *testing.T) {
 		db, mock := newDB(t)
 		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
-		mock.ExpectQuery(archQ).WillReturnRows(archRows("weird", "p_2026080105"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("weird", "p_2026080105", 1))
 		if _, err := OldestDeltaFromDB(context.Background(), db, "binlog_index"); err == nil {
 			t.Fatal("unparseable archive floor must propagate, not silently drop")
 		}
@@ -158,10 +250,10 @@ func TestOldestDeltaFromDB(t *testing.T) {
 	t.Run("empty index and empty archive is unknown, not an error", func(t *testing.T) {
 		db, mock := newDB(t)
 		mock.ExpectQuery(partsQ).WillReturnRows(partRows())
-		mock.ExpectQuery(archQ).WillReturnRows(archRows(nil, nil))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows(nil, nil, 0))
 		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
-		if err != nil || !got.IsZero() {
-			t.Fatalf("got %v, %v — want zero, nil", got, err)
+		if err != nil || !got.Hour.IsZero() || got.BelowIsUnknown {
+			t.Fatalf("got %+v, %v — want zero, nil", got, err)
 		}
 	})
 }
@@ -176,7 +268,7 @@ func TestWriteJSON_staleness(t *testing.T) {
 		{Database: "shop", Table: "orders", SnapshotTime: now.Add(-2 * time.Hour)},
 		{Database: "shop", Table: "legacy", SnapshotTime: oldest.Add(-time.Hour)},
 	}}
-	AnnotateBaselineStaleness(d.Baselines, oldest, now)
+	AnnotateBaselineStaleness(d.Baselines, DeltaFloor{Hour: oldest}, now)
 	var buf bytes.Buffer
 	if err := d.WriteJSON(&buf); err != nil {
 		t.Fatal(err)
@@ -211,7 +303,7 @@ func TestOverallBaselineStaleness_newestPerTable(t *testing.T) {
 		// …but a table whose NEWEST snapshot is broken must.
 		{Database: "shop", Table: "legacy", SnapshotTime: oldest.Add(-time.Hour)},
 	}
-	AnnotateBaselineStaleness(baselines, oldest, now)
+	AnnotateBaselineStaleness(baselines, DeltaFloor{Hour: oldest}, now)
 	if baselines[0].Staleness != BaselineBroken || baselines[1].Staleness != BaselineOK {
 		t.Fatalf("per-entry annotation wrong: %+v", baselines)
 	}
@@ -236,7 +328,7 @@ func TestWriteBaselines_stalenessColumnAndBanner(t *testing.T) {
 		{Database: "shop", Table: "orders", SnapshotTime: oldest.Add(-time.Hour)}, // superseded
 		{Database: "shop", Table: "legacy", SnapshotTime: oldest.Add(-time.Hour)},
 	}
-	AnnotateBaselineStaleness(baselines, oldest, now)
+	AnnotateBaselineStaleness(baselines, DeltaFloor{Hour: oldest}, now)
 	var buf bytes.Buffer
 	writeBaselines(&buf, baselines)
 	out := buf.String()
@@ -255,7 +347,7 @@ func TestWriteBaselines_stalenessColumnAndBanner(t *testing.T) {
 
 	// All fresh: no banner, quiet "ok" verdicts.
 	fresh := []BaselineInfo{{Database: "shop", Table: "orders", SnapshotTime: now.Add(-2 * time.Hour)}}
-	AnnotateBaselineStaleness(fresh, oldest, now)
+	AnnotateBaselineStaleness(fresh, DeltaFloor{Hour: oldest}, now)
 	buf.Reset()
 	writeBaselines(&buf, fresh)
 	if strings.Contains(buf.String(), "BASELINE STALE") {

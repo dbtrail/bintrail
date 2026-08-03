@@ -99,17 +99,17 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	// Staleness floor (#1193): best-effort but never silent and never a
 	// fabricated verdict — an unopened bundle connection or an unreadable
 	// index yields the explicit "unknown".
-	var oldestDelta time.Time
+	var floor status.DeltaFloor
 	serverID := r.Header.Get("X-Bintrail-Server")
 	if serverID == "" {
 		serverID = "default"
 	}
 	if b.db == nil {
 		slog.Warn("console: baseline staleness not evaluated — the server's index connection is not open", "server", serverID)
-	} else if od, err := status.OldestDeltaFromDB(r.Context(), b.db, b.dbName); err != nil {
+	} else if f, err := status.OldestDeltaFromDB(r.Context(), b.db, b.dbName); err != nil {
 		slog.Warn("console: could not load delta-coverage floor for baseline staleness", "server", serverID, "error", err)
 	} else {
-		oldestDelta = od
+		floor = f
 	}
 	var cur *baselineSnapshotDTO
 	var curTime time.Time
@@ -124,7 +124,7 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 				Time:     f.SnapshotTime.Format(consoleTSFormat),
 				AgeHours: now.Sub(f.SnapshotTime).Hours(),
 			}
-			dto.Staleness = string(status.BaselineStalenessFor(f.SnapshotTime, oldestDelta, now))
+			dto.Staleness = string(floor.Grade(f.SnapshotTime, now))
 			if resp.Kind == "dir" {
 				if meta, err := baseline.ReadParquetMetadata(f.Path); err == nil {
 					dto.BinlogFile = meta.BinlogFile
@@ -150,7 +150,7 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	for i, f := range files {
 		infos[i] = status.BaselineInfo{Database: f.Schema, Table: f.Table, SnapshotTime: f.SnapshotTime}
 	}
-	status.AnnotateBaselineStaleness(infos, oldestDelta, now)
+	status.AnnotateBaselineStaleness(infos, floor, now)
 	resp.Staleness = string(status.OverallBaselineStaleness(infos))
 	writeJSON(w, http.StatusOK, resp)
 }

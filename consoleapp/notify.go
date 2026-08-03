@@ -259,7 +259,7 @@ type stalenessWatcher struct {
 
 	// Injectable for tests — no ticker, no real DB, no real S3.
 	listBaselines func(ctx context.Context, source string) ([]reconstruct.BaselineFile, error)
-	oldestDelta   func(ctx context.Context, dsn string) (time.Time, error)
+	oldestDelta   func(ctx context.Context, dsn string) (status.DeltaFloor, error)
 }
 
 func startStalenessWatch(ctx context.Context, n *watchNotifier, registry *console.Registry, bootDSN, globalDir, globalS3 string) {
@@ -359,8 +359,8 @@ func (w *stalenessWatcher) runCycle(ctx context.Context) {
 			continue
 		}
 		w.unknownEdge.Resolve("staleness-empty:" + edgeID)
-		oldest, err := w.oldestDelta(ctx, t.dsn)
-		if err != nil || oldest.IsZero() {
+		floor, err := w.oldestDelta(ctx, t.dsn)
+		if err != nil || floor.Hour.IsZero() {
 			// Unknown floor is never a verdict — and must never RESOLVE an
 			// active broken alert either, so the target is skipped whole.
 			// Skipped, not silent: same rule as the unreadable source above.
@@ -383,21 +383,40 @@ func (w *stalenessWatcher) runCycle(ctx context.Context) {
 		// identity, and a map-iteration-ordered single pick would flip
 		// between cycles and re-fire through the repeat window.
 		var brokenTables []string
+		var ungradable bool
 		for k, ts := range newest {
-			if status.BaselineStalenessFor(ts, oldest, now) == status.BaselineBroken {
+			switch floor.Grade(ts, now) {
+			case status.BaselineBroken:
 				brokenTables = append(brokenTables, k)
+			case status.BaselineUnknown:
+				ungradable = ungradable || floor.BelowIsUnknown
 			}
 		}
+		if ungradable {
+			// #1219: on a multi-source index the archives cannot be attributed
+			// to the source that owns these baselines, so a snapshot older than
+			// the live window is unknowable. It must NOT fall through to the
+			// call below: with no broken table left, that call reports
+			// broken=false and RESOLVES an active alert — adding a second
+			// source to an index would silently clear a real broken-baseline
+			// alert. Skip the target whole, exactly like an unknown floor.
+			if w.unknownEdge.Fire("staleness-attribution:"+edgeID, "") {
+				slog.Warn("baseline staleness cannot be evaluated for snapshots older than the live index window — this index serves more than one source and archive coverage cannot be attributed to one of them; a broken restore window would go UNDETECTED for this server",
+					"server", t.name, "source", t.source, "live_floor", floor.Hour.UTC().Format(time.RFC3339))
+			}
+			continue
+		}
+		w.unknownEdge.Resolve("staleness-attribution:" + edgeID)
 		sort.Strings(brokenTables)
 		w.n.BaselineStale(t.name, edgeID, len(brokenTables) > 0,
-			strings.Join(brokenTables, ", "), oldest.UTC().Format(time.RFC3339))
+			strings.Join(brokenTables, ", "), floor.Hour.UTC().Format(time.RFC3339))
 	}
 }
 
-func oldestDeltaByDSN(ctx context.Context, dsn string) (time.Time, error) {
+func oldestDeltaByDSN(ctx context.Context, dsn string) (status.DeltaFloor, error) {
 	db, err := config.Connect(dsn)
 	if err != nil {
-		return time.Time{}, err
+		return status.DeltaFloor{}, err
 	}
 	defer db.Close()
 	return status.OldestDeltaFromDB(ctx, db, indexDBName(dsn))
