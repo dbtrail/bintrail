@@ -13,31 +13,56 @@ import (
 // coverageResponse is GET /api/coverage — the live RPO statement behind the
 // overview card (#1194): "any point between delta_from and delta_to is
 // restorable", plus how far behind capture is and whether the range has
-// holes. Metadata-only (timestamps and verdicts, no row data), so like
-// /api/status it carries no profile gate — unlike /api/baselines, nothing
-// here bypasses redaction.
+// holes. The DELTA half is metadata-only (timestamps and verdicts, no row
+// data) and carries no profile gate, like /api/status. The FULL-TABLE half
+// is derived from the baseline listing — the surface /api/baselines refuses
+// to a profiled session (#1075: baseline reads aren't redacted, and
+// broken_tables is a table-name inventory) — so it is gated by the SAME
+// sessionRestricted rule. Capture-health drops (#1034) are deliberately not
+// consulted — they have their own surface (status, --fail-on-gap).
 type coverageResponse struct {
 	// Delta window: any row/point in [delta_from, delta_to] is recoverable
 	// from indexed deltas. delta_from omitted = unknown floor (never
 	// assumed); delta_to omitted = empty index.
 	DeltaFrom string `json:"delta_from,omitempty"`
 	DeltaTo   string `json:"delta_to,omitempty"`
-	// LagSeconds = now − delta_to, present only when a capture stream exists.
-	// The window's upper edge is the last INDEXED event, never the wall
-	// clock — the lag is what says how close to "now" that edge is.
+	// LagSeconds = now − delta_to, present only when a capture stream exists
+	// AND at least one event is indexed. The window's upper edge is the last
+	// INDEXED event, never the wall clock — the lag is what says how close
+	// to "now" that edge is.
 	LagSeconds *int64 `json:"lag_seconds,omitempty"`
 	// Continuity: ok | gap_lost | unknown | unavailable | none — the exact
 	// status.ContinuityStatus rule, never recomputed here.
-	Continuity         string `json:"continuity"`
-	BaselineConfigured bool   `json:"baseline_configured"`
-	// FullTableFrom: from this instant onwards EVERY table with a baseline
-	// is fully reconstructable (the latest usable newest-per-table anchor).
-	// Omitted when no baseline is configured, the floor is unknown, or no
-	// table has a usable newest baseline.
+	Continuity string `json:"continuity"`
+	// BaselineConfigured mirrors /api/baselines' "configured" — a baseline
+	// SOURCE exists. It is NOT the reconstruct gate (/api/capabilities), the
+	// same configured-vs-reconstruct split baselines_api documents.
+	BaselineConfigured bool `json:"baseline_configured"`
+	// FullTableStatus discriminates the full-table half when a source is
+	// configured: "ok" = evaluated (fields below are meaningful, possibly
+	// empty because no usable baseline exists yet), "unknown" = could NOT be
+	// evaluated (unknown floor or a failed listing) — absent fields must
+	// never read as "nothing broken". Omitted when no source is configured
+	// or the session is profile-restricted.
+	FullTableStatus string `json:"full_table_status,omitempty"`
+	// FullTableFrom: from this instant onwards every table WITH A USABLE
+	// baseline is fully reconstructable (the latest usable newest-per-table
+	// anchor). Tables in broken_tables are excluded — they are not
+	// reconstructable at all; never-baselined tables are invisible here.
+	// Omitted when full_table_status != "ok" or no usable baseline exists.
 	FullTableFrom string `json:"full_table_from,omitempty"`
 	// BrokenTables: tables whose NEWEST baseline predates the delta floor —
 	// full-table restore through that hole is impossible (#1193's verdict).
 	BrokenTables []string `json:"broken_tables,omitempty"`
+}
+
+// serverID labels log lines with the request's selected server — a
+// multi-server console emitting unattributed warns is undebuggable.
+func serverID(r *http.Request) string {
+	if id := r.Header.Get(serverHeader); id != "" {
+		return id
+	}
+	return "default"
 }
 
 func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
@@ -49,7 +74,7 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 	if b.db == nil {
 		// An unopened bundle connection degrades to an explicit
 		// "unavailable" card, never a fabricated window.
-		slog.Warn("console: coverage not evaluated — the server's index connection is not open")
+		slog.Warn("console: coverage not evaluated — the server's index connection is not open", "server", serverID(r))
 		resp.Continuity = "unavailable"
 		writeJSON(w, http.StatusOK, resp)
 		return
@@ -70,39 +95,48 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 	}
 	// Full-table half: newest-per-table baseline anchors graded against the
 	// floor — #1193's verdict via the status package, no second
-	// implementation. Best-effort: a listing failure degrades to the delta
-	// half, loudly. Skipped whole on an unknown floor — grading anchors
-	// against an unknown floor can neither claim a window nor name a broken
-	// table.
-	if b.baselineSrc != "" && !sum.DeltaFrom.IsZero() {
+	// implementation. Gated exactly like /api/baselines (#1075): the listing
+	// this is derived from bypasses redaction, and broken_tables is a
+	// table-name inventory a deny-profile withholds elsewhere. A failed
+	// listing or an unknown floor is "unknown", never a silently-empty "ok"
+	// — a broken-table warning must not vanish because of an error.
+	switch {
+	case b.baselineSrc == "":
+	case sessionRestricted(r):
+		recordProfileGateDeny(r, "coverage")
+	case sum.DeltaFrom.IsZero():
+		resp.FullTableStatus = "unknown"
+	default:
 		files, err := reconstruct.ListBaselines(r.Context(), b.baselineSrc)
 		if err != nil {
-			slog.Warn("console: coverage card could not list baselines", "source", b.baselineSrc, "error", err)
-		} else {
-			newest := make(map[string]time.Time, len(files))
-			for _, f := range files {
-				k := f.Schema + "." + f.Table
-				if f.SnapshotTime.After(newest[k]) {
-					newest[k] = f.SnapshotTime
-				}
+			slog.Warn("console: coverage card could not list baselines", "server", serverID(r), "source", b.baselineSrc, "error", err)
+			resp.FullTableStatus = "unknown"
+			break
+		}
+		resp.FullTableStatus = "ok"
+		newest := make(map[string]time.Time, len(files))
+		for _, f := range files {
+			k := f.Schema + "." + f.Table
+			if f.SnapshotTime.After(newest[k]) {
+				newest[k] = f.SnapshotTime
 			}
-			var from time.Time
-			for k, ts := range newest {
-				if status.BaselineStalenessFor(ts, sum.DeltaFrom, now) == status.BaselineBroken {
-					resp.BrokenTables = append(resp.BrokenTables, k)
-					continue
-				}
-				// The window covering ALL tables starts at the LATEST usable
-				// anchor: table i is reconstructable for points >= its own
-				// anchor, so "every table" holds only past the newest one.
-				if ts.After(from) {
-					from = ts
-				}
+		}
+		var from time.Time
+		for k, ts := range newest {
+			if status.BaselineStalenessFor(ts, sum.DeltaFrom, now) == status.BaselineBroken {
+				resp.BrokenTables = append(resp.BrokenTables, k)
+				continue
 			}
-			sort.Strings(resp.BrokenTables)
-			if !from.IsZero() {
-				resp.FullTableFrom = from.Format(consoleTSFormat)
+			// The window covering ALL usable tables starts at the LATEST
+			// usable anchor: table i is reconstructable for points >= its
+			// own anchor, so "every table" holds only past the newest one.
+			if ts.After(from) {
+				from = ts
 			}
+		}
+		sort.Strings(resp.BrokenTables)
+		if !from.IsZero() {
+			resp.FullTableFrom = from.Format(consoleTSFormat)
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

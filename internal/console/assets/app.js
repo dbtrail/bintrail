@@ -657,11 +657,18 @@ function covCard(c) {
   const cont = c.continuity || "unknown";
   const bad = cont === "gap_lost" || cont === "unavailable";
   const warn = cont === "unknown";
-  if (!c.delta_to) {
+  if (bad && !c.delta_to) {
+    // Unreachable/broken backend: say nothing about the window — "no events
+    // yet" would be a positive factual claim about an index we couldn't read.
+  } else if (!c.delta_to) {
     card.append(el("p", { class: "cov-line warn", text: "No indexed events yet — nothing to restore from." }));
+  } else if (!c.delta_from) {
+    // Unknown floor: don't assert a bounded window whose start we don't know.
+    card.append(el("p", { class: "cov-line" },
+      "Restorable up to ", el("b", { text: c.delta_to }), "; the window start could not be determined."));
   } else {
     card.append(el("p", { class: "cov-line" },
-      "Any point between ", el("b", { text: c.delta_from || "(unknown)" }),
+      "Any point between ", el("b", { text: c.delta_from }),
       " and ", el("b", { text: c.delta_to }), " is restorable."));
   }
   const chips = el("div", { class: "cov-chips" });
@@ -680,8 +687,13 @@ function covCard(c) {
     card.append(el("p", { class: "cov-line warn", text: "Continuity is not evaluable on this index — the window may have undetected holes." }));
   }
   if (c.baseline_configured) {
+    if (c.full_table_status === "unknown") {
+      // An error must never render like "nothing broken" — the broken-table
+      // warning would silently vanish behind a failed listing.
+      card.append(el("p", { class: "cov-line warn", text: "Full-table coverage could not be evaluated — check the daemon log." }));
+    }
     if (c.full_table_from) {
-      card.append(el("p", { class: "cov-line", text: "Full-table restore: any point from " + c.full_table_from + " onwards." }));
+      card.append(el("p", { class: "cov-line", text: "Full-table restore for tables with a baseline: any point from " + c.full_table_from + " onwards." }));
     }
     if (c.broken_tables && c.broken_tables.length) {
       card.append(el("p", { class: "cov-line bad", text: "Not fully restorable (newest baseline predates coverage): " + c.broken_tables.join(", ") + " — take a fresh baseline." }));
@@ -697,7 +709,10 @@ async function renderOverview() {
     const [status, eventsData, coverage] = await Promise.all([
       api("/api/status").catch(() => null),
       api("/api/events?limit=200&order=DESC"),
-      api("/api/coverage").catch(() => null), // best-effort like status
+      // A failed fetch must render the same red "unavailable" card the
+      // nil-db path gets — a swallowed null would make a broken endpoint
+      // indistinguishable from a console without the feature.
+      api("/api/coverage").catch((err) => { console.error("coverage fetch failed", err); return { continuity: "unavailable" }; }),
     ]);
     if (gen !== serverGen) return;
     buildOverview(status, eventsData, coverage); // render INSIDE the try: a throw here shows an error, never a stuck "Loading…"

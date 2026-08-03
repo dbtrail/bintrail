@@ -94,7 +94,9 @@ and searching events:
    wall clock; the capture-lag chip says how close to now that edge is), the
    continuity verdict, and — with a baseline source configured — the
    full-table restore window plus any table whose newest baseline predates
-   coverage. It degrades loudly on `gap_lost`/`unknown`/an empty index.
+   coverage. It degrades loudly on `gap_lost`/`unavailable`/`unknown`/an
+   empty index, and full-table coverage that could not be evaluated says so
+   instead of rendering as "nothing broken".
    Below it: headline counts (changes indexed, deletes, tables touched, most
    recent change), a **Recent changes** list (each row opens Events, with an
    inline **Undo**), and an **Activity by table** breakdown. The starting
@@ -870,7 +872,7 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `POST /api/auth/logout` | Revoke the presented session (static token → 204 no-op). |
 | `POST /api/auth/password` | Set (first time; requires static-token auth) or rotate (`current_password` verified) the console password. Revokes all sessions and returns a fresh one. |
 | `GET /api/status` | Index status (same payload as `bintrail status --format json`). |
-| `GET /api/coverage` | Live RPO summary: restorable delta window `[delta_from, delta_to]`, `lag_seconds`, `continuity`, full-table window and `broken_tables` when a baseline source is configured. |
+| `GET /api/coverage` | Live RPO summary: restorable delta window `[delta_from, delta_to]`, `lag_seconds`, `continuity`; with a baseline source, `full_table_status` (`ok`/`unknown`), `full_table_from` and `broken_tables` (profile-restricted sessions get the delta half only). |
 | `GET /api/schemas` | Schemas known to the index: those observed in `binlog_events` **plus** those in the latest schema snapshot, so a schema whose partitions have all been rotated out to Parquet/S3 is still listed (the archives still answer `/api/events` and `/api/recover`). `schemas` is that full union; `snapshot_only` (when present) is the subset with no live events observed — the UI labels these "snapshot only" since queries against them may return nothing; `snapshot_unavailable: true` means the snapshot half was skipped because the schema resolver failed to load (check the server log), so archive-only schemas may be missing from the list. The snapshot half is skipped under `--no-archive` or an active `--profile`, where archived data is unreachable anyway. Note this answers *which schemas this index knows of*, not *which have data in a given window* — for that, see `bintrail status`'s continuity verdict. `?schema=<name>` → that schema's tables. |
 | `GET /api/events` | Event browser. Query params: `schema, table, pk, event_type, gtid, since, until, changed_column, order, limit`. |
 | `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`; an `order` field is accepted but ignored — recover always processes oldest-first). Returns `{sql, statement_count, row_count, warnings}`. When the target is a foreign-key **parent** whose `DELETE` cascaded below the binlog (MySQL/MariaDB index only), cascade victims are **auto-detected** and folded into the same script; the response then also carries `{cascade_detected, victim_count, set_null_count}` (see [Recover and cascade](#cascade-recovery)). |
