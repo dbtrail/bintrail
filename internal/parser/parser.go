@@ -55,7 +55,17 @@ type Parser struct {
 	filters       Filters
 	logger        *slog.Logger
 	schemaVersion atomic.Uint32 // actual snapshot_id from schema_snapshots; updated by SwapResolver
+	skips         *SkipCounters // optional (#1199): file-mode run tally, see SetSkipCounters
 }
+
+// SetSkipCounters wires an optional skip tally into the file-index path
+// (#1199). Unlike the stream (where the counters persist to
+// stream_state.capture_skips), file-mode counters are run-scoped: the caller
+// summarizes them at end of run. They exist because a VALIDATION-EXCLUDED
+// table's skips no longer fail the file via the #778 gap tracker, and per-event
+// WARNs alone scroll away — without a tally the run would end with no
+// aggregate signal. Nil (the default) keeps every RecordSkip a no-op.
+func (p *Parser) SetSkipCounters(s *SkipCounters) { p.skips = s }
 
 // New creates a Parser that reads from binlogDir, resolves column names via
 // resolver, and applies the given filters.
@@ -259,7 +269,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.RowsEvent:
-			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, p.schemaVersion.Load(), events, &gaps, nil)
+			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, p.schemaVersion.Load(), events, &gaps, p.skips)
 			// The LAST rows event of a statement carries STMT_END_F — the
 			// actual statement boundary. Clearing here keeps one statement's
 			// text alive across its chained/split rows events, while a later
@@ -424,12 +434,14 @@ func isSnapshotExcludedSchema(schema string) bool {
 // recorded so ParseFile can fail the whole file rather than complete it with an
 // undetected gap (#778). The stream path passes nil.
 //
-// skips is the inverse split (#1034): non-nil only on the STREAM path, whose
-// warn-and-continue skips would otherwise be invisible to `status` — every
+// skips (#1034): on the STREAM path the counters persist to
+// stream_state.capture_skips so `status` can render the discards — every
 // warn-and-skip return below records a per-reason counter, and every event
 // that clears the guards records a capture (breaking the consecutive-skip run
-// that escalates to one ERROR). The file path passes nil: its stale-snapshot
-// skips already fail the whole file via gapTracker.
+// that escalates to one ERROR). The FILE path passes the Parser's optional
+// run-scoped counters (#1199, see SetSkipCounters): stale-snapshot skips still
+// fail the whole file via gapTracker, but validation-excluded tables are
+// carved out of that failure and the tally is their aggregate signal.
 func handleRows(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -481,7 +493,10 @@ func handleRows(
 		// like the system schemas: it is absent from the snapshot on purpose
 		// and re-snapshotting excludes it again, so failing the file would pin
 		// it behind a remediation that cannot converge (#1199) — its skips
-		// stay visible via the per-event WARN above and the skip ledger below.
+		// stay visible via the per-event WARN above and the skip tally below
+		// (persisted on the stream; run-scoped + end-of-run summary in file
+		// mode, which has no capture ledger by design — an empty stream_state
+		// is file mode's "no capture ran" marker).
 		_, excludedByValidation := resolver.ExclusionReason(schema, table)
 		if gapTracker != nil && !excludedByValidation && !isSnapshotExcludedSchema(schema) && !eventPredatesSnapshot(binlogEv, resolver) {
 			if gapTracker.record(fmt.Sprintf("%s.%s not in snapshot %d at %s:%d", schema, table, schemaVersion, filename, binlogEv.Header.LogPos)) {

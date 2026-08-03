@@ -95,22 +95,31 @@ func TestHandleRows_validationExcludedTableFileMode(t *testing.T) {
 		}
 	})
 
-	t.Run("excluded table still counts in the stream skip ledger", func(t *testing.T) {
-		// Visibility is not negotiable (#1034): the diagnosis changes, the
-		// skip ledger entry stays.
+	t.Run("excluded table still counts in the skip tally under the file-mode wiring", func(t *testing.T) {
+		// Visibility is not negotiable (#1034/#1199): the diagnosis changes
+		// and the file no longer fails, but the skip stays tallied. This
+		// drives the REAL file-mode combination — gapTracker AND skips both
+		// non-nil (the Parser.SetSkipCounters wiring) — so a regression that
+		// silences either half (re-nils the counters, or re-fails the file)
+		// goes red here. The stream wiring (nil tracker, non-nil skips) hits
+		// the same RecordSkip site.
 		ev := gapRowsEvent("shop", "scratch", 2, afterTS)
 		rowsEv := ev.Event.(*replication.RowsEvent)
 		var logBuf bytes.Buffer
 		skips := NewSkipCounters(newTestLogger(&logBuf))
+		tracker := &schemaGapTracker{}
 		out := make(chan Event, 4)
 		err := handleRows(context.Background(), newTestLogger(&logBuf), excludedScratchResolver(snapT),
-			&Filters{}, ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, out, nil, skips)
+			&Filters{}, ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, out, tracker, skips)
 		close(out)
 		if err != nil {
 			t.Fatalf("handleRows: %v", err)
 		}
 		if got := skips.Total(); got != 1 {
-			t.Fatalf("excluded-table skip must stay visible in the skip ledger, Total()=%d, want 1", got)
+			t.Fatalf("excluded-table skip must stay visible in the run tally, Total()=%d, want 1", got)
+		}
+		if tracker.count != 0 {
+			t.Fatalf("excluded-table skip must not fail the file, gap count=%d", tracker.count)
 		}
 	})
 }

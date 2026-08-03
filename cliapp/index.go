@@ -189,6 +189,12 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	// ── 6. Index each file ────────────────────────────────────────────────────────────
 	p := parser.New(idxBinlogDir, resolver, filters, nil)
+	// Run-scoped skip tally (#1199): validation-excluded tables no longer fail
+	// the file, so their skipped events need an aggregate end-of-run signal —
+	// file mode has no capture ledger to persist to (empty stream_state IS the
+	// no-capture marker), so the tally is summarized below instead.
+	runSkips := parser.NewSkipCounters(nil)
+	p.SetSkipCounters(runSkips)
 	idx := indexer.New(indexDB, idxBatchSize)
 
 	// DDL handler: auto-snapshot when --source-dsn is available; warn-only otherwise.
@@ -259,6 +265,13 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		"files_processed", len(files),
 		"events_indexed", totalEvents,
 		"failed_files", failedFiles)
+	if total := runSkips.Total(); total > 0 {
+		snap, _ := runSkips.Snapshot()
+		slog.Warn("events were read from the binlogs but NOT indexed this run — a restore window over them is incomplete; "+
+			"see the per-event WARNs above for each table (validation-excluded tables need a PK + InnoDB and a re-snapshot, or exclude them via --schemas/--tables)",
+			"skipped_total", total,
+			"skipped_by_reason", snap)
+	}
 
 	if idxFormat == "json" {
 		if err := cliutil.OutputJSON(struct {
