@@ -96,6 +96,7 @@ func objectLockVerdict(bucket string, st objectLockState, retain time.Duration) 
 			Status: StatusSkip,
 			Detail: fmt.Sprintf("could not read the Object Lock configuration of bucket %q: %v", bucket, st.queryErr),
 			Remediation: "The check needs the s3:GetBucketObjectLockConfiguration permission on the bucket.\n" +
+				"A PermanentRedirect means the bucket lives in a different region — pass --archive-s3-region.\n" +
 				"If the endpoint was unreachable, retry once before investigating further.",
 		}
 	}
