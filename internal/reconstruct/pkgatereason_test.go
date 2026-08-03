@@ -36,11 +36,12 @@ func TestPKTypeGateReason_discriminatesPGShape(t *testing.T) {
 	}
 }
 
-// TestFullTablePKTypeRefusal_discriminatesPGShape drives the discrimination
-// through ReconstructTable's real gate error: a PG-shaped snapshot that
-// reached the full-table MySQL path (source flavor did not resolve
-// "postgres") gets the wrong-path verdict; a genuinely unsupported MySQL type
-// keeps the pre-#1198 supported-set refusal verbatim.
+// TestFullTablePKTypeRefusal_discriminatesPGShape pins fullTablePKTypeRefusal,
+// the helper ReconstructTable's PK-type gate (fulltable.go) delegates to — the
+// gate itself needs a DB + baseline, so this test covers the message contract,
+// not the delegation: a PG-shaped snapshot that reached the full-table MySQL
+// path gets the wrong-path verdict; a genuinely unsupported MySQL type keeps
+// the pre-#1198 supported-set refusal verbatim.
 func TestFullTablePKTypeRefusal_discriminatesPGShape(t *testing.T) {
 	pg := metadata.ColumnMeta{Name: "id", IsPK: true, DataType: ""}
 	err := fullTablePKTypeRefusal("app", "orders", pg)

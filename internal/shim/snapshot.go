@@ -142,20 +142,16 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 			// snapshot writers always store a non-empty DATA_TYPE token, only
 			// WritePGSnapshot writes ""). Blaming the PK type would send the
 			// operator chasing a column problem nothing they do to the table
-			// can fix. Discriminate: a resolved postgres flavor means the real
-			// limitation is #597 (no PG full-table _snapshot); an unresolved
-			// flavor means the MySQL path was taken for a PG-shaped index and
-			// the shared wrong-path verdict applies.
+			// can fix. No flavor probe: the shape alone proves a PG-sourced
+			// table, and full-table _snapshot for PG is the #597 limitation
+			// either way — resolving the flavor would only change which
+			// refusal fires, so the shared "check the index database" remedy
+			// of the wrong-path verdict is not actionable here.
 			if strings.TrimSpace(c.DataType) == "" {
-				if query.SourceFlavor(h.indexDB) == "postgres" {
-					return nil, mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
-						"resolve %s: full-table _snapshot is not yet supported for PostgreSQL sources (#597) — "+
-							"use a single-row _snapshot lookup or _flashback for a binlog-only view",
-						q.Type))
-				}
 				return nil, mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
-					"resolve %s: %s — use _flashback for a binlog-only view",
-					q.Type, reconstruct.PKTypeGateReason(c, "full-table _snapshot", "materialize")))
+					"resolve %s: %s.%s is PostgreSQL-sourced (PG snapshot shape); full-table _snapshot is not yet supported for PostgreSQL sources (#597) — "+
+						"use a single-row _snapshot lookup or _flashback for a binlog-only view",
+					q.Type, q.Schema, q.Table))
 			}
 			// Baseline configured but this PK type can't be canonicalized for the
 			// merge — same fail-loud reasoning as the unresolved-PK branch (#822):
