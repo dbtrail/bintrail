@@ -5,8 +5,10 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -212,6 +214,31 @@ func TestIntegrationAuditContract_CLI(t *testing.T) {
 				}
 			},
 		},
+		{
+			// drill materializes historical row state into an external scratch
+			// server — the newest data-serving mode (#1195), emitted per table.
+			name:   "drill",
+			action: "drill.run",
+			table:  "orders",
+			call: func(t *testing.T) {
+				srcSchema := fmt.Sprintf("drillsrc_%d", time.Now().UnixNano())
+				dsn, baseDir, at := drillContractFixture(t, srcSchema)
+				resetDrillGlobals(t)
+				drlIndexDSN, drlBaselineDir = dsn, baseDir
+				drlTables = srcSchema + ".orders"
+				// Inside the fixture's partition coverage — the default (now)
+				// would trip the strict gap check on hours that never existed.
+				drlAt = at.Format("2006-01-02 15:04:05")
+				// The scratch is the SAME test server: srcSchema does not exist
+				// there, so the emptiness guard passes; drill creates and loads
+				// it, and the cleanup below drops it.
+				drlTargetDSN = testutil.BaseDSN() + "/"
+				drlFormat = "json"
+				if err := runDrill(newQueryTestCmd(), nil); err != nil {
+					t.Fatalf("runDrill: %v", err)
+				}
+			},
+		},
 	}
 
 	var observed []audittest.Pair
@@ -246,4 +273,86 @@ func TestIntegrationAuditContract_CLI(t *testing.T) {
 	}
 
 	audittest.CheckCoverage(t, audittest.OwnerCLI, observed)
+}
+
+// resetDrillGlobals saves and clears the drill command's flag globals.
+func resetDrillGlobals(t *testing.T) {
+	t.Helper()
+	sIdx, sTgt, sTables, sAt := drlIndexDSN, drlTargetDSN, drlTables, drlAt
+	sDir, sS3, sOut, sFmt := drlBaselineDir, drlBaselineS3, drlOutput, drlFormat
+	t.Cleanup(func() {
+		drlIndexDSN, drlTargetDSN, drlTables, drlAt = sIdx, sTgt, sTables, sAt
+		drlBaselineDir, drlBaselineS3, drlOutput, drlFormat = sDir, sS3, sOut, sFmt
+	})
+	drlIndexDSN, drlTargetDSN, drlTables, drlAt = "", "", "", ""
+	drlBaselineDir, drlBaselineS3, drlOutput, drlFormat = "", "", "", "text"
+}
+
+// drillContractFixture seeds a full-table-reconstructable index for a
+// SYNTHETIC source schema that does not exist as a database on the shared
+// test server — so the same server can serve as drill's scratch target. It
+// registers a cleanup dropping the database drill creates there.
+func drillContractFixture(t *testing.T, srcSchema string) (dsn, baselineDir string, at time.Time) {
+	t.Helper()
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	t.Cleanup(func() {
+		testutil.MustExec(t, db, "DROP DATABASE IF EXISTS `"+srcSchema+"`")
+	})
+
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), ?, 'orders', 'id', 1, 'PRI', 'int', 'NO', 0)`, srcSchema)
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), ?, 'orders', 'status', 2, '', 'varchar', 'NO', 0)`, srcSchema)
+
+	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n"
+	baselineDir = t.TempDir()
+	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
+	h2 := h1.Add(time.Hour)
+	snapshotTSDir := strings.ReplaceAll(h1.Format(time.RFC3339), ":", "-")
+	parquetDir := filepath.Join(baselineDir, snapshotTSDir, srcSchema)
+	if err := os.MkdirAll(parquetDir, 0o755); err != nil {
+		t.Fatalf("mkdir baseline: %v", err)
+	}
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	bw, err := baseline.NewWriter(filepath.Join(parquetDir, "orders.parquet"), cols, baseline.WriterConfig{
+		Compression:  "zstd",
+		RowGroupSize: 100,
+		Metadata:     map[string]string{baseline.MetaKeyCreateTableSQL: createSQL},
+	})
+	if err != nil {
+		t.Fatalf("baseline.NewWriter: %v", err)
+	}
+	for _, row := range [][]string{{"1", "start-1"}, {"2", "start-2"}, {"3", "start-3"}} {
+		if err := bw.WriteRow(row, []bool{false, false}); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+	}
+	if err := bw.Close(); err != nil {
+		t.Fatalf("writer close: %v", err)
+	}
+
+	// Deltas: update id=2, delete id=3, insert id=4 → final rows {1,2,4}.
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+	ts1 := h1.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	ts2 := h2.Add(30 * time.Minute).Format("2006-01-02 15:04:05")
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, ts1, nil,
+		srcSchema, "orders", 2, "2", nil,
+		[]byte(`{"id":2,"status":"start-2"}`), []byte(`{"id":2,"status":"paid"}`))
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, ts1, nil,
+		srcSchema, "orders", 3, "3", nil,
+		[]byte(`{"id":3,"status":"start-3"}`), nil)
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400, ts2, nil,
+		srcSchema, "orders", 1, "4", nil,
+		nil, []byte(`{"id":4,"status":"new-4"}`))
+
+	return testutil.IntegrationDSN(dbName), baselineDir, h2.Add(45 * time.Minute)
 }

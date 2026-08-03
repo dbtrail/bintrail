@@ -51,6 +51,10 @@ volumes:
   bintrail-dump:          # transient mydumper output for the `baseline`
                           # profile (its snapshot/ dir is recreated from
                           # scratch every run — never store anything here).
+  drill-scratch-data:     # THROWAWAY datadir for the `drill` profile's scratch
+                          # MySQL. Never holds anything worth keeping — wipe it
+                          # between drills with:
+                          #   docker compose --profile drill down -v
 
 services:
 
@@ -581,3 +585,21 @@ services:
     depends_on:
       baseline-dump:
         condition: service_completed_successfully
+
+  # ── `drill` profile: scratch MySQL for `bintrail drill` (#1195) ──────────
+  # An opt-in THROWAWAY server the restore rehearsal loads into. Same pinned
+  # MySQL 8.4 as the bundled index (the SHIP carve-out); the bintrail binary
+  # never launches or supervises it — it only loads into the DSN:
+  #   docker compose --profile drill up -d drill-mysql
+  #   bintrail drill --target-dsn "root:${DRILL_MYSQL_PASSWORD:-drill}@tcp(127.0.0.1:13307)/" ...
+  #   docker compose --profile drill down -v   # wipe the scratch afterwards
+  drill-mysql:
+    profiles: ["drill"]
+    image: mysql:8.4.9
+    environment:
+      # Scratch-only credential — loopback-mapped below, holds throwaway data.
+      MYSQL_ROOT_PASSWORD: ${DRILL_MYSQL_PASSWORD:-drill}
+    ports:
+      - "127.0.0.1:13307:3306"
+    volumes:
+      - drill-scratch-data:/var/lib/mysql

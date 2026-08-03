@@ -113,6 +113,11 @@ var Required = []Requirement{
 		Why:   "the only verify output that prints row-level data (the differing rows of a mismatch)",
 	},
 	{
+		Pair:  Pair{Surface: "cli", Action: "drill.run"},
+		Owner: OwnerCLI,
+		Why:   "materializing historical row state into an operator-provided scratch server (a rehearsed restore)",
+	},
+	{
 		Pair:  Pair{Surface: "mcp", Action: "query.run"},
 		Owner: OwnerMCP,
 		Why:   "an LLM client reading indexed row images",

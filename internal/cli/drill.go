@@ -1,0 +1,395 @@
+package cli
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/dbtrail/dbtrail/ext"
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
+)
+
+var drillCmd = &cobra.Command{
+	Use:   "drill",
+	Short: "Rehearse a real restore into a scratch MySQL and check it (a fire drill)",
+	Long: `Performs an actual restore end to end and reports whether it worked:
+
+  1. Reconstructs the selected tables at --at (default now) into a
+     mydumper-format dump (baseline + indexed deltas).
+  2. Loads the dump into the SCRATCH MySQL given by --target-dsn. The load
+     is refused unless the target schemas are absent from the target server
+     — pointing drill at a server that already holds those schemas is
+     assumed to be a mistake.
+  3. Checks each loaded table's row count against the exact number of rows
+     the dump writer emitted, and reports per-table timings — a measured
+     restore duration is an RTO data point.
+
+Exit is non-zero if any table fails. The intermediate dump lives in a temp
+directory, removed on success and KEPT on failure for inspection (--output
+pins it somewhere and always keeps it).
+
+What drill proves: the restore pipeline — the dump is loadable and complete,
+and how long it takes. Value-level fidelity of reconstructed content against
+the source is verify's job ('bintrail verify'), not re-proven here.
+
+The binary never launches or supervises a MySQL server: the scratch comes
+from you (any throwaway instance), e.g. the opt-in compose profile:
+  docker compose --profile drill up -d drill-mysql
+
+Example:
+  bintrail drill --index-dsn "root:pw@tcp(127.0.0.1:3306)/bintrail_index" \
+    --baseline-dir /var/lib/bintrail/baselines \
+    --tables shop.orders,shop.users \
+    --target-dsn "root:drill@tcp(127.0.0.1:13307)/"`,
+	RunE: runDrill,
+}
+
+var (
+	drlIndexDSN    string
+	drlTargetDSN   string
+	drlTables      string
+	drlAt          string
+	drlBaselineDir string
+	drlBaselineS3  string
+	drlOutput      string
+	drlFormat      string
+)
+
+func init() {
+	f := drillCmd.Flags()
+	f.StringVar(&drlIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
+	f.StringVar(&drlTargetDSN, "target-dsn", "", "DSN of the SCRATCH MySQL to load the rehearsal into (required; refused unless the target schemas are absent there)")
+	f.StringVar(&drlTables, "tables", "", "Comma-separated schema.table list to rehearse (required)")
+	f.StringVar(&drlAt, "at", "", "Point in time to restore to (default now)")
+	f.StringVar(&drlBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots")
+	f.StringVar(&drlBaselineS3, "baseline-s3", "", "S3 URL of baseline Parquet snapshots (s3://bucket/prefix)")
+	f.StringVar(&drlOutput, "output", "", "Write the intermediate dump here and keep it (default: temp dir — removed on success, kept on failure)")
+	f.StringVar(&drlFormat, "format", "text", "Output format: text or json")
+	_ = drillCmd.MarkFlagRequired("index-dsn")
+	_ = drillCmd.MarkFlagRequired("target-dsn")
+	_ = drillCmd.MarkFlagRequired("tables")
+	AddDuckDBTuningFlags(drillCmd)
+	BindCommandEnv(drillCmd)
+}
+
+// drillTableResult is one table's rehearsal outcome. ReconstructSeconds and
+// LoadSeconds are separate on purpose: the first is bounded by index/archive
+// read speed, the second by the scratch server — an operator sizing a real
+// recovery needs both numbers.
+type drillTableResult struct {
+	Schema             string  `json:"schema"`
+	Table              string  `json:"table"`
+	Status             string  `json:"status"` // "pass" | "fail"
+	RowsWritten        int64   `json:"rows_written"`
+	RowsLoaded         int64   `json:"rows_loaded"`
+	ReconstructSeconds float64 `json:"reconstruct_seconds"`
+	LoadSeconds        float64 `json:"load_seconds"`
+	Error              string  `json:"error,omitempty"`
+}
+
+type drillReport struct {
+	At time.Time `json:"at"`
+	// DumpDir is present when the intermediate dump was kept (always under
+	// --output; on failure otherwise).
+	DumpDir string             `json:"dump_dir,omitempty"`
+	Tables  []drillTableResult `json:"tables"`
+}
+
+// ExitError is the single exit decision for both output formats — add a
+// verdict path here, not in a renderer (the Report.ExitError discipline).
+func (r *drillReport) ExitError() error {
+	failed := 0
+	for _, t := range r.Tables {
+		if t.Status != "pass" {
+			failed++
+		}
+	}
+	if failed == 0 {
+		return nil
+	}
+	msg := fmt.Sprintf("drill: %d of %d table(s) FAILED the restore rehearsal", failed, len(r.Tables))
+	if r.DumpDir != "" {
+		msg += "; dump kept at " + r.DumpDir
+	}
+	return fmt.Errorf("%s", msg)
+}
+
+// parseDrillTables validates and dedupes the --tables list, returning the
+// entries and the distinct schemas (both order-preserving). Identifiers are
+// rejected if they carry a backtick — they are interpolated into backtick-
+// quoted SQL against the scratch server.
+func parseDrillTables(list string) (tables []string, schemas []string, err error) {
+	seenT := map[string]bool{}
+	seenS := map[string]bool{}
+	for _, entry := range strings.Split(list, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.SplitN(entry, ".", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[1], ".") {
+			return nil, nil, fmt.Errorf("--tables entry %q is not schema.table", entry)
+		}
+		if strings.ContainsAny(entry, "`\"'") {
+			return nil, nil, fmt.Errorf("--tables entry %q carries a quote character", entry)
+		}
+		if seenT[entry] {
+			continue
+		}
+		seenT[entry] = true
+		tables = append(tables, entry)
+		if !seenS[parts[0]] {
+			seenS[parts[0]] = true
+			schemas = append(schemas, parts[0])
+		}
+	}
+	if len(tables) == 0 {
+		return nil, nil, fmt.Errorf("--tables is empty")
+	}
+	return tables, schemas, nil
+}
+
+// drillTargetEmpty refuses a target that already holds ANY table in one of
+// the drill's schemas — the guard that makes pointing --target-dsn at a real
+// server hard. It deliberately checks schema-wide, not just the drilled
+// tables: a schema with unrelated tables is not a scratch.
+func drillTargetEmpty(ctx context.Context, db *sql.DB, schemas []string) error {
+	for _, s := range schemas {
+		var name string
+		err := db.QueryRowContext(ctx,
+			`SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? LIMIT 1`, s).Scan(&name)
+		switch {
+		case err == sql.ErrNoRows:
+		case err != nil:
+			return fmt.Errorf("probe target schema %s: %w", s, err)
+		default:
+			return fmt.Errorf("target already has table %s.%s — drill refuses a non-empty target; point --target-dsn at a THROWAWAY server (e.g. `docker compose --profile drill up -d drill-mysql`)", s, name)
+		}
+	}
+	return nil
+}
+
+// drillLoadTable applies one table's dump files to the scratch server on a
+// single pinned connection: CREATE DATABASE, USE, the schema file, then the
+// chunk files in the writer's order (each chunk is one multi-row INSERT —
+// the MydumperWriter contract).
+func drillLoadTable(ctx context.Context, db *sql.DB, outDir string, rep *reconstruct.TableReport) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("target connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+rep.Schema+"`"); err != nil {
+		return fmt.Errorf("create database %s: %w", rep.Schema, err)
+	}
+	// The schema file's CREATE TABLE is unqualified (mydumper convention), so
+	// the pinned connection selects the database first.
+	if _, err := conn.ExecContext(ctx, "USE `"+rep.Schema+"`"); err != nil {
+		return fmt.Errorf("use %s: %w", rep.Schema, err)
+	}
+	apply := func(name string) error {
+		content, err := os.ReadFile(filepath.Join(outDir, name))
+		if err != nil {
+			return fmt.Errorf("read dump file %s: %w", name, err)
+		}
+		if _, err := conn.ExecContext(ctx, string(content)); err != nil {
+			return fmt.Errorf("apply %s: %w", name, err)
+		}
+		return nil
+	}
+	for _, name := range rep.Files {
+		if strings.HasSuffix(name, "-schema.sql") {
+			if err := apply(name); err != nil {
+				return err
+			}
+		}
+	}
+	for _, name := range rep.Files {
+		if name == "metadata" || strings.HasSuffix(name, "-schema.sql") {
+			continue
+		}
+		if err := apply(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// auditDrill reports one rehearsed table to the audit seam: drill
+// materializes historical row state into an external server — the same
+// data-serving class as reconstruct's mydumper mode, with the extra fact
+// that the rows now live OUTSIDE the index. ext.Record cannot fail the
+// command (see ext/audit.go).
+func auditDrill(ctx context.Context, schema, table string, rows int64) {
+	ext.Record(ctx, ext.AuditEvent{
+		Surface: "cli",
+		Action:  "drill.run",
+		Actor:   ext.ProcessActor(""),
+		Schema:  schema,
+		Table:   table,
+		Detail:  map[string]string{"target": "scratch", "rows": fmt.Sprintf("%d", rows)},
+	})
+}
+
+func runDrill(cmd *cobra.Command, args []string) error {
+	if !cliutil.IsValidOutputFormat(drlFormat) {
+		return fmt.Errorf("invalid --format %q; must be text or json", drlFormat)
+	}
+	if drlBaselineDir == "" && drlBaselineS3 == "" {
+		return fmt.Errorf("one of --baseline-dir or --baseline-s3 is required — drill rehearses a full-table restore, which starts from a baseline")
+	}
+	tables, schemas, err := parseDrillTables(drlTables)
+	if err != nil {
+		return err
+	}
+	at := time.Now().UTC()
+	if drlAt != "" {
+		parsed, err := cliutil.ParseTime(drlAt)
+		if err != nil {
+			return fmt.Errorf("--at: %w", err)
+		}
+		if parsed != nil {
+			at = *parsed
+		}
+	}
+	baselineSrc := drlBaselineDir
+	if baselineSrc == "" {
+		baselineSrc = drlBaselineS3
+	}
+
+	ctx := cmd.Context()
+	target, err := config.Connect(drlTargetDSN)
+	if err != nil {
+		return fmt.Errorf("connect to --target-dsn: %w", err)
+	}
+	defer target.Close()
+	// Fail BEFORE the expensive reconstruct, and before anything touches the
+	// target.
+	if err := drillTargetEmpty(ctx, target, schemas); err != nil {
+		return err
+	}
+
+	outDir := drlOutput
+	tempDir := false
+	if outDir == "" {
+		outDir, err = os.MkdirTemp("", "bintrail-drill-*")
+		if err != nil {
+			return fmt.Errorf("create dump temp dir: %w", err)
+		}
+		tempDir = true
+	} else if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("create --output dir: %w", err)
+	}
+
+	duckTuning, err := DuckDBTuningFromFlags(cmd)
+	if err != nil {
+		return err
+	}
+	reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
+		IndexDSN:           drlIndexDSN,
+		BaselineSrc:        baselineSrc,
+		Tables:             tables,
+		At:                 at,
+		OutputDir:          outDir,
+		WarnEventThreshold: 5_000_000,
+		ArchiveFetcher:     TunedArchiveFetcher(duckTuning),
+		DuckDBTuning:       duckTuning,
+	})
+	if err != nil {
+		if tempDir {
+			// Keep the partial output for inspection — a failed drill IS the
+			// signal the command exists to produce.
+			return fmt.Errorf("reconstruct failed (partial dump kept at %s): %w", outDir, err)
+		}
+		return fmt.Errorf("reconstruct: %w", err)
+	}
+
+	report := &drillReport{At: at}
+	for _, rep := range reports {
+		res := drillTableResult{
+			Schema:             rep.Schema,
+			Table:              rep.Table,
+			Status:             "fail",
+			RowsWritten:        rep.RowsWritten,
+			ReconstructSeconds: rep.Duration.Seconds(),
+		}
+		loadStart := time.Now()
+		if err := drillLoadTable(ctx, target, outDir, rep); err != nil {
+			res.Error = err.Error()
+			res.LoadSeconds = time.Since(loadStart).Seconds()
+			report.Tables = append(report.Tables, res)
+			continue
+		}
+		res.LoadSeconds = time.Since(loadStart).Seconds()
+		auditDrill(ctx, rep.Schema, rep.Table, rep.RowsWritten)
+		var loaded int64
+		if err := target.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM `"+rep.Schema+"`.`"+rep.Table+"`").Scan(&loaded); err != nil {
+			res.Error = fmt.Sprintf("count loaded rows: %v", err)
+			report.Tables = append(report.Tables, res)
+			continue
+		}
+		res.RowsLoaded = loaded
+		if loaded == rep.RowsWritten {
+			res.Status = "pass"
+		} else {
+			res.Error = fmt.Sprintf("loaded %d rows, dump wrote %d", loaded, rep.RowsWritten)
+		}
+		report.Tables = append(report.Tables, res)
+	}
+
+	exitErr := report.ExitError()
+	if !tempDir || exitErr != nil {
+		report.DumpDir = outDir
+	}
+	if tempDir && exitErr == nil {
+		if rmErr := os.RemoveAll(outDir); rmErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not remove temp dump dir %s: %v\n", outDir, rmErr)
+		}
+	}
+
+	if drlFormat == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(report); err != nil {
+			return err
+		}
+	} else {
+		writeDrillText(report)
+	}
+	cmd.SilenceUsage = true
+	return exitErr
+}
+
+func writeDrillText(r *drillReport) {
+	fmt.Printf("=== Restore drill @ %s ===\n", r.At.Format("2006-01-02 15:04:05"))
+	pass := 0
+	var totalLoad float64
+	for _, t := range r.Tables {
+		status := "PASS"
+		if t.Status != "pass" {
+			status = "FAIL"
+		} else {
+			pass++
+		}
+		fmt.Printf("  %-4s %s.%s  rows=%d  reconstruct=%.1fs load=%.1fs", status, t.Schema, t.Table, t.RowsLoaded, t.ReconstructSeconds, t.LoadSeconds)
+		if t.Error != "" {
+			fmt.Printf("  (%s)", t.Error)
+		}
+		fmt.Println()
+		totalLoad += t.ReconstructSeconds + t.LoadSeconds
+	}
+	fmt.Printf("Summary: %d pass, %d fail — measured restore time %.1fs (an RTO data point)\n", pass, len(r.Tables)-pass, totalLoad)
+	if r.DumpDir != "" {
+		fmt.Printf("Dump kept at: %s\n", r.DumpDir)
+	}
+}

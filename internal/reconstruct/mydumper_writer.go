@@ -43,7 +43,8 @@ type MydumperWriter struct {
 	// cols is the column name list in the order WriteRow receives values.
 	cols []string
 
-	files []string // written file names, for TableReport
+	files       []string // written file names, for TableReport
+	rowsWritten int64    // row tuples written across all chunks — the load expectation drill checks against
 
 	curFile         *os.File
 	curBuf          *bufio.Writer
@@ -163,6 +164,8 @@ func (w *MydumperWriter) WriteRow(values []any) error {
 		w.curBytes += int64(len(tuple)) + 2
 	}
 
+	w.rowsWritten++
+
 	// Rotate if the chunk has grown past the threshold.
 	if w.curBytes >= w.chunkSize {
 		if err := w.finishChunk(); err != nil {
@@ -171,6 +174,10 @@ func (w *MydumperWriter) WriteRow(values []any) error {
 	}
 	return nil
 }
+
+// Rows returns how many row tuples WriteRow has accepted. Exact by
+// construction — `bintrail drill` compares the loaded COUNT(*) against it.
+func (w *MydumperWriter) Rows() int64 { return w.rowsWritten }
 
 // Close terminates the in-progress INSERT (if any), flushes and closes the
 // current chunk file, and marks the writer terminal so subsequent WriteRow

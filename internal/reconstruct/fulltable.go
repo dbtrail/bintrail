@@ -159,8 +159,13 @@ type TableReport struct {
 	InsertsEmitted int64 // rows appended after the baseline pass (new PKs)
 	UpdatesApplied int64 // baseline rows whose PK matched an UPDATE/INSERT event
 	DeletesSkipped int64 // baseline rows whose PK matched a DELETE event
-	Files          []string
-	Duration       time.Duration
+	// RowsWritten counts the row tuples actually written into chunk files —
+	// the writer's own tally, exact by construction (not derived from the
+	// baseline/insert/delete counters). `bintrail drill` loads the dump and
+	// checks COUNT(*) against it.
+	RowsWritten int64
+	Files       []string
+	Duration    time.Duration
 	// BinlogOnly is true when the table had no baseline at all and was
 	// recovered entirely from the binlog (#766's ErrNoBaseline fallback,
 	// reconstructBinlogOnly). Files is non-empty in this case too, so
@@ -930,6 +935,7 @@ func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableRepor
 		return fmt.Errorf("close mydumper writer: %w", err)
 	}
 	rep.Files = mw.Files()
+	rep.RowsWritten = mw.Rows()
 	return nil
 }
 
@@ -1621,6 +1627,7 @@ func writeBinlogOnlyChanges(
 		return fmt.Errorf("close mydumper writer: %w", err)
 	}
 	rep.Files = mw.Files()
+	rep.RowsWritten = mw.Rows()
 	return nil
 }
 
