@@ -114,6 +114,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 					Size:         size,
 				})
 			}
+			// Staleness (#1193): grade every snapshot against the oldest
+			// available delta coverage the sections above already loaded.
+			status.AnnotateBaselineStaleness(data.Baselines, data.Coverage.OldestDelta(), time.Now().UTC())
 		}
 	}
 

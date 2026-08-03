@@ -2109,6 +2109,12 @@ function baselinesPanel(b, servers) {
       row.append(el("span", { class: "stg-name mono", text: sn.time }));
       row.append(el("span", { class: "stg-dest", text:
         (sn.tables || []).length + " table(s)" + (sn.binlog_file ? " · " + sn.binlog_file + ":" + sn.binlog_pos : "") }));
+      // Staleness verdict vs delta coverage — "ok" stays quiet; "broken"
+      // means this snapshot can no longer anchor a full-table restore.
+      if (sn.staleness && sn.staleness !== "ok") {
+        row.append(el("span", { class: "chip chip-mon", text:
+          sn.staleness === "broken" ? "⚠ STALE — restore broken" : sn.staleness.toUpperCase() }));
+      }
       row.append(el("span", { class: "stg-age", text: formatAge(sn.age_hours) + " ago" }));
       list.append(row);
     });

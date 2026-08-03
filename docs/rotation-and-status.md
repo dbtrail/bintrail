@@ -605,3 +605,17 @@ bintrail rotate \
 This is the standalone equivalent of the rotation loop that `bintrail up` / `bintrail-console watch` run built-in — use it when you rotate a BYO index on a process separate from streaming.
 
 Schedule the timer to run once per hour. The drop operation is instant, but `REORGANIZE PARTITION` on a partition containing data does a full table scan of `p_future` to redistribute rows — if your `p_future` is empty (because you add future partitions frequently), the reorganize is also instant.
+
+## Baseline staleness
+
+With `--baseline-dir`, `bintrail status` grades every baseline snapshot
+against the oldest available delta coverage (live partitions plus archives):
+`ok`, `aging` (the snapshot is older than 80% of the coverage span — the
+restore window is shrinking), or `broken` (the anchor predates coverage —
+full-table reconstruct through that window is impossible). A table whose
+**newest** snapshot is broken trips a loud banner, and the JSON output
+carries per-baseline `staleness` plus a top-level `baseline_staleness`.
+The `watch` daemon's webhook channel sends a critical `baseline_stale`
+event on the transition into broken (see
+[console.md](console.md#webhook-notifications)). The fix is always the
+same: take a fresh baseline (`bintrail dump` + `bintrail baseline`).

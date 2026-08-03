@@ -439,6 +439,11 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if notifier != nil || upMetricsAddr != "" {
 		startContinuityWatch(ctx, notifier, registry, upIndexDSN)
 	}
+	// Baseline staleness (#1193) is webhook-only: status/console carry the
+	// full verdict; the channel gets the broken transition.
+	if notifier != nil {
+		startStalenessWatch(ctx, notifier, registry, upIndexDSN, upConsoleBaselineDir, upConsoleBaselineS3)
+	}
 
 	// Built-in rotation covers the boot index plus every per-source database
 	// the control plane provisions — the unattended quickstart's real data
@@ -603,6 +608,11 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// neither, nothing runs.
 	if notifier != nil || upMetricsAddr != "" {
 		startContinuityWatch(ctx, notifier, registry, upIndexDSN)
+	}
+	// Baseline staleness (#1193) is webhook-only: status/console carry the
+	// full verdict; the channel gets the broken transition.
+	if notifier != nil {
+		startStalenessWatch(ctx, notifier, registry, upIndexDSN, upConsoleBaselineDir, upConsoleBaselineS3)
 	}
 
 	// Built-in rotation: boot index + every per-source database the control

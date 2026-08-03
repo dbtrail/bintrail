@@ -45,6 +45,7 @@ const (
 	EventContinuityGapLost = "continuity_gap_lost"
 	EventVerifyProblem     = "verify_problem"
 	EventRotationUnhealthy = "rotation_unhealthy"
+	EventBaselineStale     = "baseline_stale"
 
 	SeverityInfo     = "info"
 	SeverityWarning  = "warning"

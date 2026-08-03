@@ -8,6 +8,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/status"
 )
 
 // baselinesMaxSnapshots caps the snapshots GET /api/baselines returns — the
@@ -28,6 +29,11 @@ type baselineSnapshotDTO struct {
 	BinlogFile string `json:"binlog_file,omitempty"`
 	BinlogPos  int64  `json:"binlog_pos,omitempty"`
 	GTIDSet    string `json:"gtid_set,omitempty"`
+	// Staleness grades this snapshot's anchor against the oldest available
+	// delta coverage of the selected server's index (#1193):
+	// ok | aging | broken | unknown. Empty when the floor query failed —
+	// never reported as ok.
+	Staleness string `json:"staleness,omitempty"`
 }
 
 type baselinesResponse struct {
@@ -85,6 +91,14 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
+	// Staleness floor (#1193): best-effort — an unreadable index leaves the
+	// verdict empty (unknown-shaped), never a fabricated "ok".
+	var oldestDelta time.Time
+	if od, err := status.OldestDeltaFromDB(r.Context(), b.db); err != nil {
+		slog.Warn("console: could not load delta-coverage floor for baseline staleness", "error", err)
+	} else {
+		oldestDelta = od
+	}
 	var cur *baselineSnapshotDTO
 	var curTime time.Time
 	for _, f := range files {
@@ -97,6 +111,9 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 			dto := baselineSnapshotDTO{
 				Time:     f.SnapshotTime.Format(consoleTSFormat),
 				AgeHours: now.Sub(f.SnapshotTime).Hours(),
+			}
+			if !oldestDelta.IsZero() {
+				dto.Staleness = string(status.BaselineStalenessFor(f.SnapshotTime, oldestDelta, now))
 			}
 			if resp.Kind == "dir" {
 				if meta, err := baseline.ReadParquetMetadata(f.Path); err == nil {

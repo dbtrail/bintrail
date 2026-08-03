@@ -459,6 +459,10 @@ restore time:
 - `rotation_unhealthy` (**warning**) — a built-in rotation cycle failed or
   kept deferring unarchived partitions; either way the index is not
   shrinking when it should.
+- `baseline_stale` (**critical**) — a table's newest baseline predates the
+  oldest available delta coverage: full-table restore through the missing
+  window is impossible until a fresh baseline is taken. Checked hourly for
+  every server with a baseline location configured.
 
 The payload is `{event, severity, server, summary, details, timestamp}` —
 generic JSON, no per-vendor adapters: Slack, PagerDuty, ntfy etc. all accept

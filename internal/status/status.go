@@ -525,7 +525,10 @@ type BaselineInfo struct {
 	BinlogFile   string
 	BinlogPos    int64
 	GTIDSet      string
-	Path         string // filesystem path; ignored by display/JSON output
+	// Staleness is this snapshot's #1193 verdict against the oldest available
+	// delta coverage ("" until AnnotateBaselineStaleness runs).
+	Staleness BaselineStalenessVerdict
+	Path      string // filesystem path; ignored by display/JSON output
 	// Size is the Parquet file size in bytes (0 = unknown). Surfaced so an
 	// operator can see per-table baseline size — the signal that tells whether
 	// a single-table baseline has grown into the large regime.
@@ -1121,6 +1124,7 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		GTIDSet      *string `json:"gtid_set,omitempty"`
 		Size         int64   `json:"size_bytes,omitempty"`
 		SizeHuman    string  `json:"size_human,omitempty"`
+		Staleness    string  `json:"staleness,omitempty"`
 	}
 	// jsonStreamError is emitted (under a distinct key, never a fake `stream` object —
 	// jsonStream's non-omitempty events_indexed:0/mode:"" would read as a real empty
@@ -1141,6 +1145,9 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		Archives    *jsonArchives    `json:"archives,omitempty"`
 		Coverage    *jsonCoverage    `json:"coverage,omitempty"`
 		Baselines   []jsonBaseline   `json:"baselines,omitempty"`
+		// BaselineStaleness is the worst per-table-newest verdict — the same
+		// headline the text banner keys on (#1193).
+		BaselineStaleness string `json:"baseline_staleness,omitempty"`
 	}
 
 	jf := make([]jsonFile, len(files))
@@ -1320,8 +1327,10 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		if b.GTIDSet != "" {
 			jb.GTIDSet = &b.GTIDSet
 		}
+		jb.Staleness = string(b.Staleness)
 		out.Baselines = append(out.Baselines, jb)
 	}
+	out.BaselineStaleness = string(OverallBaselineStaleness(baselines))
 
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
@@ -1336,8 +1345,8 @@ func writeBaselines(w io.Writer, baselines []BaselineInfo) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "=== Baselines ===")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "SNAPSHOT\tDATABASE\tTABLE\tSIZE\tBINLOG_FILE\tBINLOG_POS\tGTID")
-	fmt.Fprintln(tw, "────────\t────────\t─────\t────\t───────────\t──────────\t────")
+	fmt.Fprintln(tw, "SNAPSHOT\tDATABASE\tTABLE\tSIZE\tBINLOG_FILE\tBINLOG_POS\tGTID\tSTALENESS")
+	fmt.Fprintln(tw, "────────\t────────\t─────\t────\t───────────\t──────────\t────\t─────────")
 	for _, b := range baselines {
 		binlogFile := "-"
 		if b.BinlogFile != "" {
@@ -1355,10 +1364,29 @@ func writeBaselines(w io.Writer, baselines []BaselineInfo) {
 		if b.Size > 0 {
 			size = formatBytes(b.Size)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		staleness := "-"
+		if b.Staleness != "" {
+			staleness = string(b.Staleness)
+			if b.Staleness == BaselineBroken {
+				staleness = "⚠ broken"
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			b.SnapshotTime.Format(TSFmt),
 			b.Database, b.Table, size,
-			binlogFile, binlogPos, gtid)
+			binlogFile, binlogPos, gtid, staleness)
 	}
 	tw.Flush()
+
+	// Continuity-banner-style loud line: a table whose NEWEST baseline
+	// predates delta coverage cannot be fully restored through that hole, and
+	// waiting for restore time to find out is the failure mode #1193 exists
+	// to remove.
+	if OverallBaselineStaleness(baselines) == BaselineBroken {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "=== ⚠ BASELINE STALE — FULL-TABLE RESTORE BROKEN ===")
+		fmt.Fprintln(w, "The newest baseline for at least one table predates the oldest available")
+		fmt.Fprintln(w, "delta coverage: reconstructing those tables through the missing window is")
+		fmt.Fprintln(w, "impossible. Take a fresh baseline (bintrail dump + bintrail baseline).")
+	}
 }
