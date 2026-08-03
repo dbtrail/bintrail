@@ -115,7 +115,7 @@ func (s *verifySupervisor) RunScheduled(req console.VerifyRequest) error {
 // the one-at-a-time-per-server rule cannot drift between them.
 func (s *verifySupervisor) begin(req console.VerifyRequest, trigger string) (string, error) {
 	s.mu.Lock()
-	if j, ok := s.jobs[req.ServerID]; ok && j.status.State == "running" {
+	if j, ok := s.jobs[req.ServerID]; ok && j.status.State == console.VerifyStateRunning {
 		s.mu.Unlock()
 		return "", console.ErrVerifyRunning
 	}
@@ -124,7 +124,7 @@ func (s *verifySupervisor) begin(req console.VerifyRequest, trigger string) (str
 		baselineSrc = req.BaselineS3
 	}
 	s.jobs[req.ServerID] = &verifyJob{
-		status:     console.VerifyStatus{State: "running", Mode: req.Mode, Since: nowStamp()},
+		status:     console.VerifyStatus{State: console.VerifyStateRunning, Mode: req.Mode, Since: nowStamp()},
 		mode:       req.Mode,
 		serverName: req.ServerName,
 		trigger:    trigger,
@@ -144,7 +144,7 @@ func (s *verifySupervisor) Status(serverID string) console.VerifyStatus {
 	if j, ok := s.jobs[serverID]; ok {
 		return j.status
 	}
-	return console.VerifyStatus{State: "idle"}
+	return console.VerifyStatus{State: console.VerifyStateIdle}
 }
 
 // Explain re-runs the row-level drill-down for one table the last completed
@@ -577,10 +577,10 @@ func (s *verifySupervisor) finish(serverID string, err error) {
 	}
 	j.status.FinishedAt = nowStamp()
 	if err != nil {
-		j.status.State = "failed"
+		j.status.State = console.VerifyStateFailed
 		j.status.LastError = err.Error()
 	} else {
-		j.status.State = "succeeded"
+		j.status.State = console.VerifyStateSucceeded
 	}
 	rec := console.VerifyRunRecord{
 		ServerID:     serverID,

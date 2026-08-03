@@ -61,17 +61,17 @@ func TestVerifyHistory_CapDropsOldest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range verifyHistoryCap + 5 {
+	for i := range VerifyHistoryCap + 5 {
 		if err := h.Append(VerifyRunRecord{ServerID: "s", VerifyStatus: VerifyStatus{Summary: VerifySummary{Total: i}}}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	got := h.List("s")
-	if len(got) != verifyHistoryCap {
-		t.Fatalf("want cap of %d records, got %d", verifyHistoryCap, len(got))
+	if len(got) != VerifyHistoryCap {
+		t.Fatalf("want cap of %d records, got %d", VerifyHistoryCap, len(got))
 	}
 	// Newest first: got[0] is the last appended, the tail is the oldest kept.
-	if got[0].Summary.Total != verifyHistoryCap+4 || got[len(got)-1].Summary.Total != 5 {
+	if got[0].Summary.Total != VerifyHistoryCap+4 || got[len(got)-1].Summary.Total != 5 {
 		t.Fatalf("cap dropped the wrong end: newest=%d oldest=%d", got[0].Summary.Total, got[len(got)-1].Summary.Total)
 	}
 }

@@ -25,17 +25,30 @@ import (
 func ContinuityStatus(stream *StreamStateInfo, streamErr error) string {
 	switch {
 	case stream == nil && streamErr != nil:
-		return "unavailable"
+		return ContinuityUnavailable
 	case stream == nil:
-		return "none"
+		return ContinuityNone
 	case stream.GapLostAt.Valid:
-		return "gap_lost"
+		return ContinuityGapLost
 	case !stream.GapColumnsPresent:
-		return "unknown"
+		return ContinuityUnknown
 	default:
-		return "ok"
+		return ContinuityOK
 	}
 }
+
+// The continuity verdict vocabulary, named so a consumer branches on a symbol
+// instead of a literal. Only ContinuityGapLost and ContinuityOK are claims
+// about the captured range; a consumer that treats everything-but-gap_lost as
+// healthy folds the two "never a false ok" verdicts into a pass, which is the
+// error this vocabulary exists to prevent.
+const (
+	ContinuityOK          = "ok"
+	ContinuityGapLost     = "gap_lost"
+	ContinuityUnknown     = "unknown"
+	ContinuityUnavailable = "unavailable"
+	ContinuityNone        = "none"
+)
 
 // CoverageSummary is the lean live-RPO view behind the console's coverage
 // card (#1194): the reconstructable delta window, capture lag, and the

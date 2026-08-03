@@ -10,10 +10,16 @@ import (
 	"sync"
 )
 
-// verifyHistoryCap is how many runs are kept per server. Old records fall off
+// VerifyHistoryCap is how many runs are kept per server. Old records fall off
 // the front — the history answers "when did this last verify, and how has it
 // been trending", not "archive every run forever".
-const verifyHistoryCap = 20
+//
+// Exported because eviction is SILENT: a consumer summarizing the history has
+// no other way to tell "these are all the runs there ever were" from "these
+// are the newest VerifyHistoryCap of them". A server whose List is exactly
+// this long must be reported as a possibly-truncated window, or a summary
+// says "no failed runs" about a period whose failures fell off the front.
+const VerifyHistoryCap = 20
 
 // VerifyRunRecord is one completed (or skipped) verify run as stored in the
 // history file and served by GET /api/servers/{id}/verify/history. It embeds
@@ -41,6 +47,17 @@ const (
 	VerifyTriggerManual    = "manual"
 	VerifyTriggerScheduled = "scheduled"
 	VerifyStateSkipped     = "skipped"
+)
+
+// The rest of the VerifyStatus.State vocabulary. Named alongside
+// VerifyStateSkipped because a consumer summarizing the history has to branch
+// on all of them: "not skipped" is NOT "verified" — it also admits failed,
+// and the two transient states a run can be caught in.
+const (
+	VerifyStateIdle      = "idle"
+	VerifyStateRunning   = "running"
+	VerifyStateSucceeded = "succeeded"
+	VerifyStateFailed    = "failed"
 )
 
 // verifyHistoryFile is the on-disk envelope: versioned like the server
@@ -115,8 +132,8 @@ func (h *VerifyHistory) Append(rec VerifyRunRecord) error {
 	// Clone before appending: an in-place append could write into old's spare
 	// capacity, which would corrupt the rollback below.
 	recs := append(slices.Clone(old), rec)
-	if len(recs) > verifyHistoryCap {
-		recs = recs[len(recs)-verifyHistoryCap:]
+	if len(recs) > VerifyHistoryCap {
+		recs = recs[len(recs)-VerifyHistoryCap:]
 	}
 	h.servers[rec.ServerID] = recs
 	if err := h.save(); err != nil {
