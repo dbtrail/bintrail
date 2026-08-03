@@ -67,6 +67,10 @@ func fetchObjectLockState(ctx context.Context, client objectLockAPI, bucket stri
 	if cfg.Rule != nil && cfg.Rule.DefaultRetention != nil {
 		dr := cfg.Rule.DefaultRetention
 		st.mode = string(dr.Mode)
+		// Years are approximated as 365d (S3 adds calendar years, so a leap year
+		// can differ by a day — acceptable for an advisory check whose failure
+		// direction is a spurious WARN). AWS forbids setting both Days and Years;
+		// if a non-AWS store ever returns both, Days wins.
 		if dr.Years != nil {
 			st.retention = time.Duration(*dr.Years) * 365 * 24 * time.Hour
 		}
@@ -80,13 +84,16 @@ func fetchObjectLockState(ctx context.Context, client objectLockAPI, bucket stri
 // objectLockVerdict turns the fetched posture into the check outcome:
 //   - configuration unreadable: SKIP — posture UNKNOWN, never reported as
 //     either safe or unsafe (the anti-cry-wolf rule).
-//   - lock disabled: WARN — archives are deletable; remediation says out
-//     loud that Object Lock can only be enabled at bucket CREATION.
+//   - lock disabled: WARN — archives are deletable; remediation carries the
+//     enable-on-existing-bucket steps (AWS supports that since Nov 2023;
+//     existing objects are NOT retroactively locked).
 //   - lock enabled but no default retention rule: WARN — bintrail uploads
 //     set no per-object retention, so new archives land UNLOCKED.
-//   - default retention shorter than the index retention window: WARN — the
-//     lock expires while the partition is still live, so the object is
-//     already deletable by the time rotation makes it the only copy.
+//   - default retention shorter than the index retention window: WARN —
+//     rotation archives a partition at the moment it drops it, so data the
+//     operator evidently still relies on (it was worth keeping live for the
+//     whole --retain window) would lose deletion protection sooner than
+//     that same window once the archive becomes the only copy.
 //   - otherwise PASS, with the mode and period in the detail (GOVERNANCE
 //     notes its s3:BypassGovernanceRetention escape hatch).
 func objectLockVerdict(bucket string, st objectLockState, retain time.Duration) CheckResult {
@@ -105,11 +112,14 @@ func objectLockVerdict(bucket string, st objectLockState, retain time.Duration) 
 			Name:   ObjectLockCheckName,
 			Status: StatusWarn,
 			Detail: fmt.Sprintf("bucket %q does not have S3 Object Lock enabled — after rotation the Parquet archive is the ONLY copy of a partition, and any credential that can delete S3 objects can erase it (ransomware / compromised key)", bucket),
-			Remediation: "Object Lock can only be enabled when a bucket is CREATED — it cannot be turned on later.\n" +
-				"Create a locked bucket and point --archive-s3 at it (recipe: docs/object-lock.md):\n" +
-				"  aws s3api create-bucket --bucket <name> --object-lock-enabled-for-bucket ...\n" +
-				"  aws s3api put-object-lock-configuration --bucket <name> \\\n" +
-				"    --object-lock-configuration 'ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=COMPLIANCE,Days=<retention>}}'",
+			Remediation: "On AWS, Object Lock can be enabled on an EXISTING bucket (since Nov 2023): enable\n" +
+				"versioning first, then apply the lock configuration. Objects already in the bucket\n" +
+				"are NOT retroactively locked — only new writes get the default retention. (Some\n" +
+				"S3-compatible stores still require enabling the lock at bucket creation.)\n" +
+				"  aws s3api put-bucket-versioning --bucket " + bucket + " --versioning-configuration Status=Enabled\n" +
+				"  aws s3api put-object-lock-configuration --bucket " + bucket + " \\\n" +
+				"    --object-lock-configuration 'ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=COMPLIANCE,Days=<retention>}}'\n" +
+				"Recipe and threat model: docs/object-lock.md",
 		}
 	}
 	if st.retention <= 0 {
@@ -124,13 +134,17 @@ func objectLockVerdict(bucket string, st objectLockState, retain time.Duration) 
 		}
 	}
 	if retain > 0 && st.retention < retain {
+		mode := st.mode
+		if mode == "" {
+			mode = "COMPLIANCE" // non-AWS stores can omit it; never emit a broken Mode=
+		}
 		return CheckResult{
 			Name:   ObjectLockCheckName,
 			Status: StatusWarn,
-			Detail: fmt.Sprintf("bucket %q default retention %s is SHORTER than the index retention window %s — an archive's lock expires while its partition is still in the live index, so the object is already deletable by the time rotation makes it the only copy", bucket, fmtLockDuration(st.retention), fmtLockDuration(retain)),
+			Detail: fmt.Sprintf("bucket %q default retention %s is SHORTER than the index retention window %s (doctor's --retain — pass your real rotation window if you haven't) — rotation archives a partition at the moment it drops it, so data you kept live for %s stays deletion-protected for only %s once the archive becomes the only copy", bucket, fmtLockDuration(st.retention), fmtLockDuration(retain), fmtLockDuration(retain), fmtLockDuration(st.retention)),
 			Remediation: "Raise the default retention to at least the rotation window:\n" +
 				"  aws s3api put-object-lock-configuration --bucket " + bucket + " \\\n" +
-				"    --object-lock-configuration 'ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=" + st.mode + ",Days=" + fmt.Sprintf("%d", int(retain.Hours()/24)+1) + "}}'",
+				"    --object-lock-configuration 'ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=" + mode + ",Days=" + fmt.Sprintf("%d", int(retain.Hours()/24)+1) + "}}'",
 		}
 	}
 	detail := fmt.Sprintf("bucket %q: Object Lock enabled, default retention %s %s", bucket, st.mode, fmtLockDuration(st.retention))
@@ -156,9 +170,10 @@ func CheckArchiveObjectLock(ctx context.Context, archiveS3, region string, retai
 	bucket, _, err := storage.ParseS3URL(archiveS3)
 	if err != nil {
 		return CheckResult{
-			Name:   ObjectLockCheckName,
-			Status: StatusWarn,
-			Detail: fmt.Sprintf("invalid --archive-s3 URL %q: %v", archiveS3, err),
+			Name:        ObjectLockCheckName,
+			Status:      StatusWarn,
+			Detail:      fmt.Sprintf("invalid --archive-s3 URL %q: %v", archiveS3, err),
+			Remediation: "Pass an s3:// URL, e.g. s3://my-bucket/archives/",
 		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, objectLockBudget)

@@ -31,3 +31,15 @@ func TestRunDoctorToWiresObjectLockCheck(t *testing.T) {
 		t.Fatalf("check present without --archive-s3:\n%s", without.String())
 	}
 }
+
+// TestDoctorObjectLockFlagNames pins the flag names to the ones bound in
+// internal/cli/env.go — renaming either silently disconnects
+// BINTRAIL_ARCHIVE_S3/_REGION from doctor while the generic env-binding
+// resolve test stays green (agent/rotate still register the old names).
+func TestDoctorObjectLockFlagNames(t *testing.T) {
+	for _, name := range []string{"archive-s3", "archive-s3-region"} {
+		if doctorCmd.Flags().Lookup(name) == nil {
+			t.Fatalf("doctor is missing the --%s flag (env binding depends on the name)", name)
+		}
+	}
+}

@@ -29,9 +29,23 @@ of an already-written object.
 
 ## Bucket recipe
 
-Object Lock can only be enabled **when the bucket is created** — it cannot be
-turned on later. (Versioning is enabled automatically and cannot be
-suspended on a locked bucket.)
+On AWS, Object Lock can be enabled on a **new** bucket at creation (versioning
+comes with it and cannot be suspended afterwards) or — since Nov 2023 — on an
+**existing** bucket: enable versioning first, then apply the lock
+configuration. Either way, objects already in the bucket are **not**
+retroactively locked; only writes after the default retention rule exists get
+locked. Some S3-compatible stores still require enabling the lock at bucket
+creation.
+
+Existing bucket:
+
+```bash
+aws s3api put-bucket-versioning --bucket my-bintrail-archives \
+  --versioning-configuration Status=Enabled
+# then apply step 2 and step 3 below
+```
+
+New bucket:
 
 ```bash
 # 1. Create the bucket with Object Lock enabled
@@ -53,11 +67,12 @@ aws s3api put-bucket-lifecycle-configuration --bucket my-bintrail-archives \
     "Expiration":{"ExpiredObjectDeleteMarker":true}}]}'
 ```
 
-**Choosing the retention period**: at least your `rotate --retain` window —
-if the lock expires while the partition is still in the live index, the
-object is already deletable by the time it becomes the only copy — plus
-however long you want deletion protection after that. `bintrail doctor`
-checks this arithmetic for you:
+**Choosing the retention period**: rotation archives a partition at the
+moment it drops it from the live index, so the retention clock starts exactly
+when the archive becomes the only copy. Your `rotate --retain` window is the
+sensible floor — data you considered worth keeping live for N days should
+stay immutable at least that long as an archive — plus however long you want
+deletion protection beyond it. `bintrail doctor` checks that floor for you:
 
 ```bash
 bintrail doctor --source-dsn "$SRC" --retain 30d \
@@ -67,7 +82,9 @@ bintrail doctor --source-dsn "$SRC" --retain 30d \
 The check is advisory (WARN, never a failing exit code) and reports: lock
 disabled, lock enabled but no default rule (uploads land **unlocked**),
 retention shorter than `--retain`, and the mode/period on PASS. It needs the
-`s3:GetBucketObjectLockConfiguration` permission; without it the check SKIPs.
+`s3:GetBucketObjectLockConfiguration` permission — **not** part of the
+baseline [IAM policy](s3-iam-policy.md); add it as a bucket-level action —
+and without it the check SKIPs.
 
 ## What works on a locked bucket — verified
 
@@ -79,14 +96,16 @@ retention shorter than `--retain`, and the mode/period on PASS. It needs the
   console): read-only GETs, unaffected.
 - **`archive reconcile --prune`**: deletes **registry rows only** — it never
   touches data files, locked or not.
-- **Baseline local prune** (`rotate` with `--baseline-*`): deletes **local**
+- **Baseline local prune** (`baseline --baseline-retain`): deletes **local**
   directories after confirming a durable S3 copy; it never deletes from S3.
-- The one S3 delete bintrail ever performs is the best-effort `_INCOMPLETE`
-  marker cleanup after a baseline upload. On a locked (hence versioned)
-  bucket this places a *delete marker* — a logical delete that retention
-  permits — so discovery behaves normally and the lifecycle rule above reaps
-  the leftovers. If it ever fails it was already harmless: `_SUCCESS`
-  decides completeness.
+- The only S3 deletes bintrail ever performs are the best-effort
+  `_INCOMPLETE` marker cleanup after a baseline upload and `agent --validate`
+  removing its own connectivity-probe object — never archive data. On a
+  locked (hence versioned) bucket both are *delete markers* — logical
+  deletes that retention permits — so discovery behaves normally and the
+  lifecycle rule above reaps the leftovers. (The probe object's noncurrent
+  version stays billed until its retention expires.) If the marker cleanup
+  ever fails it was already harmless: `_SUCCESS` decides completeness.
 
 There is **no** code path in bintrail that permanently deletes archived data
 from S3. Reclaiming aged archives is deliberately left to your bucket

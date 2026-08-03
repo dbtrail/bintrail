@@ -89,6 +89,29 @@ func TestObjectLockVerdict(t *testing.T) {
 	}
 }
 
+// TestObjectLockVerdictNeverFails sweeps a grid of states and pins the
+// advisory contract: no combination may return StatusFail — doctor must stay
+// safe as a CI smoke test for operators who legitimately run without Object
+// Lock. Unlike the per-case table, this survives future branch additions.
+func TestObjectLockVerdictNeverFails(t *testing.T) {
+	states := []objectLockState{
+		{},
+		{queryErr: errors.New("boom")},
+		{notEnabled: true},
+		{mode: "COMPLIANCE"},
+		{mode: "GOVERNANCE", retention: day(7)},
+		{mode: "COMPLIANCE", retention: day(30)},
+		{retention: day(7)}, // non-AWS: retention without a mode
+	}
+	for _, st := range states {
+		for _, retain := range []time.Duration{0, day(7), day(30)} {
+			if got := objectLockVerdict("b", st, retain); got.Status == StatusFail {
+				t.Fatalf("state %+v retain %v returned StatusFail — the check is advisory", st, retain)
+			}
+		}
+	}
+}
+
 // mockLockAPI returns a fixed response or error.
 type mockLockAPI struct {
 	out *s3.GetObjectLockConfigurationOutput
@@ -111,6 +134,13 @@ func TestFetchObjectLockState(t *testing.T) {
 
 	t.Run("other errors are query failures, never a posture claim", func(t *testing.T) {
 		st := fetchObjectLockState(ctx, mockLockAPI{err: &smithy.GenericAPIError{Code: "AccessDenied"}}, "b")
+		if st.queryErr == nil || st.notEnabled {
+			t.Fatalf("got %+v, want queryErr", st)
+		}
+	})
+
+	t.Run("plain non-API errors (network/timeout) are query failures, never lock-disabled", func(t *testing.T) {
+		st := fetchObjectLockState(ctx, mockLockAPI{err: errors.New("dial tcp: i/o timeout")}, "b")
 		if st.queryErr == nil || st.notEnabled {
 			t.Fatalf("got %+v, want queryErr", st)
 		}
