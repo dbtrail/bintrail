@@ -40,6 +40,14 @@ const (
 	// SkipStatementFormatDML — a STATEMENT/MIXED-format DML whose row image
 	// is not in the binlog (#999); the change cannot be captured.
 	SkipStatementFormatDML = "statement_format_dml"
+	// SkipUnreadablePreviousLedger — meta-reason (#1206): the previous run's
+	// persisted ledger existed but could not be parsed at restart. Not an
+	// event skip — it preserves the FACT that a loss tally may have been
+	// destroyed, so `status` stays non-clean (and --fail-on-gap keeps failing
+	// closed) instead of the next checkpoint silently laundering the evidence
+	// into "{}" = OK. Cleared only by the operator acknowledgement runbook
+	// (clear the ledger with the daemon stopped).
+	SkipUnreadablePreviousLedger = "unreadable_previous_ledger"
 )
 
 // SkipEscalationThreshold is the number of CONSECUTIVE skipped events (no
@@ -116,6 +124,19 @@ func (c *SkipCounters) Seed(raw string) error {
 	defer c.mu.Unlock()
 	c.byReason = m
 	return nil
+}
+
+// SeedPreserving is Seed for the daemon restart path (#1206). A document that
+// fails to parse is NOT discarded into fresh counters: the failure itself is
+// recorded under SkipUnreadablePreviousLedger, so the next checkpoint persists
+// a non-clean ledger instead of overwriting possible loss evidence with the
+// affirmative "{}". The parse error is returned for the caller to log.
+func (c *SkipCounters) SeedPreserving(raw string) error {
+	err := c.Seed(raw)
+	if err != nil {
+		c.RecordSkip(SkipUnreadablePreviousLedger)
+	}
+	return err
 }
 
 // RecordSkip notes one skipped event under reason, stamping the current time.

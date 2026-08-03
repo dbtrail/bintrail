@@ -169,6 +169,13 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				}
 				return fmt.Errorf("capture health: %d statement-format DML event(s) permanently uncaptured%s; set binlog_format=ROW server-wide on the source, then acknowledge by clearing stream_state.capture_skips with the daemon stopped (the counter is monotonic); failing closed under --fail-on-gap", st.Count, loc)
 			}
+			// #1206: the restart path stamps this meta-reason when the
+			// previously persisted ledger could not be parsed — a loss tally
+			// may have been destroyed, so a now-readable ledger carrying it
+			// must not read as "fine".
+			if st := skips[status.CaptureSkipReasonUnreadablePreviousLedger]; st.Count > 0 {
+				return fmt.Errorf("capture health: a previous capture ledger was unreadable at daemon restart and its tally is lost — permanent loss may be unrecorded; acknowledge by clearing stream_state.capture_skips with the daemon stopped; failing closed under --fail-on-gap")
+			}
 		} else if data.Stream.CaptureSkips.Valid && strings.TrimSpace(data.Stream.CaptureSkips.String) != "" {
 			return fmt.Errorf("capture health: capture_skips ledger present but unreadable; cannot confirm statement-format DML drops; failing closed under --fail-on-gap")
 		}

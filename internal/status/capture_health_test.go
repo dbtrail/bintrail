@@ -113,6 +113,9 @@ func TestCaptureSkipReasonMirrorsParser(t *testing.T) {
 	if CaptureSkipReasonStatementFormatDML != parser.SkipStatementFormatDML {
 		t.Fatalf("status reason %q != parser reason %q", CaptureSkipReasonStatementFormatDML, parser.SkipStatementFormatDML)
 	}
+	if CaptureSkipReasonUnreadablePreviousLedger != parser.SkipUnreadablePreviousLedger {
+		t.Fatalf("status reason %q != parser reason %q", CaptureSkipReasonUnreadablePreviousLedger, parser.SkipUnreadablePreviousLedger)
+	}
 }
 
 func TestWriteStatus_captureHealthOK(t *testing.T) {

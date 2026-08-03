@@ -181,6 +181,19 @@ func TestRunStatus_failOnGap_exitCode(t *testing.T) {
 	})
 	stFailOnGap = true
 
+	// #1206: a readable ledger carrying the unreadable-previous-ledger
+	// meta-reason (stamped by the restart path) → fail closed; a restart must
+	// not launder the fail-closed unreadable state into exit 0.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE stream_state SET capture_skips='{"unreadable_previous_ledger":{"count":1,"last_at":"2026-07-18T02:00:00Z"}}' WHERE id=1`); err != nil {
+		t.Fatalf("seed meta-reason: %v", err)
+	}
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err == nil || !strings.Contains(err.Error(), "previous capture ledger was unreadable") {
+			t.Errorf("want a fail-closed error for the unreadable-previous-ledger meta-reason, got: %v", err)
+		}
+	})
+
 	// An evaluated-and-clean ledger ("{}") → no alert.
 	if _, err := db.ExecContext(ctx, `UPDATE stream_state SET capture_skips='{}' WHERE id=1`); err != nil {
 		t.Fatalf("clear capture_skips: %v", err)

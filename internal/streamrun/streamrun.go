@@ -2163,14 +2163,17 @@ func One(ctx context.Context, cfg Config) error {
 	// Capture-skip counters (#1034): shared between the StreamParser (which
 	// records each discarded event) and saveCheckpoint (which persists them).
 	// Re-seeded from the previous run's persisted document so a restart never
-	// silently zeroes the DEGRADED verdict `status` renders from them. A
-	// failed load/parse degrades to fresh counters with a warning — never a
-	// startup abort — since the tallies are observability, not correctness.
+	// silently zeroes the DEGRADED verdict `status` renders from them. Since
+	// #999 the ledger is exit-code-bearing (--fail-on-gap), so an unreadable
+	// document must not be laundered into fresh counters + a clean "{}" at the
+	// next checkpoint: SeedPreserving records the failure itself under the
+	// unreadable_previous_ledger meta-reason (#1206) — status stays non-clean
+	// until the operator acknowledges. Never a startup abort either way.
 	skips := parser.NewSkipCounters(nil)
 	if raw, err := loadCaptureSkips(indexDB); err != nil {
 		slog.Warn("could not load persisted capture-skip counters; starting from zero", "error", err)
-	} else if err := skips.Seed(raw); err != nil {
-		slog.Warn("could not parse persisted capture-skip counters; starting from zero", "error", err)
+	} else if err := skips.SeedPreserving(raw); err != nil {
+		slog.Error("could not parse persisted capture-skip counters — the previous ledger may have recorded permanent loss; preserving the fact under reason unreadable_previous_ledger", "error", err)
 	}
 	state.skips = skips
 

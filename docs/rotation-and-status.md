@@ -352,7 +352,10 @@ permanently absent from the index, the same loss class as `gap_lost`. A **NULL**
 capture ledger does not trip it (the column post-dates the flag, and alerting on
 its absence would fail every pre-existing deployment) — but a ledger that is
 *present and unreadable* does fail closed: a skip-aware daemon wrote it, and it
-may be hiding a loss count.
+may be hiding a loss count. If the daemon restarts while the ledger is
+unreadable, it preserves that fact under the `unreadable_previous_ledger`
+meta-reason instead of overwriting the evidence with a clean document — which
+also fails closed until acknowledged (same runbook as below).
 
 The drop counter is **monotonic for the life of the index** — fixing
 `binlog_format` stops new drops but does not clear the count (the dropped

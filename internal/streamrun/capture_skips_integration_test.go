@@ -86,6 +86,37 @@ func TestIntegrationCaptureSkipsPersistAndSurviveRestart(t *testing.T) {
 		t.Fatalf("a nil-skips checkpoint wiped the counters:\n was: %s\n now: %s", raw2, raw3)
 	}
 
+	// ── #1206: an unreadable persisted ledger is preserved, not laundered ──
+	// Corrupt the column (valid JSON, wrong shape — what version skew
+	// produces), restart through the production seed path, and re-persist:
+	// the meta-reason must survive the round trip instead of "{}" = OK.
+	if _, err := db.Exec(`UPDATE stream_state SET capture_skips='{"statement_format_dml": 3}' WHERE id=1`); err != nil {
+		t.Fatalf("corrupt capture_skips: %v", err)
+	}
+	rawBad, err := loadCaptureSkips(db)
+	if err != nil {
+		t.Fatalf("loadCaptureSkips (corrupt): %v", err)
+	}
+	postCrash := parser.NewSkipCounters(nil)
+	if err := postCrash.SeedPreserving(rawBad); err == nil {
+		t.Fatal("SeedPreserving must surface the parse error")
+	}
+	state.skips = postCrash
+	if err := saveCheckpoint(db, state); err != nil {
+		t.Fatalf("saveCheckpoint after unreadable seed: %v", err)
+	}
+	rawAfter, err := loadCaptureSkips(db)
+	if err != nil {
+		t.Fatalf("loadCaptureSkips after re-persist: %v", err)
+	}
+	if !strings.Contains(rawAfter, parser.SkipUnreadablePreviousLedger) {
+		t.Fatalf("unreadable-ledger evidence was laundered away: %s", rawAfter)
+	}
+	// Restore the readable multi-reason document for the render assertions.
+	if _, err := db.Exec(`UPDATE stream_state SET capture_skips=? WHERE id=1`, raw2); err != nil {
+		t.Fatalf("restore capture_skips: %v", err)
+	}
+
 	// ── `status` renders DEGRADED from the same row (production read path) ──
 	ctx := context.Background()
 	stream, err := status.LoadStreamState(ctx, db)

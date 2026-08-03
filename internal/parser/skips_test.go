@@ -91,6 +91,29 @@ func TestSkipCounters_attributionRoundTrip(t *testing.T) {
 	}
 }
 
+// #1206: the restart path must never launder an unreadable ledger into fresh
+// counters — SeedPreserving stamps the failure under the meta-reason so the
+// next Snapshot persists a non-clean document; a readable document seeds
+// normally with no meta-reason.
+func TestSkipCounters_seedPreservingStampsUnreadable(t *testing.T) {
+	c := NewSkipCounters(newTestLogger(&bytes.Buffer{}))
+	if err := c.SeedPreserving(`{"statement_format_dml": 3}`); err == nil {
+		t.Fatal("SeedPreserving must return the parse error")
+	}
+	snap, _ := c.Snapshot()
+	if !strings.Contains(snap, SkipUnreadablePreviousLedger) || c.Total() != 1 {
+		t.Fatalf("unreadable ledger not preserved as meta-reason (total=%d): %s", c.Total(), snap)
+	}
+
+	ok := NewSkipCounters(newTestLogger(&bytes.Buffer{}))
+	if err := ok.SeedPreserving(`{"column_count_mismatch":{"count":2,"last_at":"2026-07-17T12:24:12Z"}}`); err != nil {
+		t.Fatalf("SeedPreserving on a readable document: %v", err)
+	}
+	if snap2, _ := ok.Snapshot(); strings.Contains(snap2, SkipUnreadablePreviousLedger) {
+		t.Fatalf("readable seed must not stamp the meta-reason: %s", snap2)
+	}
+}
+
 func TestSkipCounters_seedEmptyAndInvalid(t *testing.T) {
 	c := NewSkipCounters(newTestLogger(&bytes.Buffer{}))
 	if err := c.Seed(""); err != nil {

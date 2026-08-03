@@ -138,6 +138,11 @@ type CaptureSkipStat struct {
 // package deliberately does not import the binlog parser.
 const CaptureSkipReasonStatementFormatDML = "statement_format_dml"
 
+// CaptureSkipReasonUnreadablePreviousLedger mirrors
+// parser.SkipUnreadablePreviousLedger — the meta-reason a restarting daemon
+// stamps when the previously persisted ledger could not be parsed (#1206).
+const CaptureSkipReasonUnreadablePreviousLedger = "unreadable_previous_ledger"
+
 // ParseCaptureSkips decodes the persisted capture_skips document. ok is false
 // when the verdict is not evaluable (no column / no skip-aware daemon /
 // unparseable payload) — callers must then omit the Capture health verdict
