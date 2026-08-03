@@ -139,18 +139,23 @@ func TestParseFile_typeCorruptionMatrix_mariadb(t *testing.T) {
 		t.Fatalf("expected 1 UPDATE for table tm, got %d", len(upd))
 	}
 
-	// #986 workaround: MariaDB defers end_log_pos stamping for every
-	// non-terminal event inside a GTID-tracked transaction (Table_map,
-	// Write_rows/Update_rows all carry end_log_pos=0 on the wire — verified
-	// against mariadb-binlog directly, not a go-mysql artifact), which
-	// underflows handleRows' StartPos/EndPos computation for a MariaDB
-	// source. That is a real, separately-filed position-tracking bug,
-	// orthogonal to the column-VALUE fidelity this test sweeps (#620).
-	// Stamp safe placeholder positions here so the rest of this test
-	// exercises the real index-write and recover pipeline on otherwise
-	// unmodified, real MariaDB-decoded row values.
-	ins[0].StartPos, ins[0].EndPos = 100, 200
-	upd[0].StartPos, upd[0].EndPos = 200, 300
+	// #1117/#1180: MariaDB writes cache-buffered events (Table_map, row
+	// events) with end_log_pos=0 in the file itself; ParseFile's running-
+	// offset fill now reconstructs real positions, so the old "#986
+	// workaround" (stamping placebo 100/200 positions before indexing) is
+	// gone — the index-write and recover stages below run on the genuine
+	// parser-emitted positions. Pin their shape here: a fill regression
+	// re-emits the underflow (StartPos = 2^64-EventSize, EndPos = 0), which
+	// EndPos > StartPos catches. Exact ground-truth position equality is
+	// asserted by TestParseFile_realBinlog_mariadb; this sweep only needs
+	// the positions to be real and ordered.
+	if ins[0].StartPos < 4 || ins[0].EndPos <= ins[0].StartPos {
+		t.Fatalf("INSERT positions not filled: [%d, %d)", ins[0].StartPos, ins[0].EndPos)
+	}
+	if upd[0].StartPos < ins[0].EndPos || upd[0].EndPos <= upd[0].StartPos {
+		t.Fatalf("UPDATE positions not filled or not after INSERT: insert [%d, %d), update [%d, %d)",
+			ins[0].StartPos, ins[0].EndPos, upd[0].StartPos, upd[0].EndPos)
+	}
 
 	// ─── Stage 1: parser decode (go-mysql TABLE_MAP/ROWS_EVENT over MariaDB) ──
 

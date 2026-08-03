@@ -694,10 +694,17 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 		// on the same byos-202 tenant. Defending the entire Scan closes
 		// the pattern. event_id stays a bare uint64 because
 		// AUTO_INCREMENT cannot return NULL on read.
+		// start_pos/end_pos are BIGINT UNSIGNED: scanned through the generic
+		// sql.Null[uint64], not sql.NullInt64 — a legitimate position above
+		// 2^63 (the #986/#1117 MariaDB underflow shape stored by pre-#1180
+		// builds, or any future >8EiB offset) would be a hard Scan failure
+		// through the int64 path. The mysql driver returns uint64 for
+		// unsigned BIGINT on the binary protocol and []byte on the text
+		// protocol; convertAssign handles both losslessly into uint64.
 		var (
 			binlogFile     sql.NullString
-			startPos       sql.NullInt64
-			endPos         sql.NullInt64
+			startPos       sql.Null[uint64]
+			endPos         sql.Null[uint64]
 			eventTimestamp sql.NullTime
 			gtid           sql.NullString
 			connID         sql.NullInt64
@@ -724,10 +731,10 @@ func scanRows(rows *sql.Rows) ([]ResultRow, error) {
 			r.BinlogFile = binlogFile.String
 		}
 		if startPos.Valid {
-			r.StartPos = uint64(startPos.Int64)
+			r.StartPos = startPos.V
 		}
 		if endPos.Valid {
-			r.EndPos = uint64(endPos.Int64)
+			r.EndPos = endPos.V
 		}
 		if eventTimestamp.Valid {
 			r.EventTimestamp = eventTimestamp.Time
