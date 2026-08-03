@@ -47,6 +47,11 @@ type baselinesResponse struct {
 	Reconstruct bool                  `json:"reconstruct"`
 	Snapshots   []baselineSnapshotDTO `json:"snapshots"`
 	Truncated   bool                  `json:"truncated,omitempty"`
+	// Staleness is the panel headline: the worst verdict across each table's
+	// NEWEST snapshot (#1193). An old superseded snapshot being past coverage
+	// is routine — grading every row red on a healthy retention cadence would
+	// cry wolf, so the per-row verdicts inform and this field decides.
+	Staleness string `json:"staleness,omitempty"`
 }
 
 // handleBaselines serves GET /api/baselines: a read-only listing of the
@@ -91,16 +96,16 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	// Staleness floor (#1193): best-effort — an unopened bundle connection or
-	// an unreadable index leaves the verdict empty (unknown-shaped), never a
-	// fabricated "ok".
+	// Staleness floor (#1193): best-effort but never silent and never a
+	// fabricated verdict — an unopened bundle connection or an unreadable
+	// index yields the explicit "unknown".
 	var oldestDelta time.Time
-	if b.db != nil {
-		if od, err := status.OldestDeltaFromDB(r.Context(), b.db); err != nil {
-			slog.Warn("console: could not load delta-coverage floor for baseline staleness", "error", err)
-		} else {
-			oldestDelta = od
-		}
+	if b.db == nil {
+		slog.Warn("console: baseline staleness not evaluated — the server's index connection is not open")
+	} else if od, err := status.OldestDeltaFromDB(r.Context(), b.db, b.dbName); err != nil {
+		slog.Warn("console: could not load delta-coverage floor for baseline staleness", "error", err)
+	} else {
+		oldestDelta = od
 	}
 	var cur *baselineSnapshotDTO
 	var curTime time.Time
@@ -115,9 +120,7 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 				Time:     f.SnapshotTime.Format(consoleTSFormat),
 				AgeHours: now.Sub(f.SnapshotTime).Hours(),
 			}
-			if !oldestDelta.IsZero() {
-				dto.Staleness = string(status.BaselineStalenessFor(f.SnapshotTime, oldestDelta, now))
-			}
+			dto.Staleness = string(status.BaselineStalenessFor(f.SnapshotTime, oldestDelta, now))
 			if resp.Kind == "dir" {
 				if meta, err := baseline.ReadParquetMetadata(f.Path); err == nil {
 					dto.BinlogFile = meta.BinlogFile
@@ -135,6 +138,21 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 			cur = &resp.Snapshots[len(resp.Snapshots)-1]
 		}
 		cur.Tables = append(cur.Tables, f.Schema+"."+f.Table)
+	}
+	// Headline over ALL files (not just the listed page): newest per table.
+	newestPerTable := make(map[string]time.Time, len(files))
+	for _, f := range files {
+		k := f.Schema + "." + f.Table
+		if f.SnapshotTime.After(newestPerTable[k]) {
+			newestPerTable[k] = f.SnapshotTime
+		}
+	}
+	rank := map[string]int{"ok": 1, "unknown": 2, "aging": 3, "broken": 4}
+	for _, ts := range newestPerTable {
+		v := string(status.BaselineStalenessFor(ts, oldestDelta, now))
+		if rank[v] > rank[resp.Staleness] {
+			resp.Staleness = v
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

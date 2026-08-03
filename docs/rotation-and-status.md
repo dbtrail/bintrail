@@ -609,7 +609,9 @@ Schedule the timer to run once per hour. The drop operation is instant, but `REO
 ## Baseline staleness
 
 With `--baseline-dir`, `bintrail status` grades every baseline snapshot
-against the oldest available delta coverage (live partitions plus archives):
+against the oldest available delta coverage — the oldest **live partition**
+hour (partition existence is coverage, even if the hour recorded no writes)
+extended backwards by archives:
 `ok`, `aging` (the snapshot is older than 80% of the coverage span — the
 restore window is shrinking), or `broken` (the anchor predates coverage —
 full-table reconstruct through that window is impossible). A table whose

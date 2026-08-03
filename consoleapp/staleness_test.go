@@ -7,22 +7,38 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/notify"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 func TestWatchNotifier_BaselineStale(t *testing.T) {
 	n, f := testNotifier()
-	n.BaselineStale("wp", true, "shop.legacy: newest baseline predates coverage")
-	n.BaselineStale("wp", true, "shop.legacy: newest baseline predates coverage")
+	n.BaselineStale("wp", "dsn1", true, "shop.legacy", "2026-07-28T00:00:00Z")
+	n.BaselineStale("wp", "dsn1", true, "shop.legacy", "2026-07-28T00:00:00Z")
 	if len(f.events) != 1 || f.events[0].Event != "baseline_stale" || f.events[0].Severity != "critical" {
 		t.Fatalf("want one critical baseline_stale, got %+v", f.events)
 	}
-	n.BaselineStale("wp", false, "")
-	if len(f.events) != 2 || !f.events[1].Resolved {
+	if f.events[0].Details["tables"] != "shop.legacy" || f.events[0].Details["coverage_floor"] != "2026-07-28T00:00:00Z" {
+		t.Fatalf("details wrong: %+v", f.events[0].Details)
+	}
+	// The coverage floor advances every rotation cycle while the SAME tables
+	// stay broken — the edge detail is the table list precisely so this does
+	// not re-page hourly.
+	n.BaselineStale("wp", "dsn1", true, "shop.legacy", "2026-07-28T01:00:00Z")
+	if len(f.events) != 1 {
+		t.Fatalf("advancing floor with unchanged broken tables must not re-fire: %+v", f.events)
+	}
+	// A NEW table joining the broken set IS a new condition: immediate re-fire.
+	n.BaselineStale("wp", "dsn1", true, "shop.legacy, shop.orders", "2026-07-28T01:00:00Z")
+	if len(f.events) != 2 {
+		t.Fatalf("a new broken table must fire through the repeat window: %+v", f.events)
+	}
+	n.BaselineStale("wp", "dsn1", false, "", "")
+	if len(f.events) != 3 || !f.events[2].Resolved {
 		t.Fatalf("recovery must resolve once, got %+v", f.events)
 	}
-	n.BaselineStale("wp", false, "")
-	if len(f.events) != 2 {
+	n.BaselineStale("wp", "dsn1", false, "", "")
+	if len(f.events) != 3 {
 		t.Fatalf("healthy with no prior alert must stay silent, got %+v", f.events)
 	}
 }
@@ -67,6 +83,7 @@ func TestStalenessWatcher_runCycle(t *testing.T) {
 	}
 	w := &stalenessWatcher{
 		n: n, registry: reg,
+		unknownEdge:   notify.NewEdge(0),
 		listBaselines: func(context.Context, string) ([]reconstruct.BaselineFile, error) { return files, nil },
 		oldestDelta:   func(context.Context, string) (time.Time, error) { return oldest, nil },
 	}
@@ -77,11 +94,26 @@ func TestStalenessWatcher_runCycle(t *testing.T) {
 		t.Fatalf("healthy newest snapshot must not alert: %+v", f.events)
 	}
 
-	// The newest snapshot for a table slides past coverage: critical fires.
-	files = append(files, reconstruct.BaselineFile{Schema: "shop", Table: "legacy", SnapshotTime: oldest.Add(-2 * time.Hour)})
+	// The newest snapshots of two tables slide past coverage: ONE critical,
+	// carrying the full sorted broken set.
+	files = append(files,
+		reconstruct.BaselineFile{Schema: "shop", Table: "legacy", SnapshotTime: oldest.Add(-2 * time.Hour)},
+		reconstruct.BaselineFile{Schema: "shop", Table: "carts", SnapshotTime: oldest.Add(-3 * time.Hour)},
+	)
 	w.runCycle(context.Background())
 	if len(f.events) != 1 || f.events[0].Event != "baseline_stale" || f.events[0].Severity != "critical" {
-		t.Fatalf("broken newest snapshot must alert: %+v", f.events)
+		t.Fatalf("broken newest snapshots must alert once: %+v", f.events)
+	}
+	if f.events[0].Details["tables"] != "shop.carts, shop.legacy" {
+		t.Fatalf("detail must list ALL broken tables sorted: %+v", f.events[0].Details)
+	}
+
+	// Same broken set on the next cycle, floor advanced by rotation: silent.
+	oldestAdvanced := oldest.Add(time.Hour)
+	w.oldestDelta = func(context.Context, string) (time.Time, error) { return oldestAdvanced, nil }
+	w.runCycle(context.Background())
+	if len(f.events) != 1 {
+		t.Fatalf("unchanged broken set with an advanced floor must not re-fire: %+v", f.events)
 	}
 
 	// Unknown floor: the target is skipped whole — no fire, and crucially NO
@@ -92,9 +124,20 @@ func TestStalenessWatcher_runCycle(t *testing.T) {
 		t.Fatalf("unknown floor must neither fire nor resolve: %+v", f.events)
 	}
 
-	// Fresh baseline lands: the alert resolves once.
-	w.oldestDelta = func(context.Context, string) (time.Time, error) { return oldest, nil }
-	files = append(files, reconstruct.BaselineFile{Schema: "shop", Table: "legacy", SnapshotTime: now.Add(-time.Minute)})
+	// Unreadable baseline source: same skip-whole rule.
+	w.oldestDelta = func(context.Context, string) (time.Time, error) { return oldestAdvanced, nil }
+	w.listBaselines = func(context.Context, string) ([]reconstruct.BaselineFile, error) { return nil, errors.New("bucket gone") }
+	w.runCycle(context.Background())
+	if len(f.events) != 1 {
+		t.Fatalf("unreadable source must neither fire nor resolve: %+v", f.events)
+	}
+
+	// Fresh baselines land for both tables: the alert resolves once.
+	files = append(files,
+		reconstruct.BaselineFile{Schema: "shop", Table: "legacy", SnapshotTime: now.Add(-time.Minute)},
+		reconstruct.BaselineFile{Schema: "shop", Table: "carts", SnapshotTime: now.Add(-time.Minute)},
+	)
+	w.listBaselines = func(context.Context, string) ([]reconstruct.BaselineFile, error) { return files, nil }
 	w.runCycle(context.Background())
 	if len(f.events) != 2 || !f.events[1].Resolved {
 		t.Fatalf("fresh baseline must resolve the alert: %+v", f.events)

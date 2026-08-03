@@ -3,7 +3,11 @@ package status
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // Baseline staleness (#1193): full-table reconstruct = newest usable baseline
@@ -17,14 +21,21 @@ const (
 	BaselineOK     BaselineStalenessVerdict = "ok"
 	BaselineAging  BaselineStalenessVerdict = "aging"
 	BaselineBroken BaselineStalenessVerdict = "broken"
-	// BaselineUnknown = no evaluable delta floor (empty index, no archives).
-	// Unknown is never "ok" — the same rule every other verdict here follows.
+	// BaselineUnknown = no evaluable delta floor (unpartitioned/unreachable
+	// index, no archives). Unknown is never "ok" — the same rule every other
+	// verdict here follows.
 	BaselineUnknown BaselineStalenessVerdict = "unknown"
 )
 
 // baselineAgingFraction: a baseline older than this fraction of the delta
-// coverage span is "aging" — the restore window is shrinking, and continued
-// rotation will eventually break it.
+// coverage span is "aging" — the restore window is shrinking.
+//
+// Known bootstrap artifact: until rotation saturates retention, the span is
+// the install's age, so a young install reads "aging" within hours of its
+// first baseline. That is why "aging" stays an informational verdict on
+// status/console and is deliberately NOT wired to the webhook channel — an
+// alert that fires on every fresh install would be cried-wolf into a mute
+// before it ever mattered.
 const baselineAgingFraction = 0.8
 
 // BaselineStalenessFor grades one snapshot anchor against the oldest instant
@@ -46,38 +57,84 @@ func BaselineStalenessFor(snapshotTime, oldestDelta, now time.Time) BaselineStal
 	return BaselineOK
 }
 
-// OldestDelta is the earliest instant deltas are available from — archived
-// partitions extend live coverage backwards. Zero = unknown.
-func (c *CoverageInfo) OldestDelta() time.Time {
-	if c == nil {
-		return time.Time{}
-	}
+// OldestLivePartitionHour is the live half of the delta floor: the hour of
+// the oldest non-future binlog_events partition. Partition EXISTENCE is
+// coverage — the planner's own rule. MIN(event_timestamp) must NOT be used
+// here: it is the first WRITE, not the coverage start, and on a quiet
+// database it would fabricate a "broken" verdict (baseline taken before the
+// first write) on a perfectly restorable index.
+func OldestLivePartitionHour(parts []PartitionStat) time.Time {
 	var out time.Time
-	if c.EarliestEvent.Valid {
-		out = c.EarliestEvent.Time
-	}
-	if c.ArchiveEarliestHour.Valid && (out.IsZero() || c.ArchiveEarliestHour.Time.Before(out)) {
-		out = c.ArchiveEarliestHour.Time
+	for _, p := range parts {
+		t, ok := parsePartitionName(p.Name)
+		if !ok {
+			continue // p_future / malformed
+		}
+		if out.IsZero() || t.Before(out) {
+			out = t
+		}
 	}
 	return out
 }
 
-// OldestDeltaFromDB is the lean two-query sibling of LoadCoverage for callers
-// (the console baselines API, the watch staleness check) that need only the
-// floor. A missing archive_state table (older indexes) degrades to live
-// coverage alone, mirroring LoadCoverage's tolerance.
-func OldestDeltaFromDB(ctx context.Context, db *sql.DB) (time.Time, error) {
-	var c CoverageInfo
-	if err := db.QueryRowContext(ctx, `SELECT MIN(event_timestamp) FROM binlog_events`).Scan(&c.EarliestEvent); err != nil {
+// DeltaFloor combines the live-partition floor with the archive floor —
+// archives extend coverage backwards. Zero = unknown.
+func DeltaFloor(parts []PartitionStat, cov *CoverageInfo) time.Time {
+	out := OldestLivePartitionHour(parts)
+	if cov != nil && cov.ArchiveEarliestHour.Valid &&
+		(out.IsZero() || cov.ArchiveEarliestHour.Time.Before(out)) {
+		out = cov.ArchiveEarliestHour.Time
+	}
+	return out
+}
+
+// OldestDeltaFromDB computes the same floor for callers without a collected
+// StatusData (the console baselines API, the watch staleness check). Error
+// semantics are strict in the anti-cry-wolf direction: any failure that could
+// make the floor read LATER than reality — and so fabricate "broken" on
+// healthy archives — is returned (the caller degrades to unknown), never
+// swallowed. Only a missing archive_state table (older indexes) is tolerated.
+func OldestDeltaFromDB(ctx context.Context, db *sql.DB, dbName string) (time.Time, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT PARTITION_NAME FROM information_schema.PARTITIONS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events' AND PARTITION_NAME IS NOT NULL`, dbName)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("list live partitions: %w", err)
+	}
+	defer rows.Close()
+	var parts []PartitionStat
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return time.Time{}, err
+		}
+		parts = append(parts, PartitionStat{Name: name})
+	}
+	if err := rows.Err(); err != nil {
 		return time.Time{}, err
 	}
+	floor := OldestLivePartitionHour(parts)
+
 	var minPartition sql.NullString
-	if err := db.QueryRowContext(ctx, `SELECT MIN(partition_name) FROM archive_state`).Scan(&minPartition); err == nil && minPartition.Valid {
-		if t, ok := parsePartitionName(minPartition.String); ok {
-			c.ArchiveEarliestHour = sql.NullTime{Time: t, Valid: true}
+	if err := db.QueryRowContext(ctx, `SELECT MIN(partition_name) FROM archive_state`).Scan(&minPartition); err != nil {
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1146 {
+			return floor, nil // archive_state absent on older indexes — live floor only
+		}
+		return time.Time{}, fmt.Errorf("read archive floor: %w", err)
+	}
+	if minPartition.Valid {
+		t, ok := parsePartitionName(minPartition.String)
+		if !ok {
+			// Our own naming scheme failing to parse is drift, and silently
+			// dropping the archive floor would fabricate "broken".
+			return time.Time{}, fmt.Errorf("archive_state MIN(partition_name) %q is unparseable", minPartition.String)
+		}
+		if floor.IsZero() || t.Before(floor) {
+			floor = t
 		}
 	}
-	return c.OldestDelta(), nil
+	return floor, nil
 }
 
 // AnnotateBaselineStaleness stamps each entry's verdict in place. Every entry

@@ -2,10 +2,15 @@ package status
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-sql-driver/mysql"
 )
 
 func TestBaselineStalenessFor(t *testing.T) {
@@ -35,30 +40,116 @@ func TestBaselineStalenessFor(t *testing.T) {
 	}
 }
 
-func TestCoverageOldestDelta(t *testing.T) {
-	at := func(h int) sql.NullTime {
-		return sql.NullTime{Time: time.Date(2026, 8, 1, h, 0, 0, 0, time.UTC), Valid: true}
+func TestOldestLivePartitionHour(t *testing.T) {
+	if got := OldestLivePartitionHour(nil); !got.IsZero() {
+		t.Fatalf("no partitions must be unknown, got %v", got)
 	}
-	var nilCov *CoverageInfo
-	if !nilCov.OldestDelta().IsZero() {
-		t.Fatal("nil coverage must be unknown")
+	// Only p_future / malformed names: still unknown, never a fabricated floor.
+	parts := []PartitionStat{{Name: "p_future"}, {Name: "garbage"}}
+	if got := OldestLivePartitionHour(parts); !got.IsZero() {
+		t.Fatalf("unparseable-only partitions must be unknown, got %v", got)
 	}
-	if got := (&CoverageInfo{}).OldestDelta(); !got.IsZero() {
-		t.Fatalf("empty coverage must be unknown, got %v", got)
+	parts = append(parts, PartitionStat{Name: "p_2026080103"}, PartitionStat{Name: "p_2026080101"})
+	want := time.Date(2026, 8, 1, 1, 0, 0, 0, time.UTC)
+	if got := OldestLivePartitionHour(parts); !got.Equal(want) {
+		t.Fatalf("oldest live partition hour = %v, want %v", got, want)
+	}
+}
+
+func TestDeltaFloor(t *testing.T) {
+	at := func(h int) time.Time { return time.Date(2026, 8, 1, h, 0, 0, 0, time.UTC) }
+	live := []PartitionStat{{Name: "p_2026080110"}, {Name: "p_future"}}
+	arch := func(h int) *CoverageInfo {
+		return &CoverageInfo{ArchiveEarliestHour: sql.NullTime{Time: at(h), Valid: true}}
+	}
+	if got := DeltaFloor(nil, nil); !got.IsZero() {
+		t.Fatalf("no partitions, no coverage must be unknown, got %v", got)
 	}
 	// Archives extend live coverage backwards; the earlier of the two wins.
-	c := &CoverageInfo{EarliestEvent: at(10), ArchiveEarliestHour: at(3)}
-	if got := c.OldestDelta(); got != at(3).Time {
+	if got := DeltaFloor(live, arch(3)); !got.Equal(at(3)) {
 		t.Fatalf("archive floor must win when earlier: %v", got)
 	}
-	c = &CoverageInfo{EarliestEvent: at(2), ArchiveEarliestHour: at(5)}
-	if got := c.OldestDelta(); got != at(2).Time {
+	if got := DeltaFloor(live, arch(12)); !got.Equal(at(10)) {
 		t.Fatalf("live floor must win when earlier: %v", got)
 	}
-	c = &CoverageInfo{ArchiveEarliestHour: at(7)}
-	if got := c.OldestDelta(); got != at(7).Time {
+	if got := DeltaFloor(nil, arch(7)); !got.Equal(at(7)) {
 		t.Fatalf("archive-only coverage must count: %v", got)
 	}
+	if got := DeltaFloor(live, &CoverageInfo{}); !got.Equal(at(10)) {
+		t.Fatalf("live-only coverage must count: %v", got)
+	}
+}
+
+func TestOldestDeltaFromDB(t *testing.T) {
+	partsQ := regexp.QuoteMeta("SELECT PARTITION_NAME FROM information_schema.PARTITIONS")
+	archQ := regexp.QuoteMeta("SELECT MIN(partition_name) FROM archive_state")
+	partRows := func(names ...string) *sqlmock.Rows {
+		r := sqlmock.NewRows([]string{"PARTITION_NAME"})
+		for _, n := range names {
+			r.AddRow(n)
+		}
+		return r
+	}
+	newDB := func(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
+		t.Helper()
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return db, mock
+	}
+
+	t.Run("archive floor wins when earlier", func(t *testing.T) {
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110", "p_future"))
+		mock.ExpectQuery(archQ).WillReturnRows(sqlmock.NewRows([]string{"min"}).AddRow("p_2026080103"))
+		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
+		if err != nil || !got.Equal(time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)) {
+			t.Fatalf("got %v, %v", got, err)
+		}
+	})
+
+	t.Run("missing archive_state table is tolerated (older index)", func(t *testing.T) {
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
+		mock.ExpectQuery(archQ).WillReturnError(&mysql.MySQLError{Number: 1146, Message: "Table 'binlog_index.archive_state' doesn't exist"})
+		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
+		if err != nil || !got.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) {
+			t.Fatalf("got %v, %v", got, err)
+		}
+	})
+
+	t.Run("any other archive_state error propagates", func(t *testing.T) {
+		// The anti-cry-wolf direction: a swallowed archive error would make the
+		// floor read LATER than reality and fabricate "broken" on healthy
+		// archives. The caller must degrade to unknown instead.
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
+		mock.ExpectQuery(archQ).WillReturnError(&mysql.MySQLError{Number: 1045, Message: "access denied"})
+		if _, err := OldestDeltaFromDB(context.Background(), db, "binlog_index"); err == nil {
+			t.Fatal("non-1146 archive error must propagate")
+		}
+	})
+
+	t.Run("unparseable archive partition name propagates", func(t *testing.T) {
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
+		mock.ExpectQuery(archQ).WillReturnRows(sqlmock.NewRows([]string{"min"}).AddRow("weird"))
+		if _, err := OldestDeltaFromDB(context.Background(), db, "binlog_index"); err == nil {
+			t.Fatal("unparseable archive floor must propagate, not silently drop")
+		}
+	})
+
+	t.Run("empty index and empty archive is unknown, not an error", func(t *testing.T) {
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows())
+		mock.ExpectQuery(archQ).WillReturnRows(sqlmock.NewRows([]string{"min"}).AddRow(nil))
+		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
+		if err != nil || !got.IsZero() {
+			t.Fatalf("got %v, %v — want zero, nil", got, err)
+		}
+	})
 }
 
 func TestOverallBaselineStaleness_newestPerTable(t *testing.T) {

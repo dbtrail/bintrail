@@ -302,7 +302,7 @@ func foldEventWindow(ctx context.Context, fc foldConfig) (*foldResult, error) {
 		// unarchived.
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) && fc.Opts.Since != nil {
-			return nil, fmt.Errorf("fetch events: %w — the delta window starts at this table's newest usable baseline anchor (%s); if the missing hours were rotated out unarchived, take a fresh baseline (bintrail dump + bintrail baseline)",
+			return nil, fmt.Errorf("fetch events: %w — the delta window starts at this table's newest usable baseline anchor (%s); if archive_state drifted, `bintrail archive reconcile --repair` is the cheap fix, and if the missing hours were rotated out unarchived, take a fresh baseline (bintrail dump + bintrail baseline)",
 				err, fc.Opts.Since.UTC().Format(time.RFC3339))
 		}
 		return nil, fmt.Errorf("fetch events: %w", err)

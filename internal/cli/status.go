@@ -115,8 +115,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				})
 			}
 			// Staleness (#1193): grade every snapshot against the oldest
-			// available delta coverage the sections above already loaded.
-			status.AnnotateBaselineStaleness(data.Baselines, data.Coverage.OldestDelta(), time.Now().UTC())
+			// available delta coverage — the live-partition floor (partition
+			// existence = coverage) extended backwards by archives.
+			status.AnnotateBaselineStaleness(data.Baselines, status.DeltaFloor(data.Parts, data.Coverage), time.Now().UTC())
 		}
 	}
 
