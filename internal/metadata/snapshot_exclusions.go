@@ -50,3 +50,42 @@ func ensureSnapshotExclusionsTable(ctx context.Context, db *sql.DB) error {
 	}
 	return nil
 }
+
+// loadSnapshotExclusions returns the "schema.table" → reason map a degraded
+// snapshot (#1051) recorded for snapshotID. A missing snapshot_exclusions
+// table is NOT an error (see the DDLSnapshotExclusions doc: an index that only
+// ever took strict snapshots simply has no exclusions) — nil map, nil error.
+func loadSnapshotExclusions(db *sql.DB, snapshotID int) (map[string]string, error) {
+	var exists bool
+	if err := db.QueryRow(
+		"SELECT COUNT(*) > 0 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'snapshot_exclusions'",
+	).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("metadata: check snapshot_exclusions table: %w", err)
+	}
+	if !exists {
+		return nil, nil
+	}
+	rows, err := db.Query(
+		"SELECT schema_name, table_name, reason FROM snapshot_exclusions WHERE snapshot_id = ?",
+		snapshotID)
+	if err != nil {
+		return nil, fmt.Errorf("metadata: query snapshot_exclusions for snapshot %d: %w", snapshotID, err)
+	}
+	defer rows.Close()
+
+	var excluded map[string]string
+	for rows.Next() {
+		var schemaName, tableName, reason string
+		if err := rows.Scan(&schemaName, &tableName, &reason); err != nil {
+			return nil, fmt.Errorf("metadata: scan snapshot_exclusions row: %w", err)
+		}
+		if excluded == nil {
+			excluded = make(map[string]string)
+		}
+		excluded[schemaName+"."+tableName] = reason
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("metadata: iterate snapshot_exclusions: %w", err)
+	}
+	return excluded, nil
+}

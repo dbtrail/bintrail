@@ -464,6 +464,10 @@ func handleRows(
 	tm, err := resolver.Resolve(schema, table)
 	if err != nil {
 		// Table not in snapshot — warn and skip all rows for this event.
+		// Resolve's error text carries the diagnosis: for a table the
+		// degraded snapshot EXCLUDED by validation (#1051) it names the
+		// exclusion reason and the real fix (give the table a PK / InnoDB),
+		// not the non-converging "re-run `bintrail snapshot`" (#1199).
 		logger.Warn("table not in snapshot — skipping",
 			"file", filename,
 			"pos", binlogEv.Header.LogPos,
@@ -473,8 +477,13 @@ func handleRows(
 		// whose consumer-side resolver swap landed too late for these buffered
 		// rows). Record it so ParseFile fails the file instead of completing it
 		// with an undetected gap (#778). Pre-snapshot events stay a warn-only
-		// historical skip.
-		if gapTracker != nil && !isSnapshotExcludedSchema(schema) && !eventPredatesSnapshot(binlogEv, resolver) {
+		// historical skip. A VALIDATION-EXCLUDED table (#1051) is carved out
+		// like the system schemas: it is absent from the snapshot on purpose
+		// and re-snapshotting excludes it again, so failing the file would pin
+		// it behind a remediation that cannot converge (#1199) — its skips
+		// stay visible via the per-event WARN above and the skip ledger below.
+		_, excludedByValidation := resolver.ExclusionReason(schema, table)
+		if gapTracker != nil && !excludedByValidation && !isSnapshotExcludedSchema(schema) && !eventPredatesSnapshot(binlogEv, resolver) {
 			if gapTracker.record(fmt.Sprintf("%s.%s not in snapshot %d at %s:%d", schema, table, schemaVersion, filename, binlogEv.Header.LogPos)) {
 				logger.Error("schema gap: skipping rows for a table absent from the snapshot at-or-after snapshot time — the snapshot is stale; this file will be marked failed (run `bintrail snapshot`, then re-index)",
 					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)

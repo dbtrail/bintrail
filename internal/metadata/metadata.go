@@ -106,6 +106,14 @@ type Resolver struct {
 	// event (before it).
 	snapshotTime time.Time
 	tables       map[string]*TableMeta // key: "schema.table"
+	// excluded maps "schema.table" → validation reason for tables a DEGRADED
+	// snapshot (TakeSnapshotExcludingInvalid, #1051) deliberately left out.
+	// It lets consumers tell "excluded by validation — re-snapshotting
+	// excludes it again, the table itself must change" apart from "absent
+	// because the snapshot is stale — `bintrail snapshot` converges" (#1199).
+	// Nil when the snapshot recorded no exclusions (strict snapshots always)
+	// or the constructor has no index DB to read them from.
+	excluded map[string]string
 }
 
 // NewResolver loads all table metadata for the given snapshot from the index
@@ -154,6 +162,18 @@ func NewResolver(db *sql.DB, snapshotID int) (*Resolver, error) {
 			"snapshot_id", snapshotID, "error", err)
 	} else if snapTime.Valid {
 		r.snapshotTime = snapTime.Time
+	}
+
+	// Validation exclusions of a degraded snapshot (#1051). Best-effort like
+	// the snapshot time, but the failure must be in the logs: without them an
+	// excluded table's skips are misdiagnosed as a stale snapshot, and file
+	// mode marks files failed with a remediation ("run `bintrail snapshot`")
+	// that cannot converge (#1199).
+	if excluded, exErr := loadSnapshotExclusions(db, snapshotID); exErr != nil {
+		slog.Warn("could not read snapshot_exclusions — skips on a validation-excluded table will be misdiagnosed as a stale snapshot (file mode may fail files with a non-converging remediation)",
+			"snapshot_id", snapshotID, "error", exErr)
+	} else {
+		r.excluded = excluded
 	}
 
 	stats, err := scanSnapshotRows(rows, r.tables)
@@ -409,6 +429,14 @@ func NewResolverFromTablesAt(snapshotID int, snapshotTime time.Time, tables map[
 	return &Resolver{snapshotID: snapshotID, snapshotTime: snapshotTime, tables: tables}
 }
 
+// NewResolverFromTablesAtExcluding is NewResolverFromTablesAt with the
+// snapshot's validation exclusions ("schema.table" → reason, #1051), for tests
+// exercising the excluded-table skip diagnosis (#1199). Production resolvers
+// load exclusions from snapshot_exclusions in NewResolver.
+func NewResolverFromTablesAtExcluding(snapshotID int, snapshotTime time.Time, tables map[string]*TableMeta, excluded map[string]string) *Resolver {
+	return &Resolver{snapshotID: snapshotID, snapshotTime: snapshotTime, tables: tables, excluded: excluded}
+}
+
 // SnapshotID returns the snapshot ID this resolver was loaded from.
 func (r *Resolver) SnapshotID() int { return r.snapshotID }
 
@@ -462,6 +490,14 @@ func (r *Resolver) Resolve(schema, table string) (*TableMeta, error) {
 	key := schema + "." + table
 	tm, ok := r.tables[key]
 	if !ok {
+		// A validation-excluded table (#1051) is absent ON PURPOSE, and
+		// re-snapshotting excludes it again — suggesting `bintrail snapshot`
+		// here would send the operator down a remediation that can never
+		// converge (#1199). Tell the truth: the table itself must change.
+		if reason, excludedByValidation := r.excluded[key]; excludedByValidation {
+			return nil, fmt.Errorf("table %s.%s is excluded from snapshot %d (%s) — the table is not capturable as-is and re-snapshotting excludes it again; to capture it, add an explicit primary key and use InnoDB, then re-run `bintrail snapshot`; otherwise leave it out of --schemas/--tables",
+				schema, table, r.snapshotID, reason)
+		}
 		if r.snapshotID == 0 {
 			// Per-table-newest union resolvers (NewLatestPerTableResolver)
 			// span many snapshot_ids; "snapshot 0" would misread as a real id.
@@ -472,6 +508,16 @@ func (r *Resolver) Resolve(schema, table string) (*TableMeta, error) {
 			schema, table, r.snapshotID)
 	}
 	return tm, nil
+}
+
+// ExclusionReason reports whether schema.table was deliberately excluded from
+// this resolver's snapshot by validation (no explicit PK / non-InnoDB,
+// TakeSnapshotExcludingInvalid #1051) and, if so, why. Consumers use it to
+// tell a non-converging permanent skip apart from a stale snapshot (#1199):
+// for an excluded table, re-running `bintrail snapshot` excludes it again.
+func (r *Resolver) ExclusionReason(schema, table string) (string, bool) {
+	reason, ok := r.excluded[schema+"."+table]
+	return reason, ok
 }
 
 // MapRow maps a binlog row ([]any in column ordinal order) to a named
