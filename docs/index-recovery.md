@@ -1,5 +1,9 @@
 # Index loss and recovery — `bintrail restore-index`
 
+> This runbook assumes the S3 archive tier survived the incident. To make
+> that assumption hold against ransomware or a stolen credential, put the
+> archives on an S3 Object Lock bucket — see [object-lock.md](object-lock.md).
+
 The index database is the system of record, but it is also just a MySQL
 database — disks die, volumes get deleted. The archive tier is the answer to
 "who backs up the backup": `bintrail restore-index` turns the Parquet

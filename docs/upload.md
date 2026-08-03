@@ -31,6 +31,11 @@ This recursively walks the source directory and uploads every `*.parquet` file t
 
 ## AWS Credentials
 
+> Uploading to an S3 **Object Lock** bucket (ransomware-proof archives) works
+> with no extra flags — see [object-lock.md](object-lock.md) for the bucket
+> recipe and the `bintrail doctor --archive-s3` posture check.
+
+
 `bintrail upload` uses the standard AWS SDK credential chain. The SDK checks these sources **in order** — the first one that provides valid credentials wins:
 
 ### 1. Environment variables (recommended for CI/CD and automation)
