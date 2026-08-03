@@ -3,6 +3,7 @@ package console
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -63,6 +64,7 @@ const verifyHistoryVersion = 1
 type VerifyHistory struct {
 	mu      sync.Mutex
 	path    string
+	found   bool
 	servers map[string][]VerifyRunRecord
 }
 
@@ -85,6 +87,7 @@ func OpenVerifyHistory(path string) (*VerifyHistory, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read verify history %s: %w", path, err)
 	}
+	h.found = true
 	if len(data) == 0 {
 		return h, nil
 	}
@@ -141,6 +144,23 @@ func (h *VerifyHistory) List(serverID string) []VerifyRunRecord {
 		out[len(recs)-1-i] = r
 	}
 	return out
+}
+
+// Found reports whether a history file existed when this history was opened.
+// A consumer that reports on verification activity MUST keep this distinct
+// from an opened-but-empty history: the file is written only by
+// `bintrail-console watch`, so a CLI-only deployment has no history at all,
+// and rendering that absence like "no failed runs" would state a clean
+// verification record for a period nothing ever verified.
+func (h *VerifyHistory) Found() bool { return h.found }
+
+// ServerIDs returns the server ids present in the history, sorted, so a
+// consumer can enumerate what was recorded without access to the server
+// registry (a run's server may since have been removed from it).
+func (h *VerifyHistory) ServerIDs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Sorted(maps.Keys(h.servers))
 }
 
 // save writes the file atomically. Callers hold h.mu. Same temp-file + fsync

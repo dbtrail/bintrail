@@ -127,6 +127,69 @@ func TestOpenVerifyHistory_RefusesCorruptAndNewer(t *testing.T) {
 	}
 }
 
+// Found is about the FILE, not the records: "this deployment never ran the
+// scheduled verifier" and "it ran and nothing failed" are both an empty
+// List, and a consumer that reports on verification activity has to tell them
+// apart or it states a clean record for a period nothing ever verified.
+func TestVerifyHistory_FoundSeparatesAbsentFromEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "console-verify-history.json")
+
+	h, err := OpenVerifyHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Found() {
+		t.Fatal("Found() is true for a history file that does not exist")
+	}
+	if ids := h.ServerIDs(); len(ids) != 0 {
+		t.Fatalf("absent history has server ids: %v", ids)
+	}
+
+	// An existing file with zero records still counts as found — the history
+	// is present, it simply has nothing in this window.
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	empty, err := OpenVerifyHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !empty.Found() {
+		t.Fatal("Found() is false for an existing (empty) history file")
+	}
+
+	if err := h.Append(VerifyRunRecord{
+		ServerID: "srv1", Trigger: VerifyTriggerScheduled,
+		VerifyStatus: VerifyStatus{State: "succeeded"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenVerifyHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.Found() {
+		t.Fatal("Found() is false after a run was recorded")
+	}
+}
+
+func TestVerifyHistory_ServerIDsEnumeratesSorted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "h.json")
+	h, err := OpenVerifyHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"srv2", "srv1", "srv2"} {
+		if err := h.Append(VerifyRunRecord{ServerID: id, VerifyStatus: VerifyStatus{State: "succeeded"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := h.ServerIDs()
+	if len(got) != 2 || got[0] != "srv1" || got[1] != "srv2" {
+		t.Fatalf("ServerIDs() = %v, want [srv1 srv2]", got)
+	}
+}
+
 func TestDefaultVerifyHistoryPath_SiblingOfRegistry(t *testing.T) {
 	got := DefaultVerifyHistoryPath("/etc/bintrail/console-servers.yaml")
 	if got != "/etc/bintrail/console-verify-history.json" {
