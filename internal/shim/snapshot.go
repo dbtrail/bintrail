@@ -33,10 +33,31 @@ func snapshotSincePos(ctx context.Context, baselinePath string, logger *slog.Log
 			"schema", schema, "table", table, "path", baselinePath, "error", err)
 		return nil
 	}
+	// Rendering-GUC stamp check (#921) rides the metadata read both _snapshot
+	// paths (single-row and full-table) already pay here — no second read. It
+	// must run BEFORE the MySQL-anchor early return below: a PostgreSQL
+	// baseline records an LSN anchor and no binlog file/pos.
+	warnRenderGUCsMismatch(bmeta, logger, schema, table, baselinePath)
 	if bmeta.BinlogFile == "" || bmeta.BinlogPos <= 0 {
 		return nil
 	}
 	return &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
+}
+
+// warnRenderGUCsMismatch flags a PostgreSQL baseline (LSN anchor present)
+// whose rendering-GUC stamp is absent (pre-pin) or differs from the current
+// pin (#593/#921): the baseline↔delta merge is an exact text join, so on a
+// server whose TimeZone/DateStyle/extra_float_digits/bytea_output/
+// IntervalStyle defaults differ from the pinned values its GUC-sensitive text
+// will not join post-pin deltas. Same predicate as the CLI single-row warn
+// (internal/cli/reconstruct.go). Warn-only server-side, consistent with how
+// the shim handles FindBaseline's StaleWarning (#466) — an in-band MySQL
+// signal is deferred.
+func warnRenderGUCsMismatch(bmeta baseline.DumpMetadata, logger *slog.Logger, schema, table, baselinePath string) {
+	if bmeta.LSN != 0 && bmeta.RenderGUCs != baseline.RenderGUCsPinned {
+		logger.Warn("shim: _snapshot baseline's rendering-GUC stamp does not match the current pin (#593) — it predates GUC pinning or was produced under a different pin; its GUC-sensitive text (timestamps, floats, bytea, intervals) may not match newer deltas; re-run `bintrail-pg baseline` to refresh it",
+			"schema", schema, "table", table, "path", baselinePath, "baseline_render_gucs", bmeta.RenderGUCs)
+	}
 }
 
 // runSnapshot resolves a _snapshot query. _snapshot is the

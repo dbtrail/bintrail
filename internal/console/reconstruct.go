@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/ext"
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -325,6 +326,15 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "find baseline: "+err.Error())
 		return
 	}
+	// Read the baseline's Parquet metadata for the rendering-GUC stamp check
+	// (#921). Best-effort: on a read failure bmeta stays zero (LSN 0) and the
+	// warning is simply not raised — the fold below never needs this metadata
+	// (deltas anchor on snapshotTime).
+	bmeta, bmetaErr := baseline.ReadParquetMetadataAny(ctx, path)
+	if bmetaErr != nil {
+		slog.Debug("reconstruct: could not read baseline metadata for the render-GUCs check",
+			"path", path, "error", bmetaErr)
+	}
 	// PK column metadata from the snapshot in effect when the baseline was
 	// taken (#1159), enabling the fixed BINARY(n) pad-and-retry inside
 	// ReadBaselineRow (#1155/#1157): a key copied out of the events view
@@ -412,11 +422,10 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		At:           atTime.Format(consoleTSFormat),
 		BaselineTime: snapshotTime.Format(consoleTSFormat),
 		EventCount:   len(rows),
-		// Surface a stale-baseline fallback (#466) alongside coverage-gap
-		// warnings: the table is absent from a newer snapshot, so Time-travel is
-		// reconstructing from an older one. The server already logged it; this
-		// puts it in front of the operator.
-		Warnings: appendStaleWarning(gapWarnings(plan), stale),
+		// Surface a stale-baseline fallback (#466) and a rendering-GUC stamp
+		// mismatch (#921) alongside coverage-gap warnings: the server already
+		// logs these; this puts them in front of the operator.
+		Warnings: appendRenderGUCsWarning(appendStaleWarning(gapWarnings(plan), stale), bmeta),
 	}
 
 	// 3. Fold baseline + deltas. baselineRow may be nil. "existed" = the row was
@@ -521,6 +530,24 @@ func appendStaleWarning(warnings []string, stale reconstruct.StaleWarning) []str
 		return warnings
 	}
 	return append(warnings, "stale_baseline: "+stale.Message)
+}
+
+// appendRenderGUCsWarning adds a "render_gucs_mismatch: …" entry when the
+// baseline is a PostgreSQL one (LSN anchor present) whose rendering-GUC stamp
+// is absent (pre-pin) or differs from the current pin (#593/#921) — the same
+// predicate as the CLI single-row warn (internal/cli/reconstruct.go). The
+// baseline↔delta merge is an exact text join, so a mismatched stamp means the
+// baseline's GUC-sensitive text may not join post-pin deltas. In-band like the
+// stale_baseline entry (#466). A no-op for MySQL baselines (LSN 0, which also
+// covers a failed metadata read) and matching stamps, so callers can wire it
+// unconditionally.
+func appendRenderGUCsWarning(warnings []string, bmeta baseline.DumpMetadata) []string {
+	if bmeta.LSN == 0 || bmeta.RenderGUCs == baseline.RenderGUCsPinned {
+		return warnings
+	}
+	return append(warnings, fmt.Sprintf(
+		"render_gucs_mismatch: this baseline's rendering-GUC stamp (%q) does not match the current pin — it predates GUC pinning or was produced under a different pin; its GUC-sensitive text (timestamps, floats, bytea, intervals) may not match newer deltas; re-run `bintrail-pg baseline` to refresh it",
+		bmeta.RenderGUCs))
 }
 
 // isTrue reports whether a query-param flag is set to a truthy value.
