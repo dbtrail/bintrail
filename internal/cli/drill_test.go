@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,8 +66,10 @@ func TestDrillLoadTable_ordersSchemaBeforeChunks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	// Ordered: database, USE, schema file, then chunks in Files order —
-	// and the metadata file is never applied.
+	// Ordered (sqlmock's default ordered matching IS the assertion here):
+	// session setup, database, USE, schema file, then chunks in Files order
+	// — and the metadata file is never applied.
+	expectLoadSession(mock)
 	mock.ExpectExec("CREATE DATABASE IF NOT EXISTS `shop`").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("USE `shop`").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("CREATE TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
@@ -79,6 +82,70 @@ func TestDrillLoadTable_ordersSchemaBeforeChunks(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func expectLoadSession(mock sqlmock.Sqlmock) {
+	mock.ExpectExec("SET NAMES binary").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("FOREIGN_KEY_CHECKS").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("sql_mode").WillReturnResult(sqlmock.NewResult(0, 0))
+}
+
+// TestDrillTable_verdicts pins the verdict wiring itself: fail-by-default,
+// the count comparison, and the binlog-only refusal — the halves a
+// regression could quietly turn into a rubber stamp.
+func TestDrillTable_verdicts(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"shop.orders-schema.sql": "CREATE TABLE `orders` (id INT PRIMARY KEY)",
+		"shop.orders.00000.sql":  "INSERT INTO `shop`.`orders` (`id`) VALUES (1), (2), (3);\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rep := func() *reconstruct.TableReport {
+		return &reconstruct.TableReport{Schema: "shop", Table: "orders", RowsWritten: 3,
+			Files: []string{"shop.orders-schema.sql", "shop.orders.00000.sql"}}
+	}
+	newDB := func(t *testing.T, count int64) *sql.DB {
+		t.Helper()
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		expectLoadSession(mock)
+		mock.ExpectExec("CREATE DATABASE").WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec("USE").WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec("CREATE TABLE").WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectExec("VALUES").WillReturnResult(sqlmock.NewResult(0, 3))
+		mock.ExpectQuery(`COUNT\(\*\)`).WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(count))
+		return db
+	}
+
+	got := drillTable(context.Background(), newDB(t, 3), dir, rep())
+	if got.Status != "pass" || got.RowsLoaded != 3 || got.Error != "" {
+		t.Fatalf("matching count must pass: %+v", got)
+	}
+
+	got = drillTable(context.Background(), newDB(t, 2), dir, rep())
+	if got.Status != "fail" || !strings.Contains(got.Error, "loaded 2 rows, dump wrote 3") {
+		t.Fatalf("count mismatch must fail with both numbers: %+v", got)
+	}
+
+	// Binlog-only: refused up front — no statement ever reaches the target.
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	r := rep()
+	r.BinlogOnly = true
+	got = drillTable(context.Background(), db, dir, r)
+	if got.Status != "fail" || !got.BinlogOnly || !strings.Contains(got.Error, "baseline") {
+		t.Fatalf("binlog-only must fail without loading: %+v", got)
 	}
 }
 

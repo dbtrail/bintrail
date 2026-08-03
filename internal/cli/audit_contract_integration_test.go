@@ -310,7 +310,11 @@ func drillContractFixture(t *testing.T, srcSchema string) (dsn, baselineDir stri
 		(snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, is_nullable, is_generated)
 		VALUES (1, UTC_TIMESTAMP(), ?, 'orders', 'status', 2, '', 'varchar', 'NO', 0)`, srcSchema)
 
-	createSQL := "CREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n"
+	// VERBATIM mydumper shape — the /*!…*/ SET preamble makes the schema
+	// file multi-statement, exactly what a real `bintrail baseline` stores
+	// (a single-statement synthetic here would hide load-session bugs; it
+	// did once).
+	createSQL := "/*!40101 SET NAMES binary*/;\n/*!40014 SET FOREIGN_KEY_CHECKS=0*/;\nCREATE TABLE `orders` (\n  `id` INT NOT NULL,\n  `status` VARCHAR(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n"
 	baselineDir = t.TempDir()
 	h1 := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Hour)
 	h2 := h1.Add(time.Hour)

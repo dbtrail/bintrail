@@ -54,7 +54,10 @@ volumes:
   drill-scratch-data:     # THROWAWAY datadir for the `drill` profile's scratch
                           # MySQL. Never holds anything worth keeping — wipe it
                           # between drills with:
-                          #   docker compose --profile drill down -v
+                          #   docker compose --profile drill rm -sf drill-mysql
+                          #   docker volume rm <project>_drill-scratch-data
+                          # NEVER `docker compose down -v` — it also removes
+                          # the INDEX volumes above (your system of record).
 
 services:
 
@@ -592,7 +595,10 @@ services:
   # never launches or supervises it — it only loads into the DSN:
   #   docker compose --profile drill up -d drill-mysql
   #   bintrail drill --target-dsn "root:${DRILL_MYSQL_PASSWORD:-drill}@tcp(127.0.0.1:13307)/" ...
-  #   docker compose --profile drill down -v   # wipe the scratch afterwards
+  #   # wipe ONLY the scratch afterwards (never `down -v`: that also removes
+  #   # the index volumes — the system of record):
+  #   docker compose --profile drill rm -sf drill-mysql
+  #   docker volume rm <project>_drill-scratch-data
   drill-mysql:
     profiles: ["drill"]
     image: mysql:8.4.9

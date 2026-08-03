@@ -25,11 +25,17 @@ The intermediate dump lives in a temp directory: removed on success, **kept
 on failure** so you can inspect exactly what didn't load. `--output DIR`
 pins it and always keeps it.
 
+A table with **no usable baseline** (drill would fall back to binlog-only
+reconstruction, i.e. an empty starting table) always **fails** with an
+explicit reason — a rehearsal that never touched a baseline must not read
+PASS.
+
 ## What drill proves — and what it doesn't
 
-Drill proves the **restore pipeline**: the dump is loadable, complete, and
-you know its duration. Value-level fidelity of reconstructed content against
-the source is [`verify`](query-and-recovery.md)'s job — it compares
+Drill proves the **restore pipeline**: the dump loads, it contains exactly
+what the dump writer emitted, and you know the duration. Value-level
+fidelity of reconstructed content against
+the source is [`verify`](verify.md)'s job — it compares
 normalized content digests and explains mismatches row by row. The two are
 complementary: `verify` says *the data is right*, `drill` says *the restore
 works and takes N seconds*.
@@ -49,7 +55,11 @@ bintrail drill \
   --tables shop.orders,shop.users \
   --target-dsn "root:${DRILL_MYSQL_PASSWORD:-drill}@tcp(127.0.0.1:13307)/"
 
-docker compose --profile drill down -v   # wipe the scratch afterwards
+# Wipe ONLY the scratch afterwards. NEVER `docker compose down -v` here —
+# that removes every volume in the compose file, INCLUDING the index
+# datadir (your system of record).
+docker compose --profile drill rm -sf drill-mysql
+docker volume rm "$(basename "$PWD")_drill-scratch-data"
 ```
 
 ## The monthly runbook
@@ -72,7 +82,7 @@ RTO trend, not a hope.
 | Flag | Meaning |
 |---|---|
 | `--index-dsn` | The bintrail index (required). |
-| `--target-dsn` | The scratch MySQL to load into (required; refused unless the drilled schemas are absent there). |
+| `--target-dsn` | The scratch MySQL to load into (required; refused if the target already holds any table in the drilled schemas). |
 | `--tables` | Comma-separated `schema.table` list (required). |
 | `--at` | Point in time to restore to (default now; accepts the same forms as `reconstruct --at`). |
 | `--baseline-dir` / `--baseline-s3` | Where baselines live (one required — a full-table restore starts from a baseline). |
