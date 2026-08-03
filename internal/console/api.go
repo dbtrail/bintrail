@@ -513,8 +513,13 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 
 // handleStatus serves GET /api/status — index health, partitions, coverage,
 // stream lag, archives. Reuses status.CollectStatus + WriteJSON verbatim;
-// that surface exposes only aggregate server metadata, never per-event actor
-// attribution, so it stays inside the free query_explorer boundary.
+// that surface exposes only aggregate server metadata — never per-event actor
+// attribution for INDEXED row history (the paid forensics surface) — so it
+// stays inside the free query_explorer boundary. The one deliberate carve-out
+// (#999): capture_health may carry the last DROPPED statement's file/pos/
+// keyword/connection id. That event is NOT in the index — the datum exists to
+// debug capture configuration (binlog_format), not to query row history, and
+// the issue's acceptance placed it in OSS `status` explicitly.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	b := s.resolveOr(w, r)
 	if b == nil {

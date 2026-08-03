@@ -123,7 +123,20 @@ type StreamStateInfo struct {
 type CaptureSkipStat struct {
 	Count  int64     `json:"count"`
 	LastAt time.Time `json:"last_at"`
+	// Last-seen attribution (#999), stamped by the capture daemon for the most
+	// recent skip of a reason — present only for reasons whose detection site
+	// stamps it (see parser.SkipStat, the single source of truth for which do).
+	LastFile          string `json:"last_file,omitempty"`
+	LastPos           uint64 `json:"last_pos,omitempty"`
+	LastStatementType string `json:"last_statement_type,omitempty"`
+	LastConnectionID  uint32 `json:"last_connection_id,omitempty"`
 }
+
+// CaptureSkipReasonStatementFormatDML mirrors parser.SkipStatementFormatDML —
+// the persisted reason key for STATEMENT/MIXED-format DML drops (#999). Kept as
+// an independent decl for the same reason CaptureSkipStat is: this display
+// package deliberately does not import the binlog parser.
+const CaptureSkipReasonStatementFormatDML = "statement_format_dml"
 
 // ParseCaptureSkips decodes the persisted capture_skips document. ok is false
 // when the verdict is not evaluable (no column / no skip-aware daemon /
@@ -683,6 +696,9 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 			if total := totalCaptureSkips(skips); total > 0 {
 				fmt.Fprintf(w, "  Capture health:  ⚠ DEGRADED — %s events skipped (%s), last %s\n",
 					commaGroup(total), captureSkipReasons(skips), lastCaptureSkip(skips).Format(TSFmt))
+				if attr := lastCaptureSkipAttribution(skips); attr != "" {
+					fmt.Fprintf(w, "  Last drop:       %s\n", attr)
+				}
 				fmt.Fprintln(w, "  Skipped events were read from the stream but NOT indexed — a restore window")
 				fmt.Fprintln(w, "  over them is incomplete. Most often the schema snapshot is stale or corrupt:")
 				fmt.Fprintln(w, "  run `bintrail snapshot` against the source, then check the daemon log.")
@@ -904,6 +920,37 @@ func lastCaptureSkip(skips map[string]CaptureSkipStat) time.Time {
 	return last
 }
 
+// lastCaptureSkipAttribution formats the newest attributed skip (#999) for the
+// DEGRADED block: "file:pos" plus, when a statement keyword was stamped, a
+// " (STATEMENT_TYPE, connection id N)" segment. An empty file (a drop before
+// the first rotate event) renders as "?" rather than a malformed ":pos". ""
+// when no stat carries attribution (pre-#999 ledger, or only unattributed
+// reasons).
+func lastCaptureSkipAttribution(skips map[string]CaptureSkipStat) string {
+	var best CaptureSkipStat
+	found := false
+	for _, st := range skips {
+		if st.LastFile == "" && st.LastStatementType == "" {
+			continue
+		}
+		if !found || st.LastAt.After(best.LastAt) {
+			best, found = st, true
+		}
+	}
+	if !found {
+		return ""
+	}
+	file := best.LastFile
+	if file == "" {
+		file = "?"
+	}
+	s := fmt.Sprintf("%s:%d", file, best.LastPos)
+	if best.LastStatementType != "" {
+		s += fmt.Sprintf(" (%s, connection id %d)", best.LastStatementType, best.LastConnectionID)
+	}
+	return s
+}
+
 // captureSkipReasons renders the non-zero reasons for the DEGRADED line: the
 // bare reason when there is one ("column_count_mismatch", the #1034 wording),
 // else "reason: count" pairs sorted by count descending (ties alphabetical).
@@ -1029,6 +1076,12 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 	type jsonSkipStat struct {
 		Count  int64  `json:"count"`
 		LastAt string `json:"last_at"`
+		// Last-seen attribution (#999); present only for reasons the capture
+		// daemon stamps (see parser.SkipStat for which do).
+		LastFile          string `json:"last_file,omitempty"`
+		LastPos           uint64 `json:"last_pos,omitempty"`
+		LastStatementType string `json:"last_statement_type,omitempty"`
+		LastConnectionID  uint32 `json:"last_connection_id,omitempty"`
 	}
 	type jsonCaptureHealth struct {
 		Status       string                  `json:"status"`
@@ -1176,7 +1229,14 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 				ch.Skipped = make(map[string]jsonSkipStat, len(skips))
 				for r, st := range skips {
 					if st.Count > 0 {
-						ch.Skipped[r] = jsonSkipStat{Count: st.Count, LastAt: st.LastAt.Format(TSFmt)}
+						ch.Skipped[r] = jsonSkipStat{
+							Count:             st.Count,
+							LastAt:            st.LastAt.Format(TSFmt),
+							LastFile:          st.LastFile,
+							LastPos:           st.LastPos,
+							LastStatementType: st.LastStatementType,
+							LastConnectionID:  st.LastConnectionID,
+						}
 					}
 				}
 			}

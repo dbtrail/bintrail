@@ -124,6 +124,73 @@ func TestRunStatus_failOnGap_exitCode(t *testing.T) {
 		}
 	})
 
+	// #999: in-scope statement-format DML drops in the ledger → fail closed
+	// (same permanent-loss class as gap_lost), with the last-drop attribution
+	// in the error.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE stream_state SET capture_skips='{"statement_format_dml":{"count":3,"last_at":"2026-07-18T01:00:00Z","last_file":"binlog.000042","last_pos":99012,"last_statement_type":"UPDATE","last_connection_id":55}}' WHERE id=1`); err != nil {
+		t.Fatalf("seed capture_skips: %v", err)
+	}
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err == nil {
+			t.Error("want a non-zero exit for statement-format DML drops under --fail-on-gap, got nil")
+		} else if !strings.Contains(err.Error(), "statement-format DML") || !strings.Contains(err.Error(), "binlog.000042:99012") {
+			t.Errorf("want a capture-health error with the last-drop attribution, got: %v", err)
+		}
+	})
+
+	// Drops AND a stamped gap: the gap error wins (its remediation —
+	// re-baseline — subsumes the drop one).
+	if _, err := db.ExecContext(ctx,
+		`UPDATE stream_state SET gap_lost_at=UTC_TIMESTAMP(), gap_lost_detail='unfillable binlog gap' WHERE id=1`); err != nil {
+		t.Fatalf("re-stamp gap: %v", err)
+	}
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err == nil || !strings.Contains(err.Error(), "events permanently lost") {
+			t.Errorf("with both a gap and drops, the gap error must win, got: %v", err)
+		}
+	})
+	if _, err := db.ExecContext(ctx,
+		"UPDATE stream_state SET gap_lost_at=NULL, gap_lost_detail=NULL WHERE id=1"); err != nil {
+		t.Fatalf("clear gap again: %v", err)
+	}
+
+	// A ledger that is PRESENT but unreadable (valid JSON, wrong shape) gets
+	// no grandfathering pass: a skip-aware daemon wrote it and it may hide a
+	// loss count — fail closed, like the sibling can't-confirm branches.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE stream_state SET capture_skips='{"statement_format_dml": 3}' WHERE id=1`); err != nil {
+		t.Fatalf("seed unreadable capture_skips: %v", err)
+	}
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err == nil || !strings.Contains(err.Error(), "unreadable") {
+			t.Errorf("want a fail-closed error for a present-but-unreadable ledger, got: %v", err)
+		}
+	})
+	if _, err := db.ExecContext(ctx,
+		`UPDATE stream_state SET capture_skips='{"statement_format_dml":{"count":3,"last_at":"2026-07-18T01:00:00Z","last_file":"binlog.000042","last_pos":99012,"last_statement_type":"UPDATE","last_connection_id":55}}' WHERE id=1`); err != nil {
+		t.Fatalf("restore capture_skips: %v", err)
+	}
+
+	// Flag OFF + the same drops → exit 0 (break-nothing for existing scripts).
+	stFailOnGap = false
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err != nil {
+			t.Errorf("default (no --fail-on-gap) must exit 0 even with recorded drops, got: %v", err)
+		}
+	})
+	stFailOnGap = true
+
+	// An evaluated-and-clean ledger ("{}") → no alert.
+	if _, err := db.ExecContext(ctx, `UPDATE stream_state SET capture_skips='{}' WHERE id=1`); err != nil {
+		t.Fatalf("clear capture_skips: %v", err)
+	}
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err != nil {
+			t.Errorf("a clean capture ledger must not alert under --fail-on-gap, got: %v", err)
+		}
+	})
+
 	// No stream row at all + --fail-on-gap ON → fail closed (cannot confirm).
 	if _, err := db.ExecContext(ctx, "DELETE FROM stream_state WHERE id=1"); err != nil {
 		t.Fatalf("delete stream row: %v", err)

@@ -50,6 +50,47 @@ func TestSkipCounters_snapshotSeedRoundTrip(t *testing.T) {
 	}
 }
 
+// Attribution (#999): RecordSkipAttributed stamps file/pos/keyword/connection
+// id into the persisted stat, an unattributed skip must not erase the last
+// lead, and the document round-trips through Seed. Reasons that never carried
+// attribution serialize none of the last_* keys (pre-#999 shape preserved).
+func TestSkipCounters_attributionRoundTrip(t *testing.T) {
+	c := NewSkipCounters(newTestLogger(&bytes.Buffer{}))
+	c.RecordSkipAttributed(SkipStatementFormatDML, SkipAttribution{
+		File: "binlog.000042", Pos: 99012, StatementType: "UPDATE", ConnectionID: 55,
+	})
+	c.RecordSkip(SkipStatementFormatDML)
+	c.RecordSkip(SkipColumnCountMismatch)
+
+	snap, err := c.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	m := map[string]SkipStat{}
+	if err := json.Unmarshal([]byte(snap), &m); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	st := m[SkipStatementFormatDML]
+	if st.Count != 2 || st.LastFile != "binlog.000042" || st.LastPos != 99012 ||
+		st.LastStatementType != "UPDATE" || st.LastConnectionID != 55 {
+		t.Fatalf("attribution lost or wiped by the unattributed skip: %+v", st)
+	}
+	if cc := m[SkipColumnCountMismatch]; cc.LastFile != "" || cc.LastStatementType != "" {
+		t.Fatalf("unattributed reason must not carry attribution: %+v", cc)
+	}
+
+	restarted := NewSkipCounters(newTestLogger(&bytes.Buffer{}))
+	if err := restarted.Seed(snap); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	snap2, _ := restarted.Snapshot()
+	for _, want := range []string{`"last_file":"binlog.000042"`, `"last_pos":99012`, `"last_statement_type":"UPDATE"`, `"last_connection_id":55`} {
+		if !strings.Contains(snap2, want) {
+			t.Errorf("attribution must survive the restart round-trip; missing %q: %s", want, snap2)
+		}
+	}
+}
+
 func TestSkipCounters_seedEmptyAndInvalid(t *testing.T) {
 	c := NewSkipCounters(newTestLogger(&bytes.Buffer{}))
 	if err := c.Seed(""); err != nil {
@@ -246,14 +287,33 @@ func TestStreamParser_statementDMLCountsSkip(t *testing.T) {
 	streamer := replication.NewBinlogStreamer()
 	out := make(chan Event, 10)
 
+	qev := makeQueryEvent("UPDATE shop.orders SET amount = 1")
+	qev.Header.LogPos = 4242
+	qev.Event.(*replication.QueryEvent).SlaveProxyID = 77
+
 	ctx, cancel := context.WithCancel(context.Background())
-	feedThenCancel(t, streamer, cancel, makeQueryEvent("UPDATE shop.orders SET amount = 1"))
+	// The rotate precedes the drop, as on a real stream — pinning that Run
+	// plumbs currentFile into the attribution, not just pos/keyword/conn id.
+	feedThenCancel(t, streamer, cancel, makeRotate("binlog.000123"), qev)
 	if err := sp.Run(ctx, streamer, out); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	snap, _ := skips.Snapshot()
 	if !strings.Contains(snap, SkipStatementFormatDML) || skips.Total() != 1 {
 		t.Fatalf("statement-format DML drop not counted (total=%d): %s", skips.Total(), snap)
+	}
+	// The production site must stamp the attribution (#999) — the same fields
+	// the per-event WARN carries, minus the statement text.
+	m := map[string]SkipStat{}
+	if err := json.Unmarshal([]byte(snap), &m); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	st := m[SkipStatementFormatDML]
+	if st.LastFile != "binlog.000123" || st.LastPos != 4242 || st.LastStatementType != "UPDATE" || st.LastConnectionID != 77 {
+		t.Fatalf("statement-DML site did not stamp attribution: %+v", st)
+	}
+	if strings.Contains(snap, "amount") {
+		t.Fatalf("statement text must NEVER be persisted: %s", snap)
 	}
 }
 

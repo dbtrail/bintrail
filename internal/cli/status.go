@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -28,8 +29,9 @@ The Stream section also reports continuity — the cheap "did I lose any events?
 verdict: "no gaps in the captured range" (a contiguity check, not a liveness
 one), or a loud "GAP LOST" when an unfillable gap forced an auto-advance with
 permanent loss. Pass --fail-on-gap to exit non-zero on that loss — or when
-continuity can't be confirmed (fails closed) — for CI/cron alerting; by default
-a gap never changes the exit code.
+continuity can't be confirmed (fails closed), or when in-scope statement-format
+DML drops were recorded (the same permanent-loss class) — for CI/cron alerting;
+by default a gap never changes the exit code.
 
 Partition row counts are estimates read from information_schema (no table scan).
 
@@ -49,7 +51,7 @@ func init() {
 	statusCmd.Flags().StringVar(&stIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	statusCmd.Flags().StringVar(&stFormat, "format", "text", "Output format: text or json")
 	statusCmd.Flags().StringVar(&stBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (optional, shows baseline binlog positions)")
-	statusCmd.Flags().BoolVar(&stFailOnGap, "fail-on-gap", false, "Exit non-zero if the stream lost data, or its continuity can't be confirmed (fails closed); for CI/cron alerting. By default a gap never changes the exit code")
+	statusCmd.Flags().BoolVar(&stFailOnGap, "fail-on-gap", false, "Exit non-zero if the stream lost data (a binlog gap or statement-format DML drops), or its continuity can't be confirmed (fails closed); for CI/cron alerting. By default a gap never changes the exit code")
 	_ = statusCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(statusCmd)
 	// Registration on a root command happens via AddReadCommands(root), which
@@ -142,6 +144,33 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		case data.Stream.GapLostAt.Valid:
 			return fmt.Errorf("stream continuity: events permanently lost (gap detected at %s); index is valid only up to the gap, resume requires re-baseline",
 				data.Stream.GapLostAt.Time.Format(status.TSFmt))
+		}
+		// #999: a non-zero IN-SCOPE statement-format DML count is the same loss
+		// class as gap_lost — those changes are permanently absent from the
+		// index — so it joins the fail-closed contract. A NULL/empty ledger
+		// (legacy index / no skip-aware daemon) deliberately does NOT alert
+		// here: unlike the gap columns above, capture_skips post-dates this
+		// flag, and failing every pre-#1034 deployment's cron would bury the
+		// signal in false alarms (the gap-column unknowns already alerted
+		// before capture_skips existed, so their fail-closed stance breaks no
+		// one). A ledger that IS present but unreadable gets no such pass —
+		// a skip-aware daemon wrote it, it may be hiding a loss count, and
+		// "couldn't check" must not read as "fine" (the sibling branches'
+		// stance).
+		if skips, ok := data.Stream.ParseCaptureSkips(); ok {
+			if st := skips[status.CaptureSkipReasonStatementFormatDML]; st.Count > 0 {
+				loc := ""
+				if st.LastFile != "" || st.LastStatementType != "" {
+					file := st.LastFile
+					if file == "" {
+						file = "?"
+					}
+					loc = fmt.Sprintf(" (last: %s at %s:%d, connection id %d)", st.LastStatementType, file, st.LastPos, st.LastConnectionID)
+				}
+				return fmt.Errorf("capture health: %d statement-format DML event(s) permanently uncaptured%s; set binlog_format=ROW server-wide on the source, then acknowledge by clearing stream_state.capture_skips with the daemon stopped (the counter is monotonic); failing closed under --fail-on-gap", st.Count, loc)
+			}
+		} else if data.Stream.CaptureSkips.Valid && strings.TrimSpace(data.Stream.CaptureSkips.String) != "" {
+			return fmt.Errorf("capture health: capture_skips ledger present but unreadable; cannot confirm statement-format DML drops; failing closed under --fail-on-gap")
 		}
 	}
 	return nil
