@@ -668,7 +668,9 @@ function covCard(c) {
   if (typeof c.lag_seconds === "number") {
     chips.append(el("span", { class: "cov-chip" + (c.lag_seconds > 300 ? " warn" : " ok"), text: "capture lag " + c.lag_seconds + "s" }));
   }
-  chips.append(el("span", { class: "cov-chip " + (bad ? "bad" : warn ? "warn" : "ok"), text: "continuity " + cont }));
+  // "none" (file-mode: no capture ran) stays NEUTRAL — green would paint a
+  // non-claim as assurance.
+  chips.append(el("span", { class: "cov-chip" + (bad ? " bad" : warn ? " warn" : cont === "ok" ? " ok" : ""), text: "continuity " + cont }));
   card.append(chips);
   if (cont === "gap_lost") {
     card.append(el("p", { class: "cov-line bad", text: "Events were permanently lost — the window has a hole; points beyond the gap need a fresh baseline." }));
