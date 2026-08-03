@@ -19,7 +19,7 @@ import (
 
 // writeBaselineParquet writes a one-row baseline snapshot in the layout
 // FindBaseline expects: <baseDir>/<RFC3339-with-hyphens>/<schema>/<table>.parquet.
-func writeBaselineParquet(t *testing.T, baseDir, schema, table string, at time.Time, idVal, nameVal string) {
+func writeBaselineParquet(t *testing.T, baseDir, schema, table string, at time.Time, idVal, nameVal string, meta ...map[string]string) {
 	t.Helper()
 	tsDir := strings.ReplaceAll(at.UTC().Format(time.RFC3339), ":", "-")
 	dir := filepath.Join(baseDir, tsDir, schema)
@@ -30,8 +30,11 @@ func writeBaselineParquet(t *testing.T, baseDir, schema, table string, at time.T
 		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
 		{Name: "name", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 	}
-	w, err := baseline.NewWriter(filepath.Join(dir, table+".parquet"), cols,
-		baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+	cfg := baseline.WriterConfig{Compression: "none", RowGroupSize: 100}
+	if len(meta) > 0 {
+		cfg.Metadata = meta[0]
+	}
+	w, err := baseline.NewWriter(filepath.Join(dir, table+".parquet"), cols, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +49,11 @@ func writeBaselineParquet(t *testing.T, baseDir, schema, table string, at time.T
 // seedReconstruct builds an index with a snapshot (id is PK), a baseline row
 // (id=1, name=alice at 00:00), and three deltas: UPDATE→alicia (12:00),
 // UPDATE→alex (13:00), DELETE (14:00).
-func seedReconstruct(t *testing.T) *Server {
+func seedReconstruct(t *testing.T) *Server { return seedReconstructMeta(t, nil) }
+
+// seedReconstructMeta is seedReconstruct with optional key-value metadata
+// stamped into the baseline Parquet footer (#921: LSN + render-GUCs stamp).
+func seedReconstructMeta(t *testing.T, baselineMeta map[string]string) *Server {
 	t.Helper()
 	db, dbName := testutil.CreateTestDB(t)
 	testutil.InitIndexTables(t, db)
@@ -71,7 +78,7 @@ func seedReconstruct(t *testing.T) *Server {
 		nil, nil, []byte(`{"id":3,"name":{"__bintrail_unchanged_toast__":true}}`))
 
 	baseDir := t.TempDir()
-	writeBaselineParquet(t, baseDir, "app", "users", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), "1", "alice")
+	writeBaselineParquet(t, baseDir, "app", "users", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC), "1", "alice", baselineMeta)
 
 	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, BaselineDir: baseDir})
 	if err != nil {
@@ -100,6 +107,36 @@ func reconstructAt(t *testing.T, srv *Server, qs string) reconstructResponse {
 // only p_future, so the planner classifies the whole window as a coverage gap.
 // A real deployment with hourly partitions would not need it. The gap-refusal
 // behavior itself is asserted separately below.
+// #921: the render_gucs_mismatch warning must reach the response through the
+// REAL handler path (handleReconstruct → ReadParquetMetadataAny →
+// appendRenderGUCsWarning) — the unit test pins only the helper contract, so
+// unwiring the append in handleReconstruct must go red HERE.
+func TestIntegrationReconstructRenderGUCsWarning(t *testing.T) {
+	srv := seedReconstructMeta(t, map[string]string{
+		baseline.MetaKeyLSN:        "42",
+		baseline.MetaKeyRenderGUCs: "TimeZone=America/New_York;DateStyle=SQL;extra_float_digits=0;bytea_output=escape;IntervalStyle=sql_standard",
+	})
+	r := reconstructAt(t, srv, "schema=app&table=users&pk=1&at=2026-06-01%2000:00:01&allow_gaps=true")
+	found := false
+	for _, wmsg := range r.Warnings {
+		if strings.HasPrefix(wmsg, "render_gucs_mismatch: ") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("render_gucs_mismatch warning missing from the handler response: %v", r.Warnings)
+	}
+
+	// A MySQL baseline (no LSN anchor) must not raise it.
+	srv2 := seedReconstruct(t)
+	r2 := reconstructAt(t, srv2, "schema=app&table=users&pk=1&at=2026-06-01%2000:00:01&allow_gaps=true")
+	for _, wmsg := range r2.Warnings {
+		if strings.HasPrefix(wmsg, "render_gucs_mismatch") {
+			t.Fatalf("MySQL baseline must not raise the GUC warning: %v", r2.Warnings)
+		}
+	}
+}
+
 func TestIntegrationReconstructValueAsOf(t *testing.T) {
 	srv := seedReconstruct(t)
 

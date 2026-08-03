@@ -37,8 +37,11 @@ func TestAppendRenderGUCsWarning(t *testing.T) {
 	}
 }
 
-// TestRenderGUCsMismatchReachesWarningsDTO drives a REAL mismatched stamp
-// end-to-end on the surfacing path (#921), mirroring the #466 stale_baseline
+// TestRenderGUCsMismatchReachesWarningsDTO pins the read+predicate+append
+// contract on a REAL mismatched stamp (#921). It does NOT drive
+// handleReconstruct — the handler wiring (bmeta reaching the response
+// Warnings) is pinned by TestIntegrationReconstructRenderGUCsWarning in
+// reconstruct_integration_test.go. Original framing, kept for the helper half: #466 stale_baseline
 // test: a baseline Parquet whose metadata carries an LSN anchor and an old
 // rendering-GUC stamp is read with the same ReadParquetMetadataAny call
 // handleReconstruct uses, and appendRenderGUCsWarning lands the entry in the

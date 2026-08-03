@@ -332,7 +332,10 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	// (deltas anchor on snapshotTime).
 	bmeta, bmetaErr := baseline.ReadParquetMetadataAny(ctx, path)
 	if bmetaErr != nil {
-		slog.Debug("reconstruct: could not read baseline metadata for the render-GUCs check",
+		// Warn, not Debug: a PG baseline whose metadata cannot be read loses
+		// the render-GUCs mismatch warning silently otherwise (parity with the
+		// shim's failure log level).
+		slog.Warn("reconstruct: could not read baseline metadata for the render-GUCs check",
 			"path", path, "error", bmetaErr)
 	}
 	// PK column metadata from the snapshot in effect when the baseline was
