@@ -209,6 +209,36 @@ func TestRotationCycleHooks(t *testing.T) {
 	}
 }
 
+// TestVerifyRunPublishable: only a succeeded run that conclusively verified
+// at least one table may reach the gauges — a failed, zero-table, or
+// all-inconclusive run overwriting the counts would auto-resolve a live
+// mismatch alert and keep the staleness alert quiet while verification is
+// broken (the gauge-path twin of the webhook's clean/problem split).
+func TestVerifyRunPublishable(t *testing.T) {
+	rec := func(state string, match, mismatch, inconclusive, total int) console.VerifyRunRecord {
+		return console.VerifyRunRecord{VerifyStatus: console.VerifyStatus{State: state,
+			Summary: console.VerifySummary{Match: match, Mismatch: mismatch, Inconclusive: inconclusive, Total: total}}}
+	}
+	cases := []struct {
+		name string
+		rec  console.VerifyRunRecord
+		want bool
+	}{
+		{"clean run", rec("succeeded", 5, 0, 0, 5), true},
+		{"mismatch run still publishes (the alert must fire)", rec("succeeded", 3, 2, 0, 5), true},
+		{"partially inconclusive publishes", rec("succeeded", 3, 0, 2, 5), true},
+		{"failed run must not publish", rec("failed", 0, 0, 0, 0), false},
+		{"zero-table run must not publish", rec("succeeded", 0, 0, 0, 0), false},
+		{"all-inconclusive must not publish", rec("succeeded", 0, 0, 5, 5), false},
+		{"skip record must not publish", rec(console.VerifyStateSkipped, 0, 0, 0, 0), false},
+	}
+	for _, tc := range cases {
+		if got := verifyRunPublishable(tc.rec); got != tc.want {
+			t.Errorf("%s: publishable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestVerifyFinishObservers: gauges never panic without a notifier, and the
 // notifier still receives the record when configured.
 func TestVerifyFinishObservers(t *testing.T) {

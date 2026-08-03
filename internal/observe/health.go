@@ -66,6 +66,16 @@ func ClearContinuity(server string) {
 	continuityGapLost.DeleteLabelValues(server)
 }
 
+// DeleteVerifyOutcome unpublishes a server's verify gauges — called when the
+// server leaves the registry or is renamed, so a frozen series can never keep
+// alerting (or keep reading healthy) for something nobody evaluates anymore.
+func DeleteVerifyOutcome(server string) {
+	verifyLastRun.DeleteLabelValues(server)
+	for _, status := range []string{"match", "mismatch", "inconclusive", "error"} {
+		verifyTables.DeleteLabelValues(server, status)
+	}
+}
+
 // SetVerifyOutcome publishes the newest finished verify run for a server.
 func SetVerifyOutcome(server string, finishedAt time.Time, match, mismatch, inconclusive, errorCount int) {
 	verifyLastRun.WithLabelValues(server).Set(float64(finishedAt.Unix()))

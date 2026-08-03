@@ -897,17 +897,31 @@ func wireVerify(ctx context.Context, cfg *console.Config, registry *console.Regi
 // the same record history gets.
 func verifyFinishObservers(notifier *watchNotifier) func(console.VerifyRunRecord) {
 	return func(rec console.VerifyRunRecord) {
-		setVerifyGauges(rec)
+		setVerifyGauges(rec, rec.ServerName)
 		if notifier != nil {
 			notifier.VerifyFinished(rec)
 		}
 	}
 }
 
-// setVerifyGauges publishes one finished run. Skip records are bookkeeping,
-// not runs; a record without a parseable finish stamp is not publishable.
-func setVerifyGauges(rec console.VerifyRunRecord) {
-	if rec.State == console.VerifyStateSkipped {
+// verifyRunPublishable reports whether a record carries a verdict the gauges
+// may publish. Only a succeeded run that verified at least one table
+// conclusively counts — a failed run, a zero-table run ("only one baseline
+// yet"), or an all-inconclusive run must NOT overwrite the last real verdict:
+// zeroed counts would auto-resolve a live mismatch alert, and a refreshed
+// timestamp would keep the staleness alert quiet while verification is in
+// fact broken. Same rule as the webhook path's clean/problem split
+// (watchNotifier.VerifyFinished) and Report.ExitError.
+func verifyRunPublishable(rec console.VerifyRunRecord) bool {
+	s := rec.Summary
+	return rec.State == "succeeded" && s.Total > 0 && s.Inconclusive < s.Total
+}
+
+// setVerifyGauges publishes one finished run under the given server label
+// (the CURRENT display name — the seed path must not resurrect a pre-rename
+// name from an old record).
+func setVerifyGauges(rec console.VerifyRunRecord, server string) {
+	if !verifyRunPublishable(rec) {
 		return
 	}
 	finished, err := time.Parse(time.RFC3339, rec.FinishedAt)
@@ -915,22 +929,22 @@ func setVerifyGauges(rec console.VerifyRunRecord) {
 		return
 	}
 	s := rec.Summary
-	observe.SetVerifyOutcome(rec.ServerName, finished, s.Match, s.Mismatch, s.Inconclusive, s.Error)
+	observe.SetVerifyOutcome(server, finished, s.Match, s.Mismatch, s.Inconclusive, s.Error)
 }
 
-// seedVerifyGauges republishes each registry server's newest persisted run at
-// startup (#1203) — the pull path survives restarts exactly like the console
-// panel does, from the same history.
+// seedVerifyGauges republishes each registry server's newest publishable run
+// at startup (#1203) — the pull path survives restarts exactly like the
+// console panel does, from the same history.
 func seedVerifyGauges(registry *console.Registry, history *console.VerifyHistory) {
 	if registry == nil || history == nil {
 		return
 	}
 	for _, e := range registry.List() {
 		for _, rec := range history.List(e.ID) {
-			if rec.State == console.VerifyStateSkipped {
+			if !verifyRunPublishable(rec) {
 				continue
 			}
-			setVerifyGauges(rec)
+			setVerifyGauges(rec, e.Name)
 			break
 		}
 	}

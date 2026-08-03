@@ -211,6 +211,12 @@ func startContinuityWatch(ctx context.Context, n *watchNotifier, registry *conso
 	// The unknown-warn rate limit gets its own edge so it works with a nil
 	// notifier too.
 	unknownEdge := notify.NewEdge(0)
+	// prevNames remembers the labels published last cycle so a renamed or
+	// deleted server's gauges are UNPUBLISHED, not frozen at their last value
+	// (a stale gap_lost=1 would alert forever; a stale gap_lost=0 would read
+	// "evaluated, healthy" for an index nobody evaluates). Poller-goroutine
+	// only.
+	prevNames := make(map[string]bool)
 	go func() {
 		runCycle := func() {
 			defer func() {
@@ -218,7 +224,19 @@ func startContinuityWatch(ctx context.Context, n *watchNotifier, registry *conso
 					slog.Error("continuity watch cycle panicked; watching continues next tick", "panic", r)
 				}
 			}()
-			for _, t := range continuityTargets(registry, bootDSN) {
+			targets := continuityTargets(registry, bootDSN)
+			curNames := make(map[string]bool, len(targets))
+			for _, t := range targets {
+				curNames[t.name] = true
+			}
+			for name := range prevNames {
+				if !curNames[name] {
+					observe.ClearContinuity(name)
+					observe.DeleteVerifyOutcome(name)
+				}
+			}
+			prevNames = curNames
+			for _, t := range targets {
 				if ctx.Err() != nil {
 					return
 				}
