@@ -295,11 +295,16 @@ func runDrill(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
-		IndexDSN:           drlIndexDSN,
-		BaselineSrc:        baselineSrc,
-		Tables:             tables,
-		At:                 at,
-		OutputDir:          outDir,
+		IndexDSN:    drlIndexDSN,
+		BaselineSrc: baselineSrc,
+		Tables:      tables,
+		At:          at,
+		OutputDir:   outDir,
+		// Each chunk is applied to the scratch as ONE statement, so it must
+		// fit the target's max_allowed_packet — 16MiB stays well under the
+		// stock 64M default (reconstruct's own 256MiB default assumes
+		// myloader, which the operator tunes).
+		ChunkSize:          16 << 20,
 		WarnEventThreshold: 5_000_000,
 		ArchiveFetcher:     TunedArchiveFetcher(duckTuning),
 		DuckDBTuning:       duckTuning,
