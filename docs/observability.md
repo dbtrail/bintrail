@@ -164,14 +164,15 @@ A Prometheus gauge for this state is not exposed in this release.
 The `bintrail-console watch` daemon exports its three safety-net conditions —
 the same ones the webhook channel notifies on
 ([console.md](console.md#webhook-notifications)) — as gauges. Each publishes
-only while its feature is actually evaluating; an **absent series means "not
-evaluated", never "healthy"** (the continuity gauge is even unpublished for an
-index the watcher cannot reach, so unknown can never read as no-gap).
+only while its feature is actually producing verdicts; an **absent series
+means "no verdict" — never evaluated, or (for the verify pair) never a
+conclusive run — never "healthy"** (the continuity gauge is even unpublished
+for an index the watcher cannot reach, so unknown can never read as no-gap).
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `bintrail_continuity_gap_lost{server}` | gauge | 1 = the stream stamped a permanent capture gap (events in it are unrecoverable). Runs under `--notify-webhook` and/or `--metrics-addr` |
-| `bintrail_verify_last_run_timestamp_seconds{server}` | gauge | Unix time of the newest finished verify run (manual or scheduled); re-seeded from the persisted run history at startup |
+| `bintrail_verify_last_run_timestamp_seconds{server}` | gauge | Unix time of the newest verify run that **succeeded and conclusively verified at least one table** — failed and all-inconclusive runs do not refresh it, so staleness means verification is broken. Re-seeded from the persisted run history at startup |
 | `bintrail_verify_tables{server,status}` | gauge | Per-status table counts (`match` / `mismatch` / `inconclusive` / `error`) of that run |
 | `bintrail_rotation_healthy` | gauge | 1 = the last built-in rotation cycle neither failed nor deferred unarchived partitions |
 | `bintrail_rotation_deferred_partitions` | gauge | Unarchived partitions the last cycle declined to drop |
@@ -225,7 +226,7 @@ groups:
         expr: time() - bintrail_verify_last_run_timestamp_seconds > 172800
         labels: {severity: warning}
         annotations:
-          summary: "bintrail: no verify run finished in 2 days — scheduled verification may be broken"
+          summary: "bintrail: no verify run succeeded in 2 days — scheduled verification is broken or persistently failing"
       - alert: BintrailRotationUnhealthy
         expr: bintrail_rotation_healthy == 0
         for: 2h

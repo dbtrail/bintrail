@@ -41,24 +41,23 @@ func TestVerifyGauges(t *testing.T) {
 }
 
 func TestDeleteVerifyOutcome_unpublishes(t *testing.T) {
+	// Count-delta against the shared default registry: sibling tests may own
+	// other labels, but Delete must remove exactly this label's series —
+	// ABSENCE, not a zeroed value, is the invariant the alert rules and the
+	// Help text promise.
+	before := testutil.CollectAndCount(verifyLastRun)
+	beforeTables := testutil.CollectAndCount(verifyTables)
 	SetVerifyOutcome("gone", time.Now(), 1, 2, 3, 4)
+	if n := testutil.CollectAndCount(verifyLastRun); n != before+1 {
+		t.Fatalf("Set did not add a last_run series: %d -> %d", before, n)
+	}
 	DeleteVerifyOutcome("gone")
-	if n := testutil.CollectAndCount(verifyLastRun); n != 0 {
-		// Other tests publish under different labels; count only after
-		// isolating — reset by deleting the known label and asserting the
-		// specific series is gone via a fresh set/delete cycle.
-		t.Logf("registry still has %d verify_last_run series from sibling tests", n)
+	if n := testutil.CollectAndCount(verifyLastRun); n != before {
+		t.Fatalf("Delete left last_run series behind: want %d, got %d", before, n)
 	}
-	// The concrete assertion: re-reading the deleted label creates a NEW
-	// zero-valued child, proving the old values did not linger.
-	if got := testutil.ToFloat64(verifyLastRun.WithLabelValues("gone")); got != 0 {
-		t.Fatalf("deleted series lingered with value %v", got)
+	if n := testutil.CollectAndCount(verifyTables); n != beforeTables {
+		t.Fatalf("Delete left tables series behind: want %d, got %d", beforeTables, n)
 	}
-	verifyLastRun.DeleteLabelValues("gone")
-	if got := testutil.ToFloat64(verifyTables.WithLabelValues("gone", "mismatch")); got != 0 {
-		t.Fatalf("deleted tables series lingered with value %v", got)
-	}
-	verifyTables.DeleteLabelValues("gone", "mismatch")
 }
 
 func TestRotationGauges(t *testing.T) {

@@ -910,8 +910,11 @@ func verifyFinishObservers(notifier *watchNotifier) func(console.VerifyRunRecord
 // yet"), or an all-inconclusive run must NOT overwrite the last real verdict:
 // zeroed counts would auto-resolve a live mismatch alert, and a refreshed
 // timestamp would keep the staleness alert quiet while verification is in
-// fact broken. Same rule as the webhook path's clean/problem split
-// (watchNotifier.VerifyFinished) and Report.ExitError.
+// fact broken. It recognizes the same degenerate-run shapes as the webhook's
+// clean/problem split (watchNotifier.VerifyFinished) and Report.ExitError,
+// but the VERDICTS differ by design: the webhook still notifies on
+// failed/all-inconclusive runs, and the gauges publish mismatch runs (the
+// alert must fire) — do not extract one shared predicate.
 func verifyRunPublishable(rec console.VerifyRunRecord) bool {
 	s := rec.Summary
 	return rec.State == "succeeded" && s.Total > 0 && s.Inconclusive < s.Total
@@ -933,8 +936,9 @@ func setVerifyGauges(rec console.VerifyRunRecord, server string) {
 }
 
 // seedVerifyGauges republishes each registry server's newest publishable run
-// at startup (#1203) — the pull path survives restarts exactly like the
-// console panel does, from the same history.
+// at startup (#1203) — the pull path survives restarts, reading the same
+// history the console panel reads (the panel additionally shows failed runs;
+// the gauges only carry conclusive verdicts).
 func seedVerifyGauges(registry *console.Registry, history *console.VerifyHistory) {
 	if registry == nil || history == nil {
 		return

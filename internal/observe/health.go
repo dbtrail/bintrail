@@ -12,9 +12,10 @@ import (
 // conditions, exported for Prometheus/Alertmanager.
 //
 // All are *Vec collectors — including the label-less rotation pair — so
-// nothing is published until the daemon actually evaluates the condition:
-// an absent series means "not evaluated", never a misleading healthy zero
-// (the same rule the index timestamp gauges follow for an empty index).
+// nothing is published until the daemon actually has a verdict: an absent
+// series means "no verdict" — never evaluated, or (for the verify pair)
+// never a conclusive run — and NEVER a misleading healthy zero (the same
+// rule the index timestamp gauges follow for an empty index).
 // The server label is the display name — the same identity the webhook's
 // `server` field and the console UI use.
 var (
@@ -29,14 +30,14 @@ var (
 		Namespace: "bintrail",
 		Subsystem: "verify",
 		Name:      "last_run_timestamp_seconds",
-		Help:      "Unix time of the newest finished verify run (manual or scheduled) for this server.",
+		Help:      "Unix time of the newest verify run that succeeded and conclusively verified at least one table. Failed and all-inconclusive runs do not refresh it - staleness means verification is broken.",
 	}, []string{"server"})
 
 	verifyTables = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "bintrail",
 		Subsystem: "verify",
 		Name:      "tables",
-		Help:      "Per-status table counts of the newest finished verify run.",
+		Help:      "Per-status table counts of the newest conclusive verify run (see last_run_timestamp_seconds for what counts as one).",
 	}, []string{"server", "status"})
 
 	rotationHealthy = promauto.NewGaugeVec(prometheus.GaugeOpts{
