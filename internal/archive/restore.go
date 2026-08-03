@@ -43,9 +43,15 @@ func RestorePartition(ctx context.Context, db *sql.DB, localPath string, batchSi
 	insertPrefix := "INSERT INTO binlog_events (" + strings.Join(quoted, ", ") + ") VALUES "
 	tuple := "(" + strings.TrimSuffix(strings.Repeat("?,", len(cols)), ",") + ")"
 
+	// Flush on row count OR approximate payload size: binlog_events rows
+	// carry full before/after JSON images, so a count-only batch of fat rows
+	// can exceed a stock 64M max_allowed_packet (the #652 failure class) —
+	// 16MiB leaves the same headroom drill uses.
+	const maxBatchBytes = 16 << 20
 	var total int64
 	var args []any
 	var tuples int
+	var batchBytes int
 	flush := func() error {
 		if tuples == 0 {
 			return nil
@@ -55,7 +61,7 @@ func RestorePartition(ctx context.Context, db *sql.DB, localPath string, batchSi
 			return fmt.Errorf("insert batch into binlog_events: %w", err)
 		}
 		total += int64(tuples)
-		args, tuples = args[:0], 0
+		args, tuples, batchBytes = args[:0], 0, 0
 		return nil
 	}
 
@@ -70,9 +76,17 @@ func RestorePartition(ctx context.Context, db *sql.DB, localPath string, batchSi
 		}
 		for _, v := range scan {
 			args = append(args, v)
+			switch t := v.(type) {
+			case string:
+				batchBytes += len(t)
+			case []byte:
+				batchBytes += len(t)
+			default:
+				batchBytes += 16
+			}
 		}
 		tuples++
-		if tuples >= batchSize {
+		if tuples >= batchSize || batchBytes >= maxBatchBytes {
 			if err := flush(); err != nil {
 				return total, err
 			}
