@@ -1224,14 +1224,9 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			s := stream.LastEventTime.Time.Format(TSFmt)
 			jstr.LastEventTime = &s
 		}
-		switch {
-		case stream.GapLostAt.Valid:
-			jstr.Continuity.Status = "gap_lost"
+		jstr.Continuity.Status = ContinuityStatus(stream, nil)
+		if stream.GapLostAt.Valid {
 			jstr.GapLost = &jsonGapLost{At: stream.GapLostAt.Time.Format(TSFmt), Detail: stream.GapLostDetail.String}
-		case !stream.GapColumnsPresent:
-			jstr.Continuity.Status = "unknown"
-		default:
-			jstr.Continuity.Status = "ok"
 		}
 		if stream.SourceHealth.Valid && stream.SourceHealth.String != "" {
 			jstr.SourceHealth = json.RawMessage(stream.SourceHealth.String)
@@ -1263,7 +1258,7 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		// stream_state could not be READ (nil stream + error) — surface it as a distinct
 		// "unavailable" verdict so the omitted Stream section is not misread as "no loss".
 		out.StreamError = &jsonStreamError{
-			Continuity: jsonContinuity{Status: "unavailable"},
+			Continuity: jsonContinuity{Status: ContinuityStatus(nil, streamErr)},
 			Error:      streamErr.Error(),
 		}
 	}

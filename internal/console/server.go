@@ -442,6 +442,7 @@ func (s *Server) selectedEntry(r *http.Request) (ServerEntry, bool) {
 func (s *Server) buildHandler() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/status", s.handleStatus)
+	api.HandleFunc("GET /api/coverage", s.handleCoverage)
 	api.HandleFunc("GET /api/schemas", s.handleSchemas)
 	api.HandleFunc("GET /api/events", s.handleEvents)
 	api.HandleFunc("POST /api/recover", s.recordAction("recover", s.handleRecover))

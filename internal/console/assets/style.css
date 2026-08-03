@@ -1414,3 +1414,14 @@ button { font-family: inherit; }
    mount; reserve a minimum height so an empty/slow module doesn't collapse the
    view region to a bare page head. */
 .ext-view-mount { min-height: 240px; }
+
+/* ── restore-coverage card (#1194) ─────────────────────────────────────── */
+.cov-card { margin-bottom: 14px; }
+.cov-line { margin: 6px 0 0; font-size: 14px; color: var(--ink); }
+.cov-line.bad { color: var(--delete); font-weight: 600; }
+.cov-line.warn { color: var(--ink-2); }
+.cov-chips { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.cov-chip { font-family: var(--f-mono); font-size: 12px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink-2); }
+.cov-chip.ok { color: var(--insert); border-color: var(--insert); }
+.cov-chip.warn { color: var(--update); border-color: var(--update); }
+.cov-chip.bad { color: var(--delete); border-color: var(--delete); font-weight: 600; }
