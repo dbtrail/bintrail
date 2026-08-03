@@ -91,13 +91,16 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	// Staleness floor (#1193): best-effort — an unreadable index leaves the
-	// verdict empty (unknown-shaped), never a fabricated "ok".
+	// Staleness floor (#1193): best-effort — an unopened bundle connection or
+	// an unreadable index leaves the verdict empty (unknown-shaped), never a
+	// fabricated "ok".
 	var oldestDelta time.Time
-	if od, err := status.OldestDeltaFromDB(r.Context(), b.db); err != nil {
-		slog.Warn("console: could not load delta-coverage floor for baseline staleness", "error", err)
-	} else {
-		oldestDelta = od
+	if b.db != nil {
+		if od, err := status.OldestDeltaFromDB(r.Context(), b.db); err != nil {
+			slog.Warn("console: could not load delta-coverage floor for baseline staleness", "error", err)
+		} else {
+			oldestDelta = od
+		}
 	}
 	var cur *baselineSnapshotDTO
 	var curTime time.Time
