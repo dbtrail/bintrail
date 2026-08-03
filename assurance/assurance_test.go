@@ -82,6 +82,14 @@ func TestVerifyHistoryAbsenceIsVisibleThroughTheFacade(t *testing.T) {
 	if base := filepath.Base(path); base != "console-verify-history.json" {
 		t.Fatalf("history path = %q", base)
 	}
+	// The default location has to be derivable through the facade too, or a
+	// caller hardcodes it and reads nothing once the registry moves.
+	if got, want := DefaultRegistryPath(), console.DefaultRegistryPath(); got != want {
+		t.Fatalf("DefaultRegistryPath() = %q, want %q", got, want)
+	}
+	if filepath.Dir(DefaultVerifyHistoryPath(DefaultRegistryPath())) != filepath.Dir(DefaultRegistryPath()) {
+		t.Fatal("the default history does not sit beside the default registry")
+	}
 	h, err := OpenVerifyHistory(path)
 	if err != nil {
 		t.Fatal(err)

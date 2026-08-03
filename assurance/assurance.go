@@ -124,8 +124,19 @@ func ListBaselines(ctx context.Context, source string) ([]BaselineFile, error) {
 	return reconstruct.ListBaselines(ctx, source)
 }
 
+// DefaultRegistryPath returns the console server-registry path the console
+// uses when --servers-file is not set. Re-exported because the history is
+// located relative to it: without this a caller would hardcode the path, and
+// a relocated or later-moved registry would silently read no history at all.
+func DefaultRegistryPath() string {
+	return console.DefaultRegistryPath()
+}
+
 // DefaultVerifyHistoryPath returns the verify-history file path for a given
-// console server-registry path (the history lives beside the registry).
+// console server-registry path (the history lives beside the registry). For
+// a console running on defaults that is
+// DefaultVerifyHistoryPath(DefaultRegistryPath()); pass the operator's
+// --servers-file / --console-servers-file value when one is configured.
 func DefaultVerifyHistoryPath(serversPath string) string {
 	return console.DefaultVerifyHistoryPath(serversPath)
 }
