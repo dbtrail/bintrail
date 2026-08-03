@@ -132,6 +132,23 @@ func Perform(ctx context.Context, db *sql.DB, dbName string, opts Options) (Resu
 					}
 				}
 
+				// #1196: persist the durable-state sidecar (schema snapshots +
+				// server identity) alongside this source's archives, so a
+				// future restore-index can rebuild the state the event files
+				// don't carry. Best-effort by contract: a sidecar failure must
+				// never fail rotation — the events are the payload.
+				sidecarDir := filepath.Join(opts.ArchiveDir, "bintrail_id="+opts.BintrailID)
+				if err := archive.WriteMetaSidecar(ctx, db, sidecarDir); err != nil {
+					slog.Warn("could not write index-meta sidecar; a future restore-index will be missing schema snapshots/identity", "error", err)
+				} else if s3Client != nil {
+					sidecarPath := filepath.Join(sidecarDir, archive.MetaSidecarName)
+					if key, kerr := storage.BuildS3Key(opts.ArchiveDir, sidecarPath, s3Prefix); kerr != nil {
+						slog.Warn("could not build sidecar S3 key", "error", kerr)
+					} else if uerr := uploadFileFunc(ctx, s3Client, sidecarPath, s3Bucket, key); uerr != nil {
+						slog.Warn("could not upload index-meta sidecar to S3", "error", uerr)
+					}
+				}
+
 				for _, name := range toDrop {
 					outPath, err := HiveArchivePath(opts.ArchiveDir, opts.BintrailID, name)
 					if err != nil {

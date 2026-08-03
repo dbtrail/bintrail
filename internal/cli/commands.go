@@ -38,4 +38,5 @@ func AddReadCommands(root *cobra.Command) {
 func AddMaintenanceCommands(root *cobra.Command) {
 	root.AddCommand(rotateCmd)
 	root.AddCommand(archiveCmd)
+	root.AddCommand(restoreIndexCmd)
 }
