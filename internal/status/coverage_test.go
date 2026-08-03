@@ -89,8 +89,8 @@ func TestCollectCoverageSummary(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !sum.DeltaFrom.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) || !sum.DeltaTo.Equal(latest) {
-			t.Fatalf("window = [%v, %v]", sum.DeltaFrom, sum.DeltaTo)
+		if !sum.Floor.Hour.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) || !sum.DeltaTo.Equal(latest) {
+			t.Fatalf("window = [%v, %v]", sum.Floor.Hour, sum.DeltaTo)
 		}
 		if sum.Continuity != "ok" || sum.LagSeconds == nil || *sum.LagSeconds != 42 {
 			t.Fatalf("continuity=%q lag=%v", sum.Continuity, sum.LagSeconds)
@@ -163,7 +163,7 @@ func TestCollectCoverageSummary(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !sum.DeltaFrom.IsZero() || !sum.DeltaTo.Equal(latest) {
+		if !sum.Floor.Hour.IsZero() || !sum.DeltaTo.Equal(latest) {
 			t.Fatalf("unknown floor must stay zero: %+v", sum)
 		}
 	})

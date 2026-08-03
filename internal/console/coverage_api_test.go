@@ -15,6 +15,13 @@ import (
 // probe → stream_state (no row = file-mode). archErr != nil makes the floor
 // unknown.
 func coverageMockDB(t *testing.T, part string, latest time.Time, archErr error) *sql.DB {
+	return coverageMockDBArchives(t, part, latest, archErr, nil, nil, 0)
+}
+
+// coverageMockDBArchives is coverageMockDB with an archive_state row: archMin/
+// archMax name the archived range and sources is COUNT(DISTINCT bintrail_id),
+// so a caller can build the multi-source (unattributable) floor.
+func coverageMockDBArchives(t *testing.T, part string, latest time.Time, archErr error, archMin, archMax any, sources int) *sql.DB {
 	t.Helper()
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -27,7 +34,7 @@ func coverageMockDB(t *testing.T, part string, latest time.Time, archErr error) 
 		mock.ExpectQuery(`MIN\(partition_name\)`).WillReturnError(archErr)
 	} else {
 		mock.ExpectQuery(`MIN\(partition_name\)`).
-			WillReturnRows(sqlmock.NewRows([]string{"min", "max", "sources"}).AddRow(nil, nil, 0))
+			WillReturnRows(sqlmock.NewRows([]string{"min", "max", "sources"}).AddRow(archMin, archMax, sources))
 	}
 	mock.ExpectQuery("PARTITION_NAME FROM information_schema.PARTITIONS").
 		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME"}).AddRow(part))
@@ -68,6 +75,32 @@ func TestCoverageAPI(t *testing.T) {
 	writeBaselineFixture(t, dir, tsDir(200*time.Hour), "shop", "orders.parquet")
 	writeBaselineFixture(t, dir, tsDir(10*time.Hour), "shop", "users.parquet")
 	writeBaselineFixture(t, dir, tsDir(150*time.Hour), "shop", "legacy.parquet")
+
+	// #1219: the archives reach back 300h but belong to two sources, so the
+	// floor collapses to the live partitions (-100h) and the -150h `legacy`
+	// anchor becomes UNATTRIBUTABLE. Grading it against the bare floor hour
+	// would name a table whose archives are intact in broken_tables — the
+	// false alarm the narrowed floor exists to avoid — and letting it define
+	// the window would assert restorability it cannot prove. Neither: the
+	// full-table half reports "unknown" and claims no anchor.
+	t.Run("unattributable floor: no broken claim and no window claim", func(t *testing.T) {
+		srv := newBaselineServer(t, dir, true)
+		srv.cm.boot.db = coverageMockDBArchives(t, part, latest, nil,
+			now.Add(-300*time.Hour).Format("p_2006010215"),
+			now.Add(-101*time.Hour).Format("p_2006010215"), 2)
+		srv.cm.boot.dbName = "binlog_index"
+		got := coverageGet(t, srv)
+		if len(got.BrokenTables) != 0 {
+			t.Fatalf("unattributable anchors must not be named broken: %+v", got.BrokenTables)
+		}
+		if got.FullTableStatus != "unknown" || got.FullTableFrom != "" {
+			t.Fatalf("want unknown with no window, got status=%q from=%q", got.FullTableStatus, got.FullTableFrom)
+		}
+		// The delta half still states the window every source provably has.
+		if got.DeltaFrom == "" {
+			t.Fatal("the live floor is still a real window and must be reported")
+		}
+	})
 
 	t.Run("window, latest usable anchor, broken named", func(t *testing.T) {
 		srv := newBaselineServer(t, dir, true)

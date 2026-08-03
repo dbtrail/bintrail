@@ -57,12 +57,6 @@ func BaselineStalenessFor(snapshotTime, oldestDelta, now time.Time) BaselineStal
 	return BaselineOK
 }
 
-// OldestLivePartitionHour is the live half of the delta floor: the hour of
-// the oldest non-future binlog_events partition. Partition EXISTENCE is
-// coverage — the planner's own rule. MIN(event_timestamp) must NOT be used
-// here: it is the first WRITE, not the coverage start, and on a quiet
-// database it would fabricate a "broken" verdict (baseline taken before the
-// first write) on a perfectly restorable index.
 // DeltaFloor is the delta-coverage floor plus how to read a snapshot older
 // than it. It exists because the two halves of the floor have different
 // scopes (#1219): the live partitions are SHARED — every source writes into
@@ -85,6 +79,14 @@ type DeltaFloor struct {
 // Grade returns the staleness verdict of one snapshot against this floor. It
 // is the single place the ambiguity demotion lives: below an unattributable
 // floor, "broken" becomes "unknown".
+//
+// Only "broken" is demoted, deliberately. A snapshot ABOVE the floor is
+// covered by the live partitions every source shares, so ok/aging need no
+// attribution — and an unattributable floor makes the span shorter, so
+// "aging" fires earlier than it would against the archive-extended floor.
+// That reads as a conservative "your provable window is shrinking", which is
+// the honest thing to say; demoting it too would erase the one signal still
+// standing on those indexes.
 func (f DeltaFloor) Grade(snapshotTime, now time.Time) BaselineStalenessVerdict {
 	v := BaselineStalenessFor(snapshotTime, f.Hour, now)
 	if v == BaselineBroken && f.BelowIsUnknown {
@@ -93,6 +95,12 @@ func (f DeltaFloor) Grade(snapshotTime, now time.Time) BaselineStalenessVerdict 
 	return v
 }
 
+// OldestLivePartitionHour is the live half of the delta floor: the hour of
+// the oldest non-future binlog_events partition. Partition EXISTENCE is
+// coverage — the planner's own rule. MIN(event_timestamp) must NOT be used
+// here: it is the first WRITE, not the coverage start, and on a quiet
+// database it would fabricate a "broken" verdict (baseline taken before the
+// first write) on a perfectly restorable index.
 func OldestLivePartitionHour(parts []PartitionStat) time.Time {
 	var out time.Time
 	for _, p := range parts {
@@ -138,8 +146,13 @@ func OldestDeltaFromDB(ctx context.Context, db *sql.DB, dbName string) (DeltaFlo
 	floor := DeltaFloor{Hour: OldestLivePartitionHour(parts)}
 
 	// COUNT(DISTINCT bintrail_id) rides the query that was already here — no
-	// extra round trip, and no NULL bucket to reason about: rotate refuses to
-	// archive without an id (errNoArchiveBintrailID), so every row has one.
+	// extra round trip. Every writer stamps a non-empty id (CLI rotate via
+	// errNoArchiveBintrailID, the watch control plane via its own empty-id
+	// drop-only branch, and reconcile --repair / restore-index from the
+	// bintrail_id=<id> path segment), but the COLUMN is nullable: a NULL row
+	// would drop out of the COUNT while still feeding MIN(partition_name), so
+	// the count is treated as evidence of attribution, never as proof — see
+	// the archivedSources == 0 branch below.
 	var minPartition, maxPartition sql.NullString
 	var archivedSources int
 	if err := db.QueryRowContext(ctx, `SELECT MIN(partition_name), MAX(partition_name), COUNT(DISTINCT bintrail_id) FROM archive_state`).Scan(&minPartition, &maxPartition, &archivedSources); err != nil {
@@ -170,6 +183,15 @@ func OldestDeltaFromDB(ctx context.Context, db *sql.DB, dbName string) (DeltaFlo
 	// baselines. Neither identifies WHICH source owns a given baseline (a
 	// baseline snapshot carries no source identity), so the answer here can
 	// only be "attributable" or "not".
+	if archivedSources == 0 {
+		// Archived hours exist but carry NO source identity (only reachable
+		// through a hand-written or pre-identity row, since the column is
+		// nullable). Rows that name no source are the strongest case of
+		// "cannot attribute", so they must not extend anyone's floor — the
+		// count reading 0 while MIN is valid is exactly that.
+		floor.BelowIsUnknown = true
+		return floor, nil
+	}
 	multiSource := archivedSources > 1
 	if !multiSource {
 		known, err := knownSourceCount(ctx, db)
@@ -232,7 +254,12 @@ func AnnotateBaselineStaleness(baselines []BaselineInfo, floor DeltaFloor, now t
 // OverallBaselineStaleness is the worst verdict across each table's NEWEST
 // snapshot. "" when the list is empty or unannotated.
 func OverallBaselineStaleness(baselines []BaselineInfo) BaselineStalenessVerdict {
-	rank := map[BaselineStalenessVerdict]int{BaselineOK: 1, BaselineUnknown: 2, BaselineAging: 3, BaselineBroken: 4}
+	// Unknown outranks aging: aging is informational (it fires on every young
+	// install and never alerts), while unknown means the restore window could
+	// not be established at all. #1219 makes unknown the ROUTINE verdict for
+	// below-floor snapshots on multi-source indexes, so ranking it under
+	// aging would headline "mildly old" over "could not be checked".
+	rank := map[BaselineStalenessVerdict]int{BaselineOK: 1, BaselineAging: 2, BaselineUnknown: 3, BaselineBroken: 4}
 	newest := make(map[string]BaselineInfo, len(baselines))
 	for _, b := range baselines {
 		k := b.Database + "." + b.Table

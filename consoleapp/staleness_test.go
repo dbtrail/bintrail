@@ -42,12 +42,21 @@ func TestStalenessWatcher_unattributableFloorNeverResolves(t *testing.T) {
 		t.Fatalf("an unattributable floor must neither resolve nor re-fire: %+v", f.events)
 	}
 
+	if !w.unknownEdge.Active("staleness-attribution:d1\x1f/b") {
+		t.Fatal("the cannot-evaluate condition must be latched, or it re-warns every cycle")
+	}
+
 	// Attribution is restored and the baseline is still broken: the edge was
 	// never resolved, so the standing alert must not re-fire either.
 	floor.BelowIsUnknown = false
 	w.runCycle(context.Background())
 	if len(f.events) != 1 {
 		t.Fatalf("unchanged broken condition must not re-fire: %+v", f.events)
+	}
+	// ...and the cannot-evaluate latch must be RELEASED, or a later relapse
+	// would be swallowed by the repeat window and never warned about again.
+	if w.unknownEdge.Active("staleness-attribution:d1\x1f/b") {
+		t.Fatal("attribution recovered: the unknown edge must be resolved")
 	}
 }
 

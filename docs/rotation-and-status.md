@@ -633,7 +633,12 @@ coverage for another would hide a genuinely broken restore window, and
 declaring it broken would page you over archives that are perfectly fine.
 The `watch` daemon reports those servers as *cannot be evaluated* (rate
 limited to one warning per day) and — deliberately — never resolves a
-standing `baseline_stale` alert on that basis. To grade them, keep one
-source per index database, or verify the window directly with
-`bintrail reconstruct` (its planner gap check is source-exact at restore
-time).
+standing `baseline_stale` alert on that basis. The way to get a graded
+verdict is to keep one source per index database.
+
+Do **not** read reconstruct's gap check as the source-exact fallback: its
+planner classifies an hour as covered when *any* source archived it
+(`archive_state` is scanned unscoped), so on a multi-source index it can
+pass a window the graded source does not actually have. The honest check
+there is to restore into a scratch target and compare — see
+[drill.md](drill.md).

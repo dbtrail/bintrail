@@ -1395,6 +1395,20 @@ func writeBaselines(w io.Writer, baselines []BaselineInfo) {
 	// predates delta coverage cannot be fully restored through that hole, and
 	// waiting for restore time to find out is the failure mode #1193 exists
 	// to remove.
+	// The check being DISARMED is itself a finding: a bare "unknown" in the
+	// column reads as a cosmetic gap, while it actually means a broken
+	// restore window would not be detected here (#1219 makes this the routine
+	// verdict for below-floor snapshots on multi-source indexes; an
+	// unreadable floor lands here too).
+	if OverallBaselineStaleness(baselines) == BaselineUnknown {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "=== ⚠ BASELINE STALENESS NOT EVALUABLE ===")
+		fmt.Fprintln(w, "The delta-coverage floor could not be established for at least one table:")
+		fmt.Fprintln(w, "an index serving more than one source cannot attribute archived coverage to")
+		fmt.Fprintln(w, "the source that owns a baseline, and an unreadable index yields the same.")
+		fmt.Fprintln(w, "A broken restore window would NOT be detected here — see")
+		fmt.Fprintln(w, "docs/rotation-and-status.md (Baseline staleness).")
+	}
 	if OverallBaselineStaleness(baselines) == BaselineBroken {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "=== ⚠ BASELINE STALE — FULL-TABLE RESTORE BROKEN ===")

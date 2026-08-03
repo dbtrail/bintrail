@@ -389,7 +389,10 @@ func (w *stalenessWatcher) runCycle(ctx context.Context) {
 			case status.BaselineBroken:
 				brokenTables = append(brokenTables, k)
 			case status.BaselineUnknown:
-				ungradable = ungradable || floor.BelowIsUnknown
+				// Keyed on the VERDICT, not on the floor flag: whatever makes
+				// a table ungradable, grading the rest and reporting
+				// broken=false below would resolve on partial evidence.
+				ungradable = true
 			}
 		}
 		if ungradable {
@@ -400,9 +403,14 @@ func (w *stalenessWatcher) runCycle(ctx context.Context) {
 			// broken=false and RESOLVES an active alert — adding a second
 			// source to an index would silently clear a real broken-baseline
 			// alert. Skip the target whole, exactly like an unknown floor.
+			reason := "a baseline snapshot carries no usable timestamp"
+			if floor.BelowIsUnknown {
+				reason = "this index serves more than one source, so archived coverage below the live index window cannot be attributed to the source that owns these baselines"
+			}
 			if w.unknownEdge.Fire("staleness-attribution:"+edgeID, "") {
-				slog.Warn("baseline staleness cannot be evaluated for snapshots older than the live index window — this index serves more than one source and archive coverage cannot be attributed to one of them; a broken restore window would go UNDETECTED for this server",
-					"server", t.name, "source", t.source, "live_floor", floor.Hour.UTC().Format(time.RFC3339))
+				slog.Warn("baseline staleness cannot be evaluated for at least one table; a broken restore window would go UNDETECTED for this server",
+					"server", t.name, "source", t.source, "reason", reason,
+					"live_floor", floor.Hour.UTC().Format(time.RFC3339))
 			}
 			continue
 		}

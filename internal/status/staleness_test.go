@@ -76,6 +76,31 @@ func TestDeltaFloorGrade(t *testing.T) {
 	if got := (DeltaFloor{Hour: live, BelowIsUnknown: true}).Grade(now.Add(-time.Hour), now); got != BaselineOK {
 		t.Fatalf("in-window snapshot: got %s, want ok", got)
 	}
+	// Aging is deliberately NOT demoted: it is a true statement about the
+	// window that IS provable, and demoting it would erase the only signal
+	// left on a multi-source index.
+	if got := (DeltaFloor{Hour: live, BelowIsUnknown: true}).Grade(now.Add(-9*time.Hour), now); got != BaselineAging {
+		t.Fatalf("in-window aging snapshot: got %s, want aging", got)
+	}
+}
+
+// TestOverallBaselineStalenessRanksUnknownOverAging: #1219 makes unknown the
+// routine below-floor verdict, and aging is the one verdict the codebase
+// treats as ignorable (it never alerts). A table that CANNOT be evaluated
+// must not hide behind a merely-old one in the headline.
+func TestOverallBaselineStalenessRanksUnknownOverAging(t *testing.T) {
+	baselines := []BaselineInfo{
+		{Database: "shop", Table: "orders", SnapshotTime: time.Unix(2000, 0), Staleness: BaselineAging},
+		{Database: "shop", Table: "legacy", SnapshotTime: time.Unix(1000, 0), Staleness: BaselineUnknown},
+	}
+	if got := OverallBaselineStaleness(baselines); got != BaselineUnknown {
+		t.Fatalf("got %s, want unknown", got)
+	}
+	// Broken still outranks everything: a known-broken table is actionable.
+	baselines[0].Staleness = BaselineBroken
+	if got := OverallBaselineStaleness(baselines); got != BaselineBroken {
+		t.Fatalf("got %s, want broken", got)
+	}
 }
 
 func TestOldestDeltaFromDB(t *testing.T) {
@@ -89,10 +114,11 @@ func TestOldestDeltaFromDB(t *testing.T) {
 		}
 		return r
 	}
-	// ExpectationsWereMet on every subtest pins the QUERY SET, not just the
-	// result: the single-source path must keep costing exactly two queries
-	// (plus the sources probe), and an extra round trip in the common case
-	// would fail here.
+	// Two mechanisms pin the QUERY SET, not just the result: sqlmock's
+	// ordered mode rejects an UNEXPECTED query at call time (that is what
+	// catches a new round trip on the single-source path), and
+	// ExpectationsWereMet catches the converse — a query the code stopped
+	// issuing, e.g. the sources probe silently skipped.
 	newDB := func(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 		t.Helper()
 		db, mock, err := sqlmock.New()
@@ -244,6 +270,23 @@ func TestOldestDeltaFromDB(t *testing.T) {
 		mock.ExpectQuery(archQ).WillReturnRows(archRows("weird", "p_2026080105", 1))
 		if _, err := OldestDeltaFromDB(context.Background(), db, "binlog_index"); err == nil {
 			t.Fatal("unparseable archive floor must propagate, not silently drop")
+		}
+	})
+
+	t.Run("archived hours naming no source are unattributable", func(t *testing.T) {
+		// COUNT(DISTINCT bintrail_id) == 0 with a valid MIN means every
+		// archive row has a NULL id (the column is nullable). Rows naming no
+		// source are the strongest case of "cannot attribute" — reading the
+		// zero as single-source would extend the floor with them.
+		db, mock := newDB(t)
+		mock.ExpectQuery(partsQ).WillReturnRows(partRows("p_2026080110"))
+		mock.ExpectQuery(archQ).WillReturnRows(archRows("p_2026080101", "p_2026080109", 0))
+		got, err := OldestDeltaFromDB(context.Background(), db, "binlog_index")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Hour.Equal(time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)) || !got.BelowIsUnknown {
+			t.Fatalf("got %+v — want the live floor with BelowIsUnknown", got)
 		}
 	})
 

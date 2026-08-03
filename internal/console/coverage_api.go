@@ -87,8 +87,8 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.Continuity = sum.Continuity
 	resp.LagSeconds = sum.LagSeconds
-	if !sum.DeltaFrom.IsZero() {
-		resp.DeltaFrom = sum.DeltaFrom.Format(consoleTSFormat)
+	if !sum.Floor.Hour.IsZero() {
+		resp.DeltaFrom = sum.Floor.Hour.Format(consoleTSFormat)
 	}
 	if !sum.DeltaTo.IsZero() {
 		resp.DeltaTo = sum.DeltaTo.Format(consoleTSFormat)
@@ -104,7 +104,7 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 	case b.baselineSrc == "":
 	case sessionRestricted(r):
 		recordProfileGateDeny(r, "coverage")
-	case sum.DeltaFrom.IsZero():
+	case sum.Floor.Hour.IsZero():
 		resp.FullTableStatus = "unknown"
 	default:
 		files, err := reconstruct.ListBaselines(r.Context(), b.baselineSrc)
@@ -121,20 +121,36 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 				newest[k] = f.SnapshotTime
 			}
 		}
+		// Graded THROUGH the floor, never against its hour alone: on a
+		// multi-source index the hour is the live floor and an anchor below
+		// it is unattributable, not broken (#1219). Grading with the bare
+		// hour would name healthy tables in broken_tables — the false alarm
+		// the floor's own narrowing exists to avoid.
 		var from time.Time
+		var unevaluable bool
 		for k, ts := range newest {
-			if status.BaselineStalenessFor(ts, sum.DeltaFrom, now) == status.BaselineBroken {
+			switch sum.Floor.Grade(ts, now) {
+			case status.BaselineBroken:
 				resp.BrokenTables = append(resp.BrokenTables, k)
-				continue
-			}
-			// The window covering ALL usable tables starts at the LATEST
-			// usable anchor: table i is reconstructable for points >= its
-			// own anchor, so "every table" holds only past the newest one.
-			if ts.After(from) {
-				from = ts
+			case status.BaselineUnknown:
+				// Neither broken nor usable: it must not join broken_tables
+				// AND must not define the window below, or "ok" would assert
+				// restorability from an anchor whose coverage is unknown.
+				unevaluable = true
+			default:
+				// The window covering ALL usable tables starts at the LATEST
+				// usable anchor: table i is reconstructable for points >= its
+				// own anchor, so "every table" holds only past the newest one.
+				if ts.After(from) {
+					from = ts
+				}
 			}
 		}
 		sort.Strings(resp.BrokenTables)
+		if unevaluable {
+			resp.FullTableStatus = "unknown"
+			break
+		}
 		if !from.IsZero() {
 			resp.FullTableFrom = from.Format(consoleTSFormat)
 		}
