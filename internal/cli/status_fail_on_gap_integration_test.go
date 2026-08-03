@@ -194,6 +194,25 @@ func TestRunStatus_failOnGap_exitCode(t *testing.T) {
 		}
 	})
 
+	// #1207: any other reason with a non-zero count is the same loss class →
+	// fail closed with the reason named (the #1034 case: stale snapshot).
+	if _, err := db.ExecContext(ctx,
+		`UPDATE stream_state SET capture_skips='{"column_count_mismatch":{"count":41203,"last_at":"2026-07-17T12:24:12Z"}}' WHERE id=1`); err != nil {
+		t.Fatalf("seed column_count_mismatch: %v", err)
+	}
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err == nil || !strings.Contains(err.Error(), "permanently dropped") || !strings.Contains(err.Error(), "column_count_mismatch") {
+			t.Errorf("want a fail-closed error naming the drop reason, got: %v", err)
+		}
+	})
+	stFailOnGap = false
+	captureStdout(t, func() {
+		if err := runStatus(statusCmd, nil); err != nil {
+			t.Errorf("default (no --fail-on-gap) must exit 0 with generic drops too, got: %v", err)
+		}
+	})
+	stFailOnGap = true
+
 	// An evaluated-and-clean ledger ("{}") → no alert.
 	if _, err := db.ExecContext(ctx, `UPDATE stream_state SET capture_skips='{}' WHERE id=1`); err != nil {
 		t.Fatalf("clear capture_skips: %v", err)

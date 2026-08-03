@@ -347,8 +347,9 @@ PostgreSQL replication slot (#532) after the capture process has exited.
 code — `status` is a report. Pass `--fail-on-gap` to exit non-zero when continuity
 is `gap_lost` **or** `unknown`; it **fails closed**, so an un-migrated legacy index
 or an unloadable stream state also trips it. It also exits non-zero when the
-capture ledger records in-scope `statement_format_dml` drops — those changes are
-permanently absent from the index, the same loss class as `gap_lost`. A **NULL**
+capture ledger records **any** dropped events — `statement_format_dml`,
+`column_count_mismatch`, and the rest — those changes are permanently absent
+from the index, the same loss class as `gap_lost`. A **NULL**
 capture ledger does not trip it (the column post-dates the flag, and alerting on
 its absence would fail every pre-existing deployment) — but a ledger that is
 *present and unreadable* does fail closed: a skip-aware daemon wrote it, and it
