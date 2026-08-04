@@ -1027,7 +1027,9 @@ func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 			// from it is the correct answer, not a dropped filter. Warned, not
 			// silent: the operator's window is being answered by a source that
 			// predates statement capture, and only they can tell whether that
-			// makes the overall answer incomplete.
+			// makes the overall answer incomplete. One line per scanned FILE —
+			// noisy over a wide window of old archives, and kept at Warn anyway,
+			// because the alternative is a quietly narrower answer.
 			slog.Warn("parquetquery: archive predates statement capture; it cannot match a statement-digest filter",
 				"query_hash", opts.QueryHash)
 			where = append(where, "1=0")

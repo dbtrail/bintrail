@@ -236,6 +236,15 @@ both accept:
 - `profile` — RBAC table-deny + column-redaction
 - `no_archive` — disable Parquet archive auto-routing (see below)
 
+`query` also takes `query_hash` — the 64-character statement digest of an event
+you already have, returning every event that statement produced across every
+table it touched. It selects a statement *shape* (literals are normalised
+away), so it is a read filter only: `recover` does not accept it, because a
+reversal scoped to a shape would undo executions nobody named. It is refused on
+surfaces that withhold statement text (the console's `/mcp`) and whenever a
+`profile` is active — the digest is blanked on every returned event there, so
+filtering on it would confirm what is withheld.
+
 The `pk` parameter takes the stored `pk_values` spelling — for a binary PK
 whose bytes are not valid UTF-8 that is `0x` + uppercase hex, see
 [Binary primary keys](query-and-recovery.md#binary-primary-keys-the-0x-hex-spelling).

@@ -96,6 +96,30 @@ func TestFetch_refusesQueryHashUnderProfileBeforeTouchingTheDB(t *testing.T) {
 	}
 }
 
+// TestFetchMergedOptions_validateRefusesQueryHashUnderProfile pins the check at
+// the ENTRY point rather than only inside Engine.Fetch. A window fully covered
+// by archives skips the MySQL fetch (QueryPlan.SkipMySQL), and the archive
+// engine builds its own predicate with no policy check of its own — so
+// "Engine.Fetch validates" is not by itself a guarantee about which tiers ran.
+//
+// validate() is called directly, not through FetchMerged: with a nil engine
+// FetchMerged reaches Engine.Fetch and returns the same error anyway, so the
+// public path cannot tell the two checks apart.
+func TestFetchMergedOptions_validateRefusesQueryHashUnderProfile(t *testing.T) {
+	o := FetchMergedOptions{
+		NoArchive: true,
+		AllowGaps: true,
+		Opts:      Options{QueryHash: testDigest, ProfileActive: true},
+	}
+	if err := o.validate(); !errors.Is(err, ErrQueryHashUnderProfile) {
+		t.Fatalf("err = %v, want ErrQueryHashUnderProfile", err)
+	}
+	o.Opts.ProfileActive = false
+	if err := o.validate(); err != nil {
+		t.Fatalf("err = %v, want the same options without a policy to validate cleanly", err)
+	}
+}
+
 // TestNormalizeQueryHash pins the shape check. Its value is entirely in the
 // failure cases: a digest that is silently wrong matches no row on any engine,
 // which is indistinguishable from a correct filter over a statement that

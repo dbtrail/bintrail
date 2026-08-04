@@ -139,6 +139,14 @@ func (o FetchMergedOptions) validate() error {
 	if !o.AllowGaps && o.DBName == "" && (o.Opts.Since != nil || o.Opts.Until != nil) {
 		return errors.New("FetchMerged: AllowGaps=false requires a non-empty DBName when a time range is set; gap detection cannot run without it")
 	}
+	// Checked here as well as in Engine.Fetch: a plan whose window is fully
+	// covered by archives skips the MySQL fetch entirely (QueryPlan.SkipMySQL),
+	// and the archive engine builds its own predicate with no policy check of
+	// its own. Asserting it at the entry point costs one call and does not
+	// depend on which tiers happen to run.
+	if err := o.Opts.ValidateStatementFilter(); err != nil {
+		return err
+	}
 	return nil
 }
 
