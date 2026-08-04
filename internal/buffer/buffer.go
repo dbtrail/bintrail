@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -171,7 +172,7 @@ func (b *Buffer) Fetch(_ context.Context, opts query.Options) []query.ResultRow 
 		// profiles today), but if profile options ever reach it, statement
 		// text must not be the surface that leaks. The stored entry is
 		// untouched — row is a copy, and QueryText is only niled on it.
-		if opts.ProfileActive || len(opts.RedactColumns) > 0 || len(opts.DenyTables) > 0 {
+		if opts.RedactionActive() {
 			row.QueryText = nil
 			row.QueryHash = nil
 		}
@@ -282,6 +283,18 @@ func matchesOpts(e *entry, opts query.Options) bool {
 	}
 	if opts.Until != nil && r.EventTimestamp.After(*opts.Until) {
 		return false
+	}
+	if opts.QueryHash != "" {
+		// A buffered event NEVER carries a digest: STATEMENT_DIGEST is computed
+		// on the index connection when the batch is inserted, and these events
+		// have not been inserted yet (see Insert). So a digest filter excludes
+		// the whole buffer — stated as a rule rather than left to the nil
+		// comparison below, because the failure mode of omitting this branch is
+		// not an empty result, it is buffered rows flowing UNFILTERED into a
+		// digest-scoped answer and being read as that statement's work.
+		if r.QueryHash == nil || !strings.EqualFold(*r.QueryHash, opts.QueryHash) {
+			return false
+		}
 	}
 	if opts.ChangedColumn != "" && !slices.Contains(r.ChangedColumns, opts.ChangedColumn) {
 		return false

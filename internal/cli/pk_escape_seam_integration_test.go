@@ -120,6 +120,7 @@ func resetQueryGlobals(t *testing.T) {
 	qIndexDSN, qSchema, qTable, qPK = "", "", "", ""
 	qPKs, qLimitPerPK, qEventType, qGTID = nil, 0, "", ""
 	qSince, qUntil, qChangedCol, qColumnEq = "", "", "", nil
+	qQueryHash = ""
 	qFlag, qFormat, qLimit, qOrder = "", "table", 100, "ASC"
 	qArchiveDir, qArchiveS3, qBintrailID, qProfile = "", "", "", ""
 	qNoArchive, qIncludeSnapshot, qBaseline = true, false, ""

@@ -253,10 +253,29 @@ type Options struct {
 	// MySQL engine ignores it. Populated from QueryPlan.MisfiledArchiveHours
 	// (or query.MisfiledArchiveHours) by callers that prune archives by time.
 	ExtraArchiveHours []time.Time
-	ChangedColumn     string     // column name; matched via JSON_CONTAINS
-	ColumnEq          []ColumnEq // match against values inside row_after / row_before
-	Flag              string     // return events from tables/columns carrying this flag
-	Limit             int        // 0 → no limit (no LIMIT clause emitted)
+	ChangedColumn     string // column name; matched via JSON_CONTAINS
+	// QueryHash restricts results to the events produced by ONE statement
+	// digest: the 64-char hex STATEMENT_DIGEST() stored in
+	// binlog_events.query_hash at index time (#699). It is populated only while
+	// the source logs the originating statement
+	// (binlog_rows_query_log_events=ON, or MariaDB's
+	// binlog_annotate_row_events) — against an index captured without it the
+	// column is NULL everywhere and this filter correctly matches nothing.
+	//
+	// The digest identifies a statement SHAPE, not one execution: literals are
+	// normalised away, so `WHERE id=1` and `WHERE id=999` share a digest and
+	// every execution of that shape inside the window matches. That is why this
+	// is a READ filter and is deliberately not offered on recover — a reversal
+	// scoped to a shape would undo executions the operator never named. Pinning
+	// one execution needs connection_id + digest + time, which is a separate
+	// correlation problem.
+	//
+	// Matched case-sensitively on the archive side (DuckDB), so the canonical
+	// lowercase form is required — NormalizeQueryHash produces it.
+	QueryHash string
+	ColumnEq  []ColumnEq // match against values inside row_after / row_before
+	Flag      string     // return events from tables/columns carrying this flag
+	Limit     int        // 0 → no limit (no LIMIT clause emitted)
 	// LimitPerPK caps the number of latest events returned per pk_values value.
 	// 0 = unlimited. Applied via ROW_NUMBER OVER (PARTITION BY pk_values
 	// ORDER BY event_timestamp DESC, event_id DESC) so the kept events are
@@ -338,6 +357,9 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 	if err := opts.validateCursor(); err != nil {
 		return nil, err
 	}
+	if err := opts.ValidateStatementFilter(); err != nil {
+		return nil, err
+	}
 	q, args := buildQuery(opts)
 	rows, err := e.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -359,10 +381,69 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 	// profile with ZERO rules (ProfileActive): query_text is per-STATEMENT,
 	// so rows of an ALLOWED table can carry a statement whose literals
 	// belong to a denied sibling table — see applyRedaction (#699).
-	if opts.ProfileActive || len(opts.RedactColumns) > 0 || len(opts.DenyTables) > 0 {
+	if opts.RedactionActive() {
 		applyRedaction(results, opts.RedactColumns)
 	}
 	return results, nil
+}
+
+// RedactionActive reports whether an RBAC policy is in force for these options.
+// It is the single predicate every surface must consult: the redaction pass
+// fires on a NAMED profile even when it resolved to zero rules (#838), and on
+// deny/redact rules supplied without one. Two copies of this condition would
+// drift, and the drift is silent — see ValidateStatementFilter.
+func (o Options) RedactionActive() bool {
+	return o.ProfileActive || len(o.RedactColumns) > 0 || len(o.DenyTables) > 0
+}
+
+// ErrQueryHashUnderProfile is returned when a statement-digest filter is
+// combined with an active RBAC policy.
+//
+// The digest is blanked on EVERY returned row under a policy (see
+// applyRedaction) precisely because a stable digest leaks statement shape and
+// permits dictionary confirmation of the literals it carried. Honouring a
+// filter over that same column would hand back the answer the blanking
+// withholds — "these rows came from the statement you guessed" — one candidate
+// digest at a time. Refusing is the only consistent option: silently dropping
+// the filter would over-return, and an empty result set would read as "that
+// statement touched nothing", a false negative on a forensic question.
+//
+// The message names no CLI flag: this error reaches MCP clients too, and an
+// agent handed a --flag it cannot type will invent one.
+var ErrQueryHashUnderProfile = errors.New(
+	"statement-digest filter unavailable while an RBAC profile is active: the digest is withheld from every returned row, so filtering on it would confirm the statement that redaction hides")
+
+// ValidateStatementFilter rejects option combinations the redaction contract
+// cannot honour. Called by Fetch, so every engine path is covered.
+func (o Options) ValidateStatementFilter() error {
+	if o.QueryHash != "" && o.RedactionActive() {
+		return ErrQueryHashUnderProfile
+	}
+	return nil
+}
+
+// NormalizeQueryHash canonicalises a user-supplied statement digest to the form
+// stored in binlog_events.query_hash: 64 lowercase hex characters, as produced
+// by MySQL's STATEMENT_DIGEST(). An empty input stays empty (no filter).
+//
+// Validating the SHAPE here is what keeps a mistake loud. The natural error —
+// pasting the statement TEXT, or a truncated digest — would otherwise match no
+// row on either engine and be indistinguishable from a correct filter over a
+// statement that genuinely touched nothing.
+func NormalizeQueryHash(s string) (string, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return "", nil
+	}
+	if len(s) != 64 {
+		return "", fmt.Errorf("statement digest must be the 64-character hex STATEMENT_DIGEST stored in query_hash, got %d characters", len(s))
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", fmt.Errorf("statement digest must be hexadecimal, found %q", c)
+		}
+	}
+	return s, nil
 }
 
 // sortResults orders rows by (event_timestamp, event_id) in dir ("ASC"/"DESC"),
@@ -542,6 +623,14 @@ func buildQuery(opts Options) (string, []any) {
 		needle, _ := json.Marshal(opts.ChangedColumn)
 		where = append(where, "JSON_CONTAINS(changed_columns, ?)")
 		args = append(args, string(needle))
+	}
+	if opts.QueryHash != "" {
+		// Lowercased for parity with the archive side: MySQL's CHAR(64) compares
+		// case-insensitively under the default collation, DuckDB does not, and a
+		// filter that matches live rows but not archived ones would report a
+		// statement as having stopped touching rows at the rotation boundary.
+		where = append(where, "query_hash = ?")
+		args = append(args, strings.ToLower(opts.QueryHash))
 	}
 	for _, ce := range opts.ColumnEq {
 		// Defense-in-depth: ParseColumnEq is the canonical entry, but

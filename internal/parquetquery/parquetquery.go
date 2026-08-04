@@ -834,7 +834,7 @@ func fileArrayLiteral(files []string) string {
 // connection_id when it is absent from every file, matching buildQueryForFile
 // so archives written before that column read back correctly.
 func buildQueryFromFiles(files []string, opts query.Options, cols map[string]bool) (string, []any) {
-	where, args := buildFilters(opts)
+	where, args := buildFilters(opts, cols)
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
 		" gtid, " + optionalCol(cols, "connection_id", "INT32") + ", schema_name, table_name, event_type, pk_values," +
@@ -875,7 +875,7 @@ func buildGlob(source string) string {
 // sorting after collecting all results. Skipping ORDER BY lets DuckDB stream
 // rows without buffering the full result set, dramatically reducing memory.
 func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
-	where, args := buildFilters(opts)
+	where, args := buildFilters(opts, nil)
 	safePath := strings.ReplaceAll(path, "'", "''")
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +
@@ -897,7 +897,7 @@ func buildUnsortedQuery(path string, opts query.Options) (string, []any) {
 // The glob is embedded directly in the SQL because DuckDB table functions do not
 // support bind parameters for the file path argument.
 func buildQuery(glob string, opts query.Options) (string, []any) {
-	where, args := buildFilters(opts)
+	where, args := buildFilters(opts, nil)
 
 	// Escape single quotes in the glob path to prevent SQL injection.
 	safeGlob := strings.ReplaceAll(glob, "'", "''")
@@ -937,7 +937,7 @@ func limitPerPKClause(opts query.Options) (string, []any) {
 }
 
 // buildFilters extracts WHERE clause fragments and bind args from query options.
-func buildFilters(opts query.Options) ([]string, []any) {
+func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 	var where []string
 	var args []any
 
@@ -1017,6 +1017,30 @@ func buildFilters(opts query.Options) ([]string, []any) {
 		where = append(where, "json_contains(changed_columns, ?)")
 		args = append(args, string(needle))
 	}
+	if opts.QueryHash != "" {
+		if cols != nil && !cols["query_hash"] {
+			// Pre-#699 archive: the column exists in NONE of the scanned files,
+			// and parquet_scan errors on a predicate over a column it cannot
+			// resolve — the same trap optionalCol handles for the SELECT list,
+			// which is why this cannot be left to the projection. Such a file
+			// provably holds no event carrying any digest, so an empty result
+			// from it is the correct answer, not a dropped filter. Warned, not
+			// silent: the operator's window is being answered by a source that
+			// predates statement capture, and only they can tell whether that
+			// makes the overall answer incomplete.
+			slog.Warn("parquetquery: archive predates statement capture; it cannot match a statement-digest filter",
+				"query_hash", opts.QueryHash)
+			where = append(where, "1=0")
+		} else {
+			// Lowercased because DuckDB compares strings case-sensitively while
+			// MySQL's default collation does not: without this the same filter
+			// would return live rows and drop their archived counterparts,
+			// which reads as "the statement stopped touching rows" at exactly
+			// the rotation boundary.
+			where = append(where, "query_hash = ?")
+			args = append(args, strings.ToLower(opts.QueryHash))
+		}
+	}
 	for _, ce := range opts.ColumnEq {
 		// DuckDB does not bind JSON paths either, so the column name is
 		// interpolated; re-validate via the shared allowlist for the same
@@ -1085,7 +1109,7 @@ func optionalCol(cols map[string]bool, name, sqlType string) string {
 // buildQueryForFile constructs a DuckDB query for a single parquet file,
 // substituting typed NULLs for optional columns not present in the file.
 func buildQueryForFile(path string, opts query.Options, cols map[string]bool) (string, []any) {
-	where, args := buildFilters(opts)
+	where, args := buildFilters(opts, cols)
 	safePath := strings.ReplaceAll(path, "'", "''")
 
 	q := "SELECT event_id, binlog_file, start_pos, end_pos, event_timestamp," +

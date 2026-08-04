@@ -47,7 +47,10 @@ Examples:
 
   # Rows where 'status' changed
   bintrail query --index-dsn "..." --schema mydb --table orders \
-    --changed-column status --since "2026-02-19 14:00:00"`,
+    --changed-column status --since "2026-02-19 14:00:00"
+
+  # Everything one statement did, across every table it touched
+  bintrail query --index-dsn "..." --query-hash 9c1e...  # from a previous result's query_hash`,
 	RunE: runQuery,
 }
 
@@ -63,6 +66,7 @@ var (
 	qSince           string
 	qUntil           string
 	qChangedCol      string
+	qQueryHash       string
 	qColumnEq        []string
 	qFlag            string
 	qFormat          string
@@ -89,6 +93,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qSince, "since", "", "Filter events at or after this time (2006-01-02 15:04:05, interpreted as UTC; use RFC3339 with an explicit offset, e.g. 2006-01-02T15:04:05-05:00, for another zone)")
 	queryCmd.Flags().StringVar(&qUntil, "until", "", "Filter events at or before this time (2006-01-02 15:04:05, interpreted as UTC; use RFC3339 with an explicit offset, e.g. 2006-01-02T15:04:05-05:00, for another zone)")
 	queryCmd.Flags().StringVar(&qChangedCol, "changed-column", "", "Filter UPDATEs that modified this column")
+	queryCmd.Flags().StringVar(&qQueryHash, "query-hash", "", "Filter to the events produced by one statement digest (the 64-char query_hash from a previous result; needs binlog_rows_query_log_events=ON at capture time). Matches every execution of that statement shape in the window")
 	queryCmd.Flags().StringArrayVar(&qColumnEq, "column-eq", nil, "Filter events where a column in row_after or row_before equals the given value (format: column=value, repeat for AND; literal NULL matches JSON null)")
 	queryCmd.Flags().StringVar(&qFlag, "flag", "", "Filter events from tables or columns carrying this flag (see 'bintrail flag list')")
 	queryCmd.Flags().StringVar(&qFormat, "format", "table", "Output format: table, json, or csv")
@@ -151,6 +156,17 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if len(qColumnEq) > 0 && (qSchema == "" || qTable == "") {
 		return fmt.Errorf("--column-eq requires both --schema and --table")
+	}
+	queryHash, err := query.NormalizeQueryHash(qQueryHash)
+	if err != nil {
+		return fmt.Errorf("--query-hash: %w", err)
+	}
+	// Refused here as well as in the engine so the operator gets the flag names
+	// back. Under a profile the digest is blanked on every returned row, so
+	// filtering on it would confirm the statement the redaction hides — see
+	// query.ErrQueryHashUnderProfile.
+	if queryHash != "" && qProfile != "" {
+		return fmt.Errorf("--query-hash cannot be combined with --profile: the statement digest is withheld from every row under a profile, so filtering on it would confirm what the profile hides")
 	}
 	columnEq, err := query.ParseColumnEqs(qColumnEq)
 	if err != nil {
@@ -224,6 +240,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		Since:         since,
 		Until:         until,
 		ChangedColumn: qChangedCol,
+		QueryHash:     queryHash,
 		ColumnEq:      columnEq,
 		Flag:          qFlag,
 		Limit:         qLimit,

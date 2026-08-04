@@ -163,6 +163,14 @@ func shouldSkipSnapshot(opts Options) (string, bool) {
 	if opts.ChangedColumn != "" {
 		return "--changed-column set (baseline rows have no changed-columns metadata)", true
 	}
+	if opts.QueryHash != "" {
+		// A baseline row is a materialised row image, not a statement's effect:
+		// no statement produced it, so it can never carry the digest asked for.
+		// Skipping the whole source is what the other always-excluders do, and
+		// it keeps the filter honest — a snapshot row surviving a
+		// statement-scoped query would claim provenance it does not have.
+		return "--query-hash set (baseline rows carry no statement digest)", true
+	}
 	if opts.Flag != "" {
 		return "--flag set (baseline rows do not carry table_flags)", true
 	}

@@ -455,6 +455,7 @@ type QueryArgs struct {
 	Since         string   `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
 	Until         string   `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
 	ChangedColumn string   `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
+	QueryHash     string   `json:"query_hash,omitempty" jsonschema:"Filter to the events produced by one statement digest: the 64-character query_hash of an event you already have. It identifies a statement SHAPE so every execution of that statement in the window matches. Unavailable on surfaces that withhold statement text."`
 	ColumnEq      []string `json:"column_eq,omitempty" jsonschema:"Filter events where a column in row_after or row_before equals the given value. Each entry is column=value. Repeat for AND. Literal NULL matches JSON null."`
 	Flag          string   `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
 	Format        string   `json:"format,omitempty" jsonschema:"Output format: json table or csv (default: json)"`
@@ -549,6 +550,22 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		if err != nil {
 			return ErrorResult(err), nil, nil
 		}
+
+		// Set after BuildQueryOptions rather than through it: the recover tool
+		// shares that builder and must NOT gain this filter (a digest names a
+		// statement shape, so a reversal scoped to one would undo executions
+		// nobody asked about — see query.Options.QueryHash).
+		queryHash, err := query.NormalizeQueryHash(args.QueryHash)
+		if err != nil {
+			return ErrorResult(err), nil, nil
+		}
+		if queryHash != "" && t.RedactStatementText {
+			// A surface that strips the digest from every event it returns
+			// cannot also let a client test candidate digests against it: that
+			// hands back the withheld association one guess at a time.
+			return ErrorResult(errors.New("query_hash filtering is unavailable on this surface: the statement digest is withheld from every returned event, so filtering on it would confirm what is withheld")), nil, nil
+		}
+		opts.QueryHash = queryHash
 
 		// Hard ceiling on an explicit, oversized limit (#654). BuildQueryOptions
 		// already coerces limit<=0 to the default, so this only bounds a large
