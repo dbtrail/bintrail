@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"database/sql"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -76,5 +77,23 @@ func TestQueryTool_queryHashRefusedWhenStatementTextIsWithheld(t *testing.T) {
 				t.Fatalf("unfiltered query refused by the digest gate: %s", resultText(res))
 			}
 		})
+	}
+}
+
+// TestRecoverArgs_hasNoQueryHashParam enforces on the MCP surface the rule the
+// CLI test enforces on cobra: a digest names a statement SHAPE, so a reversal
+// scoped to one would undo every execution of that shape in the window — none
+// of which the operator named.
+//
+// The realistic regression is not the shared BuildQueryOptions (its positional
+// signature makes leakage hard) but someone adding QueryHash to RecoverArgs
+// "for symmetry" with QueryArgs. The blast radius of that mistake is generated
+// reversal SQL, so it gets its own assertion rather than a comment.
+func TestRecoverArgs_hasNoQueryHashParam(t *testing.T) {
+	rt := reflect.TypeOf(RecoverArgs{})
+	for i := range rt.NumField() {
+		if tag := rt.Field(i).Tag.Get("json"); strings.HasPrefix(tag, "query_hash") {
+			t.Fatalf("RecoverArgs.%s exposes %q: recover must never be scoped by statement digest", rt.Field(i).Name, tag)
+		}
 	}
 }

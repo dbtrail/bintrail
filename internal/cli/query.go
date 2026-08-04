@@ -93,7 +93,7 @@ func init() {
 	queryCmd.Flags().StringVar(&qSince, "since", "", "Filter events at or after this time (2006-01-02 15:04:05, interpreted as UTC; use RFC3339 with an explicit offset, e.g. 2006-01-02T15:04:05-05:00, for another zone)")
 	queryCmd.Flags().StringVar(&qUntil, "until", "", "Filter events at or before this time (2006-01-02 15:04:05, interpreted as UTC; use RFC3339 with an explicit offset, e.g. 2006-01-02T15:04:05-05:00, for another zone)")
 	queryCmd.Flags().StringVar(&qChangedCol, "changed-column", "", "Filter UPDATEs that modified this column")
-	queryCmd.Flags().StringVar(&qQueryHash, "query-hash", "", "Filter to the events produced by one statement digest (the 64-char query_hash from a previous result; MySQL/MariaDB sources only, and only while the source logs statements: binlog_rows_query_log_events / binlog_annotate_row_events). Matches every execution of that statement shape in the window")
+	queryCmd.Flags().StringVar(&qQueryHash, "query-hash", "", "Filter to the events produced by one statement digest (the 64-char query_hash from a previous result; MySQL/MariaDB sources only, and only while the source logs statements: binlog_rows_query_log_events, or binlog_annotate_row_events plus --source-flavor mariadb when streaming). Matches every execution of that statement shape in the window")
 	queryCmd.Flags().StringArrayVar(&qColumnEq, "column-eq", nil, "Filter events where a column in row_after or row_before equals the given value (format: column=value, repeat for AND; literal NULL matches JSON null)")
 	queryCmd.Flags().StringVar(&qFlag, "flag", "", "Filter events from tables or columns carrying this flag (see 'bintrail flag list')")
 	queryCmd.Flags().StringVar(&qFormat, "format", "table", "Output format: table, json, or csv")
@@ -246,6 +246,14 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		Limit:         qLimit,
 		LimitPerPK:    qLimitPerPK,
 		Order:         qOrder,
+	}
+
+	// The engine validates this too, but a fully-archived window skips
+	// Engine.Fetch (see plan.SkipMySQL below) and the archive engine carries no
+	// policy check of its own — so on that path this call is the only one that
+	// runs.
+	if err := opts.ValidateStatementFilter(); err != nil {
+		return err
 	}
 
 	// ── Connect and fetch from the index ─────────────────────────────────────
@@ -444,6 +452,25 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if n >= qLimit {
 		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows. Use a narrower time range or --limit to adjust.\n", qLimit)
+	}
+	// An empty digest-filtered result means one of two opposite things. Probe
+	// only here — after the answer came back empty — so the cost lands on the
+	// query that needs the disambiguation and on no other. Both channels, per
+	// the archive-visibility invariant: a --log-level change must not be able
+	// to silence the line that says the answer is structurally narrower than it
+	// looks. A failed probe is itself reported: falling back to silence would
+	// restore exactly the ambiguity this exists to remove.
+	if opts.QueryHash != "" && n == 0 {
+		captured, probeErr := query.DigestCaptureInWindow(cmd.Context(), db, opts)
+		switch {
+		case probeErr != nil:
+			fmt.Fprintf(os.Stderr, "Warning: could not determine whether this window carries statement digests: %s\n", probeErr)
+			slog.Warn("statement-digest capture probe failed", "error", probeErr)
+		case !captured:
+			fmt.Fprintln(os.Stderr, query.NoDigestCaptureWarning)
+			slog.Warn("no statement digests in window; empty result is not evidence the statement touched nothing",
+				"query_hash", opts.QueryHash)
+		}
 	}
 	return nil
 }

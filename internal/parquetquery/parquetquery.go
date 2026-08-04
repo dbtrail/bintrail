@@ -177,6 +177,7 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 	if colErr != nil {
 		return nil, fmt.Errorf("read parquet schema: %w", colErr)
 	}
+	reportDigestCoverage(ctx, db, "'"+strings.ReplaceAll(glob, "'", "''")+"'", source, opts)
 	q, args := buildQueryForFile(glob, opts, cols)
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -243,6 +244,7 @@ func queryFileList(ctx context.Context, db *sql.DB, files []string, opts query.O
 	if err != nil {
 		return nil, fmt.Errorf("read parquet schema: %w", err)
 	}
+	reportDigestCoverage(ctx, db, fileArrayLiteral(files), "s3-direct", opts)
 	q, args := buildQueryFromFiles(files, opts, cols)
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -708,6 +710,7 @@ func queryLocalFile(ctx context.Context, db *sql.DB, path, srcURL string, opts q
 	if colErr != nil {
 		return nil, fmt.Errorf("read parquet schema %s: %w", srcURL, colErr)
 	}
+	reportDigestCoverage(ctx, db, "'"+strings.ReplaceAll(path, "'", "''")+"'", srcURL, opts)
 	q, args := buildQueryForFile(path, opts, cols)
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -1019,19 +1022,19 @@ func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 	}
 	if opts.QueryHash != "" {
 		if cols != nil && !cols["query_hash"] {
-			// Pre-#699 archive: the column exists in NONE of the scanned files,
-			// and parquet_scan errors on a predicate over a column it cannot
-			// resolve — the same trap optionalCol handles for the SELECT list,
-			// which is why this cannot be left to the projection. Such a file
-			// provably holds no event carrying any digest, so an empty result
-			// from it is the correct answer, not a dropped filter. Warned, not
-			// silent: the operator's window is being answered by a source that
-			// predates statement capture, and only they can tell whether that
-			// makes the overall answer incomplete. One line per scanned FILE —
-			// noisy over a wide window of old archives, and kept at Warn anyway,
-			// because the alternative is a quietly narrower answer.
-			slog.Warn("parquetquery: archive predates statement capture; it cannot match a statement-digest filter",
-				"query_hash", opts.QueryHash)
+			// The column exists in NONE of the scanned files, and parquet_scan
+			// errors on a predicate over a column it cannot resolve — the same
+			// trap optionalCol handles for the SELECT list, which is why this
+			// cannot be left to the projection. Such a file provably holds no
+			// event carrying any digest, so contributing nothing is the correct
+			// answer, not a dropped filter.
+			//
+			// Reporting deliberately does NOT live here. cols is a UNION over
+			// the scanned set on two of the three entry paths, so this branch
+			// says nothing about the case that actually matters — a set MIXED
+			// across the #699 upgrade, where the predicate IS emitted and the
+			// older files quietly pad to NULL. reportDigestCoverage is where
+			// that distinction is visible; see it for what the operator is told.
 			where = append(where, "1=0")
 		} else {
 			// Lowercased because DuckDB compares strings case-sensitively while
@@ -1093,6 +1096,56 @@ func parquetColumns(ctx context.Context, db *sql.DB, path string) (map[string]bo
 		cols[n] = true
 	}
 	return cols, nil
+}
+
+// digestCoverageWarning renders what an operator must be told when only part of
+// the scanned archive set can carry a statement digest. Pure so the wording and
+// the boundaries are testable without DuckDB.
+//
+// Both non-empty verdicts describe the SAME row-level outcome — those files
+// contribute nothing — and that outcome is correct. What is not acceptable is
+// it happening silently: a narrower answer that looks identical to "the
+// statement touched nothing" is the failure this whole filter is written
+// against. Returns "" when every scanned file can answer, which is the steady
+// state once every archive postdates the upgrade.
+func digestCoverageWarning(withDigest, total int) string {
+	switch {
+	case total == 0 || withDigest >= total:
+		return ""
+	case withDigest == 0:
+		return fmt.Sprintf("no archive file in this source has a statement-digest column (%d file(s), all written before statement capture); this source contributes no rows to a --query-hash answer", total)
+	default:
+		return fmt.Sprintf("%d of %d archive file(s) in this source predate statement capture and contribute no rows to a --query-hash answer", total-withDigest, total)
+	}
+}
+
+// reportDigestCoverage probes how many of the scanned parquet files carry
+// query_hash and warns when some or all of them cannot.
+//
+// scanTarget is the parquet_schema() argument the caller would pass to
+// parquet_scan (a quoted glob, or an array literal from fileArrayLiteral);
+// source names it in the warning, because a query can span several registered
+// archive sources and "some files are old" is useless without knowing which.
+//
+// Best-effort by construction: it reads footers only, it runs ONLY under a
+// digest filter, and a probe failure downgrades to a warning about the probe
+// rather than failing a query whose rows are already correct.
+func reportDigestCoverage(ctx context.Context, db *sql.DB, scanTarget, source string, opts query.Options) {
+	if opts.QueryHash == "" {
+		return
+	}
+	var total, withDigest int
+	err := db.QueryRowContext(ctx,
+		"SELECT count(DISTINCT file_name), count(DISTINCT CASE WHEN name = 'query_hash' THEN file_name END) FROM parquet_schema("+scanTarget+")").
+		Scan(&total, &withDigest)
+	if err != nil {
+		slog.Warn("could not determine statement-digest coverage of this archive source; a narrower answer would go unreported",
+			"source", source, "error", err)
+		return
+	}
+	if w := digestCoverageWarning(withDigest, total); w != "" {
+		slog.Warn("parquetquery: "+w, "source", source, "query_hash", opts.QueryHash)
+	}
 }
 
 // optionalCol returns the bare column name when the scanned parquet source has

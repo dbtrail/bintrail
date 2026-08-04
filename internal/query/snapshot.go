@@ -147,8 +147,8 @@ func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow,
 
 // shouldSkipSnapshot reports whether any filter in opts rules out the entire
 // snapshot source before the DuckDB query runs. It is the unit-testable
-// truth table for the four always-excluder filters: wrong event-type, gtid,
-// changed-column, flag. Extracted so the branches are testable without
+// truth table for the five always-excluder filters: wrong event-type, gtid,
+// changed-column, flag, query-hash. Extracted so the branches are testable without
 // standing up DuckDB.
 //
 // Returns (reason, true) when the source must be skipped, with a

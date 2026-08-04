@@ -286,8 +286,10 @@ func matchesOpts(e *entry, opts query.Options) bool {
 	}
 	if opts.QueryHash != "" {
 		// A buffered event NEVER carries a digest: STATEMENT_DIGEST is computed
-		// on the index connection when the batch is inserted, and these events
-		// have not been inserted yet (see Insert). So a digest filter excludes
+		// on the index connection at insert time, and a buffered event has not
+		// reached one — in BYOS mode it may never reach one at all (payload to
+		// the customer's S3, metadata to the API; no digest is computed on
+		// either path). See Insert. So a digest filter excludes
 		// the whole buffer — stated as a rule rather than left to the nil
 		// comparison below, because the failure mode of omitting this branch is
 		// not an empty result, it is buffered rows flowing UNFILTERED into a

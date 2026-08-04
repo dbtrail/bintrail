@@ -260,7 +260,11 @@ type Options struct {
 	// the source logs the originating statement
 	// (binlog_rows_query_log_events=ON, or MariaDB's
 	// binlog_annotate_row_events) — against an index captured without it the
-	// column is NULL everywhere and this filter correctly matches nothing.
+	// column is NULL everywhere and this filter matches nothing. That empty
+	// result is ambiguous on its own, which is what DigestCaptureInWindow is
+	// for. (A pre-#699 index that never ran EnsureSchema lacks the COLUMN, not
+	// just the values; that is a 1054 from the SELECT list, filter or no
+	// filter.)
 	//
 	// The digest identifies a statement SHAPE, not one execution: literals are
 	// normalised away, so `WHERE id=1` and `WHERE id=999` share a digest and
@@ -388,10 +392,14 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 }
 
 // RedactionActive reports whether an RBAC policy is in force for these options.
-// It is the single predicate every surface must consult: the redaction pass
+// It is the single predicate every OPTIONS-level surface must consult: the
+// redaction pass
 // fires on a NAMED profile even when it resolved to zero rules (#838), and on
 // deny/redact rules supplied without one. Two copies of this condition would
-// drift, and the drift is silent — see ValidateStatementFilter.
+// drift, and the drift is silent — see ValidateStatementFilter. (Two sibling
+// copies of the same three terms survive over OTHER receivers — console
+// Server.rbacActive and mcptools recover-cascade — which cannot call this
+// method; they are known, not overlooked.)
 func (o Options) RedactionActive() bool {
 	return o.ProfileActive || len(o.RedactColumns) > 0 || len(o.DenyTables) > 0
 }
@@ -421,6 +429,62 @@ func (o Options) ValidateStatementFilter() error {
 	}
 	return nil
 }
+
+// DigestCaptureInWindow reports whether the index holds at least ONE event
+// carrying a statement digest inside the window opts describes.
+//
+// It exists to disambiguate the one result a digest filter cannot explain by
+// itself: ZERO rows. That is either "this statement touched nothing" or "no
+// event here could have carried a digest" — the source was not logging
+// statements (MySQL defaults binlog_rows_query_log_events OFF), a MariaDB
+// stream ran without --source-flavor mariadb, the window predates #699, or the
+// source is Postgres, whose capture plane writes the column never. Those are
+// opposite answers to a forensic question and they print identically.
+//
+// Cost is why this is a separate call rather than part of every fetch: there is
+// no index on query_hash, so an all-NULL window scans its partitions to prove
+// the negative. Callers must invoke it ONLY after a digest-filtered fetch came
+// back empty — never on the hot path — and it is bounded by the same
+// schema/table/time predicates the query itself used.
+func DigestCaptureInWindow(ctx context.Context, db *sql.DB, opts Options) (bool, error) {
+	where := []string{"query_hash IS NOT NULL"}
+	var args []any
+	if opts.Schema != "" {
+		where = append(where, "schema_name = ?")
+		args = append(args, opts.Schema)
+	}
+	if opts.Table != "" {
+		where = append(where, "table_name = ?")
+		args = append(args, opts.Table)
+	}
+	// Hour-aligned TO_SECONDS literals for partition pruning, same as
+	// buildQuery: a parameterised datetime comparison prunes nothing, and
+	// pruning is the entire cost control here.
+	if opts.Since != nil {
+		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", mysqlToSeconds(opts.Since.Truncate(time.Hour))))
+	}
+	if opts.Until != nil {
+		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", mysqlToSeconds(opts.Until.Truncate(time.Hour).Add(time.Hour))))
+	}
+	q := "SELECT 1 FROM binlog_events WHERE " + strings.Join(where, " AND ") + " LIMIT 1"
+
+	var one int
+	err := db.QueryRowContext(ctx, q, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("probe statement-digest capture: %w", err)
+	}
+	return true, nil
+}
+
+// NoDigestCaptureWarning is the operator-facing text for a digest-filtered
+// query that returned nothing from a window where nothing COULD have matched.
+// Shared so the CLI's stderr line and the MCP notice cannot drift into saying
+// different things about the same finding.
+const NoDigestCaptureWarning = "Warning: no event in this window carries a statement digest, so this empty result does NOT mean the statement touched nothing. " +
+	"The source was not logging statements when these events were captured (MySQL: binlog_rows_query_log_events, MariaDB: binlog_annotate_row_events + --source-flavor mariadb; PostgreSQL sources never populate it)."
 
 // NormalizeQueryHash canonicalises a user-supplied statement digest to the form
 // stored in binlog_events.query_hash: 64 lowercase hex characters, as produced
@@ -625,8 +689,9 @@ func buildQuery(opts Options) (string, []any) {
 		args = append(args, string(needle))
 	}
 	if opts.QueryHash != "" {
-		// Lowercased for parity with the archive side: MySQL's CHAR(64) compares
-		// case-insensitively under the default collation, DuckDB does not, and a
+		// Lowercased for parity with the archive side: under a stock
+		// case-insensitive default collation (binlog_events declares none of its
+		// own) MySQL compares query_hash case-insensitively, DuckDB never does, and a
 		// filter that matches live rows but not archived ones would report a
 		// statement as having stopped touching rows at the rotation boundary.
 		where = append(where, "query_hash = ?")

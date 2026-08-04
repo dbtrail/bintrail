@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/testutil"
@@ -71,9 +72,9 @@ func TestFetch_queryHashFilter(t *testing.T) {
 		t.Errorf("table spread = %v, want 2 orders + 1 order_lines", tables)
 	}
 
-	// Case is the trap: MySQL's default collation compares CHAR(64)
-	// case-insensitively, DuckDB does not, so the engines only agree on a
-	// canonicalised digest. Passing the un-normalised form must not change the
+	// Case is the trap: under a stock case-insensitive default collation MySQL
+	// compares query_hash case-insensitively while DuckDB never does, so the
+	// engines only agree on a canonicalised digest. Passing the un-normalised form must not change the
 	// answer here either.
 	upper, err := e.Fetch(context.Background(), Options{QueryHash: strings.ToUpper(digestA), Limit: 100})
 	if err != nil {
@@ -121,5 +122,55 @@ func insertWithStatement(t *testing.T, db *sql.DB, ts string, pos uint64, schema
 		pos, pos+100, ts, schema, table, pk, `{"id":1}`, stmt, digest)
 	if err != nil {
 		t.Fatalf("insert event: %v", err)
+	}
+}
+
+// TestDigestCaptureInWindow is the probe that makes an empty digest-filtered
+// result readable. Zero rows means either "this statement touched nothing" or
+// "nothing here could have carried a digest", and those print identically —
+// the second is the one that ends an investigation early.
+//
+// The window scoping is asserted, not just the boolean: a probe that ignored
+// --since/--until would answer about the wrong hours and report capture the
+// operator's window never had.
+func TestDigestCaptureInWindow(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	captureOff := "2026-02-19 10:00:00"
+	captureOn := "2026-02-19 14:00:00"
+	// The hour the operator was blind: statements were not being logged.
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, captureOff, nil, "mydb", "orders", 1, "1", nil, nil, []byte(`{"id":1}`))
+	// The hour after someone turned it on.
+	stmt := "UPDATE mydb.orders SET status = 'shipped' WHERE id = 1"
+	insertWithStatement(t, db, captureOn, 300, "mydb", "orders", "1", stmt, statementDigest(t, db, stmt))
+
+	blindStart := time.Date(2026, 2, 19, 10, 0, 0, 0, time.UTC)
+	blindEnd := time.Date(2026, 2, 19, 10, 59, 59, 0, time.UTC)
+	seeingStart := time.Date(2026, 2, 19, 14, 0, 0, 0, time.UTC)
+	seeingEnd := time.Date(2026, 2, 19, 14, 59, 59, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name string
+		opts Options
+		want bool
+	}{
+		{"whole index", Options{}, true},
+		{"window where capture was off", Options{Since: &blindStart, Until: &blindEnd}, false},
+		{"window where capture was on", Options{Since: &seeingStart, Until: &seeingEnd}, true},
+		{"table that has no digested events", Options{Schema: "mydb", Table: "nothing_here"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DigestCaptureInWindow(context.Background(), db, tc.opts)
+			if err != nil {
+				t.Fatalf("DigestCaptureInWindow: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
