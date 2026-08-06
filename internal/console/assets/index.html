@@ -119,6 +119,10 @@
         <div class="side-meta" id="side-meta">
           <div><b id="meta-conn">—</b></div>
           <div id="meta-stream">stream <b>—</b></div>
+          <!-- Unlike the two rows above, this one is process-global (the
+               running build), not per-server — it does not change on a server
+               switch. Painted from the capabilities payload, not from status. -->
+          <div id="meta-version">version <b>—</b></div>
         </div>
       </div>
     </aside>

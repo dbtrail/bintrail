@@ -50,6 +50,51 @@ try {
   }
   monitor ? ok("boot: monitor capability reported") : bad("boot: monitor capability reported", "capsCache.monitor !== true after caps load");
 
+  // Scenario 0b — the sidebar footer reports the running build (#1221). This
+  // harness builds the daemon without -ldflags, so the server reports "dev";
+  // the assertion is against the SERVER's own value, not a hardcoded string,
+  // so a CONSOLE_BIN=<released build> run still passes. What it really guards
+  // is the blank/garbage artifact: an empty row, or a label glued together as
+  // "v" + a missing value.
+  const sideVer = await page.evaluate(() => ({
+    label: (document.querySelector("#meta-version b") || {}).textContent || "",
+    reported: typeof capsCache !== "undefined" ? capsCache.version : undefined,
+  }));
+  const wantVer = /^v?\d+\.\d+\.\d+/.test(String(sideVer.reported || ""))
+    ? "v" + String(sideVer.reported).replace(/^v/, "")
+    : (String(sideVer.reported || "") || "dev");
+  sideVer.label === wantVer
+    ? ok("sidebar: running version shown")
+    : bad("sidebar: running version shown", `label=${JSON.stringify(sideVer.label)} want=${JSON.stringify(wantVer)} (capabilities version=${JSON.stringify(sideVer.reported)})`);
+
+  // Scenario 0c — the two degraded shapes, driven through the REAL function
+  // (same technique as the ext-view scenarios below: stub capsCache, call the
+  // production code, read the DOM). `version` is omitempty, so an unversioned
+  // build sends no key at all — that must read "dev", never "" or "vundefined".
+  // A FAILED capabilities fetch is a different state: it must keep the "—"
+  // placeholder rather than report "dev" for a build it never read.
+  const degraded = await page.evaluate(() => {
+    const keep = capsCache.version;
+    const read = () => (document.querySelector("#meta-version b") || {}).textContent;
+    delete capsCache.version;
+    updateSideVersion(true);
+    const unversioned = read();
+    updateSideVersion(false);
+    const unknown = read();
+    capsCache.version = keep;
+    updateSideVersion(true);
+    return { unversioned, unknown, restored: read() };
+  });
+  degraded.unversioned === "dev"
+    ? ok("sidebar: unversioned build falls back to 'dev'")
+    : bad("sidebar: unversioned build falls back to 'dev'", `got ${JSON.stringify(degraded.unversioned)}`);
+  degraded.unknown === "—"
+    ? ok("sidebar: failed capabilities fetch never claims a version")
+    : bad("sidebar: failed capabilities fetch never claims a version", `got ${JSON.stringify(degraded.unknown)}`);
+  degraded.restored === wantVer
+    ? ok("sidebar: version restored after the degraded probes")
+    : bad("sidebar: version restored after the degraded probes", `got ${JSON.stringify(degraded.restored)}`);
+
   await page.evaluate(() => openServersModal());
   await page.waitForSelector("#servers-list", { timeout: 5000 });
   await page.waitForTimeout(400);

@@ -2926,11 +2926,14 @@ function otherClientsPanel(servers) {
 async function gateCapabilities() {
   const gen = serverGen;
   let caps = {};
+  // capsOK distinguishes "the server reported no version" from "we could not
+  // ask" — the version row must never claim a build we failed to read (#1221).
+  let capsOK = false;
   // Degrading to {} hides capability-gated UI (Time-travel tab, the source
   // section of the server form) — warn so a wrongly-shaped UI is diagnosable.
   // A 401 is NOT capability loss: rethrow so session expiry surfaces as the
   // sign-in gate (api() already raised it), never as silently vanished tabs.
-  try { caps = await api("/api/capabilities"); } catch (err) {
+  try { caps = await api("/api/capabilities"); capsOK = true; } catch (err) {
     if (err && err.status === 401) throw err;
     console.warn("capabilities check failed; UI degrades to no-capability gating", err);
     caps = {};
@@ -2946,6 +2949,22 @@ async function gateCapabilities() {
   gatePermissions();
   applyAuthGate();
   updateSrvNote(); // capsCache.monitor may have just changed
+  updateSideVersion(capsOK);
+}
+
+// updateSideVersion paints the running build into the sidebar footer (#1221),
+// reading the capabilities payload already fetched above — no extra request.
+// `version` is `omitempty`, so an unversioned build sends NO key at all: the
+// label must never be built as "v" + a missing value ("vundefined"/"vdev").
+// `known` is false when the capabilities fetch itself failed — the row keeps
+// its "—" placeholder there instead of reporting "dev" for a build whose real
+// version we never read (a wrong version in a bug report is worse than none).
+function updateSideVersion(known) {
+  const b = $("#meta-version b");
+  if (!b) return;
+  const ver = String(capsCache.version || "").replace(/^v/, "");
+  if (!known) b.textContent = "—";
+  else b.textContent = /^\d+\.\d+\.\d+/.test(ver) ? "v" + ver : (ver || "dev");
 }
 
 // gatePermissions hides a [data-perm] surface when the session's policy denies
