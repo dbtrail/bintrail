@@ -67,7 +67,7 @@ services:
   bintrail-shim:
     build:
       context: ../..
-      dockerfile: e2e/shim/Dockerfile.shim
+      dockerfile: test/shim/Dockerfile.shim
     # Sidecar — share proxysql's network namespace so the shim's
     # 127.0.0.1:3308 IS the address the proxysql-config SQL points
     # at. Cannot declare its own `ports:` — the network is owned by

@@ -429,7 +429,7 @@ func TestIsClientDisconnect(t *testing.T) {
 
 // ─── .mcpb bundle manifest ───────────────────────────────────────────────────
 
-// TestMCPBManifestToolsMatchServer pins packaging/mcpb/manifest.template.json
+// TestMCPBManifestToolsMatchServer pins build/packaging/mcpb/manifest.template.json
 // against the tools the standalone server actually registers. The Claude
 // Desktop bundle advertises its tool list in that manifest, and nothing else
 // checks it: scripts/validate-mcpb.sh inspects the BUILT bundle, whose binary
@@ -440,7 +440,7 @@ func TestMCPBManifestToolsMatchServer(t *testing.T) {
 	// `go test` runs with the working directory set to the package directory,
 	// so the template is reachable relatively from cmd/bintrail-mcp. Keep it
 	// that way — an absolute path would only work on the machine that wrote it.
-	raw, err := os.ReadFile(filepath.Join("..", "..", "packaging", "mcpb", "manifest.template.json"))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "build", "packaging", "mcpb", "manifest.template.json"))
 	if err != nil {
 		t.Fatalf("read mcpb manifest template: %v", err)
 	}
@@ -489,7 +489,7 @@ func TestMCPBManifestToolsMatchServer(t *testing.T) {
 	slices.Sort(serverNames)
 	slices.Sort(manifestNames)
 	if !slices.Equal(serverNames, manifestNames) {
-		t.Errorf("packaging/mcpb/manifest.template.json is out of sync with the server:\n  manifest: %v\n  server:   %v",
+		t.Errorf("build/packaging/mcpb/manifest.template.json is out of sync with the server:\n  manifest: %v\n  server:   %v",
 			manifestNames, serverNames)
 	}
 }

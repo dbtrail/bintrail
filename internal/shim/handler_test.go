@@ -1096,7 +1096,7 @@ func TestNewHandlerWiresArchiveFetcher(t *testing.T) {
 // archive fetcher: both constructors must install a non-nil
 // resolverFn or every time-travel query falls back to alphabetical
 // column order silently. A failure here means a refactor dropped
-// the schema_snapshots wiring; the e2e/shim test would catch it
+// the schema_snapshots wiring; the test/shim test would catch it
 // end-to-end but at much higher cost.
 func TestNewHandlerWiresResolverFn(t *testing.T) {
 	if h := NewHandler(nil, nil); h.resolverFn == nil {

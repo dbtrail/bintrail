@@ -25,7 +25,7 @@ GOARCH="$3"
 VERSION="$4"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TEMPLATE="$REPO_ROOT/packaging/mcpb/manifest.template.json"
+TEMPLATE="$REPO_ROOT/build/packaging/mcpb/manifest.template.json"
 OUT_DIR="$REPO_ROOT/dist/mcpb"
 OUT="$OUT_DIR/dbtrail-$GOOS-$GOARCH.mcpb"
 

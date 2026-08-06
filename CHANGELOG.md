@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were. `PRIVACY.md` in particular cannot move: the shipped `.mcpb` bundles
   declare its absolute URL, and GitHub 404s a moved file rather than
   redirecting. The `drafts/` directory is no longer tracked.
+- **End-to-end tests and bundle packaging consolidated.** `e2e_test.go` moved
+  from the module root to `test/e2e/`, `e2e/shim/` to `test/shim/` (so every
+  end-to-end harness lives under `test/`, alongside `test/console-e2e/`), and
+  `packaging/` to `build/packaging/`. Test names are unchanged, so the CI
+  false-green tripwires that assert `TestEndToEnd_fullPipeline` actually ran
+  still match. If you run the shim harness by hand, the path is now
+  `SHIM_E2E=1 go test -tags shim_e2e ./test/shim/...`.
 
 ## [0.49.0] - 2026-08-03
 
