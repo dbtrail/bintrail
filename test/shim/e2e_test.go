@@ -89,7 +89,7 @@ func TestShimEndToEnd(t *testing.T) {
 	bintrailBin := buildBintrailBinary(t)
 
 	// Compose lifecycle is owned by the test (not run.sh) so a
-	// developer running `go test -tags shim_e2e ./e2e/shim/...`
+	// developer running `go test -tags shim_e2e ./test/shim/...`
 	// directly still gets the full setup + teardown.
 	composeUp(t)
 	t.Cleanup(func() { composeDown(t) })
@@ -356,7 +356,7 @@ func TestShimEndToEnd(t *testing.T) {
 		// (1526) — MySQL's existing code for "no partition matches the
 		// value you queried", which is literally what a coverage gap is.
 		//
-		// The seed (e2e/shim/seed.sql) creates partitions covering 09:00
+		// The seed (test/shim/seed.sql) creates partitions covering 09:00
 		// to 18:00 on 2026-05-04. AS OF 18:00 lies just past the last
 		// real partition (p_future is not coverage), producing one gap
 		// hour under default strict mode — which the compose preserves

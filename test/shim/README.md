@@ -13,7 +13,7 @@ rules, and shim ↔ index DB cooperation as a single integrated unit.
 ## Running it
 
 ```sh
-cd e2e/shim
+cd test/shim
 ./run.sh
 ```
 
@@ -22,7 +22,7 @@ test owns the docker-compose lifecycle (build, up, down) so you can
 also run it directly:
 
 ```sh
-SHIM_E2E=1 go test -tags shim_e2e -v ./e2e/shim/...
+SHIM_E2E=1 go test -tags shim_e2e -v ./test/shim/...
 ```
 
 Without `SHIM_E2E=1` the test skips. Without Docker on `PATH` the

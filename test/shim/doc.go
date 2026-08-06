@@ -3,7 +3,7 @@
 // gated behind the `shim_e2e` build tag plus an explicit SHIM_E2E=1
 // env var. See README.md for the run instructions.
 //
-// This file exists solely so `go list ./e2e/shim/...` reports a
+// This file exists solely so `go list ./test/shim/...` reports a
 // valid (empty) package when the build tag is not set — without it,
 // IDEs and `go vet ./...` flag the directory as "no Go files".
 package shim_e2e

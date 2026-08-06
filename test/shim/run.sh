@@ -2,7 +2,7 @@
 # Wrapper that runs the bintrail shim end-to-end test.
 #
 # The test itself owns the docker-compose lifecycle (so a developer
-# can also run `SHIM_E2E=1 go test -tags shim_e2e ./e2e/shim/...`
+# can also run `SHIM_E2E=1 go test -tags shim_e2e ./test/shim/...`
 # directly from any directory and get the same setup + teardown).
 # This script just sets the gating env var and pins the working
 # directory so docker-compose finds its yaml.

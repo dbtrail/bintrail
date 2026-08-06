@@ -105,7 +105,7 @@ log "row 1 minute ago (virtual): ${PAST:-<empty>}"
 # The bare tagline form (#385): time-travel on the REAL table name —
 # the literal acceptance query of issue #350. NOTE: the bare form is
 # `*`-only (column lists stay on the virtual schemas). Both forms are
-# pinned to the same deterministic historical image in e2e/shim, so
+# pinned to the same deterministic historical image in test/shim, so
 # non-empty is the right assertion here.
 BARE=$(mysql_demo "SELECT * FROM orders WHERE id = 1 AS OF '1 minute ago'" || true)
 [ -n "$BARE" ] || { log "FAIL: bare AS OF form returned no row"; docker logs "$NAME" | tail -40; exit 1; }
