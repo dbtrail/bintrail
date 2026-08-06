@@ -339,7 +339,7 @@ across the rotation dialog and the per-server edit form):
   beacons immediately (no restart) and records the machine-wide choice, exactly
   like `bintrail telemetry off`. When an environment variable (`DO_NOT_TRACK`,
   `BINTRAIL_TELEMETRY`) or the `--telemetry` flag already controls it, the card
-  says so and defers to that. See [TELEMETRY.md](../TELEMETRY.md).
+  says so and defers to that. See [TELEMETRY.md](./TELEMETRY.md).
 
 #### Creating a baseline from the console
 

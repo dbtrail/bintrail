@@ -103,7 +103,7 @@ bintrail telemetry show     # see exactly what would be sent — sends nothing
 No identifier of any kind is stored or transmitted, so there is nothing tying
 those statistics to you or your machine. A binary you build yourself has no
 reporting address compiled in and is incapable of sending anything.
-[TELEMETRY.md](TELEMETRY.md) documents every field, every control, and the CI
+[TELEMETRY.md](docs/TELEMETRY.md) documents every field, every control, and the CI
 tests that enforce both.
 
 The [privacy policy](PRIVACY.md) covers the Claude Desktop extension (`.mcpb`)
@@ -113,10 +113,10 @@ your deployment.
 ## License
 
 [Apache-2.0](LICENSE) — free for any use, including commercial and production.
-Contributions welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) (CLA required,
+Contributions welcome: see [CONTRIBUTING.md](.github/CONTRIBUTING.md) (CLA required,
 prompted automatically on your first PR).
 
 Want the index server **operated** for you — sized, backed up, upgraded, kept
 alive on-call — instead of running it yourself? That is the managed service at
-[dbtrail.com](https://dbtrail.com). See [SUPPORT.md](SUPPORT.md) for the
+[dbtrail.com](https://dbtrail.com). See [SUPPORT.md](docs/SUPPORT.md) for the
 ship-vs-operate boundary.

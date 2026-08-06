@@ -33,7 +33,7 @@ GRANT SELECT ON shop.* TO 'dbtrail'@'%';        -- repeat per monitored schema
 
 If you scope `SELECT`, it must cover **every column of every monitored table**, or the schema snapshot fails with `no columns found for the requested schemas`.
 
-> The source must also have `binlog_format = ROW` and `binlog_row_image = FULL`. The preflight check (and `bintrail doctor`) refuses to start otherwise — verify with `SHOW VARIABLES LIKE 'binlog_%';`. Set `binlog_row_image = FULL` **server-wide**: the preflight only sees its own connection, so a per-session `SET SESSION binlog_row_image = MINIMAL`/`NOBLOB` on another connection still writes partial images that index as incomplete (unsupported — see [SUPPORT.md](../SUPPORT.md)). Also keep `binlog_row_value_options` clear of `PARTIAL_JSON`, which logs only a JSON diff.
+> The source must also have `binlog_format = ROW` and `binlog_row_image = FULL`. The preflight check (and `bintrail doctor`) refuses to start otherwise — verify with `SHOW VARIABLES LIKE 'binlog_%';`. Set `binlog_row_image = FULL` **server-wide**: the preflight only sees its own connection, so a per-session `SET SESSION binlog_row_image = MINIMAL`/`NOBLOB` on another connection still writes partial images that index as incomplete (unsupported — see [SUPPORT.md](./SUPPORT.md)). Also keep `binlog_row_value_options` clear of `PARTIAL_JSON`, which logs only a JSON diff.
 
 ---
 
@@ -384,4 +384,4 @@ DO_NOT_TRACK=1
 ```
 
 Full details, including every field and the tests that enforce them:
-[TELEMETRY.md](../TELEMETRY.md).
+[TELEMETRY.md](./TELEMETRY.md).

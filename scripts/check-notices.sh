@@ -18,13 +18,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-MARKER="$REPO_ROOT/THIRD-PARTY-NOTICES.deps.sha256"
+MARKER="$REPO_ROOT/scripts/THIRD-PARTY-NOTICES.deps.sha256"
 NOTICES="$REPO_ROOT/THIRD-PARTY-NOTICES"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
 [ -f "$NOTICES" ] || fail "THIRD-PARTY-NOTICES is missing. Run: make notices"
-[ -f "$MARKER" ]  || fail "THIRD-PARTY-NOTICES.deps.sha256 is missing. Run: make notices"
+[ -f "$MARKER" ]  || fail "scripts/THIRD-PARTY-NOTICES.deps.sha256 is missing. Run: make notices"
 
 want="$(cat "$MARKER")"
 have="$(go list -m all | shasum -a 256 | awk '{print $1}')"
@@ -36,7 +36,7 @@ if [ "$want" != "$have" ]; then
   echo "" >&2
   echo "A dependency was added, removed, or bumped. Regenerate the notices:" >&2
   echo "  make notices" >&2
-  echo "and commit THIRD-PARTY-NOTICES + THIRD-PARTY-NOTICES.deps.sha256." >&2
+  echo "and commit THIRD-PARTY-NOTICES + scripts/THIRD-PARTY-NOTICES.deps.sha256." >&2
   exit 1
 fi
 

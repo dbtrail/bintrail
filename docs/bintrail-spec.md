@@ -1,6 +1,6 @@
 # Bintrail — Architecture & Implementation Spec
 
-> **Historical document.** This was the original design spec. The canonical reference is [CLAUDE.md](CLAUDE.md). Key differences from this spec: partition expression uses `TO_DAYS()` not `UNIX_TIMESTAMP()`, `schema_snapshots` has separate auto-increment `id` PK (not `snapshot_id`), `stream` command and MCP server were added post-spec, observability (slog + Prometheus) was added post-spec. See [README](README.md) for the current command reference.
+> **Historical document.** This was the original design spec. The canonical reference is `CLAUDE.md` (maintainer notes, not published). Key differences from this spec: partition expression uses `TO_DAYS()` not `UNIX_TIMESTAMP()`, `schema_snapshots` has separate auto-increment `id` PK (not `snapshot_id`), `stream` command and MCP server were added post-spec, observability (slog + Prometheus) was added post-spec. See [README](../README.md) for the current command reference.
 
 ## Overview
 

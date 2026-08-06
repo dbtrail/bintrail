@@ -272,7 +272,7 @@ dockers:
     ids:
       - bintrail
       - bintrail-mcp
-    dockerfile: Dockerfile.goreleaser
+    dockerfile: build/Dockerfile.goreleaser
     use: buildx
     # Stage the license-compliance notices into the docker build context so the
     # Dockerfile's COPY can pick them up (#428).
@@ -297,7 +297,7 @@ dockers:
     ids:
       - bintrail
       - bintrail-mcp
-    dockerfile: Dockerfile.goreleaser
+    dockerfile: build/Dockerfile.goreleaser
     use: buildx
     extra_files:
       - LICENSE
@@ -321,7 +321,7 @@ dockers:
     goarch: amd64
     ids:
       - bintrail-console
-    dockerfile: Dockerfile.bintrail-console.goreleaser
+    dockerfile: build/Dockerfile.bintrail-console.goreleaser
     use: buildx
     extra_files:
       - LICENSE
@@ -343,7 +343,7 @@ dockers:
     goarch: arm64
     ids:
       - bintrail-console
-    dockerfile: Dockerfile.bintrail-console.goreleaser
+    dockerfile: build/Dockerfile.bintrail-console.goreleaser
     use: buildx
     extra_files:
       - LICENSE
@@ -367,7 +367,7 @@ dockers:
     goarch: amd64
     ids:
       - bintrail-pg
-    dockerfile: Dockerfile.bintrail-pg.goreleaser
+    dockerfile: build/Dockerfile.bintrail-pg.goreleaser
     use: buildx
     extra_files:
       - LICENSE
@@ -389,7 +389,7 @@ dockers:
     goarch: arm64
     ids:
       - bintrail-pg
-    dockerfile: Dockerfile.bintrail-pg.goreleaser
+    dockerfile: build/Dockerfile.bintrail-pg.goreleaser
     use: buildx
     extra_files:
       - LICENSE

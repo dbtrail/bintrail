@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-const telemetryDocPath = "../../TELEMETRY.md"
+const telemetryDocPath = "../../docs/TELEMETRY.md"
 
 // section returns the body of a "## <title>" section of the document.
 func section(t *testing.T, doc, title string) string {

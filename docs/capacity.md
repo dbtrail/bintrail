@@ -2,7 +2,7 @@
 
 How much disk the index MySQL needs, how to estimate it before you deploy, and how to monitor it afterwards.
 
-This page covers the math; the *operation* of the index MySQL — provisioning the disk, watching it, backing it up — is the operator's responsibility, as spelled out in [SUPPORT.md](../SUPPORT.md). It applies to whatever MySQL 8.0+ your `--index-dsn` points at. (Want the index sized, monitored, and operated for you? That is what [dbtrail](https://dbtrail.com) is.)
+This page covers the math; the *operation* of the index MySQL — provisioning the disk, watching it, backing it up — is the operator's responsibility, as spelled out in [SUPPORT.md](./SUPPORT.md). It applies to whatever MySQL 8.0+ your `--index-dsn` points at. (Want the index sized, monitored, and operated for you? That is what [dbtrail](https://dbtrail.com) is.)
 
 ## What one event costs
 

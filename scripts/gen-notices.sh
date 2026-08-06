@@ -27,7 +27,7 @@ cd "$REPO_ROOT"
 
 OUT="$REPO_ROOT/THIRD-PARTY-NOTICES"
 HEADER="$REPO_ROOT/scripts/notices-header.txt"
-MARKER="$REPO_ROOT/THIRD-PARTY-NOTICES.deps.sha256"
+MARKER="$REPO_ROOT/scripts/THIRD-PARTY-NOTICES.deps.sha256"
 
 MAINS=(./cmd/bintrail ./cmd/bintrail-mcp ./cmd/bintrail-console ./cmd/bintrail-pg)
 

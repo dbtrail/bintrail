@@ -170,7 +170,7 @@ Notes:
   `bintrail-state` volume.
 - `BINTRAIL_TAG` in `.env` pins the image version (default `latest`);
   building from a source checkout instead is a comment-toggle in the
-  compose file (`build:` with `dockerfile: Dockerfile.bintrail-console`).
+  compose file (`build:` with `dockerfile: build/Dockerfile.bintrail-console`).
 
 ### The bundled index MySQL 8.4
 
@@ -179,7 +179,7 @@ container holds the binary; the data lives in a separate `bintrail-index-data`
 volume — bumping a minor version is "swap the container, keep the volume"
 (the PMM pattern). dbtrail **ships** this MySQL but does not **operate** it:
 disk, backups, and upgrades are yours (for a managed, operated index, see
-[dbtrail.com](https://dbtrail.com)). Support boundary: [SUPPORT.md](../SUPPORT.md).
+[dbtrail.com](https://dbtrail.com)). Support boundary: [SUPPORT.md](./SUPPORT.md).
 
 **Credentials** — no static default password. On the first `up`, the
 one-shot `index-init` service generates a random password into the
@@ -251,7 +251,7 @@ and all data volumes (`bintrail-index-data`, `bintrail-index-secret`,
 
 The bundled `index-mysql` container is your forensic system of record
 (`binlog_events` with full before/after images). dbtrail **ships** this MySQL
-but does not **operate** it — backups are yours ([SUPPORT.md](../SUPPORT.md)).
+but does not **operate** it — backups are yours ([SUPPORT.md](./SUPPORT.md)).
 Two paths:
 
 **Logical dump (online, no downtime).** `mysqldump` runs inside the container,
@@ -318,7 +318,7 @@ leave but pointless once you delete the volume it points at), and the
 `depends_on: index-mysql` on the `bintrail` service. dbtrail installs only its schema on your server;
 its sizing, backups, and upgrades are yours — see
 [Capacity Planning](./capacity.md), [deployment.md](./deployment.md), and
-[SUPPORT.md](../SUPPORT.md). (The BYO contract floor stays MySQL **8.0+** —
+[SUPPORT.md](./SUPPORT.md). (The BYO contract floor stays MySQL **8.0+** —
 only the *bundled* index is 8.4.)
 
 ### Baselines and Time-travel (the `baseline` profile)
@@ -517,7 +517,7 @@ The `ghcr.io/dbtrail/bintrail-console` image follows the same contract with
 one binary: entrypoint `bintrail-console`, uid 999 pinned (the compose secret
 volume is chowned to it), `/var/lib/bintrail` pre-created for the server
 registry. Build it from source with
-`docker build -f Dockerfile.bintrail-console -t bintrail-console .`
+`docker build -f build/Dockerfile.bintrail-console -t bintrail-console .`
 
 ### Why not Alpine?
 
@@ -542,4 +542,4 @@ services:
 
 The **demo image** (`ghcr.io/dbtrail/bintrail-demo`) never reports, regardless
 of configuration — it is hard-disabled in the image and asserted by its smoke
-test. See [TELEMETRY.md](../TELEMETRY.md).
+test. See [TELEMETRY.md](./TELEMETRY.md).

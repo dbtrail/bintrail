@@ -74,7 +74,7 @@ On-demand (DBA workstation):
 
 > These are source-configuration requirements you own. Data captured under a
 > non-`FULL` row image or `PARTIAL_JSON` is **out of support** — see
-> [SUPPORT.md](../SUPPORT.md).
+> [SUPPORT.md](./SUPPORT.md).
 
 ### Replication user
 
@@ -606,4 +606,4 @@ inherits the choice made on the machine the image was built from. Setting the
 environment variable in the unit is what makes that explicit.
 
 A binary you build yourself has no reporting address compiled in and cannot
-send anything at all. See [TELEMETRY.md](../TELEMETRY.md).
+send anything at all. See [TELEMETRY.md](./TELEMETRY.md).

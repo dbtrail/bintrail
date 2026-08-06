@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Repository root tidied so the README is reachable without scrolling.** Pure
+  file moves, no behaviour change: `CONTRIBUTING.md`, `SECURITY.md` and `CLA.md`
+  moved to `.github/`; `SUPPORT.md`, `TELEMETRY.md` and `bintrail-spec.md` moved
+  to `docs/`; the four named Dockerfile variants moved to `build/`;
+  `THIRD-PARTY-NOTICES.deps.sha256` moved next to the script that generates it
+  (`scripts/`). GitHub still renders the Contributing and Security-policy links
+  because it looks for community-health files in `.github/` and `docs/` as well
+  as the root. If you build images from source, the flag changes from
+  `-f Dockerfile.bintrail-console` to `-f build/Dockerfile.bintrail-console`;
+  the plain `docker build .` path is untouched, and `LICENSE`, `NOTICE`,
+  `THIRD-PARTY-NOTICES`, `PRIVACY.md`, `install.sh`, `.env.example`,
+  `docker-compose.yml` and every exported Go package stay exactly where they
+  were. `PRIVACY.md` in particular cannot move: the shipped `.mcpb` bundles
+  declare its absolute URL, and GitHub 404s a moved file rather than
+  redirecting. The `drafts/` directory is no longer tracked.
+
 ## [0.49.0] - 2026-08-03
 
 The **continuous backup assurance** epic (#1189). A recovery tool that is never

@@ -199,5 +199,5 @@ Telemetry is currently ON.
   bintrail telemetry show    see exactly what is sent (sends nothing)
   DO_NOT_TRACK=1             disable telemetry entirely
 
-Details: https://github.com/dbtrail/dbtrail/blob/main/TELEMETRY.md
+Details: https://github.com/dbtrail/dbtrail/blob/main/docs/TELEMETRY.md
 `

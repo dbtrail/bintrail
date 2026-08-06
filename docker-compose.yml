@@ -76,7 +76,7 @@ services:
     # tags the local build with that name, so nothing is pulled):
     # build:
     #   context: .
-    #   dockerfile: Dockerfile.bintrail-console
+    #   dockerfile: build/Dockerfile.bintrail-console
     # Runs as root: a freshly-created named volume is root-owned, and the
     # bintrail image otherwise runs as a non-root user that couldn't write it.
     # The secret is then chowned to uid 999 mode 0600 FOR the bintrail process
@@ -207,7 +207,7 @@ services:
     # the local build with that name, so nothing is pulled):
     # build:
     #   context: .
-    #   dockerfile: Dockerfile.bintrail-console
+    #   dockerfile: build/Dockerfile.bintrail-console
     ports:
       # Console on the host loopback only — first-run password setup is allowed
       # because reaching loopback already implies local access. To reach it from

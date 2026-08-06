@@ -183,7 +183,7 @@ need a rollback option, keep the previous binary/image tag around and pin
 
 ## Getting help
 
-[SUPPORT.md](../SUPPORT.md) is the canonical scope statement — the schema
+[SUPPORT.md](./SUPPORT.md) is the canonical scope statement — the schema
 and its migrations are in scope; operating the index server (disk, backups,
 running the actual `apt`/`dnf`/`docker` upgrade commands, sizing) is the
 operator's, per the ship-vs-operate boundary. `bintrail doctor` is a good

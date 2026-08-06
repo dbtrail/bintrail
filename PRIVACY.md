@@ -24,7 +24,7 @@ The bintrail **command-line tools** are a separate matter: official release
 builds send metadata-only usage statistics (command names, version, platform,
 error class — never your data), on by default and disableable in one line. That
 is documented in full, including how to turn it off, in
-[TELEMETRY.md](TELEMETRY.md). It does not apply to this extension.
+[TELEMETRY.md](docs/TELEMETRY.md). It does not apply to this extension.
 
 ## What the extension does with data
 

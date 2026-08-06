@@ -80,7 +80,7 @@ back up its volumes** (`bintrail-index-data` + `bintrail-index-secret`
 together; volume loss means re-indexing). dbtrail **ships** that MySQL but
 does not **operate** it — disk, backups, and upgrades are yours, as is sizing
 (see [Capacity Planning](./capacity.md)). The ship-vs-operate boundary triage
-cites is [SUPPORT.md](../SUPPORT.md). See [docker.md](./docker.md) for the
+cites is [SUPPORT.md](./SUPPORT.md). See [docker.md](./docker.md) for the
 credential mechanism and the `8.0→8.4` upgrade note.
 
 **Bring your own index MySQL** (co-equal path, not an afterthought): set

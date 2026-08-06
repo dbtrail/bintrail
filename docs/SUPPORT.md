@@ -46,7 +46,7 @@ free core — and this holds whether you bring your own server OR run the MySQL
 yours:
 
 - Sizing, InnoDB tuning, and capacity planning — the math is documented
-  in [Capacity Planning](docs/capacity.md); running the numbers and the
+  in [Capacity Planning](./capacity.md); running the numbers and the
   disk is yours.
 - Backups and restore of the index server, and replication of the index
   itself.
@@ -84,7 +84,7 @@ The boundary triage cites:
   managed tier at [dbtrail.com](https://dbtrail.com) operates it for you.
 - **BYO stays co-equal.** Set `INDEX_DSN` in `.env` to a MySQL 8.0+ you run
   and remove the bundled `index-init` + `index-mysql` services (see
-  [docker.md](docs/docker.md)) — same ship-vs-operate split, your server.
+  [docker.md](./docker.md)) — same ship-vs-operate split, your server.
 
 ## Source server configuration (required for correct capture)
 
@@ -92,7 +92,7 @@ dbtrail captures changes from your **source** database — **MySQL**, **MariaDB*
 (alpha), or **PostgreSQL**; see [Supported source families](#supported-source-families)
 below. The requirements here cover a **MySQL** (and MariaDB) source's ROW-format
 binary logs; PostgreSQL's capture requirements (logical replication, `wal_level`,
-`REPLICA IDENTITY`) live in [docs/postgres.md](docs/postgres.md). Faithful capture
+`REPLICA IDENTITY`) live in [docs/postgres.md](./postgres.md). Faithful capture
 requires the source to be configured **server-wide** (not just per-session):
 
 - `binlog_format = ROW`.
@@ -109,7 +109,7 @@ they see on bintrail's own connection; bintrail can't observe what other
 application sessions set, so preventing per-session overrides is the operator's
 responsibility. Data captured while the source violated these requirements is out
 of scope — configure the source (see
-[deployment.md → Source MySQL Requirements](docs/deployment.md#2-source-mysql-requirements))
+[deployment.md → Source MySQL Requirements](./deployment.md#2-source-mysql-requirements))
 and re-index.
 
 ## Supported source families
@@ -121,9 +121,9 @@ at a non-MySQL server is **not** supported.
 
 | Source | Status | Capture mechanism | Guide |
 |---|---|---|---|
-| **MySQL** 8.0+ (incl. Percona, RDS, Aurora, Cloud SQL) | Supported | ROW-format binlog over the replication protocol | [streaming.md](docs/streaming.md) |
-| **MariaDB** (target 11.4) | Alpha | ROW-format binlog (MariaDB GTID) | [mariadb.md](docs/mariadb.md) |
-| **PostgreSQL** | Supported — via the separate `bintrail-pg` binary | Logical replication (`pgoutput`) | [postgres.md](docs/postgres.md) |
+| **MySQL** 8.0+ (incl. Percona, RDS, Aurora, Cloud SQL) | Supported | ROW-format binlog over the replication protocol | [streaming.md](./streaming.md) |
+| **MariaDB** (target 11.4) | Alpha | ROW-format binlog (MariaDB GTID) | [mariadb.md](./mariadb.md) |
+| **PostgreSQL** | Supported — via the separate `bintrail-pg` binary | Logical replication (`pgoutput`) | [postgres.md](./postgres.md) |
 
 **We install nothing in your source database.** dbtrail connects as an ordinary
 read-only replication client. For PostgreSQL specifically, capture uses the
@@ -140,7 +140,7 @@ PostgreSQL logical replication **slot retains WAL** until dbtrail consumes it: i
 `bintrail-pg` is stopped long enough, the slot can fill the source's disk. Sizing
 `max_slot_wal_keep_size`, monitoring slot lag, and the source's own disk are
 yours (`bintrail-pg doctor` reports slot/WAL health — see
-[postgres.md](docs/postgres.md)). Capturing from a misconfigured source
+[postgres.md](./postgres.md)). Capturing from a misconfigured source
 (non-`FULL` row image, missing `REPLICA IDENTITY`, `PARTIAL_JSON`) is out of scope.
 
 ## Reporting issues
