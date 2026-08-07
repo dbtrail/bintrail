@@ -60,7 +60,7 @@ func init() {
 	dumpCmd.Flags().StringVar(&dmpMydumperImage, "mydumper-image", "mydumper/mydumper:latest", "Docker image for mydumper (used when no local binary is found)")
 	dumpCmd.Flags().IntVar(&dmpThreads, "threads", 4, "Number of mydumper dump threads")
 	dumpCmd.Flags().StringVar(&dmpFormat, "format", "text", "Output format: text or json")
-	dumpCmd.Flags().BoolVar(&dmpEncrypt, "encrypt", false, "Encrypt dump files at rest using AES-256-CBC (requires openssl on $PATH)")
+	dumpCmd.Flags().BoolVar(&dmpEncrypt, "encrypt", false, "Encrypt dump files at rest using AES-256-CBC and write an HMAC-SHA256 integrity sidecar (<file>.enc.hmac) per file (requires openssl on $PATH)")
 	dumpCmd.Flags().StringVar(&dmpEncryptKey, "encrypt-key", "", "Path to encryption key file (default: ~/.config/bintrail/dump.key; generate with 'bintrail generate-key')")
 	_ = dumpCmd.MarkFlagRequired("source-dsn")
 	_ = dumpCmd.MarkFlagRequired("output-dir")
@@ -341,6 +341,25 @@ func runDump(cmd *cobra.Command, args []string) error {
 	if err := baseline.WriteStartedAtMarker(dmpOutputDir, dumpStartedAt); err != nil {
 		slog.Warn("could not write dump-start marker; baseline conversion will fall back to mydumper's local-time 'Started dump at' line",
 			"output_dir", dmpOutputDir, "error", err)
+	}
+
+	// CBC gives no authentication (#960): authenticate every encrypted file
+	// with an HMAC-SHA256 sidecar so `bintrail baseline --encrypt` can refuse
+	// a tampered/bit-rotted .enc instead of decrypting it into garbled SQL.
+	// A failure here is a hard error — an unauthenticated encrypted dump is
+	// exactly what this step exists to prevent — but the dump directory is
+	// kept (dumpSucceeded is already true) so the operator can retry.
+	if encryptKeyPath != "" {
+		key, err := readHMACKey(encryptKeyPath)
+		if err != nil {
+			return err
+		}
+		n, err := writeDumpHMACSidecars(dmpOutputDir, key)
+		if err != nil {
+			return fmt.Errorf("write HMAC integrity sidecars: %w", err)
+		}
+		slog.Info("wrote HMAC-SHA256 integrity sidecars for encrypted dump files",
+			"files", n, "output_dir", dmpOutputDir)
 	}
 
 	if dmpFormat == "json" {

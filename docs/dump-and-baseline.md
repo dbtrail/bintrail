@@ -129,9 +129,18 @@ This dumps **every accessible schema** into `/tmp/mydumper-output` — bare `bin
 | `--mydumper-path` | `mydumper` | Path to the mydumper binary. When set, skips Docker fallback. |
 | `--mydumper-image` | `mydumper/mydumper:latest` | Docker image for mydumper. Used only when no local binary is found. |
 | `--threads` | `4` | Number of parallel dump threads |
-| `--encrypt` | `false` | Encrypt dump files at rest using AES-256-CBC (requires `openssl` on `$PATH`) |
+| `--encrypt` | `false` | Encrypt dump files at rest using AES-256-CBC, with an HMAC-SHA256 integrity sidecar per file (requires `openssl` on `$PATH`) |
 | `--encrypt-key` | `~/.config/bintrail/dump.key` | Path to the encryption key file (generate with `bintrail generate-key`) |
 | `--format` | `text` | Output format: `text` or `json` |
+
+### Encryption and integrity (`--encrypt`)
+
+With `--encrypt`, every dump file is piped through `openssl enc -aes-256-cbc -pbkdf2` as mydumper writes it, producing `<file>.enc`. CBC encrypts but does **not** authenticate, so after the dump completes bintrail also writes an HMAC-SHA256 digest of each `.enc` file to a `<file>.enc.hmac` sidecar, keyed with your `--encrypt-key` file. Keep the sidecars next to the `.enc` files (copy/upload them together).
+
+`bintrail baseline --encrypt` verifies each sidecar **before** decrypting:
+
+- **Mismatch** — the `.enc` file was modified (tampering, bit rot, truncated copy) or a different key is in use. This is a **hard error**; the file is never decrypted, so corrupted SQL can't silently flow into your baseline.
+- **Sidecar missing** — a dump made by an older bintrail. Decryption proceeds with a warning (`legacy unauthenticated dump, integrity cannot be verified`). Re-run `bintrail dump --encrypt` to get authenticated dumps.
 
 ### Schema and table filtering
 
@@ -222,7 +231,7 @@ bintrail baseline \
 | `--tables` | *(all)* | Comma-separated `db.table` filter |
 | `--compression` | `zstd` | Parquet compression: `zstd`, `snappy`, `gzip`, `none` |
 | `--row-group-size` | `500000` | Rows per Parquet row group |
-| `--encrypt` | `false` | Decrypt encrypted dump files (`.enc`, from `dump --encrypt`) before processing (requires `openssl` on `$PATH`) |
+| `--encrypt` | `false` | Decrypt encrypted dump files (`.enc`, from `dump --encrypt`) before processing, verifying each file's `.enc.hmac` integrity sidecar first — a mismatch is a hard error, a missing sidecar (legacy dump) warns and proceeds (requires `openssl` on `$PATH`) |
 | `--encrypt-key` | `~/.config/bintrail/dump.key` | Path to the decryption key file |
 | `--upload` | *(disabled)* | S3 URL to upload Parquet files after generation |
 | `--upload-region` | *(from AWS env)* | AWS region for `--upload` |
