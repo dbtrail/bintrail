@@ -126,6 +126,14 @@ type BaselineProvider interface {
 	// fkCol == parentPK in the newest complete baseline for (schema, table) at
 	// or before `at`, capped at limit. ok is false when no baseline covers the
 	// table (the caller then runs Phase-1 only for it).
+	//
+	// Contract for PERMANENT refusals (#1273): an implementation refusing a
+	// table because its primary key contains a generated column must wrap
+	// reconstruct.ErrGeneratedPK in the returned error, so the engine files
+	// the caveat as permanent (`generatedpk:`) and skips Phase-1 for the edge
+	// — a plain error lands in the transient `baselinefail:` bucket and the
+	// engine proceeds to scan the exact candidates the refusal exists to
+	// avoid.
 	BaselineChildren(ctx context.Context, schema, table, fkCol, parentPK string, at time.Time, limit int) (lookup BaselineLookup, ok bool, err error)
 }
 
@@ -158,7 +166,10 @@ type Options struct {
 	// anyway. Gated edges are skipped with a permanent `generatedpk:` caveat
 	// covering BOTH phases. nil disables the gate; the Phase-2 provider still
 	// refuses on its own via reconstruct.ErrGeneratedPK, which the caveat
-	// classifier recognizes — the backstop for probe-less callers.
+	// classifier recognizes — but ONLY when a baseline actually covers the
+	// table (a no-baseline edge returns ok=false before the provider's gate
+	// runs), so with no probe and no covering baseline the gate is off
+	// entirely. Wire the probe.
 	PKMetas func(schema, table string) []metadata.ColumnMeta
 }
 
@@ -431,6 +442,40 @@ func SynthesizeVictims(
 		warned[key] = true
 		warnings = append(warnings, msg)
 	}
+	// addGeneratedPKCaveat is the ONE caveat frame for both #1273 gate paths
+	// (the PKMetas probe and the provider-error backstop), so the two cannot
+	// drift in wording or key format; detail carries the path-specific cause.
+	addGeneratedPKCaveat := func(fk CascadeFK, detail string) {
+		addIncomplete("generatedpk:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+			"%s.%s cannot be synthesized: %s — a PERMANENT property of the table, not a transient failure; "+
+				"its cascade side effects (and those of any deeper descendants through it) are not recovered, and for "+
+				"an ON UPDATE root the parent key reversal in the emitted SQL is still applied, leaving such child "+
+				"rows referencing a key that no longer exists", fk.Schema, fk.Table, detail))
+	}
+	// genPKGated memoizes the probe verdict per child table — a static fact of
+	// the schema snapshot, while scanChildren runs per (edge × parent key);
+	// same static-fact memo pattern as skewChecked. The memo also keeps the
+	// caveat's Sprintf from being rebuilt just for addIncomplete's dedup to
+	// discard it.
+	genPKGated := map[string]bool{}
+	generatedPKGated := func(fk CascadeFK) bool {
+		key := fk.Schema + "." + fk.Table
+		if gated, seen := genPKGated[key]; seen {
+			return gated
+		}
+		gated := false
+		if opts.PKMetas != nil {
+			if c, ok := reconstruct.GeneratedPKColumn(opts.PKMetas(fk.Schema, fk.Table)); ok {
+				gated = true
+				addGeneratedPKCaveat(fk, fmt.Sprintf(
+					"primary-key column %q is a generated column — most commonly the MariaDB system-versioning "+
+						"shape, whose binlog history carries history rows and versioned deletes under the surviving key",
+					c.Name))
+			}
+		}
+		genPKGated[key] = gated
+		return gated
+	}
 
 	// Count columns per constraint so composite (multi-column) FKs can be
 	// detected: the single-column victim match below would mis-reconstruct them
@@ -509,22 +554,12 @@ func SynthesizeVictims(
 	scanChildren := func(fk CascadeFK, parentKey string, rootTS time.Time) childScan {
 		// #1273: a child whose PK contains a generated column — the MariaDB
 		// system-versioning shape — cannot be synthesized from EITHER phase:
-		// its binlog history carries history-row inserts and row_end tombstone
-		// updates under the surviving key (the #1266 evidence), so the
-		// per-pk_values candidate scan would rebuild children from
-		// history-polluted state, and the baseline omits the generated PK
-		// member. Skip the edge with a permanent caveat instead, before any
-		// index or baseline work.
-		if opts.PKMetas != nil {
-			for _, c := range opts.PKMetas(fk.Schema, fk.Table) {
-				if c.IsGenerated {
-					addIncomplete("generatedpk:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-						"%s.%s cannot be synthesized: primary-key column %q is a generated column (the MariaDB "+
-							"system-versioning shape) — a PERMANENT property of the table, not a transient failure; "+
-							"its cascade side effects are not recovered", fk.Schema, fk.Table, c.Name))
-					return childScan{failed: true}
-				}
-			}
+		// the per-pk_values candidate scan would rebuild children from
+		// history-polluted state (the #1266 evidence), and the baseline omits
+		// the generated PK member. Skip the edge with a permanent caveat
+		// instead, before any index or baseline work.
+		if generatedPKGated(fk) {
+			return childScan{failed: true}
 		}
 		until := rootTS
 		// Phase-1 window; widened to the baseline snapshot below.
@@ -554,9 +589,11 @@ func SynthesizeVictims(
 				// that pass no PKMetas probe; with the probe wired, the gate
 				// at the top of scanChildren fires first.
 				if errors.Is(berr, reconstruct.ErrGeneratedPK) {
-					addIncomplete("generatedpk:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-						"%s.%s cannot be synthesized: %v — a PERMANENT property of the table, not a transient "+
-							"lookup failure; its cascade side effects are not recovered", fk.Schema, fk.Table, berr))
+					// Not berr verbatim: it already names the table and the
+					// generated column, and the caveat frame names both again —
+					// re-state the cause once, cleanly.
+					addGeneratedPKCaveat(fk, "its baseline lookup refused it: the primary key contains a "+
+						"generated column (most commonly the MariaDB system-versioning shape)")
 					return childScan{failed: true}
 				}
 				addIncomplete("baselinefail:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
@@ -944,6 +981,17 @@ func SynthesizeVictims(
 							fk.Schema, fk.Table, fk.ConstraintName))
 						continue
 					}
+					// #1273 gate BEFORE the key-chain probe: a gated edge is
+					// skipped unconditionally, so running the probe would only
+					// add a redundant `keychain:` caveat implying a probing
+					// limitation on an edge that was never going to be probed.
+					// Deliberately AFTER `cascadedHere = true`, like the
+					// excluded-child branch above: the parent's own key
+					// reversal is real and must still be emitted (the caveat
+					// says so).
+					if generatedPKGated(fk) {
+						continue
+					}
 					if depth == 0 {
 						checkKeyChain(fk, pev, parentOldKey, item.rootTS, rootKey,
 							"some ON UPDATE cascade children may NOT be reconstructed")
@@ -1058,6 +1106,11 @@ func SynthesizeVictims(
 					continue
 				}
 				parentPK := valToString(refVal)
+				// #1273 gate before the key-chain probe — same reasoning as the
+				// ON UPDATE path: no probe caveat for an edge skipped outright.
+				if generatedPKGated(fk) {
+					continue
+				}
 				if depth == 0 && fk.UpdateRule == "CASCADE" {
 					// #1125: the delete-path analog of the key-chain blind spot.
 					// If an earlier UPDATE moved the referenced key INTO the value
