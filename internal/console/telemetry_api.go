@@ -137,7 +137,7 @@ func (s *Server) handleTelemetrySet(w http.ResponseWriter, r *http.Request) {
 		Enabled bool `json:"enabled"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		writeBodyDecodeError(w, err)
 		return
 	}
 	// A higher-precedence control (DO_NOT_TRACK, --telemetry, or

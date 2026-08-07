@@ -284,7 +284,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	}
 	var body recoverRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeBodyDecodeError(w, err)
 		return
 	}
 	p := filterParams{
@@ -800,6 +800,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		slog.Error("console: JSON encode failed", "error", err)
 	}
+}
+
+// writeBodyDecodeError maps a request-body decode failure onto a response:
+// 413 when the apiGuard size cap tripped (MaxBytesReader makes json.Decode
+// return *http.MaxBytesError), 400 for malformed JSON. The 413 message is
+// static — the overflow error must not surface internals.
+func writeBodyDecodeError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeJSONError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("request body too large (limit %d bytes)", tooLarge.Limit))
+		return
+	}
+	writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {

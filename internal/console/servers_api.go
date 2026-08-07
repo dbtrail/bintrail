@@ -194,7 +194,7 @@ func (s *Server) handleServersGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleServersCreate(w http.ResponseWriter, r *http.Request) {
 	var req serverRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeBodyDecodeError(w, err)
 		return
 	}
 	flavor, err := NormalizeFlavor(req.Flavor)
@@ -276,7 +276,7 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req serverRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeBodyDecodeError(w, err)
 		return
 	}
 	dsn, err := buildDSN(req, old.DSN)
@@ -346,7 +346,7 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if dsn != old.DSN {
-		s.cm.evict(id)                    // connection points at the old DSN; close and reopen lazily
+		s.cm.evict(id)                   // connection points at the old DSN; close and reopen lazily
 		s.sessionProfiles.invalidate(id) // its cached profile rules were resolved against the old index (#1075)
 	} else {
 		s.cm.rebuildDerived(entry) // keep the db, recompute baseline/no-archive gates
@@ -567,7 +567,7 @@ func (s *Server) handleServersTest(w http.ResponseWriter, r *http.Request) {
 	// An empty body means "test the stored DSN as-is"; anything else must parse.
 	var req serverRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeBodyDecodeError(w, err)
 		return
 	}
 
@@ -594,11 +594,34 @@ func isUnknownDatabase(err error) bool {
 	return errors.As(err, &me) && me.Number == 1049
 }
 
-// probeServer runs the write-free reachability probe against one DSN. When
-// monitored is true, an Unknown-database error means the per-source index has
-// not been provisioned yet (Start creates it) rather than an unreachable
-// server, so it is reported as a pending state instead of a hard failure.
+// probeServer runs the write-free reachability probe and logs one structured
+// line per attempt (#848): destination host:port and outcome only, never
+// credentials or the DSN (the error string is already scrubbed by
+// scrubDSNError). The probe connects to an arbitrary host:port taken from the
+// request body, so leaving no trace would make the console a silent
+// internal-network mapping oracle for a leaked automation token. slog, not
+// the ext audit seam: the audit contract (ext/audit.go) covers reads of
+// historical row data, and a connectivity probe returns none.
 func probeServer(r *http.Request, dsn string, monitored bool) testResponse {
+	resp := runProbe(r, dsn, monitored)
+	addr := "<invalid-dsn>"
+	if cfg, err := mysql.ParseDSN(dsn); err == nil {
+		addr = cfg.Addr
+	}
+	slog.Info("console: connection test probe",
+		"addr", addr,
+		"ok", resp.OK,
+		"provision_pending", resp.ProvisionPending,
+		"latency_ms", resp.LatencyMS,
+		"error", resp.Error)
+	return resp
+}
+
+// runProbe is the probe itself. When monitored is true, an Unknown-database
+// error means the per-source index has not been provisioned yet (Start
+// creates it) rather than an unreachable server, so it is reported as a
+// pending state instead of a hard failure.
+func runProbe(r *http.Request, dsn string, monitored bool) testResponse {
 	short, dbName, err := shortTimeoutDSN(dsn)
 	if err != nil {
 		return testResponse{Error: scrubDSNError(err, dsn)}

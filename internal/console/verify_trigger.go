@@ -211,7 +211,7 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 		// EOF = no/empty body = defaults. Any other decode error means the
 		// caller's actual request (e.g. an explicit live-source mode) must
 		// not be silently substituted with the baseline-anchored default.
-		writeJSONError(w, http.StatusBadRequest, "malformed request body: "+err.Error())
+		writeBodyDecodeError(w, err)
 		return
 	}
 	mode := VerifyModeBaselineAnchored

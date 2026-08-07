@@ -132,6 +132,12 @@ func (s *Server) mcpHandler() http.Handler {
 				"unknown server: use /mcp for the default server, or /mcp/{id-or-name} for a server from the console registry")
 			return
 		}
+		// This request has authenticated. Clear the connection read deadline
+		// armed by the server-wide ReadTimeout (#848): a streamable-HTTP SSE
+		// GET hangs open by design, and net/http's background read hitting
+		// that deadline would cancel the stream's context 30s in. Pre-auth
+		// traffic (rejected above by RequireBearerToken) keeps the deadline.
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
 		streamable.ServeHTTP(w, r)
 	}))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -360,9 +366,9 @@ func (s *Server) newMCPServer(id string, pol *ext.AccessPolicy) *mcp.Server {
 		// call from the bundle's FindBaseline exactly like the handler's
 		// cascadeProviderFor(b), baseline parameters rejected like
 		// reconstruct's.
-		RecoverCascade: true,
-		QueryMaxLimit:       func() int { return eventsMaxLimit },
-		RecoverMaxLimit:     recoverMaxLimit,
+		RecoverCascade:  true,
+		QueryMaxLimit:   func() int { return eventsMaxLimit },
+		RecoverMaxLimit: recoverMaxLimit,
 		// #849: the console's /mcp recover tool renders the same reversal
 		// script as /api/recover, in the same shared daemon process — it must
 		// not be left at the Generator's CLI-sized 2 GiB default just because

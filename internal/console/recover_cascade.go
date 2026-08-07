@@ -110,7 +110,7 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 
 	var body recoverCascadeRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeBodyDecodeError(w, err)
 		return
 	}
 
