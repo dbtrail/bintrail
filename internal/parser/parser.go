@@ -40,6 +40,33 @@ const (
 // Aliased here so the binlog parser and existing callers keep using parser.Event.
 type Event = event.Event
 
+// emitter is the parser's only way out to a consumer. It exists so the read
+// timestamp (#1223 T1) is stamped STRUCTURALLY: every event leaves through
+// send, so a new emit path cannot forget to stamp the way it could if ReadAt
+// were just another field each Event literal had to remember to set.
+//
+// readAt is the zero Time on the file path — see event.Event.ReadAt for why
+// consumers must skip, not observe, a zero.
+type emitter struct {
+	ch     chan<- Event
+	readAt time.Time
+}
+
+// emitTo builds an unstamped emitter, for the file path and for tests.
+func emitTo(ch chan<- Event) emitter { return emitter{ch: ch} }
+
+// send stamps and delivers one event, honouring cancellation exactly as the
+// bare channel sends it replaced.
+func (e emitter) send(ctx context.Context, ev Event) error {
+	ev.ReadAt = e.readAt
+	select {
+	case e.ch <- ev:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // ─── Filters ─────────────────────────────────────────────────────────────────
 
 // Filters is the source-agnostic schema/table filter, moved to internal/event
@@ -149,6 +176,10 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	// 'completed' with an undetected gap (#778).
 	var gaps schemaGapTracker
 
+	// The file path never stamps a read time: re-indexing a binlog from disk
+	// has no availability lag to measure (#1224).
+	em := emitTo(events)
+
 	bp := replication.NewBinlogParser()
 	// Pin TIMESTAMP-column string rendering to UTC. go-mysql's default (nil
 	// location) formats fracTime.String() using the raw time.Unix(...) value,
@@ -222,10 +253,8 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentQueryText = ""
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
 			if ddlEv, ok := parseDDL(p.logger, filename, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), p.schemaVersion.Load()); ok {
-				select {
-				case events <- ddlEv:
-				case <-ctx.Done():
-					return ctx.Err()
+				if err := em.send(ctx, ddlEv); err != nil {
+					return err
 				}
 			} else if kw, isDML := statementDML(string(ev.Query)); isDML {
 				// STATEMENT/MIXED-format DML (or a session flip off ROW): the row
@@ -269,7 +298,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			currentQueryText = event.SanitizeQueryText(string(ev.Query))
 
 		case *replication.RowsEvent:
-			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, p.schemaVersion.Load(), events, &gaps, p.skips)
+			err := handleRows(ctx, p.logger, p.resolver.Load(), &p.filters, binlogEv, ev, filename, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, p.schemaVersion.Load(), em, &gaps, p.skips)
 			// The LAST rows event of a statement carries STMT_END_F — the
 			// actual statement boundary. Clearing here keeps one statement's
 			// text alive across its chained/split rows events, while a later
@@ -454,7 +483,7 @@ func handleRows(
 	commitTsUS uint64,
 	queryText string,
 	schemaVersion uint32,
-	out chan<- Event,
+	out emitter,
 	gapTracker *schemaGapTracker,
 	skips *SkipCounters,
 ) error {
@@ -718,7 +747,7 @@ func emitInserts(
 	pkCols []metadata.ColumnMeta,
 	schemaVersion uint32,
 	stmtEnd bool,
-	out chan<- Event,
+	out emitter,
 ) error {
 	for _, row := range rows {
 		named, err := resolver.MapRow(schema, table, row)
@@ -736,10 +765,8 @@ func emitInserts(
 			SchemaVersion: schemaVersion,
 			StmtEnd:       stmtEnd,
 		}
-		select {
-		case out <- ev:
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := out.send(ctx, ev); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -759,7 +786,7 @@ func emitDeletes(
 	pkCols []metadata.ColumnMeta,
 	schemaVersion uint32,
 	stmtEnd bool,
-	out chan<- Event,
+	out emitter,
 ) error {
 	for _, row := range rows {
 		named, err := resolver.MapRow(schema, table, row)
@@ -777,10 +804,8 @@ func emitDeletes(
 			SchemaVersion: schemaVersion,
 			StmtEnd:       stmtEnd,
 		}
-		select {
-		case out <- ev:
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := out.send(ctx, ev); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -800,7 +825,7 @@ func emitUpdates(
 	pkCols []metadata.ColumnMeta,
 	schemaVersion uint32,
 	stmtEnd bool,
-	out chan<- Event,
+	out emitter,
 ) error {
 	// go-mysql delivers UPDATE rows as interleaved before/after pairs:
 	//   rows[0]=before0, rows[1]=after0, rows[2]=before1, rows[3]=after1, ...
@@ -827,10 +852,8 @@ func emitUpdates(
 			SchemaVersion: schemaVersion,
 			StmtEnd:       stmtEnd,
 		}
-		select {
-		case out <- ev:
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := out.send(ctx, ev); err != nil {
+			return err
 		}
 	}
 	return nil

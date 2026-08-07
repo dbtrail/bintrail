@@ -219,7 +219,7 @@ func TestHandleRows_columnCountMismatchCountsSkip(t *testing.T) {
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 	out := make(chan Event, 4)
 	logBuf := &bytes.Buffer{}
-	err := handleRows(context.Background(), newTestLogger(logBuf), driftResolver(), &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, out, nil, skips)
+	err := handleRows(context.Background(), newTestLogger(logBuf), driftResolver(), &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, emitTo(out), nil, skips)
 	if err != nil {
 		t.Fatalf("a column-count mismatch is warn-and-skip on the stream path, got error: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestHandleRows_tableNotInSnapshotCountsSkip(t *testing.T) {
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 	rowsEv.Table.Schema = []byte("unknowndb")
 	out := make(chan Event, 4)
-	err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), driftResolver(), &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, out, nil, skips)
+	err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), driftResolver(), &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, emitTo(out), nil, skips)
 	if err != nil {
 		t.Fatalf("handleRows: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestHandleRows_excludedSchemaSkipNotCounted(t *testing.T) {
 	rowsEv.Table.Schema = []byte("mysql")
 	rowsEv.Table.Table = []byte("rds_heartbeat2")
 	out := make(chan Event, 4)
-	err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), driftResolver(), &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, out, nil, skips)
+	err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), driftResolver(), &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, emitTo(out), nil, skips)
 	if err != nil {
 		t.Fatalf("handleRows: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestHandleRows_captureBreaksEscalationRun(t *testing.T) {
 		t.Helper()
 		rowsEv := binlogEv.Event.(*replication.RowsEvent)
 		out := make(chan Event, 4)
-		if err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), driftResolver(), &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, out, nil, skips); err != nil {
+		if err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), driftResolver(), &Filters{}, binlogEv, rowsEv, "binlog.000001", "", 0, 0, "", 9, emitTo(out), nil, skips); err != nil {
 			t.Fatalf("handleRows: %v", err)
 		}
 	}

@@ -1111,3 +1111,67 @@ func TestStreamParser_emptyPayloadNoEffect(t *testing.T) {
 		t.Errorf("expected 0 events from empty/ignored payloads, got %d", len(out))
 	}
 }
+
+// TestStreamParser_stampsReadAt pins T1 (#1224): every event leaving the stream
+// parser carries the time the replication client delivered the binlog event it
+// came from. The assertion is bracketed by wall-clock reads taken around Run, so
+// it fails both on a missing stamp (zero) and on a stamp taken from the wrong
+// clock or the wrong moment.
+func TestStreamParser_stampsReadAt(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	before := time.Now()
+	feedThenCancel(t, streamer, cancel, makeGTIDEvent(42))
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	after := time.Now()
+
+	if len(out) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(out))
+	}
+	ev := <-out
+	if ev.ReadAt.IsZero() {
+		t.Fatal("ReadAt is zero on a streamed event — the T1 stamp never landed")
+	}
+	if ev.ReadAt.Before(before) || ev.ReadAt.After(after) {
+		t.Errorf("ReadAt %v outside the run window [%v, %v]", ev.ReadAt, before, after)
+	}
+}
+
+// TestEmitter_filePathLeavesReadAtZero pins the other half of the contract: the
+// unstamped emitter the file path uses must never fabricate a read time. A zero
+// ReadAt is the signal consumers key off to SKIP the observation — a stamped
+// file-mode event would report a re-index of month-old binlogs as fresh.
+func TestEmitter_filePathLeavesReadAtZero(t *testing.T) {
+	ch := make(chan Event, 1)
+	if err := emitTo(ch).send(context.Background(), Event{EventType: EventInsert}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if got := (<-ch).ReadAt; !got.IsZero() {
+		t.Errorf("emitTo stamped ReadAt = %v, want zero", got)
+	}
+}
+
+// TestEmitter_sendStampsAndHonoursCancellation covers the two behaviours send
+// took over from the bare channel sends it replaced.
+func TestEmitter_sendStampsAndHonoursCancellation(t *testing.T) {
+	want := time.Now().Add(-3 * time.Second)
+	ch := make(chan Event, 1)
+	if err := (emitter{ch: ch, readAt: want}).send(context.Background(), Event{}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if got := (<-ch).ReadAt; !got.Equal(want) {
+		t.Errorf("ReadAt = %v, want %v", got, want)
+	}
+
+	// Unbuffered channel with no reader: send must return ctx.Err(), not block.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := (emitter{ch: make(chan Event), readAt: want}).send(ctx, Event{}); !errors.Is(err, context.Canceled) {
+		t.Errorf("send on a cancelled ctx = %v, want context.Canceled", err)
+	}
+}
