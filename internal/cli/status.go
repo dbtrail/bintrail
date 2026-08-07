@@ -35,6 +35,14 @@ records ANY dropped events (statement-format DML, column-count mismatches, …;
 all the same permanent-loss class) — for CI/cron alerting; by default a gap
 never changes the exit code.
 
+Freshness is the liveness half continuity is not: "current" (checkpointing and
+indexing recent events), "idle" (checkpointing, nothing recent) or "stalled"
+(the checkpoint itself is stale — the daemon, not the workload). Offline,
+"idle" cannot distinguish a quiet source from one whose capture is far behind;
+the daemon's bintrail_stream_index_commit_latency_seconds metric can. Pass
+--fail-on-lag <duration> to exit non-zero on a stall, on an unevaluable
+verdict, or on a newest event older than the duration.
+
 Partition row counts are estimates read from information_schema (no table scan).
 
 Example:
@@ -47,12 +55,14 @@ var (
 	stFormat      string
 	stBaselineDir string
 	stFailOnGap   bool
+	stFailOnLag   time.Duration
 )
 
 func init() {
 	statusCmd.Flags().StringVar(&stIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	statusCmd.Flags().StringVar(&stFormat, "format", "text", "Output format: text or json")
 	statusCmd.Flags().StringVar(&stBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (optional, shows baseline binlog positions)")
+	statusCmd.Flags().DurationVar(&stFailOnLag, "fail-on-lag", 0, "Exit non-zero if capture is not keeping up: a stalled checkpoint, an unevaluable verdict (fails closed), or a newest indexed event older than this duration (e.g. 15m). TRAFFIC-SENSITIVE: on a source with genuinely quiet periods the age check fires with nothing wrong, so pick a threshold above your quiet windows. Unset (0) never changes the exit code")
 	statusCmd.Flags().BoolVar(&stFailOnGap, "fail-on-gap", false, "Exit non-zero if the stream lost data (a binlog gap or any recorded capture drops), or its continuity can't be confirmed (fails closed); for CI/cron alerting. By default a gap never changes the exit code")
 	_ = statusCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(statusCmd)
@@ -215,6 +225,41 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			}
 		} else if data.Stream.CaptureSkips.Valid && strings.TrimSpace(data.Stream.CaptureSkips.String) != "" {
 			return fmt.Errorf("capture health: capture_skips ledger present but unreadable; cannot confirm statement-format DML drops; failing closed under --fail-on-gap")
+		}
+	}
+
+	// Opt-in alertable exit for FRESHNESS (#1226) — the liveness sibling of
+	// --fail-on-gap, and deliberately a separate flag: continuity and liveness
+	// are independent failures (a contiguous index can be days stale) and an
+	// operator should be able to alert on one without the other.
+	//
+	// Fails closed on the three verdicts that are not claims — a "couldn't
+	// check" that exits 0 is the same cry-wolf inversion --fail-on-gap avoids.
+	//
+	// The age check is the one an operator can misconfigure into noise: offline,
+	// a quiet source and a badly-lagging one are the SAME observation (see
+	// status.FreshnessStatus), so this necessarily fires on a genuinely idle
+	// source. That is why it is opt-in, takes an explicit duration, and says so
+	// in the flag help rather than shipping a default that surprises people.
+	if stFailOnLag > 0 {
+		cmd.SilenceUsage = true
+		now := time.Now()
+		verdict := status.FreshnessStatus(data.Stream, data.StreamErr, now, 0, 0)
+		if !status.FreshnessEvaluated(verdict) {
+			return fmt.Errorf("stream freshness: could not evaluate capture liveness (%s); failing closed under --fail-on-lag", verdict)
+		}
+		if verdict == status.FreshnessStalled {
+			age, _ := status.CheckpointAge(data.Stream, now)
+			return fmt.Errorf("stream freshness: capture is STALLED — no checkpoint written for %s; the checkpoint ticker runs even with no traffic, so check the daemon is running",
+				age.Round(time.Second))
+		}
+		age, ok := status.NewestEventAge(data.Stream, now)
+		if !ok {
+			return fmt.Errorf("stream freshness: no event has been indexed yet, so lag against %s cannot be evaluated; failing closed under --fail-on-lag", stFailOnLag)
+		}
+		if age > stFailOnLag {
+			return fmt.Errorf("stream freshness: newest indexed event is %s old, over the %s threshold (on a source with quiet periods this can be idleness, not lag — bintrail_stream_index_commit_latency_seconds on the daemon distinguishes them)",
+				age.Round(time.Second), stFailOnLag)
 		}
 	}
 	return nil

@@ -299,18 +299,17 @@ func convertValue(col Column, raw string) (parquet.Value, error) {
 		}
 		return parquet.Int32Value(int32(n)), nil
 
-	case "binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob", "bit",
-		// GEOMETRY and its subtypes carry WKB (binary) bytes; route them through
-		// the binary path so a --hex-blob dump decodes and the value is stored as
-		// bytes, not UTF-8 text (#503 item 2). NOTE: the exact form mydumper emits
-		// for spatial columns is not verified end-to-end here (mydumper unavailable
-		// in the unit env); the type mapping is the safe floor.
-		"geometry", "point", "linestring", "polygon",
-		"multipoint", "multilinestring", "multipolygon",
-		"geometrycollection", "geomcollection": // MySQL 8.0 canonicalizes the former to the latter
-		return parquet.ByteArrayValue(decodeBinaryLiteral(raw)), nil
-
 	default:
+		// Binary-family types route through decodeBinaryLiteral so a --hex-blob
+		// dump's 0x… literal is stored as bytes, not as UTF-8 text (#503 item 2).
+		// The membership test reads the same authority as the Parquet node
+		// mapping (binaryTypeTokens in schema.go), so the two can never disagree
+		// about which columns are byte arrays. NOTE: the exact form mydumper
+		// emits for spatial columns is not verified end-to-end here (mydumper
+		// unavailable in the unit env); the type mapping is the safe floor.
+		if IsBinaryType(col.MySQLType) {
+			return parquet.ByteArrayValue(decodeBinaryLiteral(raw)), nil
+		}
 		// String types and fallback.
 		return parquet.ByteArrayValue([]byte(raw)), nil
 	}

@@ -2,13 +2,45 @@ package baseline
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
 
 	"github.com/parquet-go/parquet-go"
 )
+
+// binaryTypeTokens is the single authority for "this MySQL type carries raw
+// bytes, not text". Two independent decisions read it and MUST agree, which is
+// why it is one map rather than two switch case-lists: the Parquet column node
+// (a binary leaf, never the UTF-8 STRING default, #503 item 2) and the value
+// conversion (decodeBinaryLiteral, which turns a --hex-blob 0x… literal back
+// into bytes). A type present in one list and absent from the other would write
+// non-UTF-8 bytes into a string column, or store the ASCII text "0x…" as the
+// value.
+//
+// GEOMETRY and its subtypes carry WKB bytes. MySQL 8.0 canonicalizes
+// GEOMETRYCOLLECTION to GEOMCOLLECTION; both spellings are listed because a
+// schema file can come from either server generation.
+var binaryTypeTokens = map[string]bool{
+	"binary": true, "varbinary": true,
+	"tinyblob": true, "blob": true, "mediumblob": true, "longblob": true,
+	"bit":      true,
+	"geometry": true, "point": true, "linestring": true, "polygon": true,
+	"multipoint": true, "multilinestring": true, "multipolygon": true,
+	"geometrycollection": true, "geomcollection": true,
+}
+
+// IsBinaryType reports whether a MySQL type token names a binary-family column
+// — one whose Parquet representation is a byte array and whose text rendering
+// is the --hex-blob 0x<hex> literal form. Exported for producers that build a
+// baseline row's text values themselves rather than reading them out of a
+// mydumper dump (full-table reconstruct's Parquet output, #1169).
+func IsBinaryType(typeToken string) bool {
+	return binaryTypeTokens[strings.ToLower(strings.TrimSpace(typeToken))]
+}
 
 // Column describes a single column parsed from a CREATE TABLE statement.
 type Column struct {
@@ -65,8 +97,30 @@ func ParseSchema(path string) ([]Column, error) {
 	}
 	defer f.Close()
 
+	cols, err := parseSchemaFrom(f)
+	if err != nil {
+		return nil, fmt.Errorf("%w (schema file %s)", err, path)
+	}
+	return cols, nil
+}
+
+// ParseSchemaText parses the same mydumper schema SQL that ParseSchema reads
+// from disk, but from an in-memory string.
+//
+// It exists for the consumers that already hold those exact bytes rather than a
+// path: a baseline Parquet's MetaKeyCreateTableSQL metadata is the verbatim
+// <db>.<table>-schema.sql that produced it (embedded by Run), so a producer
+// deriving a NEW snapshot from an existing one — full-table reconstruct's
+// Parquet output (#1169) — can recover the column list and its MySQL types
+// without a dump directory on disk.
+func ParseSchemaText(createSQL string) ([]Column, error) {
+	return parseSchemaFrom(strings.NewReader(createSQL))
+}
+
+// parseSchemaFrom is the shared scanner both entry points above drive.
+func parseSchemaFrom(r io.Reader) ([]Column, error) {
 	var cols []Column
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
 		// Stop at PRIMARY KEY / KEY / UNIQUE or closing paren lines.
@@ -98,10 +152,10 @@ func ParseSchema(path string) ([]Column, error) {
 		})
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read schema file: %w", err)
+		return nil, fmt.Errorf("read schema: %w", err)
 	}
 	if len(cols) == 0 {
-		return nil, fmt.Errorf("no columns found in schema file %s", path)
+		return nil, errors.New("no columns found in schema SQL")
 	}
 	return cols, nil
 }
@@ -145,6 +199,13 @@ func MysqlToParquetNode2(typeToken string, unsigned bool) parquet.Node {
 //
 // TINYINT/SMALLINT/MEDIUMINT UNSIGNED already fit in int32, so they keep Int(32).
 func mysqlToParquetNode(typeToken string, unsigned bool) parquet.Node {
+	// Binary-family types first, from the shared authority above: storing WKB or
+	// BLOB bytes in the STRING default would place non-UTF-8 bytes in a UTF-8
+	// column (#503 item 2). The exact mydumper spatial encoding is unverified
+	// end-to-end here; the binary type mapping is the safe floor.
+	if IsBinaryType(typeToken) {
+		return parquet.Optional(parquet.Leaf(parquet.ByteArrayType))
+	}
 	switch typeToken {
 	case "int", "integer":
 		if unsigned {
@@ -178,16 +239,6 @@ func mysqlToParquetNode(typeToken string, unsigned bool) parquet.Node {
 	case "char", "varchar", "tinytext", "text", "mediumtext", "longtext",
 		"enum", "set", "json":
 		return parquet.Optional(parquet.String())
-	case "binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob",
-		"bit",
-		// GEOMETRY and its subtypes carry WKB bytes: store as a binary leaf, not
-		// the STRING default (which would place non-UTF-8 bytes in a UTF-8 column).
-		// #503 item 2. The exact mydumper spatial encoding is unverified end-to-end
-		// here; the binary type mapping is the safe floor.
-		"geometry", "point", "linestring", "polygon",
-		"multipoint", "multilinestring", "multipolygon",
-		"geometrycollection", "geomcollection": // MySQL 8.0 canonicalizes the former to the latter
-		return parquet.Optional(parquet.Leaf(parquet.ByteArrayType))
 	default:
 		// Unknown type — treat as string to avoid data loss.
 		return parquet.Optional(parquet.String())

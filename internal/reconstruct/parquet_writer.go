@@ -1,0 +1,447 @@
+package reconstruct
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"math"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/dbtrail/dbtrail/internal/baseline"
+)
+
+// ParquetWriterCompression / ParquetWriterRowGroupSize are the codec and row
+// group size a reconstructed baseline snapshot is written with. They are pinned
+// to `bintrail baseline`'s own defaults rather than exposed as flags: the whole
+// point of #1169 is that the emitted snapshot is indistinguishable from a
+// mydumper-sourced one, and a snapshot chain whose files alternate codecs run to
+// run is a needless source of "why is this one different".
+const (
+	ParquetWriterCompression  = "zstd"
+	ParquetWriterRowGroupSize = 500_000
+)
+
+// parquetTableWriter writes one table of a reconstructed baseline snapshot.
+//
+// It is the Parquet-mode sibling of MydumperWriter and deliberately mirrors its
+// lifecycle — Close finalizes, Discard unlinks (#1162) — so ReconstructTable's
+// error paths behave identically in both output formats. The difference that
+// matters is what a partial file means: a truncated Parquet file has no footer
+// and does not parse at all, so a crash leaves something visibly broken rather
+// than a loadable prefix. Discard still removes it, because a snapshot directory
+// containing an unreadable file for one table is a worse diagnostic than one
+// where that table is simply absent.
+type parquetTableWriter struct {
+	w    *baseline.Writer
+	cols []baseline.Column
+	path string
+
+	rows      int64
+	closed    bool
+	finalized bool
+
+	// missingWarned tracks columns already warned about being absent from an
+	// emitted row, so a systematic mismatch warns once per column instead of once
+	// per row.
+	missingWarned map[string]bool
+}
+
+// newParquetTableWriter creates the table's Parquet file under snapshotDir,
+// laid out exactly where baseline.Run puts it (<snapshot>/<db>/<table>.parquet)
+// so reconstruct.FindBaseline discovers it by the same glob.
+func newParquetTableWriter(path string, cols []baseline.Column, md map[string]string) (*parquetTableWriter, error) {
+	w, err := baseline.NewWriter(path, cols, baseline.WriterConfig{
+		Compression:  ParquetWriterCompression,
+		RowGroupSize: ParquetWriterRowGroupSize,
+		Metadata:     md,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create baseline parquet writer %s: %w", path, err)
+	}
+	return &parquetTableWriter{w: w, cols: cols, path: path, missingWarned: map[string]bool{}}, nil
+}
+
+// WriteRow renders one reconstructed row — keyed by column name, as
+// mergeBaselineImages emits it — into the text form baseline.Writer converts,
+// and appends it to the Parquet file.
+func (w *parquetTableWriter) WriteRow(row map[string]any, schema, table string) error {
+	if w.closed {
+		return ErrWriterClosed
+	}
+	values := make([]string, len(w.cols))
+	nulls := make([]bool, len(w.cols))
+	for i, col := range w.cols {
+		v, ok := row[col.Name]
+		if !ok {
+			// Same defensive stance as rowAfterOrdered on the mydumper path: the
+			// #602/#843 guards already refused every drift shape that could get
+			// here, so this is a bug-catcher, not a supported layout.
+			if !w.missingWarned[col.Name] {
+				w.missingWarned[col.Name] = true
+				slog.Warn("reconstructed row missing column present in the baseline schema; emitting NULL",
+					"schema", schema, "table", table, "column", col.Name)
+			}
+			nulls[i] = true
+			continue
+		}
+		text, isNull, err := renderBaselineValue(col, v)
+		if err != nil {
+			return fmt.Errorf("%s.%s column %q: %w", schema, table, col.Name, err)
+		}
+		values[i], nulls[i] = text, isNull
+	}
+	if err := w.w.WriteRow(values, nulls); err != nil {
+		return err
+	}
+	w.rows++
+	return nil
+}
+
+// Rows returns how many rows have been written.
+func (w *parquetTableWriter) Rows() int64 { return w.rows }
+
+// Close flushes the Parquet footer. Only a successful Close finalizes the file;
+// see MydumperWriter.finalized for why that distinction is load-bearing.
+func (w *parquetTableWriter) Close() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if err := w.w.Close(); err != nil {
+		return err
+	}
+	w.finalized = true
+	return nil
+}
+
+// Discard aborts the writer and unlinks the file it created. A no-op after a
+// successful Close, so a completed table's output is structurally undeletable by
+// a caller's deferred error path (#1162).
+func (w *parquetTableWriter) Discard() error {
+	if w.finalized {
+		return nil
+	}
+	if !w.closed {
+		w.closed = true
+		// Ignore the close error: the file is unlinked immediately below, so
+		// whatever failed to flush changes nothing.
+		_ = w.w.Close()
+	}
+	if err := os.Remove(w.path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// baselineMeta identifies the snapshot a reconstruction was derived from.
+type baselineMeta struct {
+	Path     string
+	Time     time.Time
+	Metadata baseline.DumpMetadata
+}
+
+// Parquet file-metadata keys unique to a RECONSTRUCTED snapshot. They are pure
+// provenance: no existing reader looks them up, so their presence cannot change
+// how a consumer treats the snapshot (which is the #1169 requirement), but they
+// make "was this snapshot dumped from a source, or folded out of the index?"
+// answerable forever from the file itself.
+const (
+	MetaKeySnapshotProducer = "bintrail.snapshot_producer"
+	MetaKeyDerivedFrom      = "bintrail.derived_from_snapshot"
+	MetaKeyDerivedFromPath  = "bintrail.derived_from_path"
+	// SnapshotProducerReconstruct is the MetaKeySnapshotProducer value this
+	// package stamps. A snapshot written by `bintrail baseline` carries no
+	// producer key at all.
+	SnapshotProducerReconstruct = "reconstruct"
+)
+
+// mergeBaselineIntoParquet is the OutputFormatParquet sibling of
+// mergeBaselineIntoWriter: it runs the identical merge and writes the result as
+// a baseline snapshot Parquet file instead of a mydumper SQL dump.
+//
+// # What makes the output a baseline rather than just a Parquet file
+//
+//   - Layout: <snapshot>/<db>/<table>.parquet, byte-for-byte where baseline.Run
+//     puts it, so FindBaseline's glob discovers it unchanged.
+//   - Schema: the columns come from the SOURCE baseline's own
+//     MetaKeyCreateTableSQL, parsed by the same ParseSchema code path that read
+//     the mydumper schema file originally — so the emitted Parquet has the same
+//     column names, the same MySQL→Parquet type mapping, and (via
+//     baseline.Writer's alphabetical sort) the same physical column order.
+//   - Anchor: MetaKeyBinlogFile/Pos carry the run's cut, the coordinate where
+//     the next fold resumes. This is the load-bearing field; see
+//     ResolveSnapshotCut.
+//   - MetaKeyCreateTableSQL is propagated verbatim, so a reconstruct anchored on
+//     THIS snapshot can emit a schema file (or a further snapshot) exactly as it
+//     could from the original.
+//
+// # What is deliberately NOT stamped
+//
+//   - MetaKeyGTIDSet: binlog_events.gtid is per event, not an accumulated
+//     executed-set, and there is no correct way to synthesize one from it. No
+//     consumer needs it (the delta fetch anchors on file/pos), and operators read
+//     it — so absent beats wrong.
+//   - MetaKeyContentDigest / MetaKeyRowCount: the digest certifies that a dump
+//     captured the same rows as the SOURCE (#633), and `verify` compares it
+//     against a live source. A reconstructed snapshot never touched the source,
+//     so any digest here would be a fingerprint of our own arithmetic presented
+//     as source fidelity — it would manufacture a mismatch, or worse, a false
+//     match. Absent is the honest state, and readers already treat an absent
+//     digest as "not verifiable this way" rather than as an error.
+func mergeBaselineIntoParquet(ctx context.Context, in mergeInput, rep *TableReport) (retErr error) {
+	colNames, err := prepareMerge(ctx, in)
+	if err != nil {
+		return err
+	}
+
+	// The emitted snapshot's schema is the SOURCE snapshot's schema. Parsing the
+	// embedded CREATE TABLE (rather than inferring types from the Parquet file
+	// we are about to read) is what keeps the types identical across a refresh
+	// chain: Parquet's own types are lossy in the other direction — a DECIMAL, a
+	// TIME and a JSON column are all "string" once written.
+	cols, err := baseline.ParseSchemaText(in.CreateTableSQL)
+	if err != nil {
+		return fmt.Errorf("parse the baseline's embedded CREATE TABLE for %s.%s: %w", in.Schema, in.Table, err)
+	}
+	if err := checkSchemaMatchesBaseline(cols, colNames, in.Schema, in.Table); err != nil {
+		return err
+	}
+
+	md := map[string]string{
+		"bintrail.snapshot_timestamp":  in.SnapshotAt.UTC().Format(time.RFC3339),
+		"bintrail.source_database":     in.Schema,
+		"bintrail.source_table":        in.Table,
+		"bintrail.bintrail_version":    baseline.Version,
+		baseline.MetaKeyCreateTableSQL: in.CreateTableSQL,
+		MetaKeySnapshotProducer:        SnapshotProducerReconstruct,
+		MetaKeyDerivedFrom:             in.SourceBaseline.Time.UTC().Format(time.RFC3339),
+		MetaKeyDerivedFromPath:         in.SourceBaseline.Path,
+	}
+	switch {
+	case in.Cut != nil:
+		md[baseline.MetaKeyBinlogFile] = in.Cut.File
+		md[baseline.MetaKeyBinlogPos] = strconv.FormatUint(in.Cut.Pos, 10)
+	case in.SourceBaseline.Metadata.BinlogFile != "":
+		// No cut means the index holds no events, so nothing was folded and the
+		// source's anchor is still exactly where deltas resume. Carrying it over
+		// keeps the chain unbroken; omitting it would strand the new snapshot with
+		// no anchor at all and force the next fetch back onto the imprecise
+		// timestamp bound (#797).
+		md[baseline.MetaKeyBinlogFile] = in.SourceBaseline.Metadata.BinlogFile
+		md[baseline.MetaKeyBinlogPos] = strconv.FormatInt(in.SourceBaseline.Metadata.BinlogPos, 10)
+	}
+
+	path := filepath.Join(in.SnapshotDir, in.Schema, in.Table+".parquet")
+	w, err := newParquetTableWriter(path, cols, md)
+	if err != nil {
+		return err
+	}
+	// Same #1162 stance as the mydumper path: any error return unlinks this
+	// table's file. A removal failure is logged, never returned — it must not
+	// shadow the error that triggered the abort.
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if derr := w.Discard(); derr != nil {
+			slog.Warn("could not remove partial snapshot file for failed table",
+				"schema", in.Schema, "table", in.Table, "path", path, "error", derr)
+		}
+	}()
+
+	stats, err := mergeBaselineImages(ctx, mergeCore{
+		LocalBaselinePath: in.LocalBaselinePath,
+		Schema:            in.Schema,
+		Table:             in.Table,
+		PKCols:            in.PKCols,
+		Changes:           in.Changes,
+		DuckDBTuning:      in.DuckDBTuning,
+	}, func(rowMap map[string]any) error {
+		return w.WriteRow(rowMap, in.Schema, in.Table)
+	})
+	if err != nil {
+		return err
+	}
+	rep.BaselineRows = stats.BaselineRows
+	rep.UpdatesApplied = stats.UpdatesApplied
+	rep.InsertsEmitted = stats.InsertsEmitted
+	rep.DeletesSkipped = stats.DeletesSkipped
+
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("close snapshot writer for %s.%s: %w", in.Schema, in.Table, err)
+	}
+	rep.Files = []string{filepath.Join(in.Schema, in.Table+".parquet")}
+	rep.RowsWritten = w.Rows()
+	return nil
+}
+
+// checkSchemaMatchesBaseline refuses when the CREATE TABLE embedded in the
+// source snapshot does not describe the columns that snapshot actually holds.
+//
+// The two are written together by baseline.Run and normally agree exactly. When
+// they don't — a hand-assembled snapshot, a CREATE TABLE whose DDL shape
+// ParseSchema reads differently than it did at dump time (an unusual generated
+// column, #767) — the mismatch is silent and directional: a column in the DDL
+// but not in the file is written as all-NULL, and a column in the file but not
+// in the DDL is dropped. Both produce a snapshot that loads and is wrong, which
+// is the one outcome this whole path exists to avoid.
+func checkSchemaMatchesBaseline(cols []baseline.Column, colNames []string, schema, table string) error {
+	inDDL := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		inDDL[c.Name] = true
+	}
+	inFile := make(map[string]bool, len(colNames))
+	for _, n := range colNames {
+		inFile[n] = true
+	}
+	var onlyDDL, onlyFile []string
+	for _, c := range cols {
+		if !inFile[c.Name] {
+			onlyDDL = append(onlyDDL, c.Name)
+		}
+	}
+	for _, n := range colNames {
+		if !inDDL[n] {
+			onlyFile = append(onlyFile, n)
+		}
+	}
+	if len(onlyDDL) == 0 && len(onlyFile) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"baseline for %s.%s disagrees with its own embedded CREATE TABLE "+
+			"(only in the DDL: %s; only in the Parquet file: %s) — emitting a snapshot from it would NULL-fill or "+
+			"drop those columns; re-run `bintrail dump` + `bintrail baseline` to take a consistent snapshot",
+		schema, table,
+		strings.Join(orNone(onlyDDL), ", "), strings.Join(orNone(onlyFile), ", "))
+}
+
+func orNone(s []string) []string {
+	if len(s) == 0 {
+		return []string{"none"}
+	}
+	return s
+}
+
+// renderBaselineValue converts one reconstructed value into the text form
+// baseline.Writer's convertValue parses, plus a NULL flag.
+//
+// Going through text rather than building parquet.Values directly is
+// deliberate: convertValue is the single, test-pinned authority on how a MySQL
+// value becomes a Parquet value (UNSIGNED widening #506, zero-date pseudo-NULL,
+// hex-blob decoding #503), and every other producer feeding baseline.Writer —
+// the mydumper readers, internal/archive, internal/byos — reaches it the same
+// way. A parallel typed path would be a second conversion authority free to
+// drift from it.
+//
+// The values arriving here have two provenances and both must round-trip:
+//
+//   - Baseline pass-through rows carry DuckDB scan types read back out of the
+//     PREVIOUS snapshot's Parquet (int32/int64/uint64/float/string/[]byte/
+//     time.Time). These are re-rendered into the exact text that produced them,
+//     so a row untouched by any delta is byte-identical across a refresh chain —
+//     which is what makes repeated refreshes stable rather than slowly drifting.
+//   - Delta rows carry a binlog event's row_after image, JSON-decoded upstream
+//     (#668/#475), so every number is a float64 regardless of the column's real
+//     type. That is why the integer families re-render through a truncation
+//     check instead of a bare float format: `1.234568e+06` in an INT column
+//     would fail convertValue's ParseInt and abort the run.
+//
+// An unrecognised Go type falls through to %v rather than failing here.
+// convertValue is the fail-loud gate: a value it cannot parse aborts the run
+// with the column, type and text in the message, which is a better diagnostic
+// than a Go type name from this layer.
+func renderBaselineValue(col baseline.Column, v any) (text string, isNull bool, err error) {
+	if v == nil {
+		return "", true, nil
+	}
+	switch t := v.(type) {
+	case string:
+		return t, false, nil
+
+	case []byte:
+		if baseline.IsBinaryType(col.MySQLType) {
+			// The 0x<hex> form convertValue's decodeBinaryLiteral decodes. Always
+			// hex — never the raw bytes — so bytes that happen to spell "0x1234"
+			// round-trip as themselves rather than being decoded as a literal.
+			return "0x" + hex.EncodeToString(t), false, nil
+		}
+		return string(t), false, nil
+
+	case time.Time:
+		if strings.EqualFold(strings.TrimSpace(col.MySQLType), "date") {
+			return t.UTC().Format("2006-01-02"), false, nil
+		}
+		// The fractional part is elided when zero, which is the form
+		// parseDatetimeToMicros's no-dot branch expects; a value with sub-second
+		// precision keeps it and takes the other branch. UTC because the Parquet
+		// timestamp is microseconds since the Unix epoch and convertValue parses
+		// the text back in UTC.
+		return t.UTC().Format("2006-01-02 15:04:05.999999"), false, nil
+
+	case bool:
+		// MySQL's BOOLEAN is TINYINT(1); a JSON row image can carry it as a real
+		// bool, which ParseInt would reject as "true".
+		if t {
+			return "1", false, nil
+		}
+		return "0", false, nil
+
+	case float32:
+		return formatFloatForColumn(float64(t), col, 32), false, nil
+	case float64:
+		return formatFloatForColumn(t, col, 64), false, nil
+
+	case json.Number:
+		return t.String(), false, nil
+
+	case int, int8, int16, int32, int64:
+		return fmt.Sprintf("%d", t), false, nil
+	case uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%d", t), false, nil
+
+	default:
+		return fmt.Sprintf("%v", t), false, nil
+	}
+}
+
+// integerTypeTokens names the MySQL types convertValue parses with ParseInt /
+// ParseUint, i.e. the ones for which a float rendering must not carry a decimal
+// point or an exponent.
+var integerTypeTokens = map[string]bool{
+	"tinyint": true, "smallint": true, "mediumint": true,
+	"int": true, "integer": true, "bigint": true, "year": true,
+}
+
+// formatFloatForColumn renders a float value as the text convertValue will parse
+// for this column's type. bitSize is the float's own precision, so a float32 is
+// not widened into the noise of its float64 expansion (0.1 → 0.10000000149…).
+func formatFloatForColumn(f float64, col baseline.Column, bitSize int) string {
+	typ := strings.ToLower(strings.TrimSpace(col.MySQLType))
+	if integerTypeTokens[typ] {
+		if !math.IsInf(f, 0) && !math.IsNaN(f) && f == math.Trunc(f) {
+			// 'f' with -1 precision never emits an exponent, so ParseInt sees a
+			// plain integer for any magnitude.
+			return strconv.FormatFloat(f, 'f', -1, 64)
+		}
+		// A non-integral value in an integer column is a real inconsistency;
+		// render it faithfully and let convertValue refuse it rather than
+		// silently truncating data here.
+		return strconv.FormatFloat(f, 'f', -1, bitSize)
+	}
+	if typ == "float" || typ == "double" || typ == "real" {
+		// ParseFloat accepts exponent notation, so 'g' is safe here and keeps the
+		// shortest exact representation.
+		return strconv.FormatFloat(f, 'g', -1, bitSize)
+	}
+	// Everything else (DECIMAL, and any column whose value arrived as a float
+	// through JSON) is stored as text verbatim; avoid an exponent so the stored
+	// string still looks like the number MySQL would print.
+	return strconv.FormatFloat(f, 'f', -1, bitSize)
+}

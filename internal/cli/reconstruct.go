@@ -72,11 +72,21 @@ auto-discovered via archive_state. Pass --no-archive to query MySQL only.
 By default, a coverage gap (an hour rotated out of MySQL with no archive)
 aborts the reconstruction; pass --allow-gaps to proceed with a warning.
 
-Full-table mode (--output-format mydumper) reconstructs entire tables at a
-target point in time and emits a mydumper-compatible dump directory
-(schema file + chunked INSERT files + metadata) restorable with a plain
-mysql client. Use --tables schema.table,... to select which tables to
-reconstruct and --output-dir for the destination.
+Full-table mode reconstructs entire tables at a target point in time. Use
+--tables schema.table,... to select the tables and --output-dir for the
+destination. Two output formats:
+
+  --output-format mydumper   a mydumper-compatible dump directory (schema
+                             file + chunked INSERT files + metadata),
+                             restorable with a plain mysql client.
+  --output-format parquet    a baseline snapshot: the same artifact
+                             "bintrail baseline" produces, written under
+                             --output-dir/<timestamp>/ and discoverable as
+                             the newest baseline. --output-dir is the
+                             BASELINES ROOT here, not the file destination.
+                             The snapshot carries the exact binlog
+                             coordinate where the next reconstruct resumes,
+                             so it can anchor the one after it.
 
 Examples:
   # Current state of a row (baseline + all binlog events up to now)
@@ -88,6 +98,11 @@ Examples:
     --tables mydb.orders,mydb.users --baseline-dir /data/baselines \
     --at "2026-04-01 15:30:00" \
     --output-format mydumper --output-dir ./pitr-dump
+
+  # Refresh the baselines from the index itself — no mydumper, no source
+  bintrail reconstruct --index-dsn "..." \
+    --tables mydb.orders,mydb.users --baseline-dir /data/baselines \
+    --output-format parquet --output-dir /data/baselines
 
   # State at a past timestamp
   bintrail reconstruct --index-dsn "..." --schema mydb --table orders \
@@ -154,9 +169,9 @@ func init() {
 	reconstructCmd.Flags().BoolVar(&recNoArchive, "no-archive", false, "Disable auto-routing to Parquet archives (MySQL-only event fetch)")
 	reconstructCmd.Flags().BoolVar(&recAllowGaps, "allow-gaps", false, "Proceed even when the event index has missing hours in the baseline-to-target range (may produce incomplete reconstruction)")
 	// Full-table mydumper mode (#187).
-	reconstructCmd.Flags().StringVar(&recOutputFormat, "output-format", "", "Output format for full-table mode: 'mydumper' to produce a mydumper-compatible dump directory (default: single-row mode)")
-	reconstructCmd.Flags().StringVar(&recOutputDir, "output-dir", "", "Output directory for --output-format=mydumper (will be created if missing)")
-	reconstructCmd.Flags().StringVar(&recTables, "tables", "", "Comma-separated schema.table list for --output-format=mydumper (e.g. mydb.orders,mydb.users)")
+	reconstructCmd.Flags().StringVar(&recOutputFormat, "output-format", "", "Output format for full-table mode: 'mydumper' for a mydumper-compatible dump directory, 'parquet' for a discoverable baseline snapshot (default: single-row mode)")
+	reconstructCmd.Flags().StringVar(&recOutputDir, "output-dir", "", "Output directory for full-table mode (created if missing); with --output-format=parquet this is the baselines root and the snapshot lands in a <timestamp>/ subdirectory")
+	reconstructCmd.Flags().StringVar(&recTables, "tables", "", "Comma-separated schema.table list for full-table mode (e.g. mydb.orders,mydb.users)")
 	reconstructCmd.Flags().StringVar(&recChunkSize, "chunk-size", "256MB", "Max size per SQL chunk file in full-table mode (e.g. 64MB, 1GB)")
 	reconstructCmd.Flags().IntVar(&recParallelism, "parallelism", 0, "Max tables to reconstruct concurrently in full-table mode (default: runtime.NumCPU())")
 	reconstructCmd.Flags().Int64Var(&recWarnEvents, "warn-event-threshold", 5_000_000, "Full-table mode: log a memory warning when a table's reconstruct window exceeds this many events (#654; this threshold is divided by --parallelism, capped to the number of --tables, so it reflects the total concurrent RAM across tables reconstructing at once, #842; 0 disables)")
@@ -171,8 +186,9 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 
 	// ── --output-format mydumper mode: full-table reconstruct (#187) ───────────
 	if recOutputFormat != "" {
-		if recOutputFormat != "mydumper" {
-			return fmt.Errorf("--output-format: only 'mydumper' is supported, got %q", recOutputFormat)
+		if recOutputFormat != reconstruct.OutputFormatMydumper && recOutputFormat != reconstruct.OutputFormatParquet {
+			return fmt.Errorf("--output-format: only %q and %q are supported, got %q",
+				reconstruct.OutputFormatMydumper, reconstruct.OutputFormatParquet, recOutputFormat)
 		}
 		return runReconstructFullTable(cmd, start)
 	}
@@ -653,33 +669,33 @@ func writeReconstructOutput(baselineRow map[string]any, events []query.ResultRow
 func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 	// ── Validate incompatible flags ────────────────────────────────────────
 	if recPK != "" || recPKColumns != "" {
-		return fmt.Errorf("--output-format=mydumper is incompatible with --pk / --pk-columns (full-table mode reconstructs every row)")
+		return fmt.Errorf("full-table mode is incompatible with --pk / --pk-columns (full-table mode reconstructs every row)")
 	}
 	if recHistory {
-		return fmt.Errorf("--output-format=mydumper is incompatible with --history")
+		return fmt.Errorf("full-table mode is incompatible with --history")
 	}
 	if recBaselineOnly {
-		return fmt.Errorf("--output-format=mydumper is incompatible with --baseline-only")
+		return fmt.Errorf("full-table mode is incompatible with --baseline-only")
 	}
 	if recSQL != "" {
-		return fmt.Errorf("--output-format=mydumper is incompatible with --sql")
+		return fmt.Errorf("full-table mode is incompatible with --sql")
 	}
 	if recSchema != "" || recTable != "" {
-		return fmt.Errorf("--output-format=mydumper uses --tables for schema.table selection, not --schema/--table")
+		return fmt.Errorf("full-table mode uses --tables for schema.table selection, not --schema/--table")
 	}
 
 	// ── Validate required flags ────────────────────────────────────────────
 	if recTables == "" {
-		return fmt.Errorf("--tables is required with --output-format=mydumper (e.g. --tables mydb.orders,mydb.users)")
+		return fmt.Errorf("--tables is required in full-table mode (e.g. --tables mydb.orders,mydb.users)")
 	}
 	if recOutputDir == "" {
-		return fmt.Errorf("--output-dir is required with --output-format=mydumper")
+		return fmt.Errorf("--output-dir is required in full-table mode")
 	}
 	if recIndexDSN == "" {
-		return fmt.Errorf("--index-dsn is required with --output-format=mydumper")
+		return fmt.Errorf("--index-dsn is required in full-table mode")
 	}
 	if recBaselineDir == "" && recBaselineS3 == "" {
-		return fmt.Errorf("one of --baseline-dir or --baseline-s3 is required with --output-format=mydumper")
+		return fmt.Errorf("one of --baseline-dir or --baseline-s3 is required in full-table mode")
 	}
 
 	// ── Parse --at ─────────────────────────────────────────────────────────
@@ -738,6 +754,7 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 		Tables:             tables,
 		At:                 at,
 		OutputDir:          recOutputDir,
+		OutputFormat:       recOutputFormat,
 		ChunkSize:          chunkSize,
 		Parallelism:        recParallelism,
 		AllowGaps:          recAllowGaps,
@@ -782,10 +799,11 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 	// materializes each of them in full.
 	for _, rep := range reports {
 		auditReconstruct(cmd.Context(), "full-table", rep.Schema, rep.Table, map[string]string{
-			"at":         recAt,
-			"rows":       strconv.FormatInt(rep.BaselineRows+rep.UpdatesApplied+rep.InsertsEmitted, 10),
-			"events":     strconv.FormatInt(rep.EventsApplied, 10),
-			"output_dir": recOutputDir,
+			"at":            recAt,
+			"rows":          strconv.FormatInt(rep.BaselineRows+rep.UpdatesApplied+rep.InsertsEmitted, 10),
+			"events":        strconv.FormatInt(rep.EventsApplied, 10),
+			"output_dir":    recOutputDir,
+			"output_format": recOutputFormat,
 		})
 	}
 
