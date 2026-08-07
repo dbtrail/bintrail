@@ -120,18 +120,20 @@ func TestParseSchemaExcludesSystemVersioningPeriodColumns(t *testing.T) {
 	}
 }
 
-// TestParseSchemaSystemVersioningPeriodColumnVariants covers the two edges of
-// rowPeriodRe: trailing attributes after the period clause (MariaDB allows
-// INVISIBLE on explicit period columns) must still be excluded, and a plain
-// column that merely SHARES the conventional row_start/row_end NAME — with no
-// GENERATED clause — must be kept: its values ARE in the dump, and dropping it
-// would shift every later column's positional slot (the #767 corruption class).
+// TestParseSchemaSystemVersioningPeriodColumnVariants covers the edges of
+// rowPeriodRe: trailing attributes after the period clause (verified on
+// MariaDB 11.4 — SHOW CREATE TABLE emits INVISIBLE right after the period
+// clause) and a lowercase hand-rolled spelling must still be excluded, and a
+// plain column that merely SHARES the conventional row_start/row_end NAME —
+// with no GENERATED clause — must be kept: its values ARE in the dump, and
+// dropping it would shift every later column's positional slot (the #767
+// corruption class).
 func TestParseSchemaSystemVersioningPeriodColumnVariants(t *testing.T) {
 	const schema = "CREATE TABLE `t` (\n" +
 		"  `id` int(11) NOT NULL,\n" +
 		"  `row_start` timestamp(6) NOT NULL DEFAULT current_timestamp(6),\n" +
 		"  `rs` timestamp(6) GENERATED ALWAYS AS ROW START INVISIBLE,\n" +
-		"  `re` timestamp(6) GENERATED ALWAYS AS ROW END INVISIBLE,\n" +
+		"  `re` timestamp(6) generated always as row end,\n" +
 		"  `val` varchar(20) DEFAULT NULL,\n" +
 		"  PRIMARY KEY (`id`,`re`)\n" +
 		") ENGINE=InnoDB WITH SYSTEM VERSIONING;\n"

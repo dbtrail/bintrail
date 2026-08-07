@@ -95,8 +95,8 @@ var generatedRe = regexp.MustCompile(`(?i)\bAS\s*\(.*\)\s*(?:VIRTUAL|STORED|PERS
 //	`row_start` timestamp(6) GENERATED ALWAYS AS ROW START,
 //	`row_end`   timestamp(6) GENERATED ALWAYS AS ROW END,
 //
-// Verified against a real dump (issue #863, mydumper/mydumper:latest vs
-// MariaDB 11.4, same flags bintrail passes incl. --complete-insert): mydumper
+// Verified against a real dump (issue #863, mydumper v1.0.3-1 vs MariaDB
+// 11.4, same flags bintrail passes incl. --complete-insert): mydumper
 // emits these columns in the -schema.sql exactly as above but EXCLUDES their
 // values from the INSERT column-list and VALUES tuples, the same treatment
 // STORED/VIRTUAL generated columns get — so ParseSchema must drop them from
@@ -110,7 +110,15 @@ var generatedRe = regexp.MustCompile(`(?i)\bAS\s*\(.*\)\s*(?:VIRTUAL|STORED|PERS
 // trade-off as generatedRe: the failure mode is the loud arity check, never
 // silent corruption. internal/consistency/checksum.go needs no sibling change —
 // its tableColumns already excludes these via GENERATION_EXPRESSION, which
-// MariaDB fills with the literal "ROW START"/"ROW END".
+// MariaDB fills with the literal "ROW START"/"ROW END" (verified live).
+//
+// Known scope limit (#1266): MariaDB extends the table's PRIMARY KEY with the
+// ROW END column, and the schema snapshot keeps it (PKColumnMetas selects on
+// IsPK only), so FULL-TABLE reconstruct — and verify, which reconstructs —
+// still refuse such a table loudly at the PK-canonicalization step
+// (MissingPKColumnError: the baseline no longer carries the column). The
+// baseline itself, single-row reconstruct with --pk-columns, and the query
+// paths all work.
 var rowPeriodRe = regexp.MustCompile(`(?i)\bGENERATED\s+ALWAYS\s+AS\s+ROW\s+(?:START|END)\b`)
 
 // ParseSchema reads a mydumper <db>.<table>-schema.sql file and returns the
