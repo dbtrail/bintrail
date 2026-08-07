@@ -317,6 +317,29 @@ It prunes a local snapshot **only** when all of these hold — pruning never ris
 
 The S3 copy is **not** pruned — only the redundant local copy. To prune on a long-lived daemon instead of from cron, `bintrail-console watch` takes the same `--baseline-retain` and runs the prune on its rotation cadence. It reclaims both the global `--baseline-dir` (against `--baseline-s3`) and every monitored server's own baseline directory (against that server's S3 prefix) — including the per-server dirs the console **Create baseline** button writes into. Env: `BINTRAIL_BASELINE_RETAIN` (CLI) / `BINTRAIL_CONSOLE_BASELINE_RETAIN` (`watch`).
 
+## Step 3 (optional): a newer baseline without a new dump
+
+`bintrail reconstruct --output-format parquet` writes its result **as a baseline snapshot** instead of a SQL dump. Since the index already holds every change since the last snapshot, a fresher snapshot can be folded out of storage you already have — no mydumper run, no connection to the source:
+
+```sh
+bintrail reconstruct \
+  --index-dsn     "user:pass@tcp(index-db:3306)/bintrail_index" \
+  --baseline-dir  /data/baselines \
+  --tables        mydb.orders,mydb.users \
+  --output-format parquet \
+  --output-dir    /data/baselines
+```
+
+`--output-dir` is the **baselines root** here, not the destination file: the snapshot lands in `/data/baselines/<timestamp>/<db>/<table>.parquet` with the same `_SUCCESS` / `_MANIFEST` files a converted dump gets, and the next `reconstruct`, `verify` or shim query discovers it as the newest baseline with no configuration change.
+
+Why this matters beyond convenience: reconstructing from a **fresh** snapshot reads a short delta window instead of replaying months of events, so time-travel gets faster and the archive hours the replay depends on stop growing without bound.
+
+**What it inherits.** The emitted snapshot is subject to every full-table reconstruct limit — the table needs a primary key, a PK-changing `UPDATE` in the window refuses the run, and a `TRUNCATE`/`DROP`/`RENAME` between the source snapshot and `--at` refuses it too. A table with no baseline at all is refused rather than degraded: a snapshot folded from deltas alone would silently omit every row the window never touched. Refuse cases point at `bintrail dump` — a real re-dump is the only correct answer for all of them.
+
+**What it deliberately omits.** A dumped snapshot carries a content digest fingerprinting the rows against the live source, which `bintrail verify` compares. A reconstructed snapshot never read the source, so it carries **no** digest — that table is not verifiable against a source through this snapshot until the next real dump. It also carries no GTID set (the index stores GTIDs per event, not as an accumulated executed-set). Both absences are visible in the file's metadata, alongside a `bintrail.snapshot_producer = reconstruct` marker so a reconstructed snapshot stays distinguishable from a dumped one forever.
+
+**Where the deltas resume.** The snapshot records the exact binlog coordinate the next reconstruct starts from — chosen as the position of the first transaction committed after `--at`, not derived from `--at` itself. Binlog row events carry the time a statement *executed*, not the time it *committed*, so a cut made on the timestamp alone can drop a transaction from both the snapshot and the following delta window. Cutting on position on both sides of the seam cannot: what one side ends at is exactly what the other starts from.
+
 ### No database connection required
 
 `bintrail baseline` reads only files — it never connects to MySQL. This means you can:
