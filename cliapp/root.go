@@ -84,6 +84,7 @@ func Main(version, commitSHA, buildDate string) int {
 	Version, CommitSHA, BuildDate = version, commitSHA, buildDate
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", Version, CommitSHA, BuildDate)
 	telemetry.SetVersion(version)
+	cli.SetBuildVersion(version)
 
 	err := tel.Execute(rootCmd)
 	if err == nil {

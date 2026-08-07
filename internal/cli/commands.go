@@ -23,6 +23,7 @@ func AddReadCommands(root *cobra.Command) {
 	root.AddCommand(verifyCmd)
 	root.AddCommand(drillCmd)
 	root.AddCommand(shimCmd)
+	root.AddCommand(viewsCmd)
 }
 
 // AddMaintenanceCommands registers the index-side maintenance commands: rotate

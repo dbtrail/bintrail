@@ -82,6 +82,7 @@ func init() {
 	// Usage telemetry control surface, same set as the core binary.
 	cli.AddTelemetryCommand(rootCmd)
 	telemetry.SetVersion(Version)
+	cli.SetBuildVersion(Version)
 }
 
 func main() {

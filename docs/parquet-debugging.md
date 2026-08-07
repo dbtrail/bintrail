@@ -16,6 +16,43 @@ Verify with `duckdb --version`.
 
 ---
 
+## Let bintrail write the views for you (`bintrail views`)
+
+The rest of this page shows how to write the `read_parquet` globs by hand — worth reading once, because it is what the archive layout actually is. For day-to-day use, `bintrail views` generates them from your own layout:
+
+```sh
+bintrail views \
+  --index-dsn    "user:pass@tcp(index-db:3306)/bintrail_index" \
+  --baseline-dir /data/baselines \
+  --out          views.sql
+
+duckdb lake.db < views.sql
+```
+
+You get:
+
+| View | What it is |
+|---|---|
+| `events` | every archived binlog event across all archive sources, with `event_type` decoded to `INSERT`/`UPDATE`/`DELETE` (the raw code stays as `event_type_code`), `commit_ts_us` also exposed as a real timestamp in `commit_time`, and the Hive path columns `bintrail_id` / `event_date` / `event_hour` projected |
+| `state_<schema>_<table>` | one per table in the newest discoverable baseline snapshot — that table's full contents as of the snapshot |
+
+Archive sources come from the index's `archive_state` registry, so a new server or a new bucket shows up without being named. To generate the file without an index at all, name a source directly:
+
+```sh
+bintrail views --archive-s3 s3://bucket/archives/ --bintrail-id <uuid> \
+  --baseline-s3 s3://bucket/baselines/ --out -
+```
+
+Three properties worth knowing:
+
+- **bintrail never runs this SQL.** The command writes text; your DuckDB executes it, in your process, with no result caps and no server involved. There is no new query surface to secure.
+- **No credentials are in the file.** S3 access uses DuckDB's credential chain — the same thing bintrail's own reads use — so `views.sql` is safe to commit or paste into a notebook. The generated file shows the explicit-key alternative in a comment if your environment has no chain.
+- **It is a snapshot of the layout, not a live binding.** The event globs keep picking up newly rotated partitions on their own, but the `state_` views point at one baseline snapshot. Regenerate after taking or refreshing a baseline.
+
+`state_` views are the snapshot's rows, not the table's current state. To materialize a *later* point in time, use `bintrail reconstruct` — folding deltas back onto a baseline is what that command does, and it is not expressible as a view.
+
+---
+
 ## Parquet Column Schema
 
 Archive Parquet files contain 17 columns (the `pk_hash` stored generated column is omitted):
