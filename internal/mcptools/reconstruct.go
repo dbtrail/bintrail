@@ -473,7 +473,7 @@ func reconstructFetchError(err error) error {
 	}
 	var emptyErr *query.SourceEmptyError
 	if errors.As(err, &emptyErr) {
-		return fmt.Errorf("%w; run `bintrail archive reconcile` to re-sync archive_state with storage, "+
+		return fmt.Errorf("%w; run `bintrail archive reconcile --repair` to re-sync archive_state with storage (without --repair it only reports the drift), "+
 			"or re-run with allow_gaps: true to proceed without that source", err)
 	}
 	return fmt.Errorf("fetch binlog events: %w", err)
