@@ -175,6 +175,25 @@ async function api(path, opts = {}) {
   return data;
 }
 
+// apiText is api() for a text/plain endpoint. Same auth, same server header,
+// same central 401 handling — only the parsing differs, because views.sql is a
+// SQL file and api()'s JSON.parse would reject it as malformed.
+async function apiText(path) {
+  const headers = { Authorization: "Bearer " + TOKEN };
+  if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+  const res = await fetch(path, { headers });
+  const text = await res.text();
+  if (!res.ok) {
+    if (res.status === 401) handleUnauthorized();
+    // An error body here is the API's JSON {error}; fall back to the raw text
+    // so a proxy's HTML error page still says something useful.
+    let msg = text || "HTTP " + res.status;
+    try { const j = JSON.parse(text); if (j && j.error) msg = j.error; } catch (_) { /* raw text it is */ }
+    throw apiError(res.status, msg);
+  }
+  return text;
+}
+
 function apiError(status, message) {
   const err = new Error(message);
   err.status = status;
@@ -1967,6 +1986,7 @@ function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
   cards.append(rotationCard(rotation));
   cards.append(credentialsCard(storage));
   cards.append(telemetryCard(telemetry));
+  if (capsCache.views) cards.append(duckdbCard());
   cards.append(baselineSummaryCard(baselines, cur));
   v.append(cards);
 
@@ -2030,6 +2050,34 @@ function credentialsCard(storage) {
 // toggle. Turning it off here stops THIS running daemon's beacons immediately
 // (the daemon wired its live client) and persists the choice for every bintrail
 // process on the machine.
+// duckdbCard offers the generated DuckDB schema for this server's Parquet
+// layout. The console does not run the SQL and gains no query engine: the file
+// is executed by the operator's own DuckDB, on their machine, which is why
+// "unrestricted SQL over your lake" needs no sandbox, timeout or result cap here.
+function duckdbCard() {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Query in DuckDB" }));
+  card.append(el("p", { class: "form-hint", text:
+    "Download a ready-made schema over your archived Parquet: an events view across every archive source, " +
+    "plus one view per table in the newest baseline snapshot. Run it in your own DuckDB — nothing is executed here." }));
+  card.append(el("p", { class: "form-hint", text:
+    "No credentials are in the file: S3 access uses your AWS credential chain, so it is safe to share." }));
+  const btn = el("button", { class: "btn btn-sm", type: "button", text: "Open in DuckDB…" });
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const sql = await apiText("/api/views.sql");
+      downloadBlob("views.sql", sql, "text/plain");
+      toast("views.sql downloaded — run it with: duckdb lake.db < views.sql");
+    } catch (err) {
+      toast("could not generate views: " + ((err && err.message) || err));
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  card.append(el("div", { class: "stg-cardfoot" }, btn));
+  return card;
+}
+
 function telemetryCard(t) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Usage telemetry" }));
   if (!t || t.error) {

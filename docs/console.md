@@ -334,6 +334,18 @@ across the rotation dialog and the per-server edit form):
   start from. The empty states explain how to produce a first baseline
   (`bintrail dump` → `bintrail baseline`). When the **Create baseline** button
   is enabled (see below) it sits in this panel's header.
+- **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
+  DuckDB schema over the selected server's own Parquet — an `events` view
+  across every archive source registered in `archive_state`, plus one
+  `state_<schema>_<table>` view per table in the newest baseline snapshot. It
+  is the same file `bintrail views` writes. **The console does not run it.**
+  You get a text file; your own DuckDB executes it, in your process, on your
+  machine — which is why unrestricted SQL over your lake needs no sandbox, no
+  timeout and no result cap here. No credentials appear in the file (S3 uses
+  your AWS credential chain), so it is safe to share or commit. The card is
+  hidden for a server with archives disabled, for one with nothing archived and
+  no baseline yet, and while an access-control profile is active — the file
+  maps straight onto the unredacted Parquet a profile exists to withhold.
 - **Usage telemetry** — the current state of dbtrail's metadata-only usage
   telemetry and a one-click opt-out. Turning it off stops this `watch` daemon's
   beacons immediately (no restart) and records the machine-wide choice, exactly
@@ -860,7 +872,7 @@ start-to-finish walkthrough (bundle install included), see
 
 ## API
 
-All endpoints return JSON. `/api/*` (except `healthz`) require
+All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. `/api/*` (except `healthz`) require
 `Authorization: Bearer <token>`.
 
 | Method & path | Purpose |
@@ -891,6 +903,7 @@ All endpoints return JSON. `/api/*` (except `healthz`) require
 | `GET /api/rotation` | Effective global rotation policy: `{retain, interval, add_future, source, enabled}` — `source` is `"override"` (console-saved) or `"default"` (daemon `--rotate-*`). |
 | `PUT /api/rotation` | Supervisor only (403 on the standalone console): save a global rotation override `{retain, interval, add_future}` (validated; `off` rejected). Applies live on the next cycle. |
 | `GET /api/baselines` | Read-only listing of the **selected server's** baseline snapshots, grouped per snapshot: `{configured, source, kind, reconstruct, snapshots: [{time, age_hours, tables, binlog_file, binlog_pos, gtid_set}]}` (coordinates local-only, capped at 50 snapshots). `502` when the configured source is unreadable. |
+| `GET /api/views.sql` | **Not JSON** — a `text/plain` DuckDB schema over the selected server's Parquet (the same output as `bintrail views`), served as a `views.sql` attachment. Nothing is executed here; the file runs in your own DuckDB. 404 when archives are disabled or nothing is archived yet, 403 while an access-control profile is active. |
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`,

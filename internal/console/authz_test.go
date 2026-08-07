@@ -27,6 +27,7 @@ var registeredAPIPatterns = []struct{ method, pattern string }{
 	{"GET", "/api/capabilities"},
 	{"GET", "/api/reconstruct"},
 	{"GET", "/api/baselines"},
+	{"GET", "/api/views.sql"},
 	{"GET", "/api/storage"},
 	{"GET", "/api/telemetry"},
 	{"POST", "/api/telemetry"},
