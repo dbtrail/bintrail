@@ -139,6 +139,57 @@ try {
     ? ok("sidebar: version repainted once capabilities recover")
     : bad("sidebar: version repainted once capabilities recover", `got ${JSON.stringify(wiring.restored)}`);
 
+  // Scenario 0e — the coverage card's capture-liveness rendering (#1227),
+  // driven through the REAL covCard with stub payloads (the technique the
+  // ext-view scenarios use). The thing under test is not "a chip appeared" but
+  // that the SAME lag number renders differently depending on the verdict: a
+  // dead daemon and a quiet source used to paint identical amber, which is the
+  // ambiguity this whole epic exists to remove.
+  const cov = await page.evaluate(() => {
+    const read = (c) => {
+      const card = covCard(c);
+      const chips = Array.from(card.querySelectorAll(".cov-chip")).map((n) => ({ text: n.textContent, cls: n.className }));
+      const lines = Array.from(card.querySelectorAll(".cov-line")).map((n) => ({ text: n.textContent, cls: n.className }));
+      return { chips, lines };
+    };
+    const base = { delta_from: "2026-08-01 00:00:00", delta_to: "2026-08-07 00:00:00", continuity: "ok", lag_seconds: 3600 };
+    return {
+      stalled: read({ ...base, freshness: "stalled", checkpoint_age_seconds: 3600 }),
+      idle: read({ ...base, freshness: "idle" }),
+      current: read({ ...base, freshness: "current", lag_seconds: 5 }),
+      none: read({ delta_from: "2026-08-01 00:00:00", delta_to: "2026-08-07 00:00:00", continuity: "none", freshness: "none" }),
+    };
+  });
+  const chipFor = (r, prefix) => r.chips.find((c) => c.text.startsWith(prefix)) || { text: "", cls: "" };
+
+  // stalled: the lag chip must go RED, not amber — the window's upper edge is
+  // frozen and changes since are not recoverable.
+  chipFor(cov.stalled, "capture lag").cls.includes("bad")
+    ? ok("coverage: a stalled stream paints the lag chip as an error")
+    : bad("coverage: a stalled stream paints the lag chip as an error", `cls=${chipFor(cov.stalled, "capture lag").cls}`);
+  cov.stalled.lines.some((l) => l.cls.includes("bad") && /STALLED/.test(l.text))
+    ? ok("coverage: stalled renders an explicit error line")
+    : bad("coverage: stalled renders an explicit error line", JSON.stringify(cov.stalled.lines));
+
+  // idle: the SAME 3600s lag must NOT read as an error, and the card must say
+  // it cannot tell a quiet source from a lagging one.
+  chipFor(cov.idle, "capture lag").cls.includes("bad")
+    ? bad("coverage: an idle stream is not an error state", "the lag chip is red — idle is not a fault")
+    : ok("coverage: an idle stream is not an error state");
+  cov.idle.lines.some((l) => /identical/.test(l.text))
+    ? ok("coverage: idle admits it cannot tell quiet from lagging")
+    : bad("coverage: idle admits it cannot tell quiet from lagging", JSON.stringify(cov.idle.lines));
+
+  chipFor(cov.current, "capture lag").cls.includes("ok")
+    ? ok("coverage: a current stream paints the lag chip green")
+    : bad("coverage: a current stream paints the lag chip green", `cls=${chipFor(cov.current, "capture lag").cls}`);
+
+  // "none" is a NON-CLAIM (a file-mode index ran no capture). Green there would
+  // paint the absence of a claim as assurance — the same rule continuity follows.
+  chipFor(cov.none, "capture ").cls.includes("ok")
+    ? bad("coverage: a file-mode index never claims healthy capture", "the freshness chip is green for a no-claim")
+    : ok("coverage: a file-mode index never claims healthy capture");
+
   await page.evaluate(() => openServersModal());
   await page.waitForSelector("#servers-list", { timeout: 5000 });
   await page.waitForTimeout(400);

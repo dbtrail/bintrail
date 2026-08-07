@@ -113,6 +113,16 @@ func TestCoverageAPI(t *testing.T) {
 		if got.Continuity != "none" || got.LagSeconds != nil {
 			t.Fatalf("file-mode index: continuity=%q lag=%v", got.Continuity, got.LagSeconds)
 		}
+		// Freshness is WIRED (#1227): an unpopulated field would be "", not
+		// "none". A file-mode index makes no liveness claim, exactly as it makes
+		// no continuity claim — and with no checkpoint to age, the age must be
+		// OMITTED rather than serialized as a confident 0 ("just now").
+		if got.Freshness != "none" {
+			t.Fatalf("file-mode index: freshness=%q, want \"none\"", got.Freshness)
+		}
+		if got.CheckpointAgeSeconds != nil {
+			t.Fatalf("checkpoint_age_seconds = %v, want omitted with no checkpoint", *got.CheckpointAgeSeconds)
+		}
 		if got.FullTableStatus != "ok" {
 			t.Fatalf("full_table_status = %q", got.FullTableStatus)
 		}

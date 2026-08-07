@@ -672,9 +672,21 @@ function covCard(c) {
       " and ", el("b", { text: c.delta_to }), " is restorable."));
   }
   const chips = el("div", { class: "cov-chips" });
+  // Freshness (#1227) is what makes the lag number readable, so it decides the
+  // lag chip's colour instead of a bare threshold. The same "3600s" means a
+  // DEAD DAEMON under "stalled" and a source nobody wrote to under "idle", and
+  // those need opposite responses — the old unconditional amber said neither.
+  const fresh = c.freshness || "unknown";
   if (typeof c.lag_seconds === "number") {
-    chips.append(el("span", { class: "cov-chip" + (c.lag_seconds > 300 ? " warn" : " ok"), text: "capture lag " + c.lag_seconds + "s" }));
+    const lagTone = fresh === "stalled" ? " bad" : fresh === "current" ? " ok" : " warn";
+    chips.append(el("span", { class: "cov-chip" + lagTone, text: "capture lag " + c.lag_seconds + "s" }));
   }
+  // "none" (file-mode: no capture ran) and "unknown"/"unavailable" stay
+  // NEUTRAL/amber — never green, which would paint a non-claim as assurance.
+  const freshTone = fresh === "stalled" || fresh === "unavailable" ? " bad"
+    : fresh === "current" ? " ok"
+    : fresh === "none" ? "" : " warn";
+  chips.append(el("span", { class: "cov-chip" + freshTone, text: "capture " + fresh }));
   // "none" (file-mode: no capture ran) stays NEUTRAL — green would paint a
   // non-claim as assurance.
   chips.append(el("span", { class: "cov-chip" + (bad ? " bad" : warn ? " warn" : cont === "ok" ? " ok" : ""), text: "continuity " + cont }));
@@ -685,6 +697,19 @@ function covCard(c) {
     card.append(el("p", { class: "cov-line bad", text: "Continuity could not be read — treat the window as unverified." }));
   } else if (warn) {
     card.append(el("p", { class: "cov-line warn", text: "Continuity is not evaluable on this index — the window may have undetected holes." }));
+  }
+  // The freshness explanation lines. "stalled" is the only one that is an
+  // error state: the checkpoint ticker runs even with no traffic, so a stale
+  // checkpoint is the daemon, never the workload.
+  if (fresh === "stalled") {
+    const age = typeof c.checkpoint_age_seconds === "number" ? " for " + Math.round(c.checkpoint_age_seconds / 60) + "m" : "";
+    card.append(el("p", { class: "cov-line bad", text:
+      "Capture is STALLED — the daemon has not checkpointed" + age + ". The window's upper edge is frozen: changes since then are NOT recoverable. Check that the stream is running." }));
+  } else if (fresh === "idle") {
+    card.append(el("p", { class: "cov-line warn", text:
+      "Capture is checkpointing but has indexed nothing recent. From the index alone a quiet source and a capture falling behind look identical — the daemon's bintrail_stream_index_commit_latency_seconds metric tells them apart." }));
+  } else if (fresh === "unavailable") {
+    card.append(el("p", { class: "cov-line bad", text: "Capture liveness could not be read — treat the window's upper edge as unverified." }));
   }
   if (c.baseline_configured) {
     if (c.full_table_status === "unknown") {

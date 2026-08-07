@@ -34,6 +34,18 @@ type coverageResponse struct {
 	// Continuity: ok | gap_lost | unknown | unavailable | none — the exact
 	// status.ContinuityStatus rule, never recomputed here.
 	Continuity string `json:"continuity"`
+	// Freshness: current | idle | stalled | unknown | unavailable | none — the
+	// exact status.FreshnessStatus rule, never recomputed here either (#1227).
+	// It is the LIVENESS half continuity is not, and it is what makes
+	// lag_seconds readable: the same number means a dead daemon under
+	// "stalled" and a quiet source under "idle". Note the offline limit
+	// FreshnessStatus documents — "idle" cannot separate a quiet source from
+	// one whose capture is far behind, and the card must not imply either.
+	Freshness string `json:"freshness"`
+	// CheckpointAgeSeconds is how long ago the daemon last wrote stream_state;
+	// omitted (never 0) when there is no checkpoint to age. Under "stalled"
+	// this is the number that says how long it has been down.
+	CheckpointAgeSeconds *int64 `json:"checkpoint_age_seconds,omitempty"`
 	// BaselineConfigured mirrors /api/baselines' "configured" — a baseline
 	// SOURCE exists. It is NOT the reconstruct gate (/api/capabilities), the
 	// same configured-vs-reconstruct split baselines_api documents.
@@ -76,6 +88,7 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		// "unavailable" card, never a fabricated window.
 		slog.Warn("console: coverage not evaluated — the server's index connection is not open", "server", serverID(r))
 		resp.Continuity = "unavailable"
+		resp.Freshness = status.FreshnessUnavailable
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -86,6 +99,8 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.Continuity = sum.Continuity
+	resp.Freshness = sum.Freshness
+	resp.CheckpointAgeSeconds = sum.CheckpointAgeSeconds
 	resp.LagSeconds = sum.LagSeconds
 	if !sum.Floor.Hour.IsZero() {
 		resp.DeltaFrom = sum.Floor.Hour.Format(consoleTSFormat)

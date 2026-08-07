@@ -78,6 +78,16 @@ type CoverageSummary struct {
 	// measure, and an empty index has no edge to measure from.
 	LagSeconds *int64
 	Continuity string
+	// Freshness is the LIVENESS verdict (#1226/#1227), computed here from the
+	// same stream row Continuity uses so the console cannot reach a different
+	// answer than `bintrail status`. It is what disambiguates LagSeconds: a big
+	// lag under "stalled" is a dead daemon, the same number under "idle" is a
+	// source nobody wrote to, and those two need opposite operator responses.
+	Freshness string
+	// CheckpointAgeSeconds is how long ago the daemon last wrote stream_state.
+	// Nil when there is no checkpoint to age — never 0, which would render as a
+	// confident "just now" for a daemon that has never checkpointed.
+	CheckpointAgeSeconds *int64
 	// Note: capture-health drops (#1034 capture_skips) are deliberately NOT
 	// folded into this summary — they are a capture-plane verdict with their
 	// own surface (status Capture health, --fail-on-gap). The delta window
@@ -106,6 +116,11 @@ func CollectCoverageSummary(ctx context.Context, db *sql.DB, dbName string, now 
 		slog.Warn("could not load stream state for the coverage summary", "db", dbName, "error", streamErr)
 	}
 	sum.Continuity = ContinuityStatus(stream, streamErr)
+	sum.Freshness = FreshnessStatus(stream, streamErr, now, 0, 0)
+	if age, ok := CheckpointAge(stream, now); ok {
+		secs := int64(age / time.Second)
+		sum.CheckpointAgeSeconds = &secs
+	}
 	if stream != nil && !sum.DeltaTo.IsZero() {
 		lag := int64(now.Sub(sum.DeltaTo) / time.Second)
 		if lag < 0 {
