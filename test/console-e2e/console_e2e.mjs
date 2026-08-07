@@ -18,6 +18,16 @@ const URL = process.env.CONSOLE_URL || "http://127.0.0.1:8090";
 const TOKEN = process.env.CONSOLE_TOKEN || "";
 const CHANNEL = process.env.PW_CHANNEL || undefined; // undefined → bundled chromium
 const ART = process.env.E2E_ARTIFACT_DIR || "/tmp";
+// Read-fixture coordinates (seeded by run.sh into the boot index; see the
+// fixture block there). FIX is the seeded schema; TT_AT is a timestamp just
+// after the last seeded event, inside the hour whose partition exists — using
+// the default `at` (now) would race the top-of-hour partition boundary.
+const FIX = process.env.E2E_FIX_SCHEMA || "e2eshop";
+const TT_AT = process.env.E2E_TT_AT || "";
+// The query_text canary run.sh embeds in the seeded UPDATE event. query_text /
+// query_hash are captured index data but NEVER cross the DTO layer (#699);
+// this string appearing anywhere in the page or an export is a leak.
+const CANARY = "e2e-canary-query-text";
 
 const results = [];
 const ok = (name) => results.push({ name, pass: true });
@@ -575,6 +585,279 @@ try {
   csv.plain === "hello" && csv.number === "42" ? ok("csv: benign values pass through untouched") : bad("csv: benign values pass through untouched", JSON.stringify([csv.plain, csv.number]));
   csv.quoted === '"a,""b"' ? ok("csv: existing quoting logic unchanged") : bad("csv: existing quoting logic unchanged", JSON.stringify(csv.quoted));
   csv.objFormula === '"{""id"":1}"' ? ok("csv: JSON object cells are not prefixed") : bad("csv: JSON object cells are not prefixed", JSON.stringify(csv.objFormula));
+
+  // ── Scenarios 12-15: the primary READ workflows over REAL indexed data ─────
+  // (#970/#686/#619). Everything below runs against the "byo-idx" server from
+  // scenario 5 — its index is the boot db run.sh provisioned with `bintrail
+  // init`, seeded events, and a real `bintrail baseline` snapshot (which the
+  // daemon-level --baseline-dir exposes to every server, making this one
+  // Time-travel-capable).
+  await page.evaluate(async (id) => { await switchServer(id); }, byoId);
+
+  // Scenario 12 — Events renders real rows, and the redaction contract holds
+  // end-to-end (#970): query_text/query_hash are captured index data that must
+  // NEVER reach the browser (#699 — the canary is IN the seeded UPDATE row),
+  // while connection_id must PASS THROUGH (#701 D1 un-gated it; asserting
+  // absence here would pin the stale pre-#701 contract).
+  await page.evaluate(() => navigate("events"));
+  await page.waitForSelector("#ev-rows .ev-row", { timeout: 10000 });
+  const evr = await page.evaluate(({ FIX, CANARY }) => {
+    const rows = Array.from(document.querySelectorAll("#ev-rows .ev-row"));
+    const updRow = rows.find((r) => r.textContent.includes(FIX + ".orders") && r.textContent.includes("UPDATE"));
+    let diffText = "";
+    if (updRow) {
+      updRow.click(); // expands and lazy-renders the before/after diff
+      diffText = updRow.nextElementSibling ? updRow.nextElementSibling.textContent : "";
+    }
+    const upd = lastEvents.find((e) => e.event_type === "UPDATE" && e.schema_name === FIX && e.table_name === "orders") || {};
+    return {
+      rowCount: rows.length,
+      updFound: !!updRow,
+      diffText,
+      domCanary: document.body.textContent.includes(CANARY),
+      leakedKeys: lastEvents.filter((e) => ("query_text" in e) || ("query_hash" in e)).length,
+      connId: upd.connection_id,
+    };
+  }, { FIX, CANARY });
+  evr.rowCount === 6 ? ok("events: all 6 seeded events render") : bad("events: all 6 seeded events render", `rowCount=${evr.rowCount}`);
+  evr.updFound ? ok("events: the seeded orders UPDATE row renders") : bad("events: the seeded orders UPDATE row renders", "row not found");
+  (/shipped/.test(evr.diffText) && /new/.test(evr.diffText))
+    ? ok("events: expanding a row shows the before/after diff")
+    : bad("events: expanding a row shows the before/after diff", `diffText=${evr.diffText.slice(0, 120)}`);
+  !evr.domCanary ? ok("events: query_text never reaches the DOM") : bad("events: query_text never reaches the DOM", "canary found in page text");
+  evr.leakedKeys === 0 ? ok("events: no query_text/query_hash keys in the wire events") : bad("events: no query_text/query_hash keys in the wire events", `${evr.leakedKeys} event(s) carry them`);
+  evr.connId === 777 ? ok("events: connection_id passes through (#701 D1)") : bad("events: connection_id passes through (#701 D1)", `connection_id=${JSON.stringify(evr.connId)}`);
+
+  // Scenario 12b — the export path (#970): drive the REAL JSON/CSV buttons and
+  // capture the blobs downloadBlob mints. Export is over the on-screen
+  // redacted DTOs — so it must stay query_text-free WITH connection_id, and
+  // the CSV header must stay in lockstep with EVENT_CSV_COLUMNS.
+  const exp = await page.evaluate(async (CANARY) => {
+    const btns = Array.from(document.querySelectorAll(".result-bar button"));
+    const jsonBtn = btns.find((b) => b.textContent.trim() === "JSON");
+    const csvBtn = btns.find((b) => b.textContent.trim() === "CSV");
+    const blobs = [];
+    const orig = URL.createObjectURL;
+    URL.createObjectURL = (b) => { blobs.push(b); return orig.call(URL, b); };
+    jsonBtn.click();
+    csvBtn.click();
+    URL.createObjectURL = orig;
+    const [jsonText, csvText] = await Promise.all(blobs.map((b) => b.text()));
+    const arr = JSON.parse(jsonText);
+    const header = csvText.split("\r\n")[0];
+    return {
+      n: arr.length,
+      jsonLeak: arr.filter((e) => ("query_text" in e) || ("query_hash" in e)).length,
+      jsonConn: arr.every((e) => "connection_id" in e),
+      jsonCanary: jsonText.includes(CANARY),
+      headerLockstep: header === EVENT_CSV_COLUMNS.join(","),
+      headerConn: header.split(",").includes("connection_id"),
+      headerLeak: /query_text|query_hash/.test(header),
+      csvCanary: csvText.includes(CANARY),
+      csvConnVal: csvText.split("\r\n").some((l) => l.split(",").includes("777")),
+    };
+  }, CANARY);
+  exp.n === 6 ? ok("export: JSON blob carries the full rendered page") : bad("export: JSON blob carries the full rendered page", `n=${exp.n}`);
+  (exp.jsonLeak === 0 && !exp.jsonCanary) ? ok("export: JSON blob is query_text/query_hash-free") : bad("export: JSON blob is query_text/query_hash-free", `leak=${exp.jsonLeak} canary=${exp.jsonCanary}`);
+  exp.jsonConn ? ok("export: JSON blob keeps connection_id") : bad("export: JSON blob keeps connection_id", "some entry lacks the key");
+  exp.headerLockstep ? ok("export: CSV header in lockstep with EVENT_CSV_COLUMNS") : bad("export: CSV header in lockstep with EVENT_CSV_COLUMNS", "header drifted");
+  (exp.headerConn && !exp.headerLeak) ? ok("export: CSV columns include connection_id, never query_text") : bad("export: CSV columns include connection_id, never query_text", `conn=${exp.headerConn} leak=${exp.headerLeak}`);
+  (!exp.csvCanary && exp.csvConnVal) ? ok("export: CSV rows redacted but carry the connection_id value") : bad("export: CSV rows redacted but carry the connection_id value", `canary=${exp.csvCanary} conn777=${exp.csvConnVal}`);
+
+  // Scenario 13 — Recover actually SUBMITS and renders the reversal SQL
+  // (#970). Scenario 6 above only checks the form's DOM exists.
+  await page.evaluate(() => navigate("recover"));
+  await page.waitForSelector("#recover-form", { timeout: 8000 });
+  await page.waitForFunction((FIX) => {
+    const f = document.getElementById("recover-form");
+    return f && Array.from(f.elements.schema.options).some((o) => o.value === FIX);
+  }, FIX, { timeout: 8000 });
+  await page.evaluate((FIX) => {
+    const f = document.getElementById("recover-form");
+    f.elements.schema.value = FIX;
+    f.elements.table.value = "orders";
+    f.elements.pk.value = "1";
+    f.requestSubmit();
+  }, FIX);
+  await page.waitForSelector("#recover-out #sql-panel", { timeout: 8000 });
+  const rec = await page.evaluate(() => ({
+    sql: (document.querySelector("#recover-out #sql-panel .code") || {}).textContent || "",
+    meta: (document.querySelector("#recover-out #sql-panel .lbl") || {}).textContent || "",
+    cascadeBanner: !!document.querySelector("#recover-out .ctx-banner"),
+  }));
+  (/UPDATE/.test(rec.sql) && rec.sql.includes("'new'"))
+    ? ok("recover: submit renders the reversal SQL")
+    : bad("recover: submit renders the reversal SQL", `sql=${rec.sql.slice(0, 160)}`);
+  /1 statement\(s\) from 1 event\(s\)/.test(rec.meta)
+    ? ok("recover: meta line reports statement/event counts")
+    : bad("recover: meta line reports statement/event counts", rec.meta);
+  !rec.cascadeBanner ? ok("recover: a plain undo shows no CASCADE banner") : bad("recover: a plain undo shows no CASCADE banner", "banner rendered for a non-parent target");
+
+  // Scenario 13b — the cascade-detected banner (#619): the seeded parent DELETE
+  // has two child INSERTs behind an ON DELETE CASCADE fk_constraints row, so
+  // /api/recover auto-detects and the positive-half rendering (banner + counts
+  // meta) must run. During #617 a missing ')' in this exact block broke the
+  // whole SPA and only a manual boot probe caught it — this is that guard.
+  await page.evaluate(() => {
+    const f = document.getElementById("recover-form");
+    f.elements.table.value = "parent";
+    f.elements.pk.value = "";
+    f.requestSubmit();
+  });
+  await page.waitForFunction(() => {
+    const b = document.querySelector("#recover-out .ctx-banner .badge");
+    return b && b.textContent === "CASCADE";
+  }, { timeout: 8000 });
+  const cas = await page.evaluate(() => ({
+    banner: (document.querySelector("#recover-out .ctx-banner") || {}).textContent || "",
+    sql: (document.querySelector("#recover-out #sql-panel .code") || {}).textContent || "",
+    meta: (document.querySelector("#recover-out #sql-panel .lbl") || {}).textContent || "",
+  }));
+  cas.banner.includes("restores 2 related row(s)")
+    ? ok("cascade: banner counts the repaired child rows")
+    : bad("cascade: banner counts the repaired child rows", cas.banner);
+  (cas.meta.includes("2 cascade child row(s)") && cas.meta.includes("0 SET NULL restore(s)"))
+    ? ok("cascade: meta line carries the cascade-aware counts")
+    : bad("cascade: meta line carries the cascade-aware counts", cas.meta);
+  (/INSERT INTO/.test(cas.sql) && cas.sql.includes("child") && cas.sql.includes("10") && cas.sql.includes("11"))
+    ? ok("cascade: script re-inserts both cascade-deleted children")
+    : bad("cascade: script re-inserts both cascade-deleted children", cas.sql.slice(0, 200));
+
+  // Scenario 14 — Time-travel over the fixture baseline (#970). First pin the
+  // gate itself: this server must report reconstruct (a baseline is
+  // configured), and a server WITHOUT it must be rerouted off /timetravel.
+  const ttGate = await page.evaluate(() => {
+    const had = !!capsCache.reconstruct;
+    capsCache.reconstruct = false;
+    navigate("timetravel");
+    const rerouted = location.pathname === "/overview";
+    capsCache.reconstruct = had;
+    return { had, rerouted };
+  });
+  ttGate.had ? ok("timetravel: a baseline-configured server reports the reconstruct capability") : bad("timetravel: a baseline-configured server reports the reconstruct capability", "capsCache.reconstruct falsy on byo-idx");
+  ttGate.rerouted ? ok("timetravel: gated-off navigation reroutes to overview") : bad("timetravel: gated-off navigation reroutes to overview", "landed on /timetravel without the capability");
+
+  await page.evaluate(() => navigate("timetravel"));
+  await page.waitForSelector("#tt-form", { timeout: 8000 });
+  await page.waitForFunction((FIX) => {
+    const f = document.getElementById("tt-form");
+    return f && Array.from(f.elements.schema.options).some((o) => o.value === FIX);
+  }, FIX, { timeout: 8000 });
+  // pk=1: baseline row (status new) + a later UPDATE (status shipped) — the
+  // event fold half. email only ever existed in the baseline's full row image.
+  await page.evaluate(async ({ FIX, TT_AT }) => {
+    const f = document.getElementById("tt-form");
+    f.elements.schema.value = FIX;
+    await loadTables(f);
+    f.elements.table.value = "orders";
+    f.elements.pk.value = "1";
+    if (TT_AT) f.elements.at.value = TT_AT;
+    f.requestSubmit();
+  }, { FIX, TT_AT });
+  await page.waitForSelector("#tt-out .statetable", { timeout: 10000 });
+  const tt1 = await page.evaluate(() => {
+    const cells = {};
+    document.querySelectorAll("#tt-out .statetable tr").forEach((tr) => {
+      cells[tr.querySelector("th").textContent] = tr.querySelector("td").textContent;
+    });
+    return { cells, meta: (document.querySelector("#tt-out .meta-line") || {}).textContent || "" };
+  });
+  (tt1.cells.status === "shipped" && tt1.cells.email === "a@example.com")
+    ? ok("timetravel: reconstructed row folds the event over the baseline")
+    : bad("timetravel: reconstructed row folds the event over the baseline", JSON.stringify(tt1.cells));
+  /baseline /.test(tt1.meta) ? ok("timetravel: meta line names the baseline anchor") : bad("timetravel: meta line names the baseline anchor", tt1.meta);
+
+  // pk=4: exists ONLY in the baseline (no events) — a binlog-only reconstruct
+  // cannot resolve it, so this pins the baseline half of baseline+deltas.
+  await page.evaluate(() => { const f = document.getElementById("tt-form"); f.elements.pk.value = "4"; f.requestSubmit(); });
+  await page.waitForFunction(() => /d@example\.com/.test((document.getElementById("tt-out") || {}).textContent || ""), { timeout: 10000 });
+  const tt4 = await page.evaluate(() => {
+    const cells = {};
+    document.querySelectorAll("#tt-out .statetable tr").forEach((tr) => {
+      cells[tr.querySelector("th").textContent] = tr.querySelector("td").textContent;
+    });
+    return cells;
+  });
+  (tt4.status === "new" && tt4.email === "d@example.com")
+    ? ok("timetravel: a never-touched row resolves from the baseline alone")
+    : bad("timetravel: a never-touched row resolves from the baseline alone", JSON.stringify(tt4));
+
+  // pk=2: in the baseline, then DELETEd — must render the deleted note, not an
+  // empty table and not the stale baseline value.
+  await page.evaluate(() => { const f = document.getElementById("tt-form"); f.elements.pk.value = "2"; f.requestSubmit(); });
+  await page.waitForFunction(() => !!document.querySelector("#tt-out .deleted-note"), { timeout: 10000 });
+  const tt2 = await page.evaluate(() => (document.querySelector("#tt-out .deleted-note") || {}).textContent || "");
+  /Row was deleted/.test(tt2)
+    ? ok("timetravel: a deleted row renders the deleted note")
+    : bad("timetravel: a deleted row renders the deleted note", tt2);
+
+  // Scenario 15 — Overview window honesty (#686): fixture-drive the REAL
+  // buildOverview with a status.coverage spanning far more history than the
+  // fetched events window, and assert the window line uses the window's OWN
+  // bounds (#679/#684) — a reintroduced status.coverage fallback fails here
+  // and nowhere else (the Go suite never renders app.js).
+  const ov = await page.evaluate(() => {
+    const mkev = (ts, type, pk) => ({ event_timestamp: ts, schema_name: "ovfix", table_name: "t", event_type: type, pk_values: pk, changed_columns: [] });
+    const events = [mkev("2026-03-01 10:30:00", "DELETE", "9"), mkev("2026-03-01 10:00:00", "INSERT", "8")];
+    const status = { coverage: { oldest: "2020-01-01 00:00:00", newest: "2026-06-30 00:00:00", total_events: 123456 } };
+    buildOverview(status, { events }, null);
+    return {
+      win: (document.querySelector(".ov-coverage") || {}).textContent || "",
+      sub: (document.querySelector(".page-sub") || {}).textContent || "",
+    };
+  });
+  (ov.win.includes("2026-03-01 10:00:00") && ov.win.includes("2026-03-01 10:30:00") && !ov.win.includes("2020-01-01"))
+    ? ok("overview: window line uses the fetched window's own bounds")
+    : bad("overview: window line uses the fetched window's own bounds", ov.win);
+  (ov.sub.includes("1 delete(s)") && ov.sub.includes("2 event(s)"))
+    ? ok("overview: subhead counts come from the fetched window")
+    : bad("overview: subhead counts come from the fetched window", ov.sub);
+
+  // Scenario 15b — Storage page live (#686): with the daemon opted in
+  // (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1) and this server baseline-configured,
+  // the Create-baseline button must render enabled, and the fixture snapshot
+  // (1 table, anchored at binlog.000001:50) must be listed.
+  await page.evaluate(() => navigate("storage"));
+  await page.waitForFunction(() => Array.from(document.querySelectorAll(".stg-row")).some((r) => r.textContent.includes("binlog.000001:50")), { timeout: 10000 });
+  const stg = await page.evaluate(() => {
+    const heads = Array.from(document.querySelectorAll(".ov-panel-head"));
+    const bHead = heads.find((h) => /Baseline snapshots/.test(h.textContent));
+    const btn = bHead ? Array.from(bHead.querySelectorAll("button")).find((b) => b.textContent === "Create baseline") : null;
+    const row = Array.from(document.querySelectorAll(".stg-row")).find((r) => r.textContent.includes("binlog.000001:50"));
+    return { capOn: !!capsCache.baseline_trigger, btnPresent: !!btn, btnEnabled: btn ? !btn.disabled : false, rowText: row ? row.textContent : "" };
+  });
+  stg.capOn ? ok("storage: baseline_trigger capability reaches the frontend") : bad("storage: baseline_trigger capability reaches the frontend", "capsCache.baseline_trigger falsy");
+  (stg.btnPresent && stg.btnEnabled) ? ok("storage: Create-baseline button renders enabled when both gates pass") : bad("storage: Create-baseline button renders enabled when both gates pass", `present=${stg.btnPresent} enabled=${stg.btnEnabled}`);
+  stg.rowText.includes("1 table(s)") ? ok("storage: the fixture snapshot is listed with its table count") : bad("storage: the fixture snapshot is listed with its table count", stg.rowText);
+
+  // Scenario 15c — the button's other gate arms, fixture-driven through the
+  // REAL baselinesPanel (destination-missing can't exist live once the daemon
+  // sets a default --baseline-dir): no destination → no button + the setup
+  // empty state; capability off → no button even with a destination.
+  const gates = await page.evaluate(() => {
+    const servers = [{ id: "srv-fix", name: "fixture" }];
+    const keepCur = currentServer;
+    currentServer = "srv-fix";
+    const cfgOff = baselinesPanel({ configured: false }, servers);
+    const keepCap = capsCache.baseline_trigger;
+    capsCache.baseline_trigger = false;
+    const capOff = baselinesPanel({ configured: true, source: "/tmp/baselines", snapshots: [] }, servers);
+    capsCache.baseline_trigger = keepCap;
+    currentServer = keepCur;
+    const hasBtn = (n) => Array.from(n.querySelectorAll("button")).some((b) => b.textContent === "Create baseline");
+    return {
+      cfgOffBtn: hasBtn(cfgOff),
+      cfgOffEmpty: /No baselines configured/.test(cfgOff.textContent),
+      capOffBtn: hasBtn(capOff),
+      capOffEmpty: /no snapshots found/.test(capOff.textContent),
+    };
+  });
+  (!gates.cfgOffBtn && gates.cfgOffEmpty)
+    ? ok("storage: no baseline destination → no button, setup empty state")
+    : bad("storage: no baseline destination → no button, setup empty state", JSON.stringify(gates));
+  (!gates.capOffBtn && gates.capOffEmpty)
+    ? ok("storage: baseline_trigger off → no button even with a destination")
+    : bad("storage: baseline_trigger off → no button even with a destination", JSON.stringify(gates));
 
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));

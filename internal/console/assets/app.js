@@ -63,6 +63,7 @@ let TOKEN = "";
 let currentServer = "";       // X-Bintrail-Server target ("" = backend default)
 let defaultServerId = "";
 let serverGen = 0;            // bumped on every server switch (staleness guard)
+let viewGen = 0;              // bumped on every route render (staleness guard)
 let capsCache = {};           // last /api/capabilities for the selected server
 let extViews = [];            // extension views advertised for the selected server (embedding builds)
 let lastSQL = "";             // last generated undo SQL (for copy/download)
@@ -641,6 +642,12 @@ function renderRoute() {
   // the page must release the daemon's single-query latch.
   closeDatePicker();
   abortSQLRun();
+  // Route-level staleness: the full-view async renderers (overview / status /
+  // storage) fetch before painting, so navigating away while their fetches are
+  // in flight would let the OLD view's completion clear and repaint over the
+  // new one (nav highlighting one route, content showing another). serverGen
+  // only covers server switches; this covers same-server navigation.
+  viewGen++;
   const route = routeFromLocation();
   setActiveNav(route);
   cursorIdx = -1;
@@ -753,7 +760,7 @@ function covCard(c) {
 }
 
 async function renderOverview() {
-  const gen = serverGen;
+  const gen = serverGen, vgen = viewGen;
   viewLoading();
   try {
     const [status, eventsData, coverage] = await Promise.all([
@@ -764,10 +771,10 @@ async function renderOverview() {
       // indistinguishable from a console without the feature.
       api("/api/coverage").catch((err) => { console.error("coverage fetch failed", err); return { continuity: "unavailable" }; }),
     ]);
-    if (gen !== serverGen) return;
+    if (gen !== serverGen || vgen !== viewGen) return;
     buildOverview(status, eventsData, coverage); // render INSIDE the try: a throw here shows an error, never a stuck "Loading…"
   } catch (err) {
-    if (gen !== serverGen) return;
+    if (gen !== serverGen || vgen !== viewGen) return;
     const v = VIEW(); clear(v); v.append(pageHead("Overview", null)); renderError(v, err);
   }
 }
@@ -1735,12 +1742,12 @@ function renderTimeline(container, data) {
 // ── Status ─────────────────────────────────────────────────────────────────
 
 async function renderStatus() {
-  const gen = serverGen;
+  const gen = serverGen, vgen = viewGen;
   viewLoading();
   let data;
   try { data = await api("/api/status"); }
-  catch (err) { if (gen !== serverGen) return; const v = VIEW(); clear(v); v.append(pageHead("Status", null)); renderError(v, err); return; }
-  if (gen !== serverGen) return;
+  catch (err) { if (gen !== serverGen || vgen !== viewGen) return; const v = VIEW(); clear(v); v.append(pageHead("Status", null)); renderError(v, err); return; }
+  if (gen !== serverGen || vgen !== viewGen) return;
   updateSideMeta(data);
 
   const v = VIEW(); clear(v);
@@ -1980,7 +1987,7 @@ async function renderStorage() {
   // Gated like Time-travel: a direct URL / Back with the capability off must
   // REWRITE the URL (replaceState) before re-dispatching — see renderTimetravel.
   if (!capsCache.monitor) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
-  const gen = serverGen;
+  const gen = serverGen, vgen = viewGen;
   viewLoading();
   // Each fetch degrades independently: a panel renders its own failure note
   // instead of one error wiping the whole page. (A 401 inside api() raises the
@@ -1993,7 +2000,7 @@ async function renderStorage() {
     api("/api/baselines").catch(asErr),
     api("/api/telemetry").catch(asErr),
   ]);
-  if (gen !== serverGen) return;
+  if (gen !== serverGen || vgen !== viewGen) return;
   // Same guard as renderOverview: a throw inside the build must show an
   // error, never leave the "Loading…" skeleton up forever.
   try {

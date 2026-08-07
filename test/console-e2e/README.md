@@ -23,10 +23,15 @@ make console-e2e
 PW_CHANNEL=chrome make console-e2e
 ```
 
-`run.sh` builds `bintrail-console`, creates a throwaway index database, launches
-a source-less `watch` daemon, seeds a monitored source whose per-source index
-is intentionally **not** provisioned (the lifecycle state that exercises the
-guards), drives the scenarios, and tears everything down.
+`run.sh` builds `bintrail-console` and `bintrail`, creates a throwaway index
+database, provisions it with the production schema (`bintrail init`) plus a
+seeded read fixture — row events, a cascade fixture, and a baseline snapshot
+produced by the real `bintrail baseline` converter over a hand-written
+mydumper-format dump — launches a source-less `watch` daemon (with
+`--baseline-dir` and the baseline-trigger opt-in), seeds a monitored source
+whose per-source index is intentionally **not** provisioned (the lifecycle
+state that exercises the guards), drives the scenarios, and tears everything
+down.
 
 ## What each scenario guards
 
@@ -39,6 +44,13 @@ guards), drives the scenarios, and tears everything down.
 | form: advanced expanded for a BYO-index entry | the other `byoIndex` arm — a no-source entry must show its index fields |
 | form: source fields visible | the monitor form rendering for a source entry |
 | error: real 1049 reaches the frontend + empty state (×4) | the actual backend 1049 (from the unprovisioned default server) must surface as an actionable empty state, not a raw wall — and `scrubDSNError` must preserve the index db name |
+| events: render + redaction (×6) | the primary read workflow over REAL indexed rows (#970): rows render, the diff expands, and the seeded `query_text`/`query_hash` canary never reaches the DOM while `connection_id` passes through (#701 D1) |
+| export: JSON/CSV blobs (×6) | the real download buttons, blobs captured at `URL.createObjectURL`: query_text-free, connection_id kept, CSV header in lockstep with `EVENT_CSV_COLUMNS` |
+| recover: submit renders SQL (×3) | Recover actually submits and paints the reversal SQL panel — scenario 6 only checks the form DOM exists |
+| cascade: banner + counts (×3) | the `cascade_detected` positive-half rendering (#619) — the banner block whose missing `)` once broke the whole SPA |
+| timetravel (×6) | the reconstruct gate + baseline+deltas over a real fixture baseline (#970): event fold, baseline-only row, deleted row |
+| overview: window honesty (×2) | `buildOverview` window line uses the fetched window's own bounds, never `status.coverage` (#679/#686) |
+| storage: Create-baseline gates (×5) | the button's double-gate (#686): live enabled arm, destination-missing arm, capability-off arm; the fixture snapshot listed |
 | no uncaught JS errors | any thrown error over the whole drive |
 
 Adding a scenario: append an `ok(...)`/`bad(...)` block in `console_e2e.mjs`.
