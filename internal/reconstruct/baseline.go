@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -230,6 +231,40 @@ type BaselineFile struct {
 	Schema       string
 	Table        string
 	Path         string
+}
+
+// NewestSnapshotTables returns the schema.table entries of the NEWEST
+// discoverable snapshot under source, sorted; nil when nothing is discoverable.
+//
+// It is the table list a REFRESH operates on. Deliberately the newest snapshot
+// rather than every table the index has ever seen: a refreshed snapshot is a
+// strict successor of the one it was folded from, and a table absent from the
+// source has nothing to fold onto — inventing an entry for it would publish a
+// snapshot claiming coverage it does not have.
+func NewestSnapshotTables(ctx context.Context, source string) ([]string, error) {
+	files, err := ListBaselines(ctx, source)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return nil, nil
+	}
+	newest := files[0].SnapshotTime // ListBaselines returns newest first
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range files {
+		if !f.SnapshotTime.Equal(newest) {
+			continue
+		}
+		entry := f.Schema + "." + f.Table
+		if seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		out = append(out, entry)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // ListBaselines enumerates every baseline snapshot file under source (a local

@@ -11,12 +11,17 @@ type stubBaselineCtrl struct {
 	triggered []BaselineRequest
 	err       error
 	status    BaselineStatus
+	refresh   BaselineStatus
 }
 
 func (c *stubBaselineCtrl) Trigger(req BaselineRequest) error {
 	c.triggered = append(c.triggered, req)
 	return c.err
 }
+
+// RefreshStatus makes the stub usable as a BaselineRefreshReporter too. It
+// reports what the state means when set: refreshed once, successfully.
+func (c *stubBaselineCtrl) RefreshStatus(string) BaselineStatus { return c.refresh }
 
 func (c *stubBaselineCtrl) Status(string) BaselineStatus { return c.status }
 
@@ -274,5 +279,55 @@ func TestSplitSchemas(t *testing.T) {
 				t.Errorf("splitSchemas(%q)[%d] = %q, want %q", in, i, got[i], want[i])
 			}
 		}
+	}
+}
+
+// TestBaselineRefreshDoesNotUnGateTheDumpTrigger pins the split between the two
+// baseline features (#1171). They are independently opt-in — a refresh needs no
+// mydumper and no BINTRAIL_CONSOLE_BASELINE_TRIGGER=1 — so wiring the refresh
+// reporter must not hand the operator a Create-baseline button they never asked
+// for and whose dependency may not be installed.
+//
+// The inverse (a refresh-only daemon refusing to start) was the original defect:
+// the refresh used to READ its status off BaselineController, which forced the
+// two features to share one opt-in.
+func TestBaselineRefreshDoesNotUnGateTheDumpTrigger(t *testing.T) {
+	reg, err := LoadRegistry(t.TempDir() + "/console-servers.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		Listen: "127.0.0.1:8090", Token: "t", Registry: reg,
+		MonitorCtrl: &stubMonitorCtrl{},
+		// Refresh reporter ONLY — no BaselineCtrl.
+		BaselineRefresh: &stubBaselineCtrl{refresh: BaselineStatus{State: "succeeded", Tables: 3}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.baselineCtrl != nil {
+		t.Fatal("wiring BaselineRefresh must not populate baselineCtrl: that is what gates the dump trigger")
+	}
+	if srv.baselineRefresh == nil {
+		t.Fatal("BaselineRefresh was not wired through to the server")
+	}
+
+	id := addBaselineEntry(t, srv, "u:p@tcp(127.0.0.1:3306)/", "s3://b/baselines/", "", "")
+	rec, _ := doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline", "")
+	if rec.Code != 403 {
+		t.Fatalf("baseline trigger with refresh-only wiring = %d, want 403 (the mydumper dump was never enabled)", rec.Code)
+	}
+
+	srv.cm.boot = &bundle{}
+	rec, body := doServersReq(t, srv, "GET", "/api/capabilities", "")
+	if rec.Code != 200 {
+		t.Fatalf("capabilities: code=%d body=%s", rec.Code, body)
+	}
+	var caps capabilitiesResponse
+	if err := json.Unmarshal(body, &caps); err != nil {
+		t.Fatal(err)
+	}
+	if caps.BaselineTrigger {
+		t.Error("baseline_trigger capability advertised on a refresh-only daemon")
 	}
 }

@@ -2209,6 +2209,30 @@ function archivingPanel(servers, serversErr) {
   return panel;
 }
 
+// baselineRefreshNote renders the last automatic refresh for the selected
+// server.
+function baselineRefreshNote(rf) {
+  const when = rf.finished_at || rf.since || "";
+  let text;
+  switch (rf.state) {
+    case "running":
+      text = "Automatic refresh running" + (rf.since ? " since " + rf.since : "") + "…";
+      break;
+    case "succeeded":
+      text = "Automatic refresh: " + (rf.tables || 0) + " table(s) refreshed" + (when ? " at " + when : "") + ".";
+      break;
+    case "failed":
+      text = "Automatic refresh published nothing" + (when ? " at " + when : "") +
+        (rf.refused ? " — " + rf.refused + " table(s) refused" : "") +
+        (rf.last_error ? ": " + rf.last_error : "") +
+        " Nothing was overwritten; the next run retries.";
+      break;
+    default:
+      return el("p", { class: "form-hint", text: "Automatic refresh is enabled; it has not run yet." });
+  }
+  return el("p", { class: "form-hint", text: text });
+}
+
 function baselinesPanel(b, servers) {
   const panel = el("section", { class: "ov-panel" });
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
@@ -2225,6 +2249,16 @@ function baselinesPanel(b, servers) {
     head.append(btn);
   }
   panel.append(head);
+  // The daemon's periodic refresh (#1171). Shown next to the list because the
+  // question it answers — "is this list going to keep moving on its own?" — is
+  // only meaningful here. A failed refresh is reported plainly: it usually means
+  // the fold refused (a capture gap, a schema change), which is the fail-closed
+  // contract working, not a broken daemon.
+  //
+  // Gated on the PAYLOAD, never on capsCache.baseline_trigger: the refresh and
+  // the mydumper dump are independently opt-in, so a refresh-only daemon reports
+  // here with baseline_trigger false, and a capability gate would render nothing.
+  if (b && !b.error && b.refresh) panel.append(baselineRefreshNote(b.refresh));
   const list = el("div", { class: "stg-list" });
   if (!b || b.error) {
     list.append(el("div", { class: "ev-empty", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));

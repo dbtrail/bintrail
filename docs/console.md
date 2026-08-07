@@ -334,6 +334,13 @@ across the rotation dialog and the per-server edit form):
   start from. The empty states explain how to produce a first baseline
   (`bintrail dump` → `bintrail baseline`). When the **Create baseline** button
   is enabled (see below) it sits in this panel's header.
+- **Automatic baseline refresh** — when `--baseline-refresh-interval` is set,
+  the Baseline snapshots panel reports the daemon's last automatic refresh for
+  the selected server: how many tables it published, or that it published
+  nothing and why. A refusal there is the fail-closed contract working (a
+  capture gap, a schema change), not a broken daemon — nothing was overwritten
+  and the next run retries. The refresh is opt-in on its own — it does not
+  require, and does not enable, the **Create baseline** button.
 - **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one

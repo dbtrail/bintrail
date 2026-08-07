@@ -89,6 +89,13 @@ type Config struct {
 	// where the trigger endpoint refuses with 403 and /api/capabilities reports
 	// baseline_trigger:false. Set together with MonitorCtrl (both control-plane).
 	BaselineCtrl BaselineController
+	// BaselineRefresh reports the daemon's PERIODIC baseline refresh (#1171).
+	// Wired in ONLY by `bintrail-console watch --baseline-refresh-interval`, and
+	// deliberately a separate field from BaselineCtrl because the two features
+	// are independently opt-in — the refresh needs no mydumper and no
+	// BINTRAIL_CONSOLE_BASELINE_TRIGGER=1. nil when no refresh loop runs, and the
+	// baseline listing then simply carries no refresh section.
+	BaselineRefresh BaselineRefreshReporter
 	// VerifyCtrl runs bintrail verify's engine in-process for a monitored
 	// server (#677). Wired in ONLY by `bintrail-console watch` when the
 	// operator opts in (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1); nil otherwise,
@@ -179,6 +186,9 @@ type Server struct {
 	// baselineCtrl: non-nil only when the watch daemon opted into in-process
 	// baseline creation (see Config.BaselineCtrl).
 	baselineCtrl BaselineController
+	// baselineRefresh: non-nil only when the watch daemon opted into the
+	// periodic refresh (see Config.BaselineRefresh).
+	baselineRefresh BaselineRefreshReporter
 	// verifyCtrl: non-nil only when the watch daemon opted into in-process
 	// verify runs (see Config.VerifyCtrl).
 	verifyCtrl VerifyController
@@ -349,6 +359,7 @@ func New(cfg Config) (*Server, error) {
 		allowedHosts:     cfg.AllowedHosts,
 		monitorCtrl:      cfg.MonitorCtrl,
 		baselineCtrl:     cfg.BaselineCtrl,
+		baselineRefresh:  cfg.BaselineRefresh,
 		verifyCtrl:       cfg.VerifyCtrl,
 		verifyHistory:    cfg.VerifyHistory,
 		telemetry:        cfg.Telemetry,
