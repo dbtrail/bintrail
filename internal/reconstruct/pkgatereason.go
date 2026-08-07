@@ -79,12 +79,12 @@ func GeneratedPKColumn(pkCols []metadata.ColumnMeta) (metadata.ColumnMeta, bool)
 // names in the text: console and wire surfaces emit it too.
 func GeneratedPKGateReason(c metadata.ColumnMeta, surface string) string {
 	return fmt.Sprintf(
-		"primary-key column %q is a generated column — the MariaDB system-versioning shape, which extends a versioned "+
-			"table's PK with its ROW END period column — and baselines deliberately omit generated columns, so %s cannot "+
-			"build the baseline-side PK join key for this table; dropping the column from the key instead would corrupt "+
-			"silently, because the binlog carries history rows (as inserts) and versioned deletes (as row_end updates) "+
-			"under the same remaining key; single-row reconstruct with an explicit PK column list, query, and recover "+
-			"are unaffected", c.Name, surface)
+		"primary-key column %q is a generated column — most commonly the MariaDB system-versioning shape, which extends "+
+			"a versioned table's PK with its ROW END period column — and baselines deliberately omit generated columns, "+
+			"so %s cannot build the baseline-side PK join key for this table; dropping the column from the key instead "+
+			"would corrupt silently, because a versioned table's binlog carries history rows (as inserts) and versioned "+
+			"deletes (as row_end updates) under the same remaining key; query and recover are unaffected, and the CLI's "+
+			"single-row reconstruct with an explicit PK column list also works", c.Name, surface)
 }
 
 // fullTableGeneratedPKRefusal is the error both full-table reconstruct paths

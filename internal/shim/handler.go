@@ -885,6 +885,13 @@ func (h *Handler) runShowTablesFromVirtual(currentDB, virtualSchema string) (*my
 // those columns dropped — same behaviour as a regular MySQL
 // `SELECT *` after an ALTER TABLE that removed a column.
 func (h *Handler) runFullTable(q TimeTravelQuery) (*mysql.Result, error) {
+	// #1266: a generated PK member (MariaDB system versioning) makes the
+	// binlog-only full-table fold corrupt, not merely partial — refuse before
+	// spending a gate slot. See checkGeneratedPKFullTable.
+	if err := h.checkGeneratedPKFullTable(q.Type, q.Schema, q.Table); err != nil {
+		return nil, err
+	}
+
 	ctx, cancel := h.queryContext()
 	defer cancel()
 

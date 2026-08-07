@@ -115,8 +115,11 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 	}
 	// A generated PK member — the MariaDB system-versioning shape (#1266) —
 	// is a permanent property of the table, not a transient condition, so it
-	// is inconclusive (like "no primary key"), never a mismatch or an error:
-	// a verify that fails forever on a versioned table is cry-wolf noise.
+	// is inconclusive (like "no primary key"), never a mismatch or an error.
+	// A run scoped to ONLY such tables still exits non-zero (all-inconclusive
+	// = unproven, Report.ExitError), matching the no-PK convention; the win
+	// is that one versioned table no longer poisons a multi-table run with a
+	// hard per-table error.
 	if c, ok := reconstruct.GeneratedPKColumn(pkCols); ok {
 		return inconclusive(res, generatedPKGateReason(c)), nil
 	}

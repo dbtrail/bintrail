@@ -91,6 +91,16 @@ func (p *Provider) BaselineChildren(ctx context.Context, schema, table, fkCol, p
 	if err != nil {
 		return cascade.BaselineLookup{}, false, fmt.Errorf("resolve %s.%s for baseline: %w", schema, table, err)
 	}
+	// A generated PK member — the MariaDB system-versioning shape (#1266) —
+	// cannot canonicalize against a baseline that omits the column; without
+	// this gate every row below dies with MissingPKColumnError and its
+	// misleading "run `bintrail snapshot` to refresh" remediation, which no
+	// re-snapshot can ever satisfy. Fail loud with the real cause instead,
+	// same stance as the fkFilterSafe refusal below.
+	if c, found := reconstruct.GeneratedPKColumn(tm.PKColumnMetas()); found {
+		return cascade.BaselineLookup{}, false, fmt.Errorf("baseline scan of %s.%s: %s",
+			schema, table, reconstruct.GeneratedPKGateReason(c, "the cascade baseline fallback"))
+	}
 	// The FK filter binds parentPK as a STRING against the baseline column.
 	// DuckDB coerces it exactly for integer/string FK columns, but for
 	// DATETIME/DECIMAL/DATE the string form may not match the stored value and
