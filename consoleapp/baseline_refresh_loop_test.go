@@ -62,7 +62,7 @@ func TestStartBaselineRefreshLoop_refusesAtStartup(t *testing.T) {
 	}{
 		{"disabled by default", sup, "", "", "", ""},
 		{"unparseable interval", sup, "sometimes", "d", "/b", "--baseline-refresh-interval"},
-		{"no control plane", nil, "6h", "d", "/b", "requires the control plane"},
+		{"no supervisor wired", nil, "6h", "d", "/b", "without a baseline supervisor"},
 		{"nothing refreshable", sup, "6h", "", "", "no server has BOTH"},
 		{"configured", sup, "6h", "dsn", "/b", ""},
 	} {

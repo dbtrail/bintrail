@@ -26,11 +26,25 @@ type BaselineController interface {
 	// this process — the durable record is the snapshot itself, listed by
 	// /api/baselines).
 	Status(serverID string) BaselineStatus
-	// RefreshStatus reports the latest PERIODIC REFRESH state for a server
-	// (#1171), kept apart from Status because the two answer different
-	// questions: "did my dump work" and "is my baseline still moving forward on
-	// its own". Folding them into one slot would let a manual dump erase the
-	// evidence that the automatic refresh has been failing for a week.
+}
+
+// BaselineRefreshReporter reports the daemon's periodic baseline refresh
+// (#1171). Deliberately a SEPARATE interface from BaselineController, wired from
+// a separate Config field, because the two features are independently opt-in:
+// the manual dump needs mydumper and BINTRAIL_CONSOLE_BASELINE_TRIGGER=1, while
+// a refresh needs neither — it exists precisely so a fresher baseline does not
+// require a dump. Folding the report into BaselineController would gate the
+// refresh behind the dump's opt-in, or (worse) un-gate the Create-baseline
+// button for anyone who enabled only the refresh.
+//
+// nil when the daemon runs no refresh loop.
+type BaselineRefreshReporter interface {
+	// RefreshStatus reports the latest periodic refresh for a server, or state
+	// "idle" when none has run here. Kept apart from BaselineController.Status
+	// because the two answer different questions — "did my dump work" and "is my
+	// baseline still moving forward on its own" — and one shared slot would let
+	// a manual dump erase the evidence that the automatic refresh has been
+	// failing for a week.
 	RefreshStatus(serverID string) BaselineStatus
 }
 

@@ -370,13 +370,17 @@ A table with no baseline is refused rather than degraded to the binlog-only fall
 
 `bintrail-console watch --baseline-refresh-interval 12h` (env `BINTRAIL_BASELINE_REFRESH_INTERVAL`) runs the same refresh from the daemon, per monitored server, with no cron. It is **off by default** and refuses at startup when no server has both an index DSN and a local baseline directory — a loop that wakes up hourly to find nothing to do is indistinguishable from one that is working.
 
-Three properties are deliberate:
+It is **independent of the Create-baseline button**: the refresh needs neither mydumper nor `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`, which is the whole point of it. Enabling one does not enable the other in either direction.
+
+Four properties are deliberate:
 
 - **Conservative resources.** The refresh runs with DuckDB's container-safe budget (2 threads / 4 GB), never `--ultrafast`. That flag is for offline commands that own the machine; a background job that self-tuned to ~80% of host RAM would starve the capture path it depends on.
 - **Never `--allow-gaps`.** An unattended job must not publish a knowingly-incomplete baseline: accepting a permanent capture loss has consequences for every future reconstruct, and nobody is watching this one to make that call. A gapped window is refused and retried next interval.
 - **Isolated from capture.** A failure is logged and retried; it can never take down the stream or the supervisor. A baseline that stopped refreshing is a degradation, a daemon that stopped capturing is an outage, and the first must never cause the second.
+- **Nothing is uploaded, so nothing is pruned.** A refreshed snapshot is written locally only, and `bintrail baseline prune` reclaims a snapshot only once it has confirmed a durable S3 copy of it — so snapshots this loop publishes accumulate, whether or not an S3 destination is configured. The loop says so at startup. Upload and prune them on your own schedule (`bintrail upload --source <baseline-dir> --destination s3://…`), or size the disk for one full-table snapshot per interval.
 
 It shares its single-flight with the console's **Create baseline** button, so a refresh and a dump never run against the same server at once. The last outcome per server shows up in the console's Storage page and in `GET /api/baselines`.
+
 
 An S3-only baseline destination is skipped with a warning: a refresh reads and writes snapshot files on disk, so there is nothing for it to refresh in place.
 

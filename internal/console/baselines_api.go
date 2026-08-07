@@ -90,8 +90,8 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := baselinesResponse{Reconstruct: b.baselineConfigured, Snapshots: []baselineSnapshotDTO{}}
-	if s.baselineCtrl != nil {
-		if st := s.baselineCtrl.RefreshStatus(selectedServerID(r)); st.State != "idle" {
+	if s.baselineRefresh != nil {
+		if st := s.baselineRefresh.RefreshStatus(selectedServerID(r)); st.State != "idle" {
 			resp.Refresh = &st
 		}
 	}

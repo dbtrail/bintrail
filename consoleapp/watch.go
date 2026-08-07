@@ -425,10 +425,23 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
+	// One supervisor, TWO independently opt-in features: the manual dump-based
+	// baseline trigger (#613, needs mydumper and BINTRAIL_CONSOLE_BASELINE_TRIGGER=1)
+	// and the periodic refresh (#1171, needs neither — it exists precisely so a
+	// fresher baseline does not require a dump). Build it when EITHER is asked
+	// for, but wire the two Config fields separately: assigning cfg.BaselineCtrl
+	// un-gates the Create-baseline button, so deriving one from the other would
+	// either refuse to start a refresh-only daemon or silently switch on a
+	// feature the operator did not enable.
 	var baselineSup *baselineSupervisor
-	if upConsoleBaselineTrigger {
+	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
 		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
+	}
+	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = baselineSup
+	}
+	if upBaselineRefreshEvery != "" {
+		cfg.BaselineRefresh = baselineSup
 	}
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {
@@ -603,10 +616,23 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// the HTTP requests that start them.
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
+	// One supervisor, TWO independently opt-in features: the manual dump-based
+	// baseline trigger (#613, needs mydumper and BINTRAIL_CONSOLE_BASELINE_TRIGGER=1)
+	// and the periodic refresh (#1171, needs neither — it exists precisely so a
+	// fresher baseline does not require a dump). Build it when EITHER is asked
+	// for, but wire the two Config fields separately: assigning cfg.BaselineCtrl
+	// un-gates the Create-baseline button, so deriving one from the other would
+	// either refuse to start a refresh-only daemon or silently switch on a
+	// feature the operator did not enable.
 	var baselineSup *baselineSupervisor
-	if upConsoleBaselineTrigger {
+	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
 		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
+	}
+	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = baselineSup
+	}
+	if upBaselineRefreshEvery != "" {
+		cfg.BaselineRefresh = baselineSup
 	}
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {

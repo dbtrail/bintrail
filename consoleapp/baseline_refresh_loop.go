@@ -149,21 +149,34 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 		return fmt.Errorf("--baseline-refresh-interval must be positive, got %q", intervalRaw)
 	}
 	if sup == nil {
-		// The supervisor only exists on the control-plane daemon. Refusing here
-		// beats a flag that is silently inert.
-		return fmt.Errorf("--baseline-refresh-interval requires the control plane; " +
-			"it has no effect on a read-only console")
+		// Unreachable from watch.go, which builds the supervisor whenever this
+		// interval is set. Kept so a future caller that forgets fails loudly
+		// instead of running a console with a flag that is silently inert.
+		return fmt.Errorf("internal: --baseline-refresh-interval was set without a baseline supervisor")
 	}
 	// Refuse at startup rather than discovering it a tick later: an operator who
 	// set the flag expects refreshes, and a loop that wakes up every hour to find
 	// nothing to do is indistinguishable from one that is working.
-	if len(baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)) == 0 {
+	targets := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
+	if len(targets) == 0 {
 		return fmt.Errorf("--baseline-refresh-interval is set but no server has BOTH an index DSN and a " +
 			"LOCAL baseline directory; a refresh reads the previous snapshot and writes the new one on disk " +
 			"(an S3-only baseline destination cannot be refreshed in place)")
 	}
 
-	slog.Info("baseline refresh loop enabled", "interval", interval)
+	slog.Info("baseline refresh loop enabled", "interval", interval, "servers", len(targets))
+	// RETENTION INTERPLAY (#616), stated at startup on purpose. A refreshed
+	// snapshot is written locally and is NOT uploaded, and baseline.PruneLocal
+	// only reclaims a snapshot whose _SUCCESS marker it can confirm in S3 — so
+	// nothing this loop publishes is prunable, with or without an S3 destination
+	// configured. Unattended that is one full-table snapshot per interval,
+	// forever. An operator who discovers this from a full disk discovers it far
+	// too late, and the loop has no business quietly deciding to upload on their
+	// behalf.
+	slog.Warn("baseline refresh: snapshots from this loop are written locally and never uploaded, so retention "+
+		"cannot reclaim them (a prune needs a confirmed S3 copy of the snapshot). Upload and prune on your own "+
+		"schedule, or size the disk for one full-table snapshot per interval.",
+		"dir", globalBaselineDir, "interval", interval)
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()

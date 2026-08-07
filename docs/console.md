@@ -339,7 +339,8 @@ across the rotation dialog and the per-server edit form):
   the selected server: how many tables it published, or that it published
   nothing and why. A refusal there is the fail-closed contract working (a
   capture gap, a schema change), not a broken daemon — nothing was overwritten
-  and the next run retries.
+  and the next run retries. The refresh is opt-in on its own — it does not
+  require, and does not enable, the **Create baseline** button.
 - **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one
