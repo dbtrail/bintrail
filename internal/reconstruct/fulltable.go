@@ -72,15 +72,57 @@ import (
 // path and the binlog-only fallback) catch every case; pkChangingUpdate is a
 // cheap map backstop. Re-snapshot the baseline at or after the PK change and
 // reconstruct from there.
+// Output formats FullTableConfig.OutputFormat accepts.
+const (
+	// OutputFormatMydumper writes a mydumper-compatible SQL dump directory —
+	// the original full-table output (#187), and what the zero value resolves to.
+	OutputFormatMydumper = "mydumper"
+	// OutputFormatParquet writes a baseline snapshot in Parquet (#1169): the same
+	// artifact `bintrail baseline` produces from a mydumper dump, so the output of
+	// a reconstruct can itself anchor the next one.
+	OutputFormatParquet = "parquet"
+)
+
+// snapshotDirName renders a snapshot's directory name from its target instant,
+// byte-identical to what baseline.Run produces (RFC3339 UTC with ':' replaced
+// by '-' for filesystem portability). The name IS the snapshot's timestamp as
+// far as FindBaseline is concerned, so this formatting is a compatibility
+// contract, not a display choice.
+func snapshotDirName(at time.Time) string {
+	return strings.ReplaceAll(at.UTC().Format(time.RFC3339), ":", "-")
+}
+
 type FullTableConfig struct {
 	IndexDSN    string    // DSN for the bintrail index database
 	BaselineSrc string    // local directory or s3:// URL of baselines
 	Tables      []string  // "db.table" entries
 	At          time.Time // target point-in-time
-	OutputDir   string    // mydumper dump output directory (must exist)
+	OutputDir   string    // output root: the mydumper dump directory, or the baselines root under OutputFormatParquet
 	ChunkSize   int64     // per-chunk SQL file size (0 → 256 MiB)
-	Parallelism int       // max concurrent tables (0 → runtime.NumCPU())
-	AllowGaps   bool      // false = strict abort on gaps (default for reconstruct)
+
+	// OutputFormat selects the artifact the run produces. The zero value means
+	// "not specified" and resolves to OutputFormatMydumper, matching this
+	// struct's existing convention for ArchiveFetcher/WarnEventThreshold.
+	//
+	// Under OutputFormatParquet the run writes a discoverable BASELINE SNAPSHOT
+	// (#1169) instead of a SQL dump, and OutputDir is read as the baselines root
+	// — the same path `bintrail baseline --output` takes — not as the directory
+	// the files land in directly. See emitParquetSnapshot for the layout and the
+	// anchoring contract.
+	OutputFormat string
+
+	// snapshotDir and cut are per-run state ReconstructTables resolves once and
+	// hands to each ReconstructTable goroutine. Unexported because they are
+	// derived, not configured: setting them from outside would let a caller
+	// anchor a snapshot at a coordinate unrelated to the events it folded.
+	//
+	// snapshotDir is <OutputDir>/<at, RFC3339 with ':' → '-'>, the directory
+	// FindBaseline discovers. cut is the binlog coordinate the snapshot is
+	// anchored at (nil when the index holds no events); see ResolveSnapshotCut.
+	snapshotDir string
+	cut         *query.BinlogPos
+	Parallelism int  // max concurrent tables (0 → runtime.NumCPU())
+	AllowGaps   bool // false = strict abort on gaps (default for reconstruct)
 
 	// WarnEventThreshold logs a loud warning when a table's fetched event count
 	// exceeds it: full-table reconstruct holds every event plus one change-map
@@ -248,11 +290,58 @@ func maybeWarnEventVolume(schema, table string, n int64, threshold int64, parall
 			"via --warn-event-threshold / BINTRAIL_RECONSTRUCT_WARN_EVENTS (0 disables)")
 }
 
+// Refusal classes a caller can act on without parsing error text. Every
+// full-table refusal that a REFRESH loop needs to report distinctly wraps one of
+// these; anything else is an ordinary failure.
+//
+// They exist for `bintrail baseline refresh`, which must tell an operator WHY a
+// table could not be refreshed — "the events are gone" and "the table changed
+// shape" have completely different remedies — without the summary code
+// string-matching messages that are free to be reworded.
+var (
+	// ErrCaptureGap: the fold window spans a permanent capture loss (or an
+	// index that cannot rule one out). Remedy: --allow-gaps to accept a
+	// knowingly-incomplete result, or a fresh dump.
+	ErrCaptureGap = errors.New("capture gap in the reconstruction window")
+	// ErrSchemaChanged: the table's shape moved between the baseline and the
+	// target — an ALTER, a destructive DDL, or delta events disagreeing with
+	// the baseline's columns. Remedy: a real re-dump; no flag helps.
+	ErrSchemaChanged = errors.New("schema changed since the baseline")
+)
+
+// TableFailure is one table's refusal, kept separate from the joined error so a
+// caller can classify and report per table.
+type TableFailure struct {
+	Schema string
+	Table  string
+	Err    error
+}
+
+// ReconstructTablesDetailed is ReconstructTables plus the per-table failures.
+//
+// ReconstructTables joins every failure into one error, which is right for a
+// command that either produces a dump or doesn't. A refresh has to render a
+// per-table verdict — refreshed / refused-gap / refused-ddl — so it needs the
+// failures apart, classifiable against the sentinels above. The run semantics
+// are identical, including all-or-nothing publication: any failure leaves the
+// snapshot directory marked _INCOMPLETE and therefore undiscoverable.
+func ReconstructTablesDetailed(ctx context.Context, cfg FullTableConfig) ([]*TableReport, []TableFailure, error) {
+	var failures []TableFailure
+	reports, err := reconstructTables(ctx, cfg, &failures)
+	return reports, failures, err
+}
+
 // ReconstructTables runs ReconstructTable concurrently for every entry in
 // cfg.Tables, sharing a single *sql.DB + *query.Engine + *metadata.Resolver.
 // Returns the list of reports in arbitrary order plus a joined error
 // containing every per-table failure (via errors.Join).
 func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport, error) {
+	return reconstructTables(ctx, cfg, nil)
+}
+
+// reconstructTables is the implementation both entry points share. failures, when
+// non-nil, collects each per-table error alongside the joined one.
+func reconstructTables(ctx context.Context, cfg FullTableConfig, failures *[]TableFailure) ([]*TableReport, error) {
 	if cfg.IndexDSN == "" {
 		return nil, errors.New("FullTableConfig: IndexDSN is required")
 	}
@@ -274,9 +363,53 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = 256 << 20
 	}
+	if cfg.OutputFormat == "" {
+		cfg.OutputFormat = OutputFormatMydumper
+	}
+	if cfg.OutputFormat != OutputFormatMydumper && cfg.OutputFormat != OutputFormatParquet {
+		return nil, fmt.Errorf("FullTableConfig: unknown OutputFormat %q (want %q or %q)",
+			cfg.OutputFormat, OutputFormatMydumper, OutputFormatParquet)
+	}
+	parquetMode := cfg.OutputFormat == OutputFormatParquet
 
 	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output dir: %w", err)
+	}
+
+	// In Parquet mode the files land in a per-snapshot subdirectory of the
+	// baselines root, not in OutputDir itself, and it is THAT directory whose
+	// completeness marker discovery reads (#467). Everything below therefore
+	// operates on markerDir rather than cfg.OutputDir.
+	markerDir := cfg.OutputDir
+	if parquetMode {
+		cfg.snapshotDir = filepath.Join(cfg.OutputDir, snapshotDirName(cfg.At))
+		// Refuse rather than merge into an existing snapshot directory. Unlike a
+		// reconstruct output dir — an operator-chosen path that is routinely
+		// re-run into, which markRunIncomplete handles by clearing the stale
+		// marker — a snapshot directory is identified by its timestamp and is
+		// meant to be written once. Two runs sharing one (same --at, or two
+		// refreshes inside the same second) would interleave table files from
+		// different folds under a single anchor, and the second run's _SUCCESS
+		// would publish the mixture as one coherent snapshot.
+		//
+		// The exception is a directory holding NOTHING BUT the _INCOMPLETE
+		// marker: that is a previous run of this exact target that published
+		// nothing, so there is no data to interleave. Refusing it would make the
+		// most ordinary recovery impossible — fix the problem the run reported,
+		// retry the same --at, and be told the directory is in the way.
+		leftover, err := snapshotDirLeftovers(cfg.snapshotDir)
+		if err != nil {
+			return nil, err
+		}
+		if len(leftover) > 0 {
+			return nil, fmt.Errorf("snapshot directory %s already holds %s; "+
+				"a baseline snapshot is written once — remove it, or target a different instant with --at",
+				cfg.snapshotDir, strings.Join(leftover, ", "))
+		}
+		if err := os.MkdirAll(cfg.snapshotDir, 0o755); err != nil {
+			return nil, fmt.Errorf("create snapshot directory %s: %w", cfg.snapshotDir, err)
+		}
+		markerDir = cfg.snapshotDir
 	}
 
 	// Crash-safety completeness marker (#842): flag the output dir _INCOMPLETE
@@ -292,8 +425,8 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	// baseline.go: proceeding without the crash-safety net deployed and then
 	// dying uncatchably mid-run would leave a markerless partial dump that the
 	// marker-absent-is-complete legacy-compat rule reads as complete.
-	if err := markRunIncomplete(cfg.OutputDir); err != nil {
-		return nil, fmt.Errorf("could not write incomplete-dump marker in %s (refusing to reconstruct without the crash-safety marker): %w", cfg.OutputDir, err)
+	if err := markRunIncomplete(markerDir); err != nil {
+		return nil, fmt.Errorf("could not write incomplete-dump marker in %s (refusing to reconstruct without the crash-safety marker): %w", markerDir, err)
 	}
 
 	db, err := config.Connect(cfg.IndexDSN)
@@ -330,6 +463,31 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	}
 
 	engine := query.New(db)
+
+	// Resolve the snapshot's binlog cut ONCE for the whole run, before any table
+	// is folded. One index database tracks one source, so a single coordinate is
+	// the right anchor for every table in the snapshot — and resolving it per
+	// table would let two tables in one snapshot end up anchored at different
+	// points, which is not a state the marker/discovery scheme can express.
+	//
+	// The cut also bounds every table's fetch (Options.UntilPos below), so it
+	// must be pinned before the first fetch: reading it afterwards would anchor
+	// the snapshot at a coordinate later than the events it actually folded, and
+	// the next refresh would skip everything in between.
+	if parquetMode {
+		cut, cutErr := ResolveSnapshotCut(ctx, db, cfg.At)
+		if cutErr != nil {
+			return nil, cutErr
+		}
+		cfg.cut = cut
+		if cut == nil {
+			slog.Warn("index holds no events; the emitted snapshot will carry its source baseline's coordinates unchanged",
+				"at", cfg.At.UTC().Format(time.RFC3339))
+		} else {
+			slog.Info("snapshot anchored", "binlog_file", cut.File, "binlog_pos", cut.Pos,
+				"at", cfg.At.UTC().Format(time.RFC3339))
+		}
+	}
 
 	// Resolve archive sources once — the same set is used for every table.
 	archSources, archErr := query.ResolveArchiveSources(ctx, db)
@@ -372,6 +530,9 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 				slog.Error("full-table reconstruct failed",
 					"schema", schema, "table", table, "error", err)
 				errs = append(errs, fmt.Errorf("%s.%s: %w", schema, table, err))
+				if failures != nil {
+					*failures = append(*failures, TableFailure{Schema: schema, Table: table, Err: err})
+				}
 				return
 			}
 			reports = append(reports, rep)
@@ -385,7 +546,7 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	// user somehow reconstructs tables from baselines of different ages,
 	// the metadata file will reflect the first one and the rest will log
 	// a warning in ReconstructTable itself.
-	if len(reports) > 0 {
+	if len(reports) > 0 && !parquetMode {
 		// Pick the first report that actually produced output files from a
 		// real baseline (skip tables that had no baseline: an empty report,
 		// or a #766 binlog-only report — neither has baseline GTID/binlog
@@ -435,10 +596,45 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 		}
 	}
 
-	if err := finalizeCompletenessMarker(cfg.OutputDir, ctx.Err(), errs); err != nil {
+	// A Parquet snapshot carries an at-rest integrity manifest (#636), written
+	// before the _SUCCESS marker so a complete snapshot ALWAYS has its checksums
+	// — identical ordering and identical fatality to baseline.Run, because a
+	// complete-but-manifestless snapshot is indistinguishable at read time from a
+	// legacy one and silently forfeits corruption detection. Only attempted when
+	// the run is otherwise clean; a failed run stays _INCOMPLETE and needs no
+	// manifest.
+	if parquetMode && ctx.Err() == nil && len(errs) == 0 {
+		if err := baselineintegrity.WriteManifest(cfg.snapshotDir); err != nil {
+			errs = append(errs, fmt.Errorf("snapshot complete but could not write integrity manifest: %w", err))
+		}
+	}
+
+	if err := finalizeCompletenessMarker(markerDir, ctx.Err(), errs); err != nil {
 		return reports, err
 	}
 	return reports, nil
+}
+
+// snapshotDirLeftovers lists what an existing snapshot directory holds that a
+// new run must not write alongside. An absent directory, or one holding only the
+// _INCOMPLETE marker a previous failed run left, yields nothing — see the caller
+// for why that exception is load-bearing.
+func snapshotDirLeftovers(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect snapshot directory %s: %w", dir, err)
+	}
+	var out []string
+	for _, e := range entries {
+		if e.Name() == baseline.IncompleteMarker {
+			continue
+		}
+		out = append(out, e.Name())
+	}
+	return out, nil
 }
 
 // markRunIncomplete stamps outputDir _INCOMPLETE for a NEW reconstruct run
@@ -560,6 +756,19 @@ func ReconstructTable(
 		// so fall back to a binlog-only reconstruction instead of silently
 		// emitting an empty report — parity with the shim's _snapshot→
 		// _flashback degrade (internal/shim/snapshot.go runSnapshotFullTable).
+		// That degrade has no Parquet-mode counterpart. The fallback synthesizes a
+		// placeholder CREATE TABLE from the observed row images
+		// (binlogOnlySchemaPlaceholder) and reconstructs only the rows the window
+		// happens to touch — neither is a baseline. Publishing it as one would
+		// anchor every future reconstruct on a snapshot that silently omits every
+		// row the window never touched, so refuse and name the only correct fix.
+		if cfg.OutputFormat == OutputFormatParquet {
+			return nil, fmt.Errorf(
+				"%s.%s has no baseline snapshot at or before %s, so it cannot be re-emitted as one: "+
+					"a snapshot derived only from binlog deltas would omit every row the window never touched — "+
+					"take a real snapshot for this table first (`bintrail dump` + `bintrail baseline`)",
+				schema, table, cfg.At.UTC().Format(time.RFC3339))
+		}
 		return reconstructBinlogOnly(ctx, cfg, schema, table, db, engine, resolver, dbName, rep, start)
 	}
 	slog.Debug("baseline selected",
@@ -632,6 +841,29 @@ func ReconstructTable(
 		}
 	}
 
+	// ── 3a-bis. Parquet mode only: refuse when the baseline's schema is no ──
+	// longer the current one. The #602/#843 guards below catch drift only when
+	// a delta event carries (or stops carrying) the column, so an ALTER that no
+	// write followed is invisible to them — and the emitted snapshot would then
+	// declare an obsolete CREATE TABLE over rows nobody can place. Only Parquet
+	// mode: a mydumper dump is read by a human or myloader against a table they
+	// chose, while a baseline is picked up automatically by every later
+	// reconstruct.
+	if cfg.OutputFormat == OutputFormatParquet {
+		if err := checkBaselineSchemaCurrent(bmeta.CreateTableSQL, tm, schema, table); err != nil {
+			return nil, err
+		}
+		// A gapped ancestor taints every descendant: the events it lost are
+		// still lost. Warn on READ as well as stamping on write, so an operator
+		// reconstructing from such a chain is told once per run rather than
+		// having to inspect a Parquet footer.
+		if bmeta.CaptureGap != "" {
+			slog.Warn("the baseline this reconstruction is anchored on was itself published over a KNOWN capture gap; "+
+				"its missing events are missing here too",
+				"schema", schema, "table", table, "baseline", baselinePath, "capture_gap", bmeta.CaptureGap)
+		}
+	}
+
 	// ── 3b. Refuse if a TRUNCATE/DROP/RENAME hit this table in the window ──
 	// TRUNCATE/DROP emit no row events (#764): without this check the merge
 	// below would replay the baseline straight through and silently
@@ -645,7 +877,12 @@ func ReconstructTable(
 	// binlogs purged before the stream caught up); unlike the archive-coverage
 	// gap the fetch below already guards against, no amount of archive
 	// resolution can fill this — it must be checked directly.
-	if err := CheckCaptureGap(ctx, db, schema, table, snapshotTime, cfg.At, cfg.AllowGaps); err != nil {
+	// The finding is kept, not just acted on: under --allow-gaps the run
+	// proceeds over a known permanent loss, and a Parquet snapshot published
+	// that way must carry the fact in its own metadata (#1170). A log line
+	// cannot: the artifact outlives the terminal.
+	capGap, err := CheckCaptureGapStatus(ctx, db, schema, table, snapshotTime, cfg.At, cfg.AllowGaps)
+	if err != nil {
 		return nil, err
 	}
 
@@ -667,6 +904,18 @@ func ReconstructTable(
 	// see baseline.DumpMetadata) fall back to the plain Since-only fetch.
 	if bmeta.BinlogFile != "" && bmeta.BinlogPos > 0 {
 		fetchOpts.SincePos = &query.BinlogPos{File: bmeta.BinlogFile, Pos: uint64(bmeta.BinlogPos)}
+	}
+	// In Parquet mode the window's upper bound is the run's binlog cut, not just
+	// the target time. This is what makes the emitted snapshot a valid anchor:
+	// the set folded here (end_pos <= cut) and the set the NEXT reconstruct
+	// fetches from this snapshot (start_pos >= cut) partition the binlog exactly.
+	// The `Until: cfg.At` filter above stays and is a strict superset of the
+	// positional window by construction — see ResolveSnapshotCut for the proof
+	// and for why the reverse derivation (a position from a time cut) is not
+	// safe. cfg.cut is nil only when the index holds no events at all, where the
+	// window is empty either way.
+	if cfg.OutputFormat == OutputFormatParquet && cfg.cut != nil {
+		fetchOpts.UntilPos = cfg.cut
 	}
 	// nil ArchiveFetcher → the container-safe parquetquery.Fetch. Resolved here
 	// at the point of use so both ReconstructTables and any direct
@@ -728,9 +977,9 @@ func ReconstructTable(
 	}
 	defer cleanup()
 
-	// ── 7-9. Merge baseline + changes into the mydumper writer ────────────
+	// ── 7-9. Merge baseline + changes into the output writer ──────────────
 	// The merge loop is extracted so it can be unit-tested without MySQL.
-	if err := mergeBaselineIntoWriter(ctx, mergeInput{
+	in := mergeInput{
 		LocalBaselinePath: localPath,
 		CreateTableSQL:    bmeta.CreateTableSQL,
 		Schema:            schema,
@@ -742,7 +991,21 @@ func ReconstructTable(
 		OutputDir:         cfg.OutputDir,
 		ChunkSize:         cfg.ChunkSize,
 		DuckDBTuning:      cfg.DuckDBTuning,
-	}, rep); err != nil {
+	}
+	if cfg.OutputFormat == OutputFormatParquet {
+		in.SnapshotDir = cfg.snapshotDir
+		in.SnapshotAt = cfg.At
+		in.Cut = cfg.cut
+		in.CaptureGap = capGap
+		in.SourceBaseline = baselineMeta{
+			Path:     baselinePath,
+			Time:     snapshotTime,
+			Metadata: bmeta,
+		}
+		if err := mergeBaselineIntoParquet(ctx, in, rep); err != nil {
+			return nil, err
+		}
+	} else if err := mergeBaselineIntoWriter(ctx, in, rep); err != nil {
 		return nil, err
 	}
 	rep.Duration = time.Since(start)
@@ -756,6 +1019,55 @@ func ReconstructTable(
 		"deletes_skipped", rep.DeletesSkipped,
 		"duration_ms", rep.Duration.Milliseconds())
 	return rep, nil
+}
+
+// prepareMerge reads the baseline's column list and runs the two schema-drift
+// guards that must fire BEFORE any output file is opened, so a refused table
+// leaves nothing on disk. Shared by both output formats — the drift they detect
+// is a property of the reconstruction, not of the artifact it is written into,
+// and a guard that ran for one format only would make the other silently wrong.
+func prepareMerge(ctx context.Context, in mergeInput) ([]string, error) {
+	colNames, err := readBaselineColumns(ctx, in.LocalBaselinePath, in.DuckDBTuning)
+	if err != nil {
+		return nil, fmt.Errorf("read baseline columns: %w", err)
+	}
+
+	// Fail loud on a column ADDED after the baseline (#602). This path projects
+	// every emitted row onto the baseline column set and carries the baseline's
+	// CREATE TABLE as the schema; it does not reconstruct intermediate DDL. So a
+	// delta event's row_after key absent from the baseline columns would be
+	// dropped silently (its value never reaches the output). Refuse instead, the
+	// same fail-loud choice the supportedPKType guard in ReconstructTable makes:
+	// a warning isn't enough because an operator running --log-level error would
+	// not see it and would get output silently missing a column.
+	if extra := postBaselineColumns(in.Changes, colNames); len(extra) > 0 {
+		return nil, fmt.Errorf(
+			"full-table reconstruct: %s.%s has column(s) %s present in delta events but absent from the baseline schema "+
+				"(added after the baseline snapshot); their values cannot be emitted without dropping data silently — "+
+				"re-run `bintrail baseline` to capture a snapshot that includes the new column(s): %w",
+			in.Schema, in.Table, strings.Join(extra, ", "), ErrSchemaChanged)
+	}
+
+	// Fail loud on a baseline column DROPPED after the baseline (#843), the
+	// symmetric direction of the #602 guard above: post-drop delta events stop
+	// carrying the column in row_after, so projecting them onto the baseline
+	// columns would NULL-fill it while never-touched pass-through rows keep
+	// the pre-drop value — one artifact mixing two schema epochs (a state that
+	// never existed) under a CREATE TABLE that still declares the column.
+	// Column ABSENCE from the image is the signal (binlog_row_image=FULL is a
+	// hard requirement, so an after-image always carries every column live at
+	// event time); a genuinely-NULL value is present in the map with a nil value
+	// and passes through untouched. Aggregated over the whole change map — not
+	// the old per-row×column slog.Warn.
+	if missing := droppedBaselineColumns(in.ImageColumns, in.SawImage, colNames); len(missing) > 0 {
+		return nil, fmt.Errorf(
+			"full-table reconstruct: %s.%s has baseline column(s) %s absent from delta-event row images "+
+				"(dropped from the source table after the baseline snapshot); emitting would mix schema epochs — "+
+				"rows touched after the drop would carry NULL while never-touched rows keep the pre-drop value — "+
+				"re-run `bintrail baseline` to capture a snapshot of the current schema: %w",
+			in.Schema, in.Table, strings.Join(missing, ", "), ErrSchemaChanged)
+	}
+	return colNames, nil
 }
 
 // mergeInput bundles everything mergeBaselineIntoWriter needs. Extracted so
@@ -777,6 +1089,21 @@ type mergeInput struct {
 	SawImage     bool
 	OutputDir    string
 	ChunkSize    int64
+
+	// SnapshotDir / SnapshotAt / Cut / SourceBaseline are set only under
+	// OutputFormatParquet and drive mergeBaselineIntoParquet: where the snapshot
+	// goes, the instant it is labelled with, the binlog coordinate it is anchored
+	// at (nil = index holds no events, so the source baseline's own anchor
+	// carries over), and the snapshot it was derived from.
+	SnapshotDir    string
+	SnapshotAt     time.Time
+	Cut            *query.BinlogPos
+	SourceBaseline baselineMeta
+	// CaptureGap is the permanent-loss finding this run OVERRODE under
+	// AllowGaps, or nil when the window was verifiably clean. Non-nil means the
+	// emitted snapshot is knowingly incomplete and must say so in its metadata.
+	CaptureGap *CaptureGap
+
 	// DuckDBTuning sets the resource budget for the DuckDB sessions this
 	// function opens (readBaselineColumns, mergeBaselineImages) (#842). Zero
 	// value → the container-safe default; see effectiveDuckDBTuning.
@@ -827,49 +1154,9 @@ type mergeInput struct {
 // maps DO carry before-images (the shim's _snapshot path and the binlog-only
 // fallback); they are simply not applicable to this one.
 func mergeBaselineIntoWriter(ctx context.Context, in mergeInput, rep *TableReport) (retErr error) {
-	colNames, err := readBaselineColumns(ctx, in.LocalBaselinePath, in.DuckDBTuning)
+	colNames, err := prepareMerge(ctx, in)
 	if err != nil {
-		return fmt.Errorf("read baseline columns: %w", err)
-	}
-
-	// Fail loud on a column ADDED after the baseline (#602). This path projects
-	// every emitted row onto the baseline column set and writes the baseline's
-	// CREATE TABLE as the schema header; it does not reconstruct intermediate
-	// DDL. So a delta event's row_after key absent from the baseline columns
-	// would be dropped silently by rowAfterOrdered (its value never reaches the
-	// dump). Refuse instead, the same fail-loud choice the supportedPKType
-	// guard in ReconstructTable makes: a warning isn't enough because an
-	// operator running --log-level error would not see it and would get a dump
-	// silently missing a column. Detected up front, before the writer opens, so
-	// no partial chunk files are left on disk.
-	if extra := postBaselineColumns(in.Changes, colNames); len(extra) > 0 {
-		return fmt.Errorf(
-			"full-table reconstruct: %s.%s has column(s) %s present in delta events but absent from the baseline schema "+
-				"(added after the baseline snapshot); their values cannot be emitted without dropping data silently — "+
-				"re-run `bintrail baseline` to capture a snapshot that includes the new column(s)",
-			in.Schema, in.Table, strings.Join(extra, ", "))
-	}
-
-	// Fail loud on a baseline column DROPPED after the baseline (#843), the
-	// symmetric direction of the #602 guard above: post-drop delta events stop
-	// carrying the column in row_after, so projecting them onto the baseline
-	// columns would NULL-fill it while never-touched pass-through rows keep
-	// the pre-drop value — one dump mixing two schema epochs (a state that
-	// never existed) under a CREATE TABLE header that still declares the
-	// column. Column ABSENCE from the image is the signal
-	// (binlog_row_image=FULL is a hard requirement, so an after-image always
-	// carries every column live at event time); a genuinely-NULL value is
-	// present in the map with a nil value and passes through untouched.
-	// Detected up front, aggregated over the whole change map — not the old
-	// per-row×column slog.Warn — and before the writer opens, so no partial
-	// chunk files are left on disk.
-	if missing := droppedBaselineColumns(in.ImageColumns, in.SawImage, colNames); len(missing) > 0 {
-		return fmt.Errorf(
-			"full-table reconstruct: %s.%s has baseline column(s) %s absent from delta-event row images "+
-				"(dropped from the source table after the baseline snapshot); emitting would mix schema epochs — "+
-				"rows touched after the drop would carry NULL while never-touched rows keep the pre-drop value — "+
-				"re-run `bintrail baseline` to capture a snapshot of the current schema",
-			in.Schema, in.Table, strings.Join(missing, ", "))
+		return err
 	}
 
 	mw, err := NewMydumperWriter(in.OutputDir, in.Schema, in.Table, colNames, in.ChunkSize)

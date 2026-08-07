@@ -111,9 +111,25 @@ func CaptureGapStatus(ctx context.Context, db *sql.DB, since, until time.Time) (
 // --allow-gaps it logs a slog.Warn and returns nil so the caller proceeds with
 // a known-incomplete result.
 func CheckCaptureGap(ctx context.Context, db *sql.DB, schema, table string, since, until time.Time, allowGaps bool) error {
+	_, err := CheckCaptureGapStatus(ctx, db, schema, table, since, until, allowGaps)
+	return err
+}
+
+// CheckCaptureGapStatus is CheckCaptureGap plus the finding it acted on: the
+// same strict/allow policy, but the caller also learns WHAT was overridden when
+// allowGaps let the run proceed.
+//
+// It exists because "proceeded over a known gap" has to outlive the log line
+// that reported it. A snapshot published under --allow-gaps is knowingly
+// incomplete forever, and the only place that can say so forever is the
+// artifact itself (baseline.MetaKeyCaptureGap, #1170) — a warning in a
+// terminal the operator has since closed is not a record.
+//
+// A nil finding with a nil error means the window was evaluated and is clean.
+func CheckCaptureGapStatus(ctx context.Context, db *sql.DB, schema, table string, since, until time.Time, allowGaps bool) (*CaptureGap, error) {
 	gap, err := CaptureGapStatus(ctx, db, since, until)
 	if err != nil || gap == nil {
-		return err
+		return nil, err
 	}
 	if allowGaps {
 		slog.Warn("reconstruct: "+gap.Reason()+"; output may be incomplete, proceeding due to --allow-gaps",
@@ -121,8 +137,8 @@ func CheckCaptureGap(ctx context.Context, db *sql.DB, schema, table string, sinc
 			"gap_lost_at", gap.At.UTC().Format(time.RFC3339), "detail", gap.Detail,
 			"gap_evaluable", !gap.Unevaluable,
 			"window_since", since.UTC().Format(time.RFC3339), "window_until", until.UTC().Format(time.RFC3339))
-		return nil
+		return gap, nil
 	}
-	return fmt.Errorf("reconstruct: %s for %s.%s; pass --allow-gaps to proceed with a known-incomplete reconstruction",
-		gap.Reason(), schema, table)
+	return nil, fmt.Errorf("reconstruct: %s for %s.%s; pass --allow-gaps to proceed with a known-incomplete reconstruction: %w",
+		gap.Reason(), schema, table, ErrCaptureGap)
 }

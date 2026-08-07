@@ -193,7 +193,7 @@ type Server struct {
 	// version is the running build's version string (Config.Version).
 	version string
 	cm      *connManager
-	mux              http.Handler
+	mux     http.Handler
 	// Password login: authPath is the credential file (re-read per login so a
 	// live `user set-password` applies without restart); passwordCfg is its
 	// boot-time existence, which drives the bind gate and the printed banner.
@@ -453,6 +453,7 @@ func (s *Server) buildHandler() http.Handler {
 	// listing, and the process's ambient AWS credential signals (presence
 	// booleans and non-secret names — never values).
 	api.HandleFunc("GET /api/baselines", s.handleBaselines)
+	api.HandleFunc("GET /api/views.sql", s.handleViewsSQL)
 	api.HandleFunc("GET /api/storage", s.handleStorageInfo)
 	// Usage-telemetry opt-out: read the machine-wide state, and toggle it (a
 	// local config write, not a data write). Available on any console; the UI

@@ -62,6 +62,11 @@ type capabilitiesResponse struct {
 	// baseline dir set but `bintrail snapshot` never run), where the handler
 	// degrades to Phase-1; advertising true there would over-promise.
 	RecoverCascadeBaseline bool `json:"recover_cascade_baseline"`
+	// Views: GET /api/views.sql can produce a DuckDB schema for the SELECTED
+	// server's Parquet layout. Per-server and gated exactly as the handler is
+	// (archives enabled, no active data profile, and something to describe), so
+	// the UI never offers a button that only 404s.
+	Views bool `json:"views"`
 	// BaselineTrigger: this process can create baseline snapshots in-process from
 	// the console (the watch daemon opted in with BINTRAIL_CONSOLE_BASELINE_TRIGGER=1).
 	// Process-global, like Monitor — the endpoint does the per-server validation
@@ -175,6 +180,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		// capabilities must go false for a profiled session too (#1075).
 		restricted := sessionRestricted(r)
 		resp.Reconstruct = b.baselineConfigured && !restricted
+		resp.Views = s.viewsAvailable(r, b)
 		// Match the recover-cascade handler's Phase-2 gate exactly so the advertised
 		// capability can't over-promise (handler builds the provider only when both
 		// a baseline source and a resolver are present).
