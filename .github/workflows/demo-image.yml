@@ -11,6 +11,14 @@
 # Manual runs take an explicit existing tag (workflow_dispatch input) so
 # a dispatch can never publish an unversioned branch build.
 #
+# Publish gate (#971): each arch's pushed digest is BOOTED on its native
+# runner (the `smoke` job, reusing demo/image/smoke-test.sh) before
+# `merge` tags and cosign-signs the manifest list. The build proves the
+# image compiles; the demo's real failure modes are runtime-only
+# (Percona apt drift, entrypoint ordering, ProxySQL handshake), so a
+# tag must not exist until the container has answered the acceptance
+# time-travel query on both arches.
+#
 # NOTE: like ghcr.io/dbtrail/bintrail, the bintrail-demo package is
 # created PRIVATE on first push and needs a one-time manual flip to
 # public before anonymous `docker run` works (see docs/docker.md).
@@ -114,9 +122,81 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Boot-test each arch's pushed digest on its NATIVE runner before
+  # anything is tagged or signed (#971). Reuses demo/image/smoke-test.sh
+  # (SKIP_BUILD=1 + IMAGE=<ref>@<digest>) instead of re-encoding the
+  # readiness/time-travel checks in YAML — a second copy of the same
+  # check is how guards rot. Testing the per-arch digests is equivalent
+  # to testing the final index: `imagetools create` in `merge` only
+  # assembles pointers to these same digests. Gating BEFORE merge is
+  # strictly stronger than the issue's "fail before cosign-signing":
+  # on a boot failure the version tag is never created at all.
+  smoke:
+    runs-on: ${{ matrix.runner }}
+    needs: build
+    permissions:
+      contents: read # checkout: smoke-test.sh + the demo/image/ files its static guards grep
+      packages: read # pull the per-arch image by digest from ghcr.io
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-22.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Prepare platform slug
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Same tree the build legs used (see the build job's checkout).
+          ref: ${{ inputs.tag || github.ref }}
+
+      # This leg's digest travels as the artifact's FILENAME (see the
+      # build job's "Export digest"). download-artifact fails loudly if
+      # the named artifact is missing.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Boot the pushed digest and run the smoke test
+        run: |
+          set -euo pipefail
+          # failglob: an empty digests dir aborts here (same guard as the
+          # merge job) instead of smoking a bogus ref.
+          shopt -s failglob
+          files=("${{ runner.temp }}/digests"/*)
+          [[ ${#files[@]} -eq 1 ]] || { echo "expected exactly one digest file, got ${#files[@]}: ${files[*]}"; exit 1; }
+          DIGEST="sha256:$(basename "${files[0]}")"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "unexpected digest: '$DIGEST'"; exit 1; }
+          # smoke-test.sh drives its acceptance queries with the mysql
+          # client; not every runner image ships it (arm in particular).
+          command -v mysql >/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq mysql-client
+          }
+          # SKIP_BUILD=1 runs the EXACT bytes the build leg pushed —
+          # `docker run` pulls the digest ref on its own. The script
+          # boots the container, waits for the stack, checks the
+          # telemetry guard, and asserts all three time-travel forms.
+          SKIP_BUILD=1 IMAGE="${IMAGE}@${DIGEST}" demo/image/smoke-test.sh
+
   merge:
     runs-on: ubuntu-22.04
-    needs: build
+    # smoke: no tag, no signature, unless both arches booted and served
+    # the acceptance query (#971).
+    needs: [build, smoke]
     permissions:
       packages: write # push the merged manifest list to ghcr.io
       id-token: write # cosign keyless signing via GitHub OIDC

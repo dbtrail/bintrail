@@ -90,6 +90,10 @@ docker run --rm -p 6033:6033 bintrail-demo
 `demo/image/smoke-test.sh` builds, boots, and asserts the acceptance flow
 (time-travel returns a previous `orders id=1` state distinct from the live
 row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
+CI runs this same script against each architecture's pushed image before
+a release tag is published or signed (the `smoke` job in
+`.github/workflows/demo-image.yml`), so a published demo image is one
+that has actually booted.
 
 ## Troubleshooting
 
