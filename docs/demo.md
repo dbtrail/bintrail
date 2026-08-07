@@ -91,7 +91,7 @@ docker run --rm -p 6033:6033 bintrail-demo
 (time-travel returns a previous `orders id=1` state distinct from the live
 row). It needs Docker and ~3 minutes; it is not part of `go test ./...`.
 CI runs this same script against each architecture's pushed image before
-a release tag is published or signed (the `smoke` job in
+the demo image is tagged and signed in GHCR (the `smoke` job in
 `.github/workflows/demo-image.yml`), so a published demo image is one
 that has actually booted.
 

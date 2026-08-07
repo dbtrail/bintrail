@@ -15,9 +15,11 @@
 # runner (the `smoke` job, reusing demo/image/smoke-test.sh) before
 # `merge` tags and cosign-signs the manifest list. The build proves the
 # image compiles; the demo's real failure modes are runtime-only
-# (Percona apt drift, entrypoint ordering, ProxySQL handshake), so a
-# tag must not exist until the container has answered the acceptance
-# time-travel query on both arches.
+# (Percona apt drift, entrypoint ordering, ProxySQL handshake), so the
+# GHCR image tag must not exist until the container has answered the
+# acceptance time-travel query on both arches. (The v* GIT tag triggers
+# this workflow, so it necessarily already exists — what the gate
+# withholds is the image tag and the signature.)
 #
 # NOTE: like ghcr.io/dbtrail/bintrail, the bintrail-demo package is
 # created PRIVATE on first push and needs a one-time manual flip to
@@ -56,6 +58,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Keep in sync with the `smoke` job's matrix: `merge` publishes
+        # EVERY digest artifact (pattern: digests-*), but only the
+        # platforms listed THERE get boot-tested — an arch added here
+        # alone would ship unsmoked.
         include:
           - platform: linux/amd64
             runner: ubuntu-22.04
@@ -130,16 +136,24 @@ jobs:
   # to testing the final index: `imagetools create` in `merge` only
   # assembles pointers to these same digests. Gating BEFORE merge is
   # strictly stronger than the issue's "fail before cosign-signing":
-  # on a boot failure the version tag is never created at all.
+  # on a boot failure the version IMAGE tag (:X.Y.Z / :latest) is never
+  # created at all.
   smoke:
     runs-on: ${{ matrix.runner }}
     needs: build
+    # smoke-test.sh self-bounds at ~6 min, but the ghcr pull and the
+    # docker execs are unbounded — without this, a hung pull presents
+    # as "stuck" for the 6h default while gating the publish.
+    timeout-minutes: 15
     permissions:
       contents: read # checkout: smoke-test.sh + the demo/image/ files its static guards grep
       packages: read # pull the per-arch image by digest from ghcr.io
     strategy:
       fail-fast: false
       matrix:
+        # Keep in sync with the `build` job's matrix — an arch built but
+        # not listed here would be published by `merge` without ever
+        # having booted.
         include:
           - platform: linux/amd64
             runner: ubuntu-22.04

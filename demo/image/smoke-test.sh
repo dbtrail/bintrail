@@ -95,11 +95,15 @@ log "bintrail processes: ${TOTAL:-0}, of them with DO_NOT_TRACK=1: ${GUARDED:-0}
 [ "${TOTAL:-0}" = "${GUARDED:-0}" ] \
     || { log "FAIL: $((TOTAL - GUARDED)) bintrail process(es) missing DO_NOT_TRACK=1"; exit 1; }
 
-LIVE=$(mysql_demo "SELECT status, total FROM orders WHERE id = 1")
+# `|| true` on the substitutions below: a client/shim ERROR becomes an
+# empty string so the labeled [ -n ] assertion reports it (same idiom
+# as BARE/HINT) — without it, errexit kills the script with zero
+# diagnostics, which matters now that CI gates publishing on this.
+LIVE=$(mysql_demo "SELECT status, total FROM orders WHERE id = 1" || true)
 log "live row:        ${LIVE:-<empty>}"
 [ -n "$LIVE" ] || { log "FAIL: live row missing"; exit 1; }
 
-PAST=$(mysql_demo "SELECT status, total FROM _flashback.orders AS OF '1 minute ago' WHERE id = 1")
+PAST=$(mysql_demo "SELECT status, total FROM _flashback.orders AS OF '1 minute ago' WHERE id = 1" || true)
 log "row 1 minute ago (virtual): ${PAST:-<empty>}"
 
 # The bare tagline form (#385): time-travel on the REAL table name —
