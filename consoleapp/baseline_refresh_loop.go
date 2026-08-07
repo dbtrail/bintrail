@@ -154,17 +154,23 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 		// instead of running a console with a flag that is silently inert.
 		return fmt.Errorf("internal: --baseline-refresh-interval was set without a baseline supervisor")
 	}
-	// Refuse at startup rather than discovering it a tick later: an operator who
-	// set the flag expects refreshes, and a loop that wakes up every hour to find
-	// nothing to do is indistinguishable from one that is working.
 	targets := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
-	if len(targets) == 0 {
-		return fmt.Errorf("--baseline-refresh-interval is set but no server has BOTH an index DSN and a " +
-			"LOCAL baseline directory; a refresh reads the previous snapshot and writes the new one on disk " +
-			"(an S3-only baseline destination cannot be refreshed in place)")
-	}
-
 	slog.Info("baseline refresh loop enabled", "interval", interval, "servers", len(targets))
+	if len(targets) == 0 {
+		// WARN, not a refusal — and the distinction is load-bearing. Every tick
+		// recomputes the target set, so "nothing to refresh" is a state a daemon
+		// legitimately starts in and grows out of: a source-less `watch` lists no
+		// servers at all until they are added FROM THE CONSOLE, and per-server
+		// baseline directories live in the registry, not on the command line.
+		// Refusing here would mean a compose file carrying the interval could not
+		// boot a fresh install — the operator would have to add a server through a
+		// console that is not running. The visibility this warning gives is what
+		// the refusal was actually for.
+		slog.Warn("baseline refresh: no server is refreshable yet, so nothing will run until one has BOTH an " +
+			"index DSN and a LOCAL baseline directory (a refresh reads the previous snapshot and writes the new " +
+			"one on disk; an S3-only baseline destination cannot be refreshed in place). Servers added later are " +
+			"picked up automatically.")
+	}
 	// RETENTION INTERPLAY (#616), stated at startup on purpose. A refreshed
 	// snapshot is written locally and is NOT uploaded, and baseline.PruneLocal
 	// only reclaims a snapshot whose _SUCCESS marker it can confirm in S3 — so
@@ -176,7 +182,7 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 	slog.Warn("baseline refresh: snapshots from this loop are written locally and never uploaded, so retention "+
 		"cannot reclaim them (a prune needs a confirmed S3 copy of the snapshot). Upload and prune on your own "+
 		"schedule, or size the disk for one full-table snapshot per interval.",
-		"dir", globalBaselineDir, "interval", interval)
+		"interval", interval, "dirs", refreshTargetDirs(targets))
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
@@ -216,6 +222,23 @@ func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *ba
 			slog.Debug("baseline refresh skipped this tick", "server", req.ServerName, "reason", err)
 		}
 	}
+}
+
+// refreshTargetDirs lists the directories that will grow, for the retention
+// warning. Naming globalBaselineDir instead would print "" whenever the
+// refreshable servers came from the registry — a disk-growth warning that names
+// no directory is the wrong half of the message.
+func refreshTargetDirs(targets []refreshRequest) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range targets {
+		if seen[t.BaselineDir] {
+			continue
+		}
+		seen[t.BaselineDir] = true
+		out = append(out, t.BaselineDir)
+	}
+	return out
 }
 
 func registryEntries(reg *console.Registry) []console.ServerEntry {

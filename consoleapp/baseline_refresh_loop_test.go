@@ -45,11 +45,17 @@ func TestBaselineRefreshTargets_bootNeedsBoth(t *testing.T) {
 	}
 }
 
-// TestStartBaselineRefreshLoop_refusesAtStartup: an operator who set the flag
-// expects refreshes. A loop that wakes up every hour to find nothing to do is
-// indistinguishable from one that is working, so the misconfiguration must be
-// named at startup.
-func TestStartBaselineRefreshLoop_refusesAtStartup(t *testing.T) {
+// TestStartBaselineRefreshLoop_startupContract pins WHICH startup conditions
+// refuse and which only warn — the distinction is not cosmetic.
+//
+// A malformed interval is the operator's typo and can only ever be a typo, so it
+// refuses. "No server is refreshable yet" is NOT: every tick recomputes the
+// target set, a source-less `watch` starts with no servers at all and gains them
+// from the console, and per-server baseline directories live in the registry.
+// Refusing there would mean a compose file carrying the interval cannot boot a
+// fresh install — the operator would have to add a server through a console that
+// refused to start. It warns instead.
+func TestStartBaselineRefreshLoop_startupContract(t *testing.T) {
 	ctx := context.Background()
 	sup := newBaselineSupervisor(ctx, t.TempDir(), false)
 
@@ -63,7 +69,7 @@ func TestStartBaselineRefreshLoop_refusesAtStartup(t *testing.T) {
 		{"disabled by default", sup, "", "", "", ""},
 		{"unparseable interval", sup, "sometimes", "d", "/b", "--baseline-refresh-interval"},
 		{"no supervisor wired", nil, "6h", "d", "/b", "without a baseline supervisor"},
-		{"nothing refreshable", sup, "6h", "", "", "no server has BOTH"},
+		{"nothing refreshable yet: warns, starts anyway", sup, "6h", "", "", ""},
 		{"configured", sup, "6h", "dsn", "/b", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

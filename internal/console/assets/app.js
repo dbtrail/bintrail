@@ -2229,6 +2229,10 @@ function baselinesPanel(b, servers) {
   // only meaningful here. A failed refresh is reported plainly: it usually means
   // the fold refused (a capture gap, a schema change), which is the fail-closed
   // contract working, not a broken daemon.
+  //
+  // Gated on the PAYLOAD, never on capsCache.baseline_trigger: the refresh and
+  // the mydumper dump are independently opt-in, so a refresh-only daemon reports
+  // here with baseline_trigger false, and a capability gate would render nothing.
   if (b && !b.error && b.refresh) panel.append(baselineRefreshNote(b.refresh));
   const list = el("div", { class: "stg-list" });
   if (!b || b.error) {

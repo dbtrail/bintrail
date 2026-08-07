@@ -368,7 +368,7 @@ A table with no baseline is refused rather than degraded to the binlog-only fall
 
 ### Refreshing on a schedule
 
-`bintrail-console watch --baseline-refresh-interval 12h` (env `BINTRAIL_BASELINE_REFRESH_INTERVAL`) runs the same refresh from the daemon, per monitored server, with no cron. It is **off by default** and refuses at startup when no server has both an index DSN and a local baseline directory — a loop that wakes up hourly to find nothing to do is indistinguishable from one that is working.
+`bintrail-console watch --baseline-refresh-interval 12h` (env `BINTRAIL_BASELINE_REFRESH_INTERVAL`) runs the same refresh from the daemon, per monitored server, with no cron. It is **off by default**. A malformed interval refuses at startup; a daemon with nothing refreshable yet starts and says so, because every tick re-checks — servers added from the console later are picked up automatically, and refusing would mean a compose file carrying the interval could not boot a fresh install.
 
 It is **independent of the Create-baseline button**: the refresh needs neither mydumper nor `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`, which is the whole point of it. Enabling one does not enable the other in either direction.
 
