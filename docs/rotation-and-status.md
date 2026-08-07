@@ -294,7 +294,7 @@ The status command produces a multi-section report. The sections, in order:
 | Section | Shown when | Contents |
 |---|---|---|
 | **Servers** | `bintrail_servers` has rows | Registered source servers — `bintrail_id`, host/port, server UUID, status |
-| **Stream** | `stream_state` has a checkpoint, **or** reading it failed | Replication position/GTID, events indexed, last event/checkpoint, and the **continuity verdict** (below). On a read failure the block shows only an `unavailable` verdict |
+| **Stream** | `stream_state` has a checkpoint, **or** reading it failed | Replication position/GTID, events indexed, last event/checkpoint, and the **continuity** and **freshness** verdicts (below). On a read failure the block shows only an `unavailable` verdict |
 | **Indexed Files** | always | Every row in `index_state`, with the `bintrail_id` that indexed each file |
 | **Partitions** | always | Each partition's boundary and estimated row count |
 | **Archives** | `archive_state` has data | Archived-file / S3-upload counts |
@@ -318,6 +318,7 @@ about gap-**contiguity** of the captured range; it is **not** a liveness/lag che
   Last checkpoint: 2026-02-19 10:01:12
   Server ID:       100
   Continuity:      no gaps in the captured range (not a liveness check)
+  Freshness:       current — newest indexed event is 3s old
   Capture health:  OK — no events skipped
 ```
 
@@ -342,6 +343,47 @@ When data was permanently lost, a loud banner follows the section:
 
 This banner is also how an index-only `status` surfaces a lost or invalidated
 PostgreSQL replication slot (#532) after the capture process has exited.
+
+### Stream freshness ("is capture still keeping up?")
+
+Continuity's sibling, and deliberately a different question. Continuity is about
+gap-contiguity of what was captured; freshness is the **liveness** half. Both are
+needed: a perfectly contiguous index can be three days stale, and a perfectly
+fresh one can have a hole in the middle.
+
+| Text | JSON `stream.freshness.status` | Meaning |
+|---|---|---|
+| `current — newest indexed event is Ns old` | `current` | Checkpointing **and** indexing recent events |
+| `idle — checkpointing, newest indexed event is …` | `idle` | Checkpointing, but nothing recent indexed. **Not a fault, and not a clean bill of health** — see below |
+| `⚠ STALLED — no checkpoint for …` | `stalled` | The checkpoint itself is stale. The alertable state |
+| `not evaluated (a stream row with no checkpoint …)` | `unknown` | Nothing to judge; never a false `current` |
+| *(no Stream block)* | `unavailable` / `none` | `stream_state` unreadable, or a file-mode index that ran no capture and makes no claim |
+
+The **checkpoint** is the liveness signal, not the event time: the checkpoint
+ticker runs with or **without** traffic, so a stale checkpoint means the daemon
+is dead or wedged — never that the workload went quiet.
+
+**What `idle` does and does not tell you.** From the index alone, a source
+nobody wrote to and a capture running an hour behind are the *same
+observation*: fresh checkpoint, old newest-event. Nothing in `stream_state`
+separates them, so `status` reports the ambiguity instead of guessing. The
+daemon *can* tell — that is exactly what
+`bintrail_stream_index_commit_latency_seconds` measures (see
+[observability.md](observability.md)).
+
+**`--fail-on-lag <duration>` (for CI / cron).** The freshness equivalent of
+`--fail-on-gap`, and a separate flag because the two failures are independent —
+alert on one without the other. It exits non-zero on `stalled`, on any verdict
+that is not a claim (**fails closed**), or when the newest indexed event is
+older than the duration:
+
+```bash
+bintrail status --index-dsn "$IDX" --fail-on-lag 15m || alert "dbtrail capture is behind"
+```
+
+The age check is **traffic-sensitive by construction** (see `idle` above): on a
+source with genuinely quiet periods it fires with nothing wrong. Pick a
+threshold above your quiet windows. Unset, it never changes the exit code.
 
 **`--fail-on-gap` (for CI / cron).** By default a gap **never** changes the exit
 code — `status` is a report. Pass `--fail-on-gap` to exit non-zero when continuity
@@ -521,7 +563,8 @@ bintrail status
         information_schema.PARTITIONS, archive_state, schema_changes
         (and baseline Parquet with --baseline-dir)
         prints multi-section report incl. the stream-continuity verdict
-        (--format json for machine-readable; --fail-on-gap to alert on loss)
+        (--format json for machine-readable; --fail-on-gap to alert on loss,
+        --fail-on-lag to alert on capture falling behind or stalling)
 
 bintrail query [--archive-s3 s3://...]
     └── partition pruning: only reads relevant partitions

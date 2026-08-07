@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/dbtrail/dbtrail/ext"
 )
@@ -121,16 +122,68 @@ func (s *Server) tokenMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// securityHeaders sets three static response headers on everything:
+// maxAPIBody caps authenticated JSON request bodies (#848). 1 MiB is far
+// above any legitimate console request (the largest are recover filters and
+// server CRUD payloads, well under a kilobyte) while keeping a leaked
+// automation token from buffering a multi-GB JSON string in the watch
+// daemon's heap — which shares the process with the capture stream. The
+// pre-auth login/setup bodies have their own tighter cap (maxLoginBody).
+const maxAPIBody = 1 << 20
+
+// apiGuard runs after authentication on every /api handler. It does two
+// things (#848):
+//
+//   - caps the request body at maxAPIBody, so json.Decode fails with
+//     *http.MaxBytesError on overflow (writeBodyDecodeError maps it to 413);
+//   - clears the connection read deadline armed by the server-wide
+//     ReadTimeout. That timeout exists to bound unauthenticated slow-drip
+//     connections; several authenticated handlers (recover, verify explain,
+//     reconstruct over S3 archives) legitimately run past it, and net/http's
+//     background read hitting the deadline cancels the request context
+//     mid-flight. Best-effort: recorders and non-deadline writers just skip
+//     it.
+func apiGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxAPIBody)
+		_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+		next.ServeHTTP(w, r)
+	})
+}
+
+// securityHeaders sets four static response headers on everything:
 // Referrer-Policy keeps the ?token= bootstrap URL out of Referer headers,
-// nosniff hardens the embedded assets, and DENY blocks framing the login
-// overlay (clickjacking).
+// nosniff hardens the embedded assets, DENY blocks framing the login
+// overlay (clickjacking), and the CSP freezes the frontend's no-inline-script
+// invariant structurally (#848) — app.js builds the DOM with el()/textContent
+// and never innerHTML, so even a stored-XSS payload smuggled through source
+// data (row images, schema/table names, source error messages) has no
+// executable sink, and script-src 'self' guarantees that stays true.
+//
+// The CSP value matches what the embedded frontend actually needs:
+// script-src 'self' (index.html has exactly one <script src="app.js">, no
+// inline scripts; real extension views are same-origin module imports —
+// ext.ConsoleViewProvider.Script names a URL under the provider's /ext/<ID>/
+// StaticHandler subtree) plus blob:, because dynamically minted module URLs
+// are part of the ext-view import surface (the console-e2e ext-view contract
+// stubs Script() with a blob: ES module, and an embedding build may do the
+// same to hand the SPA a module it assembled client-side). blob: is an
+// acceptable relaxation, not a hole: a blob URL can only be minted by
+// same-origin script that is ALREADY executing, so it cannot serve as an
+// initial injection vector the way 'unsafe-inline' or a remote origin could;
+// style-src needs 'unsafe-inline' (index.html carries a <style> block and
+// inline style attributes, including on the DOMParser-built SVG icons);
+// img-src needs data: (style.css embeds data:image/svg+xml select arrows);
+// frame-ancestors 'none' restates X-Frame-Options DENY for CSP-first
+// browsers.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self' blob:; style-src 'self' 'unsafe-inline'; "+
+				"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }

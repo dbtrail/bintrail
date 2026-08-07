@@ -194,6 +194,19 @@ func runShim(cmd *cobra.Command, args []string) error {
 	// below catches the more interesting case where so many tenants
 	// have unusable DSNs that the operator should notice at startup.
 	userSchemas := buildUserSchemas(tenantCfgs)
+	// Per-tenant schema allowlists (#824). Opt-in: a tenant without
+	// allowed_schemas keeps the historical any-schema behaviour, but a
+	// multi-tenant shim.yaml that leaves any tenant unrestricted means
+	// tenants can read each other's indexed history — say so once at
+	// startup instead of letting the operator discover it in an audit.
+	userAllowedSchemas := buildUserAllowedSchemas(tenantCfgs)
+	if unrestricted := tenantsWithoutAllowedSchemas(tenantCfgs); len(tenantCfgs) > 1 && len(unrestricted) > 0 {
+		slog.Warn(
+			"shim: cross-schema isolation is NOT enforced for some tenants; any of them can query every schema in the index. Add allowed_schemas to each tenant in shim.yaml to isolate them",
+			"tenants", len(tenantCfgs),
+			"unrestricted_users", unrestricted,
+		)
+	}
 	if missing := len(tenantCfgs) - len(userSchemas); missing > 0 {
 		// Name the affected users so a 50-tenant deployment doesn't
 		// force the operator to grep the prior per-tenant warnings.
@@ -341,7 +354,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("auth method: %w", err)
 	}
-	serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas, shMaxConns)
+	serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas, userAllowedSchemas, shMaxConns)
 	// Block until the monitorDeniedTicker has run its final drain.
 	// serveLoop returning means ctx is cancelled; the ticker is
 	// observing the same ctx and will hit its `case <-ctx.Done()`
@@ -366,7 +379,7 @@ func runShim(cmd *cobra.Command, args []string) error {
 // hiccup doesn't burn CPU and a permanent listener wedge doesn't fill
 // the log at ~10 lines/sec. The backoff resets to zero on every
 // successful Accept so a brief spike doesn't poison the steady state.
-func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string, maxConns int) {
+func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string, userAllowedSchemas map[string][]string, maxConns int) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
@@ -416,7 +429,7 @@ func serveLoop(ctx context.Context, listener net.Listener, db *sql.DB, srv *serv
 			if connSem != nil {
 				defer func() { <-connSem }()
 			}
-			handleConn(ctx, c, db, srv, auth, cfg, userSchemas)
+			handleConn(ctx, c, db, srv, auth, cfg, userSchemas, userAllowedSchemas)
 		}(conn)
 	}
 }
@@ -678,6 +691,37 @@ func buildUserSchemas(tenantCfgs []shim.TenantConfig) map[string]string {
 	return out
 }
 
+// buildUserAllowedSchemas maps mysql_user → allowed_schemas for the
+// tenants that opted into schema isolation (#824). Tenants without the
+// field are simply absent — handleConn's map lookup then yields nil,
+// which Handler.BindAllowedSchemas treats as unrestricted (the exact
+// pre-#824 behaviour).
+func buildUserAllowedSchemas(tenantCfgs []shim.TenantConfig) map[string][]string {
+	out := make(map[string][]string)
+	for _, t := range tenantCfgs {
+		if len(t.AllowedSchemas) > 0 {
+			out[t.MySQLUser] = t.AllowedSchemas
+		}
+	}
+	return out
+}
+
+// tenantsWithoutAllowedSchemas lists the mysql_users that have no
+// allowed_schemas allowlist. runShim warns once at startup when the
+// config has more than one tenant and this list is non-empty: in a
+// multi-tenant shim, an unrestricted tenant can read every other
+// tenant's indexed history. Pure function so the classification is
+// unit-testable without a listener.
+func tenantsWithoutAllowedSchemas(tenantCfgs []shim.TenantConfig) []string {
+	var out []string
+	for _, t := range tenantCfgs {
+		if len(t.AllowedSchemas) == 0 {
+			out = append(out, t.MySQLUser)
+		}
+	}
+	return out
+}
+
 // handleConn wraps one accepted TCP connection in go-mysql/server's
 // Conn (which performs the MySQL handshake + auth) and dispatches
 // every COM_QUERY through our Handler.
@@ -695,7 +739,7 @@ func buildUserSchemas(tenantCfgs []shim.TenantConfig) map[string]string {
 // the Handler, so a client disconnect OR a daemon shutdown cancels any
 // in-flight FetchMerged instead of letting it run to completion for a
 // reader that no longer exists.
-func handleConn(ctx context.Context, c net.Conn, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string) {
+func handleConn(ctx context.Context, c net.Conn, db *sql.DB, srv *server.Server, auth shim.TenantAuth, cfg shim.Config, userSchemas map[string]string, userAllowedSchemas map[string][]string) {
 	defer c.Close()
 
 	wc, connCtx, stop := watchConn(ctx, c)
@@ -726,8 +770,17 @@ func handleConn(ctx context.Context, c net.Conn, db *sql.DB, srv *server.Server,
 	// real per-tenant credentials, so it records its authenticated user rather
 	// than the process owner. Post-handshake: GetUser is only meaningful here.
 	handler.BindActor(mysqlConn.GetUser())
+	// Bind the tenant's allowed_schemas allowlist (#824) BEFORE seeding the
+	// default schema, so a source_dsn-derived default that the operator
+	// excluded from allowed_schemas is refused rather than silently trusted.
+	handler.BindAllowedSchemas(userAllowedSchemas[mysqlConn.GetUser()])
 	if schema, ok := userSchemas[mysqlConn.GetUser()]; ok && schema != "" {
-		_ = handler.UseDB(schema)
+		if err := handler.UseDB(schema); err != nil {
+			slog.Warn(
+				"shim: tenant's default schema (derived from source_dsn) is outside its allowed_schemas; no default schema seeded — queries from this tenant must name an allowed schema",
+				"mysql_user", mysqlConn.GetUser(), "schema", schema,
+			)
+		}
 	}
 	for {
 		if err := mysqlConn.HandleCommand(); err != nil {

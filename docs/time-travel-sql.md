@@ -182,6 +182,40 @@ Edit `shim.yaml`, uncomment the two TODO lines, and paste the values:
 
 > **Auth note**: both `bintrail shim` and ProxySQL validate the application's password against the same `mysql_password`. The default is `mysql_native_password`; `caching_sha2_password` is opt-in via `--auth-method` (see Step 4). The shim's listen address defaults to `127.0.0.1:3308` so it is not reachable from the network. Treat `shim.yaml` as you'd treat `.bintrail.env` — it contains a password and ships at 0o600.
 
+### Isolating tenants with `allowed_schemas`
+
+Authentication alone does not scope what a tenant can *query*: the shim answers
+every time-travel query from one shared index, so in a multi-tenant `shim.yaml`
+any authenticated tenant could `USE` (or fully qualify) another tenant's schema
+and read its entire indexed history — including deleted rows.
+
+Add the optional `allowed_schemas` list to each tenant to enforce isolation:
+
+```yml
+tenants:
+  - mysql_user: app_a
+    mysql_password: '...'
+    source_dsn: 'a:pw@tcp(db-a:3306)/app_a'
+    allowed_schemas: [app_a]
+  - mysql_user: app_b
+    mysql_password: '...'
+    source_dsn: 'b:pw@tcp(db-b:3306)/app_b'
+    allowed_schemas: [app_b, app_b_audit]
+```
+
+With `allowed_schemas` set, a `USE` of — or any time-travel query resolving to
+— a schema outside the list is rejected with MySQL error 1044
+(`ER_DBACCESS_DENIED_ERROR`), the same code a real mysqld returns for a
+database the user has no grants on. The check applies to every statement
+shape, including fully qualified forms that never issue `USE`
+(`SELECT /*+ DBTRAIL_AT='…' */ * FROM other_schema.t`). Schema names are
+matched case-insensitively.
+
+The field is **opt-in**: a tenant without it keeps the historical
+any-schema behaviour, so existing configs are unaffected. When `shim.yaml`
+has more than one tenant and any of them lacks `allowed_schemas`, the shim
+logs a startup warning that cross-schema isolation is not enforced.
+
 ---
 
 ## Step 2 — Install ProxySQL

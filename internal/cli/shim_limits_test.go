@@ -267,7 +267,7 @@ func TestShim_ShutdownCancelsInFlightFetch(t *testing.T) {
 	go func() {
 		defer close(done)
 		serveLoop(ctx, listener, db, srv, auth, cfg,
-			map[string]string{"tenant_a": "myapp"}, 0)
+			map[string]string{"tenant_a": "myapp"}, nil, 0)
 	}()
 
 	client, err := sql.Open("mysql", "tenant_a:pw@tcp("+listener.Addr().String()+")/?timeout=2s&readTimeout=60s")

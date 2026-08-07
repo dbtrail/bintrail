@@ -78,7 +78,7 @@ func (s *Server) handleRotationUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	var req rotationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeBodyDecodeError(w, err)
 		return
 	}
 	retain := strings.TrimSpace(req.Retain)

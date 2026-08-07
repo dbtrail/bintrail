@@ -28,6 +28,26 @@ type BaselineController interface {
 	Status(serverID string) BaselineStatus
 }
 
+// BaselineRefreshReporter reports the daemon's periodic baseline refresh
+// (#1171). Deliberately a SEPARATE interface from BaselineController, wired from
+// a separate Config field, because the two features are independently opt-in:
+// the manual dump needs mydumper and BINTRAIL_CONSOLE_BASELINE_TRIGGER=1, while
+// a refresh needs neither — it exists precisely so a fresher baseline does not
+// require a dump. Folding the report into BaselineController would gate the
+// refresh behind the dump's opt-in, or (worse) un-gate the Create-baseline
+// button for anyone who enabled only the refresh.
+//
+// nil when the daemon runs no refresh loop.
+type BaselineRefreshReporter interface {
+	// RefreshStatus reports the latest periodic refresh for a server, or state
+	// "idle" when none has run here. Kept apart from BaselineController.Status
+	// because the two answer different questions — "did my dump work" and "is my
+	// baseline still moving forward on its own" — and one shared slot would let
+	// a manual dump erase the evidence that the automatic refresh has been
+	// failing for a week.
+	RefreshStatus(serverID string) BaselineStatus
+}
+
 // BaselineRequest is the in-process job description the endpoint hands the
 // controller. The source DSN (a secret) stays inside the process — it is never
 // written to disk or serialized to any HTTP response.
@@ -66,6 +86,11 @@ type BaselineStatus struct {
 	Tables     int    `json:"tables,omitempty"`
 	Rows       int64  `json:"rows,omitempty"`
 	Uploaded   int    `json:"uploaded,omitempty"`
+	// Refused counts tables a refresh declined to fold (gap / schema change).
+	// A refresh that refuses every table is not a failure of the daemon — it is
+	// a correct fail-closed verdict — so it reports succeeded=false with this
+	// count rather than an opaque error.
+	Refused int `json:"refused,omitempty"`
 }
 
 // handleBaselineTrigger enqueues an in-process baseline for the selected server.

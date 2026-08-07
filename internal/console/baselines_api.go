@@ -47,11 +47,26 @@ type baselinesResponse struct {
 	Reconstruct bool                  `json:"reconstruct"`
 	Snapshots   []baselineSnapshotDTO `json:"snapshots"`
 	Truncated   bool                  `json:"truncated,omitempty"`
+	// Refresh is the daemon's last PERIODIC baseline refresh for this server
+	// (#1171), omitted when the daemon does not run one. It belongs in the
+	// listing rather than in a status endpoint of its own because the question
+	// it answers — "is this snapshot list going to keep moving on its own?" — is
+	// only meaningful next to the list.
+	Refresh *BaselineStatus `json:"refresh,omitempty"`
 	// Staleness is the panel headline: the worst verdict across each table's
 	// NEWEST snapshot (#1193). An old superseded snapshot being past coverage
 	// is routine — grading every row red on a healthy retention cadence would
 	// cry wolf, so the per-row verdicts inform and this field decides.
 	Staleness string `json:"staleness,omitempty"`
+}
+
+// selectedServerID is the id the request selected, defaulting to the reserved
+// boot entry — the same rule the rest of the handler uses.
+func selectedServerID(r *http.Request) string {
+	if id := r.Header.Get("X-Bintrail-Server"); id != "" {
+		return id
+	}
+	return "default"
 }
 
 // handleBaselines serves GET /api/baselines: a read-only listing of the
@@ -75,6 +90,11 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := baselinesResponse{Reconstruct: b.baselineConfigured, Snapshots: []baselineSnapshotDTO{}}
+	if s.baselineRefresh != nil {
+		if st := s.baselineRefresh.RefreshStatus(selectedServerID(r)); st.State != "idle" {
+			resp.Refresh = &st
+		}
+	}
 	if b.baselineSrc == "" {
 		writeJSON(w, http.StatusOK, resp)
 		return

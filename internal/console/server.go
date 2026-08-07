@@ -90,6 +90,13 @@ type Config struct {
 	// where the trigger endpoint refuses with 403 and /api/capabilities reports
 	// baseline_trigger:false. Set together with MonitorCtrl (both control-plane).
 	BaselineCtrl BaselineController
+	// BaselineRefresh reports the daemon's PERIODIC baseline refresh (#1171).
+	// Wired in ONLY by `bintrail-console watch --baseline-refresh-interval`, and
+	// deliberately a separate field from BaselineCtrl because the two features
+	// are independently opt-in — the refresh needs no mydumper and no
+	// BINTRAIL_CONSOLE_BASELINE_TRIGGER=1. nil when no refresh loop runs, and the
+	// baseline listing then simply carries no refresh section.
+	BaselineRefresh BaselineRefreshReporter
 	// VerifyCtrl runs bintrail verify's engine in-process for a monitored
 	// server (#677). Wired in ONLY by `bintrail-console watch` when the
 	// operator opts in (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1); nil otherwise,
@@ -186,6 +193,9 @@ type Server struct {
 	// baselineCtrl: non-nil only when the watch daemon opted into in-process
 	// baseline creation (see Config.BaselineCtrl).
 	baselineCtrl BaselineController
+	// baselineRefresh: non-nil only when the watch daemon opted into the
+	// periodic refresh (see Config.BaselineRefresh).
+	baselineRefresh BaselineRefreshReporter
 	// verifyCtrl: non-nil only when the watch daemon opted into in-process
 	// verify runs (see Config.VerifyCtrl).
 	verifyCtrl VerifyController
@@ -361,6 +371,7 @@ func New(cfg Config) (*Server, error) {
 		allowedHosts:     cfg.AllowedHosts,
 		monitorCtrl:      cfg.MonitorCtrl,
 		baselineCtrl:     cfg.BaselineCtrl,
+		baselineRefresh:  cfg.BaselineRefresh,
 		verifyCtrl:       cfg.VerifyCtrl,
 		verifyHistory:    cfg.VerifyHistory,
 		telemetry:        cfg.Telemetry,
@@ -558,7 +569,7 @@ func (s *Server) buildHandler() http.Handler {
 	// authorization (authzMiddleware). authz is inert for policy-less sessions —
 	// the static token, the password login, and every OSS session — so this only
 	// enforces when an EE build attaches a policy via the session-issuer seam.
-	root.Handle("/api/", s.tokenMiddleware(s.authzMiddleware(api)))
+	root.Handle("/api/", s.tokenMiddleware(s.authzMiddleware(apiGuard(api))))
 	// MCP endpoint (#1039): the read-only tools over Streamable HTTP,
 	// token-authenticated (static or UI-managed — #1052), routed per server
 	// by URL path. Carries its own auth check (tokens only, no sessions —
@@ -614,17 +625,39 @@ func (s *Server) Listen() (net.Listener, error) {
 	return net.Listen("tcp", s.listen)
 }
 
+// httpServer builds the http.Server Serve runs. Split out so tests can assert
+// the timeout posture without binding a socket.
+//
+// ReadTimeout bounds a slow-dripped request from an unauthenticated client
+// (slowloris): MaxBytesReader caps body SIZE, not time, so without it a
+// 1-byte-per-minute POST to /api/auth/login would pin a goroutine and an fd
+// forever (#848). Authenticated surfaces that legitimately outlive it — the
+// /api handlers (recover/verify/reconstruct can run long against S3 archives)
+// and /mcp (hanging streamable-HTTP SSE GETs) — clear the connection read
+// deadline once the credential has been verified (see apiGuard and
+// mcpHandler); pre-auth traffic keeps the full deadline.
+//
+// WriteTimeout is deliberately absent: it is a whole-response deadline, and
+// it would sever exactly those long responses and /mcp SSE streams mid-write.
+// IdleTimeout only reaps keep-alive connections BETWEEN requests, so it is
+// safe everywhere.
+func (s *Server) httpServer() *http.Server {
+	return &http.Server{
+		Handler:           s.mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		TLSConfig:         s.tlsConf,
+	}
+}
+
 // Serve serves on ln and blocks until ctx is cancelled, then shuts the server
 // down gracefully (5s drain). It takes ownership of ln (Shutdown closes it).
 // Lazily-opened registry connections are closed on the way out; the boot
 // entry's db belongs to the cmd layer and its deferred Close.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	defer s.cm.CloseAll()
-	srv := &http.Server{
-		Handler:           s.mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		TLSConfig:         s.tlsConf,
-	}
+	srv := s.httpServer()
 
 	errCh := make(chan error, 1)
 	go func() {

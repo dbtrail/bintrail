@@ -40,6 +40,10 @@ type baselineSupervisor struct {
 
 	mu   sync.Mutex
 	jobs map[string]*console.BaselineStatus
+	// refreshes tracks the PERIODIC refresh jobs (#1171), kept apart from jobs
+	// so a manual dump cannot erase the evidence that the automatic refresh has
+	// been failing. Both share the single-flight (busyLocked).
+	refreshes map[string]*console.BaselineStatus
 }
 
 // newBaselineSupervisor builds a supervisor bound to the daemon context. The
@@ -51,6 +55,7 @@ func newBaselineSupervisor(ctx context.Context, stagingDir string, pointConsiste
 		stagingDir:      stagingDir,
 		pointConsistent: pointConsistent,
 		jobs:            make(map[string]*console.BaselineStatus),
+		refreshes:       make(map[string]*console.BaselineStatus),
 	}
 }
 
@@ -58,7 +63,10 @@ func newBaselineSupervisor(ctx context.Context, stagingDir string, pointConsiste
 // if one is already in flight for this server.
 func (s *baselineSupervisor) Trigger(req console.BaselineRequest) error {
 	s.mu.Lock()
-	if st, ok := s.jobs[req.ServerID]; ok && st.State == "running" {
+	// Shared with the periodic refresh (#1171): a dump writing a new snapshot
+	// while a refresh folds the newest one forward would leave the refresh
+	// anchored on a snapshot being written underneath it.
+	if s.busyLocked(req.ServerID) {
 		s.mu.Unlock()
 		return console.ErrBaselineRunning
 	}

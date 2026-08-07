@@ -58,7 +58,7 @@ func init() {
 	baselineCmd.Flags().StringVar(&bslBaselineRetain, "baseline-retain", "", "Prune local snapshots older than this (Nd/Nh) once a durable S3 copy exists (requires --upload; never deletes the only copy or the newest snapshot per table)")
 	baselineCmd.Flags().StringVar(&bslFormat, "format", "text", "Output format: text or json")
 	baselineCmd.Flags().BoolVar(&bslRetry, "retry", false, "Skip tables whose output Parquet file already exists and S3 objects that were already uploaded")
-	baselineCmd.Flags().BoolVar(&bslEncrypt, "encrypt", false, "Decrypt encrypted dump files before processing (requires openssl on $PATH)")
+	baselineCmd.Flags().BoolVar(&bslEncrypt, "encrypt", false, "Decrypt encrypted dump files before processing, verifying each file's .enc.hmac integrity sidecar first (requires openssl on $PATH)")
 	baselineCmd.Flags().StringVar(&bslEncryptKey, "encrypt-key", "", "Path to encryption key file (default: ~/.config/bintrail/dump.key)")
 	_ = baselineCmd.MarkFlagRequired("input")
 	_ = baselineCmd.MarkFlagRequired("output")
@@ -222,10 +222,24 @@ func resolveBaselineRetain(retainRaw, upload string) (retain time.Duration, doPr
 // decryptDumpFiles walks inputDir and decrypts every .enc file using openssl,
 // writing the decrypted output alongside with the .enc extension stripped.
 // Returns a cleanup function that removes the decrypted files.
+//
+// Before decrypting each file it verifies the HMAC-SHA256 sidecar written by
+// `bintrail dump --encrypt` (#960): CBC gives no authentication, so a tampered
+// or bit-rotted .enc would otherwise decrypt into garbled SQL that flows
+// silently into the baseline. A sidecar mismatch is a hard error and the file
+// is never handed to openssl; a MISSING sidecar (legacy pre-sidecar dump) only
+// warns, so existing dumps keep working. The `.enc.hmac` sidecars themselves
+// do not end in ".enc" and are skipped by the walk.
 func decryptDumpFiles(inputDir, keyPath string) (func(), error) {
 	absKey, err := filepath.Abs(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve key path: %w", err)
+	}
+
+	// Raw key bytes double as the HMAC key. Read in-process — never on argv.
+	hmacKey, err := readHMACKey(absKey)
+	if err != nil {
+		return nil, err
 	}
 
 	entries, err := os.ReadDir(inputDir)
@@ -246,6 +260,16 @@ func decryptDumpFiles(inputDir, keyPath string) (func(), error) {
 		}
 		encPath := filepath.Join(inputDir, e.Name())
 		outPath := strings.TrimSuffix(encPath, ".enc")
+
+		hadSidecar, verr := verifyEncFileHMAC(encPath, hmacKey)
+		if verr != nil {
+			cleanup()
+			return nil, verr
+		}
+		if !hadSidecar {
+			slog.Warn("no .hmac sidecar for encrypted dump file — legacy unauthenticated dump, integrity cannot be verified",
+				"file", e.Name())
+		}
 
 		cmd := exec.Command("openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2",
 			"-pass", "file:"+absKey, "-in", encPath, "-out", outPath)

@@ -79,6 +79,7 @@ var (
 	upConsoleBaselineDir    string
 	upConsoleBaselineS3     string
 	upConsoleBaselineRetain string
+	upBaselineRefreshEvery  string
 	upConsoleServersFile    string
 	upConsoleAuthFile       string
 	upConsoleTLSCert        string
@@ -210,6 +211,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Opt-in static token for API automation (never generated; humans use the console password)")
 	watchCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface")
 	watchCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
+	watchCmd.Flags().StringVar(&upBaselineRefreshEvery, "baseline-refresh-interval", "", "Periodically refresh each server's newest baseline snapshot from the index (Nh/Nd; default: off). Runs with the conservative DuckDB budget and never publishes over a known capture gap.")
 	watchCmd.Flags().StringVar(&upConsoleBaselineRetain, "baseline-retain", "", "Periodically prune local --baseline-dir snapshots older than this (Nd/Nh) once a durable copy exists in --baseline-s3 (never deletes the only copy or the newest snapshot per table)")
 	watchCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML (default ~/.config/bintrail/console-servers.yaml)")
 	watchCmd.Flags().StringVar(&upConsoleAuthFile, "console-auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
@@ -423,8 +425,23 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
+	// One supervisor, TWO independently opt-in features: the manual dump-based
+	// baseline trigger (#613, needs mydumper and BINTRAIL_CONSOLE_BASELINE_TRIGGER=1)
+	// and the periodic refresh (#1171, needs neither — it exists precisely so a
+	// fresher baseline does not require a dump). Build it when EITHER is asked
+	// for, but wire the two Config fields separately: assigning cfg.BaselineCtrl
+	// un-gates the Create-baseline button, so deriving one from the other would
+	// either refuse to start a refresh-only daemon or silently switch on a
+	// feature the operator did not enable.
+	var baselineSup *baselineSupervisor
+	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
+		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
+	}
 	if upConsoleBaselineTrigger {
-		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
+		cfg.BaselineCtrl = baselineSup
+	}
+	if upBaselineRefreshEvery != "" {
+		cfg.BaselineRefresh = baselineSup
 	}
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {
@@ -456,6 +473,12 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
 	// the global --baseline-dir plus every registry server's per-server dir.
 	if err := startBaselinePruneLoop(ctx, registry, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
+		return err
+	}
+
+	// Keep each server's newest snapshot moving forward from the index alone
+	// (#1171). Opt-in, and refused at startup when nothing can be refreshed.
+	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery); err != nil {
 		return err
 	}
 
@@ -593,8 +616,23 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// the HTTP requests that start them.
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
+	// One supervisor, TWO independently opt-in features: the manual dump-based
+	// baseline trigger (#613, needs mydumper and BINTRAIL_CONSOLE_BASELINE_TRIGGER=1)
+	// and the periodic refresh (#1171, needs neither — it exists precisely so a
+	// fresher baseline does not require a dump). Build it when EITHER is asked
+	// for, but wire the two Config fields separately: assigning cfg.BaselineCtrl
+	// un-gates the Create-baseline button, so deriving one from the other would
+	// either refuse to start a refresh-only daemon or silently switch on a
+	// feature the operator did not enable.
+	var baselineSup *baselineSupervisor
+	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
+		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
+	}
 	if upConsoleBaselineTrigger {
-		cfg.BaselineCtrl = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselinePointConsistent)
+		cfg.BaselineCtrl = baselineSup
+	}
+	if upBaselineRefreshEvery != "" {
+		cfg.BaselineRefresh = baselineSup
 	}
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {
@@ -625,6 +663,12 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// Reclaim local baseline snapshots that already have a durable S3 copy (#616):
 	// the global --baseline-dir plus every registry server's per-server dir.
 	if err := startBaselinePruneLoop(ctx, registry, upConsoleBaselineDir, upConsoleBaselineS3, upConsoleBaselineRetain, upRotationCfg.Interval); err != nil {
+		return err
+	}
+
+	// Keep each server's newest snapshot moving forward from the index alone
+	// (#1171). Opt-in, and refused at startup when nothing can be refreshed.
+	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery); err != nil {
 		return err
 	}
 
@@ -783,6 +827,11 @@ func resolveUpConsoleEnv(cmd *cobra.Command) {
 	if !cmd.Flags().Changed("baseline-retain") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_RETAIN"); v != "" {
 			upConsoleBaselineRetain = v
+		}
+	}
+	if !cmd.Flags().Changed("baseline-refresh-interval") {
+		if v := os.Getenv("BINTRAIL_BASELINE_REFRESH_INTERVAL"); v != "" {
+			upBaselineRefreshEvery = v
 		}
 	}
 	if !cmd.Flags().Changed("console-servers-file") {

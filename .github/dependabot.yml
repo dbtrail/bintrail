@@ -1,0 +1,10 @@
+# Keep the SHA-pinned actions in .github/workflows/ receiving update PRs.
+# Actions are pinned to full commit SHAs (immutable — a hijacked tag can't
+# swap the code we run); Dependabot understands the `sha # vX.Y.Z` comment
+# convention and bumps both together.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
