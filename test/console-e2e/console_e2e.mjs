@@ -67,15 +67,24 @@ try {
     ? ok("sidebar: running version shown")
     : bad("sidebar: running version shown", `label=${JSON.stringify(sideVer.label)} want=${JSON.stringify(wantVer)} (capabilities version=${JSON.stringify(sideVer.reported)})`);
 
-  // Scenario 0c — the two degraded shapes, driven through the REAL function
-  // (same technique as the ext-view scenarios below: stub capsCache, call the
-  // production code, read the DOM). `version` is omitempty, so an unversioned
-  // build sends no key at all — that must read "dev", never "" or "vundefined".
-  // A FAILED capabilities fetch is a different state: it must keep the "—"
-  // placeholder rather than report "dev" for a build it never read.
+  // Scenario 0c — the shapes the live daemon cannot produce, driven through the
+  // REAL function (same technique as the ext-view scenarios below: stub
+  // capsCache, call the production code, read the DOM). This harness builds
+  // without -ldflags, so 0b above only ever exercises the "dev" branch — the
+  // released-build expectation has to come from a FIXED input with a HARDCODED
+  // expectation, or a double-"v" or a broken anchor ships green. The other two:
+  // `version` is omitempty, so an unversioned build sends no key at all and must
+  // read "dev", never "" or "vundefined"; a FAILED capabilities fetch is a
+  // different state and must keep the "—" placeholder rather than report "dev"
+  // for a build it never read.
+  // Must stay AHEAD of the ext-view scenarios: scenario 10 re-runs the real
+  // gateCapabilities() against a stub with no `version`, repainting this row.
   const degraded = await page.evaluate(() => {
     const keep = capsCache.version;
     const read = () => (document.querySelector("#meta-version b") || {}).textContent;
+    capsCache.version = "1.2.3";
+    updateSideVersion(true);
+    const semver = read();
     delete capsCache.version;
     updateSideVersion(true);
     const unversioned = read();
@@ -83,8 +92,11 @@ try {
     const unknown = read();
     capsCache.version = keep;
     updateSideVersion(true);
-    return { unversioned, unknown, restored: read() };
+    return { semver, unversioned, unknown, restored: read() };
   });
+  degraded.semver === "v1.2.3"
+    ? ok("sidebar: a released version renders as vX.Y.Z")
+    : bad("sidebar: a released version renders as vX.Y.Z", `got ${JSON.stringify(degraded.semver)} for capabilities version "1.2.3"`);
   degraded.unversioned === "dev"
     ? ok("sidebar: unversioned build falls back to 'dev'")
     : bad("sidebar: unversioned build falls back to 'dev'", `got ${JSON.stringify(degraded.unversioned)}`);
