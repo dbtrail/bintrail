@@ -173,6 +173,12 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 	// see the file parser's currentQueryText for the full contract.
 	var currentQueryText string
 
+	// em is the stamped way out (#1223 T1). It is REBUILT on every delivered
+	// binlog event, just below, so each emitted row carries the time go-mysql
+	// handed us the event it came from. The closures below close over the
+	// variable, not over a value, so they always send through the current stamp.
+	var em emitter
+
 	// emitCommit signals a transaction commit boundary so the stream consumer can
 	// advance the durable GTID checkpoint only after the transaction's rows have
 	// been received (#491). It commits the in-flight transaction (currentGTID) and
@@ -191,13 +197,11 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			GTID:       currentGTID,
 			EventType:  EventCommit,
 		}
-		select {
-		case out <- commitEv:
-			currentGTID = "" // committed; the next-GTID fallback must not re-commit it
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		if err := em.send(ctx, commitEv); err != nil {
+			return err
 		}
+		currentGTID = "" // committed; the next-GTID fallback must not re-commit it
+		return nil
 	}
 
 	// emitGTIDTracking emits an EventGTID for the in-flight currentGTID so the
@@ -215,12 +219,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			GTID:       currentGTID,
 			EventType:  EventGTID,
 		}
-		select {
-		case out <- gtidEv:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return em.send(ctx, gtidEv)
 	}
 
 	// handleEvent processes one binlog event. It is recursive: with
@@ -372,10 +371,8 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 						return fmt.Errorf("sync DDL hook: %w", err)
 					}
 				}
-				select {
-				case out <- ddlEv:
-				case <-ctx.Done():
-					return ctx.Err()
+				if err := em.send(ctx, ddlEv); err != nil {
+					return err
 				}
 				// Table DDL auto-commits its own GTID; EventDDL is the commit
 				// boundary the consumer acts on, so clear the in-flight GTID to keep
@@ -446,7 +443,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			// nil gapTracker: the stream keeps its warn-and-continue skip
 			// behavior (the synchronous DDL hook, SetSyncDDLHook, is the
 			// stream's post-DDL correctness mechanism, not file-level failure).
-			err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, sp.schemaVersion.Load(), out, nil, sp.skips)
+			err := handleRows(ctx, sp.logger, sp.resolver.Load(), &sp.filters, binlogEv, ev, currentFile, currentGTID, currentConnectionID, currentCommitTsUS, currentQueryText, sp.schemaVersion.Load(), em, nil, sp.skips)
 			// Statement boundary — see the file parser's RowsEvent case: the
 			// STMT_END_F clear prevents a ROWS_QUERY-less later statement in
 			// the same transaction from inheriting this statement's text.
@@ -488,6 +485,13 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			}
 			return err
 		}
+
+		// T1 (#1223): the moment the replication client delivered this event.
+		// Everything emitted while handling it carries this stamp — taken HERE
+		// and not where the consumer receives off `out`, because `out` is
+		// buffered and a receive-side stamp would swallow the queue wait, which
+		// is the largest part of the lag precisely when the indexer is behind.
+		em = emitter{ch: out, readAt: time.Now()}
 
 		if err := handleEvent(binlogEv); err != nil {
 			if ctx.Err() != nil {

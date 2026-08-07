@@ -59,6 +59,48 @@ var (
 		Help:      "Seconds between now and the timestamp of the last processed binlog event.",
 	}, []string{"source"})
 
+	// streamIndexCommitLatency is T2−T1 (#1223): the seconds between the
+	// replication client delivering an event and that event being committed to
+	// the index — i.e. how long a change existed but was NOT yet queryable or
+	// recoverable. Both ends are the same process's clock, so it is skew-free
+	// and sub-second-accurate, which is why it and not the availability gauge is
+	// the metric to alert on. Observed PER EVENT: the point of a histogram here
+	// is the tail (the slowest event in a batch is the one that defines the real
+	// RPO), and a per-flush maximum would hide how many events waited.
+	streamIndexCommitLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "bintrail",
+		Subsystem: "stream",
+		Name:      "index_commit_latency_seconds",
+		Help:      "Seconds from replication read to the event being committed to the index (queryable/recoverable).",
+		Buckets:   prometheus.ExponentialBuckets(0.005, 2, 14), // 5ms … ~40s
+	}, []string{"source"})
+
+	// streamAvailabilityLag is T2−T0: source commit → queryable, the effective
+	// RPO. APPROXIMATE by construction — it subtracts the SOURCE's clock from
+	// the local one, so it carries any skew between them, and the binlog header
+	// timestamp it starts from has one-SECOND resolution. Negatives (a source
+	// clock ahead of ours) are clamped to 0 rather than reported: a negative
+	// availability lag is not a real state and would poison a rate/avg panel.
+	streamAvailabilityLag = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "bintrail",
+		Subsystem: "stream",
+		Name:      "availability_lag_seconds",
+		Help:      "Approximate seconds from source commit to queryable in the index (crosses source and local clocks; 1s source resolution; clamped at 0).",
+	}, []string{"source"})
+
+	// streamLastFlushTimestamp exists because every gauge above is only moved BY
+	// TRAFFIC: under an idle source they all freeze at their last value and a
+	// dashboard reads "caught up" forever, including when the stream died. Alert
+	// on `time() - bintrail_stream_last_flush_timestamp_seconds` instead, and use
+	// checkpoint recency (the checkpoint ticker runs with or without traffic) to
+	// tell IDLE from STALLED.
+	streamLastFlushTimestamp = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "bintrail",
+		Subsystem: "stream",
+		Name:      "last_flush_timestamp_seconds",
+		Help:      "Unix timestamp of the last batch successfully committed to the index.",
+	}, []string{"source"})
+
 	streamErrors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "bintrail",
 		Subsystem: "stream",
@@ -107,12 +149,23 @@ type StreamMetrics struct {
 	BatchFlushes       prometheus.Counter
 	CheckpointSaves    prometheus.Counter
 	LastEventTimestamp prometheus.Gauge
-	ReplicationLag     prometheus.Gauge
+	// ReplicationLag keeps its RECEIVE-time semantics (source commit → read off
+	// the stream channel), deliberately unchanged: it is set before batching, so
+	// it can read "caught up" while events sit in an unflushed batch. The
+	// commit-side handles below are what close that window; existing dashboards
+	// built on this gauge keep meaning what they meant.
+	ReplicationLag prometheus.Gauge
+	// AvailabilityLag and LastFlushTimestamp are COMMIT-side (#1223): set only
+	// after a batch is durably in the index.
+	AvailabilityLag    prometheus.Gauge
+	LastFlushTimestamp prometheus.Gauge
 	// Errors keeps its remaining "type" dimension (batch_flush, checkpoint,
 	// gtid_update).
 	Errors *prometheus.CounterVec
 	// BatchSize is the per-source histogram handle.
 	BatchSize prometheus.Observer
+	// IndexCommitLatency is the per-source read→queryable histogram handle.
+	IndexCommitLatency prometheus.Observer
 }
 
 // ForSource returns the stream metrics curried to the given source label.
@@ -129,8 +182,11 @@ func ForSource(source string) *StreamMetrics {
 		CheckpointSaves:    streamCheckpointSaves.WithLabelValues(source),
 		LastEventTimestamp: streamLastEventTimestamp.WithLabelValues(source),
 		ReplicationLag:     streamReplicationLag.WithLabelValues(source),
+		AvailabilityLag:    streamAvailabilityLag.WithLabelValues(source),
+		LastFlushTimestamp: streamLastFlushTimestamp.WithLabelValues(source),
 		Errors:             streamErrors.MustCurryWith(prometheus.Labels{"source": source}),
 		BatchSize:          streamBatchSize.WithLabelValues(source),
+		IndexCommitLatency: streamIndexCommitLatency.WithLabelValues(source),
 	}
 }
 

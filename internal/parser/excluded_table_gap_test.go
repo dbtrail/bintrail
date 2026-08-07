@@ -53,7 +53,7 @@ func TestHandleRows_validationExcludedTableFileMode(t *testing.T) {
 		tracker := &schemaGapTracker{}
 		out := make(chan Event, 4)
 		err := handleRows(context.Background(), newTestLogger(&logBuf), excludedScratchResolver(snapT),
-			&Filters{}, ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, out, tracker, nil)
+			&Filters{}, ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, emitTo(out), tracker, nil)
 		close(out)
 		if err != nil {
 			t.Fatalf("handleRows returned a hard error on an excluded-table skip: %v", err)
@@ -85,7 +85,7 @@ func TestHandleRows_validationExcludedTableFileMode(t *testing.T) {
 		tracker := &schemaGapTracker{}
 		out := make(chan Event, 4)
 		err := handleRows(context.Background(), newTestLogger(&bytes.Buffer{}), excludedScratchResolver(snapT),
-			&Filters{}, ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, out, tracker, nil)
+			&Filters{}, ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, emitTo(out), tracker, nil)
 		close(out)
 		if err != nil {
 			t.Fatalf("handleRows: %v", err)
@@ -110,7 +110,7 @@ func TestHandleRows_validationExcludedTableFileMode(t *testing.T) {
 		tracker := &schemaGapTracker{}
 		out := make(chan Event, 4)
 		err := handleRows(context.Background(), newTestLogger(&logBuf), excludedScratchResolver(snapT),
-			&Filters{}, ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, out, tracker, skips)
+			&Filters{}, ev, rowsEv, "binlog.000007", "", 0, 0, "", 9, emitTo(out), tracker, skips)
 		close(out)
 		if err != nil {
 			t.Fatalf("handleRows: %v", err)

@@ -127,6 +127,23 @@ type Event struct {
 	// "invalid table id, no corresponding table map event" (#775). Transient:
 	// never written to binlog_events.
 	StmtEnd bool
+	// ReadAt is when the replication client delivered the binlog event this row
+	// came out of — T1 in the availability-lag design (#1223). Transient: it is
+	// in-memory only, never written to binlog_events and never to the archive
+	// Parquet, so nothing about it is a persistence contract.
+	//
+	// It is stamped at the PARSER, deliberately, not where the stream consumer
+	// receives the event off the channel: the channel is buffered, so a consumer
+	// stamp would fold the queue wait into T1 and hide exactly the backlog that
+	// T2−T1 exists to measure — when the indexer falls behind, that wait IS the
+	// lag.
+	//
+	// ZERO on the file path (`bintrail index`) and on any consumer that builds
+	// events itself: lag is meaningless for backfill re-indexing. Consumers must
+	// SKIP the observation on zero rather than observing a 0-second latency — a
+	// fabricated zero reads as "perfectly fresh", the most misleading value this
+	// field could produce.
+	ReadAt time.Time
 }
 
 // Filters controls which schemas and tables produce events.

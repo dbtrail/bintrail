@@ -1469,6 +1469,14 @@ func streamLoop(
 		state.eventsIndexed += n
 		m.EventsIndexed.Add(float64(n))
 		m.BatchFlushes.Inc()
+		if err == nil {
+			// T2 (#1225): the batch is durable, so its events are queryable and
+			// recoverable NOW. Only on success — a failed InsertBatch may have
+			// written some rows, but nothing about that partial state is an
+			// availability guarantee worth publishing. Read the batch before the
+			// truncation below.
+			observeCommitLag(m, batch, time.Now())
+		}
 		batch = batch[:0]
 		if err != nil {
 			m.Errors.WithLabelValues("batch_flush").Inc()

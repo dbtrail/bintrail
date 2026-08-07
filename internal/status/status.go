@@ -697,6 +697,12 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		default:
 			fmt.Fprintln(w, "  Continuity:      no gaps in the captured range (not a liveness check)")
 		}
+		// Freshness (#1226) — the liveness half Continuity explicitly is not.
+		// Continuity answers "did I lose events inside what I captured?"; this
+		// answers "is capture still keeping up?". A contiguous index can be three
+		// days stale and a fresh one can have a hole, so neither substitutes for
+		// the other.
+		writeFreshness(w, stream, nil, time.Now())
 		// Capture health (#1034) — the continuity verdict's sibling for
 		// IN-STREAM discards: events the daemon read and chose to drop (e.g.
 		// the column-count guard rejecting every row against a stale snapshot)
@@ -1080,6 +1086,18 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 	type jsonContinuity struct {
 		Status string `json:"status"`
 	}
+	// jsonFreshness is the always-present LIVENESS verdict (#1226) — continuity's
+	// sibling, answering "is capture keeping up?" where continuity answers "did I
+	// lose anything inside what I captured?". status is one of current / idle /
+	// stalled / unknown / unavailable / none; see status.FreshnessStatus for what
+	// each asserts and, importantly, what "idle" does NOT assert. The two age
+	// fields are omitted rather than zeroed when unknowable, so a consumer can
+	// never read an absent checkpoint as "0 seconds ago".
+	type jsonFreshness struct {
+		Status            string `json:"status"`
+		CheckpointAgeSecs *int64 `json:"checkpoint_age_seconds,omitempty"`
+		NewestEventSecs   *int64 `json:"newest_event_age_seconds,omitempty"`
+	}
 	// jsonCaptureHealth is the machine-readable Capture health verdict (#1034)
 	// — the continuity verdict's sibling for in-stream discards. Present only
 	// when a skip-aware daemon has persisted the counters ("unknown" is an
@@ -1112,6 +1130,7 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		LastCheckpoint string         `json:"last_checkpoint"`
 		ServerID       uint32         `json:"server_id"`
 		Continuity     jsonContinuity `json:"continuity"`
+		Freshness      jsonFreshness  `json:"freshness"`
 		GapLost        *jsonGapLost   `json:"gap_lost,omitempty"`
 		// SourceHealth is the raw source_health JSON passed through verbatim (#599):
 		// the console knows its shape (slot wal_status/lag, replica_identity_not_full,
@@ -1137,6 +1156,7 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 	// only checks stream presence still finds this loud sibling instead of silence.
 	type jsonStreamError struct {
 		Continuity jsonContinuity `json:"continuity"`
+		Freshness  jsonFreshness  `json:"freshness"`
 		Error      string         `json:"error"`
 	}
 	type jsonSummary struct {
@@ -1225,6 +1245,15 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			jstr.LastEventTime = &s
 		}
 		jstr.Continuity.Status = ContinuityStatus(stream, nil)
+		jstr.Freshness = jsonFreshness{Status: FreshnessStatus(stream, nil, time.Now(), 0, 0)}
+		if age, ok := CheckpointAge(stream, time.Now()); ok {
+			secs := int64(age.Seconds())
+			jstr.Freshness.CheckpointAgeSecs = &secs
+		}
+		if age, ok := NewestEventAge(stream, time.Now()); ok {
+			secs := int64(age.Seconds())
+			jstr.Freshness.NewestEventSecs = &secs
+		}
 		if stream.GapLostAt.Valid {
 			jstr.GapLost = &jsonGapLost{At: stream.GapLostAt.Time.Format(TSFmt), Detail: stream.GapLostDetail.String}
 		}
@@ -1259,6 +1288,7 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		// "unavailable" verdict so the omitted Stream section is not misread as "no loss".
 		out.StreamError = &jsonStreamError{
 			Continuity: jsonContinuity{Status: ContinuityStatus(nil, streamErr)},
+			Freshness:  jsonFreshness{Status: FreshnessStatus(nil, streamErr, time.Now(), 0, 0)},
 			Error:      streamErr.Error(),
 		}
 	}
