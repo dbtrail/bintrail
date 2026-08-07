@@ -66,7 +66,7 @@ func startTestShimFull(t *testing.T, tenants map[string]string, userSchemas map[
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas, maxConns)
+		serveLoop(ctx, listener, db, srv, auth, cfg, userSchemas, nil, maxConns)
 	}()
 
 	t.Cleanup(func() {

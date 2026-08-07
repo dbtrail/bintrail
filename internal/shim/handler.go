@@ -156,6 +156,17 @@ type Handler struct {
 	// instead of indistinguishable from a real event.
 	actor string
 
+	// allowedSchemas is the authenticated tenant's opt-in schema
+	// allowlist (issue #824), bound by BindAllowedSchemas after the
+	// handshake — same lifecycle as actor. nil/empty = unrestricted
+	// (the pre-#824 behaviour). Enforced at BOTH chokepoints: UseDB
+	// (COM_INIT_DB) and HandleQuery on the PARSED query's resolved
+	// schema — a client can fully qualify (`_flashback` needs a USE'd
+	// schema, but the hint and bare AS OF forms accept
+	// `<schema>.<table>` directly), so gating USE alone would not
+	// close #824.
+	allowedSchemas []string
+
 	mu sync.Mutex
 	db string // currently selected database (per COM_INIT_DB)
 }
@@ -430,8 +441,14 @@ func (h *Handler) QueryContext() (context.Context, context.CancelFunc) {
 }
 
 // UseDB stores the schema the client selected. _flashback queries
-// without an explicit schema use this value.
+// without an explicit schema use this value. When the tenant has an
+// allowed_schemas allowlist (#824), a USE of a schema outside it is
+// rejected with ER_DBACCESS_DENIED_ERROR — the same 1044 a real mysqld
+// returns for a schema the user has no grants on.
 func (h *Handler) UseDB(dbName string) error {
+	if !h.schemaAllowed(dbName) {
+		return h.schemaDenied(dbName)
+	}
 	h.mu.Lock()
 	h.db = dbName
 	h.mu.Unlock()
@@ -454,11 +471,28 @@ func (h *Handler) HandleQuery(qstr string) (*mysql.Result, error) {
 	// snapshots rather than letting the query fall through to the
 	// real MySQL (which returns ER_BAD_DB on the virtual schema).
 	if m := showTablesFromVirtualRE.FindStringSubmatch(qstr); m != nil {
+		// Belt to the UseDB gate (#824): currentDB can only get here via
+		// UseDB (already gated) or the serving layer's source_dsn seed,
+		// but the listing serves per-schema metadata, so re-check rather
+		// than trust the write path. Empty currentDB keeps the
+		// ER_NO_DB_ERROR path inside runShowTablesFromVirtual.
+		if currentDB != "" && !h.schemaAllowed(currentDB) {
+			return nil, h.schemaDenied(currentDB)
+		}
 		return h.runShowTablesFromVirtual(currentDB, m[1])
 	}
 
 	q, perr := Parse(qstr, currentDB)
 	if perr == nil {
+		// Per-tenant schema authorization (#824), on the RESOLVED target
+		// schema at query execution — not only at USE time. Parse fills
+		// q.Schema from the USE'd schema for the virtual-schema shapes
+		// AND from an explicit `<schema>.<table>` qualification on the
+		// hint / bare AS OF forms, so this single site covers every way
+		// a client can name a schema without a prior USE.
+		if !h.schemaAllowed(q.Schema) {
+			return nil, h.schemaDenied(q.Schema)
+		}
 		// Cross-cut PK validation (#296). Applied here, not inside each
 		// runX, so all four parsed shapes (TypeFlashback, TypeSnapshot,
 		// TypeDiff, and the hint-comment form which Parse normalises

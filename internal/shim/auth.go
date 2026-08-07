@@ -123,6 +123,14 @@ type TenantConfig struct {
 	// by LoadTenantConfigs — empty here is the #254 silent-auth
 	// regression and is rejected at the loader boundary.
 	MySQLPassword string
+	// AllowedSchemas is the opt-in per-tenant schema allowlist
+	// (issue #824). Empty/nil means unrestricted — the pre-#824
+	// behaviour, kept for single-tenant deployments and backwards
+	// compatibility. Non-empty means the shim rejects `USE` of, and
+	// any time-travel query resolving to, a schema outside this set
+	// with ER_DBACCESS_DENIED_ERROR (1044). Entries are guaranteed
+	// non-empty by LoadTenantConfigs.
+	AllowedSchemas []string
 }
 
 // LoadTenants reads shim.yaml from path and returns username →
@@ -159,13 +167,14 @@ func LoadTenantConfigs(path string) ([]TenantConfig, error) {
 	}
 	var cfg struct {
 		Tenants []struct {
-			ServerID      string `yaml:"server_id"`
-			SourceDSN     string `yaml:"source_dsn"`
-			AgentURL      string `yaml:"agent_url"`
-			AgentToken    string `yaml:"agent_token"`
-			MySQLUser     string `yaml:"mysql_user"`
-			MySQLPassword string `yaml:"mysql_password"`
-			MySQLPassSHA1 string `yaml:"mysql_pass_sha1"`
+			ServerID       string   `yaml:"server_id"`
+			SourceDSN      string   `yaml:"source_dsn"`
+			AgentURL       string   `yaml:"agent_url"`
+			AgentToken     string   `yaml:"agent_token"`
+			MySQLUser      string   `yaml:"mysql_user"`
+			MySQLPassword  string   `yaml:"mysql_password"`
+			MySQLPassSHA1  string   `yaml:"mysql_pass_sha1"`
+			AllowedSchemas []string `yaml:"allowed_schemas"`
 		} `yaml:"tenants"`
 		Listen string `yaml:"listen"`
 	}
@@ -195,11 +204,19 @@ func LoadTenantConfigs(path string) ([]TenantConfig, error) {
 				"tenant", i+1, "mysql_user", t.MySQLUser,
 			)
 		}
+		for _, s := range t.AllowedSchemas {
+			if s == "" {
+				return nil, fmt.Errorf(
+					"%s tenant #%d (mysql_user=%s): allowed_schemas contains an empty entry — remove it or list a schema name",
+					path, i+1, t.MySQLUser)
+			}
+		}
 		out = append(out, TenantConfig{
-			ServerID:      t.ServerID,
-			SourceDSN:     t.SourceDSN,
-			MySQLUser:     t.MySQLUser,
-			MySQLPassword: t.MySQLPassword,
+			ServerID:       t.ServerID,
+			SourceDSN:      t.SourceDSN,
+			MySQLUser:      t.MySQLUser,
+			MySQLPassword:  t.MySQLPassword,
+			AllowedSchemas: t.AllowedSchemas,
 		})
 	}
 	return out, nil

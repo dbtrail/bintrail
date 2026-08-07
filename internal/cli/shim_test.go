@@ -141,7 +141,7 @@ func TestServeLoopExitsOnContextCancel(t *testing.T) {
 	go func() {
 		// db / srv / auth / cfg are unused on this path because Accept
 		// never returns a connection — handleConn is unreachable.
-		serveLoop(ctx, listener, nil, nil, shim.TenantAuth{}, shim.Config{}, nil, 0)
+		serveLoop(ctx, listener, nil, nil, shim.TenantAuth{}, shim.Config{}, nil, nil, 0)
 		close(done)
 	}()
 
@@ -449,5 +449,44 @@ func TestMonitorDeniedPeriodicEmit(t *testing.T) {
 	emitMonitorDenied(logger)
 	if buf.Len() != 0 {
 		t.Errorf("second emit after reset: got %q, want empty", buf.String())
+	}
+}
+
+// TestBuildUserAllowedSchemas pins the opt-in contract of #824 at the
+// serving-layer map: a tenant with allowed_schemas gets its list; a
+// tenant without is ABSENT, so handleConn's lookup yields nil — the
+// value Handler.BindAllowedSchemas reads as unrestricted.
+func TestBuildUserAllowedSchemas(t *testing.T) {
+	cfgs := []shim.TenantConfig{
+		{MySQLUser: "tenant_a", AllowedSchemas: []string{"myapp"}},
+		{MySQLUser: "tenant_b"}, // no allowlist → absent from the map
+	}
+	got := buildUserAllowedSchemas(cfgs)
+	if len(got) != 1 {
+		t.Fatalf("buildUserAllowedSchemas = %v, want only tenant_a", got)
+	}
+	if a := got["tenant_a"]; len(a) != 1 || a[0] != "myapp" {
+		t.Errorf("tenant_a = %v, want [myapp]", a)
+	}
+	if got["tenant_b"] != nil {
+		t.Errorf("tenant without allowed_schemas must map to nil (unrestricted)")
+	}
+}
+
+// TestTenantsWithoutAllowedSchemas feeds runShim's one-time startup
+// warning: in a multi-tenant shim, an unrestricted tenant can read
+// every other tenant's indexed history, and the warning names them.
+func TestTenantsWithoutAllowedSchemas(t *testing.T) {
+	cfgs := []shim.TenantConfig{
+		{MySQLUser: "tenant_a", AllowedSchemas: []string{"myapp"}},
+		{MySQLUser: "tenant_b"},
+		{MySQLUser: "tenant_c"},
+	}
+	got := tenantsWithoutAllowedSchemas(cfgs)
+	if len(got) != 2 || got[0] != "tenant_b" || got[1] != "tenant_c" {
+		t.Errorf("tenantsWithoutAllowedSchemas = %v, want [tenant_b tenant_c]", got)
+	}
+	if got := tenantsWithoutAllowedSchemas(cfgs[:1]); got != nil {
+		t.Errorf("all-restricted config must yield nil, got %v", got)
 	}
 }
