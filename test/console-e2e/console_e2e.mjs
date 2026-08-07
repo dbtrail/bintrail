@@ -451,10 +451,12 @@ try {
   // nav item appears, the route "ext-<id>" mounts the module and calls its
   // render(mount, {apiBase, api}), and a server switch both drops the nav item
   // and abandons an in-flight render (serverGen staleness). Script() is stubbed
-  // with a blob-URL ES module — a same-document dynamic import, which works only
-  // because the console sets no Content-Security-Policy (the invariant documented
-  // on ext.ConsoleViewProvider.Script; a script-src CSP without 'self'/blob:
-  // would break this and every real extension view).
+  // with a blob-URL ES module — a same-document dynamic import, which works
+  // because the console's Content-Security-Policy allows script-src 'self'
+  // blob: (securityHeaders, #848); real extension views are same-origin
+  // ('self', ext.ConsoleViewProvider.Script), and blob: keeps this stub and
+  // client-side-minted module URLs importable. Dropping blob: from script-src
+  // breaks this scenario — that is the contract this test pins.
   const extv = await page.evaluate(async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const modURL = (marker) => URL.createObjectURL(new Blob(

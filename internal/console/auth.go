@@ -161,7 +161,15 @@ func apiGuard(next http.Handler) http.Handler {
 //
 // The CSP value matches what the embedded frontend actually needs:
 // script-src 'self' (index.html has exactly one <script src="app.js">, no
-// inline scripts; extension views load as same-origin module imports);
+// inline scripts; real extension views are same-origin module imports —
+// ext.ConsoleViewProvider.Script names a URL under the provider's /ext/<ID>/
+// StaticHandler subtree) plus blob:, because dynamically minted module URLs
+// are part of the ext-view import surface (the console-e2e ext-view contract
+// stubs Script() with a blob: ES module, and an embedding build may do the
+// same to hand the SPA a module it assembled client-side). blob: is an
+// acceptable relaxation, not a hole: a blob URL can only be minted by
+// same-origin script that is ALREADY executing, so it cannot serve as an
+// initial injection vector the way 'unsafe-inline' or a remote origin could;
 // style-src needs 'unsafe-inline' (index.html carries a <style> block and
 // inline style attributes, including on the DOMParser-built SVG icons);
 // img-src needs data: (style.css embeds data:image/svg+xml select arrows);
@@ -174,7 +182,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
+			"default-src 'self'; script-src 'self' blob:; style-src 'self' 'unsafe-inline'; "+
 				"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})

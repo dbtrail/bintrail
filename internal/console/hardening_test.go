@@ -43,17 +43,14 @@ func TestSecurityHeadersCSP(t *testing.T) {
 		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+path, nil)
 		srv.Handler().ServeHTTP(rec, req)
 		csp := rec.Header().Get("Content-Security-Policy")
-		for _, directive := range []string{
-			"default-src 'self'",
-			"script-src 'self'",
-			"style-src 'self' 'unsafe-inline'", // index.html has a <style> block + inline style attrs
-			"img-src 'self' data:",             // style.css embeds data: SVG arrows
-			"connect-src 'self'",
-			"frame-ancestors 'none'",
-		} {
-			if !strings.Contains(csp, directive) {
-				t.Errorf("%s: CSP %q missing directive %q", path, csp, directive)
-			}
+		// Pin the exact value: every directive is load-bearing (see the
+		// securityHeaders comment), and blob: in script-src is what keeps the
+		// ext-view module-import surface (console-e2e scenario 10) alive.
+		const want = "default-src 'self'; script-src 'self' blob:; " +
+			"style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+			"connect-src 'self'; frame-ancestors 'none'"
+		if csp != want {
+			t.Errorf("%s: CSP = %q, want %q", path, csp, want)
 		}
 		// script-src must NOT allow inline script — that is the invariant the
 		// header exists to freeze.
