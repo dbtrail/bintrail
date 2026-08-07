@@ -9,11 +9,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
 // ParquetWriterCompression / ParquetWriterRowGroupSize are the codec and row
@@ -223,6 +225,9 @@ func mergeBaselineIntoParquet(ctx context.Context, in mergeInput, rep *TableRepo
 		MetaKeyDerivedFrom:             in.SourceBaseline.Time.UTC().Format(time.RFC3339),
 		MetaKeyDerivedFromPath:         in.SourceBaseline.Path,
 	}
+	if line := captureGapLines(in); line != "" {
+		md[baseline.MetaKeyCaptureGap] = line
+	}
 	switch {
 	case in.Cut != nil:
 		md[baseline.MetaKeyBinlogFile] = in.Cut.File
@@ -279,6 +284,88 @@ func mergeBaselineIntoParquet(ctx context.Context, in mergeInput, rep *TableRepo
 	rep.Files = []string{filepath.Join(in.Schema, in.Table+".parquet")}
 	rep.RowsWritten = w.Rows()
 	return nil
+}
+
+// captureGapLines builds the snapshot's MetaKeyCaptureGap value: what it
+// inherited from the snapshot it was derived from, plus what this run itself
+// overrode.
+//
+// Inheritance is the load-bearing half. A refresh chain folds forward, so the
+// events a gapped ancestor never captured are absent from every descendant —
+// dropping the ancestor's line at the first refresh would silently launder a
+// knowingly-incomplete baseline into a clean-looking one, which is exactly the
+// state #1170 exists to make impossible.
+func captureGapLines(in mergeInput) string {
+	lines := strings.TrimSpace(in.SourceBaseline.Metadata.CaptureGap)
+	if in.CaptureGap == nil {
+		return lines
+	}
+	own := in.SnapshotAt.UTC().Format(time.RFC3339) + ": " + in.CaptureGap.Reason()
+	if lines == "" {
+		return own
+	}
+	return lines + "\n" + own
+}
+
+// checkBaselineSchemaCurrent refuses when the CREATE TABLE embedded in the
+// source baseline no longer describes the table's current columns.
+//
+// The comparison is against the schema SNAPSHOT (the resolver), not the live
+// table — that is the newest statement of the schema this index has, and it is
+// what every other reconstruct decision is already made against. Generated
+// columns are excluded on both sides: mydumper never dumps their values, so
+// ParseSchema drops them, and the snapshot marks them explicitly.
+//
+// Why refuse rather than warn: the emitted snapshot carries the OLD CREATE
+// TABLE forward as its own schema. Publish it and every later reconstruct
+// anchored on it declares a table shape the source stopped having, with rows
+// projected onto the old column set — a dump that loads and is wrong. A real
+// re-dump is the only correct answer, so the message says so instead of
+// offering a flag.
+func checkBaselineSchemaCurrent(createSQL string, tm *metadata.TableMeta, schema, table string) error {
+	if strings.TrimSpace(createSQL) == "" || tm == nil {
+		// A missing CREATE TABLE is already refused upstream with its own
+		// message; a nil TableMeta cannot happen on this path (the resolver
+		// errored earlier). Neither is this check's story to tell.
+		return nil
+	}
+	cols, err := baseline.ParseSchemaText(createSQL)
+	if err != nil {
+		return fmt.Errorf("parse the baseline's embedded CREATE TABLE for %s.%s: %w", schema, table, err)
+	}
+	inBaseline := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		inBaseline[strings.ToLower(c.Name)] = true
+	}
+	current := make(map[string]bool, len(tm.Columns))
+	for _, c := range tm.Columns {
+		if c.IsGenerated {
+			continue
+		}
+		current[strings.ToLower(c.Name)] = true
+	}
+	var added, dropped []string
+	for name := range current {
+		if !inBaseline[name] {
+			added = append(added, name)
+		}
+	}
+	for name := range inBaseline {
+		if !current[name] {
+			dropped = append(dropped, name)
+		}
+	}
+	if len(added) == 0 && len(dropped) == 0 {
+		return nil
+	}
+	sort.Strings(added)
+	sort.Strings(dropped)
+	return fmt.Errorf(
+		"%s.%s changed shape since its baseline was taken (added since: %s; gone since: %s) — "+
+			"a snapshot emitted from it would carry the OLD CREATE TABLE forward and project every row onto the old columns, "+
+			"so every reconstruct anchored on it would be wrong. Take a real snapshot instead: `bintrail dump` + `bintrail baseline`. "+
+			"(If the schema snapshot is what is stale, run `bintrail snapshot` first and retry.): %w",
+		schema, table, strings.Join(orNone(added), ", "), strings.Join(orNone(dropped), ", "), ErrSchemaChanged)
 }
 
 // checkSchemaMatchesBaseline refuses when the CREATE TABLE embedded in the

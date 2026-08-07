@@ -319,22 +319,54 @@ The S3 copy is **not** pruned — only the redundant local copy. To prune on a l
 
 ## Step 3 (optional): a newer baseline without a new dump
 
-`bintrail reconstruct --output-format parquet` writes its result **as a baseline snapshot** instead of a SQL dump. Since the index already holds every change since the last snapshot, a fresher snapshot can be folded out of storage you already have — no mydumper run, no connection to the source:
+`bintrail baseline refresh` folds the changes the index already holds onto the newest snapshot and publishes the result as a new one — no mydumper run, no connection to the source:
 
 ```sh
-bintrail reconstruct \
-  --index-dsn     "user:pass@tcp(index-db:3306)/bintrail_index" \
-  --baseline-dir  /data/baselines \
-  --tables        mydb.orders,mydb.users \
-  --output-format parquet \
-  --output-dir    /data/baselines
+bintrail baseline refresh \
+  --index-dsn    "user:pass@tcp(index-db:3306)/bintrail_index" \
+  --baseline-dir /data/baselines
 ```
 
-`--output-dir` is the **baselines root** here, not the destination file: the snapshot lands in `/data/baselines/<timestamp>/<db>/<table>.parquet` with the same `_SUCCESS` / `_MANIFEST` files a converted dump gets, and the next `reconstruct`, `verify` or shim query discovers it as the newest baseline with no configuration change.
+Tables default to every table in the newest snapshot; `--tables` narrows that, and `--at` targets a point in the past. The snapshot lands in `/data/baselines/<timestamp>/<db>/<table>.parquet` with the same `_SUCCESS` / `_MANIFEST` files a converted dump gets, and the next `reconstruct`, `verify` or shim query discovers it as the newest baseline with no configuration change.
+
+When the source snapshots live on S3, read from there and write locally, then publish:
+
+```sh
+bintrail baseline refresh --index-dsn "..." \
+  --baseline-s3 s3://bucket/baselines/ --output /data/baselines
+bintrail upload --source /data/baselines --destination s3://bucket/baselines/
+```
+
+The same thing is available a level down as `bintrail reconstruct --output-format parquet --output-dir <baselines root>`, which is what `refresh` runs — use it when you want to name every table and instant yourself.
+
+**Publication is all-or-nothing.** If any table refuses, nothing is published and the exit status is non-zero, with a per-table verdict:
+
+```
+baseline refresh to 2026-05-01T12:00:00Z
+
+  mydb.orders  refreshed
+  mydb.users   refused-gap
+               └─ reconstruct: stamped capture gap at 2026-04-20T06:00:00Z falls inside …
+
+NOTHING was published: a snapshot mixing refreshed and stale tables under one anchor
+would be worse than no refresh. Fix or exclude the tables above (--tables) and retry.
+```
+
+A snapshot holding some tables from one point in time and others from another, under a single anchor, is worse than no refresh at all — so a partial run publishes nothing, and `--tables` is the tool for isolating a problem table.
 
 Why this matters beyond convenience: reconstructing from a **fresh** snapshot reads a short delta window instead of replaying months of events, so time-travel gets faster and the archive hours the replay depends on stop growing without bound.
 
-**What it inherits.** The emitted snapshot is subject to every full-table reconstruct limit — the table needs a primary key, a PK-changing `UPDATE` in the window refuses the run, and a `TRUNCATE`/`DROP`/`RENAME` between the source snapshot and `--at` refuses it too. A table with no baseline at all is refused rather than degraded: a snapshot folded from deltas alone would silently omit every row the window never touched. Refuse cases point at `bintrail dump` — a real re-dump is the only correct answer for all of them.
+**What it refuses, and why refusing beats warning.** A baseline is picked up automatically by every later reconstruct, so a wrong one is not a bad output — it is a wrong answer to every future question.
+
+| Refusal | What happened | What fixes it |
+|---|---|---|
+| `refused-gap` | The window spans events the index permanently lost, or the index is too old to rule that out | `--allow-gaps` to accept the loss knowingly, or a fresh dump |
+| `refused-ddl` | The table's columns moved since the baseline, or a `TRUNCATE`/`DROP`/`RENAME` landed in the window | `bintrail dump` + `bintrail baseline` — no flag helps |
+| `refused` | Anything else (no baseline for the table, no primary key, a PK-changing `UPDATE` in the window) | Named in the message |
+
+A table with no baseline is refused rather than degraded to the binlog-only fallback: a snapshot folded from deltas alone would silently omit every row the window never touched.
+
+**A knowingly-gapped snapshot stays marked forever.** `--allow-gaps` exists because sometimes the incomplete result is genuinely what you want — but the snapshot then carries a `bintrail.capture_gap` line in its Parquet metadata naming what was lost, and **every snapshot later refreshed from it inherits that line**. The missing events stay missing down the chain, so the record does too; one refresh can never launder a knowingly-incomplete baseline into a clean-looking one.
 
 **What it deliberately omits.** A dumped snapshot carries a content digest fingerprinting the rows against the live source, which `bintrail verify` compares. A reconstructed snapshot never read the source, so it carries **no** digest — that table is not verifiable against a source through this snapshot until the next real dump. It also carries no GTID set (the index stores GTIDs per event, not as an accumulated executed-set). Both absences are visible in the file's metadata, alongside a `bintrail.snapshot_producer = reconstruct` marker so a reconstructed snapshot stays distinguishable from a dumped one forever.
 

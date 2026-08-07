@@ -71,6 +71,22 @@ const (
 	// baseline whose GUC-sensitive text may not join post-pin deltas — readers
 	// warn and recommend re-baselining. Absent on MySQL/MariaDB baselines.
 	MetaKeyRenderGUCs = "bintrail.render_gucs"
+	// MetaKeyCaptureGap marks a snapshot that was published over a KNOWN
+	// permanent capture gap — a `baseline refresh` / `reconstruct
+	// --output-format parquet` run whose window contained a stamped
+	// stream_state.gap_lost_at (or an index that could not answer the question)
+	// and which proceeded anyway under --allow-gaps (#1170).
+	//
+	// Its value is one human-readable line per gap the snapshot was folded
+	// across, oldest first. It is INHERITED: a snapshot derived from a gapped
+	// one carries its ancestor's lines plus any of its own, because the missing
+	// events are missing from every descendant too. That inheritance is the
+	// whole point — an operator must never have to reconstruct the provenance
+	// chain by hand to learn that a baseline is knowingly incomplete.
+	//
+	// Absent on every snapshot taken from a real dump, and on any reconstructed
+	// snapshot whose window was verifiably gap-free.
+	MetaKeyCaptureGap = "bintrail.capture_gap"
 )
 
 // RenderGUCsPinned is the canonical value the capture side stamps under
@@ -94,6 +110,11 @@ type DumpMetadata struct {
 	RowCount       int64  // rows ingested into this table's baseline; valid only when ContentDigest != ""
 	LSN            uint64 // PostgreSQL WAL LSN delta-replay floor, inclusive (MetaKeyLSN, see its doc comment / #771); 0 = absent (MySQL baseline, or pre-#593 PG baseline)
 	RenderGUCs     string // pinned rendering-GUC stamp (MetaKeyRenderGUCs, #593 slice D); "" = pre-pin PG baseline or MySQL baseline
+	// CaptureGap is MetaKeyCaptureGap: non-empty means this snapshot is KNOWINGLY
+	// incomplete — it was folded across a permanent capture gap under
+	// --allow-gaps, or inherited that state from the snapshot it was derived
+	// from. Empty is the normal case; see MetaKeyCaptureGap.
+	CaptureGap string
 }
 
 // StartedAtMarkerFile is a bintrail-authored sidecar written into the mydumper
@@ -268,6 +289,9 @@ func ReadParquetMetadata(path string) (DumpMetadata, error) {
 	if v, ok := pf.Lookup(MetaKeyRenderGUCs); ok {
 		m.RenderGUCs = v
 	}
+	if v, ok := pf.Lookup(MetaKeyCaptureGap); ok {
+		m.CaptureGap = v
+	}
 	if v, ok := pf.Lookup(MetaKeyRowCount); ok {
 		n, parseErr := strconv.ParseInt(v, 10, 64)
 		if parseErr != nil {
@@ -351,6 +375,8 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 			m.ContentDigest = val
 		case MetaKeyRenderGUCs:
 			m.RenderGUCs = val
+		case MetaKeyCaptureGap:
+			m.CaptureGap = val
 		case MetaKeyRowCount:
 			if n, parseErr := strconv.ParseInt(val, 10, 64); parseErr == nil {
 				m.RowCount = n

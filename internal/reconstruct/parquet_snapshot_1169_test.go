@@ -634,7 +634,38 @@ func TestReconstructTables_refusesNonEmptySnapshotDir(t *testing.T) {
 		OutputDir:    root,
 		OutputFormat: OutputFormatParquet,
 	})
-	if err == nil || !strings.Contains(err.Error(), "already exists and is not empty") {
+	if err == nil || !strings.Contains(err.Error(), "already holds") {
 		t.Fatalf("error = %v, want a refusal to write into an occupied snapshot directory", err)
+	}
+}
+
+// TestReconstructTables_retriesIntoAMarkerOnlySnapshotDir is the other side of
+// that guard. A run that refused published nothing but still left its
+// _INCOMPLETE marker; refusing THAT would make the most ordinary recovery
+// impossible — fix what the run reported, retry the same --at, be told the
+// directory is in the way.
+func TestReconstructTables_retriesIntoAMarkerOnlySnapshotDir(t *testing.T) {
+	root := t.TempDir()
+	at := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	prior := filepath.Join(root, snapshotDirName(at))
+	if err := os.MkdirAll(prior, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := baseline.WriteIncompleteMarker(prior); err != nil {
+		t.Fatalf("WriteIncompleteMarker: %v", err)
+	}
+
+	_, err := ReconstructTables(context.Background(), FullTableConfig{
+		IndexDSN:     "user:pass@tcp(127.0.0.1:1)/idx",
+		BaselineSrc:  t.TempDir(),
+		Tables:       []string{"mydb.orders"},
+		At:           at,
+		OutputDir:    root,
+		OutputFormat: OutputFormatParquet,
+	})
+	// It must get PAST the directory guard; the connection to a dead port is
+	// where this run is expected to stop.
+	if err != nil && strings.Contains(err.Error(), "already holds") {
+		t.Fatalf("a marker-only directory from a failed run blocked the retry: %v", err)
 	}
 }
