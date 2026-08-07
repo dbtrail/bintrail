@@ -126,6 +126,24 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			},
 		},
 		{
+			name:      "sql panel refused",
+			action:    "sql.run",
+			wantActor: tokenActor,
+			call: func(t *testing.T) {
+				// A gate-refused statement is audited too (outcome=refused): the
+				// refused probe is exactly what an auditor needs. Delete the
+				// recordSQLRun on the refusal branch and this case goes red.
+				baselineRoot, _ := writeSQLPanelBaseline(t)
+				srv := newSQLPanelServer(t, baselineRoot, true)
+				w := httptest.NewRecorder()
+				srv.handleSQLPanel(w, httptest.NewRequest("POST", "/api/sql",
+					strings.NewReader(`{"sql":"SELECT * FROM glob('/etc/*')"}`)))
+				if w.Code != http.StatusUnprocessableEntity {
+					t.Fatalf("refused sql panel: code=%d body=%s, want 422", w.Code, w.Body.String())
+				}
+			},
+		},
+		{
 			name:      "authz denial",
 			action:    "authz.denied",
 			wantActor: "ana@example.com",

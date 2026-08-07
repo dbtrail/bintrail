@@ -396,8 +396,10 @@ server-side (the UI only mirrors it):
   free-form SQL reads the unredacted Parquet directly and cannot honor
   per-column redaction, so the whole surface is withheld (the same stance the
   `views.sql` download takes).
-- **Audited.** Every executed statement is recorded on the audit seam
-  (`console` / `sql.run`) with the SQL text and row count.
+- **Audited.** Every statement that reaches the engine is recorded on the audit
+  seam (`console` / `sql.run`) with the SQL text, its outcome (`ok` / `refused` /
+  `error`) and row count — including one the read-only gate refuses. Only a
+  statement the client aborts mid-flight is not recorded.
 
 No AWS credentials are ever exposed to the query; S3 reads use the daemon's
 ambient credential chain, scoped to the allowed prefixes.

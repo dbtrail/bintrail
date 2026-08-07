@@ -5,11 +5,18 @@ package console
 // locked-down DuckDB session. The security posture is layered, and every layer
 // is enforced here from the first commit — none are follow-ups:
 //
-//  1. Filesystem sandbox: allowed_directories is restricted to the resolved
-//     archive/baseline roots (local paths and s3:// prefixes both — DuckDB's
-//     access check runs in its virtual-filesystem layer, above httpfs, so it
-//     governs remote paths and fails BEFORE any network I/O), external access
-//     is disabled, and lock_configuration makes the session's config immutable.
+//  1. Filesystem sandbox: `SET enable_external_access = false` is the
+//     load-bearing ban — it is what denies every file and URL read. Neither
+//     allowed_directories NOR lock_configuration restricts anything on its own
+//     (verified: with external access at its default, an out-of-root read
+//     succeeds even with both set). allowed_directories is only a CARVE-OUT
+//     from the ban, scoping the exception to the resolved archive/baseline
+//     roots — local paths AND s3:// prefixes (an out-of-root s3:// read is
+//     denied before any network request is made; an in-root one reaches S3).
+//     DO NOT remove the enable_external_access line in openSandboxedSession:
+//     without it the sandbox opens to the entire filesystem and all of S3, and
+//     the local in-root tests stay green. lock_configuration then freezes the
+//     whole config so no user SET can widen it.
 //  2. Read-only: DuckDB's allowed_directories carve-out permits WRITES inside
 //     the roots (COPY TO, ATTACH of a writable database), so read-only is
 //     enforced by a SELECT-only statement gate — classified by DuckDB's own
@@ -20,7 +27,10 @@ package console
 //     query in flight per process.
 //  4. RBAC: refused outright when a data profile is active — free-form SQL
 //     cannot honor per-column redaction (same gate shape as reconstruct).
-//  5. Audit: every executed statement emits on the audit seam (console/sql.run).
+//  5. Audit: every statement that reaches the engine emits on the audit seam
+//     (console/sql.run) with its outcome (ok/refused/error) — including one the
+//     gate refuses. Only a request the client aborted mid-flight is silent
+//     (there is no one to answer, and it is not a policy event).
 //  6. Opt-in: off by default behind BINTRAIL_CONSOLE_SQL_PANEL=1.
 //
 // Cancellation is the HTTP request's own lifetime: the browser aborts the
@@ -33,6 +43,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
@@ -63,6 +74,12 @@ const (
 // sqlPanelTimeout is the hard per-query wall-clock budget. A var so tests can
 // shrink it to exercise the interrupt without a 60-second test.
 var sqlPanelTimeout = 60 * time.Second
+
+// sqlPanelSetupTimeout bounds the pre-query setup — the S3 baseline LIST in
+// buildViewsInput is the one unbounded step that runs under the single-flight
+// latch, so a hung listing must not pin the panel at 429 for every other user.
+// The query itself is bounded separately by sqlPanelTimeout.
+var sqlPanelSetupTimeout = 30 * time.Second
 
 // forensicsEventColumns are the paid-tier forensics columns the console must
 // NOT serve as row data: the SAME set eventDTO omits (connection_id is the free
@@ -175,7 +192,12 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.sqlPanelBusy.Store(false)
 
-	in, err := s.buildViewsInput(r.Context(), b)
+	// Bound the setup: buildViewsInput's S3 baseline LIST is the one unbounded
+	// step under the latch. r.Context() still propagates (Cancel works); the
+	// deadline is what stops a hung listing from wedging the single-flight.
+	setupCtx, setupCancel := context.WithTimeout(r.Context(), sqlPanelSetupTimeout)
+	in, err := s.buildViewsInput(setupCtx, b)
+	setupCancel()
 	switch {
 	case errors.Is(err, errNoViewSources):
 		writeJSONError(w, http.StatusNotFound, errNoViewSources.Error()+" — nothing to query")
@@ -191,22 +213,40 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, context.Canceled):
 			// The human hit Cancel (or closed the tab): the fetch was aborted,
-			// the query was interrupted, and there is no one to answer.
+			// the query was interrupted, and there is no one to answer. Not a
+			// policy event — stays off the audit seam.
 			return
 		case errors.As(err, &ue):
+			recordSQLRun(r, req.SQL, "refused", ue.msg, 0, false)
 			writeJSONError(w, http.StatusUnprocessableEntity, ue.msg)
 		default:
+			recordSQLRun(r, req.SQL, "error", err.Error(), 0, false)
 			writeJSONError(w, http.StatusBadGateway, err.Error())
 		}
 		return
 	}
 
-	recordConsoleAccess(r, "sql.run", "", "", map[string]string{
-		"statement": req.SQL,
-		"rows":      fmt.Sprintf("%d", res.RowCount),
-		"truncated": fmt.Sprintf("%t", res.Truncated),
-	})
+	recordSQLRun(r, req.SQL, "ok", "", res.RowCount, res.Truncated)
 	writeJSON(w, http.StatusOK, res)
+}
+
+// recordSQLRun emits the panel's audit event. Every statement that reaches the
+// engine is recorded with its outcome — including one the gate refuses: a
+// refused free-form probe (a read_parquet against the raw archive, a
+// duckdb_secrets read) is exactly what an auditor needs, and this codebase
+// already audits blocked attempts elsewhere (profile.denied). detail carries the
+// gate/engine message on a non-ok outcome; it is never present on "ok".
+func recordSQLRun(r *http.Request, stmt, outcome, detail string, rows int, truncated bool) {
+	fields := map[string]string{
+		"statement": stmt,
+		"outcome":   outcome,
+		"rows":      fmt.Sprintf("%d", rows),
+		"truncated": fmt.Sprintf("%t", truncated),
+	}
+	if detail != "" {
+		fields["error"] = detail
+	}
+	recordConsoleAccess(r, "sql.run", "", "", fields)
 }
 
 // sqlPanelAvailable is the capability gate for /api/capabilities: the process
@@ -249,7 +289,7 @@ func runSandboxedSQL(ctx context.Context, in views.Input, stmt string) (*sqlPane
 	res := &sqlPanelResult{Columns: cols, Rows: [][]any{}}
 	bytesUsed := 0
 	for rows.Next() {
-		if res.RowCount >= sqlPanelMaxRows || bytesUsed >= sqlPanelMaxBytes {
+		if res.RowCount >= sqlPanelMaxRows {
 			res.Truncated = true
 			break
 		}
@@ -262,12 +302,22 @@ func runSandboxedSQL(ctx context.Context, in views.Input, stmt string) (*sqlPane
 			return nil, &sqlUserError{msg: err.Error()}
 		}
 		out := make([]any, len(cols))
+		rowBytes := 0
 		for i, v := range raw {
 			cell, cost := sqlPanelCell(v)
 			out[i] = cell
-			bytesUsed += cost
+			rowBytes += cost
+		}
+		// Enforce the byte budget BEFORE appending the row that would breach it —
+		// checking after the append overshoots by a full row, and a single row
+		// image can be multiple MB. Always keep at least one row so an oversized
+		// first row surfaces as data, not an empty truncated result.
+		if res.RowCount > 0 && bytesUsed+rowBytes > sqlPanelMaxBytes {
+			res.Truncated = true
+			break
 		}
 		res.Rows = append(res.Rows, out)
+		bytesUsed += rowBytes
 		res.RowCount++
 	}
 	if err := rows.Err(); err != nil {
@@ -302,7 +352,11 @@ func openSandboxedSession(ctx context.Context, in views.Input) (*sql.DB, func(),
 	}
 	cleanup := func() {
 		db.Close()
-		os.RemoveAll(spill)
+		if err := os.RemoveAll(spill); err != nil {
+			// The spill dir can hold row-image data at rest; a failure to remove
+			// it must not be silent in a file whose posture is every-step-checked.
+			slog.Warn("sql panel: could not remove spill directory", "dir", spill, "error", err)
+		}
 	}
 	fail := func(err error) (*sql.DB, func(), error) {
 		cleanup()
@@ -327,7 +381,13 @@ func openSandboxedSession(ctx context.Context, in views.Input) (*sql.DB, func(),
 	// caller can forget it. This is the eventDTO boundary; free-form SQL over an
 	// unfiltered events view would serve exactly what eventDTO omits.
 	in.ExcludeEventColumns = forensicsEventColumns
-	// Only the view DDL — the preamble is for the downloadable file.
+	// Only the view DDL — the preamble is for the downloadable file. This runs
+	// BEFORE the sandbox SETs below, so for an S3 layout its read_parquet glob
+	// resolves over the network with the daemon's ambient credentials while the
+	// session is still unlocked. That is safe ONLY because every interpolated
+	// path is operator-resolved (archive_state / reconstruct.ListBaselines via
+	// buildViewsInput), NEVER user input — routing a user-supplied path here
+	// would be an unsandboxed arbitrary file/URL read.
 	if _, err := db.ExecContext(ctx, views.GenerateViews(in)); err != nil {
 		return fail(fmt.Errorf("set up views over the Parquet layout: %w", err))
 	}
@@ -361,9 +421,12 @@ func openSandboxedSession(ctx context.Context, in views.Input) (*sql.DB, func(),
 // CREATE SECRET, ...), so the panel never grows a hand-rolled SQL classifier.
 // The statement travels as a bound parameter — it is data here, not SQL.
 func sqlPanelGate(ctx context.Context, db *sql.DB, stmt string) error {
-	// The ::VARCHAR on the RESULT is load-bearing: json_serialize_sql returns
-	// DuckDB's JSON type, which the driver decodes to a Go map — casting it
-	// back to text is what lets us Scan and re-parse it ourselves.
+	// Both casts are load-bearing. The input ?::VARCHAR is required because a
+	// bound parameter's type is otherwise unknown to json_serialize_sql (it
+	// errors "first argument must be a VARCHAR"). The ::VARCHAR on the RESULT is
+	// needed because json_serialize_sql returns DuckDB's JSON type, which the
+	// driver decodes to a Go map — casting back to text is what lets us Scan and
+	// re-parse it ourselves.
 	var out string
 	if err := db.QueryRowContext(ctx, "SELECT json_serialize_sql(?::VARCHAR)::VARCHAR", stmt).Scan(&out); err != nil {
 		return fmt.Errorf("classify statement: %w", err)

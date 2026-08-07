@@ -184,6 +184,12 @@ func TestSQLPanel_gateBlocksRawFileAccess(t *testing.T) {
 		{"query() dynamic SQL", fmt.Sprintf("SELECT * FROM query('SELECT connection_id FROM read_parquet(''%s'')')", esc(archiveFile))},
 		{"query_table()", fmt.Sprintf("SELECT connection_id FROM query_table('%s')", archiveFile)},
 		{"json_execute_serialized_sql", fmt.Sprintf("SELECT * FROM json_execute_serialized_sql(json_serialize_sql('SELECT connection_id FROM read_parquet(''%s'')'))", esc(archiveFile))},
+		// A reader nested in a set operation or a join must be caught too — the
+		// walk recurses generically, it does not special-case the from-clause, so
+		// these pin that the recursion (not a from-clause-only optimization) is
+		// what holds.
+		{"reader in UNION", fmt.Sprintf("SELECT schema_name FROM events UNION SELECT connection_id FROM read_parquet('%s')", archiveFile)},
+		{"reader in JOIN", fmt.Sprintf("SELECT e.schema_name FROM events e JOIN read_parquet('%s') r ON true", archiveFile)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			res, err := runSandboxedSQL(context.Background(), in, tc.stmt)
@@ -267,9 +273,33 @@ func TestSQLPanel_onlyAllowlistedTableFunctionsReachable(t *testing.T) {
 	// loop above would assert almost nothing): the dangerous functions the
 	// gate exists to stop MUST be in the enumerated-and-denied set.
 	t.Logf("enumerated %d table functions, %d denied by the gate", len(names), len(denied))
-	for _, must := range []string{"read_parquet", "query", "query_table", "duckdb_secrets", "glob"} {
+	for _, must := range []string{"read_parquet", "query", "query_table", "json_execute_serialized_sql", "duckdb_secrets", "glob"} {
 		if !denied[must] {
 			t.Errorf("%q was not among the enumerated-and-denied functions — the guard is not exercising the readers it claims to", must)
+		}
+	}
+}
+
+// TestSQLPanel_allowlistPinnedToExactlyTwo makes the "fails closed" guarantee
+// durable against a contributor WIDENING the allowlist: the enumeration guard
+// above consults the map under test, so it can never catch an ADDITION to it.
+// Anything new here (a convenience reader, a dynamic-SQL function) is a live
+// in-root forensics-leak primitive — the archive Parquet is inside an allowed
+// root — so the set is pinned to exactly its two justified generators.
+func TestSQLPanel_allowlistPinnedToExactlyTwo(t *testing.T) {
+	want := map[string]bool{"range": true, "generate_series": true}
+	if len(allowedTableFunctions) != len(want) {
+		t.Fatalf("allowedTableFunctions has %d entries, want exactly %d (%v) — a new from-clause table function is now reachable in the sandbox",
+			len(allowedTableFunctions), len(want), want)
+	}
+	for name := range allowedTableFunctions {
+		if !want[name] {
+			t.Errorf("allowedTableFunctions has an UNEXPECTED entry %q — justify it with an escape test and add it to want here, or remove it", name)
+		}
+	}
+	for name := range want {
+		if !allowedTableFunctions[name] {
+			t.Errorf("allowedTableFunctions is missing the expected generator %q", name)
 		}
 	}
 }
@@ -301,9 +331,24 @@ func TestSQLPanel_sandboxDeniesOutOfRootReads(t *testing.T) {
 	}
 	defer os.Remove(sharedTmp)
 
+	// A sibling directory that STRING-PREFIXES the allowed root: the allowed
+	// entry is "<root>/", so real DuckDB must not admit "<root>evil/". This
+	// proves the trailing-separator boundary in the ENGINE, not just in the
+	// allowed_directories literal (TestSQLPanelAllowedListBoundary is the string
+	// half). "<root>" is a lake, "<root>evil" is the lakeevil it must not admit.
+	siblingPrefix := baselineRoot + "evil"
+	if err := os.MkdirAll(siblingPrefix, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(siblingPrefix)
+	if err := os.WriteFile(filepath.Join(siblingPrefix, "s.csv"), []byte("x\n5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	const denied = "disabled by configuration"
 	for _, tc := range []struct{ name, stmt string }{
 		{"read sibling temp dir", fmt.Sprintf("SELECT * FROM read_csv('%s/s.csv')", secret)},
+		{"sibling prefix of an allowed root (lake vs lakeevil)", fmt.Sprintf("SELECT * FROM read_csv('%s/s.csv')", siblingPrefix)},
 		{"read shared os.TempDir file", fmt.Sprintf("SELECT * FROM read_csv('%s')", sharedTmp)},
 		{"glob outside the roots", fmt.Sprintf("SELECT * FROM glob('%s/*')", secret)},
 		{"replacement scan out of root", fmt.Sprintf("SELECT * FROM '%s/s.csv'", secret)},
@@ -421,8 +466,10 @@ func TestSQLPanel_gateRefusesNonSelect(t *testing.T) {
 		{"COPY TO inside the allowed root", fmt.Sprintf("COPY (SELECT 1) TO '%s/evil.parquet'", baselineRoot)},
 		{"ATTACH inside the allowed root", fmt.Sprintf("ATTACH '%s/evil.db' AS x", baselineRoot)},
 		{"CREATE TABLE", "CREATE TABLE t AS SELECT 1"},
-		// CREATE SECRET survives lock_configuration (secrets are not settings),
-		// so the gate is its only barrier — pinned here on purpose.
+		// CREATE SECRET survives lock_configuration (secrets are not settings);
+		// the gate refuses it here. (enable_external_access=false is also a
+		// barrier — it denies the persistent secret store — so the gate is a
+		// primary, not the only, guard.) Pinned on purpose.
 		{"CREATE SECRET", "CREATE OR REPLACE SECRET evil (TYPE s3, KEY_ID 'k', SECRET 's')"},
 		{"SET", "SET enable_external_access = true"},
 		{"PRAGMA", "PRAGMA memory_limit='99GB'"},
