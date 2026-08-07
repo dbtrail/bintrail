@@ -1313,6 +1313,7 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 		BootDSN:      indexDSN,
 		Listen:       opts.Listen,
 		Token:        opts.Token,
+		SQLPanel:     sqlPanelEnabled(),
 		BaselineDir:  opts.BaselineDir,
 		BaselineS3:   opts.BaselineS3,
 		AuthPath:     opts.AuthFile,

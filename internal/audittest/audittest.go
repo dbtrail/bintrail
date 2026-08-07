@@ -192,6 +192,11 @@ var Required = []Requirement{
 		Owner: OwnerConsoleIntegration,
 		Why:   "cascade reversal (with synthesized child rows) served by the console",
 	},
+	{
+		Pair:  Pair{Surface: "console", Action: "sql.run"},
+		Owner: OwnerConsoleUnit,
+		Why:   "a free-form SQL statement executed over the archive/baseline Parquet by the console's SQL panel (#1177)",
+	},
 }
 
 // RequiredFor returns the pairs owner must exercise.

@@ -56,6 +56,19 @@ func TestUpConsoleConfig(t *testing.T) {
 		t.Errorf("watch console config must not set NoArchive: %+v", cfg)
 	}
 
+	// The SQL panel opt-in reaches the config from the env — proving the wire,
+	// not just the function (deleting the SQLPanel assignment in upConsoleConfig
+	// must fail a test). Env-driven, so set it around this one call.
+	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "1")
+	cfgSQL, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"})
+	if err != nil {
+		t.Fatalf("upConsoleConfig (sql panel): %v", err)
+	}
+	if !cfgSQL.SQLPanel {
+		t.Error("BINTRAIL_CONSOLE_SQL_PANEL=1 did not reach console.Config.SQLPanel via watch")
+	}
+	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "")
+
 	// Without baseline flags the Phase 1 default is preserved: empty baselines
 	// keep the reconstruct surface gated off.
 	cfg, err = upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"})

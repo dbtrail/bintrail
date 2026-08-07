@@ -39,7 +39,7 @@ const EVENT_CSV_COLUMNS = [
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "timetravel", "recover", "status", "storage", "connect"];
+const ROUTES = ["overview", "events", "timetravel", "recover", "sql", "status", "storage", "connect"];
 
 const MON_STATE_TITLES = {
   failed: "connection is failing and retrying automatically; press Start for details",
@@ -625,6 +625,8 @@ function navigate(route, params, push = true) {
   if (route === "timetravel" && !capsCache.reconstruct) route = "overview";
   // Storage is a watch-daemon surface (rotation + archiving live there).
   if (route === "storage" && !capsCache.monitor) route = "overview";
+  // The SQL panel is opt-in (BINTRAIL_CONSOLE_SQL_PANEL) and per-server gated.
+  if (route === "sql" && !capsCache.sql) route = "overview";
   const qs = params && Object.keys(params).length
     ? "?" + new URLSearchParams(params).toString() : "";
   if (push) history.pushState({ route }, "", "/" + route + qs);
@@ -634,8 +636,11 @@ function navigate(route, params, push = true) {
 function renderRoute() {
   // The date-picker popover lives in document.body (position:fixed), outside
   // the #view subtree route changes normally clear — there's no per-view
-  // teardown hook in this codebase to hang that cleanup on otherwise.
+  // teardown hook in this codebase to hang that cleanup on otherwise. An
+  // in-flight SQL panel query is abandoned here for the same reason: leaving
+  // the page must release the daemon's single-query latch.
   closeDatePicker();
+  abortSQLRun();
   const route = routeFromLocation();
   setActiveNav(route);
   cursorIdx = -1;
@@ -652,6 +657,7 @@ function renderRoute() {
     case "events": return renderEvents(params);
     case "timetravel": return renderTimetravel(params);
     case "recover": return renderRecover(params);
+    case "sql": return renderSQL();
     case "status": return renderStatus();
     case "storage": return renderStorage();
     case "connect": return renderConnect();
@@ -2106,6 +2112,119 @@ function duckdbCard() {
   return card;
 }
 
+// ── SQL panel (#1177) ────────────────────────────────────────────────────────
+//
+// Free-form DuckDB SELECTs over this server's archived Parquet, executed
+// server-side in a locked-down sandbox (see internal/console/sqlpanel.go). The
+// panel is opt-in and per-server gated; navigate() already redirected here only
+// when capsCache.sql is true. The Cancel button IS the cancellation mechanism:
+// it aborts the fetch, which kills the request context, which interrupts the
+// DuckDB query — there is no server-side cancel endpoint to call.
+
+let sqlRunController = null; // AbortController for the in-flight query, if any
+
+// abortSQLRun cancels an in-flight SQL panel query. Called on navigation away
+// and on server switch so a long query never keeps holding the daemon's
+// single-in-flight latch after the operator has left the page (they would come
+// back to a 429 with no running query to cancel). Safe to call when idle.
+function abortSQLRun() { if (sqlRunController) sqlRunController.abort(); }
+
+async function renderSQL() {
+  if (!capsCache.sql) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
+  const v = VIEW();
+  clear(v);
+  v.append(pageHead("SQL", null));
+
+  const card = el("div", { class: "card" });
+  card.append(el("p", { class: "form-hint", text:
+    "Run a read-only SQL query over this server's archived Parquet — an \"events\" view across every archive source, " +
+    "plus one \"state_<schema>_<table>\" view per table in the newest baseline. Only SELECT runs; results are capped." }));
+
+  const input = el("textarea", {
+    class: "sql-input", id: "sql-input", spellcheck: "false", rows: "6",
+    placeholder: "SELECT event_type, schema_name, table_name FROM events ORDER BY commit_time DESC LIMIT 100",
+  });
+  card.append(input);
+
+  const runBtn = el("button", { class: "btn btn-primary btn-sm", type: "button", text: "Run" });
+  const cancelBtn = el("button", { class: "btn btn-sm", type: "button", text: "Cancel", hidden: true });
+  const statusLine = el("span", { class: "sql-status", id: "sql-status" });
+  card.append(el("div", { class: "sql-actions" }, runBtn, cancelBtn, statusLine));
+  v.append(card);
+
+  const results = el("div", { id: "sql-results" });
+  v.append(results);
+  viewEnter();
+
+  const run = () => runSQL(input.value, { runBtn, cancelBtn, statusLine, results });
+  runBtn.onclick = run;
+  cancelBtn.onclick = () => { if (sqlRunController) sqlRunController.abort(); };
+  // Cmd/Ctrl+Enter submits from the textarea — the expected shortcut for a
+  // query box, and it keeps Enter free for newlines in a multi-line statement.
+  input.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); run(); }
+  });
+  input.focus();
+}
+
+async function runSQL(sql, ui) {
+  const { runBtn, cancelBtn, statusLine, results } = ui;
+  if (!sql || !sql.trim()) { statusLine.textContent = "enter a SELECT statement"; return; }
+  const gen = serverGen;
+  sqlRunController = new AbortController();
+  runBtn.disabled = true;
+  cancelBtn.hidden = false;
+  statusLine.textContent = "running…";
+  clear(results);
+  try {
+    const headers = { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json" };
+    if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+    const res = await fetch("/api/sql", {
+      method: "POST", headers, body: JSON.stringify({ sql }), signal: sqlRunController.signal,
+    });
+    const text = await res.text();
+    if (gen !== serverGen) return; // a server switch abandoned this query
+    if (!res.ok) {
+      if (res.status === 401) { handleUnauthorized(); return; }
+      let msg = text || "HTTP " + res.status;
+      try { const j = JSON.parse(text); if (j && j.error) msg = j.error; } catch (_) {}
+      statusLine.textContent = "";
+      renderError(results, new Error(msg));
+      return;
+    }
+    const data = JSON.parse(text);
+    statusLine.textContent = data.row_count + " row" + (data.row_count === 1 ? "" : "s") +
+      " in " + data.elapsed_ms + " ms" + (data.truncated ? " (truncated)" : "");
+    renderSQLResult(results, data);
+  } catch (err) {
+    if (err && err.name === "AbortError") { statusLine.textContent = "canceled"; return; }
+    if (gen !== serverGen) return;
+    statusLine.textContent = "";
+    renderError(results, err);
+  } finally {
+    sqlRunController = null;
+    runBtn.disabled = false;
+    cancelBtn.hidden = true;
+  }
+}
+
+function renderSQLResult(mount, data) {
+  clear(mount);
+  const cols = data.columns || [];
+  const rows = data.rows || [];
+  if (!rows.length) { mount.append(el("div", { class: "empty" }, el("p", { text: "No rows." }))); return; }
+  const wrap = el("div", { class: "sql-table-wrap" });
+  const table = el("table", { class: "statetable sql-table" });
+  table.append(el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", { text: c })))));
+  const tbody = el("tbody");
+  for (const r of rows) {
+    tbody.append(el("tr", {}, ...r.map((cell) => el("td", { text: valueToString(cell) }))));
+  }
+  table.append(tbody);
+  wrap.append(table);
+  mount.append(wrap);
+}
+
 function telemetryCard(t) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Usage telemetry" }));
   if (!t || t.error) {
@@ -3210,9 +3329,11 @@ async function switchServer(id) {
   schemaCache = null;
   tablesCache.clear();
   // A switch is a fresh context: drop any carried undo-context and SQL so they
-  // can never be auto-applied against a different server's index.
+  // can never be auto-applied against a different server's index, and abort any
+  // in-flight panel query (it targeted the old server, and holds its latch).
   pendingRecover = null;
   lastSQL = "";
+  abortSQLRun();
   try { await gateCapabilities(); } catch (err) {
     if (err && err.status === 401) return; // chokepoint already raised the sign-in gate
     throw err;
@@ -3727,6 +3848,7 @@ function cmdkCommands() {
     { group: "Navigate", label: "Status", run: () => navigate("status") },
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
+  if (capsCache.sql) cmds.push({ group: "Navigate", label: "SQL", run: () => navigate("sql") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Storage", run: () => navigate("storage") });
   cmds.push({ group: "Navigate", label: "Connect AI", run: () => navigate("connect") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });

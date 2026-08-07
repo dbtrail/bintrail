@@ -55,16 +55,42 @@ type Input struct {
 	// older snapshot's rows are a different point in time, and a view union-ing
 	// two of them would silently mix states that never coexisted.
 	Baselines []BaselineTable
+
+	// ExcludeEventColumns drops the named columns (matched case-insensitively
+	// against archive.BinlogEventColumns) from the `events` view. Purely
+	// mechanical here — the views package names no policy. The console SQL panel
+	// (#1177) uses it to withhold the paid forensics columns (connection_id,
+	// query_text, query_hash) it must not serve, the same set eventDTO omits.
+	// Empty for the downloadable `bintrail views` file, which describes the
+	// operator's OWN Parquet in full.
+	ExcludeEventColumns []string
 }
 
-// Generate renders the complete .sql file.
+// Generate renders the complete .sql file: the explanatory header, the S3
+// credential preamble when needed, and the view definitions. This is the
+// artifact an operator downloads and runs in their OWN DuckDB, so the preamble
+// creates a credential_chain secret and INSTALLs httpfs inline.
 func Generate(in Input) string {
 	var b strings.Builder
 	writeHeader(&b, in)
 	if in.needsS3() {
 		writeS3Preamble(&b, in.ArchiveRegion)
 	}
-	writeEventsView(&b, in.ArchiveSources)
+	writeEventsView(&b, in.ArchiveSources, in.ExcludeEventColumns)
+	writeStateViews(&b, in)
+	return b.String()
+}
+
+// GenerateViews renders ONLY the view definitions — no header, no S3 preamble.
+// It is for a caller that runs the views in a DuckDB session it already set up:
+// bintrail's own S3 credential wiring (duckdbutil.EnableS3CredentialChain) is
+// best-effort and tolerates an unresolved credential chain, whereas the
+// download preamble's `CREATE SECRET` aborts the whole script when no
+// credentials resolve. The console SQL panel (#1177) uses this so its session
+// setup does not hinge on the human-facing preamble.
+func GenerateViews(in Input) string {
+	var b strings.Builder
+	writeEventsView(&b, in.ArchiveSources, in.ExcludeEventColumns)
 	writeStateViews(&b, in)
 	return b.String()
 }
@@ -167,7 +193,11 @@ const eventTypeCase = "CASE \"event_type\"\n" +
 // same slice the archiver writes with — so a column added or removed there
 // changes this output and breaks the golden test, rather than leaving the
 // generated schema quietly behind the files it describes.
-func writeEventsView(b *strings.Builder, sources []string) {
+func writeEventsView(b *strings.Builder, sources []string, excludeCols []string) {
+	exclude := make(map[string]bool, len(excludeCols))
+	for _, c := range excludeCols {
+		exclude[strings.ToLower(c)] = true
+	}
 	b.WriteString("-- events: every archived binlog event, across all archive sources.\n")
 	if len(sources) == 0 {
 		b.WriteString("-- (skipped: no archive sources are registered in archive_state)\n\n")
@@ -185,6 +215,9 @@ func writeEventsView(b *strings.Builder, sources []string) {
 	// distinguishable inside a single view.
 	b.WriteString("    \"bintrail_id\", \"event_date\", \"event_hour\",\n")
 	for _, col := range archive.BinlogEventColumns {
+		if exclude[strings.ToLower(col.Name)] {
+			continue
+		}
 		switch col.Name {
 		case "event_type":
 			b.WriteString("    \"event_type\" AS \"event_type_code\",\n")

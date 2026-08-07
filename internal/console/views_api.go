@@ -3,6 +3,8 @@ package console
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -11,6 +13,48 @@ import (
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 	"github.com/dbtrail/dbtrail/internal/views"
 )
+
+// errNoViewSources: the selected server has neither archived partitions nor a
+// baseline snapshot — there is no Parquet layout to describe (views.sql) or to
+// query (the SQL panel).
+var errNoViewSources = errors.New("this server has no archived partitions and no baseline snapshot yet")
+
+// buildViewsInput resolves the selected server's Parquet layout — archive
+// sources from archive_state plus the NEWEST baseline snapshot's tables — into
+// the generator input shared by GET /api/views.sql and the SQL panel. A
+// baseline root that is configured but unlistable is an upstream fault worth
+// naming, not a degrade: silently dropping the baseline half would hand over a
+// layout missing every state view.
+func (s *Server) buildViewsInput(ctx context.Context, b *bundle) (views.Input, error) {
+	in := views.Input{
+		GeneratedAt: time.Now().UTC(),
+		Version:     s.version,
+	}
+	in.ArchiveSources = consoleArchiveSources(ctx, b.db)
+	if b.baselineSrc != "" {
+		in.BaselineSource = b.baselineSrc
+		files, err := reconstruct.ListBaselines(ctx, b.baselineSrc)
+		if err != nil {
+			return views.Input{}, fmt.Errorf("list baselines: %w", err)
+		}
+		if len(files) > 0 {
+			newest := files[0].SnapshotTime // ListBaselines returns newest first
+			in.BaselineSnapshot = newest
+			for _, f := range files {
+				if !f.SnapshotTime.Equal(newest) {
+					continue
+				}
+				in.Baselines = append(in.Baselines, views.BaselineTable{
+					Schema: f.Schema, Table: f.Table, Path: f.Path,
+				})
+			}
+		}
+	}
+	if len(in.ArchiveSources) == 0 && len(in.Baselines) == 0 {
+		return views.Input{}, errNoViewSources
+	}
+	return in, nil
+}
 
 // handleViewsSQL serves GET /api/views.sql: the same DuckDB view definitions
 // `bintrail views` generates, with the paths resolved from the selected
@@ -53,42 +97,19 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	in := views.Input{
-		GeneratedAt: time.Now().UTC(),
-		Version:     s.version,
-	}
-	in.ArchiveSources = consoleArchiveSources(r.Context(), b.db)
-	if b.baselineSrc != "" {
-		in.BaselineSource = b.baselineSrc
-		files, err := reconstruct.ListBaselines(r.Context(), b.baselineSrc)
-		if err != nil {
-			// Configured but unreadable is an upstream fault worth naming, and
-			// the same 502 the baseline listing returns for it. Degrading to
-			// "archives only" would silently hand over a file missing every
-			// state view the operator came for.
-			writeJSONError(w, http.StatusBadGateway, "list baselines: "+err.Error())
-			return
-		}
-		if len(files) > 0 {
-			newest := files[0].SnapshotTime // ListBaselines returns newest first
-			in.BaselineSnapshot = newest
-			for _, f := range files {
-				if !f.SnapshotTime.Equal(newest) {
-					continue
-				}
-				in.Baselines = append(in.Baselines, views.BaselineTable{
-					Schema: f.Schema, Table: f.Table, Path: f.Path,
-				})
-			}
-		}
-	}
-
-	if len(in.ArchiveSources) == 0 && len(in.Baselines) == 0 {
+	in, err := s.buildViewsInput(r.Context(), b)
+	switch {
+	case errors.Is(err, errNoViewSources):
 		// Nothing to describe. A file of comments explaining that would be a
 		// worse answer than the UI simply not offering the button, which is
 		// what the matching capability arranges.
 		writeJSONError(w, http.StatusNotFound,
-			"this server has no archived partitions and no baseline snapshot yet — nothing to generate views over")
+			errNoViewSources.Error()+" — nothing to generate views over")
+		return
+	case err != nil:
+		// Configured but unreadable is an upstream fault worth naming, and
+		// the same 502 the baseline listing returns for it.
+		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 

@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/dbtrail/dbtrail/ext"
@@ -152,6 +153,12 @@ type Config struct {
 	// link release artifacts (the .mcpb bundle) matching the running binary.
 	// Optional; empty reads as an unversioned build.
 	Version string
+	// SQLPanel enables the sandboxed server-side SQL panel (#1177): POST
+	// /api/sql runs free-form DuckDB SELECTs over the selected server's
+	// archive/baseline Parquet inside a locked-down session (see sqlpanel.go
+	// for the layered posture). Off by default; the callers wire it from
+	// BINTRAIL_CONSOLE_SQL_PANEL=1, mirroring the baseline-trigger opt-in.
+	SQLPanel bool
 }
 
 // RotationDefaults is the daemon-side built-in-rotation policy, surfaced to the
@@ -222,6 +229,11 @@ type Server struct {
 	// data-profile enforcement (#1075). Inert in OSS (no session ever carries a
 	// profile); populated lazily on the first profiled request.
 	sessionProfiles *profileRuleCache
+	// sqlPanel: the SQL panel opt-in (Config.SQLPanel); sqlPanelBusy is its
+	// one-query-in-flight latch (zero value ready, so struct-literal test
+	// servers need no initialization).
+	sqlPanel     bool
+	sqlPanelBusy atomic.Bool
 }
 
 // serverHeader selects the target server per request. Selection is stateless —
@@ -374,6 +386,7 @@ func New(cfg Config) (*Server, error) {
 		tlsConf:          tlsConf,
 		mcpTokenPath:     mcpTokenPath,
 		sessionProfiles:  newProfileRuleCache(),
+		sqlPanel:         cfg.SQLPanel,
 	}
 	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot
@@ -465,6 +478,10 @@ func (s *Server) buildHandler() http.Handler {
 	// booleans and non-secret names — never values).
 	api.HandleFunc("GET /api/baselines", s.handleBaselines)
 	api.HandleFunc("GET /api/views.sql", s.handleViewsSQL)
+	// The sandboxed SQL panel (#1177). Registered unconditionally so the
+	// route's refusal (403 with the opt-in hint) is actionable; the real gate
+	// is inside the handler, like the monitor/baseline-trigger verbs.
+	api.HandleFunc("POST /api/sql", s.recordAction("sql", s.handleSQLPanel))
 	api.HandleFunc("GET /api/storage", s.handleStorageInfo)
 	// Usage-telemetry opt-out: read the machine-wide state, and toggle it (a
 	// local config write, not a data write). Available on any console; the UI

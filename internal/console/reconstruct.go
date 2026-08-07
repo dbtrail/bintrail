@@ -67,6 +67,12 @@ type capabilitiesResponse struct {
 	// (archives enabled, no active data profile, and something to describe), so
 	// the UI never offers a button that only 404s.
 	Views bool `json:"views"`
+	// SQL: the sandboxed server-side SQL panel (#1177) is usable — this
+	// process opted in (BINTRAIL_CONSOLE_SQL_PANEL=1) AND the selected server
+	// passes the same per-server conditions views does (archives enabled, no
+	// active data profile, a Parquet layout to query). Gated exactly as
+	// /api/sql refuses, so the UI never advertises a tab that only errors.
+	SQL bool `json:"sql"`
 	// BaselineTrigger: this process can create baseline snapshots in-process from
 	// the console (the watch daemon opted in with BINTRAIL_CONSOLE_BASELINE_TRIGGER=1).
 	// Process-global, like Monitor — the endpoint does the per-server validation
@@ -181,6 +187,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		restricted := sessionRestricted(r)
 		resp.Reconstruct = b.baselineConfigured && !restricted
 		resp.Views = s.viewsAvailable(r, b)
+		resp.SQL = s.sqlPanelAvailable(r, b)
 		// Match the recover-cascade handler's Phase-2 gate exactly so the advertised
 		// capability can't over-promise (handler builds the provider only when both
 		// a baseline source and a resolver are present).

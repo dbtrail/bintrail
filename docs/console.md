@@ -360,6 +360,57 @@ across the rotation dialog and the per-server edit form):
   `BINTRAIL_TELEMETRY`) or the `--telemetry` flag already controls it, the card
   says so and defers to that. See [TELEMETRY.md](./TELEMETRY.md).
 
+### The SQL panel (opt-in)
+
+The **Query in DuckDB** card above hands you a file to run in your *own* DuckDB.
+The **SQL panel** is the other half of that trade: a query box that runs the SQL
+**inside the console daemon** and returns the rows, so you never leave the
+browser. Because that SQL now executes server-side, it is **off by default** and
+guarded — start the console with `BINTRAIL_CONSOLE_SQL_PANEL=1` to expose it. It
+appears as a **SQL** item in the sidebar for any server that has an archive or
+baseline layout to query.
+
+What you can query is exactly what the `views.sql` schema defines: an `events`
+view across every archive source, plus one `state_<schema>_<table>` view per
+table in the newest baseline snapshot. Type a `SELECT`, press **Run** (or
+`⌘/Ctrl+Enter`), and the results come back in a capped table. A long query is
+**cancelable** — the **Cancel** button aborts it and interrupts the query in the
+daemon; closing the tab or navigating away does the same.
+
+The panel is deliberately constrained, and every constraint is enforced
+server-side (the UI only mirrors it):
+
+- **Read-only.** Only a single `SELECT` runs. Writes, `COPY`, `ATTACH`,
+  `INSTALL`, `CREATE SECRET`, `SET`, and multi-statement input are refused —
+  classified by DuckDB's own parser, not a text filter.
+- **Views only.** Query the pre-built `events` and `state_<schema>_<table>`
+  views. The `FROM` clause accepts those views (and a few pure generators like
+  `range`) and nothing else: every file reader (`read_parquet`, `read_csv`,
+  `FROM '…/file.parquet'`, …) and every dynamic-SQL function (`query`,
+  `query_table`, …) is refused by an allowlist that fails closed. So the views —
+  which omit the paid forensics columns, exactly as the rest of the console
+  does — are the one data path.
+- **Filesystem-sandboxed.** Under the views, the DuckDB session may touch *only*
+  the resolved archive/baseline roots for the selected server (local paths and
+  `s3://` prefixes alike); everything else — other buckets, arbitrary URLs,
+  local files outside the roots — is denied, and the sandbox configuration is
+  locked so no query can widen it.
+- **Bounded.** Conservative memory/thread budget (never the `--ultrafast`
+  profile — the daemon may also be capturing your stream), a hard 60-second
+  query timeout, a result-row cap matching the events API, and **one query at a
+  time** per process (a second concurrent request gets `429`).
+- **Access-control aware.** Refused outright while a data profile is active:
+  free-form SQL reads the unredacted Parquet directly and cannot honor
+  per-column redaction, so the whole surface is withheld (the same stance the
+  `views.sql` download takes).
+- **Audited.** Every statement that reaches the engine is recorded on the audit
+  seam (`console` / `sql.run`) with the SQL text, its outcome (`ok` / `refused` /
+  `error`) and row count — including one the read-only gate refuses. Only a
+  statement the client aborts mid-flight is not recorded.
+
+No AWS credentials are ever exposed to the query; S3 reads use the daemon's
+ambient credential chain, scoped to the allowed prefixes.
+
 #### Creating a baseline from the console
 
 By default the console only *lists* baselines — you produce them with the
@@ -552,6 +603,12 @@ see the metrics tables and example alert rules in
 - `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
 - `BINTRAIL_CONSOLE_ALLOWED_HOSTS` — comma-separated, same as `--allowed-hosts`.
 - `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
+- `BINTRAIL_CONSOLE_SQL_PANEL` — `1`/`true` enables the **SQL** page: a
+  server-side, read-only SQL query box over the selected server's Parquet (see
+  [The SQL panel](#the-sql-panel-opt-in)). Off by default; works on both `serve`
+  and `watch`. Unlike the `views.sql` download, this executes SQL **inside the
+  daemon**, so it runs in a locked-down DuckDB sandbox — read [The SQL panel](#the-sql-panel-opt-in)
+  before enabling it on a shared or public bind.
 - `BINTRAIL_CONSOLE_ARCHIVE_STAGING` (`watch` only) — local staging dir for the
   Archive-to-S3 feature, same as `--archive-staging-dir`. AWS credentials for
   the upload come from the ambient chain (`AWS_*` / `~/.aws` / role).
@@ -911,6 +968,7 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `PUT /api/rotation` | Supervisor only (403 on the standalone console): save a global rotation override `{retain, interval, add_future}` (validated; `off` rejected). Applies live on the next cycle. |
 | `GET /api/baselines` | Read-only listing of the **selected server's** baseline snapshots, grouped per snapshot: `{configured, source, kind, reconstruct, snapshots: [{time, age_hours, tables, binlog_file, binlog_pos, gtid_set}]}` (coordinates local-only, capped at 50 snapshots). `502` when the configured source is unreadable. |
 | `GET /api/views.sql` | **Not JSON** — a `text/plain` DuckDB schema over the selected server's Parquet (the same output as `bintrail views`), served as a `views.sql` attachment. Nothing is executed here; the file runs in your own DuckDB. 404 when archives are disabled or nothing is archived yet, 403 while an access-control profile is active. |
+| `POST /api/sql` | Runs a read-only `SELECT` over the selected server's Parquet **inside the daemon**, in a locked-down DuckDB sandbox, returning `{columns, rows, row_count, truncated, elapsed_ms}`. Opt-in (`BINTRAIL_CONSOLE_SQL_PANEL=1`) — `403` otherwise. `403` while a profile is active; `404` when archives are disabled or there is nothing to query; `422` for a non-`SELECT`, a statement error, or the timeout; `429` when another query is already running. Cancellation is by aborting the request. See [The SQL panel](#the-sql-panel-opt-in). |
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`,

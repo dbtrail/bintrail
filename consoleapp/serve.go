@@ -226,6 +226,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		Registry:      registry,
 		Listen:        conListen,
 		Token:         conToken,
+		SQLPanel:      sqlPanelEnabled(),
 		NoArchive:     conNoArchive || conProfile != "",
 		DenyTables:    denyTables,
 		RedactColumns: redactCols,
@@ -265,6 +266,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 // the console's mode. The URL never carries a ?token= unless an explicit token
 // is the only credential (URL() handles that); a live credential does not
 // belong in logs or shell history.
+// sqlPanelEnabled reads the SQL panel opt-in (#1177). Env-only and off by
+// default, mirroring BINTRAIL_CONSOLE_BASELINE_TRIGGER: an explicit operator
+// assertion, not something a stray flag in a wrapper script flips on. Shared
+// by serve and watch.
+func sqlPanelEnabled() bool {
+	v := os.Getenv("BINTRAIL_CONSOLE_SQL_PANEL")
+	return v == "1" || v == "true"
+}
+
 func printConsoleBanner(srv *console.Server, headline string) {
 	fmt.Fprintf(os.Stderr, "\n%s\n\n    %s\n\n", headline, srv.URL())
 	switch {
