@@ -95,7 +95,7 @@ func readSQLLine(path string, lineNum int, line string, inStatement *bool, fn fu
 			return nil
 		}
 		// Find VALUES keyword (after any column list).
-		valIdx := strings.Index(upper, " VALUES")
+		valIdx := findValuesKeyword(trimmed)
 		if valIdx < 0 {
 			// The line opens an INSERT/REPLACE but carries no VALUES clause.
 			// In a complete mydumper/mysqldump data file every INSERT/REPLACE
@@ -110,7 +110,7 @@ func readSQLLine(path string, lineNum int, line string, inStatement *bool, fn fu
 				"— dump file may be truncated or in an unsupported layout: %q",
 				path, lineNum, truncateForError(trimmed))
 		}
-		fragment = strings.TrimSpace(trimmed[valIdx+7:])
+		fragment = strings.TrimSpace(trimmed[valIdx+len("VALUES"):])
 	}
 
 	terminated, err := parseSQLTuples(fragment, fn)
@@ -119,6 +119,58 @@ func readSQLLine(path string, lineNum int, line string, inStatement *bool, fn fu
 	}
 	*inStatement = !terminated
 	return nil
+}
+
+// findValuesKeyword returns the byte offset of the statement-level VALUES
+// keyword in an INSERT/REPLACE line, or -1 when there is none.
+//
+// A naive substring search for " VALUES" (the pre-#502 code) returns the FIRST
+// occurrence, which can land INSIDE a backtick-quoted identifier with an
+// embedded space (`Allowed Values`, `sensor values`): slicing there starts the
+// tuple parser mid-identifier, which silently drops the first row of a
+// multi-line INSERT or rejects a single-line file as "truncated". So scan at
+// statement level: backtick-quoted identifiers are skipped whole (a doubled
+// backtick is MySQL's escape for a literal one inside), and VALUES matches
+// only as a standalone word. Everything before the real keyword is
+// identifiers, keywords, and the (col, …) list — dumps quote every identifier,
+// and VALUES is a reserved word, so an unquoted statement-level match is
+// always the keyword. An unterminated backtick (a line truncated
+// mid-identifier) runs to end-of-line and reports "no VALUES", which routes
+// into the loud truncated-dump error at the call site.
+func findValuesKeyword(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '`' {
+			for i++; i < len(s); i++ {
+				if s[i] == '`' {
+					if i+1 < len(s) && s[i+1] == '`' {
+						i++ // `` — escaped backtick, still inside the identifier
+						continue
+					}
+					break // closing backtick; the outer i++ steps past it
+				}
+			}
+			continue
+		}
+		if !hasPrefixFold(s[i:], "VALUES") {
+			continue
+		}
+		// Word boundaries on both sides, so a suffix ("NVALUES") or prefix
+		// ("VALUESX") of a longer unquoted token never matches.
+		if i > 0 && isWordByte(s[i-1]) {
+			continue
+		}
+		if i+len("VALUES") < len(s) && isWordByte(s[i+len("VALUES")]) {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+// isWordByte reports whether c can be part of an unquoted MySQL identifier
+// (the word-boundary test for findValuesKeyword; '$' is legal in identifiers).
+func isWordByte(c byte) bool {
+	return isIdentByte(c) || c == '$'
 }
 
 // truncateForError caps a line excerpt used in an error message so a long

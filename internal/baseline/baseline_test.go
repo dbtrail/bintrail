@@ -438,6 +438,104 @@ func TestReadSQLRow(t *testing.T) {
 	}
 }
 
+// TestReadSQLRowIdentifierEmbeddedSpace pins #502: a backtick-quoted table or
+// column identifier with an embedded space (`Allowed Values`, `sensor values`)
+// contains the substring " VALUES" before the real keyword. The pre-fix naive
+// substring search sliced mid-identifier — silently dropping the first row of
+// a multi-line INSERT, or rejecting a single-line file as truncated. The
+// VALUES finder must skip quoted identifiers and match only the keyword.
+func TestReadSQLRowIdentifierEmbeddedSpace(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want [][]string
+	}{
+		{
+			// Multi-line (mydumper native layout): pre-fix this returned rows
+			// (2,b),(3,c) — the first row lost with a clean exit.
+			name: "column with embedded space, multi-line",
+			sql:  "INSERT INTO `settings` (`id`,`Allowed Values`) VALUES(1,'a')\n,(2,'b')\n,(3,'c');\n",
+			want: [][]string{{"1", "a"}, {"2", "b"}, {"3", "c"}},
+		},
+		{
+			name: "table with embedded space, multi-line",
+			sql:  "INSERT INTO `sensor values` VALUES(1)\n,(2)\n,(3);\n",
+			want: [][]string{{"1"}, {"2"}, {"3"}},
+		},
+		{
+			// Single-line (mysqldump extended-insert): pre-fix this errored as
+			// "unterminated INSERT statement" and produced zero rows.
+			name: "column with embedded space, single-line",
+			sql:  "INSERT INTO `config` (`k`,`Default Values`) VALUES (1,'x'),(2,'y'),(3,'z');\n",
+			want: [][]string{{"1", "x"}, {"2", "y"}, {"3", "z"}},
+		},
+		{
+			// A doubled backtick is MySQL's escape for a literal backtick INSIDE
+			// a quoted identifier — the skip must not treat it as the closer.
+			name: "escaped backtick inside identifier",
+			sql:  "INSERT INTO `a``b values` VALUES(7,'q');\n",
+			want: [][]string{{"7", "q"}},
+		},
+		{
+			name: "REPLACE with embedded-space column",
+			sql:  "REPLACE INTO `settings` (`id`,`Allowed Values`) VALUES(9,'r');\n",
+			want: [][]string{{"9", "r"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "shop.t.00000.sql")
+			if err := os.WriteFile(path, []byte(tc.sql), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var rows [][]string
+			if err := ReadSQLFile(path, func(values []string, nulls []bool) error {
+				rows = append(rows, append([]string(nil), values...))
+				return nil
+			}); err != nil {
+				t.Fatalf("ReadSQLFile: %v", err)
+			}
+			if len(rows) != len(tc.want) {
+				t.Fatalf("got %d rows %v, want %d", len(rows), rows, len(tc.want))
+			}
+			for i := range tc.want {
+				for j := range tc.want[i] {
+					if rows[i][j] != tc.want[i][j] {
+						t.Errorf("row %d col %d = %q, want %q", i, j, rows[i][j], tc.want[i][j])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestFindValuesKeyword(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want int // -1 = not found; otherwise the offset of 'V'
+	}{
+		{"plain", "INSERT INTO `t` VALUES(1)", 16},
+		{"lowercase keyword", "insert into `t` values(1)", 16},
+		{"no space before paren", "INSERT INTO `t` (`a`) VALUES(1)", 22},
+		{"embedded-space identifier skipped", "INSERT INTO `sensor values` VALUES(1)", 28},
+		{"escaped backtick inside identifier", "INSERT INTO `a``b values` VALUES(1)", 26},
+		{"suffix of longer word ignored", "INSERT INTO NVALUES VALUES(1)", 20},
+		{"prefix of longer word ignored", "INSERT INTO VALUESX VALUES(1)", 20},
+		{"dollar-joined word ignored", "INSERT INTO a$VALUES VALUES(1)", 21},
+		{"no keyword", "INSERT INTO `t` (`a`,`b`)", -1},
+		{"unterminated backtick reads to end", "INSERT INTO `sensor values", -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := findValuesKeyword(tc.in); got != tc.want {
+				t.Errorf("findValuesKeyword(%q) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestReadSQLRowEscaping(t *testing.T) {
 	cases := []struct {
 		name string
