@@ -73,3 +73,48 @@ func TestVerifyBaselinePair_pgBypassesGeneratedPKGate(t *testing.T) {
 		t.Fatalf("want the PG LSN-anchor reason, got: %q", res.Detail)
 	}
 }
+
+// pgShapedGeneratedResolver combines the two gate triggers on one PK column:
+// empty DataType (the PG snapshot shape, #1009) AND IsGenerated. The type gate
+// must win — see the ordering tests below, which pin the loop-then-gate order
+// the in-code comments claim.
+func pgShapedGeneratedResolver() *metadata.Resolver {
+	return metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"app.orders": {Schema: "app", Table: "orders", Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "", IsGenerated: true},
+		}},
+	})
+}
+
+func TestVerifyTable_emptyDataTypeKeepsWrongPathVerdict(t *testing.T) {
+	res, err := VerifyTable(context.Background(), Config{Resolver: pgShapedGeneratedResolver()}, "app", "orders")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != StatusInconclusive {
+		t.Fatalf("status = %q, want inconclusive", res.Status)
+	}
+	if strings.Contains(res.Detail, "generated column") {
+		t.Fatalf("empty DataType must win the #1009 wrong-path verdict, got the generated-PK reason: %q", res.Detail)
+	}
+	if !strings.Contains(res.Detail, "PostgreSQL") {
+		t.Fatalf("want the PG wrong-path reason, got: %q", res.Detail)
+	}
+}
+
+func TestVerifyBaselinePair_emptyDataTypeKeepsWrongPathVerdict(t *testing.T) {
+	cfg := BaselineConfig{Resolver: pgShapedGeneratedResolver(), SourceFlavor: ""} // "" == mysql
+	res, err := VerifyBaselinePair(context.Background(), cfg, BaselinePair{Schema: "app", Table: "orders"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != StatusInconclusive {
+		t.Fatalf("status = %q, want inconclusive", res.Status)
+	}
+	if strings.Contains(res.Detail, "generated column") {
+		t.Fatalf("empty DataType must win the #1009 wrong-path verdict, got the generated-PK reason: %q", res.Detail)
+	}
+	if !strings.Contains(res.Detail, "PostgreSQL") {
+		t.Fatalf("want the PG wrong-path reason, got: %q", res.Detail)
+	}
+}

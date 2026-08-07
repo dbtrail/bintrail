@@ -537,6 +537,14 @@ The resolver is loaded best-effort in the `recover` command — a failure logs a
 
 Generated columns (`STORED` or `VIRTUAL`) are computed by MySQL and cannot be set explicitly, so the generated script skips them in `INSERT`/`UPDATE` SET clauses — the script won't fail trying to assign a value MySQL owns.
 
+### System-versioned tables (MariaDB)
+
+MariaDB silently extends a system-versioned table's `PRIMARY KEY` with its `ROW END` period column (`PRIMARY KEY (id, row_end)`), and that column is generated — baselines never carry its values, and the binlog records history rows and versioned `DELETE`s under the same surviving key. Rendering such a table as a whole would risk emitting history rows as live data, so bintrail refuses instead:
+
+- **Full-table `reconstruct`** (baseline merge and binlog-only fallback alike) and the shim's **full-table `_flashback`/`_snapshot`** views refuse with an error naming the generated PK column.
+- **`verify`** reports the table as `inconclusive` — a permanent property of the table's shape, not a failure. A run scoped only to such tables still exits non-zero (nothing was proven).
+- **Still available**: `query` and `recover` are not gated, and single-row `reconstruct` works with an explicit column list, e.g. `--pk 1 --pk-columns id`.
+
 ### Column type encodings (BLOB/TEXT, GEOMETRY, VECTOR)
 
 Columns that MySQL delivers as raw bytes are stored base64-encoded in the index, so `recover` decodes them back to a loadable literal using the column type from the schema snapshot:

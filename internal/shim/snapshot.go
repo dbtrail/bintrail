@@ -474,13 +474,16 @@ func (h *Handler) pkColumnMetas(schema, table string) ([]metadata.ColumnMeta, bo
 // refusals above: the binlog-only view is exactly the corrupt one here
 // (history-row inserts fold under their own full pk_values and render as
 // duplicate live rows, and a versioned DELETE is an Update_rows tombstone the
-// latest-event rule keeps as live — verified against MariaDB 11.4).
+// latest-event rule keeps as live — verified against MariaDB 11.4). And no
+// shim single-row steer either: the versioned PK is composite (id, row_end),
+// so PKColumnCheck refuses the `WHERE pk = v` shape on these tables — the one
+// single-row path that does work is the CLI's, with an explicit column list.
 func generatedPKFullTableError(qType QueryType, schema, table string, c metadata.ColumnMeta) error {
 	return mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
 		"resolve %s: primary-key column %s of %s.%s is a generated column (most commonly MariaDB system versioning, "+
 			"which extends the PK with its ROW END period column); neither the baseline merge nor a binlog-only fold "+
 			"can render this table faithfully — history rows and versioned deletes share the surviving key — so the "+
-			"full-table view is refused; single-row lookups are unaffected",
+			"full-table view is refused; use the CLI's single-row reconstruct with an explicit PK column list",
 		qType, c.Name, schema, table))
 }
 
@@ -493,6 +496,13 @@ func generatedPKFullTableError(qType QueryType, schema, table string, c metadata
 func (h *Handler) checkGeneratedPKFullTable(qType QueryType, schema, table string) error {
 	pkCols, ok := h.pkColumnMetas(schema, table)
 	if !ok {
+		// Blind spot, said out loud: with no snapshot metadata the corrupt
+		// shape is undetectable and the fold proceeds unchecked. Debug, not
+		// Warn — a snapshot-less deployment (plain _flashback use) hits this
+		// on every full-table query and has nothing to fix; resolver LOAD
+		// failures already get a rate-limited Warn in resolverCache.get.
+		h.logger.Debug("shim: cannot evaluate the generated-PK gate (no snapshot metadata); full-table fold proceeds unchecked",
+			"schema", schema, "table", table)
 		return nil
 	}
 	c, found := reconstruct.GeneratedPKColumn(pkCols)

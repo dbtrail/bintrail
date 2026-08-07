@@ -78,3 +78,31 @@ func TestReconstructTable_generatedPKRefusal_binlogOnlyPath(t *testing.T) {
 		t.Fatalf("want the generated-PK refusal naming row_end, got: %v", err)
 	}
 }
+
+// TestReconstructTable_emptyDataTypeKeepsWrongPathVerdict pins the gate
+// ORDERING the in-code comment claims: a PK member with an empty DataType —
+// the PG snapshot shape (#1009) — must keep winning the wrong-path verdict
+// even when it is ALSO marked generated. Swapping the generated gate above the
+// SupportedPKType loop would mask it with a MariaDB-shaped message; before
+// this test, that ordering was prose, not a guard.
+func TestReconstructTable_emptyDataTypeKeepsWrongPathVerdict(t *testing.T) {
+	dir := writeGateBaseline(t, "svdb", "orders", map[string]string{
+		baseline.MetaKeyCreateTableSQL: "CREATE TABLE `orders` (`id` int NOT NULL)",
+	})
+	cfg := FullTableConfig{BaselineSrc: dir, At: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)}
+	resolver := metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"svdb.orders": {Schema: "svdb", Table: "orders", Columns: []metadata.ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "", IsGenerated: true},
+		}},
+	})
+	_, err := ReconstructTable(context.Background(), cfg, "svdb", "orders", nil, nil, nil, resolver, "")
+	if err == nil {
+		t.Fatal("expected the PG wrong-path refusal, got nil")
+	}
+	if strings.Contains(err.Error(), "generated column") {
+		t.Fatalf("empty DataType must win the #1009 wrong-path verdict, got the generated-PK message: %v", err)
+	}
+	if !strings.Contains(err.Error(), "PostgreSQL") {
+		t.Fatalf("want the PG wrong-path verdict, got: %v", err)
+	}
+}

@@ -40,7 +40,9 @@ func PKTypeGateReason(c metadata.ColumnMeta, surface, action string) string {
 }
 
 // GeneratedPKColumn returns the first primary-key member that is a STORED/
-// VIRTUAL generated column, in ordinal order, and whether one exists (#1266).
+// VIRTUAL generated column, in input order, and whether one exists (#1266).
+// Callers pass PKColumnMetas(), which preserves ordinal order — the ordering
+// guarantee is the input's, not this function's.
 //
 // The shape this detects in practice is MariaDB system versioning: MariaDB
 // silently extends a versioned table's PRIMARY KEY with its ROW END period
@@ -83,7 +85,7 @@ func GeneratedPKGateReason(c metadata.ColumnMeta, surface string) string {
 			"a versioned table's PK with its ROW END period column — and baselines deliberately omit generated columns, "+
 			"so %s cannot build the baseline-side PK join key for this table; dropping the column from the key instead "+
 			"would corrupt silently, because a versioned table's binlog carries history rows (as inserts) and versioned "+
-			"deletes (as row_end updates) under the same remaining key; query and recover are unaffected, and the CLI's "+
+			"deletes (as row_end updates) under the same remaining key; query and recover are not gated, and the CLI's "+
 			"single-row reconstruct with an explicit PK column list also works", c.Name, surface)
 }
 
