@@ -193,8 +193,13 @@ func writeEventsView(b *strings.Builder, sources []string) {
 			b.WriteString("    \"commit_ts_us\",\n")
 			// Stored as epoch MICROSECONDS (#18); make the usable form the one
 			// that reads like a timestamp next to event_timestamp.
+			// The CAST is load-bearing: commit_ts_us is UNSIGNED (UBIGINT in the
+			// Parquet schema) and make_timestamp only binds BIGINT, so the
+			// uncast form is a binder error that would reach the operator's
+			// DuckDB, not ours. Epoch microseconds stay far below 2^63 (year
+			// 294247), so the narrowing cannot lose a real value.
 			b.WriteString("    CASE WHEN \"commit_ts_us\" IS NULL THEN NULL\n")
-			b.WriteString("         ELSE make_timestamp(\"commit_ts_us\") END AS \"commit_time\",\n")
+			b.WriteString("         ELSE make_timestamp(CAST(\"commit_ts_us\" AS BIGINT)) END AS \"commit_time\",\n")
 		default:
 			fmt.Fprintf(b, "    %s,\n", quoteIdent(col.Name))
 		}

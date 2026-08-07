@@ -57,7 +57,7 @@ CREATE OR REPLACE VIEW "events" AS
     "query_hash",
     "commit_ts_us",
     CASE WHEN "commit_ts_us" IS NULL THEN NULL
-         ELSE make_timestamp("commit_ts_us") END AS "commit_time"
+         ELSE make_timestamp(CAST("commit_ts_us" AS BIGINT)) END AS "commit_time"
   FROM read_parquet(
     [
       '/data/archives/bintrail_id=11111111-2222-3333-4444-555555555555/event_date=*/event_hour=*/*.parquet',
