@@ -549,6 +549,31 @@ try {
   extv.staleAborted ? ok("ext-view: a server switch mid-import abandons the render (serverGen staleness)") : bad("ext-view: a server switch mid-import abandons the render (serverGen staleness)", "render ran after the switch");
 
 
+  // Scenario 11 — CSV formula-injection guard (#965). The events CSV export
+  // includes attacker-controlled values (pk_values/row_before/row_after from
+  // the monitored DB); a leading =, +, -, @, tab or CR must be neutralized
+  // with a leading quote or Excel/Sheets executes it on open. Calls the REAL
+  // embedded csvCell — deleting the guard line in app.js turns this red.
+  const csv = await page.evaluate(() => ({
+    formula: csvCell("=HYPERLINK(\"http://evil.example\",\"click\")"),
+    plus: csvCell("+1"),
+    minus: csvCell("-2"),
+    at: csvCell("@cmd"),
+    tab: csvCell("\tx"),
+    cr: csvCell("\rx"),
+    plain: csvCell("hello"),
+    number: csvCell(42),
+    quoted: csvCell('a,"b'),
+    objFormula: csvCell({ id: 1 }), // JSON starts with { — must NOT be prefixed
+  }));
+  csv.formula === '"\'=HYPERLINK(""http://evil.example"",""click"")"' ? ok("csv: leading = is quote-prefixed (and CSV-quoted)") : bad("csv: leading = is quote-prefixed (and CSV-quoted)", csv.formula);
+  csv.plus === "'+1" && csv.minus === "'-2" && csv.at === "'@cmd" ? ok("csv: leading +/-/@ are quote-prefixed") : bad("csv: leading +/-/@ are quote-prefixed", JSON.stringify([csv.plus, csv.minus, csv.at]));
+  csv.tab === "'\tx" ? ok("csv: leading tab is quote-prefixed") : bad("csv: leading tab is quote-prefixed", JSON.stringify(csv.tab));
+  csv.cr === '"\'\rx"' ? ok("csv: leading CR is quote-prefixed and still CSV-quoted") : bad("csv: leading CR is quote-prefixed and still CSV-quoted", JSON.stringify(csv.cr));
+  csv.plain === "hello" && csv.number === "42" ? ok("csv: benign values pass through untouched") : bad("csv: benign values pass through untouched", JSON.stringify([csv.plain, csv.number]));
+  csv.quoted === '"a,""b"' ? ok("csv: existing quoting logic unchanged") : bad("csv: existing quoting logic unchanged", JSON.stringify(csv.quoted));
+  csv.objFormula === '"{""id"":1}"' ? ok("csv: JSON object cells are not prefixed") : bad("csv: JSON object cells are not prefixed", JSON.stringify(csv.objFormula));
+
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
 } catch (err) {

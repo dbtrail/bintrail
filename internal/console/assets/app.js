@@ -1378,7 +1378,10 @@ function downloadBlob(filename, content, mime) {
 }
 function csvCell(v) {
   if (v === null || v === undefined) return "";
-  const s = typeof v === "object" ? JSON.stringify(v) : String(v);
+  let s = typeof v === "object" ? JSON.stringify(v) : String(v);
+  // Formula-injection guard (OWASP): a leading =, +, -, @, tab or CR would be
+  // interpreted as a formula by Excel/Sheets — prefix a quote to neutralize.
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
   return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 function downloadEventsJSON(events) {
