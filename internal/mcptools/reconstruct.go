@@ -459,8 +459,16 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 func reconstructFetchError(err error) error {
 	var gapErr *query.GapError
 	if errors.As(err, &gapErr) {
+		// The rebuilt-index case lands here too, and there the non-lossy
+		// remedy is an operator command, named before the lossy override —
+		// same ordering as the CLI hint from #1268 (#1270). Naming a shell
+		// command is fine (the SourceEmptyError branch below already does);
+		// the leak rule only forbids `--allow-gaps`, the flag this surface
+		// cannot pass.
 		return fmt.Errorf("%w; the reconstruction would be silently incomplete. "+
-			"Re-run with allow_gaps: true to accept a known-incomplete result, or narrow `at` to a covered window", err)
+			"Gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too — "+
+			"if archives exist in storage, have the operator run `bintrail archive reconcile --repair --index-dsn ... --archive-s3 s3://...` (or --archive-dir) to repopulate archive_state, then retry. "+
+			"Otherwise re-run with allow_gaps: true to accept a known-incomplete result, or narrow `at` to a covered window", err)
 	}
 	var emptyErr *query.SourceEmptyError
 	if errors.As(err, &emptyErr) {

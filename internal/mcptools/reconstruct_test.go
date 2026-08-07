@@ -339,6 +339,24 @@ func TestReconstructWarningsCaptureGap(t *testing.T) {
 	}
 }
 
+// TestReconstructFetchErrorGapNamesToolParam is the sibling guard for the
+// planner-gap rewrite (#1270): the message must name the tool parameter
+// (allow_gaps: true), never `--allow-gaps`, and must keep the non-lossy
+// archive-reconcile remedy for the rebuilt-index case — deleting the hint
+// leaves an agent with only the lossy override.
+func TestReconstructFetchErrorGapNamesToolParam(t *testing.T) {
+	msg := reconstructFetchError(&query.GapError{GapHours: []time.Time{time.Date(2026, 6, 1, 3, 0, 0, 0, time.UTC)}}).Error()
+	if strings.Contains(msg, "--allow-gaps") {
+		t.Errorf("the MCP rewrite must not hand the client the CLI flag, got: %s", msg)
+	}
+	if !strings.Contains(msg, "allow_gaps: true") {
+		t.Errorf("the rewrite must name the tool parameter that overrides it, got: %s", msg)
+	}
+	if !strings.Contains(msg, "archive reconcile") {
+		t.Errorf("the rewrite must name the non-lossy reconcile remedy, got: %s", msg)
+	}
+}
+
 // TestReconstructCaptureGapErrorNamesToolParam guards the CLI-flag leak: the
 // refusal an MCP client receives must name the tool parameter it actually has
 // (allow_gaps: true), never `--allow-gaps`, which an agent can only translate
