@@ -26,6 +26,12 @@ type BaselineController interface {
 	// this process — the durable record is the snapshot itself, listed by
 	// /api/baselines).
 	Status(serverID string) BaselineStatus
+	// RefreshStatus reports the latest PERIODIC REFRESH state for a server
+	// (#1171), kept apart from Status because the two answer different
+	// questions: "did my dump work" and "is my baseline still moving forward on
+	// its own". Folding them into one slot would let a manual dump erase the
+	// evidence that the automatic refresh has been failing for a week.
+	RefreshStatus(serverID string) BaselineStatus
 }
 
 // BaselineRequest is the in-process job description the endpoint hands the
@@ -66,6 +72,11 @@ type BaselineStatus struct {
 	Tables     int    `json:"tables,omitempty"`
 	Rows       int64  `json:"rows,omitempty"`
 	Uploaded   int    `json:"uploaded,omitempty"`
+	// Refused counts tables a refresh declined to fold (gap / schema change).
+	// A refresh that refuses every table is not a failure of the daemon — it is
+	// a correct fail-closed verdict — so it reports succeeded=false with this
+	// count rather than an opaque error.
+	Refused int `json:"refused,omitempty"`
 }
 
 // handleBaselineTrigger enqueues an in-process baseline for the selected server.

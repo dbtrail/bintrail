@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -218,29 +217,7 @@ func resolveRefreshTables(ctx context.Context, source string) ([]string, error) 
 		return out, nil
 	}
 
-	files, err := reconstruct.ListBaselines(ctx, source)
-	if err != nil {
-		return nil, fmt.Errorf("list baseline snapshots under %s: %w", source, err)
-	}
-	if len(files) == 0 {
-		return nil, nil
-	}
-	newest := files[0].SnapshotTime // ListBaselines returns newest first
-	seen := map[string]bool{}
-	var out []string
-	for _, f := range files {
-		if !f.SnapshotTime.Equal(newest) {
-			continue
-		}
-		entry := f.Schema + "." + f.Table
-		if seen[entry] {
-			continue
-		}
-		seen[entry] = true
-		out = append(out, entry)
-	}
-	sort.Strings(out)
-	return out, nil
+	return reconstruct.NewestSnapshotTables(ctx, source)
 }
 
 // buildRefreshOutcomes pairs every requested table with its verdict.

@@ -18,6 +18,10 @@ func (c *stubBaselineCtrl) Trigger(req BaselineRequest) error {
 	return c.err
 }
 
+// RefreshStatus: the stub never runs a periodic refresh, so it reports idle —
+// the same thing the real supervisor reports for a server it has not refreshed.
+func (c *stubBaselineCtrl) RefreshStatus(string) BaselineStatus { return BaselineStatus{State: "idle"} }
+
 func (c *stubBaselineCtrl) Status(string) BaselineStatus { return c.status }
 
 // newBaselineTriggerServer builds a control-plane console with a recording baseline
