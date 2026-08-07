@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Default for every job: read-only. The `changes` job overrides with the
+# pull-requests read it needs for dorny/paths-filter.
+permissions:
+  contents: read
+
 jobs:
   # Detects which parts of the tree changed so the expensive jobs below can
   # skip themselves on PRs that can't possibly affect them (e.g. a console
@@ -38,8 +43,8 @@ jobs:
       go: ${{ steps.filter.outputs.go }}
       console: ${{ steps.filter.outputs.console }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
         id: filter
         with:
           filters: |
@@ -62,9 +67,9 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
@@ -126,10 +131,10 @@ jobs:
       # on a skipped run, leaving those required checks permanently pending.
       # Step-level `if:` lets the matrix still expand into both contexts;
       # each just completes instantly with every step skipped.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         with:
           go-version-file: go.mod
@@ -235,9 +240,9 @@ jobs:
       BINTRAIL_REQUIRE_MARIADB: "1"
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
@@ -333,10 +338,10 @@ jobs:
     steps:
       # Step-level (not job-level) `if:` — see the note on the `integration`
       # job above; this job's matrix has the same requirement.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         with:
           go-version-file: go.mod
@@ -424,13 +429,13 @@ jobs:
     if: github.event_name == 'push' || needs.changes.outputs.go == 'true' || needs.changes.outputs.console == 'true'
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
@@ -472,7 +477,7 @@ jobs:
 
       - name: Upload failure screenshot
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: console-e2e-failure
           path: |

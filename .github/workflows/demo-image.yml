@@ -26,10 +26,10 @@ on:
         required: true
         type: string
 
+# Default for every job: read-only. packages:write lives on the two jobs
+# that push to ghcr.io; id-token:write only on `merge`, which cosign-signs.
 permissions:
   contents: read
-  packages: write
-  id-token: write # cosign keyless signing via GitHub OIDC
 
 env:
   IMAGE: ghcr.io/dbtrail/bintrail-demo
@@ -42,6 +42,9 @@ jobs:
   # multi-arch manifest list. (Docker's documented multi-runner pattern.)
   build:
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write # push per-arch images by digest to ghcr.io
     strategy:
       fail-fast: false
       matrix:
@@ -56,28 +59,28 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
         run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # On dispatch, build the tag's tree (checkout fails loudly if
           # the input names a tag that doesn't exist). On tag push this
           # is the pushed ref anyway.
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
 
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: demo/image/Dockerfile
@@ -104,7 +107,7 @@ jobs:
           mkdir -p "${{ runner.temp }}/digests"
           touch "${{ runner.temp }}/digests/${DIGEST#sha256:}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
@@ -114,25 +117,28 @@ jobs:
   merge:
     runs-on: ubuntu-22.04
     needs: build
+    permissions:
+      packages: write # push the merged manifest list to ghcr.io
+      id-token: write # cosign keyless signing via GitHub OIDC
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
           tags: |
