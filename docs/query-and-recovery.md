@@ -539,7 +539,7 @@ Generated columns (`STORED` or `VIRTUAL`) are computed by MySQL and cannot be se
 
 ### System-versioned tables (MariaDB)
 
-MariaDB silently extends a system-versioned table's `PRIMARY KEY` with its `ROW END` period column (`PRIMARY KEY (id, row_end)`), and that column is generated — baselines never carry its values, and the binlog records history rows and versioned `DELETE`s under the same surviving key. Rendering such a table as a whole would risk emitting history rows as live data, so bintrail refuses instead:
+MariaDB silently extends a system-versioned table's `PRIMARY KEY` with its `ROW END` period column (`PRIMARY KEY (id, row_end)`), and that column is generated — baselines never carry its values, and the binlog records history rows and versioned `DELETE`s under the same surviving key. This applies to **both** spellings: with explicitly declared period columns, and the short implicit form (`CREATE TABLE ... WITH SYSTEM VERSIONING`), whose hidden `row_start`/`row_end` don't appear in `information_schema` — `bintrail snapshot` detects the implicit form and records them anyway, so capture works and both forms behave identically. Rendering such a table as a whole would risk emitting history rows as live data, so bintrail refuses instead:
 
 - **Full-table `reconstruct`** (baseline merge and binlog-only fallback alike) and the shim's **full-table `_flashback`/`_snapshot`** views refuse with an error naming the generated PK column.
 - **`verify`** reports the table as `inconclusive` — a permanent property of the table's shape, not a failure. A run scoped only to such tables still exits non-zero (nothing was proven).

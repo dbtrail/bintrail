@@ -874,6 +874,140 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 	return takeSnapshot(sourceDB, indexDB, schemas, false)
 }
 
+// addImplicitPeriodColumns appends synthetic columnRow entries for the HIDDEN
+// system-versioning period columns of MariaDB tables versioned WITHOUT
+// explicitly declared period columns (#1272) — `CREATE TABLE t (...) WITH
+// SYSTEM VERSIONING`, the shortest spelling.
+//
+// Why this must exist: for the implicit form, information_schema.COLUMNS does
+// not list row_start/row_end at all, but the binlog ROW image carries them —
+// so a snapshot built from COLUMNS alone undercounts the table by two and the
+// indexer's column-count-mismatch guard silently skips EVERY row event of the
+// table (zero deltas indexed; a full-table reconstruct then returns
+// baseline-only state with no refusal anywhere). Synthesizing the two columns
+// makes the implicit form behave exactly like the explicit one: capture
+// works, pk_values carries the extended key, and the #1266 generated-PK gates
+// fire where they must.
+//
+// Every synthesized fact below is empirical, measured on MariaDB 11.4:
+//
+//   - Detection: information_schema.TABLES reports TABLE_TYPE = 'SYSTEM
+//     VERSIONED' (MySQL never emits this value, so the whole function is a
+//     no-op against a MySQL source).
+//   - The hidden columns are named row_start/row_end — the TABLE_MAP optional
+//     metadata (binlog_row_metadata=FULL) names them exactly that, so the
+//     #700 drift guard agrees with the synthesized names; a user column named
+//     row_start on an implicitly versioned table is impossible (MariaDB
+//     refuses it with ER_DUP_FIELDNAME), so the names cannot collide.
+//   - They are TIMESTAMP(6) NOT NULL, and they sit LAST in the row image —
+//     ordinals max+1/max+2 — a position they keep even after ALTER TABLE ADD
+//     COLUMN (the new visible column lands BEFORE them).
+//   - KEY_COLUMN_USAGE shows the server extends the PRIMARY KEY with row_end
+//     (never row_start), same as the explicit form (#1266).
+//
+// The synthetic rows carry GENERATION_EXPRESSION = "ROW START"/"ROW END" — the
+// literal MariaDB stores for the explicit form — so the existing is_generated
+// derivation at the insert (and everything downstream of it: recovery's
+// generated-column skip, the #1266 gates) treats implicit and explicit period
+// columns identically, with no new code path.
+//
+// An explicitly-versioned table (its period columns already present in
+// COLUMNS with the ROW START/ROW END expressions, #863) is detected and left
+// untouched. Runs after the #1051 exclusion filter on purpose: an excluded
+// table has no rows in `columns`, contributes no maxOrd entry, and must not
+// re-enter the snapshot through synthesis.
+func addImplicitPeriodColumns(sourceDB *sql.DB, schemas []string, columns []columnRow) ([]columnRow, error) {
+	var (
+		q    string
+		args []any
+	)
+	if len(schemas) == 0 {
+		q = `SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES
+			WHERE TABLE_TYPE = 'SYSTEM VERSIONED'
+			  AND TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')`
+	} else {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
+		q = fmt.Sprintf(`SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES
+			WHERE TABLE_TYPE = 'SYSTEM VERSIONED' AND TABLE_SCHEMA IN (%s)`, placeholders)
+		for _, s := range schemas {
+			args = append(args, s)
+		}
+	}
+	rows, err := sourceDB.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query information_schema.TABLES for system-versioned tables: %w", err)
+	}
+	defer rows.Close()
+
+	versioned := make(map[string]bool)
+	for rows.Next() {
+		var s, t string
+		if err := rows.Scan(&s, &t); err != nil {
+			return nil, fmt.Errorf("failed to scan system-versioned table row: %w", err)
+		}
+		versioned[s+"."+t] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate system-versioned tables: %w", err)
+	}
+	if len(versioned) == 0 {
+		return columns, nil
+	}
+
+	explicit := make(map[string]bool)
+	maxOrd := make(map[string]int)
+	tableOf := make(map[string]columnRow) // any kept row of the table, for schema/table names
+	for _, c := range columns {
+		key := c.schemaName + "." + c.tableName
+		if !versioned[key] {
+			continue
+		}
+		if c.generationExpression.Valid {
+			switch strings.ToUpper(strings.TrimSpace(c.generationExpression.String)) {
+			case "ROW START", "ROW END":
+				explicit[key] = true
+			}
+		}
+		if c.ordinalPosition > maxOrd[key] {
+			maxOrd[key] = c.ordinalPosition
+			tableOf[key] = c
+		}
+	}
+
+	var keys []string
+	for key := range maxOrd {
+		if !explicit[key] {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys) // deterministic snapshot content across runs
+
+	for _, key := range keys {
+		base := tableOf[key]
+		for i, pc := range []struct {
+			name, columnKey, expr string
+		}{
+			{"row_start", "", "ROW START"},
+			{"row_end", "PRI", "ROW END"},
+		} {
+			columns = append(columns, columnRow{
+				schemaName:           base.schemaName,
+				tableName:            base.tableName,
+				columnName:           pc.name,
+				ordinalPosition:      maxOrd[key] + 1 + i,
+				columnKey:            pc.columnKey,
+				dataType:             "timestamp",
+				columnType:           "timestamp(6)",
+				isNullable:           "NO",
+				generationExpression: sql.NullString{Valid: true, String: pc.expr},
+			})
+		}
+		slog.Info("snapshot: synthesized hidden period columns for implicitly system-versioned table",
+			"table", key, "columns", "row_start,row_end")
+	}
+	return columns, nil
+}
+
 // TakeSnapshotExcludingInvalid is the degraded-validation variant of
 // TakeSnapshot used by the stream's DDL auto-snapshot hook (#1051). Where
 // TakeSnapshot rejects the whole snapshot when ANY base table in scope is not
@@ -1014,6 +1148,13 @@ func takeSnapshot(sourceDB, indexDB *sql.DB, schemas []string, excludeInvalid bo
 		for _, e := range exclusions {
 			excludedTables = append(excludedTables, e.schema+"."+e.table)
 		}
+	}
+
+	// ── 1b-bis. Synthesize the HIDDEN period columns of implicitly
+	// system-versioned MariaDB tables (#1272) ────────────────────────────────
+	columns, err = addImplicitPeriodColumns(sourceDB, schemas, columns)
+	if err != nil {
+		return SnapshotStats{}, err
 	}
 
 	// ── 1c. Query FK constraints from the source server ─────────────────────
