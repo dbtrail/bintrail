@@ -145,26 +145,38 @@ func VerifyTablePG(ctx context.Context, cfg PGLiveConfig, schema, table string) 
 	if err != nil {
 		return res, fmt.Errorf("source checksum %s.%s: %w", schema, table, err)
 	}
+	// A zero anchor would make the coverage verdict below vacuously "proven"
+	// (any nonzero checkpoint >= 0). The one shipped implementation errors
+	// before it can return LSN 0, so this guard enforces the seam's contract
+	// rather than papering over a live bug — turning a convention into an
+	// invariant instead of a silent pass.
+	if src.LSN == 0 {
+		return inconclusive(res, "source checksum carried no WAL anchor; cannot check index coverage"), nil
+	}
 	res.SourceDigest = src.Digest
 	res.SourceRows = src.RowCount
 	res.Anchor = fmt.Sprintf("LSN:%d", src.LSN) // same label form as anchorLabel's pg branch
 	asOf := time.Now().UTC()
 
-	// 2. Coverage: has the index durably absorbed everything the snapshot
-	// reflects? Inconclusive when provably not (or when events were
-	// permanently lost); a note when it cannot be proven either way.
-	covered, coverageNote := indexCoversPG(ctx, cfg.IndexDB, src.LSN)
-	if !covered {
-		return inconclusive(res, coverageNote), nil
-	}
-
-	// 3. Find the baseline at-or-before asOf — identical to the MySQL path.
+	// 2. Find the baseline at-or-before asOf — identical to the MySQL path.
+	// Found BEFORE the coverage check (the MySQL path's opposite order)
+	// because the PG gap_lost verdict is scoped to the comparison window,
+	// whose start is this baseline's snapshot time.
 	baselinePath, snapshotTime, _, err := reconstruct.FindBaseline(ctx, cfg.BaselineSource, schema, table, asOf)
 	if err != nil {
 		if isNoBaseline(err) {
 			return inconclusive(res, "no baseline at-or-before the snapshot; reconstruct would omit never-touched rows"), nil
 		}
 		return res, fmt.Errorf("find baseline %s.%s: %w", schema, table, err)
+	}
+
+	// 3. Coverage: has the index durably absorbed everything the snapshot
+	// reflects? Inconclusive when provably not (or when events were
+	// permanently lost inside the window); a note when it cannot be proven
+	// either way.
+	covered, coverageNote := indexCoversPG(ctx, cfg.IndexDB, src.LSN, snapshotTime)
+	if !covered {
+		return inconclusive(res, coverageNote), nil
 	}
 
 	// 4. Latest event per PK in (baseline, asOf]. Time bounds only — no
@@ -238,11 +250,22 @@ func VerifyTablePG(ctx context.Context, cfg PGLiveConfig, schema, table string) 
 		res.Detail = coverageNote
 	}
 
-	// 7. Compare — the same pure core as every other verify mode.
+	// 7. Compare — the same pure core as every other verify mode. Unlike the
+	// MySQL sibling (where the GTID-off coverage note is a rare corner), the
+	// coverage-unverified note is the ROUTINE state on PG (checkpoint <
+	// anchor on any non-idle cluster), and index lag is a common CAUSE of a
+	// reported divergence — so the note is APPENDED to a non-empty verdict
+	// detail, never dropped: a "row count differs" whose real cause is a
+	// lagging daemon must carry the one clue that explains it.
 	status, detail := classify(res.SourceDigest, res.SourceRows, res.ReconstructDigest, res.ReconstructRows, deferredDetail)
 	res.Status = status
-	if detail != "" {
-		res.Detail = detail // a real reason overrides the coverage note
+	switch {
+	case detail == "":
+		// StatusMatch: res.Detail already carries the coverage note (or "").
+	case coverageNote != "":
+		res.Detail = detail + " (note: " + coverageNote + ")"
+	default:
+		res.Detail = detail
 	}
 	return res, nil
 }
@@ -251,7 +274,15 @@ func VerifyTablePG(ctx context.Context, cfg PGLiveConfig, schema, table string) 
 // the PG sibling of indexCovers. Read errors degrade to not-covered with the
 // error as the reason (inconclusive, never a false mismatch), matching the
 // MySQL path's handling.
-func indexCoversPG(ctx context.Context, indexDB *sql.DB, anchorLSN uint64) (bool, string) {
+//
+// windowStart scopes the gap_lost stamp to the comparison window: a loss
+// stamped BEFORE the baseline's snapshot time is outside the window — the
+// baseline is a fresh dump of the source, so it re-covers whatever the gap
+// lost — and must not degrade the verdict, or one historical gap would make
+// this index permanently unverifiable no matter how many clean baselines
+// follow. Same window-scoping convention as `verify --check recover` ("a
+// stamped gap_lost_at inside the window degrades to inconclusive").
+func indexCoversPG(ctx context.Context, indexDB *sql.DB, anchorLSN uint64, windowStart time.Time) (bool, string) {
 	var (
 		flavor    sql.NullString
 		pos       sql.NullInt64
@@ -271,7 +302,14 @@ func indexCoversPG(ctx context.Context, indexDB *sql.DB, anchorLSN uint64) (bool
 	if pos.Valid && pos.Int64 > 0 {
 		checkpoint = uint64(pos.Int64)
 	}
-	return pgCoverageVerdict(flavor.String, checkpoint, anchorLSN, gapLostAt.Valid, gapDetail.String)
+	return pgCoverageVerdict(flavor.String, checkpoint, anchorLSN, gapLostInWindow(gapLostAt, windowStart), gapDetail.String)
+}
+
+// gapLostInWindow reports whether a stamped permanent loss falls inside the
+// comparison window (at-or-after its start). Pure — see indexCoversPG for why
+// a pre-window loss must not degrade the verdict.
+func gapLostInWindow(gapLostAt sql.NullTime, windowStart time.Time) bool {
+	return gapLostAt.Valid && !gapLostAt.Time.Before(windowStart)
 }
 
 // pgCoverageVerdict is the pure coverage decision for a PostgreSQL source —
@@ -310,7 +348,7 @@ func pgCoverageVerdict(flavor string, checkpointLSN, anchorLSN uint64, gapLost b
 		if detail == "" {
 			detail = "no detail recorded"
 		}
-		return false, "the capture stream recorded a permanent event loss (" + detail + "); events in the comparison window may be missing, so a content difference would not be conclusive"
+		return false, "the capture stream recorded a permanent event loss inside the comparison window (" + detail + "); events the reconstruction needs may be missing, so a content difference would not be conclusive"
 	}
 	if checkpointLSN == 0 {
 		return false, "index has no LSN checkpoint yet (the PostgreSQL stream has not committed a checkpoint against this index)"

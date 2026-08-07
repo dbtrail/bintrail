@@ -256,7 +256,7 @@ func (s *verifySupervisor) run(req console.VerifyRequest, baselineSrc string) {
 			runErr = s.runLiveSource(req, db, resolver, dbName)
 		}
 	case console.VerifyModeRecoverInputs:
-		runErr = s.runRecoverInputs(req, db, resolver, dbName)
+		runErr = s.runRecoverInputs(req, db, resolver, dbName, flavor)
 	case console.VerifyModeBaselineAnchored:
 		runErr = s.runBaselineAnchored(req, baselineSrc, db, resolver, dbName, flavor)
 	default:
@@ -415,6 +415,14 @@ func (s *verifySupervisor) runLiveSourcePG(req console.VerifyRequest, indexDB *s
 	if err != nil {
 		return fmt.Errorf("resolve target tables: %w", err)
 	}
+	// Defensive mirror of the CLI's guard: an empty enumeration must fail the
+	// run loudly, not complete "clean" with zero table results — a verify that
+	// verified nothing is the false assurance this tool exists to prevent.
+	// (Normally unreachable: verify.ResolverFor errors first on an index with
+	// no schema snapshot.)
+	if len(tables) == 0 {
+		return fmt.Errorf("no tables to verify (empty filter and no schema snapshot)")
+	}
 
 	baselineSrc := req.BaselineDir
 	if baselineSrc == "" {
@@ -454,10 +462,19 @@ const recoverInputsLookback = 30 * 24 * time.Hour
 // scheduled runner (#1191) falls back to it for servers with no baseline
 // configured. Window and per-table cap are the CLI's defaults; the
 // conservative archive fetcher is deliberate (this shares the daemon with the
-// stream — #510/#511 keep --ultrafast off daemons).
-func (s *verifySupervisor) runRecoverInputs(req console.VerifyRequest, indexDB *sql.DB, resolver *metadata.Resolver, dbName string) error {
+// stream — #510/#511 keep --ultrafast off daemons). Table enumeration is
+// flavor-routed like the CLI's verifyTargetTablesForFlavor: on a PG index the
+// MAX(snapshot_id) lookup silently names ONE relation, so the PG branch
+// enumerates the per-table resolver instead (#1024 review).
+func (s *verifySupervisor) runRecoverInputs(req console.VerifyRequest, indexDB *sql.DB, resolver *metadata.Resolver, dbName, flavor string) error {
 	ctx := s.ctx
-	tables, err := liveSourceTargetTables(ctx, indexDB, req.Tables)
+	var tables []query.SchemaTable
+	var err error
+	if flavor == console.FlavorPostgres {
+		tables, err = verify.PGTargetTables(resolver, req.Tables)
+	} else {
+		tables, err = liveSourceTargetTables(ctx, indexDB, req.Tables)
+	}
 	if err != nil {
 		return fmt.Errorf("resolve target tables: %w", err)
 	}

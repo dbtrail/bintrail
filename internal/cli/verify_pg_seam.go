@@ -24,3 +24,12 @@ var pgLiveVerifyConnect func(ctx context.Context, dsn string) (verify.PGSourceCh
 func SetPGLiveVerifyConnect(connect func(ctx context.Context, dsn string) (verify.PGSourceChecksum, func() error, error)) {
 	pgLiveVerifyConnect = connect
 }
+
+// PGLiveVerifySeamFilled reports whether a provider was installed. It exists
+// for ONE consumer: cmd/bintrail-pg's wiring test, which asserts its init()
+// actually filled the seam — deleting the SetPGLiveVerifyConnect call there
+// would otherwise leave every suite green while `bintrail-pg verify
+// --source-dsn` refused at runtime with a message pointing at... itself.
+func PGLiveVerifySeamFilled() bool {
+	return pgLiveVerifyConnect != nil
+}

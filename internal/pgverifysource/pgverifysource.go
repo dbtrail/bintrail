@@ -29,19 +29,21 @@ import (
 	"github.com/dbtrail/dbtrail/internal/verify"
 )
 
-// Connect opens the live-source PostgreSQL connection with the capture
+// connectPinned opens the live-source PostgreSQL connection with the capture
 // plane's pinned render GUCs (TimeZone=UTC, DateStyle=ISO,
 // extra_float_digits=3, bytea_output=hex, IntervalStyle=postgres). The pin is
 // load-bearing, not a convenience: the reconstructed side's text (pgbaseline
 // COPY + pgoutput deltas) was rendered under exactly these GUCs, so a source
 // scanned without them (server-local TimeZone, default float digits) would
 // digest-differ on identical data — every timestamptz row a conclusive false
-// MISMATCH. Kept as the single entry point so no caller can forget the pin.
-func Connect(ctx context.Context, dsn string) (*pgx.Conn, error) {
+// MISMATCH. Unexported on purpose, like the checksum below: LiveSource is the
+// ONLY composition this package offers, so the pin invariant is structural —
+// no external caller can pair the checksum with an unpinned connection.
+func connectPinned(ctx context.Context, dsn string) (*pgx.Conn, error) {
 	return pgcapture.ConnectQueryPinned(ctx, dsn)
 }
 
-// LiveSource connects to dsn (pinned, via Connect) and returns the
+// LiveSource connects to dsn (pinned, via connectPinned) and returns the
 // verify.PGSourceChecksum a verify.PGLiveConfig needs, plus the close func
 // the caller must defer. This is the one-call wiring both consumers use
 // (cmd/bintrail-pg's cli.SetPGLiveVerifyConnect hook and consoleapp's
@@ -50,17 +52,17 @@ func Connect(ctx context.Context, dsn string) (*pgx.Conn, error) {
 // pgx.Conn is not concurrency-safe — which matches VerifyTablePG's
 // one-table-at-a-time loop.
 func LiveSource(ctx context.Context, dsn string) (verify.PGSourceChecksum, func() error, error) {
-	conn, err := Connect(ctx, dsn)
+	conn, err := connectPinned(ctx, dsn)
 	if err != nil {
 		return nil, nil, err
 	}
 	checksum := func(ctx context.Context, schema, table string, normalize func(raw []byte) []byte) (consistency.TableChecksum, error) {
-		return ConsistentTableChecksumPG(ctx, conn, schema, table, normalize)
+		return consistentTableChecksumPG(ctx, conn, schema, table, normalize)
 	}
 	return checksum, func() error { return conn.Close(context.Background()) }, nil
 }
 
-// ConsistentTableChecksumPG is the PostgreSQL sibling of
+// consistentTableChecksumPG is the PostgreSQL sibling of
 // consistency.ConsistentTableChecksumNormalized (#1024): a point-in-time,
 // order-independent fingerprint of a live PG source table, byte-comparable to
 // the digest internal/verify's reconstruct computes from a pgbaseline
@@ -70,7 +72,7 @@ func LiveSource(ctx context.Context, dsn string) (verify.PGSourceChecksum, func(
 // Why this needs almost no per-type canonicalization, where the MySQL scan
 // needed plenty: for a PostgreSQL source BOTH sides of the comparison already
 // speak the same rendering — PostgreSQL's own type output functions, run under
-// the render GUCs internal/pgcapture pins (see Connect). The baseline is
+// the render GUCs internal/pgcapture pins (see connectPinned). The baseline is
 // COPY ... (FORMAT text) under those GUCs (internal/pgbaseline), the deltas
 // are pgoutput text under those GUCs, and this scan reads the SAME output
 // functions under the SAME GUCs by forcing the wire format to text. The one
@@ -80,7 +82,7 @@ func LiveSource(ctx context.Context, dsn string) (verify.PGSourceChecksum, func(
 // and the text rendering comes from pgx.QueryResultFormats{TextFormatCode},
 // never from casts.
 //
-// conn MUST be connected with the pinned render GUCs (Connect) — an unpinned
+// conn MUST be connected with the pinned render GUCs (connectPinned) — an unpinned
 // session renders timestamptz in the server's zone and floats at default
 // precision, silently breaking byte-comparability. The connection is used
 // serially: a transaction is opened and committed within this call.
@@ -114,7 +116,7 @@ func LiveSource(ctx context.Context, dsn string) (verify.PGSourceChecksum, func(
 // never called for SQL NULL (nil raw bytes). VerifyTablePG passes its own
 // render normalizer through verify.PGSourceChecksum, so the two sides are
 // symmetric by construction.
-func ConsistentTableChecksumPG(ctx context.Context, conn *pgx.Conn, schema, table string, normalize func(raw []byte) []byte) (consistency.TableChecksum, error) {
+func consistentTableChecksumPG(ctx context.Context, conn *pgx.Conn, schema, table string, normalize func(raw []byte) []byte) (consistency.TableChecksum, error) {
 	res := consistency.TableChecksum{Schema: schema, Table: table}
 	if conn == nil {
 		return res, fmt.Errorf("pgverifysource: no PostgreSQL source connection")
@@ -210,7 +212,7 @@ func ConsistentTableChecksumPG(ctx context.Context, conn *pgx.Conn, schema, tabl
 
 // pgTableColumns returns the live, non-dropped, non-generated columns of
 // schema.table in attnum order — the same catalog contract as
-// internal/pgbaseline's loadColumns (see ConsistentTableChecksumPG's doc for
+// internal/pgbaseline's loadColumns (see consistentTableChecksumPG's doc for
 // why it is duplicated rather than imported, and why generated columns are
 // excluded).
 func pgTableColumns(ctx context.Context, conn *pgx.Conn, schema, table string) ([]string, error) {

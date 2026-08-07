@@ -360,6 +360,12 @@ verifies the *other* half — that no events were dropped from the capture strea
 
 ## Charset contract: raw stored bytes
 
+This section (including the digest version tag below) describes the **MySQL**
+rendering contract. A PostgreSQL source has no charset-transcoding layer in
+this path — its rendering contract is the pinned session GUCs described in
+[Notes per source](#notes-per-source); the digests still carry the same
+version tag, and comparisons are always within one source, never across.
+
 The row-content fingerprint is computed over the bytes MySQL returns for each
 column. To make that byte stream independent of the connection charset, the
 checksum scan pins `character_set_results = binary`, so the server returns each
@@ -396,9 +402,10 @@ sources exist:
 - **MariaDB** — baseline-anchored and recover-input as MySQL. Live-source
   proceeds with the same `coverage unverified` note (MariaDB has no
   `@@gtid_executed` to prove containment against).
-- **PostgreSQL** — baseline-anchored and recover-input work against the PG
-  capture (`bintrail-pg stream` / the console's PostgreSQL servers), anchored
-  on WAL LSNs instead of binlog coordinates. Live-source mode is supported
+- **PostgreSQL** — baseline-anchored verify works against the PG capture
+  (`bintrail-pg stream` / the console's PostgreSQL servers), anchored on WAL
+  LSNs instead of binlog coordinates; recover-input works too (index-only —
+  it carries no anchor). Live-source mode is supported
   too: the source is fingerprinted inside one `REPEATABLE READ` snapshot,
   read in PostgreSQL's own text rendering under the same pinned session GUCs
   the capture and baseline run under (`TimeZone=UTC`, `DateStyle=ISO`,
@@ -411,6 +418,9 @@ sources exist:
   indexable events), so the run proceeds and the result carries a
   `coverage unverified` note — the same documented trade-off as a GTID-off
   MySQL source, where a genuinely-behind index surfaces as an investigable
-  mismatch rather than being masked. A stamped permanent capture loss
-  (`gap_lost`) always reports `inconclusive`, never a false mismatch. The
+  mismatch rather than being masked. A permanent capture loss (`gap_lost`)
+  stamped **inside the comparison window** reports `inconclusive`, never a
+  false mismatch; a loss older than the baseline snapshot is outside the
+  window — the baseline is a fresh dump of the source, so it re-covers
+  whatever the gap lost — and does not degrade the verdict. The
   quiescent-source requirement applies unchanged.

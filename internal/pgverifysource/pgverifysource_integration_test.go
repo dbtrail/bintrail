@@ -69,15 +69,15 @@ func TestConsistentTableChecksumPG_Integration(t *testing.T) {
 
 	// The scan connection MUST be the pinned one — that is the contract under
 	// test (TimeZone=UTC, DateStyle=ISO, bytea_output=hex, ...).
-	conn, err := Connect(ctx, baseDSN)
+	conn, err := connectPinned(ctx, baseDSN)
 	if err != nil {
 		t.Fatalf("pinned connect: %v", err)
 	}
 	t.Cleanup(func() { conn.Close(context.Background()) })
 
-	got, err := ConsistentTableChecksumPG(ctx, conn, "public", pgckTbl, nil)
+	got, err := consistentTableChecksumPG(ctx, conn, "public", pgckTbl, nil)
 	if err != nil {
-		t.Fatalf("ConsistentTableChecksumPG: %v", err)
+		t.Fatalf("consistentTableChecksumPG: %v", err)
 	}
 	if got.RowCount != 2 {
 		t.Errorf("RowCount = %d, want 2", got.RowCount)
@@ -115,9 +115,9 @@ func TestConsistentTableChecksumPG_Integration(t *testing.T) {
 	mustExec(fmt.Sprintf("CREATE TABLE %s %s", pgckTblRev, ddl))
 	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (2, false, NULL, NULL, NULL, '')", pgckTblRev))
 	mustExec(fmt.Sprintf("INSERT INTO %s VALUES (1, true, '\\xdeadbeef', '2024-01-02 03:04:05+00', 12.30, 'café 日本語')", pgckTblRev))
-	rev, err := ConsistentTableChecksumPG(ctx, conn, "public", pgckTblRev, nil)
+	rev, err := consistentTableChecksumPG(ctx, conn, "public", pgckTblRev, nil)
 	if err != nil {
-		t.Fatalf("ConsistentTableChecksumPG (reversed): %v", err)
+		t.Fatalf("consistentTableChecksumPG (reversed): %v", err)
 	}
 	if rev.Digest != got.Digest {
 		t.Errorf("row order changed the digest: %s vs %s", rev.Digest, got.Digest)
@@ -125,11 +125,11 @@ func TestConsistentTableChecksumPG_Integration(t *testing.T) {
 
 	// The normalize hook must rewrite values before hashing (and only non-NULL
 	// ones — it would have panicked on nil above if misapplied).
-	bang, err := ConsistentTableChecksumPG(ctx, conn, "public", pgckTbl, func(raw []byte) []byte {
+	bang, err := consistentTableChecksumPG(ctx, conn, "public", pgckTbl, func(raw []byte) []byte {
 		return append(append([]byte{}, raw...), '!')
 	})
 	if err != nil {
-		t.Fatalf("ConsistentTableChecksumPG (hook): %v", err)
+		t.Fatalf("consistentTableChecksumPG (hook): %v", err)
 	}
 	if bang.Digest == got.Digest {
 		t.Error("normalize hook did not affect the digest")
@@ -139,9 +139,9 @@ func TestConsistentTableChecksumPG_Integration(t *testing.T) {
 	// loadColumns, so the live column set always matches the baseline's.
 	mustExec(fmt.Sprintf("CREATE TABLE %s (id int PRIMARY KEY, n int, twice int GENERATED ALWAYS AS (n * 2) STORED)", pgckTblGen))
 	mustExec(fmt.Sprintf("INSERT INTO %s (id, n) VALUES (1, 21)", pgckTblGen))
-	gen, err := ConsistentTableChecksumPG(ctx, conn, "public", pgckTblGen, nil)
+	gen, err := consistentTableChecksumPG(ctx, conn, "public", pgckTblGen, nil)
 	if err != nil {
-		t.Fatalf("ConsistentTableChecksumPG (generated): %v", err)
+		t.Fatalf("consistentTableChecksumPG (generated): %v", err)
 	}
 	if len(gen.Columns) != 2 || gen.Columns[0] != "id" || gen.Columns[1] != "n" {
 		t.Errorf("Columns = %v, want [id n] (generated column excluded)", gen.Columns)
@@ -153,7 +153,7 @@ func TestConsistentTableChecksumPG_Integration(t *testing.T) {
 	}
 
 	// A missing table errors loudly, never a zero-row "match".
-	if _, err := ConsistentTableChecksumPG(ctx, conn, "public", "pgvs_ck_it_nope", nil); err == nil {
+	if _, err := consistentTableChecksumPG(ctx, conn, "public", "pgvs_ck_it_nope", nil); err == nil {
 		t.Error("want an error for a nonexistent table")
 	}
 }
@@ -163,11 +163,14 @@ func TestConsistentTableChecksumPG_Integration(t *testing.T) {
 // relation's schema snapshot and a PG stream checkpoint, and
 // verify.VerifyTablePG — wired through LiveSource, exactly as
 // cmd/bintrail-pg and the console daemon wire it — comparing the live source
-// against the reconstruction. The MATCH leg proves the live checksum and the
-// reconstruct digest agree byte-for-byte on identical data across the tricky
-// renderings (bool, numeric scale, multibyte, NULL vs empty); the two
-// MISMATCH legs prove a real divergence — an uncaptured in-place UPDATE,
-// then an uncaptured DELETE — is conclusively detected, not masked.
+// against the reconstruction. Four legs: MATCH proves the live checksum and
+// the reconstruct digest agree byte-for-byte on identical data across the
+// tricky renderings (bool, numeric scale, multibyte, NULL vs empty); an
+// UNCAPTURED in-place UPDATE is a conclusive content MISMATCH; indexing that
+// same UPDATE as a pgoutput-shaped delta event folds it onto the baseline and
+// restores MATCH (the delta half of the engine — the PK text-identity join
+// and the pgTextPK merge — running against real data); an uncaptured DELETE
+// is a conclusive row-count MISMATCH.
 //
 // Requires BOTH backends: a MySQL index (testutil.CreateTestDB) and a live
 // PostgreSQL (BINTRAIL_TEST_PG_DSN).
@@ -290,6 +293,27 @@ func TestVerifyTablePG_Integration(t *testing.T) {
 	}
 	if res.Status != verify.StatusMismatch || !strings.Contains(res.Detail, "content digest differs") {
 		t.Fatalf("status=%q detail=%q, want a content mismatch", res.Status, res.Detail)
+	}
+
+	// DELTA MATCH: index the same UPDATE as the capture daemon would store it
+	// — pgoutput text values in the row images, the raw text PK in pk_values —
+	// and the reconstruction must fold it onto the baseline and agree with the
+	// live table again. This is the delta half of the engine (time-bounded
+	// FetchMerged window, PK text-identity join, pgTextPK merge) against real
+	// data; without it a PK-spelling regression between the event and baseline
+	// sides (the #1155/#1158 bug class) would ship green and turn every
+	// captured write into a false MISMATCH.
+	testutil.InsertEvent(t, indexDB, "0/1000000", 100, 200,
+		time.Now().UTC().Format("2006-01-02 15:04:05"), nil,
+		"public", vpgTbl, 2 /*UPDATE*/, "1", nil,
+		[]byte(`{"id":"1","v":"café 日本語","ok":"t","num":"12.30"}`),
+		[]byte(`{"id":"1","v":"tampered","ok":"t","num":"12.30"}`))
+	res, err = verify.VerifyTablePG(ctx, cfg, "public", vpgTbl)
+	if err != nil {
+		t.Fatalf("VerifyTablePG (delta indexed): %v", err)
+	}
+	if res.Status != verify.StatusMatch {
+		t.Fatalf("status = %q (detail=%q), want match once the UPDATE is indexed — the delta fold or the PK join is broken", res.Status, res.Detail)
 	}
 
 	// MISMATCH (row count): an uncaptured DELETE is always conclusive.

@@ -3,8 +3,10 @@ package verify
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
@@ -58,6 +60,30 @@ func TestPGCoverageVerdict(t *testing.T) {
 				t.Errorf("note = %q, want it to contain %q", note, tc.wantInNote)
 			}
 		})
+	}
+}
+
+// TestGapLostInWindow pins the window scoping of the gap_lost stamp: a loss
+// stamped BEFORE the baseline's snapshot time is outside the comparison
+// window (the baseline is a fresh dump — it re-covers whatever the gap lost)
+// and must NOT degrade the verdict, or one historical gap would make the
+// index permanently unverifiable no matter how many clean baselines follow.
+func TestGapLostInWindow(t *testing.T) {
+	windowStart := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		gap  sql.NullTime
+		want bool
+	}{
+		{"no stamp", sql.NullTime{}, false},
+		{"loss before the window (pre-baseline)", sql.NullTime{Valid: true, Time: windowStart.Add(-time.Hour)}, false},
+		{"loss exactly at window start", sql.NullTime{Valid: true, Time: windowStart}, true},
+		{"loss inside the window", sql.NullTime{Valid: true, Time: windowStart.Add(time.Hour)}, true},
+	}
+	for _, tc := range cases {
+		if got := gapLostInWindow(tc.gap, windowStart); got != tc.want {
+			t.Errorf("%s: gapLostInWindow = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 
