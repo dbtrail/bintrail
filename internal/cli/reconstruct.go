@@ -446,7 +446,7 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 			// The rebuilt-index case (archive_state empty, hours rotated out of
 			// MySQL) also lands here; name the non-lossy remedy before the
 			// lossy one (#961).
-			return fmt.Errorf("%w; if the index was rebuilt and archives exist in storage, run `bintrail archive reconcile --repair --archive-s3 s3://...` (or --archive-dir) to repopulate archive_state and retry, or pass --allow-gaps to proceed with an incomplete reconstruction", err)
+			return fmt.Errorf("%w; gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too — if archives exist in storage, run `bintrail archive reconcile --repair --index-dsn ... --archive-s3 s3://...` (or --archive-dir) to repopulate archive_state and retry, or pass --allow-gaps to proceed with an incomplete reconstruction", err)
 		}
 		var emptyErr *query.SourceEmptyError
 		if errors.As(err, &emptyErr) {
