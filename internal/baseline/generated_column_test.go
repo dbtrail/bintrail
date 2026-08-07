@@ -85,6 +85,73 @@ func TestParseSchemaExcludesGeneratedColumnMariaDBForm(t *testing.T) {
 	}
 }
 
+// TestParseSchemaExcludesSystemVersioningPeriodColumns pins the issue #863
+// fix: a MariaDB system-versioned table's EXPLICIT temporal period columns use
+// a parenthesis-free defining clause ("GENERATED ALWAYS AS ROW START|END")
+// that generatedRe cannot see, yet mydumper excludes their values from the
+// INSERT column-list and VALUES tuples exactly like STORED/VIRTUAL generated
+// columns (verified against a real mydumper dump of MariaDB 11.4 — see
+// rowPeriodRe's comment). The schema text below is the verbatim shape that
+// dump produced. Before the fix, ParseSchema kept row_start/row_end and the
+// #861 arity check refused the whole table.
+func TestParseSchemaExcludesSystemVersioningPeriodColumns(t *testing.T) {
+	const schema = "CREATE TABLE `sv_explicit` (\n" +
+		"  `id` int(11) NOT NULL,\n" +
+		"  `val` varchar(20) DEFAULT NULL,\n" +
+		"  `row_start` timestamp(6) GENERATED ALWAYS AS ROW START,\n" +
+		"  `row_end` timestamp(6) GENERATED ALWAYS AS ROW END,\n" +
+		"  PRIMARY KEY (`id`,`row_end`),\n" +
+		"  PERIOD FOR SYSTEM_TIME (`row_start`, `row_end`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 WITH SYSTEM VERSIONING;\n"
+
+	cols, err := ParseSchemaText(schema)
+	if err != nil {
+		t.Fatalf("ParseSchemaText: %v", err)
+	}
+	wantNames := []string{"id", "val"}
+	if len(cols) != len(wantNames) {
+		t.Fatalf("got %d columns %v, want %d (%v) — period columns must be excluded",
+			len(cols), colNames(cols), len(wantNames), wantNames)
+	}
+	for i, name := range wantNames {
+		if cols[i].Name != name {
+			t.Errorf("col[%d].Name = %q, want %q", i, cols[i].Name, name)
+		}
+	}
+}
+
+// TestParseSchemaSystemVersioningPeriodColumnVariants covers the two edges of
+// rowPeriodRe: trailing attributes after the period clause (MariaDB allows
+// INVISIBLE on explicit period columns) must still be excluded, and a plain
+// column that merely SHARES the conventional row_start/row_end NAME — with no
+// GENERATED clause — must be kept: its values ARE in the dump, and dropping it
+// would shift every later column's positional slot (the #767 corruption class).
+func TestParseSchemaSystemVersioningPeriodColumnVariants(t *testing.T) {
+	const schema = "CREATE TABLE `t` (\n" +
+		"  `id` int(11) NOT NULL,\n" +
+		"  `row_start` timestamp(6) NOT NULL DEFAULT current_timestamp(6),\n" +
+		"  `rs` timestamp(6) GENERATED ALWAYS AS ROW START INVISIBLE,\n" +
+		"  `re` timestamp(6) GENERATED ALWAYS AS ROW END INVISIBLE,\n" +
+		"  `val` varchar(20) DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`,`re`)\n" +
+		") ENGINE=InnoDB WITH SYSTEM VERSIONING;\n"
+
+	cols, err := ParseSchemaText(schema)
+	if err != nil {
+		t.Fatalf("ParseSchemaText: %v", err)
+	}
+	wantNames := []string{"id", "row_start", "val"}
+	if len(cols) != len(wantNames) {
+		t.Fatalf("got %d columns %v, want %d (%v) — INVISIBLE period columns excluded, plain row_start kept",
+			len(cols), colNames(cols), len(wantNames), wantNames)
+	}
+	for i, name := range wantNames {
+		if cols[i].Name != name {
+			t.Errorf("col[%d].Name = %q, want %q", i, cols[i].Name, name)
+		}
+	}
+}
+
 func colNames(cols []Column) []string {
 	names := make([]string, len(cols))
 	for i, c := range cols {

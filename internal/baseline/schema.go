@@ -88,6 +88,31 @@ var colRe = regexp.MustCompile("^\\s+`([^`]+)`\\s+(\\w+)(?:\\s*\\([^)]*\\))?\\s*
 // loud on a column-count mismatch — never silent corruption.
 var generatedRe = regexp.MustCompile(`(?i)\bAS\s*\(.*\)\s*(?:VIRTUAL|STORED|PERSISTENT)\b`)
 
+// rowPeriodRe matches a MariaDB system-versioned table's explicit temporal
+// period columns, whose defining clause is parenthesis-free and therefore
+// invisible to generatedRe:
+//
+//	`row_start` timestamp(6) GENERATED ALWAYS AS ROW START,
+//	`row_end`   timestamp(6) GENERATED ALWAYS AS ROW END,
+//
+// Verified against a real dump (issue #863, mydumper/mydumper:latest vs
+// MariaDB 11.4, same flags bintrail passes incl. --complete-insert): mydumper
+// emits these columns in the -schema.sql exactly as above but EXCLUDES their
+// values from the INSERT column-list and VALUES tuples, the same treatment
+// STORED/VIRTUAL generated columns get — so ParseSchema must drop them from
+// the positional column list too, or the #861 arity check refuses the whole
+// table. IMPLICIT period columns (a table created WITH SYSTEM VERSIONING
+// without declaring them) are invisible and appear in neither the schema nor
+// the data files, so only the explicit form needs handling. The regex is
+// anchored on the full "GENERATED ALWAYS AS ROW START|END" phrase and tolerates
+// trailing attributes (e.g. INVISIBLE); a plain column merely NAMED row_start
+// has no such clause and is kept. Same accepted COMMENT-false-positive
+// trade-off as generatedRe: the failure mode is the loud arity check, never
+// silent corruption. internal/consistency/checksum.go needs no sibling change —
+// its tableColumns already excludes these via GENERATION_EXPRESSION, which
+// MariaDB fills with the literal "ROW START"/"ROW END".
+var rowPeriodRe = regexp.MustCompile(`(?i)\bGENERATED\s+ALWAYS\s+AS\s+ROW\s+(?:START|END)\b`)
+
 // ParseSchema reads a mydumper <db>.<table>-schema.sql file and returns the
 // ordered list of columns with their Parquet type mappings.
 func ParseSchema(path string) ([]Column, error) {
@@ -136,9 +161,10 @@ func parseSchemaFrom(r io.Reader) ([]Column, error) {
 		if m == nil {
 			continue
 		}
-		if generatedRe.MatchString(line) {
-			// STORED/VIRTUAL generated column — mydumper never dumps its value,
-			// so it must not occupy a slot in the positional column list either.
+		if generatedRe.MatchString(line) || rowPeriodRe.MatchString(line) {
+			// STORED/VIRTUAL generated column, or a system-versioning period
+			// column (#863) — mydumper never dumps its value, so it must not
+			// occupy a slot in the positional column list either.
 			continue
 		}
 		name := m[1]
