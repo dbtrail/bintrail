@@ -2928,12 +2928,15 @@ async function gateCapabilities() {
   let caps = {};
   // capsOK distinguishes "the server reported no version" from "we could not
   // ask" — the version row must never claim a build we failed to read (#1221).
+  // It tracks a payload we actually READ, not merely a call that did not throw:
+  // api() returns null for an empty body (a legitimate 204 elsewhere), which
+  // would otherwise land here as a successful read of nothing.
   let capsOK = false;
   // Degrading to {} hides capability-gated UI (Time-travel tab, the source
   // section of the server form) — warn so a wrongly-shaped UI is diagnosable.
   // A 401 is NOT capability loss: rethrow so session expiry surfaces as the
   // sign-in gate (api() already raised it), never as silently vanished tabs.
-  try { caps = await api("/api/capabilities"); capsOK = true; } catch (err) {
+  try { caps = await api("/api/capabilities"); capsOK = !!caps; } catch (err) {
     if (err && err.status === 401) throw err;
     console.warn("capabilities check failed; UI degrades to no-capability gating", err);
     caps = {};
@@ -2954,11 +2957,21 @@ async function gateCapabilities() {
 
 // updateSideVersion paints the running build into the sidebar footer (#1221),
 // reading the capabilities payload already fetched above — no extra request.
-// `version` is `omitempty`, so an unversioned build sends NO key at all: the
-// label must never be built as "v" + a missing value ("vundefined"/"vdev").
+// Two producers, both of which must survive without emitting "vundefined" or
+// "vdev": a plain `go build` sends the LITERAL "dev" (cmd/bintrail-console
+// defaults Version to it and consoleapp.Main passes it through unexamined),
+// while `version` is also `omitempty`, so a Config with an empty Version — an
+// embedder handing consoleapp.Main "" — sends no key at all.
 // `known` is false when the capabilities fetch itself failed — the row keeps
 // its "—" placeholder there instead of reporting "dev" for a build whose real
 // version we never read (a wrong version in a bug report is worse than none).
+// The leading-"v" strip is CLASSIFICATION, not formatting: it has no effect on
+// the rendered string (a "v1.2.3" that skips the released branch is echoed
+// verbatim by the fallback and reads the same), but it keeps a tag-shaped
+// -ldflags value on the same side of the released/unreleased split that
+// bundleCard() puts it on. That sibling anchors its regex and this one does
+// not, deliberately: bundleCard derives a download URL that has to resolve, so
+// it rejects "1.2.3-rc1"; this row only echoes what the server reported.
 function updateSideVersion(known) {
   const b = $("#meta-version b");
   if (!b) return;

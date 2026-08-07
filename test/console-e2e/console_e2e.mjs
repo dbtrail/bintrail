@@ -70,15 +70,17 @@ try {
   // Scenario 0c — the shapes the live daemon cannot produce, driven through the
   // REAL function (same technique as the ext-view scenarios below: stub
   // capsCache, call the production code, read the DOM). This harness builds
-  // without -ldflags, so 0b above only ever exercises the "dev" branch — the
-  // released-build expectation has to come from a FIXED input with a HARDCODED
-  // expectation, or a double-"v" or a broken anchor ships green. The other two:
-  // `version` is omitempty, so an unversioned build sends no key at all and must
-  // read "dev", never "" or "vundefined"; a FAILED capabilities fetch is a
-  // different state and must keep the "—" placeholder rather than report "dev"
-  // for a build it never read.
-  // Must stay AHEAD of the ext-view scenarios: scenario 10 re-runs the real
-  // gateCapabilities() against a stub with no `version`, repainting this row.
+  // without -ldflags, so the server always reports the literal "dev" and 0b
+  // above only ever exercises that branch; the released-build expectation has
+  // to come from a FIXED input with a HARDCODED expectation, or dropping the
+  // "v" prefix — or a regex that stops matching semver — ships green. (It does
+  // NOT cover the leading-"v" strip: that is classification-only and produces
+  // an identical string either way, which is why app.js says so in prose
+  // instead of pretending a test pins it.) The other two shapes: `version` is
+  // omitempty, so a Config with an empty Version sends no key at all and must
+  // read "dev", never "" or "vundefined"; and a capabilities fetch that FAILED
+  // is a different state — it must keep the "—" placeholder rather than report
+  // "dev" for a build it never read.
   const degraded = await page.evaluate(() => {
     const keep = capsCache.version;
     const read = () => (document.querySelector("#meta-version b") || {}).textContent;
@@ -106,6 +108,36 @@ try {
   degraded.restored === wantVer
     ? ok("sidebar: version restored after the degraded probes")
     : bad("sidebar: version restored after the degraded probes", `got ${JSON.stringify(degraded.restored)}`);
+
+  // Scenario 0d — the WIRING, not the function. 0c calls updateSideVersion(false)
+  // directly, which proves the "—" branch exists but says nothing about the
+  // caller ever reaching it: hardcoding updateSideVersion(true), or initialising
+  // capsOK to true, passes 0b and 0c untouched and ships a console that reports
+  // "dev" for a build it never read. So drive the real gateCapabilities() with a
+  // FAILING /api/capabilities.
+  // Two traps this is shaped around. The stub must answer 500, never 401 —
+  // gateCapabilities RETHROWS a 401, and an unhandled rejection inside
+  // page.evaluate surfaces as a harness crash instead of a failed assertion. And
+  // it must restore with a real gateCapabilities() before returning: the failure
+  // path sets capsCache = {}, which strips every cap-on class and would break the
+  // control-plane scenarios below (scenario 10 models the same restore).
+  const wiring = await page.evaluate(async () => {
+    const realFetch = window.fetch;
+    window.fetch = (p, o) => (typeof p === "string" && p.startsWith("/api/capabilities")
+      ? Promise.resolve(new Response('{"error":"boom"}', { status: 500, headers: { "Content-Type": "application/json" } }))
+      : realFetch(p, o));
+    await gateCapabilities();
+    window.fetch = realFetch;
+    const onFailure = (document.querySelector("#meta-version b") || {}).textContent;
+    await gateCapabilities();
+    return { onFailure, restored: (document.querySelector("#meta-version b") || {}).textContent };
+  });
+  wiring.onFailure === "—"
+    ? ok("sidebar: a failing capabilities fetch actually reaches the '—' branch")
+    : bad("sidebar: a failing capabilities fetch actually reaches the '—' branch", `got ${JSON.stringify(wiring.onFailure)} — capsOK never false?`);
+  wiring.restored === wantVer
+    ? ok("sidebar: version repainted once capabilities recover")
+    : bad("sidebar: version repainted once capabilities recover", `got ${JSON.stringify(wiring.restored)}`);
 
   await page.evaluate(() => openServersModal());
   await page.waitForSelector("#servers-list", { timeout: 5000 });
