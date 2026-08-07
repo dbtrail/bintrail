@@ -111,6 +111,21 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			},
 		},
 		{
+			name:      "sql panel",
+			action:    "sql.run",
+			wantActor: tokenActor,
+			call: func(t *testing.T) {
+				baselineRoot, _ := writeSQLPanelBaseline(t)
+				srv := newSQLPanelServer(t, baselineRoot, true)
+				w := httptest.NewRecorder()
+				srv.handleSQLPanel(w, httptest.NewRequest("POST", "/api/sql",
+					strings.NewReader(`{"sql":"SELECT count(*) FROM state_shop_orders"}`)))
+				if w.Code != http.StatusOK {
+					t.Fatalf("sql panel: code=%d body=%s", w.Code, w.Body.String())
+				}
+			},
+		},
+		{
 			name:      "authz denial",
 			action:    "authz.denied",
 			wantActor: "ana@example.com",

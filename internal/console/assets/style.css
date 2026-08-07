@@ -1425,3 +1425,21 @@ button { font-family: inherit; }
 .cov-chip.ok { color: var(--insert); border-color: var(--insert); }
 .cov-chip.warn { color: var(--update); border-color: var(--update); }
 .cov-chip.bad { color: var(--delete); border-color: var(--delete); font-weight: 600; }
+
+/* SQL panel (#1177): a read-only query box + capped results table. */
+.sql-input {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 120px;
+  font-family: var(--f-mono); font-size: 13px; line-height: 1.5;
+  padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface-2); color: var(--ink);
+}
+.sql-input:focus { outline: none; border-color: var(--ink-4); }
+.sql-actions { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.sql-status { font-family: var(--f-mono); font-size: 12px; color: var(--ink-2); }
+.sql-table-wrap { overflow-x: auto; margin-top: 4px; }
+.sql-table { min-width: 100%; }
+.sql-table th, .sql-table td {
+  text-align: left; padding: 5px 12px; border-bottom: 1px solid var(--line);
+  white-space: nowrap; max-width: 46ch; overflow: hidden; text-overflow: ellipsis;
+}
+.sql-table th { color: var(--ink-2); font-weight: 600; position: sticky; top: 0; background: var(--surface); }
