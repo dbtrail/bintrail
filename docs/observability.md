@@ -31,9 +31,35 @@ The live pipeline — emitted on the hot path as events flow.
 | `bintrail_stream_batch_flushes_total` | counter | Batch INSERT operations executed |
 | `bintrail_stream_checkpoint_saves_total` | counter | Successful checkpoint saves |
 | `bintrail_stream_last_event_timestamp_seconds` | gauge | Timestamp of the last event processed |
-| `bintrail_stream_replication_lag_seconds` | gauge | Now minus the last processed event timestamp |
+| `bintrail_stream_replication_lag_seconds` | gauge | Now minus the last processed event timestamp. **Receive-time** — see the warning below |
+| `bintrail_stream_index_commit_latency_seconds` | histogram | Seconds from replication read to the event being **queryable** in the index |
+| `bintrail_stream_availability_lag_seconds` | gauge | Approximate seconds from source commit to queryable — the effective RPO |
+| `bintrail_stream_last_flush_timestamp_seconds` | gauge | Unix timestamp of the last batch successfully committed to the index |
 | `bintrail_stream_errors_total` | counter | Errors, by `type` |
 | `bintrail_stream_batch_size` | histogram | Events per INSERT batch |
+
+### Received is not recoverable
+
+`replication_lag_seconds` is set when an event comes **off the replication
+stream**, before batching. An event can therefore sit in an unflushed batch —
+up to a full batch or a checkpoint interval — while this gauge reads
+"caught up", even though the event is **not yet queryable and not yet
+recoverable**. It is unchanged and still useful for "is the source→daemon
+connection keeping up", but it is not a recovery-readiness signal.
+
+The three commit-side metrics close that window. They are published only after
+a batch is durably in the index:
+
+| Metric | Clock | Read it as |
+|---|---|---|
+| `index_commit_latency_seconds` | one process's monotonic clock — **skew-free, sub-second** | How long a change existed but was not yet recoverable. **This is the one to alert on.** Observed per event, so the histogram's tail is the real worst case, not a per-flush average. |
+| `availability_lag_seconds` | source clock **minus** local clock | The effective RPO. **Approximate**: it carries any clock skew between the source and this host, and the binlog header timestamp it starts from has one-**second** resolution. Negative values (a source clock running ahead) are clamped to 0. Reported as the batch **maximum** — the oldest change in a batch is what defines the recovery point. |
+| `last_flush_timestamp_seconds` | local | When this process last made anything queryable. Alert on `time() - <metric>`, never on its raw value. |
+
+A zero read time — a file-mode `bintrail index` backfill, or any event a
+non-replication producer built — is **skipped**, never recorded as a
+0-second latency. Re-indexing month-old binlogs must not publish
+"everything is perfectly fresh".
 
 ## Capture loss (`bintrail_statement_dml_dropped_total`)
 
@@ -118,8 +144,33 @@ bintrail_index_storage_bytes{location="mysql"}
 predict_linear(bintrail_index_storage_bytes{location="mysql"}[6h], 7 * 24 * 3600)
 ```
 
-**Stream stalled** — replication lag climbing, **or** no events indexed (either
-condition is a separate alert):
+**Capture is not making data recoverable** — the alert that actually protects
+recovery. Every lag *gauge* is moved only BY TRAFFIC, so under an idle source
+they all freeze at their last value and a dashboard reads "caught up" forever,
+including when the stream is dead. Dividing on the flush timestamp is immune to
+that, because the flush timestamp stops advancing whether the cause is a dead
+daemon or a quiet source:
+
+```promql
+time() - bintrail_stream_last_flush_timestamp_seconds > 300
+```
+
+**Alerting on a lag gauge alone is the mistake this metric exists to prevent.**
+`bintrail_stream_availability_lag_seconds > 300` looks equivalent and is not: a
+stream that dies leaves the gauge at whatever it last was, so a healthy-looking
+value can be hours stale.
+
+**Commit latency is degrading** — changes are taking longer to become
+recoverable, before it turns into an outage. Same-process clock, so this is
+exact:
+
+```promql
+histogram_quantile(0.99, rate(bintrail_stream_index_commit_latency_seconds_bucket[5m])) > 30
+```
+
+**Stream stalled** — the source→daemon connection is behind, **or** no events
+indexed (either condition is a separate alert). Note the first is receive-time:
+it says the daemon is behind the source, not that data is unrecoverable:
 
 ```promql
 bintrail_stream_replication_lag_seconds > 300
@@ -148,6 +199,27 @@ line / `stream.continuity.status` JSON field), and the alertable hook is its exi
 # in CI/cron — exits non-zero on gap_lost OR an unconfirmable state (fails closed)
 bintrail status --index-dsn "$IDX" --fail-on-gap
 ```
+
+The liveness half has the same shape. `status` reports a freshness verdict
+(`current` / `idle` / `stalled`, plus the never-a-false-ok states) in the Stream
+section and as `stream.freshness.status` in JSON, and `--fail-on-lag` is its
+alertable exit:
+
+```bash
+# non-zero on a stalled checkpoint, an unevaluable verdict (fails closed),
+# or a newest indexed event older than the threshold
+bintrail status --index-dsn "$IDX" --fail-on-lag 15m
+```
+
+Two things to know before you put that in cron. The **checkpoint** is the
+liveness signal, not the event time — the checkpoint ticker runs with or
+without traffic, so a stale checkpoint means the daemon, never the workload.
+And the age check is **traffic-sensitive**: offline, a source nobody wrote to
+and a capture running an hour behind are the *same observation* (fresh
+checkpoint, old newest-event), which is exactly why `idle` is its own verdict
+rather than being called healthy or unhealthy. Pick a threshold above your
+quiet windows, and use `index_commit_latency_seconds` on the daemon when you
+need to tell the two apart.
 
 See [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
 A Prometheus gauge for this state is not exposed in this release.
@@ -199,12 +271,24 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "bintrail stream/metrics endpoint is down — capture may have stopped"
+      - alert: BintrailNothingBecomingRecoverable
+        expr: time() - bintrail_stream_last_flush_timestamp_seconds > 300
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "bintrail has not committed a batch to the index in 5 minutes — changes since then are NOT recoverable"
+      - alert: BintrailCommitLatencyHigh
+        expr: histogram_quantile(0.99, rate(bintrail_stream_index_commit_latency_seconds_bucket[5m])) > 30
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "bintrail p99 read→queryable latency is over 30s — the recovery window is widening"
       - alert: BintrailReplicationLagHigh
         expr: bintrail_stream_replication_lag_seconds > 300
         for: 10m
         labels: {severity: warning}
         annotations:
-          summary: "bintrail capture is more than 5 minutes behind the source"
+          summary: "bintrail is more than 5 minutes behind the source (receive-time; see BintrailNothingBecomingRecoverable for recoverability)"
       - alert: BintrailStreamErrors
         expr: rate(bintrail_stream_errors_total[15m]) > 0
         for: 15m

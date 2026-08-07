@@ -334,6 +334,31 @@ scrape_configs:
 groups:
   - name: bintrail
     rules:
+      # The recoverability alert. Every lag gauge below is moved only BY
+      # TRAFFIC and freezes at its last value under an idle source — so a dead
+      # stream reads identical to a healthy one. Dividing on the flush
+      # timestamp is immune to that: it stops advancing either way.
+      - alert: BintrailNothingBecomingRecoverable
+        expr: time() - bintrail_stream_last_flush_timestamp_seconds > 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Bintrail has not committed a batch to the index in 5 minutes"
+          description: "Changes since the last flush are NOT queryable and NOT recoverable."
+
+      # Read→queryable, both ends on one clock (skew-free, sub-second).
+      - alert: BintrailCommitLatencyHigh
+        expr: histogram_quantile(0.99, rate(bintrail_stream_index_commit_latency_seconds_bucket[5m])) > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bintrail p99 read→queryable latency is over 30s"
+          description: "The window in which a change exists but is not yet recoverable is widening."
+
+      # RECEIVE-time: says the daemon is behind the source, NOT that data is
+      # unrecoverable — it is set before batching.
       - alert: BintrailReplicationLagHigh
         expr: bintrail_stream_replication_lag_seconds > 60
         for: 5m

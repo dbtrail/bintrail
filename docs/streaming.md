@@ -334,7 +334,10 @@ When `--metrics-addr :9090` is set, a Prometheus HTTP endpoint starts at `/metri
 | `bintrail_stream_batch_flushes_total` | Counter | Number of batch INSERT operations |
 | `bintrail_stream_checkpoint_saves_total` | Counter | Successful checkpoint writes |
 | `bintrail_stream_last_event_timestamp_seconds` | Gauge | Unix timestamp of the last received event |
-| `bintrail_stream_replication_lag_seconds` | Gauge | `now() - last_event_timestamp` in seconds |
+| `bintrail_stream_replication_lag_seconds` | Gauge | `now() - last_event_timestamp` in seconds — **receive-time**, set before batching |
+| `bintrail_stream_index_commit_latency_seconds` | Histogram | Seconds from replication read to the event being **queryable** (per event) |
+| `bintrail_stream_availability_lag_seconds` | Gauge | Approximate seconds from source commit to queryable — the effective RPO |
+| `bintrail_stream_last_flush_timestamp_seconds` | Gauge | Unix timestamp of the last batch committed to the index |
 | `bintrail_stream_errors_total{source,type}` | Counter | Errors by type: `batch_flush`, `checkpoint`, `gtid_update` |
 | `bintrail_stream_batch_size` | Histogram | Distribution of events per batch flush |
 
@@ -346,7 +349,33 @@ in one process stay distinguishable (the top-level
 monitored entry's ID, and the **daemon** serves one `/metrics` endpoint covering
 all supervised streams (per-stream endpoints would fight over the bind).
 
-`replication_lag_seconds` is the most useful metric for monitoring — it tells you how far behind the stream is relative to real time. If it grows steadily, the index database can't keep up with the write rate. With multiple sources, alert per label: `bintrail_stream_replication_lag_seconds{source="<entry-id>"}`.
+`replication_lag_seconds` tells you how far behind the stream is relative to
+real time. If it grows steadily, the index database can't keep up with the
+write rate. With multiple sources, alert per label:
+`bintrail_stream_replication_lag_seconds{source="<entry-id>"}`.
+
+**It is not a recoverability signal.** It is set when an event comes *off* the
+stream, before batching, so an event can sit in an unflushed batch — up to a
+full batch or a checkpoint interval — while this gauge reads "caught up",
+though the event is not yet queryable and not yet recoverable. Its semantics
+are unchanged on purpose, so existing dashboards keep meaning what they meant.
+
+For recovery readiness use the commit-side metrics, published only after a
+batch is durably in the index:
+
+- `index_commit_latency_seconds` — read→queryable, per event. Both ends are
+  this process's own clock, so it is skew-free and sub-second: **the one to
+  alert on.**
+- `availability_lag_seconds` — source commit→queryable, the effective RPO.
+  Approximate: it crosses the source's clock and ours, the source timestamp has
+  one-second resolution, and negatives are clamped to 0. Reported as the batch
+  maximum, since the oldest change defines the recovery point.
+- `last_flush_timestamp_seconds` — alert on `time() - <metric>`. Every gauge
+  above freezes under idle traffic, so a dead stream looks identical to a
+  healthy one; dividing on the flush timestamp is what distinguishes them.
+
+See [observability.md](observability.md) for the alert rules, and
+`bintrail status --fail-on-lag` for the offline (metrics-free) equivalent.
 
 The metrics HTTP server shuts down gracefully (5-second timeout) on command exit.
 
