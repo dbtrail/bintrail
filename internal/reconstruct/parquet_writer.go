@@ -375,7 +375,7 @@ func renderBaselineValue(col baseline.Column, v any) (text string, isNull bool, 
 		return string(t), false, nil
 
 	case time.Time:
-		if strings.EqualFold(col.MySQLType, "date") {
+		if strings.EqualFold(strings.TrimSpace(col.MySQLType), "date") {
 			return t.UTC().Format("2006-01-02"), false, nil
 		}
 		// The fractional part is elided when zero, which is the form
@@ -423,7 +423,8 @@ var integerTypeTokens = map[string]bool{
 // for this column's type. bitSize is the float's own precision, so a float32 is
 // not widened into the noise of its float64 expansion (0.1 → 0.10000000149…).
 func formatFloatForColumn(f float64, col baseline.Column, bitSize int) string {
-	if integerTypeTokens[strings.ToLower(col.MySQLType)] {
+	typ := strings.ToLower(strings.TrimSpace(col.MySQLType))
+	if integerTypeTokens[typ] {
 		if !math.IsInf(f, 0) && !math.IsNaN(f) && f == math.Trunc(f) {
 			// 'f' with -1 precision never emits an exponent, so ParseInt sees a
 			// plain integer for any magnitude.
@@ -434,7 +435,7 @@ func formatFloatForColumn(f float64, col baseline.Column, bitSize int) string {
 		// silently truncating data here.
 		return strconv.FormatFloat(f, 'f', -1, bitSize)
 	}
-	if col.MySQLType == "float" || col.MySQLType == "double" || col.MySQLType == "real" {
+	if typ == "float" || typ == "double" || typ == "real" {
 		// ParseFloat accepts exponent notation, so 'g' is safe here and keeps the
 		// shortest exact representation.
 		return strconv.FormatFloat(f, 'g', -1, bitSize)

@@ -307,7 +307,7 @@ func convertValue(col Column, raw string) (parquet.Value, error) {
 		// about which columns are byte arrays. NOTE: the exact form mydumper
 		// emits for spatial columns is not verified end-to-end here (mydumper
 		// unavailable in the unit env); the type mapping is the safe floor.
-		if binaryTypeTokens[col.MySQLType] {
+		if IsBinaryType(col.MySQLType) {
 			return parquet.ByteArrayValue(decodeBinaryLiteral(raw)), nil
 		}
 		// String types and fallback.

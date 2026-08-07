@@ -12,7 +12,10 @@ import (
 
 // toSecondsEpoch converts a Go time to MySQL's TO_SECONDS() domain (seconds
 // since year 0). TO_SECONDS('1970-01-01') is 62167219200; the same constant
-// backs indexer.DescriptionToHuman in the opposite direction.
+// backs query.mysqlToSeconds (which does exactly this for the fetch's own
+// partition hints) and indexer.DescriptionToHuman in the opposite direction.
+// Kept local rather than exported from query: one arithmetic line, pinned by
+// the integration test that asserts the resolved cut against real rows.
 //
 // It is inlined as a literal into the WHERE clause rather than bound as a
 // parameter because MySQL cannot prune partitions from a parameterised

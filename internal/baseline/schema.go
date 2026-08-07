@@ -203,7 +203,7 @@ func mysqlToParquetNode(typeToken string, unsigned bool) parquet.Node {
 	// BLOB bytes in the STRING default would place non-UTF-8 bytes in a UTF-8
 	// column (#503 item 2). The exact mydumper spatial encoding is unverified
 	// end-to-end here; the binary type mapping is the safe floor.
-	if binaryTypeTokens[typeToken] {
+	if IsBinaryType(typeToken) {
 		return parquet.Optional(parquet.Leaf(parquet.ByteArrayType))
 	}
 	switch typeToken {
