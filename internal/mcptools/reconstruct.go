@@ -454,8 +454,9 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 
 // reconstructFetchError rewrites the two typed fetch failures with remediation
 // an MCP client can actually act on. The library types stay command-neutral and
-// the CLI wraps them with flag advice (`--allow-gaps`), which is meaningless
-// here — the same reason the recover tool rewrites *recovery.ScriptBudgetError.
+// the CLI wraps them with the reconcile hint plus `--allow-gaps` flag advice;
+// only the flag half is meaningless here — the same reason the recover tool
+// rewrites *recovery.ScriptBudgetError.
 func reconstructFetchError(err error) error {
 	var gapErr *query.GapError
 	if errors.As(err, &gapErr) {
@@ -463,8 +464,8 @@ func reconstructFetchError(err error) error {
 		// remedy is an operator command, named before the lossy override —
 		// same ordering as the CLI hint from #1268 (#1270). Naming a shell
 		// command is fine (the SourceEmptyError branch below already does);
-		// the leak rule only forbids `--allow-gaps`, the flag this surface
-		// cannot pass.
+		// the leak rule forbids flag spellings the client would pass on its
+		// own surface — here, `--allow-gaps`.
 		return fmt.Errorf("%w; the reconstruction would be silently incomplete. "+
 			"Gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too — "+
 			"if archives exist in storage, have the operator run `bintrail archive reconcile --repair --index-dsn ... --archive-s3 s3://...` (or --archive-dir) to repopulate archive_state, then retry. "+

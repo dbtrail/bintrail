@@ -3,6 +3,7 @@ package mcptools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -345,7 +346,29 @@ func TestReconstructWarningsCaptureGap(t *testing.T) {
 // archive-reconcile remedy for the rebuilt-index case — deleting the hint
 // leaves an agent with only the lossy override.
 func TestReconstructFetchErrorGapNamesToolParam(t *testing.T) {
-	msg := reconstructFetchError(&query.GapError{GapHours: []time.Time{time.Date(2026, 6, 1, 3, 0, 0, 0, time.UTC)}}).Error()
+	wrapped := reconstructFetchError(&query.GapError{GapHours: []time.Time{time.Date(2026, 6, 1, 3, 0, 0, 0, time.UTC)}})
+	var gapErr *query.GapError
+	if !errors.As(wrapped, &gapErr) {
+		t.Errorf("the rewrite must keep the %%w chain so callers can still errors.As the library type, got: %v", wrapped)
+	}
+	msg := wrapped.Error()
+	if strings.Contains(msg, "--allow-gaps") {
+		t.Errorf("the MCP rewrite must not hand the client the CLI flag, got: %s", msg)
+	}
+	if !strings.Contains(msg, "allow_gaps: true") {
+		t.Errorf("the rewrite must name the tool parameter that overrides it, got: %s", msg)
+	}
+	// `--repair` specifically: without it reconcile is a dry-run and the
+	// "non-lossy remedy" fixes nothing.
+	if !strings.Contains(msg, "archive reconcile --repair") {
+		t.Errorf("the rewrite must name the reconcile remedy in its acting form, got: %s", msg)
+	}
+}
+
+// TestReconstructFetchErrorSourceEmptyNamesToolParam pins the same contract on
+// the pre-existing SourceEmptyError branch, previously untested.
+func TestReconstructFetchErrorSourceEmptyNamesToolParam(t *testing.T) {
+	msg := reconstructFetchError(&query.SourceEmptyError{Source: "s3://bucket/prefix"}).Error()
 	if strings.Contains(msg, "--allow-gaps") {
 		t.Errorf("the MCP rewrite must not hand the client the CLI flag, got: %s", msg)
 	}
@@ -353,7 +376,7 @@ func TestReconstructFetchErrorGapNamesToolParam(t *testing.T) {
 		t.Errorf("the rewrite must name the tool parameter that overrides it, got: %s", msg)
 	}
 	if !strings.Contains(msg, "archive reconcile") {
-		t.Errorf("the rewrite must name the non-lossy reconcile remedy, got: %s", msg)
+		t.Errorf("the rewrite must name the reconcile remedy, got: %s", msg)
 	}
 }
 
@@ -380,6 +403,11 @@ func TestReconstructCaptureGapErrorNamesToolParam(t *testing.T) {
 			}
 			if !strings.Contains(msg, "app.users") {
 				t.Errorf("the refusal must name the table, got: %s", msg)
+			}
+			// A permanent capture loss has no reconcile remedy — copying the
+			// fetch-gap hint here would be false hope (#1270).
+			if strings.Contains(msg, "archive reconcile") {
+				t.Errorf("the capture-loss refusal must not suggest reconcile, got: %s", msg)
 			}
 		})
 	}
