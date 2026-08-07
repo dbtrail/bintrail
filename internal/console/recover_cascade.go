@@ -420,6 +420,7 @@ func (s *Server) synthesizeCascade(ctx context.Context, b *bundle, p cascadeSynt
 				MaxDepth:        p.MaxDepth,
 				Baseline:        baselineProvider,
 				ArchivesPresent: archivesExist,
+				PKMetas:         cascade.PKMetasFromResolver(b.resolver),
 			})
 			results = append(results, r)
 			if serr != nil {

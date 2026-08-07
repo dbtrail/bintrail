@@ -300,6 +300,7 @@ func runRecoverCascade(cmd *cobra.Command, args []string) error {
 				MaxDepth:        rcMaxDepth,
 				Baseline:        baselineProvider,
 				ArchivesPresent: archivesExist,
+				PKMetas:         cascade.PKMetasFromResolver(resolver),
 			})
 			results = append(results, r)
 			if serr != nil {

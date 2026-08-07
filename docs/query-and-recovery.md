@@ -543,6 +543,7 @@ MariaDB silently extends a system-versioned table's `PRIMARY KEY` with its `ROW 
 
 - **Full-table `reconstruct`** (baseline merge and binlog-only fallback alike) and the shim's **full-table `_flashback`/`_snapshot`** views refuse with an error naming the generated PK column.
 - **`verify`** reports the table as `inconclusive` — a permanent property of the table's shape, not a failure. A run scoped only to such tables still exits non-zero (nothing was proven).
+- **`recover-cascade`** skips any FK edge whose **child** table is system-versioned, reporting it as a permanent incompleteness caveat (its cascade side effects are not synthesized) — a candidate scan over such a child would rebuild rows from history-polluted state.
 - **Still available**: `query` and `recover` are not gated, and single-row `reconstruct` works with an explicit column list, e.g. `--pk 1 --pk-columns id`.
 
 ### Column type encodings (BLOB/TEXT, GEOMETRY, VECTOR)

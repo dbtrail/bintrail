@@ -98,8 +98,12 @@ func (p *Provider) BaselineChildren(ctx context.Context, schema, table, fkCol, p
 	// re-snapshot can ever satisfy. Fail loud with the real cause instead,
 	// same stance as the fkFilterSafe refusal below.
 	if c, found := reconstruct.GeneratedPKColumn(tm.PKColumnMetas()); found {
-		return cascade.BaselineLookup{}, false, fmt.Errorf("baseline scan of %s.%s: %s",
-			schema, table, reconstruct.GeneratedPKGateReason(c, "the cascade baseline fallback"))
+		// Wrapped with the ErrGeneratedPK sentinel (#1273) so the cascade
+		// engine's caveat classifier can file this under the permanent
+		// `generatedpk:` caveat — and skip Phase-1 for the edge too — instead
+		// of the transient-sounding `baselinefail:` bucket.
+		return cascade.BaselineLookup{}, false, fmt.Errorf("baseline scan of %s.%s: %w: %s",
+			schema, table, reconstruct.ErrGeneratedPK, reconstruct.GeneratedPKGateReason(c, "the cascade baseline fallback"))
 	}
 	// The FK filter binds parentPK as a STRING against the baseline column.
 	// DuckDB coerces it exactly for integer/string FK columns, but for

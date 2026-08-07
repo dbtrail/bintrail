@@ -1,11 +1,19 @@
 package reconstruct
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
+
+// ErrGeneratedPK is the errors.Is sentinel wrapped by refusals caused by a
+// generated primary-key member — the MariaDB system-versioning shape
+// (#1266/#1273). Machine callers (the cascade engine's caveat classifier)
+// use it to tell this PERMANENT table property apart from transient lookup
+// failures without string matching.
+var ErrGeneratedPK = errors.New("primary key contains a generated column")
 
 // PKTypeGateReason renders the refusal detail for a primary-key column a
 // MySQL-path SupportedPKType gate rejected. Two physically different causes

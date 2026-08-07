@@ -342,6 +342,7 @@ func MakeRecoverCascadeTool(cfg Config) func(context.Context, *mcp.CallToolReque
 					MaxDepth:        maxDepth,
 					Baseline:        baselineProvider,
 					ArchivesPresent: archivesExist,
+					PKMetas:         cascade.PKMetasFromResolver(resolver),
 				})
 				results = append(results, r)
 				if serr != nil {

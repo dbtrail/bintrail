@@ -51,7 +51,9 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/event"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 // CascadeFK is one foreign-key edge plus its referential delete action.
@@ -146,6 +148,37 @@ type Options struct {
 	// When true, baseline augmentation is skipped + flagged, exactly like a
 	// truncated binlog scan.
 	ArchivesPresent bool
+	// PKMetas, when non-nil, resolves a table's primary-key column metadata
+	// from the schema snapshot (#1273). The engine uses it to skip child
+	// edges whose PK contains a generated column — the MariaDB system-
+	// versioning shape (#1266): such a table's binlog carries history-row
+	// inserts and row_end tombstone updates under the surviving key, so the
+	// per-pk_values candidate scan would synthesize restores from
+	// history-polluted state, and the baseline omits the generated member
+	// anyway. Gated edges are skipped with a permanent `generatedpk:` caveat
+	// covering BOTH phases. nil disables the gate; the Phase-2 provider still
+	// refuses on its own via reconstruct.ErrGeneratedPK, which the caveat
+	// classifier recognizes — the backstop for probe-less callers.
+	PKMetas func(schema, table string) []metadata.ColumnMeta
+}
+
+// PKMetasFromResolver adapts a schema resolver into Options.PKMetas. A nil
+// resolver yields nil (gate off), matching the call sites' best-effort
+// resolver loading — the Phase-2 provider backstop still refuses on its own.
+// Resolution failures degrade to nil metas (gate silent for that table): the
+// cascade engine must keep working against indexes whose snapshot predates
+// the table, exactly as it did before the gate existed.
+func PKMetasFromResolver(r *metadata.Resolver) func(schema, table string) []metadata.ColumnMeta {
+	if r == nil {
+		return nil
+	}
+	return func(schema, table string) []metadata.ColumnMeta {
+		tm, err := r.Resolve(schema, table)
+		if err != nil {
+			return nil
+		}
+		return tm.PKColumnMetas()
+	}
 }
 
 // skewSampleLimit bounds the child-side DDL-skew probe: how many child
@@ -474,6 +507,25 @@ func SynthesizeVictims(
 		failed   bool // operational failure — the caller must skip this edge
 	}
 	scanChildren := func(fk CascadeFK, parentKey string, rootTS time.Time) childScan {
+		// #1273: a child whose PK contains a generated column — the MariaDB
+		// system-versioning shape — cannot be synthesized from EITHER phase:
+		// its binlog history carries history-row inserts and row_end tombstone
+		// updates under the surviving key (the #1266 evidence), so the
+		// per-pk_values candidate scan would rebuild children from
+		// history-polluted state, and the baseline omits the generated PK
+		// member. Skip the edge with a permanent caveat instead, before any
+		// index or baseline work.
+		if opts.PKMetas != nil {
+			for _, c := range opts.PKMetas(fk.Schema, fk.Table) {
+				if c.IsGenerated {
+					addIncomplete("generatedpk:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+						"%s.%s cannot be synthesized: primary-key column %q is a generated column (the MariaDB "+
+							"system-versioning shape) — a PERMANENT property of the table, not a transient failure; "+
+							"its cascade side effects are not recovered", fk.Schema, fk.Table, c.Name))
+					return childScan{failed: true}
+				}
+			}
+		}
 		until := rootTS
 		// Phase-1 window; widened to the baseline snapshot below.
 		since := rootTS.Add(-opts.Lookback)
@@ -494,6 +546,19 @@ func SynthesizeVictims(
 			bl, covered, berr := opts.Baseline.BaselineChildren(ctx, fk.Schema, fk.Table, fk.Column, parentKey, rootTS, opts.CandidateLimit)
 			switch {
 			case berr != nil:
+				// A generated-PK refusal (#1273) is a PERMANENT table
+				// property, not a lookup failure: file it under its own
+				// caveat key and skip the edge entirely — falling through to
+				// Phase-1 would scan the same history-polluted candidates the
+				// refusal exists to avoid. This is the backstop for callers
+				// that pass no PKMetas probe; with the probe wired, the gate
+				// at the top of scanChildren fires first.
+				if errors.Is(berr, reconstruct.ErrGeneratedPK) {
+					addIncomplete("generatedpk:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+						"%s.%s cannot be synthesized: %v — a PERMANENT property of the table, not a transient "+
+							"lookup failure; its cascade side effects are not recovered", fk.Schema, fk.Table, berr))
+					return childScan{failed: true}
+				}
 				addIncomplete("baselinefail:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
 					"baseline lookup failed for %s.%s (recovery may be partial): %v", fk.Schema, fk.Table, berr))
 			case covered:
