@@ -61,6 +61,12 @@ type TableChecksum struct {
 	GTIDSet  string
 	RowCount int64
 	Digest   string
+	// LSN is the PostgreSQL WAL anchor (pg_current_wal_lsn) captured when the
+	// snapshot opens — the PG sibling of GTIDSet, set only by
+	// ConsistentTableChecksumPG (zero on the MySQL paths, which leave the
+	// anchor in GTIDSet). It carries the same lock-free-window caveat as
+	// GTIDSet: pg_current_wal_lsn is global state, not MVCC-filtered.
+	LSN uint64
 	// Columns is the ordered set of column names the digest was computed over
 	// (ordinal order, generated columns excluded). A consumer that recomputes a
 	// digest to compare (the verify capstone #634) must hash exactly this set in

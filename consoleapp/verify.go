@@ -17,6 +17,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
+	"github.com/dbtrail/dbtrail/internal/pgverifysource"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/verify"
 )
@@ -247,12 +248,10 @@ func (s *verifySupervisor) run(req console.VerifyRequest, baselineSrc string) {
 	var runErr error
 	switch req.Mode {
 	case console.VerifyModeLiveSource:
-		// Live-source verify fingerprints the source with MySQL-only SQL; a PG
-		// source is refused with a clear verdict (not a misleading inconclusive).
-		// Baseline-anchored is the supported PG path. This is an engine-truth
-		// backstop; handleVerifyTrigger already rejects it at the API boundary.
+		// The index's recorded flavor routes the live fingerprint: the MySQL
+		// consistent-snapshot scan, or the PG-native checksum (#1024).
 		if flavor == console.FlavorPostgres {
-			runErr = fmt.Errorf("live-source verify is not supported for PostgreSQL sources; use baseline-anchored verify")
+			runErr = s.runLiveSourcePG(req, db, resolver, dbName)
 		} else {
 			runErr = s.runLiveSource(req, db, resolver, dbName)
 		}
@@ -383,6 +382,58 @@ func (s *verifySupervisor) runLiveSource(req console.VerifyRequest, indexDB *sql
 			return fmt.Errorf("verify interrupted: %w", err)
 		}
 		res, err := verify.VerifyTable(ctx, cfg, st.Schema, st.Table)
+		if err != nil {
+			res = verify.TableResult{Schema: st.Schema, Table: st.Table, Status: verify.StatusError, Detail: err.Error()}
+		}
+		// Live-source mismatches have no explain support in the engine.
+		s.appendResult(req.ServerID, toWireResult(res, false))
+	}
+	return nil
+}
+
+// runLiveSourcePG is runLiveSource for a PostgreSQL source (#1024): the same
+// per-table loop, driving the engine's PG sibling (verify.VerifyTablePG).
+// Two deliberate differences from the MySQL loop:
+//   - the source is reached through pgverifysource.LiveSource — a pinned PG
+//     connection (the render-GUC pin is what makes the live scan
+//     byte-comparable to the baseline/delta text) — opened once and used
+//     serially across tables; this daemon already links the PG capture
+//     stack, so unlike the core CLI no seam indirection is needed;
+//   - target tables come from the resolver (verify.PGTargetTables), never
+//     liveSourceTargetTables' MAX(snapshot_id) query: a PG index stores one
+//     relation per snapshot_id, so that query would silently verify a single
+//     table.
+func (s *verifySupervisor) runLiveSourcePG(req console.VerifyRequest, indexDB *sql.DB, resolver *metadata.Resolver, dbName string) error {
+	ctx := s.ctx
+	sourceChecksum, closeSource, err := pgverifysource.LiveSource(ctx, req.SourceDSN)
+	if err != nil {
+		return fmt.Errorf("connect source: %w", err)
+	}
+	defer func() { _ = closeSource() }()
+
+	tables, err := verify.PGTargetTables(resolver, req.Tables)
+	if err != nil {
+		return fmt.Errorf("resolve target tables: %w", err)
+	}
+
+	baselineSrc := req.BaselineDir
+	if baselineSrc == "" {
+		baselineSrc = req.BaselineS3
+	}
+	// Conservative archive fetcher and zero DuckDB tuning on purpose: this
+	// shares the daemon with the stream (#510/#511 keep --ultrafast off
+	// daemons), same as every other supervisor run mode.
+	cfg := verify.PGLiveConfig{
+		SourceChecksum: sourceChecksum, IndexDB: indexDB, Resolver: resolver,
+		BaselineSource: baselineSrc, IndexDBName: dbName,
+		NoArchive: req.NoArchive, ArchiveFetcher: parquetquery.Fetch,
+	}
+	for _, st := range tables {
+		// See runBaselineAnchored: a shutdown mid-run fails the run loudly.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("verify interrupted: %w", err)
+		}
+		res, err := verify.VerifyTablePG(ctx, cfg, st.Schema, st.Table)
 		if err != nil {
 			res = verify.TableResult{Schema: st.Schema, Table: st.Table, Status: verify.StatusError, Detail: err.Error()}
 		}

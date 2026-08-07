@@ -453,13 +453,15 @@ directly.
 > across the upgrade, so `--pk` lookups and `--history` can split there;
 > re-baselining resolves this going forward (deltas before the new anchor are
 > not replayed).
-> **Full-table** `reconstruct` (`--output-format mydumper`) and
-> baseline-anchored `verify` remain deliberately out of scope: a PG baseline
-> does not carry the `CREATE TABLE` metadata full-table reconstruct needs.
-> `query` and `recover` (which work from the indexed deltas alone, no baseline
-> required) are the fully-supported recovery surface for PostgreSQL in this
-> release — see [Limitations](#limitations) for the complete
-> picture.
+> **Full-table** `reconstruct` (`--output-format mydumper`) remains
+> deliberately out of scope: a PG baseline does not carry the `CREATE TABLE`
+> metadata it needs. `verify` is not bound by that limit — it digests row
+> content without emitting a dump, so both baseline-anchored and live-source
+> `verify` are supported for PostgreSQL (see
+> [verify — Notes per source](verify.md#notes-per-source)). `query` and
+> `recover` (which work from the indexed deltas alone, no baseline required)
+> round out the recovery surface — see [Limitations](#limitations) for the
+> complete picture.
 
 ### Interactive `AS OF` from `psql`
 
@@ -497,7 +499,7 @@ Scope and behaviour track PostgreSQL's current time-travel maturity:
 - **Single-row `AS OF` only** — a `WHERE <primary-key> = <value>` predicate.
   Full-table `AS OF` is refused with remediation: a PG baseline does not carry
   the `CREATE TABLE` metadata full-table reconstruct needs (the same limit as
-  `reconstruct --output-format mydumper` and baseline-anchored `verify`).
+  `reconstruct --output-format mydumper`).
 - Columns render as **text** (the conservative first cut): read each one as a
   string, or let your driver text-parse it into a typed target. One caveat: a
   binary/`bytea` value containing a `0x00` byte truncates at the first NUL in
@@ -723,9 +725,12 @@ coerce, but verify your own round-trip.
 - **`GENERATED ... AS IDENTITY` / generated columns** can need care on recovery
   (`GENERATED ALWAYS AS IDENTITY` rejects an explicit insert; `STORED` generated
   columns are absent from the stream before PostgreSQL 18). Treat as best-effort.
-- **Full-table `reconstruct` and baseline-anchored `verify` are not wired for
-  PostgreSQL** — a PG baseline deliberately omits the `CREATE TABLE` metadata
-  full-table reconstruct needs (see above). **Single-row** `reconstruct` and
+- **Full-table `reconstruct` is not wired for PostgreSQL** — a PG baseline
+  deliberately omits the `CREATE TABLE` metadata it needs (see above).
+  `verify` is not bound by that limit: baseline-anchored, live-source, and
+  recover-input modes are all supported for PostgreSQL sources (see
+  [verify — Notes per source](verify.md#notes-per-source), including how the
+  live-source coverage check differs). **Single-row** `reconstruct` and
   the shim's single-row `_snapshot` work against a PG baseline and are
   validated end-to-end for scalar types — including the GUC-sensitive set,
   rendered under session GUCs pinned identically at capture and baseline;
@@ -752,8 +757,8 @@ baseline↔delta rendering-GUC identity and its fold-validated type matrix
 (#593), the managed-PostgreSQL smoke matrix (RDS and Aurora — see
 [Managed PostgreSQL](#managed-postgresql)), and source-aware console
 presentation including the live replication-health panel (v0.20.1).
-**Full-table** `reconstruct` and baseline-anchored `verify` remain documented
-out of scope (above).
+**Full-table** `reconstruct` remains documented out of scope (above);
+`verify` — baseline-anchored, live-source, and recover-input — is supported.
 
 ---
 

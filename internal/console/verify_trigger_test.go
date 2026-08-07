@@ -326,23 +326,27 @@ func addVerifyEntryPG(t *testing.T, srv *Server) string {
 	return e.ID
 }
 
-// TestVerifyTrigger_postgresRefusesLiveSource: live-source verify fingerprints
-// the source with MySQL-only SQL, so a PostgreSQL source is refused with a hard
-// 400 (deferred to #1024) — a clear message, never a misleading inconclusive,
-// and the controller is never triggered. A baseline destination is set so this
-// branch (not the earlier baseline gate) is what fires. No live PG needed.
-func TestVerifyTrigger_postgresRefusesLiveSource(t *testing.T) {
+// TestVerifyTrigger_postgresAcceptsLiveSource: live-source verify has a
+// PG-native checksum path since #1024, so a PostgreSQL entry with a source and
+// a baseline destination is ACCEPTED (this endpoint used to hard-400 it) and
+// the controller receives the request with the source DSN it needs — the
+// supervisor routes to the PG engine by the index's recorded flavor.
+func TestVerifyTrigger_postgresAcceptsLiveSource(t *testing.T) {
 	srv, ctrl := newVerifyTriggerServer(t)
 	id := addVerifyEntryPG(t, srv)
 	rec, body := doServersReq(t, srv, "POST", "/api/servers/"+id+"/verify", `{"mode":"live-source"}`)
-	if rec.Code != 400 {
-		t.Fatalf("PG live-source: code=%d, want 400 (body=%s)", rec.Code, body)
+	if rec.Code != 202 {
+		t.Fatalf("PG live-source: code=%d, want 202 (body=%s)", rec.Code, body)
 	}
-	if !strings.Contains(string(body), "not supported for PostgreSQL") {
-		t.Errorf("want the clear PG-refusal message, got: %s", body)
+	if len(ctrl.triggered) != 1 {
+		t.Fatalf("controller triggered %d times, want 1", len(ctrl.triggered))
 	}
-	if len(ctrl.triggered) != 0 {
-		t.Fatal("controller must never be triggered for a PG live-source request")
+	req := ctrl.triggered[0]
+	if req.Mode != VerifyModeLiveSource {
+		t.Errorf("mode = %q, want live-source", req.Mode)
+	}
+	if req.SourceDSN == "" {
+		t.Error("request must carry the source DSN for the live fingerprint")
 	}
 }
 

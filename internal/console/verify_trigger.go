@@ -242,15 +242,9 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "this server has no source configured; set the source connection first")
 		return
 	}
-	// Live-source verify fingerprints the source with MySQL-only SQL. For a PG
-	// source, baseline-anchored verify (the default) is the supported path; a
-	// live-source request is refused with a clear message, not a misleading
-	// inconclusive (#1009). The engine backstops this in cmd/bintrail-console.
-	if mode == VerifyModeLiveSource && e.IsPostgres() {
-		writeJSONError(w, http.StatusBadRequest,
-			"live-source verify is not supported for PostgreSQL sources; use baseline-anchored (the default) instead")
-		return
-	}
+	// A PostgreSQL source is NOT refused here anymore: live-source verify has
+	// a PG-native checksum path since #1024 (verify.VerifyTablePG); the
+	// supervisor routes by the index's recorded flavor, not the registry field.
 
 	req := VerifyRequest{
 		ServerID: e.ID, ServerName: e.Name, Mode: mode, Tables: body.Tables,

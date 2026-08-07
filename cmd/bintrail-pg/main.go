@@ -21,6 +21,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/observe"
+	"github.com/dbtrail/dbtrail/internal/pgverifysource"
 	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
@@ -73,6 +74,10 @@ func init() {
 	// shared verbatim with the core binary. The PostgreSQL capture command
 	// (stream) is registered in stream.go's init().
 	cli.AddReadCommands(rootCmd)
+	// PG live-source verify provider (#1024): this binary links the PG driver
+	// stack, so it fills the seam the shared verify command leaves empty in
+	// the postgres-free core binary.
+	cli.SetPGLiveVerifyConnect(pgverifysource.LiveSource)
 	// The index-side maintenance plane (rotate, archive reconcile) — also
 	// source-agnostic, so a PostgreSQL-only install can bound its index growth
 	// with `bintrail-pg rotate` instead of needing the core MySQL binary against

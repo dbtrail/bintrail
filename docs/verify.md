@@ -100,6 +100,11 @@ bintrail verify --source-dsn "$SRC" --index-dsn "$IDX" \
   --baseline-s3 s3://bucket/baselines --tables mydb.orders,mydb.users
 ```
 
+For a PostgreSQL source the same command works unchanged — pass the
+`postgres://` DSN as `--source-dsn`; the index's recorded source flavor routes
+the fingerprint. See [Notes per source](#notes-per-source) for how the PG
+fingerprint and its coverage check differ under the hood.
+
 ### Recover-input (`--check recover`)
 
 Pass `--check recover`. Instead of comparing table content, `verify` walks each
@@ -260,8 +265,9 @@ bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines --format json
   or `no_predecessor` (only one baseline; reported, exit 0, with a `message`).
 - `tables[].status` — `match` / `mismatch` / `inconclusive` / `error`, the same
   bucket counted in `summary`. `anchor` is the point the comparison was anchored
-  to (a GTID set in live-source mode, a `file:pos` binlog coordinate in
-  baseline-anchored mode); `reason` is the detail behind the verdict.
+  to (a GTID set in MySQL live-source mode, a `file:pos` binlog coordinate in
+  MySQL baseline-anchored mode, an `LSN:` WAL position for a PostgreSQL
+  source); `reason` is the detail behind the verdict.
 - `tables[].events_checked` / `chains_checked` / `chains_inconclusive` —
   present only under `--check recover` (omitted entirely otherwise, so a
   content-mode document is unchanged): how many events the chain walk visited,
@@ -313,7 +319,7 @@ diff tool involved.
 | Flag | Default | Description |
 |---|---|---|
 | `--index-dsn` | *(required)* | DSN for the index MySQL database |
-| `--source-dsn` | *(empty)* | Live source DSN. Pass it for **live-source** mode; omit for **baseline-anchored** mode |
+| `--source-dsn` | *(empty)* | Live source DSN (MySQL DSN, or `postgres://` for a PostgreSQL source). Pass it for **live-source** mode; omit for **baseline-anchored** mode |
 | `--baseline-dir` | *(empty)* | Local directory of baseline Parquet snapshots |
 | `--baseline-s3` | *(empty)* | S3 URL prefix of baseline snapshots (e.g. `s3://bucket/baselines/`) |
 | `--tables` | *(all)* | Comma-separated `schema.table` list (default: all tables in the latest schema snapshot; in baseline-anchored mode, snapshot tables with no baseline report `inconclusive` — "never baselined") |
@@ -381,7 +387,30 @@ the contract tag differs.
 
 ## Notes per source
 
-`verify` runs against the MySQL index, so it works for any source family whose
-baselines are wired. Baseline-anchored mode requires baselines; **PostgreSQL
-baselines are not yet wired** (see [PostgreSQL limitations](postgres.md#limitations)),
-so `verify` against a PostgreSQL source is not usable in this release.
+`verify` runs against the MySQL index, so every mode works wherever its data
+sources exist:
+
+- **MySQL** — all three modes. Live-source mode anchors on `@@gtid_executed`
+  and refuses to compare when the index is provably behind the snapshot; on a
+  `gtid_mode=OFF` source it proceeds with a `coverage unverified` note.
+- **MariaDB** — baseline-anchored and recover-input as MySQL. Live-source
+  proceeds with the same `coverage unverified` note (MariaDB has no
+  `@@gtid_executed` to prove containment against).
+- **PostgreSQL** — baseline-anchored and recover-input work against the PG
+  capture (`bintrail-pg stream` / the console's PostgreSQL servers), anchored
+  on WAL LSNs instead of binlog coordinates. Live-source mode is supported
+  too: the source is fingerprinted inside one `REPEATABLE READ` snapshot,
+  read in PostgreSQL's own text rendering under the same pinned session GUCs
+  the capture and baseline run under (`TimeZone=UTC`, `DateStyle=ISO`,
+  `extra_float_digits=3`, `bytea_output=hex`, `IntervalStyle=postgres`), and
+  anchored on `pg_current_wal_lsn()`. Its coverage check differs from MySQL
+  by necessity: an index checkpoint at-or-past the anchor **proves** the
+  index absorbed everything the snapshot reflects; a checkpoint behind it
+  proves nothing (WAL from other databases and non-transactional activity —
+  autovacuum, checkpoints — advances the anchor without ever producing
+  indexable events), so the run proceeds and the result carries a
+  `coverage unverified` note — the same documented trade-off as a GTID-off
+  MySQL source, where a genuinely-behind index surfaces as an investigable
+  mismatch rather than being masked. A stamped permanent capture loss
+  (`gap_lost`) always reports `inconclusive`, never a false mismatch. The
+  quiescent-source requirement applies unchanged.
