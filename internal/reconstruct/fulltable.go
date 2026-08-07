@@ -824,6 +824,14 @@ func ReconstructTable(
 			return nil, fullTablePKTypeRefusal(schema, table, pkCol)
 		}
 	}
+	// A generated column inside the PK — the MariaDB system-versioning shape
+	// (#1266) — can never canonicalize: the baseline omits generated columns,
+	// so every probe row would die with MissingPKColumnError deep in the
+	// merge. Refuse up front with the versioning-aware message instead; see
+	// GeneratedPKColumn for why a reduced join key is NOT the fix.
+	if pkCol, ok := GeneratedPKColumn(pkCols); ok {
+		return nil, fullTableGeneratedPKRefusal(schema, table, pkCol)
+	}
 
 	// For DATETIME/TIMESTAMP PK columns, warn loudly if the column_type
 	// metadata is missing — the canonicalizer will fall back to a
@@ -1702,6 +1710,14 @@ func reconstructBinlogOnly(
 	}
 	if len(tm.PKColumnMetas()) == 0 {
 		return nil, fmt.Errorf("%s.%s has no primary key in the loaded snapshot; full-table reconstruct requires a PK", schema, table)
+	}
+	// Same generated-PK gate as the baseline path (#1266), and this path is
+	// MORE exposed, not less: with no baseline probe to fail loudly, a
+	// versioned table's history-row inserts fold under their own full
+	// pk_values and would be emitted as duplicate live rows (the output
+	// column list excludes generated columns, so nothing distinguishes them).
+	if pkCol, ok := GeneratedPKColumn(tm.PKColumnMetas()); ok {
+		return nil, fullTableGeneratedPKRefusal(schema, table, pkCol)
 	}
 
 	// Generated columns can't be set explicitly in an INSERT, so exclude them

@@ -113,6 +113,13 @@ func VerifyTable(ctx context.Context, cfg Config, schema, table string) (TableRe
 			return inconclusive(res, pkTypeGateReason(c)), nil
 		}
 	}
+	// A generated PK member — the MariaDB system-versioning shape (#1266) —
+	// is a permanent property of the table, not a transient condition, so it
+	// is inconclusive (like "no primary key"), never a mismatch or an error:
+	// a verify that fails forever on a versioned table is cry-wolf noise.
+	if c, ok := reconstruct.GeneratedPKColumn(pkCols); ok {
+		return inconclusive(res, generatedPKGateReason(c)), nil
+	}
 
 	// 1. Live source fingerprint at a consistent snapshot. Normalized (see
 	// renderCellNormalized) so it stays symmetric with step 5's reconstruct
@@ -335,6 +342,15 @@ func inconclusive(res TableResult, detail string) TableResult {
 // CLI flag names in the text: the console's verify engine emits it too.
 func pkTypeGateReason(c metadata.ColumnMeta) string {
 	return reconstruct.PKTypeGateReason(c, "verify", "verify")
+}
+
+// generatedPKGateReason renders the inconclusive detail for a primary key
+// containing a generated column — the MariaDB system-versioning shape (#1266).
+// Shared by VerifyTable (live-source) and VerifyBaselinePair (baseline-
+// anchored) so the two modes cannot drift; see reconstruct.GeneratedPKColumn
+// for the full rationale.
+func generatedPKGateReason(c metadata.ColumnMeta) string {
+	return reconstruct.GeneratedPKGateReason(c, "verify")
 }
 
 // deferredReprUnresolved reports whether some change's row image carries a

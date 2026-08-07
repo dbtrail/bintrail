@@ -149,6 +149,15 @@ func VerifyBaselinePair(ctx context.Context, cfg BaselineConfig, p BaselinePair)
 				return inconclusive(res, pkTypeGateReason(c)), nil
 			}
 		}
+		// Generated PK member (MariaDB system versioning, #1266): permanent
+		// table property → inconclusive, same stance as VerifyTable. Inside
+		// the !pg branch with the type gate — the canonicalizer this protects
+		// is bypassed entirely on the PG path. ExplainBaselinePairMismatch
+		// needs no sibling gate: it only runs after this function reported a
+		// MISMATCH, which a gated table never does.
+		if c, ok := reconstruct.GeneratedPKColumn(pkCols); ok {
+			return inconclusive(res, generatedPKGateReason(c)), nil
+		}
 	}
 	// The reconstruction is bounded at the new baseline's exact anchor. MySQL
 	// uses the binlog file:pos; PostgreSQL uses the slot consistent-point LSN

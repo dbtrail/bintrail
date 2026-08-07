@@ -115,10 +115,13 @@ var generatedRe = regexp.MustCompile(`(?i)\bAS\s*\(.*\)\s*(?:VIRTUAL|STORED|PERS
 // Known scope limit (#1266): MariaDB extends the table's PRIMARY KEY with the
 // ROW END column, and the schema snapshot keeps it (PKColumnMetas selects on
 // IsPK only), so FULL-TABLE reconstruct — and verify, which reconstructs —
-// still refuse such a table loudly at the PK-canonicalization step
-// (MissingPKColumnError: the baseline no longer carries the column). The
-// baseline itself, single-row reconstruct with --pk-columns, and the query
-// paths all work.
+// refuse such a table UP FRONT (reconstruct.GeneratedPKColumn gates both
+// full-table paths; verify reports it inconclusive rather than error).
+// Excluding the column from the join key instead would corrupt silently —
+// the binlog carries history rows and versioned deletes under the same
+// remaining key; see GeneratedPKColumn's comment for the MariaDB 11.4
+// evidence. The baseline itself, single-row reconstruct with --pk-columns,
+// and the query paths all work.
 var rowPeriodRe = regexp.MustCompile(`(?i)\bGENERATED\s+ALWAYS\s+AS\s+ROW\s+(?:START|END)\b`)
 
 // ParseSchema reads a mydumper <db>.<table>-schema.sql file and returns the

@@ -39,6 +39,62 @@ func PKTypeGateReason(c metadata.ColumnMeta, surface, action string) string {
 	return fmt.Sprintf("primary-key column %q has type %q unsupported by the baseline canonicalizer", c.Name, c.DataType)
 }
 
+// GeneratedPKColumn returns the first primary-key member that is a STORED/
+// VIRTUAL generated column, in ordinal order, and whether one exists (#1266).
+//
+// The shape this detects in practice is MariaDB system versioning: MariaDB
+// silently extends a versioned table's PRIMARY KEY with its ROW END period
+// column (`PRIMARY KEY (id, row_end)`, observed on 11.4 for both visible and
+// INVISIBLE explicit period columns) and marks that column STORED GENERATED in
+// information_schema, which is how it reaches the snapshot's is_generated
+// flag. An ordinary STORED generated column inside a PK trips this too, on
+// purpose: in both cases the baseline deliberately omits the column's values
+// (mydumper never dumps generated columns), so no baseline-side PK join key
+// can be built and the merge would die deep in the probe with
+// MissingPKColumnError on every row.
+//
+// Why the gates that call this REFUSE instead of dropping the column from the
+// join key (the fix direction #1266 first suggested): the binlog does NOT
+// carry only current-state rows for a versioned table. Verified against
+// MariaDB 11.4: an UPDATE logs the current-row update PLUS a Write_rows for
+// the history row (same remaining key, row_end = now), and a DELETE logs no
+// Delete_rows at all — it is an Update_rows tombstone (row_end sentinel →
+// now). Under a reduced key the history insert would overwrite the current
+// row in the last-write-wins change map, orphan history rows would be emitted
+// as duplicate live rows, and tombstoned deletes would resurrect — silent
+// corruption where today's refusal is loud. Supporting these tables takes
+// versioning-aware fold semantics, not a smaller key.
+func GeneratedPKColumn(pkCols []metadata.ColumnMeta) (metadata.ColumnMeta, bool) {
+	for _, c := range pkCols {
+		if c.IsGenerated {
+			return c, true
+		}
+	}
+	return metadata.ColumnMeta{}, false
+}
+
+// GeneratedPKGateReason renders the refusal/inconclusive detail for a primary
+// key that contains a generated column (see GeneratedPKColumn). surface names
+// the feature speaking ("verify", "full-table reconstruct", ...). No CLI flag
+// names in the text: console and wire surfaces emit it too.
+func GeneratedPKGateReason(c metadata.ColumnMeta, surface string) string {
+	return fmt.Sprintf(
+		"primary-key column %q is a generated column — the MariaDB system-versioning shape, which extends a versioned "+
+			"table's PK with its ROW END period column — and baselines deliberately omit generated columns, so %s cannot "+
+			"build the baseline-side PK join key for this table; dropping the column from the key instead would corrupt "+
+			"silently, because the binlog carries history rows (as inserts) and versioned deletes (as row_end updates) "+
+			"under the same remaining key; single-row reconstruct with an explicit PK column list, query, and recover "+
+			"are unaffected", c.Name, surface)
+}
+
+// fullTableGeneratedPKRefusal is the error both full-table reconstruct paths
+// (baseline merge and binlog-only fallback) return when the PK contains a
+// generated column, so the two cannot drift.
+func fullTableGeneratedPKRefusal(schema, table string, pkCol metadata.ColumnMeta) error {
+	return fmt.Errorf("full-table reconstruct: %s.%s: %s", schema, table,
+		GeneratedPKGateReason(pkCol, "full-table reconstruct"))
+}
+
 // fullTablePKTypeRefusal is the error ReconstructTable's PK-type gate returns
 // for a column supportedPKType rejected. An empty DataType gets the honest
 // wrong-path verdict (see PKTypeGateReason): the gate sits after the recorded
