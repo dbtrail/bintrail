@@ -1,10 +1,13 @@
 name: oss-firewall
 
 # This repo is Apache 2.0: anything merged here is open source forever.
-# This guard rejects the only mechanically-detectable breach — Go
-# imports or module requirements pointing at private nethalo/* repos.
-# (Plain-text references like issue links "nethalo/dbtrail#123" in
-# comments are fine and intentionally not matched.)
+# This guard rejects the mechanically-detectable breaches — Go imports
+# or module requirements pointing at private nethalo/* repos, plus a
+# catch-all sweep over every other tracked file (Dockerfiles, compose
+# files, workflow YAML, shell scripts, ...). Markdown is exempt:
+# historical CHANGELOG entries legitimately mention the old module
+# path. A committed go.work would silently rewire builds to a local
+# checkout, so its absence is asserted too.
 
 on:
   push:
@@ -25,6 +28,19 @@ jobs:
           fi
           if grep -n 'github.com/nethalo/' go.mod go.sum 2>/dev/null; then
             echo '::error::go.mod/go.sum references a private nethalo/* module'
+            fail=1
+          fi
+          # Catch-all over every tracked file: Dockerfiles, compose files,
+          # workflow YAML, shell scripts, raw-string/backtick Go literals the
+          # quoted-import grep above cannot see. Markdown is exempt (historical
+          # CHANGELOG lines mention the old module path); this workflow file is
+          # exempt because it necessarily contains the pattern itself.
+          if git grep -In 'github\.com/nethalo/' -- ':!*.md' ':!.github/workflows/oss-firewall.yml'; then
+            echo '::error::reference to a private nethalo/* repo in a tracked file — the public repo must never point at private code'
+            fail=1
+          fi
+          if [ -n "$(git ls-files go.work go.work.sum)" ]; then
+            echo '::error::go.work/go.work.sum must never be committed — a workspace file rewires the build to a local checkout instead of the pinned public module'
             fail=1
           fi
           exit $fail

@@ -4,6 +4,10 @@ deploy/.env
 *.key
 *.pem
 
+# Local multi-module workspace — must never be committed
+go.work
+go.work.sum
+
 # Build artifacts
 /bintrail
 /bintrail-mcp
