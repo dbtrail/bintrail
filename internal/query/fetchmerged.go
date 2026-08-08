@@ -176,18 +176,34 @@ func FetchMerged(
 	engine *Engine,
 	o FetchMergedOptions,
 ) ([]ResultRow, *QueryPlan, error) {
+	rows, plan, _, err := FetchMergedFull(ctx, db, engine, o)
+	return rows, plan, err
+}
+
+// FetchMergedFull is FetchMerged plus the archive sources that FAILED and
+// were skipped — non-empty only under AllowGaps=true (a failing source is
+// fatal otherwise). Surfaces whose user cannot see the server log (the
+// console, #1281) need the list to put the incompleteness in the response;
+// callers that log are fine with FetchMerged, whose slog.Warn already names
+// the skipped sources.
+func FetchMergedFull(
+	ctx context.Context,
+	db *sql.DB,
+	engine *Engine,
+	o FetchMergedOptions,
+) ([]ResultRow, *QueryPlan, []string, error) {
 	if err := o.validate(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	src, err := resolveMergeSources(ctx, db, o)
 	if err != nil {
-		return nil, src.plan, err
+		return nil, src.plan, nil, err
 	}
-	rows, _, _, err := fetchPage(ctx, engine, o, src)
+	rows, skipped, _, err := fetchPage(ctx, engine, o, src)
 	if err != nil {
-		return nil, src.plan, err
+		return nil, src.plan, nil, err
 	}
-	return rows, src.plan, nil
+	return rows, src.plan, skipped, nil
 }
 
 // DefaultStreamBatchSize is the page size FetchMergedStream uses when the

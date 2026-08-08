@@ -397,7 +397,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		AllowGaps:      allowGaps,
 		ArchiveFetcher: parquetquery.Fetch,
 	}
-	rows, plan, err := query.FetchMerged(ctx, b.db, b.engine, fmOpts)
+	rows, plan, skippedSources, err := query.FetchMergedFull(ctx, b.db, b.engine, fmOpts)
 	if err != nil {
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {
@@ -448,7 +448,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		// Surface a stale-baseline fallback (#466) and a rendering-GUC stamp
 		// mismatch (#921) alongside coverage-gap warnings: the server already
 		// logs these; this puts them in front of the operator.
-		Warnings: appendRenderGUCsWarning(appendStaleWarning(gapWarnings(plan), stale), bmeta),
+		Warnings: appendRenderGUCsWarning(appendStaleWarning(coverageWarnings(plan, skippedSources, allowGaps), stale), bmeta),
 	}
 
 	// 3. Fold baseline + deltas. baselineRow may be nil. "existed" = the row was
