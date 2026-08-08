@@ -97,7 +97,13 @@ func TrimPartialTailTransaction(
 	lookAfter := at.Truncate(time.Second).Add(time.Second)
 	continues, err := gtidHasEventAfter(ctx, db, engine, fm, gtid, lookAfter)
 	if err != nil {
-		return nil, fmt.Errorf("check whether transaction %s continues past --at: %w", gtid, err)
+		// Surface-neutral on purpose (#1286): this error reaches MCP clients
+		// verbatim via ErrorResult, and the tool parameter there is `at`, not
+		// `--at` — naming the CLI flag is the leak class the MCP no-flag-leak
+		// rule exists to prevent. Same pattern as query.GapError /
+		// SourceEmptyError: the library Error() stays flag-free and each
+		// surface attaches its own wording.
+		return nil, fmt.Errorf("check whether transaction %s continues past the requested cut point: %w", gtid, err)
 	}
 	if !continues {
 		return events, nil
