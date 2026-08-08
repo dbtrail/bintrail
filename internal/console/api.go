@@ -215,7 +215,8 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 // One residual case for these permissive endpoints: when several archive
 // sources are configured and only SOME fail to load, FetchMerged logs the
 // failure server-side and continues (again, matching the CLI). Reconstruct
-// used to be the strict contrast cited here; since #1281 its allow_gaps=true
+// used to be the strict contrast cited here (#377 — under AllowGaps=false any
+// source failure aborts the fetch, which remains true); since #1281 its allow_gaps=true
 // path instead reports skipped sources and planner failures in the response
 // Warnings (coverageWarnings + query.FetchMergedFull) — these browsing
 // endpoints can adopt the same pattern if the log-only trade-off is ever

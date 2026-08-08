@@ -8,8 +8,10 @@ import "github.com/dbtrail/dbtrail/internal/query"
 // response, never the server log:
 //
 //   - archive sources that FAILED and were skipped (including the
-//     discovery-failure sentinel): the planner counted their hours as
-//     covered, so they are absent from GapHours too;
+//     discovery-failure sentinel): the planner will normally have counted
+//     their hours as covered (its archive_state read is best-effort, so not
+//     guaranteed — the failure direction is a double warning, never a
+//     missed one), keeping them out of GapHours;
 //   - a nil plan under allow_gaps: coverage was not evaluated. Registry
 //     bundles guarantee a database name (buildBundle rejects DSNs without
 //     one) and this handler always sets Since/Until, so nil means the

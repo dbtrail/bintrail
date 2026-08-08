@@ -318,9 +318,11 @@ pair), because gap detection reads the same registry — run
 [`bintrail archive reconcile`](rotation-and-status.md) if a source drifted.
 
 Returns JSON: `state` (or `history`), `found`, `deleted`, `baseline_time`,
-`event_count`, and any `warnings` (a coverage gap you allowed, a
-[stale-baseline fallback](query-and-recovery.md), or a suspected PK-changing
-UPDATE the fold can't follow).
+`event_count`, and any `warnings` (a coverage gap or permanent capture loss
+you allowed, a [stale-baseline fallback](query-and-recovery.md), a suspected
+PK-changing UPDATE the fold can't follow, or — under `allow_gaps` — an archive
+source that failed or could not be discovered, and coverage the planner could
+not verify).
 
 ---
 

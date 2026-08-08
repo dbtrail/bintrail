@@ -499,8 +499,10 @@ func reconstructCaptureGapError(gap *reconstruct.CaptureGap, schema, table strin
 
 // reconstructWarnings assembles the non-fatal caveats attached to a successful
 // result: coverage gaps the caller opted into with allow_gaps, a stale-baseline
-// fallback (#466), the PK-change suspicion below, and a permanent capture loss
-// (#765) the caller overrode. captureGap is non-nil ONLY when the caller passed
+// fallback (#466), the PK-change suspicion below, a permanent capture loss
+// (#765) the caller overrode, and the two allow_gaps fetch-side blind spots
+// (#1281): skipped/undiscoverable archive sources and a planner that never
+// produced a plan. captureGap is non-nil ONLY when the caller passed
 // allow_gaps — the refusal above is unconditional otherwise — and it MUST be
 // carried into the payload: unlike the CLI, whose operator sees the slog.Warn
 // on stderr, an MCP client sees nothing but this JSON, so an overridden gap

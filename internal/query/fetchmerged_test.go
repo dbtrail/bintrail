@@ -141,13 +141,19 @@ func TestFetchMerged_partialArchiveFailureAbortsStrictUnit(t *testing.T) {
 		t.Errorf("expected error to name the broken archive source, got: %v", err)
 	}
 
-	// Permissive mode: same partial failure stays warn-and-continue.
+	// Permissive mode: same partial failure stays warn-and-continue, and the
+	// skipped source is returned to the caller (#1281) — FetchMergedFull is
+	// what log-blind surfaces (console, MCP) rely on to warn in-response.
 	expectQueries(mock)
-	if _, _, err = FetchMerged(context.Background(), db, New(db), FetchMergedOptions{
+	var skipped []string
+	if _, _, skipped, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
 		AllowGaps:      true,
 		ArchiveFetcher: stubFetcher,
 	}); err != nil {
 		t.Fatalf("partial archive failure under permissive mode: expected success, got: %v", err)
+	}
+	if len(skipped) != 1 || !strings.Contains(skipped[0], "broken") {
+		t.Errorf("permissive mode must return the skipped source (#1281), got %v", skipped)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -215,13 +221,19 @@ func TestFetchMergedResolverFailure(t *testing.T) {
 		// No archives resolved → fast path → one live MySQL fetch.
 		mock.ExpectQuery("FROM binlog_events").WillReturnRows(sqlmock.NewRows([]string{"event_id"}))
 		fetcherCalled := false
-		_, _, err = FetchMerged(context.Background(), db, New(db), FetchMergedOptions{
+		var skipped []string
+		_, _, skipped, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
 			AllowGaps: true,
 			ArchiveFetcher: func(_ context.Context, _ Options, _ string) ([]ResultRow, error) {
 				fetcherCalled = true
 				return nil, nil
 			},
 		})
+		// The discovery failure must surface as the sentinel (#1281): no
+		// source can be named, yet the planner may still claim coverage.
+		if len(skipped) != 1 || skipped[0] != DiscoveryFailedSource {
+			t.Errorf("want the discovery-failure sentinel, got %v", skipped)
+		}
 		if err != nil {
 			t.Fatalf("permissive mode must warn and continue, got %v", err)
 		}

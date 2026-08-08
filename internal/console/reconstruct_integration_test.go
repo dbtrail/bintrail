@@ -207,6 +207,32 @@ func TestIntegrationReconstructGapRefused(t *testing.T) {
 	}
 }
 
+// TestIntegrationReconstructSkippedSourceWarned pins the #1281 wiring
+// end-to-end: an archive_state source whose files are gone is skipped under
+// allow_gaps=true, and the skip must reach the response warnings — reverting
+// handleReconstruct to plain gapWarnings() would silently reopen the blind
+// spot while every unit test stays green.
+func TestIntegrationReconstructSkippedSourceWarned(t *testing.T) {
+	srv := seedReconstruct(t)
+	// Register a ghost source: the planner counts its hour as covered (so it
+	// never lands in GapHours), but the fetch cannot read it.
+	if _, err := srv.cm.boot.db.Exec(
+		`INSERT INTO archive_state (bintrail_id, partition_name, local_path, archived_at)
+		 VALUES ('ghost-src', 'p_2026060112', '/nonexistent/bintrail_id=ghost-src/event_date=2026-06-01/event_hour=12/events.parquet', NOW())`); err != nil {
+		t.Fatal(err)
+	}
+	r := reconstructAt(t, srv, "schema=app&table=users&pk=1&at=2026-06-01%2014:30:00&allow_gaps=true")
+	var found bool
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "skipped") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("skipped archive source must be reported in warnings (#1281), got %v", r.Warnings)
+	}
+}
+
 func TestIntegrationReconstructUnknownPK(t *testing.T) {
 	srv := seedReconstruct(t)
 	// pk=999 has no baseline row AND no deltas in the window → genuinely never

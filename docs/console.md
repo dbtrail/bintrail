@@ -1061,7 +1061,8 @@ truncated prefix.
 > sources are configured and *any* of them fails to load, `query.FetchMerged`
 > aborts the strict-mode (`allow_gaps=false`) fetch — the request returns 500
 > naming the failed source — instead of folding an incomplete delta set into a
-> 200. Pass `allow_gaps=true` to fall back to warn-and-continue.
+> 200. Pass `allow_gaps=true` to fall back to warn-and-continue — with the
+> skipped source reported in the response `warnings` (#1281).
 
 ### Time-travel over the MySQL protocol (flashback port)
 

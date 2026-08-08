@@ -318,7 +318,7 @@ func TestReconstructWarningsCaptureGap(t *testing.T) {
 		Detail: "binlogs purged before stream caught up",
 		Since:  since, Until: until,
 	}
-	w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, stamped, nil, false)
+	w := reconstructWarnings(&query.QueryPlan{}, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, stamped, nil, true)
 	if len(w) != 1 || !strings.HasPrefix(w[0], "capture_gap: ") {
 		t.Fatalf("an overridden capture gap must surface as one capture_gap warning, got %v", w)
 	}
@@ -327,14 +327,14 @@ func TestReconstructWarningsCaptureGap(t *testing.T) {
 	}
 
 	unevaluable := &reconstruct.CaptureGap{Unevaluable: true, Since: since, Until: until}
-	w = reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, unevaluable, nil, false)
+	w = reconstructWarnings(&query.QueryPlan{}, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, unevaluable, nil, true)
 	if len(w) != 1 || !strings.HasPrefix(w[0], "capture_gap: ") {
 		t.Fatalf("an overridden unevaluable verdict must surface as a capture_gap warning, got %v", w)
 	}
 
 	// The capture-gap warning stacks with the others rather than replacing them.
-	w = reconstructWarnings(nil, reconstruct.StaleWarning{Message: "using an older snapshot"},
-		map[string]any{"id": 1}, nil, stamped, nil, false)
+	w = reconstructWarnings(&query.QueryPlan{}, reconstruct.StaleWarning{Message: "using an older snapshot"},
+		map[string]any{"id": 1}, nil, stamped, nil, true)
 	if len(w) != 2 {
 		t.Errorf("expected the capture gap alongside the stale-baseline warning, got %v", w)
 	}
