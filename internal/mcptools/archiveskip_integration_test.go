@@ -33,6 +33,22 @@ func TestIntegrationArchiveSkipWarning(t *testing.T) {
 		t.Fatalf("EnsureSchema: %v", err)
 	}
 
+	cfg := Config{
+		Resolve: func(context.Context, string) (*Target, error) {
+			return &Target{DB: db}, nil
+		},
+	}
+
+	// Cry-wolf guard: a healthy target (empty archive_state, no archive
+	// trouble) must carry NO archive warnings.
+	q0, _, err := MakeQueryTool(cfg)(context.Background(), &mcp.CallToolRequest{}, QueryArgs{Schema: "app", Table: "orders"})
+	if err != nil {
+		t.Fatalf("query handler (healthy): %v", err)
+	}
+	if txt := resultText(q0); strings.Contains(txt, "archive_") {
+		t.Errorf("healthy target must render no archive warnings, got: %s", txt)
+	}
+
 	// A discoverable local archive whose only file is garbage:
 	// ResolveArchiveSources returns the bintrail_id base (the directory
 	// exists, so the local path is preferred), then parquetquery.Fetch fails
@@ -49,12 +65,6 @@ func TestIntegrationArchiveSkipWarning(t *testing.T) {
 	testutil.MustExec(t, db, `INSERT INTO archive_state
 		(partition_name, bintrail_id, local_path, row_count, s3_bucket, s3_key, s3_uploaded_at)
 		VALUES ('p_2026060112', 'skip-test', ?, 1, NULL, NULL, NULL)`, garbage)
-
-	cfg := Config{
-		Resolve: func(context.Context, string) (*Target, error) {
-			return &Target{DB: db}, nil
-		},
-	}
 
 	qres, _, err := MakeQueryTool(cfg)(context.Background(), &mcp.CallToolRequest{}, QueryArgs{Schema: "app", Table: "orders"})
 	if err != nil {
@@ -114,5 +124,24 @@ func TestIntegrationArchiveSkipWarning(t *testing.T) {
 	}
 	if txt := resultText(rres2); !strings.Contains(txt, "discovery failed") || !strings.Contains(txt, "no_archive") {
 		t.Errorf("recover refusal must name discovery and the no_archive escape hatch, got: %s", txt)
+	}
+
+	// Standalone posture: EnvArchiveDiscovery reaches state discovery only
+	// through EnvArchiveSources' fallthrough — the discovery signal must
+	// survive that hop (#1288 review: discarding the bool there recreates the
+	// #1285 bug on the shipped default surface with everything else green).
+	t.Setenv("BINTRAIL_ARCHIVE_S3", "")
+	t.Setenv("BINTRAIL_ID", "")
+	cfgEnv := Config{
+		Resolve: func(context.Context, string) (*Target, error) {
+			return &Target{DB: db, EnvArchiveDiscovery: true}, nil
+		},
+	}
+	rres3, _, err := MakeRecoverTool(cfgEnv)(context.Background(), &mcp.CallToolRequest{}, RecoverArgs{Schema: "app", Table: "orders"})
+	if err != nil {
+		t.Fatalf("recover handler (env discovery): %v", err)
+	}
+	if !rres3.IsError || !strings.Contains(resultText(rres3), "discovery failed") {
+		t.Errorf("standalone env-discovery posture must refuse on failed state discovery, got: %s", resultText(rres3))
 	}
 }

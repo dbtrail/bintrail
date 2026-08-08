@@ -628,6 +628,7 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		// as trailing warning lines so a result missing every event held by a
 		// source does not read as complete to an MCP client.
 		var skippedArchives []string
+		var misfiledScanFailed bool
 		if len(archSources) == 0 && !t.RedactStatementText {
 			// Fast path: no archives and no post-fetch redaction — fetch and
 			// format in one step.
@@ -640,7 +641,7 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 			// then format.
 			fetchOpts := opts
 			if len(archSources) > 0 {
-				fetchOpts.ExtraArchiveHours = misfiledArchiveHoursOrWarn(ctx, t.DB, opts.Since, opts.Until)
+				fetchOpts.ExtraArchiveHours, misfiledScanFailed = misfiledArchiveHours(ctx, t.DB, opts.Since, opts.Until)
 			}
 			results, err := engine.Fetch(ctx, fetchOpts)
 			if err != nil {
@@ -671,6 +672,9 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		}
 		text += QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit)
 		text += ArchiveSkipNotice(discoveryFailed, skippedArchives)
+		if misfiledScanFailed {
+			text += "\nWarning: " + archiveScanIncompleteWarning() + "\n"
+		}
 
 		ext.Record(ctx, ext.AuditEvent{
 			Surface: cfg.auditSurface(),
@@ -783,7 +787,18 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		var rows []query.ResultRow
 		if len(archSources) > 0 {
 			fetchOpts := opts
-			fetchOpts.ExtraArchiveHours = misfiledArchiveHoursOrWarn(ctx, t.DB, opts.Since, opts.Until)
+			extraHours, misfiledScanFailed := misfiledArchiveHours(ctx, t.DB, opts.Since, opts.Until)
+			if misfiledScanFailed {
+				// Third gate, same posture as the two around it: the registry
+				// scan that catches misfiled (backfilled) archives failed, so
+				// the per-source fetch may silently prune files whose events
+				// are in the window — a knowingly-possibly-incomplete reversal
+				// (the #1037 class).
+				return ErrorResult(fmt.Errorf(
+					"the archive registry could not be checked for misfiled (backfilled) archives; a reversal script generated without them could silently omit events. " +
+						"Retry with no_archive: true to recover from the live index only (archived events will NOT be reversed), or repair the index and retry")), nil, nil
+			}
+			fetchOpts.ExtraArchiveHours = extraHours
 			rows, err = engine.Fetch(ctx, fetchOpts)
 			if err != nil {
 				return ErrorResult(err), nil, nil
@@ -1070,7 +1085,11 @@ func ErrorResult(err error) *mcp.CallToolResult {
 // EnvArchiveSources returns Parquet archive source paths for use with
 // parquetquery.Fetch. It checks env vars BINTRAIL_ARCHIVE_S3 + BINTRAIL_ID
 // first (for explicit configuration — both must be set), then falls back to
-// auto-discovery from archive_state in the index database.
+// auto-discovery from archive_state in the index database. The second return
+// is true when discovery is UNRELIABLE: the archive_state read failed (see
+// stateArchiveSources), or the env pair is half-set — explicit archive intent
+// the fallback would otherwise silently discard. The fully-env-configured
+// path never fails discovery.
 func EnvArchiveSources(ctx context.Context, db *sql.DB) ([]string, bool) {
 	archiveS3 := os.Getenv("BINTRAIL_ARCHIVE_S3")
 	bintrailID := os.Getenv("BINTRAIL_ID")
@@ -1081,26 +1100,38 @@ func EnvArchiveSources(ctx context.Context, db *sql.DB) ([]string, bool) {
 	if archiveS3 != "" || bintrailID != "" {
 		slog.Warn("partial archive env var config; both BINTRAIL_ARCHIVE_S3 and BINTRAIL_ID must be set",
 			"BINTRAIL_ARCHIVE_S3", archiveS3, "BINTRAIL_ID", bintrailID)
+		// A half-set env pair is explicit archive intent that cannot be
+		// honored. With a rebuilt/empty archive_state — exactly the situation
+		// where the env pair is the documented remediation — the silent
+		// fallback would read as complete: the #1285 blind spot one env var
+		// away. Fall back to state discovery for whatever it finds, but flag
+		// discovery unreliable so the query tool warns and recover refuses.
+		s, _ := stateArchiveSources(ctx, db)
+		return s, true
 	}
 	return stateArchiveSources(ctx, db)
 }
 
-// misfiledArchiveHoursOrWarn wraps query.MisfiledArchiveHours (#1037) with the
-// MCP tools' warn-and-continue posture: on a registry read failure the fetch
-// proceeds with label-only pruning (the pre-#1037 behavior) rather than
-// failing the whole tool call.
-func misfiledArchiveHoursOrWarn(ctx context.Context, db *sql.DB, since, until *time.Time) []time.Time {
+// misfiledArchiveHours wraps query.MisfiledArchiveHours (#1037). The second
+// return is true when the registry scan FAILED: the per-source fetch would
+// then prune by hour label only and may silently skip misfiled (backfilled)
+// archives whose events are in the window. The query tool degrades with an
+// archive_scan_incomplete warning; the recover tool refuses — the same
+// knowingly-possibly-incomplete class as its other two archive gates. Never
+// fails without a time filter (since/until both nil): nothing is pruned then.
+func misfiledArchiveHours(ctx context.Context, db *sql.DB, since, until *time.Time) ([]time.Time, bool) {
 	hours, err := query.MisfiledArchiveHours(ctx, db, since, until)
 	if err != nil {
 		slog.Warn("could not check archive_state for misfiled archives (backfilled events); time-scoped archive pruning may skip them", "error", err)
-		return nil
+		return nil, true
 	}
-	return hours
+	return hours, false
 }
 
-// stateArchiveSources auto-discovers archive sources from archive_state,
-// warn-and-continue on failure (the MCP tools are deliberately permissive —
-// their own per-source fetch loops warn-and-continue too).
+// stateArchiveSources auto-discovers archive sources from archive_state. On a
+// registry read failure it returns (nil, true): the fetch layer stays
+// permissive, but the caller must surface the signal — the query tool warns,
+// the recover tool refuses (#1285).
 func stateArchiveSources(ctx context.Context, db *sql.DB) ([]string, bool) {
 	sources, err := query.ResolveArchiveSources(ctx, db)
 	if err != nil {
@@ -1170,6 +1201,13 @@ func archiveSourceSkippedWarning(src string) string {
 // failed": no source list exists, so archived events may silently be absent.
 func archiveDiscoveryFailedWarning() string {
 	return "archive_discovery_failed: no archives were read and archived hours may still be counted as covered; the result may be incomplete"
+}
+
+// archiveScanIncompleteWarning is the wording for a failed misfiled-archive
+// registry scan (#1037): archives WERE read, but time-scoped pruning may have
+// skipped backfilled files — softer than archive_discovery_failed.
+func archiveScanIncompleteWarning() string {
+	return "archive_scan_incomplete: the archive registry could not be checked for misfiled (backfilled) archives; time-scoped pruning may have skipped archived events in the window"
 }
 
 // ArchiveSkipNotice renders the query tool's trailing warning lines for

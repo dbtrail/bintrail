@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dbtrail/dbtrail/internal/mcptools"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -258,6 +259,15 @@ func TestErrorResult(t *testing.T) {
 }
 
 // ─── resolveArchiveSources ──────────────────────────────────────────────────
+
+// resolveArchiveSources is a test-only shim over mcptools.EnvArchiveSources:
+// production flows through Target.archiveSources, which also consumes the
+// discovery-failure signal these listing tests don't need. It lives here (not
+// main.go) so no production caller can inherit the signal-dropping `_`.
+func resolveArchiveSources(ctx context.Context, db *sql.DB) []string {
+	s, _ := mcptools.EnvArchiveSources(ctx, db)
+	return s
+}
 
 func TestResolveArchiveSources_envVars(t *testing.T) {
 	t.Setenv("BINTRAIL_ARCHIVE_S3", "s3://my-bucket/archives/")

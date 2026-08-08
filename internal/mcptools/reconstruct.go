@@ -324,10 +324,11 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 		}
 
 		// 3. Fetch this PK's deltas in [baseline, at], oldest-first.
-		//    AllowGaps defaults FALSE — the opposite of the query/recover tools: a
-		//    coverage gap here means a silently-wrong row state, not a few missing
-		//    rows in a result an agent can see are missing. The window is bounded
-		//    at both ends.
+		//    AllowGaps defaults FALSE — stricter than the query tool, which
+		//    degrades with warnings (recover refuses on archive trouble too,
+		//    #1285): a coverage gap here means a silently-wrong row state, and
+		//    an MCP client cannot see that rows are missing. The window is
+		//    bounded at both ends.
 		//    We fetch even when baselineRow == nil: a row created AFTER the
 		//    baseline has no baseline entry yet still exists as of `at`, and
 		//    ApplyAt(nil, deltas, at) reconstructs it correctly. Reporting

@@ -268,6 +268,17 @@ archive sources from `archive_state` in the index database (or from the
 from MySQL and Parquet are merged, deduplicated, and sorted before output or SQL
 generation. Pass `no_archive` to disable this.
 
+When archives misbehave, the two tools diverge on purpose
+([#1285](https://github.com/dbtrail/dbtrail/issues/1285)): `query` degrades and
+says so — the result carries trailing `Warning: archive_source_skipped: …` lines
+for sources that failed to read, `Warning: archive_discovery_failed: …` when
+discovery itself failed, and `Warning: archive_scan_incomplete: …` when the
+misfiled-archive registry scan failed — while `recover` **refuses** to generate
+a script in any of those cases: a reversal missing part of the matched events is
+a partial undo, not a smaller one. The refusal names the escape hatch — retry
+with `no_archive: true` to generate from the live index only, accepting that
+archived events will not be reversed.
+
 **Index DSN.** The server connects to the index via the `BINTRAIL_INDEX_DSN`
 environment variable (set once at startup) or the per-call `index_dsn` parameter,
 which overrides the env var. Set the env var at startup so callers don't repeat
@@ -293,7 +304,9 @@ the console serves `/mcp` these parameters are **rejected**: the baseline is tha
 server's own configuration, and an MCP client must not point the console at
 arbitrary storage.
 
-**`allow_gaps` defaults to `false`, unlike `query`/`recover`.** A hole in the
+**`allow_gaps` defaults to `false`, unlike `query`'s degrade-with-warnings
+posture (`recover` likewise refuses on archive trouble — see Archive
+auto-discovery above).** A hole in the
 captured history makes a reconstruction *silently wrong* (a state that never
 existed), not merely incomplete, so the tool aborts with an actionable error and
 you opt in explicitly. It also refuses outright — no override — when a

@@ -1,6 +1,7 @@
 package mcptools
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -26,5 +27,31 @@ func TestArchiveSkipNotice(t *testing.T) {
 	}
 	if strings.Contains(got, "--") {
 		t.Errorf("notice must carry no flag-shaped tokens, got %q", got)
+	}
+}
+
+// TestEnvArchiveSourcesSignal pins the standalone surface's discovery signal
+// (#1288 review: a mutation discarding stateArchiveSources' bool at the
+// fallthrough would recreate the #1285 bug verbatim with the suite green). A
+// nil DB makes state discovery a clean no-archives (nil, false), isolating
+// the env-pair logic.
+func TestEnvArchiveSourcesSignal(t *testing.T) {
+	ctx := context.Background()
+
+	t.Setenv("BINTRAIL_ARCHIVE_S3", "s3://bkt/prefix")
+	t.Setenv("BINTRAIL_ID", "id-1")
+	s, failed := EnvArchiveSources(ctx, nil)
+	if failed || len(s) != 1 || s[0] != "s3://bkt/prefix/bintrail_id=id-1" {
+		t.Errorf("full env pair must be (1 source, false), got (%v, %v)", s, failed)
+	}
+
+	t.Setenv("BINTRAIL_ID", "")
+	if _, failed := EnvArchiveSources(ctx, nil); !failed {
+		t.Error("half-set env pair is explicit archive intent that cannot be honored; discovery must be flagged unreliable")
+	}
+
+	t.Setenv("BINTRAIL_ARCHIVE_S3", "")
+	if s, failed := EnvArchiveSources(ctx, nil); failed || s != nil {
+		t.Errorf("no env + nil DB = no archives and no failure, got (%v, %v)", s, failed)
 	}
 }

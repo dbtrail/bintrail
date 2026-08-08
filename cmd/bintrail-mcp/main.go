@@ -318,13 +318,6 @@ func resolveDSN(override string) (string, error) {
 
 func errorResult(err error) *mcp.CallToolResult { return mcptools.ErrorResult(err) }
 
-func resolveArchiveSources(ctx context.Context, db *sql.DB) []string {
-	// The discovery-failure signal is consumed by the tool handlers
-	// themselves (#1285); callers of this helper only need the list.
-	s, _ := mcptools.EnvArchiveSources(ctx, db)
-	return s
-}
-
 const defaultMCPQueryMaxLimit = mcptools.DefaultQueryMaxLimit
 
 func mcpQueryMaxLimit() int { return mcptools.EnvQueryMaxLimit() }
