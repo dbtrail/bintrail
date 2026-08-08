@@ -618,6 +618,10 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		var buf bytes.Buffer
 		var n int
 
+		// Archive sources whose fetch failed and was skipped (#1285) — surfaced
+		// as trailing warning lines so a result missing every event held by a
+		// source does not read as complete to an MCP client.
+		var skippedArchives []string
 		if len(archSources) == 0 && !t.RedactStatementText {
 			// Fast path: no archives and no post-fetch redaction — fetch and
 			// format in one step.
@@ -640,6 +644,7 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 				ar, err := parquetquery.Fetch(ctx, fetchOpts, src)
 				if err != nil {
 					slog.Warn("archive query failed, skipping", "source", src, "error", err)
+					skippedArchives = append(skippedArchives, src)
 					continue
 				}
 				results = append(results, ar...)
@@ -659,6 +664,7 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 			text += fmt.Sprintf("\n%d row(s)\n", n)
 		}
 		text += QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit)
+		text += ArchiveSkipNotice("", skippedArchives)
 
 		ext.Record(ctx, ext.AuditEvent{
 			Surface: cfg.auditSurface(),
@@ -749,6 +755,9 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 			archSources = t.archiveSources(ctx)
 		}
 
+		// See the query tool above: failed-and-skipped archive sources are
+		// surfaced as trailing SQL-comment warnings (#1285).
+		var skippedArchives []string
 		var rows []query.ResultRow
 		if len(archSources) > 0 {
 			fetchOpts := opts
@@ -761,6 +770,7 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 				ar, err := parquetquery.Fetch(ctx, fetchOpts, src)
 				if err != nil {
 					slog.Warn("archive query failed, skipping", "source", src, "error", err)
+					skippedArchives = append(skippedArchives, src)
 					continue
 				}
 				rows = append(rows, ar...)
@@ -823,6 +833,7 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		if n >= opts.Limit {
 			text += fmt.Sprintf("\n-- Warning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
 		}
+		text += ArchiveSkipNotice("-- ", skippedArchives)
 
 		ext.Record(ctx, ext.AuditEvent{
 			Surface: cfg.auditSurface(),
@@ -1113,6 +1124,29 @@ func QueryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit in
 		return fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", limit)
 	}
 	return ""
+}
+
+// ArchiveSkipNotice renders trailing warning lines for archive sources whose
+// fetch failed and was skipped (#1285): an MCP client sees only the result
+// text, so a response missing every event held by a source must not read as
+// complete — the blind spot the reconstruct tool's "archive_source_skipped"
+// warnings already close, mirrored here with the same wording. prefix is
+// prepended to each line: "" for the query tool (plain-text notices, the
+// QueryResultNotice precedent — trailing lines after a JSON body included)
+// and "-- " for the recover tool, whose result is an executable SQL script a
+// bare Warning line would break. Deliberately names only the SOURCE, not the
+// fetch error: error detail stays in the server log, keeping local paths,
+// DuckDB internals, and anything the no-CLI-flag-leak rule covers out of the
+// client-visible result.
+func ArchiveSkipNotice(prefix string, skipped []string) string {
+	if len(skipped) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, s := range skipped {
+		b.WriteString("\n" + prefix + "Warning: archive_source_skipped: events held only by this source are missing from the result: " + s + "\n")
+	}
+	return b.String()
 }
 
 // BuildQueryOptions converts the shared tool filter parameters into a
