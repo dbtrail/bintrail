@@ -2,6 +2,7 @@ package archive
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 )
