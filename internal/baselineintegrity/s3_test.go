@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"net/http"
 	"testing"
 	"time"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // stubS3 serves objects from a map keyed "bucket/key" and counts GETs, so the
@@ -91,7 +94,8 @@ func TestValidateS3File_mismatchFailsLoud(t *testing.T) {
 	if err := ValidateS3File(context.Background(), p); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("corrupt S3 baseline must fail loud with ErrIntegrity, got %v", err)
 	}
-	// The mismatch verdict is terminal and cached too.
+	// The mismatch verdict is cached within the TTL (NOT terminal — see
+	// TestValidateS3File_repairedObjectUnbricksWithoutRestart).
 	if err := ValidateS3File(context.Background(), p); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("cached mismatch must persist, got %v", err)
 	}
@@ -149,6 +153,7 @@ func TestValidateS3File_degradeToSkip(t *testing.T) {
 		"s3://bkt-skip/v99/20260101000000/db/t.parquet",
 		"s3://bkt-skip/unlisted/20260101000000/db/t.parquet",
 		"s3://bkt-skip/shallow.parquet",
+		"s3://bkt-skip/onedir/t.parquet",
 	} {
 		if err := ValidateS3File(context.Background(), p); err != nil {
 			t.Errorf("%s: cannot-verify must degrade to skip, got %v", p, err)
@@ -268,5 +273,138 @@ func TestValidateS3File_manifestFetchedOncePerSnapshot(t *testing.T) {
 	}
 	if got := s.gets["bkt-multi/base/20260101000000/_MANIFEST"]; got != 1 {
 		t.Errorf("manifest fetched %d times, want 1 (per-snapshot manifest cache)", got)
+	}
+}
+
+func TestValidateS3File_nonCanonicalKeyStillValidates(t *testing.T) {
+	// A double slash in the configured prefix (trailing-slash join) must not
+	// defeat validation: path.Dir CLEANS the key, so the rel lookup must run
+	// on the cleaned key too — before the fix, TrimPrefix was a no-op on the
+	// raw key, the manifest lookup missed, and the skip was cached TERMINALLY
+	// with no log: validation permanently off for a perfectly listed object.
+	s := installStub(t)
+	good := []byte("original bytes")
+	s.objects["bkt-clean/base/20260101000000/_MANIFEST"] = manifestJSON(t, map[string]string{"db/t.parquet": crcHex(good)})
+	s.objects["bkt-clean/base/20260101000000/db/t.parquet"] = []byte("CORRUPTED bytes")
+
+	p := "s3://bkt-clean/base//20260101000000/db/t.parquet"
+	if err := ValidateS3File(context.Background(), p); !errors.Is(err, ErrIntegrity) {
+		t.Errorf("a corrupt object behind a non-canonical key must still fail loud, got %v", err)
+	}
+}
+
+func TestValidateS3File_manifestTransientThenHeals(t *testing.T) {
+	// A manifest-fetch failure (throttle, AccessDenied) must degrade to skip
+	// WITHOUT poisoning s3ManifestCache (which has no TTL): once the blip
+	// clears, validation resumes and a real mismatch is caught.
+	setTTL(t, 0)
+	s := installStub(t)
+	manifestKey := "bkt-mblip/base/20260101000000/_MANIFEST"
+	s.errs[manifestKey] = errors.New("throttled: simulated")
+	s.objects["bkt-mblip/base/20260101000000/db/t.parquet"] = []byte("CORRUPTED bytes")
+
+	p := "s3://bkt-mblip/base/20260101000000/db/t.parquet"
+	if err := ValidateS3File(context.Background(), p); err != nil {
+		t.Fatalf("manifest read failure must degrade to skip, got %v", err)
+	}
+	delete(s.errs, manifestKey)
+	s.objects[manifestKey] = manifestJSON(t, map[string]string{"db/t.parquet": crcHex([]byte("original bytes"))})
+	if err := ValidateS3File(context.Background(), p); !errors.Is(err, ErrIntegrity) {
+		t.Errorf("after the blip clears, the mismatch must be caught, got %v", err)
+	}
+}
+
+func TestValidateS3File_manifestRepairInPlace(t *testing.T) {
+	// The mismatch can be SIDECAR-side (a rotted-but-parseable digest). On a
+	// TTL recheck of a mismatch verdict the cached manifest is dropped, so
+	// regenerating _MANIFEST in place un-bricks without a daemon restart —
+	// same story as repairing the object.
+	setTTL(t, 0)
+	s := installStub(t)
+	good := []byte("original bytes")
+	manifestKey := "bkt-mrepair/base/20260101000000/_MANIFEST"
+	s.objects[manifestKey] = manifestJSON(t, map[string]string{"db/t.parquet": "00000000"}) // rotted digest
+	s.objects["bkt-mrepair/base/20260101000000/db/t.parquet"] = good
+
+	p := "s3://bkt-mrepair/base/20260101000000/db/t.parquet"
+	if err := ValidateS3File(context.Background(), p); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("rotted manifest digest must read as mismatch, got %v", err)
+	}
+	s.objects[manifestKey] = manifestJSON(t, map[string]string{"db/t.parquet": crcHex(good)}) // regenerated
+	if err := ValidateS3File(context.Background(), p); err != nil {
+		t.Errorf("regenerated manifest must validate after the TTL, got %v", err)
+	}
+}
+
+func TestValidateS3File_callerCancellationNotCached(t *testing.T) {
+	// A caller whose context dies mid-validation must not switch validation
+	// off for every OTHER caller: the verdict is caller-scoped, not
+	// object-scoped, so nothing is cached and the next (live) caller
+	// re-validates and catches the corruption.
+	s := installStub(t)
+	s.objects["bkt-cancel/base/20260101000000/_MANIFEST"] = manifestJSON(t, map[string]string{"db/t.parquet": crcHex([]byte("original bytes"))})
+	objKey := "bkt-cancel/base/20260101000000/db/t.parquet"
+	s.objects[objKey] = []byte("CORRUPTED bytes")
+	s.errs[objKey] = context.Canceled
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the caller is already dead when the hash pass errors
+	p := "s3://bkt-cancel/base/20260101000000/db/t.parquet"
+	if err := ValidateS3File(ctx, p); err != nil {
+		t.Fatalf("canceled caller must degrade to skip for THIS call, got %v", err)
+	}
+	delete(s.errs, objKey)
+	if err := ValidateS3File(context.Background(), p); !errors.Is(err, ErrIntegrity) {
+		t.Errorf("a live caller right after a canceled one must still catch the corruption, got %v", err)
+	}
+}
+
+func TestValidateS3File_oversizeManifestDegrades(t *testing.T) {
+	// A wrong multi-GB object parked at the _MANIFEST key must neither be
+	// buffered wholesale nor hard-fail the read: over maxManifestBytes it
+	// degrades via the unreadable-sidecar path, non-terminally.
+	setTTL(t, 0)
+	s := installStub(t)
+	manifestKey := "bkt-big/base/20260101000000/_MANIFEST"
+	s.objects[manifestKey] = make([]byte, maxManifestBytes+1)
+	s.objects["bkt-big/base/20260101000000/db/t.parquet"] = []byte("x")
+
+	p := "s3://bkt-big/base/20260101000000/db/t.parquet"
+	if err := ValidateS3File(context.Background(), p); err != nil {
+		t.Fatalf("oversize manifest must degrade to skip, got %v", err)
+	}
+	if err := ValidateS3File(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.gets[manifestKey]; got != 2 {
+		t.Errorf("manifest attempted %d times, want 2 (oversize verdict must not be terminal)", got)
+	}
+}
+
+func TestS3ObjectAbsent_shapes(t *testing.T) {
+	// The absent discrimination must cover every shape real backends produce
+	// (modeled types, bare API code, raw HTTP 404 from Ceph/Wasabi) and must
+	// NOT treat AccessDenied as absent — a GetObject-only policy returns 403
+	// for missing keys, indistinguishable from a real denial.
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"modeled NoSuchKey", &s3types.NoSuchKey{}, true},
+		{"modeled NotFound", &s3types.NotFound{}, true},
+		{"bare code NoSuchKey", &smithy.GenericAPIError{Code: "NoSuchKey"}, true},
+		{"bare code NotFound", &smithy.GenericAPIError{Code: "NotFound"}, true},
+		{"raw HTTP 404", &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 404}},
+			Err:      errors.New("not found"),
+		}, true},
+		{"AccessDenied is NOT absent", &smithy.GenericAPIError{Code: "AccessDenied"}, false},
+		{"plain error is NOT absent", errors.New("connection reset"), false},
+	}
+	for _, tc := range cases {
+		if got := s3ObjectAbsent(tc.err); got != tc.want {
+			t.Errorf("%s: s3ObjectAbsent = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

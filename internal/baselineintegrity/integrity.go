@@ -1,6 +1,6 @@
 // Package baselineintegrity provides at-rest integrity for baseline Parquet
-// files (#636): a CRC-32C _MANIFEST sidecar written next to the _SUCCESS marker,
-// validated on every local read path.
+// files: a CRC-32C _MANIFEST sidecar written next to the _SUCCESS marker,
+// validated on every baseline read path — local (#636) and S3 (#698).
 //
 // The Parquet readers validate nothing — DuckDB's parquet_scan and parquet-go's
 // OpenFile both trust the bytes, with no CRC validation and no pragma to force it
@@ -194,5 +194,13 @@ func (m *Manifest) digestFor(rel, snapshotLabel string) (want string, verify boo
 		return "", false
 	}
 	want, verify = m.Files[rel]
+	if !verify {
+		// Debug, not Warn: the local path re-runs this per read (no cache), so
+		// a Warn would flood loops; the signal still exists for triage — an
+		// unlisted file can indicate a writer-side bug, not just an
+		// out-of-band copy.
+		slog.Debug("baseline file not listed in its snapshot's integrity manifest; integrity not verified",
+			"snapshot", snapshotLabel, "file", rel)
+	}
 	return want, verify
 }

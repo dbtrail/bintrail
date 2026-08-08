@@ -2,15 +2,18 @@
 // (#698, follow-up to #636's local validation).
 //
 // The manifest's CRC-32C is over the raw Parquet object BYTES, and no S3 read
-// path keeps a byte-identical local copy to hash against — two stream directly
-// via DuckDB parquet_scan, one re-encodes via DuckDB COPY to a temp. So the S3
-// validation is a PRE-PASS: before any reader touches the object, the ORIGINAL
-// object is streamed once through CRC-32C via the AWS SDK and compared against
-// the snapshot's _MANIFEST (also fetched from S3). This validates exact bytes
-// on all the read paths without forcing a download-to-disk (the DuckDB read
-// that follows keeps whatever streaming mode the caller chose), at the cost of
-// one extra full read of the object — memoized per process, see the caching
-// policy below.
+// path keeps a byte-identical local copy to hash against — the row paths
+// stream directly via DuckDB parquet_scan or re-encode via DuckDB COPY to a
+// temp, and the footer read (baseline.ReadParquetMetadataAny) streams too. So
+// the S3 validation is a PRE-PASS: before any reader touches the object, the
+// ORIGINAL object is streamed once through CRC-32C via the AWS SDK and
+// compared against the snapshot's _MANIFEST (also fetched from S3). This
+// validates exact bytes on every manifest-covered read path — the
+// arbitrary-SQL surfaces (`reconstruct --sql`, the console SQL panel) validate
+// nothing, exactly as they don't locally — without forcing a download-to-disk
+// (the DuckDB read that follows keeps whatever streaming mode the caller
+// chose), at the cost of one extra full read of the object — memoized per
+// process, see the caching policy below.
 //
 // Scope is unchanged from #636: bit-rot / truncated or partial writes, NOT
 // tamper-evidence — an attacker who rewrites the object can rewrite the
@@ -49,7 +52,10 @@ var OpenS3Object = sdkOpenS3Object
 
 // Caching policy. ValidateS3File sits on hot paths that loop — the shim
 // `_snapshot` validates once per client MySQL query, cascade Phase-2 once per
-// parent PK — so every verdict is memoized per process, in two layers:
+// parent PK — so every verdict that cost an S3 round-trip is memoized per
+// process, in two layers (the no-traffic skips — unparseable URL, shallow
+// layout — are recomputed per call; and a verdict born of the CALLER's context
+// dying is never stored at all, see ValidateS3File):
 //
 //   - s3VerdictCache (full object path → verdict): match, legacy-no-manifest,
 //     file-unlisted and unrecognized-version verdicts are TERMINAL — a
@@ -91,7 +97,8 @@ const maxManifestBytes = 16 << 20
 // outcomes: nil on match, ErrIntegrity (wrapped) on a CRC mismatch, and a
 // degrade-to-skip (nil) whenever the check CANNOT run — no manifest (legacy
 // snapshot), unreadable/unparseable manifest, unrecognized version/algo, file
-// not listed, or a layout that isn't <snapshot>/<db>/<table>.parquet. All of
+// not listed, an s3:// URL that doesn't parse, or a layout that isn't
+// <snapshot>/<db>/<table>.parquet. All of
 // those mean "unverified", never "corrupt"; a rotted sidecar must not brick a
 // good baseline.
 //
@@ -106,17 +113,27 @@ const maxManifestBytes = 16 << 20
 // still produces exactly that (a complete, shorter read → CRC mismatch), so
 // the skip does not hide the partial-write case this exists to catch.
 func ValidateS3File(ctx context.Context, s3Path string) error {
+	expiredMismatch := false
 	if v, ok := s3VerdictCache.Load(s3Path); ok {
 		ve := v.(verdict)
 		if ve.expires.IsZero() || time.Now().Before(ve.expires) {
 			return ve.err
 		}
+		expiredMismatch = ve.err != nil
 		s3VerdictCache.Delete(s3Path)
 	}
 	bucket, key, err := storage.ParseS3URL(s3Path)
 	if err != nil {
-		return nil // not an interpretable s3:// URL — nothing to locate a manifest by
+		// Not an interpretable s3:// URL — nothing to locate a manifest by.
+		slog.Debug("S3 baseline path not interpretable; integrity not verified", "path", s3Path, "error", err)
+		return nil
 	}
+	// path.Dir below CLEANS the path, so the rel lookup must run on the same
+	// cleaned key: a non-canonical key (a double slash from a trailing-slash
+	// prefix join, a "./" segment) would otherwise make TrimPrefix a no-op,
+	// miss the manifest entry, and switch validation off for that object
+	// terminally and silently.
+	key = path.Clean(key)
 	// Snapshot layout is <prefix>/<timestamp>/<schema>/<table>.parquet with the
 	// _MANIFEST directly under <timestamp>/ — the object's grandparent, exactly
 	// like the local layout. Fewer than two segments above the object means the
@@ -125,13 +142,34 @@ func ValidateS3File(ctx context.Context, s3Path string) error {
 	tableDir := path.Dir(key)
 	snapKey := path.Dir(tableDir)
 	if tableDir == "." || snapKey == "." {
+		slog.Debug("S3 baseline path too shallow for the snapshot layout; integrity not verified", "path", s3Path)
 		return nil
 	}
 	rel := strings.TrimPrefix(key, snapKey+"/")
 	snapshotLabel := "s3://" + bucket + "/" + snapKey
 
+	if expiredMismatch {
+		// A mismatch verdict just expired. The operator may have repaired
+		// EITHER side in place: the object (the re-hash below catches that) or
+		// a rotted-but-parseable _MANIFEST digest (regenerated sidecar) — so
+		// drop the cached manifest and re-read both fresh. This only fires on
+		// the already-failing path, so the extra GET costs nothing in the
+		// steady state.
+		s3ManifestCache.Delete(bucket + "\x00" + snapKey)
+	}
+
 	m, ok, err := loadManifestS3(ctx, bucket, snapKey)
 	if err != nil {
+		if ctx.Err() != nil {
+			// The CALLER died mid-fetch (client disconnect, request deadline) —
+			// that says nothing about the object, and storing it would switch
+			// validation off for every OTHER caller for a full TTL. Don't
+			// cache, don't warn as corruption; the caller's own read dies on
+			// the same context right after.
+			slog.Debug("S3 manifest fetch canceled by caller; integrity not verified for this call",
+				"snapshot", snapshotLabel, "error", err)
+			return nil
+		}
 		// Unreadable / unparseable manifest = cannot verify, not data corruption
 		// (same degrade as the local path). This branch also absorbs an ABSENT
 		// manifest that S3 reports as AccessDenied (a GetObject-only policy
@@ -155,6 +193,15 @@ func ValidateS3File(ctx context.Context, s3Path string) error {
 	}
 	got, err := crc32cS3Object(ctx, bucket, key)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Caller-scoped cancellation, not an object-scoped verdict — the
+			// multi-GB hash pass is the widest cancellation window in the
+			// request, and caching this would disable validation for every
+			// other caller for a TTL. See the manifest branch above.
+			slog.Debug("S3 baseline hash pass canceled by caller; integrity not verified for this call",
+				"path", s3Path, "error", err)
+			return nil
+		}
 		// The deliberate divergence documented above: validator-side read
 		// failure ≠ corruption. Warn, then proceed unverified until the TTL
 		// re-check.
