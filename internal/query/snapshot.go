@@ -56,7 +56,13 @@ func FetchSnapshot(ctx context.Context, path string, opts Options) ([]ResultRow,
 	}
 	defer db.Close()
 	if strings.HasPrefix(path, "s3://") {
-		baselineintegrity.WarnS3IntegrityNotValidated() // #636: S3 baselines not validated (follow-up)
+		// At-rest integrity (#636/#698): pre-pass-stream the S3 object through
+		// CRC-32C against its snapshot's _MANIFEST before parquet_scan reads its
+		// rows as snapshot events. Runs before LoadHTTPFS so a corrupt object
+		// fails loud without DuckDB ever touching S3.
+		if err := baselineintegrity.ValidateS3File(ctx, path); err != nil {
+			return nil, err
+		}
 		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return nil, fmt.Errorf("load httpfs: %w", err)
 		}

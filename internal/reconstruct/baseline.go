@@ -107,14 +107,20 @@ func ReadBaselineRows(ctx context.Context, path string, filter map[string]string
 	}
 
 	if strings.HasPrefix(path, "s3://") {
-		baselineintegrity.WarnS3IntegrityNotValidated() // #636: S3 baselines not validated (follow-up)
+		// At-rest integrity (#636/#698): pre-pass-stream the S3 object through
+		// CRC-32C against its snapshot's _MANIFEST before parquet_scan trusts
+		// the bytes. Runs before LoadHTTPFS so a corrupt object fails loud
+		// without DuckDB ever touching S3.
+		if err := baselineintegrity.ValidateS3File(ctx, path); err != nil {
+			return nil, err
+		}
 		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return nil, fmt.Errorf("load httpfs extension: %w", err)
 		}
 		duckdbutil.EnableS3CredentialChain(ctx, db)
 	} else if err := baselineintegrity.ValidateLocalFile(path); err != nil {
 		// At-rest integrity (#636): fail loud on a corrupt local baseline before
-		// the cascade Phase-2 scan trusts it. S3 validation is a follow-up.
+		// the cascade Phase-2 scan trusts it.
 		return nil, err
 	}
 

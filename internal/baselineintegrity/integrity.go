@@ -6,12 +6,11 @@
 // OpenFile both trust the bytes, with no CRC validation and no pragma to force it
 // — so a file silently corrupted on disk or in S3 (bit-rot, a partial write)
 // would be read back as truth. The _MANIFEST sidecar closes that: it records a
-// CRC-32C over each table's Parquet file BYTES at write time, and the local
-// baseline read paths re-hash and compare, failing loud on a mismatch instead of
-// returning garbage rows. (S3 read-validation is a follow-up: no S3 read path
-// keeps a byte-identical local copy of the object for the manifest's raw-byte CRC
-// to check against — two stream directly via parquet_scan, one re-encodes via
-// DuckDB COPY to a temp; see WarnS3IntegrityNotValidated.)
+// CRC-32C over each table's Parquet file BYTES at write time, and the baseline
+// read paths re-hash and compare, failing loud on a mismatch instead of
+// returning garbage rows. Local reads validate via ValidateLocalFile; S3 reads
+// validate via ValidateS3File (#698), which pre-pass-streams the original
+// object through CRC-32C before any DuckDB reader touches it — see s3.go.
 //
 // Scope is bit-rot / partial-write, NOT deliberate tampering: an attacker who
 // rewrites a Parquet file can also rewrite this manifest. True tamper-evidence
@@ -40,7 +39,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 )
 
 // ManifestName is the per-snapshot integrity sidecar, written under the snapshot
@@ -160,22 +158,13 @@ func ValidateLocalFile(path string) error {
 	if !ok {
 		return nil // no manifest — legacy/temp/test, not verifiable, not a failure
 	}
-	if m.Version != manifestVersion || m.Algo != "crc32c" {
-		// An unrecognized version/algo (a future v2 schema, or a different digest)
-		// is "cannot verify with THIS binary", not "data corrupt" — degrade to a
-		// skip, never ErrIntegrity, so an older binary can't brick recovery of a
-		// newer-but-intact baseline by comparing its crc32c against a foreign value.
-		slog.Warn("integrity manifest version/algo unrecognized; treating baseline as integrity-not-verified",
-			"snapshot", snapshotDir, "version", m.Version, "algo", m.Algo)
-		return nil
-	}
 	rel, err := filepath.Rel(snapshotDir, path)
 	if err != nil {
 		return nil // path not under the snapshot dir — unexpected layout, skip
 	}
-	want, listed := m.Files[filepath.ToSlash(rel)]
-	if !listed {
-		return nil // file not in the manifest — skip rather than false-positive
+	want, verify := m.digestFor(filepath.ToSlash(rel), snapshotDir)
+	if !verify {
+		return nil
 	}
 	got, err := CRC32CFile(path)
 	if err != nil {
@@ -187,17 +176,23 @@ func ValidateLocalFile(path string) error {
 	return nil
 }
 
-var s3IntegrityWarnOnce sync.Once
-
-// WarnS3IntegrityNotValidated logs, ONCE per process, that S3 baselines are not
-// at-rest validated on read (#636 covers local baselines; no S3 read path keeps a
-// byte-identical local copy of the object for the CRC to check against — two
-// stream directly via parquet_scan, one re-encodes via COPY — a follow-up). The
-// S3 read paths call this so an operator isn't falsely assured the durable store
-// is protected. Once-only because some read paths (cascade ReadBaselineRows) run
-// in tight loops.
-func WarnS3IntegrityNotValidated() {
-	s3IntegrityWarnOnce.Do(func() {
-		slog.Warn("S3 baseline at-rest integrity is NOT verified on read (#636 covers local baselines only); a corrupt S3 object is read as truth")
-	})
+// digestFor returns the manifest's recorded digest for rel (forward-slashed,
+// snapshot-relative) and whether the manifest can vouch for it at all — the
+// shared core of ValidateLocalFile and ValidateS3File. verify=false means
+// "cannot verify", never "data corrupt":
+//   - An unrecognized version/algo (a future v2 schema, or a different digest)
+//     is "cannot verify with THIS binary" — degrade to a skip, never
+//     ErrIntegrity, so an older binary can't brick recovery of a
+//     newer-but-intact baseline by comparing its crc32c against a foreign
+//     value (logged; snapshotLabel is the directory or s3:// prefix).
+//   - A file absent from the manifest (added out-of-band after the manifest
+//     was written) skips rather than false-positives.
+func (m *Manifest) digestFor(rel, snapshotLabel string) (want string, verify bool) {
+	if m.Version != manifestVersion || m.Algo != "crc32c" {
+		slog.Warn("integrity manifest version/algo unrecognized; treating baseline as integrity-not-verified",
+			"snapshot", snapshotLabel, "version", m.Version, "algo", m.Algo)
+		return "", false
+	}
+	want, verify = m.Files[rel]
+	return want, verify
 }
