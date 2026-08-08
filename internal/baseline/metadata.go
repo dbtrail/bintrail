@@ -15,6 +15,7 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver for s3:// metadata reads
 	"github.com/parquet-go/parquet-go"
 
+	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 )
 
@@ -311,13 +312,22 @@ func ReadParquetMetadata(path string) (DumpMetadata, error) {
 
 // ReadParquetMetadataAny reads baseline Parquet metadata from either a local
 // path or an s3:// URL. For S3 it uses DuckDB's parquet_kv_metadata() table
-// function through the httpfs extension, avoiding a direct AWS SDK dependency.
+// function through the httpfs extension (validation below is the one SDK-side
+// touch, and it degrades to a skip when the SDK path can't reach the object).
 //
 // Used by the full-table reconstruct path (#187) which needs baseline
 // metadata (CreateTableSQL in particular) from S3-resident Parquet files.
 func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, error) {
 	if !strings.HasPrefix(path, "s3://") {
 		return ReadParquetMetadata(path)
+	}
+	// At-rest integrity (#698): the footer read below acts on the same S3
+	// object bytes the row paths validate — binlog anchor, CreateTableSQL —
+	// so validate BEFORE any caller trusts them. This was the fourth S3
+	// byte-read site next to the three row paths; the per-process verdict
+	// cache makes the row read's later validation of the same object free.
+	if err := baselineintegrity.ValidateS3File(ctx, path); err != nil {
+		return DumpMetadata{}, err
 	}
 
 	db, err := sql.Open("duckdb", "")

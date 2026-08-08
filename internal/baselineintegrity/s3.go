@@ -7,9 +7,10 @@
 // validation is a PRE-PASS: before any reader touches the object, the ORIGINAL
 // object is streamed once through CRC-32C via the AWS SDK and compared against
 // the snapshot's _MANIFEST (also fetched from S3). This validates exact bytes
-// on all three read paths without forcing a download-to-disk (the DuckDB read
+// on all the read paths without forcing a download-to-disk (the DuckDB read
 // that follows keeps whatever streaming mode the caller chose), at the cost of
-// one extra full read of the object — memoized per process, see s3VerdictCache.
+// one extra full read of the object — memoized per process, see the caching
+// policy below.
 //
 // Scope is unchanged from #636: bit-rot / truncated or partial writes, NOT
 // tamper-evidence — an attacker who rewrites the object can rewrite the
@@ -27,10 +28,13 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
@@ -43,15 +47,44 @@ import (
 // in this codebase uses.
 var OpenS3Object = sdkOpenS3Object
 
-// s3VerdictCache memoizes TERMINAL validation verdicts per s3:// path
-// (map[string]error; nil = validated or not-verifiable). ReadBaselineRows runs
-// in tight loops (cascade Phase-2 child scans, the shim `_snapshot` per
-// request), and without this cache every call would re-download the whole
-// object just to hash it. Caching per process is safe because snapshots are
-// immutable once their _SUCCESS marker exists. Transient failures (a manifest
-// or object GET that errored) are deliberately NOT cached, so a network blip
-// does not disable validation for the rest of the process.
-var s3VerdictCache sync.Map
+// Caching policy. ValidateS3File sits on hot paths that loop — the shim
+// `_snapshot` validates once per client MySQL query, cascade Phase-2 once per
+// parent PK — so every verdict is memoized per process, in two layers:
+//
+//   - s3VerdictCache (full object path → verdict): match, legacy-no-manifest,
+//     file-unlisted and unrecognized-version verdicts are TERMINAL — a
+//     snapshot is immutable once its _SUCCESS marker exists, so they never
+//     expire. A CRC MISMATCH and a validator-side READ FAILURE are cached only
+//     for failureVerdictTTL: long enough that a tight loop neither re-downloads
+//     the object nor emits a warn per call (the WarnS3IntegrityNotValidated
+//     this replaced was once-per-process for exactly that reason), short
+//     enough that an operator who repairs a corrupt object in place — the
+//     path this feature itself creates — is un-bricked without restarting the
+//     daemon, and that a transient S3 blip does not disable validation for
+//     the rest of the process.
+//   - s3ManifestCache ("bucket\x00snapshotKey" → *Manifest, nil = absent):
+//     one _MANIFEST GET covers every table of the snapshot instead of one per
+//     object; fetch errors are never cached here (they surface as a TTL'd
+//     verdict above).
+type verdict struct {
+	err     error
+	expires time.Time // zero = terminal, never expires
+}
+
+// failureVerdictTTL bounds how long a mismatch or a validator-read-failure
+// verdict is trusted before re-checking. Variable only for tests.
+var failureVerdictTTL = time.Minute
+
+var (
+	s3VerdictCache  sync.Map
+	s3ManifestCache sync.Map
+)
+
+// maxManifestBytes caps the _MANIFEST read: a real manifest is one small JSON
+// entry per table (a few MiB covers ~100k tables). Anything larger at that key
+// is not a manifest; without the cap a wrong multi-GB object parked there
+// would be buffered wholesale inside the long-lived shim/watch daemons.
+const maxManifestBytes = 16 << 20
 
 // ValidateS3File checks an s3:// baseline Parquet object against its
 // snapshot's _MANIFEST — the S3 mirror of ValidateLocalFile, with the same
@@ -74,10 +107,11 @@ var s3VerdictCache sync.Map
 // the skip does not hide the partial-write case this exists to catch.
 func ValidateS3File(ctx context.Context, s3Path string) error {
 	if v, ok := s3VerdictCache.Load(s3Path); ok {
-		if v == nil {
-			return nil
+		ve := v.(verdict)
+		if ve.expires.IsZero() || time.Now().Before(ve.expires) {
+			return ve.err
 		}
-		return v.(error)
+		s3VerdictCache.Delete(s3Path)
 	}
 	bucket, key, err := storage.ParseS3URL(s3Path)
 	if err != nil {
@@ -99,64 +133,112 @@ func ValidateS3File(ctx context.Context, s3Path string) error {
 	m, ok, err := loadManifestS3(ctx, bucket, snapKey)
 	if err != nil {
 		// Unreadable / unparseable manifest = cannot verify, not data corruption
-		// (same degrade as the local path). Not cached: it may be transient.
-		slog.Warn("S3 integrity manifest unreadable; treating baseline as integrity-not-verified",
+		// (same degrade as the local path). This branch also absorbs an ABSENT
+		// manifest that S3 reports as AccessDenied (a GetObject-only policy
+		// without s3:ListBucket returns 403 for missing keys — indistinguishable
+		// from a real denial), hence the IAM mention in the warning.
+		slog.Warn("S3 integrity manifest unreadable (sidecar rot, IAM, or transient S3 error); treating baseline as integrity-not-verified",
 			"snapshot", snapshotLabel, "error", err)
+		storeVerdict(s3Path, nil, false)
 		return nil
 	}
 	if !ok {
 		// Legacy snapshot written before #636 — no manifest will ever appear
-		// (snapshots are immutable), so the skip verdict is cacheable.
-		s3VerdictCache.Store(s3Path, error(nil))
+		// (snapshots are immutable), so the skip verdict is terminal.
+		storeVerdict(s3Path, nil, true)
 		return nil
 	}
 	want, verify := m.digestFor(rel, snapshotLabel)
 	if !verify {
-		s3VerdictCache.Store(s3Path, error(nil))
+		storeVerdict(s3Path, nil, true)
 		return nil
 	}
 	got, err := crc32cS3Object(ctx, bucket, key)
 	if err != nil {
 		// The deliberate divergence documented above: validator-side read
-		// failure ≠ corruption. Loud (once per attempt), then proceed unverified.
+		// failure ≠ corruption. Warn, then proceed unverified until the TTL
+		// re-check.
 		slog.Warn("could not re-read S3 baseline for integrity check; treating as integrity-not-verified",
 			"path", s3Path, "error", err)
+		storeVerdict(s3Path, nil, false)
 		return nil
 	}
 	if got != want {
 		verr := fmt.Errorf("%w: %s (crc32c %s, manifest %s)", ErrIntegrity, s3Path, got, want)
-		s3VerdictCache.Store(s3Path, verr)
+		storeVerdict(s3Path, verr, false)
 		return verr
 	}
-	s3VerdictCache.Store(s3Path, error(nil))
+	storeVerdict(s3Path, nil, true)
 	return nil
 }
 
-// loadManifestS3 is LoadManifest over S3. ok=false with a nil error means the
-// manifest object is ABSENT (NoSuchKey/NotFound — a legacy snapshot); any
-// other fetch or parse failure is returned for the caller to degrade on, since
-// an AccessDenied/throttle/network error hides a manifest that may exist
-// (same discrimination as the restore-index sidecar download).
+// storeVerdict caches a validation outcome for s3Path. terminal verdicts
+// never expire (the snapshot is immutable); non-terminal ones (mismatch,
+// validator-read failure) expire after failureVerdictTTL and re-check.
+func storeVerdict(s3Path string, err error, terminal bool) {
+	v := verdict{err: err}
+	if !terminal {
+		v.expires = time.Now().Add(failureVerdictTTL)
+	}
+	s3VerdictCache.Store(s3Path, v)
+}
+
+// loadManifestS3 is LoadManifest over S3, memoized per snapshot (immutable
+// once _SUCCESS exists). ok=false with a nil error means the manifest object
+// is ABSENT — a legacy snapshot; any other fetch or parse failure is returned
+// for the caller to degrade on, and is NOT cached, since an
+// AccessDenied/throttle/network error hides a manifest that may exist.
 func loadManifestS3(ctx context.Context, bucket, snapKey string) (*Manifest, bool, error) {
+	cacheKey := bucket + "\x00" + snapKey
+	if v, ok := s3ManifestCache.Load(cacheKey); ok {
+		m := v.(*Manifest)
+		return m, m != nil, nil
+	}
 	rc, err := OpenS3Object(ctx, bucket, path.Join(snapKey, ManifestName))
 	if err != nil {
-		var noKey *s3types.NoSuchKey
-		var notFound *s3types.NotFound
-		if errors.As(err, &noKey) || errors.As(err, &notFound) {
+		if s3ObjectAbsent(err) {
+			s3ManifestCache.Store(cacheKey, (*Manifest)(nil))
 			return nil, false, nil
 		}
 		return nil, false, err
 	}
 	defer rc.Close()
-	b, err := io.ReadAll(rc)
+	b, err := io.ReadAll(io.LimitReader(rc, maxManifestBytes+1))
 	if err != nil {
 		return nil, false, err
+	}
+	if len(b) > maxManifestBytes {
+		return nil, false, fmt.Errorf("%s exceeds %d bytes — not an integrity manifest", ManifestName, maxManifestBytes)
 	}
 	var parsed Manifest
 	if err := json.Unmarshal(b, &parsed); err != nil {
 		return nil, false, fmt.Errorf("parse %s: %w", ManifestName, err)
 	}
+	s3ManifestCache.Store(cacheKey, &parsed)
 	return &parsed, true, nil
+}
+
+// s3ObjectAbsent reports whether err means the object does not exist, across
+// the shapes real backends produce: the modeled SDK types, a bare S3 error
+// code, and the plain HTTP 404 some S3-compatible backends (Ceph, Wasabi)
+// return without a code — the same discrimination internal/storage does for
+// Exists. NOT matched: AccessDenied for a missing key under a
+// GetObject-only policy (indistinguishable from a real denial; degrades via
+// the caller's error path instead).
+func s3ObjectAbsent(err error) bool {
+	var noKey *s3types.NoSuchKey
+	var notFound *s3types.NotFound
+	if errors.As(err, &noKey) || errors.As(err, &notFound) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		if c := apiErr.ErrorCode(); c == "NoSuchKey" || c == "NotFound" {
+			return true
+		}
+	}
+	var re *smithyhttp.ResponseError
+	return errors.As(err, &re) && re.Response.StatusCode == 404
 }
 
 // crc32cS3Object streams the object through CRC-32C (Castagnoli) and returns
@@ -179,8 +261,17 @@ var (
 	s3Client   *s3.Client
 )
 
-// sharedS3Client lazily builds one process-wide S3 client. A failed build is
-// not cached, so a transient config error doesn't pin validation off forever.
+// sharedS3Client lazily builds one process-wide S3 client on the DEFAULT
+// credential-chain region (env/config/IMDS via storage.NewS3Client). It
+// deliberately does NOT chase a bucket's region across a 301 redirect: the
+// baseline READ paths this validator guards resolve region the same way
+// (duckdbutil.EnableS3CredentialChain pins no region either), so a
+// cross-region baseline bucket fails the read itself — this is validator
+// parity, not a new gap, and a redirect failure degrades to the logged skip
+// like any other validator-side read error. If the read side ever grows
+// region pinning for baselines (the #511 EnableS3CredentialChainRegion
+// treatment), thread the same region in here. A failed build is not cached,
+// so a transient config error doesn't pin validation off forever.
 func sharedS3Client(ctx context.Context) (*s3.Client, error) {
 	s3ClientMu.Lock()
 	defer s3ClientMu.Unlock()
