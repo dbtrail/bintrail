@@ -64,7 +64,7 @@ Safety rules:
     disarm the gate for the other, possibly misconfigured one; vouched
     prunes are marked in their reason). Note --repair's column clears
     deliberately keep trusting an empty scan — they are reversible and
-    the other backend was verified holding the data
+    the other backend's file was verified present for that partition
   - repair is backend-scoped: a local-only run never touches S3 columns
 
 Examples:
@@ -119,6 +119,34 @@ func parseTrustEmptyScan(v string) (local, s3 bool, err error) {
 	return local, s3, nil
 }
 
+// reconcileDiffOptions builds the Diff inputs from the reconcile flags. Split
+// from runArchiveReconcile so the flag→field wiring is unit-testable: the
+// swap mutation (the local vouch driving the S3 field) compiles, reads
+// plausibly, and no engine-level test can see it (#1282 review). It also
+// rejects an inert vouch — one naming a backend this invocation does not
+// scan — instead of silently ignoring the operator's assertion.
+func reconcileDiffOptions(now time.Time) (archive.DiffOptions, error) {
+	trustLocal, trustS3, err := parseTrustEmptyScan(arcTrustEmptyScan)
+	if err != nil {
+		return archive.DiffOptions{}, err
+	}
+	if trustLocal && arcDir == "" {
+		return archive.DiffOptions{}, fmt.Errorf("--trust-empty-scan=local requires --archive-dir (the vouch names a scanned backend)")
+	}
+	if trustS3 && arcS3 == "" {
+		return archive.DiffOptions{}, fmt.Errorf("--trust-empty-scan=s3 requires --archive-s3 (the vouch names a scanned backend)")
+	}
+	return archive.DiffOptions{
+		ScannedLocal:    arcDir != "",
+		ScannedS3:       arcS3 != "",
+		Deep:            arcDeep,
+		PruneMinAge:     arcPruneMinAge,
+		Now:             now,
+		TrustEmptyLocal: trustLocal,
+		TrustEmptyS3:    trustS3,
+	}, nil
+}
+
 func init() {
 	archiveReconcileCmd.Flags().StringVar(&arcIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
 	archiveReconcileCmd.Flags().StringVar(&arcDir, "archive-dir", "", "Local archive root to scan (the directory given to rotate --archive-dir)")
@@ -141,6 +169,13 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 	}
 	if arcDir == "" && arcS3 == "" {
 		return fmt.Errorf("nothing to scan: pass --archive-dir and/or --archive-s3")
+	}
+	// Validated BEFORE any scan: a typo in the vouch (or a vouch naming a
+	// backend this invocation does not scan) must not cost a full S3 LIST
+	// to discover.
+	diffOpts, err := reconcileDiffOptions(time.Now().UTC())
+	if err != nil {
+		return err
 	}
 	ctx := cmd.Context()
 
@@ -171,19 +206,7 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load archive_state: %w", err)
 	}
 
-	trustLocal, trustS3, err := parseTrustEmptyScan(arcTrustEmptyScan)
-	if err != nil {
-		return err
-	}
-	report := archive.Diff(files, rows, archive.DiffOptions{
-		ScannedLocal:    arcDir != "",
-		ScannedS3:       arcS3 != "",
-		Deep:            arcDeep,
-		PruneMinAge:     arcPruneMinAge,
-		Now:             time.Now().UTC(),
-		TrustEmptyLocal: trustLocal,
-		TrustEmptyS3:    trustS3,
-	})
+	report := archive.Diff(files, rows, diffOpts)
 
 	// deepUnverified counts scanned pairs --deep was asked to verify but whose
 	// picked row_count came back Invalid — the footer read failed on the

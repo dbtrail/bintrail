@@ -96,6 +96,9 @@ func TestDiffBackendScopedUpdates(t *testing.T) {
 		}
 		// Local was scanned and the registered local file is gone, while
 		// the S3 copy holds the data → the stale local_path is cleared.
+		// Deliberately scans ZERO local files: this subtest pins the
+		// trusted-clear-under-blind-scan tradeoff the #1280 comments cite —
+		// do not add a local witness file here.
 		if v, ok := ch["local_path"]; !ok || v != nil {
 			t.Errorf("stale local_path should be cleared (SET NULL), got %v present=%v", v, ok)
 		}
@@ -111,6 +114,22 @@ func TestDiffBackendScopedUpdates(t *testing.T) {
 			if _, touched := changes(a)["local_path"]; touched {
 				t.Errorf("local_path must not be touched when local was not scanned: %+v", a)
 			}
+		}
+	})
+
+	t.Run("blind S3 scan → stale S3 columns still cleared (mirror of the local direction)", func(t *testing.T) {
+		// Zero S3 files scanned; the local copy for this key is present.
+		// Pins the S3 direction of the same deliberate-trust tradeoff.
+		f := localFile("p_2026060510", "abc", "/a/x.parquet", 100, 42)
+		rows := []StateRow{{PartitionName: "p_2026060510", BintrailID: "abc",
+			LocalPath: nStr("/a/x.parquet"), FileSizeBytes: nInt(100),
+			S3Bucket: nStr("bkt"), S3Key: nStr("gone/events.parquet"), S3UploadedAt: nTime(tModified), ArchivedAt: tOld}}
+		rep := Diff([]ScannedFile{f}, rows, bothScanned())
+		if rep.Updates != 1 {
+			t.Fatalf("want 1 update, got %+v", rep)
+		}
+		if v, ok := changes(rep.Actions[0])["s3_bucket"]; !ok || v != nil {
+			t.Errorf("stale S3 columns should be cleared under a blind S3 scan, got %v present=%v", v, ok)
 		}
 	})
 
@@ -175,6 +194,38 @@ func TestDiffPruneSafety(t *testing.T) {
 		rep := Diff([]ScannedFile{witness}, []StateRow{s3OnlyRow}, bothScanned())
 		if rep.Prunes != 1 {
 			t.Fatalf("want prune candidate, got %+v", rep)
+		}
+		// Negative marker guard: an evidence-backed prune must never read as
+		// vouched, or the report's audit distinction (#1280) is destroyed.
+		if strings.Contains(rep.Actions[0].Reason, "trust-empty-scan") {
+			t.Errorf("evidence-backed prune must not carry the vouch marker, got: %s", rep.Actions[0].Reason)
+		}
+	})
+
+	t.Run("evidence-backed prune stays unmarked even with both vouches set", func(t *testing.T) {
+		// The marker keys off blindness, not off flag presence — a vouched
+		// invocation whose scans DID see files must produce ordinary,
+		// unmarked prunes.
+		witness := s3File("p_2026060409", "other-id", "bkt", "w/events.parquet", 1)
+		opts := bothScanned()
+		opts.TrustEmptyLocal, opts.TrustEmptyS3 = true, true
+		rep := Diff([]ScannedFile{witness}, []StateRow{s3OnlyRow}, opts)
+		if rep.Prunes != 1 {
+			t.Fatalf("want prune candidate, got %+v", rep)
+		}
+		if strings.Contains(rep.Actions[0].Reason, "trust-empty-scan") {
+			t.Errorf("marker must key off blindness, not flags, got: %s", rep.Actions[0].Reason)
+		}
+	})
+
+	t.Run("blind local scanner + local vouch → prune candidate (mirror of the S3 case)", func(t *testing.T) {
+		localRow := StateRow{PartitionName: "p_2026060510", BintrailID: "abc",
+			LocalPath: nStr("/data/events.parquet"), ArchivedAt: tOld}
+		opts := bothScanned()
+		opts.TrustEmptyLocal = true
+		rep := Diff(nil, []StateRow{localRow}, opts)
+		if rep.Prunes != 1 || rep.SkippedUnverified != 0 {
+			t.Fatalf("local vouch must allow the local-row prune, got %+v", rep)
 		}
 	})
 

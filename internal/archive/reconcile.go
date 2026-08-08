@@ -420,9 +420,12 @@ func updateAction(k key, row *StateRow, local, s3f *ScannedFile, opts DiffOption
 			addReason("S3 object confirmed but s3_uploaded_at was never stamped (would block partition drops)")
 		case s3f == nil && rowHasS3:
 			// Same deliberate trust as the local-clear above: reversible,
-			// the local copy was verified present for this key, and the
-			// clear errs fail-safe — a NULL s3_uploaded_at makes rotate
-			// REFUSE to drop the partition, never the reverse.
+			// and the local copy was verified PRESENT for this key (the key
+			// reached pass 1). Note the clear NULLs s3_bucket as well, so
+			// rotate's pending-upload drop-block (bucket set + stamp NULL,
+			// see insertAction) no longer applies to this row — the
+			// drop-safety argument is the verified local file, not the
+			// stamp.
 			a.Changes = append(a.Changes,
 				FieldChange{"s3_bucket", nil},
 				FieldChange{"s3_key", nil},
