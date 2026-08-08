@@ -70,4 +70,9 @@ func TestTrimPartialTailTransaction_probeErrorIsSurfaceNeutral(t *testing.T) {
 	if strings.Contains(err.Error(), "--at") {
 		t.Errorf("boundary-probe error must stay surface-neutral (no --at CLI flag), got %q", err)
 	}
+	// Positive half: the negative alone would also pass if the error came
+	// from a layer before the wrapper — pin that the probe's wrapper ran.
+	if !strings.Contains(err.Error(), "continues past") {
+		t.Errorf("expected the boundary-probe wrapper in the error, got %q", err)
+	}
 }
