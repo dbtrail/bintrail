@@ -357,7 +357,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		}
 		var emptyErr *query.SourceEmptyError
 		if errors.As(err, &emptyErr) {
-			return fmt.Errorf("%w; run `bintrail archive reconcile --repair` to re-sync archive_state with storage (without --repair it only reports the drift), or pass --allow-gaps to proceed without that source", err)
+			return fmt.Errorf("%w; "+sourceEmptyHint, err)
 		}
 		return err
 	}

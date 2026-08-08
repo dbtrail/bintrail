@@ -47,7 +47,8 @@ func (e *GapError) Error() string {
 // stale registration: the files were deleted or moved after archive_state
 // was written (#383). Under AllowGaps=false this aborts the query like any
 // archive-source failure; programmatic callers can detect it with
-// errors.As to attach remediation (e.g. `bintrail archive reconcile`).
+// errors.As to attach remediation (e.g. `bintrail archive reconcile --repair`,
+// or `--prune` when the files are gone for good — flagless only reports).
 //
 // Like GapError, the Error() string is library-neutral (no CLI command or
 // flag names) — CLI callers re-wrap with their own hint at the call site.
