@@ -199,6 +199,12 @@ func TestIntegrationReconstructGapRefused(t *testing.T) {
 	if rec.Code != 422 {
 		t.Errorf("reconstruct over a gap without allow_gaps: code=%d, want 422 (body=%s)", rec.Code, body)
 	}
+	// The refusal must name the non-lossy remedy, not just the checkbox
+	// override (#1275) — deleting the hint leaves the user with only the
+	// lossy exit.
+	if !strings.Contains(string(body), "archive reconcile --repair") {
+		t.Errorf("gap 422 must name the reconcile remedy, got body: %s", body)
+	}
 }
 
 func TestIntegrationReconstructUnknownPK(t *testing.T) {

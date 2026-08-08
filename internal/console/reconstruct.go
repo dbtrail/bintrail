@@ -402,8 +402,9 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {
 			// Non-lossy remedy first, lossy override second — same ordering
-			// as the CLI (#1268) and MCP (#1271) surfaces. The console user
-			// may not be the operator, hence the "have the operator" framing.
+			// as the CLI (#1268) and MCP (#1271) surfaces, and the same
+			// "have the operator" framing as MCP (only the CLI addresses the
+			// operator directly).
 			writeJSONError(w, http.StatusUnprocessableEntity,
 				"can't reconstruct across a gap in the captured history — "+err.Error()+
 					" — gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too; "+
