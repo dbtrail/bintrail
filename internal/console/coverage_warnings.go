@@ -7,17 +7,28 @@ import "github.com/dbtrail/dbtrail/internal/query"
 // indication at all, which matters here because a console user sees only the
 // response, never the server log:
 //
-//   - archive sources that FAILED and were skipped: the planner counted their
-//     hours as covered, so they are absent from GapHours too;
-//   - a nil plan under allow_gaps: the planner errored, so coverage could not
-//     be evaluated at all. In the reconstruct handler Since/Until are always
-//     set, so nil never means the benign "planner didn't run" case.
+//   - archive sources that FAILED and were skipped (including the
+//     discovery-failure sentinel): the planner counted their hours as
+//     covered, so they are absent from GapHours too;
+//   - a nil plan under allow_gaps: coverage was not evaluated. Registry
+//     bundles guarantee a database name (buildBundle rejects DSNs without
+//     one) and this handler always sets Since/Until, so nil means the
+//     planner errored — and on any exotic path where the planner simply
+//     could not run, coverage is equally unverified, so the warning still
+//     tells the truth.
 //
-// Planner-detected GapHours keep flowing through gapWarnings unchanged.
+// Planner-detected GapHours keep flowing through gapWarnings unchanged. The
+// per-source wording follows query.warnSkippedSources' semantics: each source
+// is a distinct bintrail_id whose deltas no other source carries, so its
+// events ARE missing, not "may be".
 func coverageWarnings(plan *query.QueryPlan, skippedSources []string, allowGaps bool) []string {
 	w := gapWarnings(plan)
 	for _, s := range skippedSources {
-		w = append(w, "archive source failed and was skipped — the result may be missing its events: "+s)
+		if s == query.DiscoveryFailedSource {
+			w = append(w, "archive source discovery failed — no archives were read, and archived hours may still be counted as covered; the result may be incomplete")
+			continue
+		}
+		w = append(w, "archive source failed and was skipped — events held only by this source are missing from the result: "+s)
 	}
 	if allowGaps && plan == nil {
 		w = append(w, "coverage could not be verified (query planner unavailable): gaps in the captured history may be undetected")

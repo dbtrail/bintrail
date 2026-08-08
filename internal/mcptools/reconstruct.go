@@ -365,7 +365,12 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 			// full wording in reconstructFetchError below.
 			ArchiveFetcher: parquetquery.Fetch,
 		}
-		rows, plan, err := query.FetchMerged(ctx, t.DB, query.New(t.DB), fmOpts)
+		// FetchMergedFull, not FetchMerged: an MCP client sees only the JSON,
+		// never the server log, so a skipped archive source or a planner
+		// failure under allow_gaps must land in Warnings (#1281) — the same
+		// no-silent-incompleteness contract CaptureGapStatus enforces for
+		// source-side loss.
+		rows, plan, skippedSources, err := query.FetchMergedFull(ctx, t.DB, query.New(t.DB), fmOpts)
 		if err != nil {
 			return ErrorResult(reconstructFetchError(err)), nil, nil
 		}
@@ -398,7 +403,7 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 			At:           atTime.Format(reconstructTSFormat),
 			BaselineTime: snapshotTime.Format(reconstructTSFormat),
 			EventCount:   len(rows),
-			Warnings:     reconstructWarnings(plan, stale, baselineRow, rows, captureGap),
+			Warnings:     reconstructWarnings(plan, stale, baselineRow, rows, captureGap, skippedSources, args.AllowGaps),
 		}
 
 		// 4. Fold baseline + deltas. baselineRow may be nil. "existed" = the row
@@ -500,7 +505,7 @@ func reconstructCaptureGapError(gap *reconstruct.CaptureGap, schema, table strin
 // carried into the payload: unlike the CLI, whose operator sees the slog.Warn
 // on stderr, an MCP client sees nothing but this JSON, so an overridden gap
 // with no warning reads as a clean, complete reconstruction.
-func reconstructWarnings(plan *query.QueryPlan, stale reconstruct.StaleWarning, baselineRow map[string]any, rows []query.ResultRow, captureGap *reconstruct.CaptureGap) []string {
+func reconstructWarnings(plan *query.QueryPlan, stale reconstruct.StaleWarning, baselineRow map[string]any, rows []query.ResultRow, captureGap *reconstruct.CaptureGap, skippedSources []string, allowGaps bool) []string {
 	var warnings []string
 	if captureGap != nil {
 		warnings = append(warnings, "capture_gap: "+captureGap.Reason()+
@@ -508,6 +513,18 @@ func reconstructWarnings(plan *query.QueryPlan, stale reconstruct.StaleWarning, 
 	}
 	if plan != nil && len(plan.GapHours) > 0 {
 		warnings = append(warnings, query.FormatGapWarning(plan.GapHours))
+	}
+	// The two allow_gaps blind spots (#1281): both would otherwise return
+	// found=true with zero warnings over a knowingly incomplete window.
+	for _, s := range skippedSources {
+		if s == query.DiscoveryFailedSource {
+			warnings = append(warnings, "archive_discovery_failed: no archives were read and archived hours may still be counted as covered; the state below may be incomplete")
+			continue
+		}
+		warnings = append(warnings, "archive_source_skipped: events held only by this source are missing from the result: "+s)
+	}
+	if allowGaps && plan == nil {
+		warnings = append(warnings, "coverage_unverified: the query planner failed or could not run; gaps in the captured history may be undetected")
 	}
 	if stale.Stale() {
 		warnings = append(warnings, "stale_baseline: "+stale.Message)

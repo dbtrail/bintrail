@@ -214,10 +214,12 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 //
 // One residual case for these permissive endpoints: when several archive
 // sources are configured and only SOME fail to load, FetchMerged logs the
-// failure server-side and continues (again, matching the CLI). That is a
-// deliberate AllowGaps=true trade-off, not a missing signal — under
-// AllowGaps=false (the reconstruct endpoint) any source failure aborts the
-// fetch (#377). The trade-off is documented in docs/console.md.
+// failure server-side and continues (again, matching the CLI). Reconstruct
+// used to be the strict contrast cited here; since #1281 its allow_gaps=true
+// path instead reports skipped sources and planner failures in the response
+// Warnings (coverageWarnings + query.FetchMergedFull) — these browsing
+// endpoints can adopt the same pattern if the log-only trade-off is ever
+// revisited. Documented in docs/console.md.
 func (s *Server) fetch(ctx context.Context, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
 	return query.FetchMerged(ctx, b.db, b.engine, query.FetchMergedOptions{
 		Opts:           opts,

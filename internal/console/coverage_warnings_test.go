@@ -30,6 +30,13 @@ func TestCoverageWarnings(t *testing.T) {
 		}
 	})
 
+	t.Run("discovery-failure sentinel → its own warning, not the per-source one", func(t *testing.T) {
+		w := coverageWarnings(&query.QueryPlan{}, []string{query.DiscoveryFailedSource}, true)
+		if len(w) != 1 || !strings.Contains(w[0], "discovery failed") {
+			t.Fatalf("want the discovery-failure warning, got %v", w)
+		}
+	})
+
 	t.Run("healthy plan, nothing skipped → quiet", func(t *testing.T) {
 		if w := coverageWarnings(&query.QueryPlan{}, nil, true); len(w) != 0 {
 			t.Fatalf("healthy path must stay quiet, got %v", w)

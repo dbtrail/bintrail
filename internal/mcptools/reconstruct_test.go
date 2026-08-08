@@ -279,18 +279,18 @@ func TestBuildPKFilterArity(t *testing.T) {
 func TestReconstructWarnings(t *testing.T) {
 	stale := reconstruct.StaleWarning{Message: "using an older snapshot"}
 
-	if w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, nil); len(w) != 0 {
+	if w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, nil, nil, false); len(w) != 0 {
 		t.Errorf("a clean reconstruction must carry no warnings, got %v", w)
 	}
 
-	w := reconstructWarnings(nil, stale, map[string]any{"id": 1}, nil, nil)
+	w := reconstructWarnings(nil, stale, map[string]any{"id": 1}, nil, nil, nil, false)
 	if len(w) != 1 || !strings.HasPrefix(w[0], "stale_baseline: ") {
 		t.Errorf("stale fallback must surface as stale_baseline, got %v", w)
 	}
 
 	// No baseline row + an UPDATE first: PK-change suspicion.
 	updateFirst := []query.ResultRow{{EventID: 1, EventType: event.EventUpdate}}
-	w = reconstructWarnings(nil, reconstruct.StaleWarning{}, nil, updateFirst, nil)
+	w = reconstructWarnings(nil, reconstruct.StaleWarning{}, nil, updateFirst, nil, nil, false)
 	if len(w) != 1 || !strings.HasPrefix(w[0], "pk_change_suspected: ") {
 		t.Errorf("expected a pk_change_suspected warning, got %v", w)
 	}
@@ -298,7 +298,7 @@ func TestReconstructWarnings(t *testing.T) {
 	// No baseline row + an INSERT first: the legitimate created-after-the-baseline
 	// case, which must NOT warn.
 	insertFirst := []query.ResultRow{{EventID: 1, EventType: event.EventInsert}}
-	if w := reconstructWarnings(nil, reconstruct.StaleWarning{}, nil, insertFirst, nil); len(w) != 0 {
+	if w := reconstructWarnings(nil, reconstruct.StaleWarning{}, nil, insertFirst, nil, nil, false); len(w) != 0 {
 		t.Errorf("a row created after the baseline must not warn, got %v", w)
 	}
 }
@@ -318,7 +318,7 @@ func TestReconstructWarningsCaptureGap(t *testing.T) {
 		Detail: "binlogs purged before stream caught up",
 		Since:  since, Until: until,
 	}
-	w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, stamped)
+	w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, stamped, nil, false)
 	if len(w) != 1 || !strings.HasPrefix(w[0], "capture_gap: ") {
 		t.Fatalf("an overridden capture gap must surface as one capture_gap warning, got %v", w)
 	}
@@ -327,16 +327,41 @@ func TestReconstructWarningsCaptureGap(t *testing.T) {
 	}
 
 	unevaluable := &reconstruct.CaptureGap{Unevaluable: true, Since: since, Until: until}
-	w = reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, unevaluable)
+	w = reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, unevaluable, nil, false)
 	if len(w) != 1 || !strings.HasPrefix(w[0], "capture_gap: ") {
 		t.Fatalf("an overridden unevaluable verdict must surface as a capture_gap warning, got %v", w)
 	}
 
 	// The capture-gap warning stacks with the others rather than replacing them.
 	w = reconstructWarnings(nil, reconstruct.StaleWarning{Message: "using an older snapshot"},
-		map[string]any{"id": 1}, nil, stamped)
+		map[string]any{"id": 1}, nil, stamped, nil, false)
 	if len(w) != 2 {
 		t.Errorf("expected the capture gap alongside the stale-baseline warning, got %v", w)
+	}
+}
+
+// TestReconstructWarningsAllowGapsBlindSpots pins the #1281 contract on the
+// MCP surface: a skipped archive source, the discovery-failure sentinel, and
+// a nil plan under allow_gaps must each land in Warnings — an MCP client sees
+// only the JSON, so a silent one reads as a verified reconstruction.
+func TestReconstructWarningsAllowGapsBlindSpots(t *testing.T) {
+	w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, nil,
+		[]string{"s3://bkt/a", query.DiscoveryFailedSource}, true)
+	if len(w) != 3 {
+		t.Fatalf("want skipped + discovery + coverage_unverified, got %v", w)
+	}
+	if !strings.Contains(w[0], "archive_source_skipped") || !strings.Contains(w[0], "s3://bkt/a") {
+		t.Errorf("first warning must name the skipped source, got %v", w)
+	}
+	if !strings.Contains(w[1], "archive_discovery_failed") {
+		t.Errorf("sentinel must map to the discovery warning, got %v", w)
+	}
+	if !strings.Contains(w[2], "coverage_unverified") {
+		t.Errorf("nil plan under allow_gaps must warn, got %v", w)
+	}
+	// Strict mode: a nil plan means the fetch already failed loud — quiet.
+	if w := reconstructWarnings(nil, reconstruct.StaleWarning{}, map[string]any{"id": 1}, nil, nil, nil, false); len(w) != 0 {
+		t.Errorf("strict mode must not warn, got %v", w)
 	}
 }
 

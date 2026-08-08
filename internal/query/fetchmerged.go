@@ -180,10 +180,18 @@ func FetchMerged(
 	return rows, plan, err
 }
 
+// DiscoveryFailedSource is the sentinel FetchMergedFull places in the skipped
+// list when archive source DISCOVERY itself failed under AllowGaps=true: no
+// individual source can be named because none were resolved, yet the planner
+// (an independent archive_state read) may still count archived hours as
+// covered, so the incompleteness would otherwise be invisible (#1281).
+const DiscoveryFailedSource = "(archive source discovery failed)"
+
 // FetchMergedFull is FetchMerged plus the archive sources that FAILED and
 // were skipped — non-empty only under AllowGaps=true (a failing source is
-// fatal otherwise). Surfaces whose user cannot see the server log (the
-// console, #1281) need the list to put the incompleteness in the response;
+// fatal otherwise). A discovery failure appears as DiscoveryFailedSource.
+// Surfaces whose user cannot see the server log (the console and the MCP
+// tool, #1281) need the list to put the incompleteness in the response;
 // callers that log are fine with FetchMerged, whose slog.Warn already names
 // the skipped sources.
 func FetchMergedFull(
@@ -202,6 +210,9 @@ func FetchMergedFull(
 	rows, skipped, _, err := fetchPage(ctx, engine, o, src)
 	if err != nil {
 		return nil, src.plan, nil, err
+	}
+	if src.discoveryFailed {
+		skipped = append(skipped, DiscoveryFailedSource)
 	}
 	return rows, src.plan, skipped, nil
 }
@@ -387,6 +398,12 @@ func warnSkippedSources(skipped []string) {
 type mergeSources struct {
 	archSources []string
 	plan        *QueryPlan
+	// discoveryFailed records that ResolveArchiveSources itself errored
+	// under AllowGaps=true — no source can be named as "skipped" because
+	// none were resolved, while the planner (an independent archive_state
+	// read that may succeed) can still count archived hours as covered.
+	// FetchMergedFull surfaces it as DiscoveryFailedSource (#1281).
+	discoveryFailed bool
 	// misfiledHours is plan.MisfiledArchiveHours, kept separately so fetchPage
 	// can forward it to every archive fetch (as Options.ExtraArchiveHours)
 	// even on paginated walks where per-page Options are rebuilt (#1037).
@@ -409,6 +426,7 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 				return src, fmt.Errorf("resolve archive sources, cannot verify coverage: %w", err)
 			}
 			slog.Warn("archive source discovery failed; proceeding without archives", "error", err)
+			src.discoveryFailed = true
 		}
 		src.archSources = srcs
 	}
