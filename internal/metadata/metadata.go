@@ -991,9 +991,9 @@ func addImplicitPeriodColumns(columns []columnRow, versioned []tableRef) []colum
 	return columns
 }
 
-// tableRef names one source table. Kept as a pair, never a joined string: a
-// schema name may itself contain a dot, so "schema.table" cannot be split
-// back unambiguously.
+// tableRef names one source table. The pair is joined for map keys but never
+// split back: a schema name may itself contain a dot, so a joined string
+// cannot be decomposed unambiguously — the authoritative halves stay here.
 type tableRef struct{ schema, table string }
 
 // The shape of MariaDB's hidden implicit period columns, shared by the two
@@ -1019,9 +1019,12 @@ const (
 // present in tables, extending PKColumns with row_end ONLY when the table has
 // an existing PK (MariaDB extends, never creates — see the belt note in
 // addImplicitPeriodColumns). Explicitly-versioned tables are detected via
-// GENERATION_EXPRESSION and left untouched. Two source round trips, at
-// startup only; both are no-ops against MySQL (no 'SYSTEM VERSIONED'
-// TABLE_TYPE, no ROW START/ROW END expressions).
+// GENERATION_EXPRESSION and left untouched. One to two source round trips,
+// at startup only: on MySQL the first (TABLE_TYPE probe) returns empty and
+// the second (GENERATION_EXPRESSION probe) never runs. Note the agent's
+// EXTRA-based IsGenerated derivation already marks EXPLICIT period columns
+// (MariaDB reports EXTRA "STORED GENERATED" for them — same 11.4 run as the
+// facts above), so both spellings reach the #1266 gates on this surface too.
 func AddImplicitPeriodColumns(sourceDB *sql.DB, schemas []string, tables map[string]*TableMeta) error {
 	versioned, err := implicitlyVersionedTables(sourceDB, schemas)
 	if err != nil {
@@ -1537,13 +1540,16 @@ func queryFKConstraints(sourceDB *sql.DB, schemas []string) ([]fkRow, error) {
 	return fks, nil
 }
 
-// invalidTables checks that all base tables in scope use InnoDB and have an
+// invalidTables checks that all tables in scope use InnoDB and have an
 // explicit primary key. Bintrail requires InnoDB for row-format binary log
 // support and needs primary keys to build pk_values for each event.
 // Returns the sorted "schema.table" names of every violation (a table can
 // appear in both lists); both nil when all tables pass. The caller decides
 // whether violations are fatal (TakeSnapshot) or degrade to exclusion
 // (TakeSnapshotExcludingInvalid, #1051) — err is reserved for probe failures.
+// The third return lists the system-versioned tables the scan saw (#1272),
+// in the query's schema/table ORDER — NOT re-sorted like the violation
+// lists; addImplicitPeriodColumns' determinism rides that ordering.
 func invalidTables(sourceDB *sql.DB, schemas []string, columns []columnRow) (nonInnoDBTables, noPKTables []string, versioned []tableRef, err error) {
 	var (
 		tabQuery string
