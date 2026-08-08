@@ -520,10 +520,10 @@ func reconstructWarnings(plan *query.QueryPlan, stale reconstruct.StaleWarning, 
 	// found=true with zero warnings over a knowingly incomplete window.
 	for _, s := range skippedSources {
 		if s == query.DiscoveryFailedSource {
-			warnings = append(warnings, "archive_discovery_failed: no archives were read and archived hours may still be counted as covered; the state below may be incomplete")
+			warnings = append(warnings, archiveDiscoveryFailedWarning())
 			continue
 		}
-		warnings = append(warnings, "archive_source_skipped: events held only by this source are missing from the result: "+s)
+		warnings = append(warnings, archiveSourceSkippedWarning(s))
 	}
 	if allowGaps && plan == nil {
 		warnings = append(warnings, "coverage_unverified: the query planner failed or could not run; gaps in the captured history may be undetected")

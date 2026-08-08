@@ -144,12 +144,17 @@ func (t *Target) stripStatementText(rows []query.ResultRow) {
 	}
 }
 
-// archiveSources returns Parquet archive source paths for this target, or nil
-// when archives are disabled or discovery fails (the MCP tools are
-// deliberately permissive: serve without archives rather than fail the call).
-func (t *Target) archiveSources(ctx context.Context) []string {
+// archiveSources returns Parquet archive source paths for this target, plus
+// whether DISCOVERY itself failed. On failure the fetch layer stays
+// permissive (serve without archives rather than fail outright) but the
+// signal must reach the client: the query tool renders an
+// archive_discovery_failed warning and the recover tool refuses (#1285 —
+// before this, a discovery failure was slog-only and a result missing every
+// archived event read as complete). NoArchive is (nil, false): archives are
+// OFF by request, nothing failed.
+func (t *Target) archiveSources(ctx context.Context) ([]string, bool) {
 	if t.NoArchive {
-		return nil
+		return nil, false
 	}
 	if t.EnvArchiveDiscovery {
 		return EnvArchiveSources(ctx, t.DB)
@@ -611,8 +616,9 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		// target's own posture (console per-server no-archive, which already
 		// folds the process profile in) is enforced inside archiveSources.
 		var archSources []string
+		var discoveryFailed bool
 		if !args.NoArchive && args.Profile == "" {
-			archSources = t.archiveSources(ctx)
+			archSources, discoveryFailed = t.archiveSources(ctx)
 		}
 
 		var buf bytes.Buffer
@@ -664,7 +670,7 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 			text += fmt.Sprintf("\n%d row(s)\n", n)
 		}
 		text += QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit)
-		text += ArchiveSkipNotice("", skippedArchives)
+		text += ArchiveSkipNotice(discoveryFailed, skippedArchives)
 
 		ext.Record(ctx, ext.AuditEvent{
 			Surface: cfg.auditSurface(),
@@ -751,12 +757,28 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		// mirror the query tool above.
 		engine := query.New(t.DB)
 		var archSources []string
+		var discoveryFailed bool
 		if !args.NoArchive && args.Profile == "" {
-			archSources = t.archiveSources(ctx)
+			archSources, discoveryFailed = t.archiveSources(ctx)
+		}
+		if discoveryFailed {
+			// Unlike the query tool — a browsing surface that degrades with a
+			// warning — recover REFUSES (#1285 review): a reversal script
+			// generated without knowing the archives could silently omit
+			// events, and undoing a partial subset can produce a state that
+			// never existed. This matches CLI recover (a failing source is
+			// fatal under its default) and the reconstruct tool's strict
+			// default; no_archive is the client-reachable escape hatch on
+			// THIS surface (a tool parameter, not a CLI flag).
+			return ErrorResult(fmt.Errorf(
+				"archive source discovery failed; a reversal script generated without the archives could silently omit events. " +
+					"Retry with no_archive: true to recover from the live index only (events already rotated to archives will NOT be reversed), " +
+					"or fix archive discovery and retry")), nil, nil
 		}
 
-		// See the query tool above: failed-and-skipped archive sources are
-		// surfaced as trailing SQL-comment warnings (#1285).
+		// Failed-and-skipped archive sources collect here and REFUSE after the
+		// fetch loop — see the discovery refusal above for why recover never
+		// warns-and-continues (#1285).
 		var skippedArchives []string
 		var rows []query.ResultRow
 		if len(archSources) > 0 {
@@ -781,6 +803,14 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 			if err != nil {
 				return ErrorResult(err), nil, nil
 			}
+		}
+
+		if len(skippedArchives) > 0 {
+			return ErrorResult(fmt.Errorf(
+				"archive source failed and its events cannot be fetched: %s. "+
+					"Refusing to generate a knowingly incomplete reversal script — undoing a partial subset of the matched events can produce a state that never existed. "+
+					"Retry with no_archive: true to recover from the live index only (events held by the failed archive will NOT be reversed), or repair the archive source and retry",
+				strings.Join(skippedArchives, ", "))), nil, nil
 		}
 
 		// The fetch above ran Order=DESC so --limit kept the newest suffix of
@@ -833,7 +863,6 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		if n >= opts.Limit {
 			text += fmt.Sprintf("\n-- Warning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
 		}
-		text += ArchiveSkipNotice("-- ", skippedArchives)
 
 		ext.Record(ctx, ext.AuditEvent{
 			Surface: cfg.auditSurface(),
@@ -1042,12 +1071,12 @@ func ErrorResult(err error) *mcp.CallToolResult {
 // parquetquery.Fetch. It checks env vars BINTRAIL_ARCHIVE_S3 + BINTRAIL_ID
 // first (for explicit configuration — both must be set), then falls back to
 // auto-discovery from archive_state in the index database.
-func EnvArchiveSources(ctx context.Context, db *sql.DB) []string {
+func EnvArchiveSources(ctx context.Context, db *sql.DB) ([]string, bool) {
 	archiveS3 := os.Getenv("BINTRAIL_ARCHIVE_S3")
 	bintrailID := os.Getenv("BINTRAIL_ID")
 	if archiveS3 != "" && bintrailID != "" {
 		base := strings.TrimSuffix(archiveS3, "/") + "/bintrail_id=" + bintrailID
-		return []string{base}
+		return []string{base}, false
 	}
 	if archiveS3 != "" || bintrailID != "" {
 		slog.Warn("partial archive env var config; both BINTRAIL_ARCHIVE_S3 and BINTRAIL_ID must be set",
@@ -1072,13 +1101,15 @@ func misfiledArchiveHoursOrWarn(ctx context.Context, db *sql.DB, since, until *t
 // stateArchiveSources auto-discovers archive sources from archive_state,
 // warn-and-continue on failure (the MCP tools are deliberately permissive —
 // their own per-source fetch loops warn-and-continue too).
-func stateArchiveSources(ctx context.Context, db *sql.DB) []string {
+func stateArchiveSources(ctx context.Context, db *sql.DB) ([]string, bool) {
 	sources, err := query.ResolveArchiveSources(ctx, db)
 	if err != nil {
 		slog.Warn("archive auto-discovery failed; proceeding without archives", "error", err)
-		return nil
+		// true = discovery FAILED — distinct from "no archives exist" (nil,
+		// false); the caller owes the client a warning or a refusal.
+		return nil, true
 	}
-	return sources
+	return sources, false
 }
 
 // DefaultQueryMaxLimit is the hard row ceiling for the MCP query tool (#654):
@@ -1126,25 +1157,40 @@ func QueryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit in
 	return ""
 }
 
-// ArchiveSkipNotice renders trailing warning lines for archive sources whose
-// fetch failed and was skipped (#1285): an MCP client sees only the result
-// text, so a response missing every event held by a source must not read as
-// complete — the blind spot the reconstruct tool's "archive_source_skipped"
-// warnings already close, mirrored here with the same wording. prefix is
-// prepended to each line: "" for the query tool (plain-text notices, the
-// QueryResultNotice precedent — trailing lines after a JSON body included)
-// and "-- " for the recover tool, whose result is an executable SQL script a
-// bare Warning line would break. Deliberately names only the SOURCE, not the
-// fetch error: error detail stays in the server log, keeping local paths,
-// DuckDB internals, and anything the no-CLI-flag-leak rule covers out of the
-// client-visible result.
-func ArchiveSkipNotice(prefix string, skipped []string) string {
-	if len(skipped) == 0 {
-		return ""
-	}
+// archiveSourceSkippedWarning is the ONE wording for a skipped archive
+// source, shared by the reconstruct tool's warnings array and
+// ArchiveSkipNotice — two byte-identical copies would drift silently, and
+// both the tests and any client matching on the wording treat the mirroring
+// as a contract.
+func archiveSourceSkippedWarning(src string) string {
+	return "archive_source_skipped: events held only by this source are missing from the result: " + src
+}
+
+// archiveDiscoveryFailedWarning is the shared wording for "discovery itself
+// failed": no source list exists, so archived events may silently be absent.
+func archiveDiscoveryFailedWarning() string {
+	return "archive_discovery_failed: no archives were read and archived hours may still be counted as covered; the result may be incomplete"
+}
+
+// ArchiveSkipNotice renders the query tool's trailing warning lines for
+// archive trouble (#1285): a discovery failure and/or per-source fetch
+// failures. An MCP client sees only the result text, so a response missing
+// archived events must not read as complete — the blind spot the reconstruct
+// tool's warnings already close, mirrored via the shared helpers above.
+// Trailing plain-text lines are the QueryResultNotice precedent (JSON bodies
+// included). Each line names only the SOURCE — which for a local archive is a
+// server-side path, exactly as the ratified reconstruct precedent already
+// exposes — and never the fetch ERROR: error detail (DuckDB internals,
+// remediation hints, anything the no-CLI-flag-leak rule covers) stays in the
+// server log. The recover tool does not use this: it REFUSES on archive
+// trouble instead (see MakeRecoverTool).
+func ArchiveSkipNotice(discoveryFailed bool, skipped []string) string {
 	var b strings.Builder
+	if discoveryFailed {
+		b.WriteString("\nWarning: " + archiveDiscoveryFailedWarning() + "\n")
+	}
 	for _, s := range skipped {
-		b.WriteString("\n" + prefix + "Warning: archive_source_skipped: events held only by this source are missing from the result: " + s + "\n")
+		b.WriteString("\nWarning: " + archiveSourceSkippedWarning(s) + "\n")
 	}
 	return b.String()
 }
