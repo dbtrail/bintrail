@@ -2,6 +2,7 @@ package cascadebaseline
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,15 @@ func TestProvider_generatedPKRefusesWithRealCause(t *testing.T) {
 	_, _, err := New(find, resolver).BaselineChildren(context.Background(), "shop", "child", "pid", "1", time.Now(), 100)
 	if err == nil {
 		t.Fatal("expected the generated-PK refusal, got nil")
+	}
+	// #1273: the REAL provider must wrap the sentinel — the cascade engine's
+	// permanent-caveat classifier keys on errors.Is, and the engine-side
+	// backstop test uses a fake provider that hand-writes the wrap, so this
+	// is the one assertion tying the two together. Reverting the %w to a
+	// plain %s would silently reclassify the refusal as transient
+	// baselinefail AND let Phase-1 scan the history-polluted candidates.
+	if !errors.Is(err, reconstruct.ErrGeneratedPK) {
+		t.Fatalf("refusal must wrap reconstruct.ErrGeneratedPK, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "generated column") || !strings.Contains(err.Error(), `"row_end"`) {
 		t.Fatalf("want the generated-PK cause naming row_end, got: %v", err)

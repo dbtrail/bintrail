@@ -8,12 +8,36 @@ import (
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
 
-// ErrGeneratedPK is the errors.Is sentinel wrapped by refusals caused by a
+// ErrGeneratedPK is the errors.Is sentinel for refusals caused by a
 // generated primary-key member — the MariaDB system-versioning shape
 // (#1266/#1273). Machine callers (the cascade engine's caveat classifier)
 // use it to tell this PERMANENT table property apart from transient lookup
 // failures without string matching.
+//
+// Who carries it: every ERROR-typed refusal from this shape — the
+// cascadebaseline provider's BaselineChildren refusal and
+// fullTableGeneratedPKRefusal below, both built via GeneratedPKRefusalError.
+// The verify inconclusive detail and the shim wire message are STRINGS by
+// construction and cannot carry a sentinel; do not branch on errors.Is for
+// those surfaces.
 var ErrGeneratedPK = errors.New("primary key contains a generated column")
+
+// generatedPKErr classifies as ErrGeneratedPK via Is WITHOUT injecting the
+// sentinel's text into the rendered message — a %w wrap stutters ("primary
+// key contains a generated column: primary-key column ... is a generated
+// column ..."). Same pattern as MissingPKColumnError below.
+type generatedPKErr struct{ msg string }
+
+func (e *generatedPKErr) Error() string { return e.msg }
+
+// Is makes errors.Is(err, ErrGeneratedPK) true for the concrete type.
+func (e *generatedPKErr) Is(target error) bool { return target == ErrGeneratedPK }
+
+// GeneratedPKRefusalError builds an error that renders exactly msg and
+// matches errors.Is(err, ErrGeneratedPK). Every error-typed generated-PK
+// refusal must be built through this, or the cascade engine's permanent-
+// caveat classifier files it as a transient lookup failure.
+func GeneratedPKRefusalError(msg string) error { return &generatedPKErr{msg: msg} }
 
 // PKTypeGateReason renders the refusal detail for a primary-key column a
 // MySQL-path SupportedPKType gate rejected. Two physically different causes
@@ -99,10 +123,11 @@ func GeneratedPKGateReason(c metadata.ColumnMeta, surface string) string {
 
 // fullTableGeneratedPKRefusal is the error both full-table reconstruct paths
 // (baseline merge and binlog-only fallback) return when the PK contains a
-// generated column, so the two cannot drift.
+// generated column, so the two cannot drift. Classified as ErrGeneratedPK
+// (via GeneratedPKRefusalError) so machine callers need no string matching.
 func fullTableGeneratedPKRefusal(schema, table string, pkCol metadata.ColumnMeta) error {
-	return fmt.Errorf("full-table reconstruct: %s.%s: %s", schema, table,
-		GeneratedPKGateReason(pkCol, "full-table reconstruct"))
+	return GeneratedPKRefusalError(fmt.Sprintf("full-table reconstruct: %s.%s: %s", schema, table,
+		GeneratedPKGateReason(pkCol, "full-table reconstruct")))
 }
 
 // fullTablePKTypeRefusal is the error ReconstructTable's PK-type gate returns

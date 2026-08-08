@@ -117,6 +117,48 @@ func TestRecoverCascade_endToEnd(t *testing.T) {
 	}
 }
 
+// TestRecoverCascade_generatedPKChildGatedViaCLIWiring pins the CLI surface's
+// PKMetas wiring (#1273): the snapshot marks the child's PK as containing a
+// STORED GENERATED member (the MariaDB system-versioning shape), so the
+// CLI-built cascade.Options must carry the probe. With it, the edge is
+// skipped with the permanent generatedpk caveat and NO child INSERTs are
+// synthesized from the indexed events; delete the `PKMetas:` line in the
+// CLI's SynthesizeVictims call and both assertions fail (Phase-1 would scan
+// and synthesize the two children).
+func TestRecoverCascade_generatedPKChildGatedViaCLIWiring(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName, dsn := seedCascadeIndex(t)
+	// seedCascadeIndex snapshots only the parent; give the child the
+	// versioned PK shape (id, row_end) with row_end STORED GENERATED.
+	h := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Hour).Format("2006-01-02 15:04:05")
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, is_nullable, is_generated)
+		VALUES (1, ?, ?, 'child', 'id', 1, 'PRI', 'int', 'NO', 0),
+		       (1, ?, ?, 'child', 'pid', 2, '', 'int', 'YES', 0),
+		       (1, ?, ?, 'child', 'row_end', 3, 'PRI', 'timestamp', 'NO', 1)`,
+		h, dbName, h, dbName, h, dbName)
+
+	out := t.TempDir() + "/cascade.sql"
+	cleanCascadeFlags(dsn, dbName, out)
+	rcAllowIncomplete = true // caveat still lands in the output banner; exit stays 0
+
+	if err := runCascadeCmd(t); err != nil {
+		t.Fatalf("runRecoverCascade with --allow-incomplete: %v", err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	sql := string(b)
+	if !strings.Contains(sql, "generated column") || !strings.Contains(sql, "PERMANENT") {
+		t.Errorf("output must carry the permanent generated-PK caveat\n---\n%s", sql)
+	}
+	if c := strings.Count(sql, "INSERT INTO `"+dbName+"`.`child`"); c != 0 {
+		t.Errorf("gated child edge must synthesize no INSERTs, got %d\n---\n%s", c, sql)
+	}
+}
+
 // addArchiveRow makes ResolveArchiveSources return non-empty (no disk
 // dependency) by registering an S3-located archived partition.
 func addArchiveRow(t *testing.T, db *sql.DB) {

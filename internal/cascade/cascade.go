@@ -591,7 +591,12 @@ func SynthesizeVictims(
 				if errors.Is(berr, reconstruct.ErrGeneratedPK) {
 					// Not berr verbatim: it already names the table and the
 					// generated column, and the caveat frame names both again —
-					// re-state the cause once, cleanly.
+					// re-state the cause once, cleanly. Memoize the verdict
+					// too: the refusal is a static table property, so later
+					// parents on this edge must neither re-run the provider
+					// scan nor emit the keychain probe's caveat (the hoisted
+					// gates consult the same memo).
+					genPKGated[fk.Schema+"."+fk.Table] = true
 					addGeneratedPKCaveat(fk, "its baseline lookup refused it: the primary key contains a "+
 						"generated column (most commonly the MariaDB system-versioning shape)")
 					return childScan{failed: true}
