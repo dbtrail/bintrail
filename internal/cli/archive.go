@@ -56,6 +56,10 @@ Safety rules:
     during a --archive-dir-only run is reported as unverified, never pruned
   - rows younger than --prune-min-age are never pruned (a concurrent
     rotate may still be mid-write)
+  - a scanned backend whose scan finds ZERO layout files provides no
+    testimony (a mistyped path looks identical to a real wipe), so its
+    rows are reported unverified, never pruned; pass --trust-empty-scan
+    only when the backend was legitimately emptied
   - repair is backend-scoped: a local-only run never touches S3 columns
 
 Examples:
@@ -84,6 +88,8 @@ var (
 	arcDeep        bool
 	arcPruneMinAge time.Duration
 	arcFormat      string
+
+	arcTrustEmptyScan bool
 )
 
 func init() {
@@ -95,6 +101,7 @@ func init() {
 	archiveReconcileCmd.Flags().BoolVar(&arcPrune, "prune", false, "Delete registry rows whose every referenced backend was scanned and holds no file (data files are never touched)")
 	archiveReconcileCmd.Flags().BoolVar(&arcDeep, "deep", false, "Also verify row counts (reads Parquet footers — one metadata GET per S3 object)")
 	archiveReconcileCmd.Flags().DurationVar(&arcPruneMinAge, "prune-min-age", time.Hour, "Never prune rows whose archived_at is younger than this (concurrent-rotate safety margin)")
+	archiveReconcileCmd.Flags().BoolVar(&arcTrustEmptyScan, "trust-empty-scan", false, "Treat a backend whose scan finds ZERO layout files as genuinely empty instead of possibly misconfigured — allows pruning after a legitimate total wipe (e.g. S3 lifecycle expiry of the whole prefix)")
 	archiveReconcileCmd.Flags().StringVar(&arcFormat, "format", "text", "Output format: text or json")
 	_ = archiveReconcileCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(archiveReconcileCmd)
@@ -138,11 +145,12 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 	}
 
 	report := archive.Diff(files, rows, archive.DiffOptions{
-		ScannedLocal: arcDir != "",
-		ScannedS3:    arcS3 != "",
-		Deep:         arcDeep,
-		PruneMinAge:  arcPruneMinAge,
-		Now:          time.Now().UTC(),
+		ScannedLocal:   arcDir != "",
+		ScannedS3:      arcS3 != "",
+		Deep:           arcDeep,
+		PruneMinAge:    arcPruneMinAge,
+		Now:            time.Now().UTC(),
+		TrustEmptyScan: arcTrustEmptyScan,
 	})
 
 	// deepUnverified counts scanned pairs --deep was asked to verify but whose

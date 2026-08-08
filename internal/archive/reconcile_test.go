@@ -188,6 +188,30 @@ func TestDiffPruneSafety(t *testing.T) {
 		}
 	})
 
+	t.Run("blind scanner + TrustEmptyScan: operator vouched for the wipe → prune candidate", func(t *testing.T) {
+		// #1280: the legitimate total wipe (e.g. S3 lifecycle expiry of the
+		// whole prefix) is indistinguishable from a mistyped path, so the
+		// gate needs an explicit override — otherwise the stale rows are
+		// unprunable forever and strict queries keep failing.
+		opts := bothScanned()
+		opts.TrustEmptyScan = true
+		rep := Diff(nil, []StateRow{s3OnlyRow}, opts)
+		if rep.Prunes != 1 || rep.SkippedUnverified != 0 {
+			t.Fatalf("vouched empty scan must allow the prune, got %+v", rep)
+		}
+	})
+
+	t.Run("TrustEmptyScan never bypasses the backend-scoped gate", func(t *testing.T) {
+		// The override vouches for a SCANNED backend's emptiness; a row
+		// referencing a backend this invocation did not scan at all stays
+		// unverified regardless.
+		opts := DiffOptions{ScannedLocal: true, PruneMinAge: time.Hour, Now: tNow, TrustEmptyScan: true}
+		rep := Diff(nil, []StateRow{s3OnlyRow}, opts)
+		if rep.Prunes != 0 || rep.SkippedUnverified != 1 {
+			t.Fatalf("unscanned backend must stay unverified even under TrustEmptyScan, got %+v", rep)
+		}
+	})
+
 	t.Run("recent row inside the margin → skip-recent", func(t *testing.T) {
 		recent := s3OnlyRow
 		recent.ArchivedAt = tNow.Add(-10 * time.Minute)

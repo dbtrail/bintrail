@@ -112,6 +112,16 @@ type DiffOptions struct {
 	// never prune candidates (an in-flight rotate may still be writing
 	// its files when the scan ran).
 	PruneMinAge time.Duration
+	// TrustEmptyScan treats a scanned backend whose scan found ZERO layout
+	// files as genuinely empty rather than possibly misconfigured,
+	// bypassing the blind-scanner prune gate (#1280). Off by default: an
+	// empty scan usually means a mistyped --archive-dir/--archive-s3, and
+	// pruning on it would wipe the registry of healthy archives. Turn it
+	// on only when the backend was legitimately emptied (e.g. S3 lifecycle
+	// expiry of the whole prefix) — the one case the gate otherwise
+	// dead-ends forever. It does NOT bypass the backend-scoped gate: a row
+	// referencing an UNSCANNED backend is never a prune candidate.
+	TrustEmptyScan bool
 	// Now anchors the PruneMinAge comparison (injected for testability).
 	Now time.Time
 }
@@ -262,11 +272,12 @@ func Diff(files []ScannedFile, rows []StateRow, opts DiffOptions) Report {
 			continue
 		}
 		// Blind-scanner gate: a scanned backend whose scan saw ZERO layout
-		// files anywhere provides no testimony — refuse to prune on it.
-		if (refsLocal && !localSaw) || (refsS3 && !s3Saw) {
+		// files anywhere provides no testimony — refuse to prune on it,
+		// unless the operator explicitly vouched for the emptiness (#1280).
+		if ((refsLocal && !localSaw) || (refsS3 && !s3Saw)) && !opts.TrustEmptyScan {
 			report.add(Action{
 				Kind: ActionSkipUnverified, PartitionName: k.partition, BintrailID: k.bintrailID,
-				Reason: "the scan found no archive-layout files at all in a referenced backend (wrong --archive-dir/--archive-s3?); refusing to prune on an empty scan",
+				Reason: "the scan found no archive-layout files at all in a referenced backend — wrong --archive-dir/--archive-s3, or the backend was legitimately emptied; refusing to prune on an empty scan (pass --trust-empty-scan if the wipe is real)",
 			})
 			continue
 		}
@@ -368,8 +379,12 @@ func updateAction(k key, row *StateRow, local, s3f *ScannedFile, opts DiffOption
 			a.Changes = append(a.Changes, FieldChange{"local_path", local.LocalPath})
 			addReason("local file present but not (correctly) registered")
 		case local == nil && rowHasLocal:
+			// Deliberately trusted even when the local scan saw zero files
+			// (pinned by TestDiffBackendScopedUpdates): the clear is
+			// registry-only, the S3 copy was verified present for this key,
+			// and a re-run with the right --archive-dir re-registers it.
 			a.Changes = append(a.Changes, FieldChange{"local_path", nil})
-			addReason("registered local file is gone (data lives in the other backend)")
+			addReason("registered local file is gone (data lives in the other backend; if --archive-dir was mistyped, re-run with the right one to re-register)")
 		}
 	}
 
@@ -389,12 +404,16 @@ func updateAction(k key, row *StateRow, local, s3f *ScannedFile, opts DiffOption
 			a.Changes = append(a.Changes, FieldChange{"s3_uploaded_at", s3f.LastModified.UTC()})
 			addReason("S3 object confirmed but s3_uploaded_at was never stamped (would block partition drops)")
 		case s3f == nil && rowHasS3:
+			// Same deliberate trust as the local-clear above: reversible,
+			// the local copy was verified present for this key, and the
+			// clear errs fail-safe — a NULL s3_uploaded_at makes rotate
+			// REFUSE to drop the partition, never the reverse.
 			a.Changes = append(a.Changes,
 				FieldChange{"s3_bucket", nil},
 				FieldChange{"s3_key", nil},
 				FieldChange{"s3_uploaded_at", nil},
 			)
-			addReason("registered S3 object is gone (data lives in the other backend)")
+			addReason("registered S3 object is gone (data lives in the other backend; if --archive-s3 was mistyped, re-run with the right one to re-register)")
 		}
 	}
 
