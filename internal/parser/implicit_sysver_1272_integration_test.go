@@ -119,3 +119,26 @@ func TestParseFile_implicitSystemVersioning_mariadb(t *testing.T) {
 		t.Fatalf("event mix = %d inserts / %d updates / %d deletes, want 2/2/0 (history INSERT + tombstone UPDATE, no Delete_rows)", ins, upd, del)
 	}
 }
+
+// TestTakeSnapshot_pkLessVersionedTableRefused pins the validation-bypass fix
+// against a real MariaDB: `CREATE TABLE t (x INT) WITH SYSTEM VERSIONING` is
+// legal and PK-less, and MariaDB reports it as TABLE_TYPE 'SYSTEM VERSIONED'
+// — before the widened scan it bypassed the no-PK validation entirely, and
+// the synthesis would have fabricated a one-column generated PK whose
+// sentinel row_end collapses every live row onto one pk_values. Strict
+// TakeSnapshot must refuse it like any other PK-less table.
+func TestTakeSnapshot_pkLessVersionedTableRefused(t *testing.T) {
+	sourceDB, sourceName := testutil.CreateTestMariaDB(t)
+	indexDB, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, indexDB)
+
+	testutil.MustExec(t, sourceDB, `CREATE TABLE nopk (x INT) WITH SYSTEM VERSIONING`)
+
+	_, err := metadata.TakeSnapshot(sourceDB, indexDB, []string{sourceName})
+	if err == nil {
+		t.Fatal("strict TakeSnapshot must refuse a PK-less system-versioned table, got nil")
+	}
+	if !strings.Contains(err.Error(), "without a primary key") || !strings.Contains(err.Error(), "nopk") {
+		t.Fatalf("want the no-PK validation refusal naming nopk, got: %v", err)
+	}
+}

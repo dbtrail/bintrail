@@ -1109,6 +1109,14 @@ func buildResolverFromSource(sourceDB *sql.DB, schemas []string) (*metadata.Reso
 		return nil, fmt.Errorf("iterate columns: %w", err)
 	}
 
+	// #1272: implicitly system-versioned MariaDB tables hide row_start/row_end
+	// from information_schema.COLUMNS while their row images carry them — the
+	// column-count-mismatch guard would silently skip every event of the
+	// table. Same synthesis `bintrail snapshot` applies; no-op on MySQL.
+	if err := metadata.AddImplicitPeriodColumns(sourceDB, schemas, tables); err != nil {
+		return nil, fmt.Errorf("detect system-versioned tables: %w", err)
+	}
+
 	if len(tables) == 0 {
 		return nil, fmt.Errorf("no tables found; check --schemas and source server permissions")
 	}

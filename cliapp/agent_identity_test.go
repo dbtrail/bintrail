@@ -342,6 +342,11 @@ func TestBuildResolverFromSource_capturesCharacterSet(t *testing.T) {
 			AddRow("mydb", "customers", "id", 1, "PRI", "int", "", "").
 			AddRow("mydb", "customers", "name", 2, "", "varchar", "", "latin1").
 			AddRow("mydb", "customers", "token", 3, "", "binary", "", ""))
+	// #1272: buildResolverFromSource now probes for implicitly
+	// system-versioned MariaDB tables; none here, so the synthesis is a no-op
+	// and its second (GENERATION_EXPRESSION) query never runs.
+	mock.ExpectQuery("SYSTEM VERSIONED").
+		WillReturnRows(sqlmock.NewRows([]string{"TABLE_SCHEMA", "TABLE_NAME"}))
 
 	resolver, err := buildResolverFromSource(db, nil)
 	if err != nil {

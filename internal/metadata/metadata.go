@@ -914,9 +914,161 @@ func TakeSnapshot(sourceDB, indexDB *sql.DB, schemas []string) (SnapshotStats, e
 // An explicitly-versioned table (its period columns already present in
 // COLUMNS with the ROW START/ROW END expressions, #863) is detected and left
 // untouched. Runs after the #1051 exclusion filter on purpose: an excluded
-// table has no rows in `columns`, contributes no maxOrd entry, and must not
-// re-enter the snapshot through synthesis.
-func addImplicitPeriodColumns(sourceDB *sql.DB, schemas []string, columns []columnRow) ([]columnRow, error) {
+// table has no rows in `columns`, is skipped as unseen, and must not re-enter
+// the snapshot through synthesis. The versioned list comes from the SAME
+// information_schema.TABLES scan validation runs (invalidTables) — versioned
+// tables no longer bypass the InnoDB/no-PK checks, and detection costs no
+// extra source round trip.
+func addImplicitPeriodColumns(columns []columnRow, versioned []tableRef) []columnRow {
+	if len(versioned) == 0 {
+		return columns
+	}
+	type periodScan struct {
+		seen     bool
+		explicit bool
+		hasPK    bool
+		maxOrd   int
+	}
+	scans := make(map[string]*periodScan, len(versioned))
+	for _, ref := range versioned {
+		scans[ref.schema+"."+ref.table] = &periodScan{}
+	}
+	for _, c := range columns {
+		s, ok := scans[c.schemaName+"."+c.tableName]
+		if !ok {
+			continue
+		}
+		s.seen = true
+		if c.columnKey == "PRI" {
+			s.hasPK = true
+		}
+		if c.generationExpression.Valid {
+			switch strings.ToUpper(strings.TrimSpace(c.generationExpression.String)) {
+			case "ROW START", "ROW END":
+				s.explicit = true
+			}
+		}
+		if c.ordinalPosition > s.maxOrd {
+			s.maxOrd = c.ordinalPosition
+		}
+	}
+	// Slice order = the detection query's ORDER BY: deterministic snapshot
+	// content across runs without a re-sort.
+	for _, ref := range versioned {
+		s := scans[ref.schema+"."+ref.table]
+		if !s.seen || s.explicit {
+			continue
+		}
+		rowEndKey := ""
+		if s.hasPK {
+			// MariaDB only EXTENDS an existing PK with row_end; a PK-less
+			// versioned table gets no key at all. Validation refuses (strict)
+			// or excludes (#1051) PK-less tables before this runs, so a
+			// !hasPK table should never reach here — but stamping "PRI"
+			// unconditionally would FABRICATE a one-column generated PK whose
+			// sentinel row_end ('2038-01-19 03:14:07.999999' on every live
+			// row) collapses the whole table onto one pk_values, making a
+			// reversal's WHERE match every live row. Belt, not the gate.
+			rowEndKey = "PRI"
+		}
+		columns = append(columns,
+			columnRow{
+				schemaName: ref.schema, tableName: ref.table, columnName: implicitRowStartName,
+				ordinalPosition: s.maxOrd + 1, dataType: implicitPeriodDataType,
+				columnType: implicitPeriodColumnType, isNullable: "NO",
+				generationExpression: sql.NullString{Valid: true, String: "ROW START"},
+			},
+			columnRow{
+				schemaName: ref.schema, tableName: ref.table, columnName: implicitRowEndName,
+				ordinalPosition: s.maxOrd + 2, columnKey: rowEndKey, dataType: implicitPeriodDataType,
+				columnType: implicitPeriodColumnType, isNullable: "NO",
+				generationExpression: sql.NullString{Valid: true, String: "ROW END"},
+			},
+		)
+		slog.Info("snapshot: synthesized hidden period columns for implicitly system-versioned table",
+			"table", ref.schema+"."+ref.table, "columns", implicitRowStartName+","+implicitRowEndName)
+	}
+	return columns
+}
+
+// tableRef names one source table. Kept as a pair, never a joined string: a
+// schema name may itself contain a dot, so "schema.table" cannot be split
+// back unambiguously.
+type tableRef struct{ schema, table string }
+
+// The shape of MariaDB's hidden implicit period columns, shared by the two
+// synthesis surfaces (takeSnapshot's addImplicitPeriodColumns and the agent's
+// AddImplicitPeriodColumns) so they cannot drift. Empirical, 11.4: the
+// TABLE_MAP FULL metadata names them exactly row_start/row_end, TIMESTAMP(6)
+// NOT NULL, always last in the row image.
+const (
+	implicitRowStartName     = "row_start"
+	implicitRowEndName       = "row_end"
+	implicitPeriodDataType   = "timestamp"
+	implicitPeriodColumnType = "timestamp(6)"
+)
+
+// AddImplicitPeriodColumns is the capture-surface sibling of takeSnapshot's
+// synthesis (#1272), for callers that build an in-memory resolver straight
+// from information_schema.COLUMNS instead of a snapshot — the agent BYOS path.
+// Without it, an implicitly system-versioned MariaDB table's resolver holds N
+// columns while the row image carries N+2, and the parser's
+// column-count-mismatch guard silently skips every event of the table.
+//
+// It appends the two hidden period columns to each implicitly-versioned table
+// present in tables, extending PKColumns with row_end ONLY when the table has
+// an existing PK (MariaDB extends, never creates — see the belt note in
+// addImplicitPeriodColumns). Explicitly-versioned tables are detected via
+// GENERATION_EXPRESSION and left untouched. Two source round trips, at
+// startup only; both are no-ops against MySQL (no 'SYSTEM VERSIONED'
+// TABLE_TYPE, no ROW START/ROW END expressions).
+func AddImplicitPeriodColumns(sourceDB *sql.DB, schemas []string, tables map[string]*TableMeta) error {
+	versioned, err := implicitlyVersionedTables(sourceDB, schemas)
+	if err != nil {
+		return err
+	}
+	if len(versioned) == 0 {
+		return nil
+	}
+	explicit, err := explicitPeriodTables(sourceDB, schemas)
+	if err != nil {
+		return err
+	}
+	for _, ref := range versioned {
+		key := ref.schema + "." + ref.table
+		if explicit[key] {
+			continue
+		}
+		tm, ok := tables[key]
+		if !ok || len(tm.Columns) == 0 {
+			continue
+		}
+		maxOrd := 0
+		for _, c := range tm.Columns {
+			if c.OrdinalPosition > maxOrd {
+				maxOrd = c.OrdinalPosition
+			}
+		}
+		hasPK := len(tm.PKColumns) > 0
+		tm.Columns = append(tm.Columns,
+			ColumnMeta{Name: implicitRowStartName, OrdinalPosition: maxOrd + 1,
+				DataType: implicitPeriodDataType, ColumnType: implicitPeriodColumnType, IsGenerated: true},
+			ColumnMeta{Name: implicitRowEndName, OrdinalPosition: maxOrd + 2, IsPK: hasPK,
+				DataType: implicitPeriodDataType, ColumnType: implicitPeriodColumnType, IsGenerated: true},
+		)
+		if hasPK {
+			tm.PKColumns = append(tm.PKColumns, implicitRowEndName)
+		}
+		slog.Info("resolver: synthesized hidden period columns for implicitly system-versioned table",
+			"table", key, "columns", implicitRowStartName+","+implicitRowEndName)
+	}
+	return nil
+}
+
+// implicitlyVersionedTables lists the in-scope tables MariaDB reports as
+// TABLE_TYPE 'SYSTEM VERSIONED' (MySQL never emits this value). Used by the
+// agent path; takeSnapshot gets the same list from invalidTables' scan.
+func implicitlyVersionedTables(sourceDB *sql.DB, schemas []string) ([]tableRef, error) {
 	var (
 		q    string
 		args []any
@@ -924,11 +1076,13 @@ func addImplicitPeriodColumns(sourceDB *sql.DB, schemas []string, columns []colu
 	if len(schemas) == 0 {
 		q = `SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES
 			WHERE TABLE_TYPE = 'SYSTEM VERSIONED'
-			  AND TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')`
+			  AND TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
+			ORDER BY TABLE_SCHEMA, TABLE_NAME`
 	} else {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
 		q = fmt.Sprintf(`SELECT TABLE_SCHEMA, TABLE_NAME FROM information_schema.TABLES
-			WHERE TABLE_TYPE = 'SYSTEM VERSIONED' AND TABLE_SCHEMA IN (%s)`, placeholders)
+			WHERE TABLE_TYPE = 'SYSTEM VERSIONED' AND TABLE_SCHEMA IN (%s)
+			ORDER BY TABLE_SCHEMA, TABLE_NAME`, placeholders)
 		for _, s := range schemas {
 			args = append(args, s)
 		}
@@ -938,74 +1092,58 @@ func addImplicitPeriodColumns(sourceDB *sql.DB, schemas []string, columns []colu
 		return nil, fmt.Errorf("failed to query information_schema.TABLES for system-versioned tables: %w", err)
 	}
 	defer rows.Close()
-
-	versioned := make(map[string]bool)
+	var out []tableRef
 	for rows.Next() {
-		var s, t string
-		if err := rows.Scan(&s, &t); err != nil {
+		var r tableRef
+		if err := rows.Scan(&r.schema, &r.table); err != nil {
 			return nil, fmt.Errorf("failed to scan system-versioned table row: %w", err)
 		}
-		versioned[s+"."+t] = true
+		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate system-versioned tables: %w", err)
 	}
-	if len(versioned) == 0 {
-		return columns, nil
-	}
+	return out, nil
+}
 
-	explicit := make(map[string]bool)
-	maxOrd := make(map[string]int)
-	tableOf := make(map[string]columnRow) // any kept row of the table, for schema/table names
-	for _, c := range columns {
-		key := c.schemaName + "." + c.tableName
-		if !versioned[key] {
-			continue
-		}
-		if c.generationExpression.Valid {
-			switch strings.ToUpper(strings.TrimSpace(c.generationExpression.String)) {
-			case "ROW START", "ROW END":
-				explicit[key] = true
-			}
-		}
-		if c.ordinalPosition > maxOrd[key] {
-			maxOrd[key] = c.ordinalPosition
-			tableOf[key] = c
-		}
-	}
-
-	var keys []string
-	for key := range maxOrd {
-		if !explicit[key] {
-			keys = append(keys, key)
+// explicitPeriodTables lists the tables whose period columns are EXPLICITLY
+// declared — they appear in information_schema.COLUMNS with the literal
+// GENERATION_EXPRESSION 'ROW START'/'ROW END' (#863) — so the agent-path
+// synthesis leaves them alone. Empty on MySQL (no such expressions).
+func explicitPeriodTables(sourceDB *sql.DB, schemas []string) (map[string]bool, error) {
+	var (
+		q    string
+		args []any
+	)
+	if len(schemas) == 0 {
+		q = `SELECT DISTINCT TABLE_SCHEMA, TABLE_NAME FROM information_schema.COLUMNS
+			WHERE GENERATION_EXPRESSION IN ('ROW START', 'ROW END')
+			  AND TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')`
+	} else {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
+		q = fmt.Sprintf(`SELECT DISTINCT TABLE_SCHEMA, TABLE_NAME FROM information_schema.COLUMNS
+			WHERE GENERATION_EXPRESSION IN ('ROW START', 'ROW END') AND TABLE_SCHEMA IN (%s)`, placeholders)
+		for _, s := range schemas {
+			args = append(args, s)
 		}
 	}
-	sort.Strings(keys) // deterministic snapshot content across runs
-
-	for _, key := range keys {
-		base := tableOf[key]
-		for i, pc := range []struct {
-			name, columnKey, expr string
-		}{
-			{"row_start", "", "ROW START"},
-			{"row_end", "PRI", "ROW END"},
-		} {
-			columns = append(columns, columnRow{
-				schemaName:           base.schemaName,
-				tableName:            base.tableName,
-				columnName:           pc.name,
-				ordinalPosition:      maxOrd[key] + 1 + i,
-				columnKey:            pc.columnKey,
-				dataType:             "timestamp",
-				columnType:           "timestamp(6)",
-				isNullable:           "NO",
-				generationExpression: sql.NullString{Valid: true, String: pc.expr},
-			})
-		}
-		slog.Info("snapshot: synthesized hidden period columns for implicitly system-versioned table",
-			"table", key, "columns", "row_start,row_end")
+	rows, err := sourceDB.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query information_schema.COLUMNS for explicit period columns: %w", err)
 	}
-	return columns, nil
+	defer rows.Close()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var s, t string
+		if err := rows.Scan(&s, &t); err != nil {
+			return nil, fmt.Errorf("failed to scan explicit period column row: %w", err)
+		}
+		out[s+"."+t] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate explicit period columns: %w", err)
+	}
+	return out, nil
 }
 
 // TakeSnapshotExcludingInvalid is the degraded-validation variant of
@@ -1092,7 +1230,7 @@ func takeSnapshot(sourceDB, indexDB *sql.DB, schemas []string, excludeInvalid bo
 	}
 
 	// ── 1b. Validate: all tables must be InnoDB with explicit PKs ────────────
-	nonInnoDB, noPK, err := invalidTables(sourceDB, schemas, columns)
+	nonInnoDB, noPK, versionedTables, err := invalidTables(sourceDB, schemas, columns)
 	if err != nil {
 		return SnapshotStats{}, err
 	}
@@ -1151,11 +1289,10 @@ func takeSnapshot(sourceDB, indexDB *sql.DB, schemas []string, excludeInvalid bo
 	}
 
 	// ── 1b-bis. Synthesize the HIDDEN period columns of implicitly
-	// system-versioned MariaDB tables (#1272) ────────────────────────────────
-	columns, err = addImplicitPeriodColumns(sourceDB, schemas, columns)
-	if err != nil {
-		return SnapshotStats{}, err
-	}
+	// system-versioned MariaDB tables (#1272). After the exclusion filter on
+	// purpose: an excluded table has no kept columns, so the synthesis skips
+	// it — it must not re-enter the snapshot. ────────────────────────────────
+	columns = addImplicitPeriodColumns(columns, versionedTables)
 
 	// ── 1c. Query FK constraints from the source server ─────────────────────
 	fkRows, err := queryFKConstraints(sourceDB, schemas)
@@ -1407,25 +1544,34 @@ func queryFKConstraints(sourceDB *sql.DB, schemas []string) ([]fkRow, error) {
 // appear in both lists); both nil when all tables pass. The caller decides
 // whether violations are fatal (TakeSnapshot) or degrade to exclusion
 // (TakeSnapshotExcludingInvalid, #1051) — err is reserved for probe failures.
-func invalidTables(sourceDB *sql.DB, schemas []string, columns []columnRow) (nonInnoDBTables, noPKTables []string, err error) {
+func invalidTables(sourceDB *sql.DB, schemas []string, columns []columnRow) (nonInnoDBTables, noPKTables []string, versioned []tableRef, err error) {
 	var (
 		tabQuery string
 		tabArgs  []any
 	)
+	// TABLE_TYPE IN (...) rather than = 'BASE TABLE' (#1272): MariaDB reports
+	// system-versioned tables as 'SYSTEM VERSIONED', so the old filter let
+	// them bypass BOTH the InnoDB check and the no-PK check entirely. That
+	// bypass was inert while such tables were silently skipped by capture;
+	// with the period-column synthesis it would be load-bearing — a PK-less
+	// implicitly-versioned table must be refused/excluded here like any other
+	// PK-less table, or the synthesis would be the only thing standing between
+	// it and capture. The same scan doubles as the versioned-table detection
+	// the synthesis consumes (no extra source round trip).
 	if len(schemas) == 0 {
 		tabQuery = `
-			SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE
+			SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, TABLE_TYPE
 			FROM information_schema.TABLES
 			WHERE TABLE_SCHEMA NOT IN ('information_schema','performance_schema','mysql','sys')
-			  AND TABLE_TYPE = 'BASE TABLE'
+			  AND TABLE_TYPE IN ('BASE TABLE', 'SYSTEM VERSIONED')
 			ORDER BY TABLE_SCHEMA, TABLE_NAME`
 	} else {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(schemas)), ",")
 		tabQuery = fmt.Sprintf(`
-			SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE
+			SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, TABLE_TYPE
 			FROM information_schema.TABLES
 			WHERE TABLE_SCHEMA IN (%s)
-			  AND TABLE_TYPE = 'BASE TABLE'
+			  AND TABLE_TYPE IN ('BASE TABLE', 'SYSTEM VERSIONED')
 			ORDER BY TABLE_SCHEMA, TABLE_NAME`, placeholders)
 		for _, s := range schemas {
 			tabArgs = append(tabArgs, s)
@@ -1434,7 +1580,7 @@ func invalidTables(sourceDB *sql.DB, schemas []string, columns []columnRow) (non
 
 	tabRows, err := sourceDB.Query(tabQuery, tabArgs...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to query information_schema.TABLES: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to query information_schema.TABLES: %w", err)
 	}
 	defer tabRows.Close()
 
@@ -1442,19 +1588,22 @@ func invalidTables(sourceDB *sql.DB, schemas []string, columns []columnRow) (non
 	var nonInnoDB []string
 
 	for tabRows.Next() {
-		var schemaName, tableName string
+		var schemaName, tableName, tableType string
 		var engine sql.NullString
-		if err := tabRows.Scan(&schemaName, &tableName, &engine); err != nil {
-			return nil, nil, fmt.Errorf("failed to scan table row: %w", err)
+		if err := tabRows.Scan(&schemaName, &tableName, &engine, &tableType); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to scan table row: %w", err)
 		}
 		key := schemaName + "." + tableName
 		baseTables[key] = struct{}{}
 		if !engine.Valid || !strings.EqualFold(engine.String, "InnoDB") {
 			nonInnoDB = append(nonInnoDB, key)
 		}
+		if strings.EqualFold(tableType, "SYSTEM VERSIONED") {
+			versioned = append(versioned, tableRef{schema: schemaName, table: tableName})
+		}
 	}
 	if err := tabRows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("failed to iterate tables: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to iterate tables: %w", err)
 	}
 
 	// Build the set of tables that have at least one PK column.
@@ -1475,7 +1624,7 @@ func invalidTables(sourceDB *sql.DB, schemas []string, columns []columnRow) (non
 
 	sort.Strings(nonInnoDB)
 	sort.Strings(noPK)
-	return nonInnoDB, noPK, nil
+	return nonInnoDB, noPK, versioned, nil
 }
 
 // validationError renders invalidTables' findings as the strict-mode snapshot

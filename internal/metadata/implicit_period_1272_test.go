@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -28,22 +29,10 @@ func implicitPeriodFixture() []columnRow {
 // them exactly like the explicit form. An EXPLICITLY-versioned table and a
 // plain table pass through untouched.
 func TestAddImplicitPeriodColumns_synthesizesHiddenColumns(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	mock.ExpectQuery("SYSTEM VERSIONED").WithArgs("svdb").WillReturnRows(
-		sqlmock.NewRows([]string{"TABLE_SCHEMA", "TABLE_NAME"}).
-			AddRow("svdb", "imp").
-			AddRow("svdb", "expl"))
-
-	out, err := addImplicitPeriodColumns(db, []string{"svdb"}, implicitPeriodFixture())
-	if err != nil {
-		t.Fatalf("addImplicitPeriodColumns: %v", err)
-	}
-	if len(out) != len(implicitPeriodFixture())+2 {
-		t.Fatalf("got %d columns, want %d (exactly two synthetic rows for the implicit table)", len(out), len(implicitPeriodFixture())+2)
+	in := implicitPeriodFixture()
+	out := addImplicitPeriodColumns(in, []tableRef{{"svdb", "imp"}, {"svdb", "expl"}})
+	if len(out) != len(in)+2 {
+		t.Fatalf("got %d columns, want %d (exactly two synthetic rows for the implicit table)", len(out), len(in)+2)
 	}
 
 	byTable := make(map[string][]columnRow)
@@ -69,29 +58,140 @@ func TestAddImplicitPeriodColumns_synthesizesHiddenColumns(t *testing.T) {
 		!re.generationExpression.Valid || re.generationExpression.String != "ROW END" {
 		t.Errorf("synthetic row_end has the wrong shape: %+v", re)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unmet sqlmock expectations: %v", err)
+}
+
+// TestAddImplicitPeriodColumns_pkLessTableGetsNoFabricatedPK is the belt
+// against the review's corruption scenario: MariaDB only EXTENDS an existing
+// PK with row_end — a PK-less versioned table (which validation refuses or
+// excludes upstream) must never receive a fabricated one-column generated PK,
+// whose sentinel row_end would collapse every live row onto one pk_values.
+func TestAddImplicitPeriodColumns_pkLessTableGetsNoFabricatedPK(t *testing.T) {
+	in := []columnRow{
+		{schemaName: "svdb", tableName: "nopk", columnName: "x", ordinalPosition: 1, dataType: "int", columnType: "int(11)", isNullable: "YES"},
+	}
+	out := addImplicitPeriodColumns(in, []tableRef{{"svdb", "nopk"}})
+	if len(out) != 3 {
+		t.Fatalf("got %d columns, want 3", len(out))
+	}
+	for _, c := range out {
+		if c.columnKey == "PRI" {
+			t.Fatalf("PK-less versioned table must not gain a fabricated PK member, got PRI on %q", c.columnName)
+		}
 	}
 }
 
-// TestAddImplicitPeriodColumns_noVersionedTablesIsNoOp pins the MySQL-source
-// path: no table reports TABLE_TYPE 'SYSTEM VERSIONED', so the input passes
-// through unchanged.
-func TestAddImplicitPeriodColumns_noVersionedTablesIsNoOp(t *testing.T) {
+// TestAddImplicitPeriodColumns_excludedTableSkipped: a versioned table with
+// no kept columns (excluded by the #1051 filter) must not re-enter the
+// snapshot through synthesis; no-versioned input is a no-op.
+func TestAddImplicitPeriodColumns_excludedTableSkipped(t *testing.T) {
+	in := implicitPeriodFixture()
+	out := addImplicitPeriodColumns(in, []tableRef{{"svdb", "excluded"}})
+	if len(out) != len(in) {
+		t.Fatalf("excluded (unseen) versioned table changed the column count: got %d, want %d", len(out), len(in))
+	}
+	if got := addImplicitPeriodColumns(in, nil); len(got) != len(in) {
+		t.Fatalf("no versioned tables must be a no-op, got %d columns", len(got))
+	}
+}
+
+// TestInvalidTables_versionedTablesAreValidated pins the review's
+// validation-bypass fix: MariaDB reports versioned tables as TABLE_TYPE
+// 'SYSTEM VERSIONED', so a TABLE_TYPE='BASE TABLE' filter let them skip BOTH
+// the InnoDB and the no-PK checks. The widened scan must flag a PK-less
+// versioned table AND report the versioned set for the synthesis.
+func TestInvalidTables_versionedTablesAreValidated(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
 	mock.ExpectQuery("SYSTEM VERSIONED").WithArgs("svdb").WillReturnRows(
-		sqlmock.NewRows([]string{"TABLE_SCHEMA", "TABLE_NAME"}))
+		sqlmock.NewRows([]string{"TABLE_SCHEMA", "TABLE_NAME", "ENGINE", "TABLE_TYPE"}).
+			AddRow("svdb", "imp", "InnoDB", "SYSTEM VERSIONED").
+			AddRow("svdb", "nopk", "InnoDB", "SYSTEM VERSIONED").
+			AddRow("svdb", "plain", "InnoDB", "BASE TABLE"))
 
-	in := implicitPeriodFixture()
-	out, err := addImplicitPeriodColumns(db, []string{"svdb"}, in)
-	if err != nil {
-		t.Fatalf("addImplicitPeriodColumns: %v", err)
+	columns := []columnRow{
+		{schemaName: "svdb", tableName: "imp", columnName: "id", ordinalPosition: 1, columnKey: "PRI"},
+		{schemaName: "svdb", tableName: "nopk", columnName: "x", ordinalPosition: 1},
+		{schemaName: "svdb", tableName: "plain", columnName: "id", ordinalPosition: 1, columnKey: "PRI"},
 	}
-	if len(out) != len(in) {
-		t.Fatalf("no-op path changed the column count: got %d, want %d", len(out), len(in))
+	nonInnoDB, noPK, versioned, err := invalidTables(db, []string{"svdb"}, columns)
+	if err != nil {
+		t.Fatalf("invalidTables: %v", err)
+	}
+	if len(nonInnoDB) != 0 {
+		t.Errorf("nonInnoDB = %v, want empty", nonInnoDB)
+	}
+	if len(noPK) != 1 || noPK[0] != "svdb.nopk" {
+		t.Fatalf("noPK = %v, want [svdb.nopk] — the PK-less VERSIONED table must not bypass validation", noPK)
+	}
+	if len(versioned) != 2 || versioned[0] != (tableRef{"svdb", "imp"}) || versioned[1] != (tableRef{"svdb", "nopk"}) {
+		t.Fatalf("versioned = %v, want [svdb.imp svdb.nopk]", versioned)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
+	}
+}
+
+// TestAddImplicitPeriodColumns_agentResolverPath pins the exported
+// capture-surface sibling (the agent BYOS path, which builds its resolver
+// straight from information_schema and never sees the snapshot synthesis):
+// the implicit table's TableMeta gains the two hidden columns and row_end
+// joins PKColumns; an explicitly-versioned table is untouched; a PK-less
+// table gains the columns but never a fabricated PK member.
+func TestAddImplicitPeriodColumns_agentResolverPath(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SYSTEM VERSIONED").WithArgs("svdb").WillReturnRows(
+		sqlmock.NewRows([]string{"TABLE_SCHEMA", "TABLE_NAME"}).
+			AddRow("svdb", "imp").AddRow("svdb", "expl").AddRow("svdb", "nopk"))
+	mock.ExpectQuery("GENERATION_EXPRESSION").WithArgs("svdb").WillReturnRows(
+		sqlmock.NewRows([]string{"TABLE_SCHEMA", "TABLE_NAME"}).AddRow("svdb", "expl"))
+
+	tables := map[string]*TableMeta{
+		"svdb.imp": {Schema: "svdb", Table: "imp", PKColumns: []string{"id"}, Columns: []ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+			{Name: "val", OrdinalPosition: 2, DataType: "varchar"},
+		}},
+		"svdb.expl": {Schema: "svdb", Table: "expl", PKColumns: []string{"id", "row_end"}, Columns: []ColumnMeta{
+			{Name: "id", OrdinalPosition: 1, IsPK: true, DataType: "int"},
+			{Name: "row_start", OrdinalPosition: 2, DataType: "timestamp", IsGenerated: true},
+			{Name: "row_end", OrdinalPosition: 3, IsPK: true, DataType: "timestamp", IsGenerated: true},
+		}},
+		"svdb.nopk": {Schema: "svdb", Table: "nopk", Columns: []ColumnMeta{
+			{Name: "x", OrdinalPosition: 1, DataType: "int"},
+		}},
+	}
+	if err := AddImplicitPeriodColumns(db, []string{"svdb"}, tables); err != nil {
+		t.Fatalf("AddImplicitPeriodColumns: %v", err)
+	}
+
+	imp := tables["svdb.imp"]
+	if len(imp.Columns) != 4 {
+		t.Fatalf("implicit table has %d columns, want 4: %+v", len(imp.Columns), imp.Columns)
+	}
+	re := imp.Columns[3]
+	if re.Name != "row_end" || re.OrdinalPosition != 4 || !re.IsPK || !re.IsGenerated || re.ColumnType != "timestamp(6)" {
+		t.Errorf("synthetic row_end has the wrong shape: %+v", re)
+	}
+	if strings.Join(imp.PKColumns, ",") != "id,row_end" {
+		t.Errorf("PKColumns = %v, want [id row_end]", imp.PKColumns)
+	}
+	if len(tables["svdb.expl"].Columns) != 3 {
+		t.Errorf("explicit table must pass through untouched, got %d columns", len(tables["svdb.expl"].Columns))
+	}
+	nopk := tables["svdb.nopk"]
+	if len(nopk.Columns) != 3 {
+		t.Fatalf("PK-less table has %d columns, want 3", len(nopk.Columns))
+	}
+	if len(nopk.PKColumns) != 0 || nopk.Columns[2].IsPK {
+		t.Errorf("PK-less table must not gain a fabricated PK member: PKColumns=%v cols=%+v", nopk.PKColumns, nopk.Columns)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }
