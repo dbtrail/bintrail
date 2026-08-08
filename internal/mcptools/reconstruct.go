@@ -360,9 +360,9 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 			// planner-driven off the same table, so consulting the standalone
 			// BINTRAIL_ARCHIVE_S3/BINTRAIL_ID env pair here would let the fetch
 			// read sources the planner does not know are covered. The `bintrail
-			// reconstruct` CLI has the identical posture; the remediation for a
-			// stale registration is `bintrail archive reconcile --repair` (or
-			// --prune when the files are gone for good — flagless only reports).
+			// reconstruct` CLI has the identical posture; the remediation for
+			// a stale registration is `bintrail archive reconcile --repair` —
+			// full wording in reconstructFetchError below.
 			ArchiveFetcher: parquetquery.Fetch,
 		}
 		rows, plan, err := query.FetchMerged(ctx, t.DB, query.New(t.DB), fmOpts)
@@ -474,7 +474,7 @@ func reconstructFetchError(err error) error {
 	}
 	var emptyErr *query.SourceEmptyError
 	if errors.As(err, &emptyErr) {
-		return fmt.Errorf("%w; run `bintrail archive reconcile --repair` to re-sync archive_state with storage "+
+		return fmt.Errorf("%w; have the operator run `bintrail archive reconcile --repair` to re-sync archive_state with storage "+
 			"(--repair re-registers files that exist; add --prune if the files are gone for good; flagless it only reports), "+
 			"or re-run with allow_gaps: true to proceed without that source", err)
 	}

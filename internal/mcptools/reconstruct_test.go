@@ -375,9 +375,14 @@ func TestReconstructFetchErrorSourceEmptyNamesToolParam(t *testing.T) {
 	if !strings.Contains(msg, "allow_gaps: true") {
 		t.Errorf("the rewrite must name the tool parameter that overrides it, got: %s", msg)
 	}
-	// `--repair` specifically: without it reconcile is a dry-run (#1274).
+	// `--repair` specifically: without it reconcile is a dry-run (#1274). The
+	// deleted-files bucket needs `--prune`, which --repair never executes —
+	// both acting flags must survive wording edits.
 	if !strings.Contains(msg, "archive reconcile --repair") {
 		t.Errorf("the rewrite must name the reconcile remedy in its acting form, got: %s", msg)
+	}
+	if !strings.Contains(msg, "--prune") {
+		t.Errorf("the rewrite must name the prune bucket for deleted files, got: %s", msg)
 	}
 }
 
