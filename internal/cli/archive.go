@@ -58,8 +58,13 @@ Safety rules:
     rotate may still be mid-write)
   - a scanned backend whose scan finds ZERO layout files provides no
     testimony (a mistyped path looks identical to a real wipe), so its
-    rows are reported unverified, never pruned; pass --trust-empty-scan
-    only when the backend was legitimately emptied
+    rows are reported unverified, never pruned; pass
+    --trust-empty-scan=local|s3 NAMING the legitimately emptied backend
+    to allow those prunes (the vouch is per-backend so it can never
+    disarm the gate for the other, possibly misconfigured one; vouched
+    prunes are marked in their reason). Note --repair's column clears
+    deliberately keep trusting an empty scan — they are reversible and
+    the other backend was verified holding the data
   - repair is backend-scoped: a local-only run never touches S3 columns
 
 Examples:
@@ -89,8 +94,30 @@ var (
 	arcPruneMinAge time.Duration
 	arcFormat      string
 
-	arcTrustEmptyScan bool
+	arcTrustEmptyScan string
 )
+
+// parseTrustEmptyScan maps --trust-empty-scan's value onto the per-backend
+// vouches. The value REQUIRES naming the backend(s): a bare boolean would make
+// one vouch cover both backends, so a real S3 wipe plus a silently blind local
+// scan (wrong dir, unmounted path) would prune healthy local registrations in
+// the same invocation (#1280 review).
+func parseTrustEmptyScan(v string) (local, s3 bool, err error) {
+	if v == "" {
+		return false, false, nil
+	}
+	for _, part := range strings.Split(v, ",") {
+		switch strings.TrimSpace(part) {
+		case "local":
+			local = true
+		case "s3":
+			s3 = true
+		default:
+			return false, false, fmt.Errorf("--trust-empty-scan: unknown backend %q (want local, s3, or local,s3)", part)
+		}
+	}
+	return local, s3, nil
+}
 
 func init() {
 	archiveReconcileCmd.Flags().StringVar(&arcIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
@@ -101,7 +128,7 @@ func init() {
 	archiveReconcileCmd.Flags().BoolVar(&arcPrune, "prune", false, "Delete registry rows whose every referenced backend was scanned and holds no file (data files are never touched)")
 	archiveReconcileCmd.Flags().BoolVar(&arcDeep, "deep", false, "Also verify row counts (reads Parquet footers — one metadata GET per S3 object)")
 	archiveReconcileCmd.Flags().DurationVar(&arcPruneMinAge, "prune-min-age", time.Hour, "Never prune rows whose archived_at is younger than this (concurrent-rotate safety margin)")
-	archiveReconcileCmd.Flags().BoolVar(&arcTrustEmptyScan, "trust-empty-scan", false, "Treat a backend whose scan finds ZERO layout files as genuinely empty instead of possibly misconfigured — allows pruning after a legitimate total wipe (e.g. S3 lifecycle expiry of the whole prefix)")
+	archiveReconcileCmd.Flags().StringVar(&arcTrustEmptyScan, "trust-empty-scan", "", "Name a backend (local, s3, or local,s3) whose ZERO-file scan is a legitimate total wipe rather than a mistyped path — allows pruning THAT backend's rows (e.g. after S3 lifecycle expiry of the whole prefix). Per-backend on purpose; never overrides the unscanned-backend rule")
 	archiveReconcileCmd.Flags().StringVar(&arcFormat, "format", "text", "Output format: text or json")
 	_ = archiveReconcileCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(archiveReconcileCmd)
@@ -144,13 +171,18 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("load archive_state: %w", err)
 	}
 
+	trustLocal, trustS3, err := parseTrustEmptyScan(arcTrustEmptyScan)
+	if err != nil {
+		return err
+	}
 	report := archive.Diff(files, rows, archive.DiffOptions{
-		ScannedLocal:   arcDir != "",
-		ScannedS3:      arcS3 != "",
-		Deep:           arcDeep,
-		PruneMinAge:    arcPruneMinAge,
-		Now:            time.Now().UTC(),
-		TrustEmptyScan: arcTrustEmptyScan,
+		ScannedLocal:    arcDir != "",
+		ScannedS3:       arcS3 != "",
+		Deep:            arcDeep,
+		PruneMinAge:     arcPruneMinAge,
+		Now:             time.Now().UTC(),
+		TrustEmptyLocal: trustLocal,
+		TrustEmptyS3:    trustS3,
 	})
 
 	// deepUnverified counts scanned pairs --deep was asked to verify but whose

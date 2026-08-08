@@ -12,8 +12,8 @@ var (
 	tModified = time.Date(2026, 6, 5, 9, 30, 0, 0, time.UTC)
 )
 
-func nInt(v int64) sql.NullInt64    { return sql.NullInt64{Int64: v, Valid: true} }
-func nStr(v string) sql.NullString  { return sql.NullString{String: v, Valid: true} }
+func nInt(v int64) sql.NullInt64     { return sql.NullInt64{Int64: v, Valid: true} }
+func nStr(v string) sql.NullString   { return sql.NullString{String: v, Valid: true} }
 func nTime(v time.Time) sql.NullTime { return sql.NullTime{Time: v, Valid: true} }
 
 func localFile(part, id, path string, size, rows int64) ScannedFile {
@@ -188,27 +188,46 @@ func TestDiffPruneSafety(t *testing.T) {
 		}
 	})
 
-	t.Run("blind scanner + TrustEmptyScan: operator vouched for the wipe → prune candidate", func(t *testing.T) {
+	t.Run("blind scanner + vouched backend: operator vouched for the wipe → prune candidate, marked", func(t *testing.T) {
 		// #1280: the legitimate total wipe (e.g. S3 lifecycle expiry of the
 		// whole prefix) is indistinguishable from a mistyped path, so the
 		// gate needs an explicit override — otherwise the stale rows are
 		// unprunable forever and strict queries keep failing.
 		opts := bothScanned()
-		opts.TrustEmptyScan = true
+		opts.TrustEmptyS3 = true
 		rep := Diff(nil, []StateRow{s3OnlyRow}, opts)
 		if rep.Prunes != 1 || rep.SkippedUnverified != 0 {
 			t.Fatalf("vouched empty scan must allow the prune, got %+v", rep)
 		}
+		// The audit trail: a vouched prune must be distinguishable from an
+		// evidence-backed one in the report.
+		if !strings.Contains(rep.Actions[0].Reason, "trust-empty-scan") {
+			t.Errorf("vouched prune must be marked in its reason, got: %s", rep.Actions[0].Reason)
+		}
 	})
 
-	t.Run("TrustEmptyScan never bypasses the backend-scoped gate", func(t *testing.T) {
+	t.Run("vouch is per-backend: an S3 vouch never disarms a blind LOCAL scan", func(t *testing.T) {
+		// The #1280-review trap: real S3 wipe vouched, but --archive-dir
+		// points somewhere wrong (its scan is also blind). Local-referencing
+		// rows must stay unverified — a global vouch would prune them.
+		localRow := StateRow{PartitionName: "p_2026060510", BintrailID: "abc",
+			LocalPath: nStr("/data/events.parquet"), ArchivedAt: tOld}
+		opts := bothScanned()
+		opts.TrustEmptyS3 = true
+		rep := Diff(nil, []StateRow{localRow}, opts)
+		if rep.Prunes != 0 || rep.SkippedUnverified != 1 {
+			t.Fatalf("S3 vouch must not cover a blind local scan, got %+v", rep)
+		}
+	})
+
+	t.Run("vouch never bypasses the backend-scoped gate", func(t *testing.T) {
 		// The override vouches for a SCANNED backend's emptiness; a row
 		// referencing a backend this invocation did not scan at all stays
 		// unverified regardless.
-		opts := DiffOptions{ScannedLocal: true, PruneMinAge: time.Hour, Now: tNow, TrustEmptyScan: true}
+		opts := DiffOptions{ScannedLocal: true, PruneMinAge: time.Hour, Now: tNow, TrustEmptyLocal: true, TrustEmptyS3: true}
 		rep := Diff(nil, []StateRow{s3OnlyRow}, opts)
 		if rep.Prunes != 0 || rep.SkippedUnverified != 1 {
-			t.Fatalf("unscanned backend must stay unverified even under TrustEmptyScan, got %+v", rep)
+			t.Fatalf("unscanned backend must stay unverified even when vouched, got %+v", rep)
 		}
 	})
 
@@ -258,7 +277,7 @@ func TestDiffDeepUnverified(t *testing.T) {
 	inSyncRow := func(rowCount int64) []StateRow {
 		return []StateRow{{
 			PartitionName: part, BintrailID: id,
-			LocalPath:     nStr("/a/x.parquet"), FileSizeBytes: nInt(100), RowCount: nInt(rowCount),
+			LocalPath: nStr("/a/x.parquet"), FileSizeBytes: nInt(100), RowCount: nInt(rowCount),
 			S3Bucket: nStr("bkt"), S3Key: nStr("k/events.parquet"), S3UploadedAt: nTime(tModified),
 			ArchivedAt: tOld,
 		}}

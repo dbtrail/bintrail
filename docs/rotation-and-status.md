@@ -275,6 +275,13 @@ Safety rules worth knowing:
   pruned — and repair never touches the columns of a backend it didn't scan.
 - **Concurrency margin:** rows younger than `--prune-min-age` (default `1h`)
   are never pruned; a concurrent `rotate` may still be mid-write.
+- **Empty scans prove nothing:** a scanned backend whose scan finds *zero*
+  layout files anywhere looks identical whether the path was mistyped or the
+  backend was legitimately emptied, so its rows are reported *unverified* and
+  never pruned. When the wipe is real (e.g. an S3 lifecycle rule expired the
+  whole prefix), pass `--trust-empty-scan=local|s3` naming the emptied
+  backend — the vouch is per-backend so it can never disarm the gate for the
+  other one, and every prune it enabled is marked in the report's reason.
 - **No phantom pending uploads:** when reconcile confirms an S3 object, it
   stamps `s3_uploaded_at` — a row with `s3_bucket` set but no stamp reads as
   an upload still in flight, which makes `rotate` refuse to drop that
