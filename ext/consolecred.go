@@ -41,6 +41,27 @@ type ConsoleCredentialProvider interface {
 	Verify(username, password string) *Credential
 }
 
+// ConsoleBootAuthPathReceiver is an OPTIONAL companion a ConsoleCredentialProvider
+// may implement. When it does, the console calls SetBootAuthPath once at
+// construction with the auth-file path it actually resolved — flag, environment,
+// or default, whichever won.
+//
+// This exists because installing a backend supersedes that file for login, so a
+// backend that wants to keep the operator's built-in credential working has to
+// read the file itself. Locating it independently means re-deriving a decision
+// the console has already made from inputs the backend cannot all see (a path
+// passed as a flag is invisible outside this process's flag parsing), and the
+// failure is not a degradation: the two disagree, the built-in credential stops
+// authenticating, and the operator is locked out of a console they configured
+// correctly.
+//
+// Implementing it is optional in both directions — a provider that does not
+// keeps whatever path it resolved on its own, and this call is the console's
+// only involvement.
+type ConsoleBootAuthPathReceiver interface {
+	SetBootAuthPath(path string)
+}
+
 // consoleCred is nil in the OSS build — the console's login form is served only
 // by the built-in single-user auth file.
 var consoleCred ConsoleCredentialProvider

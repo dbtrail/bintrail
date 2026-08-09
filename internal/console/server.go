@@ -270,6 +270,15 @@ func New(cfg Config) (*Server, error) {
 	}
 	passwordCfg := authFile != nil
 
+	// Hand the resolved path to a credential backend that wants it. Installing
+	// a backend supersedes this file for login, so one that keeps the built-in
+	// credential working has to read the file itself — and it cannot see a path
+	// that arrived as a flag. Left to guess, it reads a different file than the
+	// console did and the operator's login stops working.
+	if r, ok := ext.ConsoleCredential().(ext.ConsoleBootAuthPathReceiver); ok {
+		r.SetBootAuthPath(authPath)
+	}
+
 	// Managed MCP token (#1052): an /mcp-ONLY credential minted from the UI.
 	// Missing file = the normal not-configured state; an unreadable file is
 	// logged loudly but never blocks startup — this daemon may be the stream
