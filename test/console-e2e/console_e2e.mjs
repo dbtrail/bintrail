@@ -723,73 +723,106 @@ try {
     ? ok("cascade: script re-inserts both cascade-deleted children")
     : bad("cascade: script re-inserts both cascade-deleted children", cas.sql.slice(0, 200));
 
-  // Scenario 14 — Time-travel over the fixture baseline (#970). First pin the
-  // gate itself: this server must report reconstruct (a baseline is
-  // configured), and a server WITHOUT it must be rerouted off /timetravel.
+  // Scenario 14 — the row-state half over the fixture baseline (#970), now
+  // inside Restore (#1298). Pin the merge itself first: /timetravel must fold
+  // into /recover (old bookmarks and Back entries), and a server WITHOUT a
+  // baseline must still render the panel with an explanation instead of
+  // silently dropping it — an operator who cannot find it has no way to learn
+  // that a baseline is what is missing.
   const ttGate = await page.evaluate(() => {
     const had = !!capsCache.reconstruct;
-    capsCache.reconstruct = false;
     navigate("timetravel");
-    const rerouted = location.pathname === "/overview";
+    const merged = location.pathname === "/recover";
+    capsCache.reconstruct = false;
+    navigate("recover");
+    const sec = document.querySelector(".state-section");
+    const explains = !!sec && !document.querySelector('[name="state_at"]') && !!sec.querySelector(".state-note");
     capsCache.reconstruct = had;
-    return { had, rerouted };
+    return { had, merged, explains };
   });
-  ttGate.had ? ok("timetravel: a baseline-configured server reports the reconstruct capability") : bad("timetravel: a baseline-configured server reports the reconstruct capability", "capsCache.reconstruct falsy on byo-idx");
-  ttGate.rerouted ? ok("timetravel: gated-off navigation reroutes to overview") : bad("timetravel: gated-off navigation reroutes to overview", "landed on /timetravel without the capability");
+  ttGate.had ? ok("restore: a baseline-configured server reports the reconstruct capability") : bad("restore: a baseline-configured server reports the reconstruct capability", "capsCache.reconstruct falsy on byo-idx");
+  ttGate.merged ? ok("restore: /timetravel folds into /recover") : bad("restore: /timetravel folds into /recover", "did not land on /recover");
+  ttGate.explains ? ok("restore: no baseline explains itself instead of vanishing") : bad("restore: no baseline explains itself instead of vanishing", "panel absent or still offering controls");
 
-  await page.evaluate(() => navigate("timetravel"));
-  await page.waitForSelector("#tt-form", { timeout: 8000 });
+  await page.evaluate(() => navigate("recover"));
+  await page.waitForSelector("#recover-form", { timeout: 8000 });
   await page.waitForFunction((FIX) => {
-    const f = document.getElementById("tt-form");
+    const f = document.getElementById("recover-form");
     return f && Array.from(f.elements.schema.options).some((o) => o.value === FIX);
   }, FIX, { timeout: 8000 });
   // pk=1: baseline row (status new) + a later UPDATE (status shipped) — the
   // event fold half. email only ever existed in the baseline's full row image.
+  // The target is entered ONCE, on the undo form — that single target driving
+  // both halves is the merge (#1298).
   await page.evaluate(async ({ FIX, TT_AT }) => {
-    const f = document.getElementById("tt-form");
+    const f = document.getElementById("recover-form");
     f.elements.schema.value = FIX;
     await loadTables(f);
     f.elements.table.value = "orders";
     f.elements.pk.value = "1";
-    if (TT_AT) f.elements.at.value = TT_AT;
-    f.requestSubmit();
+    const at = document.querySelector('[name="state_at"]');
+    if (TT_AT && at) at.value = TT_AT;
+    await runState(f, false);
   }, { FIX, TT_AT });
-  await page.waitForSelector("#tt-out .statetable", { timeout: 10000 });
+  await page.waitForSelector("#state-out .statetable", { timeout: 10000 });
   const tt1 = await page.evaluate(() => {
     const cells = {};
-    document.querySelectorAll("#tt-out .statetable tr").forEach((tr) => {
+    document.querySelectorAll("#state-out .statetable tr").forEach((tr) => {
       cells[tr.querySelector("th").textContent] = tr.querySelector("td").textContent;
     });
-    return { cells, meta: (document.querySelector("#tt-out .meta-line") || {}).textContent || "" };
+    return { cells, meta: (document.querySelector("#state-out .meta-line") || {}).textContent || "" };
   });
   (tt1.cells.status === "shipped" && tt1.cells.email === "a@example.com")
-    ? ok("timetravel: reconstructed row folds the event over the baseline")
-    : bad("timetravel: reconstructed row folds the event over the baseline", JSON.stringify(tt1.cells));
-  /baseline /.test(tt1.meta) ? ok("timetravel: meta line names the baseline anchor") : bad("timetravel: meta line names the baseline anchor", tt1.meta);
+    ? ok("restore: reconstructed row folds the event over the baseline")
+    : bad("restore: reconstructed row folds the event over the baseline", JSON.stringify(tt1.cells));
+  /baseline /.test(tt1.meta) ? ok("restore: meta line names the baseline anchor") : bad("restore: meta line names the baseline anchor", tt1.meta);
 
   // pk=4: exists ONLY in the baseline (no events) — a binlog-only reconstruct
   // cannot resolve it, so this pins the baseline half of baseline+deltas.
-  await page.evaluate(() => { const f = document.getElementById("tt-form"); f.elements.pk.value = "4"; f.requestSubmit(); });
-  await page.waitForFunction(() => /d@example\.com/.test((document.getElementById("tt-out") || {}).textContent || ""), { timeout: 10000 });
+  await page.evaluate(async () => { const f = document.getElementById("recover-form"); f.elements.pk.value = "4"; await runState(f, false); });
+  await page.waitForFunction(() => /d@example\.com/.test((document.getElementById("state-out") || {}).textContent || ""), { timeout: 10000 });
   const tt4 = await page.evaluate(() => {
     const cells = {};
-    document.querySelectorAll("#tt-out .statetable tr").forEach((tr) => {
+    document.querySelectorAll("#state-out .statetable tr").forEach((tr) => {
       cells[tr.querySelector("th").textContent] = tr.querySelector("td").textContent;
     });
     return cells;
   });
   (tt4.status === "new" && tt4.email === "d@example.com")
-    ? ok("timetravel: a never-touched row resolves from the baseline alone")
-    : bad("timetravel: a never-touched row resolves from the baseline alone", JSON.stringify(tt4));
+    ? ok("restore: a never-touched row resolves from the baseline alone")
+    : bad("restore: a never-touched row resolves from the baseline alone", JSON.stringify(tt4));
 
   // pk=2: in the baseline, then DELETEd — must render the deleted note, not an
   // empty table and not the stale baseline value.
-  await page.evaluate(() => { const f = document.getElementById("tt-form"); f.elements.pk.value = "2"; f.requestSubmit(); });
-  await page.waitForFunction(() => !!document.querySelector("#tt-out .deleted-note"), { timeout: 10000 });
-  const tt2 = await page.evaluate(() => (document.querySelector("#tt-out .deleted-note") || {}).textContent || "");
+  await page.evaluate(async () => { const f = document.getElementById("recover-form"); f.elements.pk.value = "2"; await runState(f, false); });
+  await page.waitForFunction(() => !!document.querySelector("#state-out .deleted-note"), { timeout: 10000 });
+  const tt2 = await page.evaluate(() => (document.querySelector("#state-out .deleted-note") || {}).textContent || "");
   /Row was deleted/.test(tt2)
-    ? ok("timetravel: a deleted row renders the deleted note")
-    : bad("timetravel: a deleted row renders the deleted note", tt2);
+    ? ok("restore: a deleted row renders the deleted note")
+    : bad("restore: a deleted row renders the deleted note", tt2);
+
+  // The bridge that makes the two halves one errand: the state on screen
+  // becomes the undo window that produces it. since = at + 1s reverses
+  // precisely the events AFTER `at`, because reconstruct applies <= at while
+  // recover reverses >= since. Passing `at` itself would be off by every event
+  // sharing that second — these indexes routinely carry dozens.
+  const bridge = await page.evaluate(async () => {
+    const f = document.getElementById("recover-form");
+    f.elements.pk.value = "1";
+    await runState(f, false);
+    const btn = document.querySelector(".state-actions .btn-primary");
+    if (!btn) return { err: "no Restore-to-this-state button on a found row" };
+    const at = (document.querySelector("#state-out .meta-line") || {}).textContent || "";
+    btn.click();
+    return { since: f.elements.since.value, until: f.elements.until.value, at };
+  });
+  {
+    const m = /as of (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/.exec(bridge.at || "");
+    const want = m ? new Date(Date.parse(m[1].replace(" ", "T") + "Z") + 1000).toISOString().slice(0, 19).replace("T", " ") : null;
+    (want && bridge.since === want && bridge.until === "")
+      ? ok("restore: 'Restore to this state' sets the undo window to at+1s")
+      : bad("restore: 'Restore to this state' sets the undo window to at+1s", JSON.stringify({ ...bridge, want }));
+  }
 
   // Scenario 15 — Overview window honesty (#686): fixture-drive the REAL
   // buildOverview with a status.coverage spanning far more history than the
