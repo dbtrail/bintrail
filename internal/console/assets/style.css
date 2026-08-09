@@ -1119,6 +1119,23 @@ button { font-family: inherit; }
 [data-accent="warm"] .ev-row.cursor { box-shadow: inset 2px 0 0 var(--orange-2); }
 .ev-row.cursor .ev-caret { opacity: 1; color: var(--accent); }
 
+/* Restore: the folded-in row-state panel (#1298). Reads as a section of the
+   page rather than a second form — the whole point of the merge is that the
+   target above is entered once. */
+.state-section {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  padding: 18px 20px 20px;
+  box-shadow: var(--panel-shadow);
+  margin-bottom: 26px;
+}
+.state-title { font-size: 15px; font-weight: 600; color: var(--ink); margin: 0 0 6px; }
+.state-note { color: var(--ink-3); font-size: 13px; max-width: 72ch; margin: 0 0 14px; }
+.state-bar { display: flex; flex-wrap: wrap; gap: 16px 18px; align-items: flex-end; }
+.state-actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 14px; }
+.state-actions-note { color: var(--ink-3); font-size: 12.5px; }
+
 /* responsive-ish */
 @media (max-width: 880px) {
   #app { grid-template-columns: 1fr; }

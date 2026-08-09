@@ -630,8 +630,9 @@ function routeFromLocation() {
 
 function navigate(route, params, push = true) {
   if (!isKnownRoute(route)) route = "overview";
-  // Reconstruct surface is gated; never navigate to a disabled Time-travel.
-  if (route === "timetravel" && !capsCache.reconstruct) route = "overview";
+  // Time-travel merged into Restore (#1298). The route stays known so old
+  // bookmarks and Back entries land somewhere useful instead of on Overview.
+  if (route === "timetravel") route = "recover";
   // Storage is a watch-daemon surface (rotation + archiving live there).
   if (route === "storage" && !capsCache.monitor) route = "overview";
   // The SQL panel is opt-in (BINTRAIL_CONSOLE_SQL_PANEL) and per-server gated.
@@ -1483,10 +1484,10 @@ function downloadEventsCSV(events) {
 function renderRecover(params) {
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
-    "Filter the changes you want to undo, preview the affected rows, then generate reversal SQL. ",
+    "See a row as it was at any moment, and get the SQL that puts it back. ",
     el("b", { text: "Nothing is ever executed" }),
     " — copy or download the script and apply it yourself after review.");
-  v.append(pageHead("Recover", sub));
+  v.append(pageHead("Restore", sub));
 
   // Context banner when arriving via an event "Undo" (pendingRecover).
   const ctx = pendingRecover;
@@ -1517,6 +1518,7 @@ function renderRecover(params) {
   form.append(actions);
   v.append(form);
 
+  v.append(stateSection(form));
   v.append(el("div", { id: "recover-warnings", class: "warnings" }));
   v.append(el("div", { id: "recover-preview" }));
   v.append(el("div", { id: "recover-out" }));
@@ -1681,14 +1683,133 @@ function undoEvent(e) {
   navigate("recover");
 }
 
+// ── Row state, inside Restore (#1298) ────────────────────────────────────────
+
+// stateSection is the folded-in Time-travel half: the SAME target the undo
+// form already carries (schema/table/pk), plus an instant. Two views that used
+// to be two destinations with identical forms — the operator read a timestamp
+// off Events, retyped the target into one, looked, then retyped it into the
+// other. Here the target is entered once.
+//
+// Gated twice, for two different reasons. capsCache.reconstruct is a per-server
+// capability (no baseline configured, nothing to reconstruct from), and the
+// panel says so rather than vanishing — an operator who cannot find it has no
+// way to learn that a baseline is what is missing. The permission gate mirrors
+// the nav's [data-perm]: the server's 403 is the real boundary, this only
+// spares a scoped session a control that would always error.
+function stateSection(form) {
+  const wrap = el("section", { class: "state-section", "data-perm": "reconstruct:execute" });
+  wrap.append(el("h2", { class: "state-title", text: "Row at a point in time" }));
+
+  if (!capsCache.reconstruct) {
+    wrap.append(el("p", { class: "state-note", text:
+      "Configure a baseline for this server to see a row's earlier state here. Undo SQL below works without one — it reverses recorded changes, so it cannot show a row nothing has touched." }));
+    return wrap;
+  }
+
+  wrap.append(el("p", { class: "state-note", text:
+    "Uses the schema, table and PK above. Shows the row as of an instant — your latest snapshot plus every change since." }));
+
+  const bar = el("div", { class: "state-bar" });
+  const at = fieldDateInput("At (UTC)", "state_at", "md", "now");
+  bar.append(at);
+  bar.append(el("button", { class: "btn btn-ghost", type: "button", text: "Show state",
+    onclick: () => runState(form, false) }));
+  bar.append(el("button", { class: "btn btn-ghost", type: "button", text: "Show history",
+    onclick: () => runState(form, true) }));
+  wrap.append(bar);
+  wrap.append(el("div", { id: "state-warnings", class: "warnings" }));
+  wrap.append(el("div", { id: "state-out" }));
+  return wrap;
+}
+
+// runState reads the target from the undo form — one target, two questions.
+async function runState(form, history) {
+  const gen = serverGen;
+  const out = $("#state-out", VIEW());
+  const warns = $("#state-warnings", VIEW());
+  const f = Object.fromEntries(new FormData(form).entries());
+  const atField = $('[name="state_at"]', VIEW());
+  if (!f.schema || !f.table || !f.pk) {
+    clear(warns);
+    renderError(out, "Schema, table and PK are all required — fill them in above.");
+    return;
+  }
+  const params = { schema: f.schema, table: f.table, pk: f.pk };
+  const atVal = atField && atField.value.trim();
+  if (atVal) params.at = atVal;
+  if (history) params.history = "true";
+  try {
+    const data = await api("/api/reconstruct?" + new URLSearchParams(params).toString());
+    if (gen !== serverGen) return;
+    renderWarnings(warns, data.warnings);
+    clear(out);
+    if (history) renderTimeline(out, data);
+    else {
+      renderStateAt(out, data);
+      out.append(restoreToStateAction(form, data));
+    }
+  } catch (err) {
+    if (gen !== serverGen) return;
+    clear(warns);
+    renderError(out, err);
+  }
+}
+
+// restoreToStateAction is the bridge that makes the two halves one errand:
+// the state on screen becomes the undo window that produces it.
+//
+// The arithmetic is exact, not approximate. reconstruct applies events
+// timestamped <= at; recover reverses events timestamped >= since and leaves
+// the row before the earliest of them. Setting since = at + 1s therefore
+// reverses precisely the events AFTER `at`, landing the row on the state shown
+// — event_timestamp is DATETIME(0), so no event can hide between at and at+1s.
+//
+// Passing `at` itself would be off by every event sharing that second, and
+// these indexes routinely carry dozens (a single write burst stamps them all
+// alike). Until is cleared for the same reason it is set by the Undo bridge:
+// a leftover upper bound would silently drop the newest damage from the window.
+function restoreToStateAction(form, data) {
+  const row = el("div", { class: "state-actions" });
+  if (!data.found) return row;
+  row.append(el("button", {
+    class: "btn btn-primary", type: "button", text: "Restore to this state",
+    title: "Reverse every change after " + data.at + ", leaving the row exactly as shown",
+    onclick: () => {
+      const since = shiftSeconds(data.at, 1);
+      if (!since) { toast("Could not read the selected instant."); return; }
+      form.elements.since.value = since;
+      form.elements.until.value = "";
+      previewRecover(form);
+      form.scrollIntoView({ behavior: "smooth", block: "start" });
+      toast("Undo window set to everything after " + data.at);
+    },
+  }));
+  row.append(el("span", { class: "state-actions-note", text:
+    "Sets the undo window to every change after this instant. Review the rows, then generate the SQL." }));
+  return row;
+}
+
+// shiftSeconds adds n seconds to a "YYYY-MM-DD HH:MM:SS" UTC stamp, returning
+// the same shape. Parsed as UTC explicitly: bare "YYYY-MM-DD HH:MM:SS" is
+// LOCAL time to Date(), which would shift the window by the browser's offset.
+function shiftSeconds(stamp, n) {
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/.exec(String(stamp || ""));
+  if (!m) return "";
+  const t = Date.parse(m[1] + "T" + m[2] + "Z");
+  if (Number.isNaN(t)) return "";
+  return new Date(t + n * 1000).toISOString().slice(0, 19).replace("T", " ");
+}
+
 // ── Time-travel (reconstruct) ─────────────────────────────────────────────────
 
 function renderTimetravel(params) {
-  // Landed on /timetravel but reconstruct is gated off (direct URL or Back).
-  // Redirect by REWRITING the URL (replaceState) then re-dispatching — calling
+  // Merged into Restore (#1298). Rewrite the URL then re-dispatch: calling
   // navigate(push=false) here would leave the URL on /timetravel and re-resolve
   // straight back into this guard (infinite recursion).
-  if (!capsCache.reconstruct) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
+  history.replaceState({}, "", "/recover");
+  renderRoute();
+  return;
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
     "See what a row looked like at any moment in the past — your latest full snapshot plus every change since. Pick a row and a time to see its value then, or see its entire history.");
