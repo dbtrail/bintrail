@@ -217,6 +217,44 @@ func FetchMergedFull(
 	return rows, src.plan, skipped, nil
 }
 
+// topNSatisfiedLive reports whether the live partitions alone already hold the
+// answer to a newest-first page, so the archive sources can be skipped. An
+// archive source is an S3 scan; "the newest 100 events" — the console's Events
+// view, and the query behind Overview — was paying for a full multi-file
+// download whose every row then sorted in below the cut (#1295).
+//
+// All four conditions are load-bearing:
+//
+//   - DESC. ASC asks for the OLDEST rows, which is exactly where the archives
+//     live. (The keyset-cursor path is ASC-only, so it never takes this branch.)
+//   - A FILLED page. A short live result means the live half did not reach the
+//     limit and the archives genuinely extend it.
+//   - ONE contiguous live range in the plan, with the cutoff row inside it.
+//     This is what rules out an archived hour sitting ABOVE the cutoff. Normally
+//     archives are strictly older than every live partition — rotation archives
+//     the oldest partitions as it drops them — but that is a property of how
+//     partitions are usually retired, not an invariant of the schema: a restored
+//     or hand-surgered index can interleave archived hours between live ones,
+//     and then a filled live page is NOT the true top N. Requiring a single
+//     range covering the cutoff makes the span from the cutoff upward provably
+//     live-covered, whatever produced the layout.
+//   - A plan at all. No plan, no proof.
+//
+// Time and table filters need no special case: whatever they exclude, the live
+// rows that survive are still newer than everything below the cutoff, so a full
+// page of them is still the true top N.
+func topNSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
+	if opts.Limit <= 0 || len(rows) < opts.Limit || OrderDirection(opts.Order) != "DESC" {
+		return false
+	}
+	if plan == nil || len(plan.MySQLRanges) != 1 {
+		return false
+	}
+	// rows are already sorted newest-first, so the limit-th row is the cutoff.
+	cutoff := rows[opts.Limit-1].EventTimestamp
+	return !cutoff.Before(plan.MySQLRanges[0].Start)
+}
+
 // DefaultStreamBatchSize is the page size FetchMergedStream uses when the
 // caller passes 0. Chosen as a compromise between resident memory (a page of
 // ResultRows carries both decoded JSON row images, so roughly 1-2 KB per event
@@ -504,6 +542,12 @@ func fetchPage(
 			return nil, nil, nil, ferr
 		}
 		rows = r
+	}
+
+	if topNSatisfiedLive(o.Opts, rows, src.plan) {
+		slog.Debug("planner: skipping archive sources (newest-first page filled from contiguous live coverage)",
+			"limit", o.Opts.Limit, "sources", len(src.archSources))
+		return rows[:o.Opts.Limit], nil, nil, nil
 	}
 
 	// Archive fetches get the misfiled-archive file-scoping hint (#1037); the
