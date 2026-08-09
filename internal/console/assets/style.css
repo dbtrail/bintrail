@@ -1451,6 +1451,28 @@ button { font-family: inherit; }
 .cov-line { margin: 6px 0 0; font-size: 14px; color: var(--ink); }
 .cov-line.bad { color: var(--delete); font-weight: 600; }
 .cov-line.warn { color: var(--ink-2); }
+.cov-refresh { display: flex; align-items: center; gap: 8px; }
+.cov-asof { font-family: var(--f-mono); font-size: 11px; color: var(--ink-4); }
+.cov-asof.bad { color: var(--delete); }
+.cov-refresh-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; padding: 0;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: none; color: var(--ink-3); cursor: pointer;
+  transition: color .18s var(--ease), background .18s var(--ease);
+}
+.cov-refresh-btn:hover:not(:disabled) { background: var(--accent-bg); color: var(--accent); }
+.cov-refresh-btn:disabled { cursor: default; color: var(--ink-4); }
+.cov-refresh-ico { display: flex; }
+.cov-refresh-ico svg { width: 14px; height: 14px; }
+/* The spinner is the only signal that an in-flight refresh is happening — the
+   values deliberately stay on screen until the response lands. */
+.cov-refresh-btn.spin .cov-refresh-ico svg { animation: covspin .7s linear infinite; }
+@keyframes covspin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .cov-refresh-btn.spin .cov-refresh-ico svg { animation: none; }
+  .cov-refresh-btn.spin { opacity: .55; }
+}
 .cov-chips { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 .cov-chip { font-family: var(--f-mono); font-size: 12px; padding: 2px 9px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink-2); }
 .cov-chip.ok { color: var(--insert); border-color: var(--insert); }

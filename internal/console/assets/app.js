@@ -55,6 +55,7 @@ const ICONS = {
   warn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
   calendar: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg>`,
   ext: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>`,
+  refresh: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>`,
 };
 
 // ── module state ─────────────────────────────────────────────────────────────
@@ -122,7 +123,14 @@ function $all(sel, root = document) { return Array.from(root.querySelectorAll(se
 // svgEl parses a STATIC, trusted SVG constant into a detached SVG node. It is
 // NOT an innerHTML sink: image/svg+xml parsing never executes script, and the
 // argument is always a module constant — never server or user data.
+// XML parsing applies no default namespace, so a constant without an explicit
+// xmlns yields a namespace-less <svg>: it takes up its CSS box and paints
+// NOTHING. Every icon here was in that state — the extension nav item, for one,
+// has been rendering label-only. Inject the namespace rather than requiring
+// each constant to remember it, so the next icon added cannot reintroduce this.
+const SVG_NS = `xmlns="http://www.w3.org/2000/svg"`;
 function svgEl(s) {
+  if (!s.includes("xmlns=")) s = s.replace("<svg", "<svg " + SVG_NS);
   const doc = new DOMParser().parseFromString(s, "image/svg+xml");
   return document.importNode(doc.documentElement, true);
 }
@@ -678,14 +686,75 @@ function setActiveNav(route) {
 
 // ── Overview ─────────────────────────────────────────────────────────────────
 
+// covLast is the payload the visible coverage card was built from, so a FAILED
+// refresh can re-render the same numbers instead of blanking them — and label
+// them stale, which is the part that keeps that honest. One Overview is on
+// screen at a time, so one slot is enough.
+let covLast = null; // { data, at } — `at` is the local clock time of the fetch
+
+// covRefresh builds the card's refresh control: a fetch-time stamp plus the
+// button. `stamp` is {at, error} — a refresh that failed keeps the previous
+// numbers on screen and says when they are from, rather than replacing real
+// values with an "unavailable" card or, worse, leaving them looking current.
+function covRefresh(stamp) {
+  const wrap = el("div", { class: "cov-refresh" });
+  if (stamp && stamp.error) {
+    wrap.append(el("span", { class: "cov-asof bad", text: "refresh failed · showing " + stamp.at }));
+  } else if (stamp && stamp.at) {
+    wrap.append(el("span", { class: "cov-asof", text: "as of " + stamp.at }));
+  }
+  const btn = el("button", {
+    class: "cov-refresh-btn", type: "button",
+    title: "Re-read capture lag and continuity",
+    "aria-label": "Refresh restore coverage",
+    onclick: (e) => refreshCovCard(e.currentTarget),
+  });
+  btn.append(icon("refresh", "cov-refresh-ico"));
+  wrap.append(btn);
+  return wrap;
+}
+
+// refreshCovCard re-reads /api/coverage and rebuilds ONLY this card. The values
+// on screen stay put until the response lands, so there is no flash of empty
+// chips, and the rebuild goes back through covCard so the freshness-driven
+// tones (#1227) and the never-green rules apply to refreshed values exactly as
+// they do on first paint.
+async function refreshCovCard(btn) {
+  const card = btn.closest(".cov-card");
+  if (!card || btn.disabled) return;
+  const gen = serverGen, vgen = viewGen;
+  btn.disabled = true;
+  btn.classList.add("spin");
+  let next = null, failed = false;
+  try {
+    next = await api("/api/coverage");
+  } catch (err) {
+    console.error("coverage refresh failed", err);
+    failed = true;
+  }
+  // Switched server or route mid-flight: whatever came back describes a view
+  // the operator is no longer looking at.
+  if (gen !== serverGen || vgen !== viewGen || !card.isConnected) return;
+  if (failed) {
+    const prev = covLast || { data: { continuity: "unavailable" }, at: "" };
+    card.replaceWith(covCard(prev.data, { at: prev.at, error: true }));
+    return;
+  }
+  covLast = { data: next, at: nowClock() };
+  card.replaceWith(covCard(next, { at: covLast.at }));
+}
+
+function nowClock() { return new Date().toLocaleTimeString(); }
+
 // covCard renders the live RPO statement (#1194). The window's upper edge is
 // the last INDEXED event on purpose — "restorable up to now" with a dead
 // stream would be false assurance; the lag chip is what says "now". Degrades
 // loudly: gap_lost/unavailable red, unknown amber, empty index explicit.
-function covCard(c) {
+function covCard(c, stamp) {
   const card = el("section", { class: "ov-panel cov-card" });
   card.append(el("div", { class: "ov-panel-head" },
-    el("h2", { class: "ov-panel-title", text: "Restore coverage" })));
+    el("h2", { class: "ov-panel-title", text: "Restore coverage" }),
+    covRefresh(stamp)));
   const cont = c.continuity || "unknown";
   const bad = cont === "gap_lost" || cont === "unavailable";
   const warn = cont === "unknown";
@@ -815,7 +884,10 @@ function buildOverview(status, eventsData, coverage) {
 
   // Restore coverage — the live RPO statement (#1194). Best-effort: no card
   // when the fetch failed, never a fabricated window.
-  if (coverage) v.append(covCard(coverage));
+  if (coverage) {
+    covLast = { data: coverage, at: nowClock() };
+    v.append(covCard(coverage, { at: covLast.at }));
+  }
 
   // stats
   const stats = el("div", { class: "ov-stats" });
