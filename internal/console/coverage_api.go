@@ -68,6 +68,40 @@ type coverageResponse struct {
 	BrokenTables []string `json:"broken_tables,omitempty"`
 }
 
+// tableAnchors holds the two baseline anchors of one table, which answer two
+// different questions and must not be conflated.
+//
+// newest decides whether the table is BROKEN: if even its most recent baseline
+// predates the delta floor, no point in time is fully reconstructable for it.
+//
+// earliestUsable decides where the table's restorable window STARTS.
+// reconstruct.FindBaseline does not use a table's newest baseline — it picks
+// the newest snapshot AT OR BEFORE the requested instant — so an instant older
+// than the newest baseline is served from an older one, provided that one's
+// own anchor is inside delta coverage. Taking the newest here understated the
+// window by however long ago the last baseline ran, and got worse the more
+// diligently an operator snapshotted: every new baseline pushed the reported
+// floor forward (#1294).
+type tableAnchors struct {
+	newest         time.Time
+	earliestUsable time.Time
+}
+
+// observe folds one baseline file's anchor in, with the verdict already graded
+// against the delta floor. Usable means at or above the floor — ok and aging
+// both qualify; aging says the window is shrinking, not that it is gone.
+func (a *tableAnchors) observe(ts time.Time, v status.BaselineStalenessVerdict) {
+	if ts.After(a.newest) {
+		a.newest = ts
+	}
+	switch v {
+	case status.BaselineOK, status.BaselineAging:
+		if a.earliestUsable.IsZero() || ts.Before(a.earliestUsable) {
+			a.earliestUsable = ts
+		}
+	}
+}
+
 // serverID labels log lines with the request's selected server — a
 // multi-server console emitting unattributed warns is undebuggable.
 func serverID(r *http.Request) string {
@@ -129,12 +163,15 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		resp.FullTableStatus = "ok"
-		newest := make(map[string]time.Time, len(files))
+		anchors := make(map[string]*tableAnchors, len(files))
 		for _, f := range files {
 			k := f.Schema + "." + f.Table
-			if f.SnapshotTime.After(newest[k]) {
-				newest[k] = f.SnapshotTime
+			a := anchors[k]
+			if a == nil {
+				a = &tableAnchors{}
+				anchors[k] = a
 			}
+			a.observe(f.SnapshotTime, sum.Floor.Grade(f.SnapshotTime, now))
 		}
 		// Graded THROUGH the floor, never against its hour alone: on a
 		// multi-source index the hour is the live floor and an anchor below
@@ -143,23 +180,26 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 		// the floor's own narrowing exists to avoid.
 		var from time.Time
 		var unevaluable bool
-		for k, ts := range newest {
-			switch sum.Floor.Grade(ts, now) {
-			case status.BaselineBroken:
-				resp.BrokenTables = append(resp.BrokenTables, k)
-			case status.BaselineUnknown:
-				// Neither broken nor usable: it must not join broken_tables
-				// AND must not define the window below, or "ok" would assert
-				// restorability from an anchor whose coverage is unknown.
-				unevaluable = true
-			default:
+		for k, a := range anchors {
+			if !a.earliestUsable.IsZero() {
 				// The window covering ALL usable tables starts at the LATEST
-				// usable anchor: table i is reconstructable for points >= its
-				// own anchor, so "every table" holds only past the newest one.
-				if ts.After(from) {
-					from = ts
+				// of their individual starts — and a table's own start is its
+				// EARLIEST usable anchor, not its newest (see tableAnchors).
+				if a.earliestUsable.After(from) {
+					from = a.earliestUsable
 				}
+				continue
 			}
+			// No usable anchor at all: the newest one says which kind of
+			// nothing this is.
+			if sum.Floor.Grade(a.newest, now) == status.BaselineBroken {
+				resp.BrokenTables = append(resp.BrokenTables, k)
+				continue
+			}
+			// Neither broken nor usable: it must not join broken_tables AND
+			// must not define the window, or "ok" would assert restorability
+			// from an anchor whose coverage is unknown.
+			unevaluable = true
 		}
 		sort.Strings(resp.BrokenTables)
 		if unevaluable {
