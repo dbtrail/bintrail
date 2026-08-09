@@ -805,12 +805,14 @@ button { font-family: inherit; }
 @keyframes ul { to { transform: scaleX(1); } }
 
 /* restore action on each timeline node */
-.tl-actions { margin-top: 10px; }
+.tl-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
 .tl-restore {
   height: 28px; padding: 0 11px; font-size: 12px;
   color: var(--ink-2); background: var(--surface); border: 1px solid var(--line);
 }
 .tl-restore svg { width: 13px; height: 13px; }
+.tl-use { color: var(--ink-3); }
+.tl-use:hover { border-color: var(--ink-4); color: var(--ink); }
 .tl-restore:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
 [data-accent="warm"] .tl-restore:hover { border-color: var(--orange-2); color: var(--orange-2); }
 

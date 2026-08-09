@@ -824,6 +824,46 @@ try {
       : bad("restore: 'Restore to this state' sets the undo window to at+1s", JSON.stringify({ ...bridge, want }));
   }
 
+  // The timeline is how an operator picks an instant without leaving to read
+  // one off Events. Its own restore button used to route through undoEvent,
+  // which sets `until` — reversing everything UP TO that point and landing the
+  // row before its whole history, the opposite end from the state the button
+  // names. Pin both actions against a real render.
+  const tl = await page.evaluate(async () => {
+    const f = document.getElementById("recover-form");
+    f.elements.pk.value = "1";
+    f.elements.since.value = "";
+    f.elements.until.value = "2000-01-01 00:00:00"; // stale bound that must be cleared
+    await runState(f, true);
+    const nodes = Array.from(document.querySelectorAll(".tl-node"));
+    if (!nodes.length) return { err: "no timeline nodes" };
+    const last = nodes[nodes.length - 1];
+    const time = (last.querySelector(".tl-time") || {}).textContent || "";
+    const restore = last.querySelector(".tl-restore");
+    const use = last.querySelector(".tl-use");
+    if (!use) return { err: "no 'Use this moment' action" };
+    use.click();
+    const at = (document.querySelector('[name="state_at"]') || {}).value || "";
+    if (!restore) return { time, at, skippedRestore: true };
+    restore.click();
+    return { time, at, since: f.elements.since.value, until: f.elements.until.value };
+  });
+  if (tl.err) {
+    bad("restore: timeline offers per-node actions", tl.err);
+  } else {
+    (tl.at === tl.time)
+      ? ok("restore: 'Use this moment' fills the At field from the timeline")
+      : bad("restore: 'Use this moment' fills the At field from the timeline", JSON.stringify(tl));
+    if (tl.skippedRestore) {
+      ok("restore: timeline restore skipped (baseline-only node)");
+    } else {
+      const want = new Date(Date.parse(tl.time.replace(" ", "T") + "Z") + 1000).toISOString().slice(0, 19).replace("T", " ");
+      (tl.since === want && tl.until === "")
+        ? ok("restore: timeline 'Restore to this state' aims AFTER the instant, not before it")
+        : bad("restore: timeline 'Restore to this state' aims AFTER the instant, not before it", JSON.stringify({ ...tl, want }));
+    }
+  }
+
   // Scenario 15 — Overview window honesty (#686): fixture-drive the REAL
   // buildOverview with a status.coverage spanning far more history than the
   // fetched events window, and assert the window line uses the window's OWN

@@ -1756,6 +1756,29 @@ async function runState(form, history) {
   }
 }
 
+// aimUndoAtInstant points the undo window at the state as of `at`: reverse
+// everything AFTER that instant, so the row lands exactly on what was shown.
+//
+// since = at + 1s is exact, not approximate. reconstruct applies events
+// timestamped <= at; recover reverses events timestamped >= since and leaves
+// the row before the earliest of them. event_timestamp is DATETIME(0), so no
+// event can hide between at and at+1s — while passing `at` itself would be off
+// by every event sharing that second, and these indexes routinely carry dozens
+// from a single write burst.
+//
+// Clearing `until` matters just as much: a leftover upper bound (the Undo
+// bridge from Events sets one) would drop the newest damage out of the window
+// and quietly restore to the wrong place.
+function aimUndoAtInstant(form, at) {
+  const since = shiftSeconds(at, 1);
+  if (!since) { toast("Could not read the selected instant."); return; }
+  form.elements.since.value = since;
+  form.elements.until.value = "";
+  previewRecover(form);
+  form.scrollIntoView({ behavior: "smooth", block: "start" });
+  toast("Undo window set to everything after " + at);
+}
+
 // restoreToStateAction is the bridge that makes the two halves one errand:
 // the state on screen becomes the undo window that produces it.
 //
@@ -1775,19 +1798,23 @@ function restoreToStateAction(form, data) {
   row.append(el("button", {
     class: "btn btn-primary", type: "button", text: "Restore to this state",
     title: "Reverse every change after " + data.at + ", leaving the row exactly as shown",
-    onclick: () => {
-      const since = shiftSeconds(data.at, 1);
-      if (!since) { toast("Could not read the selected instant."); return; }
-      form.elements.since.value = since;
-      form.elements.until.value = "";
-      previewRecover(form);
-      form.scrollIntoView({ behavior: "smooth", block: "start" });
-      toast("Undo window set to everything after " + data.at);
-    },
+    onclick: () => aimUndoAtInstant(form, data.at),
   }));
   row.append(el("span", { class: "state-actions-note", text:
     "Sets the undo window to every change after this instant. Review the rows, then generate the SQL." }));
   return row;
+}
+
+// useTimelineInstant fills the At field from a timeline node and re-runs the
+// state view. This is what replaces typing a timestamp: the operator points at
+// the change that broke things instead of transcribing its time from Events.
+function useTimelineInstant(at) {
+  const field = $('[name="state_at"]', VIEW());
+  const form = document.getElementById("recover-form");
+  if (!field || !form) return;
+  field.value = at;
+  runState(form, false);
+  field.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 // shiftSeconds adds n seconds to a "YYYY-MM-DD HH:MM:SS" UTC stamp, returning
@@ -1915,12 +1942,31 @@ function renderTimeline(container, data) {
     }
     node.append(body);
 
+    // Both actions are "pick this moment" — the timeline is how an operator
+    // chooses an instant without leaving to read one off Events and retype it.
+    //
+    // The restore button used to route through undoEvent, which sets `until`:
+    // that reverses everything UP TO this point and lands the row before its
+    // whole recorded history — the opposite end from the state the button is
+    // pointing at. It shares the state panel's exact bridge now, so the label
+    // and the SQL finally agree.
+    const acts = el("div", { class: "tl-actions" });
+    acts.append(el("button", {
+      class: "btn btn-sm tl-use", type: "button", text: "Use this moment",
+      title: "Set the At field above to " + e.time,
+      onclick: () => useTimelineInstant(e.time),
+    }));
     if (e.source !== "baseline") {
-      const acts = el("div", { class: "tl-actions" });
-      acts.append(el("button", { class: "btn btn-sm tl-restore", type: "button", text: "Restore to this state",
-        onclick: () => undoEvent({ schema_name: data.schema, table_name: data.table, pk_values: data.pk, event_type: e.source, event_timestamp: e.time }) }));
-      node.append(acts);
+      acts.append(el("button", {
+        class: "btn btn-sm tl-restore", type: "button", text: "Restore to this state",
+        title: "Reverse every change after " + e.time + ", leaving the row as shown here",
+        onclick: () => {
+          const form = document.getElementById("recover-form");
+          if (form) aimUndoAtInstant(form, e.time);
+        },
+      }));
     }
+    node.append(acts);
     tl.append(node);
   });
   container.append(tl);
