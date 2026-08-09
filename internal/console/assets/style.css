@@ -114,15 +114,26 @@ button { font-family: inherit; }
 /* ============================================================
    shell: sidebar + main
    ============================================================ */
+/* grid-template-rows bounds the single row to the container. Without it the row
+   is auto-sized, and an auto row takes the tallest item's CONTENT height: .main
+   is a scroll container (automatic minimum size 0, so it never stretches the
+   row) but .side is not, so a sidebar taller than the viewport grew the row past
+   100vh and overflow:hidden clipped its footer off-screen with no way to scroll
+   to it (#1290). minmax(0, 1fr) makes the row exactly the container's height and
+   lets .side's own overflow handling take over. */
 #app {
   display: grid;
   grid-template-columns: var(--shell-w) 1fr;
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
 }
 
 .side {
   position: relative;
+  /* Definite height for the flex column below: without min-height:0 a grid item
+     refuses to shrink under its content, and .nav would never scroll. */
+  min-height: 0;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--line);
@@ -222,7 +233,27 @@ button { font-family: inherit; }
 .srv-manage svg { color: var(--ink-3); }
 
 /* nav */
-.nav { display: flex; flex-direction: column; gap: 0; margin-top: 2px; }
+/* The nav scrolls on its own so .side-foot (Docs, Log out, the stream/version
+   rows) stays pinned and reachable when the groups outgrow the viewport — an
+   extension view plus the Settings group overflows a laptop window at normal
+   zoom, and .side itself never scrolls (the shell clips). min-height:0 is what
+   lets a flex child shrink below its content height; without it the nav keeps
+   its full height and nothing scrolls.
+   The inline padding/negative-margin pair widens the scroller's padding box to
+   the sidebar's edges: setting overflow on one axis computes the other to auto,
+   which would clip .nav-item.active::before (it sits at left:-18px, outside the
+   content box, to draw the rail against the sidebar edge). */
+.nav {
+  display: flex; flex-direction: column; gap: 0; margin-top: 2px;
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding-inline: 18px; margin-inline: -18px;
+}
+.nav::-webkit-scrollbar { width: 11px; }
+.nav::-webkit-scrollbar-thumb {
+  background: var(--line); border-radius: 6px;
+  border: 3px solid var(--surface); background-clip: content-box;
+}
+.nav::-webkit-scrollbar-thumb:hover { background: var(--ink-4); border: 3px solid var(--surface); background-clip: content-box; }
 .nav-group { display: flex; flex-direction: column; gap: 2px; }
 .nav-group + .nav-group { margin-top: 16px; }
 .nav-label {
