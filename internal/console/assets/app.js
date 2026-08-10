@@ -3533,6 +3533,13 @@ function syncExtSettingsNav() {
       class: "nav-item",
       "data-extset-nav": "1",
       "data-route": route,
+      // settings:read is the visibility floor server-side, so the item hides
+      // under a session that lacks it — the same data-perm contract every
+      // built-in nav item uses. Without this the link stays lit for a scoped
+      // operator and the panel's first request answers 403. syncExtSettingsNav
+      // runs immediately before gatePermissions(), so these nodes are in the
+      // DOM when the sweep reads [data-perm].
+      "data-perm": "settings:read",
       href: "/" + route,
       onclick: (e) => { e.preventDefault(); pendingRecover = null; navigate(route); },
     }, icon("ext", "ni-icon"), el("span", { text: p.label })));
