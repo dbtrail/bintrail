@@ -81,6 +81,12 @@ type Config struct {
 	ShimConfig shim.Config
 	// Auth validates the per-tenant cleartext password (loaded from shim.yaml).
 	Auth shim.TenantAuth
+	// AllowedSchemas maps tenant username → allowed_schemas (#824/#1261),
+	// built with shim.UserAllowedSchemas from the same shim.yaml the MySQL
+	// front-end loads. A username ABSENT from the map is unrestricted, which
+	// is what an empty/omitted allowed_schemas means; nil disables the gate
+	// for every tenant.
+	AllowedSchemas map[string][]string
 	// Logger; nil → slog.Default().
 	Logger *slog.Logger
 	// MaxConns caps concurrent connections; 0 = unlimited.
@@ -210,8 +216,21 @@ func handleConn(ctx context.Context, c net.Conn, cfg Config, logger *slog.Logger
 	// the audit identity for every time-travel query on this connection is
 	// that tenant. Post-auth: user is only trustworthy here.
 	h.BindActor(user)
+	// Bind the tenant's allowed_schemas allowlist (#1261) BEFORE any schema is
+	// seeded, mirroring the MySQL front-end (internal/cli/shim.go handleConn).
+	// The enforcement point itself is session.resolve, on the parser-resolved
+	// target schema — the only place that sees every way a client can name one.
+	h.BindAllowedSchemas(cfg.AllowedSchemas[user])
 	// currentDB = the connect database param (the bintrail schema). Empty is
 	// allowed: queries must then schema-qualify the table (<schema>.<table>).
+	//
+	// A connect database outside the tenant's allowlist is deliberately NOT a
+	// startup refusal: denial belongs on the query, as a proper wire error the
+	// client can read, rather than a connection that dies during handshake. So
+	// the param still seeds session.currentDB and the per-query gate answers
+	// 42501 on the first real query. UseDB's error is discarded because h.db is
+	// unused on this front-end — session.currentDB is what Parse sees — and it
+	// now returns one whenever the allowlist excludes the connect database.
 	_ = h.UseDB(database)
 
 	sess := &session{be: be, h: h, currentDB: database, logger: logger}

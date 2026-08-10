@@ -691,19 +691,17 @@ func buildUserSchemas(tenantCfgs []shim.TenantConfig) map[string]string {
 	return out
 }
 
-// buildUserAllowedSchemas maps mysql_user → allowed_schemas for the
+// buildUserAllowedSchemas delegates to shim.UserAllowedSchemas, which the
+// PostgreSQL front-end also builds from (#1261) — one derivation, so the two
+// front-ends cannot disagree about who is restricted.
+//
+// Original doc: maps mysql_user → allowed_schemas for the
 // tenants that opted into schema isolation (#824). Tenants without the
 // field are simply absent — handleConn's map lookup then yields nil,
 // which Handler.BindAllowedSchemas treats as unrestricted (the exact
 // pre-#824 behaviour).
 func buildUserAllowedSchemas(tenantCfgs []shim.TenantConfig) map[string][]string {
-	out := make(map[string][]string)
-	for _, t := range tenantCfgs {
-		if len(t.AllowedSchemas) > 0 {
-			out[t.MySQLUser] = t.AllowedSchemas
-		}
-	}
-	return out
+	return shim.UserAllowedSchemas(tenantCfgs)
 }
 
 // tenantsWithoutAllowedSchemas lists the mysql_users that have no
@@ -713,13 +711,7 @@ func buildUserAllowedSchemas(tenantCfgs []shim.TenantConfig) map[string][]string
 // tenant's indexed history. Pure function so the classification is
 // unit-testable without a listener.
 func tenantsWithoutAllowedSchemas(tenantCfgs []shim.TenantConfig) []string {
-	var out []string
-	for _, t := range tenantCfgs {
-		if len(t.AllowedSchemas) == 0 {
-			out = append(out, t.MySQLUser)
-		}
-	}
-	return out
+	return shim.TenantsWithoutAllowedSchemas(tenantCfgs)
 }
 
 // handleConn wraps one accepted TCP connection in go-mysql/server's

@@ -81,6 +81,19 @@ func (s *session) resolve(qstr string) (cols []string, rows [][][]byte, tag stri
 			strings.TrimSpace(qstr))}
 	}
 
+	// Per-tenant schema authorization (#824/#1261), on the RESOLVED target
+	// schema — the same rule and the same call the MySQL front-end applies in
+	// HandleQuery. Parse fills q.Schema from the connect database for the
+	// virtual-schema shapes AND from an explicit `<schema>.<table>` on the bare
+	// AS OF form, so this one site covers every way a client can name a schema,
+	// with or without a prior selection.
+	//
+	// It runs BEFORE the PK check, matching the MySQL order: an unauthorized
+	// schema must not first be told whether its WHERE column is a PK.
+	if msg, deny := s.h.SchemaAuthzCheck(q.Schema); deny {
+		return nil, nil, "", &pgErr{"42501", msg}
+	}
+
 	// PK-column validation is shared with the MySQL front-end (#296/#821): a
 	// WHERE whose column is not the table's single-column PK is refused so a
 	// non-PK filter cannot silently return the wrong row.

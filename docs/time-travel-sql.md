@@ -216,6 +216,13 @@ any-schema behaviour, so existing configs are unaffected. When `shim.yaml`
 has more than one tenant and any of them lacks `allowed_schemas`, the shim
 logs a startup warning that cross-schema isolation is not enforced.
 
+**Both wire front-ends enforce it.** `bintrail-pg flashback` reads the same
+`shim.yaml` and applies the same allowlist to the same resolved target schema,
+including a fully qualified query that never selected a database; there the
+refusal is `SQLSTATE 42501` (`insufficient_privilege`) rather than MySQL 1044,
+and it is a query error — the connection stays usable. It emits the same
+multi-tenant startup warning.
+
 ---
 
 ## Step 2 — Install ProxySQL

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -105,6 +106,17 @@ func runFlashback(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Per-tenant schema isolation (#824/#1261), built from the same helper the
+	// MySQL shim uses. The startup warning mirrors it too: an operator who set
+	// allowed_schemas on some tenants can reasonably read the file as isolated,
+	// and silence there is how an unrestricted tenant goes unnoticed.
+	allowedSchemas := shim.UserAllowedSchemas(tenantCfgs)
+	if unrestricted := shim.TenantsWithoutAllowedSchemas(tenantCfgs); len(tenantCfgs) > 1 && len(unrestricted) > 0 {
+		slog.Warn(
+			"flashback: cross-schema isolation is NOT enforced for some tenants; any of them can query every schema in the index. Add allowed_schemas to each tenant in shim.yaml to isolate them",
+			"tenants", strings.Join(unrestricted, ", "))
+	}
+
 	db, err := config.Connect(fbIndexDSN)
 	if err != nil {
 		return fmt.Errorf("connect to index: %w", err)
@@ -168,9 +180,10 @@ func runFlashback(cmd *cobra.Command, args []string) error {
 			BaselineS3:   fbBaselineS3,
 			QueryTimeout: fbQueryTimeout,
 		},
-		Auth:     auth,
-		Logger:   slog.Default(),
-		MaxConns: fbMaxConns,
+		Auth:           auth,
+		AllowedSchemas: allowedSchemas,
+		Logger:         slog.Default(),
+		MaxConns:       fbMaxConns,
 	}
 	return pgshim.Serve(ctx, listener, cfg)
 }
