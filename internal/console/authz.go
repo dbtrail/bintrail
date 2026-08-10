@@ -116,6 +116,9 @@ var apiRoutePerms = []routePerm{
 	{"PUT", "/api/rotation", ext.PermServersWrite},
 	{"GET", "/api/baselines", ext.PermSettingsRead},
 	{"GET", "/api/storage", ext.PermSettingsRead},
+	// Data-profile NAMES on the selected server — access-control vocabulary
+	// for administration panels (settings-surface pickers), not row data.
+	{"GET", "/api/profiles", ext.PermSettingsRead},
 	// views.sql is a Settings/Storage artifact: it names paths and column
 	// names, never row data, so it reads like the storage panel it is offered
 	// from rather than like an events read.

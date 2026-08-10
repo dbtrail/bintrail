@@ -504,6 +504,7 @@ func (s *Server) buildHandler() http.Handler {
 	// is inside the handler, like the monitor/baseline-trigger verbs.
 	api.HandleFunc("POST /api/sql", s.recordAction("sql", s.handleSQLPanel))
 	api.HandleFunc("GET /api/storage", s.handleStorageInfo)
+	api.HandleFunc("GET /api/profiles", s.handleProfiles)
 	// Usage-telemetry opt-out: read the machine-wide state, and toggle it (a
 	// local config write, not a data write). Available on any console; the UI
 	// surfaces it on the watch daemon that actually beacons.
