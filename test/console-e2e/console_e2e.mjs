@@ -482,15 +482,27 @@ try {
       const btn = box ? Array.from(box.querySelectorAll("button")).find((b) => /Refresh schema snapshot/.test(b.textContent)) : null;
       return !!btn;
     };
-    const onRegistry = registryServer ? probe(registryServer.id) : null;
-    const onBoot = probe("default");
-    currentServer = before;
-    return { capOn: !!capsCache.schema_snapshot_trigger, onRegistry, onBoot };
+    try {
+      return {
+        capOn: !!capsCache.schema_snapshot_trigger,
+        // Reported, not assumed: with no registry server the button check would
+        // otherwise pass by testing nothing.
+        foundRegistryServer: !!registryServer,
+        onRegistry: registryServer ? probe(registryServer.id) : false,
+        onBoot: probe("default"),
+      };
+    } finally {
+      // Restore even on a throw: page.evaluate throwing crashes this harness,
+      // but a half-restored selection would silently point every later scenario
+      // at the wrong server.
+      currentServer = before;
+    }
   });
   capBtn.capOn ? ok("capture health: schema_snapshot_trigger capability reaches the frontend") : bad("capture health: schema_snapshot_trigger capability reaches the frontend", "capsCache.schema_snapshot_trigger falsy");
-  (capBtn.onRegistry === null || capBtn.onRegistry)
+  (capBtn.foundRegistryServer && capBtn.onRegistry)
     ? ok("capture health: Refresh-schema-snapshot button renders for a registry server")
-    : bad("capture health: Refresh-schema-snapshot button renders for a registry server", "no button in the banner");
+    : bad("capture health: Refresh-schema-snapshot button renders for a registry server",
+      capBtn.foundRegistryServer ? "no button in the banner" : "no registry server in the fixture — the check tested nothing");
   !capBtn.onBoot ? ok("capture health: no Refresh button for the command-line entry") : bad("capture health: no Refresh button for the command-line entry", "offered an action the endpoint refuses");
 
   // Scenario 9 — Storage page AWS-credentials card (#681). credentialsCard is

@@ -2343,13 +2343,20 @@ async function refreshSchemaSnapshot(id, btn) {
     return;
   }
   let msg = "Schema snapshot updated: " + (done.tables || 0) + " table(s).";
+  // Never assert WHICH state capture ended in when the reload failed: the
+  // reload can fail with the old stream still running (registry gone) or with
+  // it stopped (it did not shut down in time). Print the daemon's own account
+  // instead of guessing — "still using the previous snapshot" would be a lie
+  // for the stopped case.
   msg += done.stream_reloaded
     ? " Capture restarted on it."
-    : " Capture is STILL using the previous snapshot" + (done.reload_error ? " (" + done.reload_error + ")" : "") + ".";
+    : " Capture did NOT restart onto it — " + (done.reload_error || "restart this server's capture to pick it up") + ".";
   if ((done.excluded_tables || []).length) {
     msg += " Still not captured (no primary key / not InnoDB): " + done.excluded_tables.join(", ") + ".";
   }
-  msg += " Events already skipped stay missing.";
+  // The banner is driven by a monotonic tally, so it stays up after a working
+  // fix. Say so here or the operator concludes the button did nothing.
+  msg += " Events already skipped stay missing, and this warning stays up — it counts skips that happened.";
   toast(msg);
   renderStatus();
 }

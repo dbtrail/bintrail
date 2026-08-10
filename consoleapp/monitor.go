@@ -85,6 +85,11 @@ var (
 	monitorBackoffBase  = 15 * time.Second
 	monitorBackoffCap   = 5 * time.Minute
 	monitorHealthyReset = 10 * time.Minute
+	// monitorReloadDrainTimeout: how long ReloadSchema waits for a cancelled
+	// stream to release its advisory lock before giving up. Start's GET_LOCK
+	// has a ZERO timeout, so relaunching early fails outright instead of
+	// queueing — waiting is the only way to hand the lock over.
+	monitorReloadDrainTimeout = 15 * time.Second
 )
 
 // monitorJob is one supervised stream.
@@ -623,9 +628,12 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 // stream_state.gap_lost_at untouched — Start then re-hydrates lost_position
 // from it, so the alarm survives.
 //
-// A server this process does not supervise is a no-op success: there is no
-// stream here to reload, and the snapshot it was called for is still valid.
-func (m *monitorSupervisor) ReloadSchema(ctx context.Context, e console.ServerEntry) error {
+// reloaded is false with a nil error when this process does not supervise the
+// entry: there is no stream here to reload, which is not an error (the snapshot
+// it was called for is still valid) but must never be reported as a restart —
+// the entry may well be captured by another process, still decoding against the
+// old snapshot.
+func (m *monitorSupervisor) ReloadSchema(ctx context.Context, e console.ServerEntry) (reloaded bool, err error) {
 	m.mu.Lock()
 	job, ok := m.jobs[e.ID]
 	if ok {
@@ -633,20 +641,44 @@ func (m *monitorSupervisor) ReloadSchema(ctx context.Context, e console.ServerEn
 	}
 	m.mu.Unlock()
 	if !ok {
-		return nil
+		return false, nil
+	}
+	// restore re-publishes the job on the paths that do not relaunch. Being
+	// absent from m.jobs is not merely a wrong Status: ActiveJobs feeds the
+	// rotation provider, so a dropped entry stops having its per-source index
+	// archived and pruned — silently, with not even the per-cycle warning a
+	// terminally-failed job keeps producing.
+	restore := func() {
+		m.mu.Lock()
+		if _, taken := m.jobs[e.ID]; !taken {
+			m.jobs[e.ID] = job
+		}
+		m.mu.Unlock()
 	}
 	job.cancel()
-	// Wait for the run goroutine to finish: its outermost defer closes done
-	// AFTER releasing the advisory lock, so starting before it lands would make
-	// the new job block on the old one's lock.
+	// Wait for the run goroutine to finish before relaunching. Its outermost
+	// defer closes done AFTER closing lockDB, and Start takes the advisory lock
+	// with GET_LOCK(name, 0) — a zero timeout. Starting early would therefore
+	// not queue behind the dying stream, it would FAIL to get the lock and mark
+	// the new job terminally failed, with no retry loop to converge later.
+	//
+	// The two non-success branches leave this entry's capture STOPPED: the job
+	// is already cancelled and unpublished, and nothing here restarts it. That
+	// is reported, not smoothed over — an operator who pressed a refresh button
+	// must not be left believing capture is running when it is not.
 	select {
 	case <-job.done:
-	case <-time.After(15 * time.Second):
-		return errors.New("stream did not stop within 15s; it will finish shutting down in the background — start it again to load the new schema snapshot")
+	case <-time.After(monitorReloadDrainTimeout):
+		restore()
+		return false, errors.New("the stream did not stop in time, so capture for this server is now stopping and was NOT restarted; it is still shutting down in the background — press Start once it has, to resume on the new schema snapshot")
 	case <-ctx.Done():
-		return ctx.Err()
+		restore()
+		return false, fmt.Errorf("capture for this server was stopped and could not be restarted: %w", ctx.Err())
 	}
-	return m.Start(ctx, e)
+	if err := m.Start(ctx, e); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Stop implements console.MonitorController. Idempotent; waits briefly for

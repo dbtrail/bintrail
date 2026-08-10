@@ -487,8 +487,10 @@ the binlog — requires `binlog_format=ROW`). Routine skips of system schemas
 the snapshot deliberately excludes (e.g. RDS's `mysql.rds_heartbeat2`) are
 **not** counted.
 
-For `statement_format_dml` the daemon also stamps the most recent drop's
-**attribution** — binlog file:pos, statement keyword, and connection id, enough
+For `statement_format_dml` and the table-attributed reasons above the daemon
+also stamps the most recent drop's
+**attribution** — binlog file:pos, and for statement DML the statement keyword
+and connection id, enough
 to hunt the offending client without ever storing the statement text (it embeds
 row values). The DEGRADED block then adds a `Last drop:` line, e.g.
 `Last drop:       binlog.000042:99012 (UPDATE, connection id 55)`.

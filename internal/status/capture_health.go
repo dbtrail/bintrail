@@ -61,6 +61,15 @@ func ExplainCaptureSkips(skips map[string]CaptureSkipStat) []string {
 	lines = append(lines, "None of this recovers what was already skipped: those changes are absent "+
 		"from the index for good unless the source still has the binlogs covering that window, in "+
 		"which case `bintrail index --binlog-dir <dir> --files <file>` can re-read them.")
+	// Say that the verdict itself persists. The tallies are monotonic and
+	// re-seeded across restarts precisely so a skip episode cannot be laundered
+	// away by a restart — which means a WORKING fix does not turn this banner
+	// green, and an operator who does not know that concludes the fix failed and
+	// applies it again.
+	lines = append(lines, "This warning does not clear on its own: the tally counts skips that happened, "+
+		"not skips still happening, so it stays after a successful fix. Confirm the fix by watching the "+
+		"count stop rising; to reset the tally, stop capture for this source and clear "+
+		"stream_state.capture_skips in its index.")
 	lines = append(lines, logLine(active[0]))
 	return lines
 }
