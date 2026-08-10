@@ -67,6 +67,7 @@ let serverGen = 0;            // bumped on every server switch (staleness guard)
 let viewGen = 0;              // bumped on every route render (staleness guard)
 let capsCache = {};           // last /api/capabilities for the selected server
 let extViews = [];            // extension views advertised for the selected server (embedding builds)
+let extSettings = [];         // extension settings panels advertised for this SESSION (permission-gated, not per-server)
 let lastSQL = "";             // last generated undo SQL (for copy/download)
 let lastEvents = [];          // last rendered (filtered, capped) event page
 let pendingRecover = null;    // event context carried into Recover via "Undo"
@@ -620,6 +621,11 @@ function viewEnter() { const v = VIEW(); v.classList.remove("view-enter"); void 
 // caller redirects to overview), the same gating Time-travel/Storage get.
 function isKnownRoute(route) {
   if (ROUTES.includes(route)) return true;
+  // "extset-<id>" is checked first: it does NOT start with "ext-" (the fourth
+  // character is "s", not "-"), so the two families never claim each other's
+  // routes, and a panel the session may not reach is unknown here exactly like
+  // an unadvertised view.
+  if (route.startsWith("extset-")) return extSettings.some((p) => "extset-" + p.id === route);
   return route.startsWith("ext-") && extViews.some((v) => "ext-" + v.id === route);
 }
 
@@ -664,6 +670,10 @@ function renderRoute() {
   // Extension views (embedding builds): "ext-<id>" dispatches to the provider's
   // frontend module. routeFromLocation already redirected an unknown/ungated
   // ext route to overview, so a match here is always a live view.
+  if (route.startsWith("extset-")) {
+    const panel = extSettings.find((p) => "extset-" + p.id === route);
+    return panel ? renderExtensionSettings(panel) : renderOverview();
+  }
   if (route.startsWith("ext-")) {
     const view = extViews.find((v) => "ext-" + v.id === route);
     return view ? renderExtensionView(view) : renderOverview();
@@ -3422,7 +3432,9 @@ async function gateCapabilities() {
   // stock binary and under any active profile — the backend omits them there).
   // Rebuild the nav before the route renders so a deep-linked ext route resolves.
   extViews = Array.isArray(capsCache.extension_views) ? capsCache.extension_views : [];
+  extSettings = Array.isArray(capsCache.extension_settings) ? capsCache.extension_settings : [];
   syncExtNav();
+  syncExtSettingsNav();
   $all("[data-capability]").forEach((node) => node.classList.toggle("cap-on", !!capsCache[node.dataset.capability]));
   gatePermissions();
   applyAuthGate();
@@ -3504,6 +3516,55 @@ function syncExtNav() {
 // captured before the dynamic import and re-checked after: a server switch
 // mid-import abandons the render (no cross-server paint), matching every other
 // async view here.
+// syncExtSettingsNav rebuilds the extension settings-panel nav items inside the
+// existing Settings group (not a group of their own: a panel administers the
+// console, so it belongs where Connect AI and Storage already are). Idempotent —
+// the previously injected items are removed first, so a capabilities refresh
+// after a server switch or a re-login never accumulates duplicates.
+function syncExtSettingsNav() {
+  $all("[data-extset-nav]").forEach((n) => n.remove());
+  if (!extSettings.length) return;
+  const anchor = $('.nav-item[data-route="connect"]');
+  const group = anchor ? anchor.closest(".nav-group") : null;
+  if (!group) return;
+  for (const p of extSettings) {
+    const route = "extset-" + p.id;
+    group.append(el("a", {
+      class: "nav-item",
+      "data-extset-nav": "1",
+      "data-route": route,
+      href: "/" + route,
+      onclick: (e) => { e.preventDefault(); pendingRecover = null; navigate(route); },
+    }, icon("ext", "ni-icon"), el("span", { text: p.label })));
+  }
+}
+
+// renderExtensionSettings mounts a settings panel's ES module. Same contract as
+// renderExtensionView, with the panel's own data prefix — the two surfaces are
+// authorized differently server-side (settings:read/write vs extview:read), so
+// handing a panel the view's apiBase would send its requests through the wrong
+// gate and 403.
+async function renderExtensionSettings(panel) {
+  const gen = serverGen;
+  const v = VIEW();
+  clear(v);
+  v.append(pageHead(panel.label, null));
+  const mount = el("div", { class: "ext-view-mount" });
+  v.append(mount);
+  try {
+    const mod = await import(panel.script);
+    if (gen !== serverGen) return;
+    if (!mod || typeof mod.render !== "function") {
+      renderError(mount, "This settings panel did not export a render() function.");
+      return;
+    }
+    mod.render(mount, { apiBase: "/api/ext-settings/" + panel.id + "/", api });
+  } catch (err) {
+    if (gen !== serverGen) return;
+    renderError(mount, err);
+  }
+}
+
 async function renderExtensionView(view) {
   const gen = serverGen;
   const v = VIEW();

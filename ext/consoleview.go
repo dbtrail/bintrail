@@ -120,22 +120,66 @@ var consoleViewIDRE = regexp.MustCompile(`^[a-z0-9-]+$`)
 // provider that fails, rather than mounting a malformed route.
 func ValidConsoleViewID(id string) bool { return consoleViewIDRE.MatchString(id) }
 
-// consoleView is nil in the OSS build — the console ships no extension views.
+// consoleView is the ORIGINAL single-provider slot, kept because an embedding
+// build already calls SetConsoleView. Nil in the OSS build — the console ships
+// no extension views.
 var consoleView ConsoleViewProvider
 
-// SetConsoleView installs the process-wide console extension-view provider.
-// Call once from main() before command dispatch, like SetConsoleAuth: the
-// console reads it when the server is constructed, so a later install is never
-// picked up. A bad ID is not rejected here — the console validates it at mount
-// time and skips the provider — so this setter cannot panic on a caller's typo.
+// registeredConsoleViews holds the providers installed additively through
+// RegisterConsoleView. Separate from the slot above so SetConsoleView keeps its
+// documented replace-the-slot behavior (an existing caller that installs twice
+// must not suddenly mount two copies) while a new caller can install alongside
+// one without knowing whether the slot is taken. Empty in the OSS build.
+var registeredConsoleViews []ConsoleViewProvider
+
+// SetConsoleView installs the process-wide console extension-view provider in
+// the legacy single slot, replacing whatever was there (nil clears it). Call
+// once from main() before command dispatch, like SetConsoleAuth: the console
+// reads it when the server is constructed, so a later install is never picked
+// up. A bad ID is not rejected here — the console validates it at mount time and
+// skips the provider — so this setter cannot panic on a caller's typo.
+//
+// Prefer RegisterConsoleView for new code: this setter can hold exactly one
+// provider, so two independent installs silently reduce to whichever ran last.
 func SetConsoleView(p ConsoleViewProvider) {
 	consoleView = p
 }
 
-// ConsoleView returns the installed provider, or nil when none is installed
-// (the OSS build).
+// ConsoleView returns the provider installed in the legacy slot, or nil when
+// none is (the OSS build). It does NOT see providers installed with
+// RegisterConsoleView — a caller that must act on every installed view (the
+// console's mount and capabilities paths do) must range over ConsoleViews.
 func ConsoleView() ConsoleViewProvider {
 	return consoleView
+}
+
+// RegisterConsoleView installs an additional console extension-view provider.
+// Additive by contract: two calls install two views, which is the whole reason
+// this exists next to SetConsoleView. Call from main() before command dispatch
+// — the console reads the registry when the server is constructed. A nil
+// provider is ignored rather than appended, so an unconditional call in a build
+// that computed no provider cannot produce a nil-dereference at mount time.
+//
+// IDs are neither validated nor deduplicated here (a setter that panicked on a
+// caller's typo would take down the daemon at startup); the console skips an
+// invalid or already-mounted ID at mount time and logs it.
+func RegisterConsoleView(p ConsoleViewProvider) {
+	if p == nil {
+		return
+	}
+	registeredConsoleViews = append(registeredConsoleViews, p)
+}
+
+// ConsoleViews returns every installed extension-view provider — the legacy slot
+// first, then the registered ones in install order — as a fresh slice the caller
+// may keep. Empty in the OSS build. The order is stable so the console's nav
+// items do not shuffle between restarts.
+func ConsoleViews() []ConsoleViewProvider {
+	out := make([]ConsoleViewProvider, 0, len(registeredConsoleViews)+1)
+	if consoleView != nil {
+		out = append(out, consoleView)
+	}
+	return append(out, registeredConsoleViews...)
 }
 
 // Content-Security-Policy invariant: the console sets NO Content-Security-Policy

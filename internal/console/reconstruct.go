@@ -99,7 +99,16 @@ type capabilitiesResponse struct {
 	// nav item that would 403). The SPA reveals one nav item + route ("ext-<id>")
 	// per entry. Generic by construction — the core names no specific view.
 	ExtensionViews []extensionViewDTO `json:"extension_views,omitempty"`
-	Auth           authCapsInfo       `json:"auth"`
+	// ExtensionSettings lists administration panels contributed by an installed
+	// settings-panel provider. Omitted in the stock binary (no provider) and for a
+	// session whose policy lacks settings:read (its data routes would 403, so
+	// advertising the nav item would be a lie). NOT suppressed under a data
+	// profile, unlike ExtensionViews: a panel reads no row data, so the profile is
+	// not what gates it — the permission is. The SPA reveals one Settings nav item
+	// + route ("extset-<id>") per entry. Generic by construction — the core names
+	// no specific panel.
+	ExtensionSettings []extensionViewDTO `json:"extension_settings,omitempty"`
+	Auth              authCapsInfo       `json:"auth"`
 	// Permissions is this session's effective grant of every permission the core
 	// defines, for the SPA to gate its UI (hide tabs/buttons a scoped session
 	// cannot use). All-true for a policy-less session — the static token, the
@@ -137,10 +146,13 @@ type authCapsInfo struct {
 	AuthKind    string `json:"auth_kind"` // "token" | "session"
 }
 
-// extensionViewDTO is the wire view of one console view contributed by an
-// installed ext.ConsoleViewProvider. id keys the nav item, the SPA route
-// ("ext-"+id), and the "/api/ext/<id>/" data mount; script is the ES module the
-// SPA import()s and calls render(mount, {apiBase, api}) on.
+// extensionViewDTO is the wire view of one console surface contributed by an
+// installed ext provider — a data view (ext.ConsoleViewProvider) or an
+// administration panel (ext.ConsoleSettingsProvider); the two carry the same
+// three fields, and which list a DTO appears in tells the SPA which route and
+// data prefix to build. id keys the nav item, the SPA route ("ext-"+id or
+// "extset-"+id), and the matching data mount; script is the ES module the SPA
+// import()s and calls render(mount, {apiBase, api}) on.
 type extensionViewDTO struct {
 	ID     string `json:"id"`
 	Label  string `json:"label"`
@@ -227,9 +239,21 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	// routes would 403 (authzMiddleware), so advertising the nav item to such
 	// a session would be a lie. Allows is nil-safe (nil policy = full access),
 	// so OSS sessions are unaffected.
-	if p := ext.ConsoleView(); p != nil && !s.profileActiveFor(r) &&
-		policyFrom(r.Context()).Allows(ext.PermExtViewRead) && ext.ValidConsoleViewID(p.ID()) {
-		resp.ExtensionViews = []extensionViewDTO{{ID: p.ID(), Label: p.Label(), Script: p.Script()}}
+	if !s.profileActiveFor(r) && policyFrom(r.Context()).Allows(ext.PermExtViewRead) {
+		for _, p := range mountableExtensions(ext.ConsoleViews(), "view", false) {
+			resp.ExtensionViews = append(resp.ExtensionViews, extensionViewDTO{ID: p.ID(), Label: p.Label(), Script: p.Script()})
+		}
+	}
+	// Extension settings panels (ext seam): advertised on the SAME condition their
+	// data routes are reachable — the session holds settings:read — and NOT
+	// suppressed under a data profile, because a panel administers configuration
+	// rather than serving row data, so the profile gate that hides an extension
+	// view does not apply. A session holding neither settings permission simply
+	// sees no panel instead of a nav item that 403s.
+	if policyFrom(r.Context()).Allows(ext.PermSettingsRead) {
+		for _, p := range mountableExtensions(ext.ConsoleSettings(), "settings panel", false) {
+			resp.ExtensionSettings = append(resp.ExtensionSettings, extensionViewDTO{ID: p.ID(), Label: p.Label(), Script: p.Script()})
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

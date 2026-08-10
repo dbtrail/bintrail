@@ -555,24 +555,37 @@ func (s *Server) buildHandler() http.Handler {
 	if p := ext.ConsoleAuth(); p != nil {
 		root.Handle(extAuthPrefix, p.Handler(extAuthPrefix, s.extSessionIssuer()))
 	}
-	// Extension view (ext seam): an embedding distribution can contribute one
-	// additional console view. Its static assets mount UNAUTHENTICATED on root at
-	// /ext/<id>/ (behind hostGuard + securityHeaders only — code always ships,
-	// only data is gated), and its data routes mount on the inner api mux at
-	// /api/ext/<id>/ so they inherit tokenMiddleware, wrapped in rbacViewGuard so
-	// the whole surface is refused (403) while an RBAC profile is active. The id
-	// flows into both URL paths and a DOM route, so an invalid one is skipped
-	// (logged, not mounted) rather than producing a broken/injectable route.
-	if p := ext.ConsoleView(); p != nil {
-		id := p.ID()
-		if !ext.ValidConsoleViewID(id) {
-			slog.Error("console: ignoring extension view with an invalid id (must match ^[a-z0-9-]+$)", "id", id)
-		} else {
-			staticPrefix := "/ext/" + id + "/"
-			dataPrefix := "/api/ext/" + id + "/"
-			root.Handle(staticPrefix, p.StaticHandler(staticPrefix))
-			api.Handle(dataPrefix, s.rbacViewGuard(p.DataHandler(dataPrefix, s.consoleQueryContext)))
-		}
+	// Extension views (ext seam): an embedding distribution can contribute
+	// additional console views. Each one's static assets mount UNAUTHENTICATED on
+	// root at /ext/<id>/ (behind hostGuard + securityHeaders only — code always
+	// ships, only data is gated), and its data routes mount on the inner api mux
+	// at /api/ext/<id>/ so they inherit tokenMiddleware, wrapped in rbacViewGuard
+	// so the whole surface is refused (403) while an RBAC profile is active. The
+	// id flows into both URL paths and a DOM route, so an invalid or duplicate one
+	// is skipped by mountableExtensions (logged, not mounted) rather than
+	// producing a broken/injectable route or panicking this mux on a repeated
+	// pattern.
+	for _, p := range mountableExtensions(ext.ConsoleViews(), "view", true) {
+		staticPrefix := "/ext/" + p.ID() + "/"
+		dataPrefix := "/api/ext/" + p.ID() + "/"
+		root.Handle(staticPrefix, p.StaticHandler(staticPrefix))
+		api.Handle(dataPrefix, s.rbacViewGuard(p.DataHandler(dataPrefix, s.consoleQueryContext)))
+	}
+	// Extension settings panels (ext seam): the administration sibling of the
+	// views above, mounted at /ext-settings/<id>/ (static, unauthenticated) and
+	// /api/ext-settings/<id>/ (data, behind tokenMiddleware and then
+	// authzMiddleware, which requires settings:read to GET and settings:write to
+	// mutate). NOT wrapped in rbacViewGuard, unlike a view: a panel gets no
+	// database — only the caller's identity and grants — so the redaction concern
+	// that withholds the view surface under a data profile does not apply, and
+	// refusing it there would lock out the very administrator who carries a
+	// profile. The first segment differs from the view mounts, so a panel and a
+	// view may share an id without colliding.
+	for _, p := range mountableExtensions(ext.ConsoleSettings(), "settings panel", true) {
+		staticPrefix := "/ext-settings/" + p.ID() + "/"
+		dataPrefix := "/api/ext-settings/" + p.ID() + "/"
+		root.Handle(staticPrefix, p.StaticHandler(staticPrefix))
+		api.Handle(dataPrefix, p.DataHandler(dataPrefix, s.consoleSettingsContext))
 	}
 	// credential on all other /api/* (tokenMiddleware), then per-session
 	// authorization (authzMiddleware). authz is inert for policy-less sessions —

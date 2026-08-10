@@ -37,8 +37,15 @@ const (
 	// PermServersDelete — remove a server registry entry.
 	PermServersDelete Permission = "servers:delete"
 	// PermSettingsRead — reach the settings/administration surfaces (storage and
-	// baseline listings, telemetry opt-out, the managed MCP token).
+	// baseline listings, telemetry opt-out, the managed MCP token) and READ an
+	// installed settings panel's data routes.
 	PermSettingsRead Permission = "settings:read"
+	// PermSettingsWrite — MUTATE through a settings surface. Split from
+	// PermSettingsRead because an administration panel (ConsoleSettingsProvider)
+	// can change configuration for everyone, so a session that may inspect the
+	// settings surface must not thereby be able to rewrite it — the read-only
+	// auditor role is the case this exists for.
+	PermSettingsWrite Permission = "settings:write"
 	// PermExtViewRead — reach an installed extension view's data routes.
 	PermExtViewRead Permission = "extview:read"
 )
@@ -56,6 +63,7 @@ var allPermissions = []Permission{
 	PermServersWrite,
 	PermServersDelete,
 	PermSettingsRead,
+	PermSettingsWrite,
 	PermExtViewRead,
 }
 

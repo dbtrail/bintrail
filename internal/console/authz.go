@@ -41,8 +41,9 @@ type routePerm struct {
 // a route with a literal segment where another has a placeholder must be listed
 // FIRST (e.g. POST /api/servers/test before a hypothetical POST /api/servers/{}).
 // TestRouteTableCompleteness pins that every registered /api route appears here;
-// TestRoutePermFirstMatchWins pins the ordering invariant. The /api/ext/ subtree
-// is NOT here — it is matched by prefix in permForRoute (its depth is unbounded).
+// TestRoutePermFirstMatchWins pins the ordering invariant. The /api/ext/ and
+// /api/ext-settings/ subtrees are NOT here — they are matched by prefix in
+// permForRoute (their depth is unbounded).
 //
 // Permission tiers (an EE build's roles map onto these): status:read and
 // servers:read are the read-only floor; query/reconstruct read data; recover and
@@ -116,12 +117,49 @@ var apiRoutePerms = []routePerm{
 // row. rbacViewGuard additionally refuses it under an active data profile.
 const extAPIPrefix = "/api/ext/"
 
+// extSettingsAPIPrefix is the mount prefix for an installed settings panel's
+// data routes (see ext.ConsoleSettingsProvider). Like the view subtree its depth
+// is unbounded, so it is prefix-matched rather than given apiRoutePerms rows —
+// but unlike the view subtree it is NOT wrapped in rbacViewGuard: a panel is
+// handed no database, so the "a third-party handler may not honor redaction"
+// reasoning that withholds the view surface under a data profile does not reach
+// it, and blanket-refusing it would lock out the profile-carrying administrator
+// the panel exists for. Permission is the gate here, per method (see
+// extSettingsPerm).
+const extSettingsAPIPrefix = "/api/ext-settings/"
+
+// extSettingsPerm classifies a settings-panel data route by HTTP METHOD: GET and
+// HEAD need settings:read, every other method needs settings:write. The core
+// classifies rather than asking the provider because a provider cannot be
+// trusted to declare its own routes read-only, and the method is the one thing
+// the core can see without running the handler. Anything not explicitly a read
+// falls to the write permission — the same fail-closed posture as an
+// unclassified route, so a method nobody thought about (PATCH, a WebDAV verb)
+// is never the cheap way to mutate with a read-only grant.
+//
+// What this CANNOT catch: a provider that mutates state on GET. That is a bug in
+// the provider, invisible to the core, and the seam's doc comment says so.
+func extSettingsPerm(method string) ext.Permission {
+	if method == http.MethodGet || method == http.MethodHead {
+		return ext.PermSettingsRead
+	}
+	return ext.PermSettingsWrite
+}
+
 // permForRoute returns the permission a (method, path) requires and whether the
 // route is classified at all. An unclassified route (classified=false) is a
 // programming error — every registered /api route must appear in apiRoutePerms
-// or under the ext prefix — and authzMiddleware fails it CLOSED for a policy
-// session rather than granting it.
+// or under one of the ext prefixes — and authzMiddleware fails it CLOSED for a
+// policy session rather than granting it.
 func permForRoute(method, path string) (perm ext.Permission, classified bool) {
+	// Checked before extAPIPrefix would be: "/api/ext-settings/" does not share
+	// that prefix today ("/api/ext/" ends in a slash), but the two live one
+	// character apart, so ordering them explicitly keeps a future edit to either
+	// constant from silently routing every settings write through the view
+	// permission.
+	if strings.HasPrefix(path, extSettingsAPIPrefix) {
+		return extSettingsPerm(method), true
+	}
 	if strings.HasPrefix(path, extAPIPrefix) {
 		return ext.PermExtViewRead, true
 	}
