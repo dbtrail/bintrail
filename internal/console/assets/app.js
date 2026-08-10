@@ -1481,7 +1481,11 @@ async function exportEvents(kind, btn) {
     const rows = refineEvents(data.events || [], evLastQuery.refine);
     if (kind === "csv") downloadEventsCSV(rows); else downloadEventsJSON(rows);
     if (data.has_more) {
-      toast("Exported the newest " + data.count + " matches — the search has more. Narrow it with a time range to export the rest.");
+      // rows.length, not data.count: the client-side refine runs after the
+      // fetch, so naming the server's count would report a number that is not
+      // the row count of the file just downloaded — the same species of
+      // misleading figure this whole change set out to remove.
+      toast("Exported the newest " + rows.length + " matches — the search has more. Narrow it with a time range to export the rest.");
     }
   } catch (err) {
     toast("Export failed: " + (err && err.message ? err.message : String(err)));
