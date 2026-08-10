@@ -104,9 +104,12 @@ type capabilitiesResponse struct {
 	// session whose policy lacks settings:read (its data routes would 403, so
 	// advertising the nav item would be a lie). NOT suppressed under a data
 	// profile, unlike ExtensionViews: a panel reads no row data, so the profile is
-	// not what gates it — the permission is. The SPA reveals one Settings nav item
-	// + route ("extset-<id>") per entry. Generic by construction — the core names
-	// no specific panel.
+	// not what gates it — the permission is. settings:read is the VISIBILITY
+	// floor: a session granted settings:write alone could still POST to a panel
+	// (that route requires the write permission, and it holds it) but would never
+	// be shown the nav item, so a write-without-read role is not a supported
+	// shape. The SPA reveals one Settings nav item + route ("extset-<id>") per
+	// entry. Generic by construction — the core names no specific panel.
 	ExtensionSettings []extensionViewDTO `json:"extension_settings,omitempty"`
 	Auth              authCapsInfo       `json:"auth"`
 	// Permissions is this session's effective grant of every permission the core
