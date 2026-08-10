@@ -104,10 +104,17 @@ and searching events:
 2. **Events** — a smart search box (free text plus `type:`, `pk:`, `col:`, and
    `schema.table` tokens) with an expandable **Filters** panel. Each row expands
    in place to a before→after diff; `j`/`k` move the cursor, `↵` expands, `u`
-   jumps to Recover. Results carry **JSON / CSV** export — client-side over the
-   rows already on screen, so it stays within the result caps. Rows and exports
-   include `connection_id` (the transaction's originating thread number) but
-   never `query_text`/`query_hash`.
+   jumps to Recover. Results are **paged**: `‹ Newer` / `Older ›` walk the
+   stream a page at a time, and the header states where you are
+   (`showing 1–100 of more`, or `showing 201–247 of 247 (end)` once you reach
+   the bottom) rather than restating the page size. Paging is keyset-based —
+   the cost of page 40 is the cost of page 1 — and each page is still bound by
+   the same result cap; editing any filter returns you to page 1.
+   **Export JSON / Export CSV** export *every match of the current search*, up
+   to the endpoint's 1000-event cap, not just the page on screen; if the search
+   has more than that, the console says so instead of handing you a silent
+   prefix. Rows and exports include `connection_id` (the transaction's
+   originating thread number) but never `query_text`/`query_hash`.
 3. **Time-travel** — single-row point-in-time reconstruct, drawn as a timeline
    (baseline snapshot → each change, with a **Restore to this state** jump to
    Recover). Appears **only when a baseline is configured**

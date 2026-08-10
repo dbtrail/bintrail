@@ -36,6 +36,10 @@ const EVENT_CSV_COLUMNS = [
 ];
 
 // event_type → badge modifier class.
+// Ceiling for an Events export (#1297). Must track eventsMaxLimit in
+// internal/console/api.go — the server clamps to it regardless, so a larger
+// number here would only make the UI promise more than it delivers.
+const EVENT_EXPORT_MAX = 1000;
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
@@ -70,6 +74,16 @@ let extViews = [];            // extension views advertised for the selected ser
 let extSettings = [];         // extension settings panels advertised for this SESSION (permission-gated, not per-server)
 let lastSQL = "";             // last generated undo SQL (for copy/download)
 let lastEvents = [];          // last rendered (filtered, capped) event page
+// Events keyset paging (#1297). evPages[k] is the `before` cursor that opens
+// page k (page 0 opens with none) plus how many events precede it, so the
+// header can say "showing 201–300" without an OFFSET. Cursors are echoed back
+// from the server, never built here.
+let evPages = [{ before: null, offset: 0 }];
+let evPageIdx = 0;
+// The last Events request (API params + client-side refine terms), captured so
+// Export can re-run the SAME search across every page instead of dumping only
+// the page on screen. See exportEvents.
+let evLastQuery = null;
 let pendingRecover = null;    // event context carried into Recover via "Undo"
 let schemaCache = null;       // cached schema list for the selected server
 const tablesCache = new Map();// schema → tables[]
@@ -1041,10 +1055,21 @@ function renderEvents(params) {
   bar.append(el("span", { class: "kbd-hint" },
     el("b", { text: "j" }), "/", el("b", { text: "k" }), " move · ",
     el("b", { text: "↵" }), " expand · ", el("b", { text: "u" }), " undo"));
-  bar.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "JSON",
-    onclick: () => downloadEventsJSON(lastEvents) }));
-  bar.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "CSV",
-    onclick: () => downloadEventsCSV(lastEvents) }));
+  // Paging controls (#1297). Disabled rather than hidden so the affordance is
+  // discoverable on page 1 — the bug this fixes was an operator having no way
+  // to know event 101 was reachable at all.
+  bar.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", id: "ev-prev", text: "‹ Newer",
+    disabled: "", onclick: () => eventsGoPage(-1) }));
+  bar.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", id: "ev-next", text: "Older ›",
+    disabled: "", onclick: () => eventsGoPage(1) }));
+  // Labels name their SCOPE: these export every match of the current search
+  // (up to the server's cap), not the page on screen. See exportEvents.
+  bar.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Export JSON",
+    title: "Export all matches of this search, not just this page (max 1000 events)",
+    onclick: (e) => exportEvents("json", e.target) }));
+  bar.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Export CSV",
+    title: "Export all matches of this search, not just this page (max 1000 events)",
+    onclick: (e) => exportEvents("csv", e.target) }));
   v.append(bar);
 
   // events list
@@ -1312,7 +1337,13 @@ function parseSmartQuery(q) {
   return c;
 }
 
-async function runEventsQuery(form) {
+// keepPage is set ONLY by the Prev/Next buttons. Every other caller — the
+// debounced `input` handler, `change`, `submit` — is a filter edit, and a
+// filter edit must drop the cursor: a cursor from the previous search names a
+// row that need not exist in the new one, so keeping it would serve a page
+// from the middle of a search the operator never ran.
+async function runEventsQuery(form, keepPage) {
+  if (!keepPage) { evPages = [{ before: null, offset: 0 }]; evPageIdx = 0; }
   const gen = serverGen;
   const rowsEl = $("#ev-rows", VIEW());
   const countEl = $("#ev-count", VIEW());
@@ -1338,9 +1369,21 @@ async function runEventsQuery(form) {
     if (merged.changed_column) apiParams.changed_column = merged.changed_column;
   }
 
+  // Client-side refine terms are computed before the fetch so export can reuse
+  // the exact same pair (server filters + refine) the page was built from.
+  const refine = [];
+  if (!hasScope && merged.pk) refine.push(merged.pk.toLowerCase());
+  if (!hasScope && merged.changed_column) refine.push(merged.changed_column.toLowerCase());
+  refine.push(...parsed.terms);
+  evLastQuery = { apiParams, refine };
+
+  const pageParams = Object.assign({ order: "DESC" }, apiParams);
+  const before = evPages[evPageIdx] && evPages[evPageIdx].before;
+  if (before) pageParams.before = before;
+
   let data;
   try {
-    data = await api("/api/events?" + new URLSearchParams(apiParams).toString());
+    data = await api("/api/events?" + new URLSearchParams(pageParams).toString());
   } catch (err) {
     if (gen !== serverGen) return;
     clear(rowsEl); renderError(rowsEl, err);
@@ -1350,35 +1393,101 @@ async function runEventsQuery(form) {
   if (gen !== serverGen) return;
 
   // Client-side refine: unscoped pk/col + free terms.
-  let events = data.events || [];
-  const refine = [];
-  if (!hasScope && merged.pk) refine.push(merged.pk.toLowerCase());
-  if (!hasScope && merged.changed_column) refine.push(merged.changed_column.toLowerCase());
-  refine.push(...parsed.terms);
-  if (refine.length) {
-    events = events.filter((e) => {
-      const hay = (e.schema_name + "." + e.table_name + " " + e.event_type + " " + e.pk_values + " " +
-        (e.changed_columns || []).join(" ") + " " +
-        valueToString(e.row_before) + " " + valueToString(e.row_after)).toLowerCase();
-      return refine.every((t) => hay.includes(t));
-    });
+  const events = refineEvents(data.events || [], refine);
+
+  // Remember where the NEXT page starts before rendering this one. The cursor
+  // comes from the server (data.next_before), which derives it from the last
+  // row it actually served — not from `events`, which the refine above may
+  // have dropped the boundary row from. Deriving it here would skip whatever
+  // the refine hid.
+  if (data.has_more && data.next_before) {
+    evPages[evPageIdx + 1] = { before: data.next_before, offset: evPages[evPageIdx].offset + data.count };
+  } else {
+    evPages.length = evPageIdx + 1;
   }
 
   lastEvents = events;
-  // Honest scope (#966): free terms / unscoped pk are refined client-side over
-  // ONE fetched page. When that page is full (count === limit) older matches
-  // can exist beyond it, so qualify the count instead of presenting it as
-  // index-wide truth. A refine over a non-full page saw every matching event,
-  // so its count needs no qualifier.
+  // Honest scope (#966 + #1297): free terms / unscoped pk are refined
+  // client-side over ONE fetched page, so a refined count is page-local. The
+  // window note no longer restates the limit back at the reader ("100 events in
+  // the newest 100" answered nothing about whether 101 or ten million sat
+  // behind it) — has_more, one probe row on the server, says which.
   const refining = refine.length > 0;
-  const pageFull = data.limit > 0 && data.count === data.limit;
-  const scopeNote = pageFull
-    ? " in the newest " + data.limit + " events — narrow with schema/table or a time range"
-    : "";
+  const from = evPages[evPageIdx].offset + 1;
+  const to = evPages[evPageIdx].offset + data.count;
+  let scopeNote = "";
+  if (data.has_more) {
+    scopeNote = " · showing " + from + "–" + to + " of more — page older for the rest";
+  } else if (evPageIdx > 0) {
+    // Paged to the end, so the total IS known exactly: it is what we walked.
+    scopeNote = " · showing " + from + "–" + to + " of " + to + " (end)";
+  }
+  if (refining && data.count !== events.length) {
+    // The refine ran over this page only; say so rather than let the number
+    // read as an index-wide match count.
+    scopeNote += " · refined within this page";
+  }
   if (countEl) countEl.textContent = String(events.length);
   const noteEl = $("#ev-count-note", VIEW());
   if (noteEl) noteEl.textContent = (refining ? " match(es)" : " event(s)") + scopeNote;
+  const prevBtn = $("#ev-prev", VIEW());
+  const nextBtn = $("#ev-next", VIEW());
+  if (prevBtn) prevBtn.disabled = evPageIdx === 0;
+  if (nextBtn) nextBtn.disabled = !data.has_more;
   buildEventRows(rowsEl, events, scopeNote);
+}
+
+// refineEvents applies the client-side free-text / unscoped-pk refine. Shared
+// by the rendered page and by export so the two can never diverge on what
+// "matches this search" means.
+function refineEvents(events, refine) {
+  if (!refine.length) return events;
+  return events.filter((e) => {
+    const hay = (e.schema_name + "." + e.table_name + " " + e.event_type + " " + e.pk_values + " " +
+      (e.changed_columns || []).join(" ") + " " +
+      valueToString(e.row_before) + " " + valueToString(e.row_after)).toLowerCase();
+    return refine.every((t) => hay.includes(t));
+  });
+}
+
+// eventsGoPage steps the Events view one keyset page in `dir` (+1 = older).
+function eventsGoPage(dir) {
+  const next = evPageIdx + dir;
+  if (next < 0 || next >= evPages.length) return;
+  evPageIdx = next;
+  cursorIdx = -1; // the keyboard cursor indexes into the old page's rows
+  runEventsQuery($("#ev-form", VIEW()), true);
+}
+
+// exportEvents downloads EVERY match of the current search, not just the page
+// on screen.
+//
+// The decision, and why: once the view pages, "export what is rendered" means
+// an operator who filtered to one table, walked four pages of an incident and
+// hit Export silently gets a quarter of their evidence. That is worse than the
+// un-paged behavior it replaces. Exporting the whole filtered set costs one
+// cursor-less request at the limit the endpoint ALREADY sanctions
+// (eventsMaxLimit, 1000) — it grants no capability the caps did not already
+// permit, and deliberately does NOT page the export loop, which is exactly how
+// a download button would become the way to pull an index into a browser.
+// The cap is not silent: a result that comes back at the ceiling says so.
+async function exportEvents(kind, btn) {
+  if (!evLastQuery) return;
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  try {
+    const params = Object.assign({}, evLastQuery.apiParams, { order: "DESC", limit: String(EVENT_EXPORT_MAX) });
+    const data = await api("/api/events?" + new URLSearchParams(params).toString());
+    const rows = refineEvents(data.events || [], evLastQuery.refine);
+    if (kind === "csv") downloadEventsCSV(rows); else downloadEventsJSON(rows);
+    if (data.has_more) {
+      toast("Exported the newest " + data.count + " matches — the search has more. Narrow it with a time range to export the rest.");
+    }
+  } catch (err) {
+    toast("Export failed: " + (err && err.message ? err.message : String(err)));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+  }
 }
 
 function buildEventRows(container, events, scopeNote) {

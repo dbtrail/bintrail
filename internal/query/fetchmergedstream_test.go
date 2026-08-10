@@ -255,6 +255,10 @@ func TestFetchMergedStream_rejectsIncompatibleOptions(t *testing.T) {
 		{"global limit", Options{Limit: 10}, "cannot be combined with paging"},
 		{"per-PK limit", Options{LimitPerPK: 3}, "cannot be combined with paging"},
 		{"preset cursor", Options{AfterEvent: &EventCursor{Timestamp: streamBase, EventID: 1}}, "must not be preset"},
+		// The newest-first cursor (#1297) is refused with its OWN message, not
+		// left to validateCursor: that would blame Order for what is really
+		// "this stream owns its cursor", sending the caller to the wrong field.
+		{"preset newest-first cursor", Options{BeforeEvent: &EventCursor{Timestamp: streamBase, EventID: 1}}, "manages its own cursor"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

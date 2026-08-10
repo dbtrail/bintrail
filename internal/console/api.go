@@ -104,10 +104,30 @@ type recoverRequest struct {
 }
 
 type eventsResponse struct {
-	Events   []eventDTO `json:"events"`
-	Count    int        `json:"count"`
-	Limit    int        `json:"limit"`
-	Warnings []string   `json:"warnings,omitempty"`
+	Events []eventDTO `json:"events"`
+	// Count and Limit describe the PAGE, never the probe (#1297): handleEvents
+	// asks the engine for Limit+1 rows to learn HasMore and trims the extra
+	// before it gets here. Reporting the probe would leak a 101 back to a
+	// client that asked for 100 and would let a limit=1000 request answer 1001.
+	Count int `json:"count"`
+	Limit int `json:"limit"`
+	// HasMore reports that at least one further event matched beyond this page.
+	// It is the answer to the question the old header could not ask: "100
+	// event(s) in the newest 100" says nothing about whether 101 or ten million
+	// sit behind it. This costs exactly one extra row per fetch, so it is never
+	// a count — a real total would mean a COUNT(*) over the same window, which
+	// on a partitioned multi-source index is not cheap and is not offered here.
+	HasMore bool `json:"has_more"`
+	// NextBefore is the opaque keyset cursor for the NEXT (older) page of a
+	// newest-first listing: pass it back as ?before=. Empty when HasMore is
+	// false, or when the listing is ascending. The client never builds a
+	// cursor itself — it echoes this — which is what guarantees the next page
+	// resumes on a row the server actually served.
+	NextBefore string `json:"next_before,omitempty"`
+	// NextAfter is NextBefore's ascending counterpart (?after=), for a client
+	// that asked for order=ASC.
+	NextAfter string   `json:"next_after,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
 }
 
 type recoverResponse struct {
@@ -255,22 +275,56 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := applyEventCursors(&opts, q.Get("after"), q.Get("before")); err != nil {
+		// A 400, never a silent fall back to page 1: the UI's Next button would
+		// then re-serve the same page forever and the operator would page a
+		// loop believing they were walking backwards through the index.
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
 	if err != nil {
 		writeSessionProfileError(w, r, err)
 		return
 	}
+	// Probe one row past the page to learn whether anything is behind it. The
+	// extra row is never serialized (trimmed below) — it exists only so the
+	// header can say "more available" or "end of results" instead of the
+	// circular "100 events in the newest 100". The cap semantics are unchanged:
+	// pageLimit is what buildOptions clamped to eventsMaxLimit, and one probe
+	// row is not a paging escape hatch for pulling the index into a browser.
+	pageLimit := opts.Limit
+	opts.Limit = pageLimit + 1
 	rows, plan, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, eventsResponse{
+	hasMore := len(rows) > pageLimit
+	if hasMore {
+		rows = rows[:pageLimit]
+	}
+	resp := eventsResponse{
 		Events:   toEventDTOs(rows),
 		Count:    len(rows),
-		Limit:    opts.Limit,
+		Limit:    pageLimit,
+		HasMore:  hasMore,
 		Warnings: gapWarnings(plan),
-	})
+	}
+	// The cursor comes from the last row of the page the client is about to
+	// see, in the direction it is reading. Built server-side from a served row
+	// so the next page can neither skip nor repeat at a shared second.
+	if hasMore && len(rows) > 0 {
+		cur := formatEventCursor(rows[len(rows)-1])
+		if query.OrderDirection(opts.Order) == "DESC" {
+			resp.NextBefore = cur
+		} else {
+			resp.NextAfter = cur
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+	// Emitted per page: every page is its own read of historical row data, so
+	// page 2 is as auditable as page 1 (ext.AuditSink contract).
 	recordConsoleAccess(r, "query.run", opts.Schema, opts.Table, map[string]string{
 		"results": strconv.Itoa(len(rows)),
 		"format":  "json",

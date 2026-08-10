@@ -634,13 +634,16 @@ try {
   // the CSV header must stay in lockstep with EVENT_CSV_COLUMNS.
   const exp = await page.evaluate(async (CANARY) => {
     const btns = Array.from(document.querySelectorAll(".result-bar button"));
-    const jsonBtn = btns.find((b) => b.textContent.trim() === "JSON");
-    const csvBtn = btns.find((b) => b.textContent.trim() === "CSV");
+    const jsonBtn = btns.find((b) => b.textContent.trim() === "Export JSON");
+    const csvBtn = btns.find((b) => b.textContent.trim() === "Export CSV");
     const blobs = [];
     const orig = URL.createObjectURL;
     URL.createObjectURL = (b) => { blobs.push(b); return orig.call(URL, b); };
     jsonBtn.click();
     csvBtn.click();
+    // Export re-fetches the whole filtered set (#1297), so the blob appears a
+    // round-trip after the click — poll instead of reading it synchronously.
+    for (let i = 0; i < 100 && blobs.length < 2; i++) await new Promise((r) => setTimeout(r, 50));
     URL.createObjectURL = orig;
     const [jsonText, csvText] = await Promise.all(blobs.map((b) => b.text()));
     const arr = JSON.parse(jsonText);
@@ -657,12 +660,120 @@ try {
       csvConnVal: csvText.split("\r\n").some((l) => l.split(",").includes("777")),
     };
   }, CANARY);
-  exp.n === 6 ? ok("export: JSON blob carries the full rendered page") : bad("export: JSON blob carries the full rendered page", `n=${exp.n}`);
+  exp.n === 6 ? ok("export: JSON blob carries every match of the search") : bad("export: JSON blob carries every match of the search", `n=${exp.n}`);
   (exp.jsonLeak === 0 && !exp.jsonCanary) ? ok("export: JSON blob is query_text/query_hash-free") : bad("export: JSON blob is query_text/query_hash-free", `leak=${exp.jsonLeak} canary=${exp.jsonCanary}`);
   exp.jsonConn ? ok("export: JSON blob keeps connection_id") : bad("export: JSON blob keeps connection_id", "some entry lacks the key");
   exp.headerLockstep ? ok("export: CSV header in lockstep with EVENT_CSV_COLUMNS") : bad("export: CSV header in lockstep with EVENT_CSV_COLUMNS", "header drifted");
   (exp.headerConn && !exp.headerLeak) ? ok("export: CSV columns include connection_id, never query_text") : bad("export: CSV columns include connection_id, never query_text", `conn=${exp.headerConn} leak=${exp.headerLeak}`);
   (!exp.csvCanary && exp.csvConnVal) ? ok("export: CSV rows redacted but carry the connection_id value") : bad("export: CSV rows redacted but carry the connection_id value", `canary=${exp.csvCanary} conn777=${exp.csvConnVal}`);
+
+  // Scenario 12b — Events keyset paging (#1297). The view used to render one
+  // window and stop: event 101 was unreachable except by inventing a filter,
+  // and the header ("100 event(s) in the newest 100 events") restated the limit
+  // instead of saying whether anything was behind it. The fixture seeds 6
+  // events, so a page size of 5 splits them 5 + 1 — enough to prove the cursor
+  // hands off without repeating or skipping a row, which is the only thing a
+  // paging bug ever does.
+  const pg1 = await page.evaluate(async () => {
+    const f = document.getElementById("ev-form");
+    f.elements.limit.value = "5";
+    f.requestSubmit();
+    // Wait for the re-render to settle on the smaller page.
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      if (document.querySelectorAll("#ev-rows .ev-row").length === 5) break;
+    }
+    return {
+      rows: document.querySelectorAll("#ev-rows .ev-row").length,
+      ids: lastEvents.map((e) => e.event_id),
+      note: ($("#ev-count-note", VIEW()) || {}).textContent || "",
+      prevDisabled: document.getElementById("ev-prev").disabled,
+      nextDisabled: document.getElementById("ev-next").disabled,
+    };
+  });
+  pg1.rows === 5 ? ok("events paging: a page-size of 5 renders 5 of the 6 seeded events") : bad("events paging: a page-size of 5 renders 5 of the 6 seeded events", `rows=${pg1.rows}`);
+  pg1.prevDisabled ? ok("events paging: Newer is disabled on the first page") : bad("events paging: Newer is disabled on the first page", "enabled");
+  !pg1.nextDisabled ? ok("events paging: Older is enabled while events remain") : bad("events paging: Older is enabled while events remain", "disabled — event 6 is unreachable");
+  /showing 1–5 of more/.test(pg1.note)
+    ? ok("events paging: the header states a position, not the limit restated")
+    : bad("events paging: the header states a position, not the limit restated", `note=${pg1.note}`);
+  !/in the newest 5 events/.test(pg1.note)
+    ? ok("events paging: the circular 'in the newest N' phrasing is gone")
+    : bad("events paging: the circular 'in the newest N' phrasing is gone", `note=${pg1.note}`);
+
+  const pg2 = await page.evaluate(async () => {
+    document.getElementById("ev-next").click();
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      if (document.querySelectorAll("#ev-rows .ev-row").length === 1) break;
+    }
+    return {
+      rows: document.querySelectorAll("#ev-rows .ev-row").length,
+      ids: lastEvents.map((e) => e.event_id),
+      note: ($("#ev-count-note", VIEW()) || {}).textContent || "",
+      prevDisabled: document.getElementById("ev-prev").disabled,
+      nextDisabled: document.getElementById("ev-next").disabled,
+    };
+  });
+  pg2.rows === 1 ? ok("events paging: Older reaches the 6th event") : bad("events paging: Older reaches the 6th event", `rows=${pg2.rows}`);
+  pg2.ids.every((id) => !pg1.ids.includes(id))
+    ? ok("events paging: page 2 repeats no event from page 1 (keyset cut is exclusive)")
+    : bad("events paging: page 2 repeats no event from page 1 (keyset cut is exclusive)", `p1=${pg1.ids} p2=${pg2.ids}`);
+  pg1.ids.length + pg2.ids.length === 6
+    ? ok("events paging: the two pages together cover all 6 events (nothing skipped)")
+    : bad("events paging: the two pages together cover all 6 events (nothing skipped)", `p1=${pg1.ids} p2=${pg2.ids}`);
+  pg2.nextDisabled ? ok("events paging: Older is disabled at the end of the stream") : bad("events paging: Older is disabled at the end of the stream", "still enabled past the last event");
+  !pg2.prevDisabled ? ok("events paging: Newer is enabled off the first page") : bad("events paging: Newer is enabled off the first page", "disabled — the operator cannot get back");
+  /showing 6–6 of 6 \(end\)/.test(pg2.note)
+    ? ok("events paging: the last page reports the exact total it walked")
+    : bad("events paging: the last page reports the exact total it walked", `note=${pg2.note}`);
+
+  // The export decision (#1297): the buttons export every match of the SEARCH,
+  // not the page on screen. Paged to page 2 (1 row rendered), an export must
+  // still carry all 6 — silently handing an operator a sixth of their evidence
+  // would be worse than the un-paged behavior this replaces.
+  const expAll = await page.evaluate(async () => {
+    const btns = Array.from(document.querySelectorAll(".result-bar button"));
+    const jsonBtn = btns.find((b) => b.textContent.trim() === "Export JSON");
+    const blobs = [];
+    const orig = URL.createObjectURL;
+    URL.createObjectURL = (b) => { blobs.push(b); return orig.call(URL, b); };
+    jsonBtn.click();
+    for (let i = 0; i < 100 && blobs.length < 1; i++) await new Promise((r) => setTimeout(r, 50));
+    URL.createObjectURL = orig;
+    return {
+      n: blobs.length ? JSON.parse(await blobs[0].text()).length : -1,
+      rendered: document.querySelectorAll("#ev-rows .ev-row").length,
+      label: jsonBtn.textContent.trim(),
+      title: jsonBtn.title,
+    };
+  });
+  expAll.n === 6 && expAll.rendered === 1
+    ? ok("export: exports every match of the search, not the 1 row on screen")
+    : bad("export: exports every match of the search, not the 1 row on screen", `n=${expAll.n} rendered=${expAll.rendered}`);
+  (expAll.label === "Export JSON" && /all matches/i.test(expAll.title))
+    ? ok("export: the button states its scope in the UI")
+    : bad("export: the button states its scope in the UI", `label=${expAll.label} title=${expAll.title}`);
+
+  // A filter edit must DROP the cursor: a cursor names a row that need not
+  // exist in the next search, so keeping it would serve a page from the middle
+  // of a search the operator never ran.
+  const reset = await page.evaluate(async () => {
+    const f = document.getElementById("ev-form");
+    f.elements.limit.value = "";
+    f.requestSubmit();
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      if (document.querySelectorAll("#ev-rows .ev-row").length === 6) break;
+    }
+    return {
+      rows: document.querySelectorAll("#ev-rows .ev-row").length,
+      prevDisabled: document.getElementById("ev-prev").disabled,
+    };
+  });
+  (reset.rows === 6 && reset.prevDisabled)
+    ? ok("events paging: a filter edit resets to page 1")
+    : bad("events paging: a filter edit resets to page 1", `rows=${reset.rows} prevDisabled=${reset.prevDisabled}`);
 
   // Scenario 13 — Recover actually SUBMITS and renders the reversal SQL
   // (#970). Scenario 6 above only checks the form's DOM exists.

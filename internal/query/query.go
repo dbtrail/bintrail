@@ -34,9 +34,14 @@ func mysqlToSeconds(t time.Time) int64 {
 	return t.UTC().Unix() + mysqlToSecondsConst
 }
 
-// validateCursor rejects the one option pairing the keyset predicate cannot
-// serve: a cursor with a DESCENDING order (#1097). The two together page AWAY
-// from the unread remainder, silently returning the wrong half of the window.
+// validateCursor rejects the option pairings the keyset predicates cannot
+// serve: a FORWARD cursor with a DESCENDING order, and (since #1297) a
+// BACKWARD cursor with an ASCENDING one. Either pairing pages AWAY from the
+// unread remainder, silently returning the wrong half of the window.
+//
+// The two checks also make "both cursors set" unreachable: Order names one
+// direction, and whichever it names rejects one of the cursors. That is why
+// there is no third check for the combination.
 //
 // It lives at the ENGINE entry points rather than only inside
 // FetchMergedStream, which is the sole legitimate setter today: Options is
@@ -47,6 +52,9 @@ func mysqlToSeconds(t time.Time) int64 {
 func (o Options) validateCursor() error {
 	if o.AfterEvent != nil && OrderDirection(o.Order) == "DESC" {
 		return errors.New("query: AfterEvent is a forward keyset cursor and cannot be combined with Order=DESC")
+	}
+	if o.BeforeEvent != nil && OrderDirection(o.Order) == "ASC" {
+		return errors.New("query: BeforeEvent is a backward keyset cursor and cannot be combined with Order=ASC")
 	}
 	return nil
 }
@@ -242,6 +250,31 @@ type Options struct {
 	//
 	// nil = no cursor (fetch from the start of the window).
 	AfterEvent *EventCursor
+	// BeforeEvent is AfterEvent's mirror: it restricts results to events
+	// strictly BEFORE this point in the (event_timestamp, event_id) sort
+	// order, which is what a DESCENDING (newest-first) surface needs to reach
+	// its second page (#1297).
+	//
+	// Why a second field instead of reusing AfterEvent: the console's Events
+	// view is newest-first, and AfterEvent is a FORWARD cursor — pairing it
+	// with Order=DESC pages away from the unread remainder, which is exactly
+	// what validateCursor refuses. Narrowing Until instead is not a
+	// substitute: Until compares event_timestamp alone, and the column has
+	// one-second resolution, so a boundary second shared by several events
+	// either re-returns them (Until = cursor second) or drops them entirely
+	// (Until = cursor second minus one) — silently losing events in the middle
+	// of an investigation is the failure mode this field exists to prevent.
+	// Carrying event_id makes the cut total, so page N+1 resumes exactly where
+	// page N stopped.
+	//
+	// DESCENDING ORDER ONLY, the symmetric constraint: with Order="ASC" a
+	// backward cursor walks away from the unread remainder just as
+	// AfterEvent+DESC does. Because each cursor is pinned to the opposite
+	// order, setting BOTH is unreachable — whichever direction Order names,
+	// one of the two checks rejects it — so no third "not both" check exists.
+	//
+	// nil = no cursor (fetch from the newest end of the window).
+	BeforeEvent *EventCursor
 	// ExtraArchiveHours lists the hour LABELS of archive files whose CONTENT
 	// time range overlaps the query window even though their partition/Hive
 	// path label does not (#1037: backfilled events archived under the oldest
@@ -680,6 +713,22 @@ func buildQuery(opts Options) (string, []any) {
 		// deliberately over-inclusive, this is the precise boundary.
 		where = append(where, "(event_timestamp > ? OR (event_timestamp = ? AND event_id > ?))")
 		args = append(args, opts.AfterEvent.Timestamp, opts.AfterEvent.Timestamp, opts.AfterEvent.EventID)
+	}
+	if opts.BeforeEvent != nil {
+		// The mirror of the AfterEvent block above, for newest-first paging
+		// (#1297). Hour-aligned TO_SECONDS literal so MySQL prunes partitions at
+		// parse time; the bound is EXCLUSIVE at the next hour boundary
+		// (15:13 → 16:00) exactly like the Until hint, because every row still
+		// to be returned sorts at-or-before the cursor and so cannot live in a
+		// partition above the cursor's own hour. Flooring instead of ceiling
+		// here would prune away the cursor's own partition and drop the rest of
+		// the boundary hour — the events immediately after the page break.
+		outerBefore := mysqlToSeconds(opts.BeforeEvent.Timestamp.Truncate(time.Hour).Add(time.Hour))
+		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", outerBefore))
+		// The exact keyset cut on the composite sort key; the hint above is
+		// hour-granular and deliberately over-inclusive, this is the boundary.
+		where = append(where, "(event_timestamp < ? OR (event_timestamp = ? AND event_id < ?))")
+		args = append(args, opts.BeforeEvent.Timestamp, opts.BeforeEvent.Timestamp, opts.BeforeEvent.EventID)
 	}
 	if opts.ChangedColumn != "" {
 		// json.Marshal produces the JSON string representation (with quotes),

@@ -967,3 +967,84 @@ func TestBuildQuery_noAfterEventNoKeyset(t *testing.T) {
 		t.Errorf("keyset predicate leaked into a cursor-less query:\n%s", q)
 	}
 }
+
+// TestBuildQuery_beforeEventKeyset covers the newest-first keyset cursor
+// (#1297), the mirror of TestBuildQuery_afterEventKeyset. Both halves are
+// load-bearing, and the hint's DIRECTION especially so: it must CEIL to the
+// next hour, because the cursor's own partition still holds the events
+// immediately below the page break. A floored hint would prune that partition
+// and silently drop the rest of the boundary hour — the events right after the
+// page break, which is exactly the data the operator clicked Next to see.
+func TestBuildQuery_beforeEventKeyset(t *testing.T) {
+	cur := time.Date(2026, 7, 25, 14, 37, 5, 0, time.UTC)
+	q, args := buildQuery(Options{
+		Schema:      "mydb",
+		Table:       "orders",
+		Order:       "DESC",
+		BeforeEvent: &EventCursor{Timestamp: cur, EventID: 4242},
+	})
+
+	if !strings.Contains(q, "(event_timestamp < ? OR (event_timestamp = ? AND event_id < ?))") {
+		t.Errorf("missing the composite keyset cut; a timestamp-only cursor would skip or re-return the boundary second:\n%s", q)
+	}
+	// TO_SECONDS('2026-07-25 15:00:00') — the hour AFTER the cursor's.
+	wantHint := fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", mysqlToSeconds(cur.Truncate(time.Hour).Add(time.Hour)))
+	if !strings.Contains(q, wantHint) {
+		t.Errorf("missing partition-pruning hint %q:\n%s", wantHint, q)
+	}
+	// Guard the direction explicitly: a floored literal is the plausible typo
+	// and it prunes away the cursor's own hour.
+	floored := fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", mysqlToSeconds(cur.Truncate(time.Hour)))
+	if strings.Contains(q, floored) {
+		t.Errorf("pruning hint floored to the cursor's own hour; the rest of that hour would be dropped:\n%s", q)
+	}
+
+	if len(args) != 5 {
+		t.Fatalf("args = %v, want 5 (schema, table, ts, ts, event_id)", args)
+	}
+	if args[2] != cur || args[3] != cur {
+		t.Errorf("timestamp args = %v/%v, want %v twice", args[2], args[3], cur)
+	}
+	if args[4] != uint64(4242) {
+		t.Errorf("event_id arg = %v, want 4242", args[4])
+	}
+}
+
+// TestBuildQuery_noBeforeEventNoKeyset pins that the backward predicate is
+// absent when no cursor is set, so every pre-#1297 caller generates exactly
+// the SQL it did before.
+func TestBuildQuery_noBeforeEventNoKeyset(t *testing.T) {
+	q, _ := buildQuery(Options{Schema: "mydb", Table: "orders", Order: "DESC"})
+	if strings.Contains(q, "event_id <") {
+		t.Errorf("backward keyset predicate leaked into a cursor-less query:\n%s", q)
+	}
+}
+
+// TestValidateCursor_direction pins both pairings the keyset predicates cannot
+// serve. A cursor paired with the wrong order does not error at the database —
+// it returns a plausible, full page from the wrong half of the window, so the
+// refusal has to happen here or not at all.
+func TestValidateCursor_direction(t *testing.T) {
+	c := &EventCursor{Timestamp: time.Date(2026, 7, 25, 14, 0, 0, 0, time.UTC), EventID: 1}
+	cases := []struct {
+		name    string
+		opts    Options
+		wantErr bool
+	}{
+		{"forward cursor, DESC", Options{AfterEvent: c, Order: "DESC"}, true},
+		{"forward cursor, ASC", Options{AfterEvent: c, Order: "ASC"}, false},
+		{"forward cursor, unset order (ASC)", Options{AfterEvent: c}, false},
+		{"backward cursor, ASC", Options{BeforeEvent: c, Order: "ASC"}, true},
+		{"backward cursor, DESC", Options{BeforeEvent: c, Order: "DESC"}, false},
+		// An unset Order means the engine sorts ASC, so a backward cursor there
+		// is the ASC pairing under another name and must be refused too.
+		{"backward cursor, unset order (ASC)", Options{BeforeEvent: c}, true},
+		{"no cursor", Options{Order: "DESC"}, false},
+	}
+	for _, tc := range cases {
+		err := tc.opts.validateCursor()
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, wantErr = %v", tc.name, err, tc.wantErr)
+		}
+	}
+}

@@ -46,6 +46,9 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 	if opts.AfterEvent != nil && query.OrderDirection(opts.Order) == "DESC" {
 		return nil, errors.New("parquetquery: AfterEvent is a forward keyset cursor and cannot be combined with Order=DESC")
 	}
+	if opts.BeforeEvent != nil && query.OrderDirection(opts.Order) == "ASC" {
+		return nil, errors.New("parquetquery: BeforeEvent is a backward keyset cursor and cannot be combined with Order=ASC")
+	}
 	return FetchWithTuning(ctx, opts, source, duckdbutil.DefaultTuning())
 }
 
@@ -92,7 +95,13 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 		// away the very file a position-anchored fetch needs (see
 		// sinceLowerBoundHint).
 		sinceHint := sinceLowerBoundHint(opts)
-		files, maxSize, region, s3Client, err := listS3ParquetScoped(ctx, source, sinceHint, opts.Until, opts.ExtraArchiveHours)
+		// untilHint, not opts.Until directly: a newest-first keyset cursor
+		// lowers the top of the window with every page (see
+		// untilUpperBoundHint). It is passed to classifyEmptyS3Listing below
+		// as well, because that classification asks what filterFilesByTimeRange
+		// could have discarded — so it must see the same bounds the filter used.
+		untilHint := untilUpperBoundHint(opts)
+		files, maxSize, region, s3Client, err := listS3ParquetScoped(ctx, source, sinceHint, untilHint, opts.ExtraArchiveHours)
 		if err != nil {
 			return nil, fmt.Errorf("list S3 archive files: %w", err)
 		}
@@ -100,12 +109,12 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 		// to avoid downloading parquet files outside the requested time range.
 		// ExtraArchiveHours (#1037) exempts misfiled files — archives whose
 		// label hour lies outside the range but whose content overlaps it.
-		files = filterFilesByTimeRange(files, sinceHint, opts.Until, opts.ExtraArchiveHours)
+		files = filterFilesByTimeRange(files, sinceHint, untilHint, opts.ExtraArchiveHours)
 		// Sort chronologically so we can terminate early when --limit is satisfied.
 		files = sortFilesByHour(files)
 		slog.Debug("files after time-range pruning", "count", len(files))
 		if len(files) == 0 {
-			return classifyEmptyS3Listing(ctx, s3Client, source, sinceHint, opts.Until)
+			return classifyEmptyS3Listing(ctx, s3Client, source, sinceHint, untilHint)
 		}
 
 		// Ultrafast: read the S3 files directly via DuckDB httpfs in one
@@ -429,6 +438,34 @@ func sinceLowerBoundHint(opts query.Options) *time.Time {
 		// file scoping can act on, and flooring can only over-include.
 		cur := opts.AfterEvent.Timestamp.Truncate(time.Hour)
 		if hint == nil || cur.After(*hint) {
+			hint = &cur
+		}
+	}
+	return hint
+}
+
+// untilUpperBoundHint is sinceLowerBoundHint's mirror for newest-first paging
+// (#1297): a Options.BeforeEvent cursor tightens the archive file/date scoping
+// upper bound, because every row still to be returned sorts at-or-before the
+// cursor and so cannot live in a file whose hour STARTS after the cursor's.
+//
+// It exists for the same reason the AfterEvent half of sinceLowerBoundHint
+// does: without it every newest-first page would re-list and re-download the
+// whole window's files and lean on the row-level filter to throw them away,
+// once per page — quadratic S3 traffic behind a Next button.
+//
+// The cursor's hour is CEILED (truncate, then add an hour) rather than
+// floored: the cursor's own hour still holds the events immediately below the
+// page break, and Hive scoping is hour-granular, so flooring would prune the
+// very file the next page must read. Over-including one hour is free; the
+// row-level predicate makes the exact cut.
+//
+// Returns opts.Until unchanged when no cursor is set.
+func untilUpperBoundHint(opts query.Options) *time.Time {
+	hint := opts.Until
+	if opts.BeforeEvent != nil {
+		cur := opts.BeforeEvent.Timestamp.Truncate(time.Hour).Add(time.Hour)
+		if hint == nil || cur.Before(*hint) {
 			hint = &cur
 		}
 	}
@@ -1014,6 +1051,14 @@ func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 		// row groups from this predicate via their event_timestamp statistics.
 		where = append(where, "(event_timestamp > ? OR (event_timestamp = ? AND event_id > ?))")
 		args = append(args, opts.AfterEvent.Timestamp, opts.AfterEvent.Timestamp, opts.AfterEvent.EventID)
+	}
+	if opts.BeforeEvent != nil {
+		// The newest-first mirror (#1297). As with AfterEvent no coarse hint is
+		// emitted here — untilUpperBoundHint has already tightened file/date
+		// scoping before this filter is built — and DuckDB prunes row groups
+		// from this predicate via their event_timestamp statistics.
+		where = append(where, "(event_timestamp < ? OR (event_timestamp = ? AND event_id < ?))")
+		args = append(args, opts.BeforeEvent.Timestamp, opts.BeforeEvent.Timestamp, opts.BeforeEvent.EventID)
 	}
 	if opts.ChangedColumn != "" {
 		needle, _ := json.Marshal(opts.ChangedColumn)

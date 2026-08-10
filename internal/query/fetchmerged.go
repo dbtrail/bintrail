@@ -243,6 +243,15 @@ func FetchMergedFull(
 // Time and table filters need no special case: whatever they exclude, the live
 // rows that survive are still newer than everything below the cutoff, so a full
 // page of them is still the true top N.
+//
+// A newest-first keyset cursor (Options.BeforeEvent, #1297) needs no special
+// case either, and this is worth stating because it looks like it should: the
+// test above is entirely about the span from the cutoff row UPWARD being
+// provably live-covered, and BeforeEvent only lowers the top of that span. Page
+// 2 of a paged Events view is therefore skipped past the archives on the same
+// proof as page 1 — and once paging descends far enough that the page's cutoff
+// falls below the single live range's start, the test fails and the archives
+// are read, which is precisely when they hold the answer.
 func topNSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
 	if opts.Limit <= 0 || len(rows) < opts.Limit || OrderDirection(opts.Order) != "DESC" {
 		return false
@@ -306,6 +315,14 @@ func FetchMergedStream(
 	}
 	if o.Opts.AfterEvent != nil {
 		return nil, errors.New("FetchMergedStream: Opts.AfterEvent is managed by the stream and must not be preset")
+	}
+	// BeforeEvent is rejected with its own message rather than left to
+	// validateCursor (#1297). This path is ASC-only, so a preset backward
+	// cursor would otherwise surface as "BeforeEvent cannot be combined with
+	// Order=ASC" — a direction complaint that sends the caller looking at
+	// Order, when the actual rule is that this stream owns its cursor.
+	if o.Opts.BeforeEvent != nil {
+		return nil, errors.New("FetchMergedStream: Opts.BeforeEvent is a newest-first cursor; this stream pages ascending and manages its own cursor")
 	}
 	if batchSize <= 0 {
 		batchSize = DefaultStreamBatchSize
