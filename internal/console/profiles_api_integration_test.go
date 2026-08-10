@@ -4,8 +4,11 @@ package console
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -62,5 +65,46 @@ func TestIntegrationProfilesAPI(t *testing.T) {
 	}
 	if resp.Profiles == nil || len(resp.Profiles) != 0 {
 		t.Fatalf("profiles (no table) = %#v, want empty non-nil list", resp.Profiles)
+	}
+}
+
+// TestIntegrationProfilesAPIRequiresSettingsRead pins the route's TIER, which
+// the route-table drift guards cannot: they check that every route IS
+// classified, not what it is classified AS. Moving this row to query:execute
+// would keep every caller working (the roles that reach this panel hold both)
+// while handing access-control vocabulary to every analyst — a silent
+// widening on both sides.
+func TestIntegrationProfilesAPIRequiresSettingsRead(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: intToken, NoArchive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session := func(perms ...ext.Permission) string {
+		t.Helper()
+		tok, _, err := srv.sessions.IssueWithPolicy("ops@example.com", &ext.AccessPolicy{Permissions: perms})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok
+	}
+	get := func(bearer string) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://127.0.0.1:8090/api/profiles", nil)
+		req.Host = "127.0.0.1:8090"
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		srv.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := get(session(ext.PermSettingsRead)); code != http.StatusOK {
+		t.Errorf("settings:read session = %d, want 200", code)
+	}
+	for _, perm := range []ext.Permission{ext.PermQueryExecute, ext.PermStatusRead, ext.PermServersRead} {
+		if code := get(session(perm)); code != http.StatusForbidden {
+			t.Errorf("%s-only session = %d, want 403", perm, code)
+		}
 	}
 }
