@@ -216,10 +216,6 @@ func TestMonitorReloadSchema_undrainedStreamIsReportedAndKeepsTheJob(t *testing.
 // a job stuck in "running" makes every later Trigger answer 409 for the life of
 // the process, with a daemon restart the only way out.
 func TestSchemaSnapshotSupervisor_timeoutFreesTheEndpoint(t *testing.T) {
-	prev := schemaSnapshotTimeout
-	schemaSnapshotTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { schemaSnapshotTimeout = prev })
-
 	hang := make(chan struct{})
 	t.Cleanup(func() { close(hang) })
 	reloads := make(chan string, 4)
@@ -227,6 +223,10 @@ func TestSchemaSnapshotSupervisor_timeoutFreesTheEndpoint(t *testing.T) {
 		<-hang
 		return metadata.SnapshotStats{}, nil
 	}, func(_ context.Context, id string) (bool, error) { reloads <- id; return true, nil })
+	// Shrink this supervisor's own bound. A package-level var would be read by
+	// the job goroutines of every other test here — which outlive the test that
+	// spawned them — so assigning to one is a data race, not a knob.
+	s.timeout = 20 * time.Millisecond
 
 	req := console.SchemaSnapshotRequest{ServerID: "srv-1"}
 	if err := s.Trigger(req); err != nil {

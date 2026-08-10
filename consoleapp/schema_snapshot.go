@@ -41,6 +41,13 @@ type schemaSnapshotSupervisor struct {
 	// reload contract can be exercised without a live MySQL.
 	snapshotFn func(req console.SchemaSnapshotRequest) (metadata.SnapshotStats, error)
 
+	// timeout bounds one job. Per-supervisor rather than a package var so a
+	// test that shrinks it touches only its own instance: a global is read by
+	// the job goroutine of every OTHER test in the package, and those outlive
+	// the test that spawned them, so writing one is a data race that -race
+	// catches and a plain `go test` does not.
+	timeout time.Duration
+
 	mu   sync.Mutex
 	jobs map[string]*console.SchemaSnapshotStatus
 	// gens counts triggered runs PER SERVER. A run whose generation is no
@@ -65,22 +72,24 @@ func reloadStreamSchema(sup *monitorSupervisor, reg *console.Registry) func(cont
 	}
 }
 
-// schemaSnapshotTimeout bounds one job. A var so tests can shrink it.
+// defaultSchemaSnapshotTimeout is what a supervisor gets unless a caller
+// narrows it.
 //
-// It exists because the snapshot itself cannot be cancelled: metadata's
+// A bound exists because the snapshot itself cannot be cancelled: metadata's
 // snapshot taker holds no context, and config.Connect's timeout covers only the
 // TCP handshake — a source whose information_schema read blocks behind a
 // metadata lock hangs the job forever. Without a deadline the job stays
 // "running" for the life of the process, every later Trigger answers 409, and
 // the only recovery is a daemon restart: an endpoint permanently unable to do
 // the thing it exists for.
-var schemaSnapshotTimeout = 10 * time.Minute
+const defaultSchemaSnapshotTimeout = 10 * time.Minute
 
 func newSchemaSnapshotSupervisor(ctx context.Context, reload func(context.Context, string) (bool, error)) *schemaSnapshotSupervisor {
 	return &schemaSnapshotSupervisor{
 		ctx:        ctx,
 		reload:     reload,
 		snapshotFn: takeSchemaSnapshot,
+		timeout:    defaultSchemaSnapshotTimeout,
 		jobs:       make(map[string]*console.SchemaSnapshotStatus),
 		gens:       make(map[string]uint64),
 	}
@@ -138,7 +147,7 @@ func (s *schemaSnapshotSupervisor) Status(serverID string) console.SchemaSnapsho
 	return console.SchemaSnapshotStatus{State: "idle"}
 }
 
-// run executes one job under schemaSnapshotTimeout. On timeout the job is
+// run executes one job under s.timeout. On timeout the job is
 // reported failed so the endpoint becomes usable again; the abandoned goroutine
 // cannot corrupt anything after that, because publish drops a result from a
 // superseded generation and execute declines to restart a stream it no longer
@@ -156,11 +165,11 @@ func (s *schemaSnapshotSupervisor) run(req console.SchemaSnapshotRequest, gen ui
 	select {
 	case o := <-done:
 		s.publish(req, gen, o.st, o.err)
-	case <-time.After(schemaSnapshotTimeout):
+	case <-time.After(s.timeout):
 		slog.Warn("schema snapshot timed out; the attempt may still be finishing in the background",
-			"server", req.ServerName, "id", req.ServerID, "timeout", schemaSnapshotTimeout)
+			"server", req.ServerName, "id", req.ServerID, "timeout", s.timeout)
 		s.publish(req, gen, console.SchemaSnapshotStatus{},
-			fmt.Errorf("the source did not answer within %s; it may be holding a metadata lock. The attempt may still finish in the background — capture was not restarted", schemaSnapshotTimeout))
+			fmt.Errorf("the source did not answer within %s; it may be holding a metadata lock. The attempt may still finish in the background — capture was not restarted", s.timeout))
 	case <-s.ctx.Done():
 		s.publish(req, gen, console.SchemaSnapshotStatus{}, errors.New("the daemon is shutting down; capture was not restarted"))
 	}
