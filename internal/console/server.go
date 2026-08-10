@@ -533,7 +533,10 @@ func (s *Server) buildHandler() http.Handler {
 	// restart that server's stream onto it — the remedy the capture-degraded
 	// banner names, which had no button anywhere before. 403 unless this
 	// process runs the control plane.
-	api.HandleFunc("POST /api/servers/{id}/schema-snapshot", s.recordAction("schema_snapshot", s.handleSchemaSnapshotTrigger))
+	// Hyphen, not underscore: telemetry's sanitizeCommand rejects anything
+	// outside [a-z0-9-] and files it under "other", which would lose this
+	// action's signal entirely.
+	api.HandleFunc("POST /api/servers/{id}/schema-snapshot", s.recordAction("schema-snapshot", s.handleSchemaSnapshotTrigger))
 	api.HandleFunc("GET /api/servers/{id}/schema-snapshot", s.handleSchemaSnapshotStatus)
 	api.HandleFunc("POST /api/servers/{id}/verify", s.recordAction("verify", s.handleVerifyTrigger))
 	api.HandleFunc("GET /api/servers/{id}/verify", s.handleVerifyStatus)
