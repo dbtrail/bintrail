@@ -975,27 +975,107 @@ try {
     }
   }
 
-  // Scenario 15 — Overview window honesty (#686): fixture-drive the REAL
-  // buildOverview with a status.coverage spanning far more history than the
-  // fetched events window, and assert the window line uses the window's OWN
-  // bounds (#679/#684) — a reintroduced status.coverage fallback fails here
-  // and nowhere else (the Go suite never renders app.js).
-  const ov = await page.evaluate(() => {
-    const mkev = (ts, type, pk) => ({ event_timestamp: ts, schema_name: "ovfix", table_name: "t", event_type: type, pk_values: pk, changed_columns: [] });
-    const events = [mkev("2026-03-01 10:30:00", "DELETE", "9"), mkev("2026-03-01 10:00:00", "INSERT", "8")];
-    const status = { coverage: { oldest: "2020-01-01 00:00:00", newest: "2026-06-30 00:00:00", total_events: 123456 } };
-    buildOverview(status, { events }, null);
-    return {
+  // Scenario 14c — the Overview against the LIVE daemon (#1300). The fixture
+  // scenario below drives buildOverview directly, so it cannot catch a route
+  // that was never registered, an authz table that refuses it, or a JSON shape
+  // that drifted from the struct. This one renders the real page: two tiles
+  // must come back carrying a real period, and the window line must name the
+  // aggregate's own bounds rather than the "—" a failed fetch would leave.
+  await page.evaluate(() => navigate("overview"));
+  // Wait on the TILES, not on the scope lines: waiting on the thing under test
+  // turns a missing scope into a driver timeout that aborts the rest of the run
+  // instead of one legible failure.
+  await page.waitForFunction(() => document.querySelectorAll(".ov-stat").length === 4, { timeout: 10000 });
+  const ovLive = await page.evaluate(() => ({
+    scopes: Array.from(document.querySelectorAll(".ov-stat")).map((n) => (n.querySelector(".ov-stat-scope") || {}).textContent || ""),
+    win: (document.querySelector(".ov-coverage") || {}).textContent || "",
+    warns: Array.from(document.querySelectorAll(".warn-item")).map((n) => n.textContent),
+  }));
+  ovLive.scopes.every((s) => s.trim() !== "")
+    ? ok("overview (live): every rendered tile carries a scope line")
+    : bad("overview (live): every rendered tile carries a scope line", JSON.stringify(ovLive.scopes));
+  (ovLive.scopes.filter((s) => /^last \d+ h/.test(s)).length === 2)
+    ? ok("overview (live): the window tiles carry a real period from /api/activity")
+    : bad("overview (live): the window tiles carry a real period from /api/activity", JSON.stringify(ovLive));
+  (/window\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(ovLive.win) && !ovLive.warns.some((w) => /window counts could not be loaded/.test(w)))
+    ? ok("overview (live): the window line states the aggregate's own bounds")
+    : bad("overview (live): the window line states the aggregate's own bounds", JSON.stringify(ovLive));
+
+  // Scenario 15 — Overview scope honesty (#686 + #1300): fixture-drive the REAL
+  // buildOverview and pin that (a) every tile states its OWN scope, (b) the
+  // period-scoped numbers come from the /api/activity aggregate rather than
+  // from the handful of events the Recent-changes list renders, and (c) the
+  // window line uses the AGGREGATE's bounds — a reintroduced
+  // status.coverage.oldest fallback (#679/#684) fails here and nowhere else,
+  // since the Go suite never renders app.js.
+  //
+  // The fixture is built so the two sources DISAGREE on purpose: the events
+  // array holds 1 delete across 1 table, the aggregate says 17 deletes across
+  // 5. A tile that recomputes from the events (the pre-#1300 behaviour) prints
+  // 1 and 1 and fails.
+  const mkev = (ts, type, pk) => ({ event_timestamp: ts, schema_name: "ovfix", table_name: "t", event_type: type, pk_values: pk, changed_columns: [] });
+  const ovFix = {
+    events: [mkev("2026-03-01 10:30:00", "DELETE", "9"), mkev("2026-03-01 10:00:00", "INSERT", "8")],
+    // oldest is a decade before the aggregate's window: if it ever reaches the
+    // window line or a tile, the number is attributed to the wrong span.
+    status: { coverage: { oldest: "2020-01-01 00:00:00", newest: "2026-06-30 00:00:00", total_events: 123456 }, total_events_estimate: 3121 },
+    activity: {
+      period: "24h", label: "last 24 h",
+      since: "2026-03-01 09:00:00", until: "2026-03-02 09:00:00",
+      total: 640, inserts: 400, updates: 223, deletes: 17, other: 0,
+      tables: 5, complete: true,
+      top_tables: [{ schema: "ovfix", table: "orders", insert: 300, update: 200, delete: 10, total: 510 }],
+    },
+  };
+
+  const ov = await page.evaluate((fx) => {
+    const readTiles = () => Array.from(document.querySelectorAll(".ov-stat")).map((n) => ({
+      v: (n.querySelector(".ov-stat-v") || {}).textContent || "",
+      k: (n.querySelector(".ov-stat-k") || {}).textContent || "",
+      scope: (n.querySelector(".ov-stat-scope") || {}).textContent || "",
+    }));
+    const notes = () => Array.from(document.querySelectorAll(".warn-item")).map((n) => n.textContent);
+    buildOverview(fx.status, { events: fx.events }, null, fx.activity);
+    const full = {
+      tiles: readTiles(),
       win: (document.querySelector(".ov-coverage") || {}).textContent || "",
-      sub: (document.querySelector(".page-sub") || {}).textContent || "",
     };
-  });
-  (ov.win.includes("2026-03-01 10:00:00") && ov.win.includes("2026-03-01 10:30:00") && !ov.win.includes("2020-01-01"))
-    ? ok("overview: window line uses the fetched window's own bounds")
-    : bad("overview: window line uses the fetched window's own bounds", ov.win);
-  (ov.sub.includes("1 delete(s)") && ov.sub.includes("2 event(s)"))
-    ? ok("overview: subhead counts come from the fetched window")
-    : bad("overview: subhead counts come from the fetched window", ov.sub);
+    // Degraded arms, rendered through the SAME real function: a partial
+    // aggregate must SAY partial on the tiles it scopes (a narrower number
+    // under a wider label is the bug), and a failed aggregate must render "—"
+    // rather than a zero nobody measured.
+    buildOverview(fx.status, { events: fx.events }, null,
+      Object.assign({}, fx.activity, { complete: false, notes: ["3 hour(s) of this window have been archived to Parquet and are NOT counted here."] }));
+    const partial = { tiles: readTiles(), notes: notes() };
+    buildOverview(fx.status, { events: fx.events }, null, null);
+    const missing = { tiles: readTiles(), notes: notes() };
+    return { full, partial, missing };
+  }, ovFix);
+
+  const tileBy = (tiles, key) => tiles.find((t) => t.k === key) || { v: "", k: "", scope: "" };
+  (ov.full.tiles.length === 4 && ov.full.tiles.every((t) => t.scope.trim() !== ""))
+    ? ok("overview: every tile states its own scope")
+    : bad("overview: every tile states its own scope", JSON.stringify(ov.full.tiles));
+  (tileBy(ov.full.tiles, "deletes").v === "17" && tileBy(ov.full.tiles, "deletes").scope.includes("last 24 h"))
+    ? ok("overview: the deletes tile is the server aggregate, labelled with its period")
+    : bad("overview: the deletes tile is the server aggregate, labelled with its period", JSON.stringify(tileBy(ov.full.tiles, "deletes")));
+  (tileBy(ov.full.tiles, "tables touched").v === "5" && tileBy(ov.full.tiles, "tables touched").scope.includes("last 24 h"))
+    ? ok("overview: the tables-touched tile is the server aggregate, labelled with its period")
+    : bad("overview: the tables-touched tile is the server aggregate, labelled with its period", JSON.stringify(tileBy(ov.full.tiles, "tables touched")));
+  // total_events_estimate is information_schema TABLE_ROWS — an InnoDB
+  // estimate. It sits beside three exact counts, so the tile has to say so.
+  (tileBy(ov.full.tiles, "changes indexed").scope.includes("all time") && /estimate/i.test(tileBy(ov.full.tiles, "changes indexed").scope))
+    ? ok("overview: the all-time tile declares both its scope and that it is an estimate")
+    : bad("overview: the all-time tile declares both its scope and that it is an estimate", JSON.stringify(tileBy(ov.full.tiles, "changes indexed")));
+  (ov.full.win.includes("2026-03-01 09:00:00") && ov.full.win.includes("2026-03-02 09:00:00") && !ov.full.win.includes("2020-01-01"))
+    ? ok("overview: window line uses the aggregate's own bounds")
+    : bad("overview: window line uses the aggregate's own bounds", ov.full.win);
+  (tileBy(ov.partial.tiles, "deletes").scope.includes("partial") && ov.partial.notes.some((n) => /archived/.test(n)))
+    ? ok("overview: an incomplete window is marked partial on the tile and explained")
+    : bad("overview: an incomplete window is marked partial on the tile and explained", JSON.stringify(ov.partial));
+  (tileBy(ov.missing.tiles, "deletes").v === "—" && tileBy(ov.missing.tiles, "tables touched").v === "—" && ov.missing.notes.length > 0)
+    ? ok("overview: a failed aggregate shows no number, never a zero")
+    : bad("overview: a failed aggregate shows no number, never a zero", JSON.stringify(ov.missing));
 
   // Scenario 15b — Storage page live (#686): with the daemon opted in
   // (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1) and this server baseline-configured,

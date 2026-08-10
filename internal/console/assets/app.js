@@ -853,58 +853,69 @@ function covCard(c, stamp) {
   return card;
 }
 
+// ovPeriod is the window every count on this page describes. It is a page-level
+// choice, not a per-tile one: two tiles side by side under different periods is
+// the exact confusion #1300 is about.
+let ovPeriod = "24h";
+
 async function renderOverview() {
   const gen = serverGen, vgen = viewGen;
   viewLoading();
   try {
-    const [status, eventsData, coverage] = await Promise.all([
+    const [status, eventsData, coverage, activity] = await Promise.all([
       api("/api/status").catch(() => null),
-      api("/api/events?limit=200&order=DESC"),
+      // Only the Recent-changes list needs event ROWS, and it renders 8 of
+      // them. The tiles' counts come from /api/activity now (#1300), so this
+      // page no longer pulls ~700 kB of before/after row images to derive four
+      // integers — and the integers no longer describe a fetch size.
+      api("/api/events?limit=8&order=DESC"),
       // A failed fetch must render the same red "unavailable" card the
       // nil-db path gets — a swallowed null would make a broken endpoint
       // indistinguishable from a console without the feature.
       api("/api/coverage").catch((err) => { console.error("coverage fetch failed", err); return { continuity: "unavailable" }; }),
+      // null on failure, never {} — buildOverview renders "—" for a missing
+      // aggregate. A zero-filled fallback would print "0 deletes in the last
+      // 24 h", an assurance nobody measured.
+      api("/api/activity?period=" + encodeURIComponent(ovPeriod)).catch((err) => { console.error("activity fetch failed", err); return null; }),
     ]);
     if (gen !== serverGen || vgen !== viewGen) return;
-    buildOverview(status, eventsData, coverage); // render INSIDE the try: a throw here shows an error, never a stuck "Loading…"
+    buildOverview(status, eventsData, coverage, activity); // render INSIDE the try: a throw here shows an error, never a stuck "Loading…"
   } catch (err) {
     if (gen !== serverGen || vgen !== viewGen) return;
     const v = VIEW(); clear(v); v.append(pageHead("Overview", null)); renderError(v, err);
   }
 }
 
-// buildOverview renders the dashboard from the two fetched payloads. status may
-// be null (its fetch is best-effort); when it is, we do NOT claim a global
-// total — `events` is only the fetched window (limit 200), never the index size.
-function buildOverview(status, eventsData, coverage) {
+// buildOverview renders the dashboard from the fetched payloads. status and
+// activity may each be null (their fetches are best-effort); when one is, the
+// tiles it feeds read "—". Every tile carries its OWN scope line, because these
+// numbers get screenshotted into incident channels without the page around them
+// (#1300): "N deletes" beside "N changes indexed" invites reading the first as a
+// share of the second, and before this they were different denominators.
+function buildOverview(status, eventsData, coverage, activity) {
   if (status) updateSideMeta(status);
 
   const events = (eventsData && eventsData.events) || [];
   const cov = (status && status.coverage) || {};
   const total = status ? (status.total_events_estimate || cov.total_events || "—") : "—";
-  const deletes = events.filter((e) => e.event_type === "DELETE").length;
-
-  // Aggregate the fetched window by table.
-  const byTable = new Map();
-  for (const e of events) {
-    const k = e.schema_name + "." + e.table_name;
-    let s = byTable.get(k);
-    if (!s) { s = { key: k, insert: 0, update: 0, delete: 0, total: 0 }; byTable.set(k, s); }
-    s.total++;
-    if (e.event_type === "INSERT") s.insert++;
-    else if (e.event_type === "UPDATE") s.update++;
-    else if (e.event_type === "DELETE") s.delete++;
-  }
-  const tables = Array.from(byTable.values()).sort((a, b) => b.total - a.total);
+  // Window counts: server-side, over a stated period — never derived from the
+  // events above, which are only the 8 rows the Recent-changes list shows.
+  const deletes = activity ? activity.deletes : null;
+  const tableCount = activity ? activity.tables : null;
+  const tables = (activity && activity.top_tables || []).map((t) => ({
+    key: t.schema + "." + t.table, insert: t.insert, update: t.update, delete: t.delete, total: t.total,
+  }));
   const latest = (events[0] && events[0].event_timestamp) || "—";
-  const earliest = events.length ? events[events.length - 1].event_timestamp : "—";
+  // The window scope printed on every period-scoped tile. "partial" is not
+  // decoration: the server sets complete=false when part of the window is
+  // archived out of the live index, and a narrower number under a wider label
+  // is the bug this page is fixing.
+  const winScope = activity ? (activity.label + (activity.complete ? "" : " · partial")) : "unavailable";
 
   const v = VIEW(); clear(v);
 
   const sub = el("p", { class: "page-sub" },
-    "What changed recently, and where — your starting point. ",
-    el("b", { text: deletes + " delete(s)" }),
-    " in the last " + events.length + " event(s): the ones worth a look first.");
+    "What changed recently, and where — your starting point. Each figure below states the period it covers.");
   v.append(pageHead("Overview", sub));
 
   // Restore coverage — the live RPO statement (#1194). Best-effort: no card
@@ -914,16 +925,40 @@ function buildOverview(status, eventsData, coverage) {
     v.append(covCard(coverage, { at: covLast.at }));
   }
 
+  // Period picker — the tiles' scope is the operator's choice, so it belongs
+  // beside them rather than baked into a constant.
+  const picker = el("div", { class: "ov-period" }, el("span", { class: "ov-period-k", text: "window" }));
+  ["1h", "6h", "24h"].forEach((p) => {
+    picker.append(el("button", {
+      class: "btn btn-sm" + (p === ovPeriod ? " on" : " btn-ghost"), type: "button", text: p,
+      onclick: () => { if (p !== ovPeriod) { ovPeriod = p; renderOverview(); } },
+    }));
+  });
+  v.append(picker);
+
   // stats
   const stats = el("div", { class: "ov-stats" });
-  stats.append(ovStat(String(total), "changes indexed"));
-  stats.append(ovStat(String(deletes), "deletes", deletes > 0 ? "danger" : ""));
-  stats.append(ovStat(String(tables.length), "tables touched"));
+  // "changes indexed" is status.total_events_estimate — information_schema
+  // TABLE_ROWS, an InnoDB ESTIMATE. Say so on the tile: presenting a sampled
+  // number in the same type as three exact ones is its own quiet lie.
+  stats.append(ovStat(String(total), "changes indexed", "", "all time · estimate"));
+  stats.append(ovStat(deletes === null ? "—" : String(deletes), "deletes", deletes ? "danger" : "", winScope));
+  stats.append(ovStat(tableCount === null ? "—" : String(tableCount), "tables touched", "", winScope));
   const wide = el("div", { class: "ov-stat" },
     el("div", { class: "ov-stat-v small", text: latest }),
-    el("div", { class: "ov-stat-k", text: "most recent change" }));
+    el("div", { class: "ov-stat-k", text: "most recent change" }),
+    el("div", { class: "ov-stat-scope", text: "point in time (UTC)" }));
   stats.append(wide);
   v.append(stats);
+
+  // Whatever the aggregate could not account for, said at the point of use.
+  if (!activity) {
+    v.append(el("div", { class: "warn-item" }, icon("warn"),
+      el("span", { text: "The window counts could not be loaded, so the deletes and tables tiles show no number rather than a zero." })));
+  }
+  (activity && activity.notes || []).forEach((n) => {
+    v.append(el("div", { class: "warn-item" }, icon("warn"), el("span", { text: n })));
+  });
 
   // grid
   const grid = el("div", { class: "ov-grid" });
@@ -949,21 +984,34 @@ function buildOverview(status, eventsData, coverage) {
   tablesPanel.append(el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "Activity by table" })));
   const tbox = el("div", { class: "ov-tables" });
-  tables.slice(0, 12).forEach((s) => tbox.append(ovTableRow(s)));
+  if (!tables.length) {
+    tbox.append(el("div", { class: "ev-empty", text: activity ? "No changes in this window." : "Window activity unavailable." }));
+  }
+  tables.forEach((s) => tbox.append(ovTableRow(s)));
   tablesPanel.append(tbox);
+  // The footer states the AGGREGATE's own bounds. It must never fall back to
+  // status.coverage.oldest (#679/#684/#686): that is the index's whole history,
+  // and printing it under "window" would attribute counts from one period to a
+  // far wider one — the same class of mismatch as the tiles' (#1300).
   tablesPanel.append(el("div", { class: "ov-coverage" },
     el("span", { text: "window" }), " ",
-    el("b", { text: earliest }), " → ", el("b", { text: latest })));
+    el("b", { text: activity ? activity.since : "—" }), " → ", el("b", { text: activity ? activity.until : "—" }),
+    el("span", { text: activity ? " · " + winScope : "" })));
   grid.append(tablesPanel);
 
   v.append(grid);
   viewEnter();
 }
 
-function ovStat(value, key, mod) {
+// ovStat renders one tile. scope is REQUIRED for any tile carrying a number:
+// the tiles are visually identical, so without it a reader cannot tell an
+// all-time total from a window count — which is precisely how "53 deletes" got
+// read as a share of "3121 changes indexed" (#1300).
+function ovStat(value, key, mod, scope) {
   return el("div", { class: "ov-stat" },
     el("div", { class: "ov-stat-v" + (mod ? " " + mod : ""), text: value }),
-    el("div", { class: "ov-stat-k", text: key }));
+    el("div", { class: "ov-stat-k", text: key }),
+    el("div", { class: "ov-stat-scope", text: scope || "" }));
 }
 
 function colsSummary(cols, highlight) {

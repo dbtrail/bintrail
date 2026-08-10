@@ -50,8 +50,16 @@ type routePerm struct {
 // baseline are operator actions; servers:write/delete and settings:read are the
 // administrative surface.
 var apiRoutePerms = []routePerm{
-	// Status + data reads.
+	// Status + data reads. coverage and activity are metadata-only reads over
+	// the index — timestamps, verdicts, per-table counts, never a row image —
+	// so they sit with status on the read-only floor rather than with the
+	// surfaces that serve row history. (coverage was registered in server.go
+	// but never classified here, so every policy-carrying session got a 403 on
+	// the Overview's own coverage card; the drift went unseen because
+	// registeredAPIPatterns, the completeness test's mirror, was missing it too.)
 	{"GET", "/api/status", ext.PermStatusRead},
+	{"GET", "/api/coverage", ext.PermStatusRead},
+	{"GET", "/api/activity", ext.PermStatusRead},
 	{"GET", "/api/events", ext.PermQueryExecute},
 	{"GET", "/api/schemas", ext.PermQueryExecute},
 	{"GET", "/api/reconstruct", ext.PermReconstructExecute},

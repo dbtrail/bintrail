@@ -20,6 +20,8 @@ import (
 // prefix, not a table row, and is covered separately.)
 var registeredAPIPatterns = []struct{ method, pattern string }{
 	{"GET", "/api/status"},
+	{"GET", "/api/coverage"},
+	{"GET", "/api/activity"},
 	{"GET", "/api/schemas"},
 	{"GET", "/api/events"},
 	{"POST", "/api/recover"},
