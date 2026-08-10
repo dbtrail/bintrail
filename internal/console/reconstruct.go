@@ -83,6 +83,11 @@ type capabilitiesResponse struct {
 	// Process-global, like BaselineTrigger — the endpoint does the per-server/
 	// per-mode validation.
 	VerifyTrigger bool `json:"verify_trigger"`
+	// SchemaSnapshotTrigger: this process can refresh a monitored source's
+	// schema snapshot and restart its stream onto it (#1296). Process-global,
+	// like BaselineTrigger — the endpoint does the per-server validation
+	// (source configured, index provisioned, MySQL/MariaDB flavor).
+	SchemaSnapshotTrigger bool `json:"schema_snapshot_trigger"`
 	// Verify: baseline-anchored verify is usable for the SELECTED server — a
 	// baseline destination is configured, mirroring Reconstruct's gate (both
 	// read baseline state with no RBAC redaction, so an active profile also
@@ -181,6 +186,8 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		Monitor:         s.monitorCtrl != nil,
 		BaselineTrigger: s.baselineCtrl != nil,
 		VerifyTrigger:   s.verifyCtrl != nil,
+
+		SchemaSnapshotTrigger: s.schemaSnapCtrl != nil,
 		// recover-cascade is the free tier (like recover) and process-global, gated
 		// only by the RBAC profile (which would make synthesis leak redacted data).
 		RecoverCascade: !s.rbacActiveFor(r),

@@ -610,6 +610,45 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 	}
 }
 
+// ReloadSchema restarts the supervised stream for one entry so it loads the
+// newest schema snapshot (#1296). A stream swaps its metadata resolver only on
+// a DDL event, so a snapshot taken out of band is invisible to it until it
+// restarts — without this, a "refresh the schema snapshot" action would leave
+// capture skipping exactly the tables it was asked to fix.
+//
+// Deliberately NOT Stop+Start. Stop clears the durable gap-loss record as the
+// operator's acknowledgment of permanently lost events; routing a schema
+// refresh through it would erase a data-loss alarm as a side effect of pressing
+// an unrelated button. This cancels the job and relaunches it, leaving
+// stream_state.gap_lost_at untouched — Start then re-hydrates lost_position
+// from it, so the alarm survives.
+//
+// A server this process does not supervise is a no-op success: there is no
+// stream here to reload, and the snapshot it was called for is still valid.
+func (m *monitorSupervisor) ReloadSchema(ctx context.Context, e console.ServerEntry) error {
+	m.mu.Lock()
+	job, ok := m.jobs[e.ID]
+	if ok {
+		delete(m.jobs, e.ID)
+	}
+	m.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	job.cancel()
+	// Wait for the run goroutine to finish: its outermost defer closes done
+	// AFTER releasing the advisory lock, so starting before it lands would make
+	// the new job block on the old one's lock.
+	select {
+	case <-job.done:
+	case <-time.After(15 * time.Second):
+		return errors.New("stream did not stop within 15s; it will finish shutting down in the background — start it again to load the new schema snapshot")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return m.Start(ctx, e)
+}
+
 // Stop implements console.MonitorController. Idempotent; waits briefly for
 // the stream to flush its final checkpoint. An explicit Stop is also the
 // operator's acknowledgment of a recorded data loss: it clears the durable

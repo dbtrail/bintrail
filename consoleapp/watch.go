@@ -425,6 +425,12 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
+	// Refreshing a source's schema snapshot needs no opt-in of its own (#1296):
+	// unlike the baseline trigger it starts no dump and copies no row data — it
+	// re-reads information_schema and restarts that server's stream onto the
+	// result. It is wired wherever the control plane is, because the remedy for
+	// a degraded capture has to be reachable from the console that reports it.
+	cfg.SchemaSnapshotCtrl = newSchemaSnapshotSupervisor(ctx, reloadStreamSchema(supervisor, registry))
 	// One supervisor, TWO independently opt-in features: the manual dump-based
 	// baseline trigger (#613, needs mydumper and BINTRAIL_CONSOLE_BASELINE_TRIGGER=1)
 	// and the periodic refresh (#1171, needs neither — it exists precisely so a
@@ -616,6 +622,12 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// the HTTP requests that start them.
 	supervisor := newMonitorSupervisor(ctx, upIndexDSN, registry, upRotationCfg.Retain)
 	cfg.MonitorCtrl = supervisor
+	// Refreshing a source's schema snapshot needs no opt-in of its own (#1296):
+	// unlike the baseline trigger it starts no dump and copies no row data — it
+	// re-reads information_schema and restarts that server's stream onto the
+	// result. It is wired wherever the control plane is, because the remedy for
+	// a degraded capture has to be reachable from the console that reports it.
+	cfg.SchemaSnapshotCtrl = newSchemaSnapshotSupervisor(ctx, reloadStreamSchema(supervisor, registry))
 	// One supervisor, TWO independently opt-in features: the manual dump-based
 	// baseline trigger (#613, needs mydumper and BINTRAIL_CONSOLE_BASELINE_TRIGGER=1)
 	// and the periodic refresh (#1171, needs neither — it exists precisely so a

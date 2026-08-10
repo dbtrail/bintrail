@@ -82,6 +82,11 @@ var apiRoutePerms = []routePerm{
 	// permission; it is an operator integrity action, tiered with baseline:create.
 	{"POST", "/api/servers/{}/baseline", ext.PermBaselineCreate},
 	{"POST", "/api/servers/{}/verify", ext.PermBaselineCreate},
+	// Refreshing the schema snapshot restarts that server's capture stream, so
+	// it is an operator action, not a read. Like verify it gets no dedicated
+	// permission — the core defines no new one for it; it is tiered with
+	// baseline:create, the operator-maintenance tier it belongs to.
+	{"POST", "/api/servers/{}/schema-snapshot", ext.PermBaselineCreate},
 
 	// Server registry + control-plane. List/get/status/verify-read and the
 	// write-free test probe are reads; create/update/delete/monitor are writes.
@@ -91,6 +96,7 @@ var apiRoutePerms = []routePerm{
 	{"POST", "/api/servers/{}/monitor/start", ext.PermServersWrite},
 	{"POST", "/api/servers/{}/monitor/stop", ext.PermServersWrite},
 	{"GET", "/api/servers/{}/baseline", ext.PermServersRead},
+	{"GET", "/api/servers/{}/schema-snapshot", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify/explain", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify/history", ext.PermServersRead},

@@ -97,6 +97,13 @@ type Config struct {
 	// BINTRAIL_CONSOLE_BASELINE_TRIGGER=1. nil when no refresh loop runs, and the
 	// baseline listing then simply carries no refresh section.
 	BaselineRefresh BaselineRefreshReporter
+	// SchemaSnapshotCtrl re-reads a monitored source's column layout and
+	// restarts that server's stream onto the result (#1296). Wired in by
+	// `bintrail-console watch` alongside MonitorCtrl and needing no separate
+	// opt-in — unlike BaselineCtrl it starts no dump and copies no row data.
+	// nil elsewhere, where the endpoints refuse with 403 and
+	// /api/capabilities reports schema_snapshot_trigger:false.
+	SchemaSnapshotCtrl SchemaSnapshotController
 	// VerifyCtrl runs bintrail verify's engine in-process for a monitored
 	// server (#677). Wired in ONLY by `bintrail-console watch` when the
 	// operator opts in (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1); nil otherwise,
@@ -196,6 +203,9 @@ type Server struct {
 	// baselineRefresh: non-nil only when the watch daemon opted into the
 	// periodic refresh (see Config.BaselineRefresh).
 	baselineRefresh BaselineRefreshReporter
+	// schemaSnapCtrl: non-nil only when this process runs the control plane
+	// (see Config.SchemaSnapshotCtrl).
+	schemaSnapCtrl SchemaSnapshotController
 	// verifyCtrl: non-nil only when the watch daemon opted into in-process
 	// verify runs (see Config.VerifyCtrl).
 	verifyCtrl VerifyController
@@ -381,6 +391,7 @@ func New(cfg Config) (*Server, error) {
 		monitorCtrl:      cfg.MonitorCtrl,
 		baselineCtrl:     cfg.BaselineCtrl,
 		baselineRefresh:  cfg.BaselineRefresh,
+		schemaSnapCtrl:   cfg.SchemaSnapshotCtrl,
 		verifyCtrl:       cfg.VerifyCtrl,
 		verifyHistory:    cfg.VerifyHistory,
 		telemetry:        cfg.Telemetry,
@@ -518,6 +529,12 @@ func (s *Server) buildHandler() http.Handler {
 	// (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1). GET polls the running/last state.
 	api.HandleFunc("POST /api/servers/{id}/baseline", s.recordAction("baseline", s.handleBaselineTrigger))
 	api.HandleFunc("GET /api/servers/{id}/baseline", s.handleBaselineStatus)
+	// Schema-snapshot refresh (#1296): re-read the source's column layout and
+	// restart that server's stream onto it — the remedy the capture-degraded
+	// banner names, which had no button anywhere before. 403 unless this
+	// process runs the control plane.
+	api.HandleFunc("POST /api/servers/{id}/schema-snapshot", s.recordAction("schema_snapshot", s.handleSchemaSnapshotTrigger))
+	api.HandleFunc("GET /api/servers/{id}/schema-snapshot", s.handleSchemaSnapshotStatus)
 	api.HandleFunc("POST /api/servers/{id}/verify", s.recordAction("verify", s.handleVerifyTrigger))
 	api.HandleFunc("GET /api/servers/{id}/verify", s.handleVerifyStatus)
 	api.HandleFunc("GET /api/servers/{id}/verify/explain", s.handleVerifyExplain)

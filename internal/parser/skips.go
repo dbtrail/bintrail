@@ -16,6 +16,7 @@ package parser
 import (
 	"encoding/json"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 )
@@ -32,6 +33,13 @@ const (
 	// counted — e.g. mysql.rds_heartbeat2 is a routine, permanent skip that
 	// must never mark capture degraded).
 	SkipTableNotInSnapshot = "table_not_in_snapshot"
+	// SkipTableExcludedFromSnapshot — the row's table is absent from the
+	// snapshot because the snapshot VALIDATOR excluded it (#1051: no explicit
+	// primary key, or a non-InnoDB engine). Split from SkipTableNotInSnapshot
+	// (#1296) because the two have opposite remedies and merging them hands the
+	// operator a remediation that cannot converge: re-snapshotting excludes
+	// this table again, forever. The fix is on the source's DDL, not here.
+	SkipTableExcludedFromSnapshot = "table_excluded_from_snapshot"
 	// SkipNoResolver — no schema snapshot was available at all.
 	SkipNoResolver = "no_resolver"
 	// SkipUnhandledRowEvent — a RowsEvent type bintrail does not decode
@@ -74,7 +82,29 @@ type SkipStat struct {
 	LastPos           uint64 `json:"last_pos,omitempty"`
 	LastStatementType string `json:"last_statement_type,omitempty"`
 	LastConnectionID  uint32 `json:"last_connection_id,omitempty"`
+
+	// Tables lists the distinct "schema.table" names this reason dropped rows
+	// for, capped at MaxLedgerTables (#1296). Without it an operator is told
+	// changes are missing but not WHICH table's — the first question they ask,
+	// and one only the daemon log could answer before. Absent on a ledger
+	// written by an older daemon: consumers must then name no table at all
+	// rather than present an empty list as "none".
+	Tables []string `json:"tables,omitempty"`
+	// TablesTruncated records that more distinct tables were skipped than
+	// Tables holds. The list is capped because this document is persisted in a
+	// single stream_state column and grows monotonically — an unfiltered source
+	// with thousands of unsnapshotted tables would grow it without bound. With
+	// no flag, a capped list would read as the complete set.
+	TablesTruncated bool `json:"tables_truncated,omitempty"`
+	// LastDetail is the newest per-skip explanation the detection site could
+	// state (today: the snapshot validator's exclusion reason). Display-only
+	// free text, never parsed.
+	LastDetail string `json:"last_detail,omitempty"`
 }
+
+// MaxLedgerTables caps SkipStat.Tables — enough names to act on in one sitting
+// without letting a persisted, monotonic document grow unbounded.
+const MaxLedgerTables = 8
 
 // SkipAttribution locates one skipped event: binlog file/pos, the statement
 // keyword (derived from the statement text, which is then discarded), and the
@@ -85,6 +115,15 @@ type SkipAttribution struct {
 	Pos           uint64
 	StatementType string
 	ConnectionID  uint32
+	// Schema and Table name the table whose rows were dropped. Kept as two
+	// plain strings, not a slice: RecordSkipAttributed compares this struct
+	// against its zero value with ==, which a slice field would break at
+	// compile time.
+	Schema string
+	Table  string
+	// Detail is a short human explanation of THIS skip (today: the snapshot
+	// validator's exclusion reason). Optional.
+	Detail string
 }
 
 // SkipCounters aggregates capture-time skips by reason. Safe for concurrent
@@ -163,20 +202,48 @@ func (c *SkipCounters) RecordSkipAttributed(reason string, attr SkipAttribution)
 	if attr != (SkipAttribution{}) {
 		st.LastFile, st.LastPos = attr.File, attr.Pos
 		st.LastStatementType, st.LastConnectionID = attr.StatementType, attr.ConnectionID
+		if attr.Detail != "" {
+			st.LastDetail = attr.Detail
+		}
+		if attr.Table != "" {
+			addLedgerTable(&st, attr.Schema, attr.Table)
+		}
 	}
 	c.byReason[reason] = st
 	c.consecutive++
 	if c.consecutive >= SkipEscalationThreshold && !c.escalated {
 		c.escalated = true
 		remediation := "the schema snapshot is likely stale or corrupt — run `bintrail snapshot` against the source, then restart the stream"
-		if reason == SkipStatementFormatDML {
+		switch reason {
+		case SkipStatementFormatDML:
 			remediation = "set binlog_format=ROW server-wide on the source (a STATEMENT/MIXED format or a session-level override is producing row-less events)"
+		case SkipTableExcludedFromSnapshot:
+			// Never point this reason at `bintrail snapshot`: the validator
+			// excludes the same table on every re-run (#1051/#1199), so that
+			// remediation loops forever while the operator believes they fixed it.
+			remediation = "these tables are excluded from every snapshot by validation — give each an explicit PRIMARY KEY on an InnoDB engine at the source; re-snapshotting alone will not capture them"
 		}
 		c.logger.Error("sustained event skipping — capture is effectively stopped: every recent event was read from the stream and discarded, while the checkpoint keeps advancing past them; the skipped changes are NOT in the index",
 			"consecutive_skips", c.consecutive,
 			"reason", reason,
 			"remediation", remediation)
 	}
+}
+
+// addLedgerTable adds "schema.table" to st.Tables if it is new and the cap
+// allows, flagging TablesTruncated otherwise. Insertion order is preserved (the
+// first tables to break are the ones that broke first); dedup is linear because
+// the slice never exceeds MaxLedgerTables entries.
+func addLedgerTable(st *SkipStat, schema, table string) {
+	name := schema + "." + table
+	if slices.Contains(st.Tables, name) {
+		return
+	}
+	if len(st.Tables) >= MaxLedgerTables {
+		st.TablesTruncated = true
+		return
+	}
+	st.Tables = append(st.Tables, name)
 }
 
 // RecordCaptured notes that an event cleared every guard and was emitted for

@@ -2281,12 +2281,97 @@ function captureHealthBox(stream) {
   if (!stream || !stream.capture_health || stream.capture_health.status !== "degraded") return null;
   const h = stream.capture_health;
   const box = el("div", { class: "warn-box" });
-  box.append(el("b", { text: "⚠ Capture degraded — events are being skipped" }));
+  box.append(el("b", { text: "⚠ Capture incomplete — some changes were not indexed" }));
   const reasons = Object.keys(h.skipped || {}).sort().join(", ");
   box.append(el("div", { text: h.total_skipped + " event(s) were read from the stream but not indexed" +
     (reasons ? " (" + reasons + ")" : "") + (h.last_skip_at ? "; last " + h.last_skip_at : "") + "." }));
-  box.append(el("div", { text: "Changes in those events are missing from the index. Most often the schema snapshot is stale — take a fresh snapshot on the source, then check the capture log." }));
+  // Cause, remedy and scope come from the backend (status.ExplainCaptureSkips),
+  // the same strings `bintrail status` prints — the console must not re-author
+  // this advice in JavaScript, because the half that drifts is always the half
+  // saying what a remedy does NOT recover. The fallback covers a daemon too old
+  // to send the field, and deliberately promises nothing on its behalf.
+  const lines = (Array.isArray(h.explanation) && h.explanation.length) ? h.explanation
+    : ["Changes in those events are missing from the index. This daemon is too old to say why — run `bintrail status` against this index for the reason and the fix."];
+  lines.forEach((t) => box.append(el("div", { class: "warn-line", text: t })));
+  const action = schemaSnapshotButton();
+  if (action) box.append(action);
   return box;
+}
+
+// schemaSnapshotButton renders the Refresh-schema-snapshot action for the
+// selected server, or null when this console cannot perform it (#1296). It
+// exists because the old banner named a remedy with no button anywhere in the
+// UI, leaving the CLI — in a different container — as the only route.
+//
+// Gated on a real REGISTRY server: the reserved "default" entry is the daemon's
+// own command-line stream, which the control plane does not supervise and the
+// endpoint refuses with 409. The label never says just "snapshot": the button
+// next to it creates a BASELINE (a full copy of the data), and the two artifacts
+// were already being confused.
+function schemaSnapshotButton() {
+  const id = currentServer || defaultServerId;
+  if (!capsCache.schema_snapshot_trigger || !id || id === "default") return null;
+  const wrap = el("div", { class: "warn-actions" });
+  const btn = el("button", { class: "btn btn-sm", type: "button", text: "Refresh schema snapshot" });
+  btn.onclick = () => refreshSchemaSnapshot(id, btn);
+  wrap.append(btn);
+  return wrap;
+}
+
+// refreshSchemaSnapshot re-reads the source's column layout and restarts that
+// server's capture stream onto it, then reports what actually happened. The
+// three outcomes are reported separately on purpose: a failed snapshot, a
+// snapshot whose stream did NOT reload (capture is still on the old layout —
+// nothing is fixed yet), and tables validation excluded (those stay uncaptured
+// no matter how often this runs).
+async function refreshSchemaSnapshot(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Refreshing…"; }
+  const restore = () => { if (btn) { btn.disabled = false; btn.textContent = "Refresh schema snapshot"; } };
+  try {
+    await api("/api/servers/" + encodeURIComponent(id) + "/schema-snapshot", { method: "POST", body: {} });
+  } catch (err) {
+    toast("Schema snapshot failed: " + ((err && err.message) || err));
+    restore();
+    return;
+  }
+  toast("Reading the source's table layout…");
+  const done = await pollSchemaSnapshot(id);
+  restore();
+  if (!done) { toast("Schema snapshot still running — check back shortly."); return; }
+  if (done.state !== "succeeded") {
+    toast("Schema snapshot failed: " + (done.last_error || "unknown error"));
+    return;
+  }
+  let msg = "Schema snapshot updated: " + (done.tables || 0) + " table(s).";
+  msg += done.stream_reloaded
+    ? " Capture restarted on it."
+    : " Capture is STILL using the previous snapshot" + (done.reload_error ? " (" + done.reload_error + ")" : "") + ".";
+  if ((done.excluded_tables || []).length) {
+    msg += " Still not captured (no primary key / not InnoDB): " + done.excluded_tables.join(", ") + ".";
+  }
+  msg += " Events already skipped stay missing.";
+  toast(msg);
+  renderStatus();
+}
+
+// pollSchemaSnapshot polls until the job leaves "running" (or a ~2-minute cap:
+// a snapshot is an information_schema read plus a stream restart, not a dump).
+// Returns the terminal status, or null if it never settled. Transient poll
+// errors are retried — the stream restart briefly disturbs nothing else, but a
+// blip must not be reported as a failed snapshot.
+async function pollSchemaSnapshot(id) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 60; i++) {
+    await sleep(2000);
+    let st;
+    try {
+      st = (await api("/api/servers/" + encodeURIComponent(id) + "/schema-snapshot")).schema_snapshot;
+    } catch (_) {
+      continue;
+    }
+    if (st && st.state !== "running") return st;
+  }
+  return null;
 }
 
 // PG_HEALTH_STALE_SEC: a source_health snapshot older than this reads as STALE. The

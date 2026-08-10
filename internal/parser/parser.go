@@ -526,7 +526,7 @@ func handleRows(
 		// (persisted on the stream; run-scoped + end-of-run summary in file
 		// mode, which has no capture ledger by design — an empty stream_state
 		// is file mode's "no capture ran" marker).
-		_, excludedByValidation := resolver.ExclusionReason(schema, table)
+		exclusionReason, excludedByValidation := resolver.ExclusionReason(schema, table)
 		if gapTracker != nil && !excludedByValidation && !isSnapshotExcludedSchema(schema) && !eventPredatesSnapshot(binlogEv, resolver) {
 			if gapTracker.record(fmt.Sprintf("%s.%s not in snapshot %d at %s:%d", schema, table, schemaVersion, filename, binlogEv.Header.LogPos)) {
 				logger.Error("schema gap: skipping rows for a table absent from the snapshot at-or-after snapshot time — the snapshot is stale; this file will be marked failed (run `bintrail snapshot`, then re-index)",
@@ -536,8 +536,26 @@ func handleRows(
 		// Stream path (#1034): count the discard so `status` can show it —
 		// except for snapshot-excluded system schemas (e.g. mysql.rds_heartbeat2),
 		// a routine permanent skip that must never mark capture degraded.
+		//
+		// The two causes go under DIFFERENT reasons (#1296): a table missing
+		// because the snapshot never saw it is fixed by a fresh snapshot, while
+		// a VALIDATION-EXCLUDED table is re-excluded by every future snapshot,
+		// so one shared reason would make `status` hand half of these operators
+		// a remediation that can never converge. The table name rides along so
+		// the verdict can say WHICH table stopped being captured instead of
+		// leaving that answer only in this log line.
 		if !isSnapshotExcludedSchema(schema) {
-			skips.RecordSkip(SkipTableNotInSnapshot)
+			reason := SkipTableNotInSnapshot
+			if excludedByValidation {
+				reason = SkipTableExcludedFromSnapshot
+			}
+			skips.RecordSkipAttributed(reason, SkipAttribution{
+				File:   filename,
+				Pos:    uint64(binlogEv.Header.LogPos),
+				Schema: schema,
+				Table:  table,
+				Detail: exclusionReason,
+			})
 		}
 		return nil
 	}
@@ -564,7 +582,15 @@ func handleRows(
 					"file", filename, "pos", binlogEv.Header.LogPos, "schema", schema, "table", table)
 			}
 		}
-		skips.RecordSkip(SkipColumnCountMismatch)
+		// Same reasoning as the not-in-snapshot site above (#1296): name the
+		// table in the ledger so the status verdict can say which table stopped
+		// being captured. This reason's fix IS a fresh snapshot.
+		skips.RecordSkipAttributed(SkipColumnCountMismatch, SkipAttribution{
+			File:   filename,
+			Pos:    uint64(binlogEv.Header.LogPos),
+			Schema: schema,
+			Table:  table,
+		})
 		return nil
 	}
 

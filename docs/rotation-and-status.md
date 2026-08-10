@@ -449,9 +449,27 @@ checkpoint, surviving restarts) and `status` renders the verdict:
   Continuity:      no gaps in the captured range (not a liveness check)
   Capture health:  ⚠ DEGRADED — 41,203 events skipped (column_count_mismatch), last 2026-07-17 12:24:12
   Skipped events were read from the stream but NOT indexed — a restore window
-  over them is incomplete. Most often the schema snapshot is stale or corrupt:
-  run `bintrail snapshot` against the source, then check the daemon log.
+  over them is incomplete.
+  shop.plugin_log changed on the source but is missing from the schema snapshot
+  capture decodes against, so those row events could not be indexed. […]
+  Fix: refresh the schema snapshot for this source — the record of each table's
+  columns that capture decodes against (not a baseline, which is a full copy of
+  the data). […]
+  None of this recovers what was already skipped: those changes are absent from
+  the index for good unless the source still has the binlogs covering that
+  window […]
+  Per-event detail is in the log of the process capturing this source […]
 ```
+
+The block after the verdict is the same text the [web console](console.md)
+shows, built once in `internal/status` and shipped in the JSON as
+`capture_health.explanation`, so the two surfaces cannot tell different
+stories. It names the affected tables, distinguishes the ordinary cause (a new
+table appeared and the stream's own auto-snapshot did not follow it) from the
+one a re-snapshot can never fix (a table validation excluded — see below), and
+says plainly that **a fresh snapshot fixes capture going forward only**: events
+already skipped stay missing unless the source still has the binlogs covering
+that window.
 
 | Text | Meaning |
 |---|---|
@@ -460,8 +478,11 @@ checkpoint, surviving restarts) and `status` renders the verdict:
 | *(line absent)* | Unknown — a legacy index, or one no skip-aware daemon has written; `OK` is never asserted from absent data |
 
 Skip reasons include `column_count_mismatch` (stale/corrupt snapshot),
-`table_not_in_snapshot`, `no_resolver`, `unhandled_row_event`, and
-`statement_format_dml` (a STATEMENT/MIXED-format DML whose row image is not in
+`table_not_in_snapshot` (a table the snapshot never saw — fixed by a fresh
+snapshot), `table_excluded_from_snapshot` (a table snapshot validation left out
+because it has no explicit primary key or is not InnoDB — a fresh snapshot
+excludes it again, so the fix is on the source's DDL), `no_resolver`,
+`unhandled_row_event`, and `statement_format_dml` (a STATEMENT/MIXED-format DML whose row image is not in
 the binlog — requires `binlog_format=ROW`). Routine skips of system schemas
 the snapshot deliberately excludes (e.g. RDS's `mysql.rds_heartbeat2`) are
 **not** counted.
@@ -481,8 +502,14 @@ Under `--format json` the verdict is `stream.capture_health`:
 "last_skip_at": "...", "skipped": {"<reason>": {"count": N, "last_at": "..."}}}`;
 the key is omitted when the verdict is unknown. Attributed reasons additionally
 carry `last_file`, `last_pos`, `last_statement_type`, `last_connection_id`
-(omitted when absent). The [web console](console.md)
-Overview shows an orange "Capture degraded" box in the same states.
+(omitted when absent). Table-attributed reasons also carry `tables` (capped, with
+`tables_truncated` when more were skipped than are listed) and `last_detail`;
+the verdict carries `explanation`, the rendered prose above. The
+[web console](console.md) Overview shows an orange "Capture incomplete" box in
+the same states, with a **Refresh schema snapshot** button for a monitored
+server: it re-reads the source's column layout and restarts that server's
+capture onto it (a schema snapshot is not a baseline — it records columns, not
+data), reporting whether the stream actually reloaded.
 
 ### Sections in detail
 

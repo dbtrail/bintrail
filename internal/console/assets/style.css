@@ -1253,6 +1253,11 @@ button { font-family: inherit; }
   border-radius: var(--radius-sm); padding: 12px 14px; margin: 8px 0;
   white-space: pre-wrap;
 }
+/* One paragraph per explanation line (#1296). Without the gap the cause, the
+   fix and the "this does not recover what was already skipped" caveat run
+   together as one block — and the caveat is the part that gets skimmed past. */
+.warn-box .warn-line { margin-top: 8px; }
+.warn-box .warn-actions { margin-top: 10px; }
 .warnings:empty { display: none; }
 .warn-item {
   display: flex; gap: 8px; align-items: flex-start;

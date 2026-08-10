@@ -418,6 +418,81 @@ try {
   cont.missingNeither ? ok("continuity: missing continuity (legacy backend) shows no green") : bad("continuity: missing continuity (legacy backend) shows no green", "rendered green without continuity");
   cont.nilNeither ? ok("continuity: nil stream shows neither box") : bad("continuity: nil stream shows neither box", "rendered a box for nil stream");
 
+  // Scenario 8b — capture-degraded banner (#1296). captureHealthBox is pure
+  // like continuityBox. What it must NOT do again: render advice written in
+  // this file. The cause/remedy/scope prose is built by the backend
+  // (status.ExplainCaptureSkips) and shipped in capture_health.explanation, so
+  // `bintrail status` and the console cannot drift — and the half that drifted
+  // would be the one saying what a remedy does NOT recover. The fixture drives
+  // both the current backend (explanation present) and an older one (absent).
+  const cap = await page.evaluate(() => {
+    const withExpl = captureHealthBox({
+      capture_health: {
+        status: "degraded", total_skipped: 3, last_skip_at: "2026-08-04 19:49:33",
+        skipped: { table_not_in_snapshot: { count: 3, tables: ["shop.plugin_log"] } },
+        explanation: [
+          "shop.plugin_log changed on the source but is missing from the schema snapshot.",
+          "None of this recovers what was already skipped.",
+        ],
+      },
+    });
+    const legacy = captureHealthBox({
+      capture_health: { status: "degraded", total_skipped: 3, skipped: { table_not_in_snapshot: { count: 3 } } },
+    });
+    const okBox = captureHealthBox({ capture_health: { status: "ok" } });
+    const nilBox = captureHealthBox(null);
+    // Render it to confirm the per-paragraph spacing rule resolves — without it
+    // the caveat merges into the wall of text above it.
+    let lineGap = "";
+    if (withExpl) {
+      document.body.appendChild(withExpl);
+      const line = withExpl.querySelector(".warn-line");
+      lineGap = line ? getComputedStyle(line).marginTop : "";
+      withExpl.remove();
+    }
+    return {
+      showsBackendProse: !!withExpl && /shop\.plugin_log/.test(withExpl.textContent)
+        && /recovers what was already skipped/.test(withExpl.textContent),
+      noOperatorBlame: !!withExpl && !/take a fresh snapshot on the source/.test(withExpl.textContent)
+        && !/check the capture log/.test(withExpl.textContent),
+      legacyFallback: !!legacy && /too old to say why/.test(legacy.textContent)
+        && !/recovers what was already skipped/.test(legacy.textContent),
+      okNone: okBox === null,
+      nilNone: nilBox === null,
+      lineGap,
+    };
+  });
+  cap.showsBackendProse ? ok("capture health: banner renders the backend's explanation (table named)") : bad("capture health: banner renders the backend's explanation (table named)", JSON.stringify(cap));
+  cap.noOperatorBlame ? ok("capture health: the old blame-the-operator wording is gone") : bad("capture health: the old blame-the-operator wording is gone", "old copy still rendered");
+  cap.legacyFallback ? ok("capture health: an old backend gets a fallback that promises nothing") : bad("capture health: an old backend gets a fallback that promises nothing", "fallback missing or invents advice");
+  (cap.okNone && cap.nilNone) ? ok("capture health: ok/nil render no banner") : bad("capture health: ok/nil render no banner", `ok=${cap.okNone} nil=${cap.nilNone}`);
+  (cap.lineGap && cap.lineGap !== "0px") ? ok("capture health: explanation paragraphs are spaced apart (CSS applied)") : bad("capture health: explanation paragraphs are spaced apart (CSS applied)", `marginTop=${cap.lineGap}`);
+
+  // Scenario 8c — the remedy is reachable from the UI (#1296). The whole point
+  // of the issue: the banner named an action with no button anywhere. It must
+  // appear for a monitored REGISTRY server, and never for the reserved boot
+  // entry (which the endpoint refuses — a button that 409s is worse than none).
+  const capBtn = await page.evaluate(async () => {
+    const servers = (await api("/api/servers")).servers || [];
+    const registryServer = servers.find((s) => s.kind !== "ephemeral");
+    const before = currentServer;
+    const probe = (id) => {
+      currentServer = id;
+      const box = captureHealthBox({ capture_health: { status: "degraded", total_skipped: 1, skipped: {} } });
+      const btn = box ? Array.from(box.querySelectorAll("button")).find((b) => /Refresh schema snapshot/.test(b.textContent)) : null;
+      return !!btn;
+    };
+    const onRegistry = registryServer ? probe(registryServer.id) : null;
+    const onBoot = probe("default");
+    currentServer = before;
+    return { capOn: !!capsCache.schema_snapshot_trigger, onRegistry, onBoot };
+  });
+  capBtn.capOn ? ok("capture health: schema_snapshot_trigger capability reaches the frontend") : bad("capture health: schema_snapshot_trigger capability reaches the frontend", "capsCache.schema_snapshot_trigger falsy");
+  (capBtn.onRegistry === null || capBtn.onRegistry)
+    ? ok("capture health: Refresh-schema-snapshot button renders for a registry server")
+    : bad("capture health: Refresh-schema-snapshot button renders for a registry server", "no button in the banner");
+  !capBtn.onBoot ? ok("capture health: no Refresh button for the command-line entry") : bad("capture health: no Refresh button for the command-line entry", "offered an action the endpoint refuses");
+
   // Scenario 9 — Storage page AWS-credentials card (#681). credentialsCard is
   // pure (like pgHealthCard/continuityBox): it must lead with a plain-language
   // summary of which credential source is active, never leave the raw signals

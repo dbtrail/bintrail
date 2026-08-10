@@ -130,6 +130,14 @@ type CaptureSkipStat struct {
 	LastPos           uint64 `json:"last_pos,omitempty"`
 	LastStatementType string `json:"last_statement_type,omitempty"`
 	LastConnectionID  uint32 `json:"last_connection_id,omitempty"`
+	// Tables / TablesTruncated / LastDetail mirror parser.SkipStat (#1296):
+	// which tables stopped being captured, whether the capped list is complete,
+	// and the newest per-skip explanation. Empty on a ledger written before
+	// per-table attribution — the explanation must then name no table at all
+	// rather than present the empty list as "none".
+	Tables          []string `json:"tables,omitempty"`
+	TablesTruncated bool     `json:"tables_truncated,omitempty"`
+	LastDetail      string   `json:"last_detail,omitempty"`
 }
 
 // CaptureSkipReasonStatementFormatDML mirrors parser.SkipStatementFormatDML —
@@ -718,8 +726,11 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 					fmt.Fprintf(w, "  Last drop:       %s\n", attr)
 				}
 				fmt.Fprintln(w, "  Skipped events were read from the stream but NOT indexed — a restore window")
-				fmt.Fprintln(w, "  over them is incomplete. Most often the schema snapshot is stale or corrupt:")
-				fmt.Fprintln(w, "  run `bintrail snapshot` against the source, then check the daemon log.")
+				fmt.Fprintln(w, "  over them is incomplete.")
+				// Cause, remedy and scope come from the shared explanation
+				// builder (#1296) so this report and the console cannot tell
+				// two different stories about the same ledger.
+				writeCaptureSkipExplanation(w, skips)
 			} else {
 				fmt.Fprintln(w, "  Capture health:  OK — no events skipped")
 			}
@@ -1112,12 +1123,24 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		LastPos           uint64 `json:"last_pos,omitempty"`
 		LastStatementType string `json:"last_statement_type,omitempty"`
 		LastConnectionID  uint32 `json:"last_connection_id,omitempty"`
+		// Which tables stopped being captured (#1296), and whether the capped
+		// list is the complete set.
+		Tables          []string `json:"tables,omitempty"`
+		TablesTruncated bool     `json:"tables_truncated,omitempty"`
+		LastDetail      string   `json:"last_detail,omitempty"`
 	}
 	type jsonCaptureHealth struct {
 		Status       string                  `json:"status"`
 		TotalSkipped int64                   `json:"total_skipped"`
 		LastSkipAt   string                  `json:"last_skip_at,omitempty"`
 		Skipped      map[string]jsonSkipStat `json:"skipped,omitempty"`
+		// Explanation is the rendered cause/remedy/scope prose (#1296), built by
+		// the same ExplainCaptureSkips the text report uses. It ships over the
+		// wire rather than being re-authored in the console's JavaScript,
+		// because two hand-written copies of this advice drifted once already —
+		// and the half that drifts is the half telling an operator what a
+		// remedy does NOT recover.
+		Explanation []string `json:"explanation,omitempty"`
 	}
 	type jsonStream struct {
 		BintrailID     *string        `json:"bintrail_id"`
@@ -1276,9 +1299,13 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 							LastPos:           st.LastPos,
 							LastStatementType: st.LastStatementType,
 							LastConnectionID:  st.LastConnectionID,
+							Tables:            st.Tables,
+							TablesTruncated:   st.TablesTruncated,
+							LastDetail:        st.LastDetail,
 						}
 					}
 				}
+				ch.Explanation = ExplainCaptureSkips(skips)
 			}
 			jstr.CaptureHealth = ch
 		}
