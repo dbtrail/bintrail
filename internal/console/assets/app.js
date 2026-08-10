@@ -931,7 +931,13 @@ function buildOverview(status, eventsData, coverage, activity) {
   ["1h", "6h", "24h"].forEach((p) => {
     picker.append(el("button", {
       class: "btn btn-sm" + (p === ovPeriod ? " on" : " btn-ghost"), type: "button", text: p,
-      onclick: () => { if (p !== ovPeriod) { ovPeriod = p; renderOverview(); } },
+      // viewGen++ before the re-render, the same staleness guard renderRoute
+      // uses: without it two quick clicks leave two renders in flight, both
+      // pass their own gen check, and whichever fetch lands last paints — so
+      // the tiles can show 6 h of data under a "last 24 h" label. That is the
+      // number-disagrees-with-its-label bug this page is fixing, reintroduced
+      // through the control added for it.
+      onclick: () => { if (p !== ovPeriod) { ovPeriod = p; viewGen++; renderOverview(); } },
     }));
   });
   v.append(picker);

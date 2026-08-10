@@ -50,16 +50,22 @@ type routePerm struct {
 // baseline are operator actions; servers:write/delete and settings:read are the
 // administrative surface.
 var apiRoutePerms = []routePerm{
-	// Status + data reads. coverage and activity are metadata-only reads over
-	// the index — timestamps, verdicts, per-table counts, never a row image —
-	// so they sit with status on the read-only floor rather than with the
-	// surfaces that serve row history. (coverage was registered in server.go
-	// but never classified here, so every policy-carrying session got a 403 on
-	// the Overview's own coverage card; the drift went unseen because
+	// Status + data reads. coverage is metadata about the index — timestamps
+	// and verdicts, plus a table-name half it self-gates on sessionRestricted —
+	// so it sits with status on the read-only floor. (It was registered in
+	// server.go but never classified here, so every policy-carrying session got
+	// a 403 on the Overview's own coverage card; the drift went unseen because
 	// registeredAPIPatterns, the completeness test's mirror, was missing it too.)
+	//
+	// activity does NOT sit there: it aggregates the indexed row data and
+	// reports which tables changed and how often. The giveaway is that its
+	// handler has to apply the profile's DenyTables to be safe — an endpoint
+	// needing data-profile deny rules is not a health read. It is tiered with
+	// query execution, and costs a caller nothing extra: the page that renders
+	// it also reads /api/events.
 	{"GET", "/api/status", ext.PermStatusRead},
 	{"GET", "/api/coverage", ext.PermStatusRead},
-	{"GET", "/api/activity", ext.PermStatusRead},
+	{"GET", "/api/activity", ext.PermQueryExecute},
 	{"GET", "/api/events", ext.PermQueryExecute},
 	{"GET", "/api/schemas", ext.PermQueryExecute},
 	{"GET", "/api/reconstruct", ext.PermReconstructExecute},

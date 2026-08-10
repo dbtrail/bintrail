@@ -8,6 +8,7 @@ import (
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -209,6 +210,23 @@ func TestActivityDenyTablesReachTheQuery(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("the deny clause never reached the query: %v", err)
+	}
+}
+
+// TestActivityRequiresQueryPermission pins the TIER, not merely that the route
+// is classified (which the completeness tests already do). /api/activity
+// aggregates the indexed row data and reports which tables changed and how
+// often; the fact that its handler must apply the profile's DenyTables to be
+// safe is what disqualifies it from the status:read floor. Without this, a
+// future edit can slide it down a tier and nothing notices.
+func TestActivityRequiresQueryPermission(t *testing.T) {
+	perm, classified := permForRoute("GET", "/api/activity")
+	if !classified {
+		t.Fatal("/api/activity is not classified in apiRoutePerms")
+	}
+	if perm != ext.PermQueryExecute {
+		t.Errorf("permission = %q, want %q — activity reads indexed row data, it is not a health read",
+			perm, ext.PermQueryExecute)
 	}
 }
 
