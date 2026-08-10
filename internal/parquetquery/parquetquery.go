@@ -109,7 +109,7 @@ func FetchWithTuning(ctx context.Context, opts query.Options, source string, tun
 		// to avoid downloading parquet files outside the requested time range.
 		// ExtraArchiveHours (#1037) exempts misfiled files — archives whose
 		// label hour lies outside the range but whose content overlaps it.
-		files = filterFilesByTimeRange(files, sinceHint, untilHint, opts.ExtraArchiveHours)
+		files = scopeArchiveFiles(files, opts)
 		// Sort chronologically so we can terminate early when --limit is satisfied.
 		files = sortFilesByHour(files)
 		slog.Debug("files after time-range pruning", "count", len(files))
@@ -442,6 +442,20 @@ func sinceLowerBoundHint(opts query.Options) *time.Time {
 		}
 	}
 	return hint
+}
+
+// scopeArchiveFiles prunes a listed archive file set to the query's EFFECTIVE
+// time bounds — the keyset-cursor-tightened ones, not the raw Since/Until.
+//
+// It exists as a named function rather than an inline call so the composition
+// is reachable from a test. Passing opts.Since/opts.Until here instead of the
+// hints is invisible to every correctness test (the row-level predicate still
+// makes the exact cut, so results are identical) and merely re-downloads the
+// whole window's files once per page — a regression that would only ever show
+// up as an S3 bill. TestScopeArchiveFiles_prunesAboveTheCursor is what makes
+// it fail loudly instead.
+func scopeArchiveFiles(files []string, opts query.Options) []string {
+	return filterFilesByTimeRange(files, sinceLowerBoundHint(opts), untilUpperBoundHint(opts), opts.ExtraArchiveHours)
 }
 
 // untilUpperBoundHint is sinceLowerBoundHint's mirror for newest-first paging

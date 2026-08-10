@@ -125,3 +125,46 @@ func TestFetch_rejectsBackwardCursorWithASC(t *testing.T) {
 		t.Errorf("error should name the direction rule, got: %v", err)
 	}
 }
+
+// TestScopeArchiveFiles_prunesAboveTheCursor pins the WIRING, not the hint.
+//
+// untilUpperBoundHint can be perfectly correct and still be ignored at the
+// call site, and nothing else would notice: the row-level keyset predicate
+// makes the exact cut either way, so results stay identical and every
+// correctness test keeps passing while each newest-first page silently
+// re-downloads the whole window's archive files. This is the test that fails
+// when the hint stops being threaded through.
+func TestScopeArchiveFiles_prunesAboveTheCursor(t *testing.T) {
+	files := []string{
+		"event_date=2026-07-25/event_hour=08/events.parquet",
+		"event_date=2026-07-25/event_hour=09/events.parquet",
+		"event_date=2026-07-25/event_hour=10/events.parquet",
+		"event_date=2026-07-25/event_hour=12/events.parquet",
+		"event_date=2026-07-25/event_hour=17/events.parquet",
+	}
+	cursor := time.Date(2026, 7, 25, 9, 42, 17, 0, time.UTC)
+	until := time.Date(2026, 7, 25, 18, 0, 0, 0, time.UTC)
+
+	// Without a cursor the whole window is in scope.
+	if got := scopeArchiveFiles(files, query.Options{Until: &until}); len(got) != len(files) {
+		t.Fatalf("cursor-less scoping pruned %d of %d files", len(files)-len(got), len(files))
+	}
+
+	got := scopeArchiveFiles(files, query.Options{
+		Until:       &until,
+		Order:       "DESC",
+		BeforeEvent: &query.EventCursor{Timestamp: cursor, EventID: 7},
+	})
+	// Hours 08–10 stay: 09 holds the cursor, 08 is below it, and 10 is the
+	// one-hour over-inclusion the ceiling deliberately buys. Hours 12 and 17
+	// are entirely above the cursor and can hold nothing this page will return.
+	want := files[:3]
+	if len(got) != len(want) {
+		t.Fatalf("scoped files = %v, want %v (the hint is not reaching the file pruner)", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("scoped[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
