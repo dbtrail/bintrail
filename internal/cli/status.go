@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/status"
 )
 
@@ -55,7 +57,14 @@ var (
 	stFormat      string
 	stBaselineDir string
 	stFailOnGap   bool
-	stFailOnLag   time.Duration
+	// stAckCaptureSkips is the one WRITE this otherwise read-only command can
+	// perform (#1314). It lives on `status` rather than getting its own verb
+	// because this is the command that shows the tally: the operator reading
+	// the alarm is already holding the DSN, and a separate command they have
+	// to discover is a command they will not find. The flag name says the
+	// mutation out loud.
+	stAckCaptureSkips bool
+	stFailOnLag       time.Duration
 )
 
 func init() {
@@ -63,6 +72,7 @@ func init() {
 	statusCmd.Flags().StringVar(&stFormat, "format", "text", "Output format: text or json")
 	statusCmd.Flags().StringVar(&stBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots (optional, shows baseline binlog positions)")
 	statusCmd.Flags().DurationVar(&stFailOnLag, "fail-on-lag", 0, "Exit non-zero if capture is not keeping up: a stalled checkpoint, an unevaluable verdict (fails closed), or a newest indexed event older than this duration (e.g. 15m). TRAFFIC-SENSITIVE: on a source with genuinely quiet periods the age check fires with nothing wrong, so pick a threshold above your quiet windows. Unset (0) never changes the exit code")
+	statusCmd.Flags().BoolVar(&stAckCaptureSkips, "ack-capture-skips", false, "Record that you have seen the current capture-skip tally, then report as usual. The tally is monotonic and never clears itself, so without this a single skip episode keeps `status` non-clean and --fail-on-gap non-zero forever. Nothing is erased: the counts stay, an acknowledgement timestamp is added, and any skip AFTER this one raises the alarm again")
 	statusCmd.Flags().BoolVar(&stFailOnGap, "fail-on-gap", false, "Exit non-zero if the stream lost data (a binlog gap or any recorded capture drops), or its continuity can't be confirmed (fails closed); for CI/cron alerting. By default a gap never changes the exit code")
 	_ = statusCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(statusCmd)
@@ -94,6 +104,33 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 	slog.Debug("connected", "duration_ms", time.Since(t).Milliseconds())
+
+	// The acknowledgement (#1314) runs BEFORE the report is collected, so the
+	// status printed below is the state the operator just created rather than
+	// the one they are retiring — otherwise every acknowledgement is followed
+	// by a screen that looks like it did nothing, which is the exact confusion
+	// this feature exists to end.
+	if stAckCaptureSkips {
+		// EnsureSchema first: capture_skips_ack post-dates most indexes, and
+		// this is a CLI-typed DSN, the one place DDL is allowed to run.
+		if err := indexer.EnsureSchema(db); err != nil {
+			return indexer.WrapSchemaMigrationErr(err)
+		}
+		// -1: no stale-render guard. Unlike a console tab, this reads and
+		// writes in the same breath, so there is no earlier view to protect.
+		ackd, ackErr := status.AcknowledgeCaptureSkips(cmd.Context(), db, -1, time.Now())
+		switch {
+		case errors.Is(ackErr, status.ErrNothingToAcknowledge):
+			// Not an error: an operator who acknowledges a clean ledger got
+			// what they wanted. Saying so beats a non-zero exit on a no-op.
+			fmt.Fprintln(cmd.OutOrStdout(), "Nothing to acknowledge: no capture skips are recorded for this index.")
+		case ackErr != nil:
+			return fmt.Errorf("acknowledge capture skips: %w", ackErr)
+		default:
+			fmt.Fprintf(cmd.OutOrStdout(), "Acknowledged %d skipped event(s) (%s) at %s. The tally is kept; a later skip will alarm again.\n",
+				ackd.Total, strings.Join(ackd.Reasons, ", "), ackd.At.Format(status.TSFmt))
+		}
+	}
 
 	data, err := status.CollectStatus(cmd.Context(), db, dbName)
 	if err != nil {
@@ -186,7 +223,25 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		// a skip-aware daemon wrote it, it may be hiding a loss count, and
 		// "couldn't check" must not read as "fine" (the sibling branches'
 		// stance).
-		if skips, ok := data.Stream.ParseCaptureSkips(); ok {
+		// An ACKNOWLEDGED tally (#1314) does not fail the flag. This is a
+		// deliberate change to exit semantics, not a rendering one: the tally
+		// is monotonic, so before this an operator whose cron went red had
+		// exactly two options — hand-edit the column with the daemon stopped
+		// (destroying the loss record) or delete --fail-on-gap. An alert
+		// nobody can clear is an alert everybody removes, and the next real
+		// loss then lands in silence.
+		//
+		// It is safe because the acknowledgement records a COUNT: one more
+		// skipped event lifts the tally above it and every branch below fires
+		// again with no operator action. The check sits ahead of all of them
+		// because acknowledgement is not per-reason to the operator — they
+		// acknowledged the record, and re-failing on a sibling reason they
+		// already saw would be the same trap in a smaller box.
+		skips, skipsOK := data.Stream.ParseCaptureSkips()
+		switch {
+		case skipsOK && status.CaptureSkipsAcknowledged(skips, data.Stream.ParseCaptureSkipsAck()):
+			// Acknowledged: every branch below is deliberately skipped.
+		case skipsOK:
 			if st := skips[status.CaptureSkipReasonStatementFormatDML]; st.Count > 0 {
 				loc := ""
 				if st.LastFile != "" || st.LastStatementType != "" {
@@ -196,14 +251,14 @@ func runStatus(cmd *cobra.Command, args []string) error {
 					}
 					loc = fmt.Sprintf(" (last: %s at %s:%d, connection id %d)", st.LastStatementType, file, st.LastPos, st.LastConnectionID)
 				}
-				return fmt.Errorf("capture health: %d statement-format DML event(s) permanently uncaptured%s; set binlog_format=ROW server-wide on the source, then acknowledge by clearing stream_state.capture_skips with the daemon stopped (the counter is monotonic); failing closed under --fail-on-gap", st.Count, loc)
+				return fmt.Errorf("capture health: %d statement-format DML event(s) permanently uncaptured%s; set binlog_format=ROW server-wide on the source, then acknowledge this tally with `bintrail status --index-dsn <index> --ack-capture-skips` (it is monotonic and never clears itself; acknowledging erases nothing and a later skip fails this check again); failing closed under --fail-on-gap", st.Count, loc)
 			}
 			// #1206: the restart path stamps this meta-reason when the
 			// previously persisted ledger could not be parsed — a loss tally
 			// may have been destroyed, so a now-readable ledger carrying it
 			// must not read as "fine".
 			if st := skips[status.CaptureSkipReasonUnreadablePreviousLedger]; st.Count > 0 {
-				return fmt.Errorf("capture health: a previous capture ledger was unreadable at daemon restart and its tally is lost — permanent loss may be unrecorded; acknowledge by clearing stream_state.capture_skips with the daemon stopped; failing closed under --fail-on-gap")
+				return fmt.Errorf("capture health: a previous capture ledger was unreadable at daemon restart and its tally is lost — permanent loss may be unrecorded; acknowledge it with `bintrail status --index-dsn <index> --ack-capture-skips` once you have acted on the possibility of unrecorded loss; failing closed under --fail-on-gap")
 			}
 			// #1207: every remaining reason is the same permanent-loss class —
 			// an event read from the stream and dropped is absent from the
@@ -221,9 +276,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			}
 			if dropped > 0 {
 				sort.Strings(reasons)
-				return fmt.Errorf("capture health: %d event(s) read from the stream and permanently dropped (%s); most often the schema snapshot is stale or corrupt — run `bintrail snapshot` against the source and restart the stream, then acknowledge by clearing stream_state.capture_skips with the daemon stopped (the counter is monotonic); failing closed under --fail-on-gap", dropped, strings.Join(reasons, ", "))
+				return fmt.Errorf("capture health: %d event(s) read from the stream and permanently dropped (%s); most often the schema snapshot is stale or corrupt — run `bintrail snapshot` against the source and restart the stream, then acknowledge this tally with `bintrail status --index-dsn <index> --ack-capture-skips` (it is monotonic and never clears itself; acknowledging erases nothing and a later skip fails this check again); failing closed under --fail-on-gap", dropped, strings.Join(reasons, ", "))
 			}
-		} else if data.Stream.CaptureSkips.Valid && strings.TrimSpace(data.Stream.CaptureSkips.String) != "" {
+		case data.Stream.CaptureSkips.Valid && strings.TrimSpace(data.Stream.CaptureSkips.String) != "":
 			return fmt.Errorf("capture health: capture_skips ledger present but unreadable; cannot confirm statement-format DML drops; failing closed under --fail-on-gap")
 		}
 	}

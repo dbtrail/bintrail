@@ -1256,8 +1256,19 @@ button { font-family: inherit; }
 /* One paragraph per explanation line (#1296). Without the gap the cause, the
    fix and the "this does not recover what was already skipped" caveat run
    together as one block — and the caveat is the part that gets skimmed past. */
-.warn-box .warn-line, .ok-box .warn-line { margin-top: 8px; }
-.warn-box .warn-actions, .ok-box .warn-actions { margin-top: 10px; }
+/* an ACKNOWLEDGED capture-skip record (#1314): the loss is still on the page,
+   in the page's own muted text — no colour, no border emphasis. An operator
+   who has read the alarm and said so should not keep being alarmed by it, and
+   deleting the box instead would trade an annoyance for lost evidence. */
+.muted-box {
+  font-family: var(--f-mono); font-size: 12.5px; color: var(--ink-2);
+  background: var(--surface-3); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 12px 14px; margin: 8px 0;
+  white-space: pre-wrap;
+}
+.warn-box .warn-line, .ok-box .warn-line, .muted-box .warn-line { margin-top: 8px; }
+.warn-box .warn-actions, .ok-box .warn-actions, .muted-box .warn-actions { margin-top: 10px; }
+.ack-actions { margin-top: 10px; }
 /* The long-form cause/remedy/scope, collapsed (#1312). It used to render flat
    and unconditionally — ~250 words inside an alarm box, which is the reliable
    way to have none of it read. The summary is the affordance; the caveat about

@@ -104,6 +104,22 @@ func SkipsPredateSnapshot(skips map[string]CaptureSkipStat, snapshotAt time.Time
 	return true
 }
 
+// ackAdvice is the one place that names how to retire a skip record (#1314),
+// shared by every sentence that used to say "stop the daemon and clear
+// stream_state.capture_skips". That advice was wrong twice over: a console
+// operator cannot do it at all, and it DESTROYS the loss record — the tally is
+// the only evidence those events were dropped. Acknowledging keeps it and adds
+// a timestamp.
+//
+// The sentence must carry the re-arming property, not just the button. An
+// operator who reads "mark as read" as "make it go away for good" would never
+// trust it on a system they are responsible for; the reason it is safe is that
+// it retires a COUNT, so the next skip alarms again by itself.
+const ackAdvice = "mark it as read — in the console, the \"Mark as read\" button on this box; on the " +
+	"command line, `bintrail status --index-dsn <index> --ack-capture-skips`. That records the count you " +
+	"saw and the time you saw it, and erases nothing: the tally stays, and if anything is skipped after " +
+	"this the warning comes back on its own."
+
 // acknowledgementLine answers the one question the tally cannot: is this still
 // happening, or am I looking at a record of something already fixed?
 //
@@ -119,9 +135,7 @@ func acknowledgementLine(skips map[string]CaptureSkipStat, snapshotAt time.Time)
 	if snapshotAt.IsZero() {
 		return "This warning does not clear on its own: the tally counts skips that happened, not skips " +
 			"still happening, so it stays after a successful fix. Confirm the fix by watching the count " +
-			"stop rising; to reset the tally, stop capture for this source and clear " +
-			"stream_state.capture_skips in its index."
-	}
+			"stop rising, then " + ackAdvice}
 	if SkipsPredateSnapshot(skips, snapshotAt) {
 		return "Nothing has been skipped since the current schema snapshot was taken (" +
 			snapshotAt.Format(TSFmt) + "). That is not proof the fix took hold — capture does not record " +
@@ -209,8 +223,8 @@ func remedyLine(reason string) string {
 		return "Fix: set binlog_format=ROW server-wide on the source (a session-level override can also " +
 			"produce row-less events)."
 	case CaptureSkipReasonUnreadablePreviousLedger:
-		return "Fix: with the capture daemon stopped, clear stream_state.capture_skips to acknowledge the " +
-			"lost tally; leaving it makes every later status report stay non-clean."
+		return "Fix: there is nothing to repair — the lost tally cannot be recovered. Once you have taken " +
+			"whatever the possibility of unrecorded loss calls for, " + ackAdvice
 	default:
 		return "Fix: see the capture daemon's log for this reason's detail."
 	}

@@ -78,6 +78,12 @@ var apiRoutePerms = []routePerm{
 	{"POST", "/api/recover", ext.PermRecoverExecute},
 	{"POST", "/api/recover-cascade", ext.PermRecoverExecute},
 
+	// Acknowledging a capture-skip tally (#1314) is tiered with the other
+	// actions on that box (servers:write). It writes no data and undoes no
+	// loss — it retires an alarm for every viewer of this server, which is a
+	// control-plane-shaped consequence even though the write is one column.
+	{"POST", "/api/capture-skips/ack", ext.PermServersWrite},
+
 	// Operator maintenance actions on a specific server. verify has no dedicated
 	// permission; it is an operator integrity action, tiered with baseline:create.
 	{"POST", "/api/servers/{}/baseline", ext.PermBaselineCreate},

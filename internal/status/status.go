@@ -114,6 +114,12 @@ type StreamStateInfo struct {
 	// Capture health verdict is then unknown and the line is omitted rather
 	// than asserting OK from absent data (the GapColumnsPresent philosophy).
 	CaptureSkips sql.NullString
+	// CaptureSkipsAck is the raw capture_skips_ack JSON (#1314): the operator's
+	// acknowledgement of the tally above, shaped
+	// {"<reason>":{"count":N,"at":"RFC3339"}}. Invalid on a legacy index without
+	// the column, or one nobody has acknowledged. See acknowledge.go for why an
+	// acknowledgement records a COUNT rather than a fact.
+	CaptureSkipsAck sql.NullString
 	// SchemaSnapshotAt is when the newest schema snapshot in this index was
 	// taken — the layout capture decodes against today. It is the anchor that
 	// makes a monotonic skip tally answerable (#1312): a skip older than this
@@ -429,6 +435,12 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 	if err := loadCaptureSkips(ctx, db, s); err != nil {
 		slog.Warn("could not load capture_skips; keeping stream state without it", "error", err)
 	}
+	// The acknowledgement (#1314) is best-effort too, but note the direction it
+	// fails in: an unreadable ack leaves the verdict UNACKNOWLEDGED, so the
+	// alarm stays up. Losing this column can only ever over-report.
+	if err := loadCaptureSkipsAck(ctx, db, s); err != nil {
+		slog.Warn("could not load capture_skips_ack; capture skips will read as unacknowledged", "error", err)
+	}
 	// The snapshot anchor (#1312) is best-effort for the same reason: it only
 	// SHARPENS the capture verdict, so failing to read it must never cost the
 	// caller the stream state it already has.
@@ -503,6 +515,17 @@ func loadSourceHealth(ctx context.Context, db *sql.DB, s *StreamStateInfo) error
 // CaptureSkips invalid (verdict unknown); any other error is returned.
 func loadCaptureSkips(ctx context.Context, db *sql.DB, s *StreamStateInfo) error {
 	err := db.QueryRowContext(ctx, `SELECT capture_skips FROM stream_state WHERE id = 1`).Scan(&s.CaptureSkips)
+	if isUnknownColumnErr(err) || errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return err
+}
+
+// loadCaptureSkipsAck augments an already-loaded StreamStateInfo with the
+// capture_skips_ack column (#1314) — same tolerance contract as
+// loadCaptureSkips above.
+func loadCaptureSkipsAck(ctx context.Context, db *sql.DB, s *StreamStateInfo) error {
+	err := db.QueryRowContext(ctx, `SELECT capture_skips_ack FROM stream_state WHERE id = 1`).Scan(&s.CaptureSkipsAck)
 	if isUnknownColumnErr(err) || errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -764,7 +787,22 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 		// written the counters — same never-a-false-ok stance as Continuity's
 		// "not evaluated".
 		if skips, ok := stream.ParseCaptureSkips(); ok {
-			if total := totalCaptureSkips(skips); total > 0 {
+			ack := stream.ParseCaptureSkipsAck()
+			switch total := totalCaptureSkips(skips); {
+			case total > 0 && CaptureSkipsAcknowledged(skips, ack):
+				// An ACKNOWLEDGED record (#1314) still prints its tally — the
+				// events are still missing and a restore window over them is
+				// still incomplete — but not the cause/remedy essay. An
+				// operator who read that advice and acted on it gets it
+				// re-printed on every status run forever otherwise, which is
+				// how advice stops being read at all.
+				fmt.Fprintf(w, "  Capture health:  ⚠ ON RECORD — %s events skipped (%s), last %s\n",
+					commaGroup(total), captureSkipReasons(skips), lastCaptureSkip(skips).Format(TSFmt))
+				fmt.Fprintf(w, "  Acknowledged:    %s — that count is retired; a later skip alarms again\n",
+					CaptureSkipsAcknowledgedAt(skips, ack).Format(TSFmt))
+				fmt.Fprintln(w, "  Those events were read from the stream but NOT indexed — a restore window")
+				fmt.Fprintln(w, "  over them is incomplete.")
+			case total > 0:
 				fmt.Fprintf(w, "  Capture health:  ⚠ DEGRADED — %s events skipped (%s), last %s\n",
 					commaGroup(total), captureSkipReasons(skips), lastCaptureSkip(skips).Format(TSFmt))
 				if attr := lastCaptureSkipAttribution(skips); attr != "" {
@@ -776,7 +814,7 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 				// builder (#1296) so this report and the console cannot tell
 				// two different stories about the same ledger.
 				writeCaptureSkipExplanation(w, skips, stream.SchemaSnapshotAt.Time)
-			} else {
+			default:
 				fmt.Fprintln(w, "  Capture health:  OK — no events skipped")
 			}
 		}
@@ -1197,6 +1235,18 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		// change to exit semantics, not a rendering change.
 		SnapshotAt           string `json:"snapshot_at,omitempty"`
 		SkipsPredateSnapshot bool   `json:"skips_predate_snapshot,omitempty"`
+		// Acknowledged / AcknowledgedAt (#1314): an operator has seen this
+		// exact count and retired it. Status stays "degraded" here too, for
+		// the reason above and one more — the events really are still missing,
+		// and a consumer keying on the verdict must not read a human's "seen
+		// it" as the loss being undone. What acknowledgement changes is
+		// LOUDNESS: the console collapses its alarm and --fail-on-gap stops
+		// exiting non-zero, both of which read these fields, not Status.
+		//
+		// The count is what was acknowledged, so a later skip lifts the tally
+		// above it and both surfaces go loud again with no further action.
+		Acknowledged   bool   `json:"acknowledged,omitempty"`
+		AcknowledgedAt string `json:"acknowledged_at,omitempty"`
 	}
 	type jsonStream struct {
 		BintrailID     *string        `json:"bintrail_id"`
@@ -1366,6 +1416,13 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 					ch.SkipsPredateSnapshot = SkipsPredateSnapshot(skips, stream.SchemaSnapshotAt.Time)
 				}
 				ch.Explanation = ExplainCaptureSkips(skips, stream.SchemaSnapshotAt.Time)
+				// Explanation ships even when acknowledged: the console keeps
+				// it behind a disclosure so an operator who wants the cause
+				// back does not have to leave the page for it.
+				if ack := stream.ParseCaptureSkipsAck(); CaptureSkipsAcknowledged(skips, ack) {
+					ch.Acknowledged = true
+					ch.AcknowledgedAt = CaptureSkipsAcknowledgedAt(skips, ack).Format(TSFmt)
+				}
 			}
 			jstr.CaptureHealth = ch
 		}

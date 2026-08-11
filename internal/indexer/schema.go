@@ -188,6 +188,7 @@ const ddlStreamState = `CREATE TABLE IF NOT EXISTS stream_state (
     gap_lost_detail  TEXT            DEFAULT NULL COMMENT 'human-readable description of the lost gap',
     source_health    JSON            DEFAULT NULL COMMENT 'latest source-side health snapshot (PostgreSQL: replication-slot wal_status/lag + REPLICA IDENTITY coverage) with an embedded checked_at; serialized payload, source-agnostic column',
     capture_skips    JSON            DEFAULT NULL COMMENT 'per-reason monotonic counters of events the daemon read and chose to drop (#1034): {"<reason>":{"count":N,"last_at":"RFC3339"}}; {} = evaluated and clean; NULL = no skip-aware daemon has written yet',
+    capture_skips_ack JSON           DEFAULT NULL COMMENT 'operator acknowledgement of capture_skips (#1314): {"<reason>":{"count":N,"at":"RFC3339"}}. Written ONLY by an explicit acknowledgement, never by the capture daemon — which is why it cannot live inside capture_skips, a column every checkpoint overwrites. A reason is acknowledged while ack.count >= skips.count, so a new skip raises the alarm again on its own',
     CONSTRAINT single_row CHECK (id = 1)
 ) ENGINE=InnoDB`
 

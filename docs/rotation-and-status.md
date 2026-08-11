@@ -409,10 +409,26 @@ also fails closed until acknowledged (same runbook as below).
 
 The drop counter is **monotonic for the life of the index** — fixing
 `binlog_format` stops new drops but does not clear the count (the dropped
-changes stay lost). To acknowledge after remediation: stop the capture daemon,
-clear the ledger (`UPDATE stream_state SET capture_skips = '{}' WHERE id = 1` on
-your index), and restart — clearing it with the daemon running is ineffective,
-the next checkpoint re-persists the in-memory tallies.
+changes stay lost). To retire the alert after remediation, **acknowledge** it:
+
+```sh
+bintrail status --index-dsn "$IDX" --ack-capture-skips
+```
+
+or press **Mark as read** on the capture-health box in the web console. Either
+one records the count you saw and the moment you saw it in
+`stream_state.capture_skips_ack`; nothing is erased, `status` keeps reporting
+the tally, and `--fail-on-gap` stops failing on it.
+
+Acknowledgement covers a **count**, not the problem: if anything is skipped
+afterwards the tally rises above what was acknowledged and both the alert and
+the console's alarm come back with no further action. That is what makes it
+safe to press — it can retire a record, it cannot mute the next incident.
+
+Do **not** clear `capture_skips` by hand. That was the old advice and it is
+worse in both directions: the counts are the only evidence those events were
+dropped, and clearing them with the daemon running is ineffective anyway (the
+next checkpoint re-persists the in-memory tallies).
 
 ```sh
 bintrail status --index-dsn "$IDX" --fail-on-gap || alert "dbtrail lost events"
@@ -475,6 +491,7 @@ that window.
 |---|---|
 | `OK — no events skipped` | A skip-aware daemon has evaluated the stream and dropped nothing |
 | `⚠ DEGRADED — N events skipped (<reasons>), last <ts>` | N events were read and discarded; the reasons and the most recent skip time follow |
+| `⚠ ON RECORD — N events skipped (<reasons>), last <ts>` | The same loss, acknowledged by an operator: still reported, no longer alerting. A later skip returns it to `DEGRADED` |
 | *(line absent)* | Unknown — a legacy index, or one no skip-aware daemon has written; `OK` is never asserted from absent data |
 
 Skip reasons include `column_count_mismatch` (stale/corrupt snapshot),

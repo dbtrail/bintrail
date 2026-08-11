@@ -539,6 +539,10 @@ func (s *Server) buildHandler() http.Handler {
 	// action's signal entirely.
 	api.HandleFunc("POST /api/servers/{id}/schema-snapshot", s.recordAction("schema-snapshot", s.handleSchemaSnapshotTrigger))
 	api.HandleFunc("GET /api/servers/{id}/schema-snapshot", s.handleSchemaSnapshotStatus)
+	// Capture-skip acknowledgement (#1314): retire a monotonic skip tally that
+	// otherwise renders its alarm forever. Header-selected like /api/status —
+	// see the handler on why it is not a /api/servers/{id} route.
+	api.HandleFunc("POST /api/capture-skips/ack", s.recordAction("capture-skips-ack", s.handleCaptureSkipsAck))
 	api.HandleFunc("POST /api/servers/{id}/verify", s.recordAction("verify", s.handleVerifyTrigger))
 	api.HandleFunc("GET /api/servers/{id}/verify", s.handleVerifyStatus)
 	api.HandleFunc("GET /api/servers/{id}/verify/explain", s.handleVerifyExplain)

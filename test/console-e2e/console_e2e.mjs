@@ -460,6 +460,18 @@ try {
         explanation: ["Nothing has been skipped since the current schema snapshot was taken (2026-08-11 12:00:00)."],
       },
     });
+    // Acknowledged (#1314): the same permanent loss, retired by an operator.
+    // It must go MUTED (not the green "nothing since the snapshot" box — that
+    // one is a claim about capture, this one is a claim about a human), keep
+    // stating the loss, and stop offering the button it already consumed.
+    const acked = captureHealthBox({
+      capture_health: {
+        status: "degraded", total_skipped: 3, last_skip_at: "2026-08-04 19:49:33",
+        acknowledged: true, acknowledged_at: "2026-08-11 20:14:00",
+        skipped: { table_not_in_snapshot: { count: 3 } },
+        explanation: ["Nothing has been skipped since the current schema snapshot was taken (2026-08-11 12:00:00)."],
+      },
+    });
     // Render it to confirm the per-paragraph spacing rule resolves — without it
     // the caveat merges into the wall of text above it. The lines now live in a
     // <details>, so it must be opened before measuring: a closed disclosure has
@@ -486,6 +498,15 @@ try {
         && !!historic.querySelector("details .warn-actions");
       historic.remove();
     }
+    let ackedGap = "";
+    if (acked) {
+      document.body.appendChild(acked);
+      const det = acked.querySelector("details");
+      if (det) det.open = true;
+      const line = acked.querySelector(".warn-line");
+      ackedGap = line ? getComputedStyle(line).marginTop : "";
+      acked.remove();
+    }
     capsCache.schema_snapshot_trigger = keepCaps;
     currentServer = keepServer;
     return {
@@ -508,6 +529,19 @@ try {
       historicDatesTheSnapshot: !!historic && /2026-08-11 12:00:00/.test(historic.textContent),
       // An old daemon sends no anchor: no claim, so it must stay loud.
       legacyStaysLoud: !!legacy && legacy.classList.contains("warn-box"),
+      // Mark-as-read (#1314). The button must be reachable WITHOUT opening the
+      // disclosure while the record is unacknowledged: it is the one thing an
+      // operator staring at a permanent record actually wants.
+      ackButtonAtTopLevel: !!withExpl && !!withExpl.querySelector(":scope > .ack-actions button"),
+      ackedIsMuted: !!acked && acked.classList.contains("muted-box")
+        && !acked.classList.contains("warn-box") && !acked.classList.contains("ok-box"),
+      // ...and gone once acknowledged: pressing it again would 400.
+      ackedHasNoAckButton: !!acked && !acked.querySelector(".ack-actions"),
+      ackedStillStatesLoss: !!acked && /missing from the index for good/.test(acked.textContent),
+      ackedNamesTheMoment: !!acked && /2026-08-11 20:14:00/.test(acked.textContent),
+      // The muted box must inherit the paragraph spacing, or its disclosure is
+      // the wall of text the orange one stopped being.
+      ackedGap,
     };
   });
   cap.showsBackendProse ? ok("capture health: banner renders the backend's explanation (table named)") : bad("capture health: banner renders the backend's explanation (table named)", JSON.stringify(cap));
@@ -523,6 +557,12 @@ try {
   cap.legacyStaysLoud ? ok("capture health: a backend with no anchor stays loud") : bad("capture health: a backend with no anchor stays loud", "missing anchor was read as 'quiet' — that hides a live failure");
   cap.buttonAtTopLevel ? ok("capture health: the fix button is under the headline while skips are active") : bad("capture health: the fix button is under the headline while skips are active", "the actionable state buried its action");
   cap.historicButtonInDetails ? ok("capture health: the quiet box moves the button into the disclosure") : bad("capture health: the quiet box moves the button into the disclosure", "a pressed button still sits under the headline");
+  cap.ackButtonAtTopLevel ? ok("capture health: Mark-as-read is reachable without opening the disclosure") : bad("capture health: Mark-as-read is reachable without opening the disclosure", "the only action on a permanent record is buried");
+  cap.ackedIsMuted ? ok("capture health: an acknowledged record renders muted, not as an alarm") : bad("capture health: an acknowledged record renders muted, not as an alarm", "acknowledging did not calm the box");
+  cap.ackedHasNoAckButton ? ok("capture health: an acknowledged record stops offering Mark-as-read") : bad("capture health: an acknowledged record stops offering Mark-as-read", "a button that would now 400 is still on screen");
+  cap.ackedStillStatesLoss ? ok("capture health: acknowledging keeps the permanent-loss statement on screen") : bad("capture health: acknowledging keeps the permanent-loss statement on screen", "going quiet erased the evidence");
+  cap.ackedNamesTheMoment ? ok("capture health: the acknowledged box names when it was acknowledged") : bad("capture health: the acknowledged box names when it was acknowledged", "no timestamp — the operator cannot tell who saw what when");
+  (cap.ackedGap && cap.ackedGap !== "0px") ? ok("capture health: the muted box inherits the paragraph spacing (CSS applied)") : bad("capture health: the muted box inherits the paragraph spacing (CSS applied)", `marginTop=${cap.ackedGap}`);
 
   // Scenario 8c — the remedy is reachable from the UI (#1296). The whole point
   // of the issue: the banner named an action with no button anywhere. It must

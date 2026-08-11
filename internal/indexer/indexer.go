@@ -710,6 +710,18 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
+	// capture_skips_ack (#1314) is the operator's acknowledgement of the tally
+	// above: {"<reason>":{"count":N,"at":"RFC3339"}}. It is a SEPARATE column
+	// and not a key inside capture_skips because saveCheckpoint rewrites that
+	// column from the daemon's in-memory tally on every checkpoint — anything
+	// stored there would be gone within seconds. Nothing in the capture path
+	// writes this one; only `status --ack-capture-skips` and the console's
+	// acknowledge endpoint do. NULL = never acknowledged.
+	if err := ensureColumn(db, "stream_state", "capture_skips_ack",
+		`ALTER TABLE stream_state ADD COLUMN capture_skips_ack JSON DEFAULT NULL COMMENT 'operator acknowledgement of capture_skips (#1314): {"<reason>":{"count":N,"at":"RFC3339"}}; a reason is acknowledged while ack.count >= skips.count' AFTER capture_skips`,
+	); err != nil {
+		return err
+	}
 	// flavor records the source database flavor (mysql/mariadb) so a resume
 	// parses the saved gtid_set with the correct GTID parser. NOT NULL DEFAULT
 	// 'mysql' means existing rows read back as mysql with no data migration,

@@ -2295,16 +2295,20 @@ function continuityBox(stream, pg) {
 function captureHealthBox(stream) {
   if (!stream || !stream.capture_health || stream.capture_health.status !== "degraded") return null;
   const h = stream.capture_health;
+  const acked = h.acknowledged === true;
   const historic = h.skips_predate_snapshot === true;
-  const box = el("div", { class: historic ? "ok-box" : "warn-box" });
-  box.append(el("b", { text: historic
-    ? "Capture gap on record — nothing skipped since the current snapshot"
-    : "⚠ Capture incomplete — some changes were not indexed" }));
+  const box = el("div", { class: acked ? "muted-box" : (historic ? "ok-box" : "warn-box") });
+  box.append(el("b", { text: acked
+    ? "Capture gap on record (acknowledged)"
+    : historic
+      ? "Capture gap on record — nothing skipped since the current snapshot"
+      : "⚠ Capture incomplete — some changes were not indexed" }));
   const reasons = Object.keys(h.skipped || {}).sort().join(", ");
   box.append(el("div", { text: h.total_skipped + " event(s) were read from the stream but not indexed" +
     (reasons ? " (" + reasons + ")" : "") + (h.last_skip_at ? "; last " + h.last_skip_at : "") +
     ". Those changes are missing from the index for good." +
-    (historic && h.snapshot_at ? " The schema snapshot in force since " + h.snapshot_at + " has recorded none." : "") }));
+    (acked && h.acknowledged_at ? " Acknowledged " + h.acknowledged_at + "; anything skipped after that count raises this again." : "") +
+    (!acked && historic && h.snapshot_at ? " The schema snapshot in force since " + h.snapshot_at + " has recorded none." : "") }));
   // Cause, remedy and scope come from the backend (status.ExplainCaptureSkips),
   // the same strings `bintrail status` prints — the console must not re-author
   // this advice in JavaScript, because the half that drifts is always the half
@@ -2318,9 +2322,49 @@ function captureHealthBox(stream) {
   // The action sits inside the disclosure once the skips are historic: it has
   // already been pressed, and leaving it under the headline invites pressing it
   // again forever against a tally that will never move.
-  if (action) (historic ? details : box).append(action);
+  if (action) (historic || acked ? details : box).append(action);
+  // Mark-as-read (#1314) is the only action on an already-acknowledged record,
+  // so it is absent once acked — and it stays OUTSIDE the disclosure while
+  // unacknowledged, because it is the one thing an operator looking at a
+  // permanent record actually wants and it must not be five paragraphs down.
+  //
+  // seen_total is the count THIS render displayed: the endpoint refuses the
+  // acknowledgement if the live tally has since gone higher, so a tab left
+  // open cannot retire skips that happened while nobody was looking.
+  if (!acked) {
+    // A class of its own, NOT .warn-actions: the e2e pins where the
+    // schema-snapshot action sits by querying ":scope > .warn-actions", and a
+    // second wrapper sharing that class would make the assertion pass no
+    // matter where the snapshot button went.
+    const wrap = el("div", { class: "ack-actions" });
+    const ackBtn = el("button", { class: "btn btn-sm", type: "button", text: "Mark as read" });
+    ackBtn.onclick = () => acknowledgeCaptureSkips(h.total_skipped, ackBtn);
+    wrap.append(ackBtn);
+    box.append(wrap);
+  }
   box.append(details);
   return box;
+}
+
+// acknowledgeCaptureSkips records that the operator has seen this tally, so the
+// box stops being an alarm (#1314). It does not clear the tally and does not
+// pretend the events came back: the record stays, quietly, and a later skip
+// pushes the count above what was acknowledged and turns the alarm back on by
+// itself. That is why this is safe to offer as a plain button — it can retire a
+// record, it cannot suppress the next incident.
+async function acknowledgeCaptureSkips(total, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Marking…"; }
+  try {
+    await api("/api/capture-skips/ack", { method: "POST", body: { seen_total: total } });
+  } catch (err) {
+    // The 409 here is the stale-tab refusal, and its message already says to
+    // reload — surfacing the server's own text keeps the two in one voice.
+    toast("Could not mark as read: " + ((err && err.message) || err));
+    if (btn) { btn.disabled = false; btn.textContent = "Mark as read"; }
+    return;
+  }
+  toast("Marked as read. The record stays — if anything is skipped from now on, the warning comes back.");
+  renderStatus();
 }
 
 // schemaSnapshotButton renders the Refresh-schema-snapshot action for the
@@ -2381,7 +2425,7 @@ async function refreshSchemaSnapshot(id, btn) {
   }
   // The banner is driven by a monotonic tally, so it stays up after a working
   // fix. Say so here or the operator concludes the button did nothing.
-  msg += " Events already skipped stay missing, and this warning stays up — it counts skips that happened.";
+  msg += " Events already skipped stay missing, and this warning stays up — it counts skips that happened; use \u201cMark as read\u201d once you have seen the count.";
   toast(msg);
   renderStatus();
 }
