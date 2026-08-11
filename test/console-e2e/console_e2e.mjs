@@ -498,13 +498,33 @@ try {
         && !!historic.querySelector("details .warn-actions");
       historic.remove();
     }
-    let ackedGap = "";
+    let ackedGap = "", ackedPaint = null;
     if (acked) {
       document.body.appendChild(acked);
       const det = acked.querySelector("details");
       if (det) det.open = true;
       const line = acked.querySelector(".warn-line");
       ackedGap = line ? getComputedStyle(line).marginTop : "";
+      // The whole point of the muted box is that it is QUIET, and a CSS
+      // custom property that does not exist resolves to nothing — the rule
+      // matches, the spacing assertion above passes, and the box paints with
+      // the page's default colours. (That is not hypothetical: the first
+      // draft of this rule referenced three tokens this stylesheet has never
+      // defined.) Read the real computed paint and compare it against the
+      // orange alarm's.
+      const mc = getComputedStyle(acked);
+      let wc = null;
+      if (withExpl) {
+        document.body.appendChild(withExpl);
+        const w = getComputedStyle(withExpl);
+        wc = { color: w.color, bg: w.backgroundColor, border: w.borderTopColor };
+        withExpl.remove();
+      }
+      ackedPaint = {
+        color: mc.color, bg: mc.backgroundColor, border: mc.borderTopColor,
+        transparentBg: mc.backgroundColor === "rgba(0, 0, 0, 0)" || mc.backgroundColor === "transparent",
+        differsFromAlarm: !!wc && (mc.color !== wc.color && mc.backgroundColor !== wc.bg && mc.borderTopColor !== wc.border),
+      };
       acked.remove();
     }
     capsCache.schema_snapshot_trigger = keepCaps;
@@ -542,6 +562,7 @@ try {
       // The muted box must inherit the paragraph spacing, or its disclosure is
       // the wall of text the orange one stopped being.
       ackedGap,
+      ackedPaint,
     };
   });
   cap.showsBackendProse ? ok("capture health: banner renders the backend's explanation (table named)") : bad("capture health: banner renders the backend's explanation (table named)", JSON.stringify(cap));
@@ -563,6 +584,9 @@ try {
   cap.ackedStillStatesLoss ? ok("capture health: acknowledging keeps the permanent-loss statement on screen") : bad("capture health: acknowledging keeps the permanent-loss statement on screen", "going quiet erased the evidence");
   cap.ackedNamesTheMoment ? ok("capture health: the acknowledged box names when it was acknowledged") : bad("capture health: the acknowledged box names when it was acknowledged", "no timestamp — the operator cannot tell who saw what when");
   (cap.ackedGap && cap.ackedGap !== "0px") ? ok("capture health: the muted box inherits the paragraph spacing (CSS applied)") : bad("capture health: the muted box inherits the paragraph spacing (CSS applied)", `marginTop=${cap.ackedGap}`);
+  (cap.ackedPaint && !cap.ackedPaint.transparentBg && cap.ackedPaint.differsFromAlarm)
+    ? ok("capture health: the muted box paints its own quiet palette (every token resolves)")
+    : bad("capture health: the muted box paints its own quiet palette (every token resolves)", JSON.stringify(cap.ackedPaint));
 
   // Scenario 8c — the remedy is reachable from the UI (#1296). The whole point
   // of the issue: the banner named an action with no button anywhere. It must
