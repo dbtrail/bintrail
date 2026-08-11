@@ -426,6 +426,14 @@ try {
   // would be the one saying what a remedy does NOT recover. The fixture drives
   // both the current backend (explanation present) and an older one (absent).
   const cap = await page.evaluate(() => {
+    // schemaSnapshotButton() is gated on the capability and on a REAL registry
+    // server (the reserved "default" is the daemon's own CLI stream, which the
+    // control plane refuses). Force both, restored below: without them the
+    // button is null and the placement assertions would pass by rendering
+    // nothing, which is the shape this whole scenario exists to catch.
+    const keepCaps = capsCache.schema_snapshot_trigger, keepServer = currentServer;
+    capsCache.schema_snapshot_trigger = true;
+    currentServer = "e2e-registry-server";
     const withExpl = captureHealthBox({
       capture_health: {
         status: "degraded", total_skipped: 3, last_skip_at: "2026-08-04 19:49:33",
@@ -441,15 +449,45 @@ try {
     });
     const okBox = captureHealthBox({ capture_health: { status: "ok" } });
     const nilBox = captureHealthBox(null);
+    // Historic vs active (#1312): the SAME tally, distinguished only by the
+    // backend's skips_predate_snapshot. Historic must go quiet without going
+    // away — the events are still permanently missing.
+    const historic = captureHealthBox({
+      capture_health: {
+        status: "degraded", total_skipped: 3, last_skip_at: "2026-08-04 19:49:33",
+        snapshot_at: "2026-08-11 12:00:00", skips_predate_snapshot: true,
+        skipped: { table_not_in_snapshot: { count: 3 } },
+        explanation: ["Nothing has been skipped since the current schema snapshot was taken (2026-08-11 12:00:00)."],
+      },
+    });
     // Render it to confirm the per-paragraph spacing rule resolves — without it
-    // the caveat merges into the wall of text above it.
-    let lineGap = "";
+    // the caveat merges into the wall of text above it. The lines now live in a
+    // <details>, so it must be opened before measuring: a closed disclosure has
+    // no layout, and a marginTop read from it would prove nothing.
+    let lineGap = "", detailsClosedByDefault = null, buttonAtTopLevel = null, historicButtonInDetails = null;
     if (withExpl) {
       document.body.appendChild(withExpl);
+      const det = withExpl.querySelector("details");
+      detailsClosedByDefault = !!det && !det.open;
+      // The action stays at the top level while the skips are ACTIVE — that is
+      // the state where pressing it is the fix.
+      buttonAtTopLevel = !!withExpl.querySelector(":scope > .warn-actions");
+      if (det) det.open = true;
       const line = withExpl.querySelector(".warn-line");
       lineGap = line ? getComputedStyle(line).marginTop : "";
       withExpl.remove();
     }
+    if (historic) {
+      document.body.appendChild(historic);
+      // ...and moves inside the disclosure once they are HISTORIC: it has been
+      // pressed already, and a button under the headline invites pressing it
+      // forever against a tally that will never move.
+      historicButtonInDetails = !historic.querySelector(":scope > .warn-actions")
+        && !!historic.querySelector("details .warn-actions");
+      historic.remove();
+    }
+    capsCache.schema_snapshot_trigger = keepCaps;
+    currentServer = keepServer;
     return {
       showsBackendProse: !!withExpl && /shop\.plugin_log/.test(withExpl.textContent)
         && /recovers what was already skipped/.test(withExpl.textContent),
@@ -460,6 +498,16 @@ try {
       okNone: okBox === null,
       nilNone: nilBox === null,
       lineGap,
+      detailsClosedByDefault,
+      buttonAtTopLevel,
+      historicButtonInDetails,
+      activeIsOrange: !!withExpl && withExpl.classList.contains("warn-box"),
+      historicIsQuiet: !!historic && historic.classList.contains("ok-box")
+        && !historic.classList.contains("warn-box"),
+      historicStillStatesLoss: !!historic && /missing from the index for good/.test(historic.textContent),
+      historicDatesTheSnapshot: !!historic && /2026-08-11 12:00:00/.test(historic.textContent),
+      // An old daemon sends no anchor: no claim, so it must stay loud.
+      legacyStaysLoud: !!legacy && legacy.classList.contains("warn-box"),
     };
   });
   cap.showsBackendProse ? ok("capture health: banner renders the backend's explanation (table named)") : bad("capture health: banner renders the backend's explanation (table named)", JSON.stringify(cap));
@@ -467,6 +515,14 @@ try {
   cap.legacyFallback ? ok("capture health: an old backend gets a fallback that promises nothing") : bad("capture health: an old backend gets a fallback that promises nothing", "fallback missing or invents advice");
   (cap.okNone && cap.nilNone) ? ok("capture health: ok/nil render no banner") : bad("capture health: ok/nil render no banner", `ok=${cap.okNone} nil=${cap.nilNone}`);
   (cap.lineGap && cap.lineGap !== "0px") ? ok("capture health: explanation paragraphs are spaced apart (CSS applied)") : bad("capture health: explanation paragraphs are spaced apart (CSS applied)", `marginTop=${cap.lineGap}`);
+  cap.detailsClosedByDefault ? ok("capture health: the long explanation starts collapsed") : bad("capture health: the long explanation starts collapsed", "details rendered open — the banner is a wall of text again");
+  cap.activeIsOrange ? ok("capture health: an active skip stays the orange alarm") : bad("capture health: an active skip stays the orange alarm", "active skips lost their alarm styling");
+  cap.historicIsQuiet ? ok("capture health: skips that predate the current snapshot go quiet") : bad("capture health: skips that predate the current snapshot go quiet", "historic skips still render as a live alarm");
+  cap.historicStillStatesLoss ? ok("capture health: the quiet box still states the events are gone for good") : bad("capture health: the quiet box still states the events are gone for good", "going quiet dropped the permanent-loss statement");
+  cap.historicDatesTheSnapshot ? ok("capture health: the quiet box names the snapshot it compared against") : bad("capture health: the quiet box names the snapshot it compared against", "no snapshot date — the operator cannot check the claim");
+  cap.legacyStaysLoud ? ok("capture health: a backend with no anchor stays loud") : bad("capture health: a backend with no anchor stays loud", "missing anchor was read as 'quiet' — that hides a live failure");
+  cap.buttonAtTopLevel ? ok("capture health: the fix button is under the headline while skips are active") : bad("capture health: the fix button is under the headline while skips are active", "the actionable state buried its action");
+  cap.historicButtonInDetails ? ok("capture health: the quiet box moves the button into the disclosure") : bad("capture health: the quiet box moves the button into the disclosure", "a pressed button still sits under the headline");
 
   // Scenario 8c — the remedy is reachable from the UI (#1296). The whole point
   // of the issue: the banner named an action with no button anywhere. It must

@@ -114,6 +114,17 @@ type StreamStateInfo struct {
 	// Capture health verdict is then unknown and the line is omitted rather
 	// than asserting OK from absent data (the GapColumnsPresent philosophy).
 	CaptureSkips sql.NullString
+	// SchemaSnapshotAt is when the newest schema snapshot in this index was
+	// taken — the layout capture decodes against today. It is the anchor that
+	// makes a monotonic skip tally answerable (#1312): a skip older than this
+	// cannot have been caused by the snapshot now in force. Invalid when the
+	// index holds no snapshot at all, which keeps the verdict at "cannot tell"
+	// rather than inventing a clean window.
+	//
+	// stream_state is single-row per index database, so the newest snapshot in
+	// the same database belongs to the same source — the comparison cannot
+	// cross sources.
+	SchemaSnapshotAt sql.NullTime
 }
 
 // CaptureSkipStat is one reason's tally decoded from CaptureSkips. The JSON
@@ -418,7 +429,31 @@ func LoadStreamState(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) 
 	if err := loadCaptureSkips(ctx, db, s); err != nil {
 		slog.Warn("could not load capture_skips; keeping stream state without it", "error", err)
 	}
+	// The snapshot anchor (#1312) is best-effort for the same reason: it only
+	// SHARPENS the capture verdict, so failing to read it must never cost the
+	// caller the stream state it already has.
+	if err := loadSchemaSnapshotTime(ctx, db, s); err != nil {
+		slog.Warn("could not load the newest schema snapshot time; capture skips will not be dated against it", "error", err)
+	}
 	return s, nil
+}
+
+// loadSchemaSnapshotTime augments an already-loaded StreamStateInfo with the
+// newest schema_snapshots.snapshot_time (#1312). MAX over the whole table, not
+// the newest snapshot_id: the id is an auto-increment and the time is what the
+// comparison is about.
+//
+// An index with no snapshot yields a NULL row, not zero rows, so the scan
+// target is nullable and an empty result leaves the field invalid — the
+// verdict then stays "cannot tell". A missing TABLE (an index predating
+// snapshots entirely) is tolerated for the same reason the sibling loaders
+// tolerate a missing column.
+func loadSchemaSnapshotTime(ctx context.Context, db *sql.DB, s *StreamStateInfo) error {
+	err := db.QueryRowContext(ctx, `SELECT MAX(snapshot_time) FROM schema_snapshots`).Scan(&s.SchemaSnapshotAt)
+	if isMissingTableErr(err) || errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return err
 }
 
 func loadStreamStateCore(ctx context.Context, db *sql.DB) (*StreamStateInfo, error) {
@@ -503,6 +538,16 @@ func loadStreamStateBase(ctx context.Context, db *sql.DB) (*StreamStateInfo, err
 func isUnknownColumnErr(err error) bool {
 	var me *mysql.MySQLError
 	return errors.As(err, &me) && me.Number == 1054
+}
+
+// isMissingTableErr is 1054's sibling for a whole table that is not there
+// (1146) — the shape an index predating a table shows, as opposed to a
+// connection that died. Kept narrow to 1146 on purpose: swallowing any error
+// would report "no snapshot exists" for an unreachable database, and the
+// caller reads that absence as "cannot tell", not as an alarm.
+func isMissingTableErr(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1146
 }
 
 // StatusData holds all data sections loaded by CollectStatus.
@@ -730,7 +775,7 @@ func WriteStatus(w io.Writer, files []IndexStateRow, parts []PartitionStat, arch
 				// Cause, remedy and scope come from the shared explanation
 				// builder (#1296) so this report and the console cannot tell
 				// two different stories about the same ledger.
-				writeCaptureSkipExplanation(w, skips)
+				writeCaptureSkipExplanation(w, skips, stream.SchemaSnapshotAt.Time)
 			} else {
 				fmt.Fprintln(w, "  Capture health:  OK — no events skipped")
 			}
@@ -1141,6 +1186,17 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		// and the half that drifts is the half telling an operator what a
 		// remedy does NOT recover.
 		Explanation []string `json:"explanation,omitempty"`
+		// SnapshotAt / SkipsPredateSnapshot are the anchor that makes a
+		// monotonic tally answerable (#1312): when every skip predates the
+		// schema snapshot capture decodes against today, the console renders
+		// the box quietly instead of as a live alarm. Omitted together when
+		// the index holds no snapshot — no anchor, no claim.
+		//
+		// Status stays "degraded" in both cases on purpose. --fail-on-gap keys
+		// on it, and turning a permanent-loss record into an "ok" would be a
+		// change to exit semantics, not a rendering change.
+		SnapshotAt           string `json:"snapshot_at,omitempty"`
+		SkipsPredateSnapshot bool   `json:"skips_predate_snapshot,omitempty"`
 	}
 	type jsonStream struct {
 		BintrailID     *string        `json:"bintrail_id"`
@@ -1305,7 +1361,11 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 						}
 					}
 				}
-				ch.Explanation = ExplainCaptureSkips(skips)
+				if stream.SchemaSnapshotAt.Valid {
+					ch.SnapshotAt = stream.SchemaSnapshotAt.Time.Format(TSFmt)
+					ch.SkipsPredateSnapshot = SkipsPredateSnapshot(skips, stream.SchemaSnapshotAt.Time)
+				}
+				ch.Explanation = ExplainCaptureSkips(skips, stream.SchemaSnapshotAt.Time)
 			}
 			jstr.CaptureHealth = ch
 		}

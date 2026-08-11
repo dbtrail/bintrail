@@ -25,6 +25,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Capture-skip reason keys, mirroring the parser's persisted vocabulary. Kept
@@ -45,7 +46,7 @@ const (
 //
 // Pure and fixture-drivable: no clock, no IO. The caller supplies the decoded
 // ledger; every claim here is derived from it.
-func ExplainCaptureSkips(skips map[string]CaptureSkipStat) []string {
+func ExplainCaptureSkips(skips map[string]CaptureSkipStat, snapshotAt time.Time) []string {
 	active := activeReasons(skips)
 	if len(active) == 0 {
 		return nil
@@ -66,12 +67,70 @@ func ExplainCaptureSkips(skips map[string]CaptureSkipStat) []string {
 	// away by a restart — which means a WORKING fix does not turn this banner
 	// green, and an operator who does not know that concludes the fix failed and
 	// applies it again.
-	lines = append(lines, "This warning does not clear on its own: the tally counts skips that happened, "+
-		"not skips still happening, so it stays after a successful fix. Confirm the fix by watching the "+
-		"count stop rising; to reset the tally, stop capture for this source and clear "+
-		"stream_state.capture_skips in its index.")
+	lines = append(lines, acknowledgementLine(skips, snapshotAt))
 	lines = append(lines, logLine(active[0]))
 	return lines
+}
+
+// SkipsPredateSnapshot reports whether every recorded skip happened BEFORE the
+// schema snapshot capture decodes against today.
+//
+// It exists because the tally is monotonic — it counts skips that HAPPENED, not
+// skips still happening — so it reads identically before and after a successful
+// re-snapshot, which left the console's own "Refresh schema snapshot" button
+// with no observable effect at all (#1312). The snapshot's own timestamp is the
+// acknowledgement: no new column, and nothing erased.
+//
+// False when the anchor is missing (no snapshot time, or a ledger entry with no
+// last_at): absence of evidence is not a clean window, and this verdict decides
+// whether an operator is shown an alarm.
+//
+// There is deliberately no `if snapshotAt.IsZero()` guard: it would be dead
+// code. No recorded skip can predate the zero time, so a zero anchor already
+// falls out of the comparison below as false — and a guard that cannot be made
+// to fail is a guard nobody can trust. The zero case IS load-bearing in
+// acknowledgementLine, where it selects a different paragraph, and it is tested
+// there.
+func SkipsPredateSnapshot(skips map[string]CaptureSkipStat, snapshotAt time.Time) bool {
+	active := activeReasons(skips)
+	if len(active) == 0 {
+		return false
+	}
+	for _, r := range active {
+		if st := skips[r]; st.LastAt.IsZero() || !st.LastAt.Before(snapshotAt) {
+			return false
+		}
+	}
+	return true
+}
+
+// acknowledgementLine answers the one question the tally cannot: is this still
+// happening, or am I looking at a record of something already fixed?
+//
+// Neither branch says "resolved", and that restraint is the point. stream_state
+// does not record WHICH snapshot capture is running on, so a newer snapshot
+// proves one exists — not that the stream reloaded onto it (refreshSchemaSnapshot
+// already treats "snapshot taken, stream did NOT reload" as its own outcome).
+// And on a source with no writes, "nothing skipped since" is true for the
+// trivial reason. What both branches report is the comparison itself, which is
+// a fact; the caller's own preceding line has already said the skipped events
+// are missing for good.
+func acknowledgementLine(skips map[string]CaptureSkipStat, snapshotAt time.Time) string {
+	if snapshotAt.IsZero() {
+		return "This warning does not clear on its own: the tally counts skips that happened, not skips " +
+			"still happening, so it stays after a successful fix. Confirm the fix by watching the count " +
+			"stop rising; to reset the tally, stop capture for this source and clear " +
+			"stream_state.capture_skips in its index."
+	}
+	if SkipsPredateSnapshot(skips, snapshotAt) {
+		return "Nothing has been skipped since the current schema snapshot was taken (" +
+			snapshotAt.Format(TSFmt) + "). That is not proof the fix took hold — capture does not record " +
+			"which snapshot it is running on, and a source with no writes skips nothing either way — but " +
+			"no drop has been recorded against the layout capture decodes against today."
+	}
+	return "Events were skipped AFTER the current schema snapshot was taken (" + snapshotAt.Format(TSFmt) +
+		"), so this is not a stale tally left over from an already-fixed problem: rows are being dropped " +
+		"against the layout capture decodes against today."
 }
 
 // activeReasons lists the reasons with a non-zero count, most events first
@@ -236,8 +295,8 @@ func wrapAt(text string, width int) []string {
 
 // writeCaptureSkipExplanation prints the explanation into the text status
 // output, indented and wrapped to the width the rest of the report uses.
-func writeCaptureSkipExplanation(w io.Writer, skips map[string]CaptureSkipStat) {
-	for _, para := range ExplainCaptureSkips(skips) {
+func writeCaptureSkipExplanation(w io.Writer, skips map[string]CaptureSkipStat, snapshotAt time.Time) {
+	for _, para := range ExplainCaptureSkips(skips, snapshotAt) {
 		for _, line := range wrapAt(para, 76) {
 			fmt.Fprintf(w, "  %s\n", line)
 		}

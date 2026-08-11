@@ -16,8 +16,12 @@ import (
 // string to look for. Each test below pins one of those repairs, plus the
 // honesty caveat the old text omitted entirely.
 
+// explainJoined renders with NO snapshot anchor (the zero time), which is the
+// state of an index that holds no schema snapshot. The anchored states have
+// their own tests below; these pin the per-reason cause/remedy prose, which the
+// anchor does not touch.
 func explainJoined(skips map[string]CaptureSkipStat) string {
-	return strings.Join(ExplainCaptureSkips(skips), "\n")
+	return strings.Join(ExplainCaptureSkips(skips, time.Time{}), "\n")
 }
 
 func TestExplainCaptureSkips_namesTheSkippedTables(t *testing.T) {
@@ -154,10 +158,10 @@ func TestExplainCaptureSkips_distinguishesSnapshotFromBaseline(t *testing.T) {
 }
 
 func TestExplainCaptureSkips_emptyLedgerExplainsNothing(t *testing.T) {
-	if got := ExplainCaptureSkips(map[string]CaptureSkipStat{}); got != nil {
+	if got := ExplainCaptureSkips(map[string]CaptureSkipStat{}, time.Time{}); got != nil {
 		t.Errorf("nothing skipped must explain nothing, got %v", got)
 	}
-	if got := ExplainCaptureSkips(map[string]CaptureSkipStat{"x": {Count: 0}}); got != nil {
+	if got := ExplainCaptureSkips(map[string]CaptureSkipStat{"x": {Count: 0}}, time.Time{}); got != nil {
 		t.Errorf("a zero-count reason must explain nothing, got %v", got)
 	}
 }
@@ -232,5 +236,138 @@ func TestWrapAt_keepsLongWordsIntact(t *testing.T) {
 		if strings.Contains(line, "  ") {
 			t.Errorf("wrapping introduced double spaces: %q", line)
 		}
+	}
+}
+
+// ─── The snapshot anchor (#1312) ─────────────────────────────────────────────
+//
+// The tally is monotonic, so it reads identically before and after a successful
+// re-snapshot: an operator pressed the console's own "Refresh schema snapshot"
+// button, reloaded, and got the same alarm. These pin the comparison that makes
+// the tally answerable — and, just as hard, pin that it never claims "fixed".
+
+func skipAt(ts string) CaptureSkipStat {
+	t, err := time.Parse("2006-01-02 15:04:05", ts)
+	if err != nil {
+		panic(err)
+	}
+	return CaptureSkipStat{Count: 3, LastAt: t, Tables: []string{"shop.plugin_log"}}
+}
+
+func mustTime(t *testing.T, ts string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse("2006-01-02 15:04:05", ts)
+	if err != nil {
+		t.Fatalf("bad fixture time %q: %v", ts, err)
+	}
+	return parsed
+}
+
+func TestSkipsPredateSnapshot(t *testing.T) {
+	cases := []struct {
+		name     string
+		skips    map[string]CaptureSkipStat
+		snapshot string
+		want     bool
+	}{
+		{"skip before the snapshot is historic",
+			map[string]CaptureSkipStat{CaptureSkipReasonTableNotInSnapshot: skipAt("2026-08-04 19:49:33")},
+			"2026-08-11 12:00:00", true},
+		{"skip after the snapshot is still active",
+			map[string]CaptureSkipStat{CaptureSkipReasonTableNotInSnapshot: skipAt("2026-08-11 13:00:00")},
+			"2026-08-11 12:00:00", false},
+		// Equal timestamps are NOT historic: a skip stamped at the same second
+		// the snapshot was taken could have come after it, and this verdict
+		// decides whether an operator sees an alarm.
+		{"a skip at the snapshot's own second is not historic",
+			map[string]CaptureSkipStat{CaptureSkipReasonTableNotInSnapshot: skipAt("2026-08-11 12:00:00")},
+			"2026-08-11 12:00:00", false},
+		// One reason quiet does not make the ledger quiet.
+		{"one active reason after the snapshot keeps the whole ledger active",
+			map[string]CaptureSkipStat{
+				CaptureSkipReasonTableNotInSnapshot:  skipAt("2026-08-04 19:49:33"),
+				CaptureSkipReasonColumnCountMismatch: skipAt("2026-08-11 13:00:00"),
+			},
+			"2026-08-11 12:00:00", false},
+		// A zero-count reason is not active and must not veto the verdict.
+		{"a zero-count reason is ignored",
+			map[string]CaptureSkipStat{
+				CaptureSkipReasonTableNotInSnapshot:  skipAt("2026-08-04 19:49:33"),
+				CaptureSkipReasonColumnCountMismatch: {Count: 0},
+			},
+			"2026-08-11 12:00:00", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := SkipsPredateSnapshot(c.skips, mustTime(t, c.snapshot)); got != c.want {
+				t.Errorf("SkipsPredateSnapshot = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// No anchor and an undated skip both mean "cannot tell", and cannot-tell must
+// never render as the quiet state — that is the direction that hides a live
+// capture failure.
+func TestSkipsPredateSnapshot_missingAnchorIsNeverHistoric(t *testing.T) {
+	skips := map[string]CaptureSkipStat{CaptureSkipReasonTableNotInSnapshot: skipAt("2026-08-04 19:49:33")}
+	if SkipsPredateSnapshot(skips, time.Time{}) {
+		t.Error("no snapshot time must not read as historic")
+	}
+	undated := map[string]CaptureSkipStat{CaptureSkipReasonTableNotInSnapshot: {Count: 3}}
+	if SkipsPredateSnapshot(undated, mustTime(t, "2026-08-11 12:00:00")) {
+		t.Error("a skip with no last_at must not read as historic")
+	}
+	if SkipsPredateSnapshot(map[string]CaptureSkipStat{}, mustTime(t, "2026-08-11 12:00:00")) {
+		t.Error("an empty ledger is not a historic ledger")
+	}
+}
+
+func TestExplainCaptureSkips_historicSaysNothingSinceTheSnapshot(t *testing.T) {
+	out := strings.Join(ExplainCaptureSkips(
+		map[string]CaptureSkipStat{CaptureSkipReasonTableNotInSnapshot: skipAt("2026-08-04 19:49:33")},
+		mustTime(t, "2026-08-11 12:00:00")), "\n")
+	if !strings.Contains(out, "Nothing has been skipped since the current schema snapshot") {
+		t.Errorf("the historic state must say the tally stopped moving:\n%s", out)
+	}
+	if !strings.Contains(out, "2026-08-11 12:00:00") {
+		t.Errorf("the historic state must date the snapshot it compared against:\n%s", out)
+	}
+	// The whole reason this verdict is safe to show quietly.
+	if !strings.Contains(out, "not proof the fix took hold") {
+		t.Errorf("the historic state must not read as 'resolved':\n%s", out)
+	}
+	if !strings.Contains(out, "no writes skips nothing") {
+		t.Errorf("an idle source makes 'nothing skipped since' vacuous; the text must say so:\n%s", out)
+	}
+	if !strings.Contains(out, "recovers what was already skipped") {
+		t.Errorf("going quiet must not drop the permanent-loss statement:\n%s", out)
+	}
+}
+
+func TestExplainCaptureSkips_activeSaysTheDropsAreCurrent(t *testing.T) {
+	out := strings.Join(ExplainCaptureSkips(
+		map[string]CaptureSkipStat{CaptureSkipReasonTableNotInSnapshot: skipAt("2026-08-11 13:00:00")},
+		mustTime(t, "2026-08-11 12:00:00")), "\n")
+	if !strings.Contains(out, "skipped AFTER the current schema snapshot") {
+		t.Errorf("the active state must say the drops post-date the snapshot:\n%s", out)
+	}
+	if strings.Contains(out, "Nothing has been skipped since") {
+		t.Errorf("the active state must not carry the historic wording:\n%s", out)
+	}
+}
+
+// With no snapshot in the index there is nothing to compare against, so the
+// pre-#1312 paragraph — including the manual ledger-clearing escape hatch — is
+// still the honest thing to print.
+func TestExplainCaptureSkips_noAnchorKeepsTheManualAcknowledgement(t *testing.T) {
+	out := strings.Join(ExplainCaptureSkips(
+		map[string]CaptureSkipStat{CaptureSkipReasonTableNotInSnapshot: skipAt("2026-08-04 19:49:33")},
+		time.Time{}), "\n")
+	if !strings.Contains(out, "does not clear on its own") {
+		t.Errorf("without an anchor the caveat must stay:\n%s", out)
+	}
+	if strings.Contains(out, "current schema snapshot") {
+		t.Errorf("without an anchor nothing may be claimed about a snapshot:\n%s", out)
 	}
 }

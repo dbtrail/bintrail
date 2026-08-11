@@ -2277,14 +2277,34 @@ function continuityBox(stream, pg) {
 // checkpoint, green continuity) while indexing nothing. "ok", "unknown"
 // (missing field) and no stream all render nothing; the continuity box remains
 // the affirmative/loss surface. Pure and fixture-drivable like continuityBox.
+// Two things this renders that the tally alone cannot say (#1312):
+//
+//   - HISTORIC vs ACTIVE. The tally is monotonic, so a successful re-snapshot
+//     leaves it byte-identical and the button this box offers had no visible
+//     effect at all — an operator clicked it, reloaded, and saw the same orange
+//     alarm. `skips_predate_snapshot` (computed by the backend against the
+//     schema snapshot's own timestamp) separates "still dropping rows" from "a
+//     record of something that stopped". Historic goes quiet; it does NOT go
+//     away, because those events are permanently missing and a dismissed box
+//     would trade an annoyance for lost evidence.
+//   - The long form is one click away instead of five paragraphs down. ~250
+//     words of cause/remedy/scope in an alarm box is text nobody reads.
+//
+// An old daemon sends neither field: no anchor, so the box stays loud and open
+// — the pre-#1312 rendering, which is the safe direction.
 function captureHealthBox(stream) {
   if (!stream || !stream.capture_health || stream.capture_health.status !== "degraded") return null;
   const h = stream.capture_health;
-  const box = el("div", { class: "warn-box" });
-  box.append(el("b", { text: "⚠ Capture incomplete — some changes were not indexed" }));
+  const historic = h.skips_predate_snapshot === true;
+  const box = el("div", { class: historic ? "ok-box" : "warn-box" });
+  box.append(el("b", { text: historic
+    ? "Capture gap on record — nothing skipped since the current snapshot"
+    : "⚠ Capture incomplete — some changes were not indexed" }));
   const reasons = Object.keys(h.skipped || {}).sort().join(", ");
   box.append(el("div", { text: h.total_skipped + " event(s) were read from the stream but not indexed" +
-    (reasons ? " (" + reasons + ")" : "") + (h.last_skip_at ? "; last " + h.last_skip_at : "") + "." }));
+    (reasons ? " (" + reasons + ")" : "") + (h.last_skip_at ? "; last " + h.last_skip_at : "") +
+    ". Those changes are missing from the index for good." +
+    (historic && h.snapshot_at ? " The schema snapshot in force since " + h.snapshot_at + " has recorded none." : "") }));
   // Cause, remedy and scope come from the backend (status.ExplainCaptureSkips),
   // the same strings `bintrail status` prints — the console must not re-author
   // this advice in JavaScript, because the half that drifts is always the half
@@ -2292,9 +2312,14 @@ function captureHealthBox(stream) {
   // to send the field, and deliberately promises nothing on its behalf.
   const lines = (Array.isArray(h.explanation) && h.explanation.length) ? h.explanation
     : ["Changes in those events are missing from the index. This daemon is too old to say why — run `bintrail status` against this index for the reason and the fix."];
-  lines.forEach((t) => box.append(el("div", { class: "warn-line", text: t })));
+  const details = el("details", { class: "warn-details" }, el("summary", { text: "Why this happened, and what fixes it" }));
+  lines.forEach((t) => details.append(el("div", { class: "warn-line", text: t })));
   const action = schemaSnapshotButton();
-  if (action) box.append(action);
+  // The action sits inside the disclosure once the skips are historic: it has
+  // already been pressed, and leaving it under the headline invites pressing it
+  // again forever against a tally that will never move.
+  if (action) (historic ? details : box).append(action);
+  box.append(details);
   return box;
 }
 

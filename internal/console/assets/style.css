@@ -1256,8 +1256,18 @@ button { font-family: inherit; }
 /* One paragraph per explanation line (#1296). Without the gap the cause, the
    fix and the "this does not recover what was already skipped" caveat run
    together as one block — and the caveat is the part that gets skimmed past. */
-.warn-box .warn-line { margin-top: 8px; }
-.warn-box .warn-actions { margin-top: 10px; }
+.warn-box .warn-line, .ok-box .warn-line { margin-top: 8px; }
+.warn-box .warn-actions, .ok-box .warn-actions { margin-top: 10px; }
+/* The long-form cause/remedy/scope, collapsed (#1312). It used to render flat
+   and unconditionally — ~250 words inside an alarm box, which is the reliable
+   way to have none of it read. The summary is the affordance; the caveat about
+   what a remedy does NOT recover stays one click away, never deleted. */
+.warn-details { margin-top: 10px; }
+.warn-details > summary {
+  cursor: pointer; font-family: var(--f-mono); font-size: 12.5px;
+  text-decoration: underline; text-underline-offset: 2px; opacity: 0.85;
+}
+.warn-details[open] > summary { margin-bottom: 4px; }
 .warnings:empty { display: none; }
 .warn-item {
   display: flex; gap: 8px; align-items: flex-start;

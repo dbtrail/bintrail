@@ -240,3 +240,55 @@ func TestCommaGroup(t *testing.T) {
 		}
 	}
 }
+
+// ─── The snapshot anchor on the wire (#1312) ─────────────────────────────────
+//
+// The console renders quietly or loudly off these two fields alone, so their
+// presence and their absence both have to be pinned: a missing anchor must not
+// arrive as `skips_predate_snapshot: false` dressed up as a judgement — it is
+// simply no claim, and the renderer keeps the alarm.
+
+func TestWriteStatusJSON_captureHealthCarriesTheSnapshotAnchor(t *testing.T) {
+	s := captureStream(`{"table_not_in_snapshot":{"count":3,"last_at":"2026-08-04T19:49:33Z"}}`)
+	s.SchemaSnapshotAt = sql.NullTime{Time: time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC), Valid: true}
+	ch := decodeStatusJSON(t, s)["stream"].(map[string]any)["capture_health"].(map[string]any)
+
+	if ch["snapshot_at"] != "2026-08-11 12:00:00" {
+		t.Errorf("snapshot_at = %v, want the newest schema snapshot's time", ch["snapshot_at"])
+	}
+	if ch["skips_predate_snapshot"] != true {
+		t.Errorf("skips_predate_snapshot = %v, want true (the skip is a week older)", ch["skips_predate_snapshot"])
+	}
+	// The verdict stays degraded: --fail-on-gap keys on it, and these events are
+	// still permanently missing from the index.
+	if ch["status"] != "degraded" {
+		t.Errorf("status = %v, want degraded even when the skips are historic", ch["status"])
+	}
+}
+
+func TestWriteStatusJSON_captureHealthOmitsTheAnchorWhenThereIsNoSnapshot(t *testing.T) {
+	s := captureStream(`{"table_not_in_snapshot":{"count":3,"last_at":"2026-08-04T19:49:33Z"}}`)
+	ch := decodeStatusJSON(t, s)["stream"].(map[string]any)["capture_health"].(map[string]any)
+
+	if _, present := ch["snapshot_at"]; present {
+		t.Errorf("snapshot_at must be absent with no snapshot in the index, got %v", ch["snapshot_at"])
+	}
+	if _, present := ch["skips_predate_snapshot"]; present {
+		t.Error("skips_predate_snapshot must be absent rather than a false that reads as a judgement")
+	}
+}
+
+func TestWriteStatusJSON_captureHealthAnchorSaysActiveWhenSkipsAreNewer(t *testing.T) {
+	s := captureStream(`{"table_not_in_snapshot":{"count":3,"last_at":"2026-08-11T13:00:00Z"}}`)
+	s.SchemaSnapshotAt = sql.NullTime{Time: time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC), Valid: true}
+	ch := decodeStatusJSON(t, s)["stream"].(map[string]any)["capture_health"].(map[string]any)
+
+	if ch["snapshot_at"] != "2026-08-11 12:00:00" {
+		t.Errorf("snapshot_at = %v", ch["snapshot_at"])
+	}
+	// omitempty: false is absent on the wire, which the renderer reads as
+	// "not historic" — the loud path.
+	if _, present := ch["skips_predate_snapshot"]; present {
+		t.Errorf("a skip newer than the snapshot must not ship a true flag, got %v", ch["skips_predate_snapshot"])
+	}
+}
