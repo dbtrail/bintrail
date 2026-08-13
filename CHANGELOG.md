@@ -19,24 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a "consolidation candidate", and a comment cannot fail.
 
 ### Fixed
-- **A duplicate event whose two copies disagree is no longer discarded in
-  silence** (#841). While a partition is archived but not yet dropped, the same
-  `event_id` arrives from both the index and the Parquet archive.
-  `MergeResults` kept the first appearance, and "MySQL first, MySQL wins" was a
-  comment with nothing enforcing it — the agent deliberately puts its buffer
-  first. If the copies genuinely differed (an index row mutated after
-  archiving, or two index generations writing under one `bintrail_id`) the
-  operator got an arbitrary one of two answers with no signal at all. A
-  collision now compares the copies and warns, naming the event, schema, table
-  and PK. Which copy wins is unchanged — this adds visibility, not a new
-  resolution rule.
-  - The comparison only runs on collision, so the normal path is unaffected.
-  - Columns added after the original schema (`connection_id`, `query_text`,
-    `query_hash`, `commit_ts_us`) are compared only when BOTH sides carry a
-    value: an archive written before a column existed loads it as NULL, and
-    treating that as divergence would fire on every legacy archive in the
-    fleet. Row images are compared with `reflect.DeepEqual` — `==` on an `any`
-    holding a nested JSON array or object panics.
+
 
 ### Added
 - **A capture-skip record can be acknowledged** (#1314). `stream_state.capture_skips`
