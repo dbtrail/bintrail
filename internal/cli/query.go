@@ -357,8 +357,25 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			// discovery resolved) is not coverage for THIS read, and
 			// counting it suppressed the gap warning over data the fetch
 			// never opens.
+			// scope nil = "every archive in the index"; non-nil empty =
+			// "this query opens none". Both are reachable here and the
+			// difference decides whether a rotated hour is a gap.
 			var scope []string
-			if !discoveryFailed {
+			switch {
+			case discoveryFailed:
+				// Unknown set. An empty scope would report every rotated hour
+				// as a gap, so stay unscoped and let the warning path be
+				// permissive, as it already is for the failed discovery
+				// itself.
+			case qProfile != "":
+				// An active profile skips archive discovery entirely (archive
+				// reads enforce no redaction rules), so this query provably
+				// opens NO archives. Leaving it unscoped credited every
+				// registered archive as coverage for a fetch that reads only
+				// live MySQL — the same false OK this change removes,
+				// reachable from the command line with one flag.
+				scope = []string{}
+			default:
 				scope = query.SourceIDsFromPaths(archSources)
 			}
 			plan = query.RunPlanAndWarn(cmd.Context(), db, cfg.DBName, since, until, scope)

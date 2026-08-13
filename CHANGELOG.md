@@ -59,12 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has more than one archive destination and nothing makes them archive the same
   partitions. `loadArchiveCoverage` read `archive_state` unscoped, so an hour
   archived by one rotation was classified as covered for a read that opens a
-  different destination — the read fetched nothing for that hour, `GapHours`
-  came back empty, and a strict `AllowGaps=false` `reconstruct` proceeded over
-  data it could not see. Coverage is now scoped to the archive sources the read
-  will actually fetch from (`query.SourceIDsFromPaths` over the set
-  `resolveMergeSources` already resolved), which closes the gap between what the
-  planner counts and what the fetch opens.
+  different destination — the read fetched nothing for that hour and `GapHours`
+  came back empty. Coverage is now scoped to the archive sources the read will
+  actually fetch from, closing the gap between what the planner counts and what
+  the fetch opens. Concretely this fixes: `bintrail query` scoped to a subset
+  with `--archive-dir`/`--archive-s3` + `--bintrail-id`; `bintrail query
+  --profile`, which opens no archives at all yet was credited with every
+  registered one; and, on every merged read, `archive_state` rows with a NULL
+  `bintrail_id` or with paths that resolve to nothing on this host, which
+  previously counted as coverage for files nobody could open.
   - Single-source indexes are byte-identical to before, as are the index-wide
     callers that legitimately read every archive (the
     `bintrail_index_gap_hours` gauge and the console's activity caveat), which
