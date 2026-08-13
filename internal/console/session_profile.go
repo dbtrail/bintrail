@@ -221,15 +221,15 @@ func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle
 	rows, plan, err := query.FetchMerged(ctx, b.db, b.engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         b.dbName,
-		NoArchive:      excl != archivesRead,
+		NoArchive:      excl.any(),
 		AllowGaps:      true,
 		ArchiveFetcher: parquetquery.Fetch,
 	})
 	return rows, plan, excl, err
 }
 
-// archiveExclusion says WHY a fetch left the Parquet archives out, or
-// archivesRead when it did not (#1311).
+// archiveExclusion records WHY a fetch left the Parquet archives out (#1311),
+// tracking the two causes SEPARATELY rather than collapsing them.
 //
 // Excluding them is correct — the archive path runs no redaction, so a
 // profiled session must not be served from it — and it fails in the safe
@@ -238,46 +238,64 @@ func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle
 // still exist; the session simply does not read them. An operator sees a short
 // or empty result and reads it as "nothing happened in that window", which is
 // the one conclusion the data does not support.
-type archiveExclusion string
+//
+// The two causes are kept apart because collapsing them to one winner made a
+// profiled session on a --no-archive console silent: the server-wide cause
+// won, and the server-wide notice is deliberately conditional on the planner
+// finding gaps, which the default browse never produces (no time range, no
+// plan). Session and console are different facts about the same read and both
+// have to survive.
+type archiveExclusion struct {
+	// server: the whole console excludes archives (--no-archive, or a startup
+	// --profile, which implies it — see consoleapp/serve.go).
+	server bool
+	// profile: THIS session carries a data profile.
+	profile bool
+}
 
-const (
-	archivesRead              archiveExclusion = ""
-	archivesExcludedByProfile archiveExclusion = "profile"
-	archivesExcludedByServer  archiveExclusion = "server"
-)
+func (e archiveExclusion) any() bool { return e.server || e.profile }
 
 // archiveExclusionFor reports why this request will not read archives.
-//
-// The server-wide cause wins when both apply: --no-archive (or a startup
-// --profile, which implies it) makes EVERY session archive-blind, so naming
-// the session's own profile would point the operator at something that is not
-// the reason and whose removal would change nothing.
 func archiveExclusionFor(r *http.Request, b *bundle) archiveExclusion {
-	switch {
-	case b.noArchive:
-		return archivesExcludedByServer
-	case sessionRestricted(r):
-		return archivesExcludedByProfile
-	default:
-		return archivesRead
-	}
+	return archiveExclusion{server: b.noArchive, profile: sessionRestricted(r)}
+}
+
+// announce reports whether the operator must be told, given whether the
+// planner found hours this read could not see.
+//
+// A session data profile is ALWAYS announced: it is invisible to the person
+// reading the screen — they did not set it, the UI does not show it, and
+// nothing else in the response hints that half the index is out of scope.
+//
+// A console-wide --no-archive alone is announced only once there is a gap to
+// point at. Putting it on every response would be a permanent banner on every
+// page of that console, and a banner that is always there is read by nobody —
+// including on the day it matters, and it would train users straight past the
+// profile notice.
+func (e archiveExclusion) announce(gaps bool) bool {
+	return e.profile || (e.server && gaps)
 }
 
 // notice is the operator-facing sentence for an exclusion. It states the scope
 // of the result and explicitly denies the wrong inference, because the wrong
 // inference is the whole failure mode: a short result under an unstated
 // restriction reads as an answer about the data.
+// The wording names the cause whose removal would actually change the result.
+// When the whole console excludes archives, saying "your data profile" would
+// point the operator at something that is not the reason and whose removal
+// would change nothing — so the console-wide sentence wins the WORDING even
+// though the profile wins the decision to speak.
 func (e archiveExclusion) notice() string {
-	switch e {
-	case archivesExcludedByProfile:
+	switch {
+	case e.server:
+		return "This console reads the LIVE INDEX ONLY (started with --no-archive, or with a profile that " +
+			"implies it), so archived (rotated) hours are not searched. A short or empty result does not " +
+			"mean nothing happened in that window."
+	case e.profile:
 		return "Your session carries a data profile, so these results come from the LIVE INDEX ONLY: " +
 			"archived (rotated) hours are not searched, because the archive path cannot apply the " +
 			"redaction your profile requires. A short or empty result does not mean nothing happened " +
 			"in that window — ask an operator without a data profile, or use the CLI, to search the archives."
-	case archivesExcludedByServer:
-		return "This console reads the LIVE INDEX ONLY (started with --no-archive, or with a profile that " +
-			"implies it), so archived (rotated) hours are not searched. A short or empty result does not " +
-			"mean nothing happened in that window."
 	}
 	return ""
 }

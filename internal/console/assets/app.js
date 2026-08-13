@@ -1126,6 +1126,14 @@ function renderEvents(params) {
     onclick: (e) => exportEvents("csv", e.target) }));
   v.append(bar);
 
+  // Scope/coverage notices for this result set (#1311). The response has
+  // carried a `warnings` array all along and this view dropped it, which meant
+  // the default browse -- the exact case a profiled session reads live-index
+  // only with no time filter -- computed the right sentence server-side and
+  // threw it away at the browser. Above the list on purpose: a caveat about
+  // what a result does NOT include is worthless below the result.
+  v.append(el("div", { id: "ev-warnings", class: "warnings" }));
+
   // events list
   const list = el("div", { class: "events", id: "events-list" });
   const head = el("div", { class: "ev-head" });
@@ -1445,6 +1453,7 @@ async function runEventsQuery(form, keepPage) {
     return;
   }
   if (gen !== serverGen) return;
+  renderWarnings($("#ev-warnings", VIEW()), data.warnings);
 
   // Client-side refine: unscoped pk/col + free terms.
   const events = refineEvents(data.events || [], refine);
@@ -1769,13 +1778,16 @@ async function previewRecover(form) {
     // Truncation warning (#967): more matches than the preview's limit means
     // the actual undo script (same limit, applied server-side) may cover more
     // events than are shown here.
+    // Preview and Generate-undo share #recover-warnings, so this must render
+    // the server's OWN warnings (the archive-exclusion notice among them)
+    // alongside its truncation note -- not clear the box. Clearing it made the
+    // caveat vanish the moment an operator adjusted a filter and re-previewed,
+    // which is exactly when it is most load-bearing.
+    const notes = (data.warnings || []).slice();
     if (data.count >= data.limit) {
-      renderWarnings(warns, [
-        "Only the newest " + data.limit + " events are shown. The actual undo script may include more if you increase the limit."
-      ]);
-    } else {
-      clear(warns);
+      notes.push("Only the newest " + data.limit + " events are shown. The actual undo script may include more if you increase the limit.");
     }
+    renderWarnings(warns, notes);
   } catch (err) {
     if (gen !== serverGen) return;
     renderError(container, err);

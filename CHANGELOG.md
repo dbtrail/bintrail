@@ -32,6 +32,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `"degraded"`: the events really are still missing, and a consumer keying on
     the verdict must not read a human's "seen it" as the loss being undone.
 
+- **A capture-skip record can be acknowledged** (#1314). `stream_state.capture_skips`
+  is monotonic, so a single skip episode kept the console's capture-health box
+  on screen and `status --fail-on-gap` exiting non-zero forever. The only escape
+  the product documented — stop the daemon and clear the column — is impossible
+  from the console and *destroys the loss record*, which is the one thing that
+  should survive. An alert nobody can clear is an alert everybody removes, and
+  the next real loss then lands in silence.
+  - `bintrail status --ack-capture-skips` and the console's **Mark as read**
+    button (`POST /api/capture-skips/ack`, `servers:write`) record the count and
+    the moment in a new `stream_state.capture_skips_ack` column. Nothing is
+    erased: the tally stays, `status` keeps printing it (`⚠ ON RECORD` instead
+    of `⚠ DEGRADED`), and the console renders it muted rather than as an alarm.
+  - An acknowledgement covers a **count**, not a fact, so a later skip lifts the
+    tally above it and the alarm — and the `--fail-on-gap` failure — return with
+    no operator action. It can retire a record; it cannot mute the next
+    incident.
+  - The console endpoint takes the total the page rendered and refuses with 409
+    if the live tally is higher, so a tab left open cannot acknowledge skips
+    nobody looked at.
+  - `status --format json` gains `capture_health.acknowledged` and
+    `capture_health.acknowledged_at`. `capture_health.status` deliberately stays
+    `"degraded"`: the events really are still missing, and a consumer keying on
+    the verdict must not read a human's "seen it" as the loss being undone.
+
 ### Changed
 - **`bintrail-console` no longer carries its own copy of the env-file loader**
   (#963). `consoleapp/env.go` held `loadEnvFile`/`parseAndSetEnv` byte-for-byte
@@ -98,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A console started with `--no-archive` announces itself only once the plan
     actually finds hours it could not read, so a whole-deployment setting does
     not become a permanent banner on every response — which is read by nobody,
-    including on the day it matters.
+including on the day it matters.
 - **`status` no longer reports an unreadable archive tier as no archive tier**
   (#816). `LoadCoverage` degraded every `archive_state` failure to live-only
   coverage behind a `slog.Warn`, so "this index has no archives" and "I could
@@ -112,6 +136,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lower bound (`⚠ NOT READ` in the text report, `coverage.archives_unavailable`
   plus `archives_error` in JSON). The "(includes archives)" label is withheld
   in that state rather than claiming coverage that was never read.
+    including on the day it matters. A session profile is announced regardless,
+    because it is the one the reader cannot otherwise discover.
+  - The events view now renders the response's `warnings`, and Preview no
+    longer clears the notice Generate-undo rendered. The server had been
+    computing the right sentence for `/api/events` and the browser was dropping
+    it, so the flagship case — a profiled session's default browse — stayed
+    silent on screen.
 ## [0.53.0] - 2026-08-11
 
 ### Fixed

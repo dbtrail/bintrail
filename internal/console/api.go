@@ -229,7 +229,8 @@ func (s *Server) buildOptions(p filterParams, defaultLimit, maxLimit int) (query
 // AllowGaps is true for both events and recover, matching the CLI `recover`
 // (warn-and-continue — a human reviews the script). Coverage gaps the planner
 // detects are returned in the QueryPlan and surfaced to the caller as warnings
-// via gapWarnings(plan); the recover UI renders them prominently, so an
+// via restrictedFetchWarnings(plan, excl); the recover view and the events
+// view both render response warnings (#1311 added the events container), so an
 // incomplete-coverage undo is never presented as a clean success.
 //
 // One residual case for these permissive endpoints: when several archive

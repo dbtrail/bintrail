@@ -565,6 +565,37 @@ try {
       ackedPaint,
     };
   });
+  // Scenario 8b-bis — /api/events warnings must REACH the screen (#1311). The
+  // server computed the archive-exclusion notice correctly and the events view
+  // dropped `data.warnings` on the floor, so the flagship case -- a profiled
+  // session's default browse -- was silent in the UI while the API said the
+  // right thing. A server-side test cannot see that; this can.
+  const evWarn = await page.evaluate(() => {
+    const box = document.createElement("div");
+    box.id = "probe-warnings";
+    document.body.appendChild(box);
+    renderWarnings(box, ["LIVE INDEX ONLY probe notice"]);
+    const rendered = /LIVE INDEX ONLY probe notice/.test(box.textContent);
+    box.remove();
+    return {
+      rendered,
+      // The container the events view must build, by id. Without it
+      // renderWarnings has nowhere to write and the notice is lost.
+      hasEventsContainer: /id:\s*"ev-warnings"/.test(renderEvents.toString()),
+      // ...and it must actually be filled from the response.
+      wiredToResponse: /#ev-warnings/.test(runEventsQuery.toString())
+        && /data\.warnings/.test(runEventsQuery.toString()),
+      // previewRecover shares #recover-warnings with generateUndo; clearing it
+      // made the notice vanish the moment a filter was adjusted.
+      previewKeepsServerWarnings: /data\.warnings/.test(previewRecover.toString())
+        && !/clear\(warns\)/.test(previewRecover.toString()),
+    };
+  });
+  evWarn.rendered ? ok("warnings: renderWarnings paints a notice into a container") : bad("warnings: renderWarnings paints a notice into a container", JSON.stringify(evWarn));
+  evWarn.hasEventsContainer ? ok("warnings: the events view builds a warnings container") : bad("warnings: the events view builds a warnings container", "no #ev-warnings — an API notice has nowhere to land");
+  evWarn.wiredToResponse ? ok("warnings: the events query renders the response's own warnings") : bad("warnings: the events query renders the response's own warnings", "data.warnings is computed server-side and dropped at the browser");
+  evWarn.previewKeepsServerWarnings ? ok("warnings: Preview keeps the server's notices instead of clearing them") : bad("warnings: Preview keeps the server's notices instead of clearing them", "re-previewing wipes the scope caveat");
+
   cap.showsBackendProse ? ok("capture health: banner renders the backend's explanation (table named)") : bad("capture health: banner renders the backend's explanation (table named)", JSON.stringify(cap));
   cap.noOperatorBlame ? ok("capture health: the old blame-the-operator wording is gone") : bad("capture health: the old blame-the-operator wording is gone", "old copy still rendered");
   cap.legacyFallback ? ok("capture health: an old backend gets a fallback that promises nothing") : bad("capture health: an old backend gets a fallback that promises nothing", "fallback missing or invents advice");

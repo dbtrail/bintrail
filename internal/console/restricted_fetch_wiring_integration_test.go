@@ -74,6 +74,32 @@ func TestIntegrationProfiledSessionDeclaresItsScope(t *testing.T) {
 		t.Errorf("an unprofiled session must warn about nothing, got %#v", w)
 	}
 
+	// /api/recover is the endpoint whose warning actually reaches a human
+	// today (the recover view renders response warnings; the events view did
+	// not until this change). It had no coverage at all, which meant the one
+	// working half of the feature was the untested half.
+	{
+		body := strings.NewReader(`{"schema":"app","table":"users","dry_run":true}`)
+		r := httptest.NewRequest("POST", "http://127.0.0.1:8090/api/recover", body)
+		r.Host = "127.0.0.1:8090"
+		r = r.WithContext(context.WithValue(r.Context(),
+			policyCtxKey{}, &ext.AccessPolicy{Profile: "analyst", Permissions: ext.AllPermissions()}))
+		w := httptest.NewRecorder()
+		srv.handleRecover(w, r)
+		if w.Code != 200 {
+			t.Fatalf("recover code = %d, body = %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Warnings []string `json:"warnings"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode recover: %v\n%s", err, w.Body.String())
+		}
+		if !strings.Contains(strings.Join(resp.Warnings, "\n"), "LIVE INDEX ONLY") {
+			t.Errorf("/api/recover does not declare its scope to a profiled session: %#v", resp.Warnings)
+		}
+	}
+
 	got := strings.Join(get(t, "analyst"), "\n")
 	if !strings.Contains(got, "LIVE INDEX ONLY") {
 		t.Fatalf("the profiled response does not declare its scope — a short result still reads as an answer about the data:\n%s", got)
