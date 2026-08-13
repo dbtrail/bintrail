@@ -3,8 +3,87 @@ package query
 import (
 	"cmp"
 	"fmt"
+	"log/slog"
 	"slices"
 )
+
+// maxDivergenceReports caps the per-merge divergence log (#841). One line per
+// event would turn a systematically corrupt archive into a log flood that
+// buries the first — and most useful — report; the tail is summarised instead.
+const maxDivergenceReports = 5
+
+// sameEvent reports whether two copies of one event_id carry the same event.
+//
+// It compares the fields that DEFINE the event and have existed since the
+// original schema. The columns added later — connection_id (#701),
+// query_text/query_hash (#699), commit_ts_us (#18) — are compared only when
+// BOTH sides have a value: an archive written before a column existed loads it
+// as NULL (see restore-index's per-file introspection), so treating
+// "archive NULL, index set" as divergence would fire on every legacy archive
+// in the fleet. That is the cry-wolf failure this warning exists to avoid
+// becoming.
+//
+// SchemaVersion is deliberately NOT compared: it is the snapshot_id at index
+// time, index-local bookkeeping rather than event content.
+func sameEvent(a, b ResultRow) bool {
+	if a.BinlogFile != b.BinlogFile || a.StartPos != b.StartPos || a.EndPos != b.EndPos ||
+		!a.EventTimestamp.Equal(b.EventTimestamp) ||
+		a.SchemaName != b.SchemaName || a.TableName != b.TableName ||
+		a.EventType != b.EventType || a.PKValues != b.PKValues {
+		return false
+	}
+	if !sameOptionalString(a.GTID, b.GTID) ||
+		!sameOptionalString(a.QueryText, b.QueryText) ||
+		!sameOptionalString(a.QueryHash, b.QueryHash) {
+		return false
+	}
+	if a.ConnectionID != nil && b.ConnectionID != nil && *a.ConnectionID != *b.ConnectionID {
+		return false
+	}
+	if a.CommitTsUS != nil && b.CommitTsUS != nil && *a.CommitTsUS != *b.CommitTsUS {
+		return false
+	}
+	if !slices.Equal(a.ChangedColumns, b.ChangedColumns) {
+		return false
+	}
+	return sameRowImage(a.RowBefore, b.RowBefore) && sameRowImage(a.RowAfter, b.RowAfter)
+}
+
+// sameOptionalString treats "one side absent" as agreement, for the same
+// legacy-archive reason sameEvent documents; two present values must match.
+func sameOptionalString(a, b *string) bool {
+	if a == nil || b == nil {
+		return true
+	}
+	return *a == *b
+}
+
+// sameRowImage compares two decoded row images by rendering each value, which
+// is what makes the comparison survive the JSON round trip the archive path
+// puts values through: the same number arrives as json.Number from one side
+// and float64 from the other, and a == on `any` would call that a divergence
+// on every single duplicate row.
+func sameRowImage(a, b map[string]any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok {
+			return false
+		}
+		if (av == nil) != (bv == nil) {
+			return false
+		}
+		if av != nil && fmt.Sprintf("%v", av) != fmt.Sprintf("%v", bv) {
+			return false
+		}
+	}
+	return true
+}
 
 // MergeResults deduplicates rows by event_id, sorts by (event_timestamp, event_id)
 // in the requested direction, and applies the limit. MySQL rows should be
@@ -15,13 +94,40 @@ import (
 // "DESC" (case-insensitive) → descending. The same direction is applied to
 // both sort keys so the ordering is total and deterministic.
 func MergeResults(rows []ResultRow, limit int, order string) []ResultRow {
-	seen := make(map[uint64]struct{}, len(rows))
+	seen := make(map[uint64]int, len(rows))
 	unique := rows[:0]
+	var diverged, reported int
 	for _, r := range rows {
-		if _, dup := seen[r.EventID]; !dup {
-			seen[r.EventID] = struct{}{}
-			unique = append(unique, r)
+		if kept, dup := seen[r.EventID]; dup {
+			// #841: which copy wins is a positional convention with nothing
+			// enforcing it, and the losing copy used to be discarded in
+			// silence. A duplicate is only supposed to happen while a
+			// partition is archived-but-not-dropped, where the archive was
+			// written byte-for-byte from the index — so the copies agreeing
+			// is an INVARIANT, and an operator should hear about it breaking
+			// rather than get an arbitrary one of two answers.
+			//
+			// The comparison runs only on collision, which is rare, so the
+			// normal path pays one map lookup it already paid.
+			if !sameEvent(unique[kept], r) {
+				diverged++
+				if reported < maxDivergenceReports {
+					reported++
+					slog.Warn("merge: two copies of the same event disagree; keeping the first-seen copy (index rows are passed first)",
+						"event_id", r.EventID,
+						"schema", r.SchemaName, "table", r.TableName,
+						"pk_values", r.PKValues,
+						"detail", "an archived partition should be a byte-for-byte copy of the index rows; a mismatch means the index row changed after archiving, or two index generations wrote under the same bintrail_id")
+				}
+			}
+			continue
 		}
+		seen[r.EventID] = len(unique)
+		unique = append(unique, r)
+	}
+	if diverged > reported {
+		slog.Warn("merge: further diverging duplicate events were not individually logged",
+			"diverged_total", diverged, "logged", reported)
 	}
 	descending := OrderDirection(order) == "DESC"
 	slices.SortFunc(unique, func(a, b ResultRow) int {
