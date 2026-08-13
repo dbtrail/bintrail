@@ -4,8 +4,6 @@ package status_test
 
 import (
 	"context"
-	"encoding/json"
-	"strings"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -88,36 +86,28 @@ func TestLoadCoverage_DistinguishesUnreadableArchivesFromNone(t *testing.T) {
 		t.Error("no reason recorded — an operator cannot act on 'unavailable' alone")
 	}
 
-	// Both renderings must carry it. The text report is what an operator
-	// reads during an incident; the JSON is what a monitor keys on.
-	var buf strings.Builder
-	data := &status.StatusData{Coverage: c}
-	data.Write(&buf)
-	out := buf.String()
-	if !strings.Contains(out, "NOT READ") {
-		t.Errorf("the text report does not say the archives were not read:\n%s", out)
+	// The RENDERING assertions live in coverage_render_test.go, as a plain
+	// unit test: they are pure functions over *CoverageInfo, and behind
+	// //go:build integration they are skipped in silence on any machine
+	// without MySQL. Only the discrimination below needs a real driver error.
+
+	// A partition name that will not parse is the same class, reached one
+	// step later: the row was read, and the archives still cannot be placed
+	// in time.
+	exec(`DROP TABLE archive_state`)
+	exec(`CREATE TABLE archive_state (
+	        partition_name VARCHAR(64) NOT NULL,
+	        bintrail_id    VARCHAR(64) NOT NULL,
+	        row_count      BIGINT DEFAULT 0,
+	        PRIMARY KEY (partition_name, bintrail_id))`)
+	exec(`INSERT INTO archive_state (partition_name, bintrail_id, row_count)
+	      VALUES ('not-a-partition', 'src', 5)`)
+	c, err = status.LoadCoverage(ctx, db)
+	if err != nil {
+		t.Fatalf("LoadCoverage (unparseable name): %v", err)
 	}
-	if !strings.Contains(out, "LOWER BOUND") {
-		t.Errorf("the text report does not qualify the restore window:\n%s", out)
-	}
-	if strings.Contains(out, "(includes archives)") {
-		t.Errorf("the text report claims the window includes archives it could not read:\n%s", out)
+	if !c.ArchiveUnavailable {
+		t.Error("an unplaceable archive floor was reported as no archives; the restore window silently understates reality")
 	}
 
-	var jbuf strings.Builder
-	if err := data.WriteJSON(&jbuf); err != nil {
-		t.Fatalf("WriteJSON: %v", err)
-	}
-	var parsed struct {
-		Coverage struct {
-			ArchivesUnavailable bool   `json:"archives_unavailable"`
-			ArchivesError       string `json:"archives_error"`
-		} `json:"coverage"`
-	}
-	if err := json.Unmarshal([]byte(jbuf.String()), &parsed); err != nil {
-		t.Fatalf("status JSON: %v\n%s", err, jbuf.String())
-	}
-	if !parsed.Coverage.ArchivesUnavailable || parsed.Coverage.ArchivesError == "" {
-		t.Errorf("the JSON report does not carry the unavailable verdict: %s", jbuf.String())
-	}
 }

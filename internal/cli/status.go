@@ -169,8 +169,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			// available delta coverage — the live-partition floor (partition
 			// existence = coverage) extended backwards by archives. The floor
 			// comes from OldestDeltaFromDB, NOT data.Coverage: coverage is
-			// best-effort display data that swallows archive_state errors,
-			// and a floor built on it would fabricate "broken" on healthy
+			// best-effort display data that reports an archive_state failure
+			// as a flag rather than an error (#816), so a floor built on it
+			// still cannot distinguish the cases and would fabricate "broken"
+			// on healthy
 			// archives whenever that one read fails. A floor error degrades
 			// every verdict to unknown.
 			floor, fErr := status.OldestDeltaFromDB(cmd.Context(), db, dbName)

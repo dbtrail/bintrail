@@ -202,16 +202,24 @@ type CoverageInfo struct {
 	// Archive-derived fields (from archive_state partition names and row counts).
 	ArchiveEarliestHour sql.NullTime // earliest hour derived from MIN(partition_name)
 	ArchiveTotalRows    int64
-	// ArchiveUnavailable marks archive coverage as UNREAD rather than absent
+	// ArchiveUnavailable marks archive coverage as UNREAD or UNPLACEABLE rather
+	// than absent
 	// (#816). Both states leave the two fields above zero, and reporting them
 	// the same way understates the restore window: an operator reads a
 	// too-recent "Earliest event" and concludes an old incident is beyond
 	// recovery while the Parquet that covers it is sitting in the bucket.
 	//
 	// Only a genuinely missing archive_state (ER_NO_SUCH_TABLE on an index
-	// that never archived) counts as "no archives"; every other failure —
-	// permissions, a transient network error, a corrupt table — is unknown,
-	// and unknown is never rendered as a fact.
+	// that never archived) counts as "no archives"; every other outcome —
+	// a table-level permission denial, a corrupt table, a legacy shape
+	// missing a column, or a partition_name that will not parse — is
+	// unknown, and unknown is never rendered as a fact.
+	//
+	// Note the scope: a dead connection or a query timeout fails the
+	// binlog_events read at the top of LoadCoverage and never reaches here,
+	// so this flag is specific to archive_state. That outer failure drops
+	// the whole coverage section instead, which is its own gap (see the
+	// CoverageErr follow-up).
 	ArchiveUnavailable bool
 	ArchiveError       string
 
@@ -364,9 +372,24 @@ func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 		return &c, nil
 	}
 	if minPartition.Valid {
-		if t, ok := parsePartitionName(minPartition.String); ok {
-			c.ArchiveEarliestHour = sql.NullTime{Time: t, Valid: true}
+		t, ok := parsePartitionName(minPartition.String)
+		if !ok {
+			// Same class as an unreadable table, reached three lines later:
+			// the archives exist, we read the row, and we still cannot place
+			// them in time — so the floor below is live-only and the window
+			// is a lower bound. Dropping this silently printed a too-recent
+			// "Earliest event" as fact, which is the whole of #816.
+			//
+			// staleness.go's OldestDeltaFromDB hard-errors on the identical
+			// parse of the identical value ("our own naming scheme failing to
+			// parse is drift"). Two readers of one value must not take
+			// opposite stances, and the silent one was the one an operator
+			// reads mid-incident.
+			c.ArchiveUnavailable = true
+			c.ArchiveError = fmt.Sprintf("archive_state MIN(partition_name) %q is not a partition name", minPartition.String)
+			return &c, nil
 		}
+		c.ArchiveEarliestHour = sql.NullTime{Time: t, Valid: true}
 	}
 
 	return &c, nil

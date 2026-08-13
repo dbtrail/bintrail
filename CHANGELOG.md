@@ -7,20 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **`bintrail-console` no longer carries its own copy of the env-file loader**
-  (#963). `consoleapp/env.go` held `loadEnvFile`/`parseAndSetEnv` byte-for-byte
-  identical to `internal/cli/env.go`, plus its own `sync.Once`, so any change
-  to env-file semantics would land in one binary and silently not the other.
-  Both now call the exported `cli.LoadEnvFile`. Sharing the `sync.Once` is also
-  more correct: `consoleapp` imports `internal/cli`, so two of them in one
-  process meant the file could be read twice. A guard test fails if the
-  duplicate comes back — the previous marker was a code comment naming itself
-  a "consolidation candidate", and a comment cannot fail.
-
-### Fixed
-
-
 ### Added
 - **A capture-skip record can be acknowledged** (#1314). `stream_state.capture_skips`
   is monotonic, so a single skip episode kept the console's capture-health box
@@ -46,6 +32,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `"degraded"`: the events really are still missing, and a consumer keying on
     the verdict must not read a human's "seen it" as the loss being undone.
 
+### Changed
+- **`bintrail-console` no longer carries its own copy of the env-file loader**
+  (#963). `consoleapp/env.go` held `loadEnvFile`/`parseAndSetEnv` byte-for-byte
+  identical to `internal/cli/env.go`, plus its own `sync.Once`, so any change
+  to env-file semantics would land in one binary and silently not the other.
+  Both now call the exported `cli.LoadEnvFile`. Sharing the `sync.Once` is also
+  more correct: `consoleapp` imports `internal/cli`, so two of them in one
+  process meant the file could be read twice. A guard test fails if the
+  duplicate comes back — the previous marker was a code comment naming itself
+  a "consolidation candidate", and a comment cannot fail.
+
+### Fixed
+- **`status` no longer reports an unreadable archive tier as no archive tier**
+  (#816). `LoadCoverage` degraded every `archive_state` failure to live-only
+  coverage behind a `slog.Warn`, so "this index has no archives" and "I could
+  not read the archives" printed identically — a restore window SHORTER than
+  reality, which an operator reads as "that incident is beyond recovery" while
+  the Parquet covering it is still in the bucket. Only a genuinely missing
+  table now counts as no archive tier; any other outcome — including an
+  `archive_state` row whose `partition_name` will not parse, which left the
+  floor silently live-only — sets
+  `CoverageInfo.ArchiveUnavailable`, and both renderings say the window is a
+  lower bound (`⚠ NOT READ` in the text report, `coverage.archives_unavailable`
+  plus `archives_error` in JSON). The "(includes archives)" label is withheld
+  in that state rather than claiming coverage that was never read.
 ## [0.53.0] - 2026-08-11
 
 ### Fixed

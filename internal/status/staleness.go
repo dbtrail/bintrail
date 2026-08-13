@@ -118,8 +118,9 @@ func OldestLivePartitionHour(parts []PartitionStat) time.Time {
 // OldestDeltaFromDB computes the delta-coverage floor: the live-partition
 // floor extended backwards by contiguous archives. It is the ONLY floor
 // implementation — the CLI, console, and watcher all use it (CoverageInfo's
-// ArchiveEarliestHour is a best-effort DISPLAY figure whose errors are
-// swallowed, which a verdict must never be built on). Error semantics are
+// ArchiveEarliestHour is a best-effort DISPLAY figure that reports a read
+// failure as ArchiveUnavailable rather than returning it, so a verdict must
+// never be built on it). Error semantics are
 // strict in the anti-cry-wolf direction: any failure that could make the
 // floor read LATER than reality — and so fabricate "broken" on healthy
 // archives — is returned (the caller degrades to unknown), never swallowed.
