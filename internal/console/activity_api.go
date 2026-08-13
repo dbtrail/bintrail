@@ -179,7 +179,11 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// what makes the caveat honest. Passing the bundle's noArchive would
 	// reclassify those hours as gaps and silence the caveat.
 	resp.Complete = !resp.Truncated
-	plan, perr := query.Plan(r.Context(), b.db, b.dbName, &since, &until, false)
+	// nil scope (#1232), for the same reason noArchive is false above: this
+	// reads archive_state as INDEX METADATA to caveat a count, not to decide
+	// what a fetch will open. Scoping it would drop hours that are archived
+	// and silence the caveat they exist to raise.
+	plan, perr := query.Plan(r.Context(), b.db, b.dbName, &since, &until, false, nil)
 	switch {
 	case perr != nil:
 		// Never assume completeness we could not check.

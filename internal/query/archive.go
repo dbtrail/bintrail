@@ -192,3 +192,54 @@ func extractBasePath(path string) string {
 	}
 	return path[:idx+len(marker)+slashIdx]
 }
+
+// SourceIDsFromPaths extracts the bintrail_ids embedded in resolved archive
+// source paths — the set of archives a read will actually OPEN (#1232).
+//
+// The id is in the path because every archive base ends at the Hive marker
+// `bintrail_id=<id>` (extractBasePath is what puts it there, for both local
+// dirs and `s3://bucket/prefix` sources), so the caller that resolved the
+// sources already holds the scope without a second database read.
+//
+// Returns a non-nil EMPTY slice for a non-nil input that yields no ids, and
+// nil only for a nil input. That distinction is load-bearing: the planner
+// reads nil as "every archive in the index" and empty as "this read opens
+// none", and collapsing the two would turn "I resolved nothing" into "I
+// resolved everything" — the false-OK this exists to prevent. A path with no
+// marker is therefore DROPPED rather than silently widening the scope; it can
+// only come from a caller that bypassed extractBasePath, and counting an
+// unidentifiable archive as "all archives" is the same false OK.
+func SourceIDsFromPaths(paths []string) []string {
+	if paths == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(paths))
+	ids := make([]string, 0, len(paths))
+	for _, p := range paths {
+		id := sourceIDFromBase(p)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// sourceIDFromBase pulls the id out of a base path ending in
+// `bintrail_id=<id>`. It matches on the marker rather than on the id's shape:
+// rotate's --bintrail-id takes an arbitrary string verbatim, and a reader
+// stricter than the writer would silently skip every archive under a
+// human-named id (the #392 review lesson, in the discovery direction).
+func sourceIDFromBase(base string) string {
+	const marker = "bintrail_id="
+	i := strings.LastIndex(base, marker)
+	if i < 0 {
+		return ""
+	}
+	id := strings.TrimSuffix(base[i+len(marker):], "/")
+	if strings.Contains(id, "/") {
+		return ""
+	}
+	return id
+}

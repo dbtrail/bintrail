@@ -43,7 +43,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplicate comes back — the previous marker was a code comment naming itself
   a "consolidation candidate", and a comment cannot fail.
 
+- **`bintrail-console` no longer carries its own copy of the env-file loader**
+  (#963). `consoleapp/env.go` held `loadEnvFile`/`parseAndSetEnv` byte-for-byte
+  identical to `internal/cli/env.go`, plus its own `sync.Once`, so any change
+  to env-file semantics would land in one binary and silently not the other.
+  Both now call the exported `cli.LoadEnvFile`. Sharing the `sync.Once` is also
+  more correct: `consoleapp` imports `internal/cli`, so two of them in one
+  process meant the file could be read twice. A guard test fails if the
+  duplicate comes back — the previous marker was a code comment naming itself
+  a "consolidation candidate", and a comment cannot fail.
+
 ### Fixed
+- **The query planner no longer counts archives the read will never open**
+  (#1232). Rotation is per-process, so an index capturing more than one source
+  has more than one archive destination and nothing makes them archive the same
+  partitions. `loadArchiveCoverage` read `archive_state` unscoped, so an hour
+  archived by one rotation was classified as covered for a read that opens a
+  different destination — the read fetched nothing for that hour, `GapHours`
+  came back empty, and a strict `AllowGaps=false` `reconstruct` proceeded over
+  data it could not see. Coverage is now scoped to the archive sources the read
+  will actually fetch from (`query.SourceIDsFromPaths` over the set
+  `resolveMergeSources` already resolved), which closes the gap between what the
+  planner counts and what the fetch opens.
+  - Single-source indexes are byte-identical to before, as are the index-wide
+    callers that legitimately read every archive (the
+    `bintrail_index_gap_hours` gauge and the console's activity caveat), which
+    pass an explicit unscoped nil.
+  - Note this is **not** scoping by which source produced the events:
+    `binlog_events` has no source discriminator and `ArchivePartition` archives
+    the whole shared partition, so one source's archive of an hour holds every
+    source's rows for it. `archive_state.bintrail_id` records who archived a
+    partition, not whose rows are inside — scoping by data ownership would
+    report gaps over data that is present.
 - **`status` no longer reports an unreadable archive tier as no archive tier**
   (#816). `LoadCoverage` degraded every `archive_state` failure to live-only
   coverage behind a `slog.Warn`, so "this index has no archives" and "I could

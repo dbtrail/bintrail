@@ -1120,7 +1120,9 @@ func EnvArchiveSources(ctx context.Context, db *sql.DB) ([]string, bool) {
 // knowingly-possibly-incomplete class as its other two archive gates. Never
 // fails without a time filter (since/until both nil): nothing is pruned then.
 func misfiledArchiveHours(ctx context.Context, db *sql.DB, since, until *time.Time) ([]time.Time, bool) {
-	hours, err := query.MisfiledArchiveHours(ctx, db, since, until)
+	// nil scope (#1232): a widening pruning hint, safe over-broad and unsafe
+	// narrow — see the agent handler's call site.
+	hours, err := query.MisfiledArchiveHours(ctx, db, since, until, nil)
 	if err != nil {
 		slog.Warn("could not check archive_state for misfiled archives (backfilled events); time-scoped archive pruning may skip them", "error", err)
 		return nil, true

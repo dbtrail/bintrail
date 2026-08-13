@@ -323,12 +323,17 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	// (archive queries do not enforce DenyTables/RedactColumns rules; explicit
 	// archive flags are already blocked by the --profile validation above).
 	var archSources []string
+	// discoveryFailed keeps the coverage scope honest (#1232): with an
+	// unknown source set the planner must stay unscoped, because an
+	// empty scope would report every rotated hour as a gap.
+	discoveryFailed := false
 	if !qNoArchive {
 		archSources = archiveSources()
 		if len(archSources) == 0 && qArchiveDir == "" && qArchiveS3 == "" && qProfile == "" {
 			var rerr error
 			archSources, rerr = query.ResolveArchiveSources(cmd.Context(), db)
 			if rerr != nil {
+				discoveryFailed = true
 				// bintrail query is deliberately permissive (multi-region
 				// operators shouldn't lose a query to one bad registry
 				// read) — but the failure is surfaced on both channels,
@@ -346,7 +351,17 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		if parseErr != nil {
 			slog.Warn("could not parse DSN for query planning", "error", parseErr)
 		} else if cfg.DBName != "" {
-			plan = query.RunPlanAndWarn(cmd.Context(), db, cfg.DBName, since, until)
+			// Scope the coverage read to the archives this query will
+			// actually open (#1232): an hour recorded by a rotation whose
+			// destination is not in --archive-dir/--archive-s3 (or in what
+			// discovery resolved) is not coverage for THIS read, and
+			// counting it suppressed the gap warning over data the fetch
+			// never opens.
+			var scope []string
+			if !discoveryFailed {
+				scope = query.SourceIDsFromPaths(archSources)
+			}
+			plan = query.RunPlanAndWarn(cmd.Context(), db, cfg.DBName, since, until, scope)
 		}
 	}
 

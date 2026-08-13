@@ -68,7 +68,22 @@ type QueryPlan struct {
 // only in archives are then classified as GAPS, because those archives will not
 // be fetched. Counting them as covered would let a strict (AllowGaps=false)
 // reconstruct silently return incomplete state.
-func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time, noArchive bool) (*QueryPlan, error) {
+//
+// sourceIDs names the archive sources this read will actually OPEN, as
+// bintrail_ids (#1232). It is the same rule as noArchive applied at a finer
+// grain: coverage recorded by an archive the fetch will not read is not
+// coverage. nil means "every archive registered in the index", which is the
+// only honest answer for a caller that reads them all — or that cannot
+// enumerate the set. An EMPTY non-nil slice means "this read opens no
+// archives", so every rotated hour is a gap.
+//
+// Note what this deliberately does NOT scope by: which source PRODUCED the
+// events. binlog_events carries no source discriminator and ArchivePartition
+// archives the whole shared partition, so one source's archive of hour H holds
+// every source's events for H. archive_state.bintrail_id records who archived
+// a partition, not whose rows are in it — scoping by data ownership would
+// report gaps over data that is present.
+func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time, noArchive bool, sourceIDs []string) (*QueryPlan, error) {
 	if db == nil || dbName == "" {
 		return nil, nil
 	}
@@ -102,7 +117,7 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 	// covered. Leaving archivedHours nil makes buildPlan classify them as gaps.
 	var cov []archiveCoverage
 	if !noArchive {
-		cov, err = loadArchiveCoverage(ctx, db)
+		cov, err = loadArchiveCoverage(ctx, db, sourceIDs)
 		if err != nil {
 			slog.Debug("archive_state not available for planning", "error", err)
 			cov = nil
@@ -225,10 +240,10 @@ func (p *QueryPlan) SkipMySQL() bool {
 // applicable or fails (callers should fall back to the default path).
 //
 // parseDSN is a function that extracts the database name from the DSN.
-func RunPlanAndWarn(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time) *QueryPlan {
+func RunPlanAndWarn(ctx context.Context, db *sql.DB, dbName string, since, until *time.Time, sourceIDs []string) *QueryPlan {
 	// Callers that exclude archives (bintrail query --no-archive) skip planning
 	// entirely, so this warn path is always archive-aware (noArchive=false).
-	plan, err := Plan(ctx, db, dbName, since, until, false)
+	plan, err := Plan(ctx, db, dbName, since, until, false, sourceIDs)
 	if err != nil {
 		slog.Warn("query planner failed; coverage gaps may not be detected", "error", err)
 		return nil
@@ -315,19 +330,42 @@ type archiveCoverage struct {
 // back to label-only coverage (the pre-#1037 behavior).
 const maxCoverageSpan = 20 * 366 * 24 * time.Hour
 
+// sourceScopeClause builds the optional `WHERE bintrail_id IN (...)` that
+// restricts coverage to the archives a read will open (#1232). A nil scope
+// yields no clause at all — every registered archive counts, which is correct
+// for a caller that reads them all. The empty-scope case never reaches here:
+// callers return early, because `IN ()` is a syntax error, not an empty set.
+func sourceScopeClause(sourceIDs []string) (string, []any) {
+	if len(sourceIDs) == 0 {
+		return "", nil
+	}
+	args := make([]any, len(sourceIDs))
+	for i, id := range sourceIDs {
+		args[i] = id
+	}
+	return " WHERE bintrail_id IN (?" + strings.Repeat(", ?", len(sourceIDs)-1) + ")", args
+}
+
 // loadArchiveCoverage returns per-row archive coverage from archive_state.
 // On an index whose archive_state predates the min/max_event_ts columns
 // (error 1054 — the migration only runs where EnsureSchema does, e.g. rotate),
 // it falls back to label-only coverage so planning keeps working unchanged.
-func loadArchiveCoverage(ctx context.Context, db *sql.DB) ([]archiveCoverage, error) {
+func loadArchiveCoverage(ctx context.Context, db *sql.DB, sourceIDs []string) ([]archiveCoverage, error) {
+	if sourceIDs != nil && len(sourceIDs) == 0 {
+		// Scoped to nothing: this read opens no archives, so no archive_state
+		// row can describe coverage it will see. Returning early (rather than
+		// building an `IN ()`, which is a syntax error) keeps that explicit.
+		return nil, nil
+	}
+	where, args := sourceScopeClause(sourceIDs)
 	rows, err := db.QueryContext(ctx, `
 		SELECT partition_name, min_event_ts, max_event_ts
-		FROM archive_state
-		ORDER BY partition_name`)
+		FROM archive_state`+where+`
+		ORDER BY partition_name`, args...)
 	if err != nil {
 		var myErr *mysql.MySQLError
 		if errors.As(err, &myErr) && myErr.Number == 1054 {
-			return loadArchiveCoverageLegacy(ctx, db)
+			return loadArchiveCoverageLegacy(ctx, db, sourceIDs)
 		}
 		return nil, err
 	}
@@ -356,11 +394,15 @@ func loadArchiveCoverage(ctx context.Context, db *sql.DB) ([]archiveCoverage, er
 
 // loadArchiveCoverageLegacy is loadArchiveCoverage for pre-#1037 archive_state
 // schemas: partition names only, no content range.
-func loadArchiveCoverageLegacy(ctx context.Context, db *sql.DB) ([]archiveCoverage, error) {
+func loadArchiveCoverageLegacy(ctx context.Context, db *sql.DB, sourceIDs []string) ([]archiveCoverage, error) {
+	if sourceIDs != nil && len(sourceIDs) == 0 {
+		return nil, nil
+	}
+	where, args := sourceScopeClause(sourceIDs)
 	rows, err := db.QueryContext(ctx, `
 		SELECT DISTINCT partition_name
-		FROM archive_state
-		ORDER BY partition_name`)
+		FROM archive_state`+where+`
+		ORDER BY partition_name`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -452,11 +494,11 @@ func misfiledHours(cov []archiveCoverage, rangeStart, rangeEnd time.Time) []time
 // hour labels of misfiled archives overlapping [since, until]; nil bounds are
 // open. Returns (nil, nil) when db is nil or no time bound is set (no pruning
 // happens then, so nothing can be missed).
-func MisfiledArchiveHours(ctx context.Context, db *sql.DB, since, until *time.Time) ([]time.Time, error) {
+func MisfiledArchiveHours(ctx context.Context, db *sql.DB, since, until *time.Time, sourceIDs []string) ([]time.Time, error) {
 	if db == nil || (since == nil && until == nil) {
 		return nil, nil
 	}
-	cov, err := loadArchiveCoverage(ctx, db)
+	cov, err := loadArchiveCoverage(ctx, db, sourceIDs)
 	if err != nil {
 		return nil, err
 	}

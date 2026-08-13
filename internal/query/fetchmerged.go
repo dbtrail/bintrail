@@ -494,7 +494,24 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 	// detection for --no-archive callers (observability win for recover,
 	// correctness win for reconstruct under AllowGaps=false).
 	if o.DBName != "" && (len(src.archSources) > 0 || o.Opts.Since != nil || o.Opts.Until != nil) {
-		p, err := Plan(ctx, db, o.DBName, o.Opts.Since, o.Opts.Until, o.NoArchive)
+		// Scope coverage to the archives THIS read will open (#1232). The
+		// set is src.archSources, already resolved a few lines up, so the
+		// planner and the fetch can no longer disagree about which archives
+		// exist — an hour recorded in archive_state by a rotation whose
+		// destination this read does not open is not coverage, and counting
+		// it was letting a strict reconstruct proceed over data it would
+		// never fetch.
+		//
+		// nil (unscoped, the old behaviour) is deliberate on the
+		// discovery-failure path: we do not know the set, and inventing an
+		// empty one would report every rotated hour as a gap. AllowGaps=false
+		// has already refused above in that case, and AllowGaps=true asked
+		// for best-effort.
+		var scope []string
+		if !src.discoveryFailed {
+			scope = SourceIDsFromPaths(src.archSources)
+		}
+		p, err := Plan(ctx, db, o.DBName, o.Opts.Since, o.Opts.Until, o.NoArchive, scope)
 		if err != nil {
 			if !o.AllowGaps {
 				return src, fmt.Errorf("query planner failed, cannot verify coverage: %w", err)
