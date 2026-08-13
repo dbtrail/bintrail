@@ -295,7 +295,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// row is not a paging escape hatch for pulling the index into a browser.
 	pageLimit := opts.Limit
 	opts.Limit = pageLimit + 1
-	rows, plan, err := s.fetchRestricted(r.Context(), r, b, opts)
+	rows, plan, excl, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -309,7 +309,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		Count:    len(rows),
 		Limit:    pageLimit,
 		HasMore:  hasMore,
-		Warnings: gapWarnings(plan),
+		Warnings: restrictedFetchWarnings(plan, excl),
 	}
 	// The cursor comes from the last row of the page the client is about to
 	// see, in the direction it is reading. Built server-side from a served row
@@ -389,12 +389,12 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// Coverage gaps come back in plan.GapHours and are surfaced as warnings
 	// below — the recover UI renders them, so an incomplete-coverage undo is
 	// flagged to the operator rather than silently presented as complete.
-	rows, plan, err := s.fetchRestricted(r.Context(), r, b, opts)
+	rows, plan, excl, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
 	}
-	warnings := gapWarnings(plan)
+	warnings := restrictedFetchWarnings(plan, excl)
 
 	// The fetch above ran Order=DESC so the limit kept the newest suffix of
 	// the window (#981). Detect truncation on the FETCHED row count — before
@@ -843,7 +843,8 @@ func writeRecoverError(w http.ResponseWriter, err error) {
 }
 
 // gapWarnings renders coverage-gap hours from a query plan into a warning list
-// for the API response, or nil when there are none.
+// for the API response, or nil when there are none. Callers that fetch through
+// fetchRestricted must use restrictedFetchWarnings instead — see its doc.
 func gapWarnings(plan *query.QueryPlan) []string {
 	if plan == nil || len(plan.GapHours) == 0 {
 		return nil

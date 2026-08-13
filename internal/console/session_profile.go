@@ -216,13 +216,68 @@ func (s *Server) applySessionProfile(ctx context.Context, r *http.Request, b *bu
 // archives OFF when the request's session carries a data profile: Parquet
 // archives do not run the redaction pass, so a profiled session must read live
 // MySQL only (the same reason a startup profile forces --no-archive process-wide).
-func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
-	noArchive := b.noArchive || sessionRestricted(r)
-	return query.FetchMerged(ctx, b.db, b.engine, query.FetchMergedOptions{
+func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, error) {
+	excl := archiveExclusionFor(r, b)
+	rows, plan, err := query.FetchMerged(ctx, b.db, b.engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         b.dbName,
-		NoArchive:      noArchive,
+		NoArchive:      excl != archivesRead,
 		AllowGaps:      true,
 		ArchiveFetcher: parquetquery.Fetch,
 	})
+	return rows, plan, excl, err
+}
+
+// archiveExclusion says WHY a fetch left the Parquet archives out, or
+// archivesRead when it did not (#1311).
+//
+// Excluding them is correct — the archive path runs no redaction, so a
+// profiled session must not be served from it — and it fails in the safe
+// direction: the session is shown less, never unredacted more. What was
+// missing is that the RESULT never said so. Hours rotated out of live MySQL
+// still exist; the session simply does not read them. An operator sees a short
+// or empty result and reads it as "nothing happened in that window", which is
+// the one conclusion the data does not support.
+type archiveExclusion string
+
+const (
+	archivesRead              archiveExclusion = ""
+	archivesExcludedByProfile archiveExclusion = "profile"
+	archivesExcludedByServer  archiveExclusion = "server"
+)
+
+// archiveExclusionFor reports why this request will not read archives.
+//
+// The server-wide cause wins when both apply: --no-archive (or a startup
+// --profile, which implies it) makes EVERY session archive-blind, so naming
+// the session's own profile would point the operator at something that is not
+// the reason and whose removal would change nothing.
+func archiveExclusionFor(r *http.Request, b *bundle) archiveExclusion {
+	switch {
+	case b.noArchive:
+		return archivesExcludedByServer
+	case sessionRestricted(r):
+		return archivesExcludedByProfile
+	default:
+		return archivesRead
+	}
+}
+
+// notice is the operator-facing sentence for an exclusion. It states the scope
+// of the result and explicitly denies the wrong inference, because the wrong
+// inference is the whole failure mode: a short result under an unstated
+// restriction reads as an answer about the data.
+func (e archiveExclusion) notice() string {
+	switch e {
+	case archivesExcludedByProfile:
+		return "Your session carries a data profile, so these results come from the LIVE INDEX ONLY: " +
+			"archived (rotated) hours are not searched, because the archive path cannot apply the " +
+			"redaction your profile requires. A short or empty result does not mean nothing happened " +
+			"in that window — ask an operator without a data profile, or use the CLI, to search the archives."
+	case archivesExcludedByServer:
+		return "This console reads the LIVE INDEX ONLY (started with --no-archive, or with a profile that " +
+			"implies it), so archived (rotated) hours are not searched. A short or empty result does not " +
+			"mean nothing happened in that window."
+	}
+	return ""
 }

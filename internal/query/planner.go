@@ -219,11 +219,25 @@ func FormatGapWarning(gaps []time.Time) string {
 	if len(gaps) == 0 {
 		return ""
 	}
-	first := gaps[0]
-	last := gaps[len(gaps)-1]
-	return fmt.Sprintf("query covers hours with no data (rotated and not archived): %s – %s",
-		first.Format("2006-01-02 15:00"),
-		last.Format("2006-01-02 15:00"))
+	first, last := GapRange(gaps)
+	return fmt.Sprintf("query covers hours with no data (rotated and not archived): %s – %s", first, last)
+}
+
+// GapRange renders the first and last gap hour for callers that need to say
+// something OTHER than FormatGapWarning's sentence about the same hours.
+//
+// It exists because that sentence names a cause — "rotated and not archived" —
+// which is only true when the reader actually opens the archives. A reader
+// that deliberately excludes them (console --no-archive, or a session data
+// profile) sees the same hours reported as gaps by design, and telling that
+// operator the data was never archived sends them to audit a rotation that is
+// working fine.
+func GapRange(gaps []time.Time) (first, last string) {
+	if len(gaps) == 0 {
+		return "", ""
+	}
+	const f = "2006-01-02 15:00"
+	return gaps[0].Format(f), gaps[len(gaps)-1].Format(f)
 }
 
 // SkipMySQL returns true when the planner determined that MySQL can be skipped

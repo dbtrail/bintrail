@@ -78,6 +78,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     source's rows for it. `archive_state.bintrail_id` records who archived a
     partition, not whose rows are inside — scoping by data ownership would
     report gaps over data that is present.
+- **A console session with an RBAC data profile now says it reads the live
+  index only** (#1311). Such a session is served with `NoArchive` because the
+  Parquet path cannot apply per-column redaction — the right call, and it fails
+  in the safe direction — but the response never said so. Hours rotated into
+  archive storage still exist; the session simply does not open them, and a
+  short or empty result reads as "nothing happened in that window", which is
+  the one conclusion the data does not support. `/api/events` and
+  `/api/recover` now carry a warning that states the scope and denies that
+  inference in words.
+  - The warning does **not** depend on the query planner. The planner only runs
+    with a time range, so the default browse — newest N events — produced no
+    plan and therefore no warning at all, which was the worst case.
+  - Gap hours under an archive-excluded read are no longer explained as
+    "rotated and not archived". The planner classifies archived-only hours as
+    gaps for such a read by design; naming rotation as the cause sends the
+    operator to audit a rotation that is working. The hours are still named,
+    with the cause left open.
+  - A console started with `--no-archive` announces itself only once the plan
+    actually finds hours it could not read, so a whole-deployment setting does
+    not become a permanent banner on every response — which is read by nobody,
+    including on the day it matters.
 - **`status` no longer reports an unreadable archive tier as no archive tier**
   (#816). `LoadCoverage` degraded every `archive_state` failure to live-only
   coverage behind a `slog.Warn`, so "this index has no archives" and "I could
