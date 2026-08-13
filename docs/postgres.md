@@ -740,8 +740,14 @@ coerce, but verify your own round-trip.
   are captured as ordinary row changes — see
   [Querying and recovering](#querying-and-recovering).)
 - **No connection attribution.** `pgoutput` does not carry the backend PID, so
-  the `connection_id` column is empty for PostgreSQL sources — nothing upstream
-  can add it.
+  the `connection_id` column is empty for PostgreSQL sources. Forensic
+  attribution ("which session made this change") is therefore a MySQL-only
+  capability today, and this is a **settled decision, not a pending gap**
+  ([#1212](https://github.com/dbtrail/dbtrail/issues/1212)): the only way to
+  recover the backend PID is to install something into your database, and
+  bintrail installs nothing into a source. Everything else forensics offers —
+  the full before/after row images, the change timeline, `--query-hash`
+  grouping where the source logs statements — works identically on PostgreSQL.
 - **One database per slot.** A logical slot is scoped to a single database; to
   capture multiple databases on one cluster, run one `bintrail-pg stream` (and
   slot/publication) per database.
