@@ -35,8 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `query_hash`, `commit_ts_us`) are compared only when BOTH sides carry a
     value: an archive written before a column existed loads it as NULL, and
     treating that as divergence would fire on every legacy archive in the
-    fleet. Row images are compared by rendered value, so the JSON round trip
-    the archive path performs is not mistaken for a difference.
+    fleet. Row images are compared with `reflect.DeepEqual` — `==` on an `any`
+    holding a nested JSON array or object panics.
 
 ### Added
 - **A capture-skip record can be acknowledged** (#1314). `stream_state.capture_skips`

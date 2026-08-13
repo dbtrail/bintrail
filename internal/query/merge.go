@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"slices"
 )
 
@@ -58,11 +59,28 @@ func sameOptionalString(a, b *string) bool {
 	return *a == *b
 }
 
-// sameRowImage compares two decoded row images by rendering each value, which
-// is what makes the comparison survive the JSON round trip the archive path
-// puts values through: the same number arrives as json.Number from one side
-// and float64 from the other, and a == on `any` would call that a divergence
-// on every single duplicate row.
+// sameRowImage compares two decoded row images.
+//
+// reflect.DeepEqual, not ==, and the reason is not stylistic: MySQL JSON
+// columns decode to []any and map[string]any, and == on an `any` holding
+// either PANICS with "comparing uncomparable type". A row image with a nested
+// JSON array would take down every merged query.
+//
+// An earlier version rendered each value with fmt.Sprintf("%v") to dodge that.
+// It dodged it, but %v erases type: json.Number("7") and "7" both render as 7,
+// true and "true" both render as true. In MySQL JSON those are different
+// values, and "an index row re-marshalled by a different generation of writer"
+// is one of the two causes this warning names — so the comparison was blind to
+// a case it exists to catch. It also allocated two strings per column per side
+// on every duplicate row.
+//
+// (The %v version justified itself as bridging a json.Number/float64 split
+// across the archive boundary. That split does not exist: both sides decode
+// through UnmarshalRowImage, which sets dec.UseNumber(), so both are
+// json.Number.)
+//
+// The length guard stays because DeepEqual(map[string]any{}, nil) is false,
+// and a nil RowBefore on an INSERT must agree with an empty one.
 func sameRowImage(a, b map[string]any) bool {
 	if len(a) != len(b) {
 		return false
@@ -70,19 +88,7 @@ func sameRowImage(a, b map[string]any) bool {
 	if len(a) == 0 {
 		return true
 	}
-	for k, av := range a {
-		bv, ok := b[k]
-		if !ok {
-			return false
-		}
-		if (av == nil) != (bv == nil) {
-			return false
-		}
-		if av != nil && fmt.Sprintf("%v", av) != fmt.Sprintf("%v", bv) {
-			return false
-		}
-	}
-	return true
+	return reflect.DeepEqual(a, b)
 }
 
 // MergeResults deduplicates rows by event_id, sorts by (event_timestamp, event_id)
@@ -107,13 +113,25 @@ func MergeResults(rows []ResultRow, limit int, order string) []ResultRow {
 			// is an INVARIANT, and an operator should hear about it breaking
 			// rather than get an arbitrary one of two answers.
 			//
-			// The comparison runs only on collision, which is rare, so the
-			// normal path pays one map lookup it already paid.
+			// The normal path pays one map lookup it already paid. The
+			// comparison itself runs only on collision — usually rare, but
+			// NOT always: a partition that is archived and then blocked from
+			// dropping (a bucket-set/stamp-NULL archive_state row trips
+			// hasPendingS3Upload, and rotate then refuses to drop it) stays
+			// duplicated in every query touching that hour until someone runs
+			// `archive reconcile --repair`. That is why the comparison must
+			// stay allocation-free.
 			if !sameEvent(unique[kept], r) {
 				diverged++
 				if reported < maxDivergenceReports {
 					reported++
-					slog.Warn("merge: two copies of the same event disagree; keeping the first-seen copy (index rows are passed first)",
+					// No claim about WHICH source won: "index rows are
+					// passed first" is the contract for the MySQL+archive
+					// merge but false for the agent, which fetches its
+					// buffer before the index (internal/agent/handler.go).
+					// A BYOS operator told to trust the index copy would
+					// reconcile against the wrong one of the two values.
+					slog.Warn("merge: two copies of the same event disagree; keeping the one the caller passed first",
 						"event_id", r.EventID,
 						"schema", r.SchemaName, "table", r.TableName,
 						"pk_values", r.PKValues,

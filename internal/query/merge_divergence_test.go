@@ -2,6 +2,7 @@ package query
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
@@ -107,18 +108,106 @@ func TestMergeResults_silentOnAgreeingDuplicates(t *testing.T) {
 	}
 }
 
-// Row images cross the archive as JSON, so the same number comes back as a
-// different Go type on each side. A == on `any` would call every duplicate
-// row a divergence.
-func TestMergeResults_jsonRoundTripIsNotDivergence(t *testing.T) {
+// Both sides of the merge decode through UnmarshalRowImage, which sets
+// dec.UseNumber(), so a number is json.Number on the index side AND on the
+// archive side. An earlier version of this test asserted int64 vs float64 was
+// not divergence — a pair production cannot produce, so it passed while
+// proving nothing about the real path.
+func TestMergeResults_decodedJSONTypesAgree(t *testing.T) {
 	live := row(3)
-	live.RowAfter = map[string]any{"id": int64(7), "amount": 10.0}
+	live.RowAfter = map[string]any{"id": json.Number("7"), "amount": json.Number("10.00"), "tags": []any{"a", "b"}}
 	archived := row(3)
-	archived.RowAfter = map[string]any{"id": float64(7), "amount": float64(10)}
+	archived.RowAfter = map[string]any{"id": json.Number("7"), "amount": json.Number("10.00"), "tags": []any{"a", "b"}}
 
 	log := captureWarn(t, func() { MergeResults([]ResultRow{live, archived}, 0, "ASC") })
 	if strings.Contains(log, "disagree") {
-		t.Errorf("a JSON type round-trip was reported as divergence:\n%s", log)
+		t.Errorf("identically decoded row images were reported as divergence:\n%s", log)
+	}
+}
+
+// A nested JSON array or object in a row image makes == on `any` PANIC
+// ("comparing uncomparable type"). This is the reason the comparison is
+// reflect.DeepEqual and not ==, and it is worth a test because a future
+// "simplification" back to == would not fail any other one here.
+func TestMergeResults_nestedJSONDoesNotPanic(t *testing.T) {
+	live := row(4)
+	live.RowAfter = map[string]any{"meta": map[string]any{"tags": []any{"x"}}}
+	archived := row(4)
+	archived.RowAfter = map[string]any{"meta": map[string]any{"tags": []any{"y"}}}
+
+	log := captureWarn(t, func() { MergeResults([]ResultRow{live, archived}, 0, "ASC") })
+	if !strings.Contains(log, "disagree") {
+		t.Errorf("a nested-JSON divergence was not detected:\n%s", log)
+	}
+}
+
+// %v-based comparison erased type: json.Number("7") and "7" both rendered as
+// 7, true and "true" both as true. In MySQL JSON those are different values,
+// and "re-marshalled by a different generation of writer" is one of the two
+// causes this warning names — so the comparison was blind to a case it exists
+// to catch.
+func TestMergeResults_typeChangeIsDivergence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a, b any
+	}{
+		{"number vs string", json.Number("7"), "7"},
+		{"bool vs string", true, "true"},
+		{"number vs bool", json.Number("1"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			live, archived := row(5), row(5)
+			live.RowAfter = map[string]any{"v": tc.a}
+			archived.RowAfter = map[string]any{"v": tc.b}
+			log := captureWarn(t, func() { MergeResults([]ResultRow{live, archived}, 0, "ASC") })
+			if !strings.Contains(log, "disagree") {
+				t.Errorf("a type change was not detected as divergence:\n%s", log)
+			}
+		})
+	}
+}
+
+// sameEvent has a dozen divergence branches and the suite exercised exactly
+// one (RowAfter). Deleting `a.EndPos != b.EndPos` from the condition broke
+// nothing. One mutation per field, per the project's own lesson that a helper
+// must be mutated at every site rather than once.
+func TestMergeResults_everyComparedFieldDetectsDivergence(t *testing.T) {
+	id1, id2 := uint32(1), uint32(2)
+	s1, s2 := "a", "b"
+	c1, c2 := uint64(1), uint64(2)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ResultRow)
+	}{
+		{"BinlogFile", func(r *ResultRow) { r.BinlogFile = "bin.000009" }},
+		{"StartPos", func(r *ResultRow) { r.StartPos = 999 }},
+		{"EndPos", func(r *ResultRow) { r.EndPos = 999 }},
+		{"EventTimestamp", func(r *ResultRow) { r.EventTimestamp = r.EventTimestamp.Add(time.Hour) }},
+		{"SchemaName", func(r *ResultRow) { r.SchemaName = "other" }},
+		{"TableName", func(r *ResultRow) { r.TableName = "other" }},
+		{"EventType", func(r *ResultRow) { r.EventType = 3 }},
+		{"PKValues", func(r *ResultRow) { r.PKValues = "8" }},
+		{"ChangedColumns", func(r *ResultRow) { r.ChangedColumns = []string{"name"} }},
+		{"RowBefore", func(r *ResultRow) { r.RowBefore = map[string]any{"id": json.Number("9")} }},
+		{"RowAfter", func(r *ResultRow) { r.RowAfter = map[string]any{"id": json.Number("9")} }},
+		// The optional columns divergence only when BOTH sides are present.
+		{"GTID both present", func(r *ResultRow) { r.GTID = &s2 }},
+		{"QueryText both present", func(r *ResultRow) { r.QueryText = &s2 }},
+		{"QueryHash both present", func(r *ResultRow) { r.QueryHash = &s2 }},
+		{"ConnectionID both present", func(r *ResultRow) { r.ConnectionID = &id2 }},
+		{"CommitTsUS both present", func(r *ResultRow) { r.CommitTsUS = &c2 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			live := row(6)
+			live.GTID, live.QueryText, live.QueryHash = &s1, &s1, &s1
+			live.ConnectionID, live.CommitTsUS = &id1, &c1
+			archived := live
+			tc.mutate(&archived)
+			log := captureWarn(t, func() { MergeResults([]ResultRow{live, archived}, 0, "ASC") })
+			if !strings.Contains(log, "disagree") {
+				t.Errorf("a divergence in %s was not detected:\n%s", tc.name, log)
+			}
+		})
 	}
 }
 
@@ -126,9 +215,9 @@ func TestMergeResults_jsonRoundTripIsNotDivergence(t *testing.T) {
 // report, which is the one an operator reads.
 func TestMergeResults_divergenceLogIsBounded(t *testing.T) {
 	var rows []ResultRow
-	for i := uint64(1); i <= 40; i++ {
+	for i := uint64(100); i <= 139; i++ {
 		a, b := row(i), row(i)
-		b.RowAfter = map[string]any{"id": 7, "name": "MUTATED"}
+		b.RowAfter = map[string]any{"id": json.Number("7"), "name": "MUTATED"}
 		rows = append(rows, a, b)
 	}
 	log := captureWarn(t, func() { MergeResults(rows, 0, "ASC") })
@@ -140,3 +229,8 @@ func TestMergeResults_divergenceLogIsBounded(t *testing.T) {
 		t.Errorf("the suppressed tail was not summarised:\n%s", log)
 	}
 }
+
+// captureWarn swaps the process-global slog.Default. Safe today because these
+// tests run sequentially; it would race the moment anything in package query
+// calls t.Parallel().
+var _ = captureWarn
