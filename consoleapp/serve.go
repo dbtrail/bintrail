@@ -12,6 +12,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/indexer"
@@ -79,7 +80,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// bintrail binary does this in each command's init() via bindCommandEnv;
 	// this standalone binary loads it here, then reads the relevant vars below
 	// with flag > env > default precedence.
-	envOnce.Do(loadEnvFile)
+	cli.LoadEnvFile()
 
 	// index-dsn falls back to BINTRAIL_INDEX_DSN, the one shared binding the
 	// console uses (core bintrail wires this via bindCommandEnv/cli.EnvBindings).

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`bintrail-console` no longer carries its own copy of the env-file loader**
+  (#963). `consoleapp/env.go` held `loadEnvFile`/`parseAndSetEnv` byte-for-byte
+  identical to `internal/cli/env.go`, plus its own `sync.Once`, so any change
+  to env-file semantics would land in one binary and silently not the other.
+  Both now call the exported `cli.LoadEnvFile`. Sharing the `sync.Once` is also
+  more correct: `consoleapp` imports `internal/cli`, so two of them in one
+  process meant the file could be read twice. A guard test fails if the
+  duplicate comes back — the previous marker was a code comment naming itself
+  a "consolidation candidate", and a comment cannot fail.
+
 ### Added
 - **A capture-skip record can be acknowledged** (#1314). `stream_state.capture_skips`
   is monotonic, so a single skip episode kept the console's capture-health box

@@ -74,6 +74,17 @@ var EnvBindings = []EnvBinding{
 
 var envOnce sync.Once
 
+// LoadEnvFile loads the env file once per process. It is the whole API other
+// binaries in this module need (#963): bintrail-console used to carry a
+// byte-for-byte copy of loadEnvFile/parseAndSetEnv plus its own sync.Once, so
+// any change to env-file semantics landed in one binary and silently not the
+// other — the skew #529's extraction was meant to prevent.
+//
+// Sharing the Once is not just tidier, it is more correct: consoleapp imports
+// this package, so two Onces in one process meant the file could be read
+// twice.
+func LoadEnvFile() { envOnce.Do(loadEnvFile) }
+
 // loadEnvFile reads the first found env file and loads its key=value pairs
 // into the process environment without overwriting already-set variables.
 // Locations tried in order:

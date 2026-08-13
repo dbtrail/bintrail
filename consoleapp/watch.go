@@ -19,6 +19,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
@@ -174,7 +175,7 @@ var watchEnvBindings = []struct {
 // exist on core commands and the direct read keeps the precedence dance in
 // one auditable place.
 func bindWatchEnv(cmd *cobra.Command) {
-	envOnce.Do(loadEnvFile)
+	cli.LoadEnvFile()
 	for _, b := range watchEnvBindings {
 		v := os.Getenv(b.EnvVar)
 		if v == "" {

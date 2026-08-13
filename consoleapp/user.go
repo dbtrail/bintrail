@@ -12,6 +12,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/term"
 
+	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/console"
 )
 
@@ -88,7 +89,7 @@ func init() {
 // default falls back to an unwritable relative ./.config when the process
 // user has no home, and the path is the only way to see that.
 func resolveAuthPath(cmd *cobra.Command) string {
-	envOnce.Do(loadEnvFile)
+	cli.LoadEnvFile()
 	if usrAuthFile != "" {
 		return usrAuthFile
 	}
