@@ -20,18 +20,27 @@ import (
 // MySQL table order (pk_hash is a stored generated column and is omitted).
 // Exported for reuse by the buffer package when writing Parquet files.
 //
-// event_id / start_pos / end_pos are BIGINT UNSIGNED in MySQL but are scanned as
-// sql.NullInt64 here (ArchivePartition) and never exceed int64 in practice —
-// AUTO_INCREMENT and binlog byte offsets stay well under 2^63 — so the signed
-// Int64 column they map to via MysqlToParquetNode is lossless. connection_id is
-// the one column that genuinely needs the unsigned widening below: it is INT
-// UNSIGNED (a CONNECTION_ID() can exceed int32's 2147483647) and is written via
-// FormatUint by the buffer path, so a signed Int(32) column would reject it.
+// event_id / start_pos / end_pos are BIGINT UNSIGNED in MySQL. event_id is
+// AUTO_INCREMENT (counts from 1, never near 2^63), so its signed Int64 column
+// is lossless. start_pos/end_pos are NOT bounded the same way: pre-#1180
+// builds stored the MariaDB underflow shape (StartPos = 2^64 - EventSize,
+// #986/#1117) in real indexes, so a legitimate stored position exceeds 2^63.
+// They are therefore scanned through sql.Null[uint64] (the #1202/#1217
+// pattern from internal/query) and mapped to UNSIGNED Uint(64) parquet columns
+// (#1218) — widening only the scan against the old signed Int(64) columns
+// would have written a silently wrapped negative to disk. Archives written
+// before #1218 keep signed Int(64) positions forever; parquetquery reads the
+// two generations together in one union_by_name scan (DuckDB promotes the
+// mixed column to HUGEINT) and widens its scan targets to match — see its
+// scanRows. connection_id needs the same treatment one size down: it is INT
+// UNSIGNED (a CONNECTION_ID() can exceed int32's 2147483647) and is written
+// via FormatUint by the buffer path, so a signed Int(32) column would reject
+// it.
 var BinlogEventColumns = []baseline.Column{
 	{Name: "event_id", MySQLType: "bigint", ParquetType: baseline.MysqlToParquetNode("bigint")},
 	{Name: "binlog_file", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
-	{Name: "start_pos", MySQLType: "bigint", ParquetType: baseline.MysqlToParquetNode("bigint")},
-	{Name: "end_pos", MySQLType: "bigint", ParquetType: baseline.MysqlToParquetNode("bigint")},
+	{Name: "start_pos", MySQLType: "bigint", Unsigned: true, ParquetType: baseline.MysqlToParquetNode2("bigint", true)},
+	{Name: "end_pos", MySQLType: "bigint", Unsigned: true, ParquetType: baseline.MysqlToParquetNode2("bigint", true)},
 	{Name: "event_timestamp", MySQLType: "datetime", ParquetType: baseline.MysqlToParquetNode("datetime")},
 	{Name: "gtid", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
 	{Name: "connection_id", MySQLType: "int", Unsigned: true, ParquetType: baseline.MysqlToParquetNode2("int", true)},
@@ -127,11 +136,18 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		// production observation that "NOT NULL" cannot be trusted in
 		// drifted/external-pipeline-fed indexes. event_id stays a bare
 		// uint64 since AUTO_INCREMENT cannot return NULL.
+		// start_pos/end_pos scan through sql.Null[uint64], not sql.NullInt64:
+		// a stored position above 2^63 (the #986/#1117 MariaDB underflow
+		// shape written by pre-#1180 builds) failed the int64 Scan and the
+		// partition could never archive — so rotation could never drop it
+		// (#1218). The mysql driver hands back uint64 (TEXT protocol) or
+		// []byte above 2^63 (BINARY protocol); convertAssign takes both
+		// losslessly into uint64, same as internal/query's scanRows.
 		var (
 			eventID        uint64
 			binlogFile     sql.NullString
-			startPos       sql.NullInt64
-			endPos         sql.NullInt64
+			startPos       sql.Null[uint64]
+			endPos         sql.Null[uint64]
 			eventTimestamp sql.NullTime
 			gtid           sql.NullString
 			connID         sql.NullInt64
@@ -182,8 +198,8 @@ func ArchivePartition(ctx context.Context, db *sql.DB, dbName, partition, output
 		values := []string{
 			strconv.FormatUint(eventID, 10),
 			binlogFile.String,
-			strconv.FormatInt(startPos.Int64, 10),
-			strconv.FormatInt(endPos.Int64, 10),
+			strconv.FormatUint(startPos.V, 10),
+			strconv.FormatUint(endPos.V, 10),
 			eventTimestampStr,
 			gtid.String,
 			connIDStr,

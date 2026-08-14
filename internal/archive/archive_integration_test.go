@@ -10,6 +10,9 @@ import (
 
 	"github.com/parquet-go/parquet-go"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/parquetquery"
+	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -264,4 +267,144 @@ func TestArchivePartition_commitTsRoundTrip(t *testing.T) {
 	if !row[0][idx].IsNull() {
 		t.Errorf("row 1 commit_ts_us must be a real Parquet NULL, got %v", row[0][idx])
 	}
+}
+
+// ─── #1218: start_pos/end_pos above 2^63 through the rotate + restore paths ──
+
+// oldSignedPositionColumnsTest reproduces the pre-#1218 archive schema:
+// identical to BinlogEventColumns except start_pos/end_pos are the SIGNED
+// Int(64) nodes the old MysqlToParquetNode("bigint") mapping produced. Every
+// archive written before the fix carries this schema on disk forever.
+func oldSignedPositionColumnsTest() []baseline.Column {
+	cols := make([]baseline.Column, len(BinlogEventColumns))
+	copy(cols, BinlogEventColumns)
+	for i, c := range cols {
+		if c.Name == "start_pos" || c.Name == "end_pos" {
+			c.Unsigned = false
+			c.ParquetType = baseline.MysqlToParquetNode("bigint")
+			cols[i] = c
+		}
+	}
+	return cols
+}
+
+// writePositionArchive writes one archive parquet file with the given schema
+// and one INSERT row per (eventID, startPos, endPos, pk) tuple.
+func writePositionArchive(t *testing.T, path string, cols []baseline.Column, rows [][4]string) {
+	t.Helper()
+	w, err := baseline.NewWriter(path, cols, baseline.WriterConfig{Compression: "none"})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	for _, r := range rows {
+		values := []string{r[0], "mariadb-bin.000001", r[1], r[2], "2026-02-19 14:00:00", "", "", "mydb", "orders", "1", r[3], "", "", `{"id":` + r[3] + `}`, "0", "", ""}
+		nulls := []bool{false, false, false, false, false, true, true, false, false, false, false, true, true, false, false, true, true}
+		if err := w.WriteRow(values, nulls); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestArchivePartition_positionsAbove2to63 is the #1218 rotate-path pin: a
+// partition holding the #986/#1117 MariaDB underflow shape (start_pos =
+// 2^64 - EventSize, stored by pre-#1180 builds and still present in real
+// indexes) used to fail ArchivePartition's int64 Scan — "scan row: ... value
+// out of range" — so the partition never archived and rotation could never
+// drop it. The full loop must now hold: MySQL → ArchivePartition → Parquet →
+// parquetquery.Fetch, with the positions EXACT at the far end.
+func TestArchivePartition_positionsAbove2to63(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	const (
+		bigStart = uint64(18446744073709551516) // 2^64 - 100
+		bigEnd   = uint64(18446744073709551615) // max BIGINT UNSIGNED
+	)
+	ts := "2026-02-19 14:00:00"
+	testutil.InsertEvent(t, db, "mariadb-bin.000001", bigStart, bigEnd, ts, nil,
+		"mydb", "orders", 1, "1", nil, nil, []byte(`{"id":1}`))
+	testutil.InsertEvent(t, db, "mariadb-bin.000001", 100, 200, ts, nil,
+		"mydb", "orders", 1, "2", nil, nil, []byte(`{"id":2}`))
+
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, "events.parquet")
+	stats, err := ArchivePartition(context.Background(), db, dbName, "p_future", outPath, "none")
+	if err != nil {
+		t.Fatalf("ArchivePartition over >2^63 positions failed (the #1218 bug): %v", err)
+	}
+	if stats.Rows != 2 {
+		t.Fatalf("rowCount = %d, want 2", stats.Rows)
+	}
+
+	rows, err := parquetquery.Fetch(context.Background(),
+		query.Options{Schema: "mydb", Table: "orders", Limit: 10}, dir)
+	if err != nil {
+		t.Fatalf("Fetch over the archived file: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	byPK := map[string]query.ResultRow{}
+	for _, r := range rows {
+		byPK[r.PKValues] = r
+	}
+	if r := byPK["1"]; r.StartPos != bigStart || r.EndPos != bigEnd {
+		t.Errorf("pk 1 positions = [%d, %d], want [%d, %d] (exact, no wrap)",
+			r.StartPos, r.EndPos, bigStart, bigEnd)
+	}
+	if r := byPK["2"]; r.StartPos != 100 || r.EndPos != 200 {
+		t.Errorf("pk 2 positions = [%d, %d], want [100, 200]", r.StartPos, r.EndPos)
+	}
+}
+
+// TestRestorePartition_mixedSignedUnsignedPositionArchives pins restore-index's
+// read side across both archive generations: an OLD file (signed Int64
+// positions, pre-#1218) and a NEW file (unsigned Uint64, one position above
+// 2^63) must both load back into binlog_events with exact values —
+// RestorePartition scans per file, so each schema is exercised on its own.
+func TestRestorePartition_mixedSignedUnsignedPositionArchives(t *testing.T) {
+	db, _ := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+
+	const (
+		bigStart = uint64(18446744073709551516)
+		bigEnd   = uint64(18446744073709551615)
+	)
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old-signed.parquet")
+	newPath := filepath.Join(dir, "new-unsigned.parquet")
+	writePositionArchive(t, oldPath, oldSignedPositionColumnsTest(), [][4]string{
+		{"1", "100", "200", "1"},
+	})
+	writePositionArchive(t, newPath, BinlogEventColumns, [][4]string{
+		{"2", "18446744073709551516", "18446744073709551615", "2"},
+	})
+
+	for _, p := range []string{oldPath, newPath} {
+		n, err := RestorePartition(context.Background(), db, p, 0)
+		if err != nil {
+			t.Fatalf("RestorePartition(%s): %v", filepath.Base(p), err)
+		}
+		if n != 1 {
+			t.Fatalf("RestorePartition(%s) loaded %d rows, want 1", filepath.Base(p), n)
+		}
+	}
+
+	check := func(pk string, wantStart, wantEnd uint64) {
+		t.Helper()
+		var start, end uint64
+		if err := db.QueryRow(
+			`SELECT start_pos, end_pos FROM binlog_events WHERE pk_values = ?`, pk).
+			Scan(&start, &end); err != nil {
+			t.Fatalf("read back pk %s: %v", pk, err)
+		}
+		if start != wantStart || end != wantEnd {
+			t.Errorf("pk %s positions = [%d, %d], want [%d, %d]", pk, start, end, wantStart, wantEnd)
+		}
+	}
+	check("1", 100, 200)
+	check("2", bigStart, bigEnd)
 }

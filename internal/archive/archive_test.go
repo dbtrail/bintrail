@@ -252,6 +252,71 @@ func TestWriteRowConnectionIDUnsignedDuckDBScan(t *testing.T) {
 	}
 }
 
+// TestWriteRowStartEndPosUnsignedDuckDBScan pins the #1218 write half:
+// start_pos/end_pos are BIGINT UNSIGNED and pre-#1180 builds stored the
+// MariaDB underflow shape (StartPos = 2^64 - EventSize, #986/#1117) in real
+// indexes, so a legitimate stored position exceeds 2^63. Against the old
+// signed Int(64) columns such a value could not be written at all (ParseInt
+// fails loud in convertValue) — which is what kept the partition unarchivable.
+// This drives the production BinlogEventColumns through WriteRow with max
+// uint64 and the underflow shape, then reads back via DuckDB parquet_scan
+// (the real consumer): both must round-trip EXACTLY as unsigned values.
+func TestWriteRowStartEndPosUnsignedDuckDBScan(t *testing.T) {
+	const (
+		bigStart = uint64(18446744073709551516) // 2^64 - 100, the underflow shape
+		bigEnd   = uint64(18446744073709551615) // max BIGINT UNSIGNED
+	)
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, "pos.parquet")
+	w, err := baseline.NewWriter(outPath, BinlogEventColumns,
+		baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+
+	values := make([]string, 15)
+	nulls := make([]bool, 15)
+	for i := range nulls {
+		nulls[i] = true
+	}
+	values[0], nulls[0] = "1", false                    // event_id
+	values[2], nulls[2] = "18446744073709551516", false // start_pos
+	values[3], nulls[3] = "18446744073709551615", false // end_pos
+	values[4], nulls[4] = "2026-02-19 10:00:00", false
+
+	if err := w.WriteRow(values, nulls); err != nil {
+		t.Fatalf("WriteRow(start_pos>2^63): got error, want round-trip: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	defer db.Close()
+
+	safePath := strings.ReplaceAll(outPath, "'", "''")
+	var start, end any
+	if err := db.QueryRowContext(context.Background(),
+		"SELECT start_pos, end_pos FROM parquet_scan('"+safePath+"')").Scan(&start, &end); err != nil {
+		t.Fatalf("scan positions: %v", err)
+	}
+	// BIGINT UNSIGNED → Uint(64) parquet → DuckDB UBIGINT → Go uint64.
+	gotStart, ok := start.(uint64)
+	if !ok {
+		t.Fatalf("start_pos scanned as %T (%v), want uint64", start, start)
+	}
+	gotEnd, ok := end.(uint64)
+	if !ok {
+		t.Fatalf("end_pos scanned as %T (%v), want uint64", end, end)
+	}
+	if gotStart != bigStart || gotEnd != bigEnd {
+		t.Errorf("positions = [%d, %d], want [%d, %d] (exact, no wrap)", gotStart, gotEnd, bigStart, bigEnd)
+	}
+}
+
 // parquetColumnIndex looks up the position of a column in the file's leaf
 // schema. parquet-go's NewReader returns rows whose values are ordered by
 // the schema's leaf walk (alphabetical for our flat schemas), not by the

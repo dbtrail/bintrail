@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"math/big"
 	"os"
 	"runtime"
 	"slices"
@@ -990,6 +992,20 @@ func limitPerPKClause(opts query.Options) (string, []any) {
 		" ORDER BY event_timestamp DESC, event_id DESC) <= ?", []any{opts.LimitPerPK}
 }
 
+// posArg renders a binlog position for use as a DuckDB bind argument. The
+// duckdb driver rejects a uint64 whose high bit is set ("uint64 values with
+// high bit set are not supported"), and a >2^63 position is exactly the
+// #986/#1117 underflow shape this filter must be able to anchor on (#1218) —
+// so positions above int64 bind as *big.Int (HUGEINT), which DuckDB compares
+// exactly against BIGINT, UBIGINT, and HUGEINT position columns alike. The
+// common below-2^63 case keeps the plain uint64 fast path.
+func posArg(pos uint64) any {
+	if pos > math.MaxInt64 {
+		return new(big.Int).SetUint64(pos)
+	}
+	return pos
+}
+
 // buildFilters extracts WHERE clause fragments and bind args from query options.
 func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 	var where []string
@@ -1036,7 +1052,7 @@ func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 		where = append(where, "(length(binlog_file) > length(?)"+
 			" OR (length(binlog_file) = length(?) AND binlog_file > ?)"+
 			" OR (binlog_file = ? AND start_pos >= ?))")
-		args = append(args, opts.SincePos.File, opts.SincePos.File, opts.SincePos.File, opts.SincePos.File, opts.SincePos.Pos)
+		args = append(args, opts.SincePos.File, opts.SincePos.File, opts.SincePos.File, opts.SincePos.File, posArg(opts.SincePos.Pos))
 	} else if opts.Since != nil {
 		where = append(where, "event_timestamp >= ?")
 		args = append(args, *opts.Since)
@@ -1054,7 +1070,7 @@ func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 		where = append(where, "(length(binlog_file) < length(?)"+
 			" OR (length(binlog_file) = length(?) AND binlog_file < ?)"+
 			" OR (binlog_file = ? AND end_pos <= ?))")
-		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
+		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, posArg(opts.UntilPos.Pos))
 	}
 	if opts.AfterEvent != nil {
 		// Keyset cut on the composite sort key, mirroring internal/query's
@@ -1317,11 +1333,22 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 		// every column its Scan saw as NULL, so the consumer side must
 		// handle the same set. See dbtrail/bintrail#318. event_id stays
 		// a bare int64 since AUTO_INCREMENT cannot be NULL.
+		// start_pos/end_pos scan through sql.Null[uint64], not sql.NullInt64
+		// (#1218): a >2^63 position (the #986/#1117 MariaDB underflow shape
+		// written by pre-#1180 builds) does not fit the int64 path. The
+		// driver hands back three shapes, one per archive generation mix —
+		// int64 from a signed pre-#1218 file, uint64 from a current unsigned
+		// file, and *big.Int when one union_by_name scan covers BOTH
+		// generations (DuckDB promotes BIGINT ∪ UBIGINT to HUGEINT).
+		// convertAssign takes all three losslessly into uint64 (*big.Int via
+		// its exact decimal-string fallback); the int64 destination was the
+		// one that failed, on two of the three. Pinned against real files by
+		// TestFetch_mixedSignedUnsignedPositionArchives and siblings.
 		var (
 			eventID        int64
 			binlogFile     sql.NullString
-			startPos       sql.NullInt64
-			endPos         sql.NullInt64
+			startPos       sql.Null[uint64]
+			endPos         sql.Null[uint64]
 			eventTimestamp sql.NullTime
 			gtid           sql.NullString
 			connID         sql.NullInt64
@@ -1349,8 +1376,8 @@ func scanRows(rows *sql.Rows) ([]query.ResultRow, error) {
 		r := query.ResultRow{
 			EventID:        uint64(eventID),
 			BinlogFile:     binlogFile.String,
-			StartPos:       uint64(startPos.Int64),
-			EndPos:         uint64(endPos.Int64),
+			StartPos:       startPos.V,
+			EndPos:         endPos.V,
 			EventTimestamp: eventTimestamp.Time,
 			SchemaName:     schemaName.String,
 			TableName:      tableName.String,

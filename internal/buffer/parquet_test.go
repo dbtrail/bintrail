@@ -13,6 +13,8 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver — exercises the real read path
 	"github.com/parquet-go/parquet-go"
 
+	"github.com/dbtrail/dbtrail/internal/event"
+	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -232,5 +234,50 @@ func TestWriteParquet_nullableFields(t *testing.T) {
 	}
 	if pf.NumRows() != 1 {
 		t.Errorf("NumRows = %d, want 1", pf.NumRows())
+	}
+}
+
+// TestWriteParquet_positionsAbove2to63 pins the buffer's write half of #1218:
+// rowToParquet always rendered StartPos/EndPos via FormatUint, so before the
+// archive schema widened those columns to unsigned, a buffered event carrying
+// the #986/#1117 underflow shape (>2^63) aborted WriteParquet at conversion.
+// Now it must round-trip exactly through the real consumer, parquetquery.Fetch.
+func TestWriteParquet_positionsAbove2to63(t *testing.T) {
+	const (
+		bigStart = uint64(18446744073709551516) // 2^64 - 100
+		bigEnd   = uint64(18446744073709551615) // max BIGINT UNSIGNED
+	)
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, "buffer.parquet")
+
+	rows := []query.ResultRow{{
+		EventID:        1,
+		BinlogFile:     "mariadb-bin.000001",
+		StartPos:       bigStart,
+		EndPos:         bigEnd,
+		EventTimestamp: time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+		SchemaName:     "mydb",
+		TableName:      "orders",
+		EventType:      event.EventInsert,
+		PKValues:       "1",
+	}}
+	n, err := WriteParquet(rows, outPath, "none")
+	if err != nil {
+		t.Fatalf("WriteParquet(positions>2^63): %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("count = %d, want 1", n)
+	}
+
+	got, err := parquetquery.Fetch(context.Background(), query.Options{Limit: 10}, dir)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1", len(got))
+	}
+	if got[0].StartPos != bigStart || got[0].EndPos != bigEnd {
+		t.Errorf("positions = [%d, %d], want [%d, %d] (exact, no wrap)",
+			got[0].StartPos, got[0].EndPos, bigStart, bigEnd)
 	}
 }
