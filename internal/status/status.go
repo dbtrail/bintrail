@@ -640,6 +640,23 @@ type StatusData struct {
 	// not silent). json:"-" — StatusData is rendered via the manual jsonSummary mapping,
 	// never marshalled directly; the tag is insurance against a future direct marshal.
 	StreamErr error `json:"-"`
+	// ArchivesErr records a failure to READ archive_state for the Archives
+	// section (StreamErr's sibling, #1323) — as distinct from an index with no
+	// archive tier at all (Archives==nil, ArchivesErr==nil: ER_NO_SUCH_TABLE,
+	// which the absent section describes correctly). When set, the output must
+	// render the section as unreadable rather than omit it: a consumer reading
+	// "no archives section" concludes "no archives exist" while the Parquet may
+	// be sitting in the bucket.
+	ArchivesErr error `json:"-"`
+	// CoverageErr records a LoadCoverage failure (#1323) — the likeliest
+	// at-scale one being the full binlog_events scan hitting max_execution_time
+	// or a lost connection. #816 taught LoadCoverage to report an unreadable
+	// archive tier INSIDE its result; this is the frame above, where the whole
+	// result is lost: without it the report prints no restore window, no error,
+	// and exits 0 — a read failure rendering as an affirmative fact about the
+	// data. When set, Coverage is nil and the output must carry a tombstone in
+	// both renderings.
+	CoverageErr error `json:"-"`
 }
 
 // BaselineInfo holds metadata about a discovered baseline Parquet file.
@@ -695,13 +712,28 @@ func CollectStatus(ctx context.Context, db *sql.DB, dbName string) (*StatusData,
 	}
 
 	if archives, err := LoadArchiveStats(ctx, db); err != nil {
-		slog.Warn("could not load archive stats", "error", err)
+		// Same discrimination LoadCoverage applies to the same table (#816,
+		// #1323): a missing archive_state is an index with no archive tier —
+		// a fact the absent section describes correctly, and flagging it would
+		// put a scary banner on every pre-archive index. Anything else means
+		// archives may exist that we could not see, and the report must say so
+		// instead of rendering the failure as "no archives".
+		if isMissingTableErr(err) {
+			slog.Debug("archive_state not present; no archive tier to report", "error", err)
+		} else {
+			slog.Warn("could not load archive stats; the Archives section will report itself unreadable", "error", err)
+			d.ArchivesErr = err
+		}
 	} else {
 		d.Archives = archives
 	}
 
 	if coverage, err := LoadCoverage(ctx, db); err != nil {
-		slog.Warn("could not load coverage info", "error", err)
+		slog.Warn("could not load coverage info; the coverage section will report itself unreadable", "error", err)
+		// Record the failure so the output renders a coverage tombstone instead
+		// of silently omitting the section — a monitor keyed on
+		// coverage.archives_unavailable must see coverage_error, not nothing.
+		d.CoverageErr = err
 	} else {
 		d.Coverage = coverage
 	}
@@ -739,6 +771,12 @@ func (d *StatusData) Write(w io.Writer) {
 	if d.Stream == nil && d.StreamErr != nil {
 		writeStreamUnavailable(w, d.StreamErr)
 	}
+	if d.Archives == nil && d.ArchivesErr != nil {
+		writeArchivesUnavailable(w, d.ArchivesErr)
+	}
+	if d.Coverage == nil && d.CoverageErr != nil {
+		writeCoverageUnavailable(w, d.CoverageErr)
+	}
 	writeBaselines(w, d.Baselines)
 }
 
@@ -754,9 +792,38 @@ func writeStreamUnavailable(w io.Writer, err error) {
 	fmt.Fprintln(w)
 }
 
+// writeArchivesUnavailable renders a visible Archives block when archive_state
+// could not be READ (ArchivesErr set, Archives nil) — writeStreamUnavailable's
+// sibling (#1323). Distinct from a missing table (no block): "no archive tier"
+// is a fact the absent section describes correctly, while a read failure
+// rendered the same way tells the operator archives do not exist when they may
+// simply be unreadable right now.
+func writeArchivesUnavailable(w io.Writer, err error) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "=== Archives ===")
+	fmt.Fprintf(w, "  ⚠ NOT READ — archive_state could not be queried: %v\n", err)
+	fmt.Fprintln(w, "  This is a read failure, not \"no archives\": archived data may exist that")
+	fmt.Fprintln(w, "  is not shown here. Re-run status to retry.")
+	fmt.Fprintln(w)
+}
+
+// writeCoverageUnavailable renders a visible Restore Coverage block when
+// LoadCoverage itself failed (CoverageErr set, Coverage nil) — the frame above
+// the #816 in-section flag (#1323). Without it the report prints no restore
+// window at all and an operator mid-incident reads the silence as "nothing to
+// restore from".
+func writeCoverageUnavailable(w io.Writer, err error) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "=== Restore Coverage ===")
+	fmt.Fprintf(w, "  ⚠ NOT READ — coverage could not be computed: %v\n", err)
+	fmt.Fprintln(w, "  The restore window is UNKNOWN, not empty: indexed events and archived")
+	fmt.Fprintln(w, "  hours may exist that are not shown here. Re-run status to retry.")
+	fmt.Fprintln(w)
+}
+
 // WriteJSON writes the status data as JSON to w.
 func (d *StatusData) WriteJSON(w io.Writer) error {
-	return writeStatusJSONFull(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream, d.Baselines, d.BaselinesUnavailable, d.StreamErr)
+	return writeStatusJSONFull(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream, d.Baselines, d.BaselinesUnavailable, d.StreamErr, d.ArchivesErr, d.CoverageErr)
 }
 
 // WriteStatus writes a multi-section status report (Servers, Stream, Indexed Files, Partitions, Archives, Coverage, Summary) to w.
@@ -1177,10 +1244,10 @@ func Truncate(s string, n int) string {
 
 // WriteStatusJSON writes the status data as a JSON object to w.
 func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo) error {
-	return writeStatusJSONFull(w, files, parts, archives, coverage, servers, stream, nil, false, nil)
+	return writeStatusJSONFull(w, files, parts, archives, coverage, servers, stream, nil, false, nil, nil, nil)
 }
 
-func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo, baselines []BaselineInfo, baselinesUnavailable bool, streamErr error) error {
+func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo, baselines []BaselineInfo, baselinesUnavailable bool, streamErr, archivesErr, coverageErr error) error {
 	type jsonFile struct {
 		BinlogFile    string  `json:"binlog_file"`
 		Status        string  `json:"status"`
@@ -1358,6 +1425,15 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		Freshness  jsonFreshness  `json:"freshness"`
 		Error      string         `json:"error"`
 	}
+	// jsonSectionError marks a section whose data could not be READ (#1323) —
+	// stream_error's shape for sections with no verdict sub-structure. Emitted
+	// under a distinct key, never as a fake archives/coverage object whose
+	// non-omitempty zero fields would read as real empty data. Absence of the
+	// data key alone is NOT the signal: absent-and-no-error means the fact
+	// "there is nothing here", absent-with-this means "could not look".
+	type jsonSectionError struct {
+		Error string `json:"error"`
+	}
 	type jsonSummary struct {
 		Servers     []jsonServer     `json:"servers,omitempty"`
 		Stream      *jsonStream      `json:"stream,omitempty"`
@@ -1366,8 +1442,15 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		Parts       []jsonPartition  `json:"partitions"`
 		Total       int64            `json:"total_events_estimate"`
 		Archives    *jsonArchives    `json:"archives,omitempty"`
-		Coverage    *jsonCoverage    `json:"coverage,omitempty"`
-		Baselines   []jsonBaseline   `json:"baselines,omitempty"`
+		// ArchivesError / CoverageError (#1323): the read failed, so the
+		// corresponding data key is absent for a BAD reason. Note the scope
+		// difference from coverage.archives_error (#816): that one says
+		// coverage was computed but its archive extension was not; these say
+		// the whole section is missing because its read failed.
+		ArchivesError *jsonSectionError `json:"archives_error,omitempty"`
+		Coverage      *jsonCoverage     `json:"coverage,omitempty"`
+		CoverageError *jsonSectionError `json:"coverage_error,omitempty"`
+		Baselines     []jsonBaseline    `json:"baselines,omitempty"`
 		// BaselineStaleness is the worst per-table-newest verdict — the same
 		// headline the text banner keys on (#1193).
 		BaselineStaleness string `json:"baseline_staleness,omitempty"`
@@ -1516,6 +1599,15 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			S3Files:        archives.S3Files,
 			S3Buckets:      archives.S3Buckets,
 		}
+	} else if archives == nil && archivesErr != nil {
+		// archive_state could not be READ — surface it so an absent archives
+		// key is not misread as "no archives exist" (#1323).
+		out.ArchivesError = &jsonSectionError{Error: archivesErr.Error()}
+	}
+	if coverage == nil && coverageErr != nil {
+		// LoadCoverage failed — a monitor keyed on coverage.archives_unavailable
+		// must find this loud sibling instead of no coverage key at all (#1323).
+		out.CoverageError = &jsonSectionError{Error: coverageErr.Error()}
 	}
 	if coverage != nil {
 		jc := &jsonCoverage{
