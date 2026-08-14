@@ -230,6 +230,17 @@ jobs:
     if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
     runs-on: ubuntu-22.04
 
+    # Spans the supported MariaDB range (#622): 10.6 LTS (declared minimum)
+    # through 10.11 LTS and 11.4. fail-fast: false so a regression on one
+    # version still reports the others, matching the PostgreSQL matrix. No
+    # per-version server args are needed: the `mariadb` client name, the
+    # MARIADB_ROOT_PASSWORD image env, gtid_strict_mode, log_bin_compress and
+    # the ON default of binlog_annotate_row_events all hold from 10.6 up.
+    strategy:
+      fail-fast: false
+      matrix:
+        mariadb: ["10.6", "10.11", "11.4"]
+
     env:
       BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
       BINTRAIL_TEST_MARIADB_DSN: "root:testroot@tcp(127.0.0.1:13307)"
@@ -271,12 +282,12 @@ jobs:
           docker logs bintrail-test-mysql >&2 || true
           exit 1
 
-      - name: Start MariaDB source (bintrail-test-mariadb, 11.4)
+      - name: Start MariaDB source (bintrail-test-mariadb, ${{ matrix.mariadb }})
         run: |
           docker run -d --name bintrail-test-mariadb \
             -e MARIADB_ROOT_PASSWORD=testroot \
             -p 13307:3306 \
-            mariadb:11.4 \
+            mariadb:${{ matrix.mariadb }} \
             --log-bin=mariadb-bin --binlog-format=ROW --binlog-row-image=FULL \
             --server-id=2 --gtid-strict-mode=ON
           # Same socket-vs-TCP readiness race as the MySQL-start steps (#949):
@@ -284,7 +295,7 @@ jobs:
           # successes, instead of `docker exec ... mariadb-admin ping`.
           consecutive=0
           for i in $(seq 1 60); do
-            if docker run --rm --network host mariadb:11.4 \
+            if docker run --rm --network host mariadb:${{ matrix.mariadb }} \
                  mariadb --protocol=TCP -h 127.0.0.1 -P 13307 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
               consecutive=$((consecutive + 1))
               [ "$consecutive" -ge 3 ] && { echo "MariaDB source is ready."; exit 0; }
