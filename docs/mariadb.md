@@ -134,6 +134,15 @@ silently become the write key for every server. Two caveats:
   A purged-binlog gap raises the data-loss alarm (or, with `--no-gap-fill`,
   refuses to start) in **both position and GTID mode**, and multi-domain GTID
   sets are compared per domain.
+- **Multi-domain GTID: per-domain resume.** This is the supported stance, not a
+  best-effort side effect: the checkpoint's MariaDB GTID set carries every
+  domain's position independently, resume hands the source the full per-domain
+  map, and gap detection compares each domain against the purge floor
+  separately. Validated live against an interleaved multi-domain stream
+  (per-session `gtid_domain_id`): stop mid-stream, write more under every
+  domain, resume — no event lost, none double-indexed, each domain's sequence
+  advancing from its own position, and no false alarm from the per-domain
+  purge-floor comparison.
 - **File-based `bintrail index`** over MariaDB binlog files.
 - All row events (INSERT/UPDATE/DELETE) with before/after images, including
   `UNSIGNED`, `DECIMAL`, and DDL detection / auto-snapshot.
@@ -161,10 +170,14 @@ silently become the write key for every server. Two caveats:
 - **The source flavor is fixed per checkpoint.** Resuming a saved MariaDB
   checkpoint requires the same `--source-flavor mariadb`. A mismatch is rejected
   with an actionable error; use `--reset` to start fresh.
-- **Mid-capture primary failover is untested.** Gap detection compares GTID
-  sequences per domain (correct for single-server and multi-domain topologies),
-  but a primary failover that changes the `server_id` *within* a domain mid-stream
-  has not been validated against a live multi-server MariaDB cluster.
+- **Multi-server multi-domain topologies are untested.** Per-domain GTID
+  resume is validated live on a single server producing several domains (the
+  `gtid_domain_id` mechanism itself — see "What works" above). What has NOT
+  been validated live: topologies where the domains originate on different
+  servers (multi-master rings, Galera), a primary failover that changes the
+  `server_id` *within* a domain mid-stream, and sustained multi-domain load (no
+  soak run yet). Gap detection compares sequences per domain, so the design
+  covers these shapes, but treat them as unverified territory.
 - **BYOS agent support is the least exercised path.** `bintrail agent` accepts
   `--source-flavor mariadb` (same flag and `BINTRAIL_SOURCE_FLAVOR` env as
   `stream`) for its BYOS streaming, but unlike `stream` it has no saved
