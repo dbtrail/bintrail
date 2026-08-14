@@ -190,6 +190,14 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("console: activity coverage not evaluated", "server", serverID(r), "error", perr)
 		resp.Complete = false
 		resp.Notes = append(resp.Notes, "Coverage for this window could not be checked, so these counts may be missing archived hours.")
+	case plan != nil && plan.ArchiveCoverageUnavailable:
+		// Same stance one layer down (#1324): the planner ran but could not
+		// read archive_state, so every archived hour in the window classified
+		// as a gap and archivedHoursInWindow below would count 0. Before the
+		// plan carried this, an unreadable archive tier rendered as
+		// "complete". (Plan already logged the underlying error at Warn.)
+		resp.Complete = false
+		resp.Notes = append(resp.Notes, "The archive records for this window could not be read, so these counts may be missing archived hours.")
 	case plan != nil:
 		if n := archivedHoursInWindow(plan, since, until); n > 0 {
 			resp.Complete = false

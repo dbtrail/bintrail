@@ -52,6 +52,17 @@ type QueryPlan struct {
 	// file/date scoping still opens those files; row-level time filters keep
 	// the result set correct.
 	MisfiledArchiveHours []time.Time
+
+	// ArchiveCoverageUnavailable reports that archive_state exists but could
+	// not be read, so archive coverage was NOT evaluated (#1324). Hours the
+	// archives may hold are classified as GapHours — fail-closed for data —
+	// but a caller rendering completeness or naming a cause must key on this:
+	// "complete" was never checked, and "rotated and not archived" was never
+	// established. A genuinely missing archive_state (ER_NO_SUCH_TABLE, an
+	// index that never archived) does NOT set it — there the gaps are the
+	// truth — and neither does noArchive, where skipping the read is the
+	// caller's decision rather than a failure.
+	ArchiveCoverageUnavailable bool
 }
 
 // Plan builds a QueryPlan for the given time range by inspecting live partition
@@ -109,24 +120,39 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 		return nil, fmt.Errorf("load partition info for planning: %w", err)
 	}
 
-	// Load archived partition names. Failure is non-fatal: archive_state may
-	// not exist in older indexes. Gap detection still works from live partitions.
+	// Load archived partition names. A missing archive_state (ER_NO_SUCH_TABLE
+	// — an index that never archived) is non-fatal and means there is no
+	// archive tier; gap detection still works from live partitions. Every
+	// OTHER failure is a different fact (#1324, the same conflation #816
+	// retired in status.LoadCoverage): archives may exist that this plan could
+	// not see, so it is recorded on the plan instead of letting "unreadable"
+	// classify as "no archives". Either way cov stays nil — fail-closed: an
+	// hour that could not be verified is a gap, never coverage.
 	//
 	// Skipped entirely when noArchive: those archives are excluded from the
 	// fetch, so reading their coverage here would only mislabel rotated hours as
 	// covered. Leaving archivedHours nil makes buildPlan classify them as gaps.
 	var cov []archiveCoverage
+	var covUnavailable bool
 	if !noArchive {
 		cov, err = loadArchiveCoverage(ctx, db, sourceIDs)
 		if err != nil {
-			slog.Debug("archive_state not available for planning", "error", err)
+			if isMissingTableErr(err) {
+				slog.Debug("archive_state not present; planning from live partitions only", "error", err)
+			} else {
+				slog.Warn("could not read archive coverage for planning; archived hours will be classified as gaps", "error", err)
+				covUnavailable = true
+			}
 			cov = nil
 		}
 	}
 
 	plan := buildPlan(liveHours, expandArchiveHours(cov), rangeStart, rangeEnd, noArchive)
-	if plan != nil && !noArchive {
-		plan.MisfiledArchiveHours = misfiledHours(cov, rangeStart, rangeEnd)
+	if plan != nil {
+		plan.ArchiveCoverageUnavailable = covUnavailable
+		if !noArchive {
+			plan.MisfiledArchiveHours = misfiledHours(cov, rangeStart, rangeEnd)
+		}
 	}
 	return plan, nil
 }
@@ -358,6 +384,16 @@ func sourceScopeClause(sourceIDs []string) (string, []any) {
 		args[i] = id
 	}
 	return " WHERE bintrail_id IN (?" + strings.Repeat(", ?", len(sourceIDs)-1) + ")", args
+}
+
+// isMissingTableErr reports whether err is MySQL's ER_NO_SUCH_TABLE (1146) —
+// the shape an index that never archived shows, as opposed to a table that
+// exists and would not read. Kept narrow to 1146 on purpose, mirroring
+// status.LoadCoverage (#816): widening it re-creates the very conflation
+// #1324 removes.
+func isMissingTableErr(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1146
 }
 
 // loadArchiveCoverage returns per-row archive coverage from archive_state.

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -344,6 +345,50 @@ func TestActivityArchivedWindowIsNotComplete(t *testing.T) {
 	}
 	if len(got.Notes) == 0 || !strings.Contains(got.Notes[0], "archived") {
 		t.Errorf("notes must name the archived hours, got %v", got.Notes)
+	}
+}
+
+// TestActivityUnreadableArchiveStateIsNotComplete (#1324): before the plan
+// carried ArchiveCoverageUnavailable, an unreadable archive_state made
+// query.Plan return (plan, nil) with every archived hour classified as a gap
+// — the perr branch never fired, archivedHoursInWindow counted 0, and the
+// tile said "complete" over a window nobody checked. A missing table (1146,
+// an index that never archived) keeps today's behaviour: no note, complete.
+func TestActivityUnreadableArchiveStateIsNotComplete(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		errno        uint16
+		wantComplete bool
+	}{
+		{"unreadable table", 1142, false}, // ER_TABLEACCESS_DENIED_ERROR
+		{"no archive tier", 1146, true},   // ER_NO_SUCH_TABLE
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, closeDB := newSQLMock(t)
+			defer closeDB()
+			now := time.Now().UTC()
+
+			mock.ExpectQuery(`COUNT\(\*\) AS n FROM binlog_events`).WillReturnRows(activityResult())
+			mock.ExpectQuery("PARTITION_NAME FROM information_schema.PARTITIONS").
+				WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME"}).AddRow(now.Format("p_2006010215")))
+			mock.ExpectQuery("FROM archive_state").
+				WillReturnError(&mysql.MySQLError{Number: tc.errno, Message: "induced"})
+
+			srv := newBootServer(db)
+			// The planner is dbName-gated; a bundle without one makes Plan a no-op.
+			srv.cm.boot.dbName = "binlog_index"
+
+			code, got, body := getActivity(t, srv, "/api/activity?period=1h")
+			if code != 200 {
+				t.Fatalf("code = %d, body = %s", code, body)
+			}
+			if got.Complete != tc.wantComplete {
+				t.Fatalf("complete = %v, want %v; notes = %v", got.Complete, tc.wantComplete, got.Notes)
+			}
+			if !tc.wantComplete && (len(got.Notes) == 0 || !strings.Contains(got.Notes[0], "could not be read")) {
+				t.Errorf("notes must say the archive records were unreadable, got %v", got.Notes)
+			}
+		})
 	}
 }
 

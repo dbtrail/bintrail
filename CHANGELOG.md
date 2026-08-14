@@ -78,6 +78,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a "consolidation candidate", and a comment cannot fail.
 
 ### Fixed
+- **The query planner no longer plans an unreadable `archive_state` as "no
+  archives"** (#1324). `Plan` swallowed every `archive_state` failure at
+  `Debug` and planned as if the table were empty, so two different facts were
+  indistinguishable: an index with no archive tier, and an archive tier that
+  exists but could not be read. Only `ER_NO_SUCH_TABLE` now counts as "no
+  archive tier"; every other failure — a permission denial, a corrupt table, a
+  legacy shape the fallback cannot read — is logged at `Warn` and recorded as
+  `QueryPlan.ArchiveCoverageUnavailable`. The same conflation #816 retired in
+  `status.LoadCoverage`, one layer over.
+  - The console's activity tiles keyed "complete" on that plan: with coverage
+    unread, every archived hour classified as a gap, the archived-hours caveat
+    counted zero, and an `archive_state` read failure rendered as "these
+    counts are complete." The response now says the archive records could not
+    be read and drops the completeness claim.
+  - Gap classification itself is unchanged and stays fail-closed: an hour
+    whose coverage could not be verified is still a gap, so a strict
+    (`AllowGaps=false`) `reconstruct` still refuses — but the real cause now
+    reaches the operator instead of sitting at `Debug` under a message that
+    blames rotation.
 - **The query planner no longer counts archives the read will never open**
   (#1232). Rotation is per-process, so an index capturing more than one source
   has more than one archive destination and nothing makes them archive the same
