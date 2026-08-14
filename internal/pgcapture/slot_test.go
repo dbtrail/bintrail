@@ -1,8 +1,12 @@
 package pgcapture
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestMissingPublishedOps(t *testing.T) {
@@ -89,4 +93,26 @@ func TestRestrictedPublicationError(t *testing.T) {
 			t.Errorf("expected apple before zebra (sorted), got %q", msg)
 		}
 	})
+}
+
+func TestIsUndefinedTable(t *testing.T) {
+	// SQLSTATE 42P01 is how a pre-15 server answers a pg_publication_namespace
+	// query — the ONE error the schema-member enumeration must swallow (#1211).
+	if !isUndefinedTable(&pgconn.PgError{Code: "42P01"}) {
+		t.Error("42P01 should be recognized as undefined_table")
+	}
+	if !isUndefinedTable(fmt.Errorf("wrapped: %w", &pgconn.PgError{Code: "42P01"})) {
+		t.Error("a wrapped 42P01 should be recognized")
+	}
+	// Any OTHER failure (permission, connection, syntax) must surface, not be
+	// silently treated as "no schema members".
+	if isUndefinedTable(&pgconn.PgError{Code: "42501"}) {
+		t.Error("insufficient_privilege must NOT be swallowed")
+	}
+	if isUndefinedTable(errors.New("connection refused")) {
+		t.Error("a non-PgError must NOT be swallowed")
+	}
+	if isUndefinedTable(nil) {
+		t.Error("nil is not an undefined-table error")
+	}
 }

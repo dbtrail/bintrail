@@ -272,4 +272,86 @@ func TestBuildPGReport_CoverageWarnings_Integration(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("unlogged-under-schema-publication", func(t *testing.T) {
+		// #1211: a FOR TABLES IN SCHEMA publication (PG 15+) accepts a schema that
+		// contains UNLOGGED tables — pg_publication_tables silently omits them, the
+		// exact silent-loss shape #555 closed for FOR ALL TABLES. The guard must
+		// enumerate pg_publication_namespace and WARN about UNLOGGED tables in the
+		// published schemas ONLY: the same table shape in an UNPUBLISHED schema is
+		// out of capture scope and must NOT be reported — that absence is what
+		// proves the scan is schema-scoped, not the FOR ALL TABLES scan rerun.
+		var version int
+		if err := conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+			t.Fatalf("read server_version_num: %v", err)
+		}
+		if version < 150000 {
+			t.Skipf("FOR TABLES IN SCHEMA requires PostgreSQL 15+; server is %d", version)
+		}
+
+		const pub = "bintrail_cov_sch_pub"
+		const schIn = "bintrail_cov_sch_in"   // published via FOR TABLES IN SCHEMA
+		const schOut = "bintrail_cov_sch_out" // NOT published
+		dropAll := func() {
+			bg := context.Background()
+			_, _ = conn.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+			_, _ = conn.Exec(bg, "DROP SCHEMA IF EXISTS "+schIn+" CASCADE")
+			_, _ = conn.Exec(bg, "DROP SCHEMA IF EXISTS "+schOut+" CASCADE")
+		}
+		dropAll()
+		t.Cleanup(dropAll)
+
+		mustExec("CREATE SCHEMA " + schIn)
+		mustExec("CREATE SCHEMA " + schOut)
+		mustExec("CREATE UNLOGGED TABLE " + schIn + ".cov_unlogged (id int PRIMARY KEY, v text)")
+		mustExec("CREATE UNLOGGED TABLE " + schOut + ".cov_unlogged (id int PRIMARY KEY, v text)")
+		mustExec("CREATE PUBLICATION " + pub + " FOR TABLES IN SCHEMA " + schIn)
+
+		// The Tables filter admits BOTH candidates, so the unpublished one being
+		// absent from the detail can only come from the schema scoping itself.
+		r := pgstreamrun.BuildPGReport(ctx, pgstreamrun.PGDoctorConfig{
+			QueryDSN: dsn, SlotName: "bintrail_cov_sch_slot", Publication: pub,
+			Tables: schIn + ".cov_unlogged," + schOut + ".cov_unlogged",
+		})
+		c := findCheck(t, r, "No UNLOGGED tables")
+		if c.Status != doctor.StatusWarn {
+			t.Errorf("No UNLOGGED tables = %s (%s), want warn", c.Status, c.Detail)
+		}
+		if !strings.Contains(c.Detail, schIn+".cov_unlogged") {
+			t.Errorf("detail should name the published schema's UNLOGGED table, got %q", c.Detail)
+		}
+		if strings.Contains(c.Detail, schOut) {
+			t.Errorf("detail must NOT name the unpublished schema %s, got %q", schOut, c.Detail)
+		}
+	})
+
+	t.Run("unlogged-check-clean-under-for-table-publication", func(t *testing.T) {
+		// A plain FOR TABLE publication has no schema members, and PostgreSQL refuses
+		// UNLOGGED members outright — the check must PASS, not WARN "could not check".
+		// On a pre-15 server this same path exercises the pg_publication_namespace
+		// degrade: the catalog does not exist there (SQLSTATE 42P01) and the guard
+		// must treat that as "no schema members", never as a probe failure — the
+		// PG 14 CI cell runs this against a server that genuinely lacks the catalog.
+		const pub = "bintrail_cov_plain_pub"
+		const tbl = "doctor_cov_plain"
+		dropAll := func() {
+			bg := context.Background()
+			_, _ = conn.Exec(bg, "DROP PUBLICATION IF EXISTS "+pub)
+			_, _ = conn.Exec(bg, "DROP TABLE IF EXISTS "+tbl)
+		}
+		dropAll()
+		t.Cleanup(dropAll)
+
+		mustExec("CREATE TABLE " + tbl + " (id int PRIMARY KEY)")
+		mustExec("ALTER TABLE " + tbl + " REPLICA IDENTITY FULL")
+		mustExec("CREATE PUBLICATION " + pub + " FOR TABLE " + tbl)
+
+		r := pgstreamrun.BuildPGReport(ctx, pgstreamrun.PGDoctorConfig{
+			QueryDSN: dsn, SlotName: "bintrail_cov_plain_slot", Publication: pub,
+		})
+		c := findCheck(t, r, "No UNLOGGED tables")
+		if c.Status != doctor.StatusPass {
+			t.Errorf("No UNLOGGED tables = %s (%s), want pass", c.Status, c.Detail)
+		}
+	})
 }

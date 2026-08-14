@@ -229,10 +229,10 @@ bintrail-pg doctor --query-dsn "$PG" --slot bintrail_shop --publication bintrail
   (**WARN** — retaining WAL and approaching the limit; doctor still exits 0) →
   `lost` (a loud **FAIL** with the re-baseline recovery path).
 - **No UNLOGGED tables** → WARN if any captured table is `UNLOGGED` (under a
-  `FOR ALL TABLES` publication; a `FOR TABLES IN SCHEMA` publication is **not**
-  covered by the check). UNLOGGED tables write no WAL, so their changes are
-  never captured — `ALTER TABLE <t> SET LOGGED` if you need them, or ignore if the
-  data is intentionally ephemeral.
+  `FOR ALL TABLES` publication, and under a `FOR TABLES IN SCHEMA` — PostgreSQL
+  15+ — publication for its member schemas). UNLOGGED tables write no WAL, so
+  their changes are never captured — `ALTER TABLE <t> SET LOGGED` if you need
+  them, or ignore if the data is intentionally ephemeral.
 - **FK cascade-child coverage** → WARN if a published table has a foreign-key
   `ON DELETE CASCADE` / `SET NULL` **child** that is *not* in the publication. A
   delete on the parent would rewrite that child, and the rewrite would not be
@@ -694,13 +694,11 @@ coerce, but verify your own round-trip.
 ## Limitations
 
 - **`UNLOGGED` tables are not captured.** They bypass the WAL by design, so logical
-  decoding never sees them. bintrail-pg now **warns** when an UNLOGGED table is in
-  capture scope (at `stream` startup and in `bintrail-pg doctor`, under a
-  `FOR ALL TABLES` publication) — but the changes are still not captured, so don't
-  rely on bintrail for UNLOGGED data. The warning does **not** cover a
-  `FOR TABLES IN SCHEMA` (PostgreSQL 15+) publication: an UNLOGGED table pulled
-  into scope by a schema-scoped publication is silently uncaptured with no
-  warning — audit those schemas by hand.
+  decoding never sees them. bintrail-pg **warns** when an UNLOGGED table is in
+  capture scope (at `stream` startup and in `bintrail-pg doctor`) — under a
+  `FOR ALL TABLES` publication and under a `FOR TABLES IN SCHEMA` (PostgreSQL
+  15+) publication's member schemas alike — but the changes are still not
+  captured, so don't rely on bintrail for UNLOGGED data.
 - **A cascade child must be in the publication.** A foreign-key `ON DELETE CASCADE`
   / `SET NULL` is captured (PostgreSQL performs it as ordinary row changes) **only
   if the child table is published**. If a published parent has an unpublished

@@ -335,14 +335,17 @@ func QueryReplicaIdentityNotFull(ctx context.Context, conn *pgx.Conn, publicatio
 // (pg_relation_is_publishable gates on relpersistence). A query over pg_publication_
 // tables therefore can never match an UNLOGGED row — it would be dead code.
 //
-// The dangerous case is FOR ALL TABLES: the operator believes "everything" is captured,
-// but the UNLOGGED tables silently are not. We scan user base tables for relpersistence
-// = 'u' and report the ones in the client filter scope. For a FOR TABLE publication an
-// UNLOGGED table cannot be in the publication at all, and a client --tables naming an
-// unpublished table is already a fatal coverage gap in validatePublication — so there
-// is nothing this guard could uniquely surface and it returns nil. (FOR TABLES IN
-// SCHEMA, PG 15+, is not covered here — a documented limitation, not silent: the doctor
-// still lists the check.)
+// The dangerous cases are FOR ALL TABLES and FOR TABLES IN SCHEMA (PG 15+): the
+// operator believes "everything" (or "everything in that schema") is captured, but the
+// UNLOGGED tables silently are not — a schema-scoped publication accepts a schema
+// containing UNLOGGED tables, and pg_publication_tables simply omits them. We scan user
+// base tables for relpersistence = 'u' — all user schemas under FOR ALL TABLES, only the
+// published schemas (pg_publication_namespace) under a schema-scoped publication — and
+// report the ones in the client filter scope. For a FOR TABLE publication an UNLOGGED
+// table cannot be in the publication at all, and a client --tables naming an unpublished
+// table is already a fatal coverage gap in validatePublication — so there is nothing
+// this guard could uniquely surface and it returns nil. (#1211 added the schema-scoped
+// coverage.)
 func listUnloggedCaptureTables(ctx context.Context, conn *pgx.Conn, publication string, filters event.Filters) ([]string, error) {
 	var allTables bool
 	err := conn.QueryRow(ctx, `SELECT puballtables FROM pg_publication WHERE pubname = $1`, publication).Scan(&allTables)
@@ -352,8 +355,19 @@ func listUnloggedCaptureTables(ctx context.Context, conn *pgx.Conn, publication 
 	if err != nil {
 		return nil, fmt.Errorf("pgcapture: reading publication %q for the UNLOGGED check: %w", publication, err)
 	}
+
+	// nil = every user schema is in scope (FOR ALL TABLES); non-nil = only the
+	// publication's schema members are (FOR TABLES IN SCHEMA, PG 15+).
+	var schemaScope []string
 	if !allTables {
-		return nil, nil // FOR TABLE: UNLOGGED tables cannot be published (see doc above)
+		schemas, err := publicationSchemas(ctx, conn, publication)
+		if err != nil {
+			return nil, err
+		}
+		if len(schemas) == 0 {
+			return nil, nil // FOR TABLE only: UNLOGGED tables cannot be published (see doc above)
+		}
+		schemaScope = schemas
 	}
 
 	rows, err := conn.Query(ctx, `
@@ -363,7 +377,8 @@ func listUnloggedCaptureTables(ctx context.Context, conn *pgx.Conn, publication 
 		WHERE c.relkind = 'r' AND c.relpersistence = 'u'
 		  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
 		  AND n.nspname NOT LIKE 'pg_temp%'
-		  AND n.nspname NOT LIKE 'pg_toast_temp%'`)
+		  AND n.nspname NOT LIKE 'pg_toast_temp%'
+		  AND ($1::text[] IS NULL OR n.nspname = ANY($1))`, schemaScope)
 	if err != nil {
 		return nil, fmt.Errorf("pgcapture: scanning for UNLOGGED tables: %w", err)
 	}
@@ -375,8 +390,8 @@ func listUnloggedCaptureTables(ctx context.Context, conn *pgx.Conn, publication 
 		if err := rows.Scan(&schema, &table); err != nil {
 			return nil, fmt.Errorf("pgcapture: scanning UNLOGGED tables: %w", err)
 		}
-		// Under FOR ALL TABLES the captured set is every user table narrowed by the
-		// client schema/table filter (the zero Filters accepts all), so honor it here.
+		// The captured set is the publication scope narrowed by the client
+		// schema/table filter (the zero Filters accepts all), so honor it here.
 		if filters.Matches(schema, table) {
 			unlogged = append(unlogged, schema+"."+table)
 		}
@@ -386,6 +401,51 @@ func listUnloggedCaptureTables(ctx context.Context, conn *pgx.Conn, publication 
 	}
 	sort.Strings(unlogged)
 	return unlogged, nil
+}
+
+// publicationSchemas returns the schema names a FOR TABLES IN SCHEMA publication
+// (PostgreSQL 15+) covers; empty when the publication has no schema members. On a
+// server predating pg_publication_namespace (PG 14 and older, SQLSTATE 42P01
+// undefined_table) it returns empty rather than an error: schema-scoped publications
+// cannot exist there, so there is nothing to enumerate — an advisory guard must not
+// break the preflight or the doctor on an older server. (#1211)
+func publicationSchemas(ctx context.Context, conn *pgx.Conn, publication string) ([]string, error) {
+	rows, err := conn.Query(ctx, `
+		SELECT n.nspname
+		FROM pg_publication_namespace pn
+		JOIN pg_publication p ON p.oid = pn.pnpubid
+		JOIN pg_namespace n ON n.oid = pn.pnnspid
+		WHERE p.pubname = $1`, publication)
+	if err != nil {
+		if isUndefinedTable(err) {
+			return nil, nil // pre-15 server: schema-scoped publications do not exist
+		}
+		return nil, fmt.Errorf("pgcapture: reading publication %q schema members for the UNLOGGED check: %w", publication, err)
+	}
+	defer rows.Close()
+
+	var schemas []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, fmt.Errorf("pgcapture: scanning publication %q schema members: %w", publication, err)
+		}
+		schemas = append(schemas, s)
+	}
+	if err := rows.Err(); err != nil {
+		if isUndefinedTable(err) {
+			return nil, nil // pre-15 server (pgx may defer the error to rows.Err)
+		}
+		return nil, fmt.Errorf("pgcapture: reading publication %q schema members for the UNLOGGED check: %w", publication, err)
+	}
+	return schemas, nil
+}
+
+// isUndefinedTable reports SQLSTATE 42P01 (undefined_table) — how a server answers a
+// query over a catalog relation it does not have (pg_publication_namespace before 15).
+func isUndefinedTable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
 }
 
 // ListUnloggedCaptureTables is the report-only form of the #555 UNLOGGED guard for
