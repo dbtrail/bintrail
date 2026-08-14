@@ -230,7 +230,70 @@ func TestMergeResults_divergenceLogIsBounded(t *testing.T) {
 	}
 }
 
-// captureWarn swaps the process-global slog.Default. Safe today because these
-// tests run sequentially; it would race the moment anything in package query
-// calls t.Parallel().
-var _ = captureWarn
+// #1325: the count is the merge layer's RESPONSE-LEVEL signal — the log line
+// above dies in the daemon log, and the console/MCP surfaces build their
+// warnings from this number. One count per diverging duplicate; agreeing
+// duplicates and legacy-archive NULLs stay zero (the cry-wolf rule), and the
+// wrapper must return byte-identical rows so no call site changes behavior.
+func TestMergeResultsReport_countsDivergingDuplicates(t *testing.T) {
+	agreeA, agreeB := row(10), row(10)
+	divLiveA, divArchA := row(11), row(11)
+	divArchA.RowAfter = map[string]any{"id": 7, "name": "MUTATED"}
+	divLiveB, divArchB := row(12), row(12)
+	divArchB.RowBefore = map[string]any{"id": 7, "name": "old"}
+
+	in := []ResultRow{agreeA, agreeB, divLiveA, divArchA, divLiveB, divArchB}
+	var merged []ResultRow
+	var diverged int
+	captureWarn(t, func() { merged, diverged = MergeResultsReport(in, 0, "ASC") })
+	if diverged != 2 {
+		t.Errorf("diverged = %d, want 2 (one per disagreeing duplicate, none for the agreeing pair)", diverged)
+	}
+	if len(merged) != 3 {
+		t.Errorf("dedup broken: got %d rows, want 3", len(merged))
+	}
+
+	captureWarn(t, func() { _, diverged = MergeResultsReport([]ResultRow{agreeA, agreeB}, 0, "ASC") })
+	if diverged != 0 {
+		t.Errorf("agreeing duplicates reported diverged = %d, want 0", diverged)
+	}
+
+	// The wrapper is the compatibility contract: same rows, count discarded.
+	var viaWrapper []ResultRow
+	captureWarn(t, func() { viaWrapper = MergeResults(append([]ResultRow(nil), in...), 0, "ASC") })
+	if len(viaWrapper) != len(merged) {
+		t.Errorf("MergeResults returned %d rows, MergeResultsReport %d — the wrapper must be behavior-identical", len(viaWrapper), len(merged))
+	}
+}
+
+// NOTE: captureWarn swaps the process-global slog.Default. Safe today because
+// these tests run sequentially; it would race the moment anything in package
+// query calls t.Parallel().
+
+// MergeAndTrimReport must propagate the count on BOTH branches: the plain
+// merge, and the limitPerPK path whose DESC re-sort runs a second (already
+// deduplicated) merge that must not zero the finding out.
+func TestMergeAndTrimReport_propagatesCount(t *testing.T) {
+	mk := func() []ResultRow {
+		live, arch := row(20), row(20)
+		arch.RowAfter = map[string]any{"id": 7, "name": "MUTATED"}
+		return []ResultRow{live, arch}
+	}
+	for _, tc := range []struct {
+		name       string
+		limitPerPK int
+		order      string
+	}{
+		{"plain merge", 0, "ASC"},
+		{"limitPerPK", 1, "ASC"},
+		{"limitPerPK with DESC re-sort", 1, "DESC"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var diverged int
+			captureWarn(t, func() { _, diverged = MergeAndTrimReport(mk(), 0, tc.limitPerPK, tc.order) })
+			if diverged != 1 {
+				t.Errorf("diverged = %d, want 1", diverged)
+			}
+		})
+	}
+}

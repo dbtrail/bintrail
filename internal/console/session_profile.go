@@ -216,16 +216,25 @@ func (s *Server) applySessionProfile(ctx context.Context, r *http.Request, b *bu
 // archives OFF when the request's session carries a data profile: Parquet
 // archives do not run the redaction pass, so a profiled session must read live
 // MySQL only (the same reason a startup profile forces --no-archive process-wide).
-func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, error) {
+//
+// diverged is the count of duplicate event_ids whose live-index and archive
+// copies DISAGREED during the merge (#1325); the handlers put it in the
+// response warnings, since a console operator never sees the server log where
+// the merge already warns. The skipped-sources list FetchMergedFull also
+// returns stays deliberately unused here: for these browsing endpoints a
+// partially-failing archive source remains a log-only condition (the
+// documented trade-off on Server.fetch), and adopting it is a separate
+// decision from surfacing divergence.
+func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, int, error) {
 	excl := archiveExclusionFor(r, b)
-	rows, plan, err := query.FetchMerged(ctx, b.db, b.engine, query.FetchMergedOptions{
+	rows, plan, _, diverged, err := query.FetchMergedFull(ctx, b.db, b.engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         b.dbName,
 		NoArchive:      excl.any(),
 		AllowGaps:      true,
 		ArchiveFetcher: parquetquery.Fetch,
 	})
-	return rows, plan, excl, err
+	return rows, plan, excl, diverged, err
 }
 
 // archiveExclusion records WHY a fetch left the Parquet archives out (#1311),

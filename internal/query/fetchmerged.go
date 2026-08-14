@@ -176,7 +176,7 @@ func FetchMerged(
 	engine *Engine,
 	o FetchMergedOptions,
 ) ([]ResultRow, *QueryPlan, error) {
-	rows, plan, _, err := FetchMergedFull(ctx, db, engine, o)
+	rows, plan, _, _, err := FetchMergedFull(ctx, db, engine, o)
 	return rows, plan, err
 }
 
@@ -189,32 +189,34 @@ const DiscoveryFailedSource = "(archive source discovery failed)"
 
 // FetchMergedFull is FetchMerged plus the archive sources that FAILED and
 // were skipped — non-empty only under AllowGaps=true (a failing source is
-// fatal otherwise). A discovery failure appears as DiscoveryFailedSource.
+// fatal otherwise) — plus the number of duplicate event_ids whose two merged
+// copies DISAGREED (#1325, see MergeResultsReport). A discovery failure
+// appears as DiscoveryFailedSource.
 // Surfaces whose user cannot see the server log (the console and the MCP
-// tool, #1281) need the list to put the incompleteness in the response;
+// tool, #1281) need both to put the incompleteness in the response;
 // callers that log are fine with FetchMerged, whose slog.Warn already names
-// the skipped sources.
+// the skipped sources and the diverging events.
 func FetchMergedFull(
 	ctx context.Context,
 	db *sql.DB,
 	engine *Engine,
 	o FetchMergedOptions,
-) ([]ResultRow, *QueryPlan, []string, error) {
+) ([]ResultRow, *QueryPlan, []string, int, error) {
 	if err := o.validate(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, 0, err
 	}
 	src, err := resolveMergeSources(ctx, db, o)
 	if err != nil {
-		return nil, src.plan, nil, err
+		return nil, src.plan, nil, 0, err
 	}
-	rows, skipped, _, err := fetchPage(ctx, engine, o, src)
+	rows, skipped, _, diverged, err := fetchPage(ctx, engine, o, src)
 	if err != nil {
-		return nil, src.plan, nil, err
+		return nil, src.plan, nil, 0, err
 	}
 	if src.discoveryFailed {
 		skipped = append(skipped, DiscoveryFailedSource)
 	}
-	return rows, src.plan, skipped, nil
+	return rows, src.plan, skipped, diverged, nil
 }
 
 // topNSatisfiedLive reports whether the live partitions alone already hold the
@@ -341,7 +343,12 @@ func FetchMergedStream(
 
 	for {
 		pageOpts.Opts.AfterEvent = cursor
-		rows, skipped, exhausted, err := fetchPage(ctx, engine, pageOpts, src)
+		// The per-page diverged count is deliberately dropped: every stream
+		// caller in this repo is a logging surface (CLI reconstruct / verify
+		// folds), and MergeResultsReport's slog.Warn already reports each
+		// divergence there. The response-level plumbing (#1325) covers the
+		// log-blind surfaces via FetchMergedFull.
+		rows, skipped, exhausted, _, err := fetchPage(ctx, engine, pageOpts, src)
 		if err != nil {
 			return src.plan, err
 		}
@@ -565,22 +572,24 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 // and returned nothing. Paginating callers need both, for opposite reasons: a
 // skipped source shortens a page without proving anything (so a short or empty
 // page must not be read as end-of-stream), while an exhausted one can be
-// retired from the walk entirely.
+// retired from the walk entirely. diverged counts the duplicate event_ids
+// whose two merged copies disagreed (#1325); zero on every path that reads a
+// single source, since no duplicate can exist there.
 func fetchPage(
 	ctx context.Context,
 	engine *Engine,
 	o FetchMergedOptions,
 	src mergeSources,
-) (rows []ResultRow, skipped, exhausted []string, err error) {
+) (rows []ResultRow, skipped, exhausted []string, diverged int, err error) {
 	// Fast path: no archives → single fetch from MySQL, no merge. engine.Fetch
 	// already applied ORDER BY and LIMIT in SQL, so MergeAndTrim would be a
 	// no-op over a single source.
 	if len(src.archSources) == 0 {
 		r, ferr := engine.Fetch(ctx, o.Opts)
 		if ferr != nil {
-			return nil, nil, nil, ferr
+			return nil, nil, nil, 0, ferr
 		}
-		return r, nil, nil, nil
+		return r, nil, nil, 0, nil
 	}
 
 	// Archives present: fetch from MySQL unless the planner says we can skip
@@ -590,7 +599,7 @@ func fetchPage(
 	} else {
 		r, ferr := engine.Fetch(ctx, o.Opts)
 		if ferr != nil {
-			return nil, nil, nil, ferr
+			return nil, nil, nil, 0, ferr
 		}
 		rows = r
 	}
@@ -598,7 +607,7 @@ func fetchPage(
 	if topNSatisfiedLive(o.Opts, rows, src.plan) {
 		slog.Debug("planner: skipping archive sources (newest-first page filled from contiguous live coverage)",
 			"limit", o.Opts.Limit, "sources", len(src.archSources))
-		return rows[:o.Opts.Limit], nil, nil, nil
+		return rows[:o.Opts.Limit], nil, nil, 0, nil
 	}
 
 	// Archive fetches get the misfiled-archive file-scoping hint (#1037); the
@@ -625,7 +634,7 @@ func fetchPage(
 			// fetch — so skipping the source would return an incomplete
 			// result the caller has no way to detect (#377).
 			if !o.AllowGaps {
-				return nil, nil, nil, fmt.Errorf("archive source %s failed under strict mode, cannot verify coverage: %w", s, aerr)
+				return nil, nil, nil, 0, fmt.Errorf("archive source %s failed under strict mode, cannot verify coverage: %w", s, aerr)
 			}
 			// Permissive mode: a broken archive must not block the entire
 			// query. Log and move on.
@@ -636,5 +645,6 @@ func fetchPage(
 		rows = append(rows, ar...)
 	}
 
-	return MergeAndTrim(rows, o.Opts.Limit, o.Opts.LimitPerPK, o.Opts.Order), skipped, exhausted, nil
+	rows, diverged = MergeAndTrimReport(rows, o.Opts.Limit, o.Opts.LimitPerPK, o.Opts.Order)
+	return rows, skipped, exhausted, diverged, nil
 }

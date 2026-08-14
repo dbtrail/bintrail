@@ -146,7 +146,7 @@ func TestFetchMerged_partialArchiveFailureAbortsStrictUnit(t *testing.T) {
 	// what log-blind surfaces (console, MCP) rely on to warn in-response.
 	expectQueries(mock)
 	var skipped []string
-	if _, _, skipped, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
+	if _, _, skipped, _, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
 		AllowGaps:      true,
 		ArchiveFetcher: stubFetcher,
 	}); err != nil {
@@ -222,7 +222,7 @@ func TestFetchMergedResolverFailure(t *testing.T) {
 		mock.ExpectQuery("FROM binlog_events").WillReturnRows(sqlmock.NewRows([]string{"event_id"}))
 		fetcherCalled := false
 		var skipped []string
-		_, _, skipped, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
+		_, _, skipped, _, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
 			AllowGaps: true,
 			ArchiveFetcher: func(_ context.Context, _ Options, _ string) ([]ResultRow, error) {
 				fetcherCalled = true
@@ -266,7 +266,7 @@ func TestFetchPage_forwardsMisfiledHoursToArchiveFetcher(t *testing.T) {
 	}
 	o := FetchMergedOptions{Opts: Options{}, AllowGaps: true, ArchiveFetcher: fetcher}
 
-	rows, skipped, exhausted, err := fetchPage(context.Background(), nil, o, src)
+	rows, skipped, exhausted, _, err := fetchPage(context.Background(), nil, o, src)
 	if err != nil {
 		t.Fatalf("fetchPage: %v", err)
 	}
@@ -280,5 +280,89 @@ func TestFetchPage_forwardsMisfiledHoursToArchiveFetcher(t *testing.T) {
 		if len(hours) != 1 || !hours[0].Equal(misfiled[0]) {
 			t.Errorf("fetch %d: ExtraArchiveHours = %v, want %v", i, hours, misfiled)
 		}
+	}
+}
+
+// #1325: a diverging duplicate found during the merge must reach the caller
+// as a COUNT, not only as a slog.Warn — FetchMergedFull is what the log-blind
+// surfaces (console, MCP) build their response warnings from. Two archive
+// sources return the same event_id with disagreeing row images; zero live
+// rows keep sqlmock trivial (the divergence check is source-agnostic).
+func TestFetchMergedFull_reportsDivergedDuplicates(t *testing.T) {
+	dir := t.TempDir()
+	aBase := filepath.Join(dir, "bintrail_id=a")
+	bBase := filepath.Join(dir, "bintrail_id=b")
+	for _, d := range []string{aBase, bBase} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	mk := func(name string) ResultRow {
+		return ResultRow{
+			EventID:        7,
+			BinlogFile:     "bin.000001",
+			StartPos:       4,
+			EndPos:         40,
+			EventTimestamp: time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
+			SchemaName:     "app",
+			TableName:      "users",
+			EventType:      1,
+			PKValues:       "1",
+			RowAfter:       map[string]any{"name": name},
+		}
+	}
+	expectQueries := func(mock sqlmock.Sqlmock) {
+		mock.ExpectQuery("FROM archive_state").WillReturnRows(
+			sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}).
+				AddRow("a", filepath.Join(aBase, "events.parquet"), nil, nil).
+				AddRow("b", filepath.Join(bBase, "events.parquet"), nil, nil))
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(
+			sqlmock.NewRows([]string{"event_id"}))
+	}
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// Disagreeing copies → count 1, dedup still returns one row.
+	expectQueries(mock)
+	divergeFetcher := func(_ context.Context, _ Options, src string) ([]ResultRow, error) {
+		if strings.Contains(src, "bintrail_id=a") {
+			return []ResultRow{mk("alice")}, nil
+		}
+		return []ResultRow{mk("MUTATED")}, nil
+	}
+	rows, _, skipped, diverged, err := FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
+		AllowGaps:      true,
+		ArchiveFetcher: divergeFetcher,
+	})
+	if err != nil {
+		t.Fatalf("FetchMergedFull: %v", err)
+	}
+	if len(rows) != 1 || len(skipped) != 0 {
+		t.Fatalf("unexpected fetch outcome: rows=%d skipped=%v", len(rows), skipped)
+	}
+	if diverged != 1 {
+		t.Errorf("diverged = %d, want 1", diverged)
+	}
+
+	// Cry-wolf control: agreeing copies must report zero.
+	expectQueries(mock)
+	agreeFetcher := func(_ context.Context, _ Options, _ string) ([]ResultRow, error) {
+		return []ResultRow{mk("alice")}, nil
+	}
+	if _, _, _, diverged, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
+		AllowGaps:      true,
+		ArchiveFetcher: agreeFetcher,
+	}); err != nil {
+		t.Fatalf("FetchMergedFull (agreeing): %v", err)
+	}
+	if diverged != 0 {
+		t.Errorf("agreeing duplicate reported diverged = %d, want 0", diverged)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet sqlmock expectations: %v", err)
 	}
 }

@@ -371,7 +371,7 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 		// failure under allow_gaps must land in Warnings (#1281) — the same
 		// no-silent-incompleteness contract CaptureGapStatus enforces for
 		// source-side loss.
-		rows, plan, skippedSources, err := query.FetchMergedFull(ctx, t.DB, query.New(t.DB), fmOpts)
+		rows, plan, skippedSources, diverged, err := query.FetchMergedFull(ctx, t.DB, query.New(t.DB), fmOpts)
 		if err != nil {
 			return ErrorResult(reconstructFetchError(err)), nil, nil
 		}
@@ -405,6 +405,13 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 			BaselineTime: snapshotTime.Format(reconstructTSFormat),
 			EventCount:   len(rows),
 			Warnings:     reconstructWarnings(plan, stale, baselineRow, rows, captureGap, skippedSources, args.AllowGaps),
+		}
+		if diverged > 0 {
+			// A diverging duplicate between the index and an archive (#1325)
+			// means the deltas folded below may carry the wrong row images —
+			// the same no-silent-incompleteness contract as skippedSources
+			// above, so it lands in the same Warnings list.
+			res.Warnings = append(res.Warnings, eventDivergenceWarning(diverged))
 		}
 
 		// 4. Fold baseline + deltas. baselineRow may be nil. "existed" = the row

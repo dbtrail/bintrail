@@ -1,6 +1,10 @@
 package console
 
-import "github.com/dbtrail/dbtrail/internal/query"
+import (
+	"fmt"
+
+	"github.com/dbtrail/dbtrail/internal/query"
+)
 
 // coverageWarnings extends gapWarnings with the two allow_gaps blind spots
 // (#1281) — conditions where partial state would otherwise render with no
@@ -34,6 +38,28 @@ func coverageWarnings(plan *query.QueryPlan, skippedSources []string, allowGaps 
 	}
 	if allowGaps && plan == nil {
 		w = append(w, "coverage could not be verified (query planner unavailable): gaps in the captured history may be undetected")
+	}
+	return w
+}
+
+// divergenceWarning renders the merge-layer divergence finding (#1325) for the
+// events and recover responses: two copies of one event_id — live index vs an
+// archived partition — disagreed, and one was silently chosen. The merge layer
+// already slog.Warns with per-event detail; this is the response-level echo for
+// an operator who is in a browser, not in the daemon log. It matters most on
+// the recover path, where the chosen copy's row images become the generated
+// reversal SQL. The wording claims no winner: which copy is kept is a
+// positional convention of the caller, not a contract of the merge (see the
+// comment inside query.MergeResultsReport).
+func divergenceWarning(n int) string {
+	return fmt.Sprintf("%d duplicate event(s) disagreed between the live index and an archive copy; the first copy fetched (normally the live index) was used. An archived partition should be a byte-for-byte copy of the index rows — a mismatch means the index row changed after archiving, or two index generations wrote under the same bintrail_id. Details are in the server log.", n)
+}
+
+// appendDivergenceWarning appends divergenceWarning when the merge reported
+// any diverging duplicates, else returns w unchanged.
+func appendDivergenceWarning(w []string, diverged int) []string {
+	if diverged > 0 {
+		w = append(w, divergenceWarning(diverged))
 	}
 	return w
 }

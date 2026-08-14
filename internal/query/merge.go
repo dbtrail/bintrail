@@ -100,6 +100,19 @@ func sameRowImage(a, b map[string]any) bool {
 // "DESC" (case-insensitive) → descending. The same direction is applied to
 // both sort keys so the ordering is total and deterministic.
 func MergeResults(rows []ResultRow, limit int, order string) []ResultRow {
+	merged, _ := MergeResultsReport(rows, limit, order)
+	return merged
+}
+
+// MergeResultsReport is MergeResults plus the number of duplicate event_ids
+// whose two copies DISAGREED (#1325). The slog.Warn below is the right channel
+// for the CLI, but the console and MCP surfaces serve callers who never see
+// the server log — for them a silent coin-flip between two disagreeing
+// before-images is a data-integrity event that must land in the RESPONSE, the
+// same split CaptureGapStatus makes for capture gaps (the finding travels even
+// when policy lets the query proceed). Callers that log are fine with
+// MergeResults, which discards the count.
+func MergeResultsReport(rows []ResultRow, limit int, order string) ([]ResultRow, int) {
 	seen := make(map[uint64]int, len(rows))
 	unique := rows[:0]
 	var diverged, reported int
@@ -161,7 +174,7 @@ func MergeResults(rows []ResultRow, limit int, order string) []ResultRow {
 	if limit > 0 && len(unique) > limit {
 		unique = unique[:limit]
 	}
-	return unique
+	return unique, diverged
 }
 
 // MergeAndTrim runs the full post-fetch pipeline: dedup+sort, then the per-PK
@@ -183,10 +196,21 @@ func MergeResults(rows []ResultRow, limit int, order string) []ResultRow {
 // order is passed through to MergeResults (see its doc); pre-#1511 callers
 // that pass "" get the historical ascending behavior.
 func MergeAndTrim(rows []ResultRow, limit, limitPerPK int, order string) []ResultRow {
+	merged, _ := MergeAndTrimReport(rows, limit, limitPerPK, order)
+	return merged
+}
+
+// MergeAndTrimReport is MergeAndTrim plus the diverged-duplicate count from
+// the dedup pass (#1325, see MergeResultsReport). Only the FIRST merge can
+// observe a divergence — the optional DESC re-sort below runs over rows that
+// are already deduplicated, so its count is structurally zero and is
+// discarded.
+func MergeAndTrimReport(rows []ResultRow, limit, limitPerPK int, order string) ([]ResultRow, int) {
+	var diverged int
 	if limitPerPK > 0 {
 		// LimitPerPK requires ASC-sorted input to pick the timestamp-latest
 		// events per PK.
-		rows = MergeResults(rows, 0, "ASC")
+		rows, diverged = MergeResultsReport(rows, 0, "ASC")
 		rows = LimitPerPK(rows, limitPerPK)
 		// Re-sort in the caller's direction before slicing — otherwise
 		// "limit N + Order=DESC" would slice from the wrong end of the
@@ -195,12 +219,12 @@ func MergeAndTrim(rows []ResultRow, limit, limitPerPK int, order string) []Resul
 			rows = MergeResults(rows, 0, "DESC")
 		}
 	} else {
-		rows = MergeResults(rows, 0, order)
+		rows, diverged = MergeResultsReport(rows, 0, order)
 	}
 	if limit > 0 && len(rows) > limit {
 		rows = rows[:limit]
 	}
-	return rows
+	return rows, diverged
 }
 
 // LimitPerPK trims rows to keep at most n per pk_values, preserving the input

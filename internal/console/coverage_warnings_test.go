@@ -43,3 +43,28 @@ func TestCoverageWarnings(t *testing.T) {
 		}
 	})
 }
+
+// #1325: the merge divergence finding must render once, count-first, and the
+// zero case must append nothing (cry-wolf rule — the normal
+// archived-but-not-dropped overlap produces agreeing duplicates, count 0).
+func TestAppendDivergenceWarning(t *testing.T) {
+	if w := appendDivergenceWarning(nil, 0); len(w) != 0 {
+		t.Errorf("count 0 must append nothing, got %#v", w)
+	}
+	base := []string{"existing"}
+	w := appendDivergenceWarning(base, 3)
+	if len(w) != 2 || w[0] != "existing" {
+		t.Fatalf("expected existing warning + one divergence entry, got %#v", w)
+	}
+	for _, want := range []string{"3 duplicate event(s) disagreed", "archive copy", "byte-for-byte"} {
+		if !strings.Contains(w[1], want) {
+			t.Errorf("warning lacks %q: %s", want, w[1])
+		}
+	}
+	// The console DTO boundary deliberately omits row internals
+	// (connection_id/query_text); the warning must not smuggle any in — it
+	// carries a COUNT, and per-event detail stays in the server log.
+	if strings.Contains(w[1], "connection_id") || strings.Contains(w[1], "query_text") {
+		t.Errorf("warning must not name row internals: %s", w[1])
+	}
+}

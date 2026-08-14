@@ -629,6 +629,10 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		// source does not read as complete to an MCP client.
 		var skippedArchives []string
 		var misfiledScanFailed bool
+		// Duplicate event_ids whose live and archive copies disagreed in the
+		// merge (#1325) — same blindness: the merge layer slog.Warns, but an
+		// MCP client sees only the result text.
+		var divergedEvents int
 		if len(archSources) == 0 && !t.RedactStatementText {
 			// Fast path: no archives and no post-fetch redaction — fetch and
 			// format in one step.
@@ -657,7 +661,7 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 				results = append(results, ar...)
 			}
 			if len(archSources) > 0 {
-				results = query.MergeResults(results, opts.Limit, opts.Order)
+				results, divergedEvents = query.MergeResultsReport(results, opts.Limit, opts.Order)
 			}
 			t.stripStatementText(results)
 			n, err = query.Format(results, format, &buf)
@@ -672,6 +676,7 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		}
 		text += QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit)
 		text += ArchiveSkipNotice(discoveryFailed, skippedArchives)
+		text += EventDivergenceNotice(divergedEvents)
 		if misfiledScanFailed {
 			text += "\nWarning: " + archiveScanIncompleteWarning() + "\n"
 		}
@@ -785,6 +790,14 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		// warns-and-continues (#1285).
 		var skippedArchives []string
 		var rows []query.ResultRow
+		// Diverging duplicates in the merge (#1325) stay a WARNING here, not a
+		// refusal like the archive-trouble gates above: both copies of the
+		// event exist and one — the live index's, the same one recover would
+		// use with no archives at all — is used, so the script is not
+		// knowingly incomplete. But the disagreement itself is a data-integrity
+		// finding the reviewing operator must see: the kept copy's row images
+		// become the reversal SQL.
+		var divergedEvents int
 		if len(archSources) > 0 {
 			fetchOpts := opts
 			extraHours, misfiledScanFailed := misfiledArchiveHours(ctx, t.DB, opts.Since, opts.Until)
@@ -812,7 +825,7 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 				}
 				rows = append(rows, ar...)
 			}
-			rows = query.MergeResults(rows, opts.Limit, opts.Order)
+			rows, divergedEvents = query.MergeResultsReport(rows, opts.Limit, opts.Order)
 		} else {
 			rows, err = engine.Fetch(ctx, opts)
 			if err != nil {
@@ -877,6 +890,12 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		}
 		if n >= opts.Limit {
 			text += fmt.Sprintf("\n-- Warning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
+		}
+		if divergedEvents > 0 {
+			// SQL-comment form so the warning survives inside the script text an
+			// agent may hand to an operator verbatim (the truncation warning
+			// above is the precedent).
+			text += "\n-- Warning: " + eventDivergenceWarning(divergedEvents) + "\n"
 		}
 
 		ext.Record(ctx, ext.AuditEvent{
@@ -1210,6 +1229,31 @@ func archiveDiscoveryFailedWarning() string {
 // skipped backfilled files — softer than archive_discovery_failed.
 func archiveScanIncompleteWarning() string {
 	return "archive_scan_incomplete: the archive registry could not be checked for misfiled (backfilled) archives; time-scoped pruning may have skipped archived events in the window"
+}
+
+// eventDivergenceWarning is the ONE wording for a merge divergence (#1325):
+// two copies of the same event_id — the live index's and an archived
+// partition's — disagreed, and one was silently chosen. Shared by the query
+// tool's trailing notice, the recover tool's SQL-comment warning and the
+// reconstruct tool's warnings array, same single-wording contract as
+// archiveSourceSkippedWarning. Deliberately no remediation command and no
+// flag-shaped tokens: per-event detail (event_id, schema, table, pk) is in the
+// server log, which is where the diagnosis lives.
+func eventDivergenceWarning(n int) string {
+	return fmt.Sprintf("event_divergence: %d duplicate event(s) disagreed between the live index and an archive copy; the first copy fetched (normally the live index) was used. "+
+		"An archived partition should be a byte-for-byte copy of the index rows — a mismatch means the index row changed after archiving, or two index generations wrote under the same bintrail_id. "+
+		"Per-event detail is in the server log", n)
+}
+
+// EventDivergenceNotice renders the query tool's trailing warning line for a
+// merge divergence (#1325). Empty when nothing diverged — the cry-wolf rule:
+// an agreeing duplicate (the normal archived-but-not-dropped overlap) must
+// render nothing.
+func EventDivergenceNotice(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return "\nWarning: " + eventDivergenceWarning(n) + "\n"
 }
 
 // ArchiveSkipNotice renders the query tool's trailing warning lines for
