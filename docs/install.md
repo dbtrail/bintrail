@@ -144,6 +144,32 @@ sudo rpm -i bintrail_VERSION_linux_amd64.rpm
 Each `.deb`/`.rpm`, like each tarball, has a syft SPDX SBOM sidecar —
 `<artifact>.sbom.json` — attached to the release.)
 
+### Verify a download
+
+`checksums.txt` is signed keylessly with cosign; the signature is attached to
+the release as a Sigstore **bundle** — `checksums.txt.sigstore.json`
+(certificate, signature and transparency-log entry in one file). Verifying it
+needs **cosign v3.0 or newer** (`cosign version`; on older cosign, `--bundle`
+names a different legacy format and verification fails on a genuinely valid
+artifact). With the bundle, `checksums.txt`, and your downloaded artifacts in
+one directory:
+
+```sh
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/dbtrail/dbtrail/\.github/workflows/release\.yaml@refs/tags/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+sha256sum --check --ignore-missing checksums.txt   # macOS: shasum -a 256 --check
+```
+
+The first command proves `checksums.txt` was produced by this repository's
+release workflow on a tag; the second proves your downloads match what the
+release shipped. (Releases up to v0.53.0 attached the older
+`checksums.txt.sig` + `checksums.txt.pem` pair instead — verify those with
+`--signature`/`--certificate` in place of `--bundle`.) Container images are
+signed separately — see [docker.md](./docker.md).
+
 The `bintrail` package carries the core CLI + `bintrail-mcp`; the web console
 is a separate `bintrail-console` package — install it only where an operator
 wants the UI. PostgreSQL-source capture is a separate `bintrail-pg`

@@ -490,13 +490,23 @@ sboms:
   - id: packages
     artifacts: package
 
+# Keyless cosign signature over checksums.txt (which itself covers every
+# artifact). The signature is a Sigstore BUNDLE — checksums.txt.sigstore.json:
+# certificate, signature and transparency-log entry in one file, the default
+# sign-blob output since cosign v3 (#1350; the older .sig/.pem pair is gone;
+# the installer ACTION major is v4 — do not confuse the two). The ci.yml
+# `signing` job replays this exact block against a throwaway file on every
+# push and same-repo PR, so a cosign or config change that would break the
+# release fails while a failed run is cheap — signing otherwise only executes
+# on tag push. Contract with that replay: only the ${artifact}/${signature}/
+# ${certificate} placeholders, no {{ }} templates — it fails closed on
+# anything else. Verification recipe: docs/install.md "Verify a download".
 signs:
   - cmd: cosign
-    certificate: "${artifact}.pem"
+    signature: "${artifact}.sigstore.json"
     args:
       - sign-blob
-      - "--output-certificate=${certificate}"
-      - "--output-signature=${signature}"
+      - "--bundle=${signature}"
       - "${artifact}"
       - "--yes"
     artifacts: checksum

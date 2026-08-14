@@ -592,3 +592,93 @@ jobs:
             ${{ runner.temp }}/console-e2e-failure.png
             ${{ runner.temp }}/console-e2e-daemon.log
           if-no-files-found: ignore
+
+  # The .goreleaser.yaml signs block only ever executes on a tag push, so no
+  # PR check can catch a broken flag set until a release run fails — the worst
+  # possible moment (recovery is delete-tag, fix, re-tag; cosign v3 made the
+  # Sigstore bundle sign-blob's default output, and an installer-action major
+  # bump is what pulls a new cosign in). This job replays the EXACT cmd/args
+  # from the config against a throwaway file, with the same keyless OIDC flow
+  # and the same cosign-installer pin the release uses, then verifies the
+  # bundle it produced. A cosign bump or a signs-block edit that would break
+  # the release now fails here instead (#1350). Fork PRs carry no id-token,
+  # so they skip rather than fail; pushes and same-repo PRs (dependabot
+  # included) always run it. No `changes` gate on purpose: it must fire on
+  # workflow/config-only PRs, which the go filter would skip.
+  signing:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write # keyless signing via OIDC, same as the release job
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The action pin determines which cosign BINARY ships (v4.x of the
+      # action installs cosign v3.x) — which is why the lockstep check below
+      # insists ci.yml and release.yaml carry the same SHA.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Replay the signs block against a throwaway artifact
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          # What CI proves must be what the release runs: same action pin.
+          # Comment-enforced lockstep rots silently; this does not.
+          ci_pin="$(grep -oE 'cosign-installer@[0-9a-f]{40}' .github/workflows/ci.yml | sort -u)"
+          rel_pin="$(grep -oE 'cosign-installer@[0-9a-f]{40}' .github/workflows/release.yaml | sort -u)"
+          if [ "$ci_pin" != "$rel_pin" ]; then
+            echo "cosign-installer pins diverged: ci.yml has '$ci_pin', release.yaml has '$rel_pin'" >&2
+            exit 1
+          fi
+
+          artifact="$(mktemp)"
+          echo "signing probe ${GITHUB_SHA}" > "$artifact"
+
+          cmd="$(yq -r '.signs[0].cmd' .goreleaser.yaml)"
+          sig_tpl="$(yq -r '.signs[0].signature // "${artifact}.sig"' .goreleaser.yaml)"
+          cert_tpl="$(yq -r '.signs[0].certificate // ""' .goreleaser.yaml)"
+          args_raw="$(yq -r '.signs[0].args[]' .goreleaser.yaml)"
+
+          # Fail closed on template forms this replay does not implement: the
+          # renderer below knows exactly ${artifact}/${signature}/${certificate}.
+          # A {{ }} goreleaser template or an unknown ${} placeholder would
+          # otherwise reach cosign as literal bytes — a green proving the
+          # wrong invocation. Teach the renderer first, then use the form.
+          probe="$(printf '%s\n%s\n%s\n%s' "$cmd" "$sig_tpl" "$cert_tpl" "$args_raw")"
+          probe="${probe//\$\{artifact\}/}"
+          probe="${probe//\$\{signature\}/}"
+          probe="${probe//\$\{certificate\}/}"
+          case "$probe" in *'{{'*|*'${'*)
+            echo "signs block uses template forms the CI replay cannot render — teach the replay first" >&2
+            exit 1 ;;
+          esac
+
+          signature=""
+          certificate=""
+          render() {
+            local s="$1"
+            s="${s//\$\{artifact\}/$artifact}"
+            s="${s//\$\{signature\}/$signature}"
+            s="${s//\$\{certificate\}/$certificate}"
+            printf '%s' "$s"
+          }
+          signature="$(render "$sig_tpl")"
+          certificate="$(render "$cert_tpl")"
+          args=()
+          while IFS= read -r a; do args+=("$(render "$a")"); done <<< "$args_raw"
+          echo "replaying: $cmd ${args[*]}"
+          "$cmd" "${args[@]}"
+          test -s "$signature" || { echo "signs block produced no signature at $signature" >&2; exit 1; }
+
+          # This run's Fulcio identity is THIS workflow's ref (ci.yml@...), so
+          # that is what the verify pins. The user-facing recipe in
+          # docs/install.md pins release.yaml@refs/tags/ instead and is
+          # exercised by nothing here — review it by hand when it changes.
+          cosign verify-blob \
+            --bundle "$signature" \
+            --certificate-identity-regexp "^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/ci\.yml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$artifact"
