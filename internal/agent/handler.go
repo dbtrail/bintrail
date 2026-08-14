@@ -302,11 +302,11 @@ func (h *DefaultHandler) HandleRecover(ctx context.Context, req RecoverRequest) 
 		// out-of-range hour label must survive date/file pruning. Best-effort:
 		// without an index DB (archive-only handlers) this stays nil and
 		// pruning falls back to labels.
-		// nil scope (#1232). Misfiled hours are a WIDENING hint — "do not
+		// AllArchives (#1232). Misfiled hours are a WIDENING hint — "do not
 		// prune these files" — so an over-broad set costs a few unpruned
 		// reads while a narrow one silently skips backfilled rows. Unscoped is
 		// the safe direction for a hint, the opposite of coverage.
-		hours, mErr := query.MisfiledArchiveHours(ctx, h.IndexDB, opts.Since, opts.Until, nil)
+		hours, mErr := query.MisfiledArchiveHours(ctx, h.IndexDB, opts.Since, opts.Until, query.AllArchives())
 		if mErr != nil {
 			h.logger().Warn("could not check archive_state for misfiled archives", "error", mErr)
 		} else {

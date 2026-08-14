@@ -156,7 +156,7 @@ func TestQueryPlan_SkipMySQL(t *testing.T) {
 
 func TestPlan_nilDB(t *testing.T) {
 	since := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)
-	p, err := Plan(t.Context(), nil, "testdb", &since, nil, false, nil)
+	p, err := Plan(t.Context(), nil, "testdb", &since, nil, false, AllArchives())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestPlan_nilDB(t *testing.T) {
 
 func TestPlan_noTimeRange(t *testing.T) {
 	// Nil since and until should produce nil plan (no routing possible).
-	p, err := Plan(t.Context(), nil, "testdb", nil, nil, false, nil)
+	p, err := Plan(t.Context(), nil, "testdb", nil, nil, false, AllArchives())
 	if err != nil {
 		t.Fatal(err)
 	}

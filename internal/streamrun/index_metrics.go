@@ -101,12 +101,12 @@ func scrapeIndexMetrics(ctx context.Context, db *sql.DB, dbName string, m *obser
 		archiveEarliest = data.Coverage.ArchiveEarliestHour
 	}
 	if since, until, ok := gapScrapeRange(snap.OldestEvent, archiveEarliest, newestExplicit); ok {
-		// nil scope (#1232): this gauge is about the INDEX, not about any one
-		// reader's archive set. bintrail_index_gap_hours answers "is there a
-		// hole in what this index retains", so every registered archive counts
-		// — scoping it to a reader's subset would make the daemon's metric
-		// depend on who happens to be querying.
-		if plan, err := query.Plan(ctx, db, dbName, &since, &until, false, nil); err != nil {
+		// AllArchives (#1232): this gauge is about the INDEX, not about any
+		// one reader's archive set. bintrail_index_gap_hours answers "is
+		// there a hole in what this index retains", so every registered
+		// archive counts — scoping it to a reader's subset would make the
+		// daemon's metric depend on who happens to be querying.
+		if plan, err := query.Plan(ctx, db, dbName, &since, &until, false, query.AllArchives()); err != nil {
 			slog.Warn("index metrics scrape: could not plan gap hours", "error", err)
 		} else if plan != nil { // belt-and-suspenders: Plan can still return nil
 			snap.GapHours = len(plan.GapHours)

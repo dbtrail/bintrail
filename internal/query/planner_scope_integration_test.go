@@ -43,7 +43,7 @@ func TestPlanScopesCoverageToTheArchivesTheReadOpens(t *testing.T) {
 	}
 
 	since, until := hour, hour.Add(30*time.Minute)
-	gapHours := func(t *testing.T, scope []string) int {
+	gapHours := func(t *testing.T, scope query.ArchiveScope) int {
 		t.Helper()
 		p, err := query.Plan(ctx, db, dbName, &since, &until, false, scope)
 		if err != nil {
@@ -57,33 +57,34 @@ func TestPlanScopesCoverageToTheArchivesTheReadOpens(t *testing.T) {
 
 	// A read that opens A's archives sees the hour as covered — it really
 	// will fetch that file.
-	if n := gapHours(t, []string{"source-a"}); n != 0 {
+	if n := gapHours(t, query.OnlyArchives("source-a")); n != 0 {
 		t.Errorf("a read scoped to the source that archived the hour reported %d gap hour(s); it will fetch that archive", n)
 	}
 
 	// THE REGRESSION: a read that opens only B's archives must NOT inherit
 	// A's coverage. Before #1232 this returned 0 and a strict reconstruct
 	// proceeded over an hour it could not read.
-	if n := gapHours(t, []string{"source-b"}); n != 1 {
+	if n := gapHours(t, query.OnlyArchives("source-b")); n != 1 {
 		t.Errorf("a read scoped to a source that never archived the hour reported %d gap hour(s), want 1 — A's archive is being counted as B's coverage", n)
 	}
 
-	// A read that opens NO archives (non-nil, empty) is the same statement in
-	// its strongest form.
-	if n := gapHours(t, []string{}); n != 1 {
+	// A read that opens NO archives is the same statement in its strongest
+	// form. If this reports 0, OnlyArchives() has collapsed into
+	// AllArchives() — the exact conflation #1327's type exists to prevent.
+	if n := gapHours(t, query.OnlyArchives()); n != 1 {
 		t.Errorf("a read that opens no archives reported %d gap hour(s), want 1", n)
 	}
 
-	// nil is "every archive in the index", the honest answer for a caller
-	// that reads them all — and the one that keeps single-source indexes and
-	// the index-wide gauges byte-identical to before.
-	if n := gapHours(t, nil); n != 0 {
+	// AllArchives is "every archive in the index", the honest answer for a
+	// caller that reads them all — and the one that keeps single-source
+	// indexes and the index-wide gauges byte-identical to before.
+	if n := gapHours(t, query.AllArchives()); n != 0 {
 		t.Errorf("an unscoped plan reported %d gap hour(s), want 0 — this is the pre-#1232 behaviour every index-wide caller still relies on", n)
 	}
 
 	// Scoping must be a filter, not a rename: a source that archived the hour
 	// is still covered when named alongside one that did not.
-	if n := gapHours(t, []string{"source-b", "source-a"}); n != 0 {
+	if n := gapHours(t, query.OnlyArchives("source-b", "source-a")); n != 0 {
 		t.Errorf("a read opening both destinations reported %d gap hour(s), want 0", n)
 	}
 }

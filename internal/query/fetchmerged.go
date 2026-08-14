@@ -515,25 +515,16 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 		// classify as gaps. The subset case the scope really exists for lives
 		// on `bintrail query --archive-dir/--archive-s3 --bintrail-id`.
 		//
-		// nil (unscoped, the old behaviour) is deliberate on the
+		// AllArchives (unscoped, the old behaviour) is deliberate on the
 		// discovery-failure path: we do not know the set, and inventing an
 		// empty one would report every rotated hour as a gap. AllowGaps=false
 		// has already refused above in that case, and AllowGaps=true asked
-		// for best-effort.
-		var scope []string
+		// for best-effort. On the success path ScopeFromPaths owns the other
+		// half of the contract: a discovery that resolved NOTHING is a read
+		// that opens nothing, never "opens everything" (#1327).
+		scope := AllArchives()
 		if !src.discoveryFailed {
-			// Non-nil even when discovery resolved NOTHING. This is the sharp
-			// edge of the nil/empty contract: ResolveArchiveSources builds its
-			// result with append, so "succeeded, found zero sources" comes
-			// back as a nil slice — which SourceIDsFromPaths faithfully maps
-			// to nil, which the planner reads as "every archive in the index".
-			// A successful discovery that found nothing means this read opens
-			// nothing, and it must not be spelled the same way as "opens
-			// everything".
-			scope = []string{}
-			if ids := SourceIDsFromPaths(src.archSources); ids != nil {
-				scope = ids
-			}
+			scope = ScopeFromPaths(src.archSources)
 		}
 		p, err := Plan(ctx, db, o.DBName, o.Opts.Since, o.Opts.Until, o.NoArchive, scope)
 		if err != nil {

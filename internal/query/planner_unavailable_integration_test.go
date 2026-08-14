@@ -45,7 +45,7 @@ func TestPlanDistinguishesUnreadableArchivesFromNone(t *testing.T) {
 	since, until := hour, hour.Add(30*time.Minute)
 	plan := func(t *testing.T) *query.QueryPlan {
 		t.Helper()
-		p, err := query.Plan(ctx, db, dbName, &since, &until, false, nil)
+		p, err := query.Plan(ctx, db, dbName, &since, &until, false, query.AllArchives())
 		if err != nil {
 			t.Fatalf("Plan must stay non-fatal on an archive_state failure: %v", err)
 		}
