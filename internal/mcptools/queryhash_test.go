@@ -85,8 +85,8 @@ func TestQueryTool_queryHashRefusedWhenStatementTextIsWithheld(t *testing.T) {
 // scoped to one would undo every execution of that shape in the window — none
 // of which the operator named.
 //
-// The realistic regression is not the shared BuildQueryOptions (its positional
-// signature makes leakage hard) but someone adding QueryHash to RecoverArgs
+// The realistic regression is not the shared BuildQueryOptions (FilterParams
+// deliberately has no QueryHash field) but someone adding QueryHash to RecoverArgs
 // "for symmetry" with QueryArgs. The blast radius of that mistake is generated
 // reversal SQL, so it gets its own assertion rather than a comment.
 func TestRecoverArgs_hasNoQueryHashParam(t *testing.T) {

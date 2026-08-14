@@ -455,6 +455,8 @@ type QueryArgs struct {
 	Schema        string   `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
 	Table         string   `json:"table,omitempty" jsonschema:"Filter by table name"`
 	PK            string   `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys e.g. 123 or 123|2)"`
+	PKs           []string `json:"pks,omitempty" jsonschema:"Filter by multiple primary key values (each pipe-delimited for composite keys); requires schema and table; mutually exclusive with pk"`
+	LimitPerPK    int      `json:"limit_per_pk,omitempty" jsonschema:"Cap returned events per pk_values to the latest N (0 = unlimited); requires pk or pks"`
 	EventType     string   `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
 	GTID          string   `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
 	Since         string   `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
@@ -470,21 +472,38 @@ type QueryArgs struct {
 }
 
 // RecoverArgs are the recover tool's parameters.
+//
+// Deliberately NOT here, matching the CLI recover surface (see
+// TestRecoverToolParams_matchCLIRecoverFlags):
+//
+//   - changed_column: a changed-column filter names row VERSIONS, and
+//     reversing a filtered subset of a row's history can produce a state that
+//     never existed — which is why CLI recover has never accepted
+//     --changed-column (it is query-only). The MCP recover tool exposed it
+//     anyway until #962. It is REMOVED rather than kept-and-rejected: the
+//     inferred input schema sets additionalProperties:false, so a client that
+//     still sends changed_column gets a loud schema-validation error naming
+//     the property instead of a silently ignored filter (the dangerous
+//     outcome would be a reversal covering more events than the client
+//     believes it scoped).
+//   - query_hash: same shape-vs-instance reasoning — see
+//     TestRecoverArgs_hasNoQueryHashParam.
 type RecoverArgs struct {
-	IndexDSN      string   `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var. Rejected on servers that route connections themselves (the console /mcp endpoint)."`
-	Schema        string   `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
-	Table         string   `json:"table,omitempty" jsonschema:"Filter by table name"`
-	PK            string   `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys)"`
-	EventType     string   `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
-	GTID          string   `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
-	Since         string   `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	Until         string   `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
-	ChangedColumn string   `json:"changed_column,omitempty" jsonschema:"Filter UPDATE events that modified this column"`
-	ColumnEq      []string `json:"column_eq,omitempty" jsonschema:"Filter events where a column in row_after or row_before equals the given value. Each entry is column=value. Repeat for AND. Literal NULL matches JSON null."`
-	Flag          string   `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
-	Limit         int      `json:"limit,omitempty" jsonschema:"Maximum number of events to reverse (default: 1000)"`
-	Profile       string   `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
-	NoArchive     bool     `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
+	IndexDSN   string   `json:"index_dsn,omitempty" jsonschema:"MySQL DSN for the index database. Overrides BINTRAIL_INDEX_DSN env var. Rejected on servers that route connections themselves (the console /mcp endpoint)."`
+	Schema     string   `json:"schema,omitempty" jsonschema:"Filter by database schema name"`
+	Table      string   `json:"table,omitempty" jsonschema:"Filter by table name"`
+	PK         string   `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys)"`
+	PKs        []string `json:"pks,omitempty" jsonschema:"Filter by multiple primary key values (each pipe-delimited for composite keys); requires schema and table; mutually exclusive with pk"`
+	LimitPerPK int      `json:"limit_per_pk,omitempty" jsonschema:"Cap reversed events per pk_values to the latest N (0 = unlimited); requires pk or pks"`
+	EventType  string   `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
+	GTID       string   `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
+	Since      string   `json:"since,omitempty" jsonschema:"Filter events at or after this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	Until      string   `json:"until,omitempty" jsonschema:"Filter events at or before this time (YYYY-MM-DD HH:MM:SS or RFC 3339)"`
+	ColumnEq   []string `json:"column_eq,omitempty" jsonschema:"Filter events where a column in row_after or row_before equals the given value. Each entry is column=value. Repeat for AND. Literal NULL matches JSON null."`
+	Flag       string   `json:"flag,omitempty" jsonschema:"Filter events from tables or columns carrying this flag"`
+	Limit      int      `json:"limit,omitempty" jsonschema:"Maximum number of events to reverse (default: 1000)"`
+	Profile    string   `json:"profile,omitempty" jsonschema:"Apply RBAC access rules for this profile (table-level deny and column-level redaction)"`
+	NoArchive  bool     `json:"no_archive,omitempty" jsonschema:"Disable auto-routing to Parquet archives (MySQL-only results)"`
 }
 
 // StatusArgs are the status tool's parameters.
@@ -550,8 +569,21 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 			}
 		}
 
-		opts, err := BuildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
-			args.GTID, args.Since, args.Until, args.ChangedColumn, args.ColumnEq, args.Flag, args.Limit, DefaultQueryLimit)
+		opts, err := BuildQueryOptions(FilterParams{
+			Schema:        args.Schema,
+			Table:         args.Table,
+			PK:            args.PK,
+			PKs:           args.PKs,
+			LimitPerPK:    args.LimitPerPK,
+			EventType:     args.EventType,
+			GTID:          args.GTID,
+			Since:         args.Since,
+			Until:         args.Until,
+			ChangedColumn: args.ChangedColumn,
+			ColumnEq:      args.ColumnEq,
+			Flag:          args.Flag,
+			Limit:         args.Limit,
+		}, DefaultQueryLimit)
 		if err != nil {
 			return ErrorResult(err), nil, nil
 		}
@@ -661,7 +693,12 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 				results = append(results, ar...)
 			}
 			if len(archSources) > 0 {
-				results, divergedEvents = query.MergeResultsReport(results, opts.Limit, opts.Order)
+				// MergeAndTrimReport, not MergeResultsReport: each source
+				// applied its own per-PK cap independently (SQL window /
+				// DuckDB QUALIFY), so the union can still exceed limit_per_pk
+				// per PK — the same post-merge re-trim the CLI query path
+				// does, carrying the #1325 divergence count through.
+				results, divergedEvents = query.MergeAndTrimReport(results, opts.Limit, opts.LimitPerPK, opts.Order)
 			}
 			t.stripStatementText(results)
 			n, err = query.Format(results, format, &buf)
@@ -720,8 +757,22 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 			}
 		}
 
-		opts, err := BuildQueryOptions(args.Schema, args.Table, args.PK, args.EventType,
-			args.GTID, args.Since, args.Until, args.ChangedColumn, args.ColumnEq, args.Flag, args.Limit, DefaultRecoverLimit)
+		// No ChangedColumn here on purpose — see the RecoverArgs doc comment:
+		// the field does not exist on the recover surface, matching CLI recover.
+		opts, err := BuildQueryOptions(FilterParams{
+			Schema:     args.Schema,
+			Table:      args.Table,
+			PK:         args.PK,
+			PKs:        args.PKs,
+			LimitPerPK: args.LimitPerPK,
+			EventType:  args.EventType,
+			GTID:       args.GTID,
+			Since:      args.Since,
+			Until:      args.Until,
+			ColumnEq:   args.ColumnEq,
+			Flag:       args.Flag,
+			Limit:      args.Limit,
+		}, DefaultRecoverLimit)
 		if err != nil {
 			return ErrorResult(err), nil, nil
 		}
@@ -825,7 +876,11 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 				}
 				rows = append(rows, ar...)
 			}
-			rows, divergedEvents = query.MergeResultsReport(rows, opts.Limit, opts.Order)
+			// MergeAndTrimReport, not MergeResultsReport: each source applied
+			// its own per-PK cap independently, so the union can still exceed
+			// limit_per_pk per PK — mirror the CLI recover merge
+			// (FetchMerged), carrying the #1325 divergence count through.
+			rows, divergedEvents = query.MergeAndTrimReport(rows, opts.Limit, opts.LimitPerPK, opts.Order)
 		} else {
 			rows, err = engine.Fetch(ctx, opts)
 			if err != nil {
@@ -1279,52 +1334,119 @@ func ArchiveSkipNotice(discoveryFailed bool, skipped []string) string {
 	return b.String()
 }
 
+// FilterParams are the shared filter parameters the query and recover tools
+// hand to BuildQueryOptions. Both tools map their (deliberately separate) arg
+// structs into this one builder so the cross-field validation stays in one
+// place. ChangedColumn is query-only: the recover handler has no field to
+// plumb into it (see the RecoverArgs doc comment), and QueryHash is
+// deliberately absent — the query tool layers it on AFTER the builder so the
+// recover tool can never gain it through here.
+type FilterParams struct {
+	Schema        string
+	Table         string
+	PK            string
+	PKs           []string
+	LimitPerPK    int
+	EventType     string
+	GTID          string
+	Since         string
+	Until         string
+	ChangedColumn string
+	ColumnEq      []string
+	Flag          string
+	Limit         int
+}
+
+// cleanPKs mirrors the CLI's pks hygiene (internal/cli cleanPKList): trim
+// whitespace, reject empty entries loudly, and drop duplicates while keeping
+// the first occurrence's order. MCP clients send a JSON array so there is no
+// comma-splitting concern, but a whitespace-only entry is still a client bug
+// worth naming rather than a silently narrower filter.
+func cleanPKs(pks []string) ([]string, error) {
+	if len(pks) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(pks))
+	out := make([]string, 0, len(pks))
+	for _, pk := range pks {
+		trimmed := strings.TrimSpace(pk)
+		if trimmed == "" {
+			return nil, fmt.Errorf("pks: empty or whitespace-only PK value")
+		}
+		if _, dup := seen[trimmed]; dup {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out, nil
+}
+
 // BuildQueryOptions converts the shared tool filter parameters into a
 // query.Options, validating cross-field requirements and applying the default
 // limit to a non-positive request.
-func BuildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string, columnEq []string, flagVal string, limit, defaultLimit int) (query.Options, error) {
-	if pk != "" && (schema == "" || table == "") {
+func BuildQueryOptions(p FilterParams, defaultLimit int) (query.Options, error) {
+	if p.PK != "" && (p.Schema == "" || p.Table == "") {
 		return query.Options{}, fmt.Errorf("pk requires both schema and table")
 	}
-	if changedCol != "" && (schema == "" || table == "") {
+	if len(p.PKs) > 0 && (p.Schema == "" || p.Table == "") {
+		return query.Options{}, fmt.Errorf("pks requires both schema and table")
+	}
+	if p.PK != "" && len(p.PKs) > 0 {
+		return query.Options{}, fmt.Errorf("pk and pks are mutually exclusive; use one or the other")
+	}
+	pks, err := cleanPKs(p.PKs)
+	if err != nil {
+		return query.Options{}, err
+	}
+	if p.LimitPerPK < 0 {
+		return query.Options{}, fmt.Errorf("limit_per_pk must be >= 0")
+	}
+	if p.LimitPerPK > 0 && p.PK == "" && len(pks) == 0 {
+		return query.Options{}, fmt.Errorf("limit_per_pk requires pk or pks")
+	}
+	if p.ChangedColumn != "" && (p.Schema == "" || p.Table == "") {
 		return query.Options{}, fmt.Errorf("changed_column requires both schema and table")
 	}
-	if len(columnEq) > 0 && (schema == "" || table == "") {
+	if len(p.ColumnEq) > 0 && (p.Schema == "" || p.Table == "") {
 		return query.Options{}, fmt.Errorf("column_eq requires both schema and table")
 	}
 
-	et, err := cliutil.ParseEventType(eventType)
+	et, err := cliutil.ParseEventType(p.EventType)
 	if err != nil {
 		return query.Options{}, err
 	}
-	sinceT, err := cliutil.ParseTime(since)
+	sinceT, err := cliutil.ParseTime(p.Since)
 	if err != nil {
 		return query.Options{}, fmt.Errorf("invalid since: %w", err)
 	}
-	untilT, err := cliutil.ParseTime(until)
+	untilT, err := cliutil.ParseTime(p.Until)
 	if err != nil {
 		return query.Options{}, fmt.Errorf("invalid until: %w", err)
 	}
-	parsedEq, err := query.ParseColumnEqs(columnEq)
+	parsedEq, err := query.ParseColumnEqs(p.ColumnEq)
 	if err != nil {
 		return query.Options{}, err
 	}
 
+	limit := p.Limit
 	if limit <= 0 {
 		limit = defaultLimit
 	}
 
 	return query.Options{
-		Schema:        schema,
-		Table:         table,
-		PKValues:      pk,
+		Schema:        p.Schema,
+		Table:         p.Table,
+		PKValues:      p.PK,
+		PKValuesIn:    pks,
+		LimitPerPK:    p.LimitPerPK,
 		EventType:     et,
-		GTID:          gtid,
+		GTID:          p.GTID,
 		Since:         sinceT,
 		Until:         untilT,
-		ChangedColumn: changedCol,
+		ChangedColumn: p.ChangedColumn,
 		ColumnEq:      parsedEq,
-		Flag:          flagVal,
+		Flag:          p.Flag,
 		Limit:         limit,
 	}, nil
 }

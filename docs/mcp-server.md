@@ -230,11 +230,21 @@ The `query` and `recover` tools share the CLI's filters and validation. Beyond
 the basics (`schema`, `table`, `pk`, `event_type`, `gtid`, `since`, `until`),
 both accept:
 
-- `changed_column` — events that touched a given column
+- `pks` — multiple primary key values (each pipe-delimited for composite
+  keys); requires `schema` and `table`, mutually exclusive with `pk`
+- `limit_per_pk` — cap events per `pk_values` to the latest N (0 = unlimited);
+  requires `pk` or `pks`
 - `column_eq` — repeatable `column=value` equality filters
 - `flag` — table/column flag filter
 - `profile` — RBAC table-deny + column-redaction
 - `no_archive` — disable Parquet archive auto-routing (see below)
+
+`query` also takes `changed_column` — events that touched a given column.
+`recover` does not: a changed-column filter selects row *versions*, and
+reversing a filtered subset of a row's history can produce a state that never
+existed — the same reason the `bintrail recover` CLI has no `--changed-column`
+flag (a `recover` call passing `changed_column` is rejected by the tool's
+input schema).
 
 `query` also takes `query_hash` — the 64-character statement digest of an event
 you already have, returning every event that statement produced across every

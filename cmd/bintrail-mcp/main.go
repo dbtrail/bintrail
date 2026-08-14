@@ -330,6 +330,6 @@ func queryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit in
 	return mcptools.QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, limit)
 }
 
-func buildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol string, columnEq []string, flagVal string, limit, defaultLimit int) (query.Options, error) {
-	return mcptools.BuildQueryOptions(schema, table, pk, eventType, gtid, since, until, changedCol, columnEq, flagVal, limit, defaultLimit)
+func buildQueryOptions(p mcptools.FilterParams, defaultLimit int) (query.Options, error) {
+	return mcptools.BuildQueryOptions(p, defaultLimit)
 }
