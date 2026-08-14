@@ -286,15 +286,18 @@ func TestDetectMariaDBGTIDGap_crossServerFailover(t *testing.T) {
 	}
 }
 
-// TestMariaDBCheckpointCoversFloor_multiServerPerDomain pins the one path the
-// detect-level tests cannot reach: mariadbDomainMaxSeq's max() aggregating MORE
-// THAN ONE server within a SINGLE domain. The cross-server detect test keeps its
-// two servers in separate sets (one per domain each), so the multi-server max()
-// never runs there — and the floor-side aggregation is the silent-data-loss
-// direction: under-computing the floor frontier reports a real unfillable gap as
-// fillable, and would stay green on every detect-level test. So assert it
-// directly and order-independently.
-func TestMariaDBCheckpointCoversFloor_multiServerPerDomain(t *testing.T) {
+// TestMariaDBCheckpointCoversFloor_perDomainIgnoresServerID pins the comparison
+// mariadbCheckpointCoversFloor performs on go-mysql v1.15.0+'s
+// one-GTID-per-domain MariadbGTIDSet: the domain's sequence is compared and
+// the server_id is ignored (a MariaDB sequence is domain-global), so a floor
+// and a checkpoint written by different server_ids in the same domain still
+// compare correctly — the cross-server failover shape that pre-v1.15.0
+// set-level Contain false-alarmed on. Multi-server-per-domain sets no longer
+// exist as a parsed shape: go-mysql collapses a legacy "0-1-X,0-2-Y" string to
+// the LAST entry (warning "out of order binlog" when the sequence regresses),
+// so the old max-across-servers aggregation this test used to pin has no
+// input to aggregate anymore.
+func TestMariaDBCheckpointCoversFloor_perDomainIgnoresServerID(t *testing.T) {
 	mustParse := func(s string) *gomysql.MariadbGTIDSet {
 		set, err := parseMariadbSet(s)
 		if err != nil {
@@ -303,43 +306,25 @@ func TestMariaDBCheckpointCoversFloor_multiServerPerDomain(t *testing.T) {
 		return set
 	}
 
-	// Checkpoint-side max(): a realistic post-failover accumulated checkpoint with
-	// two servers in domain 0. The domain frontier is max(50,100)=100, which
-	// covers floor 71 → fillable. A first-wins/min regression makes this fail
-	// regardless of map iteration order (100 must win).
-	if !mariadbCheckpointCoversFloor(mustParse("0-1-50,0-2-100"), mustParse("0-1-71")) {
-		t.Error("multi-server checkpoint: domain-0 max(50,100)=100 >= floor 71 → want covered (fillable)")
+	// Cross-server coverage: checkpoint seq 100 (server 2) covers floor seq 71
+	// (server 1) in the same domain — server_id must not enter the comparison.
+	if !mariadbCheckpointCoversFloor(mustParse("0-2-100"), mustParse("0-1-71")) {
+		t.Error("cp 0-2-100 vs floor 0-1-71: seq 100 >= 71 must be covered regardless of server_id")
 	}
 
-	// Floor-side max() — the silent-data-loss direction. The domain-0 purge floor
-	// is max(71,30)=71; a checkpoint at seq 50 has NOT seen purged 51..71 →
-	// unfillable.
-	if mariadbCheckpointCoversFloor(mustParse("0-2-50"), mustParse("0-1-71,0-2-30")) {
-		t.Error("multi-server floor: cp seq 50 does not cover domain-0 frontier max(71,30)=71 → want NOT covered (unfillable)")
+	// Cross-server miss — the silent-data-loss direction: checkpoint seq 50
+	// (server 2) does NOT cover floor seq 71 (server 1); purged 51..71 are gone.
+	if mariadbCheckpointCoversFloor(mustParse("0-2-50"), mustParse("0-1-71")) {
+		t.Error("cp 0-2-50 vs floor 0-1-71: seq 50 < 71 must NOT be covered (unfillable)")
 	}
 
-	// Pin the floor-side aggregation directly. On a multi-server domain ANY
-	// "pick one server" regression (first-wins, drop-higher) equals the true max
-	// whenever map iteration happens to start on the max element, so a single
-	// assertion is ~50/50 against it — Go re-randomizes map order per range. Turn
-	// that randomization AGAINST the bug: assert the frontier over many iterations
-	// so a first-wins regression (P(miss) = (1/2)^N) is caught with overwhelming
-	// probability, while min/drop-higher are caught on the first iteration.
-	floor := mustParse("0-1-71,0-2-30")
-	for i := range 64 {
-		if got := mariadbDomainMaxSeq(floor.Sets[0]); got != 71 {
-			t.Fatalf("mariadbDomainMaxSeq(domain 0 of {0-1-71,0-2-30}) = %d, want 71 (the per-domain "+
-				"frontier) on iteration %d — the aggregation must be order-independent", got, i)
-		}
+	// Multi-domain: every domain must independently cover its floor — domain 1
+	// behind its floor breaks coverage even though domain 0 is far ahead.
+	if mariadbCheckpointCoversFloor(mustParse("0-1-200,1-1-20"), mustParse("0-1-50,1-1-30")) {
+		t.Error("domain 1 cp seq 20 < floor 30 must break coverage regardless of domain 0")
 	}
-
-	// Also assert the defining invariant order-independently: the frontier is >=
-	// every server's sequence in the domain (catches any under-computing
-	// aggregation, the silent-data-loss direction).
-	for srv, g := range floor.Sets[0] {
-		if mariadbDomainMaxSeq(floor.Sets[0]) < g.SequenceNumber {
-			t.Errorf("mariadbDomainMaxSeq < server %d seq %d — frontier must cover every server", srv, g.SequenceNumber)
-		}
+	if !mariadbCheckpointCoversFloor(mustParse("0-1-200,1-1-40"), mustParse("0-1-50,1-1-30")) {
+		t.Error("both domains at/above their floors must be covered")
 	}
 }
 
@@ -445,8 +430,8 @@ func TestPersistGapAutoAdvance_stampIsUpsert(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectExec(`(?s)INSERT INTO stream_state\s+\(id, mode,.*gap_lost_at, gap_lost_detail\)` +
-		`.*ON DUPLICATE KEY UPDATE\s+` +
+	mock.ExpectExec(`(?s)INSERT INTO stream_state\s+\(id, mode,.*gap_lost_at, gap_lost_detail\)`+
+		`.*ON DUPLICATE KEY UPDATE\s+`+
 		`gap_lost_at\s+= UTC_TIMESTAMP\(\),\s+gap_lost_detail = VALUES\(gap_lost_detail\)\s*$`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),

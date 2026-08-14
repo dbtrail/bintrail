@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 )
 
@@ -40,39 +41,40 @@ func TestNewTenantAuthRejectsEmptyPassword(t *testing.T) {
 	}
 }
 
-func TestTenantAuthCheckUsername(t *testing.T) {
-	a, err := NewTenantAuth(map[string]string{"alice": "alicepw", "bob": "bobpw"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		name string
-		want bool
-	}{
-		{"alice", true},
-		{"bob", true},
-		{"carol", false},
-		{"", false},
-	} {
-		got, _ := a.CheckUsername(tc.name)
-		if got != tc.want {
-			t.Errorf("CheckUsername(%q) = %v, want %v", tc.name, got, tc.want)
-		}
-	}
-}
-
 func TestTenantAuthGetCredentialReturnsCleartext(t *testing.T) {
 	a, _ := NewTenantAuth(map[string]string{"alice": "alicepw"})
-	pw, found, err := a.GetCredential("alice")
+	cred, found, err := a.GetCredential("alice")
 	if err != nil || !found {
 		t.Errorf("GetCredential(alice): found=%v err=%v", found, err)
 	}
-	if pw != "alicepw" {
-		t.Errorf("GetCredential(alice) password = %q, want %q", pw, "alicepw")
+	if len(cred.Passwords) != 1 || cred.Passwords[0] != "alicepw" {
+		t.Errorf("GetCredential(alice) passwords = %q, want [alicepw]", cred.Passwords)
+	}
+	// The credential's plugin drives go-mysql's comparison (and any
+	// auth switch); the default must stay mysql_native_password so
+	// existing ProxySQL fronting keeps working without --auth-method.
+	if cred.AuthPluginName != mysql.AUTH_NATIVE_PASSWORD {
+		t.Errorf("default AuthPluginName = %q, want %q", cred.AuthPluginName, mysql.AUTH_NATIVE_PASSWORD)
 	}
 	_, found, _ = a.GetCredential("eve")
 	if found {
 		t.Error("GetCredential(eve) should not be found")
+	}
+}
+
+// TestTenantAuthWithAuthMethod pins that --auth-method reaches the
+// credential: go-mysql auth-switches the client to the CREDENTIAL's
+// plugin when it differs from the negotiated one, so a shim started
+// with caching_sha2_password must hand out credentials that say so —
+// otherwise every handshake would bounce back to native.
+func TestTenantAuthWithAuthMethod(t *testing.T) {
+	a, _ := NewTenantAuth(map[string]string{"alice": "alicepw"})
+	cred, found, err := a.WithAuthMethod(mysql.AUTH_CACHING_SHA2_PASSWORD).GetCredential("alice")
+	if err != nil || !found {
+		t.Fatalf("GetCredential(alice): found=%v err=%v", found, err)
+	}
+	if cred.AuthPluginName != mysql.AUTH_CACHING_SHA2_PASSWORD {
+		t.Errorf("AuthPluginName = %q, want %q", cred.AuthPluginName, mysql.AUTH_CACHING_SHA2_PASSWORD)
 	}
 }
 

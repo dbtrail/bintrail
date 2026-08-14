@@ -34,17 +34,18 @@ func newFlashbackConsole(t *testing.T, token string) *console.Server {
 func TestFlashbackCreds(t *testing.T) {
 	creds := flashbackCreds{srv: newFlashbackConsole(t, "sekret")}
 	for _, u := range []string{"someid", "alpha", "", "ghost"} {
-		if ok, _ := creds.CheckUsername(u); !ok {
-			t.Fatalf("CheckUsername(%q) = false, want true (token-only auth)", u)
+		cred, found, _ := creds.GetCredential(u)
+		if !found || len(cred.Passwords) != 1 || cred.Passwords[0] != "sekret" {
+			t.Fatalf("GetCredential(%q) = (%q,%v), want ([sekret],true)", u, cred.Passwords, found)
 		}
-		if pw, found, _ := creds.GetCredential(u); !found || pw != "sekret" {
-			t.Fatalf("GetCredential(%q) = (%q,%v), want (sekret,true)", u, pw, found)
+		// The credential's plugin must default to native — it has to match
+		// the method shim.NewMySQLServer("") builds the port with, or
+		// go-mysql auth-switches every client.
+		if cred.AuthPluginName != gomysql.AUTH_NATIVE_PASSWORD {
+			t.Fatalf("GetCredential(%q) plugin = %q, want %q", u, cred.AuthPluginName, gomysql.AUTH_NATIVE_PASSWORD)
 		}
 	}
 	credsNoTok := flashbackCreds{srv: newFlashbackConsole(t, "")}
-	if ok, _ := credsNoTok.CheckUsername("x"); ok {
-		t.Fatal("no token: CheckUsername must deny")
-	}
 	if _, found, _ := credsNoTok.GetCredential("x"); found {
 		t.Fatal("no token must never authorise a passwordless handshake")
 	}

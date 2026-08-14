@@ -6,25 +6,28 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 	yaml "go.yaml.in/yaml/v2"
 )
 
-// TenantAuth implements server.CredentialProvider against the
+// TenantAuth implements server.AuthenticationHandler against the
 // per-tenant cleartext password stored in shim.yaml's mysql_password
 // field. Both halves of the auth flow validate against this same
 // value: ProxySQL's frontend (which derives mysql_pass_sha1 from it
 // via bintrail proxysql-config) and the shim's backend (which hands
-// the cleartext to go-mysql/server's mysql_native_password handshake).
+// the cleartext to go-mysql/server's challenge/response check via
+// server.Credential.Passwords).
 //
-// Why the shim now stores cleartext: go-mysql/server's
-// CredentialProvider API requires the cleartext password to drive its
-// challenge/response check. Storing only mysql_pass_sha1 (as earlier
-// versions did) made every ProxySQL → shim connection fail because
-// the library could not validate ProxySQL-forwarded auth without the
-// cleartext. shim.yaml is operator-owned and 0o600; it already holds
-// source_dsn (which contains a MySQL password), so adding the tenant
-// cleartext alongside is a no-op against the existing trust model.
+// Why the shim now stores cleartext: go-mysql/server's credential API
+// requires the cleartext password to drive its challenge/response
+// check (Credential.Passwords are raw and hashed on demand). Storing
+// only mysql_pass_sha1 (as earlier versions did) made every ProxySQL →
+// shim connection fail because the library could not validate
+// ProxySQL-forwarded auth without the cleartext. shim.yaml is
+// operator-owned and 0o600; it already holds source_dsn (which
+// contains a MySQL password), so adding the tenant cleartext alongside
+// is a no-op against the existing trust model.
 //
 // Validation is real (not "any password accepted"): the username must
 // appear in the tenants block AND the client's wire-protocol response
@@ -34,6 +37,13 @@ import (
 // alone.
 type TenantAuth struct {
 	users map[string]string // username → cleartext mysql_password
+	// authPlugin is the MySQL auth plugin every returned Credential
+	// advertises; "" means mysql_native_password. It must match the
+	// method NewMySQLServer was built with: go-mysql compares the
+	// client's response under the CREDENTIAL's plugin and auth-switches
+	// the client to it when the negotiated plugin differs, so a
+	// mismatch forces an auth switch on every handshake.
+	authPlugin string
 }
 
 // NewTenantAuth builds a TenantAuth from a map of username →
@@ -68,14 +78,40 @@ func NewTenantAuth(users map[string]string) (TenantAuth, error) {
 	return TenantAuth{users: clean}, nil
 }
 
-// CheckUsername implements server.CredentialProvider.
-func (a TenantAuth) CheckUsername(u string) (bool, error) {
-	_, ok := a.users[u]
-	return ok, nil
+// WithAuthMethod returns a copy whose credentials advertise the given
+// MySQL auth plugin ("" keeps mysql_native_password). Pass the same
+// value NewMySQLServer is built with — see the authPlugin field doc.
+func (a TenantAuth) WithAuthMethod(method string) TenantAuth {
+	a.authPlugin = method
+	return a
 }
 
-// GetCredential implements server.CredentialProvider. Returns the
-// stored cleartext password so go-mysql/server's mysql_native_password
+func (a TenantAuth) plugin() string {
+	if a.authPlugin == "" {
+		return mysql.AUTH_NATIVE_PASSWORD
+	}
+	return a.authPlugin
+}
+
+// LookupPassword returns the tenant's stored cleartext password. The
+// PostgreSQL shim validates its cleartext-password handshake against
+// this directly (it speaks pgproto3, not the MySQL wire protocol, so
+// go-mysql's Credential machinery does not apply there).
+//
+// Unknown usernames return server.ErrAccessDenied rather than
+// (found=false, err=nil) — see GetCredential for why the explicit
+// error is load-bearing on the MySQL side; the PG shim treats any
+// error as a failed match, so sharing the semantics is harmless there.
+func (a TenantAuth) LookupPassword(u string) (password string, found bool, err error) {
+	p, ok := a.users[u]
+	if !ok {
+		return "", false, server.ErrAccessDenied
+	}
+	return p, true, nil
+}
+
+// GetCredential implements server.AuthenticationHandler. Returns the
+// stored cleartext password (as Credential.Passwords) so go-mysql's
 // handshake can validate the client's scrambled response against it.
 //
 // Unknown usernames return server.ErrAccessDenied rather than
@@ -86,13 +122,20 @@ func (a TenantAuth) CheckUsername(u string) (bool, error) {
 // Returning the error explicitly routes us through the 1045 path so
 // ProxySQL's monitor probes look like normal auth failures and the
 // backend stays ONLINE.
-func (a TenantAuth) GetCredential(u string) (password string, found bool, err error) {
-	p, ok := a.users[u]
-	if !ok {
-		return "", false, server.ErrAccessDenied
+func (a TenantAuth) GetCredential(u string) (server.Credential, bool, error) {
+	p, found, err := a.LookupPassword(u)
+	if err != nil || !found {
+		return server.Credential{}, false, err
 	}
-	return p, ok, nil
+	return server.Credential{Passwords: []string{p}, AuthPluginName: a.plugin()}, true, nil
 }
+
+// OnAuthSuccess and OnAuthFailure are server.AuthenticationHandler
+// lifecycle hooks. The shim needs neither: post-auth work happens in
+// the command Handler, and failure logging happens at the accept-loop
+// call site (classifyHandshakeErr), which sees the translated 1045.
+func (TenantAuth) OnAuthSuccess(*server.Conn) error  { return nil }
+func (TenantAuth) OnAuthFailure(*server.Conn, error) {}
 
 // TenantConfig is the validated form of one entry in shim.yaml's
 // tenants block. Used by `bintrail shim` so callers can recover the

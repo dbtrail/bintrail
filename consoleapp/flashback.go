@@ -84,10 +84,10 @@ func (c flashbackConfig) withDefaults() flashbackConfig {
 // token is). The client therefore connects as, e.g., `-u <server-id> -p<token>`.
 //
 // Auth requires a token: go-mysql validates the handshake by recomputing the
-// scramble from the cleartext GetCredential returns (the
-// compareNativePasswordAuthData path in go-mysql v1.13.0 server/auth.go), and
-// the console's bcrypt password store cannot produce that cleartext. Callers
-// that leave --token empty get an error here rather than an unauthenticated port.
+// scramble from the cleartext the credential carries (Credential.Passwords are
+// raw and hashed on demand in go-mysql server's auth flow), and the console's
+// bcrypt password store cannot produce that cleartext. Callers that leave
+// --token empty get an error here rather than an unauthenticated port.
 //
 // Blocks until ctx is cancelled (which closes ln and drains in-flight
 // connections) or ln fails unrecoverably.
@@ -114,7 +114,9 @@ func serveFlashback(ctx context.Context, srv *console.Server, ln net.Listener, c
 		return fmt.Errorf("flashback: %w", err)
 	}
 	gate := shim.NewGate(cfg.MaxFullTable)
-	creds := flashbackCreds{srv: srv}
+	// The credential must advertise the same plugin mysrv was built with —
+	// go-mysql auth-switches the client to the credential's plugin on mismatch.
+	creds := flashbackCreds{srv: srv, authMethod: cfg.AuthMethod}
 	logger := slog.Default()
 
 	// Close the listener when the daemon context ends so Accept unblocks and
@@ -162,7 +164,7 @@ func serveFlashback(ctx context.Context, srv *console.Server, ln net.Listener, c
 // passed to NewCustomizedConn and its inner *shim.Handler is set once GetUser()
 // reveals the target. Commands are dispatched sequentially in this goroutine
 // strictly after that, so no synchronisation is needed.
-func handleFlashbackConn(ctx context.Context, srv *console.Server, c net.Conn, mysrv *server.Server, creds server.CredentialProvider, gate *shim.Gate, cfg flashbackConfig, logger *slog.Logger) {
+func handleFlashbackConn(ctx context.Context, srv *console.Server, c net.Conn, mysrv *server.Server, creds server.AuthenticationHandler, gate *shim.Gate, cfg flashbackConfig, logger *slog.Logger) {
 	defer c.Close()
 
 	// Cancel + close the socket when the daemon context dies (SIGTERM) or this
@@ -278,28 +280,37 @@ func bindFlashbackHandler(ctx context.Context, srv *console.Server, proxy *routi
 // live rather than snapshotting it.
 type flashbackCreds struct {
 	srv *console.Server
+	// authMethod mirrors flashbackConfig.AuthMethod ("" = native) — the
+	// plugin the returned Credential advertises must match the one the
+	// port's *server.Server was built with, or go-mysql auth-switches
+	// every client.
+	authMethod string
 }
 
-// CheckUsername accepts any username: authentication is the shared token, and
-// the target server is validated AFTER the handshake (bindFlashbackHandler).
-// Deciding validity here would leak which usernames name a real server through
+// GetCredential implements server.AuthenticationHandler. It returns the shared
+// console token for EVERY username, so auth turns on the token alone — deciding
+// username validity here would leak which usernames name a real server through
 // the handshake's error code (unknown-user vs bad-password), letting an
-// unauthenticated client enumerate monitored servers. Returns false only when
-// no token is configured — a uniform denial of every connection.
-func (f flashbackCreds) CheckUsername(username string) (bool, error) {
-	return f.srv.Token() != "", nil
+// unauthenticated client enumerate monitored servers; the target server is
+// validated AFTER the handshake instead (bindFlashbackHandler). found=false on
+// an empty token is defence in depth behind serveFlashback's startup guard: an
+// empty token must never authorise a passwordless MySQL handshake.
+func (f flashbackCreds) GetCredential(username string) (server.Credential, bool, error) {
+	if f.srv.Token() == "" {
+		return server.Credential{}, false, nil
+	}
+	plugin := f.authMethod
+	if plugin == "" {
+		plugin = gomysql.AUTH_NATIVE_PASSWORD
+	}
+	return server.Credential{Passwords: []string{f.srv.Token()}, AuthPluginName: plugin}, true, nil
 }
 
-// GetCredential returns the shared console token for every username, so auth
-// turns on the token alone. found=false on an empty token is defence in depth
-// behind serveFlashback's startup guard: an empty token must never authorise a
-// passwordless MySQL handshake.
-func (f flashbackCreds) GetCredential(username string) (password string, found bool, err error) {
-	if f.srv.Token() == "" {
-		return "", false, nil
-	}
-	return f.srv.Token(), true, nil
-}
+// OnAuthSuccess and OnAuthFailure are server.AuthenticationHandler lifecycle
+// hooks; this port needs neither (routing happens in bindFlashbackHandler,
+// failure logging in handleFlashbackConn).
+func (flashbackCreds) OnAuthSuccess(*server.Conn) error  { return nil }
+func (flashbackCreds) OnAuthFailure(*server.Conn, error) {}
 
 // routingHandler is the go-mysql Handler passed to NewCustomizedConn before the
 // authenticated username (and thus the target server) is known. Its inner

@@ -40,15 +40,16 @@ import (
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
-// domainMaxSeq returns the highest sequence number the set holds for one
-// domain, 0 when the domain is absent — so "the domain advanced" is expressible
-// even when the earlier set had never seen that domain.
+// domainMaxSeq returns the sequence number the set holds for one domain, 0
+// when the domain is absent — so "the domain advanced" is expressible even
+// when the earlier set had never seen that domain. (go-mysql v1.15.0+ holds
+// exactly one GTID per domain, matching MariaDB's own position semantics.)
 func domainMaxSeq(set *gomysql.MariadbGTIDSet, domain uint32) uint64 {
-	servers, ok := set.Sets[domain]
+	g, ok := set.Sets[domain]
 	if !ok {
 		return 0
 	}
-	return mariadbDomainMaxSeq(servers)
+	return g.SequenceNumber
 }
 
 func TestIntegrationMultiDomainGTIDResumeExactlyOnce_mariadb(t *testing.T) {

@@ -233,9 +233,11 @@ func gtidSetContainsUUID(gtidSet, serverUUID string) bool {
 	if !ok {
 		return false
 	}
-	want := strings.ToLower(serverUUID)
-	for sid := range set.Sets {
-		if strings.ToLower(sid) == want {
+	// go-mysql v1.15.0+ keys MysqlGTIDSet by a typed uuid.UUID; String()
+	// renders it canonical-lowercase, so EqualFold absorbs any uppercase
+	// in the stored serverUUID without importing the uuid package here.
+	for sid := range *set {
+		if strings.EqualFold(sid.String(), serverUUID) {
 			return true
 		}
 	}

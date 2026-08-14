@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
 	"fmt"
 	"math/big"
 	"time"
@@ -60,28 +59,31 @@ func NewMySQLServer(authMethod string) (*server.Server, error) {
 			mysql.AUTH_SHA256_PASSWORD)
 	}
 
-	pubKeyPEM, tlsConfig, err := generateSelfSignedTLS()
+	priv, tlsConfig, err := generateSelfSignedTLS()
 	if err != nil {
 		return nil, fmt.Errorf("shim: generate self-signed cert for %s: %w", authMethod, err)
 	}
-	return server.NewServer("8.0.11", mysql.DEFAULT_COLLATION_ID, authMethod, pubKeyPEM, tlsConfig), nil
+	return server.NewServer("8.0.11", mysql.DEFAULT_COLLATION_ID, authMethod, priv, tlsConfig), nil
 }
 
 // generateSelfSignedTLS builds an RSA-2048 keypair and wraps it in a
-// minimal self-signed cert + tls.Config + PEM-encoded public key.
+// minimal self-signed cert + tls.Config, returning the private key
+// alongside — go-mysql's server.NewServer takes the *rsa.PrivateKey
+// directly (v1.15.0+) and derives the public-key bytes it serves to
+// clients from it.
 //
 // Self-signed-from-itself (no separate CA) is fine for a shim sitting
 // behind ProxySQL on a private network — the client (ProxySQL backend
 // connection or operator-side mysql CLI with --ssl-mode=DISABLED) does
 // not verify the server cert. The cert exists solely so the SHA2 full-
 // auth path has a private key to decrypt the client-encrypted password
-// with (see auth_switch_response.go:98 in go-mysql v1.13.0).
+// with (go-mysql server's RSA-OAEP branch in handleAuthSwitchResponse).
 //
 // Kept under 30 lines using stdlib helpers; do NOT grow this into a
 // general-purpose CA / cert-rotation framework. Operators who need
 // real TLS termination put a TLS-aware proxy in front of the shim.
-func generateSelfSignedTLS() (pubKeyPEM []byte, tlsConfig *tls.Config, err error) {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+func generateSelfSignedTLS() (priv *rsa.PrivateKey, tlsConfig *tls.Config, err error) {
+	priv, err = rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, nil, fmt.Errorf("rsa.GenerateKey: %w", err)
 	}
@@ -99,11 +101,5 @@ func generateSelfSignedTLS() (pubKeyPEM []byte, tlsConfig *tls.Config, err error
 	}
 	cert := tls.Certificate{Certificate: [][]byte{certDER}, PrivateKey: priv}
 	tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-
-	pubKeyDER, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("x509.MarshalPKIXPublicKey: %w", err)
-	}
-	pubKeyPEM = pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubKeyDER})
-	return pubKeyPEM, tlsConfig, nil
+	return priv, tlsConfig, nil
 }

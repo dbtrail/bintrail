@@ -336,7 +336,7 @@ func authenticate(be *pgproto3.Backend, auth shim.TenantAuth, user string) error
 		sendFatal(be, "08P01", fmt.Sprintf("expected a password message, got %T", msg))
 		return fmt.Errorf("expected PasswordMessage, got %T", msg)
 	}
-	expected, found, cerr := auth.GetCredential(user)
+	expected, found, cerr := auth.LookupPassword(user)
 	match := found && cerr == nil &&
 		subtle.ConstantTimeCompare([]byte(pw.Password), []byte(expected)) == 1
 	if !match {

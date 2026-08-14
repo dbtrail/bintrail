@@ -228,6 +228,10 @@ func runShim(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	// The credential must advertise the same plugin the server below is
+	// built with (shim.NewMySQLServer(cfg.AuthMethod)) — go-mysql
+	// auth-switches the client to the credential's plugin on mismatch.
+	auth = auth.WithAuthMethod(shAuthMethod)
 
 	db, err := config.Connect(shIndexDSN)
 	if err != nil {

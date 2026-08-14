@@ -1165,24 +1165,37 @@ func detectGTIDGap(sourceDB *sql.DB, checkpointGTID string, timeout time.Duratio
 	//
 	// Direction 2 (inline): if a purged UUID is absent from the checkpoint
 	// entirely, MySQL would try to send all of that UUID's GTIDs.
-	for uuid, purgedIntervals := range purgedSet.Sets {
-		cpIntervals, exists := cpSet.Sets[uuid]
+	//
+	// go-mysql v1.15.0+ shapes MysqlGTIDSet as map[uuid]map[tag]intervals to
+	// carry MySQL 8.4 tagged GTIDs; untagged GTIDs live under the zero Tag, so
+	// on an untagged source the inner loop runs exactly once per UUID and
+	// reduces to the old per-UUID interval check. A tag present in the purged
+	// set but absent from the checkpoint is the tagged analog of Direction 2.
+	for uuid, purgedTags := range *purgedSet {
+		cpTags, exists := (*cpSet)[uuid]
 		if !exists {
 			// Purged UUID the checkpoint has never seen.
 			needsPurged = true
 			break
 		}
-		if len(purgedIntervals.Intervals) == 0 {
-			continue
+		for tag, purgedIntervals := range purgedTags {
+			if len(purgedIntervals) == 0 {
+				continue
+			}
+			cpIntervals, ok := cpTags[tag]
+			if !ok || len(cpIntervals) == 0 {
+				needsPurged = true
+				break
+			}
+			// Check if the checkpoint's intervals fully contain the purged
+			// intervals. IntervalSlice.Contain(sub) returns true if sub is a
+			// subset of s.
+			if !cpIntervals.Contain(purgedIntervals) {
+				needsPurged = true
+				break
+			}
 		}
-		if len(cpIntervals.Intervals) == 0 {
-			needsPurged = true
-			break
-		}
-		// Check if the checkpoint's intervals fully contain the purged intervals.
-		// IntervalSlice.Contain(sub) returns true if sub is a subset of s.
-		if !cpIntervals.Intervals.Contain(purgedIntervals.Intervals) {
-			needsPurged = true
+		if needsPurged {
 			break
 		}
 	}
@@ -1386,52 +1399,43 @@ func mariadbGTIDSetsEqual(a, b string) bool {
 // every GTID at or below the purge floor — i.e. resuming from the checkpoint will
 // not require any GTID the source has purged.
 //
-// It compares the MAX sequence number PER DOMAIN and deliberately ignores the
+// It compares the sequence number PER DOMAIN and deliberately ignores the
 // server_id, because a MariaDB GTID sequence is domain-GLOBAL: within one
 // replication domain the sequence increments monotonically regardless of which
-// server writes the event. So the next GTID a checkpoint at domainMax needs is
-// domainMax+1, which is still available iff checkpointMax >= floorMax. This is the
-// "per-domain seq >= other.seq" semantics gate #1 was designed around.
+// server writes the event. So the next GTID a checkpoint at domainSeq needs is
+// domainSeq+1, which is still available iff checkpointSeq >= floorSeq. This is
+// the "per-domain seq >= other.seq" semantics gate #1 was designed around.
 //
-// We deliberately do NOT use go-mysql's MariadbGTIDSet.Contain: its set-level map
-// lookup is keyed by (domain, server), so after a primary failover — where the
-// floor and the checkpoint carry different server_ids inside the same domain — it
-// reports a spurious unfillable gap even though the checkpoint is demonstrably
-// ahead. That error is in the safe direction (a false data-loss alarm, never a
-// silent loss), but the per-domain max comparison avoids it. (go-mysql's per-GTID
-// MariadbGTID.Contain already ignores server_id; only its set wrapper re-keys by
-// server.)
+// go-mysql v1.15.0+ holds ONE GTID per domain in MariadbGTIDSet, matching
+// MariaDB's own position semantics (@@gtid_binlog_pos and BINLOG_GTID_POS
+// carry exactly one GTID per domain), so the domain's frontier is the entry
+// itself — the old max-across-servers aggregation has no input to aggregate
+// anymore. Upstream's set-level Contain now performs this same
+// ignore-the-server_id comparison (pre-v1.15.0 it re-keyed by (domain,
+// server) and false-alarmed across a failover); the explicit loop is kept
+// because this check is a data-loss gate — the comparison it performs should
+// be readable here, not inherited from a dependency's semantics.
 //
-// Confidence boundary: the max-per-domain logic is exact for the single-server
-// and multi-DOMAIN topologies that are gate #1's scope. Multi-SERVER-within-a-
-// domain only arises after a primary failover mid-capture; the per-domain max
-// handles it and it is unit-tested (TestMariaDBCheckpointCoversFloor_multiServerPerDomain),
-// but it is not validated against a live multi-server failover cluster — the
-// "topology untested" alpha caveat in docs/mariadb.md.
+// Legacy-checkpoint corner: a checkpoint accumulated by go-mysql <= v1.14.0
+// after a mid-capture primary failover could serialize TWO server_ids for one
+// domain (its set was keyed by (domain, server), serialized in map order).
+// v1.15.0+ parses such a string by collapsing the domain to the LAST entry,
+// warning "out of order binlog" when the higher sequence came first. The
+// mid-capture failover topology remains explicitly untested either way
+// (docs/mariadb.md); a fresh checkpoint clears the legacy shape.
 func mariadbCheckpointCoversFloor(checkpoint, floor *gomysql.MariadbGTIDSet) bool {
-	for domain, floorServers := range floor.Sets {
-		cpServers, ok := checkpoint.Sets[domain]
+	for domain, floorGTID := range floor.Sets {
+		cpGTID, ok := checkpoint.Sets[domain]
 		if !ok {
 			// The source purged GTIDs in a domain the checkpoint never indexed —
 			// those events are unreachable.
 			return false
 		}
-		if mariadbDomainMaxSeq(cpServers) < mariadbDomainMaxSeq(floorServers) {
+		if cpGTID.SequenceNumber < floorGTID.SequenceNumber {
 			return false
 		}
 	}
 	return true
-}
-
-// mariadbDomainMaxSeq returns the highest sequence number across every server
-// recorded for one domain. A MariaDB sequence is domain-global, so this max is the
-// domain's frontier regardless of which server produced the latest event.
-func mariadbDomainMaxSeq(serverSet map[uint32]*gomysql.MariadbGTID) uint64 {
-	var hi uint64
-	for _, gtid := range serverSet {
-		hi = max(hi, gtid.SequenceNumber)
-	}
-	return hi
 }
 
 // ─── Stream loop ────────────────────────────────────────────────────────────────

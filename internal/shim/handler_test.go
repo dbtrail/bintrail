@@ -2005,7 +2005,6 @@ func driveClient(addr, user, password string) error {
 	return nil
 }
 
-
 // recordingHandler is a minimal slog.Handler that captures every
 // emitted record into an in-memory slice. Used by tests that need
 // to assert log levels and messages — without it we'd have to
@@ -2401,9 +2400,9 @@ func TestValidatePKColumnRejectsNonPKWhere(t *testing.T) {
 	})
 }
 
-// Compile-time check: TenantAuth implements the credential provider
+// Compile-time check: TenantAuth implements the authentication handler
 // interface.
-var _ server.CredentialProvider = TenantAuth{}
+var _ server.AuthenticationHandler = TenantAuth{}
 
 // Compile-time check: nil-safe constructor returns a real Handler.
 var _ = func() *Handler {
