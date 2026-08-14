@@ -63,17 +63,25 @@ func TestUpReachesTheSeamWithItsOwnConfiguration(t *testing.T) {
 }
 
 func TestAgentSourceJobInfoRequiresSourceAndIndex(t *testing.T) {
-	origSource, origIndex := agtSourceDSN, agtIndexDSN
-	t.Cleanup(func() { agtSourceDSN, agtIndexDSN = origSource, origIndex })
+	origSource, origIndex, origFlavor := agtSourceDSN, agtIndexDSN, agtFlavor
+	t.Cleanup(func() { agtSourceDSN, agtIndexDSN, agtFlavor = origSource, origIndex, origFlavor })
 
 	tests := []struct {
 		name             string
 		source, index    string
+		flavor           string
 		wantOK           bool
 		wantSrc, wantIdx string
+		wantFlavor       string
 	}{
 		{name: "both set", source: "u:p@tcp(src:3306)/", index: "u:p@tcp(idx:3306)/bintrail_index",
-			wantOK: true, wantSrc: "u:p@tcp(src:3306)/", wantIdx: "u:p@tcp(idx:3306)/bintrail_index"},
+			wantOK: true, wantSrc: "u:p@tcp(src:3306)/", wantIdx: "u:p@tcp(idx:3306)/bintrail_index",
+			wantFlavor: "mysql"},
+		// --source-flavor mariadb must reach the source job — a flavor-gated
+		// job otherwise observes a MariaDB source believing it is MySQL.
+		{name: "mariadb flavor", source: "u:p@tcp(src:3306)/", index: "u:p@tcp(idx:3306)/bintrail_index",
+			flavor: "mariadb", wantOK: true, wantSrc: "u:p@tcp(src:3306)/", wantIdx: "u:p@tcp(idx:3306)/bintrail_index",
+			wantFlavor: "mariadb"},
 		// Stateless BYOS: a live source, but nowhere to persist an
 		// observation — jobs must not start and then fail on an empty DSN.
 		{name: "no index", source: "u:p@tcp(src:3306)/", index: "", wantOK: false},
@@ -83,7 +91,7 @@ func TestAgentSourceJobInfoRequiresSourceAndIndex(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			agtSourceDSN, agtIndexDSN = tc.source, tc.index
+			agtSourceDSN, agtIndexDSN, agtFlavor = tc.source, tc.index, tc.flavor
 			got, ok := agentSourceJobInfo()
 			if ok != tc.wantOK {
 				t.Fatalf("agentSourceJobInfo() ok = %v, want %v", ok, tc.wantOK)
@@ -94,8 +102,8 @@ func TestAgentSourceJobInfoRequiresSourceAndIndex(t *testing.T) {
 			if got.SourceDSN != tc.wantSrc || got.IndexDSN != tc.wantIdx {
 				t.Errorf("agentSourceJobInfo() = %+v, want the agent's DSNs", got)
 			}
-			if got.Flavor != "mysql" {
-				t.Errorf("agentSourceJobInfo().Flavor = %q, want \"mysql\" (the agent streams MySQL binlogs and has no flavor flag)", got.Flavor)
+			if got.Flavor != tc.wantFlavor {
+				t.Errorf("agentSourceJobInfo().Flavor = %q, want %q (an empty flavor would make a flavor-gated source job skip with no signal)", got.Flavor, tc.wantFlavor)
 			}
 		})
 	}

@@ -43,9 +43,10 @@ The connection auto-reconnects with exponential backoff on failure and sends
 periodic heartbeats to report agent status.
 
 In BYOS mode (when --source-dsn and --server-id are provided), the agent also
-reads binlogs from the customer MySQL and keeps recent events in an in-memory
-buffer. Recovery and pk resolution queries check the buffer first (fastest,
-recent data), then fall back to S3 Parquet archives.
+reads binlogs from the customer MySQL (or MariaDB, with --source-flavor
+mariadb) and keeps recent events in an in-memory buffer. Recovery and pk
+resolution queries check the buffer first (fastest, recent data), then fall
+back to S3 Parquet archives.
 
 Examples:
   # Start agent with index database
@@ -68,6 +69,7 @@ var (
 	agtEndpoint             string
 	agtIndexDSN             string
 	agtSourceDSN            string
+	agtFlavor               string
 	agtArchiveDir           string
 	agtArchiveS3            string
 	agtBufferRetain         string
@@ -92,6 +94,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agtEndpoint, "endpoint", "", "dbtrail WebSocket endpoint URL (required)")
 	agentCmd.Flags().StringVar(&agtIndexDSN, "index-dsn", "", "DSN for the index MySQL database")
 	agentCmd.Flags().StringVar(&agtSourceDSN, "source-dsn", "", "DSN for the source MySQL database (enables forensics queries; required for BYOS streaming)")
+	agentCmd.Flags().StringVar(&agtFlavor, "source-flavor", "mysql", "Source database flavor for BYOS streaming: mysql or mariadb (MariaDB source support is alpha)")
 	agentCmd.Flags().StringVar(&agtArchiveDir, "archive-dir", "", "Local directory containing Parquet archives")
 	agentCmd.Flags().StringVar(&agtArchiveS3, "archive-s3", "", "S3 path to Parquet archives (e.g. s3://bucket/prefix/)")
 	agentCmd.Flags().StringVar(&agtBufferRetain, "buffer-retain", "6h", "How long to retain events in the in-memory buffer (e.g. 6h, 24h)")
@@ -117,6 +120,12 @@ func init() {
 }
 
 func runAgent(cmd *cobra.Command, args []string) error {
+	flavor, err := normalizeAgentFlavor(agtFlavor)
+	if err != nil {
+		return err
+	}
+	agtFlavor = flavor
+
 	if agtValidate {
 		return runAgentValidate(cmd.Context())
 	}
@@ -633,8 +642,11 @@ func (s *flushPipelineState) toFlushStatus() *agent.FlushStatus {
 // Both DSNs are required: --source-dsn is the live server a job observes, and
 // the index is the only place a job can persist what it observes — a stateless
 // BYOS agent (no --index-dsn) has neither a local destination nor a schema to
-// write into. Flavor is always MySQL: the agent carries no --source-flavor
-// flag, and its BYOS stream is the MySQL binlog reader.
+// write into. Flavor is the agent's --source-flavor (normalized at the top of
+// runAgent), so a flavor-gated source job sees the flavor the BYOS stream
+// actually runs with. The cmp.Or default only matters when the globals are set
+// without going through cobra (tests): a job must never be told an empty
+// flavor, which a flavor-gated job would silently skip on.
 func agentSourceJobInfo() (ext.SourceJobInfo, bool) {
 	if agtSourceDSN == "" || agtIndexDSN == "" {
 		return ext.SourceJobInfo{}, false
@@ -642,14 +654,31 @@ func agentSourceJobInfo() (ext.SourceJobInfo, bool) {
 	return ext.SourceJobInfo{
 		SourceDSN: agtSourceDSN,
 		IndexDSN:  agtIndexDSN,
-		Flavor:    "mysql",
+		Flavor:    cmp.Or(agtFlavor, gomysql.MySQLFlavor),
 	}, true
+}
+
+// normalizeAgentFlavor validates --source-flavor and maps the empty string to
+// the default. Mirrors internal/streamrun's normalizeFlavor (same accepted
+// literals, same defaulting) so the agent and `bintrail stream` reject and
+// accept identically. postgres is deliberately not accepted: the BYOS stream
+// is a binlog reader.
+func normalizeAgentFlavor(flavor string) (string, error) {
+	switch flavor {
+	case "":
+		return gomysql.MySQLFlavor, nil
+	case gomysql.MySQLFlavor, gomysql.MariaDBFlavor:
+		return flavor, nil
+	default:
+		return "", fmt.Errorf("invalid --source-flavor %q: must be %q or %q", flavor, gomysql.MySQLFlavor, gomysql.MariaDBFlavor)
+	}
 }
 
 // ─── BYOS streaming ────────────────────────────────────────────────────────
 
-// runBYOSStream reads binlogs from the source MySQL and writes events to
-// the in-memory buffer, and optionally flushes metadata/payload to sinks.
+// runBYOSStream reads binlogs from the source MySQL (or MariaDB, under
+// --source-flavor mariadb) and writes events to the in-memory buffer, and
+// optionally flushes metadata/payload to sinks.
 func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer, fc *byosFlushConfig) error {
 	// Validate binlog settings.
 	if err := metadata.ValidateBinlogFormat(sourceDB); err != nil {
@@ -681,28 +710,11 @@ func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer, fc
 		return err
 	}
 
-	syncerCfg := replication.BinlogSyncerConfig{
-		ServerID:                agtServerID,
-		Flavor:                  "mysql",
-		Host:                    host,
-		Port:                    port,
-		User:                    user,
-		Password:                password,
-		HeartbeatPeriod:         30 * time.Second,
-		MaxReconnectAttempts:    0,
-		TimestampStringLocation: time.UTC, // see internal/parser/parser.go (#757)
-		// MariaDB 11.4+ zero-LogPos compensation (#1117; see the syncer in
-		// internal/streamrun for the full rationale). Library-gated to the
-		// MariaDB flavor, so it is inert under this syncer's fixed "mysql"
-		// flavor today — set so the site stays correct if the agent ever
-		// grows a flavor flag.
-		FillZeroLogPos: true,
-	}
-	syncer := replication.NewBinlogSyncer(syncerCfg)
+	syncer := replication.NewBinlogSyncer(byosSyncerConfig(agtServerID, agtFlavor, host, port, user, password))
 	defer syncer.Close()
 
 	// Determine start position.
-	streamer, err := startBYOSSyncer(sourceDB, syncer, agtStartGTID)
+	streamer, err := startBYOSSyncer(sourceDB, syncer, agtFlavor, agtStartGTID)
 	if err != nil {
 		return err
 	}
@@ -727,13 +739,40 @@ func runBYOSStream(ctx context.Context, sourceDB *sql.DB, buf *buffer.Buffer, fc
 	return err
 }
 
+// byosSyncerConfig builds the BYOS binlog syncer's config. Pure — extracted
+// from runBYOSStream so the flavor fan-out is unit-testable without a live
+// source (mirrors consoleapp's sourceStreamConfig extraction).
+func byosSyncerConfig(serverID uint32, flavor, host string, port uint16, user, password string) replication.BinlogSyncerConfig {
+	cfg := replication.BinlogSyncerConfig{
+		ServerID:                serverID,
+		Flavor:                  flavor,
+		Host:                    host,
+		Port:                    port,
+		User:                    user,
+		Password:                password,
+		HeartbeatPeriod:         30 * time.Second,
+		MaxReconnectAttempts:    0,
+		TimestampStringLocation: time.UTC, // see internal/parser/parser.go (#757)
+	}
+	if flavor == gomysql.MariaDBFlavor {
+		// Ask the MariaDB source to send ANNOTATE_ROWS events — MariaDB only
+		// forwards them to a replica that set this dump flag (#699) — and
+		// compensate the MariaDB 11.4+ zero-LogPos events (#1117). Both
+		// mirror the streamrun syncer's MariaDB branch; see the full
+		// rationale there.
+		cfg.DumpCommandFlag |= replication.BINLOG_SEND_ANNOTATE_ROWS_EVENT
+		cfg.FillZeroLogPos = true
+	}
+	return cfg
+}
+
 // startBYOSSyncer starts the binlog syncer from the given GTID set or
 // from the server's current binlog position.
-func startBYOSSyncer(sourceDB *sql.DB, syncer *replication.BinlogSyncer, startGTID string) (*replication.BinlogStreamer, error) {
+func startBYOSSyncer(sourceDB *sql.DB, syncer *replication.BinlogSyncer, flavor, startGTID string) (*replication.BinlogStreamer, error) {
 	if startGTID != "" {
-		gset, err := gomysql.ParseGTIDSet("mysql", startGTID)
+		gset, err := parseBYOSStartGTID(flavor, startGTID)
 		if err != nil {
-			return nil, fmt.Errorf("parse start GTID set: %w", err)
+			return nil, err
 		}
 		return syncer.StartSyncGTID(gset)
 	}
@@ -744,6 +783,18 @@ func startBYOSSyncer(sourceDB *sql.DB, syncer *replication.BinlogSyncer, startGT
 	}
 	slog.Info("starting from current binlog position", "file", file, "pos", pos)
 	return syncer.StartSync(gomysql.Position{Name: file, Pos: pos})
+}
+
+// parseBYOSStartGTID parses --start-gtid with the parser for the configured
+// source flavor. A MariaDB GTID set ("0-2-71") is not parseable as a MySQL
+// set, so the hardwired "mysql" literal this replaces made --start-gtid
+// unusable against a MariaDB source.
+func parseBYOSStartGTID(flavor, startGTID string) (gomysql.GTIDSet, error) {
+	gset, err := gomysql.ParseGTIDSet(flavor, startGTID)
+	if err != nil {
+		return nil, fmt.Errorf("parse start GTID set: %w", err)
+	}
+	return gset, nil
 }
 
 // byosStreamLoop reads events from the parser channel and writes them to

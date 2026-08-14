@@ -165,10 +165,13 @@ silently become the write key for every server. Two caveats:
   sequences per domain (correct for single-server and multi-domain topologies),
   but a primary failover that changes the `server_id` *within* a domain mid-stream
   has not been validated against a live multi-server MariaDB cluster.
-- **No BYOS agent support.** `bintrail agent` does not yet support MariaDB
-  (it streams with the fixed `mysql` flavor). The web console **does** capture
-  MariaDB sources (**+ Add server** → MariaDB, with a flavor chip in the server
-  list).
+- **BYOS agent support is the least exercised path.** `bintrail agent` accepts
+  `--source-flavor mariadb` (same flag and `BINTRAIL_SOURCE_FLAVOR` env as
+  `stream`) for its BYOS streaming, but unlike `stream` it has no saved
+  checkpoint — on restart it resumes from `--start-gtid` (parsed with the
+  configured flavor) or the server's current binlog position. The web console
+  also captures MariaDB sources (**+ Add server** → MariaDB, with a flavor chip
+  in the server list).
 - **Index-on-MariaDB is out of scope** — the index database stays MySQL.
 
 ---
