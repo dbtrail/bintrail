@@ -612,7 +612,8 @@ func (s *Server) handleSchemas(w http.ResponseWriter, r *http.Request) {
 	}
 	schema := r.URL.Query().Get("schema")
 	if schema == "" {
-		names, snapshotOnly, err := b.distinctSchemas(r.Context())
+		restricted := sessionRestricted(r)
+		names, snapshotOnly, err := b.distinctSchemas(r.Context(), restricted)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -620,10 +621,11 @@ func (s *Server) handleSchemas(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, schemasResponse{
 			Schemas:      names,
 			SnapshotOnly: snapshotOnly,
-			// Suppressed under noArchive: there the snapshot half is skipped by
-			// design (archives unreachable), so a broken resolver changes nothing
-			// about this listing and the flag would only read as noise.
-			SnapshotUnavailable: b.resolverUnavailable && !b.noArchive,
+			// Suppressed under noArchive and under a profiled session: there the
+			// snapshot half is skipped by design (archives unreachable), so a
+			// broken resolver changes nothing about this listing and the flag
+			// would only read as noise.
+			SnapshotUnavailable: b.resolverUnavailable && !b.noArchive && !restricted,
 		})
 		return
 	}
@@ -655,9 +657,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // from the source is absent from the latest snapshot, yet its archived events
 // are still recoverable and must stay listed.
 //
-// The snapshot half is gated on archives being reachable (see below), so this
-// is strictly additive: a server that cannot read archives keeps the exact
-// pre-#1065 listing.
+// The snapshot half is gated on archives being reachable BY THIS REQUEST (see
+// below), so this is strictly additive: a server that cannot read archives —
+// and a session whose data profile excludes them — keeps the exact pre-#1065
+// listing.
 //
 // One residual gap, out of scope — this endpoint answers "which schemas does
 // this index know of", NOT "which schemas have retrievable data in a given
@@ -671,7 +674,13 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 //
 // The resolver is loaded once when the bundle opens (manager.go, server.go), so
 // a snapshot taken after the console started is not picked up until restart.
-func (b *bundle) distinctSchemas(ctx context.Context) (schemas, snapshotOnly []string, err error) {
+//
+// restricted carries sessionRestricted(r): a session with a data profile is
+// served archive-excluded (the Parquet path runs no redaction — see
+// fetchRestricted), so for that session the snapshot half is exactly as
+// unreachable as it is under --no-archive, and listing it would offer targets
+// the session's every query provably answers zero rows for (#1326).
+func (b *bundle) distinctSchemas(ctx context.Context, restricted bool) (schemas, snapshotOnly []string, err error) {
 	rows, err := b.db.QueryContext(ctx, "SELECT DISTINCT schema_name FROM binlog_events ORDER BY schema_name")
 	if err != nil {
 		return nil, nil, err
@@ -681,13 +690,14 @@ func (b *bundle) distinctSchemas(ctx context.Context) (schemas, snapshotOnly []s
 	if err != nil {
 		return nil, nil, err
 	}
-	if b.noArchive {
-		// Archives are never consulted for this server (--no-archive, or ANY
-		// active RBAC profile — see newBundleDerived), so a schema that survives
-		// only in the snapshot is unreachable BY CONSTRUCTION: the union's whole
-		// justification is that the archives still answer. Advertising it would
-		// offer the operator a target this server provably cannot return a row
-		// for. Live-only here is byte-identical to the pre-#1065 behaviour.
+	if b.noArchive || restricted {
+		// Archives are never consulted for this read (--no-archive or a startup
+		// RBAC profile — see newBundleDerived — or THIS session's data profile),
+		// so a schema that survives only in the snapshot is unreachable BY
+		// CONSTRUCTION: the union's whole justification is that the archives
+		// still answer. Advertising it would offer the operator a target this
+		// read provably cannot return a row for. Live-only here is
+		// byte-identical to the pre-#1065 behaviour.
 		return live, nil, nil
 	}
 	schemas, snapshotOnly = mergeSchemaNames(live, b.resolver)

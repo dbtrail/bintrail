@@ -12,6 +12,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 
+	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -423,7 +424,7 @@ func TestDistinctSchemasUnionsSnapshot(t *testing.T) {
 		"app.customers": {Schema: "app", Table: "customers"},
 		"shop.items":    {Schema: "shop", Table: "items"},
 	})}
-	got, snapOnly, err := b.distinctSchemas(context.Background())
+	got, snapOnly, err := b.distinctSchemas(context.Background(), false)
 	if err != nil {
 		t.Fatalf("distinctSchemas: %v", err)
 	}
@@ -487,7 +488,7 @@ func TestDistinctSchemasNoArchiveKeepsLiveOnly(t *testing.T) {
 	b := &bundle{db: db, noArchive: true, resolver: metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
 		"archived.orders": {Schema: "archived", Table: "orders"},
 	})}
-	got, snapOnly, err := b.distinctSchemas(context.Background())
+	got, snapOnly, err := b.distinctSchemas(context.Background(), false)
 	if err != nil {
 		t.Fatalf("distinctSchemas: %v", err)
 	}
@@ -496,6 +497,36 @@ func TestDistinctSchemasNoArchiveKeepsLiveOnly(t *testing.T) {
 	}
 	if len(snapOnly) != 0 {
 		t.Errorf("--no-archive snapshot-only = %v, want none (snapshot half skipped)", snapOnly)
+	}
+}
+
+// TestDistinctSchemasRestrictedSessionKeepsLiveOnly pins the #1326 gate: a
+// session carrying a data profile is served archive-excluded (the Parquet path
+// runs no redaction), so even on a server that DOES read archives the snapshot
+// half must be skipped for it — otherwise the dropdown offers archive-only
+// schemas the session's every query answers zero rows for.
+func TestDistinctSchemasRestrictedSessionKeepsLiveOnly(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SELECT DISTINCT schema_name FROM binlog_events").
+		WillReturnRows(sqlmock.NewRows([]string{"schema_name"}).AddRow("live"))
+
+	// noArchive is FALSE: the server reads archives, only the session doesn't.
+	b := &bundle{db: db, resolver: metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{
+		"archived.orders": {Schema: "archived", Table: "orders"},
+	})}
+	got, snapOnly, err := b.distinctSchemas(context.Background(), true)
+	if err != nil {
+		t.Fatalf("distinctSchemas: %v", err)
+	}
+	if want := []string{"live"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("restricted-session schemas = %v, want %v (snapshot-only schema is unreachable for this session)", got, want)
+	}
+	if len(snapOnly) != 0 {
+		t.Errorf("restricted-session snapshot-only = %v, want none (snapshot half skipped)", snapOnly)
 	}
 }
 
@@ -546,15 +577,18 @@ func TestHandleSchemasProvenance(t *testing.T) {
 // (#1071): when the resolver failed to load for a reason other than
 // ErrNoSnapshots, the response says the snapshot half was skipped instead of
 // answering an empty list indistinguishable from the #1065 bug. Under
-// --no-archive that half is skipped by design, so the flag stays off there.
+// --no-archive — and for a profiled session (#1326) — that half is skipped by
+// design, so the flag stays off there.
 func TestHandleSchemasSnapshotUnavailable(t *testing.T) {
 	for _, c := range []struct {
 		name      string
 		noArchive bool
+		profiled  bool
 		want      bool
 	}{
-		{"archives reachable flags the skip", false, true},
-		{"no-archive suppresses the flag", true, false},
+		{"archives reachable flags the skip", false, false, true},
+		{"no-archive suppresses the flag", true, false, false},
+		{"profiled session suppresses the flag", false, true, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			db, mock, err := sqlmock.New()
@@ -568,8 +602,13 @@ func TestHandleSchemasSnapshotUnavailable(t *testing.T) {
 			s := newBootServer(db)
 			s.cm.boot.noArchive = c.noArchive
 			s.cm.boot.resolverUnavailable = true // loadResolver's Warn path: nil resolver, real failure
+			req := httptest.NewRequest("GET", "/api/schemas", nil)
+			if c.profiled {
+				req = req.WithContext(context.WithValue(req.Context(),
+					policyCtxKey{}, &ext.AccessPolicy{Profile: "analyst", Permissions: ext.AllPermissions()}))
+			}
 			rec := httptest.NewRecorder()
-			s.handleSchemas(rec, httptest.NewRequest("GET", "/api/schemas", nil))
+			s.handleSchemas(rec, req)
 			if rec.Code != 200 {
 				t.Fatalf("code = %d, want 200 (body %s)", rec.Code, rec.Body.String())
 			}
