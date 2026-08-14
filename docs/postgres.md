@@ -440,10 +440,10 @@ directly.
 > `real`/`double precision`, `bytea`, `interval`), whose text rendering is
 > pinned identically on the baseline COPY connections and the logical-decoding
 > session (`TimeZone=UTC`, `DateStyle=ISO`, `extra_float_digits=3`,
-> `bytea_output=hex`, `IntervalStyle=postgres`). Container types (arrays
-> beyond the tested `integer[]`/`text[]`, composite, range/multirange,
-> `hstore`, geometric) remain untested through the fold — validate your own
-> round-trip. **Re-baseline after upgrading:** baselines taken before the
+> `bytea_output=hex`, `IntervalStyle=postgres`) — and user-defined
+> **composite** types. Container types beyond that (arrays beyond the tested
+> `integer[]`/`text[]`, range/multirange, `hstore`, geometric) remain
+> untested through the fold — validate your own round-trip. **Re-baseline after upgrading:** baselines taken before the
 > rendering-GUC pin were rendered under your server's session defaults; on a
 > server whose defaults differ from the pinned values, re-run
 > `bintrail-pg baseline` — the baseline↔delta merge is an exact text join
@@ -650,6 +650,7 @@ run across the PG 14/15/16/17 CI matrix:
 | Array | `integer[]`, `text[]` | element quoting/escaping (e.g. a comma inside an element) preserved |
 | Geometric | `point` | |
 | Enum | user `ENUM` types | recovered **by label** — the target must declare the same enum type |
+| Composite | user-defined composite types | field quoting preserved (embedded comma, doubled quote); the target must declare the same composite type |
 | Money | `money` | round-trips, but its text form is **locale-dependent** (`$`-prefixed); recover into a target with the same `lc_monetary` |
 
 The generated reversal SQL is PostgreSQL dialect (double-quoted identifiers,
@@ -658,9 +659,15 @@ guard) — the dialect is selected automatically from the source recorded in the
 so `bintrail-pg recover`, the console, and the MCP server all emit valid PostgreSQL
 for a PostgreSQL source.
 
+**Extension types** — PostGIS `geometry`/`geography` and pgvector `vector` — are
+round-trip tested the same insert → capture → `recover` → re-execute way, in
+dedicated CI cells running extension-bearing images
+(`TestOne_PGExtensionTypeRoundTripMatrix`); see
+[Extensions and custom types](#extensions-and-custom-types) below.
+
 **Untested / best-effort:** `hstore` and other extension-provided types are covered
-under [Extensions and custom types](#extensions-and-custom-types) below. Composite
-types, range types beyond `int4range`, multirange, geometric types beyond `point`,
+under [Extensions and custom types](#extensions-and-custom-types) below. Range
+types beyond `int4range`, multirange, geometric types beyond `point`,
 arrays beyond the tested `integer[]`/`text[]` (multi-dimensional, `NULL`-containing)
 are not yet in the round-trip suite — they are captured as text and are expected to
 coerce, but verify your own round-trip.
@@ -673,15 +680,21 @@ coerce, but verify your own round-trip.
   `pgoutput` plugin only — no output plugin, no `CREATE EXTENSION`, no event
   trigger. This is a deliberate red line, and it is what lets bintrail-pg work
   against managed PostgreSQL (which forbids custom extensions).
-- **PostGIS works well.** Geometry columns stream as hex-EWKB, which embeds the
-  SRID and round-trips losslessly back into PostgreSQL — the target just needs
-  PostGIS installed. (Set `REPLICA IDENTITY FULL` as for any table; large
-  geometries are TOASTed, so FULL matters.)
-- **Other extension/custom types** (`vector`/pgvector, composite types) are
-  captured **as their text representation**. Recovery into a target that has the
-  same extension installed works; treat exotic types as best-effort and test your
-  round-trip. (Enums and ranges are round-trip tested — see the
-  [Type support](#type-support) matrix.)
+- **PostGIS is round-trip tested.** `geometry` and `geography` columns stream
+  as hex-EWKB, which embeds the SRID and round-trips losslessly back into
+  PostgreSQL — proven empirically by `TestOne_PGExtensionTypeRoundTripMatrix`
+  against the `postgis/postgis` image in CI. The target just needs PostGIS
+  installed. (Set `REPLICA IDENTITY FULL` as for any table; large geometries
+  are TOASTed, so FULL matters.)
+- **pgvector is round-trip tested.** `vector` columns stream as their bracketed
+  text form (`[0.5,-1.25,3.75]`) and round-trip byte-for-byte — same test,
+  against the `pgvector/pgvector` image in CI. The target needs the extension
+  installed.
+- **Other extension/custom types** (`hstore`, …) are captured **as their text
+  representation**. Recovery into a target that has the same extension installed
+  is expected to work; treat exotic types as best-effort and test your
+  round-trip. (Enums, ranges and user-defined composite types are round-trip
+  tested — see the [Type support](#type-support) matrix.)
 - **TimescaleDB hypertables are out of scope.** Logical decoding emits the
   underlying *chunk* tables (`_timescaledb_internal._hyper_*`), not the
   hypertable, so a hypertable is not captured coherently in this release.

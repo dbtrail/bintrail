@@ -419,6 +419,103 @@ jobs:
           grep -q -- '--- PASS: TestPGWire_PostgresSourceRoundTrip' /tmp/pg-it.out \
             || { echo "FATAL: pgwire PostgreSQL-source E2E did not run — false-green tripwire" >&2; exit 1; }
 
+  integration-postgres-extensions:
+    # Extension-type round-trip coverage (#1210): PostGIS geometry/geography
+    # and pgvector's vector are text-decoded through pgoutput like any other
+    # type, but the plain postgres:N images above cannot host the extensions —
+    # so this job pairs the same MySQL index container with one extension-
+    # bearing PostgreSQL image per cell (no single stock image ships both
+    # extensions) and runs ONLY the extension matrix test; the full PG suite
+    # already runs in integration-postgres-source. One modern PG major per
+    # extension, not a full version matrix: the extension's text I/O is what's
+    # under test, not the server version (that axis is covered above).
+    #
+    # BINTRAIL_REQUIRE_PGEXT names the extension each cell guarantees, turning
+    # the test's per-extension skip into a FAILURE here — plus the usual
+    # PASS-line tripwire, so a renamed test cannot go green-via-empty `-run`.
+    needs: changes
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: "postgis/postgis:16-3.4"
+            ext: "postgis"
+          - image: "pgvector/pgvector:pg16"
+            ext: "vector"
+    env:
+      BINTRAIL_TEST_DSN: "root:testroot@tcp(127.0.0.1:13306)"
+      BINTRAIL_TEST_PG_DSN: "postgres://postgres:testpg@127.0.0.1:15432/pgtest?sslmode=disable"
+      BINTRAIL_REQUIRE_POSTGRES: "1"
+      BINTRAIL_REQUIRE_PGEXT: ${{ matrix.ext }}
+    steps:
+      # Step-level (not job-level) `if:` — see the note on the `integration`
+      # job above; this job's matrix has the same requirement.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
+        with:
+          go-version-file: go.mod
+
+      - name: Start MySQL index (bintrail-test-mysql, 8.4)
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
+        run: |
+          docker run -d --name bintrail-test-mysql \
+            -e MYSQL_ROOT_PASSWORD=testroot \
+            -p 13306:3306 \
+            mysql:8.4 \
+            --binlog-format=ROW --binlog-row-image=FULL --log-bin=binlog --server-id=1
+          # See the "integration" job's MySQL-start step for why this probes
+          # host TCP with full auth + a real query, requiring 3 consecutive
+          # successes, instead of `docker exec ... mysqladmin ping` (#949).
+          consecutive=0
+          for i in $(seq 1 60); do
+            if docker run --rm --network host mysql:8.4 \
+                 mysql --protocol=TCP -h 127.0.0.1 -P 13306 -u root -ptestroot -e "SELECT 1" >/dev/null 2>&1; then
+              consecutive=$((consecutive + 1))
+              [ "$consecutive" -ge 3 ] && { echo "MySQL index is ready."; exit 0; }
+            else
+              consecutive=0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in time" >&2
+          docker logs bintrail-test-mysql >&2 || true
+          exit 1
+
+      - name: Start PostgreSQL source (bintrail-test-postgres, ${{ matrix.image }})
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
+        run: |
+          docker run -d --name bintrail-test-postgres \
+            -e POSTGRES_PASSWORD=testpg \
+            -e POSTGRES_DB=pgtest \
+            -p 15432:5432 \
+            ${{ matrix.image }} \
+            -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+          # Same in-container TCP probe as integration-postgres-source (the
+          # postgis/pgvector images reuse the official postgres entrypoint,
+          # first-init unix-socket-only phase included).
+          for i in $(seq 1 60); do
+            if docker exec bintrail-test-postgres pg_isready -h 127.0.0.1 -U postgres -d pgtest --quiet 2>/dev/null; then
+              echo "PostgreSQL source is ready."; exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready in time" >&2
+          docker logs bintrail-test-postgres >&2 || true
+          exit 1
+
+      - name: Extension-type round-trip test (${{ matrix.ext }})
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
+        run: |
+          set -o pipefail
+          go test -tags=integration -race -p 1 -count=1 -v \
+            -run 'TestOne_PGExtensionTypeRoundTripMatrix' ./internal/pgstreamrun/ 2>&1 | tee /tmp/pgext-it.out
+          grep -q -- '--- PASS: TestOne_PGExtensionTypeRoundTripMatrix' /tmp/pgext-it.out \
+            || { echo "FATAL: PG extension-type round-trip test did not run — false-green tripwire" >&2; exit 1; }
+
   console-e2e:
     # Headless-Chrome regression guard for the console SPA: go test never
     # renders assets/*, so CSS/DOM/presentation bugs (invisible buttons, a

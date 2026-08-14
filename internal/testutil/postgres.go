@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -19,6 +20,25 @@ func PostgresDSN() string { return os.Getenv("BINTRAIL_TEST_PG_DSN") }
 // unset, so PG tests skip cleanly there. Mirrors MariaDBRequired.
 func PostgresRequired() bool {
 	return os.Getenv("BINTRAIL_REQUIRE_POSTGRES") == "1"
+}
+
+// RequiredPGExtensions returns the set of PostgreSQL extensions the
+// extension-type integration tests must exercise, from the comma-separated
+// BINTRAIL_REQUIRE_PGEXT (e.g. "postgis" or "vector"). When an extension named
+// here cannot be created in the test database, the extension-type round-trip
+// test FAILS instead of skipping its cases: the dedicated CI cells run images
+// that guarantee the extension (postgis/postgis, pgvector/pgvector), so an
+// unavailable extension there is a misconfiguration to surface loudly, not a
+// green-via-skip. Cells without the env var (the plain postgres matrix) skip
+// the extension cases cleanly. Mirrors PostgresRequired / MariaDBRequired.
+func RequiredPGExtensions() map[string]bool {
+	req := map[string]bool{}
+	for _, e := range strings.Split(os.Getenv("BINTRAIL_REQUIRE_PGEXT"), ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			req[e] = true
+		}
+	}
+	return req
 }
 
 // SkipIfNoPostgres skips the test unless BINTRAIL_TEST_PG_DSN is set, and returns

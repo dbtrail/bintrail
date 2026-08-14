@@ -1061,6 +1061,7 @@ func TestOne_PGTypeRoundTripMatrix(t *testing.T) {
 			_, _ = pg.Exec(bg, "DROP TABLE IF EXISTS "+tblOf(c.name))
 		}
 		_, _ = pg.Exec(bg, "DROP TYPE IF EXISTS mood")
+		_, _ = pg.Exec(bg, "DROP TYPE IF EXISTS pgt_pair")
 		_, _ = pg.Exec(bg, "SELECT pg_drop_replication_slot($1) WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)", slot)
 	}
 	dropAll()
@@ -1073,6 +1074,7 @@ func TestOne_PGTypeRoundTripMatrix(t *testing.T) {
 		}
 	}
 	mustExec("CREATE TYPE mood AS ENUM ('happy','sad')")
+	mustExec("CREATE TYPE pgt_pair AS (a int, b text)")
 	tbls := make([]string, len(cases))
 	for i, c := range cases {
 		tbl := tblOf(c.name)
