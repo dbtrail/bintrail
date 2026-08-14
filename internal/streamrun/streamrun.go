@@ -849,28 +849,17 @@ func resolveStartForFlavor(
 			"provide --start-file or --start-gtid to begin streaming")
 }
 
-// resolveStartWithAutoDiscover wraps resolveStart with an auto-discover
-// fallback for the first-run, no-flags case. When neither --start-file nor
-// --start-gtid is set AND no checkpoint exists yet, the provided autoDiscover
-// callback is invoked to query the source's current binlog position (matching
-// the behavior of `bintrail agent` BYOS mode). The callback is typically
-// config.CurrentBinlogPosition(sourceDB).
+// resolveStartWithAutoDiscoverForFlavor wraps resolveStartForFlavor with an
+// auto-discover fallback for the first-run, no-flags case. When neither
+// --start-file nor --start-gtid is set AND no checkpoint exists yet, the
+// provided callbacks are invoked to query the source's current coordinates
+// (matching the behavior of `bintrail agent` BYOS mode); they are typically
+// config.CurrentGTIDExecuted / config.CurrentBinlogPosition over sourceDB, and
+// exist as callbacks so the discovery side-effect can be unit-tested without a
+// real *sql.DB.
 //
 // All other paths (saved checkpoint, explicit flags, mutually-exclusive flags,
-// invalid GTID, etc.) delegate to resolveStart unchanged. The wrapper exists
-// so the discovery side-effect can be unit-tested without a real *sql.DB —
-// callers pass a stub function.
-func resolveStartWithAutoDiscover(
-	startFile, startGTID string, startPos uint32,
-	saved *streamState,
-	autoDiscover func() (string, uint32, error),
-	gtidAutoDiscover func() (string, error),
-) (mode, file, gtidStr string, pos uint32, accGTID gomysql.GTIDSet, err error) {
-	return resolveStartWithAutoDiscoverForFlavor(startFile, startGTID, startPos, saved, gomysql.MySQLFlavor, autoDiscover, gtidAutoDiscover)
-}
-
-// resolveStartWithAutoDiscoverForFlavor is the flavor-aware variant of
-// resolveStartWithAutoDiscover; see that function for the contract. flavor is
+// invalid GTID, etc.) delegate to resolveStartForFlavor unchanged. flavor is
 // threaded into resolveStartForFlavor so saved/flag GTID sets parse with the
 // right flavor.
 //

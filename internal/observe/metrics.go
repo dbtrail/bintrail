@@ -133,6 +133,23 @@ var (
 		Name:      "statement_dml_dropped_total",
 		Help:      "DML statements seen in the binlog under STATEMENT/MIXED format (or a session override) — changes bintrail could not capture as row events.",
 	})
+
+	// unhandledRowsDropped counts ROWS carried by a binlog row event whose type
+	// handleRows does not decode — the warn-and-skip default arm shared by the
+	// file and stream parsers. Each such row is a change bintrail could NOT
+	// capture; the sibling of statementDMLDropped above for the row-event side
+	// of the capture boundary.
+	//
+	// Same shape as its sibling, for the same reasons: top-level (no "stream"
+	// subsystem, no "source" label — the parser has no source handle to curry)
+	// and no schema/table labels (the documented stance in observability.md:
+	// per-table label sets grow as tables come and go). The paired warn carries
+	// file/pos, schema.table and the raw event type as the disambiguator.
+	unhandledRowsDropped = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "bintrail",
+		Name:      "unhandled_rows_dropped_total",
+		Help:      "Rows carried by binlog row events of a type bintrail does not decode — changes dropped at capture, never indexed.",
+	})
 )
 
 // StatementDMLDropped increments the statement-DML-dropped counter. Called from
@@ -140,6 +157,13 @@ var (
 // statement — not DDL, not transaction-control — is observed, i.e. the
 // row-capture invariant (binlog_format=ROW) has been violated at the source.
 func StatementDMLDropped() { statementDMLDropped.Inc() }
+
+// UnhandledRowsDropped adds n — the row count of one skipped event — to the
+// unhandled-rows-dropped counter. Called from handleRows' default arm (shared
+// by the file and stream parsers) when a RowsEvent arrives with a type bintrail
+// does not decode: the rows are dropped, so the operator needs a metric to
+// alert on, not just the paired warn.
+func UnhandledRowsDropped(n int) { unhandledRowsDropped.Add(float64(n)) }
 
 // StreamMetrics is the full set of stream metrics curried to one source
 // label — call sites keep the ergonomics of plain counters/gauges.

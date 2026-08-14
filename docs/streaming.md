@@ -343,7 +343,8 @@ When `--metrics-addr :9090` is set, a Prometheus HTTP endpoint starts at `/metri
 
 Every metric in the table above carries a `source` label so concurrent streams
 in one process stay distinguishable (the top-level
-`bintrail_statement_dml_dropped_total` counter is the exception — see
+`bintrail_statement_dml_dropped_total` and
+`bintrail_unhandled_rows_dropped_total` counters are the exception — see
 [observability.md](observability.md#capture-loss-bintrail_statement_dml_dropped_total)). For a standalone `bintrail stream` it is the server's resolved
 `bintrail_id` (`default` if unresolved); under `bintrail-console watch` it is the
 monitored entry's ID, and the **daemon** serves one `/metrics` endpoint covering

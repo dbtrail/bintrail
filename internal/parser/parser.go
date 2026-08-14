@@ -753,6 +753,7 @@ func handleRows(
 			"table", table,
 			"event_type", binlogEv.Header.EventType,
 			"rows_skipped", len(rowsEv.Rows))
+		observe.UnhandledRowsDropped(len(rowsEv.Rows))
 		skips.RecordSkip(SkipUnhandledRowEvent)
 	}
 

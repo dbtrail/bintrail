@@ -1285,14 +1285,14 @@ func TestGtidSetsEqual(t *testing.T) {
 	}
 }
 
-// ─── resolveStartWithAutoDiscover ────────────────────────────────────────────
+// ─── resolveStartWithAutoDiscoverForFlavor ────────────────────────────────────────────
 
 // TestResolveStartWithAutoDiscover_firesOnFirstRun verifies that the
 // auto-discover callback is invoked when saved is nil and no flags are set,
 // and that its result becomes the start position.
 func TestResolveStartWithAutoDiscover_firesOnFirstRun(t *testing.T) {
 	called := false
-	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, nil, gomysql.MySQLFlavor,
 		func() (string, uint32, error) {
 			called = true
 			return "mysql-bin.000042", 1234, nil
@@ -1313,7 +1313,7 @@ func TestResolveStartWithAutoDiscover_firesOnFirstRun(t *testing.T) {
 // explicit --start-file bypasses auto-discover (preserves operator override).
 func TestResolveStartWithAutoDiscover_skippedWhenFlagSet(t *testing.T) {
 	called := false
-	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("binlog.000001", "", 100, nil,
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscoverForFlavor("binlog.000001", "", 100, nil, gomysql.MySQLFlavor,
 		func() (string, uint32, error) {
 			called = true
 			return "should-not-be-used", 999, nil
@@ -1339,7 +1339,7 @@ func TestResolveStartWithAutoDiscover_skippedWhenFlagSet(t *testing.T) {
 func TestResolveStartWithAutoDiscover_skippedWhenGTIDFlagSet(t *testing.T) {
 	gtidSet := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5"
 	called := false
-	mode, _, returnedGTID, _, accGTID, err := resolveStartWithAutoDiscover("", gtidSet, 4, nil,
+	mode, _, returnedGTID, _, accGTID, err := resolveStartWithAutoDiscoverForFlavor("", gtidSet, 4, nil, gomysql.MySQLFlavor,
 		func() (string, uint32, error) {
 			called = true
 			return "should-not-be-used", 999, nil
@@ -1368,7 +1368,7 @@ func TestResolveStartWithAutoDiscover_skippedWhenSavedExists(t *testing.T) {
 		mode: "position", binlogFile: "saved.000007", binlogPos: 500,
 	}
 	called := false
-	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("", "", 4, saved,
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, saved, gomysql.MySQLFlavor,
 		func() (string, uint32, error) {
 			called = true
 			return "should-not-be-used", 999, nil
@@ -1389,7 +1389,7 @@ func TestResolveStartWithAutoDiscover_skippedWhenSavedExists(t *testing.T) {
 // that when no callback is wired and no flags/saved exist, the original
 // "no start position" error still surfaces (back-compat).
 func TestResolveStartWithAutoDiscover_nilCallbackPreservesOriginalError(t *testing.T) {
-	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil, nil, nil)
+	_, _, _, _, _, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, nil, gomysql.MySQLFlavor, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when nil callback and no flags/saved, got nil")
 	}
@@ -1402,7 +1402,7 @@ func TestResolveStartWithAutoDiscover_nilCallbackPreservesOriginalError(t *testi
 // auto-discover failure is surfaced (wrapped) rather than silently masked.
 func TestResolveStartWithAutoDiscover_discoveryErrorWrapped(t *testing.T) {
 	stubErr := errors.New("SHOW BINARY LOG STATUS returned no rows")
-	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+	_, _, _, _, _, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, nil, gomysql.MySQLFlavor,
 		func() (string, uint32, error) {
 			return "", 0, stubErr
 		}, nil)
@@ -1422,7 +1422,7 @@ func TestResolveStartWithAutoDiscover_discoveryErrorWrapped(t *testing.T) {
 // auto-discover instead.
 func TestResolveStartWithAutoDiscover_mutuallyExclusiveFlagsErrorPropagates(t *testing.T) {
 	called := false
-	_, _, _, _, _, err := resolveStartWithAutoDiscover("binlog.000001", "uuid:1", 4, nil,
+	_, _, _, _, _, err := resolveStartWithAutoDiscoverForFlavor("binlog.000001", "uuid:1", 4, nil, gomysql.MySQLFlavor,
 		func() (string, uint32, error) {
 			called = true
 			return "", 0, nil
@@ -1456,7 +1456,7 @@ func gtidDiscoverMustNotBeCalled(t *testing.T) func() (string, error) {
 func TestResolveStartWithAutoDiscover_gtidDiscoveredSelectsGTIDMode(t *testing.T) {
 	const set = "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-77"
 	posCalled := false
-	mode, file, gtidStr, _, accGTID, err := resolveStartWithAutoDiscover("", "", 4, nil,
+	mode, file, gtidStr, _, accGTID, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, nil, gomysql.MySQLFlavor,
 		func() (string, uint32, error) {
 			posCalled = true
 			return "should-not-be-used", 999, nil
@@ -1489,7 +1489,7 @@ func TestResolveStartWithAutoDiscover_gtidDiscoveredSelectsGTIDMode(t *testing.T
 // instead of "starting from now".
 func TestResolveStartWithAutoDiscover_gtidEmptyFallsBackToPosition(t *testing.T) {
 	gtidCalled := false
-	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, nil, gomysql.MySQLFlavor,
 		func() (string, uint32, error) { return "mysql-bin.000042", 1234, nil },
 		func() (string, error) {
 			gtidCalled = true
@@ -1514,7 +1514,7 @@ func TestResolveStartWithAutoDiscover_gtidEmptyFallsBackToPosition(t *testing.T)
 func TestResolveStartWithAutoDiscover_gtidErrorIsFatal(t *testing.T) {
 	stubErr := errors.New("SELECT @@GLOBAL.gtid_mode: connection reset")
 	posCalled := false
-	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+	_, _, _, _, _, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, nil, gomysql.MySQLFlavor,
 		func() (string, uint32, error) {
 			posCalled = true
 			return "mysql-bin.000042", 1234, nil
@@ -1538,7 +1538,7 @@ func TestResolveStartWithAutoDiscover_gtidErrorIsFatal(t *testing.T) {
 // discovered set the flavor parser rejects fails loud instead of degrading to
 // position mode.
 func TestResolveStartWithAutoDiscover_gtidUnparseableIsFatal(t *testing.T) {
-	_, _, _, _, _, err := resolveStartWithAutoDiscover("", "", 4, nil,
+	_, _, _, _, _, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, nil, gomysql.MySQLFlavor,
 		func() (string, uint32, error) { return "mysql-bin.000042", 1234, nil },
 		func() (string, error) { return "not-a-gtid-set", nil })
 	if err == nil {
@@ -1572,7 +1572,7 @@ func TestResolveStartWithAutoDiscoverForFlavor_mariadbSkipsGTIDDiscovery(t *test
 // re-discover.
 func TestResolveStartWithAutoDiscover_gtidSkippedWhenSavedExists(t *testing.T) {
 	saved := &streamState{mode: "position", binlogFile: "saved.000007", binlogPos: 500}
-	mode, file, _, pos, _, err := resolveStartWithAutoDiscover("", "", 4, saved,
+	mode, file, _, pos, _, err := resolveStartWithAutoDiscoverForFlavor("", "", 4, saved, gomysql.MySQLFlavor,
 		func() (string, uint32, error) {
 			t.Error("position auto-discover must not be called with a saved checkpoint")
 			return "", 0, nil

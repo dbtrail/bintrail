@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
 )
@@ -177,6 +178,24 @@ func TestFormatGTID_anonymousEvent(t *testing.T) {
 // through to `return nil`, dropping every row with no trace (a silent data-loss
 // class). The guarantee is that unrecognized row events are never dropped
 // silently.
+// readUnhandledRowsDropped reads bintrail_unhandled_rows_dropped_total from the
+// default Prometheus registry. It is a process-global singleton other tests may
+// touch, so callers assert before/after deltas, never absolute values (same
+// pattern as readStatementDMLDropped in skips_test.go).
+func readUnhandledRowsDropped(t *testing.T) float64 {
+	t.Helper()
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == "bintrail_unhandled_rows_dropped_total" {
+			return mf.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+	return 0
+}
+
 func TestHandleRows_unhandledEventTypeLogsNotSilent(t *testing.T) {
 	tm := &metadata.TableMeta{
 		Schema:    "shop",
@@ -207,6 +226,7 @@ func TestHandleRows_unhandledEventTypeLogsNotSilent(t *testing.T) {
 	rowsEv := binlogEv.Event.(*replication.RowsEvent)
 
 	out := make(chan Event, 4)
+	before := readUnhandledRowsDropped(t)
 	if err := handleRows(context.Background(), logger, resolver, &Filters{}, binlogEv, rowsEv, "mariadb-bin.000001", "0-1-1", 0, 0, "", 1, emitTo(out), nil, nil); err != nil {
 		t.Fatalf("handleRows: %v", err)
 	}
@@ -215,10 +235,15 @@ func TestHandleRows_unhandledEventTypeLogsNotSilent(t *testing.T) {
 	if !strings.Contains(strings.ToLower(logged), "unhandled") {
 		t.Errorf("expected a warn mentioning the unhandled row event type, got logs: %q", logged)
 	}
-	// The anti-silent-data-loss contract is two-part: the warn must quantify the
-	// drop (rows_skipped) and nothing may leak onto the output channel.
+	// The anti-silent-data-loss contract is three-part: the warn must quantify
+	// the drop (rows_skipped), the drop must move the alertable counter (the
+	// fixture event carries exactly one row), and nothing may leak onto the
+	// output channel.
 	if !strings.Contains(logged, "rows_skipped") {
 		t.Errorf("expected rows_skipped count in the warn, got logs: %q", logged)
+	}
+	if got := readUnhandledRowsDropped(t); got != before+1 {
+		t.Errorf("bintrail_unhandled_rows_dropped_total moved %v -> %v, want +1 (one dropped row)", before, got)
 	}
 	if len(out) != 0 {
 		t.Errorf("unhandled event must emit no rows downstream, got %d", len(out))

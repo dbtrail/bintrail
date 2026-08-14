@@ -15,10 +15,11 @@ Under `bintrail-console watch` the daemon serves one `/metrics` endpoint for
 every monitored source; the per-source `source` label keeps them distinct.
 
 Every stream and index metric carries a `source` label (the supervisor's entry
-ID when monitored, else the resolved `bintrail_id`, or `default`). The one
-exception is the top-level capture-loss counter
-[`bintrail_statement_dml_dropped_total`](#capture-loss-bintrail_statement_dml_dropped_total),
-which has no `source` label.
+ID when monitored, else the resolved `bintrail_id`, or `default`). The
+exceptions are the top-level capture-loss counters
+[`bintrail_statement_dml_dropped_total` and
+`bintrail_unhandled_rows_dropped_total`](#capture-loss-bintrail_statement_dml_dropped_total),
+which have no `source` label.
 
 ## Stream metrics (`bintrail_stream_*`)
 
@@ -66,6 +67,7 @@ non-replication producer built — is **skipped**, never recorded as a
 | Metric | Type | Meaning |
 |---|---|---|
 | `bintrail_statement_dml_dropped_total` | counter | DML statements (INSERT/UPDATE/DELETE/REPLACE/LOAD DATA) seen in the binlog as SQL text instead of row events — the signature of `binlog_format=STATEMENT`/`MIXED` or a session-level override away from ROW. Each one is a change bintrail could **not** capture. |
+| `bintrail_unhandled_rows_dropped_total` | counter | Rows carried by a binlog row event of a type bintrail does not decode — skipped at capture, never indexed. Incremented **per dropped row** (one event can carry many rows). |
 
 **Nonzero means changes are being missed.** bintrail validates
 `binlog_format=ROW` at startup against the global value, but the variable is
@@ -74,12 +76,19 @@ The stream is not aborted — each dropped statement emits a loud warning
 (`statement-format DML in binlog — event NOT captured …`) plus one increment
 of this counter.
 
-This counter is deliberately **top-level**: it is not part of
-`bintrail_stream_*` and carries **no `source` label**, so under
-`bintrail-console watch` concurrent streams conflate into one counter. The
-paired warning carries the binlog file/position (and the statement type —
-never the SQL text, which embeds row values); use the log line to tell which
-source produced the drop.
+`bintrail_unhandled_rows_dropped_total` is the row-event sibling: rows carried
+by a binlog row event of a type bintrail does not decode are skipped with a
+loud warning (`unhandled row event type — rows skipped`) plus one counter
+increment per dropped row. Nonzero means row changes reached the parser but
+were never indexed.
+
+Both counters are deliberately **top-level**: they are not part of
+`bintrail_stream_*` and carry **no `source` label**, so under
+`bintrail-console watch` concurrent streams conflate into one counter each. The
+paired warning carries the binlog file/position (plus the statement type for
+the former — never the SQL text, which embeds row values — and the
+schema.table and raw event type for the latter); use the log line to tell
+which source produced the drop.
 
 ## Index metrics (`bintrail_index_*`)
 
@@ -126,11 +135,16 @@ bintrail_index_retention_horizon_seconds < 7 * 24 * 3600
 bintrail_index_gap_hours > 0
 ```
 
-**Changes slipping past capture** — statement-format DML the index will never
-contain (see [Capture loss](#capture-loss-bintrail_statement_dml_dropped_total)):
+**Changes slipping past capture** — statement-format DML, or rows from
+undecodable row events, that the index will never contain (see
+[Capture loss](#capture-loss-bintrail_statement_dml_dropped_total)):
 
 ```promql
 rate(bintrail_statement_dml_dropped_total[5m]) > 0
+```
+
+```promql
+rate(bintrail_unhandled_rows_dropped_total[5m]) > 0
 ```
 
 **Index disk growth** — MySQL index size trend, to project a disk-full date

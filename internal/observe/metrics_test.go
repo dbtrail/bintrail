@@ -119,3 +119,28 @@ func TestStatementDMLDropped(t *testing.T) {
 		t.Errorf("statement_dml_dropped_total = %v after two increments, want %v", got, before+2)
 	}
 }
+
+// TestUnhandledRowsDropped verifies the unhandled-row-event drop counter adds
+// the per-event ROW count (an unhandled event can carry many rows), rendered
+// under the exact top-level name alerts key off. Global-registry singleton, so
+// before/after delta like its statement-DML sibling.
+func TestUnhandledRowsDropped(t *testing.T) {
+	read := func() float64 {
+		mfs, err := prometheus.DefaultGatherer.Gather()
+		if err != nil {
+			t.Fatalf("Gather: %v", err)
+		}
+		for _, mf := range mfs {
+			if mf.GetName() == "bintrail_unhandled_rows_dropped_total" {
+				return mf.GetMetric()[0].GetCounter().GetValue()
+			}
+		}
+		return 0
+	}
+	before := read()
+	observe.UnhandledRowsDropped(3)
+	observe.UnhandledRowsDropped(1)
+	if got := read(); got != before+4 {
+		t.Errorf("unhandled_rows_dropped_total = %v after adding 3+1, want %v", got, before+4)
+	}
+}
