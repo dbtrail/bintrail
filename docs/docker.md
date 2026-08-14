@@ -172,6 +172,32 @@ Notes:
   building from a source checkout instead is a comment-toggle in the
   compose file (`build:` with `dockerfile: build/Dockerfile.bintrail-console`).
 
+### Metrics and the healthcheck
+
+The `bintrail` service serves the watch daemon's Prometheus endpoint at
+**http://127.0.0.1:9090/metrics** by default (host loopback only, same
+posture as the console): per-source stream metrics — every metric carries a
+`source` label — plus the `bintrail_index_*` gauges. The scrape config and
+alerting rules in [Deployment §7 Observability](deployment.md#7-observability)
+work against this endpoint as-is. A Prometheus running as a *container* on
+the same compose network scrapes `bintrail:9090` and needs no published
+port. Set `METRICS_ADDR=` (empty) in `.env` to disable the endpoint. It has
+no authentication — widen the port mapping beyond loopback only behind a
+firewall.
+
+The service also carries a Docker **healthcheck** probing the console's
+unauthenticated `GET /api/healthz`, so `docker compose ps` shows `(healthy)`
+for a live daemon and `(unhealthy)` for one whose HTTP loop has died. Two
+honest limits:
+
+- Plain Docker/Compose **does not restart** an unhealthy container —
+  `restart: unless-stopped` fires on process *exit* only. Swarm, Kubernetes,
+  Podman's `--health-on-failure=restart`, or an autoheal sidecar are the
+  pieces that act on health status; whether to run one is your call.
+- A wedged capture *stream* behind a live HTTP loop passes this probe.
+  Detect that with the stream-lag/error alerting rules on the metrics
+  endpoint above, or `bintrail status --fail-on-gap` from cron.
+
 ### The bundled index MySQL 8.4
 
 The bundled index is **MySQL 8.4 LTS**, pinned to an exact minor tag. The
@@ -460,6 +486,7 @@ surface, use the demo image ([demo.md](./demo.md)).
 | `INDEX_DSN` | compose (optional) | Bring-your-own index MySQL (default: the bundled container) |
 | `SCHEMAS` | compose (optional) | Comma-separated schemas to track (empty = all user schemas) |
 | `CONSOLE_TOKEN` | compose (optional) | Opt-in static API-automation token (default: none — humans sign in with the console password) |
+| `METRICS_ADDR` | compose (optional) | Container-side bind for the watch daemon's Prometheus `/metrics` (default `:9090`, published on the host loopback as `127.0.0.1:9090`; set empty to disable) |
 | `INDEX_MYSQL_ROOT_PASSWORD` | compose (optional) | Pin the bundled index root password (set *before* first boot; default: randomly generated into the `bintrail-index-secret` volume) |
 | `BINTRAIL_TAG` | compose (optional) | Image tag to run (default `latest`) |
 | `BASELINE_SOURCE_DSN` | compose `baseline` profile | Source MySQL to snapshot (default: `SOURCE_DSN`) |

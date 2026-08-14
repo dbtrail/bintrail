@@ -312,6 +312,13 @@ After the first successful checkpoint, restart without `--start-gtid` — the po
 
 ## 7. Observability
 
+The metrics endpoint is opt-in for a standalone binary — pass
+`--metrics-addr :9090` (env `BINTRAIL_METRICS_ADDR`) to `bintrail stream` or
+`bintrail-console watch`. The [compose quickstart](docker.md#docker-compose)
+serves it out of the box on the host loopback (`127.0.0.1:9090`; a Prometheus
+container on the same compose network scrapes `bintrail:9090`), so the scrape
+config and alerting rules below apply to it unchanged.
+
 ### Prometheus scrape config
 
 ```yaml

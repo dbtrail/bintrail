@@ -216,6 +216,14 @@ services:
       # off-loopback setup is refused), THEN change to "8090:8090", ideally
       # behind TLS or a TLS-terminating proxy.
       - "127.0.0.1:8090:8090"
+      # Prometheus /metrics on the host loopback (the daemon serves it because
+      # of BINTRAIL_METRICS_ADDR below). A host-run Prometheus scrapes
+      # 127.0.0.1:9090; a Prometheus CONTAINER on this compose network scrapes
+      # bintrail:9090 and does not need this mapping. /metrics has no auth —
+      # widen to "9090:9090" only behind a firewall (docs/deployment.md §7).
+      # If you disable metrics (METRICS_ADDR= empty in .env) this mapping stays
+      # but nothing listens behind it — connections are simply refused.
+      - "127.0.0.1:9090:9090"
     environment:
       # Optional: a source MySQL to start watching immediately. Leave unset
       # and add servers from the console UI instead (the zero-config path).
@@ -229,6 +237,13 @@ services:
       # The console binds all interfaces INSIDE the container; the `ports`
       # mapping above is what controls actual exposure on the host.
       BINTRAIL_CONSOLE_LISTEN: 0.0.0.0:8090
+      # Prometheus metrics for the watch daemon: stream lag/error counters for
+      # every supervised source plus the bintrail_index_* gauges (all metrics
+      # carry a "source" label). deployment.md §7 ships scrape config and
+      # alerting rules against this endpoint. On by default so the shipped
+      # stack is observable out of the box; set METRICS_ADDR= (empty) in .env
+      # to disable. The `ports` mapping above controls actual host exposure.
+      BINTRAIL_METRICS_ADDR: ${METRICS_ADDR-:9090}
       BINTRAIL_CONSOLE_TOKEN: ${CONSOLE_TOKEN:-}
       # Saved console connections persist across container recreations.
       BINTRAIL_CONSOLE_SERVERS: /var/lib/bintrail/console-servers.yaml
@@ -340,6 +355,25 @@ services:
           exec bintrail-console watch --source-dsn "$$SOURCE_DSN" --index-dsn "$$INDEX_DSN"
         fi
         exec bintrail-console watch --index-dsn "$$INDEX_DSN"
+    # Liveness probe against the console's unauthenticated GET /api/healthz
+    # (wget ships in the image). It detects a daemon whose HTTP loop is dead
+    # (deadlock, wedged event loop) and surfaces health in `docker ps` and to
+    # anything that acts on Docker health status. HONEST LIMITS: (1) plain
+    # Docker/Compose only auto-restarts on process EXIT — an `unhealthy`
+    # container is marked, not restarted (Swarm, Kubernetes, Podman
+    # --health-on-failure, or an autoheal sidecar are the pieces that act on
+    # it; running one is the operator's call); (2) a capture STALL with a live
+    # HTTP loop (e.g. source unreachable mid-gap-fill) passes this probe — for
+    # that, alert on the /metrics endpoint above (stream lag/error rules in
+    # docs/deployment.md §7) or run `bintrail status --fail-on-gap` from cron.
+    # start_period covers the doctor preflight + init + schema snapshot a
+    # SOURCE_DSN boot runs before the console binds.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 5 -O /dev/null http://127.0.0.1:8090/api/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     depends_on:
       index-mysql:
         condition: service_healthy
@@ -453,9 +487,10 @@ services:
         condition: service_healthy
       # The shim only reads the index; the `bintrail` service is what creates
       # the tables and streams the boot SOURCE_DSN source into bintrail_index.
-      # Depend on it so `up -d shim` can't start against an unprovisioned index.
+      # Depend on its HEALTH (the daemon answering, not just the process
+      # started) so `up -d shim` can't start against an unprovisioned index.
       bintrail:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
 
   # ── Baselines (one-shot, opt-in `baseline` profile) ──────
