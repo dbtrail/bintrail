@@ -96,7 +96,8 @@ tar xzf bintrail_X.Y.Z_*.tar.gz
 sudo install bintrail /usr/local/bin/bintrail
 ```
 
-Every release also ships `checksums.txt` and a cosign signature — verify
+Every release also ships `checksums.txt`, a cosign signature, and per-artifact
+SPDX SBOMs (`*.sbom.json`, tarballs and `.deb`/`.rpm` alike) — verify
 before installing on anything you don't trust the download channel for.
 `bintrail-console` and `bintrail-pg` are separate `.deb`/`.rpm` packages and
 separate tarball archives; upgrade each you have installed.

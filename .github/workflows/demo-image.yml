@@ -103,12 +103,19 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           # Push by digest only (no tag here); the merge job applies tags.
-          # No provenance attestation: it would add per-platform attestation
-          # manifests to the index; the manifest list already carries both
-          # arches so a host resolves its native entry directly. Integrity
-          # comes from the cosign signature on the merged index.
+          # SBOM + provenance attestations (#976): each per-arch push becomes
+          # a small OCI index — the arch image plus BuildKit attestation
+          # manifests (platform "unknown/unknown"). `docker run` resolves the
+          # native-arch image from that index, so the smoke job still boots
+          # the exact pushed bytes via this digest, and `imagetools create`
+          # in the merge job folds the per-arch entries — attestations
+          # included — into the final manifest list (Docker's documented
+          # multi-runner pattern). mode=min keeps build args and env out of
+          # the provenance statement. The cosign signature on the merged
+          # index (merge job) remains the integrity anchor.
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          provenance: false
+          provenance: mode=min
+          sbom: true
 
       - name: Export digest
         env:
@@ -266,6 +273,9 @@ jobs:
           # arches. A partial build (one matrix leg's digest missing) would
           # otherwise tag+sign a single-arch manifest green — exactly the
           # regression this image's multi-arch support exists to prevent.
+          # BuildKit SBOM/provenance attestation manifests also appear here
+          # as "unknown/unknown" entries (#976) — expected; the check below
+          # only requires the two real arches to be present.
           PLATFORMS=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
             --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')
           echo "manifest platforms: ${PLATFORMS}"

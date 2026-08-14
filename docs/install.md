@@ -118,8 +118,8 @@ docker pull ghcr.io/dbtrail/bintrail:latest
 docker run --rm ghcr.io/dbtrail/bintrail:latest --version
 ```
 
-Multi-arch (`linux/amd64` + `linux/arm64`), signed with cosign, SBOM attached
-to every release. The image bundles both `bintrail` and `bintrail-mcp`; the
+Multi-arch (`linux/amd64` + `linux/arm64`), signed with cosign, with
+per-architecture SPDX SBOMs attached to the image as cosign attestations. The image bundles both `bintrail` and `bintrail-mcp`; the
 web console ships as its own image, `ghcr.io/dbtrail/bintrail-console`
 (`serve` = read-only console, `watch` = stream + console daemon — what the
 Compose stack runs). The PostgreSQL-source binary ships as its own image,
@@ -140,7 +140,9 @@ sudo dpkg -i bintrail_*_linux_amd64.deb
 sudo rpm -i bintrail_VERSION_linux_amd64.rpm
 ```
 
-(Replace `VERSION` with the release version; `checksums.txt` is cosign-signed.)
+(Replace `VERSION` with the release version; `checksums.txt` is cosign-signed.
+Each `.deb`/`.rpm`, like each tarball, has a syft SPDX SBOM sidecar —
+`<artifact>.sbom.json` — attached to the release.)
 
 The `bintrail` package carries the core CLI + `bintrail-mcp`; the web console
 is a separate `bintrail-console` package — install it only where an operator

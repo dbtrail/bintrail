@@ -56,7 +56,36 @@ cosign verify ghcr.io/dbtrail/bintrail:latest \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```
 
-An SBOM is attached to each release archive on the GitHub Releases page.
+Every image also carries per-architecture SPDX SBOMs, attached as cosign
+attestations under the same keyless OIDC identity — the input a CVE scanner
+needs to answer "are we affected?" for the statically linked dependencies
+(DuckDB, Arrow, the AWS SDK, …). Verify, and optionally extract, them:
+
+```sh
+# Verify the SBOM attestations (works against :latest, a version tag, or a digest)
+cosign verify-attestation ghcr.io/dbtrail/bintrail:latest \
+  --type spdxjson \
+  --certificate-identity-regexp "https://github.com/dbtrail/dbtrail/.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+# Extract the raw SPDX documents (one per architecture)
+cosign download attestation ghcr.io/dbtrail/bintrail:latest \
+  | jq -r '.payload | @base64d | fromjson | .predicate'
+```
+
+The same applies to `bintrail-console` and `bintrail-pg`. (You can also scan
+an image directly — `syft ghcr.io/dbtrail/bintrail:latest` or `docker scout
+sbom` — without trusting our attestation.) SBOM files for the release
+tarballs **and** the `.deb`/`.rpm` packages (`<artifact>.sbom.json`) are
+attached to each release on the GitHub Releases page.
+
+The demo image (`bintrail-demo`) embeds its SBOM and provenance as BuildKit
+attestations in the image index instead — read them with:
+
+```sh
+docker buildx imagetools inspect ghcr.io/dbtrail/bintrail-demo:latest \
+  --format '{{ json .SBOM }}'
+```
 
 > **Just evaluating?** `ghcr.io/dbtrail/bintrail-demo` is a zero-setup,
 > single-container demo (MySQL + dbtrail + ProxySQL + traffic generator,
