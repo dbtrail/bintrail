@@ -26,8 +26,8 @@ never from a CDN. The console makes zero external requests by design, so the
 
 Provenance: downloaded from Google Fonts' static woff2 endpoints
 (`fonts.gstatic.com`, latin unicode-range files), then further subset with
-fonttools `pyftsubset` (`--flavor=woff2 --layout-features='*'`) to basic latin
-plus common punctuation:
+fonttools `pyftsubset` (`--flavor=woff2 --layout-features='*'
+--name-IDs='*'`) to basic latin plus common punctuation:
 
 ```
 U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+2013-2014, U+2018-2019,
@@ -48,8 +48,42 @@ by themselves. Copyright holders:
   (<https://github.com/ateliertriay/bricolage>)
 - Geist — © 2023 Vercel, in collaboration with basement.studio
   (<https://github.com/vercel/geist-font>)
-- IBM Plex Mono — © 2017 IBM Corp. (<https://github.com/IBM/plex>)
+- IBM Plex Mono — © 2017 IBM Corp. (<https://github.com/IBM/plex>),
+  with Reserved Font Name "Plex"
+
+### License metadata (OFL-1.1 §2) — do not regress
+
+OFL-1.1 §2 requires every distributed copy to carry both the copyright notice
+and the license, either as accompanying text or in machine-readable font
+metadata. Both paths are covered, and each has a CI pin:
+
+- **Accompanying text**: the full OFL-1.1 text plus the three copyright
+  notices above ship in the repo-root `THIRD-PARTY-NOTICES` (the manual
+  section, maintained in `scripts/notices-header.txt`), which rides in every
+  release artifact — tarballs, deb/rpm, and images. `scripts/check-notices.sh`
+  fails CI if the section goes missing.
+- **Font metadata**: every vendored woff2 carries name IDs 0 (copyright),
+  13 (license description) and 14 (license URL). The Google Fonts statics ship
+  with IDs 0 and 14 but no ID 13, and `pyftsubset`'s DEFAULT `--name-IDs`
+  keeps only IDs 0–6 — which is how the v0.55.0 files lost the license URL.
+  The pipeline therefore injects ID 13 before subsetting and subsets with
+  `--name-IDs='*'`. `scripts/check-font-licenses.sh` (`make check-fonts`)
+  fails CI if any font loses IDs 0/13/14.
+
+The ID-13 injection, run on each downloaded static before `pyftsubset`
+(fontTools, same venv):
+
+```python
+from fontTools.ttLib import TTFont
+f = TTFont("<downloaded-static>.woff2")
+url = f["name"].getDebugName(14)  # each family's own license URL
+f["name"].setName(
+    "This Font Software is licensed under the SIL Open Font License, "
+    f"Version 1.1. This license is available with a FAQ at: {url}",
+    13, 3, 1, 0x409)
+f.save("<downloaded-static>.with-license.woff2")
+```
 
 If any other third-party asset is ever added, list it here with its name,
-version, license, and source URL, and confirm its license permits
-redistribution.
+version, license, and source URL, confirm its license permits redistribution,
+and extend the notices header + guard scripts above to cover it.

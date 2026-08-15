@@ -11,7 +11,7 @@ MCP_LDFLAGS=-ldflags "-X main.mcpVersion=$(VERSION)"
 # bintrail-console and bintrail-pg both reuse BINTRAIL_LDFLAGS: they inject the
 # same main.Version/CommitSHA/BuildDate vars as the core binary.
 
-.PHONY: all build build-mcp build-console build-pg clean test console-e2e lint install build-all tidy deps notices check-notices mcpb validate-mcpb
+.PHONY: all build build-mcp build-console build-pg clean test console-e2e lint install build-all tidy deps notices check-notices check-fonts mcpb validate-mcpb
 
 all: build build-mcp build-console build-pg
 
@@ -104,3 +104,10 @@ notices:
 # `make notices` regeneration. Cheap — hashes `go list -m all`, no CGO build.
 check-notices:
 	bash scripts/check-notices.sh
+
+# CI guard for the OFL-1.1 metadata inside the vendored console fonts: every
+# woff2 under internal/console/assets/fonts must carry its copyright and
+# license name records (IDs 0/13/14). Needs python3 only; installs fonttools
+# into a throwaway venv.
+check-fonts:
+	bash scripts/check-font-licenses.sh

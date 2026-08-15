@@ -40,7 +40,27 @@ if [ "$want" != "$have" ]; then
   exit 1
 fi
 
+# Content pin for the manually-maintained OFL-1.1 web-fonts section (#1360).
+# The graph hash above cannot see it — the vendored console fonts are not Go
+# modules — and a regeneration reassembles the file from
+# scripts/notices-header.txt, so if that section were ever trimmed the marker
+# would stay valid while every artifact quietly stopped carrying the license
+# text OFL-1.1 §2 requires. Pin the section heading and each family's
+# copyright line in the ASSEMBLED file.
+while IFS= read -r needle; do
+  grep -qF "$needle" "$NOTICES" || fail "THIRD-PARTY-NOTICES lost its OFL-1.1 web-fonts section (missing: \"$needle\").
+Restore the section in scripts/notices-header.txt and run: make notices"
+done <<'NEEDLES'
+SIL OPEN FONT LICENSE
+Bricolage Grotesque
+Geist
+IBM Plex Mono
+Reserved Font Name "Plex"
+NEEDLES
+
 # Note: this only confirms the dependency GRAPH is unchanged since the notices
 # were generated; it does not re-hash the THIRD-PARTY-NOTICES body, so a manual
-# corruption of that file with an intact marker is not caught here.
+# corruption of that file with an intact marker is not caught here (beyond the
+# OFL needles pinned above).
 echo "dependency graph unchanged since THIRD-PARTY-NOTICES was generated."
+echo "OFL-1.1 web-fonts section present."

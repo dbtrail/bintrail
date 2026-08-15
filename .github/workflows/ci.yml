@@ -85,6 +85,13 @@ jobs:
       - name: THIRD-PARTY-NOTICES staleness check
         run: make check-notices
 
+      # OFL-1.1 metadata guard (#1360): every vendored console woff2 must
+      # carry its copyright + license name records (IDs 0/13/14) — the
+      # machine-readable half of OFL §2, which pyftsubset's default
+      # --name-IDs silently drops. python3-only; no Go build.
+      - name: Font license metadata check
+        run: make check-fonts
+
       - name: gofmt (warning-only)
         # The repo has pre-existing unformatted files; surface the list as a
         # warning but do not fail CI on it. Tighten to a hard fail once the

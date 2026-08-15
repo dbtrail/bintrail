@@ -89,6 +89,17 @@ find "$SAVE_DIR" -type f \
 # header + generated body → final file (single cat; not a rename).
 cat "$HEADER" "$BODY" >"$OUT"
 
+# The OFL-1.1 web-fonts section (the vendored console fonts, #1360) lives in
+# the MANUAL header — go-licenses cannot see it. A regeneration must never
+# publish a notices file without it; fail loudly if the header lost it.
+for needle in "SIL OPEN FONT LICENSE" "Bricolage Grotesque" "Geist" "IBM Plex Mono"; do
+  grep -qF "$needle" "$OUT" || {
+    echo "error: assembled THIRD-PARTY-NOTICES is missing the OFL-1.1 web-fonts section (missing: \"$needle\")." >&2
+    echo "Restore it in scripts/notices-header.txt before regenerating." >&2
+    exit 1
+  }
+done
+
 # Stamp the dependency-graph hash so the CI staleness guard can detect drift
 # without re-running the (slow, CGO) go-licenses pipeline. `go list -m all` is
 # deterministic and platform-independent (the module graph, not the build).
