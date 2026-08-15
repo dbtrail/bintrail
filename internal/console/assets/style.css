@@ -993,6 +993,59 @@ button { font-family: inherit; }
 .modal-foot { display: flex; gap: 10px; margin-top: 22px; align-items: center; }
 
 /* ============================================================
+   busy modal — Restore actions (#1363)
+   ============================================================ */
+/* Pure-CSS loading animation on the brand accent (--accent-a/--accent-b) —
+   the semantic insert/update/delete colors are data, never decoration.
+   Reduced-motion rule mirrors the #1353 event skeletons: the animation only
+   exists under no-preference; otherwise the static .busy-static note shows. */
+.busy-modal { max-width: 480px; text-align: center; }
+.busy-modal .modal-title { margin-bottom: 0; }
+.busy-anim { display: none; gap: 11px; justify-content: center; padding: 22px 0 4px; }
+.busy-anim span {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+}
+.busy-static { display: block; color: var(--ink-2); font-size: 13.5px; margin: 16px 0 4px; }
+@media (prefers-reduced-motion: no-preference) {
+  .busy-anim { display: flex; }
+  .busy-anim span { animation: busypulse 1.05s ease-in-out infinite; }
+  .busy-anim span:nth-child(2) { animation-delay: .15s; }
+  .busy-anim span:nth-child(3) { animation-delay: .3s; }
+  .busy-static { display: none; }
+}
+@keyframes busypulse { 0%, 100% { transform: scale(.62); opacity: .4; } 50% { transform: none; opacity: 1; } }
+.busy-facts { margin: 14px auto 0; max-width: 340px; display: flex; flex-direction: column; gap: 6px; }
+.busy-fact { display: flex; gap: 14px; justify-content: space-between; align-items: baseline; }
+.busy-fact .bf-k {
+  color: var(--ink-3); font-family: var(--f-mono); font-size: 11px;
+  font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+}
+.busy-fact .bf-v {
+  color: var(--ink); font-family: var(--f-mono); font-size: 12.5px;
+  word-break: break-all; text-align: right;
+}
+.busy-note { color: var(--ink-3); font-size: 12.5px; margin: 16px auto 0; max-width: 40ch; }
+/* Error state: the modal never silently vanishes — it re-renders as the
+   error surface, with the working chrome hidden and Cancel become Dismiss. */
+.busy-modal.busy-failed .busy-anim,
+.busy-modal.busy-failed .busy-static,
+.busy-modal.busy-failed .busy-note { display: none; }
+.busy-error {
+  margin: 16px 0 0; padding: 12px 14px; text-align: left;
+  background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.busy-error-title { margin: 0 0 6px; font-weight: 600; font-size: 13.5px; color: var(--ink); }
+.busy-error-msg { margin: 0; font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere; }
+.busy-modal .modal-foot { justify-content: center; }
+/* Focus landing for the generated reversal.sql panel header (#1363). */
+.code-head:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* table combobox busy hint (#1364) */
+.combo-hint { display: block; margin-top: 4px; font-size: 11.5px; color: var(--ink-3); min-height: 15px; }
+
+/* ============================================================
    tweaks panel (vanilla)
    ============================================================ */
 #tweaks {

@@ -1404,6 +1404,276 @@ try {
     ? ok("storage: baseline_trigger off → no button even with a destination")
     : bad("storage: baseline_trigger off → no button even with a destination", JSON.stringify(gates));
 
+  // Scenario 16 — Restore Table combobox (#1364). The Table field must be an
+  // input + datalist fed from /api/schemas?schema=… (the same endpoint the
+  // events table picker consumes): suggestions from the fixture's tables,
+  // swapped on a schema switch, a stale value cleared on switch — and still
+  // free text, because recover legitimately targets dropped tables whose
+  // events are indexed (that half is pinned in scenario 17's typed-submit leg).
+  await page.evaluate(() => navigate("recover"));
+  await page.waitForSelector("#recover-form", { timeout: 8000 });
+  await page.waitForFunction((FIX) => {
+    const f = document.getElementById("recover-form");
+    return f && Array.from(f.elements.schema.options).some((o) => o.value === FIX);
+  }, FIX, { timeout: 8000 });
+  const combo = await page.evaluate(async (FIX) => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const f = document.getElementById("recover-form");
+    const input = f.elements.table;
+    const listId = input.getAttribute("list");
+    const dl = listId ? document.getElementById(listId) : null;
+    const read = () => (dl ? Array.from(dl.options).map((o) => o.value).sort() : []);
+    // Select the fixture schema through the REAL change path (what a user does).
+    f.elements.schema.value = FIX;
+    f.elements.schema.dispatchEvent(new Event("change"));
+    for (let i = 0; i < 80 && !read().length; i++) await sleep(50);
+    const tablesA = read();
+    // A value from the old schema, then a switch: suggestions must swap and
+    // the stale value must clear (never silently kept under the new schema).
+    input.value = "orders";
+    f.elements.schema.value = "e2estock";
+    f.elements.schema.dispatchEvent(new Event("change"));
+    for (let i = 0; i < 80 && (!read().length || read().join() === tablesA.join()); i++) await sleep(50);
+    const tablesB = read();
+    const clearedOnSwitch = input.value === "";
+    // Back to the fixture schema for the scenarios below.
+    f.elements.schema.value = FIX;
+    f.elements.schema.dispatchEvent(new Event("change"));
+    for (let i = 0; i < 80 && read().join() !== tablesA.join(); i++) await sleep(50);
+    return {
+      isInput: input.tagName === "INPUT",
+      hasList: !!dl,
+      hasHint: !!f.querySelector(".combo-hint"),
+      disabled: input.disabled,
+      tablesA, tablesB, clearedOnSwitch,
+    };
+  }, FIX);
+  (combo.isInput && combo.hasList)
+    ? ok("restore combo: Table is an input+datalist combobox, not a closed select")
+    : bad("restore combo: Table is an input+datalist combobox, not a closed select", JSON.stringify(combo));
+  combo.tablesA.join(",") === "child,orders,parent"
+    ? ok("restore combo: selecting a schema populates suggestions from its listing")
+    : bad("restore combo: selecting a schema populates suggestions from its listing", JSON.stringify(combo.tablesA));
+  combo.tablesB.join(",") === "inventory"
+    ? ok("restore combo: switching schemas swaps the suggestions")
+    : bad("restore combo: switching schemas swaps the suggestions", JSON.stringify(combo.tablesB));
+  combo.clearedOnSwitch
+    ? ok("restore combo: a stale table value is cleared on schema switch")
+    : bad("restore combo: a stale table value is cleared on schema switch", "kept the previous schema's table");
+  (!combo.disabled && combo.hasHint)
+    ? ok("restore combo: the field stays a usable free-text input with a busy-hint slot")
+    : bad("restore combo: the field stays a usable free-text input with a busy-hint slot", JSON.stringify(combo));
+
+  // Scenario 17 — Generate-undo busy modal (#1363). A slowed /api/recover must
+  // open the modal immediately (dialog semantics, facts stated, button
+  // disabled), block a second click, close on completion with focus on the
+  // reversal.sql header; Cancel and ESC must abort the fetch and restore the
+  // pre-click state; an error must render IN the modal, then dismiss cleanly.
+  // The stub honors AbortController like real fetch — which also proves api()
+  // passes the signal through: if it dropped it, the abort never rejects and
+  // the cancel legs below fail visibly.
+  const busyRun = await page.evaluate(async (FIX) => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const f = document.getElementById("recover-form");
+    const genBtn = f.querySelector('button[type="submit"]');
+    const prevBtn = Array.from(f.querySelectorAll(".filter-actions button")).find((b) => b.textContent === "Preview rows");
+    const modalSel = () => document.querySelector("#modal .busy-modal");
+    const realFetch = window.fetch;
+    const calls = [];
+    let mode = "delay", delay = 800;
+    window.fetch = (p, o) => {
+      if (!(typeof p === "string" && p.startsWith("/api/recover"))) return realFetch(p, o);
+      calls.push(o && o.body ? String(o.body) : "");
+      if (mode === "error") {
+        return Promise.resolve(new Response('{"error":"the index server went away mid-read — check the connection and retry"}',
+          { status: 500, headers: { "Content-Type": "application/json" } }));
+      }
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => resolve(realFetch(p, o)), delay);
+        if (o && o.signal) o.signal.addEventListener("abort", () => { clearTimeout(t); reject(new DOMException("Aborted", "AbortError")); });
+      });
+    };
+    try {
+      // A) slow generate: modal + facts + disabled button + second click inert.
+      f.elements.schema.value = FIX;
+      f.elements.table.value = "orders";
+      f.elements.pk.value = "1";
+      f.elements.since.value = ""; f.elements.until.value = "";
+      document.getElementById("recover-out").replaceChildren();
+      genBtn.focus(); genBtn.click();
+      await sleep(120);
+      const m = modalSel();
+      const open = {
+        present: !!m,
+        role: m ? m.getAttribute("role") : "",
+        busyAttr: m ? m.getAttribute("aria-busy") : "",
+        facts: m ? m.textContent : "",
+        btnDisabled: genBtn.disabled,
+        prevDisabled: prevBtn ? prevBtn.disabled : false,
+        focusInModal: m ? m.contains(document.activeElement) : false,
+      };
+      genBtn.click();    // disabled click — inert
+      f.requestSubmit(); // a keyboard/programmatic submit must hit the re-entry guard
+      await sleep(80);
+      const secondBlocked = calls.length === 1;
+      for (let i = 0; i < 100 && modalSel(); i++) await sleep(50);
+      const done = {
+        modalGone: !modalSel(),
+        panel: !!document.querySelector("#recover-out #sql-panel"),
+        calls: calls.length,
+        btnEnabled: !genBtn.disabled,
+        focusOnResult: !!document.activeElement && document.activeElement.classList.contains("code-head"),
+      };
+
+      // B) Cancel restores the pre-click state.
+      document.getElementById("recover-out").replaceChildren();
+      delay = 5000;
+      genBtn.focus(); genBtn.click();
+      await sleep(120);
+      const cbtn = Array.from((modalSel() || document.createElement("i")).querySelectorAll("button")).find((b) => b.textContent === "Cancel");
+      if (cbtn) cbtn.click();
+      await sleep(150);
+      const afterCancel = {
+        modalGone: !modalSel(),
+        noPanel: !document.querySelector("#recover-out #sql-panel"),
+        btnEnabled: !genBtn.disabled,
+        focusBack: document.activeElement === genBtn,
+        calls: calls.length, // 2: the canceled call fired once, never retried
+      };
+
+      // B2) ESC aborts the same way.
+      genBtn.focus(); genBtn.click();
+      await sleep(120);
+      const escOpened = !!modalSel();
+      document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await sleep(150);
+      const afterEsc = { opened: escOpened, modalGone: !modalSel(), btnEnabled: !genBtn.disabled, noPanel: !document.querySelector("#recover-out #sql-panel") };
+
+      // C) an error renders IN the modal, then Dismiss returns to pre-click state.
+      mode = "error";
+      genBtn.focus(); genBtn.click();
+      await sleep(200);
+      const em = modalSel();
+      const errShown = {
+        stillOpen: !!em,
+        busyAttr: em ? em.getAttribute("aria-busy") : "",
+        text: em ? em.textContent : "",
+      };
+      const dismiss = em ? Array.from(em.querySelectorAll("button")).find((b) => b.textContent === "Dismiss") : null;
+      if (dismiss) dismiss.click();
+      await sleep(80);
+      const afterErr = { modalGone: !modalSel(), noPanel: !document.querySelector("#recover-out #sql-panel"), btnEnabled: !genBtn.disabled };
+
+      // D) a hand-typed table NOT in the listing still submits (#1364) and
+      // reaches the backend — dropped tables with indexed events are a
+      // legitimate recover target.
+      mode = "delay"; delay = 0;
+      f.elements.table.value = "vanished_tbl";
+      f.elements.pk.value = "";
+      genBtn.focus(); genBtn.click();
+      for (let i = 0; i < 100 && modalSel(); i++) await sleep(50);
+      const typed = {
+        submitted: calls.some((c) => c.includes('"table":"vanished_tbl"')),
+        panel: !!document.querySelector("#recover-out #sql-panel"),
+      };
+
+      // E) Preview rows adopts the same busy mechanism (same latency source).
+      window.fetch = (p, o) => {
+        if (!(typeof p === "string" && p.startsWith("/api/events"))) return realFetch(p, o);
+        return new Promise((resolve, reject) => {
+          const t = setTimeout(() => resolve(realFetch(p, o)), 700);
+          if (o && o.signal) o.signal.addEventListener("abort", () => { clearTimeout(t); reject(new DOMException("Aborted", "AbortError")); });
+        });
+      };
+      f.elements.table.value = "orders";
+      f.elements.pk.value = "1";
+      prevBtn.focus(); prevBtn.click();
+      await sleep(120);
+      const pm = modalSel();
+      const previewBusy = { modalOpen: !!pm, title: pm ? pm.textContent : "" };
+      for (let i = 0; i < 100 && modalSel(); i++) await sleep(50);
+      const previewDone = {
+        modalGone: !modalSel(),
+        rendered: !!document.querySelector("#recover-preview .events"),
+        btnEnabled: !prevBtn.disabled,
+      };
+      return { open, secondBlocked, done, afterCancel, afterEsc, errShown, afterErr, typed, previewBusy, previewDone };
+    } finally {
+      window.fetch = realFetch;
+    }
+  }, FIX);
+  (busyRun.open.present && busyRun.open.role === "dialog" && busyRun.open.busyAttr === "true")
+    ? ok("busy modal: opens immediately as an aria-busy dialog")
+    : bad("busy modal: opens immediately as an aria-busy dialog", JSON.stringify(busyRun.open));
+  (busyRun.open.facts.includes(FIX + ".orders") && /pk/.test(busyRun.open.facts))
+    ? ok("busy modal: states what is being generated (target + pk)")
+    : bad("busy modal: states what is being generated (target + pk)", busyRun.open.facts.slice(0, 200));
+  (busyRun.open.btnDisabled && busyRun.open.prevDisabled)
+    ? ok("busy modal: the Restore action buttons are disabled while open")
+    : bad("busy modal: the Restore action buttons are disabled while open", JSON.stringify(busyRun.open));
+  busyRun.open.focusInModal
+    ? ok("busy modal: keyboard focus moves into the dialog")
+    : bad("busy modal: keyboard focus moves into the dialog", "focus stayed outside");
+  busyRun.secondBlocked
+    ? ok("busy modal: a second click/submit queues no second generation")
+    : bad("busy modal: a second click/submit queues no second generation", "a second /api/recover fired");
+  (busyRun.done.modalGone && busyRun.done.panel && busyRun.done.calls === 1)
+    ? ok("busy modal: closes on completion with the reversal panel rendered (one call total)")
+    : bad("busy modal: closes on completion with the reversal panel rendered (one call total)", JSON.stringify(busyRun.done));
+  (busyRun.done.btnEnabled && busyRun.done.focusOnResult)
+    ? ok("busy modal: success re-enables the button and focuses the reversal.sql header")
+    : bad("busy modal: success re-enables the button and focuses the reversal.sql header", JSON.stringify(busyRun.done));
+  (busyRun.afterCancel.modalGone && busyRun.afterCancel.noPanel && busyRun.afterCancel.btnEnabled && busyRun.afterCancel.calls === 2)
+    ? ok("busy modal: Cancel aborts the fetch and restores the pre-click state")
+    : bad("busy modal: Cancel aborts the fetch and restores the pre-click state", JSON.stringify(busyRun.afterCancel));
+  busyRun.afterCancel.focusBack
+    ? ok("busy modal: Cancel restores focus to the Generate button")
+    : bad("busy modal: Cancel restores focus to the Generate button", "focus elsewhere");
+  (busyRun.afterEsc.opened && busyRun.afterEsc.modalGone && busyRun.afterEsc.btnEnabled && busyRun.afterEsc.noPanel)
+    ? ok("busy modal: ESC aborts and restores like Cancel")
+    : bad("busy modal: ESC aborts and restores like Cancel", JSON.stringify(busyRun.afterEsc));
+  (busyRun.errShown.stillOpen && busyRun.errShown.busyAttr === "false" && /went away mid-read/.test(busyRun.errShown.text))
+    ? ok("busy modal: an error renders the server's actionable text IN the modal")
+    : bad("busy modal: an error renders the server's actionable text IN the modal", JSON.stringify(busyRun.errShown).slice(0, 300));
+  (busyRun.afterErr.modalGone && busyRun.afterErr.noPanel && busyRun.afterErr.btnEnabled)
+    ? ok("busy modal: Dismiss after an error returns to the pre-click state")
+    : bad("busy modal: Dismiss after an error returns to the pre-click state", JSON.stringify(busyRun.afterErr));
+  (busyRun.typed.submitted && busyRun.typed.panel)
+    ? ok("restore combo: a typed table not in the listing still submits end-to-end")
+    : bad("restore combo: a typed table not in the listing still submits end-to-end", JSON.stringify(busyRun.typed));
+  (busyRun.previewBusy.modalOpen && /Previewing affected rows/.test(busyRun.previewBusy.title))
+    ? ok("busy modal: Preview rows adopts the same busy affordance")
+    : bad("busy modal: Preview rows adopts the same busy affordance", JSON.stringify(busyRun.previewBusy).slice(0, 200));
+  (busyRun.previewDone.modalGone && busyRun.previewDone.rendered && busyRun.previewDone.btnEnabled)
+    ? ok("busy modal: preview closes on completion with the rows rendered")
+    : bad("busy modal: preview closes on completion with the rows rendered", JSON.stringify(busyRun.previewDone));
+
+  // Scenario 17b — the reduced-motion arm (#1363, same rule as the #1353
+  // skeletons): under prefers-reduced-motion the CSS animation is replaced by
+  // the static note; under no-preference the animation shows and the note
+  // hides. Driven through the REAL openRecoverBusy against emulated media.
+  const rmProbe = async () => page.evaluate(() => {
+    const busy = openRecoverBusy(document.getElementById("recover-form"),
+      { title: "probe", errTitle: "probe", facts: [], onCancel: () => {} });
+    const res = {
+      anim: getComputedStyle(document.querySelector("#modal .busy-anim")).display,
+      note: getComputedStyle(document.querySelector("#modal .busy-static")).display,
+    };
+    busy.close(false);
+    return res;
+  });
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  const rmOff = await rmProbe();
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const rmOn = await rmProbe();
+  await page.emulateMedia({ reducedMotion: null });
+  (rmOff.anim === "flex" && rmOff.note === "none")
+    ? ok("busy modal: animation renders under no-preference (static note hidden)")
+    : bad("busy modal: animation renders under no-preference (static note hidden)", JSON.stringify(rmOff));
+  (rmOn.anim === "none" && rmOn.note === "block")
+    ? ok("busy modal: prefers-reduced-motion collapses the animation to the static note")
+    : bad("busy modal: prefers-reduced-motion collapses the animation to the static note", JSON.stringify(rmOn));
+
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
 } catch (err) {

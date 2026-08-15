@@ -174,6 +174,9 @@ async function api(path, opts = {}) {
     method: opts.method || "GET",
     headers,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
+    // AbortController support (#1363): callers that show a cancelable busy
+    // affordance pass a signal; an abort rejects with err.name "AbortError".
+    signal: opts.signal,
   });
   const text = await res.text();
   let data = null;
@@ -1310,6 +1313,23 @@ function fieldSelect(label, name, size, isSchema, isTable, options, anyLabel, re
     fieldLabel(label, required), sel);
 }
 
+// fieldTableCombo is an input + datalist combobox for a table name (#1364):
+// suggestions come from the selected schema's listing (loadTables fills the
+// datalist on schema change), but a hand-typed name still submits — recover
+// can legitimately target a dropped table whose events are indexed, and a
+// closed <select> would make that recovery impossible from the UI. The
+// combo-hint span is the brief busy note while a listing loads.
+let tableComboSeq = 0;
+function fieldTableCombo(label, name, size, placeholder) {
+  const listId = "table-combo-list-" + (++tableComboSeq);
+  return el("div", { class: "field field--" + size },
+    fieldLabel(label),
+    el("input", { class: "input table-combo", name, placeholder: placeholder || "",
+      list: listId, autocomplete: "off", spellcheck: "false" }),
+    el("datalist", { id: listId }),
+    el("span", { class: "combo-hint", "aria-live": "polite" }));
+}
+
 // ── date/time picker (calendar + clock) for Since/Until/At filter fields ────
 // event_timestamp round-trips through consoleTSFormat under the UTC location
 // config.Connect forces on every index-DB connection (internal/config), so
@@ -1865,7 +1885,10 @@ function renderRecover(params) {
   // Manual filter form
   const form = el("form", { class: "filters", id: "recover-form" });
   form.append(fieldSelect("Schema", "schema", "md", true, false, null, "— select —"));
-  form.append(fieldInput("Table", "table", "md", "orders"));
+  // Input + datalist, not a closed select (#1364): suggestions come from the
+  // selected schema, but recover legitimately targets dropped tables whose
+  // events are still indexed — a typed name must always submit.
+  form.append(fieldTableCombo("Table", "table", "md", "orders"));
   form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
   form.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
   form.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
@@ -1921,7 +1944,118 @@ function setSelectWhenReady(form, name, value, cb) {
   }, 50);
 }
 
+// ── busy modal for the Restore actions (#1363) ───────────────────────────────
+//
+// Generate-undo (and Preview, which sits on the same latency) used to give no
+// feedback until the fetch returned — seconds, when the window reaches
+// archived hours — so a user who suspected the click didn't register clicked
+// again and queued a second generation. The modal opens the moment the button
+// is clicked: it states what is being generated (the same facts as the blue
+// context banner), animates with pure-CSS keyframes on the brand accent
+// (never the semantic insert/update/delete colors — those are data, not
+// decoration), collapses to a static note under prefers-reduced-motion (the
+// #1353 skeleton rule), blocks re-entry while open, and Cancel/ESC abort the
+// in-flight fetch via AbortController. Errors render IN the modal with the
+// server's own actionable text — never a silently-vanished overlay.
+
+let recoverBusyOpen = false; // one click = one generation (re-entry guard)
+
+// recoverBusyFacts mirrors the context banner's facts: target, pk, window.
+function recoverBusyFacts(f) {
+  const facts = [];
+  facts.push(["target", f.schema ? f.schema + (f.table ? "." + f.table : "") : "(all schemas)"]);
+  if (f.pk) facts.push(["pk", f.pk]);
+  if (f.since) facts.push(["since", f.since + " UTC"]);
+  if (f.until) facts.push(["until", f.until + " UTC"]);
+  return facts;
+}
+
+// openRecoverBusy opens the busy dialog and disables the form's action
+// buttons until it closes. Returns {close(refocus), showError(err)}; Cancel
+// and ESC run opts.onCancel (the fetch abort) and restore focus to the
+// element that had it. Accessibility: role="dialog", aria-busy while working,
+// focus trapped inside, focus restored on cancel/dismiss.
+function openRecoverBusy(form, opts) {
+  recoverBusyOpen = true;
+  const mount = document.getElementById("modal");
+  const trigger = document.activeElement;
+  const actions = $all(".filter-actions button", form);
+  actions.forEach((b) => { b.disabled = true; });
+
+  const scrim = el("div", { class: "modal-scrim show" });
+  const panel = el("div", { class: "modal busy-modal", role: "dialog", "aria-label": opts.title, "aria-busy": "true" });
+  panel.append(el("div", { class: "modal-head" }, el("h2", { class: "modal-title", text: opts.title })));
+  const body = el("div", { class: "modal-body" });
+  body.append(el("div", { class: "busy-anim", "aria-hidden": "true" }, el("span"), el("span"), el("span")));
+  // The reduced-motion arm: CSS swaps the animation for this static note.
+  body.append(el("p", { class: "busy-static", text: "Working — this closes when the result is ready." }));
+  const facts = el("div", { class: "busy-facts" });
+  (opts.facts || []).forEach(([k, v]) => facts.append(el("div", { class: "busy-fact" },
+    el("span", { class: "bf-k", text: k }), el("span", { class: "bf-v", text: v }))));
+  body.append(facts);
+  body.append(el("p", { class: "busy-note", text:
+    "Reading indexed changes — a window that reaches archived hours can take a few seconds." }));
+  const foot = el("div", { class: "modal-foot" });
+  const cancelBtn = el("button", { class: "btn", type: "button", text: "Cancel", onclick: () => cancel() });
+  foot.append(cancelBtn);
+  body.append(foot);
+  panel.append(body);
+  scrim.append(panel);
+  clear(mount);
+  mount.append(scrim);
+  cancelBtn.focus();
+
+  let closed = false;
+  // Capture phase, so this runs BEFORE globalKeydown's generic #modal-emptying
+  // Escape handler — closing that way would leave the fetch in flight and the
+  // form's buttons disabled. Tab is trapped inside the dialog.
+  const onKey = (e) => {
+    if (closed) return;
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancel(); return; }
+    if (e.key !== "Tab") return;
+    const foci = $all("button, input, select, textarea, a[href]", panel).filter((n) => !n.disabled);
+    if (!foci.length) { e.preventDefault(); return; }
+    const first = foci[0], last = foci[foci.length - 1];
+    if (!panel.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+    else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
+  document.addEventListener("keydown", onKey, true);
+
+  const teardown = () => {
+    if (closed) return false;
+    closed = true;
+    document.removeEventListener("keydown", onKey, true);
+    scrim.remove();
+    actions.forEach((b) => { b.disabled = false; });
+    recoverBusyOpen = false;
+    return true;
+  };
+  const restoreFocus = () => {
+    if (trigger && document.contains(trigger) && typeof trigger.focus === "function") trigger.focus();
+  };
+  const cancel = () => {
+    if (!teardown()) return;
+    if (opts.onCancel) opts.onCancel();
+    restoreFocus();
+  };
+  return {
+    close(refocus) { if (teardown() && refocus) restoreFocus(); },
+    showError(err) {
+      if (closed) return;
+      panel.setAttribute("aria-busy", "false");
+      panel.classList.add("busy-failed");
+      body.insertBefore(el("div", { class: "busy-error", role: "alert" },
+        el("p", { class: "busy-error-title", text: opts.errTitle }),
+        el("p", { class: "busy-error-msg", text: String((err && err.message) || err) })), foot);
+      cancelBtn.textContent = "Dismiss";
+      cancelBtn.focus();
+    },
+  };
+}
+
 async function previewRecover(form) {
+  if (recoverBusyOpen) return; // shares the one-in-flight guard with Generate (#1363)
   const gen = serverGen;
   const container = $("#recover-preview", VIEW());
   const warns = $("#recover-warnings", VIEW());
@@ -1934,9 +2068,16 @@ async function previewRecover(form) {
   // there is no Go-to-JS constant-sharing mechanism in this codebase.
   params.limit = "1000";
   params.order = "desc";
+  const ctrl = new AbortController();
+  const busy = openRecoverBusy(form, {
+    title: "Previewing affected rows",
+    errTitle: "Couldn't preview the rows",
+    facts: recoverBusyFacts(params),
+    onCancel: () => ctrl.abort(),
+  });
   try {
-    const data = await api("/api/events?" + new URLSearchParams(params).toString());
-    if (gen !== serverGen) return;
+    const data = await api("/api/events?" + new URLSearchParams(params).toString(), { signal: ctrl.signal });
+    if (gen !== serverGen) { busy.close(false); return; }
     clear(container);
     container.append(el("div", { class: "meta-line" }, el("b", { text: String(data.count) }), " affected event(s) · limit " + data.limit));
     const list = el("div", { class: "events" });
@@ -1960,13 +2101,17 @@ async function previewRecover(form) {
       notes.push("Only the newest " + data.limit + " events are shown. The actual undo script may include more if you increase the limit.");
     }
     renderWarnings(warns, notes);
+    busy.close(true); // success: back to the button that started the preview
   } catch (err) {
-    if (gen !== serverGen) return;
-    renderError(container, err);
+    // Cancel/ESC already closed the modal and restored the pre-click state.
+    if (err && err.name === "AbortError") return;
+    if (gen !== serverGen) { busy.close(false); return; }
+    busy.showError(err);
   }
 }
 
 async function generateUndo(form) {
+  if (recoverBusyOpen) return; // one click = one generation (#1363)
   const gen = serverGen;
   const warns = $("#recover-warnings", VIEW());
   const out = $("#recover-out", VIEW());
@@ -1974,9 +2119,16 @@ async function generateUndo(form) {
   const body = {};
   ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) body[k] = f[k].trim(); });
   if (!body.schema) { renderError(out, "Choose at least a schema to search."); return; }
+  const ctrl = new AbortController();
+  const busy = openRecoverBusy(form, {
+    title: "Generating undo SQL",
+    errTitle: "Couldn't generate the undo SQL",
+    facts: recoverBusyFacts(body),
+    onCancel: () => ctrl.abort(),
+  });
   try {
-    const data = await api("/api/recover", { method: "POST", body });
-    if (gen !== serverGen) return;
+    const data = await api("/api/recover", { method: "POST", body, signal: ctrl.signal });
+    if (gen !== serverGen) { busy.close(false); return; }
     renderWarnings(warns, data.warnings);
     lastSQL = data.sql || "";
     clear(out);
@@ -2011,15 +2163,27 @@ async function generateUndo(form) {
         (data.set_null_count || 0) + " SET NULL restore(s) · " + (data.key_restore_count || 0) + " FK restore(s)"
       : data.statement_count + " statement(s) from " + data.row_count + " event(s)";
     out.append(codePanel(lastSQL, meta));
+    // Success: close the busy dialog and land keyboard focus on the result —
+    // the reversal.sql panel header (#1363).
+    busy.close(false);
+    const head = $("#sql-panel .code-head", out);
+    if (head) head.focus();
   } catch (err) {
-    if (gen !== serverGen) return;
-    clear(warns); renderError(out, err);
+    // Cancel/ESC already closed the modal and restored the pre-click state;
+    // the page below was never touched.
+    if (err && err.name === "AbortError") return;
+    if (gen !== serverGen) { busy.close(false); return; }
+    // Errors render IN the modal (with a Dismiss), never as a silently
+    // vanished overlay — and the page keeps its pre-click state.
+    busy.showError(err);
   }
 }
 
 function codePanel(sql, metaLabel) {
   const panel = el("div", { class: "codepanel", id: "sql-panel" });
-  const head = el("div", { class: "code-head" });
+  // tabindex -1: programmatic focus target — the busy modal moves keyboard
+  // focus here when a generation succeeds (#1363).
+  const head = el("div", { class: "code-head", tabindex: "-1" });
   head.append(icon("file"));
   const lbl = el("span", { class: "lbl" }, el("b", { text: "reversal.sql" }), " · " + (metaLabel || "read-only preview"));
   head.append(lbl);
@@ -3638,26 +3802,61 @@ async function loadTables(form) {
   const gen = serverGen;
   const sel = form.querySelector(".schema-select");
   const tsel = form.querySelector(".table-select");
-  if (!tsel) return;
+  // A form carries either a closed table <select> (query-style filters, where
+  // "any" is meaningful) or a table-combo input+datalist (#1364, Restore —
+  // where a hand-typed dropped table must still submit).
+  const combo = form.querySelector(".table-combo");
+  if (!tsel && !combo) return;
   const schema = sel ? sel.value : "";
-  clear(tsel);
-  tsel.append(opt("", "— any —"));
+  if (tsel) {
+    clear(tsel);
+    tsel.append(opt("", "— any —"));
+  }
+  const dl = combo ? document.getElementById(combo.getAttribute("list")) : null;
+  const hint = combo ? combo.parentElement.querySelector(".combo-hint") : null;
+  // The schema the current combo value was entered under — read BEFORE the
+  // fetch so a slow listing still knows whether this is a schema SWITCH.
+  const prevSchema = combo ? (combo.dataset.schema || "") : "";
+  if (combo) combo.dataset.schema = schema;
+  if (dl) clear(dl);
+  if (hint) hint.textContent = "";
   if (!schema) return;
   let tables = tablesCache.get(schema);
   try {
     if (!tables) {
+      if (hint) hint.textContent = "loading tables…";
+      if (combo) combo.setAttribute("aria-busy", "true");
       const data = await api("/api/schemas?schema=" + encodeURIComponent(schema));
       tables = data.tables || [];
       if (gen === serverGen) tablesCache.set(schema, tables); // don't cache under a server we've since switched away from
     }
   } catch (err) {
+    if (combo) combo.removeAttribute("aria-busy");
     if (gen !== serverGen) return;
-    tsel.append(opt("", "(error loading tables)"));
+    if (hint) hint.textContent = "";
+    if (tsel) tsel.append(opt("", "(error loading tables)"));
+    // A failed listing leaves the combo as usable free text with its value
+    // intact — we cannot know whether the value belongs to the new schema,
+    // and a dead or emptied field would be worse than a stale suggestion.
     toast("failed to load tables: " + ((err && err.message) || err));
     return;
   }
+  if (combo) combo.removeAttribute("aria-busy");
   if (gen !== serverGen) return;
-  tables.forEach((t) => tsel.append(opt(t, t)));
+  if (hint) hint.textContent = "";
+  // A newer selection may have superseded this fetch (rapid schema switching):
+  // the last resolver must not repopulate under the wrong schema.
+  if ((sel ? sel.value : "") !== schema) return;
+  if (tsel) tables.forEach((t) => tsel.append(opt(t, t)));
+  if (dl) tables.forEach((t) => dl.append(opt(t, t)));
+  // Switching schema clears a stale table value that doesn't belong to the new
+  // schema (#1364) — but only on a SWITCH (previous schema non-empty and
+  // different): a name typed before the FIRST schema selection is the
+  // dropped-table flow and must survive. A value present in the new schema's
+  // own listing belongs there and is kept.
+  if (combo && prevSchema && prevSchema !== schema && combo.value && !tables.includes(combo.value)) {
+    combo.value = "";
+  }
 }
 
 function wireSchemaCascade(root) {
