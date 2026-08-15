@@ -296,7 +296,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// row is not a paging escape hatch for pulling the index into a browser.
 	pageLimit := opts.Limit
 	opts.Limit = pageLimit + 1
-	rows, plan, excl, diverged, err := s.fetchRestricted(r.Context(), r, b, opts)
+	rows, plan, excl, diverged, archivesElided, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -312,8 +312,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		HasMore: hasMore,
 		// The divergence finding (#1325) rides the same warnings list: the
 		// merge's slog.Warn dies in the daemon log, and this operator is in a
-		// browser.
-		Warnings: appendDivergenceWarning(restrictedFetchWarnings(plan, excl), diverged),
+		// browser. So does the archive-elision notice (#1353): a page served
+		// fast because the archives provably could not change it must still
+		// SAY the archives went unread.
+		Warnings: appendDivergenceWarning(
+			appendArchiveElisionNotice(restrictedFetchWarnings(plan, excl), archivesElided), diverged),
 	}
 	// The cursor comes from the last row of the page the client is about to
 	// see, in the direction it is reading. Built server-side from a served row
@@ -393,7 +396,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// Coverage gaps come back in plan.GapHours and are surfaced as warnings
 	// below — the recover UI renders them, so an incomplete-coverage undo is
 	// flagged to the operator rather than silently presented as complete.
-	rows, plan, excl, diverged, err := s.fetchRestricted(r.Context(), r, b, opts)
+	rows, plan, excl, diverged, archivesElided, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -401,8 +404,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// The divergence finding (#1325) is sharpest here: the kept copy's row
 	// images become the SET/WHERE clauses of the generated reversal SQL, so a
 	// silent coin-flip between two disagreeing before-images must reach the
-	// operator reviewing the script.
-	warnings := appendDivergenceWarning(restrictedFetchWarnings(plan, excl), diverged)
+	// operator reviewing the script. The elision notice (#1353) matters too:
+	// this fetch runs DESC with a limit, so a filled page can skip the
+	// archives, and the reviewer of an undo script must see that stated.
+	warnings := appendDivergenceWarning(
+		appendArchiveElisionNotice(restrictedFetchWarnings(plan, excl), archivesElided), diverged)
 
 	// The fetch above ran Order=DESC so the limit kept the newest suffix of
 	// the window (#981). Detect truncation on the FETCHED row count — before

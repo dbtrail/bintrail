@@ -589,6 +589,32 @@ button { font-family: inherit; }
 .ev-row:hover .ev-caret { opacity: 1; }
 .ev-row.open .ev-caret { transform: translateY(-50%) rotate(90deg); color: var(--accent); opacity: 1; }
 
+/* events loading state (#1353): skeleton rows while the fetch is in flight —
+   a blank list must never be the busy rendering. The note under the rows is
+   revealed by .ev-loading.slow (fetch ran past ~2s, see runEventsQuery). */
+.ev-skel-row {
+  display: grid;
+  grid-template-columns: 200px 1fr 116px 88px 1.2fr;
+  align-items: center; gap: 12px;
+  padding: 13px 14px; border-bottom: 1px solid var(--line-soft);
+}
+.ev-skel-bar { height: 12px; border-radius: 6px; background: var(--surface-3); }
+.ev-skel-time { width: 76%; }
+.ev-skel-table { width: 58%; }
+.ev-skel-type { width: 62%; }
+.ev-skel-pk { width: 46%; }
+.ev-skel-cols { width: 70%; }
+.ev-skel-row:nth-child(2n) .ev-skel-bar { animation-delay: .18s; }
+@media (prefers-reduced-motion: no-preference) {
+  .ev-skel-bar { animation: skelpulse 1.3s ease-in-out infinite; }
+}
+@keyframes skelpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+.ev-skel-note {
+  display: none; padding: 18px 14px; text-align: center;
+  color: var(--ink-3); font-size: 13px;
+}
+.ev-loading.slow .ev-skel-note { display: block; }
+
 /* diff panel (expand) */
 .diff-wrap { overflow: hidden; }
 .diff {

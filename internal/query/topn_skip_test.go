@@ -155,7 +155,7 @@ func TestFetchPageSkipsArchivesOnFilledTopN(t *testing.T) {
 		},
 	}
 
-	rows, _, _, _, err := fetchPage(context.Background(), New(db), o, src)
+	rows, _, _, _, _, err := fetchPage(context.Background(), New(db), o, src)
 	if err != nil {
 		t.Fatalf("fetchPage: %v", err)
 	}

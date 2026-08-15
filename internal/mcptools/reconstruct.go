@@ -371,7 +371,9 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 		// failure under allow_gaps must land in Warnings (#1281) — the same
 		// no-silent-incompleteness contract CaptureGapStatus enforces for
 		// source-side loss.
-		rows, plan, skippedSources, diverged, err := query.FetchMergedFull(ctx, t.DB, query.New(t.DB), fmOpts)
+		// The elision flag is structurally always false here (this fetch is
+		// ASC with no limit, which the newest-first short-circuit never takes).
+		rows, plan, skippedSources, diverged, _, err := query.FetchMergedFull(ctx, t.DB, query.New(t.DB), fmOpts)
 		if err != nil {
 			return ErrorResult(reconstructFetchError(err)), nil, nil
 		}

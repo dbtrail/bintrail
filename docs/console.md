@@ -1096,6 +1096,17 @@ script. The recover screen renders those warnings prominently, so an
 incomplete-coverage undo is flagged to the operator rather than silently
 presented as complete.
 
+On an archive-heavy server the default Events browse (newest first, no time
+filter) is answered from the live index alone whenever the live index fills
+the whole page: rotation only archives hours **older** than the oldest live
+partition, so archived events cannot appear in a newest-first page the live
+index already filled. When that shortcut is taken the response says so with a
+notice in `warnings` ("Archived (rotated) hours were not searched for this
+page because they could not change it…") — that notice records a
+completeness-preserving optimization, nothing is missing from the page. Older
+pages, time filters that reach archived hours, and pages the live index cannot
+fill read the archives exactly as before.
+
 One residual limitation: a few failure modes are logged server-side but not
 surfaced to the browser (this matches the CLI `recover`, which warns to stderr
 and continues; both apply only to these permissive `AllowGaps=true` endpoints —

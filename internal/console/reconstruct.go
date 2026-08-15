@@ -431,7 +431,9 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		AllowGaps:      allowGaps,
 		ArchiveFetcher: parquetquery.Fetch,
 	}
-	rows, plan, skippedSources, diverged, err := query.FetchMergedFull(ctx, b.db, b.engine, fmOpts)
+	// The elision flag is structurally always false here (this fetch is ASC
+	// with no limit, which the newest-first short-circuit never takes).
+	rows, plan, skippedSources, diverged, _, err := query.FetchMergedFull(ctx, b.db, b.engine, fmOpts)
 	if err != nil {
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {

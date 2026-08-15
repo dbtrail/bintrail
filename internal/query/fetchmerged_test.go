@@ -146,7 +146,7 @@ func TestFetchMerged_partialArchiveFailureAbortsStrictUnit(t *testing.T) {
 	// what log-blind surfaces (console, MCP) rely on to warn in-response.
 	expectQueries(mock)
 	var skipped []string
-	if _, _, skipped, _, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
+	if _, _, skipped, _, _, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
 		AllowGaps:      true,
 		ArchiveFetcher: stubFetcher,
 	}); err != nil {
@@ -222,7 +222,7 @@ func TestFetchMergedResolverFailure(t *testing.T) {
 		mock.ExpectQuery("FROM binlog_events").WillReturnRows(sqlmock.NewRows([]string{"event_id"}))
 		fetcherCalled := false
 		var skipped []string
-		_, _, skipped, _, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
+		_, _, skipped, _, _, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
 			AllowGaps: true,
 			ArchiveFetcher: func(_ context.Context, _ Options, _ string) ([]ResultRow, error) {
 				fetcherCalled = true
@@ -266,7 +266,7 @@ func TestFetchPage_forwardsMisfiledHoursToArchiveFetcher(t *testing.T) {
 	}
 	o := FetchMergedOptions{Opts: Options{}, AllowGaps: true, ArchiveFetcher: fetcher}
 
-	rows, skipped, exhausted, _, err := fetchPage(context.Background(), nil, o, src)
+	rows, skipped, exhausted, _, _, err := fetchPage(context.Background(), nil, o, src)
 	if err != nil {
 		t.Fatalf("fetchPage: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestFetchMergedFull_reportsDivergedDuplicates(t *testing.T) {
 		}
 		return []ResultRow{mk("MUTATED")}, nil
 	}
-	rows, _, skipped, diverged, err := FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
+	rows, _, skipped, diverged, _, err := FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
 		AllowGaps:      true,
 		ArchiveFetcher: divergeFetcher,
 	})
@@ -352,7 +352,7 @@ func TestFetchMergedFull_reportsDivergedDuplicates(t *testing.T) {
 	agreeFetcher := func(_ context.Context, _ Options, _ string) ([]ResultRow, error) {
 		return []ResultRow{mk("alice")}, nil
 	}
-	if _, _, _, diverged, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
+	if _, _, _, diverged, _, err = FetchMergedFull(context.Background(), db, New(db), FetchMergedOptions{
 		AllowGaps:      true,
 		ArchiveFetcher: agreeFetcher,
 	}); err != nil {

@@ -64,6 +64,34 @@ func appendDivergenceWarning(w []string, diverged int) []string {
 	return w
 }
 
+// archiveElisionNotice is the response-level record of the newest-first
+// short-circuit (#1353): registered archives were deliberately not read
+// because they provably could not change this page — every archived hour sits
+// below the live rotation floor, and the live index filled the requested page
+// with events newer than that floor. Unlike archiveExclusion's notices this
+// describes a CORRECTNESS-PRESERVING optimization, not a scope reduction, and
+// the wording must carry that distinction: the #1311/#1321 contract is that a
+// result says what scope was read, and "we skipped the archives because they
+// could not matter" is a different fact from "we skipped the archives and your
+// result may be incomplete". It still must be said — silence here would make
+// the fast path indistinguishable from a fetch that never knew archives
+// existed.
+func archiveElisionNotice() string {
+	return "Archived (rotated) hours were not searched for this page because they could not change it: " +
+		"the live index filled the page with the newest matching events, and every archived hour is older " +
+		"than what the live index still holds. Nothing is missing from this page. Paging further back, or " +
+		"filtering to a time range that reaches archived hours, does search the archives."
+}
+
+// appendArchiveElisionNotice appends archiveElisionNotice when the fetch
+// reported the newest-first short-circuit, else returns w unchanged.
+func appendArchiveElisionNotice(w []string, archivesElided bool) []string {
+	if archivesElided {
+		w = append(w, archiveElisionNotice())
+	}
+	return w
+}
+
 // restrictedFetchWarnings is gapWarnings for a fetch that may have excluded the
 // archives (#1311). It closes two holes the plan alone cannot:
 //

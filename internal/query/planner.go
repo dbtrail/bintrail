@@ -148,6 +148,95 @@ func Plan(ctx context.Context, db *sql.DB, dbName string, since, until *time.Tim
 	return plan, nil
 }
 
+// PlanBrowse builds the minimal QueryPlan for an UNBOUNDED read — no since
+// and no until, the console's default Events browse (#1353). Plan deliberately
+// returns nil there (no window, no hour-by-hour classification), which left
+// topNSatisfiedLive without a proof, so a newest-first page the live index
+// filled in milliseconds still opened every Parquet archive (on S3: a
+// per-request multi-file download) only to sort every archived row in below
+// the cutoff.
+//
+// What this plan asserts, and why it is correct by construction: rotation
+// archives a partition AS it drops it, so archives only ever hold hours OLDER
+// than the oldest live partition. When that holds — verified against the
+// scoped archive_state coverage, never assumed — every archived event sorts
+// strictly below any event the live partitions can serve, and the plan carries
+// ONE MySQLRange spanning the whole live partition span. topNSatisfiedLive
+// then proves a filled DESC page cannot gain from archives. A layout that
+// breaks the invariant (an archived hour at or above the oldest live hour —
+// a restored or hand-surgered index, or an archived-but-not-yet-dropped
+// partition after a rotate crash) yields a nil plan: fail open to the
+// slow-but-complete merged read.
+//
+// The single spanning range is sound even when the live hours have interior
+// holes: every archived hour is strictly below the live floor, so an hour
+// inside a hole holds no archived data either — nothing any tier could
+// contribute there. The span is about what archives CANNOT hold, not a claim
+// that every hour in it has data.
+//
+// GapHours is deliberately empty. An unbounded browse states no coverage
+// contract to enforce — before this function existed the plan was nil and no
+// gap was ever reported for it — and enumerating "gaps" across an index's
+// whole lifetime would put a permanent cry-wolf warning on every default
+// browse.
+//
+// Returns (nil, nil) when nothing is provable (nil db, no live partitions —
+// which also keeps SkipMySQL from misfiring on an all-archived index whose
+// p_future may still hold rows). Errors are the caller's to treat as "no
+// plan": this plan only ever ENABLES an optimization, so no fetch may fail
+// because it could not be built.
+func PlanBrowse(ctx context.Context, db *sql.DB, dbName string, scope ArchiveScope) (*QueryPlan, error) {
+	if db == nil || dbName == "" {
+		return nil, nil
+	}
+	liveHours, err := loadLivePartitionHours(ctx, db, dbName)
+	if err != nil {
+		return nil, fmt.Errorf("load partition info for browse planning: %w", err)
+	}
+	cov, err := loadArchiveCoverage(ctx, db, scope)
+	if err != nil {
+		if !isMissingTableErr(err) {
+			return nil, fmt.Errorf("load archive coverage for browse planning: %w", err)
+		}
+		cov = nil
+	}
+	return browsePlanFromHours(liveHours, expandArchiveHours(cov)), nil
+}
+
+// browsePlanFromHours is the pure core of PlanBrowse: liveHours are the live
+// partition hours, archivedHours the scoped archive coverage expanded to
+// content hours (expandArchiveHours, so a misfiled archive's real span counts,
+// not just its label). Nil when the archives-strictly-below-live invariant
+// does not hold — see PlanBrowse for the argument.
+func browsePlanFromHours(liveHours, archivedHours []time.Time) *QueryPlan {
+	if len(liveHours) == 0 {
+		return nil
+	}
+	oldestLive, newestLive := liveHours[0], liveHours[0]
+	for _, h := range liveHours[1:] {
+		if h.Before(oldestLive) {
+			oldestLive = h
+		}
+		if h.After(newestLive) {
+			newestLive = h
+		}
+	}
+	plan := &QueryPlan{OldestKnownHour: oldestLive}
+	for _, h := range archivedHours {
+		if !h.Before(oldestLive) {
+			// An archived hour at or above the live floor: the "archives are
+			// strictly older" invariant does not hold on this index, so no
+			// filled live page proves anything. Fail open.
+			return nil
+		}
+		if h.Before(plan.OldestKnownHour) {
+			plan.OldestKnownHour = h
+		}
+	}
+	plan.MySQLRanges = []TimeRange{{Start: oldestLive, End: newestLive.Add(time.Hour)}}
+	return plan
+}
+
 // buildPlan is the pure-logic core of the planner. It classifies each hour in
 // [rangeStart, rangeEnd) as live, archived, or gap, then builds a QueryPlan.
 // This function is extracted from Plan() for testability.

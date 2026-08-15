@@ -1443,6 +1443,19 @@ async function runEventsQuery(form, keepPage) {
   const before = evPages[evPageIdx] && evPages[evPageIdx].before;
   if (before) pageParams.before = before;
 
+  // Loading state (#1353): skeleton rows from the moment the fetch starts — a
+  // blank list must never be the "busy" rendering (it reads as "no events" or
+  // "broken", on the page an operator opens mid-incident). Past ~2s the
+  // skeleton names what is happening, so a slow archive read looks like work
+  // instead of a hang. The skeleton lives inside #ev-rows, so the success path
+  // (buildEventRows) and the error path (renderError) both sweep it away with
+  // their own clear() — a failed fetch can never leave a stuck skeleton. The
+  // isConnected guard keeps a superseded search's timer from touching the
+  // newer render.
+  const skel = renderEventsLoading(rowsEl);
+  const slowT = setTimeout(() => { if (skel.isConnected) skel.classList.add("slow"); }, 2000);
+  if (countEl) countEl.textContent = "…";
+
   let data;
   try {
     data = await api("/api/events?" + new URLSearchParams(pageParams).toString());
@@ -1451,6 +1464,8 @@ async function runEventsQuery(form, keepPage) {
     clear(rowsEl); renderError(rowsEl, err);
     if (countEl) countEl.textContent = "0";
     return;
+  } finally {
+    clearTimeout(slowT);
   }
   if (gen !== serverGen) return;
   renderWarnings($("#ev-warnings", VIEW()), data.warnings);
@@ -1498,6 +1513,26 @@ async function runEventsQuery(form, keepPage) {
   if (prevBtn) prevBtn.disabled = evPageIdx === 0;
   if (nextBtn) nextBtn.disabled = !data.has_more;
   buildEventRows(rowsEl, events, scopeNote);
+}
+
+// renderEventsLoading paints the Events list's busy state (#1353): skeleton
+// rows in the shape of the real ones, plus a what's-happening note that stays
+// hidden until the caller's slow-fetch timer flips the wrapper to "slow".
+// Returns the wrapper so that timer can check it is still on screen
+// (isConnected) before speaking — a superseded search repaints its own
+// skeleton, and the stale timer must not touch it.
+function renderEventsLoading(container) {
+  clear(container);
+  const wrap = el("div", { class: "ev-loading", role: "status", "aria-label": "Loading events" });
+  for (let i = 0; i < 8; i++) {
+    const r = el("div", { class: "ev-skel-row" });
+    ["time", "table", "type", "pk", "cols"].forEach((c) => r.append(el("span", { class: "ev-skel-bar ev-skel-" + c })));
+    wrap.append(r);
+  }
+  wrap.append(el("div", { class: "ev-skel-note",
+    text: "Still working — reading history (archived hours can take a while)…" }));
+  container.append(wrap);
+  return wrap;
 }
 
 // refineEvents applies the client-side free-text / unscoped-pk refine. Shared

@@ -225,16 +225,26 @@ func (s *Server) applySessionProfile(ctx context.Context, r *http.Request, b *bu
 // partially-failing archive source remains a log-only condition (the
 // documented trade-off on Server.fetch), and adopting it is a separate
 // decision from surfacing divergence.
-func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, int, error) {
+//
+// archivesElided reports the newest-first short-circuit (#1353): registered
+// archives were deliberately not read because the live index filled the page
+// and every archived hour sits below the live rotation floor — they could not
+// have changed the answer. The handlers surface it as a response notice
+// (appendArchiveElisionNotice) so the skip is auditable, per the #1311/#1321
+// contract that a result always says what scope was read. Structurally always
+// false for a profiled session or a --no-archive console: there the archives
+// are EXCLUDED (excl says so and its notice speaks), not elided — nothing was
+// resolved that could have been skipped.
+func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, int, bool, error) {
 	excl := archiveExclusionFor(r, b)
-	rows, plan, _, diverged, err := query.FetchMergedFull(ctx, b.db, b.engine, query.FetchMergedOptions{
+	rows, plan, _, diverged, archivesElided, err := query.FetchMergedFull(ctx, b.db, b.engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         b.dbName,
 		NoArchive:      excl.any(),
 		AllowGaps:      true,
 		ArchiveFetcher: parquetquery.Fetch,
 	})
-	return rows, plan, excl, diverged, err
+	return rows, plan, excl, diverged, archivesElided, err
 }
 
 // archiveExclusion records WHY a fetch left the Parquet archives out (#1311),
