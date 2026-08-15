@@ -709,13 +709,63 @@ function setActiveNav(route) {
   $all(".nav-item").forEach((a) => a.classList.toggle("active", a.dataset.route === route));
 }
 
+// ── Timezone discipline (#1354) ──────────────────────────────────────────────
+// Every time this console renders is UTC — the zone the wire speaks
+// (consoleTSFormat / status.TSFmt) and the zone the Since/Until/At filters and
+// `--since`/`--until`/`AS OF` parse. So the DISPLAYED text of a data timestamp
+// is the exact wire string (copy-pasteable into those inputs unchanged), and
+// the zone is DECLARED next to it instead of suffixed onto every row: a
+// section-level chip or "(UTC)" label, plus a hover tooltip carrying the
+// viewer's local equivalent. Freshness/metadata stamps ("as of …", "created …")
+// are not paste targets, so those carry an inline " UTC" label directly.
+// Never render an unlabeled browser-local time.
+
+// utcLocalTitle builds the hover tooltip for a UTC stamp: it names the zone of
+// the displayed value and gives the viewer's local equivalent. "" for
+// non-stamps ("—", empty), so callers can set title unconditionally.
+function utcLocalTitle(stamp) {
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/.exec(String(stamp || ""));
+  if (!m) return "";
+  const t = new Date(m[1] + "T" + m[2] + "Z");
+  if (isNaN(t)) return "";
+  return "UTC — in your local time: " + t.toLocaleString();
+}
+
+// tsSpan renders one data timestamp: exact wire text, local-time tooltip.
+function tsSpan(cls, stamp) {
+  return el("span", { class: cls, text: stamp, title: utcLocalTitle(stamp) || null });
+}
+
+// utcLabel normalizes a wire timestamp (RFC3339 "…T…Z" or the bare
+// "YYYY-MM-DD HH:MM:SS" UTC form) into the labeled display shape
+// "YYYY-MM-DD HH:MM:SS UTC", for prose and freshness lines that are read, not
+// copy-pasted. Non-stamps pass through unlabeled — never label a value as UTC
+// unless it parses as one.
+function utcLabel(stamp) {
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:Z)?$/.exec(String(stamp || ""));
+  return m ? m[1] + " " + m[2] + " UTC" : String(stamp || "");
+}
+
+// tzChip is the section-level zone declaration: a small "UTC" chip for the
+// head of a card/panel whose body renders bare timestamps.
+function tzChip() {
+  return el("span", { class: "tz-chip", text: "UTC",
+    title: "All times in this section are UTC — copy-paste ready for the Since/Until/At filters. Hover a timestamp for your local time." });
+}
+
+// nowClock is the freshness clock ("as of …"). UTC and labeled, NOT
+// toLocaleTimeString: it sits beside data timestamps that are all UTC, and an
+// unlabeled browser-local clock made the same instant appear hours apart on
+// one page (#1354).
+function nowClock() { return new Date().toISOString().slice(11, 19) + " UTC"; }
+
 // ── Overview ─────────────────────────────────────────────────────────────────
 
 // covLast is the payload the visible coverage card was built from, so a FAILED
 // refresh can re-render the same numbers instead of blanking them — and label
 // them stale, which is the part that keeps that honest. One Overview is on
 // screen at a time, so one slot is enough.
-let covLast = null; // { data, at } — `at` is the local clock time of the fetch
+let covLast = null; // { data, at } — `at` is the UTC clock time of the fetch
 
 // covRefresh builds the card's refresh control: a fetch-time stamp plus the
 // button. `stamp` is {at, error} — a refresh that failed keeps the previous
@@ -769,8 +819,6 @@ async function refreshCovCard(btn) {
   card.replaceWith(covCard(next, { at: covLast.at }));
 }
 
-function nowClock() { return new Date().toLocaleTimeString(); }
-
 // covCard renders the live RPO statement (#1194). The window's upper edge is
 // the last INDEXED event on purpose — "restorable up to now" with a dead
 // stream would be false assurance; the lag chip is what says "now". Degrades
@@ -779,6 +827,7 @@ function covCard(c, stamp) {
   const card = el("section", { class: "ov-panel cov-card" });
   card.append(el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "Restore coverage" }),
+    tzChip(),
     covRefresh(stamp)));
   const cont = c.continuity || "unknown";
   const bad = cont === "gap_lost" || cont === "unavailable";
@@ -791,11 +840,11 @@ function covCard(c, stamp) {
   } else if (!c.delta_from) {
     // Unknown floor: don't assert a bounded window whose start we don't know.
     card.append(el("p", { class: "cov-line" },
-      "Restorable up to ", el("b", { text: c.delta_to }), "; the window start could not be determined."));
+      "Restorable up to ", el("b", { text: c.delta_to, title: utcLocalTitle(c.delta_to) || null }), "; the window start could not be determined."));
   } else {
     card.append(el("p", { class: "cov-line" },
-      "Any point between ", el("b", { text: c.delta_from }),
-      " and ", el("b", { text: c.delta_to }), " is restorable."));
+      "Any point between ", el("b", { text: c.delta_from, title: utcLocalTitle(c.delta_from) || null }),
+      " and ", el("b", { text: c.delta_to, title: utcLocalTitle(c.delta_to) || null }), " is restorable."));
   }
   const chips = el("div", { class: "cov-chips" });
   // Freshness (#1227) is what makes the lag number readable, so it decides the
@@ -844,7 +893,9 @@ function covCard(c, stamp) {
       card.append(el("p", { class: "cov-line warn", text: "Full-table coverage could not be evaluated — check the daemon log." }));
     }
     if (c.full_table_from) {
-      card.append(el("p", { class: "cov-line", text: "Full-table restore for tables with a baseline: any point from " + c.full_table_from + " onwards." }));
+      card.append(el("p", { class: "cov-line" },
+        "Full-table restore for tables with a baseline: any point from ",
+        el("b", { text: c.full_table_from, title: utcLocalTitle(c.full_table_from) || null }), " onwards."));
     }
     if (c.broken_tables && c.broken_tables.length) {
       card.append(el("p", { class: "cov-line bad", text: "Not fully restorable (newest baseline predates coverage): " + c.broken_tables.join(", ") + " — take a fresh baseline." }));
@@ -920,6 +971,7 @@ function ovFrame() {
   f.recentPanel = el("section", { class: "ov-panel" });
   f.recentPanel.append(el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "Recent changes" }),
+    tzChip(),
     el("a", { class: "btn btn-sm btn-ghost", href: "/events",
       onclick: (e) => { e.preventDefault(); navigate("events"); }, text: "Browse all events ›" })));
   f.recentBody = el("div", { class: "ov-evlist" });
@@ -972,7 +1024,7 @@ function fillOvEvents(f, eventsData, err) {
   const events = (eventsData && eventsData.events) || [];
   const latest = (events[0] && events[0].event_timestamp) || "—";
   const wide = el("div", { class: "ov-stat" },
-    el("div", { class: "ov-stat-v small", text: latest }),
+    el("div", { class: "ov-stat-v small", text: latest, title: utcLocalTitle(latest) || null }),
     el("div", { class: "ov-stat-k", text: "most recent change" }),
     el("div", { class: "ov-stat-scope", text: "point in time (UTC)" }));
   f.statLatest.replaceWith(f.statLatest = wide);
@@ -1000,8 +1052,10 @@ function fillOvActivity(f, activity) {
   const deletes = activity ? activity.deletes : null;
   const tableCount = activity ? activity.tables : null;
   const refreshed = (activity && activity.refreshed_at) || "";
-  // Tiles carry the compact time-of-day stamp; the footer carries the full one.
-  const asofShort = refreshed ? " · as of " + (refreshed.length > 11 ? refreshed.slice(11) : refreshed) : "";
+  // Tiles carry the compact time-of-day stamp; the footer carries the full
+  // one. Both are labeled: the freshness clock beside them (nowClock) says
+  // "UTC", and an unlabeled sibling would read as a different zone (#1354).
+  const asofShort = refreshed ? " · as of " + (refreshed.length > 11 ? refreshed.slice(11) : refreshed) + " UTC" : "";
   // The window scope printed on every window-scoped tile. "partial" is not
   // decoration: the server sets complete=false when the counts are knowably a
   // floor, and a narrower number under a wider label is the bug this page is
@@ -1022,7 +1076,7 @@ function fillOvActivity(f, activity) {
   });
 
   if (refreshed) {
-    f.tablesHead.append(el("span", { class: "cov-asof", text: "as of " + refreshed }));
+    f.tablesHead.append(el("span", { class: "cov-asof", text: "as of " + utcLabel(refreshed) }));
   }
   clear(f.tablesBody);
   const tables = (activity && activity.top_tables || []).map((t) => ({
@@ -1038,8 +1092,10 @@ function fillOvActivity(f, activity) {
   // far wider one — the same class of mismatch as the tiles' (#1300).
   clear(f.tablesFoot);
   f.tablesFoot.append(
-    el("span", { text: "window" }), " ",
-    el("b", { text: activity ? activity.since : "—" }), " → ", el("b", { text: activity ? activity.until : "—" }),
+    el("span", { text: "window (UTC)" }), " ",
+    el("b", { text: activity ? activity.since : "—", title: activity ? utcLocalTitle(activity.since) || null : null }),
+    " → ",
+    el("b", { text: activity ? activity.until : "—", title: activity ? utcLocalTitle(activity.until) || null : null }),
     el("span", { text: activity ? " · " + winScope : "" }));
 }
 
@@ -1115,7 +1171,7 @@ function colsSummary(cols, highlight) {
 function ovEventRow(e) {
   const row = el("div", { class: "ov-ev",
     onclick: () => navigate("events", { q: "pk:" + e.pk_values }) });
-  row.append(el("span", { class: "ov-ev-time", text: e.event_timestamp }));
+  row.append(tsSpan("ov-ev-time", e.event_timestamp));
   row.append(badge(e.event_type));
   const tbl = el("span", { class: "ov-ev-tbl", text: e.schema_name + "." + e.table_name + " " });
   tbl.append(el("span", { class: "ov-ev-pk", text: "#" + e.pk_values }));
@@ -1218,7 +1274,7 @@ function renderEvents(params) {
   // events list
   const list = el("div", { class: "events", id: "events-list" });
   const head = el("div", { class: "ev-head" });
-  ["time", "table", "type", "pk", "changed columns"].forEach((h) => head.append(el("span", { text: h })));
+  ["time (UTC)", "table", "type", "pk", "changed columns"].forEach((h) => head.append(el("span", { text: h })));
   list.append(head);
   list.append(el("div", { id: "ev-rows" }));
   v.append(list);
@@ -1687,7 +1743,7 @@ function buildEventRows(container, events, scopeNote) {
   events.forEach((e, i) => {
     const row = el("div", { class: "ev-row", "data-ev": i, tabindex: "0", role: "button", "aria-expanded": "false" });
     row.append(icon("caret", "ev-caret"));
-    row.append(el("span", { class: "ev-time", text: e.event_timestamp }));
+    row.append(tsSpan("ev-time", e.event_timestamp));
     row.append(el("span", { class: "ev-table", text: e.schema_name + "." + e.table_name }));
     row.append(el("span", {}, badge(e.event_type)));
     row.append(el("span", { class: "ev-pk", text: e.pk_values }));
@@ -1799,7 +1855,7 @@ function renderRecover(params) {
     banner.append(el("div", { class: "ctx-main" },
       el("span", { class: "ctx-eyebrow", text: "Reverting this row to before this point" }),
       el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " · pk " + ctx.pk }),
-      el("span", { class: "ctx-detail", text: "undoing changes up to " + ctx.type + " at " + ctx.time })));
+      el("span", { class: "ctx-detail", text: "undoing changes up to " + ctx.type + " at " + ctx.time + " UTC" })));
     banner.append(el("span", { class: "spacer" }));
     banner.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear",
       onclick: () => { pendingRecover = null; navigate("recover"); } }));
@@ -1885,7 +1941,7 @@ async function previewRecover(form) {
     container.append(el("div", { class: "meta-line" }, el("b", { text: String(data.count) }), " affected event(s) · limit " + data.limit));
     const list = el("div", { class: "events" });
     const head = el("div", { class: "ev-head" });
-    ["time", "table", "type", "pk", "changed columns"].forEach((h) => head.append(el("span", { text: h })));
+    ["time (UTC)", "table", "type", "pk", "changed columns"].forEach((h) => head.append(el("span", { text: h })));
     list.append(head);
     const rows = el("div");
     buildEventRows(rows, data.events || []);
@@ -2081,7 +2137,7 @@ function aimUndoAtInstant(form, at) {
   form.elements.until.value = "";
   previewRecover(form);
   form.scrollIntoView({ behavior: "smooth", block: "start" });
-  toast("Undo window set to everything after " + at);
+  toast("Undo window set to everything after " + at + " UTC");
 }
 
 // restoreToStateAction is the bridge that makes the two halves one errand:
@@ -2102,7 +2158,7 @@ function restoreToStateAction(form, data) {
   if (!data.found) return row;
   row.append(el("button", {
     class: "btn btn-primary", type: "button", text: "Restore to this state",
-    title: "Reverse every change after " + data.at + ", leaving the row exactly as shown",
+    title: "Reverse every change after " + data.at + " UTC, leaving the row exactly as shown",
     onclick: () => aimUndoAtInstant(form, data.at),
   }));
   row.append(el("span", { class: "state-actions-note", text:
@@ -2198,13 +2254,14 @@ async function runReconstruct(form, history) {
 function reconstructMeta(data, label) {
   return el("div", { class: "meta-line" },
     el("b", { text: data.schema + "." + data.table + " pk=" + data.pk }),
-    " · " + label + " · baseline " + data.baseline_time + " · " + data.event_count + " event(s)");
+    " · " + label + " · baseline " + data.baseline_time + " · " + data.event_count + " event(s)",
+    tzChip());
 }
 
 function renderStateAt(container, data) {
   container.append(reconstructMeta(data, "as of " + data.at));
   if (!data.found) { container.append(el("div", { class: "deleted-note", text: "No row with this primary key existed at or before the selected time." })); return; }
-  if (data.deleted) { container.append(el("div", { class: "deleted-note", text: "Row was deleted as of " + data.at + "." })); return; }
+  if (data.deleted) { container.append(el("div", { class: "deleted-note", text: "Row was deleted as of " + data.at + " UTC." })); return; }
   container.append(stateTable(data.state || {}));
 }
 
@@ -2229,7 +2286,7 @@ function renderTimeline(container, data) {
     node.append(el("span", { class: "tl-dot " + kind }));
     const head = el("div", { class: "tl-head" });
     head.append(el("span", { class: "badge " + (e.source === "baseline" ? "b-baseline" : badgeClass(e.source)), text: e.source }));
-    head.append(el("span", { class: "tl-time", text: e.time }));
+    head.append(tsSpan("tl-time", e.time));
     node.append(head);
 
     const body = el("div", { class: "tl-body" });
@@ -2258,13 +2315,13 @@ function renderTimeline(container, data) {
     const acts = el("div", { class: "tl-actions" });
     acts.append(el("button", {
       class: "btn btn-sm tl-use", type: "button", text: "Use this moment",
-      title: "Set the At field above to " + e.time,
+      title: "Set the At field above to " + e.time + " UTC",
       onclick: () => useTimelineInstant(e.time),
     }));
     if (e.source !== "baseline") {
       acts.append(el("button", {
         class: "btn btn-sm tl-restore", type: "button", text: "Restore to this state",
-        title: "Reverse every change after " + e.time + ", leaving the row as shown here",
+        title: "Reverse every change after " + e.time + " UTC, leaving the row as shown here",
         onclick: () => {
           const form = document.getElementById("recover-form");
           if (form) aimUndoAtInstant(form, e.time);
@@ -2316,8 +2373,8 @@ async function renderStatus() {
     ["partitions", (data.partitions || []).length],
   ]));
   cards.append(statusCard("Coverage", [
-    ["earliest event", cov.earliest_event],
-    ["latest event", cov.latest_event],
+    ["earliest event (UTC)", cov.earliest_event],
+    ["latest event (UTC)", cov.latest_event],
     ["total events", cov.total_events],
     ["schema changes", cov.schema_changes],
   ]));
@@ -2385,7 +2442,7 @@ function continuityBox(stream, pg) {
     lost.append(el("div", { text: stream.gap_lost.detail ||
       (pg ? "The replication slot PostgreSQL was using got invalidated. To keep capturing changes, create a new baseline and start over."
           : "A gap in the binlog can't be filled — some history is permanently missing. To keep capturing changes, create a new baseline and start over.") }));
-    lost.append(el("div", { text: "Detected: " + stream.gap_lost.at }));
+    lost.append(el("div", { text: "Detected: " + utcLabel(stream.gap_lost.at) }));
     return lost;
   }
   if (stream.continuity && stream.continuity.status === "ok") {
@@ -2433,10 +2490,10 @@ function captureHealthBox(stream) {
       : "⚠ Capture incomplete — some changes were not indexed" }));
   const reasons = Object.keys(h.skipped || {}).sort().join(", ");
   box.append(el("div", { text: h.total_skipped + " event(s) were read from the stream but not indexed" +
-    (reasons ? " (" + reasons + ")" : "") + (h.last_skip_at ? "; last " + h.last_skip_at : "") +
+    (reasons ? " (" + reasons + ")" : "") + (h.last_skip_at ? "; last " + utcLabel(h.last_skip_at) : "") +
     ". Those changes are missing from the index for good." +
-    (acked && h.acknowledged_at ? " Acknowledged " + h.acknowledged_at + "; anything skipped after that count raises this again." : "") +
-    (!acked && historic && h.snapshot_at ? " The schema snapshot in force since " + h.snapshot_at + " has recorded none." : "") }));
+    (acked && h.acknowledged_at ? " Acknowledged " + utcLabel(h.acknowledged_at) + "; anything skipped after that count raises this again." : "") +
+    (!acked && historic && h.snapshot_at ? " The schema snapshot in force since " + utcLabel(h.snapshot_at) + " has recorded none." : "") }));
   // Cause, remedy and scope come from the backend (status.ExplainCaptureSkips),
   // the same strings `bintrail status` prints — the console must not re-author
   // this advice in JavaScript, because the half that drifts is always the half
@@ -2990,7 +3047,7 @@ function baselineSummaryCard(b, cur) {
   const snaps = b.snapshots || [];
   kvRow(card, "source", b.source);
   kvRow(card, "snapshots", String(snaps.length) + (b.truncated ? "+" : ""));
-  kvRow(card, "latest", snaps.length ? snaps[0].time : "none yet");
+  kvRow(card, "latest (UTC)", snaps.length ? snaps[0].time : "none yet");
   if (snaps.length) kvRow(card, "age", formatAge(snaps[0].age_hours));
   kvRow(card, "time-travel", b.reconstruct ? "enabled" : "off (archives disabled)");
   return card;
@@ -3046,11 +3103,13 @@ function archivingPanel(servers, serversErr) {
 // baselineRefreshNote renders the last automatic refresh for the selected
 // server.
 function baselineRefreshNote(rf) {
-  const when = rf.finished_at || rf.since || "";
+  // finished_at/since are RFC3339 UTC on the wire; utcLabel renders them in
+  // the console's labeled shape ("YYYY-MM-DD HH:MM:SS UTC", #1354).
+  const when = utcLabel(rf.finished_at || rf.since || "");
   let text;
   switch (rf.state) {
     case "running":
-      text = "Automatic refresh running" + (rf.since ? " since " + rf.since : "") + "…";
+      text = "Automatic refresh running" + (rf.since ? " since " + utcLabel(rf.since) : "") + "…";
       break;
     case "succeeded":
       text = "Automatic refresh: " + (rf.tables || 0) + " table(s) refreshed" + (when ? " at " + when : "") + ".";
@@ -3073,7 +3132,8 @@ function baselinesPanel(b, servers) {
   let owner = cur ? serverLabel(cur) : "";
   if (!owner && b && !b.error && b.configured) owner = "daemon (--baseline-dir / --baseline-s3)";
   const head = el("div", { class: "ov-panel-head" },
-    el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (owner ? " — " + owner : "") }));
+    el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (owner ? " — " + owner : "") }),
+    tzChip());
   // Create-baseline action: only when the daemon opted in (capsCache.baseline_trigger),
   // a real server is selected, and it has a baseline destination configured (else the
   // endpoint 400s). The endpoint still re-validates the source DSN server-side.
@@ -3120,7 +3180,7 @@ function baselinesPanel(b, servers) {
     }
     b.snapshots.forEach((sn, idx) => {
       const row = el("div", { class: "stg-row" });
-      row.append(el("span", { class: "stg-name mono", text: sn.time }));
+      row.append(tsSpan("stg-name mono", sn.time));
       row.append(el("span", { class: "stg-dest", text:
         (sn.tables || []).length + " table(s)" + (sn.binlog_file ? " · " + sn.binlog_file + ":" + sn.binlog_pos : "") }));
       if (idx === 0 && sn.staleness && sn.staleness !== "ok") {
@@ -3354,7 +3414,7 @@ async function loadVerifyHistory(id, box) {
     if (r.state === "skipped") outcome = "skipped — " + (r.skip_reason || "");
     else if (r.state === "failed") outcome = "failed — " + (r.last_error || "unknown error");
     else outcome = s.match + " match · " + s.mismatch + " mismatch · " + s.inconclusive + " inconclusive · " + s.error + " error";
-    const when = (r.finished_at || r.since || "").replace("T", " ").replace("Z", " UTC");
+    const when = utcLabel(r.finished_at || r.since || "");
     const row = el("div", { class: "stg-row" });
     row.append(
       el("span", { class: "stg-age", text: when }),
@@ -3757,7 +3817,7 @@ function mcpTokenCard(tok, minted) {
   if (tok.managed) {
     if (!minted) {
       card.append(el("p", { class: "stg-hint", text:
-        "A managed token is active" + (tok.created_at ? " (created " + tok.created_at + ")" : "") +
+        "A managed token is active" + (tok.created_at ? " (created " + utcLabel(tok.created_at) + ")" : "") +
         ". Its value is not stored and cannot be re-displayed — rotate to get a fresh one." }));
     }
     if (tok.read_only) {

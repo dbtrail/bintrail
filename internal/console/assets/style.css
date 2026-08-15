@@ -1544,6 +1544,18 @@ button { font-family: inherit; }
 .cov-refresh { display: flex; align-items: center; gap: 8px; }
 .cov-asof { font-family: var(--f-mono); font-size: 11px; color: var(--ink-4); }
 .cov-asof.bad { color: var(--delete); }
+
+/* Section-level timezone declaration (#1354): a small "UTC" chip on the head
+   of any card/panel whose body renders bare timestamps. The rows keep the
+   exact wire text (copy-pasteable into the Since/Until/At filters, which
+   parse UTC); the chip states the zone once per section. In the flex panel
+   heads margin-right:auto keeps it grouped with the title while buttons stay
+   right; in non-flex contexts (meta lines) the auto margin is inert. */
+.tz-chip {
+  font-size: 10px; color: var(--ink-4); letter-spacing: .05em;
+  border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px;
+  margin-left: 8px; margin-right: auto; cursor: default; white-space: nowrap;
+}
 .cov-refresh-btn {
   display: flex; align-items: center; justify-content: center;
   width: 26px; height: 26px; padding: 0;

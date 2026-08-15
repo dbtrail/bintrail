@@ -866,6 +866,26 @@ try {
   evr.leakedKeys === 0 ? ok("events: no query_text/query_hash keys in the wire events") : bad("events: no query_text/query_hash keys in the wire events", `${evr.leakedKeys} event(s) carry them`);
   evr.connId === 777 ? ok("events: connection_id passes through (#701 D1)") : bad("events: connection_id passes through (#701 D1)", `connection_id=${JSON.stringify(evr.connId)}`);
 
+  // Scenario 12tz — timezone discipline on Events (#1354): the column header
+  // declares the zone once, and each row keeps the EXACT wire text — so it
+  // copy-pastes into Since/Until/At unchanged — with the viewer's local
+  // equivalent as a hover tooltip. Never an unlabeled browser-local render.
+  const evtz = await page.evaluate(() => {
+    const head = document.querySelector(".ev-head span");
+    const t = document.querySelector("#ev-rows .ev-time");
+    return {
+      headCol: head ? head.textContent : "",
+      text: t ? t.textContent : "",
+      title: t ? t.getAttribute("title") || "" : "",
+    };
+  });
+  evtz.headCol === "time (UTC)"
+    ? ok("events: the time column declares UTC")
+    : bad("events: the time column declares UTC", JSON.stringify(evtz));
+  (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(evtz.text) && evtz.title.startsWith("UTC — in your local time:"))
+    ? ok("events: rows keep exact UTC text with a local-time tooltip")
+    : bad("events: rows keep exact UTC text with a local-time tooltip", JSON.stringify(evtz));
+
   // Scenario 12b — the export path (#970): drive the REAL JSON/CSV buttons and
   // capture the blobs downloadBlob mints. Export is over the on-screen
   // redacted DTOs — so it must stay query_text-free WITH connection_id, and
@@ -1224,10 +1244,15 @@ try {
   // turns a missing scope into a driver timeout that aborts the rest of the run
   // instead of one legible failure.
   await page.waitForFunction(() => document.querySelectorAll(".ov-stat").length === 4, { timeout: 10000 });
+  // The coverage card fills independently (#1352); its freshness clock is part
+  // of what this scenario pins, so wait for that fill too.
+  await page.waitForFunction(() => !!document.querySelector(".cov-card .cov-asof"), { timeout: 10000 });
   const ovLive = await page.evaluate(() => ({
     scopes: Array.from(document.querySelectorAll(".ov-stat")).map((n) => (n.querySelector(".ov-stat-scope") || {}).textContent || ""),
     win: (document.querySelector(".ov-coverage") || {}).textContent || "",
     warns: Array.from(document.querySelectorAll(".warn-item")).map((n) => n.textContent),
+    asof: (document.querySelector(".cov-card .cov-asof") || {}).textContent || "",
+    tzChips: document.querySelectorAll(".tz-chip").length,
   }));
   ovLive.scopes.every((s) => s.trim() !== "")
     ? ok("overview (live): every rendered tile carries a scope line")
@@ -1239,12 +1264,23 @@ try {
     : bad("overview (live): the window tiles carry a real window from /api/activity", JSON.stringify(ovLive));
   // The aggregate is a server-side materialization (#1352): its freshness must
   // be rendered with its numbers, or a stale count reads as live.
-  (ovLive.scopes.filter((s) => / · as of \d{2}:\d{2}:\d{2}/.test(s)).length === 2)
-    ? ok("overview (live): the window tiles disclose the aggregate's refresh time")
-    : bad("overview (live): the window tiles disclose the aggregate's refresh time", JSON.stringify(ovLive));
-  (/window\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(ovLive.win) && !ovLive.warns.some((w) => /window counts could not be loaded/.test(w)))
-    ? ok("overview (live): the window line states the aggregate's own bounds")
-    : bad("overview (live): the window line states the aggregate's own bounds", JSON.stringify(ovLive));
+  (ovLive.scopes.filter((s) => / · as of \d{2}:\d{2}:\d{2} UTC/.test(s)).length === 2)
+    ? ok("overview (live): the window tiles disclose the aggregate's refresh time, labeled UTC")
+    : bad("overview (live): the window tiles disclose the aggregate's refresh time, labeled UTC", JSON.stringify(ovLive));
+  (/window \(UTC\)\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(ovLive.win) && !ovLive.warns.some((w) => /window counts could not be loaded/.test(w)))
+    ? ok("overview (live): the window line states the aggregate's own bounds and their zone")
+    : bad("overview (live): the window line states the aggregate's own bounds and their zone", JSON.stringify(ovLive));
+  // Timezone discipline (#1354): the freshness clock is the labeled UTC clock
+  // — nowClock() was toLocaleTimeString(), which put an unlabeled browser-local
+  // time directly above data timestamps that are all UTC, so the same instant
+  // read hours apart on one page. And the sections that render bare data
+  // timestamps each carry a UTC chip.
+  /as of \d{2}:\d{2}:\d{2} UTC$/.test(ovLive.asof)
+    ? ok("overview (live): the freshness clock is UTC and says so")
+    : bad("overview (live): the freshness clock is UTC and says so", JSON.stringify(ovLive.asof));
+  (ovLive.tzChips >= 2)
+    ? ok("overview (live): timestamp-bearing sections carry a UTC chip")
+    : bad("overview (live): timestamp-bearing sections carry a UTC chip", `tz chips: ${ovLive.tzChips}`);
 
   // Scenario 15 — Overview scope honesty (#686 + #1300): fixture-drive the REAL
   // buildOverview and pin that (a) every tile states its OWN scope, (b) the
@@ -1301,7 +1337,7 @@ try {
   (ov.full.tiles.length === 4 && ov.full.tiles.every((t) => t.scope.trim() !== ""))
     ? ok("overview: every tile states its own scope")
     : bad("overview: every tile states its own scope", JSON.stringify(ov.full.tiles));
-  (tileBy(ov.full.tiles, "deletes").v === "17" && tileBy(ov.full.tiles, "deletes").scope.includes("live retention") && tileBy(ov.full.tiles, "deletes").scope.includes("as of 09:00:00"))
+  (tileBy(ov.full.tiles, "deletes").v === "17" && tileBy(ov.full.tiles, "deletes").scope.includes("live retention") && tileBy(ov.full.tiles, "deletes").scope.includes("as of 09:00:00 UTC"))
     ? ok("overview: the deletes tile is the server aggregate, labelled with its window and freshness")
     : bad("overview: the deletes tile is the server aggregate, labelled with its window and freshness", JSON.stringify(tileBy(ov.full.tiles, "deletes")));
   (tileBy(ov.full.tiles, "tables touched").v === "5" && tileBy(ov.full.tiles, "tables touched").scope.includes("live retention"))
