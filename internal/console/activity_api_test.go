@@ -7,7 +7,6 @@ import (
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -30,6 +29,16 @@ func activityResult(rows ...aRow) *sqlmock.Rows {
 	return r
 }
 
+// partitionsResult builds the information_schema.PARTITIONS listing the
+// live-window derivation reads.
+func partitionsResult(names ...string) *sqlmock.Rows {
+	r := sqlmock.NewRows([]string{"PARTITION_NAME"})
+	for _, n := range names {
+		r.AddRow(n)
+	}
+	return r
+}
+
 func getActivity(t *testing.T, srv *Server, path string) (int, activityResponse, string) {
 	t.Helper()
 	rec, body := doServersReq(t, srv, "GET", path, "")
@@ -42,10 +51,13 @@ func getActivity(t *testing.T, srv *Server, path string) (int, activityResponse,
 	return rec.Code, got, string(body)
 }
 
-// TestActivityAPICounts pins the whole point of the endpoint (#1300): the tiles'
-// numbers describe a STATED period, are exact (not a fetch-window artefact), and
-// carry the label the tile prints. It also pins that Tables is the distinct
-// table count over the WHOLE window, not the length of the truncated top list.
+// TestActivityAPICounts pins the point of the endpoint (#1300): the tiles'
+// numbers describe a STATED window, are exact (not a fetch-window artefact),
+// and carry the label the tile prints. It also pins that Tables is the distinct
+// table count over the WHOLE window, not the length of the truncated top list,
+// and — since #1352 — that the response stamps refreshed_at, the freshness the
+// tile renders. The bundle carries no dbName here, so the window is the stated
+// 24 h fallback (the live-retention path is pinned separately below).
 func TestActivityAPICounts(t *testing.T) {
 	db, mock, closeDB := newSQLMock(t)
 	defer closeDB()
@@ -62,8 +74,8 @@ func TestActivityAPICounts(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("code = %d, body = %s", code, body)
 	}
-	if got.Period != "24h" || got.Label != "last 24 h" {
-		t.Errorf("period/label = %q/%q, want 24h/last 24 h", got.Period, got.Label)
+	if got.Label != activityFallbackLabel {
+		t.Errorf("label = %q, want %q (no dbName → stated fallback window)", got.Label, activityFallbackLabel)
 	}
 	if got.Total != 27 || got.Inserts != 10 || got.Updates != 5 || got.Deletes != 9 || got.Other != 3 {
 		t.Errorf("counts = total %d ins %d upd %d del %d other %d; want 27/10/5/9/3",
@@ -78,8 +90,8 @@ func TestActivityAPICounts(t *testing.T) {
 	if got.TopTables[0].Delete != 2 {
 		t.Errorf("orders delete = %d, want 2", got.TopTables[0].Delete)
 	}
-	// The window must be exactly the period wide, so the label is not a claim
-	// about a different span than the counts.
+	// The fallback window must be exactly as wide as stated, so the label is
+	// not a claim about a different span than the counts.
 	since, err := time.Parse(consoleTSFormat, got.Since)
 	if err != nil {
 		t.Fatal(err)
@@ -88,56 +100,222 @@ func TestActivityAPICounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d := until.Sub(since); d != 24*time.Hour {
-		t.Errorf("until-since = %s, want 24h", d)
+	if d := until.Sub(since); d != activityFallbackWindow {
+		t.Errorf("until-since = %s, want %s", d, activityFallbackWindow)
+	}
+	// Freshness is part of the wire contract (#1352): the aggregate is a
+	// materialization, and the tile renders "as of <refreshed_at>".
+	if got.RefreshedAt == "" {
+		t.Error("refreshed_at is empty — a materialized aggregate must disclose when it was computed")
+	}
+	if got.RefreshedAt != got.Until {
+		t.Errorf("refreshed_at = %q, until = %q — the window edge is the refresh time by construction", got.RefreshedAt, got.Until)
 	}
 	if !got.Complete {
-		t.Errorf("complete = false with no coverage finding; notes = %v", got.Notes)
+		t.Errorf("complete = false with no truncation; notes = %v", got.Notes)
 	}
 }
 
-// TestActivityAPIPeriods pins the allowlist: a supported key sets both the
-// window width and the label, an unsupported one is a 400 that names the
-// options rather than silently falling back to a period the tile then mislabels.
-func TestActivityAPIPeriods(t *testing.T) {
-	for _, tc := range []struct {
-		key, label string
-		width      time.Duration
-	}{
-		{"1h", "last 1 h", time.Hour},
-		{"6h", "last 6 h", 6 * time.Hour},
-		{"24h", "last 24 h", 24 * time.Hour},
-	} {
-		t.Run(tc.key, func(t *testing.T) {
-			db, mock, closeDB := newSQLMock(t)
-			defer closeDB()
-			mock.ExpectQuery(`COUNT\(\*\) AS n FROM binlog_events`).WillReturnRows(activityResult())
-			code, got, body := getActivity(t, newBootServer(db), "/api/activity?period="+tc.key)
-			if code != 200 {
-				t.Fatalf("code = %d, body = %s", code, body)
-			}
-			if got.Label != tc.label {
-				t.Errorf("label = %q, want %q", got.Label, tc.label)
-			}
-			since, _ := time.Parse(consoleTSFormat, got.Since)
-			until, _ := time.Parse(consoleTSFormat, got.Until)
-			if d := until.Sub(since); d != tc.width {
-				t.Errorf("window = %s, want %s", d, tc.width)
-			}
-		})
+// TestActivityWindowIsLiveRetention pins #1352 point 3: the window IS the live
+// retention, derived from the oldest dated live partition — not a fixed picker
+// period. If rotation keeps 3 hours live, the window is 3 hours, and the label
+// says so.
+func TestActivityWindowIsLiveRetention(t *testing.T) {
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+	now := time.Now().UTC()
+	oldest := now.Add(-3 * time.Hour).Truncate(time.Hour)
+
+	mock.ExpectQuery("PARTITION_NAME FROM information_schema.PARTITIONS").
+		WillReturnRows(partitionsResult(
+			now.Format("p_2006010215"),
+			oldest.Format("p_2006010215"), // the floor, listed out of order on purpose
+			now.Add(-time.Hour).Format("p_2006010215"),
+			"p_future", // never a floor
+		))
+	mock.ExpectQuery(`COUNT\(\*\) AS n FROM binlog_events`).WillReturnRows(activityResult())
+
+	srv := newBootServer(db)
+	srv.cm.boot.dbName = "binlog_index"
+
+	code, got, body := getActivity(t, srv, "/api/activity")
+	if code != 200 {
+		t.Fatalf("code = %d, body = %s", code, body)
+	}
+	if got.Since != oldest.Format(consoleTSFormat) {
+		t.Errorf("since = %q, want the oldest live partition hour %q", got.Since, oldest.Format(consoleTSFormat))
+	}
+	if !strings.HasPrefix(got.Label, "live retention · ~") {
+		t.Errorf("label = %q, want a live-retention label naming the measured window", got.Label)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("window derivation did not run as expected: %v", err)
+	}
+}
+
+// TestActivityReadsLiveTierOnly pins #1352 point 2 by construction: the
+// ordered mock expects EXACTLY the partition listing and the live aggregate —
+// nothing else. Reintroducing the pre-#1352 archive-completeness pass (the
+// query.Plan / archive_state read) issues an unexpected query, which errors the
+// aggregate and fails the 200 assertion; and with the whole archive tier gone
+// the response is still complete with no notes, because the window equals live
+// coverage and can contain no archived-only hours.
+func TestActivityReadsLiveTierOnly(t *testing.T) {
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+	now := time.Now().UTC()
+
+	mock.ExpectQuery("PARTITION_NAME FROM information_schema.PARTITIONS").
+		WillReturnRows(partitionsResult(now.Add(-2 * time.Hour).Format("p_2006010215")))
+	mock.ExpectQuery(`COUNT\(\*\) AS n FROM binlog_events`).
+		WillReturnRows(activityResult(aRow{"shop", "orders", 3, 4}))
+
+	srv := newBootServer(db)
+	srv.cm.boot.dbName = "binlog_index"
+
+	code, got, body := getActivity(t, srv, "/api/activity")
+	if code != 200 {
+		t.Fatalf("code = %d, body = %s", code, body)
+	}
+	if !got.Complete || len(got.Notes) != 0 {
+		t.Errorf("complete = %v notes = %v; the single-tier window has nothing to caveat", got.Complete, got.Notes)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected query traffic (an archive-tier read?): %v", err)
+	}
+}
+
+// TestActivityIsMaterializedAndDisclosesFreshness pins #1352 point 1: the
+// aggregate is precomputed. The mock carries expectations for exactly ONE
+// compute; a second request must be a cache read — same numbers, same
+// refreshed_at (the visible freshness) — and issue no query at all. If the
+// per-request scan came back, the second request would hit sqlmock with an
+// unexpected query and fail loudly.
+func TestActivityIsMaterializedAndDisclosesFreshness(t *testing.T) {
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+	mock.ExpectQuery(`COUNT\(\*\) AS n FROM binlog_events`).
+		WillReturnRows(activityResult(aRow{"shop", "orders", 3, 4}))
+	srv := newBootServer(db)
+
+	code, first, body := getActivity(t, srv, "/api/activity")
+	if code != 200 {
+		t.Fatalf("first code = %d, body = %s", code, body)
+	}
+	code, second, body := getActivity(t, srv, "/api/activity")
+	if code != 200 {
+		t.Fatalf("second code = %d, body = %s", code, body)
+	}
+	if second.RefreshedAt != first.RefreshedAt || second.Deletes != first.Deletes {
+		t.Errorf("second response (%q, %d deletes) is not the cached first (%q, %d deletes)",
+			second.RefreshedAt, second.Deletes, first.RefreshedAt, first.Deletes)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("the second request re-scanned instead of reading the cache: %v", err)
+	}
+}
+
+// TestActivityStaleCacheServesOldAndRefreshes pins the refresh mechanism: a
+// request against a stale cache returns the OLD aggregate immediately — with
+// its ORIGINAL refreshed_at, which is what makes the staleness visible — and
+// starts one background recompute, whose result the next request serves.
+func TestActivityStaleCacheServesOldAndRefreshes(t *testing.T) {
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+	mock.ExpectQuery(`COUNT\(\*\) AS n FROM binlog_events`).
+		WillReturnRows(activityResult(aRow{"shop", "orders", 3, 4}))
+	// The background refresh's compute: different counts, so serving it is
+	// observable.
+	mock.ExpectQuery(`COUNT\(\*\) AS n FROM binlog_events`).
+		WillReturnRows(activityResult(aRow{"shop", "orders", 3, 9}))
+	srv := newBootServer(db)
+
+	if code, first, body := getActivity(t, srv, "/api/activity"); code != 200 {
+		t.Fatalf("first code = %d, body = %s", code, body)
+	} else if first.Deletes != 4 {
+		t.Fatalf("first deletes = %d, want 4", first.Deletes)
 	}
 
-	t.Run("unsupported", func(t *testing.T) {
-		db, _, closeDB := newSQLMock(t)
-		defer closeDB()
-		code, _, body := getActivity(t, newBootServer(db), "/api/activity?period=30d")
-		if code != 400 {
-			t.Fatalf("code = %d, want 400; body = %s", code, body)
+	// Age the entry past the TTL.
+	c := srv.cm.boot.activity
+	c.mu.Lock()
+	for k := range c.stamps {
+		c.stamps[k] = c.stamps[k].Add(-activityRefreshTTL - time.Minute)
+	}
+	c.mu.Unlock()
+
+	// The stale read serves the previous aggregate as-is: old count, old
+	// refreshed_at — stale-but-disclosed, never blocked on the recompute.
+	code, stale, body := getActivity(t, srv, "/api/activity")
+	if code != 200 {
+		t.Fatalf("stale code = %d, body = %s", code, body)
+	}
+	if stale.Deletes != 4 {
+		t.Errorf("stale read deletes = %d, want the previous aggregate's 4", stale.Deletes)
+	}
+
+	// The background flight it started lands the second compute; poll for it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if mock.ExpectationsWereMet() == nil {
+			break
 		}
-		if !strings.Contains(body, "1h") || !strings.Contains(body, "24h") {
-			t.Errorf("400 body must name the supported periods, got %s", body)
+		if time.Now().After(deadline) {
+			t.Fatal("background refresh never ran")
 		}
-	})
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The refresh publishes under the cache lock after the query completes;
+	// poll the served value, not the mock, for the flip.
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		code, refreshed, body := getActivity(t, srv, "/api/activity")
+		if code != 200 {
+			t.Fatalf("refreshed code = %d, body = %s", code, body)
+		}
+		if refreshed.Deletes == 9 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("refreshed deletes = %d, want the recomputed 9", refreshed.Deletes)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestActivityDenyKey pins the cache key: order-insensitive over the same deny
+// set (one profile, one materialization) and distinct across different sets
+// (two profiles must never share counts — a table NAME is exactly what a deny
+// profile withholds).
+func TestActivityDenyKey(t *testing.T) {
+	a := []query.SchemaTable{{Schema: "shop", Table: "secrets"}, {Schema: "hr", Table: "salaries"}}
+	b := []query.SchemaTable{{Schema: "hr", Table: "salaries"}, {Schema: "shop", Table: "secrets"}}
+	if activityDenyKey(a) != activityDenyKey(b) {
+		t.Error("same deny set in different order produced different cache keys")
+	}
+	if activityDenyKey(a) == activityDenyKey(a[:1]) {
+		t.Error("different deny sets share a cache key — a redaction bypass via the cache")
+	}
+	if activityDenyKey(nil) != "" || activityDenyKey(nil) == activityDenyKey(a) {
+		t.Error("the empty deny set must key separately from every profile")
+	}
+}
+
+// TestBundleAlwaysCarriesActivityCache pins the wiring that keeps the cached
+// path from silently degrading to per-request scans: every production bundle
+// (newBundleDerived is the single production constructor) carries a cache, and
+// a derived-only rebuild keeps the SAME cache warm.
+func TestBundleAlwaysCarriesActivityCache(t *testing.T) {
+	b := newBundleDerived(nil, "db", ServerEntry{ID: "x"}, false)
+	if b.activity == nil {
+		t.Fatal("newBundleDerived built a bundle with no activity cache — /api/activity would re-scan per request")
+	}
+	cm := newConnManager(nil, false)
+	cm.bundles["x"] = b
+	cm.rebuildDerived(ServerEntry{ID: "x"})
+	if cm.bundles["x"].activity != b.activity {
+		t.Error("rebuildDerived dropped the warm activity cache")
+	}
 }
 
 // TestActivitySQLPrunesPartitions pins the two properties the aggregate's cost
@@ -242,7 +420,7 @@ func TestActivityAggFold(t *testing.T) {
 	a.add("db", "aaa", 1, 4)
 	a.add("db", "big", 2, 9)
 	a.add("db", "big", 5, 1) // EventGTID → Other, but still this table's activity
-	resp := a.response("1h", "last 1 h", time.Now(), time.Now())
+	resp := a.response("last 1 h", time.Now(), time.Now())
 
 	if resp.Total != 18 || resp.Inserts != 8 || resp.Updates != 9 || resp.Deletes != 0 || resp.Other != 1 {
 		t.Errorf("fold = total %d ins %d upd %d del %d other %d", resp.Total, resp.Inserts, resp.Updates, resp.Deletes, resp.Other)
@@ -271,7 +449,7 @@ func TestActivityAggCapsRenderedTables(t *testing.T) {
 	for i := 0; i < activityTopTables+5; i++ {
 		a.add("db", string(rune('a'+i)), 1, int64(i+1))
 	}
-	resp := a.response("1h", "last 1 h", time.Now(), time.Now())
+	resp := a.response("last 1 h", time.Now(), time.Now())
 	if len(resp.TopTables) != activityTopTables {
 		t.Errorf("top_tables = %d, want %d", len(resp.TopTables), activityTopTables)
 	}
@@ -280,121 +458,28 @@ func TestActivityAggCapsRenderedTables(t *testing.T) {
 	}
 }
 
-// TestArchivedHoursInWindow pins the completeness rule. The aggregate reads
-// LIVE binlog_events only, so an hour that has rotated into Parquet is an hour
-// its counts cannot see — that is the number the caveat is built on. Gap hours
-// are NOT it: nothing retrievable lives there, and counting them would cry wolf
-// on every index younger than the window and on every lapsed future-partition
-// horizon.
-func TestArchivedHoursInWindow(t *testing.T) {
-	h := func(n int) time.Time { return time.Date(2026, 8, 9, n, 0, 0, 0, time.UTC) }
-	since, until := h(10), h(13) // window hours: 10, 11, 12, 13
-
-	cases := []struct {
-		name string
-		plan *query.QueryPlan
-		want int
-	}{
-		{"all live", &query.QueryPlan{MySQLRanges: []query.TimeRange{{Start: h(10), End: h(14)}}}, 0},
-		{"two hours archived", &query.QueryPlan{MySQLRanges: []query.TimeRange{{Start: h(12), End: h(14)}}}, 2},
-		{"gap hours are not undercounts", &query.QueryPlan{
-			MySQLRanges: []query.TimeRange{{Start: h(12), End: h(14)}},
-			GapHours:    []time.Time{h(10), h(11)},
-		}, 0},
-		{"nil plan claims nothing", nil, 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := archivedHoursInWindow(tc.plan, since, until); got != tc.want {
-				t.Errorf("archivedHoursInWindow = %d, want %d", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestActivityArchivedWindowIsNotComplete pins the WIRING of the rule above
-// through the handler: with part of the window rotated into Parquet, the
-// response must say so. Without it the tile answers a "last 24 h" label with
-// only the hours still live — a wrong number under an explicit period, which is
-// strictly worse than the mislabelled one #1300 started from.
-func TestActivityArchivedWindowIsNotComplete(t *testing.T) {
-	db, mock, closeDB := newSQLMock(t)
-	defer closeDB()
-	now := time.Now().UTC()
-	prev := now.Add(-time.Hour)
-
-	mock.ExpectQuery(`COUNT\(\*\) AS n FROM binlog_events`).WillReturnRows(activityResult())
-	// Only the current hour has a live partition; the previous hour is in
-	// archive_state, so it is archived-away, not a gap.
-	mock.ExpectQuery("PARTITION_NAME FROM information_schema.PARTITIONS").
-		WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME"}).AddRow(now.Format("p_2006010215")))
-	mock.ExpectQuery("FROM archive_state").
-		WillReturnRows(sqlmock.NewRows([]string{"partition_name", "min_event_ts", "max_event_ts"}).
-			AddRow(prev.Format("p_2006010215"), nil, nil))
-
-	srv := newBootServer(db)
-	// The planner is dbName-gated; a bundle without one makes Plan a no-op.
-	srv.cm.boot.dbName = "binlog_index"
-
-	code, got, body := getActivity(t, srv, "/api/activity?period=1h")
-	if code != 200 {
-		t.Fatalf("code = %d, body = %s", code, body)
-	}
-	if got.Complete {
-		t.Fatalf("complete = true with an archived hour inside the window; notes = %v", got.Notes)
-	}
-	if len(got.Notes) == 0 || !strings.Contains(got.Notes[0], "archived") {
-		t.Errorf("notes must name the archived hours, got %v", got.Notes)
-	}
-}
-
-// TestActivityUnreadableArchiveStateIsNotComplete (#1324): before the plan
-// carried ArchiveCoverageUnavailable, an unreadable archive_state made
-// query.Plan return (plan, nil) with every archived hour classified as a gap
-// — the perr branch never fired, archivedHoursInWindow counted 0, and the
-// tile said "complete" over a window nobody checked. A missing table (1146,
-// an index that never archived) keeps today's behaviour: no note, complete.
-func TestActivityUnreadableArchiveStateIsNotComplete(t *testing.T) {
+// TestWindowLabel pins the human-sized width summary: rounded, tilde-marked,
+// hours under two days and days beyond.
+func TestWindowLabel(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		errno        uint16
-		wantComplete bool
+		d    time.Duration
+		want string
 	}{
-		{"unreadable table", 1142, false}, // ER_TABLEACCESS_DENIED_ERROR
-		{"no archive tier", 1146, true},   // ER_NO_SUCH_TABLE
+		{30 * time.Minute, "~1 h"},
+		{90 * time.Minute, "~2 h"},
+		{14 * time.Hour, "~14 h"},
+		{47 * time.Hour, "~47 h"},
+		{49 * time.Hour, "~2 d"},
+		{6 * 24 * time.Hour, "~6 d"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			db, mock, closeDB := newSQLMock(t)
-			defer closeDB()
-			now := time.Now().UTC()
-
-			mock.ExpectQuery(`COUNT\(\*\) AS n FROM binlog_events`).WillReturnRows(activityResult())
-			mock.ExpectQuery("PARTITION_NAME FROM information_schema.PARTITIONS").
-				WillReturnRows(sqlmock.NewRows([]string{"PARTITION_NAME"}).AddRow(now.Format("p_2006010215")))
-			mock.ExpectQuery("FROM archive_state").
-				WillReturnError(&mysql.MySQLError{Number: tc.errno, Message: "induced"})
-
-			srv := newBootServer(db)
-			// The planner is dbName-gated; a bundle without one makes Plan a no-op.
-			srv.cm.boot.dbName = "binlog_index"
-
-			code, got, body := getActivity(t, srv, "/api/activity?period=1h")
-			if code != 200 {
-				t.Fatalf("code = %d, body = %s", code, body)
-			}
-			if got.Complete != tc.wantComplete {
-				t.Fatalf("complete = %v, want %v; notes = %v", got.Complete, tc.wantComplete, got.Notes)
-			}
-			if !tc.wantComplete && (len(got.Notes) == 0 || !strings.Contains(got.Notes[0], "could not be read")) {
-				t.Errorf("notes must say the archive records were unreadable, got %v", got.Notes)
-			}
-		})
+		if got := windowLabel(tc.d); got != tc.want {
+			t.Errorf("windowLabel(%s) = %q, want %q", tc.d, got, tc.want)
+		}
 	}
 }
 
 // TestActivityUnopenedIndexIsNotZero: a server whose index connection never
-// opened must fail loudly. "0 deletes in the last 24 h" is an assurance, and
-// nobody measured it.
+// opened must fail loudly. "0 deletes" is an assurance, and nobody measured it.
 func TestActivityUnopenedIndexIsNotZero(t *testing.T) {
 	srv := &Server{token: "t", cm: newConnManager(nil, false)}
 	srv.cm.boot = &bundle{db: nil, noArchive: true}

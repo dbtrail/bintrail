@@ -1232,9 +1232,16 @@ try {
   ovLive.scopes.every((s) => s.trim() !== "")
     ? ok("overview (live): every rendered tile carries a scope line")
     : bad("overview (live): every rendered tile carries a scope line", JSON.stringify(ovLive.scopes));
-  (ovLive.scopes.filter((s) => /^last \d+ h/.test(s)).length === 2)
-    ? ok("overview (live): the window tiles carry a real period from /api/activity")
-    : bad("overview (live): the window tiles carry a real period from /api/activity", JSON.stringify(ovLive));
+  // The window is the live retention (#1352): "live retention · ~N h/d" when a
+  // dated partition names the floor, the stated 24 h fallback otherwise.
+  (ovLive.scopes.filter((s) => /^(live retention · ~\d+ [hd]|last 24 h)/.test(s)).length === 2)
+    ? ok("overview (live): the window tiles carry a real window from /api/activity")
+    : bad("overview (live): the window tiles carry a real window from /api/activity", JSON.stringify(ovLive));
+  // The aggregate is a server-side materialization (#1352): its freshness must
+  // be rendered with its numbers, or a stale count reads as live.
+  (ovLive.scopes.filter((s) => / · as of \d{2}:\d{2}:\d{2}/.test(s)).length === 2)
+    ? ok("overview (live): the window tiles disclose the aggregate's refresh time")
+    : bad("overview (live): the window tiles disclose the aggregate's refresh time", JSON.stringify(ovLive));
   (/window\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(ovLive.win) && !ovLive.warns.some((w) => /window counts could not be loaded/.test(w)))
     ? ok("overview (live): the window line states the aggregate's own bounds")
     : bad("overview (live): the window line states the aggregate's own bounds", JSON.stringify(ovLive));
@@ -1258,7 +1265,7 @@ try {
     // window line or a tile, the number is attributed to the wrong span.
     status: { coverage: { oldest: "2020-01-01 00:00:00", newest: "2026-06-30 00:00:00", total_events: 123456 }, total_events_estimate: 3121 },
     activity: {
-      period: "24h", label: "last 24 h",
+      label: "live retention · ~24 h", refreshed_at: "2026-03-02 09:00:00",
       since: "2026-03-01 09:00:00", until: "2026-03-02 09:00:00",
       total: 640, inserts: 400, updates: 223, deletes: 17, other: 0,
       tables: 5, complete: true,
@@ -1283,7 +1290,7 @@ try {
     // under a wider label is the bug), and a failed aggregate must render "—"
     // rather than a zero nobody measured.
     buildOverview(fx.status, { events: fx.events }, null,
-      Object.assign({}, fx.activity, { complete: false, notes: ["3 hour(s) of this window have been archived to Parquet and are NOT counted here."] }));
+      Object.assign({}, fx.activity, { complete: false, truncated: true, notes: ["This index has more than 20000 table/event-type groups in the window; the counts below are a floor, not the total."] }));
     const partial = { tiles: readTiles(), notes: notes() };
     buildOverview(fx.status, { events: fx.events }, null, null);
     const missing = { tiles: readTiles(), notes: notes() };
@@ -1294,12 +1301,12 @@ try {
   (ov.full.tiles.length === 4 && ov.full.tiles.every((t) => t.scope.trim() !== ""))
     ? ok("overview: every tile states its own scope")
     : bad("overview: every tile states its own scope", JSON.stringify(ov.full.tiles));
-  (tileBy(ov.full.tiles, "deletes").v === "17" && tileBy(ov.full.tiles, "deletes").scope.includes("last 24 h"))
-    ? ok("overview: the deletes tile is the server aggregate, labelled with its period")
-    : bad("overview: the deletes tile is the server aggregate, labelled with its period", JSON.stringify(tileBy(ov.full.tiles, "deletes")));
-  (tileBy(ov.full.tiles, "tables touched").v === "5" && tileBy(ov.full.tiles, "tables touched").scope.includes("last 24 h"))
-    ? ok("overview: the tables-touched tile is the server aggregate, labelled with its period")
-    : bad("overview: the tables-touched tile is the server aggregate, labelled with its period", JSON.stringify(tileBy(ov.full.tiles, "tables touched")));
+  (tileBy(ov.full.tiles, "deletes").v === "17" && tileBy(ov.full.tiles, "deletes").scope.includes("live retention") && tileBy(ov.full.tiles, "deletes").scope.includes("as of 09:00:00"))
+    ? ok("overview: the deletes tile is the server aggregate, labelled with its window and freshness")
+    : bad("overview: the deletes tile is the server aggregate, labelled with its window and freshness", JSON.stringify(tileBy(ov.full.tiles, "deletes")));
+  (tileBy(ov.full.tiles, "tables touched").v === "5" && tileBy(ov.full.tiles, "tables touched").scope.includes("live retention"))
+    ? ok("overview: the tables-touched tile is the server aggregate, labelled with its window")
+    : bad("overview: the tables-touched tile is the server aggregate, labelled with its window", JSON.stringify(tileBy(ov.full.tiles, "tables touched")));
   // total_events_estimate is information_schema TABLE_ROWS — an InnoDB
   // estimate. It sits beside three exact counts, so the tile has to say so.
   (tileBy(ov.full.tiles, "changes indexed").scope.includes("all time") && /estimate/i.test(tileBy(ov.full.tiles, "changes indexed").scope))
@@ -1308,7 +1315,7 @@ try {
   (ov.full.win.includes("2026-03-01 09:00:00") && ov.full.win.includes("2026-03-02 09:00:00") && !ov.full.win.includes("2020-01-01"))
     ? ok("overview: window line uses the aggregate's own bounds")
     : bad("overview: window line uses the aggregate's own bounds", ov.full.win);
-  (tileBy(ov.partial.tiles, "deletes").scope.includes("partial") && ov.partial.notes.some((n) => /archived/.test(n)))
+  (tileBy(ov.partial.tiles, "deletes").scope.includes("partial") && ov.partial.notes.some((n) => /floor/.test(n)))
     ? ok("overview: an incomplete window is marked partial on the tile and explained")
     : bad("overview: an incomplete window is marked partial on the tile and explained", JSON.stringify(ov.partial));
   (tileBy(ov.missing.tiles, "deletes").v === "—" && tileBy(ov.missing.tiles, "tables touched").v === "—" && ov.missing.notes.length > 0)

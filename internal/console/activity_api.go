@@ -8,13 +8,15 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/event"
+	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
-// GET /api/activity — the Overview's window aggregate (#1300).
+// GET /api/activity — the Overview's window aggregate (#1300, redesigned #1352).
 //
 // Why this exists at all: the Overview used to derive "N deletes" and "N tables
 // touched" client-side from a 200-event /api/events fetch. That made the tiles
@@ -24,9 +26,24 @@ import (
 // from a grouped COUNT(*) over a stated time window, so the tile can name its
 // own scope and the page no longer needs the row images.
 //
-// Deliberately NOT cached. This is the one page whose entire purpose is "what
-// changed recently"; a cache would freeze exactly the numbers an operator is
-// watching, and would leave the cost unchanged everywhere else (#1300).
+// PRECOMPUTED since #1352, superseding #1300's "deliberately NOT cached" stance.
+// That stance reasoned that a cache would freeze exactly the numbers an operator
+// is watching — but it lost to an unusable page: the per-request scan put the
+// landing page's first paint behind an aggregate measured in tens of seconds.
+// Declared staleness beats a per-request scan: the aggregate is materialized
+// per server (per bundle), refreshed when older than activityRefreshTTL, and
+// every response carries refreshed_at, which the tile renders ("as of …") — a
+// frozen number that SAYS when it froze is disclosure, not a lie. The refresh
+// is lazy (recompute-on-request-if-stale, serving the previous aggregate while
+// one flight recomputes in the background), so an idle console runs no scans
+// and no daemon loop is needed — the mechanism works identically under `serve`
+// and `watch`.
+//
+// SINGLE-TIER since #1352: the aggregate reads live binlog_events EXCLUSIVELY —
+// no archive counts, and no archive_state read for a completeness caveat,
+// because the window IS the live retention (see liveWindow). A window equal to
+// live coverage cannot contain archived-only hours, so the old planner-backed
+// "N hour(s) … archived" caveat has nothing to caveat and left this page.
 //
 // Deliberately NOT audited. ext.Record fires from surfaces that serve HISTORICAL
 // ROW DATA; this endpoint returns counts and table names only — never a row
@@ -34,11 +51,6 @@ import (
 // metadata-only side of the line ext/audit.go draws. Emitting query.run here
 // would put a page load in the trail next to real data reads and dilute it.
 const (
-	// activityDefaultPeriod is the window the Overview asks for when it says
-	// nothing else: long enough that a quiet production system still shows
-	// activity, short enough to keep the scan bounded (see activityPeriods).
-	activityDefaultPeriod = "24h"
-
 	// activityTopTables caps the per-table breakdown returned to the browser.
 	// The totals and the distinct-table count are computed over EVERY group —
 	// only the rendered list is truncated, so "9 tables touched" is never the
@@ -49,29 +61,34 @@ const (
 	// handler will fold before it gives up on exactness. MySQL materializes the
 	// grouping; the console is a shared daemon (under `bintrail-console watch`
 	// it also runs capture), so an index with a pathological table count must
-	// not be able to turn a page load into an unbounded Go-side map. Reaching
+	// not be able to turn a refresh into an unbounded Go-side map. Reaching
 	// the cap sets Truncated, and the response then says the counts are a floor
 	// rather than presenting them as the window's total.
 	activityMaxGroups = 20000
-)
 
-// activityPeriods is the allowlist of windows this endpoint will aggregate.
-//
-// The ceiling is deliberate, not arbitrary. binlog_events is RANGE-partitioned
-// by hour, so a bounded event_timestamp predicate prunes to the hours in the
-// window — but no index leads with event_timestamp (idx_row_lookup leads with
-// schema_name) and event_type is in no index at all, so the aggregate is a full
-// scan of the pruned partitions plus a grouping pass. 24 h caps that at ~25
-// hourly partitions. A week-long aggregate is a reporting query, not a dashboard
-// tile that loads on every visit to the landing page; it does not belong here.
-var activityPeriods = map[string]struct {
-	dur   time.Duration
-	label string
-}{
-	"1h":  {time.Hour, "last 1 h"},
-	"6h":  {6 * time.Hour, "last 6 h"},
-	"24h": {24 * time.Hour, "last 24 h"},
-}
+	// activityRefreshTTL is how old a cached aggregate may grow before a
+	// request triggers a recompute. The tile prints refreshed_at, so within
+	// this budget the numbers are stale-but-disclosed, never stale-and-silent.
+	activityRefreshTTL = 30 * time.Minute
+
+	// activityComputeTimeout bounds one materialization flight. Flights run on
+	// a background context (a browser navigating away must not abort the
+	// refresh every OTHER tab is waiting on), so they need their own leash.
+	activityComputeTimeout = 5 * time.Minute
+
+	// activityMaxProfiles caps the cached aggregates per server. The cache is
+	// keyed by the session's RBAC deny set (each deny profile must see its own
+	// counts — a table NAME is exactly what a deny profile withholds), and
+	// profiles are operator-configured and few; the cap only stops a
+	// pathological profile churn from growing the map without bound.
+	activityMaxProfiles = 16
+
+	// activityFallbackWindow is the window when the live floor cannot be
+	// determined (no dated partitions yet, or a bundle with no database name):
+	// bounded and stated, like the pre-#1352 default.
+	activityFallbackWindow = 24 * time.Hour
+	activityFallbackLabel  = "last 24 h"
+)
 
 // activityTable is one table's breakdown inside the window.
 type activityTable struct {
@@ -87,12 +104,19 @@ type activityTable struct {
 // [since, until) and nothing else — the frontend prints Label on the tiles so
 // the scope travels WITH the number instead of sitting in prose above the card.
 type activityResponse struct {
-	// Period is the requested window key ("24h"); Label is what a tile prints
-	// ("last 24 h"). The server owns the wording so the two can never disagree.
-	Period string `json:"period"`
-	Label  string `json:"label"`
-	Since  string `json:"since"`
-	Until  string `json:"until"`
+	// Label is what a tile prints ("live retention · ~14 h"). The server owns
+	// the wording so the tile and the window can never disagree. Since/Until
+	// are the measured window's exact bounds; Until is the refresh time, so a
+	// cached response's window edge matches its refreshed_at instead of
+	// claiming a currency nobody measured.
+	Label string `json:"label"`
+	Since string `json:"since"`
+	Until string `json:"until"`
+	// RefreshedAt is when this aggregate was computed. The counts are a
+	// materialization refreshed at most every activityRefreshTTL (#1352), and
+	// this is the field that keeps that honest: the UI renders it on the tile
+	// ("as of …"), so a stale number is visibly stale, never silently so.
+	RefreshedAt string `json:"refreshed_at"`
 
 	Total   int64 `json:"total"`
 	Inserts int64 `json:"inserts"`
@@ -108,9 +132,10 @@ type activityResponse struct {
 	TopTables []activityTable `json:"top_tables"`
 
 	// Complete is false when something in the window is knowably NOT in these
-	// numbers; Notes then says what. A tile must never present a narrower
-	// number under a wider label — that is the bug this endpoint exists to fix,
-	// so an undercount we can detect is reported, never swallowed.
+	// numbers; Notes then says what. Since #1352 the only such case is
+	// Truncated (the window is the live retention by construction, so no
+	// archived-only hours can fall inside it), but the field stays: a tile
+	// must never present a narrower number under a wider label.
 	Complete bool     `json:"complete"`
 	Notes    []string `json:"notes,omitempty"`
 	// Truncated reports that activityMaxGroups tripped: the counts are a floor.
@@ -122,30 +147,19 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 	if b == nil {
 		return
 	}
-	key := strings.TrimSpace(r.URL.Query().Get("period"))
-	if key == "" {
-		key = activityDefaultPeriod
-	}
-	p, ok := activityPeriods[key]
-	if !ok {
-		writeJSONError(w, http.StatusBadRequest,
-			"unknown period "+key+"; supported: "+strings.Join(activityPeriodKeys(), ", "))
-		return
-	}
 	if b.db == nil {
 		// An unopened bundle connection must not render as a quiet zero: "0
-		// deletes in the last 24 h" reads as an assurance nobody earned.
+		// deletes" reads as an assurance nobody earned.
 		writeJSONError(w, http.StatusBadGateway, "the selected server's index connection is not open")
 		return
 	}
 
-	until := time.Now().UTC().Truncate(time.Second)
-	since := until.Add(-p.dur)
-
 	// RBAC: the same deny rules every read on this server carries — startup
 	// floor plus the request session's profile. Denied tables are excluded from
 	// the SQL, so they contribute to neither the counts nor the table list (a
-	// table NAME is exactly what a deny profile withholds elsewhere).
+	// table NAME is exactly what a deny profile withholds elsewhere). The cache
+	// is keyed by the resolved deny set for the same reason: two sessions under
+	// different profiles must never share a materialization.
 	opts, err := s.applySessionProfile(r.Context(), r, b, query.Options{
 		DenyTables:    s.denyTables,
 		RedactColumns: s.redactCols,
@@ -156,71 +170,229 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agg, err := collectActivity(r.Context(), b.db, since, until, opts.DenyTables)
+	resp, err := b.activityFor(r.Context(), opts.DenyTables)
 	if err != nil {
 		writeFetchError(w, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, resp)
+}
 
-	resp := agg.response(key, p.label, since, until)
-
-	// Completeness. The counts above come from LIVE binlog_events only — by
-	// design: aggregating the Parquet archives would mean the DuckDB scan this
-	// endpoint exists to remove from the page. So ask the planner whether the
-	// window has hours whose data lives ONLY in the archives, and say so when
-	// it does. Without this, an index with rotation would answer a "last 24 h"
-	// tile with the few hours still live — a silently WRONG number under an
-	// explicit label, which is strictly worse than the mislabelled one this
-	// issue started from.
-	//
-	// noArchive is false here on purpose even for a server that never READS
-	// archives (--no-archive, or a profiled session): archive_state is index
-	// metadata, and knowing that part of the window is archived is precisely
-	// what makes the caveat honest. Passing the bundle's noArchive would
-	// reclassify those hours as gaps and silence the caveat.
-	resp.Complete = !resp.Truncated
-	// AllArchives (#1232), for the same reason noArchive is false above: this
-	// reads archive_state as INDEX METADATA to caveat a count, not to decide
-	// what a fetch will open. Scoping it would drop hours that are archived
-	// and silence the caveat they exist to raise.
-	plan, perr := query.Plan(r.Context(), b.db, b.dbName, &since, &until, false, query.AllArchives())
-	switch {
-	case perr != nil:
-		// Never assume completeness we could not check.
-		slog.Warn("console: activity coverage not evaluated", "server", serverID(r), "error", perr)
-		resp.Complete = false
-		resp.Notes = append(resp.Notes, "Coverage for this window could not be checked, so these counts may be missing archived hours.")
-	case plan != nil && plan.ArchiveCoverageUnavailable:
-		// Same stance one layer down (#1324): the planner ran but could not
-		// read archive_state, so every archived hour in the window classified
-		// as a gap and archivedHoursInWindow below would count 0. Before the
-		// plan carried this, an unreadable archive tier rendered as
-		// "complete". (Plan already logged the underlying error at Warn.)
-		resp.Complete = false
-		resp.Notes = append(resp.Notes, "The archive records for this window could not be read, so these counts may be missing archived hours.")
-	case plan != nil:
-		if n := archivedHoursInWindow(plan, since, until); n > 0 {
-			resp.Complete = false
-			resp.Notes = append(resp.Notes, fmt.Sprintf(
-				"%d hour(s) of this window have been archived to Parquet and are NOT counted here — these totals cover the live index only.", n))
-		}
+// activityFor returns the materialized aggregate for this server under the
+// given deny set, computing it when no cached copy exists (single-flight:
+// concurrent misses share one computation) and serving the cached copy —
+// with its original refreshed_at — while a stale one recomputes in the
+// background.
+func (b *bundle) activityFor(ctx context.Context, deny []query.SchemaTable) (activityResponse, error) {
+	compute := func(cctx context.Context) (activityResponse, error) {
+		return computeActivity(cctx, b.db, b.dbName, deny)
 	}
+	if b.activity == nil {
+		// Test-constructed bundles only: every production bundle gets its cache
+		// in newBundleDerived (pinned by TestBundleAlwaysCarriesActivityCache).
+		return compute(ctx)
+	}
+	return b.activity.get(ctx, activityDenyKey(deny), compute)
+}
+
+// computeActivity is one materialization flight: derive the live-retention
+// window, run the aggregate over live binlog_events, fold, and stamp the
+// result. This is the ONLY data path behind /api/activity — there is no
+// archive read to fall back to (see the #1352 header comment).
+func computeActivity(ctx context.Context, db *sql.DB, dbName string, deny []query.SchemaTable) (activityResponse, error) {
+	until := time.Now().UTC().Truncate(time.Second)
+	since, label, err := liveWindow(ctx, db, dbName, until)
+	if err != nil {
+		return activityResponse{}, err
+	}
+	agg, err := collectActivity(ctx, db, since, until, deny)
+	if err != nil {
+		return activityResponse{}, err
+	}
+	resp := agg.response(label, since, until)
+	resp.RefreshedAt = until.Format(consoleTSFormat)
+	resp.Complete = !resp.Truncated
 	if resp.Truncated {
 		resp.Notes = append(resp.Notes, fmt.Sprintf(
 			"This index has more than %d table/event-type groups in the window; the counts below are a floor, not the total.", activityMaxGroups))
 	}
-	writeJSON(w, http.StatusOK, resp)
+	return resp, nil
 }
 
-// activityPeriodKeys returns the allowlist in ascending duration order, for the
-// 400 message. Map iteration order would make the error text non-deterministic.
-func activityPeriodKeys() []string {
-	keys := make([]string, 0, len(activityPeriods))
-	for k := range activityPeriods {
-		keys = append(keys, k)
+// liveWindow derives the Overview's window from what the live table actually
+// holds: since = the oldest dated live partition's hour, until = now. The
+// window IS the live retention (#1352) — if rotation keeps 12 hours live, the
+// window is 12 hours — which is what makes the single-tier read honest by
+// construction: a window equal to live coverage cannot contain archived-only
+// hours, so no completeness caveat is needed and none is computed.
+//
+// When the floor cannot be determined — no dated partitions yet (a fresh index
+// whose rows all sit in p_future) or a bundle with no database name — the
+// window falls back to a bounded, stated activityFallbackWindow rather than an
+// unbounded scan or a fabricated floor.
+func liveWindow(ctx context.Context, db *sql.DB, dbName string, until time.Time) (time.Time, string, error) {
+	if dbName == "" {
+		return until.Add(-activityFallbackWindow), activityFallbackLabel, nil
 	}
-	sort.Slice(keys, func(i, j int) bool { return activityPeriods[keys[i]].dur < activityPeriods[keys[j]].dur })
-	return keys
+	rows, err := db.QueryContext(ctx, `
+		SELECT PARTITION_NAME FROM information_schema.PARTITIONS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events' AND PARTITION_NAME IS NOT NULL`, dbName)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("list live partitions: %w", err)
+	}
+	defer rows.Close()
+	var oldest time.Time
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return time.Time{}, "", err
+		}
+		t, ok := indexer.PartitionDate(name)
+		if !ok {
+			continue // p_future / malformed
+		}
+		if oldest.IsZero() || t.Before(oldest) {
+			oldest = t
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return time.Time{}, "", err
+	}
+	if oldest.IsZero() || !oldest.Before(until) {
+		return until.Add(-activityFallbackWindow), activityFallbackLabel, nil
+	}
+	return oldest, "live retention · " + windowLabel(until.Sub(oldest)), nil
+}
+
+// windowLabel renders an approximate width for the tile ("~14 h", "~3 d"). The
+// exact bounds travel in since/until; the label is the human-sized summary, and
+// the tilde marks it as rounded so it never overclaims.
+func windowLabel(d time.Duration) string {
+	hrs := int(d.Round(time.Hour) / time.Hour)
+	if hrs < 1 {
+		hrs = 1
+	}
+	if hrs < 48 {
+		return fmt.Sprintf("~%d h", hrs)
+	}
+	return fmt.Sprintf("~%d d", (hrs+12)/24)
+}
+
+// activityDenyKey canonicalizes a deny set into a cache key: same tables in any
+// order → same key, so a session's counts are shared per PROFILE, not per
+// request ordering.
+func activityDenyKey(deny []query.SchemaTable) string {
+	if len(deny) == 0 {
+		return ""
+	}
+	keys := make([]string, len(deny))
+	for i, dt := range deny {
+		keys[i] = dt.Schema + "\x00" + dt.Table
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, "\x01")
+}
+
+// activityCache is one server's materialized Overview aggregates, keyed by
+// RBAC deny set. Lives on the bundle so it shares the connection's lifecycle:
+// evicting a server (DSN edit/delete) drops its materialization with it.
+type activityCache struct {
+	mu      sync.Mutex
+	entries map[string]activityResponse
+	stamps  map[string]time.Time
+	flights map[string]*activityFlight
+}
+
+// activityFlight is one in-progress materialization. resp/err are written
+// before done is closed; waiters read them only after <-done.
+type activityFlight struct {
+	done chan struct{}
+	resp activityResponse
+	err  error
+}
+
+func newActivityCache() *activityCache {
+	return &activityCache{
+		entries: map[string]activityResponse{},
+		stamps:  map[string]time.Time{},
+		flights: map[string]*activityFlight{},
+	}
+}
+
+// get implements the read path described on handleActivity:
+//   - cached and fresh → return it;
+//   - cached and stale → return it AS IS (its refreshed_at discloses the age)
+//     and start ONE background recompute for the next request;
+//   - not cached → compute now, single-flight (concurrent misses wait for the
+//     same flight rather than each scanning).
+//
+// The compute always runs on a background context with its own timeout: the
+// flight outlives the request that started it on purpose, so a canceled tab
+// neither aborts the refresh other waiters share nor leaves the cache cold.
+func (c *activityCache) get(ctx context.Context, key string, compute func(context.Context) (activityResponse, error)) (activityResponse, error) {
+	c.mu.Lock()
+	if resp, ok := c.entries[key]; ok {
+		if time.Since(c.stamps[key]) >= activityRefreshTTL && c.flights[key] == nil {
+			f := &activityFlight{done: make(chan struct{})}
+			c.flights[key] = f
+			go c.run(key, f, compute, true)
+		}
+		c.mu.Unlock()
+		return resp, nil
+	}
+	f := c.flights[key]
+	if f == nil {
+		f = &activityFlight{done: make(chan struct{})}
+		c.flights[key] = f
+		go c.run(key, f, compute, false)
+	}
+	c.mu.Unlock()
+	select {
+	case <-f.done:
+		return f.resp, f.err
+	case <-ctx.Done():
+		return activityResponse{}, ctx.Err()
+	}
+}
+
+// run executes one flight and publishes its result. A FAILED background
+// refresh keeps the previous entry (stale-but-disclosed beats an error page on
+// the landing tile) and logs; the flight is cleared either way, so the next
+// request retries instead of waiting for a TTL that will never restamp.
+func (c *activityCache) run(key string, f *activityFlight, compute func(context.Context) (activityResponse, error), background bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), activityComputeTimeout)
+	defer cancel()
+	resp, err := compute(ctx)
+	c.mu.Lock()
+	if err == nil {
+		c.entries[key] = resp
+		c.stamps[key] = time.Now()
+		c.evictOverCapLocked()
+	}
+	delete(c.flights, key)
+	c.mu.Unlock()
+	if err != nil && background {
+		slog.Warn("console: activity refresh failed; the previous aggregate stays on screen with its refreshed_at", "error", err)
+	}
+	f.resp, f.err = resp, err
+	close(f.done)
+}
+
+// evictOverCapLocked drops the oldest entries beyond activityMaxProfiles.
+// Caller holds c.mu.
+func (c *activityCache) evictOverCapLocked() {
+	for len(c.entries) > activityMaxProfiles {
+		var oldestKey string
+		var oldestAt time.Time
+		first := true
+		for k, at := range c.stamps {
+			if first || at.Before(oldestAt) {
+				oldestKey, oldestAt, first = k, at, false
+			}
+		}
+		delete(c.entries, oldestKey)
+		delete(c.stamps, oldestKey)
+	}
 }
 
 // activityAgg folds the grouped rows. It is separate from the SQL so the fold
@@ -278,7 +450,7 @@ func (a *activityAgg) add(schema, table string, etype uint8, n int64) bool {
 // response renders the aggregate. TopTables is sorted by total descending with
 // the table key as the tiebreaker so the panel does not reshuffle between two
 // loads of the same data.
-func (a *activityAgg) response(period, label string, since, until time.Time) activityResponse {
+func (a *activityAgg) response(label string, since, until time.Time) activityResponse {
 	tables := make([]activityTable, 0, len(a.byTable))
 	for _, t := range a.byTable {
 		tables = append(tables, *t)
@@ -293,7 +465,6 @@ func (a *activityAgg) response(period, label string, since, until time.Time) act
 		tables = tables[:activityTopTables]
 	}
 	return activityResponse{
-		Period:    period,
 		Label:     label,
 		Since:     since.Format(consoleTSFormat),
 		Until:     until.Format(consoleTSFormat),
@@ -355,42 +526,4 @@ func collectActivity(ctx context.Context, db *sql.DB, since, until time.Time, de
 		return nil, err
 	}
 	return agg, nil
-}
-
-// archivedHoursInWindow counts the hours of [since, until) whose data has been
-// rotated out of live MySQL but IS held in the Parquet archives — the hours the
-// live aggregate cannot see.
-//
-// GapHours are deliberately NOT counted. A gap hour holds no retrievable data
-// anywhere, so there is nothing the aggregate failed to count; folding them in
-// would also cry wolf twice over — every hour older than the index itself is a
-// "gap" (#1126), and so is the leading edge of an index whose future-partition
-// horizon has lapsed and whose newest events are landing in p_future (where
-// this aggregate DOES count them, since it filters by timestamp, not by
-// partition). Data actually lost in a gap is the coverage card's continuity
-// verdict, which sits directly above these tiles.
-func archivedHoursInWindow(plan *query.QueryPlan, since, until time.Time) int {
-	if plan == nil {
-		return 0
-	}
-	live := make(map[time.Time]bool)
-	for _, rg := range plan.MySQLRanges {
-		for h := rg.Start; h.Before(rg.End); h = h.Add(time.Hour) {
-			live[h] = true
-		}
-	}
-	gap := make(map[time.Time]bool, len(plan.GapHours))
-	for _, h := range plan.GapHours {
-		gap[h] = true
-	}
-	n := 0
-	// Same hour-aligned enumeration the planner used to classify (Plan
-	// truncates since and rounds until up), so an hour cannot be classified
-	// here that the planner never saw.
-	for h := since.Truncate(time.Hour); h.Before(until.Truncate(time.Hour).Add(time.Hour)); h = h.Add(time.Hour) {
-		if !live[h] && !gap[h] {
-			n++
-		}
-	}
-	return n
 }

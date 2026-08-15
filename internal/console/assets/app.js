@@ -853,160 +853,241 @@ function covCard(c, stamp) {
   return card;
 }
 
-// ovPeriod is the window every count on this page describes. It is a page-level
-// choice, not a per-tile one: two tiles side by side under different periods is
-// the exact confusion #1300 is about.
-let ovPeriod = "24h";
+// ── Overview: progressive render (#1352) ─────────────────────────────────────
+// The page frame and per-card skeletons paint SYNCHRONOUSLY; each card fills as
+// ITS fetch lands. The pre-#1352 Promise.all gated first paint on the slowest
+// of four endpoints, so an archive-heavy source sat on a bare "Loading…" for
+// tens of seconds while /api/events had answered in under one. buildOverview()
+// composes the same per-card fills from already-fetched payloads — the seam the
+// e2e fixture drives — so the progressive path and the fixture path render
+// through identical code.
 
-async function renderOverview() {
-  const gen = serverGen, vgen = viewGen;
-  viewLoading();
-  try {
-    const [status, eventsData, coverage, activity] = await Promise.all([
-      api("/api/status").catch(() => null),
-      // Only the Recent-changes list needs event ROWS, and it renders 8 of
-      // them. The tiles' counts come from /api/activity now (#1300), so this
-      // page no longer pulls ~700 kB of before/after row images to derive four
-      // integers — and the integers no longer describe a fetch size.
-      api("/api/events?limit=8&order=DESC"),
-      // A failed fetch must render the same red "unavailable" card the
-      // nil-db path gets — a swallowed null would make a broken endpoint
-      // indistinguishable from a console without the feature.
-      api("/api/coverage").catch((err) => { console.error("coverage fetch failed", err); return { continuity: "unavailable" }; }),
-      // null on failure, never {} — buildOverview renders "—" for a missing
-      // aggregate. A zero-filled fallback would print "0 deletes in the last
-      // 24 h", an assurance nobody measured.
-      api("/api/activity?period=" + encodeURIComponent(ovPeriod)).catch((err) => { console.error("activity fetch failed", err); return null; }),
-    ]);
-    if (gen !== serverGen || vgen !== viewGen) return;
-    buildOverview(status, eventsData, coverage, activity); // render INSIDE the try: a throw here shows an error, never a stuck "Loading…"
-  } catch (err) {
-    if (gen !== serverGen || vgen !== viewGen) return;
-    const v = VIEW(); clear(v); v.append(pageHead("Overview", null)); renderError(v, err);
-  }
+// ovSkelLines: shimmer placeholder block for a still-loading card body.
+function ovSkelLines(n) {
+  const box = el("div", { class: "skel-box" });
+  for (let i = 0; i < n; i++) box.append(el("div", { class: "skel-line" }));
+  return box;
 }
 
-// buildOverview renders the dashboard from the fetched payloads. status and
-// activity may each be null (their fetches are best-effort); when one is, the
-// tiles it feeds read "—". Every tile carries its OWN scope line, because these
-// numbers get screenshotted into incident channels without the page around them
-// (#1300): "N deletes" beside "N changes indexed" invites reading the first as a
-// share of the second, and before this they were different denominators.
-function buildOverview(status, eventsData, coverage, activity) {
-  if (status) updateSideMeta(status);
+// ovPendingCard: a card's loading state — its REAL title plus shimmer lines and
+// a label naming what is still being computed, so a slow aggregate reads as
+// work in progress instead of a hang (and the page layout shows immediately).
+function ovPendingCard(title, waiting, cls) {
+  const card = el("section", { class: "ov-panel" + (cls ? " " + cls : "") });
+  card.append(el("div", { class: "ov-panel-head" }, el("h2", { class: "ov-panel-title", text: title })));
+  card.append(ovSkelLines(3));
+  card.append(el("div", { class: "skel-note", text: waiting }));
+  return card;
+}
 
-  const events = (eventsData && eventsData.events) || [];
-  const cov = (status && status.coverage) || {};
-  const total = status ? (status.total_events_estimate || cov.total_events || "—") : "—";
-  // Window counts: server-side, over a stated period — never derived from the
-  // events above, which are only the 8 rows the Recent-changes list shows.
-  const deletes = activity ? activity.deletes : null;
-  const tableCount = activity ? activity.tables : null;
-  const tables = (activity && activity.top_tables || []).map((t) => ({
-    key: t.schema + "." + t.table, insert: t.insert, update: t.update, delete: t.delete, total: t.total,
-  }));
-  const latest = (events[0] && events[0].event_timestamp) || "—";
-  // The window scope printed on every period-scoped tile. "partial" is not
-  // decoration: the server sets complete=false when part of the window is
-  // archived out of the live index, and a narrower number under a wider label
-  // is the bug this page is fixing.
-  const winScope = activity ? (activity.label + (activity.complete ? "" : " · partial")) : "unavailable";
+// ovStatPending: one tile in its loading state — key and scope already legible,
+// value shimmering.
+function ovStatPending(key, scope) {
+  return el("div", { class: "ov-stat" },
+    el("div", { class: "ov-stat-v" }, el("div", { class: "skel-line skel-stat" })),
+    el("div", { class: "ov-stat-k", text: key }),
+    el("div", { class: "ov-stat-scope", text: scope || "" }));
+}
 
+// ovFrame builds the whole page skeleton synchronously and returns handles to
+// every slot a fetch will fill. Nothing here waits on the network.
+function ovFrame() {
   const v = VIEW(); clear(v);
-
   const sub = el("p", { class: "page-sub" },
-    "What changed recently, and where — your starting point. Each figure below states the period it covers.");
+    "What changed recently, and where — your starting point. Each figure below states the window it covers.");
   v.append(pageHead("Overview", sub));
 
-  // Restore coverage — the live RPO statement (#1194). Best-effort: no card
-  // when the fetch failed, never a fabricated window.
-  if (coverage) {
-    covLast = { data: coverage, at: nowClock() };
-    v.append(covCard(coverage, { at: covLast.at }));
-  }
+  const f = {};
+  f.covSlot = el("div");
+  f.covSlot.append(ovPendingCard("Restore coverage", "computing restore coverage…", "cov-card"));
+  v.append(f.covSlot);
 
-  // Period picker — the tiles' scope is the operator's choice, so it belongs
-  // beside them rather than baked into a constant.
-  const picker = el("div", { class: "ov-period" }, el("span", { class: "ov-period-k", text: "window" }));
-  ["1h", "6h", "24h"].forEach((p) => {
-    picker.append(el("button", {
-      class: "btn btn-sm" + (p === ovPeriod ? " on" : " btn-ghost"), type: "button", text: p,
-      // viewGen++ before the re-render, the same staleness guard renderRoute
-      // uses: without it two quick clicks leave two renders in flight, both
-      // pass their own gen check, and whichever fetch lands last paints — so
-      // the tiles can show 6 h of data under a "last 24 h" label. That is the
-      // number-disagrees-with-its-label bug this page is fixing, reintroduced
-      // through the control added for it.
-      onclick: () => { if (p !== ovPeriod) { ovPeriod = p; viewGen++; renderOverview(); } },
-    }));
-  });
-  v.append(picker);
-
-  // stats
   const stats = el("div", { class: "ov-stats" });
-  // "changes indexed" is status.total_events_estimate — information_schema
-  // TABLE_ROWS, an InnoDB ESTIMATE. Say so on the tile: presenting a sampled
-  // number in the same type as three exact ones is its own quiet lie.
-  stats.append(ovStat(String(total), "changes indexed", "", "all time · estimate"));
-  stats.append(ovStat(deletes === null ? "—" : String(deletes), "deletes", deletes ? "danger" : "", winScope));
-  stats.append(ovStat(tableCount === null ? "—" : String(tableCount), "tables touched", "", winScope));
+  f.statTotal = ovStatPending("changes indexed", "all time · estimate");
+  f.statDeletes = ovStatPending("deletes", "");
+  f.statTables = ovStatPending("tables touched", "");
+  f.statLatest = ovStatPending("most recent change", "point in time (UTC)");
+  stats.append(f.statTotal, f.statDeletes, f.statTables, f.statLatest);
+  v.append(stats);
+
+  // Whatever the aggregate could not account for lands here, at the point of
+  // use — between the tiles and the panels, where the old layout put it.
+  f.warnSlot = el("div");
+  v.append(f.warnSlot);
+
+  const grid = el("div", { class: "ov-grid" });
+
+  f.recentPanel = el("section", { class: "ov-panel" });
+  f.recentPanel.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Recent changes" }),
+    el("a", { class: "btn btn-sm btn-ghost", href: "/events",
+      onclick: (e) => { e.preventDefault(); navigate("events"); }, text: "Browse all events ›" })));
+  f.recentBody = el("div", { class: "ov-evlist" });
+  f.recentBody.append(ovSkelLines(4), el("div", { class: "skel-note", text: "loading recent changes…" }));
+  f.recentPanel.append(f.recentBody);
+  grid.append(f.recentPanel);
+
+  f.tablesPanel = el("section", { class: "ov-panel" });
+  f.tablesHead = el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Activity by table" }));
+  f.tablesPanel.append(f.tablesHead);
+  f.tablesBody = el("div", { class: "ov-tables" });
+  f.tablesBody.append(ovSkelLines(4), el("div", { class: "skel-note", text: "computing window activity…" }));
+  f.tablesPanel.append(f.tablesBody);
+  f.tablesFoot = el("div", { class: "ov-coverage" });
+  f.tablesPanel.append(f.tablesFoot);
+  grid.append(f.tablesPanel);
+
+  v.append(grid);
+  viewEnter();
+  return f;
+}
+
+// fillOvCoverage — the live RPO statement (#1194). Best-effort: a null payload
+// removes the pending card and renders nothing, never a fabricated window (the
+// fetch path substitutes {continuity:"unavailable"} on failure, which renders
+// the red card).
+function fillOvCoverage(f, coverage) {
+  clear(f.covSlot);
+  if (!coverage) return;
+  covLast = { data: coverage, at: nowClock() };
+  f.covSlot.append(covCard(coverage, { at: covLast.at }));
+}
+
+// fillOvStatus fills the all-time tile. "changes indexed" is
+// status.total_events_estimate — information_schema TABLE_ROWS, an InnoDB
+// ESTIMATE. Say so on the tile: presenting a sampled number in the same type
+// as three exact ones is its own quiet lie.
+function fillOvStatus(f, status) {
+  if (status) updateSideMeta(status);
+  const cov = (status && status.coverage) || {};
+  const total = status ? (status.total_events_estimate || cov.total_events || "—") : "—";
+  f.statTotal.replaceWith(f.statTotal = ovStat(String(total), "changes indexed", "", "all time · estimate"));
+}
+
+// fillOvEvents fills the Recent-changes panel and the most-recent-change tile.
+// A failed fetch renders a red error box in the panel — never a swallowed
+// blank list.
+function fillOvEvents(f, eventsData, err) {
+  const events = (eventsData && eventsData.events) || [];
+  const latest = (events[0] && events[0].event_timestamp) || "—";
   const wide = el("div", { class: "ov-stat" },
     el("div", { class: "ov-stat-v small", text: latest }),
     el("div", { class: "ov-stat-k", text: "most recent change" }),
     el("div", { class: "ov-stat-scope", text: "point in time (UTC)" }));
-  stats.append(wide);
-  v.append(stats);
+  f.statLatest.replaceWith(f.statLatest = wide);
+  clear(f.recentBody);
+  if (err) {
+    f.recentBody.append(el("div", { class: "error-box", text: "Recent changes unavailable: " + (err.message || err) }));
+    return;
+  }
+  if (!events.length) {
+    f.recentBody.append(el("div", { class: "ev-empty", text: "No changes indexed yet." }));
+  } else {
+    events.slice(0, 8).forEach((e) => f.recentBody.append(ovEventRow(e)));
+  }
+}
 
-  // Whatever the aggregate could not account for, said at the point of use.
+// fillOvActivity fills every window-scoped surface from the /api/activity
+// materialization (#1352): the deletes/tables tiles, the warning items, the
+// Activity-by-table panel, and the window footer. The aggregate is precomputed
+// server-side, so its refreshed_at is rendered wherever its numbers appear
+// ("as of …") — a stale count must be visibly stale, never silently so. The
+// window is the LIVE RETENTION, derived server-side from the oldest live
+// partition; the label travels in the payload so the tile and the measurement
+// can never disagree.
+function fillOvActivity(f, activity) {
+  const deletes = activity ? activity.deletes : null;
+  const tableCount = activity ? activity.tables : null;
+  const refreshed = (activity && activity.refreshed_at) || "";
+  // Tiles carry the compact time-of-day stamp; the footer carries the full one.
+  const asofShort = refreshed ? " · as of " + (refreshed.length > 11 ? refreshed.slice(11) : refreshed) : "";
+  // The window scope printed on every window-scoped tile. "partial" is not
+  // decoration: the server sets complete=false when the counts are knowably a
+  // floor, and a narrower number under a wider label is the bug this page is
+  // fixing.
+  const winScope = activity ? (activity.label + (activity.complete ? "" : " · partial") + asofShort) : "unavailable";
+  f.statDeletes.replaceWith(f.statDeletes =
+    ovStat(deletes === null ? "—" : String(deletes), "deletes", deletes ? "danger" : "", winScope));
+  f.statTables.replaceWith(f.statTables =
+    ovStat(tableCount === null ? "—" : String(tableCount), "tables touched", "", winScope));
+
+  clear(f.warnSlot);
   if (!activity) {
-    v.append(el("div", { class: "warn-item" }, icon("warn"),
+    f.warnSlot.append(el("div", { class: "warn-item" }, icon("warn"),
       el("span", { text: "The window counts could not be loaded, so the deletes and tables tiles show no number rather than a zero." })));
   }
   (activity && activity.notes || []).forEach((n) => {
-    v.append(el("div", { class: "warn-item" }, icon("warn"), el("span", { text: n })));
+    f.warnSlot.append(el("div", { class: "warn-item" }, icon("warn"), el("span", { text: n })));
   });
 
-  // grid
-  const grid = el("div", { class: "ov-grid" });
-
-  // recent changes
-  const recentPanel = el("section", { class: "ov-panel" });
-  const rHead = el("div", { class: "ov-panel-head" },
-    el("h2", { class: "ov-panel-title", text: "Recent changes" }),
-    el("a", { class: "btn btn-sm btn-ghost", href: "/events",
-      onclick: (e) => { e.preventDefault(); navigate("events"); }, text: "Browse all events ›" }));
-  recentPanel.append(rHead);
-  const evlist = el("div", { class: "ov-evlist" });
-  if (!events.length) {
-    evlist.append(el("div", { class: "ev-empty", text: "No changes indexed yet." }));
-  } else {
-    events.slice(0, 8).forEach((e) => evlist.append(ovEventRow(e)));
+  if (refreshed) {
+    f.tablesHead.append(el("span", { class: "cov-asof", text: "as of " + refreshed }));
   }
-  recentPanel.append(evlist);
-  grid.append(recentPanel);
-
-  // activity by table
-  const tablesPanel = el("section", { class: "ov-panel" });
-  tablesPanel.append(el("div", { class: "ov-panel-head" },
-    el("h2", { class: "ov-panel-title", text: "Activity by table" })));
-  const tbox = el("div", { class: "ov-tables" });
+  clear(f.tablesBody);
+  const tables = (activity && activity.top_tables || []).map((t) => ({
+    key: t.schema + "." + t.table, insert: t.insert, update: t.update, delete: t.delete, total: t.total,
+  }));
   if (!tables.length) {
-    tbox.append(el("div", { class: "ev-empty", text: activity ? "No changes in this window." : "Window activity unavailable." }));
+    f.tablesBody.append(el("div", { class: "ev-empty", text: activity ? "No changes in this window." : "Window activity unavailable." }));
   }
-  tables.forEach((s) => tbox.append(ovTableRow(s)));
-  tablesPanel.append(tbox);
+  tables.forEach((s) => f.tablesBody.append(ovTableRow(s)));
   // The footer states the AGGREGATE's own bounds. It must never fall back to
   // status.coverage.oldest (#679/#684/#686): that is the index's whole history,
-  // and printing it under "window" would attribute counts from one period to a
+  // and printing it under "window" would attribute counts from one span to a
   // far wider one — the same class of mismatch as the tiles' (#1300).
-  tablesPanel.append(el("div", { class: "ov-coverage" },
+  clear(f.tablesFoot);
+  f.tablesFoot.append(
     el("span", { text: "window" }), " ",
     el("b", { text: activity ? activity.since : "—" }), " → ", el("b", { text: activity ? activity.until : "—" }),
-    el("span", { text: activity ? " · " + winScope : "" })));
-  grid.append(tablesPanel);
+    el("span", { text: activity ? " · " + winScope : "" }));
+}
 
-  v.append(grid);
-  viewEnter();
+function renderOverview() {
+  const gen = serverGen, vgen = viewGen;
+  const f = ovFrame();
+  const live = () => gen === serverGen && vgen === viewGen;
+  // Four independent fetches; each fills its card as it lands. No Promise.all:
+  // the slowest aggregate must not hold the frame or its siblings hostage —
+  // the #1352 target (p95 < 5 s to a useful first paint) is about the PAINT,
+  // not the backend. Every fill re-checks the generation guards so a server
+  // switch or navigation mid-flight drops the late payload instead of
+  // painting over the new view.
+  api("/api/status").catch(() => null)
+    .then((status) => { if (live()) fillOvStatus(f, status); });
+  // Only the Recent-changes list needs event ROWS, and it renders 8 of them.
+  // The tiles' counts come from /api/activity (#1300), so this page never
+  // pulls row images to derive four integers.
+  api("/api/events?limit=8&order=DESC").then(
+    (d) => { if (live()) fillOvEvents(f, d, null); },
+    (err) => { console.error("events fetch failed", err); if (live()) fillOvEvents(f, null, err); });
+  // A failed fetch must render the same red "unavailable" card the nil-db
+  // path gets — a swallowed null would make a broken endpoint
+  // indistinguishable from a console without the feature.
+  api("/api/coverage").catch((err) => { console.error("coverage fetch failed", err); return { continuity: "unavailable" }; })
+    .then((coverage) => { if (live()) fillOvCoverage(f, coverage); });
+  // null on failure, never {} — the fill renders "—" for a missing aggregate.
+  // A zero-filled fallback would print "0 deletes", an assurance nobody
+  // measured. No period parameter: the server derives the window from the
+  // live retention (#1352) and names it in the payload's label.
+  api("/api/activity").catch((err) => { console.error("activity fetch failed", err); return null; })
+    .then((activity) => { if (live()) fillOvActivity(f, activity); });
+}
+
+// buildOverview renders the dashboard from already-fetched payloads — the
+// composition seam the e2e fixture drives directly, sharing every fill with
+// the progressive path above. status and activity may each be null (their
+// fetches are best-effort); when one is, the tiles it feeds read "—". Every
+// tile carries its OWN scope line, because these numbers get screenshotted
+// into incident channels without the page around them (#1300): "N deletes"
+// beside "N changes indexed" invites reading the first as a share of the
+// second, and before this they were different denominators.
+function buildOverview(status, eventsData, coverage, activity) {
+  const f = ovFrame();
+  fillOvStatus(f, status);
+  fillOvEvents(f, eventsData, null);
+  fillOvCoverage(f, coverage);
+  fillOvActivity(f, activity);
 }
 
 // ovStat renders one tile. scope is REQUIRED for any tile carrying a number:

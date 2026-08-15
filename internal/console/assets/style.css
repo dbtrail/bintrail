@@ -976,9 +976,21 @@ button { font-family: inherit; }
    than the label, but never hidden: these tiles are screenshotted out of the
    page, so the scope has to travel with the number. */
 .ov-stat-scope { font-size: 11px; color: var(--ink-4); margin-top: 3px; letter-spacing: 0.02em; }
-.ov-period { display: flex; align-items: center; gap: 6px; margin-bottom: 14px; }
-.ov-period-k { font-size: 12px; color: var(--ink-3); margin-right: 2px; }
-.ov-period .btn.on { border-color: var(--accent); color: var(--accent); }
+
+/* Overview loading skeletons (#1352): each card paints its frame immediately
+   and shimmers until its own fetch lands, so a slow aggregate reads as work in
+   progress instead of a hang. */
+.skel-box { display: flex; flex-direction: column; gap: 10px; padding: 6px 0; }
+.skel-line {
+  height: 13px; border-radius: 4px;
+  background: linear-gradient(90deg, var(--line) 25%, transparent 50%, var(--line) 75%);
+  background-size: 200% 100%;
+  animation: skel-shimmer 1.4s linear infinite;
+}
+.skel-line.skel-stat { height: 26px; width: 72px; margin-bottom: 4px; }
+.skel-note { font-family: var(--f-mono); font-size: 11px; color: var(--ink-4); margin-top: 8px; }
+@keyframes skel-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .skel-line { animation: none; } }
 
 .ov-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 18px; align-items: start; }
 .ov-panel {

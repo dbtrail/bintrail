@@ -16,7 +16,7 @@ import (
 // true, matching the old tests' default (no planner / archive discovery).
 func newBootServer(db *sql.DB) *Server {
 	s := &Server{token: "t", cm: newConnManager(nil, false)}
-	s.cm.boot = &bundle{db: db, engine: query.New(db), noArchive: true}
+	s.cm.boot = &bundle{db: db, engine: query.New(db), noArchive: true, activity: newActivityCache()}
 	s.mux = s.buildHandler()
 	return s
 }
