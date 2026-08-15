@@ -128,6 +128,11 @@ type eventsResponse struct {
 	// that asked for order=ASC.
 	NextAfter string   `json:"next_after,omitempty"`
 	Warnings  []string `json:"warnings,omitempty"`
+	// Notes are benign informational audit facts (#1365) — today the #1353
+	// archive-elision record. Split from Warnings on the wire because the two
+	// severities render differently (alert vs muted) and API clients read the
+	// same shape. Additive: clients that ignore it are unaffected.
+	Notes []string `json:"notes,omitempty"`
 }
 
 type recoverResponse struct {
@@ -135,6 +140,9 @@ type recoverResponse struct {
 	StatementCount int      `json:"statement_count"`
 	RowCount       int      `json:"row_count"`
 	Warnings       []string `json:"warnings,omitempty"`
+	// Notes: see eventsResponse.Notes — the info half of the #1365 severity
+	// split (benign audit facts, today the archive-elision record).
+	Notes []string `json:"notes,omitempty"`
 	// Cascade fields are set only when the recover target was auto-detected as a
 	// foreign-key parent whose DELETE or key UPDATE cascaded below the binlog (the
 	// script then also repairs the invisible children). Zero/false/empty for a
@@ -305,18 +313,20 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		rows = rows[:pageLimit]
 	}
+	// The divergence finding (#1325) rides the warnings list: the merge's
+	// slog.Warn dies in the daemon log, and this operator is in a browser. The
+	// archive-elision record (#1353) still reaches the response — a page
+	// served fast because the archives provably could not change it must SAY
+	// the archives went unread — but as an info NOTE (#1365): it is a benign
+	// audit fact, not an incident.
+	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided)
 	resp := eventsResponse{
-		Events:  toEventDTOs(rows),
-		Count:   len(rows),
-		Limit:   pageLimit,
-		HasMore: hasMore,
-		// The divergence finding (#1325) rides the same warnings list: the
-		// merge's slog.Warn dies in the daemon log, and this operator is in a
-		// browser. So does the archive-elision notice (#1353): a page served
-		// fast because the archives provably could not change it must still
-		// SAY the archives went unread.
-		Warnings: appendDivergenceWarning(
-			appendArchiveElisionNotice(restrictedFetchWarnings(plan, excl), archivesElided), diverged),
+		Events:   toEventDTOs(rows),
+		Count:    len(rows),
+		Limit:    pageLimit,
+		HasMore:  hasMore,
+		Warnings: warnings,
+		Notes:    notes,
 	}
 	// The cursor comes from the last row of the page the client is about to
 	// see, in the direction it is reading. Built server-side from a served row
@@ -404,11 +414,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// The divergence finding (#1325) is sharpest here: the kept copy's row
 	// images become the SET/WHERE clauses of the generated reversal SQL, so a
 	// silent coin-flip between two disagreeing before-images must reach the
-	// operator reviewing the script. The elision notice (#1353) matters too:
+	// operator reviewing the script. The elision record (#1353) matters too:
 	// this fetch runs DESC with a limit, so a filled page can skip the
-	// archives, and the reviewer of an undo script must see that stated.
-	warnings := appendDivergenceWarning(
-		appendArchiveElisionNotice(restrictedFetchWarnings(plan, excl), archivesElided), diverged)
+	// archives, and the reviewer of an undo script must see that stated — as
+	// an info note (#1365), since the skip is correctness-preserving.
+	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided)
 
 	// The fetch above ran Order=DESC so the limit kept the newest suffix of
 	// the window (#981). Detect truncation on the FETCHED row count — before
@@ -536,6 +546,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 				StatementCount:  cres.StatementCount,
 				RowCount:        len(rows),
 				Warnings:        cw,
+				Notes:           notes,
 				CascadeDetected: true,
 				VictimCount:     cres.VictimCount,
 				SetNullCount:    cres.SetNullCount,
@@ -574,6 +585,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		StatementCount: n,
 		RowCount:       len(rows),
 		Warnings:       warnings,
+		Notes:          notes,
 	})
 	recordConsoleAccess(r, "recover.generate", opts.Schema, opts.Table, map[string]string{
 		"statements": strconv.Itoa(n),

@@ -142,6 +142,7 @@ func TestIntegrationEventsBrowseArchiveShortCircuit(t *testing.T) {
 		Count    int      `json:"count"`
 		HasMore  bool     `json:"has_more"`
 		Warnings []string `json:"warnings"`
+		Notes    []string `json:"notes"`
 	}
 	get := func(t *testing.T, params string, profile string) eventsResp {
 		t.Helper()
@@ -180,12 +181,19 @@ func TestIntegrationEventsBrowseArchiveShortCircuit(t *testing.T) {
 		if !resp.HasMore {
 			t.Error("has_more = false with events behind the page")
 		}
-		joined := strings.Join(resp.Warnings, "\n")
-		if !strings.Contains(joined, "could not change it") {
-			t.Errorf("the archive skip is not auditable in the response warnings: %#v", resp.Warnings)
+		// #1365: the elision record is an info NOTE, not a warning — the
+		// response must still carry the fact (auditability, #1353), in the
+		// notes list, and the warnings list must be clean (routing the note
+		// back into warnings fails here; silencing it entirely fails below).
+		notes := strings.Join(resp.Notes, "\n")
+		if !strings.Contains(notes, "answered from the live index") {
+			t.Errorf("the archive skip is not auditable in the response notes: %#v", resp.Notes)
 		}
-		if strings.Contains(joined, "does not mean nothing happened") {
-			t.Errorf("the elision must not be phrased as a scope reduction: %#v", resp.Warnings)
+		if strings.Contains(notes, "does not mean nothing happened") {
+			t.Errorf("the elision must not be phrased as a scope reduction: %#v", resp.Notes)
+		}
+		if len(resp.Warnings) != 0 {
+			t.Errorf("a clean fast-path browse must carry no warnings — the elision record belongs in notes (#1365): %#v", resp.Warnings)
 		}
 		for _, e := range resp.Events {
 			if e.EventTimestamp < liveFloor {
@@ -206,8 +214,8 @@ func TestIntegrationEventsBrowseArchiveShortCircuit(t *testing.T) {
 		if belowFloor == 0 {
 			t.Fatal("no archived (below live floor) events in a 200-event page the live index cannot fill — the archives were not read")
 		}
-		if strings.Contains(strings.Join(resp.Warnings, "\n"), "could not change it") {
-			t.Errorf("elision claimed on a page that read the archives: %#v", resp.Warnings)
+		if joined := strings.Join(append(append([]string{}, resp.Warnings...), resp.Notes...), "\n"); strings.Contains(joined, "answered from the live index") {
+			t.Errorf("elision claimed on a page that read the archives: warnings=%#v notes=%#v", resp.Warnings, resp.Notes)
 		}
 	})
 
@@ -223,7 +231,14 @@ func TestIntegrationEventsBrowseArchiveShortCircuit(t *testing.T) {
 		if !strings.Contains(joined, "LIVE INDEX ONLY") {
 			t.Errorf("profiled session lost its scope notice (#1321 regression): %#v", resp.Warnings)
 		}
-		if strings.Contains(joined, "could not change it") {
+		// The exclusion is a WARNING and must stay one (#1365 split). A
+		// profiled session resolves no archives, so nothing can be elided:
+		// notes must be empty — an entry here would either demote the
+		// exclusion or reframe it as a harmless elision.
+		if len(resp.Notes) != 0 {
+			t.Errorf("a profiled session must carry no info notes: %#v", resp.Notes)
+		}
+		if strings.Contains(joined, "answered from the live index") {
 			t.Errorf("a profiled session's exclusion must not be reframed as a harmless elision: %#v", resp.Warnings)
 		}
 		for _, e := range resp.Events {

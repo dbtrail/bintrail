@@ -29,10 +29,12 @@ MYSQL_CONTAINER="${MYSQL_CONTAINER:-bintrail-test-mysql}"
 PORT="${E2E_PORT:-8090}"
 TOKEN="${E2E_TOKEN:-e2e-console-token}"
 IDX_DB="bintrail_e2e_idx"
+ARC_DB="bintrail_e2e_arc"
 FIX_SCHEMA="e2eshop"
 SERVERS_FILE="$(mktemp -t console-e2e-servers.XXXXXX.yaml)"
 DUMP_DIR="$(mktemp -d -t console-e2e-dump.XXXXXX)"
 BASELINE_ROOT="$(mktemp -d -t console-e2e-baseline.XXXXXX)"
+ARC_DIR="$(mktemp -d -t console-e2e-arc.XXXXXX)"
 export E2E_ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-${RUNNER_TEMP:-/tmp}}"
 
 mysql_exec() { docker exec -i "$MYSQL_CONTAINER" mysql -uroot -ptestroot "$@" 2>/dev/null; }
@@ -41,8 +43,9 @@ DAEMON_PID=""
 cleanup() {
   [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
   mysql_exec -e "DROP DATABASE IF EXISTS $IDX_DB;" >/dev/null 2>&1 || true
+  mysql_exec -e "DROP DATABASE IF EXISTS $ARC_DB;" >/dev/null 2>&1 || true
   rm -f "$SERVERS_FILE" 2>/dev/null || true
-  rm -rf "$DUMP_DIR" "$BASELINE_ROOT" 2>/dev/null || true
+  rm -rf "$DUMP_DIR" "$BASELINE_ROOT" "$ARC_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -131,6 +134,66 @@ INSERT INTO `orders` VALUES (1,"new","a@example.com"),(2,"new","b@example.com"),
 SQL
 "$CLI_BIN" baseline --input "$DUMP_DIR" --output "$BASELINE_ROOT" >/dev/null
 
+echo "==> provision the archive fixture index $ARC_DB (#1365: info note vs alert register)"
+# A second index whose history is mostly ARCHIVED: six past hourly partitions,
+# 8 events each, run through the REAL rotation (archive to Parquet + drop past
+# retention). The live remnant fills a small Events page, so the default
+# newest-first browse takes the #1353 short-circuit and the response carries
+# the archive-elision NOTE (info register). Deleting the OLDEST hour's
+# archive_state row afterwards manufactures a real "rotated and not archived"
+# coverage gap for the warning-register state — the archives that remain
+# registered stay strictly older than the live remnant, so the elision
+# premise is untouched.
+mysql_exec -e "DROP DATABASE IF EXISTS $ARC_DB; CREATE DATABASE $ARC_DB;"
+"$CLI_BIN" init --index-dsn "${BASE_DSN}/${ARC_DB}" --partitions 4 >/dev/null
+node -e '
+const H = new Date(); H.setUTCMinutes(0, 0, 0);
+const f = (d) => d.toISOString().slice(0, 19).replace("T", " ");
+const pn = (d) => "p_" + d.toISOString().slice(0, 13).replace(/[-T]/g, "");
+const hours = [];
+for (let h = 6; h >= 1; h--) hours.push(new Date(H.getTime() - h * 3600e3));
+// Give each past hour a named partition (init only partitions forward from
+// the current hour): split the current-hour partition open, keeping its own
+// upper bound last. Double-quoted SQL strings on purpose — this script is
+// single-quoted in the shell.
+const parts = hours.map((d, i) => {
+  const upper = i + 1 < hours.length ? hours[i + 1] : H;
+  return `PARTITION ${pn(d)} VALUES LESS THAN (TO_SECONDS("${f(upper)}"))`;
+});
+parts.push(`PARTITION ${pn(H)} VALUES LESS THAN (TO_SECONDS("${f(new Date(H.getTime() + 3600e3))}"))`);
+console.log(`ALTER TABLE binlog_events REORGANIZE PARTITION ${pn(H)} INTO (${parts.join(", ")});`);
+const values = [];
+let pk = 0;
+for (const hour of hours) {
+  for (let i = 0; i < 8; i++) {
+    const ts = f(new Date(hour.getTime() + i * 5 * 60e3));
+    pk++;
+    values.push(`("binlog.000001", ${1000 + pk}, ${1100 + pk}, "${ts}", "arcshop", "widgets", 1, "${pk}")`);
+  }
+}
+console.log(`INSERT INTO binlog_events (binlog_file, start_pos, end_pos, event_timestamp, schema_name, table_name, event_type, pk_values) VALUES ${values.join(", ")};`);
+' | mysql_exec "$ARC_DB"
+"$CLI_BIN" rotate --index-dsn "${BASE_DSN}/${ARC_DB}" --retain 2h \
+  --archive-dir "$ARC_DIR" --bintrail-id e2e-arc >/dev/null
+# The manufactured gap: the oldest archived hour loses its registration, so a
+# time-ranged read covering it reports a REAL coverage-gap warning.
+mysql_exec "$ARC_DB" -e "DELETE FROM archive_state ORDER BY partition_name ASC LIMIT 1;"
+IFS='|' read -r ARC_GAP_SINCE ARC_GAP_UNTIL <<EOF
+$(node -e '
+const H = new Date(); H.setUTCMinutes(0, 0, 0);
+const f = (d) => d.toISOString().slice(0, 19).replace("T", " ");
+console.log([f(new Date(H.getTime() - 6 * 3600e3)), f(new Date(H.getTime() - 5 * 3600e3))].join("|"));')
+EOF
+# Premises, asserted loudly (a broken fixture must fail the run, not skip the
+# scenario): the live remnant must fill a 5-event page plus its probe row, and
+# registered archives must remain behind it.
+ARC_LIVE="$(mysql_exec "$ARC_DB" -N -e "SELECT COUNT(*) FROM binlog_events;")"
+ARC_ARCH="$(mysql_exec "$ARC_DB" -N -e "SELECT COUNT(*) FROM archive_state;")"
+if [ "${ARC_LIVE:-0}" -lt 6 ] || [ "${ARC_ARCH:-0}" -lt 1 ]; then
+  echo "arc fixture premise broken: live=$ARC_LIVE (want >=6), registered archives=$ARC_ARCH (want >=1)" >&2
+  exit 1
+fi
+
 echo "==> launch source-less watch daemon on :$PORT"
 BINTRAIL_CONSOLE_TOKEN="$TOKEN" BINTRAIL_CONSOLE_BASELINE_TRIGGER=1 "$CONSOLE_BIN" watch \
   --index-dsn "${BASE_DSN}/${IDX_DB}" \
@@ -165,5 +228,6 @@ fi
 
 echo "==> drive headless Chrome"
 cd "$HERE"
-CONSOLE_URL="http://127.0.0.1:$PORT" CONSOLE_TOKEN="$TOKEN" \
+CONSOLE_URL="http://127.0.0.1:$PORT" E2E_ARC_DB="$ARC_DB" \
+  E2E_ARC_GAP_SINCE="$ARC_GAP_SINCE" E2E_ARC_GAP_UNTIL="$ARC_GAP_UNTIL" CONSOLE_TOKEN="$TOKEN" \
   E2E_FIX_SCHEMA="$FIX_SCHEMA" E2E_TT_AT="$TT_AT" node console_e2e.mjs

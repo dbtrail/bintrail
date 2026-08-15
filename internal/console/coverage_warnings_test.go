@@ -3,6 +3,7 @@ package console
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -66,5 +67,76 @@ func TestAppendDivergenceWarning(t *testing.T) {
 	// carries a COUNT, and per-event detail stays in the server log.
 	if strings.Contains(w[1], "connection_id") || strings.Contains(w[1], "query_text") {
 		t.Errorf("warning must not name row internals: %s", w[1])
+	}
+}
+
+// #1365: the archive-elision record is an info NOTE — plain words, still
+// carrying the audit fact (archives skipped, and why), and never worded or
+// shaped like an incident.
+func TestArchiveElisionNote(t *testing.T) {
+	if n := archiveElisionNotes(false); len(n) != 0 {
+		t.Fatalf("no elision must produce no note, got %#v", n)
+	}
+	n := archiveElisionNotes(true)
+	if len(n) != 1 {
+		t.Fatalf("want exactly one elision note, got %#v", n)
+	}
+	// The audit fact survives the rewrite: the note still says the archives
+	// went unread, why that loses nothing, and how to reach them.
+	for _, want := range []string{"answered from the live index", "were not read", "nothing is missing", "Paging further back", "time range"} {
+		if !strings.Contains(strings.ToLower(n[0]), strings.ToLower(want)) {
+			t.Errorf("note lost the audit fact %q: %s", want, n[0])
+		}
+	}
+	// The jargon the issue was filed over is gone...
+	if strings.Contains(n[0], "could not change it") {
+		t.Errorf("the old 'because they could not change it' jargon is back: %s", n[0])
+	}
+	// ...and the string is read by API/MCP clients too, so it must stay
+	// flag-free (no `--flag` a client cannot pass on its own surface).
+	if strings.Contains(n[0], "--") {
+		t.Errorf("the wire note must not name CLI flags: %s", n[0])
+	}
+}
+
+// #1365: the severity split itself. Every cautionary fact — coverage gap,
+// session archive-exclusion (#1311/#1321), divergence finding (#1325) — lands
+// in warnings; the benign elision record (#1353) lands in notes. Routing the
+// elision back into warnings, or dropping it, fails here.
+func TestResponseAdvisoriesSeveritySplit(t *testing.T) {
+	hour := time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)
+	planWithGap := &query.QueryPlan{GapHours: []time.Time{hour}}
+
+	warnings, notes := responseAdvisories(planWithGap, archiveExclusion{profile: true}, 2, true)
+
+	joinedW := strings.Join(warnings, "\n")
+	for name, want := range map[string]string{
+		"session exclusion (#1321)": "LIVE INDEX ONLY",
+		"gap hours":                 "2026-08-01 03:00",
+		"divergence (#1325)":        "2 duplicate event(s) disagreed",
+	} {
+		if !strings.Contains(joinedW, want) {
+			t.Errorf("%s missing from warnings: %#v", name, warnings)
+		}
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "answered from the live index") {
+		t.Fatalf("the elision record must be the info note, got %#v", notes)
+	}
+	// The lists never cross: the elision is not ALSO (or instead) a warning,
+	// and no cautionary fact is quietly demoted to a note.
+	if strings.Contains(joinedW, "answered from the live index") || strings.Contains(joinedW, "could not change it") {
+		t.Errorf("the elision record leaked into warnings: %#v", warnings)
+	}
+	joinedN := strings.Join(notes, "\n")
+	for _, caution := range []string{"LIVE INDEX ONLY", "disagreed", "2026-08-01"} {
+		if strings.Contains(joinedN, caution) {
+			t.Errorf("a cautionary fact was demoted to a note: %#v", notes)
+		}
+	}
+
+	// The quiet path: nothing to say in either register.
+	w, n := responseAdvisories(&query.QueryPlan{}, archiveExclusion{}, 0, false)
+	if len(w) != 0 || len(n) != 0 {
+		t.Errorf("clean read must produce no warnings and no notes, got %#v / %#v", w, n)
 	}
 }

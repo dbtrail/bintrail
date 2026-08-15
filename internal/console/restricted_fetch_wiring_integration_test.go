@@ -91,12 +91,18 @@ func TestIntegrationProfiledSessionDeclaresItsScope(t *testing.T) {
 		}
 		var resp struct {
 			Warnings []string `json:"warnings"`
+			Notes    []string `json:"notes"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("decode recover: %v\n%s", err, w.Body.String())
 		}
 		if !strings.Contains(strings.Join(resp.Warnings, "\n"), "LIVE INDEX ONLY") {
 			t.Errorf("/api/recover does not declare its scope to a profiled session: %#v", resp.Warnings)
+		}
+		// #1365 split: the exclusion is a cautionary fact and must never be
+		// demoted to the info `notes` list.
+		if strings.Contains(strings.Join(resp.Notes, "\n"), "LIVE INDEX ONLY") {
+			t.Errorf("/api/recover demoted the exclusion notice to an info note: %#v", resp.Notes)
 		}
 	}
 

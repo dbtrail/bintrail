@@ -24,6 +24,13 @@ const ART = process.env.E2E_ARTIFACT_DIR || "/tmp";
 // the default `at` (now) would race the top-of-hour partition boundary.
 const FIX = process.env.E2E_FIX_SCHEMA || "e2eshop";
 const TT_AT = process.env.E2E_TT_AT || "";
+// The #1365 archive fixture (run.sh): an index whose history is mostly
+// rotated into Parquet, with a manufactured coverage-gap hour. Deliberately
+// no fallback default — an unset env must fail the scenario loudly, never
+// skip it.
+const ARC_DB = process.env.E2E_ARC_DB || "";
+const ARC_GAP_SINCE = process.env.E2E_ARC_GAP_SINCE || "";
+const ARC_GAP_UNTIL = process.env.E2E_ARC_GAP_UNTIL || "";
 // The query_text canary run.sh embeds in the seeded UPDATE event. query_text /
 // query_hash are captured index data but NEVER cross the DTO layer (#699);
 // this string appearing anywhere in the page or an export is a leak.
@@ -1863,6 +1870,124 @@ try {
   (rmOn.anim === "none" && rmOn.note === "block")
     ? ok("busy modal: prefers-reduced-motion collapses the animation to the static note")
     : bad("busy modal: prefers-reduced-motion collapses the animation to the static note", JSON.stringify(rmOn));
+
+  // ── Scenario 18 — advisory severity split on the archive fixture (#1365) ──
+  // The archive-elision record must render in the INFO register (muted line,
+  // no ⚠ icon, no amber, no alert classes) while a real coverage-gap warning
+  // keeps the ALERT register — both driven end to end against the run.sh
+  // archive fixture (real rotation, real gap). One visual register for both
+  // was the bug: a note saying "nothing is missing" read as an incident.
+  const arcId = await page.evaluate(async (db) => {
+    const res = await api("/api/servers", { method: "POST", body: {
+      name: "arc-idx", host: "127.0.0.1", port: "13306", user: "root", password: "testroot", dbname: db,
+    } });
+    return res.id;
+  }, ARC_DB);
+  await page.evaluate(async (id) => { await switchServer(id); }, arcId);
+
+  // The wire shape first: the elision fact lands in `notes` on a filled fast
+  // page (warnings clean), and a large page really reads the archives (the
+  // premise that makes the elision meaningful) with no elision claimed.
+  const arcWire = await page.evaluate(async () => {
+    const fast = await api("/api/events?limit=5");
+    const slow = await api("/api/events?limit=500");
+    return {
+      fastCount: fast.count,
+      fastNotes: fast.notes || [],
+      fastWarnings: fast.warnings || [],
+      slowCount: slow.count,
+      slowNotes: slow.notes || [],
+    };
+  });
+  arcWire.fastCount === 5 && arcWire.slowCount > arcWire.fastCount
+    ? ok("severity split: archive fixture premise holds (fast page filled, slow page reads archives)")
+    : bad("severity split: archive fixture premise holds (fast page filled, slow page reads archives)", JSON.stringify(arcWire));
+  arcWire.fastNotes.some((n) => /answered from the live index/.test(n))
+    ? ok("severity split: the elision fact rides the response `notes` list")
+    : bad("severity split: the elision fact rides the response `notes` list", JSON.stringify(arcWire.fastNotes));
+  arcWire.fastWarnings.length === 0
+    ? ok("severity split: the elision is NOT a warning on the wire")
+    : bad("severity split: the elision is NOT a warning on the wire", JSON.stringify(arcWire.fastWarnings));
+  arcWire.slowNotes.length === 0
+    ? ok("severity split: no elision claimed on a page that read the archives")
+    : bad("severity split: no elision claimed on a page that read the archives", JSON.stringify(arcWire.slowNotes));
+
+  // The INFO register in the real DOM: a filled 5-event browse.
+  await page.evaluate(() => navigate("events"));
+  await page.waitForSelector("#ev-rows .ev-row", { timeout: 10000 });
+  const arcInfo = await page.evaluate(async () => {
+    const f = document.getElementById("ev-form");
+    f.elements.since.value = ""; f.elements.until.value = "";
+    f.elements.limit.value = "5";
+    f.requestSubmit();
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      if (document.querySelectorAll("#ev-notes .note-item").length) break;
+    }
+    const note = document.querySelector("#ev-notes .note-item");
+    const cs = note ? getComputedStyle(note) : null;
+    const bar = document.querySelector(".result-bar");
+    const notesBox = document.getElementById("ev-notes");
+    return {
+      noteCount: document.querySelectorAll("#ev-notes .note-item").length,
+      noteText: note ? note.textContent : "",
+      warnCount: document.querySelectorAll("#ev-warnings .warn-item").length,
+      hasIcon: note ? !!note.querySelector("svg") : true,
+      alertClass: note ? /warn|alert|error/.test(note.className) : true,
+      inAlertContainer: note ? !!note.closest(".warnings, .warn-box, .error-box") : true,
+      bg: cs ? cs.backgroundColor : "",
+      border: cs ? cs.borderTopStyle : "",
+      underCountLine: !!(bar && notesBox && (bar.compareDocumentPosition(notesBox) & Node.DOCUMENT_POSITION_FOLLOWING)),
+    };
+  });
+  arcInfo.noteCount === 1 && /answered from the live index/.test(arcInfo.noteText)
+    ? ok("severity split: the elision note renders on the Events view")
+    : bad("severity split: the elision note renders on the Events view", JSON.stringify(arcInfo));
+  (!arcInfo.hasIcon && !arcInfo.alertClass && !arcInfo.inAlertContainer)
+    ? ok("severity split: the note carries no alert classes and no ⚠ icon")
+    : bad("severity split: the note carries no alert classes and no ⚠ icon", JSON.stringify(arcInfo));
+  (arcInfo.bg === "rgba(0, 0, 0, 0)" && arcInfo.border === "none")
+    ? ok("severity split: the note paints muted — no amber background, no border")
+    : bad("severity split: the note paints muted — no amber background, no border", `bg=${arcInfo.bg} border=${arcInfo.border}`);
+  arcInfo.warnCount === 0
+    ? ok("severity split: no alert component renders for the benign fact")
+    : bad("severity split: no alert component renders for the benign fact", `warnCount=${arcInfo.warnCount}`);
+  arcInfo.underCountLine
+    ? ok("severity split: the note sits under the result-count line")
+    : bad("severity split: the note sits under the result-count line", "notes container precedes the result bar");
+
+  // The ALERT register: a time range covering the manufactured gap hour must
+  // keep the warning component — amber box, ⚠ icon — and claim no elision.
+  const arcWarn = await page.evaluate(async ({ since, until }) => {
+    const f = document.getElementById("ev-form");
+    f.elements.since.value = since;
+    f.elements.until.value = until;
+    f.elements.limit.value = "50";
+    f.requestSubmit();
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      if (document.querySelectorAll("#ev-warnings .warn-item").length) break;
+    }
+    const w = document.querySelector("#ev-warnings .warn-item");
+    const cs = w ? getComputedStyle(w) : null;
+    return {
+      warnCount: document.querySelectorAll("#ev-warnings .warn-item").length,
+      warnText: w ? w.textContent : "",
+      hasIcon: w ? !!w.querySelector("svg") : false,
+      bg: cs ? cs.backgroundColor : "",
+      border: cs ? cs.borderTopStyle : "",
+      noteCount: document.querySelectorAll("#ev-notes .note-item").length,
+    };
+  }, { since: ARC_GAP_SINCE, until: ARC_GAP_UNTIL });
+  arcWarn.warnCount >= 1 && /rotated and not archived/.test(arcWarn.warnText)
+    ? ok("severity split: a real coverage-gap warning renders")
+    : bad("severity split: a real coverage-gap warning renders", JSON.stringify(arcWarn));
+  (arcWarn.hasIcon && arcWarn.bg !== "rgba(0, 0, 0, 0)" && arcWarn.border === "solid")
+    ? ok("severity split: the gap warning keeps the alert register (⚠, amber, border)")
+    : bad("severity split: the gap warning keeps the alert register (⚠, amber, border)", `icon=${arcWarn.hasIcon} bg=${arcWarn.bg} border=${arcWarn.border}`);
+  arcWarn.noteCount === 0
+    ? ok("severity split: no elision note on a time-ranged read into the archives")
+    : bad("severity split: no elision note on a time-ranged read into the archives", `noteCount=${arcWarn.noteCount}`);
 
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));

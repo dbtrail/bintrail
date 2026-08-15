@@ -372,7 +372,12 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 		// no-silent-incompleteness contract CaptureGapStatus enforces for
 		// source-side loss.
 		// The elision flag is structurally always false here (this fetch is
-		// ASC with no limit, which the newest-first short-circuit never takes).
+		// ASC with no limit, which the newest-first short-circuit never
+		// takes) — which is also why the MCP surface keeps its single
+		// warnings list under the #1365 severity split: no tool ever
+		// produces the elision record. If a future fetch shape makes it
+		// reachable, it belongs in an info notes list, never in warnings
+		// (see the console's responseAdvisories).
 		rows, plan, skippedSources, diverged, _, err := query.FetchMergedFull(ctx, t.DB, query.New(t.DB), fmOpts)
 		if err != nil {
 			return ErrorResult(reconstructFetchError(err)), nil, nil

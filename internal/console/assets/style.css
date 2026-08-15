@@ -1444,6 +1444,16 @@ button { font-family: inherit; }
   background: var(--orange-bg); border: 1px solid var(--ochre);
   border-radius: var(--radius-sm); padding: 9px 12px; margin: 6px 0;
 }
+/* Info notes (#1365): the quiet sibling of .warn-item for the response
+   `notes` list — benign audit facts (the archive-elision record) whose job is
+   auditability, not attention. Muted ink (ink-3 meets the >=4.5:1 floor), no
+   icon, no border, no amber: rendering these through the alert register is
+   the "benign fact styled like an incident" bug this class exists to end. */
+.notes:empty { display: none; }
+.note-item {
+  font-family: var(--f-mono); font-size: 12px; color: var(--ink-3);
+  padding: 2px 0; margin: 4px 0;
+}
 
 /* PostgreSQL replication-health card (#599) */
 .hstat { font-family: var(--f-mono); font-size: 12.5px; font-weight: 600; }

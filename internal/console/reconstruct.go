@@ -432,7 +432,9 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		ArchiveFetcher: parquetquery.Fetch,
 	}
 	// The elision flag is structurally always false here (this fetch is ASC
-	// with no limit, which the newest-first short-circuit never takes).
+	// with no limit, which the newest-first short-circuit never takes), so
+	// this response carries no `notes` list (#1365) — grow one the day a
+	// benign audit fact exists to put in it.
 	rows, plan, skippedSources, diverged, _, err := query.FetchMergedFull(ctx, b.db, b.engine, fmOpts)
 	if err != nil {
 		var gapErr *query.GapError

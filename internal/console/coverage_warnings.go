@@ -64,32 +64,54 @@ func appendDivergenceWarning(w []string, diverged int) []string {
 	return w
 }
 
-// archiveElisionNotice is the response-level record of the newest-first
+// archiveElisionNote is the response-level record of the newest-first
 // short-circuit (#1353): registered archives were deliberately not read
 // because they provably could not change this page — every archived hour sits
 // below the live rotation floor, and the live index filled the requested page
 // with events newer than that floor. Unlike archiveExclusion's notices this
 // describes a CORRECTNESS-PRESERVING optimization, not a scope reduction, and
-// the wording must carry that distinction: the #1311/#1321 contract is that a
-// result says what scope was read, and "we skipped the archives because they
-// could not matter" is a different fact from "we skipped the archives and your
-// result may be incomplete". It still must be said — silence here would make
-// the fast path indistinguishable from a fetch that never knew archives
-// existed.
-func archiveElisionNotice() string {
-	return "Archived (rotated) hours were not searched for this page because they could not change it: " +
-		"the live index filled the page with the newest matching events, and every archived hour is older " +
-		"than what the live index still holds. Nothing is missing from this page. Paging further back, or " +
-		"filtering to a time range that reaches archived hours, does search the archives."
+// since #1365 that distinction is carried on the wire: this is a NOTE (info),
+// never a warning — a benign audit fact rendered in one alarm register with
+// the coverage-gap and exclusion warnings read as an incident while its own
+// text says nothing is missing. It still must be said — silence here would
+// make the fast path indistinguishable from a fetch that never knew archives
+// existed (the #1311/#1321 contract: a result says what scope was read). The
+// wording is plain words on purpose, and flag-free: API and MCP-side clients
+// read this string too.
+func archiveElisionNote() string {
+	return "This page was answered from the live index; the registered archives were not read. " +
+		"Every archived event is older than this page reaches, so nothing is missing here. " +
+		"Paging further back, or filtering to a time range that reaches archived hours, searches the archives too."
 }
 
-// appendArchiveElisionNotice appends archiveElisionNotice when the fetch
-// reported the newest-first short-circuit, else returns w unchanged.
-func appendArchiveElisionNotice(w []string, archivesElided bool) []string {
-	if archivesElided {
-		w = append(w, archiveElisionNotice())
+// archiveElisionNotes returns the response Notes list for a fetch that
+// reported the newest-first short-circuit — nil otherwise. It feeds the
+// `notes` (info) list, never `warnings`: see responseAdvisories.
+func archiveElisionNotes(archivesElided bool) []string {
+	if !archivesElided {
+		return nil
 	}
-	return w
+	return []string{archiveElisionNote()}
+}
+
+// responseAdvisories assembles the two severity lists the events and recover
+// responses carry (#1365):
+//
+//   - warnings — cautionary facts: coverage gaps, a session's archive
+//     exclusion (#1311/#1321), merge divergence findings (#1325). Things an
+//     operator may need to act on, rendered in the alert register.
+//   - notes — benign audit facts: the #1353 archive-elision record, which is
+//     correct-by-construction ("nothing is missing") and exists for
+//     auditability, not attention. Rendered muted, never as an alert.
+//
+// The split lives HERE, on the wire, because the API and the console UI share
+// the shape: classifying UI-side would leave every other client (curl, an
+// agent) with one undifferentiated list. `notes` is additive — consumers that
+// ignore it see the same warnings contract as before.
+func responseAdvisories(plan *query.QueryPlan, excl archiveExclusion, diverged int, archivesElided bool) (warnings, notes []string) {
+	warnings = appendDivergenceWarning(restrictedFetchWarnings(plan, excl), diverged)
+	notes = archiveElisionNotes(archivesElided)
+	return warnings, notes
 }
 
 // restrictedFetchWarnings is gapWarnings for a fetch that may have excluded the
