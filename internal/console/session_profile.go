@@ -233,11 +233,10 @@ func (s *Server) applySessionProfile(ctx context.Context, r *http.Request, b *bu
 // (archiveElisionNotes → the `notes` list, #1365) so the skip is auditable,
 // per the #1311/#1321 contract that a result always says what scope was read;
 // it is a note and not a warning because the skip is correctness-preserving
-// ("nothing is missing"), while warnings stay for cautionary facts.
-// Structurally always
-// false for a profiled session or a --no-archive console: there the archives
-// are EXCLUDED (excl says so and its notice speaks), not elided — nothing was
-// resolved that could have been skipped.
+// ("nothing is missing"), while warnings stay for cautionary facts. The flag
+// is structurally always false for a profiled session or a --no-archive
+// console: there the archives are EXCLUDED (excl says so and its notice
+// speaks), not elided — nothing was resolved that could have been skipped.
 func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, int, bool, error) {
 	excl := archiveExclusionFor(r, b)
 	rows, plan, _, diverged, archivesElided, err := query.FetchMergedFull(ctx, b.db, b.engine, query.FetchMergedOptions{

@@ -72,30 +72,48 @@ func TestAppendDivergenceWarning(t *testing.T) {
 
 // #1365: the archive-elision record is an info NOTE — plain words, still
 // carrying the audit fact (archives skipped, and why), and never worded or
-// shaped like an incident.
+// shaped like an incident. Both surface strings are pinned VERBATIM (PR #1367
+// review): fragment checks alone let a rewording that keeps the fragments —
+// e.g. one dropping the "older than this page reaches" justification — ship
+// green. Changing the copy is fine; changing it without looking here is not.
 func TestArchiveElisionNote(t *testing.T) {
-	if n := archiveElisionNotes(false); len(n) != 0 {
+	if n := archiveElisionNotes(false, archiveElisionNote()); len(n) != 0 {
 		t.Fatalf("no elision must produce no note, got %#v", n)
 	}
-	n := archiveElisionNotes(true)
-	if len(n) != 1 {
-		t.Fatalf("want exactly one elision note, got %#v", n)
+	const wantEvents = "This page was answered from the live index; the registered archives were not read. " +
+		"Every archived event is older than this page reaches, so nothing is missing here. " +
+		"Paging further back, or filtering to a time range that reaches archived hours, searches the archives too."
+	const wantRecover = "This reversal was built from the live index; the registered archives were not read. " +
+		"Every archived event is older than the window this request reaches, so nothing is missing here. " +
+		"A time range that reaches archived hours, or a higher limit, searches the archives too."
+	if got := archiveElisionNote(); got != wantEvents {
+		t.Errorf("events elision note drifted from the pinned copy:\ngot:  %s\nwant: %s", got, wantEvents)
 	}
-	// The audit fact survives the rewrite: the note still says the archives
-	// went unread, why that loses nothing, and how to reach them.
-	for _, want := range []string{"answered from the live index", "were not read", "nothing is missing", "Paging further back", "time range"} {
-		if !strings.Contains(strings.ToLower(n[0]), strings.ToLower(want)) {
-			t.Errorf("note lost the audit fact %q: %s", want, n[0])
+	if got := recoverArchiveElisionNote(); got != wantRecover {
+		t.Errorf("recover elision note drifted from the pinned copy:\ngot:  %s\nwant: %s", got, wantRecover)
+	}
+	n := archiveElisionNotes(true, archiveElisionNote())
+	if len(n) != 1 || n[0] != wantEvents {
+		t.Fatalf("want exactly the pinned events note, got %#v", n)
+	}
+	for name, s := range map[string]string{"events": wantEvents, "recover": wantRecover} {
+		// The audit fact survives the rewrite on BOTH surfaces: the note says
+		// the archives went unread, why that loses nothing, and how to reach
+		// them.
+		for _, want := range []string{"live index", "were not read", "nothing is missing", "time range"} {
+			if !strings.Contains(strings.ToLower(s), strings.ToLower(want)) {
+				t.Errorf("%s note lost the audit fact %q: %s", name, want, s)
+			}
 		}
-	}
-	// The jargon the issue was filed over is gone...
-	if strings.Contains(n[0], "could not change it") {
-		t.Errorf("the old 'because they could not change it' jargon is back: %s", n[0])
-	}
-	// ...and the string is read by API/MCP clients too, so it must stay
-	// flag-free (no `--flag` a client cannot pass on its own surface).
-	if strings.Contains(n[0], "--") {
-		t.Errorf("the wire note must not name CLI flags: %s", n[0])
+		// The jargon the issue was filed over is gone...
+		if strings.Contains(s, "could not change it") {
+			t.Errorf("%s note brings back the 'because they could not change it' jargon: %s", name, s)
+		}
+		// ...and the strings are read by API/MCP clients too, so they must
+		// stay flag-free (no `--flag` a client cannot pass on its surface).
+		if strings.Contains(s, "--") {
+			t.Errorf("the %s wire note must not name CLI flags: %s", name, s)
+		}
 	}
 }
 
@@ -107,7 +125,7 @@ func TestResponseAdvisoriesSeveritySplit(t *testing.T) {
 	hour := time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)
 	planWithGap := &query.QueryPlan{GapHours: []time.Time{hour}}
 
-	warnings, notes := responseAdvisories(planWithGap, archiveExclusion{profile: true}, 2, true)
+	warnings, notes := responseAdvisories(planWithGap, archiveExclusion{profile: true}, 2, true, archiveElisionNote())
 
 	joinedW := strings.Join(warnings, "\n")
 	for name, want := range map[string]string{
@@ -119,12 +137,20 @@ func TestResponseAdvisoriesSeveritySplit(t *testing.T) {
 			t.Errorf("%s missing from warnings: %#v", name, warnings)
 		}
 	}
-	if len(notes) != 1 || !strings.Contains(notes[0], "answered from the live index") {
+	if len(notes) != 1 || notes[0] != archiveElisionNote() {
 		t.Fatalf("the elision record must be the info note, got %#v", notes)
 	}
+	// The recover surface flows its own wording through the same seam.
+	if _, rn := responseAdvisories(&query.QueryPlan{}, archiveExclusion{}, 0, true, recoverArchiveElisionNote()); len(rn) != 1 || rn[0] != recoverArchiveElisionNote() {
+		t.Fatalf("the recover elision record must flow through as the info note, got %#v", rn)
+	}
 	// The lists never cross: the elision is not ALSO (or instead) a warning,
-	// and no cautionary fact is quietly demoted to a note.
-	if strings.Contains(joinedW, "answered from the live index") || strings.Contains(joinedW, "could not change it") {
+	// and no cautionary fact is quietly demoted to a note. The probes are the
+	// elision strings' own openings — a bare "live index" would false-positive
+	// on the divergence warning, which legitimately names the live index.
+	if strings.Contains(joinedW, "answered from the live index") ||
+		strings.Contains(joinedW, "built from the live index") ||
+		strings.Contains(joinedW, "could not change it") {
 		t.Errorf("the elision record leaked into warnings: %#v", warnings)
 	}
 	joinedN := strings.Join(notes, "\n")
@@ -135,7 +161,7 @@ func TestResponseAdvisoriesSeveritySplit(t *testing.T) {
 	}
 
 	// The quiet path: nothing to say in either register.
-	w, n := responseAdvisories(&query.QueryPlan{}, archiveExclusion{}, 0, false)
+	w, n := responseAdvisories(&query.QueryPlan{}, archiveExclusion{}, 0, false, archiveElisionNote())
 	if len(w) != 0 || len(n) != 0 {
 		t.Errorf("clean read must produce no warnings and no notes, got %#v / %#v", w, n)
 	}

@@ -1277,10 +1277,6 @@ function renderEvents(params) {
     onclick: (e) => exportEvents("csv", e.target) }));
   v.append(bar);
 
-  // Info notes (#1365), directly under the result-count line: the muted
-  // register for the response `notes` list (benign audit facts like the
-  // archive-elision record). Never the alert component.
-  v.append(el("div", { id: "ev-notes", class: "notes" }));
   // Scope/coverage notices for this result set (#1311). The response has
   // carried a `warnings` array all along and this view dropped it, which meant
   // the default browse -- the exact case a profiled session reads live-index
@@ -1288,6 +1284,11 @@ function renderEvents(params) {
   // threw it away at the browser. Above the list on purpose: a caveat about
   // what a result does NOT include is worthless below the result.
   v.append(el("div", { id: "ev-warnings", class: "warnings" }));
+  // Info notes (#1365) under the result-count line, BELOW the warnings:
+  // alerts render first in both views (Recover has the same order). The muted
+  // register for the response `notes` list (benign audit facts like the
+  // archive-elision record) — never the alert component.
+  v.append(el("div", { id: "ev-notes", class: "notes" }));
 
   // events list
   const list = el("div", { class: "events", id: "events-list" });
@@ -1634,6 +1635,10 @@ async function runEventsQuery(form, keepPage) {
   } catch (err) {
     if (gen !== serverGen) return;
     clear(rowsEl); renderError(rowsEl, err);
+    // Clear stale advisories along with the rows: a lingering "nothing is
+    // missing here" (or an old warning) beside an error is misleading (#1365).
+    renderWarnings($("#ev-warnings", VIEW()), []);
+    renderNotes($("#ev-notes", VIEW()), []);
     if (countEl) countEl.textContent = "0";
     return;
   } finally {

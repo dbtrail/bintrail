@@ -319,7 +319,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// served fast because the archives provably could not change it must SAY
 	// the archives went unread — but as an info NOTE (#1365): it is a benign
 	// audit fact, not an incident.
-	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided)
+	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided, archiveElisionNote())
 	resp := eventsResponse{
 		Events:   toEventDTOs(rows),
 		Count:    len(rows),
@@ -417,8 +417,9 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// operator reviewing the script. The elision record (#1353) matters too:
 	// this fetch runs DESC with a limit, so a filled page can skip the
 	// archives, and the reviewer of an undo script must see that stated — as
-	// an info note (#1365), since the skip is correctness-preserving.
-	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided)
+	// an info note (#1365), since the skip is correctness-preserving —
+	// worded for this surface (a reversal has a window, not pages).
+	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided, recoverArchiveElisionNote())
 
 	// The fetch above ran Order=DESC so the limit kept the newest suffix of
 	// the window (#981). Detect truncation on the FETCHED row count — before
@@ -541,6 +542,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 			// response's Warnings list, but never framed as "provably partial"
 			// and never gating CascadeDetected/complete-ness above.
 			cw = append(cw, cres.Warnings...)
+			// Notes carries the same info list as the plain path below. NB:
+			// the positive notes wiring test (the recover subtest on the
+			// short-circuit fixture) exercises the PLAIN write site only —
+			// its fixture has no FK parent, so this cascade site shares the
+			// untested-notes caveat unless that subtest ever cascades.
 			writeJSON(w, http.StatusOK, recoverResponse{
 				SQL:             cres.SQL,
 				StatementCount:  cres.StatementCount,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -371,14 +372,20 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 		// failure under allow_gaps must land in Warnings (#1281) — the same
 		// no-silent-incompleteness contract CaptureGapStatus enforces for
 		// source-side loss.
-		// The elision flag is structurally always false here (this fetch is
-		// ASC with no limit, which the newest-first short-circuit never
-		// takes) — which is also why the MCP surface keeps its single
+		// The elision flag is false here on exactly ONE leg: this fetch is
+		// ASC, and the newest-first short-circuit is DESC-only. It DOES
+		// carry a limit (MaxReconstructEvents+1), so the order is the only
+		// thing standing between this fetch and the short-circuit — which is
+		// why the flag is captured and guarded below rather than discarded.
+		// That one-leg fact is also why the MCP surface keeps its single
 		// warnings list under the #1365 severity split: no tool ever
 		// produces the elision record. If a future fetch shape makes it
 		// reachable, it belongs in an info notes list, never in warnings
 		// (see the console's responseAdvisories).
-		rows, plan, skippedSources, diverged, _, err := query.FetchMergedFull(ctx, t.DB, query.New(t.DB), fmOpts)
+		rows, plan, skippedSources, diverged, archivesElided, err := query.FetchMergedFull(ctx, t.DB, query.New(t.DB), fmOpts)
+		if archivesElided {
+			slog.Warn("mcp reconstruct: archive elision reported on a fetch assumed ASC-only; the elision audit note is NOT surfaced on this response — wire a notes list before relying on this path")
+		}
 		if err != nil {
 			return ErrorResult(reconstructFetchError(err)), nil, nil
 		}

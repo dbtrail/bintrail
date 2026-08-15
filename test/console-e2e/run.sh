@@ -146,8 +146,12 @@ echo "==> provision the archive fixture index $ARC_DB (#1365: info note vs alert
 # premise is untouched.
 mysql_exec -e "DROP DATABASE IF EXISTS $ARC_DB; CREATE DATABASE $ARC_DB;"
 "$CLI_BIN" init --index-dsn "${BASE_DSN}/${ARC_DB}" --partitions 4 >/dev/null
-node -e '
-const H = new Date(); H.setUTCMinutes(0, 0, 0);
+# The anchor hour is computed ONCE and passed to both node scripts below:
+# independent `new Date()` calls could straddle an hour boundary, leaving the
+# gap bounds pointing one hour off the seeded partitions — a loud flake.
+ARC_EPOCH_MS="$(node -e 'const H = new Date(); H.setUTCMinutes(0, 0, 0); console.log(H.getTime());')"
+ARC_EPOCH_MS="$ARC_EPOCH_MS" node -e '
+const H = new Date(Number(process.env.ARC_EPOCH_MS));
 const f = (d) => d.toISOString().slice(0, 19).replace("T", " ");
 const pn = (d) => "p_" + d.toISOString().slice(0, 13).replace(/[-T]/g, "");
 const hours = [];
@@ -179,8 +183,8 @@ console.log(`INSERT INTO binlog_events (binlog_file, start_pos, end_pos, event_t
 # time-ranged read covering it reports a REAL coverage-gap warning.
 mysql_exec "$ARC_DB" -e "DELETE FROM archive_state ORDER BY partition_name ASC LIMIT 1;"
 IFS='|' read -r ARC_GAP_SINCE ARC_GAP_UNTIL <<EOF
-$(node -e '
-const H = new Date(); H.setUTCMinutes(0, 0, 0);
+$(ARC_EPOCH_MS="$ARC_EPOCH_MS" node -e '
+const H = new Date(Number(process.env.ARC_EPOCH_MS));
 const f = (d) => d.toISOString().slice(0, 19).replace("T", " ");
 console.log([f(new Date(H.getTime() - 6 * 3600e3)), f(new Date(H.getTime() - 5 * 3600e3))].join("|"));')
 EOF

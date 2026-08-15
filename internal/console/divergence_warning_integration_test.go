@@ -54,9 +54,15 @@ func TestIntegrationMergeDivergenceReachesResponseWarnings(t *testing.T) {
 		var resp struct {
 			Count    int      `json:"count"`
 			Warnings []string `json:"warnings"`
+			Notes    []string `json:"notes"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("decode: %v\n%s", err, w.Body.String())
+		}
+		// #1365: a divergence read consults the archives, so nothing is elided
+		// and the info list must stay empty — the finding is a WARNING only.
+		if len(resp.Notes) != 0 {
+			t.Errorf("events response carries unexpected info notes: %#v", resp.Notes)
 		}
 		return resp.Count, resp.Warnings
 	}
@@ -119,9 +125,15 @@ func TestIntegrationMergeDivergenceReachesResponseWarnings(t *testing.T) {
 			SQL      string   `json:"sql"`
 			RowCount int      `json:"row_count"`
 			Warnings []string `json:"warnings"`
+			Notes    []string `json:"notes"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("decode recover: %v\n%s", err, w.Body.String())
+		}
+		// #1365: same as the events check above — archives were read, so the
+		// info list stays empty and the divergence remains warnings-only.
+		if len(resp.Notes) != 0 {
+			t.Errorf("recover response carries unexpected info notes: %#v", resp.Notes)
 		}
 		if resp.RowCount != 2 || resp.SQL == "" {
 			t.Fatalf("recover did not process the merged rows (row_count=%d, sql empty=%v) — the warning assertion below would be vacuous", resp.RowCount, resp.SQL == "")

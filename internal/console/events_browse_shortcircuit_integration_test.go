@@ -202,6 +202,49 @@ func TestIntegrationEventsBrowseArchiveShortCircuit(t *testing.T) {
 		}
 	})
 
+	t.Run("recover: filled window elides — the note is in notes, positively", func(t *testing.T) {
+		// The POSITIVE recover-side pin (#1120 class, PR #1367 review): every
+		// other recover-notes assertion in the suite is a negative that holds
+		// vacuously on nil, so deleting `Notes: notes` at the plain recover
+		// write site — or reverting the split only in handleRecover — passed
+		// everything. This fails on both. Recover forces Order=DESC and the
+		// live remnant fills the 50-event limit, so the fetch elides the
+		// archives exactly like the events fast path above.
+		body := strings.NewReader(`{"schema":"shop","table":"orders","limit":50}`)
+		r := httptest.NewRequest("POST", "http://127.0.0.1:8090/api/recover", body)
+		r.Host = "127.0.0.1:8090"
+		w := httptest.NewRecorder()
+		srv.handleRecover(w, r)
+		if w.Code != 200 {
+			t.Fatalf("recover code = %d, body = %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			SQL      string   `json:"sql"`
+			RowCount int      `json:"row_count"`
+			Warnings []string `json:"warnings"`
+			Notes    []string `json:"notes"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode recover: %v\n%s", err, w.Body.String())
+		}
+		if resp.RowCount != 50 || resp.SQL == "" {
+			t.Fatalf("recover did not process a filled window (row_count=%d, sql empty=%v) — the notes assertion below would be vacuous", resp.RowCount, resp.SQL == "")
+		}
+		if !strings.Contains(strings.Join(resp.Notes, "\n"), "built from the live index") {
+			t.Errorf("the recover elision record is not in notes: %#v", resp.Notes)
+		}
+		// Warnings must be clean of the elision — but NOT empty: the filled
+		// window trips the limit-truncation warning, and asserting it keeps
+		// the leak check below from passing on an accidentally empty list.
+		joined := strings.Join(resp.Warnings, "\n")
+		if !strings.Contains(joined, "truncated at the limit") {
+			t.Errorf("expected the limit-truncation warning on a filled window: %#v", resp.Warnings)
+		}
+		if strings.Contains(joined, "built from the live index") || strings.Contains(joined, "answered from the live index") {
+			t.Errorf("the elision record leaked into recover warnings: %#v", resp.Warnings)
+		}
+	})
+
 	t.Run("short page: archives read, no elision claimed", func(t *testing.T) {
 		resp := get(t, "limit=200", "")
 		wantIDs(t, resp, 200)

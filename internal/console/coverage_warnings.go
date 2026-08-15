@@ -84,14 +84,26 @@ func archiveElisionNote() string {
 		"Paging further back, or filtering to a time range that reaches archived hours, searches the archives too."
 }
 
+// recoverArchiveElisionNote is archiveElisionNote in the recover surface's own
+// words: a reversal request has a window and a limit, not pages, so "this
+// page" and "paging further back" would be nonsense to the operator reviewing
+// an undo script. Same fact, same severity, surface-appropriate wording —
+// both strings are pinned verbatim by TestArchiveElisionNote.
+func recoverArchiveElisionNote() string {
+	return "This reversal was built from the live index; the registered archives were not read. " +
+		"Every archived event is older than the window this request reaches, so nothing is missing here. " +
+		"A time range that reaches archived hours, or a higher limit, searches the archives too."
+}
+
 // archiveElisionNotes returns the response Notes list for a fetch that
-// reported the newest-first short-circuit — nil otherwise. It feeds the
-// `notes` (info) list, never `warnings`: see responseAdvisories.
-func archiveElisionNotes(archivesElided bool) []string {
+// reported the newest-first short-circuit — nil otherwise. elisionNote is the
+// surface's own wording (archiveElisionNote / recoverArchiveElisionNote). It
+// feeds the `notes` (info) list, never `warnings`: see responseAdvisories.
+func archiveElisionNotes(archivesElided bool, elisionNote string) []string {
 	if !archivesElided {
 		return nil
 	}
-	return []string{archiveElisionNote()}
+	return []string{elisionNote}
 }
 
 // responseAdvisories assembles the two severity lists the events and recover
@@ -108,9 +120,19 @@ func archiveElisionNotes(archivesElided bool) []string {
 // the shape: classifying UI-side would leave every other client (curl, an
 // agent) with one undifferentiated list. `notes` is additive — consumers that
 // ignore it see the same warnings contract as before.
-func responseAdvisories(plan *query.QueryPlan, excl archiveExclusion, diverged int, archivesElided bool) (warnings, notes []string) {
+//
+// The lists' exclusivity is enforced by CONVENTION, not by type: this
+// function is the only place the events and recover handlers may assemble
+// advisory lists. A handler that hand-appends a fact to either list bypasses
+// the split and re-creates the one-register bug — add facts here, where the
+// severity decision is visible and unit-tested
+// (TestResponseAdvisoriesSeveritySplit).
+//
+// elisionNote is the surface's own wording for the elision record; pass
+// archiveElisionNote() (events) or recoverArchiveElisionNote() (recover).
+func responseAdvisories(plan *query.QueryPlan, excl archiveExclusion, diverged int, archivesElided bool, elisionNote string) (warnings, notes []string) {
 	warnings = appendDivergenceWarning(restrictedFetchWarnings(plan, excl), diverged)
-	notes = archiveElisionNotes(archivesElided)
+	notes = archiveElisionNotes(archivesElided, elisionNote)
 	return warnings, notes
 }
 

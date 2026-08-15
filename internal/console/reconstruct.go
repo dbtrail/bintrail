@@ -431,11 +431,18 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		AllowGaps:      allowGaps,
 		ArchiveFetcher: parquetquery.Fetch,
 	}
-	// The elision flag is structurally always false here (this fetch is ASC
-	// with no limit, which the newest-first short-circuit never takes), so
-	// this response carries no `notes` list (#1365) — grow one the day a
-	// benign audit fact exists to put in it.
-	rows, plan, skippedSources, diverged, _, err := query.FetchMergedFull(ctx, b.db, b.engine, fmOpts)
+	// The elision flag is false here on exactly ONE leg: this fetch is ASC,
+	// and the newest-first short-circuit is DESC-only. It DOES carry a limit
+	// (reconstructMaxEvents+1), so the order is the only thing standing
+	// between this fetch and the short-circuit — which is why the flag is
+	// captured and guarded below rather than discarded: a future flip to
+	// DESC must not silently swallow the audit fact. This response carries
+	// no `notes` list (#1365) — grow one the day a benign audit fact exists
+	// to put in it.
+	rows, plan, skippedSources, diverged, archivesElided, err := query.FetchMergedFull(ctx, b.db, b.engine, fmOpts)
+	if archivesElided {
+		slog.Warn("console reconstruct: archive elision reported on a fetch assumed ASC-only; the elision audit note is NOT surfaced on this response — wire a notes list before relying on this path")
+	}
 	if err != nil {
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {
