@@ -45,6 +45,41 @@ func TestStreamDaemonWiringEmitsBeacon(t *testing.T) {
 	}
 }
 
+// TestUpDelegationNamesBeaconUp pins the docs' "up beacons" claim, which
+// rides on runUpStream delegating to runStream WITH the up command itself:
+// the shared call site names the beacon via cmd.Name(), so invoked as `up` it
+// must say "up", not "stream". Hardcode the name in runStream — or break the
+// delegation's cmd pass-through — and this fails.
+func TestUpDelegationNamesBeaconUp(t *testing.T) {
+	c, bodies := telemetrytest.CollectingClient(t)
+	defer tel.SetClientForTest(c)()
+
+	addr, sever := telemetrytest.HangingTCPAddr(t)
+	origIndex, origSource := strmIndexDSN, strmSourceDSN
+	defer func() { strmIndexDSN, strmSourceDSN = origIndex, origSource }()
+	// As in production `up`, the strm* globals carry the DSNs by the time
+	// runStream runs (populateStreamFlags has copied them).
+	strmIndexDSN = "root:x@tcp(" + addr + ")/bintrail_index"
+	strmSourceDSN = "root:x@tcp(" + addr + ")/ignored"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	upCmd.SetContext(ctx)
+
+	done := make(chan error, 1)
+	go func() { done <- runStream(upCmd, nil) }()
+
+	telemetrytest.WaitForBeacon(t, bodies, "up")
+
+	cancel()
+	sever()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runStream did not return after cancel — daemon shutdown would hang")
+	}
+}
+
 // TestAgentDaemonWiringEmitsBeacon keeps `bintrail agent` alive through its
 // channel reconnect backoff (a connection-refused endpoint, a few attempts)
 // while the shortened daemon tick fires.

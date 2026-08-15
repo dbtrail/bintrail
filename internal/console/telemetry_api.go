@@ -9,11 +9,13 @@ import (
 	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
-// TelemetryController is the live usage-telemetry client a long-running console
-// (`bintrail-console watch`) wires in, so the UI opt-out toggle takes effect on
-// the running process immediately instead of only on the next start. Satisfied
-// by *telemetry.Client. nil on the read-only console, where the toggle still
-// persists the machine-wide choice to the consent file.
+// TelemetryController is the live usage-telemetry surface a long-running
+// console wires in, so the UI opt-out toggle takes effect on the running
+// process immediately instead of only on the next start. `watch` wires
+// *telemetry.Client directly; the read-only `serve` wires a consent-only
+// adapter whose RecordDaemonCommand returns nil, because it beacons (#1362)
+// but must not record console actions. nil means no live process to control —
+// the toggle still persists the machine-wide choice to the consent file.
 type TelemetryController interface {
 	Enabled() bool
 	Decision() telemetry.Decision
@@ -30,8 +32,9 @@ type TelemetryController interface {
 // ("recover", "reconstruct", …) — never derived from the request, path params,
 // query, or body — so nothing about the operator's data (schemas, tables, PKs,
 // row values) can reach the wire. A 5xx becomes an internal-error event; every
-// other status is a plain run. No telemetry client (the read-only `serve`
-// binary) means the handler is called untouched.
+// other status is a plain run. No telemetry client — or serve's consent-only
+// controller, whose RecordDaemonCommand returns a nil (inert) span — means
+// the handler runs effectively untouched.
 func (s *Server) recordAction(action string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.telemetry == nil {

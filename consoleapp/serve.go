@@ -17,6 +17,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/query"
+	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
 var serveCmd = &cobra.Command{
@@ -221,9 +222,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	srv, err := console.New(console.Config{
-		DB:            db,
-		DBName:        dbName,
-		BootDSN:       conIndexDSN,
+		DB:      db,
+		DBName:  dbName,
+		BootDSN: conIndexDSN,
+		// The consent-only adapter (serveTelemetry): serve beacons (#1362), so
+		// the UI opt-out toggle must stop THIS running process and the state
+		// endpoint must report the live decision — while console actions stay
+		// unrecorded, per TELEMETRY.md.
+		Telemetry:     serveTelemetry{},
 		Registry:      registry,
 		Listen:        conListen,
 		Token:         conToken,
@@ -298,3 +304,23 @@ func printConsoleBanner(srv *console.Server, headline string) {
 		fmt.Fprintln(os.Stderr)
 	}
 }
+
+// serveTelemetry adapts the process's live telemetry client for the read-only
+// console. It delegates the CONSENT surface — Enabled, Decision,
+// SetRuntimeConsent — so the UI opt-out toggle stops a running serve's daily
+// beacon immediately (not just on the next start), and so the telemetry state
+// endpoint reports the LIVE decision, including a --telemetry launch flag
+// (which the POST handler's 409 override guard keys on). Without this, serve
+// would keep beaconing after the operator opted out, while GET /api/telemetry
+// claimed reporting was off.
+//
+// It deliberately does NOT delegate RecordDaemonCommand: TELEMETRY.md
+// promises the read-only serve records no console-action events, so actions
+// return a nil *Span (inert by contract). Wiring tel.Client() directly, the
+// way `watch` does, would silently break that promise.
+type serveTelemetry struct{}
+
+func (serveTelemetry) Enabled() bool                              { return tel.Client().Enabled() }
+func (serveTelemetry) Decision() telemetry.Decision               { return tel.Client().Decision() }
+func (serveTelemetry) SetRuntimeConsent(enabled bool)             { tel.Client().SetRuntimeConsent(enabled) }
+func (serveTelemetry) RecordDaemonCommand(string) *telemetry.Span { return nil }

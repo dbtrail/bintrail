@@ -170,6 +170,12 @@ func runFlashback(cmd *cobra.Command, args []string) error {
 		listener.Close()
 	}()
 
+	// Usage telemetry for a months-lived process (#1362): Init's drain runs
+	// once, at startup, so without this loop a daemon's beacons would spool
+	// and age out undelivered. Own goroutine — never on a client connection's
+	// path. Same seam as the MySQL shim, via this binary's own hook.
+	go tel.Client().RunDaemon(ctx, cmd.Name())
+
 	cfg := pgshim.Config{
 		IndexDB: db,
 		ShimConfig: shim.Config{

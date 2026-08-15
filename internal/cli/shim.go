@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"os/signal"
 	"strings"
 	"sync"
@@ -279,10 +278,12 @@ func runShim(cmd *cobra.Command, args []string) error {
 		"tenants_with_default_schema", len(userSchemas),
 	)
 
-	// Derive from the cobra context (context.Background under a normal
-	// Execute) so an embedding caller — or a wiring test — can stop the
-	// daemon by cancelling it, exactly like every other long-running command.
-	ctx, cancel := context.WithCancel(cmd.Context())
+	// SIGINT/SIGTERM or parent-context cancellation (an embedding caller, a
+	// wiring test) → ctx done → close listener → accept loop returns. The
+	// signal-bound context is the sibling daemons' pattern (`serve`,
+	// bintrail-pg flashback), and NotifyContext un-registers the handler when
+	// runShim returns.
+	ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	// Usage telemetry for a months-lived process (#1362): Init's drain runs
@@ -293,18 +294,9 @@ func runShim(cmd *cobra.Command, args []string) error {
 	// hook publishes the client it resolved at Start.
 	go processClient.RunDaemon(ctx, cmd.Name())
 
-	// SIGINT / SIGTERM → cancel ctx → close listener → accept loop returns.
-	// Parent-context cancellation closes the listener the same way, or a
-	// cancelled daemon would sit blocked in Accept forever.
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		select {
-		case <-sigs:
-			slog.Info("shim shutting down")
-			cancel()
-		case <-ctx.Done():
-		}
+		<-ctx.Done()
+		slog.Info("shim shutting down")
 		listener.Close()
 	}()
 

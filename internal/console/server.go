@@ -506,8 +506,10 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/storage", s.handleStorageInfo)
 	api.HandleFunc("GET /api/profiles", s.handleProfiles)
 	// Usage-telemetry opt-out: read the machine-wide state, and toggle it (a
-	// local config write, not a data write). Available on any console; the UI
-	// surfaces it on the watch daemon that actually beacons.
+	// local config write, not a data write). Every console daemon beacons
+	// (#1362), so every embedding binary wires a live TelemetryController —
+	// watch the full client, serve a consent-only adapter — and the toggle
+	// stops the running process's beacons immediately.
 	api.HandleFunc("GET /api/telemetry", s.handleTelemetryGet)
 	api.HandleFunc("POST /api/telemetry", s.handleTelemetrySet)
 	// Server management: CRUD over the local registry file (never a DB write)

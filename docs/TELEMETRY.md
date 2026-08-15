@@ -159,10 +159,12 @@ no cookie, and no account identifier**.
 
 ### Daemons
 
-Long-running commands (`stream`, `agent`, `up`, `watch`, `bintrail-console
-serve`, `bintrail shim`) send at most **one beacon per UTC day**, and the
-first only after they have been running for an hour. A finer cadence would reconstruct your uptime and maintenance windows; a
-beacon at startup would mean a crash-looping daemon emitted one per restart.
+Long-running commands (`stream`, `agent`, `up`, `watch`,
+`bintrail-console serve`, `bintrail shim`, `bintrail-pg stream`,
+`bintrail-pg flashback`) send at most **one beacon per UTC day**, and the
+first only after they have been running for an hour. A finer cadence would
+reconstruct your uptime and maintenance windows; a beacon at startup would
+mean a crash-looping daemon emitted one per restart.
 
 Beacons carry no `run_id`.
 
@@ -240,7 +242,7 @@ binary — cannot emit telemetry.
 | Surface | Reports? | |
 |---|---|---|
 | `bintrail`, `bintrail-pg` commands | Yes, by default | |
-| Daemons (`stream`, `agent`, `up`, `watch`, `bintrail-console serve`, `bintrail shim`) | Yes, one beacon per day | `watch` also records the console actions below |
+| Daemons (`stream`, `agent`, `up`, `watch`, `bintrail-console serve`, `bintrail shim`, `bintrail-pg stream`, `bintrail-pg flashback`) | Yes, one beacon per day | `watch` also records the console actions below |
 | **Demo image** (`ghcr.io/dbtrail/bintrail-demo`) | **Never** | Hard-disabled in the image and in its entrypoint, and asserted by its smoke test. An evaluation image must not phone home from a laptop |
 | **MCP server** (`bintrail-mcp`) | **Never** | Invoked by an AI agent inside an editor or chat session — no human is present to consent and no terminal exists for a notice. It cannot link the telemetry package at all |
 | **Web console UI** (under `watch`) | A deliberate-action event, server-side | See below. No JavaScript beacon, ever — the frontend has no third-party dependencies and makes no telemetry request; the event is recorded by the server it already talks to |
@@ -347,6 +349,7 @@ statements of fact rather than intent.
 | `TestRootHookIsNotShadowed` (×3 binaries) | Instrumentation cannot be silently lost from part of the command tree |
 | `TestMCPServerIsTelemetryFree` | The MCP server cannot link the telemetry package |
 | `TestRunDaemonDoesNotBeaconBeforeFirstTick` | A crash-looping daemon emits nothing |
+| Per-daemon wiring guards (`*DaemonWiringEmitsBeacon`, one per call site across `stream`, `agent`, `up`, both `watch` paths, `serve`, `shim`, `bintrail-pg stream`, `bintrail-pg flashback`) | Every daemon this document says beacons actually starts the beacon loop — each test drives the real run function and fails if its launch line is deleted |
 | `TestBeaconCarriesNoRunID` | Daemon beacons carry no identifier |
 | `TestRecordDaemonCommandOmitsRunID` | A console action inside a daemon records no `run_id` — no per-install timeline |
 | `TestRecordActionUsesFixedName` | The console action name is a fixed constant, never derived from the request |
