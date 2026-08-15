@@ -99,7 +99,8 @@ INSERT INTO schema_snapshots (snapshot_id, snapshot_time, schema_name, table_nam
   (1,'$P_HOUR','$FIX_SCHEMA','parent','id',1,'PRI','int','NO'),
   (1,'$P_HOUR','$FIX_SCHEMA','child','id',1,'PRI','int','NO'),
   (1,'$P_HOUR','$FIX_SCHEMA','child','pid',2,'','int','YES'),
-  (1,'$P_HOUR','e2estock','inventory','id',1,'PRI','int','NO');
+  (1,'$P_HOUR','e2estock','inventory','id',1,'PRI','int','NO'),
+  (1,'$P_HOUR','e2estock','orders','id',1,'PRI','int','NO');
 INSERT INTO binlog_events (binlog_file, start_pos, end_pos, event_timestamp, connection_id, schema_name, table_name, event_type, pk_values, changed_columns, row_before, row_after, query_text, query_hash) VALUES
   ('binlog.000001',100,200,'$TS_INS',NULL,'$FIX_SCHEMA','orders',1,'3',NULL,NULL,'{"id":3,"status":"new","email":"c@example.com"}',NULL,NULL),
   ('binlog.000001',200,300,'$TS_UPD',777,'$FIX_SCHEMA','orders',2,'1','["status"]','{"id":1,"status":"new","email":"a@example.com"}','{"id":1,"status":"shipped","email":"a@example.com"}','UPDATE orders SET status = ''shipped'' /* e2e-canary-query-text */',SHA2('e2e-canary-query-text',256)),

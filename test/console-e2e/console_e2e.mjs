@@ -1423,55 +1423,125 @@ try {
     const listId = input.getAttribute("list");
     const dl = listId ? document.getElementById(listId) : null;
     const read = () => (dl ? Array.from(dl.options).map((o) => o.value).sort() : []);
-    // Select the fixture schema through the REAL change path (what a user does).
-    f.elements.schema.value = FIX;
-    f.elements.schema.dispatchEvent(new Event("change"));
-    for (let i = 0; i < 80 && !read().length; i++) await sleep(50);
+    const hintText = () => (f.querySelector(".combo-hint") || {}).textContent || "";
+    const waitFor = async (pred) => { for (let i = 0; i < 80 && !pred(); i++) await sleep(50); return pred(); };
+    const pick = (schema) => { f.elements.schema.value = schema; f.elements.schema.dispatchEvent(new Event("change")); };
+
+    // The dropped-table flow: a name typed BEFORE the first schema selection
+    // must survive that selection — clearing here would make the one recovery
+    // a closed <select> can't do impossible from this combobox too.
+    input.value = "preseeded_tbl";
+    pick(FIX);
+    await waitFor(() => read().length > 0);
     const tablesA = read();
-    // A value from the old schema, then a switch: suggestions must swap and
-    // the stale value must clear (never silently kept under the new schema).
-    input.value = "orders";
-    f.elements.schema.value = "e2estock";
-    f.elements.schema.dispatchEvent(new Event("change"));
-    for (let i = 0; i < 80 && (!read().length || read().join() === tablesA.join()); i++) await sleep(50);
+    const preseededKept = input.value === "preseeded_tbl";
+
+    // A value from the old schema not in the new listing: suggestions must
+    // swap and the stale value must clear (never silently kept).
+    input.value = "child";
+    pick("e2estock");
+    await waitFor(() => read().length > 0 && read().join() !== tablesA.join());
     const tablesB = read();
     const clearedOnSwitch = input.value === "";
-    // Back to the fixture schema for the scenarios below.
-    f.elements.schema.value = FIX;
-    f.elements.schema.dispatchEvent(new Event("change"));
-    for (let i = 0; i < 80 && read().join() !== tablesA.join(); i++) await sleep(50);
+
+    // The keep-arm: "orders" exists in BOTH schemas (shared fixture name), so
+    // switching must KEEP it — an unconditional clear-on-switch fails here.
+    pick(FIX);
+    await waitFor(() => read().join() === tablesA.join());
+    input.value = "orders";
+    pick("e2estock");
+    await waitFor(() => read().join() === tablesB.join());
+    const sharedKept = input.value === "orders";
+
+    // A → "— select —" → B must still clear: the empty option must not reset
+    // the switch marker and launder B into a "first selection".
+    pick(FIX);
+    await waitFor(() => read().join() === tablesA.join());
+    input.value = "parent";
+    pick("");
+    await sleep(120);
+    const keptOnEmpty = input.value === "parent"; // deselecting alone never clears
+    pick("e2estock");
+    await waitFor(() => read().join() === tablesB.join());
+    const clearedViaEmpty = input.value === "";
+
+    // A FAILED listing: value intact, field usable, aria-busy gone, and the
+    // persistent aria-live hint says to type the name (the toast is 2.2s).
+    const realFetch = window.fetch;
+    window.fetch = (p, o) => (typeof p === "string" && p.startsWith("/api/schemas")
+      ? Promise.resolve(new Response('{"error":"boom"}', { status: 500, headers: { "Content-Type": "application/json" } }))
+      : realFetch(p, o));
+    tablesCache.delete(FIX);
+    input.value = "typed_under_failure";
+    pick(FIX);
+    await waitFor(() => /type the table name/.test(hintText()));
+    const failed = {
+      valueKept: input.value === "typed_under_failure",
+      enabled: !input.disabled,
+      ariaBusyGone: !input.hasAttribute("aria-busy"),
+      hint: hintText(),
+    };
+    window.fetch = realFetch;
+    // ...and a submit still reaches the backend despite the failed listing.
+    document.getElementById("recover-out").replaceChildren();
+    f.elements.pk.value = "";
+    f.elements.since.value = ""; f.elements.until.value = "";
+    f.requestSubmit();
+    await waitFor(() => !!document.querySelector("#recover-out #sql-panel") && !document.querySelector("#modal .busy-modal"));
+    const failedSubmit = !!document.querySelector("#recover-out #sql-panel");
     return {
       isInput: input.tagName === "INPUT",
       hasList: !!dl,
       hasHint: !!f.querySelector(".combo-hint"),
       disabled: input.disabled,
-      tablesA, tablesB, clearedOnSwitch,
+      preseededKept, tablesA, tablesB, clearedOnSwitch, sharedKept,
+      keptOnEmpty, clearedViaEmpty, failed, failedSubmit,
     };
   }, FIX);
   (combo.isInput && combo.hasList)
     ? ok("restore combo: Table is an input+datalist combobox, not a closed select")
     : bad("restore combo: Table is an input+datalist combobox, not a closed select", JSON.stringify(combo));
+  combo.preseededKept
+    ? ok("restore combo: a name typed before the first schema selection survives it")
+    : bad("restore combo: a name typed before the first schema selection survives it", "first listing load cleared the typed value");
   combo.tablesA.join(",") === "child,orders,parent"
     ? ok("restore combo: selecting a schema populates suggestions from its listing")
     : bad("restore combo: selecting a schema populates suggestions from its listing", JSON.stringify(combo.tablesA));
-  combo.tablesB.join(",") === "inventory"
+  combo.tablesB.join(",") === "inventory,orders"
     ? ok("restore combo: switching schemas swaps the suggestions")
     : bad("restore combo: switching schemas swaps the suggestions", JSON.stringify(combo.tablesB));
   combo.clearedOnSwitch
     ? ok("restore combo: a stale table value is cleared on schema switch")
     : bad("restore combo: a stale table value is cleared on schema switch", "kept the previous schema's table");
-  (!combo.disabled && combo.hasHint)
-    ? ok("restore combo: the field stays a usable free-text input with a busy-hint slot")
-    : bad("restore combo: the field stays a usable free-text input with a busy-hint slot", JSON.stringify(combo));
+  combo.sharedKept
+    ? ok("restore combo: a value present in the NEW schema's listing survives the switch")
+    : bad("restore combo: a value present in the NEW schema's listing survives the switch", "cleared a value that belongs to the new schema");
+  (combo.keptOnEmpty && combo.clearedViaEmpty)
+    ? ok("restore combo: routing a switch through '— select —' still clears the stale value")
+    : bad("restore combo: routing a switch through '— select —' still clears the stale value", JSON.stringify({ keptOnEmpty: combo.keptOnEmpty, clearedViaEmpty: combo.clearedViaEmpty }));
+  (combo.failed.valueKept && combo.failed.enabled && combo.failed.ariaBusyGone)
+    ? ok("restore combo: a failed listing keeps the value and the field usable")
+    : bad("restore combo: a failed listing keeps the value and the field usable", JSON.stringify(combo.failed));
+  /type the table name/.test(combo.failed.hint)
+    ? ok("restore combo: a failed listing shows the persistent aria-live hint")
+    : bad("restore combo: a failed listing shows the persistent aria-live hint", JSON.stringify(combo.failed.hint));
+  combo.failedSubmit
+    ? ok("restore combo: a submit still reaches the backend after a failed listing")
+    : bad("restore combo: a submit still reaches the backend after a failed listing", "no reversal panel rendered");
+  !combo.disabled
+    ? ok("restore combo: the field is never disabled")
+    : bad("restore combo: the field is never disabled", "input.disabled");
 
   // Scenario 17 — Generate-undo busy modal (#1363). A slowed /api/recover must
   // open the modal immediately (dialog semantics, facts stated, button
   // disabled), block a second click, close on completion with focus on the
   // reversal.sql header; Cancel and ESC must abort the fetch and restore the
   // pre-click state; an error must render IN the modal, then dismiss cleanly.
-  // The stub honors AbortController like real fetch — which also proves api()
-  // passes the signal through: if it dropped it, the abort never rejects and
-  // the cancel legs below fail visibly.
+  // The stub honors AbortController like real fetch. That alone proves
+  // nothing — teardown is synchronous, so the modal closes either way; the
+  // wiring is proven by leg B sleeping PAST the stub's delay after Cancel:
+  // if api() dropped opts.signal, the un-aborted response lands, renders a
+  // panel and moves focus, and the post-delay assertions fail.
   const busyRun = await page.evaluate(async (FIX) => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const f = document.getElementById("recover-form");
@@ -1525,9 +1595,11 @@ try {
         focusOnResult: !!document.activeElement && document.activeElement.classList.contains("code-head"),
       };
 
-      // B) Cancel restores the pre-click state.
+      // B) Cancel restores the pre-click state — and the abort is PROVEN by
+      // sleeping past the stub's short delay afterwards: an un-aborted fetch
+      // resolves then, renders a panel and moves focus, failing below.
       document.getElementById("recover-out").replaceChildren();
-      delay = 5000;
+      delay = 600;
       genBtn.focus(); genBtn.click();
       await sleep(120);
       const cbtn = Array.from((modalSel() || document.createElement("i")).querySelectorAll("button")).find((b) => b.textContent === "Cancel");
@@ -1540,24 +1612,41 @@ try {
         focusBack: document.activeElement === genBtn,
         calls: calls.length, // 2: the canceled call fired once, never retried
       };
+      await sleep(900); // PAST the stub's delay
+      afterCancel.noPanelAfterDelay = !document.querySelector("#recover-out #sql-panel");
+      afterCancel.focusStillBack = document.activeElement === genBtn;
 
-      // B2) ESC aborts the same way.
+      // B2) ESC aborts the same way (same past-delay proof).
       genBtn.focus(); genBtn.click();
       await sleep(120);
       const escOpened = !!modalSel();
       document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
       await sleep(150);
       const afterEsc = { opened: escOpened, modalGone: !modalSel(), btnEnabled: !genBtn.disabled, noPanel: !document.querySelector("#recover-out #sql-panel") };
+      await sleep(900); // PAST the stub's delay
+      afterEsc.noPanelAfterDelay = !document.querySelector("#recover-out #sql-panel");
 
-      // C) an error renders IN the modal, then Dismiss returns to pre-click state.
+      // C) an error renders IN the modal — and a FAILED generation must not
+      // leave the PREVIOUS run's script on screen with Download live (those
+      // bytes answer a filter nobody named). Seed a successful result first,
+      // then fail the next generation and assert the stale panel and the
+      // download buffer are gone.
+      mode = "delay"; delay = 0;
+      genBtn.focus(); genBtn.click();
+      for (let i = 0; i < 100 && (modalSel() || !document.querySelector("#recover-out #sql-panel")); i++) await sleep(50);
+      const seeded = { panel: !!document.querySelector("#recover-out #sql-panel"), sql: lastSQL.length > 0 };
       mode = "error";
+      f.elements.pk.value = "2"; // a DIFFERENT filter than the seeded script answers
       genBtn.focus(); genBtn.click();
       await sleep(200);
       const em = modalSel();
       const errShown = {
+        seeded,
         stillOpen: !!em,
         busyAttr: em ? em.getAttribute("aria-busy") : "",
         text: em ? em.textContent : "",
+        stalePanelCleared: !document.querySelector("#recover-out #sql-panel"),
+        staleSQLCleared: lastSQL === "",
       };
       const dismiss = em ? Array.from(em.querySelectorAll("button")).find((b) => b.textContent === "Dismiss") : null;
       if (dismiss) dismiss.click();
@@ -1597,7 +1686,84 @@ try {
         rendered: !!document.querySelector("#recover-preview .events"),
         btnEnabled: !prevBtn.disabled,
       };
-      return { open, secondBlocked, done, afterCancel, afterEsc, errShown, afterErr, typed, previewBusy, previewDone };
+      window.fetch = (p, o) => {
+        if (!(typeof p === "string" && p.startsWith("/api/recover"))) return realFetch(p, o);
+        calls.push(o && o.body ? String(o.body) : "");
+        return new Promise((resolve, reject) => {
+          const t = setTimeout(() => resolve(realFetch(p, o)), delay);
+          if (o && o.signal) o.signal.addEventListener("abort", () => { clearTimeout(t); reject(new DOMException("Aborted", "AbortError")); });
+        });
+      };
+
+      // F) the ⌘K palette stacks ABOVE the dialog in its own mount and owns
+      // its keys: Escape with the palette open must close the palette ONLY —
+      // neither the modal's capture trap (which would beat the palette
+      // input's own handler to the event) nor globalKeydown's generic
+      // #modal-emptying fall-through (the same Escape that closed the
+      // palette bubbles on) may touch the busy dialog.
+      delay = 2000;
+      f.elements.table.value = "orders"; f.elements.pk.value = "1";
+      genBtn.focus(); genBtn.click();
+      await sleep(100);
+      const cmdkMount = document.getElementById("cmdk-mount");
+      document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true, cancelable: true }));
+      await sleep(100);
+      const paletteOpened = !!cmdkMount.firstChild;
+      document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await sleep(100);
+      const cmdkLeg = {
+        paletteOpened,
+        paletteClosed: !cmdkMount.firstChild,
+        modalSurvived: !!modalSel(),
+      };
+      document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await sleep(150);
+      cmdkLeg.canceledAfter = !modalSel();
+      cmdkLeg.btnEnabled = !genBtn.disabled;
+
+      // G) another dialog CLOBBERING the shared #modal slot (openServersModal
+      // replaces its children without our teardown) must dissolve the trap on
+      // the next keystroke: buttons re-enabled, re-entry flag reset, and the
+      // occupying dialog left alone.
+      delay = 1200;
+      document.getElementById("recover-out").replaceChildren();
+      genBtn.focus(); genBtn.click();
+      await sleep(100);
+      const clobberBefore = !!modalSel();
+      openServersModal();
+      for (let i = 0; i < 60 && !document.getElementById("servers-list"); i++) await sleep(50);
+      const busyGone = !modalSel();
+      // The click path can arrive before any keystroke: the re-entry guard
+      // must self-heal on read when the flag is set but no .busy-modal is in
+      // the slot.
+      const selfHealed = !recoverBusyActive() && !recoverBusyOpen;
+      document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }));
+      await sleep(80);
+      const clobberLeg = {
+        before: clobberBefore,
+        busyGone,
+        selfHealed,
+        btnEnabled: !genBtn.disabled,
+        flagReset: !recoverBusyOpen,
+        serversIntact: !!document.getElementById("servers-list"),
+      };
+      closeServersModal();
+      // Let the orphaned (never-aborted) request land before the next leg.
+      for (let i = 0; i < 100 && !document.querySelector("#recover-out #sql-panel"); i++) await sleep(50);
+
+      // H) a server switch mid-flight closes the dialog and renders nothing.
+      delay = 700;
+      document.getElementById("recover-out").replaceChildren();
+      genBtn.focus(); genBtn.click();
+      await sleep(100);
+      serverGen++;
+      for (let i = 0; i < 60 && modalSel(); i++) await sleep(50);
+      const switchLeg = {
+        modalGone: !modalSel(),
+        noPanel: !document.querySelector("#recover-out #sql-panel"),
+        btnEnabled: !genBtn.disabled,
+      };
+      return { open, secondBlocked, done, afterCancel, afterEsc, errShown, afterErr, typed, previewBusy, previewDone, cmdkLeg, clobberLeg, switchLeg };
     } finally {
       window.fetch = realFetch;
     }
@@ -1626,15 +1792,21 @@ try {
   (busyRun.afterCancel.modalGone && busyRun.afterCancel.noPanel && busyRun.afterCancel.btnEnabled && busyRun.afterCancel.calls === 2)
     ? ok("busy modal: Cancel aborts the fetch and restores the pre-click state")
     : bad("busy modal: Cancel aborts the fetch and restores the pre-click state", JSON.stringify(busyRun.afterCancel));
+  (busyRun.afterCancel.noPanelAfterDelay && busyRun.afterCancel.focusStillBack)
+    ? ok("busy modal: the abort actually reaches the fetch (nothing renders after the stub's delay)")
+    : bad("busy modal: the abort actually reaches the fetch (nothing renders after the stub's delay)", JSON.stringify(busyRun.afterCancel));
   busyRun.afterCancel.focusBack
     ? ok("busy modal: Cancel restores focus to the Generate button")
     : bad("busy modal: Cancel restores focus to the Generate button", "focus elsewhere");
-  (busyRun.afterEsc.opened && busyRun.afterEsc.modalGone && busyRun.afterEsc.btnEnabled && busyRun.afterEsc.noPanel)
+  (busyRun.afterEsc.opened && busyRun.afterEsc.modalGone && busyRun.afterEsc.btnEnabled && busyRun.afterEsc.noPanel && busyRun.afterEsc.noPanelAfterDelay)
     ? ok("busy modal: ESC aborts and restores like Cancel")
     : bad("busy modal: ESC aborts and restores like Cancel", JSON.stringify(busyRun.afterEsc));
   (busyRun.errShown.stillOpen && busyRun.errShown.busyAttr === "false" && /went away mid-read/.test(busyRun.errShown.text))
     ? ok("busy modal: an error renders the server's actionable text IN the modal")
     : bad("busy modal: an error renders the server's actionable text IN the modal", JSON.stringify(busyRun.errShown).slice(0, 300));
+  (busyRun.errShown.seeded.panel && busyRun.errShown.seeded.sql && busyRun.errShown.stalePanelCleared && busyRun.errShown.staleSQLCleared)
+    ? ok("busy modal: a failed generation clears the previous script and its download buffer")
+    : bad("busy modal: a failed generation clears the previous script and its download buffer", JSON.stringify(busyRun.errShown).slice(0, 300));
   (busyRun.afterErr.modalGone && busyRun.afterErr.noPanel && busyRun.afterErr.btnEnabled)
     ? ok("busy modal: Dismiss after an error returns to the pre-click state")
     : bad("busy modal: Dismiss after an error returns to the pre-click state", JSON.stringify(busyRun.afterErr));
@@ -1647,6 +1819,24 @@ try {
   (busyRun.previewDone.modalGone && busyRun.previewDone.rendered && busyRun.previewDone.btnEnabled)
     ? ok("busy modal: preview closes on completion with the rows rendered")
     : bad("busy modal: preview closes on completion with the rows rendered", JSON.stringify(busyRun.previewDone));
+  (busyRun.cmdkLeg.paletteOpened && busyRun.cmdkLeg.paletteClosed && busyRun.cmdkLeg.modalSurvived)
+    ? ok("busy modal: Escape over the ⌘K palette closes the palette only — the dialog survives")
+    : bad("busy modal: Escape over the ⌘K palette closes the palette only — the dialog survives", JSON.stringify(busyRun.cmdkLeg));
+  (busyRun.cmdkLeg.canceledAfter && busyRun.cmdkLeg.btnEnabled)
+    ? ok("busy modal: the next Escape (palette closed) cancels the dialog as usual")
+    : bad("busy modal: the next Escape (palette closed) cancels the dialog as usual", JSON.stringify(busyRun.cmdkLeg));
+  (busyRun.clobberLeg.before && busyRun.clobberLeg.busyGone && busyRun.clobberLeg.serversIntact)
+    ? ok("busy modal: another dialog can claim the shared #modal slot (fixture precondition)")
+    : bad("busy modal: another dialog can claim the shared #modal slot (fixture precondition)", JSON.stringify(busyRun.clobberLeg));
+  (busyRun.clobberLeg.btnEnabled && busyRun.clobberLeg.flagReset)
+    ? ok("busy modal: a clobbered dialog dissolves its trap — buttons re-enabled, re-entry flag reset")
+    : bad("busy modal: a clobbered dialog dissolves its trap — buttons re-enabled, re-entry flag reset", JSON.stringify(busyRun.clobberLeg));
+  busyRun.clobberLeg.selfHealed
+    ? ok("busy modal: the re-entry guard self-heals on read after a clobber")
+    : bad("busy modal: the re-entry guard self-heals on read after a clobber", JSON.stringify(busyRun.clobberLeg));
+  (busyRun.switchLeg.modalGone && busyRun.switchLeg.noPanel && busyRun.switchLeg.btnEnabled)
+    ? ok("busy modal: a server switch mid-flight closes the dialog and renders nothing")
+    : bad("busy modal: a server switch mid-flight closes the dialog and renders nothing", JSON.stringify(busyRun.switchLeg));
 
   // Scenario 17b — the reduced-motion arm (#1363, same rule as the #1353
   // skeletons): under prefers-reduced-motion the CSS animation is replaced by

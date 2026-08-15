@@ -1960,6 +1960,20 @@ function setSelectWhenReady(form, name, value, cb) {
 
 let recoverBusyOpen = false; // one click = one generation (re-entry guard)
 
+// recoverBusyActive is the re-entry guard READ, and it self-heals: the shared
+// #modal slot has other occupants (Manage servers, the rotation dialog) that
+// replace its children without our teardown, so a set flag with no
+// .busy-modal actually in the slot is stale — honoring it would wedge every
+// future Generate/Preview click silently. The isConnected guards in
+// openRecoverBusy tear down on the next keystroke; this covers the click
+// path that arrives first.
+function recoverBusyActive() {
+  if (!recoverBusyOpen) return false;
+  if (document.querySelector("#modal .busy-modal")) return true;
+  recoverBusyOpen = false;
+  return false;
+}
+
 // recoverBusyFacts mirrors the context banner's facts: target, pk, window.
 function recoverBusyFacts(f) {
   const facts = [];
@@ -2011,6 +2025,17 @@ function openRecoverBusy(form, opts) {
   // form's buttons disabled. Tab is trapped inside the dialog.
   const onKey = (e) => {
     if (closed) return;
+    // The ⌘K palette stacks ABOVE this dialog in its own mount and handles
+    // its own keys (its Escape handler sits on the palette input, which this
+    // capture-phase listener would otherwise beat to the event) — while it is
+    // open, bail entirely: same check globalKeydown does.
+    const cmdk = document.getElementById("cmdk-mount");
+    if (cmdk && cmdk.firstChild) return;
+    // Another dialog clobbered the shared #modal slot (openServersModal /
+    // showRotationDialog replace its children without our teardown): the trap
+    // must dissolve, not keep intercepting Tab over a detached dialog and
+    // holding the form's buttons disabled.
+    if (!scrim.isConnected) { teardown(); return; }
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancel(); return; }
     if (e.key !== "Tab") return;
     const foci = $all("button, input, select, textarea, a[href]", panel).filter((n) => !n.disabled);
@@ -2043,11 +2068,21 @@ function openRecoverBusy(form, opts) {
     close(refocus) { if (teardown() && refocus) restoreFocus(); },
     showError(err) {
       if (closed) return;
+      const msg = String((err && err.message) || err);
+      if (!scrim.isConnected) {
+        // Another dialog clobbered the shared #modal slot mid-flight:
+        // rendering into the detached panel would be exactly the silently
+        // vanished failure this modal exists to prevent. Tear down and
+        // surface the error where it can be seen.
+        teardown();
+        toast(opts.errTitle + ": " + msg);
+        return;
+      }
       panel.setAttribute("aria-busy", "false");
       panel.classList.add("busy-failed");
       body.insertBefore(el("div", { class: "busy-error", role: "alert" },
         el("p", { class: "busy-error-title", text: opts.errTitle }),
-        el("p", { class: "busy-error-msg", text: String((err && err.message) || err) })), foot);
+        el("p", { class: "busy-error-msg", text: msg })), foot);
       cancelBtn.textContent = "Dismiss";
       cancelBtn.focus();
     },
@@ -2055,7 +2090,7 @@ function openRecoverBusy(form, opts) {
 }
 
 async function previewRecover(form) {
-  if (recoverBusyOpen) return; // shares the one-in-flight guard with Generate (#1363)
+  if (recoverBusyActive()) return; // shares the one-in-flight guard with Generate (#1363)
   const gen = serverGen;
   const container = $("#recover-preview", VIEW());
   const warns = $("#recover-warnings", VIEW());
@@ -2078,6 +2113,13 @@ async function previewRecover(form) {
   try {
     const data = await api("/api/events?" + new URLSearchParams(params).toString(), { signal: ctrl.signal });
     if (gen !== serverGen) { busy.close(false); return; }
+    if (!container || !container.isConnected) {
+      // The view was rebuilt mid-flight (palette navigation): don't render
+      // into detached nodes — close and say what happened.
+      busy.close(false);
+      toast("The page changed while previewing — run Preview rows again.");
+      return;
+    }
     clear(container);
     container.append(el("div", { class: "meta-line" }, el("b", { text: String(data.count) }), " affected event(s) · limit " + data.limit));
     const list = el("div", { class: "events" });
@@ -2103,15 +2145,21 @@ async function previewRecover(form) {
     renderWarnings(warns, notes);
     busy.close(true); // success: back to the button that started the preview
   } catch (err) {
-    // Cancel/ESC already closed the modal and restored the pre-click state.
+    // Cancel/ESC = a WITHDRAWN request: the modal is already closed and the
+    // page keeps its pre-click state, previous preview included.
     if (err && err.name === "AbortError") return;
     if (gen !== serverGen) { busy.close(false); return; }
+    // A FAILED preview must not leave the previous run's rows on screen as
+    // if they answered the current filters; the error renders in the modal.
+    // #recover-warnings is deliberately NOT cleared (#1311: server notices
+    // must survive a re-preview).
+    clear(container);
     busy.showError(err);
   }
 }
 
 async function generateUndo(form) {
-  if (recoverBusyOpen) return; // one click = one generation (#1363)
+  if (recoverBusyActive()) return; // one click = one generation (#1363)
   const gen = serverGen;
   const warns = $("#recover-warnings", VIEW());
   const out = $("#recover-out", VIEW());
@@ -2129,6 +2177,13 @@ async function generateUndo(form) {
   try {
     const data = await api("/api/recover", { method: "POST", body, signal: ctrl.signal });
     if (gen !== serverGen) { busy.close(false); return; }
+    if (!out || !out.isConnected) {
+      // The view was rebuilt mid-flight (palette navigation): don't render
+      // into detached nodes — close and say what happened.
+      busy.close(false);
+      toast("The page changed while generating — run Generate undo SQL again.");
+      return;
+    }
     renderWarnings(warns, data.warnings);
     lastSQL = data.sql || "";
     clear(out);
@@ -2169,12 +2224,18 @@ async function generateUndo(form) {
     const head = $("#sql-panel .code-head", out);
     if (head) head.focus();
   } catch (err) {
-    // Cancel/ESC already closed the modal and restored the pre-click state;
-    // the page below was never touched.
+    // Cancel/ESC = a WITHDRAWN request: the modal is already closed and the
+    // page keeps its pre-click state, previous result included.
     if (err && err.name === "AbortError") return;
     if (gen !== serverGen) { busy.close(false); return; }
-    // Errors render IN the modal (with a Dismiss), never as a silently
-    // vanished overlay — and the page keeps its pre-click state.
+    // A FAILED generation is different: the previous run's script must not
+    // stay on screen with Copy/Download live — those bytes answer a filter
+    // nobody named. Clear the result and the download buffer, then render
+    // the error IN the modal (with a Dismiss), never as a silently vanished
+    // overlay.
+    clear(warns);
+    clear(out);
+    lastSQL = "";
     busy.showError(err);
   }
 }
@@ -3816,8 +3877,11 @@ async function loadTables(form) {
   const hint = combo ? combo.parentElement.querySelector(".combo-hint") : null;
   // The schema the current combo value was entered under — read BEFORE the
   // fetch so a slow listing still knows whether this is a schema SWITCH.
+  // The marker only advances on a REAL selection: letting "— select —"
+  // overwrite it would launder A → "— select —" → B into a first selection
+  // and carry A's table silently into B.
   const prevSchema = combo ? (combo.dataset.schema || "") : "";
-  if (combo) combo.dataset.schema = schema;
+  if (combo && schema) combo.dataset.schema = schema;
   if (dl) clear(dl);
   if (hint) hint.textContent = "";
   if (!schema) return;
@@ -3832,8 +3896,10 @@ async function loadTables(form) {
     }
   } catch (err) {
     if (combo) combo.removeAttribute("aria-busy");
+    // Persistent, announced (aria-live) failure note — the toast alone lasts
+    // 2.2s. Set BEFORE the serverGen bail so no path strands "loading…".
+    if (hint) hint.textContent = "couldn't load suggestions — type the table name";
     if (gen !== serverGen) return;
-    if (hint) hint.textContent = "";
     if (tsel) tsel.append(opt("", "(error loading tables)"));
     // A failed listing leaves the combo as usable free text with its value
     // intact — we cannot know whether the value belongs to the new schema,
@@ -4966,6 +5032,13 @@ function globalKeydown(e) {
     const cmdk = document.getElementById("cmdk-mount");
     if (cmdk && cmdk.firstChild) return;
     const modalMount = document.getElementById("modal");
+    // The recover busy dialog owns its Escape (a capture-phase handler that
+    // also aborts the in-flight fetch, #1363) — never generically empty the
+    // mount over it. This branch is still reachable with that dialog open:
+    // cmdkKeydown closes the palette without stopping propagation, so the
+    // SAME Escape that closed the palette lands here with the cmdk check
+    // above already passing.
+    if (modalMount && modalMount.querySelector(".busy-modal")) return;
     if (modalMount && modalMount.firstChild) { e.preventDefault(); modalMount.replaceChildren(); }
     return;
   }
