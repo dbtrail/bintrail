@@ -3,19 +3,31 @@ package console
 import (
 	"embed"
 	"io/fs"
+	"mime"
 	"net/http"
 	"path"
 	"strings"
 )
 
-// assetsFS embeds the static frontend (HTML/CSS/JS + brand images). The
-// console ships as a single Go binary with no Node build step — these files
-// are vanilla and dependency-free (see assets/VENDOR.md). Only the served
-// files are embedded; VENDOR.md stays as source-tree documentation and is
-// not exposed.
+// assetsFS embeds the static frontend (HTML/CSS/JS + brand images + the
+// vendored, latin-subset brand typefaces under assets/fonts — the console
+// makes zero external requests, so the fonts ship in the binary). The
+// console has no Node build step — these files are vanilla and, beyond the
+// OFL-licensed fonts, dependency-free (see assets/VENDOR.md). Only the
+// served files are embedded; VENDOR.md stays as source-tree documentation
+// and is not exposed.
 //
-//go:embed assets/index.html assets/app.js assets/style.css assets/logo.png assets/favicon.png
+//go:embed assets/index.html assets/app.js assets/style.css assets/logo.png assets/favicon.png assets/fonts
 var assetsFS embed.FS
+
+func init() {
+	// Go's built-in MIME table has no ".woff2" entry, so http.FileServer
+	// would fall back to the host OS mime.types (or octet-stream). Fonts
+	// load either way — nosniff does not apply to font destinations — but
+	// registering the type keeps the served Content-Type deterministic
+	// across hosts.
+	_ = mime.AddExtensionType(".woff2", "font/woff2")
+}
 
 // assetHandler serves the embedded frontend rooted at the assets/ directory,
 // so "/" resolves to index.html and "/app.js", "/style.css" resolve directly.

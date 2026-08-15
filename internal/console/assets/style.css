@@ -1,49 +1,112 @@
 /* ============================================================
-   dbtrail console — light, warm redesign
-   Type:  Bricolage Grotesque (display) · Hanken Grotesk (UI) · IBM Plex Mono (data)
-   Accent system: blue (primary) + orange + ochre, on white, warm neutrals.
+   dbtrail console — the dbtrail.com brand, tuned for a data tool
+   Type:  Bricolage Grotesque (display) · Geist (UI) · IBM Plex Mono (data)
+   Palette: the site's cool purple-tinted neutrals + its product accents
+   (blue / mint / red), mapped by ROLE — site hue+chroma at the console's
+   lightness steps, so WCAG AA holds where the marketing values would not
+   (the site's muted ink is ~3.1:1 on white; a console cannot ship that).
+   Brand accents (sun, violet) appear only in brand moments, never on data.
    Three directions via [data-dir="paper" | "studio" | "trail"].
    ============================================================ */
 
+/* Vendored brand typefaces — latin-subset woff2 embedded in the binary
+   (assets/fonts/, provenance + license in VENDOR.md). The console makes
+   zero external requests by design: no CDN, no Google Fonts. local()
+   first so an installed copy wins; swap keeps text visible while the
+   embedded file decodes. */
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: local("Bricolage Grotesque"), url("fonts/bricolage-grotesque-latin.woff2") format("woff2");
+  font-weight: 200 800;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+2013-2014, U+2018-2019, U+201C-201D, U+2022, U+2026, U+2039-203A, U+2212, U+2713;
+}
+@font-face {
+  font-family: "Geist";
+  src: local("Geist"), url("fonts/geist-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+2013-2014, U+2018-2019, U+201C-201D, U+2022, U+2026, U+2039-203A, U+2212, U+2713;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: local("IBM Plex Mono"), local("IBMPlexMono"), url("fonts/ibm-plex-mono-400-latin.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+2013-2014, U+2018-2019, U+201C-201D, U+2022, U+2026, U+2039-203A, U+2212, U+2713;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: local("IBM Plex Mono Medium"), local("IBMPlexMono-Medium"), url("fonts/ibm-plex-mono-500-latin.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+2013-2014, U+2018-2019, U+201C-201D, U+2022, U+2026, U+2039-203A, U+2212, U+2713;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: local("IBM Plex Mono SemiBold"), local("IBMPlexMono-SemiBold"), url("fonts/ibm-plex-mono-600-latin.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+0131, U+0152-0153, U+2013-2014, U+2018-2019, U+201C-201D, U+2022, U+2026, U+2039-203A, U+2212, U+2713;
+}
+
 :root {
-  /* warm neutral surfaces — white-led, never cream */
+  /* cool purple-tinted surfaces (site line hue) — white-led, never cream */
   --bg:        #ffffff;
   --surface:   #ffffff;
-  --surface-2: oklch(0.985 0.003 70);
-  --surface-3: oklch(0.972 0.004 70);
-  --line:      oklch(0.918 0.004 70);
-  --line-soft: oklch(0.948 0.003 70);
+  --surface-2: oklch(0.985 0.004 320);
+  --surface-3: oklch(0.972 0.006 320);
+  --line:      oklch(0.918 0.012 320);
+  --line-soft: oklch(0.948 0.008 320);
 
-  /* warm ink ramp */
-  --ink:   oklch(0.255 0.012 60);
-  --ink-2: oklch(0.46 0.012 60);
-  --ink-3: oklch(0.605 0.010 65);
-  --ink-4: oklch(0.72 0.008 70);
+  /* ink ramp — site ink hue/chroma at console lightness steps.
+     ink-3/ink-4 sit slightly below their old L: the old steps (0.605/0.72)
+     never met the floors this ramp is verified against (>=4.5:1 muted text,
+     >=3:1 hints on every surface they appear on). */
+  --ink:   oklch(0.255 0.055 301);
+  --ink-2: oklch(0.46 0.072 303);
+  --ink-3: oklch(0.55 0.061 304);
+  --ink-4: oklch(0.648 0.048 304);
 
-  /* accents */
-  --blue:    oklch(0.575 0.158 252);
-  --blue-2:  oklch(0.515 0.16 252);
-  --blue-bg: oklch(0.962 0.024 252);
-  --orange:  oklch(0.70 0.155 52);
-  --orange-2:oklch(0.635 0.15 48);
-  --orange-bg: oklch(0.965 0.03 60);
-  --ochre:   oklch(0.715 0.105 78);
-  --ochre-bg: oklch(0.97 0.03 85);
+  /* accents — site product-accent hues; L set by the AA floors
+     (each accent doubles as small text on its tint and on white) */
+  --blue:    oklch(0.54 0.17 260);
+  --blue-2:  oklch(0.48 0.17 260);
+  --blue-bg: oklch(0.962 0.018 258);
+  --orange:  oklch(0.70 0.16 50);
+  --orange-2:oklch(0.545 0.146 50);
+  --orange-bg: oklch(0.965 0.03 55);
+  --ochre:   oklch(0.715 0.115 91);
+  --ochre-bg: oklch(0.97 0.035 91);
 
-  /* semantic (badges + diff) — sacred */
-  --insert:  oklch(0.60 0.135 152);
-  --insert-bg: oklch(0.965 0.04 152);
-  --update:  oklch(0.575 0.155 252);
-  --update-bg: oklch(0.963 0.028 252);
-  --delete:  oklch(0.585 0.185 25);
-  --delete-bg: oklch(0.966 0.03 25);
+  /* semantic (badges + diff) — sacred; the mapping the site itself declares:
+     INSERT=mint, UPDATE=blue, DELETE=red (+tints). Reserved for these
+     meanings only — brand pink/violet/sun never encode data. */
+  --insert:  oklch(0.515 0.135 165);
+  --insert-bg: oklch(0.965 0.035 168);
+  --update:  oklch(0.54 0.17 260);
+  --update-bg: oklch(0.962 0.018 258);
+  --delete:  oklch(0.555 0.19 23);
+  --delete-bg: oklch(0.966 0.025 22);
 
-  --diff-del: oklch(0.555 0.17 22);
-  --diff-add: oklch(0.52 0.12 152);
+  --diff-del: oklch(0.555 0.17 23);
+  --diff-add: oklch(0.52 0.12 165);
+  --diff-del-bg: oklch(0.96 0.04 23 / 0.6);
+  --diff-add-bg: oklch(0.955 0.045 165 / 0.6);
+
+  /* brand moments only (never data): sun paints text selection like the
+     site; violet lives inside the accent gradient via --accent-b. */
+  --sun: oklch(0.879 0.163 91);
+  --scrim: oklch(0.3 0.03 305 / 0.33);
 
   /* fonts */
   --f-display: "Bricolage Grotesque", system-ui, sans-serif;
-  --f-ui: "Hanken Grotesk", system-ui, sans-serif;
+  --f-ui: "Geist", system-ui, sans-serif;
   --f-mono: "IBM Plex Mono", ui-monospace, monospace;
 
   /* tunables (direction + tweaks drive these) */
@@ -51,12 +114,14 @@
   --radius-sm: 8px;
   --panel-bg: var(--surface-2);
   --panel-border: var(--line);
-  --panel-shadow: 0 1px 2px oklch(0.6 0.02 60 / 0.04);
+  --panel-shadow: 0 1px 2px oklch(0.6 0.03 305 / 0.04);
   --accent: var(--blue);
   --accent-2: var(--blue-2);
   --accent-bg: var(--blue-bg);
   --accent-a: var(--blue);
-  --accent-b: oklch(0.60 0.16 268);
+  /* blue -> brand violet: the one gradient-only brand moment (rails, primary
+     button). L capped so white button text stays >=4.5:1 on either stop. */
+  --accent-b: oklch(0.575 0.17 286);
   --title-font: var(--f-display);
   --title-weight: 600;
   --title-tracking: -0.02em;
@@ -87,7 +152,7 @@
   --radius: 16px; --radius-sm: 11px;
   --panel-bg: var(--surface);
   --panel-border: var(--line);
-  --panel-shadow: 0 6px 24px -14px oklch(0.5 0.04 60 / 0.28);
+  --panel-shadow: 0 6px 24px -14px oklch(0.5 0.04 305 / 0.28);
   --title-weight: 700;
   --title-tracking: -0.03em;
 }
@@ -109,7 +174,9 @@ body {
   text-rendering: optimizeLegibility;
 }
 button { font-family: inherit; }
-::selection { background: oklch(0.575 0.158 252 / 0.18); }
+/* Selection is the site's own brand moment: sun behind ink, exactly like
+   dbtrail.com — a brand accent on chrome, not on a data encoding. */
+::selection { background: var(--sun); color: var(--ink); }
 
 /* ============================================================
    shell: sidebar + main
@@ -142,7 +209,7 @@ button { font-family: inherit; }
   gap: 22px;
   z-index: 5;
 }
-[data-dir="studio"] .side { background: oklch(0.991 0.003 70); }
+[data-dir="studio"] .side { background: oklch(0.991 0.003 320); }
 [data-dir="trail"] .side {
   background:
     radial-gradient(120% 60% at -10% -5%, var(--blue-bg), transparent 60%),
@@ -156,8 +223,8 @@ button { font-family: inherit; }
   border-radius: 8px;
   display: grid; place-items: center;
   color: #fff;
-  background: linear-gradient(150deg, var(--ink) 0%, oklch(0.32 0.02 60) 100%);
-  box-shadow: 0 1px 0 oklch(1 0 0 / 0.4) inset, 0 2px 6px oklch(0.3 0.02 60 / 0.18);
+  background: linear-gradient(150deg, var(--ink) 0%, oklch(0.32 0.055 301) 100%);
+  box-shadow: 0 1px 0 oklch(1 0 0 / 0.4) inset, 0 2px 6px oklch(0.3 0.03 305 / 0.18);
 }
 [data-dir="trail"] .brand-mark,
 [data-accent="warm"] .brand-mark {
@@ -187,7 +254,7 @@ button { font-family: inherit; }
   text-transform: uppercase;
   color: var(--insert);
   background: var(--insert-bg);
-  border: 1px solid oklch(0.60 0.135 152 / 0.25);
+  border: 1px solid color-mix(in srgb, var(--insert) 25%, transparent);
   padding: 3px 7px 2px;
   border-radius: 999px;
   white-space: nowrap;
@@ -202,7 +269,7 @@ button { font-family: inherit; }
   font-size: 12.5px;
   color: var(--ink);
   background: var(--surface)
-    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path fill='%239a9590' d='M0 0h10L5 6z'/></svg>")
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path fill='%239588a7' d='M0 0h10L5 6z'/></svg>")
     no-repeat right 12px center;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
@@ -216,7 +283,7 @@ button { font-family: inherit; }
   position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
   width: 7px; height: 7px; border-radius: 50%;
   background: var(--insert);
-  box-shadow: 0 0 0 3px oklch(0.60 0.135 152 / 0.16);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--insert) 16%, transparent);
 }
 .srv-select:hover { border-color: var(--ink-4); }
 .srv-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
@@ -408,7 +475,7 @@ button { font-family: inherit; }
 }
 .select {
   padding-right: 30px; cursor: pointer;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path fill='%239a9590' d='M0 0h10L5 6z'/></svg>");
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path fill='%239588a7' d='M0 0h10L5 6z'/></svg>");
   background-repeat: no-repeat; background-position: right 11px center;
 }
 .input::placeholder { color: var(--ink-4); }
@@ -500,17 +567,17 @@ button { font-family: inherit; }
 
 .btn-primary {
   color: #fff; background: linear-gradient(135deg, var(--accent-a), var(--accent-b)); border-color: transparent;
-  box-shadow: 0 1px 2px oklch(0.4 0.04 60 / 0.22), 0 1px 0 oklch(1 0 0 / 0.2) inset;
+  box-shadow: 0 1px 2px oklch(0.4 0.04 305 / 0.22), 0 1px 0 oklch(1 0 0 / 0.2) inset;
 }
 /* Re-assert the gradient: .btn:hover (same specificity, earlier in source)
    sets background:var(--surface-2), which would otherwise win and leave the
    primary button's white text on a light-gray fill — invisible on hover. */
 .btn-primary:hover { filter: brightness(1.05) saturate(1.04); border-color: transparent;
   background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
-  box-shadow: 0 5px 16px -5px oklch(0.5 0.08 60 / 0.45), 0 1px 0 oklch(1 0 0 / 0.2) inset; }
+  box-shadow: 0 5px 16px -5px oklch(0.5 0.08 305 / 0.45), 0 1px 0 oklch(1 0 0 / 0.2) inset; }
 
 .btn-accent { color: #fff; background: var(--orange-2); border-color: transparent; }
-.btn-accent:hover { background: oklch(0.585 0.15 46); border-color: transparent; }
+.btn-accent:hover { background: oklch(0.51 0.146 50); border-color: transparent; }
 
 .btn-sm { height: 32px; padding: 0 12px; font-size: 12.5px; }
 .btn-ghost { background: transparent; border-color: transparent; color: var(--ink-2); }
@@ -640,8 +707,8 @@ button { font-family: inherit; }
 .diff-after { color: var(--diff-add); }
 .diff-row-changed .diff-col { color: var(--ink); }
 .diff-row-changed { position: relative; }
-.diff-row-changed .diff-before { background: oklch(0.96 0.04 22 / 0.6); }
-.diff-row-changed .diff-after  { background: oklch(0.955 0.045 152 / 0.6); }
+.diff-row-changed .diff-before { background: var(--diff-del-bg); }
+.diff-row-changed .diff-after  { background: var(--diff-add-bg); }
 .diff-grid > div:nth-last-child(-n+3) { border-bottom: none; }
 .diff-same { color: var(--ink-3); }
 
@@ -767,7 +834,7 @@ button { font-family: inherit; }
   display: flex; align-items: center; gap: 11px;
   font-size: 13px; color: var(--orange-2);
   background: var(--orange-bg);
-  border: 1px solid oklch(0.70 0.155 52 / 0.3);
+  border: 1px solid color-mix(in srgb, var(--orange) 30%, transparent);
   border-radius: var(--radius-sm);
   padding: 12px 16px; margin-bottom: 24px;
 }
@@ -847,7 +914,7 @@ button { font-family: inherit; }
    ============================================================ */
 .modal-scrim {
   position: fixed; inset: 0; z-index: 50;
-  background: oklch(0.3 0.02 60 / 0.32);
+  background: var(--scrim);
   -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px);
   display: none; align-items: flex-start; justify-content: center;
   padding: 56px 24px; overflow-y: auto;
@@ -858,7 +925,7 @@ button { font-family: inherit; }
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 18px;
-  box-shadow: 0 30px 80px -24px oklch(0.3 0.03 60 / 0.45);
+  box-shadow: 0 30px 80px -24px oklch(0.3 0.03 305 / 0.45);
   overflow: hidden;
 }
 @media (prefers-reduced-motion: no-preference) {
@@ -934,7 +1001,7 @@ button { font-family: inherit; }
   background: oklch(1 0 0 / 0.82);
   -webkit-backdrop-filter: blur(22px) saturate(160%); backdrop-filter: blur(22px) saturate(160%);
   border: 1px solid var(--line); border-radius: 15px;
-  box-shadow: 0 18px 50px -20px oklch(0.3 0.03 60 / 0.4), 0 1px 0 oklch(1 0 0 / 0.6) inset;
+  box-shadow: 0 18px 50px -20px oklch(0.3 0.03 305 / 0.4), 0 1px 0 oklch(1 0 0 / 0.6) inset;
   font-family: var(--f-ui); color: var(--ink);
   display: none; flex-direction: column; overflow: hidden;
 }
@@ -953,7 +1020,7 @@ button { font-family: inherit; }
   font-family: inherit; font-size: 12px; font-weight: 500; color: var(--ink-2);
   padding: 6px 4px; border-radius: 6px; transition: background .15s, color .15s, box-shadow .15s;
 }
-.seg button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px oklch(0.4 0.02 60 / 0.12); font-weight: 600; }
+.seg button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px oklch(0.4 0.02 305 / 0.12); font-weight: 600; }
 .swatches { display: flex; gap: 7px; }
 .swatches button { width: 30px; height: 30px; border-radius: 8px; border: 2px solid transparent; cursor: pointer; padding: 0; position: relative; transition: transform .12s; }
 .swatches button:hover { transform: scale(1.08); }
@@ -1104,7 +1171,7 @@ button { font-family: inherit; }
 
 .cmdk-scrim {
   position: fixed; inset: 0; z-index: 60;
-  background: oklch(0.3 0.02 60 / 0.34);
+  background: var(--scrim);
   -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
   display: none; align-items: flex-start; justify-content: center;
   padding: 12vh 24px 24px;
@@ -1114,7 +1181,7 @@ button { font-family: inherit; }
   width: 100%; max-width: 580px;
   background: var(--surface); border: 1px solid var(--line);
   border-radius: 16px; overflow: hidden;
-  box-shadow: 0 32px 80px -28px oklch(0.3 0.03 60 / 0.5), 0 1px 0 oklch(1 0 0 / 0.6) inset;
+  box-shadow: 0 32px 80px -28px oklch(0.3 0.03 305 / 0.5), 0 1px 0 oklch(1 0 0 / 0.6) inset;
 }
 @media (prefers-reduced-motion: no-preference) {
   .cmdk-scrim.open .cmdk { animation: cmdkin .26s var(--ease-out); }
@@ -1401,7 +1468,7 @@ button { font-family: inherit; }
   z-index: 60; max-width: 80vw;
   font-family: var(--f-ui); font-size: 13px; color: var(--bg);
   background: var(--ink); border-radius: var(--radius-sm);
-  padding: 11px 18px; box-shadow: 0 8px 28px -10px oklch(0.3 0.02 60 / 0.5);
+  padding: 11px 18px; box-shadow: 0 8px 28px -10px oklch(0.3 0.03 305 / 0.5);
 }
 
 /* loading shimmer for #view while a screen fetches */
@@ -1496,7 +1563,7 @@ button { font-family: inherit; }
 .dt-pop {
   position: fixed; z-index: 55; width: 264px;
   background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--radius); box-shadow: 0 20px 55px -22px oklch(0.3 0.03 60 / 0.4);
+  border-radius: var(--radius); box-shadow: 0 20px 55px -22px oklch(0.3 0.03 305 / 0.4);
   padding: 12px; font-family: var(--f-ui);
 }
 .dt-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
