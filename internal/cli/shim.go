@@ -279,16 +279,32 @@ func runShim(cmd *cobra.Command, args []string) error {
 		"tenants_with_default_schema", len(userSchemas),
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// Derive from the cobra context (context.Background under a normal
+	// Execute) so an embedding caller — or a wiring test — can stop the
+	// daemon by cancelling it, exactly like every other long-running command.
+	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
+	// Usage telemetry for a months-lived process (#1362): Init's drain runs
+	// once, at startup, so without this loop a daemon's beacons would spool
+	// and age out undelivered. Own goroutine — never on a client connection's
+	// path. The client arrives through the package seam (processClient): shim
+	// is the one daemon implemented in this shared package, and each binary's
+	// hook publishes the client it resolved at Start.
+	go processClient.RunDaemon(ctx, cmd.Name())
+
 	// SIGINT / SIGTERM → cancel ctx → close listener → accept loop returns.
+	// Parent-context cancellation closes the listener the same way, or a
+	// cancelled daemon would sit blocked in Accept forever.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigs
-		slog.Info("shim shutting down")
-		cancel()
+		select {
+		case <-sigs:
+			slog.Info("shim shutting down")
+			cancel()
+		case <-ctx.Done():
+		}
 		listener.Close()
 	}()
 

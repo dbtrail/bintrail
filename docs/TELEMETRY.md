@@ -159,9 +159,9 @@ no cookie, and no account identifier**.
 
 ### Daemons
 
-Long-running commands (`stream`, `agent`, `up`, `watch`) send at most **one
-beacon per UTC day**, and the first only after they have been running for an
-hour. A finer cadence would reconstruct your uptime and maintenance windows; a
+Long-running commands (`stream`, `agent`, `up`, `watch`, `bintrail-console
+serve`, `bintrail shim`) send at most **one beacon per UTC day**, and the
+first only after they have been running for an hour. A finer cadence would reconstruct your uptime and maintenance windows; a
 beacon at startup would mean a crash-looping daemon emitted one per restart.
 
 Beacons carry no `run_id`.
@@ -240,8 +240,7 @@ binary — cannot emit telemetry.
 | Surface | Reports? | |
 |---|---|---|
 | `bintrail`, `bintrail-pg` commands | Yes, by default | |
-| Daemons (`stream`, `agent`, `up`, `watch`) | Yes, one beacon per day | `watch` also records the console actions below |
-| `bintrail-console serve`, `bintrail shim` | Command events only | They record like any command; they do not beacon |
+| Daemons (`stream`, `agent`, `up`, `watch`, `bintrail-console serve`, `bintrail shim`) | Yes, one beacon per day | `watch` also records the console actions below |
 | **Demo image** (`ghcr.io/dbtrail/bintrail-demo`) | **Never** | Hard-disabled in the image and in its entrypoint, and asserted by its smoke test. An evaluation image must not phone home from a laptop |
 | **MCP server** (`bintrail-mcp`) | **Never** | Invoked by an AI agent inside an editor or chat session — no human is present to consent and no terminal exists for a notice. It cannot link the telemetry package at all |
 | **Web console UI** (under `watch`) | A deliberate-action event, server-side | See below. No JavaScript beacon, ever — the frontend has no third-party dependencies and makes no telemetry request; the event is recorded by the server it already talks to |
@@ -261,8 +260,10 @@ value can reach the wire; the closed allowlist still applies. Crucially, because
 the console lives in a months-long daemon that holds a single `run_id`, these
 events are recorded **without any `run_id`** (like beacons), so they cannot be
 stitched into a per-install activity timeline. They are day-granularity usage
-counts, nothing more. The read-only `bintrail-console serve` wires no telemetry
-client and records no console actions.
+counts, nothing more. The read-only `bintrail-console serve` wires no
+console-action client and records none of these events; like every other
+long-running daemon it still emits the daily liveness beacon, which carries
+nothing a command event doesn't.
 
 ## Cloned machines — the honest caveat
 

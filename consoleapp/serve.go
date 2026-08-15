@@ -254,6 +254,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Usage telemetry for a months-lived process (#1362): Init's drain runs
+	// once, at startup, so without this loop a daemon's beacons would spool
+	// and age out undelivered. Own goroutine — never on a request path. serve
+	// is as long-lived as `watch`; a read-only console counts toward daily
+	// active daemons like any other daemon, and the beacon carries nothing a
+	// command event doesn't (no run_id, one per UTC day).
+	go tel.Client().RunDaemon(ctx, cmd.Name())
+
 	printConsoleBanner(srv, "Bintrail console (read-only) is running. Open:")
 	slog.Info("console listening", "addr", conListen, "no_archive", conNoArchive || conProfile != "")
 

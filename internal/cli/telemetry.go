@@ -35,6 +35,15 @@ type TelemetryHook struct {
 	span   *telemetry.Span
 }
 
+// processClient is the telemetry client Start resolved for THIS process.
+// Published at package level because long-running commands implemented in this
+// package (shim) need the daemon beacon loop (telemetry.Client.RunDaemon) but
+// cannot reach the binary's hook variable — cliapp, consoleapp and
+// cmd/bintrail-pg each hold their own. One process, one Start, one client, so
+// a package-level publication is exact. Nil (an exempt command, or Start never
+// ran) is safe: every telemetry.Client method tolerates a nil receiver.
+var processClient *telemetry.Client
+
 // Start resolves consent and begins recording the command about to run, unless
 // the command is one of the exempt trees (see uninstrumented).
 func (h *TelemetryHook) Start(cmd *cobra.Command) {
@@ -42,7 +51,20 @@ func (h *TelemetryHook) Start(cmd *cobra.Command) {
 		return
 	}
 	h.client = telemetry.Init(telemetry.Config{Flag: telemetryFlagValue(cmd)})
+	processClient = h.client
 	h.span = h.client.RecordCommand(commandPath(cmd))
+}
+
+// SetClientForTest injects a resolved client into the hook and the package
+// seam, returning a restore func. Test support ONLY (the ext.ResetForTest
+// pattern): the per-daemon wiring tests (#1362) drive a REAL daemon run
+// function — runStream, runServe, runShim, … — and need an observable client
+// in place of the one Start would resolve from the live environment.
+// Production code resolves the client exclusively through Start.
+func (h *TelemetryHook) SetClientForTest(c *telemetry.Client) (restore func()) {
+	prevHook, prevProcess := h.client, processClient
+	h.client, processClient = c, c
+	return func() { h.client, processClient = prevHook, prevProcess }
 }
 
 // uninstrumented reports whether cmd belongs to a tree that must not be

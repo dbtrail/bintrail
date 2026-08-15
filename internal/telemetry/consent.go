@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -42,6 +43,11 @@ var ciEnvVars = []string{
 	"CI", "GITHUB_ACTIONS", "TF_BUILD", "TRAVIS",
 	"CIRCLECI", "JENKINS_URL", "BUILDKITE", "GITLAB_CI",
 }
+
+// CIEnvVars returns a copy of the CI marker variables IsCI checks. Exposed for
+// the telemetrytest helpers, which neutralize them so the daemon wiring tests
+// behave identically on a laptop and in CI.
+func CIEnvVars() []string { return slices.Clone(ciEnvVars) }
 
 // IsCI reports whether the process looks like it is running in CI.
 func IsCI() bool {

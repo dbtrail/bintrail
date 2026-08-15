@@ -273,9 +273,24 @@ func (c *Client) drainOnce() {
 // accumulated. Beacons are capped at one per UTC day regardless, so this
 // governs delivery latency rather than beacon frequency.
 //
-// A var rather than a const so tests can shorten it; nothing in production
-// writes it.
-var daemonTick = time.Hour
+// Mutable so tests can shorten it; nothing in production writes it. Stored
+// atomically because the per-daemon WIRING tests (#1362) live in OTHER
+// packages and restore the tick while the RunDaemon goroutine their daemon
+// started may still be winding down — with a plain var that restore would be
+// a data race.
+var daemonTick atomic.Int64
+
+func init() { daemonTick.Store(int64(time.Hour)) }
+
+// ShortenDaemonTickForTest overrides the daemon loop's tick and returns a
+// restore func. Test support ONLY (the ext.ResetForTest pattern): it exists so
+// the per-daemon wiring tests in cliapp/consoleapp/cmd/bintrail-pg/internal/cli
+// can drive a REAL daemon run function and observe a beacon without waiting an
+// hour. Production code never calls it.
+func ShortenDaemonTickForTest(d time.Duration) (restore func()) {
+	prev := daemonTick.Swap(int64(d))
+	return func() { daemonTick.Store(prev) }
+}
 
 // RunDaemon keeps telemetry alive for a long-running process. Run it in its own
 // goroutine; it returns when ctx is done.
@@ -312,7 +327,7 @@ func (c *Client) RunDaemon(ctx context.Context, daemon string) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(daemonTick):
+		case <-time.After(time.Duration(daemonTick.Load())):
 		}
 		if !c.Enabled() {
 			continue // consent off right now; a runtime opt-in resumes us

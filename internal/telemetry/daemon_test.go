@@ -15,9 +15,7 @@ import (
 // withDaemonTick shortens the daemon loop for the duration of a test.
 func withDaemonTick(t *testing.T, d time.Duration) {
 	t.Helper()
-	prev := daemonTick
-	daemonTick = d
-	t.Cleanup(func() { daemonTick = prev })
+	t.Cleanup(ShortenDaemonTickForTest(d))
 }
 
 func TestRunDaemonStopsOnContextCancel(t *testing.T) {
