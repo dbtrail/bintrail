@@ -16,7 +16,13 @@ var ErrVerifyRunning = errors.New("a verify run is already running for this serv
 // no cached baseline pair to explain from: no completed baseline-anchored run
 // exists for this server, the table was not reported as a mismatch by it, or
 // a newer run has since replaced it. The handler maps it to 404.
-var ErrExplainUnavailable = errors.New("no explainable mismatch for this table — run a baseline-anchored verify first, or this table was not reported as a mismatch by the last run")
+// The message names the newer-run case explicitly: a scheduled run
+// (--verify-interval) that starts while a drill-down is still computing drops
+// the previous run's cached pairs, so an operator mid-wait can land here with
+// a verify actually in flight. Without that clause the text tells them to "run
+// a baseline-anchored verify first" while one is running — advice that sends
+// them looking for a problem that does not exist.
+var ErrExplainUnavailable = errors.New("no explainable mismatch for this table — run a baseline-anchored verify first, or this table was not reported as a mismatch by the last run, or a newer run has replaced the previous results (re-open Explain once it finishes)")
 
 // ErrExplainRunning is returned by VerifyController.Explain while the
 // drill-down for that table is still being computed. The handler maps it to

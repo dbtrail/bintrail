@@ -3,6 +3,7 @@ package consoleapp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -297,5 +298,131 @@ func TestVerifySupervisor_ExplainInvalidatedByNewRun(t *testing.T) {
 	}
 	if !otherKept {
 		t.Error("a run on one server dropped another server's cached drill-down")
+	}
+}
+
+// TestVerifySupervisor_FinishExplainChecksJobIdentity is the other end of the
+// invalidation invariant, and the sequence that actually happens in
+// production: click Explain, let a new run start before the reconstruction
+// lands. A key-presence check would pass here and publish a drill-down
+// computed against the PREVIOUS run's BaselinePair under the current run's
+// verdict — wrong evidence on a forensics surface, not merely stale UI.
+func TestVerifySupervisor_FinishExplainChecksJobIdentity(t *testing.T) {
+	s := explainableSupervisor(t)
+	key := explainKey("s1", "wp", "posts")
+	superseded := &explainJob{}
+	stale := &console.VerifyExplanation{Schema: "wp", Table: "posts"}
+
+	// Leg 1: a new run deleted the key (begin's purge). The late result must
+	// not resurrect it — the next click has to recompute against the new pair.
+	s.mu.Lock()
+	s.explains[key] = superseded
+	delete(s.explains, key)
+	s.mu.Unlock()
+
+	s.finishExplain(key, superseded, stale, nil)
+
+	s.mu.Lock()
+	_, resurrected := s.explains[key]
+	s.mu.Unlock()
+	if resurrected {
+		t.Error("a superseded drill-down re-created its own cache entry; the next poll would serve the previous run's diff")
+	}
+
+	// Leg 2: the key was re-created by a LATER request. The superseded
+	// goroutine must leave that job alone.
+	current := &explainJob{}
+	s.mu.Lock()
+	s.explains[key] = current
+	s.mu.Unlock()
+
+	s.finishExplain(key, superseded, stale, nil)
+
+	s.mu.Lock()
+	got := s.explains[key]
+	done, res := got.done, got.result
+	s.mu.Unlock()
+	if got != current {
+		t.Fatal("the superseded goroutine replaced the current job")
+	}
+	if done || res != nil {
+		t.Error("a superseded goroutine published its result into a later request's job — the operator would see a diff against the wrong snapshot pair")
+	}
+
+	// And the live case still publishes, or the identity check would be a
+	// guard that never lets anything through.
+	s.finishExplain(key, current, stale, nil)
+	s.mu.Lock()
+	done, res = s.explains[key].done, s.explains[key].result
+	s.mu.Unlock()
+	if !done || res != stale {
+		t.Error("finishExplain did not publish to the job that requested it")
+	}
+}
+
+// TestVerifySupervisor_ExplainReturnsFinishedResult covers the delivery half:
+// the other tests all drive failures (the helper's index is unreachable on
+// purpose), so without this one no test ever carries a real explanation back
+// out through Explain.
+func TestVerifySupervisor_ExplainReturnsFinishedResult(t *testing.T) {
+	s := explainableSupervisor(t)
+	key := explainKey("s1", "wp", "posts")
+	want := &console.VerifyExplanation{Schema: "wp", Table: "posts"}
+	s.mu.Lock()
+	s.explains[key] = &explainJob{done: true, result: want}
+	s.mu.Unlock()
+
+	got, err := s.Explain("s1", "wp", "posts")
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if got != want {
+		t.Fatalf("Explain returned %v, want the cached explanation", got)
+	}
+	s.mu.Lock()
+	_, still := s.explains[key]
+	s.mu.Unlock()
+	if still {
+		t.Error("a delivered explanation stayed cached; it holds rendered diff text nobody will read again")
+	}
+}
+
+// TestVerifySupervisor_ExplainEvictsOnlyFinished pins the eviction policy the
+// const's comment claims: dropping an in-flight entry would abandon work still
+// running and make the next poll restart it — the pile-up this cache exists to
+// prevent.
+func TestVerifySupervisor_ExplainEvictsOnlyFinished(t *testing.T) {
+	s := explainableSupervisor(t)
+	inFlight := &explainJob{}
+	s.mu.Lock()
+	s.explains[explainKey("s1", "wp", "busy")] = inFlight
+	for i := 1; i < maxCachedExplains; i++ {
+		s.explains[explainKey("s1", "wp", fmt.Sprintf("t%d", i))] = &explainJob{done: true}
+	}
+	n := len(s.explains)
+	s.mu.Unlock()
+	if n != maxCachedExplains {
+		t.Fatalf("seeded %d entries, want %d", n, maxCachedExplains)
+	}
+
+	// wp.posts is the one table the helper cached a pair for, so this is the
+	// request that trips the eviction.
+	if _, err := s.Explain("s1", "wp", "posts"); !errors.Is(err, console.ErrExplainRunning) {
+		t.Fatalf("Explain: err = %v, want ErrExplainRunning", err)
+	}
+
+	s.mu.Lock()
+	kept, ok := s.explains[explainKey("s1", "wp", "busy")]
+	_, started := s.explains[explainKey("s1", "wp", "posts")]
+	n = len(s.explains)
+	s.mu.Unlock()
+	if !ok || kept != inFlight {
+		t.Error("eviction dropped an in-flight drill-down; its next poll would restart minutes of work already running")
+	}
+	if !started {
+		t.Error("the request that tripped eviction did not register its own job")
+	}
+	if n != 2 {
+		t.Errorf("explains has %d entries after eviction, want 2 (the in-flight one plus the new request)", n)
 	}
 }

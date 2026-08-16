@@ -3787,7 +3787,8 @@ async function openVerifyExplain(id, schema, table, btn) {
     errTitle: "Couldn't explain this mismatch",
     facts: [["table", schema + "." + table]],
     note: "Rebuilding this table from the older snapshot and its change log to diff it row by row — minutes on a large table. " +
-      "The work continues on the server; closing this only stops the waiting.",
+      "The work continues on the server; closing this only stops the waiting. " +
+      "A new verify run discards drill-downs from the previous one, so reopening then starts over.",
     disable: btn ? [btn] : [],
     onCancel: () => ctrl.abort(),
   });
@@ -3800,6 +3801,12 @@ async function openVerifyExplain(id, schema, table, btn) {
     "?schema=" + encodeURIComponent(schema) + "&table=" + encodeURIComponent(table);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let ex;
+  // A blip mid-poll must not be reported as a failed drill-down: the whole
+  // reason this endpoint went async is that long waits sit behind proxies
+  // that hiccup, and the daemon's job is unaffected by a dropped poll. But
+  // an endpoint that is genuinely down must still surface, so only
+  // CONSECUTIVE failures are tolerated — a single success resets the count.
+  let misses = 0;
   // ~20 minutes at 2s, the same cap and cadence pollVerify uses.
   for (let i = 0; i < 600; i++) {
     let res;
@@ -3807,17 +3814,24 @@ async function openVerifyExplain(id, schema, table, btn) {
       res = await api(url, { signal: ctrl.signal });
     } catch (err) {
       if (err && err.name === "AbortError") return; // Cancel/ESC already tore the modal down
-      busy.showError(err);
-      return;
+      if (++misses > 5) { busy.showError(err); return; }
+      await sleep(2000);
+      continue;
     }
+    misses = 0;
     if (gen !== serverGen) { busy.close(); return; }
     if (res && res.explain) { ex = res.explain; break; }
     // 202 → still running. api() returns the {state:"running"} body.
     await sleep(2000);
   }
   if (!ex) {
-    busy.showError(new Error(
-      "still working after 20 minutes — it keeps running on the server, so reopening Explain later will show the result."));
+    // NOT showError: giving up waiting is not the drill-down failing, and the
+    // red "Couldn't explain this mismatch" treatment would report a failure
+    // that has not happened. Mirrors pollBaseline's neutral "check back"
+    // toast. The wording promises nothing about reopening — a scheduled run
+    // may have discarded the result by then.
+    busy.close();
+    toast("Still working after 20 minutes — it continues on the server. Reopen Explain to check.");
     return;
   }
   busy.close();

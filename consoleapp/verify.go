@@ -69,12 +69,17 @@ type explainJob struct {
 	err    error
 }
 
-// maxCachedExplains bounds the cache. Explanations carry rendered text and up
-// to the engine's per-table diff cap, so they are not free; a run's mismatch
-// list is the realistic upper bound on distinct keys and this sits above it.
-// Overflow drops the whole cache rather than guessing which entry matters —
-// a dropped entry costs one recomputation, and a stale-eviction policy here
-// would be more machinery than the payload deserves.
+// maxCachedExplains bounds the FINISHED entries only. Explanations carry
+// rendered text and up to the engine's per-table diff cap, so they are not
+// free; a run's mismatch list is the realistic upper bound on distinct keys
+// and this sits above it. Overflow drops every finished entry rather than
+// guessing which one matters — a dropped entry costs one recomputation.
+//
+// In-flight entries are deliberately NOT capped: evicting one would abandon
+// work still running and make the next poll start it again, which is the
+// pile-up this cache exists to prevent. Concurrent drill-downs are therefore
+// bounded by callers, not here — the same as before this cache existed, when
+// every request ran its own reconstruction with no dedup at all.
 const maxCachedExplains = 16
 
 func explainKey(serverID, schema, table string) string {
@@ -164,8 +169,8 @@ func (s *verifySupervisor) begin(req console.VerifyRequest, trigger string) (str
 	// A new run invalidates this server's cached drill-downs: each belongs to
 	// the BaselinePair of the run that produced its verdict, so serving one
 	// afterwards would explain a mismatch the displayed results no longer
-	// claim. In-flight entries go too — their goroutine finds the key gone
-	// and drops the result.
+	// claim. In-flight entries go too — finishExplain sees its
+	// job is no longer the one under that key and drops the result.
 	for k := range s.explains {
 		if strings.HasPrefix(k, req.ServerID+"|") {
 			delete(s.explains, k)
@@ -252,21 +257,58 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 			}
 		}
 	}
-	s.explains[key] = &explainJob{}
+	job := &explainJob{}
+	s.explains[key] = job
 	s.mu.Unlock()
 
 	go func() {
+		// A panic here must NEVER take down the daemon: this background
+		// goroutine shares the process with the stream and console under
+		// `watch`, so a panic in the reconstruct/DuckDB path would stop
+		// CAPTURE over a drill-down click. Mirrors run's guard below.
+		// finishExplain also closes the job, so the recover cannot leave a
+		// key stuck "running" forever.
+		defer func() {
+			if r := recover(); r != nil {
+				s.finishExplain(key, job, nil, fmt.Errorf("internal error: %v", r))
+			}
+		}()
 		res, err := s.explainNow(indexDSN, noArchive, schema, table, pair)
-		s.mu.Lock()
-		// Gone means a newer run (or an eviction) invalidated this key while
-		// the work ran: the result belongs to a verdict nobody is showing any
-		// more, so drop it rather than serve it.
-		if ej, ok := s.explains[key]; ok {
-			ej.result, ej.err, ej.done = res, err, true
-		}
-		s.mu.Unlock()
+		s.finishExplain(key, job, res, err)
 	}()
 	return nil, console.ErrExplainRunning
+}
+
+// finishExplain publishes a drill-down result to the job that requested it.
+//
+// The identity check is the load-bearing part: comparing only the KEY would
+// let a superseded goroutine write its result into a LATER job that happens to
+// reuse the same key, so the operator would be shown a diff computed against a
+// different BaselinePair than the verdict on screen — the exact hazard begin's
+// invalidation loop exists to prevent, reintroduced from the other end. On a
+// forensics surface that is wrong evidence, not merely stale UI.
+//
+// Every outcome is logged, because the response is NOT a reliable delivery
+// path: a poll only sees this result if the operator is still waiting and the
+// key survived. A failure nobody was polling for would otherwise exist
+// nowhere at all, and the daemon log is the surface that outlives the modal.
+func (s *verifySupervisor) finishExplain(key string, job *explainJob, res *console.VerifyExplanation, err error) {
+	s.mu.Lock()
+	cur, ok := s.explains[key]
+	live := ok && cur == job
+	if live {
+		cur.result, cur.err, cur.done = res, err, true
+	}
+	s.mu.Unlock()
+
+	switch {
+	case err != nil && live:
+		slog.Error("verify: drill-down failed", "key", key, "error", err)
+	case err != nil:
+		slog.Error("verify: drill-down failed after being superseded", "key", key, "error", err)
+	case !live:
+		slog.Warn("verify: discarding a drill-down whose request was superseded", "key", key)
+	}
 }
 
 // explainNow performs the reconstruction and row-level diff. It is the old

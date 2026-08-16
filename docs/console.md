@@ -510,9 +510,13 @@ results a `verify` cron/CI run produced elsewhere:
   runs on the daemon and the console polls for it — minutes on a large
   table — behind a busy dialog that says so. Closing that dialog only stops
   the waiting: the drill-down keeps computing, and reopening **Explain**
-  picks up the finished result. A new verify run discards the previous
-  run's drill-downs, since each explains the snapshot pair its own run
-  compared.
+  picks up the finished result if it is still held. It is not held
+  indefinitely — a new verify run discards the previous run's drill-downs
+  (each explains the snapshot pair its own run compared), the first reopen
+  consumes the result, and a finished result may be dropped to make room
+  once many tables have been explained. In every one of those cases
+  reopening simply recomputes; nothing is lost but the wait. Failures are
+  logged by the daemon whether or not anyone is still polling.
 - **Check recovery inputs** is the console face of
   [`bintrail verify --check recover`](verify.md): index-only — no baseline
   and no source read — walking each primary key's event chain over the last
