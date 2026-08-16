@@ -135,9 +135,11 @@
      dark ground would re-point --surface, not these rules. Alphas are the
      ceiling that keeps --ink-3 body text >=4.5:1 where BOTH washes overlap
      (4.59:1; --ink-3 on bare --surface is only 4.96:1, so a wash has little
-     room and these are deliberately faint). */
-  --brand-wash-sun:  oklch(0.879 0.163 91 / 0.12);   /* --sun at 12% */
-  --brand-wash-pink: oklch(0.635 0.18 348 / 0.03);   /* --brand-canvas-1 at 3% */
+     room and these are deliberately faint).
+     Derived with color-mix rather than re-typed as an oklch literal: a literal
+     would silently stop being "--sun at 12%" the day --sun moves. */
+  --brand-wash-sun:  color-mix(in srgb, var(--sun) 12%, transparent);
+  --brand-wash-pink: color-mix(in srgb, var(--brand-canvas-1) 3%, transparent);
   /* The nav's active rail EXTENDS the blue->violet accent gradient into the
      sunset instead of replacing it: product blue stays the interactive accent.
      A separate token on purpose — .timeline::before is a DATA surface and
@@ -855,7 +857,9 @@ button { font-family: inherit; }
    ============================================================ */
 /* An empty screen is where the console should be friendliest, so this is a
    brand moment: a faint sunrise wash over --surface and a sunset hairline on
-   the top edge. It stays a FRAME treatment — the wash never reaches a row, and
+   the top edge. (.empty-ic below stays muted ink — no construction site builds
+   one today, so branding it would be a change nothing renders.)
+   It stays a FRAME treatment — the wash never reaches a row, and
    .ev-empty (which doubles as an inline error line: "Could not load servers…")
    deliberately does NOT get it. Alphas are set by the --ink-3 body pair, which
    holds >=4.5:1 even where both washes overlap. */
@@ -876,7 +880,7 @@ button { font-family: inherit; }
   content: ""; position: absolute; inset: 0 0 auto; height: 3px;
   background: linear-gradient(90deg, var(--brand-canvas-1) 0%, var(--brand-canvas-2) 52%, var(--brand-canvas-3) 100%);
 }
-.empty-ic { color: var(--brand-warm-b); }
+.empty-ic { color: var(--ink-4); }
 .empty h3 { font-family: var(--title-font); font-weight: 600; color: var(--ink-2); margin: 0; font-size: 17px; letter-spacing: -0.01em; }
 .empty p { margin: 0; max-width: 42ch; font-size: 13.5px; }
 
