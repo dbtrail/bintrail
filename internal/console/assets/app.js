@@ -2052,18 +2052,21 @@ function recoverBusyFacts(f) {
   return facts;
 }
 
-// openBusyModal opens the busy dialog and disables the form's action
-// buttons until it closes. Returns {close(refocus), showError(err)}; Cancel
-// and ESC run opts.onCancel (the fetch abort) and restore focus to the
-// element that had it. Accessibility: role="dialog", aria-busy while working,
-// focus trapped inside, focus restored on cancel/dismiss.
+// openBusyModal opens the busy dialog over a long-running request. form, when
+// given, supplies the action row to disable; a caller with no form (Explain)
+// passes null and names its own elements in opts.disable. opts.note adds a
+// line under the title explaining what the wait is. Returns {close(refocus),
+// showError(err)}; Cancel and ESC run opts.onCancel (the fetch abort) and
+// restore focus to the element that had it. Accessibility: role="dialog",
+// aria-busy while working, focus trapped inside, focus restored on
+// cancel/dismiss.
 function openBusyModal(form, opts) {
   busyModalOpen = true;
   const mount = document.getElementById("modal");
   const trigger = document.activeElement;
   // A form caller disables its action row; a non-form caller (Explain) names
-  // the elements itself. Either way SOMETHING visibly stops accepting clicks,
-  // which is half of what tells an operator the click registered.
+  // the elements itself. Either may be empty — the scrim is what actually
+  // blocks input; this is the visible confirmation on top of it.
   const actions = opts.disable || (form ? $all(".filter-actions button", form) : []);
   actions.forEach((b) => { b.disabled = true; });
 
@@ -3776,8 +3779,11 @@ function renderVerifyResults(container, status, id) {
   container.append(cards);
 }
 
-// openVerifyExplain fetches and shows the row-level drill-down for one
-// mismatched table, re-using the modal chrome showRotationDialog established.
+// openVerifyExplain shows the row-level drill-down for one mismatched table,
+// re-using the modal chrome showRotationDialog established. The server
+// computes it in the background (#1375), so most of this is the wait: a busy
+// dialog with Cancel, a ~20-minute poll, and the rules for which failures are
+// worth retrying.
 async function openVerifyExplain(id, schema, table, btn) {
   if (busyModalActive()) return; // one drill-down at a time (#1375)
   const gen = serverGen;
@@ -3788,7 +3794,7 @@ async function openVerifyExplain(id, schema, table, btn) {
     facts: [["table", schema + "." + table]],
     note: "Rebuilding this table from the older snapshot and its change log to diff it row by row — minutes on a large table. " +
       "The work continues on the server; closing this only stops the waiting. " +
-      "A new verify run discards drill-downs from the previous one, so reopening then starts over.",
+      "A new verify run discards drill-downs from the previous one — Explain is unavailable until that run finishes.",
     disable: btn ? [btn] : [],
     onCancel: () => ctrl.abort(),
   });
@@ -3801,11 +3807,9 @@ async function openVerifyExplain(id, schema, table, btn) {
     "?schema=" + encodeURIComponent(schema) + "&table=" + encodeURIComponent(table);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let ex;
-  // A blip mid-poll must not be reported as a failed drill-down: the whole
-  // reason this endpoint went async is that long waits sit behind proxies
-  // that hiccup, and the daemon's job is unaffected by a dropped poll. But
-  // an endpoint that is genuinely down must still surface, so only
-  // CONSECUTIVE failures are tolerated — a single success resets the count.
+  // Consecutive transport failures tolerated before giving up. A dropped
+  // poll does not affect the daemon's job, and the whole reason this endpoint
+  // went async is that long waits sit behind proxies that hiccup.
   let misses = 0;
   // ~20 minutes at 2s, the same cap and cadence pollVerify uses.
   for (let i = 0; i < 600; i++) {
@@ -3814,6 +3818,23 @@ async function openVerifyExplain(id, schema, table, btn) {
       res = await api(url, { signal: ctrl.signal });
     } catch (err) {
       if (err && err.name === "AbortError") return; // Cancel/ESC already tore the modal down
+      // A 401 already raised the sign-in gate inside api() and bumped
+      // serverGen. Bail on that here, not only in the success branch below:
+      // a dead session never reaches the success branch, and retrying would
+      // end in a red "Couldn't explain this mismatch: session expired" that
+      // blames the drill-down and pulls focus off the password field.
+      if (gen !== serverGen) { busy.close(); return; }
+      // Only a MISSING response or a gateway status is the proxy hiccup this
+      // loop tolerates. Any other status is an answer the console actually
+      // received, and retrying it is worse than useless: the 500 that carries
+      // the drill-down's own failure was CONSUMED by the read that produced
+      // it, so the next poll starts a whole new reconstruction and answers
+      // 202 — which resets the miss count. A failing drill-down would loop
+      // for the full 20 minutes and never show the operator the error.
+      // Durable 403/404 are terminal for the same reason pollVerify treats
+      // them so. Re-clicking Explain is the retry.
+      const gateway = err && (err.status === 502 || err.status === 503 || err.status === 504);
+      if (err && err.status && !gateway) { busy.showError(err); return; }
       if (++misses > 5) { busy.showError(err); return; }
       await sleep(2000);
       continue;
@@ -3821,17 +3842,20 @@ async function openVerifyExplain(id, schema, table, btn) {
     misses = 0;
     if (gen !== serverGen) { busy.close(); return; }
     if (res && res.explain) { ex = res.explain; break; }
-    // 202 → still running. api() returns the {state:"running"} body.
+    // api() does not throw on a 202: it returns the {state:"running"} body,
+    // which has no .explain, so the loop falls through to the sleep.
     await sleep(2000);
   }
   if (!ex) {
-    // NOT showError: giving up waiting is not the drill-down failing, and the
-    // red "Couldn't explain this mismatch" treatment would report a failure
-    // that has not happened. Mirrors pollBaseline's neutral "check back"
-    // toast. The wording promises nothing about reopening — a scheduled run
-    // may have discarded the result by then.
+    // NOT showError: after 600 ticks the last answer was a 202, so the daemon
+    // is still working — this loop cannot tell a slow reconstruction from one
+    // that is merely slow, and the red "Couldn't explain this mismatch"
+    // treatment would assert a failure it has not seen. Mirrors
+    // pollBaseline's neutral "check back" toast. The wording promises nothing
+    // about reopening: a scheduled run may have discarded the result, and the
+    // daemon log is where a repeat belongs.
     busy.close();
-    toast("Still working after 20 minutes — it continues on the server. Reopen Explain to check.");
+    toast("Still waiting after 20 minutes — it continues on the server. Reopen Explain to try again; check the daemon log if this repeats.");
     return;
   }
   busy.close();

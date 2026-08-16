@@ -22,18 +22,20 @@ var ErrVerifyRunning = errors.New("a verify run is already running for this serv
 // a verify actually in flight. Without that clause the text tells them to "run
 // a baseline-anchored verify first" while one is running — advice that sends
 // them looking for a problem that does not exist.
-var ErrExplainUnavailable = errors.New("no explainable mismatch for this table — run a baseline-anchored verify first, or this table was not reported as a mismatch by the last run, or a newer run has replaced the previous results (re-open Explain once it finishes)")
+var ErrExplainUnavailable = errors.New("no explainable mismatch for this table — run a baseline-anchored verify first, or this table was not reported as a mismatch by the last run, or a newer run has replaced the previous results (re-open Explain if that run still reports this table as a mismatch)")
 
 // ErrExplainRunning is returned by VerifyController.Explain while the
 // drill-down for that table is still being computed. The handler maps it to
-// 202 Accepted, and the caller polls the same URL until it answers 200.
+// 202 Accepted, and the caller polls the same URL until it answers 200, 404
+// (a newer run replaced the pair), or the caller's own cap.
 //
 // This exists because the drill-down RE-RECONSTRUCTS the table (#1375): on a
-// large table that is minutes of DuckDB work, which outlives any fronting
-// proxy's read timeout. Answering synchronously meant the operator's only
-// possible experience was a request that died in the proxy — a button that
-// silently did nothing. The work now runs on the daemon like a verify run
-// does, and the request returns immediately either way.
+// large table that is minutes of DuckDB work. The console itself tolerates
+// that — it sets no WriteTimeout and apiGuard clears the read deadline — but
+// a fronting reverse proxy at its stock read timeout (60s on nginx) does not,
+// so behind one the operator's only experience was a request that died in the
+// proxy: a button that silently did nothing. The work now runs on the daemon
+// like a verify run does, and the request returns immediately either way.
 var ErrExplainRunning = errors.New("the drill-down for this table is still being computed")
 
 // VerifyController runs bintrail verify's engine in-process for a monitored

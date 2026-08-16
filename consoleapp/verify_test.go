@@ -301,6 +301,61 @@ func TestVerifySupervisor_ExplainInvalidatedByNewRun(t *testing.T) {
 	}
 }
 
+// TestVerifySupervisor_ExplainCancelsInvalidatedWork: dropping the map entry
+// is not enough. The goroutine would keep reconstructing for minutes on the
+// daemon that also runs capture, for a result finishExplain is guaranteed to
+// discard — and with the entry gone, the re-entry guard no longer stops a
+// click on the same table from starting a SECOND one alongside it.
+func TestVerifySupervisor_ExplainCancelsInvalidatedWork(t *testing.T) {
+	s := explainableSupervisor(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	other, cancelOther := context.WithCancel(context.Background())
+	defer cancelOther()
+	s.mu.Lock()
+	s.explains[explainKey("s1", "wp", "posts")] = &explainJob{cancel: cancel}
+	s.explains[explainKey("other", "wp", "posts")] = &explainJob{cancel: cancelOther}
+	s.mu.Unlock()
+
+	if _, err := s.begin(console.VerifyRequest{ServerID: "s1", Mode: console.VerifyModeBaselineAnchored}, console.VerifyTriggerManual); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	select {
+	case <-ctx.Done():
+	default:
+		t.Error("a new run abandoned an in-flight drill-down without canceling it; it keeps burning DuckDB for a result nobody can be served")
+	}
+	select {
+	case <-other.Done():
+		t.Error("a run on one server canceled another server's in-flight drill-down")
+	default:
+	}
+}
+
+// TestVerifySupervisor_ExplainSurvivesPanic pins the guard whose failure mode
+// is the worst in this file: the drill-down goroutine is bare, so before the
+// recover a panic in the reconstruct path took down the process — and under
+// `watch` that process is also the capture plane, so a click on Explain would
+// stop binlog capture. The panic must instead land as this job's error.
+func TestVerifySupervisor_ExplainSurvivesPanic(t *testing.T) {
+	s := explainableSupervisor(t)
+	s.explainFn = func(context.Context, string, bool, string, string, verify.BaselinePair) (*console.VerifyExplanation, error) {
+		panic("boom from the reconstruct path")
+	}
+
+	if _, err := s.Explain("s1", "wp", "posts"); !errors.Is(err, console.ErrExplainRunning) {
+		t.Fatalf("Explain: err = %v, want ErrExplainRunning", err)
+	}
+	_, err := waitExplain(t, s, "wp", "posts")
+	if err == nil {
+		t.Fatal("a panicking drill-down reported success")
+	}
+	if !strings.Contains(err.Error(), "boom from the reconstruct path") {
+		t.Errorf("terminal err = %v, want the panic value surfaced to the operator", err)
+	}
+}
+
 // TestVerifySupervisor_FinishExplainChecksJobIdentity is the other end of the
 // invalidation invariant, and the sequence that actually happens in
 // production: click Explain, let a new run start before the reconstruction

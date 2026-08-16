@@ -44,13 +44,21 @@ type verifySupervisor struct {
 	// notification hook). Set only at construction, so no run can race it.
 	onFinish func(console.VerifyRunRecord)
 
+	// explainFn overrides the drill-down implementation. Nil in production —
+	// this exists so a test can make the work panic and pin that the recover
+	// in Explain's goroutine holds. Without a seam that guard is untestable,
+	// and it is the one whose failure mode is "a click stops capture".
+	explainFn func(ctx context.Context, indexDSN string, noArchive bool, schema, table string, pair verify.BaselinePair) (*console.VerifyExplanation, error)
+
 	mu   sync.Mutex
 	jobs map[string]*verifyJob
-	// explains caches the on-demand drill-downs, keyed serverID|schema|table.
+	// explains caches the on-demand drill-downs, keyed serverID|schema.table.
 	// Guarded by mu like jobs. Cleared for a server when a new run begins:
 	// an explanation belongs to the BaselinePair of the run that produced the
 	// verdict, so serving one across runs would explain a mismatch nobody is
-	// looking at any more.
+	// looking at any more. The map is GLOBAL across monitored servers while
+	// that invalidation is per-server, so its key count is the sum over
+	// servers, not one run's mismatch list.
 	explains map[string]*explainJob
 }
 
@@ -58,28 +66,33 @@ type verifySupervisor struct {
 // or an error. Written by the goroutine Explain starts, read by later polls —
 // every field under verifySupervisor.mu.
 //
-// The error is KEPT rather than discarded so a failed reconstruction reports
-// its reason on the next poll instead of silently restarting forever (the
-// poller would otherwise see "running" for as long as the operator waits).
-// Reading a finished job CONSUMES it, so a retry re-runs rather than
-// re-serving a stale failure.
+// The error is KEPT rather than discarded so ONE read can surface its reason;
+// dropping the entry instead would make the next poll look like a fresh
+// "running" and hide the failure entirely. It is a single shot: reading a
+// finished job CONSUMES it, so a retry re-runs rather than re-serving a stale
+// failure. That is why the console's poll loop stops at a delivered failure
+// instead of retrying it — retrying would just start a new reconstruction
+// every other tick and never show the operator anything.
 type explainJob struct {
 	done   bool
 	result *console.VerifyExplanation
 	err    error
+	// cancel stops the goroutine's work. Called when a new run invalidates
+	// this key, so an abandoned drill-down stops burning DuckDB on the daemon
+	// that also runs capture instead of grinding to a result nobody can be
+	// served. Set once at creation and never reassigned, so calling it needs
+	// no lock (context.CancelFunc is safe to call concurrently and twice).
+	cancel context.CancelFunc
 }
 
-// maxCachedExplains bounds the FINISHED entries only. Explanations carry
-// rendered text and up to the engine's per-table diff cap, so they are not
-// free; a run's mismatch list is the realistic upper bound on distinct keys
-// and this sits above it. Overflow drops every finished entry rather than
-// guessing which one matters — a dropped entry costs one recomputation.
-//
-// In-flight entries are deliberately NOT capped: evicting one would abandon
-// work still running and make the next poll start it again, which is the
-// pile-up this cache exists to prevent. Concurrent drill-downs are therefore
-// bounded by callers, not here — the same as before this cache existed, when
-// every request ran its own reconstruction with no dedup at all.
+// maxCachedExplains is the TOTAL map size at which finished entries are
+// swept. Explanations carry rendered text and up to the engine's per-table
+// diff cap, so they are not free. Only FINISHED entries are dropped —
+// evicting an in-flight one would abandon work still running and make the
+// next poll start it again — so in-flight entries consume the budget without
+// being reclaimable: with N in flight, at most 16-N finished results are
+// held, and with 16 in flight the map grows past this constant rather than
+// throwing away running work. Concurrency is therefore NOT bounded here.
 const maxCachedExplains = 16
 
 func explainKey(serverID, schema, table string) string {
@@ -169,10 +182,17 @@ func (s *verifySupervisor) begin(req console.VerifyRequest, trigger string) (str
 	// A new run invalidates this server's cached drill-downs: each belongs to
 	// the BaselinePair of the run that produced its verdict, so serving one
 	// afterwards would explain a mismatch the displayed results no longer
-	// claim. In-flight entries go too — finishExplain sees its
-	// job is no longer the one under that key and drops the result.
-	for k := range s.explains {
+	// claim. In-flight entries go too: they are CANCELED, not merely dropped.
+	// Deleting alone would leave the goroutine grinding DuckDB for minutes on
+	// the daemon that also runs capture, for a result finishExplain is then
+	// guaranteed to discard — and it would also remove the re-entry guard, so
+	// a click on the same table after the new run finishes would start a
+	// SECOND reconstruction alongside the orphan.
+	for k, ej := range s.explains {
 		if strings.HasPrefix(k, req.ServerID+"|") {
+			if ej.cancel != nil {
+				ej.cancel()
+			}
 			delete(s.explains, k)
 		}
 	}
@@ -203,8 +223,15 @@ func (s *verifySupervisor) Status(serverID string) console.VerifyStatus {
 // Explain re-runs the row-level drill-down for one table the last completed
 // baseline-anchored run reported as a mismatch, using the EXACT BaselinePair
 // that run verified — never a freshly re-derived one (see verifyJob's doc
-// comment). It opens its own short-lived index connection: the triggering
-// run's connection is already closed by the time an operator clicks Explain.
+// comment). explainNow opens its own short-lived index connection: the
+// triggering run's connection is already closed by the time an operator
+// clicks Explain.
+//
+// It NEVER blocks on the reconstruction (#1375, and VerifyController.Explain
+// requires it). Three answers: the explanation, console.ErrExplainRunning
+// while the work is in flight — the caller polls — or
+// console.ErrExplainUnavailable when no cached pair names this table. A
+// finished job is consumed by the read that delivers it.
 func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.VerifyExplanation, error) {
 	key := explainKey(serverID, schema, table)
 
@@ -225,10 +252,15 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 		}
 		// Finished entries are CONSUMED on read: a retry after a failure
 		// re-runs the work instead of replaying the old error forever, and a
-		// delivered result stops holding its rendered text.
+		// delivered result stops holding its rendered text. Read the fields
+		// under the lock too — the delete already guarantees no finishExplain
+		// can match this job again, but keeping every access inside the
+		// critical section is the discipline explainJob's doc states, and a
+		// later post-done writer would silently break a read outside it.
+		res, rerr := ej.result, ej.err
 		delete(s.explains, key)
 		s.mu.Unlock()
-		return ej.result, ej.err
+		return res, rerr
 	}
 
 	j, ok := s.jobs[serverID]
@@ -247,20 +279,22 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 		return nil, console.ErrExplainUnavailable
 	}
 	if len(s.explains) >= maxCachedExplains {
-		// Evict only FINISHED entries: dropping an in-flight one would throw
-		// away work that is still running and make the next poll start it
-		// again, which on a big table is exactly the pile-up this cache
-		// exists to prevent.
+		// Only FINISHED entries — see maxCachedExplains.
 		for k, ej := range s.explains {
 			if ej.done {
 				delete(s.explains, k)
 			}
 		}
 	}
-	job := &explainJob{}
+	ctx, cancel := context.WithCancel(s.ctx)
+	job := &explainJob{cancel: cancel}
 	s.explains[key] = job
 	s.mu.Unlock()
 
+	run := s.explainNow
+	if s.explainFn != nil {
+		run = s.explainFn
+	}
 	go func() {
 		// A panic here must NEVER take down the daemon: this background
 		// goroutine shares the process with the stream and console under
@@ -273,7 +307,7 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 				s.finishExplain(key, job, nil, fmt.Errorf("internal error: %v", r))
 			}
 		}()
-		res, err := s.explainNow(indexDSN, noArchive, schema, table, pair)
+		res, err := run(ctx, indexDSN, noArchive, schema, table, pair)
 		s.finishExplain(key, job, res, err)
 	}()
 	return nil, console.ErrExplainRunning
@@ -288,10 +322,12 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 // invalidation loop exists to prevent, reintroduced from the other end. On a
 // forensics surface that is wrong evidence, not merely stale UI.
 //
-// Every outcome is logged, because the response is NOT a reliable delivery
-// path: a poll only sees this result if the operator is still waiting and the
-// key survived. A failure nobody was polling for would otherwise exist
-// nowhere at all, and the daemon log is the surface that outlives the modal.
+// Failures and superseded results are LOGGED, because the response is not a
+// reliable delivery path: a poll only sees this result if the operator is
+// still waiting and the key survived. A failure nobody was polling for would
+// otherwise exist nowhere at all, and the daemon log outlives the modal. A
+// successful, still-live result is not logged — that is the case a poll is
+// expected to collect.
 func (s *verifySupervisor) finishExplain(key string, job *explainJob, res *console.VerifyExplanation, err error) {
 	s.mu.Lock()
 	cur, ok := s.explains[key]
@@ -300,6 +336,13 @@ func (s *verifySupervisor) finishExplain(key string, job *explainJob, res *conso
 		cur.result, cur.err, cur.done = res, err, true
 	}
 	s.mu.Unlock()
+
+	// The work is over either way, so release the per-job context. Safe
+	// unconditionally: cancel is idempotent, and a canceled context cannot
+	// affect a result already published.
+	if job.cancel != nil {
+		job.cancel()
+	}
 
 	switch {
 	case err != nil && live:
@@ -313,9 +356,10 @@ func (s *verifySupervisor) finishExplain(key string, job *explainJob, res *conso
 
 // explainNow performs the reconstruction and row-level diff. It is the old
 // synchronous body of Explain, called on the goroutine Explain starts; it
-// takes everything it needs by value so it holds no lock and touches no
-// supervisor state.
-func (s *verifySupervisor) explainNow(indexDSN string, noArchive bool, schema, table string, pair verify.BaselinePair) (*console.VerifyExplanation, error) {
+// takes everything it needs as arguments, so it holds no lock and reads no
+// supervisor state. ctx is per-job (derived from the daemon's) so a new run
+// can cancel an abandoned drill-down.
+func (s *verifySupervisor) explainNow(ctx context.Context, indexDSN string, noArchive bool, schema, table string, pair verify.BaselinePair) (*console.VerifyExplanation, error) {
 	db, err := config.Connect(indexDSN)
 	if err != nil {
 		return nil, fmt.Errorf("connect index: %w", err)
@@ -333,7 +377,7 @@ func (s *verifySupervisor) explainNow(indexDSN string, noArchive bool, schema, t
 		SourceFlavor: query.SourceFlavor(db),
 	}
 
-	ex, err := verify.ExplainBaselinePairMismatch(s.ctx, cfg, pair)
+	ex, err := verify.ExplainBaselinePairMismatch(ctx, cfg, pair)
 	if err != nil {
 		return nil, fmt.Errorf("explain %s.%s: %w", schema, table, err)
 	}

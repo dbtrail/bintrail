@@ -228,8 +228,8 @@ const maxAPIBody = 1 << 20
 //     *http.MaxBytesError on overflow (writeBodyDecodeError maps it to 413);
 //   - clears the connection read deadline armed by the server-wide
 //     ReadTimeout. That timeout exists to bound unauthenticated slow-drip
-//     connections; several authenticated handlers (recover, verify explain,
-//     reconstruct over S3 archives) legitimately run past it, and net/http's
+//     connections; several authenticated handlers (recover, reconstruct over
+//     S3 archives) legitimately run past it, and net/http's
 //     background read hitting the deadline cancels the request context
 //     mid-flight. Best-effort: recorders and non-deadline writers just skip
 //     it.
