@@ -13,7 +13,7 @@ import (
 // established empirically against the pinned mydumper build (#800): RELOAD or
 // FLUSH_TABLES is required on every flavor; BACKUP_ADMIN is additionally
 // required ONLY on MySQL/Percona 8.0+ (it doesn't exist on MariaDB or MySQL
-// 5.7 — see RequiresBackupAdmin). Critically, on a flavor where
+// 5.7 — see requiresBackupAdmin). Critically, on a flavor where
 // BACKUP_ADMIN IS required, having it without RELOAD/FLUSH_TABLES must still
 // be rejected here rather than let mydumper run, because that specific
 // half-privileged combination segfaults mydumper instead of failing cleanly.
@@ -106,7 +106,7 @@ func TestCheckPrivileges(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			db := newMockWithPrivileges(t, tt.version, tt.privileges)
-			err := checkPrivilegesDB(context.Background(), db)
+			err := checkPrivilegesDB(context.Background(), db, RemedyConsole)
 			if tt.wantErr && err == nil {
 				t.Fatalf("expected an error, got nil")
 			}
@@ -147,5 +147,40 @@ func TestServerMajorVersion(t *testing.T) {
 				t.Errorf("serverMajorVersion(%q) = (%d, %v), want (%d, %v)", tt.version, major, ok, tt.wantMajor, tt.wantOK)
 			}
 		})
+	}
+}
+
+// TestCheckPrivilegesRemedyIsSurfaceSpecific: the alternatives clause is the
+// one actionable sentence in the refusal, and both surfaces reach it on their
+// DEFAULT path. Naming the other surface's knob is worse than naming none —
+// `bintrail dump` does not read the console's environment variable, and the
+// console has no flags.
+func TestCheckPrivilegesRemedyIsSurfaceSpecific(t *testing.T) {
+	for _, tc := range []struct {
+		remedy         Remedy
+		want           string
+		mustNotContain string
+	}{
+		{RemedyCLI, "--lock-mode safe-no-lock", "BINTRAIL_CONSOLE"},
+		{RemedyConsole, "BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=safe-no-lock", "--lock-mode"},
+	} {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("8.0.36"))
+		mock.ExpectQuery("USER_PRIVILEGES").WillReturnRows(sqlmock.NewRows([]string{"p"}))
+		err = checkPrivilegesDB(context.Background(), db, tc.remedy)
+		db.Close()
+		if err == nil {
+			t.Fatalf("%s: a user with no privileges was allowed to run a point-consistent dump", tc.remedy)
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: refusal = %q, want it to name %q", tc.remedy, err, tc.want)
+		}
+		if strings.Contains(err.Error(), tc.mustNotContain) {
+			t.Errorf("%s: refusal names the OTHER surface's knob (%q), which this caller does not read: %q",
+				tc.remedy, tc.mustNotContain, err)
+		}
 	}
 }

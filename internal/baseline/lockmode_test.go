@@ -87,3 +87,23 @@ func TestParseLockMode(t *testing.T) {
 		}
 	}
 }
+
+// TestLockModeZeroValueIsTreatedAsFTWRL: the three methods must agree on a
+// value ParseLockMode never produced. MydumperValue's default arm already
+// sends FTWRL, so a NeedsElevatedPrivileges that answered false would send
+// FTWRL to mydumper while skipping the privilege preflight — reopening the
+// segfault path internal/mydumperlock exists to make unreachable. No caller
+// passes the zero value today; this keeps that from becoming load-bearing.
+func TestLockModeZeroValueIsTreatedAsFTWRL(t *testing.T) {
+	for _, m := range []LockMode{"", "bogus"} {
+		if got := m.MydumperValue(); got != "FTWRL" {
+			t.Errorf("%q.MydumperValue() = %q, want FTWRL", m, got)
+		}
+		if !m.NeedsElevatedPrivileges() {
+			t.Errorf("%q sends FTWRL to mydumper but reports it needs no privileges; the preflight would be skipped and the crash becomes reachable", m)
+		}
+		if !m.PointConsistent() {
+			t.Errorf("%q.PointConsistent() = false while it sends FTWRL; the three methods must agree", m)
+		}
+	}
+}

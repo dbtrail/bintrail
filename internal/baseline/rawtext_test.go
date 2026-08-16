@@ -34,8 +34,8 @@ func TestWriter_RawTextRoundTrip(t *testing.T) {
 	}{
 		{[]string{"1", "plain"}, []bool{false, false}},
 		{[]string{"2", "tab\tnewline\nback\\slash"}, []bool{false, false}},
-		{[]string{"3", ""}, []bool{false, false}},   // empty string, NOT NULL
-		{[]string{"4", ""}, []bool{false, true}},    // NULL
+		{[]string{"3", ""}, []bool{false, false}}, // empty string, NOT NULL
+		{[]string{"4", ""}, []bool{false, true}},  // NULL
 		{[]string{"5", "café 日本語 🎉"}, []bool{false, false}},
 		{[]string{"00042", "not-an-int-and-that-is-fine"}, []bool{false, false}}, // leading zeros preserved verbatim
 	}

@@ -449,8 +449,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// feature the operator did not enable.
 	var baselineSup *baselineSupervisor
 	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
-		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselineLockMode)
-		baselineSup.configErr = upConsoleBaselineLockModeErr
+		baselineSup = newBaselineSupervisorFromConfig(ctx, baselineStagingDir())
 	}
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = baselineSup
@@ -649,8 +648,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// feature the operator did not enable.
 	var baselineSup *baselineSupervisor
 	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
-		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselineLockMode)
-		baselineSup.configErr = upConsoleBaselineLockModeErr
+		baselineSup = newBaselineSupervisorFromConfig(ctx, baselineStagingDir())
 	}
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = baselineSup
@@ -827,6 +825,18 @@ func mainSourceJobInfo(sourceDSN, indexDSN, streamFlavor string) ext.SourceJobIn
 // console-only vars whose flags (--baseline-dir/--baseline-s3) also exist on
 // core bintrail commands, and the direct read keeps the precedence dance in
 // one unit-testable place.
+// newBaselineSupervisorFromConfig builds the supervisor from the resolved
+// console configuration. It exists so the two watch entry points cannot drift
+// on the one wiring that matters: carrying an invalid-lock-mode error into the
+// supervisor. Dropping that assignment is invisible at either call site — the
+// daemon still boots and baselines still run, in a mode the operator did not
+// ask for — so it is asserted here rather than duplicated there.
+func newBaselineSupervisorFromConfig(ctx context.Context, stagingDir string) *baselineSupervisor {
+	sup := newBaselineSupervisor(ctx, stagingDir, upConsoleBaselineLockMode)
+	sup.configErr = upConsoleBaselineLockModeErr
+	return sup
+}
+
 func resolveUpConsoleEnv(cmd *cobra.Command) error {
 	if !cmd.Flags().Changed("console-listen") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_LISTEN"); v != "" {
@@ -921,7 +931,7 @@ func resolveUpConsoleEnv(cmd *cobra.Command) error {
 			// from every Trigger, so it lands in baseline status where the
 			// operator is looking.
 			upConsoleBaselineLockModeErr = fmt.Errorf("BINTRAIL_CONSOLE_BASELINE_LOCK_MODE: %w", err)
-			slog.Error("console: baselines disabled by an invalid lock mode; capture is unaffected",
+			slog.Error("console: MySQL baseline DUMPS disabled by an invalid lock mode; capture and the periodic refresh are unaffected",
 				"error", upConsoleBaselineLockModeErr)
 		} else {
 			upConsoleBaselineLockMode = m

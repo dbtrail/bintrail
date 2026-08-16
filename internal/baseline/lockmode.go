@@ -48,7 +48,9 @@ const (
 // DefaultLockMode is what every surface uses when the operator says nothing.
 const DefaultLockMode = LockModeFTWRL
 
-// LockModeValues lists the accepted spellings, for flag help and error text.
+// LockModeValues lists the accepted spellings. Test-only today: the flag
+// help, ParseLockMode's error and the compose case statement each spell the
+// three names out, so adding a mode means updating all of them by hand.
 var LockModeValues = []LockMode{LockModeFTWRL, LockModeSafeNoLock, LockModeNoLock}
 
 // ParseLockMode maps an operator-supplied string to a LockMode. It is
@@ -99,4 +101,12 @@ func (m LockMode) PointConsistent() bool { return m != LockModeNoLock }
 // type comment). Callers use this to check privileges BEFORE launching
 // mydumper: the pinned build segfaults on a half-granted state rather than
 // failing cleanly.
-func (m LockMode) NeedsElevatedPrivileges() bool { return m == LockModeFTWRL }
+func (m LockMode) NeedsElevatedPrivileges() bool {
+	// Written as "not one of the low-privilege modes" rather than "== FTWRL"
+	// so the three methods agree on an UNKNOWN value: MydumperValue's default
+	// arm already sends FTWRL, and answering false here would send FTWRL while
+	// skipping the preflight — reopening the segfault path internal/mydumperlock
+	// exists to make unreachable. No caller passes the zero value today; this
+	// keeps that from becoming load-bearing.
+	return m != LockModeSafeNoLock && m != LockModeNoLock
+}

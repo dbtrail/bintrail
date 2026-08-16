@@ -224,41 +224,14 @@ func runDump(cmd *cobra.Command, args []string) error {
 	schemas := cliutil.ParseSchemaList(dmpSchemas)
 	tables := cliutil.ParseSchemaList(dmpTables)
 
-	// 4. Acquire dump lock — only one dump at a time.
-	lockFile, err := acquireDumpLock()
-	if err != nil {
-		return fmt.Errorf("another dump is already running: %w", err)
-	}
-	defer releaseDumpLock(lockFile)
-
-	// 5. Safely prepare the output directory (#809). Refuse to delete a
-	// non-empty directory that is not a recognizable prior mydumper/bintrail
-	// dump — a typo'd --output-dir (or a stray BINTRAIL_OUTPUT_DIR in a sibling
-	// .bintrail.env) must never wipe an arbitrary tree, including baselines
-	// that reconstruct/verify depend on. A recognizable prior dump is moved
-	// aside (dir → dir.old) and only deleted once THIS dump succeeds, so a
-	// failed dump restores the previous (only-good) output.
-	prep, err := prepareDumpOutputDir(dmpOutputDir)
-	if err != nil {
-		return err
-	}
-	dumpSucceeded := false
-	defer func() {
-		if dumpSucceeded {
-			prep.commit()
-		} else {
-			prep.rollback()
-		}
-	}()
-
-	// 6. Probe mydumper version and build args.
-	// --sync-thread-lock-mode and --trx-tables require mydumper >= 0.18 (see
-	// mydumperSupportsLockMode). Distro apt packages ship older builds —
-	// Ubuntu 24.04 and Debian bookworm both package upstream 0.10.1, whose
-	// binary self-reports 0.10.0 — so we must not pass the flags
-	// unconditionally or the dump fails (#219, #460). Docker mode is NOT
-	// version-probed: a pinned --mydumper-image older than 0.18 fails with
-	// "unknown option", which is why the docs' pin examples stay >= 0.18.
+	// Lock mode is resolved and its privileges probed BEFORE the dump lock and
+	// before prepareDumpOutputDir moves a previous dump aside. Step 2b states
+	// the rule (#809): a wrong credential must fail before the previous,
+	// only-good dump is disturbed — and a missing RELOAD grant is that same
+	// failure class. CheckPrivileges opens its own connection, so leaving it
+	// below the rename would put a multi-second network round trip inside the
+	// window where the good dump exists only under a .old-<pid>-<nanos> name
+	// the operator has never seen.
 	lockMode, lmErr := baseline.ParseLockMode(dmpLockMode)
 	if lmErr != nil {
 		return lmErr
@@ -295,10 +268,46 @@ func runDump(cmd *cobra.Command, args []string) error {
 	// point-consistent mode the default here too, so the guard has to come
 	// with it. Skipped when the flag is not being sent at all.
 	if supportsLockMode && lockMode.NeedsElevatedPrivileges() {
-		if err := mydumperlock.CheckPrivileges(cmd.Context(), dmpSourceDSN); err != nil {
+		if err := mydumperlock.CheckPrivileges(cmd.Context(), dmpSourceDSN, mydumperlock.RemedyCLI); err != nil {
 			return err
 		}
 	}
+
+	// 4. Acquire dump lock — only one dump at a time.
+	lockFile, err := acquireDumpLock()
+	if err != nil {
+		return fmt.Errorf("another dump is already running: %w", err)
+	}
+	defer releaseDumpLock(lockFile)
+
+	// 5. Safely prepare the output directory (#809). Refuse to delete a
+	// non-empty directory that is not a recognizable prior mydumper/bintrail
+	// dump — a typo'd --output-dir (or a stray BINTRAIL_OUTPUT_DIR in a sibling
+	// .bintrail.env) must never wipe an arbitrary tree, including baselines
+	// that reconstruct/verify depend on. A recognizable prior dump is moved
+	// aside (dir → dir.old) and only deleted once THIS dump succeeds, so a
+	// failed dump restores the previous (only-good) output.
+	prep, err := prepareDumpOutputDir(dmpOutputDir)
+	if err != nil {
+		return err
+	}
+	dumpSucceeded := false
+	defer func() {
+		if dumpSucceeded {
+			prep.commit()
+		} else {
+			prep.rollback()
+		}
+	}()
+
+	// 6. Probe mydumper version and build args.
+	// --sync-thread-lock-mode and --trx-tables require mydumper >= 0.18 (see
+	// mydumperSupportsLockMode). Distro apt packages ship older builds —
+	// Ubuntu 24.04 and Debian bookworm both package upstream 0.10.1, whose
+	// binary self-reports 0.10.0 — so we must not pass the flags
+	// unconditionally or the dump fails (#219, #460). Docker mode is NOT
+	// version-probed: a pinned --mydumper-image older than 0.18 fails with
+	// "unknown option", which is why the docs' pin examples stay >= 0.18.
 	// The source password must never reach mydumper's argv (visible in
 	// `ps aux` / /proc/<pid>/cmdline and, under Docker, in `docker inspect`).
 	// Docker mode delivers it via a 0600 defaults-file bind-mounted read-only;

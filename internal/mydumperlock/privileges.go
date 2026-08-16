@@ -34,7 +34,7 @@ import (
 // information_schema.USER_PRIVILEGES on MySQL 8.0+.
 var requiredPrivileges = []string{"BACKUP_ADMIN", "RELOAD", "FLUSH_TABLES"}
 
-// RequiresBackupAdmin reports whether the connected server needs the
+// requiresBackupAdmin reports whether the connected server needs the
 // BACKUP_ADMIN privilege for FTWRL's `LOCK INSTANCE FOR BACKUP` step.
 // BACKUP_ADMIN is a MySQL 8.0+ dynamic privilege (also present on Percona
 // Server 8.0+, a MySQL 8.0 fork) — it does not exist on MariaDB (any version)
@@ -54,7 +54,7 @@ var requiredPrivileges = []string{"BACKUP_ADMIN", "RELOAD", "FLUSH_TABLES"}
 // clean failure, verified — never the segfault); the dangerous direction is
 // over-requiring a privilege that doesn't exist on the source's actual
 // flavor, which is exactly the bug this function exists to avoid.
-func RequiresBackupAdmin(ctx context.Context, db *sql.DB) (bool, error) {
+func requiresBackupAdmin(ctx context.Context, db *sql.DB) (bool, error) {
 	var version string
 	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
 		return false, fmt.Errorf("point-consistent baseline: cannot read source VERSION() to determine privilege requirements: %w", err)
@@ -87,23 +87,39 @@ func serverMajorVersion(version string) (major int, ok bool) {
 // CheckPrivileges queries the source for its required
 // point-consistent privileges and fails loudly, before mydumper ever runs,
 // unless they are present. This is a hard gate, not an advisory warning:
-// unlike the NO_LOCK skew warning below, a query failure here aborts the dump
+// unlike the no-lock skew warning in consoleapp, a query failure here aborts the dump
 // rather than being swallowed, because the alternative — letting mydumper
 // attempt FTWRL half-privileged — is a segfault, not a clean error (#800).
 // Never silently falls back to NO_LOCK.
-func CheckPrivileges(ctx context.Context, sourceDSN string) error {
+// Remedy is how the CALLING surface selects a weaker lock mode. It is a
+// parameter because the refusal text is the one actionable sentence an
+// operator gets, and naming the other surface's knob is worse than naming
+// none: `bintrail dump` does not read the console's environment variable, and
+// the console has no flags. Both callers reach this on their DEFAULT path
+// since #1377, so this is the first thing an upgrading least-privilege
+// deployment sees on either one.
+type Remedy string
+
+const (
+	// RemedyCLI is `bintrail dump`'s knob.
+	RemedyCLI Remedy = "pass --lock-mode safe-no-lock"
+	// RemedyConsole is the console daemon's; it has no flag surface.
+	RemedyConsole Remedy = "set BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=safe-no-lock"
+)
+
+func CheckPrivileges(ctx context.Context, sourceDSN string, remedy Remedy) error {
 	db, err := config.Connect(sourceDSN)
 	if err != nil {
 		return fmt.Errorf("point-consistent baseline: cannot connect to source to verify privileges: %w", err)
 	}
 	defer db.Close()
-	return checkPrivilegesDB(ctx, db)
+	return checkPrivilegesDB(ctx, db, remedy)
 }
 
-// checkPrivilegesDB is checkPointConsistentPrivileges' core logic
+// checkPrivilegesDB is checkPrivilegesDB is CheckPrivileges' core logic
 // against an already-open *sql.DB, split out so it is unit-testable with
 // sqlmock without a live MySQL connection. It first determines whether this
-// source's flavor/version needs BACKUP_ADMIN at all (sourceRequiresBackupAdmin)
+// source's flavor/version needs BACKUP_ADMIN at all (requiresBackupAdmin)
 // — RELOAD/FLUSH_TABLES is mandatory on every flavor, BACKUP_ADMIN only on
 // MySQL/Percona 8.0+ — then reads the CURRENT_USER()'s own privileges from
 // information_schema.USER_PRIVILEGES, which is self-scoped to the connecting
@@ -121,8 +137,8 @@ func CheckPrivileges(ctx context.Context, sourceDSN string) error {
 // pattern used anywhere else in this codebase's documented grant examples, and
 // this fails CLOSED (over-refuses, never under-refuses) for a role-using
 // operator, so the segfault path stays unreachable either way.
-func checkPrivilegesDB(ctx context.Context, db *sql.DB) error {
-	requireBackupAdmin, err := RequiresBackupAdmin(ctx, db)
+func checkPrivilegesDB(ctx context.Context, db *sql.DB, remedy Remedy) error {
+	requireBackupAdmin, err := requiresBackupAdmin(ctx, db)
 	if err != nil {
 		return err
 	}
@@ -162,7 +178,9 @@ func checkPrivilegesDB(ctx context.Context, db *sql.DB) error {
 	// pre-#1377 text pointed at an opt-in variable that is no longer read and
 	// told the operator to "disable point-consistent mode", which is not a
 	// thing they can do any more.
-	const alternatives = " — or set BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=safe-no-lock to dump without these privileges (it needs none, but ABORTS rather than write a snapshot stitched from several instants, so expect it to refuse on a write-active source), or =no-lock to accept such a snapshot"
+	alternatives := " — or " + string(remedy) + " to dump without these privileges" +
+		" (it needs none, but ABORTS rather than write a snapshot stitched from several instants," +
+		" so expect it to refuse on a write-active source); the same knob set to no-lock accepts such a snapshot"
 
 	const roleCaveat = " (privileges granted only via an activated MySQL ROLE, rather than directly to the user, are not detected by this check — grant directly to the user, or double-check with SHOW GRANTS if you believe this refusal is wrong)"
 
@@ -170,7 +188,7 @@ func checkPrivilegesDB(ctx context.Context, db *sql.DB) error {
 	case missingFlushTables && missingBackupAdmin:
 		return errors.New("point-consistent baseline mode (the default) requires the " +
 			"source DB user to have BOTH the BACKUP_ADMIN and the RELOAD (or FLUSH_TABLES) privilege (MySQL/Percona " +
-			"8.0+); the current user has neither — grant both, e.g. GRANT BACKUP_ADMIN, RELOAD ON *.* TO '<user>'@'%', " +
+			"8.0+); the current user has neither — grant both, e.g. GRANT BACKUP_ADMIN, RELOAD ON *.* TO '<user>'@'%'" +
 			"" + alternatives + roleCaveat)
 	case missingFlushTables && requireBackupAdmin:
 		// The dangerous half-privileged combination: BACKUP_ADMIN is present but

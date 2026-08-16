@@ -37,7 +37,7 @@ type baselineSupervisor struct {
 	// BINTRAIL_CONSOLE_BASELINE_LOCK_MODE. No effect on PostgreSQL baselines
 	// (executePG uses pgoutput's own consistent-point LSN unconditionally).
 	lockMode baseline.LockMode
-	// configErr, when set, makes every Trigger refuse with it. A misconfigured
+	// configErr, when set, makes every MySQL/MariaDB Trigger refuse with it. A misconfigured
 	// lock mode must disable BASELINES, never the daemon: under `watch` this
 	// process is also the capture plane, and refusing to boot over a baseline
 	// setting would turn a typo into permanently lost events. Same reasoning
@@ -68,7 +68,11 @@ func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode base
 // Trigger starts a baseline in the background; returns console.ErrBaselineRunning
 // if one is already in flight for this server.
 func (s *baselineSupervisor) Trigger(req console.BaselineRequest) error {
-	if s.configErr != nil {
+	// Scoped to MySQL/MariaDB: executePG anchors on pgoutput's own
+	// consistent-point LSN and never consults lockMode, so refusing a
+	// Postgres baseline over a MySQL-only knob would take away a working
+	// button for a setting that cannot affect it.
+	if s.configErr != nil && req.Flavor != console.FlavorPostgres {
 		return s.configErr
 	}
 	s.mu.Lock()
@@ -264,7 +268,7 @@ func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDi
 		// Hard gate, unlike the NO_LOCK warning below: granting BACKUP_ADMIN
 		// without RELOAD/FLUSH_TABLES does not fail cleanly in mydumper — it
 		// SEGFAULTS (verified against the pinned build, #800). Never skipped.
-		if err := mydumperlock.CheckPrivileges(ctx, sourceDSN); err != nil {
+		if err := mydumperlock.CheckPrivileges(ctx, sourceDSN, mydumperlock.RemedyConsole); err != nil {
 			return err
 		}
 	} else if lockMode == baseline.LockModeNoLock {
@@ -367,12 +371,15 @@ func dumpableTableCountQuery(schemas []string) (string, []any) {
 	return base + "TABLE_SCHEMA IN (" + placeholders + ")", args
 }
 
-// warnIfMultiTableNoLock logs an advisory warning when a NO_LOCK dump (the
-// default) is about to span more than one table, pointing operators at the
-// opt-in point-consistent mode and the docs (#800). It is best-effort: opening
-// the source or running the count query never fails or delays the dump — an
-// error here is logged at Debug and swallowed, since this is a UX nudge, not a
-// correctness gate. Only called when pointConsistent is false.
+// warnIfMultiTableNoLock logs an advisory warning when a no-lock dump is about
+// to span more than one table, pointing operators back at the point-consistent
+// default and the docs (#800). It is best-effort: opening the source or running
+// the count query never fails or delays the dump — an error here is logged at
+// Debug and swallowed, since this is a UX nudge, not a correctness gate.
+//
+// Called ONLY for no-lock, not for safe-no-lock: the latter aborts on thread
+// skew instead of writing it, so warning there would cry wolf about the one
+// low-privilege mode that cannot produce the condition this describes.
 func warnIfMultiTableNoLock(ctx context.Context, sourceDSN string, schemas []string) {
 	db, err := config.Connect(sourceDSN)
 	if err != nil {

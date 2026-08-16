@@ -46,10 +46,10 @@ func TestDecodeBinaryLiteral_Fallbacks(t *testing.T) {
 	}{
 		{"0x612C6229", []byte{0x61, 0x2c, 0x62, 0x29}}, // even hex → decode
 		{"0x", []byte("0x")},                           // no digits → verbatim
-		{"0xZZ", []byte("0xZZ")},                        // invalid hex → verbatim
-		{"0x612", []byte("0x612")},                      // odd length → verbatim (DecodeString errors)
-		{"plain", []byte("plain")},                      // not hex → verbatim
-		{"", []byte("")},                                // empty → verbatim
+		{"0xZZ", []byte("0xZZ")},                       // invalid hex → verbatim
+		{"0x612", []byte("0x612")},                     // odd length → verbatim (DecodeString errors)
+		{"plain", []byte("plain")},                     // not hex → verbatim
+		{"", []byte("")},                               // empty → verbatim
 	}
 	for _, c := range cases {
 		if got := decodeBinaryLiteral(c.in); !bytes.Equal(got, c.want) {

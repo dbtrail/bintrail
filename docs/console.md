@@ -449,41 +449,17 @@ straight from the Storage page, and it only runs on the `watch` daemon:
   discarded; for a local `baseline_dir` it is written there. Region and
   credentials come from the daemon's ambient AWS chain, like every other S3
   access. When it finishes the new snapshot appears in the listing.
-- **For MySQL/MariaDB sources, this button's dump is *not* point-consistent
-  across tables by default** — see
+- **For MySQL/MariaDB sources, this button's dump IS point-consistent across
+  tables by default** (`--sync-thread-lock-mode FTWRL`), which needs `RELOAD`
+  (or `FLUSH_TABLES`) plus `BACKUP_ADMIN` on MySQL/Percona 8.0+. The daemon
+  checks those privileges before launching mydumper and refuses with an
+  actionable error if any are missing — it never silently falls back to a
+  weaker mode. Set `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=safe-no-lock` to dump
+  without them (it aborts rather than write a snapshot stitched from several
+  instants, so expect it to refuse on a write-active source) or `=no-lock` to
+  accept such a snapshot; only under `no-lock` does the daemon log a warning
+  when a dump spans more than one table. See
   [Cross-table consistency](dump-and-baseline.md#cross-table-consistency).
-  Each mydumper worker opens its own snapshot independently, so on a
-  write-heavy source a multi-table reconstruct (e.g. a parent/child FK pair)
-  can read mutually inconsistent state, and the daemon logs a warning when a
-  dump spans more than one table under the default mode. Set
-  `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` to change the
-  point-in-time snapshot across all **transactional** tables instead (a
-  non-transactional/MyISAM table makes mydumper refuse to dump at all, rather
-  than silently skip consistency for it). It requires the `RELOAD` (or
-  `FLUSH_TABLES`) privilege on **every** source flavor, plus `BACKUP_ADMIN` on
-  **MySQL/Percona 8.0+ only** — `BACKUP_ADMIN` is a MySQL 8.0+ dynamic
-  privilege that does not exist on MariaDB or MySQL 5.7 at all, so it is never
-  required there. The console detects the source's actual flavor/version
-  (`SELECT VERSION()`) and checks for exactly the privileges that source needs
-  *before* invoking mydumper, refusing with a clear error if any are missing,
-  rather than silently falling back to the default. On a MySQL/Percona 8.0+
-  source this preflight isn't just extra caution: granting `BACKUP_ADMIN`
-  without `RELOAD`/`FLUSH_TABLES` doesn't make mydumper fail cleanly on its
-  own — it makes the pinned build (`v1.0.3-1`) **crash**. PostgreSQL baselines
-  are unaffected — `pgbaseline` always anchors on the replication slot's own
-  consistent-point LSN.
-
-The button is hidden on the read-only `serve` console and whenever the trigger
-is disabled — the CLI/compose recipe in the empty state remains the
-always-available path.
-
-#### Running verification from the console
-
-The Storage page's **Verification** panel runs [`bintrail verify`](verify.md)
-in-process for the selected server — trigger a run, watch per-table results
-land as they complete, and drill into a mismatch — instead of only reading
-results a `verify` cron/CI run produced elsewhere:
-
 - Like the Create-baseline button, this only runs on the `watch` daemon; a
   bare invocation needs `BINTRAIL_CONSOLE_VERIFY_TRIGGER=1`, while the bundled
   compose stack enables it **by default** (`VERIFY_TRIGGER=0` in `.env` opts
@@ -647,24 +623,15 @@ see the metrics tables and example alert rules in
   [docker.md](docker.md) — `BASELINE_TRIGGER=0` in `.env` opts out there).
 - `BINTRAIL_CONSOLE_BASELINE_STAGING` (`watch` only) — local staging dir for
   S3-destined baselines created by that button (default a temp subdir).
-- `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` (`watch` only) — `ftwrl` (default)/`safe-no-lock`/`no-lock`
-  makes the **Create baseline** button dump MySQL/MariaDB sources with
-  mydumper's `FTWRL` sync mode instead of the default `NO_LOCK`, giving a
-  single point-in-time snapshot across all **transactional** tables instead of
-  a per-table one (see
-  [Cross-table consistency](dump-and-baseline.md#cross-table-consistency)).
-  Off by default — the default trades this away for needing no elevated
-  privilege. Requires the source user to have `RELOAD` (or `FLUSH_TABLES`) on
-  every flavor, plus `BACKUP_ADMIN` on **MySQL/Percona 8.0+ only** (the
-  privilege doesn't exist on MariaDB or MySQL 5.7 — the console detects the
-  source's actual flavor/version and only requires what that source actually
-  needs). The console checks for the applicable privileges before invoking
-  mydumper and refuses with a clear error if any are missing — never silently
-  falling back to `NO_LOCK`, and on a MySQL/Percona 8.0+ source never letting
-  mydumper attempt the dump with only one of `BACKUP_ADMIN`/`RELOAD` (that
-  combination doesn't fail cleanly, it crashes the pinned mydumper build). No
-  effect unless `BINTRAIL_CONSOLE_BASELINE_TRIGGER` is also on, and no effect
-  on PostgreSQL sources.
+- `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` (`watch` only) — `ftwrl` (default),
+  `safe-no-lock` or `no-lock`. Selects how mydumper synchronizes its worker
+  threads onto one instant for the **Create baseline** button. The default is
+  point-consistent and needs `RELOAD`/`FLUSH_TABLES` (plus `BACKUP_ADMIN` on
+  MySQL/Percona 8.0+); `safe-no-lock` needs neither but aborts rather than
+  write a torn snapshot; `no-lock` accepts one. A baseline is the seed state
+  `reconstruct` merges deltas onto, which is why the weaker modes must be named
+  explicitly. An unrecognized value disables baseline DUMPS only — capture and
+  the periodic refresh keep running.
 - `BINTRAIL_CONSOLE_NOTIFY_WEBHOOK` (`watch` only) — same as
   `--notify-webhook`: URL for JSON notifications on lost continuity, verify
   problems, and unhealthy rotation (see
