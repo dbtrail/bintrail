@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -330,6 +331,33 @@ func TestVerifySupervisor_ExplainCancelsInvalidatedWork(t *testing.T) {
 	case <-other.Done():
 		t.Error("a run on one server canceled another server's in-flight drill-down")
 	default:
+	}
+}
+
+// TestExplainLogVerdict: a canceled drill-down is one WE abandoned, so it
+// must not be reported as a failure. Without this, every scheduled run that
+// overlaps an open drill-down logs an error, and the real failures this
+// logging exists to surface drown in routine noise.
+func TestExplainLogVerdict(t *testing.T) {
+	canceled := fmt.Errorf("explain wp.posts: %w", context.Canceled)
+	for _, tc := range []struct {
+		name string
+		err  error
+		live bool
+		want slog.Level
+	}{
+		{"canceled by a new run", canceled, false, slog.LevelDebug},
+		{"canceled at shutdown", canceled, true, slog.LevelDebug},
+		{"failed and still wanted", errors.New("connect index: refused"), true, slog.LevelError},
+		{"failed after superseded", errors.New("connect index: refused"), false, slog.LevelError},
+		{"succeeded but superseded", nil, false, slog.LevelWarn},
+		{"succeeded and delivered", nil, true, slog.LevelDebug},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, _ := explainLogVerdict(tc.err, tc.live); got != tc.want {
+				t.Errorf("level = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

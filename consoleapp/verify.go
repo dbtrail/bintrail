@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -344,14 +345,34 @@ func (s *verifySupervisor) finishExplain(key string, job *explainJob, res *conso
 		job.cancel()
 	}
 
+	level, msg := explainLogVerdict(err, live)
+	slog.Log(context.Background(), level, msg, "key", key, "error", err)
+}
+
+// explainLogVerdict decides how a finished drill-down is reported. Split out
+// as a pure function so the policy is assertable: the levels are the whole
+// point of the logging, and a level chosen inside finishExplain could only be
+// tested by capturing global slog output.
+//
+// Cancellation is deliberately NOT an error. A canceled drill-down is one WE
+// abandoned — a new run purged it, or the daemon is shutting down — so
+// reporting it at Error would emit a failure line on every --verify-interval
+// tick that overlaps an open drill-down, and bury the failures this logging
+// exists to surface. Same reasoning as status's refusal to grade an
+// unattributable baseline as broken: a log that cries wolf is worse than one
+// that says less.
+func explainLogVerdict(err error, live bool) (slog.Level, string) {
 	switch {
+	case errors.Is(err, context.Canceled):
+		return slog.LevelDebug, "verify: drill-down canceled"
 	case err != nil && live:
-		slog.Error("verify: drill-down failed", "key", key, "error", err)
+		return slog.LevelError, "verify: drill-down failed"
 	case err != nil:
-		slog.Error("verify: drill-down failed after being superseded", "key", key, "error", err)
+		return slog.LevelError, "verify: drill-down failed after being superseded"
 	case !live:
-		slog.Warn("verify: discarding a drill-down whose request was superseded", "key", key)
+		return slog.LevelWarn, "verify: discarding a drill-down whose request was superseded"
 	}
+	return slog.LevelDebug, "verify: drill-down delivered"
 }
 
 // explainNow performs the reconstruction and row-level diff. It is the old
