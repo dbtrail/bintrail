@@ -3,7 +3,6 @@ package consoleapp
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -17,6 +16,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/mydumperlock"
 	"github.com/dbtrail/dbtrail/internal/pgbaseline"
 )
 
@@ -29,14 +29,20 @@ type baselineSupervisor struct {
 	ctx        context.Context // daemon lifecycle; cancels an in-flight dump on shutdown
 	stagingDir string          // base dir for temp dump + staged Parquet (S3-destined runs)
 
-	// pointConsistent opts a MySQL/MariaDB dump into mydumper's FTWRL sync mode
-	// instead of the NO_LOCK default, trading the least-privilege requirement
-	// for a single point-in-time snapshot across ALL tables (#800). Set only via
-	// BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT=1 — mirrors how
-	// BINTRAIL_CONSOLE_BASELINE_TRIGGER gates the feature itself. No effect on
-	// PostgreSQL baselines (executePG uses pgoutput's own consistent-point LSN
-	// unconditionally).
+	// lockMode selects how mydumper synchronizes its worker threads onto one
+	// instant for MySQL/MariaDB dumps — see internal/baseline.LockMode for the
+	// measured trade-offs. Defaults to baseline.DefaultLockMode (FTWRL): a
+	// baseline is the seed state reconstruct merges deltas onto, so a snapshot
+	// that can be torn must be asked for, never landed on (#1377). Set via
+	// BINTRAIL_CONSOLE_BASELINE_LOCK_MODE. No effect on PostgreSQL baselines
+	// (executePG uses pgoutput's own consistent-point LSN unconditionally).
 	lockMode baseline.LockMode
+	// configErr, when set, makes every Trigger refuse with it. A misconfigured
+	// lock mode must disable BASELINES, never the daemon: under `watch` this
+	// process is also the capture plane, and refusing to boot over a baseline
+	// setting would turn a typo into permanently lost events. Same reasoning
+	// as audit readability gating nothing in the capture path.
+	configErr error
 
 	mu   sync.Mutex
 	jobs map[string]*console.BaselineStatus
@@ -47,21 +53,24 @@ type baselineSupervisor struct {
 }
 
 // newBaselineSupervisor builds a supervisor bound to the daemon context. The
-// staging dir is created lazily per run. pointConsistent selects the MySQL dump's
-// lock mode for every run this supervisor executes — see the field doc.
+// staging dir is created lazily per run. lockMode selects the MySQL dump's sync
+// mode for every run this supervisor executes — see the field doc.
 func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode baseline.LockMode) *baselineSupervisor {
 	return &baselineSupervisor{
-		ctx:             ctx,
-		stagingDir:      stagingDir,
-		lockMode: lockMode,
-		jobs:            make(map[string]*console.BaselineStatus),
-		refreshes:       make(map[string]*console.BaselineStatus),
+		ctx:        ctx,
+		stagingDir: stagingDir,
+		lockMode:   lockMode,
+		jobs:       make(map[string]*console.BaselineStatus),
+		refreshes:  make(map[string]*console.BaselineStatus),
 	}
 }
 
 // Trigger starts a baseline in the background; returns console.ErrBaselineRunning
 // if one is already in flight for this server.
 func (s *baselineSupervisor) Trigger(req console.BaselineRequest) error {
+	if s.configErr != nil {
+		return s.configErr
+	}
 	s.mu.Lock()
 	// Shared with the periodic refresh (#1171): a dump writing a new snapshot
 	// while a refresh folds the newest one forward would leave the refresh
@@ -244,7 +253,7 @@ func pgBaselineConfig(req console.BaselineRequest, outputDir string) (pgbaseline
 // a dump (with binlog coordinates in its metadata, which baseline.Run reads) into
 // dumpDir. The image pins the SAME mydumper version the compose baseline-dump
 // pipeline uses, so a console-created baseline matches a CLI/compose one exactly.
-// pointConsistent selects the lock mode — see buildConsoleMydumperArgs.
+// lockMode selects the sync mode — see buildConsoleMydumperArgs.
 func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDir string, lockMode baseline.LockMode) error {
 	host, port, user, password, err := config.ParseSourceDSN(sourceDSN)
 	if err != nil {
@@ -255,7 +264,7 @@ func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDi
 		// Hard gate, unlike the NO_LOCK warning below: granting BACKUP_ADMIN
 		// without RELOAD/FLUSH_TABLES does not fail cleanly in mydumper — it
 		// SEGFAULTS (verified against the pinned build, #800). Never skipped.
-		if err := checkPointConsistentPrivileges(ctx, sourceDSN); err != nil {
+		if err := mydumperlock.CheckPrivileges(ctx, sourceDSN); err != nil {
 			return err
 		}
 	} else if lockMode == baseline.LockModeNoLock {
@@ -297,63 +306,23 @@ const systemSchemaExcludeRegex = `^(?!(mysql|sys|performance_schema|information_
 
 // buildConsoleMydumperArgs builds the mydumper argument slice for the console's
 // in-process dump. It mirrors `bintrail dump` / the compose baseline-dump
-// invocation for the shared flags; the lock mode is selected by pointConsistent
-// (#800):
+// invocation for the shared flags; lockMode picks --sync-thread-lock-mode
+// (#800, #1377). internal/baseline.LockMode carries the measured comparison of
+// the three modes; the two consequences specific to THIS call site:
 //
-//   - pointConsistent=false (the default): --sync-thread-lock-mode NO_LOCK
-//     --trx-tables. Each mydumper worker opens its own consistent snapshot
-//     independently, with NO synchronization barrier between workers/tables —
-//     this is a per-table transactional snapshot, NOT a cross-table-consistent
-//     one. On a write-heavy source, different tables (and the metadata's
-//     recorded binlog coordinates) can be anchored at slightly different
-//     instants, and a multi-table reconstruct spanning a parent/child FK pair
-//     can be mutually inconsistent. Non-transactional tables (MyISAM) get no
-//     consistency guarantee at all — but they ARE still dumped: under NO_LOCK,
-//     --trx-tables' non-transactional-table check does not trigger a refusal
-//     (only a warning about binlog-coordinate accuracy), unlike under FTWRL
-//     below, where the SAME flag hard-refuses on the SAME table type. Verified
-//     empirically in the same session (#800): a MyISAM table dumped
-//     successfully (warning only) under NO_LOCK, and was hard-refused under
-//     FTWRL — the check is evidently gated to an actual "consistent backup
-//     attempt" (mydumper's own wording), which NO_LOCK explicitly is not
-//     attempting. It is the default because it needs no elevated privilege: a
-//     least-privilege replication user (SELECT + REPLICATION CLIENT only) can
-//     run it — verified against a real Percona 8.0 source. See
-//     docs/dump-and-baseline.md ("Cross-table consistency") for the
-//     operator-facing writeup.
-//   - pointConsistent=true (opt-in via BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT=1):
-//     --sync-thread-lock-mode FTWRL --trx-tables (same --trx-tables as the
-//     default — NOT --no-trx-tables). FTWRL (FLUSH TABLES WITH READ LOCK) is
-//     mydumper's own built-in sync mode: it holds one global read lock just long
-//     enough for every worker to open its consistent snapshot at the SAME
-//     instant, then releases it. This gives one point-in-time snapshot across
-//     every TRANSACTIONAL table — it does NOT cover non-transactional (MyISAM)
-//     tables: unlike the default mode above, mydumper itself detects a MyISAM
-//     table under --trx-tables HERE and refuses to run at all ("Non
-//     transactional table found ... Restart backup using --trx-tables=0"), a
-//     clean failure rather than a silent gap — the check is gated to a
-//     "consistent backup attempt," which FTWRL is and NO_LOCK isn't. Requires
-//     RELOAD or the FLUSH_TABLES dynamic privilege (for `FLUSH TABLES WITH READ
-//     LOCK`) on EVERY flavor, verified against the pinned mydumper build
-//     (v1.0.3-1, #800), PLUS BACKUP_ADMIN (for `LOCK INSTANCE FOR BACKUP`,
-//     checked first) ONLY on MySQL/Percona 8.0+ — BACKUP_ADMIN is a MySQL 8.0+
-//     dynamic privilege that does not exist on MariaDB or MySQL 5.7, and
-//     neither issues LOCK INSTANCE FOR BACKUP (see sourceRequiresBackupAdmin).
-//     On sources where BOTH are required, they are required together: granting
-//     BACKUP_ADMIN WITHOUT RELOAD/FLUSH_TABLES does NOT fail cleanly — the
-//     pinned mydumper build SEGFAULTS instead (reproduced on both amd64 and
-//     arm64). checkPointConsistentPrivileges below exists specifically to catch
-//     that half-privileged state and turn it into a clean Go error before
-//     mydumper ever runs, since this code deliberately never lets mydumper
-//     crash or silently fall back to NO_LOCK.
-//
-// Schema selection: single → --database; multiple → an anchored --regex; none →
-// every user schema with the system schemas excluded. Extracted for unit testing
-// without a live mydumper.
-//
-// The source password is NEVER placed on argv (world-readable via `ps aux` /
-// /proc/<pid>/cmdline); runMydumper delivers it via MYSQL_PWD in the child env
-// (#811).
+//   - FTWRL (the default) covers TRANSACTIONAL tables only, and --trx-tables
+//     makes mydumper REFUSE the whole dump when it finds a non-transactional
+//     one ("Non transactional table found ... Restart backup using
+//     --trx-tables=0"), which the console propagates as the run's error. The
+//     same flag under NO_LOCK only warns and proceeds — verified empirically
+//     on the identical MyISAM table (#800). The refusal is gated to an actual
+//     "consistent backup attempt" in mydumper's own wording, which NO_LOCK is
+//     explicitly not making.
+//   - FTWRL needs RELOAD/FLUSH_TABLES on every flavor, plus BACKUP_ADMIN on
+//     MySQL/Percona 8.0+ (for LOCK INSTANCE FOR BACKUP). Granting BACKUP_ADMIN
+//     WITHOUT RELOAD does not fail cleanly — the pinned build SEGFAULTS — which
+//     is why mydumperlock.CheckPrivileges runs first and never lets mydumper
+//     attempt it half-privileged, and why this code never silently falls back.
 func buildConsoleMydumperArgs(host string, port uint16, user string, schemas []string, dumpDir string, lockMode baseline.LockMode) []string {
 	syncMode := lockMode.MydumperValue()
 	args := []string{
@@ -376,172 +345,6 @@ func buildConsoleMydumperArgs(host string, port uint16, user string, schemas []s
 	// --outputdir last: docker wrapper scripts read the last arg for the mount.
 	args = append(args, "--outputdir", dumpDir)
 	return args
-}
-
-// pointConsistentRequiredPrivileges are the MySQL privileges the pinned
-// mydumper build (v1.0.3-1) can need for --sync-thread-lock-mode FTWRL,
-// verified empirically against a real MySQL 8.0 source (#800): BACKUP_ADMIN
-// for `LOCK INSTANCE FOR BACKUP` (checked first — missing it alone fails
-// cleanly with a CRITICAL "Access denied ... BACKUP_ADMIN" and exit 1) and
-// RELOAD or the FLUSH_TABLES dynamic privilege for the subsequent `FLUSH
-// TABLES WITH READ LOCK` (missing THIS one while BACKUP_ADMIN is present does
-// NOT fail cleanly — mydumper segfaults). BACKUP_ADMIN itself is required only
-// on MySQL/Percona 8.0+ — see sourceRequiresBackupAdmin. Both classic (RELOAD)
-// and dynamic (BACKUP_ADMIN, FLUSH_TABLES) privileges appear side by side in
-// information_schema.USER_PRIVILEGES on MySQL 8.0+.
-var pointConsistentRequiredPrivileges = []string{"BACKUP_ADMIN", "RELOAD", "FLUSH_TABLES"}
-
-// sourceRequiresBackupAdmin reports whether the connected server needs the
-// BACKUP_ADMIN privilege for FTWRL's `LOCK INSTANCE FOR BACKUP` step.
-// BACKUP_ADMIN is a MySQL 8.0+ dynamic privilege (also present on Percona
-// Server 8.0+, a MySQL 8.0 fork) — it does not exist on MariaDB (any version)
-// or MySQL 5.7, and neither issues `LOCK INSTANCE FOR BACKUP`, so FTWRL there
-// needs only RELOAD/FLUSH_TABLES (#800 review). Requiring BACKUP_ADMIN
-// unconditionally would make point-consistent mode permanently unusable on
-// those sources: `GRANT BACKUP_ADMIN` itself errors on MariaDB, since the
-// privilege doesn't exist there at all — there would be no way forward.
-//
-// Detection is a single SELECT VERSION(), mirroring the same MariaDB
-// substring check metadata.DetectFlavor uses (self-contained here rather than
-// imported, since this also needs the major version number DetectFlavor
-// doesn't expose). An unparseable version string defaults to false (does NOT
-// require BACKUP_ADMIN) — the safe direction: if the server actually needs it
-// and this under-requires, mydumper's own LOCK INSTANCE FOR BACKUP check
-// still fails cleanly on its own (missing BACKUP_ADMIN alone is always a
-// clean failure, verified — never the segfault); the dangerous direction is
-// over-requiring a privilege that doesn't exist on the source's actual
-// flavor, which is exactly the bug this function exists to avoid.
-func sourceRequiresBackupAdmin(ctx context.Context, db *sql.DB) (bool, error) {
-	var version string
-	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
-		return false, fmt.Errorf("point-consistent baseline: cannot read source VERSION() to determine privilege requirements: %w", err)
-	}
-	if strings.Contains(strings.ToLower(version), "mariadb") {
-		return false, nil
-	}
-	major, ok := serverMajorVersion(version)
-	if !ok {
-		return false, nil
-	}
-	return major >= 8, nil
-}
-
-// serverMajorVersion extracts the leading major version number from a
-// SELECT VERSION() string (e.g. "8.0.46" → 8, "5.7.44" → 5, "10.11.6-MariaDB"
-// → 10). Returns ok=false for anything it cannot parse.
-func serverMajorVersion(version string) (major int, ok bool) {
-	dot := strings.IndexByte(version, '.')
-	if dot <= 0 {
-		return 0, false
-	}
-	n, err := strconv.Atoi(version[:dot])
-	if err != nil {
-		return 0, false
-	}
-	return n, true
-}
-
-// checkPointConsistentPrivileges queries the source for its required
-// point-consistent privileges and fails loudly, before mydumper ever runs,
-// unless they are present. This is a hard gate, not an advisory warning:
-// unlike the NO_LOCK skew warning below, a query failure here aborts the dump
-// rather than being swallowed, because the alternative — letting mydumper
-// attempt FTWRL half-privileged — is a segfault, not a clean error (#800).
-// Never silently falls back to NO_LOCK.
-func checkPointConsistentPrivileges(ctx context.Context, sourceDSN string) error {
-	db, err := config.Connect(sourceDSN)
-	if err != nil {
-		return fmt.Errorf("point-consistent baseline: cannot connect to source to verify privileges: %w", err)
-	}
-	defer db.Close()
-	return checkPointConsistentPrivilegesDB(ctx, db)
-}
-
-// checkPointConsistentPrivilegesDB is checkPointConsistentPrivileges' core logic
-// against an already-open *sql.DB, split out so it is unit-testable with
-// sqlmock without a live MySQL connection. It first determines whether this
-// source's flavor/version needs BACKUP_ADMIN at all (sourceRequiresBackupAdmin)
-// — RELOAD/FLUSH_TABLES is mandatory on every flavor, BACKUP_ADMIN only on
-// MySQL/Percona 8.0+ — then reads the CURRENT_USER()'s own privileges from
-// information_schema.USER_PRIVILEGES, which is self-scoped to the connecting
-// user without needing any special grant, so it works even for an otherwise
-// least-privilege replication user. The GRANTEE reconstruction (split
-// CURRENT_USER() on '@', requote both halves) was verified against a real
-// MySQL 8.0 server for both a wildcard-host account ('user'@'%') and a
-// specific-host-pattern account ('user'@'172.20.%.%') — CURRENT_USER() always
-// returns the exact host pattern from the matched mysql.user row, not the
-// connecting client's resolved address, so the reconstruction is not a
-// wildcard-only coincidence. Known gap, surfaced in the refusal message below
-// so an affected operator can self-diagnose: privileges granted only via an
-// activated MySQL 8.0 ROLE (not directly to the user) are attributed to the
-// role's own GRANTEE in this view and would not be picked up here — not a
-// pattern used anywhere else in this codebase's documented grant examples, and
-// this fails CLOSED (over-refuses, never under-refuses) for a role-using
-// operator, so the segfault path stays unreachable either way.
-func checkPointConsistentPrivilegesDB(ctx context.Context, db *sql.DB) error {
-	requireBackupAdmin, err := sourceRequiresBackupAdmin(ctx, db)
-	if err != nil {
-		return err
-	}
-
-	const query = `SELECT PRIVILEGE_TYPE FROM information_schema.USER_PRIVILEGES ` +
-		`WHERE GRANTEE = CONCAT("'", SUBSTRING_INDEX(CURRENT_USER(), '@', 1), "'@'", SUBSTRING_INDEX(CURRENT_USER(), '@', -1), "'")`
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("point-consistent baseline: cannot verify source privileges: %w", err)
-	}
-	defer rows.Close()
-
-	have := make(map[string]bool, len(pointConsistentRequiredPrivileges))
-	for rows.Next() {
-		var priv string
-		if err := rows.Scan(&priv); err != nil {
-			return fmt.Errorf("point-consistent baseline: cannot read source privileges: %w", err)
-		}
-		have[priv] = true
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("point-consistent baseline: cannot read source privileges: %w", err)
-	}
-
-	hasBackupAdmin := have["BACKUP_ADMIN"]
-	hasFlushTables := have["RELOAD"] || have["FLUSH_TABLES"]
-	missingFlushTables := !hasFlushTables
-	missingBackupAdmin := requireBackupAdmin && !hasBackupAdmin
-
-	if !missingFlushTables && !missingBackupAdmin {
-		return nil
-	}
-
-	const roleCaveat = " (privileges granted only via an activated MySQL ROLE, rather than directly to the user, are not detected by this check — grant directly to the user, or double-check with SHOW GRANTS if you believe this refusal is wrong)"
-
-	switch {
-	case missingFlushTables && missingBackupAdmin:
-		return errors.New("point-consistent baseline mode (BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT=1) requires the " +
-			"source DB user to have BOTH the BACKUP_ADMIN and the RELOAD (or FLUSH_TABLES) privilege (MySQL/Percona " +
-			"8.0+); the current user has neither — grant both, e.g. GRANT BACKUP_ADMIN, RELOAD ON *.* TO '<user>'@'%', " +
-			"or disable point-consistent mode" + roleCaveat)
-	case missingFlushTables && requireBackupAdmin:
-		// The dangerous half-privileged combination: BACKUP_ADMIN is present but
-		// RELOAD/FLUSH_TABLES is not — this is exactly what segfaults mydumper.
-		return errors.New("point-consistent baseline mode requires the RELOAD (or FLUSH_TABLES) privilege in addition " +
-			"to BACKUP_ADMIN, which the current user already has — granting BACKUP_ADMIN alone makes mydumper crash " +
-			"rather than fail cleanly; grant RELOAD, e.g. GRANT RELOAD ON *.* TO '<user>'@'%', or disable " +
-			"point-consistent mode" + roleCaveat)
-	case missingFlushTables:
-		// requireBackupAdmin is false here (MariaDB, MySQL 5.7, or an
-		// undetectable version) — BACKUP_ADMIN is never mentioned since it
-		// isn't required, and on MariaDB the privilege doesn't even exist.
-		return errors.New("point-consistent baseline mode requires the RELOAD (or FLUSH_TABLES) privilege; the current " +
-			"user has neither — grant it, e.g. GRANT RELOAD ON *.* TO '<user>'@'%', or disable point-consistent mode" +
-			roleCaveat)
-	default:
-		// missingBackupAdmin only: requireBackupAdmin is true and hasFlushTables
-		// is true.
-		return errors.New("point-consistent baseline mode requires the BACKUP_ADMIN privilege (MySQL/Percona 8.0+) in " +
-			"addition to RELOAD/FLUSH_TABLES, which the current user already has — grant it, e.g. " +
-			"GRANT BACKUP_ADMIN ON *.* TO '<user>'@'%', or disable point-consistent mode" + roleCaveat)
-	}
 }
 
 // dumpableTableCountQuery builds the information_schema.TABLES COUNT(*) query and
@@ -580,14 +383,14 @@ func warnIfMultiTableNoLock(ctx context.Context, sourceDSN string, schemas []str
 
 	count, err := countDumpableTables(ctx, db, schemas)
 	if err != nil {
-		slog.Debug("baseline: could not count tables for the NO_LOCK skew warning", "error", err)
+		slog.Debug("baseline: could not count tables for the no-lock skew warning", "error", err)
 		return
 	}
 	if count > 1 {
-		slog.Warn("baseline: dumping multiple tables under the default NO_LOCK mode — each table's snapshot is "+
+		slog.Warn("baseline: dumping multiple tables under no-lock — each table's snapshot is "+
 			"anchored at a slightly different instant (no cross-table synchronization barrier), so a multi-table "+
-			"reconstruct (e.g. a parent/child FK pair) can be mutually inconsistent; set "+
-			"BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT=1 for a single point-in-time snapshot across all transactional "+
+			"reconstruct (e.g. a parent/child FK pair) can be mutually inconsistent; unset "+
+			"BINTRAIL_CONSOLE_BASELINE_LOCK_MODE to return to the point-consistent default across all transactional "+
 			"tables (requires the RELOAD or FLUSH_TABLES privilege; MySQL/Percona 8.0+ also requires BACKUP_ADMIN, not "+
 			"needed on MariaDB or MySQL 5.7) — see docs/dump-and-baseline.md",
 			"tables", count)

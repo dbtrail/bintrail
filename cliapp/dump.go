@@ -20,6 +20,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/mydumperlock"
 )
 
 var dumpCmd = &cobra.Command{
@@ -285,6 +286,18 @@ func runDump(cmd *cobra.Command, args []string) error {
 	if !supportsLockMode && cmd.Flags().Changed("lock-mode") {
 		return fmt.Errorf("--lock-mode %s needs mydumper 0.18 or newer (this build does not accept --sync-thread-lock-mode); "+
 			"upgrade mydumper, or point --mydumper-image at a newer pinned image", lockMode)
+	}
+	// Probe privileges BEFORE launching mydumper. Granting BACKUP_ADMIN without
+	// RELOAD/FLUSH_TABLES does not make mydumper fail cleanly — the pinned build
+	// SEGFAULTS (#800) — so the crash has to be made unreachable rather than
+	// reported. This check used to live only on the console because the CLI
+	// always passed NO_LOCK and could not reach the crash; #1377 made the
+	// point-consistent mode the default here too, so the guard has to come
+	// with it. Skipped when the flag is not being sent at all.
+	if supportsLockMode && lockMode.NeedsElevatedPrivileges() {
+		if err := mydumperlock.CheckPrivileges(cmd.Context(), dmpSourceDSN); err != nil {
+			return err
+		}
 	}
 	// The source password must never reach mydumper's argv (visible in
 	// `ps aux` / /proc/<pid>/cmdline and, under Docker, in `docker inspect`).

@@ -526,6 +526,11 @@ services:
       # USER schemas — the system schemas mysql/sys/performance_schema/
       # information_schema are always excluded, see the dump command below).
       BASELINE_SCHEMAS: ${BASELINE_SCHEMAS:-${SCHEMAS:-}}
+      # Same knob and same vocabulary as the console's
+      # BINTRAIL_CONSOLE_BASELINE_LOCK_MODE: ftwrl | safe-no-lock | no-lock.
+      # It MUST be listed here or it never enters the container and the
+      # operator's choice is silently ignored (#1378).
+      BASELINE_LOCK_MODE: ${BASELINE_LOCK_MODE:-ftwrl}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -560,13 +565,22 @@ services:
         rm -rf /dump/snapshot
         mkdir -p /dump/snapshot
         # Mirror `bintrail dump`'s mydumper invocation (cmd/bintrail/dump.go):
-        # light locking (flags exist since mydumper 0.18), compressed
+        # point-consistent by default (flags exist since mydumper 0.18), compressed
         # protocol, complete INSERTs, and
         # --outputdir last. The metadata file it writes carries the binlog
         # coordinates `bintrail baseline` embeds in the Parquet.
+        # Translate the operator vocabulary to mydumper's. A typo must FAIL
+        # here rather than fall through to a weaker mode: the whole point of
+        # the default is that a torn snapshot has to be asked for.
+        case "$${BASELINE_LOCK_MODE:-ftwrl}" in
+          ftwrl)        sync_mode=FTWRL ;;
+          safe-no-lock) sync_mode=SAFE_NO_LOCK ;;
+          no-lock)      sync_mode=NO_LOCK ;;
+          *) echo "FATAL: BASELINE_LOCK_MODE='$$BASELINE_LOCK_MODE' is not one of: ftwrl, safe-no-lock, no-lock" >&2; exit 1 ;;
+        esac
         set -- --host "$$host" --port "$$port" --user "$$user" \
           --threads 4 --compress-protocol --complete-insert \
-          --sync-thread-lock-mode "$${BASELINE_LOCK_MODE_MYDUMPER:-FTWRL}" --trx-tables
+          --sync-thread-lock-mode "$$sync_mode" --trx-tables
         [ -n "$$pass" ] && set -- "$$@" --password "$$pass"
         schemas="$$(printf '%s' "$$BASELINE_SCHEMAS" | tr -d ' ')"
         if [ -n "$$schemas" ]; then

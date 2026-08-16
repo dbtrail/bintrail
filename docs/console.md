@@ -456,7 +456,7 @@ straight from the Storage page, and it only runs on the `watch` daemon:
   write-heavy source a multi-table reconstruct (e.g. a parent/child FK pair)
   can read mutually inconsistent state, and the daemon logs a warning when a
   dump spans more than one table under the default mode. Set
-  `BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT=1` to opt into a single
+  `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` to change the
   point-in-time snapshot across all **transactional** tables instead (a
   non-transactional/MyISAM table makes mydumper refuse to dump at all, rather
   than silently skip consistency for it). It requires the `RELOAD` (or
@@ -647,7 +647,7 @@ see the metrics tables and example alert rules in
   [docker.md](docker.md) — `BASELINE_TRIGGER=0` in `.env` opts out there).
 - `BINTRAIL_CONSOLE_BASELINE_STAGING` (`watch` only) — local staging dir for
   S3-destined baselines created by that button (default a temp subdir).
-- `BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT` (`watch` only) — `1`/`true`
+- `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` (`watch` only) — `ftwrl` (default)/`safe-no-lock`/`no-lock`
   makes the **Create baseline** button dump MySQL/MariaDB sources with
   mydumper's `FTWRL` sync mode instead of the default `NO_LOCK`, giving a
   single point-in-time snapshot across all **transactional** tables instead of

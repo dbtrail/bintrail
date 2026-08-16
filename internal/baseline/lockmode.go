@@ -84,8 +84,14 @@ func (m LockMode) MydumperValue() string {
 // PointConsistent reports whether a snapshot this mode PRODUCES can be trusted
 // to represent one instant. SAFE_NO_LOCK counts: it aborts instead of writing
 // a torn snapshot, so anything it does write is consistent. Only NO_LOCK can
-// hand back skew without saying so — which is what the footer marker and the
-// downstream warnings key off.
+// hand back skew without saying so.
+//
+// NOTE: nothing durable records which mode produced a snapshot yet, so a
+// no-lock baseline is indistinguishable from a consistent one downstream —
+// unlike a capture gap, which stamps bintrail.capture_gap into the footer and
+// is inherited by every descendant. Closing that is the remaining half of
+// #1377; until then this predicate serves callers deciding what to WARN
+// about, not readers of an existing snapshot.
 func (m LockMode) PointConsistent() bool { return m != LockModeNoLock }
 
 // NeedsElevatedPrivileges reports whether the mode issues statements a

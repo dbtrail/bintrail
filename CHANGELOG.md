@@ -8,8 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING (operators without `RELOAD`) — baseline dumps are point-consistent
-  by default** (#1377). `bintrail dump` and the console's **Create baseline**
+- **BREAKING (operators without `RELOAD`, or with any non-transactional table)
+  — baseline dumps are point-consistent by default** (#1377). `bintrail dump` and the console's **Create baseline**
   both passed mydumper `--sync-thread-lock-mode NO_LOCK`, which is the mode
   mydumper's own documentation describes as the choice for when *"you don't
   need a consistent backup"* — and which it **deprecated in 0.18.1**. Under it
@@ -30,10 +30,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     naming the alternatives; neither surface downgrades silently. Deployments
     running as a least-privilege replication user must either grant those
     privileges or pass `--lock-mode safe-no-lock` / set the console variable.
-  - The compose `baseline` profile follows the same default and gains the
-    passthrough it was missing, so the mode is reachable from the shipped stack
-    at all (#1378) — the previous opt-in existed in the binary but no
-    compose variable mapped to it.
+  - **A second break, independent of privileges**: `FTWRL` with `--trx-tables`
+    makes mydumper refuse a dump outright when it finds a non-transactional
+    (MyISAM) table — *"Non transactional table found ... Restart backup using
+    --trx-tables=0"* — where `NO_LOCK` only warned and proceeded. A source with
+    one legacy MyISAM table now fails even with every privilege granted. The
+    refusal is mydumper's, gated to an actual "consistent backup attempt".
+  - The stack's own documented source user (`REPLICATION SLAVE, REPLICATION
+    CLIENT, SELECT` in `.env.example` and the quickstart) does **not** satisfy
+    the new default, and `BASELINE_TRIGGER` defaults on — so the documented
+    happy path needs either the extra grants or an explicit weaker mode. Both
+    documents now say so.
+  - The compose `baseline` profile follows the same default and gains a working
+    passthrough (#1378): the pre-existing opt-in was unreachable from the
+    shipped stack, and the first attempt at this fix declared a variable the
+    service's `environment:` block never passed into the container — so it was
+    read as unset and the operator's choice was silently ignored. Both compose
+    surfaces now take the same `BASELINE_LOCK_MODE` in the same vocabulary, and
+    an unrecognized value fails the run loudly instead of falling through.
+  - An invalid `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` disables **baselines**, not
+    the daemon: under `watch` this process is also the capture plane, so
+    refusing to boot over a baseline setting would turn a typo into permanently
+    lost events. The error surfaces from every baseline trigger instead.
 
 ## [0.57.1] - 2026-08-16
 

@@ -18,8 +18,12 @@ the **command line**. Both need a source MySQL user first.
   ```sql
   CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';
   GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';
+  -- Baselines are point-consistent by default and need these too.
+  -- BACKUP_ADMIN is MySQL/Percona 8.0+ only; omit it on MariaDB and MySQL 5.7.
+  GRANT RELOAD, BACKUP_ADMIN ON *.* TO 'dbtrail'@'%';
   ```
 
+  `RELOAD`/`BACKUP_ADMIN` let the baseline dump take a point-in-time snapshot — skip them and set `BASELINE_LOCK_MODE=safe-no-lock` if you would rather not grant them (it never writes a torn snapshot, but it refuses on a write-active source).
   `REPLICATION SLAVE`/`REPLICATION CLIENT` drive the binlog stream; `SELECT` lets
   dbtrail snapshot the schema. dbtrail never writes to or locks the source.
   (Least-privilege variant: [streaming.md](streaming.md#the-source-mysql-user).)

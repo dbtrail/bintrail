@@ -110,6 +110,10 @@ var (
 	// (BINTRAIL_CONSOLE_BASELINE_LOCK_MODE); has no effect unless
 	// baseline-trigger is also on.
 	upConsoleBaselineLockMode = baseline.DefaultLockMode
+	// upConsoleBaselineLockModeErr holds an invalid BINTRAIL_CONSOLE_BASELINE_LOCK_MODE
+	// so the baseline supervisor can refuse with it. Startup is NOT failed:
+	// see the parse site in resolveUpConsoleEnv.
+	upConsoleBaselineLockModeErr error
 	// upConsoleVerifyTrigger opts into in-process bintrail verify runs from the
 	// console (#677). Env-only (BINTRAIL_CONSOLE_VERIFY_TRIGGER=1) — off by
 	// default for a bare `watch` invocation; unlike baseline-trigger it starts
@@ -446,6 +450,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	var baselineSup *baselineSupervisor
 	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
 		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselineLockMode)
+		baselineSup.configErr = upConsoleBaselineLockModeErr
 	}
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = baselineSup
@@ -645,6 +650,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	var baselineSup *baselineSupervisor
 	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
 		baselineSup = newBaselineSupervisor(ctx, baselineStagingDir(), upConsoleBaselineLockMode)
+		baselineSup.configErr = upConsoleBaselineLockModeErr
 	}
 	if upConsoleBaselineTrigger {
 		cfg.BaselineCtrl = baselineSup
@@ -900,16 +906,26 @@ func resolveUpConsoleEnv(cmd *cobra.Command) error {
 		upBaselineStageDir = v
 	}
 	// Lock mode defaults to point-consistent (baseline.DefaultLockMode). The
-	// legacy BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT=1 opt-in is still read
-	// so an operator who set it keeps working, but it now names the default
-	// and only the explicit lock-mode variable can select a weaker one — an
-	// operator must ASK for a snapshot that can be torn.
+	// pre-#1377 BINTRAIL_CONSOLE_BASELINE_POINT_CONSISTENT opt-in is gone: it
+	// selected what is now the default, so an operator who set it keeps the
+	// behaviour they asked for and needs no migration. Only this variable can
+	// select a WEAKER mode — a snapshot that can be torn has to be asked for.
 	if v := os.Getenv("BINTRAIL_CONSOLE_BASELINE_LOCK_MODE"); v != "" {
 		m, err := baseline.ParseLockMode(v)
 		if err != nil {
-			return fmt.Errorf("BINTRAIL_CONSOLE_BASELINE_LOCK_MODE: %w", err)
+			// Refuse BASELINES, not the daemon. Under `watch` this process is
+			// also the capture plane, so failing startup over a baseline
+			// setting would turn a typo into permanently lost events — the
+			// same trap that made a refresh-only daemon refuse to boot. The
+			// error is carried to the baseline supervisor, which returns it
+			// from every Trigger, so it lands in baseline status where the
+			// operator is looking.
+			upConsoleBaselineLockModeErr = fmt.Errorf("BINTRAIL_CONSOLE_BASELINE_LOCK_MODE: %w", err)
+			slog.Error("console: baselines disabled by an invalid lock mode; capture is unaffected",
+				"error", upConsoleBaselineLockModeErr)
+		} else {
+			upConsoleBaselineLockMode = m
 		}
-		upConsoleBaselineLockMode = m
 	}
 	// Verify trigger is env-only (no flag), same shape as baseline trigger.
 	if v := os.Getenv("BINTRAIL_CONSOLE_VERIFY_TRIGGER"); v == "1" || v == "true" {

@@ -425,9 +425,14 @@ inconclusive results land, and drill into a mismatch — see
 
 Notes:
 
-- The dump uses mydumper light locking (`--sync-thread-lock-mode NO_LOCK
+- The dump is **point-consistent** by default (`--sync-thread-lock-mode FTWRL
   --trx-tables`, available since mydumper 0.18 — the pinned image is recent)
-  — same flags as `bintrail dump`. It still reads every row of the selected
+  — same default as `bintrail dump`. FTWRL holds one global read lock only
+  long enough for every worker to open its snapshot at the same instant, and
+  needs `RELOAD`/`FLUSH_TABLES` (plus `BACKUP_ADMIN` on MySQL/Percona 8.0+).
+  Set `BASELINE_LOCK_MODE=safe-no-lock` to dump without those privileges (it
+  aborts rather than write a torn snapshot, so expect it to refuse on a
+  write-active source) or `=no-lock` to accept a torn one. It still reads every row of the selected
   schemas; schedule it off-peak for large sources. On sources with
   non-transactional tables (MyISAM), the binlog coordinates embedded in the
   snapshot may not exactly match those tables' data — the same caveat as
