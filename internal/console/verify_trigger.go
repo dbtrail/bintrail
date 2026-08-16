@@ -18,6 +18,18 @@ var ErrVerifyRunning = errors.New("a verify run is already running for this serv
 // a newer run has since replaced it. The handler maps it to 404.
 var ErrExplainUnavailable = errors.New("no explainable mismatch for this table — run a baseline-anchored verify first, or this table was not reported as a mismatch by the last run")
 
+// ErrExplainRunning is returned by VerifyController.Explain while the
+// drill-down for that table is still being computed. The handler maps it to
+// 202 Accepted, and the caller polls the same URL until it answers 200.
+//
+// This exists because the drill-down RE-RECONSTRUCTS the table (#1375): on a
+// large table that is minutes of DuckDB work, which outlives any fronting
+// proxy's read timeout. Answering synchronously meant the operator's only
+// possible experience was a request that died in the proxy — a button that
+// silently did nothing. The work now runs on the daemon like a verify run
+// does, and the request returns immediately either way.
+var ErrExplainRunning = errors.New("the drill-down for this table is still being computed")
+
 // VerifyController runs bintrail verify's engine in-process for a monitored
 // server (#677) — the same internal/verify functions internal/cli/verify.go
 // calls, looped over a server's tables in a background goroutine so the
@@ -40,6 +52,13 @@ type VerifyController interface {
 	// re-reconstructs the table). Returns ErrExplainUnavailable when no such
 	// run/table exists (including: the last run was live-source, which has no
 	// explain support in the engine).
+	//
+	// It MUST NOT block on the reconstruction (#1375): implementations start
+	// the work in the background and return ErrExplainRunning immediately,
+	// answering with the result on a later call. The reconstruction takes
+	// minutes on a large table, and a synchronous answer cannot outlive a
+	// fronting proxy's read timeout — so a blocking implementation makes the
+	// feature unusable on exactly the tables an operator most needs it for.
 	Explain(serverID, schema, table string) (*VerifyExplanation, error)
 }
 
@@ -308,6 +327,14 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, ErrExplainUnavailable) {
 			writeJSONError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		// 202: the work is running on the daemon; the caller polls this same
+		// URL. Deliberately NOT an error body — a poll tick is a normal
+		// state, and rendering it as a failure is what would put a spurious
+		// "explain failed" in front of an operator who is merely waiting.
+		if errors.Is(err, ErrExplainRunning) {
+			writeJSON(w, http.StatusAccepted, map[string]any{"state": "running"})
 			return
 		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())

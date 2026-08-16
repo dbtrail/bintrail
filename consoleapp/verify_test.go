@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/verify"
@@ -175,5 +176,126 @@ func TestVerifySupervisor_Explain_preconditions(t *testing.T) {
 	s.jobs["baseline"] = &verifyJob{status: console.VerifyStatus{State: "succeeded"}, mode: console.VerifyModeBaselineAnchored}
 	if _, err := s.Explain("baseline", "wp", "never_mismatched"); !errors.Is(err, console.ErrExplainUnavailable) {
 		t.Errorf("table never cached as a mismatch: err = %v, want ErrExplainUnavailable", err)
+	}
+}
+
+// explainableSupervisor returns a supervisor whose "s1" job has one cached
+// mismatch pair, so Explain gets past its preconditions and starts real work.
+// The index DSN points at a port nothing listens on: the reconstruction fails
+// fast at connect, which is exactly what these tests want — they are about the
+// job LIFECYCLE (running → finished → consumed), not about the diff engine.
+func explainableSupervisor(t *testing.T) *verifySupervisor {
+	t.Helper()
+	s := newVerifySupervisor(context.Background(), nil, nil)
+	s.jobs["s1"] = &verifyJob{
+		status:   console.VerifyStatus{State: "succeeded"},
+		mode:     console.VerifyModeBaselineAnchored,
+		indexDSN: "u:p@tcp(127.0.0.1:1)/idx",
+		pairs:    map[string]verify.BaselinePair{"wp.posts": {}},
+	}
+	return s
+}
+
+// waitExplain polls Explain the way the console does, returning the first
+// answer that is not "still running".
+func waitExplain(t *testing.T, s *verifySupervisor, schema, table string) (*console.VerifyExplanation, error) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		ex, err := s.Explain("s1", schema, table)
+		if !errors.Is(err, console.ErrExplainRunning) {
+			return ex, err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("explain never left the running state")
+	return nil, nil
+}
+
+// TestVerifySupervisor_ExplainIsAsync pins #1375's core contract: Explain
+// returns immediately with ErrExplainRunning and delivers the outcome on a
+// later call. A blocking implementation cannot outlive a fronting proxy's
+// read timeout, which made the button look dead on exactly the large tables
+// the drill-down exists for.
+func TestVerifySupervisor_ExplainIsAsync(t *testing.T) {
+	s := explainableSupervisor(t)
+
+	if _, err := s.Explain("s1", "wp", "posts"); !errors.Is(err, console.ErrExplainRunning) {
+		t.Fatalf("first call: err = %v, want ErrExplainRunning (it must not block on the reconstruction)", err)
+	}
+
+	// The work fails at connect (nothing listens on port 1), so the terminal
+	// answer is that error — surfaced, not swallowed, and not ErrExplainRunning.
+	_, err := waitExplain(t, s, "wp", "posts")
+	if err == nil {
+		t.Fatal("finished explain returned no error although the index is unreachable")
+	}
+	if errors.Is(err, console.ErrExplainRunning) || errors.Is(err, console.ErrExplainUnavailable) {
+		t.Errorf("terminal err = %v, want the underlying failure", err)
+	}
+
+	// Reading a finished job consumes it, so a retry re-runs instead of
+	// replaying the old failure forever.
+	s.mu.Lock()
+	_, still := s.explains[explainKey("s1", "wp", "posts")]
+	s.mu.Unlock()
+	if still {
+		t.Error("finished explain stayed cached; a retry would replay the stale error instead of re-running")
+	}
+}
+
+// TestVerifySupervisor_ExplainReentryGuard: polling (or an impatient second
+// click) must not launch a second reconstruction of the same table — that is
+// minutes of DuckDB work per extra job on a shared daemon.
+func TestVerifySupervisor_ExplainReentryGuard(t *testing.T) {
+	s := explainableSupervisor(t)
+	// Pre-seed an in-flight job so the guard is exercised without racing a
+	// real one to completion.
+	key := explainKey("s1", "wp", "posts")
+	s.mu.Lock()
+	first := &explainJob{}
+	s.explains[key] = first
+	s.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		if _, err := s.Explain("s1", "wp", "posts"); !errors.Is(err, console.ErrExplainRunning) {
+			t.Fatalf("poll %d: err = %v, want ErrExplainRunning", i, err)
+		}
+	}
+	s.mu.Lock()
+	got, ok := s.explains[key]
+	n := len(s.explains)
+	s.mu.Unlock()
+	if !ok || got != first {
+		t.Error("a poll replaced the in-flight job — a second reconstruction was started")
+	}
+	if n != 1 {
+		t.Errorf("explains has %d entries, want 1", n)
+	}
+}
+
+// TestVerifySupervisor_ExplainInvalidatedByNewRun: an explanation belongs to
+// the BaselinePair of the run that produced its verdict, so a new run must
+// drop it. Serving it afterwards would explain a mismatch the displayed
+// results no longer claim.
+func TestVerifySupervisor_ExplainInvalidatedByNewRun(t *testing.T) {
+	s := explainableSupervisor(t)
+	s.mu.Lock()
+	s.explains[explainKey("s1", "wp", "posts")] = &explainJob{done: true, result: &console.VerifyExplanation{Schema: "wp", Table: "posts"}}
+	s.explains[explainKey("other", "wp", "posts")] = &explainJob{done: true, result: &console.VerifyExplanation{Schema: "wp", Table: "posts"}}
+	s.mu.Unlock()
+
+	if _, err := s.begin(console.VerifyRequest{ServerID: "s1", Mode: console.VerifyModeBaselineAnchored}, console.VerifyTriggerManual); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	s.mu.Lock()
+	_, stale := s.explains[explainKey("s1", "wp", "posts")]
+	_, otherKept := s.explains[explainKey("other", "wp", "posts")]
+	s.mu.Unlock()
+	if stale {
+		t.Error("a new run left the previous run's drill-down cached")
+	}
+	if !otherKept {
+		t.Error("a run on one server dropped another server's cached drill-down")
 	}
 }

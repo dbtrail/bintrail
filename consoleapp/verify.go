@@ -46,6 +46,39 @@ type verifySupervisor struct {
 
 	mu   sync.Mutex
 	jobs map[string]*verifyJob
+	// explains caches the on-demand drill-downs, keyed serverID|schema|table.
+	// Guarded by mu like jobs. Cleared for a server when a new run begins:
+	// an explanation belongs to the BaselinePair of the run that produced the
+	// verdict, so serving one across runs would explain a mismatch nobody is
+	// looking at any more.
+	explains map[string]*explainJob
+}
+
+// explainJob is one table's drill-down: in flight, or finished with a result
+// or an error. Written by the goroutine Explain starts, read by later polls —
+// every field under verifySupervisor.mu.
+//
+// The error is KEPT rather than discarded so a failed reconstruction reports
+// its reason on the next poll instead of silently restarting forever (the
+// poller would otherwise see "running" for as long as the operator waits).
+// Reading a finished job CONSUMES it, so a retry re-runs rather than
+// re-serving a stale failure.
+type explainJob struct {
+	done   bool
+	result *console.VerifyExplanation
+	err    error
+}
+
+// maxCachedExplains bounds the cache. Explanations carry rendered text and up
+// to the engine's per-table diff cap, so they are not free; a run's mismatch
+// list is the realistic upper bound on distinct keys and this sits above it.
+// Overflow drops the whole cache rather than guessing which entry matters —
+// a dropped entry costs one recomputation, and a stale-eviction policy here
+// would be more machinery than the payload deserves.
+const maxCachedExplains = 16
+
+func explainKey(serverID, schema, table string) string {
+	return serverID + "|" + schema + "." + table
 }
 
 // verifyJob is the mutable per-server job state: the pollable status PLUS the
@@ -83,7 +116,11 @@ type verifyJob struct {
 // history and onFinish may be nil (runs are then not recorded / not
 // observed); both are fixed at construction on purpose — see their fields.
 func newVerifySupervisor(ctx context.Context, history *console.VerifyHistory, onFinish func(console.VerifyRunRecord)) *verifySupervisor {
-	return &verifySupervisor{ctx: ctx, history: history, onFinish: onFinish, jobs: make(map[string]*verifyJob)}
+	return &verifySupervisor{
+		ctx: ctx, history: history, onFinish: onFinish,
+		jobs:     make(map[string]*verifyJob),
+		explains: make(map[string]*explainJob),
+	}
 }
 
 // Trigger starts a verify run in the background; returns
@@ -124,6 +161,16 @@ func (s *verifySupervisor) begin(req console.VerifyRequest, trigger string) (str
 	if baselineSrc == "" {
 		baselineSrc = req.BaselineS3
 	}
+	// A new run invalidates this server's cached drill-downs: each belongs to
+	// the BaselinePair of the run that produced its verdict, so serving one
+	// afterwards would explain a mismatch the displayed results no longer
+	// claim. In-flight entries go too — their goroutine finds the key gone
+	// and drops the result.
+	for k := range s.explains {
+		if strings.HasPrefix(k, req.ServerID+"|") {
+			delete(s.explains, k)
+		}
+	}
 	s.jobs[req.ServerID] = &verifyJob{
 		status:     console.VerifyStatus{State: console.VerifyStateRunning, Mode: req.Mode, Since: nowStamp()},
 		mode:       req.Mode,
@@ -154,12 +201,31 @@ func (s *verifySupervisor) Status(serverID string) console.VerifyStatus {
 // comment). It opens its own short-lived index connection: the triggering
 // run's connection is already closed by the time an operator clicks Explain.
 func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.VerifyExplanation, error) {
+	key := explainKey(serverID, schema, table)
+
 	// Copy everything needed out of the job under the SAME critical section:
 	// j.pairs is a plain map, mutated by cachePair from the run's goroutine
 	// while a run is still in flight (mismatches on later tables cache in
 	// after earlier ones have already been polled/explained) — reading it
 	// after releasing the lock would race that write.
 	s.mu.Lock()
+	if ej, ok := s.explains[key]; ok {
+		if !ej.done {
+			// Already computing: report that instead of starting a second
+			// reconstruction of the same table. This is the re-entry guard —
+			// without it every poll tick would launch another minutes-long
+			// DuckDB job on a shared daemon.
+			s.mu.Unlock()
+			return nil, console.ErrExplainRunning
+		}
+		// Finished entries are CONSUMED on read: a retry after a failure
+		// re-runs the work instead of replaying the old error forever, and a
+		// delivered result stops holding its rendered text.
+		delete(s.explains, key)
+		s.mu.Unlock()
+		return ej.result, ej.err
+	}
+
 	j, ok := s.jobs[serverID]
 	var (
 		indexDSN  string
@@ -171,11 +237,43 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 		indexDSN, noArchive = j.indexDSN, j.noArchive
 		pair, pairOK = j.pairs[schema+"."+table]
 	}
-	s.mu.Unlock()
 	if !pairOK {
+		s.mu.Unlock()
 		return nil, console.ErrExplainUnavailable
 	}
+	if len(s.explains) >= maxCachedExplains {
+		// Evict only FINISHED entries: dropping an in-flight one would throw
+		// away work that is still running and make the next poll start it
+		// again, which on a big table is exactly the pile-up this cache
+		// exists to prevent.
+		for k, ej := range s.explains {
+			if ej.done {
+				delete(s.explains, k)
+			}
+		}
+	}
+	s.explains[key] = &explainJob{}
+	s.mu.Unlock()
 
+	go func() {
+		res, err := s.explainNow(indexDSN, noArchive, schema, table, pair)
+		s.mu.Lock()
+		// Gone means a newer run (or an eviction) invalidated this key while
+		// the work ran: the result belongs to a verdict nobody is showing any
+		// more, so drop it rather than serve it.
+		if ej, ok := s.explains[key]; ok {
+			ej.result, ej.err, ej.done = res, err, true
+		}
+		s.mu.Unlock()
+	}()
+	return nil, console.ErrExplainRunning
+}
+
+// explainNow performs the reconstruction and row-level diff. It is the old
+// synchronous body of Explain, called on the goroutine Explain starts; it
+// takes everything it needs by value so it holds no lock and touches no
+// supervisor state.
+func (s *verifySupervisor) explainNow(indexDSN string, noArchive bool, schema, table string, pair verify.BaselinePair) (*console.VerifyExplanation, error) {
 	db, err := config.Connect(indexDSN)
 	if err != nil {
 		return nil, fmt.Errorf("connect index: %w", err)

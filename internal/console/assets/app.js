@@ -2006,7 +2006,13 @@ function setSelectWhenReady(form, name, value, cb) {
   }, 50);
 }
 
-// ── busy modal for the Restore actions (#1363) ───────────────────────────────
+// ── busy modal for long actions (#1363, generalized in #1375) ────────────────
+//
+// Originally Restore-only, hence the recover-flavored default note. Verify's
+// Explain reuses it (#1375) because it has the identical shape: one click
+// starts minutes of work with nothing to show, and the failure mode is an
+// operator concluding the button is dead. Callers that are not a form pass
+// opts.disable (the elements to hold disabled) instead of a form element.
 //
 // Generate-undo (and Preview, which sits on the same latency) used to give no
 // feedback until the fetch returned — seconds, when the window reaches
@@ -2020,19 +2026,19 @@ function setSelectWhenReady(form, name, value, cb) {
 // in-flight fetch via AbortController. Errors render IN the modal with the
 // server's own actionable text — never a silently-vanished overlay.
 
-let recoverBusyOpen = false; // one click = one generation (re-entry guard)
+let busyModalOpen = false; // one click = one generation (re-entry guard)
 
-// recoverBusyActive is the re-entry guard READ, and it self-heals: the shared
+// busyModalActive is the re-entry guard READ, and it self-heals: the shared
 // #modal slot has other occupants (Manage servers, the rotation dialog) that
 // replace its children without our teardown, so a set flag with no
 // .busy-modal actually in the slot is stale — honoring it would wedge every
 // future Generate/Preview click silently. The isConnected guards in
-// openRecoverBusy tear down on the next keystroke; this covers the click
+// openBusyModal tear down on the next keystroke; this covers the click
 // path that arrives first.
-function recoverBusyActive() {
-  if (!recoverBusyOpen) return false;
+function busyModalActive() {
+  if (!busyModalOpen) return false;
   if (document.querySelector("#modal .busy-modal")) return true;
-  recoverBusyOpen = false;
+  busyModalOpen = false;
   return false;
 }
 
@@ -2046,16 +2052,19 @@ function recoverBusyFacts(f) {
   return facts;
 }
 
-// openRecoverBusy opens the busy dialog and disables the form's action
+// openBusyModal opens the busy dialog and disables the form's action
 // buttons until it closes. Returns {close(refocus), showError(err)}; Cancel
 // and ESC run opts.onCancel (the fetch abort) and restore focus to the
 // element that had it. Accessibility: role="dialog", aria-busy while working,
 // focus trapped inside, focus restored on cancel/dismiss.
-function openRecoverBusy(form, opts) {
-  recoverBusyOpen = true;
+function openBusyModal(form, opts) {
+  busyModalOpen = true;
   const mount = document.getElementById("modal");
   const trigger = document.activeElement;
-  const actions = $all(".filter-actions button", form);
+  // A form caller disables its action row; a non-form caller (Explain) names
+  // the elements itself. Either way SOMETHING visibly stops accepting clicks,
+  // which is half of what tells an operator the click registered.
+  const actions = opts.disable || (form ? $all(".filter-actions button", form) : []);
   actions.forEach((b) => { b.disabled = true; });
 
   const scrim = el("div", { class: "modal-scrim show" });
@@ -2069,7 +2078,7 @@ function openRecoverBusy(form, opts) {
   (opts.facts || []).forEach(([k, v]) => facts.append(el("div", { class: "busy-fact" },
     el("span", { class: "bf-k", text: k }), el("span", { class: "bf-v", text: v }))));
   body.append(facts);
-  body.append(el("p", { class: "busy-note", text:
+  body.append(el("p", { class: "busy-note", text: opts.note ||
     "Reading indexed changes — a window that reaches archived hours can take a few seconds." }));
   const foot = el("div", { class: "modal-foot" });
   const cancelBtn = el("button", { class: "btn", type: "button", text: "Cancel", onclick: () => cancel() });
@@ -2115,7 +2124,7 @@ function openRecoverBusy(form, opts) {
     document.removeEventListener("keydown", onKey, true);
     scrim.remove();
     actions.forEach((b) => { b.disabled = false; });
-    recoverBusyOpen = false;
+    busyModalOpen = false;
     return true;
   };
   const restoreFocus = () => {
@@ -2152,7 +2161,7 @@ function openRecoverBusy(form, opts) {
 }
 
 async function previewRecover(form) {
-  if (recoverBusyActive()) return; // shares the one-in-flight guard with Generate (#1363)
+  if (busyModalActive()) return; // shares the one-in-flight guard with Generate (#1363)
   const gen = serverGen;
   const container = $("#recover-preview", VIEW());
   const warns = $("#recover-warnings", VIEW());
@@ -2166,7 +2175,7 @@ async function previewRecover(form) {
   params.limit = "1000";
   params.order = "desc";
   const ctrl = new AbortController();
-  const busy = openRecoverBusy(form, {
+  const busy = openBusyModal(form, {
     title: "Previewing affected rows",
     errTitle: "Couldn't preview the rows",
     facts: recoverBusyFacts(params),
@@ -2228,7 +2237,7 @@ async function previewRecover(form) {
 }
 
 async function generateUndo(form) {
-  if (recoverBusyActive()) return; // one click = one generation (#1363)
+  if (busyModalActive()) return; // one click = one generation (#1363)
   const gen = serverGen;
   const warns = $("#recover-warnings", VIEW());
   const out = $("#recover-out", VIEW());
@@ -2237,7 +2246,7 @@ async function generateUndo(form) {
   ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) body[k] = f[k].trim(); });
   if (!body.schema) { renderError(out, "Choose at least a schema to search."); return; }
   const ctrl = new AbortController();
-  const busy = openRecoverBusy(form, {
+  const busy = openBusyModal(form, {
     title: "Generating undo SQL",
     errTitle: "Couldn't generate the undo SQL",
     facts: recoverBusyFacts(body),
@@ -3758,7 +3767,7 @@ function renderVerifyResults(container, status, id) {
       el("div", { class: "dc-name", text: r.schema + "." + r.table + " — " + r.status + (r.reason ? " — " + r.reason : "") }));
     if (r.explainable) {
       const explainBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Explain" });
-      explainBtn.onclick = () => openVerifyExplain(id, r.schema, r.table);
+      explainBtn.onclick = () => openVerifyExplain(id, r.schema, r.table, explainBtn);
       body.append(explainBtn);
     }
     card.append(body);
@@ -3769,15 +3778,49 @@ function renderVerifyResults(container, status, id) {
 
 // openVerifyExplain fetches and shows the row-level drill-down for one
 // mismatched table, re-using the modal chrome showRotationDialog established.
-async function openVerifyExplain(id, schema, table) {
+async function openVerifyExplain(id, schema, table, btn) {
+  if (busyModalActive()) return; // one drill-down at a time (#1375)
+  const gen = serverGen;
+  const ctrl = new AbortController();
+  const busy = openBusyModal(null, {
+    title: "Working out what differs",
+    errTitle: "Couldn't explain this mismatch",
+    facts: [["table", schema + "." + table]],
+    note: "Rebuilding this table from the older snapshot and its change log to diff it row by row — minutes on a large table. " +
+      "The work continues on the server; closing this only stops the waiting.",
+    disable: btn ? [btn] : [],
+    onCancel: () => ctrl.abort(),
+  });
+
+  // The server answers 202 while the reconstruction runs and 200 with the
+  // drill-down once it lands (#1375), so this polls instead of holding one
+  // long request open — a synchronous answer could not outlive a fronting
+  // proxy's read timeout, which is what made this button look dead.
+  const url = "/api/servers/" + encodeURIComponent(id) + "/verify/explain" +
+    "?schema=" + encodeURIComponent(schema) + "&table=" + encodeURIComponent(table);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let ex;
-  try {
-    ex = (await api("/api/servers/" + encodeURIComponent(id) + "/verify/explain" +
-      "?schema=" + encodeURIComponent(schema) + "&table=" + encodeURIComponent(table))).explain;
-  } catch (err) {
-    toast("Explain failed: " + ((err && err.message) || err));
+  // ~20 minutes at 2s, the same cap and cadence pollVerify uses.
+  for (let i = 0; i < 600; i++) {
+    let res;
+    try {
+      res = await api(url, { signal: ctrl.signal });
+    } catch (err) {
+      if (err && err.name === "AbortError") return; // Cancel/ESC already tore the modal down
+      busy.showError(err);
+      return;
+    }
+    if (gen !== serverGen) { busy.close(); return; }
+    if (res && res.explain) { ex = res.explain; break; }
+    // 202 → still running. api() returns the {state:"running"} body.
+    await sleep(2000);
+  }
+  if (!ex) {
+    busy.showError(new Error(
+      "still working after 20 minutes — it keeps running on the server, so reopening Explain later will show the result."));
     return;
   }
+  busy.close();
   const mount = document.getElementById("modal");
   const scrim = el("div", { class: "modal-scrim show" });
   const modal = el("div", { class: "modal vfy-explain-modal", role: "dialog", "aria-label": "Verify mismatch drill-down" });

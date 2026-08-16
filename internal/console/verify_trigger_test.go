@@ -460,6 +460,31 @@ func TestVerifyExplain_unavailable(t *testing.T) {
 	}
 }
 
+// TestVerifyExplain_running: while the drill-down is being computed the
+// handler answers 202 with a plain running state — NOT an error body (#1375).
+// A poll tick is a normal state; rendering it as a failure would put a
+// spurious "explain failed" in front of an operator who is merely waiting,
+// which is the shape this whole change exists to remove.
+func TestVerifyExplain_running(t *testing.T) {
+	srv, ctrl := newVerifyTriggerServer(t)
+	ctrl.explainErr = ErrExplainRunning
+	id := addVerifyEntry(t, srv, "u:p@tcp(127.0.0.1:3306)/", "s3://b/baselines/", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/servers/"+id+"/verify/explain?schema=wp&table=posts", "")
+	if rec.Code != 202 {
+		t.Fatalf("running: code=%d body=%s, want 202", rec.Code, body)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("body not JSON: %v (%s)", err, body)
+	}
+	if resp["state"] != "running" {
+		t.Errorf("body = %s, want state=running", body)
+	}
+	if _, isErr := resp["error"]; isErr {
+		t.Errorf("202 carries an error field (%s) — a poll tick must not read as a failure", body)
+	}
+}
+
 // TestVerifyExplain_happy: a successful drill-down round-trips through JSON.
 func TestVerifyExplain_happy(t *testing.T) {
 	srv, ctrl := newVerifyTriggerServer(t)

@@ -506,7 +506,13 @@ results a `verify` cron/CI run produced elsewhere:
   baseline-anchored run gets an **Explain** button — an on-demand,
   never-precomputed row-level drill-down (`--explain`'s console equivalent),
   re-run only when clicked. Live-source mismatches have no explain support
-  (mirroring the CLI).
+  (mirroring the CLI). Because it REBUILDS the table to diff it, the work
+  runs on the daemon and the console polls for it — minutes on a large
+  table — behind a busy dialog that says so. Closing that dialog only stops
+  the waiting: the drill-down keeps computing, and reopening **Explain**
+  picks up the finished result. A new verify run discards the previous
+  run's drill-downs, since each explains the snapshot pair its own run
+  compared.
 - **Check recovery inputs** is the console face of
   [`bintrail verify --check recover`](verify.md): index-only — no baseline
   and no source read — walking each primary key's event chain over the last

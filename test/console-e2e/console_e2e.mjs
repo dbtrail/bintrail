@@ -1764,7 +1764,7 @@ try {
       // The click path can arrive before any keystroke: the re-entry guard
       // must self-heal on read when the flag is set but no .busy-modal is in
       // the slot.
-      const selfHealed = !recoverBusyActive() && !recoverBusyOpen;
+      const selfHealed = !busyModalActive() && !busyModalOpen;
       document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }));
       await sleep(80);
       const clobberLeg = {
@@ -1772,7 +1772,7 @@ try {
         busyGone,
         selfHealed,
         btnEnabled: !genBtn.disabled,
-        flagReset: !recoverBusyOpen,
+        flagReset: !busyModalOpen,
         serversIntact: !!document.getElementById("servers-list"),
       };
       closeServersModal();
@@ -1869,9 +1869,9 @@ try {
   // Scenario 17b — the reduced-motion arm (#1363, same rule as the #1353
   // skeletons): under prefers-reduced-motion the CSS animation is replaced by
   // the static note; under no-preference the animation shows and the note
-  // hides. Driven through the REAL openRecoverBusy against emulated media.
+  // hides. Driven through the REAL openBusyModal against emulated media.
   const rmProbe = async () => page.evaluate(() => {
-    const busy = openRecoverBusy(document.getElementById("recover-form"),
+    const busy = openBusyModal(document.getElementById("recover-form"),
       { title: "probe", errTitle: "probe", facts: [], onCancel: () => {} });
     const res = {
       anim: getComputedStyle(document.querySelector("#modal .busy-anim")).display,
