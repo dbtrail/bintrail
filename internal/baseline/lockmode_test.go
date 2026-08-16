@@ -1,0 +1,89 @@
+package baseline
+
+import "testing"
+
+// TestDefaultLockModeIsPointConsistent is the guard the whole change exists
+// for. A baseline is the seed state reconstruct merges deltas onto, so a
+// default that can hand back a torn snapshot makes every downstream answer
+// quietly untrustworthy. If someone flips this back, this test says why it
+// matters rather than just that a constant moved.
+func TestDefaultLockModeIsPointConsistent(t *testing.T) {
+	if !DefaultLockMode.PointConsistent() {
+		t.Fatalf("DefaultLockMode = %s, which can emit a torn snapshot; a baseline that may be stitched from several instants is not a backup", DefaultLockMode)
+	}
+	if DefaultLockMode != LockModeFTWRL {
+		t.Errorf("DefaultLockMode = %s, want %s: safe-no-lock aborts on any write-active source, so it cannot be the default", DefaultLockMode, LockModeFTWRL)
+	}
+}
+
+func TestLockModeMydumperValue(t *testing.T) {
+	for _, tc := range []struct {
+		mode LockMode
+		want string
+	}{
+		{LockModeFTWRL, "FTWRL"},
+		{LockModeSafeNoLock, "SAFE_NO_LOCK"},
+		{LockModeNoLock, "NO_LOCK"},
+	} {
+		if got := tc.mode.MydumperValue(); got != tc.want {
+			t.Errorf("%s.MydumperValue() = %q, want %q", tc.mode, got, tc.want)
+		}
+	}
+}
+
+// TestLockModePointConsistent: safe-no-lock counts as point-consistent because
+// it ABORTS rather than write skew, so every snapshot it produces represents
+// one instant. Only no-lock can hand back skew without saying so.
+func TestLockModePointConsistent(t *testing.T) {
+	for mode, want := range map[LockMode]bool{
+		LockModeFTWRL:      true,
+		LockModeSafeNoLock: true,
+		LockModeNoLock:     false,
+	} {
+		if got := mode.PointConsistent(); got != want {
+			t.Errorf("%s.PointConsistent() = %v, want %v", mode, got, want)
+		}
+	}
+}
+
+// TestLockModeNeedsElevatedPrivileges pins the empirical finding: measured
+// against mydumper v1.0.3-1 and MySQL 8.0, FTWRL fails for a SELECT +
+// REPLICATION CLIENT user on LOCK INSTANCE FOR BACKUP, while SAFE_NO_LOCK and
+// NO_LOCK both succeed. Callers use this to probe privileges BEFORE launching
+// mydumper, which segfaults on a half-granted state.
+func TestLockModeNeedsElevatedPrivileges(t *testing.T) {
+	for mode, want := range map[LockMode]bool{
+		LockModeFTWRL:      true,
+		LockModeSafeNoLock: false,
+		LockModeNoLock:     false,
+	} {
+		if got := mode.NeedsElevatedPrivileges(); got != want {
+			t.Errorf("%s.NeedsElevatedPrivileges() = %v, want %v", mode, got, want)
+		}
+	}
+}
+
+// TestParseLockModeRejectsUnknown: a typo must not land on a weaker mode. The
+// difference between these values is whether a wrong answer can ship
+// unannounced, so "close enough" parsing is a correctness bug, not a UX one.
+func TestParseLockModeRejectsUnknown(t *testing.T) {
+	for _, in := range []string{"FTWRL", "ftwrl ", "no_lock", "nolock", "safe", "none", "yes"} {
+		if got, err := ParseLockMode(in); err == nil {
+			t.Errorf("ParseLockMode(%q) = %s with no error; a near-miss must be refused, not guessed", in, got)
+		}
+	}
+}
+
+func TestParseLockMode(t *testing.T) {
+	// Empty means "operator said nothing", which must resolve to the default
+	// rather than to the zero value of the type (which is not a valid mode).
+	if got, err := ParseLockMode(""); err != nil || got != DefaultLockMode {
+		t.Errorf(`ParseLockMode("") = %s, %v; want %s, nil`, got, err, DefaultLockMode)
+	}
+	for _, want := range LockModeValues {
+		got, err := ParseLockMode(string(want))
+		if err != nil || got != want {
+			t.Errorf("ParseLockMode(%q) = %s, %v; want %s, nil", want, got, err, want)
+		}
+	}
+}

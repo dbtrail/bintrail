@@ -280,6 +280,12 @@ services:
       # .env to disable. Staging for S3-destined baselines lives on the state
       # volume.
       BINTRAIL_CONSOLE_BASELINE_TRIGGER: ${BASELINE_TRIGGER:-1}
+      # How a console-triggered baseline syncs mydumper's threads onto one
+      # instant: ftwrl (default, point-consistent), safe-no-lock (no extra
+      # privilege, ABORTS rather than emit a torn snapshot) or no-lock
+      # (accepts a torn snapshot). A baseline is the seed state reconstruct
+      # merges deltas onto, so the weaker modes must be asked for (#1377/#1378).
+      BINTRAIL_CONSOLE_BASELINE_LOCK_MODE: ${BASELINE_LOCK_MODE:-ftwrl}
       BINTRAIL_CONSOLE_BASELINE_STAGING: /var/lib/bintrail/baseline-staging
       # "Run verification" button (#677): lets the console run `bintrail verify`
       # in-process for a monitored server (trigger, poll per-table results,
@@ -560,7 +566,7 @@ services:
         # coordinates `bintrail baseline` embeds in the Parquet.
         set -- --host "$$host" --port "$$port" --user "$$user" \
           --threads 4 --compress-protocol --complete-insert \
-          --sync-thread-lock-mode NO_LOCK --trx-tables
+          --sync-thread-lock-mode "$${BASELINE_LOCK_MODE_MYDUMPER:-FTWRL}" --trx-tables
         [ -n "$$pass" ] && set -- "$$@" --password "$$pass"
         schemas="$$(printf '%s' "$$BASELINE_SCHEMAS" | tr -d ' ')"
         if [ -n "$$schemas" ]; then

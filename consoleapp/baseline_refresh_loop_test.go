@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
 )
 
@@ -57,7 +58,7 @@ func TestBaselineRefreshTargets_bootNeedsBoth(t *testing.T) {
 // refused to start. It warns instead.
 func TestStartBaselineRefreshLoop_startupContract(t *testing.T) {
 	ctx := context.Background()
-	sup := newBaselineSupervisor(ctx, t.TempDir(), false)
+	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
 
 	for _, tc := range []struct {
 		name     string
@@ -91,7 +92,7 @@ func TestStartBaselineRefreshLoop_startupContract(t *testing.T) {
 // refresh from folding a snapshot another job is writing underneath it. The two
 // job kinds have separate status slots but ONE lock.
 func TestBaselineSupervisor_singleFlightIsShared(t *testing.T) {
-	sup := newBaselineSupervisor(context.Background(), t.TempDir(), false)
+	sup := newBaselineSupervisor(context.Background(), t.TempDir(), baseline.DefaultLockMode)
 
 	// A dump in flight blocks a refresh for the same server...
 	sup.jobs["a"] = &console.BaselineStatus{State: "running"}
@@ -114,7 +115,7 @@ func TestBaselineSupervisor_singleFlightIsShared(t *testing.T) {
 // TestBaselineSupervisor_statusSlotsAreSeparate: a manual dump must not erase
 // the evidence that the automatic refresh has been failing.
 func TestBaselineSupervisor_statusSlotsAreSeparate(t *testing.T) {
-	sup := newBaselineSupervisor(context.Background(), t.TempDir(), false)
+	sup := newBaselineSupervisor(context.Background(), t.TempDir(), baseline.DefaultLockMode)
 	sup.refreshes["a"] = &console.BaselineStatus{State: "failed", LastError: "capture gap"}
 	sup.jobs["a"] = &console.BaselineStatus{State: "succeeded"}
 
@@ -147,7 +148,7 @@ func TestRunBaselineRefreshCycle_survivesAPanic(t *testing.T) {
 func TestRunBaselineRefreshCycle_stopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	sup := newBaselineSupervisor(ctx, t.TempDir(), false)
+	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
 	runBaselineRefreshCycle(ctx, nil, sup, "dsn", "/b")
 	if got := sup.RefreshStatus("default"); got.State != "idle" {
 		t.Fatalf("a cancelled cycle started work: %+v", got)

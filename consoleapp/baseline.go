@@ -36,7 +36,7 @@ type baselineSupervisor struct {
 	// BINTRAIL_CONSOLE_BASELINE_TRIGGER gates the feature itself. No effect on
 	// PostgreSQL baselines (executePG uses pgoutput's own consistent-point LSN
 	// unconditionally).
-	pointConsistent bool
+	lockMode baseline.LockMode
 
 	mu   sync.Mutex
 	jobs map[string]*console.BaselineStatus
@@ -49,11 +49,11 @@ type baselineSupervisor struct {
 // newBaselineSupervisor builds a supervisor bound to the daemon context. The
 // staging dir is created lazily per run. pointConsistent selects the MySQL dump's
 // lock mode for every run this supervisor executes — see the field doc.
-func newBaselineSupervisor(ctx context.Context, stagingDir string, pointConsistent bool) *baselineSupervisor {
+func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode baseline.LockMode) *baselineSupervisor {
 	return &baselineSupervisor{
 		ctx:             ctx,
 		stagingDir:      stagingDir,
-		pointConsistent: pointConsistent,
+		lockMode: lockMode,
 		jobs:            make(map[string]*console.BaselineStatus),
 		refreshes:       make(map[string]*console.BaselineStatus),
 	}
@@ -140,7 +140,7 @@ func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stat
 	// otherwise be misread as UTC verbatim, skewing the replay window by the
 	// host's UTC offset (#768).
 	dumpStartedAt := time.Now().UTC()
-	if err := runMydumper(s.ctx, req.SourceDSN, req.Schemas, dumpDir, s.pointConsistent); err != nil {
+	if err := runMydumper(s.ctx, req.SourceDSN, req.Schemas, dumpDir, s.lockMode); err != nil {
 		return baseline.Stats{}, 0, fmt.Errorf("dump: %w", err)
 	}
 
@@ -245,26 +245,30 @@ func pgBaselineConfig(req console.BaselineRequest, outputDir string) (pgbaseline
 // dumpDir. The image pins the SAME mydumper version the compose baseline-dump
 // pipeline uses, so a console-created baseline matches a CLI/compose one exactly.
 // pointConsistent selects the lock mode — see buildConsoleMydumperArgs.
-func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDir string, pointConsistent bool) error {
+func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDir string, lockMode baseline.LockMode) error {
 	host, port, user, password, err := config.ParseSourceDSN(sourceDSN)
 	if err != nil {
 		return err
 	}
 
-	if pointConsistent {
+	if lockMode.NeedsElevatedPrivileges() {
 		// Hard gate, unlike the NO_LOCK warning below: granting BACKUP_ADMIN
 		// without RELOAD/FLUSH_TABLES does not fail cleanly in mydumper — it
 		// SEGFAULTS (verified against the pinned build, #800). Never skipped.
 		if err := checkPointConsistentPrivileges(ctx, sourceDSN); err != nil {
 			return err
 		}
-	} else {
+	} else if lockMode == baseline.LockModeNoLock {
+		// Only for no-lock. safe-no-lock reaches this branch too, but it
+		// ABORTS on thread skew instead of writing it, so warning about
+		// cross-table inconsistency there would cry wolf about the one
+		// low-privilege mode that cannot produce it.
 		// Best-effort, advisory only — never blocks or fails the dump. See
 		// warnIfMultiTableNoLock.
 		warnIfMultiTableNoLock(ctx, sourceDSN, schemas)
 	}
 
-	args := buildConsoleMydumperArgs(host, port, user, schemas, dumpDir, pointConsistent)
+	args := buildConsoleMydumperArgs(host, port, user, schemas, dumpDir, lockMode)
 	cmd := exec.CommandContext(ctx, "mydumper", args...)
 	// Deliver the source password out of band via MYSQL_PWD (honored by the
 	// MySQL client library mydumper links against) so it never lands on argv,
@@ -350,11 +354,8 @@ const systemSchemaExcludeRegex = `^(?!(mysql|sys|performance_schema|information_
 // The source password is NEVER placed on argv (world-readable via `ps aux` /
 // /proc/<pid>/cmdline); runMydumper delivers it via MYSQL_PWD in the child env
 // (#811).
-func buildConsoleMydumperArgs(host string, port uint16, user string, schemas []string, dumpDir string, pointConsistent bool) []string {
-	syncMode := "NO_LOCK"
-	if pointConsistent {
-		syncMode = "FTWRL"
-	}
+func buildConsoleMydumperArgs(host string, port uint16, user string, schemas []string, dumpDir string, lockMode baseline.LockMode) []string {
+	syncMode := lockMode.MydumperValue()
 	args := []string{
 		"--host", host,
 		"--port", strconv.Itoa(int(port)),

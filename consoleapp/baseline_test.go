@@ -3,6 +3,7 @@ package consoleapp
 import (
 	"context"
 	"database/sql"
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"os"
 	"path/filepath"
 	"slices"
@@ -21,7 +22,7 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 		// These let a least-privilege replication user (no BACKUP_ADMIN/RELOAD)
 		// dump consistently — verified against a real Percona 8.0 source. Their
 		// absence is the bug that produced a schema-only dump.
-		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"x"}, "/out", false)
+		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"x"}, "/out", baseline.LockModeNoLock)
 		if valueAfter(args, "--sync-thread-lock-mode") != "NO_LOCK" {
 			t.Errorf("missing --sync-thread-lock-mode NO_LOCK: %v", args)
 		}
@@ -39,7 +40,7 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 	// stays present: it shortens the FTWRL hold for transactional tables and is
 	// documented as compatible with any --sync-thread-lock-mode value.
 	t.Run("point-consistent mode uses FTWRL", func(t *testing.T) {
-		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"x"}, "/out", true)
+		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"x"}, "/out", baseline.LockModeFTWRL)
 		if valueAfter(args, "--sync-thread-lock-mode") != "FTWRL" {
 			t.Errorf("missing --sync-thread-lock-mode FTWRL: %v", args)
 		}
@@ -52,7 +53,7 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 	})
 
 	t.Run("no schema filter excludes system schemas", func(t *testing.T) {
-		args := buildConsoleMydumperArgs("h", 3306, "u", nil, "/out", false)
+		args := buildConsoleMydumperArgs("h", 3306, "u", nil, "/out", baseline.LockModeNoLock)
 		if has(args, "--database") {
 			t.Errorf("no schema filter must not use --database: %v", args)
 		}
@@ -65,7 +66,7 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 	})
 
 	t.Run("single schema uses --database", func(t *testing.T) {
-		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"wordpress"}, "/out", false)
+		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"wordpress"}, "/out", baseline.LockModeNoLock)
 		if v := valueAfter(args, "--database"); v != "wordpress" {
 			t.Errorf("--database = %q, want wordpress: %v", v, args)
 		}
@@ -75,7 +76,7 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 	})
 
 	t.Run("multiple schemas use anchored --regex", func(t *testing.T) {
-		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"a", "b"}, "/out", false)
+		args := buildConsoleMydumperArgs("h", 3306, "u", []string{"a", "b"}, "/out", baseline.LockModeNoLock)
 		if v := valueAfter(args, "--regex"); v != "^(a|b)\\." {
 			t.Errorf("--regex = %q, want ^(a|b)\\. : %v", v, args)
 		}
@@ -86,10 +87,10 @@ func TestBuildConsoleMydumperArgs(t *testing.T) {
 
 	t.Run("password never appears on argv (#811)", func(t *testing.T) {
 		for _, schemas := range [][]string{nil, {"wordpress"}, {"a", "b"}} {
-			for _, pointConsistent := range []bool{false, true} {
-				args := buildConsoleMydumperArgs("h", 3306, "u", schemas, "/out", pointConsistent)
+			for _, lockMode := range baseline.LockModeValues {
+				args := buildConsoleMydumperArgs("h", 3306, "u", schemas, "/out", lockMode)
 				if has(args, "--password") {
-					t.Errorf("schemas=%v pointConsistent=%v: --password must never appear on argv: %v", schemas, pointConsistent, args)
+					t.Errorf("schemas=%v lockMode=%v: --password must never appear on argv: %v", schemas, lockMode, args)
 				}
 			}
 		}
@@ -324,9 +325,9 @@ exit 0
 	// pointConsistent=false: true would hit checkPointConsistentPrivileges' HARD
 	// gate, which needs a real, successful DB connection+query and would fail
 	// against this fake setup (nothing listens on 127.0.0.1:3306), aborting
-	// before the fake mydumper ever runs. false only triggers the best-effort
-	// NO_LOCK skew warning, whose connection failure is swallowed (Debug-logged).
-	err := runMydumper(context.Background(), "root:"+pw+"@tcp(127.0.0.1:3306)/", nil, filepath.Join(dir, "out"), false)
+	// before the fake mydumper ever runs. no-lock only triggers the best-effort
+	// skew warning, whose connection failure is swallowed (Debug-logged).
+	err := runMydumper(context.Background(), "root:"+pw+"@tcp(127.0.0.1:3306)/", nil, filepath.Join(dir, "out"), baseline.LockModeNoLock)
 	if err != nil {
 		t.Fatalf("runMydumper: %v", err)
 	}
@@ -377,7 +378,7 @@ func TestRunMydumper_pointConsistentPreflightBlocksExecution(t *testing.T) {
 
 	// 127.0.0.1:1 refuses the connection immediately (closed port) so the
 	// preflight's config.Connect fails fast rather than waiting out a timeout.
-	err := runMydumper(context.Background(), "root:pw@tcp(127.0.0.1:1)/", nil, filepath.Join(dir, "out"), true)
+	err := runMydumper(context.Background(), "root:pw@tcp(127.0.0.1:1)/", nil, filepath.Join(dir, "out"), baseline.LockModeFTWRL)
 	if err == nil {
 		t.Fatal("expected an error from the point-consistent preflight, got nil")
 	}

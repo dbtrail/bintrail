@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING (operators without `RELOAD`) — baseline dumps are point-consistent
+  by default** (#1377). `bintrail dump` and the console's **Create baseline**
+  both passed mydumper `--sync-thread-lock-mode NO_LOCK`, which is the mode
+  mydumper's own documentation describes as the choice for when *"you don't
+  need a consistent backup"* — and which it **deprecated in 0.18.1**. Under it
+  each worker thread opens its own snapshot with no barrier between them, so
+  the dumped data could postdate the binlog coordinate recorded beside it. A
+  baseline is the seed state `reconstruct` merges deltas onto, so that skew
+  propagates silently into every reconstruct, verify and drill answer. It also
+  produced real, correct-but-baffling `verify` mismatches: rows present in the
+  newer baseline that replaying the change log to its anchor could not
+  reproduce, because they were written during the dump.
+  - The new `--lock-mode` (CLI) and `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE`
+    (console) select `ftwrl` (the new default, point-consistent),
+    `safe-no-lock` (no elevated privilege; **aborts** rather than emit a torn
+    snapshot, so expect it to refuse on a write-active source) or `no-lock`
+    (accepts a torn snapshot). The weaker modes must now be asked for by name.
+  - `ftwrl` needs `RELOAD`/`FLUSH_TABLES`, plus `BACKUP_ADMIN` on MySQL/Percona
+    8.0+. A source that lacks them now **refuses with an actionable error**
+    naming the alternatives; neither surface downgrades silently. Deployments
+    running as a least-privilege replication user must either grant those
+    privileges or pass `--lock-mode safe-no-lock` / set the console variable.
+  - The compose `baseline` profile follows the same default and gains the
+    passthrough it was missing, so the mode is reachable from the shipped stack
+    at all (#1378) — the previous opt-in existed in the binary but no
+    compose variable mapped to it.
+
 ## [0.57.1] - 2026-08-16
 
 ### Fixed
