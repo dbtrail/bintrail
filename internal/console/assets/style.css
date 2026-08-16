@@ -1042,8 +1042,20 @@ button { font-family: inherit; }
 /* Focus landing for the generated reversal.sql panel header (#1363). */
 .code-head:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
 
-/* table combobox busy hint (#1364) */
-.combo-hint { display: block; margin-top: 4px; font-size: 11.5px; color: var(--ink-3); min-height: 15px; }
+/* table combobox busy hint (#1364). Out of flow (#1369): the filter row
+   aligns fields by their bottom edge (align-items: flex-end), so an in-flow
+   hint — even empty — made the combo field taller than its siblings and
+   pushed its label+input above the row. Absolutely positioned below the
+   field, the field's box matches its siblings whether the hint is empty,
+   loading, or showing a note, and toggling it never shifts the layout.
+   It's a transient note that may overlap content below, hence the surface
+   background + z-index for readability. */
+.field--combo { position: relative; }
+.combo-hint {
+  position: absolute; top: 100%; left: 0; right: 0; margin-top: 3px;
+  font-size: 11.5px; color: var(--ink-3);
+  background: var(--surface); z-index: 1;
+}
 
 /* ============================================================
    tweaks panel (vanilla)

@@ -1334,11 +1334,13 @@ function fieldSelect(label, name, size, isSchema, isTable, options, anyLabel, re
 // datalist on schema change), but a hand-typed name still submits — recover
 // can legitimately target a dropped table whose events are indexed, and a
 // closed <select> would make that recovery impossible from the UI. The
-// combo-hint span is the brief busy note while a listing loads.
+// combo-hint span is the brief busy note while a listing loads; field--combo
+// anchors it OUT of flow (#1369) so the empty hint reserves no height — under
+// .filters' align-items:flex-end it pushed the label+input above the row.
 let tableComboSeq = 0;
 function fieldTableCombo(label, name, size, placeholder) {
   const listId = "table-combo-list-" + (++tableComboSeq);
-  return el("div", { class: "field field--" + size },
+  return el("div", { class: "field field--combo field--" + size },
     fieldLabel(label),
     el("input", { class: "input table-combo", name, placeholder: placeholder || "",
       list: listId, autocomplete: "off", spellcheck: "false" }),

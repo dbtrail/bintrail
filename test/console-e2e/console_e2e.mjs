@@ -1434,6 +1434,19 @@ try {
     const waitFor = async (pred) => { for (let i = 0; i < 80 && !pred(); i++) await sleep(50); return pred(); };
     const pick = (schema) => { f.elements.schema.value = schema; f.elements.schema.dispatchEvent(new Event("change")); };
 
+    // Hint geometry (#1369): the hint is out of flow, so with the hint EMPTY
+    // the combo field's box must match its siblings (under .filters'
+    // align-items:flex-end an in-flow empty hint pushed the label+input above
+    // the row), and SHOWING the hint must not change the field's box. Deltas
+    // are relative to the schema field so the view-enter animation (which
+    // translates the whole filter panel) can't skew a comparison across time.
+    const geom = () => {
+      const c = input.closest(".field").getBoundingClientRect();
+      const s = f.elements.schema.closest(".field").getBoundingClientRect();
+      return { dTop: c.top - s.top, comboH: c.height, sibH: s.height };
+    };
+    const geomEmpty = geom(); // fresh form: hint is empty
+
     // The dropped-table flow: a name typed BEFORE the first schema selection
     // must survive that selection — clearing here would make the one recovery
     // a closed <select> can't do impossible from this combobox too.
@@ -1482,6 +1495,7 @@ try {
     input.value = "typed_under_failure";
     pick(FIX);
     await waitFor(() => /type the table name/.test(hintText()));
+    const geomHint = geom(); // the persistent failure note is showing
     const failed = {
       valueKept: input.value === "typed_under_failure",
       enabled: !input.disabled,
@@ -1503,8 +1517,15 @@ try {
       disabled: input.disabled,
       preseededKept, tablesA, tablesB, clearedOnSwitch, sharedKept,
       keptOnEmpty, clearedViaEmpty, failed, failedSubmit,
+      geomEmpty, geomHint,
     };
   }, FIX);
+  (Math.abs(combo.geomEmpty.dTop) <= 1 && Math.abs(combo.geomEmpty.comboH - combo.geomEmpty.sibH) <= 1)
+    ? ok("restore combo: empty hint reserves no height — field box matches its siblings (#1369)")
+    : bad("restore combo: empty hint reserves no height — field box matches its siblings (#1369)", JSON.stringify(combo.geomEmpty));
+  (Math.abs(combo.geomHint.dTop) <= 1 && Math.abs(combo.geomHint.comboH - combo.geomEmpty.comboH) <= 1)
+    ? ok("restore combo: a showing hint never changes the field box or moves the row (#1369)")
+    : bad("restore combo: a showing hint never changes the field box or moves the row (#1369)", JSON.stringify({ empty: combo.geomEmpty, hint: combo.geomHint }));
   (combo.isInput && combo.hasList)
     ? ok("restore combo: Table is an input+datalist combobox, not a closed select")
     : bad("restore combo: Table is an input+datalist combobox, not a closed select", JSON.stringify(combo));
