@@ -334,6 +334,40 @@ func TestVerifySupervisor_ExplainCancelsInvalidatedWork(t *testing.T) {
 	}
 }
 
+// TestVerifySupervisor_ExplainWorkSeesTheCancel pins the WIRING, not the two
+// halves: that the context Explain hands the work is the one a new run
+// cancels. Both are easy to get right separately and still leave the cancel
+// decorative, which would make explainJob.cancel's promise to stop burning
+// DuckDB false while every other test stayed green.
+func TestVerifySupervisor_ExplainWorkSeesTheCancel(t *testing.T) {
+	s := explainableSupervisor(t)
+	started := make(chan struct{})
+	observed := make(chan error, 1)
+	s.explainFn = func(ctx context.Context, _ string, _ bool, _, _ string, _ verify.BaselinePair) (*console.VerifyExplanation, error) {
+		close(started)
+		<-ctx.Done()
+		observed <- ctx.Err()
+		return nil, ctx.Err()
+	}
+
+	if _, err := s.Explain("s1", "wp", "posts"); !errors.Is(err, console.ErrExplainRunning) {
+		t.Fatalf("Explain: err = %v, want ErrExplainRunning", err)
+	}
+	<-started
+	if _, err := s.begin(console.VerifyRequest{ServerID: "s1", Mode: console.VerifyModeBaselineAnchored}, console.VerifyTriggerManual); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	select {
+	case err := <-observed:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("the work saw %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a new run did not reach the running drill-down: the work is on a context the purge cannot stop, so it keeps burning DuckDB for a result that will be discarded")
+	}
+}
+
 // TestExplainLogVerdict: a canceled drill-down is one WE abandoned, so it
 // must not be reported as a failure. Without this, every scheduled run that
 // overlaps an open drill-down logs an error, and the real failures this

@@ -48,7 +48,8 @@ type verifySupervisor struct {
 	// explainFn overrides the drill-down implementation. Nil in production —
 	// this exists so a test can make the work panic and pin that the recover
 	// in Explain's goroutine holds. Without a seam that guard is untestable,
-	// and it is the one whose failure mode is "a click stops capture".
+	// and it is the one whose failure mode is "a click stops capture". Set it
+	// before the first Explain, never after: it is read outside mu.
 	explainFn func(ctx context.Context, indexDSN string, noArchive bool, schema, table string, pair verify.BaselinePair) (*console.VerifyExplanation, error)
 
 	mu   sync.Mutex
@@ -229,10 +230,13 @@ func (s *verifySupervisor) Status(serverID string) console.VerifyStatus {
 // clicks Explain.
 //
 // It NEVER blocks on the reconstruction (#1375, and VerifyController.Explain
-// requires it). Three answers: the explanation, console.ErrExplainRunning
-// while the work is in flight — the caller polls — or
-// console.ErrExplainUnavailable when no cached pair names this table. A
-// finished job is consumed by the read that delivers it.
+// requires it). Four answers: the explanation; console.ErrExplainRunning
+// while the work is in flight — the caller polls; console.ErrExplainUnavailable
+// when no cached pair names this table; or the finished job's own error, which
+// the handler renders as a 500 and the console treats as terminal. A finished
+// job is consumed by the read that delivers it, error included — so that 500
+// is the ONE delivery of that failure, which is why retrying it client-side
+// would restart the work instead of re-reading it.
 func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.VerifyExplanation, error) {
 	key := explainKey(serverID, schema, table)
 
@@ -292,7 +296,7 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 	s.explains[key] = job
 	s.mu.Unlock()
 
-	run := s.explainNow
+	run := explainNow
 	if s.explainFn != nil {
 		run = s.explainFn
 	}
@@ -327,8 +331,8 @@ func (s *verifySupervisor) Explain(serverID, schema, table string) (*console.Ver
 // reliable delivery path: a poll only sees this result if the operator is
 // still waiting and the key survived. A failure nobody was polling for would
 // otherwise exist nowhere at all, and the daemon log outlives the modal. A
-// successful, still-live result is not logged — that is the case a poll is
-// expected to collect.
+// successful, still-live result drops to Debug — it is the case a poll is
+// expected to collect, so it is a trace, not news.
 func (s *verifySupervisor) finishExplain(key string, job *explainJob, res *console.VerifyExplanation, err error) {
 	s.mu.Lock()
 	cur, ok := s.explains[key]
@@ -346,7 +350,13 @@ func (s *verifySupervisor) finishExplain(key string, job *explainJob, res *conso
 	}
 
 	level, msg := explainLogVerdict(err, live)
-	slog.Log(context.Background(), level, msg, "key", key, "error", err)
+	// No error attr when there is no error: `error=<nil>` on the delivered and
+	// superseded-success lines reads like a failure with a missing reason.
+	if err != nil {
+		slog.Log(context.Background(), level, msg, "key", key, "error", err)
+		return
+	}
+	slog.Log(context.Background(), level, msg, "key", key)
 }
 
 // explainLogVerdict decides how a finished drill-down is reported. Split out
@@ -380,7 +390,13 @@ func explainLogVerdict(err error, live bool) (slog.Level, string) {
 // takes everything it needs as arguments, so it holds no lock and reads no
 // supervisor state. ctx is per-job (derived from the daemon's) so a new run
 // can cancel an abandoned drill-down.
-func (s *verifySupervisor) explainNow(ctx context.Context, indexDSN string, noArchive bool, schema, table string, pair verify.BaselinePair) (*console.VerifyExplanation, error) {
+//
+// Deliberately NOT a method: with no receiver, s.ctx is not in scope, so the
+// per-job ctx cannot be quietly bypassed here — which would leave the cancel
+// wired but decorative, and explainJob.cancel's promise to stop burning
+// DuckDB false. A test could only catch that after the fact; this makes it
+// not compile.
+func explainNow(ctx context.Context, indexDSN string, noArchive bool, schema, table string, pair verify.BaselinePair) (*console.VerifyExplanation, error) {
 	db, err := config.Connect(indexDSN)
 	if err != nil {
 		return nil, fmt.Errorf("connect index: %w", err)

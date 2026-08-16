@@ -3794,7 +3794,7 @@ async function openVerifyExplain(id, schema, table, btn) {
     facts: [["table", schema + "." + table]],
     note: "Rebuilding this table from the older snapshot and its change log to diff it row by row — minutes on a large table. " +
       "The work continues on the server; closing this only stops the waiting. " +
-      "A new verify run discards drill-downs from the previous one — Explain is unavailable until that run finishes.",
+      "A new verify run discards drill-downs from the previous one — Explain is unavailable until a baseline-anchored run reports this table as a mismatch again.",
     disable: btn ? [btn] : [],
     onCancel: () => ctrl.abort(),
   });
@@ -3847,13 +3847,14 @@ async function openVerifyExplain(id, schema, table, btn) {
     await sleep(2000);
   }
   if (!ex) {
-    // NOT showError: after 600 ticks the last answer was a 202, so the daemon
-    // is still working — this loop cannot tell a slow reconstruction from one
-    // that is merely slow, and the red "Couldn't explain this mismatch"
-    // treatment would assert a failure it has not seen. Mirrors
-    // pollBaseline's neutral "check back" toast. The wording promises nothing
-    // about reopening: a scheduled run may have discarded the result, and the
-    // daemon log is where a repeat belongs.
+    // NOT showError: this loop cannot distinguish a STUCK reconstruction from
+    // a merely slow one, and it may have spent its last ticks on tolerated
+    // poll failures rather than 202s (misses resets on any success), so it
+    // cannot even assert the daemon answered recently. Either way the red
+    // "Couldn't explain this mismatch" treatment would claim a failure it has
+    // not seen. Mirrors pollBaseline's neutral "check back" toast. The
+    // wording promises nothing about reopening: a scheduled run may have
+    // discarded the result, and the daemon log is where a repeat belongs.
     busy.close();
     toast("Still waiting after 20 minutes — it continues on the server. Reopen Explain to try again; check the daemon log if this repeats.");
     return;

@@ -516,9 +516,10 @@ results a `verify` cron/CI run produced elsewhere:
   reopening simply recomputes, and nothing is lost but the wait. A new verify
   run is different: it discards (and cancels) the previous run's drill-downs,
   because each explains the snapshot pair its own run compared, and Explain
-  reports no explainable mismatch until that run finishes and reports the
-  table as a mismatch again. Failures are logged by the daemon whether or not
-  anyone is still polling.
+  reports no explainable mismatch until a *baseline-anchored* run reports the
+  table as a mismatch again — a live-source or check-recovery-inputs run
+  clears the drill-downs without being able to replace them. Failures are
+  logged by the daemon whether or not anyone is still polling.
 - **Check recovery inputs** is the console face of
   [`bintrail verify --check recover`](verify.md): index-only — no baseline
   and no source read — walking each primary key's event chain over the last
