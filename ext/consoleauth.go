@@ -12,15 +12,22 @@ import (
 // in-memory session a password login mints, with the same lifetime and
 // revocation behavior.
 //
+// w is the in-flight login response the provider is about to complete: the
+// console sets its HttpOnly session cookie on it (the cookie is how a NEW
+// browser tab authenticates without the sessionStorage token), so the provider
+// must call issue BEFORE writing its response headers. The documented flow —
+// call issue, then redirect to /?token=<token> — already satisfies this.
+//
 // policy scopes what the minted session may do (see AccessPolicy). Pass nil for
 // a full-access session — identical to what the built-in password login and the
 // static token mint. Only an EE build that maps roles onto permissions passes a
 // non-nil policy; the OSS core never does, so its sessions stay full-access.
 //
-// The policy parameter was added when per-session authorization landed. There is
-// no in-repo implementor of this seam, so the signature break is absorbed in one
-// release by the sole external caller (the SSO provider in the EE build).
-type ConsoleSessionIssuer func(identity string, policy *AccessPolicy) (token string, expiresAt time.Time, err error)
+// The policy parameter was added when per-session authorization landed, and w
+// when the session cookie did. There is no in-repo implementor of this seam, so
+// each signature break is absorbed in one release by the sole external caller
+// (the SSO provider in the embedding build).
+type ConsoleSessionIssuer func(w http.ResponseWriter, identity string, policy *AccessPolicy) (token string, expiresAt time.Time, err error)
 
 // ConsoleAuthProvider plugs an external authentication flow (e.g. OIDC
 // single sign-on) into the web console's login surface. The console stays

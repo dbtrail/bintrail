@@ -482,7 +482,9 @@ func (s *Server) selectedEntry(r *http.Request) (ServerEntry, bool) {
 //   - the static shell and assets are served without a token, so a browser
 //     can load the page and read its bootstrap token from the URL
 //   - every /api/* route except healthz, the auth probe, and login requires a
-//     bearer credential (static token or login session)
+//     credential (static token or login session), presented as a Bearer
+//     header or as the HttpOnly session cookie a login sets (#1370; see
+//     tokenMiddleware for the precedence and the cookie CSRF belt)
 func (s *Server) buildHandler() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/status", s.handleStatus)

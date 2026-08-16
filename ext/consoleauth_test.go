@@ -9,7 +9,7 @@ import (
 // The issuer contract is a plain func type — keep a compile-time pin on its
 // exact shape so an accidental signature change fails here, not only in the
 // console wiring.
-var _ ConsoleSessionIssuer = func(string, *AccessPolicy) (string, time.Time, error) {
+var _ ConsoleSessionIssuer = func(http.ResponseWriter, string, *AccessPolicy) (string, time.Time, error) {
 	return "", time.Time{}, nil
 }
 

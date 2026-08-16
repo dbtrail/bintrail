@@ -41,6 +41,58 @@ func bearerToken(r *http.Request) string {
 	return h[len(prefix):]
 }
 
+// sessionCookieName carries the login session token as an HttpOnly cookie, so
+// a NEW browser tab (whose sessionStorage is empty — it is per-tab) arrives
+// already authenticated. The cookie value IS the session token the login
+// response also returns as JSON: same store, same expiry, same policy —
+// nothing new is persisted server-side.
+const sessionCookieName = "bintrail_session"
+
+// sessionCookieToken returns the session cookie's value, or "" when absent.
+func sessionCookieToken(r *http.Request) string {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return ""
+	}
+	return c.Value
+}
+
+// setSessionCookie attaches the issued session token to a login response.
+// HttpOnly keeps it out of script reach; SameSite=Lax withholds it on
+// cross-site POSTs (the first CSRF layer — see tokenMiddleware for the belt);
+// Secure is safe for the local first-run flow because browsers treat loopback
+// as a secure context, and matters behind a TLS-terminating proxy (documented
+// in docs/console.md). Max-Age mirrors the session's absolute expiry; the
+// idle TTL may end the session earlier, which the middleware enforces — a
+// cookie outliving its session is just a refused credential.
+func setSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(time.Until(expires) / time.Second),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// clearSessionCookie expires the session cookie (Max-Age=0 on the wire), so a
+// logout kills every tab, not just the one that clicked it. Attributes match
+// setSessionCookie — a clear that differs in Path would leave the original
+// cookie standing.
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
 // authKind records, in the request context, which credential authenticated
 // the request. The change-password first-set branch keys on it: only the
 // static token (the bootstrap trust root) may claim the first password.
@@ -81,14 +133,14 @@ func identityFrom(ctx context.Context) string {
 	return s
 }
 
-// tokenMiddleware requires a valid bearer credential on every wrapped
-// request: either the static access token or a login session. Both checks
-// run on the same path with no prefix branching, so response shape never
-// reveals which credential kind a guess was tested against. The static
-// compare is constant-time for equal-length inputs (subtle returns 0
-// immediately on a length mismatch, so credential *length* is not hidden —
-// fine: the token is 32 hex chars and sessions are "bcs_"+64 hex by
-// construction, not secrets in their shape).
+// tokenMiddleware requires a valid credential on every wrapped request:
+// either the static access token or a login session. Both checks run on the
+// same path with no prefix branching, so response shape never reveals which
+// credential kind a guess was tested against. The static compare is
+// constant-time for equal-length inputs (subtle returns 0 immediately on a
+// length mismatch, so credential *length* is not hidden — fine: the token is
+// 32 hex chars and sessions are "bcs_"+64 hex by construction, not secrets in
+// their shape).
 //
 // Two guards are independent and BOTH load-bearing in password-only mode,
 // where s.token == "" and ConstantTimeCompare("", "") returns 1: the empty-got
@@ -97,29 +149,68 @@ func identityFrom(ctx context.Context) string {
 // an empty configured token. Removing either leaves the other as the last line
 // of defense — keep both.
 //
-// The credential is required in the Authorization header specifically (not a
-// cookie): a browser fetch() must opt in to sending it, which keeps a
-// cross-site form-POST from carrying ambient credentials to /api/recover.
+// The credential arrives in the Authorization header (a browser fetch() must
+// opt in to sending it) or, since #1370, in the HttpOnly session cookie a
+// login sets — which is how a NEW tab authenticates before the SPA has a
+// token in hand. Bearer, when present, wins: a request carrying an
+// Authorization: Bearer header is judged on that header alone and never falls
+// back to the cookie, so scripted access is byte-identical to the pre-cookie
+// behavior. A cookie is an AMBIENT credential, so cookie-authenticated
+// requests pass two extra defenses: SameSite=Lax on the cookie itself, and a
+// belt here — a state-changing method (anything but GET/HEAD/OPTIONS) must
+// carry Content-Type: application/json, which a cross-site HTML form cannot
+// send (forms are limited to urlencoded/multipart/text-plain). The SPA sends
+// JSON on every write already. The belt runs AFTER the credential check on
+// purpose: an invalid cookie stays a uniform 401, and the actionable 403 is
+// only ever shown to a caller who is really signed in.
 func (s *Server) tokenMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := bearerToken(r)
+		viaCookie := false
+		if got == "" {
+			got = sessionCookieToken(r)
+			viaCookie = got != ""
+		}
 		if got == "" {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
 			return
 		}
+		// admit runs the shared post-credential steps: the cookie CSRF belt,
+		// then the handler with the auth context attached. The cookie is
+		// deliberately run through the SAME two credential checks as a Bearer
+		// (no branching by transport — same shape property as above).
+		admit := func(ctx context.Context) {
+			if viaCookie && !csrfMarkerOK(r) {
+				writeJSONError(w, http.StatusForbidden,
+					"forbidden: cookie-authenticated write requests must send Content-Type: application/json (cross-site request protection); scripted clients should use an Authorization: Bearer header instead")
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
+		}
 		if s.token != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1 {
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authKindCtxKey{}, authKindToken)))
+			admit(context.WithValue(r.Context(), authKindCtxKey{}, authKindToken))
 			return
 		}
 		if identity, policy, ok := s.sessions.Lookup(got); ok {
 			ctx := context.WithValue(r.Context(), authKindCtxKey{}, authKindSession)
 			ctx = context.WithValue(ctx, policyCtxKey{}, policy)
 			ctx = context.WithValue(ctx, identityCtxKey{}, identity)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			admit(ctx)
 			return
 		}
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
 	})
+}
+
+// csrfMarkerOK is the cookie-auth CSRF belt's predicate: safe methods pass;
+// state-changing ones must carry the application/json marker, which no
+// cross-site HTML form can produce. Same media-type parse as requireJSONBody.
+func csrfMarkerOK(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	return isJSONContentType(r.Header.Get("Content-Type"))
 }
 
 // maxAPIBody caps authenticated JSON request bodies (#848). 1 MiB is far

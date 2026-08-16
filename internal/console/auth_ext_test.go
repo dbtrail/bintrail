@@ -31,7 +31,7 @@ func (fakeAuthProvider) Handler(prefix string, issue ext.ConsoleSessionIssuer) h
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("GET "+prefix+"finish", func(w http.ResponseWriter, r *http.Request) {
-		token, _, err := issue("tester@example.com", nil)
+		token, _, err := issue(w, "tester@example.com", nil)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

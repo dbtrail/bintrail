@@ -28,13 +28,21 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// isJSONContentType reports whether the Content-Type header names the
+// application/json media type (parameters ignored). Shared by the pre-auth
+// requireJSONBody gate and the cookie-auth CSRF belt (csrfMarkerOK) — one
+// parse, so the two defenses cannot drift on what counts as JSON.
+func isJSONContentType(ct string) bool {
+	mt, _, _ := strings.Cut(ct, ";")
+	return strings.TrimSpace(mt) == "application/json"
+}
+
 // requireJSONBody enforces Content-Type: application/json and a size cap on
 // the pre-auth endpoints. The Content-Type check is a CSRF defense in its own
 // right: an HTML form can only submit urlencoded/multipart/text-plain, so a
 // cross-site form POST can never reach the login verifier.
 func requireJSONBody(w http.ResponseWriter, r *http.Request) bool {
-	ct := r.Header.Get("Content-Type")
-	if mt, _, _ := strings.Cut(ct, ";"); strings.TrimSpace(mt) != "application/json" {
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
 		writeJSONError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
 		return false
 	}
@@ -67,13 +75,17 @@ func (s *Server) handleAuthInfo(w http.ResponseWriter, r *http.Request) {
 // extSessionIssuer adapts the session store to the ext.ConsoleSessionIssuer
 // contract: the installed provider calls it after verifying an identity, and
 // the returned token is a normal console session (same TTLs, same revocation).
-// The identity is logged for the operator's audit trail and never stored.
+// The session cookie is set on the provider's in-flight response here — the
+// issue call, not the delivery mechanism, is what makes a login — so external
+// logins extend to new tabs exactly like password logins do. The identity is
+// logged for the operator's audit trail and never stored.
 func (s *Server) extSessionIssuer() ext.ConsoleSessionIssuer {
-	return func(identity string, policy *ext.AccessPolicy) (string, time.Time, error) {
+	return func(w http.ResponseWriter, identity string, policy *ext.AccessPolicy) (string, time.Time, error) {
 		token, expires, err := s.sessions.IssueWithPolicy(identity, policy)
 		if err != nil {
 			return "", time.Time{}, err
 		}
+		setSessionCookie(w, token, expires)
 		slog.Info("console external-auth login", "identity", identity)
 		return token, expires, nil
 	}
@@ -167,6 +179,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("console password created via first-run setup", "remote", ip)
+	setSessionCookie(w, token, expires)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"token":      token,
 		"expires_at": expires.UTC().Format(time.RFC3339),
@@ -229,6 +242,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// The verified identity is the operator's audit trail (like the external
 		// auth issuer); logged only on SUCCESS, where it is a real identity.
 		slog.Info("console login", "remote", ip, "identity", cred.Identity)
+		setSessionCookie(w, token, expires)
 		writeJSON(w, http.StatusOK, map[string]string{
 			"token":      token,
 			"expires_at": expires.UTC().Format(time.RFC3339),
@@ -264,6 +278,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("console login", "remote", ip)
+	setSessionCookie(w, token, expires)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"token":      token,
 		"expires_at": expires.UTC().Format(time.RFC3339),
@@ -271,10 +286,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLogout serves POST /api/auth/logout (authenticated). It revokes the
-// presented Bearer when it is a session; a static token is not revocable over
-// HTTP by design, so logout with one is a 204 no-op. Idempotent.
+// presented Bearer AND the session cookie's session when they are sessions
+// (usually the same one; a tab that logged in twice can hold two), and clears
+// the cookie so every tab's ambient credential dies with this click — not
+// just the tab that clicked. A static token is not revocable over HTTP by
+// design, so logout with one only clears the cookie. Idempotent.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	s.sessions.Revoke(bearerToken(r))
+	s.sessions.Revoke(sessionCookieToken(r))
+	clearSessionCookie(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -363,6 +383,9 @@ func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("console password changed", "remote", ip)
+	// The RevokeAll above also killed the session the cookie names; hand this
+	// tab's cookie the fresh session so its new tabs stay signed in.
+	setSessionCookie(w, token, expires)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"token":      token,
 		"expires_at": expires.UTC().Format(time.RFC3339),

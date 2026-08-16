@@ -715,6 +715,17 @@ A running server accepts it on the next login — no restart needed.
   (24 h absolute, 8 h idle, max 16 concurrent) the SPA uses as its Bearer
   credential. Sessions die on logout, on password change (which revokes all
   of them), and on process restart — nothing session-shaped touches disk.
+- The login response also sets the session token as an **HttpOnly
+  `bintrail_session` cookie** (`Secure; SameSite=Lax; Path=/`, `Max-Age`
+  matching the session's absolute expiry), so opening a console link in a new
+  tab or window is already signed in — same store, same expiry, same
+  revocation as the Bearer path; the cookie holds nothing new. Logout revokes
+  the session server-side *and* expires the cookie, killing every tab at once.
+  The `Secure` flag is safe on the local first-run flow (browsers treat
+  loopback as a secure context); **operators terminating TLS at a reverse
+  proxy** should serve the console over `https://` end-to-end from the
+  browser's point of view, or the browser will drop the cookie and each tab
+  falls back to its own login (the Bearer flow keeps working either way).
 - **An opt-in static token** for automation: set `--token` /
   `BINTRAIL_CONSOLE_TOKEN` explicitly and scripts/curl/CI can call the API with
   it. It is never generated for you, and it is not the human path — when a
@@ -791,13 +802,18 @@ itself:
   sessions are looked up by SHA-256 of the presented value, so raw session
   tokens never live server-side; unknown-username logins still burn a full
   bcrypt compare so timing cannot enumerate the username).
-- **Bearer header on the API — never a cookie.** `/api/*` requires the
-  credential (static token or login session) in the `Authorization: Bearer …`
-  header, so a cross-site form POST cannot carry ambient credentials to
-  `/api/recover`. Login itself requires `Content-Type: application/json`,
-  which an HTML form cannot send — login-CSRF dies the same way. The page
-  shell loads without a token (it reads the token from the URL to bootstrap
-  its requests).
+- **Bearer header first; the session cookie is the tab-bridging sibling.**
+  `/api/*` accepts the credential (static token or login session) in the
+  `Authorization: Bearer <token>` header, or — for browser navigation — the
+  HttpOnly session cookie a login sets. A request carrying a Bearer header is
+  judged on that header alone (no cookie fallback), so scripted access is
+  unchanged. Cookie-authenticated **state-changing** requests (anything but
+  GET/HEAD/OPTIONS) must additionally send `Content-Type: application/json`,
+  which an HTML form cannot produce — combined with `SameSite=Lax`, a
+  cross-site form POST cannot carry the ambient cookie to `/api/recover`.
+  Login itself requires `Content-Type: application/json` too — login-CSRF
+  dies the same way. The page shell loads without a token (it reads the token
+  from the URL, or probes the session cookie, to bootstrap its requests).
 - **No CORS headers.** Requests are same-origin only.
 - **Host-header allowlist.** Requests whose `Host` is a domain name are
   rejected (only IP literals and `localhost` pass), which defeats DNS-rebinding
@@ -821,7 +837,7 @@ itself:
   (does password login exist — what the login form's presence would reveal
   anyway), `POST /api/auth/login`, and — only during first-run setup —
   `POST /api/auth/setup`. Everything else needs a Bearer
-  credential.
+  credential or the login session cookie.
 
 ## PostgreSQL sources
 

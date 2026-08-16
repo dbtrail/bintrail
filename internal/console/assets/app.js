@@ -8,6 +8,12 @@
 // Security invariants kept from the prior frontend (do not regress):
 //  1. The token comes from ?token= on first load, is stashed in sessionStorage,
 //     and is stripped from the URL — it never lingers in the address bar.
+//     Logins ALSO set an HttpOnly session cookie server-side (#1370) so a new
+//     tab is already signed in; when sessionStorage is empty this file PROBES
+//     a cheap authenticated endpoint and, on 200, runs cookie-only (no
+//     Authorization header — the middleware accepts the cookie). Every
+//     non-GET request must then send Content-Type: application/json: that is
+//     the server's cookie-CSRF marker, and api() sets it unconditionally.
 //  2. The X-Bintrail-Server header is captured INSIDE api() at dispatch time, so
 //     an in-flight request keeps the server it was fired for.
 //  3. Every async render captures `serverGen` before its await and bails if a
@@ -167,9 +173,18 @@ const VIEW = () => document.getElementById("view");
 // ── api ──────────────────────────────────────────────────────────────────────
 
 async function api(path, opts = {}) {
-  const headers = { Authorization: "Bearer " + TOKEN };
+  // No Authorization header without a token: a cookie-bootstrapped tab (fresh
+  // tab, HttpOnly session cookie, empty sessionStorage) authenticates via the
+  // cookie the browser attaches on its own (same-origin fetch sends cookies
+  // by default).
+  const headers = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
   if (currentServer) headers["X-Bintrail-Server"] = currentServer; // captured at dispatch
-  if (opts.body) headers["Content-Type"] = "application/json";
+  // Content-Type on EVERY state-changing request, body or not (a body-less
+  // POST like logout included): the server's cookie-auth CSRF belt requires
+  // the application/json marker on non-GET methods, and sending it under
+  // Bearer too keeps the request shape uniform.
+  const method = (opts.method || "GET").toUpperCase();
+  if (opts.body || (method !== "GET" && method !== "HEAD")) headers["Content-Type"] = "application/json";
   const res = await fetch(path, {
     method: opts.method || "GET",
     headers,
@@ -206,7 +221,7 @@ async function api(path, opts = {}) {
 // same central 401 handling — only the parsing differs, because views.sql is a
 // SQL file and api()'s JSON.parse would reject it as malformed.
 async function apiText(path) {
-  const headers = { Authorization: "Bearer " + TOKEN };
+  const headers = TOKEN ? { Authorization: "Bearer " + TOKEN } : {};
   if (currentServer) headers["X-Bintrail-Server"] = currentServer;
   const res = await fetch(path, { headers });
   const text = await res.text();
@@ -246,6 +261,21 @@ async function fetchAuthInfo() {
   const res = await fetch("/api/auth");
   if (!res.ok) throw new Error("HTTP " + res.status);
   return res.json();
+}
+
+// probeCookieSession: a fresh tab has no sessionStorage token (it is per-tab),
+// but a login in another tab left the HttpOnly session cookie — try one cheap
+// authenticated GET before raising the sign-in gate. /api/servers is the
+// lightest authenticated read (registry only, touches no index DB), the
+// browser attaches the cookie on its own, and a 200 means the middleware
+// accepted it: the tab then runs cookie-only with TOKEN empty. Raw fetch on
+// purpose — a 401 here is the NORMAL signed-out case and must not recurse
+// into handleUnauthorized's "session expired" messaging.
+async function probeCookieSession() {
+  try {
+    const res = await fetch("/api/servers");
+    return res.ok;
+  } catch (_) { return false; }
 }
 
 // handleUnauthorized is api()'s 401 chokepoint: the bearer is dead, so clear
@@ -544,9 +574,14 @@ async function submitPasswordChange(form, msg, firstSet) {
   };
   let res;
   try {
+    // Cookie-bootstrapped tabs have no TOKEN — the session cookie carries the
+    // credential, and the JSON Content-Type doubles as the CSRF marker.
+    const headers = TOKEN
+      ? { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json" }
+      : { "Content-Type": "application/json" };
     res = await fetch("/api/auth/password", {
       method: "POST",
-      headers: { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
   } catch (_) { loginMsg(msg, "Network error — is the console still running?"); return; }
@@ -3206,7 +3241,10 @@ async function runSQL(sql, ui) {
   statusLine.textContent = "running…";
   clear(results);
   try {
-    const headers = { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json" };
+    // Content-Type doubles as the cookie-auth CSRF marker; no Authorization
+    // header in a cookie-bootstrapped tab (TOKEN empty), same as api().
+    const headers = { "Content-Type": "application/json" };
+    if (TOKEN) headers.Authorization = "Bearer " + TOKEN;
     if (currentServer) headers["X-Bintrail-Server"] = currentServer;
     const res = await fetch("/api/sql", {
       method: "POST", headers, body: JSON.stringify({ sql }), signal: sqlRunController.signal,
@@ -5142,11 +5180,15 @@ async function init() {
   document.getElementById("nav-rotation").addEventListener("click", showRotationDialog);
   window.addEventListener("popstate", renderRoute);
 
-  // Pre-auth gate: ask the (unauthenticated) probe how this console
-  // authenticates BEFORE firing data fetches that are guaranteed 401s. First
-  // run with no credential → create-password screen; password configured →
-  // sign-in form; token mode → the printed-link hint.
-  if (!TOKEN) {
+  // Pre-auth gate: with no stored token, first try the HttpOnly session
+  // cookie a login in another tab may have left (#1370) — on success the tab
+  // proceeds signed-in with TOKEN empty (api() omits the Authorization header
+  // and the cookie authenticates every call). Otherwise ask the
+  // (unauthenticated) probe how this console authenticates BEFORE firing data
+  // fetches that are guaranteed 401s. First run with no credential →
+  // create-password screen; password configured → sign-in form; token mode →
+  // the printed-link hint.
+  if (!TOKEN && !(await probeCookieSession())) {
     let auth = {};
     try { auth = await fetchAuthInfo(); } catch (_) { /* server down — fall through, the view will surface it */ }
     if (auth.setup) { showLoginOverlay({ setup: true, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
