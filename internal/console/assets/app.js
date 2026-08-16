@@ -298,7 +298,10 @@ function showLoginOverlay(opts) {
   // dialog mounted in the same slot).
   clear(VIEW());
   const mount = document.getElementById("login-mount");
-  const scrim = el("div", { class: "modal-scrim show" });
+  // .login-gate marks THIS scrim as the full-screen brand canvas (#1371).
+  // showPasswordDialog() mounts its panel in the same slot but is a task modal
+  // over an authenticated workspace, so it keeps the ordinary translucent scrim.
+  const scrim = el("div", { class: "modal-scrim show login-gate" });
   const panel = el("div", { class: "modal login-panel", role: "dialog", "aria-label": opts.setup ? "Set up console" : "Sign in" });
   panel.append(el("h2", { class: "modal-title", text: "dbtrail console" }));
 

@@ -5,7 +5,9 @@
    (blue / mint / red), mapped by ROLE — site hue+chroma at the console's
    lightness steps, so WCAG AA holds where the marketing values would not
    (the site's muted ink is ~3.1:1 on white; a console cannot ship that).
-   Brand accents (sun, violet) appear only in brand moments, never on data.
+   Brand accents (the site's tropical sunset — pink/peach/violet/sun) appear
+   only in brand moments: the sign-in gate, empty states, the busy indicator,
+   text selection, the nav rail's tail. Never on data.
    Three directions via [data-dir="paper" | "studio" | "trail"].
    ============================================================ */
 
@@ -103,6 +105,44 @@
      site; violet lives inside the accent gradient via --accent-b. */
   --sun: oklch(0.879 0.163 91);
   --scrim: oklch(0.3 0.03 305 / 0.33);
+
+  /* ---- the site's tropical sunset, at console lightness ----
+     dbtrail.com's hero canvas and headline/CTA stops, translated to oklch and
+     mapped the same way #1359 mapped the ink ramp: the site's HUE + CHROMA are
+     kept exactly, the LIGHTNESS is lowered, because the marketing values do not
+     survive a console's contrast floors. The binding pair is the white panel
+     that floats ON the canvas: at site lightness the peach stop leaves it at
+     2.05:1, below the 3:1 a UI surface needs to be identifiable, so all three
+     hero stops drop a uniform ΔL ≈ -0.12 (relationships preserved, ordering
+     preserved) which puts the BRIGHTEST stop at 3.26:1 and the others above it.
+     Every canvas layer is built from these three stops, so the canvas can never
+     be brighter than --brand-canvas-2 anywhere.
+     Reserved for brand moments — the sign-in gate, empty states, the busy
+     indicator, the nav rail's tail. They never encode data: the semantic
+     INSERT/UPDATE/DELETE tokens above and the diff colors are untouched, and
+     pink never lands on a surface that carries a row. */
+  --brand-canvas-1: oklch(0.635 0.18 348);  /* site hero pink   #FF7AC3 */
+  --brand-canvas-2: oklch(0.66 0.142 53);   /* site hero peach  #FF9D5C */
+  --brand-canvas-3: oklch(0.555 0.19 293);  /* site hero violet #9D7AFF */
+  --brand-warm-a:   oklch(0.63 0.218 3);    /* site CTA pink    #FF4D8D */
+  --brand-warm-b:   oklch(0.63 0.155 51);   /* site CTA orange  #FF8A3D */
+  --brand-canvas: linear-gradient(160deg, var(--brand-canvas-1) 0%, var(--brand-canvas-2) 52%, var(--brand-canvas-3) 100%);
+  --brand-headline: linear-gradient(135deg, var(--brand-warm-a) 0%, var(--brand-warm-b) 55%, var(--brand-canvas-3) 100%);
+  --brand-warm: linear-gradient(135deg, var(--brand-warm-a), var(--brand-warm-b));
+  /* The empty-state washes are the brand colors at low ALPHA over whatever
+     surface is under them, never a baked-in light value — the composite
+     follows the ground, so the pairs below hold by construction and a future
+     dark ground would re-point --surface, not these rules. Alphas are the
+     ceiling that keeps --ink-3 body text >=4.5:1 where BOTH washes overlap
+     (4.59:1; --ink-3 on bare --surface is only 4.96:1, so a wash has little
+     room and these are deliberately faint). */
+  --brand-wash-sun:  oklch(0.879 0.163 91 / 0.12);   /* --sun at 12% */
+  --brand-wash-pink: oklch(0.635 0.18 348 / 0.03);   /* --brand-canvas-1 at 3% */
+  /* The nav's active rail EXTENDS the blue->violet accent gradient into the
+     sunset instead of replacing it: product blue stays the interactive accent.
+     A separate token on purpose — .timeline::before is a DATA surface and
+     keeps the plain accent gradient. */
+  --brand-rail: linear-gradient(var(--accent-a) 0%, var(--accent-b) 55%, var(--brand-warm-a) 100%);
 
   /* fonts */
   --f-display: "Bricolage Grotesque", system-ui, sans-serif;
@@ -347,16 +387,18 @@ button { font-family: inherit; }
 .nav-item.active { color: var(--ink); font-weight: 600; background: var(--accent-bg); }
 .nav-item.active .ni-icon { color: var(--accent); }
 .nav-item.active .ni-icon { transform: translateX(1px); }
-/* active rail accent */
+/* active rail accent — blue -> violet -> sunset pink (--brand-rail): the
+   accent gradient extended into the brand family, not replaced by it. The
+   timeline rail keeps the plain accent gradient; it reads data. */
 .nav-item.active::before {
   content: ""; position: absolute; left: -18px; top: 50%; transform: translateY(-50%);
   width: 3px; height: 18px; border-radius: 0 3px 3px 0;
-  background: linear-gradient(var(--accent-a), var(--accent-b));
+  background: var(--brand-rail);
   animation: railpop .3s var(--ease-out);
 }
 [data-dir="trail"] .nav-item.active::before {
   height: 26px; width: 4px;
-  background: linear-gradient(var(--accent-a), var(--accent-b));
+  background: var(--brand-rail);
 }
 [data-dir="paper"] .nav-item.active { background: transparent; }
 [data-dir="paper"] .nav-item.active::before { left: -2px; }
@@ -811,13 +853,30 @@ button { font-family: inherit; }
 /* ============================================================
    empty / placeholder states
    ============================================================ */
+/* An empty screen is where the console should be friendliest, so this is a
+   brand moment: a faint sunrise wash over --surface and a sunset hairline on
+   the top edge. It stays a FRAME treatment — the wash never reaches a row, and
+   .ev-empty (which doubles as an inline error line: "Could not load servers…")
+   deliberately does NOT get it. Alphas are set by the --ink-3 body pair, which
+   holds >=4.5:1 even where both washes overlap. */
 .empty {
+  position: relative; overflow: hidden;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   text-align: center; padding: 64px 24px; gap: 14px;
-  border: 1px dashed var(--line); border-radius: var(--radius);
-  color: var(--ink-3); background: var(--surface);
+  border: 1px dashed color-mix(in srgb, var(--brand-canvas-2) 26%, var(--line));
+  border-radius: var(--radius);
+  color: var(--ink-3);
+  background:
+    radial-gradient(128% 104% at 50% -14%, var(--brand-wash-sun), transparent 64%),
+    radial-gradient(84% 78% at 104% 112%, var(--brand-wash-pink), transparent 70%),
+    var(--surface);
 }
-.empty-ic { color: var(--ink-4); }
+/* Absolute, so the flex column above never gets a fourth item. */
+.empty::before {
+  content: ""; position: absolute; inset: 0 0 auto; height: 3px;
+  background: linear-gradient(90deg, var(--brand-canvas-1) 0%, var(--brand-canvas-2) 52%, var(--brand-canvas-3) 100%);
+}
+.empty-ic { color: var(--brand-warm-b); }
 .empty h3 { font-family: var(--title-font); font-weight: 600; color: var(--ink-2); margin: 0; font-size: 17px; letter-spacing: -0.01em; }
 .empty p { margin: 0; max-width: 42ch; font-size: 13.5px; }
 
@@ -995,8 +1054,10 @@ button { font-family: inherit; }
 /* ============================================================
    busy modal — Restore actions (#1363)
    ============================================================ */
-/* Pure-CSS loading animation on the brand accent (--accent-a/--accent-b) —
-   the semantic insert/update/delete colors are data, never decoration.
+/* Pure-CSS loading animation on the brand's pink->orange arm (--brand-warm) —
+   the semantic insert/update/delete colors are data, never decoration, and a
+   modal that is WORKING is chrome, so the sunset belongs here (#1371). Both
+   stops clear 3:1 on the modal surface (3.94 / 3.70).
    Reduced-motion rule mirrors the #1353 event skeletons: the animation only
    exists under no-preference; otherwise the static .busy-static note shows. */
 .busy-modal { max-width: 480px; text-align: center; }
@@ -1004,7 +1065,7 @@ button { font-family: inherit; }
 .busy-anim { display: none; gap: 11px; justify-content: center; padding: 22px 0 4px; }
 .busy-anim span {
   width: 12px; height: 12px; border-radius: 50%;
-  background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+  background: var(--brand-warm);
 }
 .busy-static { display: block; color: var(--ink-2); font-size: 13.5px; margin: 16px 0 4px; }
 @media (prefers-reduced-motion: no-preference) {
@@ -1366,6 +1427,42 @@ button { font-family: inherit; }
    overflow:hidden clips the text against the edges. */
 .login-panel { max-width: 400px; padding: 30px 32px; }
 .login-panel .modal-title { margin-bottom: 12px; }
+/* The sign-in gate is the console's one full-screen brand canvas: the site's
+   hero sunset with the panel floating on it, the way dbtrail.com floats its
+   terminal block. Scoped to .login-gate — showPasswordDialog() mounts in the
+   same slot and is an ordinary task modal over the workspace, so it keeps the
+   shared translucent --scrim. Every layer here is one of the canvas stops, so
+   the brightest point of the whole screen is --brand-canvas-2 (white panel on
+   it: 3.26:1). Static by design: nothing to collapse under reduced motion. */
+.modal-scrim.login-gate {
+  background:
+    radial-gradient(72% 58% at 82% 2%, var(--brand-canvas-2), transparent 62%),
+    radial-gradient(96% 76% at 2% 106%, var(--brand-canvas-3), transparent 68%),
+    var(--brand-canvas);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  /* Near-centered on a tall viewport without flex centering: an overflowing
+     panel must still be scrollable to its top, which align-items:center inside
+     an overflow-y:auto scrim would clip away. */
+  padding: clamp(48px, 15vh, 150px) 24px 56px;
+}
+.modal-scrim.login-gate .login-panel {
+  box-shadow: 0 40px 90px -30px oklch(0.2 0.06 300 / 0.55), 0 1px 0 oklch(1 0 0 / 0.5) inset;
+}
+/* The panel's own title takes the site's headline gradient — the same
+   pink->orange->violet as dbtrail.com's H1. 22px/600 is WCAG "large text", and
+   all three stops clear the 3:1 large floor on the white panel (3.94 / 3.70 /
+   5.15). @supports so a browser without background-clip:text keeps solid ink
+   instead of a transparent fill. */
+@supports (background-clip: text) or (-webkit-background-clip: text) {
+  .modal-scrim.login-gate .login-panel .modal-title {
+    background: var(--brand-headline);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    width: fit-content;
+  }
+}
 .login-panel .modal-desc { max-width: none; }
 .login-panel .modal-desc + .modal-desc { margin-top: 10px; }
 .login-form { display: flex; flex-direction: column; gap: 14px; margin-top: 18px; }
@@ -1569,8 +1666,17 @@ button { font-family: inherit; }
 .stg-hint { margin-bottom: 0; }
 .stg-cardfoot { margin-top: 12px; }
 
-/* Storage empty states: lead + short steps, not paragraphs */
-.stg-empty { padding: 14px 4px; display: flex; flex-direction: column; gap: 7px; }
+/* Storage empty states: lead + short steps, not paragraphs. Same brand-moment
+   treatment as .empty (these are the onboarding surfaces), lighter-weight
+   because they sit inside a panel rather than standing alone. */
+.stg-empty {
+  padding: 15px 16px 17px; display: flex; flex-direction: column; gap: 7px;
+  border: 1px solid color-mix(in srgb, var(--brand-canvas-2) 22%, var(--line));
+  border-radius: var(--radius);
+  background:
+    radial-gradient(118% 128% at 100% -10%, var(--brand-wash-sun), transparent 66%),
+    var(--surface);
+}
 .stg-empty-lead { margin: 0; font-size: 13.5px; font-weight: 600; color: var(--ink-2); }
 .stg-empty-sub { margin: 0; font-size: 12.5px; color: var(--ink-3); max-width: 52ch; }
 
