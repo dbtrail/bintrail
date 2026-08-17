@@ -1900,14 +1900,17 @@ try {
     const closeBtn = t.querySelector(".toast-close");
     if (closeBtn) closeBtn.click();
     await sleep(50);
-    const closeDismisses = t.hidden && !t.classList.contains("toast-error");
+    // Only `hidden` decides visibility: #toast-error carries the toast-error
+    // class permanently in index.html now that failures have their own node,
+    // so asserting the class is absent would assert the markup is wrong.
+    const closeDismisses = t.hidden && t.textContent === "";
 
     // A repeat of a message already showing is counted, not dropped: several
     // failures carry no server name, so a second one would otherwise change
     // nothing on screen and read as success.
     toastError("Refusal four.");
     toastError("Refusal four.");
-    const counted = /\u00d74|×4|\(×2\)/.test(t.textContent) || /\(×2\)/.test(t.textContent);
+    const counted = /\(×2\)/.test(t.textContent);
     dismissToast();
 
     // A success notice still fades on its own.
