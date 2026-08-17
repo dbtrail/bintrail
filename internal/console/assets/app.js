@@ -4932,14 +4932,25 @@ function buildServerForm() {
   // The source user is the #1 friction point — spell out the grant inline,
   // never behind a <details>. REPLICATION SLAVE/CLIENT drive the stream;
   // SELECT covers the information_schema snapshot of columns/PKs/FKs.
+  //
+  // LOCK TABLES is listed here too, commented, because omitting it is a
+  // DELAYED failure: capture starts clean and only Create baseline refuses,
+  // hours or days later. The form is the last place anyone reads a grant list
+  // before pasting it, so the line has to exist here even though the stream
+  // does not need it.
   const grantHint = tagFlavor(el("p", { class: "form-hint", style: "margin-top:10px" }), "mysql mariadb");
   grantHint.append("Source user needs ");
   grantHint.append(el("code", { text: "REPLICATION SLAVE, REPLICATION CLIENT, SELECT" }));
-  grantHint.append(". Create one on the source MySQL — copy and run:");
+  grantHint.append(" to capture, plus ");
+  grantHint.append(el("code", { text: "LOCK TABLES" }));
+  grantHint.append(" if you want baselines. Create one on the source MySQL — copy and run:");
   mon.append(grantHint);
   mon.append(tagFlavor(el("pre", { class: "form-code", text:
     "CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';\n" +
-    "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';" }), "mysql mariadb"));
+    "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';\n" +
+    "-- Baselines only (point-consistent by default). On RDS/Aurora also set\n" +
+    "-- BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=lock-all.\n" +
+    "GRANT LOCK TABLES ON *.* TO 'dbtrail'@'%';" }), "mysql mariadb"));
   // PostgreSQL prerequisites — the console reads them, it never runs CREATE
   // PUBLICATION / ALTER SYSTEM (validate-don't-create; capture is pgoutput-only).
   const pgHint = tagFlavor(el("p", { class: "form-hint", style: "margin-top:10px" }), "postgres");

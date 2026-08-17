@@ -237,9 +237,14 @@ immediately; warnings (e.g. short binlog retention) show but don't block.
 
 The **source user** you paste into the form needs `REPLICATION SLAVE,
 REPLICATION CLIENT, SELECT` on the source MySQL — the form spells out the
-exact `CREATE USER` / `GRANT` to copy. dbtrail never writes to or locks the
-source. Full per-privilege breakdown and the least-privilege (schema-scoped
-`SELECT`) variant: [streaming.md](streaming.md#the-source-mysql-user).
+exact `CREATE USER` / `GRANT` to copy. dbtrail never writes to the source, and
+capture never locks it. The **Create baseline** button needs one privilege
+more, `LOCK TABLES`, because a baseline is point-consistent by default; without
+it capture keeps running and only the baseline is refused, naming the exact
+`GRANT`. On RDS/Aurora set `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=lock-all` —
+`ftwrl` needs `BACKUP_ADMIN`, which managed MySQL will not grant. Full
+per-privilege breakdown and the least-privilege (schema-scoped `SELECT`)
+variant: [streaming.md](streaming.md#the-source-mysql-user).
 
 - Each monitored source gets **its own index database** — per-source state
   (checkpoints, snapshots) stays structurally isolated, and the server

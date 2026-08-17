@@ -21,7 +21,47 @@ That is the complete, minimal set. Each privilege maps to exactly one thing dbtr
 | `REPLICATION CLIENT` | Discover the start position and detect gaps: `SHOW BINARY LOG STATUS` / `SHOW MASTER STATUS`, `SHOW BINARY LOGS`, `@@gtid_purged`, `@@gtid_executed`. |
 | `SELECT` | Snapshot the schema (column types, primary keys, foreign keys) from `information_schema`, and run the preflight checks. |
 
-dbtrail **never** writes to the source and never locks it. It does not need `RELOAD`, `LOCK TABLES`, `PROCESS`, `SHOW VIEW`, or `EXECUTE`.
+dbtrail **never writes to the source**, and nothing on the capture path ever locks it. Capture does not need `RELOAD`, `LOCK TABLES`, `PROCESS`, `SHOW VIEW`, or `EXECUTE`.
+
+### If you also want baselines: add `LOCK TABLES`
+
+Capture alone gives you the change history. A **baseline** — the full-table
+snapshot that `reconstruct`, Time-travel and the console's **Create baseline**
+button merge those changes onto — is a `mydumper` run, and it needs one more
+privilege:
+
+```sql
+GRANT LOCK TABLES ON *.* TO 'dbtrail'@'%';   -- only if you want baselines
+```
+
+Baselines are **point-consistent by default**: every worker thread opens its
+snapshot at the same instant, so the result represents one moment rather than a
+table stitched together from several. That guarantee is what needs a lock, held
+only for the moment the threads synchronize — never for the duration of the
+dump. A baseline that is not point-consistent yields a table state that never
+existed, and every answer reconstructed from it inherits that silently.
+
+Two ways to satisfy it, both point-consistent:
+
+| Lock mode | Privileges | Use when |
+|---|---|---|
+| `lock-all` | `LOCK TABLES` (global, or on the dumped schemas) | **Anywhere.** The only option on RDS/Aurora — see below. |
+| `ftwrl` (default) | `RELOAD` or `FLUSH_TABLES`, **plus** `BACKUP_ADMIN` on MySQL/Percona 8.0+ | Self-hosted, when you would rather not grant `LOCK TABLES`. |
+
+**On Amazon RDS and Aurora, use `lock-all`.** `BACKUP_ADMIN` cannot be granted
+there at all (`GRANT BACKUP_ADMIN` fails with *"ERROR 1227 … you need the
+RDSADMIN USER privilege"*), and `ftwrl` issues `LOCK INSTANCE FOR BACKUP` first,
+so it cannot work no matter what else you grant. mydumper says so itself: *"We
+support LOCK_ALL and SAFE_NO_LOCK modes for RDS/Aurora."* Select it with
+`bintrail dump --lock-mode lock-all`, or
+`BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=lock-all` for the console.
+
+If you grant neither, capture keeps working normally and only the baseline is
+refused — with a message naming the exact `GRANT` to run. It never quietly falls
+back to a snapshot it cannot vouch for. The low-privilege escape hatches are
+`safe-no-lock` (needs nothing extra, but **aborts** rather than write a torn
+snapshot, so expect it to refuse on a write-active source) and `no-lock` (accepts
+a torn snapshot — see [dump-and-baseline.md](dump-and-baseline.md)).
 
 **Least-privilege variant** — `SELECT` is the only privilege you can scope to specific schemas (the two `REPLICATION` grants are global-only in MySQL):
 

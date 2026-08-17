@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The documented source user could not take a baseline.** Every place that
+  spells out the source grants — `streaming.md`, `quickstart.md`, `install.md`,
+  `console.md`, `docker.md`, `guide.md`, `mariadb.md`, `deployment.md`,
+  `.env.example`, and the console's own "+ Add server" form — listed
+  `REPLICATION SLAVE, REPLICATION CLIENT, SELECT` and nothing else. Since
+  baselines became point-consistent by default in 0.58.0, that user is refused
+  by **every** consistent lock mode, so an operator who followed the docs
+  exactly hit a wall at the Create-baseline button. `streaming.md` additionally
+  asserted dbtrail "does not need `RELOAD`, `LOCK TABLES`…", which stopped being
+  true for the baseline path.
+
+  The grant lists now separate the two: capture needs the original three and
+  still never locks the source; a baseline needs `LOCK TABLES` on top, and says
+  so where the list is read. Omitting it is a DELAYED failure — capture starts
+  clean and only the snapshot is refused — which is why the console form now
+  carries the line too. `streaming.md` gained a section covering both
+  point-consistent modes and why RDS/Aurora must use `lock-all`.
+
 ## [0.59.0] - 2026-08-17
 
 ### Fixed
