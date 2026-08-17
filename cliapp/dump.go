@@ -23,6 +23,14 @@ import (
 	"github.com/dbtrail/dbtrail/internal/mydumperlock"
 )
 
+// checkMydumperPrivileges is mydumperlock.CheckPrivileges behind a seam, so a
+// test can observe the LOCK MODE this call site actually forwards. Without it
+// the argument is unverifiable: every mode fails identically against an
+// unreachable source, so hardcoding one here passes the whole suite while
+// re-introducing #1381 — an operator who selected lock-all gets judged against
+// ftwrl's requirements and told to grant BACKUP_ADMIN, which RDS refuses.
+var checkMydumperPrivileges = mydumperlock.CheckPrivileges
+
 var dumpCmd = &cobra.Command{
 	Use:   "dump",
 	Short: "Invoke mydumper to create a logical dump of the source MySQL instance",
@@ -268,7 +276,7 @@ func runDump(cmd *cobra.Command, args []string) error {
 	// point-consistent mode the default here too, so the guard has to come
 	// with it. Skipped when the flag is not being sent at all.
 	if supportsLockMode && lockMode.NeedsElevatedPrivileges() {
-		if err := mydumperlock.CheckPrivileges(cmd.Context(), dmpSourceDSN, lockMode, mydumperlock.RemedyCLI); err != nil {
+		if err := checkMydumperPrivileges(cmd.Context(), dmpSourceDSN, lockMode, mydumperlock.RemedyCLI); err != nil {
 			return err
 		}
 	}

@@ -204,8 +204,10 @@ with *"ERROR 1227 ... you need the RDSADMIN USER privilege"* — and mydumper's
 `FTWRL` path issues `LOCK INSTANCE FOR BACKUP` first, so `ftwrl` cannot work
 there no matter what else you grant. `lock-all` synchronizes the workers by
 locking the exported tables instead of the instance, needs only `LOCK TABLES`
-(which the RDS master user already has), and is equally point-consistent.
-Verified both ways against the same privilege set.
+(which the RDS master user already has, and which also works granted on just the
+dumped schema), and is equally point-consistent. mydumper says so itself — its
+help carries *"We support LOCK_ALL and SAFE_NO_LOCK modes for RDS/Aurora"* — and
+both directions were verified against the pinned build.
 
 `safe-no-lock` does not *prevent* thread skew — it *detects* it. mydumper compares the binlog
 position before and after syncing threads and, on any difference, stops with *"we cannot guarantee
@@ -214,16 +216,17 @@ torn snapshot, but on a source taking concurrent writes it will mostly refuse. V
 against mydumper `v1.0.3-1` and MySQL 8.0: it aborts under sustained writes, and it is the only
 low-privilege mode that will not lie to you.
 
-`no-lock` accepts a torn snapshot. mydumper's own documentation describes it as the mode to use *"if
-you don't need a consistent backup"*, and **deprecated it in 0.18.1**. Choose it only when you
+`no-lock` accepts a torn snapshot. mydumper's own help describes it as the mode to use *"if you
+don't need a consistent backup"* and pointedly leaves it out of its list of sync modes (*"There are 4
+modes that can be use to sync: SAFE_NO_LOCK, FTWRL, LOCK_ALL and GTID"*). Choose it only when you
 knowingly accept that the snapshot may not represent any single instant.
 
 Neither surface downgrades silently: if the privileges for `ftwrl` are missing, the dump refuses
 with an actionable error naming the alternatives, rather than quietly producing a weaker snapshot.
 
-`FTWRL` mode covers **transactional tables only** — the same `--trx-tables` flag as the other modes, but it behaves differently under `FTWRL`: mydumper detects a non-transactional (MyISAM) table and **refuses to dump at all** ("Non transactional table found ... Restart backup using --trx-tables=0"), which the console propagates as the run's error, instead of silently proceeding the way it does under `NO_LOCK`. Verified empirically: the identical MyISAM table dumped successfully (with only a warning) under `NO_LOCK`, and was hard-refused under `FTWRL`, in the same test session — the refusal is gated to an actual "consistent backup attempt" (mydumper's own wording), which `NO_LOCK` explicitly is not attempting and `FTWRL` is.
+**Every point-consistent mode covers transactional tables only** — `lock-all` exactly as much as `ftwrl`, verified separately for each. bintrail passes `--trx-tables` on all modes, and under a mode that is attempting a consistent backup mydumper detects a non-transactional (MyISAM) table and **refuses to dump at all** ("Non transactional table found ... Restart backup using --trx-tables=0"), which the console propagates as the run's error, instead of silently proceeding the way it does under `NO_LOCK`. Verified empirically: the identical MyISAM table dumped successfully (with only a warning) under `NO_LOCK`, and was hard-refused under both `FTWRL` and `LOCK_ALL` — the refusal is gated to an actual "consistent backup attempt" (mydumper's own wording), which `NO_LOCK` explicitly is not attempting and the point-consistent modes are. **Switching `ftwrl` → `lock-all` does not get you past it**; a source with MyISAM tables needs those tables converted, excluded via `--tables`, or a low-privilege mode.
 
-`FTWRL` mode needs `RELOAD` or the `FLUSH_TABLES` dynamic privilege (for `FLUSH TABLES WITH READ LOCK`) on **every** source flavor, verified against the pinned mydumper build (`v1.0.3-1`) against a real MySQL 8.0 source — plus `BACKUP_ADMIN` (for `LOCK INSTANCE FOR BACKUP`) **only on MySQL/Percona 8.0+**. `BACKUP_ADMIN` is a MySQL 8.0+ dynamic privilege: it does not exist on MariaDB (any version) or MySQL 5.7, and neither of those issues `LOCK INSTANCE FOR BACKUP`, so `FTWRL` there needs only `RELOAD`/`FLUSH_TABLES`. The console detects this from the source's own `SELECT VERSION()` and checks for exactly the privileges that source actually needs **before** invoking mydumper, refusing with a clear, actionable error if any are missing — this is not just belt-and-suspenders: on a MySQL/Percona 8.0+ source, granting `BACKUP_ADMIN` **without** `RELOAD`/`FLUSH_TABLES` does not make mydumper fail cleanly, it makes the pinned build **crash** (a segfault, reproduced on both amd64 and arm64), so the console's own preflight check exists specifically to turn that crash into a clean error instead of ever letting mydumper attempt it half-privileged. Point-consistent mode never silently falls back to `NO_LOCK`. Both surfaces expose the same three modes: `bintrail dump --lock-mode`, and `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` for the console's in-process baseline pipeline.
+`FTWRL` mode needs `RELOAD` or the `FLUSH_TABLES` dynamic privilege (for `FLUSH TABLES WITH READ LOCK`) on **every** source flavor, verified against the pinned mydumper build (`v1.0.3-1`) against a real MySQL 8.0 source — plus `BACKUP_ADMIN` (for `LOCK INSTANCE FOR BACKUP`) **only on MySQL/Percona 8.0+**. `BACKUP_ADMIN` is a MySQL 8.0+ dynamic privilege: it does not exist on MariaDB (any version) or MySQL 5.7, and neither of those issues `LOCK INSTANCE FOR BACKUP`, so `FTWRL` there needs only `RELOAD`/`FLUSH_TABLES`. The console detects this from the source's own `SELECT VERSION()` and checks for exactly the privileges that source actually needs **before** invoking mydumper, refusing with a clear, actionable error if any are missing — this is not just belt-and-suspenders: on a MySQL/Percona 8.0+ source, granting `BACKUP_ADMIN` **without** `RELOAD`/`FLUSH_TABLES` does not make mydumper fail cleanly, it makes the pinned build **crash** (a segfault, reproduced on both amd64 and arm64), so the console's own preflight check exists specifically to turn that crash into a clean error instead of ever letting mydumper attempt it half-privileged. Point-consistent mode never silently falls back to `NO_LOCK`. Both surfaces expose the same four modes: `bintrail dump --lock-mode`, and `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` for the console's in-process baseline pipeline.
 
 ### Concurrency protection
 

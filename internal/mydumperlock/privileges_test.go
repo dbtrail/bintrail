@@ -99,11 +99,11 @@ func TestCheckPrivilegesLockAllWithoutLockTables(t *testing.T) {
 	}
 }
 
-// TestCheckPrivilegesOnlyGlobalGrantsCount: a schema-scoped grant does not
-// authorize FLUSH TABLES WITH READ LOCK, so parsing must ignore anything that
-// is not ON *.*. Accepting one would under-refuse — the direction that lets
-// mydumper run half-privileged, which is what segfaults it.
-func TestCheckPrivilegesOnlyGlobalGrantsCount(t *testing.T) {
+// TestCheckPrivilegesFTWRLIgnoresSchemaScopedGrants: RELOAD, FLUSH_TABLES and
+// BACKUP_ADMIN are global-only privileges, and a schema-scoped row must not be
+// read as satisfying them. Accepting one would under-refuse — the direction
+// that lets mydumper run half-privileged, which is what segfaults it.
+func TestCheckPrivilegesFTWRLIgnoresSchemaScopedGrants(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
@@ -112,11 +112,137 @@ func TestCheckPrivilegesOnlyGlobalGrantsCount(t *testing.T) {
 
 	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
 		"GRANT SELECT ON *.* TO `u`@`%`",
-		"GRANT LOCK TABLES ON `appdb`.* TO `u`@`%`",
+		"GRANT ALL PRIVILEGES ON `appdb`.* TO `u`@`%`",
 	))
-	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyCLI)
+	mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("8.0.36"))
+	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyCLI)
 	if err == nil {
-		t.Fatal("a schema-scoped LOCK TABLES was accepted as a global privilege")
+		t.Fatal("a schema-scoped ALL PRIVILEGES was accepted as authorizing FLUSH TABLES WITH READ LOCK")
+	}
+}
+
+// TestCheckPrivilegesLockAllAcceptsSchemaScopedGrant is the regression for a
+// false refusal this package shipped once already, in the very mode added to
+// cure one: lock-all demanded LOCK TABLES globally.
+//
+// LOCK_ALL locks the EXPORTED TABLES, not the instance, so a grant covering the
+// dumped schema is sufficient — measured, not reasoned: mydumper v1.0.3-1 ran a
+// dump to completion against MySQL 8.0 as a user holding exactly
+// `GRANT SELECT, LOCK TABLES, SHOW VIEW ON \`appdb\`.*`. Refusing that sends a
+// least-privilege operator to widen a grant they did not need to widen, or to
+// give up point-consistency — on managed MySQL, where lock-all is the ONLY
+// point-consistent mode available, the second is the likelier outcome.
+func TestCheckPrivilegesLockAllAcceptsSchemaScopedGrant(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
+		"GRANT REPLICATION CLIENT ON *.* TO `scoped`@`%`",
+		"GRANT SELECT, LOCK TABLES, SHOW VIEW ON `appdb`.* TO `scoped`@`%`",
+	))
+	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyCLI); err != nil {
+		t.Fatalf("lock-all refused a per-schema LOCK TABLES grant that runs a real dump to completion: %v", err)
+	}
+}
+
+// TestCheckPrivilegesFlushTablesSubstitutesForReload: on MySQL 8.0+ the dynamic
+// FLUSH_TABLES privilege exists precisely so an account can be granted the
+// narrow thing instead of all of RELOAD, so a least-privilege 8.0 deployment
+// may hold it ALONE. Refusing that is the same class of over-refusal as #1381.
+func TestCheckPrivilegesFlushTablesSubstitutesForReload(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
+		"GRANT SELECT, BACKUP_ADMIN, FLUSH_TABLES ON *.* TO `u`@`%`",
+	))
+	mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("8.0.36"))
+	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole); err != nil {
+		t.Fatalf("ftwrl refused a user holding FLUSH_TABLES (without the broader RELOAD): %v", err)
+	}
+}
+
+// TestCheckPrivilegesBackupAdminWithoutReloadIsRefused pins the exact input
+// this package exists for: BACKUP_ADMIN granted, RELOAD/FLUSH_TABLES not. The
+// pinned mydumper build does not fail cleanly on it — it SEGFAULTS (#800,
+// reproduced on amd64 and arm64). If this check ever accepts this grant set,
+// the crash is reachable again from the DEFAULT path.
+func TestCheckPrivilegesBackupAdminWithoutReloadIsRefused(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
+		"GRANT SELECT, BACKUP_ADMIN ON *.* TO `u`@`%`",
+	))
+	mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("8.0.36"))
+	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole)
+	if err == nil {
+		t.Fatal("BACKUP_ADMIN without RELOAD/FLUSH_TABLES was accepted — this is the mydumper segfault input")
+	}
+	if !strings.Contains(err.Error(), "RELOAD") {
+		t.Errorf("refusal = %v, want it to name the missing RELOAD", err)
+	}
+	// The operator in this state already granted BACKUP_ADMIN and needs to know
+	// the remaining half is not just another clean refusal.
+	if !strings.Contains(err.Error(), "SEGFAULT") {
+		t.Errorf("refusal = %v, want it to say why this particular half-grant is dangerous", err)
+	}
+}
+
+// TestGrantSetParsing covers the shapes SHOW GRANTS actually emits. The parser
+// must never REPORT a privilege the user lacks: a false positive lets mydumper
+// launch half-privileged, which is the crash this package prevents.
+func TestGrantSetParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		line       string
+		wantGlobal []string
+		wantScoped bool
+	}{
+		{"global list", "GRANT SELECT, LOCK TABLES ON *.* TO `u`@`%`", []string{"SELECT", "LOCK TABLES"}, false},
+		{"with grant option", "GRANT ALL PRIVILEGES ON *.* TO `r`@`localhost` WITH GRANT OPTION", []string{"ALL PRIVILEGES"}, false},
+		// A role membership carries no privilege of its own. MySQL expands an
+		// ACTIVE role's privileges into their own ON *.* lines in the same
+		// result set, so skipping this loses nothing.
+		{"role membership", "GRANT `r`@`%` TO `u`@`%`", nil, false},
+		// PROXY's "object" is an account, not a schema, so it lands in scoped.
+		// Harmless: nothing ever asks about PROXY, and it cannot manufacture an
+		// entry under a name that is asked about. What matters is that it adds
+		// nothing GLOBAL — asserted by the exact-length check below.
+		{"proxy", "GRANT PROXY ON ``@`` TO `root`@`localhost` WITH GRANT OPTION", nil, true},
+		{"schema scoped", "GRANT LOCK TABLES ON `appdb`.* TO `u`@`%`", nil, true},
+		{"table scoped", "GRANT SELECT ON `appdb`.`t` TO `u`@`%`", nil, true},
+		// Column names must not be parsed as privilege names: splitting on the
+		// comma before stripping the parenthesised list would yield "B".
+		{"column list", "GRANT SELECT (a, b) ON `appdb`.`t` TO `u`@`%`", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := &grantSet{global: map[string]bool{}, scoped: map[string][]string{}}
+			g.add(tc.line)
+			for _, w := range tc.wantGlobal {
+				if !g.global[w] {
+					t.Errorf("global %q missing from %q", w, tc.line)
+				}
+			}
+			if len(tc.wantGlobal) != len(g.global) {
+				t.Errorf("global = %v, want exactly %v", g.global, tc.wantGlobal)
+			}
+			if got := len(g.scoped) > 0; got != tc.wantScoped {
+				t.Errorf("scoped = %v, want scoped=%v", g.scoped, tc.wantScoped)
+			}
+			if g.global["B"] {
+				t.Error("a column name was parsed as a privilege")
+			}
+		})
 	}
 }
 

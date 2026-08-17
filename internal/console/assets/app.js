@@ -610,9 +610,16 @@ async function submitPasswordChange(form, msg, firstSet) {
 
 // toast shows a transient notice. Use it for things that went RIGHT, or for
 // neutral progress. Failures must not fade — see toastError.
+//
+// A visible error OUTRANKS it. #toast is one shared node, and the common
+// sequence is a failure followed immediately by progress from another panel
+// ("Baseline started…", a poll's "still running"); overwriting would delete an
+// unread failure on a timer the operator never saw start. The dropped notice is
+// by definition the one that reports nothing went wrong.
 function toast(msg) {
   const t = document.getElementById("toast");
   if (!t) return;
+  if (!t.hidden && t.classList.contains("toast-error")) return;
   clearTimeout(toast._t);
   t.classList.remove("toast-error");
   t.removeAttribute("role");
@@ -633,17 +640,27 @@ function toastError(msg) {
   const t = document.getElementById("toast");
   if (!t) return;
   clearTimeout(toast._t);
+  // A second failure STACKS rather than replaces. These never auto-hide, so a
+  // silent overwrite would destroy an unread failure with nothing to hint one
+  // existed \u2014 two servers' baselines refusing together is the ordinary case.
+  const prior = t.hidden ? [] : $all(".toast-msg", t).map((n) => n.textContent);
+  if (prior.includes(msg)) return;
   t.classList.add("toast-error");
   // role=alert so a screen reader announces it; the visual persistence is
-  // useless to someone who cannot see it fade.
+  // useless to someone who cannot see it fade. The node is unhidden BEFORE the
+  // text lands: a live region that appears with its content already in place
+  // is the shape screen readers routinely fail to announce.
   t.setAttribute("role", "alert");
   t.replaceChildren();
-  t.append(el("span", { class: "toast-msg", text: msg }));
-  const close = el("button", { class: "toast-close", type: "button", "aria-label": "Dismiss" });
+  t.hidden = false;
+  const body = el("div", { class: "toast-body" });
+  for (const m of prior) body.append(el("span", { class: "toast-msg", text: m }));
+  body.append(el("span", { class: "toast-msg", text: msg }));
+  t.append(body);
+  const close = el("button", { class: "toast-close", type: "button", "aria-label": "Dismiss all" });
   close.textContent = "\u2715";
   close.addEventListener("click", () => dismissToast());
   t.append(close);
-  t.hidden = false;
 }
 
 function dismissToast() {
@@ -656,13 +673,32 @@ function dismissToast() {
 }
 
 // ESC dismisses a persistent error, matching every other dismissible surface
-// in this console. Registered once, and only acts on the error variant so it
-// cannot swallow an ESC meant for an open modal.
-document.addEventListener("keydown", (e) => {
+// in this console — but only as the LAST of them.
+//
+// Restricting this to the error variant is not enough on its own. cmdkKeydown
+// closes the ⌘K palette WITHOUT stopping propagation (deliberately, see
+// globalKeydown), so the same Escape reaches the document and would also
+// destroy an unread error — the failure this whole change exists to prevent,
+// arriving through a different door.
+//
+// Hence the CAPTURE phase (registered with `true` in init). Deciding on the
+// bubble phase cannot work: by then globalKeydown has already emptied #modal
+// and cmdkKeydown has already emptied #cmdk-mount, so the very state this
+// guard reads to yield the key has been erased by the handlers it is yielding
+// to, and it would dismiss the notice anyway. Capture runs before all of them,
+// while "is a dialog open" is still answerable.
+//
+// It never calls preventDefault or stopPropagation, so yielding is all it does
+// — the dialog handlers still run normally on the same event.
+function toastEscape(e) {
   if (e.key !== "Escape") return;
+  const cmdk = document.getElementById("cmdk-mount");
+  if (cmdk && cmdk.firstChild) return;
+  const modalMount = document.getElementById("modal");
+  if (modalMount && modalMount.firstChild) return;
   const t = document.getElementById("toast");
   if (t && !t.hidden && t.classList.contains("toast-error")) dismissToast();
-});
+}
 
 function renderError(container, err) {
   if (!container) return;
@@ -2196,7 +2232,7 @@ function openBusyModal(form, opts) {
         // vanished failure this modal exists to prevent. Tear down and
         // surface the error where it can be seen.
         teardown();
-        toast(opts.errTitle + ": " + msg);
+        toastError(opts.errTitle + ": " + msg);
         return;
       }
       panel.setAttribute("aria-busy", "false");
@@ -2489,7 +2525,7 @@ async function runState(form, history) {
 // and quietly restore to the wrong place.
 function aimUndoAtInstant(form, at) {
   const since = shiftSeconds(at, 1);
-  if (!since) { toast("Could not read the selected instant."); return; }
+  if (!since) { toastError("Could not read the selected instant."); return; }
   form.elements.since.value = since;
   form.elements.until.value = "";
   previewRecover(form);
@@ -2901,7 +2937,7 @@ async function acknowledgeCaptureSkips(total, btn) {
   } catch (err) {
     // The 409 here is the stale-tab refusal, and its message already says to
     // reload — surfacing the server's own text keeps the two in one voice.
-    toast("Could not mark as read: " + ((err && err.message) || err));
+    toastError("Could not mark as read: " + ((err && err.message) || err));
     if (btn) { btn.disabled = false; btn.textContent = "Mark as read"; }
     return;
   }
@@ -3229,7 +3265,7 @@ function duckdbCard() {
       downloadBlob("views.sql", sql, "text/plain");
       toast("views.sql downloaded — run it with: duckdb lake.db < views.sql");
     } catch (err) {
-      toast("could not generate views: " + ((err && err.message) || err));
+      toastError("could not generate views: " + ((err && err.message) || err));
     } finally {
       btn.disabled = false;
     }
@@ -3386,7 +3422,7 @@ async function setTelemetry(enabled) {
   try {
     await api("/api/telemetry", { method: "POST", body: JSON.stringify({ enabled: enabled }) });
   } catch (e) {
-    toast("Could not change telemetry: " + ((e && e.message) || e));
+    toastError("Could not change telemetry: " + ((e && e.message) || e));
     return;
   }
   toast(enabled ? "Telemetry turned on." : "Telemetry turned off — this daemon stops beaconing now.");
@@ -4692,7 +4728,7 @@ async function showRotationDialog() {
   if (loginGateRaised) return;
   let cur;
   try { cur = await api("/api/rotation"); }
-  catch (err) { toast("Could not load rotation settings: " + ((err && err.message) || err)); return; }
+  catch (err) { toastError("Could not load rotation settings: " + ((err && err.message) || err)); return; }
 
   const mount = document.getElementById("modal");
   const scrim = el("div", { class: "modal-scrim show" });
@@ -5016,7 +5052,7 @@ async function editServer(id) {
   // as an uncaught error, not masquerade as "failed to load server".
   let s;
   try { s = await api("/api/servers/" + encodeURIComponent(id)); }
-  catch (err) { toast("Could not load server: " + ((err && err.message) || err)); return false; }
+  catch (err) { toastError("Could not load server: " + ((err && err.message) || err)); return false; }
   showServerForm(s);
   return true;
 }
@@ -5049,7 +5085,7 @@ async function saveServer(form) {
 async function deleteServer(s) {
   if (!window.confirm('Remove server "' + s.name + '"? This only removes the saved connection — nothing happens to the server itself.')) return;
   try { await api("/api/servers/" + encodeURIComponent(s.id), { method: "DELETE" }); }
-  catch (err) { toast("Could not remove server: " + ((err && err.message) || err)); return; }
+  catch (err) { toastError("Could not remove server: " + ((err && err.message) || err)); return; }
   if (currentServer === s.id) { await switchServer(""); const sel = document.getElementById("server-select"); if (sel) sel.value = defaultServerId; }
   await refreshServersList();
   toast("Server removed");
@@ -5113,7 +5149,7 @@ function renderDoctor(report) {
 
 async function startMonitor(id) {
   try { return await api("/api/servers/" + encodeURIComponent(id) + "/monitor/start", { method: "POST", body: {} }); }
-  catch (err) { toast("Could not start: " + ((err && err.message) || err)); return null; }
+  catch (err) { toastError("Could not start: " + ((err && err.message) || err)); return null; }
 }
 
 async function startMonitorRow(id) {
@@ -5127,12 +5163,13 @@ async function startMonitorRow(id) {
   if (opened) {
     renderDoctor(res.doctor);
     formMsg(res.started ? "Monitoring started — review the warnings below" : "Startup checks failed — fix the items below, save, and start again", !res.started);
-  } else { toast(res.started ? "Monitoring started — with warnings" : "Startup checks failed"); }
+  } else if (res.started) { toast("Monitoring started — with warnings"); }
+  else { toastError("Startup checks failed"); }
 }
 
 async function stopMonitorRow(id) {
   try { await api("/api/servers/" + encodeURIComponent(id) + "/monitor/stop", { method: "POST", body: {} }); toast("Monitoring stopped"); }
-  catch (err) { toast("Could not stop: " + ((err && err.message) || err)); }
+  catch (err) { toastError("Could not stop: " + ((err && err.message) || err)); }
   await refreshServersList();
 }
 
@@ -5279,7 +5316,7 @@ async function bootSequence() {
   // error when its fetch fails.
   try { servers = await loadServers(); } catch (err) {
     if (err && err.status === 401) return null;
-    toast("Could not load servers: " + ((err && err.message) || err));
+    toastError("Could not load servers: " + ((err && err.message) || err));
   }
   try { await gateCapabilities(); } catch (err) {
     if (err && err.status === 401) return null;
@@ -5295,6 +5332,10 @@ async function init() {
   document.getElementById("open-cmdk").addEventListener("click", openCmdk);
   document.getElementById("logout-btn").addEventListener("click", doLogout);
   document.addEventListener("keydown", globalKeydown);
+  // Capture phase on purpose — see toastEscape. An Escape that closes a dialog
+  // must not also dismiss an error notice behind it, and only the capture phase
+  // still sees that the dialog was open.
+  document.addEventListener("keydown", toastEscape, true);
 
   // Sidebar nav (real hrefs upgraded to in-place swaps). A manual nav starts
   // fresh — clear any carried "Undo" context so the sidebar's Recover link
@@ -5329,7 +5370,7 @@ async function init() {
     // password): raise the gate with the SSO entry instead of toasting about
     // a printed token link that never existed in that deployment.
     if (auth.sso_start) { showLoginOverlay({ passwordLogin: false, ssoName: auth.sso_name, ssoStart: auth.sso_start }); return; }
-    toast("No token in URL — open the link printed by `bintrail-console`.");
+    toastError("No token in URL — open the link printed by `bintrail-console`.");
   }
 
   const servers = await bootSequence();

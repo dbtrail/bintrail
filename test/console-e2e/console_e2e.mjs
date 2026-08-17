@@ -1841,6 +1841,82 @@ try {
   (busyRun.typed.submitted && busyRun.typed.panel)
     ? ok("restore combo: a typed table not in the listing still submits end-to-end")
     : bad("restore combo: a typed table not in the listing still submits end-to-end", JSON.stringify(busyRun.typed));
+
+  // ── persistent failure notices (#1381) ───────────────────────────────────
+  // A failure notice that fades is a failure nobody saw. The baseline privilege
+  // refusal is ~550 characters of remediation, and at the old 2.2s auto-hide it
+  // was unreadable and unrecoverable — it was reported from a screenshot caught
+  // by luck. These assertions exist so a re-added setTimeout, or an ESC handler
+  // that stops discriminating, cannot ship silently.
+  const toastRun = await page.evaluate(async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const t = document.getElementById("toast");
+    const shown = () => !t.hidden && t.classList.contains("toast-error");
+
+    toastError("Refusal one: grant LOCK TABLES.");
+    const immediately = shown();
+    // Comfortably past the 2.2s auto-hide a transient toast would have used.
+    await sleep(2600);
+    const survivesAutoHide = shown();
+
+    // A success notice must not silently delete an unread failure.
+    toast("Baseline started…");
+    const survivesSuccess = shown() && /Refusal one/.test(t.textContent);
+
+    // A second failure stacks rather than overwrites.
+    toastError("Refusal two: BACKUP_ADMIN cannot be granted on RDS.");
+    const stacked = /Refusal one/.test(t.textContent) && /Refusal two/.test(t.textContent);
+
+    // ESC belongs to an open dialog first. Put something in the shared modal
+    // slot and confirm the notice survives that Escape.
+    const modalMount = document.getElementById("modal");
+    modalMount.append(document.createElement("div"));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(50);
+    const survivesModalEsc = shown();
+    modalMount.replaceChildren();
+
+    // With nothing else open, ESC dismisses it.
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(50);
+    const escDismisses = t.hidden;
+
+    // And so does the close button.
+    toastError("Refusal three.");
+    const closeBtn = t.querySelector(".toast-close");
+    if (closeBtn) closeBtn.click();
+    await sleep(50);
+    const closeDismisses = t.hidden && !t.classList.contains("toast-error");
+
+    // A success notice still fades once no error is showing.
+    toast("Done");
+    const successShown = !t.hidden;
+    await sleep(2600);
+    return {
+      immediately, survivesAutoHide, survivesSuccess, stacked,
+      survivesModalEsc, escDismisses, closeDismisses,
+      successShown, successFaded: t.hidden,
+    };
+  });
+
+  (toastRun.immediately && toastRun.survivesAutoHide)
+    ? ok("toast: a failure notice is still on screen well past the transient auto-hide")
+    : bad("toast: a failure notice is still on screen well past the transient auto-hide", JSON.stringify(toastRun));
+  toastRun.survivesSuccess
+    ? ok("toast: a success notice does not overwrite an unread failure")
+    : bad("toast: a success notice does not overwrite an unread failure", JSON.stringify(toastRun));
+  toastRun.stacked
+    ? ok("toast: concurrent failures stack instead of replacing each other")
+    : bad("toast: concurrent failures stack instead of replacing each other", JSON.stringify(toastRun));
+  toastRun.survivesModalEsc
+    ? ok("toast: an ESC meant for an open dialog does not destroy the failure notice")
+    : bad("toast: an ESC meant for an open dialog does not destroy the failure notice", JSON.stringify(toastRun));
+  (toastRun.escDismisses && toastRun.closeDismisses)
+    ? ok("toast: ESC and the close button both dismiss the failure notice")
+    : bad("toast: ESC and the close button both dismiss the failure notice", JSON.stringify(toastRun));
+  (toastRun.successShown && toastRun.successFaded)
+    ? ok("toast: success notices still fade on their own")
+    : bad("toast: success notices still fade on their own", JSON.stringify(toastRun));
   (busyRun.previewBusy.modalOpen && /Previewing affected rows/.test(busyRun.previewBusy.title))
     ? ok("busy modal: Preview rows adopts the same busy affordance")
     : bad("busy modal: Preview rows adopts the same busy affordance", JSON.stringify(busyRun.previewBusy).slice(0, 200));

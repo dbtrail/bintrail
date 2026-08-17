@@ -2,12 +2,16 @@ package cliapp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/mydumperlock"
 )
 
 // fakeMydumper0180 writes a fake mydumper that reports a version NEW ENOUGH to
@@ -118,3 +122,55 @@ func TestRunDumpSafeNoLockSkipsPreflightAndCarriesTheMode(t *testing.T) {
 		t.Errorf("argv = %q; the operator asked for safe-no-lock and mydumper was told something else", argv)
 	}
 }
+
+// TestRunDumpForwardsTheSelectedModeToThePreflight closes a gap that a green
+// suite hid: nothing verified that the mode the OPERATOR chose is the mode the
+// privilege check judges. Hardcoding baseline.LockModeFTWRL at the call site
+// passed every other test in this package, because an unreachable source fails
+// identically for every mode.
+//
+// The consequence of that mutation is exactly #1381: an RDS operator passes
+// --lock-mode lock-all, is judged against ftwrl's requirements, and is told to
+// grant BACKUP_ADMIN — which RDS refuses to grant at all.
+func TestRunDumpForwardsTheSelectedModeToThePreflight(t *testing.T) {
+	dir := t.TempDir()
+	bin, _ := fakeMydumper0180(t, dir)
+
+	stubPingSource(t)
+	dumpLockDir = func() string { return dir }
+	t.Cleanup(func() { dumpLockDir = os.TempDir })
+
+	var got baseline.LockMode
+	var gotRemedy mydumperlock.Remedy
+	checkMydumperPrivileges = func(_ context.Context, _ string, m baseline.LockMode, r mydumperlock.Remedy) error {
+		got, gotRemedy = m, r
+		return errStopAfterPreflight
+	}
+	t.Cleanup(func() { checkMydumperPrivileges = mydumperlock.CheckPrivileges })
+
+	dmpSourceDSN = "u:p@tcp(127.0.0.1:1)/"
+	dmpOutputDir = filepath.Join(dir, "out")
+	dmpMydumperPath = bin
+	dmpLockMode = "lock-all"
+	dmpFormat = "text"
+	t.Cleanup(func() { dmpLockMode = "ftwrl"; dmpSourceDSN = ""; dmpOutputDir = "" })
+
+	cmd := newDumpCmdForTest(t)
+	if err := cmd.Flags().Set("mydumper-path", bin); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("lock-mode", "lock-all"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDump(cmd, nil); !errors.Is(err, errStopAfterPreflight) {
+		t.Fatalf("runDump err = %v, want the preflight's own error to propagate unchanged", err)
+	}
+	if got != baseline.LockModeLockAll {
+		t.Errorf("preflight judged %q, but the operator asked for lock-all — on RDS this refuses a working config", got)
+	}
+	if gotRemedy != mydumperlock.RemedyCLI {
+		t.Errorf("remedy = %q, want the CLI's own knob named in the refusal", gotRemedy)
+	}
+}
+
+var errStopAfterPreflight = errors.New("stop after preflight")

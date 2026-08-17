@@ -430,9 +430,12 @@ Notes:
   — same default as `bintrail dump`. FTWRL holds one global read lock only
   long enough for every worker to open its snapshot at the same instant, and
   needs `RELOAD`/`FLUSH_TABLES` (plus `BACKUP_ADMIN` on MySQL/Percona 8.0+).
-  Set `BASELINE_LOCK_MODE=safe-no-lock` to dump without those privileges (it
+  On **managed MySQL (RDS/Aurora) `BACKUP_ADMIN` cannot be granted**, so
+  `ftwrl` cannot run there: set `BASELINE_LOCK_MODE=lock-all`, which is
+  equally point-consistent and needs only `LOCK TABLES`. Otherwise
+  `BASELINE_LOCK_MODE=safe-no-lock` dumps without either privilege (it
   aborts rather than write a torn snapshot, so expect it to refuse on a
-  write-active source) or `=no-lock` to accept a torn one. It still reads every row of the selected
+  write-active source) or `=no-lock` accepts a torn one. It still reads every row of the selected
   schemas; schedule it off-peak for large sources. On sources with
   non-transactional tables (MyISAM), the binlog coordinates embedded in the
   snapshot may not exactly match those tables' data — the same caveat as

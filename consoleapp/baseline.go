@@ -20,6 +20,14 @@ import (
 	"github.com/dbtrail/dbtrail/internal/pgbaseline"
 )
 
+// checkMydumperPrivileges is mydumperlock.CheckPrivileges behind a seam, so a
+// test can observe the LOCK MODE this call site actually forwards. Without it
+// the argument is unverifiable: every mode fails identically against an
+// unreachable source, so hardcoding one here passes the whole suite while
+// re-introducing #1381 — an operator who selected lock-all gets judged against
+// ftwrl's requirements and told to grant BACKUP_ADMIN, which RDS refuses.
+var checkMydumperPrivileges = mydumperlock.CheckPrivileges
+
 // baselineSupervisor implements console.BaselineController by running the
 // dump→convert→upload pipeline IN-PROCESS (#613): the console image bundles
 // mydumper, so a baseline never starts a sibling container and the daemon never
@@ -268,7 +276,7 @@ func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDi
 		// Hard gate, unlike the NO_LOCK warning below: granting BACKUP_ADMIN
 		// without RELOAD/FLUSH_TABLES does not fail cleanly in mydumper — it
 		// SEGFAULTS (verified against the pinned build, #800). Never skipped.
-		if err := mydumperlock.CheckPrivileges(ctx, sourceDSN, lockMode, mydumperlock.RemedyConsole); err != nil {
+		if err := checkMydumperPrivileges(ctx, sourceDSN, lockMode, mydumperlock.RemedyConsole); err != nil {
 			return err
 		}
 	} else if lockMode == baseline.LockModeNoLock {
@@ -314,14 +322,16 @@ const systemSchemaExcludeRegex = `^(?!(mysql|sys|performance_schema|information_
 // (#800, #1377). internal/baseline.LockMode carries the measured comparison of
 // the three modes; the two consequences specific to THIS call site:
 //
-//   - FTWRL (the default) covers TRANSACTIONAL tables only, and --trx-tables
-//     makes mydumper REFUSE the whole dump when it finds a non-transactional
-//     one ("Non transactional table found ... Restart backup using
+//   - EVERY point-consistent mode covers TRANSACTIONAL tables only — LOCK_ALL
+//     exactly as much as FTWRL, verified for each — and --trx-tables makes
+//     mydumper REFUSE the whole dump when it finds a non-transactional one
+//     ("Non transactional table found ... Restart backup using
 //     --trx-tables=0"), which the console propagates as the run's error. The
 //     same flag under NO_LOCK only warns and proceeds — verified empirically
 //     on the identical MyISAM table (#800). The refusal is gated to an actual
 //     "consistent backup attempt" in mydumper's own wording, which NO_LOCK is
-//     explicitly not making.
+//     explicitly not making. So this is NOT a reason to move an RDS source off
+//     LOCK_ALL: switching modes among the consistent ones cannot avoid it.
 //   - FTWRL needs RELOAD/FLUSH_TABLES on every flavor, plus BACKUP_ADMIN on
 //     MySQL/Percona 8.0+ (for LOCK INSTANCE FOR BACKUP). Granting BACKUP_ADMIN
 //     WITHOUT RELOAD does not fail cleanly — the pinned build SEGFAULTS — which
@@ -396,10 +406,11 @@ func warnIfMultiTableNoLock(ctx context.Context, sourceDSN string, schemas []str
 	if count > 1 {
 		slog.Warn("baseline: dumping multiple tables under no-lock — each table's snapshot is "+
 			"anchored at a slightly different instant (no cross-table synchronization barrier), so a multi-table "+
-			"reconstruct (e.g. a parent/child FK pair) can be mutually inconsistent; unset "+
-			"BINTRAIL_CONSOLE_BASELINE_LOCK_MODE to return to the point-consistent default across all transactional "+
-			"tables (requires the RELOAD or FLUSH_TABLES privilege; MySQL/Percona 8.0+ also requires BACKUP_ADMIN, not "+
-			"needed on MariaDB or MySQL 5.7) — see docs/dump-and-baseline.md",
+			"reconstruct (e.g. a parent/child FK pair) can be mutually inconsistent; set "+
+			"BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=lock-all for a point-consistent snapshot (needs only LOCK TABLES, and "+
+			"is the mode that works on managed MySQL such as RDS), or unset it for the ftwrl default (requires the "+
+			"RELOAD or FLUSH_TABLES privilege; MySQL/Percona 8.0+ also requires BACKUP_ADMIN, which RDS will not grant "+
+			"and which MariaDB and MySQL 5.7 do not have) — see docs/dump-and-baseline.md",
 			"tables", count)
 	}
 }

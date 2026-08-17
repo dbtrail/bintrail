@@ -1,10 +1,13 @@
 package consoleapp
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/mydumperlock"
 )
 
 // TestConsoleBaselineDefaultsToConsistent: the console's Create-baseline button
@@ -41,5 +44,37 @@ func TestBuildConsoleMydumperArgsCarriesLockMode(t *testing.T) {
 		if args[i+1] != tc.want {
 			t.Errorf("mode %s produced %q, want %q", tc.mode, args[i+1], tc.want)
 		}
+	}
+}
+
+// TestRunMydumperForwardsTheSelectedModeToThePreflight is the console's half of
+// the CLI's identically-named test. The console had NO preflight test at all,
+// so hardcoding a mode at this call site passed the whole package.
+//
+// This is the surface where it matters most: the console is where the
+// **Create baseline** button lives, and BINTRAIL_CONSOLE_BASELINE_LOCK_MODE is
+// the only way its operator can select lock-all. Judging their choice against
+// ftwrl's requirements is #1381 — a refusal demanding BACKUP_ADMIN, which
+// managed MySQL will not grant under any circumstances.
+func TestRunMydumperForwardsTheSelectedModeToThePreflight(t *testing.T) {
+	var got baseline.LockMode
+	var gotRemedy mydumperlock.Remedy
+	sentinel := errors.New("stop after preflight")
+	checkMydumperPrivileges = func(_ context.Context, _ string, m baseline.LockMode, r mydumperlock.Remedy) error {
+		got, gotRemedy = m, r
+		return sentinel
+	}
+	t.Cleanup(func() { checkMydumperPrivileges = mydumperlock.CheckPrivileges })
+
+	err := runMydumper(context.Background(), "u:p@tcp(127.0.0.1:1)/db", []string{"appdb"},
+		t.TempDir(), baseline.LockModeLockAll)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("runMydumper err = %v, want the preflight's own error to propagate unchanged", err)
+	}
+	if got != baseline.LockModeLockAll {
+		t.Errorf("preflight judged %q, but the console was configured for lock-all — on RDS this refuses a working config", got)
+	}
+	if gotRemedy != mydumperlock.RemedyConsole {
+		t.Errorf("remedy = %q, want the console's own knob named in the refusal", gotRemedy)
 	}
 }

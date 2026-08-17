@@ -14,25 +14,14 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/config"
 )
-
-// requiredPrivileges are the MySQL privileges the pinned
-// mydumper build (v1.0.3-1) can need for --sync-thread-lock-mode FTWRL,
-// verified empirically against a real MySQL 8.0 source (#800): BACKUP_ADMIN
-// for `LOCK INSTANCE FOR BACKUP` (checked first — missing it alone fails
-// cleanly with a CRITICAL "Access denied ... BACKUP_ADMIN" and exit 1) and
-// RELOAD or the FLUSH_TABLES dynamic privilege for the subsequent `FLUSH
-// TABLES WITH READ LOCK` (missing THIS one while BACKUP_ADMIN is present does
-// NOT fail cleanly — mydumper segfaults). BACKUP_ADMIN itself is required only
-// on MySQL/Percona 8.0+ — see RequiresBackupAdmin. Both classic (RELOAD)
-// and dynamic (BACKUP_ADMIN, FLUSH_TABLES) privileges appear side by side in
-// information_schema.USER_PRIVILEGES on MySQL 8.0+.
-var requiredPrivileges = []string{"BACKUP_ADMIN", "RELOAD", "FLUSH_TABLES"}
 
 // requiresBackupAdmin reports whether the connected server needs the
 // BACKUP_ADMIN privilege for FTWRL's `LOCK INSTANCE FOR BACKUP` step.
@@ -84,21 +73,22 @@ func serverMajorVersion(version string) (major int, ok bool) {
 	return n, true
 }
 
-// CheckPrivileges queries the source for its required
-// point-consistent privileges and fails loudly, before mydumper ever runs,
-// unless they are present. This is a hard gate, not an advisory warning:
-// unlike the no-lock skew warning in consoleapp, a query failure here aborts the dump
-// rather than being swallowed, because the alternative — letting mydumper
-// attempt FTWRL half-privileged — is a segfault, not a clean error (#800).
-// Never silently falls back to NO_LOCK.
-// Remedy is how the CALLING surface selects a weaker lock mode. It is a
-// parameter because the refusal text is the one actionable sentence an
-// operator gets, and naming the other surface's knob is worse than naming
-// none: `bintrail dump` does not read the console's environment variable, and
-// the console has no flags. Both callers reach this on their DEFAULT path
-// since #1377, so this is the first thing an upgrading least-privilege
-// deployment sees on either one.
+// Remedy identifies the CALLING surface, so a refusal can name that surface's
+// own way of selecting a different lock mode. It is a parameter because the
+// refusal text is the one actionable sentence an operator gets, and naming the
+// other surface's knob is worse than naming none: `bintrail dump` does not read
+// the console's environment variable, and the console has no flags. Both
+// callers reach this on their DEFAULT path since #1377, so this is the first
+// thing an upgrading least-privilege deployment sees on either one.
 type Remedy string
+
+const (
+	// RemedyCLI marks `bintrail dump`, whose knob is the --lock-mode flag.
+	RemedyCLI Remedy = "cli"
+	// RemedyConsole marks the console daemon, which has no flag surface and is
+	// configured by environment variable.
+	RemedyConsole Remedy = "console"
+)
 
 // forMode renders this surface's way of selecting a specific mode.
 func (r Remedy) forMode(m baseline.LockMode) string {
@@ -108,23 +98,140 @@ func (r Remedy) forMode(m baseline.LockMode) string {
 	return "set BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=" + string(m)
 }
 
-const (
-	// RemedyCLI is `bintrail dump`'s knob.
-	RemedyCLI Remedy = "cli"
-	// RemedyConsole is the console daemon's; it has no flag surface.
-	RemedyConsole Remedy = "console"
-)
+// noCheckModes names the modes that skip this gate entirely. It is the escape
+// hatch offered when the CHECK ITSELF could not run — suggesting lock-all there
+// would be useless, since lock-all is verified by this same query. Without it,
+// an operator whose source cannot answer SHOW GRANTS gets a hard stop on the
+// default path with nothing to try.
+func (r Remedy) noCheckModes() string {
+	return " — to proceed without this check, " + r.forMode(baseline.LockModeSafeNoLock) +
+		", which needs no privilege but ABORTS rather than write a snapshot stitched from" +
+		" several instants; or " + r.forMode(baseline.LockModeNoLock) + " to accept such a snapshot"
+}
 
+// CheckPrivileges queries the source for the privileges the requested
+// point-consistent lock mode needs and fails loudly, before mydumper ever runs,
+// unless they are present. This is a hard gate, not an advisory warning:
+// unlike the no-lock skew warning in consoleapp, a query failure here aborts the
+// dump rather than being swallowed, because the alternative — letting mydumper
+// attempt FTWRL half-privileged — is a segfault, not a clean error (#800).
+// Never silently falls back to a mode that is not point-consistent.
 func CheckPrivileges(ctx context.Context, sourceDSN string, mode baseline.LockMode, remedy Remedy) error {
 	db, err := config.Connect(sourceDSN)
 	if err != nil {
-		return fmt.Errorf("point-consistent baseline: cannot connect to source to verify privileges: %w", err)
+		return fmt.Errorf("point-consistent baseline: cannot connect to source to verify privileges: %w%s", err, remedy.noCheckModes())
 	}
 	defer db.Close()
 	return checkPrivilegesDB(ctx, db, mode, remedy)
 }
 
-// grantedPrivileges reads the connecting user's GLOBAL privileges.
+// grantSet is what SHOW GRANTS FOR CURRENT_USER() told us, split by SCOPE.
+// The distinction is load-bearing: FTWRL's privileges are global-only, while
+// LOCK_ALL's LOCK TABLES is grantable per schema and is routinely held that
+// way by a least-privilege account.
+type grantSet struct {
+	// global holds privileges granted ON *.*.
+	global map[string]bool
+	// scoped maps a privilege to the objects it was granted on (`db`.*,
+	// `db`.`tbl`). Kept as the raw object text so a refusal can quote back
+	// what the operator's own SHOW GRANTS shows.
+	scoped map[string][]string
+	// unparsed counts grant lines this parser did not recognise as either a
+	// privilege grant or a role membership. It exists so a misparse is
+	// DEBUGGABLE: the failure this whole package is fixing was a check that
+	// refused confidently while reading the wrong source, and the operator had
+	// no way to tell a real refusal from a blind one.
+	unparsed int
+}
+
+// grantedGlobally reports whether p was granted ON *.*, directly or via
+// ALL PRIVILEGES. This is the right question for RELOAD, FLUSH_TABLES and
+// BACKUP_ADMIN: MySQL only accepts those at global scope.
+func (g *grantSet) grantedGlobally(p string) bool {
+	return g.global[p] || g.global["ALL PRIVILEGES"]
+}
+
+// grantedAnywhere reports whether p was granted at ANY scope. This is the
+// right question for LOCK TABLES under LOCK_ALL — see checkPrivilegesDB.
+func (g *grantSet) grantedAnywhere(p string) bool {
+	return g.grantedGlobally(p) || len(g.scoped[p]) > 0 || len(g.scoped["ALL PRIVILEGES"]) > 0
+}
+
+// scopesFor renders the objects p was granted on, for a message.
+func (g *grantSet) scopesFor(p string) string {
+	s := append([]string{}, g.scoped[p]...)
+	s = append(s, g.scoped["ALL PRIVILEGES"]...)
+	sort.Strings(s)
+	return strings.Join(s, ", ")
+}
+
+// add parses one SHOW GRANTS line into the set.
+func (g *grantSet) add(line string) {
+	if !strings.HasPrefix(line, "GRANT ") {
+		g.unparsed++
+		return
+	}
+	rest := line[len("GRANT "):]
+	oi := strings.Index(rest, " ON ")
+	if oi < 0 {
+		// A role membership: "GRANT `r`@`%` TO `u`@`%`". Not a privilege grant,
+		// and nothing is lost by skipping it — MySQL expands an ACTIVE role's
+		// privileges into their own ON *.* lines in this same result set
+		// (measured on MySQL 8.0: a user whose RELOAD and FLUSH_TABLES came
+		// only from a default-activated role saw both listed inline, attributed
+		// to the user). Not counted as unparsed: it is a normal line.
+		return
+	}
+	obj := rest[oi+len(" ON "):]
+	ti := strings.Index(obj, " TO ")
+	if ti < 0 {
+		g.unparsed++
+		return
+	}
+	names := splitPrivileges(rest[:oi])
+	if len(names) == 0 {
+		g.unparsed++
+		return
+	}
+	if obj = strings.TrimSpace(obj[:ti]); obj == "*.*" {
+		for _, n := range names {
+			g.global[n] = true
+		}
+		return
+	}
+	for _, n := range names {
+		g.scoped[n] = append(g.scoped[n], obj)
+	}
+}
+
+// splitPrivileges turns "SELECT (a, b), LOCK TABLES" into the privilege names
+// alone. Column lists are stripped BEFORE the comma split — splitting first
+// would parse the column names as privileges.
+func splitPrivileges(s string) []string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch {
+		case r == '(':
+			depth++
+		case r == ')':
+			if depth > 0 {
+				depth--
+			}
+		case depth == 0:
+			b.WriteRune(r)
+		}
+	}
+	var out []string
+	for _, p := range strings.Split(b.String(), ",") {
+		if p = strings.ToUpper(strings.TrimSpace(p)); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// parseGrants reads the connecting user's privileges.
 //
 // It parses SHOW GRANTS FOR CURRENT_USER() rather than reading
 // information_schema.USER_PRIVILEGES, which was the source until this was
@@ -134,47 +241,37 @@ func CheckPrivileges(ctx context.Context, sourceDSN string, mode baseline.LockMo
 // SHOW GRANTS listed RELOAD and FLUSH_TABLES as direct grants. Reading it made
 // this check fail CLOSED on every managed source, which since #1377 made the
 // point-consistent default unreachable there. SHOW GRANTS needs no privilege
-// to run for the current user and expands whatever the session actually has.
-//
-// Only global grants count: a privilege is what it is on `ON *.*`, and a
-// schema-scoped grant does not authorize FLUSH TABLES WITH READ LOCK or
-// LOCK INSTANCE FOR BACKUP.
-func grantedPrivileges(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+// to run for the current user and expands whatever the session actually has,
+// including the privileges of active roles.
+func parseGrants(ctx context.Context, db *sql.DB) (*grantSet, error) {
 	rows, err := db.QueryContext(ctx, "SHOW GRANTS FOR CURRENT_USER()")
 	if err != nil {
 		return nil, fmt.Errorf("point-consistent baseline: cannot verify source privileges: %w", err)
 	}
 	defer rows.Close()
 
-	have := map[string]bool{}
+	g := &grantSet{global: map[string]bool{}, scoped: map[string][]string{}}
 	for rows.Next() {
 		var line string
 		if err := rows.Scan(&line); err != nil {
 			return nil, fmt.Errorf("point-consistent baseline: cannot read source privileges: %w", err)
 		}
-		// "GRANT <privs> ON *.* TO ..." — anything else (schema grants, role
-		// memberships, proxy grants) carries no global privilege.
-		const on = " ON *.* TO "
-		idx := strings.Index(line, on)
-		if idx < 0 || !strings.HasPrefix(line, "GRANT ") {
-			continue
-		}
-		for _, p := range strings.Split(line[len("GRANT "):idx], ",") {
-			p = strings.ToUpper(strings.TrimSpace(p))
-			// A privilege can carry a column list, e.g. SELECT (col). Keep the
-			// name; the parenthesised part is never global-only anyway.
-			if k := strings.IndexByte(p, '('); k >= 0 {
-				p = strings.TrimSpace(p[:k])
-			}
-			if p != "" {
-				have[p] = true
-			}
-		}
+		g.add(line)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("point-consistent baseline: cannot read source privileges: %w", err)
 	}
-	return have, nil
+	// The parsed verdict is the input to a refusal an operator reads mid-incident.
+	// Log what we actually read so a misparse is diagnosable from the daemon log
+	// instead of being indistinguishable from a genuine refusal.
+	names := make([]string, 0, len(g.global))
+	for n := range g.global {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	slog.Debug("read source privileges for baseline lock mode",
+		"global", names, "scoped", g.scoped, "unrecognized_lines", g.unparsed)
+	return g, nil
 }
 
 // checkPrivilegesDB is CheckPrivileges' core logic against an already-open
@@ -184,37 +281,60 @@ func grantedPrivileges(ctx context.Context, db *sql.DB) (map[string]bool, error)
 //   - FTWRL needs RELOAD or FLUSH_TABLES on every flavor, plus BACKUP_ADMIN on
 //     MySQL/Percona 8.0+ (it issues LOCK INSTANCE FOR BACKUP first). Granting
 //     BACKUP_ADMIN WITHOUT RELOAD does not fail cleanly — the pinned build
-//     SEGFAULTS — which is why this check exists at all.
-//   - LOCK_ALL needs LOCK TABLES and nothing else. This is the mode that works
-//     on managed MySQL, where BACKUP_ADMIN is not grantable.
+//     SEGFAULTS — which is why this check exists at all. All three are
+//     global-only privileges, so only an ON *.* grant can satisfy them.
+//   - LOCK_ALL needs LOCK TABLES, at ANY scope. mydumper's own help names it as
+//     one of the two modes it supports on RDS/Aurora ("We support LOCK_ALL and
+//     SAFE_NO_LOCK modes for RDS/Aurora", string in the pinned v1.0.3-1 binary),
+//     and it locks the EXPORTED TABLES rather than the instance — so a
+//     least-privilege account holding LOCK TABLES on just the dumped schema is
+//     enough. Verified: a dump ran to completion with only
+//     `GRANT SELECT, LOCK TABLES, SHOW VIEW ON \`appdb\`.*`. Requiring it
+//     globally would refuse a configuration that demonstrably works, which is
+//     the exact defect (#1381) this mode was added to fix.
 //   - The low-privilege modes never reach here.
 //
-// ALL PRIVILEGES satisfies any of them.
+// ALL PRIVILEGES satisfies any of them at the matching scope.
 func checkPrivilegesDB(ctx context.Context, db *sql.DB, mode baseline.LockMode, remedy Remedy) error {
-	have, err := grantedPrivileges(ctx, db)
+	g, err := parseGrants(ctx, db)
 	if err != nil {
 		return err
 	}
-	if have["ALL PRIVILEGES"] {
-		return nil
-	}
 
-	const roleCaveat = " (if these are granted through a role, activate it for this connection — SHOW GRANTS reflects the session's active roles)"
+	// SHOW GRANTS expands the privileges of a session's ACTIVE roles (measured
+	// on MySQL 8.0). The remedy is therefore server-side: bintrail opens this
+	// connection itself and mydumper opens its own, so there is no point at
+	// which an operator could issue SET ROLE for either.
+	const roleCaveat = " (if these are granted through a role, make it active on connect —" +
+		" SET DEFAULT ROLE ALL TO '<user>'@'<host>', or activate_all_roles_on_login=ON —" +
+		" since neither this check nor mydumper can issue SET ROLE on its own connection)"
 
 	if mode == baseline.LockModeLockAll {
-		if have["LOCK TABLES"] {
+		if g.grantedAnywhere("LOCK TABLES") {
+			if !g.grantedGlobally("LOCK TABLES") {
+				// Accepted, but say which schemas it covers: if the dump reaches a
+				// schema outside them mydumper fails cleanly, and this line is what
+				// makes that error make sense.
+				slog.Info("lock-all: LOCK TABLES is granted per schema, not globally;"+
+					" the dump must stay within these", "scopes", g.scopesFor("LOCK TABLES"))
+			}
 			return nil
 		}
-		return fmt.Errorf("lock-all baseline mode requires the LOCK TABLES privilege; the current user does not have it"+
-			" — grant it, e.g. GRANT LOCK TABLES ON *.* TO '<user>'@'%%'%s", roleCaveat)
+		return fmt.Errorf("lock-all baseline mode requires the LOCK TABLES privilege, which the current user does not"+
+			" have at any scope — grant it, e.g. GRANT LOCK TABLES ON *.* TO '<user>'@'%%' (a grant on just the dumped"+
+			" schema also works, since LOCK_ALL locks the exported tables)%s%s", roleCaveat, remedy.noCheckModes())
+	}
+
+	if g.grantedGlobally("ALL PRIVILEGES") {
+		return nil
 	}
 
 	requireBackupAdmin, err := requiresBackupAdmin(ctx, db)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w%s", err, remedy.noCheckModes())
 	}
-	hasFlush := have["RELOAD"] || have["FLUSH_TABLES"]
-	missingBackupAdmin := requireBackupAdmin && !have["BACKUP_ADMIN"]
+	hasFlush := g.grantedGlobally("RELOAD") || g.grantedGlobally("FLUSH_TABLES")
+	missingBackupAdmin := requireBackupAdmin && !g.grantedGlobally("BACKUP_ADMIN")
 	if hasFlush && !missingBackupAdmin {
 		return nil
 	}
@@ -229,12 +349,14 @@ func checkPrivilegesDB(ctx context.Context, db *sql.DB, mode baseline.LockMode, 
 	// operator hunting a privilege their server cannot have.
 	lockAllNote := ", which is also point-consistent and needs only LOCK TABLES"
 	if requireBackupAdmin {
-		lockAllNote += " (the mode that works on managed MySQL, where BACKUP_ADMIN cannot be granted at all)"
+		lockAllNote += " (the mode that works on managed MySQL, where BACKUP_ADMIN cannot be granted at all;" +
+			" mydumper's own help names LOCK_ALL and SAFE_NO_LOCK as the modes it supports on RDS/Aurora)"
 	}
 	alternatives := " — or " + remedy.forMode(baseline.LockModeLockAll) + lockAllNote +
 		"; or " + remedy.forMode(baseline.LockModeSafeNoLock) +
 		", which needs no privilege but ABORTS rather than write a snapshot stitched from several instants," +
-		" so expect it to refuse on a write-active source; or no-lock to accept such a snapshot"
+		" so expect it to refuse on a write-active source; or " + remedy.forMode(baseline.LockModeNoLock) +
+		" to accept such a snapshot"
 
 	switch {
 	case !hasFlush && missingBackupAdmin:
@@ -242,8 +364,19 @@ func checkPrivilegesDB(ctx context.Context, db *sql.DB, mode baseline.LockMode, 
 			" BACKUP_ADMIN and the RELOAD (or FLUSH_TABLES) privilege (MySQL/Percona 8.0+); the current user has"+
 			" neither — grant both, e.g. GRANT BACKUP_ADMIN, RELOAD ON *.* TO '<user>'@'%%'%s%s", alternatives, roleCaveat)
 	case !hasFlush:
-		return fmt.Errorf("point-consistent baseline mode requires the RELOAD (or FLUSH_TABLES) privilege; the current"+
-			" user has neither — grant it, e.g. GRANT RELOAD ON *.* TO '<user>'@'%%'%s%s", alternatives, roleCaveat)
+		// Reached when BACKUP_ADMIN is present (or not required) but RELOAD is
+		// not. On MySQL 8.0+ that half-grant is the #800 crash input, and it is
+		// worth naming: an operator holding BACKUP_ADMIN has already been told
+		// once that it was the missing privilege, and needs to know why the
+		// remaining half is not merely another clean refusal.
+		crashNote := ""
+		if requireBackupAdmin {
+			crashNote = " — granting BACKUP_ADMIN alone is the dangerous half-grant:" +
+				" the pinned mydumper build SEGFAULTS on it rather than failing cleanly, which is why this check runs first"
+		}
+		return fmt.Errorf("point-consistent baseline mode requires the RELOAD (or FLUSH_TABLES) privilege, which the"+
+			" current user has at neither name — grant it, e.g. GRANT RELOAD ON *.* TO '<user>'@'%%'%s%s%s",
+			crashNote, alternatives, roleCaveat)
 	default:
 		return fmt.Errorf("point-consistent baseline mode requires the BACKUP_ADMIN privilege (MySQL/Percona 8.0+) in"+
 			" addition to RELOAD/FLUSH_TABLES, which the current user already has — grant it, e.g."+

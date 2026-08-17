@@ -22,25 +22,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ftwrl` genuinely cannot work on RDS: `BACKUP_ADMIN` is refused outright
     (*"ERROR 1227 ... you need the RDSADMIN USER privilege"*) and mydumper's
     FTWRL path issues `LOCK INSTANCE FOR BACKUP` first. So **`lock-all` is
-    new**: mydumper's fourth sync mode, equally point-consistent, synchronizing
-    workers by locking the exported tables instead of the instance. It needs
-    only `LOCK TABLES` — which the RDS master user already has — and was
-    verified to succeed against the exact privilege set on which `ftwrl` fails.
-    Available as `--lock-mode lock-all`, `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE`
-    and `BASELINE_LOCK_MODE`.
+    new**: bintrail's fourth lock mode, mapping to mydumper's `LOCK_ALL`, which
+    is equally point-consistent and synchronizes workers by locking the exported
+    tables instead of the instance. mydumper names it for this itself — *"We
+    support LOCK_ALL and SAFE_NO_LOCK modes for RDS/Aurora"* — and it needs only
+    `LOCK TABLES`, at any scope covering the dumped tables, which the RDS master
+    user already has. Verified to succeed against the exact privilege set on
+    which `ftwrl` fails. Available as `--lock-mode lock-all`,
+    `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` and `BASELINE_LOCK_MODE`.
+    Note this changes which privileges are required, not which tables can be
+    dumped: like `ftwrl`, it refuses a source with non-transactional tables.
   - Privilege requirements are now evaluated PER MODE rather than assuming
     every point-consistent mode needs the same grants, and a refusal names
     `lock-all` **before** the weaker modes: on a source that cannot do `ftwrl`
     it is the only alternative that is still point-consistent.
 
 ### Changed
-- **Console failures no longer disappear on their own.** Every failure notice
-  was a toast that auto-hid after 2.2 seconds. The baseline privilege refusal
-  is ~550 characters — which privilege to grant, the exact `GRANT`, and the
+- **Console failures no longer disappear on their own.** Failure notices were
+  toasts that auto-hid after 2.2 seconds. The baseline privilege refusal is
+  ~550 characters — which privilege to grant, the exact `GRANT`, and the
   alternative modes — so at that duration it was not merely easy to miss, it
   was unreadable, and there was no way to recover the reason afterwards.
   Failures now stay until dismissed with the close button or ESC, and scroll
-  if long; success and progress notices still fade.
+  if long; success and progress notices still fade. Concurrent failures stack
+  instead of overwriting each other, and a success notice no longer replaces an
+  unread failure — with no auto-hide, a silent overwrite would destroy a message
+  the operator never saw.
 
 ## [0.58.0] - 2026-08-16
 

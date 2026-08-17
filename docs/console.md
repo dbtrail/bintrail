@@ -629,8 +629,11 @@ see the metrics tables and example alert rules in
   `lock-all`, `safe-no-lock` or `no-lock`. Selects how mydumper synchronizes its worker
   threads onto one instant for the **Create baseline** button. The default is
   point-consistent and needs `RELOAD`/`FLUSH_TABLES` (plus `BACKUP_ADMIN` on
-  MySQL/Percona 8.0+); `safe-no-lock` needs neither but aborts rather than
-  write a torn snapshot; `no-lock` accepts one. A baseline is the seed state
+  MySQL/Percona 8.0+). `lock-all` is also point-consistent and needs only
+  `LOCK TABLES` — **the mode to use on RDS/Aurora**, where `BACKUP_ADMIN`
+  cannot be granted and `ftwrl` therefore cannot run. `safe-no-lock` needs no
+  elevated privilege but aborts rather than write a torn snapshot; `no-lock`
+  accepts one. A baseline is the seed state
   `reconstruct` merges deltas onto, which is why the weaker modes must be named
   explicitly. An unrecognized value disables baseline DUMPS only — capture and
   the periodic refresh keep running.

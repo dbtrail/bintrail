@@ -21,9 +21,12 @@ the **command line**. Both need a source MySQL user first.
   -- Baselines are point-consistent by default and need these too.
   -- BACKUP_ADMIN is MySQL/Percona 8.0+ only; omit it on MariaDB and MySQL 5.7.
   GRANT RELOAD, BACKUP_ADMIN ON *.* TO 'dbtrail'@'%';
+  -- On RDS/Aurora, BACKUP_ADMIN cannot be granted at all. Use LOCK TABLES
+  -- and BASELINE_LOCK_MODE=lock-all instead — see below.
   ```
 
-  `RELOAD`/`BACKUP_ADMIN` let the baseline dump take a point-in-time snapshot — skip them and set `BASELINE_LOCK_MODE=safe-no-lock` if you would rather not grant them (it never writes a torn snapshot, but it refuses on a write-active source).
+  `RELOAD`/`BACKUP_ADMIN` let the baseline dump take a point-in-time snapshot.
+  **On managed MySQL (RDS/Aurora), `GRANT BACKUP_ADMIN` is refused outright**, so grant `LOCK TABLES` and set `BASELINE_LOCK_MODE=lock-all` — equally point-consistent, and the mode mydumper itself names for RDS. If you would rather grant nothing extra on a self-hosted source, `BASELINE_LOCK_MODE=safe-no-lock` never writes a torn snapshot, but it refuses on a write-active source.
   `REPLICATION SLAVE`/`REPLICATION CLIENT` drive the binlog stream; `SELECT` lets
   dbtrail snapshot the schema. dbtrail never writes to or locks the source.
   (Least-privilege variant: [streaming.md](streaming.md#the-source-mysql-user).)
