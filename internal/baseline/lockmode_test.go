@@ -22,6 +22,7 @@ func TestLockModeMydumperValue(t *testing.T) {
 		want string
 	}{
 		{LockModeFTWRL, "FTWRL"},
+		{LockModeLockAll, "LOCK_ALL"},
 		{LockModeSafeNoLock, "SAFE_NO_LOCK"},
 		{LockModeNoLock, "NO_LOCK"},
 	} {
@@ -37,6 +38,7 @@ func TestLockModeMydumperValue(t *testing.T) {
 func TestLockModePointConsistent(t *testing.T) {
 	for mode, want := range map[LockMode]bool{
 		LockModeFTWRL:      true,
+		LockModeLockAll:    true,
 		LockModeSafeNoLock: true,
 		LockModeNoLock:     false,
 	} {
@@ -54,6 +56,7 @@ func TestLockModePointConsistent(t *testing.T) {
 func TestLockModeNeedsElevatedPrivileges(t *testing.T) {
 	for mode, want := range map[LockMode]bool{
 		LockModeFTWRL:      true,
+		LockModeLockAll:    true,
 		LockModeSafeNoLock: false,
 		LockModeNoLock:     false,
 	} {
@@ -105,5 +108,21 @@ func TestLockModeZeroValueIsTreatedAsFTWRL(t *testing.T) {
 		if !m.PointConsistent() {
 			t.Errorf("%q.PointConsistent() = false while it sends FTWRL; the three methods must agree", m)
 		}
+	}
+}
+
+// TestLockAllIsPointConsistent pins the property that makes lock-all worth
+// having: it is the point-consistent mode reachable on managed MySQL, where
+// BACKUP_ADMIN cannot be granted and ftwrl therefore cannot run at all.
+// Demoting it to "weak" would leave RDS with no consistent option.
+func TestLockAllIsPointConsistent(t *testing.T) {
+	if !LockModeLockAll.PointConsistent() {
+		t.Fatal("lock-all reported as able to emit a torn snapshot; it locks the exported tables to synchronize workers")
+	}
+	if !LockModeLockAll.NeedsElevatedPrivileges() {
+		t.Error("lock-all reported as needing no privileges; it needs LOCK TABLES, and skipping the preflight would let mydumper fail mid-dump instead of refusing up front")
+	}
+	if got := LockModeLockAll.MydumperValue(); got != "LOCK_ALL" {
+		t.Errorf("MydumperValue = %q, want LOCK_ALL", got)
 	}
 }

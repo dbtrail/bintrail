@@ -29,6 +29,7 @@ func TestBuildConsoleMydumperArgsCarriesLockMode(t *testing.T) {
 		want string
 	}{
 		{baseline.LockModeFTWRL, "FTWRL"},
+		{baseline.LockModeLockAll, "LOCK_ALL"},
 		{baseline.LockModeSafeNoLock, "SAFE_NO_LOCK"},
 		{baseline.LockModeNoLock, "NO_LOCK"},
 	} {

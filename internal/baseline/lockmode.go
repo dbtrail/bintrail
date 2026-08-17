@@ -25,6 +25,12 @@ import "fmt"
 //     the backup to be consistent. Stopping backup due to the use of
 //     SAFE_NO_LOCK." Verified: under sustained concurrent writes it aborts.
 //     So it never lies, but on a write-active source it mostly refuses.
+//   - LOCK_ALL synchronizes workers by locking the exported tables instead of
+//     the instance. It needs only LOCK TABLES, and it is the mode that works on
+//     managed MySQL: on RDS the master user CANNOT be granted BACKUP_ADMIN
+//     ("ERROR 1227 ... you need the RDSADMIN USER privilege"), so FTWRL is
+//     impossible there, while LOCK_ALL succeeds with exactly the privilege set
+//     RDS hands out. Measured both ways against the same user.
 //   - NO_LOCK always succeeds and is the only mode that can silently produce a
 //     torn snapshot. mydumper's own docs describe it as the choice for when
 //     "you don't need a consistent backup", and DEPRECATED it in v0.18.1.
@@ -37,6 +43,11 @@ const (
 	// LockModeFTWRL holds one global read lock only long enough for every
 	// worker to open its snapshot at the same instant, then releases it.
 	LockModeFTWRL LockMode = "ftwrl"
+	// LockModeLockAll locks the exported tables long enough for every worker to
+	// open its snapshot together. Needs LOCK TABLES and no more, which makes it
+	// the point-consistent mode available on managed MySQL where BACKUP_ADMIN
+	// cannot be granted.
+	LockModeLockAll LockMode = "lock-all"
 	// LockModeSafeNoLock needs no elevated privilege and refuses rather than
 	// emit a torn snapshot. Expect it to abort on a write-active source.
 	LockModeSafeNoLock LockMode = "safe-no-lock"
@@ -51,7 +62,7 @@ const DefaultLockMode = LockModeFTWRL
 // LockModeValues lists the accepted spellings. Test-only today: the flag
 // help, ParseLockMode's error and the compose case statement each spell the
 // three names out, so adding a mode means updating all of them by hand.
-var LockModeValues = []LockMode{LockModeFTWRL, LockModeSafeNoLock, LockModeNoLock}
+var LockModeValues = []LockMode{LockModeFTWRL, LockModeLockAll, LockModeSafeNoLock, LockModeNoLock}
 
 // ParseLockMode maps an operator-supplied string to a LockMode. It is
 // deliberately strict: a typo must not silently land on a weaker mode, because
@@ -60,6 +71,8 @@ func ParseLockMode(s string) (LockMode, error) {
 	switch LockMode(s) {
 	case LockModeFTWRL:
 		return LockModeFTWRL, nil
+	case LockModeLockAll:
+		return LockModeLockAll, nil
 	case LockModeSafeNoLock:
 		return LockModeSafeNoLock, nil
 	case LockModeNoLock:
@@ -67,13 +80,15 @@ func ParseLockMode(s string) (LockMode, error) {
 	case "":
 		return DefaultLockMode, nil
 	}
-	return "", fmt.Errorf("unknown lock mode %q: want one of %s, %s, %s",
-		s, LockModeFTWRL, LockModeSafeNoLock, LockModeNoLock)
+	return "", fmt.Errorf("unknown lock mode %q: want one of %s, %s, %s, %s",
+		s, LockModeFTWRL, LockModeLockAll, LockModeSafeNoLock, LockModeNoLock)
 }
 
 // MydumperValue is the --sync-thread-lock-mode argument for this mode.
 func (m LockMode) MydumperValue() string {
 	switch m {
+	case LockModeLockAll:
+		return "LOCK_ALL"
 	case LockModeSafeNoLock:
 		return "SAFE_NO_LOCK"
 	case LockModeNoLock:

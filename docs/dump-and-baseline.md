@@ -129,7 +129,7 @@ This dumps **every accessible schema** into `/tmp/mydumper-output` — bare `bin
 | `--mydumper-path` | `mydumper` | Path to the mydumper binary. When set, skips Docker fallback. |
 | `--mydumper-image` | `mydumper/mydumper:latest` | Docker image for mydumper. Used only when no local binary is found. |
 | `--threads` | `4` | Number of parallel dump threads |
-| `--lock-mode` | `ftwrl` | How mydumper syncs its threads onto one instant: `ftwrl` (point-consistent), `safe-no-lock` (no extra privilege, aborts rather than emit a torn snapshot), `no-lock` (accepts a torn snapshot) |
+| `--lock-mode` | `ftwrl` | How mydumper syncs its threads onto one instant: `ftwrl` (point-consistent), `lock-all` (point-consistent, needs only LOCK TABLES — use it on managed MySQL), `safe-no-lock` (no extra privilege, aborts rather than emit a torn snapshot), `no-lock` (accepts a torn snapshot) |
 | `--encrypt` | `false` | Encrypt dump files at rest using AES-256-CBC, with an HMAC-SHA256 integrity sidecar per file (requires `openssl` on `$PATH`) |
 | `--encrypt-key` | `~/.config/bintrail/dump.key` | Path to the encryption key file (generate with `bintrail generate-key`) |
 | `--format` | `text` | Output format: `text` or `json` |
@@ -194,8 +194,18 @@ default to `ftwrl` and the weaker modes must be asked for by name.
 | `--lock-mode` | mydumper mode | Point-consistent? | Works on a write-active source? | Privileges |
 |---|---|---|---|---|
 | `ftwrl` (default) | `FTWRL` | yes | yes | `RELOAD`/`FLUSH_TABLES`, plus `BACKUP_ADMIN` on MySQL/Percona 8.0+ |
+| `lock-all` | `LOCK_ALL` | yes | yes | `LOCK TABLES` |
 | `safe-no-lock` | `SAFE_NO_LOCK` | yes — or it aborts | **usually not** | `SELECT` + `REPLICATION CLIENT` |
 | `no-lock` | `NO_LOCK` | **no** | yes | `SELECT` + `REPLICATION CLIENT` |
+
+**On managed MySQL, use `lock-all`.** RDS (and equivalents) will not grant
+`BACKUP_ADMIN` at all — `GRANT BACKUP_ADMIN ON *.* TO CURRENT_USER()` is refused
+with *"ERROR 1227 ... you need the RDSADMIN USER privilege"* — and mydumper's
+`FTWRL` path issues `LOCK INSTANCE FOR BACKUP` first, so `ftwrl` cannot work
+there no matter what else you grant. `lock-all` synchronizes the workers by
+locking the exported tables instead of the instance, needs only `LOCK TABLES`
+(which the RDS master user already has), and is equally point-consistent.
+Verified both ways against the same privilege set.
 
 `safe-no-lock` does not *prevent* thread skew — it *detects* it. mydumper compares the binlog
 position before and after syncing threads and, on any difference, stops with *"we cannot guarantee

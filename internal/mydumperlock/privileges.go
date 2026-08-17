@@ -13,11 +13,11 @@ package mydumperlock
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/config"
 )
 
@@ -100,113 +100,154 @@ func serverMajorVersion(version string) (major int, ok bool) {
 // deployment sees on either one.
 type Remedy string
 
+// forMode renders this surface's way of selecting a specific mode.
+func (r Remedy) forMode(m baseline.LockMode) string {
+	if r == RemedyCLI {
+		return "pass --lock-mode " + string(m)
+	}
+	return "set BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=" + string(m)
+}
+
 const (
 	// RemedyCLI is `bintrail dump`'s knob.
-	RemedyCLI Remedy = "pass --lock-mode safe-no-lock"
+	RemedyCLI Remedy = "cli"
 	// RemedyConsole is the console daemon's; it has no flag surface.
-	RemedyConsole Remedy = "set BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=safe-no-lock"
+	RemedyConsole Remedy = "console"
 )
 
-func CheckPrivileges(ctx context.Context, sourceDSN string, remedy Remedy) error {
+func CheckPrivileges(ctx context.Context, sourceDSN string, mode baseline.LockMode, remedy Remedy) error {
 	db, err := config.Connect(sourceDSN)
 	if err != nil {
 		return fmt.Errorf("point-consistent baseline: cannot connect to source to verify privileges: %w", err)
 	}
 	defer db.Close()
-	return checkPrivilegesDB(ctx, db, remedy)
+	return checkPrivilegesDB(ctx, db, mode, remedy)
 }
 
-// checkPrivilegesDB is checkPrivilegesDB is CheckPrivileges' core logic
-// against an already-open *sql.DB, split out so it is unit-testable with
-// sqlmock without a live MySQL connection. It first determines whether this
-// source's flavor/version needs BACKUP_ADMIN at all (requiresBackupAdmin)
-// — RELOAD/FLUSH_TABLES is mandatory on every flavor, BACKUP_ADMIN only on
-// MySQL/Percona 8.0+ — then reads the CURRENT_USER()'s own privileges from
-// information_schema.USER_PRIVILEGES, which is self-scoped to the connecting
-// user without needing any special grant, so it works even for an otherwise
-// least-privilege replication user. The GRANTEE reconstruction (split
-// CURRENT_USER() on '@', requote both halves) was verified against a real
-// MySQL 8.0 server for both a wildcard-host account ('user'@'%') and a
-// specific-host-pattern account ('user'@'172.20.%.%') — CURRENT_USER() always
-// returns the exact host pattern from the matched mysql.user row, not the
-// connecting client's resolved address, so the reconstruction is not a
-// wildcard-only coincidence. Known gap, surfaced in the refusal message below
-// so an affected operator can self-diagnose: privileges granted only via an
-// activated MySQL 8.0 ROLE (not directly to the user) are attributed to the
-// role's own GRANTEE in this view and would not be picked up here — not a
-// pattern used anywhere else in this codebase's documented grant examples, and
-// this fails CLOSED (over-refuses, never under-refuses) for a role-using
-// operator, so the segfault path stays unreachable either way.
-func checkPrivilegesDB(ctx context.Context, db *sql.DB, remedy Remedy) error {
+// grantedPrivileges reads the connecting user's GLOBAL privileges.
+//
+// It parses SHOW GRANTS FOR CURRENT_USER() rather than reading
+// information_schema.USER_PRIVILEGES, which was the source until this was
+// measured against RDS: that view exposes only the rows the connecting user
+// can SEE in mysql.user, and a managed master user cannot see its own. On RDS
+// MySQL 8.4 it returned exactly one row — USAGE — for an account whose
+// SHOW GRANTS listed RELOAD and FLUSH_TABLES as direct grants. Reading it made
+// this check fail CLOSED on every managed source, which since #1377 made the
+// point-consistent default unreachable there. SHOW GRANTS needs no privilege
+// to run for the current user and expands whatever the session actually has.
+//
+// Only global grants count: a privilege is what it is on `ON *.*`, and a
+// schema-scoped grant does not authorize FLUSH TABLES WITH READ LOCK or
+// LOCK INSTANCE FOR BACKUP.
+func grantedPrivileges(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, "SHOW GRANTS FOR CURRENT_USER()")
+	if err != nil {
+		return nil, fmt.Errorf("point-consistent baseline: cannot verify source privileges: %w", err)
+	}
+	defer rows.Close()
+
+	have := map[string]bool{}
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return nil, fmt.Errorf("point-consistent baseline: cannot read source privileges: %w", err)
+		}
+		// "GRANT <privs> ON *.* TO ..." — anything else (schema grants, role
+		// memberships, proxy grants) carries no global privilege.
+		const on = " ON *.* TO "
+		idx := strings.Index(line, on)
+		if idx < 0 || !strings.HasPrefix(line, "GRANT ") {
+			continue
+		}
+		for _, p := range strings.Split(line[len("GRANT "):idx], ",") {
+			p = strings.ToUpper(strings.TrimSpace(p))
+			// A privilege can carry a column list, e.g. SELECT (col). Keep the
+			// name; the parenthesised part is never global-only anyway.
+			if k := strings.IndexByte(p, '('); k >= 0 {
+				p = strings.TrimSpace(p[:k])
+			}
+			if p != "" {
+				have[p] = true
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("point-consistent baseline: cannot read source privileges: %w", err)
+	}
+	return have, nil
+}
+
+// checkPrivilegesDB is CheckPrivileges' core logic against an already-open
+// *sql.DB, split out so it is unit-testable with sqlmock. Requirements are
+// PER MODE, because they differ in kind:
+//
+//   - FTWRL needs RELOAD or FLUSH_TABLES on every flavor, plus BACKUP_ADMIN on
+//     MySQL/Percona 8.0+ (it issues LOCK INSTANCE FOR BACKUP first). Granting
+//     BACKUP_ADMIN WITHOUT RELOAD does not fail cleanly — the pinned build
+//     SEGFAULTS — which is why this check exists at all.
+//   - LOCK_ALL needs LOCK TABLES and nothing else. This is the mode that works
+//     on managed MySQL, where BACKUP_ADMIN is not grantable.
+//   - The low-privilege modes never reach here.
+//
+// ALL PRIVILEGES satisfies any of them.
+func checkPrivilegesDB(ctx context.Context, db *sql.DB, mode baseline.LockMode, remedy Remedy) error {
+	have, err := grantedPrivileges(ctx, db)
+	if err != nil {
+		return err
+	}
+	if have["ALL PRIVILEGES"] {
+		return nil
+	}
+
+	const roleCaveat = " (if these are granted through a role, activate it for this connection — SHOW GRANTS reflects the session's active roles)"
+
+	if mode == baseline.LockModeLockAll {
+		if have["LOCK TABLES"] {
+			return nil
+		}
+		return fmt.Errorf("lock-all baseline mode requires the LOCK TABLES privilege; the current user does not have it"+
+			" — grant it, e.g. GRANT LOCK TABLES ON *.* TO '<user>'@'%%'%s", roleCaveat)
+	}
+
 	requireBackupAdmin, err := requiresBackupAdmin(ctx, db)
 	if err != nil {
 		return err
 	}
-
-	const query = `SELECT PRIVILEGE_TYPE FROM information_schema.USER_PRIVILEGES ` +
-		`WHERE GRANTEE = CONCAT("'", SUBSTRING_INDEX(CURRENT_USER(), '@', 1), "'@'", SUBSTRING_INDEX(CURRENT_USER(), '@', -1), "'")`
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("point-consistent baseline: cannot verify source privileges: %w", err)
-	}
-	defer rows.Close()
-
-	have := make(map[string]bool, len(requiredPrivileges))
-	for rows.Next() {
-		var priv string
-		if err := rows.Scan(&priv); err != nil {
-			return fmt.Errorf("point-consistent baseline: cannot read source privileges: %w", err)
-		}
-		have[priv] = true
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("point-consistent baseline: cannot read source privileges: %w", err)
-	}
-
-	hasBackupAdmin := have["BACKUP_ADMIN"]
-	hasFlushTables := have["RELOAD"] || have["FLUSH_TABLES"]
-	missingFlushTables := !hasFlushTables
-	missingBackupAdmin := requireBackupAdmin && !hasBackupAdmin
-
-	if !missingFlushTables && !missingBackupAdmin {
+	hasFlush := have["RELOAD"] || have["FLUSH_TABLES"]
+	missingBackupAdmin := requireBackupAdmin && !have["BACKUP_ADMIN"]
+	if hasFlush && !missingBackupAdmin {
 		return nil
 	}
 
-	// The alternatives clause is load-bearing: this gate now fires on the
-	// DEFAULT path, so it is the first thing an upgrading least-privilege
-	// deployment sees. It must name the knob that actually exists — the
-	// pre-#1377 text pointed at an opt-in variable that is no longer read and
-	// told the operator to "disable point-consistent mode", which is not a
-	// thing they can do any more.
-	alternatives := " — or " + string(remedy) + " to dump without these privileges" +
-		" (it needs none, but ABORTS rather than write a snapshot stitched from several instants," +
-		" so expect it to refuse on a write-active source); the same knob set to no-lock accepts such a snapshot"
-
-	const roleCaveat = " (privileges granted only via an activated MySQL ROLE, rather than directly to the user, are not detected by this check — grant directly to the user, or double-check with SHOW GRANTS if you believe this refusal is wrong)"
+	// The alternatives clause is the one actionable sentence here, and this
+	// gate fires on the DEFAULT path. lock-all comes FIRST because it is the
+	// only alternative that is still point-consistent — and on managed MySQL
+	// (RDS grants LOCK TABLES but refuses BACKUP_ADMIN outright) it is the
+	// only one that can work at all.
+	// The managed-MySQL parenthetical is gated on requireBackupAdmin: BACKUP_ADMIN
+	// does not exist on MariaDB or MySQL 5.7, and naming it there would send an
+	// operator hunting a privilege their server cannot have.
+	lockAllNote := ", which is also point-consistent and needs only LOCK TABLES"
+	if requireBackupAdmin {
+		lockAllNote += " (the mode that works on managed MySQL, where BACKUP_ADMIN cannot be granted at all)"
+	}
+	alternatives := " — or " + remedy.forMode(baseline.LockModeLockAll) + lockAllNote +
+		"; or " + remedy.forMode(baseline.LockModeSafeNoLock) +
+		", which needs no privilege but ABORTS rather than write a snapshot stitched from several instants," +
+		" so expect it to refuse on a write-active source; or no-lock to accept such a snapshot"
 
 	switch {
-	case missingFlushTables && missingBackupAdmin:
-		return errors.New("point-consistent baseline mode (the default) requires the " +
-			"source DB user to have BOTH the BACKUP_ADMIN and the RELOAD (or FLUSH_TABLES) privilege (MySQL/Percona " +
-			"8.0+); the current user has neither — grant both, e.g. GRANT BACKUP_ADMIN, RELOAD ON *.* TO '<user>'@'%'" +
-			"" + alternatives + roleCaveat)
-	case missingFlushTables && requireBackupAdmin:
-		// The dangerous half-privileged combination: BACKUP_ADMIN is present but
-		// RELOAD/FLUSH_TABLES is not — this is exactly what segfaults mydumper.
-		return errors.New("point-consistent baseline mode requires the RELOAD (or FLUSH_TABLES) privilege in addition " +
-			"to BACKUP_ADMIN, which the current user already has — granting BACKUP_ADMIN alone makes mydumper crash " +
-			"rather than fail cleanly; grant RELOAD, e.g. GRANT RELOAD ON *.* TO '<user>'@'%'" + alternatives + roleCaveat)
-	case missingFlushTables:
-		// requireBackupAdmin is false here (MariaDB, MySQL 5.7, or an
-		// undetectable version) — BACKUP_ADMIN is never mentioned since it
-		// isn't required, and on MariaDB the privilege doesn't even exist.
-		return errors.New("point-consistent baseline mode requires the RELOAD (or FLUSH_TABLES) privilege; the current " +
-			"user has neither — grant it, e.g. GRANT RELOAD ON *.* TO '<user>'@'%'" + alternatives + roleCaveat)
+	case !hasFlush && missingBackupAdmin:
+		return fmt.Errorf("point-consistent baseline mode (the default) requires the source DB user to have BOTH the"+
+			" BACKUP_ADMIN and the RELOAD (or FLUSH_TABLES) privilege (MySQL/Percona 8.0+); the current user has"+
+			" neither — grant both, e.g. GRANT BACKUP_ADMIN, RELOAD ON *.* TO '<user>'@'%%'%s%s", alternatives, roleCaveat)
+	case !hasFlush:
+		return fmt.Errorf("point-consistent baseline mode requires the RELOAD (or FLUSH_TABLES) privilege; the current"+
+			" user has neither — grant it, e.g. GRANT RELOAD ON *.* TO '<user>'@'%%'%s%s", alternatives, roleCaveat)
 	default:
-		// missingBackupAdmin only: requireBackupAdmin is true and hasFlushTables
-		// is true.
-		return errors.New("point-consistent baseline mode requires the BACKUP_ADMIN privilege (MySQL/Percona 8.0+) in " +
-			"addition to RELOAD/FLUSH_TABLES, which the current user already has — grant it, e.g. " +
-			"GRANT BACKUP_ADMIN ON *.* TO '<user>'@'%'" + alternatives + roleCaveat)
+		return fmt.Errorf("point-consistent baseline mode requires the BACKUP_ADMIN privilege (MySQL/Percona 8.0+) in"+
+			" addition to RELOAD/FLUSH_TABLES, which the current user already has — grant it, e.g."+
+			" GRANT BACKUP_ADMIN ON *.* TO '<user>'@'%%'. NOTE: on managed MySQL such as RDS this grant is REFUSED"+
+			" outright, so ftwrl cannot work there%s%s", alternatives, roleCaveat)
 	}
 }

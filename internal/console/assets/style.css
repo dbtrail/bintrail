@@ -1647,6 +1647,25 @@ button { font-family: inherit; }
   padding: 11px 18px; box-shadow: 0 8px 28px -10px oklch(0.3 0.03 305 / 0.5);
 }
 
+/* Persistent failure notice. Unlike the transient toast it never auto-hides,
+   so it has to survive being long: a privilege refusal carries the GRANT to
+   run and the alternative modes, and truncating that would put the operator
+   back where the fading toast left them. */
+.toast.toast-error {
+  display: flex; align-items: flex-start; gap: 12px;
+  max-width: min(70ch, 90vw); max-height: 60vh; overflow-y: auto;
+  text-align: left; line-height: 1.5; white-space: pre-wrap;
+}
+.toast.toast-error .toast-msg { flex: 1; }
+.toast.toast-error .toast-close {
+  flex: none; align-self: flex-start;
+  background: none; border: 0; cursor: pointer;
+  color: var(--bg); opacity: 0.75; font-size: 14px; line-height: 1;
+  padding: 2px 4px; border-radius: var(--radius-sm);
+}
+.toast.toast-error .toast-close:hover { opacity: 1; }
+.toast.toast-error .toast-close:focus-visible { outline: 2px solid var(--bg); outline-offset: 1px; }
+
 /* loading shimmer for #view while a screen fetches */
 .view-loading { font-family: var(--f-mono); font-size: 12.5px; color: var(--ink-4); padding: 20px 2px; }
 

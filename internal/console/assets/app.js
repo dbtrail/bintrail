@@ -608,14 +608,61 @@ async function submitPasswordChange(form, msg, firstSet) {
 
 // ── toast / errors / warnings ─────────────────────────────────────────────────
 
+// toast shows a transient notice. Use it for things that went RIGHT, or for
+// neutral progress. Failures must not fade — see toastError.
 function toast(msg) {
   const t = document.getElementById("toast");
   if (!t) return;
+  clearTimeout(toast._t);
+  t.classList.remove("toast-error");
+  t.removeAttribute("role");
   t.textContent = msg;
   t.hidden = false;
-  clearTimeout(toast._t);
   toast._t = setTimeout(() => { t.hidden = true; }, 2200);
 }
+
+// toastError shows a failure that stays until the operator dismisses it.
+//
+// A failure that disappears on its own is a failure nobody saw. The baseline
+// privilege refusal is ~550 characters of remediation — which privilege to
+// grant, the exact GRANT statement, and the alternative modes — and at the
+// 2.2s auto-hide it was not merely easy to miss, it was unreadable. The
+// operator was left with a button that did nothing and no way to recover the
+// reason. Nothing here starts a timer.
+function toastError(msg) {
+  const t = document.getElementById("toast");
+  if (!t) return;
+  clearTimeout(toast._t);
+  t.classList.add("toast-error");
+  // role=alert so a screen reader announces it; the visual persistence is
+  // useless to someone who cannot see it fade.
+  t.setAttribute("role", "alert");
+  t.replaceChildren();
+  t.append(el("span", { class: "toast-msg", text: msg }));
+  const close = el("button", { class: "toast-close", type: "button", "aria-label": "Dismiss" });
+  close.textContent = "\u2715";
+  close.addEventListener("click", () => dismissToast());
+  t.append(close);
+  t.hidden = false;
+}
+
+function dismissToast() {
+  const t = document.getElementById("toast");
+  if (!t) return;
+  t.hidden = true;
+  t.classList.remove("toast-error");
+  t.removeAttribute("role");
+  t.textContent = "";
+}
+
+// ESC dismisses a persistent error, matching every other dismissible surface
+// in this console. Registered once, and only acts on the error variant so it
+// cannot swallow an ESC meant for an open modal.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const t = document.getElementById("toast");
+  if (t && !t.hidden && t.classList.contains("toast-error")) dismissToast();
+});
 
 function renderError(container, err) {
   if (!container) return;
@@ -1804,7 +1851,7 @@ async function exportEvents(kind, btn) {
       toast("Exported the newest " + rows.length + " matches — the search has more. Narrow it with a time range to export the rest.");
     }
   } catch (err) {
-    toast("Export failed: " + (err && err.message ? err.message : String(err)));
+    toastError("Export failed: " + (err && err.message ? err.message : String(err)));
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = label; }
   }
@@ -1899,7 +1946,7 @@ function downloadBlob(filename, content, mime) {
     const a = el("a", { href: url, download: filename });
     document.body.append(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
-  } catch (err) { toast("download failed: " + ((err && err.message) || err)); }
+  } catch (err) { toastError("download failed: " + ((err && err.message) || err)); }
 }
 function csvCell(v) {
   if (v === null || v === undefined) return "";
@@ -2341,7 +2388,7 @@ function codePanel(sql, metaLabel) {
   return panel;
 }
 function copySQL() {
-  navigator.clipboard.writeText(lastSQL).then(() => toast("SQL copied to clipboard"), () => toast("Copy failed."));
+  navigator.clipboard.writeText(lastSQL).then(() => toast("SQL copied to clipboard"), () => toastError("Copy failed."));
 }
 function downloadSQL() { downloadBlob("dbtrail-undo.sql", lastSQL, "application/sql"); }
 
@@ -2894,7 +2941,7 @@ async function refreshSchemaSnapshot(id, btn) {
   try {
     await api("/api/servers/" + encodeURIComponent(id) + "/schema-snapshot", { method: "POST", body: {} });
   } catch (err) {
-    toast("Schema snapshot failed: " + ((err && err.message) || err));
+    toastError("Schema snapshot failed: " + ((err && err.message) || err));
     restore();
     return;
   }
@@ -2903,7 +2950,7 @@ async function refreshSchemaSnapshot(id, btn) {
   restore();
   if (!done) { toast("Schema snapshot still running — check back shortly."); return; }
   if (done.state !== "succeeded") {
-    toast("Schema snapshot failed: " + (done.last_error || "unknown error"));
+    toastError("Schema snapshot failed: " + (done.last_error || "unknown error"));
     return;
   }
   let msg = "Schema snapshot updated: " + (done.tables || 0) + " table(s).";
@@ -3518,7 +3565,7 @@ async function createBaseline(id, btn) {
   try {
     await api("/api/servers/" + encodeURIComponent(id) + "/baseline", { method: "POST", body: {} });
   } catch (err) {
-    toast("Baseline failed: " + ((err && err.message) || err));
+    toastError("Baseline failed: " + ((err && err.message) || err));
     restore();
     return;
   }
@@ -3529,7 +3576,7 @@ async function createBaseline(id, btn) {
     toast("Baseline complete: " + (done.tables || 0) + " table(s)" +
       (done.uploaded ? ", " + done.uploaded + " file(s) uploaded" : ""));
   } else if (done) {
-    toast("Baseline failed: " + (done.last_error || "unknown error"));
+    toastError("Baseline failed: " + (done.last_error || "unknown error"));
   } else {
     toast("Baseline still running — check back shortly.");
   }
@@ -3637,7 +3684,7 @@ async function createVerify(id, mode, btn, resultsEl) {
   try {
     status = (await api("/api/servers/" + encodeURIComponent(id) + "/verify", { method: "POST", body: { mode } })).verify;
   } catch (err) {
-    toast("Verify failed: " + ((err && err.message) || err));
+    toastError("Verify failed: " + ((err && err.message) || err));
     restore();
     return;
   }
@@ -3654,7 +3701,7 @@ async function createVerify(id, mode, btn, resultsEl) {
     toast(done.note || ("Verification complete: " + s.match + " match, " + s.mismatch + " mismatch, " +
       s.inconclusive + " inconclusive, " + s.error + " error"));
   } else if (done) {
-    toast("Verification failed: " + (done.last_error || "unknown error"));
+    toastError("Verification failed: " + (done.last_error || "unknown error"));
   } else {
     toast("Verification still running — check back shortly.");
   }
@@ -4062,7 +4109,7 @@ async function loadTables(form) {
     // A failed listing leaves the combo as usable free text with its value
     // intact — we cannot know whether the value belongs to the new schema,
     // and a dead or emptied field would be worse than a stale suggestion.
-    toast("failed to load tables: " + ((err && err.message) || err));
+    toastError("failed to load tables: " + ((err && err.message) || err));
     return;
   }
   if (combo) combo.removeAttribute("aria-busy");
@@ -4167,7 +4214,7 @@ function mcpURL(servers) {
 }
 
 function copyText(text, what) {
-  navigator.clipboard.writeText(text).then(() => toast(what + " copied to clipboard"), () => toast("Copy failed."));
+  navigator.clipboard.writeText(text).then(() => toast(what + " copied to clipboard"), () => toastError("Copy failed."));
 }
 
 function buildConnect(servers, tokStatus, minted) {
@@ -4198,7 +4245,7 @@ async function mintMCPToken(rotate) {
   try {
     res = await api("/api/mcp-token", { method: "POST" });
   } catch (err) {
-    toast("Token generation failed: " + (err.message || err));
+    toastError("Token generation failed: " + (err.message || err));
     return;
   }
   mcpMintedOnce = (res && res.token) || null;
@@ -4211,7 +4258,7 @@ async function revokeMCPToken() {
   try {
     await api("/api/mcp-token", { method: "DELETE" });
   } catch (err) {
-    toast("Revoke failed: " + (err.message || err));
+    toastError("Revoke failed: " + (err.message || err));
     return;
   }
   toast("Managed MCP token revoked");

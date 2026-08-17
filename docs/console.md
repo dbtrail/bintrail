@@ -454,8 +454,10 @@ straight from the Storage page, and it only runs on the `watch` daemon:
   (or `FLUSH_TABLES`) plus `BACKUP_ADMIN` on MySQL/Percona 8.0+. The daemon
   checks those privileges before launching mydumper and refuses with an
   actionable error if any are missing — it never silently falls back to a
-  weaker mode. Set `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=safe-no-lock` to dump
-  without them (it aborts rather than write a snapshot stitched from several
+  weaker mode. On managed MySQL such as RDS, `BACKUP_ADMIN` cannot be
+  granted at all, so use `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=lock-all` — equally
+  point-consistent, needs only `LOCK TABLES`. Or `=safe-no-lock` to dump
+  without any of them (it aborts rather than write a snapshot stitched from several
   instants, so expect it to refuse on a write-active source) or `=no-lock` to
   accept such a snapshot; only under `no-lock` does the daemon log a warning
   when a dump spans more than one table. See
@@ -624,7 +626,7 @@ see the metrics tables and example alert rules in
 - `BINTRAIL_CONSOLE_BASELINE_STAGING` (`watch` only) — local staging dir for
   S3-destined baselines created by that button (default a temp subdir).
 - `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE` (`watch` only) — `ftwrl` (default),
-  `safe-no-lock` or `no-lock`. Selects how mydumper synchronizes its worker
+  `lock-all`, `safe-no-lock` or `no-lock`. Selects how mydumper synchronizes its worker
   threads onto one instant for the **Create baseline** button. The default is
   point-consistent and needs `RELOAD`/`FLUSH_TABLES` (plus `BACKUP_ADMIN` on
   MySQL/Percona 8.0+); `safe-no-lock` needs neither but aborts rather than

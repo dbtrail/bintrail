@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Point-consistent baselines were impossible on managed MySQL** (#1381).
+  v0.58.0 made them the default; on RDS the button then failed for every
+  operator, for two independent reasons.
+  - The privilege preflight read `information_schema.USER_PRIVILEGES`, which
+    exposes only the rows the connecting user can SEE in `mysql.user`. A
+    managed master user cannot see its own: on RDS MySQL 8.4 that view returned
+    a single `USAGE` row for an account whose `SHOW GRANTS` listed `RELOAD` and
+    `FLUSH_TABLES` as direct grants. The check therefore failed **closed** on
+    every managed source and reported "the current user has neither" about
+    privileges the user held. It now parses `SHOW GRANTS FOR CURRENT_USER()`,
+    which needs no privilege to run and reflects the session's active roles.
+  - `ftwrl` genuinely cannot work on RDS: `BACKUP_ADMIN` is refused outright
+    (*"ERROR 1227 ... you need the RDSADMIN USER privilege"*) and mydumper's
+    FTWRL path issues `LOCK INSTANCE FOR BACKUP` first. So **`lock-all` is
+    new**: mydumper's fourth sync mode, equally point-consistent, synchronizing
+    workers by locking the exported tables instead of the instance. It needs
+    only `LOCK TABLES` — which the RDS master user already has — and was
+    verified to succeed against the exact privilege set on which `ftwrl` fails.
+    Available as `--lock-mode lock-all`, `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE`
+    and `BASELINE_LOCK_MODE`.
+  - Privilege requirements are now evaluated PER MODE rather than assuming
+    every point-consistent mode needs the same grants, and a refusal names
+    `lock-all` **before** the weaker modes: on a source that cannot do `ftwrl`
+    it is the only alternative that is still point-consistent.
+
+### Changed
+- **Console failures no longer disappear on their own.** Every failure notice
+  was a toast that auto-hid after 2.2 seconds. The baseline privilege refusal
+  is ~550 characters — which privilege to grant, the exact `GRANT`, and the
+  alternative modes — so at that duration it was not merely easy to miss, it
+  was unreadable, and there was no way to recover the reason afterwards.
+  Failures now stay until dismissed with the close button or ESC, and scroll
+  if long; success and progress notices still fade.
+
 ## [0.58.0] - 2026-08-16
 
 ### Changed
