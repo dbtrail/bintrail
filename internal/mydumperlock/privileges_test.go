@@ -45,7 +45,7 @@ func TestCheckPrivilegesReadsShowGrants(t *testing.T) {
 	// RELOAD is present but BACKUP_ADMIN is not, so ftwrl is still refused —
 	// correctly, and that is the platform's limit, not a reading error. What
 	// must NOT happen is the pre-fix behaviour: claiming the user has NEITHER.
-	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole)
+	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole, nil)
 	if err == nil {
 		t.Fatal("ftwrl was allowed without BACKUP_ADMIN")
 	}
@@ -70,7 +70,7 @@ func TestCheckPrivilegesLockAllOnManagedMySQL(t *testing.T) {
 	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
 		"GRANT SELECT, RELOAD, LOCK TABLES, REPLICATION CLIENT ON *.* TO `admin`@`%`",
 	))
-	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyConsole); err != nil {
+	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyConsole, nil); err != nil {
 		t.Fatalf("lock-all was refused for a user holding LOCK TABLES: %v", err)
 	}
 	// It must not have asked for the version: lock-all's requirement does not
@@ -90,7 +90,7 @@ func TestCheckPrivilegesLockAllWithoutLockTables(t *testing.T) {
 	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
 		"GRANT SELECT, REPLICATION CLIENT ON *.* TO `u`@`%`",
 	))
-	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyCLI)
+	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyCLI, nil)
 	if err == nil {
 		t.Fatal("lock-all was allowed without LOCK TABLES")
 	}
@@ -115,7 +115,7 @@ func TestCheckPrivilegesFTWRLIgnoresSchemaScopedGrants(t *testing.T) {
 		"GRANT ALL PRIVILEGES ON `appdb`.* TO `u`@`%`",
 	))
 	mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("8.0.36"))
-	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyCLI)
+	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyCLI, nil)
 	if err == nil {
 		t.Fatal("a schema-scoped ALL PRIVILEGES was accepted as authorizing FLUSH TABLES WITH READ LOCK")
 	}
@@ -143,7 +143,7 @@ func TestCheckPrivilegesLockAllAcceptsSchemaScopedGrant(t *testing.T) {
 		"GRANT REPLICATION CLIENT ON *.* TO `scoped`@`%`",
 		"GRANT SELECT, LOCK TABLES, SHOW VIEW ON `appdb`.* TO `scoped`@`%`",
 	))
-	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyCLI); err != nil {
+	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyCLI, nil); err != nil {
 		t.Fatalf("lock-all refused a per-schema LOCK TABLES grant that runs a real dump to completion: %v", err)
 	}
 }
@@ -163,7 +163,7 @@ func TestCheckPrivilegesFlushTablesSubstitutesForReload(t *testing.T) {
 		"GRANT SELECT, BACKUP_ADMIN, FLUSH_TABLES ON *.* TO `u`@`%`",
 	))
 	mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("8.0.36"))
-	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole); err != nil {
+	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole, nil); err != nil {
 		t.Fatalf("ftwrl refused a user holding FLUSH_TABLES (without the broader RELOAD): %v", err)
 	}
 }
@@ -184,7 +184,7 @@ func TestCheckPrivilegesBackupAdminWithoutReloadIsRefused(t *testing.T) {
 		"GRANT SELECT, BACKUP_ADMIN ON *.* TO `u`@`%`",
 	))
 	mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("8.0.36"))
-	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole)
+	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole, nil)
 	if err == nil {
 		t.Fatal("BACKUP_ADMIN without RELOAD/FLUSH_TABLES was accepted — this is the mydumper segfault input")
 	}
@@ -192,9 +192,11 @@ func TestCheckPrivilegesBackupAdminWithoutReloadIsRefused(t *testing.T) {
 		t.Errorf("refusal = %v, want it to name the missing RELOAD", err)
 	}
 	// The operator in this state already granted BACKUP_ADMIN and needs to know
-	// the remaining half is not just another clean refusal.
-	if !strings.Contains(err.Error(), "SEGFAULT") {
-		t.Errorf("refusal = %v, want it to say why this particular half-grant is dangerous", err)
+	// the remaining half is not just another clean refusal. Asserting the
+	// CONSEQUENCE rather than one word of prose: a meaning-preserving reword
+	// must not fail, but dropping the warning entirely must.
+	if !strings.Contains(err.Error(), "BACKUP_ADMIN alone") {
+		t.Errorf("refusal = %v, want it to warn about the half-grant it is refusing", err)
 	}
 }
 
@@ -224,6 +226,7 @@ func TestGrantSetParsing(t *testing.T) {
 		// Column names must not be parsed as privilege names: splitting on the
 		// comma before stripping the parenthesised list would yield "B".
 		{"column list", "GRANT SELECT (a, b) ON `appdb`.`t` TO `u`@`%`", nil, true},
+		{"multi column list", "GRANT SELECT (a, b), INSERT (col2) ON `appdb`.`t` TO `u`@`%`", nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := &grantSet{global: map[string]bool{}, scoped: map[string][]string{}}
@@ -239,8 +242,14 @@ func TestGrantSetParsing(t *testing.T) {
 			if got := len(g.scoped) > 0; got != tc.wantScoped {
 				t.Errorf("scoped = %v, want scoped=%v", g.scoped, tc.wantScoped)
 			}
-			if g.global["B"] {
-				t.Error("a column name was parsed as a privilege")
+			// Check BOTH maps. Reading only `global` made this guard inert: a
+			// column list is only legal on a scoped object, so a misparsed
+			// column name lands in `scoped` and the global-only assertion
+			// stayed green with the paren-stripping deleted.
+			for _, bad := range []string{"B", "COL2", "A"} {
+				if g.global[bad] || len(g.scoped[bad]) > 0 {
+					t.Errorf("%q was parsed as a privilege name from %q", bad, tc.line)
+				}
 			}
 		})
 	}
@@ -255,7 +264,7 @@ func TestCheckPrivilegesAllPrivileges(t *testing.T) {
 		mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
 			"GRANT ALL PRIVILEGES ON *.* TO `root`@`localhost` WITH GRANT OPTION",
 		))
-		if err := checkPrivilegesDB(context.Background(), db, mode, RemedyConsole); err != nil {
+		if err := checkPrivilegesDB(context.Background(), db, mode, RemedyConsole, nil); err != nil {
 			t.Errorf("%s refused for ALL PRIVILEGES: %v", mode, err)
 		}
 		db.Close()
@@ -278,7 +287,7 @@ func TestCheckPrivilegesMariaDBNeverMentionsBackupAdmin(t *testing.T) {
 	))
 	mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("10.11.6-MariaDB"))
 
-	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole)
+	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole, nil)
 	if err == nil {
 		t.Fatal("ftwrl allowed without RELOAD")
 	}
@@ -303,7 +312,7 @@ func TestCheckPrivilegesRefusalOffersLockAllFirst(t *testing.T) {
 	))
 	mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("8.4.10"))
 
-	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole)
+	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, RemedyConsole, nil)
 	if err == nil {
 		t.Fatal("ftwrl allowed without BACKUP_ADMIN")
 	}
@@ -339,7 +348,7 @@ func TestCheckPrivilegesRemedyIsSurfaceSpecific(t *testing.T) {
 		}
 		mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows("GRANT SELECT ON *.* TO `u`@`%`"))
 		mock.ExpectQuery("VERSION").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("8.0.36"))
-		err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, tc.remedy)
+		err = checkPrivilegesDB(context.Background(), db, baseline.LockModeFTWRL, tc.remedy, nil)
 		db.Close()
 		if err == nil {
 			t.Fatalf("%s: a user with no privileges was allowed to run a point-consistent dump", tc.remedy)
@@ -372,5 +381,91 @@ func TestServerMajorVersion(t *testing.T) {
 		if major != tc.wantMajor || ok != tc.wantOK {
 			t.Errorf("serverMajorVersion(%q) = (%d, %v), want (%d, %v)", tc.version, major, ok, tc.wantMajor, tc.wantOK)
 		}
+	}
+}
+
+// TestCheckPrivilegesPartialRevokeIsNotIgnored: MySQL 8.0.16+ renders a partial
+// revoke as its OWN line in SHOW GRANTS, and reading only the GRANT lines
+// reports a privilege the user does not have. Measured on MySQL 8.0.46 with
+// partial_revokes=ON — this exact grant set produced
+// "ERROR 1044 Access denied for user 'prtest'@'%' to database 'appdb'" on
+// LOCK TABLES in appdb.
+//
+// This is the FALSE-PASS direction, the one this package exists to prevent:
+// the preflight would wave the dump through and mydumper would die partway,
+// leaving a partial dump directory, which is precisely what "fails loudly,
+// before mydumper ever runs" promises not to happen.
+func TestCheckPrivilegesPartialRevokeIsNotIgnored(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
+		"GRANT SELECT, LOCK TABLES, REPLICATION CLIENT ON *.* TO `prtest`@`%`",
+		"REVOKE LOCK TABLES ON `appdb`.* FROM `prtest`@`%`",
+	))
+	err = checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyCLI, []string{"appdb"})
+	if err == nil {
+		t.Fatal("a partial REVOKE of LOCK TABLES on the dumped schema was ignored — mydumper would launch and fail partway")
+	}
+	if !strings.Contains(err.Error(), "appdb") {
+		t.Errorf("refusal = %v, want it to name the schema the revoke applies to", err)
+	}
+}
+
+// TestCheckPrivilegesPartialRevokeElsewhereIsNotABlocker is the other half, and
+// the more important one: refusing a dump a revoke does not touch would be the
+// same false refusal #1381 was filed for. The revoke here names a schema that
+// is not in the dump.
+func TestCheckPrivilegesPartialRevokeElsewhereIsNotABlocker(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
+		"GRANT SELECT, LOCK TABLES ON *.* TO `u`@`%`",
+		"REVOKE LOCK TABLES ON `otherdb`.* FROM `u`@`%`",
+	))
+	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyCLI, []string{"appdb"}); err != nil {
+		t.Fatalf("lock-all refused over a revoke on a schema this dump never touches: %v", err)
+	}
+}
+
+// TestCheckPrivilegesPartialRevokeWithNoSchemaFilter: an empty schema list means
+// "dump every non-system schema", so a revoke anywhere IS inside the dump.
+func TestCheckPrivilegesPartialRevokeWithNoSchemaFilter(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(grantRows(
+		"GRANT SELECT, LOCK TABLES ON *.* TO `u`@`%`",
+		"REVOKE LOCK TABLES ON `otherdb`.* FROM `u`@`%`",
+	))
+	if err := checkPrivilegesDB(context.Background(), db, baseline.LockModeLockAll, RemedyCLI, nil); err == nil {
+		t.Fatal("a whole-instance dump ignored a partial revoke; every schema is in scope when no filter is set")
+	}
+}
+
+// TestCheckPrivilegesConnectFailureOffersNoWeakerMode: an unreachable source is
+// not a privilege problem — mydumper cannot dump in ANY mode. Suggesting a
+// weaker one there is worse than saying nothing: on the console the knob is a
+// DAEMON environment variable, so an operator who flips it to get past a
+// transient blip silently degrades every future baseline, with nothing to
+// expire it.
+func TestCheckPrivilegesConnectFailureOffersNoWeakerMode(t *testing.T) {
+	err := CheckPrivileges(context.Background(), "u:p@tcp(127.0.0.1:1)/db",
+		baseline.LockModeFTWRL, RemedyConsole, nil)
+	if err == nil {
+		t.Fatal("an unreachable source passed the preflight")
+	}
+	if strings.Contains(err.Error(), "no-lock") {
+		t.Errorf("a connection failure recommends downgrading consistency: %v", err)
 	}
 }

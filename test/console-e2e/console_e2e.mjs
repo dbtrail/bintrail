@@ -1850,8 +1850,9 @@ try {
   // that stops discriminating, cannot ship silently.
   const toastRun = await page.evaluate(async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    const t = document.getElementById("toast");
-    const shown = () => !t.hidden && t.classList.contains("toast-error");
+    const t = document.getElementById("toast-error");
+    const transient = document.getElementById("toast");
+    const shown = () => !t.hidden;
 
     toastError("Refusal one: grant LOCK TABLES.");
     const immediately = shown();
@@ -1859,9 +1860,11 @@ try {
     await sleep(2600);
     const survivesAutoHide = shown();
 
-    // A success notice must not silently delete an unread failure.
+    // A success notice must not silently delete an unread failure — and must
+    // itself still render, which the shared-node version could not guarantee.
     toast("Baseline started…");
     const survivesSuccess = shown() && /Refusal one/.test(t.textContent);
+    const successStillRenders = !transient.hidden && /Baseline started/.test(transient.textContent);
 
     // A second failure stacks rather than overwrites.
     toastError("Refusal two: BACKUP_ADMIN cannot be granted on RDS.");
@@ -1876,6 +1879,17 @@ try {
     const survivesModalEsc = shown();
     modalMount.replaceChildren();
 
+    // Third door: the date picker renders into document.body, not #modal, and
+    // closes itself on ESC without stopping propagation. Enumerating #modal and
+    // #cmdk-mount was not enough — this is the case that got through.
+    const pop = document.createElement("div");
+    pop.className = "dt-pop";
+    document.body.append(pop);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(50);
+    const survivesDatePickerEsc = shown();
+    pop.remove();
+
     // With nothing else open, ESC dismisses it.
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     await sleep(50);
@@ -1888,29 +1902,40 @@ try {
     await sleep(50);
     const closeDismisses = t.hidden && !t.classList.contains("toast-error");
 
-    // A success notice still fades once no error is showing.
+    // A repeat of a message already showing is counted, not dropped: several
+    // failures carry no server name, so a second one would otherwise change
+    // nothing on screen and read as success.
+    toastError("Refusal four.");
+    toastError("Refusal four.");
+    const counted = /\u00d74|×4|\(×2\)/.test(t.textContent) || /\(×2\)/.test(t.textContent);
+    dismissToast();
+
+    // A success notice still fades on its own.
     toast("Done");
-    const successShown = !t.hidden;
+    const successShown = !transient.hidden;
     await sleep(2600);
     return {
-      immediately, survivesAutoHide, survivesSuccess, stacked,
-      survivesModalEsc, escDismisses, closeDismisses,
-      successShown, successFaded: t.hidden,
+      immediately, survivesAutoHide, survivesSuccess, successStillRenders, stacked, counted,
+      survivesModalEsc, survivesDatePickerEsc, escDismisses, closeDismisses,
+      successShown, successFaded: transient.hidden,
     };
   });
 
   (toastRun.immediately && toastRun.survivesAutoHide)
     ? ok("toast: a failure notice is still on screen well past the transient auto-hide")
     : bad("toast: a failure notice is still on screen well past the transient auto-hide", JSON.stringify(toastRun));
-  toastRun.survivesSuccess
-    ? ok("toast: a success notice does not overwrite an unread failure")
-    : bad("toast: a success notice does not overwrite an unread failure", JSON.stringify(toastRun));
+  (toastRun.survivesSuccess && toastRun.successStillRenders)
+    ? ok("toast: a success notice neither overwrites an unread failure nor is suppressed by it")
+    : bad("toast: a success notice neither overwrites an unread failure nor is suppressed by it", JSON.stringify(toastRun));
+  toastRun.counted
+    ? ok("toast: a repeated failure is counted rather than silently dropped")
+    : bad("toast: a repeated failure is counted rather than silently dropped", JSON.stringify(toastRun));
   toastRun.stacked
     ? ok("toast: concurrent failures stack instead of replacing each other")
     : bad("toast: concurrent failures stack instead of replacing each other", JSON.stringify(toastRun));
-  toastRun.survivesModalEsc
-    ? ok("toast: an ESC meant for an open dialog does not destroy the failure notice")
-    : bad("toast: an ESC meant for an open dialog does not destroy the failure notice", JSON.stringify(toastRun));
+  (toastRun.survivesModalEsc && toastRun.survivesDatePickerEsc)
+    ? ok("toast: an ESC meant for an open dialog or popover does not destroy the failure notice")
+    : bad("toast: an ESC meant for an open dialog or popover does not destroy the failure notice", JSON.stringify(toastRun));
   (toastRun.escDismisses && toastRun.closeDismisses)
     ? ok("toast: ESC and the close button both dismiss the failure notice")
     : bad("toast: ESC and the close button both dismiss the failure notice", JSON.stringify(toastRun));

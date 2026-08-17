@@ -147,6 +147,11 @@
   <div id="cmdk-mount"></div>
 
   <div id="toast" class="toast" hidden></div>
+  <!-- Failures get their OWN node. Sharing one with the transient toast forced a
+       choice between two bad options: let a success notice delete an unread
+       failure, or let a stuck failure suppress every later notice — including
+       warnings that are reported nowhere else. Two nodes, no contention. -->
+  <div id="toast-error" class="toast toast-error" hidden></div>
   <script src="app.js"></script>
 </body>
 </html>

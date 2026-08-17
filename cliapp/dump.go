@@ -276,7 +276,7 @@ func runDump(cmd *cobra.Command, args []string) error {
 	// point-consistent mode the default here too, so the guard has to come
 	// with it. Skipped when the flag is not being sent at all.
 	if supportsLockMode && lockMode.NeedsElevatedPrivileges() {
-		if err := checkMydumperPrivileges(cmd.Context(), dmpSourceDSN, lockMode, mydumperlock.RemedyCLI); err != nil {
+		if err := checkMydumperPrivileges(cmd.Context(), dmpSourceDSN, lockMode, mydumperlock.RemedyCLI, schemas); err != nil {
 			return err
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -142,8 +143,9 @@ func TestRunDumpForwardsTheSelectedModeToThePreflight(t *testing.T) {
 
 	var got baseline.LockMode
 	var gotRemedy mydumperlock.Remedy
-	checkMydumperPrivileges = func(_ context.Context, _ string, m baseline.LockMode, r mydumperlock.Remedy) error {
-		got, gotRemedy = m, r
+	var gotSchemas []string
+	checkMydumperPrivileges = func(_ context.Context, _ string, m baseline.LockMode, r mydumperlock.Remedy, sch []string) error {
+		got, gotRemedy, gotSchemas = m, r, sch
 		return errStopAfterPreflight
 	}
 	t.Cleanup(func() { checkMydumperPrivileges = mydumperlock.CheckPrivileges })
@@ -151,9 +153,12 @@ func TestRunDumpForwardsTheSelectedModeToThePreflight(t *testing.T) {
 	dmpSourceDSN = "u:p@tcp(127.0.0.1:1)/"
 	dmpOutputDir = filepath.Join(dir, "out")
 	dmpMydumperPath = bin
-	dmpLockMode = "lock-all"
+	// NOTE: dmpLockMode is deliberately NOT set here — newDumpCmdForTest's
+	// StringVar registration resets it, so only the Flags().Set below carries
+	// the mode. Assigning it here would read as load-bearing and be inert.
+	dmpSchemas = "appdb"
 	dmpFormat = "text"
-	t.Cleanup(func() { dmpLockMode = "ftwrl"; dmpSourceDSN = ""; dmpOutputDir = "" })
+	t.Cleanup(func() { dmpLockMode = "ftwrl"; dmpSchemas = ""; dmpSourceDSN = ""; dmpOutputDir = "" })
 
 	cmd := newDumpCmdForTest(t)
 	if err := cmd.Flags().Set("mydumper-path", bin); err != nil {
@@ -170,6 +175,11 @@ func TestRunDumpForwardsTheSelectedModeToThePreflight(t *testing.T) {
 	}
 	if gotRemedy != mydumperlock.RemedyCLI {
 		t.Errorf("remedy = %q, want the CLI's own knob named in the refusal", gotRemedy)
+	}
+	// The schema list decides whether a partial REVOKE applies to THIS dump.
+	// Forwarding the wrong one turns a provable refusal into a guess.
+	if !slices.Equal(gotSchemas, []string{"appdb"}) {
+		t.Errorf("schemas = %v, want the dump's own --schemas filter", gotSchemas)
 	}
 }
 

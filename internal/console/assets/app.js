@@ -611,18 +611,17 @@ async function submitPasswordChange(form, msg, firstSet) {
 // toast shows a transient notice. Use it for things that went RIGHT, or for
 // neutral progress. Failures must not fade — see toastError.
 //
-// A visible error OUTRANKS it. #toast is one shared node, and the common
-// sequence is a failure followed immediately by progress from another panel
-// ("Baseline started…", a poll's "still running"); overwriting would delete an
-// unread failure on a timer the operator never saw start. The dropped notice is
-// by definition the one that reports nothing went wrong.
+// It writes to its OWN node, never the error node. An earlier attempt shared
+// one element and had toast() yield to a visible error, which silently dropped
+// messages this function also carries: "rotate your MCP token" after a display
+// interruption (the token is already unrecoverable by then), "capture did NOT
+// restart onto the new snapshot", export-truncation warnings. Each is reported
+// nowhere else, and one undismissed error would have suppressed them all for
+// the rest of the session. Two nodes, no contention.
 function toast(msg) {
   const t = document.getElementById("toast");
   if (!t) return;
-  if (!t.hidden && t.classList.contains("toast-error")) return;
   clearTimeout(toast._t);
-  t.classList.remove("toast-error");
-  t.removeAttribute("role");
   t.textContent = msg;
   t.hidden = false;
   toast._t = setTimeout(() => { t.hidden = true; }, 2200);
@@ -637,15 +636,23 @@ function toast(msg) {
 // operator was left with a button that did nothing and no way to recover the
 // reason. Nothing here starts a timer.
 function toastError(msg) {
-  const t = document.getElementById("toast");
+  const t = document.getElementById("toast-error");
   if (!t) return;
-  clearTimeout(toast._t);
   // A second failure STACKS rather than replaces. These never auto-hide, so a
   // silent overwrite would destroy an unread failure with nothing to hint one
-  // existed \u2014 two servers' baselines refusing together is the ordinary case.
-  const prior = t.hidden ? [] : $all(".toast-msg", t).map((n) => n.textContent);
-  if (prior.includes(msg)) return;
-  t.classList.add("toast-error");
+  // existed — two servers' baselines refusing together is the ordinary case.
+  //
+  // A REPEAT of a message already showing gets a count, not a dropped call.
+  // Dropping it was wrong: several of these messages carry no server name
+  // ("Startup checks failed", "Copy failed."), so failing on server B after
+  // server A produced NO change on screen — indistinguishable from success.
+  const prior = t.hidden ? [] : $all(".toast-msg", t).map((n) => ({
+    text: n.dataset.msg || n.textContent,
+    n: Number(n.dataset.count || "1"),
+  }));
+  const dupe = prior.find((p) => p.text === msg);
+  if (dupe) dupe.n += 1;
+  else prior.push({ text: msg, n: 1 });
   // role=alert so a screen reader announces it; the visual persistence is
   // useless to someone who cannot see it fade. The node is unhidden BEFORE the
   // text lands: a live region that appears with its content already in place
@@ -654,8 +661,12 @@ function toastError(msg) {
   t.replaceChildren();
   t.hidden = false;
   const body = el("div", { class: "toast-body" });
-  for (const m of prior) body.append(el("span", { class: "toast-msg", text: m }));
-  body.append(el("span", { class: "toast-msg", text: msg }));
+  for (const m of prior) {
+    const span = el("span", { class: "toast-msg", text: m.n > 1 ? m.text + "  (\u00d7" + m.n + ")" : m.text });
+    span.dataset.msg = m.text;
+    span.dataset.count = String(m.n);
+    body.append(span);
+  }
   t.append(body);
   const close = el("button", { class: "toast-close", type: "button", "aria-label": "Dismiss all" });
   close.textContent = "\u2715";
@@ -664,10 +675,9 @@ function toastError(msg) {
 }
 
 function dismissToast() {
-  const t = document.getElementById("toast");
+  const t = document.getElementById("toast-error");
   if (!t) return;
   t.hidden = true;
-  t.classList.remove("toast-error");
   t.removeAttribute("role");
   t.textContent = "";
 }
@@ -675,30 +685,40 @@ function dismissToast() {
 // ESC dismisses a persistent error, matching every other dismissible surface
 // in this console — but only as the LAST of them.
 //
-// Restricting this to the error variant is not enough on its own. cmdkKeydown
-// closes the ⌘K palette WITHOUT stopping propagation (deliberately, see
-// globalKeydown), so the same Escape reaches the document and would also
-// destroy an unread error — the failure this whole change exists to prevent,
-// arriving through a different door.
+// cmdkKeydown closes the ⌘K palette WITHOUT stopping propagation
+// (deliberately, see globalKeydown), so the same Escape reaches the document
+// and would also destroy an unread error — the failure this whole change
+// exists to prevent, arriving through a different door.
 //
 // Hence the CAPTURE phase (registered with `true` in init). Deciding on the
 // bubble phase cannot work: by then globalKeydown has already emptied #modal
 // and cmdkKeydown has already emptied #cmdk-mount, so the very state this
 // guard reads to yield the key has been erased by the handlers it is yielding
-// to, and it would dismiss the notice anyway. Capture runs before all of them,
-// while "is a dialog open" is still answerable.
+// to, and it would dismiss the notice anyway. Verified in a browser: on the
+// bubble phase one Escape closes a modal AND wipes the notice behind it.
 //
 // It never calls preventDefault or stopPropagation, so yielding is all it does
 // — the dialog handlers still run normally on the same event.
 function toastEscape(e) {
   if (e.key !== "Escape") return;
+  if (loginGateRaised) return;
   const cmdk = document.getElementById("cmdk-mount");
   if (cmdk && cmdk.firstChild) return;
   const modalMount = document.getElementById("modal");
   if (modalMount && modalMount.firstChild) return;
-  const t = document.getElementById("toast");
-  if (t && !t.hidden && t.classList.contains("toast-error")) dismissToast();
+  // Every surface that consumes Escape must be listed here, including ones
+  // that are NOT inside #modal. The date picker renders into document.body
+  // (see toggleDatePicker) and closes itself on Escape without stopping
+  // propagation, so closing a calendar popover used to destroy the notice —
+  // the same defect as the ⌘K palette, through a third door. A fourth surface
+  // will not announce itself; if you add one that handles Escape, add it here.
+  if (document.querySelector(ESCAPE_OWNING_POPOVERS)) return;
+  const t = document.getElementById("toast-error");
+  if (t && !t.hidden) dismissToast();
 }
+
+// Popovers that live outside #modal and consume Escape themselves.
+const ESCAPE_OWNING_POPOVERS = ".dt-pop";
 
 function renderError(container, err) {
   if (!container) return;
@@ -4215,13 +4235,13 @@ async function renderConnect() {
   if (gen !== serverGen) {
     // The consumed plaintext cannot be re-shown; say so instead of losing it
     // silently (the user must rotate to get a usable value).
-    if (minted) toast("Token display interrupted — rotate to get a fresh value");
+    if (minted) toastError("Token display interrupted — the plaintext token is gone; rotate to get a fresh value");
     return;
   }
   try {
     buildConnect(servers, tokStatus, minted);
   } catch (err) {
-    if (minted) toast("Token display interrupted — rotate to get a fresh value");
+    if (minted) toastError("Token display interrupted — the plaintext token is gone; rotate to get a fresh value");
     const v = VIEW(); clear(v); v.append(pageHead("Connect AI", null)); renderError(v, err);
   }
 }

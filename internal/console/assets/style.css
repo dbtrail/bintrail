@@ -1655,6 +1655,11 @@ button { font-family: inherit; }
   display: flex; align-items: flex-start; gap: 12px;
   max-width: min(70ch, 90vw); max-height: 60vh; overflow-y: auto;
   text-align: left; line-height: 1.5; white-space: pre-wrap;
+  /* Sits ABOVE the transient toast: they are separate nodes now (so neither can
+     suppress the other) and both are position:fixed, so without an offset they
+     would render on top of each other. Growing upward keeps the transient one
+     where operators already expect it. */
+  bottom: 84px;
 }
 /* Concurrent failures stack rather than overwrite, so the messages need their
    own column — as direct children of the flex row they would sit side by side. */

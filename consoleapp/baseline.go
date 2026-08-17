@@ -276,7 +276,7 @@ func runMydumper(ctx context.Context, sourceDSN string, schemas []string, dumpDi
 		// Hard gate, unlike the NO_LOCK warning below: granting BACKUP_ADMIN
 		// without RELOAD/FLUSH_TABLES does not fail cleanly in mydumper — it
 		// SEGFAULTS (verified against the pinned build, #800). Never skipped.
-		if err := checkMydumperPrivileges(ctx, sourceDSN, lockMode, mydumperlock.RemedyConsole); err != nil {
+		if err := checkMydumperPrivileges(ctx, sourceDSN, lockMode, mydumperlock.RemedyConsole, schemas); err != nil {
 			return err
 		}
 	} else if lockMode == baseline.LockModeNoLock {

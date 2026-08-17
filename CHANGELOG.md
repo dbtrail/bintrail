@@ -35,7 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Privilege requirements are now evaluated PER MODE rather than assuming
     every point-consistent mode needs the same grants, and a refusal names
     `lock-all` **before** the weaker modes: on a source that cannot do `ftwrl`
-    it is the only alternative that is still point-consistent.
+    it is the only alternative that is still point-consistent. `lock-all`
+    accepts `LOCK TABLES` granted on the dumped schema rather than demanding it
+    globally — `LOCK_ALL` locks the exported tables, and a dump runs to
+    completion with only `GRANT SELECT, LOCK TABLES, SHOW VIEW ON <schema>.*`.
+  - **Partial revokes are no longer read as a grant.** MySQL 8.0.16+ renders
+    `REVOKE LOCK TABLES ON \`db\`.*` as its own `SHOW GRANTS` line; reading only
+    the `GRANT` lines reported a privilege the user does not have, and mydumper
+    would then launch and die partway leaving a partial dump. A revoke that
+    provably covers a dumped schema is now a refusal naming it, one that
+    provably does not is ignored, and an undecidable grant pattern is a
+    warning — never a refusal, which would be the same over-refusal as above.
 
 ### Changed
 - **Console failures no longer disappear on their own.** Failure notices were
@@ -44,10 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alternative modes — so at that duration it was not merely easy to miss, it
   was unreadable, and there was no way to recover the reason afterwards.
   Failures now stay until dismissed with the close button or ESC, and scroll
-  if long; success and progress notices still fade. Concurrent failures stack
-  instead of overwriting each other, and a success notice no longer replaces an
-  unread failure — with no auto-hide, a silent overwrite would destroy a message
-  the operator never saw.
+  if long; success and progress notices still fade. Failures render in their own
+  element, so neither channel can suppress the other: a success notice cannot
+  replace an unread failure, and an undismissed failure cannot swallow a warning
+  that is reported nowhere else (an interrupted MCP-token display, a schema
+  snapshot that capture did not restart onto, an export hitting its row cap).
+  Concurrent failures stack, and a repeat of a message already on screen is
+  counted rather than dropped — several of them carry no server name, so a
+  second failure would otherwise change nothing on screen.
 
 ## [0.58.0] - 2026-08-16
 

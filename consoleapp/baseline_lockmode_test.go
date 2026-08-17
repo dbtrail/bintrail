@@ -59,9 +59,10 @@ func TestBuildConsoleMydumperArgsCarriesLockMode(t *testing.T) {
 func TestRunMydumperForwardsTheSelectedModeToThePreflight(t *testing.T) {
 	var got baseline.LockMode
 	var gotRemedy mydumperlock.Remedy
+	var gotSchemas []string
 	sentinel := errors.New("stop after preflight")
-	checkMydumperPrivileges = func(_ context.Context, _ string, m baseline.LockMode, r mydumperlock.Remedy) error {
-		got, gotRemedy = m, r
+	checkMydumperPrivileges = func(_ context.Context, _ string, m baseline.LockMode, r mydumperlock.Remedy, sch []string) error {
+		got, gotRemedy, gotSchemas = m, r, sch
 		return sentinel
 	}
 	t.Cleanup(func() { checkMydumperPrivileges = mydumperlock.CheckPrivileges })
@@ -76,5 +77,8 @@ func TestRunMydumperForwardsTheSelectedModeToThePreflight(t *testing.T) {
 	}
 	if gotRemedy != mydumperlock.RemedyConsole {
 		t.Errorf("remedy = %q, want the console's own knob named in the refusal", gotRemedy)
+	}
+	if !slices.Equal(gotSchemas, []string{"appdb"}) {
+		t.Errorf("schemas = %v, want the request's own schema filter", gotSchemas)
 	}
 }

@@ -116,13 +116,19 @@ func (r Remedy) noCheckModes() string {
 // dump rather than being swallowed, because the alternative — letting mydumper
 // attempt FTWRL half-privileged — is a segfault, not a clean error (#800).
 // Never silently falls back to a mode that is not point-consistent.
-func CheckPrivileges(ctx context.Context, sourceDSN string, mode baseline.LockMode, remedy Remedy) error {
+func CheckPrivileges(ctx context.Context, sourceDSN string, mode baseline.LockMode, remedy Remedy, schemas []string) error {
 	db, err := config.Connect(sourceDSN)
 	if err != nil {
-		return fmt.Errorf("point-consistent baseline: cannot connect to source to verify privileges: %w%s", err, remedy.noCheckModes())
+		// Deliberately NO alternatives clause. An unreachable source is not a
+		// privilege problem: mydumper cannot dump in ANY mode, so naming the
+		// weaker ones buys nothing and actively misleads — on the console the
+		// knob is a daemon environment variable, so an operator who sets
+		// no-lock to get past a transient blip silently degrades EVERY future
+		// baseline, with nothing to expire it or prompt a revert.
+		return fmt.Errorf("point-consistent baseline: cannot connect to source to verify privileges: %w", err)
 	}
 	defer db.Close()
-	return checkPrivilegesDB(ctx, db, mode, remedy)
+	return checkPrivilegesDB(ctx, db, mode, remedy, schemas)
 }
 
 // grantSet is what SHOW GRANTS FOR CURRENT_USER() told us, split by SCOPE.
@@ -136,6 +142,16 @@ type grantSet struct {
 	// `db`.`tbl`). Kept as the raw object text so a refusal can quote back
 	// what the operator's own SHOW GRANTS shows.
 	scoped map[string][]string
+	// revoked maps a privilege to the objects a PARTIAL REVOKE took it back on.
+	// MySQL 8.0.16+ renders these as separate REVOKE lines in SHOW GRANTS, and
+	// reading only the GRANT lines reports a privilege the user does not have —
+	// verified on MySQL 8.0.46 with partial_revokes=ON: a user holding
+	// `GRANT LOCK TABLES ON *.*` with `REVOKE LOCK TABLES ON \`appdb\`.*` gets
+	// "ERROR 1044 Access denied ... to database 'appdb'" on LOCK TABLES there.
+	// That is the FALSE-PASS direction: mydumper launches and dies partway,
+	// leaving a partial dump, which is exactly what this preflight exists to
+	// prevent. partial_revokes defaults OFF, but it is a one-way switch.
+	revoked map[string][]string
 	// unparsed counts grant lines this parser did not recognise as either a
 	// privilege grant or a role membership. It exists so a misparse is
 	// DEBUGGABLE: the failure this whole package is fixing was a check that
@@ -167,6 +183,10 @@ func (g *grantSet) scopesFor(p string) string {
 
 // add parses one SHOW GRANTS line into the set.
 func (g *grantSet) add(line string) {
+	if strings.HasPrefix(line, "REVOKE ") {
+		g.addRevoke(line)
+		return
+	}
 	if !strings.HasPrefix(line, "GRANT ") {
 		g.unparsed++
 		return
@@ -202,6 +222,86 @@ func (g *grantSet) add(line string) {
 	for _, n := range names {
 		g.scoped[n] = append(g.scoped[n], obj)
 	}
+}
+
+// addRevoke parses "REVOKE <privs> ON <object> FROM <user>".
+func (g *grantSet) addRevoke(line string) {
+	rest := line[len("REVOKE "):]
+	oi := strings.Index(rest, " ON ")
+	if oi < 0 {
+		g.unparsed++
+		return
+	}
+	obj := rest[oi+len(" ON "):]
+	fi := strings.Index(obj, " FROM ")
+	if fi < 0 {
+		g.unparsed++
+		return
+	}
+	names := splitPrivileges(rest[:oi])
+	if len(names) == 0 {
+		g.unparsed++
+		return
+	}
+	obj = strings.TrimSpace(obj[:fi])
+	for _, n := range names {
+		g.revoked[n] = append(g.revoked[n], obj)
+	}
+}
+
+// revokeSchema extracts the schema component of a grant/revoke object
+// (`appdb`.* → appdb). Returns ok=false for a shape it does not recognise —
+// which is treated as "cannot evaluate", never as "does not apply".
+func revokeSchema(obj string) (string, bool) {
+	dot := strings.Index(obj, ".")
+	if dot <= 0 {
+		return "", false
+	}
+	return strings.Trim(obj[:dot], "`\""), true
+}
+
+// revokesAffecting splits the partial revokes of p into those that PROVABLY
+// apply to a dump of these schemas and those that cannot be decided.
+//
+// The split matters because the two directions have opposite costs. Refusing a
+// dump whose schemas a revoke does not touch is a false refusal — the defect
+// #1381 was filed for. Passing one it does touch lets mydumper die partway.
+// So only a LITERAL schema-name match counts as blocking: a MySQL grant pattern
+// may contain `%`/`_` wildcards, and a pattern equal to the schema name matches
+// it whatever the wildcard rules say, while a non-equal pattern containing a
+// wildcard MIGHT match and is reported rather than acted on.
+//
+// An empty schema list means "dump every non-system schema", so any revoke is
+// blocking: whatever it names is inside the dump.
+func (g *grantSet) revokesAffecting(p string, schemas []string) (blocking, undecidable []string) {
+	var objs []string
+	objs = append(objs, g.revoked[p]...)
+	objs = append(objs, g.revoked["ALL PRIVILEGES"]...)
+	for _, obj := range objs {
+		if len(schemas) == 0 {
+			blocking = append(blocking, obj)
+			continue
+		}
+		name, ok := revokeSchema(obj)
+		if !ok {
+			undecidable = append(undecidable, obj)
+			continue
+		}
+		matched := false
+		for _, s := range schemas {
+			if strings.EqualFold(name, s) {
+				matched = true
+				break
+			}
+		}
+		switch {
+		case matched:
+			blocking = append(blocking, obj)
+		case strings.ContainsAny(name, "%_"):
+			undecidable = append(undecidable, obj)
+		}
+	}
+	return blocking, undecidable
 }
 
 // splitPrivileges turns "SELECT (a, b), LOCK TABLES" into the privilege names
@@ -250,7 +350,7 @@ func parseGrants(ctx context.Context, db *sql.DB) (*grantSet, error) {
 	}
 	defer rows.Close()
 
-	g := &grantSet{global: map[string]bool{}, scoped: map[string][]string{}}
+	g := &grantSet{global: map[string]bool{}, scoped: map[string][]string{}, revoked: map[string][]string{}}
 	for rows.Next() {
 		var line string
 		if err := rows.Scan(&line); err != nil {
@@ -295,10 +395,13 @@ func parseGrants(ctx context.Context, db *sql.DB) (*grantSet, error) {
 //   - The low-privilege modes never reach here.
 //
 // ALL PRIVILEGES satisfies any of them at the matching scope.
-func checkPrivilegesDB(ctx context.Context, db *sql.DB, mode baseline.LockMode, remedy Remedy) error {
+func checkPrivilegesDB(ctx context.Context, db *sql.DB, mode baseline.LockMode, remedy Remedy, schemas []string) error {
 	g, err := parseGrants(ctx, db)
 	if err != nil {
-		return err
+		// The hatch belongs HERE, not on the connect path: the source answered,
+		// so a dump can genuinely still succeed — it is only this check that
+		// could not run.
+		return fmt.Errorf("%w%s", err, remedy.noCheckModes())
 	}
 
 	// SHOW GRANTS expands the privileges of a session's ACTIVE roles (measured
@@ -311,18 +414,42 @@ func checkPrivilegesDB(ctx context.Context, db *sql.DB, mode baseline.LockMode, 
 
 	if mode == baseline.LockModeLockAll {
 		if g.grantedAnywhere("LOCK TABLES") {
+			blocking, undecidable := g.revokesAffecting("LOCK TABLES", schemas)
+			if len(undecidable) > 0 {
+				slog.Warn("lock-all: a partial revoke of LOCK TABLES may cover a schema in this dump;"+
+					" if mydumper fails with \"Access denied\", this is why",
+					"revokes", strings.Join(undecidable, ", "), "schemas", schemas)
+			}
+			if len(blocking) > 0 {
+				return fmt.Errorf("lock-all baseline mode requires LOCK TABLES on the dumped schemas, and a partial"+
+					" REVOKE takes it back on %s — the global grant does not apply there (verified: LOCK TABLES then"+
+					" fails with \"ERROR 1044 Access denied\"). Restore it, e.g."+
+					" GRANT LOCK TABLES ON <schema>.* TO '<user>'@'%%', or exclude that schema from the dump%s",
+					strings.Join(blocking, ", "), remedy.noCheckModes())
+			}
 			if !g.grantedGlobally("LOCK TABLES") {
-				// Accepted, but say which schemas it covers: if the dump reaches a
+				// Accepted, but say which objects it covers: if the dump reaches a
 				// schema outside them mydumper fails cleanly, and this line is what
-				// makes that error make sense.
-				slog.Info("lock-all: LOCK TABLES is granted per schema, not globally;"+
-					" the dump must stay within these", "scopes", g.scopesFor("LOCK TABLES"))
+				// makes that error make sense. Not a refusal — the grant patterns
+				// can carry wildcards, so "does it cover the dump" is not decidable
+				// here, and guessing wrong is the false refusal #1381 was about.
+				slog.Info("lock-all: LOCK TABLES is granted per object, not globally;"+
+					" the dump must stay within these", "scopes", g.scopesFor("LOCK TABLES"),
+					"schemas", schemas)
 			}
 			return nil
 		}
+		// Name ftwrl when the user could actually run it: an operator who copied
+		// an RDS recipe onto a self-hosted source holding global RELOAD would
+		// otherwise be steered straight past the point-consistent mode they have.
+		alt := remedy.noCheckModes()
+		if g.grantedGlobally("RELOAD") || g.grantedGlobally("FLUSH_TABLES") {
+			alt = " — this user already holds RELOAD/FLUSH_TABLES globally, so " +
+				remedy.forMode(baseline.LockModeFTWRL) + " is available and is also point-consistent" + alt
+		}
 		return fmt.Errorf("lock-all baseline mode requires the LOCK TABLES privilege, which the current user does not"+
 			" have at any scope — grant it, e.g. GRANT LOCK TABLES ON *.* TO '<user>'@'%%' (a grant on just the dumped"+
-			" schema also works, since LOCK_ALL locks the exported tables)%s%s", roleCaveat, remedy.noCheckModes())
+			" schema also works, since LOCK_ALL locks the exported tables)%s%s", roleCaveat, alt)
 	}
 
 	if g.grantedGlobally("ALL PRIVILEGES") {
@@ -331,9 +458,20 @@ func checkPrivilegesDB(ctx context.Context, db *sql.DB, mode baseline.LockMode, 
 
 	requireBackupAdmin, err := requiresBackupAdmin(ctx, db)
 	if err != nil {
+		// Unlike the paths above, the grants ARE known here — so if this user
+		// can run lock-all, say so instead of offering only the weaker modes.
+		// noCheckModes exists for when the grant query itself failed.
+		if g.grantedAnywhere("LOCK TABLES") {
+			return fmt.Errorf("%w — this user holds LOCK TABLES, so %s, which is point-consistent and needs no"+
+				" version check%s", err, remedy.forMode(baseline.LockModeLockAll), remedy.noCheckModes())
+		}
 		return fmt.Errorf("%w%s", err, remedy.noCheckModes())
 	}
 	hasFlush := g.grantedGlobally("RELOAD") || g.grantedGlobally("FLUSH_TABLES")
+	// A partial revoke cannot take back a global-only privilege like RELOAD in a
+	// way that affects FLUSH TABLES WITH READ LOCK (which is not schema-scoped),
+	// so no revoke check here — but say so, or the asymmetry with lock-all above
+	// reads as an oversight.
 	missingBackupAdmin := requireBackupAdmin && !g.grantedGlobally("BACKUP_ADMIN")
 	if hasFlush && !missingBackupAdmin {
 		return nil
