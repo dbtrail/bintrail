@@ -2037,9 +2037,19 @@ function renderRecover(params) {
     const banner = el("div", { class: "ctx-banner" });
     banner.append(el("span", { class: "badge " + badgeClass(ctx.type), text: ctx.type }));
     banner.append(el("div", { class: "ctx-main" },
-      el("span", { class: "ctx-eyebrow", text: "Reverting this row to before this point" }),
+      // Scope, not target state. The prefill below sets `until` and never
+      // `since`, so this reverses EVERY event on the row in an unbounded
+      // window — the row lands where it was when the window opened, which is
+      // only "the state just before this event" when that event is the sole
+      // one in range. The old wording ("reverting this row to before this
+      // point") promised the latter and quietly delivered the former: on a
+      // row inserted and deleted inside the same second, undoing both leaves
+      // no row at all. If the prefill ever bounds the window, revisit this
+      // text — TestAppJSUndoBannerStatesWindowScope pins the pairing.
+      el("span", { class: "ctx-eyebrow", text: "Undoing every change up to this point" }),
       el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " · pk " + ctx.pk }),
-      el("span", { class: "ctx-detail", text: "undoing changes up to " + ctx.type + " at " + ctx.time + " UTC" })));
+      el("span", { class: "ctx-detail", text: "reverses all events on this row through " + ctx.type
+        + " at " + ctx.time + " UTC, not only that one — set Since to narrow the window" })));
     banner.append(el("span", { class: "spacer" }));
     banner.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear",
       onclick: () => { pendingRecover = null; navigate("recover"); } }));

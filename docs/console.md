@@ -131,7 +131,10 @@ and searching events:
 4. **Recover** — filter schema / table / PK / time, preview the affected rows
    with before→after diffs, then **Generate undo SQL** and copy/download the
    script. Arriving via an **Undo** action scopes it to that row and shows a
-   context banner. When you undo a `DELETE` on a foreign-key **parent** whose
+   context banner; it fills in **Until** from the event you clicked and leaves
+   **Since** open, so every change to that row up to that point is reversed —
+   not only the event you clicked. Set **Since** to narrow the window.
+   When you undo a `DELETE` on a foreign-key **parent** whose
    children InnoDB cascade-deleted *below* the binlog (MySQL ≤ 8.x / MariaDB) —
    or an `UPDATE` of a referenced key whose `ON UPDATE` cascade rewrote them just
    as invisibly —
