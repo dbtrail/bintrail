@@ -342,6 +342,36 @@ editing flags or restarting:
 - The standalone `bintrail-console serve` hides the panel and refuses the write
   (HTTP 403) — only the daemon running the loop consumes the policy.
 
+### The Protect pages
+
+Under `watch` the sidebar carries a **Protect** group with two pages. They were
+part of the Storage page until they outgrew it: both are operations that
+produce and validate the artifacts a restore depends on, rather than settings,
+and the snapshot listing is unbounded in practice — it pushed verification, the
+panel that answers whether a restore would work, far below the fold.
+
+**Protect → Baselines**
+
+- A read-only listing of the **selected server's** baseline source
+  (`baseline_dir` / `baseline_s3`): each snapshot's timestamp, age, table
+  count, and (local sources) the binlog coordinates its deltas start from. The
+  empty states explain how to produce a first baseline (`bintrail dump` →
+  `bintrail baseline`). When the **Create baseline** button is enabled it sits
+  in this panel's header.
+- **Automatic baseline refresh** — when `--baseline-refresh-interval` is set,
+  the panel reports the daemon's last automatic refresh for the selected
+  server: how many tables it published, or that it published nothing and why.
+  A refusal there is the fail-closed contract working (a capture gap, a schema
+  change), not a broken daemon — nothing was overwritten and the next run
+  retries. The refresh is opt-in on its own: it does not require, and does not
+  enable, the **Create baseline** button.
+
+**Protect → Verification** carries the verification runner and the history of
+past runs for the selected server.
+
+The Storage page keeps a compact **Baselines** summary card (count and age)
+alongside the rest of the storage picture.
+
 ### The Storage page
 
 Under `watch` the sidebar grows a **Settings → Storage** page that gathers
@@ -355,19 +385,6 @@ compact baseline summary card and links onward:
 - **S3 archiving per source** — every monitored server with its
   `Archive to S3` destination (or `drop-only` when none), with a shortcut into
   that server's edit form. The boot (cli) index always rotates drop-only.
-- **Baseline snapshots** — a read-only listing of the **selected server's**
-  baseline source (`baseline_dir` / `baseline_s3`): each snapshot's timestamp,
-  age, table count, and (local sources) the binlog coordinates its deltas
-  start from. The empty states explain how to produce a first baseline
-  (`bintrail dump` → `bintrail baseline`). When the **Create baseline** button
-  is enabled (see below) it sits in this panel's header.
-- **Automatic baseline refresh** — when `--baseline-refresh-interval` is set,
-  the Baseline snapshots panel reports the daemon's last automatic refresh for
-  the selected server: how many tables it published, or that it published
-  nothing and why. A refusal there is the fail-closed contract working (a
-  capture gap, a schema change), not a broken daemon — nothing was overwritten
-  and the next run retries. The refresh is opt-in on its own — it does not
-  require, and does not enable, the **Create baseline** button.
 - **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one
@@ -632,7 +649,7 @@ see the metrics tables and example alert rules in
   the upload come from the ambient chain (`AWS_*` / `~/.aws` / role).
 - `BINTRAIL_CONSOLE_BASELINE_TRIGGER` (`watch` only) — `1`/`true` enables the
   **Create baseline** button (runs `mydumper` → convert → upload in-process;
-  see [The Storage page](#the-storage-page)). Off by default for a bare
+  see [Protect → Baselines](#the-protect-pages)). Off by default for a bare
   `watch` invocation; the bundled compose stack sets this on by default (see
   [docker.md](docker.md) — `BASELINE_TRIGGER=0` in `.env` opts out there).
 - `BINTRAIL_CONSOLE_BASELINE_STAGING` (`watch` only) — local staging dir for

@@ -413,13 +413,13 @@ reconstruct knows where deltas begin. Then point the console at it:
   in `.env` and `docker compose up -d` again.
 
 The console also has an in-process **Create baseline** button (in the sidebar
-under Settings → Storage, for the selected server) that runs the same
+under Protect → Baselines, for the selected server) that runs the same
 dump→convert→upload pipeline without the CLI profile — it's on by default in this compose stack;
 set `BASELINE_TRIGGER=0` in `.env` to disable it. The button still needs a
 source DSN and a baseline dir/S3 configured on the server before it does
 anything.
 
-The same Storage page also has a **Verification** panel (also on by default;
+**Protect → Verification** carries the verification runner (also on by default;
 `VERIFY_TRIGGER=0` in `.env` to disable) that runs `bintrail verify` in-process
 for the selected server — trigger a run, watch per-table match/mismatch/
 inconclusive results land, and drill into a mismatch — see

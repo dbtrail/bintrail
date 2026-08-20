@@ -3168,7 +3168,7 @@ function updateSideMeta(status) {
   }
 }
 
-// ── Storage (rotation · S3 archiving · baselines · credentials) ──────────────
+// ── Storage (rotation · S3 archiving · credentials · telemetry) ──────────────
 
 async function renderStorage() {
   // Gated like Time-travel: a direct URL / Back with the capability off must
@@ -3215,7 +3215,7 @@ function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
   cards.append(credentialsCard(storage));
   cards.append(telemetryCard(telemetry));
   if (capsCache.views) cards.append(duckdbCard());
-  cards.append(baselineSummaryCard(baselines, cur));
+  cards.append(baselineSummaryCard(baselines, cur, { linkOnward: true }));
   v.append(cards);
 
   // Storage keeps storage POLICY. Baselines and verification moved to their
@@ -3251,6 +3251,11 @@ async function renderBaselines() {
   if (gen !== serverGen || vgen !== viewGen) return;
   try {
     const servers = (serversRes && serversRes.servers) || [];
+    // A failed /api/servers must be REPORTED, not absorbed into an empty list:
+    // with servers=[] the Create baseline button silently disappears and the
+    // empty state advises "Add a server first" — on the page that owns the
+    // button. buildStorage keeps serversErr for the same reason.
+    const serversErr = serversRes && serversRes.error;
     const v = VIEW(); clear(v);
     v.append(pageHead("Baselines", el("p", { class: "page-sub" },
       "Full-table snapshots Time-travel and full restores are built from. ",
@@ -3258,6 +3263,7 @@ async function renderBaselines() {
     const cards = el("div", { class: "cards" });
     cards.append(baselineSummaryCard(baselines, servers.find((s) => s.id === (currentServer || defaultServerId))));
     v.append(cards);
+    if (serversErr) v.append(el("div", { class: "error-box", text: "Could not load servers: " + serversErr }));
     const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
     grid.append(baselinesPanel(baselines, servers));
     v.append(grid);
@@ -3275,11 +3281,15 @@ async function renderVerification() {
   if (gen !== serverGen || vgen !== viewGen) return;
   try {
     const servers = (serversRes && serversRes.servers) || [];
+    // Same reason as renderBaselines: swallowed, a transient 500 renders
+    // "Select a server to run verification" while a server IS selected.
+    const serversErr = serversRes && serversRes.error;
     const v = VIEW(); clear(v);
     v.append(pageHead("Verification", el("p", { class: "page-sub" },
       "Prove a snapshot still reconstructs what it claims — the check that answers whether a restore would actually work.")));
+    if (serversErr) v.append(el("div", { class: "error-box", text: "Could not load servers: " + serversErr }));
     const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
-    grid.append(verifyPanel(servers));
+    grid.append(verifyPanel(servers, { hideTitle: true }));
     v.append(grid);
     viewEnter();
   } catch (err) {
@@ -3522,16 +3532,30 @@ async function setTelemetry(enabled) {
   renderStorage();
 }
 
-function baselineSummaryCard(b, cur) {
+// On Storage this card is the POINTER to Protect > Baselines, so it carries a
+// link there — docs/console.md says it "links onward" and, before this, it did
+// not. On the Baselines page itself the link would point at the current page,
+// so the caller omits it.
+function baselineSummaryCard(b, cur, opts) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Baselines" }));
+  // Appended at every exit, so the link is the card's FOOT rather than sitting
+  // above an error message. Every branch returns through here.
+  const done = () => {
+    if (opts && opts.linkOnward) {
+      card.append(el("div", { class: "stg-cardfoot" },
+        el("button", { class: "btn btn-sm", type: "button", text: "All snapshots \u2192",
+          onclick: () => navigate("baselines") })));
+    }
+    return card;
+  };
   if (!b || b.error) {
     card.append(el("p", { class: "form-hint", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
-    return card;
+    return done();
   }
   if (!b.configured) {
     kvRow(card, "source", "not configured");
     kvRow(card, "time-travel", "off");
-    return card;
+    return done();
   }
   const snaps = b.snapshots || [];
   kvRow(card, "source", b.source);
@@ -3539,7 +3563,7 @@ function baselineSummaryCard(b, cur) {
   kvRow(card, "latest (UTC)", snaps.length ? snaps[0].time : "none yet");
   if (snaps.length) kvRow(card, "age", formatAge(snaps[0].age_hours));
   kvRow(card, "time-travel", b.reconstruct ? "enabled" : "off (archives disabled)");
-  return card;
+  return done();
 }
 
 // baselineConfigHint: the boot (cli) entry is not editable from the UI — its
@@ -3741,7 +3765,12 @@ async function pollBaseline(id) {
 // baseline_trigger) plus a per-server precondition (verify: a baseline is
 // configured; verify_live_source: a source DSN is also configured), both
 // re-enforced server-side so this gating is UX only.
-function verifyPanel(servers) {
+// opts.hideTitle: /verification renders pageHead("Verification") already, and
+// an h1 immediately above an identical h2 is a duplicated landmark for anyone
+// navigating by heading. The parameter exists rather than deleting the head
+// outright because the head is also the panel's own append target in three
+// early-return branches.
+function verifyPanel(servers, opts) {
   // Full-width. This override was originally a workaround: verification was a
   // third panel in a 2-column grid built for archiving | baselines, and with
   // align-items:start it landed under the SHORT sibling with a dead gap beside
@@ -3750,7 +3779,8 @@ function verifyPanel(servers) {
   // sole panel should do. Kept because the grid is still 2-column.
   const panel = el("section", { class: "ov-panel vfy-panel-full" });
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
-  const head = el("div", { class: "ov-panel-head" }, el("h2", { class: "ov-panel-title", text: "Verification" }));
+  const head = el("div", { class: "ov-panel-head" });
+  if (!(opts && opts.hideTitle)) head.append(el("h2", { class: "ov-panel-title", text: "Verification" }));
   const list = el("div", { class: "stg-list vfy-list" });
 
   if (!capsCache.verify_trigger) {
@@ -5295,6 +5325,8 @@ function cmdkCommands() {
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
   if (capsCache.sql) cmds.push({ group: "Navigate", label: "SQL", run: () => navigate("sql") });
+  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Baselines", run: () => navigate("baselines") });
+  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Verification", run: () => navigate("verification") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Storage", run: () => navigate("storage") });
   cmds.push({ group: "Navigate", label: "Connect AI", run: () => navigate("connect") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });

@@ -427,7 +427,7 @@ Four properties are deliberate:
 - **Isolated from capture.** A failure is logged and retried; it can never take down the stream or the supervisor. A baseline that stopped refreshing is a degradation, a daemon that stopped capturing is an outage, and the first must never cause the second.
 - **Nothing is uploaded, so nothing is pruned.** A refreshed snapshot is written locally only, and `bintrail baseline prune` reclaims a snapshot only once it has confirmed a durable S3 copy of it — so snapshots this loop publishes accumulate, whether or not an S3 destination is configured. The loop says so at startup. Upload and prune them on your own schedule (`bintrail upload --source <baseline-dir> --destination s3://…`), or size the disk for one full-table snapshot per interval.
 
-It shares its single-flight with the console's **Create baseline** button, so a refresh and a dump never run against the same server at once. The last outcome per server shows up in the console's Storage page and in `GET /api/baselines`.
+It shares its single-flight with the console's **Create baseline** button, so a refresh and a dump never run against the same server at once. The last outcome per server shows up on the console's **Protect → Baselines** page and in `GET /api/baselines`.
 
 
 An S3-only baseline destination is skipped with a warning: a refresh reads and writes snapshot files on disk, so there is nothing for it to refresh in place.

@@ -9,6 +9,9 @@ import (
 
 var navRouteRE = regexp.MustCompile(`data-route="([a-z-]+)"`)
 
+// Route names as they appear in the ROUTES array: quoted, lowercase, no spaces.
+var routeLiteralRE = regexp.MustCompile(`"([a-z-]+)"`)
+
 // Every nav entry must name a route the router knows.
 //
 // The failure this prevents is silent: navigate() falls back to "overview" for
@@ -26,7 +29,12 @@ func TestNavEntriesNameKnownRoutes(t *testing.T) {
 	}
 
 	routes := parseRoutesConst(t, string(js))
-	dispatch := string(js)
+	// Scoped to renderRoute. A file-wide search for `case "x":` passes when the
+	// arm is deleted from the router and an unrelated switch happens to carry
+	// the same case label — demonstrated by the reviewer, who removed the real
+	// arm, added one elsewhere, and watched this go green while the failure
+	// message still said "no case in renderRoute's switch".
+	dispatch := renderRouteBody(t, string(js))
 
 	matches := navRouteRE.FindAllStringSubmatch(string(html), -1)
 	if len(matches) == 0 {
@@ -60,9 +68,30 @@ func TestNavEntriesNameKnownRoutes(t *testing.T) {
 	}
 }
 
+// renderRouteBody returns the body of renderRoute's dispatch switch.
+func renderRouteBody(t *testing.T, js string) string {
+	t.Helper()
+	i := strings.Index(js, "function renderRoute(")
+	if i < 0 {
+		t.Fatal("renderRoute is gone from assets/app.js — this guard covers nothing")
+	}
+	rest := js[i:]
+	if j := strings.Index(rest, "\nfunction "); j > 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
 // parseRoutesConst reads the ROUTES array literal out of app.js. Parsing the
 // source rather than hardcoding the list keeps this guard honest: a hardcoded
 // copy would drift from the thing it claims to check.
+//
+// Comments are stripped per line BEFORE splitting. Without that the splitter
+// treats commas inside the explanatory comment as separators and accepts prose
+// fragments as route names — the reviewer measured 14 "routes" parsed from an
+// array of 10, four of them sentence fragments. That also made the
+// len(out) == 0 tripwire dead: emptying the array entirely still parsed four
+// entries, so the "parser broke, not the code" check could never fire.
 func parseRoutesConst(t *testing.T, js string) map[string]bool {
 	t.Helper()
 	const marker = "const ROUTES = ["
@@ -75,19 +104,17 @@ func parseRoutesConst(t *testing.T, js string) map[string]bool {
 	if j < 0 {
 		t.Fatal("unterminated ROUTES array in assets/app.js")
 	}
-	out := map[string]bool{}
-	for _, part := range strings.Split(rest[:j], ",") {
-		// Strip whitespace, comments and quotes. Entries may be spread over
-		// several lines with // comments between them.
-		for _, line := range strings.Split(part, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "//") {
-				continue
-			}
-			if name := strings.Trim(line, `"' `); name != "" {
-				out[name] = true
-			}
+	var code strings.Builder
+	for _, line := range strings.Split(rest[:j], "\n") {
+		if c := strings.Index(line, "//"); c >= 0 {
+			line = line[:c]
 		}
+		code.WriteString(line)
+		code.WriteString("\n")
+	}
+	out := map[string]bool{}
+	for _, m := range routeLiteralRE.FindAllStringSubmatch(code.String(), -1) {
+		out[m[1]] = true
 	}
 	if len(out) == 0 {
 		t.Fatal("parsed zero routes from the ROUTES array — the parser broke, not the code")

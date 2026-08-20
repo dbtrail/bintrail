@@ -88,9 +88,15 @@
              and validate recovery artifacts, not settings — and a layout
              problem: the snapshot list is unbounded, so it pushed verification
              far below the fold. Same per-item monitor gate as Storage: both
-             read watch-daemon state, so on a standalone serve the whole group
-             collapses to nothing rather than showing dead entries. -->
-        <div class="nav-group">
+             read watch-daemon state. The gate is on the GROUP, not per item:
+             every member is monitor-gated, so per-item gating would leave a
+             bare "Protect" heading with nothing under it on a standalone
+             serve — and on every console for the duration of the boot
+             capabilities fetch. (Settings is per-item for the opposite
+             reason: Connect AI is always visible, so its group must survive.)
+             The [data-capability]:not(.cap-on) rule and the $all sweep are
+             both element-agnostic, so this works unchanged. -->
+        <div class="nav-group" data-capability="monitor">
           <div class="nav-label">Protect</div>
           <a class="nav-item" data-route="baselines" href="/baselines" data-capability="monitor">
             <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 3 7l9 5 9-5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></span>
