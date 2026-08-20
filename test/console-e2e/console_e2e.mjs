@@ -1365,11 +1365,12 @@ try {
     ? ok("overview: a failed aggregate shows no number, never a zero")
     : bad("overview: a failed aggregate shows no number, never a zero", JSON.stringify(ov.missing));
 
-  // Scenario 15b — Storage page live (#686): with the daemon opted in
-  // (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1) and this server baseline-configured,
-  // the Create-baseline button must render enabled, and the fixture snapshot
-  // (1 table, anchored at binlog.000001:50) must be listed.
-  await page.evaluate(() => navigate("storage"));
+  // Scenario 15b — Baselines page live (#686, moved off Storage by #1384):
+  // with the daemon opted in (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1) and this
+  // server baseline-configured, the Create-baseline button must render
+  // enabled, and the fixture snapshot (1 table, anchored at
+  // binlog.000001:50) must be listed.
+  await page.evaluate(() => navigate("baselines"));
   await page.waitForFunction(() => Array.from(document.querySelectorAll(".stg-row")).some((r) => r.textContent.includes("binlog.000001:50")), { timeout: 10000 });
   const stg = await page.evaluate(() => {
     const heads = Array.from(document.querySelectorAll(".ov-panel-head"));
@@ -1378,9 +1379,9 @@ try {
     const row = Array.from(document.querySelectorAll(".stg-row")).find((r) => r.textContent.includes("binlog.000001:50"));
     return { capOn: !!capsCache.baseline_trigger, btnPresent: !!btn, btnEnabled: btn ? !btn.disabled : false, rowText: row ? row.textContent : "" };
   });
-  stg.capOn ? ok("storage: baseline_trigger capability reaches the frontend") : bad("storage: baseline_trigger capability reaches the frontend", "capsCache.baseline_trigger falsy");
-  (stg.btnPresent && stg.btnEnabled) ? ok("storage: Create-baseline button renders enabled when both gates pass") : bad("storage: Create-baseline button renders enabled when both gates pass", `present=${stg.btnPresent} enabled=${stg.btnEnabled}`);
-  stg.rowText.includes("1 table(s)") ? ok("storage: the fixture snapshot is listed with its table count") : bad("storage: the fixture snapshot is listed with its table count", stg.rowText);
+  stg.capOn ? ok("baselines: baseline_trigger capability reaches the frontend") : bad("baselines: baseline_trigger capability reaches the frontend", "capsCache.baseline_trigger falsy");
+  (stg.btnPresent && stg.btnEnabled) ? ok("baselines: Create-baseline button renders enabled when both gates pass") : bad("baselines: Create-baseline button renders enabled when both gates pass", `present=${stg.btnPresent} enabled=${stg.btnEnabled}`);
+  stg.rowText.includes("1 table(s)") ? ok("baselines: the fixture snapshot is listed with its table count") : bad("baselines: the fixture snapshot is listed with its table count", stg.rowText);
 
   // Scenario 15c — the button's other gate arms, fixture-driven through the
   // REAL baselinesPanel (destination-missing can't exist live once the daemon
@@ -1405,11 +1406,50 @@ try {
     };
   });
   (!gates.cfgOffBtn && gates.cfgOffEmpty)
-    ? ok("storage: no baseline destination → no button, setup empty state")
-    : bad("storage: no baseline destination → no button, setup empty state", JSON.stringify(gates));
+    ? ok("baselines: no baseline destination → no button, setup empty state")
+    : bad("baselines: no baseline destination → no button, setup empty state", JSON.stringify(gates));
   (!gates.capOffBtn && gates.capOffEmpty)
-    ? ok("storage: baseline_trigger off → no button even with a destination")
-    : bad("storage: baseline_trigger off → no button even with a destination", JSON.stringify(gates));
+    ? ok("baselines: baseline_trigger off → no button even with a destination")
+    : bad("baselines: baseline_trigger off → no button even with a destination", JSON.stringify(gates));
+
+  // Scenario 15d — Protect group (#1384). Baselines and verification moved off
+  // Settings > Storage into their own routes. Two halves must hold TOGETHER,
+  // and only the first is obvious: each route renders its panel, AND Storage
+  // no longer carries it. A move that left a copy behind would sail past a
+  // "does /baselines work" check — which is the shape of the regression 15b
+  // caught when this scenario did not exist.
+  //
+  // waitForFunction rather than a sleep: renderBaselines awaits two fetches,
+  // and a fixed delay is the classic way this suite goes intermittently red.
+  const protectNav = await page.evaluate(() => ({
+    baselines: !!document.querySelector('.nav-item[data-route="baselines"]'),
+    verification: !!document.querySelector('.nav-item[data-route="verification"]'),
+  }));
+  (protectNav.baselines && protectNav.verification)
+    ? ok("protect: both nav entries render")
+    : bad("protect: both nav entries render", JSON.stringify(protectNav));
+
+  await page.evaluate(() => navigate("baselines"));
+  await page.waitForFunction(() => location.pathname === "/baselines"
+    && Array.from(document.querySelectorAll(".ov-panel-title")).some((h) => /Baseline snapshots/.test(h.textContent)),
+    { timeout: 10000 });
+  ok("protect: /baselines renders the snapshot panel");
+
+  await page.evaluate(() => navigate("verification"));
+  await page.waitForFunction(() => location.pathname === "/verification"
+    && Array.from(document.querySelectorAll(".ov-panel-title")).some((h) => /Verification/.test(h.textContent)),
+    { timeout: 10000 });
+  ok("protect: /verification renders the verification panel");
+
+  await page.evaluate(() => navigate("storage"));
+  await page.waitForFunction(() => location.pathname === "/storage"
+    && Array.from(document.querySelectorAll(".ov-panel-title")).some((h) => /S3 archiving/.test(h.textContent)),
+    { timeout: 10000 });
+  const storageTitles = await page.evaluate(() =>
+    Array.from(document.querySelectorAll(".ov-panel-title")).map((h) => h.textContent));
+  (!storageTitles.some((t) => /Baseline snapshots|Verification/.test(t)))
+    ? ok("protect: Storage no longer carries the moved panels")
+    : bad("protect: Storage no longer carries the moved panels", JSON.stringify(storageTitles));
 
   // Scenario 16 — Restore Table combobox (#1364). The Table field must be an
   // input + datalist fed from /api/schemas?schema=… (the same endpoint the
