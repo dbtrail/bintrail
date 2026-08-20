@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -153,6 +154,14 @@ type recoverResponse struct {
 	// KeyRestoreCount is the ON UPDATE CASCADE / SET NULL half (#1002): child
 	// foreign keys the cascade rewrote and this script puts back.
 	KeyRestoreCount int `json:"key_restore_count,omitempty"`
+	// GeneratedInMs is the wall time this request spent producing the script:
+	// the event fetch (including any archive/Parquet leg) plus SQL rendering.
+	// Timing only the rendering would report the cheap half — the fetch is
+	// where a recover that had to reach S3 differs from one served entirely
+	// from live partitions by orders of magnitude, and telling those apart is
+	// the point. Not omitempty: a sub-millisecond recover is a real answer,
+	// and dropping the field would render as "unknown" rather than "fast".
+	GeneratedInMs int64 `json:"generated_in_ms"`
 }
 
 type schemasResponse struct {
@@ -356,6 +365,11 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	if b == nil {
 		return
 	}
+	// Started before the fetch, not before the render: see
+	// recoverResponse.GeneratedInMs. resolveOr sits above it deliberately —
+	// lazily opening a registry server's connection is a one-off cost of
+	// selecting it, not part of generating this script.
+	start := time.Now()
 	var body recoverRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeBodyDecodeError(w, err)
@@ -557,6 +571,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 				VictimCount:     cres.VictimCount,
 				SetNullCount:    cres.SetNullCount,
 				KeyRestoreCount: cres.KeyRestoreCount,
+				GeneratedInMs:   time.Since(start).Milliseconds(),
 			})
 			// Still recover.generate (this IS /api/recover), with cascade=true:
 			// the explicit /api/recover-cascade endpoint is what emits
@@ -592,6 +607,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		RowCount:       len(rows),
 		Warnings:       warnings,
 		Notes:          notes,
+		GeneratedInMs:  time.Since(start).Milliseconds(),
 	})
 	recordConsoleAccess(r, "recover.generate", opts.Schema, opts.Table, map[string]string{
 		"statements": strconv.Itoa(n),

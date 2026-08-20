@@ -67,6 +67,10 @@ type recoverCascadeResponse struct {
 	Complete   bool     `json:"complete"`
 	Incomplete []string `json:"incomplete,omitempty"`
 	Warnings   []string `json:"warnings,omitempty"`
+	// GeneratedInMs: see recoverResponse.GeneratedInMs (internal/console/api.go).
+	// It matters more here — cascade adds victim synthesis and per-link key-chain
+	// probes on top of the same fetch, so this is the slower of the two paths.
+	GeneratedInMs int64 `json:"generated_in_ms"`
 }
 
 // rbacActive reports whether the console is running under an RBAC profile with
@@ -107,6 +111,9 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 	if b == nil {
 		return
 	}
+	// Same boundary as handleRecover: after the bundle resolves, before the
+	// fetch — so synthesis and the key-chain probes are inside the measurement.
+	start := time.Now()
 
 	var body recoverCascadeRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
@@ -211,6 +218,7 @@ func (s *Server) handleRecoverCascade(w http.ResponseWriter, r *http.Request) {
 		Complete:        len(synth.Caveats) == 0 && synth.SynthErr == nil,
 		Incomplete:      synth.Caveats,
 		Warnings:        synth.Warnings,
+		GeneratedInMs:   time.Since(start).Milliseconds(),
 	})
 	// An incomplete synthesis still produced a script, so it is still recorded
 	// (matching the CLI's emit-before-cascadeExit placement).

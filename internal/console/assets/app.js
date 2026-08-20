@@ -2342,6 +2342,19 @@ async function previewRecover(form) {
   }
 }
 
+// formatGeneratedIn renders the server's generation time as a trailing meta
+// clause. Absence and zero are DIFFERENT answers and must not collapse: a
+// server that predates generated_in_ms sends nothing (render nothing), while a
+// recover served entirely from live partitions can legitimately round to 0 ms
+// (render "<0.1s" — fast, measured). Hence the typeof check rather than a
+// falsy one, which would misreport the fast case as unreported.
+function formatGeneratedIn(ms) {
+  if (typeof ms !== "number" || !isFinite(ms) || ms < 0) return "";
+  // Coarse on purpose: an orientation signal, not a benchmark. Sub-100ms is
+  // reported as a floor rather than a spuriously precise 0.04s.
+  return " · generated in " + (ms < 100 ? "<0.1s" : (ms / 1000).toFixed(1) + "s");
+}
+
 async function generateUndo(form) {
   if (busyModalActive()) return; // one click = one generation (#1363)
   const gen = serverGen;
@@ -2398,10 +2411,11 @@ async function generateUndo(form) {
           el("span", { class: "ctx-eyebrow", text: "Also repairing rows MySQL changed automatically along with this one" }),
           el("span", { class: "ctx-detail", text: "this script also " + parts.join(", ") + "." }))));
     }
-    const meta = data.cascade_detected
+    const meta = (data.cascade_detected
       ? data.statement_count + " statement(s) · " + (data.victim_count || 0) + " cascade child row(s) · " +
         (data.set_null_count || 0) + " SET NULL restore(s) · " + (data.key_restore_count || 0) + " FK restore(s)"
-      : data.statement_count + " statement(s) from " + data.row_count + " event(s)";
+      : data.statement_count + " statement(s) from " + data.row_count + " event(s)")
+      + formatGeneratedIn(data.generated_in_ms);
     out.append(codePanel(lastSQL, meta));
     // Success: close the busy dialog and land keyboard focus on the result —
     // the reversal.sql panel header (#1363).
