@@ -167,7 +167,6 @@
   --title-font: var(--f-display);
   --title-weight: 600;
   --title-tracking: -0.02em;
-  --motion: 1;
   --rail: var(--line);
 
   --shell-w: 248px;
@@ -396,7 +395,9 @@ button { font-family: inherit; }
   content: ""; position: absolute; left: -18px; top: 50%; transform: translateY(-50%);
   width: 3px; height: 18px; border-radius: 0 3px 3px 0;
   background: var(--brand-rail);
-  animation: railpop .3s var(--ease-out);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .nav-item.active::before { animation: railpop .3s var(--ease-out); }
 }
 [data-dir="trail"] .nav-item.active::before {
   height: 26px; width: 4px;
@@ -468,10 +469,10 @@ button { font-family: inherit; }
    (the preview's animation clock can freeze at t=0; opacity-from-0 would blank it) */
 @keyframes rise { from { transform: translateY(var(--rise, 10px)); } to { transform: none; } }
 @media (prefers-reduced-motion: no-preference) {
-  .view-enter > * { animation: rise calc(.45s * var(--motion)) var(--ease-out) both; }
-  .view-enter > *:nth-child(2) { animation-delay: calc(.04s * var(--motion)); }
-  .view-enter > *:nth-child(3) { animation-delay: calc(.08s * var(--motion)); }
-  .view-enter > *:nth-child(4) { animation-delay: calc(.12s * var(--motion)); }
+  .view-enter > * { animation: rise .45s var(--ease-out) both; }
+  .view-enter > *:nth-child(2) { animation-delay: .04s; }
+  .view-enter > *:nth-child(3) { animation-delay: .08s; }
+  .view-enter > *:nth-child(4) { animation-delay: .12s; }
 }
 
 /* ============================================================
@@ -734,7 +735,9 @@ button { font-family: inherit; }
   border-radius: var(--radius-sm);
   overflow: hidden;
   background: var(--surface);
-  animation: diffin calc(.32s * var(--motion)) var(--ease-out);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .diff { animation: diffin .32s var(--ease-out); }
 }
 @keyframes diffin { from { transform: translateY(-6px); } to { transform: none; } }
 .diff-grid { display: grid; grid-template-columns: 150px 1fr 1fr; }
@@ -927,16 +930,14 @@ button { font-family: inherit; }
   position: relative; padding: 0 0 26px 4px;
   transform: translateX(10px);
 }
-.tl-node.in { transform: none; transition: transform .45s var(--ease-out); }
+.tl-node.in { transform: none; }
 .tl-node:last-child { padding-bottom: 4px; }
 .tl-dot {
   position: absolute; left: -29px; top: 3px;
   width: 12px; height: 12px; border-radius: 50%;
   background: var(--surface); border: 2px solid var(--accent);
   box-shadow: 0 0 0 4px var(--bg);
-  transition: transform .3s var(--ease-out);
 }
-.tl-node.in .tl-dot { animation: dotpop .4s var(--ease-out) both; }
 @keyframes dotpop { 0% { transform: scale(0); } 60% { transform: scale(1.3); } 100% { transform: scale(1); } }
 .tl-dot.insert { border-color: var(--insert); }
 .tl-dot.update { border-color: var(--update); }
@@ -955,10 +956,21 @@ button { font-family: inherit; }
 .tl-body .pv.changed { color: var(--orange-2); font-weight: 600; position: relative; }
 .tl-body .pv.changed::after {
   content: ""; position: absolute; left: 0; right: 0; bottom: -2px; height: 2px;
-  background: var(--orange); border-radius: 2px; transform: scaleX(0); transform-origin: left;
-  animation: ul .4s .2s var(--ease-out) forwards;
+  background: var(--orange); border-radius: 2px; transform-origin: left;
 }
 @keyframes ul { to { transform: scaleX(1); } }
+/* All four timeline entrance effects, in one guard. Each rule above is left in
+   its RESTING state, which is the part that is easy to get wrong: `ul` defines
+   only a `to` frame, so its scaleX(0) start has to live in here too — leaving
+   it on the base rule would hide the changed-value underline permanently for
+   anyone who asked for less motion, turning a motion preference into lost
+   information. */
+@media (prefers-reduced-motion: no-preference) {
+  .tl-node.in { transition: transform .45s var(--ease-out); }
+  .tl-dot { transition: transform .3s var(--ease-out); }
+  .tl-node.in .tl-dot { animation: dotpop .4s var(--ease-out) both; }
+  .tl-body .pv.changed::after { transform: scaleX(0); animation: ul .4s .2s var(--ease-out) forwards; }
+}
 
 /* restore action on each timeline node */
 .tl-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
@@ -1135,8 +1147,11 @@ button { font-family: inherit; }
   font-family: var(--f-ui); color: var(--ink);
   display: none; flex-direction: column; overflow: hidden;
 }
-#tweaks.open { display: flex; animation: twkin .28s var(--ease-out); }
+#tweaks.open { display: flex; }
 @keyframes twkin { from { transform: translateY(10px) scale(.98); } to { transform: none; } }
+@media (prefers-reduced-motion: no-preference) {
+  #tweaks.open { animation: twkin .28s var(--ease-out); }
+}
 .twk-h { display: flex; align-items: center; justify-content: space-between; padding: 13px 12px 11px 16px; border-bottom: 1px solid var(--line-soft); }
 .twk-h b { font-family: var(--f-display); font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
 .twk-h .x { border: none; background: none; color: var(--ink-3); cursor: pointer; width: 24px; height: 24px; border-radius: 6px; font-size: 15px; }
@@ -1208,12 +1223,15 @@ button { font-family: inherit; }
   height: 13px; border-radius: 4px;
   background: linear-gradient(90deg, var(--line) 25%, transparent 50%, var(--line) 75%);
   background-size: 200% 100%;
-  animation: skel-shimmer 1.4s linear infinite;
 }
 .skel-line.skel-stat { height: 26px; width: 72px; margin-bottom: 4px; }
 .skel-note { font-family: var(--f-mono); font-size: 11px; color: var(--ink-4); margin-top: 8px; }
 @keyframes skel-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
-@media (prefers-reduced-motion: reduce) { .skel-line { animation: none; } }
+/* Without the shimmer the bar is still a visibly empty grey placeholder, so
+   unlike the spinner below it needs no static stand-in. */
+@media (prefers-reduced-motion: no-preference) {
+  .skel-line { animation: skel-shimmer 1.4s linear infinite; }
+}
 
 .ov-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 18px; align-items: start; }
 .ov-panel {
@@ -1846,12 +1864,16 @@ button { font-family: inherit; }
 .cov-refresh-btn:disabled { cursor: default; color: var(--ink-4); }
 .cov-refresh-ico { display: flex; }
 .cov-refresh-ico svg { width: 14px; height: 14px; }
-/* The spinner is the only signal that an in-flight refresh is happening — the
-   values deliberately stay on screen until the response lands. */
-.cov-refresh-btn.spin .cov-refresh-ico svg { animation: covspin .7s linear infinite; }
 @keyframes covspin { to { transform: rotate(360deg); } }
+/* The values deliberately stay on screen until the response lands, so this
+   spin is the ONLY signal that a refresh is in flight. That makes it the one
+   place a reduce block is the right answer: honouring the preference by simply
+   dropping the animation would remove the signal, not just the motion, so the
+   button dims instead. */
+@media (prefers-reduced-motion: no-preference) {
+  .cov-refresh-btn.spin .cov-refresh-ico svg { animation: covspin .7s linear infinite; }
+}
 @media (prefers-reduced-motion: reduce) {
-  .cov-refresh-btn.spin .cov-refresh-ico svg { animation: none; }
   .cov-refresh-btn.spin { opacity: .55; }
 }
 .cov-chips { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }

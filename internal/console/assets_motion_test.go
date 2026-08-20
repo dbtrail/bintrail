@@ -15,12 +15,16 @@ import (
 // section that sets `background:` would fail the color guard here.
 //
 // Scoped to this section rather than the whole stylesheet, and that is
-// deliberate. An earlier version audited the entire file and produced seven
-// findings, several against correct code: style.css legitimately uses three
-// shapes for reduced motion (a no-preference block; a dedicated reduce block
-// setting animation:none for the same selector; duration scaling), and a
-// checker that knows only the first cries wolf. The pre-existing unguarded
-// animations that audit did surface are filed as #1392, not absorbed here.
+// deliberate — though for a different reason than when it was written. The
+// original reason (style.css honoured reduced motion three inconsistent ways,
+// so a whole-file checker cried wolf) is gone: #1392 settled on one shape and
+// TestReducedMotionHasOneShape now audits the entire file.
+//
+// What survives is a STRICTER local rule. The whole-file guard tolerates short
+// geometry transitions anywhere, because a 120ms hover nudge is feedback and
+// banning it outright is a rule nobody follows. This section exists for no
+// reason except to add decorative motion, so here every transition is motion
+// regardless of duration and none may sit outside the guard.
 func motionSection(t *testing.T) string {
 	t.Helper()
 	data, err := os.ReadFile("assets/style.css")

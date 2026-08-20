@@ -2078,6 +2078,77 @@ try {
     ? ok("busy modal: prefers-reduced-motion collapses the animation to the static note")
     : bad("busy modal: prefers-reduced-motion collapses the animation to the static note", JSON.stringify(rmOn));
 
+  // Scenario 17c — resting states under prefers-reduced-motion (#1392).
+  //
+  // The whole-file guard in assets_reducedmotion_test.go proves every
+  // animation SITS inside the reduced-motion block. It cannot prove the rule
+  // left OUTSIDE is a usable resting state, and that is the failure that costs
+  // information rather than polish: `ul` defines only a `to` frame, so while
+  // its scaleX(0) start lived on the base rule, honouring the preference hid
+  // the underline marking WHICH value changed — permanently, with the guard
+  // green. A text checker cannot see that; it is a cascade question, so it is
+  // asked of a real browser.
+  //
+  // The elements are synthesised rather than driven to through the UI on
+  // purpose: the claim is about the stylesheet, and reaching a timeline with a
+  // changed value through five navigations would test the route, not the CSS.
+  const restProbe = async () => page.evaluate(() => {
+    const host = document.createElement("div");
+    host.innerHTML = '<div class="tl-node in"><span class="tl-dot"></span>'
+      + '<div class="tl-body"><span class="pv changed">v</span></div></div>'
+      + '<nav class="nav"><a class="nav-item active"><span>x</span></a></nav>'
+      + '<button class="cov-refresh-btn spin"><span class="cov-refresh-ico">'
+      + '<svg viewBox="0 0 24 24"></svg></span></button>'
+      + '<div class="view-enter"><div>panel</div></div>';
+    document.body.appendChild(host);
+    const cs = (sel, pseudo) => getComputedStyle(host.querySelector(sel), pseudo || null);
+    const res = {
+      underline: cs(".pv.changed", "::after").transform,
+      underlineAnim: cs(".pv.changed", "::after").animationName,
+      node: cs(".tl-node.in").transform,
+      dot: cs(".tl-dot").transform,
+      railHeight: cs(".nav-item.active", "::before").height,
+      railAnim: cs(".nav-item.active", "::before").animationName,
+      spinAnim: cs(".cov-refresh-ico svg").animationName,
+      spinOpacity: cs(".cov-refresh-btn.spin").opacity,
+      riseAnim: cs(".view-enter > div").animationName,
+    };
+    host.remove();
+    return res;
+  });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const rest = await restProbe();
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  const moved = await restProbe();
+  await page.emulateMedia({ reducedMotion: null });
+
+  // Every element must ARRIVE without its animation. "none" is the computed
+  // transform of an element with none declared — i.e. scaleX(1), full size,
+  // final position.
+  (rest.underline === "none" && rest.underlineAnim === "none")
+    ? ok("reduced motion: the changed-value underline is VISIBLE without its animation")
+    : bad("reduced motion: the changed-value underline is VISIBLE without its animation", JSON.stringify(rest));
+  (rest.node === "none" && rest.dot === "none")
+    ? ok("reduced motion: timeline node and dot rest at their final position")
+    : bad("reduced motion: timeline node and dot rest at their final position", JSON.stringify(rest));
+  (rest.railHeight !== "0px" && rest.railAnim === "none" && rest.riseAnim === "none")
+    ? ok("reduced motion: the active rail keeps its height and no entrance animation runs")
+    : bad("reduced motion: the active rail keeps its height and no entrance animation runs", JSON.stringify(rest));
+  // The spinner is the ONLY in-flight signal, so its guard owes a replacement.
+  (rest.spinAnim === "none" && rest.spinOpacity === "0.55")
+    ? ok("reduced motion: the refresh spinner is replaced by a dimmed button, not by nothing")
+    : bad("reduced motion: the refresh spinner is replaced by a dimmed button, not by nothing", JSON.stringify(rest));
+
+  // The other half: moving the rules into the guard must not have deleted the
+  // motion for everyone else. Without this, emptying the block passes above.
+  (moved.underlineAnim === "ul" && moved.railAnim === "railpop"
+    && moved.spinAnim === "covspin" && moved.riseAnim === "rise")
+    ? ok("reduced motion: under no-preference every guarded animation still runs")
+    : bad("reduced motion: under no-preference every guarded animation still runs", JSON.stringify(moved));
+  moved.spinOpacity === "1"
+    ? ok("reduced motion: the dimmed-button stand-in does not leak into no-preference")
+    : bad("reduced motion: the dimmed-button stand-in does not leak into no-preference", moved.spinOpacity);
+
   // ── Scenario 18 — advisory severity split on the archive fixture (#1365) ──
   // The archive-elision record must render in the INFO register (muted line,
   // no ⚠ icon, no amber, no alert classes) while a real coverage-gap warning
