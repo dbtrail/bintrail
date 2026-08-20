@@ -2037,19 +2037,30 @@ function renderRecover(params) {
     const banner = el("div", { class: "ctx-banner" });
     banner.append(el("span", { class: "badge " + badgeClass(ctx.type), text: ctx.type }));
     banner.append(el("div", { class: "ctx-main" },
-      // Scope, not target state. The prefill below sets `until` and never
-      // `since`, so this reverses EVERY event on the row in an unbounded
-      // window — the row lands where it was when the window opened, which is
-      // only "the state just before this event" when that event is the sole
-      // one in range. The old wording ("reverting this row to before this
-      // point") promised the latter and quietly delivered the former: on a
-      // row inserted and deleted inside the same second, undoing both leaves
-      // no row at all. If the prefill ever bounds the window, revisit this
-      // text — TestAppJSUndoBannerStatesWindowScope pins the pairing.
-      el("span", { class: "ctx-eyebrow", text: "Undoing every change up to this point" }),
+      // Scope, not target state — and the scope is a WINDOW OF TIME, not an
+      // event. The prefill sets `until` from ctx.time and never `since`;
+      // ctx.time is second-granular (consoleTSFormat) and the predicate is
+      // `event_timestamp <= ?`, so the ceiling is the END OF THAT SECOND, not
+      // the clicked event. Everything on the row up to there is reversed,
+      // including events that happened AFTER the clicked one inside the same
+      // second.
+      //
+      // That is not a corner case, it is the case this wording exists for: on
+      // a row inserted and deleted inside one second, undoing from EITHER
+      // event reverses both and leaves no row at all. An earlier draft said
+      // "up to this point", which named the event as the boundary and was
+      // wrong the same way the phrasing it replaced was wrong, one revision
+      // later.
+      //
+      // Since is offered AND its limit is stated: it parses at the same
+      // granularity, so it cannot split events inside one second. Naming a
+      // control without saying where it stops working is how an operator ends
+      // up believing they narrowed something they did not.
+      el("span", { class: "ctx-eyebrow", text: "Undoing every change in this window" }),
       el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " · pk " + ctx.pk }),
-      el("span", { class: "ctx-detail", text: "reverses all events on this row through " + ctx.type
-        + " at " + ctx.time + " UTC, not only that one — set Since to narrow the window" })));
+      el("span", { class: "ctx-detail", text: "reverses all events on this row through the end of the second holding this "
+        + ctx.type + " (" + ctx.time + " UTC), not only that one" }),
+      el("span", { class: "ctx-detail", text: "Set Since to narrow the window — timestamps are second-granular, so it cannot split events inside one second." })));
     banner.append(el("span", { class: "spacer" }));
     banner.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear",
       onclick: () => { pendingRecover = null; navigate("recover"); } }));

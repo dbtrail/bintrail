@@ -132,8 +132,12 @@ and searching events:
    with before→after diffs, then **Generate undo SQL** and copy/download the
    script. Arriving via an **Undo** action scopes it to that row and shows a
    context banner; it fills in **Until** from the event you clicked and leaves
-   **Since** open, so every change to that row up to that point is reversed —
-   not only the event you clicked. Set **Since** to narrow the window.
+   **Since** open. Timestamps are second-granular and the bound is inclusive,
+   so the window closes at the **end of that event's second**: every change to
+   the row up to there is reversed — including events that happened *after*
+   the one you clicked, inside the same second — not only the event you
+   clicked. **Since** narrows the window but cannot split events within a
+   single second; use `--limit-per-pk` for that.
    When you undo a `DELETE` on a foreign-key **parent** whose
    children InnoDB cascade-deleted *below* the binlog (MySQL ≤ 8.x / MariaDB) —
    or an `UPDATE` of a referenced key whose `ON UPDATE` cascade rewrote them just
