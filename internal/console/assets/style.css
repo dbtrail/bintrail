@@ -924,7 +924,6 @@ button { font-family: inherit; }
 [data-accent="blue"][data-dir="studio"] .timeline::before { background: var(--line); }
 [data-accent="blue"][data-dir="paper"] .timeline::before { background: var(--line); width: 1.5px; }
 
-@keyframes fadeup { from { opacity: 0; transform: translateY(9px); } to { opacity: 1; transform: none; } }
 
 .tl-node {
   position: relative; padding: 0 0 26px 4px;
@@ -959,8 +958,13 @@ button { font-family: inherit; }
   background: var(--orange); border-radius: 2px; transform-origin: left;
 }
 @keyframes ul { to { transform: scaleX(1); } }
-/* All four timeline entrance effects, in one guard. Each rule above is left in
-   its RESTING state, which is the part that is easy to get wrong: `ul` defines
+/* All four timeline entrance effects, in one guard — and their TRIGGER is
+   gated to match, in app.js, which applies the .in class to every node at once
+   under reduce. Guarding only the CSS removes the smoothness while the timer
+   still schedules the movement, which is a jumpier version of the same thing.
+
+   Each rule above is left in its RESTING state, the part that is easy to get
+   wrong: `ul` defines
    only a `to` frame, so its scaleX(0) start has to live in here too — leaving
    it on the base rule would hide the changed-value underline permanently for
    anyone who asked for less motion, turning a motion preference into lost
@@ -1227,8 +1231,10 @@ button { font-family: inherit; }
 .skel-line.skel-stat { height: 26px; width: 72px; margin-bottom: 4px; }
 .skel-note { font-family: var(--f-mono); font-size: 11px; color: var(--ink-4); margin-top: 8px; }
 @keyframes skel-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
-/* Without the shimmer the bar is still a visibly empty grey placeholder, so
-   unlike the spinner below it needs no static stand-in. */
+/* Without the shimmer the bar is still visible: at the static
+   background-position the gradient renders solid --line across its left half,
+   fading out towards the right. A placeholder either way, so unlike the
+   spinner below it needs no stand-in. */
 @media (prefers-reduced-motion: no-preference) {
   .skel-line { animation: skel-shimmer 1.4s linear infinite; }
 }
@@ -1865,11 +1871,17 @@ button { font-family: inherit; }
 .cov-refresh-ico { display: flex; }
 .cov-refresh-ico svg { width: 14px; height: 14px; }
 @keyframes covspin { to { transform: rotate(360deg); } }
-/* The values deliberately stay on screen until the response lands, so this
-   spin is the ONLY signal that a refresh is in flight. That makes it the one
-   place a reduce block is the right answer: honouring the preference by simply
-   dropping the animation would remove the signal, not just the motion, so the
-   button dims instead. */
+/* The values deliberately stay on screen until the response lands, so the spin
+   carries nearly all of the in-flight signal. It is not quite alone — the
+   :disabled rule above shifts the icon --ink-3 -> --ink-4 and drops the cursor
+   to default — but both are easy to miss, so dropping the animation with no
+   replacement would leave almost nothing. The button dims instead.
+
+   This is the file's only reduce block, and it is a preference rather than a
+   law: the busy modal solves the same problem in shape 1, keeping a static
+   note as the base rule and revealing the animation under no-preference. That
+   shape swaps a display value; here the base rule stays byte-identical for the
+   overwhelmingly common case and the stand-in is purely additive. */
 @media (prefers-reduced-motion: no-preference) {
   .cov-refresh-btn.spin .cov-refresh-ico svg { animation: covspin .7s linear infinite; }
 }
@@ -1921,8 +1933,8 @@ button { font-family: inherit; }
      
      TRANSFORM ONLY, and no fill-mode — both are load-bearing.
      
-     No opacity: :467 states the invariant for `rise` ("content is ALWAYS
-     visible"), and a tile that starts transparent flashes on every
+     No opacity: the `rise` keyframes comment states the invariant ("content
+     is ALWAYS visible"), and a tile that starts transparent flashes on every
      replaceWith as Overview swaps skeletons for values.
      
      No `both`/`forwards`: a filling animation keeps contributing
@@ -1951,8 +1963,9 @@ button { font-family: inherit; }
   /* Nav: the icon leads the eye toward the destination. 2px — responsive
      without rippling as a mouse crosses the sidebar.
 
-     No `transition` declaration here on purpose. :385 already transitions
-     both color and transform on this exact selector, and `transition` is a
+     No `transition` declaration here on purpose. `.nav-item .ni-icon`'s own
+     base rule already transitions both color and transform on this exact
+     selector, and `transition` is a
      SHORTHAND: re-declaring it later in the file reset transition-property to
      `transform` alone, so the icon's color snapped instantly for every
      no-preference user. The section whose first rule is "no color moves" had

@@ -1240,6 +1240,57 @@ try {
     }
   }
 
+
+  // ── Scenario 17d — the JavaScript half of reduced motion (#1392) ──
+  // Placed here, out of numeric order, because this is the one point in the
+  // run with a REAL rendered timeline. The stagger under test is scheduled by
+  // renderTimeline's own rAF loop; the synthesised DOM 17c uses never runs it.
+  //
+  // The Go guard and 17c both stop at the stylesheet. This stagger is driven
+  // from app.js — one setTimeout per node — so honouring the preference in CSS
+  // alone removes the SMOOTHNESS while the loop still moves every node: under
+  // `reduce` a long timeline snapped one node at a time across seconds of
+  // shifting content, a jumpier version of the motion the preference asked to
+  // remove. Only matchMedia can see this, and only at run time.
+  //
+  // NOT covered: the two scrollIntoView call sites gated on the same helper.
+  // Their smooth/auto difference is a browser-internal scroll with no
+  // observable DOM state, so this scenario makes no claim about them.
+  const staggerProbe = async (mode) => {
+    await page.emulateMedia({ reducedMotion: mode });
+    return page.evaluate(async () => {
+      const f = document.getElementById("recover-form");
+      f.elements.pk.value = "1";
+      f.elements.since.value = "";
+      f.elements.until.value = "2000-01-01 00:00:00";
+      await runState(f, true);
+      // Sample once renderTimeline's rAF has run. Under reduce that callback
+      // marks every node synchronously; under no-preference the FIRST node is
+      // still 60 ms out and the last 60 + (n-1)*55 ms.
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const nodes = Array.from(document.querySelectorAll(".tl-node"));
+      return { total: nodes.length, arrived: nodes.filter((n) => n.classList.contains("in")).length };
+    });
+  };
+  const rmTl = await staggerProbe("reduce");
+  const npTl = await staggerProbe("no-preference");
+  await page.emulateMedia({ reducedMotion: null });
+
+  (rmTl.total > 0 && rmTl.arrived === rmTl.total)
+    ? ok("reduced motion: every timeline node has arrived by the first frame — no JS stagger")
+    : bad("reduced motion: every timeline node has arrived by the first frame — no JS stagger", JSON.stringify(rmTl));
+  // The other half, and the reason the arm above is not satisfied by a broken
+  // render: under no-preference the same probe must find nodes still en route.
+  // Needs two nodes to stay clear of the 60 ms first delay on a slow runner;
+  // with fewer, say so rather than assert on a coin flip.
+  if (npTl.total < 2) {
+    ok("reduced motion: no-preference stagger not asserted (timeline rendered " + npTl.total + " node(s))");
+  } else {
+    (npTl.arrived < npTl.total)
+      ? ok("reduced motion: under no-preference the timeline still arrives one node at a time")
+      : bad("reduced motion: under no-preference the timeline still arrives one node at a time", JSON.stringify(npTl));
+  }
+
   // Scenario 14c — the Overview against the LIVE daemon (#1300). The fixture
   // scenario below drives buildOverview directly, so it cannot catch a route
   // that was never registered, an authz table that refuses it, or a JSON shape
@@ -2083,9 +2134,9 @@ try {
   // The whole-file guard in assets_reducedmotion_test.go proves every
   // animation SITS inside the reduced-motion block. It cannot prove the rule
   // left OUTSIDE is a usable resting state, and that is the failure that costs
-  // information rather than polish: `ul` defines only a `to` frame, so while
-  // its scaleX(0) start lived on the base rule, honouring the preference hid
-  // the underline marking WHICH value changed — permanently, with the guard
+  // information rather than polish: `ul` defines only a `to` frame, so leaving
+  // its scaleX(0) start on the base rule WOULD have hidden the underline
+  // marking WHICH value changed — permanently, and with the text guard
   // green. A text checker cannot see that; it is a cascade question, so it is
   // asked of a real browser.
   //
@@ -2112,6 +2163,12 @@ try {
       spinAnim: cs(".cov-refresh-ico svg").animationName,
       spinOpacity: cs(".cov-refresh-btn.spin").opacity,
       riseAnim: cs(".view-enter > div").animationName,
+      // Transitions have no @keyframes, so the Go orphan check cannot notice
+      // one being deleted. These two are the only motion in the file with no
+      // other guard behind them.
+      nodeTransDur: cs(".tl-node.in").transitionDuration,
+      dotTransDur: cs(".tl-dot").transitionDuration,
+      dotAnim: cs(".tl-dot").animationName,
     };
     host.remove();
     return res;
@@ -2128,23 +2185,32 @@ try {
   (rest.underline === "none" && rest.underlineAnim === "none")
     ? ok("reduced motion: the changed-value underline is VISIBLE without its animation")
     : bad("reduced motion: the changed-value underline is VISIBLE without its animation", JSON.stringify(rest));
-  (rest.node === "none" && rest.dot === "none")
-    ? ok("reduced motion: timeline node and dot rest at their final position")
-    : bad("reduced motion: timeline node and dot rest at their final position", JSON.stringify(rest));
-  (rest.railHeight !== "0px" && rest.railAnim === "none" && rest.riseAnim === "none")
-    ? ok("reduced motion: the active rail keeps its height and no entrance animation runs")
-    : bad("reduced motion: the active rail keeps its height and no entrance animation runs", JSON.stringify(rest));
-  // The spinner is the ONLY in-flight signal, so its guard owes a replacement.
+  (rest.node === "none" && rest.dot === "none" && rest.dotAnim === "none"
+    && rest.nodeTransDur === "0s" && rest.dotTransDur === "0s")
+    ? ok("reduced motion: timeline node and dot rest at their final position, untimed")
+    : bad("reduced motion: timeline node and dot rest at their final position, untimed", JSON.stringify(rest));
+  rest.railHeight !== "0px"
+    ? ok("reduced motion: the active rail keeps its height without railpop")
+    : bad("reduced motion: the active rail keeps its height without railpop", rest.railHeight);
+  (rest.railAnim === "none" && rest.riseAnim === "none")
+    ? ok("reduced motion: neither the rail nor the view entrance animates")
+    : bad("reduced motion: neither the rail nor the view entrance animates", JSON.stringify(rest));
+  // The spin carries nearly all the in-flight signal — the :disabled dim is
+  // subtle and the cursor change invisible without a pointer — so its guard
+  // owes a replacement rather than a plain removal.
   (rest.spinAnim === "none" && rest.spinOpacity === "0.55")
     ? ok("reduced motion: the refresh spinner is replaced by a dimmed button, not by nothing")
     : bad("reduced motion: the refresh spinner is replaced by a dimmed button, not by nothing", JSON.stringify(rest));
 
   // The other half: moving the rules into the guard must not have deleted the
   // motion for everyone else. Without this, emptying the block passes above.
-  (moved.underlineAnim === "ul" && moved.railAnim === "railpop"
-    && moved.spinAnim === "covspin" && moved.riseAnim === "rise")
-    ? ok("reduced motion: under no-preference every guarded animation still runs")
-    : bad("reduced motion: under no-preference every guarded animation still runs", JSON.stringify(moved));
+  (moved.underlineAnim === "ul" && moved.railAnim === "railpop" && moved.spinAnim === "covspin"
+    && moved.riseAnim === "rise" && moved.dotAnim === "dotpop")
+    ? ok("reduced motion: under no-preference every animation this probe covers still runs")
+    : bad("reduced motion: under no-preference every animation this probe covers still runs", JSON.stringify(moved));
+  (moved.nodeTransDur === "0.45s" && moved.dotTransDur === "0.3s")
+    ? ok("reduced motion: the two guarded timeline transitions still have their durations")
+    : bad("reduced motion: the two guarded timeline transitions still have their durations", JSON.stringify(moved));
   moved.spinOpacity === "1"
     ? ok("reduced motion: the dimmed-button stand-in does not leak into no-preference")
     : bad("reduced motion: the dimmed-button stand-in does not leak into no-preference", moved.spinOpacity);

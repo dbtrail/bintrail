@@ -3,6 +3,7 @@ package console
 import (
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,12 +13,18 @@ import (
 // byte offsets and newlines so every match position and line number computed
 // against the result is valid for the original file.
 //
-// Blanking rather than deleting is what makes the whole-file scan safe. Two
-// concrete hazards it removes, both of which produced wrong answers in earlier
-// hand-written versions of this audit: a comment quoting `@media
-// (prefers-reduced-motion: ...)` was picked up as a real at-rule, and a
-// `content: "{"` declaration desynchronised the brace scanner so a block's
-// computed end landed hundreds of lines past its real one.
+// Blanking rather than deleting is what makes the whole-file scan safe, and it
+// is load-bearing twice over. It keeps offsets aligned, and because a blanked
+// comment becomes whitespace it still satisfies the `[;{\s]` prefix the
+// declaration patterns below require — so `.a{/*c*/animation: x 1s}` is caught
+// where deleting the comment would have joined `{` to `animation` and, with a
+// different prefix class, could have hidden it.
+//
+// Two hazards it forecloses. Neither is present in style.css today, and both
+// were demonstrated by review rather than observed in the wild: a comment
+// quoting `@media (prefers-reduced-motion: ...)` read as a real at-rule, and a
+// `content: "{"` declaration desynchronising the brace scanner so a block's
+// computed end lands hundreds of lines past its real one.
 func sanitizeCSS(css string) string {
 	out := []byte(css)
 	blank := func(i int) {
@@ -28,9 +35,16 @@ func sanitizeCSS(css string) string {
 	for i := 0; i < len(css); i++ {
 		switch {
 		case css[i] == '/' && i+1 < len(css) && css[i+1] == '*':
+			blank(i)
+			blank(i + 1)
+			// Scanning from i+2, not i: starting at the opening `/` let the
+			// terminator check match the comment's OWN `*`, so `/*/` closed
+			// immediately and `.a>*/*{ … } */` leaked its braces into the
+			// scan — the exact desync this function exists to prevent.
+			i += 2
 			for ; i < len(css); i++ {
 				blank(i)
-				if css[i] == '/' && i > 0 && css[i-1] == '*' && i > 1 {
+				if css[i] == '/' && css[i-1] == '*' {
 					break
 				}
 			}
@@ -98,43 +112,98 @@ func within(rs [][2]int, p int) bool {
 	return false
 }
 
+const (
+	noPrefNeedle = "@media (prefers-reduced-motion: no-preference)"
+	reduceNeedle = "@media (prefers-reduced-motion: reduce)"
+	// Where feedback ends and animation begins, in milliseconds.
+	motionThresholdMs = 300
+)
+
 var (
 	animRE = regexp.MustCompile(`(?:^|[;{\s])animation(?:-name)?\s*:`)
-	tranRE = regexp.MustCompile(`(?:^|[;{\s])transition\s*:`)
+	// The longhand is matched too. `animation(-name)?` already covered its
+	// counterpart, and the asymmetry was the whole bug: `transition-property:
+	// transform; transition-duration: .45s` produced zero findings.
+	tranRE = regexp.MustCompile(`(?:^|[;{\s])transition(?:-property)?\s*:`)
 	// Properties whose transition physically moves something on screen.
 	// Colour and shadow transitions are deliberately absent: reduced-motion is
 	// about vestibular motion, and banning a 150ms colour fade would make the
 	// rule one nobody could follow.
 	geomRE = regexp.MustCompile(`\b(transform|all|translate|scale|rotate|top|left|right|bottom|width|height|margin|padding|inset|gap)\b`)
-	durRE  = regexp.MustCompile(`(?:^|[\s(,])(\d*\.?\d+)(ms|s)\b`)
+	// `\btop\b` matches INSIDE `border-top-color`, because `-` is a non-word
+	// character on both sides — so the rule above fired on a pure colour
+	// transition, contradicting its own comment. A guard that invents alarms
+	// against correct code is the one that gets deleted, so the non-geometric
+	// suffixed properties are removed before matching. Dropping every
+	// hyphenated name instead would also lose `max-height` and `margin-left`,
+	// which genuinely do move things.
+	nonGeomPropRE = regexp.MustCompile(`\b[a-z-]*-(color|style|shadow|image|radius)\b`)
+	// Case-insensitive: `400MS` is valid CSS. The prefix class admits `:` so a
+	// duration written flush against the colon (`transition:.4s transform`) is
+	// still found.
+	durRE = regexp.MustCompile(`(?i)(?:^|[\s(,:])(\d*\.?\d+)(ms|s)\b`)
+	// Balanced groups are blanked before the value is split on commas: the
+	// commas inside `cubic-bezier(.4, 0, .2, 1)` tore one transition into four
+	// fragments, and a duration written AFTER the timing function landed in a
+	// fragment naming no property, so it escaped entirely.
+	parenGroupRE = regexp.MustCompile(`\([^()]*\)`)
+	kfDeclRE     = regexp.MustCompile(`@keyframes\s+([\w-]+)`)
+	animValueRE  = regexp.MustCompile(`(?:^|[;{\s])animation(?:-name)?\s*:([^;}]*)`)
 )
+
+// declValue returns the declaration starting at from, up to its terminator.
+func declValue(css string, from int) string {
+	end := strings.IndexAny(css[from:], ";}")
+	if end < 0 {
+		return css[from:]
+	}
+	return css[from : from+end]
+}
+
+func blankParens(s string) string {
+	for {
+		next := parenGroupRE.ReplaceAllStringFunc(s, func(m string) string { return strings.Repeat(" ", len(m)) })
+		if next == s {
+			return s
+		}
+		s = next
+	}
+}
 
 // transitionIsMotion reports whether any comma-separated segment of a
 // transition value both moves geometry AND runs long enough to read as
 // animation rather than feedback.
 //
 // The threshold exists because a blanket "no transform transitions outside the
-// guard" would be a rule nobody follows: five of the seven this audit first
-// surfaced were a 2px icon nudge on hover, a 1px button press, and a rotating
-// caret — direct-manipulation feedback, not the large sustained motion
-// prefers-reduced-motion is about. At a third of a second a transition has
-// stopped being feedback; that is where the two genuine entrance animations in
-// this file (a timeline node sliding in, its dot scaling up) sit, and both are
-// entrances, exactly the class `rise` is already guarded for.
+// guard" would be a rule nobody follows. Of the seven this audit first
+// surfaced, five are direct-manipulation feedback: a 2px icon nudge on hover,
+// a 1px button press, a rotating caret, an 8% swatch hover scale, and — the
+// largest thing the threshold waives, so worth naming rather than implying —
+// a 16px settings-toggle knob slide. At a third of a second a transition has
+// stopped being feedback; that is where the timeline node's .45s slide-in
+// sits, an entrance of exactly the class `rise` is already guarded for.
+//
+// The other declaration above the line, `.tl-dot`'s .3s, is currently inert —
+// nothing changes that element's transform, and the dot's scale-up is the
+// `dotpop` ANIMATION, not this transition. It is guarded anyway rather than
+// deleted: the cost is one line, and the day something does move the dot the
+// guard is already in place.
 func transitionIsMotion(value string) (bool, string) {
-	for _, seg := range strings.Split(value, ",") {
-		if !geomRE.MatchString(seg) {
+	for _, seg := range strings.Split(blankParens(value), ",") {
+		if !geomRE.MatchString(nonGeomPropRE.ReplaceAllString(seg, "")) {
 			continue
 		}
 		m := durRE.FindStringSubmatch(seg)
 		if m == nil {
-			continue // no duration: nothing transitions
+			// No LITERAL duration. A `var(--slow)` duration is waived here,
+			// not proven safe.
+			continue
 		}
 		ms, err := strconv.ParseFloat(m[1], 64)
 		if err != nil {
 			continue
 		}
-		if m[2] == "s" {
+		if !strings.EqualFold(m[2], "ms") {
 			ms *= 1000
 		}
 		if ms >= motionThresholdMs {
@@ -142,17 +211,6 @@ func transitionIsMotion(value string) (bool, string) {
 		}
 	}
 	return false, ""
-}
-
-// Where feedback ends and animation begins, in milliseconds.
-const motionThresholdMs = 300
-
-func declValue(css string, from int) string {
-	end := strings.IndexAny(css[from:], ";}")
-	if end < 0 {
-		return css[from:]
-	}
-	return css[from : from+end]
 }
 
 // Every motion declaration in style.css must sit inside the reduced-motion
@@ -165,8 +223,23 @@ func declValue(css string, from int) string {
 //  1. motion lives in @media (prefers-reduced-motion: no-preference); the rule
 //     outside it is the resting state.
 //  2. @media (prefers-reduced-motion: reduce) may carry a STATIC alternative
-//     for an indicator whose animation was the only signal (the coverage
+//     for an indicator whose animation carried nearly all of its signal (the coverage
 //     spinner dims instead of spinning), and nothing else.
+//
+// This test enforces the negative half of shape 2 — no animation, no long
+// geometry transition inside a reduce block — and cannot enforce "nothing
+// else". Nor is it "every motion declaration" in the fullest sense: it knows
+// two property families, so `scroll-behavior: smooth`, view transitions and
+// anything driven from JavaScript are invisible to it.
+//
+// Where the rest is checked, precisely, because "the e2e covers it" was itself
+// wrong once: scenario 17c in console-e2e renders the guarded rules in a real
+// browser and asserts the RESTING state each one leaves behind — a cascade
+// question no text scan can answer. Scenario 17d drives renderTimeline under
+// both media states and pins the stagger app.js schedules in JavaScript, which
+// neither this test nor 17c can reach. The two scrollIntoView call sites that
+// read the same matchMedia helper have NO guard: their smooth/auto difference
+// is a browser-internal scroll with no observable DOM state.
 //
 // The console is opened during incidents. Someone whose OS asks for reduced
 // motion is not asking for a nicer console; motion sickness while reading a
@@ -178,10 +251,24 @@ func TestReducedMotionHasOneShape(t *testing.T) {
 	}
 	css := sanitizeCSS(string(raw))
 
-	noPref := atRuleRanges(t, css, "@media (prefers-reduced-motion: no-preference)")
-	reduce := atRuleRanges(t, css, "@media (prefers-reduced-motion: reduce)")
+	noPref := atRuleRanges(t, css, noPrefNeedle)
+	reduce := atRuleRanges(t, css, reduceNeedle)
 	if len(noPref) == 0 {
 		t.Fatal("style.css has no prefers-reduced-motion: no-preference block — this guard covers nothing")
+	}
+	// atRuleRanges fails loudly on ONE brace error, but a stray `{` inside a
+	// guard paired with a stray `}` later balances out into a single range
+	// spanning most of the file — at which point everything looks guarded.
+	// Comparing the range count to the needle count catches the swallowing
+	// without re-architecting the scanner.
+	for _, n := range []struct {
+		needle string
+		got    int
+	}{{noPrefNeedle, len(noPref)}, {reduceNeedle, len(reduce)}} {
+		if want := strings.Count(css, n.needle); n.got != want {
+			t.Fatalf("found %d %s blocks but %d occurrences of the at-rule: a brace error has "+
+				"merged blocks, so this guard cannot tell guarded from unguarded", n.got, n.needle, want)
+		}
 	}
 
 	ws := regexp.MustCompile(`\s+`)
@@ -196,15 +283,22 @@ func TestReducedMotionHasOneShape(t *testing.T) {
 			report(m[0], "a reduce block must not animate. Move the animation into the "+
 				"no-preference block; keep only the static alternative here.")
 		case !within(noPref, m[0]):
-			report(m[0], "animates outside @media (prefers-reduced-motion: no-preference). "+
-				"Move it in, and make sure the rule left outside is the RESTING state — an "+
-				"animation with forwards/both fill often leaves the base rule holding the "+
-				"START frame, which then becomes permanent.")
+			report(m[0], "animates outside "+noPrefNeedle+". Move it in, and make sure the rule "+
+				"left outside is the RESTING state — an animation with forwards/both fill often "+
+				"leaves the base rule holding the START frame, which then becomes permanent.")
 		}
 	}
 
 	for _, m := range tranRE.FindAllStringIndex(css, -1) {
-		motion, seg := transitionIsMotion(declValue(css, m[0]))
+		val := declValue(css, m[0])
+		motion, seg := transitionIsMotion(val)
+		if strings.Contains(val, "transition-property") {
+			// The longhand's duration lives in a SEPARATE declaration, so
+			// pairing them reliably is more machinery than the case is worth.
+			// Geometry named by a transition-property must be inside the
+			// guard, duration unread.
+			motion, seg = geomRE.MatchString(nonGeomPropRE.ReplaceAllString(val, "")), strings.TrimSpace(val)
+		}
 		if !motion {
 			continue
 		}
@@ -214,8 +308,8 @@ func TestReducedMotionHasOneShape(t *testing.T) {
 		case !within(noPref, m[0]):
 			report(m[0], "`"+seg+"` moves geometry for "+strconv.Itoa(motionThresholdMs)+
 				"ms or longer, which reads as animation rather than feedback. Move the "+
-				"transition into @media (prefers-reduced-motion: no-preference); leave the "+
-				"final position outside it so the element still ARRIVES without the animation.")
+				"transition into "+noPrefNeedle+"; leave the final position outside it so the "+
+				"element still ARRIVES without the animation.")
 		}
 	}
 
@@ -228,4 +322,115 @@ func TestReducedMotionHasOneShape(t *testing.T) {
 			"zeroed under reduce, so scaling a duration by it guarded nothing while looking "+
 			"like it did. Put the rule in the no-preference block instead.", lineOf(css, i))
 	}
+}
+
+// Every @keyframes must be driven from inside the reduced-motion guard.
+//
+// This is the half the rule above structurally cannot see. "Motion may not sit
+// outside the guard" is satisfied perfectly by having no motion at all, so
+// deleting a guarded declaration — the ordinary way a refactor loses an
+// animation — passes it green. Nine such deletions were demonstrated during
+// review, every assertion still passing.
+//
+// Anchoring on the keyframes rather than on a list of names in a test keeps
+// the two in step automatically: a new animation is covered the moment its
+// keyframes land, and an intentionally retired one is removed in the same
+// commit as its declaration or this fails.
+func TestEveryKeyframeIsDrivenFromInsideTheGuard(t *testing.T) {
+	raw, err := os.ReadFile("assets/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := sanitizeCSS(string(raw))
+	noPref := atRuleRanges(t, css, noPrefNeedle)
+
+	declared := map[string]int{}
+	for _, m := range kfDeclRE.FindAllStringSubmatchIndex(css, -1) {
+		declared[css[m[2]:m[3]]] = m[0]
+	}
+	if len(declared) == 0 {
+		t.Fatal("style.css declares no @keyframes — this guard covers nothing")
+	}
+
+	driven := map[string]bool{}
+	for _, m := range animValueRE.FindAllStringSubmatchIndex(css, -1) {
+		if !within(noPref, m[0]) {
+			continue
+		}
+		for _, tok := range strings.FieldsFunc(css[m[2]:m[3]], func(r rune) bool {
+			return r == ' ' || r == ',' || r == '\t' || r == '\n'
+		}) {
+			if _, ok := declared[tok]; ok {
+				driven[tok] = true
+			}
+		}
+	}
+
+	var orphans []string
+	for name := range declared {
+		if !driven[name] {
+			orphans = append(orphans, name)
+		}
+	}
+	sort.Strings(orphans)
+	for _, name := range orphans {
+		t.Errorf("style.css:%d: @keyframes %s is never driven from inside %s.\n"+
+			"  Either it lost its animation declaration (a deletion no other guard here can "+
+			"see), the declaration sits outside the guard, or the keyframes are dead code and "+
+			"should go in this commit.", lineOf(css, declared[name]), name, noPrefNeedle)
+	}
+}
+
+// Motion started from JavaScript must consult the setting itself.
+//
+// style.css cannot reach it, and the CSS guard's success is what makes this
+// necessary rather than optional: removing a transition under `reduce` stops
+// the movement being SMOOTH, but a timer that schedules the position change
+// still moves things. The timeline reveal was exactly that — the guarded CSS
+// left every node snapping into place one at a time across ~2.8 seconds.
+//
+// Both anchors name a visual effect rather than a mechanism, so they survive
+// renaming a local or retuning the stagger: `behavior: "smooth"` is the only
+// scroll animation the platform offers, and `"in"` is the entrance class the
+// stylesheet's .tl-node rules key on.
+func TestJavaScriptMotionConsultsThePreference(t *testing.T) {
+	raw, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+	const gate = "prefersReducedMotion"
+
+	for _, m := range regexp.MustCompile(`\bbehavior:\s*[^,;)\n]*"smooth"`).FindAllStringIndex(js, -1) {
+		if !strings.Contains(lineAt(js, m[0]), gate) {
+			t.Errorf("app.js:%d: %s\n  Smooth scrolling is a vestibular trigger and this one is on "+
+				"the Restore path. Pass %s() ? \"auto\" : \"smooth\".",
+				lineOf(js, m[0]), strings.TrimSpace(lineAt(js, m[0])), gate)
+		}
+	}
+
+	// Scoped to the enclosing function, not the whole file: a gate anywhere in
+	// 5000 lines would satisfy a file-wide search while the reveal it is
+	// supposed to cover stays ungated.
+	for _, m := range regexp.MustCompile(`classList\.add\("in"\)`).FindAllStringIndex(js, -1) {
+		body := js[enclosingFuncStart(js, m[0]):]
+		if end := strings.Index(body[1:], "\nfunction "); end > 0 {
+			body = body[:end+1]
+		}
+		if !strings.Contains(body, gate) {
+			t.Errorf("app.js:%d: the entrance class is applied in a function that never consults %s().\n"+
+				"  Guarding the CSS only removes the SMOOTHNESS; a scheduled class change still moves "+
+				"content. Apply it to every node at once when the preference is set.",
+				lineOf(js, m[0]), gate)
+		}
+	}
+}
+
+// enclosingFuncStart returns the offset of the top-level function declaration
+// containing pos, or 0 if there is none before it.
+func enclosingFuncStart(js string, pos int) int {
+	if i := strings.LastIndex(js[:pos], "\nfunction "); i >= 0 {
+		return i
+	}
+	return 0
 }

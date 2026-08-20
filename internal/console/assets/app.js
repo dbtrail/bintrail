@@ -126,6 +126,16 @@ function setCurrentServer(id) {
 
 // ── tiny DOM helpers (no data ever assigned as HTML) ─────────────────────────
 
+// prefersReducedMotion reports the OS-level setting for motion started from
+// JavaScript, which no media query in style.css can reach.
+//
+// Read at CALL time rather than cached once: the setting can change while the
+// console is open — both macOS and Windows apply it live — and this console
+// stays open for hours during an incident.
+function prefersReducedMotion() {
+  return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+}
+
 function el(tag, attrs, ...kids) {
   const n = document.createElement(tag);
   if (attrs) {
@@ -2633,7 +2643,7 @@ function aimUndoAtInstant(form, at) {
   form.elements.since.value = since;
   form.elements.until.value = "";
   previewRecover(form);
-  form.scrollIntoView({ behavior: "smooth", block: "start" });
+  form.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
   toast("Undo window set to everything after " + at + " UTC");
 }
 
@@ -2672,7 +2682,7 @@ function useTimelineInstant(at) {
   if (!field || !form) return;
   field.value = at;
   runState(form, false);
-  field.scrollIntoView({ behavior: "smooth", block: "center" });
+  field.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "center" });
 }
 
 // shiftSeconds adds n seconds to a "YYYY-MM-DD HH:MM:SS" UTC stamp, returning
@@ -2831,9 +2841,18 @@ function renderTimeline(container, data) {
   container.append(tl);
 
   // "draws itself" — progressive-enhancement reveal (decorative).
+  //
+  // The stagger is gated here and not only in CSS, because the CSS guard
+  // removes the SMOOTHNESS while this loop still schedules the position
+  // change: with the transition gone, a 50-row timeline snapped one node at a
+  // time across ~2.8s of content shifting under the reader — a jumpier version
+  // of the motion the preference asked to remove. Under reduce every node
+  // arrives at once and nothing moves.
   requestAnimationFrame(() => {
     tl.classList.add("drawn");
-    $all(".tl-node", tl).forEach((n, i) => setTimeout(() => n.classList.add("in"), 60 + i * 55));
+    const nodes = $all(".tl-node", tl);
+    if (prefersReducedMotion()) { nodes.forEach((n) => n.classList.add("in")); return; }
+    nodes.forEach((n, i) => setTimeout(() => n.classList.add("in"), 60 + i * 55));
   });
 }
 
