@@ -1877,3 +1877,44 @@ button { font-family: inherit; }
   white-space: nowrap; max-width: 46ch; overflow: hidden; text-overflow: ellipsis;
 }
 .sql-table th { color: var(--ink-2); font-weight: 600; position: sticky; top: 0; background: var(--surface); }
+
+/* ============================================================
+   Motion: chrome only (#1385)
+
+   The console is opened when something has gone wrong — someone is tracing a
+   bad DELETE. Delight lives in the chrome: navigation, tiles, headers.
+   Data surfaces (rows, diffs, badges, the numbers under inspection) stay calm
+   and are deliberately untouched here.
+
+   Two rules this section must keep:
+   - No color moves. The semantic INSERT/UPDATE/DELETE tokens and the brand
+     palette's "never encode data" boundary are set above and stay set; every
+     rule below animates transform, opacity or shadow only.
+   - Everything is inside prefers-reduced-motion: no-preference, following the
+     pattern the rest of this file already uses. With motion off the page must
+     lose nothing but the movement.
+   ============================================================ */
+
+/* Transitions live OUTSIDE the media query on purpose: a hover lift with
+   motion reduced should still change state, just instantly. Only the
+   transition timing is motion; the state change is feedback. */
+.ov-stat { transition: transform .22s var(--ease), box-shadow .22s var(--ease); }
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Tiles rise as their fetch lands. No stagger delay: Overview replaces each
+     tile independently as its own request resolves, so the arrival order IS
+     the stagger. A fixed delay would instead hold an already-loaded tile
+     invisible (animation-fill-mode: both) waiting for its slot. */
+  .ov-stat { animation: fadeup .38s var(--ease) both; }
+
+  .ov-stat:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 26px -14px oklch(0.4 0.06 305 / 0.42), var(--panel-shadow);
+  }
+
+  /* Nav: the icon leads the eye toward the destination. 2px — enough to feel
+     responsive, small enough that a mouse crossing the sidebar does not
+     ripple. */
+  .nav-item .ni-icon { transition: transform .18s var(--ease); }
+  .nav-item:hover .ni-icon { transform: translateX(2px); }
+}
