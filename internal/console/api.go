@@ -302,6 +302,20 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	// Parsed with an error rather than atoiDefault, unlike `limit`. The
+	// directions differ: a dropped `limit` falls back to a CAP (safe), while a
+	// dropped `limit_per_pk` REMOVES one — `?limit_per_pk=abc` would silently
+	// widen the result set. The JSON side of this filter already 400s on a
+	// non-number via the decoder; this makes the query-string side agree.
+	lpp := 0
+	if raw := q.Get("limit_per_pk"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "limit_per_pk must be a whole number")
+			return
+		}
+		lpp = n
+	}
 	p := filterParams{
 		Schema:        q.Get("schema"),
 		Table:         q.Get("table"),
@@ -318,11 +332,28 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		// shows the events the undo script will reverse; wiring latest-per-row
 		// into recover alone would break that promise silently — the preview
 		// would list events the script leaves untouched.
-		LimitPerPK: atoiDefault(q.Get("limit_per_pk"), 0),
+		LimitPerPK: lpp,
 	}
 	opts, err := s.buildOptions(p, eventsDefaultLimit, eventsMaxLimit)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Per-PK caps and keyset paging are mutually exclusive, and the reason is
+	// the SQL: the cursor predicate joins the same `where` slice that is
+	// interpolated INSIDE the ROW_NUMBER subquery, so every page would
+	// re-anchor "latest N per PK" to the post-cursor remainder. Page 6 of a
+	// limit_per_pk=50 walk serves events 51+ for that PK — no single row wrong,
+	// the SET silently larger than the one asked for. internal/query states the
+	// same invariant for the streaming path (FetchMergedStream: "Limit/
+	// LimitPerPK are whole-result-set caps and cannot be combined with
+	// paging"); this is the HTTP edge of it. Unreachable from the UI today —
+	// previewRecover renders one flat list — but the Events view pages on
+	// `before=`, so the day this field is offered there it would break quietly.
+	if opts.LimitPerPK > 0 && (q.Get("after") != "" || q.Get("before") != "") {
+		writeJSONError(w, http.StatusBadRequest,
+			"latest-per-row is a whole-result-set cap and cannot be combined with paging; "+
+				"drop the after/before cursor or the limit_per_pk filter")
 		return
 	}
 	if err := applyEventCursors(&opts, q.Get("after"), q.Get("before")); err != nil {

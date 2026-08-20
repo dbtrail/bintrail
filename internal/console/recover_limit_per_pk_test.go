@@ -120,6 +120,67 @@ func TestRecoverLimitPerPKReachesTheQuery(t *testing.T) {
 	})
 }
 
+// /api/events honours limit_per_pk, and refuses it alongside a cursor.
+//
+// The events half is the whole justification for touching that endpoint:
+// previewRecover promises the preview shows the events the undo script will
+// reverse. Without this test, deleting the one line that threads the param
+// leaves every other test in this file green — the regression the PR exists to
+// prevent would be undetectable.
+func TestEventsHonoursLimitPerPK(t *testing.T) {
+	const window = "ROW_NUMBER() OVER (PARTITION BY pk_values"
+
+	t.Run("reaches the query", func(t *testing.T) {
+		db, mock, cap, closeDB := newCapturingMock(t)
+		defer closeDB()
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(sameSecondRows())
+
+		rec := httptest.NewRecorder()
+		newBootServer(db).handleEvents(rec,
+			httptest.NewRequest("GET", "/api/events?schema=app&table=users&pk=42&limit_per_pk=1", nil))
+		if rec.Code != 200 {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		if got := cap.eventsQuery(t); !strings.Contains(got, window) {
+			t.Errorf("limit_per_pk did not reach query.Options on /api/events — the Restore preview "+
+				"would list events the undo script leaves untouched:\n%s", got)
+		}
+	})
+
+	// Paging re-anchors the per-PK window to the post-cursor remainder, so a
+	// walk silently exceeds the cap it was given. internal/query refuses the
+	// same combination for the streaming path; this is the HTTP edge.
+	for _, cursor := range []string{"after", "before"} {
+		t.Run("refused with a "+cursor+" cursor", func(t *testing.T) {
+			db, _, closeDB := newSQLMock(t)
+			defer closeDB()
+			rec := httptest.NewRecorder()
+			newBootServer(db).handleEvents(rec, httptest.NewRequest("GET",
+				"/api/events?schema=app&table=users&pk=42&limit_per_pk=5&"+cursor+"=1700000000000000_5", nil))
+			if rec.Code != 400 {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "cannot be combined with paging") {
+				t.Errorf("refusal does not explain itself: %s", rec.Body.String())
+			}
+		})
+	}
+
+	// A dropped cap is not the same class of mistake as a dropped page size:
+	// this one WIDENS the result set.
+	t.Run("malformed value is refused, not silently unlimited", func(t *testing.T) {
+		db, _, closeDB := newSQLMock(t)
+		defer closeDB()
+		rec := httptest.NewRecorder()
+		newBootServer(db).handleEvents(rec,
+			httptest.NewRequest("GET", "/api/events?schema=app&table=users&pk=42&limit_per_pk=abc", nil))
+		if rec.Code != 400 {
+			t.Fatalf("status = %d, want 400 (a coerced 0 means UNLIMITED here); body = %s",
+				rec.Code, rec.Body.String())
+		}
+	})
+}
+
 // The PK precondition is enforced by the SERVER, not the form. The API is
 // reachable without the UI, and "latest N per row" over an unscoped window
 // would quietly keep N events for every PK the other filters happen to touch.
@@ -157,7 +218,13 @@ func TestAppJSPreviewMirrorsLimitPerPK(t *testing.T) {
 	}
 	js := string(data)
 
-	if !strings.Contains(js, `params.limit_per_pk = String(plpp)`) {
+	// NB: the SERVER half of the mirror is pinned by
+	// TestEventsHonoursLimitPerPK, not here. This only asserts the client
+	// sends it, and deliberately matches the API param rather than a local
+	// variable name — an earlier version pinned `String(plpp)`, so renaming a
+	// local would have failed with "previewRecover no longer forwards
+	// limit_per_pk", an assertion that says something untrue.
+	if !strings.Contains(js, "params.limit_per_pk =") {
 		t.Error("previewRecover no longer forwards limit_per_pk — the preview would list events " +
 			"the generated script will not reverse, breaking the mirror it documents")
 	}
