@@ -2093,6 +2093,11 @@ function renderRecover(params) {
   // events are still indexed — a typed name must always submit.
   form.append(fieldTableCombo("Table", "table", "md", "orders"));
   form.append(fieldInput("PK", "pk", "sm", "42 or 42|7"));
+  // Latest-per-row sits beside PK because it is meaningless without one (the
+  // server refuses the pair). It is the only filter that can separate events
+  // sharing a timestamp: Since/Until are second-granular, so a row created and
+  // deleted inside the same second cannot be split by time.
+  form.append(fieldInput("Latest per row", "limit_per_pk", "sm", "all"));
   form.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
   form.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
   const actions = el("div", { class: "filter-actions" });
@@ -2185,12 +2190,27 @@ function busyModalActive() {
 }
 
 // recoverBusyFacts mirrors the context banner's facts: target, pk, window.
+// parseLatestPerRow normalises the "Latest per row" field. Returns null for
+// anything that is not a whole number >= 0 — the caller reports that rather
+// than sending it, because a silently dropped filter here means reversing MORE
+// events than the operator asked for. Blank is 0 (all).
+function parseLatestPerRow(raw) {
+  const s = (raw || "").trim();
+  if (s === "") return 0;
+  const n = Number(s);
+  if (!Number.isInteger(n) || n < 0) return null;
+  return n;
+}
+
 function recoverBusyFacts(f) {
   const facts = [];
   facts.push(["target", f.schema ? f.schema + (f.table ? "." + f.table : "") : "(all schemas)"]);
   if (f.pk) facts.push(["pk", f.pk]);
   if (f.since) facts.push(["since", f.since + " UTC"]);
   if (f.until) facts.push(["until", f.until + " UTC"]);
+  // Both call sites pass their own request object — generateUndo a number,
+  // previewRecover a string — so stringify rather than assume either.
+  if (f.limit_per_pk) facts.push(["latest per row", String(f.limit_per_pk)]);
   return facts;
 }
 
@@ -2313,6 +2333,11 @@ async function previewRecover(form) {
   const f = Object.fromEntries(new FormData(form).entries());
   const params = {};
   ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) params[k] = f[k].trim(); });
+  // Part of mirroring recover's effective window (see below): without this the
+  // preview would list events the generated script will not touch.
+  const plpp = parseLatestPerRow(f.limit_per_pk);
+  if (plpp === null) { renderError(container, "Latest per row must be a whole number, 0 or more."); return; }
+  if (plpp > 0) params.limit_per_pk = String(plpp);
   // Mirror /api/recover's EFFECTIVE fetch window (#967) so the preview shows
   // the same events the undo script will actually reverse: newest-first, same
   // limit as recoverDefaultLimit in internal/console/api.go. Hardcoded here —
@@ -2403,6 +2428,12 @@ async function generateUndo(form) {
   const body = {};
   ["schema", "table", "pk", "since", "until"].forEach((k) => { if (f[k] && f[k].trim()) body[k] = f[k].trim(); });
   if (!body.schema) { renderError(out, "Choose at least a schema to search."); return; }
+  // Sent as a NUMBER: the field is an int on the wire, and a string would be
+  // rejected by the decoder rather than silently ignored. Only when > 0 —
+  // blank and 0 both mean "all", so neither needs to travel.
+  const lpp = parseLatestPerRow(f.limit_per_pk);
+  if (lpp === null) { renderError(out, "Latest per row must be a whole number, 0 or more."); return; }
+  if (lpp > 0) body.limit_per_pk = lpp;
   const ctrl = new AbortController();
   const busy = openBusyModal(form, {
     title: "Generating undo SQL",
