@@ -17,14 +17,16 @@ import (
 // Scoped to this section rather than the whole stylesheet, and that is
 // deliberate — though for a different reason than when it was written. The
 // original reason (style.css honoured reduced motion three inconsistent ways,
-// so a whole-file checker cried wolf) is gone: #1392 settled on one shape and
-// TestReducedMotionHasOneShape now audits the entire file.
+// so a whole-file checker cried wolf) is gone: #1392 settled on one shape plus
+// a narrow reduce-block exception, and TestReducedMotionHasOneShape now audits
+// the entire file.
 //
 // What survives is a STRICTER local rule. The whole-file guard tolerates short
 // geometry transitions anywhere, because a 120ms hover nudge is feedback and
 // banning it outright is a rule nobody follows. This section exists for no
-// reason except to add decorative motion, so here every transition is motion
-// regardless of duration and none may sit outside the guard.
+// reason except to add decorative motion, so here EVERY transition is motion —
+// any duration, and colour and opacity too, both of which the whole-file guard
+// ignores by design — and none may sit outside the guard.
 func motionSection(t *testing.T) string {
 	t.Helper()
 	data, err := os.ReadFile("assets/style.css")
@@ -193,7 +195,7 @@ func TestMotionSectionAnimatesGeometryOnly(t *testing.T) {
 	// opacity is banned here for a different reason than the colors above, so
 	// it gets its own message. Overview replaces tiles as fetches land; a tile
 	// whose entrance starts transparent flashes at every replaceWith, and
-	// style.css:467 already states the invariant for `rise` — content is
+	// the `rise` keyframes comment already states the invariant — content is
 	// ALWAYS visible.
 	if strings.Contains(section, "opacity:") {
 		t.Error("the motion section animates opacity. Tiles are REPLACED as their fetch lands, so an " +
