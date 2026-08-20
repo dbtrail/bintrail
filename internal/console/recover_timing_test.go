@@ -110,6 +110,37 @@ func assertNoOmitEmpty(t *testing.T, v any, field string) {
 	}
 }
 
+// The cascade endpoint measures too.
+//
+// A source guard rather than a handler test, deliberately and with the
+// tradeoff stated: /api/recover-cascade needs FK-constraint fixtures to reach
+// its 200 path, and the reflection check above only proves the TAG is right —
+// it would pass with the assignment deleted, reporting a fabricated 0. This
+// pins the assignment itself inside the response literal. It is weaker than
+// exercising the handler and is not a substitute for one; it is what makes the
+// difference between "guarded" and "guarded on one of two sites".
+func TestRecoverCascadeMeasuresGenerationTime(t *testing.T) {
+	data, err := os.ReadFile("recover_cascade.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(data)
+	i := strings.Index(src, "recoverCascadeResponse{")
+	if i < 0 {
+		t.Fatal("no recoverCascadeResponse literal in recover_cascade.go — this guard covers nothing")
+	}
+	j := strings.Index(src[i:], "})")
+	if j < 0 {
+		t.Fatal("could not find the end of the recoverCascadeResponse literal")
+	}
+	if !strings.Contains(src[i:i+j], "GeneratedInMs:   time.Since(start)") {
+		t.Error("the recover-cascade response no longer measures its generation time. " +
+			"Because the field is not omitempty it would still emit generated_in_ms:0, and the client " +
+			"would render \"generated in <0.1s\" — a fabricated fast measurement on the SLOWER of the " +
+			"two paths, which is worse than reporting nothing.")
+	}
+}
+
 // The frontend must actually RENDER the timing, and must keep absence and zero
 // apart while doing it. A field that reaches the wire and no surface is the
 // same silence with more code.
