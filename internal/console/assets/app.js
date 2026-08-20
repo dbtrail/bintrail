@@ -1086,47 +1086,6 @@ function ovPendingCard(title, waiting, cls) {
   return card;
 }
 
-// countUpText animates a numeric tile from 0 to its value, then writes the
-// EXACT original string so the final DOM is byte-identical to the static
-// render — anything reading the tile after the animation (a test, a
-// screenshot, assistive tech) sees what it would have seen without it.
-//
-// Refuses anything that is not a plain non-negative integer. Tiles also carry
-// timestamps and "—", and "counting up" to a date is nonsense; re-formatting a
-// value the caller already formatted would be worse, since this function does
-// not know whether a separator is a thousands mark or part of an identifier.
-//
-// Skipped entirely under prefers-reduced-motion, and abandoned if the node
-// leaves the document mid-flight — Overview replaces tiles as fetches land, so
-// a stale animation could otherwise write into a detached node forever.
-function countUpText(node, value) {
-  const s = String(value);
-  if (!/^\d+$/.test(s)) return;
-  const target = Number(s);
-  // Below this a count-up is a flicker, not an animation.
-  if (!isFinite(target) || target < 10) return;
-  if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-
-  const DUR = 620;
-  let t0 = null;
-  const step = (ts) => {
-    if (!node.isConnected) return;
-    if (t0 === null) t0 = ts;
-    const p = Math.min(1, (ts - t0) / DUR);
-    // easeOutCubic: fast first, settling — reads as the number arriving
-    // rather than being scrubbed.
-    const eased = 1 - Math.pow(1 - p, 3);
-    if (p < 1) {
-      node.textContent = String(Math.round(target * eased));
-      requestAnimationFrame(step);
-    } else {
-      node.textContent = s;
-    }
-  };
-  node.textContent = "0";
-  requestAnimationFrame(step);
-}
-
 // ovStatPending: one tile in its loading state — key and scope already legible,
 // value shimmering.
 function ovStatPending(key, scope) {
@@ -1347,15 +1306,14 @@ function buildOverview(status, eventsData, coverage, activity) {
 // all-time total from a window count — which is precisely how "53 deletes" got
 // read as a share of "3121 changes indexed" (#1300).
 function ovStat(value, key, mod, scope) {
-  const valEl = el("div", { class: "ov-stat-v" + (mod ? " " + mod : ""), text: value });
-  // The tile's value counts up as it lands (#1385). Motion only — the number's
-  // COLOR is left alone on purpose: the deletes tile is .danger/--delete, and
-  // the semantic INSERT/UPDATE/DELETE mapping must not be repainted for
-  // decoration. countUpText is a no-op for anything that is not a plain
-  // integer (timestamps, "—") and under reduced motion.
-  countUpText(valEl, value);
+  // Tiles animate their ARRIVAL (a rise, in style.css), never their VALUE. A
+  // count-up was tried and removed: it writes intermediate numbers into the
+  // DOM, so for the length of the animation the tile states something untrue —
+  // the console-e2e read "0" from the deletes tile mid-flight. A forensics
+  // surface that briefly reports zero deletions is a small lie, and the
+  // entrance animation already supplies the sense of arrival without one.
   return el("div", { class: "ov-stat" },
-    valEl,
+    el("div", { class: "ov-stat-v" + (mod ? " " + mod : ""), text: value }),
     el("div", { class: "ov-stat-k", text: key }),
     el("div", { class: "ov-stat-scope", text: scope || "" }));
 }
