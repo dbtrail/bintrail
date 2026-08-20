@@ -23,6 +23,11 @@ import (
 // from a genuinely sub-millisecond recover. The client's renderer relies on
 // exactly that distinction (absent = older server, render nothing; 0 = fast,
 // render "<0.1s"), so the key's PRESENCE is the contract, not its value.
+// fetchDelay is large enough to survive scheduler jitter and small enough not
+// to slow the suite. The assertion uses half of it, so a loaded machine cannot
+// flake the test while a dropped assignment (0ms) still fails decisively.
+const fetchDelay = 40 * time.Millisecond
+
 func TestRecoverReportsGenerationTime(t *testing.T) {
 	db, mock, closeDB := newSQLMock(t)
 	defer closeDB()
@@ -34,7 +39,13 @@ func TestRecoverReportsGenerationTime(t *testing.T) {
 		"commit_ts_us",
 	}
 	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	mock.ExpectQuery("FROM binlog_events").WillReturnRows(
+	// The fixture DELAYS the fetch. Without it this test cannot see the mutation
+	// it exists to prevent: because the field is deliberately not omitempty,
+	// dropping the assignment still emits "generated_in_ms":0, which satisfies
+	// both key-presence and ms >= 0. Worse than a missing key — the panel would
+	// render "generated in <0.1s", a fabricated fast measurement. A measurable
+	// floor is what makes the assignment load-bearing.
+	mock.ExpectQuery("FROM binlog_events").WillDelayFor(fetchDelay).WillReturnRows(
 		sqlmock.NewRows(cols).AddRow(
 			int64(1), "bin.000001", int64(4), int64(40), ts,
 			nil, nil, "app", "users", int64(parser.EventInsert), "42",
@@ -65,8 +76,10 @@ func TestRecoverReportsGenerationTime(t *testing.T) {
 	if !isNum {
 		t.Fatalf("generated_in_ms = %#v, want a number", v)
 	}
-	if ms < 0 {
-		t.Errorf("generated_in_ms = %v, want >= 0", ms)
+	if floor := float64(fetchDelay.Milliseconds()) / 2; ms < floor {
+		t.Errorf("generated_in_ms = %v, want >= %v — the fixture delays the fetch by %s, so a "+
+			"value near zero means the field is being reported without being measured",
+			ms, floor, fetchDelay)
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
