@@ -33,17 +33,36 @@ func motionSection(t *testing.T) string {
 	if i < 0 {
 		t.Fatal("the #1385 motion section header is gone — this guard no longer covers anything")
 	}
-	section := css[i:]
-	// The next "/* ====" banner, if any, ends this section.
-	if j := strings.Index(section, "/* ======"); j > 0 {
-		section = section[:j]
+	// Only the FIRST marker was found before, so a second banner further down
+	// sat outside both guards entirely.
+	if strings.Count(css, marker) > 1 {
+		t.Fatalf("the %q marker appears %d times — a duplicate puts everything under the later "+
+			"one outside these guards", marker, strings.Count(css, marker))
 	}
-	return section
+	// Back up to the banner that OPENS this section: the marker sits inside a
+	// /* … */ block, so slicing at the marker leaves an unterminated comment
+	// whose header prose then reaches the property matcher as if it were code.
+	if b := strings.LastIndex(css[:i], "/* ======"); b >= 0 {
+		i = b
+	}
+	section := css[i:]
+	// The next banner, if any, ends this section — without this bound both
+	// guards would silently extend over every section appended later.
+	if j := strings.Index(section[1:], "/* ======"); j > 0 {
+		section = section[:j+1]
+	}
+	// Stripped ONCE, here, so both guards see the same code-only text. It also
+	// removes the phantom-range hazard: a comment quoting the no-preference
+	// at-rule used to make the brace scanner treat the next `{` as a block.
+	return stripCSSComments(section)
 }
 
-// animDeclRE matches the shorthand and the longhand. The shorthand alone was a
-// hole: `animation-name: x` outside the guard escaped entirely.
-var animDeclRE = regexp.MustCompile(`animation(-name)?\s*:`)
+// animDeclRE matches what can START motion: the animation shorthand, its -name
+// longhand (you cannot run an animation without one of the two), and
+// `transition`. Transition was the hole this section argues about at length in
+// its own comment and then did not enforce — a transition IS animation, and
+// moving the tile's transition outside the guard passed green.
+var animDeclRE = regexp.MustCompile(`(animation(-name)?|transition)\s*:`)
 
 // Every animation this section adds must sit inside its reduced-motion guard.
 //
@@ -144,12 +163,10 @@ func lineAt(s string, pos int) string {
 // box-shadow is the documented exception: it carries a color but paints depth,
 // not meaning.
 func TestMotionSectionAnimatesGeometryOnly(t *testing.T) {
-	// Comments stripped first: these needles are PROPERTY NAMES, and the
-	// section's own commentary explains why several of them are absent — the
-	// note about not using opacity contains the literal "opacity:". Matching
-	// raw text fires on the explanation, which is how the first run of this
-	// guard failed.
-	section := stripCSSComments(motionSection(t))
+	// motionSection already strips comments — these needles are PROPERTY NAMES
+	// and the section's own commentary explains why several are absent (the
+	// note about not using opacity contains the literal "opacity:").
+	section := motionSection(t)
 
 	// `color:` substring-matches every *-color longhand (border-color,
 	// outline-color, accent-color, caret-color, text-decoration-color).
@@ -157,7 +174,7 @@ func TestMotionSectionAnimatesGeometryOnly(t *testing.T) {
 		"color:",
 		"background:", "background-image:",
 		"filter:", "backdrop-filter:",
-		"text-shadow:", "mix-blend-mode:",
+		"text-shadow:", "mix-blend-mode:", "background-blend-mode:", "border-image:",
 		// Shorthands that carry a color.
 		"border:", "outline:",
 	}

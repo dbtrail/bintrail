@@ -1411,6 +1411,43 @@ try {
     ? ok("storage: baseline_trigger off → no button even with a destination")
     : bad("storage: baseline_trigger off → no button even with a destination", JSON.stringify(gates));
 
+  // Scenario 15e — motion that cannot be seen from Go (#1385).
+  //
+  // Both of these shipped BROKEN and a text-grep guard in the Go suite passed
+  // them. That is the whole reason they live here: both are CASCADE-PRECEDENCE
+  // bugs, a class no source-text assertion can observe. ci.yml says as much
+  // about this suite — "go test never renders assets/*, so CSS/DOM/presentation
+  // bugs are invisible to the Go suite".
+  //
+  //  1. `animation: … both` filled `transform: none` forward, and animations
+  //     outrank normal author declarations, so `.ov-stat:hover { transform }`
+  //     never applied — measured matrix(1,0,0,1,0,0). The box-shadow half DID
+  //     apply, so it looked half-alive rather than broken.
+  //  2. Re-declaring the `transition` SHORTHAND on `.nav-item .ni-icon` reset
+  //     transition-property to `transform` alone, so the icon colour snapped.
+  await page.evaluate(() => navigate("overview"));
+  await page.waitForSelector(".ov-stat", { timeout: 10000 });
+  // Let the entrance finish first: a RUNNING animation outranks the author rule
+  // too, so hovering early measures the animation rather than the bug.
+  await page.waitForTimeout(700);
+  await page.hover(".ov-stat");
+  await page.waitForTimeout(400); // the lift transitions over .22s
+  const lift = await page.evaluate(() => getComputedStyle(document.querySelector(".ov-stat")).transform);
+  // translateY(-3px) is the last component of the 2D matrix.
+  /-3\)$/.test(lift.replace(/\s/g, ""))
+    ? ok("motion: hovering a stat tile actually lifts it")
+    : bad("motion: hovering a stat tile actually lifts it",
+        `${lift} — an animation filling transform forward outranks the :hover rule`);
+
+  const iconTransition = await page.evaluate(() => {
+    const icon = document.querySelector(".nav-item .ni-icon");
+    return icon ? getComputedStyle(icon).transitionProperty : "(no icon)";
+  });
+  (iconTransition.includes("color") && iconTransition.includes("transform"))
+    ? ok("motion: the nav icon still transitions colour as well as transform")
+    : bad("motion: the nav icon still transitions colour as well as transform",
+        `${iconTransition} — re-declaring the transition shorthand resets transition-property`);
+
   // Scenario 16 — Restore Table combobox (#1364). The Table field must be an
   // input + datalist fed from /api/schemas?schema=… (the same endpoint the
   // events table picker consumes): suggestions from the fixture's tables,
