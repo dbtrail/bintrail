@@ -1436,8 +1436,13 @@ try {
   ok("protect: /baselines renders the snapshot panel");
 
   await page.evaluate(() => navigate("verification"));
+  // NOT .ov-panel-title: the page suppresses the panel's own h2 (hideTitle) so
+  // it does not sit under an identical h1, which makes that selector
+  // unsatisfiable here. Anchor on the page heading and the mode control — the
+  // things whose absence would mean the route did not render.
   await page.waitForFunction(() => location.pathname === "/verification"
-    && Array.from(document.querySelectorAll(".ov-panel-title")).some((h) => /Verification/.test(h.textContent)),
+    && Array.from(document.querySelectorAll("h1.page-title")).some((h) => /Verification/.test(h.textContent))
+    && document.querySelector(".vfy-panel-full") !== null,
     { timeout: 10000 });
   ok("protect: /verification renders the verification panel");
 

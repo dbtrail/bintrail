@@ -3265,7 +3265,7 @@ async function renderBaselines() {
     v.append(cards);
     if (serversErr) v.append(el("div", { class: "error-box", text: "Could not load servers: " + serversErr }));
     const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
-    grid.append(baselinesPanel(baselines, servers));
+    grid.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
     v.append(grid);
     viewEnter();
   } catch (err) {
@@ -3289,7 +3289,7 @@ async function renderVerification() {
       "Prove a snapshot still reconstructs what it claims — the check that answers whether a restore would actually work.")));
     if (serversErr) v.append(el("div", { class: "error-box", text: "Could not load servers: " + serversErr }));
     const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
-    grid.append(verifyPanel(servers, { hideTitle: true }));
+    grid.append(verifyPanel(servers, { hideTitle: true, serversErr: serversErr }));
     v.append(grid);
     viewEnter();
   } catch (err) {
@@ -3570,7 +3570,10 @@ function baselineSummaryCard(b, cur, opts) {
 // baseline comes only from --baseline-dir/--baseline-s3 (or the BINTRAIL_
 // CONSOLE_BASELINE_DIR/_S3 env; BASELINE_DIR in the compose stack) — so the
 // "edit the server" instruction would point it at a dead end.
-function baselineConfigHint(cur) {
+function baselineConfigHint(cur, serversErr) {
+  // A failed server list is not an empty one. "Add a server first" told an
+  // operator who has servers to create another, and hid the real cause.
+  if (serversErr) return "The server list could not be loaded (" + serversErr + "), so this cannot be checked.";
   if (!cur) return "Add a server first (Manage servers).";
   if (cur.kind === "ephemeral") {
     return "Restart the daemon with --baseline-dir or --baseline-s3 (compose: BASELINE_DIR in .env).";
@@ -3639,11 +3642,18 @@ function baselineRefreshNote(rf) {
   return el("p", { class: "form-hint", text: text });
 }
 
-function baselinesPanel(b, servers) {
+// opts.serversErr: when /api/servers failed, `servers` is empty for the WRONG
+// reason. Without it this panel derives affirmative claims from a failure —
+// the Create baseline button vanishes with no stated cause, and the `owner`
+// fallback below attributes the snapshots to the daemon when the selected
+// server may have its own baseline_s3.
+function baselinesPanel(b, servers, opts) {
   const panel = el("section", { class: "ov-panel" });
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
   let owner = cur ? serverLabel(cur) : "";
-  if (!owner && b && !b.error && b.configured) owner = "daemon (--baseline-dir / --baseline-s3)";
+  if (!owner && b && !b.error && b.configured && !(opts && opts.serversErr)) {
+    owner = "daemon (--baseline-dir / --baseline-s3)";
+  }
   const head = el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (owner ? " — " + owner : "") }),
     tzChip());
@@ -3675,7 +3685,7 @@ function baselinesPanel(b, servers) {
       el("p", { class: "stg-empty-sub", text: "A baseline is a full copy of your table at one point in time. With one, Time-travel can show complete rows — not just the ones that changed recently." }),
       el("p", { class: "stg-empty-sub", text: "1. Create snapshots:" }),
       el("code", { class: "stg-code", text: "docker compose --profile baseline run --rm baseline" }),
-      el("p", { class: "stg-empty-sub", text: "2. " + baselineConfigHint(cur) })));
+      el("p", { class: "stg-empty-sub", text: "2. " + baselineConfigHint(cur, opts && opts.serversErr) })));
   } else if (!(b.snapshots || []).length) {
     list.append(el("div", { class: "stg-empty" },
       el("p", { class: "stg-empty-lead", text: "Source configured, no snapshots found." }),
@@ -3737,8 +3747,9 @@ async function createBaseline(id, btn) {
   // still appears on /storage, so refresh whichever is on screen. Hardcoding
   // /storage would leave the page that OWNS the button showing a stale list
   // right after the run it started.
+  // Only /baselines: the Create baseline button lives in baselinesPanel, which
+  // no longer renders on Storage, so a /storage arm here would be unreachable.
   if (location.pathname === "/baselines") renderBaselines();
-  else if (location.pathname === "/storage") renderStorage();
 }
 
 // pollBaseline polls the per-server baseline status until it leaves "running"
@@ -3792,7 +3803,13 @@ function verifyPanel(servers, opts) {
     return panel;
   }
   if (!cur || !cur.id) {
-    list.append(el("div", { class: "ev-empty", text: "Select a server to run verification." }));
+    // A failed /api/servers arrives here as an empty list, and "Select a
+    // server" is then an instruction to do something the operator already did.
+    // archivingPanel takes serversErr for exactly this reason; prepending an
+    // error box above the panel does not stop the panel from contradicting it.
+    list.append(el("div", { class: "ev-empty", text: (opts && opts.serversErr)
+      ? "Could not load the server list, so verification cannot target one: " + opts.serversErr
+      : "Select a server to run verification." }));
     panel.append(head, list);
     return panel;
   }

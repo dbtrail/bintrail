@@ -49,9 +49,19 @@ func TestNavEntriesNameKnownRoutes(t *testing.T) {
 		}
 		// A route in ROUTES with no dispatch arm renders Overview too, via the
 		// switch default. Both halves must exist for a nav entry to work.
-		if !strings.Contains(dispatch, `case "`+route+`":`) {
-			t.Errorf("route %q has a nav entry but no case in renderRoute's switch — it would "+
-				"fall through to the default and render Overview", route)
+		arm := regexp.MustCompile(`case "` + regexp.QuoteMeta(route) + `":\s*return (\w+)\(`)
+		m := arm.FindStringSubmatch(dispatch)
+		if m == nil {
+			t.Errorf("route %q has a nav entry but no `case \"%s\": return …()` in renderRoute's "+
+				"switch — it would fall through to the default and render Overview", route, route)
+			continue
+		}
+		// The arm naming a function does not mean the function exists. Deleting
+		// the renderer leaves the switch intact, so a text guard on the case
+		// alone passes and the route throws at runtime.
+		if fn := m[1]; !strings.Contains(string(js), "function "+fn+"(") {
+			t.Errorf("route %q dispatches to %s(), which is not defined in app.js — the route would "+
+				"throw instead of rendering", route, fn)
 		}
 	}
 
