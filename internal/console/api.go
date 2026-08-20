@@ -154,13 +154,16 @@ type recoverResponse struct {
 	// KeyRestoreCount is the ON UPDATE CASCADE / SET NULL half (#1002): child
 	// foreign keys the cascade rewrote and this script puts back.
 	KeyRestoreCount int `json:"key_restore_count,omitempty"`
-	// GeneratedInMs is the wall time this request spent producing the script:
-	// the event fetch (including any archive/Parquet leg) plus SQL rendering.
-	// Timing only the rendering would report the cheap half — the fetch is
-	// where a recover that had to reach S3 differs from one served entirely
-	// from live partitions by orders of magnitude, and telling those apart is
-	// the point. Not omitempty: a sub-millisecond recover is a real answer,
-	// and dropping the field would render as "unknown" rather than "fast".
+	// GeneratedInMs is the wall time this request spent producing the script,
+	// measured from request-body decode: filter parsing, session-profile
+	// resolution (a DB read on a cold cache), the event fetch including any
+	// archive/Parquet leg, cascade victim synthesis when auto-detected, and
+	// SQL rendering. Timing only the rendering would report the cheap half —
+	// the fetch is where a recover that had to reach S3 differs from one
+	// served entirely from live partitions by orders of magnitude, and telling
+	// those apart is the point. Not omitempty: a sub-millisecond recover is a
+	// real answer, and dropping the field would render as "unknown" rather
+	// than "fast".
 	GeneratedInMs int64 `json:"generated_in_ms"`
 }
 

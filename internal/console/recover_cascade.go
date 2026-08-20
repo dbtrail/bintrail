@@ -68,8 +68,13 @@ type recoverCascadeResponse struct {
 	Incomplete []string `json:"incomplete,omitempty"`
 	Warnings   []string `json:"warnings,omitempty"`
 	// GeneratedInMs: see recoverResponse.GeneratedInMs (internal/console/api.go).
-	// It matters more here — cascade adds victim synthesis and per-link key-chain
-	// probes on top of the same fetch, so this is the slower of the two paths.
+	// The two endpoints are dominated by different work and neither ranks above
+	// the other. This one runs a LIVE-ONLY parent fetch (cascade recovery never
+	// reads archives — see the note further down this file) plus victim
+	// synthesis and per-link key-chain probes, so synthesis dominates.
+	// /api/recover is the one that can be dominated by storage: its fetch can
+	// take an archive/Parquet leg, and it is a strict superset of this work
+	// when cascade is auto-detected there.
 	GeneratedInMs int64 `json:"generated_in_ms"`
 }
 

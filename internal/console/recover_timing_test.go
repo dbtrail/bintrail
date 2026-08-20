@@ -133,11 +133,68 @@ func TestRecoverCascadeMeasuresGenerationTime(t *testing.T) {
 	if j < 0 {
 		t.Fatal("could not find the end of the recoverCascadeResponse literal")
 	}
-	if !strings.Contains(src[i:i+j], "GeneratedInMs:   time.Since(start)") {
+	// Matched as two independent needles rather than one aligned string: gofmt
+	// re-aligns the literal's values whenever a longer field name is added, so
+	// pinning "GeneratedInMs:   time.Since(start)" with its three spaces would
+	// fail with "no longer measures" on an unrelated field rename.
+	lit := src[i : i+j]
+	if !strings.Contains(lit, "GeneratedInMs:") || !strings.Contains(lit, "time.Since(start)") {
 		t.Error("the recover-cascade response no longer measures its generation time. " +
-			"Because the field is not omitempty it would still emit generated_in_ms:0, and the client " +
-			"would render \"generated in <0.1s\" — a fabricated fast measurement on the SLOWER of the " +
-			"two paths, which is worse than reporting nothing.")
+			"Because the field is not omitempty it would still emit generated_in_ms:0, so an API " +
+			"consumer reads a fabricated sub-millisecond measurement rather than an absent field. " +
+			"(The shipped console never calls this endpoint — it reaches cascade through " +
+			"/api/recover auto-detection — so the reader here is an external client.)")
+	}
+}
+
+// The clock must start AFTER the bundle resolves.
+//
+// This is the half of the documented boundary that nothing else pins.
+// TestRecoverReportsGenerationTime proves `start` is BEFORE the fetch (the
+// delayed fixture has to land inside it); nothing proved it is AFTER
+// resolveOr. Moving the declaration one line up keeps every other test green
+// while making the docs false — /api/recover would bill a lazily-opened
+// registry connection (a 10s TCP dial ceiling) as generation time, so the
+// first request after switching servers reports a dial the operator did not
+// ask about.
+//
+// Source-level for the same reason the cascade guard is: reproducing a cold
+// connManager open in a unit test means faking the registry, and the ordering
+// IS the contract.
+func TestTimerStartsAfterBundleResolution(t *testing.T) {
+	for _, tc := range []struct{ file, fn string }{
+		{"api.go", "func (s *Server) handleRecover("},
+		{"recover_cascade.go", "func (s *Server) handleRecoverCascade("},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			data, err := os.ReadFile(tc.file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			src := string(data)
+			i := strings.Index(src, tc.fn)
+			if i < 0 {
+				t.Fatalf("%s is gone from %s — this guard covers nothing", tc.fn, tc.file)
+			}
+			body := src[i:]
+			if j := strings.Index(body[1:], "\nfunc "); j > 0 {
+				body = body[:j+1]
+			}
+			resolve := strings.Index(body, "s.resolveOr(w, r)")
+			start := strings.Index(body, "start := time.Now()")
+			if resolve < 0 {
+				t.Fatalf("no resolveOr call in %s — the handler shape changed", tc.fn)
+			}
+			if start < 0 {
+				t.Fatalf("no timer in %s", tc.fn)
+			}
+			if start < resolve {
+				t.Errorf("%s starts its timer BEFORE resolveOr. docs/console.md promises "+
+					"generated_in_ms excludes selecting and opening the target server's connection; "+
+					"above resolveOr it bills a lazy connection open (10s dial ceiling) as generation "+
+					"time, and the first request after a server switch reports a dial.", tc.fn)
+			}
+		})
 	}
 }
 
