@@ -2,20 +2,25 @@ package console
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
 
-// motionSection returns the #1385 motion block of style.css.
+// motionSection returns the #1385 motion block of style.css, bounded at the
+// next section header.
 //
-// Scoped to that section on purpose. An earlier version of this guard tried to
-// police the WHOLE stylesheet and got it wrong: the file legitimately uses
-// three different shapes (a no-preference block, a dedicated reduce block that
-// sets animation:none for the same selector, and duration scaling), and a
-// checker that knows only the first manufactures findings against correct
-// code. A guard that cries wolf is worse than no guard. The pre-existing
-// unguarded animations that audit did surface are filed separately rather than
-// silently absorbed here.
+// Bounded, not "to end of file": an unbounded tail would silently extend both
+// guards over any section appended later, so a perfectly ordinary future
+// section that sets `background:` would fail the color guard here.
+//
+// Scoped to this section rather than the whole stylesheet, and that is
+// deliberate. An earlier version audited the entire file and produced seven
+// findings, several against correct code: style.css legitimately uses three
+// shapes for reduced motion (a no-preference block; a dedicated reduce block
+// setting animation:none for the same selector; duration scaling), and a
+// checker that knows only the first cries wolf. The pre-existing unguarded
+// animations that audit did surface are filed as #1392, not absorbed here.
 func motionSection(t *testing.T) string {
 	t.Helper()
 	data, err := os.ReadFile("assets/style.css")
@@ -28,71 +33,181 @@ func motionSection(t *testing.T) string {
 	if i < 0 {
 		t.Fatal("the #1385 motion section header is gone — this guard no longer covers anything")
 	}
-	return css[i:]
+	section := css[i:]
+	// The next "/* ====" banner, if any, ends this section.
+	if j := strings.Index(section, "/* ======"); j > 0 {
+		section = section[:j]
+	}
+	return section
 }
+
+// animDeclRE matches the shorthand and the longhand. The shorthand alone was a
+// hole: `animation-name: x` outside the guard escaped entirely.
+var animDeclRE = regexp.MustCompile(`animation(-name)?\s*:`)
 
 // Every animation this section adds must sit inside its reduced-motion guard.
 //
-// The failure mode is invisible to the author: someone whose own OS setting is
+// The failure mode is invisible to the author: anyone whose own OS setting is
 // "no preference" — nearly everyone — sees an unguarded rule work perfectly.
 // The console is opened during incidents, so honouring the setting is not a
 // nicety.
 func TestMotionSectionIsReducedMotionGuarded(t *testing.T) {
 	section := motionSection(t)
 
-	const guard = "@media (prefers-reduced-motion: no-preference)"
-	g := strings.Index(section, guard)
-	if g < 0 {
+	guarded := noPreferenceRanges(t, section)
+	if len(guarded) == 0 {
 		t.Fatal("the #1385 motion section has no prefers-reduced-motion: no-preference block")
 	}
-	open := strings.Index(section[g:], "{")
-	if open < 0 {
-		t.Fatal("malformed no-preference block in the #1385 motion section")
-	}
-	depth, end := 0, g+open
-	for ; end < len(section); end++ {
-		if section[end] == '{' {
-			depth++
-		} else if section[end] == '}' {
-			depth--
-			if depth == 0 {
-				break
-			}
-		}
-	}
 
-	for idx, line := range strings.Split(section, "\n") {
-		if !strings.Contains(line, "animation:") {
+	for _, m := range animDeclRE.FindAllStringIndex(section, -1) {
+		if inRanges(guarded, m[0]) {
 			continue
 		}
-		// Offset of this line within the section.
-		off := 0
-		for i, l := range strings.Split(section, "\n") {
-			if i == idx {
-				break
-			}
-			off += len(l) + 1
-		}
-		if off < g || off > end {
-			t.Errorf("the #1385 motion section animates outside its reduced-motion guard:\n  %s\n"+
-				"Move the rule inside @media (prefers-reduced-motion: no-preference).", strings.TrimSpace(line))
-		}
+		line := strings.TrimSpace(lineAt(section, m[0]))
+		t.Errorf("the #1385 motion section animates outside its reduced-motion guard:\n  %s\n"+
+			"Move the rule inside @media (prefers-reduced-motion: no-preference).", line)
 	}
 }
 
-// The motion section must not introduce color. The brand palette's "never
-// encode data" boundary and the semantic INSERT/UPDATE/DELETE tokens are
-// decided in :root; a decorative rule repainting a data surface would undo
-// that quietly, and "make it feel alive" is exactly the change that invites it.
+// noPreferenceRanges returns the byte ranges of EVERY no-preference block in
+// the section.
+//
+// Two failures the single-block version had, both demonstrated by review:
+// it took only the FIRST such block, so adding a second — an ordinary edit —
+// reported its contents as unguarded; and if the brace scan never returned to
+// depth 0 it left `end` at the section end, at which point nothing could be
+// flagged and the guard failed OPEN. One `{` inside a comment or a
+// `content: "{"` string was enough. Unbalanced braces are now a hard failure
+// rather than a silent pass.
+func noPreferenceRanges(t *testing.T, section string) [][2]int {
+	t.Helper()
+	const needle = "@media (prefers-reduced-motion: no-preference)"
+	var out [][2]int
+	for i := 0; ; {
+		j := strings.Index(section[i:], needle)
+		if j < 0 {
+			return out
+		}
+		start := i + j
+		open := strings.Index(section[start:], "{")
+		if open < 0 {
+			t.Fatalf("no-preference block at offset %d has no opening brace", start)
+		}
+		depth, k := 0, start+open
+		closed := false
+		for ; k < len(section); k++ {
+			switch section[k] {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					closed = true
+				}
+			}
+			if closed {
+				break
+			}
+		}
+		if !closed {
+			t.Fatalf("unbalanced braces in the no-preference block at offset %d — this guard "+
+				"cannot tell guarded from unguarded here, so it fails loudly instead of passing", start)
+		}
+		out = append(out, [2]int{start, k})
+		i = k + 1
+	}
+}
+
+func inRanges(ranges [][2]int, pos int) bool {
+	for _, r := range ranges {
+		if pos >= r[0] && pos <= r[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func lineAt(s string, pos int) string {
+	start := strings.LastIndexByte(s[:pos], '\n') + 1
+	end := strings.IndexByte(s[pos:], '\n')
+	if end < 0 {
+		return s[start:]
+	}
+	return s[start : pos+end]
+}
+
+// The motion section must not move color. The brand palette's "never encode
+// data" boundary and the semantic INSERT/UPDATE/DELETE tokens are decided in
+// :root; a decorative rule repainting a data surface would undo that quietly,
+// and "make it feel alive" is exactly the change that invites it.
+//
 // box-shadow is the documented exception: it carries a color but paints depth,
 // not meaning.
 func TestMotionSectionAnimatesGeometryOnly(t *testing.T) {
-	section := motionSection(t)
-	for _, prop := range []string{"color:", "background:", "background-color:", "border-color:", "fill:", "stroke:"} {
+	// Comments stripped first: these needles are PROPERTY NAMES, and the
+	// section's own commentary explains why several of them are absent — the
+	// note about not using opacity contains the literal "opacity:". Matching
+	// raw text fires on the explanation, which is how the first run of this
+	// guard failed.
+	section := stripCSSComments(motionSection(t))
+
+	// `color:` substring-matches every *-color longhand (border-color,
+	// outline-color, accent-color, caret-color, text-decoration-color).
+	banned := []string{
+		"color:",
+		"background:", "background-image:",
+		"filter:", "backdrop-filter:",
+		"text-shadow:", "mix-blend-mode:",
+		// Shorthands that carry a color.
+		"border:", "outline:",
+	}
+	for _, prop := range banned {
 		if strings.Contains(section, prop) {
-			t.Errorf("the motion section sets %q. It is limited to transform/opacity/shadow: "+
+			t.Errorf("the motion section sets %q. It is limited to transform and box-shadow: "+
 				"repainting a surface here can silently break the semantic DELETE=red mapping or the "+
 				"contrast floors the palette comment pins.", prop)
 		}
+	}
+
+	// opacity is banned here for a different reason than the colors above, so
+	// it gets its own message. Overview replaces tiles as fetches land; a tile
+	// whose entrance starts transparent flashes at every replaceWith, and
+	// style.css:467 already states the invariant for `rise` — content is
+	// ALWAYS visible.
+	if strings.Contains(section, "opacity:") {
+		t.Error("the motion section animates opacity. Tiles are REPLACED as their fetch lands, so an " +
+			"entrance that starts transparent flashes on every swap; keep the entrance transform-only, " +
+			"as `rise` is.")
+	}
+
+	// The highest-impact miss the property list cannot catch: redefining a
+	// custom property here repaints its token EVERYWHERE, which is precisely
+	// what this guard exists to prevent.
+	// Not anchored to line start: `transform: translateX(2px); --delete: red;`
+	// is valid CSS on one line, and an anchored pattern missed it — verified by
+	// mutation. `var(--ease)` cannot match because the colon is required.
+	if regexp.MustCompile(`--[a-z0-9-]+\s*:`).MatchString(section) {
+		t.Error("the motion section redefines a custom property. A `--delete:` or `--panel-bg:` here " +
+			"repaints that token across the whole console — the exact failure this guard exists to " +
+			"prevent, and invisible to a property-name check.")
+	}
+}
+
+// stripCSSComments removes /* … */ blocks. CSS has no line comments, so this
+// is the whole grammar that matters here.
+func stripCSSComments(css string) string {
+	var b strings.Builder
+	for {
+		i := strings.Index(css, "/*")
+		if i < 0 {
+			b.WriteString(css)
+			return b.String()
+		}
+		b.WriteString(css[:i])
+		j := strings.Index(css[i:], "*/")
+		if j < 0 {
+			return b.String()
+		}
+		css = css[i+j+2:]
 	}
 }

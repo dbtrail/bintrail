@@ -1882,39 +1882,59 @@ button { font-family: inherit; }
    Motion: chrome only (#1385)
 
    The console is opened when something has gone wrong — someone is tracing a
-   bad DELETE. Delight lives in the chrome: navigation, tiles, headers.
-   Data surfaces (rows, diffs, badges, the numbers under inspection) stay calm
-   and are deliberately untouched here.
+   bad DELETE. Delight lives in the chrome: navigation, tiles, headers. Data
+   surfaces (rows, diffs, badges, the numbers under inspection) stay calm and
+   are deliberately untouched here.
 
-   Two rules this section must keep:
-   - No color moves. The semantic INSERT/UPDATE/DELETE tokens and the brand
-     palette's "never encode data" boundary are set above and stay set; every
-     rule below animates transform, opacity or shadow only.
-   - Everything is inside prefers-reduced-motion: no-preference, following the
-     pattern the rest of this file already uses. With motion off the page must
-     lose nothing but the movement.
+   Rules this section keeps:
+   - No color moves, and no custom-property redefinition. The semantic
+     INSERT/UPDATE/DELETE tokens and the brand palette's "never encode data"
+     boundary are set in :root and stay set.
+   - Everything animated sits inside prefers-reduced-motion: no-preference.
+     With motion off the page loses movement and nothing else.
    ============================================================ */
 
-/* Transitions live OUTSIDE the media query on purpose: a hover lift with
-   motion reduced should still change state, just instantly. Only the
-   transition timing is motion; the state change is feedback. */
-.ov-stat { transition: transform .22s var(--ease), box-shadow .22s var(--ease); }
-
 @media (prefers-reduced-motion: no-preference) {
-  /* Tiles rise as their fetch lands. No stagger delay: Overview replaces each
-     tile independently as its own request resolves, so the arrival order IS
-     the stagger. A fixed delay would instead hold an already-loaded tile
-     invisible (animation-fill-mode: both) waiting for its slot. */
-  .ov-stat { animation: fadeup .38s var(--ease) both; }
+  /* Tiles rise as their fetch lands.
+     
+     TRANSFORM ONLY, and no fill-mode — both are load-bearing.
+     
+     No opacity: :467 states the invariant for `rise` ("content is ALWAYS
+     visible"), and a tile that starts transparent flashes on every
+     replaceWith as Overview swaps skeletons for values.
+     
+     No `both`/`forwards`: a filling animation keeps contributing
+     `transform: none` after it ends, and animations outrank normal author
+     declarations — which silently killed the hover lift below. Measured in
+     Chrome: hovered transform was matrix(1,0,0,1,0,0) with the fill, and
+     translateY(-3px) without it. `rise` ends at the element's natural
+     transform, so nothing needs filling. A hover landing inside the first
+     380ms still will not lift, because a RUNNING animation outranks author
+     rules too; at 380ms that is a shrug, not a bug.
+     
+     Reuses the existing `rise` keyframe rather than adding one. */
+  .ov-stat { animation: rise .38s var(--ease-out); }
 
+  /* Inside the guard with the state it times. An earlier draft kept this
+     outside on the theory that "a hover lift with motion reduced should still
+     change state, just instantly" — but the :hover rule is itself guarded, so
+     under reduce there is no state change for a transition to time and the
+     rationale described something that could not happen. */
+  .ov-stat { transition: transform .22s var(--ease), box-shadow .22s var(--ease); }
   .ov-stat:hover {
     transform: translateY(-3px);
     box-shadow: 0 12px 26px -14px oklch(0.4 0.06 305 / 0.42), var(--panel-shadow);
   }
 
-  /* Nav: the icon leads the eye toward the destination. 2px — enough to feel
-     responsive, small enough that a mouse crossing the sidebar does not
-     ripple. */
-  .nav-item .ni-icon { transition: transform .18s var(--ease); }
+  /* Nav: the icon leads the eye toward the destination. 2px — responsive
+     without rippling as a mouse crosses the sidebar.
+
+     No `transition` declaration here on purpose. :385 already transitions
+     both color and transform on this exact selector, and `transition` is a
+     SHORTHAND: re-declaring it later in the file reset transition-property to
+     `transform` alone, so the icon's color snapped instantly for every
+     no-preference user. The section whose first rule is "no color moves" had
+     changed color behaviour, and the color guard could not see it because the
+     line contained no color property. */
   .nav-item:hover .ni-icon { transform: translateX(2px); }
 }
