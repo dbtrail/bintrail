@@ -144,9 +144,14 @@ and searching events:
    permanently lost" record when an unfillable gap (or a lost PostgreSQL slot)
    was detected. Both fire for any source family. See
    [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
-6. **Settings** (under `watch` only) — **Storage** (rotation policy,
-   per-source S3 archiving, baseline snapshots, AWS credential signals, and a
-   usage-telemetry opt-out — see
+6. **Protect** (under `watch` only) — **Baselines** (the selected server's
+   snapshot listing, plus **Create baseline**) and **Verification** (run
+   `bintrail verify` and read past runs). These produce and validate the
+   artifacts a restore depends on, so they are operations rather than
+   settings; they lived on the Storage page until they outgrew it.
+7. **Settings** (under `watch` only) — **Storage** (rotation policy,
+   per-source S3 archiving, a baseline summary card, AWS credential signals,
+   and a usage-telemetry opt-out — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
    rotation dialog).
 
@@ -340,8 +345,10 @@ editing flags or restarting:
 ### The Storage page
 
 Under `watch` the sidebar grows a **Settings → Storage** page that gathers
-everything S3/baseline-related in one place (it was previously scattered
-across the rotation dialog and the per-server edit form):
+storage policy in one place (it was previously scattered across the rotation
+dialog and the per-server edit form). The full baseline listing and the
+verification runner moved to their own **Protect** group; Storage keeps a
+compact baseline summary card and links onward:
 
 - **Rotation** — the effective policy (override vs daemon defaults) with an
   edit shortcut to the rotation dialog.
@@ -436,7 +443,7 @@ ambient credential chain, scoped to the allowed prefixes.
 By default the console only *lists* baselines — you produce them with the
 `bintrail dump` → `bintrail baseline` CLI (or the compose `baseline` profile).
 A **Create baseline** button can run that pipeline for a monitored server
-straight from the Storage page, and it only runs on the `watch` daemon:
+straight from the **Protect → Baselines** page, and it only runs on the `watch` daemon:
 
 - A bare `watch` invocation (no compose) has this **opt-in** and off by
   default — start it with `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`. The bundled
@@ -652,7 +659,7 @@ see the metrics tables and example alert rules in
   [Running verification from the console](#running-verification-from-the-console)).
 - `BINTRAIL_CONSOLE_VERIFY_TABLES` (`watch` only) — same as `--verify-tables`.
 - `BINTRAIL_CONSOLE_VERIFY_TRIGGER` (`watch` only) — `1`/`true` enables the
-  Storage page's **Verification** panel (runs `bintrail verify` in-process;
+  **Protect → Verification** page (runs `bintrail verify` in-process;
   see [Running verification from the console](#running-verification-from-the-console)).
   Off by default for a bare `watch` invocation; the bundled compose stack sets
   this on by default (see [docker.md](docker.md) — `VERIFY_TRIGGER=0` in

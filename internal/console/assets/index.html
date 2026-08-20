@@ -82,6 +82,25 @@
             <span>Status</span>
           </a>
         </div>
+        <!-- Protect group (#1384). Baselines and verification used to be two of
+             three panels on Settings > Storage, which was a category error —
+             Create baseline and Run verification are operations that produce
+             and validate recovery artifacts, not settings — and a layout
+             problem: the snapshot list is unbounded, so it pushed verification
+             far below the fold. Same per-item monitor gate as Storage: both
+             read watch-daemon state, so on a standalone serve the whole group
+             collapses to nothing rather than showing dead entries. -->
+        <div class="nav-group">
+          <div class="nav-label">Protect</div>
+          <a class="nav-item" data-route="baselines" href="/baselines" data-capability="monitor">
+            <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 3 7l9 5 9-5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></span>
+            <span>Baselines</span>
+          </a>
+          <a class="nav-item" data-route="verification" href="/verification" data-capability="monitor">
+            <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v6c0 4.4 3.2 8.2 8 9 4.8-.8 8-4.6 8-9V6l-8-3z"/><path d="m9 12 2 2 4-4"/></svg></span>
+            <span>Verification</span>
+          </a>
+        </div>
         <!-- Settings group. Storage and Rotation exist only on the watch
              daemon (the process that runs rotation and archiving) — gated
              per-item like the Time-travel item, so the always-available

@@ -49,7 +49,13 @@ const EVENT_EXPORT_MAX = 1000;
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "timetravel", "recover", "sql", "status", "storage", "connect"];
+const ROUTES = ["overview", "events", "timetravel", "recover", "sql", "status", "storage", "connect",
+  // Protect (#1384): baselines and verification used to be two of three panels
+  // on Settings > Storage. They are operations that produce and validate
+  // recovery artifacts, not settings, and the snapshot list is unbounded in
+  // practice — it pushed verification, the panel that answers "are my backups
+  // restorable", roughly two screens below the fold.
+  "baselines", "verification"];
 
 const MON_STATE_TITLES = {
   failed: "connection is failing and retrying automatically; press Start for details",
@@ -810,6 +816,10 @@ function navigate(route, params, push = true) {
   if (route === "timetravel") route = "recover";
   // Storage is a watch-daemon surface (rotation + archiving live there).
   if (route === "storage" && !capsCache.monitor) route = "overview";
+  // Protect shares that gate: both routes read watch-daemon state (the
+  // snapshot listing and the verification runner). Same treatment, so a
+  // bookmark to either lands on Overview rather than an empty page.
+  if ((route === "baselines" || route === "verification") && !capsCache.monitor) route = "overview";
   // The SQL panel is opt-in (BINTRAIL_CONSOLE_SQL_PANEL) and per-server gated.
   if (route === "sql" && !capsCache.sql) route = "overview";
   const qs = params && Object.keys(params).length
@@ -855,6 +865,8 @@ function renderRoute() {
     case "sql": return renderSQL();
     case "status": return renderStatus();
     case "storage": return renderStorage();
+    case "baselines": return renderBaselines();
+    case "verification": return renderVerification();
     case "connect": return renderConnect();
     default: return renderOverview();
   }
@@ -3206,12 +3218,73 @@ function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
   cards.append(baselineSummaryCard(baselines, cur));
   v.append(cards);
 
+  // Storage keeps storage POLICY. Baselines and verification moved to their
+  // own routes (#1384): the snapshot list is unbounded, so it used to push
+  // verification off the fold, and verifyPanel needed a both-columns override
+  // to escape a grid built for two panels. baselineSummaryCard stays as the
+  // pointer — the count and age belong on a storage overview, the full list
+  // does not.
   const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
   grid.append(archivingPanel(servers, serversErr));
-  grid.append(baselinesPanel(baselines, servers));
-  grid.append(verifyPanel(servers));
   v.append(grid);
   viewEnter();
+}
+
+// ── Protect: baselines and verification (#1384) ──
+//
+// Both gate on capsCache.monitor and both use the replaceState + re-dispatch
+// pattern renderStorage/renderTimetravel share: a direct URL or Back with the
+// capability off must REWRITE the URL before re-rendering, or the address bar
+// keeps pointing at a view the session cannot show.
+
+async function renderBaselines() {
+  if (!capsCache.monitor) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
+  const gen = serverGen, vgen = viewGen;
+  viewLoading();
+  // Independent degradation, as on Storage: a panel renders its own failure
+  // note rather than one error blanking the page.
+  const asErr = (err) => ({ error: (err && err.message) || String(err) });
+  const [serversRes, baselines] = await Promise.all([
+    api("/api/servers").catch(asErr),
+    api("/api/baselines").catch(asErr),
+  ]);
+  if (gen !== serverGen || vgen !== viewGen) return;
+  try {
+    const servers = (serversRes && serversRes.servers) || [];
+    const v = VIEW(); clear(v);
+    v.append(pageHead("Baselines", el("p", { class: "page-sub" },
+      "Full-table snapshots Time-travel and full restores are built from. ",
+      el("b", { text: "Nothing is ever executed" }), " against your source by viewing this page.")));
+    const cards = el("div", { class: "cards" });
+    cards.append(baselineSummaryCard(baselines, servers.find((s) => s.id === (currentServer || defaultServerId))));
+    v.append(cards);
+    const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
+    grid.append(baselinesPanel(baselines, servers));
+    v.append(grid);
+    viewEnter();
+  } catch (err) {
+    const v = VIEW(); clear(v); v.append(pageHead("Baselines", null)); renderError(v, err);
+  }
+}
+
+async function renderVerification() {
+  if (!capsCache.monitor) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
+  const gen = serverGen, vgen = viewGen;
+  viewLoading();
+  const serversRes = await api("/api/servers").catch((err) => ({ error: (err && err.message) || String(err) }));
+  if (gen !== serverGen || vgen !== viewGen) return;
+  try {
+    const servers = (serversRes && serversRes.servers) || [];
+    const v = VIEW(); clear(v);
+    v.append(pageHead("Verification", el("p", { class: "page-sub" },
+      "Prove a snapshot still reconstructs what it claims — the check that answers whether a restore would actually work.")));
+    const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
+    grid.append(verifyPanel(servers));
+    v.append(grid);
+    viewEnter();
+  } catch (err) {
+    const v = VIEW(); clear(v); v.append(pageHead("Verification", null)); renderError(v, err);
+  }
 }
 
 function kvRow(card, k, val) {
@@ -3636,7 +3709,12 @@ async function createBaseline(id, btn) {
   } else {
     toast("Baseline still running — check back shortly.");
   }
-  if (location.pathname === "/storage") renderStorage();
+  // Create baseline now lives on /baselines (#1384) while the summary card
+  // still appears on /storage, so refresh whichever is on screen. Hardcoding
+  // /storage would leave the page that OWNS the button showing a stale list
+  // right after the run it started.
+  if (location.pathname === "/baselines") renderBaselines();
+  else if (location.pathname === "/storage") renderStorage();
 }
 
 // pollBaseline polls the per-server baseline status until it leaves "running"
@@ -3664,12 +3742,12 @@ async function pollBaseline(id) {
 // configured; verify_live_source: a source DSN is also configured), both
 // re-enforced server-side so this gating is UX only.
 function verifyPanel(servers) {
-  // Full-width: ov-grid is a 2-column grid (archiving | baselines) with
-  // align-items:start, and Baseline snapshots routinely runs much taller
-  // than S3 archiving (one row per snapshot) — a 3rd item left to the grid's
-  // normal auto-placement lands in row 2 col 1, floating under the SHORT
-  // sibling with a large dead gap to its right where the tall one still
-  // extends. Spanning both columns puts it in its own row instead.
+  // Full-width. This override was originally a workaround: verification was a
+  // third panel in a 2-column grid built for archiving | baselines, and with
+  // align-items:start it landed under the SHORT sibling with a dead gap beside
+  // the tall one. #1384 moved it to its own route, where it is the only panel,
+  // so the span is no longer compensating for anything — it is simply what a
+  // sole panel should do. Kept because the grid is still 2-column.
   const panel = el("section", { class: "ov-panel vfy-panel-full" });
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
   const head = el("div", { class: "ov-panel-head" }, el("h2", { class: "ov-panel-title", text: "Verification" }));
