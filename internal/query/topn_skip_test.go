@@ -44,6 +44,18 @@ func TestTopNSatisfiedLive(t *testing.T) {
 			why:  "the archives are all below the cutoff and cannot survive the limit",
 		},
 		{
+			// The sibling of the perPK case: an unread archive_state makes
+			// archivesBelowLive vacuously true over an empty hour list, so the
+			// plan claims the premise it never got to evaluate. Sources are
+			// resolved by a separate query and can still be present.
+			name: "archive coverage could not be read",
+			opts: Options{Limit: 100, Order: "DESC"},
+			rows: rowsAt(100, cutoffInside),
+			plan: &QueryPlan{ArchivesBelowLive: true, ArchiveCoverageUnavailable: true, MySQLRanges: []TimeRange{live}},
+			want: false,
+			why:  "a vacuous premise over an unread archive_state is not a premise",
+		},
+		{
 			name: "short page",
 			opts: Options{Limit: 100, Order: "DESC"},
 			rows: rowsAt(40, cutoffInside),
@@ -84,7 +96,7 @@ func TestTopNSatisfiedLive(t *testing.T) {
 				hourRange(24*time.Hour, 0, now),
 			}},
 			want: false,
-			why:  "two live ranges mean an archived hour can sit ABOVE the cutoff",
+			why:  "two live ranges mean the planner saw a hole in the live hours, so a filled page is\n\t\t\t\t\t\tnot provably the true top N whatever the archive layout is",
 		},
 		{
 			name: "cutoff below the live range",

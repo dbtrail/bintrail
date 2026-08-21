@@ -277,7 +277,7 @@ func topNSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
 	// read), so the hole was latent here and load-bearing in the sibling —
 	// closing only the sibling would have left the two reasoning differently
 	// about the same layout.
-	if plan == nil || len(plan.MySQLRanges) != 1 || !plan.ArchivesBelowLive {
+	if plan == nil || len(plan.MySQLRanges) != 1 || !plan.ArchivesBelowLive || plan.ArchiveCoverageUnavailable {
 		return false
 	}
 	// rows are already sorted newest-first, so the limit-th row is the cutoff.
@@ -356,6 +356,18 @@ func perPKSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
 	if len(names) == 0 {
 		return false
 	}
+	// Three requirements that look like one.
+	//
+	// ArchiveCoverageUnavailable is the third and the quietest: when the
+	// archive_state read fails for a reason other than a missing table, Plan
+	// hands buildPlan an EMPTY archive hour list, and archivesBelowLive then
+	// returns vacuously true over it. The plan would simultaneously say
+	// "coverage was never evaluated" and "every archived hour is below live".
+	// Sources can still have been resolved — that is a separate query — so this
+	// is reachable on a statement timeout or lock wait between the two round
+	// trips, and under AllowGaps the resulting gap hours are only a warning.
+	// Refusing the skip there costs an archive read on a degraded index.
+	//
 	// Two separate requirements that look like one.
 	//
 	// A single range says the LIVE hours have no interior hole —
@@ -372,7 +384,7 @@ func perPKSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
 	// complete, which is the worst output this package can produce.
 	// browsePlanFromHours has refused that layout since it was written; this
 	// path now refuses it too, rather than the two rules disagreeing.
-	if plan == nil || len(plan.MySQLRanges) != 1 || !plan.ArchivesBelowLive {
+	if plan == nil || len(plan.MySQLRanges) != 1 || !plan.ArchivesBelowLive || plan.ArchiveCoverageUnavailable {
 		return false
 	}
 
@@ -399,20 +411,25 @@ func perPKSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
 		}
 	}
 
-	// A belt, and labelled as one. This was the ORIGINAL fourth condition, and
-	// review showed it proves nothing: buildPlan sets Start to the oldest live
-	// partition HOUR, and a row in partition p_H has ts >= H, so a live row can
-	// essentially never fall below it. Believing it was the soundness argument
-	// is what let an archive sitting above the live range go unnoticed —
-	// ArchivesBelowLive, above, is the condition that actually carries the
-	// proof.
+	// The other half of the proof, and NOT redundant — an earlier revision of
+	// this comment called it that, and deleting the line fails
+	// TestPerPKSatisfiedLive in this same package.
 	//
-	// Kept anyway, because it is one comparison and it fails CLOSED. The one
-	// shape that reaches it is a backfilled event (#1037) whose timestamp
-	// undercuts its partition's label; the archives-below-live check already
-	// covers that case, so this is redundant rather than load-bearing. Removing
-	// a check on the strength of "I proved it cannot fire" is how the hole
-	// above got in, so it stays — demoted, not deleted.
+	// The two conditions guard opposite sides and neither subsumes the other.
+	// ArchivesBelowLive is computed from partition LABELS and archive hours; it
+	// never sees a row timestamp, so it structurally cannot see a backfilled
+	// event (#1037) sitting INSIDE the oldest live partition with a timestamp
+	// below that partition's label. Concretely: live {10:00, 11:00}, archived
+	// {09:00} — flag true — with PK "A" holding a normal row at 10:15 and a
+	// backfilled one at 08:30, while the archive holds an "A" row at 09:00. The
+	// true latest-2 is {10:15, 09:00}; the live-only latest-2 is {10:15, 08:30}.
+	// Only this comparison refuses that skip.
+	//
+	// It IS true that the shape is rare and that this fires almost never on a
+	// normally-rotated index. That was the whole content of the previous
+	// comment, and it was the wrong thing to emphasise: "I proved it cannot
+	// fire" is precisely the reasoning that let an archive above the live range
+	// go unchecked in the first version of this predicate.
 	return !oldest.Before(plan.MySQLRanges[0].Start)
 }
 

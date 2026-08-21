@@ -503,3 +503,55 @@ func TestMisfiledHours(t *testing.T) {
 		}
 	})
 }
+
+// The POSITIVE direction of ArchivesBelowLive, which the short-circuit tests
+// cannot cover: every one of those hands the predicate a plan literal with the
+// flag it chose, so hardwiring buildPlan to `false` left the entire repo green
+// while quietly disabling the optimization the whole feature exists for. A
+// silently absent speed-up is a worse failure than a noisy one — nothing tells
+// the operator the 0.3s path became 27.6s.
+//
+// The interleaved case is here for a different mutation: swapping the
+// reference point from the OLDEST live hour to the newest also survived
+// everything else. Newest would be unsound exactly on the layout the feature
+// refuses — an archived-but-not-dropped hour whose live partition was later
+// truncated — so the doc's "oldest live partition hour" needs a test that
+// distinguishes them, and only an archive sitting BETWEEN live hours does.
+func TestBuildPlanComputesArchivesBelowLive(t *testing.T) {
+	var live []time.Time
+	for i := 10; i <= 17; i++ {
+		live = append(live, h(5, i))
+	}
+	tests := []struct {
+		name     string
+		archived []time.Time
+		want     bool
+		why      string
+	}{
+		{"strictly below live", []time.Time{h(5, 8), h(5, 9)}, true,
+			"the ordinary rotated index — this is the layout the short-circuit exists for, " +
+				"and a flag stuck at false disables it everywhere with no signal"},
+		{"no archives at all", nil, true,
+			"nothing to skip, so the premise holds vacuously"},
+		{"one archived hour above the live range", []time.Time{h(5, 18)}, false,
+			"a restored index or a rotate that archived without dropping — the archive can hold " +
+				"rows newer than anything live"},
+		{"archived hour interleaved between live hours", []time.Time{h(5, 13)}, false,
+			"below the NEWEST live hour but not below the oldest; a reference point of newest " +
+				"would call this safe and it is not"},
+		{"archived hour equal to the oldest live hour", []time.Time{h(5, 10)}, false,
+			"strictly below, not at-or-below: the same hour on both sides means the partition " +
+				"was archived and not dropped"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := buildPlan(live, tc.archived, h(5, 8), h(5, 20), false)
+			if plan == nil {
+				t.Fatal("buildPlan returned nil")
+			}
+			if plan.ArchivesBelowLive != tc.want {
+				t.Errorf("ArchivesBelowLive = %v, want %v — %s", plan.ArchivesBelowLive, tc.want, tc.why)
+			}
+		})
+	}
+}

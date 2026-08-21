@@ -121,7 +121,22 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			rows: pkRowsAt("42", 1, inside),
 			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live, hourRange(72*time.Hour, 48*time.Hour, now)}},
 			want: false,
-			why:  "an archived hour could sit between them, above the kept row",
+			why:  "two live ranges mean the planner saw a hole in the live hours; what fills it is not\n\t\t\t\t\t\tknowable from here, so no live result proves anything about the span above it",
+		},
+		{
+			// Plan sets this when the archive_state read fails for a reason
+			// other than a missing table, and then hands buildPlan an EMPTY
+			// hour list — over which archivesBelowLive is vacuously true. The
+			// plan would say "coverage was never evaluated" and "every
+			// archived hour is below live" at the same time. Sources come
+			// from a SEPARATE query, so they can still be resolved and
+			// waiting to be skipped.
+			name: "archive coverage could not be read",
+			opts: Options{LimitPerPK: 1, PKValues: "42"},
+			rows: pkRowsAt("42", 1, inside),
+			plan: &QueryPlan{ArchivesBelowLive: true, ArchiveCoverageUnavailable: true, MySQLRanges: []TimeRange{live}},
+			want: false,
+			why:  "a vacuous premise over an unread archive_state is not a premise",
 		},
 		{
 			name: "no plan",
