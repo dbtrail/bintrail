@@ -2258,14 +2258,26 @@ try {
   // unconditionally keeps the count at one and leaves every text guard green.
   // Verified by mutation, which is why this scenario exists.
   //
-  // What is at stake is not decoration. The gradient's stops measure 3.70:1 to
-  // 5.16:1 on white, so they clear WCAG's LARGE-text bar of 3:1 and none of
-  // them clears the 4.5:1 body bar. A tile that takes the gradient without
-  // being large text is unreadable, and the deletes tile additionally carries
-  // the semantic --delete that the brand palette must never repaint.
+  // What is at stake is not decoration. A gradient has to satisfy its contrast
+  // bar at every point along the sweep, and this one dips to 3.70:1 on the
+  // tile ground it actually paints on — so it can be relied on at WCAG's
+  // LARGE-text bar of 3:1 and never at the 4.5:1 body bar. (Its violet stop
+  // alone would clear 4.5:1; that buys nothing, the other stops share the
+  // sweep.) A tile that takes the gradient without being large text is
+  // unreadable, and the deletes tile additionally carries the semantic
+  // --delete that the brand palette must never repaint.
   //
   // ovStat is called for real rather than synthesised: the gate lives inside
   // it, so a hand-built div would test the stylesheet and skip the bug.
+  //
+  // Two things this deliberately does NOT reach, so nobody reads more into a
+  // green run than it earns. The scenario passes "danger" itself, so it proves
+  // the GATE honours the modifier and not that fillOvEvents still sends one —
+  // drop that argument at its call site and the deletes tile takes the
+  // gradient with every check green. And the tiles are mounted on document.body
+  // rather than inside a rendered Overview, so a rule scoped to an .ov-stats
+  // or .view ancestor is invisible here in both directions. The wordmark
+  // assertion below has neither limit: it reads the real element in place.
   const brandProbe = () => page.evaluate(() => {
     const host = document.createElement("div");
     document.body.appendChild(host);
@@ -2278,8 +2290,11 @@ try {
     const danger = tile("7", "deletes", "danger");
     // The `small` variant is built inline in fillOvEvents, not through ovStat.
     // Mirrored here because it is the surface the gradient would hurt MOST:
-    // 19px at weight 500 is body text, so it is held to 4.5:1, which no stop
-    // in this gradient reaches.
+    // 19px at weight 500 is body text, held to 4.5:1, which the sweep as a
+    // whole does not hold. It is also the exclusion the CSS cascade does NOT
+    // protect — `.ov-stat-v.small` sets no colour, so the gradient rule would
+    // win outright. The gate in ovStat is the only thing standing there, which
+    // is precisely why this row is asserted.
     const small = el("div", { class: "ov-stat-v small", text: "2026-08-20 11:00:00" });
     host.appendChild(small);
     // A reference for the semantic colour, computed through the same pipeline
@@ -2296,6 +2311,8 @@ try {
       dangerColor: cs(danger).color,
       smallImage: cs(small).backgroundImage,
       smallColor: cs(small).color,
+      wordImage: cs(document.querySelector(".brand-name")).backgroundImage,
+      wordColor: cs(document.querySelector(".brand-name")).color,
       deleteRef: cs(ref).color,
     };
     host.remove();
@@ -2316,6 +2333,13 @@ try {
   (brand.smallImage === "none" && brand.smallColor !== transparent)
     ? ok("brand paint: the 19px/500 timestamp tile is left as plain readable ink")
     : bad("brand paint: the 19px/500 timestamp tile is left as plain readable ink", JSON.stringify(brand));
+  // The other painted surface. Read off the REAL sidebar wordmark rather than
+  // a copy — it is static markup that has been on screen since the first
+  // navigation, so there is nothing to synthesise. Dropping .brand-name from
+  // the gradient rule used to leave every check green.
+  (brand.wordImage.includes("gradient") && brand.wordColor === transparent)
+    ? ok("brand paint: the sidebar wordmark wears the headline gradient")
+    : bad("brand paint: the sidebar wordmark wears the headline gradient", JSON.stringify(brand));
 
   // ── Scenario 18 — advisory severity split on the archive fixture (#1365) ──
   // The archive-elision record must render in the INFO register (muted line,

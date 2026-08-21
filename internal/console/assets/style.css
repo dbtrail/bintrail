@@ -1979,28 +1979,47 @@ button { font-family: inherit; }
 
    The site's headline gradient, brought into the console's two most
    chrome-like surfaces. It gets its own section because the motion section
-   above is transform-and-shadow only, by a rule its guard enforces — so the
-   PAINT half of "make it feel alive" has nowhere to live up there.
+   above is limited to transform and box-shadow by a guard that bans paint
+   properties — so the PAINT half of "make it feel alive" has nowhere to live
+   up there.
 
    This section holds the same line the motion section holds, drawn for colour
    instead of movement: brand paint decorates chrome and never encodes
-   anything. It goes on the sidebar wordmark and, uniformly, on the Overview
-   counts. It does NOT go on the Restore-coverage card, whose whole job is to
-   state degradation in red and amber — a warm wash behind "Events were
-   permanently lost" competes with the most important alarm this console has.
-   It does not go on rows, diffs or badges.
+   anything. It goes on the sidebar wordmark and on the LARGE Overview counts.
+   It does NOT go on the Restore-coverage card, whose whole job is to state
+   degradation in red and amber — a warm wash behind "Events were permanently
+   lost" competes with the most important alarm this console has. It does not
+   go on rows, diffs or badges.
 
-   WCAG, measured against white rather than assumed. The gradient's stops run
-   3.70:1 (--brand-warm-b) to 5.16:1 (--brand-canvas-3), so a surface here must
-   clear the LARGE-text bar of 3:1 and may never rely on the 4.5:1 body bar.
-   The two 19px elements in this console land on opposite sides of that bar,
-   which is the entire reason the gradient is opt-in rather than a rule on
-   .ov-stat-v:
+   WCAG. The gradient may only land on LARGE text, held to 3:1, and can never
+   be relied on at the 4.5:1 body bar — a gradient has to satisfy its bar at
+   every point along the sweep, and this one dips to 3.70:1 at --brand-warm-b.
+   (Its violet stop alone would clear 4.5:1. That buys nothing: the other two
+   stops are on the same sweep.)
+
+   Measured against the grounds these rules actually paint on, rather than
+   against white — white is the assumption easiest to make here and none of the
+   shipped grounds IS white:
+
+     ground                             warm-a  warm-b  canvas-3
+     white (not a shipped ground)        3.92    3.70     5.16
+     --surface-2, the .ov-stat tile      3.75    3.54     4.93
+     the studio sidebar, the wordmark    3.82    3.60     5.02
+
+   So the real floor is 3.54:1, still clear of 3:1.
+
+   Which surfaces qualify is the whole reason the gradient is OPT-IN rather
+   than a rule on .ov-stat-v. The two 19px elements in this console land on
+   opposite sides of the large-text bar:
 
      .brand-name       19px / 700  bold and >=18.66px  -> large text.  ok
      .ov-stat-num      32px / 600  >=24px              -> large text.  ok
      .ov-stat-v.small  19px / 500  NOT bold            -> body text.   excluded
-     .ov-stat-v.danger colour is --delete              -> semantic.    excluded
+     .ov-stat-v.danger colour is semantic              -> excluded
+
+   The metrics in the first two rows are declared by .brand-name and by
+   .ov-stat-v respectively; .ov-stat-num carries no font rules of its own and
+   only ever rides along on an .ov-stat-v.
 
    Nothing here animates, so there is nothing for prefers-reduced-motion to
    gate. Anything added here that MOVES belongs in the motion section instead.
@@ -2008,36 +2027,46 @@ button { font-family: inherit; }
 
 /* Clipping a gradient to text means painting the ink transparent, and that is
    the whole risk of the technique: wherever the clip does not take effect the
-   text is GONE, not merely unstyled. One query carries that risk, and it is
-   not decorative: @supports puts the declaration that hides the ink behind
-   proof that paint arrives to replace it.
+   text is GONE, not merely unstyled. @supports is what keeps the declaration
+   that hides the ink behind evidence that the engine can paint over it.
 
-   There is deliberately NO forced-colors companion, which is worth stating
-   because the opposite looks obviously right. The worry — Windows High
-   Contrast strips the gradient, the transparent ink survives alone, the text
-   disappears — turns out to be unreachable: `color` is itself one of the
-   properties forced-colors replaces, so the ink can never be left transparent.
-   Measured in Chromium rather than argued: under forced-colors the computed
-   pair is background-image `none` with color `rgb(0, 0, 0)`, BYTE-IDENTICAL
-   with and without a reset block. A reset here would be a rule no change can
-   affect. (The @supports test above is not the same case: nothing in the
-   platform substitutes for it, and its correctness follows from the at-rule's
-   own semantics rather than from a measurement — if the condition is false the
-   ink is simply never made transparent.)
+   Evidence about the ENGINE, and only that: an @supports test cannot notice
+   that --brand-headline stopped resolving, which computes to the same
+   invisible pair. Scenario 17e in console-e2e is what sees that one.
 
-   Deliberately NOT -webkit-text-fill-color, though that is the more common
+   There is deliberately no forced-colors companion, worth writing down because
+   adding one looks obviously right. The worry — High Contrast strips the
+   gradient, the transparent ink survives alone, the text disappears — does not
+   reach: `color` is itself one of the properties forced-colors substitutes, so
+   the ink is never left transparent. Measured under Chromium's LIGHT
+   forced-colors palette, the computed pair is an absent background image with
+   an opaque colour, identical with and without a reset block — so a reset here
+   would have been a rule no change could affect. One engine and one palette,
+   but the substitution is the spec's behaviour rather than Chromium's. What
+   WOULD reopen it is a `forced-color-adjust: none` above these elements;
+   nothing in this file sets one.
+
+   Deliberately NOT -webkit-text-fill-color, though it is the more common
    incantation: it overrides `color` outright, which would break the
-   degradation described below — and it would also defeat the forced-colors
-   substitution this section is relying on. Plain `color: transparent` is
-   enough in every engine that satisfies the @supports test. */
+   degradation described below — and, by the same mechanism, would likely
+   defeat the forced-colors substitution as well. That second half is a
+   prediction from the spec's substituted-property list, not a measurement like
+   the paragraph above. Plain `color: transparent` suffices wherever the
+   @supports test passes. */
 @supports ((background-clip: text) or (-webkit-background-clip: text)) {
-  /* One class selector each, NOT .ov-stat-v.ov-stat-num — the low specificity
-     is load-bearing in both directions. It is enough to beat .ov-stat-v's own
-     `color` (equal specificity, earlier in the file), and it deliberately
-     LOSES to .ov-stat-v.danger. So a tile that wrongly received this class
-     would still be painted opaque --delete red, hiding the clipped gradient
-     behind its glyphs; the failure degrades to the correct colour instead of
-     to invisible text. Raising the specificity here inverts that. */
+  /* One class selector each, NOT .ov-stat-v.ov-stat-num. The low specificity
+     is deliberate: it is enough to beat .ov-stat-v's own `color` (equal
+     specificity, earlier in the file) and it LOSES to .ov-stat-v.danger — so a
+     danger tile that wrongly received this class is still painted opaque in
+     the semantic colour, hiding the clipped gradient behind its own glyphs.
+     Raising the specificity here inverts that.
+
+     That belt covers ONE of the two excluded rows above, which is worth being
+     precise about rather than claiming as a property of the design.
+     .ov-stat-v.small sets no `color` at all, so this rule would win outright
+     and render 19px body text as transparent ink over the gradient — exactly
+     the unreadable outcome this section exists to prevent. `small` is
+     protected by the gate in ovStat and by nothing else. */
   .brand-name,
   .ov-stat-num {
     background-image: var(--brand-headline);
@@ -2045,4 +2074,15 @@ button { font-family: inherit; }
     background-clip: text;
     color: transparent;
   }
+
+  /* The clip paints the BOX, not the glyphs. .brand-name is a flex item and so
+     already shrink-to-fit, but .ov-stat-v is a block that fills its tile: a
+     two-digit count would sample only the leading sliver of a ramp stretched
+     across the full tile and render as flat pink, with the violet stop never
+     reaching the screen.
+
+     Scoped to the opt-in class and never to .ov-stat-v — the loading tile puts
+     a .skel-line INSIDE .ov-stat-v, and a shrink-to-fit parent would collapse
+     that skeleton to nothing. Same fix the login panel's title already uses. */
+  .ov-stat-num { width: fit-content; }
 }
