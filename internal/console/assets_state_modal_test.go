@@ -119,9 +119,7 @@ func TestStateResultsRenderInDialog(t *testing.T) {
 	// weakened by the next person to hit it, so the literals are blanked (not
 	// removed: blanking preserves every offset, so the reported line is still
 	// the real one).
-	code := regexp.MustCompile(`"[^"\n]*"`).ReplaceAllStringFunc(region, func(s string) string {
-		return `"` + strings.Repeat(" ", len(s)-2) + `"`
-	})
+	code := blankStringLiterals(region)
 	inline := regexp.MustCompile(`\b(out|warns)\b`)
 	for _, m := range inline.FindAllStringIndex(code, -1) {
 		// clear(out) / clear(warns) are the permitted mentions.
@@ -140,7 +138,14 @@ func TestStateResultsRenderInDialog(t *testing.T) {
 	// name only inside a string, where the identifier scan can no longer see
 	// it. Narrowing a guard is how false negatives get in.
 	for _, id := range []string{"state-out", "state-warnings"} {
-		if strings.Contains(region, `"`+id+`"`) {
+		// Bare, not quote-wrapped. A CSS selector puts a `#` in front of the id
+		// — `$("#state-out", VIEW())`, which is runState's own first line and
+		// this file's idiom for the lookup — so requiring the quote directly
+		// before the name missed the exact shape this check is named after.
+		// Neither pass saw it: the identifier scan had already blanked the
+		// literal. Hyphenated names cannot appear as JS identifiers, so
+		// dropping the anchor costs no precision.
+		if strings.Contains(region, id) {
 			t.Errorf("runState: %q is looked up again after the validation return. Those "+
 				"containers hold the form-validation refusal only; a result sent back to one "+
 				"lands under the filter form (#1405).", id)
@@ -193,6 +198,47 @@ func cssRule(t *testing.T, css, selector string) string {
 		t.Fatalf("style.css: no rule for %q", selector)
 	}
 	return m[1]
+}
+
+// blankStringLiterals replaces the CONTENTS of every quoted run with spaces,
+// preserving length so reported offsets stay real.
+//
+// A regex was tried first and was not enough. `"[^"\n]*"` mis-pairs across an
+// escaped quote and across a single-quoted string that contains double quotes,
+// letting prose back into the identifier scan — and the second shape already
+// exists in this function (`$('[name="state_at"]', VIEW())`). Both were shown
+// producing the fabricated alarm the blanking exists to stop.
+//
+// One property to preserve if this is touched: the scanned region begins
+// MID-LITERAL, because runStateAfterValidation splits on a fragment of the
+// validation message, so the opening quote of that literal is outside the
+// region. Closing an unterminated run at the newline instead of swallowing the
+// rest of the function is what makes that safe.
+func blankStringLiterals(s string) string {
+	out := []byte(s)
+	for i := 0; i < len(out); i++ {
+		q := out[i]
+		if q != '"' && q != '\'' && q != '`' {
+			continue
+		}
+		for j := i + 1; j < len(out); j++ {
+			if out[j] == '\\' && q != '`' && j+1 < len(out) && out[j+1] != '\n' {
+				out[j], out[j+1] = ' ', ' '
+				j++
+				continue
+			}
+			if out[j] == q {
+				i = j
+				break
+			}
+			if out[j] == '\n' && q != '`' {
+				i = j
+				break
+			}
+			out[j] = ' '
+		}
+	}
+	return string(out)
 }
 
 func lineAround(s string, pos int) string {

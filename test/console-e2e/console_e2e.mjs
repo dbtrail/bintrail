@@ -1365,8 +1365,19 @@ try {
     use.click();
     const at = (document.querySelector('[name="state_at"]') || {}).value || "";
     if (!restore) return { time, at, skippedRestore: true };
+    // Stubbed for the click, for the same reason the state panel's bridge is:
+    // aimUndoAtInstant calls previewRecover synchronously, previewRecover opens
+    // the busy dialog, and openBusyModal clears the shared #modal mount — so
+    // the timeline dialog vanishes whether or not renderTimeline passed the
+    // caller's close down to this button. Without the stub the assertion below
+    // is satisfied by that side effect and proves nothing, which is exactly how
+    // the state panel's version got shipped vacuous.
+    const realPreview = previewRecover;
+    previewRecover = () => {};
     restore.click();
-    return { time, at, since: f.elements.since.value, until: f.elements.until.value };
+    const stillOpen = !!document.querySelector("#modal .state-modal");
+    previewRecover = realPreview;
+    return { time, at, since: f.elements.since.value, until: f.elements.until.value, stillOpen };
   });
   if (tl.err) {
     bad("restore: timeline offers per-node actions", tl.err);
@@ -1381,6 +1392,13 @@ try {
       (tl.since === want && tl.until === "")
         ? ok("restore: timeline 'Restore to this state' aims AFTER the instant, not before it")
         : bad("restore: timeline 'Restore to this state' aims AFTER the instant, not before it", JSON.stringify({ ...tl, want }));
+      // The history half of the dismissal. Show state's action is a footer on
+      // the panel and closes; each timeline node carries its OWN button, and
+      // those were left retargeting the form under a scrim that stayed up on
+      // either of previewRecover's two early returns.
+      (tl.stillOpen === false)
+        ? ok("restore: a timeline node's 'Restore to this state' closes the dialog too")
+        : bad("restore: a timeline node's 'Restore to this state' closes the dialog too", JSON.stringify(tl));
     }
   }
 
