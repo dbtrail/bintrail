@@ -2316,6 +2316,32 @@ try {
       wordColor: cs(document.querySelector(".brand-name")).color,
       deleteRef: cs(ref).color,
     };
+
+    // The warmed loading bar (#1385), and the one bound that matters for it:
+    // it is an opaque fill nothing is read through, so no contrast CEILING
+    // applies — but it still has to be distinguishable from the panel, or a
+    // loading Overview reads as an empty one. Measured through a canvas rather
+    // than compared as strings, because both values are authored in oklch and
+    // one of them is a color-mix: string equality would answer a different
+    // question, and only rendered pixels say how far apart they are.
+    const pending = ovStatPending("changes indexed", "all time");
+    host.appendChild(pending);
+    res.skelPainted = cs(pending.querySelector(".skel-line")).backgroundImage;
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = 1;
+    const ctx = cv.getContext("2d", { willReadFrequently: true });
+    const lum = (token) => {
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, 1, 1);
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue(token).trim();
+      ctx.fillRect(0, 0, 1, 1);
+      const d = ctx.getImageData(0, 0, 1, 1).data;
+      const c = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+      return 0.2126 * c(d[0]) + 0.7152 * c(d[1]) + 0.0722 * c(d[2]);
+    };
+    const [hi, lo] = [lum("--skel-warm"), lum("--surface-2")].sort((a, b) => b - a);
+    res.skelRatio = (hi + 0.05) / (lo + 0.05);
+
     host.remove();
     return res;
   });
@@ -2341,6 +2367,14 @@ try {
   (brand.wordImage.includes("gradient") && brand.wordColor === transparent)
     ? ok("brand paint: the sidebar wordmark wears the headline gradient")
     : bad("brand paint: the sidebar wordmark wears the headline gradient", JSON.stringify(brand));
+  // A floor, not the measurement. 1.60:1 is what it renders at today; 1.3 is
+  // low enough that an ordinary retune of --brand-canvas-1 or --line does not
+  // ring, and high enough to catch a mix that washes the bar out — which is
+  // the direction a "make it subtler" edit pushes it.
+  (brand.skelPainted.includes("gradient") && brand.skelRatio >= 1.3)
+    ? ok("brand paint: the warmed loading bar stays visible against its panel")
+    : bad("brand paint: the warmed loading bar stays visible against its panel",
+        brand.skelPainted + " ratio=" + brand.skelRatio.toFixed(3));
 
   // ── Scenario 18 — advisory severity split on the archive fixture (#1365) ──
   // The archive-elision record must render in the INFO register (muted line,

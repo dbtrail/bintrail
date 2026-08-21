@@ -140,6 +140,18 @@
      would silently stop being "--sun at 12%" the day --sun moves. */
   --brand-wash-sun:  color-mix(in srgb, var(--sun) 12%, transparent);
   --brand-wash-pink: color-mix(in srgb, var(--brand-canvas-1) 3%, transparent);
+  /* The loading bars, warmed toward the hero pink (#1385). A much stronger
+     mix than the washes above because this is an opaque FILL rather than a
+     tint over content — nothing is read through it, so the alpha ceiling that
+     constrains those two does not apply here. What does apply is the opposite
+     bound: the bar has to stay visible against the panel it sits on, or the
+     loading state reads as an empty page. Measured off rendered pixels on
+     --surface-2, the warmed bar sits at 1.60:1 against its ground where the
+     plain --line it replaces sat at 1.23:1 — noticeably MORE separated, not
+     less, which was not the expected direction and is why it was measured.
+     color-mix over --line rather than a new colour, so it still tracks the
+     line token if the ramp is ever retuned. */
+  --skel-warm: color-mix(in srgb, var(--brand-canvas-1) 26%, var(--line));
   /* The nav's active rail EXTENDS the blue->violet accent gradient into the
      sunset instead of replacing it: product blue stays the interactive accent.
      A separate token on purpose — .timeline::before is a DATA surface and
@@ -1225,7 +1237,7 @@ button { font-family: inherit; }
 .skel-box { display: flex; flex-direction: column; gap: 10px; padding: 6px 0; }
 .skel-line {
   height: 13px; border-radius: 4px;
-  background: linear-gradient(90deg, var(--line) 25%, transparent 50%, var(--line) 75%);
+  background: linear-gradient(90deg, var(--skel-warm) 25%, transparent 50%, var(--skel-warm) 75%);
   background-size: 200% 100%;
 }
 .skel-line.skel-stat { height: 26px; width: 72px; margin-bottom: 4px; }
