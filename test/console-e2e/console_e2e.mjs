@@ -2259,11 +2259,11 @@ try {
   // Verified by mutation, which is why this scenario exists.
   //
   // What is at stake is not decoration. A gradient has to satisfy its contrast
-  // bar at every point along the sweep, and this one dips to 3.70:1 on the
-  // tile ground it actually paints on — so it can be relied on at WCAG's
-  // LARGE-text bar of 3:1 and never at the 4.5:1 body bar. (Its violet stop
-  // alone would clear 4.5:1; that buys nothing, the other stops share the
-  // sweep.) A tile that takes the gradient without being large text is
+  // bar at every point along the sweep, and this one bottoms out at 3.53:1 on
+  // the studio tile ground it actually paints on (3.70:1 on white) — so it can
+  // be relied on at WCAG's LARGE-text bar of 3:1 and never at the 4.5:1 body
+  // bar. (Its violet stop alone would clear 4.5:1; that buys nothing, the
+  // other stops share the sweep.) A tile that takes the gradient without being large text is
   // unreadable, and the deletes tile additionally carries the semantic
   // --delete that the brand palette must never repaint.
   //
@@ -2272,8 +2272,8 @@ try {
   //
   // Two things this deliberately does NOT reach, so nobody reads more into a
   // green run than it earns. The scenario passes "danger" itself, so it proves
-  // the GATE honours the modifier and not that fillOvEvents still sends one —
-  // drop that argument at its call site and the deletes tile takes the
+  // the GATE honours the modifier and not that fillOvActivity still sends one
+  // — drop that argument at its call site and the deletes tile takes the
   // gradient with every check green. And the tiles are mounted on document.body
   // rather than inside a rendered Overview, so a rule scoped to an .ov-stats
   // or .view ancestor is invisible here in both directions. The wordmark
@@ -2293,8 +2293,9 @@ try {
     // 19px at weight 500 is body text, held to 4.5:1, which the sweep as a
     // whole does not hold. It is also the exclusion the CSS cascade does NOT
     // protect — `.ov-stat-v.small` sets no colour, so the gradient rule would
-    // win outright. The gate in ovStat is the only thing standing there, which
-    // is precisely why this row is asserted.
+    // win outright over it. Built by hand here on purpose, unlike the two
+    // tiles above: this row asserts the STYLESHEET, that a bare
+    // `.ov-stat-v.small` is left alone, which is the half no gate can supply.
     const small = el("div", { class: "ov-stat-v small", text: "2026-08-20 11:00:00" });
     host.appendChild(small);
     // A reference for the semantic colour, computed through the same pipeline

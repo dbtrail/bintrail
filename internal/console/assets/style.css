@@ -1993,20 +1993,30 @@ button { font-family: inherit; }
 
    WCAG. The gradient may only land on LARGE text, held to 3:1, and can never
    be relied on at the 4.5:1 body bar — a gradient has to satisfy its bar at
-   every point along the sweep, and this one dips to 3.70:1 at --brand-warm-b.
-   (Its violet stop alone would clear 4.5:1. That buys nothing: the other two
-   stops are on the same sweep.)
+   every point along the sweep, and the sweep's floor is --brand-warm-b, at
+   3.70:1 on white and 3.53:1 on the tile. (Its violet stop alone would clear
+   4.5:1. That buys nothing: the other two stops are on the same sweep.)
 
-   Measured against the grounds these rules actually paint on, rather than
-   against white — white is the assumption easiest to make here and none of the
-   shipped grounds IS white:
+   The figures below are read off RENDERED PIXELS in Chromium rather than
+   converted arithmetically, and that distinction earned itself: two
+   independent oklch->sRGB conversions agreed with each other and both
+   disagreed with the browser in the second decimal. --brand-warm-a is outside
+   the sRGB gamut, so the mapping is the engine's to choose and a converter is
+   guessing which one.
 
      ground                             warm-a  warm-b  canvas-3
-     white (not a shipped ground)        3.92    3.70     5.16
-     --surface-2, the .ov-stat tile      3.75    3.54     4.93
-     the studio sidebar, the wordmark    3.82    3.60     5.02
+     white                               3.94    3.70     5.15
+     --surface-2, the studio tile        3.76    3.53     4.91
+     the studio sidebar                  3.82    3.59     5.00
 
-   So the real floor is 3.54:1, still clear of 3:1.
+   So the floor across them is 3.53:1, still clear of 3:1.
+
+   White is in that table as a real ground, not a hypothetical: the login
+   panel's title clips this same gradient onto --surface, and under the `paper`
+   and `trail` directions the Overview tile resolves to white as well
+   (--panel-bg becomes transparent and var(--surface) respectively). The two
+   studio rows are the shipped default, which is the only direction index.html
+   sets.
 
    Which surfaces qualify is the whole reason the gradient is OPT-IN rather
    than a rule on .ov-stat-v. The two 19px elements in this console land on
@@ -2015,7 +2025,7 @@ button { font-family: inherit; }
      .brand-name       19px / 700  bold and >=18.66px  -> large text.  ok
      .ov-stat-num      32px / 600  >=24px              -> large text.  ok
      .ov-stat-v.small  19px / 500  NOT bold            -> body text.   excluded
-     .ov-stat-v.danger colour is semantic              -> excluded
+     .ov-stat-v.danger colour is --delete              -> excluded
 
    The metrics in the first two rows are declared by .brand-name and by
    .ov-stat-v respectively; .ov-stat-num carries no font rules of its own and
@@ -2065,8 +2075,14 @@ button { font-family: inherit; }
      precise about rather than claiming as a property of the design.
      .ov-stat-v.small sets no `color` at all, so this rule would win outright
      and render 19px body text as transparent ink over the gradient — exactly
-     the unreadable outcome this section exists to prevent. `small` is
-     protected by the gate in ovStat and by nothing else. */
+     the unreadable outcome this section exists to prevent.
+
+     What keeps that from happening is neither the cascade nor the gate in
+     ovStat. `small` is built inline in fillOvEvents and never calls ovStat, so
+     it is protected by its own construction site simply not granting the
+     class. The gate WOULD catch it if it were ever routed through ovStat,
+     which is why the gate keys on the modifier rather than on the name — but
+     that protection is latent today, not load-bearing. */
   .brand-name,
   .ov-stat-num {
     background-image: var(--brand-headline);
@@ -2075,14 +2091,25 @@ button { font-family: inherit; }
     color: transparent;
   }
 
-  /* The clip paints the BOX, not the glyphs. .brand-name is a flex item and so
-     already shrink-to-fit, but .ov-stat-v is a block that fills its tile: a
-     two-digit count would sample only the leading sliver of a ramp stretched
-     across the full tile and render as flat pink, with the violet stop never
-     reaching the screen.
+  /* The clip paints the BOX, not the glyphs, so a gradient box wider than its
+     text renders as a slice of the ramp. .ov-stat-v is a block filling its
+     tile: a two-digit count sampled the leading ~10% and came out flat pink,
+     with the violet stop never reaching the screen.
 
-     Scoped to the opt-in class and never to .ov-stat-v — the loading tile puts
-     a .skel-line INSIDE .ov-stat-v, and a shrink-to-fit parent would collapse
-     that skeleton to nothing. Same fix the login panel's title already uses. */
+     .brand-name is here too, though it looks like it does not need to be. It
+     is NOT a flex item — it is a plain block inside an unclassed wrapper, and
+     what shrinks it is that wrapper being .brand's flex item, so its width is
+     the wider of the wordmark and .brand-sub. Today the wordmark wins and the
+     box is already tight. That is a coincidence about two strings, not a
+     property: measured, lengthening .brand-sub takes the box from 55px to 88px
+     around unchanged 55px of glyphs, reproducing the same bug. Cheaper to
+     remove the coincidence than to document it.
+
+     Scoped to these two and never to .ov-stat-v, so the loading tile is
+     untouched. Its skeleton would survive either way — .skel-line.skel-stat
+     carries an explicit width, which a fit-content parent honours — but a rule
+     about painted text has no business reaching a tile with no text in it.
+     Same fix the login panel's title already uses. */
+  .brand-name,
   .ov-stat-num { width: fit-content; }
 }

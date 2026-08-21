@@ -27,8 +27,9 @@ func readAsset(t *testing.T, name string) string {
 //
 // Blanking rather than deleting keeps every offset inside the section aligned
 // with the original text, so a finding can be reported at its real file line.
-// It is also required rather than tidy: this section's prose names properties
-// and at-rules that the guards below treat as findings.
+// It is also required rather than tidy: the section's prose names --delete
+// while explaining why the deletes tile is excluded, and the semantics guard
+// below treats that token as a finding.
 func brandSection(t *testing.T) (string, int) {
 	t.Helper()
 	css := readAsset(t, "style.css")
@@ -43,11 +44,17 @@ func brandSection(t *testing.T) (string, int) {
 	}
 	// Back up to the banner that OPENS the section. Slicing at the marker
 	// instead does NOT run the comment away — sanitizeCSS only reacts to an
-	// opening `/*`, and starting mid-body it never sees one. The damage is the
-	// opposite shape: the header PROSE survives unblanked and is read as CSS,
-	// and it quotes both `@supports` and `color: transparent`. That turns
-	// guardRanges' count check into a Fatal blaming a brace error that does not
-	// exist, and invents a finding for a sentence.
+	// opening `/*`, and starting mid-body it never sees one, so brace balance
+	// and every at-rule count come out identical either way. What it does leave
+	// behind is the MARKER, now readable as CSS, and the marker contains
+	// `#1385` — which the colour-literal guard below reads as a four-digit hex
+	// colour and reports the section for writing. Backing up to the banner puts
+	// the marker back inside a comment where it belongs.
+	//
+	// It is load-bearing in the other direction too: without it the header
+	// prose reaches the SELECTOR checks, and the wordmark guard is satisfied by
+	// the words ".brand-name" in the exclusion table rather than by the rule.
+	// Drop the back-up and drop the selector together, and that guard passes.
 	if b := strings.LastIndex(css[:i], "/* ======"); b >= 0 {
 		i = b
 	}
@@ -68,6 +75,13 @@ var (
 	// `transparent` and are entirely ordinary. Group 1 ends where `color`
 	// begins.
 	transparentInkRE = regexp.MustCompile(`(^|[^-a-zA-Z])color\s*:\s*transparent\b`)
+	// The other spelling, and it needs its own pattern rather than riding on
+	// the one above — the leading-class guard that excludes `border-color`
+	// excludes this too, because it is also hyphen-prefixed. Missing it would
+	// be worse than an oversight: the section's own prose names
+	// -webkit-text-fill-color as the tempting alternative, so it is the
+	// substitution a reader is most likely to reach for.
+	transparentFillRE = regexp.MustCompile(`(?:-webkit-)?text-fill-color\s*:\s*transparent\b`)
 )
 
 // clipSupportsRanges returns the ranges of the @supports blocks that actually
@@ -87,11 +101,88 @@ func clipSupportsRanges(t *testing.T, css string) [][2]int {
 		if b := strings.IndexByte(prelude, '{'); b >= 0 {
 			prelude = prelude[:b]
 		}
-		if clipToTextRE.MatchString(prelude) {
+		// Polarity is not optional. `@supports not (background-clip: text)`
+		// mentions the feature and means the exact opposite: its body applies
+		// only on the engines that CANNOT paint over transparent ink, which is
+		// the failure this whole guard exists for. A prelude that mentions the
+		// feature under a `not` is therefore not a guard, and the declarations
+		// inside it get reported like any other unguarded ones.
+		if clipToTextRE.MatchString(prelude) && !regexp.MustCompile(`\bnot\b`).MatchString(prelude) {
 			out = append(out, r)
 		}
 	}
 	return out
+}
+
+// topLevelRules splits a block body into (prelude, body) pairs at depth 0, so
+// a nested block cannot contribute its declarations as though they were
+// selectors.
+func topLevelRules(body string) [][2]string {
+	var out [][2]string
+	depth, start, openAt := 0, 0, 0
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '{':
+			if depth == 0 {
+				openAt = i
+			}
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				out = append(out, [2]string{body[start:openAt], body[openAt+1 : i]})
+				start = i + 1
+			}
+		}
+	}
+	return out
+}
+
+// gradientRuleSelectors returns the selector list of the rule that actually
+// PAINTS the gradient — not every class mentioned somewhere in the section.
+//
+// The distinction is not pedantic; a mention-based check was already satisfied
+// once by prose, and then a second time by a rule. Both painted classes now
+// appear on TWO rules — the gradient and the width fix beside it — so
+// "is this class in the section" stays true with the class removed from the
+// only rule that paints it. Verified by mutation: that shape passed.
+func gradientRuleSelectors(t *testing.T, section string) []string {
+	t.Helper()
+	rs := guardRanges(t, section, "@supports")
+	if len(rs) != 1 {
+		t.Fatalf("expected exactly one @supports block in the brand section, found %d", len(rs))
+	}
+	open := strings.IndexByte(section[rs[0][0]:], '{') + rs[0][0]
+	for _, rule := range topLevelRules(section[open+1 : rs[0][1]]) {
+		if !strings.Contains(rule[1], "background-image") {
+			continue
+		}
+		var out []string
+		for _, sel := range strings.Split(rule[0], ",") {
+			if s := strings.Join(strings.Fields(sel), " "); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	t.Fatal("no rule inside the brand section's @supports block declares background-image: " +
+		"the gradient is not painted at all, and every selector check below would be vacuous")
+	return nil
+}
+
+// paintsGradient compares selectors for EQUALITY, not containment.
+//
+// That is what closes the prefix trap an earlier version of this guard fell
+// into: a plain Contains reported the pair as intact when the selector had
+// been renamed to `.ov-stat-number`, because the old name is a prefix of the
+// new one. Exact comparison against a parsed selector list rules out the whole
+// family, extension at either end included.
+func paintsGradient(sels []string, class string) bool {
+	for _, s := range sels {
+		if s == "."+class {
+			return true
+		}
+	}
+	return false
 }
 
 // Clipping a gradient to text requires painting the ink transparent, so where
@@ -118,12 +209,14 @@ func TestTransparentInkStaysBehindABackgroundClipSupportsTest(t *testing.T) {
 			"without background-clip:text renders those elements as blank space")
 	}
 
-	for _, m := range clipToTextRE.FindAllStringIndex(css, -1) {
-		if within(guarded, m[0]) {
-			continue
+	for _, re := range []*regexp.Regexp{clipToTextRE, transparentFillRE} {
+		for _, m := range re.FindAllStringIndex(css, -1) {
+			if within(guarded, m[0]) {
+				continue
+			}
+			t.Errorf("style.css:%d: %q is not inside an @supports test for background-clip.",
+				lineOf(css, m[0]), strings.TrimSpace(css[m[0]:m[1]]))
 		}
-		t.Errorf("style.css:%d: %q is not inside an @supports test for background-clip.",
-			lineOf(css, m[0]), strings.TrimSpace(css[m[0]:m[1]]))
 	}
 	for _, m := range transparentInkRE.FindAllStringSubmatchIndex(css, -1) {
 		at := m[3] // end of group 1 == start of `color`
@@ -166,39 +259,60 @@ func TestBrandSectionPaintsFromTokensAndNeverSemantics(t *testing.T) {
 	}
 
 	// The section is paint-only by construction, which is what lets it exist
-	// alongside the motion section instead of inside it. Motion here would also
-	// escape that section's reduced-motion guard.
+	// alongside the motion section instead of inside it. A PLACEMENT rule, not
+	// a coverage backstop: the whole-file reduced-motion guard would catch a
+	// long transition written here on its own, but it deliberately classifies
+	// anything under 300ms as direct-manipulation feedback rather than
+	// animation, so a short one would land here seen by nothing else.
 	if m := regexp.MustCompile(`\b(animation|transition)(-[a-z]+)?\s*:`).FindStringIndex(section); m != nil {
 		t.Errorf("style.css:%d: the brand section declares %q. It is paint-only; anything that "+
-			"moves belongs in the motion section, where the reduced-motion guard covers it.",
+			"moves belongs in the motion section, where it sits inside the reduced-motion block.",
 			at(m[0]), strings.TrimSpace(section[m[0]:m[1]]))
 	}
 }
 
-// cssRef and jsRef match a class as a WHOLE token, never as a substring.
+// stripJSCommentLines blanks whole-line comments and /* … */ regions, working
+// A LINE AT A TIME.
 //
-// A plain Contains passed happily when the CSS selector was renamed to
-// `.ov-stat-number`, because the old name is a PREFIX of the new one — so the
-// guard reported the pair as intact at the exact moment it came apart. The
-// trailing \b is what closes that; it does not (and need not) reject a name
-// EXTENDED at the front, since `-` is not a word character.
-func cssRef(class string) *regexp.Regexp {
-	return regexp.MustCompile(`\.` + regexp.QuoteMeta(class) + `\b`)
-}
-
-// jsGrantRE counts the class inside STRING literals only.
+// Deliberately not a JavaScript lexer, and the file is the argument: app.js
+// holds a regex literal containing a double quote (`/[",\r\n]/`) and another
+// containing an escaped slash (`/^\//`), plus four URLs with `//` inside
+// string literals. A character scanner tracking quote state desyncs on the
+// first of those and then blanks arbitrary code — silently, and in a guard.
+// Line granularity cannot desync at all.
 //
-// Counting raw bytes made an ordinary documentation line — one that merely
-// named the class in a comment — read as a second grant site, and the test
-// accused it of bypassing the gate. A guard that invents alarms against
-// correct code is the one that gets deleted. Both quote styles are accepted so
-// switching them is not an alarm either.
+// Two earlier shapes were both wrong, each in the direction the other was
+// right. Counting raw bytes made an ordinary documentation line naming the
+// class read as a second grant site. Narrowing to quoted strings fixed that
+// and opened two holes: a grant written in a TEMPLATE literal stopped
+// counting (57 backticks in this file, so not exotic), and English
+// contractions around the class name — "Don't rename ov-stat-num, it's …" —
+// became string delimiters, so the false alarm came back in prose the
+// codebase writes constantly.
 //
-// Known limit, stated rather than papered over: a comment that puts the class
-// in QUOTES still counts. That is a much narrower surface than any mention,
-// and it does not warrant a JavaScript parser here.
-func jsGrantRE(class string) *regexp.Regexp {
-	return regexp.MustCompile(`["'][^"'\n]*\b` + regexp.QuoteMeta(class) + `\b[^"'\n]*["']`)
+// Residual, stated rather than papered over: a mention in a TRAILING comment
+// on a line of code still counts. The failure message says to move it.
+func stripJSCommentLines(js string) string {
+	var b strings.Builder
+	inBlock := false
+	for _, line := range strings.Split(js, "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case inBlock:
+			if strings.Contains(line, "*/") {
+				inBlock = false
+			}
+		case strings.HasPrefix(t, "//"):
+		case strings.HasPrefix(t, "/*"):
+			if !strings.Contains(t[2:], "*/") {
+				inBlock = true
+			}
+		default:
+			b.WriteString(line)
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // The Overview tile's opt-in class must exist on both sides, and app.js must
@@ -218,20 +332,22 @@ func jsGrantRE(class string) *regexp.Regexp {
 // scoped to the file it reads.
 func TestBrandOptInClassIsGrantedInExactlyOnePlace(t *testing.T) {
 	section, _ := brandSection(t)
-	if !cssRef(brandOptInClass).MatchString(section) {
-		t.Fatalf("the brand section no longer styles .%s — app.js still adds the class, so the "+
+	if !paintsGradient(gradientRuleSelectors(t, section), brandOptInClass) {
+		t.Fatalf("the gradient rule no longer lists .%s — app.js still adds the class, so the "+
 			"Overview counts render with no gradient and nothing reports it", brandOptInClass)
 	}
 
-	js := readAsset(t, "app.js")
-	switch n := len(jsGrantRE(brandOptInClass).FindAllString(js, -1)); {
+	js := stripJSCommentLines(readAsset(t, "app.js"))
+	grant := regexp.MustCompile(regexp.QuoteMeta(brandOptInClass) + `\b`)
+	switch n := len(grant.FindAllString(js, -1)); {
 	case n == 0:
 		t.Fatalf("style.css styles .%s but app.js never applies it: the rule is dead and the "+
 			"Overview counts are unstyled", brandOptInClass)
 	case n > 1:
-		t.Errorf("app.js puts %q in %d string literals. It is granted in one place on purpose — "+
-			"that expression is the gate that withholds the gradient from the semantic `danger` "+
-			"tile and from any modifier below the large-text bar; a second site bypasses it.",
+		t.Errorf("app.js names %q %d times outside a comment line. It is granted in one place on "+
+			"purpose — that expression is the gate that withholds the gradient from the semantic "+
+			"`danger` tile and from any modifier below the large-text bar, and a second site "+
+			"bypasses it. If one of these IS just documentation, move it to its own comment line.",
 			brandOptInClass, n)
 	}
 }
@@ -248,9 +364,10 @@ func TestWordmarkKeepsItsGradient(t *testing.T) {
 	const wordmark = "brand-name"
 
 	section, _ := brandSection(t)
-	if !cssRef(wordmark).MatchString(section) {
-		t.Errorf("the #1385 brand section no longer paints .%s. The sidebar wordmark is one of the "+
-			"two surfaces this section exists for; dropping it is silent everywhere else.", wordmark)
+	if !paintsGradient(gradientRuleSelectors(t, section), wordmark) {
+		t.Errorf("the gradient rule no longer lists .%s. The sidebar wordmark is one of the two "+
+			"surfaces this section exists for; dropping it is silent everywhere else, and the "+
+			"class still appearing on the width rule beside it does not count.", wordmark)
 	}
 	if !regexp.MustCompile(`class="[^"]*\b` + wordmark + `\b`).MatchString(readAsset(t, "index.html")) {
 		t.Errorf("index.html no longer carries class=%q, so the wordmark loses BOTH its base rule "+
