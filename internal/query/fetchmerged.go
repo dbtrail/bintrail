@@ -269,7 +269,15 @@ func topNSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
 	if opts.Limit <= 0 || len(rows) < opts.Limit || OrderDirection(opts.Order) != "DESC" {
 		return false
 	}
-	if plan == nil || len(plan.MySQLRanges) != 1 {
+	// ArchivesBelowLive for the same reason its per-PK sibling requires it: a
+	// single range proves the LIVE hours are contiguous and says nothing about
+	// an archived hour sitting above them, and a full page of live rows is not
+	// the true top N when an archive holds newer ones. This one could not fire
+	// on `recover` (its 1000-row default page is never filled by a PK-scoped
+	// read), so the hole was latent here and load-bearing in the sibling —
+	// closing only the sibling would have left the two reasoning differently
+	// about the same layout.
+	if plan == nil || len(plan.MySQLRanges) != 1 || !plan.ArchivesBelowLive {
 		return false
 	}
 	// rows are already sorted newest-first, so the limit-th row is the cutoff.
@@ -348,7 +356,23 @@ func perPKSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
 	if len(names) == 0 {
 		return false
 	}
-	if plan == nil || len(plan.MySQLRanges) != 1 {
+	// Two separate requirements that look like one.
+	//
+	// A single range says the LIVE hours have no interior hole —
+	// buildContiguousRanges reads liveHours and nothing else, so it is silent
+	// about where the archives sit. ArchivesBelowLive is the premise this
+	// predicate actually rests on: that no archived hour is at or above the
+	// live floor. Review caught the first version asserting only the first and
+	// believing it had the second.
+	//
+	// Without it, an index whose archives sit ABOVE the live range — a restored
+	// or hand-surgered index, a rotate that archived without dropping — lets a
+	// PK with its N newest LIVE rows skip an archive holding rows NEWER than
+	// all of them. On `recover` that is a short reversal script reported as
+	// complete, which is the worst output this package can produce.
+	// browsePlanFromHours has refused that layout since it was written; this
+	// path now refuses it too, rather than the two rules disagreeing.
+	if plan == nil || len(plan.MySQLRanges) != 1 || !plan.ArchivesBelowLive {
 		return false
 	}
 
@@ -374,6 +398,21 @@ func perPKSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
 			return false
 		}
 	}
+
+	// A belt, and labelled as one. This was the ORIGINAL fourth condition, and
+	// review showed it proves nothing: buildPlan sets Start to the oldest live
+	// partition HOUR, and a row in partition p_H has ts >= H, so a live row can
+	// essentially never fall below it. Believing it was the soundness argument
+	// is what let an archive sitting above the live range go unnoticed —
+	// ArchivesBelowLive, above, is the condition that actually carries the
+	// proof.
+	//
+	// Kept anyway, because it is one comparison and it fails CLOSED. The one
+	// shape that reaches it is a backfilled event (#1037) whose timestamp
+	// undercuts its partition's label; the archives-below-live check already
+	// covers that case, so this is redundant rather than load-bearing. Removing
+	// a check on the strength of "I proved it cannot fire" is how the hole
+	// above got in, so it stays — demoted, not deleted.
 	return !oldest.Before(plan.MySQLRanges[0].Start)
 }
 

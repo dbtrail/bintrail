@@ -42,6 +42,26 @@ type QueryPlan struct {
 	// "gap" that was never captured in the first place (#1126).
 	OldestKnownHour time.Time
 
+	// ArchivesBelowLive reports that every archived hour the planner saw sits
+	// strictly below the oldest live partition hour — the "archives are older
+	// than live" invariant. It is the premise every archive short-circuit
+	// silently rests on, and it does NOT always hold: a restored or
+	// hand-surgered index, or an archived-but-not-yet-dropped partition after a
+	// rotate crash, can leave archived hours at or above the live floor.
+	//
+	// browsePlanFromHours has checked exactly this since it was written, and
+	// returns nil rather than a plan when it fails. Plan did not, so a caller
+	// that reasoned "the live rows already satisfy this request" could skip an
+	// archive holding NEWER rows than anything live. That is a short reversal
+	// script, reported as complete — see topNSatisfiedLive/perPKSatisfiedLive,
+	// which now both require this.
+	//
+	// Deliberately as strict as the browse sibling: every archived hour, not
+	// just the ones inside the queried window. Over-strict costs an archive
+	// read; the two rules disagreeing costs a wrong answer on one path only,
+	// which is how this bug existed in the first place.
+	ArchivesBelowLive bool
+
 	// MisfiledArchiveHours are the hour LABELS of archived partitions whose
 	// content-derived time range (archive_state.min/max_event_ts, #1037)
 	// escapes the label hour AND overlaps the queried range. Backfilled
@@ -233,6 +253,13 @@ func browsePlanFromHours(liveHours, archivedHours []time.Time) *QueryPlan {
 			plan.OldestKnownHour = h
 		}
 	}
+	// True by CONSTRUCTION here, not by a second check: the loop above returned
+	// nil for every archived hour at or above oldestLive, so reaching this line
+	// IS the invariant. Stated explicitly because the field defaults to false —
+	// deliberately, so a hand-built plan never claims safety it has not earned —
+	// and leaving it unset would silently disable topNSatisfiedLive on the
+	// browse path, the one path where the proof was already being done.
+	plan.ArchivesBelowLive = true
 	plan.MySQLRanges = []TimeRange{{Start: oldestLive, End: newestLive.Add(time.Hour)}}
 	return plan
 }
@@ -316,7 +343,34 @@ func buildPlan(liveHours, archivedHours []time.Time, rangeStart, rangeEnd time.T
 		plan.MySQLRanges = buildContiguousRanges(liveHours, rangeStart, rangeEnd)
 	}
 
+	// buildContiguousRanges reads liveHours ONLY, so a single range proves the
+	// live hours have no interior hole and says nothing about where the
+	// archives sit. That distinction is the whole reason this flag exists.
+	plan.ArchivesBelowLive = archivesBelowLive(liveHours, archivedHours)
+
 	return plan
+}
+
+// archivesBelowLive reports whether every archived hour is strictly older than
+// the oldest live one. Empty archives satisfy it vacuously (there is nothing a
+// short-circuit could skip); no live hours also satisfies it, and is moot —
+// every caller that consults this also requires a live range.
+func archivesBelowLive(liveHours, archivedHours []time.Time) bool {
+	if len(liveHours) == 0 || len(archivedHours) == 0 {
+		return true
+	}
+	oldestLive := liveHours[0]
+	for _, h := range liveHours[1:] {
+		if h.Before(oldestLive) {
+			oldestLive = h
+		}
+	}
+	for _, h := range archivedHours {
+		if !h.Before(oldestLive) {
+			return false
+		}
+	}
+	return true
 }
 
 // FormatGapWarning returns a human-readable warning string for gap hours,

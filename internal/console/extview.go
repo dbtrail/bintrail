@@ -65,6 +65,16 @@ func (s *Server) consoleQueryContext(r *http.Request) (ext.ConsoleQueryContext, 
 // profile (#699/#838) — the same signal the guard now keys on. The field type
 // on ext.ConsoleQueryContext.Fetch is an alias of this signature, so the
 // returned value assigns directly.
+//
+// One thing it does NOT carry: the archive-elision signal. s.fetch goes through
+// query.FetchMerged, which discards archivesElided, so a view that set
+// PKValues/PKValuesIn together with LimitPerPK would have its archives skipped
+// (#1403) with no note reaching the operator — the audit hole the CLI recover
+// path was changed to close in that same PR. No view in dbtrail-ee sets
+// LimitPerPK today, verified by grep, so this is unreachable rather than fixed.
+// A view that starts setting it must move this seam to FetchMergedFull and
+// surface the flag; the closure's signature is the reason that is a change here
+// and not in the view.
 func (s *Server) consoleFetch(b *bundle) func(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
 	return func(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
 		opts.DenyTables = s.denyTables

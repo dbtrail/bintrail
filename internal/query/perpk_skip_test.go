@@ -40,7 +40,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "one named PK with its latest N already live",
 			opts: Options{LimitPerPK: 1, PKValues: "42"},
 			rows: pkRowsAt("42", 1, inside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: true,
 			why:  "the trim keeps this row and discards every older archived one",
 		},
@@ -48,14 +48,14 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "several named PKs, all satisfied",
 			opts: Options{LimitPerPK: 2, PKValuesIn: []string{"1", "2"}},
 			rows: append(pkRowsAt("1", 2, inside), pkRowsAt("2", 2, inside)...),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: true,
 		},
 		{
 			name: "one PK short of its N",
 			opts: Options{LimitPerPK: 2, PKValuesIn: []string{"1", "2"}},
 			rows: append(pkRowsAt("1", 2, inside), pkRowsAt("2", 1, inside)...),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "the archives can still extend PK 2 — one short PK invalidates the whole skip",
 		},
@@ -63,7 +63,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "a named PK absent from the live result",
 			opts: Options{LimitPerPK: 1, PKValuesIn: []string{"1", "2"}},
 			rows: pkRowsAt("1", 1, inside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "PK 2's entire history may be archived; skipping would drop the row, not trim it",
 		},
@@ -71,7 +71,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "the empty PK name",
 			opts: Options{LimitPerPK: 1, PKValuesIn: []string{""}},
 			rows: pkRowsAt("", 1, inside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "merge.go buckets every empty-PK row under its own synthetic key, so the trim discards nothing there and the proof does not hold — see the #318 drift carve-out in LimitPerPK",
 		},
@@ -79,7 +79,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "an alternate PK encoding is in play",
 			opts: Options{LimitPerPK: 1, PKValues: "42", PKValuesAlt: "0x2A"},
 			rows: pkRowsAt("42", 1, inside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "the same logical row can be stored under either spelling, and the trim partitions by the stored one — so its N is not well defined",
 		},
@@ -87,7 +87,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "a different PK than the one named",
 			opts: Options{LimitPerPK: 1, PKValues: "42"},
 			rows: pkRowsAt("99", 3, inside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "PK 42 is absent; counting distinct keys instead of walking the named ones would let 99 stand in for it",
 		},
@@ -95,7 +95,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "no PK named",
 			opts: Options{LimitPerPK: 1},
 			rows: pkRowsAt("42", 1, inside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "this is the unsound case: an archive-only pk_values is a legitimate result row, and nothing here names the set that would have to be complete",
 		},
@@ -103,7 +103,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "no per-PK trim",
 			opts: Options{PKValues: "42"},
 			rows: pkRowsAt("42", 5, inside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "without the trim the archives are not discarded, they are the older half of the answer",
 		},
@@ -111,7 +111,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "oldest kept row sits below the live range",
 			opts: Options{LimitPerPK: 2, PKValues: "42"},
 			rows: pkRowsAt("42", 2, below),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "the span above the kept rows is not provably live-covered",
 		},
@@ -119,7 +119,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "two live ranges",
 			opts: Options{LimitPerPK: 1, PKValues: "42"},
 			rows: pkRowsAt("42", 1, inside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live, hourRange(72*time.Hour, 48*time.Hour, now)}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live, hourRange(72*time.Hour, 48*time.Hour, now)}},
 			want: false,
 			why:  "an archived hour could sit between them, above the kept row",
 		},
@@ -135,7 +135,7 @@ func TestPerPKSatisfiedLive(t *testing.T) {
 			name: "no live rows at all",
 			opts: Options{LimitPerPK: 1, PKValues: "42"},
 			rows: nil,
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "the whole history may be archived",
 		},
@@ -175,7 +175,7 @@ func TestFetchPageSkipsArchivesWhenEveryNamedPKIsSatisfiedLive(t *testing.T) {
 	var archiveCalls int
 	src := mergeSources{
 		archSources: []string{"s3://bucket/bintrail_id=x"},
-		plan:        &QueryPlan{MySQLRanges: []TimeRange{{Start: now.Add(-24 * time.Hour), End: now.Add(time.Hour)}}},
+		plan:        &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{{Start: now.Add(-24 * time.Hour), End: now.Add(time.Hour)}}},
 	}
 	o := FetchMergedOptions{
 		// The shape the console sends for a scoped reversal: one PK, latest
@@ -229,7 +229,7 @@ func TestFetchPageReadsArchivesWhenANamedPKHasNothingLive(t *testing.T) {
 	var archiveCalls int
 	src := mergeSources{
 		archSources: []string{"s3://bucket/bintrail_id=x"},
-		plan:        &QueryPlan{MySQLRanges: []TimeRange{{Start: now.Add(-24 * time.Hour), End: now.Add(time.Hour)}}},
+		plan:        &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{{Start: now.Add(-24 * time.Hour), End: now.Add(time.Hour)}}},
 	}
 	o := FetchMergedOptions{
 		Opts:      Options{LimitPerPK: 1, PKValues: "93921", Limit: 1000, Order: "DESC"},
@@ -277,5 +277,90 @@ func TestLimitPerPKDoesNotTrimEmptyPKs(t *testing.T) {
 	}
 	if got := LimitPerPK(named, 1); len(got) != 1 {
 		t.Fatalf("LimitPerPK(named PK, 1) kept %d rows, want 1", len(got))
+	}
+}
+
+// The negative control #1403 asked for by name — "an index whose archived hour
+// sits above the live range" — and the one the first version of this file
+// substituted a different layout for, because the predicate as written could
+// not pass it.
+//
+// This is the layout that makes the short-circuit dangerous rather than merely
+// wrong: live partitions 10:00–17:00, an archived hour at 18:00 ABOVE them
+// (a restored index, or a rotate that archived without dropping), and the
+// archive holding an event NEWER than anything live. The named PK has its one
+// live row, so a per-PK count alone says "satisfied" — and the reversal would
+// be built from the 15:00 event while the 18:05 one that limit_per_pk=1 should
+// have kept is never read. Short reversal script, reported complete.
+//
+// The plan comes from the REAL buildPlan rather than a literal. That is the
+// point: every other case here hands the predicate an ArchivesBelowLive it
+// chose, so without this one the field could be computed wrongly — or not at
+// all — and the suite would not notice.
+func TestFetchPageReadsArchivesWhenAnArchivedHourSitsAboveLive(t *testing.T) {
+	base := time.Date(2026, 3, 4, 0, 0, 0, 0, time.UTC)
+	hr := func(h int) time.Time { return base.Add(time.Duration(h) * time.Hour) }
+
+	var liveHours []time.Time
+	for h := 10; h <= 17; h++ {
+		liveHours = append(liveHours, hr(h))
+	}
+	plan := buildPlan(liveHours, []time.Time{hr(18)}, hr(10), hr(20), false)
+	if plan == nil {
+		t.Fatal("buildPlan returned nil for a live+archived layout")
+	}
+	if len(plan.MySQLRanges) != 1 {
+		t.Fatalf("MySQLRanges = %v, want one contiguous range — the fixture is meant to have no "+
+			"interior hole, so that condition cannot be what refuses the skip", plan.MySQLRanges)
+	}
+	if plan.ArchivesBelowLive {
+		t.Fatal("buildPlan says ArchivesBelowLive with an archived hour at 18:00 above a live " +
+			"range topping out at 17:00 — the flag is not being computed from the hours")
+	}
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	live := sqlmock.NewRows([]string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
+	})
+	live.AddRow(uint64(1), "mysql-bin.000001", 100, 200, hr(15),
+		nil, nil, "shop", "orders", 3, "A",
+		nil, nil, nil, 1, nil, nil, nil)
+	mock.ExpectQuery("SELECT").WillReturnRows(live)
+
+	var archiveCalls int
+	until := hr(20)
+	o := FetchMergedOptions{
+		Opts:      Options{LimitPerPK: 1, PKValues: "A", Limit: 1000, Order: "DESC", Until: &until},
+		AllowGaps: true,
+		ArchiveFetcher: func(context.Context, Options, string) ([]ResultRow, error) {
+			archiveCalls++
+			// NEWER than the live row, which is the whole hazard.
+			return []ResultRow{{EventID: 99, PKValues: "A", EventTimestamp: hr(18).Add(5 * time.Minute)}}, nil
+		},
+	}
+	rows, _, _, _, elided, err := fetchPage(context.Background(), New(db), o,
+		mergeSources{archSources: []string{"s3://bucket/bintrail_id=x"}, plan: plan})
+	if err != nil {
+		t.Fatalf("fetchPage: %v", err)
+	}
+	if archiveCalls != 1 {
+		t.Fatalf("archive fetcher called %d time(s); with an archived hour above the live range the "+
+			"skip is unsound — the archive holds the newest event for this PK", archiveCalls)
+	}
+	if elided {
+		t.Error("archivesElided is true on a page that DID read the archives; the console renders " +
+			"that as \"nothing is missing here\", which would be a false assurance on a short reversal")
+	}
+	// The trim keeps the newest per PK: the archived event, not the live one.
+	if len(rows) != 1 || rows[0].EventID != 99 {
+		t.Errorf("rows = %+v, want the archived event 99 — it is newer than the live one and "+
+			"limit_per_pk=1 keeps the newest", rows)
 	}
 }
