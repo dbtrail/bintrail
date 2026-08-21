@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,14 @@ func TestAnchorSatisfiedLive(t *testing.T) {
 			want: false,
 			why: "aged out into an archived partition; falling through to the archives is how it " +
 				"is found, so this must NOT elide",
+		},
+		{
+			name: "right id, wrong timestamp",
+			opts: Options{EventAnchor: &EventCursor{Timestamp: ts.Add(time.Hour), EventID: 403440}},
+			rows: rows,
+			want: false,
+			why: "the predicate must be self-sufficient rather than trusting the caller to have " +
+				"applied the anchor: a row that is not the anchored event proves nothing about it",
 		},
 		{
 			name: "anchored event absent and the live page is empty",
@@ -214,20 +223,34 @@ func TestBuildQueryFiltersOnTheAnchor(t *testing.T) {
 	if !strings.Contains(q, "event_timestamp = ? AND event_id = ?") {
 		t.Errorf("buildQuery emitted no anchor equality.\nSQL: %s", q)
 	}
-	// The partition-pruning bracket. An id-only predicate is correct and scans
-	// every partition of binlog_events, which on the index this was written for
-	// is the difference the anchor was supposed to make.
-	if !strings.Contains(q, "TO_SECONDS(event_timestamp) >=") || !strings.Contains(q, "TO_SECONDS(event_timestamp) <") {
-		t.Errorf("buildQuery emitted no hour bracket around the anchor, so MySQL prunes no "+
-			"partitions and the anchored read scans the whole table.\nSQL: %s", q)
+	// The partition-pruning bracket, asserted as LITERAL BOUNDS.
+	//
+	// Checking only that the operators appear is what an earlier version did,
+	// and review killed it with one mutation: flooring `lo` to the hour AFTER
+	// the anchor's still prints "TO_SECONDS(event_timestamp) >=", so a bracket
+	// that excludes the anchor's own partition read as present. That lands as
+	// zero rows → HTTP 200 → `statement_count: 0`, which the console renders
+	// as a completed undo that found nothing.
+	wantLo := mysqlToSeconds(ts.Truncate(time.Hour))
+	wantHi := mysqlToSeconds(ts.Truncate(time.Hour).Add(time.Hour))
+	if !strings.Contains(q, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", wantLo)) {
+		t.Errorf("the anchor's lower bracket is not the floor of its own hour (want %d). A bracket "+
+			"that excludes the anchor's partition prunes away the row it names.\nSQL: %s", wantLo, q)
 	}
-	var sawID bool
-	for _, a := range args {
-		if id, ok := a.(uint64); ok && id == 403440 {
-			sawID = true
-		}
+	if !strings.Contains(q, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", wantHi)) {
+		t.Errorf("the anchor's upper bracket is not the next hour boundary (want %d).\nSQL: %s", wantHi, q)
 	}
-	if !sawID {
-		t.Errorf("the anchor's event_id never reached the bind args: %v", args)
+	// Bind POSITIONS, not membership. Scanning args for "a uint64 equal to the
+	// id anywhere" survives a swapped pair, and a swap makes MySQL compare
+	// event_timestamp against 403440 — again zero rows under a 200. sqlmock
+	// never executes SQL, so no handler test can catch this either.
+	if len(args) != 4 {
+		t.Fatalf("args = %v, want 4 (schema, table, ts, event_id)", args)
+	}
+	if args[2] != ts {
+		t.Errorf("args[2] = %v, want the anchor timestamp %v — the binds are out of order", args[2], ts)
+	}
+	if args[3] != uint64(403440) {
+		t.Errorf("args[3] = %v, want the anchor event_id 403440 — the binds are out of order", args[3])
 	}
 }

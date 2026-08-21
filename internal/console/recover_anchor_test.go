@@ -63,6 +63,64 @@ func TestRecoverAppliesTheEventAnchorToTheQuery(t *testing.T) {
 	}
 }
 
+// The preview and the script must apply the SAME anchor. previewRecover
+// promises the preview lists the events the undo script will reverse, and
+// /api/events is where that promise is kept or broken.
+//
+// This is the assertion the JS-side guard could not make. That one checks the
+// literal "event" appears in both request builders; the client half was wired
+// and the server half was not, so it stayed green while the preview listed the
+// row's whole history against a script that reversed one event of it. A guard
+// that reads one end of a wire cannot see the other.
+func TestEventsAppliesTheEventAnchorToTheQuery(t *testing.T) {
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+
+	ts := time.Date(2026, 8, 21, 20, 8, 36, 0, time.UTC)
+	rows := sqlmock.NewRows([]string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
+	}).AddRow(
+		int64(403440), "bin.000001", int64(4), int64(40), ts,
+		nil, nil, "wordpress", "dbt_options", int64(parser.EventInsert), "94057",
+		nil, nil, []byte(`{"option_id":94057}`), int64(0),
+		nil, nil, nil,
+	)
+	mock.ExpectQuery("event_timestamp = \\? AND event_id = \\?").WillReturnRows(rows)
+
+	s := newBootServer(db)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET",
+		"/api/events?schema=wordpress&table=dbt_options&pk=94057&event=2026-08-21T20%3A08%3A36Z%7C403440", nil)
+	s.handleEvents(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("events status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("the anchor never reached the events query, so the preview does not mirror the "+
+			"script it is supposed to preview: %v", err)
+	}
+}
+
+// The refusal is shared too. A malformed anchor that 400s on one surface and
+// is ignored on the other is the same divergence one step later.
+func TestEventsRefusesAMalformedAnchor(t *testing.T) {
+	db, _, closeDB := newSQLMock(t)
+	defer closeDB()
+	s := newBootServer(db)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/events?schema=wordpress&event=yesterday", nil)
+	s.handleEvents(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 — a malformed anchor must not degrade into an unanchored "+
+			"listing of the row's whole history.\nBody: %s", rec.Code, rec.Body.String())
+	}
+}
+
 // A malformed anchor is a 400, never a silent fall back to the unanchored
 // window. The client asked to reverse ONE event; the remaining filters admit
 // the row's whole history, so the degraded result is not a near miss — it is a

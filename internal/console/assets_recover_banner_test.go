@@ -206,6 +206,56 @@ func TestBothRecoverRequestsCarryTheAnchor(t *testing.T) {
 	}
 }
 
+// Editing the target must retire the anchor. It names one event of one row, so
+// after a PK change it names the wrong row's event and the request comes back
+// empty — a 200 with no statements, which reads as "this row has no history".
+//
+// Pinned because the narrowing is invisible: it moved from a field the banner
+// named into a hidden one nothing names, so nothing on screen contradicts a
+// stale anchor and no error is produced.
+func TestEditingTheTargetRetiresTheUndoAnchor(t *testing.T) {
+	fn := functionSource(t, "renderRecover")
+	for _, want := range []string{`["schema", "table", "pk"]`, "clearUndoAnchor(form)"} {
+		if !strings.Contains(fn, want) {
+			t.Errorf("renderRecover no longer retires the anchor when the target changes: missing %q.\n"+
+				"A stale anchor names the previous row's event, and the empty result reads as "+
+				"'nothing to undo' rather than as a leftover filter.", want)
+		}
+	}
+	// The retirement itself must clear the field AND the banner. Clearing only
+	// the field leaves a banner claiming a single-event scope over a form that
+	// no longer has one; clearing only the banner leaves the scope in place
+	// with nothing describing it.
+	clear := functionSource(t, "clearUndoAnchor")
+	for _, want := range []struct{ line, why string }{
+		{`form.elements.event.value = "";`, "the anchor stays on the wire"},
+		{"pendingRecover = null;", "renderRecover rebuilds the banner from it on the next render"},
+		{`document.getElementById("undo-ctx-banner")`, "the banner outlives the scope it describes"},
+	} {
+		if !strings.Contains(clear, want.line) {
+			t.Errorf("clearUndoAnchor is missing %q — %s", want.line, want.why)
+		}
+	}
+	// …and it must NOT clear `until`: that is the scope the operator is left
+	// with, and blanking it widens a retargeted search to the whole index.
+	if strings.Contains(clear, `form.elements.until.value = ""`) {
+		t.Error("clearUndoAnchor blanks `until`. Retiring the single-event selection should leave " +
+			"the visible window standing, not widen the search to the whole index.")
+	}
+}
+
+// The busy modal is the only place an operator can see the anchor, because it
+// has no visible field. Itemising every other filter and omitting the one that
+// most determines the scope is how a request becomes unreviewable.
+func TestBusyFactsItemiseTheAnchor(t *testing.T) {
+	fn := functionSource(t, "recoverBusyFacts")
+	if !strings.Contains(fn, "f.event") {
+		t.Error("recoverBusyFacts omits the event anchor. It is the narrowest filter on the " +
+			"request and the only one with no field on screen, so the busy modal is the only " +
+			"place it can be reviewed before the script is generated.")
+	}
+}
+
 // functionSource returns the body of a top-level function in app.js with
 // whole-line comments stripped, bounded to that function.
 func functionSource(t *testing.T, name string) string {

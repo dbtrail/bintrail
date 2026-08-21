@@ -311,6 +311,31 @@ func (s *Server) fetch(ctx context.Context, b *bundle, opts query.Options) ([]qu
 	})
 }
 
+// applyEventAnchor parses the `event` parameter onto opts, writing a 400 and
+// returning false when it is malformed.
+//
+// A 400 rather than a silent fall back to the unanchored request: the caller
+// asked for ONE event and would instead get everything the remaining filters
+// admit. Undo's other filters are deliberately wide — schema/table/pk and an
+// `until` at the clicked second — so the degraded result is not a near miss,
+// it is the row's whole history returned with a 200.
+//
+// Shared by /api/events and /api/recover so the preview and the script cannot
+// disagree about what the anchor means, or about whether it is honoured at
+// all. They diverged once already, in exactly that direction.
+func applyEventAnchor(w http.ResponseWriter, opts *query.Options, raw string) bool {
+	if raw == "" {
+		return true
+	}
+	anchor, err := parseEventCursor("event", raw)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return false
+	}
+	opts.EventAnchor = anchor
+	return true
+}
+
 // handleEvents serves GET /api/events — the events browser.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	b := s.resolveOr(w, r)
@@ -353,6 +378,15 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	opts, err := s.buildOptions(p, eventsDefaultLimit, eventsMaxLimit)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// The anchor is accepted here for exactly the reason stated above the cap,
+	// and it is the sharper case: unmirrored, the preview lists the row's whole
+	// history up to the clicked second while the script reverses one event of
+	// it. Review caught this wired on the client and missing here — with a
+	// guard that only checked the client half, so it was green over the broken
+	// promise.
+	if !applyEventAnchor(w, &opts, q.Get("event")) {
 		return
 	}
 	// Per-PK caps and keyset paging are mutually exclusive, and the reason is
@@ -472,18 +506,8 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.Event != "" {
-		// A 400 rather than a silent fall back to the unanchored window: a
-		// malformed anchor means the client asked to reverse ONE event and
-		// would instead get everything the remaining filters admit. Undo's
-		// other filters are deliberately wide (schema/table/pk and an `until`
-		// at the clicked second), so the unanchored result is not a near miss.
-		anchor, perr := parseEventCursor("event", body.Event)
-		if perr != nil {
-			writeJSONError(w, http.StatusBadRequest, perr.Error())
-			return
-		}
-		opts.EventAnchor = anchor
+	if !applyEventAnchor(w, &opts, body.Event) {
+		return
 	}
 	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
 	if err != nil {

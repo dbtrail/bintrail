@@ -88,10 +88,12 @@ func TestArchiveElisionNote(t *testing.T) {
 	}
 	const wantEvents = "This page was answered from the live index; the registered archives were not read. " +
 		"Nothing they hold could have survived this request's filters, so nothing is missing here. " +
-		"Widening the time range, or clearing a per-row limit, reads them."
+		"Widening the time range, clearing a per-row limit, or clearing a single-event " +
+		"selection, reads them."
 	const wantRecover = "This reversal was built from the live index; the registered archives were not read. " +
 		"Nothing they hold could have survived this request's filters, so nothing is missing here. " +
-		"Widening the time range, or clearing the per-row limit, reads them."
+		"Widening the time range, clearing the per-row limit, or clearing a single-event " +
+		"selection, reads them."
 	if got := archiveElisionNote(); got != wantEvents {
 		t.Errorf("events elision note drifted from the pinned copy:\ngot:  %s\nwant: %s", got, wantEvents)
 	}
@@ -106,7 +108,10 @@ func TestArchiveElisionNote(t *testing.T) {
 		// The audit fact survives the rewrite on BOTH surfaces: the note says
 		// the archives went unread, why that loses nothing, and how to reach
 		// them.
-		for _, want := range []string{"live index", "were not read", "nothing is missing", "time range"} {
+		// "single-event" is in this list for the same reason "time range" is:
+		// the note must name a remedy that applies on the path that actually
+		// elides. An Undo elides via the anchor, where the other two are inert.
+		for _, want := range []string{"live index", "were not read", "nothing is missing", "time range", "single-event"} {
 			if !strings.Contains(strings.ToLower(s), strings.ToLower(want)) {
 				t.Errorf("%s note lost the audit fact %q: %s", name, want, s)
 			}

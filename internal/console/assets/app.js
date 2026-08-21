@@ -2125,9 +2125,11 @@ function renderRecover(params) {
   // usefully type: it is set by Undo and removed by the banner's Clear.
   form.append(el("input", { type: "hidden", name: "event" }));
   // Latest-per-row sits beside PK because it is meaningless without one (the
-  // server refuses the pair). It is the only filter that can separate events
-  // sharing a timestamp: Since/Until are second-granular, so a row created and
-  // deleted inside the same second cannot be split by time.
+  // server refuses the pair). It caps a row's HISTORY — it does not name an
+  // event: this comment used to claim it was "the only filter that can
+  // separate events sharing a timestamp", which was true of the time filters
+  // and false as a general claim, and Undo relied on it (#1411). The hidden
+  // `event` field above is what separates events sharing a second.
   form.append(fieldInput("Latest per row", "limit_per_pk", "sm", "all"));
   form.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
   form.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
@@ -2145,6 +2147,24 @@ function renderRecover(params) {
   v.append(el("div", { id: "recover-out" }));
 
   form.addEventListener("submit", (e) => { e.preventDefault(); generateUndo(form); });
+  // Editing the target retires the anchor, and the banner with it.
+  //
+  // The anchor names one event of one row. Retype the PK and it still names
+  // the OLD row's event, so the request comes back empty — a 200 with no
+  // statements, which reads as "this row has no history to undo". It fails
+  // closed rather than producing wrong SQL, but the narrowing moved from a
+  // VISIBLE field the banner named ("Latest per row is set to 1 — clear it
+  // to…") into a hidden one nothing names, so an operator has nothing to
+  // notice. Retiring it on a target edit is what keeps the form's visible
+  // state and its actual scope the same thing.
+  //
+  // Bound to `change`, not `input`: a keystroke-by-keystroke clear would drop
+  // the anchor while the operator is still typing over a value they mean to
+  // restore.
+  for (const name of ["schema", "table", "pk"]) {
+    const field = form.elements[name];
+    if (field) field.addEventListener("change", () => clearUndoAnchor(form));
+  }
   wireSchemaCascade(form);
   populateSchemas(form);
 
@@ -2256,6 +2276,12 @@ function recoverBusyFacts(f) {
   // Both call sites pass their own request object — generateUndo a number,
   // previewRecover a string — so stringify rather than assume either.
   if (f.limit_per_pk) facts.push(["latest per row", String(f.limit_per_pk)]);
+  // The anchor is the filter that most determines the scope and the only one
+  // with no visible field, so the busy modal is where an operator can see it
+  // at all. Shown as the event id rather than the raw token: the timestamp is
+  // already on the `until` line above, and the id is what the Events view
+  // shows beside the row they clicked.
+  if (f.event) facts.push(["single event", String(f.event).split("|").pop()]);
   return facts;
 }
 
@@ -2699,6 +2725,21 @@ async function runState(form, history) {
     });
     renderError(dlg.body, err);
   }
+}
+
+// clearUndoAnchor retires the single-event selection and the banner that
+// describes it, leaving the visible filters untouched.
+//
+// Shared by the target-edit listeners and available to anything else that
+// widens the scope. It does NOT touch `until`: that is the scope the operator
+// is left with, and blanking it here would silently widen a retargeted search
+// to the whole index.
+function clearUndoAnchor(form) {
+  if (!form.elements.event || !form.elements.event.value) return;
+  form.elements.event.value = "";
+  pendingRecover = null;
+  const banner = document.getElementById("undo-ctx-banner");
+  if (banner) banner.remove();
 }
 
 // aimUndoAtInstant points the undo window at the state as of `at`: reverse

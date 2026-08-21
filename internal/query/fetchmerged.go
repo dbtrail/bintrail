@@ -255,7 +255,16 @@ func anchorSatisfiedLive(opts Options, rows []ResultRow) bool {
 		return false
 	}
 	for i := range rows {
-		if rows[i].EventID == opts.EventAnchor.EventID {
+		// The whole key, not the id alone. event_id is unique on its own, so
+		// matching it would be enough GIVEN that the live fetch applied the
+		// anchor — which fetchPage does, passing the same Options to
+		// engine.Fetch. That proof is contextual rather than local, and
+		// internal/buffer.Fetch is an existing Options consumer that filters by
+		// hand and would ignore an anchor entirely. Comparing the timestamp too
+		// costs nothing and makes the predicate self-sufficient: it can only
+		// answer true about a row that IS the anchored event.
+		if rows[i].EventID == opts.EventAnchor.EventID &&
+			rows[i].EventTimestamp.Equal(opts.EventAnchor.Timestamp) {
 			return true
 		}
 	}
