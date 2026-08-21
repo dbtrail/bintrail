@@ -100,6 +100,37 @@ func TestAppJSUndoBannerStatesWhatIsReversed(t *testing.T) {
 	}
 }
 
+// The other half of the retirement, and it fails SILENTLY on its own: the
+// removal above looks up "undo-ctx-banner", so dropping the id from the node
+// leaves getElementById returning null, the `if` short-circuiting, and the
+// banner surviving with nothing anywhere reporting it. Review demonstrated
+// exactly that mutation passing the whole package.
+//
+// The id is checked, not the class: generateUndo appends a SECOND .ctx-banner
+// into #recover-out for the cascade notice, so an unscoped removal would take
+// whichever came first.
+func TestUndoBannerCarriesTheIdItIsRetiredBy(t *testing.T) {
+	data, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(data)
+	start := strings.Index(js, "function renderRecover(")
+	if start < 0 {
+		t.Fatal("renderRecover is gone from assets/app.js — this guard covers nothing")
+	}
+	end := strings.Index(js[start:], "\nfunction ")
+	if end < 0 {
+		end = len(js) - start
+	}
+	fn := stripJSCommentLines(js[start : start+end])
+	if !strings.Contains(fn, `id: "undo-ctx-banner"`) {
+		t.Error(`the Undo banner no longer carries id: "undo-ctx-banner". aimUndoAtInstant removes ` +
+			"it by that id when it replaces the scope the banner describes; without it that removal " +
+			"is a no-op and the stale banner stays on screen, with no error anywhere.")
+	}
+}
+
 // The banner is prose; this pins the behaviour it describes. They fail to
 // different edits — dropping the prefill leaves a banner promising something
 // the script no longer does, and nothing throws either way.
@@ -197,8 +228,19 @@ func undoBannerText(t *testing.T) (eyebrow, detail string) {
 // `"… holding this " + ctx.type + " (" + ctx.time + " UTC)"`, so a helper that
 // stops at the first closing quote truncates it, and one that slices raw
 // source to the end of the append swallows every comment in between. This
-// walks each text expression consuming quoted runs atomically and stopping at
-// the span's closing brace.
+// walks each text expression consuming quoted runs atomically.
+//
+// It stops at the end of the EXPRESSION — a top-level comma or closing brace —
+// not merely at the next `}`. The first version stopped at `}` alone, and
+// review showed that is not the same thing: the scan ran on past `text:` into
+// every later literal of the same object, so moving the required sentences
+// into a sibling `title:` (which el() sets as an attribute, not as visible
+// text) kept the guard GREEN over a banner reading "See tooltip." — the exact
+// class the literal-only rewrite was supposed to retire, just one property
+// over. A probe with `text:` written before `class:` made the reach visible:
+// the extracted "detail" picked up `text: "Clear"` from the button below AND
+// the "recover" literal from inside its onclick arrow body, because `{` never
+// stopped the scan.
 func spanLiterals(t *testing.T, fn, cls string) []string {
 	t.Helper()
 	marker := `class: "` + cls + `"`
@@ -215,6 +257,7 @@ func spanLiterals(t *testing.T, fn, cls string) []string {
 		}
 		p := i + k + len("text:")
 		var b strings.Builder
+		depth := 0
 	scan:
 		for p < len(fn) {
 			switch fn[p] {
@@ -222,8 +265,28 @@ func spanLiterals(t *testing.T, fn, cls string) []string {
 				lit, next := readJSString(t, fn, p)
 				b.WriteString(lit)
 				p = next
+			case '(', '[':
+				depth++
+				p++
+			case ')', ']':
+				depth--
+				p++
+			case ',':
+				// Top-level comma ends the property's value. Inside a call's
+				// argument list it does not, hence the depth counter.
+				if depth <= 0 {
+					break scan
+				}
+				p++
+			case '{':
+				depth++
+				p++
 			case '}':
-				break scan
+				if depth <= 0 {
+					break scan
+				}
+				depth--
+				p++
 			case '/':
 				// A comment inside the text expression would put its quoted
 				// content into the haystack, which is exactly the defect this
@@ -296,6 +359,15 @@ func TestRestoreToStateClearsTheUndoBridgesPerRowCap(t *testing.T) {
 			"a cap inherited from the Undo bridge reverses only the newest change after the instant, so the row does not land on the state shown"},
 		{`form.elements.until.value = "";`,
 			"a leftover upper bound silently drops the newest damage from the window"},
+		// The label, not a field — and it is a claim about the fields above.
+		// The banner states "Latest per row is set to 1" as a fact about this
+		// form; the first clear in this list makes that false, so leaving it up
+		// shows a one-change scope over a script that reverses everything after
+		// the instant.
+		{`pendingRecover = null;`,
+			"renderRecover rebuilds the banner from pendingRecover, so leaving it set puts the contradicting banner back on the next render"},
+		{`document.getElementById("undo-ctx-banner")`,
+			"the banner already on screen is not removed, so it outlives the scope it describes"},
 	} {
 		if !strings.Contains(fn, want.line) {
 			t.Errorf("aimUndoAtInstant no longer clears a field the other bridge sets: missing %q.\n%s",

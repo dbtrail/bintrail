@@ -2081,12 +2081,19 @@ function renderRecover(params) {
       // including events that happened AFTER the clicked one inside the same
       // second.
       //
-      // That is not a corner case, it is the case this wording exists for: on
-      // a row inserted and deleted inside one second, undoing from EITHER
-      // event reverses both and leaves no row at all. An earlier draft said
-      // "up to this point", which named the event as the boundary and was
-      // wrong the same way the phrasing it replaced was wrong, one revision
-      // later.
+      // That is not a corner case, it is the case this wording exists for —
+      // and #1404 INVERTED its outcome, which this paragraph went on claiming
+      // the opposite of until review caught it. It used to read "undoing from
+      // EITHER event reverses both and leaves no row at all", which was true
+      // when it was written and was falsified by the prefill below, sixteen
+      // lines away, in the same file. What happens now: the cap keeps the LAST
+      // event in that second — the DELETE — so undoing from either event
+      // RE-CREATES the row. The banner says so; this comment used to say the
+      // reverse of it.
+      //
+      // Worth knowing about the guard: it deliberately reads string literals
+      // only, so no test can ever see prose in this block. Stale comments here
+      // are a manual-review class, and this was a live instance of one.
       //
       // The remaining imprecision is stated rather than smoothed over. Latest
       // per row keeps the LATEST event at or before the ceiling, and the
