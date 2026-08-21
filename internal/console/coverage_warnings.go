@@ -66,10 +66,10 @@ func appendDivergenceWarning(w []string, diverged int) []string {
 
 // archiveElisionNote is the response-level record of the newest-first
 // short-circuit (#1353): registered archives were deliberately not read
-// because they provably could not change this page. There are now TWO proofs
-// that reach here — the live index filled a newest-first page from a
-// contiguous live range, or every named PK already held its latest N live
-// (#1403) — and the flag does not say which.
+// because they provably could not change this page. THREE proofs reach here —
+// the live index filled a newest-first page from a contiguous live range, every
+// named PK already held its latest N live (#1403), or the one event the request
+// anchored on came back live (#1411) — and the flag does not say which.
 //
 // That is why the wording below states the FACT and not the reason, which it
 // used to. Inferring the reason from the request is wrong: the newest-first

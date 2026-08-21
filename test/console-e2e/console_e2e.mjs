@@ -1358,10 +1358,10 @@ try {
     : bad("restore: the Undo banner claims the clicked event, and no longer carries the retired same-second caveat", JSON.stringify(undoBridge));
   // The two bridges collide one level above the fields. With the Undo banner
   // on screen — the only place in the run where it really is — driving
-  // "Restore to this state" must retire it: the banner states "Latest per row
-  // is set to 1" as a fact about this form, and that action clears the field.
-  // Left up, the operator reads a one-change scope over a script that reverses
-  // everything after the instant.
+  // "Restore to this state" must retire it: the banner asserts that exactly the
+  // clicked event is reversed, and that action clears the anchor. Left up, the
+  // operator reads a one-event scope over a script that reverses everything
+  // after the instant.
   const staleBanner = await page.evaluate(async () => {
     const f = document.getElementById("recover-form");
     const before = !!document.getElementById("undo-ctx-banner");
@@ -1384,9 +1384,10 @@ try {
   }
 
   // Leave the page as this scenario found it. pendingRecover survives a
-  // re-render, and the prefilled cap makes every later generate 400 with
-  // "the latest-per-row filter needs a PK" the moment a scenario clears the PK
-  // — which is a correct server refusal and a wrong reason for fourteen
+  // re-render, and a leftover Undo prefill makes later scenarios answer the
+  // wrong question — historically the cap 400'd every generate that cleared
+  // the PK, and since #1411 a leftover anchor pins them all to one old event.
+  // Either way: a correct server response, and a wrong reason for fourteen
   // unrelated checks to go red.
   const undoRestore = await page.evaluate(async (fixSchema) => {
     pendingRecover = null;

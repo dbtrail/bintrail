@@ -2104,8 +2104,17 @@ function renderRecover(params) {
         + ", the one you clicked (" + ctx.time + " UTC) — not the rest of the row's history, and not other changes sharing that second" }),
       el("span", { class: "ctx-detail", text: "Clear to search this row freely instead; the time you clicked stays as the upper bound." })));
     banner.append(el("span", { class: "spacer" }));
+    // Clear retires the SELECTION, not the form.
+    //
+    // It used to `navigate("recover")`, which re-renders the route and builds a
+    // fresh EMPTY form — so the one control labelled Clear wiped the target and
+    // the upper bound, while the sentence above it promised the opposite
+    // ("search this row freely… the time you clicked stays as the upper
+    // bound"). The mechanism that sentence describes already existed, as
+    // clearUndoAnchor; it just had no name in the UI. Calling it here is what
+    // makes the copy true.
     banner.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear",
-      onclick: () => { pendingRecover = null; navigate("recover"); } }));
+      onclick: () => clearUndoAnchor(form) }));
     v.append(banner);
   }
 
@@ -2774,11 +2783,12 @@ function aimUndoAtInstant(form, at) {
   // clicked minutes ago in Events and nothing else, while the button that
   // produced it named a completely different outcome.
   form.elements.event.value = "";
-  // …and retire the banner that describes the scope just replaced. It states
-  // "Latest per row is set to 1" as a fact about this form, and the line above
-  // makes that false: the operator would read a one-change scope over a script
-  // that reverses everything after `at`. The stale-label half of the same bug
-  // the comment above describes, one level up from the fields.
+  // …and retire the banner that describes the scope just replaced. It asserts
+  // that exactly the clicked event is reversed, and the lines above make that
+  // false: this action reverses EVERYTHING after `at`. (Before #1411 the same
+  // contradiction ran through the cap — the banner then read "Latest per row is
+  // set to 1", which the clear above falsified.) The stale-label half of the
+  // same bug, one level up from the fields.
   //
   // By ID, not by `.ctx-banner`: generateUndo appends a second node with that
   // class into #recover-out for the cascade notice, and an unscoped remove

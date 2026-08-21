@@ -336,6 +336,44 @@ func applyEventAnchor(w http.ResponseWriter, opts *query.Options, raw string) bo
 	return true
 }
 
+// anchorMissedWarning fires when a request named ONE event and the fetch
+// returned nothing.
+//
+// Before the anchor, an empty Undo meant exactly one thing: nothing happened in
+// the window. The anchor adds several causes that all render identically — a
+// 200 with `-- No events matched the specified criteria.`, no warnings, no
+// notes — and the operator has no way to tell them apart:
+//
+//   - the anchor is stale after a target edit (the client clears it on
+//     schema/table/pk changes, but that is a client-side mitigation of a
+//     server-side ambiguity, and it deliberately does NOT cover since/until);
+//   - since/until were narrowed past the anchored instant, which is an
+//     ordinary scope edit on a visible field and leaves the banner on screen
+//     still asserting the clicked event was reversed;
+//   - an access profile withholds the target table;
+//   - the event lives only in an archive source that failed under AllowGaps
+//     (these browsing endpoints keep a partially-failing source a log-only
+//     condition — a deliberate trade-off for BROWSING, and a reversal script
+//     naming one event is not browsing);
+//   - the anchor was minted against a different server's index (event_id is a
+//     per-index AUTO_INCREMENT, so the same id exists in several at once);
+//   - the index was rebuilt or renumbered under it.
+//
+// The server is the only layer that can see all of them, so this is where the
+// distinction is drawn. It is a WARNING, not an error: the empty result is a
+// legitimate answer, it just must not read as a finding.
+func anchorMissedWarning(opts query.Options, rowCount int) []string {
+	if opts.EventAnchor == nil || rowCount > 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"The selected event (id %d at %s UTC) was not found. It may fall outside the time range "+
+			"on this form, be withheld by your access profile, be held only in an archive this "+
+			"read did not reach, or belong to a different server — event ids are per-index. "+
+			"This is NOT evidence that the row has no history.",
+		opts.EventAnchor.EventID, opts.EventAnchor.Timestamp.UTC().Format("2006-01-02 15:04:05"))}
+}
+
 // handleEvents serves GET /api/events — the events browser.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	b := s.resolveOr(w, r)
@@ -442,6 +480,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// the archives went unread — but as an info NOTE (#1365): it is a benign
 	// audit fact, not an incident.
 	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided, archiveElisionNote())
+	// The preview mirrors the script, so it mirrors this too: an empty preview
+	// under an anchor is the same ambiguity, rendered as "0 affected event(s)".
+	warnings = append(anchorMissedWarning(opts, len(rows)), warnings...)
 	resp := eventsResponse{
 		Events:   toEventDTOs(rows),
 		Count:    len(rows),
@@ -551,6 +592,9 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// an info note (#1365), since the skip is correctness-preserving —
 	// worded for this surface (a reversal has a window, not pages).
 	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided, recoverArchiveElisionNote())
+	// Prepended: on an empty anchored reversal this is the only thing the
+	// response says, and it has to be the first thing read.
+	warnings = append(anchorMissedWarning(opts, len(rows)), warnings...)
 
 	// The fetch above ran Order=DESC so the limit kept the newest suffix of
 	// the window (#981). Detect truncation on the FETCHED row count — before

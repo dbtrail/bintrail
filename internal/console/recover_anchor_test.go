@@ -121,6 +121,114 @@ func TestEventsRefusesAMalformedAnchor(t *testing.T) {
 	}
 }
 
+// An anchored request that matches nothing must SAY so. Before the anchor,
+// an empty Undo meant one thing — nothing happened in the window. The anchor
+// adds several causes that render identically, and the operator cannot tell
+// them apart from a 200 with an empty script.
+//
+// Both surfaces, because the preview mirrors the script: a silent empty
+// preview is the same ambiguity one click earlier.
+func TestAnchoredEmptyResultIsExplained(t *testing.T) {
+	cols := []string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
+	}
+
+	t.Run("recover", func(t *testing.T) {
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(sqlmock.NewRows(cols))
+		s := newBootServer(db)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(
+			`{"schema":"wordpress","table":"dbt_options","pk":"94057","event":"2026-08-21T20:08:36Z|403440"}`))
+		s.handleRecover(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		var resp recoverResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		assertAnchorMissWarning(t, resp.Warnings)
+	})
+
+	t.Run("events", func(t *testing.T) {
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		mock.ExpectQuery("FROM binlog_events").WillReturnRows(sqlmock.NewRows(cols))
+		s := newBootServer(db)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET",
+			"/api/events?schema=wordpress&table=dbt_options&event=2026-08-21T20%3A08%3A36Z%7C403440", nil)
+		s.handleEvents(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		var resp eventsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		assertAnchorMissWarning(t, resp.Warnings)
+	})
+}
+
+func assertAnchorMissWarning(t *testing.T, warnings []string) {
+	t.Helper()
+	if len(warnings) == 0 {
+		t.Fatal("an anchored request that matched nothing returned no warnings. The response is " +
+			"then byte-identical to 'this row has no history', which is a finding the read did " +
+			"not make.")
+	}
+	joined := strings.Join(warnings, " ")
+	// The id, so the operator can tell WHICH selection missed — the stale-anchor
+	// case is only diagnosable if the id is visible.
+	if !strings.Contains(joined, "403440") {
+		t.Errorf("the warning does not name the event id: %q", joined)
+	}
+	// …and the disclaimer, which is the whole point: without it the sentence
+	// reads as a description of the empty result rather than a refusal to
+	// treat it as evidence.
+	if !strings.Contains(joined, "NOT evidence") {
+		t.Errorf("the warning does not refuse the finding: %q", joined)
+	}
+}
+
+// The mirror: a matching anchored request must NOT carry the warning. Without
+// this the fix could be an unconditional warning on every anchored read, which
+// would train the operator to ignore it.
+func TestAnchoredHitCarriesNoMissWarning(t *testing.T) {
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+	ts := time.Date(2026, 8, 21, 20, 8, 36, 0, time.UTC)
+	rows := sqlmock.NewRows([]string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
+	}).AddRow(
+		int64(403440), "bin.000001", int64(4), int64(40), ts,
+		nil, nil, "wordpress", "dbt_options", int64(parser.EventInsert), "94057",
+		nil, nil, []byte(`{"option_id":94057}`), int64(0), nil, nil, nil,
+	)
+	mock.ExpectQuery("FROM binlog_events").WillReturnRows(rows)
+	s := newBootServer(db)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/recover", strings.NewReader(
+		`{"schema":"wordpress","table":"dbt_options","pk":"94057","event":"2026-08-21T20:08:36Z|403440"}`))
+	s.handleRecover(rec, req)
+	var resp recoverResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if strings.Contains(strings.Join(resp.Warnings, " "), "was not found") {
+		t.Errorf("a matching anchored request carried the miss warning: %v. A warning on every "+
+			"anchored read is a warning the operator learns to skip.", resp.Warnings)
+	}
+}
+
 // A malformed anchor is a 400, never a silent fall back to the unanchored
 // window. The client asked to reverse ONE event; the remaining filters admit
 // the row's whole history, so the degraded result is not a near miss — it is a

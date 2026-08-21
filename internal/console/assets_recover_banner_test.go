@@ -244,6 +244,30 @@ func TestEditingTheTargetRetiresTheUndoAnchor(t *testing.T) {
 	}
 }
 
+// The banner's Clear button must retire the SELECTION, not rebuild the form.
+//
+// It used to navigate("recover"), which re-renders the route into a fresh empty
+// form — so the one control labelled Clear wiped the target and the upper bound
+// while the sentence beside it promised "search this row freely… the time you
+// clicked stays as the upper bound". The mechanism that sentence describes
+// existed as clearUndoAnchor and had no name in the UI.
+//
+// Pinned as the handler, because the copy guard cannot see this: it only
+// requires the substring "Clear" in the detail, which the false sentence
+// satisfied perfectly.
+func TestBannerClearRetiresTheSelectionNotTheForm(t *testing.T) {
+	fn := functionSource(t, "renderRecover")
+	if !strings.Contains(fn, "onclick: () => clearUndoAnchor(form)") {
+		t.Error("the banner's Clear button no longer calls clearUndoAnchor. Any handler that " +
+			"re-renders the route builds a NEW empty form, which contradicts the banner's own " +
+			"promise that the target and the upper bound survive.")
+	}
+	if strings.Contains(fn, `pendingRecover = null; navigate("recover")`) {
+		t.Error("the banner's Clear button navigates again, wiping the target and the upper " +
+			"bound the banner says it keeps.")
+	}
+}
+
 // The busy modal is the only place an operator can see the anchor, because it
 // has no visible field. Itemising every other filter and omitting the one that
 // most determines the scope is how a request becomes unreviewable.
@@ -480,10 +504,13 @@ func TestRestoreToStateClearsTheUndoBridgesPerRowCap(t *testing.T) {
 		{`form.elements.until.value = "";`,
 			"a leftover upper bound silently drops the newest damage from the window"},
 		// The label, not a field — and it is a claim about the fields above.
-		// The banner states "Latest per row is set to 1" as a fact about this
-		// form; the first clear in this list makes that false, so leaving it up
-		// shows a one-change scope over a script that reverses everything after
-		// the instant.
+		// The banner asserts that exactly the clicked event is reversed; the
+		// clears in this list make that false, so leaving it up shows a
+		// one-event scope over a script that reverses everything after the
+		// instant. (The same contradiction ran through the cap before #1411,
+		// when the banner read "Latest per row is set to 1" — a string this
+		// file now BANS at the top, which is why it is described in the past
+		// tense here rather than quoted as current.)
 		{`pendingRecover = null;`,
 			"renderRecover rebuilds the banner from pendingRecover, so leaving it set puts the contradicting banner back on the next render"},
 		{`document.getElementById("undo-ctx-banner")`,
