@@ -1264,32 +1264,51 @@ try {
       f.elements.since.value = "";
       f.elements.until.value = "2000-01-01 00:00:00";
       await runState(f, true);
-      // Sample once renderTimeline's rAF has run. Under reduce that callback
-      // marks every node synchronously; under no-preference the FIRST node is
-      // still 60 ms out and the last 60 + (n-1)*55 ms.
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const nodes = Array.from(document.querySelectorAll(".tl-node"));
-      return { total: nodes.length, arrived: nodes.filter((n) => n.classList.contains("in")).length };
+      // Record the poll tick at which each node FIRST carries `.in`, instead
+      // of sampling once at a fixed instant.
+      //
+      // What is under test is a relative ordering — setTimeout(60) fires
+      // before setTimeout(115) however loaded the runner is — and an ordering
+      // survives a stall that a fixed window does not. The single snapshot
+      // this replaces needed the second node's 115ms to still be in the
+      // future when it read, and this fixture renders exactly two nodes, so
+      // that margin was the whole assertion. It also gets STRONGER as the
+      // fixture grows rather than weaker.
+      const firstSeen = [];
+      let arrived = 0, total = 0;
+      for (let tick = 0; tick < 90; tick++) {
+        const nodes = document.querySelectorAll(".tl-node");
+        total = nodes.length;
+        arrived = 0;
+        nodes.forEach((n, i) => {
+          if (!n.classList.contains("in")) return;
+          arrived++;
+          if (firstSeen[i] === undefined) firstSeen[i] = tick;
+        });
+        if (total > 0 && arrived === total) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      return { total, arrived, firstSeen };
     });
   };
   const rmTl = await staggerProbe("reduce");
   const npTl = await staggerProbe("no-preference");
   await page.emulateMedia({ reducedMotion: null });
 
-  (rmTl.total > 0 && rmTl.arrived === rmTl.total)
-    ? ok("reduced motion: every timeline node has arrived by the first frame — no JS stagger")
-    : bad("reduced motion: every timeline node has arrived by the first frame — no JS stagger", JSON.stringify(rmTl));
+  (rmTl.total > 0 && rmTl.arrived === rmTl.total
+    && rmTl.firstSeen.every((t) => t === rmTl.firstSeen[0]))
+    ? ok("reduced motion: every timeline node arrives on the same tick — no JS stagger")
+    : bad("reduced motion: every timeline node arrives on the same tick — no JS stagger", JSON.stringify(rmTl));
   // The other half, and the reason the arm above is not satisfied by a broken
-  // render: under no-preference the same probe must find nodes still en route.
-  // Needs two nodes to stay clear of the 60 ms first delay on a slow runner;
-  // with fewer, say so rather than assert on a coin flip.
-  if (npTl.total < 2) {
-    ok("reduced motion: no-preference stagger not asserted (timeline rendered " + npTl.total + " node(s))");
-  } else {
-    (npTl.arrived < npTl.total)
-      ? ok("reduced motion: under no-preference the timeline still arrives one node at a time")
-      : bad("reduced motion: under no-preference the timeline still arrives one node at a time", JSON.stringify(npTl));
-  }
+  // render: under no-preference the nodes must arrive IN SEQUENCE.
+  //
+  // Two nodes are enough for an order claim, so unlike the snapshot version
+  // there is no fixture size at which this quietly stops asserting — and a
+  // fixture that drops below two is reported as a failure rather than waved
+  // through, because at that point the scenario has proved nothing.
+  (npTl.total >= 2 && npTl.arrived === npTl.total && npTl.firstSeen[1] > npTl.firstSeen[0])
+    ? ok("reduced motion: under no-preference the timeline arrives one node at a time")
+    : bad("reduced motion: under no-preference the timeline arrives one node at a time", JSON.stringify(npTl));
 
   // Scenario 14c — the Overview against the LIVE daemon (#1300). The fixture
   // scenario below drives buildOverview directly, so it cannot catch a route
@@ -2150,7 +2169,8 @@ try {
       + '<nav class="nav"><a class="nav-item active"><span>x</span></a></nav>'
       + '<button class="cov-refresh-btn spin"><span class="cov-refresh-ico">'
       + '<svg viewBox="0 0 24 24"></svg></span></button>'
-      + '<div class="view-enter"><div>panel</div></div>';
+      + '<div class="view-enter"><div>panel</div></div>'
+      + '<div class="ov-stat"><div class="ov-stat-v">1</div></div>';
     document.body.appendChild(host);
     const cs = (sel, pseudo) => getComputedStyle(host.querySelector(sel), pseudo || null);
     const res = {
@@ -2163,12 +2183,15 @@ try {
       spinAnim: cs(".cov-refresh-ico svg").animationName,
       spinOpacity: cs(".cov-refresh-btn.spin").opacity,
       riseAnim: cs(".view-enter > div").animationName,
-      // Transitions have no @keyframes, so the Go orphan check cannot notice
-      // one being deleted. These two are the only motion in the file with no
-      // other guard behind them.
+      // The Go orphan check anchors on @keyframes, which leaves two blind
+      // spots these four fields cover. A guarded TRANSITION has no keyframes
+      // to orphan; and `rise` is declared on BOTH .view-enter > * and
+      // .ov-stat, so deleting either one leaves the name still "driven".
       nodeTransDur: cs(".tl-node.in").transitionDuration,
       dotTransDur: cs(".tl-dot").transitionDuration,
       dotAnim: cs(".tl-dot").animationName,
+      ovAnim: cs(".ov-stat").animationName,
+      ovTransDur: cs(".ov-stat").transitionDuration,
     };
     host.remove();
     return res;
@@ -2189,6 +2212,9 @@ try {
     && rest.nodeTransDur === "0s" && rest.dotTransDur === "0s")
     ? ok("reduced motion: timeline node and dot rest at their final position, untimed")
     : bad("reduced motion: timeline node and dot rest at their final position, untimed", JSON.stringify(rest));
+  (rest.ovAnim === "none" && rest.ovTransDur === "0s")
+    ? ok("reduced motion: the stat tile neither enters nor transitions")
+    : bad("reduced motion: the stat tile neither enters nor transitions", JSON.stringify(rest));
   rest.railHeight !== "0px"
     ? ok("reduced motion: the active rail keeps its height without railpop")
     : bad("reduced motion: the active rail keeps its height without railpop", rest.railHeight);
@@ -2208,9 +2234,17 @@ try {
     && moved.riseAnim === "rise" && moved.dotAnim === "dotpop")
     ? ok("reduced motion: under no-preference every animation this probe covers still runs")
     : bad("reduced motion: under no-preference every animation this probe covers still runs", JSON.stringify(moved));
-  (moved.nodeTransDur === "0.45s" && moved.dotTransDur === "0.3s")
-    ? ok("reduced motion: the two guarded timeline transitions still have their durations")
-    : bad("reduced motion: the two guarded timeline transitions still have their durations", JSON.stringify(moved));
+  // Asserted as "nonzero", not as an exact duration. The exact form caught the
+  // deletion this exists for, but it ALSO went red on a legitimate retune
+  // (.45s -> .5s) with a message accusing the author of a deletion that never
+  // happened — the cry-wolf shape this file argues against everywhere else.
+  (parseFloat(moved.nodeTransDur) > 0 && parseFloat(moved.dotTransDur) > 0
+    && parseFloat(moved.ovTransDur) > 0)
+    ? ok("reduced motion: the guarded transitions still have a duration under no-preference")
+    : bad("reduced motion: the guarded transitions still have a duration under no-preference", JSON.stringify(moved));
+  moved.ovAnim === "rise"
+    ? ok("reduced motion: the stat tile keeps its own entrance (rise has a second driver)")
+    : bad("reduced motion: the stat tile keeps its own entrance (rise has a second driver)", moved.ovAnim);
   moved.spinOpacity === "1"
     ? ok("reduced motion: the dimmed-button stand-in does not leak into no-preference")
     : bad("reduced motion: the dimmed-button stand-in does not leak into no-preference", moved.spinOpacity);
