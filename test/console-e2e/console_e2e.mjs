@@ -2412,6 +2412,212 @@ try {
         JSON.stringify({ stop: brand.skelStop, ground: brand.skelGround || "NONE FOUND",
           ratio: Number(brand.skelRatio.toFixed(3)), parsed: brand.skelParsed }));
 
+  // ── Scenario 17f — the Events skeleton is visible (#1397) ──
+  //
+  // .ev-skel-bar stood in for event rows at 1.09:1 against the page — fainter
+  // than the 1.17:1 --line-soft hairline separating the rows it stood in for.
+  // A loading list therefore rendered as an empty list with dividers: the
+  // "blank list" that the #1353 comment introducing this feature says must
+  // never be the busy state, on the page an operator opens mid-incident.
+  //
+  // This reads SCREENSHOT PIXELS, not computed style, and that is the whole
+  // design. Two earlier drafts asserted a declared colour, and each time
+  // review produced a one-declaration edit that re-broke the rendering while
+  // the assertion sat unchanged at 1.64. `.ev-loading { opacity: .5 }` is the
+  // one that settled it: opacity does NOT inherit — it composites the group —
+  // so the bar's own computed opacity stays 1 while it renders at 1.267.
+  // Chasing that with an ancestor walk would have left `filter`, a covering
+  // ::after, and a background-image over the fill. A pixel has no such list.
+  //
+  // Every bar is measured (40 of them) because a rule can repaint SOME: the
+  // nth-child rule reaches only even rows, and the five .ev-skel-* width
+  // classes sit on the same element as .ev-skel-bar, so they repaint the bar
+  // without naming it. All three directions are measured because stripping
+  // fills is `paper`'s idiom — five existing rules do exactly that.
+  //
+  // The pulse is sampled rather than modelled. An earlier draft read the
+  // keyframes and folded the minimum opacity into the maths, which is blind
+  // to a pulse that animates any other property. Instead the animation is
+  // frozen at five phases with a negative delay and photographed, so whatever
+  // it animates is simply in the picture.
+  //
+  // Ground is sampled too, from the row's own padding a few pixels above the
+  // bar, so both halves of the ratio come from the same photograph.
+  //
+  // The limit worth naming, since nothing here reaches it: renderEventsLoading
+  // is called directly rather than through runEventsQuery. This proves the
+  // skeleton is visible, not that the fetch path still paints one.
+  const skelShot = async () => {
+    const png = (await page.screenshot({ fullPage: true })).toString("base64");
+    // Decoded by the browser's own PNG reader rather than a hand-rolled one:
+    // the image goes back into the page, onto a canvas, and comes out as bytes.
+    return page.evaluate(async (b64) => {
+      const img = new Image();
+      img.src = "data:image/png;base64," + b64;
+      await img.decode();
+      const cv = document.createElement("canvas");
+      cv.width = img.width; cv.height = img.height;
+      cv.getContext("2d").drawImage(img, 0, 0);
+      const ctx = cv.getContext("2d", { willReadFrequently: true });
+      const at = (x, y) => [...ctx.getImageData(Math.round(x), Math.round(y), 1, 1).data].slice(0, 3);
+      // Document coordinates, to match a full-page shot. The ground point sits
+      // inside the row's top padding, above the bar and well clear of the
+      // bottom border, so it photographs whatever the bar is drawn on.
+      return [...document.querySelectorAll(".ev-skel-bar")].map((b) => {
+        const r = b.getBoundingClientRect();
+        const row = b.closest(".ev-skel-row").getBoundingClientRect();
+        const x = r.left + r.width / 2 + scrollX;
+        return { bar: at(x, r.top + r.height / 2 + scrollY), ground: at(x, row.top + 3 + scrollY) };
+      });
+    }, png);
+  };
+  const relLum = (d) => {
+    const c = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+    return 0.2126 * c(d[0]) + 0.7152 * c(d[1]) + 0.0722 * c(d[2]);
+  };
+  const skelWorst = (samples) => samples.length === 0 ? null : samples.reduce((worst, s) => {
+    const [hi, lo] = [relLum(s.bar), relLum(s.ground)].sort((a, b) => b - a);
+    const ratio = (hi + 0.05) / (lo + 0.05);
+    return !worst || ratio < worst.ratio ? { ratio, n: samples.length, bar: s.bar, ground: s.ground } : worst;
+  }, null);
+
+  // Resting first, under emulated reduced motion — a determinism choice, since
+  // mid-pulse a photograph catches whatever frame it lands on. It is also the
+  // honest worst case: the pulse is gated behind the same query, so a
+  // reduced-motion user gets no movement at all to suggest the bar is there,
+  // and the static value was the invisible one.
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  // Repainted before every shot, not once for the run: renderEvents ends by
+  // firing its own query, and that resolve calls buildEventRows, which clears
+  // #ev-rows. Asserting the skeleton survived an await would be a flake in the
+  // one scenario whose stated design is determinism.
+  const skelPaint = () => page.evaluate(async () => {
+    navigate("events");
+    await new Promise((r) => setTimeout(r, 300));
+    const rows = document.querySelector("#ev-rows");
+    if (!rows) return 0;
+    renderEventsLoading(rows);
+    return document.querySelectorAll(".ev-skel-bar").length;
+  });
+  const skelSetDir = (dir) => page.evaluate((d) => {
+    const root = document.documentElement;
+    d === null ? root.removeAttribute("data-dir") : root.setAttribute("data-dir", d);
+  }, dir);
+
+  const skelPrevDir = await page.evaluate(() => document.documentElement.getAttribute("data-dir"));
+  let skelBars = 0;
+  const skelRest = {};
+  for (const dir of ["studio", "paper", "trail"]) {
+    await skelSetDir(dir);
+    skelBars = await skelPaint();
+    skelRest[dir] = skelWorst(await skelShot());
+  }
+  await skelSetDir(skelPrevDir);
+
+  // Then the pulse, sampled rather than modelled: freeze the animation with a
+  // negative delay and photograph it. Whatever it animates is in the picture,
+  // so swapping the animated property cannot slip past — an earlier draft read
+  // the keyframes' opacity and was blind to exactly that.
+  //
+  // A uniform tenth-of-a-cycle grid rather than the phases this keyframe
+  // happens to use, since reading the offsets would put the sampler back
+  // inside the model it is meant to escape. The cost is stated rather than
+  // hidden: a dip narrower than a tenth of a cycle can fall between samples.
+  // An eased pulse is flat around its extreme, so the grid finds today's, and
+  // it would find one moved off 50% — which the previous five-phase grid,
+  // clustered around this keyframe's own minimum, would not have.
+  //
+  // One direction, not three: the pulse dims whatever the fill is, so sweeping
+  // it per direction would re-measure the same multiplier. A direction that
+  // strips the fill is caught by the resting floor above, in the direction
+  // that strips it.
+  //
+  // The freeze is verified rather than trusted. If the paused state or the
+  // delay silently failed to take, every photograph would land on the RESTING
+  // pixel, clear the floor, and report that the dimmest phase had been
+  // measured when nothing was. That is a vacuous pass — the failure this
+  // scenario exists to make impossible — so the computed values are read back
+  // after being set, which checks the instrument rather than the outcome.
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await skelPaint();
+  const skelPhases = [];
+  for (const phase of [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]) {
+    const froze = await page.evaluate((p) => {
+      let name = "none", frozen = true;
+      for (const b of document.querySelectorAll(".ev-skel-bar")) {
+        const before = getComputedStyle(b);
+        name = before.animationName;
+        const secs = parseFloat(before.animationDuration) || 0;
+        b.style.animationPlayState = "paused";
+        b.style.animationDelay = `${-p * secs}s`;
+        const after = getComputedStyle(b);
+        if (after.animationPlayState !== "paused") frozen = false;
+        if (Math.abs(parseFloat(after.animationDelay) + p * secs) > 1e-6) frozen = false;
+      }
+      return { name, frozen };
+    }, phase);
+    skelPhases.push({ phase, ...froze, ...(skelWorst(await skelShot()) || {}) });
+  }
+  await page.emulateMedia({ reducedMotion: null });
+  await page.evaluate(() => { const r = document.querySelector("#ev-rows"); if (r) clear(r); });
+
+  const skelShots = Object.entries(skelRest);
+  const skelEnough = (s) => s && s.n >= 30;
+  const skelRestWorst = skelShots.every(([, s]) => skelEnough(s))
+    ? skelShots.reduce((w, [dir, s]) => (!w || s.ratio < w.ratio ? { dir, ...s } : w), null)
+    : null;
+  const skelPulseWorst = skelPhases.every(skelEnough)
+    ? skelPhases.reduce((w, s) => (!w || s.ratio < w.ratio ? s : w), null)
+    : null;
+  const skelR = (s) => s && +s.ratio.toFixed(3);
+  const skelDetail = () => JSON.stringify({
+    bars: skelBars,
+    rest: Object.fromEntries(skelShots.map(([d, s]) => [d, skelR(s)])),
+    pulse: skelPhases.map((p) => ({ at: p.phase, r: skelR(p), frozen: p.frozen, anim: p.name })),
+    worstRest: skelRestWorst && { dir: skelRestWorst.dir, ratio: skelR(skelRestWorst) },
+    worstPulse: skelPulseWorst && { at: skelPulseWorst.phase, ratio: skelR(skelPulseWorst) },
+  });
+
+  // Hoisted out of the two floors below so a broken fixture reads as a broken
+  // fixture. An empty sample list has no worst member, and every floor is
+  // satisfied by nothing at all — the vacuous direction. Each shot must also
+  // carry its own bars, since the list is repainted per direction.
+  (skelBars >= 30 && skelRestWorst && skelPulseWorst)
+    ? ok("events skeleton: the loading state paints bars this scenario can photograph")
+    : bad("events skeleton: the loading state paints bars this scenario can photograph", skelDetail());
+
+  // A floor placed BETWEEN the two measured states rather than at either:
+  // --surface-3 rendered 1.09 and the neutral mix renders 1.64, so 1.35 is
+  // what makes this bind. Reverting rings, and so does reaching for any
+  // weaker token on the ramp (--line-soft 1.17, --line 1.28). It tolerates an
+  // ordinary retune of the mix's two inputs — 80/20 is 1.52, 90/10 is 1.40 —
+  // and, like 17e's floor, it is NOT a general washout detector: a deliberate
+  // "make it subtler" edit has room to reach roughly 91% --line first — the
+  // PULSE floor below is what binds there, one point before this one. It has
+  // no opinion about hue either; --skel-warm measures 1.68 and would sail
+  // through, which is deliberate and explained at the token.
+  //
+  // Three directions, not four axes: [data-accent] is NOT swept, so an
+  // accent-scoped rule on these bars would go unphotographed. Said plainly
+  // because the directions ARE swept and a reader could assume the rest.
+  (skelRestWorst && skelRestWorst.ratio >= 1.35)
+    ? ok("events skeleton: every bar stays visible at rest, in every direction")
+    : bad("events skeleton: every bar stays visible at rest, in every direction", skelDetail());
+  // The pulse's own floor, separate because it fails to a different edit —
+  // deepening the dip rather than weakening the fill. 1.15 sits between the
+  // old RESTING value (1.09) and this bar's dip (1.24), so the claim that the
+  // animation no longer carries the bar's visibility is held by a measurement
+  // rather than by the comment making it. Deepening 0.45 -> 0.12 photographs
+  // at 1.06, below where this whole change started.
+  //
+  // A removed pulse is a legitimate pass, not a hole: with no animation the
+  // resting floor above already describes every frame there is. What is NOT
+  // allowed is an animation that exists while the freeze did not take.
+  (skelPulseWorst && skelPhases.every((p) => p.name === "none" || p.frozen) &&
+    skelPulseWorst.ratio >= 1.15)
+    ? ok("events skeleton: the pulse's dimmest phase stays above where the bar started")
+    : bad("events skeleton: the pulse's dimmest phase stays above where the bar started", skelDetail());
+
   // ── Scenario 18 — advisory severity split on the archive fixture (#1365) ──
   // The archive-elision record must render in the INFO register (muted line,
   // no ⚠ icon, no amber, no alert classes) while a real coverage-gap warning

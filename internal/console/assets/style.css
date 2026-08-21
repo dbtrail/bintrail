@@ -141,8 +141,9 @@
   --brand-wash-sun:  color-mix(in srgb, var(--sun) 12%, transparent);
   --brand-wash-pink: color-mix(in srgb, var(--brand-canvas-1) 3%, transparent);
   /* The OVERVIEW loading bars, warmed toward the hero pink (#1385). Not every
-     skeleton: the Events list uses .ev-skel-bar, a flat --surface-3 fill with a
-     pulse rather than a shimmer, and it is left alone.
+     skeleton: the Events list's .ev-skel-bar is a flat fill with a pulse
+     rather than a shimmer, and it stays NEUTRAL — see --skel-neutral below
+     for why the warmth stops here.
 
      A much stronger mix than the two washes above because the TOKEN is opaque
      — it mixes toward --line, where those mix toward transparent — so the
@@ -182,6 +183,57 @@
      replaced by the rows it stood in for — and a skeleton encodes nothing, so
      no brand colour is carrying data here. */
   --skel-warm: color-mix(in srgb, var(--brand-canvas-1) 26%, var(--line));
+  /* The EVENTS list's loading bars (#1397). The ground is plain white:
+     .events declares no background and every element between the bar and
+     <body> is transparent, in all three directions (they re-point
+     --panel-bg, which this list never consumes). Against it, read off
+     rendered pixels:
+
+       .ev-skel-bar, was --surface-3      1.09   (pulse trough 1.04)
+       the --line-soft divider beside it  1.17
+       this token                         1.64   (pulse trough 1.24)
+
+     The bar was fainter than the hairline separating the rows it stands in
+     for, so a loading list rendered as an empty list with dividers — the
+     "blank list" the .ev-skel-row comment says must never be the busy state,
+     on the page an operator opens mid-incident. The pulse made that worse
+     rather than better, and it is gated behind prefers-reduced-motion, so
+     with motion reduced there was nothing moving to suggest the bar was
+     there at all. The dip goes lower still (1.04), but the static case is the
+     one with nothing compensating for it, and it is the one the console-e2e
+     floor measures.
+
+     The pulse itself is left as it was: its dimmest point now clears the old
+     RESTING value, so the animation no longer carries the bar's visibility.
+     A separate assertion holds that, because deepening a pulse is an
+     ordinary polish edit and 0.45 -> 0.12 lands below where this started.
+
+     For scale, .skel-line — the Overview bar — peaks at 1.68 on this same
+     white ground, and 1.60 on the studio tile it usually sits on. Peaks
+     only: it is a gradient sweeping a TRANSPARENT mid-stop, so unlike this
+     bar it passes through roughly 1.0:1 once per cycle. An earlier draft of
+     this table gave it a "trough 1.25", which was this bar's opacity pulse
+     arithmetic applied to an element that has no opacity pulse.
+
+     color-mix across the two ends of the ramp the bar lives between, not a
+     new literal, so it tracks a retune of either. The erosive direction is
+     raising the --line share, which walks it back toward the page: 80% is
+     1.52 and 90% is 1.39. Lightening either input erodes it more gently
+     (--line at L 0.95 is 1.53, --ink-4 at L 0.72 is 1.54). The console-e2e
+     assertions hold the floor; these numbers are one moment's record.
+
+     NEUTRAL is the status quo, not a ratified rule, and nothing enforces it
+     — any hue clearing the floor would pass. #1385's close gives two reasons
+     for stopping the warmth here: that this is a flat pulse rather than a
+     shimmer and out of scope for an issue that named the shimmer, and a
+     strict reading of the rule as written above: "pink never lands on a
+     surface that carries a row". That comment argues the other way about
+     its OWN bars, which also sit in row-carrying panels — a placeholder
+     never coexists with a row, and encodes nothing. #1397 was filed as a
+     visibility fix and says so outright ("worth fixing whatever colour it
+     ends up"). So: a decline was recorded, no rule was ratified, and nothing
+     in the code holds either — which is why this is a comment. */
+  --skel-neutral: color-mix(in srgb, var(--line) 70%, var(--ink-4));
   /* The nav's active rail EXTENDS the blue->violet accent gradient into the
      sunset instead of replacing it: product blue stays the interactive accent.
      A separate token on purpose — .timeline::before is a DATA surface and
@@ -752,7 +804,7 @@ button { font-family: inherit; }
   align-items: center; gap: 12px;
   padding: 13px 14px; border-bottom: 1px solid var(--line-soft);
 }
-.ev-skel-bar { height: 12px; border-radius: 6px; background: var(--surface-3); }
+.ev-skel-bar { height: 12px; border-radius: 6px; background: var(--skel-neutral); }
 .ev-skel-time { width: 76%; }
 .ev-skel-table { width: 58%; }
 .ev-skel-type { width: 62%; }
