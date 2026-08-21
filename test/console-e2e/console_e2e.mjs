@@ -2317,29 +2317,53 @@ try {
       deleteRef: cs(ref).color,
     };
 
-    // The warmed loading bar (#1385), and the one bound that matters for it:
-    // it is an opaque fill nothing is read through, so no contrast CEILING
-    // applies — but it still has to be distinguishable from the panel, or a
-    // loading Overview reads as an empty one. Measured through a canvas rather
-    // than compared as strings, because both values are authored in oklch and
-    // one of them is a color-mix: string equality would answer a different
-    // question, and only rendered pixels say how far apart they are.
+    // The warmed loading bar (#1385). Measured off the ELEMENT, which is the
+    // whole point and was got wrong first: an earlier version read --skel-warm
+    // and --surface-2 off :root and compared those. That measures a token pair
+    // the bar need not use — repointing .skel-line back at var(--line), the
+    // literal state before the change, left it green.
+    //
+    // So: pull the first colour stop out of the bar's own computed gradient,
+    // and composite it over the first painted ancestor rather than over black,
+    // which keeps the arithmetic honest if the stop ever carries alpha.
+    // Canvas rather than string comparison because the two values are a
+    // color-mix and an oklch — they can never compare equal, so a string check
+    // would be vacuous rather than merely different; only rendered pixels say
+    // how far apart they are.
     const pending = ovStatPending("changes indexed", "all time");
     host.appendChild(pending);
-    res.skelPainted = cs(pending.querySelector(".skel-line")).backgroundImage;
+    const bar = pending.querySelector(".skel-line");
+    res.skelPainted = cs(bar).backgroundImage;
+    res.skelStop = (res.skelPainted.match(/\b(?:rgba?|color|oklch|oklab|hsla?)\([^)]*\)|#[0-9a-fA-F]{3,8}\b/) || [])[0] || "";
+    let ground = "rgba(0, 0, 0, 0)";
+    for (let n = bar; n && (ground === "rgba(0, 0, 0, 0)" || ground === "transparent"); n = n.parentElement) {
+      ground = cs(n).backgroundColor;
+    }
+    res.skelGround = ground;
+
     const cv = document.createElement("canvas");
     cv.width = cv.height = 1;
     const ctx = cv.getContext("2d", { willReadFrequently: true });
-    const lum = (token) => {
-      ctx.fillStyle = "#000";
+    // An unparseable fillStyle is IGNORED, leaving the previous value in place
+    // — and the previous value would be the ground, so a rejected stop would
+    // measure 1.0 and read as a failure, or worse against black would inflate
+    // the ratio and pass. Checked explicitly instead of hoped for.
+    ctx.fillStyle = "#010203";
+    ctx.fillStyle = res.skelStop;
+    res.skelParsed = ctx.fillStyle !== "#010203";
+    const px = (c, over) => {
+      ctx.clearRect(0, 0, 1, 1);
+      ctx.fillStyle = over;
       ctx.fillRect(0, 0, 1, 1);
-      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue(token).trim();
+      ctx.fillStyle = c;
       ctx.fillRect(0, 0, 1, 1);
-      const d = ctx.getImageData(0, 0, 1, 1).data;
+      return ctx.getImageData(0, 0, 1, 1).data;
+    };
+    const relLum = (d) => {
       const c = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
       return 0.2126 * c(d[0]) + 0.7152 * c(d[1]) + 0.0722 * c(d[2]);
     };
-    const [hi, lo] = [lum("--skel-warm"), lum("--surface-2")].sort((a, b) => b - a);
+    const [hi, lo] = [relLum(px(res.skelStop, ground)), relLum(px(ground, ground))].sort((a, b) => b - a);
     res.skelRatio = (hi + 0.05) / (lo + 0.05);
 
     host.remove();
@@ -2367,14 +2391,21 @@ try {
   (brand.wordImage.includes("gradient") && brand.wordColor === transparent)
     ? ok("brand paint: the sidebar wordmark wears the headline gradient")
     : bad("brand paint: the sidebar wordmark wears the headline gradient", JSON.stringify(brand));
-  // A floor, not the measurement. 1.60:1 is what it renders at today; 1.3 is
-  // low enough that an ordinary retune of --brand-canvas-1 or --line does not
-  // ring, and high enough to catch a mix that washes the bar out — which is
-  // the direction a "make it subtler" edit pushes it.
-  (brand.skelPainted.includes("gradient") && brand.skelRatio >= 1.3)
-    ? ok("brand paint: the warmed loading bar stays visible against its panel")
-    : bad("brand paint: the warmed loading bar stays visible against its panel",
-        brand.skelPainted + " ratio=" + brand.skelRatio.toFixed(3));
+  // A floor placed BETWEEN the two measured states, not at the measurement:
+  // the warmed stop renders 1.60:1 on the studio tile and the plain --line it
+  // replaced rendered 1.23:1, so 1.3 separates them. That is what makes the
+  // check bind — reverting the declaration lands at 1.23 and rings. It is not
+  // a general washout detector: the mix has to fall to roughly 5% pink before
+  // 1.3 fires on its own, so a "make it subtler" retune is NOT caught here.
+  //
+  // Studio is measured because it is the shipped direction and also the worst
+  // of the three grounds; paper and trail resolve to white, where the same
+  // stop sits at 1.68:1.
+  (brand.skelParsed && brand.skelPainted.includes("gradient") && brand.skelRatio >= 1.3)
+    ? ok("brand paint: the warmed loading bar's stop stays clear of its panel")
+    : bad("brand paint: the warmed loading bar's stop stays clear of its panel",
+        JSON.stringify({ stop: brand.skelStop, ground: brand.skelGround,
+          ratio: Number(brand.skelRatio.toFixed(3)), parsed: brand.skelParsed }));
 
   // ── Scenario 18 — advisory severity split on the archive fixture (#1365) ──
   // The archive-elision record must render in the INFO register (muted line,

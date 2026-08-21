@@ -140,17 +140,45 @@
      would silently stop being "--sun at 12%" the day --sun moves. */
   --brand-wash-sun:  color-mix(in srgb, var(--sun) 12%, transparent);
   --brand-wash-pink: color-mix(in srgb, var(--brand-canvas-1) 3%, transparent);
-  /* The loading bars, warmed toward the hero pink (#1385). A much stronger
-     mix than the washes above because this is an opaque FILL rather than a
-     tint over content — nothing is read through it, so the alpha ceiling that
-     constrains those two does not apply here. What does apply is the opposite
-     bound: the bar has to stay visible against the panel it sits on, or the
-     loading state reads as an empty page. Measured off rendered pixels on
-     --surface-2, the warmed bar sits at 1.60:1 against its ground where the
-     plain --line it replaces sat at 1.23:1 — noticeably MORE separated, not
-     less, which was not the expected direction and is why it was measured.
-     color-mix over --line rather than a new colour, so it still tracks the
-     line token if the ramp is ever retuned. */
+  /* The OVERVIEW loading bars, warmed toward the hero pink (#1385). Not every
+     skeleton: the Events list uses .ev-skel-bar, a flat --surface-3 fill with a
+     pulse rather than a shimmer, and it is left alone.
+
+     A much stronger mix than the two washes above because the TOKEN is opaque
+     — it mixes toward --line, where those mix toward transparent — so the
+     alpha ceiling that protects text read through them protects nothing here.
+     (The rendered bar is not opaque: the DECLARATION's mid-stop is
+     `transparent`, which is what produces the sweep.)
+
+     The bound that does apply is the opposite one: the solid stop has to stay
+     distinguishable from the panel, or a loading Overview reads as an empty
+     one. Read off rendered pixels, per direction:
+
+       ground                                 warmed   was (--line)
+       --surface-2, the studio tile             1.60         1.23
+       paper and trail (both resolve white)     1.68         1.28
+
+     Studio is the shipped default and also the worst case, which is why the
+     browser assertion measures that one. More separated than before, not less
+     — the direction was not the expected one, and is why it was measured
+     rather than converted.
+
+     Those figures are the stop's PEAK against its ground. The mid-stop is
+     transparent and the shimmer sweeps it, so every point on the bar passes
+     through roughly 1.0:1 once per cycle. That is the placeholder's whole
+     visual idiom, not a defect, but it is why the number belongs to the stop
+     and not to "the bar".
+
+     color-mix over --line rather than a new colour, so the bar still tracks
+     the ink ramp. It tracks BOTH inputs, and tracking does not preserve the
+     ratio above: darkening --line toward --surface-2 pulls the studio figure
+     from 1.60 to about 1.38. The browser assertion is what holds the floor;
+     the numbers here are a record of one moment.
+
+     On the data rule: these bars do appear inside .ov-evlist and .ov-tables,
+     which will carry rows. They never coexist with one — a placeholder is
+     replaced by the rows it stood in for — and a skeleton encodes nothing, so
+     no brand colour is carrying data here. */
   --skel-warm: color-mix(in srgb, var(--brand-canvas-1) 26%, var(--line));
   /* The nav's active rail EXTENDS the blue->violet accent gradient into the
      sunset instead of replacing it: product blue stays the interactive accent.
@@ -1244,8 +1272,8 @@ button { font-family: inherit; }
 .skel-note { font-family: var(--f-mono); font-size: 11px; color: var(--ink-4); margin-top: 8px; }
 @keyframes skel-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 /* Without the shimmer the bar is still visible: at the static
-   background-position the gradient renders solid --line across its left half,
-   fading out towards the right. A placeholder either way, so unlike the
+   background-position the gradient renders solid --skel-warm across its left
+   half, fading out towards the right. A placeholder either way, so unlike the
    spinner below it needs no stand-in. */
 @media (prefers-reduced-motion: no-preference) {
   .skel-line { animation: skel-shimmer 1.4s linear infinite; }
