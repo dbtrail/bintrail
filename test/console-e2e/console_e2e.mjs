@@ -2339,7 +2339,12 @@ try {
     for (let n = bar; n && (ground === "rgba(0, 0, 0, 0)" || ground === "transparent"); n = n.parentElement) {
       ground = cs(n).backgroundColor;
     }
-    res.skelGround = ground;
+    // Belt matching the fillStyle one below, for the same reason: if every
+    // ancestor came back transparent the ground's luminance is 0 and the ratio
+    // INFLATES past any floor, so the failure direction is a silent pass.
+    // Unreachable while body paints --bg, which is exactly when a belt is
+    // cheap. Recorded as null so the assertion has something to test.
+    res.skelGround = (ground === "rgba(0, 0, 0, 0)" || ground === "transparent") ? null : ground;
 
     const cv = document.createElement("canvas");
     cv.width = cv.height = 1;
@@ -2401,10 +2406,10 @@ try {
   // Studio is measured because it is the shipped direction and also the worst
   // of the three grounds; paper and trail resolve to white, where the same
   // stop sits at 1.68:1.
-  (brand.skelParsed && brand.skelPainted.includes("gradient") && brand.skelRatio >= 1.3)
+  (brand.skelParsed && brand.skelGround && brand.skelPainted.includes("gradient") && brand.skelRatio >= 1.3)
     ? ok("brand paint: the warmed loading bar's stop stays clear of its panel")
     : bad("brand paint: the warmed loading bar's stop stays clear of its panel",
-        JSON.stringify({ stop: brand.skelStop, ground: brand.skelGround,
+        JSON.stringify({ stop: brand.skelStop, ground: brand.skelGround || "NONE FOUND",
           ratio: Number(brand.skelRatio.toFixed(3)), parsed: brand.skelParsed }));
 
   // ── Scenario 18 — advisory severity split on the archive fixture (#1365) ──

@@ -171,8 +171,10 @@
 
      color-mix over --line rather than a new colour, so the bar still tracks
      the ink ramp. It tracks BOTH inputs, and tracking does not preserve the
-     ratio above: darkening --line toward --surface-2 pulls the studio figure
-     from 1.60 to about 1.38. The browser assertion is what holds the floor;
+     ratio above. The erosive direction is LIGHTENING --line toward the panel
+     it sits on: --line is L 0.918 against --surface-2's 0.985, so moving it up
+     that gap pulls the studio figure from 1.60 to about 1.37 at the far end.
+     Darkening is the safe direction and gains margin (L 0.85 measures 1.92). The browser assertion is what holds the floor;
      the numbers here are a record of one moment.
 
      On the data rule: these bars do appear inside .ov-evlist and .ov-tables,
