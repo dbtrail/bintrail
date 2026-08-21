@@ -2641,7 +2641,7 @@ async function runState(form, history) {
     const mwarns = el("div", { class: "warnings" });
     dlg.body.append(mwarns);
     renderWarnings(mwarns, data.warnings);
-    if (history) renderTimeline(dlg.body, data);
+    if (history) renderTimeline(dlg.body, data, dlg.close);
     else {
       renderStateAt(dlg.body, data);
       // The action retargets the form UNDERNEATH this dialog, so the dialog
@@ -2782,6 +2782,12 @@ function renderTimetravel(params) {
   viewEnter();
 }
 
+// runReconstruct is the standalone Time-travel view, NOT the Restore view's
+// embedded panel. It renders inline and keeps doing so: #1405 moved runState
+// into a dialog because its output was wedged between a filter form and the
+// reversal panel it was pushing off screen. Here the reconstructed state IS
+// the page, with nothing below it to displace, so a dialog would add a scrim
+// and buy nothing.
 async function runReconstruct(form, history) {
   const gen = serverGen;
   const warns = $("#tt-warnings", VIEW());
@@ -2827,7 +2833,12 @@ function stateTable(state) {
   return table;
 }
 
-function renderTimeline(container, data) {
+// onDone, when given, is the caller's dismissal — the timeline is rendered
+// into a dialog from runState and inline from runReconstruct, and only the
+// first has anything to close. Each node carries its OWN restore button, so
+// unlike the state panel there is no single footer to pin outside the scroll;
+// the button travels with the node it names, which is where it belongs.
+function renderTimeline(container, data, onDone) {
   const entries = data.history || [];
   container.append(reconstructMeta(data, "history through " + data.at + " · " + entries.length + " state(s)"));
   if (!entries.length) { container.append(el("div", { class: "deleted-note", text: "No history for this primary key in the time range that's been indexed." })); return; }
@@ -2877,6 +2888,13 @@ function renderTimeline(container, data) {
         class: "btn btn-sm tl-restore", type: "button", text: "Restore to this state",
         title: "Reverse every change after " + e.time + " UTC, leaving the row as shown here",
         onclick: () => {
+          // Same reason the state panel's action closes first: aimUndoAtInstant
+          // scrolls the form into view and previews the rows, and both are
+          // invisible behind a scrim. This one used to be carried by accident —
+          // previewRecover's busy dialog happens to replace the mount — which
+          // held right up until previewRecover took one of its two early
+          // returns and left the error rendering behind the scrim.
+          if (onDone) onDone();
           const form = document.getElementById("recover-form");
           if (form) aimUndoAtInstant(form, e.time);
         },

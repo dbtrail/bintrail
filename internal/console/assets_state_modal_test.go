@@ -29,6 +29,18 @@ import (
 // function; scoping to the body is what makes the checks mean anything.
 func jsFunctionBody(t *testing.T, js, name string) string {
 	t.Helper()
+	// Whole-line comments go BEFORE the brace walk, not after. The walk counts
+	// braces in raw source, so a `{` inside a comment in the body unbalances it
+	// and the extracted region ends in the wrong place — and this change added
+	// two dozen lines of comment to the very function being walked. Stripping
+	// first costs nothing and removes the hazard for the shape that actually
+	// grows here.
+	//
+	// Residual, stated rather than papered over: a TRAILING comment carrying an
+	// unbalanced brace still confuses the count. Handling that needs a real
+	// tokenizer, and the failure is loud (a Fatalf about unbalanced braces or a
+	// missing needle), not silent.
+	js = stripJSCommentLines(js)
 	i := strings.Index(js, "function "+name+"(")
 	if i < 0 {
 		t.Fatalf("app.js: no function %s( — it was renamed or removed. Everything below "+
@@ -52,7 +64,7 @@ func jsFunctionBody(t *testing.T, js, name string) string {
 	if end < 0 {
 		t.Fatalf("app.js:%d: unbalanced braces in %s", lineOf(js, i), name)
 	}
-	body := stripJSCommentLines(js[i+open : end+1])
+	body := js[i+open : end+1]
 	var out []string
 	for _, ln := range strings.Split(body, "\n") {
 		if c := strings.Index(ln, "//"); c >= 0 {
@@ -95,30 +107,67 @@ func TestStateResultsRenderInDialog(t *testing.T) {
 	// Past that point the only thing runState may do with them is empty them:
 	// any other use means a result is being painted back into the strip the
 	// dialog exists to keep clear. This is the single-word regression.
+	//
+	// Two separate scans, because the identifiers and the ids fail differently.
+	//
+	// The identifier scan runs over CODE ONLY. Run over the raw region it
+	// reports ordinary English: this dialog's own descriptions are in here, and
+	// so is a catch branch where "timed out" is a live thing to write. Review
+	// demonstrated it with one plausible added sentence — "Older changes have
+	// aged out of the index" — which produced a confident, wholly fabricated
+	// alarm about inline rendering. A guard that cries wolf over prose gets
+	// weakened by the next person to hit it, so the literals are blanked (not
+	// removed: blanking preserves every offset, so the reported line is still
+	// the real one).
+	code := regexp.MustCompile(`"[^"\n]*"`).ReplaceAllStringFunc(region, func(s string) string {
+		return `"` + strings.Repeat(" ", len(s)-2) + `"`
+	})
 	inline := regexp.MustCompile(`\b(out|warns)\b`)
-	for _, m := range inline.FindAllStringIndex(region, -1) {
+	for _, m := range inline.FindAllStringIndex(code, -1) {
 		// clear(out) / clear(warns) are the permitted mentions.
-		pre := region[:m[0]]
-		if strings.HasSuffix(pre, "clear(") {
+		if strings.HasSuffix(code[:m[0]], "clear(") {
 			continue
 		}
 		line := strings.TrimSpace(lineAround(region, m[0]))
 		t.Errorf("runState: %q is used after the validation return, in %q. The inline "+
 			"containers are for the form-validation refusal only; a result rendered there "+
-			"lands back under the filter form (#1405).", region[m[0]:m[1]], line)
+			"lands back under the filter form (#1405).", code[m[0]:m[1]], line)
+	}
+
+	// …and the ids scan the literals the first one just blanked. Blanking alone
+	// would open the shape it closed: re-looking-up the container by id
+	// (`renderStateAt(document.getElementById("state-out"), data)`) puts the
+	// name only inside a string, where the identifier scan can no longer see
+	// it. Narrowing a guard is how false negatives get in.
+	for _, id := range []string{"state-out", "state-warnings"} {
+		if strings.Contains(region, `"`+id+`"`) {
+			t.Errorf("runState: %q is looked up again after the validation return. Those "+
+				"containers hold the form-validation refusal only; a result sent back to one "+
+				"lands under the filter form (#1405).", id)
+		}
 	}
 }
 
 func TestStateDialogKeepsRestoreReachable(t *testing.T) {
 	region := runStateAfterValidation(t)
 
-	// Two halves of one claim, and neither is worth anything alone. Appending
-	// the action outside the scrolling body only helps if the BODY is what
-	// scrolls; capping the body only helps if the action is not inside it.
-	// A wide row's state table and a busy row's timeline both exceed the
-	// viewport, and "Restore to this state" is why the dialog was opened.
-	if !strings.Contains(region, ".panel.append(") {
-		t.Error("runState: the restore action is not appended to the dialog PANEL. Inside " +
+	// Two halves of one claim about SHOW STATE, and neither is worth anything
+	// alone. Appending the action outside the scrolling body only helps if the
+	// BODY is what scrolls; capping the body only helps if the action is not
+	// inside it. A wide row's state table exceeds the viewport, and
+	// "Restore to this state" is why the dialog was opened.
+	//
+	// Scoped to the branch, not the function. The claim does NOT hold for Show
+	// history and must not be written as if it did: there every node carries
+	// its own restore button, which belongs beside the node it names and
+	// scrolls with it. Asserting over the whole region would state a property
+	// of one mode as a property of both — and the CSS comment beside this rule
+	// said exactly that until review caught it.
+	if i := strings.Index(region, "renderStateAt("); i < 0 {
+		t.Error("runState no longer calls renderStateAt — this check is scoped to the Show state " +
+			"branch and can no longer find it.")
+	} else if !strings.Contains(region[i:], ".panel.append(") {
+		t.Error("runState: the Show state action is not appended to the dialog PANEL. Inside " +
 			".modal-body it scrolls away with the state table it belongs to (#1405).")
 	}
 

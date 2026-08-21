@@ -1238,9 +1238,19 @@ try {
     // the form, because aimUndoAtInstant scrolls that form into view and
     // previews rows — both invisible behind a scrim.
     const inline = !!document.querySelector("#state-out .statetable");
+    // previewRecover is stubbed for the duration of the click, and that is the
+    // whole assertion rather than a convenience. aimUndoAtInstant calls it
+    // synchronously, previewRecover opens the busy dialog, and openBusyModal
+    // clears the shared #modal mount — so the state dialog disappears whether
+    // or not restoreToStateAction ever calls onDone. Review showed the check
+    // below passing on that side effect alone. With the side effect removed,
+    // only the real dismissal can empty the mount.
+    const realPreview = previewRecover;
+    previewRecover = () => {};
     btn.click();
-    return { since: f.elements.since.value, until: f.elements.until.value, at, inline,
-             stillOpen: !!document.querySelector("#modal .state-modal") };
+    const stillOpen = !!document.querySelector("#modal .state-modal");
+    previewRecover = realPreview;
+    return { since: f.elements.since.value, until: f.elements.until.value, at, inline, stillOpen };
   });
   {
     const m = /as of (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/.exec(bridge.at || "");
@@ -1257,6 +1267,82 @@ try {
       ? ok("restore: 'Restore to this state' closes the dialog before retargeting the form")
       : bad("restore: 'Restore to this state' closes the dialog before retargeting the form", JSON.stringify(bridge));
   }
+
+  // #1405's hard constraint, and the one the change is most likely to lose:
+  // the warnings travel INSIDE the dialog. They used to fill a sibling of
+  // #state-out that would now sit behind the scrim, and a reconstruct can
+  // return stale_baseline or a capture-gap caveat — a state read with its
+  // caveat hidden is worse than the old layout, not better.
+  //
+  // Driven by stubbing `api` rather than by finding a fixture that warns: the
+  // claim is about WHERE renderWarnings puts its output, and a canned response
+  // exercises the real runState → openModal → renderWarnings path while making
+  // the warning unconditional. Review showed deleting the whole warnings block
+  // left both suites green, so nothing was holding this.
+  const warnPlacement = await page.evaluate(async () => {
+    const real = api;
+    api = async (path, opts) => {
+      if (path.startsWith("/api/reconstruct")) {
+        return { schema: "e2eshop", table: "orders", pk: "1", at: "2026-01-01 00:00:00",
+                 found: true, state: { id: 1, status: "shipped" },
+                 warnings: ["stale_baseline: newest snapshot has no orders, fell back to an older one"] };
+      }
+      return real(path, opts);
+    };
+    try {
+      const f = document.getElementById("recover-form");
+      f.elements.pk.value = "1";
+      await runState(f, false);
+    } finally {
+      api = real;
+    }
+    return {
+      inDialog: !!document.querySelector("#modal .state-modal .warn-item"),
+      onPage: !!document.querySelector("#state-warnings .warn-item"),
+      text: (document.querySelector("#modal .state-modal .warn-item") || {}).textContent || "",
+    };
+  });
+  (warnPlacement.inDialog && !warnPlacement.onPage && /stale_baseline/.test(warnPlacement.text))
+    ? ok("restore: a reconstruct warning renders inside the dialog, not on the page behind it")
+    : bad("restore: a reconstruct warning renders inside the dialog, not on the page behind it",
+          JSON.stringify(warnPlacement));
+
+  // The dialog's own dismissal controls. openModal wires the ✕ and the scrim
+  // click and relies on globalKeydown for Escape; none of the three had a line
+  // of executed coverage, and the one assertion that named dismissal was
+  // satisfied by a side effect (see the stub above).
+  const dismiss = await page.evaluate(async () => {
+    const f = document.getElementById("recover-form");
+    const out = {};
+    await runState(f, false);
+    out.openedForX = !!document.querySelector("#modal .state-modal");
+    const x = document.querySelector("#modal .state-modal .modal-x");
+    if (x) x.click();
+    out.afterX = !!document.getElementById("modal").firstChild;
+
+    await runState(f, false);
+    const scrim = document.querySelector("#modal .modal-scrim");
+    // On the scrim itself, not on the panel: openModal only dismisses when the
+    // event target IS the scrim, so a click inside the dialog must not close it.
+    if (scrim) scrim.querySelector(".modal").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    out.afterInsideClick = !!document.getElementById("modal").firstChild;
+    if (scrim) scrim.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    out.afterScrimClick = !!document.getElementById("modal").firstChild;
+
+    await runState(f, false);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    out.afterEscape = !!document.getElementById("modal").firstChild;
+    return out;
+  });
+  (dismiss.openedForX && dismiss.afterX === false)
+    ? ok("restore: the dialog's ✕ closes it")
+    : bad("restore: the dialog's ✕ closes it", JSON.stringify(dismiss));
+  (dismiss.afterInsideClick === true && dismiss.afterScrimClick === false)
+    ? ok("restore: clicking the scrim closes the dialog, clicking inside it does not")
+    : bad("restore: clicking the scrim closes the dialog, clicking inside it does not", JSON.stringify(dismiss));
+  (dismiss.afterEscape === false)
+    ? ok("restore: Escape closes the dialog")
+    : bad("restore: Escape closes the dialog", JSON.stringify(dismiss));
 
   // The timeline is how an operator picks an instant without leaving to read
   // one off Events. Its own restore button used to route through undoEvent,
@@ -1333,7 +1419,9 @@ try {
       // that margin was the whole assertion. It also gets STRONGER as the
       // fixture grows rather than weaker.
       const firstSeen = [];
+      const gapAround = [];
       let arrived = 0, total = 0;
+      let prev = performance.now();
       for (let tick = 0; tick < 90; tick++) {
         const nodes = document.querySelectorAll(".tl-node");
         total = nodes.length;
@@ -1343,14 +1431,36 @@ try {
           arrived++;
           if (firstSeen[i] === undefined) firstSeen[i] = tick;
         });
+        // How long this observation was blind for. The ordering claim is only
+        // readable if consecutive polls are closer together than the stagger
+        // step; a stall longer than that hides the order from the OBSERVER
+        // without saying anything about the code.
+        const nowT = performance.now();
+        gapAround.push(Math.round(nowT - prev));
+        prev = nowT;
         if (total > 0 && arrived === total) break;
         await new Promise((r) => setTimeout(r, 10));
       }
-      return { total, arrived, firstSeen };
+      return { total, arrived, firstSeen, maxGap: Math.max(0, ...gapAround) };
     });
   };
   const rmTl = await staggerProbe("reduce");
-  const npTl = await staggerProbe("no-preference");
+  // The no-preference arm reads an ORDER out of a 55ms step by polling every
+  // 10ms, so a loaded runner can hide it: if the loop stalls longer than one
+  // step, both nodes are first seen on the same poll and the arm reports a
+  // missing stagger that is really a blind observer. Seen twice on a machine
+  // running builds alongside the suite, with the trace showing exactly that —
+  // and it took a bisect against main to find out it was the runner and not
+  // the code, which is a false alarm expensive enough to be worth preventing.
+  //
+  // Retried rather than loosened: a real regression fails every attempt, so
+  // the assertion keeps its teeth. maxGap travels into the failure message so
+  // the next person can classify it in one look instead of a bisect.
+  let npTl = await staggerProbe("no-preference");
+  const staggerRead = (r) => r.total >= 2 && r.arrived === r.total && r.firstSeen[1] > r.firstSeen[0];
+  for (let attempt = 0; attempt < 2 && !staggerRead(npTl); attempt++) {
+    npTl = await staggerProbe("no-preference");
+  }
   await page.emulateMedia({ reducedMotion: null });
 
   (rmTl.total > 0 && rmTl.arrived === rmTl.total
@@ -1364,9 +1474,11 @@ try {
   // there is no fixture size at which this quietly stops asserting — and a
   // fixture that drops below two is reported as a failure rather than waved
   // through, because at that point the scenario has proved nothing.
-  (npTl.total >= 2 && npTl.arrived === npTl.total && npTl.firstSeen[1] > npTl.firstSeen[0])
+  staggerRead(npTl)
     ? ok("reduced motion: under no-preference the timeline arrives one node at a time")
-    : bad("reduced motion: under no-preference the timeline arrives one node at a time", JSON.stringify(npTl));
+    : bad("reduced motion: under no-preference the timeline arrives one node at a time — "
+        + (npTl.maxGap > 55 ? `NOTE: the poll stalled ${npTl.maxGap}ms, longer than the 55ms stagger step, on all 3 attempts` : "the poll kept up, so this is the code"),
+        JSON.stringify(npTl));
 
   // Time-travel results now live in a dialog (#1405), and the scenarios above
   // leave the last one open. Dismiss it before moving on: a scrim spanning the

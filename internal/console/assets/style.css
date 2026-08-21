@@ -1499,9 +1499,15 @@ button { font-family: inherit; }
 .state-actions-note { color: var(--ink-3); font-size: 12.5px; }
 
 /* Time-travel results render in a dialog (#1405). The body scrolls because a
-   wide row's state table and a busy row's timeline are both unbounded; the
-   action row sits OUTSIDE that scroll, so "Restore to this state" stays
-   reachable however long the content is. */
+   wide row's state table and a busy row's timeline are both unbounded.
+
+   The pinned footer applies to SHOW STATE only, and saying otherwise was a
+   local truth written as a global one. Show state has one action for the whole
+   result, so leaving it after a 40-column table would put it below the fold
+   exactly when the table is long — it belongs outside the scroll. Show history
+   has no single action: every node carries its own restore button, which
+   travels with the node it names and is meaningless detached from it. Those
+   scroll with their nodes by design. */
 .state-modal { max-width: 940px; }
 .state-modal .modal-body { max-height: 58vh; overflow-y: auto; }
 .state-modal .state-actions { margin-top: 0; padding: 14px 28px 20px; border-top: 1px solid var(--line); }
