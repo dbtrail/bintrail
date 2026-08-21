@@ -83,6 +83,21 @@ func TestAppJSUndoBannerStatesWhatIsReversed(t *testing.T) {
 			"reversal lands on the LAST change in that second, which need not be the clicked one — " +
 			"that is exactly the case this banner exists for, so the caveat is not optional.")
 	}
+
+	// (f) …and the OUTCOME of that imprecision, not only its mechanism. Stating
+	// "the last of them is the one reversed" is true and still leaves the
+	// reader to derive the inversion: on a row INSERTed and DELETEd inside one
+	// second the cap keeps the DELETE, so clicking Undo on the INSERT
+	// RE-CREATES the row instead of removing it — the opposite of the intent,
+	// with the badge above still reading INSERT. Review found this riding along
+	// undisclosed; deriving it is not the operator's job.
+	for _, want := range []string{"not necessarily the one you clicked", "comes back"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("the Undo banner dropped %q.\nDetail was: %s\n"+
+				"Without it the same-second caveat names a mechanism and hides the one outcome "+
+				"that is inverted from what the operator asked for.", want, detail)
+		}
+	}
 }
 
 // The banner is prose; this pins the behaviour it describes. They fail to
@@ -126,8 +141,22 @@ func TestUndoPrefillsLatestPerRow(t *testing.T) {
 // TRAILING comment on a gutted line (the strip only dropped whole-line
 // comments), and the stated reason for stripping at all was false — the
 // explanation it claimed to avoid firing on is lowercase and line-split, so it
-// never matched. Reading the actual `el(...)` calls removes the whole class:
-// comments, block or line, are simply not in the haystack.
+// never matched.
+//
+// Reading the `el(...)` calls was the right idea and the first version of it
+// only half-delivered: the eyebrow was parsed as a literal, but the DETAIL was
+// returned as a raw source slice from the first ctx-detail span to the end of
+// the append — so anything between the two spans, comments included, was back
+// in the haystack. That failed in both directions, and both were reproduced:
+// moving the required sentences into a comment above a gutted span kept the
+// guard GREEN over a banner that stated none of them, and adding one accurate
+// historical comment naming the old wording turned it RED over a correct
+// banner.
+//
+// So the haystack is now STRING LITERALS ONLY. A comment cannot appear inside
+// one, which retires the class rather than narrowing it — and a comment inside
+// a text expression, where a quote WOULD be scanned, is refused outright
+// instead of guessed at.
 func undoBannerText(t *testing.T) (eyebrow, detail string) {
 	t.Helper()
 	data, err := os.ReadFile("assets/app.js")
@@ -148,34 +177,92 @@ func undoBannerText(t *testing.T) (eyebrow, detail string) {
 	}
 	fn := js[start : start+end]
 
-	eyebrow = spanText(t, fn, "ctx-eyebrow")
-	// The detail is two spans; take everything from the first to the end of
-	// the append so both are covered.
-	i := strings.Index(fn, `class: "ctx-detail"`)
-	if i < 0 {
+	eyebrows := spanLiterals(t, fn, "ctx-eyebrow")
+	if len(eyebrows) == 0 {
+		t.Fatal("no ctx-eyebrow span in renderRecover — the Undo banner lost its heading")
+	}
+	details := spanLiterals(t, fn, "ctx-detail")
+	if len(details) == 0 {
 		t.Fatal("no ctx-detail span in renderRecover — the Undo banner lost its explanatory line")
 	}
-	j := strings.Index(fn[i:], "})));")
-	if j < 0 {
-		t.Fatal("could not find the end of the Undo banner's append")
-	}
-	return eyebrow, fn[i : i+j]
+	return eyebrows[0], strings.Join(details, " ")
 }
 
-// spanText pulls the literal text of `el("span", { class: "<cls>", text: "…" })`.
-func spanText(t *testing.T, fn, cls string) string {
+// spanLiterals returns, for every `el("span", { class: "<cls>", text: <expr> })`
+// in fn, the concatenation of the STRING LITERALS in that span's text
+// expression — dropping the interpolated identifiers, and structurally unable
+// to pick up a comment.
+//
+// Literal-only is the whole point. The first detail span reads
+// `"… holding this " + ctx.type + " (" + ctx.time + " UTC)"`, so a helper that
+// stops at the first closing quote truncates it, and one that slices raw
+// source to the end of the append swallows every comment in between. This
+// walks each text expression consuming quoted runs atomically and stopping at
+// the span's closing brace.
+func spanLiterals(t *testing.T, fn, cls string) []string {
 	t.Helper()
-	marker := `class: "` + cls + `", text: "`
-	i := strings.Index(fn, marker)
-	if i < 0 {
-		t.Fatalf("no %s span with a literal text in renderRecover", cls)
+	marker := `class: "` + cls + `"`
+	var out []string
+	for pos := 0; ; {
+		i := strings.Index(fn[pos:], marker)
+		if i < 0 {
+			return out
+		}
+		i += pos
+		k := strings.Index(fn[i:], "text:")
+		if k < 0 {
+			t.Fatalf("%s span at offset %d has no text: — this guard reads span text and found none", cls, i)
+		}
+		p := i + k + len("text:")
+		var b strings.Builder
+	scan:
+		for p < len(fn) {
+			switch fn[p] {
+			case '"':
+				lit, next := readJSString(t, fn, p)
+				b.WriteString(lit)
+				p = next
+			case '}':
+				break scan
+			case '/':
+				// A comment inside the text expression would put its quoted
+				// content into the haystack, which is exactly the defect this
+				// helper exists to retire. Refuse rather than guess.
+				if p+1 < len(fn) && (fn[p+1] == '/' || fn[p+1] == '*') {
+					t.Fatalf("a comment sits inside the %s span's text expression; move it above the "+
+						"el(...) call. Left here it lands in the guard's haystack and the guard "+
+						"stops meaning what it says.", cls)
+				}
+				p++
+			default:
+				p++
+			}
+		}
+		out = append(out, b.String())
+		pos = p
 	}
-	rest := fn[i+len(marker):]
-	j := strings.Index(rest, `"`)
-	if j < 0 {
-		t.Fatalf("unterminated text literal on the %s span", cls)
+}
+
+// readJSString consumes the double-quoted run starting at i and returns its
+// contents plus the offset just past the closing quote.
+func readJSString(t *testing.T, s string, i int) (string, int) {
+	t.Helper()
+	var b strings.Builder
+	for p := i + 1; p < len(s); p++ {
+		switch s[p] {
+		case '\\':
+			if p+1 < len(s) {
+				b.WriteByte(s[p+1])
+				p++
+			}
+		case '"':
+			return b.String(), p + 1
+		default:
+			b.WriteByte(s[p])
+		}
 	}
-	return rest[:j]
+	t.Fatalf("unterminated string literal at offset %d in renderRecover", i)
+	return "", len(s)
 }
 
 // The two bridges set opposite scopes on the SAME form, and #1404 is what put

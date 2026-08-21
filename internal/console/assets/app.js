@@ -2070,7 +2070,7 @@ function renderRecover(params) {
   // Context banner when arriving via an event "Undo" (pendingRecover).
   const ctx = pendingRecover;
   if (ctx) {
-    const banner = el("div", { class: "ctx-banner" });
+    const banner = el("div", { class: "ctx-banner", id: "undo-ctx-banner" });
     banner.append(el("span", { class: "badge " + badgeClass(ctx.type), text: ctx.type }));
     banner.append(el("div", { class: "ctx-main" },
       // Scope, not target state — and the scope is a WINDOW OF TIME, not an
@@ -2100,7 +2100,7 @@ function renderRecover(params) {
       el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " · pk " + ctx.pk }),
       el("span", { class: "ctx-detail", text: "reverses the latest change to this row at or before the end of the second holding this "
         + ctx.type + " (" + ctx.time + " UTC)" }),
-      el("span", { class: "ctx-detail", text: "Latest per row is set to 1 — clear it to reverse this row's whole history up to that point. If the row changed more than once inside that second, the last of them is the one reversed." })));
+      el("span", { class: "ctx-detail", text: "Latest per row is set to 1 — clear it to reverse this row's whole history up to that point. If the row changed more than once inside that second, the last of them is the one reversed — not necessarily the one you clicked. A row created and deleted within one second comes back rather than going away." })));
     banner.append(el("span", { class: "spacer" }));
     banner.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear",
       onclick: () => { pendingRecover = null; navigate("recover"); } }));
@@ -2672,6 +2672,18 @@ function aimUndoAtInstant(form, at) {
   // reverse only the newest of them and land it somewhere else entirely,
   // silently, with the button still naming the state it did not produce.
   form.elements.limit_per_pk.value = "";
+  // …and retire the banner that describes the scope just replaced. It states
+  // "Latest per row is set to 1" as a fact about this form, and the line above
+  // makes that false: the operator would read a one-change scope over a script
+  // that reverses everything after `at`. The stale-label half of the same bug
+  // the comment above describes, one level up from the fields.
+  //
+  // By ID, not by `.ctx-banner`: generateUndo appends a second node with that
+  // class into #recover-out for the cascade notice, and an unscoped remove
+  // would take whichever came first.
+  pendingRecover = null;
+  const staleBanner = document.getElementById("undo-ctx-banner");
+  if (staleBanner) staleBanner.remove();
   previewRecover(form);
   form.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
   toast("Undo window set to everything after " + at + " UTC");

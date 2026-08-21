@@ -1262,6 +1262,18 @@ try {
   // plus a navigate — rather than by calling the prefill, since the prefill
   // runs inside setSelectWhenReady's schema callback and a direct call would
   // skip the path that can actually break.
+  //
+  // And watch the POST while it happens. Every other check here reads
+  // `limit_per_pk` off the form, which is order-blind: swapping the prefill
+  // and the generateUndo call beneath it restores the original #1404 defect —
+  // a request with no cap — while leaving the field holding "1" by the time
+  // anything polls it. generateUndo snapshots the form synchronously at entry,
+  // so the only witness that dies on that swap is the body it sent.
+  const sentBodies = [];
+  await page.route("**/api/recover", async (route) => {
+    sentBodies.push(route.request().postData() || "");
+    await route.continue();
+  });
   const undoBridge = await page.evaluate(async (fixSchema) => {
     // Snapshot every field, not the schema alone: the scenarios below inherit
     // whatever this form already held (the timeline one sets only `pk` and
@@ -1289,17 +1301,55 @@ try {
   (undoBridge.cap === "1" && undoBridge.until === "2026-01-01 00:00:00")
     ? ok("restore: the Undo bridge prefills a per-row cap of 1 alongside the ceiling")
     : bad("restore: the Undo bridge prefills a per-row cap of 1 alongside the ceiling", JSON.stringify(undoBridge));
+  // Give the generate its POST, then stop intercepting.
+  for (let i = 0; i < 40 && !sentBodies.length; i++) await new Promise((r) => setTimeout(r, 100));
+  await page.unroute("**/api/recover");
+  {
+    const parsed = sentBodies.map((b) => { try { return JSON.parse(b); } catch { return {}; } });
+    const capped = parsed.filter((b) => b.limit_per_pk === 1);
+    (sentBodies.length > 0 && capped.length === parsed.length)
+      ? ok("restore: the Undo bridge's generate SENDS limit_per_pk — the cap is on the wire, not just in the field")
+      : bad("restore: the Undo bridge's generate SENDS limit_per_pk — the cap is on the wire, not just in the field",
+            JSON.stringify({ sent: sentBodies }));
+  }
   // The prefill changes what the button reverses, so the banner has to say it.
   // A prefill the banner does not mention is a silent narrowing.
   (/one change/.test(undoBridge.eyebrow) && /Latest per row is set to 1/.test(undoBridge.detail) && /clear it/.test(undoBridge.detail))
     ? ok("restore: the Undo banner states the cap it prefilled and how to clear it")
     : bad("restore: the Undo banner states the cap it prefilled and how to clear it", JSON.stringify(undoBridge));
+  // The two bridges collide one level above the fields. With the Undo banner
+  // on screen — the only place in the run where it really is — driving
+  // "Restore to this state" must retire it: the banner states "Latest per row
+  // is set to 1" as a fact about this form, and that action clears the field.
+  // Left up, the operator reads a one-change scope over a script that reverses
+  // everything after the instant.
+  const staleBanner = await page.evaluate(async () => {
+    const f = document.getElementById("recover-form");
+    const before = !!document.getElementById("undo-ctx-banner");
+    f.elements.pk.value = "1";
+    await runState(f, false);
+    const btn = document.querySelector(".state-actions .btn-primary");
+    if (!btn) return { err: "no Restore-to-this-state button on a found row" };
+    btn.click();
+    return { before, after: !!document.getElementById("undo-ctx-banner"),
+             cap: f.elements.limit_per_pk.value };
+  });
+  if (staleBanner.err) {
+    bad("restore: 'Restore to this state' retires the Undo banner it contradicts", staleBanner.err);
+  } else {
+    // `before` is asserted too: if the banner were never up, `after === false`
+    // would pass while proving nothing.
+    (staleBanner.before === true && staleBanner.after === false && staleBanner.cap === "")
+      ? ok("restore: 'Restore to this state' retires the Undo banner it contradicts")
+      : bad("restore: 'Restore to this state' retires the Undo banner it contradicts", JSON.stringify(staleBanner));
+  }
+
   // Leave the page as this scenario found it. pendingRecover survives a
   // re-render, and the prefilled cap makes every later generate 400 with
   // "the latest-per-row filter needs a PK" the moment a scenario clears the PK
   // — which is a correct server refusal and a wrong reason for fourteen
   // unrelated checks to go red.
-  await page.evaluate(async (fixSchema) => {
+  const undoRestore = await page.evaluate(async (fixSchema) => {
     pendingRecover = null;
     navigate("recover");
     for (let i = 0; i < 40; i++) {
@@ -1308,7 +1358,7 @@ try {
       await new Promise((r) => setTimeout(r, 100));
     }
     const f = document.getElementById("recover-form");
-    if (!f || !window.__preUndo) return;
+    if (!f || !window.__preUndo) return { schemaReady: false, want: null, got: null };
     // Schema first and on its own tick: the cascade listener repopulates the
     // table datalist and CLEARS a stale table value, so restoring table before
     // the cascade settles loses it again.
@@ -1317,15 +1367,25 @@ try {
     // value the select does not yet carry silently leaves it blank — which is
     // what the Time-travel scenarios below then read as "no rows". The app
     // already owns this wait; using it is also what the real prefill does.
-    await new Promise((resolve) => {
-      setSelectWhenReady(f, "schema", fixSchema, resolve);
-      setTimeout(resolve, 5000);
+    const schemaReady = await new Promise((resolve) => {
+      setSelectWhenReady(f, "schema", fixSchema, () => resolve(true));
+      setTimeout(() => resolve(false), 5000);
     });
     await new Promise((r) => setTimeout(r, 300));
     for (const n of ["table", "pk", "limit_per_pk", "since", "until"]) {
       if (f.elements[n]) f.elements[n].value = window.__preUndo[n] || "";
     }
+    // Report what the restore actually achieved instead of proceeding as if it
+    // had. The schema is compared against the SNAPSHOT, not against fixSchema:
+    // reinstalling a hardcoded value while claiming to restore is how this
+    // silently installs the wrong schema the day a preceding scenario picks
+    // another one.
+    return { schemaReady, want: window.__preUndo.schema, got: f.elements.schema.value };
   }, FIX);
+  (undoRestore && undoRestore.schemaReady && undoRestore.got === undoRestore.want)
+    ? ok("restore: the Undo scenario hands the form back as it found it")
+    : bad("restore: the Undo scenario hands the form back as it found it — the checks below inherit it",
+          JSON.stringify(undoRestore));
 
   // The timeline is how an operator picks an instant without leaving to read
   // one off Events. Its own restore button used to route through undoEvent,
