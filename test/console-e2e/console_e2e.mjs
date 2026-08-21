@@ -1185,13 +1185,13 @@ try {
     if (TT_AT && at) at.value = TT_AT;
     await runState(f, false);
   }, { FIX, TT_AT });
-  await page.waitForSelector("#state-out .statetable", { timeout: 10000 });
+  await page.waitForSelector("#modal .state-modal .statetable", { timeout: 10000 });
   const tt1 = await page.evaluate(() => {
     const cells = {};
-    document.querySelectorAll("#state-out .statetable tr").forEach((tr) => {
+    document.querySelectorAll("#modal .state-modal .statetable tr").forEach((tr) => {
       cells[tr.querySelector("th").textContent] = tr.querySelector("td").textContent;
     });
-    return { cells, meta: (document.querySelector("#state-out .meta-line") || {}).textContent || "" };
+    return { cells, meta: (document.querySelector("#modal .state-modal .meta-line") || {}).textContent || "" };
   });
   (tt1.cells.status === "shipped" && tt1.cells.email === "a@example.com")
     ? ok("restore: reconstructed row folds the event over the baseline")
@@ -1201,10 +1201,10 @@ try {
   // pk=4: exists ONLY in the baseline (no events) — a binlog-only reconstruct
   // cannot resolve it, so this pins the baseline half of baseline+deltas.
   await page.evaluate(async () => { const f = document.getElementById("recover-form"); f.elements.pk.value = "4"; await runState(f, false); });
-  await page.waitForFunction(() => /d@example\.com/.test((document.getElementById("state-out") || {}).textContent || ""), { timeout: 10000 });
+  await page.waitForFunction(() => /d@example\.com/.test((document.querySelector("#modal .state-modal") || {}).textContent || ""), { timeout: 10000 });
   const tt4 = await page.evaluate(() => {
     const cells = {};
-    document.querySelectorAll("#state-out .statetable tr").forEach((tr) => {
+    document.querySelectorAll("#modal .state-modal .statetable tr").forEach((tr) => {
       cells[tr.querySelector("th").textContent] = tr.querySelector("td").textContent;
     });
     return cells;
@@ -1216,8 +1216,8 @@ try {
   // pk=2: in the baseline, then DELETEd — must render the deleted note, not an
   // empty table and not the stale baseline value.
   await page.evaluate(async () => { const f = document.getElementById("recover-form"); f.elements.pk.value = "2"; await runState(f, false); });
-  await page.waitForFunction(() => !!document.querySelector("#state-out .deleted-note"), { timeout: 10000 });
-  const tt2 = await page.evaluate(() => (document.querySelector("#state-out .deleted-note") || {}).textContent || "");
+  await page.waitForFunction(() => !!document.querySelector("#modal .state-modal .deleted-note"), { timeout: 10000 });
+  const tt2 = await page.evaluate(() => (document.querySelector("#modal .state-modal .deleted-note") || {}).textContent || "");
   /Row was deleted/.test(tt2)
     ? ok("restore: a deleted row renders the deleted note")
     : bad("restore: a deleted row renders the deleted note", tt2);
@@ -1233,9 +1233,14 @@ try {
     await runState(f, false);
     const btn = document.querySelector(".state-actions .btn-primary");
     if (!btn) return { err: "no Restore-to-this-state button on a found row" };
-    const at = (document.querySelector("#state-out .meta-line") || {}).textContent || "";
+    const at = (document.querySelector("#modal .state-modal .meta-line") || {}).textContent || "";
+    // Also the #1405 claim: the button hands the page back before retargeting
+    // the form, because aimUndoAtInstant scrolls that form into view and
+    // previews rows — both invisible behind a scrim.
+    const inline = !!document.querySelector("#state-out .statetable");
     btn.click();
-    return { since: f.elements.since.value, until: f.elements.until.value, at };
+    return { since: f.elements.since.value, until: f.elements.until.value, at, inline,
+             stillOpen: !!document.querySelector("#modal .state-modal") };
   });
   {
     const m = /as of (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/.exec(bridge.at || "");
@@ -1243,6 +1248,14 @@ try {
     (want && bridge.since === want && bridge.until === "")
       ? ok("restore: 'Restore to this state' sets the undo window to at+1s")
       : bad("restore: 'Restore to this state' sets the undo window to at+1s", JSON.stringify({ ...bridge, want }));
+    // #1405. Retargeting the selectors above would pass just as well if the
+    // result rendered in BOTH places, so state the negative separately.
+    (bridge.inline === false)
+      ? ok("restore: the reconstructed state renders in the dialog, not inline under the form")
+      : bad("restore: the reconstructed state renders in the dialog, not inline under the form", JSON.stringify(bridge));
+    (bridge.stillOpen === false)
+      ? ok("restore: 'Restore to this state' closes the dialog before retargeting the form")
+      : bad("restore: 'Restore to this state' closes the dialog before retargeting the form", JSON.stringify(bridge));
   }
 
   // The timeline is how an operator picks an instant without leaving to read
@@ -1354,6 +1367,13 @@ try {
   (npTl.total >= 2 && npTl.arrived === npTl.total && npTl.firstSeen[1] > npTl.firstSeen[0])
     ? ok("reduced motion: under no-preference the timeline arrives one node at a time")
     : bad("reduced motion: under no-preference the timeline arrives one node at a time", JSON.stringify(npTl));
+
+  // Time-travel results now live in a dialog (#1405), and the scenarios above
+  // leave the last one open. Dismiss it before moving on: a scrim spanning the
+  // viewport is invisible to page.evaluate but intercepts every real click,
+  // and leaving shared state behind for later scenarios is the failure this
+  // suite has already been bitten by once.
+  await page.evaluate(() => { const m = document.getElementById("modal"); if (m) m.replaceChildren(); });
 
   // Scenario 14c — the Overview against the LIVE daemon (#1300). The fixture
   // scenario below drives buildOverview directly, so it cannot catch a route

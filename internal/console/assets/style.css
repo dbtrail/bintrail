@@ -1498,6 +1498,14 @@ button { font-family: inherit; }
 .state-actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 14px; }
 .state-actions-note { color: var(--ink-3); font-size: 12.5px; }
 
+/* Time-travel results render in a dialog (#1405). The body scrolls because a
+   wide row's state table and a busy row's timeline are both unbounded; the
+   action row sits OUTSIDE that scroll, so "Restore to this state" stays
+   reachable however long the content is. */
+.state-modal { max-width: 940px; }
+.state-modal .modal-body { max-height: 58vh; overflow-y: auto; }
+.state-modal .state-actions { margin-top: 0; padding: 14px 28px 20px; border-top: 1px solid var(--line); }
+
 /* responsive-ish */
 @media (max-width: 880px) {
   #app { grid-template-columns: 1fr; }
