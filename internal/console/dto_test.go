@@ -131,7 +131,11 @@ func TestEventDTOFieldAllowlist(t *testing.T) {
 	sort.Strings(got)
 
 	want := []string{
-		"binlog_file", "changed_columns", "connection_id", "end_pos", "event_id",
+		// "anchor" is (event_timestamp, event_id) re-spelled — both are already
+		// on this list, so it exposes nothing new; it is here because Undo
+		// needs to name one event and a second-granular timestamp cannot
+		// (#1411).
+		"anchor", "binlog_file", "changed_columns", "connection_id", "end_pos", "event_id",
 		"event_timestamp", "event_type", "gtid", "pk_values",
 		"row_after", "row_before", "schema_name", "start_pos", "table_name",
 	}

@@ -250,6 +250,26 @@ type Options struct {
 	//
 	// nil = no cursor (fetch from the start of the window).
 	AfterEvent *EventCursor
+	// EventAnchor names ONE event exactly: the (event_timestamp, event_id)
+	// pair identifying a single row of binlog_events. It is a membership
+	// filter, not a cursor — unlike AfterEvent/BeforeEvent it admits exactly
+	// one event rather than a half-open range, and so composes with any Order.
+	//
+	// Why a pair when event_id alone identifies the row: event_id carries no
+	// partition information, so an id-only predicate would scan every
+	// partition of binlog_events (and every Parquet file of every archive).
+	// The timestamp is what lets both engines prune to the one hour that can
+	// hold the row. Callers that have an event in hand always have both — the
+	// console's Undo bridge reads them off the row the operator clicked.
+	//
+	// It exists because a timestamp alone cannot name an event: the column has
+	// one-second resolution, so an Until bound plus LimitPerPK=1 resolves to
+	// "the newest event in that second", which on a row INSERTed and DELETEd
+	// within one second is not the event the operator pointed at — and
+	// reversing the wrong one of that pair inverts the outcome (#1411).
+	//
+	// nil = no anchor.
+	EventAnchor *EventCursor
 	// BeforeEvent is AfterEvent's mirror: it restricts results to events
 	// strictly BEFORE this point in the (event_timestamp, event_id) sort
 	// order, which is what a DESCENDING (newest-first) surface needs to reach
@@ -697,6 +717,24 @@ func buildQuery(opts Options) (string, []any) {
 			" OR (CHAR_LENGTH(binlog_file) = CHAR_LENGTH(?) AND binlog_file < ?)"+
 			" OR (binlog_file = ? AND end_pos <= ?))")
 		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.Pos)
+	}
+	if opts.EventAnchor != nil {
+		// Hour-aligned TO_SECONDS bracket so MySQL prunes to the single
+		// partition that can hold this event, for the same reason the
+		// cursor blocks below emit one: a parameterised datetime comparison
+		// prunes nothing at parse time. The bracket is exact here rather than
+		// deliberately over-inclusive — an anchor names one event, and that
+		// event's own hour is the only partition it can live in.
+		lo := mysqlToSeconds(opts.EventAnchor.Timestamp.Truncate(time.Hour))
+		hi := mysqlToSeconds(opts.EventAnchor.Timestamp.Truncate(time.Hour).Add(time.Hour))
+		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) >= %d", lo))
+		where = append(where, fmt.Sprintf("TO_SECONDS(event_timestamp) < %d", hi))
+		// The exact identity. event_timestamp is carried alongside event_id
+		// (which is unique on its own) so a stale anchor whose timestamp no
+		// longer matches the stored row returns nothing instead of silently
+		// resolving to a different moment than the caller named.
+		where = append(where, "event_timestamp = ? AND event_id = ?")
+		args = append(args, opts.EventAnchor.Timestamp, opts.EventAnchor.EventID)
 	}
 	if opts.AfterEvent != nil {
 		// Hour-aligned TO_SECONDS literal so MySQL can prune partitions at parse

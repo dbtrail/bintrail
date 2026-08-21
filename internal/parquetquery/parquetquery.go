@@ -1072,6 +1072,16 @@ func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 			" OR (binlog_file = ? AND end_pos <= ?))")
 		args = append(args, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, opts.UntilPos.File, posArg(opts.UntilPos.Pos))
 	}
+	if opts.EventAnchor != nil {
+		// The archive mirror of buildQuery's anchor block (#1411). No coarse
+		// hint is emitted: file/date scoping on this side is driven by
+		// Since/Until, and DuckDB prunes Parquet row groups from the equality
+		// below via their event_timestamp statistics. Carrying the timestamp
+		// alongside the unique event_id keeps a stale anchor returning nothing
+		// rather than a different row.
+		where = append(where, "event_timestamp = ? AND event_id = ?")
+		args = append(args, opts.EventAnchor.Timestamp, opts.EventAnchor.EventID)
+	}
 	if opts.AfterEvent != nil {
 		// Keyset cut on the composite sort key, mirroring internal/query's
 		// buildQuery (#1097). No separate coarse hint is emitted here: the

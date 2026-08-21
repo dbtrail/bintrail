@@ -198,9 +198,12 @@ const DiscoveryFailedSource = "(archive source discovery failed)"
 // the skipped sources and the diverging events.
 //
 // archivesElided reports that resolved archive sources were deliberately NOT
-// read because they provably could not change the result — the newest-first
-// short-circuit (topNSatisfiedLive: the live index filled a DESC page whose
-// span is live-covered from the cutoff upward). It is a completeness-
+// read because they provably could not change the result. Three short-circuits
+// can set it, in ascending order of how much they must prove: anchorSatisfiedLive
+// (the live index already returned the one event Options.EventAnchor names),
+// perPKSatisfiedLive (every named PK already has its latest LimitPerPK live),
+// and topNSatisfiedLive (the live index filled a DESC page whose span is
+// live-covered from the cutoff upward). It is a completeness-
 // preserving optimization, never a scope reduction, but a caller rendering
 // the result to a human must still be able to SAY the archives went unread
 // (#1353's audit requirement) — which is why it is a return value and not a
@@ -228,6 +231,35 @@ func FetchMergedFull(
 		skipped = append(skipped, DiscoveryFailedSource)
 	}
 	return rows, src.plan, skipped, diverged, elided, nil
+}
+
+// anchorSatisfiedLive reports that the live index already returned the exact
+// event Options.EventAnchor names, which makes every resolved archive source
+// redundant for this request.
+//
+// It is the cheapest of the three short-circuits and the only one that needs
+// no QueryPlan: no contiguous-range check, no ArchivesBelowLive premise, no
+// boundary comparison. The proof is the anchor itself. An anchor admits at
+// most one event, event_id is unique, and it is the key MergeResults dedupes
+// on — so an archive can hold either a byte-copy of the event already in hand
+// (which the merge would drop, warning if the copies disagree) or nothing at
+// all. Neither outcome can change the result, so reading the archives cannot
+// either.
+//
+// The converse is deliberately NOT a refusal: an anchor whose event is absent
+// from the live index — aged out into an archived partition — falls through to
+// the normal archive path and is found there. This predicate accelerates the
+// common case; it never decides membership.
+func anchorSatisfiedLive(opts Options, rows []ResultRow) bool {
+	if opts.EventAnchor == nil {
+		return false
+	}
+	for i := range rows {
+		if rows[i].EventID == opts.EventAnchor.EventID {
+			return true
+		}
+	}
+	return false
 }
 
 // topNSatisfiedLive reports whether the live partitions alone already hold the
@@ -752,8 +784,9 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 // retired from the walk entirely. diverged counts the duplicate event_ids
 // whose two merged copies disagreed (#1325); zero on every path that reads a
 // single source, since no duplicate can exist there. archivesElided reports
-// the topNSatisfiedLive short-circuit fired — resolved archives went unread
-// because they provably could not change this page (see FetchMergedFull).
+// that one of the three short-circuits below fired — resolved archives went
+// unread because they provably could not change this page (see FetchMergedFull
+// for which, and for why the signal is returned rather than logged).
 func fetchPage(
 	ctx context.Context,
 	engine *Engine,
@@ -783,6 +816,11 @@ func fetchPage(
 		rows = r
 	}
 
+	if anchorSatisfiedLive(o.Opts, rows) {
+		slog.Debug("planner: skipping archive sources (the anchored event is already live)",
+			"event_id", o.Opts.EventAnchor.EventID, "sources", len(src.archSources))
+		return rows, nil, nil, 0, true, nil
+	}
 	if topNSatisfiedLive(o.Opts, rows, src.plan) {
 		slog.Debug("planner: skipping archive sources (newest-first page filled from contiguous live coverage)",
 			"limit", o.Opts.Limit, "sources", len(src.archSources))

@@ -106,12 +106,28 @@ type recoverRequest struct {
 	// re-sorted ASC before generation. A client-supplied value has no effect.
 	Order string `json:"order"`
 	Limit int    `json:"limit"`
-	// LimitPerPK reverses only the latest N events for the matched row. It is
-	// the only filter that can isolate one event from another when both share
-	// a timestamp: `since`/`until` are second-granular, so a row INSERTed and
-	// DELETEd inside the same second cannot be split by time. Requires a PK
-	// (see buildOptions).
+	// LimitPerPK reverses only the latest N events for the matched row.
+	// Requires a PK (see buildOptions).
+	//
+	// It used to be described here as "the only filter that can isolate one
+	// event from another when both share a timestamp". That was true of the
+	// time filters and false as a general claim, and Undo relied on it: with
+	// `until` second-granular, latest-per-row=1 resolves to "the newest event
+	// in that second", which on a row INSERTed and DELETEd inside one second
+	// is not the event the operator clicked (#1411). Event is the filter that
+	// isolates one event; this one caps a row's history.
 	LimitPerPK int `json:"limit_per_pk"`
+	// Event names ONE event exactly, encoded `<RFC3339Nano>|<event_id>` — the
+	// same spelling as the ?after=/?before= cursors, parsed by the same
+	// parseEventCursor. It is what Undo sends: the operator clicked a row, so
+	// the client already holds its identity and does not need the server to
+	// re-derive it from a timestamp.
+	//
+	// Composable rather than exclusive with the filters above: an anchor
+	// admits at most one event, so anything else narrows a set of one. It is
+	// NOT rejected alongside LimitPerPK for that reason — but callers that
+	// have an anchor should not also send a cap, and Undo no longer does.
+	Event string `json:"event"`
 }
 
 type eventsResponse struct {
@@ -455,6 +471,19 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if body.Event != "" {
+		// A 400 rather than a silent fall back to the unanchored window: a
+		// malformed anchor means the client asked to reverse ONE event and
+		// would instead get everything the remaining filters admit. Undo's
+		// other filters are deliberately wide (schema/table/pk and an `until`
+		// at the clicked second), so the unanchored result is not a near miss.
+		anchor, perr := parseEventCursor("event", body.Event)
+		if perr != nil {
+			writeJSONError(w, http.StatusBadRequest, perr.Error())
+			return
+		}
+		opts.EventAnchor = anchor
 	}
 	opts, err = s.applySessionProfile(r.Context(), r, b, opts)
 	if err != nil {

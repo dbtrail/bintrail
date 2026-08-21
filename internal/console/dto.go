@@ -22,11 +22,27 @@ const consoleTSFormat = "2006-01-02 15:04:05"
 // never grown a consumer for statement text. Do not add them here without a
 // surface that actually reads them.
 type eventDTO struct {
-	EventID        uint64         `json:"event_id"`
-	BinlogFile     string         `json:"binlog_file"`
-	StartPos       uint64         `json:"start_pos"`
-	EndPos         uint64         `json:"end_pos"`
-	EventTimestamp string         `json:"event_timestamp"`
+	EventID        uint64 `json:"event_id"`
+	BinlogFile     string `json:"binlog_file"`
+	StartPos       uint64 `json:"start_pos"`
+	EndPos         uint64 `json:"end_pos"`
+	EventTimestamp string `json:"event_timestamp"`
+	// Anchor is this row's identity on the wire, `<RFC3339Nano>|<event_id>` —
+	// the same token the ?before=/?after= cursors use, produced by the same
+	// formatEventCursor.
+	//
+	// It exists because EventTimestamp above cannot name an event: it is
+	// second-granular, so a client holding only it can ask for "that second"
+	// and no finer. Undo needs finer — a row INSERTed and DELETEd inside one
+	// second yields two events a timestamp cannot tell apart, and reversing
+	// the wrong one of that pair inverts the outcome (#1411).
+	//
+	// Emitted rather than reassembled client-side on purpose. The bare
+	// timestamp has no offset, so rebuilding an RFC 3339 instant from it in JS
+	// means guessing a location, and guessing wrong does not fail — it names a
+	// different row. The server already has the instant; echoing its own token
+	// back is the only spelling both ends agree on by construction.
+	Anchor         string         `json:"anchor"`
 	GTID           *string        `json:"gtid"`
 	ConnectionID   *uint32        `json:"connection_id"`
 	SchemaName     string         `json:"schema_name"`
@@ -48,6 +64,7 @@ func toEventDTO(r query.ResultRow) eventDTO {
 		StartPos:       r.StartPos,
 		EndPos:         r.EndPos,
 		EventTimestamp: r.EventTimestamp.Format(consoleTSFormat),
+		Anchor:         formatEventCursor(r),
 		GTID:           r.GTID,
 		ConnectionID:   r.ConnectionID,
 		SchemaName:     r.SchemaName,

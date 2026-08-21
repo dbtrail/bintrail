@@ -7,40 +7,55 @@ import (
 )
 
 // The Restore "Undo" banner must describe exactly what the generated script
-// reverses — and since #1404 that is ONE change, not a window.
+// reverses — and since #1411 that is ONE NAMED EVENT, not a window and not
+// "the last change in a second".
 //
-// The history is the point of the guard. renderRecover's prefill sets `until`
-// from the clicked event and never `since`, so the window ran from the
-// beginning of time: undoing the third of five changes to a row put it back to
-// before the FIRST. #1388 fixed the WORDING to match that behaviour; #1404
-// changed the behaviour instead, prefilling `limit_per_pk = 1` so the script
-// reverses the latest change at or before the ceiling.
+// The history is the point of the guard, and it has three layers. renderRecover
+// used to set `until` from the clicked event and never `since`, so the window
+// ran from the beginning of time: undoing the third of five changes to a row
+// put it back to before the FIRST. #1388 fixed the WORDING to match that.
+// #1404 changed the BEHAVIOUR instead, prefilling `limit_per_pk = 1`.
 //
-// What did not change is the ceiling. `ctx.time` is second-granular
-// (consoleTSFormat) and the predicate is `event_timestamp <= ?`, so it is the
-// END of that second. On a row touched more than once inside it — a row
-// INSERTed and DELETEd in the same second, like WordPress
-// `_transient_doing_cron` — the reversal lands on the LAST of them, which need
-// not be the one the operator clicked. `since` is no remedy: it parses at the
-// same granularity. The banner has to say so.
+// That left one event but not necessarily the CLICKED one. `ctx.time` is
+// second-granular and the predicate was `event_timestamp <= ?`, so the cap kept
+// the last event in that whole second. On a row INSERTed and DELETEd inside one
+// second — WordPress `_transient_doing_cron` is the everyday case — that is the
+// DELETE whichever row was clicked, and reversing a DELETE re-creates the row:
+// clicking Undo on the INSERT put the row BACK, with the badge still reading
+// INSERT. The banner disclosed it in words, which is why the previous version
+// of this guard REQUIRED the caveat.
 //
-// Three drafts got this wrong in the same direction before the behaviour was
-// fixed: "Reverting this row to before this point" named a target state,
-// "Undoing every change up to this point" named the clicked event as the
-// boundary, and "Undoing every change in this window" was accurate only while
-// the whole history really was reversed. Hence a guard.
+// #1411 removed the ambiguity instead: the prefill carries the server's own
+// `<RFC3339Nano>|<event_id>` token for the clicked row, the engine filters on
+// that identity, and the caveat became false. So the sentences this guard used
+// to require are now BANNED, and the guard asserts the opposite claim. That
+// inversion is the reason it is spelled out here: a reader finding the old
+// caveat in git history must be able to see it was retired deliberately, not
+// lost.
+//
+// Four drafts got the wording wrong before the behaviour was fixed:
+// "Reverting this row to before this point" named a target state, "Undoing
+// every change up to this point" named the clicked event as the boundary,
+// "Undoing every change in this window" was accurate only while the whole
+// history was reversed, and the same-second caveat was accurate only while the
+// scope was a second. Hence a guard.
 func TestAppJSUndoBannerStatesWhatIsReversed(t *testing.T) {
 	eyebrow, detail := undoBannerText(t)
 	all := eyebrow + detail
 
-	// (a) Retired phrasings, including the one that was correct until the
-	// behaviour changed under it. Checked against the banner text ONLY — see
-	// undoBannerText: a needle in a comment can neither satisfy nor trip these.
+	// (a) Retired phrasings, each of which was correct when written and was
+	// falsified by a later change to the behaviour. Checked against the banner
+	// text ONLY — see undoBannerText: a needle in a comment can neither satisfy
+	// nor trip these, which is what lets the paragraphs above quote them.
 	for _, banned := range []struct{ text, why string }{
 		{"Reverting this row to before this point", "names a target state the script does not produce"},
-		{"up to this point", "names the clicked event as the ceiling; the ceiling is its whole second"},
-		{"Undoing every change", "the prefill reverses ONE change now, not every change on the row"},
-		{"not only that one", "was the whole-history caveat; with limit_per_pk=1 it is simply false"},
+		{"up to this point", "names the clicked event as the ceiling; the ceiling was its whole second"},
+		{"Undoing every change", "the prefill reverses ONE change, not every change on the row"},
+		{"not only that one", "was the whole-history caveat; false since the scope became one event"},
+		{"more than once inside that second", "was the same-second caveat; the anchor names the event, so the second no longer decides"},
+		{"not necessarily the one you clicked", "was true of the second-granular ceiling and is now the exact opposite of what happens"},
+		{"comes back rather than going away", "described the inverted outcome the anchor removed"},
+		{"Latest per row is set to 1", "the prefill no longer sets it; a banner naming a control it did not touch sends the operator to clear the wrong field"},
 	} {
 		if strings.Contains(all, banned.text) {
 			t.Errorf("the Undo banner reintroduces %q — %s.\nBanner was: %s", banned.text, banned.why, all)
@@ -49,54 +64,47 @@ func TestAppJSUndoBannerStatesWhatIsReversed(t *testing.T) {
 
 	// (b) The eyebrow states the singular scope.
 	if !strings.Contains(eyebrow, "one change") {
-		t.Errorf("the Undo banner eyebrow no longer says it undoes ONE change (%q). With "+
-			"limit_per_pk prefilled to 1 that is what the script does, and an eyebrow promising a "+
-			"window would over-state the blast radius in the safe direction — which still teaches "+
-			"the operator to distrust the banner.", eyebrow)
+		t.Errorf("the Undo banner eyebrow no longer says it undoes ONE change (%q). That is what "+
+			"the script does, and an eyebrow promising a window would over-state the blast radius "+
+			"in the safe direction — which still teaches the operator to distrust the banner.", eyebrow)
 	}
 
-	// (c) The ceiling is stated. Asserted as source fragments: the sentence is
-	// concatenated around ctx.type/ctx.time, so the rendered sentence never
-	// appears contiguously in the source.
-	for _, want := range []string{"latest change to this row", "end of the second"} {
+	// (c) The detail makes the IDENTITY claim, which is the one thing the
+	// operator cannot verify by reading the form: `until` is visible and says
+	// "that second", so without this sentence the visible fields under-describe
+	// the actual scope and the banner reads as the looser of the two.
+	//
+	// Asserted as source fragments: the sentence is concatenated around
+	// ctx.type/ctx.time, so the rendered sentence never appears contiguously.
+	for _, want := range []string{"exactly this", "the one you clicked"} {
 		if !strings.Contains(detail, want) {
 			t.Errorf("the Undo banner detail dropped %q.\nDetail was: %s\n"+
-				"Without it a reader cannot tell which change is reversed, or how far the ceiling reaches.", want, detail)
+				"Without it the banner does not distinguish the clicked event from everything "+
+				"else in its second, which is the distinction #1411 exists to make.", want, detail)
 		}
 	}
 
-	// (d) The control is named AND its escape hatch is offered. A prefill the
-	// banner does not mention is a silent narrowing — the thing #1388 was
-	// about not doing.
-	if !strings.Contains(detail, "Latest per row is set to 1") {
-		t.Error("the Undo banner no longer states that Latest per row was prefilled. The prefill " +
-			"changes what the button reverses; leaving it unsaid makes it a silent narrowing.")
-	}
-	if !strings.Contains(detail, "clear it") {
-		t.Error("the Undo banner states the prefill without saying how to undo it. The old " +
-			"whole-history behaviour is one cleared field away and the operator has to know that.")
-	}
-
-	// (e) The residual imprecision, which no control fixes.
-	if !strings.Contains(detail, "more than once inside that second") {
-		t.Error("the Undo banner dropped the same-second caveat. With a one-second ceiling the " +
-			"reversal lands on the LAST change in that second, which need not be the clicked one — " +
-			"that is exactly the case this banner exists for, so the caveat is not optional.")
-	}
-
-	// (f) …and the OUTCOME of that imprecision, not only its mechanism. Stating
-	// "the last of them is the one reversed" is true and still leaves the
-	// reader to derive the inversion: on a row INSERTed and DELETEd inside one
-	// second the cap keeps the DELETE, so clicking Undo on the INSERT
-	// RE-CREATES the row instead of removing it — the opposite of the intent,
-	// with the badge above still reading INSERT. Review found this riding along
-	// undisclosed; deriving it is not the operator's job.
-	for _, want := range []string{"not necessarily the one you clicked", "comes back"} {
+	// (d) …and it says what is NOT reversed. "One change" alone is ambiguous
+	// between "one change of this row's history" and "one change among those
+	// sharing this second", and the two differ on exactly the shape that used
+	// to invert.
+	for _, want := range []string{"history", "that second"} {
 		if !strings.Contains(detail, want) {
-			t.Errorf("the Undo banner dropped %q.\nDetail was: %s\n"+
-				"Without it the same-second caveat names a mechanism and hides the one outcome "+
-				"that is inverted from what the operator asked for.", want, detail)
+			t.Errorf("the Undo banner detail dropped %q.\nDetail was: %s\n"+
+				"The scope is stated by exclusion — neither the rest of the row's history nor "+
+				"the other changes in the clicked second — and dropping half of that leaves the "+
+				"remaining half readable as the wrong one.", want, detail)
 		}
+	}
+
+	// (e) The escape hatch is offered. An anchor the banner does not mention is
+	// a silent narrowing — the thing #1388 was about not doing — and it is
+	// narrower than any control visible in the form, so an operator who wants
+	// the row's history has no field to clear and no way to guess.
+	if !strings.Contains(detail, "Clear") {
+		t.Error("the Undo banner no longer points at Clear. The anchor is not a visible form " +
+			"field, so an operator who wants to widen the scope has nothing to edit and no way " +
+			"to learn that the button beside the banner is the way out.")
 	}
 }
 
@@ -134,33 +142,88 @@ func TestUndoBannerCarriesTheIdItIsRetiredBy(t *testing.T) {
 // The banner is prose; this pins the behaviour it describes. They fail to
 // different edits — dropping the prefill leaves a banner promising something
 // the script no longer does, and nothing throws either way.
-func TestUndoPrefillsLatestPerRow(t *testing.T) {
+func TestUndoPrefillsTheEventAnchor(t *testing.T) {
+	fn := functionSource(t, "renderRecover")
+
+	if !strings.Contains(fn, "form.elements.event.value = ctx.anchor;") {
+		t.Error("renderRecover's Undo prefill no longer carries the event anchor. Without it the " +
+			"request falls back to `until` alone — the window has no lower bound and no per-row " +
+			"cap, so the script reverses the row's ENTIRE history up to the clicked second (the " +
+			"#1404 defect) while the banner says one change.")
+	}
+	// The ceiling has to survive alongside it, for two reasons that outlive the
+	// anchor: it is what the operator reads to know WHEN, and it is the scope
+	// left behind when they press Clear. Without it, Clear widens to the whole
+	// index in one click.
+	if !strings.Contains(fn, "form.elements.until.value = ctx.time;") {
+		t.Error("renderRecover's Undo prefill no longer sets `until`. It is what the operator " +
+			"reads to know when, and what bounds the scope after Clear removes the anchor.")
+	}
+	// And the cap must NOT come back. Two mechanisms narrowing the same scope
+	// is how they drift: the anchor already admits one event, so a cap of 1
+	// changes nothing until someone clears the anchor — at which point it
+	// silently reinstates the #1404 behaviour under a banner that no longer
+	// mentions it.
+	if strings.Contains(fn, `form.elements.limit_per_pk.value = "1";`) {
+		t.Error("renderRecover's Undo prefill sets limit_per_pk again. The anchor already names " +
+			"one event; a second narrowing mechanism is invisible in the banner and reappears " +
+			"the moment the anchor is cleared.")
+	}
+}
+
+// The anchor is only as good as the identity it carries, and the failure mode
+// is silent in the worst way: `e.anchor` reaching the bridge as undefined
+// leaves the hidden field empty, the request unanchored, and the script back to
+// reversing the row's whole history up to the clicked second — with the new
+// banner claiming it reversed exactly one event.
+//
+// Pinned as the FIELD, not the value: rebuilding the token client-side from
+// `e.event_timestamp` is the specific mistake this guards. That timestamp is
+// second-granular and offset-less, so a reconstruction guesses a location, and
+// guessing wrong does not fail — it names a different row.
+func TestUndoBridgeCarriesTheServersAnchorToken(t *testing.T) {
+	fn := functionSource(t, "undoEvent")
+	if !strings.Contains(fn, "anchor: e.anchor") {
+		t.Error("undoEvent no longer copies the server's anchor token onto pendingRecover. " +
+			"Without it the prefill has nothing to set, the request is unanchored, and the " +
+			"banner's identity claim becomes false with nothing reporting it.")
+	}
+}
+
+// Both request builders must send the anchor, and the second one is the easy
+// half to forget: previewRecover promises the preview lists the events the
+// script will reverse. Unmirrored, the preview shows every event in the clicked
+// second while the script reverses one of them — the operator reviews a list
+// that is not what they are about to apply.
+func TestBothRecoverRequestsCarryTheAnchor(t *testing.T) {
+	for _, fnName := range []string{"generateUndo", "previewRecover"} {
+		fn := functionSource(t, fnName)
+		if !strings.Contains(fn, `"event"`) {
+			t.Errorf("%s no longer sends the event anchor. The preview and the generated script "+
+				"read the same form and must apply the same filters, or the list the operator "+
+				"reviews is not the one the script acts on.", fnName)
+		}
+	}
+}
+
+// functionSource returns the body of a top-level function in app.js with
+// whole-line comments stripped, bounded to that function.
+func functionSource(t *testing.T, name string) string {
+	t.Helper()
 	data, err := os.ReadFile("assets/app.js")
 	if err != nil {
 		t.Fatal(err)
 	}
 	js := string(data)
-	start := strings.Index(js, "function renderRecover(")
+	start := strings.Index(js, "function "+name+"(")
 	if start < 0 {
-		t.Fatal("renderRecover is gone from assets/app.js — this guard covers nothing")
+		t.Fatalf("%s is gone from assets/app.js — this guard covers nothing", name)
 	}
 	end := strings.Index(js[start:], "\nfunction ")
 	if end < 0 {
 		end = len(js) - start
 	}
-	fn := stripJSCommentLines(js[start : start+end])
-
-	if !strings.Contains(fn, `form.elements.limit_per_pk.value = "1";`) {
-		t.Error("renderRecover's Undo prefill no longer sets limit_per_pk. Without it the window " +
-			"has no lower bound and no per-row cap, so the script reverses the row's ENTIRE history " +
-			"up to the clicked second — the #1404 defect — while the banner still says one change.")
-	}
-	// The ceiling has to survive alongside it: limit_per_pk without `until`
-	// would reverse the row's most recent change, not the clicked one.
-	if !strings.Contains(fn, "form.elements.until.value = ctx.time;") {
-		t.Error("renderRecover's Undo prefill no longer sets `until`. Paired with limit_per_pk=1 " +
-			"that reverses the row's LATEST change instead of the one the operator clicked.")
-	}
+	return stripJSCommentLines(js[start : start+end])
 }
 
 // undoBannerText returns the eyebrow text and the concatenated detail source
@@ -357,6 +420,13 @@ func TestRestoreToStateClearsTheUndoBridgesPerRowCap(t *testing.T) {
 	for _, want := range []struct{ line, why string }{
 		{`form.elements.limit_per_pk.value = "";`,
 			"a cap inherited from the Undo bridge reverses only the newest change after the instant, so the row does not land on the state shown"},
+		// The strongest version of the same class, and the one that fails
+		// hardest: an anchor names ONE event, while this action reverses every
+		// change after the instant. Left set, the script reverses the event the
+		// operator clicked in Events minutes ago and nothing else, under a
+		// button naming a completely different outcome.
+		{`form.elements.event.value = "";`,
+			"an anchor inherited from the Undo bridge pins the script to one old event instead of everything after the instant"},
 		{`form.elements.until.value = "";`,
 			"a leftover upper bound silently drops the newest damage from the window"},
 		// The label, not a field — and it is a claim about the fields above.
