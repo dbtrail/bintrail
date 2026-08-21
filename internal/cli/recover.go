@@ -338,7 +338,15 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	rows, _, err := query.FetchMerged(cmd.Context(), db, engine, query.FetchMergedOptions{
+	// FetchMergedFull, not FetchMerged: the wrapper discards archivesElided,
+	// and this surface has to be able to SAY the registered archives went
+	// unread. Before #1403 that was near-theoretical here — the newest-first
+	// short-circuit needs a filled page, which a reversal scoped to one row
+	// never produces — but the per-PK proof makes it the NORMAL outcome of
+	// `recover --pk X --limit-per-pk N`. A reversal that quietly skipped
+	// registered archives, with the only trace at slog.Debug, is exactly the
+	// audit hole the flag was added to close (#1353).
+	rows, _, _, _, archivesElided, err := query.FetchMergedFull(cmd.Context(), db, engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         dbName,
 		NoArchive:      rNoArchive || rProfile != "",
@@ -367,6 +375,13 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	// generation, so the warning fires even when generation later refuses —
 	// then restore ascending order: GenerateSQLFromRows expects ASC input and
 	// reverses it internally to undo most-recent first.
+	// Said at INFO, not Debug: this is the audit record, not a planner detail.
+	// It reports what scope was read, which is the one thing an operator
+	// reviewing a reversal script cannot reconstruct from the script itself.
+	if archivesElided {
+		slog.Info("registered archives were not read: nothing they hold could have survived this " +
+			"request's filters. Widening the time range, or clearing --limit-per-pk, reads them")
+	}
 	truncated := rLimit > 0 && len(rows) >= rLimit
 	if truncated {
 		slog.Warn("matched events truncated at --limit; only the most recent events of the window are reversed",

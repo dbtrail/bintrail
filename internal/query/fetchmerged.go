@@ -277,6 +277,106 @@ func topNSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
 	return !cutoff.Before(plan.MySQLRanges[0].Start)
 }
 
+// perPKSatisfiedLive is topNSatisfiedLive's sibling for a query that asks for
+// the latest N events PER ROW rather than the newest N overall, so the archive
+// sources can be skipped for the same reason: they cannot change the answer.
+//
+// It exists because the page-fullness proof cannot reach the surface that pays
+// most for the archive leg. A reversal scoped to one PK returns a handful of
+// events against recover's default limit of 1000, so `len(rows) < opts.Limit`
+// is true essentially always and topNSatisfiedLive declines — on a window with
+// no lower bound that meant reading every registered archive hour to produce a
+// single statement. Measured on an index with ~1200 archived hours: 27.6s,
+// against 0.3s for the same reversal with the archives skipped.
+//
+// LimitPerPK is a whole-result-set trim applied AFTER the merge
+// (MergeAndTrimReport below), so the proof is that the trim would discard
+// everything the archives could contribute. All four conditions carry weight:
+//
+//   - LimitPerPK > 0. Without the trim the archives are not discarded, they
+//     are the answer's older half.
+//   - The query NAMES its PKs (PKValues or PKValuesIn). This is the condition
+//     with no counterpart in topNSatisfiedLive and the one that makes the rest
+//     sound: with an unscoped filter, a pk_values that appears ONLY in the
+//     archives is a legitimate result row, and skipping the archives would
+//     drop it entirely rather than trim it. A filled top-N page has no such
+//     hole, because everything it omits sorts below the cutoff; here what
+//     would be omitted is a whole row's history.
+//   - Every named PK already holds LimitPerPK rows live, checked BY NAME. A PK
+//     short of its N can still be extended by the archives, and one short PK
+//     is enough to make the whole skip wrong — so this is an ALL, not a
+//     majority. A PK that is simply absent counts as short.
+//   - One contiguous live range, with the oldest kept row inside it. Same
+//     reasoning as the sibling: it is what rules out an archived hour sitting
+//     ABOVE that row on a restored or hand-surgered index, which would make a
+//     live-only answer the wrong N. Worth knowing how much each path proves:
+//     on the unbounded browse path browsePlanFromHours returns nil outright if
+//     an archived content hour sits at or above the oldest live hour, so the
+//     check is verified; on the Plan path (a `until` with no `since`, which is
+//     the shape this was written for) buildPlan infers the range start FROM
+//     the oldest live hour, so the comparison is satisfied by construction and
+//     the real work is done by the per-PK condition. The single-range
+//     requirement still rules out an archived hour interleaved BELOW the live
+//     top, which is the layout rotation can actually produce.
+//
+// Order is deliberately NOT constrained, unlike the sibling's DESC-only rule,
+// and the difference is not an oversight. That rule protects a page CUTOFF;
+// there is no cutoff here. Satisfaction implies each named PK holds exactly N
+// rows and the result contains only named PKs, so the SQL LIMIT dropped
+// nothing and the set is the same either direction. Refusing ASC would cost
+// coverage and buy nothing.
+//
+// The engine has already applied LimitPerPK in SQL (a ROW_NUMBER window), so
+// the rows handed back here are the trim's output for the live half and need
+// no further trimming — which is why the caller returns them whole rather than
+// slicing to Limit as the top-N path does.
+func perPKSatisfiedLive(opts Options, rows []ResultRow, plan *QueryPlan) bool {
+	if opts.LimitPerPK <= 0 {
+		return false
+	}
+	// PKValuesAlt is a SECOND spelling of the same logical key, and the trim
+	// partitions by the stored pk_values — so one row's history can be split
+	// across two partitions and "this PK has its N" stops being well defined.
+	// Refused rather than approximated.
+	if opts.PKValuesAlt != "" {
+		return false
+	}
+	names := opts.PKValuesIn
+	if opts.PKValues != "" {
+		names = []string{opts.PKValues}
+	}
+	if len(names) == 0 {
+		return false
+	}
+	if plan == nil || len(plan.MySQLRanges) != 1 {
+		return false
+	}
+
+	perPK := make(map[string]int, len(names))
+	var oldest time.Time
+	for i := range rows {
+		perPK[rows[i].PKValues]++
+		if oldest.IsZero() || rows[i].EventTimestamp.Before(oldest) {
+			oldest = rows[i].EventTimestamp
+		}
+	}
+	// Walked by NAME, not by counting distinct keys in the result: a named PK
+	// that is simply absent must fail here, and a count comparison would let
+	// an unexpected key stand in for a missing one.
+	for _, pk := range names {
+		// The empty key is LimitPerPK's own carve-out: merge.go buckets every
+		// PKValues=="" row under its own synthetic key, so the trim discards
+		// NOTHING there and this predicate's whole proof evaporates. No caller
+		// pairs an empty name with LimitPerPK today, but internal/shim builds
+		// PKValuesIn{""} deliberately and its sibling paths do set LimitPerPK
+		// — only the two never meeting keeps that safe, and nothing pins it.
+		if pk == "" || perPK[pk] < opts.LimitPerPK {
+			return false
+		}
+	}
+	return !oldest.Before(plan.MySQLRanges[0].Start)
+}
+
 // DefaultStreamBatchSize is the page size FetchMergedStream uses when the
 // caller passes 0. Chosen as a compromise between resident memory (a page of
 // ResultRows carries both decoded JSON row images, so roughly 1-2 KB per event
@@ -631,6 +731,11 @@ func fetchPage(
 		slog.Debug("planner: skipping archive sources (newest-first page filled from contiguous live coverage)",
 			"limit", o.Opts.Limit, "sources", len(src.archSources))
 		return rows[:o.Opts.Limit], nil, nil, 0, true, nil
+	}
+	if perPKSatisfiedLive(o.Opts, rows, src.plan) {
+		slog.Debug("planner: skipping archive sources (every named PK already has its latest N live)",
+			"limit_per_pk", o.Opts.LimitPerPK, "sources", len(src.archSources))
+		return rows, nil, nil, 0, true, nil
 	}
 
 	// Archive fetches get the misfiled-archive file-scoping hint (#1037); the
