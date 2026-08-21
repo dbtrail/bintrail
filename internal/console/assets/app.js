@@ -2088,15 +2088,19 @@ function renderRecover(params) {
       // wrong the same way the phrasing it replaced was wrong, one revision
       // later.
       //
-      // Since is offered AND its limit is stated: it parses at the same
-      // granularity, so it cannot split events inside one second. Naming a
-      // control without saying where it stops working is how an operator ends
-      // up believing they narrowed something they did not.
-      el("span", { class: "ctx-eyebrow", text: "Undoing every change in this window" }),
+      // The remaining imprecision is stated rather than smoothed over. Latest
+      // per row keeps the LATEST event at or before the ceiling, and the
+      // ceiling is a whole second, so on a row touched more than once inside
+      // that second the reversal lands on the last of them — which need not be
+      // the one the operator clicked. Since cannot fix it either: it parses at
+      // the same granularity. Naming a control without saying where it stops
+      // working is how an operator ends up believing they narrowed something
+      // they did not.
+      el("span", { class: "ctx-eyebrow", text: "Undoing one change" }),
       el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " · pk " + ctx.pk }),
-      el("span", { class: "ctx-detail", text: "reverses all events on this row through the end of the second holding this "
-        + ctx.type + " (" + ctx.time + " UTC), not only that one" }),
-      el("span", { class: "ctx-detail", text: "Set Since to narrow the window — timestamps are second-granular, so it cannot split events inside one second." })));
+      el("span", { class: "ctx-detail", text: "reverses the latest change to this row at or before the end of the second holding this "
+        + ctx.type + " (" + ctx.time + " UTC)" }),
+      el("span", { class: "ctx-detail", text: "Latest per row is set to 1 — clear it to reverse this row's whole history up to that point. If the row changed more than once inside that second, the last of them is the one reversed." })));
     banner.append(el("span", { class: "spacer" }));
     banner.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear",
       onclick: () => { pendingRecover = null; navigate("recover"); } }));
@@ -2141,6 +2145,16 @@ function renderRecover(params) {
       form.elements.table.value = ctx.table;
       form.elements.pk.value = ctx.pk;
       if (ctx.time) form.elements.until.value = ctx.time;
+      // Undo means "undo THIS change", and until #1404 it did not: with only
+      // `until` set, the window ran from the beginning of time and the script
+      // reversed the row's ENTIRE history up to that second. On a row touched
+      // five times, undoing the third put it back to before the first.
+      //
+      // Prefilled rather than hardcoded: it lands in a visible, editable field
+      // and the banner states it, so widening the scope is one edit away and
+      // narrowing it was never a silent act. Clearing the field restores the
+      // old whole-history behaviour exactly.
+      form.elements.limit_per_pk.value = "1";
       generateUndo(form);
     });
   }
@@ -2650,6 +2664,14 @@ function aimUndoAtInstant(form, at) {
   if (!since) { toastError("Could not read the selected instant."); return; }
   form.elements.since.value = since;
   form.elements.until.value = "";
+  // Cleared for the same reason `until` is, and it became necessary with the
+  // same change that made `until` matter here: since #1404 the Undo bridge
+  // prefills limit_per_pk = 1, so an operator who used Undo first would arrive
+  // with a leftover cap. This action reverses EVERY change after `at` — that
+  // is what makes the row land on the state shown — and a cap of 1 would
+  // reverse only the newest of them and land it somewhere else entirely,
+  // silently, with the button still naming the state it did not produce.
+  form.elements.limit_per_pk.value = "";
   previewRecover(form);
   form.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
   toast("Undo window set to everything after " + at + " UTC");

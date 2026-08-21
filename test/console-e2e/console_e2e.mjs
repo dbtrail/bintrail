@@ -1234,8 +1234,11 @@ try {
     const btn = document.querySelector(".state-actions .btn-primary");
     if (!btn) return { err: "no Restore-to-this-state button on a found row" };
     const at = (document.querySelector("#state-out .meta-line") || {}).textContent || "";
+    // Arrive carrying the Undo bridge's per-row cap, which is what an operator
+    // who used Undo first would have in the field.
+    f.elements.limit_per_pk.value = "1";
     btn.click();
-    return { since: f.elements.since.value, until: f.elements.until.value, at };
+    return { since: f.elements.since.value, until: f.elements.until.value, cap: f.elements.limit_per_pk.value, at };
   });
   {
     const m = /as of (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/.exec(bridge.at || "");
@@ -1243,7 +1246,86 @@ try {
     (want && bridge.since === want && bridge.until === "")
       ? ok("restore: 'Restore to this state' sets the undo window to at+1s")
       : bad("restore: 'Restore to this state' sets the undo window to at+1s", JSON.stringify({ ...bridge, want }));
+    // The two bridges set opposite scopes on one form. This action reverses
+    // EVERY change after the instant — that is what makes the row land on the
+    // state shown — so a cap inherited from Undo would reverse only the newest
+    // and land it elsewhere, silently, with the button still naming the state
+    // it did not produce.
+    bridge.cap === ""
+      ? ok("restore: 'Restore to this state' clears the Undo bridge's per-row cap")
+      : bad("restore: 'Restore to this state' clears the Undo bridge's per-row cap", `limit_per_pk=${bridge.cap}`);
   }
+
+  // The other direction: arriving through Undo must land the cap in the field,
+  // because that prefill is what makes the button reverse ONE change instead
+  // of the row's whole history. Driven through the real bridge — pendingRecover
+  // plus a navigate — rather than by calling the prefill, since the prefill
+  // runs inside setSelectWhenReady's schema callback and a direct call would
+  // skip the path that can actually break.
+  const undoBridge = await page.evaluate(async (fixSchema) => {
+    // Snapshot every field, not the schema alone: the scenarios below inherit
+    // whatever this form already held (the timeline one sets only `pk` and
+    // relies on schema+table being filled), and a re-render blanks all of it.
+    {
+      const f0 = document.getElementById("recover-form");
+      window.__preUndo = {};
+      if (f0) for (const n of ["schema", "table", "pk", "limit_per_pk", "since", "until"]) {
+        window.__preUndo[n] = f0.elements[n] ? f0.elements[n].value : "";
+      }
+    }
+    pendingRecover = { schema: fixSchema, table: "orders", pk: "1", type: "update", time: "2026-01-01 00:00:00" };
+    navigate("recover");
+    for (let i = 0; i < 40; i++) {
+      const f = document.getElementById("recover-form");
+      if (f && f.elements.pk.value === "1") break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const f = document.getElementById("recover-form");
+    if (!f) return { err: "no recover form" };
+    const eyebrow = (document.querySelector(".ctx-banner .ctx-eyebrow") || {}).textContent || "";
+    const detail = Array.from(document.querySelectorAll(".ctx-banner .ctx-detail")).map((n) => n.textContent).join(" ");
+    return { cap: f.elements.limit_per_pk.value, until: f.elements.until.value, eyebrow, detail };
+  }, FIX);
+  (undoBridge.cap === "1" && undoBridge.until === "2026-01-01 00:00:00")
+    ? ok("restore: the Undo bridge prefills a per-row cap of 1 alongside the ceiling")
+    : bad("restore: the Undo bridge prefills a per-row cap of 1 alongside the ceiling", JSON.stringify(undoBridge));
+  // The prefill changes what the button reverses, so the banner has to say it.
+  // A prefill the banner does not mention is a silent narrowing.
+  (/one change/.test(undoBridge.eyebrow) && /Latest per row is set to 1/.test(undoBridge.detail) && /clear it/.test(undoBridge.detail))
+    ? ok("restore: the Undo banner states the cap it prefilled and how to clear it")
+    : bad("restore: the Undo banner states the cap it prefilled and how to clear it", JSON.stringify(undoBridge));
+  // Leave the page as this scenario found it. pendingRecover survives a
+  // re-render, and the prefilled cap makes every later generate 400 with
+  // "the latest-per-row filter needs a PK" the moment a scenario clears the PK
+  // — which is a correct server refusal and a wrong reason for fourteen
+  // unrelated checks to go red.
+  await page.evaluate(async (fixSchema) => {
+    pendingRecover = null;
+    navigate("recover");
+    for (let i = 0; i < 40; i++) {
+      const f = document.getElementById("recover-form");
+      if (f && !document.querySelector(".ctx-banner")) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const f = document.getElementById("recover-form");
+    if (!f || !window.__preUndo) return;
+    // Schema first and on its own tick: the cascade listener repopulates the
+    // table datalist and CLEARS a stale table value, so restoring table before
+    // the cascade settles loses it again.
+    // Through setSelectWhenReady, not by assigning .value: populateSchemas
+    // fills the options asynchronously after the re-render, and assigning a
+    // value the select does not yet carry silently leaves it blank — which is
+    // what the Time-travel scenarios below then read as "no rows". The app
+    // already owns this wait; using it is also what the real prefill does.
+    await new Promise((resolve) => {
+      setSelectWhenReady(f, "schema", fixSchema, resolve);
+      setTimeout(resolve, 5000);
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    for (const n of ["table", "pk", "limit_per_pk", "since", "until"]) {
+      if (f.elements[n]) f.elements[n].value = window.__preUndo[n] || "";
+    }
+  }, FIX);
 
   // The timeline is how an operator picks an instant without leaving to read
   // one off Events. Its own restore button used to route through undoEvent,

@@ -6,71 +6,114 @@ import (
 	"testing"
 )
 
-// The Restore "Undo" banner must describe the WINDOW it reverses, never a
-// target state and never a single event.
+// The Restore "Undo" banner must describe exactly what the generated script
+// reverses — and since #1404 that is ONE change, not a window.
 //
-// renderRecover's prefill sets `until` from the clicked event and never
-// `since`. `ctx.time` is second-granular (consoleTSFormat) and the predicate
-// is `event_timestamp <= ?`, so the ceiling is the END OF THAT SECOND: every
-// event on the row up to there is reversed, including ones that happened
-// AFTER the clicked event inside the same second.
+// The history is the point of the guard. renderRecover's prefill sets `until`
+// from the clicked event and never `since`, so the window ran from the
+// beginning of time: undoing the third of five changes to a row put it back to
+// before the FIRST. #1388 fixed the WORDING to match that behaviour; #1404
+// changed the behaviour instead, prefilling `limit_per_pk = 1` so the script
+// reverses the latest change at or before the ceiling.
 //
-// The failure is not hypothetical and not a corner case. A row INSERTed and
-// DELETEd inside one second (WordPress `_transient_doing_cron`) reverses BOTH
-// from either entry point, and the net effect is no row at all — correct for
-// the window, the opposite of what a banner naming one event announces.
-// `since` is no remedy there: it parses at the same granularity.
+// What did not change is the ceiling. `ctx.time` is second-granular
+// (consoleTSFormat) and the predicate is `event_timestamp <= ?`, so it is the
+// END of that second. On a row touched more than once inside it — a row
+// INSERTed and DELETEd in the same second, like WordPress
+// `_transient_doing_cron` — the reversal lands on the LAST of them, which need
+// not be the one the operator clicked. `since` is no remedy: it parses at the
+// same granularity. The banner has to say so.
 //
-// Two earlier drafts got this wrong in the same direction — "Reverting this
-// row to before this point" named a target state, then "Undoing every change
-// up to this point" named the clicked event as the boundary. Hence a guard.
-func TestAppJSUndoBannerStatesWindowScope(t *testing.T) {
+// Three drafts got this wrong in the same direction before the behaviour was
+// fixed: "Reverting this row to before this point" named a target state,
+// "Undoing every change up to this point" named the clicked event as the
+// boundary, and "Undoing every change in this window" was accurate only while
+// the whole history really was reversed. Hence a guard.
+func TestAppJSUndoBannerStatesWhatIsReversed(t *testing.T) {
 	eyebrow, detail := undoBannerText(t)
+	all := eyebrow + detail
 
-	// (a) The retired phrasings must not come back. Checked against the banner
-	// text ONLY — see undoBannerText: a needle in a comment can neither
-	// satisfy nor trip these.
-	for _, banned := range []string{
-		"Reverting this row to before this point",
-		"undoing changes up to ",
-		// Names the clicked event as the ceiling. It is not; the second is.
-		"up to this point",
+	// (a) Retired phrasings, including the one that was correct until the
+	// behaviour changed under it. Checked against the banner text ONLY — see
+	// undoBannerText: a needle in a comment can neither satisfy nor trip these.
+	for _, banned := range []struct{ text, why string }{
+		{"Reverting this row to before this point", "names a target state the script does not produce"},
+		{"up to this point", "names the clicked event as the ceiling; the ceiling is its whole second"},
+		{"Undoing every change", "the prefill reverses ONE change now, not every change on the row"},
+		{"not only that one", "was the whole-history caveat; with limit_per_pk=1 it is simply false"},
 	} {
-		if strings.Contains(eyebrow+detail, banned) {
-			t.Errorf("the Undo banner reintroduces %q.\n"+
-				"That phrasing makes the clicked event (or the state before it) the boundary. The window "+
-				"actually closes at the END of that event's second, and every event on the row up to there "+
-				"is reversed. State the window.", banned)
+		if strings.Contains(all, banned.text) {
+			t.Errorf("the Undo banner reintroduces %q — %s.\nBanner was: %s", banned.text, banned.why, all)
 		}
 	}
 
-	// (b) The eyebrow names a window, not a point.
-	if !strings.Contains(eyebrow, "window") {
-		t.Errorf("the Undo banner eyebrow no longer says it is undoing a window (%q) — "+
-			"without that word it reads as a single-event reversal, which is not what generateUndo does", eyebrow)
+	// (b) The eyebrow states the singular scope.
+	if !strings.Contains(eyebrow, "one change") {
+		t.Errorf("the Undo banner eyebrow no longer says it undoes ONE change (%q). With "+
+			"limit_per_pk prefilled to 1 that is what the script does, and an eyebrow promising a "+
+			"window would over-state the blast radius in the safe direction — which still teaches "+
+			"the operator to distrust the banner.", eyebrow)
 	}
 
-	// (c) The detail states the real ceiling and that the clicked event is not
-	// alone. Asserted as source fragments: the sentence is concatenated around
-	// ctx.type/ctx.time, so the rendered sentence never appears contiguously in
-	// the source and searching for it whole would fail on every run.
-	for _, want := range []string{"end of the second", "not only that one"} {
+	// (c) The ceiling is stated. Asserted as source fragments: the sentence is
+	// concatenated around ctx.type/ctx.time, so the rendered sentence never
+	// appears contiguously in the source.
+	for _, want := range []string{"latest change to this row", "end of the second"} {
 		if !strings.Contains(detail, want) {
-			t.Errorf("the Undo banner detail dropped %q.\n"+
-				"Detail was: %s\nA reader cannot tell how far the reversal reaches without it.", want, detail)
+			t.Errorf("the Undo banner detail dropped %q.\nDetail was: %s\n"+
+				"Without it a reader cannot tell which change is reversed, or how far the ceiling reaches.", want, detail)
 		}
 	}
 
-	// (d) Since is offered AND its limit is stated. Offering it alone is worse
-	// than silence on the motivating case: an operator narrows the window,
-	// gets the identical script, and concludes the tool is broken.
-	if !strings.Contains(detail, "Set Since to narrow the window") {
-		t.Error("the Undo banner no longer points at Since — stating the window is wide without naming " +
-			"the way to narrow it leaves the operator with a warning and no action")
+	// (d) The control is named AND its escape hatch is offered. A prefill the
+	// banner does not mention is a silent narrowing — the thing #1388 was
+	// about not doing.
+	if !strings.Contains(detail, "Latest per row is set to 1") {
+		t.Error("the Undo banner no longer states that Latest per row was prefilled. The prefill " +
+			"changes what the button reverses; leaving it unsaid makes it a silent narrowing.")
 	}
-	if !strings.Contains(detail, "second-granular") {
-		t.Error("the Undo banner points at Since without saying it cannot split events inside one second. " +
-			"That is exactly the case this banner exists for, so the caveat is not optional.")
+	if !strings.Contains(detail, "clear it") {
+		t.Error("the Undo banner states the prefill without saying how to undo it. The old " +
+			"whole-history behaviour is one cleared field away and the operator has to know that.")
+	}
+
+	// (e) The residual imprecision, which no control fixes.
+	if !strings.Contains(detail, "more than once inside that second") {
+		t.Error("the Undo banner dropped the same-second caveat. With a one-second ceiling the " +
+			"reversal lands on the LAST change in that second, which need not be the clicked one — " +
+			"that is exactly the case this banner exists for, so the caveat is not optional.")
+	}
+}
+
+// The banner is prose; this pins the behaviour it describes. They fail to
+// different edits — dropping the prefill leaves a banner promising something
+// the script no longer does, and nothing throws either way.
+func TestUndoPrefillsLatestPerRow(t *testing.T) {
+	data, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(data)
+	start := strings.Index(js, "function renderRecover(")
+	if start < 0 {
+		t.Fatal("renderRecover is gone from assets/app.js — this guard covers nothing")
+	}
+	end := strings.Index(js[start:], "\nfunction ")
+	if end < 0 {
+		end = len(js) - start
+	}
+	fn := stripJSCommentLines(js[start : start+end])
+
+	if !strings.Contains(fn, `form.elements.limit_per_pk.value = "1";`) {
+		t.Error("renderRecover's Undo prefill no longer sets limit_per_pk. Without it the window " +
+			"has no lower bound and no per-row cap, so the script reverses the row's ENTIRE history " +
+			"up to the clicked second — the #1404 defect — while the banner still says one change.")
+	}
+	// The ceiling has to survive alongside it: limit_per_pk without `until`
+	// would reverse the row's most recent change, not the clicked one.
+	if !strings.Contains(fn, "form.elements.until.value = ctx.time;") {
+		t.Error("renderRecover's Undo prefill no longer sets `until`. Paired with limit_per_pk=1 " +
+			"that reverses the row's LATEST change instead of the one the operator clicked.")
 	}
 }
 
@@ -133,4 +176,43 @@ func spanText(t *testing.T, fn, cls string) string {
 		t.Fatalf("unterminated text literal on the %s span", cls)
 	}
 	return rest[:j]
+}
+
+// The two bridges set opposite scopes on the SAME form, and #1404 is what put
+// them in conflict: Undo now prefills a per-row cap of 1, while
+// "Restore to this state" reverses every change after an instant — which is
+// the only reason the row lands on the state the button names.
+//
+// An operator who uses Undo and then Restore-to-this-state arrives with the
+// leftover cap. The result is a row left in a state nobody asked for, with no
+// error and a button still naming the state it did not produce. This is the
+// same class as the leftover `until` the function already clears, and it is
+// pinned because the two clears look like boilerplate and read as removable.
+func TestRestoreToStateClearsTheUndoBridgesPerRowCap(t *testing.T) {
+	data, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(data)
+	start := strings.Index(js, "function aimUndoAtInstant(")
+	if start < 0 {
+		t.Fatal("aimUndoAtInstant is gone from assets/app.js — this guard covers nothing")
+	}
+	end := strings.Index(js[start:], "\nfunction ")
+	if end < 0 {
+		end = len(js) - start
+	}
+	fn := stripJSCommentLines(js[start : start+end])
+
+	for _, want := range []struct{ line, why string }{
+		{`form.elements.limit_per_pk.value = "";`,
+			"a cap inherited from the Undo bridge reverses only the newest change after the instant, so the row does not land on the state shown"},
+		{`form.elements.until.value = "";`,
+			"a leftover upper bound silently drops the newest damage from the window"},
+	} {
+		if !strings.Contains(fn, want.line) {
+			t.Errorf("aimUndoAtInstant no longer clears a field the other bridge sets: missing %q.\n%s",
+				want.line, want.why)
+		}
+	}
 }
