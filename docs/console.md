@@ -805,6 +805,35 @@ it withholds the whole surface under a profile). Each data route reads the index
 of the server currently selected in the switcher, with the operator's profile
 applied.
 
+The module must export `render(mount, ctx)`. `ctx` is built in one place
+(`extContract` in `app.js`) and is the same for both extension surfaces:
+
+| key | what it is |
+|---|---|
+| `apiBase` | the extension's own data-route prefix (`/api/ext/<id>/`) |
+| `api` | the console's authenticated fetch — bearer token and `X-Bintrail-Server` already applied. An HTTP error throws an `Error` carrying `.status`; a malformed body throws one **without** it, an aborted request rejects with `AbortError`, and a 204 resolves to `null`. Branch on `.status` defensively. |
+| `ui.dateField(label, name, size, placeholder, required)` | the console's own date field: a text input plus the calendar/clock popover, returning the same `.field` wrapper the console's forms use |
+
+`ui` exists so an extension does not reimplement a widget the console already
+has — two copies drift, and the operator ends up looking at two different date
+pickers in one console. It is also the boundary of what may be relied on:
+`app.js` is a classic script, so an extension running same-origin *could* reach
+any of its functions as a window global, but only what arrives through `ctx` is
+a promise. Everything else may be renamed without notice, and because the two
+sides are built in different repos and never compile together, such a rename
+would surface as a widget that quietly stopped appearing rather than as an
+error. An extension that wants to run against older console builds should
+feature-detect (`typeof ctx.ui?.dateField === "function"`) and degrade. Two
+things that detection does not give you. It establishes **presence, not
+shape** — a build whose builder took different arguments would still answer
+`"function"` — so treat the signature above as the contract and expect it to
+be versioned with the console, not sniffed. And `render()` is called but **not
+awaited**: a synchronous throw is caught and rendered as an error in the
+mount, while an `async render()` that rejects escapes as an unhandled
+rejection and leaves the mount blank. An extension doing async work in
+`render` should catch its own failures and render them, rather than relying on
+the console to.
+
 The standalone `bintrail-console` binary ships **no extension views**: no nav
 item appears, `/api/capabilities` advertises none, and `/ext/*` and
 `/api/ext/*` are absent from the router entirely.

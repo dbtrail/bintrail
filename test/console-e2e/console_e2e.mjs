@@ -715,7 +715,23 @@ try {
   const extv = await page.evaluate(async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const modURL = (marker) => URL.createObjectURL(new Blob(
-      [`export function render(mount, ctx){ window.${marker} = !!(mount && ctx && typeof ctx.api === "function" && ctx.apiBase); mount.append(document.createTextNode("ext-content")); }`],
+      // The stub exercises the CONTRACT, not just its key names: it calls
+      // ctx.ui.dateField and inspects what comes back. A presence check would
+      // have passed with the binding moved to a sibling key, or with the
+      // builder's parameters reordered — both of which hand an extension a
+      // broken widget and no error. Only a real call can tell.
+      [`export function render(mount, ctx){
+         const f = ctx && ctx.ui && ctx.ui.dateField;
+         const node = typeof f === "function" ? f("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS") : null;
+         window.${marker} = !!(mount && ctx && typeof ctx.api === "function" && ctx.apiBase);
+         window.${marker}_ui = !!(node
+           && node.classList.contains("field")
+           && node.querySelector(".dt-trigger")
+           && node.querySelector("input") && node.querySelector("input").name === "since"
+           && node.querySelector(".field-label")
+           && node.querySelector(".field-label").textContent.includes("Since (UTC)"));
+         mount.append(document.createTextNode("ext-content"));
+       }`],
       { type: "text/javascript" },
     ));
 
@@ -753,6 +769,7 @@ try {
     capsCache = { ...capsCache, extension_views: [{ id: "demo", label: "Demo View", script }] };
     extViews = capsCache.extension_views;
     window.__ext1 = undefined;
+    window.__ext1_ui = undefined;
     syncExtNav();
     const navItem = document.querySelector('.nav-item[data-route="ext-demo"]');
     const navText = navItem ? navItem.textContent.trim() : null;
@@ -765,7 +782,26 @@ try {
     const mount = document.querySelector(".ext-view-mount");
     const mountedText = mount ? mount.textContent : "";
     const rendered = window.__ext1;
+    const renderedUI = window.__ext1_ui;
     const navActive = navItem ? navItem.classList.contains("active") : false;
+
+    // 2b) The OTHER extension surface. Settings panels take the same contract
+    //     from the same builder, and until now nothing here drove them at all
+    //     — which mattered because the settings surface is the one that was
+    //     forgotten when the shared builder was introduced: the view's call
+    //     was widened and the panel's was left hand-rolled. A guard comment
+    //     claiming "the browser tier covers the shape" was true of the view
+    //     and false of this, so the leg exists rather than the caveat.
+    //
+    //     Driven through renderExtensionSettings directly: the panel's nav
+    //     lives under Settings and its routing is exercised elsewhere; what
+    //     is unproven is the contract it hands its module.
+    window.__extset = undefined;
+    window.__extset_ui = undefined;
+    await renderExtensionSettings({ id: "demoset", label: "Demo Panel", script: modURL("__extset") });
+    await sleep(200);
+    const setRendered = window.__extset;
+    const setRenderedUI = window.__extset_ui;
 
     // 3) Server switch → the nav item is dropped and the now-unknown ext route
     //    redirects to overview (unmount across a switch).
@@ -790,7 +826,7 @@ try {
     // for the final no-errors assertion.
     await gateCapabilities();
     navigate("overview");
-    return { gatedFromCaps, gatedNav, navText, known, onRoute, mounted: !!mount, mountedText, rendered, navActive, navGone, redirected, staleAborted };
+    return { gatedFromCaps, gatedNav, navText, known, onRoute, mounted: !!mount, mountedText, rendered, renderedUI, setRendered, setRenderedUI, navActive, navGone, redirected, staleAborted };
   });
   extv.gatedFromCaps ? ok("ext-view: gateCapabilities populates extViews from /api/capabilities.extension_views") : bad("ext-view: gateCapabilities populates extViews from /api/capabilities.extension_views", "extViews not set from the parsed caps response");
   extv.gatedNav ? ok("ext-view: gateCapabilities injects the nav item from the fetched caps") : bad("ext-view: gateCapabilities injects the nav item from the fetched caps", "no ext-gated nav item after gateCapabilities");
@@ -798,7 +834,16 @@ try {
   extv.known ? ok("ext-view: isKnownRoute accepts a live ext-<id> route") : bad("ext-view: isKnownRoute accepts a live ext-<id> route", "ext-demo not known");
   extv.onRoute ? ok("ext-view: navigate routes to /ext-<id>") : bad("ext-view: navigate routes to /ext-<id>", "wrong route");
   extv.mounted ? ok("ext-view: a mount node is created") : bad("ext-view: a mount node is created", "no .ext-view-mount");
-  extv.rendered ? ok("ext-view: the module render() runs with {apiBase, api}") : bad("ext-view: the module render() runs with {apiBase, api}", `rendered=${extv.rendered}`);
+  extv.rendered ? ok("ext-view: the module render() runs with {apiBase, api, ui}") : bad("ext-view: the module render() runs with {apiBase, api, ui}", `rendered=${extv.rendered}`);
+  // The widget half, asserted by USING it. The Go guards pin the binding's
+  // spelling in app.js; only this can say the extension receives something
+  // that builds the console's own date field — right wrapper, right label,
+  // right input name, calendar attached.
+  extv.renderedUI ? ok("ext-view: ctx.ui.dateField builds the console's own date field") : bad("ext-view: ctx.ui.dateField builds the console's own date field", `renderedUI=${extv.renderedUI}`);
+  // Same two assertions for the settings surface, because "both surfaces get
+  // the same contract" is the claim and one of them was already forgotten once.
+  extv.setRendered ? ok("ext-settings: the panel module render() runs with {apiBase, api, ui}") : bad("ext-settings: the panel module render() runs with {apiBase, api, ui}", `setRendered=${extv.setRendered}`);
+  extv.setRenderedUI ? ok("ext-settings: ctx.ui.dateField builds the console's own date field") : bad("ext-settings: ctx.ui.dateField builds the console's own date field", `setRenderedUI=${extv.setRenderedUI}`);
   /ext-content/.test(extv.mountedText) ? ok("ext-view: module content lands in the mount") : bad("ext-view: module content lands in the mount", `mountedText=${extv.mountedText}`);
   extv.navActive ? ok("ext-view: the nav item is marked active on its route") : bad("ext-view: the nav item is marked active on its route", "not .active");
   extv.navGone ? ok("ext-view: server switch removes the ext nav item (idempotent)") : bad("ext-view: server switch removes the ext nav item (idempotent)", "stale nav item remained");

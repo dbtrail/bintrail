@@ -4812,6 +4812,29 @@ function syncExtSettingsNav() {
   }
 }
 
+// extContract is what an extension module receives. Both extension surfaces —
+// the settings panel and the full view — build it here, so the two cannot
+// drift into different contracts for the same kind of consumer.
+//
+// `apiBase` and `api` are the data plane. `ui` is the small set of console
+// widgets an extension should NOT be reimplementing: a second copy drifts, and
+// the operator ends up looking at two different date pickers in one console.
+//
+// Handed over explicitly rather than left to be discovered. app.js is a classic
+// script, so its function declarations are reachable as window globals and an
+// extension COULD simply call one — which is exactly the coupling to avoid.
+// The two sides are built in different repos on different release cadences and
+// never compile together, so a rename here would break the extension with no
+// error at all: the widget would just stop appearing. What is in `ui` is a
+// promise the console keeps; what is not is an internal that may move.
+//
+// dateField is fieldDateInput itself rather than a wrapper, so a rename cannot
+// leave the two spellings pointing at different builders.
+function extContract(apiBase) {
+  return { apiBase, api, ui: { dateField: fieldDateInput } };
+}
+
+
 // renderExtensionSettings mounts a settings panel's ES module. Same contract as
 // renderExtensionView, with the panel's own data prefix — the two surfaces are
 // authorized differently server-side (settings:read/write vs extview:read), so
@@ -4831,7 +4854,7 @@ async function renderExtensionSettings(panel) {
       renderError(mount, "This settings panel did not export a render() function.");
       return;
     }
-    mod.render(mount, { apiBase: "/api/ext-settings/" + panel.id + "/", api });
+    mod.render(mount, extContract("/api/ext-settings/" + panel.id + "/"));
   } catch (err) {
     if (gen !== serverGen) return;
     renderError(mount, err);
@@ -4852,7 +4875,7 @@ async function renderExtensionView(view) {
       renderError(mount, "This extension view did not export a render() function.");
       return;
     }
-    mod.render(mount, { apiBase: "/api/ext/" + view.id + "/", api });
+    mod.render(mount, extContract("/api/ext/" + view.id + "/"));
   } catch (err) {
     if (gen !== serverGen) return;
     renderError(mount, err);
