@@ -1334,8 +1334,16 @@ function ovStat(value, key, mod, scope) {
   // the console-e2e read "0" from the deletes tile mid-flight. A forensics
   // surface that briefly reports zero deletions is a small lie, and the
   // entrance animation already supplies the sense of arrival without one.
+  // The brand gradient (#1385) is opt-in per tile, and this is the only place
+  // that grants it. `mod` already names the exact set that must not have it,
+  // so the gate needs no list of its own: "danger" paints the deletes count in
+  // the semantic --delete, and the `small` variant is 19px at weight 500 —
+  // below WCAG's large-text bar, which is the only bar the gradient's stops
+  // clear. (`small` is built inline elsewhere and has never reached ovStat;
+  // gating on `mod` rather than on the name covers it if it ever does.)
+  const brand = mod ? " " + mod : " ov-stat-num";
   return el("div", { class: "ov-stat" },
-    el("div", { class: "ov-stat-v" + (mod ? " " + mod : ""), text: value }),
+    el("div", { class: "ov-stat-v" + brand, text: value }),
     el("div", { class: "ov-stat-k", text: key }),
     el("div", { class: "ov-stat-scope", text: scope || "" }));
 }

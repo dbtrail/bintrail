@@ -2249,6 +2249,74 @@ try {
     ? ok("reduced motion: the dimmed-button stand-in does not leak into no-preference")
     : bad("reduced motion: the dimmed-button stand-in does not leak into no-preference", moved.spinOpacity);
 
+  // ── Scenario 17e — who may wear the brand gradient (#1385) ──
+  //
+  // The Go guards in assets_brandpaint_test.go prove the gradient is opt-in,
+  // that its transparent ink stays behind @supports, and that app.js grants the
+  // class from exactly one place. None of them can prove the gate in that one
+  // place points the right way: rewriting it to grant the class
+  // unconditionally keeps the count at one and leaves every text guard green.
+  // Verified by mutation, which is why this scenario exists.
+  //
+  // What is at stake is not decoration. The gradient's stops measure 3.70:1 to
+  // 5.16:1 on white, so they clear WCAG's LARGE-text bar of 3:1 and none of
+  // them clears the 4.5:1 body bar. A tile that takes the gradient without
+  // being large text is unreadable, and the deletes tile additionally carries
+  // the semantic --delete that the brand palette must never repaint.
+  //
+  // ovStat is called for real rather than synthesised: the gate lives inside
+  // it, so a hand-built div would test the stylesheet and skip the bug.
+  const brandProbe = () => page.evaluate(() => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const tile = (v, key, mod) => {
+      const n = ovStat(v, key, mod, "last 24 h");
+      host.appendChild(n);
+      return n.querySelector(".ov-stat-v");
+    };
+    const plain = tile("42", "changes indexed", "");
+    const danger = tile("7", "deletes", "danger");
+    // The `small` variant is built inline in fillOvEvents, not through ovStat.
+    // Mirrored here because it is the surface the gradient would hurt MOST:
+    // 19px at weight 500 is body text, so it is held to 4.5:1, which no stop
+    // in this gradient reaches.
+    const small = el("div", { class: "ov-stat-v small", text: "2026-08-20 11:00:00" });
+    host.appendChild(small);
+    // A reference for the semantic colour, computed through the same pipeline
+    // as the tile so the two strings are comparable whatever form the engine
+    // serialises oklch into.
+    const ref = el("span", { text: "x" });
+    ref.style.color = "var(--delete)";
+    host.appendChild(ref);
+    const cs = (n) => getComputedStyle(n);
+    const res = {
+      plainImage: cs(plain).backgroundImage,
+      plainColor: cs(plain).color,
+      dangerImage: cs(danger).backgroundImage,
+      dangerColor: cs(danger).color,
+      smallImage: cs(small).backgroundImage,
+      smallColor: cs(small).color,
+      deleteRef: cs(ref).color,
+    };
+    host.remove();
+    return res;
+  });
+
+  const brand = await brandProbe();
+  const transparent = "rgba(0, 0, 0, 0)";
+
+  (brand.plainImage.includes("gradient") && brand.plainColor === transparent)
+    ? ok("brand paint: the 32px Overview count wears the headline gradient")
+    : bad("brand paint: the 32px Overview count wears the headline gradient", JSON.stringify(brand));
+  // Both halves matter. No gradient is the gate doing its job; a colour that
+  // is still --delete is the cascade doing its job if the gate ever stops.
+  (brand.dangerImage === "none" && brand.dangerColor === brand.deleteRef)
+    ? ok("brand paint: the deletes tile keeps the semantic --delete and takes no gradient")
+    : bad("brand paint: the deletes tile keeps the semantic --delete and takes no gradient", JSON.stringify(brand));
+  (brand.smallImage === "none" && brand.smallColor !== transparent)
+    ? ok("brand paint: the 19px/500 timestamp tile is left as plain readable ink")
+    : bad("brand paint: the 19px/500 timestamp tile is left as plain readable ink", JSON.stringify(brand));
+
   // ── Scenario 18 — advisory severity split on the archive fixture (#1365) ──
   // The archive-elision record must render in the INFO register (muted line,
   // no ⚠ icon, no amber, no alert classes) while a real coverage-gap warning
