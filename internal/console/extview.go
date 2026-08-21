@@ -65,6 +65,26 @@ func (s *Server) consoleQueryContext(r *http.Request) (ext.ConsoleQueryContext, 
 // profile (#699/#838) — the same signal the guard now keys on. The field type
 // on ext.ConsoleQueryContext.Fetch is an alias of this signature, so the
 // returned value assigns directly.
+//
+// One thing it does NOT carry: the archive-elision signal. s.fetch goes through
+// query.FetchMerged, which discards archivesElided, so when fetchPage decides
+// the live rows already satisfy a request and skips the registered archives,
+// no note reaches the operator through this seam — the audit hole the CLI
+// recover path closes by using FetchMergedFull instead (#1403).
+//
+// This is REACHABLE, not theoretical, and the reachable shape is the ordinary
+// one rather than the exotic one. A provider that fetches a bounded newest-first
+// page — Limit set, Order DESC — satisfies topNSatisfiedLive as soon as that
+// page fills from live partitions, which is what a "recent activity" listing
+// does by construction. The per-PK shape (PKValues plus LimitPerPK) is the
+// narrower door and no installed provider is known to use it; the top-N door is
+// wide open.
+//
+// Left as a note rather than fixed because the remedy is a signature change on
+// the seam — this closure's return shape is fixed by ext.ConsoleQueryContext,
+// so surfacing the flag means changing the contract every provider compiles
+// against, not editing a view. Adjacent to #1353/#1295, which is where the
+// console's own surfaces solved the same problem.
 func (s *Server) consoleFetch(b *bundle) func(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
 	return func(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
 		opts.DenyTables = s.denyTables

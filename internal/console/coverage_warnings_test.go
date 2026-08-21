@@ -74,18 +74,24 @@ func TestAppendDivergenceWarning(t *testing.T) {
 // carrying the audit fact (archives skipped, and why), and never worded or
 // shaped like an incident. Both surface strings are pinned VERBATIM (PR #1367
 // review): fragment checks alone let a rewording that keeps the fragments —
-// e.g. one dropping the "older than this page reaches" justification — ship
-// green. Changing the copy is fine; changing it without looking here is not.
+// e.g. one dropping the justification — ship green. Changing the copy is fine;
+// changing it without looking here is not.
+//
+// The copy stopped naming WHY the archives were skipped when #1403 added a
+// second short-circuit: the flag reaching this function is a bool, and the two
+// proofs have different remedies (a wider window vs clearing the per-row
+// limit). Stating one reason would be wrong half the time, so it states the
+// fact and names both levers.
 func TestArchiveElisionNote(t *testing.T) {
 	if n := archiveElisionNotes(false, archiveElisionNote()); len(n) != 0 {
 		t.Fatalf("no elision must produce no note, got %#v", n)
 	}
 	const wantEvents = "This page was answered from the live index; the registered archives were not read. " +
-		"Every archived event is older than this page reaches, so nothing is missing here. " +
-		"Paging further back, or filtering to a time range that reaches archived hours, searches the archives too."
+		"Nothing they hold could have survived this request's filters, so nothing is missing here. " +
+		"Widening the time range, or clearing a per-row limit, reads them."
 	const wantRecover = "This reversal was built from the live index; the registered archives were not read. " +
-		"Every archived event is older than the window this request reaches, so nothing is missing here. " +
-		"A time range that reaches archived hours, or a higher limit, searches the archives too."
+		"Nothing they hold could have survived this request's filters, so nothing is missing here. " +
+		"Widening the time range, or clearing the per-row limit, reads them."
 	if got := archiveElisionNote(); got != wantEvents {
 		t.Errorf("events elision note drifted from the pinned copy:\ngot:  %s\nwant: %s", got, wantEvents)
 	}

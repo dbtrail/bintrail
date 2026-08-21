@@ -66,9 +66,18 @@ func appendDivergenceWarning(w []string, diverged int) []string {
 
 // archiveElisionNote is the response-level record of the newest-first
 // short-circuit (#1353): registered archives were deliberately not read
-// because they provably could not change this page — every archived hour sits
-// below the live rotation floor, and the live index filled the requested page
-// with events newer than that floor. Unlike archiveExclusion's notices this
+// because they provably could not change this page. There are now TWO proofs
+// that reach here — the live index filled a newest-first page from a
+// contiguous live range, or every named PK already held its latest N live
+// (#1403) — and the flag does not say which.
+//
+// That is why the wording below states the FACT and not the reason, which it
+// used to. Inferring the reason from the request is wrong: the newest-first
+// proof is tried first and can fire on a request that also carries a per-row
+// limit. The old text asserted the window reason ("every archived event is
+// older than this page reaches") and offered a remedy that is inert under the
+// per-PK proof, which never reads the limit at all. An audit note naming the
+// wrong reason is worse than one naming none. Unlike archiveExclusion's notices this
 // describes a CORRECTNESS-PRESERVING optimization, not a scope reduction, and
 // since #1365 that distinction is carried on the wire: this is a NOTE (info),
 // never a warning — a benign audit fact rendered in one alarm register with
@@ -80,8 +89,8 @@ func appendDivergenceWarning(w []string, diverged int) []string {
 // read this string too.
 func archiveElisionNote() string {
 	return "This page was answered from the live index; the registered archives were not read. " +
-		"Every archived event is older than this page reaches, so nothing is missing here. " +
-		"Paging further back, or filtering to a time range that reaches archived hours, searches the archives too."
+		"Nothing they hold could have survived this request's filters, so nothing is missing here. " +
+		"Widening the time range, or clearing a per-row limit, reads them."
 }
 
 // recoverArchiveElisionNote is archiveElisionNote in the recover surface's own
@@ -91,8 +100,8 @@ func archiveElisionNote() string {
 // both strings are pinned verbatim by TestArchiveElisionNote.
 func recoverArchiveElisionNote() string {
 	return "This reversal was built from the live index; the registered archives were not read. " +
-		"Every archived event is older than the window this request reaches, so nothing is missing here. " +
-		"A time range that reaches archived hours, or a higher limit, searches the archives too."
+		"Nothing they hold could have survived this request's filters, so nothing is missing here. " +
+		"Widening the time range, or clearing the per-row limit, reads them."
 }
 
 // archiveElisionNotes returns the response Notes list for a fetch that

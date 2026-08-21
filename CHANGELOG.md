@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.61.0] - 2026-08-21
+
+### Added
+- **Extension views get the console's own date picker** (#1406). The extension
+  seam handed a view its mount, API base and fetch helper, but no widgets — so
+  a panel wanting a date field either hand-rolled one or shipped a plain input.
+  The contract now carries a `ui` namespace whose first member is
+  `dateField`, the same builder the console's own Since/Until use, which means
+  a calendar in an extension panel is one implementation rather than a second
+  copy of the popover, keyboard rules and outside-click dismissal to keep in
+  step on one page. Additive and defensive on both sides: a view built before
+  `ui` existed ignores it, and a view that uses it is expected to fall back
+  when an older host does not pass one.
+
 ## [0.60.0] - 2026-08-21
 
 ### Added

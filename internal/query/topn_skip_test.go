@@ -39,15 +39,27 @@ func TestTopNSatisfiedLive(t *testing.T) {
 			name: "filled DESC page inside one live range",
 			opts: Options{Limit: 100, Order: "DESC"},
 			rows: rowsAt(100, cutoffInside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: true,
 			why:  "the archives are all below the cutoff and cannot survive the limit",
+		},
+		{
+			// The sibling of the perPK case: an unread archive_state makes
+			// archivesBelowLive vacuously true over an empty hour list, so the
+			// plan claims the premise it never got to evaluate. Sources are
+			// resolved by a separate query and can still be present.
+			name: "archive coverage could not be read",
+			opts: Options{Limit: 100, Order: "DESC"},
+			rows: rowsAt(100, cutoffInside),
+			plan: &QueryPlan{ArchivesBelowLive: true, ArchiveCoverageUnavailable: true, MySQLRanges: []TimeRange{live}},
+			want: false,
+			why:  "a vacuous premise over an unread archive_state is not a premise",
 		},
 		{
 			name: "short page",
 			opts: Options{Limit: 100, Order: "DESC"},
 			rows: rowsAt(40, cutoffInside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "live did not fill the limit, so the archives genuinely extend the result",
 		},
@@ -55,7 +67,7 @@ func TestTopNSatisfiedLive(t *testing.T) {
 			name: "ASC asks for the oldest rows",
 			opts: Options{Limit: 100, Order: "ASC"},
 			rows: rowsAt(100, cutoffInside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "oldest-first is exactly where the archives live",
 		},
@@ -63,7 +75,7 @@ func TestTopNSatisfiedLive(t *testing.T) {
 			name: "empty order defaults to ASC",
 			opts: Options{Limit: 100},
 			rows: rowsAt(100, cutoffInside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "OrderDirection defaults to ASC, which must not take the skip",
 		},
@@ -71,7 +83,7 @@ func TestTopNSatisfiedLive(t *testing.T) {
 			name: "no limit",
 			opts: Options{Order: "DESC"},
 			rows: rowsAt(100, cutoffInside),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "without a limit every archived row is still wanted",
 		},
@@ -79,18 +91,18 @@ func TestTopNSatisfiedLive(t *testing.T) {
 			name: "interleaved live coverage",
 			opts: Options{Limit: 100, Order: "DESC"},
 			rows: rowsAt(100, now.Add(-200*time.Hour)),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{
 				hourRange(300*time.Hour, 250*time.Hour, now),
 				hourRange(24*time.Hour, 0, now),
 			}},
 			want: false,
-			why:  "two live ranges mean an archived hour can sit ABOVE the cutoff",
+			why:  "two live ranges mean the planner saw a hole in the live hours, so a filled page is\n\t\t\t\t\t\tnot provably the true top N whatever the archive layout is",
 		},
 		{
 			name: "cutoff below the live range",
 			opts: Options{Limit: 100, Order: "DESC"},
 			rows: rowsAt(100, now.Add(-48*time.Hour)),
-			plan: &QueryPlan{MySQLRanges: []TimeRange{live}},
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
 			want: false,
 			why:  "the page reaches below live coverage, so the span above it is not provably live",
 		},
@@ -144,7 +156,7 @@ func TestFetchPageSkipsArchivesOnFilledTopN(t *testing.T) {
 	var archiveCalls int
 	src := mergeSources{
 		archSources: []string{"s3://bucket/bintrail_id=x"},
-		plan:        &QueryPlan{MySQLRanges: []TimeRange{{Start: now.Add(-24 * time.Hour), End: now.Add(time.Hour)}}},
+		plan:        &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{{Start: now.Add(-24 * time.Hour), End: now.Add(time.Hour)}}},
 	}
 	o := FetchMergedOptions{
 		Opts:      Options{Limit: limit, Order: "DESC"},
@@ -173,3 +185,76 @@ func TestFetchPageSkipsArchivesOnFilledTopN(t *testing.T) {
 }
 
 var _ = sql.ErrNoRows
+
+// The mirror of TestFetchPageReadsArchivesWhenAnArchivedHourSitsAboveLive, and
+// it exists because adding the requirement to this predicate without a test
+// left it inert: mutating it back out kept the whole suite green.
+//
+// The layouts are the same — live 10:00–17:00, an archived hour at 18:00 above
+// them, and an archived event NEWER than anything live — but the proof being
+// attacked is different. Here a FILLED newest-first page claims to be the true
+// top N, which it is not when an archive holds newer rows.
+//
+// Worth stating why the browse path is not enough coverage: PlanBrowse refuses
+// this layout by returning a nil plan, so on that path the skip was always
+// declined. It is the buildPlan path that hands a non-nil plan over the same
+// layout, and that is the one under test here.
+func TestFetchPageReadsArchivesOnFilledTopNWhenAnArchivedHourSitsAboveLive(t *testing.T) {
+	base := time.Date(2026, 3, 4, 0, 0, 0, 0, time.UTC)
+	hr := func(h int) time.Time { return base.Add(time.Duration(h) * time.Hour) }
+
+	var liveHours []time.Time
+	for h := 10; h <= 17; h++ {
+		liveHours = append(liveHours, hr(h))
+	}
+	plan := buildPlan(liveHours, []time.Time{hr(18)}, hr(10), hr(20), false)
+	if plan == nil || len(plan.MySQLRanges) != 1 || plan.ArchivesBelowLive {
+		t.Fatalf("fixture premise broken: plan=%+v — it must be one contiguous live range with the "+
+			"archives NOT below live, or this test is not attacking the top-N proof", plan)
+	}
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	live := sqlmock.NewRows([]string{
+		"event_id", "binlog_file", "start_pos", "end_pos", "event_timestamp",
+		"gtid", "connection_id", "schema_name", "table_name", "event_type", "pk_values",
+		"changed_columns", "row_before", "row_after", "schema_version", "query_text", "query_hash",
+		"commit_ts_us",
+	})
+	// Two rows for a Limit of 2: the page is FULL, which is the whole basis of
+	// the top-N claim.
+	live.AddRow(uint64(2), "mysql-bin.000001", 100, 200, hr(16),
+		nil, nil, "shop", "orders", 3, "A", nil, nil, nil, 1, nil, nil, nil)
+	live.AddRow(uint64(1), "mysql-bin.000001", 100, 200, hr(15),
+		nil, nil, "shop", "orders", 3, "B", nil, nil, nil, 1, nil, nil, nil)
+	mock.ExpectQuery("SELECT").WillReturnRows(live)
+
+	var archiveCalls int
+	until := hr(20)
+	o := FetchMergedOptions{
+		Opts:      Options{Limit: 2, Order: "DESC", Until: &until},
+		AllowGaps: true,
+		ArchiveFetcher: func(context.Context, Options, string) ([]ResultRow, error) {
+			archiveCalls++
+			return []ResultRow{{EventID: 99, PKValues: "C", EventTimestamp: hr(18).Add(5 * time.Minute)}}, nil
+		},
+	}
+	rows, _, _, _, elided, err := fetchPage(context.Background(), New(db), o,
+		mergeSources{archSources: []string{"s3://bucket/bintrail_id=x"}, plan: plan})
+	if err != nil {
+		t.Fatalf("fetchPage: %v", err)
+	}
+	if archiveCalls != 1 {
+		t.Fatalf("archive fetcher called %d time(s); a filled live page is not the true top N when "+
+			"an archived hour sits above the live range", archiveCalls)
+	}
+	if elided {
+		t.Error("archivesElided is true on a page that DID read the archives")
+	}
+	if len(rows) == 0 || rows[0].EventID != 99 {
+		t.Errorf("rows = %+v, want the archived event 99 first — it is the newest in the window", rows)
+	}
+}

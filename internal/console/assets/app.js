@@ -2070,7 +2070,7 @@ function renderRecover(params) {
   // Context banner when arriving via an event "Undo" (pendingRecover).
   const ctx = pendingRecover;
   if (ctx) {
-    const banner = el("div", { class: "ctx-banner" });
+    const banner = el("div", { class: "ctx-banner", id: "undo-ctx-banner" });
     banner.append(el("span", { class: "badge " + badgeClass(ctx.type), text: ctx.type }));
     banner.append(el("div", { class: "ctx-main" },
       // Scope, not target state — and the scope is a WINDOW OF TIME, not an
@@ -2081,22 +2081,33 @@ function renderRecover(params) {
       // including events that happened AFTER the clicked one inside the same
       // second.
       //
-      // That is not a corner case, it is the case this wording exists for: on
-      // a row inserted and deleted inside one second, undoing from EITHER
-      // event reverses both and leaves no row at all. An earlier draft said
-      // "up to this point", which named the event as the boundary and was
-      // wrong the same way the phrasing it replaced was wrong, one revision
-      // later.
+      // That is not a corner case, it is the case this wording exists for —
+      // and #1404 INVERTED its outcome, which this paragraph went on claiming
+      // the opposite of until review caught it. It used to read "undoing from
+      // EITHER event reverses both and leaves no row at all", which was true
+      // when it was written and was falsified by the prefill below, sixteen
+      // lines away, in the same file. What happens now: the cap keeps the LAST
+      // event in that second — the DELETE — so undoing from either event
+      // RE-CREATES the row. The banner says so; this comment used to say the
+      // reverse of it.
       //
-      // Since is offered AND its limit is stated: it parses at the same
-      // granularity, so it cannot split events inside one second. Naming a
-      // control without saying where it stops working is how an operator ends
-      // up believing they narrowed something they did not.
-      el("span", { class: "ctx-eyebrow", text: "Undoing every change in this window" }),
+      // Worth knowing about the guard: it deliberately reads string literals
+      // only, so no test can ever see prose in this block. Stale comments here
+      // are a manual-review class, and this was a live instance of one.
+      //
+      // The remaining imprecision is stated rather than smoothed over. Latest
+      // per row keeps the LATEST event at or before the ceiling, and the
+      // ceiling is a whole second, so on a row touched more than once inside
+      // that second the reversal lands on the last of them — which need not be
+      // the one the operator clicked. Since cannot fix it either: it parses at
+      // the same granularity. Naming a control without saying where it stops
+      // working is how an operator ends up believing they narrowed something
+      // they did not.
+      el("span", { class: "ctx-eyebrow", text: "Undoing one change" }),
       el("span", { class: "ctx-title", text: ctx.schema + "." + ctx.table + " · pk " + ctx.pk }),
-      el("span", { class: "ctx-detail", text: "reverses all events on this row through the end of the second holding this "
-        + ctx.type + " (" + ctx.time + " UTC), not only that one" }),
-      el("span", { class: "ctx-detail", text: "Set Since to narrow the window — timestamps are second-granular, so it cannot split events inside one second." })));
+      el("span", { class: "ctx-detail", text: "reverses the latest change to this row at or before the end of the second holding this "
+        + ctx.type + " (" + ctx.time + " UTC)" }),
+      el("span", { class: "ctx-detail", text: "Latest per row is set to 1 — clear it to reverse this row's whole history up to that point. If the row changed more than once inside that second, the last of them is the one reversed — not necessarily the one you clicked. A row created and deleted within one second comes back rather than going away." })));
     banner.append(el("span", { class: "spacer" }));
     banner.append(el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Clear",
       onclick: () => { pendingRecover = null; navigate("recover"); } }));
@@ -2141,6 +2152,16 @@ function renderRecover(params) {
       form.elements.table.value = ctx.table;
       form.elements.pk.value = ctx.pk;
       if (ctx.time) form.elements.until.value = ctx.time;
+      // Undo means "undo THIS change", and until #1404 it did not: with only
+      // `until` set, the window ran from the beginning of time and the script
+      // reversed the row's ENTIRE history up to that second. On a row touched
+      // five times, undoing the third put it back to before the first.
+      //
+      // Prefilled rather than hardcoded: it lands in a visible, editable field
+      // and the banner states it, so widening the scope is one edit away and
+      // narrowing it was never a silent act. Clearing the field restores the
+      // old whole-history behaviour exactly.
+      form.elements.limit_per_pk.value = "1";
       generateUndo(form);
     });
   }
@@ -2684,6 +2705,26 @@ function aimUndoAtInstant(form, at) {
   if (!since) { toastError("Could not read the selected instant."); return; }
   form.elements.since.value = since;
   form.elements.until.value = "";
+  // Cleared for the same reason `until` is, and it became necessary with the
+  // same change that made `until` matter here: since #1404 the Undo bridge
+  // prefills limit_per_pk = 1, so an operator who used Undo first would arrive
+  // with a leftover cap. This action reverses EVERY change after `at` — that
+  // is what makes the row land on the state shown — and a cap of 1 would
+  // reverse only the newest of them and land it somewhere else entirely,
+  // silently, with the button still naming the state it did not produce.
+  form.elements.limit_per_pk.value = "";
+  // …and retire the banner that describes the scope just replaced. It states
+  // "Latest per row is set to 1" as a fact about this form, and the line above
+  // makes that false: the operator would read a one-change scope over a script
+  // that reverses everything after `at`. The stale-label half of the same bug
+  // the comment above describes, one level up from the fields.
+  //
+  // By ID, not by `.ctx-banner`: generateUndo appends a second node with that
+  // class into #recover-out for the cascade notice, and an unscoped remove
+  // would take whichever came first.
+  pendingRecover = null;
+  const staleBanner = document.getElementById("undo-ctx-banner");
+  if (staleBanner) staleBanner.remove();
   previewRecover(form);
   form.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
   toast("Undo window set to everything after " + at + " UTC");
