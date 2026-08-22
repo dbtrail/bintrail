@@ -53,6 +53,17 @@ func TestToWireResult(t *testing.T) {
 	// set, not by the zero struct: the walk and the report each had their own
 	// tests, and the engine-side copy stayed green with the field deleted —
 	// this is the console's instance of the same seam.
+	// The recover-inputs counters must survive the copy too (#1425 review:
+	// the console rendered a counts column these fields never reached).
+	counted := toWireResult(verify.TableResult{
+		Schema: "wp", Table: "orders", Status: verify.StatusMatch,
+		EventsChecked: 120, ChainsChecked: 7,
+	}, false)
+	if counted.EventsChecked != 120 || counted.ChainsChecked != 7 {
+		t.Errorf("counters = %d/%d, want 120/7 — the walk's counts must reach the wire",
+			counted.EventsChecked, counted.ChainsChecked)
+	}
+
 	quiet := toWireResult(verify.TableResult{
 		Schema: "wp", Table: "quiet", Status: verify.StatusInconclusive,
 		Detail: "no changes in the window", InconclusiveKind: verify.InconclusiveNoActivity,

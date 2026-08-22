@@ -3491,10 +3491,10 @@ function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
 
   // Storage keeps storage POLICY. Baselines and verification moved to their
   // own routes (#1384): the snapshot list is unbounded, so it used to push
-  // verification off the fold, and verifyPanel needed a both-columns override
-  // to escape a grid built for two panels. baselineSummaryCard stays as the
-  // pointer — the count and age belong on a storage overview, the full list
-  // does not.
+  // verification off the fold inside a grid built for two panels (the
+  // verification builder is verifyRegions since #1419). baselineSummaryCard
+  // stays as the pointer — the count and age belong on a storage overview,
+  // the full list does not.
   const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
   grid.append(archivingPanel(servers, serversErr));
   v.append(grid);
@@ -3537,7 +3537,7 @@ async function renderBaselines() {
     // collection (source, count, freshness, tables-per-snapshot when uniform)
     // so the rows below can carry only what varies between snapshots.
     const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
-    v.append(baselineContextStrip(baselines, cur, { serversErr: serversErr }));
+    v.append(baselineContextStrip(baselines, cur));
     v.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
     viewEnter();
   } catch (err) {
@@ -3922,8 +3922,12 @@ function baselineRefreshNote(rf) {
 // has the same one — else null. A value identical in all 22 rows was the
 // list's widest column saying nothing (#1415); uniform, it is a fact about
 // the collection and belongs in the context strip.
-function snapshotTablesUniform(snaps) {
-  if (!snaps || !snaps.length) return null;
+function snapshotTablesUniform(snaps, truncated) {
+  // A TRUNCATED listing cannot decide either way: promoting the visible
+  // rows' count to "N per snapshot" claims snapshots the API never showed,
+  // and suppressing the per-row column does the same in the other
+  // direction — under truncation the rows keep their column.
+  if (truncated || !snaps || !snaps.length) return null;
   const n = (snaps[0].tables || []).length;
   return snaps.every((sn) => (sn.tables || []).length === n) ? n : null;
 }
@@ -3933,7 +3937,7 @@ function snapshotTablesUniform(snaps) {
 // plus the page's one primary action. Replaces the half-width summary card
 // whose eyebrow duplicated the H1 and whose 405px forced the source path to
 // wrap mid-word.
-function baselineContextStrip(b, cur, opts) {
+function baselineContextStrip(b, cur) {
   const strip = el("section", { class: "tcard ctx-strip" });
   const item = (label, val, cls) => el("div", { class: "ctx-item" + (cls ? " " + cls : "") },
     el("span", { class: "ctx-label", text: label }),
@@ -3957,7 +3961,7 @@ function baselineContextStrip(b, cur, opts) {
     // same freshness spelled two ways 300px apart.
     strip.append(item("LATEST", snaps[0].time + " UTC · " + formatAge(snaps[0].age_hours) + " ago"));
   }
-  const uniform = snapshotTablesUniform(snaps);
+  const uniform = snapshotTablesUniform(snaps, b.truncated);
   if (uniform !== null) strip.append(item("TABLES", uniform + " per snapshot"));
   strip.append(item("TIME-TRAVEL", b.reconstruct ? "enabled" : "off (archives disabled)"));
   // The page's primary action, at page level — not a list-header costume.
@@ -3978,7 +3982,7 @@ function baselinesPanel(b, servers, opts) {
   // Full-width (#1415): this list is the page. The Create-baseline action
   // moved to the context strip — at page level it is a page action; inside
   // this header it read as scoped to the list.
-  const panel = el("section", { class: "ov-panel vfy-panel-full" });
+  const panel = el("section", { class: "ov-panel" });
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
   let owner = cur ? serverLabel(cur) : "";
   if (!owner && b && !b.error && b.configured && !(opts && opts.serversErr)) {
@@ -4029,7 +4033,7 @@ function baselinesPanel(b, servers, opts) {
     // about the same instant, formerly ~650px apart), and the table count
     // appears per-row only when it VARIES — a value identical in every row
     // is a fact about the collection and lives in the context strip.
-    const uniformTables = snapshotTablesUniform(b.snapshots);
+    const uniformTables = snapshotTablesUniform(b.snapshots, b.truncated);
     b.snapshots.forEach((sn, idx) => {
       const row = el("div", { class: "stg-row" + (idx === 0 ? " stg-row-latest" : "") });
       if (idx === 0) row.append(el("span", { class: "tag-pill", text: "Newest" }));
@@ -4197,8 +4201,8 @@ function verifyRegions(servers, opts) {
 // operator browses. Source of truth for the long form is the issue; keep
 // these three claims per entry: proof, prerequisite, cost.
 const VFY_MODE_HELP = {
-  "baseline-anchored": "Replays your indexed changes from the previous snapshot forward and fingerprints the result against the newest one. Proves your backup chain is sound — the default. Needs two snapshots; never touches your database.",
-  "live-source": "Rebuilds each table from a snapshot plus the indexed changes and compares it against the real table. The strongest proof, and the only mode that reads your database — it can take a while and adds load, so best run outside busy hours. It can also report honest drift from writes that bypassed the binlog.",
+  "baseline-anchored": "Replays your indexed changes from the previous snapshot forward and fingerprints the result against the newest one. Strong evidence your backup chain is sound — the default. Needs two snapshots; never touches your database.",
+  "live-source": "Rebuilds each table from a snapshot plus the indexed changes and compares it against the real table. The strongest check, and the only mode that reads your database — it can take a while, adds load, and needs a QUIET table: writes landing during the scan read as mismatches. Best run outside busy hours.",
   "recover-inputs": "Walks the index's own before/after images and checks every row's chain is self-consistent — exactly the data an undo script would be built from. Needs no snapshot and never touches your database.",
 };
 
@@ -4225,7 +4229,7 @@ async function createVerify(id, mode, btn, resultsEl) {
   // justFinished: the running→done transition gets a one-shot highlight so
   // completion is perceptible off-chip (#1420); the toast below is the other
   // half for an operator who looked away.
-  if (done) renderVerifyResults(resultsEl, done, id, { justFinished: true });
+  if (done) renderVerifyResults(resultsEl, done, id, { justFinished: done.state === "succeeded" });
   // The finished run is now in the persisted history too — refresh the list.
   const histBox = document.querySelector(".vfy-history");
   if (histBox) loadVerifyHistory(id, histBox);
@@ -4347,7 +4351,7 @@ async function loadVerifyHistory(id, box) {
           ? s.match + " match · " + s.mismatch + " mismatch · " + s.error + " error"
           : s.match + "/" + s.total + " match") })));
   }
-  recs.slice(0, 8).forEach((r) => {
+  recs.slice(0, 8).forEach((r, i) => {
     const s = r.summary || {};
     let outcome;
     if (r.state === "skipped") outcome = "skipped — " + (r.skip_reason || "");
@@ -4358,13 +4362,14 @@ async function loadVerifyHistory(id, box) {
     // VerifyRunRecord embeds VerifyStatus, results included — the old
     // renderer just dropped it on the floor. Disclosure, not navigation:
     // the history is short and comparing runs side by side is the point.
-    const row = el("button", { class: "stg-row vfy-histrow", type: "button", "aria-expanded": "false" });
+    const detailID = "vfy-hist-" + i;
+    const row = el("button", { class: "stg-row vfy-histrow", type: "button", "aria-expanded": "false", "aria-controls": detailID });
     row.append(
       icon("caret", "ev-caret"),
       el("span", { class: "stg-name mono", text: when }),
       el("span", { text: (VFY_MODE_LABEL[r.mode] || r.mode || "") + (r.trigger === "scheduled" ? " (scheduled)" : "") }),
       el("span", { class: "stg-age", text: outcome }));
-    const detail = el("div", { class: "vfy-histdetail", hidden: "" });
+    const detail = el("div", { class: "vfy-histdetail", id: detailID, hidden: "" });
     let rendered = false;
     row.onclick = () => {
       const open = row.classList.toggle("open");
@@ -4384,12 +4389,12 @@ async function loadVerifyHistory(id, box) {
   });
 }
 
-// vfySortResults:// vfySortResults: worst verdict first (#1419 §3) — a mismatch must not sit
+// vfySortResults: worst verdict first (#1419 §3) — a mismatch must not sit
 // at alphabetical position 31 below the fold, visually identical to the 46
 // clean rows around it. Within a band the alphabetical order is kept (stable
 // sort), so scanning stays predictable. Display-only: the wire order is the
 // engine's completion order and the summary counts are order-free.
-const VFY_SORT_BAND = { fail: 0, warn: 2, note: 3, pass: 4 };
+const VFY_SORT_BAND = { warn: 2, note: 3, pass: 4 }; // fail band ranks 0/1 inline (mismatch first)
 function vfySortResults(results) {
   return results.map((r, i) => [r, i]).sort((a, b) => {
     const ba = vfyCardClass(a[0]), bb = vfyCardClass(b[0]);
@@ -4400,8 +4405,11 @@ function vfySortResults(results) {
   }).map((p) => p[0]);
 }
 
-// vfyCountsText: the per-table counters as a compact fixed column (#1419 §2)
-// — only the recover-inputs rows carry them (content modes omit all three).
+// vfyCountsText: the per-table counters as a compact fixed column (#1419 §2).
+// The wire carries them only for recover-inputs rows (toWireResult copies the
+// walk's counters; the content modes never set them) — review caught the
+// first cut reading keys the DTO did not carry at all, rendering the column
+// permanently blank.
 function vfyCountsText(r) {
   if (r.events_checked === undefined && r.chains_checked === undefined) return "";
   return (r.events_checked || 0) + " ev · " + (r.chains_checked || 0) + " chains";

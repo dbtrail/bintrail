@@ -1993,7 +1993,25 @@ try {
       controlTinted: regions[0] ? regions[0].classList.contains("tcard-violet") : false,
       subDescribesAll: !/prove a snapshot still reconstructs/i.test(document.querySelector(".page-sub").textContent),
       helpBefore, helpAfter: help ? help.textContent : "",
-      selWideEnough: sel ? sel.scrollWidth <= sel.clientWidth + 2 : false,
+      // Measured, not scrollWidth: Chrome reports scrollWidth == clientWidth
+      // for a <select> at ANY width (the dropdown clips, the control never
+      // scrolls) — the first cut of this assertion stayed green with the old
+      // 260px cap restored. Render the longest option's text in the select's
+      // own font and compare real pixels, leaving room for the chrome.
+      selWideEnough: (() => {
+        if (!sel) return false;
+        const cs = getComputedStyle(sel);
+        const probe = document.createElement("span");
+        probe.style.cssText = "position:absolute;visibility:hidden;white-space:nowrap;font:" + cs.font;
+        document.body.appendChild(probe);
+        let widest = 0;
+        Array.from(sel.options).forEach((o) => {
+          probe.textContent = o.textContent;
+          widest = Math.max(widest, probe.getBoundingClientRect().width);
+        });
+        probe.remove();
+        return sel.clientWidth >= widest + 30;
+      })(),
     };
   });
   (vfyStruct.regionCount >= 3 && vfyStruct.controlTinted)
@@ -2053,7 +2071,13 @@ try {
     : bad("verification: rows sort worst-first and the benign verdict is written in words", JSON.stringify(vfyOrder));
 
   // (d) a REAL run end to end: recover-inputs over the fixture index.
-  await page.evaluate(() => { document.querySelector(".vfy-run").click(); });
+  await page.evaluate(() => {
+    // Self-contained: leg (a) set the mode, but this leg's premise (a run
+    // that reads only the index) must not depend on assertion ordering.
+    const sel = document.querySelector(".vfy-mode");
+    if (sel.value !== "recover-inputs") { sel.value = "recover-inputs"; sel.dispatchEvent(new Event("change")); }
+    document.querySelector(".vfy-run").click();
+  });
   await page.waitForFunction(() => document.querySelector(".vfy-results .chip-done") !== null, { timeout: 60000 });
   const vfyDone = await page.evaluate(() => ({
     verdictSentence: (document.querySelector(".vfy-results .form-hint") || {}).textContent || "",

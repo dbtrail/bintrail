@@ -1951,7 +1951,6 @@ button { font-family: inherit; }
 .stg-empty-sub { margin: 0; font-size: 12.5px; color: var(--ink-3); max-width: 52ch; }
 
 /* Verification panel (#677) */
-.vfy-panel-full { grid-column: 1 / -1; }
 .vfy-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 /* wide enough for its own longest option — the select used to cut
    "Check recovery inputs (no sn" mid-word (#1419 §6) */
@@ -2017,13 +2016,16 @@ button { font-family: inherit; }
 }
 
 /* expandable history rows (#1417): full-width button rows with a caret */
-.vfy-histrow { width: 100%; text-align: left; background: none; border: none; cursor: pointer; font: inherit; color: inherit; }
+/* border:none kills the UA button chrome, so the .stg-row divider it also
+   resets is re-added explicitly — review caught the collapsed list running
+   together with no hairlines */
+.vfy-histrow { width: 100%; text-align: left; background: none; border: none; border-bottom: 1px solid var(--line-soft); cursor: pointer; font: inherit; color: inherit; }
 .vfy-histrow .ev-caret { transition: transform .14s; }
 .vfy-histrow.open .ev-caret { transform: rotate(90deg); }
 .vfy-histdetail { padding: 4px 10px 10px 30px; border-top: 1px dashed var(--line-soft); }
 
 /* baselines context strip (#1415) */
-.ctx-strip { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; margin-top: 4px; padding: 14px 18px; }
+.ctx-strip { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; margin-top: 4px; margin-bottom: 16px; padding: 14px 18px; }
 .ctx-item { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .ctx-grow { flex: 1 1 320px; }
 .ctx-label { font-family: var(--f-mono); font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; color: var(--ink-4); text-transform: uppercase; }

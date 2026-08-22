@@ -125,7 +125,14 @@ type VerifyTableResult struct {
 	InconclusiveKind string `json:"inconclusive_kind,omitempty"`
 	SourceRows       int64  `json:"source_rows,omitempty"`
 	ReconstructRows  int64  `json:"reconstruct_rows,omitempty"`
-	Anchor           string `json:"anchor,omitempty"`
+	// EventsChecked/ChainsChecked: the recover-inputs walk's per-table
+	// counters, same tag names as the CLI's verify --format json (#1425
+	// review: the console rendered a counts column these fields never
+	// reached — toWireResult dropped them on the floor). Zero-omitted; the
+	// content modes carry neither.
+	EventsChecked int `json:"events_checked,omitempty"`
+	ChainsChecked int `json:"chains_checked,omitempty"`
+	Anchor        string `json:"anchor,omitempty"`
 	// Explainable is true only for a baseline-anchored mismatch whose pair is
 	// still cached from the run that produced this result — the precondition
 	// for calling Explain on it.
