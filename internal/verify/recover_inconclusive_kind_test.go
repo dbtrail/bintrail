@@ -43,7 +43,7 @@ func TestRecoverInconclusiveKinds(t *testing.T) {
 			},
 			wantKind: InconclusiveUnproven,
 			why: "the row has prior history the window cannot see; widening the lookback " +
-				"makes it assertable, so 'does not apply' would over-claim benignity",
+				"makes it assertable, so 'nothing to cross-check' would over-claim benignity",
 		},
 		{
 			name: "a truncated window is unproven even over a benign shape",
@@ -63,7 +63,7 @@ func TestRecoverInconclusiveKinds(t *testing.T) {
 			},
 			wantKind: InconclusiveUnproven,
 			why: "Events counts what was WALKED, so a drift-only table also has Events==0 — " +
-				"reporting it as 'no changes in the window' is false",
+				"reporting it as 'did not change in the window' is false",
 		},
 	}
 	for _, tc := range tests {

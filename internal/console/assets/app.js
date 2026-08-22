@@ -1048,7 +1048,7 @@ function covCard(c, stamp) {
   } else if (cont === "unavailable") {
     card.append(el("p", { class: "cov-line bad", text: "Continuity could not be read. Treat the window as unverified." }));
   } else if (warn) {
-    card.append(el("p", { class: "cov-line warn", text: "This index cannot report continuity, so the window may have holes nothing detected." }));
+    card.append(el("p", { class: "cov-line warn", text: "This index cannot report continuity, so the window may have undetected holes." }));
   }
   // The freshness explanation lines. "stalled" is the only one that is an
   // error state: the checkpoint ticker runs even with no traffic, so a stale
@@ -4273,7 +4273,7 @@ function verifyRegions(servers, opts) {
     el("summary", { class: "form-adv-summary", text: "What these words mean" }),
     el("p", { class: "form-hint", text: "Row history: every recorded change to one row, oldest to newest. The check walks each row's history in order." }),
     el("p", { class: "form-hint", text: "Before-image: each update or delete stores what the row looked like just before it. The check compares that against what the previous change left. Undo scripts are built from these images." }),
-    el("p", { class: "form-hint", text: "Existed before the window: the window caught a row mid-life, so its first change has nothing older to compare against. A longer window can reach that older history (CLI: verify --check recover --lookback)." }),
+    el("p", { class: "form-hint", text: "No earlier change in the window: this run saw a change without anything older to compare it against. A longer window may reach the history it needs (CLI: verify --check recover --lookback)." }),
     el("p", { class: "form-hint", text: "Nothing to check: the table did not change, or only gained new rows. Zero comparisons is the expected result there, not a finding." })));
 
   // ── Region 3: what ran before ──
@@ -4566,7 +4566,7 @@ function renderVerifyResults(container, status, id, opts) {
   // words, so it does not have to be derived from 28 rows. Only on a FINISHED
   // run — a partial tally must not be read as a verdict (#1420).
   if (status.state === "succeeded") {
-    container.append(el("p", { class: "form-hint", text: vfyVerdictSentence(s) }));
+    container.append(el("p", { class: "form-hint vfy-verdict-sentence", text: vfyVerdictSentence(s) }));
   }
   if (status.note) container.append(el("p", { class: "form-hint", text: status.note }));
   if (status.last_error) container.append(el("p", { class: "form-msg err", text: status.last_error }));

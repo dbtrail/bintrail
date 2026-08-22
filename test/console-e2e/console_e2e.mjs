@@ -2128,7 +2128,7 @@ try {
       liveChip: !!tmp.querySelector(".chip-live"),
       progress: !!tmp.querySelector(".vfy-progress"),
       soFar: /so far/.test(tmp.textContent),
-      noVerdict: !/verified clean/.test(tmp.textContent),
+      noVerdict: !tmp.querySelector(".vfy-verdict-sentence"),
       ageChipDistinct: !tmp.querySelector(".chip-age"),
     };
     tmp.remove();
@@ -2146,8 +2146,8 @@ try {
     document.querySelector(".view").appendChild(tmp);
     renderVerifyResults(tmp, { state: "succeeded", mode: "recover-inputs",
       results: [
-        { schema: "s", table: "aaa_clean", status: "match", events_checked: 200000, chains_checked: 200000,
-          reason: "checked 200000 change(s) on 200000 row(s); settled 0 comparison(s) between one change and the next, all matched" },
+        { schema: "s", table: "aaa_clean", status: "match", events_checked: 200000, chains_checked: 100000,
+          reason: "checked 200000 change(s) on 100000 row(s); settled 100000 comparison(s) between one change and the next, all matched" },
         { schema: "s", table: "bbb_quiet", status: "inconclusive", inconclusive_kind: "no-activity" },
         { schema: "s", table: "mmm_broken", status: "mismatch", reason: "chain break" },
         { schema: "s", table: "ccc_hard", status: "inconclusive" },

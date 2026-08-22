@@ -881,7 +881,7 @@ func TestCheckRecoverChains_MismatchDetailKeepsFirstAndCountsRest(t *testing.T) 
 	if out.Status != StatusMismatch {
 		t.Fatalf("got %s (%s), want %s", out.Status, out.Detail, StatusMismatch)
 	}
-	if !strings.Contains(out.Detail, "contradicts itself in 3 place(s)") {
+	if !strings.Contains(out.Detail, "does not hold together in 3 place(s)") {
 		t.Errorf("detail must carry the full count, got: %s", out.Detail)
 	}
 	if !strings.Contains(out.Detail, "event 2") {

@@ -203,9 +203,8 @@ discard every clean assertion beside it and fail the gate on a healthy index.
 > retention (or enable archiving), not to ignore the result. Since an
 > all-inconclusive run exits non-zero, a cron gate will tell you immediately.
 > An index **younger** than the lookback is called out explicitly: the reason
-> says the missing hours *predate the index's history* (nothing rotated away —
-> the index did not exist yet), and the remedy is the same — shorten
-> `--lookback` to the index's age or less.
+> says *nothing rotated away; the index did not exist yet*, and the remedy is
+> the same: shorten `--lookback` to the index's age or less.
 
 Memory bound: the walk loads at most `--max-events` events per table (default
 200,000) plus one row of state per distinct primary key seen. The cap is a

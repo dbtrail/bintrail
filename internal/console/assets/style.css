@@ -1971,7 +1971,8 @@ button { font-family: inherit; }
 .vfy-rows { display: flex; flex-direction: column; }
 .vfy-row {
   /* The counts track sizes to its content (max-content), never a fixed
-     width: 130px + nowrap let "200000 ev · 200000 chains" paint OVER the
+     width: 130px + nowrap let a six-digit counts cell ("200,000 changes ·
+     100,000 rows") paint OVER the
      reason column (user report, 2026-08-22). Grid tracks do not grow for
      overflowing fixed sizes; they must be allowed to fit. */
   display: grid; grid-template-columns: 18px minmax(150px, 240px) 100px minmax(0, max-content) minmax(120px, 1fr) auto;
