@@ -2461,7 +2461,15 @@ button { font-family: inherit; }
     radial-gradient(130% 44% at -25% 106%, oklch(0.42 0.16 293 / 0.55), transparent 62%),
     linear-gradient(198deg, oklch(0.275 0.062 312) 0%, oklch(0.215 0.06 294) 100%);
 }
-.side .brand-name { color: #fff; }
+/* The wordmark keeps its headline-gradient clip (guarded), but the site's
+   stops were tuned for white paper and go muddy on the aubergine; restate
+   the same sunset brighter for the dark ground. color stays transparent —
+   an opaque color here paints OVER the clip and kills the gradient. */
+.side .brand-name {
+  background: linear-gradient(135deg, oklch(0.74 0.19 3) 0%, oklch(0.76 0.14 51) 55%, oklch(0.72 0.15 293) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+}
 .side .brand-mark {
   background: var(--brand-warm);
   box-shadow: 0 2px 10px oklch(0.55 0.2 3 / 0.45);
@@ -2553,5 +2561,7 @@ button { font-family: inherit; }
    fixed); restate them against the tinted grounds. */
 .cards .card .kv { border-bottom-color: oklch(0.5 0.05 320 / 0.22); }
 
-/* neutral buttons warm on touch — product blue stays the pressed accent. */
-.btn:hover { border-color: color-mix(in srgb, var(--brand-warm-b) 45%, var(--line)); color: var(--orange-2); }
+/* neutral buttons warm on touch — product blue stays the pressed accent,
+   and the primary button is untouched: its white-on-gradient contract has
+   its own guard. */
+.btn:hover:not(.btn-primary) { border-color: color-mix(in srgb, var(--brand-warm-b) 45%, var(--line)); color: var(--orange-2); }
