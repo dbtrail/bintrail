@@ -14,6 +14,7 @@
 // playwright-managed chromium).
 import { chromium } from "playwright";
 import zlib from "node:zlib";
+import { execSync } from "node:child_process";
 
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:8090";
 const TOKEN = process.env.CONSOLE_TOKEN || "";
@@ -2266,6 +2267,70 @@ try {
   (/shipped/.test(sqlxText) && !/b@example\.com/.test(sqlxText) && !/_SUCCESS/.test(sqlxText))
     ? ok("sqlx: the dump carries the FOLDED state (the update landed, the deleted row is gone, the build markers stay out)")
     : bad("sqlx: the dump carries the FOLDED state (the update landed, the deleted row is gone, the build markers stay out)", JSON.stringify({ shipped: /shipped/.test(sqlxText), deleted: /b@example\.com/.test(sqlxText), marker: /_SUCCESS/.test(sqlxText) }));
+
+  // 15f gap arm — the fail-closed contract on the REAL path: stamp a
+  // permanent capture gap inside the window, and the build must refuse
+  // (AllowGaps is hardwired false at the call site — this is the guard that
+  // goes red if anyone ever plumbs it through), the failure must render
+  // inline WITHOUT the engine's CLI flag, and the previous artifact must no
+  // longer be downloadable (the failed build's wipe revoked it).
+  const IDX_DB = process.env.E2E_IDX_DB || "";
+  const MYSQL_CTR = process.env.E2E_MYSQL_CONTAINER || "";
+  if (IDX_DB && MYSQL_CTR) {
+    const gapAt = TT_AT.replace(/:\d{2}$/, ":00"); // any instant inside the window
+    const mysqlIdx = (sql) => execSync(
+      ["docker", "exec", "-i", MYSQL_CTR, "mysql", "-uroot", "-ptestroot", IDX_DB].join(" "),
+      { input: sql, stdio: ["pipe", "pipe", "ignore"] });
+    mysqlIdx("INSERT INTO stream_state (id, mode, binlog_file, binlog_position, last_checkpoint, server_id, gap_lost_at, gap_lost_detail) " +
+      "VALUES (1,'position','binlog.000001',400,NOW(),99,'" + gapAt + "','e2e manufactured gap');");
+    try {
+      const gapRun = await page.evaluate(async (TT_AT) => {
+        await api("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export",
+          { method: "POST", body: { at: TT_AT } });
+        for (let i = 0; i < 240; i++) {
+          await new Promise((r) => setTimeout(r, 500));
+          try {
+            const st = await api("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export");
+            if (st.sql_export && st.sql_export.state !== "running") return st.sql_export;
+          } catch (_) { /* transient */ }
+        }
+        return { err: "never settled" };
+      }, TT_AT);
+      (gapRun.state === "failed" && /capture gap/.test(gapRun.last_error || ""))
+        ? ok("sqlx: a stamped capture gap fails the build closed")
+        : bad("sqlx: a stamped capture gap fails the build closed", JSON.stringify(gapRun));
+      const gapDl = await page.evaluate(async () => {
+        const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
+        if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+        const res = await fetch("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export/download", { headers });
+        return res.status;
+      });
+      gapDl === 409
+        ? ok("sqlx: the failed build revoked the previous artifact (download refuses)")
+        : bad("sqlx: the failed build revoked the previous artifact (download refuses)", "status " + gapDl);
+      await page.evaluate(() => navigate("baselines"));
+      await page.waitForFunction(() => {
+        const v = document.querySelector(".view");
+        if (!v) return false;
+        const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+          /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+        return !!card && /Last build failed/.test(card.textContent);
+      }, { timeout: 15000 });
+      const gapMsg = await page.evaluate(() => {
+        const v = document.querySelector(".view");
+        const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+          /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+        return card.textContent;
+      });
+      (/capture gap/.test(gapMsg) && !/--allow-gaps/.test(gapMsg))
+        ? ok("sqlx: the gap refusal renders inline without the engine's CLI flag")
+        : bad("sqlx: the gap refusal renders inline without the engine's CLI flag", gapMsg.slice(0, 300));
+    } finally {
+      mysqlIdx("DELETE FROM stream_state;"); // scenario 15v's verify reads this table
+    }
+  } else {
+    bad("sqlx: gap arm env missing", "E2E_IDX_DB/E2E_MYSQL_CONTAINER not passed by run.sh");
+  }
 
   // Scenario 15d — Protect group (#1384). Baselines and verification moved off
   // Settings > Storage into their own routes. Two halves must hold TOGETHER,

@@ -21,9 +21,11 @@ import (
 // SQLExporter builds a custom .sql backup: fold the backup at-or-before an
 // operator-chosen instant forward through the index and write it as a
 // mydumper-format dump the operator downloads and loads with myloader (or
-// the mysql client), no bintrail needed on the restore side. A separate
-// interface from the other baseline controllers for the same reason they
-// are separate from each other: independent wiring, no derived opt-ins.
+// the mysql client, applying mydumper's session assumptions), no bintrail
+// needed on the restore side. A separate interface from the other baseline
+// controllers so its wiring CAN diverge (the #1171 lesson); today it
+// deliberately rides the same supervisor as BaselineRestore — see
+// wireBaselineExtras for why that derivation is safe here.
 type SQLExporter interface {
 	// TriggerSQLExport starts the build asynchronously. ErrBaselineRunning
 	// when another baseline job for the server is in flight.
@@ -31,7 +33,8 @@ type SQLExporter interface {
 	// SQLExportStatus reports the last build for a server (idle if none).
 	SQLExportStatus(serverID string) BaselineStatus
 	// SQLExportDir returns the finished dump's directory; ok is false until
-	// a build has succeeded and its completeness marker agrees.
+	// a build has succeeded and its directory affirmatively carries the
+	// completeness marker.
 	SQLExportDir(serverID string) (string, bool)
 }
 
@@ -56,6 +59,23 @@ func (s *Server) handleSQLExportTrigger(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	// The build writes a full unredacted dump to disk (and its wipe removes
+	// the previous build another operator may be about to download), so a
+	// profile-scoped session may not start one — the same #1075 line the
+	// download itself draws.
+	if sessionRestricted(r) {
+		recordProfileGateDeny(r, "sql-export-trigger")
+		writeJSONError(w, http.StatusForbidden,
+			"custom .sql backups are unavailable while an access-control profile is active: baseline reads aren't redacted")
+		return
+	}
+	// An entry with no baseline of its own inherits the process-wide
+	// --baseline-dir/--baseline-s3 (#1010), like the verify trigger: the
+	// Backups listing the card gates on applies the same fallback, so the
+	// trigger must accept what the UI was told is configured. Read-only over
+	// that store, so the restore trigger's shared-store refusal does not
+	// apply here.
+	e = s.cm.withBaselineDefaults(e)
 	src := e.BaselineDir
 	if src == "" {
 		src = e.BaselineS3

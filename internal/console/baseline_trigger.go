@@ -120,7 +120,9 @@ type BaselineStatus struct {
 	Uploaded   int    `json:"uploaded,omitempty"`
 	// At is the anchor instant of a refresh or restore run (RFC3339 UTC): the
 	// moment the published snapshot represents, which is also its directory
-	// name. Empty on dump jobs (the anchor is chosen mid-run).
+	// name. A sql-export build stamps it too (the instant the dump
+	// represents; it publishes no snapshot). Empty on dump jobs (the anchor
+	// is chosen mid-run).
 	At string `json:"at,omitempty"`
 	// Refused counts tables a refresh declined to fold (gap / schema change).
 	// A refresh that refuses every table is not a failure of the daemon — it is

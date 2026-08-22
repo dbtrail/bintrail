@@ -1,10 +1,12 @@
 package consoleapp
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
@@ -16,7 +18,7 @@ import (
 // fold the newest snapshot at-or-before the chosen instant forward through
 // the index's deltas and write the result as a mydumper-format dump —
 // schema files, INSERT chunks and the coordinates `metadata` file — that
-// `myloader` (or the mysql client with mydumper's session assumptions)
+// `myloader` (or the mysql client, applying mydumper's session assumptions)
 // loads directly, no bintrail needed on the restore side.
 //
 // Same engine as `reconstruct --output-format mydumper --at T`, same
@@ -24,12 +26,20 @@ import (
 // completeness marker gates the download), fail-closed on capture gaps and
 // schema changes, conservative DuckDB budget, and the per-server
 // single-flight shared with dump/refresh/restore — every one of these
-// writes or reads the same store and index.
+// writes or reads the same baseline store, and all but the dump the same
+// index.
+//
+// Deliberately NOT recorded in the baseline run history: an export
+// publishes no snapshot, so FindBySnapshot (the history's one consumer)
+// could never match its record, while each one would still consume the
+// per-server cap and evict a dump/refresh/restore record the Backups
+// detail view needs.
 
-// sqlExportDir is where a server's last built dump lives. One per server,
-// wiped at the start of each build: the artifact is a download, not a
-// store — keeping N of them would grow the staging disk silently.
-func (s *baselineSupervisor) sqlExportDir(serverID string) string {
+// sqlExportRoot holds a server's builds. Each build writes into its OWN
+// subdirectory: a shared path reused across builds would let a rebuild
+// interleave two instants into one archive whose per-file guards all pass
+// (fresh Stat, matching sizes) — the silent half of the wipe race.
+func (s *baselineSupervisor) sqlExportRoot(serverID string) string {
 	return filepath.Join(s.stagingDir, "sql-export", serverID)
 }
 
@@ -41,13 +51,15 @@ func (s *baselineSupervisor) TriggerSQLExport(req console.SQLExportRequest) erro
 		s.mu.Unlock()
 		return console.ErrBaselineRunning
 	}
+	dir := filepath.Join(s.sqlExportRoot(req.ServerID), strconv.FormatInt(time.Now().UnixNano(), 10))
 	s.exports[req.ServerID] = &console.BaselineStatus{State: "running", Since: nowStamp(),
 		At: req.At.UTC().Format(time.RFC3339)}
+	s.exportDirs[req.ServerID] = dir
 	s.mu.Unlock()
 
 	slog.Info("sql export: starting", "server", req.ServerName, "id", req.ServerID,
 		"at", req.At.UTC().Format(time.RFC3339))
-	go s.runSQLExport(req)
+	go s.runSQLExport(req, dir)
 	return nil
 }
 
@@ -61,31 +73,36 @@ func (s *baselineSupervisor) SQLExportStatus(serverID string) console.BaselineSt
 	return console.BaselineStatus{State: "idle"}
 }
 
-// SQLExportDir returns the finished dump's directory. ok is false until a
-// build has SUCCEEDED and its completeness marker agrees — a status that
-// says succeeded while the marker says otherwise (a crash between the two)
-// must not hand out a partial dump.
+// SQLExportDir returns the finished dump's directory. ok is false until the
+// build has SUCCEEDED and its directory affirmatively carries the #842
+// _SUCCESS marker without an _INCOMPLETE one. Affirmative on purpose:
+// baseline.SnapshotComplete is complete-by-default when NO marker exists (a
+// legacy rule for pre-marker snapshots), and the marker-less shapes here are
+// never legacy — they are a torn or externally-removed staging directory
+// (the default staging root lives under the system temp dir, which some
+// hosts reap), and must read not-ready, not stream a 500.
 func (s *baselineSupervisor) SQLExportDir(serverID string) (string, bool) {
 	s.mu.Lock()
-	st, ok := s.exports[serverID]
+	var state, dir string
+	if st, ok := s.exports[serverID]; ok {
+		state = st.State
+		dir = s.exportDirs[serverID]
+	}
 	s.mu.Unlock()
-	if !ok || st.State != "succeeded" {
+	if state != "succeeded" || dir == "" {
 		return "", false
 	}
-	dir := s.sqlExportDir(serverID)
-	if !baseline.SnapshotComplete(dir) {
+	if _, err := os.Stat(filepath.Join(dir, baseline.SuccessMarker)); err != nil {
+		return "", false
+	}
+	if _, err := os.Stat(filepath.Join(dir, baseline.IncompleteMarker)); err == nil {
 		return "", false
 	}
 	return dir, true
 }
 
-func (s *baselineSupervisor) runSQLExport(req console.SQLExportRequest) {
-	started := time.Now().UTC()
-	tables, refused, rows, err := s.executeSQLExport(req)
-	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
-		Kind: console.BaselineRunSQLExport, StartedAt: started.Format(time.RFC3339),
-		Tables: tables, Refused: refused, Rows: rows,
-	}, err)
+func (s *baselineSupervisor) runSQLExport(req console.SQLExportRequest, dir string) {
+	tables, rows, err := s.executeSQLExport(req, dir)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -96,15 +113,16 @@ func (s *baselineSupervisor) runSQLExport(req console.SQLExportRequest) {
 	}
 	st.FinishedAt = nowStamp()
 	st.Tables = tables
-	st.Refused = refused
 	st.Rows = rows
 	if err != nil {
 		st.State = "failed"
 		st.LastError = err.Error()
 		// Warn, never Error: a refusal (gap, schema change) is the fail-closed
-		// contract working; the operator picks another moment.
-		slog.Warn("sql export: built nothing", "server", req.ServerName, "id", req.ServerID,
-			"refused", refused, "error", err)
+		// contract working; the operator picks another moment. Partial files
+		// may remain in the build dir under _INCOMPLETE — never downloadable,
+		// removed by the next build or the boot sweep.
+		slog.Warn("sql export: failed, nothing downloadable", "server", req.ServerName,
+			"id", req.ServerID, "error", err)
 		return
 	}
 	st.State = "succeeded"
@@ -113,29 +131,44 @@ func (s *baselineSupervisor) runSQLExport(req console.SQLExportRequest) {
 		"tables", tables, "rows", rows, "at", st.At)
 }
 
-func (s *baselineSupervisor) executeSQLExport(req console.SQLExportRequest) (tables, refused int, rows int64, err error) {
+func (s *baselineSupervisor) executeSQLExport(req console.SQLExportRequest, dir string) (tables int, rows int64, err error) {
 	tableList, err := reconstruct.SnapshotTablesAt(s.ctx, req.BaselineSrc, req.At)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("list the backup to build from: %w", err)
+		return 0, 0, fmt.Errorf("list the backup to build from: %w", err)
 	}
 	if len(tableList) == 0 {
-		return 0, 0, 0, fmt.Errorf("no backup exists at or before %s; the build folds an existing backup forward, so pick a moment after your oldest backup", req.At.UTC().Format("2006-01-02 15:04:05"))
+		return 0, 0, fmt.Errorf("no backup exists at or before %s; the build folds an existing backup forward, so pick a moment after your oldest backup", req.At.UTC().Format("2006-01-02 15:04:05"))
 	}
-	dir := s.sqlExportDir(req.ServerID)
-	// Wipe the previous build: scoped to this server's own export dir, which
-	// holds nothing but the artifact this function writes.
-	if err := os.RemoveAll(dir); err != nil {
-		return 0, 0, 0, fmt.Errorf("clear previous build: %w", err)
+	// Tear down previous builds as this one starts; the new build writes only
+	// into its own directory, so an in-flight download of an OLD build either
+	// completes byte-exact (files already open survive the unlink) or dies
+	// loudly on its abort guard — never silently mixed.
+	root := filepath.Dir(dir)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return 0, 0, fmt.Errorf("create staging directory: %w", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, 0, fmt.Errorf("scan staging directory: %w", err)
+	}
+	for _, ent := range entries {
+		if ent.Name() == filepath.Base(dir) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, ent.Name())); err != nil {
+			return 0, 0, fmt.Errorf("clear previous build: %w", err)
+		}
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return 0, 0, 0, fmt.Errorf("create build directory: %w", err)
+		return 0, 0, fmt.Errorf("create build directory: %w", err)
 	}
 
-	// RESOURCE POSTURE: same reasoning as executeRefresh — this daemon is
-	// also capturing and serving the console, so the fold keeps the
-	// conservative DuckDB budget (zero value = DefaultTuning) and a bounded
-	// table parallelism instead of NumCPU.
-	reports, failures, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, reconstruct.FullTableConfig{
+	// RESOURCE POSTURE: the DuckDB budget stays conservative like every
+	// supervisor fold (zero value = DefaultTuning) — this daemon is also
+	// capturing and serving the console — plus a bound this fold adds that
+	// the refresh does not: table parallelism 2 instead of the engine's
+	// NumCPU default.
+	reports, _, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, reconstruct.FullTableConfig{
 		IndexDSN:     req.IndexDSN,
 		BaselineSrc:  req.BaselineSrc,
 		Tables:       tableList,
@@ -149,8 +182,20 @@ func (s *baselineSupervisor) executeSQLExport(req console.SQLExportRequest) (tab
 	for _, rep := range reports {
 		rows += rep.RowsWritten
 	}
-	if runErr != nil {
-		return len(tableList), len(failures), rows, runErr
+	return len(tableList), rows, sqlExportRunError(reports, runErr)
+}
+
+// sqlExportRunError folds the engine's per-table reports into the run
+// verdict. The engine's binlog-only fallback (baseline vanished mid-build)
+// warns and keeps going in mydumper mode; here it must fail the run: such a
+// table holds only the rows the window touched, and drill's doctrine
+// applies — a dump without its baseline is never a PASS.
+func sqlExportRunError(reports []*reconstruct.TableReport, runErr error) error {
+	for _, rep := range reports {
+		if rep.BinlogOnly {
+			runErr = errors.Join(runErr, fmt.Errorf(
+				"table %s.%s lost its backup mid-build and was rebuilt from recorded changes only; that dump would silently miss every row those changes never touched", rep.Schema, rep.Table))
+		}
 	}
-	return len(tableList), 0, rows, nil
+	return runErr
 }

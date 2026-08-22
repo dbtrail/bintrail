@@ -156,7 +156,13 @@ and searching events:
    backup took, with a **Download (.tar.gz)** of the whole snapshot; plus
    **Create backup** and — for a server with its own local backup directory —
    **Restore to a moment**, which folds a chosen past instant into a NEW
-   discoverable snapshot in the same store) and **Verification** (run
+   discoverable snapshot in the same store, and **Build a .sql backup for
+   any moment**, which folds a chosen instant into a mydumper-format dump
+   downloaded as one `.tar.gz` — load it with `myloader`, nothing from
+   bintrail needed on the restore side. The build is a full plaintext copy
+   of every row, staged on the daemon's disk (under the system temp
+   directory unless `BINTRAIL_CONSOLE_BASELINE_STAGING` says otherwise) until the next
+   build replaces it or the daemon restarts) and **Verification** (run
    `bintrail verify` and read past runs). These produce and validate the
    artifacts a restore depends on, so they are operations rather than
    settings; they lived on the Storage page until they outgrew it.

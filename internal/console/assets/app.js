@@ -4248,7 +4248,7 @@ function fmtSeconds(sec) {
   return Math.floor(sec / 3600) + "h " + Math.round((sec % 3600) / 60) + "m";
 }
 
-const BACKUP_KIND_LABEL = { dump: "full copy of the source", refresh: "automatic refresh", restore: "point-in-time restore", "sql-export": "custom .sql build" };
+const BACKUP_KIND_LABEL = { dump: "full copy of the source", refresh: "automatic refresh", restore: "point-in-time restore" };
 
 // loadBackupDetail fills a row's expansion: tables with sizes, total weight,
 // and duration. The recorded run (this daemon performed it) gives the exact
@@ -4511,7 +4511,8 @@ async function startBackupRestore(id, at, btn, msgEl) {
 // backupSQLExportCard offers the made-to-measure .sql backup: pick any past
 // moment, the console folds the nearest earlier backup forward to it and
 // packages the result as plain SQL files. Unlike the point-in-time restore it
-// publishes NOTHING: the build lives in a staging directory until downloaded.
+// publishes NOTHING: the build lives in a staging directory until the next
+// build (or a daemon restart) replaces it.
 // S3-backed backups qualify too (the fold engine reads them directly), which
 // is why this card has no b.kind === "dir" gate.
 function backupSQLExportCard(cur, b, sqlSt) {
@@ -4524,7 +4525,7 @@ function backupSQLExportCard(cur, b, sqlSt) {
     el("summary", { class: "form-adv-summary", text: "Build a .sql backup for any moment" }));
   const body = el("div", { class: "bk-restore-body" });
   body.append(el("p", { class: "form-hint", text:
-    "Pick a past moment. The console rebuilds every table as it was then, from your backups plus the recorded changes, and packages the result as plain SQL files (mydumper format). Load the download with myloader or any MySQL client; restoring needs nothing from dbtrail. Your database is not touched." }));
+    "Pick a past moment. The console takes the backup from just before it, replays the recorded changes up to it, and packages the result as plain SQL files (mydumper format), ready for myloader. Restoring needs nothing from dbtrail. Your database is not touched." }));
   const input = el("input", { class: "in", type: "text", spellcheck: "false",
     placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
   input.value = (b.snapshots[0] && b.snapshots[0].time) || "";

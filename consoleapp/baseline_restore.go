@@ -96,8 +96,9 @@ func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) 
 	}, req.At.UTC(), tableList)
 }
 
-// wireBaselineExtras attaches the run history and the restore capability to a
-// freshly built supervisor, and exposes both on the console Config. Called by
+// wireBaselineExtras attaches the run history, the restore capability and
+// the sql-export capability to a freshly built supervisor, and exposes them
+// on the console Config. Called by
 // both watch entry paths; a no-op without a supervisor (serve-only consoles
 // keep their 403s).
 //
@@ -107,7 +108,9 @@ func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) 
 // reads the source; mydumper may not exist). A restore is the same fold the
 // refresh already performs, into the same store, with no source contact; the
 // only delta is who picks the instant. A daemon that opted into either
-// baseline producer has already accepted exactly this work. An unreadable history file runs without history rather
+// baseline producer has already accepted exactly this work. The sql export
+// rides the same reasoning: the same fold, into staging instead of the
+// store, handed out only through the query:execute download. An unreadable history file runs without history rather
 // than refusing the daemon — durations degrade to file-timestamp spans, and
 // not opening a store means nothing overwrites the file it might describe.
 func wireBaselineExtras(cfg *console.Config, sup *baselineSupervisor, serversPath string) {

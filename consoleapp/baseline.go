@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +62,9 @@ type baselineSupervisor struct {
 	// exports tracks custom .sql backup builds, keyed by server id — the
 	// fourth job kind under the shared single-flight.
 	exports map[string]*console.BaselineStatus
+	// exportDirs is each server's CURRENT build directory (unique per build;
+	// see sqlExportRoot for why builds never share a path).
+	exportDirs map[string]string
 	// history, when non-nil, records every finished run (dump/refresh/
 	// restore) so the backups page can report exact durations. Failures to
 	// save are logged, never returned: history must not fail a run.
@@ -75,6 +79,13 @@ type baselineSupervisor struct {
 // staging dir is created lazily per run. lockMode selects the MySQL dump's sync
 // mode for every run this supervisor executes — see the field doc.
 func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode baseline.LockMode) *baselineSupervisor {
+	// Sweep sql-export staging from previous processes: a restart empties the
+	// in-memory exports map, so any dump a dead process built is unreachable
+	// from the API — remove the plaintext rows rather than leave them on disk
+	// indefinitely.
+	if err := os.RemoveAll(filepath.Join(stagingDir, "sql-export")); err != nil {
+		slog.Warn("could not sweep stale sql-export staging", "error", err)
+	}
 	return &baselineSupervisor{
 		ctx:        ctx,
 		stagingDir: stagingDir,
@@ -83,6 +94,7 @@ func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode base
 		refreshes:  make(map[string]*console.BaselineStatus),
 		restores:   make(map[string]*console.BaselineStatus),
 		exports:    make(map[string]*console.BaselineStatus),
+		exportDirs: make(map[string]string),
 	}
 }
 

@@ -36,6 +36,22 @@ func (s *stubSQLExporter) SQLExportStatus(string) BaselineStatus {
 }
 func (s *stubSQLExporter) SQLExportDir(string) (string, bool) { return s.dir, s.ready }
 
+func newSQLExportServerWithDefault(t *testing.T, exp SQLExporter, baselineDir string) *Server {
+	t.Helper()
+	reg, err := LoadRegistry(t.TempDir() + "/console-servers.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		Listen: "127.0.0.1:8090", Token: "t", Registry: reg,
+		MonitorCtrl: &stubMonitorCtrl{}, SQLExport: exp, BaselineDir: baselineDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv
+}
+
 func newSQLExportServer(t *testing.T, exp SQLExporter) *Server {
 	t.Helper()
 	reg, err := LoadRegistry(t.TempDir() + "/console-servers.yaml")
@@ -126,6 +142,20 @@ func TestSQLExport_gates(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// An entry with no baseline of its own inherits the process-wide
+	// default (#1010): the Backups listing the card gates on applies the
+	// same fallback, so the trigger must accept it — refusing here made
+	// every Build click 400 on the shipped compose deployment.
+	srvDef := newSQLExportServerWithDefault(t, stub, "/proc-wide/baselines")
+	bareDef, err := srvDef.cm.reg.Add(ServerEntry{Name: "bare2", DSN: "i:p@tcp(h:3306)/idx"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, body = doServersReq(t, srvDef, "POST", "/api/servers/"+bareDef.ID+"/sql-export", `{"at":"2026-06-10 12:00:00"}`)
+	if rec.Code != 202 || stub.last.BaselineSrc != "/proc-wide/baselines" {
+		t.Fatalf("inherited default: code=%d body=%s src=%q, want 202 with the process-wide dir", rec.Code, body, stub.last.BaselineSrc)
+	}
+
 	// Unlike the point-in-time restore, an S3-only backup store qualifies:
 	// the fold engine reads s3:// sources directly.
 	s3only, err := srv.cm.reg.Add(ServerEntry{Name: "s3only", DSN: "i:p@tcp(h:3306)/idx",
@@ -168,9 +198,10 @@ func TestSQLExportDownload_notReady(t *testing.T) {
 	}
 }
 
-// newSQLDumpFixture lays out a finished mydumper-format build with both
-// completeness markers present (a _SUCCESS from this run and a stale
-// _INCOMPLETE would never coexist live, but the skip rule is per-name).
+// newSQLDumpFixture lays out a finished mydumper-format build with BOTH
+// completeness markers present, so the round trip proves the per-name skip
+// for each. (They can coexist live: WriteSuccessMarker's removal of a stale
+// _INCOMPLETE is best-effort.)
 func newSQLDumpFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -179,6 +210,7 @@ func newSQLDumpFixture(t *testing.T) string {
 		"shop.orders-schema.sql": "CREATE TABLE `orders` (id INT PRIMARY KEY);",
 		"shop.orders.00000.sql":  "INSERT INTO `orders` VALUES (1);",
 		"_SUCCESS":               "",
+		"_INCOMPLETE":            "",
 	}
 	for name, content := range files {
 		if err := os.WriteFile(dir+"/"+name, []byte(content), 0o644); err != nil {
@@ -249,6 +281,25 @@ func TestSQLExportDownload_emptyBuild(t *testing.T) {
 	rec, body := doServersReq(t, srv, "GET", "/api/servers/"+id+"/sql-export/download", "")
 	if rec.Code != 409 {
 		t.Fatalf("marker-only build: code=%d body=%s, want 409", rec.Code, body)
+	}
+}
+
+func TestSQLExportTrigger_profileRefusal(t *testing.T) {
+	stub := &stubSQLExporter{}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+	pol := &ext.AccessPolicy{Profile: "sensitive"}
+	req := httptest.NewRequest("POST", "/api/servers/"+id+"/sql-export",
+		strings.NewReader(`{"at":"2026-06-10 12:00:00"}`))
+	req.SetPathValue("id", id)
+	req = req.WithContext(context.WithValue(req.Context(), policyCtxKey{}, pol))
+	w := httptest.NewRecorder()
+	srv.handleSQLExportTrigger(w, req)
+	if w.Code != 403 {
+		t.Fatalf("code = %d body = %s, want 403 under a data profile (the build writes unredacted rows)", w.Code, w.Body.String())
+	}
+	if stub.last != nil {
+		t.Fatal("a refused trigger must never reach the exporter")
 	}
 }
 

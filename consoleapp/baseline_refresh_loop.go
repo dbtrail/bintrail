@@ -54,8 +54,9 @@ func (s *baselineSupervisor) RefreshStatus(serverID string) console.BaselineStat
 	return console.BaselineStatus{State: "idle"}
 }
 
-// busyLocked reports whether either kind of baseline job is in flight for a
-// server. Callers must hold s.mu.
+// busyLocked reports whether any of the four baseline job kinds (dump,
+// refresh, restore, sql export) is in flight for a server. Callers must
+// hold s.mu.
 func (s *baselineSupervisor) busyLocked(serverID string) bool {
 	if st, ok := s.jobs[serverID]; ok && st.State == "running" {
 		return true

@@ -11,10 +11,12 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 // TestSQLExportSingleFlight pins that the export shares the per-server lock
-// with dump/refresh/restore in BOTH directions.
+// with dump/refresh/restore in BOTH directions, the second one literally:
+// a restore trigger during a running export must refuse.
 func TestSQLExportSingleFlight(t *testing.T) {
 	sup := newBaselineSupervisor(context.Background(), t.TempDir(), "")
 	req := console.SQLExportRequest{ServerID: "srv1", ServerName: "wp",
@@ -31,56 +33,86 @@ func TestSQLExportSingleFlight(t *testing.T) {
 	sup.mu.Lock()
 	sup.refreshes["srv1"] = &console.BaselineStatus{State: "succeeded"}
 	sup.exports["srv1"] = &console.BaselineStatus{State: "running"}
-	busy := sup.busyLocked("srv1")
 	sup.mu.Unlock()
-	if !busy {
-		t.Fatal("a running export must block the other kinds (busyLocked)")
+	rreq := console.BaselineRestoreRequest{ServerID: "srv1", ServerName: "wp",
+		IndexDSN: "i:p@tcp(h:3306)/idx", BaselineDir: t.TempDir(),
+		At: time.Date(2026, 6, 10, 11, 0, 0, 0, time.UTC)}
+	if err := sup.TriggerRestore(rreq); !errors.Is(err, console.ErrBaselineRunning) {
+		t.Fatalf("restore during export: err = %v, want ErrBaselineRunning", err)
 	}
 }
 
+// seedExport puts a build state + dir into the supervisor the way Trigger
+// does, without running a fold.
+func seedExport(sup *baselineSupervisor, serverID, state, dir string) {
+	sup.mu.Lock()
+	sup.exports[serverID] = &console.BaselineStatus{State: state}
+	sup.exportDirs[serverID] = dir
+	sup.mu.Unlock()
+}
+
 // TestSQLExportDirGating: the download seam refuses until the status says
-// succeeded AND the directory's completeness marker agrees.
+// succeeded AND the directory affirmatively wears _SUCCESS (and no
+// _INCOMPLETE). Marker-absent is NOT complete here — that legacy default is
+// for pre-marker baseline snapshots, and a build dir is never legacy.
 func TestSQLExportDirGating(t *testing.T) {
 	sup := newBaselineSupervisor(context.Background(), t.TempDir(), "")
 	if _, ok := sup.SQLExportDir("srv1"); ok {
 		t.Fatal("no build ever ran: ok must be false")
 	}
-	sup.mu.Lock()
-	sup.exports["srv1"] = &console.BaselineStatus{State: "failed"}
-	sup.mu.Unlock()
-	if _, ok := sup.SQLExportDir("srv1"); ok {
-		t.Fatal("failed build: ok must be false")
-	}
-	sup.mu.Lock()
-	sup.exports["srv1"] = &console.BaselineStatus{State: "succeeded"}
-	sup.mu.Unlock()
-	dir := sup.sqlExportDir("srv1")
+	dir := filepath.Join(sup.sqlExportRoot("srv1"), "1")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// A succeeded status over a dir still wearing _INCOMPLETE (the fold's
-	// crash-safety marker) must not hand out a partial dump.
+	if err := baseline.WriteSuccessMarker(dir); err != nil {
+		t.Fatal(err)
+	}
+	// A complete directory under a non-succeeded status stays refused: the
+	// state is the authority on WHICH build the dir belongs to.
+	for _, state := range []string{"failed", "running"} {
+		seedExport(sup, "srv1", state, dir)
+		if _, ok := sup.SQLExportDir("srv1"); ok {
+			t.Fatalf("%s build over a complete dir: ok must be false", state)
+		}
+	}
+	seedExport(sup, "srv1", "succeeded", dir)
+	got, ok := sup.SQLExportDir("srv1")
+	if !ok || got != dir {
+		t.Fatalf("complete build: got (%q,%v), want (%q,true)", got, ok, dir)
+	}
+	// _INCOMPLETE present (the fold's crash-safety marker still in place)
+	// overrides everything, even beside a _SUCCESS.
 	if err := os.WriteFile(filepath.Join(dir, baseline.IncompleteMarker), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := sup.SQLExportDir("srv1"); ok {
 		t.Fatal("_INCOMPLETE dir: ok must be false even with a succeeded status")
 	}
+	// Marker-less dir (torn staging): refused, not legacy-complete.
 	if err := os.Remove(filepath.Join(dir, baseline.IncompleteMarker)); err != nil {
 		t.Fatal(err)
 	}
-	if err := baseline.WriteSuccessMarker(dir); err != nil {
+	if err := os.Remove(filepath.Join(dir, baseline.SuccessMarker)); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := sup.SQLExportDir("srv1")
-	if !ok || got != dir {
-		t.Fatalf("complete build: got (%q,%v), want (%q,true)", got, ok, dir)
+	if _, ok := sup.SQLExportDir("srv1"); ok {
+		t.Fatal("marker-less dir: ok must be false (no legacy default for build dirs)")
+	}
+	// Vanished dir (a tmp-reaping host): refused, so the handler answers 409
+	// "build one first" instead of a raw 500.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	seedExport(sup, "srv1", "succeeded", dir)
+	if _, ok := sup.SQLExportDir("srv1"); ok {
+		t.Fatal("vanished dir: ok must be false")
 	}
 }
 
 // TestSQLExportRun_failure: a build over a store with no usable snapshot
-// fails with words about the missing backup, publishes nothing, and records
-// a history row with the error and no snapshot time (it publishes none).
+// fails with words about the missing backup, publishes nothing, and is
+// deliberately ABSENT from the run history (it publishes no snapshot for
+// FindBySnapshot to match; recording it would only evict real records).
 func TestSQLExportRun_failure(t *testing.T) {
 	sup := newBaselineSupervisor(context.Background(), t.TempDir(), "")
 	h, err := console.OpenBaselineHistory(filepath.Join(t.TempDir(), "h.json"))
@@ -93,8 +125,10 @@ func TestSQLExportRun_failure(t *testing.T) {
 		At: time.Date(2026, 6, 10, 11, 0, 0, 0, time.UTC)}
 	sup.mu.Lock()
 	sup.exports["srv1"] = &console.BaselineStatus{State: "running", At: "2026-06-10T11:00:00Z"}
+	dir := filepath.Join(sup.sqlExportRoot("srv1"), "1")
+	sup.exportDirs["srv1"] = dir
 	sup.mu.Unlock()
-	sup.runSQLExport(req)
+	sup.runSQLExport(req, dir)
 
 	st := sup.SQLExportStatus("srv1")
 	if st.State != "failed" || !strings.Contains(st.LastError, "no backup exists at or before") {
@@ -106,20 +140,14 @@ func TestSQLExportRun_failure(t *testing.T) {
 	if _, ok := sup.SQLExportDir("srv1"); ok {
 		t.Fatal("a failed build must not be downloadable")
 	}
-	var rec *console.BaselineRunRecord
-	for _, r := range h.List("srv1") {
-		if r.Kind == console.BaselineRunSQLExport {
-			c := r
-			rec = &c
-		}
-	}
-	if rec == nil || rec.Error == "" || rec.SnapshotTime != "" {
-		t.Fatalf("history record = %+v, want the error and no snapshot time", rec)
+	if recs := h.List("srv1"); len(recs) != 0 {
+		t.Fatalf("history = %+v, want none: export runs are deliberately unrecorded", recs)
 	}
 }
 
 // TestSQLExportTrigger_stampsInstant: the running status carries the chosen
-// instant from the very first poll (the UI labels the run region with it).
+// instant from the very first poll, and nothing is downloadable while the
+// build runs.
 func TestSQLExportTrigger_stampsInstant(t *testing.T) {
 	sup := newBaselineSupervisor(context.Background(), t.TempDir(), "")
 	at := time.Date(2026, 6, 10, 11, 0, 0, 0, time.UTC)
@@ -132,14 +160,78 @@ func TestSQLExportTrigger_stampsInstant(t *testing.T) {
 	if st.At != "2026-06-10T11:00:00Z" || st.Since == "" {
 		t.Fatalf("status right after trigger = %+v, want the instant and a start stamp", st)
 	}
+	if st.State == "running" {
+		if _, ok := sup.SQLExportDir("srv1"); ok {
+			t.Fatal("a running build must not be downloadable")
+		}
+	}
 	// The empty store makes the goroutine fail fast without touching the DSN;
 	// wait for it so the test does not leak a running fold.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if sup.SQLExportStatus("srv1").State != "running" {
-			return
+	waitSettled := func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if sup.SQLExportStatus("srv1").State != "running" {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
-		time.Sleep(20 * time.Millisecond)
+		t.Fatal("export never settled")
 	}
-	t.Fatal("export never settled")
+	waitSettled()
+	sup.mu.Lock()
+	dir1 := sup.exportDirs["srv1"]
+	sup.mu.Unlock()
+	// A second build gets its OWN directory: a shared path reused across
+	// builds is the silent half of the wipe race (two instants interleaved
+	// into one archive whose per-file guards all pass).
+	if err := sup.TriggerSQLExport(req); err != nil {
+		t.Fatal(err)
+	}
+	waitSettled()
+	sup.mu.Lock()
+	dir2 := sup.exportDirs["srv1"]
+	sup.mu.Unlock()
+	if dir1 == dir2 {
+		t.Fatalf("both builds share %q; every build must get a fresh directory", dir1)
+	}
+}
+
+// TestSQLExportRunError: a binlog-only table report fails the run even when
+// the engine reported no error — a dump without its baseline is never a
+// PASS — and names the table; clean reports pass the engine verdict through.
+func TestSQLExportRunError(t *testing.T) {
+	clean := []*reconstruct.TableReport{{Schema: "shop", Table: "orders"}}
+	if err := sqlExportRunError(clean, nil); err != nil {
+		t.Fatalf("clean reports: err = %v, want nil", err)
+	}
+	degraded := []*reconstruct.TableReport{
+		{Schema: "shop", Table: "orders"},
+		{Schema: "shop", Table: "users", BinlogOnly: true},
+	}
+	err := sqlExportRunError(degraded, nil)
+	if err == nil || !strings.Contains(err.Error(), "shop.users") ||
+		!strings.Contains(err.Error(), "recorded changes only") {
+		t.Fatalf("binlog-only report: err = %v, want a refusal naming shop.users", err)
+	}
+	if kept := sqlExportRunError(clean, errors.New("fold died")); kept == nil || kept.Error() != "fold died" {
+		t.Fatalf("engine error must pass through, got %v", kept)
+	}
+}
+
+// TestSQLExportBootSweep: staging left by a previous process is removed at
+// supervisor construction — a restart empties the in-memory map, so the
+// artifact would otherwise sit unreachable on disk forever.
+func TestSQLExportBootSweep(t *testing.T) {
+	staging := t.TempDir()
+	stale := filepath.Join(staging, "sql-export", "srv-old", "1")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stale, "shop.orders.00000.sql"), []byte("INSERT"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newBaselineSupervisor(context.Background(), staging, "")
+	if _, err := os.Stat(filepath.Join(staging, "sql-export")); !os.IsNotExist(err) {
+		t.Fatalf("stale sql-export staging survived construction (err=%v)", err)
+	}
 }
