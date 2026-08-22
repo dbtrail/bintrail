@@ -25,9 +25,9 @@ server, exactly like the console's Time-travel tab; without one the tool says so
 
 ## Step 1 — you need the console with a token
 
-> The numbers here match the cards on the console's **Connect AI** page
-> (Step 1 · Access token, Step 2 · Console address, Step 3 · Add it to
-> Claude), so you can follow either surface.
+> The numbers here match the numbered cards on the console's **Connect AI**
+> page (1 Create a token, 2 Copy the address, 3 Add it to Claude), so you can
+> follow either surface.
 
 The AI connects to your **web console**, which serves an MCP endpoint at
 `/mcp`. If you already run `bintrail-console` (standalone `serve`, `watch`, or
@@ -35,7 +35,7 @@ the Docker stack), you're nearly done — the AI client just needs an **access
 token**, and you mint one without leaving the browser:
 
 Open **Settings → Connect AI** in the sidebar. If no token is configured yet,
-the **Access token** card has a **Generate token** button — click it, copy the
+the **Create a token** card has a **Generate token** button — click it, copy the
 value it shows (it appears exactly once and is never stored), and you're done.
 No flags, no environment variables, no restart. The same card replaces the
 token (**New token**) or deletes it (**Delete token**) later. The generated token is scoped to the MCP tools only —

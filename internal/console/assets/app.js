@@ -5449,8 +5449,7 @@ function copyText(text, what) {
 function buildConnect(servers, tokStatus, minted) {
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
-    "Let Claude (or another AI assistant) read this console and answer questions about your database history. Three steps: create an access token, copy this console's address, and give both to Claude. The AI sees the same read-only view as this page; it can never change your data. ",
-    el("b", { text: "Your token is shown only once, right after you create it, so copy it somewhere safe at that moment." }));
+    "Three steps and Claude can answer questions about your database history. It can only read; it can never change anything.");
   v.append(pageHead("Connect AI", sub));
 
   const cards = el("div", { class: "cards" });
@@ -5495,16 +5494,36 @@ async function revokeMCPToken() {
   renderConnect();
 }
 
+// cnCard: a step card whose number is a BADGE, not prose. The three cards are
+// the whole how-to, so each stays at one action plus one short line; every
+// conditional or rare fact folds into cnFine below.
+function cnCard(num, title) {
+  return el("div", { class: "card cn-card" },
+    el("div", { class: "card-title cn-title" },
+      el("span", { class: "cn-num", text: String(num) }),
+      title));
+}
+
+// cnFine: collapsed fine print. The audience is non-technical, and the #1430
+// step rewrite proved that spelling every contingency out in the open reads
+// as a wall of text; the facts stay on the page, but folded.
+function cnFine(label, ...kids) {
+  const d = el("details", { class: "form-advanced cn-fine" },
+    el("summary", { class: "form-adv-summary", text: label }));
+  for (const k of kids) d.append(k);
+  return d;
+}
+
 // mcpTokenCard (#1052): generate, rotate, and revoke the managed MCP token
 // without leaving the UI. The token value renders exactly once — right after
 // generation — and is otherwise represented only by its creation date.
 function mcpTokenCard(tok, minted) {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Step 1 · Access token" }));
-  // The one-time plaintext renders UNCONDITIONALLY — a failed status fetch
+  const card = cnCard(1, "Create a token");
+  // The one-time plaintext renders UNCONDITIONALLY: a failed status fetch
   // must never swallow a token that was just minted (after a rotate, it is
   // the only valid credential and cannot be re-displayed).
   if (minted) {
-    card.append(el("p", { class: "stg-hint", text: "Here is your new token. Copy it NOW and keep it somewhere safe (a password manager is ideal). It is not stored anywhere, so this is the only time it will ever be on screen:" }));
+    card.append(el("p", { class: "stg-hint", text: "Copy it now and keep it somewhere safe. It will never be shown again:" }));
     card.append(el("div", { class: "cn-urlrow" },
       el("code", { class: "stg-code cn-url", text: minted }),
       el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(minted, "Access token") })));
@@ -5516,30 +5535,30 @@ function mcpTokenCard(tok, minted) {
   if (tok.managed) {
     if (!minted) {
       card.append(el("p", { class: "stg-hint", text:
-        "A token already exists" + (tok.created_at ? " (created " + utcLabel(tok.created_at) + ")" : "") +
-        ". Its value is not saved anywhere, so it cannot be shown again." +
+        "You already have a token" + (tok.created_at ? ", created " + utcLabel(tok.created_at) : "") +
+        ". It cannot be shown again." +
         // read_only hides the buttons below, so never tell that user to click one
-        (tok.read_only ? "" : " Lost it? Click New token: you get a fresh value to copy, and the old one stops working.") }));
+        (tok.read_only ? "" : " Lost it? New token gives you a fresh one; the old one stops working.") }));
     }
     if (tok.read_only) {
-      card.append(el("p", { class: "form-hint", text:
-        "This token was created by a newer version of bintrail. It keeps working, but this page cannot replace or delete it; upgrading the console brings those buttons back." }));
+      card.append(cnFine("Why is there no button here?",
+        el("p", { class: "form-hint", text: "This token was created by a newer version of bintrail. It keeps working, but this page cannot replace or delete it; upgrading the console brings those buttons back." })));
     } else {
       card.append(el("div", { class: "cn-links" },
         el("button", { class: "btn btn-sm", type: "button", text: "New token", onclick: () => mintMCPToken(true) }),
         el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Delete token", onclick: revokeMCPToken })));
     }
   } else if (!minted) {
-    card.append(el("p", { class: "stg-hint", text:
-      "Claude cannot use your console password; it needs its own token, a long random key that works as its password. Click Generate token and copy the value that appears. The token only lets an AI read your history; it cannot change data or console settings." }));
+    card.append(el("p", { class: "stg-hint", text: "The token is Claude's password for this console. It is shown only once, so copy it right away." }));
     card.append(el("div", { class: "cn-links" },
       el("button", { class: "btn btn-sm", type: "button", text: "Generate token", onclick: () => mintMCPToken(false) })));
   }
   if (tok.static) {
-    card.append(el("p", { class: "form-hint" },
-      "A fixed token set outside this page also works (CLI: ",
-      el("code", { text: "--token" }), " or ", el("code", { text: "BINTRAIL_CONSOLE_TOKEN" }),
-      "). It is managed wherever it was set up, not here."));
+    card.append(cnFine("A token was set at startup",
+      el("p", { class: "form-hint" },
+        "That fixed token also works (CLI: ",
+        el("code", { text: "--token" }), " or ", el("code", { text: "BINTRAIL_CONSOLE_TOKEN" }),
+        "). It is managed wherever it was set up, not here.")));
   }
   return card;
 }
@@ -5548,62 +5567,90 @@ function mcpTokenCard(tok, minted) {
 // how-to-enable explanation when no token is configured (capabilities.mcp) —
 // never a URL presented as ready that would only ever answer 403.
 function mcpEndpointCard(servers) {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Step 2 · Console address" }));
+  const card = cnCard(2, "Copy the address");
   if (!capsCache.mcp) {
-    card.append(el("p", { class: "stg-hint", text:
-      "This card fills in after step 1: create the access token and this console's address appears here, ready to copy." }));
+    card.append(el("p", { class: "stg-hint", text: "Finish step 1 first; this console's address then appears here, ready to copy." }));
     return card;
   }
   const url = mcpURL(servers);
   card.append(el("div", { class: "cn-urlrow" },
     el("code", { class: "stg-code cn-url", text: url }),
     el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(url, "Console address") })));
+  card.append(el("p", { class: "stg-hint", text: "Claude will ask for a URL; this is the one to paste." }));
   if ((servers || []).length > 1) {
-    card.append(el("p", { class: "form-hint", text:
-      "This address points at the server picked in the left sidebar (the Server box at the top). To connect a different server, pick it there first and copy again: each server has its own address." }));
+    card.append(cnFine("Connecting a different server?",
+      el("p", { class: "form-hint", text: "This address points at the server picked in the left sidebar (the Server box at the top). Pick a different server there and copy again; each server has its own address." })));
   }
-  card.append(el("p", { class: "form-hint", text:
-    "When Claude asks for the URL, paste this address. When it asks for the access token, paste the one from step 1." }));
   return card;
 }
 
+// claudeAskMock: a drawn miniature of Claude Desktop's install dialog, so the
+// user recognizes the two fields instead of reading a paragraph about them.
+// The field labels are quoted VERBATIM from
+// build/packaging/mcpb/manifest.template.json; if the bundle renames them the
+// picture lies, so they change together.
+function claudeAskMock() {
+  const field = (n, label, hint) => el("div", { class: "cn-mock-row" },
+    el("div", { class: "cn-mock-label", text: label }),
+    el("div", { class: "cn-mock-field" },
+      el("span", { class: "cn-chip", text: String(n) }),
+      el("span", { class: "cn-mock-paste", text: hint })));
+  return el("div", { class: "cn-mock" },
+    el("div", { class: "cn-mock-bar" }, el("span", { class: "cn-mock-dots" }), "Claude Desktop"),
+    field(2, "Console / MCP endpoint URL", "paste the address from step 2"),
+    field(1, "Access token", "paste the token from step 1"));
+}
+
+// askExample: the payoff line, drawn as the chat message it becomes.
+function askExample() {
+  return el("div", { class: "cn-ask" },
+    "Then ask Claude: ",
+    el("b", { text: "\u201Cwhat changed in my database in the last hour?\u201D" }));
+}
+
 // bundleCard links the .mcpb bundle (one-click Claude Desktop install) for the
-// RUNNING version. Best-effort: a release that predates the bundle artifact
-// 404s the direct link, so a releases-page path is always offered too.
+// RUNNING version. Honesty rules carried from #1430: never render a download
+// that can only 404 (no Windows bundle has ever been published, and an
+// unversioned build has no matching asset), and the dialog mock's field
+// labels come verbatim from the manifest.
 function bundleCard() {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Step 3 · Add it to Claude" }));
+  const card = cnCard(3, "Add it to Claude");
   const ver = String(capsCache.version || "").replace(/^v/, "");
   const released = /^\d+\.\d+\.\d+$/.test(ver);
-  card.append(el("ol", { class: "cn-steps" },
-    el("li", { text: "You need the Claude Desktop app installed (claude.ai/download). Using claude.ai in the browser instead? See the note below." }),
-    el("li", { text: released && guessPlatform()
-      ? "Download the installer with the button below; it is the best guess for this computer, and the note under the buttons says when to pick a different file."
-      : "Download the installer from the releases page below; the note under the button says which file matches this computer." }),
-    el("li", { text: "Double-click the downloaded file. Claude Desktop opens and asks to install dbtrail; accept." }),
-    el("li", { text: "Claude then asks for two things. In \"Console / MCP endpoint URL\" paste the address from step 2; in \"Access token\" paste the token from step 1." }),
-    el("li", { text: "Open a new chat and try: what changed in my database in the last hour?" })));
   const plat = guessPlatform();
+  const relTag = "https://github.com/dbtrail/dbtrail/releases/tag/v" + ver;
   if (released && plat) {
     const asset = "dbtrail-" + plat + ".mcpb";
+    card.append(el("p", { class: "stg-hint", text: "Get the Claude Desktop app (claude.ai/download), then download this installer and double-click it:" }));
     card.append(el("div", { class: "cn-links" },
-      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/download/v" + ver + "/" + asset, target: "_blank", rel: "noopener", text: "Download " + asset }),
-      el("a", { class: "btn btn-sm btn-ghost", href: "https://github.com/dbtrail/dbtrail/releases/tag/v" + ver, target: "_blank", rel: "noopener", text: "All downloads for v" + ver })));
-    card.append(el("p", { class: "form-hint", text:
-      "The download matches this console's version (v" + ver + ") and guesses your computer (Macs are assumed Apple chip). Intel Mac? Use All downloads and take dbtrail-darwin-amd64.mcpb. If the link lands on Not Found, that release shipped without this file; take the newest release's file from All downloads instead." }));
+      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/download/v" + ver + "/" + asset, target: "_blank", rel: "noopener", text: "Download the installer" }),
+      el("a", { class: "btn btn-sm btn-ghost", href: relTag, target: "_blank", rel: "noopener", text: "All downloads" })));
+    card.append(el("p", { class: "stg-hint", text: "Claude opens and asks for two things:" }));
+    card.append(claudeAskMock());
+    card.append(askExample());
+    card.append(cnFine("Intel Mac, Windows, or claude.ai in the browser?",
+      el("p", { class: "form-hint", text: "The download button guesses this computer from the browser, and Macs are assumed to have an Apple chip. On an Intel Mac, use All downloads and take dbtrail-darwin-amd64.mcpb (v" + ver + " matches this console)." }),
+      el("p", { class: "form-hint", text: "If the download lands on Not Found, that release shipped without the installer; take the newest release's file from All downloads instead." }),
+      el("p", { class: "form-hint", text: "Windows has no installer yet. Use claude.ai in the browser: if this console is reachable from the internet, open Settings, then Connectors, then Add custom connector, and paste the same address and token. On a private network (only reachable from inside), the browser path cannot reach it; use the desktop app on a Mac or Linux machine instead." })));
   } else if (released) {
-    // Windows on a released build: never render a download that can only 404.
-    card.append(el("div", { class: "cn-links" },
-      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/tag/v" + ver, target: "_blank", rel: "noopener", text: "All downloads for v" + ver })));
-    card.append(el("p", { class: "form-hint", text:
-      "There is no Windows installer yet. Use the claude.ai note below instead; it needs no download at all." }));
+    // Windows on a released build: the desktop bundle does not exist, so the
+    // browser connector IS the path, not a footnote.
+    card.append(el("p", { class: "stg-hint", text: "There is no Windows installer yet. Connect from claude.ai in the browser instead: open Settings, then Connectors, then Add custom connector, and paste the address and token from steps 1 and 2." }));
+    card.append(askExample());
+    card.append(cnFine("Console on a private network?",
+      el("p", { class: "form-hint", text: "The browser path needs this console to be reachable from the internet. On a private network (only reachable from inside), install the desktop bundle on a Mac or Linux machine instead; All downloads below has the files." }),
+      el("p", { class: "form-hint" }, el("a", { href: relTag, target: "_blank", rel: "noopener", text: "All downloads for v" + ver }))));
   } else {
+    card.append(el("p", { class: "stg-hint", text: "Get the Claude Desktop app (claude.ai/download), then download the newest installer for this computer and double-click it:" }));
     card.append(el("div", { class: "cn-links" },
       el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases", target: "_blank", rel: "noopener", text: "Open the releases page" })));
-    card.append(el("p", { class: "form-hint", text:
-      "This console is a development build, so there is no matching download link. Open the releases page, take the NEWEST release, and download the file for this computer: Mac with Apple chip is dbtrail-darwin-arm64.mcpb, Intel Mac is dbtrail-darwin-amd64.mcpb, Linux is dbtrail-linux-amd64.mcpb (or -arm64). Windows has no installer yet; use the claude.ai note below instead." }));
+    card.append(el("p", { class: "stg-hint", text: "Claude opens and asks for two things:" }));
+    card.append(claudeAskMock());
+    card.append(askExample());
+    card.append(cnFine("Which file is for this computer?",
+      el("p", { class: "form-hint", text: "This console is a development build, so there is no matching download link. In the newest release: Mac with Apple chip is dbtrail-darwin-arm64.mcpb, Intel Mac is dbtrail-darwin-amd64.mcpb, Linux is dbtrail-linux-amd64.mcpb (or -arm64). Windows has no installer yet." }),
+      el("p", { class: "form-hint", text: "Using claude.ai in the browser instead of the desktop app? If this console is reachable from the internet, open Settings, then Connectors, then Add custom connector, and paste the same address and token. On a private network (only reachable from inside), use the desktop app." })));
   }
-  card.append(el("p", { class: "form-hint", text:
-    "Using claude.ai in the browser instead of the desktop app? If this console is reachable from the internet, open claude.ai, go to Settings, then Connectors, then Add custom connector, and paste the same address and token there. On a private network (only reachable from inside), use the desktop app instead." }));
   return card;
 }
 
