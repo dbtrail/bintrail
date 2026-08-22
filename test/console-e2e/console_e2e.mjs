@@ -1702,6 +1702,75 @@ try {
   (tint.pill && tint.pill !== tint.violet)
     ? ok("overview (live): the pill eyebrow renders on its own surface inside the tinted card")
     : bad("overview (live): the pill eyebrow renders on its own surface inside the tinted card", JSON.stringify(tint));
+  // Identity, not just difference (#1423 review): a wrong-but-different color
+  // passed the check above. The violet ground IS the home page's --violet-tint
+  // (#EFE9FF) — home fidelity is the point of #1421, so the exact value is the
+  // contract. Update all three together if the palette ever moves: this pin,
+  // the token, and the Go contrast test's measurements.
+  (tint.violet === "rgb(239, 233, 255)")
+    ? ok("overview (live): the violet panel renders the home page's own tint value")
+    : bad("overview (live): the violet panel renders the home page's own tint value", JSON.stringify(tint));
+  // The WIRING the Go token test cannot see (#1423 review: .ov-ev-pk sat on
+  // the violet tint wearing --ink-3 at 4.20:1 while every token-level check
+  // was green). Synthetic probes inside the REAL panels: computed style
+  // answers for the class whether or not live rows have rendered yet.
+  const tintText = await page.evaluate(() => {
+    const vp = document.querySelector(".ov-panel.tcard-violet");
+    const sp = document.querySelector(".ov-panel.tcard-sun");
+    if (!vp || !sp) return null;
+    const cs = getComputedStyle;
+    // Canvas pixels, not string parsing: the ink ramp computes to oklch(...)
+    // strings, which no rgb() regex can read — the first draft measured 0 for
+    // every text ratio and only the hex-declared dividers parsed. Same
+    // technique as brandProbe, for the same reason.
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = 1;
+    const ctx = cv.getContext("2d", { willReadFrequently: true });
+    const lum = (str) => {
+      ctx.fillStyle = "#010203";
+      ctx.fillStyle = str;
+      if (ctx.fillStyle === "#010203") return null; // unparseable, fail loud
+      ctx.clearRect(0, 0, 1, 1);
+      ctx.fillRect(0, 0, 1, 1);
+      const d = ctx.getImageData(0, 0, 1, 1).data;
+      const c = (v) => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+      return 0.2126 * c(d[0]) + 0.7152 * c(d[1]) + 0.0722 * c(d[2]);
+    };
+    const ratio = (a, b) => {
+      const la = lum(a), lb = lum(b);
+      if (la === null || lb === null) return 0;
+      const [hi, lo] = [la, lb].sort((x, y) => y - x);
+      return (hi + 0.05) / (lo + 0.05);
+    };
+    const probe = (parent, cls, tag) => {
+      const n = document.createElement(tag || "div");
+      n.className = cls;
+      parent.appendChild(n);
+      return n;
+    };
+    const vbg = cs(vp).backgroundColor, sbg = cs(sp).backgroundColor;
+    const pk = probe(vp, "ov-ev-pk", "span");
+    const ev = probe(vp, "ov-ev");
+    const cov = probe(sp, "ov-coverage");
+    const trow = probe(sp, "ov-tablerow");
+    const out = {
+      pkRatio: ratio(cs(pk).color, vbg),
+      evDivider: ratio(cs(ev).borderTopColor, vbg),
+      covRatio: ratio(cs(cov).color, sbg),
+      trowDivider: ratio(cs(trow).borderTopColor, sbg),
+    };
+    [pk, ev, cov, trow].forEach((n) => n.remove());
+    return out;
+  });
+  (tintText && tintText.pkRatio >= 4.5 && tintText.covRatio >= 4.5)
+    ? ok("overview (live): body text on the tinted panels holds the 4.5:1 floor as rendered")
+    : bad("overview (live): body text on the tinted panels holds the 4.5:1 floor as rendered", JSON.stringify(tintText));
+  // 1.15 = the hairline idiom's own floor (--line-soft on white is 1.17).
+  // Deleting the tint-aware divider override lands the violet list at 1.01 —
+  // no dividers at all — and rings here, not in any token test.
+  (tintText && tintText.evDivider >= 1.15 && tintText.trowDivider >= 1.15)
+    ? ok("overview (live): row dividers stay visible on the tinted panels")
+    : bad("overview (live): row dividers stay visible on the tinted panels", JSON.stringify(tintText));
   ovLive.scopes.every((s) => s.trim() !== "")
     ? ok("overview (live): every rendered tile carries a scope line")
     : bad("overview (live): every rendered tile carries a scope line", JSON.stringify(ovLive.scopes));
@@ -2742,6 +2811,27 @@ try {
     const [hi, lo] = [relLum(px(res.skelStop, ground)), relLum(px(ground, ground))].sort((a, b) => b - a);
     res.skelRatio = (hi + 0.05) / (lo + 0.05);
 
+    // The same bar on the VIOLET PANEL ground (#1421/#1423 review): since the
+    // stat tiles went white-bento, the worst ground these bars stand on is the
+    // tinted Recent-changes panel (ovSkelLines renders straight into
+    // .ov-evlist there), and the studio-tile measurement above no longer
+    // covers the worst case. A bare .skel-line inside a .tcard-violet host is
+    // the stylesheet half; the panel's real markup carries no gate.
+    const vhost = document.createElement("div");
+    vhost.className = "tcard-violet";
+    document.body.appendChild(vhost);
+    const vbar = document.createElement("div");
+    vbar.className = "skel-line";
+    vhost.appendChild(vbar);
+    const vstop = (cs(vbar).backgroundImage.match(/\b(?:rgba?|color|oklch|oklab|hsla?)\([^)]*\)|#[0-9a-fA-F]{3,8}\b/) || [])[0] || "";
+    const vground = cs(vhost).backgroundColor;
+    ctx.fillStyle = "#010203";
+    ctx.fillStyle = vstop;
+    res.skelVioletParsed = ctx.fillStyle !== "#010203";
+    const [vhi, vlo] = [relLum(px(vstop, vground)), relLum(px(vground, vground))].sort((a, b) => b - a);
+    res.skelVioletRatio = (vhi + 0.05) / (vlo + 0.05);
+    vhost.remove();
+
     host.remove();
     return res;
   });
@@ -2782,6 +2872,13 @@ try {
     : bad("brand paint: the warmed loading bar's stop stays clear of its panel",
         JSON.stringify({ stop: brand.skelStop, ground: brand.skelGround || "NONE FOUND",
           ratio: Number(brand.skelRatio.toFixed(3)), parsed: brand.skelParsed }));
+  // The violet panel is the worst ground the bars stand on since the tiles
+  // went white (measured 1.43 there vs 1.60 on the studio tile). Same 1.3
+  // floor: reverting the bar to plain --line lands ~1.13 on violet and rings.
+  (brand.skelVioletParsed && brand.skelVioletRatio >= 1.3)
+    ? ok("brand paint: the warmed loading bar stays clear of the violet panel ground")
+    : bad("brand paint: the warmed loading bar stays clear of the violet panel ground",
+        JSON.stringify({ ratio: Number((brand.skelVioletRatio || 0).toFixed(3)), parsed: brand.skelVioletParsed }));
 
   // ── Scenario 17f — the Events skeleton is visible (#1397) ──
   //

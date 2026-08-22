@@ -159,9 +159,12 @@
        --surface-2, the studio tile             1.60         1.23
        paper and trail (both resolve white)     1.68         1.28
 
-     Studio is the shipped default and also the worst case, which is why the
-     browser assertion measures that one. More separated than before, not less
-     — the direction was not the expected one, and is why it was measured
+     Studio was the worst case when the stat tiles still consumed
+     --panel-bg; since #1421 they are white bento tiles and the worst
+     ground for these bars is the VIOLET PANEL (peak 1.43 there, still
+     above the 1.3 floor the browser assertion holds — it now photographs
+     that ground too). More separated than before, not less — the
+     direction was not the expected one, and is why it was measured
      rather than converted.
 
      Those figures are the stop's PEAK against its ground. The mid-stop is
@@ -267,7 +270,9 @@
      partners DARKENED to hold the AA floors the site's own deep values miss.
      Measured before choosing (WCAG ratio on the tint): site --pink-deep
      #D9367A lands 3.83:1, --orange-deep #C2611B 3.77:1, the sun tag text
-     #9A7800 3.84:1, bare --violet 3.68:1 — every one below the 4.5:1 floor
+     #9A7800 3.84:1, bare --violet 3.68:1 (the site's own --violet, measured
+     on the landing stylesheet at dbtrail.com — not a token in this file) —
+     every one below the 4.5:1 floor
      this file's ink ramp is verified against. The -deep values below all
      clear 5.2:1 on their tint and on white. Decorative use only: the
      semantic INSERT/UPDATE/DELETE mapping above stays reserved, and pink/
@@ -276,13 +281,26 @@
      on). */
   --violet-tint: #EFE9FF;
   --violet-deep: #5A3BD6;
-  --sun-tint:    #FFF6D8;
+  /* sun sits ONE STEP from the console's warning ground: the site's butter
+     (#FFF6D8) measures 1.008 against --ochre-bg — the same color, so a data
+     panel wore the warn register. Lightened to keep the identity while
+     separating the registers (1.03 vs --ochre-bg, floor-tested); warn
+     surfaces still must never nest inside a sun card. */
+  --sun-tint:    #FFF9E4;
   --sun-deep:    #7A5F00;
   --pink-tint:   #FFE9F5;
   --pink-deep:   #B02762;
   --orange-tint: #FFF1E2;
   --orange-deep: #A04E10;
-  /* the bento card radius — a step above --radius, never replacing it */
+  /* row hairlines drown on a tint (--line-soft on violet: 1.01 — invisible;
+     the Events-skeleton comment above documents the same failure mode for
+     bars). Each tint carries its own divider, floor-tested at >=1.15. */
+  --violet-line: #DDD4F2;
+  --sun-line:    #EADFC4;
+  /* the bento card radius — a step above --radius, never replacing it.
+     Deliberately NOT re-pointed per direction: under paper (--radius: 5px)
+     the bento cards keep 20px — mixed registers, accepted while paper stays
+     dev-only (index.html hardcodes studio). */
   --radius-lg: 20px;
 
   --shell-w: 248px;
@@ -1330,20 +1348,17 @@ button { font-family: inherit; }
   border-radius: var(--radius-lg); border: 1px solid var(--line);
   background: var(--surface); padding: 20px 22px; min-width: 0;
 }
-.tcard.violet { background: var(--violet-tint); border-color: transparent; }
-.tcard.sun    { background: var(--sun-tint);    border-color: transparent; }
-.tcard.pink   { background: var(--pink-tint);   border-color: transparent; }
-.tcard.orange { background: var(--orange-tint); border-color: transparent; }
+/* tint modifiers live further down, AFTER the .ov-panel ground rules —
+   one vocabulary, always hyphenated: class="tcard tcard-violet". (An
+   earlier draft had .tcard.violet here AND .ov-panel.tcard-violet below;
+   review caught that "tcard tcard-violet" — the natural reading — rendered
+   white.) */
 .tag-pill {
   display: inline-block; font-family: var(--f-mono); font-size: 10.5px;
   font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
   padding: 4px 11px; border-radius: 999px;
   background: var(--surface-3); color: var(--ink-2);
 }
-.tcard.violet .tag-pill { background: var(--surface); color: var(--violet-deep); }
-.tcard.sun    .tag-pill { background: var(--surface); color: var(--sun-deep); }
-.tcard.pink   .tag-pill { background: var(--surface); color: var(--pink-deep); }
-.tcard.orange .tag-pill { background: var(--surface); color: var(--orange-deep); }
 /* the dark code block: SQL and DSNs on ink, the strongest same-product
    signal the site sends. Defined with the recipe; the page sweeps
    (#1415/#1419) adopt it where code is rendered. */
@@ -1400,13 +1415,27 @@ button { font-family: inherit; }
   background: var(--panel-bg); border: 1px solid var(--panel-border);
   border-radius: var(--radius-lg); padding: 10px 10px 12px; box-shadow: var(--panel-shadow);
 }
-/* the two Overview panels take the tint layer (#1421). Violet and sun are
-   the STRUCTURE tints — pink/orange stay away from event data by rule. The
-   tint is the edge; the hairline goes. */
-.ov-panel.tcard-violet { background: var(--violet-tint); border-color: transparent; }
-.ov-panel.tcard-sun    { background: var(--sun-tint);    border-color: transparent; }
-.ov-panel.tcard-violet .tag-pill { background: var(--surface); color: var(--violet-deep); }
-.ov-panel.tcard-sun    .tag-pill { background: var(--surface); color: var(--sun-deep); }
+/* the tint modifiers (#1421) — ONE vocabulary: the hyphenated class IS the
+   modifier, valid on .tcard and .ov-panel alike ("tcard tcard-violet",
+   "ov-panel tcard-sun"). Violet and sun are the STRUCTURE tints —
+   pink/orange stay away from event data by rule. The tint is the edge; the
+   hairline goes. These sit AFTER the .ov-panel ground rules because at
+   equal (0-1-0) specificity the cascade decides — placed earlier, the
+   panel's own background wins and all four classes go inert.
+   [data-dir="paper"] .ov-panel (0-2-0) still beats them, stripping the
+   tint under paper: dev-only today (index.html hardcodes studio), the
+   same trade the old 0-2-0 tie made. */
+.tcard-violet { background: var(--violet-tint); border-color: transparent; }
+.tcard-sun    { background: var(--sun-tint);    border-color: transparent; }
+.tcard-pink   { background: var(--pink-tint);   border-color: transparent; }
+.tcard-orange { background: var(--orange-tint); border-color: transparent; }
+.tcard-violet .tag-pill { background: var(--surface); color: var(--violet-deep); }
+.tcard-sun    .tag-pill { background: var(--surface); color: var(--sun-deep); }
+.tcard-pink   .tag-pill { background: var(--surface); color: var(--pink-deep); }
+.tcard-orange .tag-pill { background: var(--surface); color: var(--orange-deep); }
+/* the tint-aware dividers (see the token block) */
+.tcard-violet .ov-ev, .tcard-violet .ov-tablerow, .tcard-violet .ov-coverage { border-top-color: var(--violet-line); }
+.tcard-sun .ov-ev, .tcard-sun .ov-tablerow, .tcard-sun .ov-coverage { border-top-color: var(--sun-line); }
 [data-dir="paper"] .ov-panel { background: transparent; border-color: var(--line); }
 .ov-panel-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 14px 10px; }
 .ov-panel-title { font-family: var(--title-font); font-weight: 600; font-size: 15px; letter-spacing: -0.01em; margin: 0; color: var(--ink); }
@@ -1422,8 +1451,11 @@ button { font-family: inherit; }
 .ov-ev:hover { background: var(--surface-2); }
 .ov-ev-time { font-family: var(--f-mono); font-size: 12px; color: var(--ink-2); }
 .ov-ev-tbl { font-family: var(--f-mono); font-size: 12.5px; color: var(--ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ov-ev-pk { color: var(--ink-3); }
-.ov-ev-cols { font-family: var(--f-mono); font-size: 11.5px; color: var(--ink-3); text-align: right; white-space: nowrap; }
+/* --ink-2, not -3: this text sits on the violet tint, where --ink-3
+   measures 4.20:1 — below the 4.5 floor the ink ramp is verified against
+   (review reproduced it; -3 clears only white and sun). */
+.ov-ev-pk { color: var(--ink-2); }
+.ov-ev-cols { font-family: var(--f-mono); font-size: 11.5px; color: var(--ink-2); text-align: right; white-space: nowrap; }
 .ov-ev-undo { height: 27px; padding: 0 9px; font-size: 11.5px; opacity: 0; transition: opacity .14s; }
 .ov-ev-undo svg { width: 12px; height: 12px; }
 .ov-ev:hover .ov-ev-undo { opacity: 1; }
