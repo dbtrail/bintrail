@@ -2192,6 +2192,24 @@ try {
     ? ok("sqlx: a bad instant is refused inline")
     : bad("sqlx: a bad instant is refused inline", JSON.stringify(sqlxGate.inlineErr));
 
+  // The gate arms, fixture-driven through the REAL builder (a daemon without
+  // the exporter cannot be photographed from this one). The on-arm is the
+  // vacuousness control: a builder that always returned null would pass the
+  // off-arm alone.
+  const sqlxGateOff = await page.evaluate(() => {
+    const cur = { id: "srv-fix", kind: "registry" };
+    const b = { configured: true, snapshots: [{ time: "2026-06-10 12:00:00" }] };
+    const st = { sql_export: { state: "idle" } };
+    const keep = capsCache.sql_export;
+    capsCache.sql_export = false;
+    const off = backupSQLExportCard(cur, b, st);
+    capsCache.sql_export = keep;
+    return { off: !!off, on: !!backupSQLExportCard(cur, b, st) };
+  });
+  (!sqlxGateOff.off && sqlxGateOff.on)
+    ? ok("sqlx: the capability gates the card (off absent, on present)")
+    : bad("sqlx: the capability gates the card (off absent, on present)", JSON.stringify(sqlxGateOff));
+
   // The real build. TT_AT sits after every fixture event; the fold reads the
   // baseline AND the index. Poll the status endpoint, not the DOM — the page
   // re-renders itself while the run region is up.
