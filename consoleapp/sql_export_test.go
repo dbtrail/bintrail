@@ -148,6 +148,62 @@ func TestSQLExportRun_failure(t *testing.T) {
 	}
 }
 
+// writeSQLExportBaseline writes a one-table baseline Parquet in the
+// FindBaseline layout (a unit-tag sibling of the integration-tagged
+// writeConsoleBaseline) so a fold can get past table discovery.
+func writeSQLExportBaseline(t *testing.T, snapTime time.Time) string {
+	t.Helper()
+	root := t.TempDir()
+	tableDir := filepath.Join(root, snapTime.UTC().Format("2006-01-02T15-04-05")+"Z", "shop")
+	if err := os.MkdirAll(tableDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cols := []baseline.Column{
+		{Name: "id", MySQLType: "int", ParquetType: baseline.MysqlToParquetNode("int")},
+		{Name: "status", MySQLType: "varchar", ParquetType: baseline.MysqlToParquetNode("varchar")},
+	}
+	w, err := baseline.NewWriter(filepath.Join(tableDir, "orders.parquet"), cols,
+		baseline.WriterConfig{Compression: "none", RowGroupSize: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WriteRow([]string{"1", "new"}, []bool{false, false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// TestSQLExportRun_failureAfterDiscovery: a fold that fails AFTER counting
+// tables (here: unreachable index) must still report zero tables/rows/bytes
+// — attempt-scoped partials on a failed status read as progress.
+func TestSQLExportRun_failureAfterDiscovery(t *testing.T) {
+	sup := newBaselineSupervisor(context.Background(), t.TempDir(), "")
+	at := time.Date(2026, 6, 10, 11, 0, 0, 0, time.UTC)
+	src := writeSQLExportBaseline(t, at.Add(-time.Hour))
+	req := console.SQLExportRequest{ServerID: "srv1", ServerName: "wp",
+		IndexDSN: "i:p@tcp(127.0.0.1:1)/idx", BaselineSrc: src, At: at}
+	sup.mu.Lock()
+	sup.exports["srv1"] = &console.BaselineStatus{State: "running", At: "2026-06-10T11:00:00Z"}
+	dir := filepath.Join(sup.sqlExportRoot("srv1"), "1")
+	sup.exportDirs["srv1"] = dir
+	sup.mu.Unlock()
+	sup.runSQLExport(req, dir)
+
+	st := sup.SQLExportStatus("srv1")
+	if st.State != "failed" || st.LastError == "" {
+		t.Fatalf("status = %+v, want failed with an error", st)
+	}
+	if st.Tables != 0 || st.Rows != 0 || st.Bytes != 0 {
+		t.Fatalf("failed status carries attempt-scoped partials (%d tables, %d rows, %d bytes); a failed build published nothing", st.Tables, st.Rows, st.Bytes)
+	}
+	if _, _, ok := sup.SQLExportDir("srv1"); ok {
+		t.Fatal("a failed build must not be downloadable")
+	}
+}
+
 // TestSQLExportTrigger_stampsInstant: the running status carries the chosen
 // instant from the very first poll, and nothing is downloadable while the
 // build runs.
