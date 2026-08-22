@@ -3609,7 +3609,7 @@ try {
   // purpose: it skips a closed <details>' folded content (each summary line
   // still counts), so fine print stays free while anything unfolded on the
   // open page counts against the cap. The cap (1500)
-  // sits ~60% above the measured page (849-916 chars across the token states)
+  // sits ~50% above the measured page (869-985 chars across the token states)
   // and 35% below the pre-simplify page (2304 measured, RED verified), so a
   // copy edit breathes but a wall of text rings.
   // Limit worth naming: run.sh builds without -ldflags, so this only ever
