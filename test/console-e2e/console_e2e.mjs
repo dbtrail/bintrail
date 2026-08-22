@@ -3621,8 +3621,13 @@ try {
   // for) can satisfy it, and the preview loop for this scenario photographed
   // exactly one such half-built page. .cn-card can only exist after
   // buildConnect ran, and === 3 also rings if a card is dropped.
+  // Tolerant wait: against a page with no .cn-card at all (the M1 mutation,
+  // assets reverted to the pre-simplify page) a bare waitForFunction timeout
+  // ABORTS the suite at this line, hiding the four assertions below and every
+  // later scenario. Catch it and let the assertions report the actual shape.
   await page.waitForFunction(() => location.pathname === "/connect"
-    && document.querySelectorAll(".view .cn-card").length === 3, { timeout: 10000 });
+    && document.querySelectorAll(".view .cn-card").length === 3, { timeout: 15000 })
+    .catch(() => {});
   const cn = await page.evaluate(() => {
     const badges = Array.from(document.querySelectorAll(".view .card .cn-num")).map((n) => n.textContent).join("");
     const labels = Array.from(document.querySelectorAll(".cn-mock .cn-mock-label")).map((n) => n.textContent);
