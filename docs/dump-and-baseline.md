@@ -129,7 +129,7 @@ This dumps **every accessible schema** into `/tmp/mydumper-output` — bare `bin
 | `--mydumper-path` | `mydumper` | Path to the mydumper binary. When set, skips Docker fallback. |
 | `--mydumper-image` | `mydumper/mydumper:latest` | Docker image for mydumper. Used only when no local binary is found. |
 | `--threads` | `4` | Number of parallel dump threads |
-| `--lock-mode` | `ftwrl` | How mydumper syncs its threads onto one instant: `ftwrl` (point-consistent), `lock-all` (point-consistent, needs only LOCK TABLES — use it on managed MySQL), `safe-no-lock` (no extra privilege, aborts rather than emit a torn snapshot), `no-lock` (accepts a torn snapshot) |
+| `--lock-mode` | `ftwrl` | How mydumper syncs its threads onto one instant: `ftwrl` (point-consistent), `lock-all` (point-consistent, needs only LOCK TABLES; use it on managed MySQL), `safe-no-lock` (no extra privilege, aborts rather than emit a torn snapshot), `no-lock` (accepts a torn snapshot) |
 | `--encrypt` | `false` | Encrypt dump files at rest using AES-256-CBC, with an HMAC-SHA256 integrity sidecar per file (requires `openssl` on `$PATH`) |
 | `--encrypt-key` | `~/.config/bintrail/dump.key` | Path to the encryption key file (generate with `bintrail generate-key`) |
 | `--format` | `text` | Output format: `text` or `json` |

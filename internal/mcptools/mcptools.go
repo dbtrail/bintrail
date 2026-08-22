@@ -333,7 +333,7 @@ func NewServer(cfg Config) *mcp.Server {
 			Name: "reconstruct",
 			Description: "Reconstruct a single row's full state at a point in time (time travel). " +
 				"Folds a baseline snapshot with the indexed events after it, so columns never touched " +
-				"in the retained window resolve correctly — unlike `recover`, which only reverses events it has. " +
+				"in the retained window resolve correctly, unlike `recover`, which only reverses events it has. " +
 				"Use history=true for every state transition up to that time. " +
 				"Requires a baseline snapshot produced by `bintrail baseline`.",
 			Annotations: &mcp.ToolAnnotations{
@@ -353,7 +353,7 @@ func NewServer(cfg Config) *mcp.Server {
 			Description: "Generate reversal SQL for rows hit by a foreign-key ON DELETE / ON UPDATE " +
 				"CASCADE or SET NULL (dry-run only). InnoDB runs FK cascades below the binlog, so the plain " +
 				"`recover` tool reverses only the parent change and silently misses the cascade-deleted child " +
-				"rows and rewritten/nulled child FKs — this tool synthesizes those from the index and reverses " +
+				"rows and rewritten/nulled child FKs; this tool synthesizes those from the index and reverses " +
 				"them too. If the synthesis is provably partial the call fails with the reasons unless " +
 				"allow_incomplete is set; always check the `incomplete` list in the result. " +
 				"Review carefully before applying to production.",
@@ -523,7 +523,7 @@ type SchemaChangesArgs struct {
 	// UncoveredOnly narrows results to DDLs with no covering snapshot — the
 	// rows the status tool's "N DDL(s) detected without auto-snapshot" warning
 	// counts, so an agent can go straight from that warning to the exact rows.
-	UncoveredOnly bool `json:"uncovered_only,omitempty" jsonschema:"Return only changes with no covering schema snapshot (snapshot_id is null) — the ones counted by the status tool's uncovered-DDL warning"`
+	UncoveredOnly bool `json:"uncovered_only,omitempty" jsonschema:"Return only changes with no covering schema snapshot (snapshot_id is null); the ones counted by the status tool's uncovered-DDL warning"`
 }
 
 // rejectSurfaceParams enforces the surface's parameter policy: a non-nil
@@ -891,7 +891,7 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		if len(skippedArchives) > 0 {
 			return ErrorResult(fmt.Errorf(
 				"archive source failed and its events cannot be fetched: %s. "+
-					"Refusing to generate a knowingly incomplete reversal script — undoing a partial subset of the matched events can produce a state that never existed. "+
+					"Refusing to generate a knowingly incomplete reversal script: undoing a partial subset of the matched events can produce a state that never existed. "+
 					"Retry with no_archive: true to recover from the live index only (events held by the failed archive will NOT be reversed), or repair the archive source and retry",
 				strings.Join(skippedArchives, ", "))), nil, nil
 		}
@@ -927,7 +927,7 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 			var be *recovery.ScriptBudgetError
 			if errors.As(err, &be) {
 				return ErrorResult(fmt.Errorf(
-					"refusing to generate the reversal script — the matched events hold ~%.1f MiB of row data, "+
+					"refusing to generate the reversal script: the matched events hold ~%.1f MiB of row data, "+
 						"over the %.0f MiB budget for a single recovery. Narrow the recovery filter "+
 						"(schema/table/pk/time range) to shrink the window, or use `bintrail recover` from the CLI "+
 						"for large recoveries (it supports --max-script-bytes to raise or disable this budget)",
@@ -1296,7 +1296,7 @@ func archiveScanIncompleteWarning() string {
 // server log, which is where the diagnosis lives.
 func eventDivergenceWarning(n int) string {
 	return fmt.Sprintf("event_divergence: %d duplicate event(s) disagreed between the live index and an archive copy; the first copy fetched (normally the live index) was used. "+
-		"An archived partition should be a byte-for-byte copy of the index rows — a mismatch means the index row changed after archiving, or two index generations wrote under the same bintrail_id. "+
+		"An archived partition should be a byte-for-byte copy of the index rows; a mismatch means the index row changed after archiving, or two index generations wrote under the same bintrail_id. "+
 		"Per-event detail is in the server log", n)
 }
 

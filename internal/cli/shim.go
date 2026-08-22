@@ -53,7 +53,7 @@ var shimCmd = &cobra.Command{
 	Long: `Run an in-process MySQL-protocol server that answers
 time-travel SQL queries against the three virtual schemas
 _flashback / _snapshot / _diff. Intended to sit behind ProxySQL on the
-same host — see docs/time-travel-sql.md for the end-to-end setup.
+same host; see docs/time-travel-sql.md for the end-to-end setup.
 
 The shim auto-discovers S3 archives via archive_state, so queries that
 reach back beyond the live MySQL index's retention window resolve
@@ -61,7 +61,7 @@ transparently from Parquet. Use --no-archive to disable that and stay
 index-only.
 
 By default, an archive fetch failure or a planner-detected coverage
-gap aborts the customer's query with a MySQL protocol error — the
+gap aborts the customer's query with a MySQL protocol error; the
 client has no stderr channel, so silent partial results are worse than
 a loud failure. Use --allow-gaps to fall back to warn-and-continue
 (matches bintrail recover's behaviour).

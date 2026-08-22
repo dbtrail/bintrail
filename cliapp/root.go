@@ -38,7 +38,7 @@ var rootCmd = &cobra.Command{
 	Short: "MySQL binlog indexer and recovery tool",
 	Long: `Bintrail parses MySQL ROW-format binary logs, indexes every row event into a
 MySQL table with full before/after images, and provides query and recovery
-capabilities. The index is self-contained — recovery does not depend on
+capabilities. The index is self-contained; recovery does not depend on
 binlog files still existing on disk.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		observe.Setup(os.Stderr, logFormat, logLevel)

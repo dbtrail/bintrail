@@ -43,12 +43,12 @@ registry row each file implies, and diffs against archive_state:
                            auto-discovery and planner coverage after an
                            index rebuild)
   - rows without files   → reported; --prune deletes them (registry rows
-                           only — data files are NEVER touched)
+                           only; data files are NEVER touched)
   - metadata drift       → --repair updates (file size always; row counts
                            only under --deep, which reads Parquet footers)
 
 The default is a DRY-RUN that prints the drift and exits non-zero when any
-exists — safe to run from cron as a drift monitor.
+exists; safe to run from cron as a drift monitor.
 
 Safety rules:
   - a row is only a prune candidate when EVERY backend it references was
@@ -63,7 +63,7 @@ Safety rules:
     to allow those prunes (the vouch is per-backend so it can never
     disarm the gate for the other, possibly misconfigured one; vouched
     prunes are marked in their reason). Note --repair's column clears
-    deliberately keep trusting an empty scan — they are reversible and
+    deliberately keep trusting an empty scan; they are reversible and
     the other backend's file was verified present for that partition
   - repair is backend-scoped: a local-only run never touches S3 columns
 

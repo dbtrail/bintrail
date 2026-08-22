@@ -28,18 +28,18 @@ var statusCmd = &cobra.Command{
   - Partitions     : all time-range partitions with estimated row counts
   - Summary        : aggregate file and event counts
 
-The Stream section also reports continuity — the cheap "did I lose any events?"
+The Stream section also reports continuity: the cheap "did I lose any events?"
 verdict: "no gaps in the captured range" (a contiguity check, not a liveness
 one), or a loud "GAP LOST" when an unfillable gap forced an auto-advance with
-permanent loss. Pass --fail-on-gap to exit non-zero on that loss — or when
+permanent loss. Pass --fail-on-gap to exit non-zero on that loss, or when
 continuity can't be confirmed (fails closed), or when the capture ledger
 records ANY dropped events (statement-format DML, column-count mismatches, …;
-all the same permanent-loss class) — for CI/cron alerting; by default a gap
+all the same permanent-loss class), for CI/cron alerting; by default a gap
 never changes the exit code.
 
 Freshness is the liveness half continuity is not: "current" (checkpointing and
 indexing recent events), "idle" (checkpointing, nothing recent) or "stalled"
-(the checkpoint itself is stale — the daemon, not the workload). Offline,
+(the checkpoint itself is stale; the daemon, not the workload). Offline,
 "idle" cannot distinguish a quiet source from one whose capture is far behind;
 the daemon's bintrail_stream_index_commit_latency_seconds metric can. Pass
 --fail-on-lag <duration> to exit non-zero on a stall, on an unevaluable

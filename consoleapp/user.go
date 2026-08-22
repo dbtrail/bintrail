@@ -54,7 +54,7 @@ var userSetPasswordCmd = &cobra.Command{
 
 Prompts twice on a terminal; use --password-stdin to read one line from stdin
 in scripts. A running server honors the new password on the next login
-attempt without a restart (live sessions survive a CLI rotation — rotate from
+attempt without a restart (live sessions survive a CLI rotation; rotate from
 the console UI to also revoke them).`,
 	RunE: runUserSetPassword,
 }

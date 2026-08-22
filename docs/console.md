@@ -34,7 +34,7 @@ Bintrail console (read-only) is running. Open:
 
     http://127.0.0.1:8090/
 
-First run — open the URL and create your console username and password.
+First run: open the URL and create your console username and password.
 ```
 
 Or serve it **alongside a live stream** in one process with
@@ -720,7 +720,7 @@ $ bintrail-console user set-password
 New console password: ********
 Retype to confirm: ********
 Console password set for user "admin" (~/.config/bintrail/console-auth.yaml).
-A running server accepts it on the next login — no restart needed.
+A running server accepts it on the next login; no restart needed.
 ```
 
 - **First-run setup is loopback-only.** The unauthenticated `POST

@@ -20,7 +20,7 @@ to serve time-travel SQL: ` + "`SELECT * FROM _flashback.<table> AS OF '<ts>'" +
 Reads BINTRAIL_SOURCE_DSN and BINTRAIL_SERVER_ID from .bintrail.env (or the
 environment) to populate the tenant block. The mysql_user / mysql_password
 credentials your application uses to connect through ProxySQL are emitted
-as TODO comments — fill them in by hand. The shim validates both the
+as TODO comments; fill them in by hand. The shim validates both the
 username and the cleartext password; bintrail proxysql-config recomputes
 the SHA1 from mysql_password for ProxySQL's own user table.
 

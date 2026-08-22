@@ -37,7 +37,7 @@ var agentCmd = &cobra.Command{
 	Long: `Start an outbound agent channel to the dbtrail service. The agent opens a
 WebSocket connection to dbtrail, authenticates with its API key, and listens
 for commands (resolve_pk, recover, forensics_query). No inbound ports are
-required — all communication is initiated by the agent.
+required; all communication is initiated by the agent.
 
 The connection auto-reconnects with exponential backoff on failure and sends
 periodic heartbeats to report agent status.

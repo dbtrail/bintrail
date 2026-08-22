@@ -37,7 +37,7 @@ var watchCmd = &cobra.Command{
 	Short: "Watch one or more MySQL servers: stream + console + control plane in one daemon",
 	Long: `Runs the combined capture-and-observe daemon (the standalone successor to
 'bintrail up --console'): preflight checks, index initialization, the live
-replication stream, AND the read-only web console with its control plane —
+replication stream, AND the read-only web console with its control plane,
 all in one process sharing one SIGINT/SIGTERM lifecycle.
 
 --source-dsn is optional: without it the daemon starts source-less (the

@@ -26,7 +26,7 @@ var serveCmd = &cobra.Command{
 	Long: `Starts a local, read-only, single-operator web console over the binlog index.
 
 It is the MCP server with a web face: browse indexed row events with full
-before/after diffs, and generate recovery (undo) SQL — all from a browser. The
+before/after diffs, and generate recovery (undo) SQL, all from a browser. The
 console NEVER executes SQL; recover produces a script you review and apply
 yourself.
 
@@ -36,7 +36,7 @@ Security:
     the password in the browser (or set it up front with 'user set-password').
   - A non-loopback bind needs a credential: a configured password, an explicit
     --token (opt-in automation), or --allow-setup (assert the bind is
-    access-controlled) — otherwise it is refused.
+    access-controlled); otherwise it is refused.
 
 Example:
   bintrail-console serve --index-dsn "user:pass@tcp(127.0.0.1:3306)/binlog_index"`,

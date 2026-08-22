@@ -595,7 +595,7 @@ func recoverChainVerdict(out recoverChainOutcome, mismatchCount int, firstMismat
 
 	var notes []string
 	if out.ChainsNoPredecessor > 0 {
-		notes = append(notes, fmt.Sprintf("%d row(s) had no earlier change inside this window, so their first change had nothing to compare against", out.ChainsNoPredecessor))
+		notes = append(notes, fmt.Sprintf("%d row(s) reached a change with no known earlier state to compare against", out.ChainsNoPredecessor))
 	}
 	if unresolved > 0 {
 		notes = append(notes, fmt.Sprintf("%d comparison(s) could not be settled; first: %s", unresolved, firstUnresolved))

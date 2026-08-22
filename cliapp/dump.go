@@ -37,7 +37,7 @@ var dumpCmd = &cobra.Command{
 	Long: `Invokes mydumper to create a logical dump of the source MySQL instance.
 Only one dump may run at a time (enforced by a lockfile). Source connectivity is
 verified before the output directory is touched. An existing output directory is
-only cleared when it is empty or a recognizable prior dump — a recognizable prior
+only cleared when it is empty or a recognizable prior dump; a recognizable prior
 dump is moved aside and restored if this dump fails; a non-empty directory that
 is not a dump is refused rather than deleted.`,
 	RunE: runDump,

@@ -27,31 +27,31 @@ import (
 var restoreIndexCmd = &cobra.Command{
 	Use:   "restore-index",
 	Short: "Rebuild a lost index database from the Parquet archive tier",
-	Long: `Turns the archive tier back into a working index — the recovery story
+	Long: `Turns the archive tier back into a working index: the recovery story
 for the one stateful component that had none ("who backs up the backup"):
 
   1. Refuses an index that already holds state (events, a stream position,
-     or schema snapshots) — restore-index is for a FRESH index: mixing a
+     or schema snapshots); restore-index is for a FRESH index: mixing a
      partial restore into surviving state creates positions nothing can
      reason about (a surviving stream_state row would make the restarted
      stream resume a stale position and fake continuity across the hole).
   2. Creates the index schema (the same table set as 'bintrail init';
-     pass --encrypt if the lost index was encrypted — parity is NOT
+     pass --encrypt if the lost index was encrypted; parity is NOT
      inferred).
   3. Scans the Hive archive layout (--archive-dir or --archive-s3), then
      re-partitions binlog_events to cover exactly the archived hours plus
-     a forward horizon (one ALTER on the empty table — instant), and
+     a forward horizon (one ALTER on the empty table, instant), and
      bulk-loads every archived partition back, rebuilding archive_state
      from the scan (it is a rebuildable cache by design).
   4. Restores schema_snapshots and server identity from the index-meta
-     sidecar that rotation persists alongside the archives — when present
+     sidecar that rotation persists alongside the archives; when present
      and readable.
   5. Reports what was and was NOT recovered, and the next steps. A failed
      file leaves the index PARTIAL: the report says so, and a retry needs
      a fresh (dropped and recreated) database.
 
 Deliberately NOT recovered (and never persisted): stream_state and
-index_state — a replication position that survived an index loss is stale,
+index_state; a replication position that survived an index loss is stale,
 and resuming from it would fake continuity. Restart the stream cleanly; the
 continuity verdict then reports the seam honestly instead of pretending.
 

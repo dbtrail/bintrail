@@ -249,7 +249,7 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 		// the one tool here that reads data the redaction pass cannot cover.
 		if t.ProfileActive {
 			return ErrorResult(errors.New(
-				"time-travel is unavailable while an access-control profile is active — baseline reads aren't redacted")), nil, nil
+				"time-travel is unavailable while an access-control profile is active: baseline reads aren't redacted")), nil, nil
 		}
 
 		find, err := resolveBaselineLookup(cfg, t, args)
@@ -495,7 +495,7 @@ func reconstructFetchError(err error) error {
 		// the leak rule forbids flag spellings the client would pass on its
 		// own surface — here, `--allow-gaps`.
 		return fmt.Errorf("%w; the reconstruction would be silently incomplete. "+
-			"Gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too — "+
+			"Gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too; "+
 			"if archives exist in storage, have the operator run `bintrail archive reconcile --repair --index-dsn ... --archive-s3 s3://...` (or --archive-dir) to repopulate archive_state, then retry. "+
 			"Otherwise re-run with allow_gaps: true to accept a known-incomplete result, or narrow `at` to a covered window", err)
 	}
@@ -529,7 +529,7 @@ func reconstructElisionNotes(archivesElided bool) []string {
 	// The FACT, not the reason: the flag does not say which proof fired, so
 	// the wording must stay true under any future fifth proof.
 	return []string{"This state was computed from the live index; the registered archives were not " +
-		"read because they provably could not change this result — nothing is missing here."}
+		"read because they provably could not change this result; nothing is missing here."}
 }
 
 // reconstructWarnings assembles the non-fatal caveats attached to a successful

@@ -229,7 +229,7 @@ no address, no network path:
 $ go build ./cmd/bintrail && ./bintrail telemetry status
 Telemetry:    OFF
 Consent:      on (decided by: default)
-Endpoint:     not compiled in — this build cannot send anything
+Endpoint:     not compiled in; this build cannot send anything
 ```
 
 This is the assertion a distribution packager needs (Debian and Fedora both

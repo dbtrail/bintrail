@@ -4273,7 +4273,7 @@ function verifyRegions(servers, opts) {
     el("summary", { class: "form-adv-summary", text: "What these words mean" }),
     el("p", { class: "form-hint", text: "Row history: every recorded change to one row, oldest to newest. The check walks each row's history in order." }),
     el("p", { class: "form-hint", text: "Before-image: each update or delete stores what the row looked like just before it. The check compares that against what the previous change left. Undo scripts are built from these images." }),
-    el("p", { class: "form-hint", text: "No earlier change in the window: this run saw a change without anything older to compare it against. A longer window may reach the history it needs (CLI: verify --check recover --lookback)." }),
+    el("p", { class: "form-hint", text: "No known earlier state: the check saw a change but held nothing older to compare it against. A longer window may reach the history it needs (CLI: verify --check recover --lookback)." }),
     el("p", { class: "form-hint", text: "Nothing to check: the table did not change, or only gained new rows. Zero comparisons is the expected result there, not a finding." })));
 
   // ── Region 3: what ran before ──

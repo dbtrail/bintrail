@@ -99,7 +99,7 @@ Examples:
     --at "2026-04-01 15:30:00" \
     --output-format mydumper --output-dir ./dump-at-1530
 
-  # Refresh the baselines from the index itself — no mydumper, no source
+  # Refresh the baselines from the index itself: no mydumper, no source
   bintrail reconstruct --index-dsn "..." \
     --tables mydb.orders,mydb.users --baseline-dir /data/baselines \
     --output-format parquet --output-dir /data/baselines
@@ -113,7 +113,7 @@ Examples:
   bintrail reconstruct --index-dsn "..." --schema mydb --table orders \
     --pk 12345 --pk-columns id --baseline-dir /data/baselines --history
 
-  # Baseline snapshot only — no binlog replay, no --index-dsn needed
+  # Baseline snapshot only: no binlog replay, no --index-dsn needed
   bintrail reconstruct --schema mydb --table orders \
     --pk 12345 --pk-columns id --baseline-dir /data/baselines --baseline-only
 
@@ -446,7 +446,7 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 			// The rebuilt-index case (archive_state empty, hours rotated out of
 			// MySQL) also lands here; name the non-lossy remedy before the
 			// lossy one (#961).
-			return fmt.Errorf("%w; gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too — if archives exist in storage, run `bintrail archive reconcile --repair --index-dsn ... --archive-s3 s3://...` (or --archive-dir) to repopulate archive_state and retry, or pass --allow-gaps to proceed with an incomplete reconstruction", err)
+			return fmt.Errorf("%w; gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too; if archives exist in storage, run `bintrail archive reconcile --repair --index-dsn ... --archive-s3 s3://...` (or --archive-dir) to repopulate archive_state and retry, or pass --allow-gaps to proceed with an incomplete reconstruction", err)
 		}
 		var emptyErr *query.SourceEmptyError
 		if errors.As(err, &emptyErr) {

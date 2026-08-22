@@ -75,7 +75,7 @@ schemas to the dbtrail-shim hostgroup and everything else to the customer's
 real MySQL.
 
 Reads BINTRAIL_SOURCE_DSN from .bintrail.env (host of the passthrough
-backend) and shim.yaml (tenant credentials). The SQL is idempotent —
+backend) and shim.yaml (tenant credentials). The SQL is idempotent;
 re-running it produces the same final state.
 
 Use --out - to write to stdout instead of a file.`,

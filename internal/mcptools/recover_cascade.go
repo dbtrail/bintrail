@@ -238,7 +238,7 @@ func MakeRecoverCascadeTool(cfg Config) func(context.Context, *mcp.CallToolReque
 			r, rerr := metadata.NewResolver(t.DB, 0)
 			if rerr != nil {
 				toolWarnings = append(toolWarnings,
-					"no schema snapshot is available ("+rerr.Error()+"); recovery INSERTs use full row images, and any FK restorations would fail — run `bintrail snapshot`")
+					"no schema snapshot is available ("+rerr.Error()+"); recovery INSERTs use full row images, and any FK restorations would fail; run `bintrail snapshot`")
 				r = nil
 			}
 			resolver = r
@@ -366,7 +366,7 @@ func MakeRecoverCascadeTool(cfg Config) func(context.Context, *mcp.CallToolReque
 		// gaps hide in a comment banner it may never read.
 		if len(caveats) > 0 && !args.AllowIncomplete {
 			return ErrorResult(fmt.Errorf(
-				"the cascade recovery is INCOMPLETE — the synthesized reversal is provably partial (no script generated):%s\n"+
+				"the cascade recovery is INCOMPLETE: the synthesized reversal is provably partial (no script generated):%s\n"+
 					"Review the reasons above, then re-run with allow_incomplete: true to receive the partial script; "+
 					"the caveats are reported back in the result's `incomplete` list and inside the script's INCOMPLETE RECOVERY banner",
 				formatCascadeCaveats(caveats))), nil, nil
@@ -405,7 +405,7 @@ func MakeRecoverCascadeTool(cfg Config) func(context.Context, *mcp.CallToolReque
 			var be *recovery.ScriptBudgetError
 			if errors.As(err, &be) {
 				return ErrorResult(fmt.Errorf(
-					"refusing to generate the cascade reversal script — the matched events hold ~%.1f MiB of row data, "+
+					"refusing to generate the cascade reversal script: the matched events hold ~%.1f MiB of row data, "+
 						"over the %.0f MiB budget for a single recovery. Narrow the filter (pk/since/until) to shrink "+
 						"the window, or use `bintrail recover-cascade` from the CLI for large cascades",
 					float64(be.EstimatedBytes)/(1<<20), float64(be.Budget)/(1<<20))), nil, nil
