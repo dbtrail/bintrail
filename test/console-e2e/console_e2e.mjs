@@ -1685,6 +1685,23 @@ try {
     asof: (document.querySelector(".cov-card .cov-asof") || {}).textContent || "",
     tzChips: document.querySelectorAll(".tz-chip").length,
   }));
+  // #1421: the tint layer is RENDERED, not merely classed. Asserted as
+  // computed background because that is the only thing the operator sees — a
+  // cascade rule beating the tint would leave the classes in the DOM and the
+  // panels white, and no grep can see a cascade. The two panels must differ
+  // from each other (violet vs sun) and from plain white; the pill eyebrow
+  // must render on a distinct surface from its card.
+  const tint = await page.evaluate(() => {
+    const bg = (sel) => { const n = document.querySelector(sel); return n ? getComputedStyle(n).backgroundColor : null; };
+    return { violet: bg(".ov-panel.tcard-violet"), sun: bg(".ov-panel.tcard-sun"),
+             pill: bg(".ov-panel.tcard-violet .tag-pill"), white: "rgb(255, 255, 255)" };
+  });
+  (tint.violet && tint.sun && tint.violet !== tint.white && tint.sun !== tint.white && tint.violet !== tint.sun)
+    ? ok("overview (live): the two panels render the home tint layer (violet ≠ sun ≠ white)")
+    : bad("overview (live): the two panels render the home tint layer (violet ≠ sun ≠ white)", JSON.stringify(tint));
+  (tint.pill && tint.pill !== tint.violet)
+    ? ok("overview (live): the pill eyebrow renders on its own surface inside the tinted card")
+    : bad("overview (live): the pill eyebrow renders on its own surface inside the tinted card", JSON.stringify(tint));
   ovLive.scopes.every((s) => s.trim() !== "")
     ? ok("overview (live): every rendered tile carries a scope line")
     : bad("overview (live): every rendered tile carries a scope line", JSON.stringify(ovLive.scopes));

@@ -263,6 +263,28 @@
   --title-tracking: -0.02em;
   --rail: var(--line);
 
+  /* home-surface language (#1421): the site's tint palette, with text
+     partners DARKENED to hold the AA floors the site's own deep values miss.
+     Measured before choosing (WCAG ratio on the tint): site --pink-deep
+     #D9367A lands 3.83:1, --orange-deep #C2611B 3.77:1, the sun tag text
+     #9A7800 3.84:1, bare --violet 3.68:1 — every one below the 4.5:1 floor
+     this file's ink ramp is verified against. The -deep values below all
+     clear 5.2:1 on their tint and on white. Decorative use only: the
+     semantic INSERT/UPDATE/DELETE mapping above stays reserved, and pink/
+     orange stay away from surfaces that carry event data (a pink panel
+     behind DELETE badges would dissolve the one color code operators rely
+     on). */
+  --violet-tint: #EFE9FF;
+  --violet-deep: #5A3BD6;
+  --sun-tint:    #FFF6D8;
+  --sun-deep:    #7A5F00;
+  --pink-tint:   #FFE9F5;
+  --pink-deep:   #B02762;
+  --orange-tint: #FFF1E2;
+  --orange-deep: #A04E10;
+  /* the bento card radius — a step above --radius, never replacing it */
+  --radius-lg: 20px;
+
   --shell-w: 248px;
   --ease: cubic-bezier(.22, .61, .36, 1);
   --ease-out: cubic-bezier(.16, 1, .3, 1);
@@ -1295,12 +1317,52 @@ button { font-family: inherit; }
 [data-density="compact"] .page-head { margin-bottom: 22px; }
 
 /* ============================================================
+   home-surface card recipe (#1421) — the site's bento language as
+   reusable console classes. A tinted card's tint IS its edge
+   (border-color transparent); white cards keep the hairline. The
+   pill is the eyebrow: mono, uppercase, white-on-tint, colored by
+   the card's -deep partner. Motion deliberately subtler than the
+   site's hover lift-and-rotate: this is a working surface read
+   during incidents, and the playful register stays on the landing
+   page.
+   ============================================================ */
+.tcard {
+  border-radius: var(--radius-lg); border: 1px solid var(--line);
+  background: var(--surface); padding: 20px 22px; min-width: 0;
+}
+.tcard.violet { background: var(--violet-tint); border-color: transparent; }
+.tcard.sun    { background: var(--sun-tint);    border-color: transparent; }
+.tcard.pink   { background: var(--pink-tint);   border-color: transparent; }
+.tcard.orange { background: var(--orange-tint); border-color: transparent; }
+.tag-pill {
+  display: inline-block; font-family: var(--f-mono); font-size: 10.5px;
+  font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 4px 11px; border-radius: 999px;
+  background: var(--surface-3); color: var(--ink-2);
+}
+.tcard.violet .tag-pill { background: var(--surface); color: var(--violet-deep); }
+.tcard.sun    .tag-pill { background: var(--surface); color: var(--sun-deep); }
+.tcard.pink   .tag-pill { background: var(--surface); color: var(--pink-deep); }
+.tcard.orange .tag-pill { background: var(--surface); color: var(--orange-deep); }
+/* the dark code block: SQL and DSNs on ink, the strongest same-product
+   signal the site sends. Defined with the recipe; the page sweeps
+   (#1415/#1419) adopt it where code is rendered. */
+.code-ink {
+  background: var(--ink); color: oklch(0.93 0.02 300);
+  border-radius: var(--radius); padding: 12px 15px;
+  font-family: var(--f-mono); font-size: 12.5px; line-height: 1.55;
+  overflow-x: auto;
+}
+
+/* ============================================================
    overview / dashboard
    ============================================================ */
 .ov-stats { display: grid; grid-template-columns: repeat(3, 1fr) 1.4fr; gap: 16px; margin-bottom: 24px; }
 .ov-stat {
-  background: var(--panel-bg); border: 1px solid var(--panel-border);
-  border-radius: var(--radius); padding: 18px 20px; box-shadow: var(--panel-shadow);
+  /* white bento card (#1421): the site's own console mock keeps the stat
+     tiles white — the tint layer is for the panels below. */
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius-lg); padding: 18px 20px; box-shadow: var(--panel-shadow);
 }
 [data-dir="paper"] .ov-stat { background: transparent; border-color: var(--line); }
 .ov-stat-v { font-family: var(--f-display); font-size: 32px; font-weight: 600; letter-spacing: -0.02em; line-height: 1; color: var(--ink); }
@@ -1336,8 +1398,15 @@ button { font-family: inherit; }
 .ov-grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 18px; align-items: start; }
 .ov-panel {
   background: var(--panel-bg); border: 1px solid var(--panel-border);
-  border-radius: var(--radius); padding: 6px 6px 8px; box-shadow: var(--panel-shadow);
+  border-radius: var(--radius-lg); padding: 10px 10px 12px; box-shadow: var(--panel-shadow);
 }
+/* the two Overview panels take the tint layer (#1421). Violet and sun are
+   the STRUCTURE tints — pink/orange stay away from event data by rule. The
+   tint is the edge; the hairline goes. */
+.ov-panel.tcard-violet { background: var(--violet-tint); border-color: transparent; }
+.ov-panel.tcard-sun    { background: var(--sun-tint);    border-color: transparent; }
+.ov-panel.tcard-violet .tag-pill { background: var(--surface); color: var(--violet-deep); }
+.ov-panel.tcard-sun    .tag-pill { background: var(--surface); color: var(--sun-deep); }
 [data-dir="paper"] .ov-panel { background: transparent; border-color: var(--line); }
 .ov-panel-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 14px 10px; }
 .ov-panel-title { font-family: var(--title-font); font-weight: 600; font-size: 15px; letter-spacing: -0.01em; margin: 0; color: var(--ink); }

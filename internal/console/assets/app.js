@@ -1145,9 +1145,12 @@ function ovFrame() {
 
   const grid = el("div", { class: "ov-grid" });
 
-  f.recentPanel = el("section", { class: "ov-panel" });
+  // The two panels carry the home's tint layer (#1421): violet and sun, the
+  // structure tints. The pill is the eyebrow — the title stays an h2 for the
+  // document outline; the pill is presentation, not the heading.
+  f.recentPanel = el("section", { class: "ov-panel tcard-violet" });
   f.recentPanel.append(el("div", { class: "ov-panel-head" },
-    el("h2", { class: "ov-panel-title", text: "Recent changes" }),
+    el("h2", { class: "ov-panel-title" }, el("span", { class: "tag-pill", text: "Recent changes" })),
     tzChip(),
     el("a", { class: "btn btn-sm btn-ghost", href: "/events",
       onclick: (e) => { e.preventDefault(); navigate("events"); }, text: "Browse all events ›" })));
@@ -1156,9 +1159,9 @@ function ovFrame() {
   f.recentPanel.append(f.recentBody);
   grid.append(f.recentPanel);
 
-  f.tablesPanel = el("section", { class: "ov-panel" });
+  f.tablesPanel = el("section", { class: "ov-panel tcard-sun" });
   f.tablesHead = el("div", { class: "ov-panel-head" },
-    el("h2", { class: "ov-panel-title", text: "Activity by table" }));
+    el("h2", { class: "ov-panel-title" }, el("span", { class: "tag-pill", text: "Activity by table" })));
   f.tablesPanel.append(f.tablesHead);
   f.tablesBody = el("div", { class: "ov-tables" });
   f.tablesBody.append(ovSkelLines(4), el("div", { class: "skel-note", text: "computing window activity…" }));
