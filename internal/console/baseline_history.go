@@ -15,9 +15,9 @@ const BaselineRunHistoryCap = 40
 
 // Kind values for BaselineRunRecord. The literals are the file/wire format.
 const (
-	BaselineRunDump    = "dump"    // mydumper (or pgbaseline) snapshot of the source
-	BaselineRunRefresh = "refresh" // periodic fold of the newest snapshot forward
-	BaselineRunRestore = "restore" // operator-chosen point-in-time fold (#backups)
+	BaselineRunDump      = "dump"       // mydumper (or pgbaseline) snapshot of the source
+	BaselineRunRefresh   = "refresh"    // periodic fold of the newest snapshot forward
+	BaselineRunRestore   = "restore"    // operator-chosen point-in-time fold (#backups)
 	BaselineRunSQLExport = "sql-export" // custom .sql dump build (downloaded, publishes no snapshot)
 )
 

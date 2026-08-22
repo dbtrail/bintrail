@@ -13,6 +13,7 @@
 // optional PW_CHANNEL (e.g. "chrome" to use system Chrome instead of the
 // playwright-managed chromium).
 import { chromium } from "playwright";
+import zlib from "node:zlib";
 
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:8090";
 const TOKEN = process.env.CONSOLE_TOKEN || "";
@@ -2148,6 +2149,105 @@ try {
   (bkErr.noFlags && bkErr.bothTables && bkErr.terminated)
     ? ok("backups: fold refusals lose their CLI flags without losing table identities")
     : bad("backups: fold refusals lose their CLI flags without losing table identities", JSON.stringify(bkErr));
+
+  // Scenario 15f — the made-to-measure .sql backup: pick an instant, the
+  // daemon folds the nearest earlier backup forward through the index and
+  // hands out a mydumper-format dump. Driven END TO END against the fixture:
+  // baseline rows 1,2,4 + INSERT id 3 + UPDATE id 1 (-> shipped) + DELETE
+  // id 2, built at TT_AT (after all three), so the dump must carry the folded
+  // state — not the baseline, not the raw events.
+  const sqlxGate = await page.evaluate(async () => {
+    const out = { cap: !!capsCache.sql_export };
+    const v = document.querySelector(".view");
+    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    out.card = !!card;
+    if (!card) return out;
+    card.open = true;
+    const input = card.querySelector("input");
+    out.prefilled = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(input.value);
+    // Before any build the download must refuse with words, not stream bytes.
+    const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
+    if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+    const res = await fetch("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export/download", { headers });
+    out.preStatus = res.status;
+    try { out.preBody = (await res.json()).error || ""; } catch (_) { out.preBody = ""; }
+    // A bad instant is refused inline, next to the input.
+    input.value = "not-a-time";
+    Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Build").click();
+    for (let i = 0; i < 40; i++) {
+      const msg = card.querySelector(".form-msg.err");
+      if (msg && !msg.hidden && msg.textContent) { out.inlineErr = msg.textContent; break; }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return out;
+  });
+  (sqlxGate.cap && sqlxGate.card && sqlxGate.prefilled)
+    ? ok("sqlx: the build card renders under its capability, prefilled with the newest backup time")
+    : bad("sqlx: the build card renders under its capability, prefilled with the newest backup time", JSON.stringify(sqlxGate));
+  (sqlxGate.preStatus === 409 && /build one first/.test(sqlxGate.preBody))
+    ? ok("sqlx: downloading before any build refuses with words")
+    : bad("sqlx: downloading before any build refuses with words", JSON.stringify({ s: sqlxGate.preStatus, b: sqlxGate.preBody }));
+  (sqlxGate.inlineErr && /UTC time/.test(sqlxGate.inlineErr))
+    ? ok("sqlx: a bad instant is refused inline")
+    : bad("sqlx: a bad instant is refused inline", JSON.stringify(sqlxGate.inlineErr));
+
+  // The real build. TT_AT sits after every fixture event; the fold reads the
+  // baseline AND the index. Poll the status endpoint, not the DOM — the page
+  // re-renders itself while the run region is up.
+  const sqlxRun = await page.evaluate(async (TT_AT) => {
+    const v = document.querySelector(".view");
+    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    if (!card) return { err: "card vanished" };
+    card.open = true;
+    const input = card.querySelector("input");
+    input.value = TT_AT;
+    Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Build").click();
+    for (let i = 0; i < 240; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        const st = await api("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export");
+        if (st.sql_export && st.sql_export.state !== "running" && st.sql_export.state !== "idle") return st.sql_export;
+      } catch (_) { /* transient; keep polling */ }
+    }
+    return { err: "build never settled" };
+  }, TT_AT);
+  (sqlxRun.state === "succeeded" && sqlxRun.rows === 3 && sqlxRun.tables === 1)
+    ? ok("sqlx: the fold succeeds over the real fixture with the folded row count (1+3+4, not 4 rows)")
+    : bad("sqlx: the fold succeeds over the real fixture with the folded row count (1+3+4, not 4 rows)", JSON.stringify(sqlxRun));
+
+  // Settle: the watcher re-renders when the run finishes; the card must come
+  // back wearing the Ready line and a download action.
+  await page.waitForFunction(() => {
+    const v = document.querySelector(".view");
+    if (!v) return false;
+    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    return !!card && /Ready: every table as of/.test(card.textContent) &&
+      Array.from(card.querySelectorAll("button")).some((b) => /Download \.sql backup/.test(b.textContent));
+  }, { timeout: 30000 });
+  ok("sqlx: after the run settles the card offers the finished build for download");
+
+  // The download wire: gunzip the archive in node and read the actual SQL.
+  const sqlxDl = await page.evaluate(async () => {
+    const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
+    if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+    const res = await fetch("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export/download", { headers });
+    const buf = new Uint8Array(await res.arrayBuffer());
+    return { status: res.status, cd: res.headers.get("Content-Disposition") || "", bytes: Array.from(buf) };
+  });
+  let sqlxText = "";
+  try { sqlxText = zlib.gunzipSync(Buffer.from(sqlxDl.bytes)).toString("latin1"); } catch (_) { /* asserted below */ }
+  (sqlxDl.status === 200 && /dbtrail-sql-.*\.tar\.gz/.test(sqlxDl.cd) && sqlxText.length > 0)
+    ? ok("sqlx: the download streams a gzip archive with an attachment name")
+    : bad("sqlx: the download streams a gzip archive with an attachment name", JSON.stringify({ s: sqlxDl.status, cd: sqlxDl.cd, n: sqlxDl.bytes.length }));
+  (/-schema\.sql/.test(sqlxText) && /CREATE TABLE/.test(sqlxText) && /INSERT INTO/.test(sqlxText) && /metadata/.test(sqlxText))
+    ? ok("sqlx: the archive holds loadable SQL — schema, rows and the coordinates file")
+    : bad("sqlx: the archive holds loadable SQL — schema, rows and the coordinates file", sqlxText.slice(0, 200));
+  (/shipped/.test(sqlxText) && !/b@example\.com/.test(sqlxText) && !/_SUCCESS/.test(sqlxText))
+    ? ok("sqlx: the dump carries the FOLDED state (the update landed, the deleted row is gone, the build markers stay out)")
+    : bad("sqlx: the dump carries the FOLDED state (the update landed, the deleted row is gone, the build markers stay out)", JSON.stringify({ shipped: /shipped/.test(sqlxText), deleted: /b@example\.com/.test(sqlxText), marker: /_SUCCESS/.test(sqlxText) }));
 
   // Scenario 15d — Protect group (#1384). Baselines and verification moved off
   // Settings > Storage into their own routes. Two halves must hold TOGETHER,
