@@ -3803,7 +3803,10 @@ try {
   const skelPulseWorst = skelPhases.every(skelEnough)
     ? skelPhases.reduce((w, s) => (!w || s.ratio < w.ratio ? s : w), null)
     : null;
-  const skelR = (s) => s && +s.ratio.toFixed(3);
+  // ratio can be ABSENT (a phase whose screenshot sampled no bars spreads {}
+  // into the entry) — and this reporter runs precisely when that happens, so
+  // it must render the hole as null, not abort the whole suite reporting it.
+  const skelR = (s) => (s && s.ratio != null) ? +s.ratio.toFixed(3) : null;
   const skelDetail = () => JSON.stringify({
     bars: skelBars,
     rest: Object.fromEntries(skelShots.map(([d, s]) => [d, skelR(s)])),
