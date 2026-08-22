@@ -3545,6 +3545,35 @@ try {
     ? ok("tropical: page titles wear the headline gradient")
     : bad("tropical: page titles wear the headline gradient", JSON.stringify({ clip: trop.titleClip, c: trop.titleColor }));
 
+  // Two remap side effects with their own guards. Selection: ::selection
+  // resolves var() against the originating element, so the sidebar's
+  // near-white ink landed on the sun highlight at 1.32:1 until restated —
+  // dark ink must come back. Haze: background-attachment local is what
+  // keeps scrolled list headers off the haze peak; a background shorthand
+  // edit on .main silently resets it to scroll.
+  const tropSide = await page.evaluate(() => {
+    const lum = (c) => {
+      const cv = document.createElement("canvas");
+      cv.width = cv.height = 1;
+      const ctx = cv.getContext("2d");
+      ctx.fillStyle = c;
+      ctx.fillRect(0, 0, 1, 1);
+      const d = ctx.getImageData(0, 0, 1, 1).data;
+      return (0.2126 * d[0] + 0.7152 * d[1] + 0.0722 * d[2]) / 255;
+    };
+    const meta = document.querySelector(".side-meta");
+    return {
+      selLum: meta ? lum(getComputedStyle(meta, "::selection").color) : -1,
+      attachment: getComputedStyle(document.querySelector(".main")).backgroundAttachment,
+    };
+  });
+  (tropSide.selLum >= 0 && tropSide.selLum < 0.4)
+    ? ok("tropical: sidebar text selection keeps dark ink on the sun highlight")
+    : bad("tropical: sidebar text selection keeps dark ink on the sun highlight", "lum " + tropSide.selLum.toFixed(3));
+  /^local/.test(tropSide.attachment)
+    ? ok("tropical: the haze is anchored to scroll content, not the viewport")
+    : bad("tropical: the haze is anchored to scroll content, not the viewport", tropSide.attachment);
+
   // The card tint rotation, on the page from the user's own screenshot. Two
   // distinct tinted grounds prove rotation; "not white" alone would pass a
   // single flat tint.

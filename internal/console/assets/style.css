@@ -2525,6 +2525,11 @@ button { font-family: inherit; }
    the platform's own light chrome where the engine applies these at all —
    restate the global ink so near-white options can never land on it. */
 .side .srv-select option { color: oklch(0.255 0.055 301); background: #ffffff; }
+/* ::selection resolves var() against the ORIGINATING element, so the
+   global sun-behind-ink selection picks up this scope's near-white ink:
+   1.32:1 on gold, illegible exactly where an operator copies the stream
+   position mid-incident. Restate the global ink literal. */
+.side ::selection { color: oklch(0.255 0.055 301); }
 /* the select's chevron was inked for a light field */
 .side .srv-select {
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path fill='%23b7a8cc' d='M0 0h10L5 6z'/></svg>");
@@ -2600,6 +2605,14 @@ button { font-family: inherit; }
    fixed); restate them against the tinted grounds (measured 1.34-1.36 on
    all four, above the 1.15 divider floor). */
 .cards .card .kv { border-bottom-color: oklch(0.5 0.05 320 / 0.22); }
+/* the same two remap side effects inside tinted cards: the inset code chip
+   (--surface-3 vs sun-tint: 1.031, vs orange-tint: 1.021 — under the 1.02
+   identity floor's margin) goes white-with-hairline like the tcard
+   tag-pills; pgHealthCard's ink-3 text (4.31:1 on pink) steps up to ink-2
+   and its --line-soft divider (1.013 on pink) takes the kv literal. */
+.cards .card .stg-code { background: var(--surface); border: 1px solid oklch(0.5 0.05 320 / 0.16); }
+.cards .card .hstat-muted, .cards .card .hstale { color: var(--ink-2); }
+.cards .card .hstale { border-top-color: oklch(0.5 0.05 320 / 0.22); }
 
 /* neutral buttons warm on touch — product blue stays the pressed accent.
    Excluded: primary (white-on-gradient, own guard), ghost (borderless is
