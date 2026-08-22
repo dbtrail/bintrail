@@ -3494,6 +3494,60 @@ try {
     : bad("brand paint: the warmed loading bar stays clear of the violet panel ground",
         JSON.stringify({ ratio: Number((brand.skelVioletRatio || 0).toFixed(3)), parsed: brand.skelVioletParsed }));
 
+  // ── Scenario 16t — the tropical pass: the console wears the site's
+  // sunset for real. Four independent guards, each on the surface where the
+  // colour actually lands: the sidebar's night ground, its flipped text
+  // ramp, the active pill, the gradient page title, and the tinted card
+  // rotation. Computed style, not declarations — a scoped token remap that
+  // stops resolving (the exact way this pass could silently die) leaves
+  // declarations intact and only the computed values change.
+  const trop = await page.evaluate(() => {
+    const side = document.querySelector(".side");
+    const item = document.querySelector(".nav-item:not(.active)");
+    const active = document.querySelector(".nav-item.active");
+    const title = document.querySelector(".page-title");
+    const lum = (c) => {
+      const m = /rgba?\(([\d.]+), ([\d.]+), ([\d.]+)/.exec(c);
+      if (!m) return -1;
+      return (0.2126 * m[1] + 0.7152 * m[2] + 0.0722 * m[3]) / 255;
+    };
+    const sideCS = getComputedStyle(side);
+    return {
+      groundImage: sideCS.backgroundImage,
+      itemLum: item ? lum(getComputedStyle(item).color) : -1,
+      activeImage: active ? getComputedStyle(active).backgroundImage : "",
+      activeColor: active ? getComputedStyle(active).color : "",
+      titleClip: title ? getComputedStyle(title).webkitBackgroundClip : "",
+      titleColor: title ? getComputedStyle(title).color : "",
+      titleImage: title ? getComputedStyle(title).backgroundImage : "",
+    };
+  });
+  (/radial-gradient/.test(trop.groundImage) && /linear-gradient/.test(trop.groundImage))
+    ? ok("tropical: the sidebar wears the aubergine-night ground (radial glows over the linear base)")
+    : bad("tropical: the sidebar wears the aubergine-night ground (radial glows over the linear base)", trop.groundImage.slice(0, 120));
+  (trop.itemLum > 0.6)
+    ? ok("tropical: sidebar text flipped light for the dark ground")
+    : bad("tropical: sidebar text flipped light for the dark ground", "luminance " + trop.itemLum.toFixed(3));
+  (/linear-gradient/.test(trop.activeImage) && trop.activeColor === "rgb(255, 255, 255)")
+    ? ok("tropical: the active page is the sunset pill with white text")
+    : bad("tropical: the active page is the sunset pill with white text", JSON.stringify({ i: trop.activeImage.slice(0, 80), c: trop.activeColor }));
+  (trop.titleClip === "text" && trop.titleColor === "rgba(0, 0, 0, 0)" && /gradient/.test(trop.titleImage))
+    ? ok("tropical: page titles wear the headline gradient")
+    : bad("tropical: page titles wear the headline gradient", JSON.stringify({ clip: trop.titleClip, c: trop.titleColor }));
+
+  // The card tint rotation, on the page from the user's own screenshot. Two
+  // distinct tinted grounds prove rotation; "not white" alone would pass a
+  // single flat tint.
+  await page.evaluate(() => navigate("storage"));
+  await page.waitForFunction(() => location.pathname === "/storage" && document.querySelectorAll(".cards .card").length >= 2, { timeout: 10000 });
+  const tints = await page.evaluate(() => {
+    const cards = Array.from(document.querySelectorAll(".cards .card")).slice(0, 2);
+    return cards.map((c) => getComputedStyle(c).backgroundColor);
+  });
+  (tints.length === 2 && tints[0] !== tints[1] && !tints.includes("rgb(255, 255, 255)") && !tints.includes("rgba(0, 0, 0, 0)"))
+    ? ok("tropical: config cards rotate through the home's tint palette")
+    : bad("tropical: config cards rotate through the home's tint palette", JSON.stringify(tints));
+
   // ── Scenario 17f — the Events skeleton is visible (#1397) ──
   //
   // .ev-skel-bar stood in for event rows at 1.09:1 against the page — fainter
