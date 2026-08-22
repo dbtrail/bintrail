@@ -83,6 +83,9 @@ type capabilitiesResponse struct {
 	// page's point-in-time restore). Process-global, like BaselineTrigger —
 	// the endpoint does the per-server validation (local backup directory).
 	BaselineRestore bool `json:"baseline_restore"`
+	// SQLExport: this process can build a custom .sql backup for a chosen
+	// instant and hand it out as a download. Wired with BaselineRestore.
+	SQLExport bool `json:"sql_export"`
 	// VerifyTrigger: this process can run bintrail verify in-process from the
 	// console (the watch daemon opted in with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1).
 	// Process-global, like BaselineTrigger — the endpoint does the per-server/
@@ -191,6 +194,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		Monitor:         s.monitorCtrl != nil,
 		BaselineTrigger: s.baselineCtrl != nil,
 		BaselineRestore: s.baselineRestore != nil,
+		SQLExport:       s.sqlExport != nil,
 		VerifyTrigger:   s.verifyCtrl != nil,
 
 		SchemaSnapshotTrigger: s.schemaSnapCtrl != nil,

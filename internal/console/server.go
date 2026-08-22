@@ -102,6 +102,9 @@ type Config struct {
 	// server's own baseline store. Wired whenever the watch daemon has a
 	// baseline supervisor (creation or refresh opt-in); nil elsewhere.
 	BaselineRestore BaselineRestorer
+	// SQLExport builds custom .sql backups (fold at a chosen instant,
+	// download as a mydumper-format dump). Wired with BaselineRestore.
+	SQLExport SQLExporter
 	// BaselineHistory is the persisted record of baseline runs this daemon
 	// performed (dump/refresh/restore), used by the backups detail surface to
 	// report exact durations. Nil = no history (exact durations unavailable).
@@ -221,6 +224,7 @@ type Server struct {
 	// verifyHistory: the persisted run history, set with verifyCtrl (#1191).
 	verifyHistory   *VerifyHistory
 	baselineRestore BaselineRestorer
+	sqlExport       SQLExporter
 	baselineHistory *BaselineRunHistory
 	// telemetry: non-nil only when a long-running console wired its live
 	// telemetry client (see Config.Telemetry), so the UI opt-out reaches it.
@@ -422,6 +426,7 @@ func New(cfg Config) (*Server, error) {
 		verifyCtrl:       cfg.VerifyCtrl,
 		verifyHistory:    cfg.VerifyHistory,
 		baselineRestore:  cfg.BaselineRestore,
+		sqlExport:        cfg.SQLExport,
 		baselineHistory:  cfg.BaselineHistory,
 		telemetry:        cfg.Telemetry,
 		rotationDefaults: cfg.RotationDefaults,
@@ -568,6 +573,9 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/servers/{id}/baseline", s.handleBaselineStatus)
 	api.HandleFunc("POST /api/servers/{id}/baseline/restore", s.recordAction("baseline-restore", s.handleBaselineRestore))
 	api.HandleFunc("GET /api/servers/{id}/baseline/restore", s.handleBaselineRestoreStatus)
+	api.HandleFunc("POST /api/servers/{id}/sql-export", s.recordAction("sql-export", s.handleSQLExportTrigger))
+	api.HandleFunc("GET /api/servers/{id}/sql-export", s.handleSQLExportStatus)
+	api.HandleFunc("GET /api/servers/{id}/sql-export/download", s.handleSQLExportDownload)
 	// Schema-snapshot refresh (#1296): re-read the source's column layout and
 	// restart that server's stream onto it — the remedy the capture-degraded
 	// banner names, which had no button anywhere before. 403 unless this

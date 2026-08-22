@@ -58,6 +58,9 @@ type baselineSupervisor struct {
 	// a third kind alongside jobs (dumps) and refreshes, all sharing the
 	// single-flight in busyLocked.
 	restores map[string]*console.BaselineStatus
+	// exports tracks custom .sql backup builds, keyed by server id — the
+	// fourth job kind under the shared single-flight.
+	exports map[string]*console.BaselineStatus
 	// history, when non-nil, records every finished run (dump/refresh/
 	// restore) so the backups page can report exact durations. Failures to
 	// save are logged, never returned: history must not fail a run.
@@ -79,6 +82,7 @@ func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode base
 		jobs:       make(map[string]*console.BaselineStatus),
 		refreshes:  make(map[string]*console.BaselineStatus),
 		restores:   make(map[string]*console.BaselineStatus),
+		exports:    make(map[string]*console.BaselineStatus),
 	}
 }
 

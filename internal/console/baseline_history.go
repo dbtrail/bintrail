@@ -18,6 +18,7 @@ const (
 	BaselineRunDump    = "dump"    // mydumper (or pgbaseline) snapshot of the source
 	BaselineRunRefresh = "refresh" // periodic fold of the newest snapshot forward
 	BaselineRunRestore = "restore" // operator-chosen point-in-time fold (#backups)
+	BaselineRunSQLExport = "sql-export" // custom .sql dump build (downloaded, publishes no snapshot)
 )
 
 // BaselineRunRecord is one completed baseline-producing run as this daemon

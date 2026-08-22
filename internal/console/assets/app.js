@@ -3617,9 +3617,10 @@ async function renderBaselines() {
   // Run states for the selected server: only the endpoints this daemon
   // actually serves (each 403s when its feature is off).
   const selId = currentServer || defaultServerId;
-  const [dumpSt, restoreSt] = await Promise.all([
+  const [dumpSt, restoreSt, sqlSt] = await Promise.all([
     (capsCache.baseline_trigger && selId) ? api("/api/servers/" + encodeURIComponent(selId) + "/baseline").catch(() => null) : null,
     (capsCache.baseline_restore && selId) ? api("/api/servers/" + encodeURIComponent(selId) + "/baseline/restore").catch(() => null) : null,
+    (capsCache.sql_export && selId) ? api("/api/servers/" + encodeURIComponent(selId) + "/sql-export").catch(() => null) : null,
   ]);
   if (gen !== serverGen || vgen !== viewGen) return;
   try {
@@ -3643,7 +3644,7 @@ async function renderBaselines() {
     // A visible in-progress region (mirrors the verification page): while a
     // backup is being created or restored, the page must look like a page
     // doing work, not a stale list.
-    const running = backupRunsInFlight(dumpSt, restoreSt, baselines);
+    const running = backupRunsInFlight(dumpSt, restoreSt, baselines, sqlSt);
     if (running.length) {
       v.append(backupRunRegion(running));
       // One watcher at a time: renderBaselines() outside renderRoute does not
@@ -3655,6 +3656,8 @@ async function renderBaselines() {
     }
     const restoreCard = backupRestoreCard(cur, baselines, restoreSt);
     if (restoreCard) v.append(restoreCard);
+    const sqlCard = backupSQLExportCard(cur, baselines, sqlSt);
+    if (sqlCard) v.append(sqlCard);
     v.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
     viewEnter();
   } catch (err) {
@@ -4245,7 +4248,7 @@ function fmtSeconds(sec) {
   return Math.floor(sec / 3600) + "h " + Math.round((sec % 3600) / 60) + "m";
 }
 
-const BACKUP_KIND_LABEL = { dump: "full copy of the source", refresh: "automatic refresh", restore: "point-in-time restore" };
+const BACKUP_KIND_LABEL = { dump: "full copy of the source", refresh: "automatic refresh", restore: "point-in-time restore", "sql-export": "custom .sql build" };
 
 // loadBackupDetail fills a row's expansion: tables with sizes, total weight,
 // and duration. The recorded run (this daemon performed it) gives the exact
@@ -4331,7 +4334,7 @@ async function downloadBackup(at, btn, totalBytes) {
 }
 
 // backupRunsInFlight collects what is running right now, for the region.
-function backupRunsInFlight(dumpSt, restoreSt, b) {
+function backupRunsInFlight(dumpSt, restoreSt, b, sqlSt) {
   const running = [];
   const dump = dumpSt && dumpSt.baseline;
   if (dump && dump.state === "running") {
@@ -4340,6 +4343,10 @@ function backupRunsInFlight(dumpSt, restoreSt, b) {
   const rst = restoreSt && restoreSt.restore;
   if (rst && rst.state === "running") {
     running.push({ kind: "restore", text: "Restoring to " + (rst.at ? utcLabel(rst.at) : "the chosen moment") + ": building a new backup…" });
+  }
+  const sq = sqlSt && sqlSt.sql_export;
+  if (sq && sq.state === "running") {
+    running.push({ kind: "sql-export", text: "Building a .sql backup" + (sq.at ? " for " + utcLabel(sq.at) : "") + "\u2026" });
   }
   const rf = b && !b.error && b.refresh;
   if (rf && rf.state === "running") {
@@ -4397,6 +4404,12 @@ async function watchBackupRuns(id, vgen, kinds) {
       try {
         const st = await api("/api/servers/" + encodeURIComponent(id) + "/baseline/restore");
         if (st.restore && st.restore.state === "running") busy = true;
+      } catch (e) { if (unknown(e)) pollFailed = true; }
+    }
+    if (kinds.includes("sql-export")) {
+      try {
+        const st = await api("/api/servers/" + encodeURIComponent(id) + "/sql-export");
+        if (st.sql_export && st.sql_export.state === "running") busy = true;
       } catch (e) { if (unknown(e)) pollFailed = true; }
     }
     if (kinds.includes("refresh") && i % 5 === 4) { // every ~10s
@@ -4493,6 +4506,99 @@ async function startBackupRestore(id, at, btn, msgEl) {
   btn.disabled = false;
   toast("Restore started: building a backup as of " + at + " UTC…");
   if (location.pathname === "/baselines") renderBaselines();
+}
+
+// backupSQLExportCard offers the made-to-measure .sql backup: pick any past
+// moment, the console folds the nearest earlier backup forward to it and
+// packages the result as plain SQL files. Unlike the point-in-time restore it
+// publishes NOTHING: the build lives in a staging directory until downloaded.
+// S3-backed backups qualify too (the fold engine reads them directly), which
+// is why this card has no b.kind === "dir" gate.
+function backupSQLExportCard(cur, b, sqlSt) {
+  if (!capsCache.sql_export || !cur || !cur.id || cur.kind !== "registry") return null;
+  if (!b || b.error || !b.configured) return null;
+  if (!(b.snapshots || []).length) return null;
+  const st = sqlSt && sqlSt.sql_export;
+  if (st && st.state === "running") return null; // the run region owns it
+  const details = el("details", { class: "form-advanced bk-restore" },
+    el("summary", { class: "form-adv-summary", text: "Build a .sql backup for any moment" }));
+  const body = el("div", { class: "bk-restore-body" });
+  body.append(el("p", { class: "form-hint", text:
+    "Pick a past moment. The console rebuilds every table as it was then, from your backups plus the recorded changes, and packages the result as plain SQL files (mydumper format). Load the download with myloader or any MySQL client; restoring needs nothing from dbtrail. Your database is not touched." }));
+  const input = el("input", { class: "in", type: "text", spellcheck: "false",
+    placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
+  input.value = (b.snapshots[0] && b.snapshots[0].time) || "";
+  const go = el("button", { class: "btn", type: "button", text: "Build" });
+  const msg = el("p", { class: "form-msg err" });
+  msg.hidden = true;
+  go.onclick = () => startSQLExport(cur.id, input.value.trim(), go, msg);
+  body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
+  if (st && st.state === "failed") {
+    body.append(el("p", { class: "form-msg err", text:
+      "Last build failed: " + backupFoldError(st.last_error || "unknown error") + " Nothing was built." }));
+    details.open = true;
+  } else if (st && st.state === "succeeded") {
+    const dl = el("button", { class: "btn", type: "button", text: "Download .sql backup (.tar.gz)" });
+    dl.onclick = () => downloadSQLExport(cur.id, dl);
+    body.append(el("div", { class: "bk-restore-row" },
+      el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") + "." }), dl));
+    details.open = true;
+  }
+  details.append(body);
+  return details;
+}
+
+async function startSQLExport(id, at, btn, msgEl) {
+  msgEl.hidden = true;
+  if (!at) { msgEl.textContent = "Enter a UTC time, YYYY-MM-DD HH:MM:SS."; msgEl.hidden = false; return; }
+  btn.disabled = true;
+  try {
+    await api("/api/servers/" + encodeURIComponent(id) + "/sql-export", { method: "POST", body: { at: at } });
+  } catch (err) {
+    msgEl.textContent = (err && err.message) || String(err);
+    msgEl.hidden = false;
+    btn.disabled = false;
+    return;
+  }
+  btn.disabled = false;
+  toast("Build started: a .sql backup as of " + at + " UTC\u2026");
+  if (location.pathname === "/baselines") renderBaselines();
+}
+
+// downloadSQLExport mirrors downloadBackup: fetch + blob because the API
+// authenticates via header. The blob buffers the whole archive in browser
+// memory, and unlike downloadBackup this card has no byte count to gate a
+// confirm on (the status carries none), so there is no size prompt.
+async function downloadSQLExport(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Preparing\u2026"; }
+  try {
+    const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
+    if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+    const res = await fetch("/api/servers/" + encodeURIComponent(id) + "/sql-export/download", { headers });
+    if (res.status === 401) { handleUnauthorized(); return; }
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { msg = (await res.json()).error || msg; } catch (_) { /* non-JSON error body */ }
+      throw new Error(msg);
+    }
+    const cd = res.headers.get("Content-Disposition") || "";
+    const m = /filename="([^"]+)"/.exec(cd);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = m ? m[1] : "dbtrail-sql-backup.tar.gz";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Delayed: Firefox has cancelled downloads whose object URL was revoked
+    // synchronously after click.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    toastError("Download failed: " + ((err && err.message) || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Download .sql backup (.tar.gz)"; }
+  }
 }
 
 // verifyRegions (#677, restructured #1419): trigger/poll/explain the

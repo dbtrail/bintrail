@@ -122,4 +122,5 @@ func wireBaselineExtras(cfg *console.Config, sup *baselineSupervisor, serversPat
 	sup.history = history
 	cfg.BaselineHistory = history
 	cfg.BaselineRestore = sup
+	cfg.SQLExport = sup
 }

@@ -88,6 +88,7 @@ var apiRoutePerms = []routePerm{
 	// permission; it is an operator integrity action, tiered with baseline:create.
 	{"POST", "/api/servers/{}/baseline", ext.PermBaselineCreate},
 	{"POST", "/api/servers/{}/baseline/restore", ext.PermBaselineCreate},
+	{"POST", "/api/servers/{}/sql-export", ext.PermBaselineCreate},
 	{"POST", "/api/servers/{}/verify", ext.PermBaselineCreate},
 	// Refreshing the schema snapshot STOPS AND RESTARTS that server's capture
 	// stream, so it is tiered with the monitor verbs below (servers:write), not
@@ -106,6 +107,10 @@ var apiRoutePerms = []routePerm{
 	{"POST", "/api/servers/{}/schema-snapshot", ext.PermServersWrite},
 	{"GET", "/api/servers/{}/baseline", ext.PermServersRead},
 	{"GET", "/api/servers/{}/baseline/restore", ext.PermServersRead},
+	{"GET", "/api/servers/{}/sql-export", ext.PermServersRead},
+	// The dump download is a full unredacted copy of every row — the
+	// row-data tier, exactly like /api/baselines/download.
+	{"GET", "/api/servers/{}/sql-export/download", ext.PermQueryExecute},
 	{"GET", "/api/servers/{}/schema-snapshot", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify/explain", ext.PermServersRead},

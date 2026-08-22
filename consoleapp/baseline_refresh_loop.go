@@ -66,6 +66,9 @@ func (s *baselineSupervisor) busyLocked(serverID string) bool {
 	if st, ok := s.restores[serverID]; ok && st.State == "running" {
 		return true
 	}
+	if st, ok := s.exports[serverID]; ok && st.State == "running" {
+		return true
+	}
 	return false
 }
 
