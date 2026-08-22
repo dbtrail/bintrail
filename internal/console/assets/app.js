@@ -4147,8 +4147,7 @@ async function createVerify(id, mode, btn, resultsEl) {
   if (histBox) loadVerifyHistory(id, histBox);
   if (done && done.state === "succeeded") {
     const s = done.summary || {};
-    toast(done.note || ("Verification complete: " + s.match + " match, " + s.mismatch + " mismatch, " +
-      s.inconclusive + " inconclusive, " + s.error + " error"));
+    toast(done.note || ("Verification complete: " + vfySummaryText(s)));
   } else if (done) {
     toastError("Verification failed: " + (done.last_error || "unknown error"));
   } else {
@@ -4263,7 +4262,7 @@ async function loadVerifyHistory(id, box) {
     let outcome;
     if (r.state === "skipped") outcome = "skipped — " + (r.skip_reason || "");
     else if (r.state === "failed") outcome = "failed — " + (r.last_error || "unknown error");
-    else outcome = s.match + " match · " + s.mismatch + " mismatch · " + s.inconclusive + " inconclusive · " + s.error + " error";
+    else outcome = vfySummaryText(s);
     const when = utcLabel(r.finished_at || r.since || "");
     const row = el("div", { class: "stg-row" });
     row.append(

@@ -229,6 +229,34 @@ func TestVerifyTextFormatUnchanged(t *testing.T) {
 	}
 }
 
+// TestVerifyTextSummarySplit: with a benign inconclusive present, the summary
+// line names the slice and the remainder (#1416) — mutation-proven gap: the
+// whole split block deleted left this package green, so the split existed
+// only as prose until this pinned it.
+func TestVerifyTextSummarySplit(t *testing.T) {
+	setVerifyFormat(t, "text")
+	cmd := &cobra.Command{}
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	rep := verify.NewReport(verify.ModeRecoverInputs, []verify.TableResult{
+		{Schema: "mydb", Table: "orders", Status: verify.StatusMatch},
+		{Schema: "mydb", Table: "logs", Status: verify.StatusInconclusive, InconclusiveKind: verify.InconclusiveNoActivity},
+		{Schema: "mydb", Table: "hard", Status: verify.StatusInconclusive, InconclusiveKind: verify.InconclusiveUnproven},
+		{Schema: "mydb", Table: "old", Status: verify.StatusInconclusive}, // unclassified: attention side
+	})
+	if err := emitVerifyReport(cmd, rep); err != nil {
+		t.Fatalf("emitVerifyReport: %v", err)
+	}
+	s := out.String()
+	// The arithmetic is the point: 3 inconclusive, 1 benign, remainder 2
+	// (the unproven one AND the unclassified one — rounding the unknown
+	// toward benign is the direction this feature must never take).
+	want := "1 match, 0 mismatch, 3 inconclusive (1 nothing to check — quiet or append-only; 2 unproven), 0 error"
+	if !strings.Contains(s, want) {
+		t.Errorf("text summary missing %q:\n%s", want, s)
+	}
+}
+
 // TestVerifyFormatIsCaseSensitive: `--format JSON` renders TEXT, exactly like
 // every other --format command in the repo (status.go:118, query, recover,
 // rotate, recover-cascade, telemetry all compare exactly) — and, load-bearing,

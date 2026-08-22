@@ -516,7 +516,10 @@ straight from the **Protect → Baselines** page, and it only runs on the `watch
   [verify.md](verify.md)'s own warning). It only appears in the mode selector
   when the server has a source DSN configured.
 - Per-table results are colored match / mismatch / inconclusive / error, the
-  same four outcomes `bintrail verify` reports. A mismatch found by a
+  same four outcomes `bintrail verify` reports — except that a recover-inputs
+  inconclusive whose kind is benign (`no-activity` / `nothing-to-assert`)
+  renders as a neutral grey note instead of amber, and the summary splits
+  those out as "nothing to check". A mismatch found by a
   baseline-anchored run gets an **Explain** button — an on-demand,
   never-precomputed row-level drill-down (`--explain`'s console equivalent),
   re-run only when clicked. Live-source mismatches have no explain support

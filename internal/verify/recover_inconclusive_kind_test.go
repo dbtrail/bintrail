@@ -14,10 +14,11 @@ import (
 // exists so a summary can be read; these pin which shape lands where.
 func TestRecoverInconclusiveKinds(t *testing.T) {
 	tests := []struct {
-		name     string
-		events   []query.ResultRow
-		wantKind string
-		why      string
+		name      string
+		events    []query.ResultRow
+		truncated bool
+		wantKind  string
+		why       string
 	}{
 		{
 			name:     "no activity",
@@ -45,6 +46,17 @@ func TestRecoverInconclusiveKinds(t *testing.T) {
 				"makes it assertable, so 'does not apply' would over-claim benignity",
 		},
 		{
+			name: "a truncated window is unproven even over a benign shape",
+			events: []query.ResultRow{
+				riEvent(1, event.EventInsert, "1", nil, riRow(1, "a", 1)),
+			},
+			truncated: true,
+			wantKind:  InconclusiveUnproven,
+			why: "the tail of the window was never loaded, so nothing about its shape is " +
+				"known — rounding truncation toward 'nothing to check' hides exactly the " +
+				"runs that most need a narrower window",
+		},
+		{
 			name: "drift rows are activity, not quiet",
 			events: []query.ResultRow{
 				riEvent(1, event.EventUpdate, "", riRow(1, "a", 1), riRow(1, "a", 2)),
@@ -56,7 +68,9 @@ func TestRecoverInconclusiveKinds(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			out := checkRecoverChains(riInput(tc.events))
+			in := riInput(tc.events)
+			in.Truncated = tc.truncated
+			out := checkRecoverChains(in)
 			if out.Status != StatusInconclusive {
 				t.Fatalf("Status = %s (%s), want inconclusive", out.Status, out.Detail)
 			}

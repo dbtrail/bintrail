@@ -48,6 +48,19 @@ func TestToWireResult(t *testing.T) {
 	if got != want {
 		t.Errorf("toWireResult = %+v, want %+v", got, want)
 	}
+
+	// The kind must survive the engine→wire copy (#1416). Pinned with a value
+	// set, not by the zero struct: the walk and the report each had their own
+	// tests, and the engine-side copy stayed green with the field deleted —
+	// this is the console's instance of the same seam.
+	quiet := toWireResult(verify.TableResult{
+		Schema: "wp", Table: "quiet", Status: verify.StatusInconclusive,
+		Detail: "no changes in the window", InconclusiveKind: verify.InconclusiveNoActivity,
+	}, false)
+	if quiet.InconclusiveKind != string(verify.InconclusiveNoActivity) {
+		t.Errorf("InconclusiveKind = %q, want %q — the console renders every quiet table as attention without it",
+			quiet.InconclusiveKind, verify.InconclusiveNoActivity)
+	}
 	if got := toWireResult(res, false); got.Explainable {
 		t.Error("explainable must be exactly what the caller passed, not re-derived from Status")
 	}
@@ -118,13 +131,17 @@ func TestVerifySupervisor_appendResult_accumulatesSummary(t *testing.T) {
 	s.appendResult("srv1", console.VerifyTableResult{Schema: "wp", Table: "posts", Status: "match"})
 	s.appendResult("srv1", console.VerifyTableResult{Schema: "wp", Table: "users", Status: "mismatch"})
 	s.appendResult("srv1", console.VerifyTableResult{Schema: "wp", Table: "opts", Status: "inconclusive"})
+	s.appendResult("srv1", console.VerifyTableResult{Schema: "wp", Table: "logs", Status: "inconclusive", InconclusiveKind: "no-activity"})
 	s.appendResult("srv1", console.VerifyTableResult{Schema: "wp", Table: "bad", Status: "something-unrecognized"})
 
 	got := s.Status("srv1")
-	if len(got.Results) != 4 || got.Results[0].Table != "posts" || got.Results[3].Table != "bad" {
-		t.Fatalf("Results = %+v, want 4 entries in append order", got.Results)
+	if len(got.Results) != 5 || got.Results[0].Table != "posts" || got.Results[4].Table != "bad" {
+		t.Fatalf("Results = %+v, want 5 entries in append order", got.Results)
 	}
-	want := console.VerifySummary{Match: 1, Mismatch: 1, Inconclusive: 1, Error: 1, Total: 4}
+	// The kind-less inconclusive counts on the attention side and the benign
+	// one in the split — the tally must go through CountWithKind, or every
+	// quiet table renders amber in the console summary (#1416).
+	want := console.VerifySummary{Match: 1, Mismatch: 1, Inconclusive: 2, InconclusiveNothingToCheck: 1, Error: 1, Total: 5}
 	if got.Summary != want {
 		t.Errorf("Summary = %+v, want %+v (an unrecognized status must fall through to Error)", got.Summary, want)
 	}

@@ -226,6 +226,17 @@ Results are **per table**, one of:
   (regenerate the baseline — see below), or a value class this version cannot yet
   compare.
 
+  Under `--check recover`, inconclusive is subdivided by `inconclusive_kind`
+  so a summary can be read: `no-activity` (nothing changed in the window),
+  `nothing-to-assert` (every chain is a single INSERT — an append-only shape
+  where zero assertions is the expected outcome, in every window), and
+  `unproven` (there was content the walk could not prove: chains beginning
+  mid-history, unresolvable values, or a truncated window). The first two are
+  benign and counted in `summary.inconclusive_nothing_to_check`; the remainder
+  — including an inconclusive with **no** kind, from a content mode or an
+  older producer — is the slice worth a look. The exit contract is unchanged:
+  an all-inconclusive run still exits non-zero, whatever the kinds.
+
 ## Machine-readable output (`--format json`)
 
 `--format json` (default `text`) emits the whole run as one JSON document, so a
@@ -255,7 +266,8 @@ bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines --format json
       "reason": "content digest differs"
     }
   ],
-  "summary": { "match": 8, "mismatch": 1, "inconclusive": 2, "error": 0, "total": 11 }
+  "summary": { "match": 8, "mismatch": 1, "inconclusive": 2,
+               "inconclusive_nothing_to_check": 1, "error": 0, "total": 11 }
 }
 ```
 
@@ -268,6 +280,12 @@ bintrail verify --index-dsn "$IDX" --baseline-dir /data/baselines --format json
   to (a GTID set in MySQL live-source mode, a `file:pos` binlog coordinate in
   MySQL baseline-anchored mode, an `LSN:` WAL position for a PostgreSQL
   source); `reason` is the detail behind the verdict.
+- `tables[].inconclusive_kind` — only on `status: "inconclusive"` rows and
+  only under `--check recover` (omitted otherwise, mirroring the counters
+  below): `no-activity`, `nothing-to-assert`, or `unproven` — see the
+  taxonomy above. `summary.inconclusive_nothing_to_check` is always present
+  and counts the benign kinds; it is a subdivision of `summary.inconclusive`,
+  not a fifth bucket.
 - `tables[].events_checked` / `chains_checked` / `chains_inconclusive` —
   present only under `--check recover` (omitted entirely otherwise, so a
   content-mode document is unchanged): how many events the chain walk visited,
