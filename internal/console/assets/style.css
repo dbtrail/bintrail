@@ -2557,6 +2557,15 @@ button { font-family: inherit; }
 .cards .card .hstat-muted, .cards .card .hstale { color: var(--ink-2); }
 .cards .card .hstale { border-top-color: oklch(0.5 0.05 320 / 0.22); }
 
+/* the Connect AI step list: a real <ol> so the order is structural, not
+   prose — the audience is Claude users following it literally. */
+.cn-steps { margin: 0 0 14px; padding-left: 19px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--ink-2); }
+.cn-steps li::marker { color: var(--ink-3); font-weight: 600; }
+/* inline flag/env names in hints never wrap mid-token: a --flag broken
+   across lines reads as "- -flag" to the non-technical audience this page
+   addresses. */
+.card .form-hint code { white-space: nowrap; font-family: var(--f-mono); font-size: 11.5px; }
+
 /* neutral buttons warm on touch — product blue stays the pressed accent.
    Excluded: primary (white-on-gradient, own guard), ghost (borderless is
    its idiom), accent (white label on a warm fill — orange text there would

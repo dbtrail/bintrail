@@ -5449,8 +5449,8 @@ function copyText(text, what) {
 function buildConnect(servers, tokStatus, minted) {
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
-    "Let an AI assistant query this console: the same read-only tools and result caps as this UI. ",
-    el("b", { text: "A token is only ever shown once, at the moment you generate it." }));
+    "Let Claude (or another AI assistant) read this console and answer questions about your database history. Three steps: create an access token, copy this console's address, and give both to Claude. The AI sees the same read-only view as this page; it can never change your data. ",
+    el("b", { text: "Your token is shown only once, right after you create it, so copy it somewhere safe at that moment." }));
   v.append(pageHead("Connect AI", sub));
 
   const cards = el("div", { class: "cards" });
@@ -5466,7 +5466,7 @@ function buildConnect(servers, tokStatus, minted) {
 // capability gate (the endpoint may have just become usable), and re-renders
 // the view with the plaintext displayed once.
 async function mintMCPToken(rotate) {
-  if (rotate && !window.confirm("Rotate the MCP token? The current value stops working immediately and every connected AI client will need the new one.")) return;
+  if (rotate && !window.confirm("Replace the token? The current one stops working right away, and every AI client that used it will need the new one. The new value appears on the next screen, ready to copy.")) return;
   // Only the mutation itself may report failure — once the POST succeeded the
   // token EXISTS (and on rotate the old one is already dead), so a failing
   // follow-up refresh must never toast "generation failed".
@@ -5483,14 +5483,14 @@ async function mintMCPToken(rotate) {
 }
 
 async function revokeMCPToken() {
-  if (!window.confirm("Revoke the managed MCP token? Connected AI clients stop working immediately.")) return;
+  if (!window.confirm("Delete the token? Every AI client using it stops working right away. You can create a new token here whenever you want.")) return;
   try {
     await api("/api/mcp-token", { method: "DELETE" });
   } catch (err) {
     toastError("Revoke failed: " + (err.message || err));
     return;
   }
-  toast("Managed MCP token revoked");
+  toast("Token deleted. AI clients that used it are disconnected");
   try { await gateCapabilities(); } catch (_) {}
   renderConnect();
 }
@@ -5499,43 +5499,45 @@ async function revokeMCPToken() {
 // without leaving the UI. The token value renders exactly once — right after
 // generation — and is otherwise represented only by its creation date.
 function mcpTokenCard(tok, minted) {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Access token" }));
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Step 1 · Access token" }));
   // The one-time plaintext renders UNCONDITIONALLY — a failed status fetch
   // must never swallow a token that was just minted (after a rotate, it is
   // the only valid credential and cannot be re-displayed).
   if (minted) {
-    card.append(el("p", { class: "stg-hint", text: "Token generated. Copy it now; it is not stored and will never show again:" }));
+    card.append(el("p", { class: "stg-hint", text: "Here is your new token. Copy it NOW and keep it somewhere safe (a password manager is ideal). It is not stored anywhere, so this is the only time it will ever be on screen:" }));
     card.append(el("div", { class: "cn-urlrow" },
       el("code", { class: "stg-code cn-url", text: minted }),
       el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(minted, "MCP token") })));
   }
   if (!tok) {
-    card.append(el("p", { class: "stg-hint", text: "Token status unavailable. Reload the page to retry." }));
+    card.append(el("p", { class: "stg-hint", text: "We could not check whether a token exists. Reload the page to try again." }));
     return card;
   }
   if (tok.managed) {
     if (!minted) {
       card.append(el("p", { class: "stg-hint", text:
-        "A managed token is active" + (tok.created_at ? " (created " + utcLabel(tok.created_at) + ")" : "") +
-        ". Its value is not stored and cannot be re-displayed; rotate to get a fresh one." }));
+        "You already created a token" + (tok.created_at ? " on " + utcLabel(tok.created_at) : "") +
+        ". Its value is not saved anywhere, so it cannot be shown again. Lost it? Click New token: you get a fresh value to copy, and the old one stops working." }));
     }
     if (tok.read_only) {
       card.append(el("p", { class: "form-hint", text:
-        "The token file was written by a newer bintrail; the token works, but rotate/revoke are unavailable from this build." }));
+        "This token was created by a newer version of bintrail. It keeps working, but this page cannot replace or delete it; upgrading the console brings those buttons back." }));
     } else {
       card.append(el("div", { class: "cn-links" },
-        el("button", { class: "btn btn-sm", type: "button", text: "Rotate token", onclick: () => mintMCPToken(true) }),
-        el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Revoke", onclick: revokeMCPToken })));
+        el("button", { class: "btn btn-sm", type: "button", text: "New token", onclick: () => mintMCPToken(true) }),
+        el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Delete token", onclick: revokeMCPToken })));
     }
   } else if (!minted) {
     card.append(el("p", { class: "stg-hint", text:
-      "AI clients authenticate with a token (password login is a browser credential and cannot be used by them). Generate one here: no flags, no environment variables, no restart. The token only grants the read-only MCP tools; it cannot manage this console." }));
+      "Claude cannot use your console password; it needs its own token, a long random key that works as its password. Click Generate token and copy the value that appears. The token only lets an AI read your history; it cannot change data or console settings." }));
     card.append(el("div", { class: "cn-links" },
       el("button", { class: "btn btn-sm", type: "button", text: "Generate token", onclick: () => mintMCPToken(false) })));
   }
   if (tok.static) {
-    card.append(el("p", { class: "form-hint", text:
-      "A static token from --token / BINTRAIL_CONSOLE_TOKEN is also configured. It keeps working, but it is environment-owned and cannot be managed here." }));
+    card.append(el("p", { class: "form-hint" },
+      "A fixed token set outside this page also works (CLI: ",
+      el("code", { text: "--token" }), " or ", el("code", { text: "BINTRAIL_CONSOLE_TOKEN" }),
+      "). It is managed wherever it was set up, not here."));
   }
   return card;
 }
@@ -5544,10 +5546,10 @@ function mcpTokenCard(tok, minted) {
 // how-to-enable explanation when no token is configured (capabilities.mcp) —
 // never a URL presented as ready that would only ever answer 403.
 function mcpEndpointCard(servers) {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "MCP endpoint" }));
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Step 2 · Console address" }));
   if (!capsCache.mcp) {
     card.append(el("p", { class: "stg-hint", text:
-      "MCP is not available yet: this console has no access token configured. Generate one in the Access token card above and this card becomes a ready-to-copy URL." }));
+      "This card fills in after step 1: create the access token and this console's address appears here, ready to copy." }));
     return card;
   }
   const url = mcpURL(servers);
@@ -5556,10 +5558,10 @@ function mcpEndpointCard(servers) {
     el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(url, "MCP URL") })));
   if ((servers || []).length > 1) {
     card.append(el("p", { class: "form-hint", text:
-      "This URL targets the server selected in the sidebar; the bare /mcp targets the console's default server. Switch servers to get each one's URL." }));
+      "This address points at the server picked in the left sidebar (the Server box at the top). To connect a different server, pick it there first and copy again: each server has its own address." }));
   }
   card.append(el("p", { class: "form-hint", text:
-    "The credential is the console access token from the card above (or --token / BINTRAIL_CONSOLE_TOKEN), sent as an Authorization: Bearer header." }));
+    "When Claude asks for the URL, paste this address. When it asks for the access token, paste the one from step 1." }));
   return card;
 }
 
@@ -5567,24 +5569,32 @@ function mcpEndpointCard(servers) {
 // RUNNING version. Best-effort: a release that predates the bundle artifact
 // 404s the direct link, so a releases-page path is always offered too.
 function bundleCard() {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Claude Desktop bundle" }));
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Step 3 · Add it to Claude" }));
   const ver = String(capsCache.version || "").replace(/^v/, "");
   const released = /^\d+\.\d+\.\d+$/.test(ver);
-  card.append(el("p", { class: "stg-hint", text:
-    "Install the bundle in Claude Desktop (double-click), then paste the URL above and your console token: no config files to edit." }));
+  card.append(el("ol", { class: "cn-steps" },
+    el("li", { text: "You need the Claude Desktop app installed (claude.ai/download). Using claude.ai in the browser instead? See the note below." }),
+    el("li", { text: released
+      ? "Download the installer with the button below; it picks the right file for this computer."
+      : "Download the installer from the releases page below; the note under the button says which file matches this computer." }),
+    el("li", { text: "Double-click the downloaded file. Claude Desktop opens and asks to install dbtrail; accept." }),
+    el("li", { text: "Claude then asks for two things. In \"Console / MCP endpoint URL\" paste the address from step 2; in \"Access token\" paste the token from step 1." }),
+    el("li", { text: "Open a new chat and try: what changed in my database in the last hour?" })));
   if (released) {
     const asset = "dbtrail-" + guessPlatform() + ".mcpb";
     card.append(el("div", { class: "cn-links" },
       el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/download/v" + ver + "/" + asset, text: "Download " + asset }),
       el("a", { class: "btn btn-sm btn-ghost", href: "https://github.com/dbtrail/dbtrail/releases/tag/v" + ver, target: "_blank", rel: "noopener", text: "All downloads for v" + ver })));
     card.append(el("p", { class: "form-hint", text:
-      "The link matches this console's version (v" + ver + "). Older releases don't carry the bundle; if the download 404s, pick a newer release from the releases page." }));
+      "The download matches this console's version (v" + ver + "). If the link lands on a page saying Not Found, that older release predates the installer; use All downloads and take the newest release's file instead." }));
   } else {
     card.append(el("div", { class: "cn-links" },
       el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases", target: "_blank", rel: "noopener", text: "Open the releases page" })));
     card.append(el("p", { class: "form-hint", text:
-      "This console is an unversioned build, so no exact bundle link can be derived; pick the bundle matching your platform from the latest release." }));
+      "This console is a development build, so there is no matching download link. Open the releases page, take the NEWEST release, and download the file for this computer: Mac is dbtrail-darwin-arm64.mcpb, Windows is dbtrail-windows-amd64.mcpb, Linux is dbtrail-linux-amd64.mcpb." }));
   }
+  card.append(el("p", { class: "form-hint", text:
+    "Using claude.ai in the browser instead of the desktop app? If this console is reachable from the internet, open claude.ai, go to Settings, then Connectors, then Add custom connector, and paste the same address and token there. On a private network (only reachable from inside), use the desktop app instead." }));
   return card;
 }
 
@@ -5610,9 +5620,9 @@ function otherClientsPanel(servers) {
   }, null, 2);
   const panel = el("section", { class: "ov-panel cn-other", style: "margin-top:18px" });
   const adv = el("details", { class: "form-advanced", style: "margin-top:0" },
-    el("summary", { class: "form-adv-summary", text: "Other clients (raw config)" }));
+    el("summary", { class: "form-adv-summary", text: "Other AI tools (technical)" }));
   adv.append(el("p", { class: "form-hint", text:
-    "For claude_desktop_config.json, or any client that launches stdio MCP servers: bintrail-mcp bridges stdio to this console. Replace the placeholder with your console token:" }));
+    "For claude_desktop_config.json, or any client that launches stdio MCP servers: bintrail-mcp bridges stdio to this console. The token travels as an Authorization: Bearer header. Replace the placeholder with your console token:" }));
   adv.append(el("pre", { class: "stg-code cn-snippet", text: snippet }));
   adv.append(el("button", { class: "btn btn-sm", type: "button", text: "Copy snippet", onclick: () => copyText(snippet, "Config snippet") }));
   adv.append(el("p", { class: "form-hint", text:
