@@ -2557,8 +2557,6 @@ button { font-family: inherit; }
 .cards .card .hstat-muted, .cards .card .hstale { color: var(--ink-2); }
 .cards .card .hstale { border-top-color: oklch(0.5 0.05 320 / 0.22); }
 
-/* the Connect AI step list: a real <ol> so the order is structural, not
-   prose — the audience is Claude users following it literally. */
 /* Connect AI, simple pass: the step number is a badge, the two Claude fields
    are a drawn dialog, and everything conditional folds into <details>. */
 .cn-title { display: flex; align-items: center; gap: 10px; }
@@ -2572,7 +2570,12 @@ button { font-family: inherit; }
   color: #fff; font-size: 14px; font-weight: 700;
 }
 .cn-fine { margin-top: 10px; }
-.cn-mock { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); margin: 10px 0; max-width: 430px; box-shadow: 0 1px 2px rgb(0 0 0 / 0.04); }
+/* The mock and the ask bubble sit INSIDE a tinted config card, where the
+   --line family drowns (1.08 on the violet tint); they take the same stronger
+   hairline the file already gives .stg-code insets on tints, and the bubble
+   fills white so its identity clears the two-grounds floor on ANY tint, not
+   just the violet it lands on today. */
+.cn-mock { border: 1px solid oklch(0.5 0.05 320 / 0.22); border-radius: 10px; background: var(--surface); margin: 10px 0; max-width: 430px; box-shadow: 0 1px 2px rgb(0 0 0 / 0.04); }
 .cn-mock-bar { display: flex; align-items: center; padding: 7px 12px; border-bottom: 1px solid var(--line-soft); color: var(--ink-4); font-size: 11.5px; }
 .cn-mock-dots { width: 8px; height: 8px; border-radius: 50%; flex: none; background: oklch(0.72 0.17 25); box-shadow: 13px 0 0 oklch(0.83 0.14 85), 26px 0 0 oklch(0.72 0.17 145); margin-right: 44px; }
 .cn-mock-row { padding: 9px 12px 3px; }
@@ -2580,7 +2583,7 @@ button { font-family: inherit; }
 .cn-mock-label { font-size: 11.5px; font-weight: 600; color: var(--ink-3); margin-bottom: 4px; }
 .cn-mock-field { display: flex; align-items: center; gap: 8px; border: 1px dashed var(--line); border-radius: 8px; padding: 6px 10px; background: var(--surface-2); font-size: 12.5px; color: var(--ink-3); font-style: italic; }
 .cn-chip { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; flex: none; background: linear-gradient(120deg, oklch(0.53 0.2 3), oklch(0.54 0.14 51)); color: #fff; font-size: 11.5px; font-weight: 700; font-style: normal; }
-.cn-ask { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: baseline; margin: 8px 0 2px; padding: 8px 14px; border-radius: 14px 14px 14px 4px; background: var(--surface-2); border: 1px solid var(--line); font-size: 12.5px; color: var(--ink-2); }
+.cn-ask { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: baseline; margin: 8px 0 2px; padding: 8px 14px; border-radius: 14px 14px 14px 4px; background: var(--surface); border: 1px solid oklch(0.5 0.05 320 / 0.22); font-size: 12.5px; color: var(--ink-2); }
 /* inline flag/env names in hints never wrap mid-token: a --flag broken
    across lines reads as "- -flag" to the non-technical audience this page
    addresses. */

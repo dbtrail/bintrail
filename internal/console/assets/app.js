@@ -5495,8 +5495,8 @@ async function revokeMCPToken() {
 }
 
 // cnCard: a step card whose number is a BADGE, not prose. The three cards are
-// the whole how-to, so each stays at one action plus one short line; every
-// conditional or rare fact folds into cnFine below.
+// the whole how-to, so each stays at one action plus one short line per state;
+// parenthetical and rare facts fold into cnFine below.
 function cnCard(num, title) {
   return el("div", { class: "card cn-card" },
     el("div", { class: "card-title cn-title" },
@@ -5538,7 +5538,7 @@ function mcpTokenCard(tok, minted) {
         "You already have a token" + (tok.created_at ? ", created " + utcLabel(tok.created_at) : "") +
         ". It cannot be shown again." +
         // read_only hides the buttons below, so never tell that user to click one
-        (tok.read_only ? "" : " Lost it? New token gives you a fresh one; the old one stops working.") }));
+        (tok.read_only ? "" : " Lost it? New token gives you a fresh value, shown only once; the old one stops working.") }));
     }
     if (tok.read_only) {
       card.append(cnFine("Why is there no button here?",
@@ -5588,7 +5588,8 @@ function mcpEndpointCard(servers) {
 // user recognizes the two fields instead of reading a paragraph about them.
 // The field labels are quoted VERBATIM from
 // build/packaging/mcpb/manifest.template.json; if the bundle renames them the
-// picture lies, so they change together.
+// picture lies. e2e 17g reads the manifest's user_config titles and compares
+// the drawn labels against them, so renaming either side alone rings.
 function claudeAskMock() {
   const field = (n, label, hint) => el("div", { class: "cn-mock-row" },
     el("div", { class: "cn-mock-label", text: label }),
@@ -5604,7 +5605,7 @@ function claudeAskMock() {
 // askExample: the payoff line, drawn as the chat message it becomes.
 function askExample() {
   return el("div", { class: "cn-ask" },
-    "Then ask Claude: ",
+    "Then open a new chat and ask: ",
     el("b", { text: "\u201Cwhat changed in my database in the last hour?\u201D" }));
 }
 
@@ -5625,7 +5626,7 @@ function bundleCard() {
     card.append(el("div", { class: "cn-links" },
       el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/download/v" + ver + "/" + asset, target: "_blank", rel: "noopener", text: "Download the installer" }),
       el("a", { class: "btn btn-sm btn-ghost", href: relTag, target: "_blank", rel: "noopener", text: "All downloads" })));
-    card.append(el("p", { class: "stg-hint", text: "Claude opens and asks for two things:" }));
+    card.append(el("p", { class: "stg-hint", text: "Claude opens and asks to install dbtrail; accept, then fill in two things:" }));
     card.append(claudeAskMock());
     card.append(askExample());
     card.append(cnFine("Intel Mac, Windows, or claude.ai in the browser?",
@@ -5635,21 +5636,29 @@ function bundleCard() {
   } else if (released) {
     // Windows on a released build: the desktop bundle does not exist, so the
     // browser connector IS the path, not a footnote.
-    card.append(el("p", { class: "stg-hint", text: "There is no Windows installer yet. Connect from claude.ai in the browser instead: open Settings, then Connectors, then Add custom connector, and paste the address and token from steps 1 and 2." }));
+    card.append(el("p", { class: "stg-hint", text: "There is no Windows installer yet. If this console is reachable from the internet, connect from claude.ai in the browser: open Settings, then Connectors, then Add custom connector, and paste the address and token from steps 1 and 2." }));
     card.append(askExample());
     card.append(cnFine("Console on a private network?",
-      el("p", { class: "form-hint", text: "The browser path needs this console to be reachable from the internet. On a private network (only reachable from inside), install the desktop bundle on a Mac or Linux machine instead; All downloads below has the files." }),
+      el("p", { class: "form-hint", text: "On a private network (only reachable from inside), claude.ai cannot reach this console; install the desktop bundle on a Mac or Linux machine instead. All downloads below has the files." }),
       el("p", { class: "form-hint" }, el("a", { href: relTag, target: "_blank", rel: "noopener", text: "All downloads for v" + ver }))));
-  } else {
+  } else if (plat) {
     card.append(el("p", { class: "stg-hint", text: "Get the Claude Desktop app (claude.ai/download), then download the newest installer for this computer and double-click it:" }));
     card.append(el("div", { class: "cn-links" },
       el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases", target: "_blank", rel: "noopener", text: "Open the releases page" })));
-    card.append(el("p", { class: "stg-hint", text: "Claude opens and asks for two things:" }));
+    card.append(el("p", { class: "stg-hint", text: "Claude opens and asks to install dbtrail; accept, then fill in two things:" }));
     card.append(claudeAskMock());
     card.append(askExample());
     card.append(cnFine("Which file is for this computer?",
       el("p", { class: "form-hint", text: "This console is a development build, so there is no matching download link. In the newest release: Mac with Apple chip is dbtrail-darwin-arm64.mcpb, Intel Mac is dbtrail-darwin-amd64.mcpb, Linux is dbtrail-linux-amd64.mcpb (or -arm64). Windows has no installer yet." }),
       el("p", { class: "form-hint", text: "Using claude.ai in the browser instead of the desktop app? If this console is reachable from the internet, open Settings, then Connectors, then Add custom connector, and paste the same address and token. On a private network (only reachable from inside), use the desktop app." })));
+  } else {
+    // Development build ON WINDOWS: no installer exists at any version, so
+    // the browser connector is the only path here too.
+    card.append(el("p", { class: "stg-hint", text: "There is no Windows installer. If this console is reachable from the internet, connect from claude.ai in the browser: open Settings, then Connectors, then Add custom connector, and paste the address and token from steps 1 and 2." }));
+    card.append(askExample());
+    card.append(cnFine("Console on a private network?",
+      el("p", { class: "form-hint", text: "On a private network (only reachable from inside), claude.ai cannot reach this console; install the desktop bundle on a Mac or Linux machine instead." }),
+      el("p", { class: "form-hint" }, el("a", { href: "https://github.com/dbtrail/dbtrail/releases", target: "_blank", rel: "noopener", text: "Open the releases page" }))));
   }
   return card;
 }

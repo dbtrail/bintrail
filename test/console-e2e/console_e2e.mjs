@@ -14,6 +14,7 @@
 // playwright-managed chromium).
 import { chromium } from "playwright";
 import zlib from "node:zlib";
+import { readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:8090";
@@ -3605,18 +3606,21 @@ try {
   // Guards: the three numbered badges in order, the mock whose field labels
   // are VERBATIM from build/packaging/mcpb/manifest.template.json, and a hard
   // budget on the VISIBLE text. innerText is the budget's measuring stick on
-  // purpose: it skips closed <details>, so fine print stays free while
-  // anything unfolded on the open page counts against the cap. The cap (1500)
+  // purpose: it skips a closed <details>' folded content (each summary line
+  // still counts), so fine print stays free while anything unfolded on the
+  // open page counts against the cap. The cap (1500)
   // sits ~60% above the measured page (849-916 chars across the token states)
   // and 35% below the pre-simplify page (2304 measured, RED verified), so a
   // copy edit breathes but a wall of text rings.
   // Limit worth naming: run.sh builds without -ldflags, so this only ever
   // photographs the UNVERSIONED bundle arm.
   await page.evaluate(() => navigate("connect"));
-  // Wait on .cn-card, a connect-only marker: ".card" is satisfied by the
-  // PREVIOUS view's cards while renderConnect's fetches are still in flight
-  // (navigate flips the pathname immediately), which photographed a half-built
-  // page in the preview loop for this scenario.
+  // Wait on .cn-card, a connect-only marker. ".card" is not connect-specific:
+  // anything else that paints cards into the shared #view container (another
+  // view's late async paint — the route-clobber class scenario 17c exists
+  // for) can satisfy it, and the preview loop for this scenario photographed
+  // exactly one such half-built page. .cn-card can only exist after
+  // buildConnect ran, and === 3 also rings if a card is dropped.
   await page.waitForFunction(() => location.pathname === "/connect"
     && document.querySelectorAll(".view .cn-card").length === 3, { timeout: 10000 });
   const cn = await page.evaluate(() => {
@@ -3631,20 +3635,29 @@ try {
       fine: document.querySelectorAll(".view details.cn-fine").length,
       addrCopy: addrCard ? Array.from(addrCard.querySelectorAll("button")).some((b) => b.textContent === "Copy") : false,
       once: /shown only once/.test(visible),
+      // The 404-honesty rule's photographable half: this run is the
+      // unversioned arm, where a direct release-asset link can only 404.
+      downloadLinks: document.querySelectorAll('.view a[href*="/releases/download/"]').length,
     };
   });
+  // The mock's field labels come from the REAL bundle manifest, not from a
+  // second hand-maintained copy: renaming either side alone rings here.
+  const mcpbCfg = JSON.parse(readFileSync(new URL("../../build/packaging/mcpb/manifest.template.json", import.meta.url), "utf8")).user_config;
+  const mcpbTitles = [mcpbCfg.console_url.title, mcpbCfg.token.title];
   (cn.badges === "123")
     ? ok("connect: three numbered step badges in order")
     : bad("connect: three numbered step badges in order", JSON.stringify(cn.badges));
-  (cn.labels.length === 2 && cn.labels[0] === "Console / MCP endpoint URL" && cn.labels[1] === "Access token")
+  (cn.labels.length === 2 && cn.labels[0] === mcpbTitles[0] && cn.labels[1] === mcpbTitles[1])
     ? ok("connect: the drawn dialog carries the manifest's field names verbatim")
-    : bad("connect: the drawn dialog carries the manifest's field names verbatim", JSON.stringify(cn.labels));
+    : bad("connect: the drawn dialog carries the manifest's field names verbatim", JSON.stringify({ drawn: cn.labels, manifest: mcpbTitles }));
   (cn.visibleChars > 0 && cn.visibleChars < 1500 && cn.fine >= 1)
     ? ok("connect: visible text stays under budget with fine print folded")
     : bad("connect: visible text stays under budget with fine print folded", "chars " + cn.visibleChars + " fine " + cn.fine);
-  (cn.once && cn.addrCopy)
-    ? ok("connect: the one-time warning is visible and the address is one click to copy")
-    : bad("connect: the one-time warning is visible and the address is one click to copy", JSON.stringify({ once: cn.once, addrCopy: cn.addrCopy }));
+  // "shown only once" is carried by BOTH non-minted token states (fresh and
+  // managed); this run exercises the fresh one (no scenario mints a token).
+  (cn.once && cn.addrCopy && cn.downloadLinks === 0)
+    ? ok("connect: one-time warning visible, address one click to copy, no 404able download link")
+    : bad("connect: one-time warning visible, address one click to copy, no 404able download link", JSON.stringify({ once: cn.once, addrCopy: cn.addrCopy, downloadLinks: cn.downloadLinks }));
 
   // ── Scenario 17f — the Events skeleton is visible (#1397) ──
   //
