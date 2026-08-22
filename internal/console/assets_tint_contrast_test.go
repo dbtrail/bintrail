@@ -11,7 +11,7 @@ import (
 
 // The #1421 tint palette's ONE hard constraint, as a measurement rather than a
 // promise: every -deep text partner holds >= 4.5:1 on its own tint and on
-// white. The site's own deep values were measured FAILING this (3.7-3.8:1),
+// white. The site's own deep values were measured FAILING this (3.68-3.84:1),
 // which is why the console carries darkened partners instead of copying the
 // site's — so a well-meaning "sync the colors with the site" edit is exactly
 // the change this test exists to catch.

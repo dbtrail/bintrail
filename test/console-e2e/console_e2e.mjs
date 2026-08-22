@@ -1705,8 +1705,10 @@ try {
   // Identity, not just difference (#1423 review): a wrong-but-different color
   // passed the check above. The violet ground IS the home page's --violet-tint
   // (#EFE9FF) — home fidelity is the point of #1421, so the exact value is the
-  // contract. Update all three together if the palette ever moves: this pin,
-  // the token, and the Go contrast test's measurements.
+  // contract. The two LITERAL copies are this pin and the token; the Go test
+  // reads the token live, so on a palette move its floors ring on their own —
+  // what needs re-measuring by hand is the recorded figures in style.css's
+  // comments (the skeleton peak, the ink-3 note, the divider note).
   (tint.violet === "rgb(239, 233, 255)")
     ? ok("overview (live): the violet panel renders the home page's own tint value")
     : bad("overview (live): the violet panel renders the home page's own tint value", JSON.stringify(tint));
@@ -2874,7 +2876,7 @@ try {
           ratio: Number(brand.skelRatio.toFixed(3)), parsed: brand.skelParsed }));
   // The violet panel is the worst ground the bars stand on since the tiles
   // went white (measured 1.43 there vs 1.60 on the studio tile). Same 1.3
-  // floor: reverting the bar to plain --line lands ~1.13 on violet and rings.
+  // floor: reverting the bar to plain --line lands ~1.08 on violet and rings.
   (brand.skelVioletParsed && brand.skelVioletRatio >= 1.3)
     ? ok("brand paint: the warmed loading bar stays clear of the violet panel ground")
     : bad("brand paint: the warmed loading bar stays clear of the violet panel ground",
