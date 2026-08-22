@@ -5408,13 +5408,13 @@ async function renderConnect() {
   if (gen !== serverGen) {
     // The consumed plaintext cannot be re-shown; say so instead of losing it
     // silently (the user must rotate to get a usable value).
-    if (minted) toastError("Token display interrupted; the plain token is gone. Rotate to get a fresh one");
+    if (minted) toastError("Token display interrupted; the plain token is gone. Click New token to get a fresh one");
     return;
   }
   try {
     buildConnect(servers, tokStatus, minted);
   } catch (err) {
-    if (minted) toastError("Token display interrupted; the plain token is gone. Rotate to get a fresh one");
+    if (minted) toastError("Token display interrupted; the plain token is gone. Click New token to get a fresh one");
     const v = VIEW(); clear(v); v.append(pageHead("Connect AI", null)); renderError(v, err);
   }
 }
@@ -5487,7 +5487,7 @@ async function revokeMCPToken() {
   try {
     await api("/api/mcp-token", { method: "DELETE" });
   } catch (err) {
-    toastError("Revoke failed: " + (err.message || err));
+    toastError("Could not delete the token: " + (err.message || err));
     return;
   }
   toast("Token deleted. AI clients that used it are disconnected");
@@ -5507,7 +5507,7 @@ function mcpTokenCard(tok, minted) {
     card.append(el("p", { class: "stg-hint", text: "Here is your new token. Copy it NOW and keep it somewhere safe (a password manager is ideal). It is not stored anywhere, so this is the only time it will ever be on screen:" }));
     card.append(el("div", { class: "cn-urlrow" },
       el("code", { class: "stg-code cn-url", text: minted }),
-      el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(minted, "MCP token") })));
+      el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(minted, "Access token") })));
   }
   if (!tok) {
     card.append(el("p", { class: "stg-hint", text: "We could not check whether a token exists. Reload the page to try again." }));
@@ -5517,7 +5517,9 @@ function mcpTokenCard(tok, minted) {
     if (!minted) {
       card.append(el("p", { class: "stg-hint", text:
         "You already created a token" + (tok.created_at ? " on " + utcLabel(tok.created_at) : "") +
-        ". Its value is not saved anywhere, so it cannot be shown again. Lost it? Click New token: you get a fresh value to copy, and the old one stops working." }));
+        ". Its value is not saved anywhere, so it cannot be shown again." +
+        // read_only hides the buttons below, so never tell that user to click one
+        (tok.read_only ? "" : " Lost it? Click New token: you get a fresh value to copy, and the old one stops working.") }));
     }
     if (tok.read_only) {
       card.append(el("p", { class: "form-hint", text:
@@ -5555,7 +5557,7 @@ function mcpEndpointCard(servers) {
   const url = mcpURL(servers);
   card.append(el("div", { class: "cn-urlrow" },
     el("code", { class: "stg-code cn-url", text: url }),
-    el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(url, "MCP URL") })));
+    el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(url, "Console address") })));
   if ((servers || []).length > 1) {
     card.append(el("p", { class: "form-hint", text:
       "This address points at the server picked in the left sidebar (the Server box at the top). To connect a different server, pick it there first and copy again: each server has its own address." }));
@@ -5575,7 +5577,7 @@ function bundleCard() {
   card.append(el("ol", { class: "cn-steps" },
     el("li", { text: "You need the Claude Desktop app installed (claude.ai/download). Using claude.ai in the browser instead? See the note below." }),
     el("li", { text: released
-      ? "Download the installer with the button below; it picks the right file for this computer."
+      ? "Download the installer with the button below; it is the best guess for this computer, and the note under the buttons says when to pick a different file."
       : "Download the installer from the releases page below; the note under the button says which file matches this computer." }),
     el("li", { text: "Double-click the downloaded file. Claude Desktop opens and asks to install dbtrail; accept." }),
     el("li", { text: "Claude then asks for two things. In \"Console / MCP endpoint URL\" paste the address from step 2; in \"Access token\" paste the token from step 1." }),
@@ -5586,12 +5588,12 @@ function bundleCard() {
       el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/download/v" + ver + "/" + asset, text: "Download " + asset }),
       el("a", { class: "btn btn-sm btn-ghost", href: "https://github.com/dbtrail/dbtrail/releases/tag/v" + ver, target: "_blank", rel: "noopener", text: "All downloads for v" + ver })));
     card.append(el("p", { class: "form-hint", text:
-      "The download matches this console's version (v" + ver + "). If the link lands on a page saying Not Found, that older release predates the installer; use All downloads and take the newest release's file instead." }));
+      "The download matches this console's version (v" + ver + ") and guesses your computer (Macs are assumed Apple chip). Intel Mac? Use All downloads and take dbtrail-darwin-amd64.mcpb. Windows has no installer yet; use the claude.ai note below instead. If the link lands on Not Found, that older release predates the installer; take the newest release's file from All downloads." }));
   } else {
     card.append(el("div", { class: "cn-links" },
       el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases", target: "_blank", rel: "noopener", text: "Open the releases page" })));
     card.append(el("p", { class: "form-hint", text:
-      "This console is a development build, so there is no matching download link. Open the releases page, take the NEWEST release, and download the file for this computer: Mac is dbtrail-darwin-arm64.mcpb, Windows is dbtrail-windows-amd64.mcpb, Linux is dbtrail-linux-amd64.mcpb." }));
+      "This console is a development build, so there is no matching download link. Open the releases page, take the NEWEST release, and download the file for this computer: Mac with Apple chip is dbtrail-darwin-arm64.mcpb, Intel Mac is dbtrail-darwin-amd64.mcpb, Linux is dbtrail-linux-amd64.mcpb (or -arm64). Windows has no installer yet; use the claude.ai note below instead." }));
   }
   card.append(el("p", { class: "form-hint", text:
     "Using claude.ai in the browser instead of the desktop app? If this console is reachable from the internet, open claude.ai, go to Settings, then Connectors, then Add custom connector, and paste the same address and token there. On a private network (only reachable from inside), use the desktop app instead." }));

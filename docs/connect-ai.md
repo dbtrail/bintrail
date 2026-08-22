@@ -33,8 +33,8 @@ token**, and you mint one without leaving the browser:
 Open **Settings → Connect AI** in the sidebar. If no token is configured yet,
 the **Access token** card has a **Generate token** button — click it, copy the
 value it shows (it appears exactly once and is never stored), and you're done.
-No flags, no environment variables, no restart. The same card rotates or
-revokes the token later. The generated token is scoped to the MCP tools only —
+No flags, no environment variables, no restart. The same card replaces the
+token (**New token**) or deletes it (**Delete token**) later. The generated token is scoped to the MCP tools only —
 it cannot administer the console — and it carries the permission grants of the
 session that minted it, so each MCP tool works only if your session could use
 the matching console surface directly (details in
@@ -85,10 +85,11 @@ Two things worth knowing (the page handles both for you):
 
 That's it. No config files were harmed.
 
-> **macOS / Windows note:** published bundles currently cover Linux (the
-> release build matrix). On a Mac, build a native bundle from source with
-> `make mcpb` (output in `dist/mcpb/`), or use the raw-config fallback on the
-> Connect AI page — same two values, five lines of JSON.
+> **Platform note:** published bundles cover macOS (both chips: darwin-arm64
+> and darwin-amd64) and Linux (amd64 and arm64). There is no Windows bundle
+> yet — on Windows, add the console as a claude.ai custom connector (public
+> HTTPS deployments), or use the raw-config fallback on the Connect AI page
+> with a bridge you build yourself.
 
 ## Step 3 — ask something
 

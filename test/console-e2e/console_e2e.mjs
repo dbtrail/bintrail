@@ -3583,11 +3583,28 @@ try {
     ? ok("tropical: the haze is anchored to scroll content, not the viewport")
     : bad("tropical: the haze is anchored to scroll content, not the viewport", tropSide.attachment);
 
-  // ── Scenario 17c — Connect AI reads as steps, not as jargon. The page's
+
+  // The card tint rotation, on the page from the user's own screenshot. Two
+  // distinct tinted grounds prove rotation; "not white" alone would pass a
+  // single flat tint.
+  await page.evaluate(() => navigate("storage"));
+  await page.waitForFunction(() => location.pathname === "/storage" && document.querySelectorAll(".cards .card").length >= 2, { timeout: 10000 });
+  const tints = await page.evaluate(() => {
+    const cards = Array.from(document.querySelectorAll(".cards .card")).slice(0, 2);
+    return cards.map((c) => getComputedStyle(c).backgroundColor);
+  });
+  (tints.length === 2 && tints[0] !== tints[1] && !tints.includes("rgb(255, 255, 255)") && !tints.includes("rgba(0, 0, 0, 0)"))
+    ? ok("tropical: config cards rotate through the home's tint palette")
+    : bad("tropical: config cards rotate through the home's tint palette", JSON.stringify(tints));
+
+  // ── Scenario 17g — Connect AI reads as steps, not as jargon. The page's
   // audience is Claude users, mostly non-technical; the rewrite turned the
   // three cards into an explicit Step 1/2/3 with a literal ordered list.
   // Structure is the guard (titles, the <ol>, the one-time warning), so a
   // future copy edit can rewrite words but not silently dissolve the steps.
+  // Limit worth naming: run.sh builds without -ldflags, so this only ever
+  // exercises the UNVERSIONED bundle arm; the released arm's copy is not
+  // photographed here.
   await page.evaluate(() => navigate("connect"));
   await page.waitForFunction(() => location.pathname === "/connect"
     && document.querySelectorAll(".view .card").length >= 3, { timeout: 10000 });
@@ -3611,19 +3628,6 @@ try {
   (cn.subOnce && cn.addrCopy)
     ? ok("connect: the one-time-token warning leads the page and the address is one click to copy")
     : bad("connect: the one-time-token warning leads the page and the address is one click to copy", JSON.stringify(cn));
-
-  // The card tint rotation, on the page from the user's own screenshot. Two
-  // distinct tinted grounds prove rotation; "not white" alone would pass a
-  // single flat tint.
-  await page.evaluate(() => navigate("storage"));
-  await page.waitForFunction(() => location.pathname === "/storage" && document.querySelectorAll(".cards .card").length >= 2, { timeout: 10000 });
-  const tints = await page.evaluate(() => {
-    const cards = Array.from(document.querySelectorAll(".cards .card")).slice(0, 2);
-    return cards.map((c) => getComputedStyle(c).backgroundColor);
-  });
-  (tints.length === 2 && tints[0] !== tints[1] && !tints.includes("rgb(255, 255, 255)") && !tints.includes("rgba(0, 0, 0, 0)"))
-    ? ok("tropical: config cards rotate through the home's tint palette")
-    : bad("tropical: config cards rotate through the home's tint palette", JSON.stringify(tints));
 
   // ── Scenario 17f — the Events skeleton is visible (#1397) ──
   //

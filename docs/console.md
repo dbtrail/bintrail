@@ -979,8 +979,8 @@ Rules that differ from the standalone `bintrail-mcp` server:
   atomic write, versioned envelope with the registry's read-only-if-newer
   contract), its plaintext is shown exactly once at generation, and it is
   **scoped to `/mcp` alone** — it cannot drive the browser API (registry
-  CRUD, monitor verbs, or its own rotation). Rotate/revoke from the same
-  card take effect on the next request, including for sibling console
+  CRUD, monitor verbs, or its own rotation). New token / Delete token from
+  the same card take effect on the next request, including for sibling console
   processes sharing the file: every `/mcp` request re-validates the
   credential, so a rotated-away or revoked token stops authenticating
   immediately. An MCP *session* is additionally bound to the credential that
@@ -1023,7 +1023,7 @@ The UI's **Settings → Connect AI** page assembles all of this for you: the
 ready-to-copy `/mcp` URL for the selected server (the per-server form when
 more than one server is registered), the `.mcpb` bundle download for the
 running version, and the raw-config fallback above. Its **Access token** card
-generates, rotates, and revokes the managed MCP token; the plaintext is
+generates, replaces (**New token**), and deletes the managed MCP token; the plaintext is
 displayed exactly once, at generation, and never stored. For the
 start-to-finish walkthrough (bundle install included), see
 [Connect an AI assistant](connect-ai.md).
