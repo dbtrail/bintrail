@@ -3647,7 +3647,9 @@ try {
   });
   // The mock's field labels come from the REAL bundle manifest, not from a
   // second hand-maintained copy: renaming either side alone rings here.
-  const mcpbCfg = JSON.parse(readFileSync(new URL("../../build/packaging/mcpb/manifest.template.json", import.meta.url), "utf8")).user_config;
+  // globalThis.URL: this file shadows URL with the console's base-address
+  // string (line ~20), so the bare constructor here is a string, not URL.
+  const mcpbCfg = JSON.parse(readFileSync(new globalThis.URL("../../build/packaging/mcpb/manifest.template.json", import.meta.url), "utf8")).user_config;
   const mcpbTitles = [mcpbCfg.console_url.title, mcpbCfg.token.title];
   (cn.badges === "123")
     ? ok("connect: three numbered step badges in order")
