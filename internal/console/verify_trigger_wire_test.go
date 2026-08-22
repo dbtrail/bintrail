@@ -14,6 +14,10 @@ import (
 // shadowed under VerifyRunRecord, and silently kill Explain on every LIVE
 // run. This test is the boundary's Go half; the e2e's three legs all sit on
 // the JS side.
+//
+// Scope honesty: this leg sees only a NO-omitempty addition — an omitempty
+// Trigger populated mid-run would slip a zero-value marshal. If you add one,
+// extend this test with a POPULATED status.
 func TestVerifyStatusCarriesNoTriggerKey(t *testing.T) {
 	b, err := json.Marshal(VerifyStatus{State: "running"})
 	if err != nil {

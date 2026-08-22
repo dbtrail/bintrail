@@ -1994,12 +1994,13 @@ try {
       subDescribesAll: !/prove a snapshot still reconstructs/i.test(document.querySelector(".page-sub").textContent),
       helpBefore, helpAfter: help ? help.textContent : "",
       // Measured, not scrollWidth: Chrome reports scrollWidth == clientWidth
-      // for a <select> at ANY width (the dropdown clips, the control never
-      // scrolls) — the first cut of this assertion stayed green with the old
-      // 260px cap restored. Render the longest option's text in the select's
-      // own font and compare real pixels, leaving room for the chrome.
-      selWideEnough: (() => {
-        if (!sel) return false;
+      // for a <select> at ANY width (the closed control clips its text and
+      // never scrolls; the popup sizes itself) — the first cut of this
+      // assertion stayed green with the old 260px cap restored. Render the
+      // longest option's text in the select's own font and compare real
+      // pixels, leaving room for the chrome.
+      selWide: (() => {
+        if (!sel) return { ok: false, why: "no select" };
         const cs = getComputedStyle(sel);
         const probe = document.createElement("span");
         probe.style.cssText = "position:absolute;visibility:hidden;white-space:nowrap;font:" + cs.font;
@@ -2010,7 +2011,8 @@ try {
           widest = Math.max(widest, probe.getBoundingClientRect().width);
         });
         probe.remove();
-        return sel.clientWidth >= widest + 30;
+        return { ok: sel.clientWidth >= widest + 30,
+          why: "clientWidth=" + sel.clientWidth + " vs widest+30=" + Math.round(widest + 30) };
       })(),
     };
   });
@@ -2021,9 +2023,10 @@ try {
     && /never touches your database/.test(vfyStruct.helpAfter))
     ? ok("verification: the mode help swaps with the select and states proof, prerequisite, cost")
     : bad("verification: the mode help swaps with the select and states proof, prerequisite, cost", JSON.stringify({ b: vfyStruct.helpBefore, a: vfyStruct.helpAfter }));
-  vfyStruct.selWideEnough
+  (vfyStruct.selWide && vfyStruct.selWide.ok)
     ? ok("verification: the mode select no longer truncates its own options")
-    : bad("verification: the mode select no longer truncates its own options", "scrollWidth > clientWidth");
+    : bad("verification: the mode select no longer truncates its own options",
+        vfyStruct.selWide ? vfyStruct.selWide.why : "probe missing");
 
   // (b) the running treatment (#1420), pinned through the REAL renderer with
   // a synthetic in-flight status — the fixture run below is too fast to

@@ -1964,7 +1964,8 @@ button { font-family: inherit; }
 .vfy-modehelp { margin: 8px 2px 0; max-width: 860px; }
 .vfy-glossary { margin-top: 12px; }
 
-/* structured result rows (#1419 §2/§3): mark | table | verdict | counts | reason.
+/* structured result rows (#1419 §2/§3): mark | table | verdict | counts |
+   reason | explain (the trailing auto track holds the Explain button).
    The verdict column is fixed and colored — the word, not a mid-sentence
    glyph, carries the answer. Verdict colors reuse the doctor-card bands. */
 .vfy-rows { display: flex; flex-direction: column; }

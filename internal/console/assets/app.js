@@ -4078,12 +4078,10 @@ async function createBaseline(id, btn) {
   } else {
     toast("Baseline still running — check back shortly.");
   }
-  // Create baseline now lives on /baselines (#1384) while the summary card
-  // still appears on /storage, so refresh whichever is on screen. Hardcoding
-  // /storage would leave the page that OWNS the button showing a stale list
-  // right after the run it started.
-  // Only /baselines: the Create baseline button lives in baselinesPanel, which
-  // no longer renders on Storage, so a /storage arm here would be unreachable.
+  // Only /baselines needs the refresh: the button lives in
+  // baselineContextStrip (#1415 moved it out of baselinesPanel), and both the
+  // strip and the snapshot list render only on this page — a /storage arm
+  // here would be unreachable.
   if (location.pathname === "/baselines") renderBaselines();
 }
 
@@ -4181,7 +4179,7 @@ function verifyRegions(servers, opts) {
     el("summary", { class: "form-adv-summary", text: "What these words mean" }),
     el("p", { class: "form-hint", text: "Chain — every indexed event for one row, oldest to newest. The walk follows each row's history in order." }),
     el("p", { class: "form-hint", text: "Before-image assertion — each UPDATE/DELETE stores what the row looked like just before it; the check asserts that matches what the previous event left behind. This is exactly the data an undo script would be built from." }),
-    el("p", { class: "form-hint", text: "Began mid-history — the window caught a row mid-life, so its first event has no stored predecessor to check against. Widening the lookback usually resolves it." }),
+    el("p", { class: "form-hint", text: "Began mid-history — the window caught a row mid-life, so its first event has no stored predecessor to check against. Widening the lookback (CLI: verify --check recover --lookback …) can give these chains their predecessors — when the earlier history is still in the index." }),
     el("p", { class: "form-hint", text: "Nothing to check / no activity — quiet or append-only tables, where zero assertions is the expected outcome; counted separately so they don't read as findings." })));
 
   // ── Region 3: what ran before ──
@@ -4202,7 +4200,7 @@ function verifyRegions(servers, opts) {
 // these three claims per entry: proof, prerequisite, cost.
 const VFY_MODE_HELP = {
   "baseline-anchored": "Replays your indexed changes from the previous snapshot forward and fingerprints the result against the newest one. Strong evidence your backup chain is sound — the default. Needs two snapshots; never touches your database.",
-  "live-source": "Rebuilds each table from a snapshot plus the indexed changes and compares it against the real table. The strongest check, and the only mode that reads your database — it can take a while, adds load, and needs a QUIET table: writes landing during the scan read as mismatches. Best run outside busy hours.",
+  "live-source": "Rebuilds each table from a snapshot plus the indexed changes and compares it against the real table. The strongest content check, and the only mode that reads your database — it can take a while, adds load, and needs a QUIET table: writes landing during the scan read as mismatches. Best run outside busy hours.",
   "recover-inputs": "Walks the index's own before/after images and checks every row's chain is self-consistent — exactly the data an undo script would be built from. Needs no snapshot and never touches your database.",
 };
 
@@ -4391,8 +4389,9 @@ async function loadVerifyHistory(id, box) {
 
 // vfySortResults: worst verdict first (#1419 §3) — a mismatch must not sit
 // at alphabetical position 31 below the fold, visually identical to the 46
-// clean rows around it. Within a band the alphabetical order is kept (stable
-// sort), so scanning stays predictable. Display-only: the wire order is the
+// clean rows around it. Within a band the incoming order is kept
+// (stable sort) — alphabetical in practice, because both result enumerators
+// sort; the ORDER BY is theirs, not this function's. Display-only: the wire order is the
 // engine's completion order and the summary counts are order-free.
 const VFY_SORT_BAND = { warn: 2, note: 3, pass: 4 }; // fail band ranks 0/1 inline (mismatch first)
 function vfySortResults(results) {
@@ -4436,7 +4435,7 @@ function renderVerifyResults(container, status, id, opts) {
   const history = (opts && opts.history) || (status && status.trigger !== undefined);
   if (!status || status.state === "idle") {
     if (!history) {
-      container.append(el("div", { class: "ev-empty", text: "No run in this session yet — results appear here, table by table, as a run progresses. Past runs are under History." }));
+      container.append(el("div", { class: "ev-empty", text: "No run yet — results appear here, table by table, once you start one. Past runs are under History." }));
     }
     return;
   }
