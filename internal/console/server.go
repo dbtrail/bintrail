@@ -98,6 +98,14 @@ type Config struct {
 	// BINTRAIL_CONSOLE_BASELINE_TRIGGER=1. nil when no refresh loop runs, and the
 	// baseline listing then simply carries no refresh section.
 	BaselineRefresh BaselineRefreshReporter
+	// BaselineRestore runs operator-chosen point-in-time restores into the
+	// server's own baseline store. Wired whenever the watch daemon has a
+	// baseline supervisor (creation or refresh opt-in); nil elsewhere.
+	BaselineRestore BaselineRestorer
+	// BaselineHistory is the persisted record of baseline runs this daemon
+	// performed (dump/refresh/restore), used by the backups detail surface to
+	// report exact durations. Nil = no history (exact durations unavailable).
+	BaselineHistory *BaselineRunHistory
 	// SchemaSnapshotCtrl re-reads a monitored source's column layout and
 	// restarts that server's stream onto the result (#1296). Wired in by
 	// `bintrail-console watch` alongside MonitorCtrl and needing no separate
@@ -212,6 +220,8 @@ type Server struct {
 	verifyCtrl VerifyController
 	// verifyHistory: the persisted run history, set with verifyCtrl (#1191).
 	verifyHistory *VerifyHistory
+	baselineRestore BaselineRestorer
+	baselineHistory *BaselineRunHistory
 	// telemetry: non-nil only when a long-running console wired its live
 	// telemetry client (see Config.Telemetry), so the UI opt-out reaches it.
 	telemetry TelemetryController
@@ -411,6 +421,8 @@ func New(cfg Config) (*Server, error) {
 		schemaSnapCtrl:   cfg.SchemaSnapshotCtrl,
 		verifyCtrl:       cfg.VerifyCtrl,
 		verifyHistory:    cfg.VerifyHistory,
+		baselineRestore:  cfg.BaselineRestore,
+		baselineHistory:  cfg.BaselineHistory,
 		telemetry:        cfg.Telemetry,
 		rotationDefaults: cfg.RotationDefaults,
 		version:          cfg.Version,
@@ -518,6 +530,8 @@ func (s *Server) buildHandler() http.Handler {
 	// listing, and the process's ambient AWS credential signals (presence
 	// booleans and non-secret names — never values).
 	api.HandleFunc("GET /api/baselines", s.handleBaselines)
+	api.HandleFunc("GET /api/baselines/files", s.handleBaselineFiles)
+	api.HandleFunc("GET /api/baselines/download", s.handleBaselineDownload)
 	api.HandleFunc("GET /api/views.sql", s.handleViewsSQL)
 	// The sandboxed SQL panel (#1177). Registered unconditionally so the
 	// route's refusal (403 with the opt-in hint) is actionable; the real gate
@@ -552,6 +566,8 @@ func (s *Server) buildHandler() http.Handler {
 	// (BINTRAIL_CONSOLE_BASELINE_TRIGGER=1). GET polls the running/last state.
 	api.HandleFunc("POST /api/servers/{id}/baseline", s.recordAction("baseline", s.handleBaselineTrigger))
 	api.HandleFunc("GET /api/servers/{id}/baseline", s.handleBaselineStatus)
+	api.HandleFunc("POST /api/servers/{id}/baseline/restore", s.recordAction("baseline-restore", s.handleBaselineRestore))
+	api.HandleFunc("GET /api/servers/{id}/baseline/restore", s.handleBaselineRestoreStatus)
 	// Schema-snapshot refresh (#1296): re-read the source's column layout and
 	// restart that server's stream onto it — the remedy the capture-degraded
 	// banner names, which had no button anywhere before. 403 unless this

@@ -113,7 +113,7 @@ func zooRows() ([][]string, [][]bool) {
 // the snapshot directory plus the emitted file's path.
 func emitSnapshot(t *testing.T, sourcePath string, changes map[string]*query.ResultRow, cut *query.BinlogPos, at time.Time) (snapDir, filePath string, rep *TableReport) {
 	t.Helper()
-	snapDir = filepath.Join(t.TempDir(), snapshotDirName(at))
+	snapDir = filepath.Join(t.TempDir(), SnapshotDirName(at))
 	if err := os.MkdirAll(snapDir, 0o755); err != nil {
 		t.Fatalf("mkdir snapshot dir: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestParquetSnapshot_discoverableByFindBaseline(t *testing.T) {
 
 	root := t.TempDir()
 	at := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
-	snapDir := filepath.Join(root, snapshotDirName(at))
+	snapDir := filepath.Join(root, SnapshotDirName(at))
 	if err := os.MkdirAll(snapDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestParquetSnapshot_discoverableByFindBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindBaseline did not discover the emitted snapshot: %v", err)
 	}
-	if filepath.Base(path) != "orders.parquet" || !strings.Contains(path, snapshotDirName(at)) {
+	if filepath.Base(path) != "orders.parquet" || !strings.Contains(path, SnapshotDirName(at)) {
 		t.Errorf("discovered %q, want the emitted snapshot's file", path)
 	}
 	if !ts.Equal(at) {
@@ -488,14 +488,14 @@ func TestCheckSchemaMatchesBaseline(t *testing.T) {
 // so this is a compatibility contract with `bintrail baseline`, not formatting.
 func TestSnapshotDirName_matchesBaselineRunFormat(t *testing.T) {
 	at := time.Date(2026, 2, 28, 0, 0, 0, 0, time.UTC)
-	if got, want := snapshotDirName(at), "2026-02-28T00-00-00Z"; got != want {
+	if got, want := SnapshotDirName(at), "2026-02-28T00-00-00Z"; got != want {
 		t.Fatalf("snapshotDirName = %q, want %q", got, want)
 	}
 	// Non-UTC input must normalise, or two snapshots taken at the same instant
 	// from differently-configured hosts would sort against each other wrongly.
 	loc := time.FixedZone("X", -5*3600)
-	if got, want := snapshotDirName(at.In(loc)), "2026-02-28T00-00-00Z"; got != want {
-		t.Fatalf("snapshotDirName(non-UTC) = %q, want %q", got, want)
+	if got, want := SnapshotDirName(at.In(loc)), "2026-02-28T00-00-00Z"; got != want {
+		t.Fatalf("SnapshotDirName(non-UTC) = %q, want %q", got, want)
 	}
 }
 
@@ -618,7 +618,7 @@ func TestReconstructTables_rejectsUnknownOutputFormat(t *testing.T) {
 func TestReconstructTables_refusesNonEmptySnapshotDir(t *testing.T) {
 	root := t.TempDir()
 	at := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
-	occupied := filepath.Join(root, snapshotDirName(at))
+	occupied := filepath.Join(root, SnapshotDirName(at))
 	if err := os.MkdirAll(filepath.Join(occupied, "mydb"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -647,7 +647,7 @@ func TestReconstructTables_refusesNonEmptySnapshotDir(t *testing.T) {
 func TestReconstructTables_retriesIntoAMarkerOnlySnapshotDir(t *testing.T) {
 	root := t.TempDir()
 	at := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
-	prior := filepath.Join(root, snapshotDirName(at))
+	prior := filepath.Join(root, SnapshotDirName(at))
 	if err := os.MkdirAll(prior, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}

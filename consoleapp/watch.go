@@ -457,6 +457,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if upBaselineRefreshEvery != "" {
 		cfg.BaselineRefresh = baselineSup
 	}
+	wireBaselineExtras(&cfg, baselineSup, serversPath)
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {
 		return err
@@ -656,6 +657,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	if upBaselineRefreshEvery != "" {
 		cfg.BaselineRefresh = baselineSup
 	}
+	wireBaselineExtras(&cfg, baselineSup, serversPath)
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {
 		return err

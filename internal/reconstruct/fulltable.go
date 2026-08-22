@@ -83,12 +83,13 @@ const (
 	OutputFormatParquet = "parquet"
 )
 
-// snapshotDirName renders a snapshot's directory name from its target instant,
+// SnapshotDirName renders a snapshot's directory name from its target instant,
 // byte-identical to what baseline.Run produces (RFC3339 UTC with ':' replaced
 // by '-' for filesystem portability). The name IS the snapshot's timestamp as
 // far as FindBaseline is concerned, so this formatting is a compatibility
-// contract, not a display choice.
-func snapshotDirName(at time.Time) string {
+// contract, not a display choice. Exported for the console's backup detail
+// and download surfaces, which resolve one snapshot's directory from its time.
+func SnapshotDirName(at time.Time) string {
 	return strings.ReplaceAll(at.UTC().Format(time.RFC3339), ":", "-")
 }
 
@@ -382,7 +383,7 @@ func reconstructTables(ctx context.Context, cfg FullTableConfig, failures *[]Tab
 	// operates on markerDir rather than cfg.OutputDir.
 	markerDir := cfg.OutputDir
 	if parquetMode {
-		cfg.snapshotDir = filepath.Join(cfg.OutputDir, snapshotDirName(cfg.At))
+		cfg.snapshotDir = filepath.Join(cfg.OutputDir, SnapshotDirName(cfg.At))
 		// Refuse rather than merge into an existing snapshot directory. Unlike a
 		// reconstruct output dir — an operator-chosen path that is routinely
 		// re-run into, which markRunIncomplete handles by clearing the stale

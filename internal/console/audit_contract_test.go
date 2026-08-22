@@ -111,6 +111,21 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			},
 		},
 		{
+			name:      "baseline download",
+			action:    "baseline.download",
+			wantActor: tokenActor,
+			call: func(t *testing.T) {
+				dir := newDetailFixture(t)
+				s := newBaselineServer(t, dir, true)
+				w := httptest.NewRecorder()
+				s.handleBaselineDownload(w, httptest.NewRequest("GET",
+					"/api/baselines/download"+detailQuery(detailSnapAt), nil))
+				if w.Code != http.StatusOK {
+					t.Fatalf("baseline download: code=%d body=%s", w.Code, w.Body.String())
+				}
+			},
+		},
+		{
 			name:      "sql panel",
 			action:    "sql.run",
 			wantActor: tokenActor,

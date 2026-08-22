@@ -54,6 +54,14 @@ type baselineSupervisor struct {
 
 	mu   sync.Mutex
 	jobs map[string]*console.BaselineStatus
+	// restores tracks point-in-time restore jobs, keyed by server id —
+	// a third kind alongside jobs (dumps) and refreshes, all sharing the
+	// single-flight in busyLocked.
+	restores map[string]*console.BaselineStatus
+	// history, when non-nil, records every finished run (dump/refresh/
+	// restore) so the backups page can report exact durations. Failures to
+	// save are logged, never returned: history must not fail a run.
+	history *console.BaselineRunHistory
 	// refreshes tracks the PERIODIC refresh jobs (#1171), kept apart from jobs
 	// so a manual dump cannot erase the evidence that the automatic refresh has
 	// been failing. Both share the single-flight (busyLocked).
@@ -70,6 +78,7 @@ func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode base
 		lockMode:   lockMode,
 		jobs:       make(map[string]*console.BaselineStatus),
 		refreshes:  make(map[string]*console.BaselineStatus),
+		restores:   make(map[string]*console.BaselineStatus),
 	}
 }
 
@@ -110,7 +119,16 @@ func (s *baselineSupervisor) Status(serverID string) console.BaselineStatus {
 }
 
 func (s *baselineSupervisor) run(req console.BaselineRequest) {
-	stats, uploaded, err := s.execute(req)
+	started := time.Now().UTC()
+	stats, uploaded, snapTime, err := s.execute(req)
+	rec := console.BaselineRunRecord{
+		Kind: console.BaselineRunDump, StartedAt: started.Format(time.RFC3339),
+		Tables: stats.TablesProcessed, Rows: stats.RowsWritten, Uploaded: uploaded,
+	}
+	if err == nil && !snapTime.IsZero() {
+		rec.SnapshotTime = snapTime.UTC().Format(time.RFC3339)
+	}
+	s.recordRun(req.ServerID, req.ServerName, rec, err)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -139,17 +157,21 @@ func (s *baselineSupervisor) run(req console.BaselineRequest) {
 // For a local-dir destination the Parquet is written there persistently and not
 // uploaded; for an S3 destination it is staged under a fresh temp dir, uploaded,
 // and the staging removed (so a re-run never re-uploads an old snapshot).
-func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stats, int, error) {
+// The third return is the published snapshot's anchor instant (its directory
+// name), zero when unknown: the PG producer stamps the snapshot server-side,
+// out of this process's sight, and a failed run published nothing.
+func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stats, int, time.Time, error) {
 	if req.Flavor == console.FlavorPostgres {
-		return s.executePG(req)
+		stats, uploaded, err := s.executePG(req)
+		return stats, uploaded, time.Time{}, err
 	}
 	if err := os.MkdirAll(s.stagingDir, 0o755); err != nil {
-		return baseline.Stats{}, 0, fmt.Errorf("create staging dir: %w", err)
+		return baseline.Stats{}, 0, time.Time{}, fmt.Errorf("create staging dir: %w", err)
 	}
 
 	dumpDir, err := os.MkdirTemp(s.stagingDir, "dump-")
 	if err != nil {
-		return baseline.Stats{}, 0, fmt.Errorf("create dump dir: %w", err)
+		return baseline.Stats{}, 0, time.Time{}, fmt.Errorf("create dump dir: %w", err)
 	}
 	defer os.RemoveAll(dumpDir)
 
@@ -162,14 +184,14 @@ func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stat
 	// host's UTC offset (#768).
 	dumpStartedAt := time.Now().UTC()
 	if err := runMydumper(s.ctx, req.SourceDSN, req.Schemas, dumpDir, s.lockMode); err != nil {
-		return baseline.Stats{}, 0, fmt.Errorf("dump: %w", err)
+		return baseline.Stats{}, 0, time.Time{}, fmt.Errorf("dump: %w", err)
 	}
 
 	outputDir := req.LocalDir
 	if outputDir == "" { // S3-only: stage then upload, discard staging
 		outputDir, err = os.MkdirTemp(s.stagingDir, "baseline-")
 		if err != nil {
-			return baseline.Stats{}, 0, fmt.Errorf("create baseline staging dir: %w", err)
+			return baseline.Stats{}, 0, time.Time{}, fmt.Errorf("create baseline staging dir: %w", err)
 		}
 		defer os.RemoveAll(outputDir)
 	}
@@ -181,7 +203,7 @@ func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stat
 		Timestamp:   dumpStartedAt,
 	})
 	if err != nil {
-		return baseline.Stats{}, 0, fmt.Errorf("convert: %w", err)
+		return baseline.Stats{}, 0, time.Time{}, fmt.Errorf("convert: %w", err)
 	}
 
 	var uploaded int
@@ -190,10 +212,10 @@ func (s *baselineSupervisor) execute(req console.BaselineRequest) (baseline.Stat
 		// role), like every other S3 read the console does.
 		uploaded, err = baseline.Upload(s.ctx, outputDir, req.S3, "", false)
 		if err != nil {
-			return baseline.Stats{}, 0, fmt.Errorf("upload: %w", err)
+			return baseline.Stats{}, 0, time.Time{}, fmt.Errorf("upload: %w", err)
 		}
 	}
-	return stats, uploaded, nil
+	return stats, uploaded, dumpStartedAt, nil
 }
 
 // executePG produces a PostgreSQL baseline in-process via internal/pgbaseline —
@@ -428,3 +450,31 @@ func countDumpableTables(ctx context.Context, db *sql.DB, schemas []string) (int
 
 // nowStamp is the RFC3339 timestamp used in job status fields.
 func nowStamp() string { return time.Now().UTC().Format(time.RFC3339) }
+
+// recordRun appends one finished run to the history (no-op without one).
+// finishedAt is stamped here so every producer records the same clock.
+func (s *baselineSupervisor) recordRun(serverID, serverName string, rec console.BaselineRunRecord, runErr error) {
+	if s.history == nil {
+		return
+	}
+	rec.ServerID = serverID
+	rec.ServerName = serverName
+	rec.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+	if runErr != nil {
+		rec.Error = runErr.Error()
+	}
+	if err := s.history.Append(rec); err != nil {
+		slog.Warn("baseline history: could not record run (durations for this snapshot will fall back to file timestamps)",
+			"server", serverName, "kind", rec.Kind, "error", err)
+	}
+}
+
+// publishedSnapshotTime is the SnapshotTime a fold run records: the anchor on
+// success, empty on failure — publication is all-or-nothing, so a failed fold
+// has no snapshot for the history to name.
+func publishedSnapshotTime(at time.Time, err error) string {
+	if err != nil {
+		return ""
+	}
+	return at.UTC().Format(time.RFC3339)
+}

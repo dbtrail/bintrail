@@ -273,6 +273,41 @@ func NewestSnapshotTables(ctx context.Context, source string) ([]string, error) 
 	return out, nil
 }
 
+// SnapshotTablesAt returns the schema.table entries of the newest
+// discoverable snapshot at or before at, sorted; nil when no snapshot is that
+// old. It is the table list a point-in-time restore folds forward — NOT
+// always the newest snapshot's: a restore to a moment before the newest
+// snapshot anchors on the older snapshot FindBaseline will pick, and must
+// fold that snapshot's tables.
+func SnapshotTablesAt(ctx context.Context, source string, at time.Time) ([]string, error) {
+	files, err := ListBaselines(ctx, source)
+	if err != nil {
+		return nil, err
+	}
+	var anchor time.Time
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range files { // newest first
+		if f.SnapshotTime.After(at) {
+			continue
+		}
+		if anchor.IsZero() {
+			anchor = f.SnapshotTime
+		}
+		if !f.SnapshotTime.Equal(anchor) {
+			break
+		}
+		entry := f.Schema + "." + f.Table
+		if seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		out = append(out, entry)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // ListBaselines enumerates every baseline snapshot file under source (a local
 // directory or an s3:// prefix), newest snapshot first (then schema/table for
 // a stable render order). Entries that don't match the

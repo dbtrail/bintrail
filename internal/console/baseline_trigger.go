@@ -1,9 +1,15 @@
 package console
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 // ErrBaselineRunning is returned by BaselineController.Trigger when a baseline
@@ -78,6 +84,30 @@ type BaselineRequest struct {
 }
 
 // BaselineStatus is the pollable state of a server's most recent baseline job.
+// BaselineRestorer runs an operator-chosen point-in-time restore: fold the
+// snapshot at-or-before At forward through the index's deltas and publish the
+// result as a NEW discoverable snapshot in the same baseline store (the
+// backups page's PITR action). Deliberately a separate interface from
+// BaselineController and BaselineRefreshReporter: the three features are
+// independently wired, and deriving one from another has already produced a
+// daemon that refused to start (#1171's lesson).
+type BaselineRestorer interface {
+	// TriggerRestore starts the restore asynchronously. ErrBaselineRunning
+	// when another baseline job for the server is in flight.
+	TriggerRestore(req BaselineRestoreRequest) error
+	// RestoreStatus reports the last restore for a server (idle if none).
+	RestoreStatus(serverID string) BaselineStatus
+}
+
+// BaselineRestoreRequest identifies the server and the instant to restore to.
+type BaselineRestoreRequest struct {
+	ServerID    string
+	ServerName  string
+	IndexDSN    string
+	BaselineDir string
+	At          time.Time
+}
+
 type BaselineStatus struct {
 	State      string `json:"state"` // idle | running | succeeded | failed
 	Since      string `json:"since,omitempty"`
@@ -86,6 +116,10 @@ type BaselineStatus struct {
 	Tables     int    `json:"tables,omitempty"`
 	Rows       int64  `json:"rows,omitempty"`
 	Uploaded   int    `json:"uploaded,omitempty"`
+	// At is the anchor instant of a refresh or restore run (RFC3339 UTC): the
+	// moment the published snapshot represents, which is also its directory
+	// name. Empty on dump jobs (the anchor is chosen mid-run).
+	At string `json:"at,omitempty"`
 	// Refused counts tables a refresh declined to fold (gap / schema change).
 	// A refresh that refuses every table is not a failure of the daemon — it is
 	// a correct fail-closed verdict — so it reports succeeded=false with this
@@ -170,4 +204,90 @@ func splitSchemas(s string) []string {
 		}
 	}
 	return out
+}
+
+// handleBaselineRestore enqueues a point-in-time restore for the selected
+// server: POST /api/servers/{id}/baseline/restore {"at": "YYYY-MM-DD HH:MM:SS"}.
+// The result is a NEW snapshot in the server's own baseline store, anchored
+// at the chosen instant; nothing is handed to the requester, which is why
+// this is not an audited data hand-off (the download endpoint is).
+func (s *Server) handleBaselineRestore(w http.ResponseWriter, r *http.Request) {
+	if s.baselineRestore == nil {
+		writeJSONError(w, http.StatusForbidden,
+			"point-in-time restore from the console is not enabled; it needs the watch daemon with baseline creation or refresh turned on")
+		return
+	}
+	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	if e.BaselineDir == "" {
+		// Same constraint as the periodic refresh: the fold reads the previous
+		// snapshot and writes the new one on disk, so it needs the SERVER'S OWN
+		// local directory. The daemon-level --baseline-dir is deliberately not
+		// a fallback here: it is a shared store, and folding this server's
+		// index onto another server's snapshots would publish a backup that
+		// belongs to neither.
+		if e.BaselineS3 != "" {
+			writeJSONError(w, http.StatusBadRequest,
+				"this server keeps its backups only in S3; point-in-time restore needs a local backup directory (Edit → Advanced)")
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest,
+			"this server has no backup directory of its own; set one first (Edit → Advanced)")
+		return
+	}
+	var body struct {
+		At string `json:"at"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	at, ok2 := parseSnapshotAt(body.At)
+	if !ok2 {
+		writeJSONError(w, http.StatusBadRequest,
+			"at must be a UTC time, YYYY-MM-DD HH:MM:SS")
+		return
+	}
+	if at.After(time.Now().UTC()) {
+		writeJSONError(w, http.StatusBadRequest, "at is in the future; pick a past moment")
+		return
+	}
+	if _, err := os.Stat(filepath.Join(e.BaselineDir, reconstruct.SnapshotDirName(at))); err == nil {
+		writeJSONError(w, http.StatusConflict,
+			"a backup already exists at exactly "+at.Format(consoleTSFormat)+"; pick another second, or use that backup")
+		return
+	}
+	req := BaselineRestoreRequest{
+		ServerID:    e.ID,
+		ServerName:  e.Name,
+		IndexDSN:    e.DSN,
+		BaselineDir: e.BaselineDir,
+		At:          at,
+	}
+	if err := s.baselineRestore.TriggerRestore(req); err != nil {
+		if errors.Is(err, ErrBaselineRunning) {
+			writeJSONError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"restore": s.baselineRestore.RestoreStatus(e.ID)})
+}
+
+// handleBaselineRestoreStatus reports the latest restore job state for the
+// selected server (for the frontend to poll while a run is in flight).
+func (s *Server) handleBaselineRestoreStatus(w http.ResponseWriter, r *http.Request) {
+	if s.baselineRestore == nil {
+		writeJSONError(w, http.StatusForbidden,
+			"point-in-time restore from the console is not enabled; it needs the watch daemon with baseline creation or refresh turned on")
+		return
+	}
+	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"restore": s.baselineRestore.RestoreStatus(e.ID)})
 }

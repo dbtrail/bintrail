@@ -78,6 +78,11 @@ type capabilitiesResponse struct {
 	// Process-global, like Monitor — the endpoint does the per-server validation
 	// (source + baseline destination configured).
 	BaselineTrigger bool `json:"baseline_trigger"`
+	// BaselineRestore: this process can fold a backup forward to an
+	// operator-chosen instant and publish it as a new snapshot (the backups
+	// page's point-in-time restore). Process-global, like BaselineTrigger —
+	// the endpoint does the per-server validation (local backup directory).
+	BaselineRestore bool `json:"baseline_restore"`
 	// VerifyTrigger: this process can run bintrail verify in-process from the
 	// console (the watch daemon opted in with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1).
 	// Process-global, like BaselineTrigger — the endpoint does the per-server/
@@ -185,6 +190,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	resp := capabilitiesResponse{
 		Monitor:         s.monitorCtrl != nil,
 		BaselineTrigger: s.baselineCtrl != nil,
+		BaselineRestore: s.baselineRestore != nil,
 		VerifyTrigger:   s.verifyCtrl != nil,
 
 		SchemaSnapshotTrigger: s.schemaSnapCtrl != nil,

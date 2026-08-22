@@ -34,11 +34,13 @@ func (s *baselineSupervisor) TriggerRefresh(req refreshRequest) error {
 		s.mu.Unlock()
 		return console.ErrBaselineRunning
 	}
-	s.refreshes[req.ServerID] = &console.BaselineStatus{State: "running", Since: nowStamp()}
+	at := time.Now().UTC()
+	s.refreshes[req.ServerID] = &console.BaselineStatus{State: "running", Since: nowStamp(),
+		At: at.Format(time.RFC3339)}
 	s.mu.Unlock()
 
 	slog.Info("baseline refresh: starting", "server", req.ServerName, "id", req.ServerID)
-	go s.runRefresh(req)
+	go s.runRefresh(req, at)
 	return nil
 }
 
@@ -61,11 +63,19 @@ func (s *baselineSupervisor) busyLocked(serverID string) bool {
 	if st, ok := s.refreshes[serverID]; ok && st.State == "running" {
 		return true
 	}
+	if st, ok := s.restores[serverID]; ok && st.State == "running" {
+		return true
+	}
 	return false
 }
 
-func (s *baselineSupervisor) runRefresh(req refreshRequest) {
-	tables, refused, err := s.executeRefresh(req)
+func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time) {
+	started := time.Now().UTC()
+	tables, refused, err := s.executeRefresh(req, at)
+	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
+		Kind: console.BaselineRunRefresh, StartedAt: started.Format(time.RFC3339),
+		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused,
+	}, err)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -102,7 +112,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest) {
 // background refresh self-tune to ~80% of host RAM would starve the capture path
 // it depends on. If this ever needs to go faster, it needs its own bounded knob,
 // not the offline one.
-func (s *baselineSupervisor) executeRefresh(req refreshRequest) (tables, refused int, err error) {
+func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (tables, refused int, err error) {
 	tableList, err := reconstruct.NewestSnapshotTables(s.ctx, req.BaselineDir)
 	if err != nil {
 		return 0, 0, fmt.Errorf("list the snapshot to refresh: %w", err)
@@ -110,12 +120,18 @@ func (s *baselineSupervisor) executeRefresh(req refreshRequest) (tables, refused
 	if len(tableList) == 0 {
 		return 0, 0, fmt.Errorf("no baseline snapshot to refresh under %s", req.BaselineDir)
 	}
+	return s.foldSnapshot(req, at, tableList)
+}
 
+// foldSnapshot is the fold both the periodic refresh and the point-in-time
+// restore share: reconstruct every table at `at` and publish the result as a
+// new snapshot in the server's own baseline store, all-or-nothing.
+func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tableList []string) (tables, refused int, err error) {
 	_, failures, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, reconstruct.FullTableConfig{
 		IndexDSN:     req.IndexDSN,
 		BaselineSrc:  req.BaselineDir,
 		Tables:       tableList,
-		At:           time.Now().UTC(),
+		At:           at,
 		OutputDir:    req.BaselineDir,
 		OutputFormat: reconstruct.OutputFormatParquet,
 		// AllowGaps stays FALSE. An unattended job must never publish a

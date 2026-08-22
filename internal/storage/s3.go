@@ -226,8 +226,24 @@ func (b *S3Backend) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 
 // List returns all keys under the given prefix.
 func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
+	infos, err := b.ListInfo(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(infos))
+	for _, o := range infos {
+		keys = append(keys, o.Key)
+	}
+	return keys, nil
+}
+
+// ListInfo returns every object under prefix with its size and last-modified
+// time, paginating exactly like List. ListObjectsV2 already carries both
+// fields on every page; List used to drop them, and the console's backup
+// detail/download surfaces need them without one HeadObject per file.
+func (b *S3Backend) ListInfo(ctx context.Context, prefix string) ([]ObjectInfo, error) {
 	fullPrefix := b.fullKey(prefix)
-	var keys []string
+	var infos []ObjectInfo
 
 	var continuationToken *string
 	for {
@@ -237,11 +253,15 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("storage: list %q (after %d keys): %w", prefix, len(keys), err)
+			return nil, fmt.Errorf("storage: list %q (after %d keys): %w", prefix, len(infos), err)
 		}
 		for _, obj := range resp.Contents {
 			if obj.Key != nil {
-				keys = append(keys, b.relKey(*obj.Key))
+				infos = append(infos, ObjectInfo{
+					Key:          b.relKey(*obj.Key),
+					Size:         aws.ToInt64(obj.Size),
+					LastModified: aws.ToTime(obj.LastModified),
+				})
 			}
 		}
 		if !aws.ToBool(resp.IsTruncated) {
@@ -250,7 +270,7 @@ func (b *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 		continuationToken = resp.NextContinuationToken
 	}
 
-	return keys, nil
+	return infos, nil
 }
 
 // Delete removes the object at the given key.
@@ -296,3 +316,5 @@ func (b *S3Backend) Exists(ctx context.Context, key string) (bool, error) {
 	}
 	return true, nil
 }
+
+var _ InfoLister = (*S3Backend)(nil)

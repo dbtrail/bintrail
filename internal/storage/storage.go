@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 )
 
 // ErrObjectExists is returned by ConditionalPutter.PutIfAbsent when an object
@@ -41,6 +42,25 @@ type Backend interface {
 
 	// Exists checks whether an object exists at the given key.
 	Exists(ctx context.Context, key string) (bool, error)
+}
+
+// ObjectInfo describes one stored object as a listing reports it: the key
+// (relative, exactly as List returns it) plus the size and last-modified time
+// the backend records for it.
+type ObjectInfo struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+}
+
+// InfoLister is an optional interface a Backend can implement when the
+// underlying service reports object sizes and modification times in its
+// listing. Callers assert for it and fall back to List (keys only) when the
+// backend does not implement it.
+type InfoLister interface {
+	// ListInfo returns every object under prefix with its size and
+	// last-modified time. Key semantics match List.
+	ListInfo(ctx context.Context, prefix string) ([]ObjectInfo, error)
 }
 
 // ConditionalPutter is an optional interface a Backend can implement when the
