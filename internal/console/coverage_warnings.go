@@ -31,10 +31,10 @@ func coverageWarnings(plan *query.QueryPlan, skippedSources []string, allowGaps 
 	w := gapWarnings(plan)
 	for _, s := range skippedSources {
 		if s == query.DiscoveryFailedSource {
-			w = append(w, "archive source discovery failed — no archives were read, and archived hours may still be counted as covered; the result may be incomplete")
+			w = append(w, "archive source discovery failed: no archives were read, and archived hours may still be counted as covered; the result may be incomplete")
 			continue
 		}
-		w = append(w, "archive source failed and was skipped — events held only by this source are missing from the result: "+s)
+		w = append(w, "archive source failed and was skipped: events held only by this source are missing from the result: "+s)
 	}
 	if allowGaps && plan == nil {
 		w = append(w, "coverage could not be verified (query planner unavailable): gaps in the captured history may be undetected")
@@ -52,7 +52,7 @@ func coverageWarnings(plan *query.QueryPlan, skippedSources []string, allowGaps 
 // positional convention of the caller, not a contract of the merge (see the
 // comment inside query.MergeResultsReport).
 func divergenceWarning(n int) string {
-	return fmt.Sprintf("%d duplicate event(s) disagreed between the live index and an archive copy; the first copy fetched (normally the live index) was used. An archived partition should be a byte-for-byte copy of the index rows — a mismatch means the index row changed after archiving, or two index generations wrote under the same bintrail_id. Details are in the server log.", n)
+	return fmt.Sprintf("%d duplicate event(s) disagreed between the live index and an archive copy; the first copy fetched (normally the live index) was used. An archived partition should be a byte-for-byte copy of the index rows; a mismatch means the index row changed after archiving, or two index generations wrote under the same bintrail_id. Details are in the server log.", n)
 }
 
 // appendDivergenceWarning appends divergenceWarning when the merge reported
@@ -128,7 +128,7 @@ func reconstructArchiveElisionNote() string {
 	// (archiveElisionNote's doc establishes why inferring it is wrong), so
 	// this wording must stay true under any future fifth proof.
 	return "This state was computed from the live index; the registered archives were not read " +
-		"because they provably could not change this result — nothing is missing here."
+		"because they provably could not change this result; nothing is missing here."
 }
 
 // archiveElisionNotes returns the response Notes list for a fetch that
@@ -177,10 +177,10 @@ func responseAdvisories(plan *query.QueryPlan, excl archiveExclusion, skipped []
 	// events ARE missing, not "may be".
 	for _, src := range skipped {
 		if src == query.DiscoveryFailedSource {
-			warnings = append(warnings, "archive source discovery failed — no archives were read, and archived hours may still be counted as covered; the result may be incomplete")
+			warnings = append(warnings, "archive source discovery failed: no archives were read, and archived hours may still be counted as covered; the result may be incomplete")
 			continue
 		}
-		warnings = append(warnings, "archive source failed and was skipped — events held only by this source are missing from the result: "+src)
+		warnings = append(warnings, "archive source failed and was skipped: events held only by this source are missing from the result: "+src)
 	}
 	notes = archiveElisionNotes(archivesElided, elisionNote)
 	return warnings, notes
@@ -235,7 +235,7 @@ func liveScopeAdvisories(plan *query.QueryPlan, excl archiveExclusion, pending i
 		note := "Live-index scope (scope=live): no archive sources are registered, so nothing " +
 			"further exists to read"
 		if len(warnings) == 0 {
-			note += " — this is already the complete answer."
+			note += "; this is already the complete answer."
 		} else {
 			note += "; the hours warned about above are gaps nothing recorded, not unread archives."
 		}
@@ -278,5 +278,5 @@ func restrictedFetchWarnings(plan *query.QueryPlan, excl archiveExclusion) []str
 	first, last := query.GapRange(plan.GapHours)
 	return append(out, "Hours in this window returned no live-index data: "+first+" – "+last+
 		". They are outside what this session reads, so this is NOT a finding that the changes are "+
-		"missing — they may be sitting in archive storage.")
+		"missing; they may be sitting in archive storage.")
 }

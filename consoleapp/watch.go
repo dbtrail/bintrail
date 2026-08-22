@@ -267,7 +267,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	// ── Phase 1: Preflight ──────────────────────────────────────────────────
 	if upSourceDSN == "" {
 		fmt.Fprintln(os.Stderr, "=== Phase 1/3: Preflight checks ===")
-		fmt.Fprintln(os.Stderr, "No source configured yet — the preflight runs when you add a server from the console.")
+		fmt.Fprintln(os.Stderr, "No source configured yet; the preflight runs when you add a server from the console.")
 		fmt.Fprintln(os.Stderr)
 	} else if !upSkipDoctor {
 		fmt.Fprintln(os.Stderr, "=== Phase 1/3: Preflight checks ===")
@@ -287,7 +287,7 @@ func runWatch(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", fatal)
 		}
 		if warnCapacity {
-			fmt.Fprintln(os.Stderr, "WARNING: the index disk capacity check FAILED — starting anyway (capturing beats not capturing), but act on its remediation before the volume fills.")
+			fmt.Fprintln(os.Stderr, "WARNING: the index disk capacity check FAILED: starting anyway (capturing beats not capturing), but act on its remediation before the volume fills.")
 		}
 		fmt.Fprintln(os.Stderr)
 	}
@@ -525,7 +525,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	printConsoleBanner(srv, "Console is running — open it and add the MySQL servers to watch:")
+	printConsoleBanner(srv, "Console is running: open it and add the MySQL servers to watch:")
 	go supervisor.Reconcile(registry)
 
 	serveErr := srv.Serve(ctx, ln)
@@ -564,7 +564,7 @@ func startFlashbackPort(ctx context.Context, srv *console.Server) (func(), error
 		}
 		close(done)
 	}()
-	fmt.Fprintf(os.Stderr, "Time-travel SQL (MySQL protocol) is listening on %s — connect a MySQL client with user=<server id or name>, password=<console token>.\n", ln.Addr())
+	fmt.Fprintf(os.Stderr, "Time-travel SQL (MySQL protocol) is listening on %s; connect a MySQL client with user=<server id or name>, password=<console token>.\n", ln.Addr())
 	return func() { <-done }, nil
 }
 

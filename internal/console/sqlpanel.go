@@ -169,7 +169,7 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	if sessionRestricted(r) {
 		recordProfileGateDeny(r, "sql")
 		writeJSONError(w, http.StatusForbidden,
-			"the SQL panel is unavailable while an access-control profile is active — "+
+			"the SQL panel is unavailable while an access-control profile is active: "+
 				"free-form SQL cannot honor column redaction")
 		return
 	}
@@ -187,7 +187,7 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	// stream supervisor — concurrent 4GB sessions would starve capture.
 	if !s.sqlPanelBusy.CompareAndSwap(false, true) {
 		writeJSONError(w, http.StatusTooManyRequests,
-			"another SQL panel query is already running — wait for it to finish or cancel it")
+			"another SQL panel query is already running; wait for it to finish or cancel it")
 		return
 	}
 	defer s.sqlPanelBusy.Store(false)
@@ -200,7 +200,7 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	setupCancel()
 	switch {
 	case errors.Is(err, errNoViewSources):
-		writeJSONError(w, http.StatusNotFound, errNoViewSources.Error()+" — nothing to query")
+		writeJSONError(w, http.StatusNotFound, errNoViewSources.Error()+"; nothing to query")
 		return
 	case err != nil:
 		writeJSONError(w, http.StatusBadGateway, err.Error())
@@ -442,7 +442,7 @@ func sqlPanelGate(ctx context.Context, db *sql.DB, stmt string) error {
 	if parsed.Error {
 		msg := parsed.ErrorMessage
 		if strings.Contains(msg, "Only SELECT statements") {
-			msg = "only SELECT statements can run here — the panel is read-only (writes, settings, ATTACH and COPY are refused)"
+			msg = "only SELECT statements can run here: the panel is read-only (writes, settings, ATTACH and COPY are refused)"
 		}
 		return &sqlUserError{msg: msg}
 	}
@@ -455,7 +455,7 @@ func sqlPanelGate(ctx context.Context, db *sql.DB, stmt string) error {
 	// (a file path as a table name). Walking the AST — not the raw text — makes
 	// this robust to casing, comments, CTEs and subqueries.
 	if reason, found := astViolatesReadPolicy([]byte(out)); found {
-		return &sqlUserError{msg: reason + " is not available in the SQL panel — query the events and state_* views instead"}
+		return &sqlUserError{msg: reason + " is not available in the SQL panel; query the events and state_* views instead"}
 	}
 	return nil
 }

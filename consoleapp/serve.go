@@ -213,7 +213,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("check profile %q: %w", conProfile, perr)
 		}
 		if !exists {
-			return fmt.Errorf("profile %q does not exist in the index; create it (bintrail flag/profile/access) or fix the typo — refusing to start with an RBAC profile that enforces nothing", conProfile)
+			return fmt.Errorf("profile %q does not exist in the index; create it (bintrail flag/profile/access) or fix the typo; refusing to start with an RBAC profile that enforces nothing", conProfile)
 		}
 		denyTables, redactCols, err = query.LoadProfileRules(cmd.Context(), db, conProfile)
 		if err != nil {
@@ -295,7 +295,7 @@ func printConsoleBanner(srv *console.Server, headline string) {
 	switch {
 	case srv.NeedsSetup():
 		// First run, loopback, no credential: the browser creates the password.
-		fmt.Fprintf(os.Stderr, "First run — open the URL and create your console username and password.\n\n")
+		fmt.Fprintf(os.Stderr, "First run: open the URL and create your console username and password.\n\n")
 	case srv.PasswordLogin():
 		fmt.Fprintf(os.Stderr, "Sign in with your console username and password.\n")
 		if srv.Token() != "" {

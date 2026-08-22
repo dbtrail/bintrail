@@ -85,7 +85,7 @@ func (m *monitorSupervisor) replicaOverlapCheck(ctx context.Context, e console.S
 	}
 	if !strings.EqualFold(gtidMode, "ON") {
 		return &console.DoctorCheck{Name: replicaCheckName, Status: "skip",
-			Detail: fmt.Sprintf("gtid_mode is %s on this source — replica detection needs GTID; a position-mode duplicate cannot be detected", gtidMode)}
+			Detail: fmt.Sprintf("gtid_mode is %s on this source: replica detection needs GTID; a position-mode duplicate cannot be detected", gtidMode)}
 	}
 
 	peers := make([]peerIdentity, 0, len(entries))
@@ -148,7 +148,7 @@ func evaluateReplicaOverlap(candUUID, candExecuted string, peers []peerIdentity)
 	// direction inside gtidSetContainsUUID — surface it as skip instead.
 	if candExecuted != "" && !gtidSetParseable(candExecuted) {
 		return &console.DoctorCheck{Name: replicaCheckName, Status: "skip",
-			Detail: "could not parse the source's gtid_executed set — replica detection unavailable"}
+			Detail: "could not parse the source's gtid_executed set; replica detection unavailable"}
 	}
 
 	var findings []string
@@ -176,7 +176,7 @@ func evaluateReplicaOverlap(candUUID, candExecuted string, peers []peerIdentity)
 			Status: "warn",
 			Detail: "this server " + strings.Join(findings, "; "),
 			Remediation: "Monitoring a primary and its replica (or the same server twice) indexes every\n" +
-				"row change once per entry — duplicate history, duplicate storage.\n\n" +
+				"row change once per entry: duplicate history, duplicate storage.\n\n" +
 				"This is a WARN, not a hard fail: monitoring has already started. If the\n" +
 				"overlap is unintentional, press Stop on one of the entries (usually keep\n" +
 				"the primary).",

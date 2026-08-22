@@ -288,7 +288,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf("\nTotal events indexed: %d\n", totalEvents)
 		if failedFiles > 0 {
-			fmt.Printf("WARNING: %d of %d file(s) failed to index — see logs above\n", failedFiles, len(files))
+			fmt.Printf("WARNING: %d of %d file(s) failed to index; see logs above\n", failedFiles, len(files))
 		}
 	}
 

@@ -91,7 +91,7 @@ func writeSessionProfileError(w http.ResponseWriter, r *http.Request, err error)
 		return
 	}
 	slog.Error("console: session profile enforcement failed", "error", err)
-	writeJSONError(w, http.StatusInternalServerError, "couldn't apply your access profile — check the server log")
+	writeJSONError(w, http.StatusInternalServerError, "couldn't apply your access profile; check the server log")
 }
 
 // recordProfileGateDeny audits a raw/baseline-data surface refused because the
@@ -332,7 +332,7 @@ func (e archiveExclusion) notice() string {
 		return "Your session carries a data profile, so these results come from the LIVE INDEX ONLY: " +
 			"archived (rotated) hours are not searched, because the archive path cannot apply the " +
 			"redaction your profile requires. A short or empty result does not mean nothing happened " +
-			"in that window — ask an operator without a data profile, or use the CLI, to search the archives."
+			"in that window; ask an operator without a data profile, or use the CLI, to search the archives."
 	}
 	return ""
 }

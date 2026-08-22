@@ -165,7 +165,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := SetAuthPassword(s.authPath, req.Username, req.Password); err != nil {
 		slog.Error("console setup write failed", "path", s.authPath, "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "couldn't save the login file — check the server log")
+		writeJSONError(w, http.StatusInternalServerError, "couldn't save the login file; check the server log")
 		return
 	}
 	// A successful setup closes the endpoint anyway, but clear the IP's
@@ -175,7 +175,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	token, expires, err := s.sessions.IssueWithPolicy(req.Username, nil)
 	if err != nil {
 		slog.Error("console session issue failed after setup", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "password set, but couldn't sign you in automatically — please sign in")
+		writeJSONError(w, http.StatusInternalServerError, "password set, but couldn't sign you in automatically; please sign in")
 		return
 	}
 	slog.Info("console password created via first-run setup", "remote", ip)
@@ -236,7 +236,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		token, expires, err := s.sessions.IssueWithPolicy(cred.Identity, cred.Policy)
 		if err != nil {
 			slog.Error("console session issue failed", "error", err)
-			writeJSONError(w, http.StatusInternalServerError, "something went wrong signing you in — try again")
+			writeJSONError(w, http.StatusInternalServerError, "something went wrong signing you in; try again")
 			return
 		}
 		// The verified identity is the operator's audit trail (like the external
@@ -253,7 +253,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	a, err := LoadAuthFile(s.authPath)
 	if err != nil {
 		slog.Error("console auth file unreadable", "path", s.authPath, "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "couldn't read the console's saved login file — check the server log")
+		writeJSONError(w, http.StatusInternalServerError, "couldn't read the console's saved login file; check the server log")
 		return
 	}
 	if a == nil {
@@ -274,7 +274,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	token, expires, err := s.sessions.IssueWithPolicy(a.Username, nil)
 	if err != nil {
 		slog.Error("console session issue failed", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "something went wrong signing you in — try again")
+		writeJSONError(w, http.StatusInternalServerError, "something went wrong signing you in; try again")
 		return
 	}
 	slog.Info("console login", "remote", ip)
@@ -336,7 +336,7 @@ func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 	a, err := LoadAuthFile(s.authPath)
 	if err != nil {
 		slog.Error("console auth file unreadable", "path", s.authPath, "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "couldn't read the console's saved login file — check the server log")
+		writeJSONError(w, http.StatusInternalServerError, "couldn't read the console's saved login file; check the server log")
 		return
 	}
 
@@ -368,7 +368,7 @@ func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Error("console password write failed", "path", s.authPath, "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "couldn't save the login file — check the server log")
+		writeJSONError(w, http.StatusInternalServerError, "couldn't save the login file; check the server log")
 		return
 	}
 
@@ -379,7 +379,7 @@ func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 	token, expires, err := s.sessions.Issue()
 	if err != nil {
 		slog.Error("console session issue failed after password change", "error", err)
-		writeJSONError(w, http.StatusInternalServerError, "password changed, but couldn't sign you in automatically — please sign in again")
+		writeJSONError(w, http.StatusInternalServerError, "password changed, but couldn't sign you in automatically; please sign in again")
 		return
 	}
 	slog.Info("console password changed", "remote", ip)

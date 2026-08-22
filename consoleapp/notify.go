@@ -161,7 +161,7 @@ func (n *watchNotifier) RotationCycle(failed bool, deferred int) {
 	}
 	n.send.Notify(notify.Event{
 		Event: notify.EventRotationUnhealthy, Severity: notify.SeverityWarning,
-		Summary: "built-in rotation made no progress — the index keeps growing (see the daemon log)",
+		Summary: "built-in rotation made no progress; the index keeps growing (see the daemon log)",
 		Details: map[string]string{"failed": strconv.FormatBool(failed), "deferred_partitions": strconv.Itoa(deferred)},
 	})
 }
@@ -190,7 +190,7 @@ func (n *watchNotifier) Continuity(server, edgeKey string, gapLost bool, detail 
 	}
 	ev := notify.Event{
 		Event: notify.EventContinuityGapLost, Severity: notify.SeverityCritical, Server: server,
-		Summary: "capture continuity lost — events in the gap are PERMANENTLY unrecoverable; re-baseline to resume trustworthy coverage",
+		Summary: "capture continuity lost: events in the gap are PERMANENTLY unrecoverable; re-baseline to resume trustworthy coverage",
 	}
 	if detail != "" {
 		ev.Details = map[string]string{"detail": detail}
@@ -222,7 +222,7 @@ func (n *watchNotifier) BaselineStale(server, edgeKey string, broken bool, broke
 		if n.edge.Resolve(key) {
 			n.send.Notify(notify.Event{
 				Event: notify.EventBaselineStale, Severity: notify.SeverityInfo, Server: server, Resolved: true,
-				Summary: "every table's newest baseline is inside delta coverage again — full-table restore is possible",
+				Summary: "every table's newest baseline is inside delta coverage again; full-table restore is possible",
 			})
 		}
 		return
@@ -232,7 +232,7 @@ func (n *watchNotifier) BaselineStale(server, edgeKey string, broken bool, broke
 	}
 	n.send.Notify(notify.Event{
 		Event: notify.EventBaselineStale, Severity: notify.SeverityCritical, Server: server,
-		Summary: "the newest baseline predates available delta coverage — full-table restore through the missing window is impossible; take a fresh baseline (bintrail dump + bintrail baseline)",
+		Summary: "the newest baseline predates available delta coverage: full-table restore through the missing window is impossible; take a fresh baseline (bintrail dump + bintrail baseline)",
 		Details: map[string]string{"tables": brokenTables, "coverage_floor": coverageFloor},
 	})
 }

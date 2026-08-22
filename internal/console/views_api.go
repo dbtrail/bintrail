@@ -87,7 +87,7 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 	if sessionRestricted(r) {
 		recordProfileGateDeny(r, "views")
 		writeJSONError(w, http.StatusForbidden,
-			"the DuckDB view file is unavailable while an access-control profile is active — "+
+			"the DuckDB view file is unavailable while an access-control profile is active: "+
 				"it maps directly onto the unredacted Parquet files")
 		return
 	}
@@ -104,7 +104,7 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		// worse answer than the UI simply not offering the button, which is
 		// what the matching capability arranges.
 		writeJSONError(w, http.StatusNotFound,
-			errNoViewSources.Error()+" — nothing to generate views over")
+			errNoViewSources.Error()+"; nothing to generate views over")
 		return
 	case err != nil:
 		// Configured but unreadable is an upstream fault worth naming, and

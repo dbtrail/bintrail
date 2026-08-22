@@ -154,9 +154,9 @@ func init() {
 	archiveReconcileCmd.Flags().StringVar(&arcRegion, "region", "", "AWS region (default: from AWS_REGION env var or ~/.aws/config)")
 	archiveReconcileCmd.Flags().BoolVar(&arcRepair, "repair", false, "Execute inserts/updates that bring archive_state in line with the scanned files")
 	archiveReconcileCmd.Flags().BoolVar(&arcPrune, "prune", false, "Delete registry rows whose every referenced backend was scanned and holds no file (data files are never touched)")
-	archiveReconcileCmd.Flags().BoolVar(&arcDeep, "deep", false, "Also verify row counts (reads Parquet footers — one metadata GET per S3 object)")
+	archiveReconcileCmd.Flags().BoolVar(&arcDeep, "deep", false, "Also verify row counts (reads Parquet footers; one metadata GET per S3 object)")
 	archiveReconcileCmd.Flags().DurationVar(&arcPruneMinAge, "prune-min-age", time.Hour, "Never prune rows whose archived_at is younger than this (concurrent-rotate safety margin)")
-	archiveReconcileCmd.Flags().StringVar(&arcTrustEmptyScan, "trust-empty-scan", "", "Name a backend (local, s3, or local,s3) whose ZERO-file scan is a legitimate total wipe rather than a mistyped path — allows pruning THAT backend's rows (e.g. after S3 lifecycle expiry of the whole prefix). Per-backend on purpose; never overrides the unscanned-backend rule")
+	archiveReconcileCmd.Flags().StringVar(&arcTrustEmptyScan, "trust-empty-scan", "", "Name a backend (local, s3, or local,s3) whose ZERO-file scan is a legitimate total wipe rather than a mistyped path; allows pruning THAT backend's rows (e.g. after S3 lifecycle expiry of the whole prefix). Per-backend on purpose; never overrides the unscanned-backend rule")
 	archiveReconcileCmd.Flags().StringVar(&arcFormat, "format", "text", "Output format: text or json")
 	_ = archiveReconcileCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(archiveReconcileCmd)
@@ -635,7 +635,7 @@ func writeReconcileReport(w io.Writer, format string, rep *archive.Report, deepU
 	fmt.Fprintf(w, "archive reconcile (%s): %d in sync, %d to insert, %d to update, %d prune candidate(s), %d skipped\n",
 		mode, rep.InSync, rep.Inserts, rep.Updates, rep.Prunes, rep.SkippedUnverified+rep.SkippedRecent)
 	for _, a := range rep.Actions {
-		fmt.Fprintf(w, "  [%s] %s / %s — %s\n", a.Kind, a.PartitionName, a.BintrailID, a.Reason)
+		fmt.Fprintf(w, "  [%s] %s / %s: %s\n", a.Kind, a.PartitionName, a.BintrailID, a.Reason)
 	}
 	if deepUnverified > 0 {
 		fmt.Fprintf(w, "WARNING: %d file(s) could not be deep-verified (Parquet footer probe failed)\n", deepUnverified)

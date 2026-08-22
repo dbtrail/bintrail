@@ -98,7 +98,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agtArchiveDir, "archive-dir", "", "Local directory containing Parquet archives")
 	agentCmd.Flags().StringVar(&agtArchiveS3, "archive-s3", "", "S3 path to Parquet archives (e.g. s3://bucket/prefix/)")
 	agentCmd.Flags().StringVar(&agtBufferRetain, "buffer-retain", "6h", "How long to retain events in the in-memory buffer (e.g. 6h, 24h)")
-	agentCmd.Flags().Uint32Var(&agtServerID, "server-id", 0, "MySQL server ID for replication, numeric uint32 (required for BYOS streaming). If you have a pre-registered UUID from the dbtrail dashboard, pass it to --server-uuid instead — this flag does NOT accept UUIDs and will reject them with strconv.ParseUint.")
+	agentCmd.Flags().Uint32Var(&agtServerID, "server-id", 0, "MySQL server ID for replication, numeric uint32 (required for BYOS streaming). If you have a pre-registered UUID from the dbtrail dashboard, pass it to --server-uuid instead; this flag does NOT accept UUIDs and will reject them with strconv.ParseUint.")
 	agentCmd.Flags().StringVar(&agtServerUUID, "server-uuid", "", "UUID of a pre-registered BYOS server (POST /api/v1/servers). When set, the SaaS reconciles this agent's WebSocket connection to that record; when empty, the SaaS auto-creates a new byos-<server-id> record (back-compat). A UUID that doesn't match a pre-registered server (typo, stale config, cross-tenant) is logged server-side as a WARNING with the UUID + tenant ID; the SaaS will NOT bind your agent to any record in that case. Verify in the dashboard that the expected pre-registered server is showing the connection.")
 	agentCmd.Flags().IntVar(&agtBatchSize, "batch-size", 1000, "Number of events per batch flush")
 	agentCmd.Flags().StringVar(&agtSchemas, "schemas", "", "Comma-separated list of schemas to index (empty = all)")
@@ -914,11 +914,11 @@ func byosStreamLoop(ctx context.Context, events <-chan parser.Event, buf *buffer
 // checkSourceIdentity handles its "BUG" case.
 func flushToSinks(ctx context.Context, batch []parser.Event, fc *byosFlushConfig) error {
 	if fc.sourceIdent == nil {
-		return fmt.Errorf("BUG: sourceIdent pointer is nil — refusing to emit metadata with empty server_uuid (batch_size=%d)", len(batch))
+		return fmt.Errorf("BUG: sourceIdent pointer is nil; refusing to emit metadata with empty server_uuid (batch_size=%d)", len(batch))
 	}
 	p := fc.sourceIdent.Load()
 	if p == nil {
-		return fmt.Errorf("BUG: sourceIdent pointer not initialized — refusing to emit metadata with empty server_uuid (batch_size=%d)", len(batch))
+		return fmt.Errorf("BUG: sourceIdent pointer not initialized; refusing to emit metadata with empty server_uuid (batch_size=%d)", len(batch))
 	}
 	ident := *p
 

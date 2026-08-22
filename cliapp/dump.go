@@ -70,7 +70,7 @@ func init() {
 	dumpCmd.Flags().StringVar(&dmpMydumperImage, "mydumper-image", "mydumper/mydumper:latest", "Docker image for mydumper (used when no local binary is found)")
 	dumpCmd.Flags().IntVar(&dmpThreads, "threads", 4, "Number of mydumper dump threads")
 	dumpCmd.Flags().StringVar(&dmpLockMode, "lock-mode", string(baseline.DefaultLockMode),
-		"How mydumper syncs its threads onto one instant: ftwrl (default, point-consistent; needs RELOAD/FLUSH_TABLES plus BACKUP_ADMIN on MySQL 8.0+), lock-all (point-consistent, needs only LOCK TABLES — the mode that works on managed MySQL such as RDS, where BACKUP_ADMIN cannot be granted), safe-no-lock (no extra privilege, ABORTS rather than emit a torn snapshot), no-lock (accepts a torn snapshot)")
+		"How mydumper syncs its threads onto one instant: ftwrl (default, point-consistent; needs RELOAD/FLUSH_TABLES plus BACKUP_ADMIN on MySQL 8.0+), lock-all (point-consistent, needs only LOCK TABLES; the mode that works on managed MySQL such as RDS, where BACKUP_ADMIN cannot be granted), safe-no-lock (no extra privilege, ABORTS rather than emit a torn snapshot), no-lock (accepts a torn snapshot)")
 	dumpCmd.Flags().StringVar(&dmpFormat, "format", "text", "Output format: text or json")
 	dumpCmd.Flags().BoolVar(&dmpEncrypt, "encrypt", false, "Encrypt dump files at rest using AES-256-CBC and write an HMAC-SHA256 integrity sidecar (<file>.enc.hmac) per file (requires openssl on $PATH)")
 	dumpCmd.Flags().StringVar(&dmpEncryptKey, "encrypt-key", "", "Path to encryption key file (default: ~/.config/bintrail/dump.key; generate with 'bintrail generate-key')")

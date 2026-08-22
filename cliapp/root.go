@@ -126,15 +126,15 @@ func Main(version, commitSHA, buildDate string) int {
 func exitCodeFor(reason agent.FatalReason) (int, string) {
 	switch reason {
 	case agent.FatalRateLimited:
-		return 65, "agent rate-limited by server — contact support"
+		return 65, "agent rate-limited by server; contact support"
 	case agent.FatalMissingCredentials:
-		return 64, "missing credentials — set --api-key or BINTRAIL_API_KEY"
+		return 64, "missing credentials: set --api-key or BINTRAIL_API_KEY"
 	case agent.FatalWrongTenantMode:
-		return 64, "tenant is not in BYOS mode — WebSocket channel unavailable"
+		return 64, "tenant is not in BYOS mode; WebSocket channel unavailable"
 	case agent.FatalInvalidKey:
 		return 64, "invalid or revoked API key"
 	default:
-		return 64, "agent rejected by server — fix credentials/config and restart manually"
+		return 64, "agent rejected by server; fix credentials/config and restart manually"
 	}
 }
 

@@ -77,7 +77,7 @@ func init() {
 	f.StringVar(&drlAt, "at", "", "Point in time to restore to (default now)")
 	f.StringVar(&drlBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots")
 	f.StringVar(&drlBaselineS3, "baseline-s3", "", "S3 URL of baseline Parquet snapshots (s3://bucket/prefix)")
-	f.StringVar(&drlOutput, "output", "", "Write the intermediate dump here and keep it (default: temp dir — removed on success, kept on failure)")
+	f.StringVar(&drlOutput, "output", "", "Write the intermediate dump here and keep it (default: temp dir; removed on success, kept on failure)")
 	f.StringVar(&drlFormat, "format", "text", "Output format: text or json")
 	_ = drillCmd.MarkFlagRequired("index-dsn")
 	_ = drillCmd.MarkFlagRequired("target-dsn")
@@ -183,7 +183,7 @@ func drillTargetEmpty(ctx context.Context, db *sql.DB, schemas []string) error {
 		case err != nil:
 			return fmt.Errorf("probe target schema %s: %w", s, err)
 		default:
-			return fmt.Errorf("target already has table %s.%s — drill refuses a non-empty target; point --target-dsn at a THROWAWAY server (e.g. `docker compose --profile drill up -d drill-mysql`)", s, name)
+			return fmt.Errorf("target already has table %s.%s: drill refuses a non-empty target; point --target-dsn at a THROWAWAY server (e.g. `docker compose --profile drill up -d drill-mysql`)", s, name)
 		}
 	}
 	return nil
@@ -276,7 +276,7 @@ func runDrill(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --format %q; must be text or json", drlFormat)
 	}
 	if drlBaselineDir == "" && drlBaselineS3 == "" {
-		return fmt.Errorf("one of --baseline-dir or --baseline-s3 is required — drill rehearses a full-table restore, which starts from a baseline")
+		return fmt.Errorf("one of --baseline-dir or --baseline-s3 ; drill rehearses a full-table restore, which starts from a baseline")
 	}
 	tables, schemas, err := parseDrillTables(drlTables)
 	if err != nil {
@@ -417,7 +417,7 @@ func drillTable(ctx context.Context, target *sql.DB, outDir string, rep *reconst
 		// Not even loaded: a rehearsal that never touched a baseline starts
 		// from an EMPTY table — passing it would be false assurance, and
 		// loading it would leave misleading partial data on the scratch.
-		res.Error = "no usable baseline for this table — the dump was rebuilt from binlog deltas alone (an EMPTY starting table); a real restore would lose every never-touched row. Take a baseline (bintrail dump + bintrail baseline)"
+		res.Error = "no usable baseline for this table; the dump was rebuilt from binlog deltas alone (an EMPTY starting table); a real restore would lose every never-touched row. Take a baseline (bintrail dump + bintrail baseline)"
 		return res
 	}
 	loadStart := time.Now()
@@ -460,7 +460,7 @@ func writeDrillText(r *drillReport) {
 		fmt.Println()
 		totalLoad += t.ReconstructSeconds + t.LoadSeconds
 	}
-	fmt.Printf("Summary: %d pass, %d fail — measured restore time %.1fs (an RTO data point)\n", pass, len(r.Tables)-pass, totalLoad)
+	fmt.Printf("Summary: %d pass, %d fail; measured restore time %.1fs (an RTO data point)\n", pass, len(r.Tables)-pass, totalLoad)
 	if r.DumpDir != "" {
 		fmt.Printf("Dump kept at: %s\n", r.DumpDir)
 	}

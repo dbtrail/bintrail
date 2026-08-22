@@ -162,7 +162,7 @@ func monitorDeniedReset() {
 }
 
 func init() {
-	shimCmd.Flags().StringVar(&shListen, "listen", "127.0.0.1:3308", "Listen address for the MySQL protocol port (default: localhost-only — keep ProxySQL as the auth gate)")
+	shimCmd.Flags().StringVar(&shListen, "listen", "127.0.0.1:3308", "Listen address for the MySQL protocol port (default: localhost-only; keep ProxySQL as the auth gate)")
 	shimCmd.Flags().StringVar(&shIndexDSN, "index-dsn", "", "DSN of the bintrail MySQL index")
 	shimCmd.Flags().StringVar(&shShimConfig, "shim-config", "shim.yaml", "Path to shim.yaml (the file produced by 'bintrail init-shim')")
 	shimCmd.Flags().BoolVar(&shNoArchive, "no-archive", false, "Skip archive auto-discovery; query only the live MySQL index")
@@ -172,7 +172,7 @@ func init() {
 	shimCmd.Flags().StringVar(&shBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/). Takes precedence over --baseline-dir. Uses the standard AWS credential chain. See --baseline-dir for what it enables.")
 	shimCmd.Flags().DurationVar(&shQueryTimeout, "query-timeout", 5*time.Minute, "Per-query deadline for time-travel queries (index fetch + archive/DuckDB fetch + full-table slot wait). On expiry the client sees MySQL error 1317. 0 disables the deadline.")
 	shimCmd.Flags().IntVar(&shMaxConns, "max-connections", 100, "Maximum concurrent client connections; further connections are refused with MySQL error 1040 'Too many connections'. 0 = unlimited.")
-	shimCmd.Flags().IntVar(&shMaxFullTable, "max-fulltable-queries", 4, "Maximum concurrent full-table time-travel reconstructions (the heaviest queries — up to 100k buffered rows each); excess queries wait for a slot up to --query-timeout, then fail with MySQL error 1203. 0 = unlimited.")
+	shimCmd.Flags().IntVar(&shMaxFullTable, "max-fulltable-queries", 4, "Maximum concurrent full-table time-travel reconstructions (the heaviest queries; up to 100k buffered rows each); excess queries wait for a slot up to --query-timeout, then fail with MySQL error 1203. 0 = unlimited.")
 	_ = shimCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(shimCmd)
 }

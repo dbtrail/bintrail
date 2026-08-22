@@ -384,7 +384,7 @@ func anchorMissedWarning(opts query.Options, rowCount int) []string {
 	return []string{fmt.Sprintf(
 		"The selected event (id %d at %s UTC) was not found. It may fall outside the time range "+
 			"on this form, be withheld by your access profile, be held only in an archive this "+
-			"read did not reach, or belong to a different server — event ids are per-index. "+
+			"read did not reach, or belong to a different server; event ids are per-index. "+
 			"This is NOT evidence that the row has no history.",
 		opts.EventAnchor.EventID, opts.EventAnchor.Timestamp.UTC().Format("2006-01-02 15:04:05"))}
 }
@@ -691,7 +691,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 			// to the plain path.
 			slog.Warn("console: cascade parent detection failed; recover proceeds without cascade synthesis", "error", derr)
 			warnings = append([]string{
-				"Could not check whether this table is a foreign-key parent (detection failed: " + derr.Error() + "). If it is, any cascade-deleted child rows or cascade-rewritten child foreign keys are NOT included in the script below — retry, or use recover-cascade to reconstruct them.",
+				"Could not check whether this table is a foreign-key parent (detection failed: " + derr.Error() + "). If it is, any cascade-deleted child rows or cascade-rewritten child foreign keys are NOT included in the script below; retry, or use recover-cascade to reconstruct them.",
 			}, warnings...)
 		case isParent && s.rbacActiveFor(r):
 			// Synthesis can't honor redaction (it would leak denied/redacted child
@@ -699,7 +699,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 			// (#1075) — but SAY so, so a parent-only script is never silently
 			// presented as a full restore.
 			warnings = append([]string{
-				"This table has ON DELETE / ON UPDATE CASCADE / SET NULL children, but cascade synthesis is disabled while an RBAC redaction profile is active — the script below reverses the parent only; cascade-deleted child rows and cascade-rewritten child foreign keys are NOT included.",
+				"This table has ON DELETE / ON UPDATE CASCADE / SET NULL children, but cascade synthesis is disabled while an RBAC redaction profile is active: the script below reverses the parent only; cascade-deleted child rows and cascade-rewritten child foreign keys are NOT included.",
 			}, warnings...)
 		case isParent:
 			cres, cerr := s.cascadeRecover(r.Context(), b, body, opts, rows)
@@ -719,7 +719,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 					slog.Warn("console: cascade recovery over the script-size budget; falling back to plain recover", "error", cerr)
 					warnings = append([]string{
 						fmt.Sprintf(
-							"Cascade recovery synthesized the deleted rows, but the combined script would hold ~%.1f MiB of row data — over the console's %.0f MiB budget for a single recovery. The script below re-creates the parent only; cascade-deleted child rows are NOT included. Narrow the recovery filter (schema/table/pk/time range) to shrink the window, or use `bintrail recover-cascade` from the CLI for large cascades.",
+							"Cascade recovery synthesized the deleted rows, but the combined script would hold ~%.1f MiB of row data, over the console's %.0f MiB budget for a single recovery. The script below re-creates the parent only; cascade-deleted child rows are NOT included. Narrow the recovery filter (schema/table/pk/time range) to shrink the window, or use `bintrail recover-cascade` from the CLI for large cascades.",
 							float64(be.EstimatedBytes)/(1<<20), float64(be.Budget)/(1<<20)),
 					}, warnings...)
 					break // out of the switch → plain recover below
@@ -731,7 +731,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 				// the whole request (which would block even the parent-only undo).
 				slog.Warn("console: cascade synthesis failed; falling back to plain recover", "error", cerr)
 				warnings = append([]string{
-					"Cascade synthesis failed (" + cerr.Error() + "); the script below reverses the parent only — cascade-deleted child rows and cascade-rewritten child foreign keys are NOT included.",
+					"Cascade synthesis failed (" + cerr.Error() + "); the script below reverses the parent only; cascade-deleted child rows and cascade-rewritten child foreign keys are NOT included.",
 				}, warnings...)
 				break // out of the switch → plain recover below
 			}
@@ -749,7 +749,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 				// coverage caveat is never dropped on the way out.
 				if len(cres.Caveats) > 0 {
 					warnings = append(append([]string{
-						"Checked whether MySQL changed other rows automatically alongside these: none were found, but that check is provably partial — review the notes below.",
+						"Checked whether MySQL changed other rows automatically alongside these: none were found, but that check is provably partial; review the notes below.",
 					}, cres.Caveats...), warnings...)
 				}
 				warnings = append(warnings, cres.Warnings...)
@@ -758,7 +758,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 			cw := warnings
 			if len(cres.Caveats) > 0 {
 				cw = append([]string{
-					"Cascade recovery is provably partial — review the caveats below; some cascade-deleted rows or cascade-rewritten foreign keys may be missing.",
+					"Cascade recovery is provably partial: review the caveats below; some cascade-deleted rows or cascade-rewritten foreign keys may be missing.",
 				}, cres.Caveats...)
 				cw = append(cw, warnings...)
 			}
@@ -1102,10 +1102,10 @@ func writeRecoverError(w http.ResponseWriter, err error) {
 	var be *recovery.ScriptBudgetError
 	if errors.As(err, &be) {
 		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf(
-			"refusing to generate the reversal script — the matched events hold ~%.1f MiB of row data, "+
+			"refusing to generate the reversal script: the matched events hold ~%.1f MiB of row data, "+
 				"over the console's %.0f MiB budget for a single recovery. Narrow the recovery filter "+
 				"(schema/table/pk/time range) to shrink the window, or use `bintrail recover` from the CLI "+
-				"for large recoveries — it runs outside the console's shared process and supports "+
+				"for large recoveries; it runs outside the console's shared process and supports "+
 				"--max-script-bytes to raise or disable this budget.",
 			float64(be.EstimatedBytes)/(1<<20), float64(be.Budget)/(1<<20)))
 		return

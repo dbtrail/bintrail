@@ -114,7 +114,7 @@ func verifyEncFileHMAC(encPath string, key []byte) (hadSidecar bool, err error) 
 		return true, err
 	}
 	if !hmac.Equal([]byte(got), []byte(strings.TrimSpace(string(want)))) {
-		return true, fmt.Errorf("integrity check failed for %s: HMAC-SHA256 mismatch with its .hmac sidecar — the encrypted file was modified after the dump (or a different --encrypt-key is in use); refusing to decrypt it", filepath.Base(encPath))
+		return true, fmt.Errorf("integrity check failed for %s: HMAC-SHA256 mismatch with its .hmac sidecar; the encrypted file was modified after the dump (or a different --encrypt-key is in use); refusing to decrypt it", filepath.Base(encPath))
 	}
 	return true, nil
 }

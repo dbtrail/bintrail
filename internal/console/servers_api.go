@@ -633,7 +633,7 @@ func runProbe(r *http.Request, dsn string, monitored bool) testResponse {
 		if monitored && isUnknownDatabase(err) {
 			return testResponse{
 				ProvisionPending: true,
-				Error:            fmt.Sprintf("index database %q not provisioned yet — click Start to create it and begin streaming", dbName),
+				Error:            fmt.Sprintf("index database %q not provisioned yet; click Start to create it and begin streaming", dbName),
 				LatencyMS:        latency,
 			}
 		}

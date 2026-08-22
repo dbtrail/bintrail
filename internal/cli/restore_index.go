@@ -81,7 +81,7 @@ func init() {
 	f.StringVar(&riRegion, "region", "", "AWS region for --archive-s3")
 	f.IntVar(&riBatch, "batch-size", 5000, "Rows per INSERT batch while loading")
 	f.IntVar(&riPartitions, "partitions", 48, "Forward partition horizon to create beyond the archived hours (same default as init)")
-	f.BoolVar(&riEncrypt, "encrypt", false, "Create binlog_events with InnoDB tablespace encryption (pass it if the lost index was encrypted — parity is not inferred)")
+	f.BoolVar(&riEncrypt, "encrypt", false, "Create binlog_events with InnoDB tablespace encryption (pass it if the lost index was encrypted; parity is not inferred)")
 	f.StringVar(&riFormat, "format", "text", "Output format: text or json")
 	_ = restoreIndexCmd.MarkFlagRequired("index-dsn")
 	BindCommandEnv(restoreIndexCmd)
@@ -130,7 +130,7 @@ func (r *restoreIndexReport) ExitError() error {
 	if len(r.FailedFiles) > 0 {
 		msg := fmt.Sprintf("%d archive file(s) failed to load (%s)", len(r.FailedFiles), strings.Join(r.FailedFiles, ", "))
 		if r.PartialRows > 0 {
-			msg += fmt.Sprintf("; %d partially-loaded row(s) remain — retry needs a fresh database", r.PartialRows)
+			msg += fmt.Sprintf("; %d partially-loaded row(s) remain; retry needs a fresh database", r.PartialRows)
 		}
 		parts = append(parts, msg)
 	}
@@ -188,7 +188,7 @@ func runRestoreIndex(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("scan archives: %w", err)
 	}
 	if len(files) == 0 {
-		return fmt.Errorf("no archive files found under the given location — nothing to restore")
+		return fmt.Errorf("no archive files found under the given location; nothing to restore")
 	}
 
 	// ── Re-partition the empty table to cover the archived hours ──────────
@@ -203,7 +203,7 @@ func runRestoreIndex(cmd *cobra.Command, args []string) error {
 	// MySQL caps a table at 8,192 partitions — ~341 days of hourly archives.
 	// Fail actionably up front rather than mid-ALTER with ER 1499.
 	if len(hours)+riPartitions+1 > 8192 {
-		return fmt.Errorf("the archive tier spans %d hourly partitions; with the +%d horizon that exceeds MySQL's 8192-partition limit — restore a bounded window by pointing --archive-dir/--archive-s3 at a subset, or restore in stages", len(hours), riPartitions)
+		return fmt.Errorf("the archive tier spans %d hourly partitions; with the +%d horizon that exceeds MySQL's 8192-partition limit; restore a bounded window by pointing --archive-dir/--archive-s3 at a subset, or restore in stages", len(hours), riPartitions)
 	}
 	partSQL, partCount := buildRestorePartitionSQL(dbName, hours, time.Now().UTC(), riPartitions)
 	if _, err := db.ExecContext(ctx, partSQL); err != nil {
@@ -269,13 +269,13 @@ func runRestoreIndex(cmd *cobra.Command, args []string) error {
 	}
 
 	report.NotRecovered = append(report.NotRecovered,
-		"stream_state (replication position — deliberately never persisted: resuming a stale position would fake continuity)",
+		"stream_state (replication position; deliberately never persisted: resuming a stale position would fake continuity)",
 		"index_state (per-file indexing ledger)")
 	// Gated on the RESTORE succeeding, not just the sidecar existing —
 	// "absence of an entry is a recovery claim", and a found-but-failed
 	// sidecar recovered nothing (the restore is transactional).
 	if !report.SidecarFound || sidecarErr != nil {
-		reason := "no index-meta sidecar found — archives predate #1196, or the sidecar was unreadable (see sidecar_warnings)"
+		reason := "no index-meta sidecar found; archives predate #1196, or the sidecar was unreadable (see sidecar_warnings)"
 		if sidecarErr != nil {
 			reason = "the sidecar restore failed (see failed_files)"
 		}
@@ -285,10 +285,10 @@ func runRestoreIndex(cmd *cobra.Command, args []string) error {
 	}
 	if len(report.FailedFiles) > 0 {
 		report.NextSteps = append(report.NextSteps,
-			"this index is PARTIAL (failed files above; already-flushed batches remain loaded) — to retry, drop and recreate the database, then re-run restore-index")
+			"this index is PARTIAL (failed files above; already-flushed batches remain loaded); to retry, drop and recreate the database, then re-run restore-index")
 	}
 	report.NextSteps = append(report.NextSteps,
-		"restart the stream (`bintrail stream` / `bintrail-console watch`) from a fresh position — restarting cleanly avoids FAKING continuity across the hole; the missing window shows up as missing restore coverage, not as a gap_lost verdict",
+		"restart the stream (`bintrail stream` / `bintrail-console watch`) from a fresh position; restarting cleanly avoids FAKING continuity across the hole; the missing window shows up as missing restore coverage, not as a gap_lost verdict",
 		"run `bintrail archive reconcile --archive-dir/--archive-s3 ...` to double-check archive_state against the layout")
 
 	exitErr := report.ExitError()
@@ -331,7 +331,7 @@ func restoreIndexTargetEmpty(ctx context.Context, db *sql.DB, dbName string) err
 		case err != nil:
 			return fmt.Errorf("probe %s: %w", table, err)
 		default:
-			return fmt.Errorf("the index already holds state (%s is not empty) — restore-index only rebuilds a FRESH index; point --index-dsn at a new, empty database (a previous failed restore also leaves state: drop and recreate the database to retry)", table)
+			return fmt.Errorf("the index already holds state (%s is not empty); restore-index only rebuilds a FRESH index; point --index-dsn at a new, empty database (a previous failed restore also leaves state: drop and recreate the database to retry)", table)
 		}
 	}
 	return nil

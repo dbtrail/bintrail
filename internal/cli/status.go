@@ -260,7 +260,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			// may have been destroyed, so a now-readable ledger carrying it
 			// must not read as "fine".
 			if st := skips[status.CaptureSkipReasonUnreadablePreviousLedger]; st.Count > 0 {
-				return fmt.Errorf("capture health: a previous capture ledger was unreadable at daemon restart and its tally is lost — permanent loss may be unrecorded; acknowledge it with `bintrail status --index-dsn <index> --ack-capture-skips` once you have acted on the possibility of unrecorded loss; failing closed under --fail-on-gap")
+				return fmt.Errorf("capture health: a previous capture ledger was unreadable at daemon restart and its tally is lost: permanent loss may be unrecorded; acknowledge it with `bintrail status --index-dsn <index> --ack-capture-skips` once you have acted on the possibility of unrecorded loss; failing closed under --fail-on-gap")
 			}
 			// #1207: every remaining reason is the same permanent-loss class —
 			// an event read from the stream and dropped is absent from the
@@ -278,7 +278,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			}
 			if dropped > 0 {
 				sort.Strings(reasons)
-				return fmt.Errorf("capture health: %d event(s) read from the stream and permanently dropped (%s); most often the schema snapshot is stale or corrupt — run `bintrail snapshot` against the source and restart the stream, then acknowledge this tally with `bintrail status --index-dsn <index> --ack-capture-skips` (it is monotonic and never clears itself; acknowledging erases nothing and a later skip fails this check again); failing closed under --fail-on-gap", dropped, strings.Join(reasons, ", "))
+				return fmt.Errorf("capture health: %d event(s) read from the stream and permanently dropped (%s); most often the schema snapshot is stale or corrupt; run `bintrail snapshot` against the source and restart the stream, then acknowledge this tally with `bintrail status --index-dsn <index> --ack-capture-skips` (it is monotonic and never clears itself; acknowledging erases nothing and a later skip fails this check again); failing closed under --fail-on-gap", dropped, strings.Join(reasons, ", "))
 			}
 		case data.Stream.CaptureSkips.Valid && strings.TrimSpace(data.Stream.CaptureSkips.String) != "":
 			return fmt.Errorf("capture health: capture_skips ledger present but unreadable; cannot confirm statement-format DML drops; failing closed under --fail-on-gap")
@@ -307,7 +307,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 		if verdict == status.FreshnessStalled {
 			age, _ := status.CheckpointAge(data.Stream, now)
-			return fmt.Errorf("stream freshness: capture is STALLED — no checkpoint written for %s; the checkpoint ticker runs even with no traffic, so check the daemon is running",
+			return fmt.Errorf("stream freshness: capture is STALLED: no checkpoint written for %s; the checkpoint ticker runs even with no traffic, so check the daemon is running",
 				age.Round(time.Second))
 		}
 		age, ok := status.NewestEventAge(data.Stream, now)
@@ -315,7 +315,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("stream freshness: no event has been indexed yet, so lag against %s cannot be evaluated; failing closed under --fail-on-lag", stFailOnLag)
 		}
 		if age > stFailOnLag {
-			return fmt.Errorf("stream freshness: newest indexed event is %s old, over the %s threshold (on a source with quiet periods this can be idleness, not lag — bintrail_stream_index_commit_latency_seconds on the daemon distinguishes them)",
+			return fmt.Errorf("stream freshness: newest indexed event is %s old, over the %s threshold (on a source with quiet periods this can be idleness, not lag; bintrail_stream_index_commit_latency_seconds on the daemon distinguishes them)",
 				age.Round(time.Second), stFailOnLag)
 		}
 	}

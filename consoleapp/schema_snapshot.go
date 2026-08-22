@@ -169,7 +169,7 @@ func (s *schemaSnapshotSupervisor) run(req console.SchemaSnapshotRequest, gen ui
 		slog.Warn("schema snapshot timed out; the attempt may still be finishing in the background",
 			"server", req.ServerName, "id", req.ServerID, "timeout", s.timeout)
 		s.publish(req, gen, console.SchemaSnapshotStatus{},
-			fmt.Errorf("the source did not answer within %s; it may be holding a metadata lock. The attempt may still finish in the background — capture was not restarted", s.timeout))
+			fmt.Errorf("the source did not answer within %s; it may be holding a metadata lock. The attempt may still finish in the background; capture was not restarted", s.timeout))
 	case <-s.ctx.Done():
 		s.publish(req, gen, console.SchemaSnapshotStatus{}, errors.New("the daemon is shutting down; capture was not restarted"))
 	}

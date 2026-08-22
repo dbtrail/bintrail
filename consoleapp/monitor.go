@@ -193,7 +193,7 @@ func (j *monitorJob) snapshot() console.MonitorStatus {
 	if j.state == "running" {
 		if idle := time.Since(j.lastProgress); !j.lastProgress.IsZero() && idle > monitorStalledAfter {
 			st.State = "stalled"
-			st.LastError = fmt.Sprintf("no progress for %s: no events indexed and no checkpoint saved — the stream is connected but not advancing", idle.Round(time.Second))
+			st.LastError = fmt.Sprintf("no progress for %s: no events indexed and no checkpoint saved; the stream is connected but not advancing", idle.Round(time.Second))
 		} else if j.lostPosition != "" {
 			st.State = "lost_position"
 			st.LastError = j.lostPosition
@@ -597,7 +597,7 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 		if looping := time.Since(crashLoopSince); looping > monitorGiveUpAfter {
 			slog.Error("monitored stream crash-looped past the give-up threshold; not retrying",
 				"server", e.Name, "entry", e.ID, "looping_for", looping.Round(time.Minute), "error", scrubbed)
-			job.set("failed", fmt.Sprintf("%s (gave up after %s of crash-looping — fix the issue, then press Start to retry)",
+			job.set("failed", fmt.Sprintf("%s (gave up after %s of crash-looping; fix the issue, then press Start to retry)",
 				scrubbed, looping.Round(time.Minute)))
 			return
 		}
@@ -670,7 +670,7 @@ func (m *monitorSupervisor) ReloadSchema(ctx context.Context, e console.ServerEn
 	case <-job.done:
 	case <-time.After(monitorReloadDrainTimeout):
 		restore()
-		return false, errors.New("the stream did not stop in time, so capture for this server is now stopping and was NOT restarted; it is still shutting down in the background — press Start once it has, to resume on the new schema snapshot")
+		return false, errors.New("the stream did not stop in time, so capture for this server is now stopping and was NOT restarted; it is still shutting down in the background; press Start once it has, to resume on the new schema snapshot")
 	case <-ctx.Done():
 		restore()
 		return false, fmt.Errorf("capture for this server was stopped and could not be restarted: %w", ctx.Err())

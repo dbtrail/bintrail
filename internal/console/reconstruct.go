@@ -323,7 +323,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	if sessionRestricted(r) {
 		recordProfileGateDeny(r, "reconstruct")
 		writeJSONError(w, http.StatusForbidden,
-			"time-travel is unavailable while an access-control profile is active — baseline reads aren't redacted")
+			"time-travel is unavailable while an access-control profile is active: baseline reads aren't redacted")
 		return
 	}
 	if !b.baselineConfigured {
@@ -452,8 +452,8 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 			// "have the operator" framing as MCP (only the CLI addresses the
 			// operator directly).
 			writeJSONError(w, http.StatusUnprocessableEntity,
-				"can't reconstruct across a gap in the captured history — "+err.Error()+
-					" — gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too; "+
+				"can't reconstruct across a gap in the captured history: "+err.Error()+
+					". Gap detection reads archive_state, so a rebuilt index reports already-archived hours as gaps too; "+
 					"if archives exist in storage, have the operator run `bintrail archive reconcile --repair --index-dsn ... --archive-s3 s3://...` (or --archive-dir) and retry, "+
 					"or check \"Continue even if some history is missing\" to proceed with a possibly incomplete result")
 			return
@@ -619,7 +619,7 @@ func appendRenderGUCsWarning(warnings []string, bmeta baseline.DumpMetadata) []s
 		return warnings
 	}
 	return append(warnings, fmt.Sprintf(
-		"render_gucs_mismatch: this baseline's rendering-GUC stamp (%q) does not match the current pin — it predates GUC pinning or was produced under a different pin; its GUC-sensitive text (timestamps, floats, bytea, intervals) may not match newer deltas; re-run `bintrail-pg baseline` to refresh it",
+		"render_gucs_mismatch: this baseline's rendering-GUC stamp (%q) does not match the current pin; it predates GUC pinning or was produced under a different pin; its GUC-sensitive text (timestamps, floats, bytea, intervals) may not match newer deltas; re-run `bintrail-pg baseline` to refresh it",
 		bmeta.RenderGUCs))
 }
 

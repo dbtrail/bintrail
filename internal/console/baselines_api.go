@@ -86,7 +86,7 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	if sessionRestricted(r) {
 		recordProfileGateDeny(r, "baselines")
 		writeJSONError(w, http.StatusForbidden,
-			"baseline listings are unavailable while an access-control profile is active — baseline reads aren't redacted")
+			"baseline listings are unavailable while an access-control profile is active: baseline reads aren't redacted")
 		return
 	}
 	resp := baselinesResponse{Reconstruct: b.baselineConfigured, Snapshots: []baselineSnapshotDTO{}}

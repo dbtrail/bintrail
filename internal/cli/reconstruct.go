@@ -175,7 +175,7 @@ func init() {
 	reconstructCmd.Flags().StringVar(&recChunkSize, "chunk-size", "256MB", "Max size per SQL chunk file in full-table mode (e.g. 64MB, 1GB)")
 	reconstructCmd.Flags().IntVar(&recParallelism, "parallelism", 0, "Max tables to reconstruct concurrently in full-table mode (default: runtime.NumCPU())")
 	reconstructCmd.Flags().Int64Var(&recWarnEvents, "warn-event-threshold", 5_000_000, "Full-table mode: log a memory warning when a table's reconstruct window exceeds this many events (#654; this threshold is divided by --parallelism, capped to the number of --tables, so it reflects the total concurrent RAM across tables reconstructing at once, #842; 0 disables)")
-	reconstructCmd.Flags().IntVar(&recFetchBatch, "fetch-batch-size", 0, "Full-table mode: number of events fetched per page when streaming a table's event window (#1097). 0 uses the built-in default (100000). Lower it to cut peak memory on a small box; raise it to cut archive round trips — with S3 archives an hour's parquet file is re-fetched about (events in that hour / this value) times, and roughly double that counting the preceding hour's file, which pruning keeps, so a value well below your peak hourly event count multiplies downloads")
+	reconstructCmd.Flags().IntVar(&recFetchBatch, "fetch-batch-size", 0, "Full-table mode: number of events fetched per page when streaming a table's event window (#1097). 0 uses the built-in default (100000). Lower it to cut peak memory on a small box; raise it to cut archive round trips; with S3 archives an hour's parquet file is re-fetched about (events in that hour / this value) times, and roughly double that counting the preceding hour's file, which pruning keeps, so a value well below your peak hourly event count multiplies downloads")
 	AddDuckDBTuningFlags(reconstructCmd)
 	BindCommandEnv(reconstructCmd)
 
@@ -475,13 +475,13 @@ func runReconstruct(cmd *cobra.Command, args []string) error {
 		// the honest wrong-path verdict instead of `has type ""` blame.
 		if c := unsupportedPKType(pkMetas); c != nil {
 			return fmt.Errorf(
-				"reconstruct: no baseline row for %s.%s pk %q — %s, "+
+				"reconstruct: no baseline row for %s.%s pk %q: %s, "+
 					"so this row cannot be located in the snapshot regardless of whether it exists",
 				recSchema, recTable, recPK, reconstruct.PKTypeGateReason(*c, "reconstruct", "reconstruct"))
 		}
 		if pkChangeSuspected(events) {
 			return fmt.Errorf(
-				"reconstruct: no baseline row for %s.%s pk %q, yet the earliest indexed event for it is not an INSERT — "+
+				"reconstruct: no baseline row for %s.%s pk %q, yet the earliest indexed event for it is not an INSERT: "+
 					"a PK-changing UPDATE in the window likely brought this PK into existence under a different before-image key. "+
 					"reconstruct folds events by the before-image primary key and cannot follow an UPDATE into its new key, so this "+
 					"row cannot be resolved. Re-run `bintrail baseline` to capture a snapshot at or after the PK change, then reconstruct from there",

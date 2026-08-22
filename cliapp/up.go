@@ -128,7 +128,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", fatal)
 		}
 		if warnCapacity {
-			fmt.Fprintln(os.Stderr, "WARNING: the index disk capacity check FAILED — starting anyway (capturing beats not capturing), but act on its remediation before the volume fills.")
+			fmt.Fprintln(os.Stderr, "WARNING: the index disk capacity check FAILED: starting anyway (capturing beats not capturing), but act on its remediation before the volume fills.")
 		}
 		fmt.Fprintln(os.Stderr)
 	}

@@ -143,7 +143,7 @@ func validatePGQueryDSN(raw string) error {
 		return errors.New("PostgreSQL source_dsn must include a database name (postgres://user:pass@host:5432/dbname)")
 	}
 	if u.Query().Get("replication") != "" {
-		return errors.New("PostgreSQL source_dsn must be an ordinary (query) connection; drop replication=database — the console derives the replication connection automatically")
+		return errors.New("PostgreSQL source_dsn must be an ordinary (query) connection; drop replication=database; the console derives the replication connection automatically")
 	}
 	return nil
 }

@@ -205,15 +205,15 @@ var telemetryStatusCmd = &cobra.Command{
 		fmt.Fprintf(cmd.OutOrStdout(), "Consent:      %s (decided by: %s)\n",
 			onOff(decision.Enabled), decision.Source)
 		if ep == "" {
-			fmt.Fprintln(cmd.OutOrStdout(), "Endpoint:     not compiled in — this build cannot send anything")
+			fmt.Fprintln(cmd.OutOrStdout(), "Endpoint:     not compiled in; this build cannot send anything")
 		} else {
 			fmt.Fprintf(cmd.OutOrStdout(), "Endpoint:     %s\n", ep)
 		}
 		if isCI {
-			fmt.Fprintln(cmd.OutOrStdout(), "CI detected:  yes — reporting suppressed regardless of consent")
+			fmt.Fprintln(cmd.OutOrStdout(), "CI detected:  yes; reporting suppressed regardless of consent")
 		}
 		if dirErr != nil {
-			fmt.Fprintln(cmd.OutOrStdout(), "Config dir:   unavailable (no home directory) — telemetry disabled")
+			fmt.Fprintln(cmd.OutOrStdout(), "Config dir:   unavailable (no home directory); telemetry disabled")
 		} else {
 			fmt.Fprintf(cmd.OutOrStdout(), "Spool:        %s\n", telemetry.SpoolDir(dir))
 		}
@@ -296,7 +296,7 @@ func endpointDescription() string {
 	if ep := telemetry.Endpoint(); ep != "" {
 		return ep
 	}
-	return "nowhere — this build has no endpoint compiled in"
+	return "nowhere; this build has no endpoint compiled in"
 }
 
 func onOff(b bool) string {

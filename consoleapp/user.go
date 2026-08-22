@@ -136,7 +136,7 @@ func runUserSetPassword(cmd *cobra.Command, args []string) error {
 			user = existing.Username
 		}
 		if existing.VerifyPassword(user, password) {
-			fmt.Fprintf(os.Stderr, "Credential unchanged for user %q (%s) — nothing written.\n", user, path)
+			fmt.Fprintf(os.Stderr, "Credential unchanged for user %q (%s); nothing written.\n", user, path)
 			return nil
 		}
 	}
@@ -151,7 +151,7 @@ func runUserSetPassword(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "Console password set for user %q (%s).\nA running server accepts it on the next login — no restart needed.\n", a.Username, path)
+	fmt.Fprintf(os.Stderr, "Console password set for user %q (%s).\nA running server accepts it on the next login; no restart needed.\n", a.Username, path)
 	return nil
 }
 
@@ -181,7 +181,7 @@ func runUserRemove(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if a == nil {
-		fmt.Fprintf(os.Stderr, "No console password is configured (%s) — nothing to remove.\n", path)
+		fmt.Fprintf(os.Stderr, "No console password is configured (%s); nothing to remove.\n", path)
 		return nil
 	}
 	if !usrYes {
@@ -196,7 +196,7 @@ func runUserRemove(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "Password credential removed (%s). The console now requires its access token.\n", path)
 	fmt.Fprintln(os.Stderr, "NOTE: a running server stops accepting NEW password logins immediately, but")
-	fmt.Fprintln(os.Stderr, "live sessions ride out their TTL — restart it to revoke them. A server bound")
+	fmt.Fprintln(os.Stderr, "live sessions ride out their TTL; restart it to revoke them. A server bound")
 	fmt.Fprintln(os.Stderr, "to a non-loopback address with no --token will refuse its next restart.")
 	return nil
 }
@@ -228,7 +228,7 @@ func runUserStatus(cmd *cobra.Command, args []string) error {
 	cost, _ := bcrypt.Cost([]byte(a.PasswordBcrypt))
 	fmt.Printf("Password login: configured\n  username:   %s\n  hash:       bcrypt(cost=%d)\n  updated_at: %s\n  file:       %s\n", a.Username, cost, a.UpdatedAt, path)
 	if a.ReadOnly() {
-		fmt.Println("  note:       written by a newer bintrail — logins work, changes refused")
+		fmt.Println("  note:       written by a newer bintrail; logins work, changes refused")
 	}
 	return nil
 }
