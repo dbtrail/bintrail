@@ -2091,7 +2091,11 @@ try {
   const bkRestore = await page.evaluate(async () => {
     const out = { cap: !!capsCache.baseline_restore };
     const v = document.querySelector(".view");
-    const card = v.querySelector(".bk-restore");
+    // Two cards wear .bk-restore since the sql-export card landed; pick the
+    // restore one by its summary or this guard drifts to the wrong card the
+    // first time their gates diverge.
+    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
+      /Restore to a moment/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
     out.card = !!card;
     if (!card) return out;
     card.open = true;
@@ -2232,9 +2236,9 @@ try {
     }
     return { err: "build never settled" };
   }, TT_AT);
-  (sqlxRun.state === "succeeded" && sqlxRun.rows === 3 && sqlxRun.tables === 1)
-    ? ok("sqlx: the fold succeeds over the real fixture with the folded row count (1+3+4, not 4 rows)")
-    : bad("sqlx: the fold succeeds over the real fixture with the folded row count (1+3+4, not 4 rows)", JSON.stringify(sqlxRun));
+  (sqlxRun.state === "succeeded" && sqlxRun.rows === 3 && sqlxRun.tables === 1 && sqlxRun.bytes > 0)
+    ? ok("sqlx: the fold succeeds over the real fixture with the folded row count (1+3+4, not 4 rows) and a byte count")
+    : bad("sqlx: the fold succeeds over the real fixture with the folded row count (1+3+4, not 4 rows) and a byte count", JSON.stringify(sqlxRun));
 
   // Settle: the watcher re-renders when the run finishes; the card must come
   // back wearing the Ready line and a download action.
@@ -2277,13 +2281,25 @@ try {
   const IDX_DB = process.env.E2E_IDX_DB || "";
   const MYSQL_CTR = process.env.E2E_MYSQL_CONTAINER || "";
   if (IDX_DB && MYSQL_CTR) {
-    const gapAt = TT_AT.replace(/:\d{2}$/, ":00"); // any instant inside the window
-    const mysqlIdx = (sql) => execSync(
-      ["docker", "exec", "-i", MYSQL_CTR, "mysql", "-uroot", "-ptestroot", IDX_DB].join(" "),
-      { input: sql, stdio: ["pipe", "pipe", "ignore"] });
-    mysqlIdx("INSERT INTO stream_state (id, mode, binlog_file, binlog_position, last_checkpoint, server_id, gap_lost_at, gap_lost_detail) " +
-      "VALUES (1,'position','binlog.000001',400,NOW(),99,'" + gapAt + "','e2e manufactured gap');");
+    // STRICTLY inside the window (snapshot, TT_AT]: TT_AT itself sits on the
+    // inclusive upper bound, so stamping there keeps working only for as
+    // long as that bound stays inclusive — an interior instant does not
+    // depend on it.
+    const gapAt = new Date(new Date(TT_AT.replace(" ", "T") + "Z").getTime() - 60e3)
+      .toISOString().slice(0, 19).replace("T", " ");
+    const mysqlIdx = (sql) => {
+      try {
+        return execSync(
+          ["docker", "exec", "-i", MYSQL_CTR, "mysql", "-uroot", "-ptestroot", IDX_DB].join(" "),
+          { input: sql, stdio: ["pipe", "pipe", "pipe"] });
+      } catch (e) {
+        e.message += " :: " + String(e.stderr || "").slice(0, 400);
+        throw e;
+      }
+    };
     try {
+      mysqlIdx("INSERT INTO stream_state (id, mode, binlog_file, binlog_position, last_checkpoint, server_id, gap_lost_at, gap_lost_detail) " +
+        "VALUES (1,'position','binlog.000001',400,NOW(),99,'" + gapAt + "','e2e manufactured gap');");
       const gapRun = await page.evaluate(async (TT_AT) => {
         await api("/api/servers/" + encodeURIComponent(currentServer) + "/sql-export",
           { method: "POST", body: { at: TT_AT } });
@@ -2326,7 +2342,10 @@ try {
         ? ok("sqlx: the gap refusal renders inline without the engine's CLI flag")
         : bad("sqlx: the gap refusal renders inline without the engine's CLI flag", gapMsg.slice(0, 300));
     } finally {
-      mysqlIdx("DELETE FROM stream_state;"); // scenario 15v's verify reads this table
+      // Scenario 15v's verify reads this table; a cleanup failure must be its
+      // own loud finding, not a mask over the in-flight one.
+      try { mysqlIdx("DELETE FROM stream_state;"); }
+      catch (e) { bad("sqlx: gap fixture cleanup failed", String((e && e.message) || e)); }
     }
   } else {
     bad("sqlx: gap arm env missing", "E2E_IDX_DB/E2E_MYSQL_CONTAINER not passed by run.sh");

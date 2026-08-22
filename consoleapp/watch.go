@@ -447,6 +447,10 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	// un-gates the Create-baseline button, so deriving one from the other would
 	// either refuse to start a refresh-only daemon or silently switch on a
 	// feature the operator did not enable.
+	// The sweep runs regardless of the supervisor decision below: with both
+	// baseline features off, no supervisor would ever remove a previous
+	// process's staged dump.
+	sweepSQLExportStaging(baselineStagingDir())
 	var baselineSup *baselineSupervisor
 	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
 		baselineSup = newBaselineSupervisorFromConfig(ctx, baselineStagingDir())
@@ -647,6 +651,10 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	// un-gates the Create-baseline button, so deriving one from the other would
 	// either refuse to start a refresh-only daemon or silently switch on a
 	// feature the operator did not enable.
+	// The sweep runs regardless of the supervisor decision below: with both
+	// baseline features off, no supervisor would ever remove a previous
+	// process's staged dump.
+	sweepSQLExportStaging(baselineStagingDir())
 	var baselineSup *baselineSupervisor
 	if upConsoleBaselineTrigger || upBaselineRefreshEvery != "" {
 		baselineSup = newBaselineSupervisorFromConfig(ctx, baselineStagingDir())

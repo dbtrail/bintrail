@@ -34,7 +34,9 @@ func (s *stubSQLExporter) SQLExportStatus(string) BaselineStatus {
 	}
 	return s.st
 }
-func (s *stubSQLExporter) SQLExportDir(string) (string, bool) { return s.dir, s.ready }
+func (s *stubSQLExporter) SQLExportDir(string) (string, BaselineStatus, bool) {
+	return s.dir, s.SQLExportStatus(""), s.ready
+}
 
 func newSQLExportServerWithDefault(t *testing.T, exp SQLExporter, baselineDir string) *Server {
 	t.Helper()
@@ -370,6 +372,73 @@ func TestSQLExportDownload_midStreamAbort(t *testing.T) {
 	}
 	if ev.Detail["aborted"] != "true" || ev.Detail["bytes"] != "4" || ev.Detail["files"] != "1" {
 		t.Fatalf("audit detail = %v, want aborted=true with the 4 bytes and 1 file that left", ev.Detail)
+	}
+}
+
+// TestSQLExportDownload_unexpectedSubdir: the engine writes a flat dump; a
+// subdirectory means the layout changed under this handler, and silently
+// skipping it would ship an archive missing whatever it holds.
+func TestSQLExportDownload_unexpectedSubdir(t *testing.T) {
+	dir := newSQLDumpFixture(t)
+	if err := os.Mkdir(dir+"/extra", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := &stubSQLExporter{dir: dir, ready: true,
+		st: BaselineStatus{State: "succeeded", At: "2026-06-10T12:00:00Z"}}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+	rec, body := doServersReq(t, srv, "GET", "/api/servers/"+id+"/sql-export/download", "")
+	if rec.Code != 500 || !strings.Contains(string(body), "unexpected subdirectory") {
+		t.Fatalf("code=%d body=%s, want a loud 500 naming the subdirectory", rec.Code, body)
+	}
+}
+
+// TestSQLExportDownload_markerVanishedMidStream pins the post-stream belt:
+// a rebuild's teardown racing the stream can hand ReadDir a subset whose
+// every surviving file streams cleanly — the per-file guards cannot see it,
+// so the handler re-checks _SUCCESS after the last byte and aborts if the
+// build was replaced under it.
+func TestSQLExportDownload_markerVanishedMidStream(t *testing.T) {
+	rec := audittest.Install(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/a.sql", []byte("aaaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No _SUCCESS in the dir: from the handler's viewpoint this is exactly
+	// the mid-stream shape (the supervisor said ready; the marker is gone by
+	// the time the stream ends).
+	stub := &stubSQLExporter{dir: dir, ready: true,
+		st: BaselineStatus{State: "succeeded", At: "2026-06-10T12:00:00Z"}}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+
+	req := httptest.NewRequest("GET", "/api/servers/"+id+"/sql-export/download", nil)
+	req.SetPathValue("id", id)
+	w := httptest.NewRecorder()
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				if r != http.ErrAbortHandler {
+					t.Fatalf("panic = %v, want http.ErrAbortHandler", r)
+				}
+			}
+		}()
+		srv.handleSQLExportDownload(w, req)
+	}()
+	if !panicked {
+		t.Fatal("a vanished _SUCCESS after streaming must abort, not declare the archive whole")
+	}
+	var ev *ext.AuditEvent
+	for _, e := range rec.Events() {
+		if e.Action == "baseline.download" {
+			c := e
+			ev = &c
+		}
+	}
+	if ev == nil || ev.Detail["aborted"] != "true" {
+		t.Fatalf("audit = %v, want the aborted handover recorded", ev)
 	}
 }
 

@@ -4540,9 +4540,10 @@ function backupSQLExportCard(cur, b, sqlSt) {
     details.open = true;
   } else if (st && st.state === "succeeded") {
     const dl = el("button", { class: "btn", type: "button", text: "Download .sql backup (.tar.gz)" });
-    dl.onclick = () => downloadSQLExport(cur.id, dl);
+    dl.onclick = () => downloadSQLExport(cur.id, dl, st.bytes || 0);
     body.append(el("div", { class: "bk-restore-row" },
-      el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") + "." }), dl));
+      el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") +
+        (st.bytes ? " (" + humanBytes(st.bytes) + ")" : "") + "." }), dl));
     details.open = true;
   }
   details.append(body);
@@ -4567,10 +4568,14 @@ async function startSQLExport(id, at, btn, msgEl) {
 }
 
 // downloadSQLExport mirrors downloadBackup: fetch + blob because the API
-// authenticates via header. The blob buffers the whole archive in browser
-// memory, and unlike downloadBackup this card has no byte count to gate a
-// confirm on (the status carries none), so there is no size prompt.
-async function downloadSQLExport(id, btn) {
+// authenticates via header, with the same over-1-GiB memory confirm (the
+// status carries the finished build's byte count).
+async function downloadSQLExport(id, btn, totalBytes) {
+  if (totalBytes > 1 << 30 &&
+      !window.confirm("This backup weighs " + humanBytes(totalBytes) +
+        ". The browser holds all of it in memory before saving. Download anyway?")) {
+    return;
+  }
   if (btn) { btn.disabled = true; btn.textContent = "Preparing\u2026"; }
   try {
     const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};

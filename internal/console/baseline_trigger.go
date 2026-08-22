@@ -117,6 +117,9 @@ type BaselineStatus struct {
 	LastError  string `json:"last_error,omitempty"`
 	Tables     int    `json:"tables,omitempty"`
 	Rows       int64  `json:"rows,omitempty"`
+	// Bytes is the finished artifact's on-disk weight (sql-export builds
+	// only) — the UI's download confirm and Ready line read it.
+	Bytes int64 `json:"bytes,omitempty"`
 	Uploaded   int    `json:"uploaded,omitempty"`
 	// At is the anchor instant of a refresh or restore run (RFC3339 UTC): the
 	// moment the published snapshot represents, which is also its directory

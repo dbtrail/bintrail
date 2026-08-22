@@ -78,14 +78,21 @@ type baselineSupervisor struct {
 // newBaselineSupervisor builds a supervisor bound to the daemon context. The
 // staging dir is created lazily per run. lockMode selects the MySQL dump's sync
 // mode for every run this supervisor executes — see the field doc.
-func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode baseline.LockMode) *baselineSupervisor {
-	// Sweep sql-export staging from previous processes: a restart empties the
-	// in-memory exports map, so any dump a dead process built is unreachable
-	// from the API — remove the plaintext rows rather than leave them on disk
-	// indefinitely.
+// sweepSQLExportStaging removes sql-export staging left by previous
+// processes: a restart empties the in-memory exports map, so any dump a
+// dead process built is unreachable from the API — remove the plaintext
+// rows rather than leave them on disk indefinitely. Called from watch
+// startup UNCONDITIONALLY as well as from the supervisor constructor,
+// because a restart that turned the baseline features off would otherwise
+// keep the old artifact forever (no supervisor would ever sweep it).
+func sweepSQLExportStaging(stagingDir string) {
 	if err := os.RemoveAll(filepath.Join(stagingDir, "sql-export")); err != nil {
 		slog.Warn("could not sweep stale sql-export staging", "error", err)
 	}
+}
+
+func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode baseline.LockMode) *baselineSupervisor {
+	sweepSQLExportStaging(stagingDir)
 	return &baselineSupervisor{
 		ctx:        ctx,
 		stagingDir: stagingDir,

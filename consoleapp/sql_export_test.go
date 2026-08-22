@@ -57,7 +57,7 @@ func seedExport(sup *baselineSupervisor, serverID, state, dir string) {
 // for pre-marker baseline snapshots, and a build dir is never legacy.
 func TestSQLExportDirGating(t *testing.T) {
 	sup := newBaselineSupervisor(context.Background(), t.TempDir(), "")
-	if _, ok := sup.SQLExportDir("srv1"); ok {
+	if _, _, ok := sup.SQLExportDir("srv1"); ok {
 		t.Fatal("no build ever ran: ok must be false")
 	}
 	dir := filepath.Join(sup.sqlExportRoot("srv1"), "1")
@@ -71,21 +71,21 @@ func TestSQLExportDirGating(t *testing.T) {
 	// state is the authority on WHICH build the dir belongs to.
 	for _, state := range []string{"failed", "running"} {
 		seedExport(sup, "srv1", state, dir)
-		if _, ok := sup.SQLExportDir("srv1"); ok {
+		if _, _, ok := sup.SQLExportDir("srv1"); ok {
 			t.Fatalf("%s build over a complete dir: ok must be false", state)
 		}
 	}
 	seedExport(sup, "srv1", "succeeded", dir)
-	got, ok := sup.SQLExportDir("srv1")
-	if !ok || got != dir {
-		t.Fatalf("complete build: got (%q,%v), want (%q,true)", got, ok, dir)
+	got, gotSt, ok := sup.SQLExportDir("srv1")
+	if !ok || got != dir || gotSt.State != "succeeded" {
+		t.Fatalf("complete build: got (%q,%+v,%v), want (%q, succeeded, true)", got, gotSt, ok, dir)
 	}
 	// _INCOMPLETE present (the fold's crash-safety marker still in place)
 	// overrides everything, even beside a _SUCCESS.
 	if err := os.WriteFile(filepath.Join(dir, baseline.IncompleteMarker), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := sup.SQLExportDir("srv1"); ok {
+	if _, _, ok := sup.SQLExportDir("srv1"); ok {
 		t.Fatal("_INCOMPLETE dir: ok must be false even with a succeeded status")
 	}
 	// Marker-less dir (torn staging): refused, not legacy-complete.
@@ -95,7 +95,7 @@ func TestSQLExportDirGating(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, baseline.SuccessMarker)); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := sup.SQLExportDir("srv1"); ok {
+	if _, _, ok := sup.SQLExportDir("srv1"); ok {
 		t.Fatal("marker-less dir: ok must be false (no legacy default for build dirs)")
 	}
 	// Vanished dir (a tmp-reaping host): refused, so the handler answers 409
@@ -104,7 +104,7 @@ func TestSQLExportDirGating(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedExport(sup, "srv1", "succeeded", dir)
-	if _, ok := sup.SQLExportDir("srv1"); ok {
+	if _, _, ok := sup.SQLExportDir("srv1"); ok {
 		t.Fatal("vanished dir: ok must be false")
 	}
 }
@@ -137,8 +137,11 @@ func TestSQLExportRun_failure(t *testing.T) {
 	if st.At != "2026-06-10T11:00:00Z" {
 		t.Fatalf("At = %q, the requested instant must survive the failure", st.At)
 	}
-	if _, ok := sup.SQLExportDir("srv1"); ok {
+	if _, _, ok := sup.SQLExportDir("srv1"); ok {
 		t.Fatal("a failed build must not be downloadable")
+	}
+	if st.Tables != 0 || st.Rows != 0 || st.Bytes != 0 {
+		t.Fatalf("failed status carries attempt-scoped partials (%d tables, %d rows, %d bytes); a failed build published nothing", st.Tables, st.Rows, st.Bytes)
 	}
 	if recs := h.List("srv1"); len(recs) != 0 {
 		t.Fatalf("history = %+v, want none: export runs are deliberately unrecorded", recs)
@@ -161,7 +164,7 @@ func TestSQLExportTrigger_stampsInstant(t *testing.T) {
 		t.Fatalf("status right after trigger = %+v, want the instant and a start stamp", st)
 	}
 	if st.State == "running" {
-		if _, ok := sup.SQLExportDir("srv1"); ok {
+		if _, _, ok := sup.SQLExportDir("srv1"); ok {
 			t.Fatal("a running build must not be downloadable")
 		}
 	}

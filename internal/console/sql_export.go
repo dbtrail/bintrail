@@ -32,10 +32,12 @@ type SQLExporter interface {
 	TriggerSQLExport(req SQLExportRequest) error
 	// SQLExportStatus reports the last build for a server (idle if none).
 	SQLExportStatus(serverID string) BaselineStatus
-	// SQLExportDir returns the finished dump's directory; ok is false until
-	// a build has succeeded and its directory affirmatively carries the
+	// SQLExportDir returns the finished dump's directory and the status it
+	// belongs to, from one locked snapshot (so the caller can never label
+	// one build's bytes with another build's instant); ok is false until a
+	// build has succeeded and its directory affirmatively carries the
 	// completeness marker.
-	SQLExportDir(serverID string) (string, bool)
+	SQLExportDir(serverID string) (dir string, status BaselineStatus, ok bool)
 }
 
 // SQLExportRequest identifies the server and the instant to build for.
@@ -72,9 +74,10 @@ func (s *Server) handleSQLExportTrigger(w http.ResponseWriter, r *http.Request) 
 	// An entry with no baseline of its own inherits the process-wide
 	// --baseline-dir/--baseline-s3 (#1010), like the verify trigger: the
 	// Backups listing the card gates on applies the same fallback, so the
-	// trigger must accept what the UI was told is configured. Read-only over
-	// that store, so the restore trigger's shared-store refusal does not
-	// apply here.
+	// trigger must accept what the UI was told is configured. The restore
+	// trigger's shared-store refusal is about PUBLISHING into that store;
+	// this build publishes nothing, and the listing and time-travel already
+	// attribute those snapshots to this entry.
 	e = s.cm.withBaselineDefaults(e)
 	src := e.BaselineDir
 	if src == "" {
@@ -152,13 +155,12 @@ func (s *Server) handleSQLExportDownload(w http.ResponseWriter, r *http.Request)
 			"backups are unavailable while an access-control profile is active: baseline reads aren't redacted")
 		return
 	}
-	dir, ready := s.sqlExport.SQLExportDir(e.ID)
+	dir, st, ready := s.sqlExport.SQLExportDir(e.ID)
 	if !ready {
 		writeJSONError(w, http.StatusConflict,
-			"no finished .sql backup to download; build one first (it may still be running, or the last build failed)")
+			"no finished .sql backup to download; build one first (it may still be running, the last build may have failed, or its files were removed from the staging directory; building again fixes all three)")
 		return
 	}
-	st := s.sqlExport.SQLExportStatus(e.ID)
 	stamp := "backup"
 	if t, err := time.Parse(time.RFC3339, st.At); err == nil {
 		stamp = t.UTC().Format("2006-01-02T15-04-05Z")
@@ -171,9 +173,17 @@ func (s *Server) handleSQLExportDownload(w http.ResponseWriter, r *http.Request)
 	var names []string
 	for _, ent := range entries {
 		name := ent.Name()
+		// The engine writes a flat dump; a subdirectory means the layout
+		// changed under this handler, and silently skipping it would ship an
+		// archive missing whatever it holds.
+		if ent.IsDir() {
+			writeJSONError(w, http.StatusInternalServerError,
+				"the built backup holds an unexpected subdirectory ("+name+"); build it again")
+			return
+		}
 		// The completeness markers describe the BUILD; the dump myloader
 		// consumes is everything else (schema files, chunks, metadata).
-		if ent.IsDir() || name == baseline.SuccessMarker || name == baseline.IncompleteMarker {
+		if name == baseline.SuccessMarker || name == baseline.IncompleteMarker {
 			continue
 		}
 		names = append(names, name)
@@ -244,6 +254,13 @@ func (s *Server) handleSQLExportDownload(w http.ResponseWriter, r *http.Request)
 	}
 	if err := gz.Close(); err != nil {
 		abort("sql backup download: gzip finalize failed", err)
+	}
+	// A rebuild's teardown racing this stream can hand the ReadDir above a
+	// subset whose every surviving file then streams cleanly — the one shape
+	// the per-file guards cannot see. If the wipe happened, the _SUCCESS
+	// marker is gone with it: re-check before declaring the archive whole.
+	if _, err := os.Stat(filepath.Join(dir, baseline.SuccessMarker)); err != nil {
+		abort("sql backup download aborted: the build was replaced mid-stream", err)
 	}
 	completed = true
 }
