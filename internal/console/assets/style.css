@@ -2545,8 +2545,10 @@ button { font-family: inherit; }
    these strengths ink-3/ink-4 measure 4.3/2.9 at the peak — below their
    floors — but the peak band (the first ~120px) only ever holds the page
    head's ink/ink-2 text, and the first ink-3/ink-4 consumers (list
-   headers) enter ~250px down where the layers have faded out. Fixed to
-   the viewport instead, a scrolled list's headers would ride the peak. */
+   headers) enter ~250px down where the layers have faded out (the longest
+   layer's ray ends by ~280px; the Events loading skeleton's first bar
+   measures 308px in content coordinates). Fixed to the viewport instead,
+   a scrolled list's headers would ride the peak. */
 .main {
   background:
     radial-gradient(52% 340px at 82% -60px, oklch(0.88 0.09 88 / 0.30), transparent 70%),
