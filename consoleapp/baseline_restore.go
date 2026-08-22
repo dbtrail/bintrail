@@ -99,7 +99,15 @@ func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) 
 // wireBaselineExtras attaches the run history and the restore capability to a
 // freshly built supervisor, and exposes both on the console Config. Called by
 // both watch entry paths; a no-op without a supervisor (serve-only consoles
-// keep their 403s). An unreadable history file runs without history rather
+// keep their 403s).
+//
+// Restore rides EITHER opt-in deliberately, which looks like the derivation
+// the BaselineRestorer comment warns about — it is not. #1171's hazard was a
+// derived flag turning on a feature of a DIFFERENT class (a dump locks and
+// reads the source; mydumper may not exist). A restore is the same fold the
+// refresh already performs, into the same store, with no source contact; the
+// only delta is who picks the instant. A daemon that opted into either
+// baseline producer has already accepted exactly this work. An unreadable history file runs without history rather
 // than refusing the daemon — durations degrade to file-timestamp spans, and
 // not opening a store means nothing overwrites the file it might describe.
 func wireBaselineExtras(cfg *console.Config, sup *baselineSupervisor, serversPath string) {

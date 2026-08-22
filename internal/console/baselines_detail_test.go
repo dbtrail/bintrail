@@ -6,7 +6,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbtrail/dbtrail/ext"
+	"github.com/dbtrail/dbtrail/internal/audittest"
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
@@ -258,4 +263,98 @@ func keysOf(m map[string]string) []string {
 	}
 	sort.Strings(ks)
 	return ks
+}
+
+// TestBaselineDetail_profileRefusal: baseline reads bypass RBAC redaction, so
+// a session carrying a data profile must be refused BOTH new surfaces — the
+// download most of all, since it is a full unredacted copy of every row.
+func TestBaselineDetail_profileRefusal(t *testing.T) {
+	dir := newDetailFixture(t)
+	srv := newBaselineServer(t, dir, true)
+	pol := &ext.AccessPolicy{Profile: "sensitive"}
+	for _, path := range []string{
+		"/api/baselines/files" + detailQuery(detailSnapAt),
+		"/api/baselines/download" + detailQuery(detailSnapAt),
+	} {
+		req := httptest.NewRequest("GET", path, nil)
+		req = req.WithContext(context.WithValue(req.Context(), policyCtxKey{}, pol))
+		w := httptest.NewRecorder()
+		if strings.Contains(path, "download") {
+			srv.handleBaselineDownload(w, req)
+		} else {
+			srv.handleBaselineFiles(w, req)
+		}
+		if w.Code != 403 {
+			t.Fatalf("%s: code = %d body = %s, want 403 under a data profile", path, w.Code, w.Body.String())
+		}
+	}
+}
+
+// failingObjectStore serves the listing but dies on the second Get — the
+// mid-stream shape the download's abort contract exists for.
+type failingObjectStore struct {
+	fakeObjectStore
+	gets int
+}
+
+func (f *failingObjectStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	f.gets++
+	if f.gets >= 3 {
+		return nil, errors.New("s3: connection reset")
+	}
+	return f.fakeObjectStore.Get(ctx, key)
+}
+
+// TestBaselineDownload_midStreamAbort pins the two halves of the abort
+// contract: the handler panics with http.ErrAbortHandler (so the client's
+// read FAILS instead of saving a truncated archive as a success), and the
+// audit trail still records the aborted egress with the bytes that left.
+func TestBaselineDownload_midStreamAbort(t *testing.T) {
+	rec := audittest.Install(t)
+	fake := &failingObjectStore{fakeObjectStore: fakeObjectStore{
+		mtime: time.Date(2026, 6, 10, 12, 1, 0, 0, time.UTC),
+		objects: map[string]string{
+			// Sorted stream order: _SUCCESS (0 B), then orders (4 B of row
+			// data LEAVES), then users — whose Get fails. sent > 0 at the
+			// abort, which is exactly the egress the audit must not lose.
+			detailSnapDir + "/_SUCCESS":            "",
+			detailSnapDir + "/shop/orders.parquet": "aaaa",
+			detailSnapDir + "/shop/users.parquet":  "bbbbbbbb",
+		},
+	}}
+	orig := newBaselineObjectStore
+	newBaselineObjectStore = func(_ context.Context, _ string) (baselineObjectStore, error) { return fake, nil }
+	t.Cleanup(func() { newBaselineObjectStore = orig })
+
+	srv := newBaselineServer(t, "s3://bkt/baselines", true)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/baselines/download"+detailQuery(detailSnapAt), nil)
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				if r != http.ErrAbortHandler {
+					t.Fatalf("panic = %v, want http.ErrAbortHandler", r)
+				}
+			}
+		}()
+		srv.handleBaselineDownload(w, req)
+	}()
+	if !panicked {
+		t.Fatal("a mid-stream Get failure must abort the connection, not end the body cleanly")
+	}
+	var got *ext.AuditEvent
+	for _, ev := range rec.Events() {
+		if ev.Action == "baseline.download" {
+			e := ev
+			got = &e
+		}
+	}
+	if got == nil {
+		t.Fatal("an aborted download that already sent row data must still be audited")
+	}
+	if got.Detail["aborted"] != "true" || got.Detail["bytes"] != "4" {
+		t.Fatalf("audit detail = %v, want aborted=true with the 4 bytes that left", got.Detail)
+	}
 }

@@ -4077,7 +4077,7 @@ function baselineContextStrip(b, cur) {
   if (uniform !== null) strip.append(item("TABLES", uniform + " per backup"));
   strip.append(item("TIME-TRAVEL", b.reconstruct ? "enabled" : "off (archives disabled)"));
   // The page's primary action, at page level — not a list-header costume.
-  if (capsCache.baseline_trigger && cur && cur.id && b.configured) {
+  if (capsCache.baseline_trigger && cur && cur.id && cur.kind === "registry" && b.configured) {
     const btn = el("button", { class: "btn ctx-action", type: "button", text: "Create backup" });
     btn.onclick = () => createBaseline(cur.id, btn);
     strip.append(btn);
@@ -4252,6 +4252,7 @@ async function loadBackupDetail(at, box) {
     d = await api("/api/baselines/files?at=" + encodeURIComponent(at));
   } catch (err) {
     box.textContent = "Could not load the backup detail: " + ((err && err.message) || err);
+    delete box.dataset.loaded; // a transient failure must not pin the row
     return;
   }
   clear(box);
@@ -4265,8 +4266,10 @@ async function loadBackupDetail(at, box) {
     facts.append(el("span", { class: "stg-dest", text:
       "files written over about " + fmtSeconds(d.write_span_seconds) + " (from file timestamps; the real run took longer)" }));
   }
-  const dl = el("button", { class: "btn", type: "button", text: "Download (.tar.gz)" });
-  dl.onclick = (ev) => { ev.stopPropagation(); downloadBackup(at, dl); };
+  const dl = el("button", { class: "btn", type: "button",
+    text: "Download (.tar.gz) · " + humanBytes(d.total_bytes || 0) });
+  if (d.incomplete) dl.disabled = true;
+  dl.onclick = (ev) => { ev.stopPropagation(); downloadBackup(at, dl, d.total_bytes || 0); };
   facts.append(dl);
   box.append(facts);
   if (d.incomplete) box.append(el("p", { class: "form-msg err", text: "This backup is marked incomplete (a failed or unfinished run); it cannot be downloaded or restored from." }));
@@ -4282,8 +4285,15 @@ async function loadBackupDetail(at, box) {
 
 // downloadBackup streams the whole snapshot as one tar.gz. Fetch + blob
 // because the API authenticates via header; a plain link would arrive
-// tokenless on token-auth consoles.
-async function downloadBackup(at, btn) {
+// tokenless on token-auth consoles. The blob buffers the WHOLE archive in
+// browser memory before the save starts — fine for the common case, and the
+// confirm below makes the operator choose it knowingly for a huge one.
+async function downloadBackup(at, btn, totalBytes) {
+  if (totalBytes > 1 << 30 &&
+      !window.confirm("This backup weighs " + humanBytes(totalBytes) +
+        ". The browser holds all of it in memory before saving. Download anyway?")) {
+    return;
+  }
   if (btn) { btn.disabled = true; btn.textContent = "Preparing…"; }
   try {
     const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
@@ -4308,7 +4318,7 @@ async function downloadBackup(at, btn) {
   } catch (err) {
     toastError("Download failed: " + ((err && err.message) || err));
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "Download (.tar.gz)"; }
+    if (btn) { btn.disabled = false; btn.textContent = "Download (.tar.gz) · " + humanBytes(totalBytes || 0); }
   }
 }
 
@@ -4345,37 +4355,62 @@ function backupRunRegion(running) {
 
 // watchBackupRuns re-renders the page when the in-flight run settles, so the
 // region clears and the new backup appears without a manual reload.
+//
+// It must poll the SAME three sources backupRunsInFlight reads, or the two
+// sets drift: the first draft skipped the refresh, so during every periodic
+// refresh the watcher woke "settled" after 2s, re-rendered, saw the region
+// again, spawned a new watcher — a full re-render plus a baseline listing
+// every 2 seconds for the whole fold. The refresh state only exists on the
+// listing endpoint, which enumerates the store (billed LISTs on S3), so it
+// is polled on a slower cadence.
 async function watchBackupRuns(id, vgen) {
   if (!id) return;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let refreshBusy = true; // assume it until a listing poll says otherwise
   for (let i = 0; i < 900; i++) {
     await sleep(2000);
     if (vgen !== viewGen || location.pathname !== "/baselines") return;
     let busy = false;
+    let pollFailed = false;
     if (capsCache.baseline_trigger) {
       try {
         const st = await api("/api/servers/" + encodeURIComponent(id) + "/baseline");
         if (st.baseline && st.baseline.state === "running") busy = true;
-      } catch (_) { /* transient poll error: keep watching */ }
+      } catch (_) { pollFailed = true; }
     }
     if (capsCache.baseline_restore) {
       try {
         const st = await api("/api/servers/" + encodeURIComponent(id) + "/baseline/restore");
         if (st.restore && st.restore.state === "running") busy = true;
-      } catch (_) { /* transient poll error: keep watching */ }
+      } catch (_) { pollFailed = true; }
     }
+    if (i % 5 === 4) { // every ~10s
+      try {
+        const b = await api("/api/baselines");
+        refreshBusy = !!(b.refresh && b.refresh.state === "running");
+      } catch (_) { pollFailed = true; }
+    }
+    if (refreshBusy) busy = true;
+    // A failed poll says nothing about the run; treating it as "settled"
+    // would clear the RUNNING region while the fold is still going.
+    if (pollFailed && !busy) continue;
     if (!busy) {
       if (vgen === viewGen && location.pathname === "/baselines") renderBaselines();
       return;
     }
   }
+  // Cap expiry: re-render once so a stale RUNNING region does not outlive
+  // the watcher silently.
+  if (vgen === viewGen && location.pathname === "/baselines") renderBaselines();
 }
 
 // backupRestoreCard offers the point-in-time restore: pick a past moment, get
 // a NEW backup showing every table as it was then. Collapsed by default; the
 // last restore's outcome renders inside so a failure is not toast-only.
 function backupRestoreCard(cur, b, restoreSt) {
-  if (!capsCache.baseline_restore || !cur || !cur.id) return null;
+  // Registry servers only: the CLI (ephemeral) entry is refused by the
+  // monitor verbs with a message about monitoring, not restores.
+  if (!capsCache.baseline_restore || !cur || !cur.id || cur.kind !== "registry") return null;
   // The server needs its OWN local backup directory: the daemon-wide one is a
   // shared store the endpoint refuses (the fold would mix servers).
   if (!cur.baseline_dir) return null;

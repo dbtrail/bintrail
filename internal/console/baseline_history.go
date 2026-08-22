@@ -145,6 +145,10 @@ func (h *BaselineRunHistory) save() error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
 		return err
@@ -154,9 +158,6 @@ func (h *BaselineRunHistory) save() error {
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp.Name(), h.path)

@@ -91,12 +91,29 @@ func TestBaselineRestore_gates(t *testing.T) {
 	}
 
 	// A snapshot already at exactly that instant: refuse rather than collide.
+	// (A bare directory has neither marker, which is legacy-complete — the
+	// same rule SnapshotComplete applies everywhere.)
 	if err := os.MkdirAll(filepath.Join(dir, "2026-06-10T12-00-00Z"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	rec, body = doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline/restore", `{"at":"2026-06-10 12:00:00"}`)
 	if rec.Code != 409 {
 		t.Fatalf("collision: code=%d body=%s, want 409", rec.Code, body)
+	}
+
+	// An _INCOMPLETE leftover from a failed fold is the retry-the-same-instant
+	// case the engine supports on purpose; refusing it would strand the
+	// operator on an instant the listing does not even show.
+	leftover := filepath.Join(dir, "2026-06-10T10-00-00Z")
+	if err := os.MkdirAll(leftover, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(leftover, "_INCOMPLETE"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec, body = doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline/restore", `{"at":"2026-06-10 10:00:00"}`)
+	if rec.Code != 202 {
+		t.Fatalf("incomplete leftover: code=%d body=%s, want 202 (retry allowed)", rec.Code, body)
 	}
 
 	// Accepted: the request reaches the restorer with the parsed instant.

@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -290,7 +291,7 @@ func (s *Server) handleBaselineFiles(w http.ResponseWriter, r *http.Request) {
 		resp.WriteSpanSeconds = newest.Sub(oldest).Seconds()
 	}
 	if s.baselineHistory != nil {
-		if rec := s.baselineHistory.FindBySnapshot(selectedServerID(r), ts.Format(time.RFC3339)); rec != nil {
+		if rec := s.baselineHistory.FindBySnapshot(s.selectedServerID(r), ts.Format(time.RFC3339)); rec != nil {
 			run := &baselineRunDTO{Kind: rec.Kind, Tables: rec.Tables, Rows: rec.Rows}
 			if st, err1 := time.Parse(time.RFC3339, rec.StartedAt); err1 == nil {
 				if fin, err2 := time.Parse(time.RFC3339, rec.FinishedAt); err2 == nil {
@@ -306,6 +307,12 @@ func (s *Server) handleBaselineFiles(w http.ResponseWriter, r *http.Request) {
 // handleBaselineDownload serves GET /api/baselines/download?at=…: the whole
 // snapshot directory as one tar.gz stream, markers and manifest included, so
 // what lands on the operator's disk is a complete, discoverable snapshot.
+//
+// Mid-stream errors panic with http.ErrAbortHandler: the status is already
+// written, and cutting the connection is what makes the CLIENT fail loudly —
+// a plain return would end the chunked body cleanly, the browser would save
+// the truncated archive as a "successful" download, and the operator would
+// learn it is garbage at extraction time, plausibly mid-incident.
 func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) {
 	ss, dirName, files := s.resolveSnapshotRequest(w, r, "baseline-download")
 	if files == nil {
@@ -318,46 +325,71 @@ func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) 
 	}
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", `attachment; filename="dbtrail-backup-`+dirName+`.tar.gz"`)
+
+	// Row data leaves the store from the FIRST byte, so the audit record must
+	// not depend on the stream finishing: an aborted read is exactly the read
+	// an auditor most wants to see (see recordConsoleAccess's own contract),
+	// and gating on success would let a client fetch all but the gzip trailer
+	// of every backup unaudited. Deferred so the abort panics land here too.
+	var sent int64
+	completed := false
+	defer func() {
+		if !completed && sent == 0 {
+			return // refused or died before any row data left
+		}
+		detail := map[string]string{
+			"snapshot": dirName,
+			"files":    strconv.Itoa(len(files)),
+			"bytes":    strconv.FormatInt(sent, 10),
+		}
+		if !completed {
+			detail["aborted"] = "true"
+		}
+		recordConsoleAccess(r, "baseline.download", "", "", detail)
+	}()
+
+	abort := func(msg, file string, err error) {
+		// A canceled request context is the client hanging up: expected, and
+		// logging it as a storage fault would send an operator chasing S3
+		// errors that were browser cancels.
+		if errors.Is(err, context.Canceled) || r.Context().Err() != nil {
+			slog.Info("backup download canceled by the client", "snapshot", dirName, "file", file, "bytes", sent)
+		} else {
+			slog.Warn(msg, "snapshot", dirName, "file", file, "error", err)
+		}
+		panic(http.ErrAbortHandler)
+	}
+
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
-	var sent int64
 	for _, f := range files {
 		hdr := &tar.Header{Name: f.RelPath, Mode: 0o644, Size: f.Size, ModTime: f.ModTime}
 		if err := tw.WriteHeader(hdr); err != nil {
-			slog.Warn("backup download aborted mid-stream", "snapshot", dirName, "error", err)
-			return
+			abort("backup download aborted: tar header write failed", f.RelPath, err)
 		}
 		rc, err := ss.open(r.Context(), f.RelPath)
 		if err != nil {
-			// Headers are gone; the status cannot change. Cutting the stream
-			// leaves a truncated gzip the client's extraction fails loudly on,
-			// which beats a silently short archive that still unpacks.
-			slog.Warn("backup download aborted: file unreadable mid-stream",
-				"snapshot", dirName, "file", f.RelPath, "error", err)
-			return
+			abort("backup download aborted: file unreadable mid-stream", f.RelPath, err)
 		}
 		n, err := io.Copy(tw, rc)
 		rc.Close()
 		sent += n
 		if err != nil {
-			slog.Warn("backup download aborted mid-file", "snapshot", dirName, "file", f.RelPath, "error", err)
-			return
+			abort("backup download aborted mid-file", f.RelPath, err)
+		}
+		if n != f.Size {
+			// A file that shrank between the listing and the copy: without
+			// this check the mismatch only surfaces on the NEXT header write,
+			// blaming the wrong file.
+			abort("backup download aborted: file shorter than listed", f.RelPath,
+				fmt.Errorf("read %d bytes, listing said %d", n, f.Size))
 		}
 	}
 	if err := tw.Close(); err != nil {
-		slog.Warn("backup download: tar finalize failed", "snapshot", dirName, "error", err)
-		return
+		abort("backup download: tar finalize failed", "", err)
 	}
 	if err := gz.Close(); err != nil {
-		slog.Warn("backup download: gzip finalize failed", "snapshot", dirName, "error", err)
-		return
+		abort("backup download: gzip finalize failed", "", err)
 	}
-	// The whole snapshot's row data left the store — the read an audit trail
-	// exists to record. Success path only: an aborted stream never got here.
-	recordConsoleAccess(r, "baseline.download", "", "", map[string]string{
-		"snapshot": dirName,
-		"files":    strconv.Itoa(len(files)),
-		"bytes":    strconv.FormatInt(sent, 10),
-	})
+	completed = true
 }
-

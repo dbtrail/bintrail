@@ -3,12 +3,14 @@ package console
 import (
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
@@ -254,9 +256,22 @@ func (s *Server) handleBaselineRestore(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "at is in the future; pick a past moment")
 		return
 	}
-	if _, err := os.Stat(filepath.Join(e.BaselineDir, reconstruct.SnapshotDirName(at))); err == nil {
-		writeJSONError(w, http.StatusConflict,
-			"a backup already exists at exactly "+at.Format(consoleTSFormat)+"; pick another second, or use that backup")
+	snapDir := filepath.Join(e.BaselineDir, reconstruct.SnapshotDirName(at))
+	if _, err := os.Stat(snapDir); err == nil {
+		// Refuse only a COMPLETE snapshot: an _INCOMPLETE leftover from a
+		// failed fold is the retry-the-same-instant case the engine supports
+		// on purpose (reconstruct's leftover rule), and the listing hides it,
+		// so "use that backup" would name something the operator cannot see.
+		if baseline.SnapshotComplete(snapDir) {
+			writeJSONError(w, http.StatusConflict,
+				"a backup already exists at exactly "+at.Format(consoleTSFormat)+"; pick another second, or use that backup")
+			return
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		// A backup directory that cannot even be stat'ed predicts the fold
+		// will fail; refuse now with the real reason instead of a 202 whose
+		// failure the operator must poll for.
+		writeJSONError(w, http.StatusBadGateway, "cannot read the backup directory: "+err.Error())
 		return
 	}
 	req := BaselineRestoreRequest{
