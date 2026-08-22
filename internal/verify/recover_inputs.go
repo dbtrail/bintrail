@@ -222,7 +222,7 @@ func recoverInputsFetchOptions(schema, table string, since, until time.Time, max
 // right (#1126). The planner stamps the oldest hour it has ever seen into the
 // GapError so the two cases can be told apart here.
 func recoverGapDetail(gap *query.GapError, noArchive bool) string {
-	generic := "coverage gap in the window: " + gap.Error() + "; a chain with an interior hole cannot be asserted against"
+	generic := "coverage gap in the window: " + gap.Error() + "; a history with a hole in the middle cannot be checked across it"
 	oldest := gap.OldestKnownHour
 	if oldest.IsZero() {
 		return generic
@@ -245,14 +245,14 @@ func recoverGapDetail(gap *query.GapError, noArchive bool) string {
 		// "oldest" is the oldest LIVE partition — archived history older than
 		// it may exist but is excluded from this walk. Claiming the index has
 		// no history there would assert more than was checked.
-		msg = fmt.Sprintf("the window reaches back to %s but the oldest live partition holds %s; the hours before it are not available to this walk (--no-archive also excludes any archived history) — shorten --lookback, or drop --no-archive if archives cover them",
+		msg = fmt.Sprintf("the window reaches back to %s but the oldest live partition holds %s; the hours before it are not available to this walk (--no-archive also excludes any archived history). Shorten --lookback, or drop --no-archive if archives cover them",
 			preHistory[0].UTC().Format(hourFmt), oldest.UTC().Format(hourFmt))
 	} else {
-		msg = fmt.Sprintf("the window reaches back to %s but the oldest hour this index has ever held (live or archived) is %s; the hours before it predate the index's history — nothing rotated away, the index did not exist yet — so shorten --lookback to the index's age or less",
+		msg = fmt.Sprintf("the window reaches back to %s but the oldest hour this index has ever held (live or archived) is %s. Nothing rotated away; the index did not exist yet. Shorten --lookback to the index's age or less",
 			preHistory[0].UTC().Format(hourFmt), oldest.UTC().Format(hourFmt))
 	}
 	if len(holes) > 0 {
-		msg += "; separately, " + query.FormatGapWarning(holes) + " — a chain with an interior hole cannot be asserted against"
+		msg += "; separately, " + query.FormatGapWarning(holes) + "; a history with a hole in the middle cannot be checked across it"
 	}
 	return msg
 }
@@ -573,32 +573,33 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 // unchecked part is not a handful of values but the entire TAIL of the window,
 // which was never loaded at all.
 func recoverChainVerdict(out recoverChainOutcome, mismatchCount int, firstMismatch string, unresolved int, firstUnresolved string, truncated bool) (Status, string, string) {
-	scope := fmt.Sprintf("%d event(s), %d chain(s), %d before-image assertion(s)", out.Events, out.Chains, out.Assertions)
+	// Plain words (user report, 2026-08-22): these strings render in the
+	// console UI, the CLI and JSON. Short words, active voice, no em dashes,
+	// and CLI flags only inside an explicit "(CLI: ...)" pointer, because the
+	// console has no such knobs and a bare flag sends its users hunting.
+	scope := fmt.Sprintf("%d change(s) on %d row(s)", out.Events, out.Chains)
 
 	// A mismatch is conclusive regardless of what else could not be checked:
 	// the events that WERE walked are real, and recover would consume them.
 	if mismatchCount > 0 {
-		detail := fmt.Sprintf("%d recover-input inconsistency(ies) in %s: %s", mismatchCount, scope, firstMismatch)
-		if mismatchCount > 1 {
-			detail += fmt.Sprintf(" (and %d more)", mismatchCount-1)
-		}
+		detail := fmt.Sprintf("the stored history contradicts itself in %d place(s), out of %s checked; first: %s", mismatchCount, scope, firstMismatch)
 		return StatusMismatch, detail, ""
 	}
 	if truncated {
 		// Truncation is category-"unproven" by definition: the whole tail of
 		// the window held assertable content that was never loaded.
-		return StatusInconclusive, fmt.Sprintf("checked %s with no inconsistency, but the window exceeded the event budget and only its oldest events were walked; narrow --since/--lookback or raise --max-events to verify it whole", scope), InconclusiveUnproven
+		return StatusInconclusive, fmt.Sprintf("the oldest %s passed every check, but this window holds more changes than one run reads, so the newest went unchecked. To check everything, raise the per-run limit, or run shorter time spans that together cover the window (CLI: --max-events, or --since/--lookback)", scope), InconclusiveUnproven
 	}
 
 	var notes []string
 	if out.ChainsNoPredecessor > 0 {
-		notes = append(notes, fmt.Sprintf("%d chain(s) began mid-history and were not asserted", out.ChainsNoPredecessor))
+		notes = append(notes, fmt.Sprintf("%d row(s) existed before this window, so their first change had nothing older to compare against", out.ChainsNoPredecessor))
 	}
 	if unresolved > 0 {
-		notes = append(notes, fmt.Sprintf("%d before-image comparison(s) were not conclusive (a value representation or schema epoch that could not be resolved): %s", unresolved, firstUnresolved))
+		notes = append(notes, fmt.Sprintf("%d comparison(s) could not be settled (a stored value or an old table layout this build could not read back): %s", unresolved, firstUnresolved))
 	}
 	if out.UnwalkableEvents > 0 {
-		notes = append(notes, fmt.Sprintf("%d event(s) carry no primary key (drift rows) and belong to no chain, so they were not walked", out.UnwalkableEvents))
+		notes = append(notes, fmt.Sprintf("%d change(s) have no primary key on record, so they belong to no row's history and were skipped", out.UnwalkableEvents))
 	}
 
 	if out.Assertions == 0 {
@@ -614,7 +615,7 @@ func recoverChainVerdict(out recoverChainOutcome, mismatchCount int, firstMismat
 			// the walk VISITED, so a table of nothing but drift rows also has
 			// Events==0 — and "no changes in the window" would be false there.
 			// Existing tests caught exactly that misclassification.
-			return StatusInconclusive, "no changes to this table in the window — nothing to check", InconclusiveNoActivity
+			return StatusInconclusive, "this table did not change in the window, so there was nothing to check", InconclusiveNoActivity
 		case out.Events == out.Chains && out.ChainsNoPredecessor == 0 && unresolved == 0 && out.UnwalkableEvents == 0:
 			// Every chain is a single INSERT: true append-only. Zero
 			// assertions is the only possible outcome for this shape, in
@@ -627,19 +628,19 @@ func recoverChainVerdict(out recoverChainOutcome, mismatchCount int, firstMismat
 			// prior history the window cannot see — widen the lookback and
 			// it becomes assertable. Calling that "does not apply" would
 			// over-claim benignity; it belongs below, with the hint.
-			return StatusInconclusive, fmt.Sprintf("%d change(s), each a row's only change and all inserts (append-only shape) — consecutive-change cross-checks do not apply here", out.Events), InconclusiveNothingToAssert
+			return StatusInconclusive, fmt.Sprintf("%d change(s), every one a new row that was never edited again; a table that only gains rows leaves nothing to cross-check", out.Events), InconclusiveNothingToAssert
 		default:
-			detail := fmt.Sprintf("walked %s: nothing was proven — the window held changes that could not be cross-checked", scope)
+			detail := fmt.Sprintf("read %s and proved nothing: none of these changes could be compared against an earlier one", scope)
 			if len(notes) > 0 {
 				detail += "; " + strings.Join(notes, "; ")
 			}
 			if out.ChainsNoPredecessor > 0 {
-				detail += "; widening --lookback/--since can give mid-history chains their predecessors"
+				detail += "; a longer window may reach the older history these rows need (CLI: --lookback or --since)"
 			}
 			return StatusInconclusive, detail, InconclusiveUnproven
 		}
 	}
-	detail := fmt.Sprintf("checked %s", scope)
+	detail := fmt.Sprintf("checked %s; %d comparison(s) between one change and the next, all matched", scope, out.Assertions)
 	if len(notes) > 0 {
 		detail += "; " + strings.Join(notes, "; ")
 	}
@@ -678,7 +679,7 @@ func assertBeforeImage(ev *query.ResultRow, st *chainState, in recoverChainInput
 		// event carries a before-image for it. That is the chaining
 		// assertion failing in its starkest form: recover would re-INSERT or
 		// reverse-UPDATE a row the chain says did not exist.
-		return chainMismatch, fmt.Sprintf("event %d (pk=%s, %s): row_before is present but the chain established this row was deleted by an earlier event — either the re-INSERT in between was never captured, or the images are inconsistent; %s",
+		return chainMismatch, fmt.Sprintf("event %d (pk=%s, %s): it carries a before-image, but an earlier change deleted this row; either the index never captured a re-insert in between, or the stored images disagree; %s",
 			ev.EventID, ev.PKValues, eventTypeLabel(ev.EventType), chainBreakGuidance)
 	}
 	equal, unresolvedCol, diffCol := compareImages(st.row, ev.RowBefore, st.schemaVersion, ev.SchemaVersion, in)
@@ -692,7 +693,7 @@ func assertBeforeImage(ev *query.ResultRow, st *chainState, in recoverChainInput
 		return chainUnresolved, fmt.Sprintf("event %d (pk=%s) column %q could not be compared conclusively (a value representation that could not be normalized, or a column-set difference whose schema epoch differs or is unknown)",
 			ev.EventID, ev.PKValues, unresolvedCol)
 	default:
-		return chainMismatch, fmt.Sprintf("event %d (pk=%s, %s): row_before does not match the state the previous event on this primary key left (column %s) — either the events in between were never captured, or the stored before-image is stale or corrupt; %s",
+		return chainMismatch, fmt.Sprintf("event %d (pk=%s, %s): its before-image does not match what the previous change to this row left behind: column %s; either the index never captured the changes in between, or it stored a bad image; %s",
 			ev.EventID, ev.PKValues, eventTypeLabel(ev.EventType), diffCol, chainBreakGuidance)
 	}
 }

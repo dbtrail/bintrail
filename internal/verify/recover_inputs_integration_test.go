@@ -188,7 +188,7 @@ func TestVerifyRecoverInputs_WindowPredatingIndexHistorySaysSo(t *testing.T) {
 	if strings.Contains(res.Detail, "rotated and not archived") {
 		t.Errorf("hours before the index existed never rotated, got: %s", res.Detail)
 	}
-	if !strings.Contains(res.Detail, "predate the index's history") {
+	if !strings.Contains(res.Detail, "the index did not exist yet") {
 		t.Errorf("detail should say the window predates the index, got: %s", res.Detail)
 	}
 	if !strings.Contains(res.Detail, "--lookback") {

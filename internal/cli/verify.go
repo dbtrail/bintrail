@@ -385,7 +385,7 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 	for _, p := range toExplain {
 		ex, err := verify.ExplainBaselinePairMismatch(cmd.Context(), cfg, p)
 		if err != nil {
-			fmt.Fprintf(cmd.OutOrStdout(), "\n--- mismatch drill-down: %s.%s — unavailable: %v ---\n", p.Schema, p.Table, err)
+			fmt.Fprintf(cmd.OutOrStdout(), "\n--- mismatch drill-down: %s.%s unavailable: %v ---\n", p.Schema, p.Table, err)
 			continue
 		}
 		ex.Write(cmd.OutOrStdout())
@@ -718,7 +718,7 @@ func writeVerifyText(out io.Writer, rep *verify.Report) {
 	// attention — and it is the REMAINDER, so an unclassified inconclusive
 	// (content modes, older producers) lands on the attention side.
 	if n := rep.Summary.InconclusiveNothingToCheck; n > 0 {
-		fmt.Fprintf(out, "\n%d match, %d mismatch, %d inconclusive (%d nothing to check — quiet or append-only; %d unproven), %d error\n",
+		fmt.Fprintf(out, "\n%d match, %d mismatch, %d inconclusive (%d with nothing to check; %d unproven), %d error\n",
 			rep.Summary.Match, rep.Summary.Mismatch, rep.Summary.Inconclusive,
 			n, rep.Summary.Inconclusive-n, rep.Summary.Error)
 		return

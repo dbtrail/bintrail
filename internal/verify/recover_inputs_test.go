@@ -183,7 +183,7 @@ func TestCheckRecoverChains_NothingAssertedIsInconclusive(t *testing.T) {
 	if out.Status != StatusInconclusive {
 		t.Fatalf("nothing asserted: got %s (%s), want %s", out.Status, out.Detail, StatusInconclusive)
 	}
-	if !strings.Contains(out.Detail, "nothing was proven") {
+	if !strings.Contains(out.Detail, "proved nothing") {
 		t.Errorf("detail should say nothing was proven, got: %s", out.Detail)
 	}
 }
@@ -347,7 +347,7 @@ func TestCheckRecoverChains_EventAfterDeleteWithoutReinsertMismatches(t *testing
 	if out.Status != StatusMismatch {
 		t.Fatalf("got %s (%s), want %s", out.Status, out.Detail, StatusMismatch)
 	}
-	if !strings.Contains(out.Detail, "deleted by an earlier event") {
+	if !strings.Contains(out.Detail, "an earlier change deleted this row") {
 		t.Errorf("detail should explain the chain said the row was gone, got: %s", out.Detail)
 	}
 }
@@ -481,7 +481,7 @@ func TestCheckRecoverChains_UnresolvedEnumOrdinalIsInconclusiveNotMismatch(t *te
 	if out.Status != StatusInconclusive {
 		t.Fatalf("got %s (%s), want %s", out.Status, out.Detail, StatusInconclusive)
 	}
-	if !strings.Contains(out.Detail, "not conclusive") {
+	if !strings.Contains(out.Detail, "could not be settled") {
 		t.Errorf("detail should explain why, got: %s", out.Detail)
 	}
 }
@@ -718,7 +718,7 @@ func TestCheckRecoverChains_UnresolvedValueDoesNotEraseConclusiveAssertions(t *t
 	}
 	// The unproven part is still reported — it is a note on the verdict, not a
 	// silent omission.
-	if !strings.Contains(out.Detail, "not conclusive") {
+	if !strings.Contains(out.Detail, "could not be settled") {
 		t.Errorf("the unresolved comparison must still be reported, got: %s", out.Detail)
 	}
 }
@@ -735,7 +735,7 @@ func TestCheckRecoverChains_OnlyUnresolvedValuesStaysInconclusive(t *testing.T) 
 	if out.Status != StatusInconclusive {
 		t.Fatalf("got %s (%s), want %s", out.Status, out.Detail, StatusInconclusive)
 	}
-	if !strings.Contains(out.Detail, "nothing was proven") || !strings.Contains(out.Detail, "not conclusive") {
+	if !strings.Contains(out.Detail, "proved nothing") || !strings.Contains(out.Detail, "could not be settled") {
 		t.Errorf("detail should say nothing was proven AND why, got: %s", out.Detail)
 	}
 }
@@ -881,7 +881,7 @@ func TestCheckRecoverChains_MismatchDetailKeepsFirstAndCountsRest(t *testing.T) 
 	if out.Status != StatusMismatch {
 		t.Fatalf("got %s (%s), want %s", out.Status, out.Detail, StatusMismatch)
 	}
-	if !strings.Contains(out.Detail, "3 recover-input inconsistency(ies)") {
+	if !strings.Contains(out.Detail, "contradicts itself in 3 place(s)") {
 		t.Errorf("detail must carry the full count, got: %s", out.Detail)
 	}
 	if !strings.Contains(out.Detail, "event 2") {
@@ -890,9 +890,8 @@ func TestCheckRecoverChains_MismatchDetailKeepsFirstAndCountsRest(t *testing.T) 
 	if strings.Contains(out.Detail, "event 3") || strings.Contains(out.Detail, "event 4") {
 		t.Errorf("later findings are summarized, not listed, got: %s", out.Detail)
 	}
-	if !strings.Contains(out.Detail, "(and 2 more)") {
-		t.Errorf("detail must summarize the rest, got: %s", out.Detail)
-	}
+	// The full count ("in 3 place(s)") is the summary of the rest; the old
+	// "(and 2 more)" tail restated it and was cut with the plain-words pass.
 }
 
 // A coverage gap on an index YOUNGER than the window is not rotation: the
@@ -909,7 +908,7 @@ func TestRecoverGapDetail(t *testing.T) {
 		if strings.Contains(got, "rotated and not archived") {
 			t.Errorf("pre-history hours never rotated, got: %s", got)
 		}
-		for _, want := range []string{"predate the index's history", "--lookback", "2026-07-20 10:00", "2026-07-20 07:00"} {
+		for _, want := range []string{"the index did not exist yet", "--lookback", "2026-07-20 10:00", "2026-07-20 07:00"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("detail should contain %q, got: %s", want, got)
 			}
@@ -925,7 +924,7 @@ func TestRecoverGapDetail(t *testing.T) {
 
 	t.Run("mixed gaps report both, honestly", func(t *testing.T) {
 		got := recoverGapDetail(&query.GapError{GapHours: append(append([]time.Time{}, pre...), hole), OldestKnownHour: oldest}, false)
-		if !strings.Contains(got, "predate the index's history") || !strings.Contains(got, "rotated and not archived") {
+		if !strings.Contains(got, "the index did not exist yet") || !strings.Contains(got, "rotated and not archived") {
 			t.Errorf("mixed gaps must name both causes, got: %s", got)
 		}
 	})
@@ -942,7 +941,7 @@ func TestRecoverGapDetail(t *testing.T) {
 		// history older than the oldest LIVE partition may exist — the
 		// wording must not assert the index did not exist.
 		got := recoverGapDetail(&query.GapError{GapHours: pre, OldestKnownHour: oldest}, true)
-		if strings.Contains(got, "predate the index's history") {
+		if strings.Contains(got, "the index did not exist yet") {
 			t.Errorf("--no-archive cannot prove the index had no history, got: %s", got)
 		}
 		if !strings.Contains(got, "--no-archive") || !strings.Contains(got, "--lookback") {

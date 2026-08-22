@@ -404,7 +404,7 @@ try {
     if (okBox) { document.body.appendChild(okBox); okBorder = getComputedStyle(okBox).borderColor; okBox.remove(); }
     return {
       okGreenClass: !!okBox && okBox.classList.contains("ok-box"),
-      okGreenText: !!okBox && /No gaps in captured stream/.test(okBox.textContent) && /doesn't mean the stream is currently running/.test(okBox.textContent),
+      okGreenText: !!okBox && /No gaps in captured stream/.test(okBox.textContent) && /does not mean the stream is running/.test(okBox.textContent),
       okBorder,
       gapRed: !!gapBox && gapBox.classList.contains("error-box") && /permanently lost/i.test(gapBox.textContent),
       gapPrecedence: !!gapWins && gapWins.classList.contains("error-box"),
@@ -2141,10 +2141,13 @@ try {
   // (c) worst-first ordering (#1419 §3), pinned through the real renderer.
   const vfyOrder = await page.evaluate(() => {
     const tmp = document.createElement("div");
-    document.body.appendChild(tmp);
+    // Attached to the real view so the rows lay out at page width; a detached
+    // node cannot measure overlap.
+    document.querySelector(".view").appendChild(tmp);
     renderVerifyResults(tmp, { state: "succeeded", mode: "recover-inputs",
       results: [
-        { schema: "s", table: "aaa_clean", status: "match" },
+        { schema: "s", table: "aaa_clean", status: "match", events_checked: 200000, chains_checked: 200000,
+          reason: "checked 200000 change(s) on 200000 row(s); 0 comparison(s) between one change and the next, all matched" },
         { schema: "s", table: "bbb_quiet", status: "inconclusive", inconclusive_kind: "no-activity" },
         { schema: "s", table: "mmm_broken", status: "mismatch", reason: "chain break" },
         { schema: "s", table: "ccc_hard", status: "inconclusive" },
@@ -2152,13 +2155,29 @@ try {
       summary: { match: 1, mismatch: 1, inconclusive: 2, inconclusive_nothing_to_check: 1, error: 0, total: 4 } }, "x");
     const order = Array.from(tmp.querySelectorAll(".vfy-row .vfy-tbl")).map((n) => n.textContent);
     const verdicts = Array.from(tmp.querySelectorAll(".vfy-row .vfy-verdict")).map((n) => n.textContent);
+    // Overflow guard (user report, 2026-08-22): a six-digit counts cell used
+    // to paint over the reason beside it. NOT measured with bounding rects:
+    // a fixed grid track clamps the BOX to the track width and the text
+    // paints outside it as ink, which rects cannot see (the first draft of
+    // this guard stayed green with the exact broken CSS restored, twice).
+    // scrollWidth vs clientWidth sees both failure shapes: ink overflowing
+    // an unclipped cell AND a clipped cell truncating the number.
+    const row = Array.from(tmp.querySelectorAll(".vfy-row")).find((r) => r.querySelector(".vfy-counts").textContent);
+    const cell = row.querySelector(".vfy-counts");
+    const fits = cell.scrollWidth <= cell.clientWidth + 1;
+    const countsText = cell.textContent;
+    const geom = "scrollWidth=" + cell.scrollWidth + " clientWidth=" + cell.clientWidth;
     tmp.remove();
-    return { order, verdicts };
+    return { order, verdicts, fits, countsText, geom };
   });
   (vfyOrder.order[0] === "s.mmm_broken" && vfyOrder.order[3] === "s.aaa_clean"
     && vfyOrder.verdicts.includes("nothing to check"))
     ? ok("verification: rows sort worst-first and the benign verdict is written in words")
     : bad("verification: rows sort worst-first and the benign verdict is written in words", JSON.stringify(vfyOrder));
+  (vfyOrder.fits && /200,000 changes/.test(vfyOrder.countsText))
+    ? ok("verification: a six-digit counts cell fits its column whole and reads with separators")
+    : bad("verification: a six-digit counts cell fits its column whole and reads with separators",
+        vfyOrder.geom + " text=" + vfyOrder.countsText);
 
   // (d) a REAL run end to end: recover-inputs over the fixture index.
   await page.evaluate(() => {

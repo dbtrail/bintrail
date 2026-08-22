@@ -303,7 +303,7 @@ func (r *Report) ExitError() error {
 		// split so a human reading the failure knows whether anything was
 		// actually wrong.
 		if n := r.Summary.InconclusiveNothingToCheck; n > 0 {
-			return fmt.Errorf("no tables were verified (%d inconclusive, of which %d had nothing to check — quiet or append-only); nothing proven", r.Summary.Inconclusive, n)
+			return fmt.Errorf("no tables were verified (%d inconclusive, of which %d had nothing to check: no changes, or only new rows); nothing proven", r.Summary.Inconclusive, n)
 		}
 		return fmt.Errorf("no tables were verified (%d inconclusive); nothing proven", r.Summary.Inconclusive)
 	}

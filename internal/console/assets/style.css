@@ -1970,7 +1970,11 @@ button { font-family: inherit; }
    glyph, carries the answer. Verdict colors reuse the doctor-card bands. */
 .vfy-rows { display: flex; flex-direction: column; }
 .vfy-row {
-  display: grid; grid-template-columns: 18px minmax(180px, 240px) 110px 130px 1fr auto;
+  /* The counts track sizes to its content (max-content), never a fixed
+     width: 130px + nowrap let "200000 ev · 200000 chains" paint OVER the
+     reason column (user report, 2026-08-22). Grid tracks do not grow for
+     overflowing fixed sizes; they must be allowed to fit. */
+  display: grid; grid-template-columns: 18px minmax(150px, 240px) 100px minmax(0, max-content) minmax(120px, 1fr) auto;
   align-items: center; gap: 10px; padding: 7px 10px;
   border-top: 1px solid var(--line-soft); border-left: 3px solid transparent;
 }
@@ -1990,7 +1994,7 @@ button { font-family: inherit; }
 .vfy-row.fail .vfy-verdict { color: var(--delete); }
 .vfy-row.warn .vfy-verdict { color: var(--orange-2); }
 .vfy-row.note .vfy-verdict { color: var(--ink-3); }
-.vfy-counts { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+.vfy-counts { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vfy-reason { font-size: 12px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .vfy-reason.wrap { white-space: normal; }
 

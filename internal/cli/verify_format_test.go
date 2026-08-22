@@ -251,7 +251,7 @@ func TestVerifyTextSummarySplit(t *testing.T) {
 	// The arithmetic is the point: 3 inconclusive, 1 benign, remainder 2
 	// (the unproven one AND the unclassified one — rounding the unknown
 	// toward benign is the direction this feature must never take).
-	want := "1 match, 0 mismatch, 3 inconclusive (1 nothing to check — quiet or append-only; 2 unproven), 0 error"
+	want := "1 match, 0 mismatch, 3 inconclusive (1 with nothing to check; 2 unproven), 0 error"
 	if !strings.Contains(s, want) {
 		t.Errorf("text summary missing %q:\n%s", want, s)
 	}
