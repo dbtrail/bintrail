@@ -2458,6 +2458,10 @@ button { font-family: inherit; }
   --accent-bg: oklch(1 0 0 / 0.13);
   --blue-bg: oklch(1 0 0 / 0.13);
   border-right: none;
+  /* the inherited base: naked text (srv-note and friends) takes body's
+     COMPUTED dark ink otherwise — a scoped token only reaches elements
+     that declare color through it. */
+  color: var(--ink-2);
   background:
     radial-gradient(95% 34% at 112% -4%, oklch(0.48 0.15 348 / 0.42), transparent 68%),
     radial-gradient(130% 44% at -25% 106%, oklch(0.42 0.16 293 / 0.55), transparent 62%),
