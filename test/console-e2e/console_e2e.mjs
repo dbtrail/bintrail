@@ -3494,11 +3494,11 @@ try {
     : bad("brand paint: the warmed loading bar stays clear of the violet panel ground",
         JSON.stringify({ ratio: Number((brand.skelVioletRatio || 0).toFixed(3)), parsed: brand.skelVioletParsed }));
 
-  // ── Scenario 16t — the tropical pass: the console wears the site's
-  // sunset for real. Four independent guards, each on the surface where the
-  // colour actually lands: the sidebar's night ground, its flipped text
-  // ramp, the active pill, the gradient page title, and the tinted card
-  // rotation. Computed style, not declarations — a scoped token remap that
+  // ── Scenario 17t — the tropical pass: the console wears the site's
+  // sunset for real. Five independent guards, each on the surface where the
+  // colour actually lands: the sidebar's night ground, its flipped base
+  // text step, the active pill, the gradient page title, and the tinted
+  // card rotation. Computed style, not declarations — a scoped token remap that
   // stops resolving (the exact way this pass could silently die) leaves
   // declarations intact and only the computed values change.
   const trop = await page.evaluate(() => {
@@ -3508,7 +3508,10 @@ try {
     const title = document.querySelector(".page-title");
     // Normalized through a canvas: computed colors come back as authored
     // (oklch on this branch, rgb elsewhere), and a parse-only reader would
-    // go red on FORMAT instead of value.
+    // go red on FORMAT instead of value. Cheap gamma-encoded luma, NOT the
+    // WCAG luminance 17e computes — 0.6 is a coarse light/dark split, never
+    // a contrast floor. Fails safe: a rejected color leaves the canvas
+    // black and reads as dark.
     const lum = (c) => {
       const cv = document.createElement("canvas");
       cv.width = cv.height = 1;
