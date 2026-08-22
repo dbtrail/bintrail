@@ -3496,9 +3496,9 @@ try {
 
   // ── Scenario 17t — the tropical pass: the console wears the site's
   // sunset for real. Five independent guards, each on the surface where the
-  // colour actually lands: the sidebar's night ground, its flipped base
-  // text step, the active pill, the gradient page title, and the tinted
-  // card rotation. Computed style, not declarations — a scoped token remap that
+  // colour actually lands: the sidebar's tinted morning ground (light but
+  // NEVER white, and never back to the dark night), its dark text, the
+  // active pill, the gradient page title, and the tinted card rotation. Computed style, not declarations — a scoped token remap that
   // stops resolving (the exact way this pass could silently die) leaves
   // declarations intact and only the computed values change.
   const trop = await page.evaluate(() => {
@@ -3522,8 +3522,13 @@ try {
       return (0.2126 * d[0] + 0.7152 * d[1] + 0.0722 * d[2]) / 255;
     };
     const sideCS = getComputedStyle(side);
+    // the linear layer's first stop IS the ground's identity: light but not
+    // white. Serialized computed backgroundImage keeps the authored oklch.
+    const linear = sideCS.backgroundImage.split("linear-gradient")[1] || "";
+    const stop = (/oklch\([^)]+\)/.exec(linear) || [""])[0];
     return {
       groundImage: sideCS.backgroundImage,
+      stopLum: stop ? lum(stop) : -1,
       itemLum: item ? lum(getComputedStyle(item).color) : -1,
       activeImage: active ? getComputedStyle(active).backgroundImage : "",
       activeColor: active ? getComputedStyle(active).color : "",
@@ -3533,11 +3538,14 @@ try {
     };
   });
   (/radial-gradient/.test(trop.groundImage) && /linear-gradient/.test(trop.groundImage))
-    ? ok("tropical: the sidebar wears the aubergine-night ground (radial glows over the linear base)")
-    : bad("tropical: the sidebar wears the aubergine-night ground (radial glows over the linear base)", trop.groundImage.slice(0, 120));
-  (trop.itemLum > 0.6)
-    ? ok("tropical: sidebar text flipped light for the dark ground")
-    : bad("tropical: sidebar text flipped light for the dark ground", "luminance " + trop.itemLum.toFixed(3));
+    ? ok("tropical: the sidebar wears the tinted ground (radial glows over the linear base)")
+    : bad("tropical: the sidebar wears the tinted ground (radial glows over the linear base)", trop.groundImage.slice(0, 120));
+  (trop.stopLum > 0.80 && trop.stopLum < 0.985)
+    ? ok("tropical: the sidebar ground is light but never white (and never the night)")
+    : bad("tropical: the sidebar ground is light but never white (and never the night)", "stop luminance " + trop.stopLum.toFixed(3));
+  (trop.itemLum >= 0 && trop.itemLum < 0.4)
+    ? ok("tropical: sidebar text stays dark ink on the light ground")
+    : bad("tropical: sidebar text stays dark ink on the light ground", "luminance " + trop.itemLum.toFixed(3));
   (/linear-gradient/.test(trop.activeImage) && trop.activeColor === "rgb(255, 255, 255)")
     ? ok("tropical: the active page is the sunset pill with white text")
     : bad("tropical: the active page is the sunset pill with white text", JSON.stringify({ i: trop.activeImage.slice(0, 80), c: trop.activeColor }));
@@ -3545,12 +3553,13 @@ try {
     ? ok("tropical: page titles wear the headline gradient")
     : bad("tropical: page titles wear the headline gradient", JSON.stringify({ clip: trop.titleClip, c: trop.titleColor }));
 
-  // Two remap side effects with their own guards. Selection: ::selection
-  // resolves var() against the originating element, so the sidebar's
-  // near-white ink landed on the sun highlight at 1.32:1 until restated —
-  // dark ink must come back. Haze: background-attachment local is what
-  // keeps scrolled list headers off the haze peak; a background shorthand
-  // edit on .main silently resets it to scroll.
+  // Two guards that outlived the night version. Selection: ::selection
+  // resolves var() against the originating element, so any future ink
+  // remap inside .side puts light glyphs on the sun highlight (the night
+  // draft measured 1.32:1) — dark ink must hold. Haze:
+  // background-attachment local is what keeps scrolled list headers off
+  // the haze peak; a background shorthand edit on .main silently resets
+  // it to scroll.
   const tropSide = await page.evaluate(() => {
     const lum = (c) => {
       const cv = document.createElement("canvas");

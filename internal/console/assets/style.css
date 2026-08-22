@@ -6,7 +6,7 @@
    lightness steps, so WCAG AA holds where the marketing values would not
    (the site's muted ink is ~3.1:1 on white; a console cannot ship that).
    Brand accents (the site's tropical sunset — pink/peach/violet/sun) live
-   on chrome and config surfaces — the sidebar's night ground, page titles,
+   on chrome and config surfaces — the sidebar's tropical-morning ground, page titles,
    the tinted fact cards, the sign-in gate, empty states, the busy
    indicator, text selection (see the tropical pass at EOF). Never on data:
    row-carrying surfaces and the INSERT/UPDATE/DELETE code stay exactly as
@@ -2429,112 +2429,53 @@ button { font-family: inherit; }
 
 /* ============================================================
    the tropical pass — dbtrail.com's sunset, worn for real.
-   Two moves: the sidebar goes to the site's aubergine night with the
-   sunset as light, and the content canvas warms up (haze, gradient
+   Two moves: the sidebar goes to a light tropical morning wearing the
+   site's sunset, and the content canvas warms up (haze, gradient
    page titles, home-language tinted cards). The DATA rules survive
    untouched: INSERT/UPDATE/DELETE tokens, the diff, the timeline and
    every row-carrying surface keep their exact colors — the warmth
    lives on chrome and config surfaces only.
    ============================================================ */
 
-/* ---- sidebar: aubergine night, sunset light ---- */
+/* ---- sidebar: tropical morning — light, never white ---- */
 .side {
-  /* One scoped remap instead of per-element edits: everything inside the
-     sidebar consumes these tokens, so the whole column flips together.
-     Measured on the LIGHTER gradient stop — the worse of the two for light
-     ink: ink 13.9:1, ink-2 9.5:1, ink-3 7.5:1, ink-4 5.6:1. Under the
-     corner glows (whose centers sit off-canvas, so their on-canvas alpha
-     never reaches the declared peak) the worst composite is ink-4 at
-     ~4.8:1 in the top-right corner — above the floor, but with little
-     room: ink-4 text must stay out of the two glow corners, and today it
-     does. */
-  --ink:   oklch(0.97 0.008 300);
-  --ink-2: oklch(0.85 0.035 300);
-  --ink-3: oklch(0.78 0.04 300);
-  --ink-4: oklch(0.70 0.045 300);
-  --line:      oklch(1 0 0 / 0.15);
-  --line-soft: oklch(1 0 0 / 0.10);
-  --surface:   oklch(1 0 0 / 0.07);
-  --surface-2: oklch(1 0 0 / 0.10);
-  --surface-3: oklch(1 0 0 / 0.13);
-  /* interactive accent inside the night: light pink, not product blue —
-     blue drowns on aubergine. Focus rings become soft white. */
-  --accent: oklch(0.85 0.11 348);
-  --accent-bg: oklch(1 0 0 / 0.13);
-  --blue-bg: oklch(1 0 0 / 0.13);
-  border-right: none;
-  /* the inherited base: naked text (srv-note and friends) takes body's
-     COMPUTED dark ink otherwise — a scoped token only reaches elements
-     that declare color through it. */
-  color: var(--ink-2);
+  /* A light lavender-blush ground with the same sunset accents the night
+     version wore (the operator asked for light-but-not-white). The default
+     ink ramp mostly survives — only its two faint steps darken, because a
+     tinted ground plus the corner glows eats their margin. Measured on the
+     worse composite each floor faces (the glow corners): ink-3' 4.56:1
+     (floor 4.5), ink-4' 3.17:1 (floor 3.0, hint/icon tier); off the glows
+     they sit at 5.2-5.7 and 3.6-3.9. */
+  --ink-3: oklch(0.50 0.065 304);
+  --ink-4: oklch(0.585 0.055 304);
+  border-right: 1px solid oklch(0.9 0.02 320);
   background:
-    radial-gradient(95% 34% at 112% -4%, oklch(0.48 0.15 348 / 0.42), transparent 68%),
-    radial-gradient(130% 44% at -25% 106%, oklch(0.42 0.16 293 / 0.55), transparent 62%),
-    linear-gradient(198deg, oklch(0.275 0.062 312) 0%, oklch(0.215 0.06 294) 100%);
-}
-/* The wordmark keeps its headline-gradient clip (guarded), but the site's
-   stops were tuned for white paper and go muddy on the aubergine; restate
-   the same sunset brighter for the dark ground. color stays transparent —
-   an opaque color here paints OVER the clip and kills the gradient. Inside
-   @supports so an engine without the clip never paints the gradient BOX
-   behind the (near-white fallback) ink. */
-@supports (background-clip: text) or (-webkit-background-clip: text) {
-  .side .brand-name {
-    background: linear-gradient(135deg, oklch(0.74 0.19 3) 0%, oklch(0.76 0.14 51) 55%, oklch(0.72 0.15 293) 100%);
-    -webkit-background-clip: text;
-    background-clip: text;
-  }
+    radial-gradient(95% 34% at 112% -4%, oklch(0.8 0.1 348 / 0.22), transparent 68%),
+    radial-gradient(130% 44% at -25% 106%, oklch(0.72 0.12 293 / 0.18), transparent 62%),
+    linear-gradient(198deg, oklch(0.972 0.012 340) 0%, oklch(0.942 0.022 300) 100%);
 }
 .side .brand-mark {
   /* no background: the favicon img covers the 30px box completely (zero
      transparent pixels), so only the glow shows. */
-  box-shadow: 0 2px 10px oklch(0.55 0.2 3 / 0.45);
+  box-shadow: 0 2px 10px oklch(0.55 0.2 3 / 0.35);
 }
-/* read-only pill: the mint identity restated for the dark ground. */
-.side .ro-pill {
-  color: oklch(0.85 0.11 165);
-  background: oklch(0.85 0.13 165 / 0.14);
-  border-color: oklch(0.85 0.13 165 / 0.35);
-}
-.side .srv-dot { box-shadow: 0 0 0 3px oklch(0.85 0.13 165 / 0.25); background: oklch(0.75 0.14 165); }
-/* every section label is the sun, glowing gold on the night — the one
-   place the sun reads as light. */
-.side .nav-label { color: oklch(0.83 0.13 88); }
-.side .nav-item:hover { background: oklch(1 0 0 / 0.08); color: #fff; }
-.side .nav-item:hover .ni-icon { color: oklch(0.9 0.05 300); }
+/* every section label is deep gold — the sun's text partner on a light
+   ground (its own tint token sun-deep grades 4.49:1 in the violet glow
+   corner, a hair under the small-text floor; this literal clears 5.1). */
+.side .nav-label { color: oklch(0.46 0.095 88); }
+/* white fields and hovers lift off the tint the way cards lift off the
+   blush canvas. */
+.side .nav-item:hover { background: oklch(1 0 0 / 0.6); }
 /* the active page is the sunset itself: the site's CTA pink->orange,
    darkened for 14px white text (measured 5.9:1 on the pink stop, 5.3:1 on
    the orange). */
 .side .nav-item.active {
   color: #fff;
   background: linear-gradient(120deg, oklch(0.53 0.2 3) 0%, oklch(0.54 0.14 51) 100%);
-  box-shadow: 0 6px 18px -8px oklch(0.55 0.2 3 / 0.6);
+  box-shadow: 0 6px 18px -8px oklch(0.55 0.2 3 / 0.5);
 }
 .side .nav-item.active .ni-icon { color: #fff; }
 .side .nav-item.active .nav-kbd { color: oklch(1 0 0 / 0.75); }
-.side .cmdk-kbd { background: oklch(1 0 0 / 0.10); }
-.side .srv-manage { border-color: oklch(1 0 0 / 0.22); }
-.side .srv-manage:hover { border-color: oklch(0.85 0.11 348 / 0.6); color: #fff; }
-.side .side-docs:hover { color: #fff; }
-.side .side-docs:hover svg { color: oklch(0.85 0.11 348); }
-.side .nav::-webkit-scrollbar-thumb { border-color: transparent; }
-/* logout's danger hover restated for the night: the light-mode chip
-   (--delete-bg) reads as a pale sticker on the aubergine. */
-.side .side-logout:hover { background: oklch(0.62 0.19 23 / 0.22); color: oklch(0.93 0.05 23); }
-/* the native option popup renders OUTSIDE the sidebar's dark ground, on
-   the platform's own light chrome where the engine applies these at all —
-   restate the global ink so near-white options can never land on it. */
-.side .srv-select option { color: oklch(0.255 0.055 301); background: #ffffff; }
-/* ::selection resolves var() against the ORIGINATING element, so the
-   global sun-behind-ink selection picks up this scope's near-white ink:
-   1.32:1 on gold, illegible exactly where an operator copies the stream
-   position mid-incident. Restate the global ink literal. */
-.side ::selection { color: oklch(0.255 0.055 301); }
-/* the select's chevron was inked for a light field */
-.side .srv-select {
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path fill='%23b7a8cc' d='M0 0h10L5 6z'/></svg>");
-}
-.side .srv-select:hover { border-color: oklch(1 0 0 / 0.3); }
 
 /* ---- content: off the hospital white ----
    (the blush canvas itself lives on the ONE --bg declaration in the token
