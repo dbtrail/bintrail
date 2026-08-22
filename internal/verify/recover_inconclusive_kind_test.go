@@ -107,16 +107,24 @@ func TestSummaryCountsBenignInconclusive(t *testing.T) {
 	s.CountWithKind(StatusInconclusive, InconclusiveUnproven)
 	s.CountWithKind(StatusInconclusive, "") // unclassified: content modes, older producers
 	s.CountWithKind(StatusMatch, "")
+	// A benign kind riding on a NON-inconclusive status must not bump the
+	// benign counter — the kind subdivides inconclusive only, and the wire
+	// can carry any pairing (pass 2 proved the status conjunct deletable
+	// with every test green).
+	s.CountWithKind(StatusMatch, InconclusiveNoActivity)
 
 	if s.Inconclusive != 4 {
 		t.Errorf("Inconclusive = %d, want 4 — the split is a subdivision, not a fifth bucket", s.Inconclusive)
+	}
+	if s.Match != 2 {
+		t.Errorf("Match = %d, want 2", s.Match)
 	}
 	if s.InconclusiveNothingToCheck != 2 {
 		t.Errorf("InconclusiveNothingToCheck = %d, want 2 — unproven and unclassified must both "+
 			"land on the attention side", s.InconclusiveNothingToCheck)
 	}
-	if s.Total != 5 {
-		t.Errorf("Total = %d, want 5", s.Total)
+	if s.Total != 6 {
+		t.Errorf("Total = %d, want 6", s.Total)
 	}
 }
 
