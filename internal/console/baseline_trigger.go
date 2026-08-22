@@ -269,16 +269,22 @@ func (s *Server) handleBaselineRestore(w http.ResponseWriter, r *http.Request) {
 		}
 		// The engine's retry rule tolerates ONLY the marker: a failed fold
 		// that also left converted tables behind makes it refuse, so a 202
-		// here would promise work that cannot happen.
-		if ents, rerr := os.ReadDir(snapDir); rerr == nil {
-			for _, ent := range ents {
-				if ent.Name() == baseline.IncompleteMarker {
-					continue
-				}
-				writeJSONError(w, http.StatusConflict,
-					"a failed backup at exactly "+at.Format(consoleTSFormat)+" left files behind; delete that backup folder and retry, or pick another second")
-				return
+		// here would promise work that cannot happen. An unreadable listing
+		// refuses too — the fold's own ReadDir would die the same way, and a
+		// 202 whose failure arrives by polling is the outcome this whole
+		// check exists to avoid.
+		ents, rerr := os.ReadDir(snapDir)
+		if rerr != nil {
+			writeJSONError(w, http.StatusBadGateway, "cannot read the backup directory: "+rerr.Error())
+			return
+		}
+		for _, ent := range ents {
+			if ent.Name() == baseline.IncompleteMarker {
+				continue
 			}
+			writeJSONError(w, http.StatusConflict,
+				"a failed backup at exactly "+at.Format(consoleTSFormat)+" left files behind; delete that backup folder and retry, or pick another second")
+			return
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		// A backup directory that cannot even be stat'ed predicts the fold

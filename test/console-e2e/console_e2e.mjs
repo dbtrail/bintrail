@@ -2131,6 +2131,24 @@ try {
     ? ok("backups: every running kind renders a live chip, words, and the motion strip")
     : bad("backups: every running kind renders a live chip, words, and the motion strip", JSON.stringify(bkRun));
 
+  // 15e-4: fold refusals are rewritten for this page. The engine's errors are
+  // per-table and newline-joined; the rewrite must strip every CLI remedy
+  // WITHOUT eating the next table's identity (the first draft's non-global,
+  // newline-crossing regex did exactly that).
+  const bkErr = await page.evaluate(() => {
+    const twoTables = "orders: stamped capture gap for shop.orders; pass --allow-gaps to proceed with a known-incomplete reconstruction: gap\n" +
+      "customers: stamped capture gap for shop.customers; pass --allow-gaps to proceed with a known-incomplete reconstruction: gap";
+    const out = backupFoldError(twoTables);
+    return {
+      noFlags: !/--allow-gaps/.test(out) && !/--at/.test(backupFoldError("remove it, or target a different instant with --at")),
+      bothTables: /shop\.orders/.test(out) && /shop\.customers/.test(out),
+      terminated: /[.!?]$/.test(out.trim()),
+    };
+  });
+  (bkErr.noFlags && bkErr.bothTables && bkErr.terminated)
+    ? ok("backups: fold refusals lose their CLI flags without losing table identities")
+    : bad("backups: fold refusals lose their CLI flags without losing table identities", JSON.stringify(bkErr));
+
   // Scenario 15d — Protect group (#1384). Baselines and verification moved off
   // Settings > Storage into their own routes. Two halves must hold TOGETHER,
   // and only the first is obvious: each route renders its panel, AND Storage

@@ -3648,8 +3648,10 @@ async function renderBaselines() {
       v.append(backupRunRegion(running));
       // One watcher at a time: renderBaselines() outside renderRoute does not
       // bump viewGen, so without its own generation every re-render (its own
-      // settle path included) would stack another 2s poller.
-      watchBackupRuns(cur && cur.id, vgen, ++backupWatchGen, running.map((r) => r.kind));
+      // settle path included) would stack another 2s poller. The function
+      // owns the counter, so a no-op spawn (no server id) cannot kill a
+      // live watcher.
+      watchBackupRuns(cur && cur.id, vgen, running.map((r) => r.kind));
     }
     const restoreCard = backupRestoreCard(cur, baselines, restoreSt);
     if (restoreCard) v.append(restoreCard);
@@ -4372,8 +4374,9 @@ let backupWatchGen = 0;
 // pollFailed held a settled region up for the full 30-minute cap. The
 // refresh state only exists on the listing endpoint, which enumerates the
 // store (billed LISTs on S3), so it is polled on a slower cadence.
-async function watchBackupRuns(id, vgen, wgen, kinds) {
+async function watchBackupRuns(id, vgen, kinds) {
   if (!id) return;
+  const wgen = ++backupWatchGen;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let refreshBusy = kinds.includes("refresh"); // it WAS running at spawn
   for (let i = 0; i < 900; i++) {
@@ -4400,14 +4403,18 @@ async function watchBackupRuns(id, vgen, wgen, kinds) {
       try {
         const b = await api("/api/baselines");
         refreshBusy = !!(b.refresh && b.refresh.state === "running");
-      } catch (e) { if (unknown(e)) pollFailed = true; }
+      } catch (e) {
+        // A definitive 4xx means this selection cannot answer; keeping the
+        // primed true would hold the region up for the full cap.
+        if (unknown(e)) pollFailed = true; else refreshBusy = false;
+      }
     }
     if (refreshBusy) busy = true;
     // A failed poll says nothing about the run; treating it as "settled"
     // would clear the RUNNING region while the fold is still going.
     if (pollFailed && !busy) continue;
     if (!busy) {
-      if (vgen === viewGen && location.pathname === "/baselines") renderBaselines();
+      if (wgen === backupWatchGen && vgen === viewGen && location.pathname === "/baselines") renderBaselines();
       return;
     }
   }
@@ -4417,14 +4424,19 @@ async function watchBackupRuns(id, vgen, wgen, kinds) {
 }
 
 // backupFoldError rewrites a fold refusal for this page: the engine's
-// remedies name CLI flags an operator here cannot type (the MCP surface does
-// the same rewrite for its clients).
+// remedies name CLI flags an operator here cannot type (the MCP surface
+// avoids the same wording by composing its own remedy at the check site).
+// A fold failure is per-table and errors.Join'd, so last_error is usually
+// MULTI-LINE: the patterns are global and never cross a line, or one
+// table's remedy would eat the next table's identity.
 function backupFoldError(msg) {
-  return String(msg)
-    .replace(/;?\s*pass --allow-gaps to proceed[^.;]*/,
+  let out = String(msg)
+    .replace(/;?[ \t]*pass --allow-gaps to proceed[^.;\n]*/g,
       ". The recorded history has a permanent gap in that window, so the backup would be incomplete; pick a later moment")
-    .replace(/,?\s*or target a different instant with --at/, ", or pick another second")
+    .replace(/,?[ \t]*or target a different instant with --at/g, ", or pick another second")
     .replace(/\u2014/g, "-");
+  if (!/[.!?]$/.test(out.trim())) out = out.trim() + ".";
+  return out;
 }
 
 // backupRestoreCard offers the point-in-time restore: pick a past moment, get

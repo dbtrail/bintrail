@@ -137,6 +137,7 @@ func TestBaselineDownload_localTarRoundTrip(t *testing.T) {
 }
 
 func TestBaselineDownload_refusesIncomplete(t *testing.T) {
+	rec409 := audittest.Install(t)
 	dir := t.TempDir()
 	writeBaselineFile(t, dir, "aaaa", time.Time{}, detailSnapDir, "shop", "orders.parquet")
 	writeBaselineFile(t, dir, "", time.Time{}, detailSnapDir, "_INCOMPLETE")
@@ -145,6 +146,14 @@ func TestBaselineDownload_refusesIncomplete(t *testing.T) {
 	rec, body := doServersReq(t, srv, "GET", "/api/baselines/download"+detailQuery(detailSnapAt), "")
 	if rec.Code != 409 {
 		t.Fatalf("download: code = %d, body = %s, want 409", rec.Code, body)
+	}
+	// The refusal served no row data, so it must emit nothing: the audit
+	// defer is registered only after every refusal has returned, and that
+	// placement is the contract — prose is not a guard.
+	for _, ev := range rec409.Events() {
+		if ev.Action == "baseline.download" {
+			t.Fatalf("a 409 refusal must not emit baseline.download, got %+v", ev)
+		}
 	}
 	// The detail stays readable and says so.
 	rec, body = doServersReq(t, srv, "GET", "/api/baselines/files"+detailQuery(detailSnapAt), "")
@@ -354,7 +363,9 @@ func TestBaselineDownload_midStreamAbort(t *testing.T) {
 	if got == nil {
 		t.Fatal("an aborted download that already sent row data must still be audited")
 	}
-	if got.Detail["aborted"] != "true" || got.Detail["bytes"] != "4" {
-		t.Fatalf("audit detail = %v, want aborted=true with the 4 bytes that left", got.Detail)
+	// files counts what was HANDED OVER (the marker and orders; users never
+	// left), not the snapshot's 3-file inventory.
+	if got.Detail["aborted"] != "true" || got.Detail["bytes"] != "4" || got.Detail["files"] != "2" {
+		t.Fatalf("audit detail = %v, want aborted=true, 4 bytes, 2 files handed over (never the snapshot inventory)", got.Detail)
 	}
 }
