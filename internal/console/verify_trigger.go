@@ -22,7 +22,7 @@ var ErrVerifyRunning = errors.New("a verify run is already running for this serv
 // a verify actually in flight. Without that clause the text tells them to "run
 // a baseline-anchored verify first" while one is running — advice that sends
 // them looking for a problem that does not exist.
-var ErrExplainUnavailable = errors.New("no explainable mismatch for this table — run a baseline-anchored verify first, or this table was not reported as a mismatch by the last run, or a newer run has replaced the previous results (re-open Explain if that run still reports this table as a mismatch)")
+var ErrExplainUnavailable = errors.New("no explainable mismatch for this table: run a baseline-anchored verify first; or this table was not reported as a mismatch by the last run; or a newer run has replaced the previous results (re-open Explain if that run still reports this table as a mismatch)")
 
 // ErrExplainRunning is returned by VerifyController.Explain while the
 // drill-down for that table is still being computed. The handler maps it to
@@ -230,7 +230,7 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 			recordProfileGateDeny(r, "verify")
 		}
 		writeJSONError(w, http.StatusForbidden,
-			"verification isn't available while an access-control profile is active — baseline and live-source reads aren't redacted")
+			"verification isn't available while an access-control profile is active: baseline and live-source reads aren't redacted")
 		return
 	}
 	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
@@ -332,7 +332,7 @@ func (s *Server) handleVerifyExplain(w http.ResponseWriter, r *http.Request) {
 			recordProfileGateDeny(r, "verify-explain")
 		}
 		writeJSONError(w, http.StatusForbidden,
-			"verification isn't available while an access-control profile is active — baseline reads aren't redacted")
+			"verification isn't available while an access-control profile is active: baseline reads aren't redacted")
 		return
 	}
 	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))
@@ -388,7 +388,7 @@ func (s *Server) handleVerifyHistory(w http.ResponseWriter, r *http.Request) {
 		// set VERIFY_TRIGGER here would send them chasing a setting that is
 		// already on.
 		writeJSONError(w, http.StatusForbidden,
-			"verify is enabled but the run-history file could not be opened at daemon startup — check the watch daemon's logs")
+			"verify is enabled but the run-history file could not be opened at daemon startup; check the watch daemon's logs")
 		return
 	}
 	// History carries the same per-table verdicts/reasons as the live status —
@@ -399,7 +399,7 @@ func (s *Server) handleVerifyHistory(w http.ResponseWriter, r *http.Request) {
 			recordProfileGateDeny(r, "verify-history")
 		}
 		writeJSONError(w, http.StatusForbidden,
-			"verification isn't available while an access-control profile is active — baseline and live-source reads aren't redacted")
+			"verification isn't available while an access-control profile is active: baseline and live-source reads aren't redacted")
 		return
 	}
 	e, ok := s.requireMonitorEntry(w, r.PathValue("id"))

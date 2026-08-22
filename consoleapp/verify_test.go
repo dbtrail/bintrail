@@ -171,7 +171,7 @@ func TestVerifySupervisor_setNote_doesNotChangeState(t *testing.T) {
 	s := newVerifySupervisor(context.Background(), nil, nil)
 	s.jobs["srv1"] = &verifyJob{status: console.VerifyStatus{State: "running"}}
 
-	s.setNote("srv1", "only one baseline exists for this server yet — nothing to compare")
+	s.setNote("srv1", "only one baseline exists for this server yet; nothing to compare")
 	if got := s.Status("srv1"); got.State != "running" || got.Note == "" {
 		t.Fatalf("after setNote: %+v, want State still running with Note set", got)
 	}

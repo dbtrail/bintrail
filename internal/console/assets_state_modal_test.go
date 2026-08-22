@@ -79,7 +79,7 @@ func jsFunctionBody(t *testing.T, js, name string) string {
 // pk are all required" is a complaint about the form, and it belongs beside
 // the form. Everything after that early return is a RESULT — including a 422
 // gap refusal, which answers the request rather than correcting the fields.
-const stateValidationReturn = `required — fill them in above.`
+const stateValidationReturn = `required; fill them in above.`
 
 func runStateAfterValidation(t *testing.T) string {
 	t.Helper()

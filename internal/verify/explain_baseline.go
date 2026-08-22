@@ -31,7 +31,7 @@ const (
 // binlog event image (ordinal/base64/Go-JSON) rather than MySQL's source text, so
 // a shown value pair is not necessarily corruption. Surfaced rather than blanked
 // so a genuine baseline-vs-baseline drift in such a column is never hidden.
-const deferredCaveat = "  note: a deferred-type column (ENUM/SET/JSON/binary) is among the diffs — its reconstructed value may be an event image (ordinal/base64/JSON), not the source text; not necessarily corruption."
+const deferredCaveat = "  note: a deferred-type column (ENUM/SET/JSON/binary) is among the diffs: its reconstructed value may be an event image (ordinal/base64/JSON), not the source text; not necessarily corruption."
 
 // CellDiff is one column whose reconstructed value diverged from the new
 // baseline's, rendered in the SAME canonical text form the content digest
@@ -297,7 +297,7 @@ func (ex *MismatchExplanation) Write(w io.Writer) {
 		// A mismatch can be flagged on row COUNT while every matched PK lines up
 		// cell-for-cell (e.g. a duplicate-PK pathology collapsing in the join).
 		// Say so rather than print nothing.
-		fmt.Fprintln(w, "  no per-row content differences found — the mismatch is in row count, not row content")
+		fmt.Fprintln(w, "  no per-row content differences found; the mismatch is in row count, not row content")
 		return
 	}
 	for _, d := range ex.Diffs {

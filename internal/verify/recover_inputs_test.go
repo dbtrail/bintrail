@@ -556,7 +556,7 @@ func TestClassifyCaptureGap(t *testing.T) {
 		{name: "migrated index with no stamp",
 			ss: &status.StreamStateInfo{GapColumnsPresent: true}, want: captureGapNoneStamped, wantNoWhy: true},
 		{name: "stamped inside the window",
-			ss: stamped(since.Add(time.Hour), true), want: captureGapStamped, wantWhy: "gap_lost_at is stamped"},
+			ss: stamped(since.Add(time.Hour), true), want: captureGapStamped, wantWhy: "gap_lost_at"},
 		{name: "stamped detail is carried through",
 			ss: stamped(since.Add(time.Hour), true), want: captureGapStamped, wantWhy: "auto-advanced"},
 		{name: "stamped before the window is out of scope",
@@ -564,9 +564,9 @@ func TestClassifyCaptureGap(t *testing.T) {
 		{name: "stamped after the window is out of scope",
 			ss: stamped(until.Add(time.Second), true), want: captureGapNoneStamped, wantNoWhy: true},
 		{name: "stamped exactly at Since is in scope (both ends inclusive)",
-			ss: stamped(since, true), want: captureGapStamped, wantWhy: "gap_lost_at is stamped"},
+			ss: stamped(since, true), want: captureGapStamped, wantWhy: "gap_lost_at"},
 		{name: "stamped exactly at Until is in scope",
-			ss: stamped(until, true), want: captureGapStamped, wantWhy: "gap_lost_at is stamped"},
+			ss: stamped(until, true), want: captureGapStamped, wantWhy: "gap_lost_at"},
 		// A legacy index that somehow carries a stamp still reads as unknown:
 		// GapColumnsPresent=false means the columns were never READ, so the
 		// zero-valued fields say nothing.

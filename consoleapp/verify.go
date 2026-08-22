@@ -504,7 +504,7 @@ func (s *verifySupervisor) runBaselineAnchored(req console.VerifyRequest, baseli
 		if !any {
 			return fmt.Errorf("no baselines found under the configured baseline destination")
 		}
-		s.setNote(req.ServerID, "only one baseline exists for this server yet — nothing to compare")
+		s.setNote(req.ServerID, "only one baseline exists for this server yet; nothing to compare")
 		return nil
 	}
 	sort.Slice(pairs, func(i, j int) bool {
@@ -551,7 +551,7 @@ func (s *verifySupervisor) runBaselineAnchored(req console.VerifyRequest, baseli
 		delete(seen, key)
 		s.appendResult(req.ServerID, toWireResult(verify.TableResult{
 			Schema: st.Schema, Table: st.Table, Status: verify.StatusInconclusive,
-			Detail: "new since the previous baseline — no predecessor image to reconstruct from",
+			Detail: "new since the previous baseline; the older snapshot does not hold it, so there is nothing to compare",
 		}, false))
 	}
 	for _, st := range prevOnly {

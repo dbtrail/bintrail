@@ -139,7 +139,7 @@ func VerifyTablePG(ctx context.Context, cfg PGLiveConfig, schema, table string) 
 	// 1. Live source fingerprint at a consistent snapshot, normalized with the
 	// same policy the reconstruct render applies (see pgNormalizeRenderedBytes).
 	if cfg.SourceChecksum == nil {
-		return res, fmt.Errorf("source checksum %s.%s: no PostgreSQL source checksum wired (see PGSourceChecksum — internal/pgverifysource.LiveSource provides it)", schema, table)
+		return res, fmt.Errorf("source checksum %s.%s: no PostgreSQL source checksum wired (see PGSourceChecksum; internal/pgverifysource.LiveSource provides it)", schema, table)
 	}
 	src, err := cfg.SourceChecksum(ctx, schema, table, pgNormalizeRenderedBytes)
 	if err != nil {

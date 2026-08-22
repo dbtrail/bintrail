@@ -49,30 +49,30 @@ var verifyCmd = &cobra.Command{
 	Long: `Prove the recovery chain (baseline + indexed binlog) faithfully reproduces
 the data. Two modes:
 
-  Baseline-anchored (default, drift-free) — omit --source-dsn. Compares the two
+  Baseline-anchored (default, drift-free): omit --source-dsn. Compares the two
   most recent baselines: reconstructs the previous baseline forward to the new
   baseline's exact binlog anchor and fingerprints it against the new baseline.
-  Both sides are at-rest, so it reads no live source — run it any time after a
+  Both sides are at-rest, so it reads no live source; run it any time after a
   baseline (e.g. right after "bintrail baseline", or on a schedule). No
   production impact.
 
-  Live-source — pass --source-dsn. Reconstructs each table to a consistent
+  Live-source: pass --source-dsn. Reconstructs each table to a consistent
   snapshot of the live source and compares. Reads the whole table off the live
   server, so run it off-peak.
 
 Results are per table: match, mismatch, or inconclusive (no predecessor
 baseline, index behind, unsupported PK, coverage gap, or a value class this
-version can't yet compare — never reported as a failure). The run exits non-zero
+version can't yet compare; never reported as a failure). The run exits non-zero
 on any mismatch or error, or when comparable tables existed but none could be
-proven (all inconclusive). A source with only one baseline — no predecessor yet
-— is reported and exits zero.
+proven (all inconclusive). A source with only one baseline (no predecessor yet)
+is reported and exits zero.
 
 Both of the above compare full-table CONTENT, reconstructed from the latest
 event per primary key. That cannot exercise the data "bintrail recover" reads
-to build reversal SQL — before-images, DELETE pre-images, and events a newer
+to build reversal SQL: before-images, DELETE pre-images, and events a newer
 event on the same key superseded. Pass --check recover for that:
 
-  Recover-input — --check recover. Walks each primary key's event chain in time
+  Recover-input: --check recover. Walks each primary key's event chain in time
   order and asserts the images are internally consistent (every UPDATE/DELETE
   before-image equals the state the previous event on that key left). Reads the
   index ONLY: no baseline, no live source. A chain that begins mid-window has
@@ -83,7 +83,7 @@ Add --explain (baseline-anchored mode) to print, below the report, a row-level
 drill-down of each mismatch: which primary keys diverged and, for changed rows,
 the differing columns with the reconstructed value vs the new baseline's. It
 re-runs the same reconstruction the verdict came from (byte-identical by
-construction) — no live source, scratch database, or external tool.
+construction); it needs no live source, scratch database, or external tool.
 
 --format json emits the same run as a machine-readable document (per-table
 verdicts with their anchor and reason, summary counts, and the --explain
@@ -385,7 +385,7 @@ func runVerifyBaselinePair(cmd *cobra.Command, indexDB *sql.DB, resolver *metada
 	for _, p := range toExplain {
 		ex, err := verify.ExplainBaselinePairMismatch(cmd.Context(), cfg, p)
 		if err != nil {
-			fmt.Fprintf(cmd.OutOrStdout(), "\n--- mismatch drill-down: %s.%s unavailable: %v ---\n", p.Schema, p.Table, err)
+			fmt.Fprintf(cmd.OutOrStdout(), "\n--- mismatch drill-down for %s.%s unavailable: %v ---\n", p.Schema, p.Table, err)
 			continue
 		}
 		ex.Write(cmd.OutOrStdout())

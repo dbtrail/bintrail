@@ -934,7 +934,7 @@ try {
   evtz.headCol === "time (UTC)"
     ? ok("events: the time column declares UTC")
     : bad("events: the time column declares UTC", JSON.stringify(evtz));
-  (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(evtz.text) && evtz.title.startsWith("UTC — in your local time:"))
+  (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(evtz.text) && evtz.title.startsWith("UTC; in your local time:"))
     ? ok("events: rows keep exact UTC text with a local-time tooltip")
     : bad("events: rows keep exact UTC text with a local-time tooltip", JSON.stringify(evtz));
 
@@ -2147,7 +2147,7 @@ try {
     renderVerifyResults(tmp, { state: "succeeded", mode: "recover-inputs",
       results: [
         { schema: "s", table: "aaa_clean", status: "match", events_checked: 200000, chains_checked: 200000,
-          reason: "checked 200000 change(s) on 200000 row(s); 0 comparison(s) between one change and the next, all matched" },
+          reason: "checked 200000 change(s) on 200000 row(s); settled 0 comparison(s) between one change and the next, all matched" },
         { schema: "s", table: "bbb_quiet", status: "inconclusive", inconclusive_kind: "no-activity" },
         { schema: "s", table: "mmm_broken", status: "mismatch", reason: "chain break" },
         { schema: "s", table: "ccc_hard", status: "inconclusive" },
