@@ -3506,10 +3506,17 @@ try {
     const item = document.querySelector(".nav-item:not(.active)");
     const active = document.querySelector(".nav-item.active");
     const title = document.querySelector(".page-title");
+    // Normalized through a canvas: computed colors come back as authored
+    // (oklch on this branch, rgb elsewhere), and a parse-only reader would
+    // go red on FORMAT instead of value.
     const lum = (c) => {
-      const m = /rgba?\(([\d.]+), ([\d.]+), ([\d.]+)/.exec(c);
-      if (!m) return -1;
-      return (0.2126 * m[1] + 0.7152 * m[2] + 0.0722 * m[3]) / 255;
+      const cv = document.createElement("canvas");
+      cv.width = cv.height = 1;
+      const ctx = cv.getContext("2d");
+      ctx.fillStyle = c;
+      ctx.fillRect(0, 0, 1, 1);
+      const d = ctx.getImageData(0, 0, 1, 1).data;
+      return (0.2126 * d[0] + 0.7152 * d[1] + 0.0722 * d[2]) / 255;
     };
     const sideCS = getComputedStyle(side);
     return {
