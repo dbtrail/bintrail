@@ -1262,7 +1262,7 @@ function fillOvActivity(f, activity) {
   if (!tables.length) {
     f.tablesBody.append(el("div", { class: "ev-empty", text: activity ? "No changes in this window." : "Window activity unavailable." }));
   }
-  tables.forEach((s) => f.tablesBody.append(ovTableRow(s)));
+  tables.forEach((s) => f.tablesBody.append(ovTableRow(s, activity && activity.since)));
   // The footer states the AGGREGATE's own bounds. It must never fall back to
   // status.coverage.oldest (#679/#684/#686): that is the index's whole history,
   // and printing it under "window" would attribute counts from one span to a
@@ -1374,9 +1374,16 @@ function ovEventRow(e) {
   return row;
 }
 
-function ovTableRow(s) {
+function ovTableRow(s, winSince) {
+  // The click carries the widget's OWN window (#1414): the count was computed
+  // over the live retention, so the search it opens states that bound — as a
+  // visible since: token, not a hidden field — and the server's window proof
+  // (windowSatisfiedLive) can then skip the archive scan that structurally
+  // cannot contribute. Spelled RFC3339 (T...Z) because the smart-search
+  // tokenizer splits on spaces.
+  const q = s.key + (winSince ? " since:" + winSince.replace(" ", "T") + "Z" : "");
   const row = el("a", { class: "ov-tablerow",
-    onclick: () => navigate("events", { q: s.key }) });
+    onclick: () => navigate("events", { q }) });
   row.append(el("span", { class: "ov-tname", text: s.key }));
   const bar = el("span", { class: "ov-bar" });
   if (s.insert) bar.append(el("span", { class: "ov-seg i", style: "flex:" + s.insert }));
@@ -1808,9 +1815,106 @@ async function runEventsQuery(form, keepPage) {
   const slowT = setTimeout(() => { if (skel.isConnected) skel.classList.add("slow"); }, 2000);
   if (countEl) countEl.textContent = "…";
 
+  // Progressive read (#1414): the first page of a browse fetches the LIVE
+  // index only (scope=live) and paints immediately — rows already sitting in
+  // binlog_events must not wait behind an S3 scan — then the full merged read
+  // completes it in the background. Cursor pages keep the single full fetch:
+  // a deep page is usually IN the archives, so there is no fast half to show
+  // first.
+  const progressive = !before;
+  const myQuery = evLastQuery;
+
+  // paint renders one response. It runs twice on a progressive read — the
+  // live phase, then the merged phase — so everything it derives (cursors,
+  // counts, advisory lists) is REPLACED by phase 2 wholesale rather than
+  // merged client-side: the phase-2 response is the same authoritative shape
+  // a plain fetch returns, which is what makes reordering impossible even
+  // when plan.ArchivesBelowLive is false (#1037 backfills). Row identity for
+  // the keyboard cursor and expanded diffs survives the repaint keyed on
+  // eventDTO.anchor (#1411).
+  const paint = (data, partialPending) => {
+    let warnings = data.warnings || [];
+    if (partialPending) {
+      // The server's PARTIAL warning states the fact; this line states the
+      // in-progress half — it exists only while phase 2 is in flight and is
+      // swept by phase 2's own paint (or replaced by the failure line).
+      warnings = warnings.concat("Reading archived history in the background — the list below will complete itself.");
+    }
+    renderWarnings($("#ev-warnings", VIEW()), warnings);
+    renderNotes($("#ev-notes", VIEW()), data.notes);
+
+    // Client-side refine: unscoped pk/col + free terms.
+    const events = refineEvents(data.events || [], refine);
+
+    // Remember where the NEXT page starts before rendering this one. The cursor
+    // comes from the server (data.next_before), which derives it from the last
+    // row it actually served — not from `events`, which the refine above may
+    // have dropped the boundary row from. Deriving it here would skip whatever
+    // the refine hid.
+    if (data.has_more && data.next_before) {
+      evPages[evPageIdx + 1] = { before: data.next_before, offset: evPages[evPageIdx].offset + data.count };
+    } else {
+      evPages.length = evPageIdx + 1;
+    }
+
+    // Carry the operator's place across the phase-2 repaint: the focused row
+    // and any expanded diffs, keyed on anchor — event_id alone is per-index,
+    // which suffices here (both phases read one index), but anchor is the
+    // identity Undo already relies on.
+    const openAnchors = {}, focusedAnchor = { v: null };
+    if (lastEvents.length) {
+      rowsEl.querySelectorAll(".ev-row").forEach((r) => {
+        const ev = lastEvents[Number(r.dataset.ev)];
+        if (!ev || !ev.anchor) return;
+        if (r.classList.contains("open")) openAnchors[ev.anchor] = true;
+        if (r === document.activeElement) focusedAnchor.v = ev.anchor;
+      });
+    }
+
+    lastEvents = events;
+    // Honest scope (#966 + #1297): free terms / unscoped pk are refined
+    // client-side over ONE fetched page, so a refined count is page-local. The
+    // window note no longer restates the limit back at the reader ("100 events in
+    // the newest 100" answered nothing about whether 101 or ten million sat
+    // behind it) — has_more, one probe row on the server, says which.
+    const refining = refine.length > 0;
+    const from = evPages[evPageIdx].offset + 1;
+    const to = evPages[evPageIdx].offset + data.count;
+    let scopeNote = "";
+    if (data.has_more) {
+      scopeNote = " · showing " + from + "–" + to + " of more — page older for the rest";
+    } else if (evPageIdx > 0) {
+      // Paged to the end, so the total IS known exactly: it is what we walked.
+      scopeNote = " · showing " + from + "–" + to + " of " + to + " (end)";
+    }
+    if (refining && data.count !== events.length) {
+      // The refine ran over this page only; say so rather than let the number
+      // read as an index-wide match count.
+      scopeNote += " · refined within this page";
+    }
+    if (countEl) countEl.textContent = String(events.length);
+    const noteEl = $("#ev-count-note", VIEW());
+    if (noteEl) noteEl.textContent = (refining ? " match(es)" : " event(s)") + scopeNote;
+    const prevBtn = $("#ev-prev", VIEW());
+    const nextBtn = $("#ev-next", VIEW());
+    if (prevBtn) prevBtn.disabled = evPageIdx === 0;
+    if (nextBtn) nextBtn.disabled = !data.has_more;
+    buildEventRows(rowsEl, events, scopeNote);
+
+    if (focusedAnchor.v || Object.keys(openAnchors).length) {
+      rowsEl.querySelectorAll(".ev-row").forEach((r) => {
+        const ev = events[Number(r.dataset.ev)];
+        if (!ev || !ev.anchor) return;
+        if (openAnchors[ev.anchor] && !r.classList.contains("open")) r.click();
+        if (ev.anchor === focusedAnchor.v) r.focus();
+      });
+    }
+  };
+
   let data;
   try {
-    data = await api("/api/events?" + new URLSearchParams(pageParams).toString());
+    const p1 = progressive ? Object.assign({}, pageParams, { scope: "live" }) : pageParams;
+    data = await api("/api/events?" + new URLSearchParams(p1).toString());
   } catch (err) {
     if (gen !== serverGen) return;
     clear(rowsEl); renderError(rowsEl, err);
@@ -1824,52 +1928,24 @@ async function runEventsQuery(form, keepPage) {
     clearTimeout(slowT);
   }
   if (gen !== serverGen) return;
-  renderWarnings($("#ev-warnings", VIEW()), data.warnings);
-  renderNotes($("#ev-notes", VIEW()), data.notes);
+  const pending = progressive && !!data.archives_pending;
+  paint(data, pending);
+  if (!pending) return;
 
-  // Client-side refine: unscoped pk/col + free terms.
-  const events = refineEvents(data.events || [], refine);
-
-  // Remember where the NEXT page starts before rendering this one. The cursor
-  // comes from the server (data.next_before), which derives it from the last
-  // row it actually served — not from `events`, which the refine above may
-  // have dropped the boundary row from. Deriving it here would skip whatever
-  // the refine hid.
-  if (data.has_more && data.next_before) {
-    evPages[evPageIdx + 1] = { before: data.next_before, offset: evPages[evPageIdx].offset + data.count };
-  } else {
-    evPages.length = evPageIdx + 1;
-  }
-
-  lastEvents = events;
-  // Honest scope (#966 + #1297): free terms / unscoped pk are refined
-  // client-side over ONE fetched page, so a refined count is page-local. The
-  // window note no longer restates the limit back at the reader ("100 events in
-  // the newest 100" answered nothing about whether 101 or ten million sat
-  // behind it) — has_more, one probe row on the server, says which.
-  const refining = refine.length > 0;
-  const from = evPages[evPageIdx].offset + 1;
-  const to = evPages[evPageIdx].offset + data.count;
-  let scopeNote = "";
-  if (data.has_more) {
-    scopeNote = " · showing " + from + "–" + to + " of more — page older for the rest";
-  } else if (evPageIdx > 0) {
-    // Paged to the end, so the total IS known exactly: it is what we walked.
-    scopeNote = " · showing " + from + "–" + to + " of " + to + " (end)";
-  }
-  if (refining && data.count !== events.length) {
-    // The refine ran over this page only; say so rather than let the number
-    // read as an index-wide match count.
-    scopeNote += " · refined within this page";
-  }
-  if (countEl) countEl.textContent = String(events.length);
-  const noteEl = $("#ev-count-note", VIEW());
-  if (noteEl) noteEl.textContent = (refining ? " match(es)" : " event(s)") + scopeNote;
-  const prevBtn = $("#ev-prev", VIEW());
-  const nextBtn = $("#ev-next", VIEW());
-  if (prevBtn) prevBtn.disabled = evPageIdx === 0;
-  if (nextBtn) nextBtn.disabled = !data.has_more;
-  buildEventRows(rowsEl, events, scopeNote);
+  // Phase 2: the same search, full scope. Applied only if this search is
+  // still the one on screen — a filter edit or page step replaces
+  // evLastQuery, a server switch bumps serverGen, and either bails this
+  // stale completion out. On failure the partial marker STAYS UP and names
+  // the failure: a live-only list must never quietly present as complete.
+  api("/api/events?" + new URLSearchParams(pageParams).toString()).then((full) => {
+    if (gen !== serverGen || evLastQuery !== myQuery || !rowsEl.isConnected) return;
+    paint(full, false);
+  }, (err) => {
+    if (gen !== serverGen || evLastQuery !== myQuery || !rowsEl.isConnected) return;
+    renderWarnings($("#ev-warnings", VIEW()), (data.warnings || []).concat(
+      "The archive read FAILED — this list remains live-only and may be missing archived history: " +
+      ((err && err.message) || err)));
+  });
 }
 
 // renderEventsLoading paints the Events list's busy state (#1353): skeleton

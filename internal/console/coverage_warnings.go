@@ -155,6 +155,46 @@ func responseAdvisories(plan *query.QueryPlan, excl archiveExclusion, diverged i
 	return warnings, notes
 }
 
+// liveScopeAdvisories assembles the advisory lists for a scope=live (phase 1)
+// read (#1414) — the sibling of responseAdvisories, and bound by the same
+// convention: handlers assemble advisory lists ONLY through these two.
+//
+// pending is the number of registered archive sources the live-only read did
+// NOT consult; negative means discovery itself failed, so whether archived
+// history exists is UNKNOWN. The severity split is the issue's own
+// requirement: a phase-1 render is the OPPOSITE of the elision note's
+// situation — the archives were not read and were not provably redundant — so
+// partiality is a WARNING, louder than the elision's info note, and it must
+// stay up until a full read actually lands. Only the nothing-to-read case is
+// benign. plan-derived gap warnings are deliberately absent here: under
+// NoArchive the planner classifies archived-only hours as gaps, and "rotated
+// and not archived" would be a false claim about hours phase 2 is about to
+// read.
+func liveScopeAdvisories(excl archiveExclusion, pending int) (warnings, notes []string) {
+	// A profile exclusion is still announced — it is invisible to the operator
+	// and phase 2 will not lift it. Nil plan: no gap facts were evaluated.
+	warnings = restrictedFetchWarnings(nil, excl)
+	switch {
+	case excl.any():
+		// The archives are excluded for this session/console regardless of
+		// scope; the exclusion notice above (or its documented silence) is
+		// the whole story, and "partial pending a full read" would promise a
+		// phase 2 that cannot read them either.
+	case pending < 0:
+		warnings = append(warnings, "Live-index scope (scope=live): archive discovery failed, so "+
+			"whether archived history exists is unknown. A full read (without scope=live) will "+
+			"report it.")
+	case pending > 0:
+		warnings = append(warnings, fmt.Sprintf("Live-index scope (scope=live): %d registered "+
+			"archive source(s) were NOT read. This list is PARTIAL wherever the window reaches "+
+			"into archived history; a full read (without scope=live) completes it.", pending))
+	default:
+		notes = append(notes, "Live-index scope (scope=live): no archive sources are registered, "+
+			"so nothing further exists to read — this is already the complete answer.")
+	}
+	return warnings, notes
+}
+
 // restrictedFetchWarnings is gapWarnings for a fetch that may have excluded the
 // archives (#1311). It closes two holes the plan alone cannot:
 //

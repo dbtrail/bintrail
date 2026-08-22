@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/ext"
+	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -219,8 +220,14 @@ type Server struct {
 	rotationDefaults RotationDefaults
 	// version is the running build's version string (Config.Version).
 	version string
-	cm      *connManager
-	mux     http.Handler
+	// archiveFetcher reads one archive source for the browsing endpoints —
+	// parquetquery.Fetch in production, injectable so a test can pin the
+	// seam a mock DB cannot see: sqlmock never reports a SURPLUS query, so
+	// "scope=live read the archives anyway" is invisible at the SQL layer
+	// and only a counting stub here can observe it (#1414).
+	archiveFetcher query.ArchiveFetcher
+	cm             *connManager
+	mux            http.Handler
 	// Password login: authPath is the credential file (re-read per login so a
 	// live `user set-password` applies without restart); passwordCfg is its
 	// boot-time existence, which drives the bind gate and the printed banner.
@@ -260,6 +267,16 @@ const extAuthPrefix = "/api/auth/ext/"
 
 // New validates the config, seeds the boot connection bundle, and assembles
 // the middleware/route tree. It does no network I/O — call Run to listen.
+// archiveFetch returns the archive fetcher for the browsing endpoints —
+// the injected stub in tests, parquetquery.Fetch everywhere else (including
+// hand-built &Server{} test fixtures that never set the field).
+func (s *Server) archiveFetch() query.ArchiveFetcher {
+	if s.archiveFetcher != nil {
+		return s.archiveFetcher
+	}
+	return parquetquery.Fetch
+}
+
 func New(cfg Config) (*Server, error) {
 	listen := cfg.Listen
 	if listen == "" {
@@ -407,6 +424,7 @@ func New(cfg Config) (*Server, error) {
 		mcpTokenPath:     mcpTokenPath,
 		sessionProfiles:  newProfileRuleCache(),
 		sqlPanel:         cfg.SQLPanel,
+		archiveFetcher:   parquetquery.Fetch,
 	}
 	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot

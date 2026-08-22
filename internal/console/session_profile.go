@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
 
@@ -238,13 +237,23 @@ func (s *Server) applySessionProfile(ctx context.Context, r *http.Request, b *bu
 // console: there the archives are EXCLUDED (excl says so and its notice
 // speaks), not elided — nothing was resolved that could have been skipped.
 func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, int, bool, error) {
+	return s.fetchRestrictedScoped(ctx, r, b, opts, false)
+}
+
+// fetchRestrictedScoped is fetchRestricted with the caller-requested live-only
+// scope (#1414, `GET /api/events?scope=live`): liveOnly forces the archives
+// off for THIS request the same way a profile does mechanically, but the two
+// must not share bookkeeping — excl records exclusions the operator did not
+// choose and must be told about, while scope=live is the caller's own phase-1
+// request, disclosed through liveScopeAdvisories instead.
+func (s *Server) fetchRestrictedScoped(ctx context.Context, r *http.Request, b *bundle, opts query.Options, liveOnly bool) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, int, bool, error) {
 	excl := archiveExclusionFor(r, b)
 	rows, plan, _, diverged, archivesElided, err := query.FetchMergedFull(ctx, b.db, b.engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         b.dbName,
-		NoArchive:      excl.any(),
+		NoArchive:      excl.any() || liveOnly,
 		AllowGaps:      true,
-		ArchiveFetcher: parquetquery.Fetch,
+		ArchiveFetcher: s.archiveFetch(),
 	})
 	return rows, plan, excl, diverged, archivesElided, err
 }

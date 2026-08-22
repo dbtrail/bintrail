@@ -977,6 +977,93 @@ try {
   (exp.headerConn && !exp.headerLeak) ? ok("export: CSV columns include connection_id, never query_text") : bad("export: CSV columns include connection_id, never query_text", `conn=${exp.headerConn} leak=${exp.headerLeak}`);
   (!exp.csvCanary && exp.csvConnVal) ? ok("export: CSV rows redacted but carry the connection_id value") : bad("export: CSV rows redacted but carry the connection_id value", `canary=${exp.csvCanary} conn777=${exp.csvConnVal}`);
 
+  // Scenario 12p — progressive Events (#1414): a scope=live phase paints
+  // first with a LOUD partial marker, the merged phase replaces it wholesale
+  // and clears the marker, and a failed phase 2 leaves the marker up naming
+  // the failure. Driven by stubbing `api` with a gated phase-2 promise so the
+  // ordering is deterministic — the claim is about what the DOM says BETWEEN
+  // the phases, which no server fixture can hold still long enough to read.
+  const progressiveRead = await page.evaluate(async () => {
+    const real = api;
+    const out = { calls: [] };
+    let releasePhase2;
+    const phase2Gate = new Promise((r) => { releasePhase2 = r; });
+    const liveEvent = { event_timestamp: "2026-08-21 10:00:00", schema_name: "e2eshop", table_name: "orders",
+      event_type: "UPDATE", pk_values: "1", changed_columns: ["status"], row_before: { status: "a" },
+      row_after: { status: "b" }, anchor: "2026-08-21T10:00:00Z|11" };
+    const archEvent = { event_timestamp: "2026-08-20 09:00:00", schema_name: "e2eshop", table_name: "orders",
+      event_type: "DELETE", pk_values: "2", changed_columns: [], row_before: { status: "z" },
+      row_after: null, anchor: "2026-08-20T09:00:00Z|7" };
+    api = async (path, opts) => {
+      if (path.startsWith("/api/events?")) {
+        out.calls.push(path);
+        if (path.includes("scope=live")) {
+          return { events: [liveEvent], count: 1, limit: 100, has_more: false,
+                   scope: "live", archives_pending: true,
+                   warnings: ["Live-index scope (scope=live): 1 registered archive source(s) were NOT read. This list is PARTIAL wherever the window reaches into archived history; a full read (without scope=live) completes it."] };
+        }
+        await phase2Gate;
+        return { events: [liveEvent, archEvent], count: 2, limit: 100, has_more: false };
+      }
+      return real(path, opts);
+    };
+    const sample = () => ({
+      rows: document.querySelectorAll("#ev-rows .ev-row").length,
+      warn: (document.getElementById("ev-warnings") || {}).textContent || "",
+    });
+    try {
+      navigate("events", { q: "" });
+      await new Promise((r) => setTimeout(r, 50));
+      const form = document.getElementById("ev-form");
+      await runEventsQuery(form);
+      out.phase1 = sample();
+      releasePhase2();
+      await new Promise((r) => setTimeout(r, 50));
+      out.phase2 = sample();
+
+      // The failure leg: phase 2 rejects, the marker must STAY and say so.
+      api = async (path, opts) => {
+        if (path.startsWith("/api/events?")) {
+          if (path.includes("scope=live")) {
+            return { events: [liveEvent], count: 1, limit: 100, has_more: false,
+                     scope: "live", archives_pending: true,
+                     warnings: ["Live-index scope (scope=live): 1 registered archive source(s) were NOT read. This list is PARTIAL wherever the window reaches into archived history; a full read (without scope=live) completes it."] };
+          }
+          throw new Error("simulated archive outage");
+        }
+        return real(path, opts);
+      };
+      await runEventsQuery(form);
+      await new Promise((r) => setTimeout(r, 50));
+      out.failed = sample();
+    } finally {
+      api = real;
+    }
+    // Hand the view back to the real server for the scenarios below.
+    navigate("events", { q: "" });
+    await new Promise((r) => setTimeout(r, 150));
+    return out;
+  });
+  (progressiveRead.phase1 && progressiveRead.phase1.rows === 1 &&
+    /PARTIAL/.test(progressiveRead.phase1.warn) && /background/.test(progressiveRead.phase1.warn))
+    ? ok("progressive events: the live phase paints first, loudly marked partial and in-progress")
+    : bad("progressive events: the live phase paints first, loudly marked partial and in-progress",
+        JSON.stringify(progressiveRead.phase1) + " calls=" + JSON.stringify(progressiveRead.calls));
+  (progressiveRead.phase2 && progressiveRead.phase2.rows === 2 && !/PARTIAL|background/.test(progressiveRead.phase2.warn))
+    ? ok("progressive events: the merged phase completes the list and clears the marker — only then")
+    : bad("progressive events: the merged phase completes the list and clears the marker — only then",
+        JSON.stringify(progressiveRead.phase2));
+  (progressiveRead.failed && progressiveRead.failed.rows === 1 && /FAILED/.test(progressiveRead.failed.warn) &&
+    /live-only/.test(progressiveRead.failed.warn))
+    ? ok("progressive events: a failed archive read leaves the marker up and names the failure")
+    : bad("progressive events: a failed archive read leaves the marker up and names the failure",
+        JSON.stringify(progressiveRead.failed));
+  (progressiveRead.calls.length >= 2 && progressiveRead.calls[0].includes("scope=live") &&
+    !progressiveRead.calls[1].includes("scope=live"))
+    ? ok("progressive events: phase 1 asks scope=live, phase 2 asks the full read")
+    : bad("progressive events: phase 1 asks scope=live, phase 2 asks the full read",
+        JSON.stringify(progressiveRead.calls));
+
   // Scenario 12b — Events keyset paging (#1297). The view used to render one
   // window and stop: event 101 was unreachable except by inventing a filter,
   // and the header ("100 event(s) in the newest 100 events") restated the limit
