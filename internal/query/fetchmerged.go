@@ -239,7 +239,7 @@ func FetchMergedFull(
 // event Options.EventAnchor names, which makes every resolved archive source
 // redundant for this request.
 //
-// It is the cheapest of the three short-circuits and the only one that needs
+// It is the cheapest of the four short-circuits and the only one that needs
 // no QueryPlan: no contiguous-range check, no ArchivesBelowLive premise, no
 // boundary comparison. The proof is the anchor itself. An anchor admits at
 // most one event, event_id is unique, and it is the key MergeResults dedupes
@@ -295,6 +295,10 @@ func anchorSatisfiedLive(opts Options, rows []ResultRow) bool {
 //     and hour labels are whole: an archived hour H < range start means every
 //     label-accurate row in it has a timestamp below H+1h <= start <= Since —
 //     excluded by the row-level Since filter whichever source served it.
+//     (In practice Plan clamps its range start to Since.Truncate(1h), so the
+//     reachable predicate reduces to "a live partition exists at the Since
+//     hour" — the single-range premise is over-strict rather than
+//     load-bearing, kept for symmetry with the sibling proofs.)
 //   - No misfiled archives overlapping the window. ArchivesBelowLive is
 //     computed from partition LABELS; a #1037 backfill puts rows INSIDE the
 //     window into an archive labeled below it, and plan.MisfiledArchiveHours
@@ -308,6 +312,17 @@ func anchorSatisfiedLive(opts Options, rows []ResultRow) bool {
 // this proof is order-independent — ASC and DESC windows are the same set.
 func windowSatisfiedLive(opts Options, plan *QueryPlan) bool {
 	if opts.Since == nil {
+		return false
+	}
+	if opts.SincePos != nil {
+		// SincePos DROPS the exact `event_timestamp >= Since` row filter
+		// (buildQuery) and widens the coarse bound a full hour below Since —
+		// on both the live and the archive leg — so the fetch this proof
+		// claims equivalence to reads an hour the proof never modeled, and
+		// correctness there rests on the position comparison this predicate
+		// cannot see. Every SincePos caller (reconstruct's fold, verify,
+		// the shim's _snapshot, cascade) is a surface where a silently
+		// dropped delta becomes a wrong answer or a false mismatch. Decline.
 		return false
 	}
 	if plan == nil || len(plan.MySQLRanges) != 1 || !plan.ArchivesBelowLive || plan.ArchiveCoverageUnavailable {
@@ -841,7 +856,7 @@ func resolveMergeSources(ctx context.Context, db *sql.DB, o FetchMergedOptions) 
 // retired from the walk entirely. diverged counts the duplicate event_ids
 // whose two merged copies disagreed (#1325); zero on every path that reads a
 // single source, since no duplicate can exist there. archivesElided reports
-// that one of the three short-circuits below fired — resolved archives went
+// that one of the four short-circuits below fired — resolved archives went
 // unread because they provably could not change this page (see FetchMergedFull
 // for which, and for why the signal is returned rather than logged).
 func fetchPage(

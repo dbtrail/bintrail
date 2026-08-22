@@ -42,6 +42,18 @@ func TestWindowSatisfiedLive(t *testing.T) {
 			why:  "archived hours are strictly below the oldest live hour, so the boundary is safe",
 		},
 		{
+			name: "SincePos drops the exact Since filter — decline",
+			opts: func() Options {
+				pos := BinlogPos{File: "mysql-bin.000007", Pos: 4711}
+				return Options{Since: &inside, SincePos: &pos}
+			}(),
+			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},
+			want: false,
+			why: "with SincePos the fetch reads an hour BELOW Since on both legs and relies on " +
+				"the position comparison — a window this proof never modeled; verify's false " +
+				"mismatch is the failure mode",
+		},
+		{
 			name: "no since bound",
 			opts: Options{},
 			plan: &QueryPlan{ArchivesBelowLive: true, MySQLRanges: []TimeRange{live}},

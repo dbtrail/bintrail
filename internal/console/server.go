@@ -265,8 +265,6 @@ const serverHeader = "X-Bintrail-Server"
 // the mount contract.
 const extAuthPrefix = "/api/auth/ext/"
 
-// New validates the config, seeds the boot connection bundle, and assembles
-// the middleware/route tree. It does no network I/O — call Run to listen.
 // archiveFetch returns the archive fetcher for the browsing endpoints —
 // the injected stub in tests, parquetquery.Fetch everywhere else (including
 // hand-built &Server{} test fixtures that never set the field).
@@ -277,6 +275,8 @@ func (s *Server) archiveFetch() query.ArchiveFetcher {
 	return parquetquery.Fetch
 }
 
+// New validates the config, seeds the boot connection bundle, and assembles
+// the middleware/route tree. It does no network I/O — call Run to listen.
 func New(cfg Config) (*Server, error) {
 	listen := cfg.Listen
 	if listen == "" {

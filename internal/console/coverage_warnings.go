@@ -66,10 +66,14 @@ func appendDivergenceWarning(w []string, diverged int) []string {
 
 // archiveElisionNote is the response-level record of the newest-first
 // short-circuit (#1353): registered archives were deliberately not read
-// because they provably could not change this page. THREE proofs reach here —
+// because they provably could not change this page. FOUR proofs reach here —
 // the live index filled a newest-first page from a contiguous live range, every
-// named PK already held its latest N live (#1403), or the one event the request
-// anchored on came back live (#1411) — and the flag does not say which.
+// named PK already held its latest N live (#1403), the one event the request
+// anchored on came back live (#1411), or a Since bound sat inside contiguous
+// live coverage (#1414) — and the flag does not say which. The remedies below
+// were re-read against the fourth proof: "widening the time range" is exactly
+// its live remedy (a wider window reaches under the live floor and the proof
+// declines), so the wording needs no per-proof branching.
 //
 // That is why the wording below states the FACT and not the reason, which it
 // used to. Inferring the reason from the request is wrong: the newest-first
@@ -114,6 +118,17 @@ func recoverArchiveElisionNote() string {
 		"selection, reads them."
 }
 
+// reconstructArchiveElisionNote is the elision record in the reconstruct
+// surface's own words (#1414): a state computation has an anchor and a
+// window, not pages or per-row limits, so the events/recover remedies would
+// be nonsense here — and no remedy is needed, since the skip is
+// completeness-preserving by proof.
+func reconstructArchiveElisionNote() string {
+	return "This state was computed from the live index; the registered archives were not read. " +
+		"The window from the baseline anchor forward sits entirely inside live coverage, so " +
+		"nothing they hold could have contributed — nothing is missing here."
+}
+
 // archiveElisionNotes returns the response Notes list for a fetch that
 // reported the newest-first short-circuit — nil otherwise. elisionNote is the
 // surface's own wording (archiveElisionNote / recoverArchiveElisionNote). It
@@ -141,7 +156,8 @@ func archiveElisionNotes(archivesElided bool, elisionNote string) []string {
 // ignore it see the same warnings contract as before.
 //
 // The lists' exclusivity is enforced by CONVENTION, not by type: this
-// function is the only place the events and recover handlers may assemble
+// function and liveScopeAdvisories (its scope=live sibling) are the only
+// places the events and recover handlers may assemble
 // advisory lists. A handler that hand-appends a fact to either list bypasses
 // the split and re-creates the one-register bug — add facts here, where the
 // severity decision is visible and unit-tested
@@ -165,32 +181,50 @@ func responseAdvisories(plan *query.QueryPlan, excl archiveExclusion, diverged i
 // requirement: a phase-1 render is the OPPOSITE of the elision note's
 // situation — the archives were not read and were not provably redundant — so
 // partiality is a WARNING, louder than the elision's info note, and it must
-// stay up until a full read actually lands. Only the nothing-to-read case is
-// benign. plan-derived gap warnings are deliberately absent here: under
-// NoArchive the planner classifies archived-only hours as gaps, and "rotated
-// and not archived" would be a false claim about hours phase 2 is about to
-// read.
-func liveScopeAdvisories(excl archiveExclusion, pending int) (warnings, notes []string) {
-	// A profile exclusion is still announced — it is invisible to the operator
-	// and phase 2 will not lift it. Nil plan: no gap facts were evaluated.
-	warnings = restrictedFetchWarnings(nil, excl)
+// stay up until a full read actually lands.
+//
+// The plan is threaded through, and WHEN it speaks is the subtle half
+// (review pass 1 caught the first cut passing nil unconditionally, which
+// silenced the coverage story exactly on the three shapes that never get a
+// phase 2):
+//
+//   - archives excluded (profile / --no-archive console): pending is 0, no
+//     phase 2 runs, and the exclusion notice plus the REAL plan's gap lines
+//     are this response's only chance to say what was not read.
+//   - nothing registered (pending == 0): no phase 2 runs; a gap hour the
+//     planner found is a fact about THIS answer, and "complete answer"
+//     beside it would be false — the note softens to point at the gaps.
+//   - a phase 2 IS coming (pending != 0): plan-derived gap lines are
+//     deliberately withheld. Under NoArchive the planner classifies
+//     archived-only hours as "rotated and not archived" — a false claim
+//     about hours the full read is about to serve — and phase 2's own
+//     advisories replace this list wholesale with the true classification.
+func liveScopeAdvisories(plan *query.QueryPlan, excl archiveExclusion, pending int) (warnings, notes []string) {
 	switch {
 	case excl.any():
 		// The archives are excluded for this session/console regardless of
-		// scope; the exclusion notice above (or its documented silence) is
-		// the whole story, and "partial pending a full read" would promise a
-		// phase 2 that cannot read them either.
+		// scope; the exclusion machinery owns the whole story, gaps included
+		// — and "partial pending a full read" would promise a phase 2 that
+		// cannot read them either.
+		warnings = restrictedFetchWarnings(plan, excl)
 	case pending < 0:
-		warnings = append(warnings, "Live-index scope (scope=live): archive discovery failed, so "+
-			"whether archived history exists is unknown. A full read (without scope=live) will "+
-			"report it.")
+		warnings = append(restrictedFetchWarnings(nil, excl), "Live-index scope (scope=live): archive "+
+			"discovery failed, so whether archived history exists is unknown. A full read (without "+
+			"scope=live) will report it.")
 	case pending > 0:
-		warnings = append(warnings, fmt.Sprintf("Live-index scope (scope=live): %d registered "+
-			"archive source(s) were NOT read. This list is PARTIAL wherever the window reaches "+
-			"into archived history; a full read (without scope=live) completes it.", pending))
+		warnings = append(restrictedFetchWarnings(nil, excl), fmt.Sprintf("Live-index scope (scope=live): "+
+			"%d registered archive source(s) were NOT read. This list is PARTIAL wherever the window "+
+			"reaches into archived history; a full read (without scope=live) completes it.", pending))
 	default:
-		notes = append(notes, "Live-index scope (scope=live): no archive sources are registered, "+
-			"so nothing further exists to read — this is already the complete answer.")
+		warnings = restrictedFetchWarnings(plan, excl)
+		note := "Live-index scope (scope=live): no archive sources are registered, so nothing " +
+			"further exists to read"
+		if len(warnings) == 0 {
+			note += " — this is already the complete answer."
+		} else {
+			note += "; the hours warned about above are gaps nothing recorded, not unread archives."
+		}
+		notes = append(notes, note)
 	}
 	return warnings, notes
 }

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -113,6 +112,13 @@ type reconstructResult struct {
 	History      []reconstructStateEntry `json:"history,omitempty"`
 	EventCount   int                     `json:"event_count"`
 	Warnings     []string                `json:"warnings,omitempty"`
+	// Notes: the info half of the #1365 severity split — benign audit facts,
+	// today the archive-elision record. The window proof (#1414) made
+	// elision reachable on this ASC fetch, which is the "future fetch shape"
+	// the old comment here reserved a notes list for: the skip is
+	// completeness-preserving by proof, so it must never wear the warning
+	// register, and it must never be silent either (#1353).
+	Notes []string `json:"notes,omitempty"`
 }
 
 // rejectBaselineParams enforces the surface's baseline-parameter policy,
@@ -372,20 +378,13 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 		// failure under allow_gaps must land in Warnings (#1281) — the same
 		// no-silent-incompleteness contract CaptureGapStatus enforces for
 		// source-side loss.
-		// The elision flag is false here on exactly ONE leg: this fetch is
-		// ASC, and the newest-first short-circuit is DESC-only. It DOES
-		// carry a limit (MaxReconstructEvents+1), so the order is the only
-		// thing standing between this fetch and the short-circuit — which is
-		// why the flag is captured and guarded below rather than discarded.
-		// That one-leg fact is also why the MCP surface keeps its single
-		// warnings list under the #1365 severity split: no tool ever
-		// produces the elision record. If a future fetch shape makes it
-		// reachable, it belongs in an info notes list, never in warnings
-		// (see the console's responseAdvisories).
+		// The elision flag is REACHABLE here since #1414: the fetch is ASC
+		// and the newest-first short-circuit is DESC-only, but the window
+		// proof is order-independent and a Since at the baseline anchor is
+		// exactly the shape it fires on. The result carries the notes list
+		// the old guard's comment reserved, so the elision is said as an
+		// info note — never a warning, never silent.
 		rows, plan, skippedSources, diverged, archivesElided, err := query.FetchMergedFull(ctx, t.DB, query.New(t.DB), fmOpts)
-		if archivesElided {
-			slog.Warn("mcp reconstruct: archive elision reported on a fetch assumed ASC-only; the elision audit note is NOT surfaced on this response — wire a notes list before relying on this path")
-		}
 		if err != nil {
 			return ErrorResult(reconstructFetchError(err)), nil, nil
 		}
@@ -419,6 +418,7 @@ func MakeReconstructTool(cfg Config) func(context.Context, *mcp.CallToolRequest,
 			BaselineTime: snapshotTime.Format(reconstructTSFormat),
 			EventCount:   len(rows),
 			Warnings:     reconstructWarnings(plan, stale, baselineRow, rows, captureGap, skippedSources, args.AllowGaps),
+			Notes:        reconstructElisionNotes(archivesElided),
 		}
 		if diverged > 0 {
 			// A diverging duplicate between the index and an archive (#1325)
@@ -517,6 +517,18 @@ func reconstructCaptureGapError(gap *reconstruct.CaptureGap, schema, table strin
 	return fmt.Errorf("%s for %s.%s; the reconstruction would be silently incomplete. "+
 		"Re-run with allow_gaps: true to accept a known-incomplete result (it is reported back in `warnings`), "+
 		"or narrow `at` to a window before the loss", gap.Reason(), schema, table)
+}
+
+// reconstructElisionNotes: the archive-elision record in this surface's own
+// words. No CLI flag names (the MCP error contract) and no remedy — none is
+// needed, the skip is completeness-preserving by proof.
+func reconstructElisionNotes(archivesElided bool) []string {
+	if !archivesElided {
+		return nil
+	}
+	return []string{"This state was computed from the live index; the registered archives were not " +
+		"read. The window from the baseline anchor forward sits entirely inside live coverage, so " +
+		"nothing they hold could have contributed — nothing is missing here."}
 }
 
 // reconstructWarnings assembles the non-fatal caveats attached to a successful

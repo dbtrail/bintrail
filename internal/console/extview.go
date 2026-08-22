@@ -78,7 +78,9 @@ func (s *Server) consoleQueryContext(r *http.Request) (ext.ConsoleQueryContext, 
 // page fills from live partitions, which is what a "recent activity" listing
 // does by construction. The per-PK shape (PKValues plus LimitPerPK) is the
 // narrower door and no installed provider is known to use it; the top-N door is
-// wide open.
+// wide open. Since #1414 there is a third and WIDER door: any provider fetch
+// carrying a Since inside live coverage elides on windowSatisfiedLive, with no
+// page-fullness and no DESC required.
 //
 // Left as a note rather than fixed because the remedy is a signature change on
 // the seam — this closure's return shape is fixed by ext.ConsoleQueryContext,

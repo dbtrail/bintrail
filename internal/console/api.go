@@ -170,8 +170,11 @@ type eventsResponse struct {
 	// unknown) — the client's signal that a follow-up full read is required
 	// before this list may present itself as complete. False when nothing
 	// further exists to read, which is the client's signal to skip phase 2
-	// entirely. Always false on a merged read.
-	ArchivesPending bool `json:"archives_pending,omitempty"`
+	// entirely. Always false on a merged read. NO omitempty: false is a
+	// meaningful answer ("nothing further to read"), and eliding it left a
+	// non-browser client unable to tell that from an older server that
+	// ignored scope entirely.
+	ArchivesPending bool `json:"archives_pending"`
 }
 
 type recoverResponse struct {
@@ -517,7 +520,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				pending = len(srcs)
 			}
 		}
-		warnings, notes = liveScopeAdvisories(excl, pending)
+		warnings, notes = liveScopeAdvisories(plan, excl, pending)
 	} else {
 		warnings, notes = responseAdvisories(plan, excl, diverged, archivesElided, archiveElisionNote())
 	}

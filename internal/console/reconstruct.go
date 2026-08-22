@@ -296,6 +296,10 @@ type reconstructResponse struct {
 	History      []stateEntryDTO `json:"history,omitempty"`
 	EventCount   int             `json:"event_count"`
 	Warnings     []string        `json:"warnings,omitempty"`
+	// Notes: the info half of the #1365 severity split — benign audit facts,
+	// today the archive-elision record (#1414's window proof made elision
+	// reachable on this ASC fetch, the day the old comment here anticipated).
+	Notes []string `json:"notes,omitempty"`
 }
 
 // handleReconstruct serves GET /api/reconstruct?schema=&table=&pk=&at=&history=&allow_gaps=
@@ -431,18 +435,15 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		AllowGaps:      allowGaps,
 		ArchiveFetcher: parquetquery.Fetch,
 	}
-	// The elision flag is false here on exactly ONE leg: this fetch is ASC,
-	// and the newest-first short-circuit is DESC-only. It DOES carry a limit
-	// (reconstructMaxEvents+1), so the order is the only thing standing
-	// between this fetch and the short-circuit — which is why the flag is
-	// captured and guarded below rather than discarded: a future flip to
-	// DESC must not silently swallow the audit fact. This response carries
-	// no `notes` list (#1365) — grow one the day a benign audit fact exists
-	// to put in it.
+	// The elision flag is REACHABLE here since #1414: this fetch is ASC and
+	// the newest-first short-circuit is DESC-only, but the window proof
+	// (windowSatisfiedLive) is order-independent and this fetch carries the
+	// exact shape it fires on — a Since at the baseline anchor, which sits
+	// inside live coverage for any reconstruct within the retention window.
+	// The response grew the notes list the old guard's comment anticipated,
+	// so the #1353 audit contract holds: the elision is said, as an info
+	// note, never silently.
 	rows, plan, skippedSources, diverged, archivesElided, err := query.FetchMergedFull(ctx, b.db, b.engine, fmOpts)
-	if archivesElided {
-		slog.Warn("console reconstruct: archive elision reported on a fetch assumed ASC-only; the elision audit note is NOT surfaced on this response — wire a notes list before relying on this path")
-	}
 	if err != nil {
 		var gapErr *query.GapError
 		if errors.As(err, &gapErr) {
@@ -497,6 +498,7 @@ func (s *Server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 		Warnings: appendDivergenceWarning(
 			appendRenderGUCsWarning(appendStaleWarning(coverageWarnings(plan, skippedSources, allowGaps), stale), bmeta),
 			diverged),
+		Notes: archiveElisionNotes(archivesElided, reconstructArchiveElisionNote()),
 	}
 
 	// 3. Fold baseline + deltas. baselineRow may be nil. "existed" = the row was

@@ -1862,6 +1862,13 @@ async function runEventsQuery(form, keepPage) {
     // which suffices here (both phases read one index), but anchor is the
     // identity Undo already relies on.
     const openAnchors = {}, focusedAnchor = { v: null };
+    // The j/k cursor is a THIRD identity channel (review pass 1): cursorIdx
+    // is module state that survives the repaint while its .cursor class does
+    // not — `u` would then fire undoEvent(lastEvents[cursorIdx]) against a
+    // reindexed list with no highlight anywhere on screen. Captured by
+    // anchor with the rest and re-seated below; unresolvable → -1, the same
+    // reset eventsGoPage does for the same reason.
+    const cursorAnchor = (cursorIdx >= 0 && lastEvents[cursorIdx] && lastEvents[cursorIdx].anchor) || null;
     if (lastEvents.length) {
       rowsEl.querySelectorAll(".ev-row").forEach((r) => {
         const ev = lastEvents[Number(r.dataset.ev)];
@@ -1901,12 +1908,14 @@ async function runEventsQuery(form, keepPage) {
     if (nextBtn) nextBtn.disabled = !data.has_more;
     buildEventRows(rowsEl, events, scopeNote);
 
-    if (focusedAnchor.v || Object.keys(openAnchors).length) {
+    cursorIdx = -1;
+    if (focusedAnchor.v || cursorAnchor || Object.keys(openAnchors).length) {
       rowsEl.querySelectorAll(".ev-row").forEach((r) => {
         const ev = events[Number(r.dataset.ev)];
         if (!ev || !ev.anchor) return;
         if (openAnchors[ev.anchor] && !r.classList.contains("open")) r.click();
         if (ev.anchor === focusedAnchor.v) r.focus();
+        if (ev.anchor === cursorAnchor) { cursorIdx = Number(r.dataset.ev); r.classList.add("cursor"); }
       });
     }
   };
@@ -2787,6 +2796,9 @@ async function runState(form, history) {
     const mwarns = el("div", { class: "warnings" });
     dlg.body.append(mwarns);
     renderWarnings(mwarns, data.warnings);
+    const mnotes = el("div", { class: "notes" });
+    dlg.body.append(mnotes);
+    renderNotes(mnotes, data.notes);
     if (history) renderTimeline(dlg.body, data, dlg.close);
     else {
       renderStateAt(dlg.body, data);
@@ -2960,6 +2972,7 @@ function renderTimetravel(params) {
   v.append(form);
 
   v.append(el("div", { id: "tt-warnings", class: "warnings" }));
+  v.append(el("div", { id: "tt-notes", class: "notes" }));
   const out = el("div", { id: "tt-out" });
   out.append(el("div", { class: "tt-meta", text: "Fill in a row above and pick a button to see what it looked like." }));
   v.append(out);
@@ -2979,6 +2992,7 @@ function renderTimetravel(params) {
 async function runReconstruct(form, history) {
   const gen = serverGen;
   const warns = $("#tt-warnings", VIEW());
+  const ttNotes = $("#tt-notes", VIEW());
   const out = $("#tt-out", VIEW());
   const f = Object.fromEntries(new FormData(form).entries());
   if (!f.schema || !f.table || !f.pk) { clear(warns); renderError(out, "Schema, table, and PK are all required."); return; }
@@ -2990,6 +3004,7 @@ async function runReconstruct(form, history) {
     const data = await api("/api/reconstruct?" + new URLSearchParams(params).toString());
     if (gen !== serverGen) return;
     renderWarnings(warns, data.warnings);
+    renderNotes(ttNotes, data.notes);
     clear(out);
     if (history) renderTimeline(out, data);
     else renderStateAt(out, data);

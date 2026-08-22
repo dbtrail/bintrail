@@ -145,30 +145,47 @@ func TestEventsScopeInvalid(t *testing.T) {
 	}
 }
 
-// TestLiveScopeAdvisories pins the four-way severity decision.
+// TestLiveScopeAdvisories pins the severity decision, including WHEN the
+// plan speaks (pass 1 caught the first cut passing nil unconditionally,
+// silencing coverage on the three shapes that never get a phase 2).
 func TestLiveScopeAdvisories(t *testing.T) {
+	gapPlan := &query.QueryPlan{GapHours: []time.Time{time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)}}
 	tests := []struct {
 		name     string
+		plan     *query.QueryPlan
 		excl     archiveExclusion
 		pending  int
 		wantWarn string // "" = no warning expected
 		wantNote string // "" = no note expected
+		banWarn  string // must NOT appear
 	}{
 		{name: "sources pending", pending: 2, wantWarn: "2 registered archive source(s) were NOT read"},
+		{name: "pending suppresses the misattributed gap line", plan: gapPlan, pending: 2,
+			wantWarn: "PARTIAL", banWarn: "rotated and not archived"},
 		{name: "discovery failed", pending: -1, wantWarn: "archive discovery failed"},
-		{name: "nothing to read", pending: 0, wantNote: "complete answer"},
+		{name: "nothing to read, clean coverage", pending: 0, wantNote: "complete answer"},
+		// With NOTHING registered the plain "rotated and not archived" text is
+		// truthful — nothing is archived — so it stays; the note redirects it.
+		{name: "nothing to read, gaps present", plan: gapPlan, pending: 0,
+			wantWarn: "covers hours with no data", wantNote: "gaps nothing recorded",
+			banWarn: "complete answer"},
+		{name: "server no-archive with gaps keeps the coverage story", plan: gapPlan,
+			excl: archiveExclusion{server: true}, pending: 0, wantWarn: "LIVE INDEX ONLY"},
 		{name: "profile exclusion owns the story", excl: archiveExclusion{profile: true}, pending: 0,
 			wantWarn: "", wantNote: ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			warnings, notes := liveScopeAdvisories(tc.excl, tc.pending)
+			warnings, notes := liveScopeAdvisories(tc.plan, tc.excl, tc.pending)
 			jw, jn := strings.Join(warnings, " | "), strings.Join(notes, " | ")
 			if tc.wantWarn != "" && !strings.Contains(jw, tc.wantWarn) {
 				t.Errorf("warnings = %q, want %q", jw, tc.wantWarn)
 			}
 			if tc.wantNote != "" && !strings.Contains(jn, tc.wantNote) {
 				t.Errorf("notes = %q, want %q", jn, tc.wantNote)
+			}
+			if tc.banWarn != "" && (strings.Contains(jw, tc.banWarn) || strings.Contains(jn, tc.banWarn)) {
+				t.Errorf("advisories %q + %q must not contain %q", jw, jn, tc.banWarn)
 			}
 			if tc.wantNote == "" && strings.Contains(jn, "complete answer") {
 				t.Errorf("notes = %q — 'complete' claimed on a scope that excluded the archives", jn)
