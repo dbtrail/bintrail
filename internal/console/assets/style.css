@@ -385,12 +385,8 @@ button { font-family: inherit; }
   gap: 22px;
   z-index: 5;
 }
-[data-dir="studio"] .side { background: oklch(0.991 0.003 320); }
-[data-dir="trail"] .side {
-  background:
-    radial-gradient(120% 60% at -10% -5%, var(--blue-bg), transparent 60%),
-    var(--surface);
-}
+/* The per-direction sidebar grounds are gone: the tropical sidebar at the
+   end of this file owns the ground in every direction. */
 
 /* brand */
 .brand { display: flex; align-items: center; gap: 11px; }
@@ -2427,3 +2423,135 @@ button { font-family: inherit; }
   .brand-name,
   .ov-stat-num { width: fit-content; }
 }
+
+
+/* ============================================================
+   the tropical pass — dbtrail.com's sunset, worn for real.
+   Two moves: the sidebar goes to the site's aubergine night with the
+   sunset as light, and the content canvas warms up (haze, gradient
+   page titles, home-language tinted cards). The DATA rules survive
+   untouched: INSERT/UPDATE/DELETE tokens, the diff, the timeline and
+   every row-carrying surface keep their exact colors — the warmth
+   lives on chrome and config surfaces only.
+   ============================================================ */
+
+/* ---- sidebar: aubergine night, sunset light ---- */
+.side {
+  /* One scoped remap instead of per-element edits: everything inside the
+     sidebar consumes these tokens, so the whole column flips together.
+     Lightness floors on the dark ground (oklch L 0.22-0.27): ink 0.97
+     (~13:1), ink-2 0.85 (~8:1), ink-3 0.78 (~6:1), ink-4 0.70 (~4.6:1). */
+  --ink:   oklch(0.97 0.008 300);
+  --ink-2: oklch(0.85 0.035 300);
+  --ink-3: oklch(0.78 0.04 300);
+  --ink-4: oklch(0.70 0.045 300);
+  --line:      oklch(1 0 0 / 0.15);
+  --line-soft: oklch(1 0 0 / 0.10);
+  --surface:   oklch(1 0 0 / 0.07);
+  --surface-2: oklch(1 0 0 / 0.10);
+  --surface-3: oklch(1 0 0 / 0.13);
+  /* interactive accent inside the night: light pink, not product blue —
+     blue drowns on aubergine. Focus rings become soft white. */
+  --accent: oklch(0.85 0.11 348);
+  --accent-bg: oklch(1 0 0 / 0.13);
+  --blue-bg: oklch(1 0 0 / 0.13);
+  border-right: none;
+  background:
+    radial-gradient(95% 34% at 112% -4%, oklch(0.48 0.15 348 / 0.42), transparent 68%),
+    radial-gradient(130% 44% at -25% 106%, oklch(0.42 0.16 293 / 0.55), transparent 62%),
+    linear-gradient(198deg, oklch(0.275 0.062 312) 0%, oklch(0.215 0.06 294) 100%);
+}
+.side .brand-name { color: #fff; }
+.side .brand-mark {
+  background: var(--brand-warm);
+  box-shadow: 0 2px 10px oklch(0.55 0.2 3 / 0.45);
+}
+/* read-only pill: the mint identity restated for the dark ground. */
+.side .ro-pill {
+  color: oklch(0.85 0.11 165);
+  background: oklch(0.85 0.13 165 / 0.14);
+  border-color: oklch(0.85 0.13 165 / 0.35);
+}
+.side .srv-dot { box-shadow: 0 0 0 3px oklch(0.85 0.13 165 / 0.25); background: oklch(0.75 0.14 165); }
+/* section labels are the sun: MONITOR / EXTENSIONS / PROTECT / SETTINGS
+   glow gold on the night — the one place the sun reads as light. */
+.side .nav-label { color: oklch(0.83 0.13 88); }
+.side .nav-item:hover { background: oklch(1 0 0 / 0.08); color: #fff; }
+.side .nav-item:hover .ni-icon { color: oklch(0.9 0.05 300); }
+/* the active page is the sunset itself: the site's CTA pink->orange,
+   darkened so 14px white text holds >=4.5:1 on both stops. */
+.side .nav-item.active {
+  color: #fff;
+  background: linear-gradient(120deg, oklch(0.53 0.2 3) 0%, oklch(0.54 0.14 51) 100%);
+  box-shadow: 0 6px 18px -8px oklch(0.55 0.2 3 / 0.6);
+}
+.side .nav-item.active .ni-icon { color: #fff; }
+.side .nav-item.active .nav-kbd { color: oklch(1 0 0 / 0.75); }
+.side .nav-item.active::before { background: var(--sun); }
+.side .cmdk-kbd { background: oklch(1 0 0 / 0.10); }
+.side .srv-manage { border-color: oklch(1 0 0 / 0.22); }
+.side .srv-manage:hover { border-color: oklch(0.85 0.11 348 / 0.6); color: #fff; }
+.side .side-docs:hover { color: #fff; }
+.side .side-docs:hover svg { color: oklch(0.85 0.11 348); }
+.side .nav::-webkit-scrollbar-thumb { border-color: transparent; }
+/* the select's chevron was inked for a light field */
+.side .srv-select {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path fill='%23b7a8cc' d='M0 0h10L5 6z'/></svg>");
+}
+.side .srv-select:hover { border-color: oklch(1 0 0 / 0.3); }
+
+/* ---- content: off the hospital white ---- */
+:root {
+  /* warm blush canvas instead of clinical white; surfaces stay white so
+     panels still lift off the page. */
+  --bg: oklch(0.985 0.006 340);
+}
+/* sunset haze pinned to the top of the reading area: background of the
+   scroll CONTAINER, so it does not scroll away — the room stays warm on
+   page 2. Alphas low enough that every text token keeps its floor. */
+.main {
+  background:
+    radial-gradient(52% 340px at 82% -60px, oklch(0.88 0.09 88 / 0.30), transparent 70%),
+    radial-gradient(46% 300px at 12% -80px, oklch(0.8 0.1 348 / 0.22), transparent 70%),
+    radial-gradient(30% 260px at 55% -80px, oklch(0.75 0.1 293 / 0.14), transparent 75%),
+    var(--bg);
+}
+/* page titles wear the site's headline gradient. Children that carry their
+   own color (chips) keep it; the clipped gradient only paints text that
+   inherits. */
+.page-title {
+  background: var(--brand-headline);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  /* fit-content so the gradient spans the WORD, not the column: on a
+     full-width box a short title samples only the first stop. */
+  width: fit-content;
+}
+
+/* ---- cards speak the home's tint language ----
+   Config/fact cards rotate through the four home tints with their
+   AA-verified deep partners (the #1421 vocabulary, worn by default instead
+   of on request). Row-carrying surfaces are not .card and stay out. */
+.card { border-color: transparent; }
+.card::after {
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+}
+.cards .card:nth-child(4n+1), .card.tint-1 { background: var(--pink-tint); }
+.cards .card:nth-child(4n+2), .card.tint-2 { background: var(--sun-tint); }
+.cards .card:nth-child(4n+3), .card.tint-3 { background: var(--violet-tint); }
+.cards .card:nth-child(4n+0), .card.tint-4 { background: var(--orange-tint); }
+.cards .card:nth-child(4n+1) .card-title, .card.tint-1 .card-title { color: var(--pink-deep); }
+.cards .card:nth-child(4n+2) .card-title, .card.tint-2 .card-title { color: var(--sun-deep); }
+.cards .card:nth-child(4n+3) .card-title, .card.tint-3 .card-title { color: var(--violet-deep); }
+.cards .card:nth-child(4n+0) .card-title, .card.tint-4 .card-title { color: var(--orange-deep); }
+.cards .card:nth-child(4n+1)::after, .card.tint-1::after { background: linear-gradient(90deg, var(--brand-warm-a), transparent 75%); }
+.cards .card:nth-child(4n+2)::after, .card.tint-2::after { background: linear-gradient(90deg, var(--sun), transparent 75%); }
+.cards .card:nth-child(4n+3)::after, .card.tint-3::after { background: linear-gradient(90deg, var(--brand-canvas-3), transparent 75%); }
+.cards .card:nth-child(4n+0)::after, .card.tint-4::after { background: linear-gradient(90deg, var(--brand-warm-b), transparent 75%); }
+/* dotted kv separators drown on a tint (same failure the tcard dividers
+   fixed); restate them against the tinted grounds. */
+.cards .card .kv { border-bottom-color: oklch(0.5 0.05 320 / 0.22); }
+
+/* neutral buttons warm on touch — product blue stays the pressed accent. */
+.btn:hover { border-color: color-mix(in srgb, var(--brand-warm-b) 45%, var(--line)); color: var(--orange-2); }
