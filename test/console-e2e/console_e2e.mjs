@@ -1885,15 +1885,30 @@ try {
   await page.evaluate(() => navigate("baselines"));
   await page.waitForFunction(() => Array.from(document.querySelectorAll(".stg-row")).some((r) => r.textContent.includes("binlog.000001:50")), { timeout: 10000 });
   const stg = await page.evaluate(() => {
-    const heads = Array.from(document.querySelectorAll(".ov-panel-head"));
-    const bHead = heads.find((h) => /Baseline snapshots/.test(h.textContent));
-    const btn = bHead ? Array.from(bHead.querySelectorAll("button")).find((b) => b.textContent === "Create baseline") : null;
+    // #1415: the Create action moved to the context strip (page level); the
+    // uniform table count moved there too, so the row carries only what
+    // varies (the binlog anchor) plus the newest treatment.
+    const strip = document.querySelector(".ctx-strip");
+    const btn = strip ? Array.from(strip.querySelectorAll("button")).find((b) => b.textContent === "Create baseline") : null;
     const row = Array.from(document.querySelectorAll(".stg-row")).find((r) => r.textContent.includes("binlog.000001:50"));
-    return { capOn: !!capsCache.baseline_trigger, btnPresent: !!btn, btnEnabled: btn ? !btn.disabled : false, rowText: row ? row.textContent : "" };
+    return { capOn: !!capsCache.baseline_trigger, stripPresent: !!strip,
+      stripText: strip ? strip.textContent : "",
+      btnPresent: !!btn, btnEnabled: btn ? !btn.disabled : false,
+      rowText: row ? row.textContent : "",
+      rowIsLatest: row ? row.classList.contains("stg-row-latest") : false,
+      sourceOneLine: strip && strip.querySelector(".ctx-source") ?
+        getComputedStyle(strip.querySelector(".ctx-source")).whiteSpace === "nowrap" : false };
   });
   stg.capOn ? ok("baselines: baseline_trigger capability reaches the frontend") : bad("baselines: baseline_trigger capability reaches the frontend", "capsCache.baseline_trigger falsy");
-  (stg.btnPresent && stg.btnEnabled) ? ok("baselines: Create-baseline button renders enabled when both gates pass") : bad("baselines: Create-baseline button renders enabled when both gates pass", `present=${stg.btnPresent} enabled=${stg.btnEnabled}`);
-  stg.rowText.includes("1 table(s)") ? ok("baselines: the fixture snapshot is listed with its table count") : bad("baselines: the fixture snapshot is listed with its table count", stg.rowText);
+  (stg.stripPresent && stg.btnPresent && stg.btnEnabled) ? ok("baselines: Create baseline is a page action on the context strip, enabled when both gates pass") : bad("baselines: Create baseline is a page action on the context strip, enabled when both gates pass", `strip=${stg.stripPresent} present=${stg.btnPresent} enabled=${stg.btnEnabled}`);
+  // The facts moved, they did not vanish: table count and source live on the
+  // strip; the row keeps the anchor and gains the newest treatment.
+  (/1 per snapshot/.test(stg.stripText) && stg.sourceOneLine)
+    ? ok("baselines: the uniform table count and the one-line source render on the strip")
+    : bad("baselines: the uniform table count and the one-line source render on the strip", stg.stripText);
+  (stg.rowIsLatest && /ago/.test(stg.rowText) && !/table\(s\)/.test(stg.rowText))
+    ? ok("baselines: the newest row wears the treatment, carries relative age, and drops the constant column")
+    : bad("baselines: the newest row wears the treatment, carries relative age, and drops the constant column", stg.rowText);
 
   // Scenario 15c — the button's other gate arms, fixture-driven through the
   // REAL baselinesPanel (destination-missing can't exist live once the daemon
@@ -1901,19 +1916,25 @@ try {
   // empty state; capability off → no button even with a destination.
   const gates = await page.evaluate(() => {
     const servers = [{ id: "srv-fix", name: "fixture" }];
+    const cur = servers[0];
     const keepCur = currentServer;
     currentServer = "srv-fix";
+    // The button lives on the STRIP since #1415 — drive both builders so the
+    // gate holds where the button actually is AND the panel keeps its empty
+    // states.
     const cfgOff = baselinesPanel({ configured: false }, servers);
+    const cfgOffStrip = baselineContextStrip({ configured: false }, cur);
     const keepCap = capsCache.baseline_trigger;
     capsCache.baseline_trigger = false;
     const capOff = baselinesPanel({ configured: true, source: "/tmp/baselines", snapshots: [] }, servers);
+    const capOffStrip = baselineContextStrip({ configured: true, source: "/tmp/baselines", snapshots: [] }, cur);
     capsCache.baseline_trigger = keepCap;
     currentServer = keepCur;
     const hasBtn = (n) => Array.from(n.querySelectorAll("button")).some((b) => b.textContent === "Create baseline");
     return {
-      cfgOffBtn: hasBtn(cfgOff),
+      cfgOffBtn: hasBtn(cfgOff) || hasBtn(cfgOffStrip),
       cfgOffEmpty: /No baselines configured/.test(cfgOff.textContent),
-      capOffBtn: hasBtn(capOff),
+      capOffBtn: hasBtn(capOff) || hasBtn(capOffStrip),
       capOffEmpty: /no snapshots found/.test(capOff.textContent),
     };
   });
@@ -1948,15 +1969,154 @@ try {
   ok("protect: /baselines renders the snapshot panel");
 
   await page.evaluate(() => navigate("verification"));
-  // NOT .ov-panel-title: the page suppresses the panel's own h2 (hideTitle) so
-  // it does not sit under an identical h1, which makes that selector
-  // unsatisfiable here. Anchor on the page heading and the mode control — the
-  // things whose absence would mean the route did not render.
   await page.waitForFunction(() => location.pathname === "/verification"
     && Array.from(document.querySelectorAll("h1.page-title")).some((h) => /Verification/.test(h.textContent))
-    && document.querySelector(".vfy-panel-full") !== null,
+    && document.querySelectorAll(".vfy-region").length >= 3,
     { timeout: 10000 });
-  ok("protect: /verification renders the verification panel");
+  ok("protect: /verification renders its three regions");
+
+  // Scenario 15v — the verification page rework (#1417/#1418/#1419/#1420),
+  // driven END TO END against the real daemon: a real recover-inputs run over
+  // the fixture index, then the history it persists.
+  //
+  // (a) structure + mode help (#1418/#1419): three separated regions; the
+  // help swaps with the select and describes the selected mode.
+  const vfyStruct = await page.evaluate(() => {
+    const regions = document.querySelectorAll(".vfy-region");
+    const sel = document.querySelector(".vfy-mode");
+    const help = document.querySelector(".vfy-modehelp");
+    const helpBefore = help ? help.textContent : "";
+    sel.value = "recover-inputs";
+    sel.dispatchEvent(new Event("change"));
+    return {
+      regionCount: regions.length,
+      controlTinted: regions[0] ? regions[0].classList.contains("tcard-violet") : false,
+      subDescribesAll: !/prove a snapshot still reconstructs/i.test(document.querySelector(".page-sub").textContent),
+      helpBefore, helpAfter: help ? help.textContent : "",
+      selWideEnough: sel ? sel.scrollWidth <= sel.clientWidth + 2 : false,
+    };
+  });
+  (vfyStruct.regionCount >= 3 && vfyStruct.controlTinted)
+    ? ok("verification: control / current / history are separate surfaces, control wears the structure tint")
+    : bad("verification: control / current / history are separate surfaces, control wears the structure tint", JSON.stringify(vfyStruct));
+  (vfyStruct.helpBefore && vfyStruct.helpAfter && vfyStruct.helpBefore !== vfyStruct.helpAfter
+    && /never touches your database/.test(vfyStruct.helpAfter))
+    ? ok("verification: the mode help swaps with the select and states proof, prerequisite, cost")
+    : bad("verification: the mode help swaps with the select and states proof, prerequisite, cost", JSON.stringify({ b: vfyStruct.helpBefore, a: vfyStruct.helpAfter }));
+  vfyStruct.selWideEnough
+    ? ok("verification: the mode select no longer truncates its own options")
+    : bad("verification: the mode select no longer truncates its own options", "scrollWidth > clientWidth");
+
+  // (b) the running treatment (#1420), pinned through the REAL renderer with
+  // a synthetic in-flight status — the fixture run below is too fast to
+  // photograph mid-flight deterministically.
+  const vfyRunning = await page.evaluate(() => {
+    const tmp = document.createElement("div");
+    document.body.appendChild(tmp);
+    renderVerifyResults(tmp, { state: "running", mode: "recover-inputs",
+      results: [{ schema: "a", table: "b", status: "match" }],
+      summary: { match: 1, mismatch: 0, inconclusive: 0, error: 0, total: 1 } }, "x");
+    const out = {
+      liveChip: !!tmp.querySelector(".chip-live"),
+      progress: !!tmp.querySelector(".vfy-progress"),
+      soFar: /so far/.test(tmp.textContent),
+      noVerdict: !/verified clean/.test(tmp.textContent),
+      ageChipDistinct: !tmp.querySelector(".chip-age"),
+    };
+    tmp.remove();
+    return out;
+  });
+  (vfyRunning.liveChip && vfyRunning.progress && vfyRunning.soFar && vfyRunning.noVerdict)
+    ? ok("verification: a running status renders motion, progress-so-far framing, and no early verdict")
+    : bad("verification: a running status renders motion, progress-so-far framing, and no early verdict", JSON.stringify(vfyRunning));
+
+  // (c) worst-first ordering (#1419 §3), pinned through the real renderer.
+  const vfyOrder = await page.evaluate(() => {
+    const tmp = document.createElement("div");
+    document.body.appendChild(tmp);
+    renderVerifyResults(tmp, { state: "succeeded", mode: "recover-inputs",
+      results: [
+        { schema: "s", table: "aaa_clean", status: "match" },
+        { schema: "s", table: "bbb_quiet", status: "inconclusive", inconclusive_kind: "no-activity" },
+        { schema: "s", table: "mmm_broken", status: "mismatch", reason: "chain break" },
+        { schema: "s", table: "ccc_hard", status: "inconclusive" },
+      ],
+      summary: { match: 1, mismatch: 1, inconclusive: 2, inconclusive_nothing_to_check: 1, error: 0, total: 4 } }, "x");
+    const order = Array.from(tmp.querySelectorAll(".vfy-row .vfy-tbl")).map((n) => n.textContent);
+    const verdicts = Array.from(tmp.querySelectorAll(".vfy-row .vfy-verdict")).map((n) => n.textContent);
+    tmp.remove();
+    return { order, verdicts };
+  });
+  (vfyOrder.order[0] === "s.mmm_broken" && vfyOrder.order[3] === "s.aaa_clean"
+    && vfyOrder.verdicts.includes("nothing to check"))
+    ? ok("verification: rows sort worst-first and the benign verdict is written in words")
+    : bad("verification: rows sort worst-first and the benign verdict is written in words", JSON.stringify(vfyOrder));
+
+  // (d) a REAL run end to end: recover-inputs over the fixture index.
+  await page.evaluate(() => { document.querySelector(".vfy-run").click(); });
+  await page.waitForFunction(() => document.querySelector(".vfy-results .chip-done") !== null, { timeout: 60000 });
+  const vfyDone = await page.evaluate(() => ({
+    verdictSentence: (document.querySelector(".vfy-results .form-hint") || {}).textContent || "",
+    rows: document.querySelectorAll(".vfy-results .vfy-row").length,
+    failChip: !!document.querySelector(".vfy-results .chip-fail"),
+  }));
+  (vfyDone.rows > 0 && vfyDone.verdictSentence.length > 0 && !vfyDone.failChip)
+    ? ok("verification: a real recover-inputs run completes with structured rows and a verdict sentence")
+    : bad("verification: a real recover-inputs run completes with structured rows and a verdict sentence", JSON.stringify(vfyDone));
+
+  // (e) history (#1417): the finished run is a disclosure row that expands to
+  // its per-table detail — data the old renderer dropped on the floor — and
+  // LAST VERIFIED wears the age treatment, not the live one (#1420).
+  await page.waitForFunction(() => document.querySelectorAll(".vfy-histrow").length > 0, { timeout: 10000 });
+  const vfyHist = await page.evaluate(() => {
+    const row = document.querySelector(".vfy-histrow");
+    row.click();
+    const detail = row.nextElementSibling;
+    return {
+      expanded: row.getAttribute("aria-expanded") === "true",
+      detailRows: detail ? detail.querySelectorAll(".vfy-row").length : 0,
+      detailExplainBtns: detail ? Array.from(detail.querySelectorAll("button")).filter((b) => b.textContent === "Explain").length : -1,
+      lastChipAge: !!document.querySelector(".vfy-history .chip-age"),
+      lastChipNotLive: !document.querySelector(".vfy-history .chip-live"),
+    };
+  });
+  (vfyHist.expanded && vfyHist.detailRows > 0 && vfyHist.detailExplainBtns === 0)
+    ? ok("verification: a history row expands to per-table detail, with no dead Explain buttons")
+    : bad("verification: a history row expands to per-table detail, with no dead Explain buttons", JSON.stringify(vfyHist));
+  // The dead-button rule pinned where the fixture cannot: recover-inputs
+  // results are never explainable, so the real history above holds this
+  // assertion vacuously. A synthetic explainable mismatch through the REAL
+  // renderer is the only shape that can see the {history:true} suppression —
+  // the mutation dropping it stayed green against the fixture alone.
+  const vfyDeadBtn = await page.evaluate(() => {
+    const mk = (opts) => {
+      const tmp = document.createElement("div");
+      document.body.appendChild(tmp);
+      renderVerifyResults(tmp, { state: "succeeded", mode: "baseline-anchored",
+        results: [{ schema: "s", table: "t", status: "mismatch", reason: "digest differs", explainable: true }],
+        summary: { match: 0, mismatch: 1, inconclusive: 0, error: 0, total: 1 } }, "x", opts);
+      const n = Array.from(tmp.querySelectorAll("button")).filter((b) => b.textContent === "Explain").length;
+      tmp.remove();
+      return n;
+    };
+    // The third leg is the derivation: a RECORD (trigger present) with the
+    // option forgotten must still suppress the button — this is what makes
+    // the call-site mutation structurally impossible.
+    const tmp = document.createElement("div");
+    document.body.appendChild(tmp);
+    renderVerifyResults(tmp, { state: "succeeded", mode: "baseline-anchored", trigger: "manual",
+      results: [{ schema: "s", table: "t", status: "mismatch", reason: "digest differs", explainable: true }],
+      summary: { match: 0, mismatch: 1, inconclusive: 0, error: 0, total: 1 } }, "x");
+    const derived = Array.from(tmp.querySelectorAll("button")).filter((b) => b.textContent === "Explain").length;
+    tmp.remove();
+    return { live: mk(undefined), history: mk({ history: true }), derived };
+  });
+  (vfyDeadBtn.live === 1 && vfyDeadBtn.history === 0 && vfyDeadBtn.derived === 0)
+    ? ok("verification: Explain renders on a live run and never on a history record — even when the option is forgotten")
+    : bad("verification: Explain renders on a live run and never on a history record — even when the option is forgotten", JSON.stringify(vfyDeadBtn));
+  (vfyHist.lastChipAge && vfyHist.lastChipNotLive)
+    ? ok("verification: LAST VERIFIED wears the age treatment, distinct from RUNNING")
+    : bad("verification: LAST VERIFIED wears the age treatment, distinct from RUNNING", JSON.stringify(vfyHist));
 
   await page.evaluate(() => navigate("storage"));
   await page.waitForFunction(() => location.pathname === "/storage"

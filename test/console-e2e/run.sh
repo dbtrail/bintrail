@@ -199,7 +199,7 @@ if [ "${ARC_LIVE:-0}" -lt 6 ] || [ "${ARC_ARCH:-0}" -lt 1 ]; then
 fi
 
 echo "==> launch source-less watch daemon on :$PORT"
-BINTRAIL_CONSOLE_TOKEN="$TOKEN" BINTRAIL_CONSOLE_BASELINE_TRIGGER=1 "$CONSOLE_BIN" watch \
+BINTRAIL_CONSOLE_TOKEN="$TOKEN" BINTRAIL_CONSOLE_BASELINE_TRIGGER=1 BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 "$CONSOLE_BIN" watch \
   --index-dsn "${BASE_DSN}/${IDX_DB}" \
   --console-listen "127.0.0.1:$PORT" \
   --console-token "$TOKEN" \

@@ -1952,10 +1952,88 @@ button { font-family: inherit; }
 
 /* Verification panel (#677) */
 .vfy-panel-full { grid-column: 1 / -1; }
-.vfy-actions { display: flex; align-items: center; gap: 8px; }
-.vfy-mode { max-width: 260px; }
-.vfy-livewarn { margin: 0 0 8px; color: var(--orange-2); }
+.vfy-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* wide enough for its own longest option — the select used to cut
+   "Check recovery inputs (no sn" mid-word (#1419 §6) */
+.vfy-mode { max-width: none; width: auto; min-width: 340px; }
 .vfy-results { display: flex; flex-direction: column; gap: 8px; }
+
+/* ── /verification region surfaces (#1419): control / current / history ── */
+.vfy-region { margin-top: 16px; padding: 16px 18px 18px; }
+.vfy-region-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.vfy-region-head .ov-panel-title { margin: 0; }
+.vfy-modehelp { margin: 8px 2px 0; max-width: 860px; }
+.vfy-glossary { margin-top: 12px; }
+
+/* structured result rows (#1419 §2/§3): mark | table | verdict | counts | reason.
+   The verdict column is fixed and colored — the word, not a mid-sentence
+   glyph, carries the answer. Verdict colors reuse the doctor-card bands. */
+.vfy-rows { display: flex; flex-direction: column; }
+.vfy-row {
+  display: grid; grid-template-columns: 18px minmax(180px, 240px) 110px 130px 1fr auto;
+  align-items: center; gap: 10px; padding: 7px 10px;
+  border-top: 1px solid var(--line-soft); border-left: 3px solid transparent;
+}
+.vfy-row:first-child { border-top: none; }
+.vfy-row.pass { border-left-color: var(--insert); }
+.vfy-row.fail { border-left-color: var(--delete); background: color-mix(in srgb, var(--delete) 4%, transparent); }
+.vfy-row.warn { border-left-color: var(--ochre); }
+.vfy-row.note { border-left-color: var(--line); }
+.vfy-mark { font-weight: 700; text-align: center; }
+.vfy-row.pass .vfy-mark { color: var(--insert); }
+.vfy-row.fail .vfy-mark { color: var(--delete); }
+.vfy-row.warn .vfy-mark { color: var(--orange-2); }
+.vfy-row.note .vfy-mark { color: var(--ink-4); }
+.vfy-tbl { font-family: var(--f-mono); font-size: 12.5px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vfy-verdict { font-family: var(--f-mono); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+.vfy-row.pass .vfy-verdict { color: var(--insert); }
+.vfy-row.fail .vfy-verdict { color: var(--delete); }
+.vfy-row.warn .vfy-verdict { color: var(--orange-2); }
+.vfy-row.note .vfy-verdict { color: var(--ink-3); }
+.vfy-counts { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+.vfy-reason { font-size: 12px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.vfy-reason.wrap { white-space: normal; }
+
+/* live-state chip (#1420): animated, and DISTINCT from every age chip. The
+   pulse rides prefers-reduced-motion like all console motion. */
+.chip-live { color: var(--orange-2); border-color: var(--ochre); background: var(--ochre-bg); }
+.chip-live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.chip-done { color: var(--insert); border-color: var(--insert); background: color-mix(in srgb, var(--insert) 8%, transparent); }
+.chip-fail { color: var(--delete); border-color: var(--delete); background: color-mix(in srgb, var(--delete) 8%, transparent); }
+.chip-age { color: var(--ink-3); border-color: var(--line); background: var(--surface-2); }
+
+/* indeterminate progress strip (#1420): the engine has no planned-total, so
+   this is honest motion, not a fake percentage. */
+.vfy-progress { height: 4px; border-radius: 2px; background: var(--surface-3); overflow: hidden; position: relative; }
+.vfy-progress-bar { display: block; height: 100%; width: 30%; border-radius: 2px; background: var(--ochre); }
+.vfy-sofar { font-style: italic; }
+@media (prefers-reduced-motion: no-preference) {
+  .chip-live::before { animation: vfy-pulse 1.2s ease-in-out infinite; }
+  .vfy-progress-bar { animation: vfy-sweep 1.4s ease-in-out infinite; }
+  .vfy-flash { animation: vfy-done-flash 1.2s ease-out 1; }
+  @keyframes vfy-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  @keyframes vfy-sweep { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+  @keyframes vfy-done-flash { 0% { background: color-mix(in srgb, var(--insert) 14%, transparent); } 100% { background: transparent; } }
+}
+
+/* expandable history rows (#1417): full-width button rows with a caret */
+.vfy-histrow { width: 100%; text-align: left; background: none; border: none; cursor: pointer; font: inherit; color: inherit; }
+.vfy-histrow .ev-caret { transition: transform .14s; }
+.vfy-histrow.open .ev-caret { transform: rotate(90deg); }
+.vfy-histdetail { padding: 4px 10px 10px 30px; border-top: 1px dashed var(--line-soft); }
+
+/* baselines context strip (#1415) */
+.ctx-strip { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; margin-top: 4px; padding: 14px 18px; }
+.ctx-item { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.ctx-grow { flex: 1 1 320px; }
+.ctx-label { font-family: var(--f-mono); font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; color: var(--ink-4); text-transform: uppercase; }
+.ctx-value { font-size: 13px; color: var(--ink); }
+.ctx-source { display: block; font-size: 12px; padding: 6px 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctx-action { align-self: center; margin-left: auto; }
+/* the newest snapshot is what a restore actually uses — it gets the
+   treatment; relative age rides beside the absolute time */
+.stg-row-latest { background: var(--violet-tint); border-radius: var(--radius-sm); }
+.stg-rel { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); white-space: nowrap; }
 .vfy-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 /* Verify explain modal: a wider modal + doctor-cards for each diverging row,

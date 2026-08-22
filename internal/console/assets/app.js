@@ -3531,13 +3531,14 @@ async function renderBaselines() {
     v.append(pageHead("Baselines", el("p", { class: "page-sub" },
       "Full-table snapshots Time-travel and full restores are built from. ",
       el("b", { text: "Nothing is ever executed" }), " against your source by viewing this page.")));
-    const cards = el("div", { class: "cards" });
-    cards.append(baselineSummaryCard(baselines, servers.find((s) => s.id === (currentServer || defaultServerId))));
-    v.append(cards);
     if (serversErr) v.append(el("div", { class: "error-box", text: "Could not load servers: " + serversErr }));
-    const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
-    grid.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
-    v.append(grid);
+    // #1415: a context strip and a full-width list, not two half-width cards
+    // sharing only a left edge. The strip carries the facts that are ABOUT the
+    // collection (source, count, freshness, tables-per-snapshot when uniform)
+    // so the rows below can carry only what varies between snapshots.
+    const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
+    v.append(baselineContextStrip(baselines, cur, { serversErr: serversErr }));
+    v.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
     viewEnter();
   } catch (err) {
     const v = VIEW(); clear(v); v.append(pageHead("Baselines", null)); renderError(v, err);
@@ -3556,12 +3557,16 @@ async function renderVerification() {
     // "Select a server to run verification" while a server IS selected.
     const serversErr = serversRes && serversRes.error;
     const v = VIEW(); clear(v);
+    // The old subtitle described one of the three modes and was wrong about a
+    // second (#1418): "prove a snapshot still reconstructs" — the
+    // recovery-inputs check uses no snapshot at all.
     v.append(pageHead("Verification", el("p", { class: "page-sub" },
-      "Prove a snapshot still reconstructs what it claims — the check that answers whether a restore would actually work.")));
+      "Prove your safety net works before you need it — three checks, from the index's own consistency to a full comparison against your live data.")));
     if (serversErr) v.append(el("div", { class: "error-box", text: "Could not load servers: " + serversErr }));
-    const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
-    grid.append(verifyPanel(servers, { hideTitle: true, serversErr: serversErr }));
-    v.append(grid);
+    // Three regions with visible separation (#1419): what you can run, what is
+    // running or just ran, what ran before. One undifferentiated card made
+    // "No verification run yet" sit directly above five past runs.
+    verifyRegions(servers, { serversErr: serversErr }).forEach((region) => v.append(region));
     viewEnter();
   } catch (err) {
     const v = VIEW(); clear(v); v.append(pageHead("Verification", null)); renderError(v, err);
@@ -3913,13 +3918,67 @@ function baselineRefreshNote(rf) {
   return el("p", { class: "form-hint", text: text });
 }
 
+// snapshotTablesUniform: the per-snapshot table count, when EVERY snapshot
+// has the same one — else null. A value identical in all 22 rows was the
+// list's widest column saying nothing (#1415); uniform, it is a fact about
+// the collection and belongs in the context strip.
+function snapshotTablesUniform(snaps) {
+  if (!snaps || !snaps.length) return null;
+  const n = (snaps[0].tables || []).length;
+  return snaps.every((sn) => (sn.tables || []).length === n) ? n : null;
+}
+
+// baselineContextStrip (#1415): one horizontal band of facts about where the
+// snapshots come from and how fresh they are — a context strip, not a card —
+// plus the page's one primary action. Replaces the half-width summary card
+// whose eyebrow duplicated the H1 and whose 405px forced the source path to
+// wrap mid-word.
+function baselineContextStrip(b, cur, opts) {
+  const strip = el("section", { class: "tcard ctx-strip" });
+  const item = (label, val, cls) => el("div", { class: "ctx-item" + (cls ? " " + cls : "") },
+    el("span", { class: "ctx-label", text: label }),
+    typeof val === "string" ? el("span", { class: "ctx-value", text: val }) : val);
+  if (!b || b.error) {
+    strip.append(item("BASELINES", "could not load: " + ((b && b.error) || "unavailable")));
+    return strip;
+  }
+  if (!b.configured) {
+    strip.append(item("SOURCE", "not configured"));
+    strip.append(item("TIME-TRAVEL", "off"));
+    return strip;
+  }
+  const snaps = b.snapshots || [];
+  // The source path is code, and it gets the width to render as one line —
+  // the dark code-ink treatment the recipe reserves for SQL/DSNs/paths.
+  strip.append(item("SOURCE", el("code", { class: "code-ink ctx-source", text: b.source }), "ctx-grow"));
+  strip.append(item("SNAPSHOTS", String(snaps.length) + (b.truncated ? "+" : "")));
+  if (snaps.length) {
+    // One fact, one place: absolute and relative side by side, instead of the
+    // same freshness spelled two ways 300px apart.
+    strip.append(item("LATEST", snaps[0].time + " UTC · " + formatAge(snaps[0].age_hours) + " ago"));
+  }
+  const uniform = snapshotTablesUniform(snaps);
+  if (uniform !== null) strip.append(item("TABLES", uniform + " per snapshot"));
+  strip.append(item("TIME-TRAVEL", b.reconstruct ? "enabled" : "off (archives disabled)"));
+  // The page's primary action, at page level — not a list-header costume.
+  if (capsCache.baseline_trigger && cur && cur.id && b.configured) {
+    const btn = el("button", { class: "btn ctx-action", type: "button", text: "Create baseline" });
+    btn.onclick = () => createBaseline(cur.id, btn);
+    strip.append(btn);
+  }
+  return strip;
+}
+
 // opts.serversErr: when /api/servers failed, `servers` is empty for the WRONG
 // reason. Without it this panel derives affirmative claims from a failure —
-// the Create baseline button vanishes with no stated cause, and the `owner`
+// the empty state advises adding a server that exists, and the `owner`
 // fallback below attributes the snapshots to the daemon when the selected
 // server may have its own baseline_s3.
 function baselinesPanel(b, servers, opts) {
-  const panel = el("section", { class: "ov-panel" });
+  // Full-width (#1415): this list is the page. The Create-baseline action
+  // moved to the context strip — at page level it is a page action; inside
+  // this header it read as scoped to the list.
+  const panel = el("section", { class: "ov-panel vfy-panel-full" });
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
   let owner = cur ? serverLabel(cur) : "";
   if (!owner && b && !b.error && b.configured && !(opts && opts.serversErr)) {
@@ -3928,14 +3987,6 @@ function baselinesPanel(b, servers, opts) {
   const head = el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (owner ? " — " + owner : "") }),
     tzChip());
-  // Create-baseline action: only when the daemon opted in (capsCache.baseline_trigger),
-  // a real server is selected, and it has a baseline destination configured (else the
-  // endpoint 400s). The endpoint still re-validates the source DSN server-side.
-  if (capsCache.baseline_trigger && cur && cur.id && b && !b.error && b.configured) {
-    const btn = el("button", { class: "btn btn-sm", type: "button", text: "Create baseline" });
-    btn.onclick = () => createBaseline(cur.id, btn);
-    head.append(btn);
-  }
   panel.append(head);
   // The daemon's periodic refresh (#1171). Shown next to the list because the
   // question it answers — "is this list going to keep moving on its own?" — is
@@ -3972,16 +4023,25 @@ function baselinesPanel(b, servers, opts) {
           ? "⚠ BASELINE STALE — full-table restore broken; take a fresh baseline"
           : "BASELINE " + b.staleness.toUpperCase() })));
     }
+    // Row hierarchy (#1415): the newest snapshot is what Time-travel and a
+    // restore actually use — it gets the treatment; the rest are history and
+    // read denser. Relative age sits NEXT TO the absolute time (two facts
+    // about the same instant, formerly ~650px apart), and the table count
+    // appears per-row only when it VARIES — a value identical in every row
+    // is a fact about the collection and lives in the context strip.
+    const uniformTables = snapshotTablesUniform(b.snapshots);
     b.snapshots.forEach((sn, idx) => {
-      const row = el("div", { class: "stg-row" });
+      const row = el("div", { class: "stg-row" + (idx === 0 ? " stg-row-latest" : "") });
+      if (idx === 0) row.append(el("span", { class: "tag-pill", text: "Newest" }));
       row.append(tsSpan("stg-name mono", sn.time));
+      row.append(el("span", { class: "stg-rel", text: formatAge(sn.age_hours) + " ago" }));
       row.append(el("span", { class: "stg-dest", text:
-        (sn.tables || []).length + " table(s)" + (sn.binlog_file ? " · " + sn.binlog_file + ":" + sn.binlog_pos : "") }));
+        (uniformTables === null ? (sn.tables || []).length + " table(s)" + (sn.binlog_file ? " · " : "") : "") +
+        (sn.binlog_file ? sn.binlog_file + ":" + sn.binlog_pos : "") }));
       if (idx === 0 && sn.staleness && sn.staleness !== "ok") {
         row.append(el("span", { class: "chip chip-mon", text:
           sn.staleness === "broken" ? "⚠ STALE — restore broken" : sn.staleness.toUpperCase() }));
       }
-      row.append(el("span", { class: "stg-age", text: formatAge(sn.age_hours) + " ago" }));
       list.append(row);
     });
     if (b.truncated) list.append(el("div", { class: "ev-empty", text: "…older snapshots not shown." }));
@@ -4041,88 +4101,106 @@ async function pollBaseline(id) {
   return null;
 }
 
-// verifyPanel (#677): trigger/poll/explain the recovery-chain verification
-// engine (`bintrail verify`) for the selected server. Mirrors baselinesPanel's
-// structure — its own capability gate (verify_trigger, process-global, like
+// verifyRegions (#677, restructured #1419): trigger/poll/explain the
+// recovery-chain verification engine (`bintrail verify`) for the selected
+// server. Its own capability gate (verify_trigger, process-global, like
 // baseline_trigger) plus a per-server precondition (verify: a baseline is
 // configured; verify_live_source: a source DSN is also configured), both
 // re-enforced server-side so this gating is UX only.
-// opts.hideTitle: /verification renders pageHead("Verification") already, and
-// an h1 immediately above an identical h2 is a duplicated landmark for anyone
-// navigating by heading. The parameter exists rather than deleting the head
-// outright because the head is also the panel's own append target in three
-// early-return branches.
-function verifyPanel(servers, opts) {
-  // Full-width. This override was originally a workaround: verification was a
-  // third panel in a 2-column grid built for archiving | baselines, and with
-  // align-items:start it landed under the SHORT sibling with a dead gap beside
-  // the tall one. #1384 moved it to its own route, where it is the only panel,
-  // so the span is no longer compensating for anything — it is simply what a
-  // sole panel should do. Kept because the grid is still 2-column.
-  const panel = el("section", { class: "ov-panel vfy-panel-full" });
+//
+// The three regions of /verification — control,
+// current run, history — as separate surfaces. The gating branches (feature
+// off, no server) collapse to a single explanatory card, since with nothing
+// runnable the other two regions have nothing to hold.
+function verifyRegions(servers, opts) {
   const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
-  const head = el("div", { class: "ov-panel-head" });
-  if (!(opts && opts.hideTitle)) head.append(el("h2", { class: "ov-panel-title", text: "Verification" }));
-  const list = el("div", { class: "stg-list vfy-list" });
 
   if (!capsCache.verify_trigger) {
-    list.append(el("div", { class: "stg-empty" },
-      el("p", { class: "stg-empty-lead", text: "Verification from the console is turned off." }),
-      el("p", { class: "stg-empty-sub", text:
-        "Ask whoever manages this server to turn it on (set BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 and restart). Already on the default setup? Re-download docker-compose.yml — running \"docker compose pull\" alone doesn't add new settings to a file you already have." })));
-    panel.append(head, list);
-    return panel;
+    const card = el("section", { class: "tcard vfy-region" },
+      el("div", { class: "stg-empty" },
+        el("p", { class: "stg-empty-lead", text: "Verification from the console is turned off." }),
+        el("p", { class: "stg-empty-sub", text:
+          "Ask whoever manages this server to turn it on (set BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 and restart). Already on the default setup? Re-download docker-compose.yml — running \"docker compose pull\" alone doesn't add new settings to a file you already have." })));
+    return [card];
   }
   if (!cur || !cur.id) {
     // A failed /api/servers arrives here as an empty list, and "Select a
     // server" is then an instruction to do something the operator already did.
-    // archivingPanel takes serversErr for exactly this reason; prepending an
-    // error box above the panel does not stop the panel from contradicting it.
-    list.append(el("div", { class: "ev-empty", text: (opts && opts.serversErr)
-      ? "Could not load the server list, so verification cannot target one: " + opts.serversErr
-      : "Select a server to run verification." }));
-    panel.append(head, list);
-    return panel;
+    const card = el("section", { class: "tcard vfy-region" },
+      el("div", { class: "ev-empty", text: (opts && opts.serversErr)
+        ? "Could not load the server list, so verification cannot target one: " + opts.serversErr
+        : "Select a server to run verification." }));
+    return [card];
   }
 
+  // ── Region 1: what you can run ──
+  const control = el("section", { class: "tcard tcard-violet vfy-region vfy-control" });
+  control.append(el("div", { class: "vfy-region-head" },
+    el("h2", { class: "ov-panel-title" }, el("span", { class: "tag-pill", text: "Run a check" }))));
   const modeSel = el("select", { class: "select vfy-mode" },
     el("option", { value: "baseline-anchored", text: "Compare two saved snapshots (recommended)" }));
   if (capsCache.verify_live_source) {
     modeSel.append(el("option", { value: "live-source", text: "Compare against your live database (slower)" }));
   }
   modeSel.append(el("option", { value: "recover-inputs", text: "Check recovery inputs (no snapshot needed)" }));
-  const warn = el("p", { class: "form-hint vfy-livewarn", hidden: true, text:
-    "This reads your entire live table — it can take a while and adds load on your database. Best run outside busy hours." });
 
   const results = el("div", { class: "vfy-results" });
-  const btn = el("button", { class: "btn btn-sm", type: "button", text: "Run verification" });
+  const btn = el("button", { class: "btn vfy-run", type: "button", text: "Run verification" });
   const configured = !!capsCache.verify;
   // The snapshot-comparison modes need a baseline location; the
   // recover-inputs check reads only the index, so it stays runnable on a
   // server with no baseline configured.
-  const updateBtn = () => { btn.disabled = !configured && modeSel.value !== "recover-inputs"; };
-  modeSel.onchange = () => { warn.hidden = modeSel.value !== "live-source"; updateBtn(); };
-  updateBtn();
+  const help = el("p", { class: "form-hint vfy-modehelp" });
+  const updateMode = () => {
+    btn.disabled = !configured && modeSel.value !== "recover-inputs";
+    help.textContent = VFY_MODE_HELP[modeSel.value] || "";
+  };
+  modeSel.onchange = updateMode;
+  updateMode();
   btn.onclick = () => createVerify(cur.id, modeSel.value, btn, results);
-  head.append(el("div", { class: "vfy-actions" }, modeSel, btn));
-  panel.append(head);
-
+  control.append(el("div", { class: "vfy-actions" }, modeSel, btn));
+  control.append(help);
   if (!configured) {
-    list.append(el("div", { class: "stg-empty" },
-      el("p", { class: "stg-empty-lead", text: "No baseline set up for this server yet." }),
-      el("p", { class: "stg-empty-sub", text:
-        "Snapshot comparison checks your two most recent snapshots against each other — set a baseline location (Manage servers → Edit → Advanced) and create at least two to use it. \"Check recovery inputs\" works without one: it only reads the index." })));
-  } else {
-    list.append(warn);
+    control.append(el("p", { class: "form-hint", text:
+      "No baseline set up for this server yet — the two snapshot-comparison modes need one (Manage servers → Edit → Advanced, then create at least two snapshots). \"Check recovery inputs\" works without one: it only reads the index." }));
   }
+
+  // ── Region 2: what is running or just ran ──
+  const current = el("section", { class: "tcard vfy-region vfy-current" });
+  current.append(el("div", { class: "vfy-region-head" },
+    el("h2", { class: "ov-panel-title" }, el("span", { class: "tag-pill", text: "Current run" }))));
   renderVerifyResults(results, null, cur.id);
-  list.append(results);
+  current.append(results);
+  // The per-row nouns are precise AND internal (#1419 §5) — the glossary is
+  // the affordance that keeps them from requiring a source dive.
+  current.append(el("details", { class: "form-advanced vfy-glossary" },
+    el("summary", { class: "form-adv-summary", text: "What these words mean" }),
+    el("p", { class: "form-hint", text: "Chain — every indexed event for one row, oldest to newest. The walk follows each row's history in order." }),
+    el("p", { class: "form-hint", text: "Before-image assertion — each UPDATE/DELETE stores what the row looked like just before it; the check asserts that matches what the previous event left behind. This is exactly the data an undo script would be built from." }),
+    el("p", { class: "form-hint", text: "Began mid-history — the window caught a row mid-life, so its first event has no stored predecessor to check against. Widening the lookback usually resolves it." }),
+    el("p", { class: "form-hint", text: "Nothing to check / no activity — quiet or append-only tables, where zero assertions is the expected outcome; counted separately so they don't read as findings." })));
+
+  // ── Region 3: what ran before ──
+  const historyCard = el("section", { class: "tcard vfy-region vfy-histcard" });
+  historyCard.append(el("div", { class: "vfy-region-head" },
+    el("h2", { class: "ov-panel-title" }, el("span", { class: "tag-pill", text: "History" })),
+    tzChip()));
   const history = el("div", { class: "vfy-history" });
-  list.append(history);
+  historyCard.append(history);
   loadVerifyHistory(cur.id, history);
-  panel.append(list);
-  return panel;
+
+  return [control, current, historyCard];
 }
+
+// VFY_MODE_HELP (#1418): what each mode proves, what it needs, what it costs
+// — one compressed sentence set per mode, swapped under the select as the
+// operator browses. Source of truth for the long form is the issue; keep
+// these three claims per entry: proof, prerequisite, cost.
+const VFY_MODE_HELP = {
+  "baseline-anchored": "Replays your indexed changes from the previous snapshot forward and fingerprints the result against the newest one. Proves your backup chain is sound — the default. Needs two snapshots; never touches your database.",
+  "live-source": "Rebuilds each table from a snapshot plus the indexed changes and compares it against the real table. The strongest proof, and the only mode that reads your database — it can take a while and adds load, so best run outside busy hours. It can also report honest drift from writes that bypassed the binlog.",
+  "recover-inputs": "Walks the index's own before/after images and checks every row's chain is self-consistent — exactly the data an undo script would be built from. Needs no snapshot and never touches your database.",
+};
 
 // createVerify triggers an in-process verify run on the daemon for the
 // selected server, then polls until it finishes, updating resultsEl live
@@ -4144,7 +4222,10 @@ async function createVerify(id, mode, btn, resultsEl) {
   toast("Verification started…");
   const done = await pollVerify(id, (st) => renderVerifyResults(resultsEl, st, id));
   restore();
-  if (done) renderVerifyResults(resultsEl, done, id);
+  // justFinished: the running→done transition gets a one-shot highlight so
+  // completion is perceptible off-chip (#1420); the toast below is the other
+  // half for an operator who looked away.
+  if (done) renderVerifyResults(resultsEl, done, id, { justFinished: true });
   // The finished run is now in the persisted history too — refresh the list.
   const histBox = document.querySelector(".vfy-history");
   if (histBox) loadVerifyHistory(id, histBox);
@@ -4247,13 +4328,19 @@ async function loadVerifyHistory(id, box) {
     return;
   }
   clear(box);
-  if (!recs.length) return;
+  if (!recs.length) {
+    box.append(el("div", { class: "ev-empty", text: "No past runs yet." }));
+    return;
+  }
   const latest = recs.find((r) => r.state === "succeeded" || r.state === "failed");
   if (latest && latest.finished_at) {
     const sec = (Date.now() - Date.parse(latest.finished_at)) / 1000;
     const s = latest.summary || {};
+    // chip-age, NOT chip-mon and NOT the live treatment: this is a staleness
+    // age, and it used to wear the same amber as RUNNING (#1420) — a live
+    // state and an old fact were indistinguishable at a glance.
     box.append(el("div", { class: "vfy-summary" },
-      el("span", { class: "chip chip-mon", text: "LAST VERIFIED " + agoText(sec) }),
+      el("span", { class: "chip chip-age", text: "LAST VERIFIED " + agoText(sec) }),
       el("span", { class: "stg-age", text: latest.state === "failed"
         ? "failed — " + (latest.last_error || "unknown error")
         : ((s.mismatch || s.error)
@@ -4267,33 +4354,112 @@ async function loadVerifyHistory(id, box) {
     else if (r.state === "failed") outcome = "failed — " + (r.last_error || "unknown error");
     else outcome = vfySummaryText(s);
     const when = utcLabel(r.finished_at || r.since || "");
-    const row = el("div", { class: "stg-row" });
+    // Expandable (#1417): the per-table detail is ALREADY in this record —
+    // VerifyRunRecord embeds VerifyStatus, results included — the old
+    // renderer just dropped it on the floor. Disclosure, not navigation:
+    // the history is short and comparing runs side by side is the point.
+    const row = el("button", { class: "stg-row vfy-histrow", type: "button", "aria-expanded": "false" });
     row.append(
-      el("span", { class: "stg-age", text: when }),
+      icon("caret", "ev-caret"),
+      el("span", { class: "stg-name mono", text: when }),
       el("span", { text: (VFY_MODE_LABEL[r.mode] || r.mode || "") + (r.trigger === "scheduled" ? " (scheduled)" : "") }),
       el("span", { class: "stg-age", text: outcome }));
-    box.append(row);
+    const detail = el("div", { class: "vfy-histdetail", hidden: "" });
+    let rendered = false;
+    row.onclick = () => {
+      const open = row.classList.toggle("open");
+      row.setAttribute("aria-expanded", open ? "true" : "false");
+      detail.hidden = !open;
+      if (open && !rendered) {
+        rendered = true;
+        if ((r.results || []).length) {
+          renderVerifyResults(detail, r, id, { history: true });
+        } else {
+          detail.append(el("div", { class: "ev-empty", text: "This run recorded no per-table detail" +
+            (r.state === "skipped" ? " — it was skipped before any table was checked." : ".") }));
+        }
+      }
+    };
+    box.append(row, detail);
   });
 }
 
-// renderVerifyResults draws the current run's summary + per-table cards into
-// container, reusing the doctor preflight card styling (pass/fail/warn) since
-// both are "a list of named checks, each with a status and free-text detail".
-function renderVerifyResults(container, status, id) {
+// vfySortResults:// vfySortResults: worst verdict first (#1419 §3) — a mismatch must not sit
+// at alphabetical position 31 below the fold, visually identical to the 46
+// clean rows around it. Within a band the alphabetical order is kept (stable
+// sort), so scanning stays predictable. Display-only: the wire order is the
+// engine's completion order and the summary counts are order-free.
+const VFY_SORT_BAND = { fail: 0, warn: 2, note: 3, pass: 4 };
+function vfySortResults(results) {
+  return results.map((r, i) => [r, i]).sort((a, b) => {
+    const ba = vfyCardClass(a[0]), bb = vfyCardClass(b[0]);
+    // error shares the "fail" class with mismatch; keep mismatch first.
+    const rank = (r, band) => band === "fail" ? (r.status === "mismatch" ? 0 : 1) : VFY_SORT_BAND[band];
+    const d = rank(a[0], ba) - rank(b[0], bb);
+    return d !== 0 ? d : a[1] - b[1];
+  }).map((p) => p[0]);
+}
+
+// vfyCountsText: the per-table counters as a compact fixed column (#1419 §2)
+// — only the recover-inputs rows carry them (content modes omit all three).
+function vfyCountsText(r) {
+  if (r.events_checked === undefined && r.chains_checked === undefined) return "";
+  return (r.events_checked || 0) + " ev · " + (r.chains_checked || 0) + " chains";
+}
+
+// renderVerifyResults draws one run's summary + per-table rows into
+// container. Used by the live poll loop (results appear as they land) AND by
+// an expanded history record (#1417) — a VerifyRunRecord embeds VerifyStatus,
+// so the shapes are compatible by construction.
+//
+// opts.history: rendering a PAST run — no Explain buttons (a new verify run
+// discards the previous run's drill-down artifacts, so the button would 404
+// or answer about a different run), and no "no run yet" placeholder. Also
+// DERIVED from the record itself: every persisted VerifyRunRecord carries
+// `trigger` ("manual"/"scheduled", no omitempty) and the live VerifyStatus
+// never does, so a call site that forgets the option cannot resurrect the
+// dead buttons — deriving beats threading, and the fixture cannot red-check
+// the threaded half (recover-inputs rows are never explainable).
+// opts.justFinished: the completion transition (#1420) — a one-shot highlight
+// on the summary row so the running→done change is perceptible to someone
+// not staring at the chip.
+function renderVerifyResults(container, status, id, opts) {
   clear(container);
+  const history = (opts && opts.history) || (status && status.trigger !== undefined);
   if (!status || status.state === "idle") {
-    container.append(el("div", { class: "ev-empty", text: "No verification run yet." }));
+    if (!history) {
+      container.append(el("div", { class: "ev-empty", text: "No run in this session yet — results appear here, table by table, as a run progresses. Past runs are under History." }));
+    }
     return;
   }
+  const running = status.state === "running";
+  // RUNNING is a live state and gets a live treatment — animated, distinct
+  // from every age/staleness chip on the page (#1420): the old amber
+  // chip-mon was also the LAST VERIFIED treatment, so a glance could not
+  // tell "in flight" from "13h old".
+  const chipCls = { running: "chip chip-live", succeeded: "chip chip-done", failed: "chip chip-fail" }[status.state] || "chip chip-mon";
   const stateLabel = { running: "RUNNING", succeeded: "DONE", failed: "FAILED" }[status.state] || status.state.toUpperCase();
-  const summaryRow = el("div", { class: "vfy-summary" },
-    el("span", { class: "chip chip-mon", text: stateLabel }));
+  const summaryRow = el("div", { class: "vfy-summary" + ((opts && opts.justFinished) ? " vfy-flash" : "") },
+    el("span", { class: chipCls, text: stateLabel }));
   if (status.mode) summaryRow.append(el("span", { class: "stg-age", text: VFY_MODE_LABEL[status.mode] || status.mode }));
   const s = status.summary || {};
-  if (status.results && status.results.length) {
+  const done = (status.results || []).length;
+  if (running) {
+    // Progress, not a tally (#1420): the engine has no planned-total, so the
+    // honest number is tables completed so far — framed as progress, because
+    // a partial count read as final says "20 inconclusive" about a run that
+    // has not finished (sharpest for inconclusive, #1416).
+    summaryRow.append(el("span", { class: "stg-age", text: done + " table(s) checked so far" }));
+    if (done) summaryRow.append(el("span", { class: "stg-age vfy-sofar", text: vfySummaryText(s) + " — so far" }));
+  } else if (done) {
     summaryRow.append(el("span", { class: "stg-age", text: vfySummaryText(s) }));
   }
   container.append(summaryRow);
+  if (running) {
+    // Motion (#1420): the page must look like a page doing work. The strip is
+    // CSS-animated behind prefers-reduced-motion, like every other motion here.
+    container.append(el("div", { class: "vfy-progress" }, el("span", { class: "vfy-progress-bar" })));
+  }
   // The verdict sentence (#1416): the answer to the operator's question in
   // words, so it does not have to be derived from 28 rows. Only on a FINISHED
   // run — a partial tally must not be read as a verdict (#1420).
@@ -4303,24 +4469,32 @@ function renderVerifyResults(container, status, id) {
   if (status.note) container.append(el("p", { class: "form-hint", text: status.note }));
   if (status.last_error) container.append(el("p", { class: "form-msg err", text: status.last_error }));
 
-  const cards = el("div", { class: "doctor-cards" });
-  (status.results || []).forEach((r) => {
+  // Structured rows (#1419 §2), worst first (§3): table, verdict and counts
+  // are columns the eye can scan; the detail sentence is the LAST, flexible
+  // column, ellipsized with the full text a click (or hover title) away.
+  const rows = el("div", { class: "vfy-rows" });
+  vfySortResults(status.results || []).forEach((r) => {
     // Statuses are normalized server-side (verify.NormalizeStatus), so only
     // the four keys above can arrive; if that ever breaks, fail — never reassure.
     const cls = vfyCardClass(r);
-    const card = el("div", { class: "doctor-card " + cls });
-    card.append(el("span", { class: "dc-mark", text: VFY_STATUS_MARK[cls] || "?" }));
-    const body = el("div", { class: "dc-body" },
-      el("div", { class: "dc-name", text: r.schema + "." + r.table + " — " + r.status + (r.reason ? " — " + r.reason : "") }));
-    if (r.explainable) {
+    const row = el("div", { class: "vfy-row " + cls });
+    row.append(el("span", { class: "vfy-mark", text: VFY_STATUS_MARK[cls] || "?" }));
+    row.append(el("span", { class: "vfy-tbl", text: r.schema + "." + r.table }));
+    const verdict = r.status === "inconclusive" && VFY_BENIGN_KINDS[r.inconclusive_kind]
+      ? "nothing to check" : r.status;
+    row.append(el("span", { class: "vfy-verdict", text: verdict }));
+    row.append(el("span", { class: "vfy-counts", text: vfyCountsText(r) }));
+    const reason = el("span", { class: "vfy-reason", text: r.reason || "", title: r.reason || "" });
+    reason.onclick = () => reason.classList.toggle("wrap");
+    row.append(reason);
+    if (r.explainable && !history) {
       const explainBtn = el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Explain" });
       explainBtn.onclick = () => openVerifyExplain(id, r.schema, r.table, explainBtn);
-      body.append(explainBtn);
+      row.append(explainBtn);
     }
-    card.append(body);
-    cards.append(card);
+    rows.append(row);
   });
-  container.append(cards);
+  container.append(rows);
 }
 
 // openVerifyExplain shows the row-level drill-down for one mismatched table,
