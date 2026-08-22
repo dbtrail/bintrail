@@ -124,9 +124,11 @@ func recoverArchiveElisionNote() string {
 // be nonsense here — and no remedy is needed, since the skip is
 // completeness-preserving by proof.
 func reconstructArchiveElisionNote() string {
-	return "This state was computed from the live index; the registered archives were not read. " +
-		"The window from the baseline anchor forward sits entirely inside live coverage, so " +
-		"nothing they hold could have contributed — nothing is missing here."
+	// The FACT, not the reason: the flag does not say which proof fired
+	// (archiveElisionNote's doc establishes why inferring it is wrong), so
+	// this wording must stay true under any future fifth proof.
+	return "This state was computed from the live index; the registered archives were not read " +
+		"because they provably could not change this result — nothing is missing here."
 }
 
 // archiveElisionNotes returns the response Notes list for a fetch that
@@ -165,8 +167,21 @@ func archiveElisionNotes(archivesElided bool, elisionNote string) []string {
 //
 // elisionNote is the surface's own wording for the elision record; pass
 // archiveElisionNote() (events) or recoverArchiveElisionNote() (recover).
-func responseAdvisories(plan *query.QueryPlan, excl archiveExclusion, diverged int, archivesElided bool, elisionNote string) (warnings, notes []string) {
+func responseAdvisories(plan *query.QueryPlan, excl archiveExclusion, skipped []string, diverged int, archivesElided bool, elisionNote string) (warnings, notes []string) {
 	warnings = appendDivergenceWarning(restrictedFetchWarnings(plan, excl), diverged)
+	// The incompleteness inventory (#1414 review pass 2): a failed archive
+	// source or a failed discovery under AllowGaps used to be log-only here,
+	// which turned the scope=live phase-1 promise ("a full read will report
+	// it") into a false claim the moment phase 2 swept the marker. Same
+	// wording contract as reconstruct's coverageWarnings: a skipped source's
+	// events ARE missing, not "may be".
+	for _, src := range skipped {
+		if src == query.DiscoveryFailedSource {
+			warnings = append(warnings, "archive source discovery failed — no archives were read, and archived hours may still be counted as covered; the result may be incomplete")
+			continue
+		}
+		warnings = append(warnings, "archive source failed and was skipped — events held only by this source are missing from the result: "+src)
+	}
 	notes = archiveElisionNotes(archivesElided, elisionNote)
 	return warnings, notes
 }

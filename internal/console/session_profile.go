@@ -236,7 +236,7 @@ func (s *Server) applySessionProfile(ctx context.Context, r *http.Request, b *bu
 // is structurally always false for a profiled session or a --no-archive
 // console: there the archives are EXCLUDED (excl says so and its notice
 // speaks), not elided — nothing was resolved that could have been skipped.
-func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, int, bool, error) {
+func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle, opts query.Options) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, []string, int, bool, error) {
 	return s.fetchRestrictedScoped(ctx, r, b, opts, false)
 }
 
@@ -246,16 +246,23 @@ func (s *Server) fetchRestricted(ctx context.Context, r *http.Request, b *bundle
 // must not share bookkeeping — excl records exclusions the operator did not
 // choose and must be told about, while scope=live is the caller's own phase-1
 // request, disclosed through liveScopeAdvisories instead.
-func (s *Server) fetchRestrictedScoped(ctx context.Context, r *http.Request, b *bundle, opts query.Options, liveOnly bool) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, int, bool, error) {
+// skipped is FetchMergedFull's incompleteness inventory — failed archive
+// sources plus the DiscoveryFailedSource sentinel — and it is now RETURNED
+// rather than discarded (#1414 review pass 2): the scope=live phase-1 warning
+// promises "a full read will report it", and the phase-2 response is what
+// sweeps that warning away, so it must be able to keep the promise. The old
+// log-only trade-off (Server.fetch's doc) predates a phase-1 marker whose
+// removal asserts completeness.
+func (s *Server) fetchRestrictedScoped(ctx context.Context, r *http.Request, b *bundle, opts query.Options, liveOnly bool) ([]query.ResultRow, *query.QueryPlan, archiveExclusion, []string, int, bool, error) {
 	excl := archiveExclusionFor(r, b)
-	rows, plan, _, diverged, archivesElided, err := query.FetchMergedFull(ctx, b.db, b.engine, query.FetchMergedOptions{
+	rows, plan, skipped, diverged, archivesElided, err := query.FetchMergedFull(ctx, b.db, b.engine, query.FetchMergedOptions{
 		Opts:           opts,
 		DBName:         b.dbName,
 		NoArchive:      excl.any() || liveOnly,
 		AllowGaps:      true,
 		ArchiveFetcher: s.archiveFetch(),
 	})
-	return rows, plan, excl, diverged, archivesElided, err
+	return rows, plan, excl, skipped, diverged, archivesElided, err
 }
 
 // archiveExclusion records WHY a fetch left the Parquet archives out (#1311),

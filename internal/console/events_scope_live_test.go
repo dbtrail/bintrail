@@ -3,6 +3,7 @@ package console
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -142,6 +143,47 @@ func TestEventsScopeInvalid(t *testing.T) {
 	s.handleEvents(rec, req)
 	if rec.Code != 400 {
 		t.Errorf("scope=fast: code = %d, want 400", rec.Code)
+	}
+}
+
+// TestEventsSkippedSourceReachesTheResponse (#1414 review pass 2): a FULL
+// read whose archive source fails under AllowGaps used to disclose that only
+// in the daemon log — which turned the scope=live phase-1 promise ("a full
+// read will report it") into a false claim the moment the client swept the
+// PARTIAL marker on phase 2's warning-free response. The incompleteness
+// inventory must ride the response.
+func TestEventsSkippedSourceReachesTheResponse(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery("FROM archive_state").WillReturnRows(
+		sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}).
+			AddRow("abc-123", nil, "bkt", "bintrail/bintrail_id=abc-123/x.parquet"))
+	mock.ExpectQuery("FROM binlog_events").WillReturnRows(scopeLiveEventRows())
+
+	s := newBootServer(db)
+	s.cm.boot.noArchive = false
+	s.archiveFetcher = func(context.Context, query.Options, string) ([]query.ResultRow, error) {
+		return nil, errors.New("S3 outage (intentional)")
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/events?schema=app&table=users", nil)
+	s.handleEvents(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var resp eventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(resp.Warnings, " | ")
+	if !strings.Contains(joined, "failed and was skipped") {
+		t.Errorf("warnings = %q, want the skipped-source disclosure — a failed archive read must "+
+			"not present a partial list as complete", joined)
 	}
 }
 

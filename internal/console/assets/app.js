@@ -2995,7 +2995,7 @@ async function runReconstruct(form, history) {
   const ttNotes = $("#tt-notes", VIEW());
   const out = $("#tt-out", VIEW());
   const f = Object.fromEntries(new FormData(form).entries());
-  if (!f.schema || !f.table || !f.pk) { clear(warns); renderError(out, "Schema, table, and PK are all required."); return; }
+  if (!f.schema || !f.table || !f.pk) { clear(warns); renderNotes(ttNotes, []); renderError(out, "Schema, table, and PK are all required."); return; }
   const params = { schema: f.schema, table: f.table, pk: f.pk };
   if (f.at && f.at.trim()) params.at = f.at.trim();
   if (form.elements.allow_gaps && form.elements.allow_gaps.checked) params.allow_gaps = "true";
@@ -3010,7 +3010,10 @@ async function runReconstruct(form, history) {
     else renderStateAt(out, data);
   } catch (err) {
     if (gen !== serverGen) return;
-    clear(warns); renderError(out, err);
+    // Sweep BOTH registers (#1365, same rule the events catch states): a
+    // lingering "nothing is missing here" elision note beside an error
+    // belongs to a different query and reads as reassurance about this one.
+    clear(warns); renderNotes(ttNotes, []); renderError(out, err);
   }
 }
 

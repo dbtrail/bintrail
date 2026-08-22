@@ -136,7 +136,7 @@ func TestResponseAdvisoriesSeveritySplit(t *testing.T) {
 	hour := time.Date(2026, 8, 1, 3, 0, 0, 0, time.UTC)
 	planWithGap := &query.QueryPlan{GapHours: []time.Time{hour}}
 
-	warnings, notes := responseAdvisories(planWithGap, archiveExclusion{profile: true}, 2, true, archiveElisionNote())
+	warnings, notes := responseAdvisories(planWithGap, archiveExclusion{profile: true}, nil, 2, true, archiveElisionNote())
 
 	joinedW := strings.Join(warnings, "\n")
 	for name, want := range map[string]string{
@@ -152,7 +152,7 @@ func TestResponseAdvisoriesSeveritySplit(t *testing.T) {
 		t.Fatalf("the elision record must be the info note, got %#v", notes)
 	}
 	// The recover surface flows its own wording through the same seam.
-	if _, rn := responseAdvisories(&query.QueryPlan{}, archiveExclusion{}, 0, true, recoverArchiveElisionNote()); len(rn) != 1 || rn[0] != recoverArchiveElisionNote() {
+	if _, rn := responseAdvisories(&query.QueryPlan{}, archiveExclusion{}, nil, 0, true, recoverArchiveElisionNote()); len(rn) != 1 || rn[0] != recoverArchiveElisionNote() {
 		t.Fatalf("the recover elision record must flow through as the info note, got %#v", rn)
 	}
 	// The lists never cross: the elision is not ALSO (or instead) a warning,
@@ -172,7 +172,7 @@ func TestResponseAdvisoriesSeveritySplit(t *testing.T) {
 	}
 
 	// The quiet path: nothing to say in either register.
-	w, n := responseAdvisories(&query.QueryPlan{}, archiveExclusion{}, 0, false, archiveElisionNote())
+	w, n := responseAdvisories(&query.QueryPlan{}, archiveExclusion{}, nil, 0, false, archiveElisionNote())
 	if len(w) != 0 || len(n) != 0 {
 		t.Errorf("clean read must produce no warnings and no notes, got %#v / %#v", w, n)
 	}

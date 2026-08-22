@@ -490,7 +490,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// row is not a paging escape hatch for pulling the index into a browser.
 	pageLimit := opts.Limit
 	opts.Limit = pageLimit + 1
-	rows, plan, excl, diverged, archivesElided, err := s.fetchRestrictedScoped(r.Context(), r, b, opts, liveOnly)
+	rows, plan, excl, skipped, diverged, archivesElided, err := s.fetchRestrictedScoped(r.Context(), r, b, opts, liveOnly)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -515,6 +515,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if liveOnly {
 		if !excl.any() {
 			if srcs, derr := query.ResolveArchiveSources(r.Context(), b.db); derr != nil {
+				// The warning tells the operator discovery failed; this log
+				// line is the only server-side trace of WHY for a scope=live
+				// call that never runs a phase 2 (a direct API client).
+				slog.Warn("events scope=live: archive source discovery failed", "error", derr)
 				pending = -1
 			} else {
 				pending = len(srcs)
@@ -522,7 +526,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		warnings, notes = liveScopeAdvisories(plan, excl, pending)
 	} else {
-		warnings, notes = responseAdvisories(plan, excl, diverged, archivesElided, archiveElisionNote())
+		warnings, notes = responseAdvisories(plan, excl, skipped, diverged, archivesElided, archiveElisionNote())
 	}
 	// The preview mirrors the script, so it mirrors this too: an empty preview
 	// under an anchor is the same ambiguity, rendered as "0 affected event(s)".
@@ -626,7 +630,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// Coverage gaps come back in plan.GapHours and are surfaced as warnings
 	// below — the recover UI renders them, so an incomplete-coverage undo is
 	// flagged to the operator rather than silently presented as complete.
-	rows, plan, excl, diverged, archivesElided, err := s.fetchRestricted(r.Context(), r, b, opts)
+	rows, plan, excl, skipped, diverged, archivesElided, err := s.fetchRestricted(r.Context(), r, b, opts)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -639,7 +643,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	// archives, and the reviewer of an undo script must see that stated — as
 	// an info note (#1365), since the skip is correctness-preserving —
 	// worded for this surface (a reversal has a window, not pages).
-	warnings, notes := responseAdvisories(plan, excl, diverged, archivesElided, recoverArchiveElisionNote())
+	warnings, notes := responseAdvisories(plan, excl, skipped, diverged, archivesElided, recoverArchiveElisionNote())
 	// Prepended: on an empty anchored reversal this is the only thing the
 	// response says, and it has to be the first thing read.
 	warnings = append(anchorMissedWarning(opts, len(rows)), warnings...)

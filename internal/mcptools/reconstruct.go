@@ -526,9 +526,10 @@ func reconstructElisionNotes(archivesElided bool) []string {
 	if !archivesElided {
 		return nil
 	}
+	// The FACT, not the reason: the flag does not say which proof fired, so
+	// the wording must stay true under any future fifth proof.
 	return []string{"This state was computed from the live index; the registered archives were not " +
-		"read. The window from the baseline anchor forward sits entirely inside live coverage, so " +
-		"nothing they hold could have contributed — nothing is missing here."}
+		"read because they provably could not change this result — nothing is missing here."}
 }
 
 // reconstructWarnings assembles the non-fatal caveats attached to a successful
