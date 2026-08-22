@@ -46,7 +46,10 @@ import (
 //
 //   - metadata-only reads that return no row images: the shim's
 //     SHOW TABLES FROM <virtual schema>, and the console's
-//     status/schemas/capabilities/storage/baselines endpoints.
+//     status/schemas/capabilities/storage endpoints, plus the baselines
+//     LISTING and per-snapshot files endpoints (names, sizes, timestamps).
+//     The backup tar download is NOT in this list: it hands over every
+//     baseline row and is audited as console/baseline.download.
 //   - `verify` without --explain — including `--check recover`, which
 //     READS before/after images to compare them but reports only per-table
 //     verdicts and chain-break locators (event id, primary key, column

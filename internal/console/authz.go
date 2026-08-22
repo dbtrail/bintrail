@@ -87,6 +87,7 @@ var apiRoutePerms = []routePerm{
 	// Operator maintenance actions on a specific server. verify has no dedicated
 	// permission; it is an operator integrity action, tiered with baseline:create.
 	{"POST", "/api/servers/{}/baseline", ext.PermBaselineCreate},
+	{"POST", "/api/servers/{}/baseline/restore", ext.PermBaselineCreate},
 	{"POST", "/api/servers/{}/verify", ext.PermBaselineCreate},
 	// Refreshing the schema snapshot STOPS AND RESTARTS that server's capture
 	// stream, so it is tiered with the monitor verbs below (servers:write), not
@@ -104,6 +105,7 @@ var apiRoutePerms = []routePerm{
 	// See the note above the maintenance block: this one restarts capture.
 	{"POST", "/api/servers/{}/schema-snapshot", ext.PermServersWrite},
 	{"GET", "/api/servers/{}/baseline", ext.PermServersRead},
+	{"GET", "/api/servers/{}/baseline/restore", ext.PermServersRead},
 	{"GET", "/api/servers/{}/schema-snapshot", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify", ext.PermServersRead},
 	{"GET", "/api/servers/{}/verify/explain", ext.PermServersRead},
@@ -121,6 +123,13 @@ var apiRoutePerms = []routePerm{
 	{"GET", "/api/rotation", ext.PermSettingsRead},
 	{"PUT", "/api/rotation", ext.PermServersWrite},
 	{"GET", "/api/baselines", ext.PermSettingsRead},
+	// The per-snapshot files listing is metadata (names, sizes, timestamps),
+	// same tier as the listing above. The DOWNLOAD is not: it is a full
+	// unredacted copy of every baseline row, so it takes the row-data
+	// permission — tiering it with the settings surface would make
+	// settings:read a data-exfiltration path.
+	{"GET", "/api/baselines/files", ext.PermSettingsRead},
+	{"GET", "/api/baselines/download", ext.PermQueryExecute},
 	{"GET", "/api/storage", ext.PermSettingsRead},
 	// Data-profile NAMES on the selected server — access-control vocabulary
 	// for administration panels (settings-surface pickers), not row data.

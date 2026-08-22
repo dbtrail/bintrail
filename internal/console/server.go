@@ -219,7 +219,7 @@ type Server struct {
 	// verify runs (see Config.VerifyCtrl).
 	verifyCtrl VerifyController
 	// verifyHistory: the persisted run history, set with verifyCtrl (#1191).
-	verifyHistory *VerifyHistory
+	verifyHistory   *VerifyHistory
 	baselineRestore BaselineRestorer
 	baselineHistory *BaselineRunHistory
 	// telemetry: non-nil only when a long-running console wired its live

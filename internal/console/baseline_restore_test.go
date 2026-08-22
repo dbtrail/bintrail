@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -116,6 +117,23 @@ func TestBaselineRestore_gates(t *testing.T) {
 		t.Fatalf("incomplete leftover: code=%d body=%s, want 202 (retry allowed)", rec.Code, body)
 	}
 
+	// A failed fold that ALSO left converted tables behind is the shape the
+	// engine refuses (its retry rule tolerates only the marker): a 202 here
+	// would promise work that cannot happen.
+	dirty := filepath.Join(dir, "2026-06-10T09-00-00Z")
+	if err := os.MkdirAll(filepath.Join(dirty, "shop"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{"_INCOMPLETE": "", "shop/orders.parquet": "x"} {
+		if err := os.WriteFile(filepath.Join(dirty, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec, body = doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline/restore", `{"at":"2026-06-10 09:00:00"}`)
+	if rec.Code != 409 || !strings.Contains(string(body), "left files behind") {
+		t.Fatalf("dirty leftover: code=%d body=%s, want 409 naming the leftover", rec.Code, body)
+	}
+
 	// Accepted: the request reaches the restorer with the parsed instant.
 	rec, body = doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline/restore", `{"at":"2026-06-10 11:30:00"}`)
 	if rec.Code != 202 {
@@ -223,7 +241,7 @@ func TestBaselineFiles_joinsRunHistory(t *testing.T) {
 	if err := h.Append(BaselineRunRecord{ServerID: "default", Kind: BaselineRunRestore,
 		SnapshotTime: "2026-06-10T12:00:00Z",
 		StartedAt:    "2026-06-10T12:00:00Z", FinishedAt: "2026-06-10T12:03:30Z",
-		Tables:       2, Rows: 12}); err != nil {
+		Tables: 2, Rows: 12}); err != nil {
 		t.Fatal(err)
 	}
 	rec, body := doServersReq(t, srv, "GET", "/api/baselines/files"+detailQuery(detailSnapAt), "")

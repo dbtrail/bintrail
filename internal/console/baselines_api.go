@@ -66,10 +66,16 @@ type baselinesResponse struct {
 // the selection never resolves to — so the refresh chip and the run-history
 // join silently missed on every fresh tab of a single-server watch.
 func (s *Server) selectedServerID(r *http.Request) string {
-	if id := r.Header.Get("X-Bintrail-Server"); id != "" {
+	if id := r.Header.Get(serverHeader); id != "" {
 		return id
 	}
-	return s.cm.defaultID()
+	if id := s.cm.defaultID(); id != "" {
+		return id
+	}
+	// HideBoot with an empty registry: defaultID has nothing to name, but
+	// Resolve("") serves the hidden boot bundle — and the refresh loop
+	// registers that server's runs under the boot id.
+	return bootServerID
 }
 
 // handleBaselines serves GET /api/baselines: a read-only listing of the
@@ -123,10 +129,7 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 	// fabricated verdict — an unopened bundle connection or an unreadable
 	// index yields the explicit "unknown".
 	var floor status.DeltaFloor
-	serverID := r.Header.Get("X-Bintrail-Server")
-	if serverID == "" {
-		serverID = "default"
-	}
+	serverID := s.selectedServerID(r)
 	if b.db == nil {
 		slog.Warn("console: baseline staleness not evaluated — the server's index connection is not open", "server", serverID)
 	} else if f, err := status.OldestDeltaFromDB(r.Context(), b.db, b.dbName); err != nil {

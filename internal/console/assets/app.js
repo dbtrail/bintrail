@@ -3646,7 +3646,10 @@ async function renderBaselines() {
     const running = backupRunsInFlight(dumpSt, restoreSt, baselines);
     if (running.length) {
       v.append(backupRunRegion(running));
-      watchBackupRuns(cur && cur.id, vgen);
+      // One watcher at a time: renderBaselines() outside renderRoute does not
+      // bump viewGen, so without its own generation every re-render (its own
+      // settle path included) would stack another 2s poller.
+      watchBackupRuns(cur && cur.id, vgen, ++backupWatchGen, running.map((r) => r.kind));
     }
     const restoreCard = backupRestoreCard(cur, baselines, restoreSt);
     if (restoreCard) v.append(restoreCard);
@@ -4021,7 +4024,7 @@ function baselineRefreshNote(rf) {
     case "failed":
       text = "Automatic refresh published nothing" + (when ? " at " + when : "") +
         (rf.refused ? "; " + rf.refused + " table(s) refused" : "") +
-        (rf.last_error ? ": " + rf.last_error : "") +
+        (rf.last_error ? ": " + backupFoldError(rf.last_error) : "") +
         " Nothing was overwritten; the next run retries.";
       break;
     default:
@@ -4299,6 +4302,7 @@ async function downloadBackup(at, btn, totalBytes) {
     const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
     if (currentServer) headers["X-Bintrail-Server"] = currentServer;
     const res = await fetch("/api/baselines/download?at=" + encodeURIComponent(at), { headers });
+    if (res.status === 401) { handleUnauthorized(); return; }
     if (!res.ok) {
       let msg = "HTTP " + res.status;
       try { msg = (await res.json()).error || msg; } catch (_) { /* non-JSON error body */ }
@@ -4314,7 +4318,9 @@ async function downloadBackup(at, btn, totalBytes) {
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
+    // Delayed: Firefox has cancelled downloads whose object URL was revoked
+    // synchronously after click.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (err) {
     toastError("Download failed: " + ((err && err.message) || err));
   } finally {
@@ -4327,15 +4333,15 @@ function backupRunsInFlight(dumpSt, restoreSt, b) {
   const running = [];
   const dump = dumpSt && dumpSt.baseline;
   if (dump && dump.state === "running") {
-    running.push({ text: "Creating a backup: copying your data" + (dump.since ? ", since " + utcLabel(dump.since) : "") + "…" });
+    running.push({ kind: "dump", text: "Creating a backup: copying your data" + (dump.since ? ", since " + utcLabel(dump.since) : "") + "…" });
   }
   const rst = restoreSt && restoreSt.restore;
   if (rst && rst.state === "running") {
-    running.push({ text: "Restoring to " + (rst.at ? utcLabel(rst.at) : "the chosen moment") + ": building a new backup…" });
+    running.push({ kind: "restore", text: "Restoring to " + (rst.at ? utcLabel(rst.at) : "the chosen moment") + ": building a new backup…" });
   }
   const rf = b && !b.error && b.refresh;
   if (rf && rf.state === "running") {
-    running.push({ text: "Automatic refresh running" + (rf.since ? " since " + utcLabel(rf.since) : "") + "…" });
+    running.push({ kind: "refresh", text: "Automatic refresh running" + (rf.since ? " since " + utcLabel(rf.since) : "") + "…" });
   }
   return running;
 }
@@ -4353,42 +4359,48 @@ function backupRunRegion(running) {
   return card;
 }
 
+let backupWatchGen = 0;
+
 // watchBackupRuns re-renders the page when the in-flight run settles, so the
 // region clears and the new backup appears without a manual reload.
 //
-// It must poll the SAME three sources backupRunsInFlight reads, or the two
-// sets drift: the first draft skipped the refresh, so during every periodic
-// refresh the watcher woke "settled" after 2s, re-rendered, saw the region
-// again, spawned a new watcher — a full re-render plus a baseline listing
-// every 2 seconds for the whole fold. The refresh state only exists on the
-// listing endpoint, which enumerates the store (billed LISTs on S3), so it
-// is polled on a slower cadence.
-async function watchBackupRuns(id, vgen) {
+// It polls ONLY the kinds that raised the region — literally the sources
+// backupRunsInFlight read. The first draft skipped the refresh, so during
+// every periodic refresh the watcher woke "settled" after 2s and re-rendered
+// in a loop; the second draft polled the per-server endpoints even when the
+// selection cannot answer them (the boot entry 409s the monitor verbs), so
+// pollFailed held a settled region up for the full 30-minute cap. The
+// refresh state only exists on the listing endpoint, which enumerates the
+// store (billed LISTs on S3), so it is polled on a slower cadence.
+async function watchBackupRuns(id, vgen, wgen, kinds) {
   if (!id) return;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  let refreshBusy = true; // assume it until a listing poll says otherwise
+  let refreshBusy = kinds.includes("refresh"); // it WAS running at spawn
   for (let i = 0; i < 900; i++) {
     await sleep(2000);
-    if (vgen !== viewGen || location.pathname !== "/baselines") return;
+    if (wgen !== backupWatchGen || vgen !== viewGen || location.pathname !== "/baselines") return;
     let busy = false;
     let pollFailed = false;
-    if (capsCache.baseline_trigger) {
+    // Only a transport failure or a server fault says "unknown"; a 4xx is a
+    // definitive answer about THIS selection and must not hold the region up.
+    const unknown = (e) => !e || !e.status || e.status >= 500;
+    if (kinds.includes("dump")) {
       try {
         const st = await api("/api/servers/" + encodeURIComponent(id) + "/baseline");
         if (st.baseline && st.baseline.state === "running") busy = true;
-      } catch (_) { pollFailed = true; }
+      } catch (e) { if (unknown(e)) pollFailed = true; }
     }
-    if (capsCache.baseline_restore) {
+    if (kinds.includes("restore")) {
       try {
         const st = await api("/api/servers/" + encodeURIComponent(id) + "/baseline/restore");
         if (st.restore && st.restore.state === "running") busy = true;
-      } catch (_) { pollFailed = true; }
+      } catch (e) { if (unknown(e)) pollFailed = true; }
     }
-    if (i % 5 === 4) { // every ~10s
+    if (kinds.includes("refresh") && i % 5 === 4) { // every ~10s
       try {
         const b = await api("/api/baselines");
         refreshBusy = !!(b.refresh && b.refresh.state === "running");
-      } catch (_) { pollFailed = true; }
+      } catch (e) { if (unknown(e)) pollFailed = true; }
     }
     if (refreshBusy) busy = true;
     // A failed poll says nothing about the run; treating it as "settled"
@@ -4401,7 +4413,18 @@ async function watchBackupRuns(id, vgen) {
   }
   // Cap expiry: re-render once so a stale RUNNING region does not outlive
   // the watcher silently.
-  if (vgen === viewGen && location.pathname === "/baselines") renderBaselines();
+  if (wgen === backupWatchGen && vgen === viewGen && location.pathname === "/baselines") renderBaselines();
+}
+
+// backupFoldError rewrites a fold refusal for this page: the engine's
+// remedies name CLI flags an operator here cannot type (the MCP surface does
+// the same rewrite for its clients).
+function backupFoldError(msg) {
+  return String(msg)
+    .replace(/;?\s*pass --allow-gaps to proceed[^.;]*/,
+      ". The recorded history has a permanent gap in that window, so the backup would be incomplete; pick a later moment")
+    .replace(/,?\s*or target a different instant with --at/, ", or pick another second")
+    .replace(/\u2014/g, "-");
 }
 
 // backupRestoreCard offers the point-in-time restore: pick a past moment, get
@@ -4433,7 +4456,7 @@ function backupRestoreCard(cur, b, restoreSt) {
   body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
   if (rst && rst.state === "failed") {
     body.append(el("p", { class: "form-msg err", text:
-      "Last restore published nothing: " + (rst.last_error || "unknown error") + " Nothing was overwritten." }));
+      "Last restore published nothing: " + backupFoldError(rst.last_error || "unknown error") + " Nothing was overwritten." }));
     details.open = true;
   } else if (rst && rst.state === "succeeded") {
     body.append(el("p", { class: "form-hint", text:

@@ -309,10 +309,11 @@ func (s *Server) handleBaselineFiles(w http.ResponseWriter, r *http.Request) {
 // what lands on the operator's disk is a complete, discoverable snapshot.
 //
 // Mid-stream errors panic with http.ErrAbortHandler: the status is already
-// written, and cutting the connection is what makes the CLIENT fail loudly —
-// a plain return would end the chunked body cleanly, the browser would save
-// the truncated archive as a "successful" download, and the operator would
-// learn it is garbage at extraction time, plausibly mid-incident.
+// written, and cutting the connection is what makes the CLIENT fail loudly.
+// A plain return would end the chunked body cleanly: curl -O or wget would
+// save the truncated archive as a success (the console's own fetch+blob
+// rejects on a cut body either way), and the operator would learn it is
+// garbage at extraction time, plausibly mid-incident.
 func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) {
 	ss, dirName, files := s.resolveSnapshotRequest(w, r, "baseline-download")
 	if files == nil {
@@ -330,16 +331,19 @@ func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) 
 	// not depend on the stream finishing: an aborted read is exactly the read
 	// an auditor most wants to see (see recordConsoleAccess's own contract),
 	// and gating on success would let a client fetch all but the gzip trailer
-	// of every backup unaudited. Deferred so the abort panics land here too.
+	// of every backup unaudited. Emission is unconditional once the handler
+	// commits to streaming (every refusal returned above): a zero-byte abort
+	// still records the attempt rather than betting on deflate buffering the
+	// tar headers. Deferred so the abort panics land here too. The files
+	// count is what was HANDED OVER, not the snapshot's inventory — an
+	// auditor must never read "files: 40, bytes: 4" as forty delivered.
 	var sent int64
+	var sentFiles int
 	completed := false
 	defer func() {
-		if !completed && sent == 0 {
-			return // refused or died before any row data left
-		}
 		detail := map[string]string{
 			"snapshot": dirName,
-			"files":    strconv.Itoa(len(files)),
+			"files":    strconv.Itoa(sentFiles),
 			"bytes":    strconv.FormatInt(sent, 10),
 		}
 		if !completed {
@@ -374,6 +378,9 @@ func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) 
 		n, err := io.Copy(tw, rc)
 		rc.Close()
 		sent += n
+		if err == nil && n == f.Size {
+			sentFiles++
+		}
 		if err != nil {
 			abort("backup download aborted mid-file", f.RelPath, err)
 		}

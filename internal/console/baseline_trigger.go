@@ -267,6 +267,19 @@ func (s *Server) handleBaselineRestore(w http.ResponseWriter, r *http.Request) {
 				"a backup already exists at exactly "+at.Format(consoleTSFormat)+"; pick another second, or use that backup")
 			return
 		}
+		// The engine's retry rule tolerates ONLY the marker: a failed fold
+		// that also left converted tables behind makes it refuse, so a 202
+		// here would promise work that cannot happen.
+		if ents, rerr := os.ReadDir(snapDir); rerr == nil {
+			for _, ent := range ents {
+				if ent.Name() == baseline.IncompleteMarker {
+					continue
+				}
+				writeJSONError(w, http.StatusConflict,
+					"a failed backup at exactly "+at.Format(consoleTSFormat)+" left files behind; delete that backup folder and retry, or pick another second")
+				return
+			}
+		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		// A backup directory that cannot even be stat'ed predicts the fold
 		// will fail; refuse now with the real reason instead of a 202 whose

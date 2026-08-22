@@ -130,8 +130,8 @@ type VerifyTableResult struct {
 	// review: the console rendered a counts column these fields never
 	// reached — toWireResult dropped them on the floor). Zero-omitted; the
 	// content modes carry neither.
-	EventsChecked int `json:"events_checked,omitempty"`
-	ChainsChecked int `json:"chains_checked,omitempty"`
+	EventsChecked int    `json:"events_checked,omitempty"`
+	ChainsChecked int    `json:"chains_checked,omitempty"`
 	Anchor        string `json:"anchor,omitempty"`
 	// Explainable is true only for a baseline-anchored mismatch whose pair is
 	// still cached from the run that produced this result — the precondition
