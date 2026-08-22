@@ -59,6 +59,39 @@ type TableResult struct {
 	EventsChecked      int
 	ChainsChecked      int
 	ChainsInconclusive int
+	// InconclusiveKind subdivides an inconclusive verdict — see the constants
+	// beside it. Empty for every other status and for the content modes,
+	// whose inconclusives are not yet classified.
+	InconclusiveKind string
+}
+
+// InconclusiveKind values (#1416). One bucket was carrying three meanings:
+// "nothing happened", "nothing could ever be asserted here", and "there was
+// assertable content and it was not asserted". Only the third deserves an
+// operator's attention, and a summary that adds all three into one number
+// cannot be read.
+const (
+	// InconclusiveNoActivity: zero events in the window. Expected on a quiet
+	// table; not a finding.
+	InconclusiveNoActivity = "no-activity"
+	// InconclusiveNothingToAssert: activity existed but the check does not
+	// apply to its shape (every event its row's only change — append-only).
+	// Permanent for such tables; not a finding.
+	InconclusiveNothingToAssert = "nothing-to-assert"
+	// InconclusiveUnproven: assertable content existed and was not asserted
+	// (truncated window, unresolved comparisons, drift rows). The one kind
+	// worth attention.
+	InconclusiveUnproven = "unproven"
+)
+
+// InconclusiveKindBenign reports whether kind is one of the two
+// expected-and-permanent shapes — the ones a summary counts as "nothing to
+// check" rather than "not proven". An empty kind is NOT benign: it is an
+// unclassified inconclusive (the content modes, or an older producer), and
+// defaulting the unknown to benign is the direction a verify tool must never
+// round.
+func InconclusiveKindBenign(kind string) bool {
+	return kind == InconclusiveNoActivity || kind == InconclusiveNothingToAssert
 }
 
 // Config wires the three data sources verify needs.

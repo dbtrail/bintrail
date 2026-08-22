@@ -195,3 +195,55 @@ func TestVerifyRecoverInputs_WindowPredatingIndexHistorySaysSo(t *testing.T) {
 		t.Errorf("detail should carry the actionable remedy, got: %s", res.Detail)
 	}
 }
+
+// TestVerifyRecoverInputs_KindReachesTheTableResult pins the seam between the
+// chain walk and the report (#1416): checkRecoverChains classifies the
+// inconclusive, and VerifyRecoverInputs must COPY that classification onto the
+// TableResult it returns. The walk and the report each had their own tests and
+// both stayed green with the copy deleted — the summary then counted every
+// quiet table as attention-worthy, which is the exact misreading the kind
+// exists to end. Driven through the real fetch path against a real index.
+func TestVerifyRecoverInputs_KindReachesTheTableResult(t *testing.T) {
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	testutil.MustExec(t, db, `INSERT INTO schema_snapshots
+		(snapshot_id, snapshot_time, schema_name, table_name, column_name,
+		 ordinal_position, column_key, data_type, column_type, is_nullable, is_generated)
+		VALUES (1, UTC_TIMESTAMP(), ?, 'orders', 'id', 1, 'PRI', 'int', 'int', 'NO', 0)`, dbName)
+
+	now := time.Now().UTC()
+	curHour := now.Truncate(time.Hour)
+	h1, h2 := curHour.Add(-time.Hour), curHour
+	testutil.SetupPartitionedTable(t, db, dbName, []time.Time{h1, h2})
+
+	resolver, err := metadata.NewResolver(db, 1)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	res, err := VerifyRecoverInputs(context.Background(), RecoverInputsConfig{
+		IndexDB:     db,
+		Resolver:    resolver,
+		IndexDBName: dbName,
+		ArchiveFetcher: func(context.Context, query.Options, string) ([]query.ResultRow, error) {
+			return nil, nil
+		},
+		// A window the live partitions fully cover, over a table with no
+		// events: the walk classifies it no-activity.
+		Since: h1,
+		Until: now,
+	}, dbName, "orders")
+	if err != nil {
+		t.Fatalf("VerifyRecoverInputs: %v", err)
+	}
+	if res.Status != StatusInconclusive {
+		t.Fatalf("an empty covered window is inconclusive, got %s (%s)", res.Status, res.Detail)
+	}
+	if res.InconclusiveKind != InconclusiveNoActivity {
+		t.Errorf("TableResult.InconclusiveKind = %q, want %q — the walk classified it and the "+
+			"copy onto the result was lost, so every summary downstream counts this quiet table "+
+			"as attention-worthy", res.InconclusiveKind, InconclusiveNoActivity)
+	}
+}

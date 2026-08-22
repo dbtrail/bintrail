@@ -111,6 +111,10 @@ type TableReport struct {
 	// nil-image/unresolved-TOAST/unknown-type finding. All are legitimately
 	// unverifiable rather than divergent.
 	ChainsInconclusive int `json:"chains_inconclusive,omitempty"`
+	// InconclusiveKind subdivides an inconclusive verdict (#1416): no-activity
+	// | nothing-to-assert | unproven. Empty on other statuses and on modes
+	// that do not classify.
+	InconclusiveKind string `json:"inconclusive_kind,omitempty"`
 }
 
 // Summary is the run's per-status counts. The console's VerifySummary mirrors
@@ -120,16 +124,32 @@ type Summary struct {
 	Match        int `json:"match"`
 	Mismatch     int `json:"mismatch"`
 	Inconclusive int `json:"inconclusive"`
-	Error        int `json:"error"`
-	Total        int `json:"total"`
+	// InconclusiveNothingToCheck is the benign slice of Inconclusive — tables
+	// with no activity or an append-only shape, where zero assertions is the
+	// expected and permanent outcome (#1416). Always <= Inconclusive; the
+	// difference is the slice that deserves attention. A subdivision, not a
+	// fifth bucket: Total still sums the four statuses.
+	InconclusiveNothingToCheck int `json:"inconclusive_nothing_to_check"`
+	Error                      int `json:"error"`
+	Total                      int `json:"total"`
 }
 
 // Count files one table's status under its summary bucket and bumps Total.
 // The status is normalized first, so an unrecognized value lands in Error —
 // every summary, CLI or console, applies the default-to-failure rule from the
 // one place that owns it (NormalizeStatus) instead of re-deciding it locally.
-func (s *Summary) Count(status Status) {
+func (s *Summary) Count(status Status) { s.CountWithKind(status, "") }
+
+// CountWithKind is Count carrying the inconclusive subdivision (#1416). The
+// kind only matters for StatusInconclusive and only when it is one of the two
+// benign values; anything else — including empty, the unclassified case —
+// counts as attention-worthy, because defaulting the unknown to benign is the
+// direction a verify tool must never round.
+func (s *Summary) CountWithKind(status Status, kind string) {
 	normalized, _ := NormalizeStatus(status, "")
+	if normalized == StatusInconclusive && InconclusiveKindBenign(kind) {
+		s.InconclusiveNothingToCheck++
+	}
 	switch normalized {
 	case StatusMatch:
 		s.Match++
@@ -197,7 +217,7 @@ func NewReport(mode string, results []TableResult) *Report {
 	rep := &Report{Mode: mode, Tables: make([]TableReport, 0, len(sorted))}
 	for _, r := range sorted {
 		status, reason := NormalizeStatus(r.Status, r.Detail)
-		rep.Summary.Count(status)
+		rep.Summary.CountWithKind(status, r.InconclusiveKind)
 		rep.Tables = append(rep.Tables, TableReport{
 			Schema:            r.Schema,
 			Table:             r.Table,
@@ -212,6 +232,7 @@ func NewReport(mode string, results []TableResult) *Report {
 			EventsChecked:      r.EventsChecked,
 			ChainsChecked:      r.ChainsChecked,
 			ChainsInconclusive: r.ChainsInconclusive,
+			InconclusiveKind:   r.InconclusiveKind,
 		})
 	}
 	rep.Verdict = verdictOf(rep.Summary)
@@ -276,6 +297,14 @@ func (r *Report) ExitError() error {
 	case VerdictError:
 		return fmt.Errorf("%d table(s) could not be verified due to errors", r.Summary.Error)
 	case VerdictUnproven:
+		// The exit stays non-zero even when every inconclusive is benign: the
+		// operator asked this run to prove recover inputs and it proved none,
+		// which a CI gate must not read as success. The message carries the
+		// split so a human reading the failure knows whether anything was
+		// actually wrong.
+		if n := r.Summary.InconclusiveNothingToCheck; n > 0 {
+			return fmt.Errorf("no tables were verified (%d inconclusive, of which %d had nothing to check — quiet or append-only); nothing proven", r.Summary.Inconclusive, n)
+		}
 		return fmt.Errorf("no tables were verified (%d inconclusive); nothing proven", r.Summary.Inconclusive)
 	}
 	return nil

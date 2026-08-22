@@ -1758,6 +1758,11 @@ button { font-family: inherit; }
 .doctor-card.pass { border-color: var(--insert); }
 .doctor-card.fail { border-color: var(--delete); }
 .doctor-card.warn { border-color: var(--ochre); }
+/* "note" is the benign-inconclusive treatment (#1416): a table with nothing
+   to check is stated, not warned about. Neutral border, muted mark — visually
+   quieter than pass, never amber. */
+.doctor-card.note { border-color: var(--line); }
+.doctor-card.note .dc-mark { color: var(--ink-4); }
 .dc-mark { font-family: var(--f-mono); font-weight: 700; line-height: 1.4; flex: none; }
 .doctor-card.pass .dc-mark { color: var(--insert); }
 .doctor-card.fail .dc-mark { color: var(--delete); }

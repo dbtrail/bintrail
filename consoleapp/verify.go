@@ -791,7 +791,8 @@ func toWireResult(res verify.TableResult, explainable bool) console.VerifyTableR
 	return console.VerifyTableResult{
 		Schema: res.Schema, Table: res.Table, Status: string(status),
 		Reason: reason, Detail: reason,
-		SourceRows: res.SourceRows, ReconstructRows: res.ReconstructRows, Anchor: res.Anchor,
+		InconclusiveKind: res.InconclusiveKind,
+		SourceRows:       res.SourceRows, ReconstructRows: res.ReconstructRows, Anchor: res.Anchor,
 		Explainable: explainable,
 	}
 }
@@ -812,7 +813,7 @@ func (s *verifySupervisor) appendResult(serverID string, tr console.VerifyTableR
 	// The round-trip struct conversion is the drift guard: it stops compiling
 	// the moment console.VerifySummary and verify.Summary diverge.
 	sum := verify.Summary(j.status.Summary)
-	sum.Count(verify.Status(tr.Status))
+	sum.CountWithKind(verify.Status(tr.Status), tr.InconclusiveKind)
 	j.status.Summary = console.VerifySummary(sum)
 }
 

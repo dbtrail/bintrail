@@ -712,6 +712,17 @@ func writeVerifyText(out io.Writer, rep *verify.Report) {
 			r.Schema, r.Table, r.Status, r.SourceRows, r.ReconstructRows, r.Reason)
 	}
 	w.Flush()
+	// The inconclusive split (#1416): "20 inconclusive" was unreadable when
+	// 18 of them were quiet or append-only tables where zero assertions is
+	// the expected outcome. The parenthetical names the slice that deserves
+	// attention — and it is the REMAINDER, so an unclassified inconclusive
+	// (content modes, older producers) lands on the attention side.
+	if n := rep.Summary.InconclusiveNothingToCheck; n > 0 {
+		fmt.Fprintf(out, "\n%d match, %d mismatch, %d inconclusive (%d nothing to check — quiet or append-only; %d unproven), %d error\n",
+			rep.Summary.Match, rep.Summary.Mismatch, rep.Summary.Inconclusive,
+			n, rep.Summary.Inconclusive-n, rep.Summary.Error)
+		return
+	}
 	fmt.Fprintf(out, "\n%d match, %d mismatch, %d inconclusive, %d error\n",
 		rep.Summary.Match, rep.Summary.Mismatch, rep.Summary.Inconclusive, rep.Summary.Error)
 }

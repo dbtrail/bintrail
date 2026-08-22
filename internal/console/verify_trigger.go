@@ -119,10 +119,13 @@ type VerifyTableResult struct {
 	Reason string `json:"reason,omitempty"`
 	// Detail is the legacy alias for Reason, kept for consumers of the
 	// original #677 wire shape. Always carries the same value as Reason.
-	Detail          string `json:"detail,omitempty"`
-	SourceRows      int64  `json:"source_rows,omitempty"`
-	ReconstructRows int64  `json:"reconstruct_rows,omitempty"`
-	Anchor          string `json:"anchor,omitempty"`
+	Detail string `json:"detail,omitempty"`
+	// InconclusiveKind subdivides an inconclusive verdict (#1416):
+	// no-activity | nothing-to-assert | unproven. Empty otherwise.
+	InconclusiveKind string `json:"inconclusive_kind,omitempty"`
+	SourceRows       int64  `json:"source_rows,omitempty"`
+	ReconstructRows  int64  `json:"reconstruct_rows,omitempty"`
+	Anchor           string `json:"anchor,omitempty"`
 	// Explainable is true only for a baseline-anchored mismatch whose pair is
 	// still cached from the run that produced this result — the precondition
 	// for calling Explain on it.
@@ -144,7 +147,11 @@ type VerifySummary struct {
 	Match        int `json:"match"`
 	Mismatch     int `json:"mismatch"`
 	Inconclusive int `json:"inconclusive"`
-	Error        int `json:"error"`
+	// InconclusiveNothingToCheck mirrors verify.Summary's benign slice of
+	// Inconclusive (#1416): quiet or append-only tables where zero assertions
+	// is the expected outcome. Always <= Inconclusive.
+	InconclusiveNothingToCheck int `json:"inconclusive_nothing_to_check"`
+	Error                      int `json:"error"`
 	// Total is the number of results tallied — the same `total` the CLI's
 	// `verify --format json` summary carries.
 	Total int `json:"total"`

@@ -4186,7 +4186,48 @@ async function pollVerify(id, onTick) {
 }
 
 const VFY_STATUS_CLASS = { match: "pass", mismatch: "fail", error: "fail", inconclusive: "warn" };
-const VFY_STATUS_MARK = { pass: "✓", fail: "✗", warn: "!" };
+
+// The benign inconclusive kinds (#1416): quiet or append-only tables, where
+// zero assertions is the expected and PERMANENT outcome — not a finding. They
+// render neutral, never amber: 20 warning-coloured rows on a healthy server is
+// how operators learn to stop reading this page. The mapping is by KIND, not by
+// status — an inconclusive with no kind (content modes, older runs) stays
+// amber, because defaulting the unknown to benign is the direction a verify
+// surface must never round.
+const VFY_BENIGN_KINDS = { "no-activity": true, "nothing-to-assert": true };
+function vfyCardClass(r) {
+  if (r.status === "inconclusive" && VFY_BENIGN_KINDS[r.inconclusive_kind]) return "note";
+  return VFY_STATUS_CLASS[r.status] || "fail";
+}
+const VFY_STATUS_MARK = { pass: "✓", fail: "✗", warn: "!", note: "–" };
+// vfySummaryText renders the summary counts, splitting the inconclusive
+// bucket when the split exists (#1416): "20 inconclusive" was unreadable when
+// 18 were quiet or append-only tables. The attention-worthy number is the
+// REMAINDER, so an unclassified inconclusive lands on the attention side.
+function vfySummaryText(s) {
+  let inc = s.inconclusive + " inconclusive";
+  if (s.inconclusive_nothing_to_check > 0) {
+    inc = s.inconclusive + " inconclusive (" + s.inconclusive_nothing_to_check
+      + " nothing to check · " + (s.inconclusive - s.inconclusive_nothing_to_check) + " unproven)";
+  }
+  return s.match + " match · " + s.mismatch + " mismatch · " + inc + " · " + s.error + " error";
+}
+
+// vfyVerdictSentence answers "is my restore sound?" in words. It never claims
+// more than was proven: benign inconclusives are named as not-applicable, and
+// any unproven remainder is called out rather than absorbed.
+function vfyVerdictSentence(s) {
+  const unproven = s.inconclusive - (s.inconclusive_nothing_to_check || 0);
+  if (s.mismatch > 0) return s.mismatch + " table(s) failed verification — read those rows first.";
+  if (s.error > 0) return s.error + " table(s) could not be verified due to errors.";
+  const parts = [];
+  if (s.match > 0) parts.push(s.match + " table(s) verified clean");
+  if (s.inconclusive_nothing_to_check > 0) parts.push(s.inconclusive_nothing_to_check + " had nothing to check (no activity in the window, or append-only — expected)");
+  if (unproven > 0) parts.push(unproven + " had content that could not be proven — worth a look");
+  if (!parts.length) return "Nothing was verified.";
+  return parts.join("; ") + ".";
+}
+
 const VFY_MODE_LABEL = { "baseline-anchored": "compared two saved snapshots", "live-source": "compared against the live database", "recover-inputs": "checked recovery inputs in the index" };
 
 // loadVerifyHistory renders the persisted run history into box: a "last
@@ -4248,10 +4289,15 @@ function renderVerifyResults(container, status, id) {
   if (status.mode) summaryRow.append(el("span", { class: "stg-age", text: VFY_MODE_LABEL[status.mode] || status.mode }));
   const s = status.summary || {};
   if (status.results && status.results.length) {
-    summaryRow.append(el("span", { class: "stg-age", text:
-      s.match + " match · " + s.mismatch + " mismatch · " + s.inconclusive + " inconclusive · " + s.error + " error" }));
+    summaryRow.append(el("span", { class: "stg-age", text: vfySummaryText(s) }));
   }
   container.append(summaryRow);
+  // The verdict sentence (#1416): the answer to the operator's question in
+  // words, so it does not have to be derived from 28 rows. Only on a FINISHED
+  // run — a partial tally must not be read as a verdict (#1420).
+  if (status.state === "succeeded") {
+    container.append(el("p", { class: "form-hint", text: vfyVerdictSentence(s) }));
+  }
   if (status.note) container.append(el("p", { class: "form-hint", text: status.note }));
   if (status.last_error) container.append(el("p", { class: "form-msg err", text: status.last_error }));
 
@@ -4259,7 +4305,7 @@ function renderVerifyResults(container, status, id) {
   (status.results || []).forEach((r) => {
     // Statuses are normalized server-side (verify.NormalizeStatus), so only
     // the four keys above can arrive; if that ever breaks, fail — never reassure.
-    const cls = VFY_STATUS_CLASS[r.status] || "fail";
+    const cls = vfyCardClass(r);
     const card = el("div", { class: "doctor-card " + cls });
     card.append(el("span", { class: "dc-mark", text: VFY_STATUS_MARK[cls] || "?" }));
     const body = el("div", { class: "dc-body" },

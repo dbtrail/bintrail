@@ -176,6 +176,7 @@ func VerifyRecoverInputs(ctx context.Context, cfg RecoverInputsConfig, schema, t
 
 	res.Status = out.Status
 	res.Detail = out.Detail
+	res.InconclusiveKind = out.InconclusiveKind
 	res.EventsChecked = out.Events
 	res.ChainsChecked = out.Chains
 	res.ChainsInconclusive = out.ChainsNoPredecessor
@@ -385,6 +386,11 @@ type recoverChainOutcome struct {
 	// see the PKValues=="" guard in checkRecoverChains). They belong to no
 	// chain and are counted as unproven, never folded together.
 	UnwalkableEvents int
+	// InconclusiveKind subdivides StatusInconclusive (#1416). One bucket was
+	// carrying three meanings and rendering them identically, so a healthy
+	// run over a server full of append-only tables read as a page of
+	// warnings. Empty unless Status is StatusInconclusive.
+	InconclusiveKind string
 }
 
 // chainState is one PK's reconstructed state between events.
@@ -545,7 +551,7 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 	// rows must not report events "checked" that were never walked.
 	out.Events = len(in.Events) - out.UnwalkableEvents
 	out.ChainsNoPredecessor = len(noPredecessor)
-	out.Status, out.Detail = recoverChainVerdict(out, mismatchCount, firstMismatch, unresolved, firstUnresolved, in.Truncated)
+	out.Status, out.Detail, out.InconclusiveKind = recoverChainVerdict(out, mismatchCount, firstMismatch, unresolved, firstUnresolved, in.Truncated)
 	return out
 }
 
@@ -566,7 +572,7 @@ func checkRecoverChains(in recoverChainInput) recoverChainOutcome {
 // Truncation is the one exception that still collapses the table: there the
 // unchecked part is not a handful of values but the entire TAIL of the window,
 // which was never loaded at all.
-func recoverChainVerdict(out recoverChainOutcome, mismatchCount int, firstMismatch string, unresolved int, firstUnresolved string, truncated bool) (Status, string) {
+func recoverChainVerdict(out recoverChainOutcome, mismatchCount int, firstMismatch string, unresolved int, firstUnresolved string, truncated bool) (Status, string, string) {
 	scope := fmt.Sprintf("%d event(s), %d chain(s), %d before-image assertion(s)", out.Events, out.Chains, out.Assertions)
 
 	// A mismatch is conclusive regardless of what else could not be checked:
@@ -576,10 +582,12 @@ func recoverChainVerdict(out recoverChainOutcome, mismatchCount int, firstMismat
 		if mismatchCount > 1 {
 			detail += fmt.Sprintf(" (and %d more)", mismatchCount-1)
 		}
-		return StatusMismatch, detail
+		return StatusMismatch, detail, ""
 	}
 	if truncated {
-		return StatusInconclusive, fmt.Sprintf("checked %s with no inconsistency, but the window exceeded the event budget and only its oldest events were walked; narrow --since/--lookback or raise --max-events to verify it whole", scope)
+		// Truncation is category-"unproven" by definition: the whole tail of
+		// the window held assertable content that was never loaded.
+		return StatusInconclusive, fmt.Sprintf("checked %s with no inconsistency, but the window exceeded the event budget and only its oldest events were walked; narrow --since/--lookback or raise --max-events to verify it whole", scope), InconclusiveUnproven
 	}
 
 	var notes []string
@@ -594,17 +602,48 @@ func recoverChainVerdict(out recoverChainOutcome, mismatchCount int, firstMismat
 	}
 
 	if out.Assertions == 0 {
-		detail := fmt.Sprintf("walked %s: nothing was proven — no before-image comparison in this window was conclusive", scope)
-		if len(notes) > 0 {
-			detail += "; " + strings.Join(notes, "; ")
+		// Three shapes used to share one sentence here, and the first two are
+		// the ordinary state of a healthy server, not findings (#1416). The
+		// wording is written from the operator's question ("is my restore
+		// sound?"), not from the walk's internals — but none of them renders
+		// as a match: a table with nothing to assert must never read as "its
+		// before-images were checked", because nobody looked.
+		switch {
+		case out.Events == 0 && out.UnwalkableEvents == 0:
+			// The UnwalkableEvents guard is load-bearing: Events counts what
+			// the walk VISITED, so a table of nothing but drift rows also has
+			// Events==0 — and "no changes in the window" would be false there.
+			// Existing tests caught exactly that misclassification.
+			return StatusInconclusive, "no changes to this table in the window — nothing to check", InconclusiveNoActivity
+		case out.Events == out.Chains && out.ChainsNoPredecessor == 0 && unresolved == 0 && out.UnwalkableEvents == 0:
+			// Every chain is a single INSERT: true append-only. Zero
+			// assertions is the only possible outcome for this shape, in
+			// every window, forever — a fact about the table, not a gap in
+			// the run.
+			//
+			// The ChainsNoPredecessor == 0 condition is what keeps this
+			// honest, and the first draft lacked it: a single mid-history
+			// UPDATE or DELETE also makes events == chains, but that row HAS
+			// prior history the window cannot see — widen the lookback and
+			// it becomes assertable. Calling that "does not apply" would
+			// over-claim benignity; it belongs below, with the hint.
+			return StatusInconclusive, fmt.Sprintf("%d change(s), each a row's only change and all inserts (append-only shape) — consecutive-change cross-checks do not apply here", out.Events), InconclusiveNothingToAssert
+		default:
+			detail := fmt.Sprintf("walked %s: nothing was proven — the window held changes that could not be cross-checked", scope)
+			if len(notes) > 0 {
+				detail += "; " + strings.Join(notes, "; ")
+			}
+			if out.ChainsNoPredecessor > 0 {
+				detail += "; widening --lookback/--since can give mid-history chains their predecessors"
+			}
+			return StatusInconclusive, detail, InconclusiveUnproven
 		}
-		return StatusInconclusive, detail
 	}
 	detail := fmt.Sprintf("checked %s", scope)
 	if len(notes) > 0 {
 		detail += "; " + strings.Join(notes, "; ")
 	}
-	return StatusMatch, detail
+	return StatusMatch, detail, ""
 }
 
 // emptyImagePairMarker is compareImages' out-of-band signal that BOTH images
