@@ -1044,7 +1044,7 @@ function covCard(c, stamp) {
   chips.append(el("span", { class: "cov-chip" + (bad ? " bad" : warn ? " warn" : cont === "ok" ? " ok" : ""), text: "continuity " + cont }));
   card.append(chips);
   if (cont === "gap_lost") {
-    card.append(el("p", { class: "cov-line bad", text: "Events were lost for good: the window has a hole, and points past it need a fresh baseline." }));
+    card.append(el("p", { class: "cov-line bad", text: "Events were lost for good: the window has a hole, and points past it need a fresh backup." }));
   } else if (cont === "unavailable") {
     card.append(el("p", { class: "cov-line bad", text: "Continuity could not be read. Treat the window as unverified." }));
   } else if (warn) {
@@ -1071,11 +1071,11 @@ function covCard(c, stamp) {
     }
     if (c.full_table_from) {
       card.append(el("p", { class: "cov-line" },
-        "Full-table restore for tables with a baseline: any point from ",
+        "Full-table restore for tables with a backup: any point from ",
         el("b", { text: c.full_table_from, title: utcLocalTitle(c.full_table_from) || null }), " onwards."));
     }
     if (c.broken_tables && c.broken_tables.length) {
-      card.append(el("p", { class: "cov-line bad", text: "Not fully restorable (newest baseline predates coverage): " + c.broken_tables.join(", ") + ". Take a fresh baseline." }));
+      card.append(el("p", { class: "cov-line bad", text: "Not fully restorable (newest backup predates coverage): " + c.broken_tables.join(", ") + ". Take a fresh backup." }));
     }
   }
   return card;
@@ -2737,7 +2737,7 @@ function stateSection(form) {
 
   if (!capsCache.reconstruct) {
     wrap.append(el("p", { class: "state-note", text:
-      "Configure a baseline for this server to see a row's earlier state here. Undo SQL below works without one; it reverses recorded changes, so it cannot show a row nothing has touched." }));
+      "Configure a backup for this server to see a row's earlier state here. Undo SQL below works without one; it reverses recorded changes, so it cannot show a row nothing has touched." }));
     return wrap;
   }
 
@@ -3023,7 +3023,7 @@ async function runReconstruct(form, history) {
 function reconstructMeta(data, label) {
   return el("div", { class: "meta-line" },
     el("b", { text: data.schema + "." + data.table + " pk=" + data.pk }),
-    " · " + label + " · baseline " + data.baseline_time + " · " + data.event_count + " event(s)",
+    " · " + label + " · backup " + data.baseline_time + " · " + data.event_count + " event(s)",
     tzChip());
 }
 
@@ -3230,8 +3230,8 @@ function continuityBox(stream, pg) {
     const lost = el("div", { class: "error-box" });
     lost.append(el("b", { text: "⚠ Events permanently lost" }));
     lost.append(el("div", { text: stream.gap_lost.detail ||
-      (pg ? "The replication slot PostgreSQL was using got invalidated. To keep capturing changes, create a new baseline and start over."
-          : "A gap in the binlog can't be filled; some history is permanently missing. To keep capturing changes, create a new baseline and start over.") }));
+      (pg ? "The replication slot PostgreSQL was using got invalidated. To keep capturing changes, create a new backup and start over."
+          : "A gap in the binlog can't be filled; some history is permanently missing. To keep capturing changes, create a new backup and start over.") }));
     lost.append(el("div", { text: "Detected: " + utcLabel(stream.gap_lost.at) }));
     return lost;
   }
@@ -3614,6 +3614,14 @@ async function renderBaselines() {
     api("/api/baselines").catch(asErr),
   ]);
   if (gen !== serverGen || vgen !== viewGen) return;
+  // Run states for the selected server: only the endpoints this daemon
+  // actually serves (each 403s when its feature is off).
+  const selId = currentServer || defaultServerId;
+  const [dumpSt, restoreSt] = await Promise.all([
+    (capsCache.baseline_trigger && selId) ? api("/api/servers/" + encodeURIComponent(selId) + "/baseline").catch(() => null) : null,
+    (capsCache.baseline_restore && selId) ? api("/api/servers/" + encodeURIComponent(selId) + "/baseline/restore").catch(() => null) : null,
+  ]);
+  if (gen !== serverGen || vgen !== viewGen) return;
   try {
     const servers = (serversRes && serversRes.servers) || [];
     // A failed /api/servers must be REPORTED, not absorbed into an empty list:
@@ -3622,8 +3630,8 @@ async function renderBaselines() {
     // button. buildStorage keeps serversErr for the same reason.
     const serversErr = serversRes && serversRes.error;
     const v = VIEW(); clear(v);
-    v.append(pageHead("Baselines", el("p", { class: "page-sub" },
-      "Full-table snapshots Time-travel and full restores are built from. ",
+    v.append(pageHead("Backups", el("p", { class: "page-sub" },
+      "Full copies of your tables, taken at a moment in time. Time-travel and full restores are built from them. ",
       el("b", { text: "Nothing is ever executed" }), " against your source by viewing this page.")));
     if (serversErr) v.append(el("div", { class: "error-box", text: "Could not load servers: " + serversErr }));
     // #1415: a context strip and a full-width list, not two half-width cards
@@ -3632,10 +3640,20 @@ async function renderBaselines() {
     // so the rows below can carry only what varies between snapshots.
     const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
     v.append(baselineContextStrip(baselines, cur));
+    // A visible in-progress region (mirrors the verification page): while a
+    // backup is being created or restored, the page must look like a page
+    // doing work, not a stale list.
+    const running = backupRunsInFlight(dumpSt, restoreSt, baselines);
+    if (running.length) {
+      v.append(backupRunRegion(running));
+      watchBackupRuns(cur && cur.id, vgen);
+    }
+    const restoreCard = backupRestoreCard(cur, baselines, restoreSt);
+    if (restoreCard) v.append(restoreCard);
     v.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
     viewEnter();
   } catch (err) {
-    const v = VIEW(); clear(v); v.append(pageHead("Baselines", null)); renderError(v, err);
+    const v = VIEW(); clear(v); v.append(pageHead("Backups", null)); renderError(v, err);
   }
 }
 
@@ -3727,7 +3745,7 @@ function duckdbCard() {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Query in DuckDB" }));
   card.append(el("p", { class: "form-hint", text:
     "Download a ready-made schema over your archived Parquet: an events view across every archive source, " +
-    "plus one view per table in the newest baseline snapshot. Run it in your own DuckDB; nothing runs here." }));
+    "plus one view per table in the newest backup. Run it in your own DuckDB; nothing runs here." }));
   card.append(el("p", { class: "form-hint", text:
     "No credentials are in the file: S3 access uses your AWS credential chain, so it is safe to share." }));
   const btn = el("button", { class: "btn btn-sm", type: "button", text: "Open in DuckDB…" });
@@ -3773,7 +3791,7 @@ async function renderSQL() {
   const card = el("div", { class: "card" });
   card.append(el("p", { class: "form-hint", text:
     "Run a read-only SQL query over this server's archived Parquet: an \"events\" view across every archive source, " +
-    "plus one \"state_<schema>_<table>\" view per table in the newest baseline. Only SELECT runs; results are capped." }));
+    "plus one \"state_<schema>_<table>\" view per table in the newest backup. Only SELECT runs; results are capped." }));
 
   const input = el("textarea", {
     class: "sql-input", id: "sql-input", spellcheck: "false", rows: "6",
@@ -3907,7 +3925,7 @@ async function setTelemetry(enabled) {
 // not. On the Baselines page itself the link would point at the current page,
 // so the caller omits it.
 function baselineSummaryCard(b, cur, opts) {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Baselines" }));
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Backups" }));
   // Appended at every exit, so the link is the card's FOOT rather than sitting
   // above an error message. Every branch returns through here.
   const done = () => {
@@ -3919,7 +3937,7 @@ function baselineSummaryCard(b, cur, opts) {
     return card;
   };
   if (!b || b.error) {
-    card.append(el("p", { class: "form-hint", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
+    card.append(el("p", { class: "form-hint", text: "Could not list backups: " + ((b && b.error) || "unavailable") }));
     return done();
   }
   if (!b.configured) {
@@ -3948,7 +3966,7 @@ function baselineConfigHint(cur, serversErr) {
   if (cur.kind === "ephemeral") {
     return "Restart the daemon with --baseline-dir or --baseline-s3 (compose: BASELINE_DIR in .env).";
   }
-  return "Set Baseline dir or S3 under Manage servers → Edit → Advanced.";
+  return "Set Backup dir or S3 under Manage servers → Edit → Advanced.";
 }
 
 function formatAge(hours) {
@@ -4037,7 +4055,7 @@ function baselineContextStrip(b, cur) {
     el("span", { class: "ctx-label", text: label }),
     typeof val === "string" ? el("span", { class: "ctx-value", text: val }) : val);
   if (!b || b.error) {
-    strip.append(item("BASELINES", "could not load: " + ((b && b.error) || "unavailable")));
+    strip.append(item("BACKUPS", "could not load: " + ((b && b.error) || "unavailable")));
     return strip;
   }
   if (!b.configured) {
@@ -4049,18 +4067,18 @@ function baselineContextStrip(b, cur) {
   // The source path is code, and it gets the width to render as one line —
   // the dark code-ink treatment the recipe reserves for SQL/DSNs/paths.
   strip.append(item("SOURCE", el("code", { class: "code-ink ctx-source", text: b.source }), "ctx-grow"));
-  strip.append(item("SNAPSHOTS", String(snaps.length) + (b.truncated ? "+" : "")));
+  strip.append(item("BACKUPS", String(snaps.length) + (b.truncated ? "+" : "")));
   if (snaps.length) {
     // One fact, one place: absolute and relative side by side, instead of the
     // same freshness spelled two ways 300px apart.
     strip.append(item("LATEST", snaps[0].time + " UTC · " + formatAge(snaps[0].age_hours) + " ago"));
   }
   const uniform = snapshotTablesUniform(snaps, b.truncated);
-  if (uniform !== null) strip.append(item("TABLES", uniform + " per snapshot"));
+  if (uniform !== null) strip.append(item("TABLES", uniform + " per backup"));
   strip.append(item("TIME-TRAVEL", b.reconstruct ? "enabled" : "off (archives disabled)"));
   // The page's primary action, at page level — not a list-header costume.
   if (capsCache.baseline_trigger && cur && cur.id && b.configured) {
-    const btn = el("button", { class: "btn ctx-action", type: "button", text: "Create baseline" });
+    const btn = el("button", { class: "btn ctx-action", type: "button", text: "Create backup" });
     btn.onclick = () => createBaseline(cur.id, btn);
     strip.append(btn);
   }
@@ -4083,7 +4101,7 @@ function baselinesPanel(b, servers, opts) {
     owner = "daemon (--baseline-dir / --baseline-s3)";
   }
   const head = el("div", { class: "ov-panel-head" },
-    el("h2", { class: "ov-panel-title", text: "Baseline snapshots" + (owner ? " · " + owner : "") }),
+    el("h2", { class: "ov-panel-title", text: "Backups" + (owner ? " · " + owner : "") }),
     tzChip());
   panel.append(head);
   // The daemon's periodic refresh (#1171). Shown next to the list because the
@@ -4098,19 +4116,19 @@ function baselinesPanel(b, servers, opts) {
   if (b && !b.error && b.refresh) panel.append(baselineRefreshNote(b.refresh));
   const list = el("div", { class: "stg-list" });
   if (!b || b.error) {
-    list.append(el("div", { class: "ev-empty", text: "Could not list baselines: " + ((b && b.error) || "unavailable") }));
+    list.append(el("div", { class: "ev-empty", text: "Could not list backups: " + ((b && b.error) || "unavailable") }));
   } else if (!b.configured) {
     list.append(el("div", { class: "stg-empty" },
-      el("p", { class: "stg-empty-lead", text: "No baselines configured." }),
-      el("p", { class: "stg-empty-sub", text: "A baseline is a full copy of your table at one point in time. With one, Time-travel can show complete rows, not just the ones that changed lately." }),
+      el("p", { class: "stg-empty-lead", text: "No backups configured." }),
+      el("p", { class: "stg-empty-sub", text: "A backup is a full copy of your tables at one point in time. With one, Time-travel can show complete rows, not just the ones that changed lately." }),
       el("p", { class: "stg-empty-sub", text: "1. Create snapshots:" }),
       el("code", { class: "stg-code", text: "docker compose --profile baseline run --rm baseline" }),
       el("p", { class: "stg-empty-sub", text: "2. " + baselineConfigHint(cur, opts && opts.serversErr) })));
   } else if (!(b.snapshots || []).length) {
     list.append(el("div", { class: "stg-empty" },
-      el("p", { class: "stg-empty-lead", text: "Source configured, no snapshots found." }),
+      el("p", { class: "stg-empty-lead", text: "Source configured, no backups found." }),
       el("code", { class: "stg-code", text: b.source }),
-      el("p", { class: "stg-empty-sub", text: "Run bintrail dump and bintrail baseline to create your first snapshot. The path must point at the folder that contains the snapshots, not a specific file (<timestamp>/<schema>/<table>.parquet)." })));
+      el("p", { class: "stg-empty-sub", text: "Run bintrail dump and bintrail baseline to create your first backup. The path must point at the folder that contains the backups, not a specific file (<timestamp>/<schema>/<table>.parquet)." })));
   } else {
     // Panel headline: the newest-per-table rollup. Older snapshots being past
     // coverage is routine (superseded) — only the headline and the newest
@@ -4118,8 +4136,8 @@ function baselinesPanel(b, servers, opts) {
     if (b.staleness && b.staleness !== "ok") {
       list.append(el("div", { class: "vfy-summary" },
         el("span", { class: "chip chip-mon", text: b.staleness === "broken"
-          ? "⚠ BASELINE STALE: full-table restore broken; take a fresh baseline"
-          : "BASELINE " + b.staleness.toUpperCase() })));
+          ? "⚠ BACKUP STALE: full-table restore broken; take a fresh backup"
+          : "BACKUP " + b.staleness.toUpperCase() })));
     }
     // Row hierarchy (#1415): the newest snapshot is what Time-travel and a
     // restore actually use — it gets the treatment; the rest are history and
@@ -4140,9 +4158,24 @@ function baselinesPanel(b, servers, opts) {
         row.append(el("span", { class: "chip chip-mon", text:
           sn.staleness === "broken" ? "⚠ STALE: restore broken" : sn.staleness.toUpperCase() }));
       }
-      list.append(row);
+      // Click to expand: tables, sizes and how long the backup took. Loaded
+      // once per row, on first open.
+      const detail = el("div", { class: "bk-detail" });
+      detail.hidden = true;
+      row.classList.add("bk-expandable");
+      row.setAttribute("role", "button");
+      row.setAttribute("aria-expanded", "false");
+      row.onclick = () => {
+        detail.hidden = !detail.hidden;
+        row.setAttribute("aria-expanded", detail.hidden ? "false" : "true");
+        if (!detail.hidden && !detail.dataset.loaded) {
+          detail.dataset.loaded = "1";
+          loadBackupDetail(sn.time, detail);
+        }
+      };
+      list.append(row, detail);
     });
-    if (b.truncated) list.append(el("div", { class: "ev-empty", text: "…older snapshots not shown." }));
+    if (b.truncated) list.append(el("div", { class: "ev-empty", text: "…older backups not shown." }));
   }
   panel.append(list);
   return panel;
@@ -4153,24 +4186,25 @@ function baselinesPanel(b, servers, opts) {
 // Storage view so the new snapshot appears. The button is disabled while in flight.
 async function createBaseline(id, btn) {
   if (btn) { btn.disabled = true; btn.textContent = "Creating…"; }
-  const restore = () => { if (btn) { btn.disabled = false; btn.textContent = "Create baseline"; } };
+  const restore = () => { if (btn) { btn.disabled = false; btn.textContent = "Create backup"; } };
   try {
     await api("/api/servers/" + encodeURIComponent(id) + "/baseline", { method: "POST", body: {} });
   } catch (err) {
-    toastError("Baseline failed: " + ((err && err.message) || err));
+    toastError("Backup failed: " + ((err && err.message) || err));
     restore();
     return;
   }
-  toast("Baseline started: copying your data and uploading it…");
+  toast("Backup started: copying your data and uploading it…");
+  if (location.pathname === "/baselines") renderBaselines();
   const done = await pollBaseline(id);
   restore();
   if (done && done.state === "succeeded") {
-    toast("Baseline complete: " + (done.tables || 0) + " table(s)" +
+    toast("Backup complete: " + (done.tables || 0) + " table(s)" +
       (done.uploaded ? ", " + done.uploaded + " file(s) uploaded" : ""));
   } else if (done) {
-    toastError("Baseline failed: " + (done.last_error || "unknown error"));
+    toastError("Backup failed: " + (done.last_error || "unknown error"));
   } else {
-    toast("The baseline is still running. Check back shortly.");
+    toast("The backup is still running. Check back shortly.");
   }
   // Only /baselines needs the refresh: the button lives in
   // baselineContextStrip (#1415 moved it out of baselinesPanel), and both the
@@ -4195,6 +4229,200 @@ async function pollBaseline(id) {
     if (st && st.state !== "running") return st;
   }
   return null;
+}
+
+// ── Backups: per-row detail, download, point-in-time restore (#backups) ──
+
+// fmtSeconds renders a duration in the shortest honest unit.
+function fmtSeconds(sec) {
+  if (sec < 90) return Math.round(sec) + "s";
+  if (sec < 5400) return Math.floor(sec / 60) + "m " + Math.round(sec % 60) + "s";
+  return Math.floor(sec / 3600) + "h " + Math.round((sec % 3600) / 60) + "m";
+}
+
+const BACKUP_KIND_LABEL = { dump: "full copy of the source", refresh: "automatic refresh", restore: "point-in-time restore" };
+
+// loadBackupDetail fills a row's expansion: tables with sizes, total weight,
+// and duration. The recorded run (this daemon performed it) gives the exact
+// duration; otherwise the file timestamps bound it, labeled as such.
+async function loadBackupDetail(at, box) {
+  box.textContent = "Loading…";
+  let d;
+  try {
+    d = await api("/api/baselines/files?at=" + encodeURIComponent(at));
+  } catch (err) {
+    box.textContent = "Could not load the backup detail: " + ((err && err.message) || err);
+    return;
+  }
+  clear(box);
+  const facts = el("div", { class: "bk-facts" });
+  facts.append(el("span", { class: "stg-dest", text: humanBytes(d.total_bytes || 0) + " in " + (d.files || 0) + " file(s)" }));
+  if (d.run && d.run.seconds > 0) {
+    facts.append(el("span", { class: "stg-dest", text:
+      "took " + fmtSeconds(d.run.seconds) + " (" + (BACKUP_KIND_LABEL[d.run.kind] || d.run.kind) +
+      (d.run.rows ? ", " + Number(d.run.rows).toLocaleString("en-US") + " rows" : "") + ")" }));
+  } else if (d.write_span_seconds > 0) {
+    facts.append(el("span", { class: "stg-dest", text:
+      "files written over about " + fmtSeconds(d.write_span_seconds) + " (from file timestamps; the real run took longer)" }));
+  }
+  const dl = el("button", { class: "btn", type: "button", text: "Download (.tar.gz)" });
+  dl.onclick = (ev) => { ev.stopPropagation(); downloadBackup(at, dl); };
+  facts.append(dl);
+  box.append(facts);
+  if (d.incomplete) box.append(el("p", { class: "form-msg err", text: "This backup is marked incomplete (a failed or unfinished run); it cannot be downloaded or restored from." }));
+  const tbl = el("table", { class: "bk-table" });
+  tbl.append(el("thead", {}, el("tr", {}, el("th", { text: "Table" }), el("th", { text: "Size" }))));
+  const tb = el("tbody");
+  (d.tables || []).forEach((t) => tb.append(el("tr", {},
+    el("td", { class: "mono", text: t.schema + "." + t.table }),
+    el("td", { text: humanBytes(t.size_bytes || 0) }))));
+  tbl.append(tb);
+  box.append(tbl);
+}
+
+// downloadBackup streams the whole snapshot as one tar.gz. Fetch + blob
+// because the API authenticates via header; a plain link would arrive
+// tokenless on token-auth consoles.
+async function downloadBackup(at, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Preparing…"; }
+  try {
+    const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
+    if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+    const res = await fetch("/api/baselines/download?at=" + encodeURIComponent(at), { headers });
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { msg = (await res.json()).error || msg; } catch (_) { /* non-JSON error body */ }
+      throw new Error(msg);
+    }
+    const cd = res.headers.get("Content-Disposition") || "";
+    const m = /filename="([^"]+)"/.exec(cd);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = m ? m[1] : "dbtrail-backup.tar.gz";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    toastError("Download failed: " + ((err && err.message) || err));
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Download (.tar.gz)"; }
+  }
+}
+
+// backupRunsInFlight collects what is running right now, for the region.
+function backupRunsInFlight(dumpSt, restoreSt, b) {
+  const running = [];
+  const dump = dumpSt && dumpSt.baseline;
+  if (dump && dump.state === "running") {
+    running.push({ text: "Creating a backup: copying your data" + (dump.since ? ", since " + utcLabel(dump.since) : "") + "…" });
+  }
+  const rst = restoreSt && restoreSt.restore;
+  if (rst && rst.state === "running") {
+    running.push({ text: "Restoring to " + (rst.at ? utcLabel(rst.at) : "the chosen moment") + ": building a new backup…" });
+  }
+  const rf = b && !b.error && b.refresh;
+  if (rf && rf.state === "running") {
+    running.push({ text: "Automatic refresh running" + (rf.since ? " since " + utcLabel(rf.since) : "") + "…" });
+  }
+  return running;
+}
+
+// backupRunRegion mirrors the verification page's in-progress treatment:
+// a live chip, what is happening in words, and the motion strip.
+function backupRunRegion(running) {
+  const card = el("section", { class: "tcard vfy-region bk-run" });
+  running.forEach((r) => {
+    card.append(el("div", { class: "vfy-summary" },
+      el("span", { class: "chip chip-live", text: "RUNNING" }),
+      el("span", { class: "stg-age", text: r.text })));
+  });
+  card.append(el("div", { class: "vfy-progress" }, el("span", { class: "vfy-progress-bar" })));
+  return card;
+}
+
+// watchBackupRuns re-renders the page when the in-flight run settles, so the
+// region clears and the new backup appears without a manual reload.
+async function watchBackupRuns(id, vgen) {
+  if (!id) return;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 900; i++) {
+    await sleep(2000);
+    if (vgen !== viewGen || location.pathname !== "/baselines") return;
+    let busy = false;
+    if (capsCache.baseline_trigger) {
+      try {
+        const st = await api("/api/servers/" + encodeURIComponent(id) + "/baseline");
+        if (st.baseline && st.baseline.state === "running") busy = true;
+      } catch (_) { /* transient poll error: keep watching */ }
+    }
+    if (capsCache.baseline_restore) {
+      try {
+        const st = await api("/api/servers/" + encodeURIComponent(id) + "/baseline/restore");
+        if (st.restore && st.restore.state === "running") busy = true;
+      } catch (_) { /* transient poll error: keep watching */ }
+    }
+    if (!busy) {
+      if (vgen === viewGen && location.pathname === "/baselines") renderBaselines();
+      return;
+    }
+  }
+}
+
+// backupRestoreCard offers the point-in-time restore: pick a past moment, get
+// a NEW backup showing every table as it was then. Collapsed by default; the
+// last restore's outcome renders inside so a failure is not toast-only.
+function backupRestoreCard(cur, b, restoreSt) {
+  if (!capsCache.baseline_restore || !cur || !cur.id) return null;
+  // The server needs its OWN local backup directory: the daemon-wide one is a
+  // shared store the endpoint refuses (the fold would mix servers).
+  if (!cur.baseline_dir) return null;
+  if (!b || b.error || !b.configured || b.kind !== "dir") return null;
+  if (!(b.snapshots || []).length) return null;
+  const rst = restoreSt && restoreSt.restore;
+  if (rst && rst.state === "running") return null; // the run region owns it
+  const details = el("details", { class: "form-advanced bk-restore" },
+    el("summary", { class: "form-adv-summary", text: "Restore to a moment (builds a new backup)" }));
+  const body = el("div", { class: "bk-restore-body" });
+  body.append(el("p", { class: "form-hint", text:
+    "Pick a past moment. The console rebuilds every table as it was then, from your backups plus the recorded changes, and saves the result as a new backup in the list below. Your database is not touched." }));
+  const input = el("input", { class: "in", type: "text", spellcheck: "false",
+    placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
+  input.value = (b.snapshots[0] && b.snapshots[0].time) || "";
+  const go = el("button", { class: "btn", type: "button", text: "Restore" });
+  const msg = el("p", { class: "form-msg err" });
+  msg.hidden = true;
+  go.onclick = () => startBackupRestore(cur.id, input.value.trim(), go, msg);
+  body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
+  if (rst && rst.state === "failed") {
+    body.append(el("p", { class: "form-msg err", text:
+      "Last restore published nothing: " + (rst.last_error || "unknown error") + " Nothing was overwritten." }));
+    details.open = true;
+  } else if (rst && rst.state === "succeeded") {
+    body.append(el("p", { class: "form-hint", text:
+      "Last restore finished" + (rst.at ? ": the backup at " + utcLabel(rst.at) : "") + " is in the list below." }));
+  }
+  details.append(body);
+  return details;
+}
+
+async function startBackupRestore(id, at, btn, msgEl) {
+  msgEl.hidden = true;
+  if (!at) { msgEl.textContent = "Enter a UTC time, YYYY-MM-DD HH:MM:SS."; msgEl.hidden = false; return; }
+  btn.disabled = true;
+  try {
+    await api("/api/servers/" + encodeURIComponent(id) + "/baseline/restore", { method: "POST", body: { at: at } });
+  } catch (err) {
+    msgEl.textContent = (err && err.message) || String(err);
+    msgEl.hidden = false;
+    btn.disabled = false;
+    return;
+  }
+  btn.disabled = false;
+  toast("Restore started: building a backup as of " + at + " UTC…");
+  if (location.pathname === "/baselines") renderBaselines();
 }
 
 // verifyRegions (#677, restructured #1419): trigger/poll/explain the
@@ -4258,7 +4486,7 @@ function verifyRegions(servers, opts) {
   control.append(help);
   if (!configured) {
     control.append(el("p", { class: "form-hint", text:
-      "No baseline set up for this server yet. The two snapshot modes need one (Manage servers → Edit → Advanced, then create at least two snapshots). \"Check recovery inputs\" works without one: it only reads the index." }));
+      "No backup set up for this server yet. The two snapshot modes need one (Manage servers → Edit → Advanced, then create at least two snapshots). \"Check recovery inputs\" works without one: it only reads the index." }));
   }
 
   // ── Region 2: what is running or just ran ──
@@ -4689,7 +4917,7 @@ async function openVerifyExplain(id, schema, table, btn) {
     (ex.total === 1 ? "1 row differs" : ex.total + " rows differ") +
     "; checked against binlog position " + ex.anchor + "." }));
   head.append(el("p", { class: "modal-desc", text:
-    "Recovered = what replaying the change log on top of the older snapshot produced. Baseline (real) = the actual values from the newer, trusted snapshot." }));
+    "Recovered = what replaying the change log on top of the older snapshot produced. Backup (real) = the actual values from the newer, trusted snapshot." }));
   head.append(el("button", { class: "modal-x", type: "button", text: "✕", onclick: closeVerifyExplain }));
   modal.append(head);
 
@@ -4784,8 +5012,8 @@ const VFY_KIND_LABEL = {
 };
 const VFY_KIND_CLASS = { changed: "warn", missing: "fail", extra: "fail" };
 const VFY_KIND_NOTE = {
-  missing: "This row exists in the real baseline, but replaying the change log never reproduced it.",
-  extra: "Replaying the change log produced this row, but it isn't in the real baseline.",
+  missing: "This row exists in the real backup, but replaying the change log never reproduced it.",
+  extra: "Replaying the change log produced this row, but it isn't in the real backup.",
 };
 
 // verifyDiffCard renders one RowDiff, reusing the doctor-preflight card
@@ -4809,7 +5037,7 @@ function verifyDiffCard(d) {
 function verifyDiffCellsTable(cells) {
   const table = el("table", { class: "vfy-diff-table" });
   table.append(el("thead", {}, el("tr", {},
-    el("th", { text: "Column" }), el("th", { text: "Recovered" }), el("th", { text: "Baseline (real)" }))));
+    el("th", { text: "Column" }), el("th", { text: "Recovered" }), el("th", { text: "Backup (real)" }))));
   const tbody = el("tbody");
   cells.forEach((c) => tbody.append(el("tr", {},
     el("td", { text: c.column }),
@@ -5634,7 +5862,7 @@ function serverRow(s) {
     serverLabel(s));
   item.append(nm);
   if (s.kind === "ephemeral") item.append(el("span", { class: "chip chip-cli", text: "CLI", title: "Set from the command line with --index-dsn" }));
-  if (s.reconstruct) item.append(el("span", { class: "chip chip-tt", text: "TT", title: "Baseline configured: Time-travel available" }));
+  if (s.reconstruct) item.append(el("span", { class: "chip chip-tt", text: "TT", title: "Backup configured: Time-travel available" }));
   if (s.monitor_state) item.append(el("span", { class: "chip chip-mon", text: s.monitor_state.replace("_", " ").toUpperCase(), title: MON_STATE_TITLES[s.monitor_state] || ("monitoring " + s.monitor_state) }));
   if (s.flavor && s.flavor !== "mysql") item.append(el("span", { class: "chip", text: s.flavor === "postgres" ? "PG" : s.flavor.toUpperCase(), title: "Source type: " + s.flavor }));
 
@@ -5729,12 +5957,12 @@ function buildServerForm() {
   grantHint.append(el("code", { text: "REPLICATION SLAVE, REPLICATION CLIENT, SELECT" }));
   grantHint.append(" to capture, plus ");
   grantHint.append(el("code", { text: "LOCK TABLES" }));
-  grantHint.append(" if you want baselines. Create one on the source MySQL; copy and run:");
+  grantHint.append(" if you want backups. Create one on the source MySQL; copy and run:");
   mon.append(grantHint);
   mon.append(tagFlavor(el("pre", { class: "form-code", text:
     "CREATE USER 'dbtrail'@'%' IDENTIFIED BY 'strong-password';\n" +
     "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'dbtrail'@'%';\n" +
-    "-- Baselines only (point-consistent by default). On RDS/Aurora also set\n" +
+    "-- Backups only (point-consistent by default). On RDS/Aurora also set\n" +
     "-- BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=lock-all.\n" +
     "GRANT LOCK TABLES ON *.* TO 'dbtrail'@'%';" }), "mysql mariadb"));
   // PostgreSQL prerequisites — the console reads them, it never runs CREATE
@@ -5767,8 +5995,8 @@ function buildServerForm() {
   idxGrid.append(srvField("User", "user", { placeholder: "bintrail" }));
   idxGrid.append(srvField("Password", "password", { type: "password", autocomplete: "new-password" }));
   idxGrid.append(srvField("Index database", "dbname", { placeholder: "binlog_index" }));
-  idxGrid.append(srvField("Baseline dir", "baseline_dir", { placeholder: "(optional) enables Time-travel" }));
-  idxGrid.append(srvField("Baseline S3", "baseline_s3", { placeholder: "s3://bucket/prefix/" }));
+  idxGrid.append(srvField("Backup dir", "baseline_dir", { placeholder: "(optional) enables Time-travel" }));
+  idxGrid.append(srvField("Backup S3", "baseline_s3", { placeholder: "s3://bucket/prefix/" }));
   idx.append(idxGrid);
   idx.append(el("label", { class: "check", style: "margin-top:10px" },
     el("input", { type: "checkbox", name: "no_archive" }), el("span", { text: "Don't automatically include archived data in queries" })));
@@ -6003,7 +6231,7 @@ function cmdkCommands() {
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
   if (capsCache.sql) cmds.push({ group: "Navigate", label: "SQL", run: () => navigate("sql") });
-  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Baselines", run: () => navigate("baselines") });
+  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Backups", run: () => navigate("baselines") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Verification", run: () => navigate("verification") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Storage", run: () => navigate("storage") });
   cmds.push({ group: "Navigate", label: "Connect AI", run: () => navigate("connect") });

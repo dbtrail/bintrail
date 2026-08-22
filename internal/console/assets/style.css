@@ -1924,6 +1924,19 @@ button { font-family: inherit; }
   font-size: 13px;
 }
 .stg-row:last-child { border-bottom: none; }
+
+/* ── Backups: expandable rows, detail, restore card ── */
+.bk-expandable { cursor: pointer; }
+.bk-expandable:hover { background: var(--surface-2); }
+.bk-detail { padding: 6px 10px 12px 38px; border-bottom: 1px solid var(--line); }
+.bk-facts { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 4px 0 8px; }
+.bk-table { border-collapse: collapse; font-size: 12.5px; }
+.bk-table th { text-align: left; font-weight: 600; padding: 2px 18px 2px 0; color: var(--ink-3); }
+.bk-table td { padding: 2px 18px 2px 0; }
+.bk-restore-body { padding: 8px 2px 2px; }
+.bk-restore-row { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+.bk-restore-row .in { max-width: 260px; }
+
 .stg-name { font-weight: 600; color: var(--ink); white-space: nowrap; }
 .stg-name.mono { font-family: var(--f-mono); font-weight: 500; font-size: 12.5px; }
 .stg-dest {

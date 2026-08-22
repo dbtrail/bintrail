@@ -151,8 +151,12 @@ and searching events:
    permanently lost" record when an unfillable gap (or a lost PostgreSQL slot)
    was detected. Both fire for any source family. See
    [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
-6. **Protect** (under `watch` only) — **Baselines** (the selected server's
-   snapshot listing, plus **Create baseline**) and **Verification** (run
+6. **Protect** (under `watch` only) — **Backups** (the selected server's
+   snapshot listing; each row expands to its tables, sizes and how long the
+   backup took, with a **Download (.tar.gz)** of the whole snapshot; plus
+   **Create backup** and — for a server with its own local backup directory —
+   **Restore to a moment**, which folds a chosen past instant into a NEW
+   discoverable snapshot in the same store) and **Verification** (run
    `bintrail verify` and read past runs). These produce and validate the
    artifacts a restore depends on, so they are operations rather than
    settings; they lived on the Storage page until they outgrew it.
@@ -250,7 +254,7 @@ immediately; warnings (e.g. short binlog retention) show but don't block.
 The **source user** you paste into the form needs `REPLICATION SLAVE,
 REPLICATION CLIENT, SELECT` on the source MySQL — the form spells out the
 exact `CREATE USER` / `GRANT` to copy. dbtrail never writes to the source, and
-capture never locks it. The **Create baseline** button needs one privilege
+capture never locks it. The **Create backup** button needs one privilege
 more, `LOCK TABLES`, because a baseline is point-consistent by default; without
 it capture keeps running and only the baseline is refused, naming the exact
 `GRANT`. On RDS/Aurora set `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=lock-all` —

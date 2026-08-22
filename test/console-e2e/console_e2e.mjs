@@ -291,12 +291,13 @@ try {
   // advanced section: the index IS the whole form. This is the other arm of
   // byoIndex (scenario 3 covers the collapse-for-source arm). Its dbname points
   // at the daemon's own (existing) boot index, so it resolves cleanly.
-  const byoId = await page.evaluate(async () => {
+  const byoId = await page.evaluate(async (baselineDir) => {
     const res = await api("/api/servers", { method: "POST", body: {
       name: "byo-idx", host: "127.0.0.1", port: "13306", user: "root", password: "testroot", dbname: "bintrail_e2e_idx",
+      baseline_dir: baselineDir,
     } });
     return res.id;
-  });
+  }, process.env.E2E_BASELINE_DIR || "");
   await page.evaluate(() => openServersModal());
   await page.waitForSelector("#servers-list", { timeout: 5000 });
   await page.waitForTimeout(300);
@@ -1283,7 +1284,7 @@ try {
   (tt1.cells.status === "shipped" && tt1.cells.email === "a@example.com")
     ? ok("restore: reconstructed row folds the event over the baseline")
     : bad("restore: reconstructed row folds the event over the baseline", JSON.stringify(tt1.cells));
-  /baseline /.test(tt1.meta) ? ok("restore: meta line names the baseline anchor") : bad("restore: meta line names the baseline anchor", tt1.meta);
+  /backup /.test(tt1.meta) ? ok("restore: meta line names the backup anchor") : bad("restore: meta line names the backup anchor", tt1.meta);
 
   // pk=4: exists ONLY in the baseline (no events) — a binlog-only reconstruct
   // cannot resolve it, so this pins the baseline half of baseline+deltas.
@@ -1976,7 +1977,7 @@ try {
     // uniform table count moved there too, so the row carries only what
     // varies (the binlog anchor) plus the newest treatment.
     const strip = document.querySelector(".ctx-strip");
-    const btn = strip ? Array.from(strip.querySelectorAll("button")).find((b) => b.textContent === "Create baseline") : null;
+    const btn = strip ? Array.from(strip.querySelectorAll("button")).find((b) => b.textContent === "Create backup") : null;
     const row = Array.from(document.querySelectorAll(".stg-row")).find((r) => r.textContent.includes("binlog.000001:50"));
     return { capOn: !!capsCache.baseline_trigger, stripPresent: !!strip,
       stripText: strip ? strip.textContent : "",
@@ -1990,7 +1991,7 @@ try {
   (stg.stripPresent && stg.btnPresent && stg.btnEnabled) ? ok("baselines: Create baseline is a page action on the context strip, enabled when both gates pass") : bad("baselines: Create baseline is a page action on the context strip, enabled when both gates pass", `strip=${stg.stripPresent} present=${stg.btnPresent} enabled=${stg.btnEnabled}`);
   // The facts moved, they did not vanish: table count and source live on the
   // strip; the row keeps the anchor and gains the newest treatment.
-  (/1 per snapshot/.test(stg.stripText) && stg.sourceOneLine)
+  (/1 per backup/.test(stg.stripText) && stg.sourceOneLine)
     ? ok("baselines: the uniform table count and the one-line source render on the strip")
     : bad("baselines: the uniform table count and the one-line source render on the strip", stg.stripText);
   (stg.rowIsLatest && /ago/.test(stg.rowText) && !/table\(s\)/.test(stg.rowText))
@@ -2017,12 +2018,12 @@ try {
     const capOffStrip = baselineContextStrip({ configured: true, source: "/tmp/baselines", snapshots: [] }, cur);
     capsCache.baseline_trigger = keepCap;
     currentServer = keepCur;
-    const hasBtn = (n) => Array.from(n.querySelectorAll("button")).some((b) => b.textContent === "Create baseline");
+    const hasBtn = (n) => Array.from(n.querySelectorAll("button")).some((b) => b.textContent === "Create backup");
     return {
       cfgOffBtn: hasBtn(cfgOff) || hasBtn(cfgOffStrip),
-      cfgOffEmpty: /No baselines configured/.test(cfgOff.textContent),
+      cfgOffEmpty: /No backups configured/.test(cfgOff.textContent),
       capOffBtn: hasBtn(capOff) || hasBtn(capOffStrip),
-      capOffEmpty: /no snapshots found/.test(capOff.textContent),
+      capOffEmpty: /no backups found/.test(capOff.textContent),
     };
   });
   (!gates.cfgOffBtn && gates.cfgOffEmpty)
@@ -2031,6 +2032,104 @@ try {
   (!gates.capOffBtn && gates.capOffEmpty)
     ? ok("baselines: baseline_trigger off → no button even with a destination")
     : bad("baselines: baseline_trigger off → no button even with a destination", JSON.stringify(gates));
+
+  // Scenario 15e — the Backups feature set: rename, per-row detail with real
+  // sizes, the tar.gz download wire, the restore card's gate + inline refusal,
+  // and the in-progress region. All against the REAL fixture snapshot the
+  // runner produced with `bintrail baseline`.
+  await page.evaluate(() => navigate("baselines"));
+  await new Promise((r) => setTimeout(r, 600));
+  const bk = await page.evaluate(async () => {
+    const out = {};
+    const v = document.querySelector(".view");
+    out.title = (v.querySelector("h1") || {}).textContent || "";
+    out.stripLabels = Array.from(v.querySelectorAll(".ctx-label")).map((n) => n.textContent);
+    // Expand the newest row: the detail must load the REAL files endpoint.
+    const row = v.querySelector(".stg-row.bk-expandable");
+    out.expandable = !!row;
+    if (row) {
+      row.click();
+      for (let i = 0; i < 40 && !/file\(s\)/.test(v.querySelector(".bk-detail").textContent); i++) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const det = v.querySelector(".bk-detail");
+      out.detailText = det ? det.textContent : "";
+      out.detailTables = det ? det.querySelectorAll(".bk-table tbody tr").length : 0;
+      out.detailHasDownload = det ? Array.from(det.querySelectorAll("button")).some((b) => /Download/.test(b.textContent)) : false;
+    }
+    // The download wire: real bytes, gzip magic, attachment filename.
+    const at = (v.querySelector(".stg-row .stg-name") || {}).textContent || "";
+    const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
+    if (currentServer) headers["X-Bintrail-Server"] = currentServer;
+    const res = await fetch("/api/baselines/download?at=" + encodeURIComponent(at.trim()), { headers });
+    out.dlStatus = res.status;
+    out.dlDisposition = res.headers.get("Content-Disposition") || "";
+    const buf = new Uint8Array(await res.arrayBuffer());
+    out.dlMagic = buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+    out.dlBytes = buf.length;
+    if (res.status !== 200) out.dlBody = new TextDecoder().decode(buf).slice(0, 200);
+    return out;
+  });
+  /^Backups$/.test(bk.title.trim())
+    ? ok("backups: the page is named Backups")
+    : bad("backups: the page is named Backups", bk.title);
+  bk.stripLabels.includes("BACKUPS")
+    ? ok("backups: the strip counts BACKUPS, not snapshots")
+    : bad("backups: the strip counts BACKUPS, not snapshots", JSON.stringify(bk.stripLabels));
+  (bk.expandable && bk.detailTables >= 1 && /B/.test(bk.detailText) && bk.detailHasDownload)
+    ? ok("backups: a row expands into real tables, sizes and a download action")
+    : bad("backups: a row expands into real tables, sizes and a download action", JSON.stringify({ e: bk.expandable, t: bk.detailTables, d: bk.detailHasDownload, txt: (bk.detailText || "").slice(0, 120) }));
+  (bk.dlStatus === 200 && bk.dlMagic && /dbtrail-backup-.*\.tar\.gz/.test(bk.dlDisposition) && bk.dlBytes > 100 && !bk.dlBody)
+    ? ok("backups: the download endpoint streams a gzip archive with an attachment name")
+    : bad("backups: the download endpoint streams a gzip archive with an attachment name", JSON.stringify({ s: bk.dlStatus, m: bk.dlMagic, cd: bk.dlDisposition, n: bk.dlBytes }));
+
+  // 15e-2: the restore card. Gated on the capability the daemon advertises;
+  // a bad instant is refused INLINE (the server's 400 lands next to the
+  // input, not in a toast that outlives nothing).
+  const bkRestore = await page.evaluate(async () => {
+    const out = { cap: !!capsCache.baseline_restore };
+    const v = document.querySelector(".view");
+    const card = v.querySelector(".bk-restore");
+    out.card = !!card;
+    if (!card) return out;
+    card.open = true;
+    const input = card.querySelector("input");
+    out.prefilled = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(input.value);
+    input.value = "not-a-time";
+    card.querySelector("button").click();
+    for (let i = 0; i < 40; i++) {
+      const msg = card.querySelector(".form-msg.err");
+      if (msg && !msg.hidden && msg.textContent) { out.inlineErr = msg.textContent; break; }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return out;
+  });
+  (bkRestore.cap && bkRestore.card && bkRestore.prefilled)
+    ? ok("backups: the restore card renders under its capability, prefilled with the newest backup time")
+    : bad("backups: the restore card renders under its capability, prefilled with the newest backup time", JSON.stringify(bkRestore));
+  (bkRestore.inlineErr && /UTC time/.test(bkRestore.inlineErr))
+    ? ok("backups: a bad restore instant is refused inline with the server's words")
+    : bad("backups: a bad restore instant is refused inline with the server's words", JSON.stringify(bkRestore.inlineErr));
+
+  // 15e-3: the in-progress region, driven through the real builders (a live
+  // run cannot be photographed deterministically; same pattern as the
+  // verification running-state scenario).
+  const bkRun = await page.evaluate(() => {
+    const runs = backupRunsInFlight(
+      { baseline: { state: "running", since: "2026-06-10T12:00:00Z" } },
+      { restore: { state: "running", at: "2026-06-01T00:00:00Z" } },
+      { refresh: { state: "running" } });
+    const region = backupRunRegion(runs);
+    return {
+      count: runs.length,
+      live: region.querySelectorAll(".chip-live").length,
+      progress: !!region.querySelector(".vfy-progress"),
+      text: region.textContent,
+    };
+  });
+  (bkRun.count === 3 && bkRun.live === 3 && bkRun.progress && /Creating a backup/.test(bkRun.text) && /Restoring to/.test(bkRun.text))
+    ? ok("backups: every running kind renders a live chip, words, and the motion strip")
+    : bad("backups: every running kind renders a live chip, words, and the motion strip", JSON.stringify(bkRun));
 
   // Scenario 15d — Protect group (#1384). Baselines and verification moved off
   // Settings > Storage into their own routes. Two halves must hold TOGETHER,
@@ -2051,7 +2150,7 @@ try {
 
   await page.evaluate(() => navigate("baselines"));
   await page.waitForFunction(() => location.pathname === "/baselines"
-    && Array.from(document.querySelectorAll(".ov-panel-title")).some((h) => /Baseline snapshots/.test(h.textContent)),
+    && Array.from(document.querySelectorAll(".ov-panel-title")).some((h) => /Backups/.test(h.textContent)),
     { timeout: 10000 });
   ok("protect: /baselines renders the snapshot panel");
 
@@ -2257,7 +2356,7 @@ try {
     { timeout: 10000 });
   const storageTitles = await page.evaluate(() =>
     Array.from(document.querySelectorAll(".ov-panel-title")).map((h) => h.textContent));
-  (!storageTitles.some((t) => /Baseline snapshots|Verification/.test(t)))
+  (!storageTitles.some((t) => /Baseline snapshots|Backups|Verification/.test(t)))
     ? ok("protect: Storage no longer carries the moved panels")
     : bad("protect: Storage no longer carries the moved panels", JSON.stringify(storageTitles));
 
