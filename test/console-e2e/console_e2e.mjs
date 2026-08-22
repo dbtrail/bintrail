@@ -3628,6 +3628,17 @@ try {
   await page.waitForFunction(() => location.pathname === "/connect"
     && document.querySelectorAll(".view .cn-card").length === 3, { timeout: 15000 })
     .catch(() => {});
+  // The mock's field labels come from the REAL bundle manifest, not from a
+  // second hand-maintained copy: renaming either side alone rings below. A
+  // failed read degrades to null titles (a loud label mismatch carrying the
+  // error) instead of throwing here, which would abort 17f and 18 with it.
+  // globalThis.URL because this file shadows URL with the console's
+  // base-address string.
+  let mcpbTitles = [null, null], mcpbReadErr = "";
+  try {
+    const mcpbCfg = JSON.parse(readFileSync(new globalThis.URL("../../build/packaging/mcpb/manifest.template.json", import.meta.url), "utf8")).user_config;
+    mcpbTitles = [mcpbCfg.console_url.title, mcpbCfg.token.title];
+  } catch (e) { mcpbReadErr = String(e); }
   const cn = await page.evaluate(() => {
     const badges = Array.from(document.querySelectorAll(".view .card .cn-num")).map((n) => n.textContent).join("");
     const labels = Array.from(document.querySelectorAll(".cn-mock .cn-mock-label")).map((n) => n.textContent);
@@ -3645,23 +3656,18 @@ try {
       downloadLinks: document.querySelectorAll('.view a[href*="/releases/download/"]').length,
     };
   });
-  // The mock's field labels come from the REAL bundle manifest, not from a
-  // second hand-maintained copy: renaming either side alone rings here.
-  // globalThis.URL: this file shadows URL with the console's base-address
-  // string (line ~20), so the bare constructor here is a string, not URL.
-  const mcpbCfg = JSON.parse(readFileSync(new globalThis.URL("../../build/packaging/mcpb/manifest.template.json", import.meta.url), "utf8")).user_config;
-  const mcpbTitles = [mcpbCfg.console_url.title, mcpbCfg.token.title];
   (cn.badges === "123")
     ? ok("connect: three numbered step badges in order")
     : bad("connect: three numbered step badges in order", JSON.stringify(cn.badges));
   (cn.labels.length === 2 && cn.labels[0] === mcpbTitles[0] && cn.labels[1] === mcpbTitles[1])
     ? ok("connect: the drawn dialog carries the manifest's field names verbatim")
-    : bad("connect: the drawn dialog carries the manifest's field names verbatim", JSON.stringify({ drawn: cn.labels, manifest: mcpbTitles }));
+    : bad("connect: the drawn dialog carries the manifest's field names verbatim", JSON.stringify({ drawn: cn.labels, manifest: mcpbTitles, readErr: mcpbReadErr }));
   (cn.visibleChars > 0 && cn.visibleChars < 1500 && cn.fine >= 1)
     ? ok("connect: visible text stays under budget with fine print folded")
     : bad("connect: visible text stays under budget with fine print folded", "chars " + cn.visibleChars + " fine " + cn.fine);
-  // "shown only once" is carried by BOTH non-minted token states (fresh and
-  // managed); this run exercises the fresh one (no scenario mints a token).
+  // "shown only once" is carried by the fresh state and the managed state
+  // (except managed read_only, which drops the Lost-it clause and the phrase
+  // with it); this run exercises the fresh one (no scenario mints a token).
   (cn.once && cn.addrCopy && cn.downloadLinks === 0)
     ? ok("connect: one-time warning visible, address one click to copy, no 404able download link")
     : bad("connect: one-time warning visible, address one click to copy, no 404able download link", JSON.stringify({ once: cn.once, addrCopy: cn.addrCopy, downloadLinks: cn.downloadLinks }));
@@ -3984,15 +3990,21 @@ try {
     return {
       warnCount: document.querySelectorAll("#ev-warnings .warn-item").length,
       warnText: w ? w.textContent : "",
+      warnTexts: Array.from(document.querySelectorAll("#ev-warnings .warn-item")).map((n) => n.textContent),
       hasIcon: w ? !!w.querySelector("svg") : false,
       bg: cs ? cs.backgroundColor : "",
       border: cs ? cs.borderTopStyle : "",
       noteCount: document.querySelectorAll("#ev-notes .note-item").length,
     };
   }, { since: ARC_GAP_SINCE, until: ARC_GAP_UNTIL });
-  arcWarn.warnCount >= 1 && /rotated and not archived/.test(arcWarn.warnText)
-    ? ok("severity split: a real coverage-gap warning renders")
-    : bad("severity split: a real coverage-gap warning renders", JSON.stringify(arcWarn));
+  // The matcher that found `w` makes /rotated and not archived/ true by
+  // construction, so the real claim here is the second half: once the gap
+  // warning is up, no phase-1 transient (scope=live partial, background-read
+  // notice) and no failed-archive-read notice may share the box with it.
+  (arcWarn.warnCount >= 1 && /rotated and not archived/.test(arcWarn.warnText)
+    && !arcWarn.warnTexts.some((t) => /Reading archived history in the background|archive read FAILED|scope=live/.test(t)))
+    ? ok("severity split: a real coverage-gap warning renders, with no transient sharing the box")
+    : bad("severity split: a real coverage-gap warning renders, with no transient sharing the box", JSON.stringify(arcWarn));
   (arcWarn.hasIcon && arcWarn.bg !== "rgba(0, 0, 0, 0)" && arcWarn.border === "solid")
     ? ok("severity split: the gap warning keeps the alert register (⚠, amber, border)")
     : bad("severity split: the gap warning keeps the alert register (⚠, amber, border)", `icon=${arcWarn.hasIcon} bg=${arcWarn.bg} border=${arcWarn.border}`);

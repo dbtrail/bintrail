@@ -5554,7 +5554,7 @@ function mcpTokenCard(tok, minted) {
       el("button", { class: "btn btn-sm", type: "button", text: "Generate token", onclick: () => mintMCPToken(false) })));
   }
   if (tok.static) {
-    card.append(cnFine("A token was set at startup",
+    card.append(cnFine("A token was set at startup, and it already works",
       el("p", { class: "form-hint" },
         "That fixed token also works (CLI: ",
         el("code", { text: "--token" }), " or ", el("code", { text: "BINTRAIL_CONSOLE_TOKEN" }),
