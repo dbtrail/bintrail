@@ -5516,7 +5516,7 @@ function mcpTokenCard(tok, minted) {
   if (tok.managed) {
     if (!minted) {
       card.append(el("p", { class: "stg-hint", text:
-        "You already created a token" + (tok.created_at ? " on " + utcLabel(tok.created_at) : "") +
+        "A token already exists" + (tok.created_at ? " (created " + utcLabel(tok.created_at) + ")" : "") +
         ". Its value is not saved anywhere, so it cannot be shown again." +
         // read_only hides the buttons below, so never tell that user to click one
         (tok.read_only ? "" : " Lost it? Click New token: you get a fresh value to copy, and the old one stops working.") }));
@@ -5576,19 +5576,26 @@ function bundleCard() {
   const released = /^\d+\.\d+\.\d+$/.test(ver);
   card.append(el("ol", { class: "cn-steps" },
     el("li", { text: "You need the Claude Desktop app installed (claude.ai/download). Using claude.ai in the browser instead? See the note below." }),
-    el("li", { text: released
+    el("li", { text: released && guessPlatform()
       ? "Download the installer with the button below; it is the best guess for this computer, and the note under the buttons says when to pick a different file."
       : "Download the installer from the releases page below; the note under the button says which file matches this computer." }),
     el("li", { text: "Double-click the downloaded file. Claude Desktop opens and asks to install dbtrail; accept." }),
     el("li", { text: "Claude then asks for two things. In \"Console / MCP endpoint URL\" paste the address from step 2; in \"Access token\" paste the token from step 1." }),
     el("li", { text: "Open a new chat and try: what changed in my database in the last hour?" })));
-  if (released) {
-    const asset = "dbtrail-" + guessPlatform() + ".mcpb";
+  const plat = guessPlatform();
+  if (released && plat) {
+    const asset = "dbtrail-" + plat + ".mcpb";
     card.append(el("div", { class: "cn-links" },
-      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/download/v" + ver + "/" + asset, text: "Download " + asset }),
+      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/download/v" + ver + "/" + asset, target: "_blank", rel: "noopener", text: "Download " + asset }),
       el("a", { class: "btn btn-sm btn-ghost", href: "https://github.com/dbtrail/dbtrail/releases/tag/v" + ver, target: "_blank", rel: "noopener", text: "All downloads for v" + ver })));
     card.append(el("p", { class: "form-hint", text:
-      "The download matches this console's version (v" + ver + ") and guesses your computer (Macs are assumed Apple chip). Intel Mac? Use All downloads and take dbtrail-darwin-amd64.mcpb. Windows has no installer yet; use the claude.ai note below instead. If the link lands on Not Found, that older release predates the installer; take the newest release's file from All downloads." }));
+      "The download matches this console's version (v" + ver + ") and guesses your computer (Macs are assumed Apple chip). Intel Mac? Use All downloads and take dbtrail-darwin-amd64.mcpb. If the link lands on Not Found, that release shipped without this file; take the newest release's file from All downloads instead." }));
+  } else if (released) {
+    // Windows on a released build: never render a download that can only 404.
+    card.append(el("div", { class: "cn-links" },
+      el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases/tag/v" + ver, target: "_blank", rel: "noopener", text: "All downloads for v" + ver })));
+    card.append(el("p", { class: "form-hint", text:
+      "There is no Windows installer yet. Use the claude.ai note below instead; it needs no download at all." }));
   } else {
     card.append(el("div", { class: "cn-links" },
       el("a", { class: "btn btn-sm", href: "https://github.com/dbtrail/dbtrail/releases", target: "_blank", rel: "noopener", text: "Open the releases page" })));
@@ -5605,7 +5612,12 @@ function bundleCard() {
 // all-downloads link covers every other combination.
 function guessPlatform() {
   const ua = navigator.userAgent || "";
-  if (/Windows/i.test(ua)) return "windows-amd64";
+  // Empty on Windows ON PURPOSE: no Windows .mcpb has ever been published
+  // (the release matrix builds the bridge for linux; darwin is attached by
+  // hand), so synthesizing the name renders a download button whose link
+  // can only ever 404 while the hint below says the installer does not
+  // exist. The caller treats empty as "no direct download".
+  if (/Windows/i.test(ua)) return "";
   if (/Mac/i.test(ua)) return "darwin-arm64";
   return "linux-amd64";
 }

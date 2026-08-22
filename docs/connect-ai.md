@@ -23,7 +23,11 @@ server, exactly like the console's Time-travel tab; without one the tool says so
 
 ---
 
-## Step 0 — you need the console with a token
+## Step 1 — you need the console with a token
+
+> The numbers here match the cards on the console's **Connect AI** page
+> (Step 1 · Access token, Step 2 · Console address, Step 3 · Add it to
+> Claude), so you can follow either surface.
 
 The AI connects to your **web console**, which serves an MCP endpoint at
 `/mcp`. If you already run `bintrail-console` (standalone `serve`, `watch`, or
@@ -54,7 +58,7 @@ token is their credential.
 
 ---
 
-## Step 1 — copy your MCP URL
+## Step 2 — copy your MCP URL
 
 Open the console in your browser → **Settings → Connect AI**. Copy the URL it
 shows, e.g.:
@@ -72,26 +76,28 @@ Two things worth knowing (the page handles both for you):
   runs** — LAN, VPN, or an SSH/SSM port-forward are all fine. Nothing needs to
   be on the public internet.
 
-## Step 2 — install the bundle in Claude Desktop
+## Step 3 — install the bundle in Claude Desktop
 
 1. Grab the `.mcpb` file from the **Connect AI** page's download button (or the
    [releases page](https://github.com/dbtrail/dbtrail/releases)) — pick the one
    matching the machine where Claude Desktop runs.
 2. **Double-click it.** Claude Desktop opens an install dialog.
 3. Fill in the two fields:
-   - **Console / MCP endpoint URL** — the URL from step 1
+   - **Console / MCP endpoint URL** — the URL from step 2
    - **Access token** — your console token (Claude Desktop stores it as a
      sensitive value)
 
 That's it. No config files were harmed.
 
-> **Platform note:** published bundles cover macOS (both chips: darwin-arm64
-> and darwin-amd64) and Linux (amd64 and arm64). There is no Windows bundle
-> yet — on Windows, add the console as a claude.ai custom connector (public
-> HTTPS deployments), or use the raw-config fallback on the Connect AI page
-> with a bridge you build yourself.
+> **Platform note:** the Linux bundles (amd64/arm64) are built by CI on every
+> release. The macOS bundles (darwin-arm64 and darwin-amd64) are attached by
+> hand and MOST releases carry them, but a few skipped the step - if your
+> release lacks them, take the newest release's darwin file or build your own
+> with `make mcpb` (output in `dist/mcpb/`). There is no Windows bundle yet -
+> on Windows, add the console as a claude.ai custom connector (public HTTPS
+> deployments); it needs no download at all.
 
-## Step 3 — ask something
+## Step 4 — ask something
 
 Open a new Claude Desktop conversation. The `query`, `recover`, `recover_cascade`,
 `status`, `list_schema_changes`, and `reconstruct` tools are now available. Try:
@@ -138,7 +144,7 @@ directly with a DSN — see [mcp-server.md](mcp-server.md).
 | Symptom | Likely cause, in order of likelihood |
 |---|---|
 | **401 unauthorized** | Wrong token; or you're not talking to the console you think you are — a port-forward pointing at a stale process, another console on the same port. Check with `curl -H "Authorization: Bearer $TOKEN" http://host:8090/api/capabilities` — it should return JSON with `"mcp": true`. |
-| **403 "no token configured"** | No token exists yet. Open **Settings → Connect AI** and click **Generate token** (step 0) — no restart needed. (Or set `--token` / `BINTRAIL_CONSOLE_TOKEN` and restart.) |
+| **403 "no token configured"** | No token exists yet. Open **Settings → Connect AI** and click **Generate token** (step 1) — no restart needed. (Or set `--token` / `BINTRAIL_CONSOLE_TOKEN` and restart.) |
 | **Connection refused / timeout** | The URL isn't reachable from the AI client's machine. `curl http://host:8090/api/healthz` from that machine; if you tunnel, remember tunnels can idle out — re-establish and retry. |
 | **Bundle download 404s** | That release predates the bundles. Take the latest release, or build with `make mcpb`. |
 | **Tools don't appear in Claude Desktop** | Check Desktop's MCP logs (Settings → Extensions): the bridge exits with a one-line reason — bad URL and rejected token are spelled out, it never hangs silently. |
