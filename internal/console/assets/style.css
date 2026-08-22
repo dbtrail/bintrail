@@ -5,9 +5,12 @@
    (blue / mint / red), mapped by ROLE — site hue+chroma at the console's
    lightness steps, so WCAG AA holds where the marketing values would not
    (the site's muted ink is ~3.1:1 on white; a console cannot ship that).
-   Brand accents (the site's tropical sunset — pink/peach/violet/sun) appear
-   only in brand moments: the sign-in gate, empty states, the busy indicator,
-   text selection, the nav rail's tail. Never on data.
+   Brand accents (the site's tropical sunset — pink/peach/violet/sun) live
+   on chrome and config surfaces — the sidebar's night ground, page titles,
+   the tinted fact cards, the sign-in gate, empty states, the busy
+   indicator, text selection (see the tropical pass at EOF). Never on data:
+   row-carrying surfaces and the INSERT/UPDATE/DELETE code stay exactly as
+   they are.
    Three directions via [data-dir="paper" | "studio" | "trail"].
    ============================================================ */
 
@@ -58,8 +61,10 @@
 }
 
 :root {
-  /* cool purple-tinted surfaces (site line hue) — white-led, never cream */
-  --bg:        #ffffff;
+  /* cool purple-tinted surfaces (site line hue). The canvas is the
+     tropical pass's warm blush (EOF section); panels stay white-led so
+     they lift off it. */
+  --bg:        oklch(0.985 0.006 340);
   --surface:   #ffffff;
   --surface-2: oklch(0.985 0.004 320);
   --surface-3: oklch(0.972 0.006 320);
@@ -117,10 +122,11 @@
      preserved) which puts the BRIGHTEST stop at 3.26:1 and the others above it.
      Every canvas layer is built from these three stops, so the canvas can never
      be brighter than --brand-canvas-2 anywhere.
-     Reserved for brand moments — the sign-in gate, empty states, the busy
-     indicator, the nav rail's tail. They never encode data: the semantic
-     INSERT/UPDATE/DELETE tokens above and the diff colors are untouched, and
-     pink never lands on a surface that carries a row. */
+     Worn across the chrome since the tropical pass (EOF): the sidebar
+     ground, the active pill, page titles, the tinted fact cards. They
+     never encode data: the semantic INSERT/UPDATE/DELETE tokens above and
+     the diff colors are untouched, and pink never lands on a surface that
+     carries a row. */
   --brand-canvas-1: oklch(0.635 0.18 348);  /* site hero pink   #FF7AC3 */
   --brand-canvas-2: oklch(0.66 0.142 53);   /* site hero peach  #FF9D5C */
   --brand-canvas-3: oklch(0.555 0.19 293);  /* site hero violet #9D7AFF */
@@ -186,11 +192,13 @@
      replaced by the rows it stood in for — and a skeleton encodes nothing, so
      no brand colour is carrying data here. */
   --skel-warm: color-mix(in srgb, var(--brand-canvas-1) 26%, var(--line));
-  /* The EVENTS list's loading bars (#1397). The ground is plain white:
-     .events declares no background and every element between the bar and
-     <body> is transparent, in all three directions (they re-point
-     --panel-bg, which this list never consumes). Against it, read off
-     rendered pixels:
+  /* The EVENTS list's loading bars (#1397). The ground is the page canvas
+     (blush --bg since the tropical pass; these figures were measured on
+     white, and the blush moves them ~1-2% — the e2e probe reads the real
+     painted ancestor either way): .events declares no background and every
+     element between the bar and <body> is transparent, in all three
+     directions (they re-point --panel-bg, which this list never consumes).
+     Against it, read off rendered pixels:
 
        .ev-skel-bar, was --surface-3      1.09   (pulse trough 1.04)
        the --line-soft divider beside it  1.17
@@ -237,11 +245,6 @@
      ends up"). So: a decline was recorded, no rule was ratified, and nothing
      in the code holds either — which is why this is a comment. */
   --skel-neutral: color-mix(in srgb, var(--line) 70%, var(--ink-4));
-  /* The nav's active rail EXTENDS the blue->violet accent gradient into the
-     sunset instead of replacing it: product blue stays the interactive accent.
-     A separate token on purpose — .timeline::before is a DATA surface and
-     keeps the plain accent gradient. */
-  --brand-rail: linear-gradient(var(--accent-a) 0%, var(--accent-b) 55%, var(--brand-warm-a) 100%);
 
   /* fonts */
   --f-display: "Bricolage Grotesque", system-ui, sans-serif;
@@ -519,20 +522,19 @@ button { font-family: inherit; }
 .nav-item.active { color: var(--ink); font-weight: 600; background: var(--accent-bg); }
 .nav-item.active .ni-icon { color: var(--accent); }
 .nav-item.active .ni-icon { transform: translateX(1px); }
-/* active rail accent — blue -> violet -> sunset pink (--brand-rail): the
-   accent gradient extended into the brand family, not replaced by it. The
-   timeline rail keeps the plain accent gradient; it reads data. */
+/* active rail accent — the sun, since the tropical pass: the sunset pill
+   carries the page, the rail is its light. The timeline rail keeps the
+   plain accent gradient; it reads data. */
 .nav-item.active::before {
   content: ""; position: absolute; left: -18px; top: 50%; transform: translateY(-50%);
   width: 3px; height: 18px; border-radius: 0 3px 3px 0;
-  background: var(--brand-rail);
+  background: var(--sun);
 }
 @media (prefers-reduced-motion: no-preference) {
   .nav-item.active::before { animation: railpop .3s var(--ease-out); }
 }
 [data-dir="trail"] .nav-item.active::before {
   height: 26px; width: 4px;
-  background: var(--brand-rail);
 }
 [data-dir="paper"] .nav-item.active { background: transparent; }
 [data-dir="paper"] .nav-item.active::before { left: -2px; }
@@ -1412,8 +1414,8 @@ button { font-family: inherit; }
   background: var(--panel-bg); border: 1px solid var(--panel-border);
   border-radius: var(--radius-lg); padding: 10px 10px 12px; box-shadow: var(--panel-shadow);
 }
-/* the tint modifiers (#1421) — ONE vocabulary: the hyphenated class IS the
-   modifier, valid on .tcard and .ov-panel alike ("tcard tcard-violet",
+/* the tint modifiers (#1421) — one OPT-IN vocabulary: the hyphenated class
+   IS the modifier, valid on .tcard and .ov-panel alike ("tcard tcard-violet",
    "ov-panel tcard-sun"). Violet and sun are the STRUCTURE tints —
    pink/orange stay away from event data by rule. The tint is the edge; the
    hairline goes. These sit AFTER the .ov-panel ground rules because at
@@ -2439,10 +2441,13 @@ button { font-family: inherit; }
 .side {
   /* One scoped remap instead of per-element edits: everything inside the
      sidebar consumes these tokens, so the whole column flips together.
-     Measured on the darker gradient stop (the worse of the two): ink 13.9:1,
-     ink-2 9.5:1, ink-3 7.5:1, ink-4 5.6:1 — every step clears the 4.5:1
-     floor with room for the corner glows, which lighten their patch of
-     ground by at most one ink step. */
+     Measured on the LIGHTER gradient stop — the worse of the two for light
+     ink: ink 13.9:1, ink-2 9.5:1, ink-3 7.5:1, ink-4 5.6:1. Under the
+     corner glows (whose centers sit off-canvas, so their on-canvas alpha
+     never reaches the declared peak) the worst composite is ink-4 at
+     ~4.8:1 in the top-right corner — above the floor, but with little
+     room: ink-4 text must stay out of the two glow corners, and today it
+     does. */
   --ink:   oklch(0.97 0.008 300);
   --ink-2: oklch(0.85 0.035 300);
   --ink-3: oklch(0.78 0.04 300);
@@ -2470,14 +2475,19 @@ button { font-family: inherit; }
 /* The wordmark keeps its headline-gradient clip (guarded), but the site's
    stops were tuned for white paper and go muddy on the aubergine; restate
    the same sunset brighter for the dark ground. color stays transparent —
-   an opaque color here paints OVER the clip and kills the gradient. */
-.side .brand-name {
-  background: linear-gradient(135deg, oklch(0.74 0.19 3) 0%, oklch(0.76 0.14 51) 55%, oklch(0.72 0.15 293) 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
+   an opaque color here paints OVER the clip and kills the gradient. Inside
+   @supports so an engine without the clip never paints the gradient BOX
+   behind the (near-white fallback) ink. */
+@supports (background-clip: text) or (-webkit-background-clip: text) {
+  .side .brand-name {
+    background: linear-gradient(135deg, oklch(0.74 0.19 3) 0%, oklch(0.76 0.14 51) 55%, oklch(0.72 0.15 293) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+  }
 }
 .side .brand-mark {
-  background: var(--brand-warm);
+  /* no background: the favicon img covers the 30px box completely (zero
+     transparent pixels), so only the glow shows. */
   box-shadow: 0 2px 10px oklch(0.55 0.2 3 / 0.45);
 }
 /* read-only pill: the mint identity restated for the dark ground. */
@@ -2487,8 +2497,8 @@ button { font-family: inherit; }
   border-color: oklch(0.85 0.13 165 / 0.35);
 }
 .side .srv-dot { box-shadow: 0 0 0 3px oklch(0.85 0.13 165 / 0.25); background: oklch(0.75 0.14 165); }
-/* section labels are the sun: MONITOR / EXTENSIONS / PROTECT / SETTINGS
-   glow gold on the night — the one place the sun reads as light. */
+/* every section label is the sun, glowing gold on the night — the one
+   place the sun reads as light. */
 .side .nav-label { color: oklch(0.83 0.13 88); }
 .side .nav-item:hover { background: oklch(1 0 0 / 0.08); color: #fff; }
 .side .nav-item:hover .ni-icon { color: oklch(0.9 0.05 300); }
@@ -2502,73 +2512,97 @@ button { font-family: inherit; }
 }
 .side .nav-item.active .ni-icon { color: #fff; }
 .side .nav-item.active .nav-kbd { color: oklch(1 0 0 / 0.75); }
-.side .nav-item.active::before { background: var(--sun); }
 .side .cmdk-kbd { background: oklch(1 0 0 / 0.10); }
 .side .srv-manage { border-color: oklch(1 0 0 / 0.22); }
 .side .srv-manage:hover { border-color: oklch(0.85 0.11 348 / 0.6); color: #fff; }
 .side .side-docs:hover { color: #fff; }
 .side .side-docs:hover svg { color: oklch(0.85 0.11 348); }
 .side .nav::-webkit-scrollbar-thumb { border-color: transparent; }
+/* logout's danger hover restated for the night: the light-mode chip
+   (--delete-bg) reads as a pale sticker on the aubergine. */
+.side .side-logout:hover { background: oklch(0.62 0.19 23 / 0.22); color: oklch(0.93 0.05 23); }
+/* the native option popup renders OUTSIDE the sidebar's dark ground, on
+   the platform's own light chrome where the engine applies these at all —
+   restate the global ink so near-white options can never land on it. */
+.side .srv-select option { color: oklch(0.255 0.055 301); background: #ffffff; }
 /* the select's chevron was inked for a light field */
 .side .srv-select {
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path fill='%23b7a8cc' d='M0 0h10L5 6z'/></svg>");
 }
 .side .srv-select:hover { border-color: oklch(1 0 0 / 0.3); }
 
-/* ---- content: off the hospital white ---- */
-:root {
-  /* warm blush canvas instead of clinical white; surfaces stay white so
-     panels still lift off the page. */
-  --bg: oklch(0.985 0.006 340);
-}
-/* sunset haze pinned to the top of the reading area: background of the
-   scroll CONTAINER, so it does not scroll away — the room stays warm on
-   page 2. Alphas low enough that every text token keeps its floor. */
+/* ---- content: off the hospital white ----
+   (the blush canvas itself lives on the ONE --bg declaration in the token
+   block; two :root declarations of one token is how the first goes dead) */
+/* sunset haze at the top of the PAGE, not the viewport:
+   background-attachment local anchors it to the scroll content, so it
+   scrolls away with the page head. That is what makes the alphas safe: at
+   these strengths ink-3/ink-4 measure 4.3/2.9 at the peak — below their
+   floors — but the peak band (the first ~120px) only ever holds the page
+   head's ink/ink-2 text, and the first ink-3/ink-4 consumers (list
+   headers) enter ~250px down where the layers have faded out. Fixed to
+   the viewport instead, a scrolled list's headers would ride the peak. */
 .main {
   background:
     radial-gradient(52% 340px at 82% -60px, oklch(0.88 0.09 88 / 0.30), transparent 70%),
     radial-gradient(46% 300px at 12% -80px, oklch(0.8 0.1 348 / 0.22), transparent 70%),
     radial-gradient(30% 260px at 55% -80px, oklch(0.75 0.1 293 / 0.14), transparent 75%),
     var(--bg);
+  background-attachment: local, local, local, scroll;
 }
 /* page titles wear the site's headline gradient. Children that carry their
    own color (chips) keep it; the clipped gradient only paints text that
-   inherits. */
-.page-title {
-  background: var(--brand-headline);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  /* fit-content so the gradient spans the WORD, not the column: on a
-     full-width box a short title samples only the first stop. */
-  width: fit-content;
+   inherits. Inside @supports like every other clipped-ink rule in this
+   file: color:transparent without evidence the engine can paint over it is
+   invisible titles, the exact failure the Go asset guard rings on. Without
+   support the title stays plain ink and no gradient box paints behind it
+   (the background lives inside the guard too, for that reason). */
+@supports (background-clip: text) or (-webkit-background-clip: text) {
+  .page-title {
+    background: var(--brand-headline);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    /* fit-content so the gradient spans the WORD, not the column: on a
+       full-width box a short title samples only the first stop. */
+    width: fit-content;
+  }
 }
 
 /* ---- cards speak the home's tint language ----
-   Config/fact cards rotate through the four home tints with their
-   AA-verified deep partners (the #1421 vocabulary, worn by default instead
-   of on request). Row-carrying surfaces are not .card and stay out. */
-.card { border-color: transparent; }
-.card::after {
+   Config/fact cards INSIDE a .cards grid rotate through the four home tint
+   TOKENS with their AA-verified deep partners (the #1421 palette; the
+   tcard-* classes on the Overview stay opt-in and untouched). Scoped to
+   .cards on purpose: a standalone .card (the SQL panel) keeps its neutral
+   panel ground and border — with the page canvas now blush, its old
+   surface-2 fill alone would have no visible edge. Row-carrying surfaces
+   are not .card and stay out entirely.
+   Each family carries its own soft BORDER as well as the tint: the sun
+   tint measures 1.008:1 against the blush canvas (below the 1.02
+   two-grounds floor), so without an edge that card dissolves into the
+   page. */
+.cards .card::after {
   content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px;
 }
-.cards .card:nth-child(4n+1), .card.tint-1 { background: var(--pink-tint); }
-.cards .card:nth-child(4n+2), .card.tint-2 { background: var(--sun-tint); }
-.cards .card:nth-child(4n+3), .card.tint-3 { background: var(--violet-tint); }
-.cards .card:nth-child(4n+0), .card.tint-4 { background: var(--orange-tint); }
-.cards .card:nth-child(4n+1) .card-title, .card.tint-1 .card-title { color: var(--pink-deep); }
-.cards .card:nth-child(4n+2) .card-title, .card.tint-2 .card-title { color: var(--sun-deep); }
-.cards .card:nth-child(4n+3) .card-title, .card.tint-3 .card-title { color: var(--violet-deep); }
-.cards .card:nth-child(4n+0) .card-title, .card.tint-4 .card-title { color: var(--orange-deep); }
-.cards .card:nth-child(4n+1)::after, .card.tint-1::after { background: linear-gradient(90deg, var(--brand-warm-a), transparent 75%); }
-.cards .card:nth-child(4n+2)::after, .card.tint-2::after { background: linear-gradient(90deg, var(--sun), transparent 75%); }
-.cards .card:nth-child(4n+3)::after, .card.tint-3::after { background: linear-gradient(90deg, var(--brand-canvas-3), transparent 75%); }
-.cards .card:nth-child(4n+0)::after, .card.tint-4::after { background: linear-gradient(90deg, var(--brand-warm-b), transparent 75%); }
+.cards .card:nth-child(4n+1) { background: var(--pink-tint);   border-color: color-mix(in srgb, var(--pink-deep) 22%, transparent); }
+.cards .card:nth-child(4n+2) { background: var(--sun-tint);    border-color: color-mix(in srgb, var(--sun-deep) 26%, transparent); }
+.cards .card:nth-child(4n+3) { background: var(--violet-tint); border-color: color-mix(in srgb, var(--violet-deep) 22%, transparent); }
+.cards .card:nth-child(4n+0) { background: var(--orange-tint); border-color: color-mix(in srgb, var(--orange-deep) 22%, transparent); }
+.cards .card:nth-child(4n+1) .card-title { color: var(--pink-deep); }
+.cards .card:nth-child(4n+2) .card-title { color: var(--sun-deep); }
+.cards .card:nth-child(4n+3) .card-title { color: var(--violet-deep); }
+.cards .card:nth-child(4n+0) .card-title { color: var(--orange-deep); }
+.cards .card:nth-child(4n+1)::after { background: linear-gradient(90deg, var(--brand-warm-a), transparent 75%); }
+.cards .card:nth-child(4n+2)::after { background: linear-gradient(90deg, var(--sun), transparent 75%); }
+.cards .card:nth-child(4n+3)::after { background: linear-gradient(90deg, var(--brand-canvas-3), transparent 75%); }
+.cards .card:nth-child(4n+0)::after { background: linear-gradient(90deg, var(--brand-warm-b), transparent 75%); }
 /* dotted kv separators drown on a tint (same failure the tcard dividers
-   fixed); restate them against the tinted grounds. */
+   fixed); restate them against the tinted grounds (measured 1.34-1.36 on
+   all four, above the 1.15 divider floor). */
 .cards .card .kv { border-bottom-color: oklch(0.5 0.05 320 / 0.22); }
 
-/* neutral buttons warm on touch — product blue stays the pressed accent,
-   and the primary button is untouched: its white-on-gradient contract has
-   its own guard. */
-.btn:hover:not(.btn-primary) { border-color: color-mix(in srgb, var(--brand-warm-b) 45%, var(--line)); color: var(--orange-2); }
+/* neutral buttons warm on touch — product blue stays the pressed accent.
+   Excluded: primary (white-on-gradient, own guard), ghost (borderless is
+   its idiom), accent (white label on a warm fill — orange text there would
+   be invisible). */
+.btn:hover:not(.btn-primary):not(.btn-ghost):not(.btn-accent) { border-color: color-mix(in srgb, var(--brand-warm-b) 45%, var(--line)); color: var(--orange-2); }
