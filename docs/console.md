@@ -851,6 +851,103 @@ The standalone `bintrail-console` binary ships **no extension views**: no nav
 item appears, `/api/capabilities` advertises none, and `/ext/*` and
 `/api/ext/*` are absent from the router entirely.
 
+## Serving the console on a hostname
+
+The console binds `127.0.0.1:8090` by default, which is the right default and
+the wrong one for a team. Putting it on `console.example.com` is four things:
+a DNS record, a certificate, a listener, and one header rule that is the only
+part people get stuck on.
+
+**1. DNS.** An `A` (or `AAAA`) record for the hostname pointing at the host's
+public address. Nothing about the console is involved.
+
+**2. The firewall.** Open 443 to the clients that need it. Leave 8090 closed:
+nothing outside the host should reach the console's own port.
+
+**3. TLS.** Two shapes, and neither is more supported than the other.
+
+*The console terminates TLS itself:*
+
+```
+bintrail-console serve --index-dsn '<dsn>' \
+  --listen 0.0.0.0:8090 \
+  --tls-cert /etc/ssl/console.crt --tls-key /etc/ssl/console.key \
+  --allowed-hosts console.example.com
+```
+
+*Or a reverse proxy terminates TLS* and the console stays on loopback — the
+usual choice when the host already runs a web server, and the one that gets you
+automatic certificate renewal for free:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name console.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/console.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/console.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8090;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Backup and SQL-export downloads are written straight to the
+        # response as they are built. With buffering on, nginx spools the
+        # whole archive to disk before sending a byte of it.
+        proxy_buffering off;
+    }
+}
+```
+
+If a large export returns `504 Gateway Time-out`, that is nginx's
+`proxy_read_timeout` (60 seconds by default) elapsing while the console works
+before its first byte, not the console failing — raise it on this `location`.
+
+**4. The header rule, which is where the time goes.** With the vhost above the
+console answers:
+
+```
+HTTP 403  {"error":"forbidden: host not allowed"}
+```
+
+That is the DNS-rebinding defence doing its job, not a misconfiguration. The
+console accepts a `Host` header only if it is `localhost`, an IP literal, or a
+name you listed — so `console.example.com` has to be listed:
+
+```
+--allowed-hosts console.example.com
+# or: BINTRAIL_CONSOLE_ALLOWED_HOSTS=console.example.com
+# on `watch`, the flag is --console-allowed-hosts
+```
+
+Why the defence exists: a browser on someone's laptop can be pointed at a
+hostname that resolves to `127.0.0.1`, and without a Host check that page could
+drive a console the attacker cannot reach directly. The allowlist costs one flag
+and closes it.
+
+There is a way to skip the flag, and it is worth knowing about mostly so you
+recognise it. nginx's *default* — with no `proxy_set_header Host` line at all —
+sends the upstream address as the `Host`, i.e. `127.0.0.1:8090`, which is an IP
+literal and therefore always allowed. A vhost written that way works
+immediately and never mentions `--allowed-hosts`. It also means every request
+reaches the console claiming to be for `127.0.0.1`, so the real hostname is
+absent from the console's own logs, and any future behaviour that depends on
+knowing its public name has nothing to work with. Prefer passing the real
+`Host` and listing it.
+
+Two consequences worth stating:
+
+- **`/mcp` rides the same allowlist.** Once the hostname is allowed, an
+  MCP client can reach the console's endpoint at
+  `https://console.example.com/mcp` — which removes the need for a tunnel or a
+  port-forward to use it from elsewhere. It is behind the same credential as
+  everything else; see [MCP endpoint](#mcp-endpoint).
+- **A non-loopback console refuses to start without a credential.** That is
+  deliberate and it is checked before any of the above matters: set a password
+  (or pass `--token`) first, or the process exits. See
+  [Password login](#password-login).
+
 ## Security model
 
 The binary has no Supabase/RBAC backend to lean on, so the console defends
