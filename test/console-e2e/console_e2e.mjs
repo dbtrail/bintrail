@@ -3966,11 +3966,18 @@ try {
     f.elements.until.value = until;
     f.elements.limit.value = "50";
     f.requestSubmit();
-    for (let i = 0; i < 60; i++) {
+    // Progressive events (#1414) answer in two phases, and phase 1 paints its
+    // own TRANSIENT scope=live partial warning before phase 2 replaces it
+    // with the final set. Breaking on ANY .warn-item samples whichever phase
+    // got there first — a race this scenario lost twice in one session — so
+    // wait for the warning the assertions below are actually about.
+    let w = null;
+    for (let i = 0; i < 120; i++) {
       await new Promise((r) => setTimeout(r, 50));
-      if (document.querySelectorAll("#ev-warnings .warn-item").length) break;
+      w = Array.from(document.querySelectorAll("#ev-warnings .warn-item"))
+        .find((n) => /rotated and not archived/.test(n.textContent)) || null;
+      if (w) break;
     }
-    const w = document.querySelector("#ev-warnings .warn-item");
     const cs = w ? getComputedStyle(w) : null;
     return {
       warnCount: document.querySelectorAll("#ev-warnings .warn-item").length,
