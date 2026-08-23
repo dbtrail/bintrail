@@ -229,7 +229,7 @@ func authHint(err error) string {
 	msg := err.Error()
 	if strings.Contains(msg, "401") || strings.Contains(msg, "403") ||
 		strings.Contains(msg, "Unauthorized") || strings.Contains(msg, "Forbidden") {
-		return " (authentication rejected — check --token)"
+		return " (authentication rejected; check --token)"
 	}
 	return ""
 }
