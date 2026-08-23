@@ -135,10 +135,6 @@ func newBridge(ctx context.Context, endpoint, token string) (*bridge, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to %s: %w%s", endpoint, err, authHint(err))
 	}
-	b.mu.Lock()
-	b.session = session
-	b.mu.Unlock()
-
 	// Mirror the remote server's instructions so the stdio client sees the
 	// same guidance it would get connecting directly.
 	instructions := ""
@@ -148,6 +144,19 @@ func newBridge(ctx context.Context, endpoint, token string) (*bridge, error) {
 	b.server = mcp.NewServer(&mcp.Implementation{Name: "bintrail", Version: mcpVersion}, &mcp.ServerOptions{
 		Instructions: instructions,
 	})
+
+	// ORDER IS LOAD-BEARING: the session is published LAST, after b.server is
+	// built. The list_changed handler races every line of this function (the
+	// SDK's receive loop is live before Connect returns, and the console arms
+	// a ~10ms tool-notification debounce per fresh session), and its resync
+	// gates only on the session: a reader that observes session != nil under
+	// b.mu is guaranteed by the mutex's release/acquire edge to see the
+	// completed b.server write; a reader that observes nil returns before
+	// touching either. Publishing the session first re-opens a nil b.server
+	// dereference inside AddTool.
+	b.mu.Lock()
+	b.session = session
+	b.mu.Unlock()
 
 	if err := b.resync(connectCtx); err != nil {
 		session.Close()

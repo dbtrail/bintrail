@@ -295,13 +295,8 @@ func mintManagedMCPToken(t *testing.T, ts *httptest.Server, bearer string) strin
 	return minted.Token
 }
 
-// TestIntegrationMCPTokenGrants pins #1124 end to end over the real HTTP /mcp
-// endpoint: a managed token is capped at the permission grants of the session
-// that minted it, so the MCP door and the /api door to the same data enforce
-// the same permission model. A full-access mint (and, byte-identically, a
-// token file from before grants were recorded) keeps the full read surface.
 // A trailing slash is the most common hand-edit a pasted address suffers,
-// and before the {$} routes below existed, "/mcp/" fell through to the SPA
+// and before the {$} routes in server.go existed, "/mcp/" fell through to the SPA
 // catch-all: the bridge received the console's HTML page with a 200 and
 // died on "unsupported content type" (observed live, 2026-08-23). The
 // discriminating claim is that these paths reach the MCP handler (401 with
@@ -348,6 +343,11 @@ func TestIntegrationMCPTrailingSlashRoutes(t *testing.T) {
 	}
 }
 
+// TestIntegrationMCPTokenGrants pins #1124 end to end over the real HTTP /mcp
+// endpoint: a managed token is capped at the permission grants of the session
+// that minted it, so the MCP door and the /api door to the same data enforce
+// the same permission model. A full-access mint (and, byte-identically, a
+// token file from before grants were recorded) keeps the full read surface.
 func TestIntegrationMCPTokenGrants(t *testing.T) {
 	srv, _, _ := seedMCPConsole(t)
 	ts := httptest.NewServer(srv.Handler())
