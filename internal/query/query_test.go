@@ -579,7 +579,7 @@ func TestApplyRedaction(t *testing.T) {
 	redact := []SchemaTableColumn{
 		{Schema: "mydb", Table: "orders", Column: "amount"},
 	}
-	applyRedaction(rows, redact)
+	applyRedaction(rows, redact, nil)
 
 	if rows[0].RowBefore["amount"] != nil {
 		t.Errorf("expected RowBefore[amount] to be nil, got %v", rows[0].RowBefore["amount"])
@@ -888,7 +888,7 @@ func TestApplyRedaction_blanksQueryTextEverywhere(t *testing.T) {
 	redact := []SchemaTableColumn{
 		{Schema: "mydb", Table: "orders", Column: "amount"},
 	}
-	applyRedaction(rows, redact)
+	applyRedaction(rows, redact, nil)
 
 	for i := range rows {
 		if rows[i].QueryText != nil {
@@ -910,7 +910,7 @@ func TestApplyRedaction_wrongTable(t *testing.T) {
 	redact := []SchemaTableColumn{
 		{Schema: "mydb", Table: "orders", Column: "amount"}, // different table
 	}
-	applyRedaction(rows, redact)
+	applyRedaction(rows, redact, nil)
 
 	// Values must be unchanged — redaction only applies to the matching table.
 	if rows[0].RowBefore["amount"] != float64(50) {

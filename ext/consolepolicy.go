@@ -75,9 +75,52 @@ func AllPermissions() []Permission {
 	return out
 }
 
+// TableRef names one table by schema and table name.
+type TableRef struct{ Schema, Table string }
+
+// TableColumnRef names one column by schema, table and column name.
+type TableColumnRef struct{ Schema, Table, Column string }
+
+// SessionRestrictions scopes what ROW DATA a session reads, attached directly to
+// its AccessPolicy by the auth provider that minted it (#1449). It is the
+// label-free sibling of the Profile name: a provider whose authorization source
+// already knows the concrete tables and columns can say so here, without first
+// materializing flag/profile/access labels into every server's index.
+//
+// Enforcement is the console's, in the SAME pass that applies session profiles,
+// with the same consequences: deny/allow at the query layer, column values
+// nulled in row images, query_text/query_hash withheld (#699), archives off,
+// and every surface that cannot honor per-column redaction refused outright. A
+// session carrying a non-empty restriction set counts as restricted exactly as
+// a profiled session does.
+//
+// Deny composes over allow: a table both allowed and denied yields nothing.
+// AllowTables non-empty switches the session to allow-list mode — tables not
+// listed are withheld — so a provider expressing "only these tables" does not
+// need to enumerate the universe it wants excluded.
+type SessionRestrictions struct {
+	// DenyTables withholds every row event of these tables.
+	DenyTables []TableRef
+	// RedactColumns nulls these column values in returned row images.
+	RedactColumns []TableColumnRef
+	// AllowTables, when non-empty, withholds every table NOT listed.
+	AllowTables []TableRef
+	// AllowColumns, for each table appearing in it, nulls every column of that
+	// table's row images NOT listed for it.
+	AllowColumns []TableColumnRef
+}
+
+// Empty reports whether r restricts nothing. Nil-safe, so callers can hold a
+// nil *SessionRestrictions and never branch on it.
+func (r *SessionRestrictions) Empty() bool {
+	return r == nil ||
+		(len(r.DenyTables) == 0 && len(r.RedactColumns) == 0 &&
+			len(r.AllowTables) == 0 && len(r.AllowColumns) == 0)
+}
+
 // AccessPolicy is the optional authorization an external auth provider attaches
-// to the console session it mints (see ConsoleSessionIssuer). It has two
-// orthogonal dimensions:
+// to the console session it mints (see ConsoleSessionIssuer). It has three
+// dimensions; the first gates ROUTES, the other two scope DATA:
 //
 //   - Permissions — the capability strings this session holds, gating which
 //     routes it may call. Enforced by the OSS core, per route.
@@ -86,6 +129,9 @@ func AllPermissions() []Permission {
 //     what DATA the session sees. This struct only CARRIES the name; enforcing it
 //     (deny/redact, archive and reconstruct gates) is a separate concern the
 //     console wires per request.
+//   - Restrictions — direct table/column restrictions carried by the policy
+//     itself (#1449), for providers whose rules do not live in the index as
+//     labels. Enforced alongside Profile; both apply when both are set.
 //
 // A nil *AccessPolicy means "no policy" — a full-access session, exactly what the
 // password login and the static token mint today. The OSS build never constructs
@@ -98,6 +144,16 @@ type AccessPolicy struct {
 	Permissions []Permission
 	// Profile is the data-profile name to enforce, or "" for none.
 	Profile string
+	// Restrictions are direct data restrictions, or nil for none.
+	Restrictions *SessionRestrictions
+}
+
+// DataRestricted reports whether the policy scopes what data the session sees —
+// a data profile name, direct restrictions, or both. It is the predicate the
+// console's raw-data surface gates key on; nil-safe (no policy restricts
+// nothing).
+func (p *AccessPolicy) DataRestricted() bool {
+	return p != nil && (p.Profile != "" || !p.Restrictions.Empty())
 }
 
 // Allows reports whether the policy grants p. A nil policy allows everything (no

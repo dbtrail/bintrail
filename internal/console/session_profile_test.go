@@ -29,6 +29,12 @@ func TestSessionRestricted(t *testing.T) {
 		{"no policy (OSS)", nil, false},
 		{"policy, no profile", &ext.AccessPolicy{Permissions: ext.AllPermissions()}, false},
 		{"policy with profile", &ext.AccessPolicy{Profile: "sensitive"}, true},
+		{"policy with restrictions (#1449)", &ext.AccessPolicy{
+			Restrictions: &ext.SessionRestrictions{DenyTables: []ext.TableRef{{Schema: "s", Table: "t"}}},
+		}, true},
+		{"policy with EMPTY restrictions struct", &ext.AccessPolicy{
+			Restrictions: &ext.SessionRestrictions{},
+		}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -71,6 +77,47 @@ func TestApplySessionProfileNoOp(t *testing.T) {
 	}
 	if out.ProfileActive != false || len(out.DenyTables) != 1 {
 		t.Errorf("no-profile session must leave opts unchanged, got %+v", out)
+	}
+}
+
+// TestApplySessionPolicyRestrictions pins the #1449 path: a session whose
+// policy carries direct restrictions (no profile name) gets them unioned onto
+// the startup floor — converted to query types, allow lists included — with
+// ProfileActive forced so query_text/query_hash stay withheld. No profile
+// name means no index round trip: the bundle carries no DB here, so reaching
+// for one would panic this test.
+func TestApplySessionPolicyRestrictions(t *testing.T) {
+	s := &Server{sessionProfiles: newProfileRuleCache()}
+	pol := &ext.AccessPolicy{Restrictions: &ext.SessionRestrictions{
+		DenyTables:    []ext.TableRef{{Schema: "hr", Table: "payroll"}},
+		RedactColumns: []ext.TableColumnRef{{Schema: "hr", Table: "people", Column: "ssn"}},
+		AllowTables:   []ext.TableRef{{Schema: "shop", Table: "orders"}},
+		AllowColumns:  []ext.TableColumnRef{{Schema: "shop", Table: "orders", Column: "id"}},
+	}}
+	in := query.Options{DenyTables: []query.SchemaTable{{Schema: "floor", Table: "f"}}}
+	out, err := s.applySessionProfile(context.Background(), reqWithPolicy(pol), &bundle{}, in)
+	if err != nil {
+		t.Fatalf("applySessionProfile err = %v", err)
+	}
+	if !out.ProfileActive {
+		t.Error("restrictions must force ProfileActive (query_text/query_hash withholding)")
+	}
+	wantDeny := []query.SchemaTable{{Schema: "floor", Table: "f"}, {Schema: "hr", Table: "payroll"}}
+	if len(out.DenyTables) != 2 || out.DenyTables[0] != wantDeny[0] || out.DenyTables[1] != wantDeny[1] {
+		t.Errorf("DenyTables = %v, want startup floor + policy deny (%v)", out.DenyTables, wantDeny)
+	}
+	if len(out.RedactColumns) != 1 || out.RedactColumns[0] != (query.SchemaTableColumn{Schema: "hr", Table: "people", Column: "ssn"}) {
+		t.Errorf("RedactColumns = %v, want the policy's converted entry", out.RedactColumns)
+	}
+	if len(out.AllowTables) != 1 || out.AllowTables[0] != (query.SchemaTable{Schema: "shop", Table: "orders"}) {
+		t.Errorf("AllowTables = %v, want the policy's converted entry", out.AllowTables)
+	}
+	if len(out.AllowColumns) != 1 || out.AllowColumns[0] != (query.SchemaTableColumn{Schema: "shop", Table: "orders", Column: "id"}) {
+		t.Errorf("AllowColumns = %v, want the policy's converted entry", out.AllowColumns)
+	}
+	// The startup floor slice the caller handed in must not have been mutated.
+	if len(in.DenyTables) != 1 || in.DenyTables[0] != (query.SchemaTable{Schema: "floor", Table: "f"}) {
+		t.Errorf("caller's options were mutated: %v", in.DenyTables)
 	}
 }
 
