@@ -86,6 +86,12 @@ func TestIntegrationSessionRestrictionsAllowList(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "alice@example") {
 		t.Errorf("allowed column email must remain: %s", rec.Body.String())
 	}
+	// The changed-column existence oracle is refused at the HTTP layer under
+	// column-level rules (the engine's sentinel mapped to 403).
+	rec = getPath(t, srv, "127.0.0.1:8090", "/api/events?schema=app&table=users&changed_column=ssn", scoped)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("changed_column under a column allow list = %d, want 403: %s", rec.Code, rec.Body.String())
+	}
 }
 
 // TestIntegrationSessionRestrictionsActivity pins the Overview aggregate:
