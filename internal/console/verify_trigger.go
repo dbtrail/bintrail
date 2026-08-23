@@ -306,6 +306,19 @@ func (s *Server) handleVerifyTrigger(w http.ResponseWriter, r *http.Request) {
 // handleVerifyStatus reports the latest verify run state for the selected
 // server (for the frontend to poll while a run is in flight).
 func (s *Server) handleVerifyStatus(w http.ResponseWriter, r *http.Request) {
+	// Same gate as trigger/explain/history, checked FIRST (before the
+	// enabled-at-all check, so a restricted session always gets the policy
+	// answer): the status payload carries the per-table verdict inventory —
+	// schema and table names with mismatch findings — which can cover tables
+	// the session's policy withholds.
+	if s.rbacActiveFor(r) {
+		if sessionRestricted(r) {
+			recordProfileGateDeny(r, "verify-status")
+		}
+		writeJSONError(w, http.StatusForbidden,
+			"verification isn't available while an access-control profile is active: baseline reads aren't redacted")
+		return
+	}
 	if s.verifyCtrl == nil {
 		writeJSONError(w, http.StatusForbidden,
 			"verify from the console is not enabled; start the watch daemon with BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 or a --verify-interval schedule")

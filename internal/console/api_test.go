@@ -596,6 +596,18 @@ func TestHandleSchemasSnapshotUnavailable(t *testing.T) {
 				t.Fatalf("sqlmock: %v", err)
 			}
 			defer db.Close()
+			if c.profiled {
+				// handleSchemas resolves the session profile like every other
+				// data read (its name listings are filtered by the resolved
+				// scope), so the profile must exist — with no rules, since this
+				// test is about the snapshot flag, not filtering.
+				mock.ExpectQuery(`SELECT EXISTS\(SELECT 1 FROM profiles`).
+					WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+				mock.ExpectQuery(`SELECT DISTINCT tf.schema_name, tf.table_name\s+FROM access_rules`).
+					WillReturnRows(sqlmock.NewRows([]string{"schema_name", "table_name"}))
+				mock.ExpectQuery(`SELECT DISTINCT tf.schema_name, tf.table_name, tf.column_name`).
+					WillReturnRows(sqlmock.NewRows([]string{"schema_name", "table_name", "column_name"}))
+			}
 			mock.ExpectQuery("SELECT DISTINCT schema_name FROM binlog_events").
 				WillReturnRows(sqlmock.NewRows([]string{"schema_name"}))
 

@@ -232,8 +232,8 @@ func TestLiveScopeAdvisories(t *testing.T) {
 			if tc.wantNote == "" && strings.Contains(jn, "complete answer") {
 				t.Errorf("notes = %q — 'complete' claimed on a scope that excluded the archives", jn)
 			}
-			if tc.excl.profile && !strings.Contains(jw, "profile") {
-				t.Errorf("warnings = %q, want the profile exclusion still announced", jw)
+			if tc.excl.profile && !strings.Contains(jw, "Your session carries") {
+				t.Errorf("warnings = %q, want the session-policy exclusion still announced", jw)
 			}
 		})
 	}

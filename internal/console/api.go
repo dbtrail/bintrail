@@ -383,10 +383,46 @@ func anchorMissedWarning(opts query.Options, rowCount int) []string {
 	}
 	return []string{fmt.Sprintf(
 		"The selected event (id %d at %s UTC) was not found. It may fall outside the time range "+
-			"on this form, be withheld by your access profile, be held only in an archive this "+
+			"on this form, be withheld by your access policy, be held only in an archive this "+
 			"read did not reach, or belong to a different server; event ids are per-index. "+
 			"This is NOT evidence that the row has no history.",
 		opts.EventAnchor.EventID, opts.EventAnchor.Timestamp.UTC().Format("2006-01-02 15:04:05"))}
+}
+
+// columnRedactionWarning reports, for a recover response, that the generated
+// script covers a table whose column values the resolved scope nulls — via
+// explicit RedactColumns or via a column allow list (#1449). Empty when no
+// matched row's table is covered: a policy that redacts elsewhere does not
+// taint this script.
+func columnRedactionWarning(opts query.Options, rows []query.ResultRow) string {
+	if len(opts.RedactColumns) == 0 && len(opts.AllowColumns) == 0 {
+		return ""
+	}
+	covered := make(map[query.SchemaTable]bool, len(opts.RedactColumns)+len(opts.AllowColumns))
+	for _, c := range opts.RedactColumns {
+		covered[query.SchemaTable{Schema: c.Schema, Table: c.Table}] = true
+	}
+	for _, c := range opts.AllowColumns {
+		covered[query.SchemaTable{Schema: c.Schema, Table: c.Table}] = true
+	}
+	hit := map[string]bool{}
+	for i := range rows {
+		if covered[query.SchemaTable{Schema: rows[i].SchemaName, Table: rows[i].TableName}] {
+			hit[rows[i].SchemaName+"."+rows[i].TableName] = true
+		}
+	}
+	if len(hit) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(hit))
+	for n := range hit {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return "Your access policy hides some column values on " + strings.Join(names, ", ") +
+		", and hidden values appear as NULL in the script below: applying it would write NULL " +
+		"over those columns. Have an operator without column restrictions generate the reversal " +
+		"if a faithful restore is needed."
 }
 
 // handleEvents serves GET /api/events — the events browser.
@@ -659,6 +695,15 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	}
 	rows = query.MergeResults(rows, 0, "ASC")
 
+	// A reversal built from redacted row images writes NULL where the policy
+	// hides the value (#1449 made this the allow-list DEFAULT rather than a
+	// per-column opt-in): reversed DELETEs re-insert NULLs, reversed UPDATEs
+	// set them. That script is not a faithful restore, and the reviewer of an
+	// undo script must see it stated — prepended, like the cascade warnings.
+	if msg := columnRedactionWarning(opts, rows); msg != "" {
+		warnings = append([]string{msg}, warnings...)
+	}
+
 	// Per-bundle dialect (the console is multi-server): MySQLDialect covers MySQL +
 	// MariaDB, PostgresDialect a PG-flavored index. Read once and reused below.
 	dialect := recovery.DialectForIndex(b.db)
@@ -870,6 +915,20 @@ func (s *Server) handleSchemas(w http.ResponseWriter, r *http.Request) {
 	if b == nil {
 		return
 	}
+	// The resolved deny/allow scope (startup floor + session profile + policy
+	// restrictions, #1449) filters the NAME listings below: a table name is
+	// exactly what a deny withholds elsewhere, and in allow-list mode the
+	// unfiltered picker would leak the whole inventory EXCEPT the allowed
+	// handful — the inverse of what "only these tables" means.
+	opts, err := s.applySessionProfile(r.Context(), r, b, query.Options{
+		DenyTables:    s.denyTables,
+		RedactColumns: s.redactCols,
+		ProfileActive: s.profileActive,
+	})
+	if err != nil {
+		writeSessionProfileError(w, r, err)
+		return
+	}
 	schema := r.URL.Query().Get("schema")
 	if schema == "" {
 		restricted := sessionRestricted(r)
@@ -879,7 +938,7 @@ func (s *Server) handleSchemas(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, schemasResponse{
-			Schemas:      names,
+			Schemas:      filterSchemas(names, opts.AllowTables),
 			SnapshotOnly: snapshotOnly,
 			// Suppressed under noArchive and under a profiled session: there the
 			// snapshot half is skipped by design (archives unreachable), so a
@@ -894,7 +953,64 @@ func (s *Server) handleSchemas(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, tablesResponse{Schema: schema, Tables: tables})
+	writeJSON(w, http.StatusOK, tablesResponse{Schema: schema, Tables: filterTables(schema, tables, opts.DenyTables, opts.AllowTables)})
+}
+
+// filterSchemas applies allow-list mode to the schema listing: with a
+// non-empty allow set, only schemas that hold at least one allowed table are
+// listed. Deny rules do not hide a schema — they are table-scoped, and a
+// schema with one denied table still has listable siblings (filterTables
+// withholds the denied names).
+func filterSchemas(names []string, allow []query.SchemaTable) []string {
+	if len(allow) == 0 {
+		return names
+	}
+	allowed := make(map[string]bool, len(allow))
+	for _, at := range allow {
+		allowed[at.Schema] = true
+	}
+	var out []string
+	for _, n := range names {
+		if allowed[n] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// filterTables withholds table names the resolved scope would withhold as
+// rows: denied tables are dropped, and in allow-list mode only the listed
+// tables of this schema survive. Deny composes over allow, as everywhere.
+func filterTables(schema string, tables []string, deny, allow []query.SchemaTable) []string {
+	if len(deny) == 0 && len(allow) == 0 {
+		return tables
+	}
+	denied := make(map[string]bool, len(deny))
+	for _, dt := range deny {
+		if dt.Schema == schema {
+			denied[dt.Table] = true
+		}
+	}
+	var allowed map[string]bool
+	if len(allow) > 0 {
+		allowed = make(map[string]bool, len(allow))
+		for _, at := range allow {
+			if at.Schema == schema {
+				allowed[at.Table] = true
+			}
+		}
+	}
+	var out []string
+	for _, t := range tables {
+		if denied[t] {
+			continue
+		}
+		if allowed != nil && !allowed[t] {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // handleHealthz serves GET /api/healthz — an unauthenticated liveness probe.

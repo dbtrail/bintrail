@@ -290,14 +290,45 @@ func TestActivityStaleCacheServesOldAndRefreshes(t *testing.T) {
 func TestActivityDenyKey(t *testing.T) {
 	a := []query.SchemaTable{{Schema: "shop", Table: "secrets"}, {Schema: "hr", Table: "salaries"}}
 	b := []query.SchemaTable{{Schema: "hr", Table: "salaries"}, {Schema: "shop", Table: "secrets"}}
-	if activityDenyKey(a) != activityDenyKey(b) {
+	if activityScopeKey(a, nil) != activityScopeKey(b, nil) {
 		t.Error("same deny set in different order produced different cache keys")
 	}
-	if activityDenyKey(a) == activityDenyKey(a[:1]) {
+	if activityScopeKey(a, nil) == activityScopeKey(a[:1], nil) {
 		t.Error("different deny sets share a cache key — a redaction bypass via the cache")
 	}
-	if activityDenyKey(nil) != "" || activityDenyKey(nil) == activityDenyKey(a) {
-		t.Error("the empty deny set must key separately from every profile")
+	if activityScopeKey(nil, nil) != "" || activityScopeKey(nil, nil) == activityScopeKey(a, nil) {
+		t.Error("the empty scope must key separately from every profile")
+	}
+	// The #1449 dimensions: an allow of X must never share with a deny of X
+	// (opposite meanings), and an allow-list session must never share the
+	// full-access entry — the cross-trust-boundary collision the deny-only
+	// key allowed.
+	if activityScopeKey(a, nil) == activityScopeKey(nil, a) {
+		t.Error("deny(X) and allow(X) share a cache key — opposite scopes, one materialization")
+	}
+	if activityScopeKey(nil, a) == activityScopeKey(nil, nil) {
+		t.Error("an allow-list scope shares the full-access cache entry")
+	}
+	if activityScopeKey(nil, a) != activityScopeKey(nil, b) {
+		t.Error("same allow set in different order produced different cache keys")
+	}
+}
+
+// TestBuildActivitySQL_allowList pins allow-list mode on the aggregate: the
+// clause mirrors buildQuery's, and deny still composes over it.
+func TestBuildActivitySQL_allowList(t *testing.T) {
+	since := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	allow := []query.SchemaTable{{Schema: "app", Table: "users"}, {Schema: "app", Table: "orders"}}
+	deny := []query.SchemaTable{{Schema: "app", Table: "orders"}}
+	q, args := buildActivitySQL(since, since.Add(time.Hour), deny, allow)
+	if !strings.Contains(q, "AND ((schema_name = ? AND table_name = ?) OR (schema_name = ? AND table_name = ?))") {
+		t.Errorf("allow-list clause missing: %s", q)
+	}
+	if !strings.Contains(q, "AND NOT (schema_name = ? AND table_name = ?)") {
+		t.Errorf("deny clause must still compose over the allow list: %s", q)
+	}
+	if len(args) != 2+4+2 {
+		t.Errorf("args = %d, want window(2) + allow(4) + deny(2): %v", len(args), args)
 	}
 }
 
@@ -327,7 +358,7 @@ func TestBundleAlwaysCarriesActivityCache(t *testing.T) {
 func TestActivitySQLPrunesPartitions(t *testing.T) {
 	since := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
 	until := since.Add(24 * time.Hour)
-	q, args := buildActivitySQL(since, until, nil)
+	q, args := buildActivitySQL(since, until, nil, nil)
 
 	if !strings.Contains(q, "event_timestamp >= ?") {
 		t.Errorf("missing bare-column lower bound in %q", q)
@@ -355,7 +386,7 @@ func TestActivitySQLPrunesPartitions(t *testing.T) {
 func TestActivitySQLExcludesDeniedTables(t *testing.T) {
 	since := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
 	deny := []query.SchemaTable{{Schema: "shop", Table: "secrets"}, {Schema: "hr", Table: "salaries"}}
-	q, args := buildActivitySQL(since, since.Add(time.Hour), deny)
+	q, args := buildActivitySQL(since, since.Add(time.Hour), deny, nil)
 
 	if n := strings.Count(q, "NOT (schema_name = ? AND table_name = ?)"); n != 2 {
 		t.Errorf("deny clauses = %d, want 2 in %q", n, q)

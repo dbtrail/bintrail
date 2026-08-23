@@ -154,12 +154,14 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// RBAC: the same deny rules every read on this server carries — startup
-	// floor plus the request session's profile. Denied tables are excluded from
-	// the SQL, so they contribute to neither the counts nor the table list (a
-	// table NAME is exactly what a deny profile withholds elsewhere). The cache
-	// is keyed by the resolved deny set for the same reason: two sessions under
-	// different profiles must never share a materialization.
+	// RBAC: the same deny AND allow rules every read on this server carries —
+	// startup floor plus the request session's profile and policy restrictions
+	// (#1449). Denied tables are excluded from the SQL and, in allow-list
+	// mode, so is every table not listed — they contribute to neither the
+	// counts nor the table list (a table NAME is exactly what a restricted
+	// session is withheld elsewhere). The cache is keyed by the resolved
+	// deny+allow scope for the same reason: two sessions under different
+	// policies must never share a materialization.
 	opts, err := s.applySessionProfile(r.Context(), r, b, query.Options{
 		DenyTables:    s.denyTables,
 		RedactColumns: s.redactCols,
@@ -170,7 +172,7 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := b.activityFor(r.Context(), opts.DenyTables)
+	resp, err := b.activityFor(r.Context(), opts.DenyTables, opts.AllowTables)
 	if err != nil {
 		writeFetchError(w, err)
 		return
@@ -183,29 +185,29 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
 // concurrent misses share one computation) and serving the cached copy —
 // with its original refreshed_at — while a stale one recomputes in the
 // background.
-func (b *bundle) activityFor(ctx context.Context, deny []query.SchemaTable) (activityResponse, error) {
+func (b *bundle) activityFor(ctx context.Context, deny, allow []query.SchemaTable) (activityResponse, error) {
 	compute := func(cctx context.Context) (activityResponse, error) {
-		return computeActivity(cctx, b.db, b.dbName, deny)
+		return computeActivity(cctx, b.db, b.dbName, deny, allow)
 	}
 	if b.activity == nil {
 		// Test-constructed bundles only: every production bundle gets its cache
 		// in newBundleDerived (pinned by TestBundleAlwaysCarriesActivityCache).
 		return compute(ctx)
 	}
-	return b.activity.get(ctx, activityDenyKey(deny), compute)
+	return b.activity.get(ctx, activityScopeKey(deny, allow), compute)
 }
 
 // computeActivity is one materialization flight: derive the live-retention
 // window, run the aggregate over live binlog_events, fold, and stamp the
 // result. This is the ONLY data path behind /api/activity — there is no
 // archive read to fall back to (see the #1352 header comment).
-func computeActivity(ctx context.Context, db *sql.DB, dbName string, deny []query.SchemaTable) (activityResponse, error) {
+func computeActivity(ctx context.Context, db *sql.DB, dbName string, deny, allow []query.SchemaTable) (activityResponse, error) {
 	until := time.Now().UTC().Truncate(time.Second)
 	since, label, err := liveWindow(ctx, db, dbName, until)
 	if err != nil {
 		return activityResponse{}, err
 	}
-	agg, err := collectActivity(ctx, db, since, until, deny)
+	agg, err := collectActivity(ctx, db, since, until, deny, allow)
 	if err != nil {
 		return activityResponse{}, err
 	}
@@ -278,16 +280,27 @@ func windowLabel(d time.Duration) string {
 	return fmt.Sprintf("~%d d", (hrs+12)/24)
 }
 
-// activityDenyKey canonicalizes a deny set into a cache key: same tables in any
-// order → same key, so a session's counts are shared per PROFILE, not per
-// request ordering.
-func activityDenyKey(deny []query.SchemaTable) string {
-	if len(deny) == 0 {
+// activityScopeKey canonicalizes the resolved deny+allow scope into a cache
+// key: same tables in any order → same key, so a session's counts are shared
+// per POLICY, not per request ordering. The two halves are keyed separately
+// and joined with a distinct separator, so a deny of X can never share a
+// materialization with an allow of X — and an allow-list session (whose deny
+// half is typically empty) can never share the full-access entry, which is
+// the cross-trust-boundary collision the old deny-only key allowed.
+func activityScopeKey(deny, allow []query.SchemaTable) string {
+	if len(deny) == 0 && len(allow) == 0 {
 		return ""
 	}
-	keys := make([]string, len(deny))
-	for i, dt := range deny {
-		keys[i] = dt.Schema + "\x00" + dt.Table
+	return tableSetKey(deny) + "\x02" + tableSetKey(allow)
+}
+
+func tableSetKey(set []query.SchemaTable) string {
+	if len(set) == 0 {
+		return ""
+	}
+	keys := make([]string, len(set))
+	for i, st := range set {
+		keys[i] = st.Schema + "\x00" + st.Table
 	}
 	sort.Strings(keys)
 	return strings.Join(keys, "\x01")
@@ -489,11 +502,21 @@ func (a *activityAgg) response(label string, since, until time.Time) activityRes
 // The upper bound is not optional either: a >=-only predicate would sweep in
 // clock-skewed future rows sitting in p_future and count them under a label
 // that says they are inside the window.
-func buildActivitySQL(since, until time.Time, deny []query.SchemaTable) (string, []any) {
+func buildActivitySQL(since, until time.Time, deny, allow []query.SchemaTable) (string, []any) {
 	var sb strings.Builder
 	sb.WriteString("SELECT schema_name, table_name, event_type, COUNT(*) AS n FROM binlog_events" +
 		" WHERE event_timestamp >= ? AND event_timestamp < ?")
 	args := []any{since, until}
+	// Allow-list mode (#1449) mirrors buildQuery: only the listed tables
+	// survive; deny still composes over it below.
+	if len(allow) > 0 {
+		ors := make([]string, len(allow))
+		for i, at := range allow {
+			ors[i] = "(schema_name = ? AND table_name = ?)"
+			args = append(args, at.Schema, at.Table)
+		}
+		sb.WriteString(" AND (" + strings.Join(ors, " OR ") + ")")
+	}
 	for _, dt := range deny {
 		sb.WriteString(" AND NOT (schema_name = ? AND table_name = ?)")
 		args = append(args, dt.Schema, dt.Table)
@@ -503,8 +526,8 @@ func buildActivitySQL(since, until time.Time, deny []query.SchemaTable) (string,
 }
 
 // collectActivity runs the aggregate and folds it.
-func collectActivity(ctx context.Context, db *sql.DB, since, until time.Time, deny []query.SchemaTable) (*activityAgg, error) {
-	q, args := buildActivitySQL(since, until, deny)
+func collectActivity(ctx context.Context, db *sql.DB, since, until time.Time, deny, allow []query.SchemaTable) (*activityAgg, error) {
+	q, args := buildActivitySQL(since, until, deny, allow)
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err

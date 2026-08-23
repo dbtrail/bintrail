@@ -237,9 +237,13 @@ func (s *Server) applySessionProfile(ctx context.Context, r *http.Request, b *bu
 		for _, c := range rest.RedactColumns {
 			opts.RedactColumns = append(opts.RedactColumns, query.SchemaTableColumn{Schema: c.Schema, Table: c.Table, Column: c.Column})
 		}
-		// The allow lists have no startup-floor counterpart (nothing else sets
-		// them on console options), so these are plain conversions, copied so
-		// the session policy's slices are never aliased into query options.
+		// The allow lists have no startup-floor counterpart today (nothing
+		// else sets them on console options), but they get the same
+		// copy-before-append discipline as the deny slices anyway: the next
+		// caller who DOES pre-populate them from a shared slice must not
+		// discover cross-request mutation the hard way.
+		opts.AllowTables = append([]query.SchemaTable(nil), opts.AllowTables...)
+		opts.AllowColumns = append([]query.SchemaTableColumn(nil), opts.AllowColumns...)
 		for _, t := range rest.AllowTables {
 			opts.AllowTables = append(opts.AllowTables, query.SchemaTable{Schema: t.Schema, Table: t.Table})
 		}
@@ -326,7 +330,9 @@ type archiveExclusion struct {
 	// server: the whole console excludes archives (--no-archive, or a startup
 	// --profile, which implies it — see consoleapp/serve.go).
 	server bool
-	// profile: THIS session carries a data profile.
+	// profile: THIS session carries a data access policy — a profile name,
+	// direct restrictions (#1449), or both (sessionRestricted's verdict; the
+	// field keeps its original name).
 	profile bool
 }
 
@@ -369,10 +375,10 @@ func (e archiveExclusion) notice() string {
 			"implies it), so archived (rotated) hours are not searched. A short or empty result does not " +
 			"mean nothing happened in that window."
 	case e.profile:
-		return "Your session carries a data profile, so these results come from the LIVE INDEX ONLY: " +
+		return "Your session carries a data access policy, so these results come from the LIVE INDEX ONLY: " +
 			"archived (rotated) hours are not searched, because the archive path cannot apply the " +
-			"redaction your profile requires. A short or empty result does not mean nothing happened " +
-			"in that window; ask an operator without a data profile, or use the CLI, to search the archives."
+			"redaction your policy requires. A short or empty result does not mean nothing happened " +
+			"in that window; ask an operator without data restrictions, or use the CLI, to search the archives."
 	}
 	return ""
 }

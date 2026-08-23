@@ -89,6 +89,12 @@ func (s *Server) consoleQueryContext(r *http.Request) (ext.ConsoleQueryContext, 
 // console's own surfaces solved the same problem.
 func (s *Server) consoleFetch(b *bundle) func(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
 	return func(ctx context.Context, opts query.Options) ([]query.ResultRow, *query.QueryPlan, error) {
+		// STARTUP floor only. This closure has no *http.Request, so session
+		// scoping — the profile since #1075, and policy restrictions since
+		// #1449 — structurally cannot be attached here; rbacViewGuard is what
+		// keeps a restricted session away from every provider handler that
+		// could reach this fetch. The defense-in-depth this closure provides
+		// covers exactly the process-global posture, nothing session-scoped.
 		opts.DenyTables = s.denyTables
 		opts.RedactColumns = s.redactCols
 		opts.ProfileActive = s.profileActive

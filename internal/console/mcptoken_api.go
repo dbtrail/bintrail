@@ -63,6 +63,17 @@ var mcpTokenMutateMu sync.Mutex
 // minter (nil policy — the static token, a password login, every OSS
 // session) records no cap.
 func (s *Server) handleMCPTokenGenerate(w http.ResponseWriter, r *http.Request) {
+	// A DATA-restricted session (profile or policy restrictions, #1449) is
+	// refused outright: the token file records permission grants only, so a
+	// minted token would read the same index through /mcp with the session's
+	// redaction gone — the permission cap below cannot express a data scope.
+	// Same posture as every surface that cannot honor redaction.
+	if pol := policyFrom(r.Context()); pol.DataRestricted() {
+		recordProfileGateDeny(r, "mcp-token")
+		writeJSONError(w, http.StatusForbidden,
+			"an MCP token cannot be generated from a session with a data access policy: the token would read the index without your session's redaction. Ask an operator without data restrictions to manage the MCP token.")
+		return
+	}
 	mcpTokenMutateMu.Lock()
 	defer mcpTokenMutateMu.Unlock()
 	var grants []ext.Permission

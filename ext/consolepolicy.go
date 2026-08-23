@@ -106,7 +106,11 @@ type SessionRestrictions struct {
 	// AllowTables, when non-empty, withholds every table NOT listed.
 	AllowTables []TableRef
 	// AllowColumns, for each table appearing in it, nulls every column of that
-	// table's row images NOT listed for it.
+	// table's row images NOT listed for it. It scopes COLUMNS of the tables
+	// it names and does not by itself withhold other tables — a provider
+	// wanting table-level allow-listing sets AllowTables as well (the usual
+	// pairing: AllowTables says which tables, AllowColumns narrows within
+	// them).
 	AllowColumns []TableColumnRef
 }
 
