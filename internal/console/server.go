@@ -672,6 +672,15 @@ func (s *Server) buildHandler() http.Handler {
 	mcpH := s.mcpHandler()
 	root.Handle("/mcp", mcpH)
 	root.Handle("/mcp/{server}", mcpH)
+	// Trailing-slash tolerance: {server} requires a NON-EMPTY segment, so
+	// without these two patterns "/mcp/" and "/mcp/<name>/" fell through to
+	// the SPA catch-all below — and an MCP client that got the web page with
+	// a 200 died on "unsupported content type" (the most common hand-edit a
+	// pasted address suffers; observed live 2026-08-23). {$} pins the empty
+	// tail to the same handler; PathValue("server") is "" on the first (the
+	// default server, same as bare /mcp) and the name on the second.
+	root.Handle("/mcp/{$}", mcpH)
+	root.Handle("/mcp/{server}/{$}", mcpH)
 	root.Handle("/", assetHandler()) // static shell + assets
 
 	return s.hostGuard(securityHeaders(root))

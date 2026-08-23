@@ -502,3 +502,28 @@ func TestMCPBManifestToolsMatchServer(t *testing.T) {
 			manifestNames, serverNames)
 	}
 }
+
+// bridgeHint's two matchers are pinned to the failure signatures observed
+// live: the SDK's content-type error when an address lands on the web page,
+// and the console's authentication-rejected wording. Anything else stays
+// hint-free so the raw error is the whole story.
+func TestBridgeHint(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{nil, ""},
+		{errors.New(`calling "initialize": sending "initialize": unsupported content type "text/html"`), "web page"},
+		{errors.New(`sending "initialize": Unauthorized (authentication rejected — check --token)`), "refused the token"},
+		{errors.New("dial tcp 127.0.0.1:18091: connect: connection refused"), ""},
+	}
+	for _, c := range cases {
+		got := bridgeHint(c.err)
+		if c.want == "" && got != "" {
+			t.Errorf("bridgeHint(%v) = %q, want no hint", c.err, got)
+		}
+		if c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("bridgeHint(%v) = %q, want it to mention %q", c.err, got, c.want)
+		}
+	}
+}

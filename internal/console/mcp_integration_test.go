@@ -300,6 +300,54 @@ func mintManagedMCPToken(t *testing.T, ts *httptest.Server, bearer string) strin
 // that minted it, so the MCP door and the /api door to the same data enforce
 // the same permission model. A full-access mint (and, byte-identically, a
 // token file from before grants were recorded) keeps the full read surface.
+// A trailing slash is the most common hand-edit a pasted address suffers,
+// and before the {$} routes below existed, "/mcp/" fell through to the SPA
+// catch-all: the bridge received the console's HTML page with a 200 and
+// died on "unsupported content type" (observed live, 2026-08-23). The
+// discriminating claim is that these paths reach the MCP handler (401 with
+// a bad token, JSON-family content) and never the asset handler (200 html).
+func TestIntegrationMCPTrailingSlashRoutes(t *testing.T) {
+	srv, _, dbName := seedMCPConsole(t)
+	reg, err := LoadRegistry("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Add(ServerEntry{Name: "reg-target", DSN: testutil.SnapshotDSN(dbName), NoArchive: true}); err != nil {
+		t.Fatal(err)
+	}
+	srv.cm.reg = reg
+
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	for _, path := range []string{"/mcp/", "/mcp/reg-target/"} {
+		req, err := http.NewRequest(http.MethodPost, ts.URL+path,
+			strings.NewReader(`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("POST %s with a bad token: status %d, want 401 (the MCP handler); 200 means the SPA swallowed it", path, resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/html") {
+			t.Errorf("POST %s answered %q — the web page, not the MCP endpoint", path, ct)
+		}
+	}
+
+	// The positive half: a real session through the slashed default route.
+	session := mcpConnect(t, ts.URL+"/mcp/", intToken)
+	if _, err := session.ListTools(context.Background(), nil); err != nil {
+		t.Fatalf("ListTools via /mcp/: %v", err)
+	}
+}
+
 func TestIntegrationMCPTokenGrants(t *testing.T) {
 	srv, _, _ := seedMCPConsole(t)
 	ts := httptest.NewServer(srv.Handler())

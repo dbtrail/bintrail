@@ -50,6 +50,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -113,6 +114,23 @@ func standaloneConfig(resolve mcptools.ResolveTarget) mcptools.Config {
 	}
 }
 
+// bridgeHint turns the two connect failures a person can actually fix into a
+// plain-words next step. String matching on the SDK's error text is fine
+// here: this decorates a fatal log line, it never drives behavior.
+func bridgeHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if strings.Contains(msg, `unsupported content type "text/html"`) {
+		return "the address answered a web page, not the MCP endpoint. Check --connect: it should end in /mcp or /mcp/<server> (a trailing slash on an older console, or the console's root URL, lands on the web page)."
+	}
+	if strings.Contains(msg, "authentication rejected") {
+		return "the console refused the token. Paste the token value alone (no name= prefix), and remember every New token replaces the old one: only the newest value works."
+	}
+	return ""
+}
+
 func main() {
 	httpAddr := flag.String("http", "", "HTTP listen address (e.g. :8080); omit to use stdio")
 	tenantDSNsFile := flag.String("tenant-dsns", "", "JSON file mapping tenant IDs to index DSNs (multi-tenant mode)")
@@ -137,6 +155,9 @@ func main() {
 		}
 		// One clear line on stderr: Claude Desktop surfaces this in its logs.
 		fmt.Fprintf(os.Stderr, "bintrail-mcp: bridge failed: %v\n", err)
+		if hint := bridgeHint(err); hint != "" {
+			fmt.Fprintf(os.Stderr, "bintrail-mcp: %s\n", hint)
+		}
 		os.Exit(1)
 	}
 
