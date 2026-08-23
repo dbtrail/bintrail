@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -969,7 +970,7 @@ func filterSchemas(names []string, allow []query.SchemaTable) []string {
 	for _, at := range allow {
 		allowed[at.Schema] = true
 	}
-	var out []string
+	out := []string{} // never null on the wire, matching handleProfiles
 	for _, n := range names {
 		if allowed[n] {
 			out = append(out, n)
@@ -981,14 +982,18 @@ func filterSchemas(names []string, allow []query.SchemaTable) []string {
 // filterTables withholds table names the resolved scope would withhold as
 // rows: denied tables are dropped, and in allow-list mode only the listed
 // tables of this schema survive. Deny composes over allow, as everywhere.
+// The two matches are asymmetric like the SQL clauses (see buildQuery's
+// allow clause): allow matches EXACTLY (a case-insensitive allow fails open),
+// deny matches case-insensitively (withholding more is the safe direction,
+// and it mirrors what the column-collation deny clause withholds as rows).
 func filterTables(schema string, tables []string, deny, allow []query.SchemaTable) []string {
 	if len(deny) == 0 && len(allow) == 0 {
 		return tables
 	}
-	denied := make(map[string]bool, len(deny))
+	var denied []string
 	for _, dt := range deny {
-		if dt.Schema == schema {
-			denied[dt.Table] = true
+		if strings.EqualFold(dt.Schema, schema) {
+			denied = append(denied, dt.Table)
 		}
 	}
 	var allowed map[string]bool
@@ -1000,9 +1005,9 @@ func filterTables(schema string, tables []string, deny, allow []query.SchemaTabl
 			}
 		}
 	}
-	var out []string
+	out := []string{} // never null on the wire, matching handleProfiles
 	for _, t := range tables {
-		if denied[t] {
+		if slices.ContainsFunc(denied, func(d string) bool { return strings.EqualFold(d, t) }) {
 			continue
 		}
 		if allowed != nil && !allowed[t] {
@@ -1180,6 +1185,13 @@ func atoiDefault(s string, def int) int {
 // ALTER — is confined to the command-line DSN), so instead of a cryptic 500 we
 // return an actionable 422 telling the operator how to migrate.
 func writeFetchError(w http.ResponseWriter, err error) {
+	// A policy refusal, not a fault: the changed-column filter is withheld
+	// under column-level redaction (#1449; the engine's sentinel carries the
+	// full reasoning). 403 like every other policy refusal on this surface.
+	if errors.Is(err, query.ErrChangedColumnUnderRedaction) {
+		writeJSONError(w, http.StatusForbidden, err.Error())
+		return
+	}
 	var myErr *mysql.MySQLError
 	if errors.As(err, &myErr) && myErr.Number == 1054 &&
 		(strings.Contains(myErr.Message, "connection_id") ||

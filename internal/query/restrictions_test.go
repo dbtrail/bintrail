@@ -17,9 +17,12 @@ func TestBuildQuery_allowTables(t *testing.T) {
 	}
 	q, args := buildQuery(opts)
 
-	want := "((schema_name = ? AND table_name = ?) OR (schema_name = ? AND table_name = ?))"
+	// BINARY is load-bearing: the columns' collation is commonly
+	// case-insensitive, and a case-insensitive ALLOW fails open (it would
+	// also serve a distinct same-name-other-case table).
+	want := "((BINARY schema_name = ? AND BINARY table_name = ?) OR (BINARY schema_name = ? AND BINARY table_name = ?))"
 	if !strings.Contains(q, want) {
-		t.Errorf("expected allow-list clause %q in query: %s", want, q)
+		t.Errorf("expected exact-match allow-list clause %q in query: %s", want, q)
 	}
 	if len(args) != 4 {
 		t.Fatalf("expected 4 args for 2 allow tables, got %d: %v", len(args), args)
@@ -42,11 +45,13 @@ func TestBuildQuery_allowAndDenyCompose(t *testing.T) {
 		DenyTables:  []SchemaTable{{Schema: "db", Table: "t"}},
 	}
 	q, _ := buildQuery(opts)
-	if !strings.Contains(q, "(schema_name = ? AND table_name = ?)") {
+	if !strings.Contains(q, "(BINARY schema_name = ? AND BINARY table_name = ?)") {
 		t.Errorf("expected allow clause in query: %s", q)
 	}
+	// Deny deliberately stays on the column collation (case-insensitive
+	// withholds MORE, the safe direction) — no BINARY here.
 	if !strings.Contains(q, "NOT (schema_name = ? AND table_name = ?)") {
-		t.Errorf("expected deny clause in query: %s", q)
+		t.Errorf("expected collation-matched deny clause in query: %s", q)
 	}
 }
 
@@ -139,5 +144,74 @@ func TestRedactionActive_perField(t *testing.T) {
 	}
 	if (Options{}).RedactionActive() {
 		t.Error("zero Options must not report RedactionActive")
+	}
+}
+
+// TestChangedColumnFilterUnderColumnRules pins the #1449 sibling of the
+// digest refusal: a changed-column filter under COLUMN-level rules is an
+// existence oracle over exactly the hidden columns, so it is refused — while
+// deny-table-only rules (no hidden column anywhere) keep the filter.
+func TestChangedColumnFilterUnderColumnRules(t *testing.T) {
+	base := Options{ChangedColumn: "ssn"}
+
+	refused := []struct {
+		name string
+		opts Options
+	}{
+		{"RedactColumns", Options{ChangedColumn: "ssn", RedactColumns: []SchemaTableColumn{{Schema: "s", Table: "t", Column: "ssn"}}}},
+		{"AllowColumns", Options{ChangedColumn: "ssn", AllowColumns: []SchemaTableColumn{{Schema: "s", Table: "t", Column: "id"}}}},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.opts.ValidateStatementFilter(); !errors.Is(err, ErrChangedColumnUnderRedaction) {
+				t.Errorf("err = %v, want ErrChangedColumnUnderRedaction", err)
+			}
+		})
+	}
+	allowedCases := []struct {
+		name string
+		opts Options
+	}{
+		{"no rules", base},
+		{"deny tables only", Options{ChangedColumn: "ssn", DenyTables: []SchemaTable{{Schema: "s", Table: "t"}}}},
+		{"named profile, zero rules", Options{ChangedColumn: "ssn", ProfileActive: true}},
+		{"allow tables only", Options{ChangedColumn: "ssn", AllowTables: []SchemaTable{{Schema: "s", Table: "t"}}}},
+	}
+	for _, tc := range allowedCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.opts.ValidateStatementFilter(); err != nil {
+				t.Errorf("err = %v, want nil (no column is hidden here)", err)
+			}
+		})
+	}
+}
+
+// TestApplyRedaction_stripsHiddenChangedColumns pins that hidden column NAMES
+// are removed from ChangedColumns: values are nulled by the pass, but the
+// name list would otherwise enumerate the withheld schema on every UPDATE
+// row. Untouched tables keep their list.
+func TestApplyRedaction_stripsHiddenChangedColumns(t *testing.T) {
+	rows := []ResultRow{
+		{
+			SchemaName:     "mydb",
+			TableName:      "employees",
+			ChangedColumns: []string{"name", "salary", "ssn"},
+		},
+		{
+			SchemaName:     "mydb",
+			TableName:      "orders",
+			ChangedColumns: []string{"amount"},
+		},
+	}
+	allow := []SchemaTableColumn{{Schema: "mydb", Table: "employees", Column: "name"}}
+	redact := []SchemaTableColumn{{Schema: "mydb", Table: "employees", Column: "name"}}
+	// name is allowed AND redacted: redact wins, so it is stripped too.
+	applyRedaction(rows, redact, allow)
+
+	if len(rows[0].ChangedColumns) != 0 {
+		t.Errorf("hidden column names leaked through changed_columns: %v", rows[0].ChangedColumns)
+	}
+	if len(rows[1].ChangedColumns) != 1 || rows[1].ChangedColumns[0] != "amount" {
+		t.Errorf("a table with no column rules must keep its changed_columns: %v", rows[1].ChangedColumns)
 	}
 }

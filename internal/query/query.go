@@ -485,11 +485,28 @@ func (o Options) RedactionActive() bool {
 var ErrQueryHashUnderProfile = errors.New(
 	"statement-digest filter unavailable while an RBAC profile is active: the digest is withheld from every returned row, so filtering on it would confirm the statement that redaction hides")
 
+// ErrChangedColumnUnderRedaction is returned when a changed-column filter is
+// combined with COLUMN-LEVEL redaction rules (RedactColumns or AllowColumns,
+// #1449). The reasoning is ErrQueryHashUnderProfile's, transferred: the
+// redaction pass nulls a hidden column's VALUES, but honouring a filter on
+// "rows where <hidden column> changed" confirms that column's existence,
+// change timing and affected PKs one candidate at a time — the answer the
+// nulling withholds. Deny-table-only rules do not trip this: no column is
+// hidden there, only whole tables, which the table clauses already enforce.
+//
+// The message names no CLI flag, for the same MCP-client reason as the
+// digest refusal.
+var ErrChangedColumnUnderRedaction = errors.New(
+	"changed-column filter unavailable while column-level redaction is active: hidden columns are nulled in every returned row, so filtering on one would confirm the changes that redaction hides")
+
 // ValidateStatementFilter rejects option combinations the redaction contract
 // cannot honour. Called by Fetch, so every engine path is covered.
 func (o Options) ValidateStatementFilter() error {
 	if o.QueryHash != "" && o.RedactionActive() {
 		return ErrQueryHashUnderProfile
+	}
+	if o.ChangedColumn != "" && (len(o.RedactColumns) > 0 || len(o.AllowColumns) > 0) {
+		return ErrChangedColumnUnderRedaction
 	}
 	return nil
 }
@@ -840,9 +857,17 @@ func buildQuery(opts Options) (string, []any) {
 		// Allow-list mode (#1449): only the listed tables survive. Emitted
 		// BEFORE the deny clauses so the composed WHERE reads allow-then-deny,
 		// though AND makes the order semantically irrelevant — deny always wins.
+		//
+		// BINARY, asymmetrically on purpose: the columns' collation is the
+		// server default, commonly case-insensitive, and a case-insensitive
+		// ALLOW fails open — an entry for `users` would also serve a distinct
+		// `Users` table's rows (lower_case_table_names=0 hosts). Deny stays on
+		// the column collation: case-insensitive there withholds MORE, the
+		// safe direction. BINARY rather than a COLLATE clause so an index
+		// whose columns are not utf8mb4 cannot error the comparison.
 		ors := make([]string, len(opts.AllowTables))
 		for i, at := range opts.AllowTables {
-			ors[i] = "(schema_name = ? AND table_name = ?)"
+			ors[i] = "(BINARY schema_name = ? AND BINARY table_name = ?)"
 			args = append(args, at.Schema, at.Table)
 		}
 		where = append(where, "("+strings.Join(ors, " OR ")+")")
@@ -962,6 +987,20 @@ func applyRedaction(rows []ResultRow, redact, allow []SchemaTableColumn) {
 			if null(col) {
 				r.RowAfter[col] = nil
 			}
+		}
+		// ChangedColumns carries column NAMES, and a hidden column's name is
+		// itself what the restriction withholds — under an allow list every
+		// unlisted column of the table would otherwise be enumerated by name
+		// on every UPDATE row. Strip the hidden names; rows of tables with no
+		// column rule are untouched.
+		if r.ChangedColumns != nil && (allowListed || len(set) > 0) {
+			kept := r.ChangedColumns[:0:0]
+			for _, col := range r.ChangedColumns {
+				if !null(col) {
+					kept = append(kept, col)
+				}
+			}
+			r.ChangedColumns = kept
 		}
 	}
 }

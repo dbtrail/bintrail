@@ -321,8 +321,8 @@ func TestBuildActivitySQL_allowList(t *testing.T) {
 	allow := []query.SchemaTable{{Schema: "app", Table: "users"}, {Schema: "app", Table: "orders"}}
 	deny := []query.SchemaTable{{Schema: "app", Table: "orders"}}
 	q, args := buildActivitySQL(since, since.Add(time.Hour), deny, allow)
-	if !strings.Contains(q, "AND ((schema_name = ? AND table_name = ?) OR (schema_name = ? AND table_name = ?))") {
-		t.Errorf("allow-list clause missing: %s", q)
+	if !strings.Contains(q, "AND ((BINARY schema_name = ? AND BINARY table_name = ?) OR (BINARY schema_name = ? AND BINARY table_name = ?))") {
+		t.Errorf("exact-match allow-list clause missing: %s", q)
 	}
 	if !strings.Contains(q, "AND NOT (schema_name = ? AND table_name = ?)") {
 		t.Errorf("deny clause must still compose over the allow list: %s", q)

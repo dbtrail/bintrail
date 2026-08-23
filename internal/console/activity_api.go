@@ -507,12 +507,13 @@ func buildActivitySQL(since, until time.Time, deny, allow []query.SchemaTable) (
 	sb.WriteString("SELECT schema_name, table_name, event_type, COUNT(*) AS n FROM binlog_events" +
 		" WHERE event_timestamp >= ? AND event_timestamp < ?")
 	args := []any{since, until}
-	// Allow-list mode (#1449) mirrors buildQuery: only the listed tables
-	// survive; deny still composes over it below.
+	// Allow-list mode (#1449) mirrors buildQuery, BINARY included: a
+	// case-insensitive allow would also count a distinct same-name-other-case
+	// table (see buildQuery's allow clause for the full rationale).
 	if len(allow) > 0 {
 		ors := make([]string, len(allow))
 		for i, at := range allow {
-			ors[i] = "(schema_name = ? AND table_name = ?)"
+			ors[i] = "(BINARY schema_name = ? AND BINARY table_name = ?)"
 			args = append(args, at.Schema, at.Table)
 		}
 		sb.WriteString(" AND (" + strings.Join(ors, " OR ") + ")")

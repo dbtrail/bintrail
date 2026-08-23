@@ -61,6 +61,13 @@ func TestIntegrationSessionRestrictionsRedaction(t *testing.T) {
 func TestIntegrationSessionRestrictionsAllowList(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	srv := newProfileIndexServer(t)
+	// A DISTINCT table whose name differs only by case: the allow match must
+	// be exact (the columns' collation is case-insensitive, and a
+	// case-insensitive allow would serve this table too — the fail-open
+	// direction).
+	testutil.InsertEvent(t, srv.cm.boot.db, "bin.000001", 120, 160, "2026-06-01 12:03:00", nil,
+		"app", "Users", 1 /*INSERT*/, "1",
+		nil, nil, []byte(`{"id":1,"value":"topsecret-case"}`))
 	scoped := restrictedBearer(t, srv, &ext.SessionRestrictions{
 		AllowTables:  []ext.TableRef{{Schema: "app", Table: "users"}},
 		AllowColumns: []ext.TableColumnRef{{Schema: "app", Table: "users", Column: "id"}, {Schema: "app", Table: "users", Column: "email"}},
@@ -68,6 +75,9 @@ func TestIntegrationSessionRestrictionsAllowList(t *testing.T) {
 
 	if rec := getPath(t, srv, "127.0.0.1:8090", "/api/events?schema=app&table=secrets", scoped); strings.Contains(rec.Body.String(), "topsecret") {
 		t.Errorf("table outside the allow list leaked to a restricted session: %s", rec.Body.String())
+	}
+	if rec := getPath(t, srv, "127.0.0.1:8090", "/api/events?schema=app&table=Users", scoped); strings.Contains(rec.Body.String(), "topsecret-case") {
+		t.Errorf("a case-variant table leaked through the allow list: %s", rec.Body.String())
 	}
 	rec := getPath(t, srv, "127.0.0.1:8090", "/api/events?schema=app&table=users", scoped)
 	if strings.Contains(rec.Body.String(), "ssn-12345") {
