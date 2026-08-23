@@ -503,9 +503,10 @@ func TestMCPBManifestToolsMatchServer(t *testing.T) {
 	}
 }
 
-// bridgeHint's two matchers are pinned to the failure signatures observed
-// live: the SDK's content-type error when an address lands on the web page,
-// and the console's authentication-rejected wording. Anything else stays
+// bridgeHint's matchers: the SDK's content-type error when an address lands
+// on the web page (observed live), and OUR OWN authHint decoration from
+// bridge.go — its fixture is built by calling the real producer, so
+// rewording authHint without bridgeHint flips this red. Anything else stays
 // hint-free so the raw error is the whole story.
 func TestBridgeHint(t *testing.T) {
 	cases := []struct {
@@ -514,7 +515,7 @@ func TestBridgeHint(t *testing.T) {
 	}{
 		{nil, ""},
 		{errors.New(`calling "initialize": sending "initialize": unsupported content type "text/html"`), "web page"},
-		{errors.New(`sending "initialize": Unauthorized (authentication rejected — check --token)`), "refused the token"},
+		{errors.New(`sending "initialize": Unauthorized` + authHint(errors.New("401 Unauthorized"))), "did not accept the credential"},
 		{errors.New("dial tcp 127.0.0.1:18091: connect: connection refused"), ""},
 	}
 	for _, c := range cases {

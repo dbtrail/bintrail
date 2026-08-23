@@ -115,8 +115,10 @@ func standaloneConfig(resolve mcptools.ResolveTarget) mcptools.Config {
 }
 
 // bridgeHint turns the two connect failures a person can actually fix into a
-// plain-words next step. String matching on the SDK's error text is fine
-// here: this decorates a fatal log line, it never drives behavior.
+// plain-words next step. It decorates a fatal log line and never drives
+// behavior, so string matching is acceptable; matcher 1 is the SDK's exact
+// wording (stable across the pinned go-sdk versions), matcher 2 is our own
+// authRejectedMarker from authHint in bridge.go.
 func bridgeHint(err error) string {
 	if err == nil {
 		return ""
@@ -125,8 +127,8 @@ func bridgeHint(err error) string {
 	if strings.Contains(msg, `unsupported content type "text/html"`) {
 		return "the address answered a web page, not the MCP endpoint. Check --connect: it should end in /mcp or /mcp/<server> (a trailing slash on an older console, or the console's root URL, lands on the web page)."
 	}
-	if strings.Contains(msg, "authentication rejected") {
-		return "the console refused the token. Paste the token value alone (no name= prefix), and remember every New token replaces the old one: only the newest value works."
+	if strings.Contains(msg, authRejectedMarker) {
+		return "the console did not accept the credential. Paste only the token value, with nothing before or after it; on a console started with a fixed token, that fixed value is the one to use; and every managed token minted on the Connect AI page replaces the previous one, so only the newest works. If the console has no token configured at all, create one on its Connect AI page first."
 	}
 	return ""
 }

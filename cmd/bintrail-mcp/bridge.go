@@ -81,11 +81,22 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // side) and a remote client session (HTTP side).
 type bridge struct {
 	endpoint string
-	session  *mcp.ClientSession
 	server   *mcp.Server
 
-	mu    sync.Mutex
-	tools map[string]bool // tool names currently registered on the local server
+	mu      sync.Mutex
+	session *mcp.ClientSession // nil until Connect returns inside newBridge
+	tools   map[string]bool    // tool names currently registered on the local server
+}
+
+// remoteSession returns the connected session, or nil while Connect is still
+// in flight. The ToolListChangedHandler can fire on the session's receive
+// loop BEFORE newBridge's assignment runs (a buffered reverse proxy shifts
+// delivery timing enough to hit it live, 2026-08-23), so every use from a
+// handler goroutine goes through here instead of reading the field bare.
+func (b *bridge) remoteSession() *mcp.ClientSession {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.session
 }
 
 // newBridge connects to the remote endpoint, mirrors its tool set onto a
@@ -124,7 +135,9 @@ func newBridge(ctx context.Context, endpoint, token string) (*bridge, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to %s: %w%s", endpoint, err, authHint(err))
 	}
+	b.mu.Lock()
 	b.session = session
+	b.mu.Unlock()
 
 	// Mirror the remote server's instructions so the stdio client sees the
 	// same guidance it would get connecting directly.
@@ -144,7 +157,7 @@ func newBridge(ctx context.Context, endpoint, token string) (*bridge, error) {
 }
 
 // Close terminates the remote session.
-func (b *bridge) Close() error { return b.session.Close() }
+func (b *bridge) Close() error { return b.remoteSession().Close() }
 
 // toolCount returns the number of currently mirrored tools.
 func (b *bridge) toolCount() int {
@@ -157,8 +170,17 @@ func (b *bridge) toolCount() int {
 // set: every remote tool is (re-)registered verbatim with a forwarding
 // handler, and local tools that disappeared from the remote are removed.
 func (b *bridge) resync(ctx context.Context) error {
+	session := b.remoteSession()
+	if session == nil {
+		// tools/list_changed arrived while Connect was still in flight: the
+		// explicit resync newBridge runs right after Connect covers the same
+		// tool set, so skipping the early notification loses nothing. Before
+		// this guard, that ordering was a nil dereference PANIC, reproduced
+		// through any response-buffering proxy in front of the console.
+		return nil
+	}
 	var remote []*mcp.Tool
-	for tool, err := range b.session.Tools(ctx, nil) {
+	for tool, err := range session.Tools(ctx, nil) {
 		if err != nil {
 			return err
 		}
@@ -205,7 +227,7 @@ func (b *bridge) forward(name string) mcp.ToolHandler {
 		if len(req.Params.Arguments) > 0 {
 			params.Arguments = json.RawMessage(req.Params.Arguments)
 		}
-		return b.session.CallTool(ctx, params)
+		return b.remoteSession().CallTool(ctx, params)
 	}
 }
 
@@ -223,13 +245,18 @@ func isObjectSchema(schema any) bool {
 	return m["type"] == "object"
 }
 
+// authRejectedMarker is OUR OWN wording (nothing in the SDK or the console
+// emits it); bridgeHint keys its follow-up line on the same constant, so the
+// two can only drift together.
+const authRejectedMarker = "authentication rejected"
+
 // authHint appends a token hint when the remote rejected the request with an
 // auth-shaped status, so the one-line stderr message is actionable.
 func authHint(err error) string {
 	msg := err.Error()
 	if strings.Contains(msg, "401") || strings.Contains(msg, "403") ||
 		strings.Contains(msg, "Unauthorized") || strings.Contains(msg, "Forbidden") {
-		return " (authentication rejected; check --token)"
+		return " (" + authRejectedMarker + "; check --token)"
 	}
 	return ""
 }

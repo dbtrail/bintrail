@@ -894,7 +894,10 @@ server {
 
         # Backup and SQL-export downloads are written straight to the
         # response as they are built. With buffering on, nginx spools the
-        # whole archive to disk before sending a byte of it.
+        # whole archive to disk before sending a byte of it. The /mcp
+        # endpoint needs this line too: an AI client connecting through a
+        # buffering proxy sees its stream held back and stalls or drops
+        # during the handshake.
         proxy_buffering off;
     }
 }

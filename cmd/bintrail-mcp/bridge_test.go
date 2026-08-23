@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -64,5 +65,18 @@ func TestAuthHint(t *testing.T) {
 	}
 	if hint := authHint(errors.New("dial tcp: connection refused")); hint != "" {
 		t.Errorf("network error produced a token hint: %q", hint)
+	}
+}
+
+// The console emits tools/list_changed as soon as the session exists, and the
+// SDK can deliver it on the receive loop BEFORE Client.Connect returns — so
+// the handler's resync can run while newBridge has not assigned the session
+// yet. A buffered reverse proxy shifts timing enough to hit this live
+// (2026-08-23: nil dereference panic through nginx with default buffering).
+// The bridge must treat that early notification as a no-op, not a crash.
+func TestResyncBeforeConnectIsANoOp(t *testing.T) {
+	b := &bridge{endpoint: "test", tools: map[string]bool{}}
+	if err := b.resync(context.Background()); err != nil {
+		t.Fatalf("resync with no session yet: %v (want nil no-op)", err)
 	}
 }
