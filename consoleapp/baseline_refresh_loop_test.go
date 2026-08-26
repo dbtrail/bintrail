@@ -1,9 +1,12 @@
 package consoleapp
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
@@ -72,6 +75,11 @@ func TestStartBaselineRefreshLoop_startupContract(t *testing.T) {
 		{"no supervisor wired", nil, "6h", "d", "/b", "without a baseline supervisor"},
 		{"nothing refreshable yet: warns, starts anyway", sup, "6h", "", "", ""},
 		{"configured", sup, "6h", "dsn", "/b", ""},
+		// The wiring, not the parser: minutes reach the loop only because the
+		// flag stopped going through ParseRetain, which accepts hours and days
+		// only. Parsing "15m" correctly in cliutil proves nothing about which
+		// parser this call site actually reaches (#1469).
+		{"minutes are an interval", sup, "15m", "dsn", "/b", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := startBaselineRefreshLoop(ctx, nil, tc.sup, tc.dsn, tc.dir, tc.interval)
@@ -152,5 +160,90 @@ func TestRunBaselineRefreshCycle_stopsOnCancel(t *testing.T) {
 	runBaselineRefreshCycle(ctx, nil, sup, "dsn", "/b")
 	if got := sup.RefreshStatus("default"); got.State != "idle" {
 		t.Fatalf("a cancelled cycle started work: %+v", got)
+	}
+}
+
+func TestSnapshotsPer30Days(t *testing.T) {
+	for _, tc := range []struct {
+		interval time.Duration
+		want     int64
+	}{
+		{5 * time.Minute, 8640},
+		{15 * time.Minute, 2880},
+		{time.Hour, 720},
+		{24 * time.Hour, 30},
+		// The regime a per-DAY projection got wrong: integer division sent
+		// every interval longer than a day to zero, so a 7d refresh reported
+		// "0 snapshots per day", which reads as none and is the opposite of
+		// what it means.
+		{7 * 24 * time.Hour, 4},
+		{29 * 24 * time.Hour, 1},
+		// Past the horizon there is no honest integer, so the caller is told
+		// to omit the figure rather than print a zero.
+		{31 * 24 * time.Hour, 0},
+		{0, 0}, // guarded: a zero interval never reaches here, and must not divide
+	} {
+		if got := snapshotsPer30Days(tc.interval); got != tc.want {
+			t.Errorf("snapshotsPer30Days(%v) = %d, want %d", tc.interval, got, tc.want)
+		}
+	}
+}
+
+// A projection that rounds to zero must not be logged at all: "0 snapshots"
+// states the opposite of the truth about a long interval, and the interval
+// logged beside it already says what the rate is.
+func TestDiskArgs_omitsAnUnmeaningfulProjection(t *testing.T) {
+	has := func(args []any, key string) bool {
+		for i := 0; i+1 < len(args); i += 2 {
+			if k, ok := args[i].(string); ok && k == key {
+				return true
+			}
+		}
+		return false
+	}
+
+	short := diskArgs(15*time.Minute, nil)
+	if !has(short, "full_table_snapshots_per_30d") {
+		t.Errorf("a 15m interval logged no projection: %v", short)
+	}
+	long := diskArgs(90*24*time.Hour, nil)
+	if has(long, "full_table_snapshots_per_30d") {
+		t.Errorf("a 90d interval logged a projection that rounds to zero: %v", long)
+	}
+	for _, args := range [][]any{short, long} {
+		if !has(args, "interval") || !has(args, "dirs") {
+			t.Errorf("disk warning lost an attribute it always carried: %v", args)
+		}
+	}
+}
+
+// An overrun has no symptom of its own: the ticker drops the tick and the next
+// cycle simply starts later, so the only visible effect is snapshots appearing
+// less often than the flag asked for. This is the line that names it.
+func TestReportRefreshCycleDuration_warnsOnlyOnOverrun(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	capture := func(interval, took time.Duration) string {
+		var buf bytes.Buffer
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		reportRefreshCycleDuration(interval, took)
+		return buf.String()
+	}
+
+	if out := capture(time.Hour, 5*time.Minute); out != "" {
+		t.Errorf("a cycle inside its interval warned: %q", out)
+	}
+	if out := capture(time.Hour, time.Hour); out != "" {
+		t.Errorf("a cycle exactly at its interval warned: %q", out)
+	}
+	out := capture(5*time.Minute, 12*time.Minute)
+	if out == "" {
+		t.Fatal("a cycle that outran its interval said nothing")
+	}
+	for _, want := range []string{"took=12m", "interval=5m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("overrun warning does not carry %q, so it cannot be acted on: %q", want, out)
+		}
 	}
 }

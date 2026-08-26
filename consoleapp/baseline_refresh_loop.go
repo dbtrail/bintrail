@@ -161,7 +161,7 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 	if intervalRaw == "" {
 		return nil
 	}
-	interval, err := cliutil.ParseRetain(intervalRaw)
+	interval, err := cliutil.ParseInterval(intervalRaw)
 	if err != nil {
 		return fmt.Errorf("--baseline-refresh-interval: %w", err)
 	}
@@ -201,8 +201,8 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 	// behalf.
 	slog.Warn("baseline refresh: snapshots from this loop are written locally and never uploaded, so retention "+
 		"cannot reclaim them (a prune needs a confirmed S3 copy of the snapshot). Upload and prune on your own "+
-		"schedule, or size the disk for one full-table snapshot per interval.",
-		"interval", interval, "dirs", refreshTargetDirs(targets))
+		"schedule, or size the disk for the rate below.",
+		diskArgs(interval, targets)...)
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
@@ -211,11 +211,75 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				started := time.Now()
 				runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir)
+				reportRefreshCycleDuration(interval, time.Since(started))
 			}
 		}
 	}()
 	return nil
+}
+
+// reportRefreshCycleDuration states how long a cycle took, and says so plainly
+// when it took longer than the interval that was asked for.
+//
+// A time.Ticker drops ticks rather than queueing them, so an overrun does not
+// pile cycles up — it silently widens the interval instead. Without this the
+// only symptom is that snapshots appear less often than configured, which
+// reads as a broken flag rather than as the refresh costing more than the
+// budget it was given.
+//
+// It is also the measurement that sizes the real problem. Every cycle rewrites
+// each table in full, however little of it changed, so a cycle's duration is
+// write amplification expressed in the unit an operator can act on. An
+// estimate of that cost is a guess about someone else's data; this is theirs.
+func reportRefreshCycleDuration(interval, took time.Duration) {
+	if took <= interval {
+		slog.Info("baseline refresh cycle finished", "took", took, "interval", interval)
+		return
+	}
+	slog.Warn("baseline refresh: the cycle took longer than the configured interval, so refreshes cannot run as "+
+		"often as requested (ticks are dropped, not queued). Each cycle rewrites every table in full regardless "+
+		"of how much changed, so this is the cost of the rewrite, not of the schedule. Raise the interval to "+
+		"match, or narrow the refresh to fewer tables.",
+		"took", took, "interval", interval)
+}
+
+// diskArgs builds the disk warning's attributes, omitting the projection when
+// it is not meaningful rather than logging a misleading zero.
+func diskArgs(interval time.Duration, targets []refreshRequest) []any {
+	args := []any{"interval", interval}
+	if n := snapshotsPer30Days(interval); n > 0 {
+		args = append(args, "full_table_snapshots_per_30d", n)
+	}
+	return append(args, "dirs", refreshTargetDirs(targets))
+}
+
+// snapshotsPer30Days projects how many full-table snapshots the configured
+// interval produces over a month, for the startup warning.
+//
+// The warning has said "one snapshot per interval, forever" since the interval
+// floor was an hour, where the reader could do the arithmetic and the answer
+// was 24 a day. Minutes make that a much worse number and a much easier one to
+// skip over: "every 5m" and "8,640 a month, none of them reclaimable" are the
+// same fact and land differently.
+//
+// Thirty days rather than one, because the warning is about DISK and disk
+// fills over weeks. A per-DAY projection also divides to zero for any interval
+// longer than a day, so a --baseline-refresh-interval of 7d would have
+// reported "0 per day", which reads as "none" and is the opposite of the
+// truth.
+//
+// Returns 0 when the projection is not meaningful (a non-positive interval, or
+// one longer than the horizon itself). The caller omits the figure entirely
+// rather than print a zero, since the interval it logs alongside already tells
+// that story. Reported as a count rather than bytes because a snapshot's size
+// depends on the tables, which this loop does not know at startup.
+func snapshotsPer30Days(interval time.Duration) int64 {
+	if interval <= 0 {
+		return 0
+	}
+	return int64(30 * 24 * time.Hour / interval)
 }
 
 // runBaselineRefreshCycle triggers one refresh per eligible server.
