@@ -219,8 +219,12 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	// because archive_state could not be read) is still worth serving: a
 	// state_* query is fully answerable. What it must not do is stay quiet
 	// about it, in either direction: a success carries the note as a warning,
-	// and a failure carries it ahead of the engine's message, so "table
-	// events does not exist" is not read as a typo in the operator's SQL.
+	// and a failed statement carries it AFTER the engine's message, so "table
+	// events does not exist" is not read as a typo in the operator's SQL. After,
+	// not ahead: *sqlUserError is the panel's whole user-error class (timeouts,
+	// read-policy refusals, scan failures), and a note leading the message
+	// would assert a cause for refusals that never touched the events view.
+	// The audit record keeps the engine message alone for the same reason.
 	res, err := runSandboxedSQL(r.Context(), in, req.SQL)
 	if err != nil {
 		var ue *sqlUserError
@@ -231,11 +235,11 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 			// policy event — stays off the audit seam.
 			return
 		case errors.As(err, &ue):
+			recordSQLRun(r, req.SQL, "refused", ue.msg, 0, false)
 			msg := ue.msg
 			if in.ArchiveDiscoveryFailed {
-				msg = sqlPanelRegistryNote + ". " + msg
+				msg += ". Note: " + sqlPanelRegistryNote
 			}
-			recordSQLRun(r, req.SQL, "refused", msg, 0, false)
 			writeJSONError(w, http.StatusUnprocessableEntity, msg)
 		default:
 			recordSQLRun(r, req.SQL, "error", err.Error(), 0, false)

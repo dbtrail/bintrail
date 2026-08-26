@@ -11,8 +11,9 @@ import (
 	"github.com/go-sql-driver/mysql"
 )
 
-// TestViewsAvailable_readsTheRegistry: every other TestViewsAvailable case
-// returns before the registry read, so this is the one that executes it: a
+// TestViewsAvailable_readsTheRegistry: no other TestViewsAvailable case
+// executes the registry read (a nil db short-circuits it), so this is the one
+// that does: a
 // live registry, no baseline, one local-only archive; the gate must say yes
 // and the handler must serve it. It does NOT pin which routing the gate uses
 // (a local-only row resolves the same under both); that the two routings

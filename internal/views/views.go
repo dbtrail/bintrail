@@ -42,18 +42,21 @@ type Input struct {
 	// ArchiveSources are the archive base paths discovered from archive_state
 	// (each ending in the `bintrail_id=<id>` segment), local or s3://.
 	ArchiveSources []string
-	// ArchivesFromRegistry is true when ArchiveSources came out of the
-	// archive_state registry through query.PortableArchiveSources, which is
-	// the only case in which the header may state the S3-over-local rule; an
-	// operator who named the roots with --archive-dir/--archive-s3 gets
-	// exactly what they named, both of them if they passed both (#1456).
-	ArchivesFromRegistry bool
+	// PortableRouting is true when ArchiveSources were resolved by
+	// query.PortableArchiveSources (S3 wherever the registry has one), which
+	// is the only case in which the header may state that rule. It names the
+	// ROUTING, not the provenance: the console SQL panel's sources also come
+	// out of the registry, local-first, and leave this false. An operator who
+	// named the roots with --archive-dir/--archive-s3 gets exactly what they
+	// named, both of them if they passed both (#1456).
+	PortableRouting bool
 	// ArchiveDiscoveryFailed is set when the registry could not be read at
 	// all. The file then says so instead of "none registered", which would
 	// state a cause the caller does not know. A bool, not the error: the
 	// error text names the index host and the DB user (a dial error, a 1142),
-	// and this file is meant to be shared. The text goes to the console log
-	// and to the 502 body, which stay on the console side.
+	// and this file is meant to be shared. The text goes to the console log,
+	// and to the 502 body when there is no baseline half to serve; `bintrail
+	// views` fails the command instead of setting this.
 	ArchiveDiscoveryFailed bool
 	// ArchiveRegion pins REGION in the S3 secret. Empty = let the credential
 	// chain resolve it, which is what every other bintrail S3 read does by
@@ -139,14 +142,16 @@ func writeHeader(b *strings.Builder, in Input) {
 	b.WriteString("--\n")
 
 	// The path choice is stated where the paths are listed, and only when a
-	// choice was made: registry discovery names an archive that lives both on
-	// the generating host and in S3 by its S3 location, because this file is
-	// meant to run on a machine that is not that host (#1456). Explicitly
-	// named roots are listed as named. Baseline state views are out of this
-	// sentence on purpose: they point wherever the baseline root points.
-	if in.ArchivesFromRegistry {
-		b.WriteString("-- Archive sources (an archive registered both on the host that generated this\n")
-		b.WriteString("-- file and in S3 is listed by its S3 location, so those reads work from another\n")
+	// choice was made over a real listing: portable routing names an archive
+	// registered with both a local path and an S3 location by the S3 one,
+	// because this file is meant to run on a machine that is not the one the
+	// local path belongs to (#1456). Explicitly named roots are listed as
+	// named, and a failed read lists nothing, so neither gets the sentence.
+	// Baseline state views are out of it on purpose: they point wherever the
+	// baseline root points.
+	if in.PortableRouting && !in.ArchiveDiscoveryFailed {
+		b.WriteString("-- Archive sources (an archive registered with both a local path and an S3\n")
+		b.WriteString("-- location is listed by its S3 location, so those reads work from another\n")
 		b.WriteString("-- machine; a local path below means the registry holds no S3 location this\n")
 		b.WriteString("-- file can use):\n")
 	} else {

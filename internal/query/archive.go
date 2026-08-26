@@ -115,9 +115,10 @@ func PortableArchiveSources(ctx context.Context, db *sql.DB) ([]string, error) {
 				// The registry HAS an S3 location, but the key does not
 				// follow the bintrail_id= layout the glob needs (an
 				// `upload --source` pointed below that directory does
-				// this), so the local copy is what gets listed. Say so:
-				// the generated file's header calls a local path the only
-				// registered copy, and here that is not true.
+				// this), so the local copy is what gets listed. Say so: the
+				// file will name a host-local path for a source that DOES
+				// have an S3 registration, and this log line is the only
+				// place that explains why.
 				slog.Warn("archive_state row has S3 columns but the key lacks a bintrail_id= segment; listing the local copy instead",
 					"bintrail_id", r.bintrailID, "local_base", r.localBase)
 			}
@@ -127,9 +128,9 @@ func PortableArchiveSources(ctx context.Context, db *sql.DB) ([]string, error) {
 	return sources, nil
 }
 
-// archiveRoots is one archive_state source's registered locations, before any
+// archiveRoot is one archive_state source's registered locations, before any
 // routing policy: either field may be empty.
-type archiveRoots struct {
+type archiveRoot struct {
 	bintrailID string
 	localBase  string // base dir up to bintrail_id=<id>, or ""
 	s3Source   string // s3://bucket/…/bintrail_id=<id>, or ""
@@ -138,14 +139,14 @@ type archiveRoots struct {
 	s3Registered bool
 }
 
-// listArchiveRoots reads the archive_state registry once per distinct
-// bintrail_id. It is the shared half of ResolveArchiveSources and
+// listArchiveRoots reads the archive_state registry in one query, one row per
+// distinct bintrail_id. It is the shared half of ResolveArchiveSources and
 // PortableArchiveSources; the two differ only in which registered location
 // they hand back, so the registry read and its error contract live here.
 //
 // Returns (nil, nil) for a nil db and for a missing archive_state table (MySQL
 // 1146, legitimate on pre-archive indexes); any other read failure propagates.
-func listArchiveRoots(ctx context.Context, db *sql.DB) ([]archiveRoots, error) {
+func listArchiveRoots(ctx context.Context, db *sql.DB) ([]archiveRoot, error) {
 	if db == nil {
 		return nil, nil
 	}
@@ -169,9 +170,9 @@ func listArchiveRoots(ctx context.Context, db *sql.DB) ([]archiveRoots, error) {
 	}
 	defer rows.Close()
 
-	var roots []archiveRoots
+	var roots []archiveRoot
 	for rows.Next() {
-		var r archiveRoots
+		var r archiveRoot
 		var localPath, s3Bucket, s3Key sql.NullString
 		if err := rows.Scan(&r.bintrailID, &localPath, &s3Bucket, &s3Key); err != nil {
 			// A row we cannot read is a source we cannot resolve — the

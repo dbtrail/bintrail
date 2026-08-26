@@ -38,7 +38,7 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 	}
 	var archiveErr error
 	in.ArchiveSources, archiveErr = consoleArchiveSources(ctx, b.db, portable)
-	in.ArchivesFromRegistry = portable // the header sentence describes the portable routing only
+	in.PortableRouting = portable
 	in.ArchiveDiscoveryFailed = archiveErr != nil
 	if b.baselineSrc != "" {
 		in.BaselineSource = b.baselineSrc

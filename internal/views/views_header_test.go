@@ -12,11 +12,11 @@ const routingSentence = "listed by its S3 location"
 // them if both were passed, so the sentence would be false there (#1456).
 func TestGenerate_routingSentenceOnlyForRegistrySources(t *testing.T) {
 	in := goldenInput()
-	in.ArchivesFromRegistry = true
+	in.PortableRouting = true
 	if out := Generate(in); !strings.Contains(out, routingSentence) {
 		t.Errorf("registry-discovered sources: header lacks the routing sentence:\n%s", out)
 	}
-	in.ArchivesFromRegistry = false
+	in.PortableRouting = false
 	if out := Generate(in); strings.Contains(out, routingSentence) {
 		t.Errorf("explicitly named sources: header states a routing that did not happen:\n%s", out)
 	}
@@ -40,5 +40,9 @@ func TestGenerate_discoveryErrorInHeader(t *testing.T) {
 	}
 	if !strings.Contains(out, "-- (skipped: archive_state could not be read; see the header)") {
 		t.Errorf("events body does not point at the header:\n%s", out)
+	}
+	// Nothing was listed, so there is no routing to describe.
+	if strings.Contains(out, routingSentence) {
+		t.Errorf("routing sentence emitted over an empty, failed listing:\n%s", out)
 	}
 }

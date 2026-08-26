@@ -14,14 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is the normal shape after a rotation that archives locally and uploads
   to S3; on the operator's own machine that path does not exist and every
   `events` query failed. Both now name such an archive by its S3 location
-  (`query.PortableArchiveSources`); a local path appears only when it is the
-  sole registered copy. The console's own reads, including the SQL panel,
-  keep the local-first routing. A registry that cannot be read is now named
-  as such in the file's header (or answers 502 when there is no backup half
-  to serve) instead of reading as "nothing archived yet". The file's S3
-  preamble now states that the
-  credential-chain secret lives only in the session that runs the file (views
-  persist in a database file, secrets do not) and why it must not be made
+  (`query.PortableArchiveSources`); a local path appears only when the
+  registry holds no S3 location the file can use. The console's own reads,
+  including the SQL panel, keep the local-first routing. In the console
+  download, a registry that cannot be read is now named as such in the file's
+  header (or answers 502 when there is no backup half to serve) instead of
+  reading as "nothing archived yet"; `bintrail views` fails the command as
+  before. The SQL panel still serves the `state_*` views when `archive_state`
+  cannot be read, and says so: a `warnings` entry on success, and the same
+  note after the engine's error on a failed statement. The file's S3 preamble
+  now states that the credential-chain secret lives only in the session that
+  runs the file (views persist in a database file, secrets do not) and why it
+  must not be made
   `PERSISTENT`: DuckDB would resolve the chain at creation and write the
   resulting keys to disk. The CLI example, the docs and the console toast that
   piped the file into `duckdb lake.db` now show `duckdb -init views.sql lake.db`

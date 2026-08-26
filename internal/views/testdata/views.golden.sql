@@ -9,8 +9,8 @@
 --
 -- Nothing here writes: every view is a read over Parquet files you already own.
 --
--- Archive sources (an archive registered both on the host that generated this
--- file and in S3 is listed by its S3 location, so those reads work from another
+-- Archive sources (an archive registered with both a local path and an S3
+-- location is listed by its S3 location, so those reads work from another
 -- machine; a local path below means the registry holds no S3 location this
 -- file can use):
 --   /data/archives/bintrail_id=11111111-2222-3333-4444-555555555555
