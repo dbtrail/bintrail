@@ -104,8 +104,10 @@ import (
 // one — a false match on a primary-key lookup, which is strictly worse than
 // the miss it would be curing.
 //
-// BIT, JSON and the spatial family remain unsupported: they are not part of
-// #1155's shape and each has its own upstream representation question.
+// Every other type is refused — FLOAT/DOUBLE, TIME, BIT, JSON and the spatial
+// family among them; supportedPKType is the authoritative list and the only
+// place it lives. None of them was part of #1155's shape and each has its own
+// upstream representation question.
 func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("canonicalizePKValue: nil PK value for column %q (MySQL forbids NULL in PK columns; baseline row may be missing the column after schema drift)", col.Name)
@@ -164,7 +166,11 @@ func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 		return canonicalizeDate(raw, col)
 
 	default:
-		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q (BIT/JSON/spatial PK types are not supported because the indexer and baseline-writer representations diverge on disk; file a follow-up issue if you need one)", col.Name, col.DataType)
+		// Name only the offending type: supportedPKType is the one list of
+		// what is refused, and a second copy of it inside this message drifted
+		// (#1455 — it said "BIT/JSON/spatial" while FLOAT/DOUBLE/TIME were
+		// refused too, so those keys were blamed on a family they are not in).
+		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q: the indexer and the baseline writer store this type differently on disk, so the key cannot be matched against pk_values; file a follow-up issue if you need this type", col.Name, col.DataType)
 	}
 }
 

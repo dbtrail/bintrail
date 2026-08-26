@@ -288,15 +288,32 @@ func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
 	// TestCanonicalizePKValue_binaryFamilyMatchesIndexerSpelling. It still
 	// rejects a NON-bytes value for those types —
 	// TestCanonicalizePKValue_binaryFamilyRejectsNonBytes covers that arm.
-	for _, dt := range []string{"bit", "json", "point", "geometry", "float", "double"} {
+	for _, dt := range []string{"bit", "json", "point", "geometry", "float", "double", "time"} {
 		col := colMeta("x", dt, dt)
 		_, err := canonicalizePKValue("whatever", col)
 		if err == nil {
 			t.Errorf("%s: expected error for unsupported PK type, got nil", dt)
 			continue
 		}
-		if !strings.Contains(err.Error(), "unsupported") {
+		msg := err.Error()
+		if !strings.Contains(msg, "unsupported") {
 			t.Errorf("%s: unexpected error: %v", dt, err)
+		}
+		// #1455: the refusal must name the column's OWN type and nothing
+		// else. The old text hardcoded "BIT/JSON/spatial" as the unsupported
+		// set, so a FLOAT/DOUBLE/TIME key was blamed on a family it is not
+		// in. supportedPKType is the authoritative list; the message must
+		// not carry a second copy of it that can drift.
+		if !strings.Contains(msg, `"`+dt+`"`) {
+			t.Errorf("%s: error does not name the column's type: %v", dt, err)
+		}
+		for _, other := range []string{"BIT", "JSON", "spatial"} {
+			if strings.EqualFold(other, dt) {
+				continue
+			}
+			if strings.Contains(msg, other) {
+				t.Errorf("%s: error blames a different type family (%s): %v", dt, other, err)
+			}
 		}
 	}
 }
@@ -485,7 +502,7 @@ func TestSupportedPKType(t *testing.T) {
 	// trailing-0x00 keys that are the only inputs able to distinguish a
 	// correct canonicalization from an inverted one.
 	unsupported := []string{
-		"float", "double",
+		"float", "double", "time",
 		"bit", "json",
 		"point", "linestring", "polygon", "geometry",
 		"", "unknown-type",
