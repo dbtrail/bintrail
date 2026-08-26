@@ -335,13 +335,20 @@ func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *ba
 		switch err := sup.TriggerRefresh(req, interval); {
 		case err == nil:
 			dispatched++
-		case errors.Is(err, context.Canceled):
+		case errors.Is(err, console.ErrBaselineRunning):
 			// Expected: a refresh still folding, or a manual dump in flight.
 			// Counted rather than only logged, because at a short interval this
 			// stops being an edge case and becomes the steady state — it is the
 			// evidence that the interval is shorter than a refresh takes, and
 			// the caller needs the number to say so.
+			//
+			// The per-server line stays at Debug ALONGSIDE the count. Counting
+			// alone traded "invisible but specific" for "visible but
+			// anonymous": on a multi-server deployment `skipped=2` cannot be
+			// acted on, because nothing else names which two, and the
+			// "starting" line only fires for servers that were NOT skipped.
 			skipped++
+			slog.Debug("baseline refresh skipped this tick", "server", req.ServerName, "reason", err)
 		default:
 			// Nothing else is expected today. If that changes, it must not
 			// become invisible: this used to swallow every error at Debug,
