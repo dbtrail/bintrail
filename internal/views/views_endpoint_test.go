@@ -80,10 +80,12 @@ func TestGenerate_noEndpointIsAWS(t *testing.T) {
 // means one of their buckets will answer 301 and the file needs splitting.
 func TestGenerate_ambiguousRegionSaysSo(t *testing.T) {
 	in := goldenInput()
-	in.ArchiveRegion, in.RegionAmbiguous = "", true
+	// A NON-EMPTY region with the flag set: with "" the suppression assertion
+	// below passes whatever the flag does, which is a guard that cannot fail.
+	in.ArchiveRegion, in.RegionAmbiguous = "eu-central-1", true
 	out := Generate(in)
 
-	if !strings.Contains(out, "buckets whose regions differ") {
+	if !strings.Contains(out, "each detected in a DIFFERENT region") {
 		t.Errorf("an ambiguous region renders silently:\n%s", out)
 	}
 	// Executable lines only: the file's closing comment SHOWS a sample secret
@@ -98,7 +100,7 @@ func TestGenerate_ambiguousRegionSaysSo(t *testing.T) {
 	}
 	// The note is prose, so it must not be executable.
 	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "buckets whose regions differ") && !strings.HasPrefix(strings.TrimSpace(line), "--") {
+		if strings.Contains(line, "each detected in a DIFFERENT region") && !strings.HasPrefix(strings.TrimSpace(line), "--") {
 			t.Errorf("the note is not a comment: %s", line)
 		}
 	}
@@ -109,7 +111,7 @@ func TestGenerate_unambiguousRegionCarriesNoNote(t *testing.T) {
 	in := goldenInput()
 	in.ArchiveRegion, in.RegionAmbiguous = "eu-central-1", false
 	out := Generate(in)
-	if strings.Contains(out, "buckets whose regions differ") {
+	if strings.Contains(out, "each detected in a DIFFERENT region") {
 		t.Errorf("a pinned region carries the ambiguity note:\n%s", out)
 	}
 	if !strings.Contains(out, "REGION 'eu-central-1'") {

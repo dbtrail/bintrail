@@ -199,11 +199,13 @@ type RotationDefaults struct {
 // X-Bintrail-Server header.
 type Server struct {
 	// bucketRegions memoizes DetectBucketRegion per bucket: buildViewsInput
-	// runs on every SQL panel query, and a bucket's region is fixed for its
-	// lifetime, so one lookup per bucket per process is both enough and the
-	// most this hot path should pay.
+	// runs on every SQL panel query, so a network round trip does not belong
+	// on that path in the steady state. A DETECTED region never expires (it is
+	// fixed for the bucket's lifetime); a failed detection is not a property of
+	// the bucket and expires after negativeRegionTTL, so a blip does not poison
+	// every file this daemon hands out until someone restarts it.
 	bucketRegionMu sync.Mutex
-	bucketRegions  map[string]string
+	bucketRegions  map[string]bucketRegionEntry
 
 	listen     string
 	token      string

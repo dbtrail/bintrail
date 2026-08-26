@@ -65,11 +65,14 @@ type Input struct {
 	// default.
 	ArchiveRegion string
 
-	// RegionAmbiguous is set when the layout's buckets do not agree on one
-	// region, so ArchiveRegion was deliberately left empty rather than pinned
-	// to one of them. One secret and one s3_region cannot describe two
-	// regions. The file says so, because a reader who sees no REGION clause
-	// cannot otherwise tell "nothing to pin" from "we could not agree".
+	// RegionAmbiguous is set when two buckets were each DETECTED in a
+	// different region, so ArchiveRegion was left empty rather than pinned to
+	// one of them: one secret and one s3_region cannot describe two. The file
+	// states that as a fact, so the producer must not set it for a bucket that
+	// merely could not be asked — an undetectable bucket is not evidence that
+	// the regions differ, and claiming it would send the reader off to split a
+	// file that is fine. Same rule as ArchiveDiscoveryFailed above: never state
+	// a cause the caller does not know.
 	RegionAmbiguous bool
 	// S3Endpoint is the S3-compatible store the paths live in, when the
 	// generating process was configured with one (#1454). It is a location,
@@ -104,7 +107,15 @@ func Generate(in Input) string {
 	var b strings.Builder
 	writeHeader(&b, in)
 	if in.NeedsS3() {
-		writeS3Preamble(&b, in.ArchiveRegion, in.S3Endpoint, in.RegionAmbiguous)
+		region := in.ArchiveRegion
+		if in.RegionAmbiguous {
+			// Enforced here, not only trusted from the producer: the file
+			// STATES that no region is pinned, so emitting one anyway would
+			// make the artifact contradict itself in the one place a reader
+			// looks to understand why their read failed.
+			region = ""
+		}
+		writeS3Preamble(&b, region, in.S3Endpoint, in.RegionAmbiguous)
 	}
 	writeEventsView(&b, in)
 	writeStateViews(&b, in)
@@ -219,10 +230,10 @@ func writeS3Preamble(b *strings.Builder, region string, ep storage.S3Endpoint, a
 		fmt.Fprintf(b, "-- s3:// paths here live in an S3-compatible store at %s, not in AWS.\n", ep.URL)
 	}
 	if ambiguousRegion {
-		b.WriteString("-- No region is pinned below: the archives and baselines this file reads\n")
-		b.WriteString("-- are in buckets whose regions differ, and one secret cannot name two.\n")
-		b.WriteString("-- Your own AWS configuration resolves one; a bucket outside it answers\n")
-		b.WriteString("-- 301 PermanentRedirect. Split those reads into one file per region, or\n")
+		b.WriteString("-- No region is pinned below: two of the buckets this file reads were\n")
+		b.WriteString("-- each detected in a DIFFERENT region, and one secret cannot name two.\n")
+		b.WriteString("-- Your own AWS configuration resolves one of them; the other rejects a\n")
+		b.WriteString("-- request signed for it. Split those reads into one file per region, or\n")
 		b.WriteString("-- add a second scoped secret for the odd bucket out.\n")
 	}
 	b.WriteString("INSTALL httpfs; LOAD httpfs;\n")

@@ -2,6 +2,8 @@ package console
 
 import (
 	"context"
+	"log/slog"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
@@ -9,70 +11,133 @@ import (
 	"github.com/dbtrail/dbtrail/internal/views"
 )
 
-// archiveRegion resolves the region to pin in a generated views.sql, and in the
-// SQL panel's own DuckDB session, for the layout in `in`.
+// negativeRegionTTL bounds how long a FAILED detection is remembered. Successes
+// never expire (a bucket's region is fixed for its lifetime); a failure is not a
+// property of the bucket at all, and the cheap causes are transient — a
+// credential refresh, a network blip, or the operator closing the download tab,
+// which cancels the request context. Caching those forever would leave the
+// daemon and the files it hands out disagreeing until someone restarts it.
+const negativeRegionTTL = 5 * time.Minute
+
+type bucketRegionEntry struct {
+	region   string
+	detected bool
+	at       time.Time
+}
+
+// archiveRegion resolves the region to pin for the layout in `in` — which is
+// the downloadable views.sql, and separately the SQL panel's own DuckDB
+// session. Separately, not identically: the download resolves its archives
+// portably (S3 wherever registered) and the panel local-first, so on a daemon
+// holding local copies the file names a bucket the panel does not, and the
+// panel legitimately stays unpinned.
 //
 // It exists because those two used to pin NOTHING while the daemon's own
-// archive reads pin a DETECTED bucket region (#511): the file described a
-// different read than the one this process performs, and a store that checks
-// the signing region answers 403 (Ceph) or 301 PermanentRedirect (a
-// cross-region AWS bucket) to the recipient of a file that works here.
+// archive reads pin a DETECTED bucket region (#511), so the file described a
+// different read than this process performs and a store that checks the signing
+// region answered 403 or 301 PermanentRedirect to the recipient.
 //
-// Returns ("", true) when the layout's buckets do NOT agree on one region. One
-// secret and one s3_region cannot describe two regions, so pinning either would
-// be worse than pinning none: with none, the reader's own credential chain
-// still resolves a region, and only the odd bucket out fails. The caller
-// surfaces that so the file says which case it is instead of looking unpinned
-// by accident.
+// It pins ONLY what was actually detected, and only when every bucket agrees.
+// A guess is worse than silence here, which is the opposite of the read path's
+// trade-off: s3:GetBucketLocation is deliberately absent from bintrail's
+// documented minimal IAM policy, so the fallback is the COMMON case, and where
+// this file pins nothing the reader's own credential chain resolves the right
+// region unaided. Pinning an ambient region we never confirmed would override
+// a correct configuration on someone else's machine, hours later, with nothing
+// pointing back here.
 //
-// Cached because buildViewsInput runs on every SQL panel query, and this would
-// otherwise add a GetBucketLocation round trip to a latched hot path. A
-// bucket's region is fixed for its lifetime, so the entry never needs to
-// expire.
+// Returns ("", true) only when two DETECTIONS disagree — never when one bucket
+// merely could not be asked. One secret and one s3_region cannot name two
+// regions, and the caller renders that as a stated fact, so it must be one.
 func (s *Server) archiveRegion(ctx context.Context, in views.Input) (region string, ambiguous bool) {
 	buckets := layoutBuckets(in)
 	if len(buckets) == 0 {
 		return "", false
 	}
-	cfg, err := storage.LoadAWSConfig(ctx, "")
-	if err != nil {
-		// Best-effort: a region is a hint, and the read paths each load their
-		// own config anyway. Rendering no region leaves today's behavior.
-		return "", false
-	}
-	seen := ""
+	var (
+		cfg    aws.Config
+		loaded bool
+		seen   string
+		missed bool
+	)
 	for _, b := range buckets {
-		r := s.cachedBucketRegion(ctx, cfg, b)
-		if r == "" {
+		r, ok := s.cachedBucketRegion(ctx, &cfg, &loaded, b)
+		if !ok {
+			// Contributes neither a pin nor an ambiguity claim: an
+			// undetectable bucket is not evidence that the regions differ.
+			missed = true
 			continue
 		}
-		if seen == "" {
+		switch {
+		case seen == "":
 			seen = r
-			continue
-		}
-		if r != seen {
+		case r != seen:
 			return "", true
 		}
+	}
+	if missed {
+		// Partial knowledge is not a basis for pinning: the value would be
+		// right for the buckets we asked about and a guess for the rest.
+		return "", false
 	}
 	return seen, false
 }
 
-func (s *Server) cachedBucketRegion(ctx context.Context, cfg aws.Config, bucket string) string {
+// cachedBucketRegion memoizes detection per bucket. buildViewsInput runs on
+// every SQL panel query, so this must not put a network round trip on that path
+// in the steady state.
+//
+// The mutex is held ONLY around the map, never across the RPC: sync.Mutex is
+// not context-aware, so a goroutine blocked acquiring it cannot be released by
+// the SQL panel's setup deadline, and one hung GetBucketLocation on the
+// deadline-free download path would stall unrelated requests while the panel's
+// single-flight latch turned that into 429s for everyone. Two callers racing
+// the same bucket just make the same call twice, which is harmless.
+//
+// cfg is loaded lazily and at most once per call, and only when some bucket
+// actually needs asking — LoadAWSConfig reads ~/.aws/config from disk and can
+// pay an IMDS timeout, which does not belong on a fully cached path.
+func (s *Server) cachedBucketRegion(ctx context.Context, cfg *aws.Config, loaded *bool, bucket string) (string, bool) {
 	s.bucketRegionMu.Lock()
-	defer s.bucketRegionMu.Unlock()
+	e, ok := s.bucketRegions[bucket]
+	s.bucketRegionMu.Unlock()
+	if ok && (e.detected || time.Since(e.at) < negativeRegionTTL) {
+		return e.region, e.detected
+	}
+
+	if !*loaded {
+		c, err := storage.LoadAWSConfig(ctx, "")
+		if err != nil {
+			// The file will pin no region. Logged because the file is what
+			// leaves the host and the log is what stays: without this, "no
+			// REGION clause" has no explanation anywhere, and it is the one
+			// case the file itself cannot describe.
+			slog.Warn("could not resolve an AWS region for the generated views.sql; it will pin none",
+				"bucket", bucket, "error", err)
+			return "", false
+		}
+		*cfg, *loaded = c, true
+	}
+
+	r, detected := storage.DetectBucketRegion(ctx, *cfg, bucket)
+	if !detected {
+		// Once per bucket per TTL, not per request: the operator's remedy is
+		// to grant s3:GetBucketLocation or accept that readers resolve their
+		// own region, and neither is helped by a line on every download.
+		slog.Warn("S3 bucket region not detected; the generated views.sql will pin no region and readers will resolve their own",
+			"bucket", bucket)
+	}
+	s.bucketRegionMu.Lock()
 	if s.bucketRegions == nil {
-		s.bucketRegions = map[string]string{}
+		s.bucketRegions = map[string]bucketRegionEntry{}
 	}
-	if r, ok := s.bucketRegions[bucket]; ok {
-		return r
-	}
-	r := storage.DetectBucketRegion(ctx, cfg, bucket)
-	s.bucketRegions[bucket] = r
-	return r
+	s.bucketRegions[bucket] = bucketRegionEntry{region: r, detected: detected, at: time.Now()}
+	s.bucketRegionMu.Unlock()
+	return r, detected
 }
 
-// layoutBuckets returns the distinct S3 buckets the rendered file will read,
-// in a stable order. Both halves count: archives and baselines can live in
+// layoutBuckets returns the distinct S3 buckets the rendered file will read, in
+// a stable order. Both halves count: archives and baselines can live in
 // different buckets, and the views read both.
 func layoutBuckets(in views.Input) []string {
 	var out []string

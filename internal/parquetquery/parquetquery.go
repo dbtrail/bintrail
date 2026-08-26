@@ -315,7 +315,9 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 		return nil, 0, "", nil, err
 	}
 
-	bucketRegion := storage.DetectBucketRegion(ctx, cfg, bucket)
+	// The read path ignores the detected flag on purpose: it is about to read,
+	// so a wrong guess fails here and loudly.
+	bucketRegion, _ := storage.DetectBucketRegion(ctx, cfg, bucket)
 
 	client = storage.NewS3ClientFromConfig(cfg, func(o *s3.Options) {
 		o.Region = bucketRegion

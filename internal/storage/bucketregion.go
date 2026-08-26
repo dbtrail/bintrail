@@ -10,20 +10,24 @@ import (
 	smithy "github.com/aws/smithy-go"
 )
 
-// DetectBucketRegion resolves a bucket's ACTUAL region, falling back to the
-// resolved default when it cannot. Best-effort by contract: it never returns an
-// error, because every caller has a usable answer without one and none of them
-// should fail a read over a region hint.
+// DetectBucketRegion resolves a bucket's ACTUAL region. The second return
+// says whether that is a DETECTION or the resolved default standing in for
+// one, and the two must not be conflated: s3:GetBucketLocation is deliberately
+// absent from bintrail's documented minimal IAM policy (docs/s3-iam-policy.md),
+// so a denial — and therefore the fallback — is the COMMON path, not an edge.
 //
 // Why it is not just cfg.Region: a bucket outside the configured region answers
 // 301 PermanentRedirect, and GetBucketLocation is the call that prevents it.
 // That call must itself be made from us-east-1.
 //
-// Lives here rather than beside its first caller because a second one now needs
-// the SAME answer for a different reason: the console names archive roots in a
-// downloadable views.sql, and a file whose region disagrees with the daemon's
-// own reads sends the recipient somewhere the daemon never went.
-func DetectBucketRegion(ctx context.Context, cfg aws.Config, bucket string) string {
+// It never returns an error, because a read has a usable answer without one and
+// must not fail over a region hint. Callers that PUBLISH the answer want the
+// bool: a read that guesses wrong fails here, loudly, against a store this
+// process can see, while a wrong region written into a downloadable file fails
+// on someone else's machine hours later with nothing pointing back here — and
+// where nothing is pinned, that reader's own credential chain resolves the
+// right region on its own. Guessing is strictly worse than silence there.
+func DetectBucketRegion(ctx context.Context, cfg aws.Config, bucket string) (string, bool) {
 	locClient := NewS3ClientFromConfig(cfg, func(o *s3.Options) {
 		o.Region = "us-east-1"
 	})
@@ -39,7 +43,7 @@ func DetectBucketRegion(ctx context.Context, cfg aws.Config, bucket string) stri
 		} else {
 			slog.Warn("could not detect S3 bucket region, using default", "bucket", bucket, "error", err)
 		}
-		return cfg.Region
+		return cfg.Region, false
 	}
 	r := string(loc.LocationConstraint)
 	if r == "" {
@@ -48,7 +52,7 @@ func DetectBucketRegion(ctx context.Context, cfg aws.Config, bucket string) stri
 	if r != cfg.Region {
 		slog.Debug("S3 bucket in different region, switching", "bucket", bucket, "bucket_region", r, "default_region", cfg.Region)
 	}
-	return r
+	return r, true
 }
 
 func isBucketLocationAccessDenied(err error) bool {
