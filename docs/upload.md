@@ -114,7 +114,7 @@ export AWS_SECRET_ACCESS_KEY=...
 ```
 
 Bucket-in-path addressing (`http://host/bucket/key`, what MinIO and
-LocalStack need) is on by default with a custom endpoint. A store that only
+LocalStack need) is on by default with `BINTRAIL_S3_ENDPOINT`. A store that only
 serves virtual-hosted URLs turns it off:
 
 ```sh
@@ -140,8 +140,9 @@ Notes:
   DuckDB half, which reads no AWS configuration at all: uploads land in your
   store while Parquet reads go to AWS. bintrail warns when it sees that shape;
   set `BINTRAIL_S3_ENDPOINT` to the same value.
-- With a custom endpoint and no region configured anywhere, the region
-  defaults to `us-east-1`; S3-compatible stores accept any.
+- With `BINTRAIL_S3_ENDPOINT` set and no region configured anywhere, the
+  region defaults to `us-east-1`; S3-compatible stores accept any. An
+  endpoint the SDK resolved keeps the SDK's own region resolution.
 - An invalid `BINTRAIL_S3_ENDPOINT` (no scheme, a path, credentials in the
   URL) fails the command, on the SDK paths and the DuckDB ones alike. It never
   falls back to AWS: with uploads going to your store and reads going to an

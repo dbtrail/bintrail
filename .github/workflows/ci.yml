@@ -212,6 +212,8 @@ jobs:
       # PostgreSQL-source job does: assert the flagship end-to-end and
       # caching_sha2 auth-seam tests genuinely ran, not merely that `go test`
       # exited 0. pipefail keeps the go-test exit code through the tee.
+      # (The paragraph above documents the integration-test step further down.)
+      #
       # An S3-compatible store for the #1453/#1454 leg: the SDK half uploads
       # through BINTRAIL_S3_ENDPOINT and the DuckDB half reads the object back
       # through the session's endpoint settings. Throwaway root credentials;

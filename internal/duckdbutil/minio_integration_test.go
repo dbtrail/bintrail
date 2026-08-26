@@ -28,7 +28,7 @@ import (
 // Mutations run against THIS revision, so the record does not certify
 // coverage nobody re-checked:
 //
-//	secret loses its ENDPOINT clause (session settings kept)  -> RED
+//	secret loses its ENDPOINT clause (settings kept)   -> RED
 //	session routing removed (secret keeps ENDPOINT)           -> RED
 //	UsePathStyle forced off                                   -> RED
 //	both SDK endpoint pins removed                            -> RED
@@ -129,7 +129,7 @@ func TestS3Compat_MinIO(t *testing.T) {
 	}
 
 	// The same read with the aws extension switched off. Routing lives in the
-	// session settings, not the secret, so the escape hatch (and an air-gapped
+	// instance settings, not the secret, so the escape hatch (and an air-gapped
 	// host that cannot install the extension, and a chain that resolves
 	// nothing) must not silently redirect the read to AWS.
 	t.Run("without the aws extension", func(t *testing.T) {

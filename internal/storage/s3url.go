@@ -55,7 +55,7 @@ func NewS3Client(ctx context.Context, region string) (*s3.Client, error) {
 // bare s3.NewFromConfig would reach MinIO at a virtual-hosted URL and fail on
 // DNS. extra options are applied AFTER the addressing option and win.
 func NewS3ClientFromConfig(cfg aws.Config, extra ...func(*s3.Options)) *s3.Client {
-	client := s3.NewFromConfig(cfg, append(S3ClientOptions(cfg), extra...)...)
+	client := s3.NewFromConfig(cfg, append(S3ClientOptions(), extra...)...)
 	warnIfEndpointUnmirrored(client)
 	return client
 }
@@ -82,6 +82,9 @@ func warnIfEndpointUnmirrored(client *s3.Client) {
 }
 
 // S3ClientOptions returns the client options bintrail's own endpoint needs.
+// It takes no config on purpose: everything it decides comes from the
+// environment, and consulting cfg.BaseEndpoint is what made an earlier version
+// miss the service-specific endpoint the SDK resolves at client build time.
 //
 // The endpoint is pinned on the CLIENT, not only in cfg.BaseEndpoint, because
 // the SDK's service-specific AWS_ENDPOINT_URL_S3 overrides cfg.BaseEndpoint
@@ -95,7 +98,7 @@ func warnIfEndpointUnmirrored(client *s3.Client) {
 // the SDK resolved on its own — its AWS_ENDPOINT_URL* variables, or
 // endpoint_url in ~/.aws/config — keeps the SDK's virtual-hosted addressing:
 // overriding it would break a setup that worked before this option existed.
-func S3ClientOptions(cfg aws.Config) []func(*s3.Options) {
+func S3ClientOptions() []func(*s3.Options) {
 	ep, err := S3EndpointFromEnv()
 	if err != nil {
 		// LoadAWSConfig validated this already, so the environment changed

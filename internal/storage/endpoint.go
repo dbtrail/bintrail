@@ -30,7 +30,7 @@ const (
 // awsEndpointEnv are the AWS SDK's OWN endpoint variables. bintrail reads them
 // so the DuckDB half follows an operator who already configured the SDK half:
 // httpfs does not look at them (measured against DuckDB v1.5.5 — with
-// AWS_ENDPOINT_URL_S3 set and no session settings, a read still goes to
+// AWS_ENDPOINT_URL_S3 set and nothing else configured, a read still goes to
 // s3.amazonaws.com). It does not police them, though: the SDK accepts
 // values this package cannot parse, and failing every command over one would
 // break a working setup on upgrade. They therefore never carry bintrail's

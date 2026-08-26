@@ -89,8 +89,9 @@ func ensureWritableHome() {
 // report that state loudly and the read paths must not bury it.
 //
 // BINTRAIL_DUCKDB_NO_AWS_EXT=1 skips the aws extension and the secret, NOT
-// the endpoint routing: routing is session settings, and an unrouted read
-// does not fail, it reaches AWS. Escape hatch for
+// the endpoint routing: that is applied as DuckDB global settings (SET
+// GLOBAL, scoped to the instance), and an unrouted read does not fail, it
+// reaches AWS. Escape hatch for
 // proxies that BLACKHOLE (rather than refuse) the DuckDB extension registry:
 // there the INSTALL attempt can stall for minutes, ignores context
 // cancellation, and recurs every session because failures are never cached.
@@ -150,7 +151,7 @@ func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region strin
 		}
 		return nil
 	}
-	// The secret repeats the endpoint the session settings already carry.
+	// The secret repeats the endpoint the settings applied above already carry.
 	// DuckDB's secrets manager can take precedence over a SET for matching
 	// paths, so a secret that named only credentials would put the endpoint
 	// back to AWS for exactly the paths it matches.
@@ -187,6 +188,11 @@ func applyS3Routing(ctx context.Context, db *sql.DB, region string, ep storage.S
 	// goes to AWS (measured: a sibling connection sees "" after SET, and the
 	// configured host after SET GLOBAL). Most callers here happen to use one
 	// connection, which is exactly why this would have stayed invisible.
+	//
+	// GLOBAL is not process-wide: it is scoped to the DuckDB INSTANCE, and
+	// every caller opens its own via sql.Open (measured: two handles hold two
+	// different s3_endpoint values at once). Two sessions in one process, a
+	// console daemon serving several servers among them, do not interfere.
 	stmts := []string{
 		"SET GLOBAL s3_endpoint=" + sqlQuote(ep.Host()),
 		"SET GLOBAL s3_url_style=" + sqlQuote(ep.URLStyle()),
