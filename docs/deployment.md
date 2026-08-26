@@ -443,6 +443,15 @@ Key log fields emitted by bintrail commands:
 
 Run `bintrail rotate` hourly (cron or systemd timer) so old partitions are dropped and future ones stay provisioned — otherwise the catch-all `p_future` accumulates every new event. The cron/timer setup, the `--retain`/`--add-future` semantics, and monitoring `p_future` via `bintrail status` are in [rotation-and-status.md → Automating Rotation](rotation-and-status.md#automating-rotation). (`bintrail up`/`bintrail-console watch` also run this loop built-in.)
 
+### S3-compatible stores
+
+Archives and baselines can live in MinIO, Wasabi, LocalStack or any other
+S3-compatible store: set `BINTRAIL_S3_ENDPOINT` (and, for a store that only
+serves virtual-hosted URLs, `BINTRAIL_S3_PATH_STYLE=false`) on every bintrail
+process, including the console. The bundled Compose file passes both through.
+Details and the full list of surfaces the endpoint covers are in
+[upload.md → S3-compatible stores](upload.md#s3-compatible-stores-minio-wasabi-localstack).
+
 ### S3 archive bucket: abort orphaned multipart uploads
 
 Archive and baseline uploads stream through the AWS multipart Uploader, which

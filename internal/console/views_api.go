@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/dbtrail/dbtrail/internal/storage"
 	"log/slog"
 	"net/http"
 	"time"
@@ -36,6 +37,14 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
 	}
+	// The store the daemon reads from is the store the file must name. An
+	// invalid value is an upstream fault worth naming (502), not a file that
+	// silently points at AWS.
+	ep, err := storage.S3EndpointFromEnv()
+	if err != nil {
+		return views.Input{}, fmt.Errorf("S3 endpoint configuration: %w", err)
+	}
+	in.S3Endpoint = ep
 	var archiveErr error
 	in.ArchiveSources, archiveErr = consoleArchiveSources(ctx, b.db, portable)
 	in.PortableRouting = portable

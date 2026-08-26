@@ -212,11 +212,35 @@ jobs:
       # PostgreSQL-source job does: assert the flagship end-to-end and
       # caching_sha2 auth-seam tests genuinely ran, not merely that `go test`
       # exited 0. pipefail keeps the go-test exit code through the tee.
+      # An S3-compatible store for the #1453/#1454 leg: the SDK half uploads
+      # through BINTRAIL_S3_ENDPOINT and the DuckDB half reads the object back
+      # through the endpoint-carrying secret. Throwaway root credentials; the
+      # container is gone with the runner.
+      - name: Start MinIO (bintrail-test-minio)
+        if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
+        run: |
+          docker run -d --name bintrail-test-minio \
+            -e MINIO_ROOT_USER=bintrail \
+            -e MINIO_ROOT_PASSWORD=bintrail-it-secret \
+            -p 9000:9000 \
+            minio/minio server /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null || { docker logs bintrail-test-minio; exit 1; }
+
       - name: Integration tests (-tags=integration)
         if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
+        env:
+          BINTRAIL_TEST_MINIO_ENDPOINT: http://127.0.0.1:9000
+          BINTRAIL_TEST_MINIO_ACCESS_KEY: bintrail
+          BINTRAIL_TEST_MINIO_SECRET_KEY: bintrail-it-secret
         run: |
           set -o pipefail
           go test -tags=integration -race -p 1 -count=1 -v ./... 2>&1 | tee /tmp/mysql-it.out
+          grep -q -- '--- PASS: TestS3Compat_MinIO' /tmp/mysql-it.out \
+            || { echo "FATAL: S3-compatible (MinIO) leg did not run — false-green tripwire" >&2; exit 1; }
           grep -q -- '--- PASS: TestEndToEnd_fullPipeline' /tmp/mysql-it.out \
             || { echo "FATAL: MySQL end-to-end integration test did not run — false-green tripwire" >&2; exit 1; }
           grep -q -- '--- PASS: TestCachingSha2ColdAuthSeam' /tmp/mysql-it.out \

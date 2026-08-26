@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/dbtrail/dbtrail/internal/storage"
 	"os"
 	"path/filepath"
 	"strings"
@@ -106,15 +107,19 @@ func runViews(cmd *cobra.Command, _ []string) error {
 			"or name a source directly with --archive-dir/--archive-s3 plus --bintrail-id")
 	}
 
+	ep, err := storage.S3EndpointFromEnv()
+	if err != nil {
+		return err
+	}
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     buildVersion,
 		// Region is only meaningful for the S3 secret; a local-only layout
 		// never emits the preamble that would use it.
 		ArchiveRegion: vRegion,
+		S3Endpoint:    ep,
 	}
 
-	var err error
 	if explicitArchives {
 		in.ArchiveSources = explicitArchiveSources()
 	} else {

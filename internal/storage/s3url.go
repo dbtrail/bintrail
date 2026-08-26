@@ -41,7 +41,34 @@ func NewS3Client(ctx context.Context, region string) (*s3.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s3.NewFromConfig(awsCfg), nil
+	return NewS3ClientFromConfig(awsCfg), nil
+}
+
+// NewS3ClientFromConfig is the one constructor every S3 client in the tree
+// goes through (#1453). It carries the addressing style that goes with a
+// custom endpoint: the SDK config can hold the endpoint URL itself
+// (LoadAWSConfig sets BaseEndpoint), but path-style addressing is a client
+// option with no environment knob, so a caller that built its client with a
+// bare s3.NewFromConfig would reach MinIO at a virtual-hosted URL and fail on
+// DNS. extra options are applied AFTER the addressing option and win.
+func NewS3ClientFromConfig(cfg aws.Config, extra ...func(*s3.Options)) *s3.Client {
+	return s3.NewFromConfig(cfg, append(S3ClientOptions(cfg), extra...)...)
+}
+
+// S3ClientOptions returns the client options a custom endpoint needs. The
+// endpoint itself is already in cfg.BaseEndpoint; this adds the path style.
+// The environment was validated by LoadAWSConfig, so a parse error here can
+// only mean the environment changed between the two calls; the path style
+// then falls back to the default for a custom endpoint (on).
+func S3ClientOptions(cfg aws.Config) []func(*s3.Options) {
+	if cfg.BaseEndpoint == nil || *cfg.BaseEndpoint == "" {
+		return nil
+	}
+	pathStyle := true
+	if ep, err := S3EndpointFromEnv(); err == nil && ep.Set() {
+		pathStyle = ep.PathStyle
+	}
+	return []func(*s3.Options){func(o *s3.Options) { o.UsePathStyle = pathStyle }}
 }
 
 // LoadAWSConfig loads the default AWS config (credential chain, region) for
@@ -59,7 +86,19 @@ func NewS3Client(ctx context.Context, region string) (*s3.Client, error) {
 // empty region to fall back to. So every caller that loads AWS config for S3
 // access should go through this shared helper, not awsconfig.LoadDefaultConfig
 // directly, to get the same IMDS fallback.
+//
+// A custom endpoint (BINTRAIL_S3_ENDPOINT, see S3EndpointFromEnv) is applied
+// here as cfg.BaseEndpoint, so every SDK client built from this config
+// reaches the S3-compatible store (#1453). An invalid endpoint value fails the
+// load rather than falling back to AWS. With a custom endpoint and no region
+// anywhere, the region defaults to us-east-1: SigV4 needs one, MinIO and
+// friends accept any, and the IMDS probe would only cost a 2s timeout on a
+// host that is not an EC2 instance.
 func LoadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
+	ep, err := S3EndpointFromEnv()
+	if err != nil {
+		return aws.Config{}, fmt.Errorf("load AWS config: %w", err)
+	}
 	opts := []func(*awsconfig.LoadOptions) error{}
 	if region != "" {
 		opts = append(opts, awsconfig.WithRegion(region))
@@ -67,6 +106,13 @@ func LoadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return awsCfg, fmt.Errorf("load AWS config: %w", err)
+	}
+	if ep.Set() {
+		awsCfg.BaseEndpoint = aws.String(ep.URL)
+		if awsCfg.Region == "" {
+			awsCfg.Region = "us-east-1"
+		}
+		return awsCfg, nil
 	}
 	if region == "" && awsCfg.Region == "" {
 		if r := imdsRegion(ctx, awsCfg); r != "" {

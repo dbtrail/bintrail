@@ -315,7 +315,7 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 	if err != nil {
 		return nil, err
 	}
-	client := s3.NewFromConfig(cfg)
+	client := storage.NewS3ClientFromConfig(cfg)
 
 	// ONE DuckDB session serves every --deep footer probe of the scan (#807):
 	// extension install and credential-chain resolution happen once, not per

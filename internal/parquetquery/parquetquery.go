@@ -318,7 +318,7 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 	// from us-east-1). This prevents 301 PermanentRedirect errors when the
 	// configured region doesn't match the bucket's location.
 	bucketRegion := cfg.Region
-	locClient := s3.NewFromConfig(cfg, func(o *s3.Options) {
+	locClient := storage.NewS3ClientFromConfig(cfg, func(o *s3.Options) {
 		o.Region = "us-east-1"
 	})
 	loc, locErr := locClient.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
@@ -345,7 +345,7 @@ func listS3ParquetScoped(ctx context.Context, source string, since, until *time.
 		bucketRegion = r
 	}
 
-	client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+	client = storage.NewS3ClientFromConfig(cfg, func(o *s3.Options) {
 		o.Region = bucketRegion
 	})
 

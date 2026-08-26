@@ -260,6 +260,10 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
       AWS_REGION: ${AWS_REGION:-}
+      # S3-compatible store (MinIO, Wasabi): one endpoint for every S3 path,
+      # archive uploads and DuckDB reads alike. Empty = AWS S3.
+      BINTRAIL_S3_ENDPOINT: ${BINTRAIL_S3_ENDPOINT:-}
+      BINTRAIL_S3_PATH_STYLE: ${BINTRAIL_S3_PATH_STYLE:-}
       # Baselines for the boot entry (the cli-seeded server backed by the
       # index DSN — the one a SOURCE_DSN stream writes into): set
       # BASELINE_DIR=/var/lib/bintrail/baselines in .env after producing

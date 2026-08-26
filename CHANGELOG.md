@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **S3-compatible object stores (MinIO, Wasabi, LocalStack) for every S3
+  path** (#1453, #1454). `BINTRAIL_S3_ENDPOINT=scheme://host[:port]` points
+  the SDK clients (rotation archiving, `upload`, baseline upload and prune,
+  `restore-index`, `archive reconcile`, `doctor`, `init`) AND every DuckDB
+  httpfs read (`query`/`recover` over archives, `reconstruct --baseline-s3`,
+  `verify`, the shim, the console, `--ultrafast`) at the same store; before,
+  the SDK half could follow `AWS_ENDPOINT_URL_S3` by accident while the DuckDB
+  half always went to `s3.amazonaws.com`, so a baseline that verifiably
+  existed read as missing. Bucket-in-path addressing is on by default with a
+  custom endpoint (`BINTRAIL_S3_PATH_STYLE=false` for virtual-hosted-only
+  stores); `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT_URL` are honored as fallbacks;
+  an invalid value fails the command instead of falling back to AWS. The
+  `views.sql` download and `bintrail views` name the endpoint in their secret,
+  so the file reads the same store from another machine. Every S3 client in
+  the tree is now built by `storage.NewS3ClientFromConfig`, and CI runs the
+  round trip against a real MinIO.
+
 ### Fixed
 - **`views.sql` names archives for another machine, and says how to keep S3 working**
   (#1456). The console download and `bintrail views` named an archive by its

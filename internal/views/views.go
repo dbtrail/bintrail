@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/archive"
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 // BaselineTable names one table's Parquet file inside a baseline snapshot.
@@ -62,6 +64,11 @@ type Input struct {
 	// chain resolve it, which is what every other bintrail S3 read does by
 	// default.
 	ArchiveRegion string
+	// S3Endpoint is the S3-compatible store the paths live in, when the
+	// generating process was configured with one (#1454). It is a location,
+	// not a credential, and belongs in the file: a reader on another machine
+	// has no other way to learn that s3:// here does not mean AWS.
+	S3Endpoint storage.S3Endpoint
 
 	// BaselineSource is the root the snapshot below was discovered under, for
 	// the header. BaselineSnapshot is that snapshot's timestamp.
@@ -90,7 +97,7 @@ func Generate(in Input) string {
 	var b strings.Builder
 	writeHeader(&b, in)
 	if in.needsS3() {
-		writeS3Preamble(&b, in.ArchiveRegion)
+		writeS3Preamble(&b, in.ArchiveRegion, in.S3Endpoint)
 	}
 	writeEventsView(&b, in)
 	writeStateViews(&b, in)
@@ -194,15 +201,15 @@ func orUnknown(s string) string {
 // paste into a notebook or share with a colleague: it resolves whatever the
 // environment already has (instance role, SSO profile, env vars) and puts NO key
 // material in the generated text.
-func writeS3Preamble(b *strings.Builder, region string) {
+func writeS3Preamble(b *strings.Builder, region string, ep storage.S3Endpoint) {
 	b.WriteString("-- S3 setup, mirroring what bintrail's own DuckDB sessions configure.\n")
+	if ep.Set() {
+		fmt.Fprintf(b, "-- s3:// paths here live in an S3-compatible store at %s, not in AWS.\n", ep.URL)
+	}
 	b.WriteString("INSTALL httpfs; LOAD httpfs;\n")
 	b.WriteString("INSTALL aws; LOAD aws;\n")
-	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain"
-	if region != "" {
-		secret += ", REGION " + sqlString(region)
-	}
-	secret += ");\n"
+	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain" +
+		duckdbutil.S3SecretClauses(region, ep) + ");\n"
 	b.WriteString(secret)
 	// The secret is TEMPORARY on purpose, and the file says so where the
 	// operator will look when a reopened database file cannot read S3. The
@@ -219,7 +226,13 @@ func writeS3Preamble(b *strings.Builder, region string) {
 	b.WriteString("-- No credentials appear in this file by design. If the credential chain is not\n")
 	b.WriteString("-- available where you run this, replace the secret above with explicit keys:\n")
 	b.WriteString("--   CREATE OR REPLACE SECRET bintrail_s3_chain (\n")
-	b.WriteString("--     TYPE s3, KEY_ID '…', SECRET '…', REGION '…');\n")
+	if ep.Set() {
+		b.WriteString("--     TYPE s3, KEY_ID '…', SECRET '…', REGION '…',\n")
+		fmt.Fprintf(b, "--     ENDPOINT %s, URL_STYLE %s, USE_SSL %t);\n",
+			sqlString(ep.Host()), sqlString(map[bool]string{true: "path", false: "vhost"}[ep.PathStyle]), ep.UseSSL())
+	} else {
+		b.WriteString("--     TYPE s3, KEY_ID '…', SECRET '…', REGION '…');\n")
+	}
 	b.WriteString("\n")
 }
 

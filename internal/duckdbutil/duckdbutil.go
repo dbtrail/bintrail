@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 // execer is the subset of *sql.DB / *sql.Conn / *sql.Tx that LoadHTTPFS needs,
@@ -124,11 +126,18 @@ func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region strin
 		}
 		return
 	}
-	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain"
-	if region != "" {
-		secret += ", REGION '" + strings.ReplaceAll(region, "'", "''") + "'"
+	// The endpoint is what makes the DuckDB half agree with the SDK half
+	// (#1454): without it every httpfs read goes to s3.amazonaws.com no matter
+	// where BINTRAIL_S3_ENDPOINT points. An invalid value creates NO secret,
+	// so the read fails on credentials instead of quietly reading an AWS
+	// bucket of the same name.
+	ep, err := storage.S3EndpointFromEnv()
+	if err != nil {
+		slog.Error("duckdb: S3 endpoint configuration is invalid; no S3 secret created", "error", err)
+		return
 	}
-	secret += ")"
+	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain" +
+		S3SecretClauses(region, ep) + ")"
 	// ensureWritableHome (above) has already pointed $HOME at a writable dir, so
 	// the httpfs autoload this CREATE SECRET triggers resolves its home correctly
 	// even under a homeless user.
@@ -137,3 +146,30 @@ func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region strin
 			"error", err)
 	}
 }
+
+// S3SecretClauses renders the optional clauses of bintrail's S3 secret, each
+// with its leading ", ": REGION when pinned, and ENDPOINT / URL_STYLE /
+// USE_SSL when a custom endpoint is configured. Shared with the downloadable
+// views.sql so a file generated here reads the same store this process does.
+func S3SecretClauses(region string, ep storage.S3Endpoint) string {
+	var b strings.Builder
+	if region != "" {
+		b.WriteString(", REGION " + sqlQuote(region))
+	}
+	if ep.Set() {
+		b.WriteString(", ENDPOINT " + sqlQuote(ep.Host()))
+		style := "vhost"
+		if ep.PathStyle {
+			style = "path"
+		}
+		b.WriteString(", URL_STYLE " + sqlQuote(style))
+		if ep.UseSSL() {
+			b.WriteString(", USE_SSL true")
+		} else {
+			b.WriteString(", USE_SSL false")
+		}
+	}
+	return b.String()
+}
+
+func sqlQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
