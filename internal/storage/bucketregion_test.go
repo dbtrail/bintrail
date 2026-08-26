@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -32,5 +33,37 @@ func TestIsBucketLocationAccessDenied(t *testing.T) {
 				t.Errorf("isBucketLocationAccessDenied(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestDetectBucketRegion_failureIsReportedAsSuchExists because the fallback is
+// the COMMON path (s3:GetBucketLocation is outside bintrail's documented
+// minimal IAM policy) and it returns a plausible, confident, WRONG region. The
+// only thing separating it from a detection is the second return value, and a
+// caller that publishes the answer relies on it entirely.
+//
+// A cancelled context makes the call fail without a network or an AWS account,
+// so this is hermetic.
+func TestDetectBucketRegion_failureIsReportedAsSuch(t *testing.T) {
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("AWS_ACCESS_KEY_ID", "testdummykey")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "testdummysecret")
+
+	cfg, err := LoadAWSConfig(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	region, detected := DetectBucketRegion(ctx, cfg, "some-bucket")
+	if detected {
+		t.Error("a failed lookup reported itself as a detection; the console would pin this guess into a downloadable file")
+	}
+	// The read path still needs a usable value, which is why the failure is not
+	// an error: it is about to read, and a wrong guess fails there, loudly.
+	if region != "us-east-1" {
+		t.Errorf("region = %q, want the resolved default for the read path to fall back on", region)
 	}
 }
