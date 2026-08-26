@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strconv"
@@ -13,28 +15,60 @@ import (
 const (
 	// EnvS3Endpoint is the store's URL: scheme://host[:port], no path.
 	// Examples: http://minio:9000, https://s3.wasabisys.com. Empty = AWS S3.
-	// The AWS SDK's own AWS_ENDPOINT_URL_S3 / AWS_ENDPOINT_URL are honored as
-	// fallbacks so an operator who already set those gets the same routing on
-	// the DuckDB half, which the SDK variables would otherwise never reach.
+	// This is the variable bintrail owns, and the only one it validates and
+	// applies its own addressing rules to.
 	EnvS3Endpoint = "BINTRAIL_S3_ENDPOINT"
 	// EnvS3PathStyle forces bucket-in-path addressing (http://host/bucket/key)
-	// on or off. Default when an endpoint is set: ON, which is what MinIO and
-	// LocalStack need; a virtual-hosted-only store sets it to 0.
+	// on or off. Default with EnvS3Endpoint: ON, which is what MinIO and
+	// LocalStack need; a virtual-hosted-only store sets it to 0. Set
+	// explicitly, it also applies to an endpoint the AWS SDK resolved on its
+	// own (its env vars, or endpoint_url in ~/.aws/config).
 	EnvS3PathStyle = "BINTRAIL_S3_PATH_STYLE"
 )
+
+// awsEndpointEnv are the AWS SDK's OWN endpoint variables. bintrail reads them
+// so the DuckDB half follows an operator who already configured the SDK half
+// (httpfs never looks at them), but it does not police them: the SDK accepts
+// values this package cannot parse, and failing every command over one would
+// break a working setup on upgrade. They therefore never carry bintrail's
+// validation, its path-style default, or its region handling.
+var awsEndpointEnv = []string{"AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"}
+
+// ErrS3EndpointConfig marks a bad BINTRAIL_S3_ENDPOINT / BINTRAIL_S3_PATH_STYLE
+// value. It is a configuration fault, knowable before any byte moves, so a
+// caller that degrades on read failures (integrity validation) can tell it
+// apart from a storage problem and refuse to degrade.
+var ErrS3EndpointConfig = errors.New("S3 endpoint configuration")
 
 // S3Endpoint is where S3 requests go. The zero value means AWS S3 with the
 // SDK's own addressing; a non-empty URL means an S3-compatible store.
 type S3Endpoint struct {
-	URL       string // scheme://host[:port], validated by S3EndpointFromEnv
+	URL       string // scheme://host[:port]
 	PathStyle bool   // bucket in the path rather than in the host name
+	// Source is the environment variable URL came from, "" when unset.
+	// Managed() reads it: bintrail applies its own rules only to its own
+	// variable.
+	Source string
+	// pathStyleExplicit records that BINTRAIL_S3_PATH_STYLE was set, so the
+	// operator's choice applies even to an endpoint the SDK resolved on its
+	// own, where bintrail otherwise defers.
+	pathStyleExplicit bool
 }
 
-// Set reports whether a custom endpoint is configured.
+// PathStyleExplicit reports whether BINTRAIL_S3_PATH_STYLE named the
+// addressing mode, rather than it coming from a default.
+func (e S3Endpoint) PathStyleExplicit() bool { return e.pathStyleExplicit }
+
+// Set reports whether an endpoint is configured.
 func (e S3Endpoint) Set() bool { return e.URL != "" }
 
-// Host returns host[:port] without the scheme, the form DuckDB's httpfs
-// secret takes as ENDPOINT. Empty when no endpoint is set.
+// Managed reports whether the endpoint came from BINTRAIL_S3_ENDPOINT, the
+// variable bintrail owns end to end. An endpoint from the SDK's own variables
+// is mirrored to DuckDB but otherwise left to the SDK.
+func (e S3Endpoint) Managed() bool { return e.Source == EnvS3Endpoint }
+
+// Host returns host[:port] without the scheme, the form DuckDB takes as
+// ENDPOINT / s3_endpoint. Empty when no endpoint is set.
 func (e S3Endpoint) Host() string {
 	if !e.Set() {
 		return ""
@@ -52,36 +86,76 @@ func (e S3Endpoint) UseSSL() bool {
 	return strings.HasPrefix(strings.ToLower(e.URL), "https://")
 }
 
-// S3EndpointFromEnv resolves the endpoint from the environment. An invalid
-// value is an ERROR, never a silent fallback to AWS: with the SDK half pointed
-// at a custom store, a DuckDB read that quietly went to an AWS bucket of the
-// same name is the failure shape #1454 exists to close.
+// URLStyle renders the addressing mode as DuckDB names it.
+func (e S3Endpoint) URLStyle() string {
+	if e.PathStyle {
+		return "path"
+	}
+	return "vhost"
+}
+
+// S3EndpointFromEnv resolves the endpoint from the environment.
+//
+// A bad BINTRAIL_S3_ENDPOINT or BINTRAIL_S3_PATH_STYLE is an ERROR, never a
+// silent fallback to AWS: with writes going to the configured store and reads
+// going to an AWS bucket of the same name, a baseline that exists reads as
+// missing. An AWS SDK variable that this package cannot parse is NOT an error
+// (the SDK owns it, and it may well be valid there); it is logged and left
+// out of the DuckDB mirror, which is the most that can be done honestly.
 func S3EndpointFromEnv() (S3Endpoint, error) {
-	raw, source := "", ""
-	for _, name := range []string{EnvS3Endpoint, "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"} {
-		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-			raw, source = v, name
+	var ep S3Endpoint
+
+	if raw := strings.TrimSpace(os.Getenv(EnvS3Endpoint)); raw != "" {
+		normalized, err := normalizeEndpointURL(raw)
+		if err != nil {
+			// The value is not echoed: one of the shapes this rejects is a URL
+			// carrying credentials, and the error reaches CLI stderr, a console
+			// 502 body and the logs.
+			return S3Endpoint{}, fmt.Errorf("%w: %s: %w", ErrS3EndpointConfig, EnvS3Endpoint, err)
+		}
+		ep = S3Endpoint{URL: normalized, PathStyle: true, Source: EnvS3Endpoint}
+	} else {
+		for _, name := range awsEndpointEnv {
+			raw := strings.TrimSpace(os.Getenv(name))
+			if raw == "" {
+				continue
+			}
+			normalized, err := normalizeEndpointURL(raw)
+			if err != nil {
+				// The SDK keeps using it; only the DuckDB mirror is lost, and
+				// that divergence is exactly what the operator needs told.
+				slog.Warn("S3 endpoint from the AWS SDK's environment cannot be used for DuckDB reads, which will go to AWS; set "+EnvS3Endpoint+" so both halves agree",
+					"variable", name, "error", err)
+				break
+			}
+			// PathStyle stays false: the SDK addresses virtual-hosted by
+			// default, and the DuckDB half must match what the SDK does.
+			ep = S3Endpoint{URL: normalized, Source: name}
 			break
 		}
 	}
-	var ep S3Endpoint
-	if raw != "" {
-		u, err := url.Parse(raw)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return S3Endpoint{}, fmt.Errorf("%s=%q: want scheme://host[:port] with scheme http or https", source, raw)
-		}
-		if strings.Trim(u.Path, "/") != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-			return S3Endpoint{}, fmt.Errorf("%s=%q: only scheme://host[:port] is supported (no path, query or credentials)", source, raw)
-		}
-		ep.URL = u.Scheme + "://" + u.Host
-		ep.PathStyle = true
-	}
+
 	if v := strings.TrimSpace(os.Getenv(EnvS3PathStyle)); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			return S3Endpoint{}, fmt.Errorf("%s=%q: want true or false", EnvS3PathStyle, v)
+			return S3Endpoint{}, fmt.Errorf("%w: %s=%q: want true or false", ErrS3EndpointConfig, EnvS3PathStyle, v) //nolint:err113 // a bool value carries no secret
 		}
 		ep.PathStyle = b
+		ep.pathStyleExplicit = true
 	}
 	return ep, nil
+}
+
+// normalizeEndpointURL accepts scheme://host[:port] and returns it without a
+// trailing slash. Anything else is rejected: a path, query or credentials in
+// the URL are shapes bintrail cannot render into DuckDB's ENDPOINT.
+func normalizeEndpointURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", errors.New("want scheme://host[:port] with scheme http or https")
+	}
+	if strings.Trim(u.Path, "/") != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", errors.New("only scheme://host[:port] is supported (no path, query or credentials)")
+	}
+	return u.Scheme + "://" + u.Host, nil
 }

@@ -124,22 +124,31 @@ export BINTRAIL_S3_PATH_STYLE=false
 
 Notes:
 
-- The endpoint applies to `upload`, rotation's S3 archiving, baseline
-  upload and prune, `restore-index`, `archive reconcile`, `doctor`, `init`,
-  and to every DuckDB read of `s3://` paths (`query`/`recover` over archives,
-  `reconstruct --baseline-s3`, `verify`, the shim, the console). The
-  `views.sql` the console and `bintrail views` write names the endpoint too,
-  so it reads the same store from another machine.
-- `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL` are honored as fallbacks, so
-  an environment already set up for the AWS CLI works unchanged. Prefer
-  `BINTRAIL_S3_ENDPOINT` in new setups: it is the one the DuckDB half is
-  guaranteed to see.
+- The endpoint applies to every S3 path, including `upload`, rotation's S3
+  archiving, baseline upload and prune, `restore-index`, `archive reconcile`,
+  `doctor --archive-s3`, `init`, the agent's payload uploads, and every DuckDB
+  read of `s3://` paths (`query`/`recover` over archives, `reconstruct
+  --baseline-s3`, `verify`, `drill`, `baseline refresh`, the shim, the
+  console). The `views.sql` the console and `bintrail views` write names the
+  endpoint too, so it reads the same store from another machine.
+- `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL` are honored as fallbacks, so an
+  environment already set up for the AWS CLI keeps working: bintrail mirrors
+  their value to its DuckDB reads but otherwise leaves them to the SDK (no
+  syntax check, no forced addressing, no change to region resolution). Set
+  `BINTRAIL_S3_ENDPOINT` in new setups. An endpoint configured **only** as
+  `endpoint_url` in `~/.aws/config` routes the SDK half but cannot reach the
+  DuckDB half, which reads no AWS configuration at all: uploads land in your
+  store while Parquet reads go to AWS. bintrail warns when it sees that shape;
+  set `BINTRAIL_S3_ENDPOINT` to the same value.
 - With a custom endpoint and no region configured anywhere, the region
   defaults to `us-east-1`; S3-compatible stores accept any.
-- An invalid value (no scheme, a path, credentials in the URL) fails the
-  command. It never falls back to AWS: with uploads going to your store and
-  reads going to an AWS bucket of the same name, a baseline that exists
-  reads as missing, which is worse than an error.
+- An invalid `BINTRAIL_S3_ENDPOINT` (no scheme, a path, credentials in the
+  URL) fails the command, on the SDK paths and the DuckDB ones alike. It never
+  falls back to AWS: with uploads going to your store and reads going to an
+  AWS bucket of the same name, a baseline that exists reads as missing, which
+  is worse than an error. A value bintrail cannot parse in one of the AWS SDK
+  variables is not fatal (the SDK may well accept it); it is logged, and only
+  the DuckDB mirror is lost.
 - Object Lock and `s3:GetBucketLocation` behave as the store implements
   them; `doctor --archive-s3` reports what it can query.
 

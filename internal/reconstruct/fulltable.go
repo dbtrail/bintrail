@@ -1999,7 +1999,9 @@ func materializeBaselineLocal(ctx context.Context, path string, tuning duckdbuti
 		os.RemoveAll(tmpDir)
 		return "", nil, fmt.Errorf("load httpfs: %w", err)
 	}
-	duckdbutil.EnableS3CredentialChain(ctx, db)
+	if err := duckdbutil.EnableS3CredentialChain(ctx, db); err != nil {
+		return "", nil, err
+	}
 	safeSrc := strings.ReplaceAll(path, "'", "''")
 	safeDst := strings.ReplaceAll(tmpPath, "'", "''")
 	copyQ := fmt.Sprintf("COPY (SELECT * FROM parquet_scan('%s')) TO '%s' (FORMAT PARQUET)", safeSrc, safeDst)

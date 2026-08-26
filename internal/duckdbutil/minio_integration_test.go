@@ -60,7 +60,13 @@ func TestS3Compat_MinIO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := client.Options(); got.BaseEndpoint == nil || *got.BaseEndpoint != endpoint || !got.UsePathStyle {
+	// Compare against the NORMALIZED value: a trailing slash is accepted and
+	// trimmed, so comparing to the raw variable would fail on a correct setup.
+	wantEndpoint, err := storage.S3EndpointFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.Options(); got.BaseEndpoint == nil || *got.BaseEndpoint != wantEndpoint.URL || !got.UsePathStyle {
 		t.Fatalf("client not routed to MinIO: endpoint=%v pathStyle=%v", got.BaseEndpoint, got.UsePathStyle)
 	}
 	const bucket = "bintrail-it"
@@ -106,6 +112,32 @@ func TestS3Compat_MinIO(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("rows = %d, want 2", n)
 	}
+
+	// The same read with the aws extension switched off. Routing lives in the
+	// session settings, not the secret, so the escape hatch (and an air-gapped
+	// host that cannot install the extension, and a chain that resolves
+	// nothing) must not silently redirect the read to AWS.
+	t.Run("without the aws extension", func(t *testing.T) {
+		t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "1")
+		bare, err := sql.Open("duckdb", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bare.Close()
+		if err := duckdbutil.LoadHTTPFS(ctx, bare); err != nil {
+			t.Fatalf("httpfs: %v", err)
+		}
+		if err := duckdbutil.EnableS3CredentialChain(ctx, bare); err != nil {
+			t.Fatal(err)
+		}
+		var m int
+		if err := bare.QueryRowContext(ctx, "SELECT count(*) FROM read_parquet('s3://"+bucket+"/"+key+"')").Scan(&m); err != nil {
+			t.Fatalf("read without the aws extension: %v", err)
+		}
+		if m != 2 {
+			t.Fatalf("rows = %d, want 2", m)
+		}
+	})
 }
 
 func envOr(name, def string) string {

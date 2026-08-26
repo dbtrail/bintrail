@@ -16,7 +16,10 @@ import (
 // breakage this guard exists to prevent.
 //
 // Source-level rather than type-level: the SDK constructor is a function, so
-// nothing in the type system can stop a new call site from appearing.
+// nothing in the type system can stop a new call site from appearing. What the
+// scan sees is the literal text `s3.NewFromConfig(` in non-test .go files; an
+// aliased import would evade it. None exists today, which is when the limit is
+// worth writing down.
 func TestS3ClientConstructionGoesThroughOnePlace(t *testing.T) {
 	root, err := filepath.Abs("../..")
 	if err != nil {
@@ -31,8 +34,14 @@ func TestS3ClientConstructionGoesThroughOnePlace(t *testing.T) {
 			return err
 		}
 		if d.IsDir() {
+			// Any dot-directory: .git, and .claude/worktrees, which holds
+			// checkouts of OTHER branches. Walking those made this guard fail
+			// from the main checkout for code that is not in this tree.
+			if name := d.Name(); name != "." && strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
 			switch d.Name() {
-			case ".git", "node_modules", "vendor", "out":
+			case "node_modules", "vendor", "out":
 				return filepath.SkipDir
 			}
 			return nil

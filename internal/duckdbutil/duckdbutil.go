@@ -5,6 +5,7 @@ package duckdbutil
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -98,8 +99,8 @@ func ensureWritableHome() {
 //
 // Call it after `INSTALL httpfs; LOAD httpfs;` on sessions that will touch
 // s3:// paths.
-func EnableS3CredentialChain(ctx context.Context, db *sql.DB) {
-	EnableS3CredentialChainRegion(ctx, db, "")
+func EnableS3CredentialChain(ctx context.Context, db *sql.DB) error {
+	return EnableS3CredentialChainRegion(ctx, db, "")
 }
 
 // EnableS3CredentialChainRegion is EnableS3CredentialChain that also pins the
@@ -111,9 +112,25 @@ func EnableS3CredentialChain(ctx context.Context, db *sql.DB) {
 // 301/PermanentRedirect regardless of that precedence (#511). region "" reproduces
 // EnableS3CredentialChain exactly (no REGION clause), so existing same-region
 // callers are unchanged.
-func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region string) {
+func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region string) error {
+	// ROUTING FIRST, and outside every gate below (#1454). Which store a read
+	// reaches is not best-effort: an unrouted session does not fail, it
+	// succeeds against AWS with the ambient credentials, and an operator whose
+	// bucket name exists in both places gets someone else's data or a
+	// "missing" baseline that is sitting in their store. The gates below can
+	// all skip the secret — the escape hatch is set, the extension will not
+	// install on an air-gapped host, the chain resolves nothing — and each of
+	// those is a plausible MinIO deployment.
+	ep, err := storage.S3EndpointFromEnv()
+	if err != nil {
+		return err
+	}
+	if err := applyS3Routing(ctx, db, region, ep); err != nil {
+		return err
+	}
+
 	if os.Getenv("BINTRAIL_DUCKDB_NO_AWS_EXT") != "" {
-		return
+		return nil
 	}
 	ensureWritableHome()
 	if _, err := db.ExecContext(ctx, "INSTALL aws; LOAD aws;"); err != nil {
@@ -124,27 +141,53 @@ func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region strin
 			slog.Warn("duckdb: aws extension unavailable and no AWS env keys set — profile/role credentials will NOT apply to this S3 read; expect an authentication failure",
 				"error", err)
 		}
-		return
+		return nil
 	}
-	// The endpoint is what makes the DuckDB half agree with the SDK half
-	// (#1454): without it every httpfs read goes to s3.amazonaws.com no matter
-	// where BINTRAIL_S3_ENDPOINT points. An invalid value creates NO secret,
-	// so the read fails on credentials instead of quietly reading an AWS
-	// bucket of the same name.
-	ep, err := storage.S3EndpointFromEnv()
-	if err != nil {
-		slog.Error("duckdb: S3 endpoint configuration is invalid; no S3 secret created", "error", err)
-		return
-	}
+	// The secret repeats the endpoint the session settings already carry.
+	// DuckDB's secrets manager can take precedence over a SET for matching
+	// paths, so a secret that named only credentials would put the endpoint
+	// back to AWS for exactly the paths it matches.
 	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain" +
 		S3SecretClauses(region, ep) + ")"
 	// ensureWritableHome (above) has already pointed $HOME at a writable dir, so
 	// the httpfs autoload this CREATE SECRET triggers resolves its home correctly
 	// even under a homeless user.
 	if _, err := db.ExecContext(ctx, secret); err != nil {
+		// Credentials stay best-effort: a read that cannot be signed fails at
+		// the read, with the store's own error. Routing was applied above and
+		// is unaffected.
 		slog.Warn("duckdb: AWS credential chain resolved no usable credentials for S3 reads",
 			"error", err)
 	}
+	return nil
+}
+
+// applyS3Routing pins WHERE this session's s3:// requests go, as session
+// settings rather than as part of the secret, because settings need httpfs
+// alone: the aws extension is a download that an air-gapped or proxied host
+// does not get, and that host is a likely S3-compatible-store deployment.
+//
+// With no endpoint configured this does nothing at all, so the AWS path is
+// byte-for-byte what it was: httpfs's own defaults are already correct there.
+func applyS3Routing(ctx context.Context, db *sql.DB, region string, ep storage.S3Endpoint) error {
+	if !ep.Set() {
+		return nil
+	}
+	stmts := []string{
+		"SET s3_endpoint=" + sqlQuote(ep.Host()),
+		"SET s3_url_style=" + sqlQuote(ep.URLStyle()),
+		fmt.Sprintf("SET s3_use_ssl=%t", ep.UseSSL()),
+	}
+	if region != "" {
+		stmts = append(stmts, "SET s3_region="+sqlQuote(region))
+	}
+	for _, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			// Refusing here is the point: continuing would read AWS.
+			return fmt.Errorf("route DuckDB S3 reads to %s (is httpfs loaded?): %w", ep.URL, err)
+		}
+	}
+	return nil
 }
 
 // S3SecretClauses renders the optional clauses of bintrail's S3 secret, each

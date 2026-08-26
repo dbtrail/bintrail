@@ -378,7 +378,9 @@ func scanS3Archive(ctx context.Context, s3URL, region string, deep bool) ([]arch
 			}
 			if deep && footerDB != nil {
 				if dueForS3SecretRefresh(secretIssuedAt, time.Now(), s3FooterSecretRefreshInterval) {
-					duckdbutil.EnableS3CredentialChainRegion(ctx, footerDB, cfg.Region)
+					if err := duckdbutil.EnableS3CredentialChainRegion(ctx, footerDB, cfg.Region); err != nil {
+						return nil, err
+					}
 					secretIssuedAt = time.Now()
 				}
 				if n, err := duckdbParquetRowCount(ctx, footerDB, "s3://"+bucket+"/"+*obj.Key); err == nil {
@@ -433,7 +435,10 @@ func openS3FooterSession(ctx context.Context, region string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("load httpfs extension: %w", err)
 	}
-	duckdbutil.EnableS3CredentialChainRegion(ctx, db, region)
+	if err := duckdbutil.EnableS3CredentialChainRegion(ctx, db, region); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return db, nil
 }
 

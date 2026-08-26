@@ -18,8 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half always went to `s3.amazonaws.com`, so a baseline that verifiably
   existed read as missing. Bucket-in-path addressing is on by default with a
   custom endpoint (`BINTRAIL_S3_PATH_STYLE=false` for virtual-hosted-only
-  stores); `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT_URL` are honored as fallbacks;
-  an invalid value fails the command instead of falling back to AWS. The
+  stores). `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT_URL` are honored as fallbacks
+  and otherwise left to the SDK, so an environment already configured for the
+  AWS CLI keeps its behavior; an endpoint set only in `~/.aws/config` routes
+  the SDK half alone and now warns, since DuckDB reads no AWS configuration.
+  An invalid `BINTRAIL_S3_ENDPOINT` fails the command instead of falling back
+  to AWS, on the baseline read paths too. Routing is applied as DuckDB session
+  settings rather than only inside the credentials secret, so it survives an
+  air-gapped host where the `aws` extension cannot be installed. The
   `views.sql` download and `bintrail views` name the endpoint in their secret,
   so the file reads the same store from another machine. Every S3 client in
   the tree is now built by `storage.NewS3ClientFromConfig`, and CI runs the

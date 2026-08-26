@@ -214,8 +214,8 @@ jobs:
       # exited 0. pipefail keeps the go-test exit code through the tee.
       # An S3-compatible store for the #1453/#1454 leg: the SDK half uploads
       # through BINTRAIL_S3_ENDPOINT and the DuckDB half reads the object back
-      # through the endpoint-carrying secret. Throwaway root credentials; the
-      # container is gone with the runner.
+      # through the session's endpoint settings. Throwaway root credentials;
+      # the container is gone with the runner.
       - name: Start MinIO (bintrail-test-minio)
         if: github.event_name == 'push' || needs.changes.outputs.go == 'true'
         run: |

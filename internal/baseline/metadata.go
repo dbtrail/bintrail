@@ -339,7 +339,9 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		return DumpMetadata{}, fmt.Errorf("load httpfs extension: %w", err)
 	}
-	duckdbutil.EnableS3CredentialChain(ctx, db)
+	if err := duckdbutil.EnableS3CredentialChain(ctx, db); err != nil {
+		return DumpMetadata{}, err
+	}
 
 	safePath := strings.ReplaceAll(path, "'", "''")
 	q := fmt.Sprintf("SELECT key, value FROM parquet_kv_metadata('%s')", safePath)

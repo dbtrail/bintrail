@@ -3,6 +3,7 @@ package duckdbutil
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 
@@ -66,9 +67,83 @@ func TestEnableS3CredentialChain_customEndpoint(t *testing.T) {
 	}
 }
 
-// An invalid endpoint creates NO secret: the read then fails on credentials,
-// loudly, instead of quietly reading an AWS bucket of the same name.
-func TestEnableS3CredentialChain_invalidEndpointCreatesNoSecret(t *testing.T) {
+// TestEnableS3CredentialChain_routesWithoutAWSExtension is the regression
+// guard for the hole this feature would otherwise have (#1454): the endpoint
+// used to live only in the credential-chain secret, and three branches skip
+// that secret — the documented escape hatch, an aws extension that will not
+// install on an air-gapped host, and a chain that resolves nothing. Every one
+// of those is a plausible S3-compatible-store deployment, and an unrouted
+// session does not fail: it succeeds against AWS with the ambient credentials.
+func TestEnableS3CredentialChain_routesWithoutAWSExtension(t *testing.T) {
+	t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "1") // the branch that skips the secret
+	t.Setenv(storage.EnvS3PathStyle, "")
+	t.Setenv(storage.EnvS3Endpoint, "https://s3.wasabisys.com")
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := LoadHTTPFS(context.Background(), db); err != nil {
+		t.Skip("httpfs unavailable (offline host)")
+	}
+	if err := EnableS3CredentialChain(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	for setting, want := range map[string]string{
+		"s3_endpoint":  "s3.wasabisys.com",
+		"s3_url_style": "path",
+		"s3_use_ssl":   "true",
+	} {
+		var got string
+		if err := db.QueryRow("SELECT current_setting('" + setting + "')").Scan(&got); err != nil {
+			t.Fatalf("read %s: %v", setting, err)
+		}
+		if got != want {
+			t.Errorf("%s = %q, want %q: reads would go to AWS", setting, got, want)
+		}
+	}
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("the escape hatch created a secret anyway (n=%d, err=%v)", n, err)
+	}
+}
+
+// With no endpoint configured the session is left exactly as it was: httpfs's
+// own defaults are correct for AWS, and touching them would be a new failure
+// mode for every existing user.
+func TestEnableS3CredentialChain_noEndpointTouchesNothing(t *testing.T) {
+	t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "1")
+	t.Setenv(storage.EnvS3PathStyle, "")
+	t.Setenv(storage.EnvS3Endpoint, "")
+	t.Setenv("AWS_ENDPOINT_URL_S3", "")
+	t.Setenv("AWS_ENDPOINT_URL", "")
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := LoadHTTPFS(context.Background(), db); err != nil {
+		t.Skip("httpfs unavailable (offline host)")
+	}
+	if err := EnableS3CredentialChain(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	// NULL when the session never set it, which is the point: untouched.
+	var got sql.NullString
+	if err := db.QueryRow("SELECT current_setting('s3_endpoint')").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Valid && got.String != "" {
+		t.Errorf("s3_endpoint = %q, want the httpfs default for AWS", got.String)
+	}
+}
+
+// An invalid endpoint is returned as an error, not logged and walked past: on
+// the baseline read paths there is no SDK call to fail first, so a log line
+// would let the read proceed against AWS.
+func TestEnableS3CredentialChain_invalidEndpointIsAnError(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "testdummykey")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "testdummysecret")
 	t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "")
@@ -80,14 +155,15 @@ func TestEnableS3CredentialChain_invalidEndpointCreatesNoSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	EnableS3CredentialChain(context.Background(), db)
-
-	var loaded bool
-	if err := db.QueryRow("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'aws'").Scan(&loaded); err != nil || !loaded {
-		t.Skip("aws extension unavailable (offline host)")
+	err = EnableS3CredentialChain(context.Background(), db)
+	if err == nil {
+		t.Fatal("an invalid endpoint was accepted: the read would target AWS")
+	}
+	if !errors.Is(err, storage.ErrS3EndpointConfig) {
+		t.Errorf("error does not wrap ErrS3EndpointConfig: %v", err)
 	}
 	var n int
 	if err := db.QueryRow("SELECT count(*) FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&n); err != nil || n != 0 {
-		t.Fatalf("a secret was created over an invalid endpoint (n=%d, err=%v): reads would silently target AWS", n, err)
+		t.Fatalf("a secret was created over an invalid endpoint (n=%d, err=%v)", n, err)
 	}
 }

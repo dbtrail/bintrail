@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -37,33 +38,49 @@ func TestS3EndpointFromEnv(t *testing.T) {
 		{
 			name:     "MinIO over http, path style by default",
 			env:      map[string]string{EnvS3Endpoint: "http://minio:9000"},
-			want:     S3Endpoint{URL: "http://minio:9000", PathStyle: true},
+			want:     S3Endpoint{URL: "http://minio:9000", PathStyle: true, Source: EnvS3Endpoint},
 			wantHost: "minio:9000",
 		},
 		{
 			name:     "Wasabi over https, virtual-hosted on request",
 			env:      map[string]string{EnvS3Endpoint: "https://s3.wasabisys.com", EnvS3PathStyle: "false"},
-			want:     S3Endpoint{URL: "https://s3.wasabisys.com", PathStyle: false},
+			want:     S3Endpoint{URL: "https://s3.wasabisys.com", PathStyle: false, Source: EnvS3Endpoint, pathStyleExplicit: true},
 			wantHost: "s3.wasabisys.com",
 			wantSSL:  true,
 		},
 		{
-			name:     "the SDK's own variable is honored as a fallback",
+			// Mirrored to DuckDB so reads follow writes, but left virtual-hosted:
+			// that is how the SDK addresses it, and the two halves must agree.
+			name:     "the SDK's own variable is mirrored, with the SDK's addressing",
 			env:      map[string]string{"AWS_ENDPOINT_URL_S3": "http://localstack:4566"},
-			want:     S3Endpoint{URL: "http://localstack:4566", PathStyle: true},
+			want:     S3Endpoint{URL: "http://localstack:4566", Source: "AWS_ENDPOINT_URL_S3"},
 			wantHost: "localstack:4566",
+		},
+		{
+			name:     "an explicit path style applies to an SDK-resolved endpoint too",
+			env:      map[string]string{"AWS_ENDPOINT_URL": "http://minio:9000", EnvS3PathStyle: "true"},
+			want:     S3Endpoint{URL: "http://minio:9000", PathStyle: true, Source: "AWS_ENDPOINT_URL", pathStyleExplicit: true},
+			wantHost: "minio:9000",
 		},
 		{
 			name:     "BINTRAIL_S3_ENDPOINT wins over the SDK variable",
 			env:      map[string]string{EnvS3Endpoint: "http://minio:9000", "AWS_ENDPOINT_URL_S3": "http://other:1"},
-			want:     S3Endpoint{URL: "http://minio:9000", PathStyle: true},
+			want:     S3Endpoint{URL: "http://minio:9000", PathStyle: true, Source: EnvS3Endpoint},
 			wantHost: "minio:9000",
 		},
 		{
 			name:     "a trailing slash is not a path",
 			env:      map[string]string{EnvS3Endpoint: "http://minio:9000/"},
-			want:     S3Endpoint{URL: "http://minio:9000", PathStyle: true},
+			want:     S3Endpoint{URL: "http://minio:9000", PathStyle: true, Source: EnvS3Endpoint},
 			wantHost: "minio:9000",
+		},
+		{
+			// The SDK accepts shapes this package cannot render into DuckDB.
+			// Failing every command over one would break a working setup on
+			// upgrade, so it is dropped from the mirror, not made fatal.
+			name: "an SDK variable this package cannot parse is not fatal",
+			env:  map[string]string{"AWS_ENDPOINT_URL": "https://gw.corp/aws"},
+			want: S3Endpoint{},
 		},
 		{name: "no scheme", env: map[string]string{EnvS3Endpoint: "minio:9000"}, wantError: "scheme"},
 		{name: "a path is not supported", env: map[string]string{EnvS3Endpoint: "http://host/s3"}, wantError: "no path"},
@@ -80,6 +97,11 @@ func TestS3EndpointFromEnv(t *testing.T) {
 			if tc.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
 					t.Fatalf("err = %v, want one mentioning %q", err, tc.wantError)
+				}
+				// A caller that degrades on read failures needs to tell a
+				// configuration fault apart from a storage one.
+				if !errors.Is(err, ErrS3EndpointConfig) {
+					t.Errorf("err does not wrap ErrS3EndpointConfig: %v", err)
 				}
 				return
 			}
@@ -127,6 +149,75 @@ func TestLoadAWSConfig_customEndpoint(t *testing.T) {
 	t.Setenv(EnvS3Endpoint, "not-a-url")
 	if _, err := LoadAWSConfig(context.Background(), ""); err == nil {
 		t.Fatal("an invalid endpoint must fail the load, never fall back to AWS")
+	}
+}
+
+// TestLoadAWSConfig_sdkEndpointKeepsSDKSemantics: an operator who already
+// configured the SDK's own endpoint variable keeps the SDK's behavior. bintrail
+// mirrors the value to its DuckDB half but must not force path style (the SDK
+// addresses virtual-hosted), must not fail on a value the SDK accepts, and must
+// not suppress the IMDS region fallback — doing that would sign an EC2 role's
+// requests for us-east-1 instead of the instance's region.
+func TestLoadAWSConfig_sdkEndpointKeepsSDKSemantics(t *testing.T) {
+	isolateAWSEnv(t)
+	t.Setenv("AWS_ENDPOINT_URL_S3", "http://localstack:4566")
+
+	cfg, err := LoadAWSConfig(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Region == "us-east-1" {
+		t.Error("bintrail defaulted the region for an SDK-owned endpoint; the IMDS fallback is the SDK user's to keep")
+	}
+	if opts := NewS3ClientFromConfig(cfg).Options(); opts.UsePathStyle {
+		t.Error("path style forced on an SDK-resolved endpoint: this changes addressing for a setup that worked before")
+	}
+
+	// The SDK routes AWS_ENDPOINT_URL_S3 itself, at client build time rather
+	// than through cfg.BaseEndpoint.
+	if opts := NewS3ClientFromConfig(cfg).Options(); opts.BaseEndpoint == nil || *opts.BaseEndpoint != "http://localstack:4566" {
+		t.Errorf("client endpoint = %v, want the SDK's own routing preserved", opts.BaseEndpoint)
+	}
+
+	// The operator can still ask for path style explicitly.
+	t.Setenv(EnvS3PathStyle, "true")
+	cfg2, err := LoadAWSConfig(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts := NewS3ClientFromConfig(cfg2).Options(); !opts.UsePathStyle {
+		t.Error("BINTRAIL_S3_PATH_STYLE=true did not apply to an SDK-resolved endpoint")
+	}
+}
+
+// TestS3Endpoint_bintrailWinsOnBothHalves is the split-brain guard. The SDK's
+// service-specific AWS_ENDPOINT_URL_S3 overrides cfg.BaseEndpoint at client
+// build time, so with both variables set the SDK would write to one store
+// while DuckDB (which follows BINTRAIL_S3_ENDPOINT) reads the other. Whichever
+// variable wins, both halves must name the SAME store.
+func TestS3Endpoint_bintrailWinsOnBothHalves(t *testing.T) {
+	isolateAWSEnv(t)
+	t.Setenv(EnvS3Endpoint, "http://bintrail-store:9000")
+	t.Setenv("AWS_ENDPOINT_URL_S3", "http://sdk-store:1")
+
+	ep, err := S3EndpointFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadAWSConfig(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := NewS3ClientFromConfig(cfg).Options()
+	if opts.BaseEndpoint == nil {
+		t.Fatal("client has no endpoint")
+	}
+	// The DuckDB half reads ep.URL; the SDK half reads the client endpoint.
+	if *opts.BaseEndpoint != ep.URL {
+		t.Fatalf("halves disagree: SDK writes to %q, DuckDB reads %q", *opts.BaseEndpoint, ep.URL)
+	}
+	if *opts.BaseEndpoint != "http://bintrail-store:9000" {
+		t.Fatalf("client endpoint = %q, want bintrail's own variable to win", *opts.BaseEndpoint)
 	}
 }
 

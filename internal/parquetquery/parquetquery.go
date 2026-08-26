@@ -227,7 +227,9 @@ func fetchS3Direct(ctx context.Context, db *sql.DB, files []string, region strin
 	// credential_chain secret otherwise resolves region from the AWS SDK config,
 	// not the bucket. Both together cover every precedence model — and the SET
 	// still applies when the aws extension is unavailable and no secret exists.
-	duckdbutil.EnableS3CredentialChainRegion(ctx, db, region)
+	if err := duckdbutil.EnableS3CredentialChainRegion(ctx, db, region); err != nil {
+		return nil, err
+	}
 
 	threads := duckDBThreadCount(ctx, db)
 	warnAttrs := []any{"files", len(files), "duckdb_threads", threads}
