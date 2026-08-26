@@ -187,5 +187,7 @@ func (s *Server) viewsAvailable(r *http.Request, b *bundle) bool {
 	// per-source filesystem walk, so it is the cheaper gate. A registry read
 	// failure hides the button, as before: the handler would 502.
 	sources, err := consoleArchiveSources(r.Context(), b.db, true)
+	// sources is nil whenever err is set, so the err check is intent, not a
+	// distinct branch: the gate must never say yes on a failed read.
 	return err == nil && len(sources) > 0
 }

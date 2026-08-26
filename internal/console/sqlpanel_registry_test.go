@@ -6,6 +6,8 @@ import (
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/dbtrail/dbtrail/internal/audittest"
 )
 
 // TestSQLPanel_registryReadFailure: with a baseline present and the archive
@@ -26,6 +28,7 @@ func TestSQLPanel_registryReadFailure(t *testing.T) {
 	}
 	srv := newSQLPanelServer(t, dir, true)
 	srv.cm.boot.db = db
+	audit := audittest.Install(t)
 
 	rec, body := doServersReq(t, srv, "POST", "/api/sql", `{"sql":"SELECT 1"}`)
 	if rec.Code != 200 {
@@ -39,10 +42,35 @@ func TestSQLPanel_registryReadFailure(t *testing.T) {
 	}
 
 	rec, body = doServersReq(t, srv, "POST", "/api/sql", `{"sql":"SELECT count(*) FROM events"}`)
-	if rec.Code == 200 {
-		t.Fatalf("a query on the missing events view succeeded: %s", body)
+	// 422, not 502: a missing catalog entry is an engine (statement) error,
+	// which is the branch that carries the note. A reclassification to the
+	// server-fault branch would drop the note and must fail here loudly.
+	if rec.Code != 422 {
+		t.Fatalf("query on the missing events view: code = %d, body = %s; want 422", rec.Code, body)
 	}
-	if !strings.Contains(string(body), "archive_state") {
-		t.Errorf("failure does not name the cause ahead of the engine message: %s", body)
+	s := string(body)
+	noteAt, engineAt := strings.Index(s, ". Note: the archive registry"), strings.Index(s, "events")
+	if noteAt < 0 || engineAt < 0 || noteAt < engineAt {
+		// The note FOLLOWS the engine message: *sqlUserError is the whole
+		// user-error class (timeouts, policy refusals), and a note leading
+		// the message would assert a cause for refusals that never touched
+		// the events view.
+		t.Errorf("note must follow the engine message: %s", s)
+	}
+	// The audit detail is the engine message alone: the same claim that
+	// would mislabel a policy refusal in the body would mislabel it forever
+	// in the audit log.
+	var refused int
+	for _, ev := range audit.Events() {
+		if ev.Action != "sql.run" || ev.Detail["outcome"] != "refused" {
+			continue
+		}
+		refused++
+		if strings.Contains(ev.Detail["error"], "archive_state") {
+			t.Errorf("audit detail carries the registry note: %q", ev.Detail["error"])
+		}
+	}
+	if refused != 1 {
+		t.Errorf("refused sql.run audit events = %d, want 1", refused)
 	}
 }
