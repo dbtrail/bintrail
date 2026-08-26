@@ -183,16 +183,41 @@ func applyS3Routing(ctx context.Context, db *sql.DB, region string, ep storage.S
 	if !ep.Set() {
 		return nil
 	}
-	// SET GLOBAL, not SET: a plain SET binds to the CONNECTION that ran it, so
-	// on a *sql.DB pool the next connection reads with s3_endpoint unset and
-	// goes to AWS (measured: a sibling connection sees "" after SET, and the
-	// configured host after SET GLOBAL). Most callers here happen to use one
-	// connection, which is exactly why this would have stayed invisible.
-	//
-	// GLOBAL is not process-wide: it is scoped to the DuckDB INSTANCE, and
-	// every caller opens its own via sql.Open (measured: two handles hold two
-	// different s3_endpoint values at once). Two sessions in one process, a
-	// console daemon serving several servers among them, do not interfere.
+	for _, stmt := range S3SettingStatements(region, ep) {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			// Refusing here is the point: continuing would read AWS.
+			return fmt.Errorf("route DuckDB S3 reads to %s (is httpfs loaded?): %w", ep.URL, err)
+		}
+	}
+	return nil
+}
+
+// S3SettingStatements renders the settings that decide WHERE a DuckDB
+// instance's s3:// requests go. It is the settings half of what
+// S3SecretClauses does for the secret, shared for the same reason: the
+// downloadable views.sql must configure exactly what this process configures,
+// and a hand-copied second list drifts (it did: s3_region was missing from
+// the file's copy, so a cross-region store signed against an empty region
+// whenever the reader's secret did not apply).
+//
+// SET GLOBAL, not SET: a plain SET binds to the CONNECTION that ran it, so on
+// a *sql.DB pool the next connection reads with s3_endpoint unset and goes to
+// AWS (measured: a sibling connection sees "" after SET, and the configured
+// host after SET GLOBAL). Most callers use one connection, which is exactly
+// why this would have stayed invisible.
+//
+// GLOBAL is not process-wide: it is scoped to the DuckDB INSTANCE, and every
+// caller opens its own via sql.Open (measured: two handles hold two different
+// s3_endpoint values at once). Two sessions in one process, a console daemon
+// serving several servers among them, do not interfere.
+//
+// Returns nil when no endpoint is configured: httpfs's own defaults are
+// already correct for AWS, and touching them would be a new failure mode for
+// every existing user. Statements carry no trailing semicolon.
+func S3SettingStatements(region string, ep storage.S3Endpoint) []string {
+	if !ep.Set() {
+		return nil
+	}
 	stmts := []string{
 		"SET GLOBAL s3_endpoint=" + sqlQuote(ep.Host()),
 		"SET GLOBAL s3_url_style=" + sqlQuote(ep.URLStyle()),
@@ -201,13 +226,7 @@ func applyS3Routing(ctx context.Context, db *sql.DB, region string, ep storage.S
 	if region != "" {
 		stmts = append(stmts, "SET GLOBAL s3_region="+sqlQuote(region))
 	}
-	for _, stmt := range stmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			// Refusing here is the point: continuing would read AWS.
-			return fmt.Errorf("route DuckDB S3 reads to %s (is httpfs loaded?): %w", ep.URL, err)
-		}
-	}
-	return nil
+	return stmts
 }
 
 // S3SecretClauses renders the optional clauses of bintrail's S3 secret, each

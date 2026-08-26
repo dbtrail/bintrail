@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -28,6 +29,58 @@ func TestS3SecretClauses(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := S3SecretClauses(tc.region, tc.ep); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestS3SettingStatements pins the statements that decide WHERE this instance's
+// s3:// requests go. Both this process and the downloadable views.sql render
+// from this list, so it is the one place the two can be compared.
+func TestS3SettingStatements(t *testing.T) {
+	minio := storage.S3Endpoint{URL: "http://minio:9000", PathStyle: true}
+	cases := []struct {
+		name   string
+		region string
+		ep     storage.S3Endpoint
+		want   []string
+	}{
+		// AWS: httpfs's own defaults are already right, and rerouting them
+		// would be a new failure mode for every existing user. Region included:
+		// with no endpoint there is nothing to reroute, and the secret carries
+		// the region on its own.
+		{"aws stays untouched", "us-west-2", storage.S3Endpoint{}, nil},
+		{"endpoint, no region", "", minio, []string{
+			"SET GLOBAL s3_endpoint='minio:9000'",
+			"SET GLOBAL s3_url_style='path'",
+			"SET GLOBAL s3_use_ssl=false",
+		}},
+		// The region belongs here and not only in the secret: three documented
+		// branches skip the secret entirely, and a request signed for the wrong
+		// region is rejected by an S3-compatible store that checks it.
+		{"endpoint and region", "eu-central-1", minio, []string{
+			"SET GLOBAL s3_endpoint='minio:9000'",
+			"SET GLOBAL s3_url_style='path'",
+			"SET GLOBAL s3_use_ssl=false",
+			"SET GLOBAL s3_region='eu-central-1'",
+		}},
+		{"vhost over https", "", storage.S3Endpoint{URL: "https://s3.wasabisys.com"}, []string{
+			"SET GLOBAL s3_endpoint='s3.wasabisys.com'",
+			"SET GLOBAL s3_url_style='vhost'",
+			"SET GLOBAL s3_use_ssl=true",
+		}},
+		{"quotes are doubled", "it's", minio, []string{
+			"SET GLOBAL s3_endpoint='minio:9000'",
+			"SET GLOBAL s3_url_style='path'",
+			"SET GLOBAL s3_use_ssl=false",
+			"SET GLOBAL s3_region='it''s'",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := S3SettingStatements(tc.region, tc.ep)
+			if !slices.Equal(got, tc.want) {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Environment variables that point every S3 path (SDK clients and DuckDB
@@ -36,6 +37,10 @@ const (
 // break a working setup on upgrade. They therefore never carry bintrail's
 // validation, its path-style default, or its region handling.
 var awsEndpointEnv = []string{"AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"}
+
+// warnUnparseableOnce keeps the "cannot mirror this to DuckDB" warning to one
+// line per process; the condition is a static environment value.
+var warnUnparseableOnce sync.Once
 
 // ErrS3EndpointConfig marks a bad BINTRAIL_S3_ENDPOINT / BINTRAIL_S3_PATH_STYLE
 // value. It is a configuration fault, knowable before any byte moves, so a
@@ -127,8 +132,13 @@ func S3EndpointFromEnv() (S3Endpoint, error) {
 			if err != nil {
 				// The SDK keeps using it; only the DuckDB mirror is lost, and
 				// that divergence is exactly what the operator needs told.
-				slog.Warn("S3 endpoint from the AWS SDK's environment cannot be used for DuckDB reads, which will go to AWS; set "+EnvS3Endpoint+" so both halves agree",
-					"variable", name, "error", err)
+				// Once per process, like its twin in s3url.go: the same
+				// misconfiguration, the same remedy, and S3EndpointFromEnv
+				// runs three times per client construction.
+				warnUnparseableOnce.Do(func() {
+					slog.Warn("S3 endpoint from the AWS SDK's environment cannot be used for DuckDB reads, which will go to AWS; set "+EnvS3Endpoint+" so both halves agree",
+						"variable", name, "error", err)
+				})
 				// break, not continue: the SDK's own precedence puts
 				// AWS_ENDPOINT_URL_S3 above AWS_ENDPOINT_URL, so falling
 				// through to the generic one would point DuckDB at a store

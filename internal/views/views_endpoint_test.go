@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
@@ -11,23 +12,36 @@ import (
 // that reads an S3-compatible store must say so, or the reader's DuckDB sends
 // every s3:// path to AWS. The endpoint is a location, not a credential, and
 // the no-credentials property of the file is unchanged.
+//
+// The routing half asserts against duckdbutil.S3SettingStatements rather than a
+// list of literals. The literal version could not see the defect it was written
+// to catch: it enumerated the three statements the file happened to emit, so
+// when the file's copy of the list lost s3_region, the test agreed with the
+// copy. Deriving from the shared renderer means a settings that the process
+// applies and the file omits fails here.
 func TestGenerate_customEndpointInPreamble(t *testing.T) {
 	in := goldenInput()
 	in.S3Endpoint = storage.S3Endpoint{URL: "http://minio:9000", PathStyle: true}
 	out := Generate(in)
 
+	// Outside the secret as well: an interactive DuckDB continues past a failed
+	// statement, so a session whose credential chain resolves nothing would
+	// skip the secret and read AWS. GLOBAL because a plain SET binds to one
+	// connection.
+	routing := duckdbutil.S3SettingStatements(in.ArchiveRegion, in.S3Endpoint)
+	if len(routing) < 4 {
+		t.Fatalf("fixture exercises only %d settings; it must cover the region too: %v", len(routing), routing)
+	}
+	for _, stmt := range routing {
+		if !strings.Contains(out, stmt+";") {
+			t.Errorf("the process applies %q but the file does not:\n%s", stmt, out)
+		}
+	}
+
 	for _, want := range []string{
 		"CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, REGION 'us-east-1', ENDPOINT 'minio:9000', URL_STYLE 'path', USE_SSL false);",
 		"-- s3:// paths here live in an S3-compatible store at http://minio:9000, not in AWS.",
 		"--     ENDPOINT 'minio:9000', URL_STYLE 'path', USE_SSL false);",
-		// Outside the secret as well: an interactive DuckDB continues past a
-		// failed statement, so a session whose credential chain resolves
-		// nothing would skip the secret and read AWS.
-		// GLOBAL: a plain SET binds to one connection, so a client that pools
-		// would read the next query with no endpoint and reach AWS.
-		"SET GLOBAL s3_endpoint='minio:9000';",
-		"SET GLOBAL s3_url_style='path';",
-		"SET GLOBAL s3_use_ssl=false;",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q:\n%s", want, out)
@@ -51,7 +65,7 @@ func TestGenerate_customEndpointInPreamble(t *testing.T) {
 // The zero endpoint changes nothing: the golden file (AWS) stays byte-identical.
 func TestGenerate_noEndpointIsAWS(t *testing.T) {
 	out := Generate(goldenInput())
-	if strings.Contains(out, "ENDPOINT") || strings.Contains(out, "S3-compatible") {
-		t.Errorf("an AWS layout mentions an endpoint:\n%s", out)
+	if strings.Contains(out, "ENDPOINT") || strings.Contains(out, "S3-compatible") || strings.Contains(out, "SET GLOBAL") {
+		t.Errorf("an AWS layout mentions an endpoint or reroutes httpfs:\n%s", out)
 	}
 }

@@ -33,6 +33,7 @@ import (
 //	UsePathStyle forced off                                   -> RED
 //	both SDK endpoint pins removed                            -> RED
 //	either SDK endpoint pin alone removed                     -> green
+//	s3_region dropped from S3SettingStatements                -> green
 //
 // The last row is why both pins exist rather than one: each covers the other
 // here, and they diverge only when AWS_ENDPOINT_URL_S3 is ALSO set, which
@@ -40,6 +41,12 @@ import (
 // rows say the same about the two routing layers: DuckDB's secrets manager
 // takes precedence over a SET, and the SET is what survives a session with no
 // secret at all.
+//
+// The s3_region row is a LIMIT of this leg, not a verdict on the setting:
+// MinIO accepts any region and this test pins none, so dropping the region
+// statement stays green here while TestS3SettingStatements sees it. A store
+// that validates the signing region (Ceph, some Wasabi endpoints) is where the
+// omission bites, and nothing in CI reaches one.
 //
 // Not covered here: the BINTRAIL_S3_PATH_STYLE knob, which
 // TestLoadAWSConfig_customEndpoint pins in both directions.

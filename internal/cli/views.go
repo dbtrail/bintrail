@@ -107,26 +107,22 @@ func runViews(cmd *cobra.Command, _ []string) error {
 			"or name a source directly with --archive-dir/--archive-s3 plus --bintrail-id")
 	}
 
-	ep, err := storage.S3EndpointFromEnv()
-	if err != nil {
-		return err
-	}
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     buildVersion,
 		// Region is only meaningful for the S3 secret; a local-only layout
 		// never emits the preamble that would use it.
 		ArchiveRegion: vRegion,
-		S3Endpoint:    ep,
 	}
 
 	if explicitArchives {
 		in.ArchiveSources = explicitArchiveSources()
 	} else {
-		in.ArchiveSources, err = discoverArchiveSources(cmd.Context(), vIndexDSN)
+		sources, err := discoverArchiveSources(cmd.Context(), vIndexDSN)
 		if err != nil {
 			return err
 		}
+		in.ArchiveSources = sources
 		in.PortableRouting = true
 	}
 
@@ -134,6 +130,18 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		if err := resolveBaselineViews(cmd.Context(), &in); err != nil {
 			return err
 		}
+	}
+
+	// After the layout is known, so a purely local one is not refused over an
+	// S3 variable it will never read. When the file DOES carry s3:// paths, a
+	// broken endpoint is fatal: the alternative is a file that silently sends
+	// the operator's DuckDB to AWS.
+	if in.NeedsS3() {
+		ep, err := storage.S3EndpointFromEnv()
+		if err != nil {
+			return err
+		}
+		in.S3Endpoint = ep
 	}
 
 	sql := views.Generate(in)

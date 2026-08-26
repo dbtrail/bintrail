@@ -331,3 +331,41 @@ func TestNewS3Client_explicitEndpointWins(t *testing.T) {
 		t.Fatalf("explicit endpoint not applied last: endpoint=%v pathStyle=%v", opts.BaseEndpoint, opts.UsePathStyle)
 	}
 }
+
+// TestS3EndpointFromEnv_warnsOncePerProcess covers the one signal a user gets
+// when an AWS SDK endpoint variable cannot be mirrored to DuckDB: the SDK will
+// still honour it for writes, so the halves diverge silently and the reads land
+// on AWS. Two properties, and the second is why this test exists at all:
+//
+//   - it fires, naming the variable, so the operator can act on it
+//   - it fires ONCE, because S3EndpointFromEnv runs three times per client
+//     construction and a per-call warning turns one typo into a repeating
+//     stanza in the log of a long-running daemon
+func TestS3EndpointFromEnv_warnsOncePerProcess(t *testing.T) {
+	isolateAWSEnv(t)
+	t.Setenv("AWS_ENDPOINT_URL_S3", "minio.svc:9000") // no scheme: unusable for DuckDB
+
+	var logged strings.Builder
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	defer slog.SetDefault(restore)
+	warnUnparseableOnce = sync.Once{}
+	t.Cleanup(func() { warnUnparseableOnce = sync.Once{} })
+
+	for range 3 {
+		if _, err := S3EndpointFromEnv(); err != nil {
+			// Lenient on the SDK's own variables: bintrail did not ask for
+			// them, and failing here would break an upgrade for anyone whose
+			// AWS_ENDPOINT_URL carries a path.
+			t.Fatalf("an AWS variable was treated as fatal: %v", err)
+		}
+	}
+
+	out := logged.String()
+	if !strings.Contains(out, "AWS_ENDPOINT_URL_S3") {
+		t.Errorf("no warning naming the variable DuckDB cannot follow: %s", out)
+	}
+	if n := strings.Count(out, "AWS_ENDPOINT_URL_S3"); n != 1 {
+		t.Errorf("warned %d times for one static misconfiguration: %s", n, out)
+	}
+}

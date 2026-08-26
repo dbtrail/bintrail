@@ -96,7 +96,7 @@ type Input struct {
 func Generate(in Input) string {
 	var b strings.Builder
 	writeHeader(&b, in)
-	if in.needsS3() {
+	if in.NeedsS3() {
 		writeS3Preamble(&b, in.ArchiveRegion, in.S3Endpoint)
 	}
 	writeEventsView(&b, in)
@@ -118,7 +118,12 @@ func GenerateViews(in Input) string {
 	return b.String()
 }
 
-func (in Input) needsS3() bool {
+// NeedsS3 reports whether the rendered file will read any s3:// path. Callers
+// use it to decide whether a broken S3 endpoint configuration is worth
+// refusing over: a layout that is entirely local reads nothing through httpfs,
+// so failing it on an unrelated environment variable blocks a render that
+// would have been correct.
+func (in Input) NeedsS3() bool {
 	for _, s := range in.ArchiveSources {
 		if isS3(s) {
 			return true
@@ -208,17 +213,18 @@ func writeS3Preamble(b *strings.Builder, region string, ep storage.S3Endpoint) {
 	}
 	b.WriteString("INSTALL httpfs; LOAD httpfs;\n")
 	b.WriteString("INSTALL aws; LOAD aws;\n")
-	if ep.Set() {
-		// Ahead of the secret, and not only inside it: an interactive DuckDB
-		// CONTINUES past a failed statement, so a session where the credential
-		// chain resolves nothing (an offline laptop, expired SSO, no aws
-		// extension) would skip the secret and read AWS with whatever ambient
-		// keys it finds — the same hole the daemon's own routing closes. The
-		// two mechanisms are independent: a secret's ENDPOINT does not set
-		// these, and these do not populate the secret.
-		fmt.Fprintf(b, "SET GLOBAL s3_endpoint=%s;\n", sqlString(ep.Host()))
-		fmt.Fprintf(b, "SET GLOBAL s3_url_style=%s;\n", sqlString(ep.URLStyle()))
-		fmt.Fprintf(b, "SET GLOBAL s3_use_ssl=%t;\n", ep.UseSSL())
+	// Ahead of the secret, and not only inside it: an interactive DuckDB
+	// CONTINUES past a failed statement, so a session where the credential
+	// chain resolves nothing (an offline laptop, expired SSO, no aws
+	// extension) would skip the secret and read AWS with whatever ambient keys
+	// it finds — the same hole the daemon's own routing closes. The two
+	// mechanisms are independent: a secret's ENDPOINT does not set these, and
+	// these do not populate the secret.
+	//
+	// From duckdbutil's own list, not a copy of it: the copy drifted once
+	// already, losing s3_region.
+	for _, stmt := range duckdbutil.S3SettingStatements(region, ep) {
+		fmt.Fprintf(b, "%s;\n", stmt)
 	}
 	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain" +
 		duckdbutil.S3SecretClauses(region, ep) + ");\n"
