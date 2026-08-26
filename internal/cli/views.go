@@ -35,7 +35,13 @@ The generated file defines:
 bintrail only writes the text: it never opens DuckDB and never runs what it
 prints. Nothing in the file writes, and no credentials appear in it — S3
 access goes through DuckDB's credential chain, the same way bintrail's own
-S3 reads do.
+S3 reads do. That S3 secret lives only in the DuckDB session that runs the
+file: views persist in a database file, secrets do not, so run the file in
+every session that reads S3 (.read views.sql, or duckdb -init views.sql).
+
+The file is written to run on any machine. An archive registered both on
+this host and in S3 is named by its S3 location; a local path appears only
+when it is the sole registered copy.
 
 Archive sources come from the index's archive_state registry by default. Pass
 --archive-dir/--archive-s3 with --bintrail-id to name one explicitly instead;
@@ -49,8 +55,9 @@ Examples:
   # From the index's own registry, plus a local baseline directory
   bintrail views --index-dsn "..." --baseline-dir /data/baselines --out views.sql
 
-  # Straight to stdout, piped into DuckDB
-  bintrail views --index-dsn "..." --baseline-dir /data/baselines --out - | duckdb lake.db
+  # Open an interactive DuckDB with the views and the S3 secret loaded
+  bintrail views --index-dsn "..." --baseline-dir /data/baselines --out views.sql
+  duckdb -init views.sql lake.db
 
   # Without an index: name the archive and baseline locations directly
   bintrail views --archive-s3 s3://bucket/archives/ --bintrail-id <uuid> \
@@ -153,13 +160,17 @@ func explicitArchiveSources() []string {
 // not an error: an index whose partitions have never been archived legitimately
 // has no archive tier yet, and the generated file says so in a comment rather
 // than failing a command whose whole job is to describe what exists.
+//
+// The PORTABLE routing (S3 wherever registered) is deliberate: the file is
+// written to be run somewhere else, where this host's local copy does not
+// resolve (#1456). `bintrail query` on this host keeps the local-first routing.
 func discoverArchiveSources(ctx context.Context, dsn string) ([]string, error) {
 	db, err := config.Connect(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("connect to index DB: %w", err)
 	}
 	defer db.Close()
-	sources, err := query.ResolveArchiveSources(ctx, db)
+	sources, err := query.PortableArchiveSources(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("resolve archive sources from archive_state: %w", err)
 	}

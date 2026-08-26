@@ -3,12 +3,14 @@
 --
 -- THIS FILE IS A SNAPSHOT OF THE LAYOUT, NOT A LIVE BINDING. The globs below
 -- keep picking up newly rotated partitions on their own, but the baseline
--- state views point at ONE snapshot. Re-run `bintrail views` after taking or
--- refreshing a baseline, and whenever archive sources are added or removed.
+-- state views point at ONE snapshot. Re-run `bintrail views` (or download the
+-- file again from the console) after taking or refreshing a baseline, and
+-- whenever archive sources are added or removed.
 --
 -- Nothing here writes: every view is a read over Parquet files you already own.
 --
--- Archive sources:
+-- Archive sources (an archive registered both on this host and in S3 is
+-- listed by its S3 location, so the file runs from any machine):
 --   /data/archives/bintrail_id=11111111-2222-3333-4444-555555555555
 --   s3://my-bucket/archives/bintrail_id=66666666-7777-8888-9999-000000000000
 -- Baseline snapshot:
@@ -18,6 +20,12 @@
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws; LOAD aws;
 CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, REGION 'us-east-1');
+-- This secret lives only in this DuckDB session. Views persist in a database
+-- file; secrets do not. Reopening that file later and querying S3 fails with
+-- "No credentials are provided": run this file again in every session that
+-- reads S3 (`.read views.sql`, or `duckdb -init views.sql lake.db`).
+-- Do not make it PERSISTENT: DuckDB would resolve your credential chain now
+-- and store the resulting keys on disk.
 -- No credentials appear in this file by design. If the credential chain is not
 -- available where you run this, replace the secret above with explicit keys:
 --   CREATE OR REPLACE SECRET bintrail_s3_chain (

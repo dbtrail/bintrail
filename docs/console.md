@@ -410,7 +410,11 @@ compact baseline summary card and links onward:
   You get a text file; your own DuckDB executes it, in your process, on your
   machine — which is why unrestricted SQL over your lake needs no sandbox, no
   timeout and no result cap here. No credentials appear in the file (S3 uses
-  your AWS credential chain), so it is safe to share or commit. The card is
+  your AWS credential chain), so it is safe to share or commit. The file is
+  written for another machine: an archive that is both on the console host
+  and in S3 is named by its S3 location. The S3 secret it creates lasts one
+  DuckDB session, so run the file again (`.read views.sql`) in each session
+  that reads S3. The card is
   hidden for a server with archives disabled, for one with nothing archived and
   no baseline yet, and while an access-control profile is active — the file
   maps straight onto the unredacted Parquet a profile exists to withhold.

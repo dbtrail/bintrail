@@ -26,8 +26,10 @@ bintrail views \
   --baseline-dir /data/baselines \
   --out          views.sql
 
-duckdb lake.db < views.sql
+duckdb -init views.sql lake.db
 ```
+
+`-init` runs the file as the session opens, so the views and the S3 secret are both there when you get the prompt. In a session that is already open, `.read views.sql` does the same.
 
 You get:
 
@@ -47,6 +49,8 @@ Three properties worth knowing:
 
 - **bintrail never runs this SQL.** The command writes text; your DuckDB executes it, in your process, with no result caps and no server involved. There is no new query surface to secure.
 - **No credentials are in the file.** S3 access uses DuckDB's credential chain — the same thing bintrail's own reads use — so `views.sql` is safe to commit or paste into a notebook. The generated file shows the explicit-key alternative in a comment if your environment has no chain.
+- **The S3 secret lasts one session.** Views persist in a `.db` file; secrets do not. Reopen `lake.db` tomorrow and `SELECT * FROM events` fails with "No credentials are provided" until you run the file again (`.read views.sql`). Do not turn the secret into a `PERSISTENT` one: DuckDB resolves your credential chain at that moment and writes the resulting keys to `~/.duckdb/stored_secrets`.
+- **It runs from any machine.** An archive registered both on the host and in S3 is named by its S3 location; a local path appears only when it is the sole registered copy. The console's own reads still prefer the local copy.
 - **It is a snapshot of the layout, not a live binding.** The event globs keep picking up newly rotated partitions on their own, but the `state_` views point at one baseline snapshot. Regenerate after taking or refreshing a baseline.
 
 `state_` views are the snapshot's rows, not the table's current state. To materialize a *later* point in time, use `bintrail reconstruct` — folding deltas back onto a baseline is what that command does, and it is not expressible as a view.

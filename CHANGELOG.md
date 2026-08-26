@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`views.sql` runs from another machine, and says how to keep S3 working**
+  (#1456). The console download and `bintrail views` named an archive by its
+  local path whenever a local copy with data existed on the generating host,
+  which is the normal shape after a rotation that archives locally and uploads
+  to S3; on the operator's own machine that path does not exist and every
+  `events` query failed. Both now name such an archive by its S3 location
+  (`query.PortableArchiveSources`); a local path appears only when it is the
+  sole registered copy. The console's own reads, including the SQL panel,
+  keep the local-first routing. The file's S3 preamble now states that the
+  credential-chain secret lives only in the session that runs the file (views
+  persist in a database file, secrets do not) and why it must not be made
+  `PERSISTENT`: DuckDB would resolve the chain at creation and write the
+  resulting keys to disk. The CLI example and the console toast that suggested
+  `duckdb lake.db < views.sql` now show `duckdb -init views.sql lake.db` and
+  `.read views.sql`.
+
 ## [0.69.0] - 2026-08-23
 
 ### Added

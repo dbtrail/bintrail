@@ -196,7 +196,7 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	// step under the latch. r.Context() still propagates (Cancel works); the
 	// deadline is what stops a hung listing from wedging the single-flight.
 	setupCtx, setupCancel := context.WithTimeout(r.Context(), sqlPanelSetupTimeout)
-	in, err := s.buildViewsInput(setupCtx, b)
+	in, err := s.buildViewsInput(setupCtx, b, false) // runs here: local-first routing
 	setupCancel()
 	switch {
 	case errors.Is(err, errNoViewSources):

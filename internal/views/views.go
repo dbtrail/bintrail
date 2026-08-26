@@ -118,13 +118,20 @@ func writeHeader(b *strings.Builder, in Input) {
 	b.WriteString("--\n")
 	b.WriteString("-- THIS FILE IS A SNAPSHOT OF THE LAYOUT, NOT A LIVE BINDING. The globs below\n")
 	b.WriteString("-- keep picking up newly rotated partitions on their own, but the baseline\n")
-	b.WriteString("-- state views point at ONE snapshot. Re-run `bintrail views` after taking or\n")
-	b.WriteString("-- refreshing a baseline, and whenever archive sources are added or removed.\n")
+	b.WriteString("-- state views point at ONE snapshot. Re-run `bintrail views` (or download the\n")
+	b.WriteString("-- file again from the console) after taking or refreshing a baseline, and\n")
+	b.WriteString("-- whenever archive sources are added or removed.\n")
 	b.WriteString("--\n")
 	b.WriteString("-- Nothing here writes: every view is a read over Parquet files you already own.\n")
 	b.WriteString("--\n")
 
-	b.WriteString("-- Archive sources:\n")
+	// The path choice is stated where the paths are listed. An archive that
+	// lives both on the generating host and in S3 is named by its S3 location,
+	// because this file is meant to run on a machine that is not that host
+	// (#1456); an operator who reads a local path here knows it is the only
+	// registered copy.
+	b.WriteString("-- Archive sources (an archive registered both on this host and in S3 is\n")
+	b.WriteString("-- listed by its S3 location, so the file runs from any machine):\n")
 	if len(in.ArchiveSources) == 0 {
 		b.WriteString("--   (none registered in archive_state — no rotated partitions have been archived yet)\n")
 	}
@@ -169,6 +176,18 @@ func writeS3Preamble(b *strings.Builder, region string) {
 	}
 	secret += ");\n"
 	b.WriteString(secret)
+	// The secret is TEMPORARY on purpose, and the file says so where the
+	// operator will look when a reopened database file cannot read S3. The
+	// PERSISTENT form is not offered: DuckDB resolves the credential chain at
+	// creation and writes the resulting keys to ~/.duckdb/stored_secrets, which
+	// would make a file that promises "no credentials" plant them on disk
+	// (#1456).
+	b.WriteString("-- This secret lives only in this DuckDB session. Views persist in a database\n")
+	b.WriteString("-- file; secrets do not. Reopening that file later and querying S3 fails with\n")
+	b.WriteString("-- \"No credentials are provided\": run this file again in every session that\n")
+	b.WriteString("-- reads S3 (`.read views.sql`, or `duckdb -init views.sql lake.db`).\n")
+	b.WriteString("-- Do not make it PERSISTENT: DuckDB would resolve your credential chain now\n")
+	b.WriteString("-- and store the resulting keys on disk.\n")
 	b.WriteString("-- No credentials appear in this file by design. If the credential chain is not\n")
 	b.WriteString("-- available where you run this, replace the secret above with explicit keys:\n")
 	b.WriteString("--   CREATE OR REPLACE SECRET bintrail_s3_chain (\n")

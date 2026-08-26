@@ -3762,7 +3762,7 @@ function duckdbCard() {
     try {
       const sql = await apiText("/api/views.sql");
       downloadBlob("views.sql", sql, "text/plain");
-      toast("views.sql downloaded. Run it with: duckdb lake.db < views.sql");
+      toast("views.sql downloaded. In DuckDB run .read views.sql, once per session.");
     } catch (err) {
       toastError("could not generate views: " + ((err && err.message) || err));
     } finally {

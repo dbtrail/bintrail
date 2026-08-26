@@ -25,12 +25,18 @@ var errNoViewSources = errors.New("this server has no archived partitions and no
 // baseline root that is configured but unlistable is an upstream fault worth
 // naming, not a degrade: silently dropping the baseline half would hand over a
 // layout missing every state view.
-func (s *Server) buildViewsInput(ctx context.Context, b *bundle) (views.Input, error) {
+//
+// portable selects which registered location names each archive. The download
+// runs on the operator's machine, where this host's local copy does not exist,
+// so it takes the S3 location whenever one is registered (#1456); the SQL panel
+// runs in this daemon and keeps the local-first routing every other console
+// read uses.
+func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) (views.Input, error) {
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
 	}
-	in.ArchiveSources = consoleArchiveSources(ctx, b.db)
+	in.ArchiveSources = consoleArchiveSources(ctx, b.db, portable)
 	if b.baselineSrc != "" {
 		in.BaselineSource = b.baselineSrc
 		files, err := reconstruct.ListBaselines(ctx, b.baselineSrc)
@@ -97,7 +103,7 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	in, err := s.buildViewsInput(r.Context(), b)
+	in, err := s.buildViewsInput(r.Context(), b, true)
 	switch {
 	case errors.Is(err, errNoViewSources):
 		// Nothing to describe. A file of comments explaining that would be a
@@ -134,11 +140,18 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 // generated header states which archive sources were resolved — so an empty list
 // shows up in the artifact itself rather than only in a log. Returns nil for a
 // server whose connection is not open.
-func consoleArchiveSources(ctx context.Context, db *sql.DB) []string {
+//
+// portable picks query.PortableArchiveSources (S3 wherever registered, for a
+// file that leaves this host) over the local-first ResolveArchiveSources.
+func consoleArchiveSources(ctx context.Context, db *sql.DB, portable bool) []string {
 	if db == nil {
 		return nil
 	}
-	sources, err := query.ResolveArchiveSources(ctx, db)
+	resolve := query.ResolveArchiveSources
+	if portable {
+		resolve = query.PortableArchiveSources
+	}
+	sources, err := resolve(ctx, db)
 	if err != nil {
 		slog.Warn("console: could not resolve archive sources for views.sql; the file will describe baselines only",
 			"error", err)
@@ -160,5 +173,7 @@ func (s *Server) viewsAvailable(r *http.Request, b *bundle) bool {
 	if b.baselineSrc != "" {
 		return true
 	}
-	return len(consoleArchiveSources(r.Context(), b.db)) > 0
+	// Either routing yields the same count; the local-first read is the one
+	// that never leaves the host, so it is the cheaper gate.
+	return len(consoleArchiveSources(r.Context(), b.db, false)) > 0
 }
