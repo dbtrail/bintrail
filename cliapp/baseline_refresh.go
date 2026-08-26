@@ -104,7 +104,7 @@ func init() {
 // refreshOutcome is one table's verdict in the run summary.
 type refreshOutcome struct {
 	Table   string
-	Verdict string // "refreshed", "refused-gap", "refused-ddl", "refused"
+	Verdict string // "refreshed", "unchanged", "refused-gap", "refused-ddl", "refused"
 	Detail  string
 }
 
@@ -232,8 +232,16 @@ func buildRefreshOutcomes(tables []string, reports []*reconstruct.TableReport, f
 		failed[f.Schema+"."+f.Table] = f.Err
 	}
 	done := make(map[string]bool, len(reports))
+	// Separate from done rather than a second bool on it: a carried-forward
+	// table WAS published, so it must not read as skipped, and it was not
+	// rewritten, so calling it "refreshed" would hide the thing an operator
+	// most wants to see here — which tables are actually costing them a full
+	// rewrite each cycle.
+	unchanged := make(map[string]bool, len(reports))
 	for _, r := range reports {
-		done[r.Schema+"."+r.Table] = true
+		k := r.Schema + "." + r.Table
+		done[k] = true
+		unchanged[k] = r.CarriedForward
 	}
 
 	out := make([]refreshOutcome, 0, len(tables))
@@ -245,6 +253,8 @@ func buildRefreshOutcomes(tables []string, reports []*reconstruct.TableReport, f
 			out = append(out, refreshOutcome{t, "refused-ddl", err.Error()})
 		case bad:
 			out = append(out, refreshOutcome{t, "refused", err.Error()})
+		case done[t] && unchanged[t]:
+			out = append(out, refreshOutcome{t, "unchanged", "no events in the window; the previous file was published as-is"})
 		case done[t]:
 			out = append(out, refreshOutcome{t, "refreshed", ""})
 		default:

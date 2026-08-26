@@ -5,11 +5,13 @@ package reconstruct_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -327,4 +329,159 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// carriedInode returns the inode of a published snapshot table, so a test can
+// tell a hard link from a copy. A link is what makes carrying a table forward
+// free; a copy would still write every byte.
+func carriedInode(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no inode information on this platform")
+	}
+	return st.Ino
+}
+
+// A table with no events in the window is published by carrying its previous
+// file forward, not by folding an empty change map over it and re-emitting the
+// same rows.
+//
+// This is the whole point of the change: every cycle used to rewrite every
+// table in full, however little of it changed, and that rewrite cost is what
+// puts a floor under how often a refresh can run.
+func TestReconstructParquet_carriesForwardATableWithNoEvents(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	db, dbName := testutil.CreateTestDB(t)
+	// The production DDL rather than testutil's single-p_future stand-in, and
+	// one hour for the whole timeline: the planner derives an hour's coverage
+	// from the PARTITION list, so without hourly partitions every hour reads as
+	// a gap and the strict fetch refuses before this test's subject is reached.
+	if err := indexer.CreateIndexTables(ctx, db, 48, false, nil); err != nil {
+		t.Fatalf("CreateIndexTables: %v", err)
+	}
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	const schema = "shop"
+	base := time.Now().UTC().Truncate(time.Hour)
+	seedOrdersSnapshot(t, db, schema, base)
+
+	root := t.TempDir()
+	seedSourceBaseline(t, root, base, schema)
+
+	// No events for shop.orders, but the window still has to be COVERED, and
+	// the distinction is the realistic one: a cold table does not leave the
+	// index empty, its neighbours are still being written. Without this the
+	// planner sees an hour with no data at all and refuses for a coverage gap
+	// before the carry-forward branch is ever reached, which is correct
+	// behaviour on a genuinely empty index and not the case under test.
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200,
+		base.Add(time.Minute).Format("2006-01-02 15:04:05"), nil,
+		schema, "customers", 1, "1", nil, nil, []byte(`{"id":1,"name":"n"}`))
+
+	out := root // refresh publishes into the same baselines root
+	reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
+		IndexDSN:     testutil.BaseDSN() + "/" + dbName,
+		BaselineSrc:  root,
+		Tables:       []string{schema + ".orders"},
+		At:           base.Add(30 * time.Minute),
+		OutputDir:    out,
+		OutputFormat: reconstruct.OutputFormatParquet,
+	})
+	if err != nil {
+		t.Fatalf("ReconstructTables: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("got %d reports, want 1", len(reports))
+	}
+	if !reports[0].CarriedForward {
+		t.Fatal("a table with no events in the window was folded and re-emitted; the rewrite it did not " +
+			"need is exactly the cost this avoids")
+	}
+	if len(reports[0].Files) != 1 {
+		t.Fatalf("a carried-forward table published %d files, want 1", len(reports[0].Files))
+	}
+
+	src := filepath.Join(root, base.Format("2006-01-02T15-04-05Z"), schema, "orders.parquet")
+	if _, err := os.Stat(src); err != nil {
+		// The source snapshot's directory name is produced by seedSourceBaseline;
+		// find it rather than guess if the format ever moves.
+		t.Skipf("could not locate the source snapshot to compare inodes: %v", err)
+	}
+	if a, b := carriedInode(t, src), carriedInode(t, reports[0].Files[0]); a != b {
+		t.Errorf("the carried file is a copy, not a link (inodes %d vs %d): the bytes were written again", a, b)
+	}
+}
+
+// TestReconstructParquet_destructiveDDLRefusesEvenWithNoRowEvents is the
+// ordering guard, and it protects an invariant that is easy to invert on
+// purpose.
+//
+// A TRUNCATE emits no row-level events, so the change map for a truncated
+// table is EMPTY — indistinguishable, on its own, from a table nobody touched.
+// Carrying the previous file forward would then republish rows the truncate
+// deleted, under a fresh snapshot, silently.
+//
+// What makes an empty change map mean "untouched" is CheckDestructiveDDL
+// running first. Someone optimizing this path might reasonably think the DDL
+// check can be skipped when nothing changed; it is precisely backwards, and
+// this test is what says so.
+func TestReconstructParquet_destructiveDDLRefusesEvenWithNoRowEvents(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	db, dbName := testutil.CreateTestDB(t)
+	// The production DDL rather than testutil's single-p_future stand-in, and
+	// one hour for the whole timeline: the planner derives an hour's coverage
+	// from the PARTITION list, so without hourly partitions every hour reads as
+	// a gap and the strict fetch refuses before this test's subject is reached.
+	if err := indexer.CreateIndexTables(ctx, db, 48, false, nil); err != nil {
+		t.Fatalf("CreateIndexTables: %v", err)
+	}
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	const schema = "shop"
+	base := time.Now().UTC().Truncate(time.Hour)
+	seedOrdersSnapshot(t, db, schema, base)
+
+	root := t.TempDir()
+	seedSourceBaseline(t, root, base, schema)
+
+	// Same as above: a neighbour keeps the window covered, so the run reaches
+	// the destructive-DDL check rather than stopping at a coverage gap.
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200,
+		base.Add(time.Minute).Format("2006-01-02 15:04:05"), nil,
+		schema, "customers", 1, "1", nil, nil, []byte(`{"id":1,"name":"n"}`))
+
+	// A TRUNCATE inside the window, and no row events for orders at all.
+	if _, err := db.Exec(
+		`INSERT INTO schema_changes (detected_at, binlog_file, binlog_pos, schema_name, table_name, ddl_type, ddl_query)
+		 VALUES (?, 'binlog.000001', 400, ?, ?, 'TRUNCATE TABLE', 'TRUNCATE TABLE orders')`,
+		base.Add(10*time.Minute), schema, "orders"); err != nil {
+		t.Fatalf("seed the truncate: %v", err)
+	}
+
+	_, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
+		IndexDSN:     testutil.BaseDSN() + "/" + dbName,
+		BaselineSrc:  root,
+		Tables:       []string{schema + ".orders"},
+		At:           base.Add(30 * time.Minute),
+		OutputDir:    root,
+		OutputFormat: reconstruct.OutputFormatParquet,
+	})
+	if err == nil {
+		t.Fatal("a truncated table was published from its pre-truncate file: no row events does NOT mean " +
+			"nothing happened, and the destructive-DDL refusal is what makes an empty change map safe")
+	}
+	if !errors.Is(err, reconstruct.ErrDestructiveDDL) {
+		t.Errorf("refused for the wrong reason: %v", err)
+	}
 }

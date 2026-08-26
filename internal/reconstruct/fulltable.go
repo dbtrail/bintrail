@@ -216,6 +216,13 @@ type TableReport struct {
 	// as well — a binlog-only report has no baseline GTID/binlog coordinates
 	// to embed in the metadata file.
 	BinlogOnly bool
+	// CarriedForward is true when the delta window held no events for this
+	// table, so its previous Parquet file was published into the new snapshot
+	// unchanged instead of being folded and re-emitted. The row counters above
+	// are all zero in that case — nothing was streamed, applied or written —
+	// and reading them as "the table is empty" would be wrong. See carryForward
+	// for why an untouched table's anchor stays valid.
+	CarriedForward bool
 }
 
 // shouldWarnEvents reports whether a fetched event count should trigger the
@@ -980,6 +987,27 @@ func ReconstructTable(
 		flavor := query.SourceFlavor(db)
 		start, startOK := query.OldestIndexedEvent(db)
 		WarnBaselineFirstEventGap(flavor, bmeta, *fold.First, start, startOK, schema, table)
+	}
+
+	// ── 5b. Nothing changed: publish the previous file instead of rewriting ─
+	// Placed HERE on purpose: after the fold, so the change map is known, and
+	// after steps 3a-bis/3b/3c, so every refusal still runs first. A TRUNCATE
+	// emits no row events, so an empty change map alone would not mean the
+	// table is untouched — CheckDestructiveDDL is what makes it mean that.
+	//
+	// This also skips step 6, which reads the whole baseline back for DuckDB,
+	// so the saving is the read as well as the write.
+	if carryForwardEligible(cfg.OutputFormat, baselinePath, len(changes)) {
+		linked, cerr := carryForward(ctx, baselinePath, cfg.snapshotDir, schema, table)
+		if cerr != nil {
+			return nil, fmt.Errorf("carry %s.%s forward unchanged: %w", schema, table, cerr)
+		}
+		rep.CarriedForward = true
+		rep.Files = []string{filepath.Join(cfg.snapshotDir, schema, table+".parquet")}
+		rep.Duration = time.Since(start)
+		slog.Info("table carried forward unchanged", "schema", schema, "table", table,
+			"linked", linked, "reason", "no events in the window")
+		return rep, nil
 	}
 
 	// ── 6. Materialize the baseline locally for DuckDB streaming ───────────
