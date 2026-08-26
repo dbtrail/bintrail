@@ -288,7 +288,8 @@ func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
 	// TestCanonicalizePKValue_binaryFamilyMatchesIndexerSpelling. It still
 	// rejects a NON-bytes value for those types —
 	// TestCanonicalizePKValue_binaryFamilyRejectsNonBytes covers that arm.
-	for _, dt := range []string{"bit", "json", "point", "geometry", "float", "double", "time"} {
+	refused := []string{"bit", "json", "point", "geometry", "float", "double", "time"}
+	for _, dt := range refused {
 		col := colMeta("x", dt, dt)
 		_, err := canonicalizePKValue("whatever", col)
 		if err == nil {
@@ -303,17 +304,55 @@ func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
 		// else. The old text hardcoded "BIT/JSON/spatial" as the unsupported
 		// set, so a FLOAT/DOUBLE/TIME key was blamed on a family it is not
 		// in. supportedPKType is the authoritative list; the message must
-		// not carry a second copy of it that can drift.
+		// not carry a second copy of it that can drift — so the check is
+		// case-insensitive and covers every refused name, not just the three
+		// the old text happened to spell.
 		if !strings.Contains(msg, `"`+dt+`"`) {
 			t.Errorf("%s: error does not name the column's type: %v", dt, err)
 		}
-		for _, other := range []string{"BIT", "JSON", "spatial"} {
-			if strings.EqualFold(other, dt) {
+		low := strings.ToLower(msg)
+		for _, other := range append([]string{"spatial"}, refused...) {
+			if other == dt {
 				continue
 			}
-			if strings.Contains(msg, other) {
-				t.Errorf("%s: error blames a different type family (%s): %v", dt, other, err)
+			if strings.Contains(low, other) {
+				t.Errorf("%s: error names a different type (%s): %v", dt, other, err)
 			}
+		}
+		// Same sentence as the gates in front of this switch (#1455): an
+		// operator refused by verify and by the cascade baseline fallback
+		// must be able to tell it is one limitation.
+		if want := PKTypeGateReason(col, "the baseline merge", "canonicalize"); !strings.Contains(msg, want) {
+			t.Errorf("%s: error does not carry the shared gate reason %q: %v", dt, want, err)
+		}
+	}
+}
+
+// TestCanonicalizePKValue_everySupportedTypeHasAnArm pins that the switch in
+// canonicalizePKValue mirrors supportedPKType: a type the gates admit must
+// never land in the default branch, or every gated surface would accept the
+// table and the merge would then die per row with the "unsupported" text. The
+// value is deliberately arbitrary — the assertion is about WHICH arm fires,
+// not about the arm's own type checks (those have their own tests).
+func TestCanonicalizePKValue_everySupportedTypeHasAnArm(t *testing.T) {
+	supported := []string{
+		"int", "integer", "smallint", "tinyint", "mediumint", "bigint",
+		"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
+		"enum", "set",
+		"datetime", "timestamp", "date",
+		"year",
+		"decimal", "numeric",
+		"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob",
+	}
+	for _, dt := range supported {
+		if !supportedPKType(dt) {
+			t.Errorf("%s: expected supportedPKType to accept it", dt)
+			continue
+		}
+		col := colMeta("x", dt, dt)
+		_, err := canonicalizePKValue("whatever", col)
+		if err != nil && strings.Contains(err.Error(), "unsupported by the baseline canonicalizer") {
+			t.Errorf("%s: admitted by supportedPKType but fell into canonicalizePKValue's default branch: %v", dt, err)
 		}
 	}
 }

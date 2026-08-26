@@ -645,9 +645,11 @@ func TestRunReconstruct_fullTableRoundTrip_decimalPK(t *testing.T) {
 
 // TestRunReconstruct_rejectsRemainingUnsupportedPKTypes pins the hard-error
 // path at ReconstructTable entry for the PK types that #214 did NOT land and
-// #1155 did not either: BIT and JSON. Each has a real on-disk representation
-// mismatch between the indexer's pk_values format and the baseline Parquet
-// column (see pk_canonicalize.go doc comment).
+// #1155 did not either: FLOAT, DOUBLE, TIME, BIT and JSON. Their round-trip
+// between the indexer's pk_values format and the baseline Parquet column is
+// unverified (see the pk_canonicalize.go doc comment), which is reason enough
+// to refuse: a silent wrong match on a primary-key join is worse than a
+// refusal.
 //
 // This test is the regression guard against a future drive-by "add one
 // more type to supportedPKType" PR that would silently produce wrong
@@ -665,6 +667,9 @@ func TestRunReconstruct_rejectsRemainingUnsupportedPKTypes(t *testing.T) {
 	}{
 		{"bit", "bit", "bit(8)"},
 		{"json", "json", "json"},
+		{"float", "float", "float"},
+		{"double", "double", "double"},
+		{"time", "time", "time"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

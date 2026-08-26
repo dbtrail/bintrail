@@ -105,9 +105,12 @@ import (
 // the miss it would be curing.
 //
 // Every other type is refused — FLOAT/DOUBLE, TIME, BIT, JSON and the spatial
-// family among them; supportedPKType is the authoritative list and the only
-// place it lives. None of them was part of #1155's shape and each has its own
-// upstream representation question.
+// family among them. supportedPKType is the authoritative list; the switch
+// below mirrors it arm for arm, and
+// TestCanonicalizePKValue_everySupportedTypeHasAnArm pins the two equal so a
+// type admitted by the gates can never fall into the default branch. None of
+// the refused types was part of #1155's shape; their round-trip between the
+// indexer's pk_values and the baseline Parquet is unverified, not known-bad.
 func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("canonicalizePKValue: nil PK value for column %q (MySQL forbids NULL in PK columns; baseline row may be missing the column after schema drift)", col.Name)
@@ -166,11 +169,15 @@ func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 		return canonicalizeDate(raw, col)
 
 	default:
-		// Name only the offending type: supportedPKType is the one list of
-		// what is refused, and a second copy of it inside this message drifted
-		// (#1455 — it said "BIT/JSON/spatial" while FLOAT/DOUBLE/TIME were
-		// refused too, so those keys were blamed on a family they are not in).
-		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q: the indexer and the baseline writer store this type differently on disk, so the key cannot be matched against pk_values; file a follow-up issue if you need this type", col.Name, col.DataType)
+		// Render through PKTypeGateReason, the same wording every gate in
+		// front of this switch uses, so the one path that reaches here
+		// ungated (cascade Phase-2) refuses with the same sentence. A message
+		// of its own drifted (#1455): it hardcoded "BIT/JSON/spatial" as the
+		// refused set while FLOAT/DOUBLE/TIME were refused too, so those keys
+		// were blamed on a family they are not in. No claim about WHY the
+		// type is refused: the round-trip is simply unverified for it.
+		return nil, fmt.Errorf("canonicalizePKValue: %s; file a follow-up issue if you need this type",
+			PKTypeGateReason(col, "the baseline merge", "canonicalize"))
 	}
 }
 
