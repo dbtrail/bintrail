@@ -11,7 +11,8 @@
 --
 -- Archive sources (an archive registered both on the host that generated this
 -- file and in S3 is listed by its S3 location, so those reads work from another
--- machine; a local path below is the only location the registry holds):
+-- machine; a local path below means the registry holds no S3 location this
+-- file can use):
 --   /data/archives/bintrail_id=11111111-2222-3333-4444-555555555555
 --   s3://my-bucket/archives/bintrail_id=66666666-7777-8888-9999-000000000000
 -- Baseline snapshot:

@@ -48,10 +48,13 @@ type Input struct {
 	// operator who named the roots with --archive-dir/--archive-s3 gets
 	// exactly what they named, both of them if they passed both (#1456).
 	ArchivesFromRegistry bool
-	// ArchiveDiscoveryError is set when the registry could not be read at
-	// all. The header then says so instead of "none registered", which would
-	// state a cause the caller does not know.
-	ArchiveDiscoveryError string
+	// ArchiveDiscoveryFailed is set when the registry could not be read at
+	// all. The file then says so instead of "none registered", which would
+	// state a cause the caller does not know. A bool, not the error: the
+	// error text names the index host and the DB user (a dial error, a 1142),
+	// and this file is meant to be shared. The text goes to the console log
+	// and to the 502 body, which stay on the console side.
+	ArchiveDiscoveryFailed bool
 	// ArchiveRegion pins REGION in the S3 secret. Empty = let the credential
 	// chain resolve it, which is what every other bintrail S3 read does by
 	// default.
@@ -86,7 +89,7 @@ func Generate(in Input) string {
 	if in.needsS3() {
 		writeS3Preamble(&b, in.ArchiveRegion)
 	}
-	writeEventsView(&b, in.ArchiveSources, in.ExcludeEventColumns)
+	writeEventsView(&b, in)
 	writeStateViews(&b, in)
 	return b.String()
 }
@@ -100,7 +103,7 @@ func Generate(in Input) string {
 // setup does not hinge on the human-facing preamble.
 func GenerateViews(in Input) string {
 	var b strings.Builder
-	writeEventsView(&b, in.ArchiveSources, in.ExcludeEventColumns)
+	writeEventsView(&b, in)
 	writeStateViews(&b, in)
 	return b.String()
 }
@@ -144,13 +147,14 @@ func writeHeader(b *strings.Builder, in Input) {
 	if in.ArchivesFromRegistry {
 		b.WriteString("-- Archive sources (an archive registered both on the host that generated this\n")
 		b.WriteString("-- file and in S3 is listed by its S3 location, so those reads work from another\n")
-		b.WriteString("-- machine; a local path below is the only location the registry holds):\n")
+		b.WriteString("-- machine; a local path below means the registry holds no S3 location this\n")
+		b.WriteString("-- file can use):\n")
 	} else {
 		b.WriteString("-- Archive sources:\n")
 	}
 	switch {
-	case in.ArchiveDiscoveryError != "":
-		fmt.Fprintf(b, "--   (could not be read from archive_state: %s)\n", in.ArchiveDiscoveryError)
+	case in.ArchiveDiscoveryFailed:
+		b.WriteString("--   (could not be read from archive_state; the console log has the error)\n")
 	case len(in.ArchiveSources) == 0:
 		b.WriteString("--   (none registered in archive_state — no rotated partitions have been archived yet)\n")
 	}
@@ -231,13 +235,20 @@ const eventTypeCase = "CASE \"event_type\"\n" +
 // same slice the archiver writes with — so a column added or removed there
 // changes this output and breaks the golden test, rather than leaving the
 // generated schema quietly behind the files it describes.
-func writeEventsView(b *strings.Builder, sources []string, excludeCols []string) {
-	exclude := make(map[string]bool, len(excludeCols))
-	for _, c := range excludeCols {
+func writeEventsView(b *strings.Builder, in Input) {
+	sources := in.ArchiveSources
+	exclude := make(map[string]bool, len(in.ExcludeEventColumns))
+	for _, c := range in.ExcludeEventColumns {
 		exclude[strings.ToLower(c)] = true
 	}
 	b.WriteString("-- events: every archived binlog event, across all archive sources.\n")
-	if len(sources) == 0 {
+	switch {
+	case in.ArchiveDiscoveryFailed:
+		// The header already names the failure; the body must not contradict
+		// it with a cause nobody verified.
+		b.WriteString("-- (skipped: archive_state could not be read; see the header)\n\n")
+		return
+	case len(sources) == 0:
 		b.WriteString("-- (skipped: no archive sources are registered in archive_state)\n\n")
 		return
 	}

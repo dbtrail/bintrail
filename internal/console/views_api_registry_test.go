@@ -101,8 +101,15 @@ func TestViewsAPI_registryReadFailure(t *testing.T) {
 		if !strings.Contains(sql, "could not be read from archive_state") {
 			t.Errorf("header does not name the registry failure:\n%s", sql)
 		}
-		if strings.Contains(sql, "none registered in archive_state") {
-			t.Errorf("header claims an empty registry after a failed read:\n%s", sql)
+		for _, claim := range []string{"none registered in archive_state", "no archive sources are registered"} {
+			if strings.Contains(sql, claim) {
+				t.Errorf("file claims an empty registry after a failed read (%q):\n%s", claim, sql)
+			}
+		}
+		// The error text names the index host and the DB user; it belongs in
+		// the console log and the 502 body, never in a shareable file.
+		if strings.Contains(sql, "SELECT command denied") {
+			t.Errorf("raw registry error leaked into the downloadable file:\n%s", sql)
 		}
 		if !strings.Contains(sql, `CREATE OR REPLACE VIEW "state_shop_orders"`) {
 			t.Errorf("baseline half missing:\n%s", sql)

@@ -205,6 +205,16 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
+	case in.ArchiveDiscoveryFailed:
+		// The download can carry this in its header; the panel has no header,
+		// and a session missing the `events` view it advertises would turn
+		// every query on it into a catalog error blamed on the operator's
+		// SQL. Refuse with the cause instead. The error text stays on the
+		// console side (log + this body), never in a shareable file.
+		writeJSONError(w, http.StatusBadGateway,
+			"the archive registry (archive_state) could not be read, so the events view cannot be built; "+
+				"the console log has the error")
+		return
 	}
 
 	res, err := runSandboxedSQL(r.Context(), in, req.SQL)

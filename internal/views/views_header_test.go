@@ -27,18 +27,18 @@ func TestGenerate_routingSentenceOnlyForRegistrySources(t *testing.T) {
 func TestGenerate_discoveryErrorInHeader(t *testing.T) {
 	in := goldenInput()
 	in.ArchiveSources = nil
-	in.ArchiveDiscoveryError = "query archive_state: SELECT command denied"
+	in.ArchiveDiscoveryFailed = true
 	out := Generate(in)
-	if !strings.Contains(out, "--   (could not be read from archive_state: query archive_state: SELECT command denied)") {
+	if !strings.Contains(out, "--   (could not be read from archive_state; the console log has the error)") {
 		t.Errorf("header does not name the read failure:\n%s", out)
 	}
-	if strings.Contains(out, "none registered in archive_state") {
-		t.Errorf("header claims an empty registry after a failed read:\n%s", out)
-	}
-	// The failure is a comment, never an executable line.
-	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "SELECT command denied") && !strings.HasPrefix(line, "--") {
-			t.Errorf("error text leaked into an executable line: %s", line)
+	// Header and body must agree: neither may claim an empty registry.
+	for _, claim := range []string{"none registered in archive_state", "no archive sources are registered"} {
+		if strings.Contains(out, claim) {
+			t.Errorf("file claims an empty registry after a failed read (%q):\n%s", claim, out)
 		}
+	}
+	if !strings.Contains(out, "-- (skipped: archive_state could not be read; see the header)") {
+		t.Errorf("events body does not point at the header:\n%s", out)
 	}
 }

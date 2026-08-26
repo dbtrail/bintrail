@@ -39,9 +39,7 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 	var archiveErr error
 	in.ArchiveSources, archiveErr = consoleArchiveSources(ctx, b.db, portable)
 	in.ArchivesFromRegistry = true
-	if archiveErr != nil {
-		in.ArchiveDiscoveryError = archiveErr.Error()
-	}
+	in.ArchiveDiscoveryFailed = archiveErr != nil
 	if b.baselineSrc != "" {
 		in.BaselineSource = b.baselineSrc
 		files, err := reconstruct.ListBaselines(ctx, b.baselineSrc)
