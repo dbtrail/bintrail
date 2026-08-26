@@ -28,6 +28,11 @@ func TestGenerate_customEndpointInPreamble(t *testing.T) {
 	// statement, so a session whose credential chain resolves nothing would
 	// skip the secret and read AWS. GLOBAL because a plain SET binds to one
 	// connection.
+	// Pins THIS FIXTURE, so the loop below cannot go vacuous when the shared
+	// list shrinks. It says nothing about any producer: only `bintrail views
+	// --region` ever fills ArchiveRegion, and the console leaves it empty, so
+	// a console-generated file pins no region at all and relies on the
+	// reader's own resolution (see #1462).
 	routing := duckdbutil.S3SettingStatements(in.ArchiveRegion, in.S3Endpoint)
 	if len(routing) < 4 {
 		t.Fatalf("fixture exercises only %d settings; it must cover the region too: %v", len(routing), routing)

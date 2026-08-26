@@ -388,6 +388,16 @@ func openSandboxedSession(ctx context.Context, in views.Input) (*sql.DB, func(),
 		return nil, nil, err
 	}
 
+	// One predicate, shared with the generator: this used to be a private copy
+	// that also matched BaselineSource, and a copy of a question whose answer
+	// now decides whether a configuration fault is reported at all is the same
+	// drift hazard the settings list just stopped being. Narrowing to the
+	// generator's own answer is safe here because the FROM-clause allowlist
+	// below refuses every raw file reader, so the ONLY way this session can
+	// reach S3 is through a generated view — and a view carrying an s3:// path
+	// is exactly what NeedsS3 reports. An s3:// BaselineSource that yielded no
+	// snapshots emits no view, so there is nothing left to route.
+	//
 	// S3 credential setup, when the layout needs it, through bintrail's own
 	// tolerant helper — the SAME path parquetquery uses (httpfs + aws + a
 	// credential_chain secret). Deliberately NOT views.Generate's inline
@@ -395,7 +405,7 @@ func openSandboxedSession(ctx context.Context, in views.Input) (*sql.DB, func(),
 	// resolves, whereas EnableS3CredentialChain warns and continues — a read
 	// inside the allowed roots then fails at the S3 read (with a real auth
 	// error), not at session setup, and a local-only layout is unaffected.
-	if viewsInputNeedsS3(in) {
+	if in.NeedsS3() {
 		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return fail(fmt.Errorf("S3 archive sources are configured but the DuckDB httpfs extension could not be loaded: %w", err))
 		}
@@ -595,23 +605,6 @@ func sqlPanelAllowedList(in views.Input) string {
 		quoted[i] = sqlQuoteString(r)
 	}
 	return "[" + strings.Join(quoted, ", ") + "]"
-}
-
-func viewsInputNeedsS3(in views.Input) bool {
-	for _, src := range in.ArchiveSources {
-		if strings.HasPrefix(src, "s3://") {
-			return true
-		}
-	}
-	if strings.HasPrefix(in.BaselineSource, "s3://") {
-		return true
-	}
-	for _, b := range in.Baselines {
-		if strings.HasPrefix(b.Path, "s3://") {
-			return true
-		}
-	}
-	return false
 }
 
 // sqlQuoteString renders a DuckDB single-quoted string literal.
