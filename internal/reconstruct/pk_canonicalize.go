@@ -105,12 +105,13 @@ import (
 // the miss it would be curing.
 //
 // Every other type is refused — FLOAT/DOUBLE, TIME, BIT, JSON and the spatial
-// family among them. supportedPKType is the authoritative list; the switch
+// family among them. supportedPKTypes is the authoritative list; the switch
 // below mirrors it arm for arm, and
-// TestCanonicalizePKValue_everySupportedTypeHasAnArm pins the two equal so a
-// type admitted by the gates can never fall into the default branch. None of
-// the refused types was part of #1155's shape; their round-trip between the
-// indexer's pk_values and the baseline Parquet is unverified, not known-bad.
+// TestCanonicalizePKValue_everySupportedTypeHasAnArm walks that same slice so
+// a type admitted by the gates can never fall into the default branch. None
+// of the refused types was part of #1155's shape; their round-trip between
+// the indexer's pk_values and the baseline Parquet is unverified, not
+// known-bad.
 func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("canonicalizePKValue: nil PK value for column %q (MySQL forbids NULL in PK columns; baseline row may be missing the column after schema drift)", col.Name)
@@ -169,22 +170,21 @@ func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 		return canonicalizeDate(raw, col)
 
 	default:
-		// An EMPTY DataType is the PostgreSQL snapshot shape, and it reaches
-		// here on a legitimate path: cascade Phase-2 (the one caller with no
-		// SupportedPKType gate in front) runs for PostgreSQL sources too —
-		// internal/cli hosts recover-cascade for both binaries. So this is
-		// NOT PKTypeGateReason's wrong-index-database verdict, whose premise
-		// is a flavor check cascade never performs; say what was observed.
-		if strings.TrimSpace(col.DataType) == "" {
-			return nil, fmt.Errorf("canonicalizePKValue: column %q has no MySQL type in the schema snapshot (the PostgreSQL snapshot shape); the MySQL PK canonicalizer cannot build a join key for it, so baseline augmentation is unavailable for this table", col.Name)
-		}
-		// A real type token: render through PKTypeGateReason, the same
-		// sentence every gate in front of this switch uses, so one
-		// limitation reads as one limitation wherever it surfaces. A message
-		// of its own drifted (#1455) — it hardcoded "BIT/JSON/spatial" as the
-		// refused set while FLOAT/DOUBLE/TIME were refused too, so those keys
-		// were blamed on a family they are not in. No claim about WHY the
-		// type is refused: the round-trip is simply unverified for it.
+		// Render through PKTypeGateReason, the renderer verify and single-row
+		// reconstruct gate with, rather than a message of this switch's own:
+		// the one
+		// it used to carry drifted (#1455), hardcoding "BIT/JSON/spatial" as
+		// the refused set while FLOAT/DOUBLE/TIME were refused too, so those
+		// keys were blamed on a family they are not in. Nothing here claims
+		// WHY a type is refused — the round-trip is unverified for it, which
+		// is not the same as known-bad.
+		//
+		// An EMPTY DataType keeps PKTypeGateReason's wrong-index-database
+		// verdict on purpose (#1009/#1198): it is the PostgreSQL snapshot
+		// shape, and every caller that can carry one gates before this point
+		// — cascade Phase-2, the only ungated caller, refuses a PG-shaped
+		// table upstream at fkFilterSafe, which rejects the same empty type
+		// token on the FK column.
 		return nil, fmt.Errorf("canonicalizePKValue: %s; file a follow-up issue if you need this type",
 			PKTypeGateReason(col, "the baseline merge", "canonicalize"))
 	}
@@ -497,6 +497,37 @@ func CanonicalizePKMap(row map[string]any, pkCols []metadata.ColumnMeta) (map[st
 	return canonicalizePKMap(row, pkCols)
 }
 
+// supportedPKTypes is THE list of PK column types canonicalizePKValue
+// handles, and the only place it is written down (#1455 — the refusal message
+// used to keep a second copy of its complement, and that copy drifted). Tests
+// iterate this slice rather than restating it, so a token added here without
+// a matching arm in canonicalizePKValue's switch fails
+// TestCanonicalizePKValue_everySupportedTypeHasAnArm instead of shipping a
+// type every gate admits and the merge then refuses per row.
+//
+// #1155. BLOB-family PKs reach here as prefix keys (MySQL requires a prefix
+// length on a BLOB/TEXT index), which does not change the canonicalization:
+// both the index and the baseline carry the FULL column value, and only the
+// index definition is truncated.
+var supportedPKTypes = []string{
+	"int", "integer", "smallint", "tinyint", "mediumint", "bigint",
+	"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
+	"enum", "set",
+	"datetime", "timestamp", "date",
+	"year",
+	"decimal", "numeric",
+	"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob",
+}
+
+// supportedPKTypeSet is supportedPKTypes as a lookup set, built once.
+var supportedPKTypeSet = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(supportedPKTypes))
+	for _, t := range supportedPKTypes {
+		m[t] = struct{}{}
+	}
+	return m
+}()
+
 // supportedPKType returns true if dataType is in the set of PK column types
 // that canonicalizePKValue handles correctly. Callers use this at the start
 // of a reconstruct run to warn operators about edge cases.
@@ -506,21 +537,6 @@ func CanonicalizePKMap(row map[string]any, pkCols []metadata.ColumnMeta) (map[st
 // full COLUMN_TYPE. MySQL's DATA_TYPE never contains the "unsigned"
 // qualifier — that lives in COLUMN_TYPE.
 func supportedPKType(dataType string) bool {
-	dt := strings.ToLower(strings.TrimSpace(dataType))
-	switch dt {
-	case "int", "integer", "smallint", "tinyint", "mediumint", "bigint",
-		"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
-		"enum", "set",
-		"datetime", "timestamp", "date",
-		"year",
-		"decimal", "numeric",
-		// #1155. BLOB-family PKs reach here as prefix keys (MySQL requires a
-		// prefix length on a BLOB/TEXT index), which does not change the
-		// canonicalization: both the index and the baseline carry the FULL
-		// column value, and only the index definition is truncated.
-		"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob":
-		return true
-	default:
-		return false
-	}
+	_, ok := supportedPKTypeSet[strings.ToLower(strings.TrimSpace(dataType))]
+	return ok
 }

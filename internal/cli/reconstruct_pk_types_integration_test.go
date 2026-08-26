@@ -755,8 +755,20 @@ func TestRunReconstruct_rejectsRemainingUnsupportedPKTypes(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error for %s PK, got nil", tc.dataType)
 			}
-			if !strings.Contains(err.Error(), tc.dataType) {
-				t.Errorf("expected error to mention %q, got: %v", tc.dataType, err)
+			// Match the QUOTED type in the refusal, not the bare token: the
+			// schema name derives from tc.name, so a bare Contains is
+			// satisfied by "pkfloat.t" alone and would pass even if the
+			// message named a different type (#1455).
+			if !strings.Contains(err.Error(), `has type "`+tc.dataType+`"`) {
+				t.Errorf("expected error to name the column's type %q, got: %v", tc.dataType, err)
+			}
+			for _, other := range []string{"bit", "json", "float", "double", "time"} {
+				if other == tc.dataType {
+					continue
+				}
+				if strings.Contains(err.Error(), `has type "`+other+`"`) {
+					t.Errorf("error names a different refused type (%s), got: %v", other, err)
+				}
 			}
 			if !strings.Contains(err.Error(), "not in the supported") {
 				t.Errorf("expected error to mention unsupported set, got: %v", err)
