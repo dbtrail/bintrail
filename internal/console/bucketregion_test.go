@@ -138,9 +138,15 @@ func TestCachedBucketRegion_failureExpiresButDetectionDoesNot(t *testing.T) {
 		t.Error("the detection was re-attempted despite being cached")
 	}
 
+	// Compared against the value BEFORE the call. The first version of this
+	// asserted `!at.Equal(stale) && at.Before(now-1s)` on an entry seeded to
+	// time.Now(): the second half is false by construction, so the whole leg
+	// was unreachable and removing the negative memoization outright left it
+	// green.
+	freshBefore := s.bucketRegions["fresh-miss"].at
 	s.cachedBucketRegion(ctx, &cfg, &loaded, "fresh-miss")
-	if !s.bucketRegions["fresh-miss"].at.Equal(stale) && s.bucketRegions["fresh-miss"].at.Before(time.Now().Add(-time.Second)) {
-		t.Error("unexpected timestamp movement on a fresh miss")
+	if !s.bucketRegions["fresh-miss"].at.Equal(freshBefore) {
+		t.Error("a failure still inside the TTL was re-attempted; the memoization is what keeps this off the SQL panel's per-query path")
 	}
 
 	before := s.bucketRegions["stale-miss"].at

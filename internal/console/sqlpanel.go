@@ -76,7 +76,7 @@ const (
 var sqlPanelTimeout = 60 * time.Second
 
 // sqlPanelSetupTimeout bounds the pre-query setup — the S3 baseline LIST in
-// buildViewsInput is the one unbounded step that runs under the single-flight
+// buildViewsInput holds the unbounded steps that run under the single-flight
 // latch, so a hung listing must not pin the panel at 429 for every other user.
 // The query itself is bounded separately by sqlPanelTimeout.
 var sqlPanelSetupTimeout = 30 * time.Second
@@ -200,8 +200,8 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.sqlPanelBusy.Store(false)
 
-	// Bound the setup: buildViewsInput's S3 baseline LIST is the one unbounded
-	// step under the latch. r.Context() still propagates (Cancel works); the
+	// Bound the setup: buildViewsInput's S3 baseline LIST, and the region
+	// lookup beside it, are the unbounded steps under the latch. r.Context() still propagates (Cancel works); the
 	// deadline is what stops a hung listing from wedging the single-flight.
 	setupCtx, setupCancel := context.WithTimeout(r.Context(), sqlPanelSetupTimeout)
 	in, err := s.buildViewsInput(setupCtx, b, false) // runs here: local-first routing

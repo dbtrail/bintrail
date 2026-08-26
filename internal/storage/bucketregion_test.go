@@ -45,7 +45,10 @@ func TestIsBucketLocationAccessDenied(t *testing.T) {
 // A cancelled context makes the call fail without a network or an AWS account,
 // so this is hermetic.
 func TestDetectBucketRegion_failureIsReportedAsSuch(t *testing.T) {
-	t.Setenv("AWS_REGION", "us-east-1")
+	// NOT us-east-1: that is what the SUCCESS path substitutes for an empty
+	// LocationConstraint, so an ambient us-east-1 would let a mutation that
+	// returns the literal survive this assertion.
+	t.Setenv("AWS_REGION", "eu-west-2")
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 	t.Setenv("AWS_ACCESS_KEY_ID", "testdummykey")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "testdummysecret")
@@ -63,7 +66,7 @@ func TestDetectBucketRegion_failureIsReportedAsSuch(t *testing.T) {
 	}
 	// The read path still needs a usable value, which is why the failure is not
 	// an error: it is about to read, and a wrong guess fails there, loudly.
-	if region != "us-east-1" {
+	if region != "eu-west-2" {
 		t.Errorf("region = %q, want the resolved default for the read path to fall back on", region)
 	}
 }

@@ -112,8 +112,16 @@ func (s *Server) cachedBucketRegion(ctx context.Context, cfg *aws.Config, loaded
 			// leaves the host and the log is what stays: without this, "no
 			// REGION clause" has no explanation anywhere, and it is the one
 			// case the file itself cannot describe.
-			slog.Warn("could not resolve an AWS region for the generated views.sql; it will pin none",
+			slog.Warn("could not resolve an AWS region for this server's S3 layout; no region will be pinned",
 				"bucket", bucket, "error", err)
+			// Cached like any other failure, and for the same reason its
+			// sibling below is: the reachable cause here is a malformed
+			// ~/.aws/config or a missing AWS_PROFILE, which is persistent, and
+			// the endpoint-config class already 502s upstream. Re-reading a
+			// broken file on every SQL panel query is the cost the
+			// memoization exists to avoid; the TTL is what lets a fixed
+			// config heal without a restart.
+			s.rememberBucketRegion(bucket, "", false)
 			return "", false
 		}
 		*cfg, *loaded = c, true
@@ -124,16 +132,23 @@ func (s *Server) cachedBucketRegion(ctx context.Context, cfg *aws.Config, loaded
 		// Once per bucket per TTL, not per request: the operator's remedy is
 		// to grant s3:GetBucketLocation or accept that readers resolve their
 		// own region, and neither is helped by a line on every download.
-		slog.Warn("S3 bucket region not detected; the generated views.sql will pin no region and readers will resolve their own",
+		// Names no consumer: both the download and the SQL panel reach this,
+		// and telling a panel user about a file they never asked for is worse
+		// than saying less.
+		slog.Warn("S3 bucket region not detected (grant s3:GetBucketLocation to pin it); no region will be pinned",
 			"bucket", bucket)
 	}
+	s.rememberBucketRegion(bucket, r, detected)
+	return r, detected
+}
+
+func (s *Server) rememberBucketRegion(bucket, region string, detected bool) {
 	s.bucketRegionMu.Lock()
+	defer s.bucketRegionMu.Unlock()
 	if s.bucketRegions == nil {
 		s.bucketRegions = map[string]bucketRegionEntry{}
 	}
-	s.bucketRegions[bucket] = bucketRegionEntry{region: r, detected: detected, at: time.Now()}
-	s.bucketRegionMu.Unlock()
-	return r, detected
+	s.bucketRegions[bucket] = bucketRegionEntry{region: region, detected: detected, at: time.Now()}
 }
 
 // layoutBuckets returns the distinct S3 buckets the rendered file will read, in
