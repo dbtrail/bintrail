@@ -335,7 +335,7 @@ func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *ba
 		switch err := sup.TriggerRefresh(req, interval); {
 		case err == nil:
 			dispatched++
-		case errors.Is(err, console.ErrBaselineRunning):
+		case errors.Is(err, context.Canceled):
 			// Expected: a refresh still folding, or a manual dump in flight.
 			// Counted rather than only logged, because at a short interval this
 			// stops being an edge case and becomes the steady state — it is the
