@@ -64,6 +64,13 @@ type Input struct {
 	// chain resolve it, which is what every other bintrail S3 read does by
 	// default.
 	ArchiveRegion string
+
+	// RegionAmbiguous is set when the layout's buckets do not agree on one
+	// region, so ArchiveRegion was deliberately left empty rather than pinned
+	// to one of them. One secret and one s3_region cannot describe two
+	// regions. The file says so, because a reader who sees no REGION clause
+	// cannot otherwise tell "nothing to pin" from "we could not agree".
+	RegionAmbiguous bool
 	// S3Endpoint is the S3-compatible store the paths live in, when the
 	// generating process was configured with one (#1454). It is a location,
 	// not a credential, and belongs in the file: a reader on another machine
@@ -97,7 +104,7 @@ func Generate(in Input) string {
 	var b strings.Builder
 	writeHeader(&b, in)
 	if in.NeedsS3() {
-		writeS3Preamble(&b, in.ArchiveRegion, in.S3Endpoint)
+		writeS3Preamble(&b, in.ArchiveRegion, in.S3Endpoint, in.RegionAmbiguous)
 	}
 	writeEventsView(&b, in)
 	writeStateViews(&b, in)
@@ -206,10 +213,17 @@ func orUnknown(s string) string {
 // paste into a notebook or share with a colleague: it resolves whatever the
 // environment already has (instance role, SSO profile, env vars) and puts NO key
 // material in the generated text.
-func writeS3Preamble(b *strings.Builder, region string, ep storage.S3Endpoint) {
+func writeS3Preamble(b *strings.Builder, region string, ep storage.S3Endpoint, ambiguousRegion bool) {
 	b.WriteString("-- S3 setup, mirroring what bintrail's own DuckDB sessions configure.\n")
 	if ep.Set() {
 		fmt.Fprintf(b, "-- s3:// paths here live in an S3-compatible store at %s, not in AWS.\n", ep.URL)
+	}
+	if ambiguousRegion {
+		b.WriteString("-- No region is pinned below: the archives and baselines this file reads\n")
+		b.WriteString("-- are in buckets whose regions differ, and one secret cannot name two.\n")
+		b.WriteString("-- Your own AWS configuration resolves one; a bucket outside it answers\n")
+		b.WriteString("-- 301 PermanentRedirect. Split those reads into one file per region, or\n")
+		b.WriteString("-- add a second scoped secret for the odd bucket out.\n")
 	}
 	b.WriteString("INSTALL httpfs; LOAD httpfs;\n")
 	b.WriteString("INSTALL aws; LOAD aws;\n")

@@ -1712,7 +1712,17 @@ try {
       return { total, arrived, firstSeen, maxGap: Math.max(0, ...gapAround) };
     });
   };
-  const rmTl = await staggerProbe("reduce");
+  // Retried on READINESS, like the no-preference arm below and for the same
+  // reason: a runner loaded enough to starve runState leaves the probe with
+  // zero nodes to look at, and `total: 0` was reported as a missing-stagger
+  // regression (#1463). Readiness only — not the assertion — so a real JS
+  // stagger under reduced motion satisfies rmRead on the first attempt and
+  // still fails the same-tick check below, every attempt.
+  const rmRead = (r) => r.total >= 2 && r.arrived === r.total;
+  let rmTl = await staggerProbe("reduce");
+  for (let attempt = 0; attempt < 2 && !rmRead(rmTl); attempt++) {
+    rmTl = await staggerProbe("reduce");
+  }
   // The no-preference arm reads an ORDER out of a 55ms step by polling every
   // 10ms, so a loaded runner can hide it: if the loop stalls longer than one
   // step, both nodes are first seen on the same poll and the arm reports a

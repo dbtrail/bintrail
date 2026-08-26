@@ -96,3 +96,41 @@ func TestViewsAPI_localOnlyLayoutIgnoresEndpointTypo(t *testing.T) {
 		t.Errorf("a layout treated as local reads S3 after all:\n%s", body)
 	}
 }
+
+// TestViewsAPI_pinsTheDetectedRegion is the WIRING guard for #1462: the
+// resolver is unit-tested on its own, which says nothing about whether
+// buildViewsInput calls it. Before this the console pinned no region at all
+// while the daemon's own reads pinned a detected one, so a downloaded file
+// described a different read than the one this process performs.
+func TestViewsAPI_pinsTheDetectedRegion(t *testing.T) {
+	t.Setenv(storage.EnvS3PathStyle, "")
+	t.Setenv(storage.EnvS3Endpoint, "")
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("FROM archive_state").WillReturnRows(
+		sqlmock.NewRows([]string{"bintrail_id", "sample_local", "sample_bucket", "sample_key"}).
+			AddRow("aaaa", nil, "bkt", "events/bintrail_id=aaaa/f.parquet"))
+
+	srv := newViewsServer(t, "", false)
+	srv.cm.boot.db = db
+	// Pre-seeded so the test needs no network: what is under test is that the
+	// resolver's answer reaches the file, not how the answer is obtained.
+	srv.bucketRegions = map[string]string{"bkt": "eu-central-1"}
+
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, body)
+	}
+	if !strings.Contains(string(body), "REGION 'eu-central-1'") {
+		t.Errorf("the downloaded file pins no region, so the reader resolves their own:\n%s", body)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -197,6 +198,13 @@ type RotationDefaults struct {
 // gates) lives in a connManager bundle resolved per request from the
 // X-Bintrail-Server header.
 type Server struct {
+	// bucketRegions memoizes DetectBucketRegion per bucket: buildViewsInput
+	// runs on every SQL panel query, and a bucket's region is fixed for its
+	// lifetime, so one lookup per bucket per process is both enough and the
+	// most this hot path should pay.
+	bucketRegionMu sync.Mutex
+	bucketRegions  map[string]string
+
 	listen     string
 	token      string
 	denyTables []query.SchemaTable

@@ -81,6 +81,10 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 			return views.Input{}, fmt.Errorf("S3 endpoint configuration: %w", err)
 		}
 		in.S3Endpoint = ep
+		// The region this daemon's own archive reads would use (#1462). Left
+		// empty before, so a downloaded file described a different read than
+		// the one performed here.
+		in.ArchiveRegion, in.RegionAmbiguous = s.archiveRegion(ctx, in)
 	}
 	return in, nil
 }

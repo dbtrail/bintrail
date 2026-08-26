@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A console-generated `views.sql` now pins the same S3 region the daemon's
+  own reads use** (#1462). The console filled no region at all, while archive
+  reads pin a region detected from the bucket, so a downloaded file described a
+  different read than the one this process performs: a store that checks the
+  signing region answered 403 (Ceph) or 301 `PermanentRedirect` (a
+  cross-region AWS bucket) to whoever ran the file. The same value now also
+  reaches the SQL panel's own DuckDB session, which was equally unpinned.
+  Detection is memoized per bucket, since the panel rebuilds this on every
+  query and a bucket's region is fixed for its lifetime. When the archives and
+  baselines a file reads sit in buckets whose regions differ, nothing is
+  pinned (one secret cannot name two) and the file says so, rather than
+  looking unpinned by accident.
+
 ### Added
 - **S3-compatible object stores (MinIO, Wasabi, LocalStack) for every S3
   path** (#1453, #1454). `BINTRAIL_S3_ENDPOINT=scheme://host[:port]` points
