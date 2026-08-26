@@ -169,10 +169,19 @@ func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 		return canonicalizeDate(raw, col)
 
 	default:
-		// Render through PKTypeGateReason, the same wording every gate in
-		// front of this switch uses, so the one path that reaches here
-		// ungated (cascade Phase-2) refuses with the same sentence. A message
-		// of its own drifted (#1455): it hardcoded "BIT/JSON/spatial" as the
+		// An EMPTY DataType is the PostgreSQL snapshot shape, and it reaches
+		// here on a legitimate path: cascade Phase-2 (the one caller with no
+		// SupportedPKType gate in front) runs for PostgreSQL sources too —
+		// internal/cli hosts recover-cascade for both binaries. So this is
+		// NOT PKTypeGateReason's wrong-index-database verdict, whose premise
+		// is a flavor check cascade never performs; say what was observed.
+		if strings.TrimSpace(col.DataType) == "" {
+			return nil, fmt.Errorf("canonicalizePKValue: column %q has no MySQL type in the schema snapshot (the PostgreSQL snapshot shape); the MySQL PK canonicalizer cannot build a join key for it, so baseline augmentation is unavailable for this table", col.Name)
+		}
+		// A real type token: render through PKTypeGateReason, the same
+		// sentence every gate in front of this switch uses, so one
+		// limitation reads as one limitation wherever it surfaces. A message
+		// of its own drifted (#1455) — it hardcoded "BIT/JSON/spatial" as the
 		// refused set while FLOAT/DOUBLE/TIME were refused too, so those keys
 		// were blamed on a family they are not in. No claim about WHY the
 		// type is refused: the round-trip is simply unverified for it.

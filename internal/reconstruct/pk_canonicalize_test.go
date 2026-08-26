@@ -328,6 +328,29 @@ func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
 	}
 }
 
+// TestCanonicalizePKValue_emptyTypeIsNotTheWrongPathVerdict pins the PG-shaped
+// column (#1455 follow-up): an empty DataType reaches this switch on a
+// LEGITIMATE path — cascade Phase-2 has no SupportedPKType gate in front of it
+// and internal/cli hosts recover-cascade for bintrail-pg too — so the refusal
+// must not borrow PKTypeGateReason's wrong-index-database verdict, whose
+// premise is a stream_state flavor check cascade never performs.
+func TestCanonicalizePKValue_emptyTypeIsNotTheWrongPathVerdict(t *testing.T) {
+	col := colMeta("id", "", "")
+	_, err := canonicalizePKValue("whatever", col)
+	if err == nil {
+		t.Fatal("expected error for a column with no MySQL type, got nil")
+	}
+	msg := err.Error()
+	for _, forbidden := range []string{"index database", "stream_state", "flavor", "MySQL path"} {
+		if strings.Contains(msg, forbidden) {
+			t.Errorf("empty DataType borrows the wrong-path verdict (%q): %v", forbidden, err)
+		}
+	}
+	if !strings.Contains(msg, "PostgreSQL snapshot shape") {
+		t.Errorf("empty DataType does not name the observed shape: %v", err)
+	}
+}
+
 // TestCanonicalizePKValue_everySupportedTypeHasAnArm pins that the switch in
 // canonicalizePKValue mirrors supportedPKType: a type the gates admit must
 // never land in the default branch, or every gated surface would accept the
