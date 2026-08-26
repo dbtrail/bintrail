@@ -20,6 +20,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/snapshotdir"
 )
 
 // ErrNoBaseline is returned by FindBaseline when no baseline snapshot exists
@@ -760,18 +761,11 @@ func extractTimestampFromS3Path(path, prefix, schema, table string) (time.Time, 
 // parseDirTimestamp converts a baseline directory name like "2026-02-28T00-00-00Z"
 // to a time.Time. The format is RFC3339 with colons in the time+offset portion
 // replaced by hyphens for filesystem compatibility.
+// parseDirTimestamp delegates to snapshotdir.ParseTime so the rule lives in one
+// place: query reads the same directory names, and two hand-written parsers of
+// one format is how they drift.
 func parseDirTimestamp(name string) (time.Time, bool) {
-	idx := strings.IndexByte(name, 'T')
-	if idx < 0 {
-		return time.Time{}, false
-	}
-	// Restore colons only in the portion after 'T'.
-	rfc := name[:idx+1] + strings.ReplaceAll(name[idx+1:], "-", ":")
-	t, err := time.Parse(time.RFC3339, rfc)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t.UTC(), true
+	return snapshotdir.ParseTime(name)
 }
 
 func quoteIdent(name string) string {

@@ -45,6 +45,11 @@ import (
 // snapshot's time and publishes at the new one, so the next run checking from
 // the new time skips no window.
 //
+// The stale-schema check (3a-bis) is likewise ahead of this and likewise
+// refuses. The capture-gap check is NOT, in the sense that matters: under
+// --allow-gaps it reports and proceeds, which is why carryForwardEligible
+// takes the finding rather than relying on the ordering.
+//
 // # Integrity
 //
 // The source is validated against its own snapshot's _MANIFEST before it is
@@ -53,6 +58,12 @@ import (
 // reading it: the merge path validates on read (materializeBaselineLocal), so
 // carrying forward without validating would be the one route into a snapshot
 // that bypasses the check.
+//
+// What that check does NOT do is worth stating: ValidateLocalFile passes when
+// the snapshot has no manifest at all, or lists no entry for this file. It
+// catches a CRC mismatch, not an absent guarantee. A legacy snapshot with no
+// manifest is carried forward unverified, exactly as the merge path would read
+// it unverified.
 //
 // # Hard link, then copy
 //
@@ -78,8 +89,12 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return false, err
 	}
-	// A previous attempt's leftover would make os.Link fail with EEXIST and
-	// would be silently kept by a copy, so clear it either way.
+	// Remove before writing, and the reason is the COPY path rather than the
+	// link path. os.Create truncates, and after a carry-forward the destination
+	// may share an inode with a file an OLDER snapshot still references, so
+	// truncating in place would empty that one too. Unlinking first breaks the
+	// share before anything is written. (os.Link would also fail with EEXIST,
+	// though reconstruct's leftovers refusal already rules that out.)
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
@@ -92,17 +107,41 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 // carryForwardEligible reports whether a table can be published by carrying its
 // previous file forward instead of folding.
 //
+// # A known capture gap disqualifies the table
+//
+// This is the same trap as TRUNCATE, one step further along, and it is worth
+// stating separately because the refusal that closes it does not refuse.
+// CheckDestructiveDDL returns an error and stops the run. CheckCaptureGapStatus
+// under --allow-gaps returns the FINDING and lets the run continue, so a gap
+// reaches this point as a value rather than as an abort.
+//
+// Two things go wrong if it is ignored. The events in the gap are permanently
+// lost, so an empty change map no longer means the table was untouched: the
+// missing events may be exactly this table's, and carrying the previous file
+// forward would republish a state the source has moved on from while the
+// summary calls it "unchanged".
+//
+// And the marker would vanish. A gap the run proceeded over is stamped into
+// the new snapshot as bintrail.capture_gap by the merge path, which this
+// branch skips, so a carried file would arrive in the new snapshot carrying no
+// record that its window was knowingly incomplete. That inheritance exists so
+// nobody has to reconstruct the provenance chain by hand (#1170).
+//
+// Falling through to the fold costs a rewrite and gets both right: the rows are
+// re-emitted and the stamp is written.
+//
 // S3 sources are excluded deliberately rather than incidentally. A refresh
 // reads and writes snapshot files on disk (an S3-only baseline destination
 // cannot be refreshed in place), so the loop this exists for is always
 // local-to-local; an S3 source would have to be downloaded, which buys the
 // re-encode back and reintroduces the cost this avoids. Those runs take the
 // ordinary merge path, which is correct, just not free.
-func carryForwardEligible(format, srcPath string, changes int) bool {
+func carryForwardEligible(format, srcPath string, changes int, capGap *CaptureGap) bool {
 	// Mydumper output is a SQL dump for a human to load, not a snapshot to be
 	// discovered, so there is no previous file to carry: the rows still have
 	// to be emitted.
-	return format == OutputFormatParquet && changes == 0 && !strings.HasPrefix(srcPath, "s3://")
+	return format == OutputFormatParquet && changes == 0 && capGap == nil &&
+		!strings.HasPrefix(srcPath, "s3://")
 }
 
 func copyFile(src, dst string) error {

@@ -485,3 +485,70 @@ func TestReconstructParquet_destructiveDDLRefusesEvenWithNoRowEvents(t *testing.
 		t.Errorf("refused for the wrong reason: %v", err)
 	}
 }
+
+// TestReconstructParquet_captureGapIsNotCarriedForward is the --allow-gaps
+// sibling of the TRUNCATE guard above, and it exists because the refusal that
+// closes it does not refuse.
+//
+// CheckDestructiveDDL returns an error and stops the run. CheckCaptureGapStatus
+// under --allow-gaps returns the FINDING and lets the run proceed, so a gap
+// arrives at the carry-forward branch as a value rather than as an abort.
+//
+// Two things would go wrong. The events in the gap are permanently lost, so an
+// empty change map no longer means the table was untouched: the missing events
+// may be this table's, and the summary would call it "unchanged". And the
+// bintrail.capture_gap stamp is written by the merge path, which carrying
+// forward skips, so the new snapshot would carry no record that its window was
+// knowingly incomplete.
+func TestReconstructParquet_captureGapIsNotCarriedForward(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	db, dbName := testutil.CreateTestDB(t)
+	if err := indexer.CreateIndexTables(ctx, db, 48, false, nil); err != nil {
+		t.Fatalf("CreateIndexTables: %v", err)
+	}
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	const schema = "shop"
+	base := time.Now().UTC().Truncate(time.Hour)
+	seedOrdersSnapshot(t, db, schema, base)
+
+	root := t.TempDir()
+	seedSourceBaseline(t, root, base, schema)
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200,
+		base.Add(10*time.Second).Format("2006-01-02 15:04:05"), nil,
+		schema, "customers", 1, "1", nil, nil, []byte(`{"id":1,"name":"n"}`))
+
+	// A permanent capture loss stamped inside the window, and still no row
+	// events for orders.
+	if _, err := db.Exec(
+		`INSERT INTO stream_state (id, mode, binlog_file, binlog_position, last_checkpoint, server_id,
+		                           gap_lost_at, gap_lost_detail)
+		 VALUES (1, 'position', 'binlog.000001', 500, ?, 1, ?, 'unfillable gap: events permanently lost')
+		 ON DUPLICATE KEY UPDATE gap_lost_at = VALUES(gap_lost_at), gap_lost_detail = VALUES(gap_lost_detail)`,
+		base, base.Add(15*time.Second)); err != nil {
+		t.Fatalf("stamp the capture gap: %v", err)
+	}
+
+	reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
+		IndexDSN:     testutil.BaseDSN() + "/" + dbName,
+		BaselineSrc:  root,
+		Tables:       []string{schema + ".orders"},
+		At:           base.Add(30 * time.Second),
+		OutputDir:    root,
+		OutputFormat: reconstruct.OutputFormatParquet,
+		AllowGaps:    true,
+	})
+	if err != nil {
+		t.Fatalf("ReconstructTables with --allow-gaps: %v", err)
+	}
+	for _, r := range reports {
+		if r.CarriedForward {
+			t.Fatalf("%s.%s was carried forward over a known capture gap: the lost events may be this "+
+				"table's, and the capture_gap stamp the merge path writes would be lost with it",
+				r.Schema, r.Table)
+		}
+	}
+}

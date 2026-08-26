@@ -257,7 +257,8 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 // it. And not per tick: a tick only dispatches.
 //
 // The duration is also the honest measure of what a full rewrite costs on real
-// data: every refresh rewrites each table in full, however little of it
+// data: a refresh rewrites every table that CHANGED in full, however little of
+// it
 // changed. An estimate of that is a guess about someone else's data; this is
 // theirs.
 func reportRefreshDuration(server string, interval, took time.Duration) {
@@ -266,7 +267,8 @@ func reportRefreshDuration(server string, interval, took time.Duration) {
 		return
 	}
 	slog.Warn("baseline refresh: this server's refresh took longer than the configured interval, so it cannot "+
-		"run as often as requested. Every refresh rewrites each table in full regardless of how much changed, "+
+		"run as often as requested. A refresh rewrites every table that changed in full, however little of it "+
+		"changed (a table with no events at all is carried forward instead), "+
 		"so this is the cost of the rewrite, not of the schedule. Raise the interval to match, or refresh "+
 		"fewer tables.",
 		"server", server, "took", took, "interval", interval)

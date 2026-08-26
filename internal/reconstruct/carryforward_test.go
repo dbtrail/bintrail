@@ -12,25 +12,33 @@ import (
 )
 
 func TestCarryForwardEligible(t *testing.T) {
+	gap := &CaptureGap{Detail: "events permanently lost"}
 	for _, tc := range []struct {
 		name    string
 		format  string
 		src     string
 		changes int
+		gap     *CaptureGap
 		want    bool
 	}{
-		{"parquet, no changes, local", OutputFormatParquet, "/b/2026/demo/o.parquet", 0, true},
-		{"a single change disqualifies it", OutputFormatParquet, "/b/2026/demo/o.parquet", 1, false},
+		{"parquet, no changes, local, no gap", OutputFormatParquet, "/b/2026/demo/o.parquet", 0, nil, true},
+		{"a single change disqualifies it", OutputFormatParquet, "/b/2026/demo/o.parquet", 1, nil, false},
 		// A mydumper run emits SQL for a human to load. There is no previous
 		// artifact to carry, so the rows still have to be written.
-		{"mydumper", OutputFormatMydumper, "/b/2026/demo/o.parquet", 0, false},
+		{"mydumper", OutputFormatMydumper, "/b/2026/demo/o.parquet", 0, nil, false},
 		// The zero value resolves to mydumper, so it must NOT be treated as
 		// parquet by an == "" slip.
-		{"unset format is mydumper, not parquet", "", "/b/2026/demo/o.parquet", 0, false},
+		{"unset format is mydumper, not parquet", "", "/b/2026/demo/o.parquet", 0, nil, false},
 		// S3 would have to be downloaded, which buys back the cost this avoids.
-		{"s3 source", OutputFormatParquet, "s3://bucket/base/2026/demo/o.parquet", 0, false},
+		{"s3 source", OutputFormatParquet, "s3://bucket/base/2026/demo/o.parquet", 0, nil, false},
+		// The one that does not look like the others: a gap arrives as a VALUE
+		// rather than an error, because --allow-gaps makes step 3c report and
+		// proceed. Events were permanently lost, so an empty change map no
+		// longer means the table was untouched, and the gap stamp the merge
+		// path writes would be lost with the fold.
+		{"a known capture gap", OutputFormatParquet, "/b/2026/demo/o.parquet", 0, gap, false},
 	} {
-		if got := carryForwardEligible(tc.format, tc.src, tc.changes); got != tc.want {
+		if got := carryForwardEligible(tc.format, tc.src, tc.changes, tc.gap); got != tc.want {
 			t.Errorf("%s: carryForwardEligible = %v, want %v", tc.name, got, tc.want)
 		}
 	}

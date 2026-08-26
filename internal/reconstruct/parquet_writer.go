@@ -176,7 +176,8 @@ const (
 //     the mydumper schema file originally — so the emitted Parquet has the same
 //     column names, the same MySQL→Parquet type mapping, and (via
 //     baseline.Writer's alphabetical sort) the same physical column order.
-//   - Anchor: MetaKeyBinlogFile/Pos carry the run's cut, the coordinate where
+//   - Anchor: MetaKeyBinlogFile/Pos carry the run's cut for every table this
+//     path WRITES, the coordinate where
 //     the next fold resumes. This is the load-bearing field; see
 //     ResolveSnapshotCut.
 //   - MetaKeyCreateTableSQL is propagated verbatim, so a reconstruct anchored on

@@ -474,9 +474,17 @@ func reconstructTables(ctx context.Context, cfg FullTableConfig, failures *[]Tab
 
 	// Resolve the snapshot's binlog cut ONCE for the whole run, before any table
 	// is folded. One index database tracks one source, so a single coordinate is
-	// the right anchor for every table in the snapshot — and resolving it per
-	// table would let two tables in one snapshot end up anchored at different
-	// points, which is not a state the marker/discovery scheme can express.
+	// the right anchor for every table this run FOLDS, and resolving it per table
+	// would anchor tables that were folded together at different points for no
+	// reason.
+	//
+	// A snapshot can nonetheless hold mixed anchors, and that is deliberate
+	// rather than a hole: a table with no events in the window is published by
+	// carrying its previous file forward, keeping its own older anchor, which
+	// still points exactly where ITS deltas resume. Discovery is unaffected
+	// because it dates a snapshot by its directory name, never by a footer. Any
+	// reader that treats one table's anchor as the snapshot's will be wrong for
+	// such a table; see carryForward.
 	//
 	// The cut also bounds every table's fetch (Options.UntilPos below), so it
 	// must be pinned before the first fetch: reading it afterwards would anchor
@@ -997,7 +1005,11 @@ func ReconstructTable(
 	//
 	// This also skips step 6, which reads the whole baseline back for DuckDB,
 	// so the saving is the read as well as the write.
-	if carryForwardEligible(cfg.OutputFormat, baselinePath, len(changes)) {
+	//
+	// capGap is passed in because step 3c does NOT refuse under --allow-gaps:
+	// it returns the finding and lets the run proceed. See carryForwardEligible
+	// for why a known gap disqualifies a table from being carried at all.
+	if carryForwardEligible(cfg.OutputFormat, baselinePath, len(changes), capGap) {
 		linked, cerr := carryForward(ctx, baselinePath, cfg.snapshotDir, schema, table)
 		if cerr != nil {
 			return nil, fmt.Errorf("carry %s.%s forward unchanged: %w", schema, table, cerr)

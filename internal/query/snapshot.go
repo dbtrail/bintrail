@@ -21,6 +21,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/event"
+	"github.com/dbtrail/dbtrail/internal/snapshotdir"
 )
 
 // snapshotEventIDBase is OR'd with the row index to synthesise a ResultRow
@@ -185,11 +186,44 @@ func shouldSkipSnapshot(opts Options) (string, bool) {
 	return "", false
 }
 
-// readSnapshotTimestamp extracts bintrail.snapshot_timestamp from the Parquet
-// file metadata using the shared db handle. Returns a non-nil error when the
-// file lacks the key — the caller cannot apply the --since/--until filter
-// without it.
+// readSnapshotTimestamp resolves the instant a baseline file's rows describe,
+// for the --since/--until filter. Returns a non-nil error when neither source
+// below answers: the caller cannot apply the filter without it.
+//
+// The DIRECTORY name is preferred, and the footer is the fallback. That order
+// matters and it is not the order this used to use.
+//
+// A table whose delta window held no events is published by carrying its
+// previous Parquet file forward unchanged, so its footer keeps the OLDER
+// bintrail.snapshot_timestamp while it sits in the newer snapshot's directory.
+// Reading the footer first dated two files in the SAME snapshot differently,
+// purely by whether each table happened to be cold, and a `--since` past the
+// stale value dropped the cold table's baseline rows with a log line and no
+// error. Every other discovery path in the tree (FindBaseline, ListBaselines,
+// status's staleness grading) already treats the directory as authoritative;
+// this was the one that did not.
+//
+// The footer fallback still earns its place: a file read from outside a
+// snapshot layout has no directory to ask.
 func readSnapshotTimestamp(ctx context.Context, db *sql.DB, path string) (time.Time, error) {
+	// <root>/<timestamp>/<schema>/<table>.parquet — two levels up. Lexical on
+	// purpose so it works for an s3:// URL as well as a local path.
+	if dir := path[:strings.LastIndex(path, "/")+1]; dir != "" {
+		trimmed := strings.TrimSuffix(dir, "/")
+		if i := strings.LastIndex(trimmed, "/"); i >= 0 {
+			snapDir := trimmed[:i]
+			if j := strings.LastIndex(snapDir, "/"); j >= 0 {
+				snapDir = snapDir[j+1:]
+			}
+			if ts, ok := snapshotdir.ParseTime(snapDir); ok {
+				return ts, nil
+			}
+		}
+	}
+	return readSnapshotTimestampFromFooter(ctx, db, path)
+}
+
+func readSnapshotTimestampFromFooter(ctx context.Context, db *sql.DB, path string) (time.Time, error) {
 	safePath := strings.ReplaceAll(path, "'", "''")
 	rows, err := db.QueryContext(ctx, "SELECT key, value FROM parquet_kv_metadata('"+safePath+"')")
 	if err != nil {
