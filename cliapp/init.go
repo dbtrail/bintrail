@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/dbtrail/dbtrail/internal/storage"
 	"os"
 	"strings"
 
@@ -17,6 +16,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 var initCmd = &cobra.Command{
@@ -123,6 +123,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nSetting up S3 bucket...\n")
 		}
 		if err := setupS3Bucket(cmd.Context(), initS3Bucket, initS3Region); err != nil {
+			// A malformed S3 endpoint is a configuration fault, not a bucket
+			// one: creating the bucket by hand fixes nothing, and the
+			// remediation below would send the operator to do exactly that.
+			if errors.Is(err, storage.ErrS3EndpointConfig) {
+				return err
+			}
 			s3Err = err
 			if initFormat != "json" {
 				fmt.Fprintf(os.Stderr, "Warning: could not create S3 bucket %q: %v\n\n", initS3Bucket, err)
@@ -142,6 +148,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nVerifying existing S3 bucket...\n")
 		}
 		if err := verifyS3Bucket(cmd.Context(), s3ARNBucket, initS3Region); err != nil {
+			// See above: an IAM policy is not what is wrong here.
+			if errors.Is(err, storage.ErrS3EndpointConfig) {
+				return err
+			}
 			s3Err = err
 			if initFormat != "json" {
 				fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", s3ARNBucket, err)

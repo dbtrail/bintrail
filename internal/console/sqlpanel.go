@@ -399,7 +399,9 @@ func openSandboxedSession(ctx context.Context, in views.Input) (*sql.DB, func(),
 		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return fail(fmt.Errorf("S3 archive sources are configured but the DuckDB httpfs extension could not be loaded: %w", err))
 		}
-		duckdbutil.EnableS3CredentialChainRegion(ctx, db, in.ArchiveRegion)
+		if err := duckdbutil.EnableS3CredentialChainRegion(ctx, db, in.ArchiveRegion); err != nil {
+			return fail(err)
+		}
 	}
 	// Withhold the paid forensics columns from the events view STRUCTURALLY —
 	// a property of the panel's session, not of the caller's input, so no future

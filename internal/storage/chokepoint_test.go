@@ -20,17 +20,27 @@ var aliasedS3Import = regexp.MustCompile(`(?m)^\s*(\w+)\s+"github\.com/aws/aws-s
 // only for the one surface that got it wrong, which is the kind of partial
 // breakage this guard exists to prevent.
 //
-// Source-level rather than type-level: the SDK constructor is a function, so
-// nothing in the type system can stop a new call site from appearing. What the
-// scan sees is the literal text `s3.NewFromConfig(` in non-test .go files; an
-// aliased import would evade it. None exists today, which is when the limit is
-// worth writing down.
+// Source-level rather than type-level: these are functions, so nothing in the
+// type system can stop a new call site from appearing. Four things are
+// scanned for in non-test .go files:
+//
+//   - `s3.NewFromConfig(`, the SDK constructor that skips the shared options
+//   - an ALIASED import of the SDK's s3 package, which would rename that call
+//   - `LoadDefaultConfig(`, which skips the endpoint, the region default and
+//     the IMDS fallback that LoadAWSConfig applies
+//   - `LoadHTTPFS(` in a file that never configures S3, whose s3:// reads go
+//     wherever DuckDB defaults point, which is AWS
+//
+// What it still cannot see, since it reads text and not types: a dot-import,
+// or a wrapper in a third package that re-exports the constructor. Neither
+// exists today, which is when a limit is worth writing down.
 func TestS3ClientConstructionGoesThroughOnePlace(t *testing.T) {
 	root, err := filepath.Abs("../..")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The one legitimate call, inside the shared constructor.
+	// The shared constructor itself: exempt from all four checks, since it is
+	// the one place that legitimately makes these calls.
 	allowed := filepath.Join(root, "internal", "storage", "s3url.go")
 
 	// A second, narrower guard: an S3 read path that loads httpfs must also

@@ -88,7 +88,9 @@ func ensureWritableHome() {
 // profile, expired SSO, unreachable IMDS) always warns: the SDK upload paths
 // report that state loudly and the read paths must not bury it.
 //
-// BINTRAIL_DUCKDB_NO_AWS_EXT=1 skips the setup entirely. Escape hatch for
+// BINTRAIL_DUCKDB_NO_AWS_EXT=1 skips the aws extension and the secret, NOT
+// the endpoint routing: routing is session settings, and an unrouted read
+// does not fail, it reaches AWS. Escape hatch for
 // proxies that BLACKHOLE (rather than refuse) the DuckDB extension registry:
 // there the INSTALL attempt can stall for minutes, ignores context
 // cancellation, and recurs every session because failures are never cached.
@@ -96,6 +98,11 @@ func ensureWritableHome() {
 // The secret resolves credentials at CREATE time, not per request — fine
 // here because every caller opens a short-lived session per operation; do
 // not reuse this on long-lived pooled sessions under expiring roles.
+//
+// Only CREDENTIALS are best-effort. A non-nil error means the session could
+// not be pointed at the right store — a bad BINTRAIL_S3_ENDPOINT, or a SET
+// that would not apply — and the caller must not read: an unrouted session
+// succeeds against AWS instead of failing.
 //
 // Call it after `INSTALL httpfs; LOAD httpfs;` on sessions that will touch
 // s3:// paths.
@@ -167,19 +174,26 @@ func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region strin
 // alone: the aws extension is a download that an air-gapped or proxied host
 // does not get, and that host is a likely S3-compatible-store deployment.
 //
-// With no endpoint configured this does nothing at all, so the AWS path is
-// byte-for-byte what it was: httpfs's own defaults are already correct there.
+// With no endpoint configured this does nothing at all, so an AWS session is
+// left exactly as it was: httpfs's own defaults are already correct there.
+// (The enclosing function can still refuse earlier, for a malformed
+// BINTRAIL_S3_PATH_STYLE, which is a typo worth failing on either way.)
 func applyS3Routing(ctx context.Context, db *sql.DB, region string, ep storage.S3Endpoint) error {
 	if !ep.Set() {
 		return nil
 	}
+	// SET GLOBAL, not SET: a plain SET binds to the CONNECTION that ran it, so
+	// on a *sql.DB pool the next connection reads with s3_endpoint unset and
+	// goes to AWS (measured: a sibling connection sees "" after SET, and the
+	// configured host after SET GLOBAL). Most callers here happen to use one
+	// connection, which is exactly why this would have stayed invisible.
 	stmts := []string{
-		"SET s3_endpoint=" + sqlQuote(ep.Host()),
-		"SET s3_url_style=" + sqlQuote(ep.URLStyle()),
-		fmt.Sprintf("SET s3_use_ssl=%t", ep.UseSSL()),
+		"SET GLOBAL s3_endpoint=" + sqlQuote(ep.Host()),
+		"SET GLOBAL s3_url_style=" + sqlQuote(ep.URLStyle()),
+		fmt.Sprintf("SET GLOBAL s3_use_ssl=%t", ep.UseSSL()),
 	}
 	if region != "" {
-		stmts = append(stmts, "SET s3_region="+sqlQuote(region))
+		stmts = append(stmts, "SET GLOBAL s3_region="+sqlQuote(region))
 	}
 	for _, stmt := range stmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {

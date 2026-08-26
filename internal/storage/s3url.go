@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
-
-	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -55,7 +55,30 @@ func NewS3Client(ctx context.Context, region string) (*s3.Client, error) {
 // bare s3.NewFromConfig would reach MinIO at a virtual-hosted URL and fail on
 // DNS. extra options are applied AFTER the addressing option and win.
 func NewS3ClientFromConfig(cfg aws.Config, extra ...func(*s3.Options)) *s3.Client {
-	return s3.NewFromConfig(cfg, append(S3ClientOptions(cfg), extra...)...)
+	client := s3.NewFromConfig(cfg, append(S3ClientOptions(cfg), extra...)...)
+	warnIfEndpointUnmirrored(client)
+	return client
+}
+
+// warnIfEndpointUnmirrored reports an endpoint the SDK resolved that bintrail
+// could not pass to DuckDB. It reads the CLIENT's endpoint, not the config's:
+// the SDK resolves a service-specific endpoint (AWS_ENDPOINT_URL_S3, or
+// services.<name>.s3.endpoint_url in ~/.aws/config) when the client is built,
+// so cfg.BaseEndpoint is nil for exactly the shape that most needs the
+// warning — S3 alone pointed at a compatible store, uploads landing there
+// while every Parquet read goes to AWS.
+func warnIfEndpointUnmirrored(client *s3.Client) {
+	opts := client.Options()
+	if opts.BaseEndpoint == nil || *opts.BaseEndpoint == "" {
+		return
+	}
+	if ep, err := S3EndpointFromEnv(); err != nil || ep.Set() {
+		return // mirrored, or the caller is about to fail on the config error
+	}
+	// Redacted: this branch is REACHED BY a value bintrail refused, and one of
+	// the refused shapes is a URL carrying credentials. The scheme and host are
+	// what identify the store; the rest is not ours to print.
+	warnUnmirroredEndpoint(redactURL(*opts.BaseEndpoint))
 }
 
 // S3ClientOptions returns the client options bintrail's own endpoint needs.
@@ -84,26 +107,36 @@ func S3ClientOptions(cfg aws.Config) []func(*s3.Options) {
 		endpoint := ep.URL
 		opts = append(opts, func(o *s3.Options) { o.BaseEndpoint = aws.String(endpoint) })
 	}
-	if ep.Set() && (ep.Managed() || ep.PathStyleExplicit()) {
+	// PathStyleExplicit applies with no endpoint of our own too: the SDK has no
+	// shared-config setting for addressing style, so BINTRAIL_S3_PATH_STYLE is
+	// the only lever an operator who configured endpoint_url in ~/.aws/config
+	// has, and dropping it sends uploads to bucket.host and fails on DNS.
+	if ep.Managed() || ep.PathStyleExplicit() {
 		pathStyle := ep.PathStyle
 		opts = append(opts, func(o *s3.Options) { o.UsePathStyle = pathStyle })
-	}
-	if opts == nil && !ep.Set() && cfg.BaseEndpoint != nil && *cfg.BaseEndpoint != "" {
-		// An endpoint only the AWS shared config knows about (endpoint_url in
-		// ~/.aws/config). The SDK half is routed; the DuckDB half cannot be,
-		// because httpfs reads no AWS configuration at all.
-		warnUnmirroredEndpoint(*cfg.BaseEndpoint)
 	}
 	return opts
 }
 
-// warnUnmirroredEndpoint fires once per process: SDK writes reach the store
-// while DuckDB reads go to AWS, and nothing else in the system can notice.
+// redactURL keeps scheme://host and drops everything else, including any
+// userinfo. A value that does not parse is reported as a fixed placeholder
+// rather than echoed.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "(unparseable)"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// warnUnmirroredEndpoint fires once per process for an endpoint the SDK
+// resolved and bintrail could not mirror: SDK writes reach the store while
+// DuckDB reads go to AWS, and nothing else in the system can notice.
 var warnUnmirroredOnce sync.Once
 
 func warnUnmirroredEndpoint(endpoint string) {
 	warnUnmirroredOnce.Do(func() {
-		slog.Warn("S3 endpoint comes from the AWS shared config, which DuckDB cannot read: uploads will reach it while Parquet reads go to AWS; set "+EnvS3Endpoint+" to the same value so both halves agree",
+		slog.Warn("an S3 endpoint is configured for the AWS SDK that bintrail cannot pass to DuckDB (an ~/.aws/config endpoint_url, or a value it cannot parse): uploads will reach it while Parquet reads go to AWS; set "+EnvS3Endpoint+" to the same value so both halves agree",
 			"endpoint", endpoint)
 	})
 }

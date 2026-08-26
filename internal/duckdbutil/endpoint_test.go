@@ -50,7 +50,9 @@ func TestEnableS3CredentialChain_customEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	EnableS3CredentialChain(context.Background(), db)
+	if err := EnableS3CredentialChain(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
 
 	var loaded bool
 	if err := db.QueryRow("SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'aws'").Scan(&loaded); err != nil || !loaded {
@@ -79,15 +81,30 @@ func TestEnableS3CredentialChain_routesWithoutAWSExtension(t *testing.T) {
 	t.Setenv(storage.EnvS3PathStyle, "")
 	t.Setenv(storage.EnvS3Endpoint, "https://s3.wasabisys.com")
 
+	ctx := context.Background()
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := LoadHTTPFS(context.Background(), db); err != nil {
+	if err := LoadHTTPFS(ctx, db); err != nil {
 		t.Skip("httpfs unavailable (offline host)")
 	}
-	if err := EnableS3CredentialChain(context.Background(), db); err != nil {
+	// Hold one connection open ACROSS the call, so the pool must hand the
+	// configure step a different one. Reading back through the held
+	// connection then proves the routing reached the whole pool: a plain SET
+	// binds to the connection that ran it, and every other one goes to AWS.
+	// (An idle pool reuses its single connection, which makes the obvious
+	// version of this test pass either way.)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnableS3CredentialChain(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	for setting, want := range map[string]string{
@@ -96,7 +113,7 @@ func TestEnableS3CredentialChain_routesWithoutAWSExtension(t *testing.T) {
 		"s3_use_ssl":   "true",
 	} {
 		var got string
-		if err := db.QueryRow("SELECT current_setting('" + setting + "')").Scan(&got); err != nil {
+		if err := conn.QueryRowContext(ctx, "SELECT current_setting('"+setting+"')").Scan(&got); err != nil {
 			t.Fatalf("read %s: %v", setting, err)
 		}
 		if got != want {
@@ -104,7 +121,7 @@ func TestEnableS3CredentialChain_routesWithoutAWSExtension(t *testing.T) {
 		}
 	}
 	var n int
-	if err := db.QueryRow("SELECT count(*) FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&n); err != nil || n != 0 {
+	if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&n); err != nil || n != 0 {
 		t.Fatalf("the escape hatch created a secret anyway (n=%d, err=%v)", n, err)
 	}
 }

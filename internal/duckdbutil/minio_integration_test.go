@@ -23,12 +23,25 @@ import (
 // S3-compatible store, the SDK half WRITES through BINTRAIL_S3_ENDPOINT and
 // the DuckDB half READS the same object back through the endpoint-carrying
 // secret. Before the fix the write went to MinIO and the read to
-// s3.amazonaws.com, which is the trap both issues describe. Each half was
-// mutated to check this leg sees red: drop the secret's ENDPOINT clause and
-// the read goes to bintrail-it.s3.us-east-1.amazonaws.com (403); drop
-// BaseEndpoint and the client is not routed at all; force UsePathStyle off and
-// the round trip fails too. What this leg does not cover is the
-// BINTRAIL_S3_PATH_STYLE knob itself, which
+// s3.amazonaws.com, which is the trap both issues describe.
+//
+// Mutations run against THIS revision, so the record does not certify
+// coverage nobody re-checked:
+//
+//	secret loses its ENDPOINT clause (session settings kept)  -> RED
+//	session routing removed (secret keeps ENDPOINT)           -> RED
+//	UsePathStyle forced off                                   -> RED
+//	both SDK endpoint pins removed                            -> RED
+//	either SDK endpoint pin alone removed                     -> green
+//
+// The last row is why both pins exist rather than one: each covers the other
+// here, and they diverge only when AWS_ENDPOINT_URL_S3 is ALSO set, which
+// TestS3Endpoint_bintrailWinsOnBothHalves pins at unit level. The first two
+// rows say the same about the two routing layers: DuckDB's secrets manager
+// takes precedence over a SET, and the SET is what survives a session with no
+// secret at all.
+//
+// Not covered here: the BINTRAIL_S3_PATH_STYLE knob, which
 // TestLoadAWSConfig_customEndpoint pins in both directions.
 //
 // Skips without
@@ -104,7 +117,9 @@ func TestS3Compat_MinIO(t *testing.T) {
 	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		t.Fatalf("httpfs: %v", err)
 	}
-	duckdbutil.EnableS3CredentialChain(ctx, db)
+	if err := duckdbutil.EnableS3CredentialChain(ctx, db); err != nil {
+		t.Fatal(err)
+	}
 	var n int
 	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM read_parquet('s3://"+bucket+"/"+key+"')").Scan(&n); err != nil {
 		t.Fatalf("DuckDB read through the custom endpoint: %v", err)

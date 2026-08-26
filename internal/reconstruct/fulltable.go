@@ -2000,6 +2000,7 @@ func materializeBaselineLocal(ctx context.Context, path string, tuning duckdbuti
 		return "", nil, fmt.Errorf("load httpfs: %w", err)
 	}
 	if err := duckdbutil.EnableS3CredentialChain(ctx, db); err != nil {
+		os.RemoveAll(tmpDir)
 		return "", nil, err
 	}
 	safeSrc := strings.ReplaceAll(path, "'", "''")

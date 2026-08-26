@@ -14,7 +14,8 @@ import (
 // httpfs reads alike) at an S3-compatible store instead of AWS (#1453/#1454).
 const (
 	// EnvS3Endpoint is the store's URL: scheme://host[:port], no path.
-	// Examples: http://minio:9000, https://s3.wasabisys.com. Empty = AWS S3.
+	// Examples: http://minio:9000, https://s3.wasabisys.com. Empty falls back
+	// to the AWS SDK's own endpoint variables below, and then to AWS S3.
 	// This is the variable bintrail owns, and the only one it validates and
 	// applies its own addressing rules to.
 	EnvS3Endpoint = "BINTRAIL_S3_ENDPOINT"
@@ -27,8 +28,10 @@ const (
 )
 
 // awsEndpointEnv are the AWS SDK's OWN endpoint variables. bintrail reads them
-// so the DuckDB half follows an operator who already configured the SDK half
-// (httpfs never looks at them), but it does not police them: the SDK accepts
+// so the DuckDB half follows an operator who already configured the SDK half:
+// httpfs does not look at them (measured against DuckDB v1.5.5 — with
+// AWS_ENDPOINT_URL_S3 set and no session settings, a read still goes to
+// s3.amazonaws.com). It does not police them, though: the SDK accepts
 // values this package cannot parse, and failing every command over one would
 // break a working setup on upgrade. They therefore never carry bintrail's
 // validation, its path-style default, or its region handling.
@@ -126,6 +129,10 @@ func S3EndpointFromEnv() (S3Endpoint, error) {
 				// that divergence is exactly what the operator needs told.
 				slog.Warn("S3 endpoint from the AWS SDK's environment cannot be used for DuckDB reads, which will go to AWS; set "+EnvS3Endpoint+" so both halves agree",
 					"variable", name, "error", err)
+				// break, not continue: the SDK's own precedence puts
+				// AWS_ENDPOINT_URL_S3 above AWS_ENDPOINT_URL, so falling
+				// through to the generic one would point DuckDB at a store
+				// the SDK is not using — the split this all exists to avoid.
 				break
 			}
 			// PathStyle stays false: the SDK addresses virtual-hosted by

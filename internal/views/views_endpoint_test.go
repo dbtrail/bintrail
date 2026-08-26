@@ -20,10 +20,23 @@ func TestGenerate_customEndpointInPreamble(t *testing.T) {
 		"CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, REGION 'us-east-1', ENDPOINT 'minio:9000', URL_STYLE 'path', USE_SSL false);",
 		"-- s3:// paths here live in an S3-compatible store at http://minio:9000, not in AWS.",
 		"--     ENDPOINT 'minio:9000', URL_STYLE 'path', USE_SSL false);",
+		// Outside the secret as well: an interactive DuckDB continues past a
+		// failed statement, so a session whose credential chain resolves
+		// nothing would skip the secret and read AWS.
+		// GLOBAL: a plain SET binds to one connection, so a client that pools
+		// would read the next query with no endpoint and reach AWS.
+		"SET GLOBAL s3_endpoint='minio:9000';",
+		"SET GLOBAL s3_url_style='path';",
+		"SET GLOBAL s3_use_ssl=false;",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q:\n%s", want, out)
 		}
+	}
+	// The routing must precede the secret: a failed CREATE SECRET must not
+	// leave the session unrouted for the statements that follow.
+	if strings.Index(out, "SET GLOBAL s3_endpoint=") > strings.Index(out, "CREATE OR REPLACE SECRET") {
+		t.Errorf("routing is emitted after the secret:\n%s", out)
 	}
 	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "--") {

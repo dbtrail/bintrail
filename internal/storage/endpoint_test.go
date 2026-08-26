@@ -3,8 +3,13 @@ package storage
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 // isolateAWSEnv keeps the operator's real ~/.aws files and env out of a test
@@ -236,6 +241,24 @@ func TestS3Endpoint_bintrailWinsOnBothHalves(t *testing.T) {
 	}
 }
 
+// TestS3ClientOptions_pathStyleWithoutOurEndpoint: the AWS SDK has no
+// shared-config setting for addressing style, so BINTRAIL_S3_PATH_STYLE is the
+// only lever for an operator who configured endpoint_url in ~/.aws/config.
+// Dropping it there sends uploads to bucket.host and fails on DNS, with a
+// diagnostic that points at DNS rather than at the ignored variable.
+func TestS3ClientOptions_pathStyleWithoutOurEndpoint(t *testing.T) {
+	isolateAWSEnv(t)
+	t.Setenv(EnvS3PathStyle, "true")
+
+	cfg, err := LoadAWSConfig(context.Background(), "us-east-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts := NewS3ClientFromConfig(cfg).Options(); !opts.UsePathStyle {
+		t.Fatal("BINTRAIL_S3_PATH_STYLE=true was dropped for an endpoint bintrail did not resolve itself")
+	}
+}
+
 // Without an endpoint nothing changes: no BaseEndpoint, no path style, and an
 // explicit region is kept.
 func TestLoadAWSConfig_awsUnchanged(t *testing.T) {
@@ -252,6 +275,40 @@ func TestLoadAWSConfig_awsUnchanged(t *testing.T) {
 	}
 	if opts := NewS3ClientFromConfig(cfg).Options(); opts.UsePathStyle {
 		t.Fatal("path style must stay off for AWS")
+	}
+}
+
+// TestNewS3ClientFromConfig_warnsOnUnmirroredEndpoint: the SDK resolves a
+// service-specific endpoint when the CLIENT is built, so cfg.BaseEndpoint is
+// nil for exactly the shape that most needs the warning. Reading the client's
+// own endpoint is what makes the check see it.
+func TestNewS3ClientFromConfig_warnsOnUnmirroredEndpoint(t *testing.T) {
+	isolateAWSEnv(t)
+	// Written straight into the config: the point is that a client carrying an
+	// endpoint bintrail did not resolve is detected, whatever put it there.
+	cfg, err := LoadAWSConfig(context.Background(), "us-east-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logged strings.Builder
+	restore := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	defer slog.SetDefault(restore)
+	warnUnmirroredOnce = sync.Once{}
+
+	// A URL carrying credentials is REACHABLE here, and is why the value is
+	// redacted: bintrail refuses that shape, which is what leaves the endpoint
+	// unmirrored and lands execution in this very branch.
+	NewS3ClientFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String("http://accesskey:supersecret@minio.svc:9000")
+	})
+
+	out := logged.String()
+	if !strings.Contains(out, "minio.svc:9000") {
+		t.Errorf("no warning for an endpoint DuckDB will not follow: %s", out)
+	}
+	if strings.Contains(out, "supersecret") || strings.Contains(out, "accesskey") {
+		t.Errorf("the warning echoes credentials from the endpoint: %s", out)
 	}
 }
 

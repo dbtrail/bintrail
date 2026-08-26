@@ -208,6 +208,18 @@ func writeS3Preamble(b *strings.Builder, region string, ep storage.S3Endpoint) {
 	}
 	b.WriteString("INSTALL httpfs; LOAD httpfs;\n")
 	b.WriteString("INSTALL aws; LOAD aws;\n")
+	if ep.Set() {
+		// Ahead of the secret, and not only inside it: an interactive DuckDB
+		// CONTINUES past a failed statement, so a session where the credential
+		// chain resolves nothing (an offline laptop, expired SSO, no aws
+		// extension) would skip the secret and read AWS with whatever ambient
+		// keys it finds — the same hole the daemon's own routing closes. The
+		// two mechanisms are independent: a secret's ENDPOINT does not set
+		// these, and these do not populate the secret.
+		fmt.Fprintf(b, "SET GLOBAL s3_endpoint=%s;\n", sqlString(ep.Host()))
+		fmt.Fprintf(b, "SET GLOBAL s3_url_style=%s;\n", sqlString(ep.URLStyle()))
+		fmt.Fprintf(b, "SET GLOBAL s3_use_ssl=%t;\n", ep.UseSSL())
+	}
 	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain" +
 		duckdbutil.S3SecretClauses(region, ep) + ");\n"
 	b.WriteString(secret)
