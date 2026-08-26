@@ -338,3 +338,38 @@ func TestReportDispatch_visibleOnlyWhenSomethingWasSkipped(t *testing.T) {
 		}
 	}
 }
+
+// TestRunRefresh_doesNotAdviseTuningWhenNothingWasPublished reaches the CALL
+// SITE, which is the whole point: the previous version of this guard drove
+// reportRefreshDuration with hand-written durations and so could not see that
+// the call site invoked it unconditionally, including for runs that refused.
+// That is the same shape this PR indicts one function over.
+//
+// The interval is one nanosecond, so any real elapsed time exceeds it. An
+// unconditional call therefore WARNS here, and the warning would tell an
+// operator to raise the interval for a refresh that failed because it had no
+// baseline to fold.
+func TestRunRefresh_doesNotAdviseTuningWhenNothingWasPublished(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
+	sup.refreshes["s"] = &console.BaselineStatus{State: "running"}
+
+	// An empty baseline dir makes executeRefresh refuse: nothing to fold.
+	sup.runRefresh(refreshRequest{ServerID: "s", ServerName: "s", IndexDSN: "d", BaselineDir: t.TempDir()},
+		time.Now().UTC(), time.Nanosecond)
+
+	out := buf.String()
+	if !strings.Contains(out, "published nothing") {
+		t.Fatalf("the refusal itself was not reported, so this test is not exercising the path it claims: %q", out)
+	}
+	if strings.Contains(out, "took longer than the configured interval") {
+		t.Errorf("a refresh that published nothing was given scheduling advice; the capture gap or schema "+
+			"change that stopped it is not fixed by raising the interval: %q", out)
+	}
+}

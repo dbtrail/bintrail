@@ -76,12 +76,19 @@ func (s *baselineSupervisor) busyLocked(serverID string) bool {
 
 func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interval time.Duration) {
 	started := time.Now().UTC()
+	// Separate capture for the ELAPSED time, and the duplication is not
+	// redundant: t.UTC() strips the monotonic reading, so time.Since(started)
+	// would subtract wall clocks. A daemon whose folds run for minutes to
+	// hours is exactly where an NTP step lands mid-measurement, and it would
+	// move the number this change exists to get right, in either direction.
+	// started stays for the RFC3339 stamp, which wants the wall clock.
+	elapsed := time.Now()
 	tables, refused, err := s.executeRefresh(req, at)
 	// Measured HERE, on the far side of the `go` in TriggerRefresh, because
 	// this is where the fold actually happens. Timing the dispatch loop
 	// instead measures how long it takes to spawn a goroutine, which is
 	// microseconds no matter what the refresh costs.
-	reportRefreshDuration(req.ServerName, interval, time.Since(started))
+	took := time.Since(elapsed)
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRefresh, StartedAt: started.Format(time.RFC3339),
 		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused,
@@ -100,6 +107,14 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	if err != nil {
 		st.State = "failed"
 		st.LastError = err.Error()
+		// Deliberately NO duration report here. reportRefreshDuration's advice
+		// is "raise the interval, or refresh fewer tables", which is the wrong
+		// remediation for a run that published nothing: a capture gap, a
+		// schema change or a shutdown mid-fold are not fixed by scheduling.
+		// The fan-out runs every table to completion before it reports a
+		// refusal, so a refusal costs about what a success costs and WOULD
+		// trip the overrun threshold, printing tuning advice above the actual
+		// cause.
 		// Warn, never Error: a refusal is the fail-closed contract working, and
 		// the next tick retries. Nothing about the daemon is unhealthy.
 		slog.Warn("baseline refresh: published nothing", "server", req.ServerName, "id", req.ServerID,
@@ -109,6 +124,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	st.State = "succeeded"
 	st.LastError = ""
 	slog.Info("baseline refresh: published", "server", req.ServerName, "id", req.ServerID, "tables", tables)
+	reportRefreshDuration(req.ServerName, interval, took)
 }
 
 // executeRefresh folds the newest snapshot forward. Returns the table count and
@@ -235,8 +251,11 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 // ParseInterval accepts. An overrun warning built on that span is unreachable
 // code, and the reassuring line beside it is false.
 //
-// Fires once per completed refresh, so a loop that is permanently behind says
-// so once per fold rather than once per tick.
+// Fires once per PUBLISHED refresh. Not per completed one: a run that refused
+// costs about what a success costs, because the fan-out runs every table to
+// completion before it reports the refusal, so reporting an overrun for it
+// would put "raise the interval" above the capture gap that actually stopped
+// it. And not per tick: a tick only dispatches.
 //
 // The duration is also the honest measure of what a full rewrite costs on real
 // data: every refresh rewrites each table in full, however little of it
@@ -347,8 +366,10 @@ func reportDispatch(interval time.Duration, dispatched, skipped int) {
 		slog.Debug("baseline refresh: dispatched", "servers", dispatched, "interval", interval)
 		return
 	}
-	slog.Info("baseline refresh: a server was still busy with its previous refresh, so this tick did not start "+
-		"one for it. Refreshes cannot run more often than they take; the interval is a request, not a schedule.",
+	slog.Info("baseline refresh: a server was still busy with another baseline job, so this tick did not start "+
+		"a refresh for it. That job is a refresh still folding, a manual dump, a restore or a SQL export: they "+
+		"share one lock per server. If it is the previous refresh, the interval is shorter than a refresh "+
+		"takes, and that refresh logs its own duration when it lands.",
 		"dispatched", dispatched, "skipped", skipped, "interval", interval)
 }
 
