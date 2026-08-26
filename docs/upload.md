@@ -144,8 +144,10 @@ Notes:
   region defaults to `us-east-1`; S3-compatible stores accept any. An
   endpoint the SDK resolved keeps the SDK's own region resolution.
 - An invalid `BINTRAIL_S3_ENDPOINT` (no scheme, a path, credentials in the
-  URL) fails the command, on the SDK paths and the DuckDB ones alike. It never
-  falls back to AWS: with uploads going to your store and reads going to an
+  URL) fails any command that reads or writes S3, on the SDK paths and the
+  DuckDB ones alike. A command whose data is entirely local is not refused
+  over a setting it never reads, so `bintrail views` over local archives
+  still renders. It never falls back to AWS: with uploads going to your store and reads going to an
   AWS bucket of the same name, a baseline that exists reads as missing, which
   is worse than an error. A value bintrail cannot parse in one of the AWS SDK
   variables is not fatal (the SDK may well accept it); it is logged, and only
