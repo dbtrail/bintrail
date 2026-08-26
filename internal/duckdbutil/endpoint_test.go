@@ -237,3 +237,48 @@ func TestEnableS3CredentialChain_invalidEndpointIsAnError(t *testing.T) {
 		t.Fatalf("a secret was created over an invalid endpoint (n=%d, err=%v)", n, err)
 	}
 }
+
+// TestEnableS3CredentialChainRegion_regionReachesTheSessionWithoutSecret runs
+// the region statement against a real DuckDB, which nothing else does: the
+// only other region test pins no endpoint, so its statement list is empty and
+// the SET never executes. That matters twice over. In this process an invalid
+// statement is a returned error, and in the downloadable views.sql it is worse:
+// `duckdb -init views.sql` ABORTS the file at the first failure, so a
+// mis-rendered SET would take the view definitions down with it.
+//
+// The escape hatch is on, so the secret is skipped and the settings are the
+// only thing carrying the region. That is the deployment this setting exists
+// for, and the one where a store that validates the signing region rejects
+// what an unpinned session sends.
+func TestEnableS3CredentialChainRegion_regionReachesTheSessionWithoutSecret(t *testing.T) {
+	t.Setenv("BINTRAIL_DUCKDB_NO_AWS_EXT", "1")
+	t.Setenv(storage.EnvS3PathStyle, "")
+	t.Setenv(storage.EnvS3Endpoint, "http://minio:9000")
+
+	ctx := context.Background()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := LoadHTTPFS(ctx, db); err != nil {
+		t.Skip("httpfs unavailable (offline host)")
+	}
+	if err := EnableS3CredentialChainRegion(ctx, db, "eu-central-1"); err != nil {
+		t.Fatalf("the region statement was rejected by DuckDB: %v", err)
+	}
+
+	var got string
+	if err := db.QueryRowContext(ctx, "SELECT current_setting('s3_region')").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "eu-central-1" {
+		t.Errorf("s3_region = %q: requests would be signed for the wrong region", got)
+	}
+	// Positive evidence that the secret really was skipped, so the assertion
+	// above is about the settings and not about a secret quietly doing the work.
+	var n int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM duckdb_secrets() WHERE name = 'bintrail_s3_chain'").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a secret exists, so this proves nothing about the settings (n=%d, err=%v)", n, err)
+	}
+}
