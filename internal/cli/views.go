@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -174,6 +175,13 @@ func discoverArchiveSources(ctx context.Context, dsn string) ([]string, error) {
 		return nil, fmt.Errorf("connect to index DB: %w", err)
 	}
 	defer db.Close()
+	return discoverArchiveSourcesFrom(ctx, db)
+}
+
+// discoverArchiveSourcesFrom is the DB-taking half, split out so the routing
+// choice (portable, not local-first) is pinned by a test on THIS surface: the
+// console half has its own, and a revert here would otherwise ship unnoticed.
+func discoverArchiveSourcesFrom(ctx context.Context, db *sql.DB) ([]string, error) {
 	sources, err := query.PortableArchiveSources(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("resolve archive sources from archive_state: %w", err)

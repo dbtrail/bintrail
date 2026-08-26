@@ -45,7 +45,11 @@ func TestPortableArchiveSources(t *testing.T) {
 		// (3) S3 only (local pruned and the row's local_path NULL): S3.
 		AddRow("s3-only", nil, "bkt", "events/bintrail_id=s3-only/f.parquet").
 		// (4) neither parseable: contributes nothing, as in ResolveArchiveSources.
-		AddRow("empty", nil, nil, nil))
+		AddRow("empty", nil, nil, nil).
+		// (5) S3 columns present but the key has no bintrail_id= segment (an
+		// `upload --source` pointed below that directory): no S3 root can be
+		// built, so the local base is listed, with a warning, never omitted.
+		AddRow("odd-key", filepath.Join(dir, "bintrail_id=odd-key", "events.parquet"), "bkt", "events/no-id-segment/f.parquet"))
 
 	got, rerr := PortableArchiveSources(context.Background(), db)
 	if rerr != nil {
@@ -55,6 +59,7 @@ func TestPortableArchiveSources(t *testing.T) {
 		"s3://bkt/events/bintrail_id=with-data",
 		localOnly,
 		"s3://bkt/events/bintrail_id=s3-only",
+		filepath.Join(dir, "bintrail_id=odd-key"),
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d sources %v, want %d %v", len(got), got, len(want), want)

@@ -3858,7 +3858,8 @@ async function runSQL(sql, ui) {
     }
     const data = JSON.parse(text);
     statusLine.textContent = data.row_count + " row" + (data.row_count === 1 ? "" : "s") +
-      " in " + data.elapsed_ms + " ms" + (data.truncated ? " (truncated)" : "");
+      " in " + data.elapsed_ms + " ms" + (data.truncated ? " (truncated)" : "") +
+      ((data.warnings && data.warnings.length) ? ". " + data.warnings.join(". ") : "");
     renderSQLResult(results, data);
   } catch (err) {
     if (err && err.name === "AbortError") { statusLine.textContent = "canceled"; return; }

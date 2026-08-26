@@ -138,7 +138,15 @@ type sqlPanelResult struct {
 	// result short — never silently.
 	Truncated bool  `json:"truncated"`
 	ElapsedMS int64 `json:"elapsed_ms"`
+	// Warnings carry what the session is missing and why (#1456): a query
+	// that succeeded against half a layout must say so next to its rows.
+	Warnings []string `json:"warnings,omitempty"`
 }
+
+// sqlPanelRegistryNote is the panel's wording for a session built without the
+// events view because archive_state could not be read. The error text stays
+// in the console log: it names the index host and the DB user.
+const sqlPanelRegistryNote = "the archive registry (archive_state) could not be read, so this session has no events view; the console log has the error"
 
 // handleSQLPanel serves POST /api/sql.
 func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
@@ -205,18 +213,14 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
-	case in.ArchiveDiscoveryFailed:
-		// The download can carry this in its header; the panel has no header,
-		// and a session missing the `events` view it advertises would turn
-		// every query on it into a catalog error blamed on the operator's
-		// SQL. Refuse with the cause instead. The error text stays on the
-		// console side (log + this body), never in a shareable file.
-		writeJSONError(w, http.StatusBadGateway,
-			"the archive registry (archive_state) could not be read, so the events view cannot be built; "+
-				"the console log has the error")
-		return
 	}
 
+	// A session built over half the layout (baseline views, no events view,
+	// because archive_state could not be read) is still worth serving: a
+	// state_* query is fully answerable. What it must not do is stay quiet
+	// about it, in either direction: a success carries the note as a warning,
+	// and a failure carries it ahead of the engine's message, so "table
+	// events does not exist" is not read as a typo in the operator's SQL.
 	res, err := runSandboxedSQL(r.Context(), in, req.SQL)
 	if err != nil {
 		var ue *sqlUserError
@@ -227,8 +231,12 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 			// policy event — stays off the audit seam.
 			return
 		case errors.As(err, &ue):
-			recordSQLRun(r, req.SQL, "refused", ue.msg, 0, false)
-			writeJSONError(w, http.StatusUnprocessableEntity, ue.msg)
+			msg := ue.msg
+			if in.ArchiveDiscoveryFailed {
+				msg = sqlPanelRegistryNote + ". " + msg
+			}
+			recordSQLRun(r, req.SQL, "refused", msg, 0, false)
+			writeJSONError(w, http.StatusUnprocessableEntity, msg)
 		default:
 			recordSQLRun(r, req.SQL, "error", err.Error(), 0, false)
 			writeJSONError(w, http.StatusBadGateway, err.Error())
@@ -236,6 +244,9 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if in.ArchiveDiscoveryFailed {
+		res.Warnings = append(res.Warnings, sqlPanelRegistryNote)
+	}
 	recordSQLRun(r, req.SQL, "ok", "", res.RowCount, res.Truncated)
 	writeJSON(w, http.StatusOK, res)
 }

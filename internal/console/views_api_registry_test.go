@@ -11,12 +11,14 @@ import (
 	"github.com/go-sql-driver/mysql"
 )
 
-// TestViewsAvailable_liveRegistryLocalOnly closes the gap the first review
-// pass found: every existing TestViewsAvailable case returns before the
-// registry read, so the gate and the handler agreeing on a local-only source
-// was asserted by a comment. This case has a live registry, no baseline, and
-// one local-only archive: the gate must say yes, because the handler serves it.
-func TestViewsAvailable_liveRegistryLocalOnly(t *testing.T) {
+// TestViewsAvailable_readsTheRegistry: every other TestViewsAvailable case
+// returns before the registry read, so this is the one that executes it: a
+// live registry, no baseline, one local-only archive; the gate must say yes
+// and the handler must serve it. It does NOT pin which routing the gate uses
+// (a local-only row resolves the same under both); that the two routings
+// agree on the count, which is what lets the gate and the handler differ, is
+// pinned by TestArchiveRoutingsAgreeOnCount in internal/query.
+func TestViewsAvailable_readsTheRegistry(t *testing.T) {
 	dir := t.TempDir()
 	localBase := filepath.Join(dir, "bintrail_id=only-local")
 	if err := os.MkdirAll(filepath.Join(localBase, "event_date=2026-06-05", "event_hour=10"), 0o755); err != nil {

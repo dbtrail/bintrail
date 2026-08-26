@@ -9,27 +9,40 @@ import (
 )
 
 // TestSQLPanel_registryReadFailure: with a baseline present and the archive
-// registry unreadable, the panel would otherwise open a session without the
-// events view it advertises, and every query on it would fail as a catalog
-// error blamed on the operator's SQL. It refuses with the cause instead.
+// registry unreadable, the panel still serves the half it can build (a state_*
+// query is fully answerable) but never quietly: a success carries the note as
+// a warning, and a failure on the missing events view carries it ahead of the
+// engine's message, so it is not read as a typo in the operator's SQL.
 func TestSQLPanel_registryReadFailure(t *testing.T) {
-	dir := t.TempDir()
-	writeBaselineFixture(t, dir, "2026-06-10T12-00-00Z", "shop", "orders.parquet")
+	dir, _ := writeSQLPanelBaseline(t) // a REAL Parquet: the session opens the state views
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	mock.ExpectQuery("FROM archive_state").WillReturnError(
-		&mysql.MySQLError{Number: 1142, Message: "SELECT command denied"})
-
+	for range 2 {
+		mock.ExpectQuery("FROM archive_state").WillReturnError(
+			&mysql.MySQLError{Number: 1142, Message: "SELECT command denied"})
+	}
 	srv := newSQLPanelServer(t, dir, true)
 	srv.cm.boot.db = db
+
 	rec, body := doServersReq(t, srv, "POST", "/api/sql", `{"sql":"SELECT 1"}`)
-	if rec.Code != 502 {
-		t.Fatalf("code = %d, body = %s; want 502", rec.Code, body)
+	if rec.Code != 200 {
+		t.Fatalf("state-only query: code = %d, body = %s; want 200", rec.Code, body)
+	}
+	if !strings.Contains(string(body), `"warnings":[`) || !strings.Contains(string(body), "archive_state") {
+		t.Errorf("success does not warn about the missing events view: %s", body)
+	}
+	if strings.Contains(string(body), "SELECT command denied") {
+		t.Errorf("raw registry error reached the client: %s", body)
+	}
+
+	rec, body = doServersReq(t, srv, "POST", "/api/sql", `{"sql":"SELECT count(*) FROM events"}`)
+	if rec.Code == 200 {
+		t.Fatalf("a query on the missing events view succeeded: %s", body)
 	}
 	if !strings.Contains(string(body), "archive_state") {
-		t.Errorf("refusal does not name the registry: %s", body)
+		t.Errorf("failure does not name the cause ahead of the engine message: %s", body)
 	}
 }
