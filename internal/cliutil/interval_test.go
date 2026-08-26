@@ -24,6 +24,14 @@ var badDurations = []string{
 	"30 0d", // embedded space; Sscanf silently truncated to 30d (#817)
 	"7dd",   // trailing garbage before unit
 	" 7d",   // leading whitespace
+	// Overflow. time.Duration is an int64 of nanoseconds and the multiply
+	// wraps silently, so these are not merely "too big": unchecked, the first
+	// parsed as a valid 40s and the second as a plausible-looking 1h40m. A
+	// wrapped interval drives a ticker below the floor this package sets, and
+	// a wrapped --retain drops partitions early. Both must be refusals.
+	"384307168202282326m",
+	"153722867280913d",
+	"9223372036854775807d",
 }
 
 func TestParseInterval_valid(t *testing.T) {

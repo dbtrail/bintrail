@@ -2,6 +2,7 @@ package consoleapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -28,7 +29,7 @@ type refreshRequest struct {
 // is being written underneath it. ErrBaselineRunning here means "something else
 // is already producing this server's baseline" — the loop skips this tick and
 // tries again at the next one, which is exactly right for a periodic job.
-func (s *baselineSupervisor) TriggerRefresh(req refreshRequest) error {
+func (s *baselineSupervisor) TriggerRefresh(req refreshRequest, interval time.Duration) error {
 	s.mu.Lock()
 	if s.busyLocked(req.ServerID) {
 		s.mu.Unlock()
@@ -40,7 +41,7 @@ func (s *baselineSupervisor) TriggerRefresh(req refreshRequest) error {
 	s.mu.Unlock()
 
 	slog.Info("baseline refresh: starting", "server", req.ServerName, "id", req.ServerID)
-	go s.runRefresh(req, at)
+	go s.runRefresh(req, at, interval)
 	return nil
 }
 
@@ -73,9 +74,14 @@ func (s *baselineSupervisor) busyLocked(serverID string) bool {
 	return false
 }
 
-func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time) {
+func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interval time.Duration) {
 	started := time.Now().UTC()
 	tables, refused, err := s.executeRefresh(req, at)
+	// Measured HERE, on the far side of the `go` in TriggerRefresh, because
+	// this is where the fold actually happens. Timing the dispatch loop
+	// instead measures how long it takes to spawn a goroutine, which is
+	// microseconds no matter what the refresh costs.
+	reportRefreshDuration(req.ServerName, interval, time.Since(started))
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRefresh, StartedAt: started.Format(time.RFC3339),
 		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused,
@@ -201,7 +207,7 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 	// behalf.
 	slog.Warn("baseline refresh: snapshots from this loop are written locally and never uploaded, so retention "+
 		"cannot reclaim them (a prune needs a confirmed S3 copy of the snapshot). Upload and prune on your own "+
-		"schedule, or size the disk for the rate below.",
+		"schedule, or size the disk for one full-table snapshot per server per interval, at the rate below.",
 		diskArgs(interval, targets)...)
 	go func() {
 		t := time.NewTicker(interval)
@@ -211,38 +217,41 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				started := time.Now()
-				runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir)
-				reportRefreshCycleDuration(interval, time.Since(started))
+				dispatched, skipped := runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir, interval)
+				reportDispatch(interval, dispatched, skipped)
 			}
 		}
 	}()
 	return nil
 }
 
-// reportRefreshCycleDuration states how long a cycle took, and says so plainly
+// reportRefreshDuration states how long ONE server's refresh took, and says so
 // when it took longer than the interval that was asked for.
 //
-// A time.Ticker drops ticks rather than queueing them, so an overrun does not
-// pile cycles up — it silently widens the interval instead. Without this the
-// only symptom is that snapshots appear less often than configured, which
-// reads as a broken flag rather than as the refresh costing more than the
-// budget it was given.
+// This is per refresh rather than per tick, and that is the whole correction:
+// a tick only DISPATCHES. TriggerRefresh ends in `go s.runRefresh(...)` and
+// returns, so anything timed around the dispatch loop measures goroutine
+// launch, is always microseconds, and can never exceed any interval
+// ParseInterval accepts. An overrun warning built on that span is unreachable
+// code, and the reassuring line beside it is false.
 //
-// It is also the measurement that sizes the real problem. Every cycle rewrites
-// each table in full, however little of it changed, so a cycle's duration is
-// write amplification expressed in the unit an operator can act on. An
-// estimate of that cost is a guess about someone else's data; this is theirs.
-func reportRefreshCycleDuration(interval, took time.Duration) {
-	if took <= interval {
-		slog.Info("baseline refresh cycle finished", "took", took, "interval", interval)
+// Fires once per completed refresh, so a loop that is permanently behind says
+// so once per fold rather than once per tick.
+//
+// The duration is also the honest measure of what a full rewrite costs on real
+// data: every refresh rewrites each table in full, however little of it
+// changed. An estimate of that is a guess about someone else's data; this is
+// theirs.
+func reportRefreshDuration(server string, interval, took time.Duration) {
+	if interval <= 0 || took <= interval {
+		slog.Debug("baseline refresh finished", "server", server, "took", took, "interval", interval)
 		return
 	}
-	slog.Warn("baseline refresh: the cycle took longer than the configured interval, so refreshes cannot run as "+
-		"often as requested (ticks are dropped, not queued). Each cycle rewrites every table in full regardless "+
-		"of how much changed, so this is the cost of the rewrite, not of the schedule. Raise the interval to "+
-		"match, or narrow the refresh to fewer tables.",
-		"took", took, "interval", interval)
+	slog.Warn("baseline refresh: this server's refresh took longer than the configured interval, so it cannot "+
+		"run as often as requested. Every refresh rewrites each table in full regardless of how much changed, "+
+		"so this is the cost of the rewrite, not of the schedule. Raise the interval to match, or refresh "+
+		"fewer tables.",
+		"server", server, "took", took, "interval", interval)
 }
 
 // diskArgs builds the disk warning's attributes, omitting the projection when
@@ -250,7 +259,7 @@ func reportRefreshCycleDuration(interval, took time.Duration) {
 func diskArgs(interval time.Duration, targets []refreshRequest) []any {
 	args := []any{"interval", interval}
 	if n := snapshotsPer30Days(interval); n > 0 {
-		args = append(args, "full_table_snapshots_per_30d", n)
+		args = append(args, "full_table_snapshots_per_server_per_30d", n)
 	}
 	return append(args, "dirs", refreshTargetDirs(targets))
 }
@@ -261,8 +270,13 @@ func diskArgs(interval time.Duration, targets []refreshRequest) []any {
 // The warning has said "one snapshot per interval, forever" since the interval
 // floor was an hour, where the reader could do the arithmetic and the answer
 // was 24 a day. Minutes make that a much worse number and a much easier one to
-// skip over: "every 5m" and "8,640 a month, none of them reclaimable" are the
-// same fact and land differently.
+// skip over: "every 5m" and "8,640 a month per server, none of them
+// reclaimable" are the same fact and land differently.
+//
+// Per SERVER, and the attribute name says so: a tick triggers one refresh for
+// every eligible server, so a deployment monitoring several multiplies this.
+// Named rather than multiplied because the target set is recomputed every
+// tick, so a count fixed at startup would go stale.
 //
 // Thirty days rather than one, because the warning is about DISK and disk
 // fills over weeks. A per-DAY projection also divides to zero for any interval
@@ -289,23 +303,53 @@ func snapshotsPer30Days(interval time.Duration) int64 {
 // is establishing replication and opening its console would make every restart
 // the most expensive moment in the process's life.
 func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *baselineSupervisor,
-	globalDSN, globalBaselineDir string) {
+	globalDSN, globalBaselineDir string, interval time.Duration) (dispatched, skipped int) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("baseline refresh cycle panicked; refreshes continue next tick", "panic", r)
 		}
 	}()
 	if ctx.Err() != nil {
-		return
+		return dispatched, skipped
 	}
 	for _, req := range baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir) {
-		if err := sup.TriggerRefresh(req); err != nil {
-			// The only expected error is "already running" — a long refresh
-			// overlapping the next tick, or a manual dump in flight. Both are
-			// handled by simply waiting for the next tick.
-			slog.Debug("baseline refresh skipped this tick", "server", req.ServerName, "reason", err)
+		switch err := sup.TriggerRefresh(req, interval); {
+		case err == nil:
+			dispatched++
+		case errors.Is(err, console.ErrBaselineRunning):
+			// Expected: a refresh still folding, or a manual dump in flight.
+			// Counted rather than only logged, because at a short interval this
+			// stops being an edge case and becomes the steady state — it is the
+			// evidence that the interval is shorter than a refresh takes, and
+			// the caller needs the number to say so.
+			skipped++
+		default:
+			// Nothing else is expected today. If that changes, it must not
+			// become invisible: this used to swallow every error at Debug,
+			// below the console binary's default level.
+			slog.Warn("baseline refresh: could not start", "server", req.ServerName, "error", err)
 		}
 	}
+	return dispatched, skipped
+}
+
+// reportDispatch reports what a tick actually did, which is dispatch and
+// nothing more.
+//
+// Quiet at Debug while every server started, because a healthy loop at a short
+// interval would otherwise emit a line a minute forever. Visible as soon as
+// anything was skipped, because a skip is the ONLY loop-level evidence that
+// refreshes are not keeping up, and it was previously logged at Debug where the
+// default level hides it. reportRefreshDuration carries the matching per-server
+// detail when the slow refresh eventually lands.
+func reportDispatch(interval time.Duration, dispatched, skipped int) {
+	if skipped == 0 {
+		slog.Debug("baseline refresh: dispatched", "servers", dispatched, "interval", interval)
+		return
+	}
+	slog.Info("baseline refresh: a server was still busy with its previous refresh, so this tick did not start "+
+		"one for it. Refreshes cannot run more often than they take; the interval is a request, not a schedule.",
+		"dispatched", dispatched, "skipped", skipped, "interval", interval)
 }
 
 // refreshTargetDirs lists the directories that will grow, for the retention

@@ -2,6 +2,7 @@ package cliutil
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 )
@@ -11,12 +12,18 @@ import (
 // number must be a positive integer.
 //
 // Separate from ParseRetain on purpose, and the separation is the point.
-// ParseRetain's callers are retention and lookback WINDOWS (--retain,
-// --lookback, --buffer-retain): there, accepting "5m" would mean dropping
-// partitions almost as fast as they are written, so its unit set staying at
-// hours and days is a guardrail rather than an oversight. An INTERVAL answers
-// a different question — how often does this loop run — and minutes are an
-// ordinary answer to it.
+// MOST of ParseRetain's callers are retention and lookback WINDOWS (--retain,
+// --rotate-retain, --lookback, --buffer-retain). For the two retain flags,
+// accepting "5m" would mean dropping partitions almost as fast as they are
+// written, so the unit set staying at hours and days is a guardrail rather
+// than an oversight. An INTERVAL answers a different question — how often does
+// this loop run — and minutes are an ordinary answer to it.
+//
+// Not every ParseRetain caller is a window, and the exception is worth naming
+// so the next reader does not have to rediscover it: --verify-interval
+// (consoleapp/watch.go) is an interval still parsed by ParseRetain, so it
+// rejects minutes today. That is an oversight rather than a guardrail, but
+// widening it changes that flag's behaviour and belongs in its own change.
 //
 // Both go through parseUnitDuration so the two can differ in the only way they
 // should (which units they accept) and cannot drift in the way that would be a
@@ -64,9 +71,21 @@ func parseUnitDuration(s string, units []unitDuration, expected, useUnits string
 		return 0, fmt.Errorf("invalid format %q; %s", s, expected)
 	}
 	for _, u := range units {
-		if u.suffix == unit {
-			return time.Duration(n) * u.span, nil
+		if u.suffix != unit {
+			continue
 		}
+		// Bounds check BEFORE the multiply. time.Duration is an int64 count of
+		// nanoseconds and the product wraps silently, so a large enough N does
+		// not overflow into an error: it yields a SMALL POSITIVE duration that
+		// every downstream positivity guard accepts. Measured on the unchecked
+		// version: "384307168202282326m" parsed cleanly as 40s, which would
+		// have driven a ticker below the one-minute floor this file exists to
+		// establish, and a wrapped --retain would drop partitions early.
+		if int64(n) > int64(math.MaxInt64/u.span) {
+			return 0, fmt.Errorf("value %q is out of range; the maximum is %d%c", s,
+				int64(math.MaxInt64/u.span), u.suffix)
+		}
+		return time.Duration(n) * u.span, nil
 	}
 	return 0, fmt.Errorf("invalid unit %q in %q; %s", unit, s, useUnits)
 }
