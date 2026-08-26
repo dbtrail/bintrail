@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and otherwise left to the SDK, so an environment already configured for the
   AWS CLI keeps its behavior; an endpoint set only in `~/.aws/config` routes
   the SDK half alone and now warns, since DuckDB reads no AWS configuration.
-  An invalid `BINTRAIL_S3_ENDPOINT` fails the command instead of falling back
-  to AWS, on the baseline read paths too. Routing is applied with `SET GLOBAL`
+  An invalid `BINTRAIL_S3_ENDPOINT` fails any command that reads or writes S3,
+  instead of falling back to AWS, on the baseline read paths too; a command
+  whose data is entirely local is not refused over a setting it never reads. Routing is applied with `SET GLOBAL`
   rather than only inside the credentials secret, so it survives an air-gapped
   host where the `aws` extension cannot be installed, and it reaches every
   connection of a pool rather than the one that ran it. The
