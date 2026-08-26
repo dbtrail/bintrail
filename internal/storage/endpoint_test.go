@@ -63,6 +63,15 @@ func TestS3EndpointFromEnv(t *testing.T) {
 			wantHost: "minio:9000",
 		},
 		{
+			// The standard SDK pattern: a generic endpoint plus a
+			// service-specific override. The service-specific one wins there,
+			// so it must win here or the two halves split.
+			name:     "the service-specific AWS variable wins over the generic one",
+			env:      map[string]string{"AWS_ENDPOINT_URL": "http://generic:1", "AWS_ENDPOINT_URL_S3": "http://s3-specific:2"},
+			want:     S3Endpoint{URL: "http://s3-specific:2", Source: "AWS_ENDPOINT_URL_S3"},
+			wantHost: "s3-specific:2",
+		},
+		{
 			name:     "BINTRAIL_S3_ENDPOINT wins over the SDK variable",
 			env:      map[string]string{EnvS3Endpoint: "http://minio:9000", "AWS_ENDPOINT_URL_S3": "http://other:1"},
 			want:     S3Endpoint{URL: "http://minio:9000", PathStyle: true, Source: EnvS3Endpoint},
@@ -124,6 +133,12 @@ func TestS3EndpointFromEnv(t *testing.T) {
 // style, which no SDK environment variable can set.
 func TestLoadAWSConfig_customEndpoint(t *testing.T) {
 	isolateAWSEnv(t)
+	// Check the premise this test rests on rather than assuming it: if the
+	// environment leaked a region in, the us-east-1 assertion below would pass
+	// for the wrong reason (or fail for one).
+	if base, err := LoadAWSConfig(context.Background(), ""); err != nil || base.Region != "" {
+		t.Fatalf("isolation failed: region = %q, err = %v; the assertions below would be meaningless", base.Region, err)
+	}
 	t.Setenv(EnvS3Endpoint, "http://minio:9000")
 
 	cfg, err := LoadAWSConfig(context.Background(), "")
@@ -244,13 +259,18 @@ func TestLoadAWSConfig_awsUnchanged(t *testing.T) {
 // callers that name the store themselves.
 func TestNewS3Client_explicitEndpointWins(t *testing.T) {
 	isolateAWSEnv(t)
+	// BINTRAIL_S3_PATH_STYLE=false makes this discriminating: the explicit
+	// block sets path style ON, so if the shared options were applied LAST
+	// they would turn it back off. Without this the two orders coincide and
+	// the "extra options win" contract is prose.
 	t.Setenv(EnvS3Endpoint, "http://env-store:9000")
+	t.Setenv(EnvS3PathStyle, "false")
 	client, err := newS3Client(context.Background(), S3Config{Bucket: "b", Endpoint: "http://explicit:9000"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	opts := client.Options()
 	if opts.BaseEndpoint == nil || *opts.BaseEndpoint != "http://explicit:9000" || !opts.UsePathStyle {
-		t.Fatalf("explicit endpoint not applied: %+v", opts.BaseEndpoint)
+		t.Fatalf("explicit endpoint not applied last: endpoint=%v pathStyle=%v", opts.BaseEndpoint, opts.UsePathStyle)
 	}
 }

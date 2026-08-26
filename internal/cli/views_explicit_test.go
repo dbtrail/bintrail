@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 // TestRunViews_explicitRootsCarryNoRoutingSentence pins the producer side of
@@ -27,6 +29,8 @@ func TestRunViews_explicitRootsCarryNoRoutingSentence(t *testing.T) {
 		}
 		vNoBaselines = savedNoBaselines
 	})
+	t.Setenv(storage.EnvS3PathStyle, "")
+	t.Setenv(storage.EnvS3Endpoint, "http://minio:9000")
 	vIndexDSN, vBaselineDir, vBaselineS3 = "", "", ""
 	vArchiveDir, vArchiveS3, vBintrailID = t.TempDir(), "s3://bkt/events/", "aaaa"
 	vNoBaselines, vOut = true, "-"
@@ -39,6 +43,11 @@ func TestRunViews_explicitRootsCarryNoRoutingSentence(t *testing.T) {
 		t.Fatal(err)
 	}
 	sql := out.String()
+	if !strings.Contains(sql, "ENDPOINT 'minio:9000'") {
+		// The producer half of #1453: the generator is tested with a populated
+		// Input, so without this nothing pins that runViews fills it.
+		t.Errorf("generated file does not name the configured store:\n%s", sql)
+	}
 	if strings.Contains(sql, "listed by its S3 location") {
 		t.Errorf("explicitly named roots got the registry routing sentence:\n%s", sql)
 	}
