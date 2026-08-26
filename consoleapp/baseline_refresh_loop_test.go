@@ -373,3 +373,28 @@ func TestRunRefresh_doesNotAdviseTuningWhenNothingWasPublished(t *testing.T) {
 			"change that stopped it is not fixed by raising the interval: %q", out)
 	}
 }
+
+// The tick binds the two counters and hands them on, and it is the only place
+// that happens. Before the seam existed the whole binding lived inside the
+// ticker's closure, so swapping the arguments compiled and every test stayed
+// green: both are ints, and the cycle and the reporter were only ever driven
+// apart.
+func TestRefreshTick_reportsTheCountersInTheRightOrder(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
+	sup.jobs["default"] = &console.BaselineStatus{State: "running"}
+
+	refreshTick(ctx, nil, sup, "dsn", t.TempDir(), time.Minute)
+
+	out := buf.String()
+	if !strings.Contains(out, "skipped=1") || !strings.Contains(out, "dispatched=0") {
+		t.Errorf("the tick reported the counters swapped or not at all; the one busy server must read "+
+			"skipped=1 dispatched=0: %q", out)
+	}
+}

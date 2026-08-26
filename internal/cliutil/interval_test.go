@@ -105,3 +105,32 @@ func TestUnitErrorsNameTheirOwnUnits(t *testing.T) {
 			"ParseRetain's: %v", err)
 	}
 }
+
+// The exact overflow boundary, per unit. The values in badDurations are orders
+// of magnitude past it, so they cannot tell a correct check from one that is
+// off by one in either direction: both admit or refuse everything that far
+// out. These are the only inputs that discriminate.
+//
+// bound*span is the largest duration that still fits; (bound+1)*span wraps
+// negative, and a negative interval reaching time.NewTicker panics inside a
+// goroutine that has no recover, on a daemon that is also the capture plane.
+func TestParseInterval_overflowBoundaryPerUnit(t *testing.T) {
+	for _, tc := range []struct {
+		ok, over string
+		want     time.Duration
+	}{
+		{"153722867m", "153722868m", 153722867 * time.Minute},
+		{"2562047h", "2562048h", 2562047 * time.Hour},
+		{"106751d", "106752d", 106751 * 24 * time.Hour},
+	} {
+		got, err := ParseInterval(tc.ok)
+		if err != nil {
+			t.Errorf("ParseInterval(%q) refused the largest value that fits: %v", tc.ok, err)
+		} else if got != tc.want {
+			t.Errorf("ParseInterval(%q) = %v, want %v", tc.ok, got, tc.want)
+		}
+		if got, err := ParseInterval(tc.over); err == nil {
+			t.Errorf("ParseInterval(%q) = %v with no error; one past the bound wraps", tc.over, got)
+		}
+	}
+}

@@ -233,8 +233,7 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				dispatched, skipped := runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir, interval)
-				reportDispatch(interval, dispatched, skipped)
+				refreshTick(ctx, reg, sup, globalDSN, globalBaselineDir, interval)
 			}
 		}
 	}()
@@ -313,6 +312,20 @@ func snapshotsPer30Days(interval time.Duration) int64 {
 		return 0
 	}
 	return int64(30 * 24 * time.Hour / interval)
+}
+
+// refreshTick is one tick: run a cycle, then report what it did.
+//
+// Extracted from the ticker's anonymous func on purpose. It is the only place
+// the two counters are bound and forwarded, and inside the closure no test
+// could reach it: swapping dispatched and skipped compiled and passed, because
+// both are ints and every test drove runBaselineRefreshCycle and reportDispatch
+// separately. That is the same shape this file already carries a correction
+// for one function over, so it gets a seam rather than a comment.
+func refreshTick(ctx context.Context, reg *console.Registry, sup *baselineSupervisor,
+	globalDSN, globalBaselineDir string, interval time.Duration) {
+	dispatched, skipped := runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir, interval)
+	reportDispatch(interval, dispatched, skipped)
 }
 
 // runBaselineRefreshCycle triggers one refresh per eligible server.

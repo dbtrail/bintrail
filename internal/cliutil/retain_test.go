@@ -39,7 +39,7 @@ func TestParseRetain_invalid(t *testing.T) {
 	// badDurations lives in interval_test.go and is deliberately shared: the
 	// two entry points are allowed to disagree about UNITS and must not
 	// disagree about how the NUMBER is read. This test used to carry its own
-	// copy of the same eleven entries, which is exactly the drift the shared
+	// copy of that list, which is exactly the drift the shared
 	// corpus exists to prevent.
 	for _, c := range badDurations {
 		if _, err := ParseRetain(c); err == nil {
