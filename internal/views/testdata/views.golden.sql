@@ -9,8 +9,9 @@
 --
 -- Nothing here writes: every view is a read over Parquet files you already own.
 --
--- Archive sources (an archive registered both on this host and in S3 is
--- listed by its S3 location, so the file runs from any machine):
+-- Archive sources (an archive registered both on the host that generated this
+-- file and in S3 is listed by its S3 location, so those reads work from another
+-- machine; a local path below is the only location the registry holds):
 --   /data/archives/bintrail_id=11111111-2222-3333-4444-555555555555
 --   s3://my-bucket/archives/bintrail_id=66666666-7777-8888-9999-000000000000
 -- Baseline snapshot:
@@ -23,7 +24,7 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 -- This secret lives only in this DuckDB session. Views persist in a database
 -- file; secrets do not. Reopening that file later and querying S3 fails with
 -- "No credentials are provided": run this file again in every session that
--- reads S3 (`.read views.sql`, or `duckdb -init views.sql lake.db`).
+-- reads S3 (`.read views.sql`, or `duckdb -init views.sql your.db`).
 -- Do not make it PERSISTENT: DuckDB would resolve your credential chain now
 -- and store the resulting keys on disk.
 -- No credentials appear in this file by design. If the credential chain is not

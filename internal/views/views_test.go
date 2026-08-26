@@ -22,9 +22,10 @@ func goldenInput() Input {
 			"/data/archives/bintrail_id=11111111-2222-3333-4444-555555555555",
 			"s3://my-bucket/archives/bintrail_id=66666666-7777-8888-9999-000000000000",
 		},
-		ArchiveRegion:    "us-east-1",
-		BaselineSource:   "s3://my-bucket/baselines/",
-		BaselineSnapshot: time.Date(2026, 4, 30, 3, 0, 0, 0, time.UTC),
+		ArchivesFromRegistry: true,
+		ArchiveRegion:        "us-east-1",
+		BaselineSource:       "s3://my-bucket/baselines/",
+		BaselineSnapshot:     time.Date(2026, 4, 30, 3, 0, 0, 0, time.UTC),
 		Baselines: []BaselineTable{
 			{Schema: "shop", Table: "orders", Path: "s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/orders.parquet"},
 			{Schema: "shop", Table: "order_items", Path: "s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/order_items.parquet"},

@@ -42,6 +42,16 @@ type Input struct {
 	// ArchiveSources are the archive base paths discovered from archive_state
 	// (each ending in the `bintrail_id=<id>` segment), local or s3://.
 	ArchiveSources []string
+	// ArchivesFromRegistry is true when ArchiveSources came out of the
+	// archive_state registry through query.PortableArchiveSources, which is
+	// the only case in which the header may state the S3-over-local rule; an
+	// operator who named the roots with --archive-dir/--archive-s3 gets
+	// exactly what they named, both of them if they passed both (#1456).
+	ArchivesFromRegistry bool
+	// ArchiveDiscoveryError is set when the registry could not be read at
+	// all. The header then says so instead of "none registered", which would
+	// state a cause the caller does not know.
+	ArchiveDiscoveryError string
 	// ArchiveRegion pins REGION in the S3 secret. Empty = let the credential
 	// chain resolve it, which is what every other bintrail S3 read does by
 	// default.
@@ -125,14 +135,23 @@ func writeHeader(b *strings.Builder, in Input) {
 	b.WriteString("-- Nothing here writes: every view is a read over Parquet files you already own.\n")
 	b.WriteString("--\n")
 
-	// The path choice is stated where the paths are listed. An archive that
-	// lives both on the generating host and in S3 is named by its S3 location,
-	// because this file is meant to run on a machine that is not that host
-	// (#1456); an operator who reads a local path here knows it is the only
-	// registered copy.
-	b.WriteString("-- Archive sources (an archive registered both on this host and in S3 is\n")
-	b.WriteString("-- listed by its S3 location, so the file runs from any machine):\n")
-	if len(in.ArchiveSources) == 0 {
+	// The path choice is stated where the paths are listed, and only when a
+	// choice was made: registry discovery names an archive that lives both on
+	// the generating host and in S3 by its S3 location, because this file is
+	// meant to run on a machine that is not that host (#1456). Explicitly
+	// named roots are listed as named. Baseline state views are out of this
+	// sentence on purpose: they point wherever the baseline root points.
+	if in.ArchivesFromRegistry {
+		b.WriteString("-- Archive sources (an archive registered both on the host that generated this\n")
+		b.WriteString("-- file and in S3 is listed by its S3 location, so those reads work from another\n")
+		b.WriteString("-- machine; a local path below is the only location the registry holds):\n")
+	} else {
+		b.WriteString("-- Archive sources:\n")
+	}
+	switch {
+	case in.ArchiveDiscoveryError != "":
+		fmt.Fprintf(b, "--   (could not be read from archive_state: %s)\n", in.ArchiveDiscoveryError)
+	case len(in.ArchiveSources) == 0:
 		b.WriteString("--   (none registered in archive_state — no rotated partitions have been archived yet)\n")
 	}
 	for _, s := range in.ArchiveSources {
@@ -185,7 +204,7 @@ func writeS3Preamble(b *strings.Builder, region string) {
 	b.WriteString("-- This secret lives only in this DuckDB session. Views persist in a database\n")
 	b.WriteString("-- file; secrets do not. Reopening that file later and querying S3 fails with\n")
 	b.WriteString("-- \"No credentials are provided\": run this file again in every session that\n")
-	b.WriteString("-- reads S3 (`.read views.sql`, or `duckdb -init views.sql lake.db`).\n")
+	b.WriteString("-- reads S3 (`.read views.sql`, or `duckdb -init views.sql your.db`).\n")
 	b.WriteString("-- Do not make it PERSISTENT: DuckDB would resolve your credential chain now\n")
 	b.WriteString("-- and store the resulting keys on disk.\n")
 	b.WriteString("-- No credentials appear in this file by design. If the credential chain is not\n")

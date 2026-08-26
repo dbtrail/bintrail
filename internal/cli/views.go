@@ -39,9 +39,12 @@ S3 reads do. That S3 secret lives only in the DuckDB session that runs the
 file: views persist in a database file, secrets do not, so run the file in
 every session that reads S3 (.read views.sql, or duckdb -init views.sql).
 
-The file is written to run on any machine. An archive registered both on
-this host and in S3 is named by its S3 location; a local path appears only
-when it is the sole registered copy.
+Archive sources discovered from the index are named so the file works from
+another machine: an archive registered both on this host and in S3 is listed
+by its S3 location, and a local path appears only when the registry holds no
+S3 location for it. State views point wherever --baseline-dir/--baseline-s3
+points; a local baseline directory resolves only on the host that holds it.
+With --archive-dir/--archive-s3 the file lists exactly what you named.
 
 Archive sources come from the index's archive_state registry by default. Pass
 --archive-dir/--archive-s3 with --bintrail-id to name one explicitly instead;
@@ -118,6 +121,7 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		if err != nil {
 			return err
 		}
+		in.ArchivesFromRegistry = true
 	}
 
 	if !vNoBaselines {

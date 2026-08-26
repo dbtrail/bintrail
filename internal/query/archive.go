@@ -111,6 +111,16 @@ func PortableArchiveSources(ctx context.Context, db *sql.DB) ([]string, error) {
 		case r.s3Source != "":
 			sources = append(sources, r.s3Source)
 		case r.localBase != "":
+			if r.s3Registered {
+				// The registry HAS an S3 location, but the key does not
+				// follow the bintrail_id= layout the glob needs (an
+				// `upload --source` pointed below that directory does
+				// this), so the local copy is what gets listed. Say so:
+				// the generated file's header calls a local path the only
+				// registered copy, and here that is not true.
+				slog.Warn("archive_state row has S3 columns but the key lacks a bintrail_id= segment; listing the local copy instead",
+					"bintrail_id", r.bintrailID, "local_base", r.localBase)
+			}
 			sources = append(sources, r.localBase)
 		}
 	}
@@ -123,6 +133,9 @@ type archiveRoots struct {
 	bintrailID string
 	localBase  string // base dir up to bintrail_id=<id>, or ""
 	s3Source   string // s3://bucket/…/bintrail_id=<id>, or ""
+	// s3Registered is true when the row carries S3 columns at all, including
+	// a key with no bintrail_id= segment that s3Source cannot be built from.
+	s3Registered bool
 }
 
 // listArchiveRoots reads the archive_state registry once per distinct
@@ -169,6 +182,7 @@ func listArchiveRoots(ctx context.Context, db *sql.DB) ([]archiveRoots, error) {
 			r.localBase = extractBasePath(localPath.String)
 		}
 		if s3Bucket.Valid && s3Bucket.String != "" && s3Key.Valid && s3Key.String != "" {
+			r.s3Registered = true
 			if base := extractBasePath(s3Key.String); base != "" {
 				r.s3Source = "s3://" + s3Bucket.String + "/" + base
 			}
