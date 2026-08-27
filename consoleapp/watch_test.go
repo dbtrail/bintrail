@@ -3,6 +3,8 @@ package consoleapp
 import (
 	"context"
 	"errors"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -744,5 +746,46 @@ func TestResolveUpConsoleEnv_carryForwardPrecedence(t *testing.T) {
 					upBaselineCarryForward, tc.want, tc.env, tc.flagSet)
 			}
 		})
+	}
+}
+
+// TestWatchCarryForwardFlagIsOffByDefault asserts the default on the REAL
+// watchCmd declaration.
+//
+// TestResolveUpConsoleEnv_carryForwardPrecedence builds its own cobra command
+// and re-declares the flag with a hardcoded false, which is right for testing
+// precedence and blind to the shipped default: it substitutes its fixture for
+// the production declaration rather than reading it. This reads the real one.
+func TestWatchCarryForwardFlagIsOffByDefault(t *testing.T) {
+	f := watchCmd.Flags().Lookup("baseline-carry-forward-unchanged")
+	if f == nil {
+		t.Fatal("--baseline-carry-forward-unchanged is gone from watch; this guard covers nothing")
+	}
+	if f.DefValue != "false" {
+		t.Fatalf("default = %q, want \"false\": the daemon would reuse files nobody asked it to", f.DefValue)
+	}
+}
+
+// TestStartBaselineRefreshLoopCallSitesAgree: both watch entry paths must pass
+// the same flag variable.
+//
+// The two calls are byte-identical including their context, which is exactly
+// where a copy-paste divergence hides: `watch` with a source would ignore the
+// flag while source-less `watch` honoured it, and each line can be mutated
+// alone with the whole suite green. A source read is the cheapest thing that
+// sees both.
+func TestStartBaselineRefreshLoopCallSitesAgree(t *testing.T) {
+	src, err := os.ReadFile("watch.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "upBaselineRefreshEvery, upBaselineCarryForward)"
+	n := strings.Count(string(src), "startBaselineRefreshLoop(")
+	if n != 2 {
+		t.Fatalf("found %d startBaselineRefreshLoop call sites, expected 2; re-point this guard", n)
+	}
+	if got := strings.Count(string(src), want); got != n {
+		t.Errorf("%d of %d call sites pass the daemon flag; the other passes something else, so one watch "+
+			"entry path would silently ignore --baseline-carry-forward-unchanged", got, n)
 	}
 }

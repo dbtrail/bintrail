@@ -60,23 +60,16 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 		st = &console.BaselineStatus{}
 		s.restores[req.ServerID] = st
 	}
-	st.FinishedAt = nowStamp()
-	st.Tables = tables
-	st.Refused = refused
-	st.Carried = carried
+	applyFoldStatus(st, tables, refused, carried, err)
 	if err != nil {
-		st.State = "failed"
-		st.LastError = err.Error()
 		// Warn, never Error: a refusal (gap, schema change) is the fail-closed
 		// contract working, and the operator picks another moment.
 		slog.Warn("baseline restore: published nothing", "server", req.ServerName, "id", req.ServerID,
 			"refused", refused, "error", err)
 		return
 	}
-	st.State = "succeeded"
-	st.LastError = ""
 	slog.Info("baseline restore: published", "server", req.ServerName, "id", req.ServerID,
-		"tables", tables, "at", req.At.UTC().Format(time.RFC3339))
+		"tables", tables, "reused", carried, "at", req.At.UTC().Format(time.RFC3339))
 }
 
 // executeRestore folds toward the chosen instant. The table list comes from

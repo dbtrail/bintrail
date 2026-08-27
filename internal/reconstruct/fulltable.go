@@ -1020,7 +1020,7 @@ func ReconstructTable(
 	// it returns the finding and lets the run proceed. See carryForwardEligible
 	// for why a known gap disqualifies a table from being carried at all.
 	if carryForwardEligible(cfg.CarryForwardUnchanged, cfg.OutputFormat, baselinePath, len(changes), capGap) {
-		linked, cerr := carryForward(ctx, baselinePath, cfg.snapshotDir, schema, table)
+		cerr := carryForward(ctx, baselinePath, cfg.snapshotDir, schema, table)
 		if cerr != nil {
 			return nil, fmt.Errorf("carry %s.%s forward unchanged: %w", schema, table, cerr)
 		}
@@ -1030,8 +1030,13 @@ func ReconstructTable(
 		// consumers join it themselves (internal/cli/drill.go does).
 		rep.Files = []string{filepath.Join(schema, table+".parquet")}
 		rep.Duration = time.Since(start)
+		// CarriedForward is set unconditionally above and deliberately does NOT
+		// distinguish a link from a copy: it means "published by reuse rather
+		// than by folding", which is true either way, and it is what the
+		// unchanged verdict and the console's reused count are derived from.
+		// carryForward logs the link-versus-copy split itself, with the cause.
 		slog.Info("table carried forward unchanged", "schema", schema, "table", table,
-			"linked", linked, "reason", "no events in the window")
+			"reason", "no events in the window")
 		return rep, nil
 	}
 

@@ -65,15 +65,13 @@ func TestCarryForward_linksWhenItCanAndTheBytesSurvive(t *testing.T) {
 	}
 	dstSnap := filepath.Join(root, "new")
 
-	linked, err := carryForward(context.Background(), src, dstSnap, "demo", "orders")
-	if err != nil {
+	if err := carryForward(context.Background(), src, dstSnap, "demo", "orders"); err != nil {
 		t.Fatalf("carryForward: %v", err)
 	}
-	if !linked {
-		t.Error("fell back to a copy inside one temp dir, where a hard link should succeed; " +
-			"the saving this exists for is the bytes not copied")
-	}
 	dst := filepath.Join(dstSnap, "demo", "orders.parquet")
+	// Compare INODES rather than a returned bool. The saving this exists for is
+	// the bytes not copied, and only the filesystem knows whether they were.
+	assertSharesInode(t, src, dst, "fell back to a copy inside one temp dir, where a hard link should succeed")
 	got, err := os.ReadFile(dst)
 	if err != nil {
 		t.Fatalf("read the carried file: %v", err)
@@ -144,14 +142,11 @@ func TestCarryForward_replacesALeftoverWithoutTruncatingASharedInode(t *testing.
 		t.Skipf("no hard links on this filesystem: %v", err)
 	}
 
-	linked, err := carryForward(context.Background(), src, dstSnap, "demo", "orders")
-	if err != nil {
+	if err := carryForward(context.Background(), src, dstSnap, "demo", "orders"); err != nil {
 		t.Fatalf("carryForward over a leftover: %v", err)
 	}
-	if !linked {
-		t.Error("the retry fell back to a copy: without the unlink, os.Link fails on the leftover and the " +
-			"saving this exists for is silently lost")
-	}
+	assertSharesInode(t, src, dst, "the retry fell back to a copy: without the unlink, os.Link fails on "+
+		"the leftover and the saving this exists for is silently lost")
 	if got, err := os.ReadFile(dst); err != nil || string(got) != "the real snapshot" {
 		t.Errorf("the leftover survived: %q (%v)", got, err)
 	}
@@ -184,7 +179,7 @@ func TestCarryForward_refusesAFileItsManifestDisagreesWith(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := carryForward(context.Background(), src, filepath.Join(root, "new"), "demo", "orders")
+	err := carryForward(context.Background(), src, filepath.Join(root, "new"), "demo", "orders")
 	if err == nil {
 		t.Fatal("carried a file forward that does not match its own manifest; a corrupt snapshot would " +
 			"be re-certified under the new snapshot's manifest and look healthy")
@@ -227,5 +222,65 @@ func TestCopyFile(t *testing.T) {
 	}
 	if err := copyFile(filepath.Join(dir, "missing.parquet"), dst); err == nil {
 		t.Error("copyFile silently accepted a source that does not exist")
+	}
+}
+
+// assertSharesInode fails unless the two paths are the same file on disk.
+func assertSharesInode(t *testing.T, a, b, msg string) {
+	t.Helper()
+	fa, err := os.Stat(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(fa, fb) {
+		t.Error(msg)
+	}
+}
+
+// TestCarryForward_copiesWhenItCannotLink drives the fallback every test
+// machine hides.
+//
+// One filesystem means os.Link always succeeds, so this branch never executed
+// anywhere: replacing its copy with a bare nil published a snapshot MISSING the
+// table's Parquet file and passed both the unit and the integration tier. The
+// absence would not surface until a later reconstruct, verify or drill tripped
+// over it, a long way from the code that caused it.
+func TestCarryForward_copiesWhenItCannotLink(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "old", "demo", "orders.parquet")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("bytes that must survive a copy")
+	if err := os.WriteFile(src, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := linkFile
+	t.Cleanup(func() { linkFile = prev })
+	linkFile = func(string, string) error { return syscall.EXDEV }
+
+	dstSnap := filepath.Join(root, "new")
+	if err := carryForward(context.Background(), src, dstSnap, "demo", "orders"); err != nil {
+		t.Fatalf("carryForward with links unavailable: %v", err)
+	}
+	dst := filepath.Join(dstSnap, "demo", "orders.parquet")
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("the carried file is NOT THERE after the copy fallback: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("copied content = %q, want %q", got, want)
+	}
+	// A copy, so nothing is shared and no space was saved. Stated as an
+	// assertion because the UI hint hedges on exactly this.
+	fa, _ := os.Stat(src)
+	fb, _ := os.Stat(dst)
+	if os.SameFile(fa, fb) {
+		t.Error("the fallback still shared an inode; then it was not a copy")
 	}
 }

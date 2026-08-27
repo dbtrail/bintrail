@@ -1,6 +1,7 @@
 package console
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -24,17 +25,23 @@ func TestBackupRefreshCard_neverClaimsLiveWhileDormant(t *testing.T) {
 	if !strings.Contains(body, "(live)") {
 		t.Fatal("backupRefreshCard no longer distinguishes a live setting at all; this guard covers nothing")
 	}
-	// The gate itself. A bare `br.source === "override" ? "... (live)"` has no
-	// br.enabled between the two, which is exactly the shape this catches.
-	i := strings.Index(body, "(live)")
-	head := body[:i]
-	j := strings.LastIndex(head, "kvRow(")
-	if j < 0 {
-		t.Fatal(`"(live)" is no longer rendered from a kvRow; re-point this guard`)
+	// Assert on the CONDITION, not on adjacency. "br.enabled appears somewhere
+	// before (live)" is satisfied by `br.enabled && br.source === "override" ?
+	// "this page (live)" : "daemon default"`, which renders a dormant override
+	// as "daemon default" while the Use-the-daemon-setting button is still on
+	// screen, and by "this page (live, not running yet)", which says both
+	// things at once. Both of those survived the adjacency check.
+	const gate = `br.enabled ? "this page (live)"`
+	if !strings.Contains(body, gate) {
+		t.Fatalf("the (live) label is not produced by a %s ternary, so the card can call a dormant setting "+
+			"live or drop the override label entirely:\n%s", gate, body)
 	}
-	if !strings.Contains(head[j:], "br.enabled") {
-		t.Fatalf("the (live) label is not gated on br.enabled, so the card can call a dormant setting live "+
-			"while also saying nothing runs yet:\n%s", head[j:])
+	// And the dormant arm must not smuggle the word back in.
+	k := strings.Index(body, gate) + len(gate)
+	rest := body[k:]
+	arm := rest[:min(len(rest), 120)]
+	if strings.Contains(arm, "(live") {
+		t.Errorf("the dormant arm of the ternary also says live:\n%s", arm)
 	}
 	if !strings.Contains(body, "!br.enabled") {
 		t.Fatal("the dormancy note is gone; a setting nothing consumes would look active")
@@ -66,7 +73,12 @@ func TestSaveBackupRefresh_confirmsFromTheResponse(t *testing.T) {
 	if !strings.Contains(body, "= await api(") {
 		t.Fatal("the PUT response is discarded, so the confirmation cannot describe what the daemon actually stored")
 	}
-	toast := body[strings.Index(body, "toast("):]
+	ti := strings.Index(body, "toast(")
+	if ti < 0 {
+		t.Fatal("saveBackupRefresh no longer confirms anything; this guard covers nothing " +
+			"(and slicing on a missing needle would panic the whole package)")
+	}
+	_ = body[ti:] // the needle exists; the checks below read the whole body
 	// Qualified by the RESPONSE variable, not the bare field name. A bare
 	// "carry_forward_unchanged" also matches the request body that was just
 	// sent, which is precisely the stale value this guard exists to reject, and
@@ -76,9 +88,11 @@ func TestSaveBackupRefresh_confirmsFromTheResponse(t *testing.T) {
 			t.Errorf("the confirmation does not read %s from the PUT response", want)
 		}
 	}
-	for _, banned := range []string{"next", "body.carry_forward_unchanged"} {
-		if strings.Contains(toast, banned) || (banned != "next" && strings.Contains(body, banned)) {
-			t.Errorf("the confirmation still branches on %q, the value that was SENT, rather than the daemon's answer", banned)
+	// Ban the IDENTIFIERS, not the English word: "applies on the next start"
+	// is correct prose and used to fail this.
+	for _, banned := range []string{"next ?", "next)", "body.carry_forward_unchanged", "body.enabled"} {
+		if strings.Contains(body, banned) {
+			t.Errorf("the confirmation reads %q, the value that was SENT, rather than the daemon's answer", banned)
 		}
 	}
 	if !strings.Contains(body, "renderRoute()") {
@@ -110,5 +124,71 @@ func TestBaselineRefreshNote_partitionsTheTables(t *testing.T) {
 	if strings.Contains(body, `(rf.tables || 0) + " table(s) refreshed"`) {
 		t.Error("the note prints the TOTAL table count as the refreshed count while also printing the " +
 			"reused subset; those two numbers must partition the run")
+	}
+}
+
+// TestBackupRefreshWireNamesMatchTheFrontend: the Go struct tag and the
+// JavaScript that reads it are written independently and nothing else compares
+// them.
+//
+// This is the `schema_name`/`table_name` class: renaming the tag leaves both
+// sides internally consistent, compiles, and passes every test, while the
+// number silently stops appearing. The tag is derived by MARSHALLING rather
+// than by reading the source, so the assertion is about the bytes on the wire.
+func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	raw, err := json.Marshal(BaselineStatus{State: "succeeded", Tables: 3, Carried: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wire["carried"]; !ok {
+		t.Fatalf("BaselineStatus no longer serialises a \"carried\" key (got %s); the console reads rf.carried "+
+			"and would silently stop showing reused tables", raw)
+	}
+	for _, ref := range []string{"rf.carried", "rst.carried"} {
+		if !strings.Contains(js, ref) {
+			t.Errorf("app.js does not read %s, so the reused count never reaches the page", ref)
+		}
+	}
+
+	dto, err := json.Marshal(baselineRefreshDTO{CarryForwardUnchanged: true, Source: "override", Enabled: true, Scheduled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d map[string]any
+	if err := json.Unmarshal(dto, &d); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"carry_forward_unchanged", "source", "enabled", "scheduled"} {
+		if _, ok := d[key]; !ok {
+			t.Errorf("baselineRefreshDTO does not serialise %q (got %s)", key, dto)
+		}
+		if !strings.Contains(js, "br."+key) && !strings.Contains(js, key) {
+			t.Errorf("app.js never reads %q from the refresh DTO", key)
+		}
+	}
+}
+
+// TestStoragePanelStillMountsTheRefreshCard: the card can be unmounted, or its
+// fetch removed, with the whole suite green.
+//
+// The two guards above check what the card renders once it is called. Neither
+// notices if nothing calls it: dropping the append makes the settings panel
+// vanish, and dropping the fetch makes it render its error branch forever. A
+// setting an operator cannot reach is the same as a setting that does not
+// exist.
+func TestStoragePanelStillMountsTheRefreshCard(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "buildStorage")
+	if !strings.Contains(body, "backupRefreshCard(") {
+		t.Error("buildStorage no longer mounts backupRefreshCard, so the reuse setting has no UI at all")
+	}
+	js := readAsset(t, "app.js")
+	if !strings.Contains(js, `api("/api/baseline-refresh")`) {
+		t.Error("nothing fetches /api/baseline-refresh, so the card can only ever render its error branch")
 	}
 }

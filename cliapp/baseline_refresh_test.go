@@ -251,3 +251,16 @@ func TestBuildRefreshOutcomes_carriedForwardIsItsOwnVerdict(t *testing.T) {
 		}
 	}
 }
+
+// TestBaselineRefreshCarryForwardIsOffByDefault: see the twin in internal/cli.
+// A one-character regression here turns the opt-in into opt-out for every user
+// of `bintrail baseline refresh`, and nothing else in the suite would notice.
+func TestBaselineRefreshCarryForwardIsOffByDefault(t *testing.T) {
+	f := baselineRefreshCmd.Flags().Lookup("carry-forward-unchanged")
+	if f == nil {
+		t.Fatal("--carry-forward-unchanged is gone from baseline refresh; this guard covers nothing")
+	}
+	if f.DefValue != "false" {
+		t.Fatalf("default = %q, want \"false\"", f.DefValue)
+	}
+}

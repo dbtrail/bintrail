@@ -106,13 +106,8 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 		st = &console.BaselineStatus{}
 		s.refreshes[req.ServerID] = st
 	}
-	st.FinishedAt = nowStamp()
-	st.Tables = tables
-	st.Refused = refused
-	st.Carried = carried
+	applyFoldStatus(st, tables, refused, carried, err)
 	if err != nil {
-		st.State = "failed"
-		st.LastError = err.Error()
 		// Deliberately NO duration report here. reportRefreshDuration's advice
 		// is "raise the interval, or refresh fewer tables", which is the wrong
 		// remediation for a run that published nothing: a capture gap, a
@@ -127,10 +122,32 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 			"refused", refused, "error", err)
 		return
 	}
+	slog.Info("baseline refresh: published", "server", req.ServerName, "id", req.ServerID,
+		"tables", tables, "reused", carried)
+	reportRefreshDuration(req.ServerName, interval, took)
+}
+
+// applyFoldStatus writes a finished fold's outcome onto the status the console
+// polls. Shared by the refresh and the restore, which had byte-identical copies
+// of it.
+//
+// Split out for the reason the rest of this file keeps splitting things out:
+// both callers sit behind a `go` and a live fold, so nothing at the unit tier
+// could reach them, and dropping the reused count from either copy compiled and
+// passed the whole suite. It is also the deduplication: two copies of a
+// four-field assignment is exactly how one of them silently loses a field.
+func applyFoldStatus(st *console.BaselineStatus, tables, refused, carried int, err error) {
+	st.FinishedAt = nowStamp()
+	st.Tables = tables
+	st.Refused = refused
+	st.Carried = carried
+	if err != nil {
+		st.State = "failed"
+		st.LastError = err.Error()
+		return
+	}
 	st.State = "succeeded"
 	st.LastError = ""
-	slog.Info("baseline refresh: published", "server", req.ServerName, "id", req.ServerID, "tables", tables)
-	reportRefreshDuration(req.ServerName, interval, took)
 }
 
 // executeRefresh folds the newest snapshot forward. Returns the table count and

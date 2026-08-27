@@ -90,16 +90,25 @@ import (
 // over the baseline root tracks inodes within its own traversal and reports the
 // truth. It is a `du` run per snapshot directory, as separate invocations, that
 // counts the shared file twice.
-func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table string) (linked bool, err error) {
+// linkFile is os.Link, indirected so a test can drive the copy fallback.
+//
+// Every test machine has one filesystem, so os.Link always succeeds and the
+// copy branch never ran anywhere: replacing copyFile's call with `return nil`
+// published a snapshot MISSING the table's Parquet file and passed both tiers.
+// A missing file is not caught until a later reconstruct, verify or drill trips
+// over it, which is a long way from here.
+var linkFile = os.Link
+
+func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table string) error {
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return err
 	}
 	if err := baselineintegrity.ValidateLocalFile(srcPath); err != nil {
-		return false, fmt.Errorf("validate the snapshot being carried forward: %w", err)
+		return fmt.Errorf("validate the snapshot being carried forward: %w", err)
 	}
 	dst := filepath.Join(snapshotDir, schema, table+".parquet")
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return false, err
+		return err
 	}
 	// Remove before writing, and the reason is the COPY path rather than the
 	// link path. os.Create truncates, and after a carry-forward the destination
@@ -108,11 +117,11 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 	// share before anything is written. (os.Link would also fail with EEXIST,
 	// though reconstruct's leftovers refusal already rules that out.)
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
-		return false, err
+		return err
 	}
-	linkErr := os.Link(srcPath, dst)
+	linkErr := linkFile(srcPath, dst)
 	if linkErr == nil {
-		return true, nil
+		return nil
 	}
 	// The copy is the designed fallback, not a failure, so the error is never
 	// returned. The LEVEL splits by cause, because the two causes are worlds
@@ -130,7 +139,7 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 			"Reusing an unchanged table is meant to avoid rewriting it; a copy still writes every byte.",
 			"src", srcPath, "dst", dst, "error", linkErr)
 	}
-	return false, copyFile(srcPath, dst)
+	return copyFile(srcPath, dst)
 }
 
 // carryForwardEligible reports whether a table can be published by carrying its

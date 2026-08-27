@@ -454,6 +454,61 @@ func TestEffectiveCarryForward(t *testing.T) {
 // reach the requests the fold is built from. A resolver that is correct in
 // isolation proves nothing about whether the loop consults it.
 func TestRefreshTargetsFor_carriesTheEffectiveSettingIntoEveryRequest(t *testing.T) {
+	// Every leg runs against TWO servers, and every leg that asserts the
+	// setting reached the requests has a twin asserting TRUE. Both matter.
+	// With one target, gating the assignment on i == 0 is invisible. With the
+	// expected value false, so is dropping the assignment entirely: false is
+	// the zero value, so the field is already right for the wrong reason. The
+	// combination is what catches a daemon whose second and third servers
+	// silently ignore the flag and the console toggle.
+	newReg := func(t *testing.T, override *bool) *console.Registry {
+		t.Helper()
+		r, err := console.LoadRegistry(filepath.Join(t.TempDir(), "servers.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if override != nil {
+			if err := r.SetBaselineRefresh(&console.BaselineRefreshConfig{CarryForwardUnchanged: *override}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, name := range []string{"prod", "staging"} {
+			if _, err := r.Add(console.ServerEntry{
+				Name: name, DSN: "u:p@tcp(h:3306)/idx", BaselineDir: t.TempDir(),
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return r
+	}
+	yes, no := true, false
+
+	for _, tc := range []struct {
+		name     string
+		override *bool
+		daemon   bool
+		want     bool
+	}{
+		{"daemon flag on, nothing saved", nil, true, true},
+		{"daemon flag off, nothing saved", nil, false, false},
+		{"override on beats a flag saying off", &yes, false, true},
+		{"override off beats a flag saying on", &no, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reqs := refreshTargetsFor(newReg(t, tc.override), "dsn", "/b", tc.daemon)
+			if len(reqs) < 2 {
+				t.Fatalf("got %d targets, need at least 2 or a per-index bug stays invisible", len(reqs))
+			}
+			for i, req := range reqs {
+				if req.CarryForwardUnchanged != tc.want {
+					t.Errorf("target %d (%q): CarryForwardUnchanged = %v, want %v",
+						i, req.ServerName, req.CarryForwardUnchanged, tc.want)
+				}
+			}
+		})
+	}
+
+	// A nil registry is the source-less shape; it must still carry the flag.
 	for _, want := range []bool{true, false} {
 		reqs := refreshTargetsFor(nil, "dsn", "/b", want)
 		if len(reqs) == 0 {
@@ -463,28 +518,6 @@ func TestRefreshTargetsFor_carriesTheEffectiveSettingIntoEveryRequest(t *testing
 			if req.CarryForwardUnchanged != want {
 				t.Errorf("daemon default %v did not reach the request for %q", want, req.ServerName)
 			}
-		}
-	}
-
-	// And a saved override has to beat the daemon flag all the way through,
-	// not just inside effectiveCarryForward.
-	r, err := console.LoadRegistry(filepath.Join(t.TempDir(), "servers.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := r.SetBaselineRefresh(&console.BaselineRefreshConfig{CarryForwardUnchanged: false}); err != nil {
-		t.Fatal(err)
-	}
-	reqs := refreshTargetsFor(r, "dsn", "/b", true)
-	// The same vacuity guard the first leg carries. Without it, a change that
-	// stopped producing targets turns this leg into a loop over nothing and it
-	// reports a pass on an assertion that never ran.
-	if len(reqs) == 0 {
-		t.Fatal("no targets, so the assertion below checks nothing")
-	}
-	for _, req := range reqs {
-		if req.CarryForwardUnchanged {
-			t.Errorf("an override saying off did not reach the request for %q", req.ServerName)
 		}
 	}
 }
@@ -675,6 +708,54 @@ func TestFoldOutcome(t *testing.T) {
 		_, gotR, _, _ := foldOutcome(tables, nil, []reconstruct.TableFailure{{}}, nil)
 		if gotR != 0 {
 			t.Errorf("refused=%d on a clean run, want 0", gotR)
+		}
+	})
+}
+
+// TestApplyFoldStatus: what the console polls after a fold finishes.
+//
+// Both callers sit behind a `go` and a live fold, so this was unreachable at
+// the unit tier and existed as two byte-identical copies. Dropping the reused
+// count from either compiled and passed everything.
+func TestApplyFoldStatus(t *testing.T) {
+	t.Run("a clean run reports every count and clears the previous error", func(t *testing.T) {
+		st := &console.BaselineStatus{State: "failed", LastError: "the previous run's gap"}
+		applyFoldStatus(st, 7, 0, 3, nil)
+		if st.State != "succeeded" {
+			t.Errorf("State = %q, want succeeded", st.State)
+		}
+		if st.LastError != "" {
+			t.Errorf("LastError = %q, want cleared: a stale error outlives the run that caused it", st.LastError)
+		}
+		if st.Tables != 7 || st.Refused != 0 || st.Carried != 3 {
+			t.Errorf("tables=%d refused=%d carried=%d, want 7/0/3", st.Tables, st.Refused, st.Carried)
+		}
+		if st.FinishedAt == "" {
+			t.Error("FinishedAt is empty, so the console cannot say when this ran")
+		}
+	})
+
+	t.Run("a failed run keeps the counts and names the error", func(t *testing.T) {
+		st := &console.BaselineStatus{State: "running"}
+		applyFoldStatus(st, 7, 2, 1, errors.New("capture gap at 2026-01-01T00:00:00Z"))
+		if st.State != "failed" {
+			t.Errorf("State = %q, want failed", st.State)
+		}
+		if st.LastError == "" {
+			t.Error("LastError is empty on a failed run, so the console shows a failure with no cause")
+		}
+		if st.Tables != 7 || st.Refused != 2 || st.Carried != 1 {
+			t.Errorf("tables=%d refused=%d carried=%d, want 7/2/1", st.Tables, st.Refused, st.Carried)
+		}
+	})
+
+	t.Run("reused zero is written, not skipped", func(t *testing.T) {
+		// The field is omitempty on the wire, so a stale non-zero left behind
+		// by the PREVIOUS run would keep rendering. Assignment, not accumulation.
+		st := &console.BaselineStatus{Carried: 9}
+		applyFoldStatus(st, 2, 0, 0, nil)
+		if st.Carried != 0 {
+			t.Errorf("Carried = %d, want 0: the previous run's reuse count survived into this one", st.Carried)
 		}
 	})
 }
