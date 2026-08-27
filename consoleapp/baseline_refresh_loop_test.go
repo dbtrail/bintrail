@@ -788,6 +788,14 @@ func TestRefreshFoldConfig_boundsTheUnattendedFold(t *testing.T) {
 	if cfg.WarnEventThreshold != daemonFoldWarnEventThreshold {
 		t.Errorf("WarnEventThreshold = %d, want %d", cfg.WarnEventThreshold, daemonFoldWarnEventThreshold)
 	}
+	if cfg.RemediationHint == "" {
+		t.Error("RemediationHint left empty: the warning falls back to the CLI wording, " +
+			"which names --at / --parallelism / --warn-event-threshold. bintrail-console " +
+			"registers none of them, so the operator is sent after flags that do not exist")
+	}
+	if cfg.RemediationHint != daemonFoldRemediation {
+		t.Errorf("RemediationHint = %q, want the shared constant", cfg.RemediationHint)
+	}
 }
 
 // TestRefreshFoldConfig_restoreSharesTheBounds: the point-in-time restore is

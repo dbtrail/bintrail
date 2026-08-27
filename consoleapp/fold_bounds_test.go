@@ -57,6 +57,15 @@ const wantFoldConfigs = 2
 //     assignments, or copied from a good one and then mutated. Both are
 //     syntactically invisible here and not worth chasing; the project's
 //     convention is the literal.
+//   - an ELIDED literal inside a slice or map of the type, e.g.
+//     `[]reconstruct.FullTableConfig{{IndexDSN: "x"}}`. Go omits the element
+//     type, so the inner literal's Type is nil and never reaches
+//     isFullTableConfig. Note this one hides folds AND leaves the count at 2,
+//     so neither half of the guard fires.
+//   - a literal ADDED through a local type alias (`type fc =
+//     reconstruct.FullTableConfig`). Replacing a counted literal that way DOES
+//     fail, because the count drops; adding one alongside them does not.
+//     Catching it needs resolved types (go/types), not syntax.
 //   - the attended CLI callers (internal/cli, cliapp), which are correctly
 //     out of scope: an operator watching a terminal may have the whole host.
 //     "These two fields travel together" is a DAEMON rule, not a repo-wide one,
@@ -125,9 +134,9 @@ func TestEveryConsoleappFoldConfigIsBounded(t *testing.T) {
 					if !present {
 						t.Errorf("%s: reconstruct.FullTableConfig does not set %s.\n"+
 							"Every fold in this package runs inside the capture process, and this "+
-							"field's ZERO value is the unsafe one. Set it to %s. Do NOT satisfy this "+
-							"message by writing `%s: 0` — that is the bug this guard exists to catch.",
-							pos, field, constName, field)
+							"field's ZERO value is the wrong one. Set it to %s. Do NOT satisfy this "+
+							"message with an empty or zero value: that is the bug this guard exists to catch.",
+							pos, field, constName)
 						continue
 					}
 					if id, ok := val.(*ast.Ident); !ok || id.Name != constName {
@@ -143,8 +152,10 @@ func TestEveryConsoleappFoldConfigIsBounded(t *testing.T) {
 	}
 
 	// Guard the guard. An exact count, so this fails both when the matcher goes
-	// blind (rename, moved package, a helper building the struct another way)
+	// blind (the package renamed or moved)
 	// and when a literal is added without a human deciding it belongs here.
+	// It does NOT catch a config built without a literal of this type at all;
+	// see the scope note on this function, which is the authority on that.
 	if found != wantFoldConfigs {
 		t.Errorf("found %d reconstruct.FullTableConfig literals in package consoleapp, want exactly %d.\n"+
 			"Fewer means this guard stopped looking at the code it is supposed to guard. More means a "+
@@ -153,8 +164,10 @@ func TestEveryConsoleappFoldConfigIsBounded(t *testing.T) {
 	}
 }
 
-// localNameFor returns the name `path` is bound to in this file ("" for a dot
-// import, which puts the type in file scope) and whether it is imported at all.
+// localNameFor returns the name `path` is bound to in this file and whether it
+// is imported at all. A dot import reports ".", which is what go/ast stores in
+// ImportSpec.Name for `import . "path"` (NOT ""), and is the sentinel
+// isFullTableConfig checks to accept a bare FullTableConfig identifier.
 func localNameFor(file *ast.File, path string) (string, bool) {
 	for _, imp := range file.Imports {
 		p, err := strconv.Unquote(imp.Path.Value)
@@ -165,7 +178,7 @@ func localNameFor(file *ast.File, path string) (string, bool) {
 			if imp.Name.Name == "_" {
 				return "", false
 			}
-			return imp.Name.Name, true // named import, dot import included as ""
+			return imp.Name.Name, true // alias, or "." for a dot import
 		}
 		return filepath.Base(p), true
 	}

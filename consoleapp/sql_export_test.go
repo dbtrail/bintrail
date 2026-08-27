@@ -327,6 +327,15 @@ func TestSQLExportFoldConfig_sharesTheDaemonBounds(t *testing.T) {
 		t.Errorf("WarnEventThreshold = %d, want %d (the shared in-daemon bound)",
 			cfg.WarnEventThreshold, daemonFoldWarnEventThreshold)
 	}
+	if cfg.RemediationHint == "" {
+		t.Error("RemediationHint left empty: the warning falls back to the CLI wording, " +
+			"which names --at / --parallelism / --warn-event-threshold. bintrail-console " +
+			"registers none of them, so the operator is sent after flags that do not exist")
+	}
+	if cfg.RemediationHint != daemonFoldRemediation {
+		t.Errorf("RemediationHint = %q, want the shared constant", cfg.RemediationHint)
+	}
+
 	// The engine's fail-closed contract for an artifact the operator will load.
 	if cfg.AllowGaps {
 		t.Error("AllowGaps = true: a dump built over a known capture gap would " +

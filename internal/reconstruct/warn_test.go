@@ -233,3 +233,62 @@ func TestMaybeWarnEventVolume_remediation(t *testing.T) {
 		}
 	})
 }
+
+// TestWithFoldBudgets pins the SEAM, which is where this repo's defects live.
+//
+// Every budget a caller sets on FullTableConfig has to survive the translation
+// into the foldConfig the fold actually runs with. Before this helper existed
+// those four assignments were written out at each foldEventWindow call site,
+// and deleting one line at EITHER site reverted the budget with the whole test
+// suite green, because nothing drives a FullTableConfig through foldConfig into
+// the warning. Setting the field and READING it are different claims; the
+// config-tier tests in consoleapp only ever made the first.
+//
+// Every wanted value below is distinct and non-zero, so a helper that copied
+// the wrong field, or none, cannot pass by coincidence.
+func TestWithFoldBudgets(t *testing.T) {
+	cfg := FullTableConfig{
+		FetchBatchSize:     4242,
+		WarnEventThreshold: 777_777,
+		Parallelism:        3,
+		Tables:             []string{"a.one", "a.two", "a.three", "a.four"},
+		RemediationHint:    "do the thing this binary can actually do",
+	}
+	// A non-empty starting foldConfig: the helper must OVERWRITE the budgets,
+	// not merely fill in blanks, or a caller that pre-set a stale value keeps it.
+	got := withFoldBudgets(cfg, foldConfig{
+		Schema: "shop", Table: "orders",
+		BatchSize: 1, WarnEventThreshold: 1, Parallelism: 1, RemediationHint: "stale",
+	})
+
+	if got.BatchSize != 4242 {
+		t.Errorf("BatchSize = %d, want 4242", got.BatchSize)
+	}
+	if got.WarnEventThreshold != 777_777 {
+		t.Errorf("WarnEventThreshold = %d, want 777777", got.WarnEventThreshold)
+	}
+	if got.RemediationHint != cfg.RemediationHint {
+		t.Errorf("RemediationHint = %q, want %q.\nThis is the field whose whole point is that the "+
+			"daemon's warning must not name CLI flags that binary does not register.",
+			got.RemediationHint, cfg.RemediationHint)
+	}
+	// The DIVISOR, not the raw field. 4 tables against Parallelism 3 leaves 3.
+	if got.Parallelism != 3 {
+		t.Errorf("Parallelism = %d, want 3 (effectiveParallelism, not cfg.Parallelism verbatim)", got.Parallelism)
+	}
+	// Fields the helper has no business touching must survive untouched.
+	if got.Schema != "shop" || got.Table != "orders" {
+		t.Errorf("helper clobbered non-budget fields: schema=%q table=%q", got.Schema, got.Table)
+	}
+
+	t.Run("clamps the divisor to the table count", func(t *testing.T) {
+		// One table cannot run concurrently with anything, so dividing the
+		// threshold by a parallelism it can never reach would warn early.
+		got := withFoldBudgets(FullTableConfig{
+			Parallelism: 8, Tables: []string{"a.one"}, WarnEventThreshold: 5_000_000,
+		}, foldConfig{})
+		if got.Parallelism != 1 {
+			t.Errorf("Parallelism = %d, want 1 for a single-table run", got.Parallelism)
+		}
+	})
+}

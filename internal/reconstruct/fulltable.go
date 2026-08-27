@@ -327,6 +327,26 @@ func maybeWarnEventVolume(schema, table string, n int64, threshold int64, parall
 		"hint", remediationOrDefault(remediation))
 }
 
+// withFoldBudgets copies every caller-facing budget from a FullTableConfig onto
+// the foldConfig a fold actually runs with.
+//
+// It exists because these four assignments used to be written out at each
+// foldEventWindow call site, and a one-line deletion at EITHER site silently
+// reverted the budget with the whole suite green: nothing drives
+// FullTableConfig through foldConfig into the warning, so the seam had no
+// coverage at all. One function means one place to delete and one place to
+// test.
+func withFoldBudgets(cfg FullTableConfig, fc foldConfig) foldConfig {
+	fc.BatchSize = cfg.FetchBatchSize
+	fc.WarnEventThreshold = cfg.WarnEventThreshold
+	// The DIVISOR, not the raw field: effectiveParallelism clamps to
+	// len(cfg.Tables), so a single-table run is not divided by a parallelism it
+	// can never reach.
+	fc.Parallelism = effectiveParallelism(cfg)
+	fc.RemediationHint = cfg.RemediationHint
+	return fc
+}
+
 // remediationOrDefault falls back to the attended-CLI wording. Callers on a
 // surface that registers none of these flags set FullTableConfig.RemediationHint
 // instead; see the field's doc for why naming an absent flag is a defect.
@@ -1003,22 +1023,18 @@ func ReconstructTable(
 	// to query archives — it already handles the empty-archive case in its fast
 	// path. The pre-#1097 `len(archSources)==0` gate was wrong: it disabled
 	// archive routing even when the fetch could have resolved sources itself.
-	fold, err := foldEventWindow(ctx, foldConfig{
-		DB:                 db,
-		Engine:             engine,
-		DBName:             dbName,
-		Resolver:           resolver,
-		Schema:             schema,
-		Table:              table,
-		PKCols:             pkCols,
-		Opts:               fetchOpts,
-		AllowGaps:          cfg.AllowGaps,
-		ArchiveFetcher:     fetcher,
-		BatchSize:          cfg.FetchBatchSize,
-		WarnEventThreshold: cfg.WarnEventThreshold,
-		Parallelism:        effectiveParallelism(cfg),
-		RemediationHint:    cfg.RemediationHint,
-	})
+	fold, err := foldEventWindow(ctx, withFoldBudgets(cfg, foldConfig{
+		DB:             db,
+		Engine:         engine,
+		DBName:         dbName,
+		Resolver:       resolver,
+		Schema:         schema,
+		Table:          table,
+		PKCols:         pkCols,
+		Opts:           fetchOpts,
+		AllowGaps:      cfg.AllowGaps,
+		ArchiveFetcher: fetcher,
+	}))
 	if err != nil {
 		return nil, err
 	}
@@ -1835,7 +1851,7 @@ func reconstructBinlogOnly(
 	// this fallback has no baseline to bound the window, so it is if anything
 	// the more exposed of the two — it fetches the WHOLE retained binlog
 	// history for the table.
-	fold, err := foldEventWindow(ctx, foldConfig{
+	fold, err := foldEventWindow(ctx, withFoldBudgets(cfg, foldConfig{
 		DB:       db,
 		Engine:   engine,
 		DBName:   dbName,
@@ -1850,13 +1866,9 @@ func reconstructBinlogOnly(
 			// No Since — there is no baseline instant to anchor from; fetch
 			// the whole retained binlog-only window up to cfg.At.
 		},
-		AllowGaps:          cfg.AllowGaps,
-		ArchiveFetcher:     fetcher,
-		BatchSize:          cfg.FetchBatchSize,
-		WarnEventThreshold: cfg.WarnEventThreshold,
-		Parallelism:        effectiveParallelism(cfg),
-		RemediationHint:    cfg.RemediationHint,
-	})
+		AllowGaps:      cfg.AllowGaps,
+		ArchiveFetcher: fetcher,
+	}))
 	if err != nil {
 		return nil, err
 	}
