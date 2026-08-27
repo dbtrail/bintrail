@@ -124,13 +124,19 @@ This is the economic core of the retention design: **keep days hot in MySQL, kee
 required = live window (MySQL, expensive)  +  archive history (Parquet, cheap)
 ```
 
-## The failure mode: disk-full is a forensic gap
+## The failure mode: the index volume is a forensic gap, whether it is full or slow
 
 This is not a performance footnote. If the index volume fills:
 
 1. Index writes fail and **the stream stalls**.
 2. The source keeps purging its binlogs on its own retention schedule.
 3. If the stall outlives the source's binlog retention, the missed events are **gone — a permanent gap in the forensic record**, which is the product's entire value.
+
+**A volume that is merely too slow arrives at the same place by a quieter route.** Writes still succeed, so nothing errors and nothing crosses a free-space threshold, but they complete slower than events arrive. Capture falls further behind every second, and steps 2 and 3 then follow unchanged: once the lag exceeds the source's binlog retention, the events the stream has not reached yet are purged before it gets to them.
+
+The two cases need different alarms, because free disk catches the first and is blind to the second. The signal for the second is `bintrail_stream_replication_lag_seconds`, which `stream` already exports on `--metrics-addr`; ready-made alert rules are in [deployment.md §7](./deployment.md). Set the threshold against the source's **actual** binlog retention (`SHOW VARIABLES LIKE 'binlog_expire_logs_seconds'`, or `CALL mysql.rds_show_configuration()` and read `binlog retention hours` on RDS), because that retention is the deadline the lag is racing. A lag alert at 5 minutes protects nothing if the source keeps 30 minutes of binlog and the stream needs an hour to recover.
+
+Sustained write throughput on the index is a configuration question before it is a hardware one. The InnoDB settings in [deployment.md §3](./deployment.md) are not polish. `innodb_redo_log_capacity` is the one to check first: it defaults to 100 MB, and an index left there forces a checkpoint flush every 100 MB of redo, which on a busy source is minutes, not hours. A BYO index that skips that section can fall behind a source that the same hardware would otherwise keep up with, and the symptom is growing lag rather than any error.
 
 Prevention is rotation: without a scheduled `rotate`, `binlog_events` grows **unbounded** — the design is explicit lifecycle, not implicit GC. Run `rotate --retain <window>` on a schedule (cron, systemd timer, or `--daemon`) from day one, not after the first scare. If you are already near full, the emergency recipe is in [deployment.md §12](./deployment.md) — `DROP PARTITION` is a metadata operation and reclaims space immediately.
 
