@@ -179,20 +179,23 @@ func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (t
 	return s.foldSnapshot(req, at, tableList)
 }
 
-// The unattended fold's two bounded knobs. Both are spelled out rather than
-// left at zero because, unlike every other budget on FullTableConfig, their
-// zero values mean the opposite of conservative.
+// The bounded knobs EVERY in-daemon fold shares: the periodic refresh, the
+// point-in-time restore, and the SQL export build. All three fold inside the
+// process that is also capturing, so they get one posture rather than three
+// opinions. Both are spelled out rather than left at zero because, unlike
+// every other budget on FullTableConfig, their zero values mean the opposite
+// of conservative.
 const (
-	// refreshWarnEventThreshold matches the --warn-event-threshold default the
+	// daemonFoldWarnEventThreshold matches the --warn-event-threshold default the
 	// CLI ships (internal/cli/reconstruct.go, cliapp/baseline_refresh.go, and
-	// the hardcoded one in internal/cli/drill.go), so the unattended path is at
+	// the hardcoded one in internal/cli/drill.go), so the in-daemon paths are at
 	// least as loud as the attended one. Zero DISABLES the warning outright:
 	// shouldWarnEvents is `threshold > 0 && n > threshold`. Silence is backwards
 	// here, because the operator who typed the command is watching the output
 	// and this job has nobody reading it.
-	refreshWarnEventThreshold = 5_000_000
+	daemonFoldWarnEventThreshold = 5_000_000
 
-	// refreshParallelism bounds how many tables fold concurrently. Zero means
+	// daemonFoldParallelism bounds how many tables fold concurrently. Zero means
 	// runtime.NumCPU(), and peak resident memory is the SUM of the
 	// concurrently-folding tables' change maps (the reason scaledEventThreshold
 	// divides by parallelism at all, #842), each holding one entry per distinct
@@ -201,7 +204,7 @@ const (
 	// the process that is also capturing. Two lets a slow table overlap with the
 	// next one without letting the peak track the hardware; lower it before
 	// raising it.
-	refreshParallelism = 2
+	daemonFoldParallelism = 2
 )
 
 // refreshFoldConfig is the configuration one refresh cycle folds with.
@@ -218,8 +221,8 @@ func refreshFoldConfig(req refreshRequest, at time.Time, tableList []string) rec
 		OutputDir:             req.BaselineDir,
 		OutputFormat:          reconstruct.OutputFormatParquet,
 		CarryForwardUnchanged: req.CarryForwardUnchanged,
-		Parallelism:           refreshParallelism,
-		WarnEventThreshold:    refreshWarnEventThreshold,
+		Parallelism:           daemonFoldParallelism,
+		WarnEventThreshold:    daemonFoldWarnEventThreshold,
 		// AllowGaps stays FALSE. An unattended job must never publish a
 		// knowingly-incomplete baseline: accepting a permanent capture loss is a
 		// decision with consequences for every future reconstruct, and nobody is

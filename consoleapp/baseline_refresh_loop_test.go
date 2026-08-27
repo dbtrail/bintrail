@@ -778,15 +778,15 @@ func TestRefreshFoldConfig_boundsTheUnattendedFold(t *testing.T) {
 		t.Error("Parallelism left at zero: the fold would inherit runtime.NumCPU() " +
 			"and scale its peak memory with the host, inside the capture process")
 	}
-	if cfg.Parallelism != refreshParallelism {
-		t.Errorf("Parallelism = %d, want %d", cfg.Parallelism, refreshParallelism)
+	if cfg.Parallelism != daemonFoldParallelism {
+		t.Errorf("Parallelism = %d, want %d", cfg.Parallelism, daemonFoldParallelism)
 	}
 	if cfg.WarnEventThreshold == 0 {
 		t.Error("WarnEventThreshold left at zero: shouldWarnEvents is " +
 			"`threshold > 0 && n > threshold`, so the unattended fold would never warn")
 	}
-	if cfg.WarnEventThreshold != refreshWarnEventThreshold {
-		t.Errorf("WarnEventThreshold = %d, want %d", cfg.WarnEventThreshold, refreshWarnEventThreshold)
+	if cfg.WarnEventThreshold != daemonFoldWarnEventThreshold {
+		t.Errorf("WarnEventThreshold = %d, want %d", cfg.WarnEventThreshold, daemonFoldWarnEventThreshold)
 	}
 }
 
@@ -803,11 +803,11 @@ func TestRefreshFoldConfig_restoreSharesTheBounds(t *testing.T) {
 	})
 	cfg := refreshFoldConfig(req, at, []string{"shop.orders"})
 
-	if cfg.Parallelism != refreshParallelism {
-		t.Errorf("restore Parallelism = %d, want %d", cfg.Parallelism, refreshParallelism)
+	if cfg.Parallelism != daemonFoldParallelism {
+		t.Errorf("restore Parallelism = %d, want %d", cfg.Parallelism, daemonFoldParallelism)
 	}
-	if cfg.WarnEventThreshold != refreshWarnEventThreshold {
+	if cfg.WarnEventThreshold != daemonFoldWarnEventThreshold {
 		t.Errorf("restore WarnEventThreshold = %d, want %d",
-			cfg.WarnEventThreshold, refreshWarnEventThreshold)
+			cfg.WarnEventThreshold, daemonFoldWarnEventThreshold)
 	}
 }
