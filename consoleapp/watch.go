@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -853,6 +854,32 @@ func newBaselineSupervisorFromConfig(ctx context.Context, stagingDir string) *ba
 	return sup
 }
 
+// envBoolOr reads a boolean environment variable, keeping fallback when the
+// variable is unset or does not parse.
+//
+// strconv.ParseBool rather than a hand-written value list, because the repo
+// already had two conventions for this (pflag's ParseBool behind
+// BINTRAIL_ULTRAFAST, any-non-empty behind BINTRAIL_DUCKDB_NO_AWS_EXT) and a
+// third one written inline would be the one nobody can predict. ParseBool is
+// the same set pflag accepts: 1/t/T/TRUE/true/True and their false twins.
+//
+// An unparseable value keeps the fallback rather than erroring, and that is the
+// conservative direction for every current caller: with no flag passed the
+// fallback is the safe default, so a typo can only fail to turn something on.
+func envBoolOr(name string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("environment variable is not a true/false value, so it was ignored",
+			"variable", name, "value", raw, "using", fallback)
+		return fallback
+	}
+	return v
+}
+
 func resolveUpConsoleEnv(cmd *cobra.Command) error {
 	if !cmd.Flags().Changed("console-listen") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_LISTEN"); v != "" {
@@ -885,13 +912,7 @@ func resolveUpConsoleEnv(cmd *cobra.Command) error {
 		}
 	}
 	if !cmd.Flags().Changed("baseline-carry-forward-unchanged") {
-		// Only "1"/"true" turn it on. Anything else, including a typo, leaves
-		// the conservative default: this changes the on-disk representation, so
-		// an unreadable value must never be read as consent.
-		switch strings.ToLower(strings.TrimSpace(os.Getenv("BINTRAIL_BASELINE_CARRY_FORWARD_UNCHANGED"))) {
-		case "1", "true", "yes", "on":
-			upBaselineCarryForward = true
-		}
+		upBaselineCarryForward = envBoolOr("BINTRAIL_BASELINE_CARRY_FORWARD_UNCHANGED", upBaselineCarryForward)
 	}
 	if !cmd.Flags().Changed("console-servers-file") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_SERVERS"); v != "" {

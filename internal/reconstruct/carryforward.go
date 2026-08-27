@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,16 +69,24 @@ import (
 // # Hard link, then copy
 //
 // A link is tried first because the whole point is to stop paying for bytes
-// that did not change. Old and new snapshot directories live under the same
-// baseline root and therefore the same filesystem, so it normally succeeds.
+// that did not change. Under the daemon loop the old and new snapshot
+// directories live under one baseline root and therefore one filesystem, so it
+// normally succeeds. That is a property of the loop, not of the function: the
+// CLI's `baseline refresh --baseline-dir /a --output /b` is a documented shape
+// and puts the two on different devices, which is what the copy path is for.
 // Snapshot files are written once and never modified in place, so sharing an
 // inode between two snapshots is safe. The copy fallback covers a filesystem
 // that has no links and the cross-device case.
 //
 // One consequence to know: a prune that removes the older snapshot will not
 // reclaim a linked file's bytes while the newer one still references it. That
-// is correct (the data is still in use) but it means reclaimed-space figures
-// count the directory entry, not the blocks.
+// is correct (the data is still in use) but it means `bintrail baseline prune`
+// reports reclaimed bytes it did not reclaim.
+//
+// `du` is the narrower hazard it is tempting to state too broadly: one `du`
+// over the baseline root tracks inodes within its own traversal and reports the
+// truth. It is a `du` run per snapshot directory, as separate invocations, that
+// counts the shared file twice.
 func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table string) (linked bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -98,9 +107,18 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
-	if err := os.Link(srcPath, dst); err == nil {
+	linkErr := os.Link(srcPath, dst)
+	if linkErr == nil {
 		return true, nil
 	}
+	// The copy is the designed fallback, not a failure, so this stays at Debug
+	// and the error is never returned. It is logged rather than dropped because
+	// the two causes are worlds apart: a cross-device destination copies once
+	// by design, while a permission or filesystem limit copies every table on
+	// every cycle forever, which is the exact cost the opt-in was taken to
+	// avoid, and nothing else would ever say so.
+	slog.Debug("carry forward: hard link refused, copying instead",
+		"src", srcPath, "dst", dst, "error", linkErr)
 	return false, copyFile(srcPath, dst)
 }
 
@@ -111,8 +129,8 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 //
 // enabled is the operator's explicit opt-in, and the default is off. The output
 // is the same rows either way, but the REPRESENTATION on disk is not: carrying
-// a file forward hard-links two snapshots to one inode, so `du` and a prune
-// report space they will not reclaim while the newer snapshot references it,
+// a file forward hard-links two snapshots to one inode, so a prune reports
+// space it will not reclaim while the newer snapshot references it,
 // and one snapshot ends up holding tables anchored at different binlog
 // coordinates. Those are defensible trade-offs for a loop that would otherwise
 // rewrite terabytes to apply a handful of rows, and they are not something to

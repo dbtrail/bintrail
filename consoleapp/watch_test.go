@@ -619,3 +619,112 @@ func TestMainSourceJobInfo(t *testing.T) {
 		t.Errorf("mariadb flavor: got %+v, want %+v", got, want)
 	}
 }
+
+// TestUpConsoleConfig_baselineRefreshDefaultsReachTheConsole pins the READ path
+// of the reuse setting: daemon flag and env -> console.Config -> the panel.
+//
+// The write path (console toggle -> fold) is pinned hop by hop; this direction
+// had nothing, and it is the one the panel's whole job depends on. Deleting the
+// BaselineRefreshDefaults block in upConsoleConfig, or hardcoding Enabled to
+// true, would leave the card reporting a setting the daemon is not running,
+// which is worse than no card: the operator's consent would be recorded against
+// the wrong behaviour.
+//
+// Enabled is asserted in BOTH directions on purpose. It is the difference
+// between "this applies now" and "this applies after a restart", and a mutation
+// that pins it to one value passes every test that only ever asks for that one.
+func TestUpConsoleConfig_baselineRefreshDefaultsReachTheConsole(t *testing.T) {
+	const dsn = "user:pass@tcp(127.0.0.1:3306)/binlog_index"
+	opts := consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"}
+
+	prevCarry, prevEvery := upBaselineCarryForward, upBaselineRefreshEvery
+	t.Cleanup(func() { upBaselineCarryForward, upBaselineRefreshEvery = prevCarry, prevEvery })
+
+	for _, tc := range []struct {
+		name        string
+		carry       bool
+		every       string
+		wantCarry   bool
+		wantEnabled bool
+	}{
+		{"no schedule, reuse off", false, "", false, false},
+		// The case that matters: reuse asked for, but no loop to do it. The
+		// panel must report it dormant rather than live.
+		{"no schedule, reuse on", true, "", true, false},
+		{"scheduled, reuse off", false, "30m", false, true},
+		{"scheduled, reuse on", true, "30m", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upBaselineCarryForward, upBaselineRefreshEvery = tc.carry, tc.every
+			cfg, err := upConsoleConfig(nil, dsn, opts)
+			if err != nil {
+				t.Fatalf("upConsoleConfig: %v", err)
+			}
+			got := cfg.BaselineRefreshDefaults
+			if got.CarryForwardUnchanged != tc.wantCarry {
+				t.Errorf("CarryForwardUnchanged=%v, want %v: the daemon flag did not reach the console",
+					got.CarryForwardUnchanged, tc.wantCarry)
+			}
+			if got.Enabled != tc.wantEnabled {
+				t.Errorf("Enabled=%v, want %v: the panel would misreport whether a refresh loop is running",
+					got.Enabled, tc.wantEnabled)
+			}
+		})
+	}
+}
+
+// TestResolveUpConsoleEnv_carryForwardPrecedence: an explicit flag beats the
+// environment, and an unreadable environment value beats nothing.
+//
+// Both halves are load-bearing and neither was covered. An env var that
+// overrode an explicit --baseline-carry-forward-unchanged=false would change
+// the on-disk shape of an operator's backups against their written instruction,
+// and a value like "yes" silently turning it on is the "unreadable value must
+// never be read as consent" rule this parse exists for.
+func TestResolveUpConsoleEnv_carryForwardPrecedence(t *testing.T) {
+	prev := upBaselineCarryForward
+	t.Cleanup(func() { upBaselineCarryForward = prev })
+
+	newCmd := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "watch"}
+		cmd.Flags().BoolVar(&upBaselineCarryForward, "baseline-carry-forward-unchanged", false, "")
+		return cmd
+	}
+
+	for _, tc := range []struct {
+		name    string
+		env     string
+		flagSet string // "" = not passed
+		want    bool
+	}{
+		{"env on, no flag", "true", "", true},
+		{"env off, no flag", "false", "", false},
+		{"unset, no flag", "", "", false},
+		// Not a true/false value: keeps the default, never read as consent.
+		{"env says yes, no flag", "yes", "", false},
+		{"env says on, no flag", "on", "", false},
+		{"env typo, no flag", "ture", "", false},
+		// An explicit flag is the operator's written instruction; the
+		// environment must not overrule it in either direction.
+		{"env on, flag says false", "true", "false", false},
+		{"env off, flag says true", "false", "true", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upBaselineCarryForward = false
+			t.Setenv("BINTRAIL_BASELINE_CARRY_FORWARD_UNCHANGED", tc.env)
+			cmd := newCmd()
+			if tc.flagSet != "" {
+				if err := cmd.Flags().Set("baseline-carry-forward-unchanged", tc.flagSet); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := resolveUpConsoleEnv(cmd); err != nil {
+				t.Fatalf("resolveUpConsoleEnv: %v", err)
+			}
+			if upBaselineCarryForward != tc.want {
+				t.Errorf("carry-forward = %v, want %v (env=%q flag=%q)",
+					upBaselineCarryForward, tc.want, tc.env, tc.flagSet)
+			}
+		})
+	}
+}

@@ -23,6 +23,15 @@ type baselineRefreshDTO struct {
 // baselineRefreshRequest is the PUT /api/baseline-refresh body.
 type baselineRefreshRequest struct {
 	CarryForwardUnchanged bool `json:"carry_forward_unchanged"`
+	// UseDefault clears the saved override instead of writing one, handing the
+	// decision back to the daemon's own flag and environment.
+	//
+	// A separate field rather than a null CarryForwardUnchanged, because the
+	// two absences must not mean the same thing: a body with no keys has to
+	// stay "off", the conservative value, and making absence mean "clear"
+	// would turn a truncated request into whatever the daemon flag happens to
+	// say, including on.
+	UseDefault bool `json:"use_default"`
 }
 
 // handleBaselineRefreshGet serves GET /api/baseline-refresh. Always readable:
@@ -52,13 +61,18 @@ func (s *Server) effectiveBaselineRefresh() baselineRefreshDTO {
 }
 
 // handleBaselineRefreshUpdate serves PUT /api/baseline-refresh: persist a
-// global override. It applies live, because every refresh cycle re-reads the
-// registry. Refused on the read-only console, which runs no loop to consume it,
-// and on a newer-version (read-only) registry file.
+// global override, or clear one. Refused on the read-only console, which runs
+// no loop to consume it, and on a newer-version (read-only) registry file.
 //
-// The body is decoded into a struct with a bool rather than read as a partial
-// patch on purpose: a missing key decodes to false, which is the conservative
-// value, so a truncated body can only ever turn the behaviour OFF.
+// It applies on the next tick of a loop that is ALREADY running, because every
+// cycle re-reads the registry. With no --baseline-refresh-interval there is no
+// loop and it applies to nothing until the daemon is restarted with one, which
+// is what the DTO's Enabled reports and what the panel has to keep saying.
+//
+// The body is decoded into a struct with plain bools rather than read as a
+// partial patch on purpose: a body with the key absent decodes to false, which
+// is the conservative value, so a body that lost keys can only ever turn the
+// behaviour OFF, never on.
 func (s *Server) handleBaselineRefreshUpdate(w http.ResponseWriter, r *http.Request) {
 	if s.monitorCtrl == nil {
 		writeJSONError(w, http.StatusForbidden,
@@ -70,9 +84,11 @@ func (s *Server) handleBaselineRefreshUpdate(w http.ResponseWriter, r *http.Requ
 		writeBodyDecodeError(w, err)
 		return
 	}
-	if err := s.cm.reg.SetBaselineRefresh(BaselineRefreshConfig{
-		CarryForwardUnchanged: req.CarryForwardUnchanged,
-	}); err != nil {
+	var bc *BaselineRefreshConfig
+	if !req.UseDefault {
+		bc = &BaselineRefreshConfig{CarryForwardUnchanged: req.CarryForwardUnchanged}
+	}
+	if err := s.cm.reg.SetBaselineRefresh(bc); err != nil {
 		writeJSONError(w, registryErrStatus(err), err.Error())
 		return
 	}

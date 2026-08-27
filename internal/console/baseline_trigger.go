@@ -108,6 +108,11 @@ type BaselineRestoreRequest struct {
 	IndexDSN    string
 	BaselineDir string
 	At          time.Time
+	// CarryForwardUnchanged is the effective setting the console resolved for
+	// this restore. A restore is the same fold the refresh performs, into the
+	// same store, so it honours the same operator choice; leaving it out is
+	// how the two silently diverged.
+	CarryForwardUnchanged bool
 }
 
 type BaselineStatus struct {
@@ -116,11 +121,17 @@ type BaselineStatus struct {
 	FinishedAt string `json:"finished_at,omitempty"`
 	LastError  string `json:"last_error,omitempty"`
 	Tables     int    `json:"tables,omitempty"`
-	Rows       int64  `json:"rows,omitempty"`
+	// Carried counts tables published by reusing the previous snapshot's file
+	// rather than folding them again (refresh and restore only). It is the
+	// ONLY confirmation the operator gets that the reuse setting did anything:
+	// without it a run that reused every file and a run that rewrote every
+	// file report identically.
+	Carried int   `json:"carried,omitempty"`
+	Rows    int64 `json:"rows,omitempty"`
 	// Bytes is the finished artifact's on-disk weight (sql-export builds
 	// only) — the UI's download confirm and Ready line read it.
-	Bytes int64 `json:"bytes,omitempty"`
-	Uploaded   int    `json:"uploaded,omitempty"`
+	Bytes    int64 `json:"bytes,omitempty"`
+	Uploaded int   `json:"uploaded,omitempty"`
 	// At is the anchor instant of a refresh or restore run (RFC3339 UTC): the
 	// moment the published snapshot represents, which is also its directory
 	// name. A sql-export build stamps it too (the instant the dump
@@ -299,11 +310,12 @@ func (s *Server) handleBaselineRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req := BaselineRestoreRequest{
-		ServerID:    e.ID,
-		ServerName:  e.Name,
-		IndexDSN:    e.DSN,
-		BaselineDir: e.BaselineDir,
-		At:          at,
+		ServerID:              e.ID,
+		ServerName:            e.Name,
+		IndexDSN:              e.DSN,
+		BaselineDir:           e.BaselineDir,
+		At:                    at,
+		CarryForwardUnchanged: s.effectiveBaselineRefresh().CarryForwardUnchanged,
 	}
 	if err := s.baselineRestore.TriggerRestore(req); err != nil {
 		if errors.Is(err, ErrBaselineRunning) {

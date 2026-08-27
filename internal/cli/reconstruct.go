@@ -145,6 +145,7 @@ var (
 
 	// Full-table mydumper output mode (#187).
 	recOutputFormat string
+	recCarryForward bool
 	recOutputDir    string
 	recTables       string
 	recChunkSize    string
@@ -170,6 +171,7 @@ func init() {
 	reconstructCmd.Flags().BoolVar(&recAllowGaps, "allow-gaps", false, "Proceed even when the event index has missing hours in the baseline-to-target range (may produce incomplete reconstruction)")
 	// Full-table mydumper mode (#187).
 	reconstructCmd.Flags().StringVar(&recOutputFormat, "output-format", "", "Output format for full-table mode: 'mydumper' for a mydumper-compatible dump directory, 'parquet' for a discoverable baseline snapshot (default: single-row mode)")
+	reconstructCmd.Flags().BoolVar(&recCarryForward, "carry-forward-unchanged", false, "Off by default. With --output-format parquet, publish a table that had no changes by reusing the previous snapshot's file (hard link where possible) instead of writing it again")
 	reconstructCmd.Flags().StringVar(&recOutputDir, "output-dir", "", "Output directory for full-table mode (created if missing); with --output-format=parquet this is the baselines root and the snapshot lands in a <timestamp>/ subdirectory")
 	reconstructCmd.Flags().StringVar(&recTables, "tables", "", "Comma-separated schema.table list for full-table mode (e.g. mydb.orders,mydb.users)")
 	reconstructCmd.Flags().StringVar(&recChunkSize, "chunk-size", "256MB", "Max size per SQL chunk file in full-table mode (e.g. 64MB, 1GB)")
@@ -752,18 +754,23 @@ func runReconstructFullTable(cmd *cobra.Command, start time.Time) error {
 
 	// ── Run ────────────────────────────────────────────────────────────────
 	cfg := reconstruct.FullTableConfig{
-		IndexDSN:           recIndexDSN,
-		BaselineSrc:        baselineSrc,
-		Tables:             tables,
-		At:                 at,
-		OutputDir:          recOutputDir,
-		OutputFormat:       recOutputFormat,
-		ChunkSize:          chunkSize,
-		Parallelism:        recParallelism,
-		AllowGaps:          recAllowGaps,
-		WarnEventThreshold: recWarnEvents,
-		FetchBatchSize:     recFetchBatch,
-		ArchiveFetcher:     TunedArchiveFetcher(duckTuning),
+		IndexDSN:     recIndexDSN,
+		BaselineSrc:  baselineSrc,
+		Tables:       tables,
+		At:           at,
+		OutputDir:    recOutputDir,
+		OutputFormat: recOutputFormat,
+		// Opt-in here too, and for the same reason the daemon needs its own
+		// flag: this command can publish a discoverable snapshot (#1169), so
+		// without it the one surface an operator drives by hand is the one
+		// that can never reuse a file.
+		CarryForwardUnchanged: recCarryForward,
+		ChunkSize:             chunkSize,
+		Parallelism:           recParallelism,
+		AllowGaps:             recAllowGaps,
+		WarnEventThreshold:    recWarnEvents,
+		FetchBatchSize:        recFetchBatch,
+		ArchiveFetcher:        TunedArchiveFetcher(duckTuning),
 		// Same resolved --ultrafast/--duckdb-* budget as ArchiveFetcher above,
 		// but for the merge/baseline DuckDB sessions ReconstructTables opens
 		// directly (#842) — those previously ignored these flags entirely and

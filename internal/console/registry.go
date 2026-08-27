@@ -269,9 +269,6 @@ func (r *Registry) Rotation() (RotationConfig, bool) {
 	return *r.file.Rotation, true
 }
 
-// SetRotation persists the global rotation policy. Like every registry
-// mutation it rewrites the file atomically and is refused on a newer-version
-// (read-only) file. The caller validates the field grammar.
 // BaselineRefresh returns the saved override and whether one exists. Absent
 // means the daemon's own defaults are in force.
 func (r *Registry) BaselineRefresh() (BaselineRefreshConfig, bool) {
@@ -285,14 +282,20 @@ func (r *Registry) BaselineRefresh() (BaselineRefreshConfig, bool) {
 
 // SetBaselineRefresh persists a global baseline-refresh override, rolling back
 // the in-memory value if the write fails so the two never diverge.
-func (r *Registry) SetBaselineRefresh(bc BaselineRefreshConfig) error {
+//
+// A nil argument CLEARS the override, which is what returns the daemon's own
+// flag and environment to force. Without it the panel would be a one-way door:
+// the tri-state that lets a saved "off" beat a flag saying "on" also means that
+// once anything is saved, the flag can never be heard again short of editing
+// the file by hand.
+func (r *Registry) SetBaselineRefresh(bc *BaselineRefreshConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.readOnly {
 		return ErrRegistryReadOnly
 	}
 	prev := r.file.BaselineRefresh
-	r.file.BaselineRefresh = &bc
+	r.file.BaselineRefresh = bc
 	if err := r.save(); err != nil {
 		r.file.BaselineRefresh = prev // roll back
 		return err
@@ -300,6 +303,9 @@ func (r *Registry) SetBaselineRefresh(bc BaselineRefreshConfig) error {
 	return nil
 }
 
+// SetRotation persists the global rotation policy. Like every registry
+// mutation it rewrites the file atomically and is refused on a newer-version
+// (read-only) file. The caller validates the field grammar.
 func (r *Registry) SetRotation(rc RotationConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

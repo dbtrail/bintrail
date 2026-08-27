@@ -47,7 +47,7 @@ func (s *baselineSupervisor) RestoreStatus(serverID string) console.BaselineStat
 
 func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 	started := time.Now().UTC()
-	tables, refused, err := s.executeRestore(req)
+	tables, refused, carried, err := s.executeRestore(req)
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRestore, StartedAt: started.Format(time.RFC3339),
 		SnapshotTime: publishedSnapshotTime(req.At, err), Tables: tables, Refused: refused,
@@ -63,6 +63,7 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 	st.FinishedAt = nowStamp()
 	st.Tables = tables
 	st.Refused = refused
+	st.Carried = carried
 	if err != nil {
 		st.State = "failed"
 		st.LastError = err.Error()
@@ -82,17 +83,22 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 // the snapshot FindBaseline will anchor on (newest at-or-before At), NOT the
 // newest snapshot overall: restoring to a moment before the newest snapshot
 // must fold the older snapshot's tables.
-func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) (tables, refused int, err error) {
+func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) (tables, refused, carried int, err error) {
 	tableList, err := reconstruct.SnapshotTablesAt(s.ctx, req.BaselineDir, req.At)
 	if err != nil {
-		return 0, 0, fmt.Errorf("list the snapshot to restore from: %w", err)
+		return 0, 0, 0, fmt.Errorf("list the snapshot to restore from: %w", err)
 	}
 	if len(tableList) == 0 {
-		return 0, 0, fmt.Errorf("no backup exists at or before %s; a restore folds an existing backup forward, so pick a moment after your oldest backup", req.At.UTC().Format("2006-01-02 15:04:05"))
+		return 0, 0, 0, fmt.Errorf("no backup exists at or before %s; a restore folds an existing backup forward, so pick a moment after your oldest backup", req.At.UTC().Format("2006-01-02 15:04:05"))
 	}
 	return s.foldSnapshot(refreshRequest{
 		ServerID: req.ServerID, ServerName: req.ServerName,
 		IndexDSN: req.IndexDSN, BaselineDir: req.BaselineDir,
+		// Carried through rather than left at the zero value: the comment on
+		// wireBaselineExtras below argues a restore is the same fold as a
+		// refresh, and a setting that applies to one and not the other makes
+		// that false. The console resolves it; this only executes it.
+		CarryForwardUnchanged: req.CarryForwardUnchanged,
 	}, req.At.UTC(), tableList)
 }
 

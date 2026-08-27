@@ -88,7 +88,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	// move the number this change exists to get right, in either direction.
 	// started stays for the RFC3339 stamp, which wants the wall clock.
 	elapsed := time.Now()
-	tables, refused, err := s.executeRefresh(req, at)
+	tables, refused, carried, err := s.executeRefresh(req, at)
 	// Measured HERE, on the far side of the `go` in TriggerRefresh, because
 	// this is where the fold actually happens. Timing the dispatch loop
 	// instead measures how long it takes to spawn a goroutine, which is
@@ -109,6 +109,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	st.FinishedAt = nowStamp()
 	st.Tables = tables
 	st.Refused = refused
+	st.Carried = carried
 	if err != nil {
 		st.State = "failed"
 		st.LastError = err.Error()
@@ -143,20 +144,17 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 // background refresh self-tune to ~80% of host RAM would starve the capture path
 // it depends on. If this ever needs to go faster, it needs its own bounded knob,
 // not the offline one.
-func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (tables, refused int, err error) {
+func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (tables, refused, carried int, err error) {
 	tableList, err := reconstruct.NewestSnapshotTables(s.ctx, req.BaselineDir)
 	if err != nil {
-		return 0, 0, fmt.Errorf("list the snapshot to refresh: %w", err)
+		return 0, 0, 0, fmt.Errorf("list the snapshot to refresh: %w", err)
 	}
 	if len(tableList) == 0 {
-		return 0, 0, fmt.Errorf("no baseline snapshot to refresh under %s", req.BaselineDir)
+		return 0, 0, 0, fmt.Errorf("no baseline snapshot to refresh under %s", req.BaselineDir)
 	}
 	return s.foldSnapshot(req, at, tableList)
 }
 
-// foldSnapshot is the fold both the periodic refresh and the point-in-time
-// restore share: reconstruct every table at `at` and publish the result as a
-// new snapshot in the server's own baseline store, all-or-nothing.
 // refreshFoldConfig is the configuration one refresh cycle folds with.
 //
 // Split out of foldSnapshot so the settings it carries are checkable without
@@ -178,12 +176,38 @@ func refreshFoldConfig(req refreshRequest, at time.Time, tableList []string) rec
 	}
 }
 
-func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tableList []string) (tables, refused int, err error) {
-	_, failures, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, refreshFoldConfig(req, at, tableList))
-	if runErr != nil {
-		return len(tableList), len(failures), runErr
+// foldSnapshot is the fold both the periodic refresh and the point-in-time
+// restore share: reconstruct every table at `at` and publish the result as a
+// new snapshot in the server's own baseline store, all-or-nothing.
+//
+// carried counts the tables published by reusing the previous snapshot's file.
+// It is read out of the per-table reports rather than inferred from the
+// setting, because asking for reuse is not getting it: a table with changes,
+// with a capture gap, or on the S3 path is folded anyway.
+// countCarried counts the tables a fold published by reusing the previous
+// snapshot's file.
+//
+// A separate function for the same reason refreshFoldConfig is one: this is the
+// last hop of the reuse feature and the only evidence it produced anything, and
+// inside foldSnapshot nothing could reach it without standing up an index and a
+// baseline. Returning len(reports) here, or 0, compiles and passes every test
+// that does not call this directly.
+func countCarried(reports []*reconstruct.TableReport) (carried int) {
+	for _, rep := range reports {
+		if rep != nil && rep.CarriedForward {
+			carried++
+		}
 	}
-	return len(tableList), 0, nil
+	return carried
+}
+
+func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tableList []string) (tables, refused, carried int, err error) {
+	reports, failures, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, refreshFoldConfig(req, at, tableList))
+	carried = countCarried(reports)
+	if runErr != nil {
+		return len(tableList), len(failures), carried, runErr
+	}
+	return len(tableList), 0, carried, nil
 }
 
 // startBaselineRefreshLoop launches the opt-in periodic baseline refresh
@@ -212,7 +236,14 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 		return fmt.Errorf("internal: --baseline-refresh-interval was set without a baseline supervisor")
 	}
 	targets := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
-	slog.Info("baseline refresh loop enabled", "interval", interval, "servers", len(targets))
+	// Name the effective reuse setting AND where it came from, once, at the one
+	// moment an operator is reading the log to see whether their configuration
+	// took. A console override beats the command line silently by design, so
+	// without this line the only symptom of a stale saved toggle is work that
+	// keeps happening, or stops happening, for no stated reason.
+	carryOn, carrySource := carryForwardProvenance(reg, carryDefault)
+	slog.Info("baseline refresh loop enabled", "interval", interval, "servers", len(targets),
+		"reuse_unchanged", carryOn, "reuse_set_by", carrySource)
 	if len(targets) == 0 {
 		// WARN, not a refusal — and the distinction is load-bearing. Every tick
 		// recomputes the target set, so "nothing to refresh" is a state a daemon
@@ -342,7 +373,7 @@ func snapshotsPer30Days(interval time.Duration) int64 {
 func refreshTick(ctx context.Context, reg *console.Registry, sup *baselineSupervisor,
 	globalDSN, globalBaselineDir string, interval time.Duration, carryDefault bool) {
 	dispatched, skipped := runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir, interval, carryDefault)
-	reportDispatch(interval, dispatched, skipped)
+	reportDispatch(interval, dispatched, skipped, effectiveCarryForward(reg, carryDefault))
 }
 
 // refreshTargetsFor builds this cycle's requests with the effective settings
@@ -372,13 +403,26 @@ func refreshTargetsFor(reg *console.Registry, globalDSN, globalBaselineDir strin
 // to false: the operator's explicit command line is a better answer than a
 // silent no.
 func effectiveCarryForward(reg *console.Registry, daemonDefault bool) bool {
+	on, _ := carryForwardProvenance(reg, daemonDefault)
+	return on
+}
+
+// carryForwardProvenance resolves the same value and also names WHERE it came
+// from, which is the half that has to be logged.
+//
+// The two sources disagree silently by design: a saved override of false beats
+// a command line saying true, and that is the point of the tri-state. It also
+// means an operator can pass the flag, watch every table get rewritten, and
+// have nothing anywhere tell them a console toggle from months ago is the
+// reason. The provenance string exists so one log line can.
+func carryForwardProvenance(reg *console.Registry, daemonDefault bool) (on bool, source string) {
 	if reg == nil {
-		return daemonDefault
+		return daemonDefault, "daemon flag or environment"
 	}
 	if bc, ok := reg.BaselineRefresh(); ok {
-		return bc.CarryForwardUnchanged
+		return bc.CarryForwardUnchanged, "console setting, which overrides the daemon flag"
 	}
-	return daemonDefault
+	return daemonDefault, "daemon flag or environment"
 }
 
 // runBaselineRefreshCycle triggers one refresh per eligible server.
@@ -434,16 +478,17 @@ func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *ba
 // refreshes are not keeping up, and it was previously logged at Debug where the
 // default level hides it. reportRefreshDuration carries the matching per-server
 // detail when the slow refresh eventually lands.
-func reportDispatch(interval time.Duration, dispatched, skipped int) {
+func reportDispatch(interval time.Duration, dispatched, skipped int, carry bool) {
 	if skipped == 0 {
-		slog.Debug("baseline refresh: dispatched", "servers", dispatched, "interval", interval)
+		slog.Debug("baseline refresh: dispatched", "servers", dispatched, "interval", interval,
+			"reuse_unchanged", carry)
 		return
 	}
 	slog.Info("baseline refresh: a server was still busy with another baseline job, so this tick did not start "+
 		"a refresh for it. That job is a refresh still folding, a manual dump, a restore or a SQL export: they "+
 		"share one lock per server. If it is the previous refresh, the interval is shorter than a refresh "+
 		"takes, and that refresh logs its own duration when it lands.",
-		"dispatched", dispatched, "skipped", skipped, "interval", interval)
+		"dispatched", dispatched, "skipped", skipped, "interval", interval, "reuse_unchanged", carry)
 }
 
 // refreshTargetDirs lists the directories that will grow, for the retention

@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -323,7 +324,7 @@ func TestReportDispatch_visibleOnlyWhenSomethingWasSkipped(t *testing.T) {
 	capture := func(dispatched, skipped int) string {
 		var buf bytes.Buffer
 		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-		reportDispatch(time.Minute, dispatched, skipped)
+		reportDispatch(time.Minute, dispatched, skipped, false)
 		return buf.String()
 	}
 
@@ -414,7 +415,7 @@ func TestEffectiveCarryForward(t *testing.T) {
 			t.Fatal(err)
 		}
 		if set != nil {
-			if err := r.SetBaselineRefresh(console.BaselineRefreshConfig{CarryForwardUnchanged: *set}); err != nil {
+			if err := r.SetBaselineRefresh(&console.BaselineRefreshConfig{CarryForwardUnchanged: *set}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -470,10 +471,17 @@ func TestRefreshTargetsFor_carriesTheEffectiveSettingIntoEveryRequest(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.SetBaselineRefresh(console.BaselineRefreshConfig{CarryForwardUnchanged: false}); err != nil {
+	if err := r.SetBaselineRefresh(&console.BaselineRefreshConfig{CarryForwardUnchanged: false}); err != nil {
 		t.Fatal(err)
 	}
-	for _, req := range refreshTargetsFor(r, "dsn", "/b", true) {
+	reqs := refreshTargetsFor(r, "dsn", "/b", true)
+	// The same vacuity guard the first leg carries. Without it, a change that
+	// stopped producing targets turns this leg into a loop over nothing and it
+	// reports a pass on an assertion that never ran.
+	if len(reqs) == 0 {
+		t.Fatal("no targets, so the assertion below checks nothing")
+	}
+	for _, req := range reqs {
 		if req.CarryForwardUnchanged {
 			t.Errorf("an override saying off did not reach the request for %q", req.ServerName)
 		}
@@ -501,5 +509,115 @@ func TestRefreshFoldConfig_carriesTheSettingAndKeepsGapsStrict(t *testing.T) {
 		if cfg.OutputFormat != reconstruct.OutputFormatParquet {
 			t.Errorf("OutputFormat = %q, want parquet", cfg.OutputFormat)
 		}
+	}
+}
+
+// TestCountCarried: the reuse count is the only confirmation an operator gets
+// that the opt-in did anything, so it is derived from the per-table reports and
+// never from the setting. Asking for reuse is not getting it: a table with
+// changes, with a capture gap, or on the S3 path is folded anyway.
+func TestCountCarried(t *testing.T) {
+	rep := func(carried bool) *reconstruct.TableReport {
+		return &reconstruct.TableReport{CarriedForward: carried}
+	}
+	cases := []struct {
+		name    string
+		reports []*reconstruct.TableReport
+		want    int
+	}{
+		{"nothing folded", nil, 0},
+		{"every table rewritten", []*reconstruct.TableReport{rep(false), rep(false)}, 0},
+		{"every table reused", []*reconstruct.TableReport{rep(true), rep(true), rep(true)}, 3},
+		{"mixed, which is the normal case", []*reconstruct.TableReport{rep(true), rep(false), rep(true)}, 2},
+		{"a nil report is not a reuse", []*reconstruct.TableReport{rep(true), nil}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countCarried(tc.reports); got != tc.want {
+				t.Errorf("countCarried = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCarryForwardProvenance: the value AND where it came from. The provenance
+// is the point: a saved override of false beats a command line saying true, and
+// without a name for that an operator watching every table get rewritten has
+// nothing anywhere telling them why.
+func TestCarryForwardProvenance(t *testing.T) {
+	cases := []struct {
+		name       string
+		override   *bool
+		daemon     bool
+		wantOn     bool
+		wantSource string
+	}{
+		{"no registry at all falls back to the flag", nil, true, true, "daemon flag or environment"},
+		{"no override, flag off", nil, false, false, "daemon flag or environment"},
+		{"override true over a flag saying false", boolPtr(true), false, true, "console setting, which overrides the daemon flag"},
+		{"override FALSE over a flag saying true", boolPtr(false), true, false, "console setting, which overrides the daemon flag"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var reg *console.Registry
+			if tc.override != nil {
+				r, err := console.LoadRegistry(filepath.Join(t.TempDir(), "servers.yaml"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := r.SetBaselineRefresh(&console.BaselineRefreshConfig{CarryForwardUnchanged: *tc.override}); err != nil {
+					t.Fatal(err)
+				}
+				reg = r
+			}
+			on, src := carryForwardProvenance(reg, tc.daemon)
+			if on != tc.wantOn {
+				t.Errorf("value = %v, want %v", on, tc.wantOn)
+			}
+			if src != tc.wantSource {
+				t.Errorf("source = %q, want %q", src, tc.wantSource)
+			}
+		})
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// TestEnvBoolOr: the one input an operator can get wrong silently. An
+// unparseable value must keep the fallback, never be read as consent.
+func TestEnvBoolOr(t *testing.T) {
+	const name = "BINTRAIL_TEST_ENV_BOOL_OR"
+	cases := []struct {
+		raw      string
+		fallback bool
+		want     bool
+	}{
+		{"", false, false},
+		{"", true, true},
+		{"1", false, true},
+		{"true", false, true},
+		{"TRUE", false, true},
+		{"True", false, true},
+		{"t", false, true},
+		{"  true  ", false, true},
+		{"0", true, false},
+		{"false", true, false},
+		{"F", true, false},
+		// Not true/false values. Each must keep the fallback in BOTH
+		// directions: a typo can neither turn the setting on nor off.
+		{"yes", false, false},
+		{"on", false, false},
+		{"enabled", false, false},
+		{"tru", false, false},
+		{"yes", true, true},
+		{"off", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw+"/"+strconv.FormatBool(tc.fallback), func(t *testing.T) {
+			t.Setenv(name, tc.raw)
+			if got := envBoolOr(name, tc.fallback); got != tc.want {
+				t.Errorf("envBoolOr(%q, fallback=%v) = %v, want %v", tc.raw, tc.fallback, got, tc.want)
+			}
+		})
 	}
 }

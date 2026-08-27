@@ -3710,7 +3710,9 @@ function rotationCard(rot) {
   kvRow(card, "retention", rot.retain);
   kvRow(card, "interval", rot.interval);
   kvRow(card, "future partitions", rot.add_future);
-  kvRow(card, "policy", rot.source === "override" ? "console override (live)" : "daemon defaults");
+  kvRow(card, "policy", rot.source === "override"
+    ? ("console override" + (rot.enabled ? " (live)" : ""))
+    : "daemon defaults");
   if (!rot.enabled) card.append(el("p", { class: "form-hint", text: "Rotation is turned off. Changes you save here won't take effect until the daemon restarts." }));
   card.append(el("div", { class: "stg-cardfoot" },
     el("button", { class: "btn btn-sm", type: "button", text: "Edit rotation…", onclick: showRotationDialog })));
@@ -3734,33 +3736,59 @@ function backupRefreshCard(br) {
   }
   const on = !!br.carry_forward_unchanged;
   kvRow(card, "reuse files for unchanged tables", on ? "on" : "off");
-  kvRow(card, "setting", br.source === "override" ? "set here (live)" : "daemon default");
+  // "(live)" is gated on enabled because the card also prints "nothing runs
+  // yet" three lines down, and one card must not make two opposite claims
+  // about the running system.
+  kvRow(card, "set by", br.source === "override"
+    ? (br.enabled ? "this page (live)" : "this page (not running yet)")
+    : "daemon default");
   card.append(el("p", { class: "form-hint", text: on
-    ? "A table with no changes keeps its previous file instead of being written again. Two backups then share the same bytes on disk, so deleting the older one frees nothing while the newer one still uses it."
+    ? "A table with no changes keeps its previous file instead of being written again. Where the filesystem allows it the two backups then share the same bytes on disk, so deleting the older one frees nothing while the newer one still uses it."
     : "Every table is written again on each refresh, even when nothing in it changed. Turning this on skips that work for unchanged tables. (CLI: --baseline-carry-forward-unchanged)" }));
   if (!br.enabled) {
     card.append(el("p", { class: "form-hint", text: "No refresh schedule is set, so nothing runs yet. What you save here applies once the daemon is started with a schedule." }));
   }
-  card.append(el("div", { class: "stg-cardfoot" },
+  const foot = el("div", { class: "stg-cardfoot" },
     el("button", {
       class: "btn btn-sm", type: "button",
       text: on ? "Turn off reuse" : "Turn on reuse",
-      onclick: () => saveBackupRefresh(!on, br.enabled),
-    })));
+      onclick: () => saveBackupRefresh({ carry_forward_unchanged: !on }),
+    }));
+  // Only offered once something is saved here, because that is the only state
+  // it changes. Without it the toggle is a one-way door: the first save wins
+  // over the daemon flag forever, and an operator who set the flag on the
+  // command line has no way to hand the decision back short of editing the
+  // registry file by hand.
+  if (br.source === "override") {
+    foot.append(el("button", {
+      class: "btn btn-sm btn-ghost", type: "button",
+      text: "Use the daemon setting",
+      onclick: () => saveBackupRefresh({ use_default: true }),
+    }));
+  }
+  card.append(foot);
   return card;
 }
 
 // saveBackupRefresh writes the setting and re-renders, so the card always shows
 // what the daemon will actually do rather than what was clicked.
-async function saveBackupRefresh(next, enabled) {
+//
+// The confirmation is built from the RESPONSE, not from what was clicked or
+// from what the card was holding when it rendered. Those two can disagree with
+// the daemon: "Use the daemon setting" does not know in advance what the flag
+// says, and a card rendered before a restart carries a stale schedule. The PUT
+// already echoes the effective state, so reading it costs nothing.
+async function saveBackupRefresh(body) {
+  let now;
   try {
-    await api("/api/baseline-refresh", { method: "PUT", body: { carry_forward_unchanged: next } });
+    now = await api("/api/baseline-refresh", { method: "PUT", body });
   } catch (err) {
     toastError("Could not save: " + ((err && err.message) || err));
     return;
   }
-  toast(enabled
-    ? (next ? "Unchanged tables will be reused" : "Every table will be written again")
+  const on = !!(now && now.carry_forward_unchanged);
+  toast((now && now.enabled)
+    ? (on ? "Unchanged tables will be reused" : "Every table will be written again")
     : "Saved. No refresh schedule is set, so this applies once one is.");
   renderRoute();
 }
@@ -4075,7 +4103,13 @@ function baselineRefreshNote(rf) {
       text = "Automatic refresh running" + (rf.since ? " since " + utcLabel(rf.since) : "") + "…";
       break;
     case "succeeded":
-      text = "Automatic refresh: " + (rf.tables || 0) + " table(s) refreshed" + (when ? " at " + when : "") + ".";
+      // The reused count is the only place an operator sees the reuse setting
+      // take effect. Without it a run that reused every file and a run that
+      // rewrote every file read identically, which made the whole opt-in
+      // unconfirmable from the console that offers it.
+      text = "Automatic refresh: " + (rf.tables || 0) + " table(s) refreshed" +
+        (rf.carried ? ", " + rf.carried + " of them reused unchanged" : "") +
+        (when ? " at " + when : "") + ".";
       break;
     case "failed":
       text = "Automatic refresh published nothing" + (when ? " at " + when : "") +
