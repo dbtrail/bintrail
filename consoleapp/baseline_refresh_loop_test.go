@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 func TestBaselineRefreshTargets(t *testing.T) {
@@ -85,7 +87,7 @@ func TestStartBaselineRefreshLoop_startupContract(t *testing.T) {
 		{"minutes are an interval", sup, "15m", "dsn", "/b", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := startBaselineRefreshLoop(ctx, nil, tc.sup, tc.dsn, tc.dir, tc.interval)
+			err := startBaselineRefreshLoop(ctx, nil, tc.sup, tc.dsn, tc.dir, tc.interval, false)
 			switch {
 			case tc.wantErr == "" && err != nil:
 				t.Fatalf("unexpected error: %v", err)
@@ -152,7 +154,7 @@ func TestRunBaselineRefreshCycle_survivesAPanic(t *testing.T) {
 			t.Fatalf("a panic escaped the refresh cycle: %v", r)
 		}
 	}()
-	runBaselineRefreshCycle(context.Background(), nil, &baselineSupervisor{}, "dsn", "/b", 0)
+	runBaselineRefreshCycle(context.Background(), nil, &baselineSupervisor{}, "dsn", "/b", 0, false)
 }
 
 // TestRunBaselineRefreshCycle_stopsOnCancel: shutdown must not start new work.
@@ -160,7 +162,7 @@ func TestRunBaselineRefreshCycle_stopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
-	runBaselineRefreshCycle(ctx, nil, sup, "dsn", "/b", 0)
+	runBaselineRefreshCycle(ctx, nil, sup, "dsn", "/b", 0, false)
 	if got := sup.RefreshStatus("default"); got.State != "idle" {
 		t.Fatalf("a cancelled cycle started work: %+v", got)
 	}
@@ -258,7 +260,7 @@ func TestRunBaselineRefreshCycle_countsAServerItCouldNotStart(t *testing.T) {
 	// shared single-flight refuse the refresh.
 	sup.jobs["default"] = &console.BaselineStatus{State: "running"}
 
-	dispatched, skipped := runBaselineRefreshCycle(ctx, nil, sup, "dsn", t.TempDir(), time.Minute)
+	dispatched, skipped := runBaselineRefreshCycle(ctx, nil, sup, "dsn", t.TempDir(), time.Minute, false)
 	if dispatched != 0 || skipped != 1 {
 		t.Fatalf("cycle reported dispatched=%d skipped=%d, want 0 and 1: a busy server must be COUNTED, "+
 			"not swallowed at Debug where the default log level hides it", dispatched, skipped)
@@ -390,11 +392,114 @@ func TestRefreshTick_reportsTheCountersInTheRightOrder(t *testing.T) {
 	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
 	sup.jobs["default"] = &console.BaselineStatus{State: "running"}
 
-	refreshTick(ctx, nil, sup, "dsn", t.TempDir(), time.Minute)
+	refreshTick(ctx, nil, sup, "dsn", t.TempDir(), time.Minute, false)
 
 	out := buf.String()
 	if !strings.Contains(out, "skipped=1") || !strings.Contains(out, "dispatched=0") {
 		t.Errorf("the tick reported the counters swapped or not at all; the one busy server must read "+
 			"skipped=1 dispatched=0: %q", out)
+	}
+}
+
+// effectiveCarryForward is what makes the console panel able to change a
+// RUNNING loop, so its precedence is the contract worth pinning: a saved
+// override wins, absence falls back to the daemon flag, and an override that
+// says false must beat a daemon flag that says true (which is why the registry
+// stores a pointer and not a bare bool).
+func TestEffectiveCarryForward(t *testing.T) {
+	reg := func(t *testing.T, set *bool) *console.Registry {
+		t.Helper()
+		r, err := console.LoadRegistry(filepath.Join(t.TempDir(), "servers.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if set != nil {
+			if err := r.SetBaselineRefresh(console.BaselineRefreshConfig{CarryForwardUnchanged: *set}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return r
+	}
+	yes, no := true, false
+
+	for _, tc := range []struct {
+		name          string
+		override      *bool
+		daemonDefault bool
+		want          bool
+	}{
+		{"no override falls back to the daemon flag (on)", nil, true, true},
+		{"no override falls back to the daemon flag (off)", nil, false, false},
+		{"an override wins when it says on", &yes, false, true},
+		// The case a bare bool in the registry could not express.
+		{"an override that says off beats a daemon flag that says on", &no, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveCarryForward(reg(t, tc.override), tc.daemonDefault); got != tc.want {
+				t.Errorf("effectiveCarryForward = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// A registry that is not there at all is not consent to change behaviour:
+	// the operator's own command line is a better answer than a silent no.
+	if !effectiveCarryForward(nil, true) {
+		t.Error("a nil registry discarded the daemon flag")
+	}
+}
+
+// The wiring, not the resolver: the value effectiveCarryForward computes has to
+// reach the requests the fold is built from. A resolver that is correct in
+// isolation proves nothing about whether the loop consults it.
+func TestRefreshTargetsFor_carriesTheEffectiveSettingIntoEveryRequest(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		reqs := refreshTargetsFor(nil, "dsn", "/b", want)
+		if len(reqs) == 0 {
+			t.Fatal("no targets, so the assertion below checks nothing")
+		}
+		for _, req := range reqs {
+			if req.CarryForwardUnchanged != want {
+				t.Errorf("daemon default %v did not reach the request for %q", want, req.ServerName)
+			}
+		}
+	}
+
+	// And a saved override has to beat the daemon flag all the way through,
+	// not just inside effectiveCarryForward.
+	r, err := console.LoadRegistry(filepath.Join(t.TempDir(), "servers.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetBaselineRefresh(console.BaselineRefreshConfig{CarryForwardUnchanged: false}); err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range refreshTargetsFor(r, "dsn", "/b", true) {
+		if req.CarryForwardUnchanged {
+			t.Errorf("an override saying off did not reach the request for %q", req.ServerName)
+		}
+	}
+}
+
+// The last hop: what the request carries has to reach the fold's configuration.
+// Without this, the whole chain from the console toggle down could be correct
+// and the fold still run with the setting off, which is exactly what a mutation
+// of this line showed.
+func TestRefreshFoldConfig_carriesTheSettingAndKeepsGapsStrict(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		cfg := refreshFoldConfig(refreshRequest{
+			IndexDSN: "dsn", BaselineDir: "/b", CarryForwardUnchanged: want,
+		}, time.Now(), []string{"shop.orders"})
+		if cfg.CarryForwardUnchanged != want {
+			t.Errorf("CarryForwardUnchanged = %v, want %v", cfg.CarryForwardUnchanged, want)
+		}
+		// Pinned in the same place because it is the same class of setting and
+		// the opposite decision: an unattended job never publishes over a known
+		// permanent capture loss, whoever asked for what.
+		if cfg.AllowGaps {
+			t.Error("the refresh loop would publish over a known capture gap")
+		}
+		if cfg.OutputFormat != reconstruct.OutputFormatParquet {
+			t.Errorf("OutputFormat = %q, want parquet", cfg.OutputFormat)
+		}
 	}
 }

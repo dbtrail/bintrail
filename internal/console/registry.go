@@ -125,6 +125,20 @@ type RotationConfig struct {
 	AddFuture int    `yaml:"add_future"`
 }
 
+// BaselineRefreshConfig is the console-editable half of the baseline refresh
+// loop's configuration. The interval itself stays a daemon flag: it decides
+// whether the loop runs at all, and starting a loop that was not booted takes a
+// restart. What is here applies to a loop already running, because every cycle
+// re-reads the registry.
+type BaselineRefreshConfig struct {
+	// CarryForwardUnchanged publishes a table with no events in the window by
+	// carrying its previous Parquet file forward instead of rewriting it. Off
+	// by default: the rows are identical either way, but it hard-links two
+	// snapshots to one inode and leaves that table anchored at its older binlog
+	// coordinate, so `du` and a prune report space they will not reclaim.
+	CarryForwardUnchanged bool `yaml:"carry_forward_unchanged"`
+}
+
 // registryFile is the versioned on-disk envelope.
 type registryFile struct {
 	Version int `yaml:"version"`
@@ -136,7 +150,18 @@ type registryFile struct {
 	// gate, not round-tripping, is the cross-version safety net, since that
 	// older binary has neither this field nor the inline catch-all.
 	Rotation *RotationConfig `yaml:"rotation,omitempty"`
-	Servers  []ServerEntry   `yaml:"servers"`
+	// BaselineRefresh is the optional global baseline-refresh override, same
+	// shape and same additive story as Rotation above: absent means the
+	// daemon's own flags are in force, and the Extra catch-all preserves it
+	// across a binary that does not model it.
+	//
+	// A POINTER, and that is what carries the tri-state. The setting inside is
+	// a bool, so "no override" and "an override that says false" would be
+	// indistinguishable in a value type, and the daemon could never tell a
+	// console that had never been touched from one that had explicitly turned
+	// the behaviour off.
+	BaselineRefresh *BaselineRefreshConfig `yaml:"baseline_refresh,omitempty"`
+	Servers         []ServerEntry          `yaml:"servers"`
 	// Extra preserves any FUTURE envelope-level key a (future) older binary
 	// doesn't model, exactly as ServerEntry.Extra does at the entry level — so
 	// the next additive envelope field is downgrade-safe from here on. (It does
@@ -247,6 +272,34 @@ func (r *Registry) Rotation() (RotationConfig, bool) {
 // SetRotation persists the global rotation policy. Like every registry
 // mutation it rewrites the file atomically and is refused on a newer-version
 // (read-only) file. The caller validates the field grammar.
+// BaselineRefresh returns the saved override and whether one exists. Absent
+// means the daemon's own defaults are in force.
+func (r *Registry) BaselineRefresh() (BaselineRefreshConfig, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.file.BaselineRefresh == nil {
+		return BaselineRefreshConfig{}, false
+	}
+	return *r.file.BaselineRefresh, true
+}
+
+// SetBaselineRefresh persists a global baseline-refresh override, rolling back
+// the in-memory value if the write fails so the two never diverge.
+func (r *Registry) SetBaselineRefresh(bc BaselineRefreshConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.readOnly {
+		return ErrRegistryReadOnly
+	}
+	prev := r.file.BaselineRefresh
+	r.file.BaselineRefresh = &bc
+	if err := r.save(); err != nil {
+		r.file.BaselineRefresh = prev // roll back
+		return err
+	}
+	return nil
+}
+
 func (r *Registry) SetRotation(rc RotationConfig) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

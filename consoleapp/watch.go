@@ -81,6 +81,7 @@ var (
 	upConsoleBaselineS3     string
 	upConsoleBaselineRetain string
 	upBaselineRefreshEvery  string
+	upBaselineCarryForward  bool
 	upConsoleServersFile    string
 	upConsoleAuthFile       string
 	upConsoleTLSCert        string
@@ -217,6 +218,11 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleToken, "console-token", "", "Opt-in static token for API automation (never generated; humans use the console password)")
 	watchCmd.Flags().StringVar(&upConsoleBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots; enables the console's point-in-time Reconstruct surface")
 	watchCmd.Flags().StringVar(&upConsoleBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
+	watchCmd.Flags().BoolVar(&upBaselineCarryForward, "baseline-carry-forward-unchanged", false,
+		"When a refresh finds a table had no changes, publish its previous Parquet file instead of rewriting "+
+			"it (hard link where possible). Off by default: the rows are identical either way, but it links two "+
+			"snapshots to one file, so disk-usage and prune figures then count space they will not reclaim. "+
+			"Editable from the console settings panel, which overrides this flag.")
 	watchCmd.Flags().StringVar(&upBaselineRefreshEvery, "baseline-refresh-interval", "", "Periodically refresh each server's newest baseline snapshot from the index (Nm/Nh/Nd; default: off). Runs with the conservative DuckDB budget and never publishes over a known capture gap.")
 	watchCmd.Flags().StringVar(&upConsoleBaselineRetain, "baseline-retain", "", "Periodically prune local --baseline-dir snapshots older than this (Nd/Nh) once a durable copy exists in --baseline-s3 (never deletes the only copy or the newest snapshot per table)")
 	watchCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML (default ~/.config/bintrail/console-servers.yaml)")
@@ -497,7 +503,7 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 
 	// Keep each server's newest snapshot moving forward from the index alone
 	// (#1171). Opt-in, and refused at startup when nothing can be refreshed.
-	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery); err != nil {
+	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery, upBaselineCarryForward); err != nil {
 		return err
 	}
 
@@ -700,7 +706,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 
 	// Keep each server's newest snapshot moving forward from the index alone
 	// (#1171). Opt-in, and refused at startup when nothing can be refreshed.
-	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery); err != nil {
+	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery, upBaselineCarryForward); err != nil {
 		return err
 	}
 
@@ -876,6 +882,15 @@ func resolveUpConsoleEnv(cmd *cobra.Command) error {
 	if !cmd.Flags().Changed("baseline-refresh-interval") {
 		if v := os.Getenv("BINTRAIL_BASELINE_REFRESH_INTERVAL"); v != "" {
 			upBaselineRefreshEvery = v
+		}
+	}
+	if !cmd.Flags().Changed("baseline-carry-forward-unchanged") {
+		// Only "1"/"true" turn it on. Anything else, including a typo, leaves
+		// the conservative default: this changes the on-disk representation, so
+		// an unreadable value must never be read as consent.
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("BINTRAIL_BASELINE_CARRY_FORWARD_UNCHANGED"))) {
+		case "1", "true", "yes", "on":
+			upBaselineCarryForward = true
 		}
 	}
 	if !cmd.Flags().Changed("console-servers-file") {
@@ -1392,6 +1407,14 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 			Interval:  upRotateInterval,
 			AddFuture: upRotateAddFuture,
 			Enabled:   upRotationCfg.Enabled,
+		},
+		// Same role for the baseline-refresh panel: what the daemon itself was
+		// told, reported when no console override is saved. Enabled is the
+		// loop's boot-time liveness, so the panel can say a saved setting is
+		// dormant instead of implying it is live.
+		BaselineRefreshDefaults: console.BaselineRefreshDefaults{
+			CarryForwardUnchanged: upBaselineCarryForward,
+			Enabled:               upBaselineRefreshEvery != "",
 		},
 		AllowSetup: opts.AllowSetup,
 		Version:    appVersion,

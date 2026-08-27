@@ -13,32 +13,37 @@ import (
 
 func TestCarryForwardEligible(t *testing.T) {
 	gap := &CaptureGap{Detail: "events permanently lost"}
+	const local = "/b/2026/demo/o.parquet"
 	for _, tc := range []struct {
 		name    string
+		enabled bool
 		format  string
 		src     string
 		changes int
 		gap     *CaptureGap
 		want    bool
 	}{
-		{"parquet, no changes, local, no gap", OutputFormatParquet, "/b/2026/demo/o.parquet", 0, nil, true},
-		{"a single change disqualifies it", OutputFormatParquet, "/b/2026/demo/o.parquet", 1, nil, false},
+		{"asked for, parquet, no changes, local, no gap", true, OutputFormatParquet, local, 0, nil, true},
+		// The default. Everything else lines up and it still does not happen,
+		// because carrying a file forward changes the on-disk representation
+		// (shared inodes, mixed anchors) and that is the operator's call.
+		{"not asked for", false, OutputFormatParquet, local, 0, nil, false},
+		{"a single change disqualifies it", true, OutputFormatParquet, local, 1, nil, false},
 		// A mydumper run emits SQL for a human to load. There is no previous
 		// artifact to carry, so the rows still have to be written.
-		{"mydumper", OutputFormatMydumper, "/b/2026/demo/o.parquet", 0, nil, false},
+		{"mydumper", true, OutputFormatMydumper, local, 0, nil, false},
 		// The zero value resolves to mydumper, so it must NOT be treated as
 		// parquet by an == "" slip.
-		{"unset format is mydumper, not parquet", "", "/b/2026/demo/o.parquet", 0, nil, false},
+		{"unset format is mydumper, not parquet", true, "", local, 0, nil, false},
 		// S3 would have to be downloaded, which buys back the cost this avoids.
-		{"s3 source", OutputFormatParquet, "s3://bucket/base/2026/demo/o.parquet", 0, nil, false},
-		// The one that does not look like the others: a gap arrives as a VALUE
-		// rather than an error, because --allow-gaps makes step 3c report and
-		// proceed. Events were permanently lost, so an empty change map no
-		// longer means the table was untouched, and the gap stamp the merge
-		// path writes would be lost with the fold.
-		{"a known capture gap", OutputFormatParquet, "/b/2026/demo/o.parquet", 0, gap, false},
+		{"s3 source", true, OutputFormatParquet, "s3://bucket/base/2026/demo/o.parquet", 0, nil, false},
+		// A gap arrives as a VALUE rather than an error, because --allow-gaps
+		// makes step 3c report and proceed. Events were permanently lost, so an
+		// empty change map no longer means the table was untouched, and the gap
+		// stamp the merge path writes would be lost with the fold.
+		{"a known capture gap", true, OutputFormatParquet, local, 0, gap, false},
 	} {
-		if got := carryForwardEligible(tc.format, tc.src, tc.changes, tc.gap); got != tc.want {
+		if got := carryForwardEligible(tc.enabled, tc.format, tc.src, tc.changes, tc.gap); got != tc.want {
 			t.Errorf("%s: carryForwardEligible = %v, want %v", tc.name, got, tc.want)
 		}
 	}

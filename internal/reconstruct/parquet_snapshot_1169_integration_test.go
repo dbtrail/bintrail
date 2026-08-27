@@ -418,12 +418,13 @@ func TestReconstructParquet_carriesForwardATableWithNoEvents(t *testing.T) {
 
 	out := root // refresh publishes into the same baselines root
 	reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
-		IndexDSN:     testutil.BaseDSN() + "/" + dbName,
-		BaselineSrc:  root,
-		Tables:       []string{schema + ".orders"},
-		At:           base.Add(30 * time.Minute),
-		OutputDir:    out,
-		OutputFormat: reconstruct.OutputFormatParquet,
+		IndexDSN:              testutil.BaseDSN() + "/" + dbName,
+		BaselineSrc:           root,
+		Tables:                []string{schema + ".orders"},
+		At:                    base.Add(30 * time.Minute),
+		OutputDir:             out,
+		OutputFormat:          reconstruct.OutputFormatParquet,
+		CarryForwardUnchanged: true,
 	})
 	if err != nil {
 		t.Fatalf("ReconstructTables: %v", err)
@@ -509,12 +510,13 @@ func TestReconstructParquet_destructiveDDLRefusesEvenWithNoRowEvents(t *testing.
 	}
 
 	_, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
-		IndexDSN:     testutil.BaseDSN() + "/" + dbName,
-		BaselineSrc:  root,
-		Tables:       []string{schema + ".orders"},
-		At:           base.Add(30 * time.Minute),
-		OutputDir:    root,
-		OutputFormat: reconstruct.OutputFormatParquet,
+		IndexDSN:              testutil.BaseDSN() + "/" + dbName,
+		BaselineSrc:           root,
+		Tables:                []string{schema + ".orders"},
+		At:                    base.Add(30 * time.Minute),
+		OutputDir:             root,
+		OutputFormat:          reconstruct.OutputFormatParquet,
+		CarryForwardUnchanged: true,
 	})
 	if err == nil {
 		t.Fatal("a truncated table was published from its pre-truncate file: no row events does NOT mean " +
@@ -572,13 +574,14 @@ func TestReconstructParquet_captureGapIsNotCarriedForward(t *testing.T) {
 	}
 
 	reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
-		IndexDSN:     testutil.BaseDSN() + "/" + dbName,
-		BaselineSrc:  root,
-		Tables:       []string{schema + ".orders"},
-		At:           base.Add(30 * time.Second),
-		OutputDir:    root,
-		OutputFormat: reconstruct.OutputFormatParquet,
-		AllowGaps:    true,
+		IndexDSN:              testutil.BaseDSN() + "/" + dbName,
+		BaselineSrc:           root,
+		Tables:                []string{schema + ".orders"},
+		At:                    base.Add(30 * time.Second),
+		OutputDir:             root,
+		OutputFormat:          reconstruct.OutputFormatParquet,
+		CarryForwardUnchanged: true,
+		AllowGaps:             true,
 	})
 	if err != nil {
 		t.Fatalf("ReconstructTables with --allow-gaps: %v", err)
@@ -634,12 +637,13 @@ func TestReconstructParquet_carriesForwardTwiceThenResumes(t *testing.T) {
 	run := func(at time.Time) []*reconstruct.TableReport {
 		t.Helper()
 		reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
-			IndexDSN:     dsn,
-			BaselineSrc:  root,
-			Tables:       []string{schema + ".orders"},
-			At:           at,
-			OutputDir:    root,
-			OutputFormat: reconstruct.OutputFormatParquet,
+			IndexDSN:              dsn,
+			BaselineSrc:           root,
+			Tables:                []string{schema + ".orders"},
+			At:                    at,
+			OutputDir:             root,
+			OutputFormat:          reconstruct.OutputFormatParquet,
+			CarryForwardUnchanged: true,
 		})
 		if err != nil {
 			t.Fatalf("ReconstructTables at %s: %v", at.Format(time.RFC3339), err)
@@ -685,5 +689,65 @@ func TestReconstructParquet_carriesForwardTwiceThenResumes(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("the update made after two carried cycles is missing from the published snapshot: %v", got)
+	}
+}
+
+// Carrying an unchanged table forward is OPT-IN, and this is the default.
+//
+// The rows published are the same either way, so nothing about the OUTPUT says
+// which path ran. What differs is the representation: the carry path hard-links
+// two snapshots to one inode and leaves the table anchored at its older binlog
+// coordinate. An operator who never asked for that must not get it, so the
+// assertion is on CarriedForward, and on the file being independent bytes.
+func TestReconstructParquet_doesNotCarryForwardUnlessAsked(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	db, dbName := testutil.CreateTestDB(t)
+	if err := indexer.CreateIndexTables(ctx, db, 48, false, nil); err != nil {
+		t.Fatalf("CreateIndexTables: %v", err)
+	}
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	const schema = "shop"
+	base := time.Now().UTC().Truncate(time.Hour)
+	seedOrdersSnapshot(t, db, schema, base)
+
+	root := t.TempDir()
+	seedSourceBaseline(t, root, base, schema)
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200,
+		base.Add(10*time.Second).Format("2006-01-02 15:04:05"), nil,
+		schema, "customers", 1, "1", nil, nil, []byte(`{"id":1,"name":"n"}`))
+
+	// No events for shop.orders, and CarryForwardUnchanged left at its zero
+	// value: the whole point of this test.
+	reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
+		IndexDSN:     testutil.BaseDSN() + "/" + dbName,
+		BaselineSrc:  root,
+		Tables:       []string{schema + ".orders"},
+		At:           base.Add(30 * time.Second),
+		OutputDir:    root,
+		OutputFormat: reconstruct.OutputFormatParquet,
+	})
+	if err != nil {
+		t.Fatalf("ReconstructTables: %v", err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("got %d reports, want 1", len(reports))
+	}
+	if reports[0].CarriedForward {
+		t.Fatal("a table was carried forward without being asked for: that hard-links two snapshots to " +
+			"one inode and leaves a stale anchor, which is the operator's decision to make")
+	}
+
+	// And the published file must be its own bytes, not a link to the source.
+	src := filepath.Join(root, base.Format("2006-01-02T15-04-05Z"), schema, "orders.parquet")
+	if _, err := os.Stat(src); err != nil {
+		t.Fatalf("could not locate the source snapshot: %v", err)
+	}
+	dst := publishedUnder(t, root, reports[0].Files[0], src)
+	if a, b := carriedInode(t, src), carriedInode(t, dst); a == b {
+		t.Errorf("the published file shares an inode with the source (%d) despite the opt-in being off", a)
 	}
 }

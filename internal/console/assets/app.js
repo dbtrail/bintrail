@@ -3545,9 +3545,10 @@ async function renderStorage() {
   // instead of one error wiping the whole page. (A 401 inside api() raises the
   // sign-in gate and bumps serverGen, so the stale-render guard below bails.)
   const asErr = (err) => ({ error: (err && err.message) || String(err) });
-  const [serversRes, rotation, storage, baselines, telemetry] = await Promise.all([
+  const [serversRes, rotation, backupRefresh, storage, baselines, telemetry] = await Promise.all([
     api("/api/servers").catch(asErr),
     api("/api/rotation").catch(asErr),
+    api("/api/baseline-refresh").catch(asErr),
     api("/api/storage").catch(asErr),
     api("/api/baselines").catch(asErr),
     api("/api/telemetry").catch(asErr),
@@ -3556,13 +3557,13 @@ async function renderStorage() {
   // Same guard as renderOverview: a throw inside the build must show an
   // error, never leave the "Loading…" skeleton up forever.
   try {
-    buildStorage(serversRes, rotation, storage, baselines, telemetry);
+    buildStorage(serversRes, rotation, backupRefresh, storage, baselines, telemetry);
   } catch (err) {
     const v = VIEW(); clear(v); v.append(pageHead("Storage", null)); renderError(v, err);
   }
 }
 
-function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
+function buildStorage(serversRes, rotation, backupRefresh, storage, baselines, telemetry) {
   // serversRes is the raw /api/servers payload or {error} — archivingPanel
   // must be able to tell "failed to load" from "genuinely no sources", or a
   // transient 500 would render the affirmative "No monitored sources yet" lie.
@@ -3577,6 +3578,7 @@ function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
   const cards = el("div", { class: "cards" });
   const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
   cards.append(rotationCard(rotation));
+  cards.append(backupRefreshCard(backupRefresh));
   cards.append(credentialsCard(storage));
   cards.append(telemetryCard(telemetry));
   if (capsCache.views) cards.append(duckdbCard());
@@ -3713,6 +3715,54 @@ function rotationCard(rot) {
   card.append(el("div", { class: "stg-cardfoot" },
     el("button", { class: "btn btn-sm", type: "button", text: "Edit rotation…", onclick: showRotationDialog })));
   return card;
+}
+
+// backupRefreshCard exposes the one setting the automatic backup refresh has
+// that is safe to change while it runs. The schedule itself stays a daemon
+// flag, because starting a loop that was never booted needs a restart.
+//
+// The saving is real but it is not free of consequences, so the card states
+// them where the decision is made rather than in a doc nobody opens: reusing a
+// file links two backups to the same bytes on disk, and after that, deleting
+// the older backup does not give the space back while the newer one still
+// points at it.
+function backupRefreshCard(br) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Automatic backup refresh" }));
+  if (!br || br.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not load the refresh settings" + (br && br.error ? ": " + br.error : ".") }));
+    return card;
+  }
+  const on = !!br.carry_forward_unchanged;
+  kvRow(card, "reuse files for unchanged tables", on ? "on" : "off");
+  kvRow(card, "setting", br.source === "override" ? "set here (live)" : "daemon default");
+  card.append(el("p", { class: "form-hint", text: on
+    ? "A table with no changes keeps its previous file instead of being written again. Two backups then share the same bytes on disk, so deleting the older one frees nothing while the newer one still uses it."
+    : "Every table is written again on each refresh, even when nothing in it changed. Turning this on skips that work for unchanged tables. (CLI: --baseline-carry-forward-unchanged)" }));
+  if (!br.enabled) {
+    card.append(el("p", { class: "form-hint", text: "No refresh schedule is set, so nothing runs yet. What you save here applies once the daemon is started with a schedule." }));
+  }
+  card.append(el("div", { class: "stg-cardfoot" },
+    el("button", {
+      class: "btn btn-sm", type: "button",
+      text: on ? "Turn off reuse" : "Turn on reuse",
+      onclick: () => saveBackupRefresh(!on, br.enabled),
+    })));
+  return card;
+}
+
+// saveBackupRefresh writes the setting and re-renders, so the card always shows
+// what the daemon will actually do rather than what was clicked.
+async function saveBackupRefresh(next, enabled) {
+  try {
+    await api("/api/baseline-refresh", { method: "PUT", body: { carry_forward_unchanged: next } });
+  } catch (err) {
+    toastError("Could not save: " + ((err && err.message) || err));
+    return;
+  }
+  toast(enabled
+    ? (next ? "Unchanged tables will be reused" : "Every table will be written again")
+    : "Saved. No refresh schedule is set, so this applies once one is.");
+  renderRoute();
 }
 
 function credentialsCard(storage) {

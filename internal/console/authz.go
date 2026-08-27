@@ -127,6 +127,11 @@ var apiRoutePerms = []routePerm{
 	// the settings surface.
 	{"GET", "/api/rotation", ext.PermSettingsRead},
 	{"PUT", "/api/rotation", ext.PermServersWrite},
+	// Baseline refresh, graded exactly like rotation: reading the effective
+	// policy is a settings read, changing what the daemon's loop does is a
+	// control-plane write.
+	{"GET", "/api/baseline-refresh", ext.PermSettingsRead},
+	{"PUT", "/api/baseline-refresh", ext.PermServersWrite},
 	{"GET", "/api/baselines", ext.PermSettingsRead},
 	// The per-snapshot files listing is metadata (names, sizes, timestamps),
 	// same tier as the listing above. The DOWNLOAD is not: it is a full

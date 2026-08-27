@@ -168,6 +168,11 @@ type Config struct {
 	// daemon; zero on the standalone serve (which runs no rotation loop and
 	// hides the panel).
 	RotationDefaults RotationDefaults
+
+	// BaselineRefreshDefaults carries the daemon's baseline-refresh flag/env
+	// values, the fallback the settings panel reports when no console override
+	// is saved. Same role as RotationDefaults above.
+	BaselineRefreshDefaults BaselineRefreshDefaults
 	// Version is the running build's version string ("0.36.0", or "dev" on
 	// unversioned builds), reported in /api/capabilities so the frontend can
 	// link release artifacts (the .mcpb bundle) matching the running binary.
@@ -190,6 +195,18 @@ type RotationDefaults struct {
 	// Enabled is false when the daemon was started with rotation off
 	// (--rotate-retain off). The loop is not running then, so a console-saved
 	// override would need a restart — the panel warns in that state.
+	Enabled bool
+}
+
+// BaselineRefreshDefaults is the daemon-side baseline-refresh configuration,
+// surfaced to the settings panel as the fallback when nothing is saved.
+type BaselineRefreshDefaults struct {
+	// CarryForwardUnchanged is the daemon's --baseline-carry-forward-unchanged.
+	CarryForwardUnchanged bool
+	// Enabled is false when the daemon was started with no
+	// --baseline-refresh-interval, so no refresh loop is running. A saved
+	// override is dormant until a restart in that state, and the panel says so
+	// rather than implying the setting is live.
 	Enabled bool
 }
 
@@ -242,6 +259,9 @@ type Server struct {
 	// rotationDefaults are the daemon's --rotate-* values, the fallback GET
 	// /api/rotation reports when no console override is saved.
 	rotationDefaults RotationDefaults
+	// baselineRefreshDefaults is the fallback GET /api/baseline-refresh reports
+	// when no console override is saved.
+	baselineRefreshDefaults BaselineRefreshDefaults
 	// version is the running build's version string (Config.Version).
 	version string
 	// archiveFetcher reads one archive source for the browsing endpoints —
@@ -423,35 +443,36 @@ func New(cfg Config) (*Server, error) {
 	profileActive := cfg.ProfileActive || len(cfg.DenyTables) > 0 || len(cfg.RedactColumns) > 0
 
 	s := &Server{
-		listen:           listen,
-		token:            token,
-		denyTables:       cfg.DenyTables,
-		redactCols:       cfg.RedactColumns,
-		profileActive:    profileActive,
-		allowedHosts:     cfg.AllowedHosts,
-		monitorCtrl:      cfg.MonitorCtrl,
-		baselineCtrl:     cfg.BaselineCtrl,
-		baselineRefresh:  cfg.BaselineRefresh,
-		schemaSnapCtrl:   cfg.SchemaSnapshotCtrl,
-		verifyCtrl:       cfg.VerifyCtrl,
-		verifyHistory:    cfg.VerifyHistory,
-		baselineRestore:  cfg.BaselineRestore,
-		sqlExport:        cfg.SQLExport,
-		baselineHistory:  cfg.BaselineHistory,
-		telemetry:        cfg.Telemetry,
-		rotationDefaults: cfg.RotationDefaults,
-		version:          cfg.Version,
-		cm:               newConnManager(cfg.Registry, profileActive),
-		authPath:         authPath,
-		passwordCfg:      passwordCfg,
-		allowSetup:       cfg.AllowSetup,
-		sessions:         newSessionStore(),
-		loginLimiter:     newLoginLimiter(),
-		tlsConf:          tlsConf,
-		mcpTokenPath:     mcpTokenPath,
-		sessionProfiles:  newProfileRuleCache(),
-		sqlPanel:         cfg.SQLPanel,
-		archiveFetcher:   parquetquery.Fetch,
+		listen:                  listen,
+		token:                   token,
+		denyTables:              cfg.DenyTables,
+		redactCols:              cfg.RedactColumns,
+		profileActive:           profileActive,
+		allowedHosts:            cfg.AllowedHosts,
+		monitorCtrl:             cfg.MonitorCtrl,
+		baselineCtrl:            cfg.BaselineCtrl,
+		baselineRefresh:         cfg.BaselineRefresh,
+		schemaSnapCtrl:          cfg.SchemaSnapshotCtrl,
+		verifyCtrl:              cfg.VerifyCtrl,
+		verifyHistory:           cfg.VerifyHistory,
+		baselineRestore:         cfg.BaselineRestore,
+		sqlExport:               cfg.SQLExport,
+		baselineHistory:         cfg.BaselineHistory,
+		telemetry:               cfg.Telemetry,
+		rotationDefaults:        cfg.RotationDefaults,
+		baselineRefreshDefaults: cfg.BaselineRefreshDefaults,
+		version:                 cfg.Version,
+		cm:                      newConnManager(cfg.Registry, profileActive),
+		authPath:                authPath,
+		passwordCfg:             passwordCfg,
+		allowSetup:              cfg.AllowSetup,
+		sessions:                newSessionStore(),
+		loginLimiter:            newLoginLimiter(),
+		tlsConf:                 tlsConf,
+		mcpTokenPath:            mcpTokenPath,
+		sessionProfiles:         newProfileRuleCache(),
+		sqlPanel:                cfg.SQLPanel,
+		archiveFetcher:          parquetquery.Fetch,
 	}
 	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot
@@ -608,6 +629,10 @@ func (s *Server) buildHandler() http.Handler {
 	// the loop that consumes it).
 	api.HandleFunc("GET /api/rotation", s.handleRotationGet)
 	api.HandleFunc("PUT /api/rotation", s.handleRotationUpdate)
+	// Global baseline-refresh policy. Same split as rotation: read the
+	// effective settings, PUT an override the running loop picks up next cycle.
+	api.HandleFunc("GET /api/baseline-refresh", s.handleBaselineRefreshGet)
+	api.HandleFunc("PUT /api/baseline-refresh", s.handleBaselineRefreshUpdate)
 	// Authenticated auth verbs. Registered on the inner mux so a forgotten
 	// root registration breaks login, never security (ServeMux specificity
 	// keeps them under the tokenMiddleware-wrapped /api/ catch-all).

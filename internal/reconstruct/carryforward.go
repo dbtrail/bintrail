@@ -107,6 +107,17 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 // carryForwardEligible reports whether a table can be published by carrying its
 // previous file forward instead of folding.
 //
+// # Off unless asked for
+//
+// enabled is the operator's explicit opt-in, and the default is off. The output
+// is the same rows either way, but the REPRESENTATION on disk is not: carrying
+// a file forward hard-links two snapshots to one inode, so `du` and a prune
+// report space they will not reclaim while the newer snapshot references it,
+// and one snapshot ends up holding tables anchored at different binlog
+// coordinates. Those are defensible trade-offs for a loop that would otherwise
+// rewrite terabytes to apply a handful of rows, and they are not something to
+// hand an operator without being asked.
+//
 // # A known capture gap disqualifies the table
 //
 // This is the same trap as TRUNCATE, one step further along, and it is worth
@@ -136,11 +147,11 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 // local-to-local; an S3 source would have to be downloaded, which buys the
 // re-encode back and reintroduces the cost this avoids. Those runs take the
 // ordinary merge path, which is correct, just not free.
-func carryForwardEligible(format, srcPath string, changes int, capGap *CaptureGap) bool {
+func carryForwardEligible(enabled bool, format, srcPath string, changes int, capGap *CaptureGap) bool {
 	// Mydumper output is a SQL dump for a human to load, not a snapshot to be
 	// discovered, so there is no previous file to carry: the rows still have
 	// to be emitted.
-	return format == OutputFormatParquet && changes == 0 && capGap == nil &&
+	return enabled && format == OutputFormatParquet && changes == 0 && capGap == nil &&
 		!strings.HasPrefix(srcPath, "s3://")
 }
 

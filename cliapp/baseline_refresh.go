@@ -71,16 +71,17 @@ Examples:
 }
 
 var (
-	brIndexDSN    string
-	brBaselineDir string
-	brBaselineS3  string
-	brOutput      string
-	brTables      string
-	brAt          string
-	brAllowGaps   bool
-	brParallelism int
-	brFetchBatch  int
-	brWarnEvents  int64
+	brIndexDSN     string
+	brBaselineDir  string
+	brBaselineS3   string
+	brOutput       string
+	brTables       string
+	brAt           string
+	brAllowGaps    bool
+	brCarryForward bool
+	brParallelism  int
+	brFetchBatch   int
+	brWarnEvents   int64
 )
 
 func init() {
@@ -92,6 +93,10 @@ func init() {
 	f.StringVar(&brTables, "tables", "", "Comma-separated schema.table list (default: every table in the newest snapshot)")
 	f.StringVar(&brAt, "at", "", "Point-in-time to refresh to (default: now)")
 	f.BoolVar(&brAllowGaps, "allow-gaps", false, "Publish even when the window spans a known permanent capture gap; the snapshot is permanently marked as knowingly incomplete")
+	f.BoolVar(&brCarryForward, "carry-forward-unchanged", false,
+		"When a table had no changes, publish its previous Parquet file instead of rewriting it (hard link "+
+			"where possible). Off by default: the rows are identical either way, but it links two snapshots "+
+			"to one file, so disk-usage and prune figures then count space they will not reclaim")
 	f.IntVar(&brParallelism, "parallelism", 0, "Max tables refreshed concurrently (0 = one per CPU)")
 	f.IntVar(&brFetchBatch, "fetch-batch-size", 0, "Event page size for the delta fold (0 = default)")
 	f.Int64Var(&brWarnEvents, "warn-event-threshold", 5_000_000, "Warn when a table's delta window exceeds this many events (0 disables)")
@@ -164,18 +169,19 @@ func runBaselineRefresh(cmd *cobra.Command, _ []string) error {
 	}
 
 	reports, failures, runErr := reconstruct.ReconstructTablesDetailed(cmd.Context(), reconstruct.FullTableConfig{
-		IndexDSN:           brIndexDSN,
-		BaselineSrc:        source,
-		Tables:             tables,
-		At:                 at,
-		OutputDir:          output,
-		OutputFormat:       reconstruct.OutputFormatParquet,
-		AllowGaps:          brAllowGaps,
-		Parallelism:        brParallelism,
-		FetchBatchSize:     brFetchBatch,
-		WarnEventThreshold: brWarnEvents,
-		ArchiveFetcher:     cli.TunedArchiveFetcher(tuning),
-		DuckDBTuning:       tuning,
+		IndexDSN:              brIndexDSN,
+		BaselineSrc:           source,
+		Tables:                tables,
+		At:                    at,
+		OutputDir:             output,
+		OutputFormat:          reconstruct.OutputFormatParquet,
+		AllowGaps:             brAllowGaps,
+		CarryForwardUnchanged: brCarryForward,
+		Parallelism:           brParallelism,
+		FetchBatchSize:        brFetchBatch,
+		WarnEventThreshold:    brWarnEvents,
+		ArchiveFetcher:        cli.TunedArchiveFetcher(tuning),
+		DuckDBTuning:          tuning,
 	})
 
 	outcomes := buildRefreshOutcomes(tables, reports, failures)
