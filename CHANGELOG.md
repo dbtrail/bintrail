@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The console daemon's background folds are bounded, and their volume warning
+  works** (#1477). `bintrail-console watch` rebuilds snapshots in the same
+  process that captures binlogs, for the scheduled baseline refresh, the
+  point-in-time restore, and the SQL export build. All three left
+  `FullTableConfig.WarnEventThreshold` at zero, and zero DISABLES that warning
+  (`threshold > 0 && n > threshold`), so the one signal that a fold was about
+  to exhaust RAM could never fire. Two of the three also left `Parallelism` at
+  zero, which means `runtime.NumCPU()`: peak memory is the sum of the tables
+  folding at once, so the daemon's memory tracked the core count of whatever
+  host it landed on. Both are now fixed at shared constants (2 tables, the
+  5,000,000 the CLI ships), and the warning's advice no longer names `--at`,
+  `--parallelism` or `--warn-event-threshold`, which this binary does not
+  register. Refreshes on hosts with more than 2 cores will take longer; the
+  daemon already reports and skips a cycle that overruns its interval.
 - **A console-generated `views.sql` pins the S3 region when it is known**
   (#1462). The console filled no region at all, while archive reads pin one
   detected from the bucket, so a downloaded file described a different read

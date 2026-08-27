@@ -31,7 +31,7 @@ func TestMaybeWarnEventVolume(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			t.Cleanup(func() { slog.SetDefault(prev) })
 
-			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, 1)
+			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, 1, "")
 			out := buf.String()
 
 			if !tc.wantWarn {
@@ -83,7 +83,7 @@ func TestMaybeWarnEventVolume_scaledByParallelism(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			t.Cleanup(func() { slog.SetDefault(prev) })
 
-			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, tc.parallelism)
+			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, tc.parallelism, "")
 			out := buf.String()
 
 			if !tc.wantWarn {
@@ -183,4 +183,53 @@ func TestShouldWarnEvents(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMaybeWarnEventVolume_remediation pins WHOSE advice the warning carries.
+//
+// The default names --at / --parallelism / --warn-event-threshold, which is
+// correct for the attended CLI commands that register them and wrong on
+// bintrail-console, which registers none of the three. A warning that tells an
+// operator to lower a flag their binary does not have is worse than silence: it
+// sends them looking for something that is not there. So a caller on such a
+// surface supplies its own, and that substitution is what this pins.
+func TestMaybeWarnEventVolume_remediation(t *testing.T) {
+	capture := func(remediation string) string {
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		// n over threshold at parallelism 1, so the warning always fires and
+		// the test discriminates on the hint rather than on whether it emitted.
+		maybeWarnEventVolume("db", "orders", 100, 10, 1, remediation)
+		return buf.String()
+	}
+
+	t.Run("empty falls back to the CLI wording", func(t *testing.T) {
+		out := capture("")
+		// Every knob, not just one: an assertion on a single flag stays green
+		// while the others are edited away, and the attended commands rely on
+		// the whole list. Each name below is registered by internal/cli or
+		// cliapp today; drop one there and drop it here in the same change.
+		for _, flag := range []string{"--at", "--parallelism", "--warn-event-threshold", "BINTRAIL_RECONSTRUCT_WARN_EVENTS"} {
+			if !strings.Contains(out, flag) {
+				t.Errorf("default hint no longer names %s; the attended commands rely on it.\ngot: %s", flag, out)
+			}
+		}
+	})
+
+	t.Run("a caller-supplied hint replaces it entirely", func(t *testing.T) {
+		out := capture("shorten the refresh interval, or refresh fewer tables")
+		if !strings.Contains(out, "shorten the refresh interval") {
+			t.Errorf("caller hint not used.\ngot: %s", out)
+		}
+		// The point of the field: the flags must be GONE, not merely joined by
+		// the caller's text. Asserting only that the new text appears would
+		// pass while still sending the operator after a flag that is absent.
+		for _, flag := range []string{"--at", "--parallelism", "--warn-event-threshold", "BINTRAIL_RECONSTRUCT_WARN_EVENTS"} {
+			if strings.Contains(out, flag) {
+				t.Errorf("hint still names %s, which bintrail-console does not register.\ngot: %s", flag, out)
+			}
+		}
+	})
 }

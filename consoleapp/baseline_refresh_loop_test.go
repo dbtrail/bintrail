@@ -791,11 +791,18 @@ func TestRefreshFoldConfig_boundsTheUnattendedFold(t *testing.T) {
 }
 
 // TestRefreshFoldConfig_restoreSharesTheBounds: the point-in-time restore is
-// the OTHER unattended caller, and it reaches the same config through
-// restoreFoldRequest. Pinned separately because "they share foldSnapshot" is a
-// property of today's wiring, not a guarantee: giving restore its own config
-// builder is a plausible refactor that would silently drop these bounds on the
-// path a human just clicked and is not watching either.
+// the OTHER in-daemon caller, and it reaches the same config through
+// restoreFoldRequest.
+//
+// Scope, because the honest version is narrower than it first looks: this
+// calls refreshFoldConfig directly, so it pins that a restoreFoldRequest
+// survives the translation with both bounds intact. It does NOT pin the
+// wiring. If someone adds a restoreFoldConfig and repoints
+// baseline_restore.go at it, this test keeps calling the old builder and keeps
+// passing. What catches THAT is TestEveryConsoleappFoldConfigIsBounded: a new
+// builder means a third FullTableConfig literal, and the guard asserts an
+// exact count, so the addition cannot land without a human deciding it belongs
+// under the same budget.
 func TestRefreshFoldConfig_restoreSharesTheBounds(t *testing.T) {
 	at := time.Now()
 	req := restoreFoldRequest(console.BaselineRestoreRequest{

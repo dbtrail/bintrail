@@ -14,8 +14,11 @@ import (
 // publish the result as a NEW discoverable snapshot named by that instant.
 // It shares foldSnapshot with the periodic refresh — same all-or-nothing
 // publication, same sentinel-classified refusals (capture gap, destructive
-// DDL), same conservative DuckDB budget (this is a daemon that is also
-// capturing; see executeRefresh's resource-posture comment).
+// DDL), and the same in-daemon resource posture: the conservative DuckDB
+// budget, a fixed table parallelism, and the volume warning turned on with
+// advice written for this binary rather than for the CLI (this is a daemon
+// that is also capturing; see executeRefresh's resource-posture comment and
+// the daemonFold* constants beside it).
 
 // TriggerRestore starts a restore, sharing the supervisor's per-server
 // single-flight with dumps and refreshes: all three write the same store.

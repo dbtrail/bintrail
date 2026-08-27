@@ -182,6 +182,10 @@ type foldConfig struct {
 	// WarnEventThreshold / Parallelism drive the #654/#842 volume warning.
 	WarnEventThreshold int64
 	Parallelism        int
+
+	// RemediationHint is the advice attached to that warning; empty uses the
+	// attended-CLI wording. See FullTableConfig.RemediationHint.
+	RemediationHint string
 }
 
 // foldResult is the completed build side of the merge.
@@ -283,7 +287,7 @@ func foldEventWindow(ctx context.Context, fc foldConfig) (*foldResult, error) {
 		// not survive to reach the end, and a warning the operator never sees
 		// is no warning. Latched so it fires once per table, not once per page.
 		if !warned && shouldWarnEvents(res.Total, scaledEventThreshold(fc.WarnEventThreshold, fc.Parallelism)) {
-			maybeWarnEventVolume(fc.Schema, fc.Table, res.Total, fc.WarnEventThreshold, fc.Parallelism)
+			maybeWarnEventVolume(fc.Schema, fc.Table, res.Total, fc.WarnEventThreshold, fc.Parallelism, fc.RemediationHint)
 			warned = true
 		}
 		return nil
