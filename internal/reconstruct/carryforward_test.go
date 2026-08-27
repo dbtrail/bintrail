@@ -90,15 +90,28 @@ func TestCarryForward_linksWhenItCanAndTheBytesSurvive(t *testing.T) {
 	}
 	ss, ok1 := si.Sys().(*syscall.Stat_t)
 	ds, ok2 := di.Sys().(*syscall.Stat_t)
-	if ok1 && ok2 && ss.Ino != ds.Ino {
+	if !ok1 || !ok2 {
+		t.Fatal("no inode information available, so the link claim cannot be checked; this test cannot " +
+			"pass silently on the property it exists for")
+	}
+	if ss.Ino != ds.Ino {
 		t.Errorf("carryForward reported a link but the inodes differ (%d vs %d)", ss.Ino, ds.Ino)
 	}
 }
 
-// A leftover from an interrupted attempt must not be kept. os.Link fails with
-// EEXIST rather than overwriting, and a copy would open the stale file and be
-// happy, so the removal is what makes a retry correct.
-func TestCarryForward_replacesALeftoverDestination(t *testing.T) {
+// A leftover destination must be unlinked before anything is written, and the
+// reason is the COPY path rather than the link path.
+//
+// os.Create truncates. After a carry-forward the destination may share an inode
+// with a file an OLDER snapshot still references, so truncating in place would
+// empty that one too. Unlinking first breaks the share before a byte is
+// written. (os.Link would also fail with EEXIST, though reconstruct's leftovers
+// refusal already rules that out, so EEXIST is not the stake here.)
+//
+// The `linked` assertion is load-bearing: without it, removing the unlink
+// degrades the retry from a link to a copy, the content still comes out right,
+// and the test stays green while the saving is gone.
+func TestCarryForward_replacesALeftoverWithoutTruncatingASharedInode(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "old", "demo", "orders.parquet")
 	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
@@ -107,24 +120,40 @@ func TestCarryForward_replacesALeftoverDestination(t *testing.T) {
 	if err := os.WriteFile(src, []byte("the real snapshot"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+
+	// The leftover is itself a hard link to a THIRD snapshot's file, which is
+	// exactly what an earlier carry-forward leaves behind.
+	older := filepath.Join(root, "older", "demo", "orders.parquet")
+	if err := os.MkdirAll(filepath.Dir(older), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(older, []byte("an older snapshot still needs these bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	dstSnap := filepath.Join(root, "new")
 	dst := filepath.Join(dstSnap, "demo", "orders.parquet")
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(dst, []byte("debris from a killed run"), 0o644); err != nil {
-		t.Fatal(err)
+	if err := os.Link(older, dst); err != nil {
+		t.Skipf("no hard links on this filesystem: %v", err)
 	}
 
-	if _, err := carryForward(context.Background(), src, dstSnap, "demo", "orders"); err != nil {
+	linked, err := carryForward(context.Background(), src, dstSnap, "demo", "orders")
+	if err != nil {
 		t.Fatalf("carryForward over a leftover: %v", err)
 	}
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatal(err)
+	if !linked {
+		t.Error("the retry fell back to a copy: without the unlink, os.Link fails on the leftover and the " +
+			"saving this exists for is silently lost")
 	}
-	if string(got) != "the real snapshot" {
-		t.Errorf("the leftover survived: %q", got)
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "the real snapshot" {
+		t.Errorf("the leftover survived: %q (%v)", got, err)
+	}
+	// The older snapshot must be untouched. A copy into the shared inode would
+	// have overwritten its bytes through the link.
+	if got, err := os.ReadFile(older); err != nil || string(got) != "an older snapshot still needs these bytes" {
+		t.Errorf("an older snapshot was written through a shared inode: %q (%v)", got, err)
 	}
 }
 
@@ -157,5 +186,41 @@ func TestCarryForward_refusesAFileItsManifestDisagreesWith(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "carried forward") {
 		t.Errorf("the refusal does not say what it was doing: %v", err)
+	}
+}
+
+// copyFile is the fallback for a filesystem with no hard links, or a
+// cross-device destination. Nothing reaches it in a t.TempDir(), where the link
+// always wins, so it was entirely unexecuted: called directly here so a
+// regression in it is not invisible until it is the only path available.
+func TestCopyFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.parquet")
+	want := []byte("bytes that must arrive intact")
+	if err := os.WriteFile(src, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "dst.parquet")
+	if err := copyFile(src, dst); err != nil {
+		t.Fatalf("copyFile: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("copied bytes differ: got %q want %q", got, want)
+	}
+	// Distinct inodes: a copy is a copy. If this ever links, the fallback has
+	// stopped being a fallback and the caller's `linked` report is wrong.
+	si, _ := os.Stat(src)
+	di, _ := os.Stat(dst)
+	ss, ok1 := si.Sys().(*syscall.Stat_t)
+	ds, ok2 := di.Sys().(*syscall.Stat_t)
+	if ok1 && ok2 && ss.Ino == ds.Ino {
+		t.Error("copyFile produced a link, so a caller reporting linked=false would be wrong")
+	}
+	if err := copyFile(filepath.Join(dir, "missing.parquet"), dst); err == nil {
+		t.Error("copyFile silently accepted a source that does not exist")
 	}
 }

@@ -237,6 +237,9 @@ func TestBuildRefreshOutcomes_carriedForwardIsItsOwnVerdict(t *testing.T) {
 		nil,
 	)
 	want := map[string]string{"shop.orders": "refreshed", "shop.cold": "unchanged"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d outcomes, want %d: the loops below assert nothing on an empty result", len(got), len(want))
+	}
 	for _, o := range got {
 		if w := want[o.Table]; o.Verdict != w {
 			t.Errorf("%s: verdict = %q, want %q", o.Table, o.Verdict, w)

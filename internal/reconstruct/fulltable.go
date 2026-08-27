@@ -1015,7 +1015,10 @@ func ReconstructTable(
 			return nil, fmt.Errorf("carry %s.%s forward unchanged: %w", schema, table, cerr)
 		}
 		rep.CarriedForward = true
-		rep.Files = []string{filepath.Join(cfg.snapshotDir, schema, table+".parquet")}
+		// Relative to the snapshot dir, matching what mergeBaselineIntoParquet
+		// sets for a table it writes: one field cannot mean two things, and
+		// consumers join it themselves (internal/cli/drill.go does).
+		rep.Files = []string{filepath.Join(schema, table+".parquet")}
 		rep.Duration = time.Since(start)
 		slog.Info("table carried forward unchanged", "schema", schema, "table", table,
 			"linked", linked, "reason", "no events in the window")

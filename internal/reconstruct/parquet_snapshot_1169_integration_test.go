@@ -331,6 +331,36 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+// publishedUnder resolves a report's snapshot-relative Files entry to the file
+// the run just published, by scanning the baselines root for the newest
+// snapshot directory that holds it and is not the source. Scanned rather than
+// composed from the run's timestamp so the inode check survives a change to
+// the snapshot-dir naming instead of silently skipping.
+func publishedUnder(t *testing.T, root, rel, notThis string) string {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read the baselines root: %v", err)
+	}
+	var best string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		p := filepath.Join(root, e.Name(), rel)
+		if p == notThis {
+			continue
+		}
+		if _, err := os.Stat(p); err == nil && e.Name() > filepath.Base(filepath.Dir(filepath.Dir(best))) {
+			best = p
+		}
+	}
+	if best == "" {
+		t.Fatalf("no published snapshot under %s holds %s", root, rel)
+	}
+	return best
+}
+
 // carriedInode returns the inode of a published snapshot table, so a test can
 // tell a hard link from a copy. A link is what makes carrying a table forward
 // free; a copy would still write every byte.
@@ -409,13 +439,22 @@ func TestReconstructParquet_carriesForwardATableWithNoEvents(t *testing.T) {
 		t.Fatalf("a carried-forward table published %d files, want 1", len(reports[0].Files))
 	}
 
+	// Fatal, not Skip: a path-format change must not quietly turn this into a
+	// SKIP, which reports the whole test as skipped even after the assertions
+	// above have already passed.
 	src := filepath.Join(root, base.Format("2006-01-02T15-04-05Z"), schema, "orders.parquet")
 	if _, err := os.Stat(src); err != nil {
-		// The source snapshot's directory name is produced by seedSourceBaseline;
-		// find it rather than guess if the format ever moves.
-		t.Skipf("could not locate the source snapshot to compare inodes: %v", err)
+		t.Fatalf("could not locate the source snapshot to compare inodes: %v", err)
 	}
-	if a, b := carriedInode(t, src), carriedInode(t, reports[0].Files[0]); a != b {
+	// Files is relative to its snapshot dir, so it has to be joined; asserting
+	// that shape here is deliberate, since the field means the same thing for a
+	// carried table as for a written one.
+	if filepath.IsAbs(reports[0].Files[0]) {
+		t.Fatalf("Files carries an absolute path %q; the contract is relative to the snapshot dir",
+			reports[0].Files[0])
+	}
+	dst := publishedUnder(t, root, reports[0].Files[0], src)
+	if a, b := carriedInode(t, src), carriedInode(t, dst); a != b {
 		t.Errorf("the carried file is a copy, not a link (inodes %d vs %d): the bytes were written again", a, b)
 	}
 }
@@ -544,11 +583,107 @@ func TestReconstructParquet_captureGapIsNotCarriedForward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReconstructTables with --allow-gaps: %v", err)
 	}
+	if len(reports) == 0 {
+		t.Fatal("no reports, so the loop below asserts nothing")
+	}
 	for _, r := range reports {
 		if r.CarriedForward {
 			t.Fatalf("%s.%s was carried forward over a known capture gap: the lost events may be this "+
 				"table's, and the capture_gap stamp the merge path writes would be lost with it",
 				r.Schema, r.Table)
 		}
+	}
+}
+
+// TestReconstructParquet_carriesForwardTwiceThenResumes is the property the
+// frozen anchor exists to preserve, and nothing else pins it.
+//
+// A carried file keeps its OWN older anchor rather than the run's cut. That is
+// only safe if a later cycle, after an arbitrary cold streak, still folds every
+// event that happened since. Two consecutive carries chain the inode forward;
+// the third cycle sees a real UPDATE and must produce the updated row, folded
+// from the frozen anchor across both skipped cycles.
+//
+// It also covers what a single-cycle test cannot: that a snapshot published
+// entirely from carried files is itself discoverable and foldable, manifest and
+// markers included.
+func TestReconstructParquet_carriesForwardTwiceThenResumes(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	ctx := context.Background()
+
+	db, dbName := testutil.CreateTestDB(t)
+	if err := indexer.CreateIndexTables(ctx, db, 48, false, nil); err != nil {
+		t.Fatalf("CreateIndexTables: %v", err)
+	}
+	if err := indexer.EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	const schema = "shop"
+	base := time.Now().UTC().Truncate(time.Hour)
+	seedOrdersSnapshot(t, db, schema, base)
+
+	root := t.TempDir()
+	seedSourceBaseline(t, root, base, schema)
+	dsn := testutil.BaseDSN() + "/" + dbName
+
+	// A neighbour keeps the hours covered without touching orders.
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200,
+		base.Add(5*time.Second).Format("2006-01-02 15:04:05"), nil,
+		schema, "customers", 1, "1", nil, nil, []byte(`{"id":1,"name":"n"}`))
+
+	run := func(at time.Time) []*reconstruct.TableReport {
+		t.Helper()
+		reports, err := reconstruct.ReconstructTables(ctx, reconstruct.FullTableConfig{
+			IndexDSN:     dsn,
+			BaselineSrc:  root,
+			Tables:       []string{schema + ".orders"},
+			At:           at,
+			OutputDir:    root,
+			OutputFormat: reconstruct.OutputFormatParquet,
+		})
+		if err != nil {
+			t.Fatalf("ReconstructTables at %s: %v", at.Format(time.RFC3339), err)
+		}
+		if len(reports) != 1 {
+			t.Fatalf("got %d reports, want 1", len(reports))
+		}
+		return reports
+	}
+
+	// Two cold cycles: both must carry, and the second must carry the file the
+	// FIRST one published, not fall back to the original dump.
+	r1 := run(base.Add(10 * time.Second))
+	if !r1[0].CarriedForward {
+		t.Fatal("cycle 1 folded a table with no events")
+	}
+	r2 := run(base.Add(20 * time.Second))
+	if !r2[0].CarriedForward {
+		t.Fatal("cycle 2 folded a table with no events; a carried file must itself be carryable")
+	}
+
+	// A real change, then a warm cycle. This is the assertion that matters: the
+	// fold must resume from the frozen anchor and pick the UPDATE up across both
+	// skipped cycles.
+	testutil.InsertEvent(t, db, "binlog.000001", 300, 400,
+		base.Add(25*time.Second).Format("2006-01-02 15:04:05"), nil,
+		schema, "orders", 2, "1", nil, nil, []byte(`{"id":1,"status":"RESUMED"}`))
+
+	r3 := run(base.Add(30 * time.Second))
+	if r3[0].CarriedForward {
+		t.Fatal("cycle 3 carried a table forward despite an event in its window")
+	}
+	if r3[0].EventsApplied == 0 {
+		t.Error("cycle 3 folded no events: the anchor frozen across two carries did not resume correctly, " +
+			"which is the whole risk of not advancing it")
+	}
+	got := readOrders(t, publishedUnder(t, root, r3[0].Files[0], ""))
+	var found bool
+	for _, row := range got {
+		if strings.Contains(row, "RESUMED") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the update made after two carried cycles is missing from the published snapshot: %v", got)
 	}
 }
