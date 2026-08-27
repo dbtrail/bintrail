@@ -2,12 +2,14 @@ package reconstruct
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 )
@@ -80,8 +82,9 @@ import (
 //
 // One consequence to know: a prune that removes the older snapshot will not
 // reclaim a linked file's bytes while the newer one still references it. That
-// is correct (the data is still in use) but it means `bintrail baseline prune`
-// reports reclaimed bytes it did not reclaim.
+// is correct (the data is still in use) but it means the prune pass behind
+// `bintrail baseline --baseline-retain` reports reclaimed bytes it did not
+// reclaim: it sums file sizes, and a shared inode's blocks are counted whole.
 //
 // `du` is the narrower hazard it is tempting to state too broadly: one `du`
 // over the baseline root tracks inodes within its own traversal and reports the
@@ -111,14 +114,22 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 	if linkErr == nil {
 		return true, nil
 	}
-	// The copy is the designed fallback, not a failure, so this stays at Debug
-	// and the error is never returned. It is logged rather than dropped because
-	// the two causes are worlds apart: a cross-device destination copies once
-	// by design, while a permission or filesystem limit copies every table on
-	// every cycle forever, which is the exact cost the opt-in was taken to
-	// avoid, and nothing else would ever say so.
-	slog.Debug("carry forward: hard link refused, copying instead",
-		"src", srcPath, "dst", dst, "error", linkErr)
+	// The copy is the designed fallback, not a failure, so the error is never
+	// returned. The LEVEL splits by cause, because the two causes are worlds
+	// apart. A cross-device destination is the documented shape (`--baseline-dir
+	// /a --output /b`): it copies by design, every time, and saying so at Warn
+	// would be a line per table per cycle forever. Anything else, a permission
+	// or a filesystem with no links, silently costs the operator the exact
+	// rewrite the opt-in was taken to avoid, and Debug is below the console
+	// binary's default level, so it would never be said at all.
+	if errors.Is(linkErr, syscall.EXDEV) {
+		slog.Debug("carry forward: source and destination are on different filesystems, copying instead",
+			"src", srcPath, "dst", dst)
+	} else {
+		slog.Warn("carry forward: could not hard link, so the file was COPIED and no disk space was saved. "+
+			"Reusing an unchanged table is meant to avoid rewriting it; a copy still writes every byte.",
+			"src", srcPath, "dst", dst, "error", linkErr)
+	}
 	return false, copyFile(srcPath, dst)
 }
 
@@ -129,10 +140,10 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 //
 // enabled is the operator's explicit opt-in, and the default is off. The output
 // is the same rows either way, but the REPRESENTATION on disk is not: carrying
-// a file forward hard-links two snapshots to one inode, so a prune reports
-// space it will not reclaim while the newer snapshot references it,
-// and one snapshot ends up holding tables anchored at different binlog
-// coordinates. Those are defensible trade-offs for a loop that would otherwise
+// a file forward can leave two snapshots sharing one inode (a hard link where
+// the filesystem allows one, a copy otherwise), so a prune reports space it
+// will not reclaim while the newer snapshot references it, and one snapshot
+// ends up holding tables anchored at different binlog coordinates. Those are defensible trade-offs for a loop that would otherwise
 // rewrite terabytes to apply a handful of rows, and they are not something to
 // hand an operator without being asked.
 //

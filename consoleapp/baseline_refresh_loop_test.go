@@ -3,6 +3,7 @@ package consoleapp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"strconv"
@@ -261,7 +262,7 @@ func TestRunBaselineRefreshCycle_countsAServerItCouldNotStart(t *testing.T) {
 	// shared single-flight refuse the refresh.
 	sup.jobs["default"] = &console.BaselineStatus{State: "running"}
 
-	dispatched, skipped := runBaselineRefreshCycle(ctx, nil, sup, "dsn", t.TempDir(), time.Minute, false)
+	dispatched, skipped, _ := runBaselineRefreshCycle(ctx, nil, sup, "dsn", t.TempDir(), time.Minute, false)
 	if dispatched != 0 || skipped != 1 {
 		t.Fatalf("cycle reported dispatched=%d skipped=%d, want 0 and 1: a busy server must be COUNTED, "+
 			"not swallowed at Debug where the default log level hides it", dispatched, skipped)
@@ -620,4 +621,60 @@ func TestEnvBoolOr(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFoldOutcome: the numbers a fold reports.
+//
+// This is the hop the console's reused count travels through, and until it was
+// split out nothing at the unit tier could reach it: zeroing the count compiled
+// and passed the whole suite, because the only caller needs a live index and a
+// real baseline.
+func TestFoldOutcome(t *testing.T) {
+	rep := func(carried bool) *reconstruct.TableReport {
+		return &reconstruct.TableReport{CarriedForward: carried}
+	}
+	tables := []string{"shop.orders", "shop.users", "shop.audit"}
+
+	t.Run("clean run reports every table and the reused subset", func(t *testing.T) {
+		gotT, gotR, gotC, err := foldOutcome(tables,
+			[]*reconstruct.TableReport{rep(true), rep(false), rep(true)}, nil, nil)
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if gotT != 3 || gotR != 0 || gotC != 2 {
+			t.Errorf("tables=%d refused=%d carried=%d, want 3/0/2", gotT, gotR, gotC)
+		}
+	})
+
+	t.Run("a clean run that reused nothing reports zero, not the total", func(t *testing.T) {
+		_, _, gotC, _ := foldOutcome(tables,
+			[]*reconstruct.TableReport{rep(false), rep(false), rep(false)}, nil, nil)
+		if gotC != 0 {
+			t.Errorf("carried=%d, want 0: every table was rewritten", gotC)
+		}
+	})
+
+	t.Run("a failed run still reports what the fold did", func(t *testing.T) {
+		want := errors.New("capture gap")
+		gotT, gotR, gotC, err := foldOutcome(tables,
+			[]*reconstruct.TableReport{rep(true)},
+			[]reconstruct.TableFailure{{}, {}}, want)
+		if !errors.Is(err, want) {
+			t.Fatalf("err = %v, want the run error", err)
+		}
+		// Publication is all-or-nothing, so nothing was published; the counts
+		// still describe the attempt, and refused comes from the failures.
+		if gotT != 3 || gotR != 2 || gotC != 1 {
+			t.Errorf("tables=%d refused=%d carried=%d, want 3/2/1", gotT, gotR, gotC)
+		}
+	})
+
+	t.Run("refused is zero on success even if failures were handed in", func(t *testing.T) {
+		// Guards the branch, not the caller: a clean run must report zero
+		// refused, so the success path cannot start leaking a failure count.
+		_, gotR, _, _ := foldOutcome(tables, nil, []reconstruct.TableFailure{{}}, nil)
+		if gotR != 0 {
+			t.Errorf("refused=%d on a clean run, want 0", gotR)
+		}
+	})
 }

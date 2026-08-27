@@ -637,25 +637,39 @@ func TestUpConsoleConfig_baselineRefreshDefaultsReachTheConsole(t *testing.T) {
 	const dsn = "user:pass@tcp(127.0.0.1:3306)/binlog_index"
 	opts := consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"}
 
-	prevCarry, prevEvery := upBaselineCarryForward, upBaselineRefreshEvery
-	t.Cleanup(func() { upBaselineCarryForward, upBaselineRefreshEvery = prevCarry, prevEvery })
+	prevCarry, prevEvery, prevTrig := upBaselineCarryForward, upBaselineRefreshEvery, upConsoleBaselineTrigger
+	t.Cleanup(func() {
+		upBaselineCarryForward, upBaselineRefreshEvery, upConsoleBaselineTrigger = prevCarry, prevEvery, prevTrig
+	})
 
 	for _, tc := range []struct {
-		name        string
-		carry       bool
-		every       string
-		wantCarry   bool
-		wantEnabled bool
+		name          string
+		carry         bool
+		every         string
+		trigger       bool
+		wantCarry     bool
+		wantEnabled   bool
+		wantScheduled bool
 	}{
-		{"no schedule, reuse off", false, "", false, false},
-		// The case that matters: reuse asked for, but no loop to do it. The
-		// panel must report it dormant rather than live.
-		{"no schedule, reuse on", true, "", true, false},
-		{"scheduled, reuse off", false, "30m", false, true},
-		{"scheduled, reuse on", true, "30m", true, true},
+		{"nothing on, reuse off", false, "", false, false, false, false},
+		// Reuse asked for with no consumer at all. The panel must report it
+		// dormant rather than live.
+		{"nothing on, reuse on", true, "", false, true, false, false},
+		{"scheduled, reuse off", false, "30m", false, false, true, true},
+		{"scheduled, reuse on", true, "30m", false, true, true, true},
+		// The case the second review found: --baseline-trigger alone wires the
+		// point-in-time restore, which consumes this setting, while no refresh
+		// loop runs. Enabled must be true (a restore WILL reuse files today)
+		// and Scheduled false (nothing is on a timer). Reading liveness off the
+		// interval alone told the operator nothing was live and then hard
+		// linked their files.
+		{"trigger only, reuse on", true, "", true, true, true, false},
+		{"trigger only, reuse off", false, "", true, false, true, false},
+		{"trigger and schedule", true, "30m", true, true, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upBaselineCarryForward, upBaselineRefreshEvery = tc.carry, tc.every
+			upConsoleBaselineTrigger = tc.trigger
 			cfg, err := upConsoleConfig(nil, dsn, opts)
 			if err != nil {
 				t.Fatalf("upConsoleConfig: %v", err)
@@ -666,8 +680,12 @@ func TestUpConsoleConfig_baselineRefreshDefaultsReachTheConsole(t *testing.T) {
 					got.CarryForwardUnchanged, tc.wantCarry)
 			}
 			if got.Enabled != tc.wantEnabled {
-				t.Errorf("Enabled=%v, want %v: the panel would misreport whether a refresh loop is running",
+				t.Errorf("Enabled=%v, want %v: the panel would misreport whether ANY consumer of the setting is live",
 					got.Enabled, tc.wantEnabled)
+			}
+			if got.Scheduled != tc.wantScheduled {
+				t.Errorf("Scheduled=%v, want %v: the panel would misreport whether a refresh loop is on a timer",
+					got.Scheduled, tc.wantScheduled)
 			}
 		})
 	}

@@ -37,7 +37,14 @@ func TestBackupRefreshCard_neverClaimsLiveWhileDormant(t *testing.T) {
 			"while also saying nothing runs yet:\n%s", head[j:])
 	}
 	if !strings.Contains(body, "!br.enabled") {
-		t.Fatal("the dormancy note is gone; a saved setting on a daemon with no schedule would look active")
+		t.Fatal("the dormancy note is gone; a setting nothing consumes would look active")
+	}
+	// Three states, and the middle one is the whole point: --baseline-trigger
+	// with no schedule runs no loop but DOES apply this to restores. Collapsing
+	// it back into the dormant branch is the misreport this guard exists for.
+	if !strings.Contains(body, "br.scheduled") {
+		t.Fatal("the card no longer distinguishes 'no schedule' from 'nothing uses this', so a daemon whose " +
+			"restores reuse files today would be told nothing runs yet")
 	}
 }
 
@@ -76,5 +83,32 @@ func TestSaveBackupRefresh_confirmsFromTheResponse(t *testing.T) {
 	}
 	if !strings.Contains(body, "renderRoute()") {
 		t.Fatal("the card is not re-rendered after saving, so it would keep showing the previous state")
+	}
+}
+
+// TestBaselineRefreshNote_partitionsTheTables: reused and refreshed must ADD UP
+// to the run's table count, never overlap.
+//
+// The first version of this line printed the total beside the subset, so a run
+// that reused everything rendered "5 table(s) refreshed, 5 of them reused
+// unchanged" and asked the operator to do the subtraction. It also inverted the
+// rule the CLI summary follows and the docs state: a reused table is not a
+// refreshed one, and which tables actually cost a full rewrite is the number
+// worth seeing.
+func TestBaselineRefreshNote_partitionsTheTables(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "baselineRefreshNote")
+
+	if !strings.Contains(body, "carried") {
+		t.Fatal("the refresh note no longer reports reused tables; this guard covers nothing")
+	}
+	// The refreshed count has to be a DIFFERENCE. A bare rf.tables next to
+	// rf.carried is the double count.
+	if !strings.Contains(body, "- reused") && !strings.Contains(body, "-reused") {
+		t.Error("the refreshed count is not the total minus the reused count, so the two overlap and " +
+			"a fully reused run reads as fully refreshed")
+	}
+	if strings.Contains(body, `(rf.tables || 0) + " table(s) refreshed"`) {
+		t.Error("the note prints the TOTAL table count as the refreshed count while also printing the " +
+			"reused subset; those two numbers must partition the run")
 	}
 }

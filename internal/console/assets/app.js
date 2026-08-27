@@ -3724,10 +3724,10 @@ function rotationCard(rot) {
 // flag, because starting a loop that was never booted needs a restart.
 //
 // The saving is real but it is not free of consequences, so the card states
-// them where the decision is made rather than in a doc nobody opens: reusing a
-// file links two backups to the same bytes on disk, and after that, deleting
-// the older backup does not give the space back while the newer one still
-// points at it.
+// them where the decision is made rather than in a doc nobody opens: where the
+// filesystem allows it, reusing a file leaves two backups sharing the same
+// bytes on disk, and after that, deleting the older backup does not give the
+// space back while the newer one still points at it.
 function backupRefreshCard(br) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Automatic backup refresh" }));
   if (!br || br.error) {
@@ -3742,11 +3742,17 @@ function backupRefreshCard(br) {
   kvRow(card, "set by", br.source === "override"
     ? (br.enabled ? "this page (live)" : "this page (not running yet)")
     : "daemon default");
+  // Three states, not two. A daemon started with --baseline-trigger and no
+  // refresh schedule still applies this to restores, so calling it dormant
+  // there would let an operator hard link their files right after being told
+  // nothing runs.
   card.append(el("p", { class: "form-hint", text: on
     ? "A table with no changes keeps its previous file instead of being written again. Where the filesystem allows it the two backups then share the same bytes on disk, so deleting the older one frees nothing while the newer one still uses it."
     : "Every table is written again on each refresh, even when nothing in it changed. Turning this on skips that work for unchanged tables. (CLI: --baseline-carry-forward-unchanged)" }));
   if (!br.enabled) {
-    card.append(el("p", { class: "form-hint", text: "No refresh schedule is set, so nothing runs yet. What you save here applies once the daemon is started with a schedule." }));
+    card.append(el("p", { class: "form-hint", text: "Nothing uses this setting yet. It applies once the daemon runs automatic refreshes or point in time restores." }));
+  } else if (!br.scheduled) {
+    card.append(el("p", { class: "form-hint", text: "No automatic refresh schedule is set, so this applies to restores you run from the Backups page. Add a schedule to have it apply to automatic refreshes too." }));
   }
   const foot = el("div", { class: "stg-cardfoot" },
     el("button", {
@@ -3789,7 +3795,7 @@ async function saveBackupRefresh(body) {
   const on = !!(now && now.carry_forward_unchanged);
   toast((now && now.enabled)
     ? (on ? "Unchanged tables will be reused" : "Every table will be written again")
-    : "Saved. No refresh schedule is set, so this applies once one is.");
+    : "Saved. Nothing uses this setting yet, so it applies once something does.");
   renderRoute();
 }
 
@@ -4103,13 +4109,17 @@ function baselineRefreshNote(rf) {
       text = "Automatic refresh running" + (rf.since ? " since " + utcLabel(rf.since) : "") + "…";
       break;
     case "succeeded":
-      // The reused count is the only place an operator sees the reuse setting
-      // take effect. Without it a run that reused every file and a run that
-      // rewrote every file read identically, which made the whole opt-in
-      // unconfirmable from the console that offers it.
-      text = "Automatic refresh: " + (rf.tables || 0) + " table(s) refreshed" +
-        (rf.carried ? ", " + rf.carried + " of them reused unchanged" : "") +
-        (when ? " at " + when : "") + ".";
+      // The two numbers PARTITION the run: rf.tables is every table, rf.carried
+      // the subset that was reused, so "refreshed" has to be the difference.
+      // Printing the total next to the subset read as "5 refreshed, 5 of them
+      // reused", which asks the operator to subtract and contradicts the rule
+      // the CLI summary follows: a reused table is not a refreshed one, and
+      // which tables actually cost a rewrite is the number worth seeing.
+      const reused = rf.carried || 0;
+      const rewritten = Math.max(0, (rf.tables || 0) - reused);
+      text = "Automatic refresh" + (when ? " at " + when : "") + ": " +
+        rewritten + " table(s) refreshed" +
+        (reused ? ", " + reused + " unchanged and reused" : "") + ".";
       break;
     case "failed":
       text = "Automatic refresh published nothing" + (when ? " at " + when : "") +
@@ -4569,8 +4579,12 @@ function backupRestoreCard(cur, b, restoreSt) {
       "Last restore published nothing: " + backupFoldError(rst.last_error || "unknown error") + " Nothing was overwritten." }));
     details.open = true;
   } else if (rst && rst.state === "succeeded") {
+    // The reused count belongs here for the same reason it belongs on the
+    // refresh note: a restore consumes the same reuse setting, and without the
+    // number nothing on this page confirms the setting did anything.
     body.append(el("p", { class: "form-hint", text:
-      "Last restore finished" + (rst.at ? ": the backup at " + utcLabel(rst.at) : "") + " is in the list below." }));
+      "Last restore finished" + (rst.at ? ": the backup at " + utcLabel(rst.at) : "") + " is in the list below." +
+      (rst.carried ? " " + rst.carried + " table(s) reused an unchanged file." : "") }));
   }
   details.append(body);
   return details;

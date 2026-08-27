@@ -96,7 +96,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	took := time.Since(elapsed)
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRefresh, StartedAt: started.Format(time.RFC3339),
-		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused,
+		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused, Carried: carried,
 	}, err)
 
 	s.mu.Lock()
@@ -176,14 +176,6 @@ func refreshFoldConfig(req refreshRequest, at time.Time, tableList []string) rec
 	}
 }
 
-// foldSnapshot is the fold both the periodic refresh and the point-in-time
-// restore share: reconstruct every table at `at` and publish the result as a
-// new snapshot in the server's own baseline store, all-or-nothing.
-//
-// carried counts the tables published by reusing the previous snapshot's file.
-// It is read out of the per-table reports rather than inferred from the
-// setting, because asking for reuse is not getting it: a table with changes,
-// with a capture gap, or on the S3 path is folded anyway.
 // countCarried counts the tables a fold published by reusing the previous
 // snapshot's file.
 //
@@ -201,8 +193,44 @@ func countCarried(reports []*reconstruct.TableReport) (carried int) {
 	return carried
 }
 
+// foldSnapshot is the fold both the periodic refresh and the point-in-time
+// restore share: reconstruct every table at `at` and publish the result as a
+// new snapshot in the server's own baseline store, all-or-nothing.
+//
+// carried counts the tables published by reusing the previous snapshot's file.
+// It is read out of the per-table reports rather than inferred from the
+// setting, because asking for reuse is not getting it: a table with changes,
+// with a capture gap, or on the S3 path is folded anyway.
 func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tableList []string) (tables, refused, carried int, err error) {
 	reports, failures, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, refreshFoldConfig(req, at, tableList))
+	return foldOutcome(tableList, reports, failures, runErr)
+}
+
+// foldOutcome is everything foldSnapshot decides once the fold has run, split
+// out because the fold itself needs a live index and a real baseline and this
+// does not.
+//
+// Left inline, zeroing the carried count compiled and passed the entire suite:
+// the only path that reads it runs against real MySQL, so the number the
+// console reports had no unit-tier guard at all. That is the same shape as
+// refreshFoldConfig one function up.
+//
+// carried is reported even when runErr is set, and that is deliberate rather
+// than an oversight. Publication is all-or-nothing, so a failed run published
+// nothing at all; the count still describes the work the fold did, and the UI
+// renders it only under a succeeded state. ReconstructTablesDetailed routes a
+// failed table into failures and never into reports, so this can never count a
+// table that did not actually reuse its file.
+//
+// Residual, stated rather than papered over: the one-line delegation in
+// foldSnapshot is still only reachable with a live index and a real baseline,
+// and consoleapp has no fixture that stands those up. A mutation that bypasses
+// this function survives the unit tier. What the split buys is that the
+// unguarded surface is now a single call rather than the whole decision, and
+// the equivalent end-to-end behaviour is pinned at the integration tier by
+// internal/reconstruct's TestReconstructParquet_doesNotCarryForwardUnlessAsked.
+func foldOutcome(tableList []string, reports []*reconstruct.TableReport,
+	failures []reconstruct.TableFailure, runErr error) (tables, refused, carried int, err error) {
 	carried = countCarried(reports)
 	if runErr != nil {
 		return len(tableList), len(failures), carried, runErr
@@ -372,8 +400,12 @@ func snapshotsPer30Days(interval time.Duration) int64 {
 // for one function over, so it gets a seam rather than a comment.
 func refreshTick(ctx context.Context, reg *console.Registry, sup *baselineSupervisor,
 	globalDSN, globalBaselineDir string, interval time.Duration, carryDefault bool) {
-	dispatched, skipped := runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir, interval, carryDefault)
-	reportDispatch(interval, dispatched, skipped, effectiveCarryForward(reg, carryDefault))
+	dispatched, skipped, carry := runBaselineRefreshCycle(ctx, reg, sup, globalDSN, globalBaselineDir, interval, carryDefault)
+	// carry comes back from the cycle rather than being resolved again here: a
+	// PUT landing between the two reads would make the logged value disagree
+	// with what was actually dispatched, which is the one thing this log exists
+	// to settle.
+	reportDispatch(interval, dispatched, skipped, carry)
 }
 
 // refreshTargetsFor builds this cycle's requests with the effective settings
@@ -384,7 +416,12 @@ func refreshTick(ctx context.Context, reg *console.Registry, sup *baselineSuperv
 // running a refresh: the loop body is otherwise only observable by letting a
 // fold start.
 func refreshTargetsFor(reg *console.Registry, globalDSN, globalBaselineDir string, carryDefault bool) []refreshRequest {
-	carry := effectiveCarryForward(reg, carryDefault)
+	return refreshTargetsWith(reg, globalDSN, globalBaselineDir, effectiveCarryForward(reg, carryDefault))
+}
+
+// refreshTargetsWith is the same thing with the setting ALREADY resolved, so
+// one cycle resolves it once and logs exactly the value it dispatched with.
+func refreshTargetsWith(reg *console.Registry, globalDSN, globalBaselineDir string, carry bool) []refreshRequest {
 	reqs := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
 	for i := range reqs {
 		reqs[i].CarryForwardUnchanged = carry
@@ -432,16 +469,17 @@ func carryForwardProvenance(reg *console.Registry, daemonDefault bool) (on bool,
 // is establishing replication and opening its console would make every restart
 // the most expensive moment in the process's life.
 func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *baselineSupervisor,
-	globalDSN, globalBaselineDir string, interval time.Duration, carryDefault bool) (dispatched, skipped int) {
+	globalDSN, globalBaselineDir string, interval time.Duration, carryDefault bool) (dispatched, skipped int, carry bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("baseline refresh cycle panicked; refreshes continue next tick", "panic", r)
 		}
 	}()
+	carry = effectiveCarryForward(reg, carryDefault)
 	if ctx.Err() != nil {
-		return dispatched, skipped
+		return dispatched, skipped, carry
 	}
-	for _, req := range refreshTargetsFor(reg, globalDSN, globalBaselineDir, carryDefault) {
+	for _, req := range refreshTargetsWith(reg, globalDSN, globalBaselineDir, carry) {
 		switch err := sup.TriggerRefresh(req, interval); {
 		case err == nil:
 			dispatched++
@@ -466,7 +504,7 @@ func runBaselineRefreshCycle(ctx context.Context, reg *console.Registry, sup *ba
 			slog.Warn("baseline refresh: could not start", "server", req.ServerName, "error", err)
 		}
 	}
-	return dispatched, skipped
+	return dispatched, skipped, carry
 }
 
 // reportDispatch reports what a tick actually did, which is dispatch and

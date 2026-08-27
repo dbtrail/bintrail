@@ -1435,7 +1435,13 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 		// dormant instead of implying it is live.
 		BaselineRefreshDefaults: console.BaselineRefreshDefaults{
 			CarryForwardUnchanged: upBaselineCarryForward,
-			Enabled:               upBaselineRefreshEvery != "",
+			// Enabled is the OR because the restore consumes this setting too
+			// and is wired off the supervisor, which --baseline-trigger alone
+			// creates. Scheduled is the narrower interval-only fact. The two
+			// must be computed from the same expressions that gate the two
+			// consumers in runWatch, or the panel drifts from the daemon.
+			Enabled:   upBaselineRefreshEvery != "" || upConsoleBaselineTrigger,
+			Scheduled: upBaselineRefreshEvery != "",
 		},
 		AllowSetup: opts.AllowSetup,
 		Version:    appVersion,

@@ -36,10 +36,16 @@ type BaselineRunRecord struct {
 	StartedAt    string `json:"started_at"`
 	FinishedAt   string `json:"finished_at"`
 	Tables       int    `json:"tables,omitempty"`
-	Rows         int64  `json:"rows,omitempty"`
-	Uploaded     int    `json:"uploaded,omitempty"`
-	Refused      int    `json:"refused,omitempty"`
-	Error        string `json:"error,omitempty"`
+	// Carried counts tables published by reusing the previous snapshot's file
+	// (refresh and restore). Persisted rather than left to the live status,
+	// which the next run overwrites: whether a run cost a full rewrite is
+	// exactly the thing an operator looks back at when sizing a disk or an
+	// interval, and by then the live status is gone.
+	Carried  int    `json:"carried,omitempty"`
+	Rows     int64  `json:"rows,omitempty"`
+	Uploaded int    `json:"uploaded,omitempty"`
+	Refused  int    `json:"refused,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 type baselineHistoryFile struct {

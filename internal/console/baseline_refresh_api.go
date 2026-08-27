@@ -12,12 +12,16 @@ type baselineRefreshDTO struct {
 	// Source is "override" when the value comes from a console-saved policy,
 	// "default" when it is the daemon's own flag/env.
 	Source string `json:"source"`
-	// Enabled reports whether a refresh loop is actually RUNNING, which is
-	// false when the daemon was started without --baseline-refresh-interval.
-	// Independent of whether an override exists: the loop's run/skip decision
-	// is taken once at boot, so a saved setting is dormant until a restart and
-	// the panel must keep saying so rather than implying it is live.
+	// Enabled reports whether any consumer of the setting is live in this
+	// daemon: the periodic refresh loop, the point-in-time restore, or both.
+	// Independent of whether an override exists, because liveness is decided at
+	// boot and a saved setting is dormant until a restart when nothing consumes
+	// it.
 	Enabled bool `json:"enabled"`
+	// Scheduled reports the narrower fact that a periodic refresh loop is
+	// running. Enabled without Scheduled is the --baseline-trigger daemon: the
+	// setting governs restores today and nothing is on a timer.
+	Scheduled bool `json:"scheduled"`
 }
 
 // baselineRefreshRequest is the PUT /api/baseline-refresh body.
@@ -51,12 +55,14 @@ func (s *Server) effectiveBaselineRefresh() baselineRefreshDTO {
 			CarryForwardUnchanged: bc.CarryForwardUnchanged,
 			Source:                "override",
 			Enabled:               d.Enabled,
+			Scheduled:             d.Scheduled,
 		}
 	}
 	return baselineRefreshDTO{
 		CarryForwardUnchanged: d.CarryForwardUnchanged,
 		Source:                "default",
 		Enabled:               d.Enabled,
+		Scheduled:             d.Scheduled,
 	}
 }
 
@@ -64,10 +70,11 @@ func (s *Server) effectiveBaselineRefresh() baselineRefreshDTO {
 // global override, or clear one. Refused on the read-only console, which runs
 // no loop to consume it, and on a newer-version (read-only) registry file.
 //
-// It applies on the next tick of a loop that is ALREADY running, because every
-// cycle re-reads the registry. With no --baseline-refresh-interval there is no
-// loop and it applies to nothing until the daemon is restarted with one, which
-// is what the DTO's Enabled reports and what the panel has to keep saying.
+// It applies to the next run of whatever consumes it, with no restart: the
+// refresh loop re-reads the registry every cycle, and a restore reads it when
+// the operator asks for one. On a daemon that runs neither it applies to
+// nothing until a restart, which is what the DTO's Enabled reports and what the
+// panel has to keep saying.
 //
 // The body is decoded into a struct with plain bools rather than read as a
 // partial patch on purpose: a body with the key absent decodes to false, which

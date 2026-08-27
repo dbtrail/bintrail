@@ -203,11 +203,23 @@ type RotationDefaults struct {
 type BaselineRefreshDefaults struct {
 	// CarryForwardUnchanged is the daemon's --baseline-carry-forward-unchanged.
 	CarryForwardUnchanged bool
-	// Enabled is false when the daemon was started with no
-	// --baseline-refresh-interval, so no refresh loop is running. A saved
-	// override is dormant until a restart in that state, and the panel says so
-	// rather than implying the setting is live.
+	// Enabled reports whether ANY consumer of the setting is live in this
+	// daemon, which is what decides if a saved value has an effect today.
+	//
+	// Two consumers read it, and only one is the loop. The point-in-time
+	// restore folds into the same store with the same setting, and it is wired
+	// whenever a baseline supervisor exists, which --baseline-trigger alone is
+	// enough to create. Reading liveness off the refresh interval alone told an
+	// operator running --baseline-trigger that nothing was live, and then a
+	// Restore hard-linked their files. For a setting whose whole purpose is
+	// taking consent about the on-disk representation, that is the one thing
+	// the panel must not do.
 	Enabled bool
+	// Scheduled reports the narrower fact: a periodic refresh loop is running
+	// (--baseline-refresh-interval was set). Separate from Enabled because the
+	// panel's copy has to distinguish "this applies to your restores but
+	// nothing is on a timer" from "this applies to nothing until a restart".
+	Scheduled bool
 }
 
 // Server is a configured, ready-to-run console HTTP server. It holds only

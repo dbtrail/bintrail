@@ -133,9 +133,13 @@ type RotationConfig struct {
 type BaselineRefreshConfig struct {
 	// CarryForwardUnchanged publishes a table with no events in the window by
 	// carrying its previous Parquet file forward instead of rewriting it. Off
-	// by default: the rows are identical either way, but it hard-links two
-	// snapshots to one inode and leaves that table anchored at its older binlog
-	// coordinate, so `du` and a prune report space they will not reclaim.
+	// by default: the rows are identical either way, but the on-disk
+	// representation is not. Where the filesystem allows it the two snapshots
+	// end up sharing one inode, so a prune reports space it will not reclaim
+	// while the newer snapshot references the file. Separately, and for a
+	// different reason, the carried table stays anchored at its older binlog
+	// coordinate, which is correct rather than a cost: its deltas resume
+	// exactly there.
 	CarryForwardUnchanged bool `yaml:"carry_forward_unchanged"`
 }
 

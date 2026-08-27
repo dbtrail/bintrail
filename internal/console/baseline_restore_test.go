@@ -256,3 +256,52 @@ func TestBaselineFiles_joinsRunHistory(t *testing.T) {
 		t.Fatalf("run = %+v, want restore/210s/12 rows", got.Run)
 	}
 }
+
+// TestBaselineRestore_carriesTheEffectiveReuseSetting: the console resolves the
+// setting at request time and puts it in the request.
+//
+// Resolving at request time is deliberate. A restore runs asynchronously, so
+// binding the value the operator was looking at is more honest than re-reading
+// it whenever the fold happens to start. Both branches are asserted because the
+// override is the whole point: a daemon default of off with a saved override of
+// on must reach the restore as on.
+func TestBaselineRestore_carriesTheEffectiveReuseSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		daemon   bool
+		override *bool
+		want     bool
+	}{
+		{"daemon flag off, nothing saved", false, nil, false},
+		{"daemon flag on, nothing saved", true, nil, true},
+		{"override on beats a flag saying off", false, boolPtrRestore(true), true},
+		{"override off beats a flag saying on", true, boolPtrRestore(false), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubRestorer{}
+			srv := newRestoreServer(t, stub)
+			srv.baselineRefreshDefaults = BaselineRefreshDefaults{CarryForwardUnchanged: tc.daemon, Enabled: true}
+			if tc.override != nil {
+				if err := srv.cm.reg.SetBaselineRefresh(&BaselineRefreshConfig{CarryForwardUnchanged: *tc.override}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			id := addRestoreEntry(t, srv, t.TempDir())
+
+			rec, body := doServersReq(t, srv, "POST", "/api/servers/"+id+"/baseline/restore",
+				`{"at":"2026-01-02 03:04:05"}`)
+			if rec.Code != 202 {
+				t.Fatalf("POST code=%d body=%s", rec.Code, body)
+			}
+			if stub.last == nil {
+				t.Fatal("no restore request reached the restorer, so the assertion below checks nothing")
+			}
+			if stub.last.CarryForwardUnchanged != tc.want {
+				t.Errorf("CarryForwardUnchanged = %v, want %v: the restore does not honour the reuse setting",
+					stub.last.CarryForwardUnchanged, tc.want)
+			}
+		})
+	}
+}
+
+func boolPtrRestore(b bool) *bool { return &b }

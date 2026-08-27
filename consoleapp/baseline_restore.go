@@ -50,7 +50,7 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 	tables, refused, carried, err := s.executeRestore(req)
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRestore, StartedAt: started.Format(time.RFC3339),
-		SnapshotTime: publishedSnapshotTime(req.At, err), Tables: tables, Refused: refused,
+		SnapshotTime: publishedSnapshotTime(req.At, err), Tables: tables, Refused: refused, Carried: carried,
 	}, err)
 
 	s.mu.Lock()
@@ -91,15 +91,26 @@ func (s *baselineSupervisor) executeRestore(req console.BaselineRestoreRequest) 
 	if len(tableList) == 0 {
 		return 0, 0, 0, fmt.Errorf("no backup exists at or before %s; a restore folds an existing backup forward, so pick a moment after your oldest backup", req.At.UTC().Format("2006-01-02 15:04:05"))
 	}
-	return s.foldSnapshot(refreshRequest{
+	return s.foldSnapshot(restoreFoldRequest(req), req.At.UTC(), tableList)
+}
+
+// restoreFoldRequest translates a restore request into the fold request the
+// refresh path uses, which is the whole claim wireBaselineExtras makes below:
+// same fold, same store, the only delta is who picks the instant.
+//
+// Split out so that claim is checkable without an index and a baseline. Left
+// inline, dropping CarryForwardUnchanged compiled, passed every test, and
+// silently made the restore the one Parquet publisher that ignores the
+// operator's setting.
+func restoreFoldRequest(req console.BaselineRestoreRequest) refreshRequest {
+	return refreshRequest{
 		ServerID: req.ServerID, ServerName: req.ServerName,
 		IndexDSN: req.IndexDSN, BaselineDir: req.BaselineDir,
-		// Carried through rather than left at the zero value: the comment on
-		// wireBaselineExtras below argues a restore is the same fold as a
-		// refresh, and a setting that applies to one and not the other makes
-		// that false. The console resolves it; this only executes it.
+		// The console resolves the effective value at request time; this only
+		// executes it. Resolving again here would let a toggle saved while a
+		// restore sits in the queue change what the operator asked for.
 		CarryForwardUnchanged: req.CarryForwardUnchanged,
-	}, req.At.UTC(), tableList)
+	}
 }
 
 // wireBaselineExtras attaches the run history, the restore capability and
