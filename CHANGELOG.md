@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`bintrail views --include-live`** (#1480). The generated DuckDB views read
+  the Parquet tier, which only holds partitions `rotate` has already archived,
+  so the most recent window lived nowhere in the file and a query about it
+  returned no rows exactly as if nothing had happened. The new flag adds a
+  second leg over the index itself, making a DuckDB query fresh to capture lag
+  instead of to the archive retention window. Overlap between the two is
+  deduplicated by `event_id` with the index winning, the same rule bintrail
+  already applies in Go. The file carries the index host, port, database and
+  user and never its password: fill the empty slot in your own session. Without
+  the flag the file is unchanged except that it now states, in the `events`
+  view's own comment, which events it does not cover.
+
 ### Fixed
 - **A console-generated `views.sql` pins the S3 region when it is known**
   (#1462). The console filled no region at all, while archive reads pin one

@@ -32,6 +32,33 @@ type BaselineTable struct {
 	Path   string // local path or s3:// URL of the table's .parquet file
 }
 
+// LiveIndex names the index whose `binlog_events` the events view unions in as
+// its hot leg, so a query is fresh to capture lag instead of to the archive
+// retention window (#1480).
+//
+// The archives only hold partitions rotation has already archived. On a
+// deployment measured for #1465 that left the most recent ~12 hours visible
+// nowhere in the Parquet tier, which a reader of an archives-only view cannot
+// distinguish from those rows not existing.
+//
+// It carries HOST, PORT, DATABASE and USER, which are configuration, and NEVER
+// a password: this file is meant to be shared, and the header says it holds no
+// credentials. The generated preamble emits the password slot empty for the
+// operator to fill in their own session.
+type LiveIndex struct {
+	Host     string
+	Port     int
+	Database string
+	User     string
+
+	// BintrailID attributes the hot leg's rows. Live binlog_events has no
+	// per-row source column (the archives get theirs from the Hive path), so
+	// this can only be filled when the index serves exactly ONE source. With
+	// more than one it stays empty and the hot rows carry NULL, which the view
+	// says out loud rather than guessing an attribution.
+	BintrailID string
+}
+
 // Input is everything Generate needs. The command layer resolves it; nothing in
 // this package performs IO.
 type Input struct {
@@ -89,6 +116,11 @@ type Input struct {
 	// two of them would silently mix states that never coexisted.
 	Baselines []BaselineTable
 
+	// LiveIndex, when set, adds the hot leg to the events view. Nil keeps the
+	// archives-only view, which is what `bintrail views` emitted before #1480
+	// and what a file generated with no reachable index must still emit.
+	LiveIndex *LiveIndex
+
 	// ExcludeEventColumns drops the named columns (matched case-insensitively
 	// against archive.BinlogEventColumns) from the `events` view. Purely
 	// mechanical here — the views package names no policy. The console SQL panel
@@ -116,6 +148,9 @@ func Generate(in Input) string {
 			region = ""
 		}
 		writeS3Preamble(&b, region, in.S3Endpoint, in.RegionAmbiguous)
+	}
+	if in.LiveIndex != nil {
+		writeLivePreamble(&b, in.LiveIndex)
 	}
 	writeEventsView(&b, in)
 	writeStateViews(&b, in)
@@ -296,12 +331,44 @@ const eventTypeCase = "CASE \"event_type\"\n" +
 // same slice the archiver writes with — so a column added or removed there
 // changes this output and breaks the golden test, rather than leaving the
 // generated schema quietly behind the files it describes.
+// liveAttachAlias is the DuckDB catalog name the index is attached under. It is
+// deliberately not "index": that is close enough to a reserved word in enough
+// dialects that an operator pasting these views elsewhere hits an avoidable
+// parse error, and a distinctive name makes the hot leg obvious in a plan.
+const liveAttachAlias = "bintrail_live"
+
+// liveSecretName is the DuckDB secret the ATTACH reads credentials from.
+const liveSecretName = "bintrail_index"
+
+// writeLivePreamble emits the mysql extension setup for the hot leg.
+//
+// The password slot is left EMPTY on purpose. Everything else here (host, port,
+// database, user) is configuration that a reader on another machine genuinely
+// needs, but this file is meant to be shared and its header says it carries no
+// credentials — so the one field that is a credential is the one the operator
+// fills in their own session. Same stance as the S3 preamble, which reaches for
+// a credential chain rather than writing keys into the file; MySQL has no such
+// chain, so the slot is explicit instead.
+func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
+	b.WriteString("-- Live index setup, for the hot leg of the events view.\n")
+	b.WriteString("-- FILL IN THE PASSWORD BELOW before running: this file is shareable and\n")
+	b.WriteString("-- carries none. Everything else is the index location, which is not secret.\n")
+	b.WriteString("-- Read-only: nothing in this file writes, and the ATTACH enforces it.\n")
+	b.WriteString("INSTALL mysql; LOAD mysql;\n")
+	fmt.Fprintf(b, "CREATE OR REPLACE SECRET %s (\n", quoteIdent(liveSecretName))
+	b.WriteString("    TYPE mysql,\n")
+	fmt.Fprintf(b, "    HOST %s,\n", sqlString(li.Host))
+	fmt.Fprintf(b, "    PORT %d,\n", li.Port)
+	fmt.Fprintf(b, "    DATABASE %s,\n", sqlString(li.Database))
+	fmt.Fprintf(b, "    USER %s,\n", sqlString(li.User))
+	b.WriteString("    PASSWORD ''  -- <- your index password\n")
+	b.WriteString(");\n")
+	fmt.Fprintf(b, "ATTACH '' AS %s (TYPE mysql, SECRET %s, READ_ONLY);\n\n",
+		quoteIdent(liveAttachAlias), quoteIdent(liveSecretName))
+}
+
 func writeEventsView(b *strings.Builder, in Input) {
 	sources := in.ArchiveSources
-	exclude := make(map[string]bool, len(in.ExcludeEventColumns))
-	for _, c := range in.ExcludeEventColumns {
-		exclude[strings.ToLower(c)] = true
-	}
 	b.WriteString("-- events: every archived binlog event, across all archive sources.\n")
 	switch {
 	case in.ArchiveDiscoveryFailed:
@@ -318,22 +385,87 @@ func writeEventsView(b *strings.Builder, in Input) {
 	b.WriteString("-- existed simply lack it, and those files must read back with NULLs rather\n")
 	b.WriteString("-- than failing the whole scan. A column absent from EVERY archived file is\n")
 	b.WriteString("-- still an error — drop it from the SELECT if you hit that on an old archive.\n")
+
+	if in.LiveIndex == nil {
+		b.WriteString("--\n")
+		b.WriteString("-- SCOPE: these are the ARCHIVED events only. Partitions rotation has not\n")
+		b.WriteString("-- archived yet exist solely in the index, so the most recent window is\n")
+		b.WriteString("-- absent here and reads as if nothing happened. Regenerate with a\n")
+		b.WriteString("-- reachable index to add the live leg.\n")
+		b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
+		writeEventSelect(b, in, false, "  ")
+		b.WriteString(";\n\n")
+		return
+	}
+
+	b.WriteString("--\n")
+	b.WriteString("-- Two legs: the index for events not yet archived, the Parquet for everything\n")
+	b.WriteString("-- rotation has archived. A partition that has been archived but not yet\n")
+	b.WriteString("-- dropped exists on BOTH sides, so the cold leg excludes any event_id the hot\n")
+	b.WriteString("-- leg already returned. That is the same rule bintrail applies in Go when it\n")
+	b.WriteString("-- merges these two sources, with the index winning.\n")
 	b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
-	b.WriteString("  SELECT\n")
-	// The three hive_partitioning columns, synthesized by DuckDB from the path.
-	// bintrail_id is the one that matters: it is what keeps two servers' events
-	// distinguishable inside a single view.
-	b.WriteString("    \"bintrail_id\", \"event_date\", \"event_hour\",\n")
-	for _, col := range archive.BinlogEventColumns {
-		if exclude[strings.ToLower(col.Name)] {
+	b.WriteString("  WITH hot AS (\n")
+	writeEventSelect(b, in, true, "    ")
+	b.WriteString("\n  ), cold AS (\n")
+	writeEventSelect(b, in, false, "    ")
+	b.WriteString("\n  )\n")
+	b.WriteString("  SELECT * FROM hot\n")
+	b.WriteString("  UNION ALL BY NAME\n")
+	b.WriteString("  SELECT * FROM cold\n")
+	b.WriteString("   WHERE NOT EXISTS (SELECT 1 FROM hot WHERE hot.event_id = cold.event_id);\n\n")
+}
+
+// writeEventSelect renders one leg of the events view. Both legs go through
+// here so the derived columns (the event_type label, commit_time) cannot drift
+// between them: two hand-written copies of one projection is how a UNION starts
+// reporting different things for the same event depending on its age.
+func writeEventSelect(b *strings.Builder, in Input, live bool, indent string) {
+	exclude := make(map[string]bool, len(in.ExcludeEventColumns))
+	for _, c := range in.ExcludeEventColumns {
+		exclude[strings.ToLower(c)] = true
+	}
+	b.WriteString(indent + "SELECT\n")
+	col := indent + "  "
+
+	// The three hive_partitioning columns. The cold leg gets them synthesized
+	// by DuckDB from the path; the hot leg has to produce them itself, because
+	// live binlog_events carries no source column and no partition path.
+	if live {
+		if in.LiveIndex.BintrailID != "" {
+			fmt.Fprintf(b, "%s%s AS \"bintrail_id\",\n", col, sqlString(in.LiveIndex.BintrailID))
+		} else {
+			// Stated, not guessed. Every source writes into the same
+			// binlog_events, so with more than one registered there is no way
+			// to attribute a live row from the row itself.
+			b.WriteString(col + "NULL AS \"bintrail_id\", -- index serves more than one source; not attributable per row\n")
+		}
+		// Derived so the hot leg filters on the same predicates as the cold
+		// one. These mirror the Hive path rotation writes, which is UTC.
+		b.WriteString(col + "strftime(\"event_timestamp\", '%Y-%m-%d') AS \"event_date\",\n")
+		b.WriteString(col + "strftime(\"event_timestamp\", '%H') AS \"event_hour\",\n")
+	} else {
+		b.WriteString(col + "\"bintrail_id\", \"event_date\", \"event_hour\",\n")
+	}
+
+	for _, c := range archive.BinlogEventColumns {
+		if exclude[strings.ToLower(c.Name)] {
 			continue
 		}
-		switch col.Name {
+		switch c.Name {
+		case "event_id":
+			// Cast on BOTH legs. The index column is BIGINT UNSIGNED and the
+			// Parquet one is signed, and DuckDB reconciles that pair by
+			// widening the union to HUGEINT — a 128-bit surprise in every
+			// downstream join for a value that never leaves BIGINT range.
+			b.WriteString(col + "CAST(\"event_id\" AS BIGINT) AS \"event_id\",\n")
 		case "event_type":
-			b.WriteString("    \"event_type\" AS \"event_type_code\",\n")
-			b.WriteString("    " + eventTypeCase + ",\n")
+			b.WriteString(col + "CAST(\"event_type\" AS TINYINT) AS \"event_type_code\",\n")
+			b.WriteString(col + eventTypeCase + ",\n")
+		case "schema_version":
+			b.WriteString(col + "CAST(\"schema_version\" AS INTEGER) AS \"schema_version\",\n")
 		case "commit_ts_us":
-			b.WriteString("    \"commit_ts_us\",\n")
+			b.WriteString(col + "\"commit_ts_us\",\n")
 			// Stored as epoch MICROSECONDS (#18); make the usable form the one
 			// that reads like a timestamp next to event_timestamp.
 			// The CAST is load-bearing: commit_ts_us is UNSIGNED (UBIGINT in the
@@ -341,26 +473,34 @@ func writeEventsView(b *strings.Builder, in Input) {
 			// uncast form is a binder error that would reach the operator's
 			// DuckDB, not ours. Epoch microseconds stay far below 2^63 (year
 			// 294247), so the narrowing cannot lose a real value.
-			b.WriteString("    CASE WHEN \"commit_ts_us\" IS NULL THEN NULL\n")
-			b.WriteString("         ELSE make_timestamp(CAST(\"commit_ts_us\" AS BIGINT)) END AS \"commit_time\",\n")
+			b.WriteString(col + "CASE WHEN \"commit_ts_us\" IS NULL THEN NULL\n")
+			b.WriteString(col + "     ELSE make_timestamp(CAST(\"commit_ts_us\" AS BIGINT)) END AS \"commit_time\",\n")
 		default:
-			fmt.Fprintf(b, "    %s,\n", quoteIdent(col.Name))
+			fmt.Fprintf(b, "%s%s,\n", col, quoteIdent(c.Name))
 		}
 	}
 	trimTrailingComma(b)
-	b.WriteString("\n  FROM read_parquet(\n")
-	b.WriteString("    [\n")
-	for i, s := range sources {
+
+	if live {
+		// Only the columns above: live binlog_events also has pk_hash, a
+		// generated column the archives do not carry, and selecting it would
+		// give the two legs different shapes.
+		fmt.Fprintf(b, "\n%sFROM %s.\"binlog_events\"", indent, quoteIdent(liveAttachAlias))
+		return
+	}
+	b.WriteString("\n" + indent + "FROM read_parquet(\n")
+	b.WriteString(indent + "  [\n")
+	for i, src := range in.ArchiveSources {
 		sep := ","
-		if i == len(sources)-1 {
+		if i == len(in.ArchiveSources)-1 {
 			sep = ""
 		}
-		fmt.Fprintf(b, "      %s%s\n", sqlString(archiveGlob(s)), sep)
+		fmt.Fprintf(b, "%s    %s%s\n", indent, sqlString(archiveGlob(src)), sep)
 	}
-	b.WriteString("    ],\n")
-	b.WriteString("    hive_partitioning = true,\n")
-	b.WriteString("    union_by_name = true\n")
-	b.WriteString("  );\n\n")
+	b.WriteString(indent + "  ],\n")
+	b.WriteString(indent + "  hive_partitioning = true,\n")
+	b.WriteString(indent + "  union_by_name = true\n")
+	b.WriteString(indent + ")")
 }
 
 // archiveGlob turns an archive base path (…/bintrail_id=<id>) into the glob that

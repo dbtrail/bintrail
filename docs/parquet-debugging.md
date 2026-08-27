@@ -31,6 +31,28 @@ duckdb -init views.sql lake.db
 
 `-init` runs the file as the session opens, so the views and the S3 secret are both there when you get the prompt. In a session that is already open, `.read views.sql` does the same.
 
+### How fresh is what you get (`--include-live`)
+
+By default these views read the **Parquet only**. Parquet exists for a partition once `rotate` has archived it, so everything more recent than that lives solely in the index and is absent from the views. On one measured deployment that was the most recent 12 hours. The gap is silent: a query about this morning returns no rows, which reads exactly like nothing happened.
+
+`--include-live` adds a second leg so the `events` view also covers what the index still holds:
+
+```sh
+bintrail views \
+  --index-dsn "user:pass@tcp(index-db:3306)/bintrail_index" \
+  --include-live \
+  --out views.sql
+```
+
+The view then reads both and is fresh to capture lag, which is seconds when the index keeps up. A partition that has been archived but not yet dropped exists on both sides, so the Parquet leg excludes any `event_id` the index already returned. That is the same rule bintrail applies internally when it merges these two sources, with the index winning.
+
+Two things to know before you use it:
+
+- **You fill in the password.** The generated file carries the index host, port, database and user, because a reader on another machine needs them, and it carries no password, because the file is meant to be shared. Open it, put your password in the empty `PASSWORD ''` slot, then run it. The attachment is read-only.
+- **It needs the index reachable from wherever you run DuckDB.** The Parquet-only file works from anywhere the object store does; this one also needs a route to the index.
+
+If your index serves more than one source, live rows come back with `bintrail_id` as NULL. The archived rows get theirs from the storage path, but a row in the index carries no source of its own, so there is nothing to attribute it from.
+
 You get:
 
 | View | What it is |

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/config"
@@ -80,6 +81,7 @@ var (
 	vBaselineS3  string
 	vOut         string
 	vNoBaselines bool
+	vIncludeLive bool
 )
 
 func init() {
@@ -91,6 +93,7 @@ func init() {
 	viewsCmd.Flags().StringVar(&vBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots")
 	viewsCmd.Flags().StringVar(&vBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/)")
 	viewsCmd.Flags().BoolVar(&vNoBaselines, "no-baselines", false, "Emit only the events view, skipping the baseline state views")
+	viewsCmd.Flags().BoolVar(&vIncludeLive, "include-live", false, "Add a live leg to the events view so it also covers events the index holds but rotation has not archived yet. Requires --index-dsn. The generated file carries the index host, port, database and user, and never its password: fill that in before running")
 	viewsCmd.Flags().StringVar(&vOut, "out", "views.sql", "Output file, or - for stdout")
 }
 
@@ -124,6 +127,14 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		}
 		in.ArchiveSources = sources
 		in.PortableRouting = true
+	}
+
+	if vIncludeLive {
+		li, err := resolveLiveIndex(cmd.Context(), vIndexDSN)
+		if err != nil {
+			return err
+		}
+		in.LiveIndex = li
 	}
 
 	if !vNoBaselines {
@@ -258,4 +269,65 @@ func writeViewsOutput(cmd *cobra.Command, sql string) error {
 		return fmt.Errorf("write %s: %w", vOut, err)
 	}
 	return nil
+}
+
+// resolveLiveIndex decomposes the index DSN into the non-secret half the
+// generated file can carry, and attributes the hot leg when the index serves
+// exactly one source.
+//
+// The password is dropped HERE rather than in the generator. This is the only
+// place it exists, so dropping it at the boundary means no later change inside
+// the views package can start emitting it by accident.
+func resolveLiveIndex(ctx context.Context, dsn string) (*views.LiveIndex, error) {
+	if dsn == "" {
+		return nil, fmt.Errorf("--include-live needs --index-dsn: the live leg reads the index directly, " +
+			"so there is nothing to attach without one")
+	}
+	li, err := liveIndexFromDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := config.Connect(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("connect to the index for the live leg: %w", err)
+	}
+	defer db.Close()
+
+	// Attribution is only possible with ONE source: every source writes into
+	// the same binlog_events and the row itself carries no identity. Best
+	// effort on purpose — an index too old to have the table, or an account
+	// that cannot read it, leaves the hot rows NULL rather than failing a file
+	// whose other half is fine.
+	var n int
+	var id string
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(MIN(bintrail_id), '') FROM bintrail_servers`).Scan(&n, &id); err == nil && n == 1 {
+		li.BintrailID = id
+	}
+	return li, nil
+}
+
+// liveIndexFromDSN is the PURE half of resolveLiveIndex: DSN in, the non-secret
+// connection facts out, no IO.
+//
+// Split out so the one property that matters can be tested without a database.
+// The DSN carries the index password, this is the only place it is in scope,
+// and everything downstream renders into a file meant to be shared. Dropping it
+// here means no change further down can start emitting it.
+func liveIndexFromDSN(dsn string) (*views.LiveIndex, error) {
+	host, port, user, _, err := config.ParseSourceDSN(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse --index-dsn for the live leg: %w", err)
+	}
+	// The DSN's own database, via ParseDSN rather than SELECT DATABASE(): the
+	// generated ATTACH names it, and a reader on another machine has no session
+	// to ask.
+	cfg, err := drivermysql.ParseDSN(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("read the database name from --index-dsn: %w", err)
+	}
+	if cfg.DBName == "" {
+		return nil, fmt.Errorf("--index-dsn names no database, so the live leg has nothing to attach")
+	}
+	return &views.LiveIndex{Host: host, Port: int(port), Database: cfg.DBName, User: user}, nil
 }
