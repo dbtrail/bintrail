@@ -18,8 +18,11 @@ import (
 // dropped in a refactor with CI green. Every surface below emits:
 //
 //   - "cli"     — query.run, recover.generate, recover.cascade,
-//     reconstruct.run, verify.explain. bintrail-pg shares
-//     these command implementations (internal/cli) and so
+//     reconstruct.run, verify.explain, drill.run, and
+//     export.iceberg (every row of a table and every later
+//     change to it, written to an Iceberg table; emitted per
+//     table after its commit is durable). bintrail-pg shares
+//     the internal/cli command implementations and so
 //     reports the same "cli" surface; there is no "pg" surface.
 //   - "mcp"     — query.run, recover.generate, recover.cascade,
 //     reconstruct.row (internal/mcptools; the console's /mcp

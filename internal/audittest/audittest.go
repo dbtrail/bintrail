@@ -69,6 +69,12 @@ const (
 	// PostgreSQL wire front-end drives a real pgx client against a seeded
 	// index, the same real-code-path posture as the other owners.
 	OwnerPGShim Owner = "internal/pgshim (integration)"
+	// OwnerExportCLI: cliapp/export_iceberg_integration_test.go — the Iceberg
+	// export runs the real command against the integration MySQL plus a
+	// baseline Parquet and records after each table's commit is durable. It
+	// lives in cliapp, not internal/cli, because the Iceberg library must
+	// not be linked by anything internal/cli reaches.
+	OwnerExportCLI Owner = "cliapp (integration)"
 )
 
 // Requirement is one emission the core must make, and where it is pinned.
@@ -116,6 +122,11 @@ var Required = []Requirement{
 		Pair:  Pair{Surface: "cli", Action: "drill.run"},
 		Owner: OwnerCLI,
 		Why:   "materializing historical row state into an operator-provided scratch server (a rehearsed restore)",
+	},
+	{
+		Pair:  Pair{Surface: "cli", Action: "export.iceberg"},
+		Owner: OwnerExportCLI,
+		Why:   "writing every row of a table, and every later change to it, into an Iceberg table other engines read",
 	},
 	{
 		Pair:  Pair{Surface: "mcp", Action: "query.run"},
