@@ -134,6 +134,46 @@ func TestRunMainStream_restartsOnWriteDeadline(t *testing.T) {
 	}
 }
 
+// The incident's own shape: a daemon that had been capturing happily for a long
+// time, then hit ONE write deadline. It must restart.
+//
+// This exercises the healthy-reset branch and the breaker clock TOGETHER, which
+// is the combination the other tests here deliberately avoid (they pin
+// monitorHealthyReset above every run, or monitorGiveUpAfter at zero). With the
+// breaker clock seeded from the failed run's START, the run's own 60ms of uptime
+// is charged to it, exceeds the 20ms give-up threshold, and capture stops on
+// failure number one having restarted nothing. Scaled constants, same ordering
+// as 35 hours of uptime against a 6h breaker.
+//
+// Must not t.Parallel(): mutates indexer.WriteTimeout and the policy globals.
+func TestRunMainStream_longHealthyRunThenOneDeadlineStillRestarts(t *testing.T) {
+	shrinkMonitorBackoff(t)
+	monitorHealthyReset = 10 * time.Millisecond // the first run outlives this
+	monitorGiveUpAfter = 20 * time.Millisecond  // ...and outlives this too
+	deadlineErr := realWriteDeadlineError(t)
+
+	prev := mainStreamFn
+	t.Cleanup(func() { mainStreamFn = prev })
+
+	calls := 0
+	mainStreamFn = func(ctx context.Context, cfg streamrun.Config) error {
+		calls++
+		if calls == 1 {
+			time.Sleep(60 * time.Millisecond) // a long, healthy run
+			return deadlineErr
+		}
+		return nil
+	}
+
+	if err := runMainStreamWithWriteDeadlineRetry(context.Background(), streamrun.Config{}); err != nil {
+		t.Fatalf("a healthy daemon's first write deadline ended capture instead of restarting it: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("stream ran %d time(s); want the failed run plus one restart. The breaker charged the "+
+			"daemon's uptime to a crash loop that had not started yet (#1482)", calls)
+	}
+}
+
 // The narrowing is load-bearing, not incidental: an un-indexable event must
 // still abort loudly rather than spin (#652), so anything that is not a write
 // deadline has to return on the first failure, untouched.

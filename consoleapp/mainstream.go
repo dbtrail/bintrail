@@ -51,8 +51,7 @@ var mainStreamFn = streamrun.One
 // index that is genuinely gone fails One() at connect with a different error, so
 // this loop cannot sit on a dead link.
 func runMainStreamWithWriteDeadlineRetry(ctx context.Context, cfg streamrun.Config) error {
-	attempt := 0
-	var crashLoopSince time.Time // first failure of the current loop; zero = healthy
+	var policy crashLoopPolicy
 	for {
 		started := time.Now()
 		err := mainStreamFn(ctx, cfg)
@@ -61,25 +60,17 @@ func runMainStreamWithWriteDeadlineRetry(ctx context.Context, cfg streamrun.Conf
 		if err == nil || ctx.Err() != nil || !errors.Is(err, indexer.ErrWriteDeadline) {
 			return err
 		}
-		if time.Since(started) > monitorHealthyReset {
-			attempt = 0
-			crashLoopSince = time.Time{}
-		}
-		if crashLoopSince.IsZero() {
-			crashLoopSince = started
-		}
 		// Circuit breaker. The give-up path is the OLD behaviour, unchanged and
 		// undiluted: the same error, with the same three remedies, ends the
 		// daemon. Retrying only moves when that happens, never whether.
-		if looping := time.Since(crashLoopSince); looping > monitorGiveUpAfter {
+		delay, looping, giveUp := policy.failed(started, time.Now())
+		if giveUp {
 			slog.Error("main source stream kept exhausting the index write deadline; giving up and stopping capture",
-				"looping_for", looping.Round(time.Minute), "attempts", attempt+1, "error", err)
+				"looping_for", looping.Round(time.Minute), "error", err)
 			return err
 		}
-		delay := min(monitorBackoffBase<<attempt, monitorBackoffCap)
-		attempt++
 		slog.Warn("main source stream hit the index write deadline; restarting capture from its last checkpoint",
-			"attempt", attempt, "delay", delay, "error", err)
+			"delay", delay, "error", err)
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():

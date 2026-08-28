@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"crypto/tls"
 	"database/sql"
 	"errors"
@@ -159,19 +160,46 @@ const defaultTimeout = 10 * time.Second
 // A 10-second TCP connect timeout is applied when the DSN does not specify one.
 // The caller is responsible for closing the returned *sql.DB.
 func Connect(dsn string) (*sql.DB, error) {
-	normalized, err := buildDSN(dsn)
+	cfg, err := normalizeDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("mysql", normalized)
+	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open MySQL connection: %w", err)
 	}
-	if err := db.Ping(); err != nil {
+	if err := pingBounded(db, cfg.Timeout); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping MySQL: %w", err)
 	}
 	return db, nil
+}
+
+// pingBounded verifies a freshly opened connection within the DSN's own connect
+// budget (cfg.Timeout, defaultTimeout when the DSN sets none).
+//
+// A bare db.Ping() is UNBOUNDED, and cfg.Timeout is the DIAL timeout only —
+// normalizeDSN sets no ReadTimeout or WriteTimeout anywhere. So against a peer
+// that completes the TCP handshake and then never speaks MySQL (a frozen VM, an
+// idle-dropped NLB) the dial succeeds and the driver then blocks in
+// readHandshakePacket forever. That made opening a connection the one step of a
+// stream restart that could never return, so a supervisor could neither count
+// the attempt nor give up: the daemon stayed alive with capture dead and
+// /api/healthz green (#1482). The driver installs its context watcher BEFORE the
+// handshake read (connector.Connect), so a deadline here really does cut it.
+//
+// Scoped to the connect phase deliberately. It never becomes a read deadline on
+// a pooled connection, so a legitimately long query — a partition scan, a schema
+// migration — is untouched, which is why this is not a DSN-level ReadTimeout.
+// Operators who need a longer handshake budget already have the knob: timeout=
+// in the DSN.
+func pingBounded(db *sql.DB, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return db.PingContext(ctx)
 }
 
 // driverDefaultMaxAllowedPacket is the client-side max_allowed_packet the
@@ -265,7 +293,7 @@ func ConnectWithTLS(dsn string, tlsCfg *tls.Config) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to create MySQL connector: %w", err)
 	}
 	db := sql.OpenDB(connector)
-	if err := db.Ping(); err != nil {
+	if err := pingBounded(db, cfg.Timeout); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping MySQL: %w", err)
 	}
