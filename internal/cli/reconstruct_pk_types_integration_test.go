@@ -753,8 +753,17 @@ func TestRunReconstruct_rejectsRemainingUnsupportedPKTypes(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.dataType) {
 				t.Errorf("expected error to mention %q, got: %v", tc.dataType, err)
 			}
-			if !strings.Contains(err.Error(), "not in the supported") {
-				t.Errorf("expected error to mention unsupported set, got: %v", err)
+			// #1461: the full-table refusal now renders the SHARED
+			// reconstruct.PKTypeGateReason sentence, so this asserts the
+			// wording every other surface uses rather than a phrasing private
+			// to this path. Anchored on the live sentence, not the retired
+			// "not in the supported PK type set", which exists nowhere now and
+			// would make this check pass for an unrelated reason.
+			if !strings.Contains(err.Error(), "unsupported by the baseline canonicalizer") {
+				t.Errorf("expected the shared PK-type gate reason, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "full-table reconstruct: ") {
+				t.Errorf("expected the full-table frame around it, got: %v", err)
 			}
 
 			// No output files should be written — the reconstruct bailed

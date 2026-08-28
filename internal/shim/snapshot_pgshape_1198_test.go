@@ -11,6 +11,7 @@ import (
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 // TestRunSnapshotFullTable_pgShapedSnapshotGetsWrongPathVerdict drives a
@@ -47,7 +48,11 @@ func TestRunSnapshotFullTable_pgShapedSnapshotGetsWrongPathVerdict(t *testing.T)
 	if myErr.Code != gomysql.ER_NO_PARTITION_FOR_GIVEN_VALUE {
 		t.Errorf("wire code = %d, want %d (ER_NO_PARTITION_FOR_GIVEN_VALUE)", myErr.Code, gomysql.ER_NO_PARTITION_FOR_GIVEN_VALUE)
 	}
-	if strings.Contains(myErr.Message, "cannot canonicalize") {
+	// Anchored on the sentence a PG-shaped column must NOT get. It used to be
+	// anchored on the typed branch's old private wording, which #1461 deleted
+	// from the tree: an assertion against a string that exists nowhere passes
+	// for an unrelated reason and guards nothing.
+	if strings.Contains(myErr.Message, "unsupported by the baseline canonicalizer") {
 		t.Errorf("empty DATA_TYPE must not get the misleading PK-type blame: %q", myErr.Message)
 	}
 	for _, want := range []string{"PG snapshot shape", "not yet supported for PostgreSQL sources (#597)", "app.orders", "_flashback"} {
@@ -60,7 +65,10 @@ func TestRunSnapshotFullTable_pgShapedSnapshotGetsWrongPathVerdict(t *testing.T)
 // TestRunSnapshotFullTable_realUnsupportedTypeKeepsCanonicalizeMessage pins the
 // other half of the discrimination: a REAL MySQL type the canonicalizer does
 // not handle keeps the accurate per-type refusal — #1198 must not blur it into
-// the PostgreSQL verdict.
+// the PostgreSQL verdict. Since #1461 that refusal is the SHARED
+// reconstruct.PKTypeGateReason sentence rather than a third private phrasing
+// of the same limit; the _flashback steer this wire surface owns stays in the
+// frame around it.
 func TestRunSnapshotFullTable_realUnsupportedTypeKeepsCanonicalizeMessage(t *testing.T) {
 	h := &Handler{
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -84,8 +92,17 @@ func TestRunSnapshotFullTable_realUnsupportedTypeKeepsCanonicalizeMessage(t *tes
 	if !errors.As(err, &myErr) {
 		t.Fatalf("error = %T %v, want *mysql.MyError", err, err)
 	}
-	if !strings.Contains(myErr.Message, "which the baseline merge cannot canonicalize") {
-		t.Errorf("a real unsupported MySQL type must keep the canonicalize message, got: %q", myErr.Message)
+	want := reconstruct.PKTypeGateReason(
+		metadata.ColumnMeta{Name: "k", IsPK: true, DataType: "float"}, "full-table _snapshot", "materialize")
+	if !strings.Contains(myErr.Message, want) {
+		t.Errorf("a real unsupported MySQL type must render the shared gate reason %q, got: %q", want, myErr.Message)
+	}
+	// The frame is this surface's own and must survive the unification: the
+	// operator needs the table named and the _flashback fallback offered.
+	for _, w := range []string{"app.readings", "_snapshot cannot return a complete table", "_flashback"} {
+		if !strings.Contains(myErr.Message, w) {
+			t.Errorf("refusal lacks %q: %q", w, myErr.Message)
+		}
 	}
 	if strings.Contains(myErr.Message, "PostgreSQL") {
 		t.Errorf("a real MySQL type must not get the PostgreSQL verdict: %q", myErr.Message)

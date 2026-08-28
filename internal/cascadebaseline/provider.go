@@ -108,6 +108,33 @@ func (p *Provider) BaselineChildren(ctx context.Context, schema, table, fkCol, p
 			"baseline scan of %s.%s: %s",
 			schema, table, reconstruct.GeneratedPKGateReason(c, "the cascade baseline fallback")))
 	}
+	// A PK type the baseline canonicalizer cannot handle (FLOAT/DOUBLE, BIT,
+	// JSON, the spatial family) is the OTHER permanent refusal, and #1460 is
+	// what happened without this gate: CanonicalizePKMap below refused each
+	// row with a plain error, which the cascade engine files under its
+	// transient `baselinefail:` bucket as "baseline lookup failed ...
+	// (recovery may be partial)". That reads as worth retrying when it never
+	// will succeed, and the engine re-ran this whole lookup — FindBaseline,
+	// the Parquet metadata read, ReadBaselineRows — once per parent key on
+	// the edge, all to fail identically.
+	//
+	// Classified as reconstruct.ErrUnsupportedPKType so the engine files it as
+	// permanent and memoizes the child table. Unlike the generated-PK refusal
+	// above, this one does NOT make the edge's binlog candidates unsafe, so
+	// the engine keeps running Phase-1 for it; see cascade.BaselineProvider's
+	// contract for that asymmetry.
+	//
+	// FirstUnsupportedPKType skips an EMPTY DataType on purpose (the
+	// PostgreSQL snapshot signature, #533). Nothing on the cascade path reads
+	// the recorded source flavor, so the wrong-path verdict PKTypeGateReason
+	// renders for an empty type would name a cause this code cannot know. A
+	// PG-shaped snapshot therefore keeps reaching the per-row canonicalizer
+	// and its transient caveat, exactly as before.
+	if c, found := reconstruct.FirstUnsupportedPKType(tm.PKColumnMetas()); found {
+		return cascade.BaselineLookup{}, false, reconstruct.PKTypeRefusalError(
+			fmt.Sprintf("baseline scan of %s.%s", schema, table),
+			reconstruct.PKTypeGateReason(c, "the cascade baseline fallback", "read"))
+	}
 	// The FK filter binds parentPK as a STRING against the baseline column.
 	// DuckDB coerces it exactly for integer/string FK columns, but for
 	// DATETIME/DECIMAL/DATE the string form may not match the stored value and

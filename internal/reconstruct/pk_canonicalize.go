@@ -468,6 +468,35 @@ func canonicalizePKMap(row map[string]any, pkCols []metadata.ColumnMeta) (map[st
 // their binlog-only path when it isn't supported.
 func SupportedPKType(dataType string) bool { return supportedPKType(dataType) }
 
+// FirstUnsupportedPKType returns the first primary-key member whose DATA_TYPE
+// the baseline canonicalizer cannot handle, and whether one exists. Input
+// order is the caller's (PKColumnMetas() preserves ordinal order), same
+// contract as GeneratedPKColumn.
+//
+// An EMPTY DataType is NOT a verdict here and is skipped. It is the
+// PostgreSQL snapshot signature — metadata.WritePGSnapshot leaves data_type
+// and column_type empty (#533) — and flagging it would tell every PostgreSQL
+// operator their schema is unsupported when nothing about the column is
+// wrong.
+//
+// Only for callers with NO upstream source-flavor check: skipping the empty
+// case means they never claim a cause they cannot know. A caller that HAS
+// established it is on the MySQL path (ReconstructTable, verify, the shim)
+// must keep its own loop over SupportedPKType, so an empty DataType still
+// reaches PKTypeGateReason's wrong-path verdict there. Do not point those
+// loops at this helper: it would silently retire that verdict.
+func FirstUnsupportedPKType(pkCols []metadata.ColumnMeta) (metadata.ColumnMeta, bool) {
+	for _, c := range pkCols {
+		if strings.TrimSpace(c.DataType) == "" {
+			continue
+		}
+		if !supportedPKType(c.DataType) {
+			return c, true
+		}
+	}
+	return metadata.ColumnMeta{}, false
+}
+
 // CanonicalizePKMap is the exported form of canonicalizePKMap, for callers
 // outside this package (cascade Phase-2) that must encode a baseline Parquet
 // row's primary key to match binlog_events.pk_values for deduplication.

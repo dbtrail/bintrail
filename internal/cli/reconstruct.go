@@ -39,21 +39,20 @@ func pkChangeSuspected(events []query.ResultRow) bool {
 
 // unsupportedPKType returns the first primary-key column whose type the
 // baseline canonicalizer cannot handle, or nil when every column is supported.
+// It is the pointer-shaped adapter over reconstruct.FirstUnsupportedPKType,
+// which the cascade Phase-2 provider shares (#1460) so the two cannot drift on
+// which columns count as a verdict.
 //
 // An EMPTY DataType is not a verdict. It is the PostgreSQL snapshot signature —
 // metadata.WritePGSnapshot leaves both data_type and column_type empty (#533),
 // and single-row reconstruct deliberately runs generically for a PG source
 // (whose raw-text baseline makes every PK a string-identity match, so it never
 // needs the MySQL canonicalizer). Treating it as unsupported would tell every
-// PostgreSQL operator their schema is unsupported when it works.
+// PostgreSQL operator their schema is unsupported when it works. That skip
+// lives in the shared helper; see its doc for the callers that must NOT use it.
 func unsupportedPKType(pkMetas []metadata.ColumnMeta) *metadata.ColumnMeta {
-	for i, c := range pkMetas {
-		if strings.TrimSpace(c.DataType) == "" {
-			continue
-		}
-		if !reconstruct.SupportedPKType(c.DataType) {
-			return &pkMetas[i]
-		}
+	if c, ok := reconstruct.FirstUnsupportedPKType(pkMetas); ok {
+		return &c
 	}
 	return nil
 }

@@ -892,9 +892,17 @@ func ReconstructTable(
 	// cannot handle. Emitting a warning isn't enough because operators
 	// running with --log-level error won't see it and would silently get
 	// wrong output — the same class of bug the full-table reconstruct
-	// hardening exists to prevent. Users with DECIMAL / BINARY / BLOB /
-	// BIT / JSON / GEOMETRY / etc. PKs must track the follow-up work for
-	// their type to be added.
+	// hardening exists to prevent. What is actually left out today is
+	// FLOAT/DOUBLE, BIT, JSON and the spatial family; supportedPKType is the
+	// authority, and this comment used to also name DECIMAL and the
+	// BINARY/VARBINARY/BLOB family, which have been supported since #214 and
+	// #1155 respectively.
+	//
+	// This loop deliberately does NOT skip an empty DataType, so a PG-shaped
+	// snapshot that reached the MySQL path still gets PKTypeGateReason's
+	// wrong-path verdict. Do not swap it for reconstruct.FirstUnsupportedPKType,
+	// whose empty-skip is for callers with no upstream flavor check: it would
+	// retire that verdict silently.
 	for _, pkCol := range pkCols {
 		if !supportedPKType(pkCol.DataType) {
 			return nil, fullTablePKTypeRefusal(schema, table, pkCol)
