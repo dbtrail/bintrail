@@ -482,23 +482,53 @@ func SynthesizeVictims(
 	// entry here suppresses only the baseline lookup, while genPKGated
 	// suppresses the whole edge. Merging them would silently stop scanning
 	// binlog candidates that are perfectly safe to scan.
+	//
+	// One pre-#1460 behaviour is deliberately NOT preserved. Before the
+	// provider gate, a parent whose baseline scan happened to match ZERO rows
+	// took the `covered` arm (the per-row canonicalizer never ran, so nothing
+	// refused) and widened `since` to the snapshot time, while a parent that
+	// matched at least one row got the narrow window. Same table, same run,
+	// two different effective lookbacks decided by whether that parent had
+	// children in the baseline. Refusing the table up front makes the window
+	// uniformly the lookback one. That is narrower than the accident in the
+	// zero-match case, and the caveat above says so rather than papering over
+	// it; restoring the widening would mean silently changing the operator's
+	// --lookback for one table, on a path where no baseline row can be used
+	// anyway.
 	pkTypeGated := map[string]bool{}
 	// addPKTypeCaveat is the ONE caveat frame for the PK-type refusal, so the
 	// wording cannot drift if a second file path ever reaches it; detail
 	// carries reconstruct.PKTypeGateReason, the same sentence verify and both
 	// reconstruct surfaces render for this limit.
 	//
-	// There is no hoisted PKMetas gate for this case, unlike #1273: there is
-	// nothing to hoist. The hoists exist to skip the key-chain probe on an
-	// edge that will be abandoned, and a PK-type-refused edge is not
-	// abandoned — its Phase-1 scan, and the probe that keeps that scan's zero
-	// honest, both still run.
+	// The boundary it names is the LOOKBACK WINDOW, deliberately, and it must
+	// stay that way. `since` is widened to the baseline snapshot only in the
+	// `covered` arm below, so a refused edge scans [rootTS-Lookback, rootTS]
+	// and nothing else. On a baseline older than the lookback, "untouched
+	// since the snapshot" would be a strictly smaller set than what is
+	// actually missed, and the caveat would tell an operator a child touched
+	// 45 days ago against a 60-day-old baseline was recovered. The sibling
+	// `nobaseline:` caveat states the same boundary in the same words; keep
+	// them identical.
+	//
+	// Nor does it name a deleted parent: scanChildren serves the ON UPDATE
+	// root path as well as the ON DELETE one.
+	//
+	// No hoisted PKMetas gate, unlike #1273 — and not because a hoist is
+	// impossible (Options.PKMetas hands over exactly what
+	// FirstUnsupportedPKType takes), but because it would answer the wrong
+	// question. The provider refuses AFTER establishing that a baseline
+	// covers the table; a table with none returns ok=false first and earns
+	// the accurate `nobaseline:` caveat. A hoisted type gate cannot see that
+	// difference and would tell an operator their baseline could not be used
+	// for a table that has no baseline at all. The memo below already bounds
+	// the waste to one lookup per child table, which is what #1460 asked for.
 	addPKTypeCaveat := func(fk CascadeFK, detail string) {
 		addIncomplete("pktype:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-			"%s.%s cannot be augmented from its baseline: %s. This is a permanent property of the "+
-				"table, not a transient failure, so retrying will not change it. Children of a deleted "+
-				"parent that WERE touched within the lookback window are still recovered from the binlog; "+
-				"children untouched since the baseline snapshot are not, so the recovery may be partial",
+			"%s.%s cannot be augmented from its baseline: %s. This is a PERMANENT property of the "+
+				"table, not a transient failure, so retrying will not change it. Its cascade-affected "+
+				"children are still recovered from the binlog, but children untouched within the "+
+				"lookback window are not reconstructed, so the recovery may be partial",
 			fk.Schema, fk.Table, detail))
 	}
 	// genPKGated memoizes the probe verdict per child table — a static fact of
@@ -669,10 +699,13 @@ func SynthesizeVictims(
 					pkTypeGated[fk.Schema+"."+fk.Table] = true
 					// The provider's own message frames the reason with the
 					// table name, which the caveat names again; take the
-					// UNFRAMED reason so the two frames do not nest. A
-					// refusal carrying the sentinel without the reason (a
-					// caller that wrapped it by hand) falls back to the full
-					// error rather than an empty clause.
+					// UNFRAMED reason so the two frames do not nest.
+					// PKTypeRefusalReason unwraps with errors.As, so a %w
+					// wrap still yields the inner reason; the fallback is for
+					// the two shapes that carry no reason at all — an error
+					// wrapping the bare sentinel, or one built with an empty
+					// reason. Both then render their full text rather than
+					// leaving the caveat with an empty clause.
 					detail := reconstruct.PKTypeRefusalReason(berr)
 					if detail == "" {
 						detail = berr.Error()

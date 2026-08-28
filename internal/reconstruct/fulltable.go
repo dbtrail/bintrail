@@ -893,7 +893,7 @@ func ReconstructTable(
 	// running with --log-level error won't see it and would silently get
 	// wrong output — the same class of bug the full-table reconstruct
 	// hardening exists to prevent. What is actually left out today is
-	// FLOAT/DOUBLE, BIT, JSON and the spatial family; supportedPKType is the
+	// FLOAT/DOUBLE, TIME, BIT, JSON and the spatial family; supportedPKType is the
 	// authority, and this comment used to also name DECIMAL and the
 	// BINARY/VARBINARY/BLOB family, which have been supported since #214 and
 	// #1155 respectively.

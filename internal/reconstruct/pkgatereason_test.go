@@ -1,6 +1,7 @@
 package reconstruct
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -79,5 +80,20 @@ func TestFullTablePKTypeRefusal_discriminatesPGShape(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "PostgreSQL") {
 		t.Errorf("a real MySQL type must not get the PostgreSQL verdict: %v", err)
+	}
+	// ErrUnsupportedPKType's own doc says EVERY error-typed refusal of this
+	// shape carries the sentinel, and its sibling fullTableGeneratedPKRefusal
+	// routes through GeneratedPKRefusalError for exactly that reason. A bare
+	// fmt.Errorf here leaves the invariant written down and unenforced, and
+	// cliapp/baseline_refresh.go classifies failures by sentinel with an
+	// unrecognized error falling into a generic "refused" bucket.
+	if !errors.Is(err, ErrUnsupportedPKType) {
+		t.Errorf("the full-table refusal must carry ErrUnsupportedPKType: %v", err)
+	}
+	// The PG-shaped branch carries it too: it is the same gate refusing the
+	// same column, and a caller keying on the sentinel must not have to also
+	// know which branch of the reason rendered.
+	if !errors.Is(fullTablePKTypeRefusal("app", "orders", pg), ErrUnsupportedPKType) {
+		t.Errorf("the PG-shaped full-table refusal must carry ErrUnsupportedPKType too")
 	}
 }

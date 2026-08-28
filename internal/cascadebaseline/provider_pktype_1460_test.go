@@ -1,8 +1,10 @@
 package cascadebaseline
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -96,6 +98,30 @@ func TestProvider_emptyPKDataTypeIsNotAPKTypeVerdict(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "PostgreSQL") {
 		t.Fatalf("this path has no source-flavor check, so it must not claim a PostgreSQL cause: %v", err)
+	}
+}
+
+// TestProvider_unsupportedPKTypeRefusesBeforeAnyBaselineIO pins that the gate
+// sits above the position-anchor metadata read as well as the row read. That
+// read is best-effort and only warns on failure, so a refused table used to
+// emit "cascade: could not read baseline metadata for position-anchored
+// victim fetch" naming a problem the operator would then chase, seconds
+// before being told the table is refused for an unrelated and permanent
+// reason. Nothing is lost by ordering it this way: the anchor is only ever
+// used by a lookup that is about to be refused.
+func TestProvider_unsupportedPKTypeRefusesBeforeAnyBaselineIO(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	_, _, err := New(nonexistentBaseline, resolverWithChildPK("float")).
+		BaselineChildren(context.Background(), "shop", "child", "pid", "1", time.Now(), 100)
+	if !errors.Is(err, reconstruct.ErrUnsupportedPKType) {
+		t.Fatalf("want the PK-type refusal, got: %v", err)
+	}
+	if strings.Contains(buf.String(), "could not read baseline metadata") {
+		t.Errorf("a refused table must not first warn about the baseline metadata read: %s", buf.String())
 	}
 }
 

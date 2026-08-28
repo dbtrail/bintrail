@@ -41,7 +41,9 @@ func GeneratedPKRefusalError(msg string) error { return &generatedPKErr{msg: msg
 
 // ErrUnsupportedPKType is the errors.Is sentinel for refusals caused by a
 // primary-key column whose DATA_TYPE the baseline canonicalizer does not
-// handle (FLOAT/DOUBLE, BIT, JSON, the spatial family). Like ErrGeneratedPK
+// handle (FLOAT/DOUBLE, TIME, BIT, JSON, the spatial family; supportedPKType
+// is the authority, and DECIMAL and the BINARY/VARBINARY/BLOB family are NOT
+// in this set - they have been supported since #214 and #1155). Like ErrGeneratedPK
 // above it marks a PERMANENT property of the table, so machine callers can
 // tell it apart from a transient lookup failure without string matching.
 //
@@ -199,11 +201,17 @@ func fullTableGeneratedPKRefusal(schema, table string, pkCol metadata.ColumnMeta
 // type %q which is not in the supported PK type set; file a follow-up issue
 // if you need this type"), so one limitation reached operators in two
 // different phrasings depending on which command they ran, with nothing to
-// tell them it was the same refusal. The follow-up-issue nudge went with it:
-// the canonicalizer's own per-row backstop still carries that advice, and
-// buying it back here would cost the shared sentence that makes the surfaces
-// recognizable as one.
+// tell them it was the same refusal. The follow-up-issue nudge went with it,
+// and it is genuinely gone rather than inherited: canonicalizePKValue's
+// default branch still spells it out, but every path to that branch now sits
+// behind a SupportedPKType gate, so no operator with an unsupported MySQL
+// type reaches it. Buying it back would cost the shared sentence that makes
+// the surfaces recognizable as one refusal, which is what #1461 asked for.
+//
+// Carries ErrUnsupportedPKType, like every other error-typed refusal of this
+// shape. Both branches do: a caller keying on the sentinel must not have to
+// also know which branch of the reason rendered.
 func fullTablePKTypeRefusal(schema, table string, pkCol metadata.ColumnMeta) error {
-	return fmt.Errorf("full-table reconstruct: %s.%s: %s", schema, table,
+	return PKTypeRefusalError(fmt.Sprintf("full-table reconstruct: %s.%s", schema, table),
 		PKTypeGateReason(pkCol, "full-table reconstruct", "reconstruct"))
 }

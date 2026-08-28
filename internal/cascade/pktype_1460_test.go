@@ -2,6 +2,7 @@ package cascade_test
 
 import (
 	"context"
+	"database/sql/driver"
 	"strconv"
 	"strings"
 	"testing"
@@ -102,7 +103,7 @@ func TestSynthesizeVictims_pkTypeRefusalIsPermanentAndAsksOnce(t *testing.T) {
 
 	var permanent, transient bool
 	for _, msg := range res.Incomplete {
-		if strings.Contains(msg, "app.child") && strings.Contains(msg, "permanent") &&
+		if strings.Contains(msg, "app.child") && strings.Contains(msg, "PERMANENT") &&
 			strings.Contains(msg, "unsupported by the baseline canonicalizer") {
 			permanent = true
 		}
@@ -115,6 +116,32 @@ func TestSynthesizeVictims_pkTypeRefusalIsPermanentAndAsksOnce(t *testing.T) {
 	}
 	if transient {
 		t.Errorf("a PK-type refusal must not land in the transient baselinefail bucket: %v", res.Incomplete)
+	}
+	// The caveat must name the boundary the code actually enforces. With
+	// Phase-2 refused, `since` is never widened to the snapshot time (that
+	// assignment lives only in the `covered` arm), so what is NOT recovered is
+	// everything untouched within the LOOKBACK WINDOW, which on an older
+	// baseline is a strictly larger set than "untouched since the snapshot".
+	// Naming the snapshot would tell an operator a child touched 45 days ago
+	// against a 60-day-old baseline was recovered, when it was not. The
+	// sibling `nobaseline:` caveat states the same boundary in the same words;
+	// these two must not drift.
+	for _, msg := range res.Incomplete {
+		if !strings.HasPrefix(msg, "app.child cannot be augmented") {
+			continue
+		}
+		if !strings.Contains(msg, "untouched within the lookback window") {
+			t.Errorf("the caveat must name the lookback window as the boundary, got: %q", msg)
+		}
+		if strings.Contains(msg, "since the baseline snapshot") {
+			t.Errorf("the caveat must not claim the snapshot bounds what is recovered; the window is never widened on this path: %q", msg)
+		}
+		// scanChildren serves BOTH root kinds (the ON UPDATE path at the
+		// key-reversal site and the ON DELETE path), so the caveat cannot
+		// assume a deleted parent.
+		if strings.Contains(msg, "deleted parent") {
+			t.Errorf("the caveat is emitted for ON UPDATE roots too and must not assume a deleted parent: %q", msg)
+		}
 	}
 	// A PK-type refusal is not "no baseline covers this table" — the baseline
 	// may well cover it; it is the join key that cannot be built. This is the
@@ -170,5 +197,81 @@ func TestSynthesizeVictims_pkTypeRefusalStillRunsPhase1(t *testing.T) {
 	}
 	if !phase1 {
 		t.Errorf("Phase-1 must still run on the pass that refused Phase-2 (only the baseline join is blocked), got: %v", res.Incomplete)
+	}
+}
+
+// captureTimes is an sqlmock Argument that records every value bound at its
+// position and always matches, so the test can read the `since`/`until`
+// bounds the engine actually sent instead of inferring them.
+type captureTimes struct{ got *[]time.Time }
+
+func (c captureTimes) Match(v driver.Value) bool {
+	if t, ok := v.(time.Time); ok {
+		*c.got = append(*c.got, t)
+	}
+	return true
+}
+
+// TestSynthesizeVictims_pkTypeRefusalLeavesTheLookbackWindowNarrow pins the
+// claim the caveat makes. A refused edge never widens its Phase-1 window to
+// the baseline snapshot, because `since = bl.SnapshotTime` lives only in the
+// `covered` arm, and the memo skip on the second parent must not resurrect a
+// widened bound from a stale lookup either. Both passes must scan
+// [rootTS-Lookback, rootTS].
+//
+// Without this, nothing in the suite connects the caveat's wording to the
+// window the engine uses, and the two could drift into the caveat overstating
+// what was recovered. Lookback is set to a value no default equals so the
+// assertion cannot pass by coincidence.
+func TestSynthesizeVictims_pkTypeRefusalLeavesTheLookbackWindowNarrow(t *testing.T) {
+	const lookback = 73 * time.Hour
+
+	var sinceArgs []time.Time
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	mock.MatchExpectationsInOrder(false)
+	// Two candidate fetches (one per parent) plus the skew probe each leaves
+	// behind; extras are harmless because ExpectationsWereMet is not asserted.
+	for i := 0; i < 8; i++ {
+		mock.ExpectQuery(".*").WithArgs(
+			sqlmock.AnyArg(), sqlmock.AnyArg(),
+			captureTimes{got: &sinceArgs}, captureTimes{got: &sinceArgs},
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+		).WillReturnRows(sqlmock.NewRows([]string{"event_id"}))
+	}
+
+	fks, parents := twoParentDeletes()
+	rootTS := parents[0].EventTimestamp
+	prov := &pkTypeProvider{}
+	if _, serr := cascade.SynthesizeVictims(context.Background(), query.New(db), fks, parents, cascade.Options{
+		Baseline: prov,
+		Lookback: lookback,
+	}); serr != nil {
+		t.Fatalf("SynthesizeVictims: %v", serr)
+	}
+	if prov.calls != 1 {
+		t.Fatalf("provider call count = %d, want 1 (fixture sanity)", prov.calls)
+	}
+	if len(sinceArgs) < 2 {
+		t.Fatalf("expected at least one candidate fetch per parent, captured %d time bounds", len(sinceArgs))
+	}
+	want := rootTS.Add(-lookback)
+	checked := 0
+	for i, got := range sinceArgs {
+		if got.Equal(rootTS) || got.After(rootTS) {
+			continue // the `until` bound of the same query
+		}
+		checked++
+		if !got.Equal(want) {
+			t.Errorf("time bound %d = %v, want the lookback floor %v; a refused edge must never scan from the baseline snapshot", i, got, want)
+		}
+	}
+	// Without this the loop above is vacuous whenever the capture misses the
+	// lower bound: zero iterations assert nothing and the test still passes.
+	if checked < 2 {
+		t.Fatalf("expected a lower bound captured per parent, checked %d of %d captured bounds", checked, len(sinceArgs))
 	}
 }
