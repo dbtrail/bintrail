@@ -530,6 +530,14 @@ server: it re-reads the source's column layout and restarts that server's
 capture onto it (a schema snapshot is not a baseline — it records columns, not
 data), reporting whether the stream actually reloaded.
 
+An internal error inside that job is contained: the run is reported as failed
+with the error, its stack goes to the daemon log, capture keeps running for
+every other server, and the button works again rather than answering "already
+running" forever. One case is contained but not undone, and the reported
+failure says so: the same job restarts that server's capture, so an internal
+error during the restart can leave that one server's capture stopped. Check it
+on the Overview and press Start if it is not running.
+
 ### Sections in detail
 
 **Indexed Files** — shows every row in `index_state`. The `BINTRAIL_ID` column identifies which dbtrail server instance indexed each file:
