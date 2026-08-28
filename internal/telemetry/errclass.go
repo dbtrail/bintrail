@@ -92,8 +92,9 @@ const (
 )
 
 // classifyMySQLNumber maps a server error number to a class, shared by the
-// two client libraries that can surface one. Returns "" for numbers with no
-// bucket so the caller can record that the server DID answer.
+// two client libraries that can surface one. A number with no bucket is
+// ClassUnknown, never a connectivity class: the server ANSWERED, so the
+// failure is specific and simply not one we have a bucket for.
 func classifyMySQLNumber(number uint16) string {
 	switch number {
 	case erAccessDenied, erDBAccessDenied, erHostNotPrivileged, erTableAccessDenied, erColumnAccessDenied, erSpecificAccess:
@@ -103,7 +104,7 @@ func classifyMySQLNumber(number uint16) string {
 	case erMasterFatalReadingBinlog:
 		return ClassBinlogNotFound
 	}
-	return ""
+	return ClassUnknown
 }
 
 // ClassifyError maps an error to a bounded class using structural checks
@@ -130,19 +131,11 @@ func ClassifyError(err error) string {
 	// arrives through the latter, which reaches here as a MySQLNumbered.
 	var drvErr *mysql.MySQLError
 	if errors.As(err, &drvErr) {
-		if class := classifyMySQLNumber(drvErr.Number); class != "" {
-			return class
-		}
-		// The server answered, so this is not a connectivity problem, but the
-		// specific failure is not one we have a bucket for.
-		return ClassUnknown
+		return classifyMySQLNumber(drvErr.Number)
 	}
 	var numbered MySQLNumbered
 	if errors.As(err, &numbered) {
-		if class := classifyMySQLNumber(numbered.MySQLErrorNumber()); class != "" {
-			return class
-		}
-		return ClassUnknown
+		return classifyMySQLNumber(numbered.MySQLErrorNumber())
 	}
 
 	// A driver-level failure (bad host, refused, TLS) surfaces as a net error

@@ -87,21 +87,20 @@ func TestDocumentedErrorClassesMatchTheTaxonomy(t *testing.T) {
 	// And the other direction: a class the document lists must exist, or the
 	// list promises coverage no code path provides (#1503 removed three such
 	// classes by hand; this keeps the next one out).
-	marker := "`error_class` is one of exactly these, and nothing else:"
-	i := strings.Index(body, marker)
-	if i < 0 {
+	const marker = "`error_class` is one of exactly these, and nothing else:"
+	_, afterMarker, ok := strings.Cut(body, marker)
+	if !ok {
 		t.Fatal("TELEMETRY.md no longer carries the error_class list marker")
 	}
-	block := body[i+len(marker):]
-	open := strings.Index(block, "```")
-	if open < 0 {
+	_, afterFence, ok := strings.Cut(afterMarker, "```")
+	if !ok {
 		t.Fatal("TELEMETRY.md error_class list is not a fenced block")
 	}
-	closeIdx := strings.Index(block[open+3:], "```")
-	if closeIdx < 0 {
+	listed, _, ok := strings.Cut(afterFence, "```")
+	if !ok {
 		t.Fatal("TELEMETRY.md error_class fenced block is not closed")
 	}
-	for _, token := range strings.Fields(block[open+3 : open+3+closeIdx]) {
+	for _, token := range strings.Fields(listed) {
 		if !classes[token] {
 			t.Errorf("TELEMETRY.md lists error class %q, which nothing emits", token)
 		}

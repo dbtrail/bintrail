@@ -83,6 +83,18 @@ func queryErrorRemediation(query string) string {
 		"  - Server overloaded — raise the per-check timeout or check server load"
 }
 
+// schemaGrantsRemediation is the "bintrail sees no tables at all" advice,
+// shared by the two outcomes checkSchemaVisibility reaches with it: a schema
+// that is verifiably invisible, and one where the probe that would have told
+// "empty" from "invisible" failed — still the likeliest cause, just not a
+// verified one.
+const schemaGrantsRemediation = "Bintrail needs at least SELECT on information_schema to read column metadata.\n" +
+	"Grant minimum read access:\n\n" +
+	"  GRANT SELECT ON *.* TO <bintrail-user>;\n\n" +
+	"Or scope to the schemas you want indexed:\n\n" +
+	"  GRANT SELECT ON <schema>.* TO <bintrail-user>;\n\n" +
+	"Also double-check the schema names for typos."
+
 // isUnknownDatabaseErr reports whether err (possibly wrapped) is MySQL error
 // 1049 (ER_BAD_DB, "Unknown database ..."): the DSN names a database that
 // doesn't exist yet. `bintrail init` (and therefore `up`) creates the index
@@ -857,12 +869,6 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) Ch
 					"Then start monitoring again.",
 			}
 		}
-		grantsRemediation := "Bintrail needs at least SELECT on information_schema to read column metadata.\n" +
-			"Grant minimum read access:\n\n" +
-			"  GRANT SELECT ON *.* TO <bintrail-user>;\n\n" +
-			"Or scope to the schemas you want indexed:\n\n" +
-			"  GRANT SELECT ON <schema>.* TO <bintrail-user>;\n\n" +
-			"Also double-check the schema names for typos."
 		if probeErr != nil {
 			// The probe that tells "empty" from "invisible" failed, so this
 			// is NOT a verified grants problem: keep the visibility name (it
@@ -873,14 +879,14 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) Ch
 				Name:        "Schema visibility",
 				Status:      StatusFail,
 				Detail:      "no tables visible in " + filter + " (schema probe failed: " + probeErr.Error() + ")",
-				Remediation: grantsRemediation,
+				Remediation: schemaGrantsRemediation,
 			}
 		}
 		return CheckResult{
 			Name:        SchemaAccessCheckName,
 			Status:      StatusFail,
 			Detail:      "no tables visible in " + filter,
-			Remediation: grantsRemediation,
+			Remediation: schemaGrantsRemediation,
 		}
 	}
 	return CheckResult{
@@ -1195,10 +1201,7 @@ func (r *Report) Write(w io.Writer, format string) error {
 // Err returns a non-nil error when any required check failed, so the CLI exits
 // non-zero for CI/scripting use cases. Warnings do not cause failure.
 func (r *Report) Err() error {
-	if names := r.failingNames(nil); len(names) > 0 {
-		return &PreflightError{Checks: names}
-	}
-	return nil
+	return r.ErrExcluding()
 }
 
 // Names of the checks whose failure means something other than "a setting on
@@ -1292,19 +1295,6 @@ func BootRefusal(fatal error) error {
 	return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", fatal)
 }
 
-// failingNames lists the names of the checks in StatusFail that are not in
-// advisory, in report order.
-func (r *Report) failingNames(advisory []string) []string {
-	var names []string
-	for _, c := range r.Checks {
-		if c.Status != StatusFail || slices.Contains(advisory, c.Name) {
-			continue
-		}
-		names = append(names, c.Name)
-	}
-	return names
-}
-
 // ErrExcluding is Err but ignoring failures of the named advisory checks.
 // `up`'s preflight uses it for the capacity projection: refusing to boot the
 // stream over a disk forecast would manufacture the very forensic gap the
@@ -1312,8 +1302,15 @@ func (r *Report) failingNames(advisory []string) []string {
 // capturing while there is still room. The standalone `doctor` command keeps
 // full FAIL semantics (CI smoke tests SHOULD go red on a capacity overrun).
 func (r *Report) ErrExcluding(advisory ...string) error {
-	if names := r.failingNames(advisory); len(names) > 0 {
-		return &PreflightError{Checks: names}
+	var failing []string
+	for _, c := range r.Checks {
+		if c.Status != StatusFail || slices.Contains(advisory, c.Name) {
+			continue
+		}
+		failing = append(failing, c.Name)
 	}
-	return nil
+	if len(failing) == 0 {
+		return nil
+	}
+	return &PreflightError{Checks: failing}
 }
