@@ -236,6 +236,13 @@ type Server struct {
 	bucketRegionMu sync.Mutex
 	bucketRegions  map[string]bucketRegionEntry
 
+	// baselineDecimals memoizes the baseline files' column types per snapshot,
+	// for the reason above: buildViewsInput runs on every SQL panel query, and
+	// a footer read per table does not belong on that path either. See
+	// resolveBaselineDecimals.
+	baselineDecimalMu sync.Mutex
+	baselineDecimals  map[string]baselineDecimalEntry
+
 	listen     string
 	token      string
 	denyTables []query.SchemaTable

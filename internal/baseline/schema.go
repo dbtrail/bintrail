@@ -229,31 +229,48 @@ func parseSchemaFrom(r io.Reader) ([]Column, error) {
 }
 
 // decimalPrecisionScale reads the (p,s) out of a decimal or numeric column's
-// type arguments, applying MySQL's own defaults for the shorter spellings:
-// `decimal` is (10,0) and `decimal(p)` is (p,0). Every other type gets (0,0) —
-// the same parenthesized args carry a display width for int(10) and a length
-// for varchar(255), and reporting either as a precision would invite a cast
-// that means nothing.
+// type arguments, applying MySQL's own defaults for the spellings that OMIT
+// them: `decimal` is (10,0) and `decimal(p)` is (p,0). Every other type gets
+// (0,0) — the same parenthesized args carry a display width for int(10) and a
+// length for varchar(255), and reporting either as a precision would invite a
+// cast that means nothing.
 //
-// Unparseable args fall back to the bare defaults rather than failing the
-// schema parse: the column list is what callers came for, and a decimal whose
-// precision could not be read is still a decimal.
+// Arguments that are PRESENT but unparseable return (0,0), which callers read
+// as "no usable precision" and which keeps the column stored and read as text.
+// Falling back to the defaults there would be a guess, and not an inert one: a
+// consumer casting to a narrower scale gets SILENT ROUNDING, not an error
+// (DuckDB's CAST('1.239' AS DECIMAL(10,1)) is 1.2), so `decimal(10,2x)`
+// answered as (10,0) would report every value in the column rounded to whole
+// units. A refusal costs a cast; a guess corrupts the number.
+//
+// This never fails the schema parse. The column list is what callers came for,
+// and a decimal whose precision could not be read is still a decimal.
+//
+// The MySQL defaults are only correct because the sole producer of the footer
+// key these are read back out of is mydumper's canonical output. A future
+// non-MySQL producer of an embedded CREATE TABLE must not inherit them: an
+// unconstrained PostgreSQL `numeric`, for one, is not (10,0).
 func decimalPrecisionScale(typeToken, args string) (precision, scale int) {
 	if typeToken != "decimal" && typeToken != "numeric" {
 		return 0, 0
 	}
-	precision, scale = 10, 0
-	parts := strings.Split(args, ",")
 	if args == "" {
-		return precision, scale
+		return 10, 0
 	}
-	if p, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil && p > 0 {
-		precision = p
+	parts := strings.Split(args, ",")
+	if len(parts) > 2 {
+		return 0, 0
 	}
-	if len(parts) > 1 {
-		if s, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil && s >= 0 {
-			scale = s
-		}
+	precision, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || precision <= 0 {
+		return 0, 0
+	}
+	if len(parts) == 1 {
+		return precision, 0
+	}
+	scale, err = strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || scale < 0 {
+		return 0, 0
 	}
 	return precision, scale
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver for the footer read below
@@ -28,16 +29,19 @@ const MaxDuckDBDecimalPrecision = 38
 // let a caller report "this table has no decimal columns" about a table it
 // never managed to look at.
 //
-// One DuckDB session reads every footer in a single parquet_kv_metadata() call.
-// That is the reason this does not loop over ReadParquetMetadataAny: on S3 that
-// helper validates the whole object against its snapshot manifest and opens its
-// own session per file, so a per-table loop would download an entire baseline
-// to learn its column types. parquet_kv_metadata reads footers only.
+// One DuckDB session reads every footer in a single parquet_kv_metadata() call,
+// falling back to one call per file if that batch fails (see below). Neither
+// loops over ReadParquetMetadataAny: on S3 that helper validates the whole
+// object against its snapshot manifest and opens its own session per file, so a
+// per-table loop through it would download an entire baseline to learn its
+// column types. parquet_kv_metadata reads footers only.
 //
-// Callers are expected to treat a failure as "no type information available"
-// and carry on — knowing a column's precision is an improvement to the output,
-// never a precondition for producing it. The error is returned rather than
-// swallowed so the caller can say so in its own voice.
+// Callers are expected to treat a returned error as "no type information
+// available" and carry on — knowing a column's precision is an improvement to
+// the output, never a precondition for producing it. The error is returned
+// rather than swallowed so the caller can say so in its own voice. Note that a
+// per-FILE failure is not one of those errors: it leaves that path absent and
+// is logged here, because the readable files' answers are still worth having.
 func DecimalColumnsFor(ctx context.Context, paths []string) (map[string][]DecimalColumn, error) {
 	if len(paths) == 0 {
 		return nil, nil
@@ -62,27 +66,96 @@ func DecimalColumnsFor(ctx context.Context, paths []string) (map[string][]Decima
 	// the result be keyed by the caller's own path. A path DuckDB reports
 	// differently would simply not be found by the caller and lose its casts,
 	// which is the same output this function existed to improve on.
-	q := "SELECT file_name, value FROM parquet_kv_metadata(" + fileListLiteral(paths) + ") WHERE key = " +
-		sqlQuoteLiteral(MetaKeyCreateTableSQL)
-	rows, err := db.QueryContext(ctx, q)
+	rows, err := db.QueryContext(ctx, decimalFooterQuery(paths))
 	if err != nil {
-		return nil, fmt.Errorf("read baseline schemas from Parquet footers: %w", err)
+		// DuckDB resolves the file list up front, so ONE unreadable file (a
+		// zero-byte upload, a truncated write, an object that vanished between
+		// the listing and now) fails the whole batch. Read them one at a time
+		// instead, in this same session, so a local fault costs only its own
+		// table its casts rather than every table in the snapshot.
+		//
+		// The batch error travels into the fallback's own report. When the
+		// fault is session-wide instead of per-file (an S3 403, no httpfs) every
+		// per-file read fails too, and this is the one error that says why.
+		return decimalColumnsPerFile(ctx, db, paths, err), nil
 	}
 	defer rows.Close()
 
 	out := make(map[string][]DecimalColumn)
+	collectDecimalRows(rows, out)
+	return out, nil
+}
+
+// decimalFooterQuery reads the embedded CREATE TABLE out of each listed file's
+// footer. parquet_kv_metadata reads footers only, never row data.
+func decimalFooterQuery(paths []string) string {
+	return "SELECT file_name, value FROM parquet_kv_metadata(" + fileListLiteral(paths) + ") WHERE key = " +
+		sqlQuoteLiteral(MetaKeyCreateTableSQL)
+}
+
+// decimalColumnsPerFile is the batched read's fallback: one query per file, so
+// the files that ARE readable keep their entries. Files that fail stay absent
+// from the map, which is how the caller reports "could not look" as distinct
+// from "nothing to cast".
+//
+// The failures are logged rather than returned. The caller's answer is the map
+// either way, an absent table already says so in the generated file, and a
+// snapshot with several unreadable footers should not turn into an error that
+// costs the readable tables their casts, which is the exact failure this
+// fallback exists to undo.
+func decimalColumnsPerFile(ctx context.Context, db *sql.DB, paths []string, batchErr error) map[string][]DecimalColumn {
+	out := make(map[string][]DecimalColumn)
+	var failed []string
+	for _, p := range paths {
+		rows, err := db.QueryContext(ctx, decimalFooterQuery([]string{p}))
+		if err != nil {
+			failed = append(failed, p)
+			slog.Debug("baseline: could not read a Parquet footer for its column types",
+				"path", p, "error", err)
+			continue
+		}
+		collectDecimalRows(rows, out)
+		rows.Close()
+	}
+	if len(failed) > 0 {
+		// batchErr is reported alongside the count because when EVERY file
+		// failed the cause is usually not any one file (no httpfs, an S3 403,
+		// a cancelled context) and the per-file errors are all the same
+		// downstream symptom.
+		slog.Warn("baseline: some Parquet footers could not be read for their column types; "+
+			"those tables' state views will not cast decimal columns",
+			"unreadable_files", len(failed), "total_files", len(paths),
+			"first", failed[0], "error", batchErr)
+	}
+	return out
+}
+
+// collectDecimalRows folds one footer query's rows into the result map. Shared
+// by the batched read and the per-file fallback so the two cannot disagree
+// about what an entry means.
+func collectDecimalRows(rows *sql.Rows, out map[string][]DecimalColumn) {
 	for rows.Next() {
 		var file string
 		// parquet_kv_metadata types both key and value as BLOB.
 		var createSQL []byte
 		if err := rows.Scan(&file, &createSQL); err != nil {
-			return nil, fmt.Errorf("scan Parquet footer metadata: %w", err)
+			slog.Debug("baseline: could not scan Parquet footer metadata", "error", err)
+			continue
 		}
 		cols, err := ParseSchemaText(string(createSQL))
 		if err != nil {
 			// One unparseable CREATE TABLE costs that table its casts, not the
-			// whole run: the other tables' schemas are still good, and the
-			// caller reports an absent table as "type unknown".
+			// whole run. Left ABSENT, so the generated file reports it as a
+			// table whose types are unknown rather than one with no decimals.
+			//
+			// Warn, not Debug: a baseline that predates the embedded schema
+			// produces no row here at all (the query filters on the key), so
+			// reaching this branch means the key IS present and its value does
+			// not parse. That is always an anomaly worth naming, never the
+			// ordinary old-baseline case.
+			slog.Warn("baseline: the CREATE TABLE embedded in a Parquet footer would not parse; "+
+				"this table's state view will not cast decimal columns",
+				"path", file, "error", err)
 			continue
 		}
 		decs := DecimalColumns(cols)
@@ -94,9 +167,19 @@ func DecimalColumnsFor(ctx context.Context, paths []string) (map[string][]Decima
 		out[file] = decs
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read Parquet footer metadata: %w", err)
+		// Warn: an iteration that dies partway leaves every file after the
+		// break absent, and those tables lose their casts for a reason that is
+		// nowhere in the output otherwise.
+		//
+		// Deliberately NOT a len(out) vs len(paths) shortfall check. A short
+		// result is the NORMAL shape for a baseline older than the embedded
+		// schema and for every PostgreSQL-source baseline, neither of which
+		// carries the key, so counting would fire a fault on the two cases
+		// where nothing is wrong. rows.Err is the signal that something
+		// actually broke.
+		slog.Warn("baseline: reading Parquet footer metadata ended early; "+
+			"some tables' state views will not cast decimal columns", "error", err)
 	}
-	return out, nil
 }
 
 // DecimalColumns picks the decimal and numeric columns out of a parsed schema.

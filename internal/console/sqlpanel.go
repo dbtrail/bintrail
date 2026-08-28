@@ -251,6 +251,9 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	if in.ArchiveDiscoveryFailed {
 		res.Warnings = append(res.Warnings, sqlPanelRegistryNote)
 	}
+	if note := sqlPanelDecimalNote(in); note != "" {
+		res.Warnings = append(res.Warnings, note)
+	}
 	recordSQLRun(r, req.SQL, "ok", "", res.RowCount, res.Truncated)
 	writeJSON(w, http.StatusOK, res)
 }

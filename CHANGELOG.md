@@ -25,8 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the generated file now names each column and says why: a column wider than
   38 digits has no DuckDB `DECIMAL` to be cast to, and a baseline taken before
   bintrail embedded the `CREATE TABLE` in the footer carries no column types
-  to read. `docs/parquet-debugging.md` covers casting by hand for anyone
-  pointing DuckDB at the files without the views.
+  to read. The console's SQL panel executes these views and discards their
+  text, so when a file carries no column types it now says so next to the rows
+  instead of leaving a `sum(VARCHAR)` error unexplained. `docs/parquet-debugging.md`
+  covers casting by hand for anyone pointing DuckDB at the files without the
+  views.
 - **The console daemon's background folds are bounded, and their volume warning
   works** (#1477). `bintrail-console watch` rebuilds snapshots in the same
   process that captures binlogs, for the scheduled baseline refresh, the

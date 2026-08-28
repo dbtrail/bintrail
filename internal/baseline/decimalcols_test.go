@@ -2,6 +2,7 @@ package baseline
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -178,5 +179,86 @@ func writeFixtureTable(t *testing.T, path, createSQL string, rows [][]string) {
 	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestDecimalColumnsFor_corruptSiblingKeepsOthersCast pins the blast radius of
+// one unreadable file.
+//
+// DuckDB resolves a parquet_kv_metadata() file list up front, so a single
+// truncated or zero-byte file fails the whole batched read. Letting that stand
+// would mean one bad file in a snapshot costs EVERY table in it its casts,
+// which turns a local fault into a layout-wide one for no reason: the other
+// files' footers are perfectly readable.
+func TestDecimalColumnsFor_corruptSiblingKeepsOthersCast(t *testing.T) {
+	dir := t.TempDir()
+	createSQL := "CREATE TABLE `orders` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `total` decimal(10,2) DEFAULT NULL\n" +
+		");\n"
+	good := filepath.Join(dir, "good.parquet")
+	writeFixtureTable(t, good, createSQL, [][]string{{"1", "1.00"}})
+
+	// Zero bytes: what a truncated upload or an interrupted write leaves.
+	corrupt := filepath.Join(dir, "corrupt.parquet")
+	if err := os.WriteFile(corrupt, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := DecimalColumnsFor(context.Background(), []string{good, corrupt})
+	if err != nil {
+		t.Fatalf("one unreadable file must not fail the whole read: %v", err)
+	}
+	if len(got[good]) != 1 || got[good][0].Name != "total" {
+		t.Errorf("the readable file lost its casts to a corrupt sibling: got %v", got)
+	}
+	// The corrupt one is absent, which is how the caller reports "could not look".
+	if _, ok := got[corrupt]; ok {
+		t.Errorf("an unreadable file must be absent, not reported as having no decimals: %v", got)
+	}
+}
+
+// TestDecimalPrecisionScale_refusesMalformedArgs is about a silent wrong
+// answer, not a missing one.
+//
+// MySQL's defaults are right for the spellings that OMIT the arguments: a bare
+// `decimal` really is (10,0). Applying them to arguments that are PRESENT and
+// unparseable is a guess, and it is not an inert one. DuckDB truncates a cast
+// to a narrower scale by ROUNDING, silently: CAST('1.239' AS DECIMAL(10,1))
+// returns 1.2 with no error. So a footer reading `decimal(10,2x)` that fell
+// back to (10,0) would emit CAST(total AS DECIMAL(10,0)) and report every
+// money value rounded to whole units, in a view whose entire purpose is that
+// money arithmetic can be trusted.
+//
+// Refusing the column instead leaves it as text, which is what it reads as
+// today and what the caller already knows how to report.
+func TestDecimalPrecisionScale_refusesMalformedArgs(t *testing.T) {
+	cases := []struct {
+		name, createSQL string
+		wantRefused     bool
+	}{
+		{"garbage scale", "  `c` decimal(10,2x) DEFAULT NULL,", true},
+		{"garbage precision", "  `c` decimal(x,2) DEFAULT NULL,", true},
+		{"empty precision", "  `c` decimal(,2) DEFAULT NULL,", true},
+		{"three parts", "  `c` decimal(10,2,3) DEFAULT NULL,", true},
+		// The spellings that legitimately omit arguments keep MySQL's defaults.
+		{"bare", "  `c` decimal DEFAULT NULL,", false},
+		{"precision only", "  `c` decimal(8) DEFAULT NULL,", false},
+		{"both", "  `c` decimal(10,2) DEFAULT NULL,", false},
+		{"spaced", "  `c` decimal( 12 , 4 ) DEFAULT NULL,", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cols, err := ParseSchemaText("CREATE TABLE `t` (\n" + tc.createSQL + "\n);\n")
+			if err != nil {
+				t.Fatalf("ParseSchemaText: %v", err)
+			}
+			c := cols[0]
+			refused := c.DecimalPrecision == 0 && c.DecimalScale == 0
+			if refused != tc.wantRefused {
+				t.Errorf("%q gave DECIMAL(%d,%d); refused=%v, want refused=%v",
+					tc.createSQL, c.DecimalPrecision, c.DecimalScale, refused, tc.wantRefused)
+			}
+		})
 	}
 }

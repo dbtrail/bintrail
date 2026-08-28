@@ -73,10 +73,10 @@ Cast it yourself, with the precision and scale from the source table:
 SELECT sum(CAST(ol_amount AS DECIMAL(6,2))) FROM read_parquet('.../order_line.parquet');
 ```
 
-Or generate the views and let them do it. Two cases still read as text even in the generated views, and the file names each affected column and says why:
+Or generate the views and let them do it. Some columns still read as text even in the generated views, and the file names each affected table or column and says why:
 
-- A column wider than 38 digits has no DuckDB `DECIMAL` to be cast to. Cast it to `DOUBLE` if an approximate result answers your question.
-- A baseline taken before bintrail embedded the `CREATE TABLE` in the Parquet footer carries no column types to read. Re-take or refresh the baseline and the casts appear.
+- **A column wider than 38 digits** has no DuckDB `DECIMAL` to be cast to. Cast it to `DOUBLE` if an approximate result answers your question.
+- **A file that carries no column types** casts nothing at all. The views read the precision out of the `CREATE TABLE` in each Parquet footer, and three kinds of file do not have one: a baseline taken before bintrail started embedding it, which gains the casts the next time it is taken or refreshed; a PostgreSQL-source baseline, which stores every value as text by design and will not gain them; and a footer that could not be read, which is the only one of the three that is a fault and the only one that puts an error in the bintrail log.
 
 ---
 

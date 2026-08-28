@@ -43,8 +43,10 @@ each file's Parquet footer, so sum() and the rest work on them directly. A
 column too wide for DuckDB, or a baseline with no schema in its footer, stays
 text and is named in the file.
 
-bintrail only writes the text: it never opens DuckDB and never runs what it
-prints. Nothing in the file writes, and no credentials appear in it — S3
+bintrail never runs what it prints. It does open DuckDB once while generating,
+to read the column types out of the baseline files' Parquet footers, and that
+read touches footers only. Nothing in the file writes, and no credentials
+appear in it — S3
 access goes through DuckDB's credential chain, the same way bintrail's own
 S3 reads do. That S3 secret lives only in the DuckDB session that runs the
 file: views persist in a database file, secrets do not, so run the file in
