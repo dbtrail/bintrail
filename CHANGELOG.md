@@ -349,9 +349,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory aside first and deletes it second, so a delete interrupted part way
   can never leave table files behind with no marker on them, which is the one
   shape a reader would take for a real backup; a daemon killed during that
-  delete leaves the moved-aside directory behind, and every later cycle clears
-  any it finds, the same way the retention prune clears its own staging
-  directories. Nothing changes for `bintrail baseline refresh` on the command
+  delete leaves the moved-aside directory behind, and the next refresh cycle for
+  that same backup directory clears it, the same way the retention prune clears
+  its own staging directories. One left in a directory the refresh no longer
+  runs for (the server was removed, or the interval was turned off) stays until
+  you remove it. Nothing changes for `bintrail baseline refresh` on the command
   line, or for a restore or a custom `.sql` build you started yourself: those
   keep their fragments, because someone who typed a command is there to look at
   them. A shutdown partway through a refresh usually reclaims: a table already
