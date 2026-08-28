@@ -54,6 +54,14 @@ func writeSnapshotFiles(t *testing.T, dir string, markers ...string) {
 // the fixture cannot drift from the path the production code computes.
 func injectFold(t *testing.T, failures int, runErr error) {
 	t.Helper()
+	injectFoldMarkers(t, failures, runErr, false)
+}
+
+// injectFoldMarkers is injectFold with control over the markers the fake fold
+// leaves, so a case can stage the shapes the real fold produces on its unhappy
+// paths: no marker at all is what a caller must treat as "not mine to remove".
+func injectFoldMarkers(t *testing.T, failures int, runErr error, markerless bool) {
+	t.Helper()
 	prev := foldTables
 	t.Cleanup(func() { foldTables = prev })
 	foldTables = func(_ context.Context, cfg reconstruct.FullTableConfig) (
@@ -62,6 +70,9 @@ func injectFold(t *testing.T, failures int, runErr error) {
 		markers := []string{baseline.IncompleteMarker}
 		if runErr == nil {
 			markers = []string{baseline.SuccessMarker}
+		}
+		if markerless {
+			markers = nil
 		}
 		writeSnapshotFiles(t, dir, markers...)
 		var fails []reconstruct.TableFailure
@@ -183,8 +194,20 @@ func TestRunRefresh_keepsThePublishedSnapshotWhenTheFoldSucceeds(t *testing.T) {
 	}
 	// The reporting is bound to the same branch as the reclaim, so a run that
 	// published must not reach it at all.
+	//
+	// Both assertions are needed and the second is the one that pins the
+	// BINDING. The surviving parquet above proves only that something refused
+	// the delete, and the marker guard inside DiscardUnpublishedSnapshot would
+	// refuse a _SUCCESS directory even if the reclaim ran on every run. A
+	// reclaim wired to run unconditionally would still emit its attributes
+	// here, because a published directory holds data and reports no refusal,
+	// which is exactly the kept branch.
 	if strings.Contains(out, "published nothing") {
 		t.Errorf("a successful refresh went down the refusal path: %q", out)
+	}
+	if strings.Contains(out, "partial_snapshot") {
+		t.Errorf("a successful refresh reported on its own published snapshot as a partial one, so the reclaim "+
+			"is not bound to the failure branch: %q", out)
 	}
 }
 
@@ -193,29 +216,39 @@ func TestKeepPartialSnapshotBecause(t *testing.T) {
 		name      string
 		refused   int
 		unclaimed string
+		holdsData bool
 		want      string // "" = the directory may be reclaimed
 	}{
-		{"one table refused", 1, "", ""},
-		{"every table folded", 0, "", "may be a complete snapshot"},
+		{"one table refused", 1, "", true, ""},
+		{"every table folded", 0, "", true, "may be a complete snapshot"},
+		// A run that failed BEFORE the first table folded also reports zero
+		// refusals, and leaves the directory holding nothing but the marker.
+		// The guard exists to protect data, and there is none, so keeping it
+		// would accumulate one empty directory per interval for the whole
+		// unreachable-index failure family.
+		{"nothing folded at all", 0, "", false, ""},
 		// A directory that already held files is refused by the fold BEFORE any
 		// table folds, so it also arrives with refused == 0. The unclaimed
 		// reason is the true one and has to win, or the line names the wrong
 		// cause for the right decision.
-		{"not ours, and no table folded", 0, "the directory already held files", "the directory already held files"},
-		{"not ours", 3, "the directory already held files", "the directory already held files"},
+		{"not ours, and no table folded", 0, "the directory already held files", true, "the directory already held files"},
+		{"not ours", 3, "the directory already held files", true, "the directory already held files"},
+		// Not ours AND holding no data: still not ours. The data check must not
+		// override the ownership one.
+		{"not ours, and empty", 0, "the directory already held files", false, "the directory already held files"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := keepPartialSnapshotBecause(tc.refused, tc.unclaimed)
+			got := keepPartialSnapshotBecause(tc.refused, tc.unclaimed, tc.holdsData)
 			if tc.want == "" {
 				if got != "" {
-					t.Errorf("keepPartialSnapshotBecause(%d, %q) = %q, want the directory reclaimable",
-						tc.refused, tc.unclaimed, got)
+					t.Errorf("keepPartialSnapshotBecause(%d, %q, %v) = %q, want the directory reclaimable",
+						tc.refused, tc.unclaimed, tc.holdsData, got)
 				}
 				return
 			}
 			if !strings.Contains(got, tc.want) {
-				t.Errorf("keepPartialSnapshotBecause(%d, %q) = %q, want it to say %q",
-					tc.refused, tc.unclaimed, got, tc.want)
+				t.Errorf("keepPartialSnapshotBecause(%d, %q, %v) = %q, want it to say %q",
+					tc.refused, tc.unclaimed, tc.holdsData, got, tc.want)
 			}
 		})
 	}
@@ -255,5 +288,180 @@ func TestRefreshSnapshotDir(t *testing.T) {
 	want := filepath.Join("/var/lib/bintrail/baselines", "2026-08-28T10-00-00Z")
 	if got != want {
 		t.Errorf("refreshSnapshotDir = %q, want %q", got, want)
+	}
+}
+
+// The failure family that reaches the reclaim with nothing folded: an
+// unreachable index, a missing schema snapshot, archive discovery refusing. The
+// fold has already created the directory and stamped the marker by then, and it
+// reports zero refusals, so before the data check this whole family accumulated
+// one empty directory per interval, plus a "skipping incomplete snapshot"
+// warning on every later listing.
+func TestRunRefresh_reclaimsADirectoryNoTableEverWroteInto(t *testing.T) {
+	root := stageBaselineRoot(t)
+	prev := foldTables
+	t.Cleanup(func() { foldTables = prev })
+	foldTables = func(_ context.Context, cfg reconstruct.FullTableConfig) (
+		[]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		// What reconstructTables leaves when it fails between markRunIncomplete
+		// and the first table: the directory and the marker, nothing else.
+		dir := filepath.Join(cfg.OutputDir, reconstruct.SnapshotDirName(cfg.At))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("stage: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, baseline.IncompleteMarker), nil, 0o644); err != nil {
+			t.Fatalf("stage marker: %v", err)
+		}
+		return nil, nil, errors.New("connect to index DB: dial tcp 127.0.0.1:3306: connection refused")
+	}
+	left := filepath.Join(root, "2026-08-28T10-00-00Z")
+
+	out := runOneRefresh(t, root)
+
+	if _, err := os.Stat(left); !os.IsNotExist(err) {
+		t.Errorf("an index outage left an empty snapshot directory behind; at the one minute floor that is 1440 "+
+			"a day, each one warning on every later listing: stat = %v", err)
+	}
+	if !strings.Contains(out, "removed_partial_snapshot") {
+		t.Errorf("the line does not say the empty directory was reclaimed: %q", out)
+	}
+}
+
+// The guard that stops a discard when the code cannot see what it would delete.
+// Its failure mode is deletion, so its absence must not be invisible.
+func TestClaimSnapshotDir_refusesADirectoryItCannotRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so this case cannot be staged")
+	}
+	dir := filepath.Join(t.TempDir(), "2026-08-28T10-00-00Z")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	got := claimSnapshotDir(dir)
+	if got == "" {
+		t.Fatal("a directory whose contents could not be read was claimed as this run's, so the cleanup would " +
+			"delete a directory it never saw inside")
+	}
+	if !strings.Contains(got, "could not be read") {
+		t.Errorf("the reason does not say the directory was unreadable, so the line will name the wrong "+
+			"cause: %q", got)
+	}
+}
+
+// A delete that fails after the rename leaves the snapshot beyond every reader
+// with its bytes still on disk. Both facts have to reach the operator, and the
+// leak has to get its own line rather than an attribute on the refusal message
+// that a permanent capture gap already emits every interval.
+func TestRunRefresh_reportsADeleteThatFailedAfterTheRename(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so a failing delete cannot be staged")
+	}
+	root := stageBaselineRoot(t)
+	prev := foldTables
+	t.Cleanup(func() { foldTables = prev })
+	foldTables = func(_ context.Context, cfg reconstruct.FullTableConfig) (
+		[]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		dir := filepath.Join(cfg.OutputDir, reconstruct.SnapshotDirName(cfg.At))
+		writeSnapshotFiles(t, dir, baseline.IncompleteMarker)
+		// The table's own subdirectory is not writable, so its Parquet cannot be
+		// unlinked and RemoveAll fails. The snapshot directory itself still
+		// renames, because its PARENT is writable.
+		if err := os.Chmod(filepath.Join(dir, "shop"), 0o500); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = filepath.Walk(cfg.OutputDir, func(p string, info os.FileInfo, err error) error {
+				if err == nil && info.IsDir() {
+					_ = os.Chmod(p, 0o755)
+				}
+				return nil
+			})
+		})
+		return nil, []reconstruct.TableFailure{{Schema: "shop", Table: "audit"}},
+			errors.New("shop.audit: capture gap in the reconstruction window")
+	}
+
+	prevLog := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prevLog) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
+	sup.refreshes["s"] = &console.BaselineStatus{State: "running"}
+	sup.runRefresh(refreshRequest{ServerID: "s", ServerName: "s", IndexDSN: "d", BaselineDir: root},
+		refreshAt, time.Minute)
+
+	out := buf.String()
+	if !strings.Contains(out, "cleanup_error") {
+		t.Errorf("a delete that failed was reported as a clean removal, so the disk it did not reclaim is "+
+			"invisible: %q", out)
+	}
+	if !strings.Contains(out, "level=ERROR") {
+		t.Errorf("the leak was filed only as an attribute of the refusal line, which repeats every interval and "+
+			"is expected; it needs its own line: %q", out)
+	}
+}
+
+// The other half of the staging convention. A daemon killed during the delete
+// leaves a directory no listing will ever mention, so if nothing sweeps it the
+// leak comes back in a shape nobody can see.
+func TestRunRefresh_sweepsAStagingDirectoryAnInterruptedCleanupLeft(t *testing.T) {
+	root := stageBaselineRoot(t)
+	leftover := filepath.Join(root, ".2026-08-27T10-00-00Z.discarding")
+	writeSnapshotFiles(t, leftover)
+	injectFold(t, 1, errors.New("shop.audit: capture gap in the reconstruction window"))
+
+	runOneRefresh(t, root)
+
+	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+		t.Errorf("the staging directory from an interrupted cleanup survived the cycle: %v", err)
+	}
+}
+
+// A directory the fold left with NO marker is not this run's to remove: a
+// markerless snapshot directory is complete by default, which is the legacy
+// shape. It is kept, and the refusal is the guard working rather than a
+// filesystem failure, so it stays an attribute of the refusal line.
+func TestRunRefresh_keepsADirectoryCarryingNoMarker(t *testing.T) {
+	root := stageBaselineRoot(t)
+	injectFoldMarkers(t, 1, errors.New("shop.audit: capture gap in the reconstruction window"), true)
+	kept := filepath.Join(root, "2026-08-28T10-00-00Z")
+
+	out := runOneRefresh(t, root)
+
+	if _, err := os.Stat(filepath.Join(kept, "shop", "orders.parquet")); err != nil {
+		t.Errorf("a directory carrying no completeness marker was deleted: %v", err)
+	}
+	if !strings.Contains(out, "kept_because") || !strings.Contains(out, kept) {
+		t.Errorf("the directory was kept and the line neither names it nor says why: %q", out)
+	}
+	if strings.Contains(out, "level=ERROR") {
+		t.Errorf("the guard declining was reported as a failure; it is the guard working: %q", out)
+	}
+}
+
+// dirExists decides whether a path is worth naming. A plain file where the
+// snapshot directory would be is not a partial snapshot, and naming it would
+// point an operator at the wrong thing.
+func TestDirExists(t *testing.T) {
+	root := t.TempDir()
+	if dirExists(filepath.Join(root, "nope")) {
+		t.Error("an absent path was reported as an existing directory")
+	}
+	file := filepath.Join(root, "a-file")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if dirExists(file) {
+		t.Error("a plain file was reported as a directory")
+	}
+	if !dirExists(root) {
+		t.Error("a real directory was not reported as one")
 	}
 }

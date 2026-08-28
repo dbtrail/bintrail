@@ -1,12 +1,25 @@
 package reconstruct
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 )
+
+// ErrSnapshotNotDiscardable marks a DELIBERATE refusal by
+// DiscardUnpublishedSnapshot: the directory is not an unpublished snapshot, so
+// nothing was removed and nothing went wrong.
+//
+// It exists so a caller can tell "I correctly declined" from "I tried and the
+// filesystem refused". Those are the same return shape and completely different
+// facts: the first is the guard working, the second means the reclaim cannot
+// run for that directory and its disk is leaking. Reporting them at one level,
+// under one message, is how the second one goes unnoticed.
+var ErrSnapshotNotDiscardable = errors.New("not an unpublished snapshot")
 
 // discardingSuffix names a snapshot directory that is on its way out.
 //
@@ -87,11 +100,12 @@ func DiscardUnpublishedSnapshot(dir string) (discarded bool, err error) {
 	// Lstat, so a symlink is not followed: a fold creates a real directory, so
 	// anything else here is not ours.
 	if !info.IsDir() {
-		return false, fmt.Errorf("%s is not a directory, so it is not a snapshot this run wrote", dir)
+		return false, fmt.Errorf("%w: %s is not a directory, so it is not a snapshot this run wrote",
+			ErrSnapshotNotDiscardable, dir)
 	}
 	if baseline.SnapshotComplete(dir) {
-		return false, fmt.Errorf("%s does not carry the %s marker, so it is not an unpublished snapshot",
-			dir, baseline.IncompleteMarker)
+		return false, fmt.Errorf("%w: %s does not carry the %s marker",
+			ErrSnapshotNotDiscardable, dir, baseline.IncompleteMarker)
 	}
 	staging := filepath.Join(filepath.Dir(dir), discardingName(filepath.Base(dir)))
 	if err := os.Rename(dir, staging); err != nil {
@@ -102,4 +116,52 @@ func DiscardUnpublishedSnapshot(dir string) (discarded bool, err error) {
 			dir, staging, err)
 	}
 	return true, nil
+}
+
+// SweepDiscardedSnapshots removes ".<ts>.discarding" staging directories a
+// previous discard did not finish deleting, and reports how many it reclaimed.
+//
+// This is the other half of the convention discardingSuffix borrows. Prune
+// stages the same way AND sweeps its leftovers at the top of every cycle
+// (baseline.sweepPruningLeftovers), and the sweep is what makes the leftovers
+// bounded rather than permanent. Adopting only the rename would trade one leak
+// for a rarer leak in a shape nothing names: a staging directory is invisible
+// to every discovery path BY DESIGN, so no listing, no status and no console
+// panel would ever mention the disk it holds.
+//
+// The producer is not only a disk fault. Nothing joins the refresh goroutine at
+// shutdown, so a daemon killed during the delete exits with a part-deleted
+// staging tree, and that path logs nothing at all because the process is gone
+// before the caller's own line is written.
+//
+// Best-effort by contract: it is housekeeping running beside real work, so a
+// directory it cannot read or delete is reported, never fatal. An unreadable
+// ROOT yields (0, nil) rather than an error, matching prune's sweeper, because
+// the caller's own work fails on the same root and would say so first.
+func SweepDiscardedSnapshots(root string) (removed int, err error) {
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		return 0, nil
+	}
+	var errs []error
+	for _, e := range entries {
+		if !e.IsDir() || !isDiscardingName(e.Name()) {
+			continue
+		}
+		p := filepath.Join(root, e.Name())
+		if rmErr := removeAllDir(p); rmErr != nil {
+			errs = append(errs, fmt.Errorf("sweep leftover staging directory %s: %w", p, rmErr))
+			continue
+		}
+		removed++
+	}
+	return removed, errors.Join(errs...)
+}
+
+// isDiscardingName recognizes a staging directory this package wrote. Both
+// halves are required: a directory an operator happens to have named
+// ".backups.discarding" is not one of ours, and neither is a snapshot directory
+// whose name merely ends in the suffix.
+func isDiscardingName(name string) bool {
+	return strings.HasPrefix(name, ".") && strings.HasSuffix(name, discardingSuffix)
 }

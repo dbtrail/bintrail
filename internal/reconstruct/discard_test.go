@@ -177,3 +177,144 @@ func TestSnapshotDirVacant(t *testing.T) {
 		t.Errorf("SnapshotDirVacant(holding a table file) = %v, %v; want false, nil", vacant, err)
 	}
 }
+
+// A directory holding nothing but the marker is what a run that failed before
+// its first table folded leaves: an unreachable index, a missing schema
+// snapshot, archive discovery refusing. There is no data in it to protect.
+func TestDiscardUnpublishedSnapshot_reclaimsAMarkerOnlySnapshot(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "2026-08-28T10-00-00Z")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, baseline.IncompleteMarker), nil, 0o644); err != nil {
+		t.Fatalf("stage marker: %v", err)
+	}
+
+	discarded, err := DiscardUnpublishedSnapshot(dir)
+	if err != nil || !discarded {
+		t.Fatalf("DiscardUnpublishedSnapshot(marker only) = %v, %v; want true, nil", discarded, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("the marker-only directory is still on disk: %v", err)
+	}
+}
+
+// A caller has to be able to tell the guard declining from the filesystem
+// refusing: the first is nothing to act on, the second means the reclaim cannot
+// run for this directory and its disk leaks. Both are (false, err).
+func TestDiscardUnpublishedSnapshot_refusalIsDistinguishableFromAFailure(t *testing.T) {
+	root := t.TempDir()
+	published := stageSnapshot(t, root, "2026-08-28T10-00-00Z", baseline.SuccessMarker)
+	if _, err := DiscardUnpublishedSnapshot(published); !errors.Is(err, ErrSnapshotNotDiscardable) {
+		t.Errorf("refusing a published snapshot = %v, want it to wrap ErrSnapshotNotDiscardable so the caller "+
+			"does not report the guard working as a filesystem failure", err)
+	}
+
+	// A plain file where a snapshot directory would be: also a refusal, not a
+	// failure, and it must never be followed.
+	notADir := filepath.Join(root, "2026-08-28T11-00-00Z")
+	if err := os.WriteFile(notADir, []byte("not a snapshot"), 0o644); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	discarded, err := DiscardUnpublishedSnapshot(notADir)
+	if discarded {
+		t.Error("a plain file at the snapshot path was removed")
+	}
+	if !errors.Is(err, ErrSnapshotNotDiscardable) {
+		t.Errorf("a plain file at the snapshot path = %v, want a refusal", err)
+	}
+	if _, err := os.Stat(notADir); err != nil {
+		t.Errorf("the file was deleted: %v", err)
+	}
+}
+
+// The other half of the convention discardingSuffix borrows. Without the sweep,
+// a daemon killed during the delete leaves a staging directory that NO listing,
+// status or console panel will ever mention, because every discovery path skips
+// it on the name. The leak this change fixes would come back in a shape nothing
+// can see.
+func TestSweepDiscardedSnapshots(t *testing.T) {
+	root := t.TempDir()
+	leftover := filepath.Join(root, ".2026-08-28T09-00-00Z.discarding")
+	if err := os.MkdirAll(filepath.Join(leftover, "shop"), 0o755); err != nil {
+		t.Fatalf("stage leftover: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(leftover, "shop", "orders.parquet"), []byte("rows"), 0o644); err != nil {
+		t.Fatalf("stage leftover file: %v", err)
+	}
+	// A real published snapshot and an unrelated dot-directory both have to
+	// survive: the sweep must match on BOTH halves of the staging name.
+	keep := stageSnapshot(t, root, "2026-08-28T10-00-00Z", baseline.SuccessMarker)
+	// Both halves of the name are load-bearing, so both get a fixture: a
+	// dot-directory that is not ours, and a directory ending in the suffix that
+	// an operator named themselves.
+	unrelated := filepath.Join(root, ".config")
+	if err := os.MkdirAll(unrelated, 0o755); err != nil {
+		t.Fatalf("stage unrelated: %v", err)
+	}
+	operatorNamed := filepath.Join(root, "old-backups.discarding")
+	if err := os.MkdirAll(operatorNamed, 0o755); err != nil {
+		t.Fatalf("stage operator-named: %v", err)
+	}
+
+	removed, err := SweepDiscardedSnapshots(root)
+	if err != nil {
+		t.Fatalf("SweepDiscardedSnapshots = %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("swept %d directories, want 1", removed)
+	}
+	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+		t.Errorf("the leftover staging directory survived the sweep: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(keep, "shop", "orders.parquet")); err != nil {
+		t.Errorf("the sweep deleted a published snapshot: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("the sweep deleted an unrelated dot-directory: %v", err)
+	}
+	if _, err := os.Stat(operatorNamed); err != nil {
+		t.Errorf("the sweep deleted a directory an operator named, which this package never wrote: %v", err)
+	}
+}
+
+// The negative direction of the sentinel, which is the half that matters: a
+// filesystem failure must NOT be classed as the guard declining, or the caller
+// reports a leaking directory as "working as designed" and says nothing about
+// it.
+func TestDiscardUnpublishedSnapshot_aFailureIsNotARefusal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so a failing rename cannot be staged")
+	}
+	root := t.TempDir()
+	dir := stageSnapshot(t, root, "2026-08-28T10-00-00Z", baseline.IncompleteMarker)
+	// A read-only PARENT fails the rename while the directory itself still
+	// passes every guard above it.
+	if err := os.Chmod(root, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+
+	discarded, err := DiscardUnpublishedSnapshot(dir)
+	if discarded {
+		t.Fatal("a discard whose rename failed reported the snapshot as gone")
+	}
+	if err == nil {
+		t.Fatal("a rename that failed was reported as success")
+	}
+	if errors.Is(err, ErrSnapshotNotDiscardable) {
+		t.Errorf("a filesystem failure was classed as the guard declining, so the caller reports a directory it "+
+			"cannot reclaim as working as designed: %v", err)
+	}
+}
+
+// An absent or unreadable baseline root is not an error: the sweep is
+// housekeeping beside real work, and the real work fails on the same root and
+// says so first.
+func TestSweepDiscardedSnapshots_absentRootIsQuiet(t *testing.T) {
+	removed, err := SweepDiscardedSnapshots(filepath.Join(t.TempDir(), "nope"))
+	if removed != 0 || err != nil {
+		t.Errorf("SweepDiscardedSnapshots(absent) = %d, %v; want 0, nil", removed, err)
+	}
+}

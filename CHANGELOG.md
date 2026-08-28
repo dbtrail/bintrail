@@ -340,14 +340,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every table already folded is kept rather than deleted; and the directory has
   to still carry the incomplete marker, so a published backup is never a
   candidate. When any of them says no, the directory is kept and the line says
-  which one it is and why. The removal moves the directory aside first and
-  deletes it second, so a delete interrupted part way can never leave table
-  files behind with no marker on them, which is the one shape a reader would
-  take for a real backup. Nothing changes for `bintrail baseline refresh` on the
-  command line, or for a restore or a custom `.sql` build you started yourself:
-  those keep their fragments, because someone who typed a command is there to
-  look at them. A shutdown in the middle of a refresh also keeps its fragment,
-  since a cancelled run reports no table failure.
+  which one it is and why. The second guard stands down when the directory holds
+  nothing but the marker, which is what a run that fails before its first table
+  rebuilds leaves behind: an unreachable index, a missing schema snapshot, a
+  refused archive lookup. There is no data in those to protect, and they used to
+  accumulate one empty directory per interval, each one printing a skipped
+  incomplete snapshot warning on every later listing. The removal moves the
+  directory aside first and deletes it second, so a delete interrupted part way
+  can never leave table files behind with no marker on them, which is the one
+  shape a reader would take for a real backup; a daemon killed during that
+  delete leaves the moved-aside directory behind, and every later cycle clears
+  any it finds, the same way the retention prune clears its own staging
+  directories. Nothing changes for `bintrail baseline refresh` on the command
+  line, or for a restore or a custom `.sql` build you started yourself: those
+  keep their fragments, because someone who typed a command is there to look at
+  them. A shutdown partway through a refresh usually reclaims: a table already
+  rebuilding reports the cancellation as an ordinary table failure, so only a
+  shutdown observed while no table is in flight keeps its fragment.
 
 ### Added
 - **S3-compatible object stores (MinIO, Wasabi, LocalStack) for every S3

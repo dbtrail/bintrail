@@ -94,6 +94,10 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	// move the number this change exists to get right, in either direction.
 	// started stays for the RFC3339 stamp, which wants the wall clock.
 	elapsed := time.Now()
+	// Every cycle, not only a failing one: a staging directory a killed daemon
+	// left behind is invisible to every listing, so nothing else will ever
+	// mention it, and a server whose refusals stopped would keep it forever.
+	sweepDiscardedSnapshots(req)
 	// Asked BEFORE the fold, and it has to be: the question is whether the
 	// snapshot directory holds anything this run did not write, and once the
 	// fold has run its own files are in there too. See claimSnapshotDir.
@@ -211,29 +215,82 @@ func reportRefusedRefresh(req refreshRequest, at time.Time, refused int, unclaim
 // command is watching its output and may want to look at what came out. An
 // unattended job that will repeat in a minute is the case where nobody will.
 func reclaimPartialSnapshot(dir string, refused int, unclaimed string) []any {
-	if reason := keepPartialSnapshotBecause(refused, unclaimed); reason != "" {
+	if reason := keepPartialSnapshotBecause(refused, unclaimed, holdsTableData(dir)); reason != "" {
 		if !dirExists(dir) {
 			// The run failed before it created the directory (no snapshot to
 			// fold, an unreachable index). Naming a path that is not there
 			// would send an operator looking for it.
 			return nil
 		}
+		if unclaimed != "" {
+			// A DIFFERENT key, because this directory may not be a partial
+			// snapshot at all: the reason it was refused is that somebody else's
+			// files are in it, and one of the shapes that produces is a real
+			// backup published into the same second. Calling that
+			// partial_snapshot invites a cleanup script to delete it.
+			return []any{"unclaimed_dir", dir, "kept_because", reason}
+		}
 		return []any{"partial_snapshot", dir, "kept_because", reason}
 	}
 	discarded, err := reconstruct.DiscardUnpublishedSnapshot(dir)
 	switch {
 	case discarded && err != nil:
-		// Renamed out of every discovery path but not fully deleted. Both facts
-		// are true and both get said: nothing can read it, and the disk it
-		// holds was not reclaimed.
+		// Renamed out of every discovery path but not fully deleted, so the disk
+		// is leaking. Its own line, at Error, because this Warn is the expected
+		// one an operator with a permanent capture gap has already learned to
+		// skip past, and burying a leak in it is how the leak is never seen.
+		slog.Error("baseline refresh: could not delete the partial snapshot it moved aside, so that disk is not "+
+			"reclaimed. Nothing can read it and the next cycle sweeps it, but if this repeats, delete it by hand "+
+			"and check the filesystem.", "dir", dir, "error", err)
 		return []any{"removed_partial_snapshot", dir, "cleanup_error", err}
 	case discarded:
 		return []any{"removed_partial_snapshot", dir}
+	case errors.Is(err, reconstruct.ErrSnapshotNotDiscardable):
+		// The guard declining, which is it working. An attribute on the refusal
+		// line is the right weight for that.
+		return []any{"partial_snapshot", dir, "kept_because", err.Error()}
 	case err != nil:
+		// Tried and could not. Same class as the delete failure above: the
+		// reclaim cannot run for this directory, so it accumulates.
+		slog.Error("baseline refresh: could not reclaim the partial snapshot this run left behind, so that disk "+
+			"is not reclaimed and the directory will accumulate at every interval.", "dir", dir, "error", err)
 		return []any{"partial_snapshot", dir, "kept_because", err.Error()}
 	default:
 		return nil
 	}
+}
+
+// sweepDiscardedSnapshots clears staging directories a killed daemon left in
+// this server's baseline root.
+//
+// Silent when there is nothing to do, which is every cycle on a healthy host.
+// It speaks only when it actually reclaimed something, because that means a
+// previous delete did not finish and the operator has no other way to learn it
+// happened: a staging directory is skipped by every listing by design.
+func sweepDiscardedSnapshots(req refreshRequest) {
+	removed, err := reconstruct.SweepDiscardedSnapshots(req.BaselineDir)
+	if err != nil {
+		slog.Warn("baseline refresh: could not clear a leftover staging directory from an interrupted cleanup; "+
+			"it holds disk that nothing else will reclaim or report", "server", req.ServerName, "error", err)
+	}
+	if removed > 0 {
+		slog.Info("baseline refresh: cleared staging directories left by an interrupted cleanup",
+			"server", req.ServerName, "dirs", removed, "baseline_dir", req.BaselineDir)
+	}
+}
+
+// holdsTableData reports whether the snapshot directory holds anything beyond
+// the incomplete marker. It is the difference between a fold that wrote tables
+// and one that never got that far, and it decides whether the refused == 0
+// guard has anything to protect.
+func holdsTableData(dir string) bool {
+	vacant, err := reconstruct.SnapshotDirVacant(dir)
+	if err != nil {
+		// Cannot see inside, so assume there is something worth keeping. The
+		// conservative answer is the one that keeps the directory.
+		return true
+	}
+	return !vacant
 }
 
 // keepPartialSnapshotBecause states why a refused cycle's snapshot directory
@@ -254,15 +311,28 @@ func reclaimPartialSnapshot(dir string, refused int, unclaimed string) []any {
 // finished. In all three the bytes on disk are a whole snapshot that only
 // failed to be MARKED, and deleting one would destroy work that is complete.
 //
-// The cost of that guard is that a shutdown mid-fold leaves its partial
-// snapshot behind, because a cancelled run's remaining tables return without
-// recording a failure. That is one directory per restart rather than one per
-// interval, and it is the direction to be wrong in.
-func keepPartialSnapshotBecause(refused int, unclaimed string) string {
+// holdsData is what stops that guard from protecting nothing. A run that failed
+// BEFORE the first table folded (an unreachable index, a missing schema
+// snapshot, archive discovery refusing) has already created the directory and
+// stamped the incomplete marker, and it also arrives with refused == 0, so
+// without this the whole failure family accumulated one empty directory per
+// interval: the same symptom, minus the bytes, plus a "skipping incomplete
+// snapshot" warning on every later listing. A directory holding nothing but the
+// marker cannot be a complete snapshot, so the guard has nothing to protect and
+// stands down.
+//
+// The residual cost is a shutdown that lands BETWEEN tables. A table already
+// folding propagates the cancellation as an ordinary table error (carryForward
+// returns ctx.Err(); an in-flight fetch returns context.Canceled), so a
+// shutdown mid-fold usually arrives with refused > 0 and IS reclaimed; it is
+// only a cancellation observed while no table is in flight that returns with no
+// failure recorded and keeps its fragment. Rare, bounded by restarts rather
+// than by the interval, and the direction to be wrong in.
+func keepPartialSnapshotBecause(refused int, unclaimed string, holdsData bool) string {
 	if unclaimed != "" {
 		return unclaimed
 	}
-	if refused == 0 {
+	if refused == 0 && holdsData {
 		return "the fold reported no table failure, so what is on disk may be a complete snapshot that only " +
 			"failed to be marked"
 	}
