@@ -385,11 +385,22 @@ func TestNoLiveIndex_consoleDownloadSaysSomethingTrue(t *testing.T) {
 // otherwise measure and blame on the view. Every query streams the whole live
 // table; a predicate on the derived Hive columns cannot become an index filter.
 func TestLiveLeg_costNote(t *testing.T) {
-	out := eventsComment(Generate(liveInput(liveIdx())))
-	for _, want := range []string{"COST:", "streams the whole live binlog_events"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("the events view does not state its cost (%q)", want)
-		}
+	// BOTH live shapes. The preamble points forward at this note ("see COST
+	// below") and is emitted whenever the index is attached, so a shape whose
+	// cost note went missing would leave the file with a dangling reference.
+	// Covering only the two-leg shape let that happen unnoticed.
+	for name, in := range map[string]Input{
+		"archives and index": liveInput(liveIdx()),
+		"index alone":        func() Input { in := liveInput(liveIdx()); in.ArchiveSources = nil; return in }(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := eventsComment(Generate(in))
+			for _, want := range []string{"COST:", "streams the whole live binlog_events"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("the events view does not state its cost (%q)", want)
+				}
+			}
+		})
 	}
 }
 
@@ -511,7 +522,11 @@ func TestLivePreamble_saysTheReadLandsOnTheCaptureIndex(t *testing.T) {
 				// What it does to capture, which is the whole point.
 				"competes with capture",
 				// The way out. Naming only the cost and no remedy leaves the
-				// reader with a warning they cannot act on.
+				// reader with a warning they cannot act on, and the remedy has
+				// to be one that WORKS: this same block says a filter on the
+				// view does not reach the index, so "filter it down" would
+				// contradict it. The direct read is the one that does.
+				"\"binlog_events\" directly with your own WHERE",
 				"read replica",
 			} {
 				if !strings.Contains(pre, want) {
@@ -529,9 +544,18 @@ func TestLivePreamble_saysTheReadLandsOnTheCaptureIndex(t *testing.T) {
 func TestLivePreamble_capturePriceIsTrueAfter1482(t *testing.T) {
 	pre := livePreamble(Generate(liveInput(liveIdx())))
 	for _, want := range []string{
-		"ends the run under `bintrail stream`",
-		"restarts from the last checkpoint",
-		"`bintrail-console watch`",
+		// The whole standalone class, not one member of it: `bintrail up` and
+		// `bintrail-pg stream` reach indexer.InsertBatch through the same
+		// unwrapped streamrun/pgstreamrun call, so naming only `bintrail
+		// stream` lets those two operators read themselves out of it.
+		"`bintrail stream`",
+		"`bintrail up`",
+		"`bintrail-pg stream`",
+		// And it does not end until something restarts it. "capture falls
+		// behind while that happens" framed a process that exits and stays
+		// exited as a bounded dip.
+		"stays down until something restarts it",
+		"`bintrail-console watch` restarts from its last checkpoint",
 	} {
 		if !strings.Contains(pre, want) {
 			t.Errorf("the preamble does not name %q, so it does not say which binary recovers:\n%s", want, pre)

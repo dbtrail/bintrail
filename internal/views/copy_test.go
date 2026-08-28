@@ -3,6 +3,8 @@ package views
 import (
 	"strings"
 	"testing"
+
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 // TestHeader_saysAPeriodicRefreshNeverReachesThisFile is #1484.
@@ -19,12 +21,16 @@ func TestHeader_saysAPeriodicRefreshNeverReachesThisFile(t *testing.T) {
 		// The flag by name is the discriminator: without it the reader who
 		// takes baselines by hand and the reader whose daemon does it on a
 		// timer read the same sentence and only one of them is covered.
-		"--baseline-refresh-interval",
+		// With its binary: bintrail views is not where this flag lives.
+		"`bintrail-console watch --baseline-refresh-interval`",
 		// That the file does not follow it, and that nothing says so.
 		"no error",
 		"no warning",
 		// What to actually do about it.
-		"Regenerate this file",
+		// The remedy has to name the CADENCE. "Regenerate when convenient" is
+		// the same words and none of the point: the whole finding is that the
+		// refresh has a period and the file has to match it.
+		"Regenerate this file on the same schedule",
 	} {
 		if !strings.Contains(head, want) {
 			t.Errorf("the header does not say %q:\n%s", want, head)
@@ -34,13 +40,25 @@ func TestHeader_saysAPeriodicRefreshNeverReachesThisFile(t *testing.T) {
 
 // TestHeader_refreshNoteSurvivesAnEmptyBaseline: the note is part of the
 // header's standing description of what this file is, not a per-baseline
-// decoration. A file generated with --no-baselines that later gets a baseline
-// root must not be the one that carries no warning.
+// decoration, and it is worded so it stays TRUE with no state views ("any state
+// view below"). Gating it would add a branch whose only effect is to withhold
+// the warning.
+//
+// Both empty shapes, because they are different branches of the header:
+// --no-baselines skips resolveBaselineViews entirely and leaves BaselineSource
+// empty too, while a configured root with nothing under it renders "(none
+// discoverable under ...)". Zeroing only Baselines tests the second and reads
+// like it tests the first.
 func TestHeader_refreshNoteSurvivesAnEmptyBaseline(t *testing.T) {
-	in := goldenInput()
-	in.Baselines = nil
-	if !strings.Contains(header(Generate(in)), "--baseline-refresh-interval") {
-		t.Error("the refresh note disappeared when no baseline was discovered")
+	for name, in := range map[string]Input{
+		"--no-baselines":    func() Input { in := goldenInput(); in.Baselines, in.BaselineSource = nil, ""; return in }(),
+		"root with nothing": func() Input { in := goldenInput(); in.Baselines = nil; return in }(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(header(Generate(in)), "--baseline-refresh-interval") {
+				t.Error("the refresh note disappeared when no baseline was discovered")
+			}
+		})
 	}
 }
 
@@ -64,12 +82,20 @@ func TestGenerate_noEmDashesInTheGeneratedFile(t *testing.T) {
 	loopback.Host = "127.0.0.1"
 
 	shapes := map[string]Input{
-		"golden":            goldenInput(),
-		"no archives":       func() Input { in := goldenInput(); in.ArchiveSources = nil; return in }(),
-		"discovery failed":  func() Input { in := goldenInput(); in.ArchiveSources, in.ArchiveDiscoveryFailed = nil, true; return in }(),
-		"no baselines":      func() Input { in := goldenInput(); in.Baselines = nil; return in }(),
-		"region ambiguous":  func() Input { in := goldenInput(); in.RegionAmbiguous = true; return in }(),
-		"console download":  func() Input { in := goldenInput(); in.LiveLegUnavailable = true; return in }(),
+		"golden":           goldenInput(),
+		"no archives":      func() Input { in := goldenInput(); in.ArchiveSources = nil; return in }(),
+		"discovery failed": func() Input { in := goldenInput(); in.ArchiveSources, in.ArchiveDiscoveryFailed = nil, true; return in }(),
+		"no baselines":     func() Input { in := goldenInput(); in.Baselines = nil; return in }(),
+		"region ambiguous": func() Input { in := goldenInput(); in.RegionAmbiguous = true; return in }(),
+		"console download": func() Input { in := goldenInput(); in.LiveLegUnavailable = true; return in }(),
+		// The S3-compatible-store prose in writeS3Preamble is the one branch no
+		// other shape reaches, and an unrendered branch is exactly where a dash
+		// survives.
+		"s3 endpoint": func() Input {
+			in := goldenInput()
+			in.S3Endpoint = storage.S3Endpoint{URL: "https://minio.internal:9000", PathStyle: true}
+			return in
+		}(),
 		"live":              liveInput(live),
 		"live attributed":   liveInput(attributed),
 		"live disagreeing":  liveInput(disagreeing),

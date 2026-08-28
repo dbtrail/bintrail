@@ -282,22 +282,28 @@ func writeHeader(b *strings.Builder, in Input) {
 	b.WriteString("-- file again from the console) after taking or refreshing a baseline, and\n")
 	b.WriteString("-- whenever archive sources are added or removed.\n")
 	// The sentence above covers an operator who takes baselines by hand: the
-	// refresh is something they DO, so re-running this command is the next
-	// thing they do. It does not cover --baseline-refresh-interval, where the
-	// snapshot is published on a timer and nobody performs an action this
-	// advice can attach to (#1484). Naming the flag is what separates the two
-	// readers.
+	// refresh is something they DO, so regenerating is the next thing they do.
+	// It does not cover --baseline-refresh-interval, where the snapshot is
+	// published on a timer and nobody performs an action this advice can attach
+	// to (#1484). Naming the flag WITH its binary is what separates the two
+	// readers, and `bintrail views` is not that binary.
 	//
-	// Unconditional, like the paragraph above it: this is the file's standing
-	// description of what it is, and gating it on a baseline having been
-	// discovered would leave a file generated with --no-baselines as the one
-	// that carries no warning.
+	// Unconditional, and phrased so it stays true with no state views at all
+	// ("ANY state view below"): gating it would add a branch whose only effect
+	// is to withhold the warning, and the paragraph directly above is
+	// unconditional about the same views for the same reason. Neither asserts
+	// that a state view exists.
+	//
+	// "nothing regenerates this file", NOT "nothing re-runs this command": the
+	// console download is produced by a page, not a command, which is the same
+	// distinction Input.LiveLegUnavailable exists to make. The paragraph above
+	// already names both routes.
 	b.WriteString("--\n")
-	b.WriteString("-- A daemon set to refresh baselines on a timer (`--baseline-refresh-interval`)\n")
-	b.WriteString("-- publishes a new snapshot every interval, and nothing re-runs this command.\n")
-	b.WriteString("-- A state view below then goes on reading the snapshot it was generated\n")
-	b.WriteString("-- against, with no error and no warning: its rows just stop changing.\n")
-	b.WriteString("-- Regenerate this file on the same schedule that refresh runs on.\n")
+	b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
+	b.WriteString("-- publishes a new snapshot every interval, and nothing regenerates this file.\n")
+	b.WriteString("-- Any state view below stays bound to the snapshot it was generated against,\n")
+	b.WriteString("-- with no error and no warning: its rows just stop changing. Regenerate this\n")
+	b.WriteString("-- file on the same schedule that refresh runs on.\n")
 	b.WriteString("--\n")
 	b.WriteString("-- Nothing here writes: every view is a read over Parquet files you already own.\n")
 	b.WriteString("--\n")
@@ -493,9 +499,18 @@ func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
 // The consequence is worded from what the code does, not from that run: #1482
 // tagged the batch-INSERT deadline with indexer.ErrWriteDeadline, and
 // consoleapp/mainstream.go is the ONLY place that re-arms on it. So
-// `bintrail-console watch` restarts and replays from its checkpoint, and a
-// standalone `bintrail stream` still ends the run. Neither "capture stops" nor
-// "capture recovers" is true of both, so the note names the binary.
+// `bintrail-console watch` restarts and replays from its checkpoint, while
+// every standalone capture process ends the run: `bintrail stream`
+// (cliapp/stream.go, a bare streamrun.One), `bintrail up` (cliapp/up.go, which
+// delegates to the same runStream) and `bintrail-pg stream`
+// (cmd/bintrail-pg/stream.go, a bare pgstreamrun.One whose flush writes through
+// this same indexer). The note names the CLASS rather than one member, because
+// an `up` operator handed a sentence about `stream` reads themselves out of it.
+//
+// And the standalone case has no "while": the process exits and stays exited
+// until something outside it restarts it, which is the 41-minute outage
+// consoleapp/mainstream.go's own comment records. Wording it as capture
+// "falling behind while that happens" described a dip, not a stop.
 func writeLiveCaptureNote(b *strings.Builder) {
 	b.WriteString("-- SHARED WITH CAPTURE: this attaches the index bintrail writes captured\n")
 	b.WriteString("-- events into, so a query over the events view reads the server capture is\n")
@@ -504,12 +519,18 @@ func writeLiveCaptureNote(b *strings.Builder) {
 	b.WriteString("-- capture for that server's disk and buffer pool. One measured run: an\n")
 	b.WriteString("-- analytical query over a 15 million row binlog_events, and capture on that\n")
 	b.WriteString("-- server stopped minutes later. An index write that runs past its timeout\n")
-	b.WriteString("-- ends the run under `bintrail stream`, and restarts from the last checkpoint\n")
-	b.WriteString("-- under `bintrail-console watch`; capture falls behind either way while that\n")
-	b.WriteString("-- happens.\n")
-	b.WriteString("-- Keep the reads narrow (filter by time and table), or point HOST above at a\n")
-	b.WriteString("-- read replica of the index: the scan then lands off the instance capture\n")
-	b.WriteString("-- writes to, at the cost of that replica's own lag on top of capture lag.\n")
+	b.WriteString("-- ends the run in a standalone capture process (`bintrail stream`, `bintrail\n")
+	b.WriteString("-- up`, `bintrail-pg stream`), which then stays down until something restarts\n")
+	b.WriteString("-- it; `bintrail-console watch` restarts from its last checkpoint instead.\n")
+	b.WriteString("-- Capture is behind either way.\n")
+	// The remedy is the COST note's, not "filter the view": this same block has
+	// just said a filter does not reach the index, so advising one would
+	// contradict the sentence above it and send the reader to the one thing
+	// that cannot help.
+	b.WriteString("-- Two ways to keep it off capture: query `bintrail_live`.\"binlog_events\"\n")
+	b.WriteString("-- directly with your own WHERE, which does reach the index, or point HOST\n")
+	b.WriteString("-- above at a read replica, at the cost of that replica's own lag on top of\n")
+	b.WriteString("-- capture lag.\n")
 }
 
 // isLoopbackHost reports whether the generated ATTACH points at the generating

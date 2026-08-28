@@ -232,17 +232,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pool. In one measured run a query over a 15 million row live table was
   followed minutes later by capture stopping on that server. The flag help and
   a block next to the generated `ATTACH` now say it, along with what it costs
-  today: an index write that runs past its timeout ends the run under `bintrail
-  stream` and restarts from the last checkpoint under `bintrail-console watch`,
-  and capture falls behind either way while that happens. The way out is in the
-  same block: keep the reads narrow, or point `HOST` at a read replica of the
-  index, which moves the scan off the instance capture writes to at the cost of
-  that replica's own lag on top of capture lag. Second, each
+  today: an index write that runs past its timeout ends the run in a standalone
+  capture process (`bintrail stream`, `bintrail up`, `bintrail-pg stream`),
+  which then stays down until something restarts it, while `bintrail-console
+  watch` restarts from its last checkpoint instead. Capture is behind either
+  way. The way out is in the same block, and it is deliberately not "filter the
+  view", which that same block has just said does not reach the index: query the
+  attached `binlog_events` directly with your own `WHERE`, or point `HOST` at a
+  read replica, at the cost of that replica's own lag on top of capture lag.
+  Second, each
   `state_<schema>_<table>` view is written with one snapshot path, resolved
   when `bintrail views` ran. The header already said to regenerate after taking
   or refreshing a baseline, which covers someone who takes them by hand and
-  does not cover a daemon running `--baseline-refresh-interval`, where the
-  snapshot is published on a timer and nobody re-runs anything: seven snapshots
+  does not cover a daemon running `bintrail-console watch
+  --baseline-refresh-interval`, where the snapshot is published on a timer and
+  nobody regenerates anything: seven snapshots
   in forty minutes were ignored that way, with no error and no warning and
   numbers that simply stopped changing. The header and `docs/dump-and-baseline.md`
   now name that case and say to regenerate on the same schedule the refresh
