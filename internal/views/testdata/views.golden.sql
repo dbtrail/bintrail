@@ -38,11 +38,17 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 -- union_by_name is required, not cosmetic: archives written before a column
 -- existed simply lack it, and those files must read back with NULLs rather
 -- than failing the whole scan. A column absent from EVERY archived file is
--- still an error — drop it from the SELECT if you hit that on an old archive.
+-- still an error: drop it from the SELECT if you hit that on an old archive.
+--
+-- SCOPE: these are the ARCHIVED events only. Partitions rotation has not
+-- archived yet exist solely in the index, so the most recent window is
+-- absent here and reads as if nothing happened.
+-- Add a leg over the index by regenerating with --include-live:
+--   bintrail views --index-dsn ... --include-live
 CREATE OR REPLACE VIEW "events" AS
   SELECT
     "bintrail_id", "event_date", "event_hour",
-    "event_id",
+    CAST("event_id" AS BIGINT) AS "event_id",
     "binlog_file",
     "start_pos",
     "end_pos",
@@ -51,7 +57,7 @@ CREATE OR REPLACE VIEW "events" AS
     "connection_id",
     "schema_name",
     "table_name",
-    "event_type" AS "event_type_code",
+    CAST("event_type" AS INTEGER) AS "event_type_code",
     CASE "event_type"
       WHEN 1 THEN 'INSERT'
       WHEN 2 THEN 'UPDATE'
@@ -62,7 +68,7 @@ CREATE OR REPLACE VIEW "events" AS
     "changed_columns",
     "row_before",
     "row_after",
-    "schema_version",
+    CAST("schema_version" AS INTEGER) AS "schema_version",
     "query_text",
     "query_hash",
     "commit_ts_us",
@@ -81,7 +87,7 @@ CREATE OR REPLACE VIEW "events" AS
 --
 -- These are the SNAPSHOT's rows, not the table's current state: changes after
 -- the snapshot live in `events` above. To materialize a later point in time,
--- use `bintrail reconstruct` — folding the deltas back onto a baseline is what
+-- use `bintrail reconstruct`. Folding the deltas back onto a baseline is what
 -- that command does, and it is not expressible as a view.
 CREATE OR REPLACE VIEW "state_legacy_db_audit_log" AS
   SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/Legacy-DB/Audit Log.parquet');
