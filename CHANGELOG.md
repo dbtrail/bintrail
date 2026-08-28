@@ -15,16 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build) each ran in a goroutine with no crash guard, so an internal error in
   any of them killed the daemon and stopped replication capture. The docs
   promise the opposite: a backup that stopped refreshing is a degradation, a
-  daemon that stopped capturing is an outage. Each job now contains its own
-  crash: the daemon keeps capturing, the run is reported as failed on the
-  Backups page with the error, and the stack goes to the daemon log at error
-  level so the cause is still recoverable. It is contained, not hidden. A job
-  that already published its snapshot before the error is left reported as
-  succeeded, because the snapshot is on disk. The four jobs share one lock per
-  server, so the failed state also frees that lock, where a crashed goroutine
-  used to leave the server stuck as busy and refuse every later backup job for
-  it. One thing to know: a run that ends this way leaves no row in the Backups
-  page's run history, so read its status card and the daemon log for it.
+  daemon that stopped capturing is an outage. Two layers now contain it. An
+  internal error while rebuilding one table is recorded against that table, the
+  other tables carry on, and the run fails without publishing, exactly as it
+  would for any other unusable table. An internal error anywhere else in the
+  job marks the run failed on the Backups page. Either way the daemon keeps
+  capturing and the stack goes to the daemon log at error level, so the cause
+  is still there to read. It is contained, not hidden. A job that already
+  published its snapshot before the error is left reported as succeeded,
+  because the snapshot is on disk. The four jobs share one lock per server, so
+  the failed state also frees that lock, where a crashed goroutine used to
+  leave the server stuck as busy and refuse every later backup job for it.
+  Two things to know: a run whose error lands outside the table rebuild leaves
+  no row in the Backups page's run history, so read its status card and the
+  daemon log for it; and the manual Create-baseline button converts mydumper's
+  output table by table, where an internal error still stops the daemon.
+  Everything the CLI did before is unchanged apart from where the stack is
+  printed: `bintrail reconstruct` and `baseline refresh` still exit non-zero,
+  and now log the stack instead of dying on it.
 - **The console daemon's background folds are bounded, and their volume warning
   works** (#1477). `bintrail-console watch` rebuilds snapshots in the same
   process that captures binlogs, for the scheduled baseline refresh, the

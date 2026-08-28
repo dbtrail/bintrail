@@ -21,8 +21,15 @@ const (
 )
 
 // statusSlotLocked returns the status map a job kind publishes to. Callers
-// must hold s.mu. An unknown kind returns nil, which the one caller handles;
-// a nil map also reads as "no entry", so nothing here can panic on it.
+// must hold s.mu.
+//
+// The default arm is not defensive filler. A fifth job kind added without a
+// case here would compile (the kind is a string), and its panicking runs would
+// then keep their slot at "running" forever, which wedges the single-flight
+// ALL FOUR existing kinds share for that server. Nothing else would notice, so
+// the arm says it out loud. Never panic here: this runs inside a deferred
+// recover, where a second panic is uncatchable and would kill the daemon that
+// the guard exists to keep alive.
 func (s *baselineSupervisor) statusSlotLocked(kind baselineJobKind) map[string]*console.BaselineStatus {
 	switch kind {
 	case baselineJobDump:
@@ -33,8 +40,12 @@ func (s *baselineSupervisor) statusSlotLocked(kind baselineJobKind) map[string]*
 		return s.restores
 	case baselineJobExport:
 		return s.exports
+	default:
+		slog.Error("baseline supervisor: job kind has no status slot, so its failure cannot be recorded "+
+			"and this server's backup jobs will stay blocked until the daemon restarts. This is a bug: "+
+			"add the kind to statusSlotLocked.", "kind", string(kind))
+		return nil
 	}
-	return nil
 }
 
 // recoverBaselineJob is the panic guard every baselineSupervisor job goroutine
@@ -46,11 +57,19 @@ func (s *baselineSupervisor) statusSlotLocked(kind baselineJobKind) map[string]*
 // unrecovered panic in a background baseline job stops replication capture. A
 // baseline that stopped refreshing is a degradation, a daemon that stopped
 // capturing is an outage, and the first must never cause the second
-// (docs/dump-and-baseline.md states that as a guarantee). The reachable
-// surface is not small: these jobs fold through reconstruct and DuckDB over
-// Parquet whose schema came from a customer's CREATE TABLE. Mirrors
+// (docs/dump-and-baseline.md states that as a guarantee). Mirrors
 // verifySupervisor's guard, which is the same hazard on the neighbouring
 // supervisor.
+//
+// SCOPE, because recover() is per-goroutine and this one is easy to over-read:
+// it covers the JOB goroutine only. The fold itself fans out one goroutine per
+// table, and a panic in one of those is invisible here however well this is
+// written. That half is guarded at its own fan-out by
+// reconstruct.recoverTableFold, and it is the bigger surface: it decodes a
+// customer's Parquet through DuckDB. What THIS guard covers is the job's own
+// frames around that fan-out: the snapshot lookup, the staging and build-
+// directory setup, mydumper's privilege preflight, the history append, and the
+// status tail.
 //
 // Swallowing the panic quietly would trade a loud outage for a silent
 // degradation, which is worse. So two things happen here, and BOTH are
@@ -91,9 +110,12 @@ func (s *baselineSupervisor) recoverBaselineJob(kind baselineJobKind, serverID, 
 	// debug.Stack() here still walks the panicking frames: the deferred
 	// function runs on top of them, so the stack names where the panic came
 	// from and not just this guard.
+	// Logged BEFORE the status write, and unconditionally, so that no path
+	// below can recover a panic and leave no trace of it. It claims only what
+	// is already true at this point: the process is alive. Whether the job's
+	// slot could be freed is decided below, so the line does not promise it.
 	slog.Error(string(kind)+": the job hit an internal error and stopped. Capture and the console keep "+
-		"running, and this server's other backup jobs stay available. Please report this with the "+
-		"stack recorded here.",
+		"running. Please report this with the stack recorded here.",
 		"server", serverName, "id", serverID, "panic", r, "stack", string(debug.Stack()))
 
 	s.mu.Lock()

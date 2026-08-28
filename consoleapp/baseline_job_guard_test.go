@@ -147,13 +147,16 @@ func TestBaselineJobGoroutines_survivePanicAndReportFailure(t *testing.T) {
 			writeFakeSnapshot(t, baselineDir)
 			sup := newBaselineSupervisor(context.Background(), t.TempDir(), baseline.DefaultLockMode)
 
-			restore := tc.inject(sentinel)
+			// Deferred, not restored inline: waitForTerminalState below can
+			// end the subtest with t.Fatalf, and an inline restore after it
+			// would then never run, leaving the seam replaced for every later
+			// test in this package.
+			defer tc.inject(sentinel)()
+
 			if err := tc.trigger(sup, serverID, baselineDir); err != nil {
-				restore()
 				t.Fatalf("trigger: %v", err)
 			}
 			st := waitForTerminalState(t, func() console.BaselineStatus { return tc.read(sup, serverID) })
-			restore()
 
 			if st.State != "failed" {
 				t.Errorf("state = %q, want failed: a job whose goroutine died must not report anything else", st.State)
@@ -248,6 +251,26 @@ func TestRecoverBaselineJob_passesThroughWithoutAPanic(t *testing.T) {
 
 	if got := sup.Status("a"); got.State != "running" {
 		t.Fatalf("state = %q, want running: the guard touched a job that never panicked", got.State)
+	}
+}
+
+// TestRecoverBaselineJob_survivesAnUnregisteredJobKind: the guard runs inside
+// a deferred recover, where a SECOND panic cannot be caught and would kill the
+// daemon this whole change exists to keep alive. So an unknown job kind, which
+// a fifth job added without a statusSlotLocked case would produce, has to be
+// survivable rather than an assertion. It is reported in the log either way,
+// since the guard logs before it looks the slot up.
+func TestRecoverBaselineJob_survivesAnUnregisteredJobKind(t *testing.T) {
+	sup := newBaselineSupervisor(context.Background(), t.TempDir(), baseline.DefaultLockMode)
+
+	func() {
+		defer sup.recoverBaselineJob(baselineJobKind("a kind nobody registered"), "a", "srv")
+		panic("raised by an unregistered job kind")
+	}()
+
+	// Reached only if the guard neither panicked again nor deadlocked.
+	if got := sup.RefreshStatus("a"); got.State != "idle" {
+		t.Fatalf("state = %q, want idle: the guard wrote into a slot the kind does not own", got.State)
 	}
 }
 

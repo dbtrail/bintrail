@@ -303,6 +303,12 @@ func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tabl
 // below the `go` in each Trigger is drivable, which is exactly the gap #1472
 // was: the panic guard on these goroutines would have had no test that reaches
 // past the dispatch.
+//
+// Written by tests only, like checkMydumperPrivileges. Production never
+// reassigns it, so the job goroutines only ever read it. A test that replaces
+// it must not restore it until the job it started has reached a terminal
+// state: the jobs run in their own goroutines, and restoring while one is
+// still folding is a data race on this variable.
 var foldTables = reconstruct.ReconstructTablesDetailed
 
 // foldOutcome is everything foldSnapshot decides once the fold has run, split
