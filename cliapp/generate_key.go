@@ -36,11 +36,18 @@ func init() {
 	rootCmd.AddCommand(generateKeyCmd)
 }
 
-// defaultKeyPath returns ~/.config/bintrail/dump.key.
+// defaultKeyPath returns ~/.config/bintrail/dump.key. With no home directory
+// the fallback anchors in the working directory EXPLICITLY: filepath.Join(".",
+// ...) Cleans the leading "." away and yields a RELATIVE path, which resolves
+// against wherever the process happens to be (#1487).
 func defaultKeyPath() string {
 	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".", ".config", "bintrail", "dump.key")
+	if err != nil || home == "" {
+		wd, wdErr := os.Getwd()
+		if wdErr != nil {
+			return filepath.Join(".config", "bintrail", "dump.key")
+		}
+		home = wd
 	}
 	return filepath.Join(home, ".config", "bintrail", "dump.key")
 }

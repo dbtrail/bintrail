@@ -187,14 +187,12 @@ type Registry struct {
 	readOnly bool
 }
 
-// DefaultRegistryPath returns ~/.config/bintrail/console-servers.yaml,
-// mirroring generate-key's defaultKeyPath fallback behavior.
+// DefaultRegistryPath returns ~/.config/bintrail/console-servers.yaml, with
+// configPath's working-directory fallback for homeless environments. The
+// verify and baseline run histories are named as siblings of this path, so
+// they inherit whatever it resolves to.
 func DefaultRegistryPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".", ".config", "bintrail", "console-servers.yaml")
-	}
-	return filepath.Join(home, ".config", "bintrail", "console-servers.yaml")
+	return configPath("console-servers.yaml")
 }
 
 // LoadRegistry reads the registry file at path. A missing or empty file is an

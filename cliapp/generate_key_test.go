@@ -137,3 +137,19 @@ func TestDefaultKeyPath(t *testing.T) {
 		t.Errorf("unexpected default key path: %s", p)
 	}
 }
+
+// TestDefaultKeyPathIsAbsoluteWithoutHome pins the same #1487 defect on the
+// CLI's key path: with no HOME the fallback must still be absolute, or
+// `bintrail generate-key` writes into (and later reads from) whatever working
+// directory it was launched in.
+//
+// Not parallel: t.Setenv.
+func TestDefaultKeyPathIsAbsoluteWithoutHome(t *testing.T) {
+	// os.UserHomeDir errors on an EMPTY value, not only on an unset one.
+	t.Setenv("HOME", "")
+	t.Setenv("USERPROFILE", "") // its source on Windows
+
+	if p := defaultKeyPath(); !filepath.IsAbs(p) {
+		t.Errorf("defaultKeyPath() = %q with no HOME; want an absolute path", p)
+	}
+}

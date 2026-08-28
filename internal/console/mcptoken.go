@@ -74,13 +74,9 @@ type MCPTokenFile struct {
 var mcpTokenFileMu sync.Mutex
 
 // DefaultMCPTokenPath returns ~/.config/bintrail/console-mcp-token.yaml, with
-// the same relative fallback as DefaultAuthPath for homeless environments.
+// the same homeless fallback as DefaultAuthPath (see configPath).
 func DefaultMCPTokenPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".", ".config", "bintrail", "console-mcp-token.yaml")
-	}
-	return filepath.Join(home, ".config", "bintrail", "console-mcp-token.yaml")
+	return configPath("console-mcp-token.yaml")
 }
 
 // LoadMCPTokenFile reads the managed-token file at path. A missing file
