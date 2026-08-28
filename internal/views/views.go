@@ -293,7 +293,7 @@ func writeHeader(b *strings.Builder, in Input) {
 	case in.ArchiveDiscoveryFailed:
 		b.WriteString("--   (could not be read from archive_state; the console log has the error)\n")
 	case len(in.ArchiveSources) == 0:
-		b.WriteString("--   (none registered in archive_state — no rotated partitions have been archived yet)\n")
+		b.WriteString("--   (none registered in archive_state: no rotated partitions have been archived yet)\n")
 	}
 	for _, s := range in.ArchiveSources {
 		fmt.Fprintf(b, "--   %s\n", s)
@@ -301,7 +301,7 @@ func writeHeader(b *strings.Builder, in Input) {
 	b.WriteString("-- Baseline snapshot:\n")
 	switch {
 	case len(in.Baselines) == 0 && in.BaselineSource == "":
-		b.WriteString("--   (no baseline source given — pass --baseline-dir or --baseline-s3)\n")
+		b.WriteString("--   (no baseline source given: pass --baseline-dir or --baseline-s3)\n")
 	case len(in.Baselines) == 0:
 		fmt.Fprintf(b, "--   (none discoverable under %s)\n", in.BaselineSource)
 	default:
@@ -813,7 +813,7 @@ func writeStateViews(b *strings.Builder, in Input) {
 	b.WriteString("--\n")
 	b.WriteString("-- These are the SNAPSHOT's rows, not the table's current state: changes after\n")
 	b.WriteString("-- the snapshot live in `events` above. To materialize a later point in time,\n")
-	b.WriteString("-- use `bintrail reconstruct` — folding the deltas back onto a baseline is what\n")
+	b.WriteString("-- use `bintrail reconstruct`. Folding the deltas back onto a baseline is what\n")
 	b.WriteString("-- that command does, and it is not expressible as a view.\n")
 	if len(in.Baselines) == 0 {
 		b.WriteString("-- (skipped: no baseline snapshot was discovered)\n")

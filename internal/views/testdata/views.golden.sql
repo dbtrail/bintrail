@@ -87,7 +87,7 @@ CREATE OR REPLACE VIEW "events" AS
 --
 -- These are the SNAPSHOT's rows, not the table's current state: changes after
 -- the snapshot live in `events` above. To materialize a later point in time,
--- use `bintrail reconstruct` — folding the deltas back onto a baseline is what
+-- use `bintrail reconstruct`. Folding the deltas back onto a baseline is what
 -- that command does, and it is not expressible as a view.
 CREATE OR REPLACE VIEW "state_legacy_db_audit_log" AS
   SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/Legacy-DB/Audit Log.parquet');
