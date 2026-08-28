@@ -112,9 +112,21 @@ Indexed events go into `binlog_events`, range-partitioned by hour on
 `event_timestamp`. PK lookups are fast because `pk_hash`
 (`SHA2(pk_values, 256)`) is a stored, indexed column; queries match on
 `pk_hash` **and** the exact `pk_values` (the second check guards against the
-astronomically rare hash collision). `pk_values` is the pipe-delimited PK in
-column ordinal order; a PK value whose raw bytes are not valid UTF-8 (e.g. a
-`BINARY(16)` UUID) is stored as `0x` + uppercase hex — see
+astronomically rare hash collision).
+
+Matching those two columns is what makes the answer *correct*; it is not what
+makes it *fast*. The index is `idx_pk_hash (schema_name, table_name, pk_hash,
+event_timestamp)`, so `schema_name` and `table_name` have to be in the
+predicate too or the index cannot be used at all. A lookup naming only
+`pk_hash` and `pk_values` falls back to a full table scan, which on a
+multi-million-row `binlog_events` is seconds per query rather than
+milliseconds. `EXPLAIN` shows the difference immediately: `type: ref` with
+`key: idx_pk_hash` when the leading columns are present, `type: ALL` when they
+are not.
+
+`pk_values` is the pipe-delimited PK in column ordinal order; a PK value
+whose raw bytes are not valid UTF-8 (e.g. a `BINARY(16)` UUID) is stored as
+`0x` + uppercase hex — see
 [Binary primary keys](query-and-recovery.md#binary-primary-keys-the-0x-hex-spelling)
 for how to spell it in `--pk` lookups. Partition lifecycle, retention, and
 archiving to Parquet are covered in [Rotation and status](rotation-and-status.md).
