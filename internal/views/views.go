@@ -523,10 +523,13 @@ func writeEventsView(b *strings.Builder, in Input) {
 		b.WriteString("   WHERE NOT EXISTS (SELECT 1 FROM cold WHERE cold.event_id = hot.event_id);\n\n")
 	case live:
 		b.WriteString("--\n")
-		b.WriteString("-- The index alone: no archive source is registered, so nothing has been\n")
-		b.WriteString("-- archived for this view to read. It covers whatever the index still holds,\n")
-		b.WriteString("-- and rotation dropping a partition removes those events from it — take a\n")
-		b.WriteString("-- baseline and archive before that matters, then regenerate this file.\n")
+		// "No archive source in this file", not "nothing has been archived":
+		// this branch is also where a registry that could not be READ lands,
+		// and the header is the one place that already distinguishes the two.
+		b.WriteString("-- The index alone: this file names no archive source to read from, and the\n")
+		b.WriteString("-- header above says why. It covers whatever the index still holds, and\n")
+		b.WriteString("-- rotation dropping a partition removes those events from it — archive and\n")
+		b.WriteString("-- take a baseline before that matters, then regenerate this file.\n")
 		writeLiveCostNote(b, false)
 		b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
 		writeEventSelect(b, in, true, "  ")
