@@ -35,6 +35,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comment, which events it does not cover and how to add them.
 
 ### Fixed
+- **The managed MCP token survives a container restart** (#1493). The token
+  minted from **Settings → Connect AI** is stored as a SHA-256 hash in a file
+  that had no path override, so it always resolved under `$HOME` inside the
+  image while the compose stack redirected every other piece of console state
+  onto the persistent volume. It therefore lived in the container's writable
+  layer and was destroyed by any `docker compose up` that recreated the
+  container. Nothing reported it: a missing token file is also what a console
+  that never had one looks like, so the daemon came up quiet and the AI client
+  you had configured got a 401 on every call with no server-side explanation.
+  The file now takes a path the same way the registry and the auth file
+  already did, `--mcp-token-file` / `BINTRAIL_CONSOLE_MCP_TOKEN` on
+  `bintrail-console serve` and `--console-mcp-token-file` on `watch`, and the
+  shipped `docker-compose.yml` points it at
+  `/var/lib/bintrail/console-mcp-token.yaml` in the `bintrail-state` volume.
+  What this means for an upgrade: **the default path did not move**, so a
+  console that uses it keeps reading the same file and no existing token is
+  affected. **On the compose stack, generate a new token once** after taking
+  the updated compose file. Its predecessor was already destroyed by the
+  recreation that upgrading performs, so there is nothing to migrate, and the
+  replacement is the first one that will still be there after the next
+  restart. Paste the new value into your AI client; the old one authenticates
+  nothing.
 - **`sum()` works on a money column in the generated DuckDB views** (#1486).
   MySQL `DECIMAL` and `NUMERIC` columns are stored as text in the baseline
   Parquet, so the `state_<schema>_<table>` views handed DuckDB a `VARCHAR` and

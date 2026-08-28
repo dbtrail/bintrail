@@ -199,6 +199,12 @@ Notes:
   copy-pasteable remediation in the logs and the container retries.
 - Saved console connections (the Servers menu) persist in the
   `bintrail-state` volume.
+- The managed MCP token (**Settings → Connect AI**) lives at
+  `/var/lib/bintrail/console-mcp-token.yaml` in the same volume, so an AI
+  client you connected keeps working across restarts. An older copy of this
+  compose file kept it inside the container, where recreating the container
+  wiped it: take the updated file and generate the token once more, and it
+  survives from then on.
 - `BINTRAIL_TAG` in `.env` pins the image version (default `latest`);
   building from a source checkout instead is a comment-toggle in the
   compose file (`build:` with `dockerfile: build/Dockerfile.bintrail-console`).
