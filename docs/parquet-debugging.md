@@ -65,7 +65,7 @@ If you point DuckDB at a baseline Parquet yourself instead of using the generate
 Binder Error: No function matches the given name and argument types 'sum(VARCHAR)'.
 ```
 
-The data is fine. bintrail stores those columns as text on purpose: MySQL allows up to `DECIMAL(65,30)`, Parquet and DuckDB both stop at 38 digits of precision, and picking a narrower type would silently drop digits from a value the operator chose that column to hold. Text is the only representation that holds every legal value.
+The data is fine. bintrail stores those columns as text on purpose. MySQL allows up to `DECIMAL(65,30)` while DuckDB stops at 38 digits of precision, so no single numeric type holds every value MySQL can, and picking a narrower one would silently drop digits from a value the operator chose that column to hold. The stored text is also what bintrail's own recovery paths join and compare on, byte for byte, against the value read out of the binlog.
 
 Cast it yourself, with the precision and scale from the source table:
 
@@ -73,7 +73,7 @@ Cast it yourself, with the precision and scale from the source table:
 SELECT sum(CAST(ol_amount AS DECIMAL(6,2))) FROM read_parquet('.../order_line.parquet');
 ```
 
-Or generate the views and let them do it. Two columns keep reading as text even in the generated views, and the file names each one and says why:
+Or generate the views and let them do it. Two cases still read as text even in the generated views, and the file names each affected column and says why:
 
 - A column wider than 38 digits has no DuckDB `DECIMAL` to be cast to. Cast it to `DOUBLE` if an approximate result answers your question.
 - A baseline taken before bintrail embedded the `CREATE TABLE` in the Parquet footer carries no column types to read. Re-take or refresh the baseline and the casts appear.

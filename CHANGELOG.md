@@ -19,9 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on baselines you already have: nothing about how a value is stored changed,
   and nothing needs re-taking. Text remains the storage form on purpose, and
   the reason is worth knowing before reaching for a wider type: MySQL allows
-  `DECIMAL(65,30)`, Parquet and DuckDB both stop at 38 digits, and the stored
-  text is also what the recovery paths join and compare on, byte for byte,
-  against the value read out of the binlog. Two cases still read as text, and
+  `DECIMAL(65,30)` while DuckDB stops at 38 digits, and the stored text is also
+  what the recovery paths join and compare on, byte for byte, against the value
+  read out of the binlog. Two cases still read as text, and
   the generated file now names each column and says why: a column wider than
   38 digits has no DuckDB `DECIMAL` to be cast to, and a baseline taken before
   bintrail embedded the `CREATE TABLE` in the footer carries no column types

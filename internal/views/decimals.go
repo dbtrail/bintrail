@@ -15,8 +15,8 @@ import (
 type DecimalColumn = baseline.DecimalColumn
 
 // The baseline writer stores every MySQL DECIMAL and NUMERIC as text, because
-// MySQL allows 65 digits of precision and no Parquet or DuckDB DECIMAL goes
-// past 38 (internal/baseline.MysqlToParquetNode has the full reasoning). That
+// MySQL allows 65 digits of precision and DuckDB stops at 38
+// (internal/baseline.MysqlToParquetNode has the full reasoning). That
 // choice is right for storage and wrong for the reader: a state view built with
 // a bare SELECT * hands DuckDB a VARCHAR, and the first aggregate anyone writes
 // against a money column fails with
