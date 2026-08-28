@@ -221,6 +221,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failures expire, since a blip is not a property of a bucket. When two buckets
   are each detected in a different region, nothing is pinned (one secret cannot
   name two) and the file says so.
+- **The generated DuckDB views say whose server the live leg reads, and that a
+  baseline refresh never reaches a file already generated** (#1483, #1484). Two
+  things the file left the reader to find out by measuring. First, `bintrail
+  views --include-live` adds a leg that opens a connection to the index and
+  scans `binlog_events`, while the other leg reads Parquet off disk or S3. The
+  file presented those as two halves of one view and neither the flag help nor
+  the generated header said the hot half is the index capture is writing to, so
+  a large analytical query contends with capture for the same disk and buffer
+  pool. In one measured run a query over a 15 million row live table was
+  followed minutes later by capture stopping on that server. The flag help and
+  a block next to the generated `ATTACH` now say it, along with what it costs
+  today: an index write that runs past its timeout ends the run under `bintrail
+  stream` and restarts from the last checkpoint under `bintrail-console watch`,
+  and capture falls behind either way while that happens. The way out is in the
+  same block: keep the reads narrow, or point `HOST` at a read replica of the
+  index, which moves the scan off the instance capture writes to at the cost of
+  that replica's own lag on top of capture lag. Second, each
+  `state_<schema>_<table>` view is written with one snapshot path, resolved
+  when `bintrail views` ran. The header already said to regenerate after taking
+  or refreshing a baseline, which covers someone who takes them by hand and
+  does not cover a daemon running `--baseline-refresh-interval`, where the
+  snapshot is published on a timer and nobody re-runs anything: seven snapshots
+  in forty minutes were ignored that way, with no error and no warning and
+  numbers that simply stopped changing. The header and `docs/dump-and-baseline.md`
+  now name that case and say to regenerate on the same schedule the refresh
+  runs on. The pinning itself is unchanged and deliberate, since a fixed
+  snapshot is what reproducible analysis wants, and the file already names the
+  snapshot it is bound to in its header and in every view's path, so which one
+  you have is readable without running anything. Making the views resolve the
+  newest snapshot themselves was considered and rejected: the decimal casts are
+  built from each file's Parquet footer read at generation time, so a view that
+  silently moved to a newer file would cast a changed precision wrong or fail
+  to bind on a dropped column; snapshot completeness is a `_SUCCESS` marker
+  rather than something a path expresses, and snapshots taken before that
+  marker existed are complete without one; and per-view resolution would let a
+  join between two state views land on two different snapshots when a refresh
+  publishes mid-query, which is a state that never existed. Text only: no
+  generated view's behaviour changed, and files you already have keep working.
 
 ### Added
 - **S3-compatible object stores (MinIO, Wasabi, LocalStack) for every S3

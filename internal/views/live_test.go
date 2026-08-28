@@ -461,3 +461,94 @@ func eventsComment(out string) string {
 	}
 	return out[start : start+end]
 }
+
+// livePreamble returns the block between the live setup title and the ATTACH
+// that closes it, so an assertion about what the preamble SAYS cannot pass on a
+// sentence somewhere else in the file.
+//
+// It returns the block as PROSE: comment markers stripped and the lines joined,
+// so an assertion is about the sentence and not about where the copy happens to
+// wrap. Asserting on raw bytes makes every reflow a test failure and quietly
+// invites the next person to soften the sentence to fit a line.
+func livePreamble(out string) string {
+	start := strings.Index(out, "-- Live index setup")
+	if start < 0 {
+		return ""
+	}
+	block := out[start:]
+	if end := strings.Index(block, "ATTACH '' AS"); end >= 0 {
+		block = block[:end]
+	}
+	var words []string
+	for _, line := range strings.Split(block, "\n") {
+		words = append(words, strings.Fields(strings.TrimPrefix(strings.TrimSpace(line), "--"))...)
+	}
+	return strings.Join(words, " ")
+}
+
+// TestLivePreamble_saysTheReadLandsOnTheCaptureIndex is #1483.
+//
+// The cold leg opens Parquet on disk or in an object store; this one opens a
+// connection to the index a running bintrail is writing captured events into.
+// The file presented the two as halves of one view, and an operator who ran an
+// analytical query over the hot leg had no signal that it lands on the server
+// capture depends on.
+func TestLivePreamble_saysTheReadLandsOnTheCaptureIndex(t *testing.T) {
+	shapes := map[string]Input{
+		"archives and index": liveInput(liveIdx()),
+		"index alone":        func() Input { in := liveInput(liveIdx()); in.ArchiveSources = nil; return in }(),
+	}
+	for name, in := range shapes {
+		t.Run(name, func(t *testing.T) {
+			pre := livePreamble(Generate(in))
+			for _, want := range []string{
+				// Whose server this is. Without it the two legs read as
+				// interchangeable halves of one view.
+				"SHARED WITH CAPTURE:",
+				"the index bintrail writes captured events",
+				// Why a query here is never small.
+				"full scan of binlog_events",
+				// What it does to capture, which is the whole point.
+				"competes with capture",
+				// The way out. Naming only the cost and no remedy leaves the
+				// reader with a warning they cannot act on.
+				"read replica",
+			} {
+				if !strings.Contains(pre, want) {
+					t.Errorf("the preamble does not say %q:\n%s", want, pre)
+				}
+			}
+		})
+	}
+}
+
+// TestLivePreamble_capturePriceIsTrueAfter1482: the daemon restarts on an index
+// write deadline now instead of exiting, and only consoleapp/mainstream.go
+// re-arms. Saying capture "stops" would overstate it for `bintrail-console
+// watch`; saying it always recovers would overstate it for `bintrail stream`.
+func TestLivePreamble_capturePriceIsTrueAfter1482(t *testing.T) {
+	pre := livePreamble(Generate(liveInput(liveIdx())))
+	for _, want := range []string{
+		"ends the run under `bintrail stream`",
+		"restarts from the last checkpoint",
+		"`bintrail-console watch`",
+	} {
+		if !strings.Contains(pre, want) {
+			t.Errorf("the preamble does not name %q, so it does not say which binary recovers:\n%s", want, pre)
+		}
+	}
+}
+
+// TestNoLiveIndex_noCaptureNote: the archives-only file attaches nothing and
+// reads no index, so a warning about competing with capture there would be
+// false. This is what keeps the note out of a block shared with the cold leg.
+func TestNoLiveIndex_noCaptureNote(t *testing.T) {
+	for name, out := range map[string]string{
+		"archives only": Generate(liveInput(nil)),
+		"GenerateViews": GenerateViews(liveInput(liveIdx())),
+	} {
+		if strings.Contains(out, "SHARED WITH CAPTURE") {
+			t.Errorf("%s: warns about a capture index it never reads:\n%s", name, out)
+		}
+	}
+}

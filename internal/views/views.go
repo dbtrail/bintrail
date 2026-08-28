@@ -281,6 +281,23 @@ func writeHeader(b *strings.Builder, in Input) {
 	b.WriteString("-- state views point at ONE snapshot. Re-run `bintrail views` (or download the\n")
 	b.WriteString("-- file again from the console) after taking or refreshing a baseline, and\n")
 	b.WriteString("-- whenever archive sources are added or removed.\n")
+	// The sentence above covers an operator who takes baselines by hand: the
+	// refresh is something they DO, so re-running this command is the next
+	// thing they do. It does not cover --baseline-refresh-interval, where the
+	// snapshot is published on a timer and nobody performs an action this
+	// advice can attach to (#1484). Naming the flag is what separates the two
+	// readers.
+	//
+	// Unconditional, like the paragraph above it: this is the file's standing
+	// description of what it is, and gating it on a baseline having been
+	// discovered would leave a file generated with --no-baselines as the one
+	// that carries no warning.
+	b.WriteString("--\n")
+	b.WriteString("-- A daemon set to refresh baselines on a timer (`--baseline-refresh-interval`)\n")
+	b.WriteString("-- publishes a new snapshot every interval, and nothing re-runs this command.\n")
+	b.WriteString("-- A state view below then goes on reading the snapshot it was generated\n")
+	b.WriteString("-- against, with no error and no warning: its rows just stop changing.\n")
+	b.WriteString("-- Regenerate this file on the same schedule that refresh runs on.\n")
 	b.WriteString("--\n")
 	b.WriteString("-- Nothing here writes: every view is a read over Parquet files you already own.\n")
 	b.WriteString("--\n")
@@ -458,8 +475,41 @@ func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
 		b.WriteString("-- entirely plausible rows from a different index. Change HOST to a name that\n")
 		b.WriteString("-- resolves from where you run this.\n")
 	}
+	writeLiveCaptureNote(b)
 	fmt.Fprintf(b, "ATTACH '' AS %s (TYPE mysql, SECRET %s, READ_ONLY);\n\n",
 		quoteIdent(liveAttachAlias), quoteIdent(liveSecretName))
+}
+
+// writeLiveCaptureNote says WHOSE server the hot leg reads, next to the ATTACH
+// that opens it.
+//
+// The two legs are not two halves of one thing (#1483). The cold leg opens
+// Parquet files on disk or in an object store, which competes with nothing; this
+// one opens a connection to the index a running bintrail is writing captured
+// events into. In the run that prompted this, an analytical query scanned a 15M
+// row live binlog_events and capture on that server stopped minutes later, and
+// the person writing the query had no signal that this was a possibility.
+//
+// The consequence is worded from what the code does, not from that run: #1482
+// tagged the batch-INSERT deadline with indexer.ErrWriteDeadline, and
+// consoleapp/mainstream.go is the ONLY place that re-arms on it. So
+// `bintrail-console watch` restarts and replays from its checkpoint, and a
+// standalone `bintrail stream` still ends the run. Neither "capture stops" nor
+// "capture recovers" is true of both, so the note names the binary.
+func writeLiveCaptureNote(b *strings.Builder) {
+	b.WriteString("-- SHARED WITH CAPTURE: this attaches the index bintrail writes captured\n")
+	b.WriteString("-- events into, so a query over the events view reads the server capture is\n")
+	b.WriteString("-- writing to. The view cannot push your filter down to it (see COST below),\n")
+	b.WriteString("-- so every query is a full scan of binlog_events, and a big one competes with\n")
+	b.WriteString("-- capture for that server's disk and buffer pool. One measured run: an\n")
+	b.WriteString("-- analytical query over a 15 million row binlog_events, and capture on that\n")
+	b.WriteString("-- server stopped minutes later. An index write that runs past its timeout\n")
+	b.WriteString("-- ends the run under `bintrail stream`, and restarts from the last checkpoint\n")
+	b.WriteString("-- under `bintrail-console watch`; capture falls behind either way while that\n")
+	b.WriteString("-- happens.\n")
+	b.WriteString("-- Keep the reads narrow (filter by time and table), or point HOST above at a\n")
+	b.WriteString("-- read replica of the index: the scan then lands off the instance capture\n")
+	b.WriteString("-- writes to, at the cost of that replica's own lag on top of capture lag.\n")
 }
 
 // isLoopbackHost reports whether the generated ATTACH points at the generating

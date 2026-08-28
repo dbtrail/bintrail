@@ -7,6 +7,12 @@
 -- file again from the console) after taking or refreshing a baseline, and
 -- whenever archive sources are added or removed.
 --
+-- A daemon set to refresh baselines on a timer (`--baseline-refresh-interval`)
+-- publishes a new snapshot every interval, and nothing re-runs this command.
+-- A state view below then goes on reading the snapshot it was generated
+-- against, with no error and no warning: its rows just stop changing.
+-- Regenerate this file on the same schedule that refresh runs on.
+--
 -- Nothing here writes: every view is a read over Parquet files you already own.
 --
 -- Archive sources (an archive registered with both a local path and an S3
