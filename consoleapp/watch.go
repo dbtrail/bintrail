@@ -777,7 +777,7 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	streamCfg := watchStreamConfig(serverID)
 	ext.RunSourceJobs(ctx, mainSourceJobInfo(upSourceDSN, upIndexDSN, streamCfg.Flavor))
 
-	streamErr := streamrun.One(ctx, streamCfg)
+	streamErr := runMainStreamWithWriteDeadlineRetry(ctx, streamCfg)
 	stop()                // drain the console even if the stream returned without a signal
 	<-consoleDone         // order the console goroutine's exit before the deferred db.Close()
 	stopFlashback()       // drain the flashback port before the deferred db.Close()
