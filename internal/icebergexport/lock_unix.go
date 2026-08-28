@@ -3,6 +3,7 @@
 package icebergexport
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -17,7 +18,10 @@ func lockWarehouse(path string) (func(), error) {
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("another Iceberg export is running on this warehouse (lock %s is held): %w", path, err)
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("another Iceberg export is running on this warehouse (lock %s is held): %w", path, err)
+		}
+		return nil, fmt.Errorf("lock warehouse %s: %w", path, err)
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)

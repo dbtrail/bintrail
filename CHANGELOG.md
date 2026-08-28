@@ -17,15 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   properties in the same commit as the data, so nothing is written to the index
   and a run that dies before committing resumes from the previous snapshot.
   Refuses per table, with `baseline refresh`'s vocabulary, on a capture gap,
-  a schema change or a destructive DDL in the window; refuses tables without a
-  primary key or with a BIT column, and an index that holds more than one
-  source. DuckDB, Spark, Trino and Athena read the result. See
-  docs/iceberg-export.md.
+  skipped events, a cut behind the cursor, a schema or type change or a
+  destructive DDL in the window; refuses tables without a primary key or with
+  a BIT column, and an index that holds more than one source. Every commit is
+  audited as `cli/export.iceberg`. DuckDB and Spark read the directory
+  directly; Trino, Athena and Snowflake read it once registered in their
+  catalog. See docs/iceberg-export.md.
 - Guard `cliapp/icebergfree_test.go`: the Iceberg and Arrow libraries are
-  linked by `internal/icebergexport` alone. The guarded set is derived from
-  `go list` over the module minus a three-entry allowlist, so a new package is
-  guarded the day it appears; the console, MCP and pg binaries must never link
-  either library. Records the #1467 decision mechanically: Iceberg is an
+  imported only by `internal/icebergexport`, and only that package, the
+  `cliapp` root and `cmd/bintrail` may link them. The guarded set is derived
+  from `go list` over the module minus that three-entry allowlist, so a new
+  package is guarded the day it appears; the console, MCP and pg binaries are
+  pinned free of both. Records the #1467 decision mechanically: Iceberg is an
   output, not the storage layer.
 
 ## [0.70.0] - 2026-08-28

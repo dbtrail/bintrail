@@ -121,11 +121,7 @@ func TestColumnsFromSchema_roundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	types := map[string]baseline.Column{}
-	for _, c := range src {
-		types[c.Name] = c
-	}
-	back, err := columnsFromSchema(icebergSchema(cols), types)
+	back, err := columnsFromSchema(icebergSchema(cols))
 	if err != nil {
 		t.Fatal(err)
 	}

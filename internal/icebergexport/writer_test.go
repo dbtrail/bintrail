@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/iceberg-go/catalog"
@@ -80,10 +79,15 @@ func foldOps(t *testing.T, pk []metadata.ColumnMeta, evs ...query.ResultRow) []*
 
 func commit(t *testing.T, tbl *table.Table, cols []column, ops []*netOp, cur cursor) *table.Table {
 	t.Helper()
-	out, err := writeDelta(context.Background(), memory.DefaultAllocator, tbl, cols, ops, nil, cur)
+	// A checked allocator: every batch the appender hands to iceberg-go must
+	// be released by it, or the parameter is decoration and a leak per batch
+	// goes unseen in a long load.
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	out, err := writeDelta(context.Background(), mem, tbl, cols, ops, nil, cur)
 	if err != nil {
 		t.Fatalf("writeDelta: %v", err)
 	}
+	mem.AssertSize(t, 0)
 	return out
 }
 
@@ -345,5 +349,3 @@ func TestWriteDelta_hotKeyUpdatedManyTimesIsOneRow(t *testing.T) {
 	ddb := openDuckDBIceberg(t)
 	equalRows(t, "duckdb", duckRows(t, ddb, tbl.Location()), []string{"1=v50"})
 }
-
-var _ = arrow.PrimitiveTypes.Int64

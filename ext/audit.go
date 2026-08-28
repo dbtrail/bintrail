@@ -21,9 +21,11 @@ import (
 //     reconstruct.run, verify.explain, drill.run, and
 //     export.iceberg (every row of a table and every later
 //     change to it, written to an Iceberg table; emitted per
-//     table after its commit is durable). bintrail-pg shares
-//     the internal/cli command implementations and so
-//     reports the same "cli" surface; there is no "pg" surface.
+//     COMMIT, right after it is durable; cmd/bintrail only, it
+//     is registered from cliapp and bintrail-pg does not have
+//     it). bintrail-pg shares the internal/cli command
+//     implementations and so reports the same "cli" surface;
+//     there is no "pg" surface.
 //   - "mcp"     — query.run, recover.generate, recover.cascade,
 //     reconstruct.row (internal/mcptools; the console's /mcp
 //     endpoint reuses the same handlers with Surface "console").

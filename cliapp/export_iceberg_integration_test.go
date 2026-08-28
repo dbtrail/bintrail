@@ -50,8 +50,11 @@ func TestIntegrationAuditContract_ExportIceberg(t *testing.T) {
 		Metadata: map[string]string{
 			baseline.MetaKeyCreateTableSQL: createSQL,
 			baseline.MetaKeyBinlogFile:     "binlog.000001",
-			baseline.MetaKeyBinlogPos:      "4",
-			"bintrail.snapshot_timestamp":  base.Format(time.RFC3339),
+			// The anchor is where the first indexed event STARTS: a dump records
+			// the position its next transaction begins at, and the export reads
+			// a first event past the anchor as unproven coverage (#781).
+			baseline.MetaKeyBinlogPos:     "100",
+			"bintrail.snapshot_timestamp": base.Format(time.RFC3339),
 		},
 	})
 	if err != nil {
@@ -88,19 +91,27 @@ func TestIntegrationAuditContract_ExportIceberg(t *testing.T) {
 		t.Fatalf("json output lacks the loaded verdict:\n%s", out.String())
 	}
 
+	// One event per COMMIT: the load and the delta window are two.
 	evs := rec.Events()
-	if len(evs) != 1 {
-		t.Fatalf("audit events = %d, want exactly one for the one exported table: %+v", len(evs), evs)
+	if len(evs) != 2 {
+		t.Fatalf("audit events = %d, want two (load, delta): %+v", len(evs), evs)
 	}
-	ev := evs[0]
-	if ev.Surface != "cli" || ev.Action != "export.iceberg" || ev.Schema != "shop" || ev.Table != "orders" {
-		t.Fatalf("event = %+v", ev)
+	for _, ev := range evs {
+		if ev.Surface != "cli" || ev.Action != "export.iceberg" || ev.Schema != "shop" || ev.Table != "orders" {
+			t.Fatalf("event = %+v", ev)
+		}
+		if ev.Actor == "" || ev.Time.IsZero() {
+			t.Fatalf("event lacks actor or time: %+v", ev)
+		}
+		if ev.Detail["snapshot_id"] == "" || ev.Detail["snapshot_id"] == "0" || ev.Detail["cursor"] == "" || ev.Detail["location"] == "" {
+			t.Fatalf("event detail = %v, want a snapshot id, a cursor and a location", ev.Detail)
+		}
 	}
-	if ev.Actor == "" || ev.Time.IsZero() {
-		t.Fatalf("event lacks actor or time: %+v", ev)
+	if evs[0].Detail["commit"] != "load" || evs[0].Detail["rows"] != "2" {
+		t.Fatalf("first event = %v, want the load of 2 rows", evs[0].Detail)
 	}
-	if ev.Detail["rows_loaded"] != "2" || ev.Detail["events"] != "1" || ev.Detail["snapshot_id"] == "" || ev.Detail["snapshot_id"] == "0" {
-		t.Fatalf("event detail = %v, want the committed counts and a snapshot id", ev.Detail)
+	if evs[1].Detail["commit"] != "delta" || evs[1].Detail["events"] != "1" || evs[1].Detail["rows"] != "1" {
+		t.Fatalf("second event = %v, want the delta of 1 event / 1 upsert", evs[1].Detail)
 	}
 
 	// A second run with nothing new writes nothing and must not emit.
@@ -114,15 +125,19 @@ func TestIntegrationAuditContract_ExportIceberg(t *testing.T) {
 		t.Fatalf("an unchanged run emitted %d audit event(s); nothing was written", n)
 	}
 
-	audittest.CheckCoverage(t, audittest.OwnerExportCLI, []audittest.Pair{{Surface: ev.Surface, Action: ev.Action}})
-}
+	// The steady state: one more event, one delta commit, one audit event.
+	testutil.InsertEvent(t, db, "binlog.000001", 200, 300, base.Add(35*time.Minute).Format("2006-01-02 15:04:05"), nil,
+		"shop", "orders", 3, "1", nil, []byte(`{"id":1,"status":"new"}`), nil)
+	rec.Reset()
+	out.Reset()
+	eiAt = base.Add(40 * time.Minute).Format(time.RFC3339)
+	if err := runExportIceberg(exportIcebergCmd, nil); err != nil {
+		t.Fatalf("third export: %v\n%s", err, out.String())
+	}
+	evs = rec.Events()
+	if len(evs) != 1 || evs[0].Detail["commit"] != "delta" || evs[0].Detail["deletes"] != "1" {
+		t.Fatalf("third run events = %+v, want one delta commit with one delete", evs)
+	}
 
-func resetExportGlobals(t *testing.T) {
-	t.Helper()
-	sDSN, sDir, sS3, sWh, sTables, sAt, sBatch, sFormat := eiIndexDSN, eiBaselineDir, eiBaselineS3, eiWarehouse, eiTables, eiAt, eiFetchBatch, eiFormat
-	t.Cleanup(func() {
-		eiIndexDSN, eiBaselineDir, eiBaselineS3, eiWarehouse, eiTables, eiAt, eiFetchBatch, eiFormat = sDSN, sDir, sS3, sWh, sTables, sAt, sBatch, sFormat
-		exportIcebergCmd.SetOut(nil)
-	})
-	eiIndexDSN, eiBaselineDir, eiBaselineS3, eiWarehouse, eiTables, eiAt, eiFetchBatch, eiFormat = "", "", "", "", "", "", 0, "text"
+	audittest.CheckCoverage(t, audittest.OwnerExportCLI, []audittest.Pair{{Surface: evs[0].Surface, Action: evs[0].Action}})
 }

@@ -44,10 +44,21 @@ func MaterializeBaselineLocal(ctx context.Context, path string, tuning duckdbuti
 	return materializeBaselineLocal(ctx, path, tuning)
 }
 
+// IsBase64StoredType reports whether a column of this DATA_TYPE is stored
+// base64-encoded in the event row images (BLOB and TEXT families, JSON, the
+// spatial types, VECTOR), i.e. one whose exported value depends on the epoch
+// decoder having resolved. One list, the decoder's own.
+func IsBase64StoredType(dataType string) bool {
+	_, ok := base64StoredKind(dataType)
+	return ok
+}
+
 // EventDecoder is the per-table, epoch-aware decoder the full-table fold
 // builds once and reuses across pages: ENUM/SET ordinals become labels and
-// BLOB/TEXT base64 becomes real values, each event decoded against the schema
-// snapshot in effect at its own timestamp. Not safe for concurrent use.
+// base64-stored values become real values. BLOB/TEXT are decoded only against
+// the schema snapshot in effect at each event's own timestamp; ENUM/SET fall
+// back to the LATEST snapshot when the epochs cannot be loaded, and Typed
+// reports the first case only. Not safe for concurrent use.
 type EventDecoder struct{ d *eventDecoder }
 
 // NewEventDecoder builds the decoder for one table run. latest may be nil.
@@ -63,6 +74,8 @@ func (e *EventDecoder) DecodePage(page []query.ResultRow) {
 }
 
 // Typed reports whether every event decoded so far resolved to a schema
-// epoch. False means at least one BLOB/TEXT value may still be the stored
-// base64 text.
+// epoch. False means at least one event could not be typed against the
+// snapshot in effect at its timestamp: a base64-stored value may still be
+// the stored text, and an ENUM/SET ordinal was mapped by the latest
+// definition or not at all.
 func (e *EventDecoder) Typed() bool { return e.d.typed }

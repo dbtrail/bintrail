@@ -25,9 +25,9 @@ bintrail export iceberg \
   --baseline-dir /data/baselines \
   --warehouse /data/iceberg
 
-# Read it back
+# Read it back (the key column is selected on purpose; see "Reading the tables")
 duckdb -c "INSTALL iceberg; LOAD iceberg;
-           SELECT status, count(*) FROM iceberg_scan('/data/iceberg/shop/orders') GROUP BY 1;"
+           SELECT status, count(*), min(id) FROM iceberg_scan('/data/iceberg/shop/orders') GROUP BY 1;"
 ```
 
 Run the same command line again whenever you want the tables brought forward.
@@ -38,8 +38,11 @@ From cron, hourly is a good default:
 ```
 
 Each table lives at `<warehouse>/<schema>/<table>/` with Iceberg's `data/` and
-`metadata/` directories and a `version-hint.text`. Point any Iceberg reader at
-the table directory.
+`metadata/` directories; `metadata/version-hint.text` names the current
+metadata file. DuckDB and Spark read such a directory directly. Trino, Athena
+and Snowflake read Iceberg through a catalog, so with them you register the
+table's current metadata file (or the directory, where the catalog supports a
+Hadoop-style warehouse) rather than pointing at the path.
 
 ## What a run does
 
@@ -70,8 +73,11 @@ Because the commit is atomic, a run that dies after writing files and before
 committing leaves the previous snapshot readable and the cursor where it was;
 the next run resumes from it and the orphaned files are never referenced.
 
-A window with no events commits nothing: the table keeps its snapshot count
-and its cursor.
+A window with no events for the table still moves the cursor to the run's
+cut, in a commit that carries properties only: the next run then starts from
+there instead of re-reading the same empty window. When the whole index holds
+nothing past the cursor, the table is reported `unchanged` and nothing is
+committed.
 
 ## What it refuses, and why
 
@@ -82,8 +88,26 @@ table did not end current. The vocabulary is the same as `baseline refresh`.
 | verdict | when | what to do |
 |---|---|---|
 | `refused-gap` | the window spans events the index permanently lost, or hours rotated out without an archive | there is no flag for this; the missing events are missing. Take a fresh baseline and remove the table directory so the next run reloads from it |
-| `refused-ddl` | the table changed shape since it was exported (a column added or dropped), or a TRUNCATE / DROP / RENAME sits in the window | remove the table directory and let the next run reload it from a baseline taken after the change |
+| `refused-ddl` | the table changed shape since it was exported (a column added, dropped or retyped), or a TRUNCATE / DROP / RENAME sits in the window; on a first load, the baseline is older than the table's current schema | remove the table directory and let the next run reload it from a baseline taken after the change; on a first load, take a fresh baseline |
 | `refused` | anything else; the detail line says what | read the detail line |
+
+Four more shapes are refused rather than guessed at, all `refused-gap` or
+`refused`:
+
+- **`--at` at or before the table's cursor.** The export only moves forward;
+  re-running an older instant is reported instead of quietly answering
+  `unchanged`.
+- **`--at` below the live window** (older than the oldest live partition).
+  The cut is resolved on live events only, so a window under that floor cannot
+  be bounded exactly. Export with a later `--at`.
+- **The run's cut is before the cursor**, or the index holds no live events at
+  all while the table has a cursor. The source's binlogs were reset or the
+  index was restored behind the export, so the events in between are not in
+  this index. Remove the table directory to reload it from a fresh baseline.
+- **Skipped events.** When the capture daemon recorded that it skipped events
+  inside the window (a column-count mismatch, for example), the index does
+  not hold every change; fix the cause the skip names, re-snapshot, and reload
+  the table.
 
 Two conditions refuse before anything is written:
 
@@ -106,7 +130,7 @@ registry attributes an event to a source, so two sources with the same
 | BIGINT | long | BIGINT UNSIGNED becomes decimal(20,0) |
 | FLOAT, DOUBLE | float, double | |
 | DECIMAL(p,s) | decimal(p,s) | above 38 digits, string |
-| DATETIME, TIMESTAMP | timestamp (no zone) | the value as MySQL shows it, read as UTC wall clock |
+| DATETIME, TIMESTAMP | timestamp (no zone) | the value the index stores: TIMESTAMP as UTC, DATETIME as written |
 | DATE | date | |
 | TIME | string | |
 | CHAR, VARCHAR, TEXT family, ENUM, SET, JSON | string | ENUM and SET are exported as their labels |
@@ -135,9 +159,9 @@ Two things to know:
 - **DuckDB 1.4** applies equality deletes only when the key columns survive
   projection pushdown, so an aggregate straight over `iceberg_scan` can fail
   with `Equality deletes need the relevant columns to be selected`. Select the
-  key columns too, or materialize first:
+  key columns too (as the quick start does), or materialize first:
   `CREATE TABLE orders AS SELECT * FROM iceberg_scan('...')`. DuckDB 1.5 lifts
-  this.
+  this (checked with 1.5.5).
 - **The table is not relocatable by default.** Iceberg metadata stores
   absolute paths. If you copy or sync the warehouse elsewhere (for example
   `bintrail upload` to S3), read it with
@@ -152,7 +176,9 @@ Two things to know:
   baseline. Iceberg tracks columns by id, which is what will make an ADD
   COLUMN a metadata change in a later release.
 - Tables are unpartitioned.
-- MySQL and MariaDB sources only; `bintrail-pg` does not have the command.
+- Built for MySQL and MariaDB sources; `bintrail-pg` does not have the
+  command, and the export does not check that an index was written by the
+  MySQL capturer.
 - One writer at a time: the run holds a lock file at the warehouse root and a
   second concurrent run refuses.
 - Memory: a run holds one entry per primary key touched in its window, like
@@ -165,10 +191,13 @@ This is a one-shot command for your scheduler. It never runs inside
 `bintrail-console watch`: that process is the capture plane, and nothing that
 competes for its CPU or its S3 bandwidth belongs in it. The DuckDB budget
 defaults to the conservative 2 threads and 4 GB; `--ultrafast` is available
-here because the process is yours.
+here because the process is yours. The budget covers the baseline scan and
+the archive reads of the event window.
 
-Every table whose data was written is recorded in the audit trail as
-`cli/export.iceberg`, after the commit is durable.
+Every commit that wrote rows (a first load, or a delta with at least one
+change) is recorded in the audit trail as `cli/export.iceberg`, after the
+commit is durable. A properties-only commit and an `unchanged` table record
+nothing.
 
 ## Flags
 
@@ -178,7 +207,7 @@ Every table whose data was written is recorded in the audit trail as
 | `--baseline-dir` / `--baseline-s3` | where the baseline snapshots are (one required) |
 | `--warehouse` | local directory the Iceberg tables live under (required; env `BINTRAIL_ICEBERG_WAREHOUSE`) |
 | `--tables` | comma-separated `schema.table` list (default: every table in the newest snapshot) |
-| `--at` | export up to this instant (default: now) |
+| `--at` | export up to this instant (default: now); must be after the table's cursor and not below the live window |
 | `--fetch-batch-size` | event page size for the fold (0 = default) |
 | `--format` | `text` or `json` |
-| `--ultrafast`, `--duckdb-threads`, `--duckdb-memory-limit` | the DuckDB budget for the baseline scan |
+| `--ultrafast`, `--duckdb-threads`, `--duckdb-memory-limit` | the DuckDB budget for the baseline scan and the archive reads |

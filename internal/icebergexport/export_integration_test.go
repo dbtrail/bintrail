@@ -78,8 +78,11 @@ func seedFixture(t *testing.T) fixture {
 		Metadata: map[string]string{
 			baseline.MetaKeyCreateTableSQL: ordersCreateSQL,
 			baseline.MetaKeyBinlogFile:     "binlog.000001",
-			baseline.MetaKeyBinlogPos:      "4",
-			"bintrail.snapshot_timestamp":  f.base.Format(time.RFC3339),
+			// The anchor is where the first indexed event STARTS: a dump records
+			// the position its next transaction begins at, and the export reads
+			// a first event past the anchor as unproven coverage (#781).
+			baseline.MetaKeyBinlogPos:     "100",
+			"bintrail.snapshot_timestamp": f.base.Format(time.RFC3339),
 		},
 	})
 	if err != nil {
@@ -171,8 +174,7 @@ func TestIntegrationExport_matchesReconstructAtTheSameCut(t *testing.T) {
 	if o.Verdict != VerdictLoaded || o.RowsLoaded != 3 || o.Events != 3 || o.Upserts != 2 || o.Deletes != 1 {
 		t.Fatalf("run 1 = %+v, want loaded: 3 rows, 3 events, 2 upserts, 1 delete (%s)", o, o.Detail)
 	}
-	ddb := openDuckDBIceberg(t)
-	equalRows(t, "after run 1", duckRows(t, ddb, o.Location), []string{"1=new", "2=paid", "4=new"})
+	loc1 := o.Location
 
 	// Run 2: only the second window.
 	f.seedSecondWindow(t)
@@ -180,6 +182,12 @@ func TestIntegrationExport_matchesReconstructAtTheSameCut(t *testing.T) {
 	o = runOne(t, f.config(warehouse, at2))
 	if o.Verdict != VerdictExported || o.Events != 3 || o.Upserts != 2 || o.Deletes != 1 {
 		t.Fatalf("run 2 = %+v, want exported: 3 events, 2 upserts, 1 delete (%s)", o, o.Detail)
+	}
+	// The DuckDB leg opens only after the run-level claims held, so a
+	// machine without the extension skips the read-back, not the export.
+	ddb := openDuckDBIceberg(t)
+	if loc1 != o.Location {
+		t.Fatalf("table moved between runs: %s -> %s", loc1, o.Location)
 	}
 	equalRows(t, "after run 2", duckRows(t, ddb, o.Location), []string{"2=paid", "4=shipped", "5=new"})
 

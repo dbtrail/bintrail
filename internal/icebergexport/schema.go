@@ -14,7 +14,8 @@ import (
 type kind int
 
 const (
-	kindInt32 kind = iota
+	kindUnknown kind = iota // the zero value: never a valid column
+	kindInt32
 	kindInt64
 	kindFloat32
 	kindFloat64
@@ -35,8 +36,7 @@ const maxDecimalPrecision = 38
 // creation and then owned by the table forever.
 type column struct {
 	Name      string
-	MySQLType string
-	Unsigned  bool
+	MySQLType string // lower-case base type; read for the fixed BINARY(n) trim
 	Kind      kind
 	Precision int
 	Scale     int
@@ -121,7 +121,6 @@ func buildColumns(cols []baseline.Column, pkNames []string) ([]column, error) {
 		out = append(out, column{
 			Name:      c.Name,
 			MySQLType: strings.ToLower(strings.TrimSpace(c.MySQLType)),
-			Unsigned:  c.Unsigned,
 			Kind:      k,
 			Precision: p,
 			Scale:     s,
@@ -156,9 +155,35 @@ func icebergType(c column) iceberg.Type {
 		return iceberg.PrimitiveTypes.Date
 	case kindBinary:
 		return iceberg.PrimitiveTypes.Binary
-	default:
+	case kindString:
 		return iceberg.PrimitiveTypes.String
 	}
+	panic(fmt.Sprintf("icebergexport: column %q has no kind", c.Name))
+}
+
+// describe names the exported shape for a refusal message.
+func (c column) describe() string {
+	switch c.Kind {
+	case kindDecimal:
+		return fmt.Sprintf("decimal(%d,%d)", c.Precision, c.Scale)
+	case kindInt32:
+		return "int"
+	case kindInt64:
+		return "long"
+	case kindFloat32:
+		return "float"
+	case kindFloat64:
+		return "double"
+	case kindTimestamp:
+		return "timestamp"
+	case kindDate:
+		return "date"
+	case kindBinary:
+		return "binary"
+	case kindString:
+		return "string"
+	}
+	return "unknown"
 }
 
 // icebergSchema builds the table schema: every column by field ID, the
@@ -194,9 +219,9 @@ func pkFieldIDs(cols []column) []int {
 
 // columnsFromSchema rebuilds the export's column list from an existing
 // table's Iceberg schema, for incremental runs where the CREATE TABLE is not
-// re-read. The MySQL type is recovered from the current schema snapshot by
-// the caller; here only the Iceberg-side shape is needed.
-func columnsFromSchema(sc *iceberg.Schema, mysqlTypes map[string]baseline.Column) ([]column, error) {
+// re-read: the Iceberg table is the source of truth for what was exported,
+// and sameTableTypes compares the current snapshot against it.
+func columnsFromSchema(sc *iceberg.Schema) ([]column, error) {
 	ident := make(map[int]bool)
 	for _, id := range sc.IdentifierFieldIDs {
 		ident[id] = true
@@ -204,10 +229,6 @@ func columnsFromSchema(sc *iceberg.Schema, mysqlTypes map[string]baseline.Column
 	out := make([]column, 0, len(sc.Fields()))
 	for _, f := range sc.Fields() {
 		c := column{Name: f.Name, FieldID: f.ID, PK: ident[f.ID]}
-		if bc, ok := mysqlTypes[strings.ToLower(f.Name)]; ok {
-			c.MySQLType = strings.ToLower(strings.TrimSpace(bc.MySQLType))
-			c.Unsigned = bc.Unsigned
-		}
 		switch t := f.Type.(type) {
 		case iceberg.Int32Type:
 			c.Kind = kindInt32

@@ -1,6 +1,7 @@
 package cliapp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -59,16 +60,22 @@ WHAT IT REFUSES
   destructive DDL A TRUNCATE / DROP / RENAME in the window emits no row events,
                   so folding over it would resurrect rows that no longer exist.
   no primary key  Equality deletes name rows by key; a table without one, or
-                  with a FLOAT/DOUBLE/TIME/BIT/JSON key, cannot be exported.
+                  with a FLOAT, DOUBLE, TIME, BIT, JSON or spatial key, cannot
+                  be exported.
   BIT columns     Stored differently by the baseline and the row events; not
                   reconciled yet.
-  two sources     An index holding more than one source: events cannot be
-                  attributed to one, so two sources with the same schema.table
-                  would interleave in one Iceberg table.
+  skipped events  The capture daemon dropped events for the table inside the
+                  window (stream_state.capture_skips), so the index is not
+                  complete for it.
 
-Refusals are per table. A refused table does not advance and is retried on the
-next run; the other tables commit. The exit status is non-zero when any table
-did not end current.
+Those refusals are per table. A refused table does not advance and is retried
+on the next run; the other tables commit. The exit status is non-zero when any
+table did not end current.
+
+One refusal is for the whole run, before any table is touched: an index that
+holds more than one source (or none it can name in bintrail_servers). Events
+cannot be attributed to one source, so two sources with the same schema.table
+would interleave in one Iceberg table.
 
 This is a one-shot command for the operator's scheduler. It never runs inside
 the capture daemon.
@@ -82,8 +89,9 @@ Examples:
   bintrail export iceberg --index-dsn "..." --baseline-dir /data/baselines \
     --warehouse /data/iceberg --tables shop.orders,shop.customers
 
-  # Read it back
-  duckdb -c "INSTALL iceberg; LOAD iceberg; SELECT count(*) FROM iceberg_scan('/data/iceberg/shop/orders');"`,
+  # Read it back (DuckDB 1.4 needs the key columns selected, or a
+  # materialized copy, for equality deletes to apply; 1.5 does not)
+  duckdb -c "INSTALL iceberg; LOAD iceberg; SELECT id, status FROM iceberg_scan('/data/iceberg/shop/orders') LIMIT 10;"`,
 	RunE: runExportIceberg,
 }
 
@@ -173,11 +181,11 @@ func runExportIceberg(cmd *cobra.Command, _ []string) error {
 		FetchBatchSize: eiFetchBatch,
 		ArchiveFetcher: cli.TunedArchiveFetcher(tuning),
 		DuckDBTuning:   tuning,
+		OnCommit:       func(c icebergexport.Commit) { auditIcebergCommit(cmd.Context(), c) },
 	})
 	if err != nil {
 		return err
 	}
-	auditIcebergExport(cmd, outcomes)
 
 	failed := 0
 	for _, o := range outcomes {
@@ -186,9 +194,12 @@ func runExportIceberg(cmd *cobra.Command, _ []string) error {
 		}
 	}
 	if eiFormat == "json" {
-		writeExportJSON(cmd.OutOrStdout(), outcomes, eiWarehouse, at)
+		err = writeExportJSON(cmd.OutOrStdout(), outcomes, eiWarehouse, at)
 	} else {
-		writeExportSummary(cmd.OutOrStdout(), outcomes, eiWarehouse, at)
+		err = writeExportSummary(cmd.OutOrStdout(), outcomes, eiWarehouse, at)
+	}
+	if err != nil {
+		return fmt.Errorf("write the export report: %w", err)
 	}
 	if failed > 0 {
 		return fmt.Errorf("iceberg export: %d of %d table(s) did not end current", failed, len(outcomes))
@@ -220,39 +231,33 @@ func resolveExportTables(cmd *cobra.Command, source string) ([]string, error) {
 	return reconstruct.NewestSnapshotTables(cmd.Context(), source)
 }
 
-// auditIcebergExport records one audit event per table whose data was
-// written, after the commit is durable. An unchanged table wrote nothing and
-// is not an event; neither is a refusal, EXCEPT one whose first load had
-// already committed before the deltas refused (RowsLoaded > 0): those rows
-// are in the table and the event says so.
-func auditIcebergExport(cmd *cobra.Command, outcomes []icebergexport.Outcome) {
-	for _, o := range outcomes {
-		wrote := o.Verdict == icebergexport.VerdictLoaded || o.Verdict == icebergexport.VerdictExported || o.RowsLoaded > 0
-		if !wrote {
-			continue
-		}
-		ext.Record(cmd.Context(), ext.AuditEvent{
-			Surface: "cli",
-			Action:  "export.iceberg",
-			Actor:   ext.ProcessActor(""),
-			Schema:  o.Schema,
-			Table:   o.Table,
-			Detail: map[string]string{
-				"verdict":     string(o.Verdict),
-				"rows_loaded": strconv.FormatInt(o.RowsLoaded, 10),
-				"events":      strconv.FormatInt(o.Events, 10),
-				"upserts":     strconv.FormatInt(o.Upserts, 10),
-				"deletes":     strconv.FormatInt(o.Deletes, 10),
-				"snapshot_id": strconv.FormatInt(o.SnapshotID, 10),
-				"cursor":      o.Cursor,
-				"location":    o.Location,
-			},
-		})
-	}
+// auditIcebergCommit records one audit event per commit, called by the
+// export right after that commit is durable and before the run moves on. A
+// run killed between two tables has still written the first, and only a
+// per-commit emission says so; an unchanged table commits no rows and is not
+// an event.
+func auditIcebergCommit(ctx context.Context, c icebergexport.Commit) {
+	ext.Record(ctx, ext.AuditEvent{
+		Surface: "cli",
+		Action:  "export.iceberg",
+		Actor:   ext.ProcessActor(""),
+		Schema:  c.Schema,
+		Table:   c.Table,
+		Detail: map[string]string{
+			"commit":      string(c.Kind),
+			"rows":        strconv.FormatInt(c.Rows, 10),
+			"deletes":     strconv.FormatInt(c.Deletes, 10),
+			"events":      strconv.FormatInt(c.Events, 10),
+			"snapshot_id": strconv.FormatInt(c.SnapshotID, 10),
+			"cursor":      c.Cursor,
+			"location":    c.Location,
+		},
+	})
 }
 
-func writeExportSummary(w io.Writer, outcomes []icebergexport.Outcome, warehouse string, at time.Time) {
-	fmt.Fprintf(w, "iceberg export to %s at %s\n\n", warehouse, at.UTC().Format(time.RFC3339))
+func writeExportSummary(w io.Writer, outcomes []icebergexport.Outcome, warehouse string, at time.Time) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "iceberg export to %s at %s\n\n", warehouse, at.UTC().Format(time.RFC3339))
 	width := 0
 	for _, o := range outcomes {
 		if n := len(o.Schema) + 1 + len(o.Table); n > width {
@@ -261,12 +266,14 @@ func writeExportSummary(w io.Writer, outcomes []icebergexport.Outcome, warehouse
 	}
 	for _, o := range outcomes {
 		name := o.Schema + "." + o.Table
-		fmt.Fprintf(w, "  %-*s  %s\n", width, name, o.Verdict)
+		fmt.Fprintf(&b, "  %-*s  %s\n", width, name, o.Verdict)
 		if o.Detail != "" {
-			fmt.Fprintf(w, "  %-*s  └─ %s\n", width, "", o.Detail)
+			fmt.Fprintf(&b, "  %-*s  └─ %s\n", width, "", o.Detail)
 		}
 	}
-	fmt.Fprintln(w)
+	b.WriteString("\n")
+	_, err := io.WriteString(w, b.String())
+	return err
 }
 
 // exportJSON is the --format json shape.
@@ -290,7 +297,7 @@ type exportTableJSON struct {
 	Location   string `json:"location,omitempty"`
 }
 
-func writeExportJSON(w io.Writer, outcomes []icebergexport.Outcome, warehouse string, at time.Time) {
+func writeExportJSON(w io.Writer, outcomes []icebergexport.Outcome, warehouse string, at time.Time) error {
 	out := exportJSON{Warehouse: warehouse, At: at.UTC().Format(time.RFC3339)}
 	for _, o := range outcomes {
 		out.Tables = append(out.Tables, exportTableJSON{
@@ -301,5 +308,5 @@ func writeExportJSON(w io.Writer, outcomes []icebergexport.Outcome, warehouse st
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(out)
+	return enc.Encode(out)
 }

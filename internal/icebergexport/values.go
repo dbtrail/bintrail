@@ -30,17 +30,56 @@ func newRowAppender(mem memory.Allocator, schema *arrow.Schema, cols []column) (
 	if len(schema.Fields()) != len(cols) {
 		return nil, fmt.Errorf("arrow schema has %d fields, export has %d columns", len(schema.Fields()), len(cols))
 	}
+	// Each column's kind must match the Arrow field it will be appended into;
+	// appendValue asserts the builder type, and a mismatch there would be a
+	// panic in the middle of a write instead of a refusal here.
+	for i, c := range cols {
+		if got, want := schema.Field(i).Type.ID(), arrowTypeID(c.Kind); got != want {
+			return nil, fmt.Errorf("column %q: the Iceberg table stores %s but the export would write %s; the table's schema is not the one this export produces", c.Name, got, want)
+		}
+	}
 	return &rowAppender{cols: cols, b: array.NewRecordBuilder(mem, schema)}, nil
 }
 
-// append adds one row. A column absent from the map is NULL: the schema
-// checks upstream refuse a table whose shape moved, so absence here means a
-// NULL image value, not a dropped column.
+// arrowTypeID is the Arrow type each kind is written through, the same
+// mapping table.SchemaToArrowSchema applies to icebergType.
+func arrowTypeID(k kind) arrow.Type {
+	switch k {
+	case kindInt32:
+		return arrow.INT32
+	case kindInt64:
+		return arrow.INT64
+	case kindFloat32:
+		return arrow.FLOAT32
+	case kindFloat64:
+		return arrow.FLOAT64
+	case kindDecimal:
+		return arrow.DECIMAL128
+	case kindTimestamp:
+		return arrow.TIMESTAMP
+	case kindDate:
+		return arrow.DATE32
+	case kindBinary:
+		return arrow.BINARY
+	case kindString:
+		return arrow.STRING
+	}
+	return arrow.NULL
+}
+
+// append adds one row. Every column must be present in the map: row images
+// carry every column of the snapshot they were captured under, NULLs
+// included, so an absent key means the event was captured under a schema
+// that did not have the column, and writing NULL there would put a value the
+// source never held into a column that may not even allow it. Only the
+// spelling may differ, by case.
 func (a *rowAppender) append(row map[string]any) error {
 	for i, c := range a.cols {
 		v, ok := row[c.Name]
 		if !ok {
-			v = lookupFold(row, c.Name)
+			if v, ok = lookupFold(row, c.Name); !ok {
+				return fmt.Errorf("column %q is absent from the row image (the event was captured under a schema without it); reload the table from a fresh baseline", c.Name)
+			}
 		}
 		if err := appendValue(a.b.Field(i), c, v); err != nil {
 			return fmt.Errorf("column %q: %w", c.Name, err)
@@ -52,13 +91,13 @@ func (a *rowAppender) append(row map[string]any) error {
 
 // lookupFold finds a key by case-insensitive match, for row images whose
 // column spelling differs from the CREATE TABLE's only in case.
-func lookupFold(row map[string]any, name string) any {
+func lookupFold(row map[string]any, name string) (any, bool) {
 	for k, v := range row {
 		if strings.EqualFold(k, name) {
-			return v
+			return v, true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // flush returns the batch built so far and resets the appender.
@@ -138,12 +177,14 @@ func appendValue(b array.Builder, c column, v any) error {
 			return err
 		}
 		b.(*array.BinaryBuilder).Append(bs)
-	default:
+	case kindString:
 		s, err := toString(v)
 		if err != nil {
 			return err
 		}
 		b.(*array.StringBuilder).Append(s)
+	default:
+		return fmt.Errorf("column has no kind")
 	}
 	return nil
 }

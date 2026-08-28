@@ -18,8 +18,13 @@ type netOp struct {
 	Row map[string]any
 }
 
+// deleted reports whether the key does not exist at the cut.
+func (o *netOp) deleted() bool { return o.Row == nil }
+
 // fold reduces an ascending event window to one netOp per primary key, in
-// first-touched order. Last write wins, page after page, because pages arrive
+// first-touched order. It holds one entry per DISTINCT touched key for the
+// whole window, whatever the page size: paging bounds the fetch, not the map
+// (the same shape as reconstruct's change map, #1107). Last write wins, page after page, because pages arrive
 // in (event_timestamp, event_id) order: the same rule the full-table
 // reconstruct applies, so the exported table equals `reconstruct` at the same
 // cut.
@@ -59,12 +64,20 @@ func (f *fold) addPage(page []query.ResultRow) error {
 				return fmt.Errorf("event %d (type %d) for %s.%s pk %q carries no after-image", ev.EventID, ev.EventType, f.schema, f.table, ev.PKValues)
 			}
 			row := copyMap(ev.RowAfter)
-			op = &netOp{PK: pkImage(row, f.pkCols), Row: row}
+			pk, err := pkImage(row, f.pkCols)
+			if err != nil {
+				return fmt.Errorf("event %d for %s.%s: %w", ev.EventID, f.schema, f.table, err)
+			}
+			op = &netOp{PK: pk, Row: row}
 		case event.EventDelete:
 			if ev.RowBefore == nil {
 				return fmt.Errorf("DELETE event %d for %s.%s pk %q carries no before-image", ev.EventID, f.schema, f.table, ev.PKValues)
 			}
-			op = &netOp{PK: pkImage(ev.RowBefore, f.pkCols)}
+			pk, err := pkImage(ev.RowBefore, f.pkCols)
+			if err != nil {
+				return fmt.Errorf("DELETE event %d for %s.%s: %w", ev.EventID, f.schema, f.table, err)
+			}
+			op = &netOp{PK: pk}
 		default:
 			// EventType 0 is the drift shape (#318): a NULL event_type column.
 			// Not skippable: a skipped event is a silently wrong table.
@@ -88,19 +101,21 @@ func (f *fold) touched() []*netOp {
 	return out
 }
 
-func (f *fold) len() int { return len(f.ops) }
-
-// pkImage extracts the primary key columns of a row image.
-func pkImage(row map[string]any, pkCols []metadata.ColumnMeta) map[string]any {
+// pkImage extracts the primary key columns of a row image. A key column
+// absent from the image is refused: a NULL in an equality-delete key matches
+// nothing, and the old row would survive beside the new one.
+func pkImage(row map[string]any, pkCols []metadata.ColumnMeta) (map[string]any, error) {
 	out := make(map[string]any, len(pkCols))
 	for _, c := range pkCols {
-		if v, ok := row[c.Name]; ok {
-			out[c.Name] = v
-			continue
+		v, ok := row[c.Name]
+		if !ok {
+			if v, ok = lookupFold(row, c.Name); !ok {
+				return nil, fmt.Errorf("primary key column %q is absent from the row image", c.Name)
+			}
 		}
-		out[c.Name] = lookupFold(row, c.Name)
+		out[c.Name] = v
 	}
-	return out
+	return out, nil
 }
 
 func copyMap(m map[string]any) map[string]any {

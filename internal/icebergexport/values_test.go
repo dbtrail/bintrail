@@ -162,7 +162,7 @@ func TestAppendValue_refusals(t *testing.T) {
 	}
 }
 
-func TestRowAppender_missingColumnIsNullAndCaseFolds(t *testing.T) {
+func TestRowAppender_caseFoldsAndRefusesAbsentColumns(t *testing.T) {
 	cols, err := buildColumns([]baseline.Column{{Name: "Id", MySQLType: "int"}, {Name: "note", MySQLType: "varchar"}}, []string{"Id"})
 	if err != nil {
 		t.Fatal(err)
@@ -176,8 +176,8 @@ func TestRowAppender_missingColumnIsNullAndCaseFolds(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer app.release()
-	// "id" spelled in lower case reaches the "Id" column; "note" is absent.
-	if err := app.append(map[string]any{"id": int32(1)}); err != nil {
+	// "id" spelled in lower case reaches the "Id" column; an explicit nil is a NULL.
+	if err := app.append(map[string]any{"id": int32(1), "NOTE": nil}); err != nil {
 		t.Fatal(err)
 	}
 	rec := app.flush()
@@ -186,6 +186,33 @@ func TestRowAppender_missingColumnIsNullAndCaseFolds(t *testing.T) {
 		t.Fatalf("Id = %d, want 1 (case-folded lookup)", got)
 	}
 	if !rec.Column(1).IsNull(0) {
-		t.Fatal("note should be NULL when absent from the row image")
+		t.Fatal("note should be NULL when the image carries an explicit nil")
+	}
+	// A column ABSENT from the image is not a NULL: the event was captured
+	// under a schema without it, and writing NULL would invent a value.
+	err = app.append(map[string]any{"id": int32(2)})
+	if err == nil || !strings.Contains(err.Error(), "absent from the row image") {
+		t.Fatalf("err = %v, want a refusal naming the absent column", err)
+	}
+}
+
+func TestNewRowAppender_refusesArrowTypeMismatch(t *testing.T) {
+	// The table says string, the export would write int: a refusal, not a
+	// panic in the builder type assertion mid-write.
+	cols, err := buildColumns([]baseline.Column{{Name: "id", MySQLType: "int"}}, []string{"id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asString, err := buildColumns([]baseline.Column{{Name: "id", MySQLType: "varchar"}}, []string{"id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := table.SchemaToArrowSchema(icebergSchema(asString), nil, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = newRowAppender(memory.DefaultAllocator, sc, cols)
+	if err == nil || !strings.Contains(err.Error(), "the Iceberg table stores") {
+		t.Fatalf("err = %v, want a type-mismatch refusal", err)
 	}
 }
