@@ -27,8 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since nothing creates the tree until something saves into it. Because that
   repeated failure was in practice the only signal anywhere that `HOME` was
   unset, fixing it would have removed the signal and left the cause, so a
-  homeless daemon now warns once at startup, naming the directory it anchored
-  to and the settings that override it. It is a warning and not a refusal:
+  daemon with no home that falls back to a default path now warns once, naming
+  the directory it anchored to and the settings that override it. It is a warning and not a refusal:
   losing run history must never stop a refresh, and the console is a recovery
   path that does not decline to boot over where its own state file landed. The
   same relative fallback was shared verbatim by `generate-key`'s default key

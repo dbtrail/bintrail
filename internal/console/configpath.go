@@ -21,10 +21,14 @@ var configPathWarnOnce sync.Once
 // no HOME, systemd DynamicUser, a scrubbed container — the fallback anchors in
 // the working directory EXPLICITLY. The obvious spelling,
 // filepath.Join(".", ".config", ...), does NOT do that: Join Cleans the
-// leading "." away and yields a RELATIVE path. That path then resolves against
-// wherever the process happens to be at write time, and its failures name a
-// directory no operator can find (#1487: every baseline refresh logged
-// `open .config/bintrail/.baseline-history-…: no such file or directory`).
+// leading "." away and yields a RELATIVE path. That designates the SAME
+// directory this does, since resolution happens against the working directory
+// either way and nothing outside tests calls os.Chdir — so this moved no data
+// and there is nothing to migrate. What it buys is a path that can be READ: a
+// failure now names a directory the operator can go and look at, and the
+// anchor is stated rather than left to whenever the syscall runs (#1487: every
+// baseline refresh logged `open .config/bintrail/.baseline-history-…: no such
+// file or directory`, which names nothing findable).
 func configPath(name string) string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
