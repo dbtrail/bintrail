@@ -110,19 +110,23 @@ can group indexed files by origin server — see
 
 Indexed events go into `binlog_events`, range-partitioned by hour on
 `event_timestamp`. PK lookups are fast because `pk_hash`
-(`SHA2(pk_values, 256)`) is a stored, indexed column; queries match on
-`pk_hash` **and** the exact `pk_values` (the second check guards against the
-astronomically rare hash collision).
+(`SHA2(pk_values, 256)`) is covered by `idx_pk_hash (schema_name, table_name,
+pk_hash, event_timestamp)`; queries match on `pk_hash` **and** the exact
+`pk_values` (the second check guards against the astronomically rare hash
+collision).
 
-Matching those two columns is what makes the answer *correct*; it is not what
-makes it *fast*. The index is `idx_pk_hash (schema_name, table_name, pk_hash,
-event_timestamp)`, so `schema_name` and `table_name` have to be in the
-predicate too or the index cannot be used at all. A lookup naming only
-`pk_hash` and `pk_values` falls back to a full table scan, which on a
-multi-million-row `binlog_events` is seconds per query rather than
-milliseconds. `EXPLAIN` shows the difference immediately: `type: ref` with
+Those are two separate rules, and it is worth keeping them apart. Matching
+`pk_values` is what makes the answer *correct*. Naming `schema_name` and
+`table_name` is what makes it *fast*: they lead the index, so a predicate
+without them leaves the optimizer nothing to seek on and it falls back to
+scanning the table. `EXPLAIN` tells you which one you got — `type: ref` with
 `key: idx_pk_hash` when the leading columns are present, `type: ALL` when they
 are not.
+
+This matters when you query `binlog_events` directly, in SQL you wrote. The
+shipped commands already require it: `query`, `recover`, the MCP tools and the
+console all refuse a PK filter that does not also name a schema and a table,
+precisely so the index is never scanned blindly.
 
 `pk_values` is the pipe-delimited PK in column ordinal order; a PK value
 whose raw bytes are not valid UTF-8 (e.g. a `BINARY(16)` UUID) is stored as
