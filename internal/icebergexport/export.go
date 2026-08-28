@@ -218,6 +218,11 @@ func Run(ctx context.Context, cfg Config) ([]Outcome, error) {
 // registry existed and never re-initialised) cannot prove it is single-source
 // either, so it refuses with the fix rather than passing for an unrelated
 // reason.
+//
+// ZERO rows is accepted: a file-mode index (`bintrail index --binlog-dir`)
+// registers no source at all, and refusing it would break a supported mode.
+// That index can only interleave sources if the operator fed it two servers'
+// binlogs by hand, which is theirs to know.
 func refuseMultiSource(ctx context.Context, db *sql.DB) error {
 	var n int64
 	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bintrail_servers`).Scan(&n)
@@ -298,6 +303,13 @@ func (d *deps) runTable(ctx context.Context, schema, tbl string) Outcome {
 		out.Cursor = cur.String()
 		out.Location = icetbl.Location()
 		out.Detail = loaded.detail
+		if !d.cfg.At.After(cur.At) {
+			// --at is the snapshot's own instant (an operator asking for
+			// the table as of the dump): the load IS the answer, and the
+			// forward-only refusal below is for a RE-RUN, not for this.
+			out.Detail += "; --at is the snapshot's instant, nothing to fold"
+			return out
+		}
 	}
 
 	res, err := d.increment(ctx, schema, tbl, tm, pkCols, icetbl, cur)
@@ -393,7 +405,7 @@ func (d *deps) firstLoad(ctx context.Context, schema, tbl string, tm *metadata.T
 		if err != nil {
 			return nil, nil, none, fmt.Errorf("create Iceberg table %s.%s: %w", schema, tbl, err)
 		}
-	} else if err := sameColumns(icetbl.Schema(), cols); err != nil {
+	} else if err := sameShape(icetbl.Schema(), cols); err != nil {
 		return nil, nil, none, fmt.Errorf("Iceberg table at %s exists without an export cursor and %w; remove the table directory to reload it", icetbl.Location(), err)
 	}
 	arrowSchema, err := table.SchemaToArrowSchema(icetbl.Schema(), nil, true, false)
@@ -613,23 +625,12 @@ func (d *deps) increment(ctx context.Context, schema, tbl string, tm *metadata.T
 		// when the operator merely re-ran yesterday's instant.
 		return nil, fmt.Errorf("--at %s is not after the table's cursor (%s); the export only moves forward", at.Format(time.RFC3339), cur.String())
 	}
-	cut, err := reconstruct.ResolveSnapshotCut(ctx, d.db, at)
-	if err != nil {
-		return nil, fmt.Errorf("resolve the binlog cut for %s: %w", at.Format(time.RFC3339), err)
-	}
-	if cut == nil {
-		return nil, fmt.Errorf("%w: the index holds no live events, but %s.%s has a cursor at %s; this is not the index the table was exported from, or its history was lost",
-			reconstruct.ErrCaptureGap, schema, tbl, cur.String())
-	}
-	if cut.File == cur.File && cut.Pos == cur.Pos {
-		// Nothing indexed past the cursor: nothing to fold, nothing to
-		// commit. The cursor stays, which is correct and cheap.
-		return res, nil
-	}
-	if binlogBefore(cut.File, cut.Pos, cur.File, cur.Pos) {
-		return nil, fmt.Errorf("%w: the run's cut %s:%d is before %s.%s's cursor %s; the source's binlogs were reset or the index was restored behind the export, so the events between are not in this index. Remove the table directory to reload it from a fresh baseline",
-			reconstruct.ErrCaptureGap, cut.File, cut.Pos, schema, tbl, cur.String())
-	}
+	// The window guards run BEFORE the cut is resolved and before the
+	// "nothing new" return below. They are keyed on the time window
+	// (cursor, at], and none of what they detect lands in binlog_events: a
+	// TRUNCATE, a lost stretch and a skipped event all leave the cut where
+	// it was, so a guard placed behind the cut comparison would call a
+	// table "unchanged" while it still holds every row a TRUNCATE removed.
 	if err := d.checkLiveWindow(ctx, at); err != nil {
 		return nil, err
 	}
@@ -639,8 +640,36 @@ func (d *deps) increment(ctx context.Context, schema, tbl string, tm *metadata.T
 	if _, err := reconstruct.CheckCaptureGapStatus(ctx, d.db, schema, tbl, cur.At, at, false); err != nil {
 		return nil, err
 	}
-	if err := checkCaptureSkips(ctx, d.db, schema, tbl, cur.At, at); err != nil {
+	if err := checkCaptureSkips(ctx, d.db, schema, tbl, cur.At); err != nil {
 		return nil, err
+	}
+
+	cut, err := reconstruct.ResolveSnapshotCut(ctx, d.db, at)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the binlog cut for %s: %w", at.Format(time.RFC3339), err)
+	}
+	if cut == nil {
+		// Zero live events. Right after a first load that is the normal
+		// state of a fresh install whose stream has not indexed anything
+		// yet: nothing to bound, nothing lost. A table that already folded
+		// deltas saw events that are gone now, which a rotated-out index
+		// and a reset one look alike from here, so that one is refused
+		// without asserting which it was.
+		if cur.FromBaseline {
+			res.note += "; the index holds no live events yet, so there is nothing to fold until the stream indexes some"
+			return res, nil
+		}
+		return nil, fmt.Errorf("the index holds no live events, so no cut can be resolved for %s.%s (cursor %s); if the index was reset or restored, the events since the cursor are not in it and the table directory must be removed to reload from a fresh baseline",
+			schema, tbl, cur.String())
+	}
+	if cut.File == cur.File && cut.Pos == cur.Pos {
+		// Nothing indexed past the cursor: nothing to fold, nothing to
+		// commit. The cursor stays, which is correct and cheap.
+		return res, nil
+	}
+	if binlogBefore(cut.File, cut.Pos, cur.File, cur.Pos) {
+		return nil, fmt.Errorf("%w: the run's cut %s:%d is before %s.%s's cursor %s; the source's binlogs were reset or the index was restored behind the export, so the events between are not in this index. Remove the table directory to reload it from a fresh baseline",
+			reconstruct.ErrCaptureGap, cut.File, cut.Pos, schema, tbl, cur.String())
 	}
 
 	since, until := cur.At, at
@@ -768,7 +797,7 @@ func (d *deps) checkLiveWindow(ctx context.Context, at time.Time) error {
 // other reasons the tally records. Those rows are not a gap the planner can
 // see, and folding around them would publish a table missing them as if it
 // were current. A skip that names no tables is attributed to every table.
-func checkCaptureSkips(ctx context.Context, db *sql.DB, schema, tbl string, since, until time.Time) error {
+func checkCaptureSkips(ctx context.Context, db *sql.DB, schema, tbl string, since time.Time) error {
 	ss, err := status.LoadStreamState(ctx, db)
 	if err != nil {
 		return fmt.Errorf("read stream_state capture skips: %w", err)
@@ -782,7 +811,13 @@ func checkCaptureSkips(ctx context.Context, db *sql.DB, schema, tbl string, sinc
 	}
 	want := strings.ToLower(schema + "." + tbl)
 	for reason, s := range skips {
-		if s.LastAt.IsZero() || !s.LastAt.After(since) || s.LastAt.After(until) {
+		// The tally is cumulative: one count and ONE overwritten timestamp
+		// per reason. "LastAt before the window" proves the window clean;
+		// "LastAt after the window" proves nothing, because earlier skips of
+		// the same reason may sit inside it, so there is no upper bound
+		// here on purpose. Over-refusing a window whose skips all landed
+		// after it is the cheap direction: the cursor stays put.
+		if s.LastAt.IsZero() || !s.LastAt.After(since) {
 			continue
 		}
 		named := len(s.Tables) == 0 || s.TablesTruncated
@@ -956,6 +991,41 @@ func upsertBatches(mem memory.Allocator, arrowSchema *arrow.Schema, cols []colum
 	}
 }
 
+// sameShape checks that an existing Iceberg schema is, column for column and
+// in order, what this export would create: name, kind, decimal precision and
+// scale, and key membership. Names alone are not enough: two DECIMAL columns
+// of different scale pass a name check and Arrow then rescales the values
+// without a word (the hazard sameTableTypes documents), and the appender
+// writes by ordinal.
+func sameShape(sc *iceberg.Schema, cols []column) error {
+	have, err := columnsFromSchema(sc)
+	if err != nil {
+		return err
+	}
+	if len(have) != len(cols) {
+		return fmt.Errorf("has %d columns where the export has %d", len(have), len(cols))
+	}
+	for i, c := range cols {
+		h := have[i]
+		switch {
+		case !strings.EqualFold(h.Name, c.Name):
+			return fmt.Errorf("has column %d named %q where the export has %q", i+1, h.Name, c.Name)
+		case h.Kind != c.Kind || h.Precision != c.Precision || h.Scale != c.Scale:
+			return fmt.Errorf("stores column %q as %s where the export would write %s", c.Name, h.describe(), c.describe())
+		case h.PK != c.PK:
+			return fmt.Errorf("has column %q %s the identifier fields where the export %s", c.Name, inOrOut(h.PK), inOrOut(c.PK)+" it")
+		}
+	}
+	return nil
+}
+
+func inOrOut(pk bool) string {
+	if pk {
+		return "in"
+	}
+	return "outside"
+}
+
 // sameNames checks that a Parquet column list and the export columns name the
 // same set, case-insensitively.
 func sameNames(names []string, cols []column) error {
@@ -982,18 +1052,6 @@ func sameNames(names []string, cols []column) error {
 		return nil
 	}
 	return fmt.Errorf("differ from its CREATE TABLE (missing: %v, unexpected: %v)", missing, extra)
-}
-
-// sameColumns checks an existing Iceberg schema against the export columns.
-func sameColumns(sc *iceberg.Schema, cols []column) error {
-	names := make([]string, 0, len(sc.Fields()))
-	for _, f := range sc.Fields() {
-		names = append(names, f.Name)
-	}
-	if err := sameNames(names, cols); err != nil {
-		return fmt.Errorf("its columns %w", err)
-	}
-	return nil
 }
 
 // sameTableColumns refuses, with ErrSchemaChanged, when the current schema

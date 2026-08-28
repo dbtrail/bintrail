@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/iceberg-go/catalog"
+
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
@@ -209,11 +211,33 @@ func TestIntegrationExport_cutBeforeCursorRefuses(t *testing.T) {
 	testutil.MustExec(t, f.db, `DELETE FROM binlog_events WHERE start_pos >= 300`)
 	o2 := runOne(t, f.config(warehouse, f.base.Add(40*time.Minute)))
 	if o2.Verdict != VerdictRefusedGap || !strings.Contains(o2.Detail, "is before") {
-		t.Fatalf("verdict = %s (%s), want refused-gap naming the cut before the cursor", o2.Verdict, o2.Detail)
+		t.Errorf("verdict = %s (%s), want refused-gap naming the cut before the cursor", o2.Verdict, o2.Detail)
 	}
-	if o2.Cursor != "" && o2.Cursor != o.Cursor {
-		t.Fatalf("cursor moved: %s -> %s", o.Cursor, o2.Cursor)
+	// A refusal carries no Cursor, so the table itself is the witness. Errorf
+	// above so that a run that did not refuse also shows WHERE the cursor went.
+	if got := storedCursor(t, warehouse, f.schema, "orders"); got != o.Cursor {
+		t.Fatalf("cursor moved: %s -> %s", o.Cursor, got)
 	}
+}
+
+// storedCursor reads the cursor the Iceberg table carries in its properties,
+// the way the next run will.
+func storedCursor(t *testing.T, warehouse, schema, tbl string) string {
+	t.Helper()
+	cat, release, err := openWarehouse(context.Background(), warehouse)
+	if err != nil {
+		t.Fatalf("open warehouse: %v", err)
+	}
+	defer release()
+	icetbl, found, err := loadTable(context.Background(), cat, catalog.ToIdentifier(schema, tbl))
+	if err != nil || !found {
+		t.Fatalf("load %s.%s: found=%v err=%v", schema, tbl, found, err)
+	}
+	cur, err := readCursor(icetbl.Properties())
+	if err != nil || cur == nil {
+		t.Fatalf("read cursor of %s.%s: %+v (%v)", schema, tbl, cur, err)
+	}
+	return cur.String()
 }
 
 func TestIntegrationExport_emptyIndexWithCursorRefuses(t *testing.T) {
@@ -225,8 +249,43 @@ func TestIntegrationExport_emptyIndexWithCursorRefuses(t *testing.T) {
 	}
 	testutil.MustExec(t, f.db, `DELETE FROM binlog_events`)
 	o := runOne(t, f.config(warehouse, f.base.Add(40*time.Minute)))
-	if o.Verdict != VerdictRefusedGap || !strings.Contains(o.Detail, "no live events") {
-		t.Fatalf("verdict = %s (%s), want refused-gap for an index with no history", o.Verdict, o.Detail)
+	// The table folded deltas once, so events existed and are gone: refused,
+	// without asserting whether they rotated out or were reset.
+	if o.Verdict != VerdictRefused || !strings.Contains(o.Detail, "no live events") {
+		t.Fatalf("verdict = %s (%s), want refused for an index with no history", o.Verdict, o.Detail)
+	}
+}
+
+// TestIntegrationExport_freshInstallLoadsThenWaits: baseline taken, stream
+// not yet indexing anything. The load is the answer; an empty index is not
+// lost history, and the run must not exit 1 telling the operator it is.
+func TestIntegrationExport_freshInstallLoadsThenWaits(t *testing.T) {
+	f := seedFixture(t)
+	const createSQL = "CREATE TABLE `plain` (\n  `id` int NOT NULL,\n  `v` varchar(10) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"
+	insertSnapshotTyped(t, f.db, 1, f.base, f.schema, "plain", "id", 1, "PRI", "int", "int", "NO")
+	insertSnapshotTyped(t, f.db, 1, f.base, f.schema, "plain", "v", 2, "", "varchar", "varchar(10)", "YES")
+	writeBaseline(t, f.baseDir, f.base, f.schema, "plain", createSQL, [][]string{{"1", "a"}},
+		map[string]string{baseline.MetaKeyBinlogFile: "binlog.000001", baseline.MetaKeyBinlogPos: "100"})
+	cfg := f.config(t.TempDir(), f.base.Add(20*time.Minute))
+	cfg.Tables = []string{f.schema + ".plain"}
+	o := runOne(t, cfg)
+	if o.Verdict != VerdictLoaded || o.RowsLoaded != 1 || !strings.Contains(o.Detail, "no live events yet") {
+		t.Fatalf("verdict = %s rows=%d (%s), want loaded with the nothing-to-fold note", o.Verdict, o.RowsLoaded, o.Detail)
+	}
+	if got := storedCursor(t, cfg.Warehouse, f.schema, "plain"); got != o.Cursor || !strings.HasPrefix(got, "binlog.000001:100 ") {
+		t.Fatalf("stored cursor = %s, outcome cursor = %s, want the snapshot anchor", got, o.Cursor)
+	}
+}
+
+// TestIntegrationExport_atAtSnapshotInstantIsALoad: --at equal to the
+// snapshot's own timestamp asks for the table as of the dump. That is the
+// load; the forward-only refusal is for a RE-RUN.
+func TestIntegrationExport_atAtSnapshotInstantIsALoad(t *testing.T) {
+	f := seedFixture(t)
+	f.seedFirstWindow(t)
+	o := runOne(t, f.config(t.TempDir(), f.base))
+	if o.Verdict != VerdictLoaded || o.Events != 0 || !strings.Contains(o.Detail, "snapshot's instant") {
+		t.Fatalf("verdict = %s events=%d (%s), want a plain load", o.Verdict, o.Events, o.Detail)
 	}
 }
 
@@ -266,6 +325,20 @@ func TestIntegrationExport_captureSkipsRefuse(t *testing.T) {
 	o := runOne(t, f.config(warehouse, f.base.Add(40*time.Minute)))
 	if o.Verdict != VerdictRefusedGap || !strings.Contains(o.Detail, "skipped 3 event(s)") {
 		t.Fatalf("verdict = %s (%s), want refused-gap naming the skipped events", o.Verdict, o.Detail)
+	}
+	// The tally keeps ONE timestamp per reason. A skip recorded AFTER --at
+	// cannot be told apart from earlier skips of the same reason inside the
+	// window, so it refuses too; treating it as clean would commit and move
+	// the cursor past a window the index provably does not hold in full.
+	skips = fmt.Sprintf(`{"column_count_mismatch":{"count":8,"last_at":%q,"tables":["%s.orders"]}}`,
+		f.base.Add(50*time.Minute).UTC().Format(time.RFC3339), f.schema)
+	testutil.MustExec(t, f.db, `UPDATE stream_state SET capture_skips = ? WHERE id = 1`, skips)
+	o = runOne(t, f.config(warehouse, f.base.Add(40*time.Minute)))
+	if o.Verdict != VerdictRefusedGap || !strings.Contains(o.Detail, "skipped 8 event(s)") {
+		t.Fatalf("skip after --at: verdict = %s (%s), want refused-gap", o.Verdict, o.Detail)
+	}
+	if got := storedCursor(t, warehouse, f.schema, "orders"); !strings.HasPrefix(got, "binlog.000001:400 ") {
+		t.Fatalf("cursor = %s, want it left at the run-1 cut", got)
 	}
 }
 

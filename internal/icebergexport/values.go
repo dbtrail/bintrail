@@ -34,6 +34,9 @@ func newRowAppender(mem memory.Allocator, schema *arrow.Schema, cols []column) (
 	// appendValue asserts the builder type, and a mismatch there would be a
 	// panic in the middle of a write instead of a refusal here.
 	for i, c := range cols {
+		if name := schema.Field(i).Name; !strings.EqualFold(name, c.Name) {
+			return nil, fmt.Errorf("column %d: the Iceberg table has %q where the export has %q; the table's schema is not the one this export produces", i+1, name, c.Name)
+		}
 		if got, want := schema.Field(i).Type.ID(), arrowTypeID(c.Kind); got != want {
 			return nil, fmt.Errorf("column %q: the Iceberg table stores %s but the export would write %s; the table's schema is not the one this export produces", c.Name, got, want)
 		}
@@ -329,8 +332,8 @@ func toTime(v any) (t time.Time, isNull bool, err error) {
 		return toTime(string(x))
 	case string:
 		s := strings.TrimSpace(x)
-		if s == "" || strings.HasPrefix(s, "0000-00-00") {
-			return time.Time{}, true, nil
+		if strings.HasPrefix(s, "0000-00-00") {
+			return time.Time{}, true, nil // the documented zero-date mapping, and only that
 		}
 		for _, layout := range timeLayouts {
 			if parsed, perr := time.ParseInLocation(layout, s, time.UTC); perr == nil {

@@ -315,8 +315,16 @@ func TestIntegrationExport_destructiveDDLRefuses(t *testing.T) {
 	testutil.MustExec(t, f.db, `INSERT INTO schema_changes (detected_at, binlog_file, binlog_pos, schema_name, table_name, ddl_type, ddl_query)
 		VALUES (?, 'binlog.000001', 450, ?, 'orders', 'TRUNCATE TABLE', 'TRUNCATE TABLE orders')`,
 		f.base.Add(24*time.Minute).Format("2006-01-02 15:04:05"), f.schema)
-	f.seedSecondWindow(t)
+	// The TRUNCATE is the ONLY thing in the window: DDL never lands in
+	// binlog_events, so the cut does not move, and a check that runs only
+	// once the cut has moved would call this table "unchanged" while it
+	// still holds every row the TRUNCATE removed.
 	o := runOne(t, f.config(warehouse, f.base.Add(40*time.Minute)))
+	if o.Verdict != VerdictRefusedDDL || !strings.Contains(o.Detail, "TRUNCATE") {
+		t.Fatalf("quiet window: verdict = %s (%s), want refused-ddl naming the TRUNCATE", o.Verdict, o.Detail)
+	}
+	f.seedSecondWindow(t)
+	o = runOne(t, f.config(warehouse, f.base.Add(40*time.Minute)))
 	if o.Verdict != VerdictRefusedDDL || !strings.Contains(o.Detail, "TRUNCATE") {
 		t.Fatalf("verdict = %s (%s), want refused-ddl naming the TRUNCATE", o.Verdict, o.Detail)
 	}

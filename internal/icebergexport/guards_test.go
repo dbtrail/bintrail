@@ -119,6 +119,48 @@ func TestSameTableTypes_refusesTypeOnlyAlter(t *testing.T) {
 	}
 }
 
+// TestSameShape: an Iceberg table that exists without a cursor is reused
+// only if it is, column for column, what this export would create.
+func TestSameShape(t *testing.T) {
+	_, tbl, cols := newTestTable(t, ordersCols, []string{"id"})
+	if err := sameShape(tbl.Schema(), cols); err != nil {
+		t.Fatalf("the table this export created is refused: %v", err)
+	}
+	rescaled, err := buildColumns([]baseline.Column{
+		{Name: "id", MySQLType: "bigint"},
+		{Name: "status", MySQLType: "varchar"},
+		{Name: "amount", MySQLType: "decimal", DecimalPrecision: 12, DecimalScale: 4},
+		{Name: "updated_at", MySQLType: "datetime"},
+	}, []string{"id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same names, same Arrow type ID: only the scale differs, and Arrow would
+	// rescale 12.3456 to 12.35 on append without a word.
+	if err := sameShape(tbl.Schema(), rescaled); err == nil || !strings.Contains(err.Error(), "decimal(12,4)") {
+		t.Fatalf("err = %v, want the scale refusal naming decimal(12,4)", err)
+	}
+	swapped, err := buildColumns([]baseline.Column{
+		{Name: "id", MySQLType: "bigint"},
+		{Name: "amount", MySQLType: "decimal", DecimalPrecision: 10, DecimalScale: 2},
+		{Name: "status", MySQLType: "varchar"},
+		{Name: "updated_at", MySQLType: "datetime"},
+	}, []string{"id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sameShape(tbl.Schema(), swapped); err == nil || !strings.Contains(err.Error(), `named "status" where the export has "amount"`) {
+		t.Fatalf("err = %v, want the order refusal", err)
+	}
+	otherKey, err := buildColumns(ordersCols, []string{"status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sameShape(tbl.Schema(), otherKey); err == nil || !strings.Contains(err.Error(), "identifier fields") {
+		t.Fatalf("err = %v, want the key refusal", err)
+	}
+}
+
 func TestCursor_newerVersionRefused(t *testing.T) {
 	c := cursor{File: "binlog.000001", Pos: 4, At: time.Now().UTC()}
 	props := c.properties()

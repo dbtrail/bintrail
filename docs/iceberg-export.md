@@ -100,14 +100,24 @@ Four more shapes are refused rather than guessed at, all `refused-gap` or
 - **`--at` below the live window** (older than the oldest live partition).
   The cut is resolved on live events only, so a window under that floor cannot
   be bounded exactly. Export with a later `--at`.
-- **The run's cut is before the cursor**, or the index holds no live events at
-  all while the table has a cursor. The source's binlogs were reset or the
-  index was restored behind the export, so the events in between are not in
-  this index. Remove the table directory to reload it from a fresh baseline.
-- **Skipped events.** When the capture daemon recorded that it skipped events
-  inside the window (a column-count mismatch, for example), the index does
-  not hold every change; fix the cause the skip names, re-snapshot, and reload
-  the table.
+- **The run's cut is before the cursor.** The source's binlogs were reset or
+  the index was restored behind the export, so the events in between are not
+  in this index. Remove the table directory to reload it from a fresh
+  baseline. An index with **no live events at all** is refused the same way
+  once a table has folded deltas (it cannot tell a rotated-out index from a
+  reset one); right after a first load it is simply reported `unchanged`,
+  since a fresh install whose stream has not indexed anything yet has
+  nothing to fold and nothing lost.
+- **Skipped events.** When the capture daemon recorded skipped events (a
+  column-count mismatch, for example) at or after the window's start, the
+  index may not hold every change. The skip tally keeps one timestamp per
+  reason, so a skip recorded after `--at` cannot be told apart from one
+  inside the window and refuses too; fix the cause the skip names,
+  re-snapshot, and reload the table.
+
+These checks run on every invocation, including one where nothing new was
+indexed: a TRUNCATE never lands in the event index, so a quiet window is not
+proof of an unchanged table.
 
 Two conditions refuse before anything is written:
 

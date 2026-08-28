@@ -73,9 +73,10 @@ on the next run; the other tables commit. The exit status is non-zero when any
 table did not end current.
 
 One refusal is for the whole run, before any table is touched: an index that
-holds more than one source (or none it can name in bintrail_servers). Events
+holds more than one source in bintrail_servers, or has no such table. Events
 cannot be attributed to one source, so two sources with the same schema.table
-would interleave in one Iceberg table.
+would interleave in one Iceberg table. A file-mode index with no registered
+source is accepted.
 
 This is a one-shot command for the operator's scheduler. It never runs inside
 the capture daemon.

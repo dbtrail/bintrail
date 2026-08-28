@@ -151,6 +151,8 @@ func TestAppendValue_refusals(t *testing.T) {
 		{"garbage into int", baseline.Column{Name: "c", MySQLType: "int"}, "seven", "not an integer"},
 		{"garbage into datetime", baseline.Column{Name: "c", MySQLType: "datetime"}, "yesterday", "not a date"},
 		{"struct into text", baseline.Column{Name: "c", MySQLType: "varchar"}, struct{}{}, "cannot read"},
+		// Only a zero DATE is a documented NULL; an empty string is not one.
+		{"empty string into datetime", baseline.Column{Name: "c", MySQLType: "datetime"}, "", "not a date"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -193,6 +195,28 @@ func TestRowAppender_caseFoldsAndRefusesAbsentColumns(t *testing.T) {
 	err = app.append(map[string]any{"id": int32(2)})
 	if err == nil || !strings.Contains(err.Error(), "absent from the row image") {
 		t.Fatalf("err = %v, want a refusal naming the absent column", err)
+	}
+}
+
+// TestNewRowAppender_refusesSwappedColumns: the appender writes by ordinal,
+// so two same-typed columns in the other order would write each other's
+// values with no type check to notice.
+func TestNewRowAppender_refusesSwappedColumns(t *testing.T) {
+	ab, err := buildColumns([]baseline.Column{{Name: "id", MySQLType: "int"}, {Name: "a", MySQLType: "varchar"}, {Name: "b", MySQLType: "varchar"}}, []string{"id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ba, err := buildColumns([]baseline.Column{{Name: "id", MySQLType: "int"}, {Name: "b", MySQLType: "varchar"}, {Name: "a", MySQLType: "varchar"}}, []string{"id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := table.SchemaToArrowSchema(icebergSchema(ab), nil, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = newRowAppender(memory.DefaultAllocator, sc, ba)
+	if err == nil || !strings.Contains(err.Error(), `has "a" where the export has "b"`) {
+		t.Fatalf("err = %v, want the swapped-column refusal", err)
 	}
 }
 
