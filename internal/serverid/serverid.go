@@ -12,7 +12,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
-	"errors"
 	"fmt"
 
 	"github.com/go-sql-driver/mysql"
@@ -53,7 +52,20 @@ const DDLBintrailServerChanges = `CREATE TABLE IF NOT EXISTS bintrail_server_cha
 // ErrConflict is returned by ResolveServer when the observed server_uuid matches
 // one active record while the observed host+port+username matches a different
 // active record — a cloned-server situation that requires manual resolution.
-var ErrConflict = errors.New("server identity conflict: server_uuid and host:port:username match different records — resolve manually")
+//
+// It is a comparable value, not an errors.New sentinel, so it can declare its
+// usage-telemetry class (a cloned server is a setup the operator has to fix,
+// hence config_invalid) while errors.Is(err, ErrConflict) keeps working.
+var ErrConflict error = conflictError{}
+
+type conflictError struct{}
+
+func (conflictError) Error() string {
+	return "server identity conflict: server_uuid and host:port:username match different records — resolve manually"
+}
+
+// TelemetryClass implements telemetry.Classed.
+func (conflictError) TelemetryClass() string { return "config_invalid" }
 
 // Server represents an active row in bintrail_servers.
 type Server struct {

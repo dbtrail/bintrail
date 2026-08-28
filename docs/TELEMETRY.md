@@ -87,10 +87,17 @@ A real event looks like this:
 `error_class` is one of exactly these, and nothing else:
 
 ```
-db_connection   db_permission   binlog_parse   binlog_not_found
-schema_mismatch config_invalid  flag_invalid   storage_io
-network         not_found       internal       unknown
+db_connection   db_permission   binlog_not_found   schema_mismatch
+config_invalid  storage_io      not_found          internal
+unknown
 ```
+
+Every class has at least one code path that produces it. `config_invalid`
+is what a refused preflight reports (`up` stopping because the source is not
+configured for ROW capture), `binlog_not_found` covers both the server's own
+"binlog purged" error (1236) and the `--no-gap-fill` refusal, and
+`schema_mismatch` is the stale-snapshot guard. `unknown` is what every other
+failure reports — an honest "no bucket" rather than a guess.
 
 ### Why the values are coarse
 

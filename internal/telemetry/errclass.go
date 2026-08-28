@@ -13,16 +13,19 @@ import (
 // anything else, and in particular never returns err.Error(): bintrail error
 // strings routinely carry DSNs, hostnames, schema and table names, and file
 // paths.
+//
+// Every class here has at least one producer in the tree. Three that never
+// had one (binlog_parse, flag_invalid, network) were dropped in #1503: a
+// documented class no code path can emit reads as coverage that does not
+// exist, and the only way to produce them would have been to match on
+// message text, which this package refuses to do.
 const (
 	ClassDBConnection   = "db_connection"
 	ClassDBPermission   = "db_permission"
-	ClassBinlogParse    = "binlog_parse"
 	ClassBinlogNotFound = "binlog_not_found"
 	ClassSchemaMismatch = "schema_mismatch"
 	ClassConfigInvalid  = "config_invalid"
-	ClassFlagInvalid    = "flag_invalid"
 	ClassStorageIO      = "storage_io"
-	ClassNetwork        = "network"
 	ClassNotFound       = "not_found"
 	ClassInternal       = "internal"
 	ClassUnknown        = "unknown"
@@ -33,29 +36,73 @@ const (
 var classes = map[string]bool{
 	ClassDBConnection:   true,
 	ClassDBPermission:   true,
-	ClassBinlogParse:    true,
 	ClassBinlogNotFound: true,
 	ClassSchemaMismatch: true,
 	ClassConfigInvalid:  true,
-	ClassFlagInvalid:    true,
 	ClassStorageIO:      true,
-	ClassNetwork:        true,
 	ClassNotFound:       true,
 	ClassInternal:       true,
 	ClassUnknown:        true,
 }
 
+// Classed is implemented by errors that know their own telemetry class. The
+// packages that produce the failures worth distinguishing (doctor, serverid,
+// streamrun, parser, metadata) implement it on their sentinel or typed errors,
+// which lets ClassifyError bucket them without this package importing any of
+// them — telemetry sits under every binary, and pulling the capture stack (or
+// the doctor's AWS SDK) into it would drag those into binaries that never use
+// them. The method returns a class NAME, never a message; a value outside the
+// taxonomy is coerced to "unknown" by normalizeClass, and the wiring tests in
+// this package assert the exact class against each real producer.
+type Classed interface {
+	TelemetryClass() string
+}
+
+// MySQLNumbered is implemented by errors that carry a MySQL server error
+// number from a client library this package must not link. The replication
+// client (go-mysql) is the one that sees a binlog-side failure such as 1236,
+// but it is a capture library, and telemetry sits under the read layer too
+// (internal/event's depguard test forbids the console from linking it), so
+// the capture side wraps its error (parser.ReplicationError) and this package
+// reads the number through the interface. The number is all that is read.
+type MySQLNumbered interface {
+	MySQLErrorNumber() uint16
+}
+
 // MySQL server error numbers worth distinguishing. Only the number is read —
-// MySQLError.Message can contain schema, table and user names.
+// the Message field of either error type can contain schema, table and user
+// names.
 const (
 	erDBAccessDenied     = 1044
 	erAccessDenied       = 1045
+	erHostNotPrivileged  = 1130
 	erTableAccessDenied  = 1142
 	erColumnAccessDenied = 1143
 	erSpecificAccess     = 1227
 	erBadDB              = 1049
 	erNoSuchTable        = 1146
+	// ER_MASTER_FATAL_ERROR_READING_BINLOG: the source cannot serve the
+	// requested position — the binlog was purged, or the GTID set names
+	// transactions it no longer has. The replication client is the only path
+	// that ever sees it, which is why it arrives through MySQLNumbered and not
+	// as the driver's *MySQLError.
+	erMasterFatalReadingBinlog = 1236
 )
+
+// classifyMySQLNumber maps a server error number to a class, shared by the
+// two client libraries that can surface one. Returns "" for numbers with no
+// bucket so the caller can record that the server DID answer.
+func classifyMySQLNumber(number uint16) string {
+	switch number {
+	case erAccessDenied, erDBAccessDenied, erHostNotPrivileged, erTableAccessDenied, erColumnAccessDenied, erSpecificAccess:
+		return ClassDBPermission
+	case erBadDB, erNoSuchTable:
+		return ClassNotFound
+	case erMasterFatalReadingBinlog:
+		return ClassBinlogNotFound
+	}
+	return ""
+}
 
 // ClassifyError maps an error to a bounded class using structural checks
 // (errors.Is/errors.As) only — never string matching, which would couple the
@@ -69,16 +116,30 @@ func ClassifyError(err error) string {
 		return ""
 	}
 
-	var myErr *mysql.MySQLError
-	if errors.As(err, &myErr) {
-		switch myErr.Number {
-		case erAccessDenied, erDBAccessDenied, erTableAccessDenied, erColumnAccessDenied, erSpecificAccess:
-			return ClassDBPermission
-		case erBadDB, erNoSuchTable:
-			return ClassNotFound
+	// A producer that declared its own class wins: it knows more about the
+	// failure than any structural probe below can infer.
+	var classed Classed
+	if errors.As(err, &classed) {
+		return normalizeClass(classed.TelemetryClass())
+	}
+
+	// The query driver (go-sql-driver) and the replication client each wrap a
+	// server error packet in their own type; a binlog-side failure only ever
+	// arrives through the latter, which reaches here as a MySQLNumbered.
+	var drvErr *mysql.MySQLError
+	if errors.As(err, &drvErr) {
+		if class := classifyMySQLNumber(drvErr.Number); class != "" {
+			return class
 		}
 		// The server answered, so this is not a connectivity problem, but the
 		// specific failure is not one we have a bucket for.
+		return ClassUnknown
+	}
+	var numbered MySQLNumbered
+	if errors.As(err, &numbered) {
+		if class := classifyMySQLNumber(numbered.MySQLErrorNumber()); class != "" {
+			return class
+		}
 		return ClassUnknown
 	}
 

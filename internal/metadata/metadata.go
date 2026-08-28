@@ -29,7 +29,18 @@ const latestPerTableLoadTimeout = 15 * time.Second
 // run `bintrail snapshot` yet" from a genuine DB-side failure
 // (table dropped post-upgrade, permissions revoked, connection
 // lost) — which deserve a louder log channel.
-var ErrNoSnapshots = errors.New("no snapshots found; run `bintrail snapshot` first")
+//
+// A comparable value rather than an errors.New sentinel so it can declare its
+// usage-telemetry class (not_found: the snapshot the command needs does not
+// exist yet); errors.Is(err, ErrNoSnapshots) is unchanged.
+var ErrNoSnapshots error = noSnapshotsError{}
+
+type noSnapshotsError struct{}
+
+func (noSnapshotsError) Error() string { return "no snapshots found; run `bintrail snapshot` first" }
+
+// TelemetryClass implements telemetry.Classed.
+func (noSnapshotsError) TelemetryClass() string { return "not_found" }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 

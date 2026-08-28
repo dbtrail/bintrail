@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1180,9 +1181,45 @@ func (r *Report) Write(w io.Writer, format string) error {
 // non-zero for CI/scripting use cases. Warnings do not cause failure.
 func (r *Report) Err() error {
 	if r.Failed > 0 {
-		return fmt.Errorf("%d preflight check(s) failed", r.Failed)
+		return &PreflightError{Failed: r.Failed, Checks: r.failingNames(nil)}
 	}
 	return nil
+}
+
+// PreflightError is the typed form of "N preflight check(s) failed", so a
+// consumer can recognise a preflight refusal with errors.As instead of by its
+// text. It carries the failing checks' NAMES only — string literals in this
+// package ("binlog_format=ROW", "log_bin enabled") — never a Detail, which
+// quotes server variables, grants and hostnames. The message bytes are the
+// ones the untyped error used to print.
+type PreflightError struct {
+	// Failed is the number of non-advisory failures the caller counted.
+	Failed int
+	// Checks lists the failing checks' names in report order.
+	Checks []string
+}
+
+func (e *PreflightError) Error() string {
+	return fmt.Sprintf("%d preflight check(s) failed", e.Failed)
+}
+
+// TelemetryClass implements telemetry.Classed. A preflight refusal means the
+// source or the index is not set up the way capture needs it (ROW format,
+// FULL row image, log_bin, grants), which is what the operator has to change
+// — config_invalid, not a crash.
+func (e *PreflightError) TelemetryClass() string { return "config_invalid" }
+
+// failingNames lists the names of the checks in StatusFail that are not in
+// advisory, in report order.
+func (r *Report) failingNames(advisory []string) []string {
+	var names []string
+	for _, c := range r.Checks {
+		if c.Status != StatusFail || slices.Contains(advisory, c.Name) {
+			continue
+		}
+		names = append(names, c.Name)
+	}
+	return names
 }
 
 // ErrExcluding is Err but ignoring failures of the named advisory checks.
@@ -1192,24 +1229,8 @@ func (r *Report) Err() error {
 // capturing while there is still room. The standalone `doctor` command keeps
 // full FAIL semantics (CI smoke tests SHOULD go red on a capacity overrun).
 func (r *Report) ErrExcluding(advisory ...string) error {
-	failed := 0
-	for _, c := range r.Checks {
-		if c.Status != StatusFail {
-			continue
-		}
-		isAdvisory := false
-		for _, name := range advisory {
-			if c.Name == name {
-				isAdvisory = true
-				break
-			}
-		}
-		if !isAdvisory {
-			failed++
-		}
-	}
-	if failed > 0 {
-		return fmt.Errorf("%d preflight check(s) failed", failed)
+	if names := r.failingNames(advisory); len(names) > 0 {
+		return &PreflightError{Failed: len(names), Checks: names}
 	}
 	return nil
 }

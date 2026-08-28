@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Usage telemetry classifies first-run failures** (#1503). A fresh install
+  that could not start reported every attempt as `error_class: unknown`, so
+  the one thing telemetry exists to show — why a first run fails — was
+  invisible. Errors now declare their own class through a small interface
+  (`telemetry.Classed`), with no message text involved: a refused preflight
+  (`up`'s doctor) is `config_invalid`, the server's "binlog purged" error
+  (1236, which only the replication client ever sees and which the classifier
+  used to miss because it arrives as go-mysql's error type, not the driver's)
+  and the `--no-gap-fill` refusal are `binlog_not_found`, the stale-snapshot
+  guard is `schema_mismatch`, a missing snapshot is `not_found`, a server
+  identity conflict is `config_invalid`, and "host not allowed" (1130) is
+  `db_permission`. Three classes no code path could ever emit
+  (`binlog_parse`, `flag_invalid`, `network`) are removed from the taxonomy
+  and from `docs/TELEMETRY.md`. The wire format and `schema_version` are
+  unchanged.
+
 ## [0.70.0] - 2026-08-28
 
 ### Added

@@ -654,7 +654,7 @@ func handleRows(
 					"snapshot_time", snapTime)
 				break
 			}
-			return fmt.Errorf(
+			return &SchemaDriftError{msg: fmt.Sprintf(
 				"schema drift detected at %s:%d for %s.%s: binlog TABLE_MAP column %d is %q but schema snapshot %d has %q; "+
 					"the snapshot is stale (a column was renamed, or dropped and re-added, since it was taken) and indexing "+
 					"these events would attribute row values to the wrong columns — run `bintrail snapshot` against the "+
@@ -662,7 +662,7 @@ func handleRows(
 					"its checkpoint); if this event actually PREDATES the snapshot, check for clock skew between the "+
 					"bintrail host and the source server",
 				filename, binlogEv.Header.LogPos, schema, table,
-				i+1, names[i], schemaVersion, tm.Columns[i].Name)
+				i+1, names[i], schemaVersion, tm.Columns[i].Name)}
 		}
 	}
 
@@ -1157,3 +1157,16 @@ func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp tim
 		SchemaVersion: schemaVersion,
 	}, true
 }
+
+// SchemaDriftError is the #700 hard error: a TABLE_MAP whose column names
+// disagree with the schema snapshot at or after the snapshot's own time, so
+// indexing would attribute row values to the wrong columns. The message names
+// the file, position, table and both column spellings; that text is for the
+// operator and never leaves the process — the only thing the type exposes to
+// usage telemetry is its class.
+type SchemaDriftError struct{ msg string }
+
+func (e *SchemaDriftError) Error() string { return e.msg }
+
+// TelemetryClass implements telemetry.Classed.
+func (e *SchemaDriftError) TelemetryClass() string { return "schema_mismatch" }

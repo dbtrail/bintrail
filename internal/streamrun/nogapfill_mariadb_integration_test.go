@@ -5,6 +5,7 @@ package streamrun
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -157,6 +158,14 @@ func TestOne_MariaDBGTID_noGapFillRefusesUnfillableGap(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("One() with --no-gap-fill must refuse to start over an unfillable MariaDB GTID gap, got nil")
+	}
+	// The refusal is TYPED (#1503): usage telemetry classifies it as
+	// binlog_not_found through errors.As, so the real return site in One —
+	// not a hand-built value — must produce the type. The unit test in
+	// telemetry_class_test.go covers the class; this is the wiring.
+	var refused *GapRefusedError
+	if !errors.As(err, &refused) {
+		t.Errorf("refusal is %T, want *GapRefusedError", err)
 	}
 
 	// Pin the refusal MESSAGE shape: it must name the flag the operator set
