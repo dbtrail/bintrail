@@ -2493,8 +2493,9 @@ func StartMetricsServer(addr string) (shutdown func(), err error) {
 }
 
 // GapRefusedError is the --no-gap-fill refusal: the checkpoint names a
-// position the source no longer has (binlogs purged, or GTIDs gone from the
-// executed set) and the operator asked not to auto-advance past it. Message is
+// position the source can no longer serve (binlogs purged, GTIDs inside the
+// source's purged set, or a same-named file regenerated after RESET MASTER)
+// and the operator asked not to auto-advance past it. Message is
 // the gap detector's human description, which names binlog files and GTIDs —
 // operator-facing only; the type's usage-telemetry class is binlog_not_found,
 // the same bucket as the server's own 1236 for the same condition.

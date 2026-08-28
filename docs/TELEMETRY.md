@@ -93,11 +93,12 @@ unknown
 ```
 
 Every class has at least one code path that produces it. `config_invalid`
-is what a refused preflight reports (`up` stopping because the source is not
-configured for ROW capture), `binlog_not_found` covers both the server's own
-"binlog purged" error (1236) and the `--no-gap-fill` refusal, and
-`schema_mismatch` is the stale-snapshot guard. `unknown` is what every other
-failure reports — an honest "no bucket" rather than a guess.
+covers a refused preflight (`doctor`, or `up` refusing to boot because the
+source is not configured for ROW capture) and a server identity conflict,
+`binlog_not_found` covers both the server's own "binlog purged" error (1236)
+and the `--no-gap-fill` refusal, and `schema_mismatch` is the stale-snapshot
+guard. `unknown` is what a failure with no bucket reports — an honest "no
+bucket" rather than a guess.
 
 ### Why the values are coarse
 

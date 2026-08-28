@@ -26,8 +26,10 @@ func (e *ReplicationError) MySQLErrorNumber() uint16 { return e.Code }
 
 // WrapReplicationError returns err wrapped in a *ReplicationError when its
 // chain carries a *gomysql.MyError, and err itself otherwise (including nil).
-// Call it where a replication error leaves the capture stack: StreamParser.Run
-// and the StartSync/StartSyncGTID call sites.
+// Call it where a replication error leaves the capture stack. Wrapped today:
+// StreamParser.Run (GetEvent), streamrun's StartSync/StartSyncGTID, and the
+// agent's startBYOSSyncer. A new syncer call site that returns the raw error
+// reports its 1236 as "unknown" again.
 func WrapReplicationError(err error) error {
 	var my *gomysql.MyError
 	if err == nil || !errors.As(err, &my) {

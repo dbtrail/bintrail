@@ -250,6 +250,7 @@ func runIndex(cmd *cobra.Command, args []string) error {
 
 	var totalEvents int64
 	var failedFiles int
+	var firstErr error
 	for _, filename := range files {
 		n, err := indexFile(ctx, p, idx, indexDB, idxBinlogDir, filename, bintrailID)
 		totalEvents += n
@@ -258,6 +259,9 @@ func runIndex(cmd *cobra.Command, args []string) error {
 			// the failure is surfaced as a non-zero exit after the loop (#652).
 			slog.Error("indexing failed", "file", filename, "error", err)
 			failedFiles++
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
@@ -295,9 +299,12 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	// Fail loud: a file that could not be fully indexed (e.g. an event the
 	// server rejects as over max_allowed_packet) must not exit 0 and read as
 	// success to a cron/CI wrapper (#652). The per-file failure is already
-	// recorded as status='failed' in index_state.
+	// recorded as status='failed' in index_state. The first failure stays in
+	// the chain (%w) so a typed cause — the schema-drift guard, a replication
+	// server error — keeps its usage-telemetry class instead of collapsing to
+	// "unknown" behind a fresh summary error (#1503).
 	if failedFiles > 0 {
-		return fmt.Errorf("indexing finished with %d of %d file(s) failed", failedFiles, len(files))
+		return fmt.Errorf("indexing finished with %d of %d file(s) failed; first failure: %w", failedFiles, len(files), firstErr)
 	}
 	return nil
 }

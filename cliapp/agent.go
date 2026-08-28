@@ -774,7 +774,8 @@ func startBYOSSyncer(sourceDB *sql.DB, syncer *replication.BinlogSyncer, flavor,
 		if err != nil {
 			return nil, err
 		}
-		return syncer.StartSyncGTID(gset)
+		s, err := syncer.StartSyncGTID(gset)
+		return s, parser.WrapReplicationError(err)
 	}
 	// No start GTID — query current position from source and start there.
 	file, pos, err := config.CurrentBinlogPosition(sourceDB)
@@ -782,7 +783,8 @@ func startBYOSSyncer(sourceDB *sql.DB, syncer *replication.BinlogSyncer, flavor,
 		return nil, err
 	}
 	slog.Info("starting from current binlog position", "file", file, "pos", pos)
-	return syncer.StartSync(gomysql.Position{Name: file, Pos: pos})
+	s, err := syncer.StartSync(gomysql.Position{Name: file, Pos: pos})
+	return s, parser.WrapReplicationError(err)
 }
 
 // parseBYOSStartGTID parses --start-gtid with the parser for the configured

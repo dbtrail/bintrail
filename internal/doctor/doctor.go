@@ -1188,12 +1188,13 @@ func (r *Report) Err() error {
 
 // PreflightError is the typed form of "N preflight check(s) failed", so a
 // consumer can recognise a preflight refusal with errors.As instead of by its
-// text. It carries the failing checks' NAMES only — string literals in this
-// package ("binlog_format=ROW", "log_bin enabled") — never a Detail, which
-// quotes server variables, grants and hostnames. The message bytes are the
-// ones the untyped error used to print.
+// text. It carries the failing checks' NAMES only (the fixed check names such
+// as "binlog_format=ROW"; extensions registered through cliapp add their own)
+// — never a Detail, which quotes server variables, grants and hostnames. The
+// message bytes are the ones the untyped error used to print.
 type PreflightError struct {
-	// Failed is the number of non-advisory failures the caller counted.
+	// Failed is the number of failures after the caller's exclusions (Err:
+	// all of them; ErrExcluding: minus the named advisory checks).
 	Failed int
 	// Checks lists the failing checks' names in report order.
 	Checks []string
