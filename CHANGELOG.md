@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A backup job that hits an internal error no longer stops capture**
+  (#1472). Under `bintrail-console watch` one process is both the console and
+  the capture plane. The four background baseline jobs (the scheduled refresh,
+  the Create-baseline button, the point-in-time restore, the custom `.sql`
+  build) each ran in a goroutine with no crash guard, so an internal error in
+  any of them killed the daemon and stopped replication capture. The docs
+  promise the opposite: a backup that stopped refreshing is a degradation, a
+  daemon that stopped capturing is an outage. Each job now contains its own
+  crash: the daemon keeps capturing, the run is reported as failed on the
+  Backups page with the error, and the stack goes to the daemon log at error
+  level so the cause is still recoverable. It is contained, not hidden. A job
+  that already published its snapshot before the error is left reported as
+  succeeded, because the snapshot is on disk. The four jobs share one lock per
+  server, so the failed state also frees that lock, where a crashed goroutine
+  used to leave the server stuck as busy and refuse every later backup job for
+  it. One thing to know: a run that ends this way leaves no row in the Backups
+  page's run history, so read its status card and the daemon log for it.
 - **The console daemon's background folds are bounded, and their volume warning
   works** (#1477). `bintrail-console watch` rebuilds snapshots in the same
   process that captures binlogs, for the scheduled baseline refresh, the

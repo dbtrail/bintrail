@@ -49,6 +49,7 @@ func (s *baselineSupervisor) RestoreStatus(serverID string) console.BaselineStat
 }
 
 func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
+	defer s.recoverBaselineJob(baselineJobRestore, req.ServerID, req.ServerName)
 	started := time.Now().UTC()
 	tables, refused, carried, err := s.executeRestore(req)
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
