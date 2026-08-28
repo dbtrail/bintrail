@@ -46,11 +46,11 @@ text and is named in the file.
 bintrail never runs what it prints. It does open DuckDB once while generating,
 to read the column types out of the baseline files' Parquet footers, and that
 read touches footers only. Nothing in the file writes, and no credentials
-appear in it — S3
-access goes through DuckDB's credential chain, the same way bintrail's own
-S3 reads do. That S3 secret lives only in the DuckDB session that runs the
-file: views persist in a database file, secrets do not, so run the file in
-every session that reads S3 (.read views.sql, or duckdb -init views.sql).
+appear in it. S3 access goes through DuckDB's credential chain, the same way
+bintrail's own S3 reads do. That S3 secret lives only in the DuckDB session
+that runs the file: views persist in a database file, secrets do not, so run
+the file in every session that reads S3 (.read views.sql, or duckdb -init
+views.sql).
 
 Archive sources discovered from the index are named so the file works from
 another machine: an archive registered with both a local path and an S3

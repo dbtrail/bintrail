@@ -21,11 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reason is worth knowing before reaching for a wider type: MySQL allows
   `DECIMAL(65,30)` while DuckDB stops at 38 digits, and the stored text is also
   what the recovery paths join and compare on, byte for byte, against the value
-  read out of the binlog. Two cases still read as text, and
-  the generated file now names each column and says why: a column wider than
-  38 digits has no DuckDB `DECIMAL` to be cast to, and a baseline taken before
-  bintrail embedded the `CREATE TABLE` in the footer carries no column types
-  to read. The console's SQL panel executes these views and discards their
+  read out of the binlog. Some columns still read as text, and the generated
+  file names each one and says why: a column wider than 38 digits has no DuckDB
+  `DECIMAL` to be cast to; a baseline taken before bintrail embedded the
+  `CREATE TABLE` in the footer carries no column types to read; and a
+  PostgreSQL-source baseline stores every value as text and never carries that
+  key, by design, so there is nothing to read. The console's SQL panel
+  executes these views and discards their
   text, so when a file carries no column types it now says so next to the rows
   instead of leaving a `sum(VARCHAR)` error unexplained. `docs/parquet-debugging.md`
   covers casting by hand for anyone pointing DuckDB at the files without the

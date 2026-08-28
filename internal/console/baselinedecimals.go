@@ -88,9 +88,22 @@ func (s *Server) rememberBaselineDecimals(key string, decimals map[string][]base
 // the failure #1486 exists to remove, reproduced on the one surface whose
 // output is rows rather than a file. Same shape as sqlPanelRegistryNote.
 //
-// Worded as a fact about the files, not as a fault: for a PostgreSQL-source
-// baseline, and for one taken before bintrail embedded the schema, nothing is
-// wrong and there is nothing to go fix.
+// On a PostgreSQL-source console this fires on EVERY panel query, forever, and
+// that is the considered answer rather than an oversight. A standing warning on
+// a healthy system is normally the shape this repo treats as a defect, but the
+// test is whether the thing being reported is real, and here it is: a PG
+// baseline stores every value as text (pgbaseline writes RawText columns) and
+// deliberately omits the embedded CREATE TABLE, so its DECIMAL columns really
+// do read as text and sum() over one really does fail. Suppressing the note
+// there would remove the only available explanation from the one deployment
+// where the limitation is permanent. So it stays, worded as a property of the
+// files with the action attached, and it names the two benign causes so nobody
+// goes hunting a corrupt baseline.
+//
+// This is the one thing the generated file says that the panel cannot: the file
+// splits its note three ways because it can afford the room, while the panel has
+// only the SchemaKnown bit, which cannot tell an old baseline from a PG one from
+// a footer that would not open.
 func sqlPanelDecimalNote(in views.Input) string {
 	var untyped int
 	for _, t := range in.Baselines {
@@ -101,7 +114,8 @@ func sqlPanelDecimalNote(in views.Input) string {
 	if untyped == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%d of %d baseline tables carry no column types, so their state views do not "+
-		"cast DECIMAL columns; those columns read as text and an aggregate over one needs an "+
-		"explicit CAST", untyped, len(in.Baselines))
+	return fmt.Sprintf("%d of %d baseline tables store no column types in their files, so their "+
+		"state views leave DECIMAL columns as text and an aggregate over one needs an explicit "+
+		"CAST. A PostgreSQL source never stores them, and neither did baselines taken before "+
+		"bintrail began recording them", untyped, len(in.Baselines))
 }

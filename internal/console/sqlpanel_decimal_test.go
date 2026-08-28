@@ -67,7 +67,10 @@ func TestSQLPanel_warnsWhenCastsAreMissing(t *testing.T) {
 	}
 	found := false
 	for _, w := range res.Warnings {
-		if strings.Contains(w, "carry no column types") {
+		// Pinned on the ACTION, not on the sentence: a user who reads this note
+		// needs to come away knowing to cast. Wording that drops "explicit CAST"
+		// has stopped doing the job even if it still describes the situation.
+		if strings.Contains(w, "explicit CAST") {
 			found = true
 		}
 	}
