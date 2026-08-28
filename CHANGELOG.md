@@ -62,6 +62,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are still reconstructed, and the ones untouched within that window are not.
   The new caveat says exactly that, and it now says it for both kinds of root
   event rather than assuming a deleted parent.
+- **A backup job that hits an internal error no longer stops capture**
+  (#1472). Under `bintrail-console watch` one process is both the console and
+  the capture plane. The four background baseline jobs (the scheduled refresh,
+  the Create-baseline button, the point-in-time restore, the custom `.sql`
+  build) each ran in a goroutine with no crash guard, so an internal error in
+  any of them killed the daemon and stopped replication capture. The docs
+  promise the opposite: a backup that stopped refreshing is a degradation, a
+  daemon that stopped capturing is an outage. Two layers now contain it. An
+  internal error while rebuilding one table is recorded against that table, the
+  other tables carry on, and the run fails without publishing, exactly as it
+  would for any other unusable table. An internal error anywhere else in the
+  job marks the run failed on the Backups page. Either way the daemon keeps
+  capturing and the stack goes to the daemon log at error level, so the cause
+  is still there to read. It is contained, not hidden. A job that already
+  published its snapshot before the error is left reported as succeeded,
+  because the snapshot is on disk. The four jobs share one lock per server, so
+  the failed state also frees that lock, where a crashed goroutine used to
+  leave the server stuck as busy and refuse every later backup job for it.
+  Two things to know: a run whose error lands outside the table rebuild leaves
+  no row in the Backups page's run history, so read its status card and the
+  daemon log for it; and the manual Create-baseline button converts mydumper's
+  output table by table, where an internal error still stops the daemon.
+  Everything the CLI did before is unchanged apart from where the stack is
+  printed: `bintrail reconstruct` and `baseline refresh` still exit non-zero,
+  and now log the stack instead of dying on it.
+- **A slow index no longer ends capture** (#1482). `bintrail-console watch`
+  supervised the sources added from its console, restarting them with backoff,
+  but ran its own `--source-dsn` source as a single call: a batch INSERT that
+  ran past `--write-timeout` returned an error the daemon exited on, and
+  nothing restarted it. Read pressure on the index was enough to trigger it,
+  and capture then stayed down until an operator noticed, with the exposure
+  bounded only by how long the source keeps its binlogs. That exit also ran the
+  supervisor's shutdown, so the main source's failure stopped every supervised
+  source alongside it, and those recorded `stopped` rather than `failed`,
+  leaving nothing to show they had died of another source's error. The write
+  deadline is now its own failure class and the main source restarts on it,
+  under the policy the supervised sources already used: 15s doubling to a 5m
+  cap, reset by a run that streamed for more than 10 minutes, and a permanent
+  stop after 6h of continuous crash-looping that returns the original error
+  with its original advice. Every other error still ends the run on the first
+  failure, unchanged. This restarts the stream and deliberately does NOT retry
+  the INSERT in place, a distinction that must survive any later
+  simplification: the deadline is enforced by the client, which cancels by
+  closing the socket without a `KILL QUERY`, so a batch that was merely slow
+  usually goes on to commit on the server after the client stopped waiting, and
+  re-running that statement would write every row a second time, permanently,
+  into a table with no natural key to deduplicate on. A restart instead replays
+  from the last checkpoint through the dedup-on-resume step, which exists to
+  drop exactly those rows. Know three limits. The breaker bounds a fast crash
+  loop, not a slow flap: a source that fails only after runs longer than the
+  healthy-reset window restarts indefinitely, which is long-standing behaviour
+  and is what you want, since capture is up for all but the backoff of such a
+  cycle. The new failure class covers the batch INSERT only, so a deadline on
+  the checkpoint or the gap record still ends the daemon as before. And the
+  daemon no longer exiting means its Prometheus target no longer disappears, so
+  an `up == 0` alert will not fire and the stream gauges freeze at their last
+  healthy value rather than rising: alert on staleness of
+  `bintrail_stream_last_flush_timestamp_seconds` instead of on a lag gauge, and
+  note that `watch` exposes no metrics at all unless `--metrics-addr` is set.
+- **A connection attempt can no longer block forever** (#1482). `Connect` and
+  `ConnectWithTLS` verified a new connection with an unbounded ping, and the
+  `timeout=` DSN parameter is the dial timeout only, with no read or write
+  timeout set anywhere. A server that accepted the TCP connection and then
+  never completed the MySQL handshake, which is what a frozen VM or an
+  idle-dropped load balancer looks like, left the caller blocked with no way
+  out. Both paths now spend the DSN's own connect budget on the handshake as
+  well, so such a peer surfaces as a ping error. The bound covers the connect
+  phase only and never becomes a read deadline on an established connection, so
+  long-running statements are unaffected; raise `timeout=` in the DSN if a
+  server legitimately needs longer to complete a handshake.
+- **A supervised source no longer gives up after one failure that follows a
+  long healthy run** (#1482). The crash-loop circuit breaker measured the
+  failed run's own uptime instead of how long the source had been failing, so a
+  source that had streamed for longer than the 6h give-up threshold, which is
+  the normal state of a healthy daemon, was marked permanently `failed` on its
+  first failure without a single retry, reporting a crash loop that had never
+  happened. It now measures from the first failure. The retry delay also
+  overflowed after 30 consecutive failures and became no delay at all, hammering
+  a failing source roughly 2h13m into what should have been a 6h budget; it now
+  stops growing once it reaches the 5m cap.
 - **The console daemon keeps its baseline run history, and says when it cannot
   find a home directory** (#1487). A daemon started without `HOME`, which is
   how a service manager starts one, resolved its server registry, auth file,

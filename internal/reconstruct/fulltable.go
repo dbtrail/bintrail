@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -407,6 +408,56 @@ func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport
 	return reconstructTables(ctx, cfg, nil)
 }
 
+// foldOneTable is ReconstructTable behind a seam, so a test can make ONE
+// table's fold panic. The fan-out goroutine below is only reachable with a
+// live index and a schema snapshot, and the panic it has to survive comes from
+// deep inside a real fold (DuckDB over customer Parquet), which no fixture can
+// stage on demand. Written by tests only; production never reassigns it.
+var foldOneTable = ReconstructTable
+
+// recoverTableFold turns a panic in one table's fold into that table's
+// FAILURE, instead of letting it end the process.
+//
+// recover() is per-goroutine, so the guard consoleapp puts on its four
+// baseline job goroutines cannot reach here: this is a CHILD goroutine, and a
+// panic in it kills the process however well the parent is guarded. That
+// matters because under `bintrail-console watch` the process that runs this
+// fold is also the capture plane, and this is the surface #1472 named. The
+// fold decodes a customer's own Parquet through DuckDB, with column types that
+// came from their CREATE TABLE.
+//
+// It is a failure, not a swallow. The panic is logged at error level WITH the
+// stack, which is where the diagnosis now lives since the process no longer
+// dies printing it, and the table is recorded in BOTH sinks its ordinary error
+// path uses. So it flows on as an ordinary per-table failure: the joined error
+// fails the run, the completeness marker stays _INCOMPLETE, nothing is
+// published, and the caller's own reporting (a run history row, a refusal
+// count, a non-zero exit) happens exactly as it would for any other bad table.
+// The CLI keeps everything it had: it exits non-zero and the stack is in the
+// log, rather than on stderr from a dying process.
+//
+// One table's crash does not stop its siblings, which is deliberate: they are
+// independent folds, and the run is failing as a whole anyway.
+//
+// mu must be the mutex guarding errs and failures. failures may be nil (the
+// ReconstructTables entry point passes none); errs never is.
+func recoverTableFold(schema, table string, mu *sync.Mutex, errs *[]error, failures *[]TableFailure) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	slog.Error("full-table reconstruct hit an internal error on one table; the other tables continue and "+
+		"the run will fail without publishing. Please report this with the stack recorded here.",
+		"schema", schema, "table", table, "panic", r, "stack", string(debug.Stack()))
+	err := fmt.Errorf("%s.%s: internal error: %v", schema, table, r)
+	mu.Lock()
+	defer mu.Unlock()
+	*errs = append(*errs, err)
+	if failures != nil {
+		*failures = append(*failures, TableFailure{Schema: schema, Table: table, Err: err})
+	}
+}
+
 // reconstructTables is the implementation both entry points share. failures, when
 // non-nil, collects each per-table error alongside the joined one.
 func reconstructTables(ctx context.Context, cfg FullTableConfig, failures *[]TableFailure) ([]*TableReport, error) {
@@ -592,6 +643,10 @@ func reconstructTables(ctx context.Context, cfg FullTableConfig, failures *[]Tab
 		wg.Add(1)
 		go func(schema, table string) {
 			defer wg.Done()
+			// Registered AFTER wg.Done so it runs BEFORE it: the parent reads
+			// errs/failures once wg.Wait returns, and appending after that
+			// would be a data race.
+			defer recoverTableFold(schema, table, &mu, &errs, failures)
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
@@ -599,7 +654,7 @@ func reconstructTables(ctx context.Context, cfg FullTableConfig, failures *[]Tab
 				return
 			}
 
-			rep, err := ReconstructTable(ctx, cfg, schema, table, db, engine, archSources, resolver, dbName)
+			rep, err := foldOneTable(ctx, cfg, schema, table, db, engine, archSources, resolver, dbName)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {

@@ -148,6 +148,13 @@ func TestBaselineSupervisor_statusSlotsAreSeparate(t *testing.T) {
 // TestRunBaselineRefreshCycle_survivesAPanic: this loop must never be able to
 // take down a daemon that is also streaming replication. A refresh that stops is
 // a degradation; a daemon that stops capturing is an outage.
+//
+// Scope, because the name is broader than the test: this covers the DISPATCH
+// half only. Its panic is raised by a nil-map write inside TriggerRefresh,
+// which runs synchronously, and runBaselineRefreshCycle's recover sits on the
+// near side of the `go` that follows. The fold itself is guarded separately
+// and covered by TestBaselineJobGoroutines_survivePanicAndReportFailure
+// (#1472); reading this one as covering both is what left the fold unguarded.
 func TestRunBaselineRefreshCycle_survivesAPanic(t *testing.T) {
 	// A nil supervisor makes TriggerRefresh panic on the nil map write; the
 	// cycle's recover must contain it.
