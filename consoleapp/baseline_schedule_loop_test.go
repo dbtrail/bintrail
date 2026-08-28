@@ -353,8 +353,52 @@ func TestBackupScheduler_refusedRebuildFallsBackToAFullBackup(t *testing.T) {
 	if !strings.Contains(st2.LastSkipReason, "capture gap") || !strings.Contains(st2.LastSkipReason, "not set to 1") {
 		t.Fatalf("skip reason = %q, want the refusal and why a full backup cannot start", st2.LastSkipReason)
 	}
+	// The reason is about THIS server: it has no S3 destination and the
+	// message must not invent one (the first cut routed the decision through
+	// a forced S3 field and pasted its sentence into the skip).
+	if strings.Contains(st2.LastSkipReason, "S3") {
+		t.Fatalf("skip reason names S3 on a server that has none: %q", st2.LastSkipReason)
+	}
 	if sup2.Status(e2.ID).State != "idle" {
 		t.Fatal("a full backup was started without the opt-in")
+	}
+}
+
+// A rebuild that fails because the daemon is shutting down is not a
+// refusal: no full backup of production is started on the way out.
+func TestBackupScheduler_noFallbackDuringShutdown(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	holdFold(t, func(ctx context.Context, _ reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		close(started)
+		<-release
+		return nil, nil, ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
+	h, err := console.OpenBaselineHistory(t.TempDir() + "/h.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sup.history = h
+	reg, _ := console.LoadRegistry("")
+	b := newBackupScheduler(sup, reg, true, false)
+	e := addScheduled(t, reg, true)
+	e.SourceDSN = "src:pw@tcp(127.0.0.1:3306)/"
+	if err := reg.Update(e); err != nil {
+		t.Fatal(err)
+	}
+	fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+	<-started
+	cancel() // the daemon is going down while the rebuild is in flight
+	close(release)
+	waitTerminal(t, b, e.ID)
+	time.Sleep(2500 * time.Millisecond) // two fallback ticks
+	if st := sup.Status(e.ID); st.State != "idle" {
+		t.Fatalf("a full backup was started during shutdown: %+v", st)
+	}
+	if st := b.ScheduleState(e.ID); st.LastFallbackAt != "" {
+		t.Fatalf("a shutdown-caused failure was recorded as a fallback: %+v", st)
 	}
 }
 

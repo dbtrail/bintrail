@@ -4636,7 +4636,13 @@ function backupScheduleCard(cur, b) {
   // the last good run is exactly what the operator needs to see.
   if (sch) {
     let alarm = false;
-    if (sch.runnable && sch.next_method) {
+    if (sch.runnable && sch.next_method_error) {
+      // Runnable in principle, but the next slot will be skipped as things
+      // stand: said in red BEFORE the slot, not discovered after it.
+      alarm = true;
+      body.append(el("p", { class: "form-msg err", text:
+        "The next run cannot start: " + sch.next_method_error + (/[.!?]$/.test(sch.next_method_error) ? "" : ".") }));
+    } else if (sch.runnable && sch.next_method) {
       const how = sch.next_method === "refresh" ? "will update the latest backup from the recorded changes" : "will take a full backup from your database";
       body.append(el("p", { class: "form-hint", text:
         "Next run " + how + (sch.next_method_why ? " (" + sch.next_method_why + ")." : ".") }));
@@ -4668,10 +4674,18 @@ function backupScheduleCard(cur, b) {
           " Nothing was overwritten; the next scheduled run tries again." }));
       }
     }
-    if (fb && (!run || fb.at >= (run.started_at || ""))) {
-      body.append(el("p", { class: "form-hint", text:
-        "At " + utcLabel(fb.at) + " the update from the recorded changes was refused (" + backupFoldError(fb.reason) +
-        ") so a full backup was taken instead." }));
+    if (fb) {
+      // Always shown while the daemon remembers it, in red: a rebuild that
+      // is refused at every slot means the no-load half of this feature is
+      // dead and production is being read in full instead, and a green
+      // "last backup finished" line would hide exactly that. A crash is
+      // named as one, not as a refusal.
+      alarm = true;
+      const crashed = /^internal error/.test(fb.reason || "");
+      const why = backupFoldError(crashed ? fb.reason.replace(/^internal error:?\s*/, "") : fb.reason);
+      body.append(el("p", { class: "form-msg err", text:
+        "At " + utcLabel(fb.at) + " the update from the recorded changes " + (crashed ? "hit an internal error" : "was refused") +
+        " (" + why + ") so a full backup was taken instead. If this repeats, the recorded changes cannot be used for this server; check the reason." }));
     }
     if (skip && (!run || skip.at > (run.finished_at || ""))) {
       alarm = true;

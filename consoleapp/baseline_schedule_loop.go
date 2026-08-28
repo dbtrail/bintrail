@@ -332,7 +332,7 @@ func (b *backupScheduler) fire(e console.ServerEntry, p console.ParsedBackupSche
 	stamp := now.Format(time.RFC3339)
 	if method == console.BackupMethodRefresh {
 		if err := b.startRebuild(e, p, stamp); err == nil {
-			go b.fallBackIfRefused(e, p, stamp)
+			go b.fallBackIfRefused(e, stamp)
 			return
 		} else if !errors.Is(err, console.ErrBaselineRunning) {
 			// Not the collision case: the rebuild could not even start. A
@@ -410,7 +410,7 @@ func (b *backupScheduler) record(e console.ServerEntry, method, stamp, since str
 // when the daemon is shutting down, when a full backup is not possible here
 // (recorded as a skip with both reasons), or when another job took the
 // server meanwhile (recorded as a skip).
-func (b *backupScheduler) fallBackIfRefused(e console.ServerEntry, p console.ParsedBackupSchedule, stamp string) {
+func (b *backupScheduler) fallBackIfRefused(e console.ServerEntry, stamp string) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("backup schedule: fallback check panicked", "server", e.Name, "panic", r)
@@ -419,10 +419,14 @@ func (b *backupScheduler) fallBackIfRefused(e console.ServerEntry, p console.Par
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
-		select {
-		case <-b.sup.ctx.Done():
+		<-t.C
+		// Checked on every tick rather than as a select arm beside it: with
+		// both ready, select picks either, and a fold that failed BECAUSE
+		// the daemon is shutting down is not a refusal. A full read of
+		// production is not how to shut down. Nothing waits on this
+		// goroutine, so leaving within a second of the cancel is enough.
+		if b.sup.ctx.Err() != nil {
 			return
-		case <-t.C:
 		}
 		st := b.ScheduleState(e.ID)
 		if st.LastStartedAt != stamp || st.Last == nil {
@@ -436,7 +440,7 @@ func (b *backupScheduler) fallBackIfRefused(e console.ServerEntry, p console.Par
 		}
 		reason := st.Last.LastError
 		now := time.Now().UTC()
-		if err := fullBackupAllowed(e, b.gates()); err != nil {
+		if err := console.FullBackupPossible(e, b.gates()); err != nil {
 			b.skip(e, now, "the rebuild was refused ("+reason+") and a full backup cannot start here: "+err.Error())
 			return
 		}
@@ -448,17 +452,6 @@ func (b *backupScheduler) fallBackIfRefused(e console.ServerEntry, p console.Par
 		b.startFull(e, now.Format(time.RFC3339), now)
 		return
 	}
-}
-
-// fullBackupAllowed is ChooseBackupMethod's full-backup half, for the
-// fallback decision.
-func fullBackupAllowed(e console.ServerEntry, gates console.BackupScheduleGates) error {
-	_, _, err := console.ChooseBackupMethod(context.Background(), console.ServerEntry{
-		ID: e.ID, Name: e.Name, DSN: e.DSN, SourceDSN: e.SourceDSN, BaselineDir: e.BaselineDir,
-		BaselineS3: "s3://forces-full/", Flavor: e.Flavor, SourceSlot: e.SourceSlot, SourcePublication: e.SourcePublication,
-		Schemas: e.Schemas,
-	}, gates)
-	return err
 }
 
 // skip records a slot that did not start: in memory (the page's view when

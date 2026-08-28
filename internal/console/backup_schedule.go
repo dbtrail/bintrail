@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"strconv"
 	"strings"
 	"time"
@@ -228,9 +229,10 @@ type BackupScheduleGates struct {
 	ReadOnlyConsole bool
 }
 
-// fullBackupPossible reports whether a full backup can start for e on a
-// daemon with these gates, and why not.
-func fullBackupPossible(e ServerEntry, gates BackupScheduleGates) error {
+// FullBackupPossible reports whether a full backup can start for e on a
+// daemon with these gates, and why not. Exported for the loop's fallback
+// decision, which needs exactly this half of ChooseBackupMethod.
+func FullBackupPossible(e ServerEntry, gates BackupScheduleGates) error {
 	if !gates.FullBackups {
 		return errors.New(scheduleRefusalNoDumps)
 	}
@@ -273,9 +275,15 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 	if !gates.LoopRunning {
 		return notRunnable(scheduleRefusalNoLoop)
 	}
-	fullErr := fullBackupPossible(e, gates)
+	fullErr := FullBackupPossible(e, gates)
 	if fullErr == nil {
 		return nil
+	}
+	if e.BaselineS3 != "" {
+		// Backups that go to S3 are always full backups (ChooseBackupMethod),
+		// so a rebuild is not a candidate producer here and cannot make the
+		// schedule runnable.
+		return notRunnable("this server's backups go to S3, which only a full backup can upload, and " + fullErr.Error())
 	}
 	if rebuildErr := rebuildPossible(e); rebuildErr != nil {
 		return notRunnable(fullErr.Error() + "; " + rebuildErr.Error() + " (Edit → Advanced)")
@@ -302,7 +310,7 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 // A rule that picks a producer the daemon cannot run (the opt-in off, no
 // source) is reported as such; the caller decides whether that is a skip.
 func ChooseBackupMethod(ctx context.Context, e ServerEntry, gates BackupScheduleGates) (method, why string, err error) {
-	fullErr := fullBackupPossible(e, gates)
+	fullErr := FullBackupPossible(e, gates)
 	rebuildErr := rebuildPossible(e)
 	switch {
 	case e.BaselineS3 != "":
@@ -317,13 +325,26 @@ func ChooseBackupMethod(ctx context.Context, e ServerEntry, gates BackupSchedule
 		return BackupMethodFull, rebuildErr.Error(), nil
 	}
 	tables, listErr := reconstruct.NewestSnapshotTables(ctx, e.BaselineDir)
-	if listErr != nil || len(tables) == 0 {
+	if listErr != nil && errors.Is(listErr, fs.ErrNotExist) {
+		// A directory the first full backup has not created yet IS "no
+		// backup yet".
+		listErr, tables = nil, nil
+	}
+	if listErr != nil {
+		// Its own verdict, never "no backup yet": an unreadable directory is
+		// a permission or IO problem that a full backup into the same
+		// directory would hit too, and calling it absent would quietly turn
+		// a no-load rebuild into a nightly full read of production while the
+		// page named a reason that is false.
+		return BackupMethodFull, "", fmt.Errorf("the backup directory %s could not be read: %w", e.BaselineDir, listErr)
+	}
+	if len(tables) == 0 {
 		if fullErr != nil {
 			return BackupMethodFull, "", fmt.Errorf("no previous backup to rebuild from under %s, and a full backup cannot start: %w", e.BaselineDir, fullErr)
 		}
 		return BackupMethodFull, "no previous backup to rebuild from", nil
 	}
-	return BackupMethodRefresh, "updates the latest backup from the recorded changes, with no load on your database", nil
+	return BackupMethodRefresh, "no load on your database", nil
 }
 
 // BackupScheduleState is the schedule loop's in-memory view of one server,

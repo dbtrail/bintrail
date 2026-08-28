@@ -22,6 +22,12 @@ type backupScheduleDTO struct {
 	// by which producer ran.
 	NextMethod    string `json:"next_method,omitempty"`
 	NextMethodWhy string `json:"next_method_why,omitempty"`
+	// NextMethodError is set when the schedule is runnable in principle but
+	// the next run cannot start as things stand (a rebuild-only server with
+	// no backup to rebuild from yet, an unreadable backup directory): the
+	// loop will record a skip at the slot, and the page must alarm BEFORE
+	// it, not after.
+	NextMethodError string `json:"next_method_error,omitempty"`
 	// Runnable reports whether THIS daemon, as configured right now, will run
 	// this schedule; Reason says why not.
 	Runnable bool   `json:"runnable"`
@@ -109,10 +115,7 @@ func (s *Server) backupScheduleDTO(ctx context.Context, e ServerEntry, now time.
 		method, why, err := ChooseBackupMethod(ctx, e, gates)
 		dto.NextMethod = method
 		if err != nil {
-			// Runnable in principle, not right now (a rebuild-only server
-			// with no backup yet): the loop records the skip; the page says
-			// why here.
-			dto.NextMethodWhy = err.Error()
+			dto.NextMethodError = err.Error()
 		} else {
 			dto.NextMethodWhy = why
 		}

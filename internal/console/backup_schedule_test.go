@@ -204,9 +204,13 @@ func TestCheckBackupSchedule(t *testing.T) {
 		{"read-only console", ready, BackupScheduleGates{ReadOnlyConsole: true}, "watch daemon"},
 		{"watch without any baseline feature", ready, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no --baseline-refresh-interval"},
 		{"creation off but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true}, ""},
-		{"creation off and no local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, "is not set to 1); a rebuild from the change history needs a local backup directory"},
+		{"creation off and no local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, "go to S3, which only a full backup can upload, and creating backups"},
 		{"lock mode misconfigured but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, ""},
-		{"lock mode misconfigured, S3-only", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, "bad lock mode; a rebuild"},
+		{"lock mode misconfigured, S3-only", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, "go to S3, which only a full backup can upload, and bad lock mode"},
+		// S3 AND a local dir: the rebuild is not a candidate producer (S3
+		// forces full), so the creation opt-in being off makes this a timer
+		// nothing would honour. Refused, not saved.
+		{"creation off, S3 and a local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: "/b", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, "go to S3, which only a full backup can upload, and creating backups"},
 		{"postgres ignores the lock mode", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/", Flavor: FlavorPostgres, SourceSlot: "s", SourcePublication: "p"},
 			BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, ""},
 		{"no source, local dir: rebuild only, fine", ServerEntry{DSN: "idx", BaselineDir: "/b"}, live, ""},
@@ -303,6 +307,25 @@ func TestChooseBackupMethod(t *testing.T) {
 				t.Fatalf("why = %q, want it to mention %q", why, c.wantWhy)
 			}
 		})
+	}
+}
+
+// An unreadable backup directory is its own verdict, never "no backup yet":
+// calling it absent would turn the no-load rebuild into a nightly full read
+// of production while the page named a false reason.
+func TestChooseBackupMethod_unreadableDirIsNotNoBackup(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if os.Getuid() == 0 {
+		t.Skip("root reads a mode-000 directory")
+	}
+	_, why, err := ChooseBackupMethod(context.Background(), ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: dir},
+		BackupScheduleGates{LoopRunning: true, FullBackups: true})
+	if err == nil || !strings.Contains(err.Error(), "could not be read") || !strings.Contains(err.Error(), dir) {
+		t.Fatalf("err = %v (why=%q), want the unreadable directory named", err, why)
 	}
 }
 

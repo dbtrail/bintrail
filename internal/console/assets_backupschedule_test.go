@@ -14,7 +14,7 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 	body := jsFunctionBody(t, js, "backupScheduleCard")
 
 	raw, err := json.Marshal(backupScheduleDTO{
-		Every: "1d", At: "03:00", NextRun: "x", NextMethod: BackupMethodRefresh, NextMethodWhy: "w",
+		Every: "1d", At: "03:00", NextRun: "x", NextMethod: BackupMethodRefresh, NextMethodWhy: "w", NextMethodError: "e",
 		Runnable: false, Reason: "r", Running: true, HistoryUnavailable: true,
 		LastRun:      &backupScheduleRunDTO{Method: BackupMethodRefresh, FinishedAt: "f", Error: "e", Tables: 1, Carried: 1, Uploaded: 1},
 		LastSkipped:  &backupScheduleSkipDTO{At: "a", Reason: "r"},
@@ -27,7 +27,7 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"every", "at", "next_run", "next_method", "next_method_why", "runnable", "reason", "running", "history_unavailable", "last_run", "last_skipped", "last_fallback"} {
+	for _, key := range []string{"every", "at", "next_run", "next_method", "next_method_why", "next_method_error", "runnable", "reason", "running", "history_unavailable", "last_run", "last_skipped", "last_fallback"} {
 		if _, ok := wire[key]; !ok {
 			t.Errorf("backupScheduleDTO does not serialise %q (got %s)", key, raw)
 		}
@@ -55,6 +55,16 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 		if !strings.Contains(body, "fb."+key) {
 			t.Errorf("backupScheduleCard never reads fb.%s (last_fallback)", key)
 		}
+	}
+	// A dead rebuild half and a slot that cannot start are alarms, in red and
+	// opening the card, not hints.
+	for _, want := range []string{`sch.next_method_error) {`, `if (fb) {`, `"The next run cannot start: "`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("backupScheduleCard lost the branch around %q", want)
+		}
+	}
+	if !strings.Contains(body, `hit an internal error`) {
+		t.Error("a crashed rebuild is rendered as a refusal")
 	}
 	// The method is not an input any more: the form sends only when, and the
 	// card never offers a producer to pick.
