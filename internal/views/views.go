@@ -442,7 +442,7 @@ func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
 		// says what it can see, and what that costs a reader elsewhere.
 		b.WriteString("-- HOST above is a loopback address, which names only the machine this file\n")
 		b.WriteString("-- was generated on. Run this file somewhere else and the ATTACH resolves to\n")
-		b.WriteString("-- whatever that machine runs on the same port — which may answer, with\n")
+		b.WriteString("-- whatever that machine runs on the same port. That may answer, with\n")
 		b.WriteString("-- entirely plausible rows from a different index. Change HOST to a name that\n")
 		b.WriteString("-- resolves from where you run this.\n")
 	}
@@ -492,7 +492,7 @@ func writeEventsView(b *strings.Builder, in Input) {
 		b.WriteString("-- union_by_name is required, not cosmetic: archives written before a column\n")
 		b.WriteString("-- existed simply lack it, and those files must read back with NULLs rather\n")
 		b.WriteString("-- than failing the whole scan. A column absent from EVERY archived file is\n")
-		b.WriteString("-- still an error — drop it from the SELECT if you hit that on an old archive.\n")
+		b.WriteString("-- still an error: drop it from the SELECT if you hit that on an old archive.\n")
 	}
 
 	switch {
@@ -507,7 +507,7 @@ func writeEventsView(b *strings.Builder, in Input) {
 		b.WriteString("-- bintrail's own merge in Go. There the two copies of an event carry the same\n")
 		b.WriteString("-- fields and the winner is immaterial; here they do not. An archived row\n")
 		b.WriteString("-- knows its bintrail_id, event_date and event_hour from its path, and an\n")
-		b.WriteString("-- index row has to derive or forgo them — so letting the index win would\n")
+		b.WriteString("-- index row has to derive or forgo them. Letting the index win would\n")
 		b.WriteString("-- replace a known source with NULL for every event in the overlap, and a\n")
 		b.WriteString("-- WHERE bintrail_id = ... would then miss rows the archives hold.\n")
 		writeLiveCostNote(b, true)
@@ -528,7 +528,7 @@ func writeEventsView(b *strings.Builder, in Input) {
 		// and the header is the one place that already distinguishes the two.
 		b.WriteString("-- The index alone: this file names no archive source to read from, and the\n")
 		b.WriteString("-- header above says why. It covers whatever the index still holds, and\n")
-		b.WriteString("-- rotation dropping a partition removes those events from it — archive and\n")
+		b.WriteString("-- rotation dropping a partition removes those events from it. Archive and\n")
 		b.WriteString("-- take a baseline before that matters, then regenerate this file.\n")
 		writeLiveCostNote(b, false)
 		b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
@@ -568,8 +568,8 @@ func writeLiveCostNote(b *strings.Builder, withCold bool) {
 		b.WriteString(", and the anti-join\n-- needs every archived event_id regardless of what the query asked for")
 	}
 	b.WriteString(".\n")
-	b.WriteString("-- Every query therefore streams the whole live binlog_events — row_before,\n")
-	b.WriteString("-- row_after and query_text included")
+	b.WriteString("-- Every query therefore streams the whole live binlog_events (row_before,\n")
+	b.WriteString("-- row_after and query_text included)")
 	if withCold {
 		b.WriteString(", and the archive scan behind the\n-- anti-join is not pruned by your filter either")
 	}

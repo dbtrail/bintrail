@@ -27,8 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   password: fill the empty slot in your own session. It also says what a
   loopback host means for a reader elsewhere, and what a query against the view
   costs, where you will be looking when you measure it. Attribution of the live
-  rows states what was OBSERVED — one source, several, none registered, the
-  registry unreadable, or an id that disagrees with the archives' — rather than
+  rows states what was OBSERVED (one source, several, none registered, the
+  registry unreadable, or an id that disagrees with the archives') rather than
   one sentence covering all five. With nothing archived yet the file is the
   index leg alone rather than no `events` view at all (#1485). Without the flag
   the file is unchanged except that it now states, in the `events` view's own

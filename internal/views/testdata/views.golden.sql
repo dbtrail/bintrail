@@ -38,7 +38,7 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 -- union_by_name is required, not cosmetic: archives written before a column
 -- existed simply lack it, and those files must read back with NULLs rather
 -- than failing the whole scan. A column absent from EVERY archived file is
--- still an error — drop it from the SELECT if you hit that on an old archive.
+-- still an error: drop it from the SELECT if you hit that on an old archive.
 --
 -- SCOPE: these are the ARCHIVED events only. Partitions rotation has not
 -- archived yet exist solely in the index, so the most recent window is
