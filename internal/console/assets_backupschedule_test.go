@@ -80,7 +80,7 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 	// Reasons assembled by the daemon never appear in this file, so the em
 	// dash guard below cannot see one riding in on a fold error; they go
 	// through plainWords.
-	for _, want := range []string{`plainWords(skip.reason)`, `plainWords(sch.next_method_error)`, `plainWords(sch.reason`, `skip.at >= `} {
+	for _, want := range []string{`backupFoldError(skip.reason)`, `plainWords(sch.next_method_error)`, `plainWords(sch.reason`, `skip.at >= `, `backupsPer30Days(every.value)`, `never removed automatically`, `body.append(rate)`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("backupScheduleCard lost %q", want)
 		}

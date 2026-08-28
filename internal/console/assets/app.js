@@ -4543,6 +4543,16 @@ async function watchBackupRuns(id, vgen, kinds) {
 // A fold failure is per-table and errors.Join'd, so last_error is usually
 // MULTI-LINE: the patterns are global and never cross a line, or one
 // table's remedy would eat the next table's identity.
+// backupsPer30Days mirrors ParsedBackupSchedule.BackupsPer30Days for the
+// grammar the form accepts (a whole number of m, h or d); 0 when it cannot
+// be read, and the server's refusal then says why.
+function backupsPer30Days(every) {
+  const m = /^\s*(\d+)\s*([mhd])\s*$/.exec(String(every || ""));
+  if (!m) return 0;
+  const minutes = Number(m[1]) * ({ m: 1, h: 60, d: 1440 })[m[2]];
+  return minutes > 0 ? Math.floor(30 * 1440 / minutes) : 0;
+}
+
 // plainWords is the copy rule for reasons the daemon assembles at runtime:
 // they never appear in this file, so the source guard cannot see an em dash
 // in them, and one does ride in on fold errors.
@@ -4637,6 +4647,21 @@ function backupScheduleCard(cur, b) {
   body.append(row, el("p", { class: "form-hint", text:
     "Every: minutes, hours or days (30m, 6h, 1d), at least 15m. At: the UTC time the timetable lines up on; for whole " +
     "days (1d, 7d) it is the time of day the backup runs." }), msg);
+  // The rate, before the disk finds out: every run is a full copy of every
+  // table, and backups kept only on this machine are never removed on their
+  // own (the daemon prunes only what it confirmed durable in S3). Same
+  // number the daemon logs at save and at boot.
+  const rate = el("p", { class: "form-hint" });
+  const showRate = () => {
+    const n = backupsPer30Days(every.value);
+    if (!n) { rate.hidden = true; return; }
+    rate.hidden = false;
+    rate.textContent = "About " + n + " backup" + (n === 1 ? "" : "s") + " every 30 days at this rate, each a full copy of every table." +
+      (cur.baseline_s3 ? "" : " Backups kept only on this machine are never removed automatically; make sure the disk has room.");
+  };
+  every.addEventListener("input", showRate);
+  showRate();
+  body.append(rate);
 
   // What the schedule will do next, and what it last did. The skip is
   // shown when it is the newest fact: a slot that could not start after
@@ -4700,8 +4725,10 @@ function backupScheduleCard(cur, b) {
     // newer fact, not an older one.
     if (skip && (!run || skip.at >= (run.finished_at || ""))) {
       alarm = true;
+      // backupFoldError, not plainWords: a fold error rides in here too,
+      // with its bare --allow-gaps hint.
       body.append(el("p", { class: "form-msg err", text:
-        "Did not run at " + utcLabel(skip.at) + ": " + plainWords(skip.reason) + (/[.!?]$/.test(skip.reason) ? "" : ".") +
+        "Did not run at " + utcLabel(skip.at) + ": " + backupFoldError(skip.reason) +
         " It will try again at the next scheduled time." }));
     }
     if (!run && !skip && !sch.running && !sch.history_unavailable) {

@@ -3,6 +3,7 @@ package console
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -43,8 +44,10 @@ type backupScheduleDTO struct {
 	// persisted history, so both survive a restart.
 	LastRun     *backupScheduleRunDTO  `json:"last_run,omitempty"`
 	LastSkipped *backupScheduleSkipDTO `json:"last_skipped,omitempty"`
-	// LastFallback is the last slot where the rebuild was refused and a full
-	// backup was taken instead (this process only).
+	// LastFallback is the last slot where the update from the recorded
+	// changes failed and a full backup was STARTED in its place (a collision
+	// there is a skip, not a fallback); cleared when a later scheduled job
+	// other than that full backup succeeds. This process only.
 	LastFallback *backupScheduleSkipDTO `json:"last_fallback,omitempty"`
 }
 
@@ -54,10 +57,11 @@ type backupScheduleRunDTO struct {
 	FinishedAt string `json:"finished_at"`
 	OK         bool   `json:"ok"`
 	Error      string `json:"error,omitempty"`
-	// SnapshotTime names the backup the run published, when it did. From
-	// the history only: the loop's live view has no anchor for a full
-	// backup (it is chosen mid-run), so a scheduled dump rendered from
-	// that view has none even on success.
+	// SnapshotTime names the backup the run published, when it did. For a
+	// full backup it comes from the history only: the loop's live view has
+	// no anchor for a dump (chosen mid-run), so a scheduled dump rendered
+	// from that view has none even on success. An update rendered from
+	// the live view carries its anchor.
 	SnapshotTime string `json:"snapshot_time,omitempty"`
 	Tables       int    `json:"tables,omitempty"`
 	Rows         int64  `json:"rows,omitempty"`
@@ -247,6 +251,13 @@ func (s *Server) handleBackupScheduleUpdate(w http.ResponseWriter, r *http.Reque
 	// be up to a minute away.
 	now := time.Now().UTC()
 	s.backupSchedules.Observe(e.ID, sched, now)
+	// The rate, said where the operator will read it (the daemon log; the
+	// page shows the same number): every run is a full-table snapshot, and
+	// local-only backups are never removed automatically.
+	if p, err := sched.Parse(); err == nil {
+		slog.Warn("backup schedule saved: every run publishes a full-table snapshot",
+			"server", e.Name, "every", p.Every, "backups_per_30d", p.BackupsPer30Days(), "local_only", e.BaselineS3 == "")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"schedule": s.backupScheduleDTO(r.Context(), e, now)})
 }
 

@@ -202,7 +202,7 @@ func TestCheckBackupSchedule(t *testing.T) {
 	}{
 		{"everything on", ready, live, ""},
 		{"read-only console", ready, BackupScheduleGates{ReadOnlyConsole: true}, "watch daemon"},
-		{"watch without any baseline feature", ready, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no refresh interval (CLI: --baseline-refresh-interval)"},
+		{"watch without any baseline feature", ready, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and no refresh interval is set (CLI: --baseline-refresh-interval)"},
 		{"creation off but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true}, ""},
 		{"creation off and no local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, "go to S3, which only a full backup can upload, and creating backups"},
 		{"lock mode misconfigured but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, ""},

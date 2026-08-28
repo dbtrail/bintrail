@@ -99,6 +99,16 @@ type ParsedBackupSchedule struct {
 	At    time.Duration // offset from midnight UTC
 }
 
+// BackupsPer30Days is how many backups this schedule publishes in 30 days:
+// every one a full-table snapshot, and on a server without an S3
+// destination none of them ever removed automatically.
+func (p ParsedBackupSchedule) BackupsPer30Days() int64 {
+	if p.Every <= 0 {
+		return 0
+	}
+	return int64(30 * 24 * time.Hour / p.Every)
+}
+
 // Parse validates the schedule and resolves its defaults. Every error names
 // the field and the accepted grammar, because the message is what the Backups
 // page shows back.
@@ -207,7 +217,7 @@ func RefusalReason(err error) string {
 // schedule is reported with the same words a write is refused with.
 const (
 	scheduleRefusalReadOnly = "scheduled backups run in the watch daemon (bintrail-console watch), not the read-only console"
-	scheduleRefusalNoLoop   = "backup features are turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no refresh interval (CLI: --baseline-refresh-interval)), so nothing can run a schedule"
+	scheduleRefusalNoLoop   = "backup features are turned off on this daemon: BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and no refresh interval is set (CLI: --baseline-refresh-interval), so nothing can run a schedule"
 	scheduleRefusalNoDumps  = "creating backups from the console is turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1)"
 )
 
@@ -248,7 +258,7 @@ func FullBackupPossible(e ServerEntry, gates BackupScheduleGates) error {
 // attempted for e (the fold itself may still refuse), and why not.
 func rebuildPossible(e ServerEntry) error {
 	if e.DSN == "" {
-		return errors.New("this server has no index connection to rebuild from")
+		return errors.New("this server has no index connection to read the recorded changes from")
 	}
 	if e.BaselineDir == "" {
 		// Same constraint as the refresh loop and the point-in-time restore:
@@ -298,7 +308,7 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 // and why, on a daemon with these gates. The rule, in order:
 //
 //   - backups that go to S3 are FULL backups: only a full backup uploads, so
-//     a rebuild would leave the off-box copy stale while unprunable local
+//     an update would leave the off-box copy stale while unprunable local
 //     snapshots pile up;
 //   - a server an update cannot serve (no index DSN, no local backup
 //     directory) gets a FULL backup, with that refusal as the why;
@@ -307,9 +317,9 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 //     that case; one that cannot be READ is its own error, never "no
 //     backup yet";
 //   - otherwise the newest backup is UPDATED from the recorded changes, with
-//     no load on the source. If the fold refuses (a capture gap, a schema
-//     change), the loop takes a full backup at the same slot instead, since
-//     a fresh read of the source is exactly what heals those.
+//     no load on the source. If that update fails (a capture gap, a schema
+//     change, a crash), the loop takes a full backup at the same slot when
+//     the daemon may take one, and records a skip naming both otherwise.
 //
 // A rule that picks a producer the daemon cannot run (the opt-in off, no
 // source) is reported as such; the caller decides whether that is a skip.
@@ -378,7 +388,10 @@ type BackupScheduleState struct {
 	LastSkippedAt  string
 	LastSkipReason string
 	// LastFallbackAt / LastFallbackReason describe the last slot where the
-	// rebuild was refused and a full backup was taken instead.
+	// update from the recorded changes failed and a full backup was STARTED
+	// in its place (never a collision, which is a skip); cleared when a
+	// later scheduled job other than that full backup succeeds. This
+	// process only.
 	LastFallbackAt     string
 	LastFallbackReason string
 }

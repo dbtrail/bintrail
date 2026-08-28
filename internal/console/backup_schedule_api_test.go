@@ -411,8 +411,9 @@ func TestBackupScheduleAPI_readOnlyRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rep := &stubScheduleReporter{full: true}
 	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg, MonitorCtrl: &stubMonitorCtrl{},
-		BackupSchedules: &stubScheduleReporter{full: true}})
+		BackupSchedules: rep})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,6 +423,11 @@ func TestBackupScheduleAPI_readOnlyRegistry(t *testing.T) {
 		if rec.Code != 409 {
 			t.Fatalf("%s on a read-only registry: code=%d body=%s, want 409", tc.method, rec.Code, body)
 		}
+	}
+	// The loop is told nothing: the schedule still exists, and forgetting
+	// it would silently miss its next slot.
+	if len(rep.observed) != 0 || len(rep.forgotten) != 0 {
+		t.Fatalf("a refused write reached the loop: observed=%v forgotten=%v", rep.observed, rep.forgotten)
 	}
 	_, body := doServersReqHeader(t, srv, "GET", "/api/baselines", "", "abc")
 	if got := scheduleOf(t, body); got == nil || got.Every != "1d" {

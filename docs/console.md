@@ -387,10 +387,13 @@ panel that answers whether a restore would work, far below the fold.
   only a full backup uploads); a server with no previous backup on local disk
   gets a full backup too; otherwise the newest backup is **updated from the
   recorded changes** (the baseline-refresh fold: reads nothing from the
-  source, needs the server's own local backup directory). An update the fold
-  refuses (a capture gap, a schema change) falls back to a full backup at the
-  same slot, since a fresh read of the source is exactly what heals those,
-  and the fallback is shown on the page. Stored on the server's registry
+  source, needs the server's own local backup directory). An update that
+  fails (a capture gap, a schema change, an internal error) falls back to a
+  full backup at the same slot when the daemon may take one (the creation
+  opt-in); otherwise that slot is recorded as skipped with both reasons.
+  Every run is a full-table snapshot, and on a server without an S3
+  destination nothing removes them automatically: the card shows the 30-day
+  count under the form, and the daemon logs it at save and at boot. Stored on the server's registry
   entry (`backup_schedule`), read by the watch daemon every minute, so it
   applies without a restart. The grid is fixed (`every 1d at 03:00` is 03:00
   UTC daily; `every 6h at 03:00` is 03/09/15/21; an interval that does not
