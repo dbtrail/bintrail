@@ -1,0 +1,97 @@
+package console
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+// The schedule DTO's wire names and the keys the Backups page reads are pinned
+// against each other: a renamed field on either side compiles, passes every
+// Go test, and leaves the card rendering "undefined" for that fact.
+func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
+	js := readAsset(t, "app.js")
+	body := jsFunctionBody(t, js, "backupScheduleCard")
+
+	raw, err := json.Marshal(backupScheduleDTO{
+		Every: "1d", At: "03:00", Method: BackupMethodFull, NextRun: "x", Runnable: false, Reason: "r", Running: true,
+		LastRun:     &backupScheduleRunDTO{Method: BackupMethodRefresh, FinishedAt: "f", Error: "e", Tables: 1, Carried: 1, Uploaded: 1},
+		LastSkipped: &backupScheduleSkipDTO{At: "a", Reason: "r"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"every", "at", "method", "next_run", "runnable", "reason", "running", "last_run", "last_skipped"} {
+		if _, ok := wire[key]; !ok {
+			t.Errorf("backupScheduleDTO does not serialise %q (got %s)", key, raw)
+		}
+		if !strings.Contains(body, "sch."+key) {
+			t.Errorf("backupScheduleCard never reads sch.%s", key)
+		}
+	}
+	run := wire["last_run"].(map[string]any)
+	for _, key := range []string{"method", "finished_at", "ok", "error", "tables", "carried", "uploaded"} {
+		if _, ok := run[key]; !ok {
+			t.Errorf("last_run does not serialise %q (got %s)", key, raw)
+		}
+		if !strings.Contains(body, "run."+key) {
+			t.Errorf("backupScheduleCard never reads run.%s", key)
+		}
+	}
+	skip := wire["last_skipped"].(map[string]any)
+	for _, key := range []string{"at", "reason"} {
+		if _, ok := skip[key]; !ok {
+			t.Errorf("last_skipped does not serialise %q (got %s)", key, raw)
+		}
+		if !strings.Contains(body, "skip."+key) {
+			t.Errorf("backupScheduleCard never reads skip.%s", key)
+		}
+	}
+	// The body the form sends is what the handler decodes.
+	for _, key := range []string{"every", "at", "method"} {
+		if !strings.Contains(js, key+": ") && !strings.Contains(js, key+":") {
+			t.Errorf("the schedule form never sends %q", key)
+		}
+	}
+	// The capability gate and the two endpoints.
+	if !strings.Contains(body, "capsCache.backup_schedule") {
+		t.Error("the card is not gated on the backup_schedule capability, so the read-only console would offer a form that 403s")
+	}
+	caps, _ := json.Marshal(capabilitiesResponse{BackupSchedule: true})
+	if !strings.Contains(string(caps), `"backup_schedule":true`) {
+		t.Errorf("capabilities do not serialise backup_schedule: %s", caps)
+	}
+	for _, ep := range []string{`"/backup-schedule", { method: "PUT"`, `"/backup-schedule", { method: "DELETE"`} {
+		if !strings.Contains(js, ep) {
+			t.Errorf("app.js never calls %s", ep)
+		}
+	}
+}
+
+// The card can be unmounted with the whole suite green; this pins that the
+// Backups page still calls it.
+func TestBackupsPageStillMountsTheScheduleCard(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "renderBaselines")
+	if !strings.Contains(body, "backupScheduleCard(") {
+		t.Error("renderBaselines no longer mounts backupScheduleCard, so the schedule has no UI at all")
+	}
+}
+
+// Copy rule: nothing the card shows uses an em dash, and a not-runnable
+// schedule is never summarised as if it will run.
+func TestBackupScheduleCard_copy(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "backupScheduleCard")
+	if strings.Contains(body, "—") {
+		t.Error("backupScheduleCard copy contains an em dash")
+	}
+	if !strings.Contains(body, "Cannot run: ") {
+		t.Error("the summary line does not say when the schedule cannot run")
+	}
+	if !strings.Contains(body, "(CLI: --baseline-refresh-interval") {
+		t.Error("the CLI counterpart is not marked in the (CLI: ...) form")
+	}
+}

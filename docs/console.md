@@ -378,6 +378,27 @@ panel that answers whether a restore would work, far below the fold.
   empty states explain how to produce a first baseline (`bintrail dump` →
   `bintrail baseline`). When the **Create baseline** button is enabled it sits
   in this panel's header.
+- **Scheduled backups** (#1442) — a per-server timetable, set from this page:
+  every N minutes, hours or days (at least 15m), lined up on a UTC time of
+  day, taking either a **full backup** (the Create backup job: reads the
+  source, needs `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`) or a **rebuild from
+  change history** (the baseline-refresh fold: reads nothing from the source,
+  needs the server's own local backup directory). Stored on the server's
+  registry entry (`backup_schedule`), read by the watch daemon every minute,
+  so it applies without a restart. The grid is fixed (`every 1d at 03:00` is
+  03:00 UTC daily; `every 6h at 03:00` is 03/09/15/21), which is what makes
+  the next run computable and shown. It fires only on a slot boundary the
+  daemon is up to see: a slot missed while stopped is not made up, and saving
+  a schedule never starts a backup on the spot. A scheduled run that collides
+  with a manual backup, restore or export skips that slot rather than queuing,
+  and the skip, like every scheduled run, is written to the baseline run
+  history so the page shows the last run, its result and the last skip after
+  a restart too. A schedule the daemon cannot run as configured (the creation
+  opt-in turned off, no destination) is refused on save with the reason, and
+  one already saved is reported as not runnable, never silently skipped.
+  `PUT`/`DELETE /api/servers/{id}/backup-schedule`; state on `GET /api/baselines`
+  (`schedule`). The daemon-wide `--baseline-refresh-interval` below is
+  independent and can run alongside.
 - **Automatic baseline refresh** — when `--baseline-refresh-interval` is set,
   the panel reports the daemon's last automatic refresh for the selected
   server: how many tables it published, or that it published nothing and why.

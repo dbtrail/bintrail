@@ -471,6 +471,15 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		cfg.BaselineRefresh = baselineSup
 	}
 	wireBaselineExtras(&cfg, baselineSup, serversPath)
+	// The per-server backup schedule (#1442) needs only the supervisor: a
+	// full-backup schedule additionally checks the creation opt-in per slot.
+	// A typed nil must not reach the interface field, or the console would
+	// advertise a loop that does not exist.
+	var backupSched *backupScheduler
+	if baselineSup != nil {
+		backupSched = newBackupScheduler(baselineSup, registry, upConsoleBaselineTrigger, upBaselineCarryForward)
+		cfg.BackupSchedules = backupSched
+	}
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {
 		return err
@@ -509,6 +518,9 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery, upBaselineCarryForward); err != nil {
 		return err
 	}
+	// Per-server backup schedules from the Backups page (#1442). No flag:
+	// the registry decides what runs, the loop only looks at the clock.
+	startBackupScheduleLoop(ctx, backupSched)
 
 	// Wire the live telemetry client so the console's opt-out toggle stops this
 	// running daemon's beacons immediately, not just on the next start.
@@ -675,6 +687,15 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		cfg.BaselineRefresh = baselineSup
 	}
 	wireBaselineExtras(&cfg, baselineSup, serversPath)
+	// The per-server backup schedule (#1442) needs only the supervisor: a
+	// full-backup schedule additionally checks the creation opt-in per slot.
+	// A typed nil must not reach the interface field, or the console would
+	// advertise a loop that does not exist.
+	var backupSched *backupScheduler
+	if baselineSup != nil {
+		backupSched = newBackupScheduler(baselineSup, registry, upConsoleBaselineTrigger, upBaselineCarryForward)
+		cfg.BackupSchedules = backupSched
+	}
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {
 		return err
@@ -712,6 +733,9 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	if err := startBaselineRefreshLoop(ctx, registry, baselineSup, upIndexDSN, upConsoleBaselineDir, upBaselineRefreshEvery, upBaselineCarryForward); err != nil {
 		return err
 	}
+	// Per-server backup schedules from the Backups page (#1442). No flag:
+	// the registry decides what runs, the loop only looks at the clock.
+	startBackupScheduleLoop(ctx, backupSched)
 
 	// With the console comes the multi-stream control plane, so /metrics is
 	// served once at the daemon level (per-source "source" labels keep the

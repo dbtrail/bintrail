@@ -20,14 +20,31 @@ const (
 	BaselineRunRestore = "restore" // operator-chosen point-in-time fold (#backups)
 )
 
+// BaselineRunTriggerScheduled marks a run (or a skip) the per-server backup
+// schedule started (#1442). Empty is everything else: the Create backup
+// button, a restore, the daemon-wide refresh interval. The literal is the
+// file/wire format and matches the verify history's vocabulary.
+const BaselineRunTriggerScheduled = "scheduled"
+
 // BaselineRunRecord is one completed baseline-producing run as this daemon
 // performed it. The files listing joins it to a snapshot by SnapshotTime to
 // report the run's exact duration; snapshots produced elsewhere (the CLI,
 // another daemon) have no record and fall back to the file write span.
+//
+// A record with SkipReason set is NOT a run: it is a scheduled slot that
+// could not start (another backup job held the server, or the schedule was
+// not runnable). It has no snapshot, so the files listing never joins it;
+// it exists so a schedule that never gets to run stays visible on the
+// Backups page instead of silent.
 type BaselineRunRecord struct {
 	ServerID   string `json:"server_id"`
 	ServerName string `json:"server_name,omitempty"`
 	Kind       string `json:"kind"`
+	// Trigger is BaselineRunTriggerScheduled for the backup schedule's own
+	// runs and skips, empty otherwise.
+	Trigger string `json:"trigger,omitempty"`
+	// SkipReason is set on a scheduled slot that did not start; see above.
+	SkipReason string `json:"skip_reason,omitempty"`
 	// SnapshotTime is the published snapshot's anchor instant — its directory
 	// name — in RFC3339 UTC. Empty when the run failed before publishing, or
 	// when the producer does not report it (PostgreSQL dumps stamp the
@@ -129,6 +146,56 @@ func (h *BaselineRunHistory) FindBySnapshot(serverID, snapshotTime string) *Base
 		}
 	}
 	return nil
+}
+
+// LastScheduled returns the newest scheduled RUN for serverID and the newest
+// scheduled SKIP, either nil when there is none. Both, because they answer
+// different questions on the Backups page: "when did the schedule last
+// produce a backup" and "is it currently unable to". A skip newer than the
+// last run is the case the page has to shout about.
+func (h *BaselineRunHistory) LastScheduled(serverID string) (run, skip *BaselineRunRecord) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	recs := h.servers[serverID]
+	for i := len(recs) - 1; i >= 0 && (run == nil || skip == nil); i-- {
+		if recs[i].Trigger != BaselineRunTriggerScheduled {
+			continue
+		}
+		rec := recs[i]
+		if rec.SkipReason != "" {
+			if skip == nil {
+				skip = &rec
+			}
+			continue
+		}
+		if run == nil {
+			run = &rec
+		}
+	}
+	return run, skip
+}
+
+// AppendSkip records a scheduled slot that did not start, unless the newest
+// record for the server is already the same skip: a wedged job plus a short
+// interval would otherwise append an identical skip every slot, and the
+// capped history would evict the real runs, erasing exactly the "when did
+// this last actually back up" answer it exists to keep. Returns whether a
+// record was written.
+func (h *BaselineRunHistory) AppendSkip(rec BaselineRunRecord) (bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	recs := h.servers[rec.ServerID]
+	if n := len(recs); n > 0 && recs[n-1].Trigger == BaselineRunTriggerScheduled &&
+		recs[n-1].SkipReason == rec.SkipReason && recs[n-1].Kind == rec.Kind {
+		return false, nil
+	}
+	rec.Trigger = BaselineRunTriggerScheduled
+	recs = append(recs, rec)
+	if len(recs) > BaselineRunHistoryCap {
+		recs = recs[len(recs)-BaselineRunHistoryCap:]
+	}
+	h.servers[rec.ServerID] = recs
+	return true, h.save()
 }
 
 // List returns a copy of serverID's records, oldest first.

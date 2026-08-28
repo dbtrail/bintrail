@@ -25,6 +25,10 @@ type refreshRequest struct {
 	// rather than at boot so a change made in the settings panel takes effect
 	// on the next tick, the same way a rotation override does.
 	CarryForwardUnchanged bool
+	// Trigger is stamped onto the history record: BaselineRunTriggerScheduled
+	// when the per-server backup schedule started this fold, empty for the
+	// daemon-wide interval loop.
+	Trigger string
 }
 
 // TriggerRefresh starts a periodic baseline refresh for a server, sharing the
@@ -109,7 +113,7 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	// microseconds no matter what the refresh costs.
 	took := time.Since(elapsed)
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
-		Kind: console.BaselineRunRefresh, StartedAt: started.Format(time.RFC3339),
+		Kind: console.BaselineRunRefresh, Trigger: req.Trigger, StartedAt: started.Format(time.RFC3339),
 		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused, Carried: carried,
 	}, err)
 	if err != nil {

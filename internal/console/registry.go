@@ -102,6 +102,12 @@ type ServerEntry struct {
 	// The supervisor reconciles running streams against it at boot and on
 	// every edit; nothing reads it until phase 3.
 	MonitorDesired bool `yaml:"monitor_desired,omitempty"`
+	// BackupSchedule is this server's unattended backup timer (#1442): a full
+	// backup from the source, or a rebuild from the change history, on a
+	// fixed grid. Nil = no schedule. Non-secret. Edited only through the
+	// schedule endpoints; the server edit form carries it over untouched.
+	// On binaries that predate it, it round-trips through Extra.
+	BackupSchedule *BackupSchedule `yaml:"backup_schedule,omitempty"`
 
 	// Extra is the forward-compat catch-all: unknown fields written by a NEWER
 	// bintrail (e.g. the phase-2 control plane's source_dsn / server_id /

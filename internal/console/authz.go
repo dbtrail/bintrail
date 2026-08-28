@@ -133,6 +133,12 @@ var apiRoutePerms = []routePerm{
 	{"GET", "/api/baseline-refresh", ext.PermSettingsRead},
 	{"PUT", "/api/baseline-refresh", ext.PermServersWrite},
 	{"GET", "/api/baselines", ext.PermSettingsRead},
+	// The per-server backup schedule (#1442) is a control-plane setting like
+	// the rotation and refresh overrides: what it changes is what the daemon's
+	// loop does, so writing it is servers:write, not baseline:create. Its
+	// state rides on GET /api/baselines above.
+	{"PUT", "/api/servers/{}/backup-schedule", ext.PermServersWrite},
+	{"DELETE", "/api/servers/{}/backup-schedule", ext.PermServersWrite},
 	// The per-snapshot files listing is metadata (names, sizes, timestamps),
 	// same tier as the listing above. The DOWNLOAD is not: it is a full
 	// unredacted copy of every baseline row, so it takes the row-data

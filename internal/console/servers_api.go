@@ -325,7 +325,10 @@ func (s *Server) handleServersUpdate(w http.ResponseWriter, r *http.Request) {
 		SourceDSN:   sourceDSN,
 		// The verbs that flip monitoring intent arrive with the supervisor
 		// (phase 3); a plain edit must not silently start or stop anything.
-		MonitorDesired:    old.MonitorDesired,
+		MonitorDesired: old.MonitorDesired,
+		// The schedule has its own endpoints; an edit of the connection must
+		// not silently remove it.
+		BackupSchedule:    old.BackupSchedule,
 		SourceServerID:    req.SourceServerID,
 		Schemas:           req.Schemas,
 		Flavor:            flavor,

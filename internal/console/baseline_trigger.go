@@ -83,6 +83,45 @@ type BaselineRequest struct {
 	// Empty for MySQL/MariaDB.
 	Slot        string
 	Publication string
+	// Trigger is stamped onto the run's history record:
+	// BaselineRunTriggerScheduled when the backup schedule started this job,
+	// empty for the Create backup button.
+	Trigger string
+}
+
+// BaselineRequestFor builds the in-process job description for a registry
+// entry. One constructor for the button and the schedule, so the two can
+// never dump a different schema set or destination for the same server.
+func BaselineRequestFor(e ServerEntry) BaselineRequest {
+	return BaselineRequest{
+		ServerID:    e.ID,
+		ServerName:  e.Name,
+		SourceDSN:   e.SourceDSN,
+		Schemas:     splitSchemas(e.Schemas),
+		LocalDir:    e.BaselineDir,
+		S3:          e.BaselineS3,
+		Flavor:      e.SourceFlavor(),
+		Slot:        e.SourceSlot,
+		Publication: e.SourcePublication,
+	}
+}
+
+// baselineTriggerPrecheck is the per-server validation a full backup needs
+// before it can start: a source to read, a destination for the snapshot, and
+// for PostgreSQL the slot and publication the producer anchors on. Shared by
+// the Create backup endpoint and the schedule checker, so a schedule is
+// refused (and later reported) with exactly the words the button would use.
+func baselineTriggerPrecheck(e ServerEntry) error {
+	if e.SourceDSN == "" {
+		return errors.New("this server has no source configured; set the source connection first")
+	}
+	if e.BaselineDir == "" && e.BaselineS3 == "" {
+		return errors.New("this server has no baseline location set up; set a baseline directory or S3 location first (Edit → Advanced)")
+	}
+	if e.IsPostgres() && (e.SourceSlot == "" || e.SourcePublication == "") {
+		return errors.New("this PostgreSQL server has no replication slot/publication configured; set them first (Edit → Source)")
+	}
+	return nil
 }
 
 // BaselineStatus is the pollable state of a server's most recent baseline job.
@@ -160,33 +199,12 @@ func (s *Server) handleBaselineTrigger(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if e.SourceDSN == "" {
-		writeJSONError(w, http.StatusBadRequest, "this server has no source configured; set the source connection first")
-		return
-	}
-	if e.BaselineDir == "" && e.BaselineS3 == "" {
-		writeJSONError(w, http.StatusBadRequest,
-			"this server has no baseline location set up; set a baseline directory or S3 location first (Edit → Advanced)")
-		return
-	}
-	if e.IsPostgres() && (e.SourceSlot == "" || e.SourcePublication == "") {
-		writeJSONError(w, http.StatusBadRequest,
-			"this PostgreSQL server has no replication slot/publication configured; set them first (Edit → Source)")
+	if err := baselineTriggerPrecheck(e); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	req := BaselineRequest{
-		ServerID:    e.ID,
-		ServerName:  e.Name,
-		SourceDSN:   e.SourceDSN,
-		Schemas:     splitSchemas(e.Schemas),
-		LocalDir:    e.BaselineDir,
-		S3:          e.BaselineS3,
-		Flavor:      e.SourceFlavor(),
-		Slot:        e.SourceSlot,
-		Publication: e.SourcePublication,
-	}
-	if err := s.baselineCtrl.Trigger(req); err != nil {
+	if err := s.baselineCtrl.Trigger(BaselineRequestFor(e)); err != nil {
 		if errors.Is(err, ErrBaselineRunning) {
 			writeJSONError(w, http.StatusConflict, err.Error())
 			return

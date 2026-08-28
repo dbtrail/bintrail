@@ -3643,6 +3643,12 @@ async function renderBaselines() {
     // so the rows below can carry only what varies between snapshots.
     const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
     v.append(baselineContextStrip(baselines, cur));
+    // The backup schedule (#1442) sits right under the facts about the
+    // collection: it is the answer to "will this list keep growing on its
+    // own", and a failed scheduled run has to be visible without opening
+    // anything.
+    const scheduleCard = backupScheduleCard(cur, baselines);
+    if (scheduleCard) v.append(scheduleCard);
     // A visible in-progress region (mirrors the verification page): while a
     // backup is being created or restored, the page must look like a page
     // doing work, not a stale list.
@@ -3752,7 +3758,7 @@ function backupRefreshCard(br) {
   if (!br.enabled) {
     card.append(el("p", { class: "form-hint", text: "Nothing uses this setting yet. It applies once the daemon runs automatic refreshes or point in time restores." }));
   } else if (!br.scheduled) {
-    card.append(el("p", { class: "form-hint", text: "No automatic refresh schedule is set, so this applies to restores you run from the Backups page. Add a schedule to have it apply to automatic refreshes too." }));
+    card.append(el("p", { class: "form-hint", text: "This applies to restores and to the backup schedules you set on the Backups page. No daemon-wide refresh interval is set. (CLI: --baseline-refresh-interval)" }));
   }
   const foot = el("div", { class: "stg-cardfoot" },
     el("button", {
@@ -4550,6 +4556,137 @@ function backupFoldError(msg) {
 // backupRestoreCard offers the point-in-time restore: pick a past moment, get
 // a NEW backup showing every table as it was then. Collapsed by default; the
 // last restore's outcome renders inside so a failure is not toast-only.
+// backupScheduleCard (#1442): the per-server backup timer. The summary line
+// carries the schedule and the next run so the state reads without opening
+// the card; the body is the form plus what the schedule last did. A failed
+// or skipped scheduled run opens the card and says so in red: a schedule
+// that fails quietly is worse than none.
+function backupScheduleCard(cur, b) {
+  if (!capsCache.backup_schedule || !cur || !cur.id || cur.kind !== "registry") return null;
+  if (!b || b.error) return null;
+  const sch = b.schedule || null;
+  const details = el("details", { class: "form-advanced bk-restore bk-schedule" });
+  const summary = el("summary", { class: "form-adv-summary" });
+  details.append(summary);
+  const body = el("div", { class: "bk-restore-body" });
+
+  // Summary: one line an operator can read in passing.
+  if (!sch) {
+    summary.textContent = "Scheduled backups: none";
+  } else {
+    const how = sch.method === "refresh" ? "rebuild from change history" : "full backup";
+    let line = "Scheduled backups: every " + sch.every + " at " + sch.at + " UTC, " + how + ".";
+    if (sch.runnable && sch.next_run) line += " Next: " + utcLabel(sch.next_run) + ".";
+    if (!sch.runnable) line += " Cannot run: " + (sch.reason || "unknown reason");
+    summary.textContent = line;
+  }
+
+  body.append(el("p", { class: "form-hint", text:
+    "Takes a backup on a fixed timetable while the daemon runs, so the list below keeps growing without a terminal. " +
+    "A full backup reads your database, the same job as Create backup. A rebuild from change history makes a new backup " +
+    "from the previous one plus the recorded changes, and reads nothing from your database. " +
+    "Missed times are not made up: a backup due while the daemon was stopped waits for the next one. " +
+    "(CLI: --baseline-refresh-interval rebuilds every server at once)" }));
+
+  // The form. Prefilled from the saved schedule, else a sane daily default.
+  const every = el("input", { class: "in", type: "text", spellcheck: "false", placeholder: "1d", "aria-label": "Every" });
+  every.value = sch ? sch.every : "1d";
+  every.style.maxWidth = "90px";
+  const at = el("input", { class: "in", type: "text", spellcheck: "false", placeholder: "03:00", "aria-label": "At (UTC)" });
+  at.value = sch ? sch.at : "03:00";
+  at.style.maxWidth = "90px";
+  const how = el("select", { class: "select", "aria-label": "How" });
+  how.append(el("option", { value: "backup", text: "Full backup (reads your database)" }));
+  how.append(el("option", { value: "refresh", text: "Rebuild from change history (no load on your database)" }));
+  how.value = sch ? sch.method : (capsCache.baseline_trigger ? "backup" : "refresh");
+  const save = el("button", { class: "btn", type: "button", text: sch ? "Save schedule" : "Add schedule" });
+  const msg = el("p", { class: "form-msg err" });
+  msg.hidden = true;
+  save.onclick = () => saveBackupSchedule(cur.id, { every: every.value.trim(), at: at.value.trim(), method: how.value }, save, msg);
+  const row = el("div", { class: "bk-restore-row" },
+    el("span", { class: "form-hint", text: "every" }), every,
+    el("span", { class: "form-hint", text: "at" }), at,
+    el("span", { class: "form-hint", text: "UTC" }), how, save);
+  if (sch) {
+    const remove = el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Remove schedule" });
+    remove.onclick = () => removeBackupSchedule(cur.id, remove, msg);
+    row.append(remove);
+  }
+  body.append(row, el("p", { class: "form-hint", text:
+    "Every: minutes, hours or days (30m, 6h, 1d), at least 15m. At: the UTC time the timetable lines up on; for a daily " +
+    "or longer schedule it is the time of day the backup runs." }), msg);
+
+  // What the schedule last did. The skip is shown when it is the newest
+  // fact: a slot that could not start after the last good run is exactly
+  // what the operator needs to see.
+  if (sch) {
+    let alarm = false;
+    if (sch.running) {
+      body.append(el("p", { class: "form-hint", text: "A scheduled backup is running now." }));
+    }
+    const run = sch.last_run, skip = sch.last_skipped;
+    if (run) {
+      const when = utcLabel(run.finished_at || run.started_at || "");
+      const what = run.method === "refresh" ? "rebuild" : "full backup";
+      if (run.ok) {
+        const reused = run.carried || 0;
+        body.append(el("p", { class: "form-hint", text:
+          "Last scheduled " + what + " finished " + when + ": " + (run.tables || 0) + " table(s)" +
+          (reused ? ", " + reused + " unchanged and reused" : "") +
+          (run.uploaded ? ", " + run.uploaded + " file(s) uploaded" : "") + "." }));
+      } else {
+        alarm = true;
+        body.append(el("p", { class: "form-msg err", text:
+          "Last scheduled " + what + " failed " + when + ": " + backupFoldError(run.error || "unknown error") +
+          (run.method === "refresh" ? " Nothing was overwritten; the next scheduled run retries." : "") }));
+      }
+    }
+    if (skip && (!run || skip.at > (run.finished_at || ""))) {
+      alarm = true;
+      body.append(el("p", { class: "form-msg err", text:
+        "Did not run at " + utcLabel(skip.at) + ": " + skip.reason + (/[.!?]$/.test(skip.reason) ? "" : ".") +
+        " The next scheduled time is tried again." }));
+    }
+    if (!run && !skip && !sch.running) {
+      body.append(el("p", { class: "form-hint", text: "It has not run yet." }));
+    }
+    if (!sch.runnable || alarm) details.open = true;
+  }
+  details.append(body);
+  return details;
+}
+
+async function saveBackupSchedule(id, sched, btn, msgEl) {
+  msgEl.hidden = true;
+  btn.disabled = true;
+  try {
+    await api("/api/servers/" + encodeURIComponent(id) + "/backup-schedule", { method: "PUT", body: sched });
+  } catch (err) {
+    msgEl.textContent = (err && err.message) || String(err);
+    msgEl.hidden = false;
+    btn.disabled = false;
+    return;
+  }
+  btn.disabled = false;
+  toast("Backup schedule saved. It runs at the next scheduled time.");
+  if (location.pathname === "/baselines") renderBaselines();
+}
+
+async function removeBackupSchedule(id, btn, msgEl) {
+  msgEl.hidden = true;
+  btn.disabled = true;
+  try {
+    await api("/api/servers/" + encodeURIComponent(id) + "/backup-schedule", { method: "DELETE" });
+  } catch (err) {
+    msgEl.textContent = (err && err.message) || String(err);
+    msgEl.hidden = false;
+    btn.disabled = false;
+    return;
+  }
+  toast("Backup schedule removed.");
+  if (location.pathname === "/baselines") renderBaselines();
+}
+
 function backupRestoreCard(cur, b, restoreSt) {
   // Registry servers only: the CLI (ephemeral) entry is refused by the
   // monitor verbs with a message about monitoring, not restores.

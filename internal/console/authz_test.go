@@ -65,6 +65,8 @@ var registeredAPIPatterns = []struct{ method, pattern string }{
 	{"PUT", "/api/rotation"},
 	{"GET", "/api/baseline-refresh"},
 	{"PUT", "/api/baseline-refresh"},
+	{"PUT", "/api/servers/{}/backup-schedule"},
+	{"DELETE", "/api/servers/{}/backup-schedule"},
 	{"POST", "/api/auth/logout"},
 	{"POST", "/api/auth/password"},
 	{"GET", "/api/mcp-token"},

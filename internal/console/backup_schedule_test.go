@@ -1,0 +1,269 @@
+package console
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestBackupSchedule_Parse(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      BackupSchedule
+		want    ParsedBackupSchedule
+		wantErr string
+	}{
+		{"daily at 03:00", BackupSchedule{Every: "1d", At: "03:00"},
+			ParsedBackupSchedule{Every: 24 * time.Hour, At: 3 * time.Hour, Method: BackupMethodFull}, ""},
+		{"defaults: midnight, full", BackupSchedule{Every: "6h"},
+			ParsedBackupSchedule{Every: 6 * time.Hour, Method: BackupMethodFull}, ""},
+		{"refresh method", BackupSchedule{Every: "30m", At: "9:15", Method: "refresh"},
+			ParsedBackupSchedule{Every: 30 * time.Minute, At: 9*time.Hour + 15*time.Minute, Method: BackupMethodRefresh}, ""},
+		{"whitespace tolerated", BackupSchedule{Every: " 1d ", At: " 03:00 ", Method: " backup "},
+			ParsedBackupSchedule{Every: 24 * time.Hour, At: 3 * time.Hour, Method: BackupMethodFull}, ""},
+		{"floor", BackupSchedule{Every: "5m"}, ParsedBackupSchedule{}, "too often"},
+		{"exactly the floor is fine", BackupSchedule{Every: "15m"},
+			ParsedBackupSchedule{Every: 15 * time.Minute, Method: BackupMethodFull}, ""},
+		{"no unit", BackupSchedule{Every: "6"}, ParsedBackupSchedule{}, "every:"},
+		{"seconds are not a unit", BackupSchedule{Every: "900s"}, ParsedBackupSchedule{}, "every:"},
+		{"empty every", BackupSchedule{}, ParsedBackupSchedule{}, "every:"},
+		{"bad clock", BackupSchedule{Every: "1d", At: "25:00"}, ParsedBackupSchedule{}, "at:"},
+		{"clock without minutes", BackupSchedule{Every: "1d", At: "3"}, ParsedBackupSchedule{}, "at:"},
+		{"clock with seconds", BackupSchedule{Every: "1d", At: "03:00:00"}, ParsedBackupSchedule{}, "at:"},
+		{"unknown method", BackupSchedule{Every: "1d", Method: "incremental"}, ParsedBackupSchedule{}, "method:"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := c.in.Parse()
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("err = %v, want one containing %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != c.want {
+				t.Fatalf("got %+v, want %+v", got, c.want)
+			}
+		})
+	}
+}
+
+// The refusal names the floor as an operator would type it; the text and the
+// constant must agree or the message lies about what is accepted.
+func TestBackupSchedule_minEveryTextMatchesConstant(t *testing.T) {
+	if _, err := (BackupSchedule{Every: backupScheduleMinEveryText}).Parse(); err != nil {
+		t.Fatalf("the floor text %q does not parse as an accepted interval: %v", backupScheduleMinEveryText, err)
+	}
+	p, _ := (BackupSchedule{Every: backupScheduleMinEveryText}).Parse()
+	if p.Every != BackupScheduleMinEvery {
+		t.Fatalf("floor text %q = %s, constant = %s", backupScheduleMinEveryText, p.Every, BackupScheduleMinEvery)
+	}
+}
+
+func TestBackupSchedule_Normalized(t *testing.T) {
+	got, err := (BackupSchedule{Every: " 6h ", Extra: map[string]any{"future": 1}}).Normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Every != "6h" || got.At != "00:00" || got.Method != BackupMethodFull {
+		t.Fatalf("defaults were not spelled out: %+v", got)
+	}
+	if got.Extra["future"] != 1 {
+		t.Fatal("Normalized dropped the forward-compat catch-all")
+	}
+	if _, err := (BackupSchedule{Every: "1m"}).Normalized(); err == nil {
+		t.Fatal("Normalized accepted what Parse refuses")
+	}
+}
+
+func TestParsedBackupSchedule_slots(t *testing.T) {
+	at := func(s string) time.Time {
+		v, err := time.Parse("2006-01-02 15:04:05", s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v.UTC()
+	}
+	cases := []struct {
+		name       string
+		sched      BackupSchedule
+		now        string
+		wantBefore string
+		wantNext   string
+	}{
+		{"daily 03:00, before today's slot", BackupSchedule{Every: "1d", At: "03:00"},
+			"2026-08-28 02:59:59", "2026-08-27 03:00:00", "2026-08-28 03:00:00"},
+		{"daily 03:00, exactly on the slot", BackupSchedule{Every: "1d", At: "03:00"},
+			"2026-08-28 03:00:00", "2026-08-28 03:00:00", "2026-08-29 03:00:00"},
+		{"daily 03:00, after", BackupSchedule{Every: "1d", At: "03:00"},
+			"2026-08-28 11:43:10", "2026-08-28 03:00:00", "2026-08-29 03:00:00"},
+		{"every 6h aligned to 03:00", BackupSchedule{Every: "6h", At: "03:00"},
+			"2026-08-28 11:43:10", "2026-08-28 09:00:00", "2026-08-28 15:00:00"},
+		{"every 6h at midnight", BackupSchedule{Every: "6h"},
+			"2026-08-28 23:59:59", "2026-08-28 18:00:00", "2026-08-29 00:00:00"},
+		{"every 15m aligned to :05", BackupSchedule{Every: "15m", At: "00:05"},
+			"2026-08-28 11:43:10", "2026-08-28 11:35:00", "2026-08-28 11:50:00"},
+		// 7d from the epoch (a Thursday): the grid is fixed, not "a week from
+		// when it was saved".
+		{"weekly", BackupSchedule{Every: "7d", At: "03:00"},
+			"2026-08-28 11:43:10", "2026-08-27 03:00:00", "2026-09-03 03:00:00"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p, err := c.sched.Parse()
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := at(c.now)
+			if got := p.SlotAtOrBefore(now); !got.Equal(at(c.wantBefore)) {
+				t.Errorf("SlotAtOrBefore = %s, want %s", got, c.wantBefore)
+			}
+			if got := p.NextRun(now); !got.Equal(at(c.wantNext)) {
+				t.Errorf("NextRun = %s, want %s", got, c.wantNext)
+			}
+			if got := p.NextRun(now); !got.After(now) {
+				t.Errorf("NextRun %s is not after now %s", got, now)
+			}
+		})
+	}
+}
+
+// The slot grid must be stable in time: the slot at or before an instant
+// never depends on which instant it was asked from, only on the grid.
+func TestParsedBackupSchedule_gridIsFixed(t *testing.T) {
+	p, _ := (BackupSchedule{Every: "6h", At: "03:00"}).Parse()
+	base := time.Date(2026, 8, 28, 9, 0, 0, 0, time.UTC)
+	for _, off := range []time.Duration{0, time.Second, time.Hour, 5*time.Hour + 59*time.Minute} {
+		if got := p.SlotAtOrBefore(base.Add(off)); !got.Equal(base) {
+			t.Fatalf("at +%s the slot moved to %s", off, got)
+		}
+	}
+	if got := p.SlotAtOrBefore(base.Add(6 * time.Hour)); !got.Equal(base.Add(6 * time.Hour)) {
+		t.Fatalf("the next slot did not arrive on time: %s", got)
+	}
+}
+
+func TestCheckBackupSchedule(t *testing.T) {
+	full := BackupSchedule{Every: "1d", Method: BackupMethodFull}
+	refresh := BackupSchedule{Every: "1d", Method: BackupMethodRefresh}
+	ready := ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: "/b"}
+	live := BackupScheduleGates{LoopRunning: true, FullBackups: true}
+	cases := []struct {
+		name    string
+		e       ServerEntry
+		sched   BackupSchedule
+		gates   BackupScheduleGates
+		wantErr string // "" = runnable
+	}{
+		{"full backup, everything on", ready, full, live, ""},
+		{"refresh, everything on", ready, refresh, live, ""},
+		{"read-only console", ready, full, BackupScheduleGates{ReadOnlyConsole: true}, "watch daemon"},
+		{"watch without any baseline feature", ready, full, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER=0 and no --baseline-refresh-interval"},
+		{"full backup without the creation opt-in", ready, full, BackupScheduleGates{LoopRunning: true}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER=0); a schedule can still rebuild"},
+		{"refresh without the creation opt-in is fine", ready, refresh, BackupScheduleGates{LoopRunning: true}, ""},
+		{"full backup, no source", ServerEntry{DSN: "idx", BaselineDir: "/b"}, full, live, "no source configured"},
+		{"full backup, no destination", ServerEntry{DSN: "idx", SourceDSN: "src"}, full, live, "no baseline location"},
+		{"full backup, S3-only destination is fine", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, full, live, ""},
+		{"full backup, postgres without slot", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: "/b", Flavor: FlavorPostgres}, full, live, "replication slot"},
+		{"refresh, S3-only destination", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, refresh, live, "only in S3"},
+		{"refresh, no destination", ServerEntry{DSN: "idx", SourceDSN: "src"}, refresh, live, "no backup directory"},
+		{"refresh, no index", ServerEntry{BaselineDir: "/b"}, refresh, live, "no index connection"},
+		{"unparseable schedule", ready, BackupSchedule{Every: "1x"}, live, "every:"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := CheckBackupSchedule(c.e, c.sched, c.gates)
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("accepted, want a refusal")
+			}
+			if !errors.Is(err, ErrBackupScheduleNotRunnable) {
+				t.Fatalf("refusal is not classed: %v", err)
+			}
+			if !strings.Contains(RefusalReason(err), c.wantErr) {
+				t.Fatalf("reason %q does not mention %q", RefusalReason(err), c.wantErr)
+			}
+			if strings.HasPrefix(RefusalReason(err), ErrBackupScheduleNotRunnable.Error()) {
+				t.Fatalf("RefusalReason returned the class prefix too: %q", RefusalReason(err))
+			}
+		})
+	}
+}
+
+// The precheck the Create backup button runs is the SAME function the
+// schedule checker runs, so the two cannot accept different servers.
+func TestBaselineTriggerPrecheck_sharedWithTheSchedule(t *testing.T) {
+	e := ServerEntry{DSN: "idx", SourceDSN: "src"}
+	want := baselineTriggerPrecheck(e)
+	if want == nil {
+		t.Fatal("fixture is runnable; the test needs a refused entry")
+	}
+	got := CheckBackupSchedule(e, BackupSchedule{Every: "1d"}, BackupScheduleGates{LoopRunning: true, FullBackups: true})
+	if got == nil || RefusalReason(got) != want.Error() {
+		t.Fatalf("schedule reason %v differs from the button's %v", got, want)
+	}
+}
+
+func TestBaselineRunHistory_scheduledRunsAndSkips(t *testing.T) {
+	h, err := OpenBaselineHistory(t.TempDir() + "/h.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run, skip := h.LastScheduled("a"); run != nil || skip != nil {
+		t.Fatal("an empty history reported something")
+	}
+	// A manual run is never reported as the schedule's.
+	if err := h.Append(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, StartedAt: "t1", FinishedAt: "t1"}); err != nil {
+		t.Fatal(err)
+	}
+	if run, _ := h.LastScheduled("a"); run != nil {
+		t.Fatalf("a manual run was attributed to the schedule: %+v", run)
+	}
+	if err := h.Append(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled,
+		StartedAt: "t2", FinishedAt: "t2", SnapshotTime: "s2"}); err != nil {
+		t.Fatal(err)
+	}
+	wrote, err := h.AppendSkip(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, SkipReason: "busy", StartedAt: "t3", FinishedAt: "t3"})
+	if err != nil || !wrote {
+		t.Fatalf("first skip: wrote=%v err=%v", wrote, err)
+	}
+	// The same skip again is folded, so a wedged server cannot evict the
+	// real runs from the capped history.
+	wrote, err = h.AppendSkip(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, SkipReason: "busy", StartedAt: "t4", FinishedAt: "t4"})
+	if err != nil || wrote {
+		t.Fatalf("repeated skip: wrote=%v err=%v, want folded", wrote, err)
+	}
+	// A different reason is a new fact.
+	wrote, _ = h.AppendSkip(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, SkipReason: "off", StartedAt: "t5", FinishedAt: "t5"})
+	if !wrote {
+		t.Fatal("a skip with a new reason was folded into the old one")
+	}
+	run, skip := h.LastScheduled("a")
+	if run == nil || run.SnapshotTime != "s2" {
+		t.Fatalf("last scheduled run = %+v, want the t2 run", run)
+	}
+	if skip == nil || skip.SkipReason != "off" || skip.Trigger != BaselineRunTriggerScheduled {
+		t.Fatalf("last skip = %+v, want the t5 skip, stamped scheduled", skip)
+	}
+	// Skips never join a snapshot: they have none.
+	if rec := h.FindBySnapshot("a", ""); rec != nil {
+		t.Fatalf("a skip joined a snapshot: %+v", rec)
+	}
+	// And all of it survives a reload.
+	h2, err := OpenBaselineHistory(h.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run, skip := h2.LastScheduled("a"); run == nil || skip == nil {
+		t.Fatal("the scheduled records did not survive a reload")
+	}
+}

@@ -103,6 +103,11 @@ type Config struct {
 	// server's own baseline store. Wired whenever the watch daemon has a
 	// baseline supervisor (creation or refresh opt-in); nil elsewhere.
 	BaselineRestore BaselineRestorer
+	// BackupSchedules is the watch daemon's per-server backup schedule loop
+	// (#1442). Wired whenever the daemon has a baseline supervisor; nil
+	// elsewhere, where the schedule endpoints refuse with 403 and the listing
+	// reports a saved schedule as not runnable.
+	BackupSchedules BackupScheduleReporter
 	// SQLExport builds custom .sql backups (fold at a chosen instant,
 	// download as a mydumper-format dump). Wired with BaselineRestore.
 	SQLExport SQLExporter
@@ -270,6 +275,9 @@ type Server struct {
 	// verifyHistory: the persisted run history, set with verifyCtrl (#1191).
 	verifyHistory   *VerifyHistory
 	baselineRestore BaselineRestorer
+	// backupSchedules: non-nil only on a watch daemon with a baseline
+	// supervisor (see Config.BackupSchedules).
+	backupSchedules BackupScheduleReporter
 	sqlExport       SQLExporter
 	baselineHistory *BaselineRunHistory
 	// telemetry: non-nil only when a long-running console wired its live
@@ -475,6 +483,7 @@ func New(cfg Config) (*Server, error) {
 		verifyCtrl:              cfg.VerifyCtrl,
 		verifyHistory:           cfg.VerifyHistory,
 		baselineRestore:         cfg.BaselineRestore,
+		backupSchedules:         cfg.BackupSchedules,
 		sqlExport:               cfg.SQLExport,
 		baselineHistory:         cfg.BaselineHistory,
 		telemetry:               cfg.Telemetry,
@@ -623,6 +632,10 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/servers/{id}/baseline", s.handleBaselineStatus)
 	api.HandleFunc("POST /api/servers/{id}/baseline/restore", s.recordAction("baseline-restore", s.handleBaselineRestore))
 	api.HandleFunc("GET /api/servers/{id}/baseline/restore", s.handleBaselineRestoreStatus)
+	// Per-server backup schedule (#1442): save or remove the timer. Its state
+	// rides on GET /api/baselines. 403 unless this process runs the loop.
+	api.HandleFunc("PUT /api/servers/{id}/backup-schedule", s.recordAction("backup-schedule", s.handleBackupScheduleUpdate))
+	api.HandleFunc("DELETE /api/servers/{id}/backup-schedule", s.recordAction("backup-schedule", s.handleBackupScheduleDelete))
 	api.HandleFunc("POST /api/servers/{id}/sql-export", s.recordAction("sql-export", s.handleSQLExportTrigger))
 	api.HandleFunc("GET /api/servers/{id}/sql-export", s.handleSQLExportStatus)
 	api.HandleFunc("GET /api/servers/{id}/sql-export/download", s.handleSQLExportDownload)
