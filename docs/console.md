@@ -405,11 +405,15 @@ panel that answers whether a restore would work, far below the fold.
   record whose time moves to the latest missed slot) so the page shows the
   last run, its result and the last skip after a restart too; the daemon's
   own view of the job it last started fills in when the history file is
-  unavailable or a job died without writing one. A schedule the daemon cannot
-  serve at all (no producer possible: creation opt-in not set AND no local
-  directory, a lock-mode misconfiguration on an S3-only server, no
-  destination) is refused on save with the reason, and one already saved is
-  reported as not runnable on the page, never silently skipped.
+  unavailable or a job died without writing one (the daemon watches every
+  job it starts, so that view is complete). When an update from the
+  recorded changes fails and a full backup is started in its place, the
+  page says so in red until a later scheduled update goes through. A
+  schedule the daemon cannot serve at all (no producer possible: creation
+  opt-in not set AND no local directory, a lock-mode misconfiguration on a
+  server whose backups go to S3, no destination) is refused on save with
+  the reason, and one already saved is reported as not runnable on the
+  page, never silently skipped.
   `PUT`/`DELETE /api/servers/{id}/backup-schedule`; state on `GET /api/baselines`
   (`schedule`). The daemon-wide `--baseline-refresh-interval` below is
   independent and can run alongside.

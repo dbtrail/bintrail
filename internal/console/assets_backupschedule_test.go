@@ -66,6 +66,28 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 	if !strings.Contains(body, `hit an internal error`) {
 		t.Error("a crashed rebuild is rendered as a refusal")
 	}
+	// The fallback block itself is red and opens the card: the needles above
+	// only proved the branch exists.
+	if i := strings.Index(body, `if (fb) {`); i >= 0 {
+		block := body[i:]
+		if j := strings.Index(block, `if (skip`); j >= 0 {
+			block = block[:j]
+		}
+		if !strings.Contains(block, `alarm = true`) || !strings.Contains(block, `class: "form-msg err"`) {
+			t.Errorf("the fallback block is not a red alarm: %s", block)
+		}
+	}
+	// Reasons assembled by the daemon never appear in this file, so the em
+	// dash guard below cannot see one riding in on a fold error; they go
+	// through plainWords.
+	for _, want := range []string{`plainWords(skip.reason)`, `plainWords(sch.next_method_error)`, `plainWords(sch.reason`, `skip.at >= `} {
+		if !strings.Contains(body, want) {
+			t.Errorf("backupScheduleCard lost %q", want)
+		}
+	}
+	if save := jsFunctionBody(t, readAsset(t, "app.js"), "saveBackupSchedule"); !strings.Contains(save, `next_method_error`) {
+		t.Error("saveBackupSchedule toasts a run the response says cannot start")
+	}
 	// The method is not an input any more: the form sends only when, and the
 	// card never offers a producer to pick.
 	if strings.Contains(body, "method: how.value") || strings.Contains(body, `el("select"`) {

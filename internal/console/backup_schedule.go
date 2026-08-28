@@ -207,7 +207,7 @@ func RefusalReason(err error) string {
 // schedule is reported with the same words a write is refused with.
 const (
 	scheduleRefusalReadOnly = "scheduled backups run in the watch daemon (bintrail-console watch), not the read-only console"
-	scheduleRefusalNoLoop   = "backup features are turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no --baseline-refresh-interval), so nothing can run a schedule"
+	scheduleRefusalNoLoop   = "backup features are turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no refresh interval (CLI: --baseline-refresh-interval)), so nothing can run a schedule"
 	scheduleRefusalNoDumps  = "creating backups from the console is turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1)"
 )
 
@@ -254,7 +254,7 @@ func rebuildPossible(e ServerEntry) error {
 		// Same constraint as the refresh loop and the point-in-time restore:
 		// the fold reads the previous snapshot and writes the new one on
 		// disk, so it needs the server's own local directory.
-		return errors.New("a rebuild from the change history needs a local backup directory")
+		return errors.New("an update from the recorded changes needs a local backup directory")
 	}
 	return nil
 }
@@ -286,7 +286,7 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 		return notRunnable("this server's backups go to S3, which only a full backup can upload, and " + fullErr.Error())
 	}
 	if rebuildErr := rebuildPossible(e); rebuildErr != nil {
-		return notRunnable(fullErr.Error() + "; " + rebuildErr.Error() + " (Edit → Advanced)")
+		return notRunnable(strings.TrimSuffix(fullErr.Error(), " (Edit → Advanced)") + "; " + rebuildErr.Error() + " (Edit → Advanced)")
 	}
 	// Only a rebuild is possible. That is a runnable schedule (it is what
 	// --baseline-refresh-interval does), but only once there is a backup to
@@ -300,9 +300,13 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 //   - backups that go to S3 are FULL backups: only a full backup uploads, so
 //     a rebuild would leave the off-box copy stale while unprunable local
 //     snapshots pile up;
+//   - a server an update cannot serve (no index DSN, no local backup
+//     directory) gets a FULL backup, with that refusal as the why;
 //   - a server with no previous backup on local disk gets a FULL backup:
-//     there is nothing to rebuild from;
-//   - otherwise the newest backup is REBUILT from the recorded changes, with
+//     there is nothing to update. A directory that does not exist yet is
+//     that case; one that cannot be READ is its own error, never "no
+//     backup yet";
+//   - otherwise the newest backup is UPDATED from the recorded changes, with
 //     no load on the source. If the fold refuses (a capture gap, a schema
 //     change), the loop takes a full backup at the same slot instead, since
 //     a fresh read of the source is exactly what heals those.
@@ -340,9 +344,9 @@ func ChooseBackupMethod(ctx context.Context, e ServerEntry, gates BackupSchedule
 	}
 	if len(tables) == 0 {
 		if fullErr != nil {
-			return BackupMethodFull, "", fmt.Errorf("no previous backup to rebuild from under %s, and a full backup cannot start: %w", e.BaselineDir, fullErr)
+			return BackupMethodFull, "", fmt.Errorf("no previous backup to update under %s, and a full backup cannot start: %w", e.BaselineDir, fullErr)
 		}
-		return BackupMethodFull, "no previous backup to rebuild from", nil
+		return BackupMethodFull, "no previous backup to update", nil
 	}
 	return BackupMethodRefresh, "no load on your database", nil
 }
@@ -361,8 +365,11 @@ type BackupScheduleState struct {
 	// LastMethod is that job's producer (BackupMethodFull/Refresh).
 	LastMethod string
 	// Last is the supervisor's status for THAT job: live while it is in the
-	// slot, the copy the loop kept once it finished (so a later manual job
-	// taking the slot does not erase it), nil when nothing was started here.
+	// slot, afterwards the copy ScheduleState took when it saw the job
+	// terminal (so a later manual job taking the slot does not erase it),
+	// nil when nothing was started here. The copy is taken on READ; the
+	// loop's watcher is the read that always happens, so it exists for
+	// every scheduled job, not only the ones a page load caught in time.
 	Last *BaselineStatus
 	// Running: the job this schedule last started has not finished.
 	Running bool
@@ -392,4 +399,7 @@ type BackupScheduleReporter interface {
 	// that falls before the loop's next tick. Without it the next_run the
 	// page showed at save time could be silently skipped.
 	Observe(serverID string, sched BackupSchedule, at time.Time)
+	// Forget tells the loop the schedule for serverID was removed, so its
+	// observation and last outcome are dropped now, not at the next tick.
+	Forget(serverID string)
 }

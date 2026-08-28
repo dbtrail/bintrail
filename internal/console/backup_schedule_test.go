@@ -202,7 +202,7 @@ func TestCheckBackupSchedule(t *testing.T) {
 	}{
 		{"everything on", ready, live, ""},
 		{"read-only console", ready, BackupScheduleGates{ReadOnlyConsole: true}, "watch daemon"},
-		{"watch without any baseline feature", ready, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no --baseline-refresh-interval"},
+		{"watch without any baseline feature", ready, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no refresh interval (CLI: --baseline-refresh-interval)"},
 		{"creation off but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true}, ""},
 		{"creation off and no local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, "go to S3, which only a full backup can upload, and creating backups"},
 		{"lock mode misconfigured but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, ""},
@@ -281,7 +281,10 @@ func TestChooseBackupMethod(t *testing.T) {
 		{"local dir with a backup: rebuild", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap}, live, BackupMethodRefresh, "no load on your database", ""},
 		{"local dir with a backup, creation off: still rebuild", ServerEntry{DSN: "idx", BaselineDir: withSnap}, off, BackupMethodRefresh, "no load", ""},
 		{"local dir, no backup yet: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty}, live, BackupMethodFull, "no previous backup", ""},
-		{"local dir, no backup yet, creation off: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty}, off, BackupMethodFull, "", "no previous backup to rebuild from"},
+		// The directory the first full backup has not created yet is the
+		// same case, not an unreadable one.
+		{"local dir that does not exist yet: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: filepath.Join(empty, "not-yet")}, live, BackupMethodFull, "no previous backup", ""},
+		{"local dir, no backup yet, creation off: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty}, off, BackupMethodFull, "", "no previous backup to update"},
 		{"S3 destination: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, live, BackupMethodFull, "backups go to S3", ""},
 		{"S3 AND local dir with a backup: still full (the S3 copy must stay fresh)", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap, BaselineS3: "s3://b/"}, live, BackupMethodFull, "backups go to S3", ""},
 		{"S3 destination, creation off: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, off, BackupMethodFull, "", "only a full backup can upload"},
@@ -329,6 +332,20 @@ func TestChooseBackupMethod_unreadableDirIsNotNoBackup(t *testing.T) {
 	}
 }
 
+// Same verdict for a path that is a FILE (ENOTDIR): this one runs as root
+// too, where a mode-000 directory reads fine and the test above skips.
+func TestChooseBackupMethod_fileAsDirIsNotNoBackup(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "backups")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := ChooseBackupMethod(context.Background(), ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: file},
+		BackupScheduleGates{LoopRunning: true, FullBackups: true})
+	if err == nil || !strings.Contains(err.Error(), "could not be read") {
+		t.Fatalf("err = %v, want the unreadable path named", err)
+	}
+}
+
 // The precheck the Create backup button runs is the SAME function the
 // schedule checker runs, so the two cannot accept different servers.
 func TestBaselineTriggerPrecheck_sharedWithTheSchedule(t *testing.T) {
@@ -338,8 +355,15 @@ func TestBaselineTriggerPrecheck_sharedWithTheSchedule(t *testing.T) {
 		t.Fatal("fixture is runnable; the test needs a refused entry")
 	}
 	got := CheckBackupSchedule(e, BackupSchedule{Every: "1d"}, BackupScheduleGates{LoopRunning: true, FullBackups: true})
-	if got == nil || !strings.HasPrefix(RefusalReason(got), want.Error()) {
+	// The button's hint "(Edit → Advanced)" moves to the end of the combined
+	// reason and appears once, not once per producer.
+	const hint = " (Edit → Advanced)"
+	reason := RefusalReason(got)
+	if got == nil || !strings.HasPrefix(reason, strings.TrimSuffix(want.Error(), hint)) {
 		t.Fatalf("schedule reason %v does not start with the button's %v", got, want)
+	}
+	if !strings.HasSuffix(reason, hint) || strings.Count(reason, hint) != 1 {
+		t.Fatalf("reason %q should carry the edit hint exactly once, at the end", reason)
 	}
 }
 

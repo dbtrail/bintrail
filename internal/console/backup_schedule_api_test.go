@@ -12,10 +12,11 @@ import (
 
 // stubScheduleReporter stands in for the watch daemon's schedule loop.
 type stubScheduleReporter struct {
-	full     bool
-	refusal  error
-	state    map[string]BackupScheduleState
-	observed []string // "<id> <identity>" per Observe call
+	full      bool
+	refusal   error
+	state     map[string]BackupScheduleState
+	observed  []string // "<id> <identity>" per Observe call
+	forgotten []string // ids per Forget call
 }
 
 func (s *stubScheduleReporter) ScheduleState(id string) BackupScheduleState {
@@ -25,6 +26,7 @@ func (s *stubScheduleReporter) FullBackups() (bool, error) { return s.full, s.re
 func (s *stubScheduleReporter) Observe(id string, sched BackupSchedule, _ time.Time) {
 	s.observed = append(s.observed, id+" "+sched.Identity())
 }
+func (s *stubScheduleReporter) Forget(id string) { s.forgotten = append(s.forgotten, id) }
 
 // newScheduleServer builds a watch-shaped server with the schedule loop
 // present, a persisted history, and one registry server with a source and a
@@ -139,6 +141,9 @@ func TestBackupScheduleAPI_saveListRemove(t *testing.T) {
 	}
 	if e, _ = srv.cm.reg.Get(id); e.BackupSchedule != nil {
 		t.Fatal("DELETE left the schedule in place")
+	}
+	if len(rep.forgotten) != 1 || rep.forgotten[0] != id {
+		t.Fatalf("DELETE did not tell the loop to forget the server: %v", rep.forgotten)
 	}
 	if rec, _ = doServersReq(t, srv, "DELETE", path, ""); rec.Code != 200 {
 		t.Fatalf("removing an absent schedule = %d, want 200", rec.Code)

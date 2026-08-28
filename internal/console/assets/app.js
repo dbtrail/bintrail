@@ -3756,7 +3756,7 @@ function backupRefreshCard(br) {
     ? "A table with no changes keeps its previous file instead of being written again. Where the filesystem allows it the two backups then share the same bytes on disk, so deleting the older one frees nothing while the newer one still uses it."
     : "Every table is written again on each refresh, even when nothing in it changed. Turning this on skips that work for unchanged tables. (CLI: --baseline-carry-forward-unchanged)" }));
   if (!br.enabled) {
-    card.append(el("p", { class: "form-hint", text: "Nothing uses this setting yet. It applies once the daemon runs automatic refreshes or point in time restores." }));
+    card.append(el("p", { class: "form-hint", text: "Nothing uses this setting yet. It applies once the daemon runs automatic refreshes, scheduled backups or point in time restores." }));
   } else if (!br.scheduled) {
     card.append(el("p", { class: "form-hint", text: "This applies to restores and to the backup schedules you set on the Backups page. No daemon-wide refresh interval is set. (CLI: --baseline-refresh-interval)" }));
   }
@@ -4543,6 +4543,13 @@ async function watchBackupRuns(id, vgen, kinds) {
 // A fold failure is per-table and errors.Join'd, so last_error is usually
 // MULTI-LINE: the patterns are global and never cross a line, or one
 // table's remedy would eat the next table's identity.
+// plainWords is the copy rule for reasons the daemon assembles at runtime:
+// they never appear in this file, so the source guard cannot see an em dash
+// in them, and one does ride in on fold errors.
+function plainWords(msg) {
+  return String(msg == null ? "" : msg).replace(/\u2014/g, "-");
+}
+
 function backupFoldError(msg) {
   let out = String(msg)
     .replace(/;?[ \t]*pass --allow-gaps to proceed[^.;\n]*/g,
@@ -4586,7 +4593,7 @@ function backupScheduleCard(cur, b) {
   } else {
     let line = "Scheduled backups: every " + sch.every + " at " + sch.at + " UTC.";
     if (sch.runnable && sch.next_run) line += " Next: " + utcLabel(sch.next_run) + ".";
-    if (!sch.runnable) line += " Cannot run: " + (sch.reason || "unknown reason");
+    if (!sch.runnable) line += " Cannot run: " + plainWords(sch.reason || "unknown reason");
     summary.textContent = line;
   }
 
@@ -4641,7 +4648,7 @@ function backupScheduleCard(cur, b) {
       // stand: said in red BEFORE the slot, not discovered after it.
       alarm = true;
       body.append(el("p", { class: "form-msg err", text:
-        "The next run cannot start: " + sch.next_method_error + (/[.!?]$/.test(sch.next_method_error) ? "" : ".") }));
+        "The next run cannot start: " + plainWords(sch.next_method_error) + (/[.!?]$/.test(sch.next_method_error) ? "" : ".") }));
     } else if (sch.runnable && sch.next_method) {
       const how = sch.next_method === "refresh" ? "will update the latest backup from the recorded changes" : "will take a full backup from your database";
       body.append(el("p", { class: "form-hint", text:
@@ -4675,22 +4682,26 @@ function backupScheduleCard(cur, b) {
       }
     }
     if (fb) {
-      // Always shown while the daemon remembers it, in red: a rebuild that
+      // Always shown while the daemon remembers it, in red: an update that
       // is refused at every slot means the no-load half of this feature is
       // dead and production is being read in full instead, and a green
       // "last backup finished" line would hide exactly that. A crash is
-      // named as one, not as a refusal.
+      // named as one, not as a refusal. The daemon records a fallback only
+      // once the full backup actually started, so "started" is a fact.
       alarm = true;
       const crashed = /^internal error/.test(fb.reason || "");
       const why = backupFoldError(crashed ? fb.reason.replace(/^internal error:?\s*/, "") : fb.reason);
       body.append(el("p", { class: "form-msg err", text:
         "At " + utcLabel(fb.at) + " the update from the recorded changes " + (crashed ? "hit an internal error" : "was refused") +
-        " (" + why + ") so a full backup was taken instead. If this repeats, the recorded changes cannot be used for this server; check the reason." }));
+        " (" + why + ") so a full backup was started instead. If this repeats, the recorded changes cannot be used for this server; check the reason." }));
     }
-    if (skip && (!run || skip.at > (run.finished_at || ""))) {
+    // >= not >: the stamps are whole seconds, and a skip recorded in the
+    // same second a run finished (the fallback's collision case) is the
+    // newer fact, not an older one.
+    if (skip && (!run || skip.at >= (run.finished_at || ""))) {
       alarm = true;
       body.append(el("p", { class: "form-msg err", text:
-        "Did not run at " + utcLabel(skip.at) + ": " + skip.reason + (/[.!?]$/.test(skip.reason) ? "" : ".") +
+        "Did not run at " + utcLabel(skip.at) + ": " + plainWords(skip.reason) + (/[.!?]$/.test(skip.reason) ? "" : ".") +
         " It will try again at the next scheduled time." }));
     }
     if (!run && !skip && !sch.running && !sch.history_unavailable) {
@@ -4705,8 +4716,9 @@ function backupScheduleCard(cur, b) {
 async function saveBackupSchedule(id, sched, btn, msgEl) {
   msgEl.hidden = true;
   btn.disabled = true;
+  let saved;
   try {
-    await api("/api/servers/" + encodeURIComponent(id) + "/backup-schedule", { method: "PUT", body: sched });
+    saved = await api("/api/servers/" + encodeURIComponent(id) + "/backup-schedule", { method: "PUT", body: sched });
   } catch (err) {
     msgEl.textContent = (err && err.message) || String(err);
     msgEl.hidden = false;
@@ -4714,7 +4726,11 @@ async function saveBackupSchedule(id, sched, btn, msgEl) {
     return;
   }
   btn.disabled = false;
-  toast("Backup schedule saved. It runs at the next scheduled time.");
+  // The response already knows whether the next slot can start; a toast
+  // promising a run above a red line saying it cannot would be a lie.
+  const next = saved && saved.schedule;
+  toast(next && next.next_method_error ? "Backup schedule saved, but the next run cannot start yet. See the reason on the page."
+    : "Backup schedule saved. It runs at the next scheduled time.");
   if (location.pathname === "/baselines") renderBaselines();
 }
 

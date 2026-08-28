@@ -471,8 +471,9 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 		cfg.BaselineRefresh = baselineSup
 	}
 	wireBaselineExtras(&cfg, baselineSup, serversPath)
-	// The per-server backup schedule (#1442) needs only the supervisor: a
-	// full-backup schedule additionally checks the creation opt-in per slot.
+	// The per-server backup schedule (#1442) needs only the supervisor: the
+	// chooser checks the creation opt-in per slot whenever a full backup is
+	// the producer it picks.
 	// The helper returns a true nil interface for a nil supervisor; assigning
 	// a nil *backupScheduler here directly would advertise a loop that does
 	// not exist.
@@ -685,8 +686,9 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 		cfg.BaselineRefresh = baselineSup
 	}
 	wireBaselineExtras(&cfg, baselineSup, serversPath)
-	// The per-server backup schedule (#1442) needs only the supervisor: a
-	// full-backup schedule additionally checks the creation opt-in per slot.
+	// The per-server backup schedule (#1442) needs only the supervisor: the
+	// chooser checks the creation opt-in per slot whenever a full backup is
+	// the producer it picks.
 	// The helper returns a true nil interface for a nil supervisor; assigning
 	// a nil *backupScheduler here directly would advertise a loop that does
 	// not exist.

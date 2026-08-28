@@ -16,6 +16,18 @@ import (
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
+// The watcher polls every fallbackPoll; real seconds would make every test
+// that fires wait for them, and a test that returned BEFORE the first poll
+// proved nothing about the watcher at all (the original bug: every success
+// path returned in milliseconds and the "do not fall back after a success"
+// rule was unreachable).
+func init() { fallbackPoll = 10 * time.Millisecond }
+
+// settleWatcher gives the watcher several polls after a terminal state, so
+// an assertion that it did NOT start anything is about something it had the
+// chance to do.
+func settleWatcher() { time.Sleep(20 * fallbackPoll) }
+
 // newScheduleFixture builds a scheduler over a real supervisor and a real
 // history file. The context is cancelled BEFORE the temp dirs are removed
 // (Cleanup runs LIFO), but a fired job takes no context on its history
@@ -72,6 +84,10 @@ func waitTerminal(t *testing.T, b *backupScheduler, id string) console.BackupSch
 	for {
 		st := b.ScheduleState(id)
 		if st.Last != nil && !st.Running {
+			// The watcher's last poll, and any fallback it started: the
+			// snapshot is returned, not a re-read, because after a fallback
+			// the re-read would describe the full backup instead.
+			b.watchers.Wait()
 			return st
 		}
 		if time.Now().After(deadline) {
@@ -89,6 +105,7 @@ func waitTerminalMethod(t *testing.T, b *backupScheduler, id, method string) con
 	for {
 		st := b.ScheduleState(id)
 		if st.LastMethod == method && st.Last != nil && !st.Running {
+			b.watchers.Wait()
 			return st
 		}
 		if time.Now().After(deadline) {
@@ -361,8 +378,13 @@ func TestBackupScheduler_refusedRebuildFallsBackToAFullBackup(t *testing.T) {
 	e2 := addScheduled(t, reg2, true)
 	fireAt(b2, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
 	waitTerminal(t, b2, e2.ID)
+	// The in-memory skip lands BEFORE the history write; waiting on the
+	// history too keeps the test from returning mid-write into its TempDir.
 	deadline := time.Now().Add(5 * time.Second)
-	for b2.ScheduleState(e2.ID).LastSkippedAt == "" && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) {
+		if _, skip := sup2.history.LastScheduled(e2.ID); skip != nil && b2.ScheduleState(e2.ID).LastSkippedAt != "" {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	st2 := b2.ScheduleState(e2.ID)
@@ -409,12 +431,182 @@ func TestBackupScheduler_noFallbackDuringShutdown(t *testing.T) {
 	cancel() // the daemon is going down while the rebuild is in flight
 	close(release)
 	waitTerminal(t, b, e.ID)
-	time.Sleep(2500 * time.Millisecond) // two fallback ticks
+	settleWatcher()
 	if st := sup.Status(e.ID); st.State != "idle" {
 		t.Fatalf("a full backup was started during shutdown: %+v", st)
 	}
 	if st := b.ScheduleState(e.ID); st.LastFallbackAt != "" {
 		t.Fatalf("a shutdown-caused failure was recorded as a fallback: %+v", st)
+	}
+}
+
+// A rebuild that SUCCEEDS starts nothing else: the watcher sees the success
+// and leaves. The mutant that ignored the outcome (falling back after every
+// rebuild) survived every earlier test, because they all returned before
+// the watcher's first poll; this one waits for it.
+func TestBackupScheduler_successfulRebuildDoesNotFallBack(t *testing.T) {
+	holdFold(t, func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		return nil, nil, nil
+	})
+	b, reg, sup := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, true)
+	fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+	if st := waitTerminal(t, b, e.ID); st.Last.State != "succeeded" {
+		t.Fatalf("rebuild = %+v, want succeeded", st.Last)
+	}
+	settleWatcher()
+	if st := sup.Status(e.ID); st.State != "idle" {
+		t.Fatalf("a full backup was started after a successful rebuild: %+v", st)
+	}
+	if st := b.ScheduleState(e.ID); st.LastFallbackAt != "" || st.LastSkippedAt != "" {
+		t.Fatalf("a successful rebuild left a fallback or skip behind: %+v", st)
+	}
+}
+
+// A crashed rebuild is a failed one: with the opt-in on, the watcher falls
+// back to a full backup and the fallback names the crash.
+func TestBackupScheduler_crashedRebuildFallsBack(t *testing.T) {
+	holdFold(t, func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		panic("boom")
+	})
+	b, reg, _ := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, true)
+	e.SourceDSN = "not a dsn" // the fallback full backup fails fast
+	if err := reg.Update(e); err != nil {
+		t.Fatal(err)
+	}
+	fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+	st := waitTerminalMethod(t, b, e.ID, console.BackupMethodFull)
+	if !strings.HasPrefix(st.LastFallbackReason, "internal error") {
+		t.Fatalf("fallback = %+v, want the crash as its reason", st)
+	}
+}
+
+// The fallback alarm is about the update path, so the fallback's OWN full
+// backup succeeding does not end it; only a later successful scheduled
+// update does. The firing test cannot pin this (its fallback full backup
+// fails by construction), so the state is set by hand.
+func TestBackupScheduler_fallbackAlarmSurvivesItsOwnFullBackup(t *testing.T) {
+	b, reg, sup := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, true)
+	b.fallback[e.ID] = scheduledFallback{at: "2026-08-28T09:00:07Z", reason: "capture gap"}
+	b.started[e.ID] = scheduledStart{method: console.BackupMethodFull, at: "2026-08-28T09:00:07Z", since: "2026-08-28T09:00:07Z"}
+	sup.jobs[e.ID] = &console.BaselineStatus{State: "succeeded", Since: "2026-08-28T09:00:07Z"}
+	if st := b.ScheduleState(e.ID); st.LastFallbackAt == "" || st.Last == nil || st.Last.State != "succeeded" {
+		t.Fatalf("the fallback's own full backup ended the alarm: %+v", st)
+	}
+	// And a successful scheduled UPDATE does end it.
+	b.started[e.ID] = scheduledStart{method: console.BackupMethodRefresh, at: "2026-08-28T10:00:00Z", since: "2026-08-28T10:00:00Z"}
+	sup.refreshes[e.ID] = &console.BaselineStatus{State: "succeeded", Since: "2026-08-28T10:00:00Z"}
+	if st := b.ScheduleState(e.ID); st.LastFallbackAt != "" {
+		t.Fatalf("a later successful update did not end the alarm: %+v", st)
+	}
+}
+
+// When the fallback full backup cannot start because another job holds the
+// server, the page must not say a full backup was taken: the skip carries
+// both facts and no fallback is recorded.
+func TestBackupScheduler_fallbackCollisionIsASkipNotAFallback(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	holdFold(t, func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		close(started)
+		<-release
+		return nil, nil, errors.New("capture gap in the reconstruction window")
+	})
+	b, reg, sup := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, true)
+	fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+	<-started
+	// A manual backup takes the server while the rebuild is failing.
+	sup.mu.Lock()
+	sup.jobs[e.ID] = &console.BaselineStatus{State: "running", Since: "2099-01-01T00:00:00Z"}
+	sup.mu.Unlock()
+	close(release)
+	waitTerminal(t, b, e.ID)
+	deadline := time.Now().Add(5 * time.Second)
+	for b.ScheduleState(e.ID).LastSkippedAt == "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	st := b.ScheduleState(e.ID)
+	if st.LastFallbackAt != "" {
+		t.Fatalf("a fallback was recorded although no full backup started: %+v", st)
+	}
+	if !strings.Contains(st.LastSkipReason, "was refused (capture gap") || !strings.Contains(st.LastSkipReason, "another backup job was running") {
+		t.Fatalf("skip reason = %q, want both the failed update and the collision", st.LastSkipReason)
+	}
+	sup.mu.Lock()
+	delete(sup.jobs, e.ID)
+	sup.mu.Unlock()
+}
+
+// The rebuild ran for minutes; the schedule was changed meanwhile. The
+// fallback re-reads the entry and starts no full backup for a schedule
+// that no longer exists in that form.
+func TestBackupScheduler_changedScheduleGetsNoFallback(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	holdFold(t, func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		close(started)
+		<-release
+		return nil, nil, errors.New("capture gap in the reconstruction window")
+	})
+	b, reg, sup := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, true)
+	fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+	<-started
+	e, _ = reg.Get(e.ID)
+	e.BackupSchedule = &console.BackupSchedule{Every: "6h", At: "03:00"}
+	if err := reg.Update(e); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitTerminal(t, b, e.ID)
+	settleWatcher()
+	if st := sup.Status(e.ID); st.State != "idle" {
+		t.Fatalf("a full backup was started for a schedule that was changed meanwhile: %+v", st)
+	}
+	if st := b.ScheduleState(e.ID); st.LastFallbackAt != "" || st.LastSkippedAt != "" {
+		t.Fatalf("something was recorded for the changed schedule: %+v", st)
+	}
+}
+
+// Forget (what the DELETE route calls) drops the loop's whole view of the
+// server at once, so a schedule re-added within the minute starts silent.
+func TestBackupScheduler_forgetDropsEverything(t *testing.T) {
+	b, reg, _ := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, true)
+	b.seen[e.ID] = seenSlot{identity: "1h|00:00", slot: time.Date(2026, 8, 28, 9, 0, 0, 0, time.UTC)}
+	b.started[e.ID] = scheduledStart{method: console.BackupMethodFull, at: "x", since: "x"}
+	b.skipped[e.ID] = scheduledSkip{at: "x", reason: "r"}
+	b.fallback[e.ID] = scheduledFallback{at: "x", reason: "r"}
+	b.warned[e.ID] = true
+	b.Forget(e.ID)
+	if st := b.ScheduleState(e.ID); st.LastStartedAt != "" || st.LastSkippedAt != "" || st.LastFallbackAt != "" {
+		t.Fatalf("Forget left state behind: %+v", st)
+	}
+	if b.crossed(e.ID, "1h|00:00", time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)) {
+		t.Fatal("after Forget the next slot fired without a first observation")
+	}
+}
+
+// A panic while firing one server's slot is recorded as that server's skip
+// and does not cost the other servers the tick.
+func TestBackupScheduler_panicWhileFiringIsASkip(t *testing.T) {
+	b, reg, sup := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, true)
+	// A registry entry whose schedule pointer is nil at fire time makes
+	// fire dereference nil: the guard turns that into a skip.
+	p, _ := e.BackupSchedule.Parse()
+	broken := e
+	broken.BackupSchedule = nil
+	b.fireGuarded(broken, p, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+	st := b.ScheduleState(e.ID)
+	if !strings.HasPrefix(st.LastSkipReason, "internal error: ") {
+		t.Fatalf("a panic while firing left no skip: %+v", st)
+	}
+	if _, skip := sup.history.LastScheduled(e.ID); skip == nil || !strings.HasPrefix(skip.SkipReason, "internal error: ") {
+		t.Fatalf("the panic skip did not reach the history: %+v", skip)
 	}
 }
 
@@ -458,12 +650,20 @@ func TestBackupScheduler_panickedJobStaysVisible(t *testing.T) {
 	holdFold(t, func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
 		panic("boom")
 	})
-	b, reg, sup := newScheduleFixture(t, false) // no opt-in: a fallback would be a skip, and there must be none
+	// No opt-in: a crash is a failure like any other and the watcher would
+	// fall back, but a full backup cannot start here, so it records a skip;
+	// the kept failure is what this test is about.
+	b, reg, sup := newScheduleFixture(t, false)
 	e := addScheduled(t, reg, true)
 	fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
 	st := waitTerminal(t, b, e.ID)
 	if st.Last.State != "failed" || !strings.Contains(st.Last.LastError, "boom") {
 		t.Fatalf("panicked job = %+v, want failed with the panic value", st.Last)
+	}
+	// The page tells a crash from a refusal by this prefix (app.js
+	// /^internal error/); the guard's wording is a wire contract.
+	if !strings.HasPrefix(st.Last.LastError, "internal error: ") {
+		t.Fatalf("panic error %q does not carry the internal error prefix the page keys on", st.Last.LastError)
 	}
 	if run, _ := sup.history.LastScheduled(e.ID); run != nil {
 		t.Fatalf("the guard wrote a history record (%+v); this test assumes it does not, so the in-memory copy is the only evidence", run)

@@ -54,7 +54,10 @@ type backupScheduleRunDTO struct {
 	FinishedAt string `json:"finished_at"`
 	OK         bool   `json:"ok"`
 	Error      string `json:"error,omitempty"`
-	// SnapshotTime names the backup the run published, when it did.
+	// SnapshotTime names the backup the run published, when it did. From
+	// the history only: the loop's live view has no anchor for a full
+	// backup (it is chosen mid-run), so a scheduled dump rendered from
+	// that view has none even on success.
 	SnapshotTime string `json:"snapshot_time,omitempty"`
 	Tables       int    `json:"tables,omitempty"`
 	Rows         int64  `json:"rows,omitempty"`
@@ -93,8 +96,9 @@ func (s *Server) scheduleGates() BackupScheduleGates {
 // The last run comes from two sources and the newer one wins: the persisted
 // history (survives restarts) and the loop's in-memory view of the job it
 // last started (survives an unavailable history and a job that panicked,
-// which writes no record). Neither alone meets "a failed scheduled backup
-// must be visible".
+// which writes no record; the loop watches every job it starts, so that
+// copy exists whether or not a page load caught the job in time). Neither
+// alone meets "a failed scheduled backup must be visible".
 func (s *Server) backupScheduleDTO(ctx context.Context, e ServerEntry, now time.Time) *backupScheduleDTO {
 	sched := *e.BackupSchedule
 	dto := &backupScheduleDTO{Every: sched.Every, At: sched.At}
@@ -144,8 +148,8 @@ func (s *Server) backupScheduleDTO(ctx context.Context, e ServerEntry, now time.
 		if st.Last != nil && !st.Running && (dto.LastRun == nil || dto.LastRun.StartedAt < st.LastStartedAt) {
 			dto.LastRun = scheduleRunFromStatus(st)
 		}
-		// Same rule for the skip: the loop's stamp is the tick's instant,
-		// the history's FinishedAt for the same skip is that same stamp.
+		// Same rule for the skip: the history's FinishedAt for a skip is the
+		// loop's own stamp for it (the tick's instant, or the fallback's).
 		if st.LastSkippedAt != "" && (dto.LastSkipped == nil || dto.LastSkipped.At < st.LastSkippedAt) {
 			dto.LastSkipped = &backupScheduleSkipDTO{At: st.LastSkippedAt, Reason: st.LastSkipReason}
 		}
@@ -260,6 +264,9 @@ func (s *Server) handleBackupScheduleDelete(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
+	// After the registry write, so a failed write leaves the loop's view
+	// consistent with a schedule that still exists.
+	s.backupSchedules.Forget(e.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"schedule": nil})
 }
 
