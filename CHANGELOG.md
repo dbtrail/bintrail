@@ -8,6 +8,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A slow index no longer ends capture** (#1482). `bintrail-console watch`
+  supervised the sources added from its console, restarting them with backoff,
+  but ran its own `--source-dsn` source as a single call: a batch INSERT that
+  ran past `--write-timeout` returned an error the daemon exited on, and
+  nothing restarted it. Read pressure on the index was enough to trigger it,
+  and capture then stayed down until an operator noticed, with the exposure
+  bounded only by how long the source keeps its binlogs. That exit also ran the
+  supervisor's shutdown, so the main source's failure stopped every supervised
+  source alongside it, and those recorded `stopped` rather than `failed`,
+  leaving nothing to show they had died of another source's error. The write
+  deadline is now its own failure class and the main source restarts on it,
+  under the policy the supervised sources already used: 15s doubling to a 5m
+  cap, reset by a run that streamed for more than 10 minutes, and a permanent
+  stop after 6h of continuous crash-looping that returns the original error
+  with its original advice. Every other error still ends the run on the first
+  failure, unchanged. This restarts the stream and deliberately does NOT retry
+  the INSERT in place, a distinction that must survive any later
+  simplification: the deadline is enforced by the client, which cancels by
+  closing the socket without a `KILL QUERY`, so a batch that was merely slow
+  usually goes on to commit on the server after the client stopped waiting, and
+  re-running that statement would write every row a second time, permanently,
+  into a table with no natural key to deduplicate on. A restart instead replays
+  from the last checkpoint through the dedup-on-resume step, which exists to
+  drop exactly those rows. Know three limits. The breaker bounds a fast crash
+  loop, not a slow flap: a source that fails only after runs longer than the
+  healthy-reset window restarts indefinitely, which is long-standing behaviour
+  and is what you want, since capture is up for all but the backoff of such a
+  cycle. The new failure class covers the batch INSERT only, so a deadline on
+  the checkpoint or the gap record still ends the daemon as before. And the
+  daemon no longer exiting means its Prometheus target no longer disappears, so
+  an `up == 0` alert will not fire and the stream gauges freeze at their last
+  healthy value rather than rising: alert on staleness of
+  `bintrail_stream_last_flush_timestamp_seconds` instead of on a lag gauge, and
+  note that `watch` exposes no metrics at all unless `--metrics-addr` is set.
+- **A connection attempt can no longer block forever** (#1482). `Connect` and
+  `ConnectWithTLS` verified a new connection with an unbounded ping, and the
+  `timeout=` DSN parameter is the dial timeout only, with no read or write
+  timeout set anywhere. A server that accepted the TCP connection and then
+  never completed the MySQL handshake, which is what a frozen VM or an
+  idle-dropped load balancer looks like, left the caller blocked with no way
+  out. Both paths now spend the DSN's own connect budget on the handshake as
+  well, so such a peer surfaces as a ping error. The bound covers the connect
+  phase only and never becomes a read deadline on an established connection, so
+  long-running statements are unaffected; raise `timeout=` in the DSN if a
+  server legitimately needs longer to complete a handshake.
+- **A supervised source no longer gives up after one failure that follows a
+  long healthy run** (#1482). The crash-loop circuit breaker measured the
+  failed run's own uptime instead of how long the source had been failing, so a
+  source that had streamed for longer than the 6h give-up threshold, which is
+  the normal state of a healthy daemon, was marked permanently `failed` on its
+  first failure without a single retry, reporting a crash loop that had never
+  happened. It now measures from the first failure. The retry delay also
+  overflowed after 30 consecutive failures and became no delay at all, hammering
+  a failing source roughly 2h13m into what should have been a 6h budget; it now
+  stops growing once it reaches the 5m cap.
 - **The console daemon's background folds are bounded, and their volume warning
   works** (#1477). `bintrail-console watch` rebuilds snapshots in the same
   process that captures binlogs, for the scheduled baseline refresh, the
