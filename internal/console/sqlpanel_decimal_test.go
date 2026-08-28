@@ -41,6 +41,26 @@ func TestSQLPanelDecimalNote(t *testing.T) {
 			t.Errorf("note %q is missing %q", got, want)
 		}
 	}
+
+	// The note names two causes that are nobody's fault (a PostgreSQL source, a
+	// pre-feature baseline) and one that is (a footer that would not open). Only
+	// the SchemaKnown bit is available here, so it cannot tell which applies, and
+	// a whole-batch failure such as an S3 403 clears that bit for every table at
+	// once. Naming only the harmless two would tell an operator with real broken
+	// credentials that nothing is wrong, so the note must keep pointing at the
+	// log. This is the same rule decimalComments follows in the other direction.
+	if !strings.Contains(got, "log") {
+		t.Errorf("note %q never mentions the log, so a whole-batch failure (an S3 403, no "+
+			"httpfs) reads as the benign PostgreSQL case and the operator is told nothing "+
+			"is wrong", got)
+	}
+
+	// Reads on a single-file layout too: "1 of 1 baseline files carry" is the
+	// shape this catches, and it is the one a small deployment always sees.
+	one := sqlPanelDecimalNote(views.Input{Baselines: []views.BaselineTable{untyped}})
+	if !strings.Contains(one, "1 of 1 baseline file carries") {
+		t.Errorf("single-file note reads wrong: %q", one)
+	}
 }
 
 // TestSQLPanel_warnsWhenCastsAreMissing is the WIRING half. The note above is a

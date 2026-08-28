@@ -97,13 +97,17 @@ func (s *Server) rememberBaselineDecimals(key string, decimals map[string][]base
 // do read as text and sum() over one really does fail. Suppressing the note
 // there would remove the only available explanation from the one deployment
 // where the limitation is permanent. So it stays, worded as a property of the
-// files with the action attached, and it names the two benign causes so nobody
-// goes hunting a corrupt baseline.
+// files with the action attached.
 //
-// This is the one thing the generated file says that the panel cannot: the file
-// splits its note three ways because it can afford the room, while the panel has
-// only the SchemaKnown bit, which cannot tell an old baseline from a PG one from
-// a footer that would not open.
+// It names all THREE causes and attributes none of them, which is the same rule
+// decimalComments follows in the generated file and for the same reason, run in
+// the other direction. That function refuses to blame an unreadable footer
+// because two of the three shapes that reach it are fine; this one must not
+// claim the two benign shapes either, because only the SchemaKnown bit is
+// available here and a whole-batch failure (an S3 403, no httpfs) clears it for
+// every table at once. Naming only the harmless causes would tell an operator
+// with a real credentials fault that nothing is wrong, so the sentence ends by
+// pointing at the log, which is where that one and only that one shows up.
 func sqlPanelDecimalNote(in views.Input) string {
 	var untyped int
 	for _, t := range in.Baselines {
@@ -114,8 +118,16 @@ func sqlPanelDecimalNote(in views.Input) string {
 	if untyped == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%d of %d baseline tables store no column types in their files, so their "+
-		"state views leave DECIMAL columns as text and an aggregate over one needs an explicit "+
-		"CAST. A PostgreSQL source never stores them, and neither did baselines taken before "+
-		"bintrail began recording them", untyped, len(in.Baselines))
+	noun, verb := "files", "carry"
+	if len(in.Baselines) == 1 {
+		noun = "file"
+	}
+	if untyped == 1 {
+		verb = "carries"
+	}
+	return fmt.Sprintf("%d of %d baseline %s %s no column types, so DECIMAL columns there read as "+
+		"text and an aggregate over one needs an explicit CAST. A PostgreSQL source never stores "+
+		"column types, and neither did baselines taken before bintrail began recording them; if a "+
+		"footer could not be read instead, the console log has the error",
+		untyped, len(in.Baselines), noun, verb)
 }
