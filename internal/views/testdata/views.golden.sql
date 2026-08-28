@@ -83,12 +83,26 @@ CREATE OR REPLACE VIEW "events" AS
 -- the snapshot live in `events` above. To materialize a later point in time,
 -- use `bintrail reconstruct` — folding the deltas back onto a baseline is what
 -- that command does, and it is not expressible as a view.
+--
+-- DECIMAL and NUMERIC columns are stored as text, so that a value MySQL can
+-- hold is never rounded to fit a narrower type. The views below cast them
+-- back to DECIMAL with the precision and scale the column was declared with,
+-- so sum() and the rest work on them directly.
+-- Columns wider than 38 digits have no DuckDB DECIMAL to be cast to, so they
+-- stay text. They are named below. Cast them yourself when you need
+-- arithmetic; DOUBLE works if an approximate result is acceptable.
+-- Some tables' column types could not be read from their Parquet footer, so
+-- their views cast nothing. Those tables are named below. If one of their
+-- columns reads as text where you expected a number, cast it yourself.
+-- state_legacy_db_audit_log: column types could not be read from the Parquet footer, so nothing is cast
 CREATE OR REPLACE VIEW "state_legacy_db_audit_log" AS
   SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/Legacy-DB/Audit Log.parquet');
 CREATE OR REPLACE VIEW "state_shop_order_items" AS
   SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/order_items.parquet');
 CREATE OR REPLACE VIEW "state_shop_orders" AS
-  SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/orders.parquet');
+  SELECT * REPLACE (CAST("total" AS DECIMAL(10,2)) AS "total", CAST("tax_rate" AS DECIMAL(6,4)) AS "tax_rate")
+  FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/orders.parquet');
+-- state_shop_order_items_2: weight is DECIMAL(65,30), wider than DuckDB's 38 digits, so it is left as text
 CREATE OR REPLACE VIEW "state_shop_order_items_2" AS
   SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop_order/items.parquet');
 

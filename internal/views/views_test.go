@@ -27,11 +27,25 @@ func goldenInput() Input {
 		BaselineSource:   "s3://my-bucket/baselines/",
 		BaselineSnapshot: time.Date(2026, 4, 30, 3, 0, 0, 0, time.UTC),
 		Baselines: []BaselineTable{
-			{Schema: "shop", Table: "orders", Path: "s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/orders.parquet"},
-			{Schema: "shop", Table: "order_items", Path: "s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/order_items.parquet"},
-			// Sanitizes to the same view name as shop.order_items above.
-			{Schema: "shop_order", Table: "items", Path: "s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop_order/items.parquet"},
-			// A hyphen and mixed case, neither legal bare in an identifier.
+			// Money columns of the ordinary shape: both get cast.
+			{Schema: "shop", Table: "orders", Path: "s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/orders.parquet",
+				SchemaKnown: true,
+				Decimals: []DecimalColumn{
+					{Name: "total", Precision: 10, Scale: 2},
+					{Name: "tax_rate", Precision: 6, Scale: 4},
+				}},
+			// No decimal columns at all: nothing to cast, and nothing to say.
+			{Schema: "shop", Table: "order_items", Path: "s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/order_items.parquet",
+				SchemaKnown: true},
+			// Sanitizes to the same view name as shop.order_items above. Its
+			// DECIMAL(65,30) is past DuckDB's ceiling, so it stays text and the
+			// file has to say which column and why.
+			{Schema: "shop_order", Table: "items", Path: "s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop_order/items.parquet",
+				SchemaKnown: true,
+				Decimals:    []DecimalColumn{{Name: "weight", Precision: 65, Scale: 30}}},
+			// A hyphen and mixed case, neither legal bare in an identifier. Its
+			// footer could not be read, which is a different fact from "no
+			// decimal columns" and is stated as one.
 			{Schema: "Legacy-DB", Table: "Audit Log", Path: "s3://my-bucket/baselines/2026-04-30T03-00-00Z/Legacy-DB/Audit Log.parquet"},
 		},
 	}

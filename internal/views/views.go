@@ -30,6 +30,18 @@ type BaselineTable struct {
 	Schema string
 	Table  string
 	Path   string // local path or s3:// URL of the table's .parquet file
+
+	// Decimals are the table's DECIMAL and NUMERIC columns, which the baseline
+	// writer stores as text (internal/baseline.MysqlToParquetNode says why).
+	// The state view casts each one back to a number so arithmetic works
+	// without the reader having to discover the storage choice through a
+	// failed sum().
+	Decimals []DecimalColumn
+	// SchemaKnown records whether the table's embedded CREATE TABLE was read at
+	// all. It separates "this table has no decimal columns" from "we could not
+	// find out", which are the same empty Decimals slice and very different
+	// facts to state in a file someone reads to understand their own layout.
+	SchemaKnown bool
 }
 
 // Input is everything Generate needs. The command layer resolves it; nothing in
@@ -382,6 +394,7 @@ func writeStateViews(b *strings.Builder, in Input) {
 		b.WriteString("-- (skipped: no baseline snapshot was discovered)\n")
 		return
 	}
+	writeDecimalNote(b, in)
 
 	tables := append([]BaselineTable(nil), in.Baselines...)
 	sort.Slice(tables, func(i, j int) bool {
@@ -394,7 +407,15 @@ func writeStateViews(b *strings.Builder, in Input) {
 	used := map[string]bool{}
 	for _, t := range tables {
 		name := stateViewName(t.Schema, t.Table, used)
+		for _, line := range decimalComments(t) {
+			fmt.Fprintf(b, "-- %s: %s\n", name, line)
+		}
 		fmt.Fprintf(b, "CREATE OR REPLACE VIEW %s AS\n", quoteIdent(name))
+		if replace := decimalReplaceClause(t); replace != "" {
+			fmt.Fprintf(b, "  SELECT * REPLACE (%s)\n", replace)
+			fmt.Fprintf(b, "  FROM read_parquet(%s);\n", sqlString(t.Path))
+			continue
+		}
 		fmt.Fprintf(b, "  SELECT * FROM read_parquet(%s);\n", sqlString(t.Path))
 	}
 	b.WriteString("\n")

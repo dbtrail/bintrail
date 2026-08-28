@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 	"github.com/dbtrail/dbtrail/internal/storage"
@@ -57,6 +58,18 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 				in.Baselines = append(in.Baselines, views.BaselineTable{
 					Schema: f.Schema, Table: f.Table, Path: f.Path,
 				})
+			}
+			// Column types for the state views' decimal casts. Best-effort:
+			// this improves the file, it is not what the file is for, and the
+			// generated text names the tables it could not read. Serves the
+			// download and the SQL panel alike, both of which reach the same
+			// Parquet through the same views.
+			decimals, decErr := baseline.DecimalColumnsFor(ctx, in.BaselinePaths())
+			if decErr != nil {
+				slog.Warn("console: could not read baseline column types from the Parquet footers; "+
+					"the state views will not cast decimal columns", "error", decErr)
+			} else {
+				in.ApplyDecimals(decimals)
 			}
 		}
 	}

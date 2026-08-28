@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`sum()` works on a money column in the generated DuckDB views** (#1486).
+  MySQL `DECIMAL` and `NUMERIC` columns are stored as text in the baseline
+  Parquet, so the `state_<schema>_<table>` views handed DuckDB a `VARCHAR` and
+  the first aggregate anyone wrote against a money column died with
+  `No function matches the given name and argument types 'sum(VARCHAR)'`,
+  which reads like the data is wrong rather than like a storage choice. The
+  views now cast those columns back to `DECIMAL(p,s)`, using the precision and
+  scale read from the `CREATE TABLE` in each file's Parquet footer. This works
+  on baselines you already have: nothing about how a value is stored changed,
+  and nothing needs re-taking. Text remains the storage form on purpose, and
+  the reason is worth knowing before reaching for a wider type: MySQL allows
+  `DECIMAL(65,30)`, Parquet and DuckDB both stop at 38 digits, and the stored
+  text is also what the recovery paths join and compare on, byte for byte,
+  against the value read out of the binlog. Two cases still read as text, and
+  the generated file now names each column and says why: a column wider than
+  38 digits has no DuckDB `DECIMAL` to be cast to, and a baseline taken before
+  bintrail embedded the `CREATE TABLE` in the footer carries no column types
+  to read. `docs/parquet-debugging.md` covers casting by hand for anyone
+  pointing DuckDB at the files without the views.
 - **The console daemon's background folds are bounded, and their volume warning
   works** (#1477). `bintrail-console watch` rebuilds snapshots in the same
   process that captures binlogs, for the scheduled baseline refresh, the
