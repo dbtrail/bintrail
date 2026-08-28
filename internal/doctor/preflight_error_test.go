@@ -49,3 +49,43 @@ func TestPreflightErrorIsTypedAndClassed(t *testing.T) {
 		t.Error("a report with no failures must return a nil error, not a typed nil")
 	}
 }
+
+// TestPreflightErrorClassFollowsTheFailingChecks: the class is derived from
+// which checks failed — a refusal for connectivity or grants must not read as
+// a misconfigured server (#1503 review).
+func TestPreflightErrorClassFollowsTheFailingChecks(t *testing.T) {
+	cases := []struct {
+		name   string
+		checks []string
+		want   string
+	}{
+		{"source unreachable", []string{SourceConnectionCheckName}, telemetry.ClassDBConnection},
+		{"index unreachable", []string{IndexConnectionCheckName}, telemetry.ClassDBConnection},
+		{"pg source unreachable", []string{PGSourceConnectionCheckName}, telemetry.ClassDBConnection},
+		{"missing replication grants", []string{ReplicationGrantsCheckName}, telemetry.ClassDBPermission},
+		{"no index write access", []string{IndexWriteAccessCheckName}, telemetry.ClassDBPermission},
+		{"server variable", []string{"binlog_format=ROW"}, telemetry.ClassConfigInvalid},
+		{"retention", []string{"Binlog retention >= 2 days"}, telemetry.ClassConfigInvalid},
+		{"extension check", []string{"Audit log plugin"}, telemetry.ClassConfigInvalid},
+		{"grants beat variables", []string{"log_bin enabled", ReplicationGrantsCheckName, "binlog_format=ROW"}, telemetry.ClassDBPermission},
+		{"connection beats grants", []string{ReplicationGrantsCheckName, IndexConnectionCheckName, IndexWriteAccessCheckName}, telemetry.ClassDBConnection},
+		{"connection beats everything, any position", []string{"binlog_format=ROW", SourceConnectionCheckName}, telemetry.ClassDBConnection},
+		{"no names", nil, telemetry.ClassConfigInvalid},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := &PreflightError{Failed: len(c.checks), Checks: c.checks}
+			if got := telemetry.ClassifyError(err); got != c.want {
+				t.Errorf("ClassifyError = %q, want %q", got, c.want)
+			}
+		})
+	}
+
+	// Through the real report path, not a hand-built value: the connection
+	// check's name as the producer spells it.
+	r := &Report{}
+	r.add(CheckResult{Name: SourceConnectionCheckName, Status: StatusFail, Detail: "dial tcp: connection refused"})
+	if got := telemetry.ClassifyError(r.Err()); got != telemetry.ClassDBConnection {
+		t.Errorf("report with a failed source connection classifies %q, want %q", got, telemetry.ClassDBConnection)
+	}
+}

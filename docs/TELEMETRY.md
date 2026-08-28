@@ -92,13 +92,15 @@ config_invalid  storage_io      not_found          internal
 unknown
 ```
 
-Every class has at least one code path that produces it. `config_invalid`
-covers a refused preflight (`doctor`, or `up` refusing to boot because the
-source is not configured for ROW capture) and a server identity conflict,
-`binlog_not_found` covers both the server's own "binlog purged" error (1236)
-and the `--no-gap-fill` refusal, and `schema_mismatch` is the stale-snapshot
-guard. `unknown` is what a failure with no bucket reports — an honest "no
-bucket" rather than a guess.
+Every class has at least one code path that produces it. A refused
+preflight (`doctor`, or `up` refusing to boot) reports the class of what
+failed: `db_connection` when the source or the index could not be reached,
+`db_permission` for missing grants or index write access, `config_invalid`
+for a server setting (ROW format, row image, `log_bin`, retention). A server
+identity conflict is `config_invalid`, `binlog_not_found` covers both the
+server's own "binlog purged" error (1236) and the `--no-gap-fill` refusal,
+and `schema_mismatch` is the stale-snapshot guard. `unknown` is what a
+failure with no bucket reports — an honest "no bucket" rather than a guess.
 
 ### Why the values are coarse
 

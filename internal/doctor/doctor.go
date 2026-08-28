@@ -123,7 +123,7 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	sourceDB, err := config.Connect(sourceDSN)
 	if err != nil {
 		report.add(CheckResult{
-			Name:   "Source MySQL connection",
+			Name:   SourceConnectionCheckName,
 			Status: StatusFail,
 			Detail: err.Error(),
 			Remediation: "Verify --source-dsn is reachable: try `mysql -h<host> -P<port> -u<user> -p<pass>`.\n" +
@@ -185,7 +185,7 @@ func checkSourceConnection(ctx context.Context, db *sql.DB) CheckResult {
 	var version string
 	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
 		return CheckResult{
-			Name:   "Source MySQL connection",
+			Name:   SourceConnectionCheckName,
 			Status: StatusFail,
 			Detail: err.Error(),
 			Remediation: "The connection opened but SELECT VERSION() failed. Common causes:\n" +
@@ -195,7 +195,7 @@ func checkSourceConnection(ctx context.Context, db *sql.DB) CheckResult {
 		}
 	}
 	return CheckResult{
-		Name:   "Source MySQL connection",
+		Name:   SourceConnectionCheckName,
 		Status: StatusPass,
 		Detail: "MySQL " + version,
 	}
@@ -680,7 +680,7 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) CheckResult {
 	rows, err := db.QueryContext(ctx, "SHOW GRANTS")
 	if err != nil {
 		return CheckResult{
-			Name:        "REPLICATION SLAVE + CLIENT grants",
+			Name:        ReplicationGrantsCheckName,
 			Status:      StatusFail,
 			Detail:      err.Error(),
 			Remediation: queryErrorRemediation("SHOW GRANTS"),
@@ -693,7 +693,7 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) CheckResult {
 		var g string
 		if err := rows.Scan(&g); err != nil {
 			return CheckResult{
-				Name:        "REPLICATION SLAVE + CLIENT grants",
+				Name:        ReplicationGrantsCheckName,
 				Status:      StatusFail,
 				Detail:      err.Error(),
 				Remediation: queryErrorRemediation("SHOW GRANTS"),
@@ -705,7 +705,7 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) CheckResult {
 	slave, client := metadata.HasReplPrivileges(grants)
 	if slave && client {
 		return CheckResult{
-			Name:   "REPLICATION SLAVE + CLIENT grants",
+			Name:   ReplicationGrantsCheckName,
 			Status: StatusPass,
 			Detail: "REPLICATION SLAVE, REPLICATION CLIENT",
 		}
@@ -728,7 +728,7 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) CheckResult {
 	}
 
 	return CheckResult{
-		Name:   "REPLICATION SLAVE + CLIENT grants",
+		Name:   ReplicationGrantsCheckName,
 		Status: StatusFail,
 		Detail: "missing: " + strings.Join(missing, ", "),
 		Remediation: fmt.Sprintf("Run on the source MySQL as a privileged user (e.g. root):\n\n"+
@@ -911,7 +911,7 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) CheckResult {
 				vErr := serverDB.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version)
 				if vErr == nil {
 					return CheckResult{
-						Name:   "Index MySQL connection",
+						Name:   IndexConnectionCheckName,
 						Status: StatusPass,
 						Detail: fmt.Sprintf("MySQL %s, database=%s (does not exist yet — `bintrail init` will create it)", version, dbName),
 					}
@@ -927,7 +927,7 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) CheckResult {
 			err = fmt.Errorf("%w (server-level probe also failed: %v)", err, serverErr)
 		}
 		return CheckResult{
-			Name:   "Index MySQL connection",
+			Name:   IndexConnectionCheckName,
 			Status: StatusFail,
 			Detail: err.Error(),
 			Remediation: "Verify --index-dsn is reachable. The database does not need to exist yet — " +
@@ -938,14 +938,14 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) CheckResult {
 	var version string
 	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
 		return CheckResult{
-			Name:        "Index MySQL connection",
+			Name:        IndexConnectionCheckName,
 			Status:      StatusFail,
 			Detail:      err.Error(),
 			Remediation: queryErrorRemediation("VERSION()"),
 		}
 	}
 	return CheckResult{
-		Name:   "Index MySQL connection",
+		Name:   IndexConnectionCheckName,
 		Status: StatusPass,
 		Detail: fmt.Sprintf("MySQL %s, database=%s", version, dbName),
 	}
@@ -971,7 +971,7 @@ func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) CheckResult 
 			err = fmt.Errorf("%w (server-level probe also failed: %v)", err, serverErr)
 		}
 		return CheckResult{
-			Name:   "Index write access",
+			Name:   IndexWriteAccessCheckName,
 			Status: StatusFail,
 			Detail: err.Error(),
 			Remediation: "Could not connect to --index-dsn. Verify the host/port/user are correct " +
@@ -997,7 +997,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 		_, createErr := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName))
 		if createErr != nil {
 			return CheckResult{
-				Name:   "Index write access",
+				Name:   IndexWriteAccessCheckName,
 				Status: StatusFail,
 				Detail: fmt.Sprintf("database %q does not exist and user cannot CREATE DATABASE: %v", dbName, createErr),
 				Remediation: fmt.Sprintf("Either create the database manually as a privileged user:\n\n"+
@@ -1020,7 +1020,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 		}()
 	} else if dbErr != nil {
 		return CheckResult{
-			Name:        "Index write access",
+			Name:        IndexWriteAccessCheckName,
 			Status:      StatusFail,
 			Detail:      dbErr.Error(),
 			Remediation: queryErrorRemediation("information_schema.SCHEMATA"),
@@ -1031,7 +1031,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 	probeTable := fmt.Sprintf("`%s`.`_bintrail_doctor_probe`", dbName)
 	if _, err := db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS "+probeTable+" (id INT)"); err != nil {
 		return CheckResult{
-			Name:   "Index write access",
+			Name:   IndexWriteAccessCheckName,
 			Status: StatusFail,
 			Detail: "cannot CREATE TABLE: " + err.Error(),
 			Remediation: fmt.Sprintf("Grant table-creation privileges on the index database:\n\n"+
@@ -1045,7 +1045,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 		// passes here and then fails at runtime during `rotate` — worse than
 		// failing now.
 		return CheckResult{
-			Name:   "Index write access",
+			Name:   IndexWriteAccessCheckName,
 			Status: StatusFail,
 			Detail: "user has CREATE but not DROP TABLE: " + err.Error(),
 			Remediation: fmt.Sprintf("Grant DROP — bintrail rotates partitions and needs it at runtime:\n\n"+
@@ -1063,7 +1063,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 		detail = fmt.Sprintf("database %q does not exist yet — CREATE DATABASE privilege verified; CREATE/DROP TABLE OK", dbName)
 	}
 	return CheckResult{
-		Name:   "Index write access",
+		Name:   IndexWriteAccessCheckName,
 		Status: StatusPass,
 		Detail: detail,
 	}
@@ -1186,6 +1186,18 @@ func (r *Report) Err() error {
 	return nil
 }
 
+// Names of the checks whose failure means something other than "a setting on
+// the server is wrong". PreflightError.TelemetryClass keys on them, so they
+// are constants shared with the producers (pgstreamrun's doctor included)
+// rather than literals that could drift apart.
+const (
+	SourceConnectionCheckName   = "Source MySQL connection"
+	IndexConnectionCheckName    = "Index MySQL connection"
+	PGSourceConnectionCheckName = "Source PostgreSQL connection"
+	ReplicationGrantsCheckName  = "REPLICATION SLAVE + CLIENT grants"
+	IndexWriteAccessCheckName   = "Index write access"
+)
+
 // PreflightError is the typed form of "N preflight check(s) failed", so a
 // consumer can recognise a preflight refusal with errors.As instead of by its
 // text. It carries the failing checks' NAMES only (the fixed check names such
@@ -1204,11 +1216,31 @@ func (e *PreflightError) Error() string {
 	return fmt.Sprintf("%d preflight check(s) failed", e.Failed)
 }
 
-// TelemetryClass implements telemetry.Classed. A preflight refusal means the
-// source or the index is not set up the way capture needs it (ROW format,
-// FULL row image, log_bin, grants), which is what the operator has to change
-// — config_invalid, not a crash.
-func (e *PreflightError) TelemetryClass() string { return "config_invalid" }
+// TelemetryClass implements telemetry.Classed, deriving the class from WHICH
+// checks failed rather than reporting every refusal as one bucket: a
+// preflight that could not reach the source or the index is db_connection,
+// one refused for grants or index write access is db_permission, and
+// anything else — binlog_format, row image, log_bin, retention, FK cascades,
+// an extension's check — is config_invalid, a server setting the operator
+// has to change. Precedence when several fail together: connection, then
+// permission, then configuration — a connection failure is the root of
+// whatever failed after it (the index checks run in that order, so a
+// connect failure fails both the connection and the write-access check).
+// One imprecision is deliberate: the connection checks record a wrong
+// password as a connection failure (the cause is stringified into Detail),
+// so db_connection here reads as "could not connect as configured".
+func (e *PreflightError) TelemetryClass() string {
+	class := "config_invalid"
+	for _, name := range e.Checks {
+		switch name {
+		case SourceConnectionCheckName, IndexConnectionCheckName, PGSourceConnectionCheckName:
+			return "db_connection"
+		case ReplicationGrantsCheckName, IndexWriteAccessCheckName:
+			class = "db_permission"
+		}
+	}
+	return class
+}
 
 // failingNames lists the names of the checks in StatusFail that are not in
 // advisory, in report order.

@@ -58,7 +58,7 @@ func BuildPGReport(ctx context.Context, cfg PGDoctorConfig) *doctor.Report {
 	conn, err := pgx.Connect(ctx, cfg.QueryDSN)
 	if err != nil {
 		r.Add(doctor.CheckResult{
-			Name:        "Source PostgreSQL connection",
+			Name:        doctor.PGSourceConnectionCheckName,
 			Status:      doctor.StatusFail,
 			Detail:      err.Error(),
 			Remediation: "Check --query-dsn (or BINTRAIL_PG_QUERY_DSN) is reachable and the credentials are valid.",
@@ -66,7 +66,7 @@ func BuildPGReport(ctx context.Context, cfg PGDoctorConfig) *doctor.Report {
 		return r // nothing else can run without a connection
 	}
 	defer conn.Close(context.Background())
-	r.Add(doctor.CheckResult{Name: "Source PostgreSQL connection", Status: doctor.StatusPass})
+	r.Add(doctor.CheckResult{Name: doctor.PGSourceConnectionCheckName, Status: doctor.StatusPass})
 
 	// wal_level is the prerequisite for everything else. A genuine misconfiguration
 	// (readable, but not 'logical') skips the dependent checks — they can't run. A
