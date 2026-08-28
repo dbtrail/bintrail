@@ -307,7 +307,12 @@ func (d *deps) runTable(ctx context.Context, schema, tbl string) Outcome {
 			// --at is the snapshot's own instant (an operator asking for
 			// the table as of the dump): the load IS the answer, and the
 			// forward-only refusal below is for a RE-RUN, not for this.
-			out.Detail += "; --at is the snapshot's instant, nothing to fold"
+			const note = "--at is the snapshot's instant, nothing to fold"
+			if out.Detail == "" {
+				out.Detail = note
+			} else {
+				out.Detail += "; " + note
+			}
 			return out
 		}
 	}
@@ -1013,7 +1018,7 @@ func sameShape(sc *iceberg.Schema, cols []column) error {
 		case h.Kind != c.Kind || h.Precision != c.Precision || h.Scale != c.Scale:
 			return fmt.Errorf("stores column %q as %s where the export would write %s", c.Name, h.describe(), c.describe())
 		case h.PK != c.PK:
-			return fmt.Errorf("has column %q %s the identifier fields where the export %s", c.Name, inOrOut(h.PK), inOrOut(c.PK)+" it")
+			return fmt.Errorf("has column %q %s the identifier fields where the export puts it %s", c.Name, inOrOut(h.PK), inOrOut(c.PK))
 		}
 	}
 	return nil

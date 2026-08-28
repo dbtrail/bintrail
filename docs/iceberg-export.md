@@ -103,9 +103,10 @@ Four more shapes are refused rather than guessed at, all `refused-gap` or
 - **The run's cut is before the cursor.** The source's binlogs were reset or
   the index was restored behind the export, so the events in between are not
   in this index. Remove the table directory to reload it from a fresh
-  baseline. An index with **no live events at all** is refused the same way
-  once a table has folded deltas (it cannot tell a rotated-out index from a
-  reset one); right after a first load it is simply reported `unchanged`,
+  baseline. An index with **no live events at all** is refused too (plain
+  `refused`: it cannot tell a rotated-out index from a reset one, so it
+  names no cause) once a table has folded deltas; right after a first load
+  it is simply reported `loaded` with a note,
   since a fresh install whose stream has not indexed anything yet has
   nothing to fold and nothing lost.
 - **Skipped events.** When the capture daemon recorded skipped events (a
