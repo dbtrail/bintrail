@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The console daemon keeps its baseline run history, and says when it cannot
+  find a home directory** (#1487). A daemon started without `HOME`, which is
+  how a service manager starts one, resolved its server registry, auth file,
+  MCP token, verify history and baseline run history through a fallback
+  written as `filepath.Join(".", ".config", ...)`. That reads as though it
+  anchors to the current directory and does not: `Join` runs `Clean`, which
+  deletes the leading `"."`, so the result was a bare relative path resolved
+  against the process working directory at each IO. The path now names the
+  working directory outright. Nothing moves as a result, since no code path
+  changes directory between resolving a path and writing it; what changes is
+  that a failure names a directory an operator can go and look at, instead of
+  one that depended on when the syscall happened. Separately, and this is what
+  actually lost the history: `BaselineRunHistory.save` was the only one of five
+  sibling atomic savers that did not create its directory first, so every
+  refresh failed with `ENOENT` whenever `~/.config/bintrail` did not exist yet.
+  That is the normal state of a fresh install with a perfectly good `HOME`,
+  since nothing creates the tree until something saves into it. Because that
+  repeated failure was in practice the only signal anywhere that `HOME` was
+  unset, fixing it would have removed the signal and left the cause, so a
+  homeless daemon now warns once at startup, naming the directory it anchored
+  to and the settings that override it. It is a warning and not a refusal:
+  losing run history must never stop a refresh, and the console is a recovery
+  path that does not decline to boot over where its own state file landed. The
+  same relative fallback was shared verbatim by `generate-key`'s default key
+  path and is fixed there too.
 - **The console daemon's background folds are bounded, and their volume warning
   works** (#1477). `bintrail-console watch` rebuilds snapshots in the same
   process that captures binlogs, for the scheduled baseline refresh, the

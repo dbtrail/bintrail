@@ -1,7 +1,11 @@
 package console
 
 import (
+	"bytes"
+	"log/slog"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -38,5 +42,62 @@ func TestDefaultConfigPathsAreAbsoluteWithoutHome(t *testing.T) {
 		if !filepath.IsAbs(p) {
 			t.Errorf("%s = %q with no HOME; want an absolute path (a relative one resolves against the daemon's working directory, and its write errors name a directory the operator cannot find)", name, p)
 		}
+	}
+}
+
+// TestConfigPathWarnsWhenHomeIsMissing pins the signal that the MkdirAll fix
+// would otherwise delete.
+//
+// Before this PR, a homeless daemon's registry, auth file and MCP token were
+// written successfully (their savers all MkdirAll) while the baseline history
+// write failed every cycle. That repeated ENOENT was, by accident, the ONLY
+// indication anywhere that HOME was unset. Making the history write succeed
+// removes it, and every reader on this path is quiet by design: a missing
+// registry is an empty registry with no error, a missing auth file lands in
+// the first-run setup flow, a missing MCP token just 401s. The composite is a
+// console that comes up with no servers and offers to create a password,
+// looking merely unconfigured rather than detached from its state.
+//
+// So the fallback has to say so itself. Warning, never fatal: the console is a
+// recovery path and must still boot.
+//
+// Not parallel: t.Setenv and it swaps the default logger.
+func TestConfigPathWarnsWhenHomeIsMissing(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("USERPROFILE", "")
+
+	// The warning is once-per-process so a per-cycle caller cannot spam the
+	// log; reset it so this test does not depend on which test ran first.
+	configPathWarnOnce = sync.Once{}
+	t.Cleanup(func() { configPathWarnOnce = sync.Once{} })
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	got := configPath("console-servers.yaml")
+	logged := buf.String()
+
+	if logged == "" {
+		t.Fatal("no warning logged when the home directory could not be resolved; a homeless daemon would silently anchor all console state at its working directory")
+	}
+	// It must name the directory it actually anchored to, so the operator can
+	// go and look at it.
+	if dir := filepath.Dir(got); !strings.Contains(logged, dir) {
+		t.Errorf("warning does not name the directory it anchored to (%s): %s", dir, logged)
+	}
+	// ...and the levers that fix it.
+	for _, want := range []string{"HOME", "servers-file", "auth-file"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("warning does not mention %q, so it names no way out: %s", want, logged)
+		}
+	}
+
+	// Once per process: a second call must stay silent.
+	buf.Reset()
+	configPath("console-auth.yaml")
+	if second := buf.String(); second != "" {
+		t.Errorf("warning repeated on a later call; it must fire once per process, got: %s", second)
 	}
 }

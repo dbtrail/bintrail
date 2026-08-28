@@ -144,7 +144,10 @@ func (h *BaselineRunHistory) List(serverID string) []BaselineRunRecord {
 func (h *BaselineRunHistory) save() error {
 	b, err := json.Marshal(baselineHistoryFile{Version: baselineHistoryVersion, Servers: h.servers})
 	if err != nil {
-		return err
+		// The only step here whose failure names nothing on its own: every
+		// other one returns an *os.PathError/*os.LinkError already carrying
+		// the path, which is why they keep VerifyHistory.save's raw returns.
+		return fmt.Errorf("marshal baseline history %s: %w", h.path, err)
 	}
 	// Create the tree first, exactly as the sibling savers do (Registry.save,
 	// saveAuthFile, saveMCPTokenFile, VerifyHistory.save — this is
