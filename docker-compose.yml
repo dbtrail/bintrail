@@ -308,6 +308,16 @@ services:
       # There is deliberately NO password env var: docker inspect must never
       # be able to print a credential.
       BINTRAIL_CONSOLE_AUTH: /var/lib/bintrail/console-auth.yaml
+      # The managed MCP token (Settings → Connect AI), stored as a SHA-256
+      # hash. On the volume for the same reason as the two above: without this
+      # it would land in the container's writable layer, and every recreation
+      # would silently revoke it. The console cannot tell a wiped token from a
+      # fresh install, so it would come up quiet while the configured AI
+      # client got a 401 on every call. The value is the FILE PATH, not the
+      # token: like the password above, the credential itself is never an env
+      # var, and BINTRAIL_CONSOLE_TOKEN (the static API token, further up) is
+      # the one that takes a value.
+      BINTRAIL_CONSOLE_MCP_TOKEN_FILE: /var/lib/bintrail/console-mcp-token.yaml
       # The console binds 0.0.0.0 INSIDE the container, but the `ports` mapping
       # above publishes it on the host's loopback only — so first-run setup is
       # access-controlled in the default stack. The container can't see the

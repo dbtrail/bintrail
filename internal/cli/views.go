@@ -28,8 +28,8 @@ var viewsCmd = &cobra.Command{
 	Use:   "views",
 	Short: "Generate DuckDB view definitions over your Parquet archive layout",
 	Long: `Write a .sql file of DuckDB views over the archives and baseline snapshots
-this index already knows about, so any DuckDB — the CLI, a notebook, an
-embedded process — can query the Parquet tier without hand-writing
+this index already knows about, so any DuckDB (the CLI, a notebook, an
+embedded process) can query the Parquet tier without hand-writing
 read_parquet globs.
 
 The generated file defines:
@@ -69,7 +69,10 @@ in that case --index-dsn is not needed at all.
 
 The file is a snapshot of the layout, not a live binding. The event globs keep
 picking up newly rotated partitions on their own, but the state views point at
-one snapshot — regenerate after taking or refreshing a baseline.
+one snapshot: regenerate after taking or refreshing a baseline. A daemon running
+bintrail-console watch --baseline-refresh-interval publishes a new snapshot
+every interval and this file does not follow it, with no error and no warning,
+so regenerate on that same schedule.
 
 Examples:
   # From the index's own registry, plus a local baseline directory
@@ -107,7 +110,7 @@ func init() {
 	viewsCmd.Flags().StringVar(&vBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots")
 	viewsCmd.Flags().StringVar(&vBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/)")
 	viewsCmd.Flags().BoolVar(&vNoBaselines, "no-baselines", false, "Emit only the events view, skipping the baseline state views")
-	viewsCmd.Flags().BoolVar(&vIncludeLive, "include-live", false, "Add a live leg to the events view so it also covers events the index holds but rotation has not archived yet. Requires --index-dsn. The generated file carries the index host, port, database and user, and never its password: fill that in before running")
+	viewsCmd.Flags().BoolVar(&vIncludeLive, "include-live", false, "Add a live leg to the events view so it also covers events the index holds but rotation has not archived yet. Requires --index-dsn. The leg queries the index server directly, and the view cannot push a filter down to it, so every query is a full scan of binlog_events that competes with capture on that server: for a narrow read query the attached binlog_events directly, or point --index-dsn at a read replica of the index. The generated file carries the index host, port, database and user, and never its password: fill that in before running")
 	viewsCmd.Flags().StringVar(&vOut, "out", "views.sql", "Output file, or - for stdout")
 }
 

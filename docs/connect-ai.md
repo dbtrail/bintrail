@@ -143,7 +143,7 @@ directly with a DSN — see [mcp-server.md](mcp-server.md).
 
 | Symptom | Likely cause, in order of likelihood |
 |---|---|
-| **401 unauthorized** | Wrong token; or you're not talking to the console you think you are — a port-forward pointing at a stale process, another console on the same port. Check with `curl -H "Authorization: Bearer $TOKEN" http://host:8090/api/capabilities` — it should return JSON with `"mcp": true`. |
+| **401 unauthorized** | Wrong token; or the token was wiped by a container recreation, which happens when the managed-token file is not on a mounted volume (`--mcp-token-file` / `BINTRAIL_CONSOLE_MCP_TOKEN_FILE`; the shipped compose sets it, see [Docker](docker.md)); or you're not talking to the console you think you are, such as a port-forward pointing at a stale process or another console on the same port. Check with `curl -H "Authorization: Bearer $TOKEN" http://host:8090/api/capabilities`: it should return JSON with `"mcp": true`. |
 | **403 "no token configured"** | No token exists yet. Open **Settings → Connect AI** and click **Generate token** (step 1) — no restart needed. (Or set `--token` / `BINTRAIL_CONSOLE_TOKEN` and restart.) |
 | **Connection refused / timeout** | The URL isn't reachable from the AI client's machine. `curl http://host:8090/api/healthz` from that machine; if you tunnel, remember tunnels can idle out — re-establish and retry. |
 | **Bundle download 404s** | That release predates the bundles. Take the latest release, or build with `make mcpb`. |

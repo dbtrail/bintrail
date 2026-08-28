@@ -281,6 +281,29 @@ func writeHeader(b *strings.Builder, in Input) {
 	b.WriteString("-- state views point at ONE snapshot. Re-run `bintrail views` (or download the\n")
 	b.WriteString("-- file again from the console) after taking or refreshing a baseline, and\n")
 	b.WriteString("-- whenever archive sources are added or removed.\n")
+	// The sentence above covers an operator who takes baselines by hand: the
+	// refresh is something they DO, so regenerating is the next thing they do.
+	// It does not cover --baseline-refresh-interval, where the snapshot is
+	// published on a timer and nobody performs an action this advice can attach
+	// to (#1484). Naming the flag WITH its binary is what separates the two
+	// readers, and `bintrail views` is not that binary.
+	//
+	// Unconditional, and phrased so it stays true with no state views at all
+	// ("ANY state view below"): gating it would add a branch whose only effect
+	// is to withhold the warning, and the paragraph directly above is
+	// unconditional about the same views for the same reason. Neither asserts
+	// that a state view exists.
+	//
+	// "nothing regenerates this file", NOT "nothing re-runs this command": the
+	// console download is produced by a page, not a command, which is the same
+	// distinction Input.LiveLegUnavailable exists to make. The paragraph above
+	// already names both routes.
+	b.WriteString("--\n")
+	b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
+	b.WriteString("-- publishes a new snapshot every interval, and nothing regenerates this file.\n")
+	b.WriteString("-- Any state view below stays bound to the snapshot it was generated against,\n")
+	b.WriteString("-- with no error and no warning: its rows just stop changing. Regenerate this\n")
+	b.WriteString("-- file on the same schedule that refresh runs on.\n")
 	b.WriteString("--\n")
 	b.WriteString("-- Nothing here writes: every view is a read over Parquet files you already own.\n")
 	b.WriteString("--\n")
@@ -458,8 +481,56 @@ func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
 		b.WriteString("-- entirely plausible rows from a different index. Change HOST to a name that\n")
 		b.WriteString("-- resolves from where you run this.\n")
 	}
+	writeLiveCaptureNote(b)
 	fmt.Fprintf(b, "ATTACH '' AS %s (TYPE mysql, SECRET %s, READ_ONLY);\n\n",
 		quoteIdent(liveAttachAlias), quoteIdent(liveSecretName))
+}
+
+// writeLiveCaptureNote says WHOSE server the hot leg reads, next to the ATTACH
+// that opens it.
+//
+// The two legs are not two halves of one thing (#1483). The cold leg opens
+// Parquet files on disk or in an object store, which competes with nothing; this
+// one opens a connection to the index a running bintrail is writing captured
+// events into. In the run that prompted this, an analytical query scanned a 15M
+// row live binlog_events and capture on that server stopped minutes later, and
+// the person writing the query had no signal that this was a possibility.
+//
+// The consequence is worded from what the code does, not from that run: #1482
+// tagged the batch-INSERT deadline with indexer.ErrWriteDeadline, and
+// consoleapp/mainstream.go is the ONLY place that re-arms on it. So
+// `bintrail-console watch` restarts and replays from its checkpoint, while
+// every standalone capture process ends the run: `bintrail stream`
+// (cliapp/stream.go, a bare streamrun.One), `bintrail up` (cliapp/up.go, which
+// delegates to the same runStream) and `bintrail-pg stream`
+// (cmd/bintrail-pg/stream.go, a bare pgstreamrun.One whose flush writes through
+// this same indexer). The note names the CLASS rather than one member, because
+// an `up` operator handed a sentence about `stream` reads themselves out of it.
+//
+// And the standalone case has no "while": the process exits and stays exited
+// until something outside it restarts it, which is the 41-minute outage
+// consoleapp/mainstream.go's own comment records. Wording it as capture
+// "falling behind while that happens" described a dip, not a stop.
+func writeLiveCaptureNote(b *strings.Builder) {
+	b.WriteString("-- SHARED WITH CAPTURE: this attaches the index bintrail writes captured\n")
+	b.WriteString("-- events into, so a query over the events view reads the server capture is\n")
+	b.WriteString("-- writing to. The view cannot push your filter down to it (see COST below),\n")
+	b.WriteString("-- so every query is a full scan of binlog_events, and a big one competes with\n")
+	b.WriteString("-- capture for that server's disk and buffer pool. One measured run: an\n")
+	b.WriteString("-- analytical query over a 15 million row binlog_events, and capture on that\n")
+	b.WriteString("-- server stopped minutes later. An index write that runs past its timeout\n")
+	b.WriteString("-- ends the run in a standalone capture process (`bintrail stream`, `bintrail\n")
+	b.WriteString("-- up`, `bintrail-pg stream`), which then stays down until something restarts\n")
+	b.WriteString("-- it; `bintrail-console watch` restarts from its last checkpoint instead.\n")
+	b.WriteString("-- Capture is behind either way.\n")
+	// The remedy is the COST note's, not "filter the view": this same block has
+	// just said a filter does not reach the index, so advising one would
+	// contradict the sentence above it and send the reader to the one thing
+	// that cannot help.
+	b.WriteString("-- Two ways to keep it off capture: query `bintrail_live`.\"binlog_events\"\n")
+	b.WriteString("-- directly with your own WHERE, which does reach the index, or point HOST\n")
+	b.WriteString("-- above at a read replica, at the cost of that replica's own lag on top of\n")
+	b.WriteString("-- capture lag.\n")
 }
 
 // isLoopbackHost reports whether the generated ATTACH points at the generating

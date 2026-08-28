@@ -236,7 +236,10 @@ Security notes specific to the registry:
 - The registry file, the [auth file](#password-login) (written by
   set-password), and the [managed MCP token file](#mcp-endpoint)
   (`~/.config/bintrail/console-mcp-token.yaml`, SHA-256 only) are the only
-  things the console ever writes. Their write
+  things the console ever writes. Each has a path override
+  (`--servers-file`, `--auth-file`, `--mcp-token-file`, or the matching
+  `BINTRAIL_CONSOLE_*` variable); in a container, point all three at a mounted
+  volume or they are lost when the container is recreated. Their write
   endpoints sit behind the same bearer token and Host-header guard as
   everything else.
 
@@ -648,6 +651,7 @@ see the metrics tables and example alert rules in
 | `--baseline-s3` | — | S3 prefix of baseline snapshots (`s3://bucket/prefix/`). Enables Time-travel. |
 | `--servers-file` | `~/.config/bintrail/console-servers.yaml` | Path to the server registry YAML managed from the UI. |
 | `--auth-file` | `~/.config/bintrail/console-auth.yaml` | Console credential file enabling password login (see below). Created with `bintrail-console user set-password`, never by the server on its own. |
+| `--mcp-token-file` | `~/.config/bintrail/console-mcp-token.yaml` | Managed MCP token file (SHA-256 hash only), written by **Settings → Connect AI**. Point it at persistent storage when the console runs in a container, or a restart revokes the token. |
 | `--tls-cert` / `--tls-key` | — | Serve the console over HTTPS (PEM files, both-or-neither). Rotation = restart; no ACME. |
 | `--allow-setup` | `false` | Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. host-loopback published). Loopback always allows setup. |
 
@@ -660,6 +664,7 @@ see the metrics tables and example alert rules in
 - `BINTRAIL_CONSOLE_BASELINE_S3` — same as `--baseline-s3`.
 - `BINTRAIL_CONSOLE_SERVERS` — same as `--servers-file`.
 - `BINTRAIL_CONSOLE_AUTH` — same as `--auth-file`.
+- `BINTRAIL_CONSOLE_MCP_TOKEN_FILE`: same as `--mcp-token-file`.
 - `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
 - `BINTRAIL_CONSOLE_ALLOWED_HOSTS` — comma-separated, same as `--allowed-hosts`.
 - `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
@@ -719,8 +724,8 @@ Precedence is the usual CLI flag > environment variable > default. The
 `BINTRAIL_CONSOLE_*` variables apply equally to `bintrail-console watch` (where
 the matching flags are `--console-listen`, `--console-token`, `--baseline-dir`,
 `--baseline-s3`, `--console-servers-file`, `--console-auth-file`,
-`--console-tls-cert`, `--console-tls-key`, `--console-allowed-hosts`,
-`--console-allow-setup`).
+`--console-mcp-token-file`, `--console-tls-cert`, `--console-tls-key`,
+`--console-allowed-hosts`, `--console-allow-setup`).
 
 ## Password login
 
@@ -1080,7 +1085,8 @@ Rules that differ from the standalone `bintrail-mcp` server:
   `--token` / `BINTRAIL_CONSOLE_TOKEN` **or a managed MCP token generated
   from Settings → Connect AI** (#1052) — one click from an authenticated
   browser session, no flags, no restart. The managed token is persisted as a
-  SHA-256 hash only (`~/.config/bintrail/console-mcp-token.yaml`, `0600`,
+  SHA-256 hash only (`~/.config/bintrail/console-mcp-token.yaml`, or the
+  path given to `--mcp-token-file` / `BINTRAIL_CONSOLE_MCP_TOKEN_FILE`; `0600`,
   atomic write, versioned envelope with the registry's read-only-if-newer
   contract), its plaintext is shown exactly once at generation, and it is
   **scoped to `/mcp` alone** — it cannot drive the browser API (registry

@@ -85,6 +85,7 @@ var (
 	upBaselineCarryForward  bool
 	upConsoleServersFile    string
 	upConsoleAuthFile       string
+	upConsoleMCPTokenFile   string
 	upConsoleTLSCert        string
 	upConsoleTLSKey         string
 	upConsoleAllowedHost    []string
@@ -228,6 +229,7 @@ func init() {
 	watchCmd.Flags().StringVar(&upConsoleBaselineRetain, "baseline-retain", "", "Periodically prune local --baseline-dir snapshots older than this (Nd/Nh) once a durable copy exists in --baseline-s3 (never deletes the only copy or the newest snapshot per table)")
 	watchCmd.Flags().StringVar(&upConsoleServersFile, "console-servers-file", "", "Path to the console server registry YAML (default ~/.config/bintrail/console-servers.yaml)")
 	watchCmd.Flags().StringVar(&upConsoleAuthFile, "console-auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
+	watchCmd.Flags().StringVar(&upConsoleMCPTokenFile, "console-mcp-token-file", "", "Path to the managed MCP token file written by Settings → Connect AI (default ~/.config/bintrail/console-mcp-token.yaml). Point it at persistent storage when the console runs in a container.")
 	watchCmd.Flags().StringVar(&upConsoleTLSCert, "console-tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --console-tls-key)")
 	watchCmd.Flags().StringVar(&upConsoleTLSKey, "console-tls-key", "", "TLS private key file (PEM; requires --console-tls-cert)")
 	watchCmd.Flags().StringSliceVar(&upConsoleAllowedHost, "console-allowed-hosts", nil, "Extra hostnames allowed in the Host header (for a TLS-terminating reverse proxy); IP literals and localhost are always allowed")
@@ -924,6 +926,11 @@ func resolveUpConsoleEnv(cmd *cobra.Command) error {
 			upConsoleAuthFile = v
 		}
 	}
+	if !cmd.Flags().Changed("console-mcp-token-file") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_MCP_TOKEN_FILE"); v != "" {
+			upConsoleMCPTokenFile = v
+		}
+	}
 	if !cmd.Flags().Changed("console-tls-cert") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_TLS_CERT"); v != "" {
 			upConsoleTLSCert = v
@@ -1371,6 +1378,7 @@ type consoleOpts struct {
 	BaselineDir  string
 	BaselineS3   string
 	AuthFile     string
+	MCPTokenFile string
 	TLSCert      string
 	TLSKey       string
 	AllowedHosts []string
@@ -1385,6 +1393,7 @@ func upConsoleOpts() consoleOpts {
 		BaselineDir:  upConsoleBaselineDir,
 		BaselineS3:   upConsoleBaselineS3,
 		AuthFile:     upConsoleAuthFile,
+		MCPTokenFile: upConsoleMCPTokenFile,
 		TLSCert:      upConsoleTLSCert,
 		TLSKey:       upConsoleTLSKey,
 		AllowedHosts: upConsoleAllowedHost,
@@ -1417,6 +1426,7 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 		BaselineDir:  opts.BaselineDir,
 		BaselineS3:   opts.BaselineS3,
 		AuthPath:     opts.AuthFile,
+		MCPTokenPath: opts.MCPTokenFile,
 		TLSCert:      opts.TLSCert,
 		TLSKey:       opts.TLSKey,
 		AllowedHosts: opts.AllowedHosts,

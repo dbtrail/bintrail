@@ -54,6 +54,7 @@ var (
 	conBaselineS3   string
 	conServersFile  string
 	conAuthFile     string
+	conMCPTokenFile string
 	conTLSCert      string
 	conTLSKey       string
 	conAllowSetup   bool
@@ -70,6 +71,7 @@ func init() {
 	serveCmd.Flags().StringVar(&conBaselineS3, "baseline-s3", "", "S3 prefix of baseline Parquet snapshots (s3://bucket/prefix/); enables Reconstruct")
 	serveCmd.Flags().StringVar(&conServersFile, "servers-file", "", "Path to the server registry YAML managed by the UI (default ~/.config/bintrail/console-servers.yaml)")
 	serveCmd.Flags().StringVar(&conAuthFile, "auth-file", "", "Path to the console auth file enabling password login (default ~/.config/bintrail/console-auth.yaml; created with `bintrail-console user set-password`)")
+	serveCmd.Flags().StringVar(&conMCPTokenFile, "mcp-token-file", "", "Path to the managed MCP token file written by Settings → Connect AI (default ~/.config/bintrail/console-mcp-token.yaml). Point it at persistent storage when the console runs in a container.")
 	serveCmd.Flags().StringVar(&conTLSCert, "tls-cert", "", "TLS certificate file (PEM); serve the console over HTTPS (requires --tls-key)")
 	serveCmd.Flags().StringVar(&conTLSKey, "tls-key", "", "TLS private key file (PEM; requires --tls-cert)")
 	serveCmd.Flags().BoolVar(&conAllowSetup, "allow-setup", false, "Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. published only on the host loopback)")
@@ -119,6 +121,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if !cmd.Flags().Changed("auth-file") {
 		if v := os.Getenv("BINTRAIL_CONSOLE_AUTH"); v != "" {
 			conAuthFile = v
+		}
+	}
+	if !cmd.Flags().Changed("mcp-token-file") {
+		if v := os.Getenv("BINTRAIL_CONSOLE_MCP_TOKEN_FILE"); v != "" {
+			conMCPTokenFile = v
 		}
 	}
 	if !cmd.Flags().Changed("tls-cert") {
@@ -244,6 +251,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		BaselineDir:   conBaselineDir,
 		BaselineS3:    conBaselineS3,
 		AuthPath:      conAuthFile,
+		MCPTokenPath:  conMCPTokenFile,
 		TLSCert:       conTLSCert,
 		TLSKey:        conTLSKey,
 		AllowSetup:    conAllowSetup,
