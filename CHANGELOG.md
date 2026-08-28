@@ -321,6 +321,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   join between two state views land on two different snapshots when a refresh
   publishes mid-query, which is a state that never existed. Text only: no
   generated view's behaviour changed, and files you already have keep working.
+- **A scheduled backup refresh that refuses no longer leaves a near-complete
+  snapshot on disk** (#1473). A refresh folds every table it can before it
+  reports a refusal, and each table that folds writes its Parquet into the new
+  snapshot directory as it finishes; only the marker written at the end says the
+  result is unusable. On a server where one table carries a permanent capture
+  gap, every cycle therefore left behind a fresh directory holding all the other
+  tables and a marker saying it cannot be used. Backup discovery correctly
+  ignores such a directory, and retention cannot reclaim it either, because a
+  prune needs a confirmed S3 copy and this loop never uploads. At the old one
+  hour interval floor that was 24 directories a day; the new one minute floor
+  makes it 1440. The scheduled refresh now removes the directory its own failed
+  run created, and the failure line names that directory either way. Three
+  guards decide, and all three have to agree before anything is removed: the
+  directory has to have held nothing but a previous failed run's marker when
+  this refresh started, so everything in it now is this run's; at least one
+  table has to have refused, so a run that failed only at the last step with
+  every table already folded is kept rather than deleted; and the directory has
+  to still carry the incomplete marker, so a published backup is never a
+  candidate. When any of them says no, the directory is kept and the line says
+  which one it is and why. The removal moves the directory aside first and
+  deletes it second, so a delete interrupted part way can never leave table
+  files behind with no marker on them, which is the one shape a reader would
+  take for a real backup. Nothing changes for `bintrail baseline refresh` on the
+  command line, or for a restore or a custom `.sql` build you started yourself:
+  those keep their fragments, because someone who typed a command is there to
+  look at them. A shutdown in the middle of a refresh also keeps its fragment,
+  since a cancelled run reports no table failure.
 
 ### Added
 - **S3-compatible object stores (MinIO, Wasabi, LocalStack) for every S3

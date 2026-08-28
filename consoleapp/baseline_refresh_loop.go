@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
@@ -92,6 +94,10 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	// move the number this change exists to get right, in either direction.
 	// started stays for the RFC3339 stamp, which wants the wall clock.
 	elapsed := time.Now()
+	// Asked BEFORE the fold, and it has to be: the question is whether the
+	// snapshot directory holds anything this run did not write, and once the
+	// fold has run its own files are in there too. See claimSnapshotDir.
+	unclaimed := claimSnapshotDir(refreshSnapshotDir(req, at))
 	tables, refused, carried, err := s.executeRefresh(req, at)
 	// Measured HERE, on the far side of the `go` in TriggerRefresh, because
 	// this is where the fold actually happens. Timing the dispatch loop
@@ -102,6 +108,13 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 		Kind: console.BaselineRunRefresh, StartedAt: started.Format(time.RFC3339),
 		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused, Carried: carried,
 	}, err)
+	if err != nil {
+		// Reported and reclaimed OUTSIDE s.mu. Deleting a directory is
+		// filesystem work of unbounded duration, and s.mu is the lock every
+		// baseline job takes to start: holding it across a delete would make a
+		// slow disk block the next dump, restore or export.
+		reportRefusedRefresh(req, at, refused, unclaimed, err)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -112,23 +125,154 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	}
 	applyFoldStatus(st, tables, refused, carried, err)
 	if err != nil {
-		// Deliberately NO duration report here. reportRefreshDuration's advice
-		// is "raise the interval, or refresh fewer tables", which is the wrong
-		// remediation for a run that published nothing: a capture gap, a
-		// schema change or a shutdown mid-fold are not fixed by scheduling.
-		// The fan-out runs every table to completion before it reports a
-		// refusal, so a refusal costs about what a success costs and WOULD
-		// trip the overrun threshold, printing tuning advice above the actual
-		// cause.
-		// Warn, never Error: a refusal is the fail-closed contract working, and
-		// the next tick retries. Nothing about the daemon is unhealthy.
-		slog.Warn("baseline refresh: published nothing", "server", req.ServerName, "id", req.ServerID,
-			"refused", refused, "error", err)
+		// The refusal itself was already reported above, before this lock was
+		// taken. What happens HERE is deliberately nothing: no duration report.
+		// reportRefreshDuration's advice is "raise the interval, or refresh
+		// fewer tables", which is the wrong remediation for a run that
+		// published nothing: a capture gap, a schema change or a shutdown
+		// mid-fold are not fixed by scheduling. The fan-out runs every table to
+		// completion before it reports a refusal, so a refusal costs about what
+		// a success costs and WOULD trip the overrun threshold, printing tuning
+		// advice above the actual cause.
 		return
 	}
 	slog.Info("baseline refresh: published", "server", req.ServerName, "id", req.ServerID,
 		"tables", tables, "reused", carried)
 	reportRefreshDuration(req.ServerName, interval, took)
+}
+
+// refreshSnapshotDir names the directory one refresh cycle folds into: the
+// snapshot directory reconstruct derives from the instant the cycle targets.
+//
+// The loop knows both halves, which is why the cleanup can live here at all.
+// Deriving it a second time is also what makes a mistake harmless rather than
+// dangerous: DiscardUnpublishedSnapshot refuses any directory that does not
+// carry the incomplete marker, so a path that does not match the fold's own
+// deletes nothing.
+func refreshSnapshotDir(req refreshRequest, at time.Time) string {
+	return filepath.Join(req.BaselineDir, reconstruct.SnapshotDirName(at))
+}
+
+// claimSnapshotDir establishes, before the fold starts, that the snapshot
+// directory holds nothing this run did not put there. It returns "" when the
+// directory is this run's to reclaim, or the reason it is not.
+//
+// A refresh runs unattended every interval, so the directory it is about to
+// write into is normally absent. It can legitimately hold the incomplete marker
+// a previous failed run of the same instant left, which is why that one entry
+// does not disqualify it (the fold applies the same rule before it writes).
+// Anything else means another writer got there first, and a same-second
+// collision with a `bintrail baseline` run is the one case where a directory
+// carrying an incomplete marker is somebody else's live output.
+func claimSnapshotDir(dir string) string {
+	vacant, err := reconstruct.SnapshotDirVacant(dir)
+	switch {
+	case err != nil:
+		// Not swallowed and not duplicated: this same unreadable directory
+		// makes the fold itself fail, and that failure is reported as the run's
+		// own error on the line below. What this branch decides is only whether
+		// the cleanup may run, and the answer is no, which is reported as the
+		// reason the directory was kept.
+		return fmt.Sprintf("the directory could not be read before the refresh started: %v", err)
+	case !vacant:
+		return "the directory already held files before this refresh started, so they are not all this run's"
+	}
+	return ""
+}
+
+// reportRefusedRefresh reports a refresh cycle that published nothing, and
+// reclaims the partial snapshot the cycle wrote.
+//
+// Warn, never Error: a refusal is the fail-closed contract working, and the
+// next tick retries. Nothing about the daemon is unhealthy.
+//
+// The message is kept byte-stable because operators grep and alert on it; what
+// happened to the files is carried in the attributes.
+func reportRefusedRefresh(req refreshRequest, at time.Time, refused int, unclaimed string, err error) {
+	args := []any{"server", req.ServerName, "id", req.ServerID, "refused", refused, "error", err}
+	args = append(args, reclaimPartialSnapshot(refreshSnapshotDir(req, at), refused, unclaimed)...)
+	slog.Warn("baseline refresh: published nothing", args...)
+}
+
+// reclaimPartialSnapshot deletes the partial snapshot a refused cycle wrote and
+// returns the attributes describing what it did, for the caller's log line.
+//
+// This is the whole point of #1473. A refresh that refuses still folds every
+// table that CAN fold, and each one writes its Parquet into the snapshot
+// directory as it finishes; only the completeness marker at the end says the
+// result is unusable. On a server where one table carries a permanent capture
+// gap, every cycle therefore leaves a near-complete snapshot that discovery
+// correctly ignores and that retention cannot reclaim, because a prune needs a
+// confirmed S3 copy and this loop never uploads. At a one-hour interval that is
+// 24 a day; at the one-minute floor it is 1440.
+//
+// Only the LOOP does this. The CLI and the operator-triggered point-in-time
+// restore share the same fold and keep their fragments: someone who typed a
+// command is watching its output and may want to look at what came out. An
+// unattended job that will repeat in a minute is the case where nobody will.
+func reclaimPartialSnapshot(dir string, refused int, unclaimed string) []any {
+	if reason := keepPartialSnapshotBecause(refused, unclaimed); reason != "" {
+		if !dirExists(dir) {
+			// The run failed before it created the directory (no snapshot to
+			// fold, an unreachable index). Naming a path that is not there
+			// would send an operator looking for it.
+			return nil
+		}
+		return []any{"partial_snapshot", dir, "kept_because", reason}
+	}
+	discarded, err := reconstruct.DiscardUnpublishedSnapshot(dir)
+	switch {
+	case discarded && err != nil:
+		// Renamed out of every discovery path but not fully deleted. Both facts
+		// are true and both get said: nothing can read it, and the disk it
+		// holds was not reclaimed.
+		return []any{"removed_partial_snapshot", dir, "cleanup_error", err}
+	case discarded:
+		return []any{"removed_partial_snapshot", dir}
+	case err != nil:
+		return []any{"partial_snapshot", dir, "kept_because", err.Error()}
+	default:
+		return nil
+	}
+}
+
+// keepPartialSnapshotBecause states why a refused cycle's snapshot directory
+// must be left alone, or "" when it may be reclaimed.
+//
+// unclaimed comes first because it is the earlier and more specific fact: a
+// directory that already held files is refused by the fold at its own leftovers
+// check, which returns before a single table folds, so it also arrives here
+// with refused == 0. Reporting that as "the fold reported no table failure"
+// would name the wrong reason for the right decision.
+//
+// refused == 0 is the guard that keeps a COMPLETE snapshot out of the delete.
+// foldOutcome sets refused to the number of tables that failed, so the case
+// this exists for (one table with a permanent capture gap out of twelve)
+// arrives with refused > 0, while three paths fail a run whose tables all
+// folded: the integrity manifest could not be written, the _SUCCESS marker
+// could not be written, or the daemon was cancelled after the last table
+// finished. In all three the bytes on disk are a whole snapshot that only
+// failed to be MARKED, and deleting one would destroy work that is complete.
+//
+// The cost of that guard is that a shutdown mid-fold leaves its partial
+// snapshot behind, because a cancelled run's remaining tables return without
+// recording a failure. That is one directory per restart rather than one per
+// interval, and it is the direction to be wrong in.
+func keepPartialSnapshotBecause(refused int, unclaimed string) string {
+	if unclaimed != "" {
+		return unclaimed
+	}
+	if refused == 0 {
+		return "the fold reported no table failure, so what is on disk may be a complete snapshot that only " +
+			"failed to be marked"
+	}
+	return ""
+}
+
+// dirExists reports whether path is an existing directory.
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // applyFoldStatus writes a finished fold's outcome onto the status the console
