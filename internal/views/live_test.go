@@ -426,6 +426,28 @@ func TestLivePreamble_loopbackIsFlagged(t *testing.T) {
 	}
 }
 
+// TestLivePreamble_declaresEveryExtensionItUses.
+//
+// The file runs in a DuckDB this repo does not control, which is why the
+// preamble INSTALLs and LOADs what it reads through rather than assuming. The
+// index leg reads event_timestamp AT TIME ZONE 'UTC' — that is ICU, and an
+// undeclared dependency on it fails the same way a missing column does: a
+// binder error, and no events view created at all.
+func TestLivePreamble_declaresEveryExtensionItUses(t *testing.T) {
+	out := Generate(liveInput(liveIdx()))
+	for _, use := range []struct{ sql, ext string }{
+		{`."binlog_events"`, "mysql"},
+		{"AT TIME ZONE", "icu"},
+	} {
+		if !strings.Contains(out, use.sql) {
+			continue
+		}
+		if !strings.Contains(out, "INSTALL "+use.ext) || !strings.Contains(out, "LOAD "+use.ext) {
+			t.Errorf("the file uses %s but never declares the %s extension", use.sql, use.ext)
+		}
+	}
+}
+
 // eventsComment returns the events view's comment block, so an assertion about
 // what the file SAYS cannot pass on a sentence somewhere else in it.
 func eventsComment(out string) string {

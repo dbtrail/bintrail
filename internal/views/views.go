@@ -422,6 +422,12 @@ func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
 	b.WriteString("-- carries none. Everything else is the index location, which is not secret.\n")
 	b.WriteString("-- Read-only: nothing in this file writes, and the ATTACH enforces it.\n")
 	b.WriteString("INSTALL mysql; LOAD mysql;\n")
+	// icu is declared for the same reason mysql and httpfs are: this file runs
+	// in a DuckDB nobody here controls, and it must not depend on an extension
+	// that merely happens to be loaded. The index leg reads event_timestamp
+	// AT TIME ZONE 'UTC', which is ICU's. Where ICU is built in, both
+	// statements are a no-op that reports it already installed.
+	b.WriteString("INSTALL icu; LOAD icu;\n")
 	fmt.Fprintf(b, "CREATE OR REPLACE SECRET %s (\n", quoteIdent(liveSecretName))
 	b.WriteString("    TYPE mysql,\n")
 	fmt.Fprintf(b, "    HOST %s,\n", sqlString(li.Host))
