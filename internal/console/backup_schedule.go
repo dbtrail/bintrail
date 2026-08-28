@@ -293,12 +293,16 @@ type BackupScheduleState struct {
 	LastStartedAt string
 	// LastMethod is that job's method.
 	LastMethod string
-	// Last is the supervisor's status for THAT job, nil once the slot holds
-	// another job (a later manual backup) or when nothing was started here.
-	// Running is Last.State == "running".
+	// Last is the supervisor's status for THAT job: live while it is in the
+	// slot, the copy the loop kept once it finished (so a later manual job
+	// taking the slot does not erase it), nil when nothing was started here.
 	Last *BaselineStatus
 	// Running: the job this schedule last started has not finished.
 	Running bool
+	// LastSkippedAt / LastSkipReason describe the last slot this process
+	// could not start, empty if none. The history has the durable copy.
+	LastSkippedAt  string
+	LastSkipReason string
 }
 
 // BackupScheduleReporter is the schedule loop as the console sees it. nil when
@@ -312,4 +316,9 @@ type BackupScheduleReporter interface {
 	// supervisor would still refuse to start one (a lock-mode
 	// misconfiguration): nil when full backups can start.
 	FullBackups() (enabled bool, refusal error)
+	// Observe tells the loop a schedule was saved at `at`, so the slot in
+	// progress then counts as seen and the NEXT boundary fires, even one
+	// that falls before the loop's next tick. Without it the next_run the
+	// page showed at save time could be silently skipped.
+	Observe(serverID string, sched BackupSchedule, at time.Time)
 }

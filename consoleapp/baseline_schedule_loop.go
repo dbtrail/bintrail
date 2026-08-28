@@ -19,10 +19,12 @@ import (
 //   - a slot that passed while the daemon was down never fires: cron
 //     semantics, and the only ones that keep a restart from turning into a
 //     surprise full dump of production at 09:00 on a Monday;
-//   - the first time a schedule is observed (boot, just added, or just
-//     EDITED: the observation is keyed by the schedule's identity, not the
-//     server's), the current slot is recorded and NOT fired, so saving a
-//     schedule never starts a backup on the spot. It runs at the next slot.
+//   - a schedule is observed from the moment it is SAVED (the API tells the
+//     loop) or from boot (the loop seeds every schedule it finds), keyed by
+//     the schedule's identity, so an add and an edit are both silent for
+//     the slot already in progress and fire at the next one. That next one
+//     is exactly the next_run the page showed when the operator saved, even
+//     when it falls inside the minute before the first tick.
 //
 // Isolation matches the refresh and rotation loops: its own goroutine, a
 // recover around each tick, and it never touches the stream. A schedule that
@@ -50,9 +52,15 @@ type backupScheduler struct {
 	// is a first observation: that is what makes an edit silent.
 	seen map[string]seenSlot
 	// started is the last job this schedule started per server: which
-	// supervisor slot to look at, and the exact stamp the supervisor gave it,
-	// so a later manual job in the same slot is never mistaken for ours.
+	// supervisor slot to look at, the exact stamp the supervisor gave it (so
+	// a later manual job in the same slot is never mistaken for ours), and,
+	// once observed, its terminal status, kept so a later manual job taking
+	// the slot does not erase the schedule's last outcome from the page.
 	started map[string]scheduledStart
+	// skipped is the last slot this schedule could not start per server.
+	// The history has the durable copy; this one is what the page gets when
+	// the history is unavailable.
+	skipped map[string]scheduledSkip
 	// warned holds the servers whose unreadable schedule was already reported,
 	// so the log says it once rather than every minute.
 	warned map[string]bool
@@ -70,6 +78,14 @@ type scheduledStart struct {
 	// since is the supervisor's Since for the job, read back right after
 	// the trigger. Attribution compares on it exactly.
 	since string
+	// last is the job's status once it was observed in a terminal state,
+	// nil until then.
+	last *console.BaselineStatus
+}
+
+type scheduledSkip struct {
+	at     string
+	reason string
 }
 
 func newBackupScheduler(sup *baselineSupervisor, reg *console.Registry, fullBackups, carryDefault bool) *backupScheduler {
@@ -77,6 +93,7 @@ func newBackupScheduler(sup *baselineSupervisor, reg *console.Registry, fullBack
 		sup: sup, reg: reg, fullBackups: fullBackups, carryDefault: carryDefault,
 		seen:    make(map[string]seenSlot),
 		started: make(map[string]scheduledStart),
+		skipped: make(map[string]scheduledSkip),
 		warned:  make(map[string]bool),
 	}
 }
@@ -101,28 +118,73 @@ func (b *backupScheduler) FullBackups() (bool, error) {
 	return b.fullBackups, b.sup.configErr
 }
 
+// Observe implements console.BackupScheduleReporter: the API calls it when a
+// schedule is saved, so the slot in progress at that instant is the one the
+// loop treats as already seen. Without it the first TICK was the first
+// observation, and a boundary between the save and that tick (up to a
+// minute) was silently dropped while the page had just promised it as the
+// next run. Cheap and lock-only; an unparseable schedule is ignored here and
+// reported by the tick.
+func (b *backupScheduler) Observe(serverID string, sched console.BackupSchedule, at time.Time) {
+	p, err := sched.Parse()
+	if err != nil {
+		return
+	}
+	b.mu.Lock()
+	b.seen[serverID] = seenSlot{identity: sched.Identity(), slot: p.SlotAtOrBefore(at.UTC())}
+	b.mu.Unlock()
+}
+
+// observeAll seeds the observation of every schedule in the registry at one
+// instant: boot. A boundary in the first minute of uptime then fires (the
+// daemon was up for it), and one before boot does not.
+func (b *backupScheduler) observeAll(at time.Time) {
+	for _, e := range b.reg.List() {
+		if e.BackupSchedule != nil {
+			b.Observe(e.ID, *e.BackupSchedule, at)
+		}
+	}
+}
+
 // ScheduleState implements console.BackupScheduleReporter.
 func (b *backupScheduler) ScheduleState(serverID string) console.BackupScheduleState {
 	b.mu.Lock()
-	st, ok := b.started[serverID]
+	st, started := b.started[serverID]
+	sk, skipped := b.skipped[serverID]
 	b.mu.Unlock()
-	if !ok {
-		return console.BackupScheduleState{}
+	var out console.BackupScheduleState
+	if skipped {
+		out.LastSkippedAt, out.LastSkipReason = sk.at, sk.reason
 	}
+	if !started {
+		return out
+	}
+	out.LastStartedAt, out.LastMethod = st.at, st.method
 	var cur console.BaselineStatus
 	if st.method == console.BackupMethodRefresh {
 		cur = b.sup.RefreshStatus(serverID)
 	} else {
 		cur = b.sup.Status(serverID)
 	}
-	out := console.BackupScheduleState{LastStartedAt: st.at, LastMethod: st.method}
-	// The slot is shared with manual jobs of the same kind. Only the job
-	// whose Since is exactly the one read back at trigger time is ours: a
-	// later Create backup overwrites the slot with its own stamp and is not
-	// reported as the schedule's, in either state.
-	if cur.Since == st.since {
+	switch {
+	case cur.Since == st.since:
+		// The slot is shared with manual jobs of the same kind. Only the job
+		// whose Since is exactly the one read back at trigger time is ours.
 		out.Last = &cur
 		out.Running = cur.State == "running"
+		if !out.Running {
+			// Keep the outcome: a later manual job overwrites the slot, and
+			// a job that panicked has no history record, so this copy is
+			// the page's only evidence until the schedule's next run.
+			b.mu.Lock()
+			if cur2, ok := b.started[serverID]; ok && cur2.since == st.since {
+				cur2.last = &cur
+				b.started[serverID] = cur2
+			}
+			b.mu.Unlock()
+		}
+	case st.last != nil:
+		out.Last = st.last
 	}
 	return out
 }
@@ -133,6 +195,7 @@ func startBackupScheduleLoop(ctx context.Context, sched *backupScheduler) {
 	if sched == nil {
 		return
 	}
+	sched.observeAll(time.Now().UTC())
 	slog.Info("backup schedule loop enabled", "tick", backupScheduleTick, "full_backups", sched.fullBackups)
 	go func() {
 		t := time.NewTicker(backupScheduleTick)
@@ -189,13 +252,29 @@ func (b *backupScheduler) tick(ctx context.Context, now time.Time) {
 		}
 		b.fire(e, p, now)
 	}
-	// Forget servers whose schedule is gone, so a schedule removed and later
-	// re-added starts silent again rather than firing on a stale slot.
+	// Forget servers whose schedule is gone: a schedule removed and later
+	// re-added starts silent again rather than firing on a stale slot, and
+	// its last outcome is not reported under a schedule that no longer
+	// exists.
 	b.mu.Lock()
 	for id := range b.seen {
 		if !live[id] {
 			delete(b.seen, id)
+		}
+	}
+	for id := range b.warned {
+		if !live[id] {
 			delete(b.warned, id)
+		}
+	}
+	for id := range b.started {
+		if !live[id] {
+			delete(b.started, id)
+		}
+	}
+	for id := range b.skipped {
+		if !live[id] {
+			delete(b.skipped, id)
 		}
 	}
 	b.mu.Unlock()
@@ -204,7 +283,7 @@ func (b *backupScheduler) tick(ctx context.Context, now time.Time) {
 // crossed records slot for the server under the schedule's identity and
 // reports whether it moved past the previously observed one. The first
 // observation of an identity records and reports false, so an add and an
-// edit are both silent.
+// edit are both silent (the API's Observe normally gets there first).
 func (b *backupScheduler) crossed(serverID, identity string, slot time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -264,10 +343,15 @@ func (b *backupScheduler) fire(e console.ServerEntry, p console.ParsedBackupSche
 	}
 }
 
-// skip records a slot that did not start, in the history (so the page can
-// show it, restart or not) and in the log.
+// skip records a slot that did not start: in memory (the page's view when
+// the history is unavailable), in the history (so it survives a restart)
+// and in the log.
 func (b *backupScheduler) skip(e console.ServerEntry, method string, now time.Time, reason string) {
+	stamp := now.Format(time.RFC3339)
 	slog.Warn("backup schedule: scheduled backup did not start", "server", e.Name, "method", method, "reason", reason)
+	b.mu.Lock()
+	b.skipped[e.ID] = scheduledSkip{at: stamp, reason: reason}
+	b.mu.Unlock()
 	if b.sup.history == nil {
 		return
 	}
@@ -275,7 +359,6 @@ func (b *backupScheduler) skip(e console.ServerEntry, method string, now time.Ti
 	if method == console.BackupMethodRefresh {
 		kind = console.BaselineRunRefresh
 	}
-	stamp := now.Format(time.RFC3339)
 	_, err := b.sup.history.AppendSkip(console.BaselineRunRecord{
 		ServerID: e.ID, ServerName: e.Name, Kind: kind, SkipReason: reason,
 		StartedAt: stamp, FinishedAt: stamp,

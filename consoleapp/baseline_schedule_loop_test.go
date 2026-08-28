@@ -6,20 +6,28 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
 	"github.com/dbtrail/dbtrail/internal/mydumperlock"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
+// newScheduleFixture builds a scheduler over a real supervisor and a real
+// history file. The context is cancelled BEFORE the temp dirs are removed
+// (Cleanup runs LIFO), but a fired job takes no context on its history
+// write, so every test that fires must also await the job: see waitTerminal.
 func newScheduleFixture(t *testing.T, fullBackups bool) (*backupScheduler, *console.Registry, *baselineSupervisor) {
 	t.Helper()
+	staging := t.TempDir()
+	histDir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
-	h, err := console.OpenBaselineHistory(t.TempDir() + "/h.json")
+	sup := newBaselineSupervisor(ctx, staging, baseline.DefaultLockMode)
+	h, err := console.OpenBaselineHistory(histDir + "/h.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,20 +50,31 @@ func addScheduled(t *testing.T, reg *console.Registry, method string) console.Se
 	return e
 }
 
-// waitScheduled polls the history for the schedule's own run record: the
-// job runs in its own goroutine and fails fast (an unparseable source DSN,
-// an empty baseline directory), so the record arrives within a moment.
-func waitScheduled(t *testing.T, sup *baselineSupervisor, id string) *console.BaselineRunRecord {
+// waitTerminal polls the loop's own view until the job it started reached a
+// terminal state. The job goroutine writes the history BEFORE it flips the
+// status, so waiting on the history alone let a test return with the job
+// still finishing, and its last writes then landed in a temp dir the test
+// had already removed (CI: "TempDir RemoveAll cleanup: directory not empty").
+func waitTerminal(t *testing.T, b *backupScheduler, id string) console.BackupScheduleState {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if run, _ := sup.history.LastScheduled(id); run != nil {
-			return run
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		st := b.ScheduleState(id)
+		if st.Last != nil && !st.Running {
+			return st
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the scheduled job never reached a terminal state in the loop's view: %+v", st)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("the scheduled job never recorded itself in the history")
-	return nil
+}
+
+// fireAt drives the two ticks that fire a fresh 1h schedule: the observation
+// and the next boundary.
+func fireAt(b *backupScheduler, t0 time.Time) {
+	b.tick(context.Background(), t0)
+	b.tick(context.Background(), t0.Add(time.Hour))
 }
 
 // The first observation records the slot and never fires; a later, newer
@@ -104,11 +123,10 @@ func TestBackupScheduler_savingNeverFiresOnTheSpot(t *testing.T) {
 	}
 	// 10:00: the boundary crossed while the loop was watching.
 	b.tick(context.Background(), now.Add(time.Hour))
-	st := sup.RefreshStatus(e.ID)
-	if st.State == "idle" {
+	if st := sup.RefreshStatus(e.ID); st.State == "idle" {
 		t.Fatal("the slot boundary did not start the scheduled rebuild")
 	}
-	if got := b.ScheduleState(e.ID); got.LastStartedAt == "" {
+	if st := waitTerminal(t, b, e.ID); st.LastStartedAt == "" {
 		t.Fatal("the loop did not record what it started")
 	}
 }
@@ -141,6 +159,55 @@ func TestBackupScheduler_editingNeverFiresOnTheSpot(t *testing.T) {
 	if st := sup.RefreshStatus(e.ID); st.State == "idle" {
 		t.Fatal("the edited schedule's next slot did not fire")
 	}
+	waitTerminal(t, b, e.ID)
+}
+
+// The API observes a schedule at the instant it is saved, so a boundary
+// that falls between the save and the loop's next tick fires: the next_run
+// the page reported is kept. Without Observe, the tick at 03:00:20 was the
+// first observation and today's 03:00 was silently dropped.
+func TestBackupScheduler_observeAtSaveKeepsThePromisedNextRun(t *testing.T) {
+	b, reg, sup := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, console.BackupMethodRefresh)
+	sched := console.BackupSchedule{Every: "1d", At: "03:00", Method: console.BackupMethodRefresh}
+	e.BackupSchedule = &sched
+	if err := reg.Update(e); err != nil {
+		t.Fatal(err)
+	}
+	b.Observe(e.ID, sched, time.Date(2026, 8, 28, 2, 59, 50, 0, time.UTC))
+	b.tick(context.Background(), time.Date(2026, 8, 28, 3, 0, 20, 0, time.UTC))
+	if st := sup.RefreshStatus(e.ID); st.State == "idle" {
+		t.Fatal("the boundary between the save and the first tick was dropped")
+	}
+	waitTerminal(t, b, e.ID)
+
+	// Saved just AFTER the boundary: the slot in progress is the 03:00 one,
+	// and the first tick must not fire it.
+	b2, reg2, sup2 := newScheduleFixture(t, true)
+	e2 := addScheduled(t, reg2, console.BackupMethodRefresh)
+	e2.BackupSchedule = &sched
+	if err := reg2.Update(e2); err != nil {
+		t.Fatal(err)
+	}
+	b2.Observe(e2.ID, sched, time.Date(2026, 8, 28, 3, 0, 10, 0, time.UTC))
+	b2.tick(context.Background(), time.Date(2026, 8, 28, 3, 0, 30, 0, time.UTC))
+	if st := sup2.RefreshStatus(e2.ID); st.State != "idle" {
+		t.Fatalf("a save after the boundary fired the slot in progress: %+v", st)
+	}
+}
+
+// At boot every schedule is observed at the boot instant: a boundary in the
+// first minute of uptime fires (the daemon was up for it), a boundary before
+// boot does not.
+func TestBackupScheduler_observeAllAtBoot(t *testing.T) {
+	b, reg, sup := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, console.BackupMethodRefresh)
+	b.observeAll(time.Date(2026, 8, 28, 8, 59, 40, 0, time.UTC))
+	b.tick(context.Background(), time.Date(2026, 8, 28, 9, 0, 40, 0, time.UTC))
+	if st := sup.RefreshStatus(e.ID); st.State == "idle" {
+		t.Fatal("a boundary in the first minute of uptime did not fire")
+	}
+	waitTerminal(t, b, e.ID)
 }
 
 // A slot the daemon's clock moved past while it was down is not replayed:
@@ -149,7 +216,8 @@ func TestBackupScheduler_missedSlotsAreNotReplayed(t *testing.T) {
 	b, reg, sup := newScheduleFixture(t, true)
 	e := addScheduled(t, reg, console.BackupMethodRefresh)
 	// "Boot" hours after several slots went by.
-	b.tick(context.Background(), time.Date(2026, 8, 28, 14, 59, 0, 0, time.UTC))
+	b.observeAll(time.Date(2026, 8, 28, 14, 59, 0, 0, time.UTC))
+	b.tick(context.Background(), time.Date(2026, 8, 28, 14, 59, 30, 0, time.UTC))
 	if st := sup.RefreshStatus(e.ID); st.State != "idle" {
 		t.Fatalf("a slot from before boot was replayed: %+v", st)
 	}
@@ -171,32 +239,95 @@ func TestBackupScheduler_fireStampsTheTrigger(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			t0 := time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC)
-			b.tick(context.Background(), t0)
-			b.tick(context.Background(), t0.Add(time.Hour))
-			run := waitScheduled(t, sup, e.ID)
+			fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+			st := waitTerminal(t, b, e.ID)
+			run, _ := sup.history.LastScheduled(e.ID)
 			wantKind := console.BaselineRunDump
 			if method == console.BackupMethodRefresh {
 				wantKind = console.BaselineRunRefresh
 			}
-			if run.Kind != wantKind || run.Trigger != console.BaselineRunTriggerScheduled {
+			if run == nil || run.Kind != wantKind || run.Trigger != console.BaselineRunTriggerScheduled {
 				t.Fatalf("record = %+v, want kind %s stamped scheduled", run, wantKind)
 			}
 			if run.Error == "" {
 				t.Fatal("the fixture was supposed to fail fast; it reports success, so the assertion above may be vacuous")
 			}
 			// And the in-memory view agrees, with the job's terminal state.
-			st := b.ScheduleState(e.ID)
-			if st.Running || st.Last == nil || st.Last.State != "failed" || st.LastMethod != method {
+			if st.Last.State != "failed" || st.LastMethod != method {
 				t.Fatalf("ScheduleState = %+v, want the failed job attributed to the schedule", st)
 			}
 		})
 	}
 }
 
+// The scheduled rebuild carries the effective reuse setting: the console's
+// saved override over the daemon flag, the same resolution the refresh loop
+// and a restore use. Hardcoding either value in fire compiled and passed.
+func TestBackupScheduler_rebuildCarriesTheEffectiveCarryForward(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		t.Run(map[bool]string{true: "override on", false: "override off"}[want], func(t *testing.T) {
+			b, reg, sup := newScheduleFixture(t, true)
+			b.carryDefault = !want // the flag says the opposite; the override must win
+			if err := reg.SetBaselineRefresh(&console.BaselineRefreshConfig{CarryForwardUnchanged: want}); err != nil {
+				t.Fatal(err)
+			}
+			e := addScheduled(t, reg, console.BackupMethodRefresh)
+			writeFakeSnapshot(t, e.BaselineDir)
+			var mu sync.Mutex
+			var got []bool
+			prev := foldTables
+			foldTables = func(_ context.Context, cfg reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+				mu.Lock()
+				got = append(got, cfg.CarryForwardUnchanged)
+				mu.Unlock()
+				return nil, nil, errors.New("seam")
+			}
+			fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+			waitTerminal(t, b, e.ID)
+			foldTables = prev // only after the job is terminal: the seam is read from its goroutine
+			_ = sup
+			mu.Lock()
+			defer mu.Unlock()
+			if len(got) != 1 || got[0] != want {
+				t.Fatalf("fold config CarryForwardUnchanged = %v, want [%v]", got, want)
+			}
+		})
+	}
+}
+
+// A scheduled job that PANICS reaches the page: the guard flips the slot to
+// failed with the panic value, the loop attributes it, and the copy it keeps
+// survives a later manual job taking the slot, which is the case the history
+// cannot cover (the guard writes no record, by design).
+func TestBackupScheduler_panickedJobStaysVisible(t *testing.T) {
+	b, reg, sup := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, console.BackupMethodRefresh)
+	writeFakeSnapshot(t, e.BaselineDir)
+	prev := foldTables
+	foldTables = func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		panic("boom")
+	}
+	fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+	st := waitTerminal(t, b, e.ID)
+	foldTables = prev
+	if st.Last.State != "failed" || !strings.Contains(st.Last.LastError, "boom") {
+		t.Fatalf("panicked job = %+v, want failed with the panic value", st.Last)
+	}
+	if run, _ := sup.history.LastScheduled(e.ID); run != nil {
+		t.Fatalf("the guard wrote a history record (%+v); this test assumes it does not, so the in-memory copy is the only evidence", run)
+	}
+	// A later manual rebuild overwrites the slot. The schedule's outcome
+	// must not vanish with it.
+	sup.refreshes[e.ID] = &console.BaselineStatus{State: "running", Since: "2099-01-01T00:00:00Z"}
+	st = b.ScheduleState(e.ID)
+	if st.Running || st.Last == nil || !strings.Contains(st.Last.LastError, "boom") {
+		t.Fatalf("after a manual job took the slot: %+v, want the kept failure, not running", st)
+	}
+}
+
 // The collision the issue names: another backup job holds the server at the
 // scheduled time. The slot is skipped, not queued, and the skip is written
-// to the history so the page can show it.
+// to the history AND kept in memory so the page can show it either way.
 func TestBackupScheduler_collisionSkipsAndRecords(t *testing.T) {
 	b, reg, sup := newScheduleFixture(t, true)
 	e := addScheduled(t, reg, console.BackupMethodFull)
@@ -214,9 +345,19 @@ func TestBackupScheduler_collisionSkipsAndRecords(t *testing.T) {
 	if skip.FinishedAt != now.Format(time.RFC3339) {
 		t.Fatalf("skip stamped %s, want the slot's tick %s", skip.FinishedAt, now.Format(time.RFC3339))
 	}
+	st := b.ScheduleState(e.ID)
+	if st.LastSkippedAt != skip.FinishedAt || st.LastSkipReason != skip.SkipReason {
+		t.Fatalf("in-memory skip = %+v, want the same slot and reason as the history", st)
+	}
 	// The manual job that was already running is not reported as ours.
-	if st := b.ScheduleState(e.ID); st.Running || st.Last != nil {
+	if st.Running || st.Last != nil {
 		t.Fatalf("a manual job in flight was reported as the schedule's: %+v", st)
+	}
+	// Without a history the skip is still on record in memory.
+	sup.history = nil
+	b.tick(context.Background(), now.Add(time.Hour))
+	if st := b.ScheduleState(e.ID); st.LastSkippedAt != now.Add(time.Hour).Format(time.RFC3339) {
+		t.Fatalf("with no history the skip was lost: %+v", st)
 	}
 }
 
@@ -237,9 +378,7 @@ func TestBackupScheduler_fullBackupNeedsTheOptIn(t *testing.T) {
 			b, reg, sup := newScheduleFixture(t, tc.opt)
 			sup.configErr = tc.cfg
 			e := addScheduled(t, reg, console.BackupMethodFull)
-			now := time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC)
-			b.tick(context.Background(), now.Add(-time.Hour))
-			b.tick(context.Background(), now)
+			fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
 			if st := sup.Status(e.ID); st.State != "idle" {
 				t.Fatalf("a dump was started: %+v", st)
 			}
@@ -251,27 +390,40 @@ func TestBackupScheduler_fullBackupNeedsTheOptIn(t *testing.T) {
 	}
 }
 
-// A removed schedule is forgotten, so re-adding one starts silent.
+// A removed schedule is forgotten (observation, warning, last run and last
+// skip), so re-adding one starts silent and reports nothing stale.
 func TestBackupScheduler_removedScheduleIsForgotten(t *testing.T) {
 	b, reg, sup := newScheduleFixture(t, true)
 	e := addScheduled(t, reg, console.BackupMethodRefresh)
 	t0 := time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC)
-	b.tick(context.Background(), t0)
+	fireAt(b, t0)
+	waitTerminal(t, b, e.ID)
+	b.skipped[e.ID] = scheduledSkip{at: "x", reason: "y"}
+	b.warned[e.ID] = true
 	e.BackupSchedule = nil
 	if err := reg.Update(e); err != nil {
 		t.Fatal(err)
 	}
-	b.tick(context.Background(), t0.Add(time.Hour))
+	b.tick(context.Background(), t0.Add(2*time.Hour))
 	if _, ok := b.seen[e.ID]; ok {
-		t.Fatal("a server with no schedule is still tracked")
+		t.Fatal("a server with no schedule is still observed")
 	}
-	e.BackupSchedule = &console.BackupSchedule{Every: "1h"}
+	if st := b.ScheduleState(e.ID); st.Last != nil || st.LastStartedAt != "" || st.LastSkippedAt != "" {
+		t.Fatalf("a removed schedule still reports state: %+v", st)
+	}
+	if b.warned[e.ID] {
+		t.Fatal("the warn-once mark outlived the schedule")
+	}
+	// Re-added with the SAME identity, between ticks: still a first
+	// observation, so the tick two hours on records and does not fire.
+	e.BackupSchedule = &console.BackupSchedule{Every: "1h", At: "00:00", Method: console.BackupMethodRefresh}
 	if err := reg.Update(e); err != nil {
 		t.Fatal(err)
 	}
-	b.tick(context.Background(), t0.Add(2*time.Hour))
-	if st := sup.RefreshStatus(e.ID); st.State != "idle" {
-		t.Fatalf("a re-added schedule fired on first sight: %+v", st)
+	before := sup.RefreshStatus(e.ID)
+	b.tick(context.Background(), t0.Add(3*time.Hour))
+	if after := sup.RefreshStatus(e.ID); after.Since != before.Since || sup.Status(e.ID).State != "idle" {
+		t.Fatalf("a re-added schedule fired on first sight: %+v", after)
 	}
 }
 
@@ -300,7 +452,8 @@ func TestScheduledRuns_stampTheTrigger(t *testing.T) {
 
 // Attribution is by the exact Since the supervisor stamped on the job the
 // loop started. A job of the same kind that began before it, or a manual one
-// that took the slot after it finished, is not the schedule's, in any state.
+// that took the slot after it finished, is not the schedule's, in any state;
+// the schedule's own outcome, once observed, outlives the slot.
 func TestBackupScheduler_attributesOnlyTheJobItStarted(t *testing.T) {
 	b, _, sup := newScheduleFixture(t, true)
 	b.started["a"] = scheduledStart{method: console.BackupMethodRefresh, at: "2026-08-28T09:00:00Z", since: "2026-08-28T09:00:00Z"}
@@ -313,25 +466,27 @@ func TestBackupScheduler_attributesOnlyTheJobItStarted(t *testing.T) {
 	if st := b.ScheduleState("a"); st.Running || st.Last == nil || st.Last.LastError != "capture gap" {
 		t.Fatalf("the finished job's outcome did not reach the state: %+v", st)
 	}
-	// A dump running is not the rebuild the schedule started.
+	// A dump running is not the rebuild the schedule started; the kept
+	// outcome is still reported.
 	sup.jobs["a"] = &console.BaselineStatus{State: "running", Since: "2026-08-28T09:00:00Z"}
-	if st := b.ScheduleState("a"); st.Running {
-		t.Fatal("a manual dump was reported as the scheduled rebuild")
+	if st := b.ScheduleState("a"); st.Running || st.Last == nil || st.Last.LastError != "capture gap" {
+		t.Fatalf("a manual dump changed the schedule's reported outcome: %+v", st)
 	}
 	// Same kind, later job: the manual Create backup after the scheduled
-	// one finished. Neither running nor its outcome is the schedule's.
-	b.started["a"] = scheduledStart{method: console.BackupMethodFull, at: "2026-08-28T10:00:00Z", since: "2026-08-28T10:00:00Z"}
-	sup.jobs["a"] = &console.BaselineStatus{State: "running", Since: "2026-08-28T11:00:00Z"}
-	if st := b.ScheduleState("a"); st.Running || st.Last != nil {
-		t.Fatalf("a later manual dump was reported as the schedule's: %+v", st)
+	// one finished. Not running, and the kept outcome stays.
+	sup.refreshes["a"] = &console.BaselineStatus{State: "running", Since: "2026-08-28T11:00:00Z"}
+	if st := b.ScheduleState("a"); st.Running || st.Last == nil || st.Last.LastError != "capture gap" {
+		t.Fatalf("a later manual job was reported as the schedule's, or erased its outcome: %+v", st)
 	}
-	// Same kind, earlier job (the slot was skipped): not ours either.
-	sup.jobs["a"] = &console.BaselineStatus{State: "running", Since: "2026-08-28T09:30:00Z"}
-	if st := b.ScheduleState("a"); st.Running || st.Last != nil {
+	// Same kind, earlier job (the slot was skipped): never ours, and with
+	// nothing kept there is nothing to report.
+	b.started["b"] = scheduledStart{method: console.BackupMethodFull, at: "2026-08-28T10:00:00Z", since: "2026-08-28T10:00:00Z"}
+	sup.jobs["b"] = &console.BaselineStatus{State: "running", Since: "2026-08-28T09:30:00Z"}
+	if st := b.ScheduleState("b"); st.Running || st.Last != nil {
 		t.Fatalf("a dump that began before the scheduled slot was reported as the schedule's: %+v", st)
 	}
-	sup.jobs["a"] = &console.BaselineStatus{State: "running", Since: "2026-08-28T10:00:00Z"}
-	if st := b.ScheduleState("a"); !st.Running {
+	sup.jobs["b"] = &console.BaselineStatus{State: "running", Since: "2026-08-28T10:00:00Z"}
+	if st := b.ScheduleState("b"); !st.Running {
 		t.Fatal("the scheduled dump in flight is not reported running")
 	}
 	if st := b.ScheduleState("never"); st.Running || st.LastStartedAt != "" || st.Last != nil {
@@ -347,6 +502,7 @@ func TestBackupScheduler_runningAfterARealFire(t *testing.T) {
 	b, reg, sup := newScheduleFixture(t, true)
 	e := addScheduled(t, reg, console.BackupMethodFull)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
 	entered := make(chan struct{}, 1)
 	prev := checkMydumperPrivileges
 	checkMydumperPrivileges = func(ctx context.Context, dsn string, mode baseline.LockMode, remedy mydumperlock.Remedy, schemas []string) error {
@@ -354,10 +510,17 @@ func TestBackupScheduler_runningAfterARealFire(t *testing.T) {
 		<-release
 		return errors.New("held by the test")
 	}
-	t.Cleanup(func() { checkMydumperPrivileges = prev })
-	t0 := time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC)
-	b.tick(context.Background(), t0)
-	b.tick(context.Background(), t0.Add(time.Hour))
+	// On every exit: let the job go, wait for it, THEN restore the seam.
+	// Restoring while the goroutine may still read it is a data race.
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		deadline := time.Now().Add(10 * time.Second)
+		for b.ScheduleState(e.ID).Running && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		checkMydumperPrivileges = prev
+	})
+	fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
@@ -366,24 +529,14 @@ func TestBackupScheduler_runningAfterARealFire(t *testing.T) {
 	if st := b.ScheduleState(e.ID); !st.Running || st.Last == nil {
 		t.Fatalf("in flight: ScheduleState = %+v, want running and attributed", st)
 	}
-	close(release)
-	run := waitScheduled(t, sup, e.ID)
-	if !strings.Contains(run.Error, "held by the test") {
-		t.Fatalf("record = %+v, want the seam's error", run)
+	releaseOnce.Do(func() { close(release) })
+	st := waitTerminal(t, b, e.ID)
+	if st.Last.State != "failed" {
+		t.Fatalf("finished: ScheduleState = %+v, want failed", st)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		st := b.ScheduleState(e.ID)
-		if st.Last != nil && !st.Running {
-			if st.Last.State != "failed" {
-				t.Fatalf("finished: ScheduleState = %+v, want failed", st)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the job never reached a terminal state in the loop's view: %+v", st)
-		}
-		time.Sleep(10 * time.Millisecond)
+	run, _ := sup.history.LastScheduled(e.ID)
+	if run == nil || !strings.Contains(run.Error, "held by the test") {
+		t.Fatalf("record = %+v, want the seam's error", run)
 	}
 }
 
@@ -448,8 +601,8 @@ func TestNewBackupScheduleReporter_nilSupervisorIsANilInterface(t *testing.T) {
 	if enabled, refusal := rep.FullBackups(); !enabled || refusal != nil {
 		t.Fatalf("FullBackups = (%v, %v), want the opt-in carried through", enabled, refusal)
 	}
-	rep, _ = newBackupScheduleReporter(sup, reg, false, false)
-	if enabled, _ := rep.FullBackups(); enabled {
-		t.Fatal("the opt-in flag was not carried through")
+	rep, sched = newBackupScheduleReporter(sup, reg, false, true)
+	if enabled, _ := rep.FullBackups(); enabled || !sched.carryDefault {
+		t.Fatal("the two flags were not carried through in order")
 	}
 }

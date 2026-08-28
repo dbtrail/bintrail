@@ -100,7 +100,11 @@ func (s *Server) backupScheduleDTO(e ServerEntry, now time.Time) *backupSchedule
 	} else {
 		dto.Runnable = true
 	}
-	dto.HistoryUnavailable = s.baselineHistory == nil
+	// Unavailable means a daemon that runs the loop could not open its
+	// history, not a process that never has one (serve, a watch with every
+	// backup feature off): those report the schedule as not runnable and
+	// have no runs to show.
+	dto.HistoryUnavailable = s.backupSchedules != nil && s.baselineHistory == nil
 	if s.baselineHistory != nil {
 		run, skip := s.baselineHistory.LastScheduled(e.ID)
 		if run != nil {
@@ -119,6 +123,11 @@ func (s *Server) backupScheduleDTO(e ServerEntry, now time.Time) *backupSchedule
 		// job is never older than LastStartedAt.
 		if st.Last != nil && !st.Running && (dto.LastRun == nil || dto.LastRun.StartedAt < st.LastStartedAt) {
 			dto.LastRun = scheduleRunFromStatus(st)
+		}
+		// Same rule for the skip: the loop's stamp is the tick's instant,
+		// the history's FinishedAt for the same skip is that same stamp.
+		if st.LastSkippedAt != "" && (dto.LastSkipped == nil || dto.LastSkipped.At < st.LastSkippedAt) {
+			dto.LastSkipped = &backupScheduleSkipDTO{At: st.LastSkippedAt, Reason: st.LastSkipReason}
 		}
 	}
 	return dto
@@ -144,13 +153,21 @@ func scheduleRunFromRecord(run *BaselineRunRecord) *backupScheduleRunDTO {
 // still "running" is not a run yet, and the caller does not pass one.
 func scheduleRunFromStatus(st BackupScheduleState) *backupScheduleRunDTO {
 	cur := st.Last
+	ok := cur.State == "succeeded"
+	var snapshot string
+	if ok {
+		// At is stamped when a rebuild STARTS and survives a failure, so it
+		// names a snapshot only once the run published one. The history
+		// path applies the same rule (publishedSnapshotTime).
+		snapshot = cur.At
+	}
 	return &backupScheduleRunDTO{
 		Method:       st.LastMethod,
 		StartedAt:    st.LastStartedAt,
 		FinishedAt:   cur.FinishedAt,
-		OK:           cur.State == "succeeded",
+		OK:           ok,
 		Error:        cur.LastError,
-		SnapshotTime: cur.At,
+		SnapshotTime: snapshot,
 		Tables:       cur.Tables,
 		Rows:         cur.Rows,
 		Uploaded:     cur.Uploaded,
@@ -198,7 +215,12 @@ func (s *Server) handleBackupScheduleUpdate(w http.ResponseWriter, r *http.Reque
 		writeJSONError(w, registryErrStatus(err), err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"schedule": s.backupScheduleDTO(e, time.Now().UTC())})
+	// Observed at the instant it is saved, so the next_run this response
+	// reports is the slot that actually fires; the loop's own first tick may
+	// be up to a minute away.
+	now := time.Now().UTC()
+	s.backupSchedules.Observe(e.ID, sched, now)
+	writeJSON(w, http.StatusOK, map[string]any{"schedule": s.backupScheduleDTO(e, now)})
 }
 
 // handleBackupScheduleDelete serves DELETE /api/servers/{id}/backup-schedule.

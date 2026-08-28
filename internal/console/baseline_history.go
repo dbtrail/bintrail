@@ -220,7 +220,7 @@ func (h *BaselineRunHistory) AppendSkip(rec BaselineRunRecord) (bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	recs := h.servers[rec.ServerID]
-	if n := len(recs); n > 0 && recs[n-1].Trigger == BaselineRunTriggerScheduled &&
+	if n := len(recs); n > 0 && rec.SkipReason != "" && recs[n-1].Trigger == BaselineRunTriggerScheduled &&
 		recs[n-1].SkipReason == rec.SkipReason && recs[n-1].Kind == rec.Kind {
 		recs[n-1].FinishedAt = rec.FinishedAt
 		return false, h.save()

@@ -7,19 +7,24 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // stubScheduleReporter stands in for the watch daemon's schedule loop.
 type stubScheduleReporter struct {
-	full    bool
-	refusal error
-	state   map[string]BackupScheduleState
+	full     bool
+	refusal  error
+	state    map[string]BackupScheduleState
+	observed []string // "<id> <identity>" per Observe call
 }
 
 func (s *stubScheduleReporter) ScheduleState(id string) BackupScheduleState {
 	return s.state[id]
 }
 func (s *stubScheduleReporter) FullBackups() (bool, error) { return s.full, s.refusal }
+func (s *stubScheduleReporter) Observe(id string, sched BackupSchedule, _ time.Time) {
+	s.observed = append(s.observed, id+" "+sched.Identity())
+}
 
 // newScheduleServer builds a watch-shaped server with the schedule loop
 // present, a persisted history, and one registry server that can run either
@@ -67,7 +72,8 @@ func scheduleOf(t *testing.T, body []byte) *backupScheduleDTO {
 }
 
 func TestBackupScheduleAPI_saveListRemove(t *testing.T) {
-	srv, id := newScheduleServer(t, &stubScheduleReporter{full: true})
+	rep := &stubScheduleReporter{full: true}
+	srv, id := newScheduleServer(t, rep)
 	path := "/api/servers/" + id + "/backup-schedule"
 
 	rec, body := doServersReq(t, srv, "PUT", path, `{"every":"1d","at":"03:00","method":"backup"}`)
@@ -77,6 +83,11 @@ func TestBackupScheduleAPI_saveListRemove(t *testing.T) {
 	got := scheduleOf(t, body)
 	if got == nil || !got.Runnable || got.NextRun == "" || got.Every != "1d" || got.At != "03:00" || got.Method != BackupMethodFull {
 		t.Fatalf("PUT response = %+v", got)
+	}
+	// The loop is told at save time, with the normalized schedule, so the
+	// next_run this response promises is the slot that fires.
+	if len(rep.observed) != 1 || rep.observed[0] != id+" 1d|03:00|backup" {
+		t.Fatalf("Observe calls = %v, want one for the saved schedule", rep.observed)
 	}
 	if !strings.HasSuffix(got.NextRun, "T03:00:00Z") {
 		t.Fatalf("next_run %q is not on the 03:00 grid", got.NextRun)
@@ -133,7 +144,7 @@ func TestBackupScheduleAPI_refusals(t *testing.T) {
 		{"bad clock", `{"every":"1d","at":"3pm"}`, "HH:MM"},
 		{"bad method", `{"every":"1d","method":"snapshot"}`, "method"},
 		{"full backup with creation off", `{"every":"1d","method":"backup"}`, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1"},
-		{"not json", `{`, ""},
+		{"not json", `{`, "invalid JSON body"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -148,6 +159,9 @@ func TestBackupScheduleAPI_refusals(t *testing.T) {
 				t.Fatal("a refused schedule was saved anyway")
 			}
 		})
+	}
+	if n := len(srv.backupSchedules.(*stubScheduleReporter).observed); n != 0 {
+		t.Fatalf("a refused schedule was observed by the loop %d time(s)", n)
 	}
 	// A refresh schedule needs no creation opt-in.
 	if rec, body := doServersReq(t, srv, "PUT", path, `{"every":"1h","method":"refresh"}`); rec.Code != 200 {
@@ -288,12 +302,37 @@ func TestBackupScheduleAPI_lastRunFallsBackToTheLoop(t *testing.T) {
 		StartedAt: "2026-08-27T03:00:00Z", FinishedAt: "2026-08-27T03:04:00Z", Tables: 3}); err != nil {
 		t.Fatal(err)
 	}
-	rep.state[id] = BackupScheduleState{LastStartedAt: "2026-08-28T03:00:00Z", LastMethod: BackupMethodFull,
-		Last: &BaselineStatus{State: "failed", Since: "2026-08-28T03:00:00Z", FinishedAt: "2026-08-28T03:00:01Z", LastError: "panic: nil map"}}
+	// A REBUILD, with the anchor At the supervisor stamps at start: a failed
+	// run must not name it as a published snapshot.
+	rep.state[id] = BackupScheduleState{LastStartedAt: "2026-08-28T03:00:00Z", LastMethod: BackupMethodRefresh,
+		Last: &BaselineStatus{State: "failed", Since: "2026-08-28T03:00:00Z", At: "2026-08-28T03:00:00Z",
+			FinishedAt: "2026-08-28T03:00:01Z", LastError: "panic: nil map"}}
 	_, body := doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
 	got := scheduleOf(t, body)
 	if got.LastRun == nil || got.LastRun.OK || got.LastRun.Error != "panic: nil map" || got.LastRun.StartedAt != "2026-08-28T03:00:00Z" {
 		t.Fatalf("last_run = %+v, want the loop's newer failure", got.LastRun)
+	}
+	if got.LastRun.SnapshotTime != "" {
+		t.Fatalf("a failed rebuild named a snapshot it never published: %+v", got.LastRun)
+	}
+	rep.state[id].Last.State, rep.state[id].Last.LastError = "succeeded", ""
+	_, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
+	if got = scheduleOf(t, body); got.LastRun == nil || !got.LastRun.OK || got.LastRun.SnapshotTime != "2026-08-28T03:00:00Z" {
+		t.Fatalf("a succeeded rebuild did not name its snapshot: %+v", got.LastRun)
+	}
+	rep.state[id].Last.State, rep.state[id].Last.LastError = "failed", "panic: nil map"
+	// A skip only the loop knows about (history unavailable for it) shows
+	// too, and a newer one beats the history's.
+	if _, err := srv.baselineHistory.AppendSkip(BaselineRunRecord{ServerID: id, Kind: BaselineRunDump, SkipReason: "old",
+		StartedAt: "2026-08-26T03:00:00Z", FinishedAt: "2026-08-26T03:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	st := rep.state[id]
+	st.LastSkippedAt, st.LastSkipReason = "2026-08-29T03:00:00Z", "busy"
+	rep.state[id] = st
+	_, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
+	if got = scheduleOf(t, body); got.LastSkipped == nil || got.LastSkipped.Reason != "busy" {
+		t.Fatalf("last_skipped = %+v, want the loop's newer skip", got.LastSkipped)
 	}
 	// The same job once recorded: the record wins (it is not older).
 	if err := srv.baselineHistory.Append(BaselineRunRecord{ServerID: id, Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled,
@@ -308,8 +347,16 @@ func TestBackupScheduleAPI_lastRunFallsBackToTheLoop(t *testing.T) {
 	// the history is missing so the page does not claim "not run yet".
 	srv.baselineHistory = nil
 	_, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
-	if got = scheduleOf(t, body); !got.HistoryUnavailable || got.LastRun == nil || got.LastRun.Error != "panic: nil map" {
-		t.Fatalf("without a history = %+v, want history_unavailable and the loop's last run", got)
+	if got = scheduleOf(t, body); !got.HistoryUnavailable || got.LastRun == nil || got.LastRun.Error != "panic: nil map" ||
+		got.LastSkipped == nil || got.LastSkipped.Reason != "busy" {
+		t.Fatalf("without a history = %+v, want history_unavailable and the loop's last run and skip", got)
+	}
+	// A process that never has a history (no loop) is not "unavailable":
+	// it has nothing to show and says why the schedule is not runnable.
+	srv.backupSchedules = nil
+	_, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
+	if got = scheduleOf(t, body); got.HistoryUnavailable {
+		t.Fatalf("a process with no loop reported the history unavailable: %+v", got)
 	}
 }
 
