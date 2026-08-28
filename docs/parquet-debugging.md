@@ -130,6 +130,31 @@ Archive Parquet files contain 17 columns (the `pk_hash` stored generated column 
 
 ---
 
+## The archives are plain Parquet on purpose
+
+bintrail does not store its archives, baselines or index as an Apache Iceberg
+table, and that is a decision rather than a gap.
+
+The archive tier is a change log: the evidence that `recover`, `reconstruct`
+and the time-travel shim rebuild rows from. Iceberg describes the state of a
+table, which is a different object. Keeping the log as plain Parquet under
+`bintrail_id=/event_date=/event_hour=` lets DuckDB prune by path with no
+catalog service to run, and keeps every reader on the recovery path free of a
+table-format dependency. Moving the archives into a table format would be a
+one-way door for that path: every consumer (`query`, `recover`, `reconstruct`,
+the shim, `restore-index`, `archive reconcile`) would carry the format's
+assumptions from then on.
+
+An output can be added or dropped, so Iceberg is an output bintrail can
+write, not the storage it reads from. An incremental Iceberg export, so that
+Spark, Trino and Athena can read the current table state, is tracked in
+#1466. If you need Iceberg as the
+storage layer itself, open an issue with the concrete case. The decision is
+revisited on evidence: a use the export cannot serve, or a recovery-path
+benefit measured against the current layout.
+
+---
+
 ## Querying Local Parquet Files
 
 Archives written by `bintrail rotate --archive-dir` follow a Hive-partitioned directory layout:
