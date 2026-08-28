@@ -30,7 +30,7 @@ const composePath = "../docker-compose.yml"
 var consoleStateEnvVars = []string{
 	"BINTRAIL_CONSOLE_SERVERS",
 	"BINTRAIL_CONSOLE_AUTH",
-	"BINTRAIL_CONSOLE_MCP_TOKEN",
+	"BINTRAIL_CONSOLE_MCP_TOKEN_FILE",
 }
 
 var (
@@ -48,13 +48,23 @@ func TestComposeKeepsConsoleStateOnTheVolume(t *testing.T) {
 
 	// The writable state mount. A :ro mount of the same volume exists on
 	// another service; only a read-write one can hold state this daemon writes.
-	var mount string
+	var mounts []string
 	for _, line := range block {
 		m := composeStateMountRE.FindStringSubmatch(line)
 		if m == nil || m[2] == "ro" {
 			continue
 		}
-		mount = strings.TrimSuffix(m[1], "/")
+		mounts = append(mounts, strings.TrimSuffix(m[1], "/"))
+	}
+	// More than one writable mount of the same volume means the prefix below
+	// would be checked against whichever one this loop happened to keep, so
+	// refuse rather than pick.
+	if len(mounts) > 1 {
+		t.Fatalf("the bintrail service in %s mounts bintrail-state read-write at %v; this guard cannot say which one these paths must sit under", composePath, mounts)
+	}
+	var mount string
+	if len(mounts) == 1 {
+		mount = mounts[0]
 	}
 	if mount == "" {
 		t.Fatalf("the bintrail service in %s has no read-write bintrail-state mount; nothing it writes would survive a container recreation", composePath)

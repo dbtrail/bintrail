@@ -927,7 +927,7 @@ func resolveUpConsoleEnv(cmd *cobra.Command) error {
 		}
 	}
 	if !cmd.Flags().Changed("console-mcp-token-file") {
-		if v := os.Getenv("BINTRAIL_CONSOLE_MCP_TOKEN"); v != "" {
+		if v := os.Getenv("BINTRAIL_CONSOLE_MCP_TOKEN_FILE"); v != "" {
 			upConsoleMCPTokenFile = v
 		}
 	}

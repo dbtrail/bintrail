@@ -124,7 +124,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if !cmd.Flags().Changed("mcp-token-file") {
-		if v := os.Getenv("BINTRAIL_CONSOLE_MCP_TOKEN"); v != "" {
+		if v := os.Getenv("BINTRAIL_CONSOLE_MCP_TOKEN_FILE"); v != "" {
 			conMCPTokenFile = v
 		}
 	}

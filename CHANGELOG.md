@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that never had one looks like, so the daemon came up quiet and the AI client
   you had configured got a 401 on every call with no server-side explanation.
   The file now takes a path the same way the registry and the auth file
-  already did, `--mcp-token-file` / `BINTRAIL_CONSOLE_MCP_TOKEN` on
+  already did, `--mcp-token-file` / `BINTRAIL_CONSOLE_MCP_TOKEN_FILE` on
   `bintrail-console serve` and `--console-mcp-token-file` on `watch`, and the
   shipped `docker-compose.yml` points it at
   `/var/lib/bintrail/console-mcp-token.yaml` in the `bintrail-state` volume.

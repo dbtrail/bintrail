@@ -664,7 +664,7 @@ see the metrics tables and example alert rules in
 - `BINTRAIL_CONSOLE_BASELINE_S3` — same as `--baseline-s3`.
 - `BINTRAIL_CONSOLE_SERVERS` — same as `--servers-file`.
 - `BINTRAIL_CONSOLE_AUTH` — same as `--auth-file`.
-- `BINTRAIL_CONSOLE_MCP_TOKEN`: same as `--mcp-token-file`.
+- `BINTRAIL_CONSOLE_MCP_TOKEN_FILE`: same as `--mcp-token-file`.
 - `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
 - `BINTRAIL_CONSOLE_ALLOWED_HOSTS` — comma-separated, same as `--allowed-hosts`.
 - `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
@@ -1086,7 +1086,7 @@ Rules that differ from the standalone `bintrail-mcp` server:
   from Settings → Connect AI** (#1052) — one click from an authenticated
   browser session, no flags, no restart. The managed token is persisted as a
   SHA-256 hash only (`~/.config/bintrail/console-mcp-token.yaml`, or the
-  path given to `--mcp-token-file` / `BINTRAIL_CONSOLE_MCP_TOKEN`; `0600`,
+  path given to `--mcp-token-file` / `BINTRAIL_CONSOLE_MCP_TOKEN_FILE`; `0600`,
   atomic write, versioned envelope with the registry's read-only-if-newer
   contract), its plaintext is shown exactly once at generation, and it is
   **scoped to `/mcp` alone** — it cannot drive the browser API (registry
