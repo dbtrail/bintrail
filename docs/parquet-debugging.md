@@ -146,10 +146,13 @@ the shim, `restore-index`, `archive reconcile`) would carry the format's
 assumptions from then on.
 
 An output can be added or dropped, so Iceberg is an output bintrail can
-write, not the storage it reads from. An incremental Iceberg export, so that
-Spark, Trino and Athena can read the current table state, is tracked in
-#1466. If you need Iceberg as the
-storage layer itself, open an issue with the concrete case. The decision is
+write, not the storage it reads from. That output exists:
+[`bintrail export iceberg`](iceberg-export.md) writes each table's current
+state as an Iceberg table, incrementally, for DuckDB, Spark, Trino and
+Athena to read. It reads through the paths above and writes somewhere new;
+nothing on the recovery path links the Iceberg library, and a test fails if
+that changes. If you need Iceberg as the storage layer itself, open an issue
+with the concrete case. The decision is
 revisited on evidence: a use the export cannot serve, or a recovery-path
 benefit measured against the current layout.
 
