@@ -69,13 +69,9 @@ type AuthFile struct {
 var authFileMu sync.Mutex
 
 // DefaultAuthPath returns ~/.config/bintrail/console-auth.yaml, with the same
-// relative fallback as DefaultRegistryPath for homeless environments.
+// homeless fallback as DefaultRegistryPath (see configPath).
 func DefaultAuthPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".", ".config", "bintrail", "console-auth.yaml")
-	}
-	return filepath.Join(home, ".config", "bintrail", "console-auth.yaml")
+	return configPath("console-auth.yaml")
 }
 
 // LoadAuthFile reads the credential file at path. A missing file returns
@@ -205,8 +201,8 @@ func verifyAndMaybeRehash(path string, a *AuthFile, username, password string) b
 // (same class as the server registry). Callers hold authFileMu.
 func saveAuthFile(path string, a *AuthFile) error {
 	// Every error wraps the resolved path: in a homeless container the default
-	// resolves to an unwritable relative ./.config/... and the path is the
-	// only clue (e.g. a full-disk write needs to say WHERE).
+	// resolves outside the operator's home and the path is the only clue
+	// (e.g. a full-disk write needs to say WHERE).
 	data, err := yaml.Marshal(a)
 	if err != nil {
 		return fmt.Errorf("marshal console auth file %s: %w", path, err)

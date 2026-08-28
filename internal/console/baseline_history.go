@@ -144,9 +144,22 @@ func (h *BaselineRunHistory) List(serverID string) []BaselineRunRecord {
 func (h *BaselineRunHistory) save() error {
 	b, err := json.Marshal(baselineHistoryFile{Version: baselineHistoryVersion, Servers: h.servers})
 	if err != nil {
+		// The only step here whose failure names nothing on its own: every
+		// other one returns an *os.PathError/*os.LinkError already carrying
+		// the path, which is why they keep VerifyHistory.save's raw returns.
+		return fmt.Errorf("marshal baseline history %s: %w", h.path, err)
+	}
+	// Create the tree first, exactly as the sibling savers do (Registry.save,
+	// saveAuthFile, saveMCPTokenFile, VerifyHistory.save — this is
+	// VerifyHistory.save's shape, the closest relative). Nothing else creates
+	// ~/.config/bintrail on a fresh install, so without this the first refresh
+	// on a brand-new host loses its history to ENOENT (#1487). 0700 because
+	// the directory also holds the registry's DSN passwords.
+	dir := filepath.Dir(h.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(h.path), ".baseline-history-*")
+	tmp, err := os.CreateTemp(dir, ".baseline-history-*")
 	if err != nil {
 		return err
 	}

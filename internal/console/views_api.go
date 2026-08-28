@@ -36,6 +36,11 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
+		// The console has no --include-live and never sets LiveIndex, so the
+		// archives-only note must not tell this reader to "regenerate with a
+		// reachable index": they downloaded this file FROM a page served by
+		// that index, and regenerating gets them the same bytes.
+		LiveLegUnavailable: true,
 	}
 	var archiveErr error
 	in.ArchiveSources, archiveErr = consoleArchiveSources(ctx, b.db, portable)
