@@ -25,8 +25,8 @@ func TestParseDocRetain(t *testing.T) {
 // TestUpPreflightOutcome pins up's advisory semantics: a capacity-only FAIL
 // must not block boot but MUST surface the warning — losing either half would
 // silently change what blocks `up` or swallow the operator's only disk-full
-// signal. Reports are built from doctor's exported fields (Checks plus the
-// count fields Err reads) rather than the package-private add().
+// signal. Reports are built from doctor's exported fields (Checks, which Err
+// reads, plus the counters) rather than the package-private add().
 func TestUpPreflightOutcome(t *testing.T) {
 	clean := &doctor.Report{
 		Checks: []doctor.CheckResult{{Name: "log_bin enabled", Status: doctor.StatusPass}},

@@ -338,16 +338,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	if err := bp.ParseFile(fullPath, 0, handleEvent); err != nil {
 		return err
 	}
-	if gaps.count > 0 {
-		return fmt.Errorf(
-			"schema gap: %d row event(s) in %s were skipped because the schema snapshot is stale "+
-				"(first: %s) — these rows were NOT indexed. Run `bintrail snapshot` against the current "+
-				"schema and re-index this file (a failed file re-indexes from the start). This commonly "+
-				"follows a CREATE/ALTER TABLE within the file whose auto-snapshot landed too late for the "+
-				"buffered rows",
-			gaps.count, filename, gaps.first)
-	}
-	return nil
+	return gaps.err(filename)
 }
 
 // rewriteInnerHeader stamps a Transaction_payload inner event's header with
@@ -387,6 +378,35 @@ func firstPartialImage(skipped [][]int) []int {
 	}
 	return nil
 }
+
+// err is the file's fail-loud verdict once parsing ends: nil when nothing was
+// skipped, else a *SchemaGapError so the file is marked failed and usage
+// telemetry sees the same schema_mismatch class as the hard drift error —
+// both mean "the snapshot is stale".
+func (g *schemaGapTracker) err(filename string) error {
+	if g.count == 0 {
+		return nil
+	}
+	return &SchemaGapError{msg: fmt.Sprintf(
+		"schema gap: %d row event(s) in %s were skipped because the schema snapshot is stale "+
+			"(first: %s) — these rows were NOT indexed. Run `bintrail snapshot` against the current "+
+			"schema and re-index this file (a failed file re-indexes from the start). This commonly "+
+			"follows a CREATE/ALTER TABLE within the file whose auto-snapshot landed too late for the "+
+			"buffered rows",
+		g.count, filename, g.first)}
+}
+
+// SchemaGapError is the file-mode sibling of SchemaDriftError (#778): rows
+// were skipped because their table was absent from a stale snapshot, so the
+// file is failed rather than indexed with holes. Same root cause, same
+// usage-telemetry class (schema_mismatch); the message is for the operator
+// and never leaves the process.
+type SchemaGapError struct{ msg string }
+
+func (e *SchemaGapError) Error() string { return e.msg }
+
+// TelemetryClass implements telemetry.Classed.
+func (e *SchemaGapError) TelemetryClass() string { return "schema_mismatch" }
 
 // schemaGapTracker records recoverable schema gaps: rows skipped because their
 // table is absent from the snapshot or its column count diverged, for an event

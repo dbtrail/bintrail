@@ -97,8 +97,8 @@ preflight (`doctor`, `bintrail-pg doctor`, or `up` / `bintrail-console watch`
 refusing to boot) reports the class of what
 failed: `db_connection` when the source or the index could not be reached,
 `db_permission` for missing grants, index write access or schema access,
-`config_invalid` for a server setting (ROW format, row image, `log_bin`,
-retention) — and the `binlog_format` / `binlog_row_image` refusals that
+`config_invalid` for a server setting (ROW format, row image, `log_bin`) —
+and the `binlog_format` / `binlog_row_image` refusals that
 `stream`, `index --source-dsn` and `agent` run without the doctor in front
 report `config_invalid` too. A server
 identity conflict is `config_invalid`, `binlog_not_found` covers both the

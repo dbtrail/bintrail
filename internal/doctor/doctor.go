@@ -1252,9 +1252,13 @@ func (e *PreflightError) Error() string {
 // db_connection when the source or the index could not be reached,
 // db_permission for grants, index write access or schema access, internal
 // when a registered extension check panicked, and config_invalid for
-// everything else — binlog_format, row image, log_bin, retention, FK
-// cascades, an extension's own check: a server setting the operator has to
-// change. Precedence when several fail together: connection, then internal,
+// everything else — binlog_format, row image, log_bin, a malformed index DSN,
+// an extension's own check, and on standalone `doctor` (which excludes
+// nothing) the disk-capacity check: a setting the operator has to change.
+// Keyed on the check NAME, so a check whose probe query itself failed grades
+// as that check (config_invalid), not as the query's cause; an unreachable
+// source is caught by the connection check ahead of it. Precedence when
+// several fail together: connection, then internal,
 // then permission, then configuration — a connection failure is the root of
 // whatever failed after it (the index checks run in that order, so a
 // connect failure fails both the connection and the write-access check).

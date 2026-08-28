@@ -71,7 +71,7 @@ func TestPreflightErrorClassFollowsTheFailingChecks(t *testing.T) {
 		{"no schema access", []string{SchemaAccessCheckName}, telemetry.ClassDBPermission},
 		{"empty schema stays configuration", []string{"Schema visibility"}, telemetry.ClassConfigInvalid},
 		{"server variable", []string{"binlog_format=ROW"}, telemetry.ClassConfigInvalid},
-		{"retention", []string{"Binlog retention >= 2 days"}, telemetry.ClassConfigInvalid},
+		{"disk capacity on standalone doctor", []string{CapacityCheckName}, telemetry.ClassConfigInvalid},
 		{"extension check", []string{"Some extension check"}, telemetry.ClassConfigInvalid},
 		{"extension panic", []string{ExtensionPanicCheckName}, telemetry.ClassInternal},
 		{"panic beats grants and variables", []string{"log_bin enabled", ReplicationGrantsCheckName, ExtensionPanicCheckName}, telemetry.ClassInternal},

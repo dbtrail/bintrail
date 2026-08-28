@@ -300,8 +300,10 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	// server rejects as over max_allowed_packet) must not exit 0 and read as
 	// success to a cron/CI wrapper (#652). The per-file failure is already
 	// recorded as status='failed' in index_state. The first failure stays in
-	// the chain (%w) so a typed cause — the schema-drift or partial-row-image
-	// guard, an index-side server error, a missing binlog file — keeps its
+	// the chain (%w) so a typed cause — the schema-drift, schema-gap or
+	// partial-row-image guard, an index-side server error, an unreadable
+	// binlog file (a stat/open failure other than not-found, which the loop
+	// skips) — keeps its
 	// usage-telemetry class instead of collapsing to "unknown" behind a fresh
 	// summary error (#1503).
 	if failedFiles > 0 {
