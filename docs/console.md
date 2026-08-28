@@ -383,8 +383,12 @@ panel that answers whether a restore would work, far below the fold.
   server: how many tables it published, or that it published nothing and why.
   A refusal there is the fail-closed contract working (a capture gap, a schema
   change), not a broken daemon — nothing was overwritten and the next run
-  retries. The refresh is opt-in on its own: it does not require, and does not
-  enable, the **Create baseline** button.
+  retries. The partial files that run wrote are removed and the daemon log
+  names the directory either way, so a table that refuses every interval does
+  not fill the disk with unusable snapshot directories
+  ([details](dump-and-baseline.md#refreshing-on-a-schedule)). The refresh is
+  opt-in on its own: it does not require, and does not enable, the **Create
+  baseline** button.
 
 **Protect → Verification** carries the verification runner and the history of
 past runs for the selected server.
