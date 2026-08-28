@@ -156,9 +156,10 @@ func (s *schemaSnapshotSupervisor) Status(serverID string) console.SchemaSnapsho
 func (s *schemaSnapshotSupervisor) run(req console.SchemaSnapshotRequest, gen uint64) {
 	// This goroutine's own frames are the select below and publish, neither of
 	// which can reach the stream restart, so its report carries no capture
-	// caveat. failIfRunning rather than publish: a panic in a tail after
-	// publish already wrote must not restate a finished run.
-	defer recoverSnapshotJob(req, func(err error) { s.failIfRunning(req, gen, err) })
+	// caveat. It CAN fire while the inner goroutine is inside the restart, but
+	// that goroutine reports its own panic, so the caveat still travels with
+	// the panic that earned it.
+	defer recoverSnapshotJob(req, s.runPanicReporter(req, gen))
 
 	type outcome struct {
 		st  console.SchemaSnapshotStatus
@@ -170,22 +171,37 @@ func (s *schemaSnapshotSupervisor) run(req console.SchemaSnapshotRequest, gen ui
 		// cover this one, and believing it did is the mistake #1472's first
 		// attempt made.
 		//
-		// The panic is routed into the SAME channel a normal outcome uses, so
-		// run publishes it at once. Logging alone would leave run waiting out
-		// s.timeout and then reporting that the source did not answer: the
-		// daemon's own internal error, blamed on a metadata lock the source is
-		// not holding.
-		//
-		// The send cannot block: done is buffered for one value, and the
-		// ordinary send below can only have happened if execute returned,
-		// which it did not. If run has already given up (timeout, or
-		// shutdown) nobody reads this value and that outcome's text stands;
-		// the guard's error log is then the only record of what really
-		// happened.
+		// prog is written by execute and read here. Same goroutine, so it needs
+		// no synchronisation, and it is what lets the report name the half that
+		// died instead of hedging over both.
+		var prog executeProgress
 		defer recoverSnapshotJob(req, func(err error) {
-			done <- outcome{console.SchemaSnapshotStatus{}, fmt.Errorf("%w. %s", err, snapshotPanicCaptureNote)}
+			st, err := prog.panicOutcome(err)
+			// The panic is routed into the SAME channel a normal outcome uses,
+			// so run publishes it at once. Logging alone would leave run
+			// waiting out s.timeout and then reporting that the source did not
+			// answer: this daemon's own internal error, blamed on a metadata
+			// lock the source is not holding.
+			//
+			// Non-blocking on purpose. The send cannot fill the buffer today
+			// (the ordinary send below is reached only if execute returned,
+			// which it did not), but that is a property of a statement further
+			// down that a later edit could move, and blocking here would leak
+			// this goroutine AND lose the report.
+			select {
+			case done <- outcome{st, err}:
+			default:
+			}
+			// If run already gave up, nobody will read that value and its own
+			// timeout or shutdown text stands, which blames the source for what
+			// this daemon did. amendTerminalReport replaces it. Not closed: run
+			// leaving the select between the check inside amendTerminalReport
+			// and its own publish still lands the misleading text. That needs
+			// the panic to coincide with the deadline, unlike the reachable
+			// case this covers, where the slot went terminal minutes earlier.
+			s.amendTerminalReport(req, gen, st, err)
 		})
-		st, err := s.execute(req, gen)
+		st, err := s.execute(req, gen, &prog)
 		done <- outcome{st, err}
 	}()
 	select {
@@ -231,7 +247,9 @@ func (s *schemaSnapshotSupervisor) publish(req console.SchemaSnapshotRequest, ge
 // still running on the old one — so it is reported in its own field with the
 // state left "succeeded". Folding it into LastError would hide that the
 // snapshot itself worked and invite the operator to run it again.
-func (s *schemaSnapshotSupervisor) execute(req console.SchemaSnapshotRequest, gen uint64) (console.SchemaSnapshotStatus, error) {
+// prog records how far this got, for the panic guard in the caller's
+// goroutine. It may be nil for callers with no guard (tests).
+func (s *schemaSnapshotSupervisor) execute(req console.SchemaSnapshotRequest, gen uint64, prog *executeProgress) (console.SchemaSnapshotStatus, error) {
 	st := console.SchemaSnapshotStatus{State: "succeeded"}
 
 	stats, err := s.snapshotFn(req)
@@ -241,6 +259,11 @@ func (s *schemaSnapshotSupervisor) execute(req console.SchemaSnapshotRequest, ge
 	st.SnapshotID, st.Tables, st.ExcludedTables = stats.SnapshotID, stats.TableCount, stats.ExcludedTables
 	slog.Info("schema snapshot taken", "server", req.ServerName, "snapshot_id", stats.SnapshotID,
 		"tables", stats.TableCount, "excluded_tables", strings.Join(stats.ExcludedTables, ", "))
+	// Recorded only now: the snapshot is durable at this point, so a panic
+	// after this can say so instead of reporting the run as a total loss.
+	if prog != nil {
+		prog.taken = &st
+	}
 
 	if s.reload == nil {
 		st.ReloadError = notSupervisedNote
@@ -251,6 +274,12 @@ func (s *schemaSnapshotSupervisor) execute(req console.SchemaSnapshotRequest, ge
 		// stream now. Restarting it here would fight that one.
 		st.ReloadError = "this attempt was superseded by a newer one; capture was not restarted by it"
 		return st, nil
+	}
+	// Set immediately before the call, never cleared: from here on a panic may
+	// have left this server's capture cancelled, and that has to be reported
+	// whether it was raised inside the restart or after it returned.
+	if prog != nil {
+		prog.reloading = true
 	}
 	reloaded, err := s.reload(s.ctx, req.ServerID)
 	if err != nil {
@@ -282,16 +311,44 @@ func (s *schemaSnapshotSupervisor) superseded(serverID string, gen uint64) bool 
 	return s.gens[serverID] != gen
 }
 
-// snapshotPanicCaptureNote is appended to a panic reported from the goroutine
-// that also restarts the capture stream.
+// executeProgress records how far execute got before a panic, so the guard in
+// its goroutine can report WHICH half died.
 //
-// The guard cannot tell which half of execute raised it, and getting this
-// wrong in the confident direction is the dangerous one: a stream stopped
-// without anyone being told is silent data loss. So it states the possibility
-// and the one move that settles it, rather than a stage field execute does not
-// keep.
-const snapshotPanicCaptureNote = "This may have stopped capture for this server while restarting it. " +
-	"Check the server on the Overview page and press Start if capture is not running."
+// Both directions are wrong for an operator, not just one. Never warning about
+// capture would hide a stopped stream, which is silent data loss. But warning
+// on every panic, including the ones raised while reading the source's columns
+// with the restart not yet reached, is a false alarm on the one surface an
+// operator has to be able to trust in an incident, and a warning that cries
+// wolf is worse than none.
+type executeProgress struct {
+	// taken points at the snapshot half's result once that half is durable.
+	// nil means the snapshot did not finish, so nothing about it can be
+	// claimed.
+	taken *console.SchemaSnapshotStatus
+	// reloading records that the stream restart had begun.
+	reloading bool
+}
+
+// panicOutcome renders one recovered panic into the status and error the run
+// should report, in the operator's terms rather than the stack's.
+func (p executeProgress) panicOutcome(err error) (console.SchemaSnapshotStatus, error) {
+	if !p.reloading {
+		// The restart is not reached until after the snapshot returns, so this
+		// is a positive statement, not an absence of evidence.
+		return console.SchemaSnapshotStatus{}, fmt.Errorf("%w. Capture for this server was not touched", err)
+	}
+	// Reported as failed even though the snapshot is durable: an internal error
+	// is not a success. But the counts are carried, and the text says the
+	// snapshot is recorded, so nobody reads this as "the refresh did nothing"
+	// and goes hunting for a snapshot that is already there.
+	st := console.SchemaSnapshotStatus{}
+	if p.taken != nil {
+		st.SnapshotID, st.Tables, st.ExcludedTables = p.taken.SnapshotID, p.taken.Tables, p.taken.ExcludedTables
+	}
+	return st, fmt.Errorf("%w. The schema snapshot itself was taken and recorded. This happened while "+
+		"restarting capture for this server, which may have stopped it: open Manage servers and press "+
+		"Start if it is not running", err)
+}
 
 // recoverSnapshotJob is the panic guard BOTH schema-snapshot goroutines defer
 // as their first statement.
@@ -321,7 +378,7 @@ const snapshotPanicCaptureNote = "This may have stopped capture for this server 
 //
 // The log line claims only that the daemon survived. Whether CAPTURE survived
 // depends on where the panic was raised, which the guard cannot see; the
-// reported error covers that at the one call site than can reach the restart.
+// reported error covers that at the one call site that can reach the restart.
 //
 // SCOPE, because a recovered panic reads too easily as "and nothing else
 // happened": this contains the CRASH, not every side effect the panicking
@@ -347,21 +404,33 @@ func recoverSnapshotJob(req console.SchemaSnapshotRequest, report func(error)) {
 	report(fmt.Errorf("internal error: %v", r))
 }
 
+// runPanicReporter is the report half of run's guard, named so that a test can
+// drive the SAME closure production does. Inlining it at the defer left the two
+// interchangeable: substituting publish for failIfRunning there passed the whole
+// suite, because every test that reached failIfRunning built its own copy of
+// this closure instead of calling run's.
+func (s *schemaSnapshotSupervisor) runPanicReporter(req console.SchemaSnapshotRequest, gen uint64) func(error) {
+	return func(err error) { s.failIfRunning(req, gen, err) }
+}
+
 // failIfRunning is how the run goroutine's guard reports a panic: it moves this
 // run's status slot to "failed", which is what frees Trigger to accept a new
 // snapshot for this server.
 //
-// Two conditions, both load-bearing:
+// The generation check is load-bearing and drops a superseded run, exactly as
+// publish does: a newer Trigger has already reset the slot to "running", and a
+// stale guard must not fail the run that owns it now.
 //
-//   - The generation check drops a superseded run, exactly as publish does. A
-//     newer Trigger has already reset the slot to "running", and a stale guard
-//     must not fail the run that owns it now.
-//   - The still-running check keeps a panic raised in a run's TAIL from
-//     restating an outcome that already published. publish writes the terminal
-//     state inside the same locked region it logs from, so without this a
-//     panic there would turn a snapshot that really was taken into a failure
-//     and send the operator to re-run something that worked. Wedge-safety does
-//     not need it: a terminal state already frees Trigger.
+// The still-running check is defensive rather than live. It exists so a panic
+// raised in a run's TAIL cannot restate an outcome that already published, and
+// the sibling guard in baseline_job_guard.go needs exactly that, because those
+// jobs write their terminal state and THEN log from the same locked region. In
+// THIS file publish logs first and writes the map last, and its log sits inside
+// `if err != nil`, so no reachable panic site leaves this slot terminal with a
+// matching generation. Keep it anyway: it is one comparison, and it is what
+// makes adding a step after publish safe. Do not read it as covering a hazard
+// that exists here today. Wedge-safety never needed it: a terminal state
+// already frees Trigger.
 //
 // The panic value is scrubbed like any other reported error. A driver panic can
 // carry the whole connection string, and this string is served over HTTP.
@@ -378,4 +447,37 @@ func (s *schemaSnapshotSupervisor) failIfRunning(req console.SchemaSnapshotReque
 	st.State = "failed"
 	st.LastError = config.ScrubDSNError(err, req.SourceDSN, req.IndexDSN)
 	st.FinishedAt = nowStamp()
+}
+
+// amendTerminalReport replaces an already-published outcome with the panic that
+// really ended this run.
+//
+// It exists for one reachable shape: the snapshot half outlives s.timeout, run
+// publishes "the source did not answer within 10m; it may be holding a metadata
+// lock", and only afterwards does the work panic. Without this the operator is
+// told the source is stuck when the daemon is the one that broke, and the
+// capture consequence, the one thing this guard exists to surface, is dropped
+// with the unread channel value.
+//
+// Overwriting a terminal state is safe HERE and nowhere else, which is why this
+// is not failIfRunning's job: it runs only from the execute goroutine's guard,
+// which fires only when execute did NOT return, so no run of this generation
+// can have published a success for it to destroy. The generation check still
+// applies, because a newer Trigger owns the slot after a retry.
+func (s *schemaSnapshotSupervisor) amendTerminalReport(req console.SchemaSnapshotRequest, gen uint64, st console.SchemaSnapshotStatus, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gens[req.ServerID] != gen {
+		return
+	}
+	prev := s.jobs[req.ServerID]
+	if prev == nil || prev.State == "running" {
+		// run has not published yet, so the channel send above is the report
+		// and this must not race it.
+		return
+	}
+	st.State = "failed"
+	st.LastError = config.ScrubDSNError(err, req.SourceDSN, req.IndexDSN)
+	st.Since, st.FinishedAt = prev.Since, nowStamp()
+	s.jobs[req.ServerID] = &st
 }
