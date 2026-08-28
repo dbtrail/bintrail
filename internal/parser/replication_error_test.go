@@ -20,6 +20,11 @@ func TestWrapReplicationError(t *testing.T) {
 	if got := WrapReplicationError(plain); got != plain {
 		t.Fatalf("a non-server error must pass through unchanged, got %T", got)
 	}
+	var typedNil *gomysql.MyError
+	nilInChain := fmt.Errorf("sync: %w", typedNil)
+	if got := WrapReplicationError(nilInChain); got != nilInChain {
+		t.Fatalf("a typed-nil *MyError in the chain must pass through, got %T", got)
+	}
 
 	src := &gomysql.MyError{Code: 1236, Message: "Could not find first log file name in binary log index file", State: "HY000"}
 	wrapped := WrapReplicationError(fmt.Errorf("sync: %w", src))

@@ -1196,6 +1196,10 @@ const (
 	PGSourceConnectionCheckName = "Source PostgreSQL connection"
 	ReplicationGrantsCheckName  = "REPLICATION SLAVE + CLIENT grants"
 	IndexWriteAccessCheckName   = "Index write access"
+	// ExtensionPanicCheckName is the FAIL cliapp records when a registered
+	// extension check panics: a bug, not a setting, so it classifies as
+	// internal.
+	ExtensionPanicCheckName = "extension doctor checks"
 )
 
 // PreflightError is the typed form of "N preflight check(s) failed", so a
@@ -1220,26 +1224,39 @@ func (e *PreflightError) Error() string {
 // checks failed rather than reporting every refusal as one bucket: a
 // preflight that could not reach the source or the index is db_connection,
 // one refused for grants or index write access is db_permission, and
-// anything else — binlog_format, row image, log_bin, retention, FK cascades,
-// an extension's check — is config_invalid, a server setting the operator
-// has to change. Precedence when several fail together: connection, then
-// permission, then configuration — a connection failure is the root of
+// a panicking extension check is internal, and anything else —
+// binlog_format, row image, log_bin, retention, FK cascades, an extension's
+// own check — is config_invalid, a server setting the operator has to
+// change. Precedence when several fail together: connection, then internal,
+// then permission, then configuration — a connection failure is the root of
 // whatever failed after it (the index checks run in that order, so a
 // connect failure fails both the connection and the write-access check).
 // One imprecision is deliberate: the connection checks record a wrong
 // password as a connection failure (the cause is stringified into Detail),
 // so db_connection here reads as "could not connect as configured".
 func (e *PreflightError) TelemetryClass() string {
-	class := "config_invalid"
+	best, bestRank := "config_invalid", 0
 	for _, name := range e.Checks {
-		switch name {
-		case SourceConnectionCheckName, IndexConnectionCheckName, PGSourceConnectionCheckName:
-			return "db_connection"
-		case ReplicationGrantsCheckName, IndexWriteAccessCheckName:
-			class = "db_permission"
+		class, rank := checkClass(name)
+		if rank > bestRank {
+			best, bestRank = class, rank
 		}
 	}
-	return class
+	return best
+}
+
+// checkClass maps a failing check's name to its telemetry class and the
+// class's precedence (higher wins when several checks fail together).
+func checkClass(name string) (string, int) {
+	switch name {
+	case SourceConnectionCheckName, IndexConnectionCheckName, PGSourceConnectionCheckName:
+		return "db_connection", 3
+	case ExtensionPanicCheckName:
+		return "internal", 2
+	case ReplicationGrantsCheckName, IndexWriteAccessCheckName:
+		return "db_permission", 1
+	}
+	return "config_invalid", 0
 }
 
 // failingNames lists the names of the checks in StatusFail that are not in
