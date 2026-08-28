@@ -13,8 +13,9 @@ import (
 // Backup schedule (#1442): a per-server timer for the two ways this daemon can
 // produce a backup unattended. Stored on the server's registry entry, edited
 // from the Backups page, and consumed by the watch daemon's schedule loop,
-// which re-reads the registry every tick so a saved schedule applies without
-// a restart.
+// which reads the registry every tick so a schedule saved from the page
+// applies without a restart. (The registry is in memory once loaded: a
+// schedule typed into the file by hand is seen after the next start.)
 //
 // The grid is FIXED, not relative to the last run: slots sit at
 // epoch + At + k*Every for every integer k. "every 1d at 03:00" is 03:00 UTC
@@ -39,9 +40,9 @@ const (
 
 // BackupScheduleMinEvery is the shortest interval a schedule accepts. A full
 // backup every few minutes is a footgun on the source, and a rebuild that
-// often is one on the disk (nothing the daemon publishes is pruned on its
-// own); the floor is generous enough for every real cadence and low enough
-// to try the feature out.
+// often is one on the disk (a rebuild's output is never uploaded, so
+// retention cannot reclaim it); the floor is generous enough for every real
+// cadence and low enough to try the feature out.
 const BackupScheduleMinEvery = 15 * time.Minute
 
 // backupScheduleMinEveryText is the floor as an operator types it, for the
@@ -56,13 +57,27 @@ type BackupSchedule struct {
 	// Every is the interval: Nm, Nh or Nd (cliutil.ParseInterval).
 	Every string `yaml:"every"`
 	// At is the UTC clock time the grid is aligned to, HH:MM. Empty means
-	// 00:00. For a daily or longer interval it is the time of day the backup
-	// runs; for a shorter one it is the minute the slots line up on.
+	// 00:00. For whole days (1d, 7d) it is the time of day the backup runs;
+	// for an interval that divides a day (6h, 15m) it is the alignment of the
+	// slots; an interval that does not divide a day evenly (5h, 36h) drifts
+	// through the day, and the page shows the next run so that is visible.
 	At string `yaml:"at,omitempty"`
 	// Method is BackupMethodFull or BackupMethodRefresh. Empty means full.
 	Method string `yaml:"method,omitempty"`
 	// Extra preserves future keys the way ServerEntry.Extra does.
 	Extra map[string]any `yaml:",inline"`
+}
+
+// Identity is the schedule as a comparable string (every|at|method, with the
+// defaults resolved), for a consumer that must notice a CHANGED schedule: the
+// loop treats an edit as a new schedule, so the "first observation is silent"
+// rule covers edits the way it covers adds. Unparseable schedules identify
+// by their raw fields.
+func (b BackupSchedule) Identity() string {
+	if n, err := b.Normalized(); err == nil {
+		return n.Every + "|" + n.At + "|" + n.Method
+	}
+	return b.Every + "|" + b.At + "|" + b.Method
 }
 
 // ParsedBackupSchedule is a validated schedule, ready for slot arithmetic.
@@ -192,8 +207,16 @@ func RefusalReason(err error) string {
 	return err.Error()
 }
 
+// The refusal texts the checker and the schedule endpoints share, so a saved
+// schedule is reported with the same words a write is refused with.
+const (
+	scheduleRefusalReadOnly = "scheduled backups run in the watch daemon (bintrail-console watch), not the read-only console"
+	scheduleRefusalNoLoop   = "backup features are turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no --baseline-refresh-interval), so nothing can run a schedule"
+	scheduleRefusalNoDumps  = "creating backups from the console is turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1); a schedule can still rebuild from the change history"
+)
+
 // BackupScheduleGates is what the daemon can do, as the schedule checker
-// needs to know it. Both flags are boot-time facts of the process.
+// needs to know it. All of it is decided at boot.
 type BackupScheduleGates struct {
 	// LoopRunning: this process runs the schedule loop at all (a watch daemon
 	// with a baseline supervisor).
@@ -201,6 +224,11 @@ type BackupScheduleGates struct {
 	// FullBackups: this process may take full backups from the source (the
 	// baseline-creation opt-in). A refresh schedule does not need it.
 	FullBackups bool
+	// FullBackupsErr, when set, is why a full backup cannot START even with
+	// the opt-in on: the lock-mode misconfiguration the supervisor refuses
+	// every MySQL dump with. Reported as the reason so a schedule does not
+	// show a next run it can never keep.
+	FullBackupsErr string
 	// ReadOnlyConsole: this process is the standalone `serve` console, which
 	// runs no loop of any kind; names the daemon in the reason.
 	ReadOnlyConsole bool
@@ -217,15 +245,20 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 		return notRunnable(err.Error())
 	}
 	if gates.ReadOnlyConsole {
-		return notRunnable("this console runs no schedule; scheduled backups run in the watch daemon (bintrail-console watch)")
+		return notRunnable(scheduleRefusalReadOnly)
 	}
 	if !gates.LoopRunning {
-		return notRunnable("backup features are turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER=0 and no --baseline-refresh-interval), so nothing can run a schedule")
+		return notRunnable(scheduleRefusalNoLoop)
 	}
 	switch p.Method {
 	case BackupMethodFull:
 		if !gates.FullBackups {
-			return notRunnable("creating backups from the console is turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER=0); a schedule can still rebuild from the change history")
+			return notRunnable(scheduleRefusalNoDumps)
+		}
+		if gates.FullBackupsErr != "" && !e.IsPostgres() {
+			// Same scope as the supervisor's refusal: a PostgreSQL dump never
+			// consults the MySQL lock mode.
+			return notRunnable(gates.FullBackupsErr)
 		}
 		if err := baselineTriggerPrecheck(e); err != nil {
 			return notRunnable(err.Error())
@@ -248,15 +281,24 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 }
 
 // BackupScheduleState is the schedule loop's in-memory view of one server,
-// for the Backups page. The durable half (the last run and the last skip)
-// lives in the baseline run history; this is only what the history cannot
-// know: whether a scheduled job is in flight right now.
+// for the Backups page: the job the schedule last started in this process,
+// as the supervisor's slot reports it. The durable view (runs and skips
+// across restarts) is the baseline run history; this one exists because the
+// history can be unavailable (an unreadable file) or silent (a job that
+// panicked writes no record), and a failed scheduled backup must reach the
+// page either way.
 type BackupScheduleState struct {
-	// Running: the last job this schedule started has not finished.
-	Running bool
 	// LastStartedAt is when the loop last started a job for this server
 	// (RFC3339 UTC), empty if never in this process.
 	LastStartedAt string
+	// LastMethod is that job's method.
+	LastMethod string
+	// Last is the supervisor's status for THAT job, nil once the slot holds
+	// another job (a later manual backup) or when nothing was started here.
+	// Running is Last.State == "running".
+	Last *BaselineStatus
+	// Running: the job this schedule last started has not finished.
+	Running bool
 }
 
 // BackupScheduleReporter is the schedule loop as the console sees it. nil when
@@ -266,6 +308,8 @@ type BackupScheduleState struct {
 type BackupScheduleReporter interface {
 	ScheduleState(serverID string) BackupScheduleState
 	// FullBackups reports whether the loop may run BackupMethodFull schedules
-	// (the daemon's baseline-creation opt-in).
-	FullBackups() bool
+	// (the daemon's baseline-creation opt-in), and, when it may, whether the
+	// supervisor would still refuse to start one (a lock-mode
+	// misconfiguration): nil when full backups can start.
+	FullBackups() (enabled bool, refusal error)
 }

@@ -387,15 +387,21 @@ panel that answers whether a restore would work, far below the fold.
   registry entry (`backup_schedule`), read by the watch daemon every minute,
   so it applies without a restart. The grid is fixed (`every 1d at 03:00` is
   03:00 UTC daily; `every 6h at 03:00` is 03/09/15/21), which is what makes
-  the next run computable and shown. It fires only on a slot boundary the
-  daemon is up to see: a slot missed while stopped is not made up, and saving
-  a schedule never starts a backup on the spot. A scheduled run that collides
+  the next run computable and shown (an interval that does not divide a day
+  evenly, `5h` or `36h`, drifts through the day; the page shows where it lands
+  next). It fires only on a slot boundary the daemon is up to see: a slot
+  missed while stopped is not made up, and saving a schedule, new or edited,
+  never starts a backup on the spot. A scheduled run that collides
   with a manual backup, restore or export skips that slot rather than queuing,
   and the skip, like every scheduled run, is written to the baseline run
-  history so the page shows the last run, its result and the last skip after
-  a restart too. A schedule the daemon cannot run as configured (the creation
-  opt-in turned off, no destination) is refused on save with the reason, and
-  one already saved is reported as not runnable, never silently skipped.
+  history (a streak of identical skips is one record whose time moves to the
+  latest missed slot) so the page shows the last run, its result and the last
+  skip after a restart too; the daemon's own view of the job it last started
+  fills in when the history file is unavailable or a job died without
+  writing one. A schedule the daemon cannot run as configured (the creation
+  opt-in not set, a lock-mode misconfiguration, no destination) is refused on
+  save with the reason, and one already saved is reported as not runnable on
+  the page, never silently skipped.
   `PUT`/`DELETE /api/servers/{id}/backup-schedule`; state on `GET /api/baselines`
   (`schedule`). The daemon-wide `--baseline-refresh-interval` below is
   independent and can run alongside.

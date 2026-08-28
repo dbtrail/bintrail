@@ -14,7 +14,7 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 	body := jsFunctionBody(t, js, "backupScheduleCard")
 
 	raw, err := json.Marshal(backupScheduleDTO{
-		Every: "1d", At: "03:00", Method: BackupMethodFull, NextRun: "x", Runnable: false, Reason: "r", Running: true,
+		Every: "1d", At: "03:00", Method: BackupMethodFull, NextRun: "x", Runnable: false, Reason: "r", Running: true, HistoryUnavailable: true,
 		LastRun:     &backupScheduleRunDTO{Method: BackupMethodRefresh, FinishedAt: "f", Error: "e", Tables: 1, Carried: 1, Uploaded: 1},
 		LastSkipped: &backupScheduleSkipDTO{At: "a", Reason: "r"},
 	})
@@ -25,7 +25,7 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"every", "at", "method", "next_run", "runnable", "reason", "running", "last_run", "last_skipped"} {
+	for _, key := range []string{"every", "at", "method", "next_run", "runnable", "reason", "running", "history_unavailable", "last_run", "last_skipped"} {
 		if _, ok := wire[key]; !ok {
 			t.Errorf("backupScheduleDTO does not serialise %q (got %s)", key, raw)
 		}
@@ -51,15 +51,22 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 			t.Errorf("backupScheduleCard never reads skip.%s", key)
 		}
 	}
-	// The body the form sends is what the handler decodes.
-	for _, key := range []string{"every", "at", "method"} {
-		if !strings.Contains(js, key+": ") && !strings.Contains(js, key+":") {
-			t.Errorf("the schedule form never sends %q", key)
+	// The body the form sends is what the handler decodes. Scoped to the
+	// card: `at:` and `method:` occur dozens of times elsewhere in app.js,
+	// so a whole-file search passed without the feature.
+	for _, send := range []string{"every: every.value", "at: at.value", "method: how.value"} {
+		if !strings.Contains(body, send) {
+			t.Errorf("the schedule form never sends %q", send)
 		}
 	}
-	// The capability gate and the two endpoints.
+	// The capability gates the FORM only: a saved schedule is rendered from
+	// the listing whether or not this process can run it, because the
+	// not-runnable reason is the message the feature exists to show.
 	if !strings.Contains(body, "capsCache.backup_schedule") {
-		t.Error("the card is not gated on the backup_schedule capability, so the read-only console would offer a form that 403s")
+		t.Error("the form is not gated on the backup_schedule capability, so the read-only console would offer a form that 403s")
+	}
+	if !strings.Contains(body, "if (!sch && !canEdit) return null") || strings.Contains(body, "if (!capsCache.backup_schedule ||") {
+		t.Error("the whole card is gated on the capability, so a saved schedule on a daemon that cannot run it is hidden instead of reported")
 	}
 	caps, _ := json.Marshal(capabilitiesResponse{BackupSchedule: true})
 	if !strings.Contains(string(caps), `"backup_schedule":true`) {

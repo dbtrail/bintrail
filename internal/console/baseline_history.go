@@ -122,12 +122,46 @@ func OpenBaselineHistory(path string) (*BaselineRunHistory, error) {
 func (h *BaselineRunHistory) Append(rec BaselineRunRecord) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	recs := append(h.servers[rec.ServerID], rec)
-	if len(recs) > BaselineRunHistoryCap {
-		recs = recs[len(recs)-BaselineRunHistoryCap:]
-	}
-	h.servers[rec.ServerID] = recs
+	h.servers[rec.ServerID] = capRecords(append(h.servers[rec.ServerID], rec))
 	return h.save()
+}
+
+// capRecords trims a server's records to the cap, oldest first, keeping the
+// newest scheduled run and the newest scheduled skip whatever their age.
+//
+// Plain "drop the oldest" evicted the schedule's evidence: the daemon-wide
+// refresh loop appends a record every cycle for the same server, and at a
+// 30m interval that is the whole cap in twenty hours, so a daily scheduled
+// backup's last run was gone before the next one fired and the page fell
+// back to "it has not run yet". The two protected records are the ones
+// LastScheduled answers with; everything else is a durations ledger.
+func capRecords(recs []BaselineRunRecord) []BaselineRunRecord {
+	excess := len(recs) - BaselineRunHistoryCap
+	if excess <= 0 {
+		return recs
+	}
+	keepRun, keepSkip := -1, -1
+	for i := len(recs) - 1; i >= 0 && (keepRun < 0 || keepSkip < 0); i-- {
+		if recs[i].Trigger != BaselineRunTriggerScheduled {
+			continue
+		}
+		if recs[i].SkipReason != "" {
+			if keepSkip < 0 {
+				keepSkip = i
+			}
+		} else if keepRun < 0 {
+			keepRun = i
+		}
+	}
+	out := make([]BaselineRunRecord, 0, BaselineRunHistoryCap)
+	for i, r := range recs {
+		if excess > 0 && i != keepRun && i != keepSkip {
+			excess--
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // FindBySnapshot returns the newest record for serverID whose SnapshotTime
@@ -175,26 +209,24 @@ func (h *BaselineRunHistory) LastScheduled(serverID string) (run, skip *Baseline
 	return run, skip
 }
 
-// AppendSkip records a scheduled slot that did not start, unless the newest
-// record for the server is already the same skip: a wedged job plus a short
-// interval would otherwise append an identical skip every slot, and the
-// capped history would evict the real runs, erasing exactly the "when did
-// this last actually back up" answer it exists to keep. Returns whether a
-// record was written.
+// AppendSkip records a scheduled slot that did not start. When the newest
+// record for the server is already the same skip, that record's FinishedAt
+// moves to this slot instead of a new record being added: a wedged job plus
+// a short interval would otherwise append an identical skip every slot and
+// push the durations ledger out of the capped history, while a frozen
+// timestamp would have the page report the FIRST missed slot of a streak as
+// if the streak had ended there. Returns whether a NEW record was added.
 func (h *BaselineRunHistory) AppendSkip(rec BaselineRunRecord) (bool, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	recs := h.servers[rec.ServerID]
 	if n := len(recs); n > 0 && recs[n-1].Trigger == BaselineRunTriggerScheduled &&
 		recs[n-1].SkipReason == rec.SkipReason && recs[n-1].Kind == rec.Kind {
-		return false, nil
+		recs[n-1].FinishedAt = rec.FinishedAt
+		return false, h.save()
 	}
 	rec.Trigger = BaselineRunTriggerScheduled
-	recs = append(recs, rec)
-	if len(recs) > BaselineRunHistoryCap {
-		recs = recs[len(recs)-BaselineRunHistoryCap:]
-	}
-	h.servers[rec.ServerID] = recs
+	h.servers[rec.ServerID] = capRecords(append(recs, rec))
 	return true, h.save()
 }
 

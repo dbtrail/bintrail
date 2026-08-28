@@ -2,7 +2,9 @@ package console
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -10,13 +12,14 @@ import (
 // stubScheduleReporter stands in for the watch daemon's schedule loop.
 type stubScheduleReporter struct {
 	full    bool
-	running map[string]bool
+	refusal error
+	state   map[string]BackupScheduleState
 }
 
 func (s *stubScheduleReporter) ScheduleState(id string) BackupScheduleState {
-	return BackupScheduleState{Running: s.running[id]}
+	return s.state[id]
 }
-func (s *stubScheduleReporter) FullBackups() bool { return s.full }
+func (s *stubScheduleReporter) FullBackups() (bool, error) { return s.full, s.refusal }
 
 // newScheduleServer builds a watch-shaped server with the schedule loop
 // present, a persisted history, and one registry server that can run either
@@ -129,7 +132,7 @@ func TestBackupScheduleAPI_refusals(t *testing.T) {
 		{"too often", `{"every":"1m"}`, "too often"},
 		{"bad clock", `{"every":"1d","at":"3pm"}`, "HH:MM"},
 		{"bad method", `{"every":"1d","method":"snapshot"}`, "method"},
-		{"full backup with creation off", `{"every":"1d","method":"backup"}`, "BINTRAIL_CONSOLE_BASELINE_TRIGGER=0"},
+		{"full backup with creation off", `{"every":"1d","method":"backup"}`, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1"},
 		{"not json", `{`, ""},
 	}
 	for _, c := range cases {
@@ -163,7 +166,7 @@ func TestBackupScheduleAPI_refusals(t *testing.T) {
 func TestBackupScheduleAPI_needsTheLoop(t *testing.T) {
 	srv, id := newScheduleServer(t, nil) // watch, no baseline features
 	rec, body := doServersReq(t, srv, "PUT", "/api/servers/"+id+"/backup-schedule", `{"every":"1d"}`)
-	if rec.Code != 403 || !strings.Contains(string(body), "BINTRAIL_CONSOLE_BASELINE_TRIGGER=0") {
+	if rec.Code != 403 || !strings.Contains(string(body), "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1") {
 		t.Fatalf("watch without features: code=%d body=%s", rec.Code, body)
 	}
 	srv.cm.boot = &bundle{}
@@ -188,20 +191,45 @@ func TestBackupScheduleAPI_needsTheLoop(t *testing.T) {
 	live.backupSchedules = nil
 	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)
 	got := scheduleOf(t, body)
-	if got == nil || got.Runnable || !strings.Contains(got.Reason, "BINTRAIL_CONSOLE_BASELINE_TRIGGER=0") {
+	if got == nil || got.Runnable || !strings.Contains(got.Reason, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1") {
 		t.Fatalf("dormant schedule = %+v, want reported as not runnable with the reason", got)
 	}
+	// The words the listing reports with are the words the write refuses
+	// with, on both process shapes.
+	if !strings.Contains(got.Reason, scheduleRefusalNoLoop) {
+		t.Fatalf("listing reason %q differs from the PUT refusal", got.Reason)
+	}
+	// The supervisor's standing refusal (lock-mode misconfiguration) reaches
+	// the listing as the reason, so a next run is not promised for a
+	// schedule that can never start.
+	live.backupSchedules = &stubScheduleReporter{full: true, refusal: errors.New("BINTRAIL_CONSOLE_BASELINE_LOCK_MODE: unknown mode")}
+	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)
+	if got = scheduleOf(t, body); got == nil || got.Runnable || !strings.Contains(got.Reason, "unknown mode") {
+		t.Fatalf("misconfigured lock mode = %+v, want not runnable with the supervisor's reason", got)
+	}
+	if rec, body := doServersReq(t, live, "PUT", "/api/servers/"+id2+"/backup-schedule", `{"every":"1d"}`); rec.Code != 400 || !strings.Contains(string(body), "unknown mode") {
+		t.Fatalf("PUT under a misconfigured lock mode: code=%d body=%s, want 400 with the reason", rec.Code, body)
+	}
 	// And the creation opt-in going away flips a full-backup schedule the
-	// same way, while a refresh one stays runnable.
+	// same way.
 	live.backupSchedules = &stubScheduleReporter{full: false}
 	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)
 	if got = scheduleOf(t, body); got == nil || got.Runnable || !strings.Contains(got.Reason, "can still rebuild") {
 		t.Fatalf("full schedule with creation off = %+v", got)
 	}
+	// A rebuild schedule is subject to neither the opt-in nor the lock mode.
+	live.backupSchedules = &stubScheduleReporter{full: false, refusal: errors.New("bad lock mode")}
+	if rec, body := doServersReq(t, live, "PUT", "/api/servers/"+id2+"/backup-schedule", `{"every":"1d","method":"refresh"}`); rec.Code != 200 {
+		t.Fatalf("a rebuild schedule is not subject to the lock mode: code=%d body=%s", rec.Code, body)
+	}
+	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)
+	if got = scheduleOf(t, body); got == nil || !got.Runnable {
+		t.Fatalf("rebuild schedule with creation off = %+v, want runnable", got)
+	}
 }
 
 func TestBackupScheduleAPI_lastRunAndSkipComeFromTheHistory(t *testing.T) {
-	rep := &stubScheduleReporter{full: true, running: map[string]bool{}}
+	rep := &stubScheduleReporter{full: true, state: map[string]BackupScheduleState{}}
 	srv, id := newScheduleServer(t, rep)
 	if rec, body := doServersReq(t, srv, "PUT", "/api/servers/"+id+"/backup-schedule", `{"every":"6h","method":"refresh"}`); rec.Code != 200 {
 		t.Fatalf("seed: code=%d body=%s", rec.Code, body)
@@ -216,7 +244,8 @@ func TestBackupScheduleAPI_lastRunAndSkipComeFromTheHistory(t *testing.T) {
 		StartedAt: "2026-08-28T15:00:00Z", FinishedAt: "2026-08-28T15:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
-	rep.running[id] = true
+	rep.state[id] = BackupScheduleState{Running: true, LastStartedAt: "2026-08-28T18:30:00Z", LastMethod: BackupMethodRefresh,
+		Last: &BaselineStatus{State: "running", Since: "2026-08-28T18:30:00Z"}}
 	_, body := doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
 	got := scheduleOf(t, body)
 	if got == nil || got.LastRun == nil || got.LastRun.Method != BackupMethodRefresh || !got.LastRun.OK ||
@@ -237,6 +266,114 @@ func TestBackupScheduleAPI_lastRunAndSkipComeFromTheHistory(t *testing.T) {
 	_, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
 	if got = scheduleOf(t, body); got.LastRun == nil || got.LastRun.OK || got.LastRun.Error != "capture gap" || got.LastRun.Refused != 1 {
 		t.Fatalf("failed last_run = %+v", got.LastRun)
+	}
+	// A job in flight is not yet a run: the history's record stays.
+	if got.Running && got.LastRun.StartedAt != "2026-08-28T21:00:00Z" {
+		t.Fatalf("a running job replaced the last recorded run: %+v", got.LastRun)
+	}
+}
+
+// The loop's in-memory view fills in where the history cannot: a job that
+// panicked (no record) or a history that would not open. The newer source
+// wins; a history record of the same job is never older than the loop's
+// stamp, so it is never displaced.
+func TestBackupScheduleAPI_lastRunFallsBackToTheLoop(t *testing.T) {
+	rep := &stubScheduleReporter{full: true, state: map[string]BackupScheduleState{}}
+	srv, id := newScheduleServer(t, rep)
+	if rec, body := doServersReq(t, srv, "PUT", "/api/servers/"+id+"/backup-schedule", `{"every":"1d"}`); rec.Code != 200 {
+		t.Fatalf("seed: code=%d body=%s", rec.Code, body)
+	}
+	// Older history record, newer in-memory failure with no record (a panic).
+	if err := srv.baselineHistory.Append(BaselineRunRecord{ServerID: id, Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled,
+		StartedAt: "2026-08-27T03:00:00Z", FinishedAt: "2026-08-27T03:04:00Z", Tables: 3}); err != nil {
+		t.Fatal(err)
+	}
+	rep.state[id] = BackupScheduleState{LastStartedAt: "2026-08-28T03:00:00Z", LastMethod: BackupMethodFull,
+		Last: &BaselineStatus{State: "failed", Since: "2026-08-28T03:00:00Z", FinishedAt: "2026-08-28T03:00:01Z", LastError: "panic: nil map"}}
+	_, body := doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
+	got := scheduleOf(t, body)
+	if got.LastRun == nil || got.LastRun.OK || got.LastRun.Error != "panic: nil map" || got.LastRun.StartedAt != "2026-08-28T03:00:00Z" {
+		t.Fatalf("last_run = %+v, want the loop's newer failure", got.LastRun)
+	}
+	// The same job once recorded: the record wins (it is not older).
+	if err := srv.baselineHistory.Append(BaselineRunRecord{ServerID: id, Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled,
+		StartedAt: "2026-08-28T03:00:00Z", FinishedAt: "2026-08-28T03:00:01Z", Error: "panic: nil map", Tables: 7}); err != nil {
+		t.Fatal(err)
+	}
+	_, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
+	if got = scheduleOf(t, body); got.LastRun == nil || got.LastRun.Tables != 7 {
+		t.Fatalf("last_run = %+v, want the history's record of the same job", got.LastRun)
+	}
+	// History unavailable: the loop's view is all there is, and the DTO says
+	// the history is missing so the page does not claim "not run yet".
+	srv.baselineHistory = nil
+	_, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
+	if got = scheduleOf(t, body); !got.HistoryUnavailable || got.LastRun == nil || got.LastRun.Error != "panic: nil map" {
+		t.Fatalf("without a history = %+v, want history_unavailable and the loop's last run", got)
+	}
+}
+
+// A registry written by a newer bintrail is read-only: the schedule verbs
+// refuse rather than answer 200 while the file, and the loop, keep the old
+// schedule.
+func TestBackupScheduleAPI_readOnlyRegistry(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/console-servers.yaml"
+	if err := os.WriteFile(path, []byte("version: 2\nservers:\n  - id: abc\n    name: wp\n    index_dsn: idx:pw@tcp(127.0.0.1:3306)/idx\n    source_dsn: src:pw@tcp(127.0.0.1:3306)/\n    baseline_dir: /b\n    backup_schedule:\n      every: 1d\n      at: \"03:00\"\n      method: backup\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg, MonitorCtrl: &stubMonitorCtrl{},
+		BackupSchedules: &stubScheduleReporter{full: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.cm.bundles["abc"] = &bundle{}
+	for _, tc := range []struct{ method, body string }{{"PUT", `{"every":"6h"}`}, {"DELETE", ""}} {
+		rec, body := doServersReq(t, srv, tc.method, "/api/servers/abc/backup-schedule", tc.body)
+		if rec.Code != 409 {
+			t.Fatalf("%s on a read-only registry: code=%d body=%s, want 409", tc.method, rec.Code, body)
+		}
+	}
+	_, body := doServersReqHeader(t, srv, "GET", "/api/baselines", "", "abc")
+	if got := scheduleOf(t, body); got == nil || got.Every != "1d" {
+		t.Fatalf("the read-only file's schedule is not what the listing shows: %+v", got)
+	}
+}
+
+// The schedule round-trips through the file, including a key a newer
+// bintrail might add inside it, across a PUT that rewrites the schedule.
+func TestBackupScheduleAPI_fileRoundTripKeepsExtra(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/console-servers.yaml"
+	if err := os.WriteFile(path, []byte("version: 1\nservers:\n  - id: abc\n    name: wp\n    index_dsn: idx:pw@tcp(127.0.0.1:3306)/idx\n    source_dsn: src:pw@tcp(127.0.0.1:3306)/\n    baseline_dir: "+dir+"\n    backup_schedule:\n      every: 1d\n      at: \"03:00\"\n      method: backup\n      future_key: 42\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{Listen: "127.0.0.1:8090", Token: "t", Registry: reg, MonitorCtrl: &stubMonitorCtrl{},
+		BackupSchedules: &stubScheduleReporter{full: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec, body := doServersReq(t, srv, "PUT", "/api/servers/abc/backup-schedule", `{"every":"6h","at":"01:00","method":"refresh"}`); rec.Code != 200 {
+		t.Fatalf("PUT code=%d body=%s", rec.Code, body)
+	}
+	again, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _ := again.Get("abc")
+	if e.BackupSchedule == nil || e.BackupSchedule.Every != "6h" || e.BackupSchedule.At != "01:00" || e.BackupSchedule.Method != BackupMethodRefresh {
+		t.Fatalf("reloaded schedule = %+v", e.BackupSchedule)
+	}
+	if e.BackupSchedule.Extra["future_key"] != 42 {
+		t.Fatalf("the forward-compat key inside the schedule did not survive the PUT: %+v", e.BackupSchedule.Extra)
 	}
 }
 

@@ -80,6 +80,27 @@ func TestBackupSchedule_Normalized(t *testing.T) {
 	}
 }
 
+// Identity is what the loop keys its observations by: equal for the same
+// schedule however it was spelled, different for any edit.
+func TestBackupSchedule_Identity(t *testing.T) {
+	a := BackupSchedule{Every: "1d", At: "03:00", Method: "backup"}
+	if a.Identity() != (BackupSchedule{Every: " 1d ", At: "3:00"}).Identity() {
+		t.Fatal("the same schedule spelled differently has a different identity")
+	}
+	for _, edited := range []BackupSchedule{
+		{Every: "6h", At: "03:00", Method: "backup"},
+		{Every: "1d", At: "04:00", Method: "backup"},
+		{Every: "1d", At: "03:00", Method: "refresh"},
+	} {
+		if edited.Identity() == a.Identity() {
+			t.Fatalf("an edit (%+v) kept the identity", edited)
+		}
+	}
+	if (BackupSchedule{Every: "soon"}).Identity() == (BackupSchedule{Every: "later"}).Identity() {
+		t.Fatal("unparseable schedules collapsed to one identity")
+	}
+}
+
 func TestParsedBackupSchedule_slots(t *testing.T) {
 	at := func(s string) time.Time {
 		v, err := time.Parse("2006-01-02 15:04:05", s)
@@ -162,9 +183,13 @@ func TestCheckBackupSchedule(t *testing.T) {
 		{"full backup, everything on", ready, full, live, ""},
 		{"refresh, everything on", ready, refresh, live, ""},
 		{"read-only console", ready, full, BackupScheduleGates{ReadOnlyConsole: true}, "watch daemon"},
-		{"watch without any baseline feature", ready, full, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER=0 and no --baseline-refresh-interval"},
-		{"full backup without the creation opt-in", ready, full, BackupScheduleGates{LoopRunning: true}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER=0); a schedule can still rebuild"},
+		{"watch without any baseline feature", ready, full, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no --baseline-refresh-interval"},
+		{"full backup without the creation opt-in", ready, full, BackupScheduleGates{LoopRunning: true}, "is not set to 1); a schedule can still rebuild"},
 		{"refresh without the creation opt-in is fine", ready, refresh, BackupScheduleGates{LoopRunning: true}, ""},
+		{"full backup under a lock-mode misconfiguration", ready, full, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, "bad lock mode"},
+		{"postgres ignores the lock mode", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: "/b", Flavor: FlavorPostgres, SourceSlot: "s", SourcePublication: "p"}, full,
+			BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, ""},
+		{"refresh ignores the lock mode", ready, refresh, BackupScheduleGates{LoopRunning: true, FullBackupsErr: "bad lock mode"}, ""},
 		{"full backup, no source", ServerEntry{DSN: "idx", BaselineDir: "/b"}, full, live, "no source configured"},
 		{"full backup, no destination", ServerEntry{DSN: "idx", SourceDSN: "src"}, full, live, "no baseline location"},
 		{"full backup, S3-only destination is fine", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, full, live, ""},
@@ -236,11 +261,16 @@ func TestBaselineRunHistory_scheduledRunsAndSkips(t *testing.T) {
 	if err != nil || !wrote {
 		t.Fatalf("first skip: wrote=%v err=%v", wrote, err)
 	}
-	// The same skip again is folded, so a wedged server cannot evict the
-	// real runs from the capped history.
+	// The same skip again is folded into the existing record, so a wedged
+	// server cannot evict the real runs from the capped history, but its
+	// timestamp moves to the latest slot so the page does not report the
+	// first missed slot of a streak as the last.
 	wrote, err = h.AppendSkip(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, SkipReason: "busy", StartedAt: "t4", FinishedAt: "t4"})
 	if err != nil || wrote {
 		t.Fatalf("repeated skip: wrote=%v err=%v, want folded", wrote, err)
+	}
+	if _, skip := h.LastScheduled("a"); skip == nil || skip.FinishedAt != "t4" || len(h.List("a")) != 3 {
+		t.Fatalf("folded skip = %+v over %d records, want the timestamp moved to t4 and no new record", skip, len(h.List("a")))
 	}
 	// A different reason is a new fact.
 	wrote, _ = h.AppendSkip(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, SkipReason: "off", StartedAt: "t5", FinishedAt: "t5"})
@@ -265,5 +295,56 @@ func TestBaselineRunHistory_scheduledRunsAndSkips(t *testing.T) {
 	}
 	if run, skip := h2.LastScheduled("a"); run == nil || skip == nil {
 		t.Fatal("the scheduled records did not survive a reload")
+	}
+}
+
+// The cap keeps the newest scheduled run and skip whatever their age: the
+// daemon-wide refresh loop appends a record per cycle for the same server,
+// and at 30m that is the whole cap in twenty hours, which used to evict a
+// daily schedule's last run before its next one fired.
+func TestBaselineRunHistory_capKeepsTheScheduleEvidence(t *testing.T) {
+	h, err := OpenBaselineHistory(t.TempDir() + "/h.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Append(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled,
+		StartedAt: "s-run", FinishedAt: "s-run", SnapshotTime: "snap"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.AppendSkip(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, SkipReason: "busy", StartedAt: "s-skip", FinishedAt: "s-skip"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3*BaselineRunHistoryCap; i++ {
+		if err := h.Append(BaselineRunRecord{ServerID: "a", Kind: BaselineRunRefresh, StartedAt: "r", FinishedAt: "r"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs := h.List("a")
+	if len(recs) != BaselineRunHistoryCap {
+		t.Fatalf("%d records, want the cap %d", len(recs), BaselineRunHistoryCap)
+	}
+	run, skip := h.LastScheduled("a")
+	if run == nil || run.SnapshotTime != "snap" || skip == nil || skip.SkipReason != "busy" {
+		t.Fatalf("the schedule's evidence was evicted: run=%+v skip=%+v", run, skip)
+	}
+	// Order is preserved: the protected records stay oldest-first at the front.
+	if recs[0].Trigger != BaselineRunTriggerScheduled || recs[1].Trigger != BaselineRunTriggerScheduled {
+		t.Fatalf("protected records lost their place: %+v %+v", recs[0], recs[1])
+	}
+	// A NEWER scheduled run releases the older one to the cap.
+	if err := h.Append(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled,
+		StartedAt: "s-run-2", FinishedAt: "s-run-2", SnapshotTime: "snap2"}); err != nil {
+		t.Fatal(err)
+	}
+	if run, _ := h.LastScheduled("a"); run.SnapshotTime != "snap2" {
+		t.Fatalf("run = %+v, want the newer scheduled run", run)
+	}
+	for _, r := range h.List("a") {
+		if r.SnapshotTime == "snap" {
+			t.Fatal("the superseded scheduled run was kept past the cap")
+		}
+	}
+	if n := len(h.List("a")); n != BaselineRunHistoryCap {
+		t.Fatalf("%d records after the newer run, want the cap", n)
 	}
 }

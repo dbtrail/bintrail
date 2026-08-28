@@ -4553,18 +4553,23 @@ function backupFoldError(msg) {
   return out;
 }
 
-// backupRestoreCard offers the point-in-time restore: pick a past moment, get
-// a NEW backup showing every table as it was then. Collapsed by default; the
-// last restore's outcome renders inside so a failure is not toast-only.
 // backupScheduleCard (#1442): the per-server backup timer. The summary line
 // carries the schedule and the next run so the state reads without opening
 // the card; the body is the form plus what the schedule last did. A failed
 // or skipped scheduled run opens the card and says so in red: a schedule
 // that fails quietly is worse than none.
+//
+// Only the FORM is gated on the capability. A saved schedule is rendered
+// whenever the listing carries one, capability or not: a daemon restarted
+// with every backup feature off still has the schedule in its file, the API
+// reports it as not runnable with the reason, and hiding the card there
+// would hide exactly the message this feature exists to show.
 function backupScheduleCard(cur, b) {
-  if (!capsCache.backup_schedule || !cur || !cur.id || cur.kind !== "registry") return null;
+  if (!cur || !cur.id || cur.kind !== "registry") return null;
   if (!b || b.error) return null;
   const sch = b.schedule || null;
+  const canEdit = !!capsCache.backup_schedule;
+  if (!sch && !canEdit) return null;
   const details = el("details", { class: "form-advanced bk-restore bk-schedule" });
   const summary = el("summary", { class: "form-adv-summary" });
   details.append(summary);
@@ -4582,11 +4587,22 @@ function backupScheduleCard(cur, b) {
   }
 
   body.append(el("p", { class: "form-hint", text:
-    "Takes a backup on a fixed timetable while the daemon runs, so the list below keeps growing without a terminal. " +
+    "Takes a backup on a fixed timetable while the daemon runs, so the list below keeps growing without anyone running a command. " +
     "A full backup reads your database, the same job as Create backup. A rebuild from change history makes a new backup " +
     "from the previous one plus the recorded changes, and reads nothing from your database. " +
     "Missed times are not made up: a backup due while the daemon was stopped waits for the next one. " +
     "(CLI: --baseline-refresh-interval rebuilds every server at once)" }));
+
+  if (!canEdit) {
+    // The read-only console, or a daemon with every backup feature off:
+    // nothing here can change the schedule, and the summary already says
+    // why it is not running.
+    body.append(el("p", { class: "form-hint", text:
+      "This schedule can be changed from the watch daemon's console (bintrail-console watch) once its backup features are on." }));
+    details.open = true;
+    details.append(body);
+    return details;
+  }
 
   // The form. Prefilled from the saved schedule, else a sane daily default.
   const every = el("input", { class: "in", type: "text", spellcheck: "false", placeholder: "1d", "aria-label": "Every" });
@@ -4613,14 +4629,21 @@ function backupScheduleCard(cur, b) {
     row.append(remove);
   }
   body.append(row, el("p", { class: "form-hint", text:
-    "Every: minutes, hours or days (30m, 6h, 1d), at least 15m. At: the UTC time the timetable lines up on; for a daily " +
-    "or longer schedule it is the time of day the backup runs." }), msg);
+    "Every: minutes, hours or days (30m, 6h, 1d), at least 15m. At: the UTC time the timetable lines up on; for whole " +
+    "days (1d, 7d) it is the time of day the backup runs." }), msg);
 
   // What the schedule last did. The skip is shown when it is the newest
   // fact: a slot that could not start after the last good run is exactly
   // what the operator needs to see.
   if (sch) {
     let alarm = false;
+    if (sch.history_unavailable) {
+      // Without the run history only what this daemon started since boot is
+      // known; "it has not run yet" would be a guess, so say what is missing.
+      alarm = true;
+      body.append(el("p", { class: "form-msg err", text:
+        "The backup run history could not be opened, so runs from before this daemon started are not shown. Check the daemon log." }));
+    }
     if (sch.running) {
       body.append(el("p", { class: "form-hint", text: "A scheduled backup is running now." }));
     }
@@ -4645,9 +4668,9 @@ function backupScheduleCard(cur, b) {
       alarm = true;
       body.append(el("p", { class: "form-msg err", text:
         "Did not run at " + utcLabel(skip.at) + ": " + skip.reason + (/[.!?]$/.test(skip.reason) ? "" : ".") +
-        " The next scheduled time is tried again." }));
+        " It will try again at the next scheduled time." }));
     }
-    if (!run && !skip && !sch.running) {
+    if (!run && !skip && !sch.running && !sch.history_unavailable) {
       body.append(el("p", { class: "form-hint", text: "It has not run yet." }));
     }
     if (!sch.runnable || alarm) details.open = true;
@@ -4687,6 +4710,9 @@ async function removeBackupSchedule(id, btn, msgEl) {
   if (location.pathname === "/baselines") renderBaselines();
 }
 
+// backupRestoreCard offers the point-in-time restore: pick a past moment, get
+// a NEW backup showing every table as it was then. Collapsed by default; the
+// last restore's outcome renders inside so a failure is not toast-only.
 function backupRestoreCard(cur, b, restoreSt) {
   // Registry servers only: the CLI (ephemeral) entry is refused by the
   // monitor verbs with a message about monitoring, not restores.

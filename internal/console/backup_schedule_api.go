@@ -22,6 +22,10 @@ type backupScheduleDTO struct {
 	Reason   string `json:"reason,omitempty"`
 	// Running: a job this schedule started is in flight.
 	Running bool `json:"running,omitempty"`
+	// HistoryUnavailable: the run history could not be opened at boot, so
+	// only what this process started since is known; the page says so,
+	// because "it has not run yet" would otherwise be a guess.
+	HistoryUnavailable bool `json:"history_unavailable,omitempty"`
 	// LastRun is the newest scheduled run that started (succeeded or
 	// failed), LastSkipped the newest slot that could not start. From the
 	// persisted history, so both survive a restart.
@@ -58,14 +62,24 @@ type backupScheduleRequest struct {
 
 // scheduleGates resolves what this process can do, for CheckBackupSchedule.
 func (s *Server) scheduleGates() BackupScheduleGates {
-	return BackupScheduleGates{
-		LoopRunning:     s.backupSchedules != nil,
-		FullBackups:     s.backupSchedules != nil && s.backupSchedules.FullBackups(),
-		ReadOnlyConsole: s.monitorCtrl == nil,
+	g := BackupScheduleGates{LoopRunning: s.backupSchedules != nil, ReadOnlyConsole: s.monitorCtrl == nil}
+	if s.backupSchedules != nil {
+		enabled, refusal := s.backupSchedules.FullBackups()
+		g.FullBackups = enabled
+		if refusal != nil {
+			g.FullBackupsErr = refusal.Error()
+		}
 	}
+	return g
 }
 
 // backupScheduleDTO renders e's schedule. Requires e.BackupSchedule != nil.
+//
+// The last run comes from two sources and the newer one wins: the persisted
+// history (survives restarts) and the loop's in-memory view of the job it
+// last started (survives an unavailable history and a job that panicked,
+// which writes no record). Neither alone meets "a failed scheduled backup
+// must be visible".
 func (s *Server) backupScheduleDTO(e ServerEntry, now time.Time) *backupScheduleDTO {
 	sched := *e.BackupSchedule
 	dto := &backupScheduleDTO{Every: sched.Every, At: sched.At, Method: sched.Method}
@@ -76,6 +90,9 @@ func (s *Server) backupScheduleDTO(e ServerEntry, now time.Time) *backupSchedule
 		dto.Method = BackupMethodFull
 	}
 	if p, err := sched.Parse(); err == nil {
+		// Reported whether or not the schedule can run: the page prints it
+		// only for a runnable one, but a client reading the API gets the
+		// grid either way.
 		dto.NextRun = p.NextRun(now).Format(time.RFC3339)
 	}
 	if err := CheckBackupSchedule(e, sched, s.scheduleGates()); err != nil {
@@ -83,31 +100,63 @@ func (s *Server) backupScheduleDTO(e ServerEntry, now time.Time) *backupSchedule
 	} else {
 		dto.Runnable = true
 	}
-	if s.backupSchedules != nil {
-		dto.Running = s.backupSchedules.ScheduleState(e.ID).Running
-	}
+	dto.HistoryUnavailable = s.baselineHistory == nil
 	if s.baselineHistory != nil {
 		run, skip := s.baselineHistory.LastScheduled(e.ID)
 		if run != nil {
-			dto.LastRun = &backupScheduleRunDTO{
-				Method:       runMethod(run.Kind),
-				StartedAt:    run.StartedAt,
-				FinishedAt:   run.FinishedAt,
-				OK:           run.Error == "",
-				Error:        run.Error,
-				SnapshotTime: run.SnapshotTime,
-				Tables:       run.Tables,
-				Rows:         run.Rows,
-				Uploaded:     run.Uploaded,
-				Carried:      run.Carried,
-				Refused:      run.Refused,
-			}
+			dto.LastRun = scheduleRunFromRecord(run)
 		}
 		if skip != nil {
 			dto.LastSkipped = &backupScheduleSkipDTO{At: skip.FinishedAt, Reason: skip.SkipReason}
 		}
 	}
+	if s.backupSchedules != nil {
+		st := s.backupSchedules.ScheduleState(e.ID)
+		dto.Running = st.Running
+		// The in-memory job beats the history when it is newer (or the
+		// history has nothing): the history's StartedAt is stamped inside
+		// the job, after the loop's own stamp, so a recorded run of the same
+		// job is never older than LastStartedAt.
+		if st.Last != nil && !st.Running && (dto.LastRun == nil || dto.LastRun.StartedAt < st.LastStartedAt) {
+			dto.LastRun = scheduleRunFromStatus(st)
+		}
+	}
 	return dto
+}
+
+func scheduleRunFromRecord(run *BaselineRunRecord) *backupScheduleRunDTO {
+	return &backupScheduleRunDTO{
+		Method:       runMethod(run.Kind),
+		StartedAt:    run.StartedAt,
+		FinishedAt:   run.FinishedAt,
+		OK:           run.Error == "",
+		Error:        run.Error,
+		SnapshotTime: run.SnapshotTime,
+		Tables:       run.Tables,
+		Rows:         run.Rows,
+		Uploaded:     run.Uploaded,
+		Carried:      run.Carried,
+		Refused:      run.Refused,
+	}
+}
+
+// scheduleRunFromStatus renders the loop's view of a finished job. A slot
+// still "running" is not a run yet, and the caller does not pass one.
+func scheduleRunFromStatus(st BackupScheduleState) *backupScheduleRunDTO {
+	cur := st.Last
+	return &backupScheduleRunDTO{
+		Method:       st.LastMethod,
+		StartedAt:    st.LastStartedAt,
+		FinishedAt:   cur.FinishedAt,
+		OK:           cur.State == "succeeded",
+		Error:        cur.LastError,
+		SnapshotTime: cur.At,
+		Tables:       cur.Tables,
+		Rows:         cur.Rows,
+		Uploaded:     cur.Uploaded,
+		Carried:      cur.Carried,
+		Refused:      cur.Refused,
+	}
 }
 
 // runMethod maps a history record's Kind back to the schedule vocabulary.
@@ -175,11 +224,9 @@ func (s *Server) handleBackupScheduleDelete(w http.ResponseWriter, r *http.Reque
 func (s *Server) requireScheduleEntry(w http.ResponseWriter, r *http.Request) (ServerEntry, bool) {
 	if s.backupSchedules == nil {
 		if s.monitorCtrl == nil {
-			writeJSONError(w, http.StatusForbidden,
-				"scheduled backups run in the watch daemon (bintrail-console watch), not the read-only console")
+			writeJSONError(w, http.StatusForbidden, scheduleRefusalReadOnly)
 		} else {
-			writeJSONError(w, http.StatusForbidden,
-				"backup features are turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER=0 and no --baseline-refresh-interval), so nothing can run a schedule")
+			writeJSONError(w, http.StatusForbidden, scheduleRefusalNoLoop)
 		}
 		return ServerEntry{}, false
 	}

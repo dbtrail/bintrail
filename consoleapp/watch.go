@@ -473,13 +473,11 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	wireBaselineExtras(&cfg, baselineSup, serversPath)
 	// The per-server backup schedule (#1442) needs only the supervisor: a
 	// full-backup schedule additionally checks the creation opt-in per slot.
-	// A typed nil must not reach the interface field, or the console would
-	// advertise a loop that does not exist.
+	// The helper returns a true nil interface for a nil supervisor; assigning
+	// a nil *backupScheduler here directly would advertise a loop that does
+	// not exist.
 	var backupSched *backupScheduler
-	if baselineSup != nil {
-		backupSched = newBackupScheduler(baselineSup, registry, upConsoleBaselineTrigger, upBaselineCarryForward)
-		cfg.BackupSchedules = backupSched
-	}
+	cfg.BackupSchedules, backupSched = newBackupScheduleReporter(baselineSup, registry, upConsoleBaselineTrigger, upBaselineCarryForward)
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {
 		return err
@@ -689,13 +687,11 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	wireBaselineExtras(&cfg, baselineSup, serversPath)
 	// The per-server backup schedule (#1442) needs only the supervisor: a
 	// full-backup schedule additionally checks the creation opt-in per slot.
-	// A typed nil must not reach the interface field, or the console would
-	// advertise a loop that does not exist.
+	// The helper returns a true nil interface for a nil supervisor; assigning
+	// a nil *backupScheduler here directly would advertise a loop that does
+	// not exist.
 	var backupSched *backupScheduler
-	if baselineSup != nil {
-		backupSched = newBackupScheduler(baselineSup, registry, upConsoleBaselineTrigger, upBaselineCarryForward)
-		cfg.BackupSchedules = backupSched
-	}
+	cfg.BackupSchedules, backupSched = newBackupScheduleReporter(baselineSup, registry, upConsoleBaselineTrigger, upBaselineCarryForward)
 	notifier, err := newWatchNotifierFromFlags(ctx)
 	if err != nil {
 		return err
