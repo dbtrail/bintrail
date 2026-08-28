@@ -112,7 +112,7 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if e, ok := s.cm.reg.Get(s.selectedServerID(r)); ok && e.BackupSchedule != nil {
-		resp.Schedule = s.backupScheduleDTO(e, time.Now().UTC())
+		resp.Schedule = s.backupScheduleDTO(r.Context(), e, time.Now().UTC())
 	}
 	if b.baselineSrc == "" {
 		writeJSON(w, http.StatusOK, resp)

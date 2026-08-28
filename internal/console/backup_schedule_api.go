@@ -1,6 +1,7 @@
 package console
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -9,13 +10,18 @@ import (
 // backupScheduleDTO is a server's backup schedule and what it last did, on
 // the wire (GET /api/baselines → schedule, and the PUT/DELETE responses).
 type backupScheduleDTO struct {
-	Every  string `json:"every"`
-	At     string `json:"at"`
-	Method string `json:"method"`
+	Every string `json:"every"`
+	At    string `json:"at"`
 	// NextRun is the next slot on the grid (RFC3339 UTC). Present even when
 	// the schedule is not runnable, so the page can say "would run at X but
 	// cannot, because Y".
 	NextRun string `json:"next_run,omitempty"`
+	// NextMethod is how the next run will be made, as decided right now
+	// (BackupMethodFull or BackupMethodRefresh), with NextMethodWhy the
+	// one-line reason. The page says it so the operator is never surprised
+	// by which producer ran.
+	NextMethod    string `json:"next_method,omitempty"`
+	NextMethodWhy string `json:"next_method_why,omitempty"`
 	// Runnable reports whether THIS daemon, as configured right now, will run
 	// this schedule; Reason says why not.
 	Runnable bool   `json:"runnable"`
@@ -31,6 +37,9 @@ type backupScheduleDTO struct {
 	// persisted history, so both survive a restart.
 	LastRun     *backupScheduleRunDTO  `json:"last_run,omitempty"`
 	LastSkipped *backupScheduleSkipDTO `json:"last_skipped,omitempty"`
+	// LastFallback is the last slot where the rebuild was refused and a full
+	// backup was taken instead (this process only).
+	LastFallback *backupScheduleSkipDTO `json:"last_fallback,omitempty"`
 }
 
 type backupScheduleRunDTO struct {
@@ -53,11 +62,11 @@ type backupScheduleSkipDTO struct {
 	Reason string `json:"reason"`
 }
 
-// backupScheduleRequest is the PUT body.
+// backupScheduleRequest is the PUT body. When is the operator's; how is
+// decided per slot by the daemon (ChooseBackupMethod).
 type backupScheduleRequest struct {
-	Every  string `json:"every"`
-	At     string `json:"at"`
-	Method string `json:"method"`
+	Every string `json:"every"`
+	At    string `json:"at"`
 }
 
 // scheduleGates resolves what this process can do, for CheckBackupSchedule.
@@ -80,14 +89,11 @@ func (s *Server) scheduleGates() BackupScheduleGates {
 // last started (survives an unavailable history and a job that panicked,
 // which writes no record). Neither alone meets "a failed scheduled backup
 // must be visible".
-func (s *Server) backupScheduleDTO(e ServerEntry, now time.Time) *backupScheduleDTO {
+func (s *Server) backupScheduleDTO(ctx context.Context, e ServerEntry, now time.Time) *backupScheduleDTO {
 	sched := *e.BackupSchedule
-	dto := &backupScheduleDTO{Every: sched.Every, At: sched.At, Method: sched.Method}
+	dto := &backupScheduleDTO{Every: sched.Every, At: sched.At}
 	if dto.At == "" {
 		dto.At = "00:00"
-	}
-	if dto.Method == "" {
-		dto.Method = BackupMethodFull
 	}
 	if p, err := sched.Parse(); err == nil {
 		// Reported whether or not the schedule can run: the page prints it
@@ -95,10 +101,21 @@ func (s *Server) backupScheduleDTO(e ServerEntry, now time.Time) *backupSchedule
 		// grid either way.
 		dto.NextRun = p.NextRun(now).Format(time.RFC3339)
 	}
-	if err := CheckBackupSchedule(e, sched, s.scheduleGates()); err != nil {
+	gates := s.scheduleGates()
+	if err := CheckBackupSchedule(e, sched, gates); err != nil {
 		dto.Reason = RefusalReason(err)
 	} else {
 		dto.Runnable = true
+		method, why, err := ChooseBackupMethod(ctx, e, gates)
+		dto.NextMethod = method
+		if err != nil {
+			// Runnable in principle, not right now (a rebuild-only server
+			// with no backup yet): the loop records the skip; the page says
+			// why here.
+			dto.NextMethodWhy = err.Error()
+		} else {
+			dto.NextMethodWhy = why
+		}
 	}
 	// Unavailable means a daemon that runs the loop could not open its
 	// history, not a process that never has one (serve, a watch with every
@@ -128,6 +145,9 @@ func (s *Server) backupScheduleDTO(e ServerEntry, now time.Time) *backupSchedule
 		// the history's FinishedAt for the same skip is that same stamp.
 		if st.LastSkippedAt != "" && (dto.LastSkipped == nil || dto.LastSkipped.At < st.LastSkippedAt) {
 			dto.LastSkipped = &backupScheduleSkipDTO{At: st.LastSkippedAt, Reason: st.LastSkipReason}
+		}
+		if st.LastFallbackAt != "" {
+			dto.LastFallback = &backupScheduleSkipDTO{At: st.LastFallbackAt, Reason: st.LastFallbackReason}
 		}
 	}
 	return dto
@@ -198,7 +218,7 @@ func (s *Server) handleBackupScheduleUpdate(w http.ResponseWriter, r *http.Reque
 		writeBodyDecodeError(w, err)
 		return
 	}
-	sched, err := BackupSchedule{Every: req.Every, At: req.At, Method: req.Method}.Normalized()
+	sched, err := BackupSchedule{Every: req.Every, At: req.At}.Normalized()
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -220,7 +240,7 @@ func (s *Server) handleBackupScheduleUpdate(w http.ResponseWriter, r *http.Reque
 	// be up to a minute away.
 	now := time.Now().UTC()
 	s.backupSchedules.Observe(e.ID, sched, now)
-	writeJSON(w, http.StatusOK, map[string]any{"schedule": s.backupScheduleDTO(e, now)})
+	writeJSON(w, http.StatusOK, map[string]any{"schedule": s.backupScheduleDTO(r.Context(), e, now)})
 }
 
 // handleBackupScheduleDelete serves DELETE /api/servers/{id}/backup-schedule.

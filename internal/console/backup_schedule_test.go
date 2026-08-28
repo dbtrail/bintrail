@@ -1,10 +1,15 @@
 package console
 
 import (
+	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 func TestBackupSchedule_Parse(t *testing.T) {
@@ -15,23 +20,22 @@ func TestBackupSchedule_Parse(t *testing.T) {
 		wantErr string
 	}{
 		{"daily at 03:00", BackupSchedule{Every: "1d", At: "03:00"},
-			ParsedBackupSchedule{Every: 24 * time.Hour, At: 3 * time.Hour, Method: BackupMethodFull}, ""},
-		{"defaults: midnight, full", BackupSchedule{Every: "6h"},
-			ParsedBackupSchedule{Every: 6 * time.Hour, Method: BackupMethodFull}, ""},
-		{"refresh method", BackupSchedule{Every: "30m", At: "9:15", Method: "refresh"},
-			ParsedBackupSchedule{Every: 30 * time.Minute, At: 9*time.Hour + 15*time.Minute, Method: BackupMethodRefresh}, ""},
-		{"whitespace tolerated", BackupSchedule{Every: " 1d ", At: " 03:00 ", Method: " backup "},
-			ParsedBackupSchedule{Every: 24 * time.Hour, At: 3 * time.Hour, Method: BackupMethodFull}, ""},
+			ParsedBackupSchedule{Every: 24 * time.Hour, At: 3 * time.Hour}, ""},
+		{"default: midnight", BackupSchedule{Every: "6h"},
+			ParsedBackupSchedule{Every: 6 * time.Hour}, ""},
+		{"one-digit hour", BackupSchedule{Every: "30m", At: "9:15"},
+			ParsedBackupSchedule{Every: 30 * time.Minute, At: 9*time.Hour + 15*time.Minute}, ""},
+		{"whitespace tolerated", BackupSchedule{Every: " 1d ", At: " 03:00 "},
+			ParsedBackupSchedule{Every: 24 * time.Hour, At: 3 * time.Hour}, ""},
 		{"floor", BackupSchedule{Every: "5m"}, ParsedBackupSchedule{}, "too often"},
 		{"exactly the floor is fine", BackupSchedule{Every: "15m"},
-			ParsedBackupSchedule{Every: 15 * time.Minute, Method: BackupMethodFull}, ""},
+			ParsedBackupSchedule{Every: 15 * time.Minute}, ""},
 		{"no unit", BackupSchedule{Every: "6"}, ParsedBackupSchedule{}, "every:"},
 		{"seconds are not a unit", BackupSchedule{Every: "900s"}, ParsedBackupSchedule{}, "every:"},
 		{"empty every", BackupSchedule{}, ParsedBackupSchedule{}, "every:"},
 		{"bad clock", BackupSchedule{Every: "1d", At: "25:00"}, ParsedBackupSchedule{}, "at:"},
 		{"clock without minutes", BackupSchedule{Every: "1d", At: "3"}, ParsedBackupSchedule{}, "at:"},
 		{"clock with seconds", BackupSchedule{Every: "1d", At: "03:00:00"}, ParsedBackupSchedule{}, "at:"},
-		{"unknown method", BackupSchedule{Every: "1d", Method: "incremental"}, ParsedBackupSchedule{}, "method:"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -55,10 +59,10 @@ func TestBackupSchedule_Parse(t *testing.T) {
 // The refusal names the floor as an operator would type it; the text and the
 // constant must agree or the message lies about what is accepted.
 func TestBackupSchedule_minEveryTextMatchesConstant(t *testing.T) {
-	if _, err := (BackupSchedule{Every: backupScheduleMinEveryText}).Parse(); err != nil {
+	p, err := (BackupSchedule{Every: backupScheduleMinEveryText}).Parse()
+	if err != nil {
 		t.Fatalf("the floor text %q does not parse as an accepted interval: %v", backupScheduleMinEveryText, err)
 	}
-	p, _ := (BackupSchedule{Every: backupScheduleMinEveryText}).Parse()
 	if p.Every != BackupScheduleMinEvery {
 		t.Fatalf("floor text %q = %s, constant = %s", backupScheduleMinEveryText, p.Every, BackupScheduleMinEvery)
 	}
@@ -69,7 +73,7 @@ func TestBackupSchedule_Normalized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Every != "6h" || got.At != "00:00" || got.Method != BackupMethodFull {
+	if got.Every != "6h" || got.At != "00:00" {
 		t.Fatalf("defaults were not spelled out: %+v", got)
 	}
 	if got.Extra["future"] != 1 {
@@ -83,15 +87,11 @@ func TestBackupSchedule_Normalized(t *testing.T) {
 // Identity is what the loop keys its observations by: equal for the same
 // schedule however it was spelled, different for any edit.
 func TestBackupSchedule_Identity(t *testing.T) {
-	a := BackupSchedule{Every: "1d", At: "03:00", Method: "backup"}
+	a := BackupSchedule{Every: "1d", At: "03:00"}
 	if a.Identity() != (BackupSchedule{Every: " 1d ", At: "3:00"}).Identity() {
 		t.Fatal("the same schedule spelled differently has a different identity")
 	}
-	for _, edited := range []BackupSchedule{
-		{Every: "6h", At: "03:00", Method: "backup"},
-		{Every: "1d", At: "04:00", Method: "backup"},
-		{Every: "1d", At: "03:00", Method: "refresh"},
-	} {
+	for _, edited := range []BackupSchedule{{Every: "6h", At: "03:00"}, {Every: "1d", At: "04:00"}} {
 		if edited.Identity() == a.Identity() {
 			t.Fatalf("an edit (%+v) kept the identity", edited)
 		}
@@ -153,6 +153,26 @@ func TestParsedBackupSchedule_slots(t *testing.T) {
 	}
 }
 
+// An interval that does not divide a day still sits on the fixed grid: the
+// slot is never after now, the next run is exactly one interval later, and
+// the clock time drifts day to day (which the docs say it does).
+func TestParsedBackupSchedule_intervalThatDoesNotDivideADay(t *testing.T) {
+	p, _ := (BackupSchedule{Every: "5h", At: "03:00"}).Parse()
+	now := time.Date(2026, 8, 28, 11, 43, 10, 0, time.UTC)
+	slot := p.SlotAtOrBefore(now)
+	if slot.After(now) || now.Sub(slot) >= 5*time.Hour {
+		t.Fatalf("slot %s is not the one in progress at %s", slot, now)
+	}
+	if p.NextRun(now).Sub(slot) != 5*time.Hour {
+		t.Fatalf("next run %s is not one interval after %s", p.NextRun(now), slot)
+	}
+	a := p.SlotAtOrBefore(now).Hour()
+	b := p.SlotAtOrBefore(now.Add(24 * time.Hour)).Hour()
+	if a == b {
+		t.Fatalf("a 5h grid did not drift across a day: %d == %d", a, b)
+	}
+}
+
 // The slot grid must be stable in time: the slot at or before an instant
 // never depends on which instant it was asked from, only on the grid.
 func TestParsedBackupSchedule_gridIsFixed(t *testing.T) {
@@ -168,40 +188,39 @@ func TestParsedBackupSchedule_gridIsFixed(t *testing.T) {
 	}
 }
 
+// Runnable means at least one producer can run here. The reason, when
+// neither can, names both.
 func TestCheckBackupSchedule(t *testing.T) {
-	full := BackupSchedule{Every: "1d", Method: BackupMethodFull}
-	refresh := BackupSchedule{Every: "1d", Method: BackupMethodRefresh}
+	sched := BackupSchedule{Every: "1d"}
 	ready := ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: "/b"}
 	live := BackupScheduleGates{LoopRunning: true, FullBackups: true}
 	cases := []struct {
 		name    string
 		e       ServerEntry
-		sched   BackupSchedule
 		gates   BackupScheduleGates
 		wantErr string // "" = runnable
 	}{
-		{"full backup, everything on", ready, full, live, ""},
-		{"refresh, everything on", ready, refresh, live, ""},
-		{"read-only console", ready, full, BackupScheduleGates{ReadOnlyConsole: true}, "watch daemon"},
-		{"watch without any baseline feature", ready, full, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no --baseline-refresh-interval"},
-		{"full backup without the creation opt-in", ready, full, BackupScheduleGates{LoopRunning: true}, "is not set to 1); a schedule can still rebuild"},
-		{"refresh without the creation opt-in is fine", ready, refresh, BackupScheduleGates{LoopRunning: true}, ""},
-		{"full backup under a lock-mode misconfiguration", ready, full, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, "bad lock mode"},
-		{"postgres ignores the lock mode", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: "/b", Flavor: FlavorPostgres, SourceSlot: "s", SourcePublication: "p"}, full,
+		{"everything on", ready, live, ""},
+		{"read-only console", ready, BackupScheduleGates{ReadOnlyConsole: true}, "watch daemon"},
+		{"watch without any baseline feature", ready, BackupScheduleGates{}, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no --baseline-refresh-interval"},
+		{"creation off but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true}, ""},
+		{"creation off and no local dir", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true}, "is not set to 1); a rebuild from the change history needs a local backup directory"},
+		{"lock mode misconfigured but a rebuild is possible", ready, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, ""},
+		{"lock mode misconfigured, S3-only", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, "bad lock mode; a rebuild"},
+		{"postgres ignores the lock mode", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/", Flavor: FlavorPostgres, SourceSlot: "s", SourcePublication: "p"},
 			BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock mode"}, ""},
-		{"refresh ignores the lock mode", ready, refresh, BackupScheduleGates{LoopRunning: true, FullBackupsErr: "bad lock mode"}, ""},
-		{"full backup, no source", ServerEntry{DSN: "idx", BaselineDir: "/b"}, full, live, "no source configured"},
-		{"full backup, no destination", ServerEntry{DSN: "idx", SourceDSN: "src"}, full, live, "no baseline location"},
-		{"full backup, S3-only destination is fine", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, full, live, ""},
-		{"full backup, postgres without slot", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: "/b", Flavor: FlavorPostgres}, full, live, "replication slot"},
-		{"refresh, S3-only destination", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, refresh, live, "only in S3"},
-		{"refresh, no destination", ServerEntry{DSN: "idx", SourceDSN: "src"}, refresh, live, "no backup directory"},
-		{"refresh, no index", ServerEntry{BaselineDir: "/b"}, refresh, live, "no index connection"},
-		{"unparseable schedule", ready, BackupSchedule{Every: "1x"}, live, "every:"},
+		{"no source, local dir: rebuild only, fine", ServerEntry{DSN: "idx", BaselineDir: "/b"}, live, ""},
+		{"no source, no destination", ServerEntry{DSN: "idx"}, live, "no source configured"},
+		{"no index at all", ServerEntry{SourceDSN: "src"}, live, "no baseline location"},
+		{"unparseable schedule", ready, live, "every:"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := CheckBackupSchedule(c.e, c.sched, c.gates)
+			s := sched
+			if c.name == "unparseable schedule" {
+				s = BackupSchedule{Every: "1x"}
+			}
+			err := CheckBackupSchedule(c.e, s, c.gates)
 			if c.wantErr == "" {
 				if err != nil {
 					t.Fatalf("refused: %v", err)
@@ -224,6 +243,69 @@ func TestCheckBackupSchedule(t *testing.T) {
 	}
 }
 
+// fakeSnapshot writes the shape NewestSnapshotTables recognises: one
+// timestamped directory with one schema and one table file.
+func fakeSnapshot(t *testing.T, dir string) {
+	t.Helper()
+	d := filepath.Join(dir, reconstruct.SnapshotDirName(time.Date(2026, 8, 27, 3, 0, 0, 0, time.UTC)), "shop")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "orders.parquet"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// How the next run is made is the daemon's decision, and the rule has to be
+// the one the docs state: S3 means full, no previous backup means full,
+// otherwise rebuild; a rule that lands on a producer this daemon cannot run
+// says so.
+func TestChooseBackupMethod(t *testing.T) {
+	withSnap := t.TempDir()
+	fakeSnapshot(t, withSnap)
+	empty := t.TempDir()
+	live := BackupScheduleGates{LoopRunning: true, FullBackups: true}
+	off := BackupScheduleGates{LoopRunning: true}
+	cases := []struct {
+		name       string
+		e          ServerEntry
+		gates      BackupScheduleGates
+		wantMethod string
+		wantWhy    string
+		wantErr    string
+	}{
+		{"local dir with a backup: rebuild", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap}, live, BackupMethodRefresh, "no load on your database", ""},
+		{"local dir with a backup, creation off: still rebuild", ServerEntry{DSN: "idx", BaselineDir: withSnap}, off, BackupMethodRefresh, "no load", ""},
+		{"local dir, no backup yet: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty}, live, BackupMethodFull, "no previous backup", ""},
+		{"local dir, no backup yet, creation off: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty}, off, BackupMethodFull, "", "no previous backup to rebuild from"},
+		{"S3 destination: full", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, live, BackupMethodFull, "backups go to S3", ""},
+		{"S3 AND local dir with a backup: still full (the S3 copy must stay fresh)", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap, BaselineS3: "s3://b/"}, live, BackupMethodFull, "backups go to S3", ""},
+		{"S3 destination, creation off: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineS3: "s3://b/"}, off, BackupMethodFull, "", "only a full backup can upload"},
+		{"no destination at all: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src"}, live, BackupMethodFull, "", "no baseline location"},
+		{"lock mode misconfigured with a backup on disk: rebuild", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap}, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock"}, BackupMethodRefresh, "no load", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			method, why, err := ChooseBackupMethod(context.Background(), c.e, c.gates)
+			if method != c.wantMethod {
+				t.Fatalf("method = %q, want %q (why=%q err=%v)", method, c.wantMethod, why, err)
+			}
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("err = %v, want one containing %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if !strings.Contains(why, c.wantWhy) {
+				t.Fatalf("why = %q, want it to mention %q", why, c.wantWhy)
+			}
+		})
+	}
+}
+
 // The precheck the Create backup button runs is the SAME function the
 // schedule checker runs, so the two cannot accept different servers.
 func TestBaselineTriggerPrecheck_sharedWithTheSchedule(t *testing.T) {
@@ -233,8 +315,8 @@ func TestBaselineTriggerPrecheck_sharedWithTheSchedule(t *testing.T) {
 		t.Fatal("fixture is runnable; the test needs a refused entry")
 	}
 	got := CheckBackupSchedule(e, BackupSchedule{Every: "1d"}, BackupScheduleGates{LoopRunning: true, FullBackups: true})
-	if got == nil || RefusalReason(got) != want.Error() {
-		t.Fatalf("schedule reason %v differs from the button's %v", got, want)
+	if got == nil || !strings.HasPrefix(RefusalReason(got), want.Error()) {
+		t.Fatalf("schedule reason %v does not start with the button's %v", got, want)
 	}
 }
 
@@ -284,6 +366,10 @@ func TestBaselineRunHistory_scheduledRunsAndSkips(t *testing.T) {
 	if skip == nil || skip.SkipReason != "off" || skip.Trigger != BaselineRunTriggerScheduled {
 		t.Fatalf("last skip = %+v, want the t5 skip, stamped scheduled", skip)
 	}
+	// An empty reason never folds into a run record.
+	if _, err := h.AppendSkip(BaselineRunRecord{ServerID: "b", Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled, StartedAt: "r", FinishedAt: "r"}); err != nil {
+		t.Fatal(err)
+	}
 	// Skips never join a snapshot: they have none.
 	if rec := h.FindBySnapshot("a", ""); rec != nil {
 		t.Fatalf("a skip joined a snapshot: %+v", rec)
@@ -327,11 +413,9 @@ func TestBaselineRunHistory_capKeepsTheScheduleEvidence(t *testing.T) {
 	if run == nil || run.SnapshotTime != "snap" || skip == nil || skip.SkipReason != "busy" {
 		t.Fatalf("the schedule's evidence was evicted: run=%+v skip=%+v", run, skip)
 	}
-	// Order is preserved: the protected records stay oldest-first at the front.
 	if recs[0].Trigger != BaselineRunTriggerScheduled || recs[1].Trigger != BaselineRunTriggerScheduled {
 		t.Fatalf("protected records lost their place: %+v %+v", recs[0], recs[1])
 	}
-	// A NEWER scheduled run releases the older one to the cap.
 	if err := h.Append(BaselineRunRecord{ServerID: "a", Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled,
 		StartedAt: "s-run-2", FinishedAt: "s-run-2", SnapshotTime: "snap2"}); err != nil {
 		t.Fatal(err)

@@ -14,9 +14,11 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 	body := jsFunctionBody(t, js, "backupScheduleCard")
 
 	raw, err := json.Marshal(backupScheduleDTO{
-		Every: "1d", At: "03:00", Method: BackupMethodFull, NextRun: "x", Runnable: false, Reason: "r", Running: true, HistoryUnavailable: true,
-		LastRun:     &backupScheduleRunDTO{Method: BackupMethodRefresh, FinishedAt: "f", Error: "e", Tables: 1, Carried: 1, Uploaded: 1},
-		LastSkipped: &backupScheduleSkipDTO{At: "a", Reason: "r"},
+		Every: "1d", At: "03:00", NextRun: "x", NextMethod: BackupMethodRefresh, NextMethodWhy: "w",
+		Runnable: false, Reason: "r", Running: true, HistoryUnavailable: true,
+		LastRun:      &backupScheduleRunDTO{Method: BackupMethodRefresh, FinishedAt: "f", Error: "e", Tables: 1, Carried: 1, Uploaded: 1},
+		LastSkipped:  &backupScheduleSkipDTO{At: "a", Reason: "r"},
+		LastFallback: &backupScheduleSkipDTO{At: "a", Reason: "r"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -25,7 +27,7 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"every", "at", "method", "next_run", "runnable", "reason", "running", "history_unavailable", "last_run", "last_skipped"} {
+	for _, key := range []string{"every", "at", "next_run", "next_method", "next_method_why", "runnable", "reason", "running", "history_unavailable", "last_run", "last_skipped", "last_fallback"} {
 		if _, ok := wire[key]; !ok {
 			t.Errorf("backupScheduleDTO does not serialise %q (got %s)", key, raw)
 		}
@@ -50,11 +52,19 @@ func TestBackupScheduleWireNamesMatchTheFrontend(t *testing.T) {
 		if !strings.Contains(body, "skip."+key) {
 			t.Errorf("backupScheduleCard never reads skip.%s", key)
 		}
+		if !strings.Contains(body, "fb."+key) {
+			t.Errorf("backupScheduleCard never reads fb.%s (last_fallback)", key)
+		}
+	}
+	// The method is not an input any more: the form sends only when, and the
+	// card never offers a producer to pick.
+	if strings.Contains(body, "method: how.value") || strings.Contains(body, `el("select"`) {
+		t.Error("the card still offers the producer as a choice; the daemon decides per run (ChooseBackupMethod)")
 	}
 	// The body the form sends is what the handler decodes. Scoped to the
 	// card: `at:` and `method:` occur dozens of times elsewhere in app.js,
 	// so a whole-file search passed without the feature.
-	for _, send := range []string{"every: every.value", "at: at.value", "method: how.value"} {
+	for _, send := range []string{"every: every.value", "at: at.value"} {
 		if !strings.Contains(body, send) {
 			t.Errorf("the schedule form never sends %q", send)
 		}
@@ -98,7 +108,7 @@ func TestBackupScheduleCard_copy(t *testing.T) {
 	if !strings.Contains(body, "Cannot run: ") {
 		t.Error("the summary line does not say when the schedule cannot run")
 	}
-	if !strings.Contains(body, "(CLI: --baseline-refresh-interval") {
-		t.Error("the CLI counterpart is not marked in the (CLI: ...) form")
+	if strings.Contains(body, "rebuild from change history") || strings.Contains(body, "Full backup (reads") {
+		t.Error("the card still names the two producers as options; the operator picks when, the daemon picks how")
 	}
 }

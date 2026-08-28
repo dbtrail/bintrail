@@ -1,6 +1,7 @@
 package console
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -8,14 +9,26 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
-// Backup schedule (#1442): a per-server timer for the two ways this daemon can
-// produce a backup unattended. Stored on the server's registry entry, edited
-// from the Backups page, and consumed by the watch daemon's schedule loop,
-// which reads the registry every tick so a schedule saved from the page
-// applies without a restart. (The registry is in memory once loaded: a
-// schedule typed into the file by hand is seen after the next start.)
+// Backup schedule (#1442): a per-server timer for unattended backups. Stored
+// on the server's registry entry, edited from the Backups page, and consumed
+// by the watch daemon's schedule loop, which reads the registry every tick so
+// a schedule saved from the page applies without a restart. (The registry is
+// in memory once loaded: a schedule typed into the file by hand is seen after
+// the next start.)
+//
+// The operator picks WHEN. HOW is the daemon's decision, made per slot
+// (ChooseBackupMethod): the two producers this daemon has, a full backup from
+// the source and a rebuild of the newest backup from the recorded change
+// history, publish the same thing, a new backup in the list, and which one is
+// right depends on facts the operator should not have to track: whether a
+// previous backup exists to rebuild from, whether the backups go to S3 (only
+// a full backup uploads), whether the recorded history has a gap or a schema
+// change in the window. The first cut put that choice in a dropdown; the
+// product owner's verdict was that it asked the user to understand the fold
+// to do something they think of as "backups every night".
 //
 // The grid is FIXED, not relative to the last run: slots sit at
 // epoch + At + k*Every for every integer k. "every 1d at 03:00" is 03:00 UTC
@@ -24,17 +37,18 @@ import (
 // what keeps a restart from shifting the whole schedule to whenever the
 // daemon happened to come back.
 
-// BackupMethod values. The literals are the file/wire format.
+// BackupMethod values name the producer a scheduled run used. They are the
+// wire format of a run's method on the Backups page, not an input.
 const (
-	// BackupMethodFull takes a full backup from the source database (mydumper,
+	// BackupMethodFull is a full backup from the source database (mydumper,
 	// or pgbaseline for PostgreSQL): the same job the Create backup button
-	// runs, on a timer. It reads production and needs the console's
-	// baseline-creation opt-in.
+	// runs. It reads production and needs the console's baseline-creation
+	// opt-in; when the server has an S3 destination it uploads there.
 	BackupMethodFull = "backup"
 	// BackupMethodRefresh rebuilds the newest backup from the recorded change
 	// history alone (the same fold as --baseline-refresh-interval), reading
-	// nothing from the source. It needs a previous backup on local disk to
-	// start from.
+	// nothing from the source. It needs a previous backup on local disk and
+	// publishes locally only.
 	BackupMethodRefresh = "refresh"
 )
 
@@ -62,29 +76,26 @@ type BackupSchedule struct {
 	// slots; an interval that does not divide a day evenly (5h, 36h) drifts
 	// through the day, and the page shows the next run so that is visible.
 	At string `yaml:"at,omitempty"`
-	// Method is BackupMethodFull or BackupMethodRefresh. Empty means full.
-	Method string `yaml:"method,omitempty"`
 	// Extra preserves future keys the way ServerEntry.Extra does.
 	Extra map[string]any `yaml:",inline"`
 }
 
-// Identity is the schedule as a comparable string (every|at|method, with the
+// Identity is the schedule as a comparable string (every|at, with the
 // defaults resolved), for a consumer that must notice a CHANGED schedule: the
 // loop treats an edit as a new schedule, so the "first observation is silent"
 // rule covers edits the way it covers adds. Unparseable schedules identify
 // by their raw fields.
 func (b BackupSchedule) Identity() string {
 	if n, err := b.Normalized(); err == nil {
-		return n.Every + "|" + n.At + "|" + n.Method
+		return n.Every + "|" + n.At
 	}
-	return b.Every + "|" + b.At + "|" + b.Method
+	return b.Every + "|" + b.At
 }
 
 // ParsedBackupSchedule is a validated schedule, ready for slot arithmetic.
 type ParsedBackupSchedule struct {
-	Every  time.Duration
-	At     time.Duration // offset from midnight UTC
-	Method string
+	Every time.Duration
+	At    time.Duration // offset from midnight UTC
 }
 
 // Parse validates the schedule and resolves its defaults. Every error names
@@ -104,25 +115,20 @@ func (b BackupSchedule) Parse() (ParsedBackupSchedule, error) {
 	if err != nil {
 		return p, fmt.Errorf("at: %w", err)
 	}
-	method, err := parseBackupMethod(b.Method)
-	if err != nil {
-		return p, err
-	}
-	return ParsedBackupSchedule{Every: every, At: at, Method: method}, nil
+	return ParsedBackupSchedule{Every: every, At: at}, nil
 }
 
 // Normalized returns the schedule with its defaults spelled out, for storage:
-// "" becomes "00:00" and BackupMethodFull, so the file says what runs.
+// "" becomes "00:00", so the file says what runs.
 func (b BackupSchedule) Normalized() (BackupSchedule, error) {
 	p, err := b.Parse()
 	if err != nil {
 		return BackupSchedule{}, err
 	}
 	return BackupSchedule{
-		Every:  strings.TrimSpace(b.Every),
-		At:     formatClockTime(p.At),
-		Method: p.Method,
-		Extra:  b.Extra,
+		Every: strings.TrimSpace(b.Every),
+		At:    formatClockTime(p.At),
+		Extra: b.Extra,
 	}, nil
 }
 
@@ -147,17 +153,6 @@ func parseClockTime(s string) (time.Duration, error) {
 
 func formatClockTime(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", int(d.Hours()), int(d.Minutes())%60)
-}
-
-func parseBackupMethod(s string) (string, error) {
-	switch strings.TrimSpace(s) {
-	case "", BackupMethodFull:
-		return BackupMethodFull, nil
-	case BackupMethodRefresh:
-		return BackupMethodRefresh, nil
-	}
-	return "", fmt.Errorf("method: %q is not one of %q (full backup from the database) or %q (rebuild from the change history)",
-		s, BackupMethodFull, BackupMethodRefresh)
 }
 
 // scheduleEpoch anchors the slot grid. Any fixed instant at midnight UTC
@@ -212,7 +207,7 @@ func RefusalReason(err error) string {
 const (
 	scheduleRefusalReadOnly = "scheduled backups run in the watch daemon (bintrail-console watch), not the read-only console"
 	scheduleRefusalNoLoop   = "backup features are turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1 and there is no --baseline-refresh-interval), so nothing can run a schedule"
-	scheduleRefusalNoDumps  = "creating backups from the console is turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1); a schedule can still rebuild from the change history"
+	scheduleRefusalNoDumps  = "creating backups from the console is turned off on this daemon (BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1)"
 )
 
 // BackupScheduleGates is what the daemon can do, as the schedule checker
@@ -222,26 +217,54 @@ type BackupScheduleGates struct {
 	// with a baseline supervisor).
 	LoopRunning bool
 	// FullBackups: this process may take full backups from the source (the
-	// baseline-creation opt-in). A refresh schedule does not need it.
+	// baseline-creation opt-in). A rebuild does not need it.
 	FullBackups bool
 	// FullBackupsErr, when set, is why a full backup cannot START even with
 	// the opt-in on: the lock-mode misconfiguration the supervisor refuses
-	// every MySQL dump with. Reported as the reason so a schedule does not
-	// show a next run it can never keep.
+	// every MySQL dump with.
 	FullBackupsErr string
 	// ReadOnlyConsole: this process is the standalone `serve` console, which
 	// runs no loop of any kind; names the daemon in the reason.
 	ReadOnlyConsole bool
 }
 
+// fullBackupPossible reports whether a full backup can start for e on a
+// daemon with these gates, and why not.
+func fullBackupPossible(e ServerEntry, gates BackupScheduleGates) error {
+	if !gates.FullBackups {
+		return errors.New(scheduleRefusalNoDumps)
+	}
+	if gates.FullBackupsErr != "" && !e.IsPostgres() {
+		// Same scope as the supervisor's refusal: a PostgreSQL dump never
+		// consults the MySQL lock mode.
+		return errors.New(gates.FullBackupsErr)
+	}
+	return baselineTriggerPrecheck(e)
+}
+
+// rebuildPossible reports whether a rebuild from the change history can be
+// attempted for e (the fold itself may still refuse), and why not.
+func rebuildPossible(e ServerEntry) error {
+	if e.DSN == "" {
+		return errors.New("this server has no index connection to rebuild from")
+	}
+	if e.BaselineDir == "" {
+		// Same constraint as the refresh loop and the point-in-time restore:
+		// the fold reads the previous snapshot and writes the new one on
+		// disk, so it needs the server's own local directory.
+		return errors.New("a rebuild from the change history needs a local backup directory")
+	}
+	return nil
+}
+
 // CheckBackupSchedule reports whether e's schedule can run on a daemon with
-// these gates, and why not. Nil error means it can. Called on PUT (so a
-// schedule that could never run is refused with the reason instead of saved)
-// and on every listing (so a schedule the environment later invalidated is
-// reported, not silently skipped by the loop).
+// these gates, and why not. Nil error means at least one producer can run.
+// Called on PUT (so a schedule that could never run is refused with the
+// reason instead of saved) and on every listing (so a schedule the
+// environment later invalidated is reported, not silently skipped by the
+// loop).
 func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupScheduleGates) error {
-	p, err := sched.Parse()
-	if err != nil {
+	if _, err := sched.Parse(); err != nil {
 		return notRunnable(err.Error())
 	}
 	if gates.ReadOnlyConsole {
@@ -250,34 +273,57 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 	if !gates.LoopRunning {
 		return notRunnable(scheduleRefusalNoLoop)
 	}
-	switch p.Method {
-	case BackupMethodFull:
-		if !gates.FullBackups {
-			return notRunnable(scheduleRefusalNoDumps)
-		}
-		if gates.FullBackupsErr != "" && !e.IsPostgres() {
-			// Same scope as the supervisor's refusal: a PostgreSQL dump never
-			// consults the MySQL lock mode.
-			return notRunnable(gates.FullBackupsErr)
-		}
-		if err := baselineTriggerPrecheck(e); err != nil {
-			return notRunnable(err.Error())
-		}
-	case BackupMethodRefresh:
-		if e.DSN == "" {
-			return notRunnable("this server has no index connection to rebuild from")
-		}
-		if e.BaselineDir == "" {
-			// Same constraint as the refresh loop and the point-in-time restore:
-			// the fold reads the previous snapshot and writes the new one on
-			// disk, so it needs the server's own local directory.
-			if e.BaselineS3 != "" {
-				return notRunnable("this server keeps its backups only in S3; a rebuild from the change history needs a local backup directory (Edit → Advanced)")
-			}
-			return notRunnable("this server has no backup directory of its own; set one first (Edit → Advanced)")
-		}
+	fullErr := fullBackupPossible(e, gates)
+	if fullErr == nil {
+		return nil
 	}
+	if rebuildErr := rebuildPossible(e); rebuildErr != nil {
+		return notRunnable(fullErr.Error() + "; " + rebuildErr.Error() + " (Edit → Advanced)")
+	}
+	// Only a rebuild is possible. That is a runnable schedule (it is what
+	// --baseline-refresh-interval does), but only once there is a backup to
+	// rebuild from; the loop reports that per slot.
 	return nil
+}
+
+// ChooseBackupMethod decides how the next scheduled run for e will be made,
+// and why, on a daemon with these gates. The rule, in order:
+//
+//   - backups that go to S3 are FULL backups: only a full backup uploads, so
+//     a rebuild would leave the off-box copy stale while unprunable local
+//     snapshots pile up;
+//   - a server with no previous backup on local disk gets a FULL backup:
+//     there is nothing to rebuild from;
+//   - otherwise the newest backup is REBUILT from the recorded changes, with
+//     no load on the source. If the fold refuses (a capture gap, a schema
+//     change), the loop takes a full backup at the same slot instead, since
+//     a fresh read of the source is exactly what heals those.
+//
+// A rule that picks a producer the daemon cannot run (the opt-in off, no
+// source) is reported as such; the caller decides whether that is a skip.
+func ChooseBackupMethod(ctx context.Context, e ServerEntry, gates BackupScheduleGates) (method, why string, err error) {
+	fullErr := fullBackupPossible(e, gates)
+	rebuildErr := rebuildPossible(e)
+	switch {
+	case e.BaselineS3 != "":
+		if fullErr != nil {
+			return BackupMethodFull, "", fmt.Errorf("this server's backups go to S3, which only a full backup can upload: %w", fullErr)
+		}
+		return BackupMethodFull, "backups go to S3", nil
+	case rebuildErr != nil:
+		if fullErr != nil {
+			return BackupMethodFull, "", fmt.Errorf("%v; %v", fullErr, rebuildErr)
+		}
+		return BackupMethodFull, rebuildErr.Error(), nil
+	}
+	tables, listErr := reconstruct.NewestSnapshotTables(ctx, e.BaselineDir)
+	if listErr != nil || len(tables) == 0 {
+		if fullErr != nil {
+			return BackupMethodFull, "", fmt.Errorf("no previous backup to rebuild from under %s, and a full backup cannot start: %w", e.BaselineDir, fullErr)
+		}
+		return BackupMethodFull, "no previous backup to rebuild from", nil
+	}
+	return BackupMethodRefresh, "updates the latest backup from the recorded changes, with no load on your database", nil
 }
 
 // BackupScheduleState is the schedule loop's in-memory view of one server,
@@ -291,7 +337,7 @@ type BackupScheduleState struct {
 	// LastStartedAt is when the loop last started a job for this server
 	// (RFC3339 UTC), empty if never in this process.
 	LastStartedAt string
-	// LastMethod is that job's method.
+	// LastMethod is that job's producer (BackupMethodFull/Refresh).
 	LastMethod string
 	// Last is the supervisor's status for THAT job: live while it is in the
 	// slot, the copy the loop kept once it finished (so a later manual job
@@ -303,6 +349,10 @@ type BackupScheduleState struct {
 	// could not start, empty if none. The history has the durable copy.
 	LastSkippedAt  string
 	LastSkipReason string
+	// LastFallbackAt / LastFallbackReason describe the last slot where the
+	// rebuild was refused and a full backup was taken instead.
+	LastFallbackAt     string
+	LastFallbackReason string
 }
 
 // BackupScheduleReporter is the schedule loop as the console sees it. nil when
@@ -311,8 +361,8 @@ type BackupScheduleState struct {
 // the listing reports as not runnable.
 type BackupScheduleReporter interface {
 	ScheduleState(serverID string) BackupScheduleState
-	// FullBackups reports whether the loop may run BackupMethodFull schedules
-	// (the daemon's baseline-creation opt-in), and, when it may, whether the
+	// FullBackups reports whether the loop may run full backups (the
+	// daemon's baseline-creation opt-in), and, when it may, whether the
 	// supervisor would still refuse to start one (a lock-mode
 	// misconfiguration): nil when full backups can start.
 	FullBackups() (enabled bool, refusal error)

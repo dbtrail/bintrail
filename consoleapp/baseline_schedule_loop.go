@@ -61,6 +61,9 @@ type backupScheduler struct {
 	// The history has the durable copy; this one is what the page gets when
 	// the history is unavailable.
 	skipped map[string]scheduledSkip
+	// fallback is the last slot per server where the rebuild was refused and
+	// a full backup was taken instead, for the page.
+	fallback map[string]scheduledFallback
 	// warned holds the servers whose unreadable schedule was already reported,
 	// so the log says it once rather than every minute.
 	warned map[string]bool
@@ -88,13 +91,19 @@ type scheduledSkip struct {
 	reason string
 }
 
+type scheduledFallback struct {
+	at     string
+	reason string
+}
+
 func newBackupScheduler(sup *baselineSupervisor, reg *console.Registry, fullBackups, carryDefault bool) *backupScheduler {
 	return &backupScheduler{
 		sup: sup, reg: reg, fullBackups: fullBackups, carryDefault: carryDefault,
-		seen:    make(map[string]seenSlot),
-		started: make(map[string]scheduledStart),
-		skipped: make(map[string]scheduledSkip),
-		warned:  make(map[string]bool),
+		seen:     make(map[string]seenSlot),
+		started:  make(map[string]scheduledStart),
+		skipped:  make(map[string]scheduledSkip),
+		fallback: make(map[string]scheduledFallback),
+		warned:   make(map[string]bool),
 	}
 }
 
@@ -151,10 +160,14 @@ func (b *backupScheduler) ScheduleState(serverID string) console.BackupScheduleS
 	b.mu.Lock()
 	st, started := b.started[serverID]
 	sk, skipped := b.skipped[serverID]
+	fb, fell := b.fallback[serverID]
 	b.mu.Unlock()
 	var out console.BackupScheduleState
 	if skipped {
 		out.LastSkippedAt, out.LastSkipReason = sk.at, sk.reason
+	}
+	if fell {
+		out.LastFallbackAt, out.LastFallbackReason = fb.at, fb.reason
 	}
 	if !started {
 		return out
@@ -277,6 +290,11 @@ func (b *backupScheduler) tick(ctx context.Context, now time.Time) {
 			delete(b.skipped, id)
 		}
 	}
+	for id := range b.fallback {
+		if !live[id] {
+			delete(b.fallback, id)
+		}
+	}
 	b.mu.Unlock()
 }
 
@@ -292,75 +310,171 @@ func (b *backupScheduler) crossed(serverID, identity string, slot time.Time) boo
 	return ok && prev.identity == identity && slot.After(prev.slot)
 }
 
-// fire starts the scheduled job for e, or records why it could not.
+// fire starts the scheduled job for e, or records why it could not. HOW is
+// decided here per slot (console.ChooseBackupMethod): rebuild the newest
+// backup from the recorded changes when that is the right producer, a full
+// backup from the source otherwise. A rebuild the fold refuses (a capture
+// gap, a schema change, nothing to rebuild from after all) falls back to a
+// full backup at the same slot, because a fresh read of the source is
+// exactly what heals those; the fallback is recorded so the page can say
+// what happened and why.
 func (b *backupScheduler) fire(e console.ServerEntry, p console.ParsedBackupSchedule, now time.Time) {
-	enabled, refusal := b.FullBackups()
-	gates := console.BackupScheduleGates{LoopRunning: true, FullBackups: enabled}
-	if refusal != nil {
-		gates.FullBackupsErr = refusal.Error()
-	}
+	gates := b.gates()
 	if err := console.CheckBackupSchedule(e, *e.BackupSchedule, gates); err != nil {
-		b.skip(e, p.Method, now, console.RefusalReason(err))
+		b.skip(e, now, console.RefusalReason(err))
+		return
+	}
+	method, _, err := console.ChooseBackupMethod(b.sup.ctx, e, gates)
+	if err != nil {
+		b.skip(e, now, err.Error())
 		return
 	}
 	stamp := now.Format(time.RFC3339)
-	var err error
-	var since func() string
-	switch p.Method {
-	case console.BackupMethodRefresh:
-		req := refreshRequest{
-			ServerID: e.ID, ServerName: e.Name, IndexDSN: e.DSN, BaselineDir: e.BaselineDir,
-			CarryForwardUnchanged: effectiveCarryForward(b.reg, b.carryDefault),
-			Trigger:               console.BaselineRunTriggerScheduled,
+	if method == console.BackupMethodRefresh {
+		if err := b.startRebuild(e, p, stamp); err == nil {
+			go b.fallBackIfRefused(e, p, stamp)
+			return
+		} else if !errors.Is(err, console.ErrBaselineRunning) {
+			// Not the collision case: the rebuild could not even start. A
+			// full backup would hit the same slot; report it as a skip.
+			b.skip(e, now, err.Error())
+			return
+		} else {
+			b.skip(e, now, "another backup job was running for this server at the scheduled time")
+			return
 		}
-		// The interval is what the overrun warning measures against and
-		// names; for a scheduled rebuild that is the schedule's own `every`,
-		// which is where "raise the interval" is acted on.
-		err = b.sup.TriggerRefresh(req, p.Every)
-		since = func() string { return b.sup.RefreshStatus(e.ID).Since }
-	default:
-		req := console.BaselineRequestFor(e)
-		req.Trigger = console.BaselineRunTriggerScheduled
-		err = b.sup.Trigger(req)
-		since = func() string { return b.sup.Status(e.ID).Since }
 	}
-	switch {
+	b.startFull(e, stamp, now)
+}
+
+// gates is what the checker needs to know about this daemon.
+func (b *backupScheduler) gates() console.BackupScheduleGates {
+	enabled, refusal := b.FullBackups()
+	g := console.BackupScheduleGates{LoopRunning: true, FullBackups: enabled}
+	if refusal != nil {
+		g.FullBackupsErr = refusal.Error()
+	}
+	return g
+}
+
+// startRebuild triggers the fold and records the job as the schedule's.
+func (b *backupScheduler) startRebuild(e console.ServerEntry, p console.ParsedBackupSchedule, stamp string) error {
+	req := refreshRequest{
+		ServerID: e.ID, ServerName: e.Name, IndexDSN: e.DSN, BaselineDir: e.BaselineDir,
+		CarryForwardUnchanged: effectiveCarryForward(b.reg, b.carryDefault),
+		Trigger:               console.BaselineRunTriggerScheduled,
+	}
+	// The interval is what the overrun warning measures against and names;
+	// for a scheduled rebuild that is the schedule's own `every`, which is
+	// where "raise the interval" is acted on.
+	if err := b.sup.TriggerRefresh(req, p.Every); err != nil {
+		return err
+	}
+	b.record(e, console.BackupMethodRefresh, stamp, b.sup.RefreshStatus(e.ID).Since)
+	return nil
+}
+
+// startFull triggers a full backup and records the job as the schedule's, or
+// records the skip.
+func (b *backupScheduler) startFull(e console.ServerEntry, stamp string, now time.Time) {
+	req := console.BaselineRequestFor(e)
+	req.Trigger = console.BaselineRunTriggerScheduled
+	switch err := b.sup.Trigger(req); {
 	case err == nil:
-		// Read back the supervisor's own stamp for the job: this is the key
-		// ScheduleState attributes the slot by. The trigger returned, so the
-		// slot is ours until the job finishes and something else claims it.
-		b.mu.Lock()
-		b.started[e.ID] = scheduledStart{method: p.Method, at: stamp, since: since()}
-		b.mu.Unlock()
-		slog.Info("backup schedule: started", "server", e.Name, "method", p.Method, "every", e.BackupSchedule.Every)
+		b.record(e, console.BackupMethodFull, stamp, b.sup.Status(e.ID).Since)
 	case errors.Is(err, console.ErrBaselineRunning):
 		// The collision the issue names: a manual backup, restore or export
 		// (or the previous scheduled run) holds the server. Skip, do not
 		// queue: a queued dump would fire at an unscheduled moment.
-		b.skip(e, p.Method, now, "another backup job was running for this server at the scheduled time")
+		b.skip(e, now, "another backup job was running for this server at the scheduled time")
 	default:
-		b.skip(e, p.Method, now, err.Error())
+		b.skip(e, now, err.Error())
 	}
+}
+
+// record notes the job the schedule just started. The supervisor's own
+// stamp is read back right after the trigger: it is the key ScheduleState
+// attributes the slot by, and the trigger returned, so the slot is ours
+// until the job finishes and something else claims it.
+func (b *backupScheduler) record(e console.ServerEntry, method, stamp, since string) {
+	b.mu.Lock()
+	b.started[e.ID] = scheduledStart{method: method, at: stamp, since: since}
+	b.mu.Unlock()
+	slog.Info("backup schedule: started", "server", e.Name, "method", method, "every", e.BackupSchedule.Every)
+}
+
+// fallBackIfRefused waits for the rebuild started at stamp to finish and,
+// if it failed, takes a full backup at the same slot. Any failure of the
+// rebuild qualifies: its output is the same as a full backup's, and a full
+// backup is what the operator scheduled in the first place. Nothing happens
+// when the daemon is shutting down, when a full backup is not possible here
+// (recorded as a skip with both reasons), or when another job took the
+// server meanwhile (recorded as a skip).
+func (b *backupScheduler) fallBackIfRefused(e console.ServerEntry, p console.ParsedBackupSchedule, stamp string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("backup schedule: fallback check panicked", "server", e.Name, "panic", r)
+		}
+	}()
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-b.sup.ctx.Done():
+			return
+		case <-t.C:
+		}
+		st := b.ScheduleState(e.ID)
+		if st.LastStartedAt != stamp || st.Last == nil {
+			return // superseded, or the slot is no longer ours
+		}
+		if st.Running {
+			continue
+		}
+		if st.Last.State != "failed" {
+			return
+		}
+		reason := st.Last.LastError
+		now := time.Now().UTC()
+		if err := fullBackupAllowed(e, b.gates()); err != nil {
+			b.skip(e, now, "the rebuild was refused ("+reason+") and a full backup cannot start here: "+err.Error())
+			return
+		}
+		slog.Warn("backup schedule: the rebuild was refused, taking a full backup instead",
+			"server", e.Name, "reason", reason)
+		b.mu.Lock()
+		b.fallback[e.ID] = scheduledFallback{at: now.Format(time.RFC3339), reason: reason}
+		b.mu.Unlock()
+		b.startFull(e, now.Format(time.RFC3339), now)
+		return
+	}
+}
+
+// fullBackupAllowed is ChooseBackupMethod's full-backup half, for the
+// fallback decision.
+func fullBackupAllowed(e console.ServerEntry, gates console.BackupScheduleGates) error {
+	_, _, err := console.ChooseBackupMethod(context.Background(), console.ServerEntry{
+		ID: e.ID, Name: e.Name, DSN: e.DSN, SourceDSN: e.SourceDSN, BaselineDir: e.BaselineDir,
+		BaselineS3: "s3://forces-full/", Flavor: e.Flavor, SourceSlot: e.SourceSlot, SourcePublication: e.SourcePublication,
+		Schemas: e.Schemas,
+	}, gates)
+	return err
 }
 
 // skip records a slot that did not start: in memory (the page's view when
 // the history is unavailable), in the history (so it survives a restart)
 // and in the log.
-func (b *backupScheduler) skip(e console.ServerEntry, method string, now time.Time, reason string) {
+func (b *backupScheduler) skip(e console.ServerEntry, now time.Time, reason string) {
 	stamp := now.Format(time.RFC3339)
-	slog.Warn("backup schedule: scheduled backup did not start", "server", e.Name, "method", method, "reason", reason)
+	slog.Warn("backup schedule: scheduled backup did not start", "server", e.Name, "reason", reason)
 	b.mu.Lock()
 	b.skipped[e.ID] = scheduledSkip{at: stamp, reason: reason}
 	b.mu.Unlock()
 	if b.sup.history == nil {
 		return
 	}
-	kind := console.BaselineRunDump
-	if method == console.BackupMethodRefresh {
-		kind = console.BaselineRunRefresh
-	}
 	_, err := b.sup.history.AppendSkip(console.BaselineRunRecord{
-		ServerID: e.ID, ServerName: e.Name, Kind: kind, SkipReason: reason,
+		ServerID: e.ID, ServerName: e.Name, Kind: console.BaselineRunDump, SkipReason: reason,
 		StartedAt: stamp, FinishedAt: stamp,
 	})
 	if err != nil {

@@ -27,8 +27,9 @@ func (s *stubScheduleReporter) Observe(id string, sched BackupSchedule, _ time.T
 }
 
 // newScheduleServer builds a watch-shaped server with the schedule loop
-// present, a persisted history, and one registry server that can run either
-// method. Returns the server and the entry id.
+// present, a persisted history, and one registry server with a source and a
+// local backup directory (empty: no backup to rebuild from yet). Returns the
+// server and the entry id.
 func newScheduleServer(t *testing.T, rep *stubScheduleReporter) (*Server, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -60,6 +61,16 @@ func newScheduleServer(t *testing.T, rep *stubScheduleReporter) (*Server, string
 	return srv, e.ID
 }
 
+// s3Only rewrites the fixture server to keep its backups in S3 only.
+func s3Only(t *testing.T, srv *Server, id string) {
+	t.Helper()
+	e, _ := srv.cm.reg.Get(id)
+	e.BaselineDir, e.BaselineS3 = "", "s3://bucket/backups/"
+	if err := srv.cm.reg.Update(e); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func scheduleOf(t *testing.T, body []byte) *backupScheduleDTO {
 	t.Helper()
 	var got struct {
@@ -76,34 +87,40 @@ func TestBackupScheduleAPI_saveListRemove(t *testing.T) {
 	srv, id := newScheduleServer(t, rep)
 	path := "/api/servers/" + id + "/backup-schedule"
 
-	rec, body := doServersReq(t, srv, "PUT", path, `{"every":"1d","at":"03:00","method":"backup"}`)
+	rec, body := doServersReq(t, srv, "PUT", path, `{"every":"1d","at":"03:00"}`)
 	if rec.Code != 200 {
 		t.Fatalf("PUT code=%d body=%s", rec.Code, body)
 	}
 	got := scheduleOf(t, body)
-	if got == nil || !got.Runnable || got.NextRun == "" || got.Every != "1d" || got.At != "03:00" || got.Method != BackupMethodFull {
+	if got == nil || !got.Runnable || got.NextRun == "" || got.Every != "1d" || got.At != "03:00" {
 		t.Fatalf("PUT response = %+v", got)
-	}
-	// The loop is told at save time, with the normalized schedule, so the
-	// next_run this response promises is the slot that fires.
-	if len(rep.observed) != 1 || rep.observed[0] != id+" 1d|03:00|backup" {
-		t.Fatalf("Observe calls = %v, want one for the saved schedule", rep.observed)
 	}
 	if !strings.HasSuffix(got.NextRun, "T03:00:00Z") {
 		t.Fatalf("next_run %q is not on the 03:00 grid", got.NextRun)
 	}
+	// No backup on disk yet: the next run is a full backup, and it says why.
+	if got.NextMethod != BackupMethodFull || !strings.Contains(got.NextMethodWhy, "no previous backup") {
+		t.Fatalf("next_method = %q (%q), want a full backup because there is nothing to rebuild from", got.NextMethod, got.NextMethodWhy)
+	}
+	// The loop is told at save time, with the normalized schedule, so the
+	// next_run this response promises is the slot that fires.
+	if len(rep.observed) != 1 || rep.observed[0] != id+" 1d|03:00" {
+		t.Fatalf("Observe calls = %v, want one for the saved schedule", rep.observed)
+	}
 
-	// The listing carries it for the selected server.
+	// The listing carries it for the selected server; once a backup exists
+	// on disk the next run is a rebuild.
+	e, _ := srv.cm.reg.Get(id)
+	fakeSnapshot(t, e.BaselineDir)
 	rec, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
 	if rec.Code != 200 {
 		t.Fatalf("GET /api/baselines code=%d body=%s", rec.Code, body)
 	}
-	if got = scheduleOf(t, body); got == nil || got.Every != "1d" || !got.Runnable {
-		t.Fatalf("listing schedule = %+v", got)
+	if got = scheduleOf(t, body); got == nil || got.Every != "1d" || !got.Runnable || got.NextMethod != BackupMethodRefresh {
+		t.Fatalf("listing schedule = %+v, want runnable with a rebuild next", got)
 	}
 	// Persisted, with the defaults spelled out.
-	e, _ := srv.cm.reg.Get(id)
-	if e.BackupSchedule == nil || e.BackupSchedule.At != "03:00" || e.BackupSchedule.Method != BackupMethodFull {
+	if e.BackupSchedule == nil || e.BackupSchedule.At != "03:00" {
 		t.Fatalf("stored = %+v", e.BackupSchedule)
 	}
 
@@ -134,6 +151,7 @@ func TestBackupScheduleAPI_saveListRemove(t *testing.T) {
 
 func TestBackupScheduleAPI_refusals(t *testing.T) {
 	srv, id := newScheduleServer(t, &stubScheduleReporter{full: false})
+	s3Only(t, srv, id) // no local dir: only a full backup could run, and creation is off
 	path := "/api/servers/" + id + "/backup-schedule"
 	cases := []struct {
 		name string
@@ -142,8 +160,7 @@ func TestBackupScheduleAPI_refusals(t *testing.T) {
 	}{
 		{"too often", `{"every":"1m"}`, "too often"},
 		{"bad clock", `{"every":"1d","at":"3pm"}`, "HH:MM"},
-		{"bad method", `{"every":"1d","method":"snapshot"}`, "method"},
-		{"full backup with creation off", `{"every":"1d","method":"backup"}`, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1"},
+		{"nothing can run here", `{"every":"1d"}`, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1"},
 		{"not json", `{`, "invalid JSON body"},
 	}
 	for _, c := range cases {
@@ -163,9 +180,14 @@ func TestBackupScheduleAPI_refusals(t *testing.T) {
 	if n := len(srv.backupSchedules.(*stubScheduleReporter).observed); n != 0 {
 		t.Fatalf("a refused schedule was observed by the loop %d time(s)", n)
 	}
-	// A refresh schedule needs no creation opt-in.
-	if rec, body := doServersReq(t, srv, "PUT", path, `{"every":"1h","method":"refresh"}`); rec.Code != 200 {
-		t.Fatalf("refresh with creation off: code=%d body=%s", rec.Code, body)
+	// A "method" in the body is not an input any more and is ignored.
+	e, _ := srv.cm.reg.Get(id)
+	e.BaselineDir, e.BaselineS3 = t.TempDir(), ""
+	if err := srv.cm.reg.Update(e); err != nil {
+		t.Fatal(err)
+	}
+	if rec, body := doServersReq(t, srv, "PUT", path, `{"every":"1h","method":"backup"}`); rec.Code != 200 {
+		t.Fatalf("with a local dir and creation off: code=%d body=%s, want runnable (rebuild)", rec.Code, body)
 	}
 	if rec, body := doServersReq(t, srv, "PUT", "/api/servers/default/backup-schedule", `{"every":"1d"}`); rec.Code != 409 {
 		t.Fatalf("boot entry: code=%d body=%s, want 409", rec.Code, body)
@@ -176,7 +198,9 @@ func TestBackupScheduleAPI_refusals(t *testing.T) {
 }
 
 // Without the loop the write is refused, with the daemon named, and the
-// capability says so; the read-only console gets its own words.
+// capability says so; the read-only console gets its own words. A schedule
+// already in the file is still reported, as not runnable, so it is never
+// silently inert.
 func TestBackupScheduleAPI_needsTheLoop(t *testing.T) {
 	srv, id := newScheduleServer(t, nil) // watch, no baseline features
 	rec, body := doServersReq(t, srv, "PUT", "/api/servers/"+id+"/backup-schedule", `{"every":"1d"}`)
@@ -196,8 +220,6 @@ func TestBackupScheduleAPI_needsTheLoop(t *testing.T) {
 		t.Fatalf("read-only console: code=%d body=%s", rec.Code, body)
 	}
 
-	// A schedule that IS in the file (saved by a daemon that could run it)
-	// is still reported, as not runnable, so it is never silently inert.
 	live, id2 := newScheduleServer(t, &stubScheduleReporter{full: true})
 	if rec, body := doServersReq(t, live, "PUT", "/api/servers/"+id2+"/backup-schedule", `{"every":"1d"}`); rec.Code != 200 {
 		t.Fatalf("seed: code=%d body=%s", rec.Code, body)
@@ -205,16 +227,19 @@ func TestBackupScheduleAPI_needsTheLoop(t *testing.T) {
 	live.backupSchedules = nil
 	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)
 	got := scheduleOf(t, body)
-	if got == nil || got.Runnable || !strings.Contains(got.Reason, "BINTRAIL_CONSOLE_BASELINE_TRIGGER is not set to 1") {
-		t.Fatalf("dormant schedule = %+v, want reported as not runnable with the reason", got)
+	if got == nil || got.Runnable || !strings.Contains(got.Reason, scheduleRefusalNoLoop) {
+		t.Fatalf("dormant schedule = %+v, want reported as not runnable with the PUT refusal's words", got)
 	}
-	// The words the listing reports with are the words the write refuses
-	// with, on both process shapes.
-	if !strings.Contains(got.Reason, scheduleRefusalNoLoop) {
-		t.Fatalf("listing reason %q differs from the PUT refusal", got.Reason)
+	// The creation opt-in going away on a server whose backups go to S3
+	// (only a full backup uploads) flips it to not runnable, with the reason.
+	s3Only(t, live, id2)
+	live.backupSchedules = &stubScheduleReporter{full: false}
+	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)
+	if got = scheduleOf(t, body); got == nil || got.Runnable || !strings.Contains(got.Reason, "is not set to 1") {
+		t.Fatalf("S3 schedule with creation off = %+v", got)
 	}
 	// The supervisor's standing refusal (lock-mode misconfiguration) reaches
-	// the listing as the reason, so a next run is not promised for a
+	// the listing the same way, so a next run is not promised for a
 	// schedule that can never start.
 	live.backupSchedules = &stubScheduleReporter{full: true, refusal: errors.New("BINTRAIL_CONSOLE_BASELINE_LOCK_MODE: unknown mode")}
 	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)
@@ -224,28 +249,24 @@ func TestBackupScheduleAPI_needsTheLoop(t *testing.T) {
 	if rec, body := doServersReq(t, live, "PUT", "/api/servers/"+id2+"/backup-schedule", `{"every":"1d"}`); rec.Code != 400 || !strings.Contains(string(body), "unknown mode") {
 		t.Fatalf("PUT under a misconfigured lock mode: code=%d body=%s, want 400 with the reason", rec.Code, body)
 	}
-	// And the creation opt-in going away flips a full-backup schedule the
-	// same way.
-	live.backupSchedules = &stubScheduleReporter{full: false}
-	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)
-	if got = scheduleOf(t, body); got == nil || got.Runnable || !strings.Contains(got.Reason, "can still rebuild") {
-		t.Fatalf("full schedule with creation off = %+v", got)
+	// Back on a local directory, the rebuild path makes the same schedule
+	// runnable again under the same misconfiguration.
+	e2, _ := live.cm.reg.Get(id2)
+	e2.BaselineDir, e2.BaselineS3 = t.TempDir(), ""
+	if err := live.cm.reg.Update(e2); err != nil {
+		t.Fatal(err)
 	}
-	// A rebuild schedule is subject to neither the opt-in nor the lock mode.
-	live.backupSchedules = &stubScheduleReporter{full: false, refusal: errors.New("bad lock mode")}
-	if rec, body := doServersReq(t, live, "PUT", "/api/servers/"+id2+"/backup-schedule", `{"every":"1d","method":"refresh"}`); rec.Code != 200 {
-		t.Fatalf("a rebuild schedule is not subject to the lock mode: code=%d body=%s", rec.Code, body)
-	}
+	fakeSnapshot(t, e2.BaselineDir)
 	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)
-	if got = scheduleOf(t, body); got == nil || !got.Runnable {
-		t.Fatalf("rebuild schedule with creation off = %+v, want runnable", got)
+	if got = scheduleOf(t, body); got == nil || !got.Runnable || got.NextMethod != BackupMethodRefresh {
+		t.Fatalf("local schedule under a lock-mode misconfiguration = %+v, want runnable as a rebuild", got)
 	}
 }
 
 func TestBackupScheduleAPI_lastRunAndSkipComeFromTheHistory(t *testing.T) {
 	rep := &stubScheduleReporter{full: true, state: map[string]BackupScheduleState{}}
 	srv, id := newScheduleServer(t, rep)
-	if rec, body := doServersReq(t, srv, "PUT", "/api/servers/"+id+"/backup-schedule", `{"every":"6h","method":"refresh"}`); rec.Code != 200 {
+	if rec, body := doServersReq(t, srv, "PUT", "/api/servers/"+id+"/backup-schedule", `{"every":"6h"}`); rec.Code != 200 {
 		t.Fatalf("seed: code=%d body=%s", rec.Code, body)
 	}
 	h := srv.baselineHistory
@@ -254,7 +275,7 @@ func TestBackupScheduleAPI_lastRunAndSkipComeFromTheHistory(t *testing.T) {
 		Tables: 12, Carried: 3}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.AppendSkip(BaselineRunRecord{ServerID: id, Kind: BaselineRunRefresh, SkipReason: "busy",
+	if _, err := h.AppendSkip(BaselineRunRecord{ServerID: id, Kind: BaselineRunDump, SkipReason: "busy",
 		StartedAt: "2026-08-28T15:00:00Z", FinishedAt: "2026-08-28T15:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +293,8 @@ func TestBackupScheduleAPI_lastRunAndSkipComeFromTheHistory(t *testing.T) {
 	if !got.Running {
 		t.Fatal("the loop's running state did not reach the listing")
 	}
-	// A failed run is reported as such, error included.
+	// A failed run is reported as such, error included; a job in flight is
+	// not yet a run, so the history's record stays.
 	if err := h.Append(BaselineRunRecord{ServerID: id, Kind: BaselineRunRefresh, Trigger: BaselineRunTriggerScheduled,
 		StartedAt: "2026-08-28T21:00:00Z", FinishedAt: "2026-08-28T21:00:30Z", Error: "capture gap", Refused: 1}); err != nil {
 		t.Fatal(err)
@@ -280,10 +302,6 @@ func TestBackupScheduleAPI_lastRunAndSkipComeFromTheHistory(t *testing.T) {
 	_, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
 	if got = scheduleOf(t, body); got.LastRun == nil || got.LastRun.OK || got.LastRun.Error != "capture gap" || got.LastRun.Refused != 1 {
 		t.Fatalf("failed last_run = %+v", got.LastRun)
-	}
-	// A job in flight is not yet a run: the history's record stays.
-	if got.Running && got.LastRun.StartedAt != "2026-08-28T21:00:00Z" {
-		t.Fatalf("a running job replaced the last recorded run: %+v", got.LastRun)
 	}
 }
 
@@ -297,7 +315,6 @@ func TestBackupScheduleAPI_lastRunFallsBackToTheLoop(t *testing.T) {
 	if rec, body := doServersReq(t, srv, "PUT", "/api/servers/"+id+"/backup-schedule", `{"every":"1d"}`); rec.Code != 200 {
 		t.Fatalf("seed: code=%d body=%s", rec.Code, body)
 	}
-	// Older history record, newer in-memory failure with no record (a panic).
 	if err := srv.baselineHistory.Append(BaselineRunRecord{ServerID: id, Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled,
 		StartedAt: "2026-08-27T03:00:00Z", FinishedAt: "2026-08-27T03:04:00Z", Tables: 3}); err != nil {
 		t.Fatal(err)
@@ -321,18 +338,22 @@ func TestBackupScheduleAPI_lastRunFallsBackToTheLoop(t *testing.T) {
 		t.Fatalf("a succeeded rebuild did not name its snapshot: %+v", got.LastRun)
 	}
 	rep.state[id].Last.State, rep.state[id].Last.LastError = "failed", "panic: nil map"
-	// A skip only the loop knows about (history unavailable for it) shows
-	// too, and a newer one beats the history's.
+	// A skip and a fallback only the loop knows about show too; a newer
+	// skip beats the history's.
 	if _, err := srv.baselineHistory.AppendSkip(BaselineRunRecord{ServerID: id, Kind: BaselineRunDump, SkipReason: "old",
 		StartedAt: "2026-08-26T03:00:00Z", FinishedAt: "2026-08-26T03:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
 	st := rep.state[id]
 	st.LastSkippedAt, st.LastSkipReason = "2026-08-29T03:00:00Z", "busy"
+	st.LastFallbackAt, st.LastFallbackReason = "2026-08-28T03:00:00Z", "capture gap"
 	rep.state[id] = st
 	_, body = doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
 	if got = scheduleOf(t, body); got.LastSkipped == nil || got.LastSkipped.Reason != "busy" {
 		t.Fatalf("last_skipped = %+v, want the loop's newer skip", got.LastSkipped)
+	}
+	if got.LastFallback == nil || got.LastFallback.Reason != "capture gap" {
+		t.Fatalf("last_fallback = %+v, want the loop's fallback", got.LastFallback)
 	}
 	// The same job once recorded: the record wins (it is not older).
 	if err := srv.baselineHistory.Append(BaselineRunRecord{ServerID: id, Kind: BaselineRunDump, Trigger: BaselineRunTriggerScheduled,
@@ -366,7 +387,7 @@ func TestBackupScheduleAPI_lastRunFallsBackToTheLoop(t *testing.T) {
 func TestBackupScheduleAPI_readOnlyRegistry(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/console-servers.yaml"
-	if err := os.WriteFile(path, []byte("version: 2\nservers:\n  - id: abc\n    name: wp\n    index_dsn: idx:pw@tcp(127.0.0.1:3306)/idx\n    source_dsn: src:pw@tcp(127.0.0.1:3306)/\n    baseline_dir: /b\n    backup_schedule:\n      every: 1d\n      at: \"03:00\"\n      method: backup\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("version: 2\nservers:\n  - id: abc\n    name: wp\n    index_dsn: idx:pw@tcp(127.0.0.1:3306)/idx\n    source_dsn: src:pw@tcp(127.0.0.1:3306)/\n    baseline_dir: /b\n    backup_schedule:\n      every: 1d\n      at: \"03:00\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	reg, err := LoadRegistry(path)
@@ -396,7 +417,7 @@ func TestBackupScheduleAPI_readOnlyRegistry(t *testing.T) {
 func TestBackupScheduleAPI_fileRoundTripKeepsExtra(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/console-servers.yaml"
-	if err := os.WriteFile(path, []byte("version: 1\nservers:\n  - id: abc\n    name: wp\n    index_dsn: idx:pw@tcp(127.0.0.1:3306)/idx\n    source_dsn: src:pw@tcp(127.0.0.1:3306)/\n    baseline_dir: "+dir+"\n    backup_schedule:\n      every: 1d\n      at: \"03:00\"\n      method: backup\n      future_key: 42\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("version: 1\nservers:\n  - id: abc\n    name: wp\n    index_dsn: idx:pw@tcp(127.0.0.1:3306)/idx\n    source_dsn: src:pw@tcp(127.0.0.1:3306)/\n    baseline_dir: "+dir+"\n    backup_schedule:\n      every: 1d\n      at: \"03:00\"\n      future_key: 42\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	reg, err := LoadRegistry(path)
@@ -408,7 +429,7 @@ func TestBackupScheduleAPI_fileRoundTripKeepsExtra(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec, body := doServersReq(t, srv, "PUT", "/api/servers/abc/backup-schedule", `{"every":"6h","at":"01:00","method":"refresh"}`); rec.Code != 200 {
+	if rec, body := doServersReq(t, srv, "PUT", "/api/servers/abc/backup-schedule", `{"every":"6h","at":"01:00"}`); rec.Code != 200 {
 		t.Fatalf("PUT code=%d body=%s", rec.Code, body)
 	}
 	again, err := LoadRegistry(path)
@@ -416,7 +437,7 @@ func TestBackupScheduleAPI_fileRoundTripKeepsExtra(t *testing.T) {
 		t.Fatal(err)
 	}
 	e, _ := again.Get("abc")
-	if e.BackupSchedule == nil || e.BackupSchedule.Every != "6h" || e.BackupSchedule.At != "01:00" || e.BackupSchedule.Method != BackupMethodRefresh {
+	if e.BackupSchedule == nil || e.BackupSchedule.Every != "6h" || e.BackupSchedule.At != "01:00" {
 		t.Fatalf("reloaded schedule = %+v", e.BackupSchedule)
 	}
 	if e.BackupSchedule.Extra["future_key"] != 42 {

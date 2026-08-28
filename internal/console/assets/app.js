@@ -4559,6 +4559,11 @@ function backupFoldError(msg) {
 // or skipped scheduled run opens the card and says so in red: a schedule
 // that fails quietly is worse than none.
 //
+// The operator picks WHEN. How each run is made (a full backup from the
+// database, or updating the latest backup from the recorded changes) is the
+// daemon's call per run, and the card SAYS which one comes next and why, so
+// nobody has to understand the machinery to schedule a backup.
+//
 // Only the FORM is gated on the capability. A saved schedule is rendered
 // whenever the listing carries one, capability or not: a daemon restarted
 // with every backup feature off still has the schedule in its file, the API
@@ -4579,8 +4584,7 @@ function backupScheduleCard(cur, b) {
   if (!sch) {
     summary.textContent = "Scheduled backups: none";
   } else {
-    const how = sch.method === "refresh" ? "rebuild from change history" : "full backup";
-    let line = "Scheduled backups: every " + sch.every + " at " + sch.at + " UTC, " + how + ".";
+    let line = "Scheduled backups: every " + sch.every + " at " + sch.at + " UTC.";
     if (sch.runnable && sch.next_run) line += " Next: " + utcLabel(sch.next_run) + ".";
     if (!sch.runnable) line += " Cannot run: " + (sch.reason || "unknown reason");
     summary.textContent = line;
@@ -4588,10 +4592,9 @@ function backupScheduleCard(cur, b) {
 
   body.append(el("p", { class: "form-hint", text:
     "Takes a backup on a fixed timetable while the daemon runs, so the list below keeps growing without anyone running a command. " +
-    "A full backup reads your database, the same job as Create backup. A rebuild from change history makes a new backup " +
-    "from the previous one plus the recorded changes, and reads nothing from your database. " +
-    "Missed times are not made up: a backup due while the daemon was stopped waits for the next one. " +
-    "(CLI: --baseline-refresh-interval rebuilds every server at once)" }));
+    "When it can, the daemon updates the latest backup from the recorded changes, with no load on your database; " +
+    "when it cannot (no backup yet, backups kept in S3, a gap in the recorded changes) it takes a full backup from your database, the same job as Create backup. " +
+    "Missed times are not made up: a backup due while the daemon was stopped waits for the next one." }));
 
   if (!canEdit) {
     // The read-only console, or a daemon with every backup feature off:
@@ -4611,18 +4614,14 @@ function backupScheduleCard(cur, b) {
   const at = el("input", { class: "in", type: "text", spellcheck: "false", placeholder: "03:00", "aria-label": "At (UTC)" });
   at.value = sch ? sch.at : "03:00";
   at.style.maxWidth = "90px";
-  const how = el("select", { class: "select", "aria-label": "How" });
-  how.append(el("option", { value: "backup", text: "Full backup (reads your database)" }));
-  how.append(el("option", { value: "refresh", text: "Rebuild from change history (no load on your database)" }));
-  how.value = sch ? sch.method : (capsCache.baseline_trigger ? "backup" : "refresh");
   const save = el("button", { class: "btn", type: "button", text: sch ? "Save schedule" : "Add schedule" });
   const msg = el("p", { class: "form-msg err" });
   msg.hidden = true;
-  save.onclick = () => saveBackupSchedule(cur.id, { every: every.value.trim(), at: at.value.trim(), method: how.value }, save, msg);
+  save.onclick = () => saveBackupSchedule(cur.id, { every: every.value.trim(), at: at.value.trim() }, save, msg);
   const row = el("div", { class: "bk-restore-row" },
     el("span", { class: "form-hint", text: "every" }), every,
     el("span", { class: "form-hint", text: "at" }), at,
-    el("span", { class: "form-hint", text: "UTC" }), how, save);
+    el("span", { class: "form-hint", text: "UTC" }), save);
   if (sch) {
     const remove = el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Remove schedule" });
     remove.onclick = () => removeBackupSchedule(cur.id, remove, msg);
@@ -4632,11 +4631,16 @@ function backupScheduleCard(cur, b) {
     "Every: minutes, hours or days (30m, 6h, 1d), at least 15m. At: the UTC time the timetable lines up on; for whole " +
     "days (1d, 7d) it is the time of day the backup runs." }), msg);
 
-  // What the schedule last did. The skip is shown when it is the newest
-  // fact: a slot that could not start after the last good run is exactly
-  // what the operator needs to see.
+  // What the schedule will do next, and what it last did. The skip is
+  // shown when it is the newest fact: a slot that could not start after
+  // the last good run is exactly what the operator needs to see.
   if (sch) {
     let alarm = false;
+    if (sch.runnable && sch.next_method) {
+      const how = sch.next_method === "refresh" ? "will update the latest backup from the recorded changes" : "will take a full backup from your database";
+      body.append(el("p", { class: "form-hint", text:
+        "Next run " + how + (sch.next_method_why ? " (" + sch.next_method_why + ")." : ".") }));
+    }
     if (sch.history_unavailable) {
       // Without the run history only what this daemon started since boot is
       // known; "it has not run yet" would be a guess, so say what is missing.
@@ -4647,22 +4651,27 @@ function backupScheduleCard(cur, b) {
     if (sch.running) {
       body.append(el("p", { class: "form-hint", text: "A scheduled backup is running now." }));
     }
-    const run = sch.last_run, skip = sch.last_skipped;
+    const run = sch.last_run, skip = sch.last_skipped, fb = sch.last_fallback;
     if (run) {
       const when = utcLabel(run.finished_at || run.started_at || "");
-      const what = run.method === "refresh" ? "rebuild" : "full backup";
+      const what = run.method === "refresh" ? "update from the recorded changes" : "full backup";
       if (run.ok) {
         const reused = run.carried || 0;
         body.append(el("p", { class: "form-hint", text:
-          "Last scheduled " + what + " finished " + when + ": " + (run.tables || 0) + " table(s)" +
+          "Last scheduled backup finished " + when + " (" + what + "): " + (run.tables || 0) + " table(s)" +
           (reused ? ", " + reused + " unchanged and reused" : "") +
           (run.uploaded ? ", " + run.uploaded + " file(s) uploaded" : "") + "." }));
       } else {
         alarm = true;
         body.append(el("p", { class: "form-msg err", text:
-          "Last scheduled " + what + " failed " + when + ": " + backupFoldError(run.error || "unknown error") +
-          (run.method === "refresh" ? " Nothing was overwritten; the next scheduled run retries." : "") }));
+          "Last scheduled backup failed " + when + " (" + what + "): " + backupFoldError(run.error || "unknown error") +
+          " Nothing was overwritten; the next scheduled run tries again." }));
       }
+    }
+    if (fb && (!run || fb.at >= (run.started_at || ""))) {
+      body.append(el("p", { class: "form-hint", text:
+        "At " + utcLabel(fb.at) + " the update from the recorded changes was refused (" + backupFoldError(fb.reason) +
+        ") so a full backup was taken instead." }));
     }
     if (skip && (!run || skip.at > (run.finished_at || ""))) {
       alarm = true;

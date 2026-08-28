@@ -380,28 +380,36 @@ panel that answers whether a restore would work, far below the fold.
   in this panel's header.
 - **Scheduled backups** (#1442) — a per-server timetable, set from this page:
   every N minutes, hours or days (at least 15m), lined up on a UTC time of
-  day, taking either a **full backup** (the Create backup job: reads the
-  source, needs `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`) or a **rebuild from
-  change history** (the baseline-refresh fold: reads nothing from the source,
-  needs the server's own local backup directory). Stored on the server's
-  registry entry (`backup_schedule`), read by the watch daemon every minute,
-  so it applies without a restart. The grid is fixed (`every 1d at 03:00` is
-  03:00 UTC daily; `every 6h at 03:00` is 03/09/15/21), which is what makes
-  the next run computable and shown (an interval that does not divide a day
-  evenly, `5h` or `36h`, drifts through the day; the page shows where it lands
-  next). It fires only on a slot boundary the daemon is up to see: a slot
-  missed while stopped is not made up, and saving a schedule, new or edited,
-  never starts a backup on the spot. A scheduled run that collides
-  with a manual backup, restore or export skips that slot rather than queuing,
-  and the skip, like every scheduled run, is written to the baseline run
-  history (a streak of identical skips is one record whose time moves to the
-  latest missed slot) so the page shows the last run, its result and the last
-  skip after a restart too; the daemon's own view of the job it last started
-  fills in when the history file is unavailable or a job died without
-  writing one. A schedule the daemon cannot run as configured (the creation
-  opt-in not set, a lock-mode misconfiguration, no destination) is refused on
-  save with the reason, and one already saved is reported as not runnable on
-  the page, never silently skipped.
+  day. The operator picks WHEN; HOW each run is made is the daemon's decision
+  per slot (`console.ChooseBackupMethod`), and the page says which one comes
+  next and why: backups that go to S3 are always **full backups** (the Create
+  backup job, reads the source, needs `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`;
+  only a full backup uploads); a server with no previous backup on local disk
+  gets a full backup too; otherwise the newest backup is **updated from the
+  recorded changes** (the baseline-refresh fold: reads nothing from the
+  source, needs the server's own local backup directory). An update the fold
+  refuses (a capture gap, a schema change) falls back to a full backup at the
+  same slot, since a fresh read of the source is exactly what heals those,
+  and the fallback is shown on the page. Stored on the server's registry
+  entry (`backup_schedule`), read by the watch daemon every minute, so it
+  applies without a restart. The grid is fixed (`every 1d at 03:00` is 03:00
+  UTC daily; `every 6h at 03:00` is 03/09/15/21; an interval that does not
+  divide a day evenly, `5h` or `36h`, drifts through the day; the page shows
+  where it lands next). It fires only on a slot boundary the daemon is up to
+  see: a slot missed while stopped is not made up, and saving a schedule, new
+  or edited, never starts a backup on the spot (the API tells the loop the
+  save instant, so a boundary inside the next minute is not lost either). A
+  scheduled run that collides with a manual backup, restore or export skips
+  that slot rather than queuing, and the skip, like every scheduled run, is
+  written to the baseline run history (a streak of identical skips is one
+  record whose time moves to the latest missed slot) so the page shows the
+  last run, its result and the last skip after a restart too; the daemon's
+  own view of the job it last started fills in when the history file is
+  unavailable or a job died without writing one. A schedule the daemon cannot
+  serve at all (no producer possible: creation opt-in not set AND no local
+  directory, a lock-mode misconfiguration on an S3-only server, no
+  destination) is refused on save with the reason, and one already saved is
+  reported as not runnable on the page, never silently skipped.
   `PUT`/`DELETE /api/servers/{id}/backup-schedule`; state on `GET /api/baselines`
   (`schedule`). The daemon-wide `--baseline-refresh-interval` below is
   independent and can run alongside.
