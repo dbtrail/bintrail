@@ -146,7 +146,17 @@ func (h *BaselineRunHistory) save() error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(h.path), ".baseline-history-*")
+	// Create the tree first, exactly as the sibling savers do (Registry.save,
+	// saveAuthFile, saveMCPTokenFile, VerifyHistory.save — this is
+	// VerifyHistory.save's shape, the closest relative). Nothing else creates
+	// ~/.config/bintrail on a fresh install, so without this the first refresh
+	// on a brand-new host loses its history to ENOENT (#1487). 0700 because
+	// the directory also holds the registry's DSN passwords.
+	dir := filepath.Dir(h.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".baseline-history-*")
 	if err != nil {
 		return err
 	}
