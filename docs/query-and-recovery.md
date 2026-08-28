@@ -17,7 +17,10 @@ Filters: `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`,
 `--column-eq` (events where a column has a given value — see below), and
 `--flag` (tables/columns labeled via [RBAC flags](server-identity.md)). A
 `--pk` lookup is fast and collision-safe — it matches a hash of the PK values
-plus the exact values. Binary primary keys need a special spelling — see
+plus the exact values, and it requires `--schema` and `--table` alongside it.
+That is not a formality: those two columns lead the index, so a lookup without
+them would scan the table instead of seeking, and the command refuses rather
+than doing that quietly. Binary primary keys need a special spelling — see
 [the `0x` hex spelling](#binary-primary-keys-the-0x-hex-spelling) below.
 
 ### Binary primary keys: the `0x` hex spelling

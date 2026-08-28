@@ -110,11 +110,27 @@ can group indexed files by origin server — see
 
 Indexed events go into `binlog_events`, range-partitioned by hour on
 `event_timestamp`. PK lookups are fast because `pk_hash`
-(`SHA2(pk_values, 256)`) is a stored, indexed column; queries match on
-`pk_hash` **and** the exact `pk_values` (the second check guards against the
-astronomically rare hash collision). `pk_values` is the pipe-delimited PK in
-column ordinal order; a PK value whose raw bytes are not valid UTF-8 (e.g. a
-`BINARY(16)` UUID) is stored as `0x` + uppercase hex — see
+(`SHA2(pk_values, 256)`) is covered by `idx_pk_hash (schema_name, table_name,
+pk_hash, event_timestamp)`; queries match on `pk_hash` **and** the exact
+`pk_values` (the second check guards against the astronomically rare hash
+collision).
+
+Those are two separate rules, and it is worth keeping them apart. Matching
+`pk_values` is what makes the answer *correct*. Naming `schema_name` and
+`table_name` is what makes it *fast*: they lead the index, so a predicate
+without them leaves the optimizer nothing to seek on and it falls back to
+scanning the table. `EXPLAIN` tells you which one you got — `type: ref` with
+`key: idx_pk_hash` when the leading columns are present, `type: ALL` when they
+are not.
+
+This matters when you query `binlog_events` directly, in SQL you wrote. The
+shipped commands already require it: `query`, `recover`, the MCP tools and the
+console all refuse a PK filter that does not also name a schema and a table,
+precisely so the index is never scanned blindly.
+
+`pk_values` is the pipe-delimited PK in column ordinal order; a PK value
+whose raw bytes are not valid UTF-8 (e.g. a `BINARY(16)` UUID) is stored as
+`0x` + uppercase hex — see
 [Binary primary keys](query-and-recovery.md#binary-primary-keys-the-0x-hex-spelling)
 for how to spell it in `--pk` lookups. Partition lifecycle, retention, and
 archiving to Parquet are covered in [Rotation and status](rotation-and-status.md).
