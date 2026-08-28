@@ -36,6 +36,7 @@ var consoleStateEnvVars = []string{
 var (
 	composeStateMountRE = regexp.MustCompile(`^\s*-\s*bintrail-state:([^\s:]+)\s*(?::(ro))?\s*(?:#.*)?$`)
 	composeEnvRE        = regexp.MustCompile(`^\s*(BINTRAIL_CONSOLE_[A-Z_]+):\s*(\S+)`)
+	composeServiceKeyRE = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
 )
 
 func TestComposeKeepsConsoleStateOnTheVolume(t *testing.T) {
@@ -95,8 +96,12 @@ func composeServiceBlock(t *testing.T, doc, service string) []string {
 	}
 	end := len(lines)
 	for i := start; i < len(lines); i++ {
-		line := lines[i]
-		if strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "   ") && strings.TrimSpace(line) != "" {
+		// The next service KEY, not merely the next two-space-indented line:
+		// comments sit at that indent too, and stopping at one would truncate
+		// the block mid-service. Truncation cannot make the checks pass
+		// vacuously (a block missing the mount fails, a block missing an env
+		// var fails), but it would report the wrong reason.
+		if composeServiceKeyRE.MatchString(lines[i]) {
 			end = i
 			break
 		}
