@@ -15,8 +15,8 @@ func TestErrConflictStaysASentinelAndIsClassed(t *testing.T) {
 	if !errors.Is(wrapped, ErrConflict) {
 		t.Fatal("errors.Is(wrapped, ErrConflict) = false")
 	}
-	if errors.Is(errors.New("server identity conflict"), ErrConflict) {
-		t.Fatal("an unrelated error with similar text must not match ErrConflict")
+	if got, want := ErrConflict.Error(), "server identity conflict: server_uuid and host:port:username match different records — resolve manually"; got != want {
+		t.Fatalf("message changed: %q", got)
 	}
 	if got := telemetry.ClassifyError(wrapped); got != telemetry.ClassConfigInvalid {
 		t.Errorf("ClassifyError(ErrConflict) = %q, want %q", got, telemetry.ClassConfigInvalid)

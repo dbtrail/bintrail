@@ -3,6 +3,7 @@ package parser
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"slices"
 	"strings"
@@ -767,6 +768,10 @@ func TestHandleRows_partialImageFailsLoud(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "partial binlog row image") {
 		t.Errorf("error should name the partial-image cause, got: %v", err)
+	}
+	var partial *PartialRowImageError
+	if !errors.As(err, &partial) {
+		t.Errorf("error is %T, want *PartialRowImageError (usage telemetry classifies it as config_invalid, #1503)", err)
 	}
 	if !strings.Contains(err.Error(), "FULL") {
 		t.Errorf("error should mention binlog_row_image=FULL, got: %v", err)

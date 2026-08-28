@@ -39,10 +39,20 @@ func TestIndexChecksWithAbsentDatabase(t *testing.T) {
 	if conn.Status != StatusPass {
 		t.Errorf("checkIndexConnection with absent DB: Status = %q (detail=%q), want PASS", conn.Status, conn.Detail)
 	}
+	// Literal, not the constant: PreflightError.TelemetryClass keys on these
+	// names, so the real producer and the classifier must agree on the bytes
+	// (#1503) — a test that used the constant on both sides would not notice
+	// a producer that spelled it out again.
+	if conn.Name != "Index MySQL connection" {
+		t.Errorf("checkIndexConnection Name = %q", conn.Name)
+	}
 
 	write := checkIndexWriteAccess(ctx, dsn, dbName)
 	if write.Status != StatusPass {
 		t.Errorf("checkIndexWriteAccess with absent DB: Status = %q (detail=%q), want PASS", write.Status, write.Detail)
+	}
+	if write.Name != "Index write access" {
+		t.Errorf("checkIndexWriteAccess Name = %q", write.Name)
 	}
 
 	// The probe must not leave the database behind (#384).
@@ -63,5 +73,8 @@ func TestIndexChecksWithAbsentDatabase(t *testing.T) {
 	bad := checkIndexConnection(ctx, "root:wrong@tcp(127.0.0.1:1)/nope?timeout=1s", "nope")
 	if bad.Status != StatusFail {
 		t.Errorf("unreachable server: Status = %q, want FAIL", bad.Status)
+	}
+	if bad.Name != "Index MySQL connection" {
+		t.Errorf("unreachable server: Name = %q", bad.Name)
 	}
 }

@@ -857,7 +857,7 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) Ch
 			}
 		}
 		return CheckResult{
-			Name:   "Schema visibility",
+			Name:   SchemaAccessCheckName,
 			Status: StatusFail,
 			Detail: "no tables visible in " + filter,
 			Remediation: "Bintrail needs at least SELECT on information_schema to read column metadata.\n" +
@@ -1196,6 +1196,12 @@ const (
 	PGSourceConnectionCheckName = "Source PostgreSQL connection"
 	ReplicationGrantsCheckName  = "REPLICATION SLAVE + CLIENT grants"
 	IndexWriteAccessCheckName   = "Index write access"
+	// SchemaAccessCheckName is the schema-visibility probe's grants branch:
+	// no tables visible at all, whose remediation is GRANT SELECT. The
+	// empty-schema branch keeps the "Schema visibility" name — it is not a
+	// permission problem, and telling the operator to GRANT there sends
+	// them down the wrong path (#402).
+	SchemaAccessCheckName = "Schema access"
 	// ExtensionPanicCheckName is the FAIL cliapp records when a registered
 	// extension check panics: a bug, not a setting, so it classifies as
 	// internal.
@@ -1223,7 +1229,8 @@ func (e *PreflightError) Error() string {
 // TelemetryClass implements telemetry.Classed, deriving the class from WHICH
 // checks failed rather than reporting every refusal as one bucket: a
 // preflight that could not reach the source or the index is db_connection,
-// one refused for grants or index write access is db_permission, and
+// one refused for grants, index write access or schema access is
+// db_permission, and
 // a panicking extension check is internal, and anything else —
 // binlog_format, row image, log_bin, retention, FK cascades, an extension's
 // own check — is config_invalid, a server setting the operator has to
@@ -1253,7 +1260,7 @@ func checkClass(name string) (string, int) {
 		return "db_connection", 3
 	case ExtensionPanicCheckName:
 		return "internal", 2
-	case ReplicationGrantsCheckName, IndexWriteAccessCheckName:
+	case ReplicationGrantsCheckName, IndexWriteAccessCheckName, SchemaAccessCheckName:
 		return "db_permission", 1
 	}
 	return "config_invalid", 0

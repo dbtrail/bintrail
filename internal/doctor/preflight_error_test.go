@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -64,6 +65,8 @@ func TestPreflightErrorClassFollowsTheFailingChecks(t *testing.T) {
 		{"pg source unreachable", []string{PGSourceConnectionCheckName}, telemetry.ClassDBConnection},
 		{"missing replication grants", []string{ReplicationGrantsCheckName}, telemetry.ClassDBPermission},
 		{"no index write access", []string{IndexWriteAccessCheckName}, telemetry.ClassDBPermission},
+		{"no schema access", []string{SchemaAccessCheckName}, telemetry.ClassDBPermission},
+		{"empty schema stays configuration", []string{"Schema visibility"}, telemetry.ClassConfigInvalid},
 		{"server variable", []string{"binlog_format=ROW"}, telemetry.ClassConfigInvalid},
 		{"retention", []string{"Binlog retention >= 2 days"}, telemetry.ClassConfigInvalid},
 		{"extension check", []string{"Audit log plugin"}, telemetry.ClassConfigInvalid},
@@ -90,5 +93,24 @@ func TestPreflightErrorClassFollowsTheFailingChecks(t *testing.T) {
 	r.add(CheckResult{Name: SourceConnectionCheckName, Status: StatusFail, Detail: "dial tcp: connection refused"})
 	if got := telemetry.ClassifyError(r.Err()); got != telemetry.ClassDBConnection {
 		t.Errorf("report with a failed source connection classifies %q, want %q", got, telemetry.ClassDBConnection)
+	}
+}
+
+// TestBuildRefusedSourceClassifiesAsDBConnection drives the REAL Build with a
+// source nobody listens on, and pins the check's name as a literal: the
+// classifier keys on that exact string, and a test holding the constant on
+// both sides would stay green if the producer ever spelled it out again.
+func TestBuildRefusedSourceClassifiesAsDBConnection(t *testing.T) {
+	r := Build(context.Background(), "root:x@tcp(127.0.0.1:1)/x?timeout=1s", "", "", 0)
+	if len(r.Checks) == 0 || r.Checks[0].Name != "Source MySQL connection" || r.Checks[0].Status != StatusFail {
+		t.Fatalf("Build against a refused port: checks = %+v, want a failed \"Source MySQL connection\" first", r.Checks)
+	}
+	err := r.Err()
+	var pe *PreflightError
+	if !errors.As(err, &pe) || len(pe.Checks) != 1 || pe.Checks[0] != "Source MySQL connection" {
+		t.Fatalf("Err() = %v (%T), want *PreflightError naming the source connection", err, err)
+	}
+	if got := telemetry.ClassifyError(err); got != telemetry.ClassDBConnection {
+		t.Errorf("ClassifyError = %q, want %q", got, telemetry.ClassDBConnection)
 	}
 }

@@ -1695,16 +1695,27 @@ func ValidateBinlogRowImageContext(ctx context.Context, db *sql.DB) error {
 	var varName, val string
 	err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'binlog_row_image'").Scan(&varName, &val)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("binlog_row_image not found on source server; MySQL 5.6+ with binlog_row_image=FULL is required")
+		return &RowImageError{msg: "binlog_row_image not found on source server; MySQL 5.6+ with binlog_row_image=FULL is required"}
 	}
 	if err != nil {
 		return fmt.Errorf("failed to query binlog_row_image: %w", err)
 	}
 	if !strings.EqualFold(val, "FULL") {
-		return fmt.Errorf("source server has binlog_row_image=%q; bintrail requires FULL", val)
+		return &RowImageError{msg: fmt.Sprintf("source server has binlog_row_image=%q; bintrail requires FULL", val)}
 	}
 	return nil
 }
+
+// RowImageError is the refusal to capture from a source whose
+// binlog_row_image is not FULL (or is absent). `stream` hits it without the
+// doctor in front, so it declares its own usage-telemetry class: a server
+// setting, config_invalid. The message is unchanged from the untyped error.
+type RowImageError struct{ msg string }
+
+func (e *RowImageError) Error() string { return e.msg }
+
+// TelemetryClass implements telemetry.Classed.
+func (e *RowImageError) TelemetryClass() string { return "config_invalid" }
 
 // DetectFlavor reports the source server flavor by inspecting VERSION():
 // "mariadb" when the version string contains "MariaDB" (case-insensitive),

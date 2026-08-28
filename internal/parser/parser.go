@@ -676,13 +676,13 @@ func handleRows(
 	// covers BOTH the file-index and stream paths. Fail loud rather than index
 	// NULL-filled rows.
 	if firstSkipped := firstPartialImage(rowsEv.SkippedColumns); firstSkipped != nil {
-		return fmt.Errorf(
+		return &PartialRowImageError{msg: fmt.Sprintf(
 			"partial binlog row image detected at %s:%d for %s.%s (%d column(s) absent: %v); "+
 				"bintrail requires binlog_row_image=FULL — set it server-wide (a session-level "+
 				"override produced this event) and re-generate the binlog, or these events would "+
 				"be indexed with absent columns stored as NULL",
 			filename, binlogEv.Header.LogPos, schema, table,
-			len(firstSkipped), firstSkipped)
+			len(firstSkipped), firstSkipped)}
 	}
 
 	// LogPos points to the byte AFTER the event. Subtract EventSize to get
@@ -1170,3 +1170,15 @@ func (e *SchemaDriftError) Error() string { return e.msg }
 
 // TelemetryClass implements telemetry.Classed.
 func (e *SchemaDriftError) TelemetryClass() string { return "schema_mismatch" }
+
+// PartialRowImageError is the #493 guard: a row event whose image omits
+// columns (binlog_row_image=MINIMAL/NOBLOB, possibly a session override that
+// the one-shot startup check could not see). A server setting, so its
+// usage-telemetry class is config_invalid; the message names the file,
+// position and table for the operator and never leaves the process.
+type PartialRowImageError struct{ msg string }
+
+func (e *PartialRowImageError) Error() string { return e.msg }
+
+// TelemetryClass implements telemetry.Classed.
+func (e *PartialRowImageError) TelemetryClass() string { return "config_invalid" }

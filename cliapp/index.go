@@ -304,9 +304,17 @@ func runIndex(cmd *cobra.Command, args []string) error {
 	// server error — keeps its usage-telemetry class instead of collapsing to
 	// "unknown" behind a fresh summary error (#1503).
 	if failedFiles > 0 {
-		return fmt.Errorf("indexing finished with %d of %d file(s) failed; first failure: %w", failedFiles, len(files), firstErr)
+		return indexFailureSummary(failedFiles, len(files), firstErr)
 	}
 	return nil
+}
+
+// indexFailureSummary is the non-zero-exit error for a partially failed run.
+// Extracted so the one property that matters for usage telemetry — the first
+// failure stays in the chain — has a unit test; a %v here would turn every
+// typed cause back into "unknown".
+func indexFailureSummary(failed, total int, first error) error {
+	return fmt.Errorf("indexing finished with %d of %d file(s) failed; first failure: %w", failed, total, first)
 }
 
 // indexFile processes a single binlog file with full index_state tracking.

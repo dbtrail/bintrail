@@ -2,7 +2,7 @@ package cliapp
 
 import (
 	"errors"
-	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/doctor"
@@ -25,7 +25,10 @@ func TestUpPreflightRefusalClassifiesAsConfigInvalid(t *testing.T) {
 	if !errors.As(fatal, &pe) {
 		t.Fatalf("fatal is %T, want *doctor.PreflightError", fatal)
 	}
-	wrapped := fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", fatal)
+	wrapped := preflightRefusal(fatal)
+	if !strings.HasPrefix(wrapped.Error(), "preflight failed (use --skip-doctor") {
+		t.Errorf("refusal message = %q", wrapped.Error())
+	}
 	if got := telemetry.ClassifyError(wrapped); got != telemetry.ClassConfigInvalid {
 		t.Errorf("ClassifyError = %q, want %q", got, telemetry.ClassConfigInvalid)
 	}
