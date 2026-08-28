@@ -526,7 +526,7 @@ func SynthesizeVictims(
 	addPKTypeCaveat := func(fk CascadeFK, detail string) {
 		addIncomplete("pktype:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
 			"%s.%s cannot be augmented from its baseline: %s. This is a PERMANENT property of the "+
-				"table, not a transient failure, so retrying will not change it. Its cascade-affected "+
+				"table, not a transient failure, so retrying will not change it. Cascade-affected "+
 				"children are still recovered from the binlog, but children untouched within the "+
 				"lookback window are not reconstructed, so the recovery may be partial",
 			fk.Schema, fk.Table, detail))
