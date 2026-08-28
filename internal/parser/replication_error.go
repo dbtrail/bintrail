@@ -9,12 +9,13 @@ import (
 // ReplicationError wraps a server error packet received over the replication
 // protocol (a *gomysql.MyError from StartSync or GetEvent) so packages that
 // must not link go-mysql can still read the server's error NUMBER — usage
-// telemetry buckets 1236 (binlog purged) and 1130 (host not allowed) through
+// telemetry buckets 1236 (binlog purged), 1130 (host not allowed) and the
+// same permission / not-found numbers the driver path buckets, through
 // telemetry.MySQLNumbered. Everything else about the error is untouched:
 // Error() is the original text and Unwrap keeps errors.As on *gomysql.MyError
 // working for callers that already inspect it.
 type ReplicationError struct {
-	Code uint16
+	code uint16
 	err  error
 }
 
@@ -22,7 +23,7 @@ func (e *ReplicationError) Error() string { return e.err.Error() }
 func (e *ReplicationError) Unwrap() error { return e.err }
 
 // MySQLErrorNumber implements telemetry.MySQLNumbered.
-func (e *ReplicationError) MySQLErrorNumber() uint16 { return e.Code }
+func (e *ReplicationError) MySQLErrorNumber() uint16 { return e.code }
 
 // WrapReplicationError returns err wrapped in a *ReplicationError when its
 // chain carries a non-nil *gomysql.MyError, and err itself otherwise
@@ -38,5 +39,5 @@ func WrapReplicationError(err error) error {
 	if err == nil || !errors.As(err, &my) || my == nil {
 		return err
 	}
-	return &ReplicationError{Code: my.Code, err: err}
+	return &ReplicationError{code: my.Code, err: err}
 }

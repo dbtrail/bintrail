@@ -3,7 +3,10 @@ package doctor
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
@@ -26,8 +29,8 @@ func TestPreflightErrorIsTypedAndClassed(t *testing.T) {
 	if got, want := err.Error(), "1 preflight check(s) failed"; got != want {
 		t.Errorf("message = %q, want the pre-#1503 bytes %q", got, want)
 	}
-	if len(pe.Checks) != 1 || pe.Checks[0] != "binlog_format=ROW" || pe.Failed != 1 {
-		t.Errorf("PreflightError = %+v, want Failed=1 Checks=[binlog_format=ROW]", pe)
+	if len(pe.Checks) != 1 || pe.Checks[0] != "binlog_format=ROW" {
+		t.Errorf("PreflightError = %+v, want Checks=[binlog_format=ROW]", pe)
 	}
 	for _, c := range pe.Checks {
 		if c == "STATEMENT" || c == "root:hunter2@tcp(db.internal)/x" {
@@ -40,7 +43,7 @@ func TestPreflightErrorIsTypedAndClassed(t *testing.T) {
 
 	// Err counts every failure, capacity included, and prints the same shape.
 	err = r.Err()
-	if !errors.As(err, &pe) || pe.Failed != 2 || len(pe.Checks) != 2 {
+	if !errors.As(err, &pe) || len(pe.Checks) != 2 {
 		t.Fatalf("Err = %v (%T), want *PreflightError with 2 failures", err, err)
 	}
 	if got, want := err.Error(), "2 preflight check(s) failed"; got != want {
@@ -69,7 +72,7 @@ func TestPreflightErrorClassFollowsTheFailingChecks(t *testing.T) {
 		{"empty schema stays configuration", []string{"Schema visibility"}, telemetry.ClassConfigInvalid},
 		{"server variable", []string{"binlog_format=ROW"}, telemetry.ClassConfigInvalid},
 		{"retention", []string{"Binlog retention >= 2 days"}, telemetry.ClassConfigInvalid},
-		{"extension check", []string{"Audit log plugin"}, telemetry.ClassConfigInvalid},
+		{"extension check", []string{"Some extension check"}, telemetry.ClassConfigInvalid},
 		{"extension panic", []string{ExtensionPanicCheckName}, telemetry.ClassInternal},
 		{"panic beats grants and variables", []string{"log_bin enabled", ReplicationGrantsCheckName, ExtensionPanicCheckName}, telemetry.ClassInternal},
 		{"connection beats a panic", []string{ExtensionPanicCheckName, SourceConnectionCheckName}, telemetry.ClassDBConnection},
@@ -80,7 +83,7 @@ func TestPreflightErrorClassFollowsTheFailingChecks(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := &PreflightError{Failed: len(c.checks), Checks: c.checks}
+			err := &PreflightError{Checks: c.checks}
 			if got := telemetry.ClassifyError(err); got != c.want {
 				t.Errorf("ClassifyError = %q, want %q", got, c.want)
 			}
@@ -112,5 +115,45 @@ func TestBuildRefusedSourceClassifiesAsDBConnection(t *testing.T) {
 	}
 	if got := telemetry.ClassifyError(err); got != telemetry.ClassDBConnection {
 		t.Errorf("ClassifyError = %q, want %q", got, telemetry.ClassDBConnection)
+	}
+}
+
+// TestBootRefusalKeepsTheClass: the daemons' refusal wrapper must keep the
+// *PreflightError in the chain; a %v here would report every refused boot as
+// unknown.
+func TestBootRefusalKeepsTheClass(t *testing.T) {
+	err := BootRefusal(&PreflightError{Checks: []string{SourceConnectionCheckName}})
+	if !strings.HasPrefix(err.Error(), "preflight failed (use --skip-doctor") {
+		t.Errorf("message = %q", err.Error())
+	}
+	var pe *PreflightError
+	if !errors.As(err, &pe) {
+		t.Fatalf("BootRefusal lost the typed error: %T", err)
+	}
+	if got := telemetry.ClassifyError(err); got != telemetry.ClassDBConnection {
+		t.Errorf("ClassifyError = %q, want %q", got, telemetry.ClassDBConnection)
+	}
+}
+
+// TestReplicationGrantsFailureNameIsPinned drives the real grants check to
+// its missing-privilege FAIL and pins the name as a literal, the bytes
+// PreflightError.TelemetryClass keys on for db_permission.
+func TestReplicationGrantsFailureNameIsPinned(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("SHOW GRANTS").WillReturnRows(
+		sqlmock.NewRows([]string{"Grants for u@%"}).AddRow("GRANT SELECT ON *.* TO `u`@`%`"))
+
+	got := checkReplicationGrants(context.Background(), db)
+	if got.Status != StatusFail || got.Name != "REPLICATION SLAVE + CLIENT grants" {
+		t.Fatalf("checkReplicationGrants = %+v, want a FAIL named \"REPLICATION SLAVE + CLIENT grants\"", got)
+	}
+	r := &Report{}
+	r.add(got)
+	if c := telemetry.ClassifyError(r.Err()); c != telemetry.ClassDBPermission {
+		t.Errorf("ClassifyError = %q, want %q", c, telemetry.ClassDBPermission)
 	}
 }

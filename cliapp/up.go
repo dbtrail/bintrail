@@ -125,7 +125,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 		fatal, warnCapacity := upPreflightOutcome(preflight)
 		if fatal != nil {
-			return preflightRefusal(fatal)
+			return doctor.BootRefusal(fatal)
 		}
 		if warnCapacity {
 			fmt.Fprintln(os.Stderr, "WARNING: the index disk capacity check FAILED: starting anyway (capturing beats not capturing), but act on its remediation before the volume fills.")
@@ -143,13 +143,6 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// ── Phase 3: Stream ─────────────────────────────────────────────────────
 	fmt.Fprintln(os.Stderr, "=== Phase 3/3: Streaming ===")
 	return runUpStream(cmd, args)
-}
-
-// preflightRefusal is the error `up` exits with when the doctor refuses boot.
-// The %w is load-bearing: it keeps *doctor.PreflightError reachable, which is
-// how usage telemetry tells a refused preflight from a crash (#1503).
-func preflightRefusal(fatal error) error {
-	return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", fatal)
 }
 
 // upPreflightOutcome maps the preflight report to up's boot decision: fatal

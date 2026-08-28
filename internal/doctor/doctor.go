@@ -845,7 +845,8 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) Ch
 		// all (fix: grants / schema-name typo). Telling the operator to
 		// GRANT when the schema is simply empty sends them down the wrong
 		// path (#402).
-		if n, err := countVisibleSchemas(ctx, db, schemas); err == nil && n > 0 {
+		n, probeErr := countVisibleSchemas(ctx, db, schemas)
+		if probeErr == nil && n > 0 {
 			return CheckResult{
 				Name:   "Schema visibility",
 				Status: StatusFail,
@@ -856,16 +857,30 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) Ch
 					"Then start monitoring again.",
 			}
 		}
+		grantsRemediation := "Bintrail needs at least SELECT on information_schema to read column metadata.\n" +
+			"Grant minimum read access:\n\n" +
+			"  GRANT SELECT ON *.* TO <bintrail-user>;\n\n" +
+			"Or scope to the schemas you want indexed:\n\n" +
+			"  GRANT SELECT ON <schema>.* TO <bintrail-user>;\n\n" +
+			"Also double-check the schema names for typos."
+		if probeErr != nil {
+			// The probe that tells "empty" from "invisible" failed, so this
+			// is NOT a verified grants problem: keep the visibility name (it
+			// grades config_invalid, not db_permission, for usage telemetry)
+			// and show the probe's error instead of swallowing it. The grants
+			// advice stays, since that is still the likeliest cause.
+			return CheckResult{
+				Name:        "Schema visibility",
+				Status:      StatusFail,
+				Detail:      "no tables visible in " + filter + " (schema probe failed: " + probeErr.Error() + ")",
+				Remediation: grantsRemediation,
+			}
+		}
 		return CheckResult{
-			Name:   SchemaAccessCheckName,
-			Status: StatusFail,
-			Detail: "no tables visible in " + filter,
-			Remediation: "Bintrail needs at least SELECT on information_schema to read column metadata.\n" +
-				"Grant minimum read access:\n\n" +
-				"  GRANT SELECT ON *.* TO <bintrail-user>;\n\n" +
-				"Or scope to the schemas you want indexed:\n\n" +
-				"  GRANT SELECT ON <schema>.* TO <bintrail-user>;\n\n" +
-				"Also double-check the schema names for typos.",
+			Name:        SchemaAccessCheckName,
+			Status:      StatusFail,
+			Detail:      "no tables visible in " + filter,
+			Remediation: grantsRemediation,
 		}
 	}
 	return CheckResult{
@@ -1180,8 +1195,8 @@ func (r *Report) Write(w io.Writer, format string) error {
 // Err returns a non-nil error when any required check failed, so the CLI exits
 // non-zero for CI/scripting use cases. Warnings do not cause failure.
 func (r *Report) Err() error {
-	if r.Failed > 0 {
-		return &PreflightError{Failed: r.Failed, Checks: r.failingNames(nil)}
+	if names := r.failingNames(nil); len(names) > 0 {
+		return &PreflightError{Checks: names}
 	}
 	return nil
 }
@@ -1200,7 +1215,10 @@ const (
 	// no tables visible at all, whose remediation is GRANT SELECT. The
 	// empty-schema branch keeps the "Schema visibility" name — it is not a
 	// permission problem, and telling the operator to GRANT there sends
-	// them down the wrong path (#402).
+	// them down the wrong path (#402) — and so do the probe's query-error
+	// branches, which grade config_invalid; an unreachable source is caught
+	// by the connection check ahead of them. An extension check that reused
+	// one of these names would be classified as if it were the built-in.
 	SchemaAccessCheckName = "Schema access"
 	// ExtensionPanicCheckName is the FAIL cliapp records when a registered
 	// extension check panics: a bug, not a setting, so it classifies as
@@ -1215,25 +1233,24 @@ const (
 // — never a Detail, which quotes server variables, grants and hostnames. The
 // message bytes are the ones the untyped error used to print.
 type PreflightError struct {
-	// Failed is the number of failures after the caller's exclusions (Err:
-	// all of them; ErrExcluding: minus the named advisory checks).
-	Failed int
-	// Checks lists the failing checks' names in report order.
+	// Checks lists the failing checks' names in report order, after the
+	// caller's exclusions (Err: all of them; ErrExcluding: minus the named
+	// advisory checks). The count in the message is derived from it, so the
+	// two cannot disagree.
 	Checks []string
 }
 
 func (e *PreflightError) Error() string {
-	return fmt.Sprintf("%d preflight check(s) failed", e.Failed)
+	return fmt.Sprintf("%d preflight check(s) failed", len(e.Checks))
 }
 
 // TelemetryClass implements telemetry.Classed, deriving the class from WHICH
-// checks failed rather than reporting every refusal as one bucket: a
-// preflight that could not reach the source or the index is db_connection,
-// one refused for grants, index write access or schema access is
-// db_permission, and
-// a panicking extension check is internal, and anything else —
-// binlog_format, row image, log_bin, retention, FK cascades, an extension's
-// own check — is config_invalid, a server setting the operator has to
+// checks failed rather than reporting every refusal as one bucket:
+// db_connection when the source or the index could not be reached,
+// db_permission for grants, index write access or schema access, internal
+// when a registered extension check panicked, and config_invalid for
+// everything else — binlog_format, row image, log_bin, retention, FK
+// cascades, an extension's own check: a server setting the operator has to
 // change. Precedence when several fail together: connection, then internal,
 // then permission, then configuration — a connection failure is the root of
 // whatever failed after it (the index checks run in that order, so a
@@ -1266,6 +1283,15 @@ func checkClass(name string) (string, int) {
 	return "config_invalid", 0
 }
 
+// BootRefusal is the error a daemon exits with when the preflight refuses
+// boot; `up` and `bintrail-console watch` share it. The %w is load-bearing:
+// it keeps the *PreflightError reachable, so the refusal keeps its
+// usage-telemetry class (config_invalid, db_connection, ...) instead of
+// collapsing to unknown.
+func BootRefusal(fatal error) error {
+	return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", fatal)
+}
+
 // failingNames lists the names of the checks in StatusFail that are not in
 // advisory, in report order.
 func (r *Report) failingNames(advisory []string) []string {
@@ -1287,7 +1313,7 @@ func (r *Report) failingNames(advisory []string) []string {
 // full FAIL semantics (CI smoke tests SHOULD go red on a capacity overrun).
 func (r *Report) ErrExcluding(advisory ...string) error {
 	if names := r.failingNames(advisory); len(names) > 0 {
-		return &PreflightError{Failed: len(names), Checks: names}
+		return &PreflightError{Checks: names}
 	}
 	return nil
 }

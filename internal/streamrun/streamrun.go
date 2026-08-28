@@ -1989,7 +1989,7 @@ func One(ctx context.Context, cfg Config) error {
 				slog.Warn(gap.Message)
 
 				if cfg.NoGapFill {
-					return &GapRefusedError{Message: gap.Message}
+					return &GapRefusedError{msg: gap.Message}
 				}
 
 				// Auto-advance past the gap.
@@ -2495,14 +2495,14 @@ func StartMetricsServer(addr string) (shutdown func(), err error) {
 // GapRefusedError is the --no-gap-fill refusal: the checkpoint names a
 // position the source can no longer serve (binlogs purged, GTIDs inside the
 // source's purged set, or a same-named file regenerated after RESET MASTER)
-// and the operator asked not to auto-advance past it. Message is
+// and the operator asked not to auto-advance past it. msg is
 // the gap detector's human description, which names binlog files and GTIDs —
 // operator-facing only; the type's usage-telemetry class is binlog_not_found,
 // the same bucket as the server's own 1236 for the same condition.
-type GapRefusedError struct{ Message string }
+type GapRefusedError struct{ msg string }
 
 func (e *GapRefusedError) Error() string {
-	return "binlog gap detected and --no-gap-fill is set: " + e.Message
+	return "binlog gap detected and --no-gap-fill is set: " + e.msg
 }
 
 // TelemetryClass implements telemetry.Classed.

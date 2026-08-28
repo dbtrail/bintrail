@@ -48,15 +48,14 @@ var classes = map[string]bool{
 // Classed is implemented by errors that know their own telemetry class. The
 // packages that produce a failure worth distinguishing implement it on their
 // sentinel or typed error, which lets ClassifyError bucket them without this
-// package importing any of them — telemetry sits under the CLI, the console
-// and bintrail-pg (deliberately not the MCP server, see
-// cmd/bintrail-mcp/telemetryfree_test.go), and pulling the capture stack or
-// the doctor's AWS SDK into it would drag those into binaries that never use
-// them. The method returns a class NAME, never a message; a value outside the
-// taxonomy is coerced to "unknown" by normalizeClass. This package cannot
-// test the real producers (it must not import them), so each producer
-// package carries a wiring test that asserts the exact class against its
-// real error.
+// package importing any of them. That direction is forced, not chosen:
+// telemetry is imported by internal/console, a read-layer package whose
+// depguard (internal/event) forbids linking the capture stack, and a leaf
+// package importing its own producers invites cycles. The method returns a
+// class NAME, never a message; a value outside the taxonomy is coerced to
+// "unknown" by normalizeClass. This package's tests deliberately do not
+// import the producers either, so each producer package carries a wiring
+// test that asserts the exact class against its real error.
 type Classed interface {
 	TelemetryClass() string
 }

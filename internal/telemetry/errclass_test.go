@@ -63,7 +63,7 @@ func (e *numberedErr) MySQLErrorNumber() uint16 { return e.code }
 // the driver's *MySQLError — it comes from the replication client through
 // MySQLNumbered — and 1236 is the one number a capture daemon actually dies
 // on. Before #1503 the classifier only looked at the driver's type, so every
-// replication-side failure was unknown.
+// replication-side server error was unknown.
 func TestClassifyErrorReplicationClient(t *testing.T) {
 	cases := []struct {
 		name string

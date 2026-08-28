@@ -83,6 +83,29 @@ func TestDocumentedErrorClassesMatchTheTaxonomy(t *testing.T) {
 			t.Errorf("error class %q is emitted but not listed in TELEMETRY.md", class)
 		}
 	}
+
+	// And the other direction: a class the document lists must exist, or the
+	// list promises coverage no code path provides (#1503 removed three such
+	// classes by hand; this keeps the next one out).
+	marker := "`error_class` is one of exactly these, and nothing else:"
+	i := strings.Index(body, marker)
+	if i < 0 {
+		t.Fatal("TELEMETRY.md no longer carries the error_class list marker")
+	}
+	block := body[i+len(marker):]
+	open := strings.Index(block, "```")
+	if open < 0 {
+		t.Fatal("TELEMETRY.md error_class list is not a fenced block")
+	}
+	closeIdx := strings.Index(block[open+3:], "```")
+	if closeIdx < 0 {
+		t.Fatal("TELEMETRY.md error_class fenced block is not closed")
+	}
+	for _, token := range strings.Fields(block[open+3 : open+3+closeIdx]) {
+		if !classes[token] {
+			t.Errorf("TELEMETRY.md lists error class %q, which nothing emits", token)
+		}
+	}
 }
 
 // TestDocumentedDurationBucketsMatch: same, for the duration buckets, which are

@@ -13,11 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the one thing telemetry exists to show — why a first run fails — was
   invisible. Errors now declare their own class through a small interface
   (`telemetry.Classed`), with no message text involved: a refused preflight
-  (`doctor`, or `up` refusing to boot) reports the class of what failed —
+  (`doctor`, `bintrail-pg doctor`, or `up` / `bintrail-console watch`
+  refusing to boot) reports the class of what failed —
   `db_connection` when the source or index could not be reached,
   `db_permission` for grants, index write access or schema access,
-  `config_invalid` for a server setting (as does `stream`'s own
-  `binlog_row_image` refusal, which runs without the doctor) — the server's
+  `config_invalid` for a server setting (as do the `binlog_format` and
+  `binlog_row_image` refusals that `stream`, `index --source-dsn` and `agent`
+  run without the doctor) — the server's
   "binlog purged" error
   (1236, which only the replication client ever sees and which the classifier
   used to miss because it arrives as go-mysql's error type, not the driver's)

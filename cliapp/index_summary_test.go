@@ -15,6 +15,9 @@ import (
 // exits with must still carry the first per-file failure, so a typed cause
 // keeps its usage-telemetry class instead of collapsing to unknown (#1503).
 func TestIndexFailureSummaryKeepsTheFirstCause(t *testing.T) {
+	// A replication error is a stand-in chosen for its distinct class; file
+	// mode never produces one (its causes are the parser guards, index-side
+	// driver errors and missing files).
 	first := parser.WrapReplicationError(&gomysql.MyError{Code: 1236, Message: "binlog purged"})
 	err := indexFailureSummary(2, 3, first)
 	if !strings.HasPrefix(err.Error(), "indexing finished with 2 of 3 file(s) failed") {
