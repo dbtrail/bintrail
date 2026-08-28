@@ -106,6 +106,7 @@ func (s *baselineSupervisor) SQLExportDir(serverID string) (string, console.Base
 }
 
 func (s *baselineSupervisor) runSQLExport(req console.SQLExportRequest, dir string) {
+	defer s.recoverBaselineJob(baselineJobExport, req.ServerID, req.ServerName)
 	tables, rows, bytes, err := s.executeSQLExport(req, dir)
 
 	s.mu.Lock()
@@ -172,7 +173,7 @@ func (s *baselineSupervisor) executeSQLExport(req console.SQLExportRequest, dir 
 		return 0, 0, 0, fmt.Errorf("create build directory: %w", err)
 	}
 
-	reports, _, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, sqlExportFoldConfig(req, dir, tableList))
+	reports, _, runErr := foldTables(s.ctx, sqlExportFoldConfig(req, dir, tableList))
 	for _, rep := range reports {
 		rows += rep.RowsWritten
 	}

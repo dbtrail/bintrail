@@ -576,8 +576,7 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 	// for-loop below, so this never fires mid-retry.
 	defer job.cancel()
 
-	attempt := 0
-	var crashLoopSince time.Time // first failure of the current loop; zero = healthy
+	var policy crashLoopPolicy
 	for {
 		job.set("pending", "")
 		started := time.Now()
@@ -586,23 +585,15 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 			job.set("stopped", "")
 			return
 		}
-		if time.Since(started) > monitorHealthyReset {
-			attempt = 0
-			crashLoopSince = time.Time{}
-		}
-		if crashLoopSince.IsZero() {
-			crashLoopSince = started
-		}
 		scrubbed := config.ScrubDSNError(err, e.SourceDSN, e.DSN)
-		if looping := time.Since(crashLoopSince); looping > monitorGiveUpAfter {
+		delay, looping, giveUp := policy.failed(started, time.Now())
+		if giveUp {
 			slog.Error("monitored stream crash-looped past the give-up threshold; not retrying",
 				"server", e.Name, "entry", e.ID, "looping_for", looping.Round(time.Minute), "error", scrubbed)
 			job.set("failed", fmt.Sprintf("%s (gave up after %s of crash-looping; fix the issue, then press Start to retry)",
 				scrubbed, looping.Round(time.Minute)))
 			return
 		}
-		delay := min(monitorBackoffBase<<attempt, monitorBackoffCap)
-		attempt++
 		slog.Warn("monitored stream failed; retrying with backoff",
 			"server", e.Name, "entry", e.ID, "delay", delay, "error", scrubbed)
 		job.set("failed", scrubbed+" (retrying)")

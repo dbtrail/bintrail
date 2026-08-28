@@ -80,6 +80,10 @@ func (s *baselineSupervisor) busyLocked(serverID string) bool {
 }
 
 func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interval time.Duration) {
+	// The cycle's own recover in runBaselineRefreshCycle cannot reach here: it
+	// sits on the near side of the `go` in TriggerRefresh, so it guards the
+	// dispatch and not the fold. See recoverBaselineJob.
+	defer s.recoverBaselineJob(baselineJobRefresh, req.ServerID, req.ServerName)
 	started := time.Now().UTC()
 	// Separate capture for the ELAPSED time, and the duplication is not
 	// redundant: t.UTC() strips the monotonic reading, so time.Since(started)
@@ -284,9 +288,28 @@ func countCarried(reports []*reconstruct.TableReport) (carried int) {
 // setting, because asking for reuse is not getting it: a table with changes,
 // with a capture gap, or on the S3 path is folded anyway.
 func (s *baselineSupervisor) foldSnapshot(req refreshRequest, at time.Time, tableList []string) (tables, refused, carried int, err error) {
-	reports, failures, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, refreshFoldConfig(req, at, tableList))
+	reports, failures, runErr := foldTables(s.ctx, refreshFoldConfig(req, at, tableList))
 	return foldOutcome(tableList, reports, failures, runErr)
 }
+
+// foldTables is reconstruct.ReconstructTablesDetailed behind a seam, shared by
+// the refresh, the restore and the sql export — the three jobs whose work IS
+// the fold.
+//
+// It exists because that call is otherwise the one thing in these job
+// goroutines a unit test cannot reach: it needs a live index and a real
+// baseline, and consoleapp has no fixture that stands those up (foldOutcome's
+// doc states the same residual from the other side). Without the seam nothing
+// below the `go` in each Trigger is drivable, which is exactly the gap #1472
+// was: the panic guard on these goroutines would have had no test that reaches
+// past the dispatch.
+//
+// Written by tests only, like checkMydumperPrivileges. Production never
+// reassigns it, so the job goroutines only ever read it. A test that replaces
+// it must not restore it until the job it started has reached a terminal
+// state: the jobs run in their own goroutines, and restoring while one is
+// still folding is a data race on this variable.
+var foldTables = reconstruct.ReconstructTablesDetailed
 
 // foldOutcome is everything foldSnapshot decides once the fold has run, split
 // out because the fold itself needs a live index and a real baseline and this

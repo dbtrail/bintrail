@@ -77,6 +77,14 @@ func TestInsertBatch_boundedByWriteTimeout(t *testing.T) {
 	if !strings.Contains(err.Error(), "write deadline") || !strings.Contains(err.Error(), "--write-timeout") {
 		t.Fatalf("DeadlineExceeded error must carry the operator hint (write deadline / --write-timeout), got: %v", err)
 	}
+	// #1482: the same error must ALSO be machine-classifiable. A supervisor that
+	// restarts capture on a stalled index (consoleapp.runMainStreamWithWriteDeadlineRetry)
+	// keys on this sentinel; drop it and the daemon silently goes back to exiting
+	// on the first slow batch, with every message assertion above still green.
+	// Asserted on the REAL error from the REAL write path, not a hand-built one.
+	if !errors.Is(err, ErrWriteDeadline) {
+		t.Fatalf("the write-deadline error must be classifiable as ErrWriteDeadline, got: %v", err)
+	}
 }
 
 // digestStatements runs BEFORE the batch INSERT inside insertBatch, so an

@@ -142,6 +142,7 @@ func (s *baselineSupervisor) Status(serverID string) console.BaselineStatus {
 }
 
 func (s *baselineSupervisor) run(req console.BaselineRequest) {
+	defer s.recoverBaselineJob(baselineJobDump, req.ServerID, req.ServerName)
 	started := time.Now().UTC()
 	stats, uploaded, snapTime, err := s.execute(req)
 	rec := console.BaselineRunRecord{

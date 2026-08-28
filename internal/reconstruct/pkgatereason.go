@@ -39,6 +39,61 @@ func (e *generatedPKErr) Is(target error) bool { return target == ErrGeneratedPK
 // caveat classifier files it as a transient lookup failure.
 func GeneratedPKRefusalError(msg string) error { return &generatedPKErr{msg: msg} }
 
+// ErrUnsupportedPKType is the errors.Is sentinel for refusals caused by a
+// primary-key column whose DATA_TYPE the baseline canonicalizer does not
+// handle (FLOAT/DOUBLE, TIME, BIT, JSON, the spatial family; supportedPKType
+// is the authority, and DECIMAL and the BINARY/VARBINARY/BLOB family are NOT
+// in this set - they have been supported since #214 and #1155). Like ErrGeneratedPK
+// above it marks a PERMANENT property of the table, so machine callers can
+// tell it apart from a transient lookup failure without string matching.
+//
+// The ONE behavioural difference from ErrGeneratedPK, which the cascade
+// engine relies on: a generated PK member also makes the BINLOG candidates
+// unsafe (a versioned table's history rows and row_end tombstones share the
+// surviving key), so that refusal skips both cascade phases. An unsupported
+// PK TYPE only blocks the baseline join; the binlog scan is unaffected and
+// must still run. See cascade.BaselineProvider's contract.
+//
+// Who carries it: every ERROR-typed refusal from this shape, built via
+// PKTypeRefusalError. The verify inconclusive detail and the shim wire
+// message are STRINGS by construction and cannot carry a sentinel; do not
+// branch on errors.Is for those surfaces.
+var ErrUnsupportedPKType = errors.New("primary-key type unsupported by the baseline canonicalizer")
+
+// pkTypeErr classifies as ErrUnsupportedPKType via Is WITHOUT injecting the
+// sentinel's text into the rendered message, same reason as generatedPKErr
+// above: a %w wrap would stutter against the gate reason's own opening
+// clause. It also keeps the UNFRAMED reason, so a caller that supplies its
+// own frame (the cascade engine's caveat, which already names the table)
+// can re-state the cause without this frame nested inside it.
+type pkTypeErr struct{ msg, reason string }
+
+func (e *pkTypeErr) Error() string { return e.msg }
+
+// Is makes errors.Is(err, ErrUnsupportedPKType) true for the concrete type.
+func (e *pkTypeErr) Is(target error) bool { return target == ErrUnsupportedPKType }
+
+// PKTypeRefusalError builds an error that renders "<frame>: <reason>" and
+// matches errors.Is(err, ErrUnsupportedPKType). reason must come from
+// PKTypeGateReason so every surface refuses in the same words. Every
+// error-typed PK-type refusal must be built through this, or the cascade
+// engine's permanent-caveat classifier files it as a transient lookup
+// failure and repeats the doomed baseline scan for every parent key.
+func PKTypeRefusalError(frame, reason string) error {
+	return &pkTypeErr{msg: frame + ": " + reason, reason: reason}
+}
+
+// PKTypeRefusalReason returns the unframed gate sentence carried by an error
+// built with PKTypeRefusalError, or "" when err is not one. Callers that add
+// their own frame use it so the two frames do not nest.
+func PKTypeRefusalReason(err error) string {
+	var e *pkTypeErr
+	if errors.As(err, &e) {
+		return e.reason
+	}
+	return ""
+}
+
 // PKTypeGateReason renders the refusal detail for a primary-key column a
 // MySQL-path SupportedPKType gate rejected. Two physically different causes
 // reach such a gate, and they must not share a message (#1009, lifted here
@@ -131,19 +186,32 @@ func fullTableGeneratedPKRefusal(schema, table string, pkCol metadata.ColumnMeta
 }
 
 // fullTablePKTypeRefusal is the error ReconstructTable's PK-type gate returns
-// for a column supportedPKType rejected. An empty DataType gets the honest
-// wrong-path verdict (see PKTypeGateReason): the gate sits after the recorded
-// source flavor was checked and did NOT read "postgres", so a PG-shaped
-// snapshot here means the run took the MySQL path for a PostgreSQL-shaped
-// index (typically the wrong index database next to a MySQL-shaped baseline).
-// A real MySQL type keeps the per-type refusal the operator can act on.
+// for a column supportedPKType rejected: the `full-table reconstruct:
+// <schema>.<table>: ` frame around whatever PKTypeGateReason says about the
+// column.
+//
+// BOTH of the reason's branches reach an operator here, and both are earned on
+// this path. An empty DataType gets the wrong-path verdict because the gate
+// sits after the recorded source flavor was checked and did NOT read
+// "postgres", so a PG-shaped snapshot here means the run took the MySQL path
+// for a PostgreSQL-shaped index (typically the wrong index database next to a
+// MySQL-shaped baseline). A real MySQL type gets the per-type refusal.
+//
+// #1461: the typed branch used to carry its own sentence ("PK column %q has
+// type %q which is not in the supported PK type set; file a follow-up issue
+// if you need this type"), so one limitation reached operators in two
+// different phrasings depending on which command they ran, with nothing to
+// tell them it was the same refusal. The follow-up-issue nudge went with it,
+// and it is genuinely gone rather than inherited: canonicalizePKValue's
+// default branch still spells it out, but every path to that branch now sits
+// behind a SupportedPKType gate, so no operator with an unsupported MySQL
+// type reaches it. Buying it back would cost the shared sentence that makes
+// the surfaces recognizable as one refusal, which is what #1461 asked for.
+//
+// Carries ErrUnsupportedPKType, like every other error-typed refusal of this
+// shape. Both branches do: a caller keying on the sentinel must not have to
+// also know which branch of the reason rendered.
 func fullTablePKTypeRefusal(schema, table string, pkCol metadata.ColumnMeta) error {
-	if strings.TrimSpace(pkCol.DataType) == "" {
-		return fmt.Errorf("full-table reconstruct: %s.%s: %s", schema, table,
-			PKTypeGateReason(pkCol, "full-table reconstruct", "reconstruct"))
-	}
-	return fmt.Errorf(
-		"full-table reconstruct: %s.%s PK column %q has type %q which is not in the supported PK type set; "+
-			"file a follow-up issue if you need this type",
-		schema, table, pkCol.Name, pkCol.DataType)
+	return PKTypeRefusalError(fmt.Sprintf("full-table reconstruct: %s.%s", schema, table),
+		PKTypeGateReason(pkCol, "full-table reconstruct", "reconstruct"))
 }

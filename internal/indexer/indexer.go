@@ -38,6 +38,36 @@ const DefaultWriteTimeout = 3 * time.Minute
 // a shared global).
 var WriteTimeout = DefaultWriteTimeout
 
+// ErrWriteDeadline tags an index write that ran out of WriteTimeout, as opposed
+// to one the server refused. It exists because nothing else distinguished the
+// two: every flush failure reached the caller as an opaque error, so an index
+// that was merely SLOW (a heavy analytical read starving it) ended capture just
+// as surely as an un-indexable event did — the daemon exited and nothing brought
+// it back (#1482).
+//
+// A deadline is the only failure class where "the same write, later" is a
+// reasonable thing to attempt: the write never got a verdict, so the server
+// neither accepted nor rejected it. Match with errors.Is; never on message text.
+//
+// Deliberately NOT a licence to re-execute the INSERT in place. The deadline
+// fires client-side, and the driver reacts by closing the socket without a KILL
+// QUERY, so a slow batch usually goes on to COMMIT on the server after the
+// client has given up. Re-running that statement would duplicate every row it
+// wrote, permanently. The only duplicate-safe way to act on this tag is to
+// restart the stream, which replays from the checkpoint through
+// streamrun's dedup-on-resume — the step that exists to drop exactly those rows.
+var ErrWriteDeadline = errors.New("index write deadline exceeded")
+
+// writeDeadlineError carries ErrWriteDeadline alongside the original error
+// without changing the message operators read: Error() delegates verbatim, and
+// the multi-error Unwrap keeps BOTH the wrapped cause (context.DeadlineExceeded,
+// still matched by errors.Is, as write_timeout_test.go pins) and the sentinel
+// reachable in the chain.
+type writeDeadlineError struct{ err error }
+
+func (e *writeDeadlineError) Error() string   { return e.err.Error() }
+func (e *writeDeadlineError) Unwrap() []error { return []error{e.err, ErrWriteDeadline} }
+
 // insertColumnsSQL is the column list of insertBatch's multi-row INSERT.
 // insertColumnCount must equal its column count — pinned by a unit test.
 const insertColumnsSQL = `binlog_file, start_pos, end_pos, event_timestamp, gtid, connection_id, ` +
@@ -264,9 +294,13 @@ func (idx *Indexer) insertBatch(batch []event.Event) (int64, error) {
 			// Distinguish a slow-but-working link (a batch too large to transmit
 			// within WriteTimeout) from a genuine stall, so the operator knows the
 			// knob rather than chasing a phantom network fault (#959).
-			return 0, fmt.Errorf("batch INSERT of %d events exceeded the %s write deadline "+
+			//
+			// Tagged with ErrWriteDeadline (#1482) so a supervisor can tell this
+			// apart from every other flush failure WITHOUT matching on message
+			// text. The message itself is unchanged.
+			return 0, &writeDeadlineError{fmt.Errorf("batch INSERT of %d events exceeded the %s write deadline "+
 				"(a network stall, or a batch too large for the link — raise --write-timeout, "+
-				"or lower --batch-size / the server max_allowed_packet): %w", len(batch), WriteTimeout, err)
+				"or lower --batch-size / the server max_allowed_packet): %w", len(batch), WriteTimeout, err)}
 		}
 		return 0, fmt.Errorf("batch INSERT of %d events failed: %w", len(batch), err)
 	}
