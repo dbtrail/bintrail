@@ -338,9 +338,25 @@ func TestBackupScheduler_refusedRebuildFallsBackToAFullBackup(t *testing.T) {
 	if run, _ := sup.history.LastScheduled(e.ID); run == nil || run.Kind != console.BaselineRunDump {
 		t.Fatalf("the newest scheduled record is not the fallback's full backup: %+v", run)
 	}
+	// The fallback line is an alarm about the rebuild path, so it outlives
+	// the full backup it caused, and ends when a later scheduled rebuild
+	// goes through. Not at restart, not never.
+	if st := b.ScheduleState(e.ID); st.LastFallbackAt == "" {
+		t.Fatal("the fallback was forgotten as soon as its full backup finished")
+	}
+	holdFold(t, func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		return nil, nil, nil
+	})
+	b.tick(context.Background(), time.Date(2026, 8, 28, 11, 0, 5, 0, time.UTC))
+	if st := waitTerminalMethod(t, b, e.ID, console.BackupMethodRefresh); st.Last.State != "succeeded" || st.LastFallbackAt != "" {
+		t.Fatalf("a rebuild that went through did not end the fallback alarm: %+v", st)
+	}
 
 	// Without the creation opt-in there is no fallback: a skip with both
 	// reasons, and no dump started.
+	holdFold(t, func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		return nil, nil, errors.New("capture gap in the reconstruction window")
+	})
 	b2, reg2, sup2 := newScheduleFixture(t, false)
 	e2 := addScheduled(t, reg2, true)
 	fireAt(b2, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))

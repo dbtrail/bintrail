@@ -194,6 +194,14 @@ func (b *backupScheduler) ScheduleState(serverID string) console.BackupScheduleS
 				cur2.last = &cur
 				b.started[serverID] = cur2
 			}
+			if st.method == console.BackupMethodRefresh && cur.State == "succeeded" {
+				// The fallback line is an alarm about the rebuild path. A
+				// later scheduled rebuild that went through is the evidence
+				// the path works again, so the alarm ends here rather than
+				// at the next restart.
+				delete(b.fallback, serverID)
+				out.LastFallbackAt, out.LastFallbackReason = "", ""
+			}
 			b.mu.Unlock()
 		}
 	case st.last != nil:
