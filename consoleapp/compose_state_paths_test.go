@@ -1,10 +1,12 @@
 package consoleapp
 
 import (
+	"fmt"
 	"os"
-	"regexp"
 	"strings"
 	"testing"
+
+	"go.yaml.in/yaml/v2"
 )
 
 // The console writes exactly three files: the server registry, the auth file
@@ -21,9 +23,13 @@ import (
 //
 // An env override nobody wires into the compose fixes nothing, so this guard
 // asserts the wiring, not the flag. The mount point is READ OFF the volume
-// line rather than hardcoded: moving the volume elsewhere and leaving these
+// entry rather than hardcoded: moving the volume elsewhere and leaving these
 // paths behind is the same bug again.
-const composePath = "../docker-compose.yml"
+const (
+	composePath    = "../docker-compose.yml"
+	composeService = "bintrail"
+	composeVolume  = "bintrail-state"
+)
 
 // consoleStateEnvVars are the env vars that place console state on disk. Each
 // must point inside the state volume in the shipped stack.
@@ -33,92 +39,62 @@ var consoleStateEnvVars = []string{
 	"BINTRAIL_CONSOLE_MCP_TOKEN_FILE",
 }
 
-var (
-	composeStateMountRE = regexp.MustCompile(`^\s*-\s*bintrail-state:([^\s:]+)\s*(?::(ro))?\s*(?:#.*)?$`)
-	composeEnvRE        = regexp.MustCompile(`^\s*(BINTRAIL_CONSOLE_[A-Z_]+):\s*(\S+)`)
-	composeServiceKeyRE = regexp.MustCompile(`^  [A-Za-z0-9_.-]+:`)
-)
+// composeFile decodes only what this guard reads. Parsing the YAML rather than
+// scanning lines is deliberate: a line scanner reports the wrong cause for
+// edits that change nothing real (a quoted value reads as a path outside the
+// volume, a comment at service indent truncates the service).
+type composeFile struct {
+	Services map[string]struct {
+		Environment map[string]any `yaml:"environment"`
+		Volumes     []string       `yaml:"volumes"`
+	} `yaml:"services"`
+}
 
 func TestComposeKeepsConsoleStateOnTheVolume(t *testing.T) {
 	data, err := os.ReadFile(composePath)
 	if err != nil {
 		t.Fatalf("read %s: %v", composePath, err)
 	}
-	block := composeServiceBlock(t, string(data), "bintrail")
+	var doc composeFile
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse %s: %v", composePath, err)
+	}
+	svc, ok := doc.Services[composeService]
+	if !ok {
+		t.Fatalf("no %q service in %s", composeService, composePath)
+	}
+	if len(svc.Environment) == 0 {
+		t.Fatalf("the %q service in %s declares no environment in map form; this guard reads that form and would otherwise pass vacuously", composeService, composePath)
+	}
 
 	// The writable state mount. A :ro mount of the same volume exists on
 	// another service; only a read-write one can hold state this daemon writes.
 	var mounts []string
-	for _, line := range block {
-		m := composeStateMountRE.FindStringSubmatch(line)
-		if m == nil || m[2] == "ro" {
+	for _, v := range svc.Volumes {
+		name, target, found := strings.Cut(v, ":")
+		if !found || name != composeVolume {
 			continue
 		}
-		mounts = append(mounts, strings.TrimSuffix(m[1], "/"))
+		target, opts, _ := strings.Cut(target, ":")
+		if opts == "ro" {
+			continue
+		}
+		mounts = append(mounts, strings.TrimSuffix(target, "/"))
 	}
-	// More than one writable mount of the same volume means the prefix below
-	// would be checked against whichever one this loop happened to keep, so
-	// refuse rather than pick.
-	if len(mounts) > 1 {
-		t.Fatalf("the bintrail service in %s mounts bintrail-state read-write at %v; this guard cannot say which one these paths must sit under", composePath, mounts)
+	if len(mounts) != 1 {
+		t.Fatalf("the %q service in %s mounts %s read-write at %v; want exactly one such mount, since these paths are checked against it", composeService, composePath, composeVolume, mounts)
 	}
-	var mount string
-	if len(mounts) == 1 {
-		mount = mounts[0]
-	}
-	if mount == "" {
-		t.Fatalf("the bintrail service in %s has no read-write bintrail-state mount; nothing it writes would survive a container recreation", composePath)
-	}
+	mount := mounts[0]
 
-	env := map[string]string{}
-	for _, line := range block {
-		if m := composeEnvRE.FindStringSubmatch(line); m != nil {
-			env[m[1]] = m[2]
-		}
-	}
 	for _, name := range consoleStateEnvVars {
-		v, ok := env[name]
+		raw, ok := svc.Environment[name]
 		if !ok {
-			t.Errorf("%s does not set %s on the bintrail service, so that file resolves under $HOME in the image and is destroyed by the next container recreation", composePath, name)
+			t.Errorf("%s does not set %s on the %s service, so that file resolves under $HOME in the image and is destroyed by the next container recreation", composePath, name, composeService)
 			continue
 		}
+		v := fmt.Sprint(raw)
 		if !strings.HasPrefix(v, mount+"/") {
 			t.Errorf("%s = %s in %s, which is outside the state volume mounted at %s: it lives in the container's writable layer and does not survive a restart", name, v, composePath, mount)
 		}
 	}
-}
-
-// composeServiceBlock returns the lines of one service in the compose file.
-// Services are the two-space-indented keys under `services:`; the block ends
-// at the next key with that indent.
-func composeServiceBlock(t *testing.T, doc, service string) []string {
-	t.Helper()
-	lines := strings.Split(doc, "\n")
-	start := -1
-	for i, line := range lines {
-		if line == "  "+service+":" {
-			start = i + 1
-			break
-		}
-	}
-	if start < 0 {
-		t.Fatalf("no %q service in %s", service, composePath)
-	}
-	end := len(lines)
-	for i := start; i < len(lines); i++ {
-		// The next service KEY, not merely the next two-space-indented line:
-		// comments sit at that indent too, and stopping at one would truncate
-		// the block mid-service. Truncation cannot make the checks pass
-		// vacuously (a block missing the mount fails, a block missing an env
-		// var fails), but it would report the wrong reason.
-		if composeServiceKeyRE.MatchString(lines[i]) {
-			end = i
-			break
-		}
-	}
-	block := lines[start:end]
-	if len(block) == 0 {
-		t.Fatalf("the %q service block in %s is empty; the checks below would pass vacuously", service, composePath)
-	}
-	return block
 }

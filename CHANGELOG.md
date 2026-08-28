@@ -52,11 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What this means for an upgrade: **the default path did not move**, so a
   console that uses it keeps reading the same file and no existing token is
   affected. **On the compose stack, generate a new token once** after taking
-  the updated compose file. Its predecessor was already destroyed by the
-  recreation that upgrading performs, so there is nothing to migrate, and the
-  replacement is the first one that will still be there after the next
-  restart. Paste the new value into your AI client; the old one authenticates
-  nothing.
+  the updated compose file: the console reads the volume path from then on, so
+  a token minted before the change does not carry over, and the replacement is
+  the first one that is still there after the next restart. Paste the new value
+  into your AI client; the old one authenticates nothing.
 - **`sum()` works on a money column in the generated DuckDB views** (#1486).
   MySQL `DECIMAL` and `NUMERIC` columns are stored as text in the baseline
   Parquet, so the `state_<schema>_<table>` views handed DuckDB a `VARCHAR` and
