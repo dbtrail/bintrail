@@ -172,22 +172,7 @@ func (s *baselineSupervisor) executeSQLExport(req console.SQLExportRequest, dir 
 		return 0, 0, 0, fmt.Errorf("create build directory: %w", err)
 	}
 
-	// RESOURCE POSTURE: the DuckDB budget stays conservative like every
-	// supervisor fold (zero value = DefaultTuning) — this daemon is also
-	// capturing and serving the console — plus a bound this fold adds that
-	// the refresh does not: table parallelism 2 instead of the engine's
-	// NumCPU default.
-	reports, _, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, reconstruct.FullTableConfig{
-		IndexDSN:     req.IndexDSN,
-		BaselineSrc:  req.BaselineSrc,
-		Tables:       tableList,
-		At:           req.At.UTC(),
-		OutputDir:    dir,
-		OutputFormat: reconstruct.OutputFormatMydumper,
-		Parallelism:  2,
-		// AllowGaps stays FALSE: a dump the operator will load somewhere is
-		// the last artifact that may be knowingly incomplete.
-	})
+	reports, _, runErr := reconstruct.ReconstructTablesDetailed(s.ctx, sqlExportFoldConfig(req, dir, tableList))
 	for _, rep := range reports {
 		rows += rep.RowsWritten
 	}
@@ -201,6 +186,35 @@ func (s *baselineSupervisor) executeSQLExport(req console.SQLExportRequest, dir 
 		}
 	}
 	return len(tableList), rows, bytes, sqlExportRunError(reports, runErr)
+}
+
+// sqlExportFoldConfig is the configuration one SQL export build folds with.
+//
+// Split out of executeSQLExport for the same reason refreshFoldConfig is split
+// out of foldSnapshot: the budgets it carries are then checkable without
+// running a fold or touching a filesystem.
+//
+// RESOURCE POSTURE: this build folds inside the process that is also capturing
+// and serving the console, so it takes the shared in-daemon posture. The DuckDB
+// budget stays at its zero value, which resolves to the container-safe
+// DefaultTuning. Parallelism and WarnEventThreshold do NOT, so both are named:
+// zero would mean runtime.NumCPU() and a warning that never fires. They are the
+// same constants the refresh and restore folds use, because a host that cannot
+// afford one of these folds cannot afford another.
+func sqlExportFoldConfig(req console.SQLExportRequest, dir string, tableList []string) reconstruct.FullTableConfig {
+	return reconstruct.FullTableConfig{
+		IndexDSN:           req.IndexDSN,
+		BaselineSrc:        req.BaselineSrc,
+		Tables:             tableList,
+		At:                 req.At.UTC(),
+		OutputDir:          dir,
+		OutputFormat:       reconstruct.OutputFormatMydumper,
+		Parallelism:        daemonFoldParallelism,
+		WarnEventThreshold: daemonFoldWarnEventThreshold,
+		RemediationHint:    daemonFoldRemediation,
+		// AllowGaps stays FALSE: a dump the operator will load somewhere is
+		// the last artifact that may be knowingly incomplete.
+	}
 }
 
 // sqlExportRunError folds the engine's per-table reports into the run

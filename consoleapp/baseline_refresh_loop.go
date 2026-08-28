@@ -161,6 +161,13 @@ func applyFoldStatus(st *console.BaselineStatus, tables, refused, carried int, e
 // background refresh self-tune to ~80% of host RAM would starve the capture path
 // it depends on. If this ever needs to go faster, it needs its own bounded knob,
 // not the offline one.
+//
+// The zero value is NOT uniformly the safe choice on that struct, which is the
+// trap this note used to leave open. It is safe for the DuckDB budgets and the
+// archive fetcher, where zero resolves to the container-safe default. It is the
+// OPPOSITE for Parallelism (zero means runtime.NumCPU()) and for
+// WarnEventThreshold (zero means the volume warning never fires). Those two are
+// therefore set explicitly in refreshFoldConfig; see the constants above it.
 func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (tables, refused, carried int, err error) {
 	tableList, err := reconstruct.NewestSnapshotTables(s.ctx, req.BaselineDir)
 	if err != nil {
@@ -171,6 +178,61 @@ func (s *baselineSupervisor) executeRefresh(req refreshRequest, at time.Time) (t
 	}
 	return s.foldSnapshot(req, at, tableList)
 }
+
+// The bounded knobs EVERY in-daemon fold shares: the periodic refresh, the
+// point-in-time restore, and the SQL export build. All three fold inside the
+// process that is also capturing, so they get one posture rather than three
+// opinions. Both are spelled out rather than left at zero because, unlike
+// every other budget on FullTableConfig, their zero values mean the opposite
+// of conservative.
+const (
+	// daemonFoldWarnEventThreshold is the same RAW value every CLI path ships
+	// (internal/cli/reconstruct.go, cliapp/baseline_refresh.go, the hardcoded
+	// one in internal/cli/drill.go, and the config init template in
+	// cliapp/config.go). Zero DISABLES the warning outright: shouldWarnEvents is
+	// `threshold > 0 && n > threshold`. Silence is backwards here, because the
+	// operator who typed a command is watching its output and this job has
+	// nobody reading it.
+	//
+	// Do NOT read "same raw value" as "warns at the same point per table". The
+	// threshold reported is scaledEventThreshold(raw, effectiveParallelism),
+	// so the per-table trigger here is 5M/2 = 2.5M against an attended run's
+	// 5M/NumCPU. What the shared raw value actually equalizes is the TOTAL
+	// concurrent event volume at which either warns, which is the quantity #842
+	// scaling exists to hold steady and the one that tracks RAM. Note also that
+	// effectiveParallelism clamps to len(Tables): a SINGLE-table refresh divides
+	// by 1, so the full 5M applies there whatever this constant's sibling says.
+	//
+	// The bound below is what protects the process; this threshold is only what
+	// tells someone it happened.
+	daemonFoldWarnEventThreshold = 5_000_000
+
+	// daemonFoldParallelism bounds how many tables fold concurrently. Zero means
+	// runtime.NumCPU(), and peak resident memory is the SUM of the
+	// concurrently-folding tables' change maps (the reason scaledEventThreshold
+	// divides by parallelism at all, #842), each holding one entry per distinct
+	// touched primary key (#1107). Inheriting the core count therefore ties this
+	// daemon's peak memory to the size of the host it happens to run on, inside
+	// the process that is also capturing. Two lets a slow table overlap with the
+	// next one without letting the peak track the hardware; lower it before
+	// raising it.
+	//
+	// It is not only a memory knob: fulltable.go sizes the index connection
+	// pool as SetMaxOpenConns(2 * Parallelism), so moving this also moves the
+	// fold's share of the index server's connections (4 here, against 2*NumCPU
+	// before). Anyone tuning it is tuning both.
+	daemonFoldParallelism = 2
+
+	// daemonFoldRemediation replaces the volume warning's default advice, which
+	// names --at, --parallelism and --warn-event-threshold. bintrail-console
+	// registers none of the three: its only persistent flags are --log-level and
+	// --log-format, and these folds' budgets are the constants above. Telling an
+	// operator to lower a flag their binary does not have is worse than saying
+	// nothing, so this names what they CAN actually reach.
+	daemonFoldRemediation = "shorten the window this fold covers: for the scheduled refresh, " +
+		"lower --baseline-refresh-interval so each fold starts from a fresher backup; " +
+		"for a restore or a SQL export, pick a moment closer to an existing backup"
+)
 
 // refreshFoldConfig is the configuration one refresh cycle folds with.
 //
@@ -186,6 +248,9 @@ func refreshFoldConfig(req refreshRequest, at time.Time, tableList []string) rec
 		OutputDir:             req.BaselineDir,
 		OutputFormat:          reconstruct.OutputFormatParquet,
 		CarryForwardUnchanged: req.CarryForwardUnchanged,
+		Parallelism:           daemonFoldParallelism,
+		WarnEventThreshold:    daemonFoldWarnEventThreshold,
+		RemediationHint:       daemonFoldRemediation,
 		// AllowGaps stays FALSE. An unattended job must never publish a
 		// knowingly-incomplete baseline: accepting a permanent capture loss is a
 		// decision with consequences for every future reconstruct, and nobody is

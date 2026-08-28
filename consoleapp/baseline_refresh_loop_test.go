@@ -759,3 +759,70 @@ func TestApplyFoldStatus(t *testing.T) {
 		}
 	})
 }
+
+// TestRefreshFoldConfig_boundsTheUnattendedFold pins the two fields whose ZERO
+// value is the dangerous one. Every other budget on FullTableConfig is left at
+// zero on purpose because zero is the container-safe default there; for these
+// two it means "use every core" and "never warn", so absence is not a posture,
+// it is an omission that looks exactly like the deliberate ones beside it.
+//
+// Both wanted values are non-zero, which is what makes this test discriminate:
+// deleting either assignment leaves the field at its zero value and fails here.
+// An expectation of 0 would have passed against a missing field.
+func TestRefreshFoldConfig_boundsTheUnattendedFold(t *testing.T) {
+	cfg := refreshFoldConfig(refreshRequest{
+		IndexDSN: "dsn", BaselineDir: "/b",
+	}, time.Now(), []string{"shop.orders"})
+
+	if cfg.Parallelism == 0 {
+		t.Error("Parallelism left at zero: the fold would inherit runtime.NumCPU() " +
+			"and scale its peak memory with the host, inside the capture process")
+	}
+	if cfg.Parallelism != daemonFoldParallelism {
+		t.Errorf("Parallelism = %d, want %d", cfg.Parallelism, daemonFoldParallelism)
+	}
+	if cfg.WarnEventThreshold == 0 {
+		t.Error("WarnEventThreshold left at zero: shouldWarnEvents is " +
+			"`threshold > 0 && n > threshold`, so the unattended fold would never warn")
+	}
+	if cfg.WarnEventThreshold != daemonFoldWarnEventThreshold {
+		t.Errorf("WarnEventThreshold = %d, want %d", cfg.WarnEventThreshold, daemonFoldWarnEventThreshold)
+	}
+	if cfg.RemediationHint == "" {
+		t.Error("RemediationHint left empty: the warning falls back to the CLI wording, " +
+			"which names --at / --parallelism / --warn-event-threshold. bintrail-console " +
+			"registers none of them, so the operator is sent after flags that do not exist")
+	}
+	if cfg.RemediationHint != daemonFoldRemediation {
+		t.Errorf("RemediationHint = %q, want the shared constant", cfg.RemediationHint)
+	}
+}
+
+// TestRefreshFoldConfig_restoreSharesTheBounds: the point-in-time restore is
+// the OTHER in-daemon caller, and it reaches the same config through
+// restoreFoldRequest.
+//
+// Scope, because the honest version is narrower than it first looks: this
+// calls refreshFoldConfig directly, so it pins that a restoreFoldRequest
+// survives the translation with both bounds intact. It does NOT pin the
+// wiring. If someone adds a restoreFoldConfig and repoints
+// baseline_restore.go at it, this test keeps calling the old builder and keeps
+// passing. What catches THAT is TestEveryConsoleappFoldConfigIsBounded: a new
+// builder means a third FullTableConfig literal, and the guard asserts an
+// exact count, so the addition cannot land without a human deciding it belongs
+// under the same budget.
+func TestRefreshFoldConfig_restoreSharesTheBounds(t *testing.T) {
+	at := time.Now()
+	req := restoreFoldRequest(console.BaselineRestoreRequest{
+		ServerID: "s1", IndexDSN: "dsn", BaselineDir: "/b", At: at,
+	})
+	cfg := refreshFoldConfig(req, at, []string{"shop.orders"})
+
+	if cfg.Parallelism != daemonFoldParallelism {
+		t.Errorf("restore Parallelism = %d, want %d", cfg.Parallelism, daemonFoldParallelism)
+	}
+	if cfg.WarnEventThreshold != daemonFoldWarnEventThreshold {
+		t.Errorf("restore WarnEventThreshold = %d, want %d",
+			cfg.WarnEventThreshold, daemonFoldWarnEventThreshold)
+	}
+}

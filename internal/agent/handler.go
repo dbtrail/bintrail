@@ -151,10 +151,14 @@ func (h *DefaultHandler) HandleResolvePK(ctx context.Context, req ResolvePKReque
 
 // resolvePKFromMySQL queries binlog_events for a single pk_hash.
 //
-// Note: the standard PK lookup pattern requires both pk_hash = SHA2(?, 256)
-// AND pk_values = ? as a collision guard. Here we only have the hash (that's
-// what we're resolving), so we query by pk_hash alone. SHA-256 collisions
-// are astronomically unlikely; callers should verify results when critical.
+// Note: the standard PK lookup pattern pairs pk_hash = SHA2(?, 256) with
+// pk_values = ? as a collision guard. Here pk_values is the ANSWER, not an
+// input, so the guard cannot be applied and the hash stands alone. SHA-256
+// collisions are astronomically unlikely; callers should verify results when
+// critical.
+//
+// schema_name and table_name are still passed, and are not optional: they
+// lead idx_pk_hash, so dropping them would turn this seek into a full scan.
 func (h *DefaultHandler) resolvePKFromMySQL(ctx context.Context, item PKItem) (string, error) {
 	var pkValues string
 	err := h.IndexDB.QueryRowContext(ctx,
