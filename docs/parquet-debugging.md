@@ -44,14 +44,15 @@ bintrail views \
   --out views.sql
 ```
 
-The view then reads both and is fresh to capture lag, which is seconds when the index keeps up. A partition that has been archived but not yet dropped exists on both sides, so the Parquet leg excludes any `event_id` the index already returned. That is the same rule bintrail applies internally when it merges these two sources, with the index winning.
+The view then reads both and is fresh to capture lag, which is seconds when the index keeps up. A partition that has been archived but not yet dropped exists on both sides, so the index leg excludes any `event_id` the archives already returned: **the archives win the overlap.** They have to. An archived row knows its `bintrail_id`, `event_date` and `event_hour` from its storage path, and an index row has to derive or forgo them, so letting the index win would replace a known source with NULL for every event in the overlap window.
 
-Two things to know before you use it:
+Things to know before you use it:
 
 - **You fill in the password.** The generated file carries the index host, port, database and user, because a reader on another machine needs them, and it carries no password, because the file is meant to be shared. Open it, put your password in the empty `PASSWORD ''` slot, then run it. The attachment is read-only.
-- **It needs the index reachable from wherever you run DuckDB.** The Parquet-only file works from anywhere the object store does; this one also needs a route to the index.
+- **It needs the index reachable from wherever you run DuckDB.** The Parquet-only file works from anywhere the object store does; this one also needs a route to the index. Give `--index-dsn` a TCP address a reader can resolve: a unix socket is refused (it names one machine only), and a DSN with no address at all gets the driver's `127.0.0.1` default, which the file flags as a loopback for exactly that reason.
+- **A filter on `events` does not become a filter on the index.** The index leg derives `event_date` and `event_hour` from `event_timestamp`, so a predicate on them is applied after the rows are read, and the anti-join needs every archived `event_id` regardless of what you asked for. Every query streams the whole live `binlog_events`, `row_before`/`row_after`/`query_text` included. For a narrow read of recent events, query `bintrail_live."binlog_events"` directly with your own `WHERE`: that one does reach the index. The generated file says all this where you will be looking when you measure it.
 
-If your index serves more than one source, live rows come back with `bintrail_id` as NULL. The archived rows get theirs from the storage path, but a row in the index carries no source of its own, so there is nothing to attribute it from.
+Live rows come back with `bintrail_id` as NULL unless bintrail could establish which single source the index serves. An index row carries no source of its own — the archived rows get theirs from the storage path — so the file says which of these it observed rather than assuming: more than one source registered, no source id registered at all (a file-mode index registers none), the registry unreadable, or the registry's id disagreeing with the id the archives are written under. Pass `--bintrail-id` to name the source yourself; it wins, as it already does for the archive paths.
 
 You get:
 

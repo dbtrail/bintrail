@@ -16,6 +16,8 @@ package views
 
 import (
 	"fmt"
+	"net"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -51,13 +53,63 @@ type LiveIndex struct {
 	Database string
 	User     string
 
-	// BintrailID attributes the hot leg's rows. Live binlog_events has no
-	// per-row source column (the archives get theirs from the Hive path), so
-	// this can only be filled when the index serves exactly ONE source. With
-	// more than one it stays empty and the hot rows carry NULL, which the view
-	// says out loud rather than guessing an attribution.
+	// BintrailID attributes the hot leg's rows, and is the ONLY signal that
+	// they are attributed at all. Live binlog_events has no per-row source
+	// column (the archives get theirs from the Hive path), so this can only be
+	// filled when exactly one source was observed. Empty = the hot rows carry
+	// NULL, and Attribution below says what was observed instead.
+	//
+	// One field, not a pair: an "it is attributed" flag alongside the value is
+	// a pair that can desync, and the desynced state would emit an
+	// attribution nobody established.
 	BintrailID string
+
+	// Attribution is consulted ONLY when BintrailID is empty, to say what was
+	// observed. Its zero value is the undetermined one on purpose: a producer
+	// that fills nothing must not make the file claim anything.
+	Attribution LiveAttribution
+
+	// TableColumns is the live binlog_events column set as OBSERVED on the
+	// index. A column named here is selected; one that is absent is emitted as
+	// NULL, because naming it would make DuckDB refuse the whole file with a
+	// binder error and define no view at all.
+	//
+	// This is the hot leg's union_by_name: the cold leg tolerates archives
+	// written before a column existed, and an index migrated to a different
+	// point (the console sets EnsureSchema: false and never migrates registry
+	// servers) needs exactly the same tolerance.
+	//
+	// Empty means NOT OBSERVED, and every column is named — the behaviour of a
+	// producer that cannot probe. `bintrail views` always probes.
+	TableColumns []string
 }
+
+// LiveAttribution records what the producer OBSERVED about which source the
+// index serves, for the one line of the generated file that must not guess.
+//
+// The rule this type exists to keep is the same one Input.ArchiveDiscoveryFailed
+// and Input.RegionAmbiguous keep: never state a cause the caller does not know.
+// A single "unattributed" value collapsed four different observations —
+// several sources, none registered, an unreadable list, a disagreement — into
+// one sentence that was false for three of them.
+//
+// It names the OBSERVATION, never the inference. "No source is registered" is
+// what the count reports; that this is a file-mode or legacy index is a guess
+// about why, and it stays out of the artifact.
+type LiveAttribution int
+
+const (
+	// AttributionUndetermined: nothing was established. The zero value, so an
+	// Input that fills none of this says so rather than asserting.
+	AttributionUndetermined LiveAttribution = iota
+	// AttributionMultiSource: more than one source is registered, and a live
+	// row carries no identity of its own to tell them apart by.
+	AttributionMultiSource
+	// AttributionUnregistered: the index registers no source id — a zero count,
+	// a NULL id, or no such table at all. Every one of those is "there is no id
+	// to attribute a row to", which is what the file says.
+	AttributionUnregistered
+)
 
 // Input is everything Generate needs. The command layer resolves it; nothing in
 // this package performs IO.
@@ -121,6 +173,13 @@ type Input struct {
 	// and what a file generated with no reachable index must still emit.
 	LiveIndex *LiveIndex
 
+	// LiveLegUnavailable is set by a producer that has no way to offer the hot
+	// leg at all, so the archives-only note does not send its reader to a flag
+	// that surface cannot pass. The console download is that producer: it has
+	// no --include-live, and telling an operator to "regenerate" from a page
+	// served BY the index gets them a byte-identical file.
+	LiveLegUnavailable bool
+
 	// ExcludeEventColumns drops the named columns (matched case-insensitively
 	// against archive.BinlogEventColumns) from the `events` view. Purely
 	// mechanical here — the views package names no policy. The console SQL panel
@@ -166,6 +225,14 @@ func Generate(in Input) string {
 // setup does not hinge on the human-facing preamble.
 func GenerateViews(in Input) string {
 	var b strings.Builder
+	// The hot leg is dropped here rather than documented as unsupported. This
+	// entry point emits no preamble, so it emits no ATTACH, so a two-leg view
+	// rendered through it would reference a catalog that does not exist and
+	// fail at CREATE VIEW. Nilling it makes that divergence impossible instead
+	// of leaving Generate and GenerateViews with different preconditions on
+	// the same Input; the caller gets the archives-only view, which is what
+	// this entry point can actually back.
+	in.LiveIndex = nil
 	writeEventsView(&b, in)
 	writeStateViews(&b, in)
 	return b.String()
@@ -363,57 +430,145 @@ func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
 	fmt.Fprintf(b, "    USER %s,\n", sqlString(li.User))
 	b.WriteString("    PASSWORD ''  -- <- your index password\n")
 	b.WriteString(");\n")
+	if isLoopbackHost(li.Host) {
+		// Observed: the host IS a loopback address. NOT stated: why it is one
+		// (an omitted address in the DSN, an SSH tunnel, a sidecar). The file
+		// says what it can see, and what that costs a reader elsewhere.
+		b.WriteString("-- HOST above is a loopback address, which names only the machine this file\n")
+		b.WriteString("-- was generated on. Run this file somewhere else and the ATTACH resolves to\n")
+		b.WriteString("-- whatever that machine runs on the same port — which may answer, with\n")
+		b.WriteString("-- entirely plausible rows from a different index. Change HOST to a name that\n")
+		b.WriteString("-- resolves from where you run this.\n")
+	}
 	fmt.Fprintf(b, "ATTACH '' AS %s (TYPE mysql, SECRET %s, READ_ONLY);\n\n",
 		quoteIdent(liveAttachAlias), quoteIdent(liveSecretName))
 }
 
+// isLoopbackHost reports whether the generated ATTACH points at the generating
+// machine itself. "localhost" is included by name: it is not an IP literal, but
+// it resolves to the loopback everywhere it resolves at all.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
 func writeEventsView(b *strings.Builder, in Input) {
-	sources := in.ArchiveSources
-	b.WriteString("-- events: every archived binlog event, across all archive sources.\n")
+	live := in.LiveIndex != nil
+	// A failed discovery leaves no usable archive list whatever ArchiveSources
+	// holds, so it decides the cold leg here rather than in a second switch.
+	cold := !in.ArchiveDiscoveryFailed && len(in.ArchiveSources) > 0
+
 	switch {
-	case in.ArchiveDiscoveryFailed:
-		// The header already names the failure; the body must not contradict
-		// it with a cause nobody verified.
-		b.WriteString("-- (skipped: archive_state could not be read; see the header)\n\n")
-		return
-	case len(sources) == 0:
-		b.WriteString("-- (skipped: no archive sources are registered in archive_state)\n\n")
+	case live && !cold:
+		b.WriteString("-- events: every binlog event the index still holds.\n")
+	case live:
+		b.WriteString("-- events: every binlog event, from the archives and from the index.\n")
+	default:
+		b.WriteString("-- events: every archived binlog event, across all archive sources.\n")
+	}
+
+	if !cold && !live {
+		if in.ArchiveDiscoveryFailed {
+			// The header already names the failure; the body must not
+			// contradict it with a cause nobody verified.
+			b.WriteString("-- (skipped: archive_state could not be read; see the header)\n\n")
+		} else {
+			b.WriteString("-- (skipped: no archive sources are registered in archive_state)\n\n")
+		}
 		return
 	}
-	b.WriteString("--\n")
-	b.WriteString("-- union_by_name is required, not cosmetic: archives written before a column\n")
-	b.WriteString("-- existed simply lack it, and those files must read back with NULLs rather\n")
-	b.WriteString("-- than failing the whole scan. A column absent from EVERY archived file is\n")
-	b.WriteString("-- still an error — drop it from the SELECT if you hit that on an old archive.\n")
 
-	if in.LiveIndex == nil {
+	if cold {
+		b.WriteString("--\n")
+		b.WriteString("-- union_by_name is required, not cosmetic: archives written before a column\n")
+		b.WriteString("-- existed simply lack it, and those files must read back with NULLs rather\n")
+		b.WriteString("-- than failing the whole scan. A column absent from EVERY archived file is\n")
+		b.WriteString("-- still an error — drop it from the SELECT if you hit that on an old archive.\n")
+	}
+
+	switch {
+	case cold && live:
+		b.WriteString("--\n")
+		b.WriteString("-- Two legs: the Parquet for everything rotation has archived, the index for\n")
+		b.WriteString("-- events it has not. A partition that has been archived but not yet dropped\n")
+		b.WriteString("-- exists on BOTH sides, so the index leg excludes any event_id the archives\n")
+		b.WriteString("-- already returned.\n")
+		b.WriteString("--\n")
+		b.WriteString("-- The ARCHIVES win that overlap, which is the one place this differs from\n")
+		b.WriteString("-- bintrail's own merge in Go. There the two copies of an event carry the same\n")
+		b.WriteString("-- fields and the winner is immaterial; here they do not. An archived row\n")
+		b.WriteString("-- knows its bintrail_id, event_date and event_hour from its path, and an\n")
+		b.WriteString("-- index row has to derive or forgo them — so letting the index win would\n")
+		b.WriteString("-- replace a known source with NULL for every event in the overlap, and a\n")
+		b.WriteString("-- WHERE bintrail_id = ... would then miss rows the archives hold.\n")
+		writeLiveCostNote(b, true)
+		b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
+		b.WriteString("  WITH cold AS (\n")
+		writeEventSelect(b, in, false, "    ")
+		b.WriteString("\n  ), hot AS (\n")
+		writeEventSelect(b, in, true, "    ")
+		b.WriteString("\n  )\n")
+		b.WriteString("  SELECT * FROM cold\n")
+		b.WriteString("  UNION ALL BY NAME\n")
+		b.WriteString("  SELECT * FROM hot\n")
+		b.WriteString("   WHERE NOT EXISTS (SELECT 1 FROM cold WHERE cold.event_id = hot.event_id);\n\n")
+	case live:
+		b.WriteString("--\n")
+		b.WriteString("-- The index alone: no archive source is registered, so nothing has been\n")
+		b.WriteString("-- archived for this view to read. It covers whatever the index still holds,\n")
+		b.WriteString("-- and rotation dropping a partition removes those events from it — take a\n")
+		b.WriteString("-- baseline and archive before that matters, then regenerate this file.\n")
+		writeLiveCostNote(b, false)
+		b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
+		writeEventSelect(b, in, true, "  ")
+		b.WriteString(";\n\n")
+	default:
 		b.WriteString("--\n")
 		b.WriteString("-- SCOPE: these are the ARCHIVED events only. Partitions rotation has not\n")
 		b.WriteString("-- archived yet exist solely in the index, so the most recent window is\n")
-		b.WriteString("-- absent here and reads as if nothing happened. Regenerate with a\n")
-		b.WriteString("-- reachable index to add the live leg.\n")
+		b.WriteString("-- absent here and reads as if nothing happened.\n")
+		if in.LiveLegUnavailable {
+			b.WriteString("-- This download covers the archives; it has no way to reach the index.\n")
+			b.WriteString("-- To add a leg over the index, run `bintrail views --index-dsn ...\n")
+			b.WriteString("-- --include-live` from a host that can connect to it.\n")
+		} else {
+			b.WriteString("-- Add a leg over the index by regenerating with --include-live:\n")
+			b.WriteString("--   bintrail views --index-dsn ... --include-live\n")
+		}
 		b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
 		writeEventSelect(b, in, false, "  ")
 		b.WriteString(";\n\n")
-		return
 	}
+}
 
+// writeLiveCostNote states what a query against the two-leg view actually
+// reads, because the operator otherwise measures it and blames the view.
+//
+// Measured, not assumed: event_date and event_hour are DERIVED on the index leg
+// (the index has no partition path), so a predicate on them is evaluated above
+// that scan and cannot become a partition filter the way it does on Parquet.
+func writeLiveCostNote(b *strings.Builder, withCold bool) {
 	b.WriteString("--\n")
-	b.WriteString("-- Two legs: the index for events not yet archived, the Parquet for everything\n")
-	b.WriteString("-- rotation has archived. A partition that has been archived but not yet\n")
-	b.WriteString("-- dropped exists on BOTH sides, so the cold leg excludes any event_id the hot\n")
-	b.WriteString("-- leg already returned. That is the same rule bintrail applies in Go when it\n")
-	b.WriteString("-- merges these two sources, with the index winning.\n")
-	b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
-	b.WriteString("  WITH hot AS (\n")
-	writeEventSelect(b, in, true, "    ")
-	b.WriteString("\n  ), cold AS (\n")
-	writeEventSelect(b, in, false, "    ")
-	b.WriteString("\n  )\n")
-	b.WriteString("  SELECT * FROM hot\n")
-	b.WriteString("  UNION ALL BY NAME\n")
-	b.WriteString("  SELECT * FROM cold\n")
-	b.WriteString("   WHERE NOT EXISTS (SELECT 1 FROM hot WHERE hot.event_id = cold.event_id);\n\n")
+	b.WriteString("-- COST: a filter on this view does not become a filter on the index. The\n")
+	b.WriteString("-- index leg derives event_date and event_hour from event_timestamp, so a\n")
+	b.WriteString("-- predicate on them is applied after the rows are read")
+	if withCold {
+		b.WriteString(", and the anti-join\n-- needs every archived event_id regardless of what the query asked for")
+	}
+	b.WriteString(".\n")
+	b.WriteString("-- Every query therefore streams the whole live binlog_events — row_before,\n")
+	b.WriteString("-- row_after and query_text included")
+	if withCold {
+		b.WriteString(", and the archive scan behind the\n-- anti-join is not pruned by your filter either")
+	}
+	b.WriteString(".\n")
+	fmt.Fprintf(b, "-- For a narrow read of recent events, query %s.\"binlog_events\" directly\n",
+		quoteIdent(liveAttachAlias))
+	b.WriteString("-- with your own WHERE: that one does reach the index, which is indexed on\n")
+	b.WriteString("-- event_timestamp and on schema_name/table_name.\n")
 }
 
 // writeEventSelect renders one leg of the events view. Both legs go through
@@ -432,24 +587,42 @@ func writeEventSelect(b *strings.Builder, in Input, live bool, indent string) {
 	// by DuckDB from the path; the hot leg has to produce them itself, because
 	// live binlog_events carries no source column and no partition path.
 	if live {
-		if in.LiveIndex.BintrailID != "" {
-			fmt.Fprintf(b, "%s%s AS \"bintrail_id\",\n", col, sqlString(in.LiveIndex.BintrailID))
+		id, note := liveSourceID(in)
+		if id != "" {
+			fmt.Fprintf(b, "%s%s AS \"bintrail_id\",\n", col, sqlString(id))
 		} else {
-			// Stated, not guessed. Every source writes into the same
-			// binlog_events, so with more than one registered there is no way
-			// to attribute a live row from the row itself.
-			b.WriteString(col + "NULL AS \"bintrail_id\", -- index serves more than one source; not attributable per row\n")
+			fmt.Fprintf(b, "%sNULL AS \"bintrail_id\", %s\n", col, note)
 		}
 		// Derived so the hot leg filters on the same predicates as the cold
 		// one. These mirror the Hive path rotation writes, which is UTC.
-		b.WriteString(col + "strftime(\"event_timestamp\", '%Y-%m-%d') AS \"event_date\",\n")
+		//
+		// Run on the NAIVE column, before the UTC cast below: the index stores
+		// DATETIME in UTC and rotation names the path from that same value, so
+		// these strftimes agree with the archives exactly as they stand. The
+		// CAST to DATE is what keeps event_date a DATE in the union — DuckDB
+		// types the archives' hive column DATE and strftime returns VARCHAR, and
+		// the widened VARCHAR silently breaks date_trunc, `- INTERVAL 1 DAY` and
+		// any comparison against current_date on the SAME file regenerated with
+		// this flag. event_hour needs no cast: the hive column reads back
+		// VARCHAR ('03'), which is what strftime already produces.
+		b.WriteString(col + "CAST(strftime(\"event_timestamp\", '%Y-%m-%d') AS DATE) AS \"event_date\",\n")
 		b.WriteString(col + "strftime(\"event_timestamp\", '%H') AS \"event_hour\",\n")
 	} else {
 		b.WriteString(col + "\"bintrail_id\", \"event_date\", \"event_hour\",\n")
 	}
 
+	has := liveColumnSet(in, live)
 	for _, c := range archive.BinlogEventColumns {
 		if exclude[strings.ToLower(c.Name)] {
+			continue
+		}
+		if has != nil && !has[strings.ToLower(c.Name)] {
+			// The hot leg's union_by_name. This index does not have the column
+			// (it was migrated to an older point than this build's schema);
+			// naming it would fail the whole file with a binder error and
+			// define no view at all, so it reads back NULL the same way an old
+			// archive's missing column does.
+			writeMissingLiveColumn(b, col, c.Name)
 			continue
 		}
 		switch c.Name {
@@ -459,8 +632,31 @@ func writeEventSelect(b *strings.Builder, in Input, live bool, indent string) {
 			// widening the union to HUGEINT — a 128-bit surprise in every
 			// downstream join for a value that never leaves BIGINT range.
 			b.WriteString(col + "CAST(\"event_id\" AS BIGINT) AS \"event_id\",\n")
+		case "event_timestamp":
+			if live {
+				// The one cast that decides whether this view answers the
+				// question it was asked. DuckDB reads the archives' Parquet
+				// timestamp as TIMESTAMP WITH TIME ZONE and the index's
+				// DATETIME as a naive TIMESTAMP; UNION reconciles that pair by
+				// interpreting the naive value in the READER's session
+				// timezone. The index stores UTC, so on any non-UTC session
+				// every hot row lands off by that offset — the same event
+				// returning two different instants depending on which leg
+				// served it, and a UTC range filter returning nothing for
+				// events that are in it. Correct on a UTC box, which is how it
+				// goes unnoticed.
+				b.WriteString(col + "\"event_timestamp\" AT TIME ZONE 'UTC' AS \"event_timestamp\",\n")
+			} else {
+				b.WriteString(col + "\"event_timestamp\",\n")
+			}
 		case "event_type":
-			b.WriteString(col + "CAST(\"event_type\" AS TINYINT) AS \"event_type_code\",\n")
+			// INTEGER, not the narrower TINYINT the index stores it in: the
+			// archives read back INTEGER, so this is also the type the
+			// archives-only file has always produced. A narrowing cast would
+			// make an unknown future event type fail the whole query, which
+			// contradicts the ELSE branch below, whose entire purpose is that
+			// such a code shows up as an unfamiliar value instead.
+			b.WriteString(col + "CAST(\"event_type\" AS INTEGER) AS \"event_type_code\",\n")
 			b.WriteString(col + eventTypeCase + ",\n")
 		case "schema_version":
 			b.WriteString(col + "CAST(\"schema_version\" AS INTEGER) AS \"schema_version\",\n")
@@ -501,6 +697,98 @@ func writeEventSelect(b *strings.Builder, in Input, live bool, indent string) {
 	b.WriteString(indent + "  hive_partitioning = true,\n")
 	b.WriteString(indent + "  union_by_name = true\n")
 	b.WriteString(indent + ")")
+}
+
+// liveSourceID decides what the hot leg may claim about its rows' source, and
+// when it may claim nothing, the end-of-line comment that says WHY — stating
+// only what was observed, never a cause nobody established.
+//
+// It returns ("", note) far more often than it returns an id. That is the
+// point: one sentence about several sources used to cover a file-mode index
+// (which registers none and serves exactly one), an index too old to have the
+// table, an account without SELECT on it, and a dropped connection.
+func liveSourceID(in Input) (id, note string) {
+	li := in.LiveIndex
+	if li.BintrailID == "" {
+		switch li.Attribution {
+		case AttributionMultiSource:
+			return "", "-- more than one source is registered in this index, and an index row carries none of its own"
+		case AttributionUnregistered:
+			return "", "-- this index registers no source id, so there is none to attribute an index row to"
+		default:
+			return "", "-- the index's registered sources could not be read, so these rows are left unattributed"
+		}
+	}
+	// Cross-check against the identity the COLD leg will actually carry. The
+	// two come from unrelated places — this one from bintrail_servers, the
+	// other from the `bintrail_id=` path segment, which `rotate` takes verbatim
+	// from --bintrail-id and never validates against the registry. When they
+	// disagree, one source appears in the view as two servers and a
+	// WHERE bintrail_id = ... returns half its rows, so assert neither.
+	archived := archiveIDs(in.ArchiveSources)
+	if len(archived) > 0 && !slices.Contains(archived, li.BintrailID) {
+		return "", fmt.Sprintf(
+			"-- the index reports source %s, these archives are written under %s: unattributed rather than assert either",
+			commentSafe(li.BintrailID), commentSafe(strings.Join(archived, ", ")))
+	}
+	return li.BintrailID, ""
+}
+
+// archiveIDs pulls the `bintrail_id=<id>` identity out of each archive base
+// path — the same segment archive.ParseArchivePath reads back, and the only
+// place the cold leg's bintrail_id comes from.
+func archiveIDs(sources []string) []string {
+	var ids []string
+	for _, s := range sources {
+		const marker = "bintrail_id="
+		i := strings.LastIndex(s, marker)
+		if i < 0 {
+			continue
+		}
+		id := strings.TrimRight(s[i+len(marker):], "/")
+		if id = strings.SplitN(id, "/", 2)[0]; id != "" && !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// commentSafe keeps interpolated text inside the SQL comment it is written in.
+// A bintrail_id is an operator-chosen string on the archive side, and a newline
+// in one would end the comment and make everything after it statement text.
+func commentSafe(s string) string {
+	return strings.NewReplacer("\n", " ", "\r", " ").Replace(s)
+}
+
+// liveColumnSet returns the lookup for which columns the hot leg may name, or
+// nil when every column is nameable — the cold leg (whose union_by_name handles
+// its own absences) and a producer that observed no column set.
+func liveColumnSet(in Input, live bool) map[string]bool {
+	if !live || len(in.LiveIndex.TableColumns) == 0 {
+		return nil
+	}
+	has := make(map[string]bool, len(in.LiveIndex.TableColumns))
+	for _, c := range in.LiveIndex.TableColumns {
+		has[strings.ToLower(c)] = true
+	}
+	return has
+}
+
+// writeMissingLiveColumn emits the NULL placeholders for one column this index
+// does not have. It follows the projection's own shape: the two columns that
+// render as two outputs must produce two NULLs, or the legs stop lining up.
+func writeMissingLiveColumn(b *strings.Builder, col, name string) {
+	const why = " -- not a column of this index's binlog_events\n"
+	switch name {
+	case "event_type":
+		b.WriteString(col + "NULL AS \"event_type_code\"," + why)
+		b.WriteString(col + "NULL AS \"event_type\",\n")
+	case "commit_ts_us":
+		b.WriteString(col + "NULL AS \"commit_ts_us\"," + why)
+		b.WriteString(col + "NULL AS \"commit_time\",\n")
+	default:
+		fmt.Fprintf(b, "%sNULL AS %s,%s", col, quoteIdent(name), why)
+	}
 }
 
 // archiveGlob turns an archive base path (…/bintrail_id=<id>) into the glob that

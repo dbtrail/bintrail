@@ -14,11 +14,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returned no rows exactly as if nothing had happened. The new flag adds a
   second leg over the index itself, making a DuckDB query fresh to capture lag
   instead of to the archive retention window. Overlap between the two is
-  deduplicated by `event_id` with the index winning, the same rule bintrail
-  already applies in Go. The file carries the index host, port, database and
-  user and never its password: fill the empty slot in your own session. Without
-  the flag the file is unchanged except that it now states, in the `events`
-  view's own comment, which events it does not cover.
+  deduplicated by `event_id` with the **archives** winning: an archived row
+  knows its `bintrail_id`, `event_date` and `event_hour` from its storage path
+  and an index row has to derive or forgo them, so the leg that knows the source
+  is the one that survives the overlap. The index leg reads `event_timestamp` as
+  UTC explicitly, because the archives' Parquet column is timezone-aware and the
+  index's `DATETIME` is not, and a union of the two otherwise reads the index's
+  values in whatever timezone the reader's session happens to have. It names
+  only columns the index actually has, so an index migrated to an older schema
+  still yields a file that binds rather than a binder error and no view at all.
+  The file carries the index host, port, database and user and never its
+  password: fill the empty slot in your own session. It also says what a
+  loopback host means for a reader elsewhere, and what a query against the view
+  costs, where you will be looking when you measure it. Attribution of the live
+  rows states what was OBSERVED — one source, several, none registered, the
+  registry unreadable, or an id that disagrees with the archives' — rather than
+  one sentence covering all five. With nothing archived yet the file is the
+  index leg alone rather than no `events` view at all (#1485). Without the flag
+  the file is unchanged except that it now states, in the `events` view's own
+  comment, which events it does not cover and how to add them.
 
 ### Fixed
 - **A console-generated `views.sql` pins the S3 region when it is known**

@@ -3,9 +3,12 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -130,7 +133,7 @@ func runViews(cmd *cobra.Command, _ []string) error {
 	}
 
 	if vIncludeLive {
-		li, err := resolveLiveIndex(cmd.Context(), vIndexDSN)
+		li, err := resolveLiveIndex(cmd.Context(), vIndexDSN, vBintrailID)
 		if err != nil {
 			return err
 		}
@@ -272,13 +275,18 @@ func writeViewsOutput(cmd *cobra.Command, sql string) error {
 }
 
 // resolveLiveIndex decomposes the index DSN into the non-secret half the
-// generated file can carry, and attributes the hot leg when the index serves
-// exactly one source.
+// generated file can carry, and reads the two things about the index that the
+// generated SQL cannot be correct without: which source it serves, and which
+// columns its binlog_events actually has.
 //
 // The password is dropped HERE rather than in the generator. This is the only
 // place it exists, so dropping it at the boundary means no later change inside
 // the views package can start emitting it by accident.
-func resolveLiveIndex(ctx context.Context, dsn string) (*views.LiveIndex, error) {
+//
+// explicitID is --bintrail-id. When the operator named the source, that name
+// also scoped the archive paths this same file reads, so nothing the registry
+// reports could be more authoritative and the attribution query is not run.
+func resolveLiveIndex(ctx context.Context, dsn, explicitID string) (*views.LiveIndex, error) {
 	if dsn == "" {
 		return nil, fmt.Errorf("--include-live needs --index-dsn: the live leg reads the index directly, " +
 			"so there is nothing to attach without one")
@@ -293,18 +301,106 @@ func resolveLiveIndex(ctx context.Context, dsn string) (*views.LiveIndex, error)
 	}
 	defer db.Close()
 
-	// Attribution is only possible with ONE source: every source writes into
-	// the same binlog_events and the row itself carries no identity. Best
-	// effort on purpose — an index too old to have the table, or an account
-	// that cannot read it, leaves the hot rows NULL rather than failing a file
-	// whose other half is fine.
-	var n int
-	var id string
-	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COALESCE(MIN(bintrail_id), '') FROM bintrail_servers`).Scan(&n, &id); err == nil && n == 1 {
-		li.BintrailID = id
+	if err := describeLiveIndex(ctx, db, li, explicitID); err != nil {
+		return nil, err
 	}
 	return li, nil
+}
+
+// describeLiveIndex is the DB-taking half of resolveLiveIndex, split out so
+// what the command asks the index — and what it does NOT ask it when the
+// operator already named the source — is pinned without a MySQL.
+func describeLiveIndex(ctx context.Context, db *sql.DB, li *views.LiveIndex, explicitID string) error {
+	cols, err := liveTableColumns(ctx, db, li.Database)
+	if err != nil {
+		return err
+	}
+	li.TableColumns = cols
+
+	if explicitID != "" {
+		li.BintrailID = explicitID
+		return nil
+	}
+	attributeLiveIndex(ctx, db, li)
+	return nil
+}
+
+// attributeLiveIndex records what the index says about the sources it serves.
+//
+// Attribution is only possible with exactly ONE registered source: every source
+// writes into the same binlog_events and the row itself carries no identity.
+// Every other outcome leaves the rows unattributed, and this is where they stop
+// being one outcome: the generated file states what was observed, so an
+// unreadable list and a registry with nothing in it must not arrive as the same
+// value. Best effort on purpose — none of these fail a file whose other half is
+// fine.
+func attributeLiveIndex(ctx context.Context, db *sql.DB, li *views.LiveIndex) {
+	var n int
+	var id string
+	err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(MIN(bintrail_id), '') FROM bintrail_servers`).Scan(&n, &id)
+	if err != nil {
+		var myErr *drivermysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1146 {
+			// No such table. Read the same way status.knownSourceCount reads
+			// it: zero known sources, not an unreadable list. An index that
+			// never ran the migration is not evidence of several sources, and
+			// reporting it as one would be the exact inversion.
+			li.Attribution = views.AttributionUnregistered
+			return
+		}
+		li.Attribution = views.AttributionUndetermined
+		return
+	}
+	switch {
+	case n == 1 && id != "":
+		li.BintrailID = id
+	case n > 1:
+		li.Attribution = views.AttributionMultiSource
+	default:
+		// No rows, or one row whose bintrail_id is NULL (the column is
+		// nullable — see internal/status/staleness.go). Either way there is no
+		// id to attribute a row to, which is what the file will say.
+		li.Attribution = views.AttributionUnregistered
+	}
+}
+
+// liveTableColumns reads the index's binlog_events column set, so the generated
+// SQL names only columns that are there.
+//
+// The cold leg tolerates an archive written before a column existed
+// (union_by_name); the hot leg has no such mechanism, and an index migrated to
+// an earlier point than this build's schema — a legacy registry index the
+// console never migrates, for one — turns the whole generated file into a
+// binder error naming an internal column, with no events view created at all.
+//
+// Unlike attribution, this is NOT best effort: it decides whether the file
+// binds. A file that cannot define its main view is worse than a refused
+// command that says why.
+func liveTableColumns(ctx context.Context, db *sql.DB, dbName string) ([]string, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT COLUMN_NAME FROM information_schema.COLUMNS
+		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'binlog_events'`, dbName)
+	if err != nil {
+		return nil, fmt.Errorf("read the index's binlog_events columns for the live leg: %w", err)
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, fmt.Errorf("read the index's binlog_events columns for the live leg: %w", err)
+		}
+		cols = append(cols, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the index's binlog_events columns for the live leg: %w", err)
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("--index-dsn names database %q, which has no binlog_events table: "+
+			"--include-live builds a view over that table, so there is nothing to add", dbName)
+	}
+	return cols, nil
 }
 
 // liveIndexFromDSN is the PURE half of resolveLiveIndex: DSN in, the non-secret
@@ -314,20 +410,39 @@ func resolveLiveIndex(ctx context.Context, dsn string) (*views.LiveIndex, error)
 // The DSN carries the index password, this is the only place it is in scope,
 // and everything downstream renders into a file meant to be shared. Dropping it
 // here means no change further down can start emitting it.
+//
+// It does its own parsing rather than borrowing config.ParseSourceDSN: that
+// function's refusals name --source-dsn and justify themselves with binlog
+// replication, and a wrong flag with an irrelevant reason is worse guidance
+// than none for an operator who typed --index-dsn at a command that generates
+// text.
 func liveIndexFromDSN(dsn string) (*views.LiveIndex, error) {
-	host, port, user, _, err := config.ParseSourceDSN(dsn)
+	cfg, err := drivermysql.ParseDSN(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse --index-dsn for the live leg: %w", err)
 	}
-	// The DSN's own database, via ParseDSN rather than SELECT DATABASE(): the
-	// generated ATTACH names it, and a reader on another machine has no session
-	// to ask.
-	cfg, err := drivermysql.ParseDSN(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("read the database name from --index-dsn: %w", err)
+	if strings.EqualFold(cfg.Net, "unix") {
+		// Refused rather than rendered. The generated file names the index by
+		// host and port precisely so it can be read from another machine, and
+		// a socket path is a name for one machine only. DuckDB's mysql
+		// extension does take a SOCKET, so this is a choice about what the
+		// artifact is for, not a limitation.
+		return nil, fmt.Errorf("--index-dsn names a unix socket (%s), which --include-live cannot put in the file: "+
+			"the generated SQL locates the index by host and port so it can be run from another machine, "+
+			"and a socket path names only this one. Give --index-dsn a TCP address", cfg.Addr)
 	}
+	host, portStr, err := net.SplitHostPort(cfg.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("--index-dsn has no usable host:port for the live leg (%q): %w", cfg.Addr, err)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("--index-dsn has an unusable port for the live leg (%q): %w", portStr, err)
+	}
+	// The DSN's own database, from the same parse: the generated ATTACH names
+	// it, and a reader on another machine has no session to ask.
 	if cfg.DBName == "" {
 		return nil, fmt.Errorf("--index-dsn names no database, so the live leg has nothing to attach")
 	}
-	return &views.LiveIndex{Host: host, Port: int(port), Database: cfg.DBName, User: user}, nil
+	return &views.LiveIndex{Host: host, Port: int(port), Database: cfg.DBName, User: cfg.User}, nil
 }

@@ -42,8 +42,9 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 --
 -- SCOPE: these are the ARCHIVED events only. Partitions rotation has not
 -- archived yet exist solely in the index, so the most recent window is
--- absent here and reads as if nothing happened. Regenerate with a
--- reachable index to add the live leg.
+-- absent here and reads as if nothing happened.
+-- Add a leg over the index by regenerating with --include-live:
+--   bintrail views --index-dsn ... --include-live
 CREATE OR REPLACE VIEW "events" AS
   SELECT
     "bintrail_id", "event_date", "event_hour",
@@ -56,7 +57,7 @@ CREATE OR REPLACE VIEW "events" AS
     "connection_id",
     "schema_name",
     "table_name",
-    CAST("event_type" AS TINYINT) AS "event_type_code",
+    CAST("event_type" AS INTEGER) AS "event_type_code",
     CASE "event_type"
       WHEN 1 THEN 'INSERT'
       WHEN 2 THEN 'UPDATE'
