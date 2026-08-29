@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`bintrail export iceberg`** (#1466). Writes each table's current state as
+  an Apache Iceberg table under `--warehouse`, incrementally: the first run
+  loads the newest baseline snapshot, every run after that folds the events
+  since the table's own cursor into ONE Iceberg snapshot (equality deletes for
+  every touched key plus the rows that still exist). The table is never
+  rewritten. The cursor is the run's binlog cut, stored in the table's
+  properties in the same commit as the data, so nothing is written to the index
+  and a run that dies before committing resumes from the previous snapshot.
+  Refuses per table, with `baseline refresh`'s vocabulary, on a capture gap,
+  skipped events, a cut behind the cursor, a schema or type change or a
+  destructive DDL in the window; refuses tables without a primary key or with
+  a BIT column, and an index that holds more than one source. Every commit is
+  audited as `cli/export.iceberg`. DuckDB and Spark read the directory
+  directly; Trino, Athena and Snowflake read it once registered in their
+  catalog. See docs/iceberg-export.md.
+- Guard `cliapp/icebergfree_test.go`: the Iceberg and Arrow libraries are
+  imported only by `internal/icebergexport`, and only that package, the
+  `cliapp` root and `cmd/bintrail` may link them. The guarded set is derived
+  from `go list` over the module minus that three-entry allowlist, so a new
+  package is guarded the day it appears; the console, MCP and pg binaries are
+  pinned free of both. Records the #1467 decision mechanically: Iceberg is an
+  output, not the storage layer.
+
 ## [0.70.0] - 2026-08-28
 
 ### Added
