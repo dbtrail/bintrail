@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -262,6 +263,12 @@ func readSnapshotTimestampFromFooter(ctx context.Context, db *sql.DB, path strin
 func snapshotFilters(opts Options) ([]string, []any, error) {
 	var where []string
 	var args []any
+	if opts.PKRange != nil {
+		// Same reason as --pk/--pks: snapshot rows carry no pk_values, so
+		// a range over them cannot be evaluated. The CLI refuses the
+		// combination first; this keeps a hand-built Options honest.
+		return nil, nil, errors.New("snapshot: a primary key range cannot be applied to snapshot rows (they carry no pk_values)")
+	}
 	for _, ce := range opts.ColumnEq {
 		if !IsSafeColumnName(ce.Column) {
 			return nil, nil, fmt.Errorf("snapshot: unsafe column name %q in --column-eq; must match [A-Za-z_][A-Za-z0-9_]*", ce.Column)

@@ -270,6 +270,13 @@ func matchesOpts(e *entry, opts query.Options) bool {
 	if opts.PKValues != "" && r.PKValues != opts.PKValues {
 		return false
 	}
+	// The buffer has no SQL engine to cast for it, so the numeric window is
+	// applied by parsing the stored key with the cast's width (#1440);
+	// PKRange.Contains keeps the semantics of the two SQL predicates, and an
+	// unresolved range matches nothing rather than everything.
+	if opts.PKRange != nil && !opts.PKRange.Contains(r.PKValues) {
+		return false
+	}
 	if opts.EventType != nil && r.EventType != *opts.EventType {
 		return false
 	}
