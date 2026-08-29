@@ -65,6 +65,12 @@ type baselineSupervisor struct {
 	// build; see sqlExportRoot for why builds never share a path), the
 	// downloads streaming it, and the removal it is owed.
 	exportRuns map[string]*sqlExportRun
+	// exportOrphans is, per server id, every previous build under that
+	// server's staging root that the pre-build wipe could not remove, by
+	// path, with the last error. The trigger replaced the entry that owed
+	// each one its retry, so this is where the reaper, the Storage card and
+	// the new build's StagingError find it until the removal succeeds.
+	exportOrphans map[string]map[string]string
 	// now is the sql-export lifecycle's clock (nil = time.Now); tests inject
 	// one to cross the download TTL without waiting for it.
 	now func() time.Time
@@ -91,14 +97,15 @@ type baselineSupervisor struct {
 func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode baseline.LockMode) *baselineSupervisor {
 	sweepSQLExportStaging(stagingDir)
 	return &baselineSupervisor{
-		ctx:        ctx,
-		stagingDir: stagingDir,
-		lockMode:   lockMode,
-		jobs:       make(map[string]*console.BaselineStatus),
-		refreshes:  make(map[string]*console.BaselineStatus),
-		restores:   make(map[string]*console.BaselineStatus),
-		exports:    make(map[string]*console.BaselineStatus),
-		exportRuns: make(map[string]*sqlExportRun),
+		ctx:           ctx,
+		stagingDir:    stagingDir,
+		lockMode:      lockMode,
+		jobs:          make(map[string]*console.BaselineStatus),
+		refreshes:     make(map[string]*console.BaselineStatus),
+		restores:      make(map[string]*console.BaselineStatus),
+		exports:       make(map[string]*console.BaselineStatus),
+		exportRuns:    make(map[string]*sqlExportRun),
+		exportOrphans: make(map[string]map[string]string),
 	}
 }
 

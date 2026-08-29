@@ -1,9 +1,11 @@
 package console
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -559,6 +561,74 @@ func TestSQLExportDownload_flushFailureAborts(t *testing.T) {
 	}
 	if stub.heldOnce != 1 || stub.holds != 0 {
 		t.Fatalf("holds: taken %d, open %d; want one taken and released on abort", stub.heldOnce, stub.holds)
+	}
+	var ev *ext.AuditEvent
+	for _, e := range rec.Events() {
+		if e.Action == "baseline.download" {
+			c := e
+			ev = &c
+		}
+	}
+	if ev == nil || ev.Detail["aborted"] != "true" {
+		t.Fatalf("audit = %v, want the aborted handover recorded", ev)
+	}
+}
+
+// bareWriter is a ResponseWriter with neither Flush nor Unwrap: the shape a
+// middleware wrapper takes when it forwards neither, which leaves
+// http.ResponseController unable to reach the connection.
+type bareWriter struct{ rec *httptest.ResponseRecorder }
+
+func (w *bareWriter) Header() http.Header         { return w.rec.Header() }
+func (w *bareWriter) Write(b []byte) (int, error) { return w.rec.Write(b) }
+func (w *bareWriter) WriteHeader(code int)        { w.rec.WriteHeader(code) }
+
+// TestSQLExportDownload_unflushableWriterKeepsTheBuild: a writer that
+// cannot flush leaves "did the last bytes reach the socket" unanswerable,
+// and an unanswerable delivery must not consume the build. The handler
+// aborts, says which writer type broke the chain (a wiring bug, not a
+// client that left), delivers nothing, and the build stays succeeded.
+func TestSQLExportDownload_unflushableWriterKeepsTheBuild(t *testing.T) {
+	rec := audittest.Install(t)
+	var logs bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	dir := newSQLDumpFixture(t)
+	stub := &stubSQLExporter{dir: dir, ready: true,
+		st: BaselineStatus{State: "succeeded", At: "2026-06-10T12:00:00Z"}}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+
+	req := httptest.NewRequest("GET", "/api/servers/"+id+"/sql-export/download", nil)
+	req.SetPathValue("id", id)
+	w := &bareWriter{rec: httptest.NewRecorder()}
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				if r != http.ErrAbortHandler {
+					t.Fatalf("panic = %v, want http.ErrAbortHandler", r)
+				}
+			}
+		}()
+		srv.handleSQLExportDownload(w, req)
+	}()
+	if !panicked {
+		t.Fatal("a delivery that could not be flushed must abort, not declare the archive delivered")
+	}
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v over a writer that cannot flush, want none (the build must not be removed)", stub.delivered)
+	}
+	if st := stub.SQLExportStatus(""); st.State != "succeeded" {
+		t.Fatalf("state = %s, want succeeded (never downloaded)", st.State)
+	}
+	if stub.heldOnce != 1 || stub.holds != 0 {
+		t.Fatalf("holds: taken %d, open %d; want one taken and released on abort", stub.heldOnce, stub.holds)
+	}
+	if got := logs.String(); !strings.Contains(got, "level=ERROR") || !strings.Contains(got, "*console.bareWriter") {
+		t.Fatalf("log = %q, want an ERROR naming the writer type", got)
 	}
 	var ev *ext.AuditEvent
 	for _, e := range rec.Events() {

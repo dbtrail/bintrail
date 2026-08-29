@@ -34,7 +34,7 @@ type stagingDTO struct {
 type stagedBuildDTO struct {
 	ServerID   string `json:"server_id"`
 	ServerName string `json:"server_name,omitempty"` // resolved from the registry when the entry still exists
-	State      string `json:"state"`                 // running | succeeded | failed (removal still owed)
+	State      string `json:"state"`                 // running | succeeded | failed (removal still owed) | replaced (a previous build a newer one could not remove)
 	At         string `json:"at,omitempty"`
 	ExpiresAt  string `json:"expires_at,omitempty"`
 	// Bytes counts only when BytesKnown; an unmeasurable build is excluded

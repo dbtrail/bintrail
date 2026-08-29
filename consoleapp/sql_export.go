@@ -61,6 +61,13 @@ import (
 //     outside the sql-export staging base and any path that crosses a
 //     symbolic link, so no state this supervisor can reach makes it delete
 //     something it did not write.
+//   - A build a NEWER build could not clear is not forgotten. The trigger
+//     replaces the server's entry, so the old build's own retry is gone with
+//     it; the pre-build wipe records every sibling it could not remove in
+//     exportOrphans, where the reaper retries it every tick, the Storage
+//     card counts it, and the new build's StagingError names it until the
+//     removal succeeds. Otherwise that directory would be exactly the
+//     invisible space this lifecycle exists to prevent, until the next boot.
 
 // sqlExportTTL is how long a finished build stays downloadable. Long enough
 // to survive a coffee break and a slow browser; short enough that a forgotten
@@ -98,7 +105,18 @@ type sqlExportRun struct {
 	// take a hold on a build that is being torn down, and left set when
 	// the removal fails, so the reaper retries it.
 	pending string
+	// problem is THIS build's staging-side problem (its removal failed, or
+	// its marker could not be read); "" when fine. The status's
+	// StagingError is composed from it plus the server's orphans by
+	// syncStagingErrorLocked, so clearing one never erases the other.
+	problem string
 }
+
+// removeStagedBuildFn is the seam every in-process removal goes through.
+// A variable so a test can observe or interrupt a removal mid-flight
+// (a trigger that lands while a removal runs is the race the re-check in
+// removeSQLExportBuild exists for); production never reassigns it.
+var removeStagedBuildFn = removeStagedBuild
 
 // sqlExportBase is the one directory every build lives under. It is the
 // boundary removeStagedBuild enforces.
@@ -136,6 +154,9 @@ func (s *baselineSupervisor) TriggerSQLExport(req console.SQLExportRequest) erro
 	s.exports[req.ServerID] = &console.BaselineStatus{State: "running", Since: now.Format(time.RFC3339),
 		At: req.At.UTC().Format(time.RFC3339)}
 	s.exportRuns[req.ServerID] = &sqlExportRun{dir: dir}
+	// A previous build this server could not clear stays on the new build's
+	// status from its first poll, not from the wipe's next failure.
+	s.syncStagingErrorLocked(req.ServerID)
 	s.mu.Unlock()
 
 	slog.Info("sql export: starting", "server", req.ServerName, "id", req.ServerID,
@@ -243,9 +264,10 @@ func (s *baselineSupervisor) SQLExportDelivered(serverID, dir string) {
 // SQLExportStaged reports what the sql-export staging holds right now, for
 // the Storage page's disk picture: every build in progress, waiting for its
 // download, or owed a removal that has not succeeded yet (a failed build
-// whose partial files could not be removed included), with its LIVE size.
-// A size the walk could not establish is reported as unknown, never as
-// zero. Expires first, so a build past its deadline never counts.
+// whose partial files could not be removed included), plus every previous
+// build a newer one could not clear (state "replaced"), each with its LIVE
+// size. A size the walk could not establish is reported as unknown, never
+// as zero. Expires first, so a build past its deadline never counts.
 func (s *baselineSupervisor) SQLExportStaged() console.SQLExportStagingInfo {
 	s.expireSQLExports()
 	info := console.SQLExportStagingInfo{Dir: s.sqlExportBase(), TTL: sqlExportTTL}
@@ -254,6 +276,9 @@ func (s *baselineSupervisor) SQLExportStaged() console.SQLExportStagingInfo {
 		id  string
 		st  console.BaselineStatus
 		dir string
+		// orphan marks a previous build the wipe could not remove; st then
+		// carries only the removal error, in StagingError.
+		orphan bool
 	}
 	var builds []held
 	for id, st := range s.exports {
@@ -266,8 +291,27 @@ func (s *baselineSupervisor) SQLExportStaged() console.SQLExportStagingInfo {
 		}
 		builds = append(builds, held{id: id, st: *st, dir: run.dir})
 	}
+	for id, orphans := range s.exportOrphans {
+		for path, msg := range orphans {
+			builds = append(builds, held{id: id, dir: path, orphan: true, st: console.BaselineStatus{
+				State:        "replaced",
+				StagingError: "could not remove the staged files (replaced by a newer build): " + msg,
+			}})
+		}
+	}
 	s.mu.Unlock()
-	sort.Slice(builds, func(i, j int) bool { return builds[i].id < builds[j].id })
+	// The current build first, then its orphans by path, so the card reads
+	// top-down the way the disk filled up.
+	sort.Slice(builds, func(i, j int) bool {
+		a, b := builds[i], builds[j]
+		if a.id != b.id {
+			return a.id < b.id
+		}
+		if a.orphan != b.orphan {
+			return !a.orphan
+		}
+		return a.dir < b.dir
+	})
 	for _, b := range builds {
 		bytes, err := dirBytes(b.dir)
 		if err != nil {
@@ -330,10 +374,25 @@ func (s *baselineSupervisor) expireSQLExports() {
 			s.setStagingError(c.id, c.dir, "")
 		}
 	}
+	// Previous builds a newer build could not clear: retried on every tick
+	// and every poll, exactly like a removal the current build is owed.
+	type orphan struct{ id, path string }
+	var orphans []orphan
+	s.mu.Lock()
+	for id, paths := range s.exportOrphans {
+		for path := range paths {
+			orphans = append(orphans, orphan{id: id, path: path})
+		}
+	}
+	s.mu.Unlock()
+	for _, o := range orphans {
+		s.removeOrphan(o.id, o.path)
+	}
 }
 
-// setStagingError records (or clears) the staging-side problem the card
-// shows, only while the entry still points at dir.
+// setStagingError records (or clears) the current build's own staging-side
+// problem, only while the entry still points at dir. The server's orphans
+// stay on the status either way.
 func (s *baselineSupervisor) setStagingError(serverID, dir, msg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -342,7 +401,86 @@ func (s *baselineSupervisor) setStagingError(serverID, dir, msg string) {
 	if run == nil || st == nil || run.dir != dir || run.pending != "" {
 		return
 	}
-	st.StagingError = msg
+	run.problem = msg
+	s.syncStagingErrorLocked(serverID)
+}
+
+// syncStagingErrorLocked recomputes the status's StagingError for a server
+// from the two things it reports: the current build's own problem first,
+// then every previous build under the server's staging root that could not
+// be removed, by path. Composed rather than written in place so that the
+// paths which clear one part (a successful removal, a marker readable
+// again) cannot silently drop the other. Caller holds s.mu.
+func (s *baselineSupervisor) syncStagingErrorLocked(serverID string) {
+	st := s.exports[serverID]
+	if st == nil {
+		return
+	}
+	var parts []string
+	if run := s.exportRuns[serverID]; run != nil && run.problem != "" {
+		parts = append(parts, run.problem)
+	}
+	paths := make([]string, 0, len(s.exportOrphans[serverID]))
+	for p := range s.exportOrphans[serverID] {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		parts = append(parts, "a previous build could not be removed: "+p+": "+s.exportOrphans[serverID][p])
+	}
+	st.StagingError = strings.Join(parts, "; ")
+}
+
+// noteOrphan records a previous build under serverID's staging root that a
+// removal could not clear, with the error, and puts it on the server's
+// status. Idempotent: a retry that fails again only refreshes the error.
+func (s *baselineSupervisor) noteOrphan(serverID, path string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exportOrphans == nil {
+		s.exportOrphans = make(map[string]map[string]string)
+	}
+	if s.exportOrphans[serverID] == nil {
+		s.exportOrphans[serverID] = make(map[string]string)
+	}
+	s.exportOrphans[serverID][path] = err.Error()
+	s.syncStagingErrorLocked(serverID)
+}
+
+// forgetOrphan drops a previous build whose removal succeeded, and takes it
+// off the server's status. A path that was never recorded is a no-op.
+func (s *baselineSupervisor) forgetOrphan(serverID, path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	paths := s.exportOrphans[serverID]
+	if _, ok := paths[path]; !ok {
+		return
+	}
+	delete(paths, path)
+	if len(paths) == 0 {
+		delete(s.exportOrphans, serverID)
+	}
+	s.syncStagingErrorLocked(serverID)
+}
+
+// removeOrphan retries the removal of a previous build the wipe could not
+// clear. Through the same guard as every removal; no hold is consulted
+// because the run that could have held it was replaced by the trigger
+// (the same posture as the wipe itself).
+func (s *baselineSupervisor) removeOrphan(serverID, path string) {
+	freed, sized, err := removeStagedBuildFn(s.sqlExportBase(), path)
+	if err != nil {
+		s.noteOrphan(serverID, path, err)
+		slog.Warn("sql export: could not remove a previous build; it stays on disk and the removal is retried every minute",
+			"id", serverID, "path", path, "error", err)
+		return
+	}
+	s.forgetOrphan(serverID, path)
+	if sized {
+		slog.Info("sql export: removed a previous build", "id", serverID, "path", path, "bytes", freed)
+	} else {
+		slog.Info("sql export: removed a previous build", "id", serverID, "path", path, "bytes", "unknown")
+	}
 }
 
 // markerPresent reports whether dir carries the #842 _SUCCESS marker.
@@ -416,7 +554,10 @@ func (s *baselineSupervisor) reapSQLExportsGuarded() {
 // succeeded: a failure keeps the state, records the error in StagingError
 // (the card shows it, the Storage card keeps counting the bytes) and stays
 // owed, so every reaper tick retries it. A removal that succeeds after the
-// entry moved on to a newer build changes nothing but the disk.
+// entry moved on to a newer build changes nothing but the disk: the
+// re-check after the removal is what keeps a trigger that landed
+// mid-removal from having its fresh "running" build stamped with the old
+// build's terminal state.
 func (s *baselineSupervisor) removeSQLExportBuild(serverID, dir, why string) {
 	if dir == "" {
 		return
@@ -428,13 +569,16 @@ func (s *baselineSupervisor) removeSQLExportBuild(serverID, dir, why string) {
 		return
 	}
 	run.pending = why
+	if st := s.exports[serverID]; st != nil {
+		st.RemovalOwed = true
+	}
 	if run.holds > 0 {
 		s.mu.Unlock()
 		return
 	}
 	s.mu.Unlock()
 
-	freed, sized, err := removeStagedBuild(s.sqlExportBase(), dir)
+	freed, sized, err := removeStagedBuildFn(s.sqlExportBase(), dir)
 
 	s.mu.Lock()
 	run = s.exportRuns[serverID]
@@ -444,18 +588,29 @@ func (s *baselineSupervisor) removeSQLExportBuild(serverID, dir, why string) {
 		return
 	}
 	if err != nil {
-		st.StagingError = "could not remove the staged files (" + why + "): " + err.Error()
+		run.problem = "could not remove the staged files (" + why + "): " + err.Error()
+		s.syncStagingErrorLocked(serverID)
 		s.mu.Unlock()
 		slog.Warn("sql export: could not remove a staged build; it stays on disk and the removal is retried every minute",
 			"id", serverID, "dir", dir, "why", why, "error", err)
 		return
 	}
 	run.pending = ""
-	st.StagingError = ""
-	switch why {
-	case removeDownloaded:
+	run.problem = ""
+	st.RemovalOwed = false
+	s.syncStagingErrorLocked(serverID)
+	switch {
+	case st.State == "downloaded":
+		// Terminal already: a "vanished" or "expired" removal that lands
+		// after the delivery (the expiry pass snapshots its candidates
+		// outside the lock) finds the directory gone and must not turn a
+		// downloaded build into an expired one.
+	case st.State == "expired" && why != removeDownloaded:
+		// Same, from the other side: only a delivery upgrades an expired
+		// build (the deadline caught a stream that then completed).
+	case why == removeDownloaded:
 		st.State = "downloaded"
-	case removeFailed:
+	case why == removeFailed:
 		// Stays "failed": the verdict is the fold's, not the cleanup's.
 	default:
 		st.State = "expired"
@@ -693,10 +848,12 @@ func (s *baselineSupervisor) executeSQLExport(req console.SQLExportRequest, dir 
 	// Tear down previous builds as this one starts; the new build writes only
 	// into its own directory, so an in-flight download of an OLD build either
 	// completes byte-exact (files already open survive the unlink) or dies
-	// loudly on its abort guard — never silently mixed. A sibling the guard
-	// refuses (a link, a stray entry) is warned about and left, like the
-	// boot sweep does: it costs disk, not correctness, and failing every
-	// future build over it would read as an internal bug.
+	// loudly on its abort guard — never silently mixed. A sibling that
+	// cannot be removed (a stuck previous build, or one the guard refuses:
+	// a link, a stray entry) does not fail this build, which would read as
+	// an internal bug; it is recorded as an orphan instead, so it stays on
+	// the Storage card, on this build's status, and on the reaper's retry
+	// list rather than on disk until someone runs du.
 	root := filepath.Dir(dir)
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return 0, 0, 0, fmt.Errorf("create staging directory: %w", err)
@@ -710,10 +867,13 @@ func (s *baselineSupervisor) executeSQLExport(req console.SQLExportRequest, dir 
 			continue
 		}
 		old := filepath.Join(root, ent.Name())
-		if _, _, err := removeStagedBuild(s.sqlExportBase(), old); err != nil {
-			slog.Warn("sql export: could not clear a previous build; it stays on disk until removed by hand",
+		if _, _, err := removeStagedBuildFn(s.sqlExportBase(), old); err != nil {
+			s.noteOrphan(req.ServerID, old, err)
+			slog.Warn("sql export: could not clear a previous build; it stays on disk and the removal is retried every minute",
 				"id", req.ServerID, "path", old, "error", err)
+			continue
 		}
+		s.forgetOrphan(req.ServerID, old)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return 0, 0, 0, fmt.Errorf("create build directory: %w", err)

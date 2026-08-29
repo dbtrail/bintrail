@@ -66,7 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sql-export` staging directory and refuses any path outside it or across
   a symbolic link. The Storage page gains a **Staged downloads** card
   (`staging` in `GET /api/storage`) with each build's server, size and
-  deadline, so the space is visible while it exists.
+  deadline, so the space is visible while it exists. A previous build that
+  a new build could not remove stays on that card (state `replaced`, with
+  the reason), is named in the new build's `staging_error` until its removal
+  succeeds, and is retried every minute; the new build stays downloadable
+  (`removal_owed` in the status says when a build's OWN removal is what is
+  pending). A download whose response writer cannot flush aborts and logs
+  the writer type instead of consuming the build.
 - **Usage telemetry classifies first-run failures** (#1503). A fresh install
   that could not start reported every attempt as `error_class: unknown`, so
   the one thing telemetry exists to show — why a first run fails — was

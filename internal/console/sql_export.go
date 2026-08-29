@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -65,7 +66,7 @@ type SQLExportStagingInfo struct {
 // waiting for its download, or owed a removal that has not succeeded yet.
 type SQLExportStagedBuild struct {
 	ServerID  string
-	State     string // running | succeeded | failed (only while its removal is still owed)
+	State     string // running | succeeded | failed (only while its removal is still owed) | replaced (a previous build a newer one could not remove)
 	At        string // the instant the dump represents (RFC3339 UTC)
 	ExpiresAt string // when a finished build is removed unless downloaded first
 	// Bytes is the live on-disk size; meaningful only when BytesKnown. A
@@ -307,9 +308,16 @@ func (s *Server) handleSQLExportDownload(w http.ResponseWriter, r *http.Request)
 	// the last chunk surfaces only when that buffer is flushed. Flush before
 	// deciding the archive left, or the build could be removed on the
 	// strength of bytes that never reached the socket. A writer that cannot
-	// flush (a wrapper without Unwrap) leaves the question open rather than
-	// aborting every download; the deadline below still bounds the build.
-	if err := http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+	// flush at all (a middleware wrapper without Flush or Unwrap) leaves
+	// that question unanswerable, and an unanswerable question must not
+	// consume the build: it aborts too, and says which writer type broke
+	// the chain, because that is a wiring bug to fix rather than a client
+	// that went away. The deadline still bounds the build either way.
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		if errors.Is(err, http.ErrNotSupported) {
+			slog.Error("sql backup download: the response writer cannot flush, so the delivery cannot be confirmed and the staged build is kept; every ResponseWriter wrapper on this route must implement Flush or Unwrap",
+				"server", e.ID, "writer", fmt.Sprintf("%T", w))
+		}
 		abort("sql backup download aborted: the connection dropped before the last bytes were sent", err)
 	}
 	if err := r.Context().Err(); err != nil {

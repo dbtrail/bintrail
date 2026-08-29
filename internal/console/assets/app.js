@@ -4935,7 +4935,7 @@ function backupSQLExportCard(cur, b, sqlSt) {
     const row = el("div", { class: "bk-restore-row" },
       el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") +
         (st.bytes ? " (" + humanBytes(st.bytes) + " on this machine)" : "") + "." }));
-    if (!st.staging_error) row.append(dl);
+    if (!st.removal_owed) row.append(dl);
     body.append(row);
     body.append(el("p", { class: "form-hint", text:
       (st.expires_at ? "The download stays available until " + utcLabel(st.expires_at) + ". " : "") +

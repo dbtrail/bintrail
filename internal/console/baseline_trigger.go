@@ -192,6 +192,12 @@ type BaselineStatus struct {
 	// still on disk when they should not be (a removal that failed and is
 	// retried every minute) or why they could not be read. Empty when fine.
 	StagingError string `json:"staging_error,omitempty"`
+	// RemovalOwed (sql-export builds only) is true while THIS build's own
+	// removal has been decided and has not succeeded yet: its files are
+	// still on disk but it is no longer downloadable. A StagingError about
+	// a previous build (one this build's start could not clear) leaves it
+	// false, and the build stays downloadable.
+	RemovalOwed bool `json:"removal_owed,omitempty"`
 	// Refused counts tables a refresh declined to fold (gap / schema change).
 	// A refresh that refuses every table is not a failure of the daemon — it is
 	// a correct fail-closed verdict — so it reports succeeded=false with this

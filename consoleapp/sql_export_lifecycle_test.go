@@ -2,10 +2,12 @@ package consoleapp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -523,6 +525,9 @@ func TestSQLExportRemovalFailure_staysVisibleAndRetries(t *testing.T) {
 	if !strings.Contains(st.StagingError, "could not remove") {
 		t.Fatalf("staging_error = %q, want the removal failure", st.StagingError)
 	}
+	if !st.RemovalOwed {
+		t.Fatal("removal_owed must be set while the build's OWN removal is retried: it is what hides the download button")
+	}
 	if !onDisk(filepath.Join(dir, "shop.orders.00000.sql")) {
 		t.Fatal("the dump file is gone; the fixture did not make the removal fail")
 	}
@@ -543,8 +548,8 @@ func TestSQLExportRemovalFailure_staysVisibleAndRetries(t *testing.T) {
 	}
 	sup.reapSQLExportsGuarded()
 	st = sup.SQLExportStatus("srv1")
-	if st.State != "expired" || st.StagingError != "" || onDisk(dir) {
-		t.Fatalf("after the retry: status = %+v, dir present = %v; want expired, no error, gone", st, onDisk(dir))
+	if st.State != "expired" || st.StagingError != "" || st.RemovalOwed || onDisk(dir) {
+		t.Fatalf("after the retry: status = %+v, dir present = %v; want expired, no error, nothing owed, gone", st, onDisk(dir))
 	}
 }
 
@@ -764,5 +769,182 @@ func TestSQLExportFailedBuildStuck_staysOnStorageCard(t *testing.T) {
 	}
 	if staged := sup.SQLExportStaged(); len(staged.Builds) != 0 {
 		t.Fatalf("staged = %+v after the removal succeeded, want nothing", staged.Builds)
+	}
+}
+
+// TestSQLExportRemoval_triggerMidRemovalKeepsTheNewBuild pins the re-check
+// AFTER the removal in removeSQLExportBuild. The removal runs outside the
+// lock, so a trigger can land while it runs and put a new build (D2) in
+// the slot; when the removal of D1 returns, the old build's terminal state
+// must not be stamped on D2, which is running and owes nothing. The seam
+// over removeStagedBuild is what makes that interleaving reproducible.
+func TestSQLExportRemoval_triggerMidRemovalKeepsTheNewBuild(t *testing.T) {
+	sup, clk, cancel := newClockedSupervisor(t)
+	defer cancel()
+	d1 := seedFinishedExport(t, sup, "srv1")
+	src := t.TempDir()
+	writeFakeSnapshot(t, src)
+
+	// D2's fold blocks until the test lets it go, so D2 is "running" for as
+	// long as the assertions need it.
+	gate := make(chan struct{})
+	prevFold := foldTables
+	t.Cleanup(func() { foldTables = prevFold })
+	foldTables = func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		<-gate
+		return nil, nil, errors.New("fold released by the test")
+	}
+	// The first removal of D1 (the expiry's) triggers D2 mid-flight, then
+	// removes D1 for real. D2's own pre-build wipe also reaches for D1; it
+	// waits for that first removal to finish so the two never race on the
+	// same directory (a race there would be a different test).
+	d1Gone := make(chan struct{})
+	var removals atomic.Int32
+	prevRemove := removeStagedBuildFn
+	t.Cleanup(func() { removeStagedBuildFn = prevRemove })
+	removeStagedBuildFn = func(base, dir string) (int64, bool, error) {
+		if dir != d1 {
+			return removeStagedBuild(base, dir)
+		}
+		if removals.Add(1) == 1 {
+			defer close(d1Gone)
+			if err := sup.TriggerSQLExport(console.SQLExportRequest{ServerID: "srv1", ServerName: "wp",
+				IndexDSN: "dsn", BaselineSrc: src, At: snapshotAnchor.Add(time.Hour)}); err != nil {
+				t.Errorf("trigger mid-removal: %v", err)
+			}
+			return removeStagedBuild(base, dir)
+		}
+		<-d1Gone
+		return removeStagedBuild(base, dir)
+	}
+
+	clk.advance(sqlExportTTL + time.Second)
+	sup.expireSQLExports() // D1 past its deadline: the removal starts and the trigger lands inside it
+
+	sup.mu.Lock()
+	st := *sup.exports["srv1"]
+	run := sup.exportRuns["srv1"]
+	d2, pending := run.dir, run.pending
+	sup.mu.Unlock()
+	if d2 == d1 {
+		t.Fatal("the trigger never landed; the fixture did not reproduce the interleaving")
+	}
+	if st.State != "running" || st.StagingError != "" || st.RemovalOwed || pending != "" {
+		t.Fatalf("D2 after D1's removal returned: state = %q, staging_error = %q, removal_owed = %v, pending = %q; "+
+			"want running, no error, nothing owed (D1's verdict must not land on D2)", st.State, st.StagingError, st.RemovalOwed, pending)
+	}
+	if onDisk(d1) {
+		t.Fatalf("D1 %s is still on disk after its removal returned", d1)
+	}
+	close(gate)
+	waitForTerminalState(t, func() console.BaselineStatus { return sup.SQLExportStatus("srv1") })
+}
+
+// TestSQLExportPreBuildWipe_stuckPreviousBuildStaysVisibleAndRetried: when
+// a new build starts and the previous build cannot be removed, the trigger
+// has already replaced the entry that owed that removal its retry. The
+// directory must not fall out of sight until the next boot: it stays on
+// the Storage card with its bytes (state "replaced"), the new build's
+// status names it, the reaper retries it every tick, and the new build is
+// downloadable all the while. Once the removal succeeds, both the row and
+// the error go. The fold completing must not clear the error either: the
+// orphan is still on disk when the fold finishes.
+func TestSQLExportPreBuildWipe_stuckPreviousBuildStaysVisibleAndRetried(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	fakeFold(t)
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	d1 := seedFinishedExport(t, sup, "srv1")
+	if err := os.Chmod(d1, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(d1, 0o700) })
+	d1Bytes, err := dirBytes(d1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d2 := triggerAndFinish(t, sup, "srv1")
+	if !onDisk(filepath.Join(d1, "shop.orders.00000.sql")) {
+		t.Fatal("the previous build's file is gone; the fixture did not make the wipe fail")
+	}
+	st := sup.SQLExportStatus("srv1") // a poll after the fold completed: the orphan must survive it
+	want := "a previous build could not be removed: " + d1 + ": "
+	if st.State != "succeeded" || !strings.Contains(st.StagingError, want) {
+		t.Fatalf("status = %+v, want succeeded with a staging_error naming %q", st, want)
+	}
+	if st.RemovalOwed {
+		t.Fatal("removal_owed is set on the NEW build: only its own removal may set it, or the UI hides a working download")
+	}
+	if got, _, ok := sup.SQLExportDir("srv1"); !ok || got != d2 {
+		t.Fatalf("SQLExportDir = (%q, %v), want (%q, true): the new build stays downloadable over a stuck previous one", got, ok, d2)
+	}
+	staged := sup.SQLExportStaged()
+	if len(staged.Builds) != 2 {
+		t.Fatalf("staged = %+v, want the new build and the previous one it could not remove", staged.Builds)
+	}
+	if b := staged.Builds[0]; b.ServerID != "srv1" || b.State != "succeeded" {
+		t.Fatalf("staged[0] = %+v, want the new build first", b)
+	}
+	if b := staged.Builds[1]; b.ServerID != "srv1" || b.State != "replaced" || !b.BytesKnown || b.Bytes != d1Bytes ||
+		!strings.Contains(b.StagingError, "replaced by a newer build") {
+		t.Fatalf("staged[1] = %+v, want state replaced, %d known bytes and the removal error", b, d1Bytes)
+	}
+
+	// A delivery of the new build succeeds its own removal and clears its
+	// own problem; the orphan's must stay, read straight off the status
+	// with no poll in between that could re-stamp it.
+	sup.SQLExportDelivered("srv1", d2)
+	sup.mu.Lock()
+	after := *sup.exports["srv1"]
+	sup.mu.Unlock()
+	if after.State != "downloaded" || onDisk(d2) || !strings.Contains(after.StagingError, want) {
+		t.Fatalf("status = %+v right after the delivery (d2 present = %v), want downloaded, gone, and the previous build still named", after, onDisk(d2))
+	}
+
+	// The operator fixes the permission; the next reaper tick removes the
+	// previous build, its row goes, and the error clears.
+	if err := os.Chmod(d1, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sup.reapSQLExportsGuarded()
+	if onDisk(d1) {
+		t.Fatalf("the reaper never removed the previous build %s", d1)
+	}
+	st = sup.SQLExportStatus("srv1")
+	if st.State != "downloaded" || st.StagingError != "" {
+		t.Fatalf("after the retry: status = %+v, want downloaded with the error cleared", st)
+	}
+	if staged := sup.SQLExportStaged(); len(staged.Builds) != 0 {
+		t.Fatalf("staged = %+v after the retry, want nothing", staged.Builds)
+	}
+}
+
+// TestSQLExportDelivered_lateVanishedRemovalKeepsDownloaded: the expiry
+// pass snapshots its candidates outside the lock, so one that saw the
+// build as succeeded can find the directory gone AFTER a delivery removed
+// it and ask for a "vanished" removal of the same dir. That removal
+// succeeds (the goal is "not there") and must leave the state where the
+// delivery put it: downloaded is the truer verdict and is terminal.
+func TestSQLExportDelivered_lateVanishedRemovalKeepsDownloaded(t *testing.T) {
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	dir := seedFinishedExport(t, sup, "srv1")
+	sup.SQLExportDelivered("srv1", dir)
+	if st := sup.SQLExportStatus("srv1"); st.State != "downloaded" {
+		t.Fatalf("state = %s after the delivery, want downloaded", st.State)
+	}
+	sup.removeSQLExportBuild("srv1", dir, removeVanished)
+	st := sup.SQLExportStatus("srv1")
+	if st.State != "downloaded" || st.RemovalOwed || st.StagingError != "" {
+		t.Fatalf("status = %+v after a late vanished removal, want downloaded with nothing owed", st)
+	}
+	sup.mu.Lock()
+	pending := sup.exportRuns["srv1"].pending
+	sup.mu.Unlock()
+	if pending != "" {
+		t.Fatalf("pending = %q after the late removal, want nothing owed", pending)
 	}
 }

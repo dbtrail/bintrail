@@ -172,8 +172,11 @@ and searching events:
    new build for the same server starts, or when the daemon restarts (every
    build a previous process left behind, finished or interrupted, is removed
    at startup). If a removal fails, the build keeps its state, the card says
-   why, and the daemon retries every minute. The Storage page shows what is
-   staged while it exists.
+   why, and the daemon retries every minute. If a new build starts and the
+   previous one cannot be removed, the new build still runs and stays
+   downloadable; its status names the previous build's directory until that
+   removal succeeds. The Storage page shows what is staged while it exists,
+   previous builds that could not be removed included.
 7. **Settings** (under `watch` only) — **Storage** (rotation policy,
    per-source S3 archiving, a baseline summary card, AWS credential signals,
    and a usage-telemetry opt-out — see
@@ -463,8 +466,10 @@ compact baseline summary card and links onward:
   are waiting on the daemon's disk for their download: each build's server,
   size and download deadline, the total, and where they live. A build is
   removed once downloaded or 4 hours after it finished, so this card is
-  usually empty; it exists so that space is never invisible. Shown only on a
-  daemon that can build `.sql` backups.
+  usually empty; it exists so that space is never invisible. A build that
+  could not be removed stays listed with the reason (a previous build a
+  newer one could not clear included) and is retried every minute. Shown
+  only on a daemon that can build `.sql` backups.
 - **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one
