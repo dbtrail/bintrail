@@ -30,6 +30,10 @@ func seedSchemaChanges(t *testing.T) *Server {
 			(detected_at, binlog_file, binlog_pos, schema_name, table_name, ddl_type, ddl_query)
 			VALUES (?, ?, ?, ?, ?, ?, ?)`, at, file, pos, schema, table, ddlType, stmt)
 	}
+	// Unqualified DDL: the parser derives schema_name from the statement
+	// text alone, so `USE app; TRUNCATE TABLE secrets` lands with an EMPTY
+	// schema. A deny on app.secrets has to withhold it too.
+	insert("2026-06-01 11:59:00", "bin.000001", 800, "", "secrets", "TRUNCATE TABLE", "TRUNCATE TABLE secrets")
 	insert("2026-06-01 12:00:00", "bin.000001", 900, "app", "users", "CREATE TABLE", "CREATE TABLE users (id INT PRIMARY KEY)")
 	insert("2026-06-01 12:00:05", "bin.000001", 200, "app", "users", "ALTER TABLE", "ALTER TABLE users ADD COLUMN email VARCHAR(255)")
 	insert("2026-06-01 12:00:05", "bin.000001", 300, "app", "users", "DROP TABLE", "DROP TABLE users")
@@ -100,21 +104,21 @@ func TestIntegrationSchemaChangesOrdering(t *testing.T) {
 func TestIntegrationSchemaChangesFilters(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	srv := seedSchemaChanges(t)
-	if resp := getSchemaChanges(t, srv, "", "static-tok"); resp.Count != 6 {
-		t.Errorf("unfiltered count = %d, want 6", resp.Count)
+	if resp := getSchemaChanges(t, srv, "", "static-tok"); resp.Count != 7 {
+		t.Errorf("unfiltered count = %d, want 7", resp.Count)
 	}
 	if resp := getSchemaChanges(t, srv, "?ddl_type=alter", "static-tok"); resp.Count != 3 ||
 		resp.Changes[0].DDLType != "ALTER TABLE" || resp.Changes[1].DDLType != "ALTER TABLE" || resp.Changes[2].DDLType != "ALTER TABLE" {
 		t.Errorf("ddl_type=alter: %+v, want the three ALTER TABLE rows", resp.Changes)
 	}
-	if resp := getSchemaChanges(t, srv, "?table=secrets", "static-tok"); resp.Count != 1 || resp.Changes[0].Table != "secrets" {
-		t.Errorf("table=secrets: %+v, want the one TRUNCATE row", resp.Changes)
+	if resp := getSchemaChanges(t, srv, "?table=secrets", "static-tok"); resp.Count != 2 || resp.Changes[0].Table != "secrets" || resp.Changes[1].Schema != "" {
+		t.Errorf("table=secrets: %+v, want both TRUNCATE rows, the unqualified one last", resp.Changes)
 	}
 	if resp := getSchemaChanges(t, srv, "?schema=nope", "static-tok"); resp.Count != 0 {
 		t.Errorf("schema=nope: count = %d, want 0", resp.Count)
 	}
-	if resp := getSchemaChanges(t, srv, "?until=2026-06-01%2012:00:00", "static-tok"); resp.Count != 1 || resp.Changes[0].BinlogPos != 900 {
-		t.Errorf("until=12:00:00: %+v, want only the CREATE", resp.Changes)
+	if resp := getSchemaChanges(t, srv, "?until=2026-06-01%2012:00:00", "static-tok"); resp.Count != 2 || resp.Changes[0].BinlogPos != 900 {
+		t.Errorf("until=12:00:00: %+v, want the CREATE and the earlier unqualified TRUNCATE", resp.Changes)
 	}
 	if resp := getSchemaChanges(t, srv, "?since=2026-06-01%2012:00:01", "static-tok"); resp.Count != 5 {
 		t.Errorf("since=12:00:01: count = %d, want 5", resp.Count)
@@ -143,7 +147,7 @@ func TestIntegrationSchemaChangesRestrictedSession(t *testing.T) {
 		t.Fatalf("denied session: %d %s", rec.Code, rec.Body.String())
 	}
 	if strings.Contains(rec.Body.String(), "secrets") {
-		t.Errorf("policy-denied table app.secrets leaked its DDL to a restricted session: %s", rec.Body.String())
+		t.Errorf("policy-denied table app.secrets leaked its DDL to a restricted session (the qualified row, or the unqualified one with an empty schema_name): %s", rec.Body.String())
 	}
 	if strings.Contains(rec.Body.String(), "ADD COLUMN") || strings.Contains(rec.Body.String(), "PRIMARY KEY") {
 		t.Errorf("statement text leaked to a restricted session: %s", rec.Body.String())

@@ -54,7 +54,9 @@ func TestBuildSchemaChangesQuery(t *testing.T) {
 		"detected_at >= ?",
 		"detected_at <= ?",
 		"((BINARY schema_name = ? AND BINARY table_name = ?) OR (BINARY schema_name = ? AND BINARY table_name = ?))",
-		"NOT (schema_name = ? AND table_name = ?)",
+		// Deny also catches the unqualified row (schema_name = '') whose
+		// table matches: see buildSchemaChangesQuery.
+		"NOT (table_name = ? AND (schema_name = ? OR schema_name = ''))",
 	}
 	for _, c := range wantClauses {
 		if !strings.Contains(q, c) {
@@ -64,7 +66,7 @@ func TestBuildSchemaChangesQuery(t *testing.T) {
 	if !strings.HasSuffix(q, schemaChangesOrderBy) {
 		t.Errorf("query does not end with the ordering tiebreak %q:\n%s", schemaChangesOrderBy, q)
 	}
-	wantArgs := []any{"app", "users", "ALTER%", since, until, "app", "users", "app", "orders", "app", "secrets", 101}
+	wantArgs := []any{"app", "users", "ALTER%", since, until, "app", "users", "app", "orders", "secrets", "app", 101}
 	if len(args) != len(wantArgs) {
 		t.Fatalf("args = %v, want %v", args, wantArgs)
 	}
@@ -232,8 +234,8 @@ func TestSchemaChangesMissingTable(t *testing.T) {
 func TestSchemaChangesRestrictedSessionScope(t *testing.T) {
 	db, mock, closer := newSQLMock(t)
 	defer closer()
-	mock.ExpectQuery(regexp.QuoteMeta("(BINARY schema_name = ? AND BINARY table_name = ?)) AND NOT (schema_name = ? AND table_name = ?)")).
-		WithArgs("app", "users", "app", "secrets", 101).
+	mock.ExpectQuery(regexp.QuoteMeta("(BINARY schema_name = ? AND BINARY table_name = ?)) AND NOT (table_name = ? AND (schema_name = ? OR schema_name = ''))")).
+		WithArgs("app", "users", "secrets", "app", 101).
 		WillReturnRows(sqlmock.NewRows(schemaChangesCols))
 	s := newBootServer(db)
 	req := httptest.NewRequest("GET", "/api/schema-changes", nil)

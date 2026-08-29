@@ -154,11 +154,20 @@ func buildSchemaChangesQuery(f schemaChangesFilter) (string, []any) {
 		where = append(where, "detected_at <= ?")
 		args = append(args, *f.Until)
 	}
-	// The scope clauses mirror internal/query's buildQuery exactly: allow
-	// matches with BINARY (a case-insensitive allow fails open on a
+	// The scope clauses mirror internal/query's buildQuery: allow matches
+	// with BINARY (a case-insensitive allow fails open on a
 	// lower_case_table_names=0 host), deny stays on the column collation
 	// (case-insensitive there withholds MORE, the safe direction). Deny
 	// composes over allow via AND, so deny always wins.
+	//
+	// One thing binlog_events never has: schema_name can be EMPTY here. The
+	// parser derives it from the statement text alone, so `USE app; TRUNCATE
+	// TABLE secrets` is stored with schema_name = '' (the session's default
+	// database is not recorded). A deny keyed on the pair would let that row
+	// through, so the deny also withholds an unqualified row whose TABLE
+	// matches: it may be the denied table, and the safe direction is to
+	// withhold. The allow list already excludes such rows (BINARY '' never
+	// matches a named schema).
 	if len(f.Allow) > 0 {
 		ors := make([]string, len(f.Allow))
 		for i, at := range f.Allow {
@@ -168,8 +177,8 @@ func buildSchemaChangesQuery(f schemaChangesFilter) (string, []any) {
 		where = append(where, "("+strings.Join(ors, " OR ")+")")
 	}
 	for _, dt := range f.Deny {
-		where = append(where, "NOT (schema_name = ? AND table_name = ?)")
-		args = append(args, dt.Schema, dt.Table)
+		where = append(where, "NOT (table_name = ? AND (schema_name = ? OR schema_name = ''))")
+		args = append(args, dt.Table, dt.Schema)
 	}
 	q := "SELECT id, detected_at, schema_name, table_name, ddl_type, ddl_query, binlog_file, binlog_pos FROM schema_changes"
 	if len(where) > 0 {

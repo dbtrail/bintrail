@@ -51,7 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index attributed each statement to (a statement naming several tables is
   attributed to the first), and the statement text is withheld, as the Events
   view withholds `query_text`: DDL text can carry values and name other
-  tables. The response says what it left out.
+  tables. A statement that did not name its schema (`USE app; ALTER TABLE
+  users ...`) is recorded with an empty schema, so a deny on a table also
+  withholds unqualified DDL on a table of that name, and the page shows such
+  rows by table alone. The response says what it left out.
 - **The Connect page shows the time-travel SQL port** (#1446). Settings →
   Connect AI gains a "Connect a SQL client" panel for the embedded
   MySQL-protocol port (`bintrail-console watch --flashback-listen`). With the

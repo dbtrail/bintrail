@@ -5713,7 +5713,11 @@ function buildSchemaChangeRows(container, changes, filtered, withheld) {
     // on click, so a long ALTER does not push the next row off screen.
     const row = el("div", { class: "sc-row", "data-sc": i, tabindex: "0", role: "button", "aria-expanded": "false" });
     row.append(tsSpan("ev-time", c.detected_at));
-    row.append(el("span", { class: "ev-table", text: c.schema_name + "." + c.table_name }));
+    // The schema comes from the statement text; an unqualified statement
+    // (USE app; ALTER TABLE users ...) records none, so show the table alone
+    // rather than ".users".
+    row.append(el("span", { class: "ev-table", text: c.schema_name ? c.schema_name + "." + c.table_name : c.table_name,
+      title: c.schema_name ? "" : "Schema not recorded: the statement did not name it" }));
     row.append(el("span", {}, scBadge(c.ddl_type)));
     row.append(el("span", { class: "sc-pos", text: c.binlog_file + ":" + c.binlog_pos }));
     row.append(withheld
