@@ -112,6 +112,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   round trip against a real MinIO.
 
 ### Fixed
+- **The console's status page no longer names tables a restricted session
+  cannot read** (#1452). `GET /api/status` carried the capture-health detail
+  for every session that may see the health verdict, and that detail names the
+  tables whose capture stopped, in `capture_health.skipped[*].tables` and in
+  the explanation prose. Every other listing already withholds a table name
+  from a session with a data profile or with per-role access rules, so the
+  status page was the one inventory left: a session allowed only `app.users`
+  could read the name of every table with a capture skip.
+  The names now pass through the same rule the table pickers use, per name:
+  a denied table, or one outside the session's allow list, is dropped from
+  the list and from the explanation, which is rebuilt from the filtered
+  ledger rather than left carrying the names. The counts do not change (a
+  count is not a name), and the entry says how many names it is not showing:
+  `tables_withheld` on the wire, and "app.users and 2 tables outside your
+  access" in the prose. A reason whose every table is withheld still gets its
+  sentence, in the singular when it is one table. An unrestricted session, and
+  `bintrail status`, render the ledger exactly as before.
 - **A crash while refreshing a schema snapshot no longer stops capture**
   (#1497). Under `bintrail-console watch` one process is both the console and
   the capture plane, and neither of the two goroutines behind the Status page's
