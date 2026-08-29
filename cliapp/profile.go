@@ -3,12 +3,12 @@ package cliapp
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/accessprofiles"
-	"github.com/dbtrail/dbtrail/internal/config"
 )
 
 // ─── Parent command ───────────────────────────────────────────────────────────
@@ -50,20 +50,21 @@ func init() {
 }
 
 func runProfileAdd(cmd *cobra.Command, args []string) error {
-	name := args[0]
+	// The same code the console's Access profiles page runs (#1445). Trimmed
+	// here as well so the line printed below shows the stored value.
+	p := accessprofiles.Profile{Name: args[0], Description: proDescription}.Trimmed()
 
-	db, err := config.Connect(proIndexDSN)
+	db, err := connectIndex(proIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
 	defer db.Close()
 
-	// The same code the console's Access profiles page runs (#1445).
-	if err := accessprofiles.AddProfile(cmd.Context(), db, accessprofiles.Profile{Name: name, Description: proDescription}); err != nil {
+	if err := accessprofiles.AddProfile(cmd.Context(), db, p); err != nil {
 		return err
 	}
 
-	fmt.Printf("Profile %q added.\n", name)
+	fmt.Fprintf(cmd.OutOrStdout(), "Profile %q added.\n", p.Name)
 	return nil
 }
 
@@ -77,25 +78,27 @@ var profileRemoveCmd = &cobra.Command{
 }
 
 func runProfileRemove(cmd *cobra.Command, args []string) error {
-	name := args[0]
+	name := strings.TrimSpace(args[0])
 
-	db, err := config.Connect(proIndexDSN)
+	db, err := connectIndex(proIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
 	defer db.Close()
 
+	out := cmd.OutOrStdout()
 	err = accessprofiles.RemoveProfile(cmd.Context(), db, name)
 	var notFound *accessprofiles.ProfileNotFoundError
 	if errors.As(err, &notFound) {
-		fmt.Printf("Profile %q not found.\n", name)
+		// Exit 0, as for a flag: the state asked for is the state there is.
+		fmt.Fprintf(out, "Profile %q not found.\n", name)
 		return nil
 	}
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Profile %q removed.\n", name)
+	fmt.Fprintf(out, "Profile %q removed.\n", name)
 	return nil
 }
 
@@ -109,7 +112,7 @@ var profileListCmd = &cobra.Command{
 }
 
 func runProfileList(cmd *cobra.Command, args []string) error {
-	db, err := config.Connect(proIndexDSN)
+	db, err := connectIndex(proIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}

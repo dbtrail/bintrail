@@ -3,12 +3,12 @@ package cliapp
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
 	"github.com/dbtrail/dbtrail/internal/accessprofiles"
-	"github.com/dbtrail/dbtrail/internal/config"
 )
 
 // ─── Parent command ───────────────────────────────────────────────────────────
@@ -61,12 +61,14 @@ func init() {
 func runAccessAdd(cmd *cobra.Command, args []string) error {
 	// Validated by the shared code before any connection is opened, so a bad
 	// --permission is refused without a database (and without one in tests).
-	rule := accessprofiles.Rule{Profile: aclProfile, Flag: aclFlag, Permission: aclPermission}
+	// Trimmed first, as the writer would, so the line printed below shows
+	// the stored value.
+	rule := accessprofiles.Rule{Profile: aclProfile, Flag: aclFlag, Permission: aclPermission}.Trimmed()
 	if err := accessprofiles.ValidateRule(rule); err != nil {
 		return cliRuleError(err)
 	}
 
-	db, err := config.Connect(aclIndexDSN)
+	db, err := connectIndex(aclIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
@@ -77,7 +79,7 @@ func runAccessAdd(cmd *cobra.Command, args []string) error {
 		return cliRuleError(err)
 	}
 
-	fmt.Printf("Access rule added: profile=%q flag=%q permission=%s\n", aclProfile, aclFlag, aclPermission)
+	fmt.Fprintf(cmd.OutOrStdout(), "Access rule added: profile=%q flag=%q permission=%s\n", rule.Profile, rule.Flag, rule.Permission)
 	return nil
 }
 
@@ -109,23 +111,27 @@ func init() {
 }
 
 func runAccessRemove(cmd *cobra.Command, args []string) error {
-	db, err := config.Connect(aclIndexDSN)
+	profile, flag := strings.TrimSpace(aclProfile), strings.TrimSpace(aclFlag)
+
+	db, err := connectIndex(aclIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
 	defer db.Close()
 
-	err = accessprofiles.RemoveRule(cmd.Context(), db, aclProfile, aclFlag)
+	out := cmd.OutOrStdout()
+	err = accessprofiles.RemoveRule(cmd.Context(), db, profile, flag)
 	var notFound *accessprofiles.RuleNotFoundError
 	if errors.As(err, &notFound) {
-		fmt.Printf("Access rule not found: profile=%q flag=%q\n", aclProfile, aclFlag)
+		// Exit 0, as for a flag: the state asked for is the state there is.
+		fmt.Fprintf(out, "Access rule not found: profile=%q flag=%q\n", profile, flag)
 		return nil
 	}
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Access rule removed: profile=%q flag=%q\n", aclProfile, aclFlag)
+	fmt.Fprintf(out, "Access rule removed: profile=%q flag=%q\n", profile, flag)
 	return nil
 }
 
@@ -143,7 +149,7 @@ func init() {
 }
 
 func runAccessList(cmd *cobra.Command, args []string) error {
-	db, err := config.Connect(aclIndexDSN)
+	db, err := connectIndex(aclIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}

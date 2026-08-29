@@ -54,6 +54,10 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 		wantActor  string
 		wantSchema string
 		wantTable  string
+		// wantDetail is the part of Detail that names WHAT changed (the
+		// flag, profile or rule); a verb audited without it says only that
+		// something was edited.
+		wantDetail map[string]string
 		call       func(t *testing.T)
 	}{
 		{
@@ -168,6 +172,7 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			wantActor:  tokenActor,
 			wantSchema: "app",
 			wantTable:  "users",
+			wantDetail: map[string]string{"flag": "pii", "column": "email", "server": bootServerID},
 			call: func(t *testing.T) {
 				db, mock, closeDB := newSQLMock(t)
 				defer closeDB()
@@ -186,6 +191,7 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			wantActor:  tokenActor,
 			wantSchema: "app",
 			wantTable:  "users",
+			wantDetail: map[string]string{"flag": "pii", "column": "email", "server": bootServerID},
 			call: func(t *testing.T) {
 				db, mock, closeDB := newSQLMock(t)
 				defer closeDB()
@@ -199,12 +205,14 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			},
 		},
 		{
-			name:      "profile add",
-			action:    "profile.add",
-			wantActor: tokenActor,
+			name:       "profile add",
+			action:     "profile.add",
+			wantActor:  tokenActor,
+			wantDetail: map[string]string{"profile": "marketing", "server": bootServerID},
 			call: func(t *testing.T) {
 				db, mock, closeDB := newSQLMock(t)
 				defer closeDB()
+				expectProfileLookup(mock, "")
 				mock.ExpectExec("INSERT INTO profiles").WillReturnResult(sqlmock.NewResult(1, 1))
 				expectAccessDoc(mock)
 				w := driveAccess(t, newBootServer(db), (*Server).handleAccessProfileAdd, `{"name":"marketing"}`)
@@ -214,9 +222,10 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			},
 		},
 		{
-			name:      "profile remove",
-			action:    "profile.remove",
-			wantActor: tokenActor,
+			name:       "profile remove",
+			action:     "profile.remove",
+			wantActor:  tokenActor,
+			wantDetail: map[string]string{"profile": "marketing", "server": bootServerID},
 			call: func(t *testing.T) {
 				db, mock, closeDB := newSQLMock(t)
 				defer closeDB()
@@ -229,9 +238,10 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			},
 		},
 		{
-			name:      "access rule add",
-			action:    "access.add",
-			wantActor: tokenActor,
+			name:       "access rule add",
+			action:     "access.add",
+			wantActor:  tokenActor,
+			wantDetail: map[string]string{"profile": "marketing", "flag": "pii", "permission": "deny", "server": bootServerID},
 			call: func(t *testing.T) {
 				db, mock, closeDB := newSQLMock(t)
 				defer closeDB()
@@ -246,9 +256,10 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			},
 		},
 		{
-			name:      "access rule remove",
-			action:    "access.remove",
-			wantActor: tokenActor,
+			name:       "access rule remove",
+			action:     "access.remove",
+			wantActor:  tokenActor,
+			wantDetail: map[string]string{"profile": "marketing", "flag": "pii", "server": bootServerID},
 			call: func(t *testing.T) {
 				db, mock, closeDB := newSQLMock(t)
 				defer closeDB()
@@ -332,6 +343,11 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			}
 			if tc.wantSchema != "" && (ev.Schema != tc.wantSchema || ev.Table != tc.wantTable) {
 				t.Errorf("schema/table = %q/%q, want %q/%q", ev.Schema, ev.Table, tc.wantSchema, tc.wantTable)
+			}
+			for k, want := range tc.wantDetail {
+				if got, ok := ev.Detail[k]; !ok || got != want {
+					t.Errorf("Detail[%q] = %q (present=%v), want %q: the event must name what changed", k, got, ok, want)
+				}
 			}
 			observed = append(observed, audittest.Pair{Surface: ev.Surface, Action: ev.Action})
 		})

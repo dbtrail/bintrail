@@ -5847,15 +5847,21 @@ function buildAccessProfiles(doc) {
 
 // accessMutate posts one verb and repaints from the document it returns.
 // The server's own error text is shown as-is: it is the shared package's
-// message, the words the command line would refuse with.
+// message, the words the command line would refuse with. The generations
+// are captured at dispatch: a server switch or a navigation while the POST
+// is in flight means the document that comes back describes an index the
+// view no longer shows, so it must not be painted over whatever is there.
 async function accessMutate(path, body, okMsg) {
+  const gen = serverGen, vgen = viewGen;
   let doc;
   try {
     doc = await api(path, { method: "POST", body });
   } catch (err) {
+    if (gen !== serverGen || vgen !== viewGen) return false;
     toastError((err && err.message) || String(err));
     return false;
   }
+  if (gen !== serverGen || vgen !== viewGen) return false;
   if (okMsg) toast(okMsg);
   buildAccessProfiles(doc);
   return true;

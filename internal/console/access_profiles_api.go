@@ -26,11 +26,14 @@ import (
 //     included: it is a real index;
 //   - every mutation is audited (console/flag.add, ... access.remove).
 //
-// One more, which the permission alone does not give: a session that
-// carries a data profile is refused, whatever its permissions. Such a
-// session editing the rules could lift its own redaction, and the profile
-// gate on the row-data surfaces (reconstruct, verify, cascade) has the same
-// shape: refused rather than trusted to redact itself.
+// One more, which the permission alone does not give: while an
+// access-control profile is active, the whole surface (the GET included) is
+// refused, on the same floor recover-cascade and verify use
+// (rbacActiveFor): a console started under --profile does not rewrite the
+// rows that profile is built from, and a session that carries a data
+// profile could lift its own redaction. The GET is refused too because the
+// flagged tables and columns are exactly what such a profile withholds
+// (GET /api/profiles hands out names only, at the same tier).
 
 // accessProfilesDoc is the whole configuration in one document: what GET
 // returns and what every mutation returns once it has applied, so the page
@@ -82,9 +85,33 @@ type accessRuleRequest struct {
 	Permission string `json:"permission"`
 }
 
-// accessProfilesRefusal is the message a data-profile session gets on a
-// mutation (see the file comment).
-const accessProfilesRefusal = "your session has a data profile, so it cannot change access profiles; sign in with an account that has none"
+// accessProfilesRefusal is the message a data-profile session gets on every
+// route of this surface; accessProfilesStartupRefusal the one a console
+// started under a profile gives (see the file comment).
+const (
+	accessProfilesRefusal        = "your session has a data profile, so it cannot view or change access profiles; sign in with an account that has none"
+	accessProfilesStartupRefusal = "access profiles are not available while an access-control profile is active (CLI: --profile); the console does not edit the rows that profile is built from"
+	// accessReadbackFailedPrefix opens the error a mutation answers with
+	// when the write landed and only the readback failed, so the operator
+	// does not repeat a change that is already in.
+	accessReadbackFailedPrefix = "The change was saved but the page could not be re-read: "
+)
+
+// accessProfilesGate refuses the request while a profile is active (see the
+// file comment) and reports whether the handler may go on. A session
+// refusal is audited as profile.denied, like the other profile gates.
+func (s *Server) accessProfilesGate(w http.ResponseWriter, r *http.Request) bool {
+	if !s.rbacActiveFor(r) {
+		return true
+	}
+	if sessionRestricted(r) {
+		recordProfileGateDeny(r, "access_profiles")
+		writeJSONError(w, http.StatusForbidden, accessProfilesRefusal)
+		return false
+	}
+	writeJSONError(w, http.StatusForbidden, accessProfilesStartupRefusal)
+	return false
+}
 
 // loadAccessProfilesDoc reads the three tables of the selected index.
 func loadAccessProfilesDoc(ctx context.Context, db accessprofiles.DBExecer) (accessProfilesDoc, error) {
@@ -117,14 +144,17 @@ func loadAccessProfilesDoc(ctx context.Context, db accessprofiles.DBExecer) (acc
 }
 
 // writeAccessProfilesError maps a shared-package refusal onto a status: bad
-// input is 400, a row that is not there is 404, an index without the three
-// tables is 422 (it predates them; nothing here can create them), anything
-// else is the database's own error at 500.
+// input is 400, a row that is not there is 404, a profile that exists under
+// another spelling is 409, an index without the three tables is 422 (it
+// predates them; nothing here can create them), anything else is the
+// database's own error at 500.
 func writeAccessProfilesError(w http.ResponseWriter, err error) {
 	var myErr *mysql.MySQLError
 	switch {
 	case accessprofiles.IsNotFound(err):
 		writeJSONError(w, http.StatusNotFound, err.Error())
+	case accessprofiles.IsConflict(err):
+		writeJSONError(w, http.StatusConflict, err.Error())
 	case accessprofiles.IsRefusal(err):
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 	case errors.As(err, &myErr) && myErr.Number == 1146:
@@ -139,6 +169,9 @@ func writeAccessProfilesError(w http.ResponseWriter, err error) {
 // server. Configuration, not row data: flag names, table and column names,
 // profile names and their rules.
 func (s *Server) handleAccessProfilesGet(w http.ResponseWriter, r *http.Request) {
+	if !s.accessProfilesGate(w, r) {
+		return
+	}
 	b := s.resolveOr(w, r)
 	if b == nil {
 		return
@@ -156,15 +189,13 @@ func (s *Server) handleAccessProfilesGet(w http.ResponseWriter, r *http.Request)
 // names one, plus the fields that identify it).
 type accessMutation func(ctx context.Context, db accessprofiles.DBExecer) (schema, table string, detail map[string]string, err error)
 
-// mutateAccessProfiles is the shared shape of the six verbs: refuse a
-// data-profile session, resolve the server, run the shared code, drop the
+// mutateAccessProfiles is the shared shape of the six verbs: refuse while a
+// profile is active, resolve the server, run the shared code, drop the
 // cached profile rules for that server (a profiled session's next request
 // must see the change, not the 30-second cache), audit, and answer with the
 // fresh document.
 func (s *Server) mutateAccessProfiles(w http.ResponseWriter, r *http.Request, action string, run accessMutation) {
-	if sessionRestricted(r) {
-		recordProfileGateDeny(r, "access_profiles")
-		writeJSONError(w, http.StatusForbidden, accessProfilesRefusal)
+	if !s.accessProfilesGate(w, r) {
 		return
 	}
 	b := s.resolveOr(w, r)
@@ -176,13 +207,21 @@ func (s *Server) mutateAccessProfiles(w http.ResponseWriter, r *http.Request, ac
 		writeAccessProfilesError(w, err)
 		return
 	}
-	s.sessionProfiles.invalidate(s.selectedID(r))
+	target := s.selectedID(r)
+	s.sessionProfiles.invalidate(target)
+	if detail == nil {
+		detail = map[string]string{}
+	}
+	// Always name the index the change landed on: recordConsoleAccess
+	// records the header only when one was sent, and a change made under
+	// the default selection is a change to a real index all the same.
+	detail["server"] = target
 	recordConsoleAccess(r, action, schema, table, detail)
 	doc, err := loadAccessProfilesDoc(r.Context(), b.db)
 	if err != nil {
-		// The change is in; only the readback failed. Say so rather than
-		// reporting a failure the operator would then repeat.
-		writeAccessProfilesError(w, err)
+		// The change is in and audited; only the readback failed. The body
+		// says so, so the operator reloads rather than repeats the change.
+		writeJSONError(w, http.StatusInternalServerError, accessReadbackFailedPrefix+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, doc)

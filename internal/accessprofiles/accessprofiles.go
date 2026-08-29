@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Flag is one row of table_flags: a named label on a table (Column == "")
@@ -52,6 +53,29 @@ const (
 	PermissionAllow = "allow"
 	PermissionDeny  = "deny"
 )
+
+// Trimmed returns f with the surrounding whitespace taken off every name.
+// Every writer applies it first, so "marketing " and "marketing" are one
+// row on both surfaces; the CLI calls it too so its printed lines show the
+// value that was stored.
+func (f Flag) Trimmed() Flag {
+	f.Schema, f.Table, f.Column, f.Name =
+		strings.TrimSpace(f.Schema), strings.TrimSpace(f.Table), strings.TrimSpace(f.Column), strings.TrimSpace(f.Name)
+	return f
+}
+
+// Trimmed returns p with the surrounding whitespace taken off its name and
+// description.
+func (p Profile) Trimmed() Profile {
+	p.Name, p.Description = strings.TrimSpace(p.Name), strings.TrimSpace(p.Description)
+	return p
+}
+
+// Trimmed returns r with the surrounding whitespace taken off every field.
+func (r Rule) Trimmed() Rule {
+	r.Profile, r.Flag, r.Permission = strings.TrimSpace(r.Profile), strings.TrimSpace(r.Flag), strings.TrimSpace(r.Permission)
+	return r
+}
 
 // MissingFieldError is a required value that was empty. Field is named as
 // the operator sees it ("schema", "flag name").
@@ -91,17 +115,70 @@ func (e *RuleNotFoundError) Error() string {
 	return fmt.Sprintf("access rule not found: profile=%q flag=%q", e.Profile, e.Flag)
 }
 
+// ProfileExistsError is an AddProfile whose name differs only by letter case
+// (or whatever else the index's collation ignores) from a profile that
+// exists. The unique key on profiles.name is case-insensitive, so the
+// INSERT would silently update the existing row instead of creating a
+// second profile; both surfaces refuse instead, naming the row that is
+// there.
+type ProfileExistsError struct{ Existing, Requested string }
+
+func (e *ProfileExistsError) Error() string {
+	return fmt.Sprintf("a profile named %q already exists (names are case-insensitive)", e.Existing)
+}
+
+// The column widths of the three tables (internal/indexer/schema.go):
+// schema, table and column names are VARCHAR(64) like MySQL's own
+// identifiers, flag and profile names VARCHAR(255), the description a TEXT.
+// A value past its width would reach the database and come back as a raw
+// 1406 "data too long" error; the writers refuse first, naming the limit.
+const (
+	MaxIdentifierLen  = 64    // schema, table and column names, in characters
+	MaxFlagLen        = 255   // flag names, in characters
+	MaxProfileNameLen = 255   // profile names, in characters
+	MaxDescriptionLen = 65535 // profile descriptions, in bytes (TEXT)
+)
+
+// TooLongError is a value past its column's width. Unit is "characters" for
+// the VARCHAR columns and "bytes" for the TEXT description.
+type TooLongError struct {
+	Field string
+	Got   int
+	Max   int
+	Unit  string
+}
+
+func (e *TooLongError) Error() string {
+	return fmt.Sprintf("%s is too long (%d %s); the limit is %d %s", e.Field, e.Got, e.Unit, e.Max, e.Unit)
+}
+
+func checkLen(field, value string, max int) error {
+	if n := utf8.RuneCountInString(value); n > max {
+		return &TooLongError{Field: field, Got: n, Max: max, Unit: "characters"}
+	}
+	return nil
+}
+
 // IsRefusal reports whether err is one of this package's typed refusals
 // (bad input or a missing row) rather than a database failure. Callers use
 // it to pick a 4xx over a 500 without listing every type.
 func IsRefusal(err error) bool {
 	var mf *MissingFieldError
 	var ip *InvalidPermissionError
+	var tl *TooLongError
+	var pe *ProfileExistsError
 	var pnf *ProfileNotFoundError
 	var fnf *FlagNotFoundError
 	var rnf *RuleNotFoundError
-	return errors.As(err, &mf) || errors.As(err, &ip) || errors.As(err, &pnf) ||
-		errors.As(err, &fnf) || errors.As(err, &rnf)
+	return errors.As(err, &mf) || errors.As(err, &ip) || errors.As(err, &tl) || errors.As(err, &pe) ||
+		errors.As(err, &pnf) || errors.As(err, &fnf) || errors.As(err, &rnf)
+}
+
+// IsConflict reports whether err says the row to add is already there under
+// another spelling (*ProfileExistsError).
+func IsConflict(err error) bool {
+	var pe *ProfileExistsError
+	return errors.As(err, &pe)
 }
 
 // IsNotFound reports whether err says the row to remove was not there.
@@ -128,12 +205,33 @@ func requireFlagKey(f Flag) error {
 	case f.Table == "":
 		return &MissingFieldError{Field: "table"}
 	}
+	for _, c := range []struct {
+		field, value string
+		max          int
+	}{
+		{"flag name", f.Name, MaxFlagLen},
+		{"schema", f.Schema, MaxIdentifierLen},
+		{"table", f.Table, MaxIdentifierLen},
+		{"column", f.Column, MaxIdentifierLen},
+	} {
+		if err := checkLen(c.field, c.value, c.max); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func requireProfileName(name string) error {
+	if name == "" {
+		return &MissingFieldError{Field: "profile name"}
+	}
+	return checkLen("profile name", name, MaxProfileNameLen)
 }
 
 // AddFlag labels f.Schema.f.Table (or its f.Column) with f.Name. Adding a
 // flag that already exists is a no-op, not an error.
 func AddFlag(ctx context.Context, db DBExecer, f Flag) error {
+	f = f.Trimmed()
 	if err := requireFlagKey(f); err != nil {
 		return err
 	}
@@ -151,6 +249,7 @@ func AddFlag(ctx context.Context, db DBExecer, f Flag) error {
 // RemoveFlag deletes the one row matching f's key; *FlagNotFoundError when
 // there was none.
 func RemoveFlag(ctx context.Context, db DBExecer, f Flag) error {
+	f = f.Trimmed()
 	if err := requireFlagKey(f); err != nil {
 		return err
 	}
@@ -170,6 +269,7 @@ func RemoveFlag(ctx context.Context, db DBExecer, f Flag) error {
 // ListFlags returns every flag, optionally narrowed to a schema and a table,
 // ordered by schema, table, column, flag.
 func ListFlags(ctx context.Context, db DBExecer, schema, table string) ([]Flag, error) {
+	schema, table = strings.TrimSpace(schema), strings.TrimSpace(table)
 	q := `SELECT schema_name, table_name, column_name, flag, created_at FROM table_flags`
 	var where []string
 	var args []any
@@ -205,12 +305,33 @@ func ListFlags(ctx context.Context, db DBExecer, schema, table string) ([]Flag, 
 }
 
 // AddProfile creates p, or updates the description of an existing profile
-// of that name.
+// of exactly that name. A name the index's unique key would treat as the
+// same profile but spelled differently (letter case, for one) is refused
+// with *ProfileExistsError rather than silently re-describing the existing
+// row: the caller asked for a new profile and would otherwise be told one
+// was added. The lookup and the insert are two statements, so two callers
+// racing on the same name can still both land on the one row; the unique
+// key keeps that a re-description, never a duplicate.
 func AddProfile(ctx context.Context, db DBExecer, p Profile) error {
-	if p.Name == "" {
-		return &MissingFieldError{Field: "profile name"}
+	p = p.Trimmed()
+	if err := requireProfileName(p.Name); err != nil {
+		return err
 	}
-	_, err := db.ExecContext(ctx, `
+	if n := len(p.Description); n > MaxDescriptionLen {
+		return &TooLongError{Field: "description", Got: n, Max: MaxDescriptionLen, Unit: "bytes"}
+	}
+	// The comparison runs under the column's own collation, which is what
+	// the unique key uses, so this finds exactly the row the INSERT would
+	// collide with.
+	var existing string
+	err := db.QueryRowContext(ctx, `SELECT name FROM profiles WHERE name = ?`, p.Name).Scan(&existing)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to look up profile: %w", err)
+	}
+	if err == nil && existing != p.Name {
+		return &ProfileExistsError{Existing: existing, Requested: p.Name}
+	}
+	_, err = db.ExecContext(ctx, `
 		INSERT INTO profiles (name, description)
 		VALUES (?, ?)
 		ON DUPLICATE KEY UPDATE description = VALUES(description)`,
@@ -224,8 +345,9 @@ func AddProfile(ctx context.Context, db DBExecer, p Profile) error {
 // RemoveProfile deletes the profile; its access rules go with it (the
 // foreign key cascades). *ProfileNotFoundError when there was none.
 func RemoveProfile(ctx context.Context, db DBExecer, name string) error {
-	if name == "" {
-		return &MissingFieldError{Field: "profile name"}
+	name = strings.TrimSpace(name)
+	if err := requireProfileName(name); err != nil {
+		return err
 	}
 	res, err := db.ExecContext(ctx, `DELETE FROM profiles WHERE name = ?`, name)
 	if err != nil {
@@ -262,11 +384,15 @@ func ListProfiles(ctx context.Context, db DBExecer) ([]Profile, error) {
 }
 
 // ValidateRule is the input check AddRule runs, exposed so a caller can
-// refuse bad input before opening a connection.
+// refuse bad input before opening a connection. It checks r as given; the
+// writers trim first (AddRule calls it on r.Trimmed()), so a caller that
+// wants the trimmed verdict passes r.Trimmed() itself.
 func ValidateRule(r Rule) error {
-	// Permission first: it is the one value the command line does not
-	// enforce as a required flag, so it is the refusal the CLI has always
-	// given first.
+	// Permission first. On the command line cobra enforces that --profile,
+	// --flag and --permission are PRESENT, not what --permission says, so a
+	// bad permission is the one refusal the CLI reaches here and the one it
+	// has always given first; keeping it ahead of the field checks keeps
+	// that byte-identical.
 	if r.Permission != PermissionAllow && r.Permission != PermissionDeny {
 		return &InvalidPermissionError{Got: r.Permission}
 	}
@@ -276,7 +402,10 @@ func ValidateRule(r Rule) error {
 	if r.Flag == "" {
 		return &MissingFieldError{Field: "flag"}
 	}
-	return nil
+	if err := checkLen("profile", r.Profile, MaxProfileNameLen); err != nil {
+		return err
+	}
+	return checkLen("flag", r.Flag, MaxFlagLen)
 }
 
 // AddRule maps r.Profile to r.Flag with r.Permission, replacing the
@@ -284,6 +413,7 @@ func ValidateRule(r Rule) error {
 // (*ProfileNotFoundError); the flag name is free text, so a rule may name a
 // flag no table carries yet.
 func AddRule(ctx context.Context, db DBExecer, r Rule) error {
+	r = r.Trimmed()
 	if err := ValidateRule(r); err != nil {
 		return err
 	}
@@ -309,11 +439,18 @@ func AddRule(ctx context.Context, db DBExecer, r Rule) error {
 // RemoveRule deletes the rule for (profile, flag); *RuleNotFoundError when
 // there was none.
 func RemoveRule(ctx context.Context, db DBExecer, profile, flag string) error {
+	profile, flag = strings.TrimSpace(profile), strings.TrimSpace(flag)
 	if profile == "" {
 		return &MissingFieldError{Field: "profile"}
 	}
 	if flag == "" {
 		return &MissingFieldError{Field: "flag"}
+	}
+	if err := checkLen("profile", profile, MaxProfileNameLen); err != nil {
+		return err
+	}
+	if err := checkLen("flag", flag, MaxFlagLen); err != nil {
+		return err
 	}
 	res, err := db.ExecContext(ctx, `
 		DELETE ar FROM access_rules ar
@@ -332,6 +469,7 @@ func RemoveRule(ctx context.Context, db DBExecer, profile, flag string) error {
 // ListRules returns every rule, optionally narrowed to one profile, ordered
 // by profile then flag.
 func ListRules(ctx context.Context, db DBExecer, profile string) ([]Rule, error) {
+	profile = strings.TrimSpace(profile)
 	q := `SELECT p.name, ar.flag, ar.permission, ar.created_at
 	      FROM access_rules ar
 	      JOIN profiles p ON ar.profile_id = p.id`

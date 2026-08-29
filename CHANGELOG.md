@@ -17,12 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `access` verbs now call too, so a profile authored in either place is the
   same rows and is refused with the same words. The page and its routes
   (`GET /api/access-profiles` plus six `POST` verbs under it) need
-  `settings:read` to view and `settings:write` to change; a session that
-  carries a data profile is refused every change, whatever its permissions;
-  each change is audited as `console/flag.add`, `flag.remove`,
-  `profile.add`, `profile.remove`, `access.add` or `access.remove`; and a
+  `settings:read` to view and `settings:write` to change; while an
+  access-control profile is active (a startup `--profile` or the session's
+  own data profile) the whole page is refused, reading included, whatever
+  the permissions; each change is audited as `console/flag.add`,
+  `flag.remove`, `profile.add`, `profile.remove`, `access.add` or
+  `access.remove`, naming what changed and the server it landed on; and a
   change reaches a profiled session on its next request (the console drops
-  that server's cached rules when it writes).
+  that server's cached rules when it writes). On both surfaces names are
+  trimmed, a value longer than its column is refused with the limit in the
+  message rather than as a raw database error, and a profile name that
+  differs from an existing one only by letter case is refused instead of
+  silently re-describing the existing row.
 - **`bintrail export iceberg`** (#1466). Writes each table's current state as
   an Apache Iceberg table under `--warehouse`, incrementally: the first run
   loads the newest baseline snapshot, every run after that folds the events

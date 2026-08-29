@@ -2,6 +2,7 @@ package console
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -17,6 +18,28 @@ import (
 	"github.com/dbtrail/dbtrail/internal/audittest"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
+
+// expectProfileLookup queues the SELECT AddProfile runs before its INSERT
+// (the case-insensitive collision check); existing == "" is "no such row".
+func expectProfileLookup(mock sqlmock.Sqlmock, existing string) {
+	rows := sqlmock.NewRows([]string{"name"})
+	if existing != "" {
+		rows.AddRow(existing)
+	}
+	mock.ExpectQuery("SELECT name FROM profiles").WillReturnRows(rows)
+}
+
+// accessRoutes is every route of the surface: the GET and the six verbs,
+// with a body that passes validation so a refusal seen is the gate's.
+var accessRoutes = []struct{ method, path, body string }{
+	{"GET", "/api/access-profiles", ""},
+	{"POST", "/api/access-profiles/flags", `{"flag":"pii","schema":"app","table":"users"}`},
+	{"POST", "/api/access-profiles/flags/remove", `{"flag":"pii","schema":"app","table":"users"}`},
+	{"POST", "/api/access-profiles/profiles", `{"name":"marketing"}`},
+	{"POST", "/api/access-profiles/profiles/remove", `{"name":"marketing"}`},
+	{"POST", "/api/access-profiles/rules", `{"profile":"marketing","flag":"pii","permission":"deny"}`},
+	{"POST", "/api/access-profiles/rules/remove", `{"profile":"marketing","flag":"pii"}`},
+}
 
 // expectAccessDoc queues the three SELECTs loadAccessProfilesDoc runs (the
 // readback every mutation answers with), all empty.
@@ -109,28 +132,67 @@ func TestAccessProfilesGetEmptyIsLists(t *testing.T) {
 // TestAccessProfilesRefusalsAreTheSharedMessages pins that the console's
 // 4xx bodies are the shared package's own words (the words the CLI refuses
 // with), and that a refusal reaches no Exec: sqlmock has nothing queued, so
-// a write here fails the test as an unexpected call.
+// a write here fails the test as an unexpected call. The table is every
+// verb crossed with each of its required fields, plus the column widths.
 func TestAccessProfilesRefusalsAreTheSharedMessages(t *testing.T) {
+	long := func(n int) string { return strings.Repeat("x", n) }
 	cases := []struct {
 		name    string
 		handler func(*Server, http.ResponseWriter, *http.Request)
 		body    string
 		want    error
 	}{
-		{"flag without schema", (*Server).handleAccessFlagAdd, `{"flag":"pii","table":"t"}`,
-			&accessprofiles.MissingFieldError{Field: "schema"}},
-		{"flag without name", (*Server).handleAccessFlagAdd, `{"schema":"s","table":"t"}`,
+		// flag add
+		{"flag add without name", (*Server).handleAccessFlagAdd, `{"schema":"s","table":"t"}`,
 			&accessprofiles.MissingFieldError{Field: "flag name"}},
+		{"flag add without schema", (*Server).handleAccessFlagAdd, `{"flag":"pii","table":"t"}`,
+			&accessprofiles.MissingFieldError{Field: "schema"}},
+		{"flag add without table", (*Server).handleAccessFlagAdd, `{"flag":"pii","schema":"s"}`,
+			&accessprofiles.MissingFieldError{Field: "table"}},
+		{"flag add with a blank table", (*Server).handleAccessFlagAdd, `{"flag":"pii","schema":"s","table":"   "}`,
+			&accessprofiles.MissingFieldError{Field: "table"}},
+		// flag remove
+		{"flag remove without name", (*Server).handleAccessFlagRemove, `{"schema":"s","table":"t"}`,
+			&accessprofiles.MissingFieldError{Field: "flag name"}},
+		{"flag remove without schema", (*Server).handleAccessFlagRemove, `{"flag":"pii","table":"t"}`,
+			&accessprofiles.MissingFieldError{Field: "schema"}},
 		{"flag remove without table", (*Server).handleAccessFlagRemove, `{"flag":"pii","schema":"s"}`,
 			&accessprofiles.MissingFieldError{Field: "table"}},
-		{"profile without name", (*Server).handleAccessProfileAdd, `{"description":"x"}`,
+		// profile add / remove
+		{"profile add without name", (*Server).handleAccessProfileAdd, `{"description":"x"}`,
 			&accessprofiles.MissingFieldError{Field: "profile name"}},
-		{"rule with a bad permission", (*Server).handleAccessRuleAdd, `{"profile":"p","flag":"f","permission":"readwrite"}`,
+		{"profile remove without name", (*Server).handleAccessProfileRemove, `{}`,
+			&accessprofiles.MissingFieldError{Field: "profile name"}},
+		// rule add (the permission is checked first, so the field cases
+		// carry a valid one)
+		{"rule add with a bad permission", (*Server).handleAccessRuleAdd, `{"profile":"p","flag":"f","permission":"readwrite"}`,
 			&accessprofiles.InvalidPermissionError{Got: "readwrite"}},
-		{"rule without flag", (*Server).handleAccessRuleAdd, `{"profile":"p","permission":"deny"}`,
+		{"rule add without permission", (*Server).handleAccessRuleAdd, `{"profile":"p","flag":"f"}`,
+			&accessprofiles.InvalidPermissionError{Got: ""}},
+		{"rule add without profile", (*Server).handleAccessRuleAdd, `{"flag":"f","permission":"deny"}`,
+			&accessprofiles.MissingFieldError{Field: "profile"}},
+		{"rule add without flag", (*Server).handleAccessRuleAdd, `{"profile":"p","permission":"deny"}`,
 			&accessprofiles.MissingFieldError{Field: "flag"}},
+		// rule remove
 		{"rule remove without profile", (*Server).handleAccessRuleRemove, `{"flag":"f"}`,
 			&accessprofiles.MissingFieldError{Field: "profile"}},
+		{"rule remove without flag", (*Server).handleAccessRuleRemove, `{"profile":"p"}`,
+			&accessprofiles.MissingFieldError{Field: "flag"}},
+		// column widths: refused here, never as a raw 1406 from the database
+		{"flag add with a long schema", (*Server).handleAccessFlagAdd, `{"flag":"pii","schema":"` + long(65) + `","table":"t"}`,
+			&accessprofiles.TooLongError{Field: "schema", Got: 65, Max: 64, Unit: "characters"}},
+		{"flag add with a long flag name", (*Server).handleAccessFlagAdd, `{"flag":"` + long(256) + `","schema":"s","table":"t"}`,
+			&accessprofiles.TooLongError{Field: "flag name", Got: 256, Max: 255, Unit: "characters"}},
+		{"flag remove with a long column", (*Server).handleAccessFlagRemove, `{"flag":"pii","schema":"s","table":"t","column":"` + long(65) + `"}`,
+			&accessprofiles.TooLongError{Field: "column", Got: 65, Max: 64, Unit: "characters"}},
+		{"profile add with a long name", (*Server).handleAccessProfileAdd, `{"name":"` + long(256) + `"}`,
+			&accessprofiles.TooLongError{Field: "profile name", Got: 256, Max: 255, Unit: "characters"}},
+		{"profile add with a long description", (*Server).handleAccessProfileAdd, `{"name":"p","description":"` + long(65536) + `"}`,
+			&accessprofiles.TooLongError{Field: "description", Got: 65536, Max: 65535, Unit: "bytes"}},
+		{"rule add with a long flag", (*Server).handleAccessRuleAdd, `{"profile":"p","flag":"` + long(256) + `","permission":"deny"}`,
+			&accessprofiles.TooLongError{Field: "flag", Got: 256, Max: 255, Unit: "characters"}},
+		{"rule remove with a long profile", (*Server).handleAccessRuleRemove, `{"profile":"` + long(256) + `","flag":"f"}`,
+			&accessprofiles.TooLongError{Field: "profile", Got: 256, Max: 255, Unit: "characters"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,6 +209,79 @@ func TestAccessProfilesRefusalsAreTheSharedMessages(t *testing.T) {
 				t.Error(err)
 			}
 		})
+	}
+}
+
+// TestAccessProfilesTrimsNames: the page trims its inputs, and so does the
+// API, so "marketing " typed into another client is the same profile, and
+// a flag on "customers " is a flag on customers. Pinned on the arguments
+// that reach the database.
+func TestAccessProfilesTrimsNames(t *testing.T) {
+	t.Run("flag add", func(t *testing.T) {
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		mock.ExpectExec("INSERT INTO table_flags").WithArgs("app", "customers", "email", "pii").
+			WillReturnResult(sqlmock.NewResult(1, 1))
+		expectAccessDoc(mock)
+		w := driveAccess(t, newBootServer(db), (*Server).handleAccessFlagAdd,
+			`{"flag":" pii ","schema":"app ","table":" customers","column":"email\t"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Run("profile add", func(t *testing.T) {
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		mock.ExpectQuery("SELECT name FROM profiles").WithArgs("marketing").
+			WillReturnRows(sqlmock.NewRows([]string{"name"}))
+		mock.ExpectExec("INSERT INTO profiles").WithArgs("marketing", "Marketing analysts").
+			WillReturnResult(sqlmock.NewResult(1, 1))
+		expectAccessDoc(mock)
+		w := driveAccess(t, newBootServer(db), (*Server).handleAccessProfileAdd,
+			`{"name":"marketing ","description":" Marketing analysts "}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Run("rule remove", func(t *testing.T) {
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		mock.ExpectExec("DELETE ar FROM access_rules").WithArgs("marketing", "pii").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		expectAccessDoc(mock)
+		w := driveAccess(t, newBootServer(db), (*Server).handleAccessRuleRemove, `{"profile":" marketing","flag":"pii "}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	})
+}
+
+// TestAccessProfilesCaseCollisionIs409: the unique key on profiles.name is
+// case-insensitive, so adding "Marketing" beside "marketing" would have
+// updated the existing row and answered as if a profile had been added.
+// It is refused, naming the row that is there, and nothing is written.
+func TestAccessProfilesCaseCollisionIs409(t *testing.T) {
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+	expectProfileLookup(mock, "marketing")
+	w := driveAccess(t, newBootServer(db), (*Server).handleAccessProfileAdd, `{"name":"Marketing"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("code=%d body=%s, want 409", w.Code, w.Body.String())
+	}
+	if got := decodeErr(t, w); got != `a profile named "marketing" already exists (names are case-insensitive)` {
+		t.Errorf("error = %q", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
 	}
 }
 
@@ -247,6 +382,7 @@ func TestAccessProfilesMalformedBodyIs400(t *testing.T) {
 func TestAccessProfilesInvalidatesSessionProfileCache(t *testing.T) {
 	db, mock, closeDB := newSQLMock(t)
 	defer closeDB()
+	expectProfileLookup(mock, "")
 	mock.ExpectExec("INSERT INTO profiles").WillReturnResult(sqlmock.NewResult(1, 1))
 	expectAccessDoc(mock)
 	s := newBootServer(db)
@@ -350,6 +486,7 @@ func TestAccessProfilesRBAC(t *testing.T) {
 		t.Error(err)
 	}
 
+	expectProfileLookup(mock, "")
 	mock.ExpectExec("INSERT INTO profiles").WillReturnResult(sqlmock.NewResult(1, 1))
 	expectAccessDoc(mock)
 	if w := accessReq(t, srv, "POST", "/api/access-profiles/profiles", admin, `{"name":"marketing"}`); w.Code != http.StatusOK {
@@ -361,10 +498,11 @@ func TestAccessProfilesRBAC(t *testing.T) {
 }
 
 // TestAccessProfilesRefusesDataProfileSession: a session that carries a
-// data profile is refused every mutation even when its permissions include
-// settings:write (it could lift its own redaction), the refusal is audited
-// as profile.denied, nothing is written, and the read still works (the
-// configuration is not row data).
+// data profile is refused every route of the surface, the GET included,
+// even when its permissions include settings:write (a mutation could lift
+// its own redaction; the GET lists the very tables and columns the profile
+// withholds). Each refusal is audited as exactly one profile.denied, and
+// nothing reaches the database: sqlmock has nothing queued.
 func TestAccessProfilesRefusesDataProfileSession(t *testing.T) {
 	rec := audittest.Install(t)
 	srv, mock := newAccessPolicyServer(t)
@@ -373,25 +511,122 @@ func TestAccessProfilesRefusesDataProfileSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := accessReq(t, srv, "POST", "/api/access-profiles/rules/remove", profiled,
-		`{"profile":"marketing","flag":"pii"}`)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("profiled POST = %d body=%s, want 403", w.Code, w.Body.String())
+	for _, rt := range accessRoutes {
+		t.Run(rt.method+" "+rt.path, func(t *testing.T) {
+			rec.Reset()
+			w := accessReq(t, srv, rt.method, rt.path, profiled, rt.body)
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("profiled %s %s = %d body=%s, want 403", rt.method, rt.path, w.Code, w.Body.String())
+			}
+			if got := decodeErr(t, w); got != accessProfilesRefusal {
+				t.Errorf("error = %q", got)
+			}
+			evs := rec.Events()
+			if len(evs) != 1 || evs[0].Action != "profile.denied" || evs[0].Actor != "sam@example.com" ||
+				evs[0].Detail["surface_gate"] != "access_profiles" {
+				t.Errorf("audit events = %+v, want one profile.denied for sam@example.com on access_profiles", evs)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Error(err)
+			}
+		})
 	}
-	if got := decodeErr(t, w); got != accessProfilesRefusal {
-		t.Errorf("error = %q", got)
+}
+
+// TestAccessProfilesRefusedUnderStartupProfile: a console started under
+// --profile refuses the whole surface too, on the same floor recover-cascade
+// and verify use. It does not rewrite the rows that profile is built from.
+// No session is involved, so nothing is audited and the message names the
+// startup profile, not a session.
+func TestAccessProfilesRefusedUnderStartupProfile(t *testing.T) {
+	rec := audittest.Install(t)
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+	srv, err := New(Config{
+		DB: db, DBName: "idx",
+		Listen: "127.0.0.1:8090", Token: "static-tok", NoArchive: true,
+		AuthPath:      filepath.Join(t.TempDir(), "auth.yaml"),
+		DenyTables:    []query.SchemaTable{{Schema: "app", Table: "invoices"}},
+		ProfileActive: true,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	evs := rec.Events()
-	if len(evs) != 1 || evs[0].Action != "profile.denied" || evs[0].Actor != "sam@example.com" ||
-		evs[0].Detail["surface_gate"] != "access_profiles" {
-		t.Errorf("audit events = %+v, want one profile.denied for sam@example.com on access_profiles", evs)
+	for _, rt := range accessRoutes {
+		w := accessReq(t, srv, rt.method, rt.path, "static-tok", rt.body)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s %s under a startup profile = %d body=%s, want 403", rt.method, rt.path, w.Code, w.Body.String())
+			continue
+		}
+		if got := decodeErr(t, w); got != accessProfilesStartupRefusal {
+			t.Errorf("%s %s error = %q", rt.method, rt.path, got)
+		}
+	}
+	if evs := rec.Events(); len(evs) != 0 {
+		t.Errorf("a startup-profile refusal audited %+v; only a session refusal is a profile.denied", evs)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
 	}
+}
 
-	expectAccessDoc(mock)
-	if w := accessReq(t, srv, "GET", "/api/access-profiles", profiled, ""); w.Code != http.StatusOK {
-		t.Errorf("profiled GET = %d body=%s, want 200 (configuration, not row data)", w.Code, w.Body.String())
+// TestAccessProfilesReadbackFailureSaysSaved: the write landed and was
+// audited, then the readback failed. The body must say the change is in, so
+// the operator reloads rather than repeats it (and the audit trail keeps
+// the one event, not two).
+func TestAccessProfilesReadbackFailureSaysSaved(t *testing.T) {
+	rec := audittest.Install(t)
+	db, mock, closeDB := newSQLMock(t)
+	defer closeDB()
+	expectProfileLookup(mock, "")
+	mock.ExpectExec("INSERT INTO profiles").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("FROM table_flags").WillReturnError(errors.New("connection reset by peer"))
+	w := driveAccess(t, newBootServer(db), (*Server).handleAccessProfileAdd, `{"name":"marketing"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d body=%s, want 500", w.Code, w.Body.String())
+	}
+	got := decodeErr(t, w)
+	if !strings.HasPrefix(got, accessReadbackFailedPrefix) || !strings.Contains(got, "connection reset by peer") {
+		t.Errorf("error = %q, want it to open with %q and carry the readback error", got, accessReadbackFailedPrefix)
+	}
+	if evs := rec.Events(); len(evs) != 1 || evs[0].Action != "profile.add" {
+		t.Errorf("audit events = %+v, want the one profile.add (the write is in)", evs)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestAccessProfilesAuditNamesTheServer: the audit detail always names the
+// index the change landed on. Without the selection header the shared
+// recorder writes no server at all, and a change made under the default
+// selection is a change to a real index; with the header it is that id.
+func TestAccessProfilesAuditNamesTheServer(t *testing.T) {
+	rec := audittest.Install(t)
+	for _, header := range []string{"", bootServerID} {
+		t.Run("header="+header, func(t *testing.T) {
+			rec.Reset()
+			db, mock, closeDB := newSQLMock(t)
+			defer closeDB()
+			mock.ExpectExec("DELETE ar FROM access_rules").WillReturnResult(sqlmock.NewResult(0, 1))
+			expectAccessDoc(mock)
+			s := newBootServer(db)
+			req := httptest.NewRequest("POST", "/api/access-profiles/rules/remove", strings.NewReader(`{"profile":"marketing","flag":"pii"}`))
+			if header != "" {
+				req.Header.Set(serverHeader, header)
+			}
+			w := httptest.NewRecorder()
+			s.handleAccessRuleRemove(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+			}
+			evs := rec.Events()
+			if len(evs) != 1 {
+				t.Fatalf("audit events = %+v, want one access.remove", evs)
+			}
+			if want := s.cm.defaultID(); want == "" || evs[0].Detail["server"] != want {
+				t.Errorf("Detail[server] = %q, want %q", evs[0].Detail["server"], want)
+			}
+		})
 	}
 }

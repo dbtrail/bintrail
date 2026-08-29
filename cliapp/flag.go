@@ -36,6 +36,12 @@ var (
 	flgColumn   string
 )
 
+// connectIndex opens the index database for the flag, profile and access
+// verbs. A variable so a unit test can hand the verbs a mocked database and
+// drive the real RunE functions (the not-found-is-exit-0 mapping lives
+// there, not in the shared package).
+var connectIndex = config.Connect
+
 func init() {
 	// --index-dsn is inherited by all subcommands via PersistentFlags.
 	flagCmd.PersistentFlags().StringVar(&flgIndexDSN, "index-dsn", "", "DSN for the index MySQL database (required)")
@@ -64,24 +70,25 @@ func init() {
 }
 
 func runFlagAdd(cmd *cobra.Command, args []string) error {
-	flagName := args[0]
+	// The same code the console's Access profiles page runs (#1445). Trimmed
+	// here as well so the line printed below shows the stored value.
+	f := accessprofiles.Flag{Schema: flgSchema, Table: flgTable, Column: flgColumn, Name: args[0]}.Trimmed()
 
-	db, err := config.Connect(flgIndexDSN)
+	db, err := connectIndex(flgIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
 	defer db.Close()
 
-	// The same code the console's Access profiles page runs (#1445).
-	f := accessprofiles.Flag{Schema: flgSchema, Table: flgTable, Column: flgColumn, Name: flagName}
 	if err := accessprofiles.AddFlag(cmd.Context(), db, f); err != nil {
 		return err
 	}
 
-	if flgColumn != "" {
-		fmt.Printf("Flag %q added to %s.%s (%s)\n", flagName, flgSchema, flgTable, flgColumn)
+	out := cmd.OutOrStdout()
+	if f.Column != "" {
+		fmt.Fprintf(out, "Flag %q added to %s.%s (%s)\n", f.Name, f.Schema, f.Table, f.Column)
 	} else {
-		fmt.Printf("Flag %q added to %s.%s\n", flagName, flgSchema, flgTable)
+		fmt.Fprintf(out, "Flag %q added to %s.%s\n", f.Name, f.Schema, f.Table)
 	}
 	return nil
 }
@@ -104,35 +111,35 @@ func init() {
 }
 
 func runFlagRemove(cmd *cobra.Command, args []string) error {
-	flagName := args[0]
+	f := accessprofiles.Flag{Schema: flgSchema, Table: flgTable, Column: flgColumn, Name: args[0]}.Trimmed()
 
-	db, err := config.Connect(flgIndexDSN)
+	db, err := connectIndex(flgIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
 	defer db.Close()
 
-	f := accessprofiles.Flag{Schema: flgSchema, Table: flgTable, Column: flgColumn, Name: flagName}
+	out := cmd.OutOrStdout()
 	err = accessprofiles.RemoveFlag(cmd.Context(), db, f)
 	var notFound *accessprofiles.FlagNotFoundError
 	if errors.As(err, &notFound) {
 		// Not an error on the command line (exit 0): the state asked for is
 		// the state there is.
-		fmt.Printf("Flag %q not found on %s.%s", flagName, flgSchema, flgTable)
-		if flgColumn != "" {
-			fmt.Printf(" (%s)", flgColumn)
+		fmt.Fprintf(out, "Flag %q not found on %s.%s", f.Name, f.Schema, f.Table)
+		if f.Column != "" {
+			fmt.Fprintf(out, " (%s)", f.Column)
 		}
-		fmt.Println()
+		fmt.Fprintln(out)
 		return nil
 	}
 	if err != nil {
 		return err
 	}
 
-	if flgColumn != "" {
-		fmt.Printf("Flag %q removed from %s.%s (%s)\n", flagName, flgSchema, flgTable, flgColumn)
+	if f.Column != "" {
+		fmt.Fprintf(out, "Flag %q removed from %s.%s (%s)\n", f.Name, f.Schema, f.Table, f.Column)
 	} else {
-		fmt.Printf("Flag %q removed from %s.%s\n", flagName, flgSchema, flgTable)
+		fmt.Fprintf(out, "Flag %q removed from %s.%s\n", f.Name, f.Schema, f.Table)
 	}
 	return nil
 }
@@ -157,7 +164,7 @@ func init() {
 }
 
 func runFlagList(cmd *cobra.Command, args []string) error {
-	db, err := config.Connect(flgIndexDSN)
+	db, err := connectIndex(flgIndexDSN)
 	if err != nil {
 		return fmt.Errorf("failed to connect to index database: %w", err)
 	}
