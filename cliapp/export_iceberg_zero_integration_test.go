@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -87,8 +88,12 @@ func TestIntegrationAuditContract_ExportIceberg_zeroRowLoad(t *testing.T) {
 		t.Fatalf("tables = %+v, want one", got.Tables)
 	}
 	tb := got.Tables[0]
-	if tb.Verdict != "loaded" || tb.RowsLoaded != 0 || tb.Cursor == "" || tb.Location == "" {
-		t.Fatalf("table = %+v, want loaded with 0 rows, a cursor and a location", tb)
+	// The cursor of a zero-row load is the BASELINE anchor, not the --at
+	// instant: it is where the next run's deltas start.
+	wantCursor := "binlog.000001:100 at " + base.Format(time.RFC3339)
+	wantLocation := filepath.Join(eiWarehouse, "shop", "empty")
+	if tb.Verdict != "loaded" || tb.RowsLoaded != 0 || tb.Cursor != wantCursor || tb.Location != wantLocation {
+		t.Fatalf("table = %+v, want loaded with 0 rows, cursor %q and location %q", tb, wantCursor, wantLocation)
 	}
 	if tb.SnapshotID != nil {
 		t.Fatalf("table = %+v, want no snapshot_id", tb)
@@ -105,10 +110,43 @@ func TestIntegrationAuditContract_ExportIceberg_zeroRowLoad(t *testing.T) {
 	if ev.Surface != "cli" || ev.Action != "export.iceberg" || ev.Schema != "shop" || ev.Table != "empty" {
 		t.Fatalf("event = %+v", ev)
 	}
-	if ev.Detail["commit"] != "load" || ev.Detail["rows"] != "0" || ev.Detail["cursor"] == "" || ev.Detail["location"] == "" {
-		t.Fatalf("event detail = %v, want a load of 0 rows with a cursor and a location", ev.Detail)
+	if ev.Detail["commit"] != "load" || ev.Detail["rows"] != "0" || ev.Detail["cursor"] != wantCursor || ev.Detail["location"] != wantLocation {
+		t.Fatalf("event detail = %v, want a load of 0 rows with cursor %q and location %q", ev.Detail, wantCursor, wantLocation)
 	}
 	if v, ok := ev.Detail["snapshot_id"]; ok {
 		t.Fatalf("event detail carries snapshot_id %q for a table without a snapshot", v)
+	}
+
+	// The next thing an operator hits: a delta run against the table that
+	// has no snapshot yet. The first INSERT gives it one, and the audit event
+	// and the JSON outcome must name the SAME id.
+	testutil.InsertEvent(t, db, "binlog.000001", 100, 200, base.Add(25*time.Minute).Format("2006-01-02 15:04:05"), nil,
+		"shop", "empty", 1, "1", nil, nil, []byte(`{"id":1,"status":"new"}`))
+	rec.Reset()
+	out.Reset()
+	eiAt = base.Add(30 * time.Minute).Format(time.RFC3339)
+	if err := runExportIceberg(exportIcebergCmd, nil); err != nil {
+		t.Fatalf("second export: %v\n%s", err, out.String())
+	}
+	got = exportJSON{}
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out.String())
+	}
+	if len(got.Tables) != 1 {
+		t.Fatalf("tables = %+v, want one", got.Tables)
+	}
+	tb = got.Tables[0]
+	if tb.Verdict != "exported" || tb.Events != 1 || tb.Upserts != 1 || tb.SnapshotID == nil || *tb.SnapshotID == 0 {
+		t.Fatalf("second run table = %+v, want exported with 1 event, 1 upsert and a snapshot id", tb)
+	}
+	if tb.Cursor != "binlog.000001:200 at "+base.Add(30*time.Minute).Format(time.RFC3339) {
+		t.Fatalf("second run cursor = %q, want the cut at binlog.000001:200", tb.Cursor)
+	}
+	evs = rec.Events()
+	if len(evs) != 1 || evs[0].Detail["commit"] != "delta" || evs[0].Detail["rows"] != "1" {
+		t.Fatalf("second run events = %+v, want one delta commit of 1 row", evs)
+	}
+	if want := strconv.FormatInt(*tb.SnapshotID, 10); evs[0].Detail["snapshot_id"] != want {
+		t.Fatalf("audit snapshot_id = %q, JSON snapshot_id = %s; they must name the same snapshot", evs[0].Detail["snapshot_id"], want)
 	}
 }
