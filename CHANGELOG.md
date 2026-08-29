@@ -90,6 +90,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused like any other type change. A table loaded by a build without
   this property keeps MySQL's text in its loaded rows until the table
   directory is removed and reloaded.
+- **`list_schema_changes` keeps same-second DDLs in the order they ran**
+  (#1441). `detected_at` has one-second resolution and a migration lands
+  dozens of statements inside one second, but the tool sorted by that column
+  alone, so inside a same-second group the rows came back in storage order:
+  oldest first, the opposite of the newest-first promise. A CREATE listed
+  before the DROP that followed it read as "dropped, then created". The order
+  now breaks ties by binlog coordinate (`binlog_file`, then `binlog_pos`) and
+  finally by `id`, which also makes a `limit` that cuts inside the group keep
+  the same rows on every call. The tool description and docs carry the one
+  caveat the stored data forces: `schema_changes` records no source identity,
+  so in an index fed by more than one source, or by a Postgres source (whose
+  LSN file names are not zero-padded), same-second changes have a repeatable
+  order, not their true one. The unfiltered listing used to walk the
+  `detected_at` index backward and stop at the limit; it now costs a sort over
+  the filtered rows, so narrow with `since`/`until` on a large table.
 - **The console's capture-health detail no longer names tables a restricted
   session cannot read** (#1452). `GET /api/status` served
   `capture_health.skipped[*].tables` and the explanation prose built from
