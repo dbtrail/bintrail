@@ -5,6 +5,7 @@ package mcptools
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -57,18 +58,6 @@ func positions(rows []schemaChangeOut) []int64 {
 		out[i] = r.BinlogPos
 	}
 	return out
-}
-
-func equalInt64s(a, b []int64) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // TestIntegrationSchemaChangesTool_sameSecondOrder pins #1441: DDLs that
@@ -153,10 +142,10 @@ func TestIntegrationSchemaChangesTool_sameSecondOrder(t *testing.T) {
 			// The crm row (id 6) is filtered out; the rest keep their order.
 			want, wantP = []int64{4, 2, 5, 3, 1}, []int64{20, 300, 200, 100, 50}
 		}
-		if got := ids(rows); !equalInt64s(got, want) {
+		if got := ids(rows); !slices.Equal(got, want) {
 			t.Errorf("%s: newest-first by binlog coordinate broken: got ids %v, want %v", name, got, want)
 		}
-		if got := positions(rows); !equalInt64s(got, wantP) {
+		if got := positions(rows); !slices.Equal(got, wantP) {
 			t.Errorf("%s: got positions %v, want %v", name, got, wantP)
 		}
 	}
@@ -169,10 +158,10 @@ func TestIntegrationSchemaChangesTool_sameSecondOrder(t *testing.T) {
 	// id assertion is what does.
 	first := callSchemaChanges(t, cfg, SchemaChangesArgs{Limit: 1})
 	second := callSchemaChanges(t, cfg, SchemaChangesArgs{Limit: 1})
-	if got := ids(first); !equalInt64s(got, wantIDs[:1]) {
+	if got := ids(first); !slices.Equal(got, wantIDs[:1]) {
 		t.Errorf("limit 1 must keep the higher id of the duplicate-coordinate pair: got ids %v, want %v", got, wantIDs[:1])
 	}
-	if !equalInt64s(ids(first), ids(second)) {
+	if !slices.Equal(ids(first), ids(second)) {
 		t.Errorf("limit 1 is not repeatable: first call %v, second call %v", ids(first), ids(second))
 	}
 }

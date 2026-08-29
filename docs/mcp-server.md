@@ -216,8 +216,10 @@ newest-first, and changes inside the same second are ordered by binlog
 coordinate (`binlog_file`, then `binlog_pos`), so a migration's burst of DDLs
 reads in the order it ran and a `limit` that cuts inside the burst keeps the
 same rows on every call. One caveat: `schema_changes` records no source
-identity, so in an index fed by more than one source, same-second changes from
-different sources have no true order between them, only a repeatable one.
+identity, so in an index fed by more than one source, or by a Postgres source
+(whose LSN file names are not zero-padded), same-second changes have a
+repeatable order, not their true one. The sort runs over the filtered rows, so
+narrow with `since`/`until` on a large table.
 
 Prompts that work well:
 

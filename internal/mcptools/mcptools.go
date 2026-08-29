@@ -319,8 +319,9 @@ func NewServer(cfg Config) *mcp.Server {
 			"Returns the full DDL statement, binlog coordinates, timestamp, and the " +
 			"covering snapshot_id (null = no schema snapshot was taken after the DDL) " +
 			"for each change; set uncovered_only to list just the changes without a snapshot." +
-			" Results come back newest first; changes inside the same second are ordered by binlog position. " +
-			"When the index holds more than one source, same-second changes from different sources have no true order between them, only a repeatable one.",
+			" Results come back newest first; changes inside the same second are ordered by binlog file, then position. " +
+			"In an index fed by more than one source, or by a Postgres source (whose LSN file names are not zero-padded), " +
+			"same-second changes have a repeatable order, not their true one.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:          "List schema changes",
 			ReadOnlyHint:   true,
@@ -1075,11 +1076,16 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 		// detected_at has one-second resolution and a migration lands dozens of
 		// DDLs inside one second, so the timestamp alone leaves the group in
 		// storage order (oldest first, the opposite of the DESC promise). The
-		// binlog coordinate is the true order within a source (file names are
-		// zero-padded, so lexicographic is chronological); id is the final
-		// deterministic tail so a limit cutting inside the group is repeatable
-		// (#1441). Across sources the tie has no recoverable true order: the table
-		// carries no source identity and the file sequences are unrelated.
+		// binlog coordinate is the true order within a MySQL source (MySQL binlog
+		// file names are zero-padded, so lexicographic is chronological); id is
+		// the final deterministic tail so a limit cutting inside the group is
+		// repeatable (#1441). Two shapes the stored data cannot order truly, only
+		// repeatably: across sources (the table carries no source identity and
+		// the file sequences are unrelated) and a Postgres source, whose
+		// binlog_file is the commit LSN as "%X/%X" and NOT zero-padded, so
+		// "0/9FFFFFF" sorts after "0/10000000". Position alone would be right for
+		// Postgres and wrong for MySQL, and no single expression serves both
+		// without a source column, so the MySQL shape wins here.
 		q += " ORDER BY detected_at DESC, binlog_file DESC, binlog_pos DESC, id DESC LIMIT ?"
 		params = append(params, limit)
 
