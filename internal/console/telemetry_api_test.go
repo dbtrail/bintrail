@@ -1,15 +1,20 @@
 package console
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
+	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
@@ -350,5 +355,68 @@ func TestRecordActionStatusClassification(t *testing.T) {
 				t.Errorf("console event carries run_id: %+v", e)
 			}
 		})
+	}
+}
+
+// runIDLine matches the one field that legitimately differs between two
+// renderings of the sample event: every call draws a fresh run_id, exactly as
+// every `telemetry show` run does.
+var runIDLine = regexp.MustCompile(`"run_id": "[0-9a-f-]{36}"`)
+
+// TestHandleTelemetryGetSampleEventMatchesCLI pins the #1447 promise: the
+// console card's sample event is the SAME bytes `bintrail telemetry show`
+// prints, produced by the same function, never a hand-maintained copy. It
+// drives the real CLI command (through the cobra tree AddTelemetryCommand
+// registers) and the real GET handler, then compares the two renderings with
+// only the per-call run_id normalised, and checks that the normalisation
+// replaced exactly one line on each side so a sample that silently lost its
+// run_id could not pass by matching an empty replacement.
+func TestHandleTelemetryGetSampleEventMatchesCLI(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	root := &cobra.Command{Use: "bintrail"}
+	cli.AddTelemetryCommand(root)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"telemetry", "show"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("telemetry show: %v", err)
+	}
+	// The command prints the event, then a blank line and the field list.
+	cliJSON, _, found := strings.Cut(out.String(), "\n\n")
+	if !found {
+		t.Fatalf("telemetry show output has no blank line after the event:\n%s", out.String())
+	}
+
+	s := &Server{}
+	rec := httptest.NewRecorder()
+	s.handleTelemetryGet(rec, httptest.NewRequest("GET", "/api/telemetry", nil))
+	dto := decodeTelemetry(t, rec)
+
+	if n := len(runIDLine.FindAllString(dto.SampleEvent, -1)); n != 1 {
+		t.Fatalf("console sample carries %d run_id lines, want exactly 1:\n%s", n, dto.SampleEvent)
+	}
+	if n := len(runIDLine.FindAllString(cliJSON, -1)); n != 1 {
+		t.Fatalf("CLI sample carries %d run_id lines, want exactly 1:\n%s", n, cliJSON)
+	}
+	got := runIDLine.ReplaceAllString(dto.SampleEvent, `"run_id": "<run_id>"`)
+	want := runIDLine.ReplaceAllString(cliJSON, `"run_id": "<run_id>"`)
+	if got != want {
+		t.Errorf("console sample_event differs from `telemetry show`:\n--- console ---\n%s\n--- cli ---\n%s", got, want)
+	}
+
+	// The card renders the string verbatim, so it must already be the
+	// pretty-printed form: a parseable event, indented, with no trailing newline
+	// for the <pre> to turn into a blank last line.
+	var ev telemetry.Event
+	if err := json.Unmarshal([]byte(dto.SampleEvent), &ev); err != nil {
+		t.Fatalf("sample_event is not a JSON event: %v", err)
+	}
+	if ev.EventType != telemetry.EventCommandRun || ev.SchemaVersion != telemetry.SchemaVersion {
+		t.Errorf("sample_event is not the representative command_run event: %+v", ev)
+	}
+	if !strings.HasPrefix(dto.SampleEvent, "{\n  \"") || strings.HasSuffix(dto.SampleEvent, "\n") {
+		t.Errorf("sample_event is not the two-space pretty-printed form:\n%q", dto.SampleEvent)
 	}
 }

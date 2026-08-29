@@ -492,7 +492,9 @@ compact baseline summary card and links onward:
   beacons immediately (no restart) and records the machine-wide choice, exactly
   like `bintrail telemetry off`. When an environment variable (`DO_NOT_TRACK`,
   `BINTRAIL_TELEMETRY`) or the `--telemetry` flag already controls it, the card
-  says so and defers to that. See [TELEMETRY.md](./TELEMETRY.md).
+  says so and defers to that. Open **Show a sample event** to see the exact
+  JSON one event would carry, the same bytes `bintrail telemetry show` prints;
+  opening it sends nothing. See [TELEMETRY.md](./TELEMETRY.md).
 
 ### The SQL panel (opt-in)
 
@@ -1202,7 +1204,9 @@ running version, and the raw-config fallback above. Its **Access token** card
 generates, replaces (**New token**), and deletes the managed MCP token; the plaintext is
 displayed exactly once, at generation, and never stored. For the
 start-to-finish walkthrough (bundle install included), see
-[Connect an AI assistant](connect-ai.md).
+[Connect an AI assistant](connect-ai.md). Below the three steps, the
+**Connect a SQL client** panel does the same for the embedded time-travel SQL
+port: see [Time-travel over the MySQL protocol](#time-travel-over-the-mysql-protocol-flashback-port).
 
 ## API
 
@@ -1217,7 +1221,7 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `POST /api/auth/setup` | First-run only (loopback / `--allow-setup`, self-disables once a password exists): create the password, returns a session. |
 | `POST /api/auth/logout` | Revoke the presented session (static token → 204 no-op). |
 | `POST /api/auth/password` | Set (first time; requires static-token auth) or rotate (`current_password` verified) the console password. Revokes all sessions and returns a fresh one. |
-| `GET /api/status` | Index status (same payload as `bintrail status --format json`). |
+| `GET /api/status` | Index status (same payload as `bintrail status --format json`). For a session with restricted data access, the capture-health detail names only the tables that session may read; `tables_withheld` counts the rest and the counts stay whole. |
 | `GET /api/coverage` | Live RPO summary: restorable delta window `[delta_from, delta_to]`, `lag_seconds`, `continuity`; with a baseline source, `full_table_status` (`ok`/`unknown`), `full_table_from` and `broken_tables` (profile-restricted sessions get the delta half only). |
 | `GET /api/activity` | Window aggregate behind the Overview tiles: counts by event type, distinct tables touched, and a per-table breakdown. The window **is the live retention** — derived from the oldest live `binlog_events` partition, so the counts cover exactly what the live index still holds and read the live tier only (no archive scan, and nothing archived can fall inside the window by construction). Returns `{label, since, until, refreshed_at, total, inserts, updates, deletes, other, tables, top_tables, complete, notes}`. The aggregate is a **server-side materialization** refreshed when older than ~30 minutes (a stale copy is served immediately while one recompute runs in the background); `refreshed_at` is when it was computed, and the UI renders it on the tiles ("as of …") so a cached number is never presented as live. `complete: false` means the counts are knowably a floor (an index with a pathological table count trips the grouping cap) and `notes` says so; the UI marks the affected tiles "partial". RBAC deny rules are applied, so a denied table contributes to neither the counts nor `top_tables`, and each deny profile gets its own materialization. |
 | `GET /api/schemas` | Schemas known to the index: those observed in `binlog_events` **plus** those in the latest schema snapshot, so a schema whose partitions have all been rotated out to Parquet/S3 is still listed (the archives still answer `/api/events` and `/api/recover`). `schemas` is that full union; `snapshot_only` (when present) is the subset with no live events observed — the UI labels these "snapshot only" since queries against them may return nothing; `snapshot_unavailable: true` means the snapshot half was skipped because the schema resolver failed to load (check the server log), so archive-only schemas may be missing from the list. The snapshot half is skipped under `--no-archive` or an active `--profile`, where archived data is unreachable anyway. Note this answers *which schemas this index knows of*, not *which have data in a given window* — for that, see `bintrail status`'s continuity verdict. `?schema=<name>` → that schema's tables. |
@@ -1241,12 +1245,14 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `GET /api/views.sql` | **Not JSON** — a `text/plain` DuckDB schema over the selected server's Parquet (the same output as `bintrail views`), served as a `views.sql` attachment. Nothing is executed here; the file runs in your own DuckDB. 404 when archives are disabled or nothing is archived yet, 403 while an access-control profile is active. |
 | `POST /api/sql` | Runs a read-only `SELECT` over the selected server's Parquet **inside the daemon**, in a locked-down DuckDB sandbox, returning `{columns, rows, row_count, truncated, elapsed_ms}` plus an optional `warnings` list (present when the session is missing the `events` view because `archive_state` could not be read; a failed statement carries the same note after the engine message). Opt-in (`BINTRAIL_CONSOLE_SQL_PANEL=1`) — `403` otherwise. `403` while a profile is active; `404` when archives are disabled or there is nothing to query; `422` for a non-`SELECT`, a statement error, or the timeout; `429` when another query is already running. Cancellation is by aborting the request. See [The SQL panel](#the-sql-panel-opt-in). |
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
+| `GET /api/flashback` | Process-global: the embedded time-travel SQL port (`watch --flashback-listen`): `{enabled, listen, host, port}`. `enabled: false` alone on the standalone console and on a daemon that did not open the port; `host` is empty on a wildcard bind (the UI then uses the name it was opened with). Never the console token that authenticates the port. Backs the **Connect a SQL client** panel on Settings → Connect AI. |
 | `GET /api/profiles` | RBAC data-profile **names** defined on the selected server's index: `{"profiles": ["..."]}`, sorted; empty on a legacy index without the table. Vocabulary for administration panels (e.g. a settings-surface profile picker) — never the rules or flagged tables/columns behind a name. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`,
 `recover-cascade`, `capabilities`, `reconstruct`, `baselines`) targets the
 server named by the `X-Bintrail-Server` request header; without the header they
-target the default entry (`storage` is the one process-global exception).
+target the default entry (`storage` and `flashback` are the process-global
+exceptions).
 Selection is stateless — concurrent clients can each target a different server.
 
 ### Cascade recovery
@@ -1349,6 +1355,16 @@ and baseline, so one port covers them all. A token is required (`--console-token
 / `BINTRAIL_CONSOLE_TOKEN`) because MySQL-protocol auth cannot use the console's
 password store. Full setup, routing, and the `_snapshot` baseline-parity edge:
 [docs/time-travel-sql.md → the embedded port](time-travel-sql.md#the-embedded-port-multi-source).
+
+The console shows the port on **Settings → Connect AI**, in the **Connect a
+SQL client** panel (#1446): when `watch` opened it, the listen address, the
+user rule (the server picked in the sidebar: its registry name or id, `default`
+for the command-line entry), the password rule (the console token, never
+displayed) and a ready-to-copy `mysql -h <host> -P <port> -u <server> -p` line
+for that server. When the port is off, the panel says so and names
+`--flashback-listen` / `BINTRAIL_CONSOLE_FLASHBACK_LISTEN` as daemon
+configuration; on the standalone `serve` console it says the port belongs to
+`watch`. Display only: the console never opens or closes the port.
 
 ### Coverage gaps and incomplete data
 

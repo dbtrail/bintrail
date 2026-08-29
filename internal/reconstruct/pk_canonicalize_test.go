@@ -288,15 +288,85 @@ func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
 	// TestCanonicalizePKValue_binaryFamilyMatchesIndexerSpelling. It still
 	// rejects a NON-bytes value for those types —
 	// TestCanonicalizePKValue_binaryFamilyRejectsNonBytes covers that arm.
-	for _, dt := range []string{"bit", "json", "point", "geometry", "float", "double"} {
+	refused := []string{"bit", "json", "point", "geometry", "float", "double", "time"}
+	for _, dt := range refused {
 		col := colMeta("x", dt, dt)
 		_, err := canonicalizePKValue("whatever", col)
 		if err == nil {
 			t.Errorf("%s: expected error for unsupported PK type, got nil", dt)
 			continue
 		}
-		if !strings.Contains(err.Error(), "unsupported") {
+		msg := err.Error()
+		if !strings.Contains(msg, "unsupported") {
 			t.Errorf("%s: unexpected error: %v", dt, err)
+		}
+		// #1455: the refusal must name the column's OWN type and nothing
+		// else. The old text hardcoded "BIT/JSON/spatial" as the unsupported
+		// set, so a FLOAT/DOUBLE/TIME key was blamed on a family it is not
+		// in. supportedPKType is the authoritative list; the message must
+		// not carry a second copy of it that can drift — so the check is
+		// case-insensitive and covers every refused name, not just the three
+		// the old text happened to spell.
+		if !strings.Contains(msg, `"`+dt+`"`) {
+			t.Errorf("%s: error does not name the column's type: %v", dt, err)
+		}
+		low := strings.ToLower(msg)
+		for _, other := range append([]string{"spatial"}, refused...) {
+			if other == dt {
+				continue
+			}
+			if strings.Contains(low, other) {
+				t.Errorf("%s: error names a different type (%s): %v", dt, other, err)
+			}
+		}
+		// Same sentence as the gates in front of this switch (#1455): an
+		// operator refused by verify and by the cascade baseline fallback
+		// must be able to tell it is one limitation.
+		if want := PKTypeGateReason(col, "the baseline merge", "canonicalize"); !strings.Contains(msg, want) {
+			t.Errorf("%s: error does not carry the shared gate reason %q: %v", dt, want, err)
+		}
+	}
+}
+
+// TestCanonicalizePKValue_emptyTypeKeepsTheWrongPathVerdict pins the PG-shaped
+// column: an empty DataType is not a per-type limitation but the PostgreSQL
+// snapshot shape, and #1009/#1198 chose the wrong-index-database verdict for
+// it deliberately. Routing this backstop through PKTypeGateReason preserves
+// that; a per-type message here would bury the only actionable diagnosis.
+func TestCanonicalizePKValue_emptyTypeKeepsTheWrongPathVerdict(t *testing.T) {
+	col := colMeta("id", "", "")
+	_, err := canonicalizePKValue("whatever", col)
+	if err == nil {
+		t.Fatal("expected error for a column with no MySQL type, got nil")
+	}
+	if want := PKTypeGateReason(col, "the baseline merge", "canonicalize"); !strings.Contains(err.Error(), want) {
+		t.Errorf("empty DataType does not carry the wrong-path verdict %q: %v", want, err)
+	}
+}
+
+// TestCanonicalizePKValue_everySupportedTypeHasAnArm pins that the switch in
+// canonicalizePKValue mirrors supportedPKTypes. It walks THAT slice — not a
+// copy of it — so a token added to the list without a matching arm fails
+// here; a hand-copied list would only ever pin the tokens someone remembered
+// to add to it, which is the drift #1455 is about. The value handed in is
+// deliberately arbitrary: the assertion is about WHICH arm fires, not about
+// the arm's own type checks (those have their own tests).
+func TestCanonicalizePKValue_everySupportedTypeHasAnArm(t *testing.T) {
+	if len(supportedPKTypes) == 0 {
+		t.Fatal("supportedPKTypes is empty; this guard would be vacuous")
+	}
+	for _, dt := range supportedPKTypes {
+		if !supportedPKType(dt) {
+			t.Errorf("%s: listed in supportedPKTypes but supportedPKType rejects it", dt)
+			continue
+		}
+		col := colMeta("x", dt, dt)
+		_, err := canonicalizePKValue("whatever", col)
+		// The default branch is the only one that renders PKTypeGateReason;
+		// compare against the renderer, not a copy of its wording, so a
+		// reword cannot turn this guard permanently green.
+		if err != nil && strings.Contains(err.Error(), PKTypeGateReason(col, "the baseline merge", "canonicalize")) {
+			t.Errorf("%s: admitted by supportedPKType but fell into canonicalizePKValue's default branch: %v", dt, err)
 		}
 	}
 }
@@ -457,27 +527,23 @@ func TestCanonicalizePKMap_compositePK(t *testing.T) {
 // ─── supportedPKType ─────────────────────────────────────────────────────────
 
 func TestSupportedPKType(t *testing.T) {
-	supported := []string{
-		"int", "bigint", "smallint", "tinyint", "mediumint",
-		"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
-		"enum", "set",
-		"datetime", "timestamp", "date", "year",
-		"decimal", "numeric", // #214
-		// #1155 — see the round-trip guard this list demands below.
-		"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob",
-	}
-	for _, dt := range supported {
+	// The accepted side is supportedPKTypes itself — restating it here would
+	// be a copy that can drift from the list it is meant to describe (#1455),
+	// and the arm-coverage guard above already walks the same slice.
+	for _, dt := range supportedPKTypes {
 		if !supportedPKType(dt) {
 			t.Errorf("expected %q to be supported", dt)
 		}
 	}
-	// The types below are explicitly deferred — the indexer and
-	// baseline-writer representations diverge on disk (see pk_canonicalize.go
-	// doc comment). This list is a regression guard: if someone adds one
-	// to the allow-list without fixing the upstream representation, a
-	// round-trip will silently produce wrong output. Don't loosen this
-	// without a matching round-trip integration test like the one for
-	// DECIMAL in internal/cli/reconstruct_pk_types_integration_test.go.
+	// The types below are explicitly deferred: their round-trip between the
+	// indexer's pk_values and the baseline Parquet column is UNVERIFIED (see
+	// the pk_canonicalize.go doc comment), which is reason enough to refuse —
+	// a silent wrong match on a primary-key join is worse than a refusal.
+	// This list is a regression guard: if someone adds one to the allow-list
+	// without verifying that round-trip, it will silently produce wrong
+	// output. Don't loosen this without a matching round-trip integration
+	// test like the one for DECIMAL in
+	// internal/cli/reconstruct_pk_types_integration_test.go.
 	//
 	// The binary family moved to the supported list in #1155 under exactly
 	// that rule: TestBinaryPKBaselineJoin_endToEnd drives a real ROW binlog
@@ -485,7 +551,7 @@ func TestSupportedPKType(t *testing.T) {
 	// trailing-0x00 keys that are the only inputs able to distinguish a
 	// correct canonicalization from an inverted one.
 	unsupported := []string{
-		"float", "double",
+		"float", "double", "time",
 		"bit", "json",
 		"point", "linestring", "polygon", "geometry",
 		"", "unknown-type",
