@@ -27,6 +27,9 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 BASE_DSN="${BINTRAIL_TEST_DSN:-root:testroot@tcp(127.0.0.1:13306)}"
 MYSQL_CONTAINER="${MYSQL_CONTAINER:-bintrail-test-mysql}"
 PORT="${E2E_PORT:-8090}"
+# The daemon's embedded time-travel SQL port (#996), opened so scenario 17g
+# photographs the Connect page's SQL client panel in its enabled shape (#1446).
+FLASHBACK_PORT="${E2E_FLASHBACK_PORT:-13308}"
 TOKEN="${E2E_TOKEN:-e2e-console-token}"
 IDX_DB="bintrail_e2e_idx"
 ARC_DB="bintrail_e2e_arc"
@@ -205,6 +208,7 @@ BINTRAIL_CONSOLE_TOKEN="$TOKEN" BINTRAIL_CONSOLE_BASELINE_TRIGGER=1 BINTRAIL_CON
   --console-token "$TOKEN" \
   --console-servers-file "$SERVERS_FILE" \
   --baseline-dir "$BASELINE_ROOT" \
+  --flashback-listen "127.0.0.1:$FLASHBACK_PORT" \
   --console-allow-setup >"$E2E_ARTIFACT_DIR/console-e2e-daemon.log" 2>&1 &
 DAEMON_PID=$!
 
@@ -235,4 +239,4 @@ cd "$HERE"
 CONSOLE_URL="http://127.0.0.1:$PORT" E2E_ARC_DB="$ARC_DB" \
   E2E_ARC_GAP_SINCE="$ARC_GAP_SINCE" E2E_ARC_GAP_UNTIL="$ARC_GAP_UNTIL" CONSOLE_TOKEN="$TOKEN" \
   E2E_FIX_SCHEMA="$FIX_SCHEMA" E2E_TT_AT="$TT_AT" E2E_BASELINE_DIR="$BASELINE_ROOT" \
-  E2E_IDX_DB="$IDX_DB" E2E_MYSQL_CONTAINER="$MYSQL_CONTAINER" node console_e2e.mjs
+  E2E_IDX_DB="$IDX_DB" E2E_MYSQL_CONTAINER="$MYSQL_CONTAINER" E2E_FLASHBACK_PORT="$FLASHBACK_PORT" node console_e2e.mjs

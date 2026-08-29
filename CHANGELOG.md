@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package is guarded the day it appears; the console, MCP and pg binaries are
   pinned free of both. Records the #1467 decision mechanically: Iceberg is an
   output, not the storage layer.
+- **The Connect page shows the time-travel SQL port** (#1446). Settings →
+  Connect AI gains a "Connect a SQL client" panel for the embedded
+  MySQL-protocol port (`bintrail-console watch --flashback-listen`). With the
+  port open it shows the listen address, the user rule (the server picked in
+  the sidebar, by its registry name or id), the password rule (the console
+  token, never displayed) and a ready-to-copy `mysql` line for that server.
+  With the port off it says so and names the flag and environment variable
+  that open it, as daemon configuration; the standalone `serve` console says
+  the port belongs to `watch`. Backed by a new read-only `GET /api/flashback`
+  (`{enabled, listen, host, port}`, `settings:read`; `host` is empty on a
+  wildcard bind, so the page fills in the name it was opened with). Display
+  only: the console never opens or closes the port.
 
 ### Changed
 - **Usage telemetry classifies first-run failures** (#1503). A fresh install

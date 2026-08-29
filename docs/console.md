@@ -1188,7 +1188,9 @@ running version, and the raw-config fallback above. Its **Access token** card
 generates, replaces (**New token**), and deletes the managed MCP token; the plaintext is
 displayed exactly once, at generation, and never stored. For the
 start-to-finish walkthrough (bundle install included), see
-[Connect an AI assistant](connect-ai.md).
+[Connect an AI assistant](connect-ai.md). Below the three steps, the
+**Connect a SQL client** panel does the same for the embedded time-travel SQL
+port: see [Time-travel over the MySQL protocol](#time-travel-over-the-mysql-protocol-flashback-port).
 
 ## API
 
@@ -1227,12 +1229,14 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `GET /api/views.sql` | **Not JSON** — a `text/plain` DuckDB schema over the selected server's Parquet (the same output as `bintrail views`), served as a `views.sql` attachment. Nothing is executed here; the file runs in your own DuckDB. 404 when archives are disabled or nothing is archived yet, 403 while an access-control profile is active. |
 | `POST /api/sql` | Runs a read-only `SELECT` over the selected server's Parquet **inside the daemon**, in a locked-down DuckDB sandbox, returning `{columns, rows, row_count, truncated, elapsed_ms}` plus an optional `warnings` list (present when the session is missing the `events` view because `archive_state` could not be read; a failed statement carries the same note after the engine message). Opt-in (`BINTRAIL_CONSOLE_SQL_PANEL=1`) — `403` otherwise. `403` while a profile is active; `404` when archives are disabled or there is nothing to query; `422` for a non-`SELECT`, a statement error, or the timeout; `429` when another query is already running. Cancellation is by aborting the request. See [The SQL panel](#the-sql-panel-opt-in). |
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
+| `GET /api/flashback` | Process-global: the embedded time-travel SQL port (`watch --flashback-listen`): `{enabled, listen, host, port}`. `enabled: false` alone on the standalone console and on a daemon that did not open the port; `host` is empty on a wildcard bind (the UI then uses the name it was opened with). Never the console token that authenticates the port. Backs the **Connect a SQL client** panel on Settings → Connect AI. |
 | `GET /api/profiles` | RBAC data-profile **names** defined on the selected server's index: `{"profiles": ["..."]}`, sorted; empty on a legacy index without the table. Vocabulary for administration panels (e.g. a settings-surface profile picker) — never the rules or flagged tables/columns behind a name. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`,
 `recover-cascade`, `capabilities`, `reconstruct`, `baselines`) targets the
 server named by the `X-Bintrail-Server` request header; without the header they
-target the default entry (`storage` is the one process-global exception).
+target the default entry (`storage` and `flashback` are the process-global
+exceptions).
 Selection is stateless — concurrent clients can each target a different server.
 
 ### Cascade recovery
@@ -1335,6 +1339,16 @@ and baseline, so one port covers them all. A token is required (`--console-token
 / `BINTRAIL_CONSOLE_TOKEN`) because MySQL-protocol auth cannot use the console's
 password store. Full setup, routing, and the `_snapshot` baseline-parity edge:
 [docs/time-travel-sql.md → the embedded port](time-travel-sql.md#the-embedded-port-multi-source).
+
+The console shows the port on **Settings → Connect AI**, in the **Connect a
+SQL client** panel (#1446): when `watch` opened it, the listen address, the
+user rule (the server picked in the sidebar: its registry name or id, `default`
+for the command-line entry), the password rule (the console token, never
+displayed) and a ready-to-copy `mysql -h <host> -P <port> -u <server> -p` line
+for that server. When the port is off, the panel says so and names
+`--flashback-listen` / `BINTRAIL_CONSOLE_FLASHBACK_LISTEN` as daemon
+configuration; on the standalone `serve` console it says the port belongs to
+`watch`. Display only: the console never opens or closes the port.
 
 ### Coverage gaps and incomplete data
 
