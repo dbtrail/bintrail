@@ -86,7 +86,7 @@ and Cloud SQL: **[PostgreSQL source](docs/postgres.md)** ·
 | [30-second demo](docs/demo.md) | [Streaming](docs/streaming.md) · [Indexing](docs/indexing.md) | [Upload to S3](docs/upload.md) · [S3 IAM policy](docs/s3-iam-policy.md) · [Upgrading](docs/upgrade.md) |
 | | [MariaDB source (alpha)](docs/mariadb.md) · [PostgreSQL source](docs/postgres.md) | [Server identity](docs/server-identity.md) |
 | | [Connect an AI assistant](docs/connect-ai.md) · [MCP server](docs/mcp-server.md) | [Parquet debugging](docs/parquet-debugging.md) |
-| | [Dump & Baseline](docs/dump-and-baseline.md) · [DDL tracking](docs/ddl-tracking.md) | |
+| | [Dump & Baseline](docs/dump-and-baseline.md) · [DDL tracking](docs/ddl-tracking.md) | [Iceberg export](docs/iceberg-export.md) |
 
 ## Privacy
 

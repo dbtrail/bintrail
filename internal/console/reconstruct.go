@@ -83,6 +83,11 @@ type capabilitiesResponse struct {
 	// page's point-in-time restore). Process-global, like BaselineTrigger —
 	// the endpoint does the per-server validation (local backup directory).
 	BaselineRestore bool `json:"baseline_restore"`
+	// BackupSchedule: this process runs the per-server backup schedule loop
+	// (#1442), so the Backups page may offer the schedule form. Process-global
+	// like BaselineTrigger; whether a given schedule can run on this daemon is
+	// answered per server by the listing's schedule.runnable.
+	BackupSchedule bool `json:"backup_schedule"`
 	// SQLExport: this process can build a custom .sql backup for a chosen
 	// instant and hand it out as a download. Wired with BaselineRestore.
 	SQLExport bool `json:"sql_export"`
@@ -194,6 +199,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		Monitor:         s.monitorCtrl != nil,
 		BaselineTrigger: s.baselineCtrl != nil,
 		BaselineRestore: s.baselineRestore != nil,
+		BackupSchedule:  s.backupSchedules != nil,
 		SQLExport:       s.sqlExport != nil,
 		VerifyTrigger:   s.verifyCtrl != nil,
 

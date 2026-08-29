@@ -222,3 +222,45 @@ func writeSnapshotFixture(t *testing.T, root, ts string, tables map[string][]str
 		t.Fatalf("WriteSuccessMarker: %v", err)
 	}
 }
+
+// A carried-forward table WAS published, so it must not read as skipped, and it
+// was NOT rewritten, so calling it "refreshed" would hide the one thing an
+// operator reads this summary for: which tables are costing a full rewrite
+// every cycle. Those are the two wrong answers this pins against.
+func TestBuildRefreshOutcomes_carriedForwardIsItsOwnVerdict(t *testing.T) {
+	got := buildRefreshOutcomes(
+		[]string{"shop.orders", "shop.cold"},
+		[]*reconstruct.TableReport{
+			{Schema: "shop", Table: "orders"},
+			{Schema: "shop", Table: "cold", CarriedForward: true},
+		},
+		nil,
+	)
+	want := map[string]string{"shop.orders": "refreshed", "shop.cold": "unchanged"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d outcomes, want %d: the loops below assert nothing on an empty result", len(got), len(want))
+	}
+	for _, o := range got {
+		if w := want[o.Table]; o.Verdict != w {
+			t.Errorf("%s: verdict = %q, want %q", o.Table, o.Verdict, w)
+		}
+	}
+	for _, o := range got {
+		if o.Table == "shop.cold" && o.Detail == "" {
+			t.Error("the unchanged verdict carries no detail, so it does not say WHY the file was not rewritten")
+		}
+	}
+}
+
+// TestBaselineRefreshCarryForwardIsOffByDefault: see the twin in internal/cli.
+// A one-character regression here turns the opt-in into opt-out for every user
+// of `bintrail baseline refresh`, and nothing else in the suite would notice.
+func TestBaselineRefreshCarryForwardIsOffByDefault(t *testing.T) {
+	f := baselineRefreshCmd.Flags().Lookup("carry-forward-unchanged")
+	if f == nil {
+		t.Fatal("--carry-forward-unchanged is gone from baseline refresh; this guard covers nothing")
+	}
+	if f.DefValue != "false" {
+		t.Fatalf("default = %q, want \"false\"", f.DefValue)
+	}
+}

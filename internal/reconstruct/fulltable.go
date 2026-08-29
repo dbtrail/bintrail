@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -126,12 +127,42 @@ type FullTableConfig struct {
 	Parallelism int  // max concurrent tables (0 → runtime.NumCPU())
 	AllowGaps   bool // false = strict abort on gaps (default for reconstruct)
 
+	// CarryForwardUnchanged publishes a table that had NO events in the window
+	// by carrying its previous Parquet file forward (a hard link where the
+	// filesystem allows one) instead of folding an empty change map over it and
+	// re-emitting the same rows. OutputFormatParquet only.
+	//
+	// OPT-IN, and the zero value is the conservative one. The rows are the same
+	// either way; what changes is the representation on disk. See
+	// carryForwardEligible for the trade-offs an operator is agreeing to.
+	CarryForwardUnchanged bool
+
 	// WarnEventThreshold logs a loud warning when a table's fetched event count
-	// exceeds it: full-table reconstruct holds every event plus one change-map
-	// entry per touched PK in memory and can exhaust RAM at scale (#654). 0 =
-	// disabled — the zero value, so direct library callers stay silent; the CLI
-	// defaults it to 5,000,000 via --warn-event-threshold.
+	// exceeds it. The event window itself is PAGED since #1097, so the resident
+	// cost this warns about is the change map: one entry per touched PK, which
+	// paging does not bound (#1107). The event count stays the trigger because
+	// it is what the fetch knows (#654).
+	//
+	// 0 = disabled, and it is the zero value, so a direct library caller is
+	// silent unless it opts in. Both the CLI (--warn-event-threshold) and the
+	// in-daemon folds (consoleapp's daemonFoldWarnEventThreshold) default it to
+	// 5,000,000; keep those in step.
+	//
+	// The reported threshold is SCALED by Parallelism (#842), so two callers
+	// with the same raw value warn at the same TOTAL concurrent event volume
+	// while their per-table triggers differ.
 	WarnEventThreshold int64
+
+	// RemediationHint replaces the advice attached to that warning.
+	//
+	// Empty uses the wording for the attended CLI commands, which names the
+	// flags those commands actually register. That wording is WRONG on a daemon:
+	// bintrail-console registers no --at, --parallelism or --warn-event-threshold,
+	// so an operator told to lower one goes looking for a flag their binary does
+	// not have. Same class as the project's rule that an MCP error must never
+	// name a CLI flag the client cannot pass. A caller on such a surface sets
+	// advice its own operator can act on.
+	RemediationHint string
 
 	// FetchBatchSize is the page size used to stream a table's event window
 	// (#1097). 0 → query.DefaultStreamBatchSize, the zero-value convention this
@@ -217,6 +248,13 @@ type TableReport struct {
 	// as well — a binlog-only report has no baseline GTID/binlog coordinates
 	// to embed in the metadata file.
 	BinlogOnly bool
+	// CarriedForward is true when the delta window held no events for this
+	// table, so its previous Parquet file was published into the new snapshot
+	// unchanged instead of being folded and re-emitted. The row counters above
+	// are all zero in that case — nothing was streamed, applied or written —
+	// and reading them as "the table is empty" would be wrong. See carryForward
+	// for why an untouched table's anchor stays valid.
+	CarriedForward bool
 }
 
 // shouldWarnEvents reports whether a fetched event count should trigger the
@@ -274,7 +312,7 @@ func effectiveParallelism(cfg FullTableConfig) int {
 // warning reflects the total concurrent RAM footprint across every table
 // ReconstructTables may run at once, not just this one. Extracted from
 // ReconstructTable so the emission — not just the predicate — is unit-testable.
-func maybeWarnEventVolume(schema, table string, n int64, threshold int64, parallelism int) {
+func maybeWarnEventVolume(schema, table string, n int64, threshold int64, parallelism int, remediation string) {
 	effThreshold := scaledEventThreshold(threshold, parallelism)
 	if !shouldWarnEvents(n, effThreshold) {
 		return
@@ -288,8 +326,38 @@ func maybeWarnEventVolume(schema, table string, n int64, threshold int64, parall
 		"entry per touched row in memory and may exhaust RAM",
 		"schema", schema, "table", table,
 		"events", n, "threshold", effThreshold, "raw_threshold", threshold, "parallelism", parallelism,
-		"hint", "narrow the window with a later --at or a fresher baseline snapshot, lower --parallelism, or raise/silence "+
-			"via --warn-event-threshold / BINTRAIL_RECONSTRUCT_WARN_EVENTS (0 disables)")
+		"hint", remediationOrDefault(remediation))
+}
+
+// withFoldBudgets copies every caller-facing budget from a FullTableConfig onto
+// the foldConfig a fold actually runs with.
+//
+// It exists because these four assignments used to be written out at each
+// foldEventWindow call site, and a one-line deletion at EITHER site silently
+// reverted the budget with the whole suite green: nothing drives
+// FullTableConfig through foldConfig into the warning, so the seam had no
+// coverage at all. One function means one place to delete and one place to
+// test.
+func withFoldBudgets(cfg FullTableConfig, fc foldConfig) foldConfig {
+	fc.BatchSize = cfg.FetchBatchSize
+	fc.WarnEventThreshold = cfg.WarnEventThreshold
+	// The DIVISOR, not the raw field: effectiveParallelism clamps to
+	// len(cfg.Tables), so a single-table run is not divided by a parallelism it
+	// can never reach.
+	fc.Parallelism = effectiveParallelism(cfg)
+	fc.RemediationHint = cfg.RemediationHint
+	return fc
+}
+
+// remediationOrDefault falls back to the attended-CLI wording. Callers on a
+// surface that registers none of these flags set FullTableConfig.RemediationHint
+// instead; see the field's doc for why naming an absent flag is a defect.
+func remediationOrDefault(remediation string) string {
+	if remediation != "" {
+		return remediation
+	}
+	return "narrow the window with a later --at or a fresher baseline snapshot, lower --parallelism, or raise/silence " +
+		"via --warn-event-threshold / BINTRAIL_RECONSTRUCT_WARN_EVENTS (0 disables)"
 }
 
 // Refusal classes a caller can act on without parsing error text. Every
@@ -339,6 +407,56 @@ func ReconstructTablesDetailed(ctx context.Context, cfg FullTableConfig) ([]*Tab
 // containing every per-table failure (via errors.Join).
 func ReconstructTables(ctx context.Context, cfg FullTableConfig) ([]*TableReport, error) {
 	return reconstructTables(ctx, cfg, nil)
+}
+
+// foldOneTable is ReconstructTable behind a seam, so a test can make ONE
+// table's fold panic. The fan-out goroutine below is only reachable with a
+// live index and a schema snapshot, and the panic it has to survive comes from
+// deep inside a real fold (DuckDB over customer Parquet), which no fixture can
+// stage on demand. Written by tests only; production never reassigns it.
+var foldOneTable = ReconstructTable
+
+// recoverTableFold turns a panic in one table's fold into that table's
+// FAILURE, instead of letting it end the process.
+//
+// recover() is per-goroutine, so the guard consoleapp puts on its four
+// baseline job goroutines cannot reach here: this is a CHILD goroutine, and a
+// panic in it kills the process however well the parent is guarded. That
+// matters because under `bintrail-console watch` the process that runs this
+// fold is also the capture plane, and this is the surface #1472 named. The
+// fold decodes a customer's own Parquet through DuckDB, with column types that
+// came from their CREATE TABLE.
+//
+// It is a failure, not a swallow. The panic is logged at error level WITH the
+// stack, which is where the diagnosis now lives since the process no longer
+// dies printing it, and the table is recorded in BOTH sinks its ordinary error
+// path uses. So it flows on as an ordinary per-table failure: the joined error
+// fails the run, the completeness marker stays _INCOMPLETE, nothing is
+// published, and the caller's own reporting (a run history row, a refusal
+// count, a non-zero exit) happens exactly as it would for any other bad table.
+// The CLI keeps everything it had: it exits non-zero and the stack is in the
+// log, rather than on stderr from a dying process.
+//
+// One table's crash does not stop its siblings, which is deliberate: they are
+// independent folds, and the run is failing as a whole anyway.
+//
+// mu must be the mutex guarding errs and failures. failures may be nil (the
+// ReconstructTables entry point passes none); errs never is.
+func recoverTableFold(schema, table string, mu *sync.Mutex, errs *[]error, failures *[]TableFailure) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	slog.Error("full-table reconstruct hit an internal error on one table; the other tables continue and "+
+		"the run will fail without publishing. Please report this with the stack recorded here.",
+		"schema", schema, "table", table, "panic", r, "stack", string(debug.Stack()))
+	err := fmt.Errorf("%s.%s: internal error: %v", schema, table, r)
+	mu.Lock()
+	defer mu.Unlock()
+	*errs = append(*errs, err)
+	if failures != nil {
+		*failures = append(*failures, TableFailure{Schema: schema, Table: table, Err: err})
+	}
 }
 
 // reconstructTables is the implementation both entry points share. failures, when
@@ -468,9 +586,17 @@ func reconstructTables(ctx context.Context, cfg FullTableConfig, failures *[]Tab
 
 	// Resolve the snapshot's binlog cut ONCE for the whole run, before any table
 	// is folded. One index database tracks one source, so a single coordinate is
-	// the right anchor for every table in the snapshot — and resolving it per
-	// table would let two tables in one snapshot end up anchored at different
-	// points, which is not a state the marker/discovery scheme can express.
+	// the right anchor for every table this run FOLDS, and resolving it per table
+	// would anchor tables that were folded together at different points for no
+	// reason.
+	//
+	// A snapshot can nonetheless hold mixed anchors, and that is deliberate
+	// rather than a hole: a table with no events in the window is published by
+	// carrying its previous file forward, keeping its own older anchor, which
+	// still points exactly where ITS deltas resume. Discovery is unaffected
+	// because it dates a snapshot by its directory name, never by a footer. Any
+	// reader that treats one table's anchor as the snapshot's will be wrong for
+	// such a table; see carryForward.
 	//
 	// The cut also bounds every table's fetch (Options.UntilPos below), so it
 	// must be pinned before the first fetch: reading it afterwards would anchor
@@ -518,6 +644,10 @@ func reconstructTables(ctx context.Context, cfg FullTableConfig, failures *[]Tab
 		wg.Add(1)
 		go func(schema, table string) {
 			defer wg.Done()
+			// Registered AFTER wg.Done so it runs BEFORE it: the parent reads
+			// errs/failures once wg.Wait returns, and appending after that
+			// would be a data race.
+			defer recoverTableFold(schema, table, &mu, &errs, failures)
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
@@ -525,7 +655,7 @@ func reconstructTables(ctx context.Context, cfg FullTableConfig, failures *[]Tab
 				return
 			}
 
-			rep, err := ReconstructTable(ctx, cfg, schema, table, db, engine, archSources, resolver, dbName)
+			rep, err := foldOneTable(ctx, cfg, schema, table, db, engine, archSources, resolver, dbName)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -818,9 +948,17 @@ func ReconstructTable(
 	// cannot handle. Emitting a warning isn't enough because operators
 	// running with --log-level error won't see it and would silently get
 	// wrong output — the same class of bug the full-table reconstruct
-	// hardening exists to prevent. supportedPKType is the list; users with
-	// a PK type outside it (FLOAT, DOUBLE, TIME, BIT, JSON, spatial) must
-	// track the follow-up work for their type to be added.
+	// hardening exists to prevent. What is actually left out today is
+	// FLOAT/DOUBLE, TIME, BIT, JSON and the spatial family; supportedPKType is the
+	// authority, and this comment used to also name DECIMAL and the
+	// BINARY/VARBINARY/BLOB family, which have been supported since #214 and
+	// #1155 respectively.
+	//
+	// This loop deliberately does NOT skip an empty DataType, so a PG-shaped
+	// snapshot that reached the MySQL path still gets PKTypeGateReason's
+	// wrong-path verdict. Do not swap it for reconstruct.FirstUnsupportedPKType,
+	// whose empty-skip is for callers with no upstream flavor check: it would
+	// retire that verdict silently.
 	for _, pkCol := range pkCols {
 		if !supportedPKType(pkCol.DataType) {
 			return nil, fullTablePKTypeRefusal(schema, table, pkCol)
@@ -949,21 +1087,18 @@ func ReconstructTable(
 	// to query archives — it already handles the empty-archive case in its fast
 	// path. The pre-#1097 `len(archSources)==0` gate was wrong: it disabled
 	// archive routing even when the fetch could have resolved sources itself.
-	fold, err := foldEventWindow(ctx, foldConfig{
-		DB:                 db,
-		Engine:             engine,
-		DBName:             dbName,
-		Resolver:           resolver,
-		Schema:             schema,
-		Table:              table,
-		PKCols:             pkCols,
-		Opts:               fetchOpts,
-		AllowGaps:          cfg.AllowGaps,
-		ArchiveFetcher:     fetcher,
-		BatchSize:          cfg.FetchBatchSize,
-		WarnEventThreshold: cfg.WarnEventThreshold,
-		Parallelism:        effectiveParallelism(cfg),
-	})
+	fold, err := foldEventWindow(ctx, withFoldBudgets(cfg, foldConfig{
+		DB:             db,
+		Engine:         engine,
+		DBName:         dbName,
+		Resolver:       resolver,
+		Schema:         schema,
+		Table:          table,
+		PKCols:         pkCols,
+		Opts:           fetchOpts,
+		AllowGaps:      cfg.AllowGaps,
+		ArchiveFetcher: fetcher,
+	}))
 	if err != nil {
 		return nil, err
 	}
@@ -981,6 +1116,39 @@ func ReconstructTable(
 		flavor := query.SourceFlavor(db)
 		start, startOK := query.OldestIndexedEvent(db)
 		WarnBaselineFirstEventGap(flavor, bmeta, *fold.First, start, startOK, schema, table)
+	}
+
+	// ── 5b. Nothing changed: publish the previous file instead of rewriting ─
+	// Placed HERE on purpose: after the fold, so the change map is known, and
+	// after steps 3a-bis/3b/3c, so every refusal still runs first. A TRUNCATE
+	// emits no row events, so an empty change map alone would not mean the
+	// table is untouched — CheckDestructiveDDL is what makes it mean that.
+	//
+	// This also skips step 6, which reads the whole baseline back for DuckDB,
+	// so the saving is the read as well as the write.
+	//
+	// capGap is passed in because step 3c does NOT refuse under --allow-gaps:
+	// it returns the finding and lets the run proceed. See carryForwardEligible
+	// for why a known gap disqualifies a table from being carried at all.
+	if carryForwardEligible(cfg.CarryForwardUnchanged, cfg.OutputFormat, baselinePath, len(changes), capGap) {
+		cerr := carryForward(ctx, baselinePath, cfg.snapshotDir, schema, table)
+		if cerr != nil {
+			return nil, fmt.Errorf("carry %s.%s forward unchanged: %w", schema, table, cerr)
+		}
+		rep.CarriedForward = true
+		// Relative to the snapshot dir, matching what mergeBaselineIntoParquet
+		// sets for a table it writes: one field cannot mean two things, and
+		// consumers join it themselves (internal/cli/drill.go does).
+		rep.Files = []string{filepath.Join(schema, table+".parquet")}
+		rep.Duration = time.Since(start)
+		// CarriedForward is set unconditionally above and deliberately does NOT
+		// distinguish a link from a copy: it means "published by reuse rather
+		// than by folding", which is true either way, and it is what the
+		// unchanged verdict and the console's reused count are derived from.
+		// carryForward logs the link-versus-copy split itself, with the cause.
+		slog.Info("table carried forward unchanged", "schema", schema, "table", table,
+			"reason", "no events in the window")
+		return rep, nil
 	}
 
 	// ── 6. Materialize the baseline locally for DuckDB streaming ───────────
@@ -1747,7 +1915,7 @@ func reconstructBinlogOnly(
 	// this fallback has no baseline to bound the window, so it is if anything
 	// the more exposed of the two — it fetches the WHOLE retained binlog
 	// history for the table.
-	fold, err := foldEventWindow(ctx, foldConfig{
+	fold, err := foldEventWindow(ctx, withFoldBudgets(cfg, foldConfig{
 		DB:       db,
 		Engine:   engine,
 		DBName:   dbName,
@@ -1762,12 +1930,9 @@ func reconstructBinlogOnly(
 			// No Since — there is no baseline instant to anchor from; fetch
 			// the whole retained binlog-only window up to cfg.At.
 		},
-		AllowGaps:          cfg.AllowGaps,
-		ArchiveFetcher:     fetcher,
-		BatchSize:          cfg.FetchBatchSize,
-		WarnEventThreshold: cfg.WarnEventThreshold,
-		Parallelism:        effectiveParallelism(cfg),
-	})
+		AllowGaps:      cfg.AllowGaps,
+		ArchiveFetcher: fetcher,
+	}))
 	if err != nil {
 		return nil, err
 	}
@@ -2000,7 +2165,10 @@ func materializeBaselineLocal(ctx context.Context, path string, tuning duckdbuti
 		os.RemoveAll(tmpDir)
 		return "", nil, fmt.Errorf("load httpfs: %w", err)
 	}
-	duckdbutil.EnableS3CredentialChain(ctx, db)
+	if err := duckdbutil.EnableS3CredentialChain(ctx, db); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, err
+	}
 	safeSrc := strings.ReplaceAll(path, "'", "''")
 	safeDst := strings.ReplaceAll(tmpPath, "'", "''")
 	copyQ := fmt.Sprintf("COPY (SELECT * FROM parquet_scan('%s')) TO '%s' (FORMAT PARQUET)", safeSrc, safeDst)

@@ -5,10 +5,13 @@ package duckdbutil
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 // execer is the subset of *sql.DB / *sql.Conn / *sql.Tx that LoadHTTPFS needs,
@@ -85,7 +88,10 @@ func ensureWritableHome() {
 // profile, expired SSO, unreachable IMDS) always warns: the SDK upload paths
 // report that state loudly and the read paths must not bury it.
 //
-// BINTRAIL_DUCKDB_NO_AWS_EXT=1 skips the setup entirely. Escape hatch for
+// BINTRAIL_DUCKDB_NO_AWS_EXT=1 skips the aws extension and the secret, NOT
+// the endpoint routing: that is applied as DuckDB global settings (SET
+// GLOBAL, scoped to the instance), and an unrouted read does not fail, it
+// reaches AWS. Escape hatch for
 // proxies that BLACKHOLE (rather than refuse) the DuckDB extension registry:
 // there the INSTALL attempt can stall for minutes, ignores context
 // cancellation, and recurs every session because failures are never cached.
@@ -94,10 +100,15 @@ func ensureWritableHome() {
 // here because every caller opens a short-lived session per operation; do
 // not reuse this on long-lived pooled sessions under expiring roles.
 //
+// Only CREDENTIALS are best-effort. A non-nil error means the session could
+// not be pointed at the right store — a bad BINTRAIL_S3_ENDPOINT, or a SET
+// that would not apply — and the caller must not read: an unrouted session
+// succeeds against AWS instead of failing.
+//
 // Call it after `INSTALL httpfs; LOAD httpfs;` on sessions that will touch
 // s3:// paths.
-func EnableS3CredentialChain(ctx context.Context, db *sql.DB) {
-	EnableS3CredentialChainRegion(ctx, db, "")
+func EnableS3CredentialChain(ctx context.Context, db *sql.DB) error {
+	return EnableS3CredentialChainRegion(ctx, db, "")
 }
 
 // EnableS3CredentialChainRegion is EnableS3CredentialChain that also pins the
@@ -109,9 +120,25 @@ func EnableS3CredentialChain(ctx context.Context, db *sql.DB) {
 // 301/PermanentRedirect regardless of that precedence (#511). region "" reproduces
 // EnableS3CredentialChain exactly (no REGION clause), so existing same-region
 // callers are unchanged.
-func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region string) {
+func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region string) error {
+	// ROUTING FIRST, and outside every gate below (#1454). Which store a read
+	// reaches is not best-effort: an unrouted session does not fail, it
+	// succeeds against AWS with the ambient credentials, and an operator whose
+	// bucket name exists in both places gets someone else's data or a
+	// "missing" baseline that is sitting in their store. The gates below can
+	// all skip the secret — the escape hatch is set, the extension will not
+	// install on an air-gapped host, the chain resolves nothing — and each of
+	// those is a plausible MinIO deployment.
+	ep, err := storage.S3EndpointFromEnv()
+	if err != nil {
+		return err
+	}
+	if err := applyS3Routing(ctx, db, region, ep); err != nil {
+		return err
+	}
+
 	if os.Getenv("BINTRAIL_DUCKDB_NO_AWS_EXT") != "" {
-		return
+		return nil
 	}
 	ensureWritableHome()
 	if _, err := db.ExecContext(ctx, "INSTALL aws; LOAD aws;"); err != nil {
@@ -122,18 +149,109 @@ func EnableS3CredentialChainRegion(ctx context.Context, db *sql.DB, region strin
 			slog.Warn("duckdb: aws extension unavailable and no AWS env keys set — profile/role credentials will NOT apply to this S3 read; expect an authentication failure",
 				"error", err)
 		}
-		return
+		return nil
 	}
-	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain"
-	if region != "" {
-		secret += ", REGION '" + strings.ReplaceAll(region, "'", "''") + "'"
-	}
-	secret += ")"
+	// The secret repeats the endpoint the settings applied above already carry.
+	// DuckDB's secrets manager can take precedence over a SET for matching
+	// paths, so a secret that named only credentials would put the endpoint
+	// back to AWS for exactly the paths it matches.
+	secret := "CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain" +
+		S3SecretClauses(region, ep) + ")"
 	// ensureWritableHome (above) has already pointed $HOME at a writable dir, so
 	// the httpfs autoload this CREATE SECRET triggers resolves its home correctly
 	// even under a homeless user.
 	if _, err := db.ExecContext(ctx, secret); err != nil {
+		// Credentials stay best-effort: a read that cannot be signed fails at
+		// the read, with the store's own error. Routing was applied above and
+		// is unaffected.
 		slog.Warn("duckdb: AWS credential chain resolved no usable credentials for S3 reads",
 			"error", err)
 	}
+	return nil
 }
+
+// applyS3Routing pins WHERE this session's s3:// requests go, as session
+// settings rather than as part of the secret, because settings need httpfs
+// alone: the aws extension is a download that an air-gapped or proxied host
+// does not get, and that host is a likely S3-compatible-store deployment.
+//
+// With no endpoint configured this does nothing at all, so an AWS session is
+// left exactly as it was: httpfs's own defaults are already correct there.
+// (The enclosing function can still refuse earlier, for a malformed
+// BINTRAIL_S3_PATH_STYLE, which is a typo worth failing on either way.)
+func applyS3Routing(ctx context.Context, db *sql.DB, region string, ep storage.S3Endpoint) error {
+	if !ep.Set() {
+		return nil
+	}
+	for _, stmt := range S3SettingStatements(region, ep) {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			// Refusing here is the point: continuing would read AWS.
+			return fmt.Errorf("route DuckDB S3 reads to %s (is httpfs loaded?): %w", ep.URL, err)
+		}
+	}
+	return nil
+}
+
+// S3SettingStatements renders the settings that decide WHERE a DuckDB
+// instance's s3:// requests go. It is the settings half of what
+// S3SecretClauses does for the secret, shared for the same reason: the
+// downloadable views.sql must configure exactly what this process configures,
+// and a hand-copied second list drifts (it did: s3_region was missing from
+// the file's copy, so a cross-region store signed against an empty region
+// whenever the reader's secret did not apply).
+//
+// SET GLOBAL, not SET: a plain SET binds to the CONNECTION that ran it, so on
+// a *sql.DB pool the next connection reads with s3_endpoint unset and goes to
+// AWS (measured: a sibling connection sees "" after SET, and the configured
+// host after SET GLOBAL). Most callers use one connection, which is exactly
+// why this would have stayed invisible.
+//
+// GLOBAL is not process-wide: it is scoped to the DuckDB INSTANCE, and every
+// caller opens its own via sql.Open (measured: two handles hold two different
+// s3_endpoint values at once). Two sessions in one process, a console daemon
+// serving several servers among them, do not interfere.
+//
+// Returns nil when no endpoint is configured: httpfs's own defaults are
+// already correct for AWS, and touching them would be a new failure mode for
+// every existing user. Statements carry no trailing semicolon.
+func S3SettingStatements(region string, ep storage.S3Endpoint) []string {
+	if !ep.Set() {
+		return nil
+	}
+	stmts := []string{
+		"SET GLOBAL s3_endpoint=" + sqlQuote(ep.Host()),
+		"SET GLOBAL s3_url_style=" + sqlQuote(ep.URLStyle()),
+		fmt.Sprintf("SET GLOBAL s3_use_ssl=%t", ep.UseSSL()),
+	}
+	if region != "" {
+		stmts = append(stmts, "SET GLOBAL s3_region="+sqlQuote(region))
+	}
+	return stmts
+}
+
+// S3SecretClauses renders the optional clauses of bintrail's S3 secret, each
+// with its leading ", ": REGION when pinned, and ENDPOINT / URL_STYLE /
+// USE_SSL when a custom endpoint is configured. Shared with the downloadable
+// views.sql so a file generated here reads the same store this process does.
+func S3SecretClauses(region string, ep storage.S3Endpoint) string {
+	var b strings.Builder
+	if region != "" {
+		b.WriteString(", REGION " + sqlQuote(region))
+	}
+	if ep.Set() {
+		b.WriteString(", ENDPOINT " + sqlQuote(ep.Host()))
+		style := "vhost"
+		if ep.PathStyle {
+			style = "path"
+		}
+		b.WriteString(", URL_STYLE " + sqlQuote(style))
+		if ep.UseSSL() {
+			b.WriteString(", USE_SSL true")
+		} else {
+			b.WriteString(", USE_SSL false")
+		}
+	}
+	return b.String()
+}
+
+func sqlQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }

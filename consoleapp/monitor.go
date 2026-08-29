@@ -349,6 +349,35 @@ func (m *monitorSupervisor) Start(ctx context.Context, e console.ServerEntry) er
 		return errors.New(scrubbed)
 	}
 
+	// A panic during provisioning would otherwise leave this entry reserved as
+	// "pending" for the life of the process, which nothing heals: Start is
+	// idempotent on "pending" (the switch above), so a later press of Start
+	// returns success and does nothing; snapshot() ages out only "running", so
+	// it never becomes stalled; Reconcile goes through Start too. The servers
+	// list counts "pending" as live and therefore offers Stop rather than
+	// Start, so the operator is not even shown the control that would help.
+	//
+	// That state is reachable only because a caller in this daemon now RECOVERS
+	// such a panic instead of dying on it: the schema-snapshot refresh reaches
+	// Start through ReloadSchema, and #1497 guards its goroutines. So make the
+	// reserved slot terminal FIRST, with the same fail() every error path here
+	// uses, and then re-panic. The re-panic is the point: it leaves the crash
+	// exactly as loud as it is today for every caller that does not guard, and
+	// it costs no diagnostics, because a stack taken by a later recover still
+	// walks the original panicking frames through a re-panic.
+	//
+	// launched scopes this to the provisioning window. m.run closes job.done on
+	// exit, so calling fail once that goroutine exists would close it twice.
+	launched := false
+	defer func() {
+		if r := recover(); r != nil {
+			if !launched {
+				_ = fail(fmt.Errorf("internal error: %v", r))
+			}
+			panic(r)
+		}
+	}()
+
 	// ── Provision the per-source index database ──────────────────────────
 	idxCfg, err := mysql.ParseDSN(e.DSN)
 	if err != nil {
@@ -576,8 +605,7 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 	// for-loop below, so this never fires mid-retry.
 	defer job.cancel()
 
-	attempt := 0
-	var crashLoopSince time.Time // first failure of the current loop; zero = healthy
+	var policy crashLoopPolicy
 	for {
 		job.set("pending", "")
 		started := time.Now()
@@ -586,23 +614,15 @@ func (m *monitorSupervisor) run(ctx context.Context, job *monitorJob, e console.
 			job.set("stopped", "")
 			return
 		}
-		if time.Since(started) > monitorHealthyReset {
-			attempt = 0
-			crashLoopSince = time.Time{}
-		}
-		if crashLoopSince.IsZero() {
-			crashLoopSince = started
-		}
 		scrubbed := config.ScrubDSNError(err, e.SourceDSN, e.DSN)
-		if looping := time.Since(crashLoopSince); looping > monitorGiveUpAfter {
+		delay, looping, giveUp := policy.failed(started, time.Now())
+		if giveUp {
 			slog.Error("monitored stream crash-looped past the give-up threshold; not retrying",
 				"server", e.Name, "entry", e.ID, "looping_for", looping.Round(time.Minute), "error", scrubbed)
 			job.set("failed", fmt.Sprintf("%s (gave up after %s of crash-looping; fix the issue, then press Start to retry)",
 				scrubbed, looping.Round(time.Minute)))
 			return
 		}
-		delay := min(monitorBackoffBase<<attempt, monitorBackoffCap)
-		attempt++
 		slog.Warn("monitored stream failed; retrying with backoff",
 			"server", e.Name, "entry", e.ID, "delay", delay, "error", scrubbed)
 		job.set("failed", scrubbed+" (retrying)")

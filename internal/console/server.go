@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -102,6 +103,11 @@ type Config struct {
 	// server's own baseline store. Wired whenever the watch daemon has a
 	// baseline supervisor (creation or refresh opt-in); nil elsewhere.
 	BaselineRestore BaselineRestorer
+	// BackupSchedules is the watch daemon's per-server backup schedule loop
+	// (#1442). Wired whenever the daemon has a baseline supervisor; nil
+	// elsewhere, where the schedule endpoints refuse with 403 and the listing
+	// reports a saved schedule as not runnable.
+	BackupSchedules BackupScheduleReporter
 	// SQLExport builds custom .sql backups (fold at a chosen instant,
 	// download as a mydumper-format dump). Wired with BaselineRestore.
 	SQLExport SQLExporter
@@ -167,6 +173,11 @@ type Config struct {
 	// daemon; zero on the standalone serve (which runs no rotation loop and
 	// hides the panel).
 	RotationDefaults RotationDefaults
+
+	// BaselineRefreshDefaults carries the daemon's baseline-refresh flag/env
+	// values, the fallback the settings panel reports when no console override
+	// is saved. Same role as RotationDefaults above.
+	BaselineRefreshDefaults BaselineRefreshDefaults
 	// Version is the running build's version string ("0.36.0", or "dev" on
 	// unversioned builds), reported in /api/capabilities so the frontend can
 	// link release artifacts (the .mcpb bundle) matching the running binary.
@@ -192,11 +203,51 @@ type RotationDefaults struct {
 	Enabled bool
 }
 
+// BaselineRefreshDefaults is the daemon-side baseline-refresh configuration,
+// surfaced to the settings panel as the fallback when nothing is saved.
+type BaselineRefreshDefaults struct {
+	// CarryForwardUnchanged is the daemon's --baseline-carry-forward-unchanged.
+	CarryForwardUnchanged bool
+	// Enabled reports whether ANY consumer of the setting is live in this
+	// daemon, which is what decides if a saved value has an effect today.
+	//
+	// Two consumers read it, and only one is the loop. The point-in-time
+	// restore folds into the same store with the same setting, and it is wired
+	// whenever a baseline supervisor exists, which --baseline-trigger alone is
+	// enough to create. Reading liveness off the refresh interval alone told an
+	// operator running --baseline-trigger that nothing was live, and then a
+	// Restore hard-linked their files. For a setting whose whole purpose is
+	// taking consent about the on-disk representation, that is the one thing
+	// the panel must not do.
+	Enabled bool
+	// Scheduled reports the narrower fact: a periodic refresh loop is running
+	// (--baseline-refresh-interval was set). Separate from Enabled because the
+	// panel's copy has to distinguish "this applies to your restores but
+	// nothing is on a timer" from "this applies to nothing until a restart".
+	Scheduled bool
+}
+
 // Server is a configured, ready-to-run console HTTP server. It holds only
 // process-global state; everything per-server (db, engine, resolver, baseline
 // gates) lives in a connManager bundle resolved per request from the
 // X-Bintrail-Server header.
 type Server struct {
+	// bucketRegions memoizes DetectBucketRegion per bucket: buildViewsInput
+	// runs on every SQL panel query, so a network round trip does not belong
+	// on that path in the steady state. A DETECTED region never expires (it is
+	// fixed for the bucket's lifetime); a failed detection is not a property of
+	// the bucket and expires after negativeRegionTTL, so a blip does not poison
+	// every file this daemon hands out until someone restarts it.
+	bucketRegionMu sync.Mutex
+	bucketRegions  map[string]bucketRegionEntry
+
+	// baselineDecimals memoizes the baseline files' column types per snapshot,
+	// for the reason above: buildViewsInput runs on every SQL panel query, and
+	// a footer read per table does not belong on that path either. See
+	// resolveBaselineDecimals.
+	baselineDecimalMu sync.Mutex
+	baselineDecimals  map[string]baselineDecimalEntry
+
 	listen     string
 	token      string
 	denyTables []query.SchemaTable
@@ -224,6 +275,9 @@ type Server struct {
 	// verifyHistory: the persisted run history, set with verifyCtrl (#1191).
 	verifyHistory   *VerifyHistory
 	baselineRestore BaselineRestorer
+	// backupSchedules: non-nil only on a watch daemon with a baseline
+	// supervisor (see Config.BackupSchedules).
+	backupSchedules BackupScheduleReporter
 	sqlExport       SQLExporter
 	baselineHistory *BaselineRunHistory
 	// telemetry: non-nil only when a long-running console wired its live
@@ -232,6 +286,9 @@ type Server struct {
 	// rotationDefaults are the daemon's --rotate-* values, the fallback GET
 	// /api/rotation reports when no console override is saved.
 	rotationDefaults RotationDefaults
+	// baselineRefreshDefaults is the fallback GET /api/baseline-refresh reports
+	// when no console override is saved.
+	baselineRefreshDefaults BaselineRefreshDefaults
 	// version is the running build's version string (Config.Version).
 	version string
 	// archiveFetcher reads one archive source for the browsing endpoints —
@@ -413,35 +470,37 @@ func New(cfg Config) (*Server, error) {
 	profileActive := cfg.ProfileActive || len(cfg.DenyTables) > 0 || len(cfg.RedactColumns) > 0
 
 	s := &Server{
-		listen:           listen,
-		token:            token,
-		denyTables:       cfg.DenyTables,
-		redactCols:       cfg.RedactColumns,
-		profileActive:    profileActive,
-		allowedHosts:     cfg.AllowedHosts,
-		monitorCtrl:      cfg.MonitorCtrl,
-		baselineCtrl:     cfg.BaselineCtrl,
-		baselineRefresh:  cfg.BaselineRefresh,
-		schemaSnapCtrl:   cfg.SchemaSnapshotCtrl,
-		verifyCtrl:       cfg.VerifyCtrl,
-		verifyHistory:    cfg.VerifyHistory,
-		baselineRestore:  cfg.BaselineRestore,
-		sqlExport:        cfg.SQLExport,
-		baselineHistory:  cfg.BaselineHistory,
-		telemetry:        cfg.Telemetry,
-		rotationDefaults: cfg.RotationDefaults,
-		version:          cfg.Version,
-		cm:               newConnManager(cfg.Registry, profileActive),
-		authPath:         authPath,
-		passwordCfg:      passwordCfg,
-		allowSetup:       cfg.AllowSetup,
-		sessions:         newSessionStore(),
-		loginLimiter:     newLoginLimiter(),
-		tlsConf:          tlsConf,
-		mcpTokenPath:     mcpTokenPath,
-		sessionProfiles:  newProfileRuleCache(),
-		sqlPanel:         cfg.SQLPanel,
-		archiveFetcher:   parquetquery.Fetch,
+		listen:                  listen,
+		token:                   token,
+		denyTables:              cfg.DenyTables,
+		redactCols:              cfg.RedactColumns,
+		profileActive:           profileActive,
+		allowedHosts:            cfg.AllowedHosts,
+		monitorCtrl:             cfg.MonitorCtrl,
+		baselineCtrl:            cfg.BaselineCtrl,
+		baselineRefresh:         cfg.BaselineRefresh,
+		schemaSnapCtrl:          cfg.SchemaSnapshotCtrl,
+		verifyCtrl:              cfg.VerifyCtrl,
+		verifyHistory:           cfg.VerifyHistory,
+		baselineRestore:         cfg.BaselineRestore,
+		backupSchedules:         cfg.BackupSchedules,
+		sqlExport:               cfg.SQLExport,
+		baselineHistory:         cfg.BaselineHistory,
+		telemetry:               cfg.Telemetry,
+		rotationDefaults:        cfg.RotationDefaults,
+		baselineRefreshDefaults: cfg.BaselineRefreshDefaults,
+		version:                 cfg.Version,
+		cm:                      newConnManager(cfg.Registry, profileActive),
+		authPath:                authPath,
+		passwordCfg:             passwordCfg,
+		allowSetup:              cfg.AllowSetup,
+		sessions:                newSessionStore(),
+		loginLimiter:            newLoginLimiter(),
+		tlsConf:                 tlsConf,
+		mcpTokenPath:            mcpTokenPath,
+		sessionProfiles:         newProfileRuleCache(),
+		sqlPanel:                cfg.SQLPanel,
+		archiveFetcher:          parquetquery.Fetch,
 	}
 	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot
@@ -573,6 +632,10 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/servers/{id}/baseline", s.handleBaselineStatus)
 	api.HandleFunc("POST /api/servers/{id}/baseline/restore", s.recordAction("baseline-restore", s.handleBaselineRestore))
 	api.HandleFunc("GET /api/servers/{id}/baseline/restore", s.handleBaselineRestoreStatus)
+	// Per-server backup schedule (#1442): save or remove the timer. Its state
+	// rides on GET /api/baselines. 403 unless this process runs the loop.
+	api.HandleFunc("PUT /api/servers/{id}/backup-schedule", s.recordAction("backup-schedule", s.handleBackupScheduleUpdate))
+	api.HandleFunc("DELETE /api/servers/{id}/backup-schedule", s.recordAction("backup-schedule", s.handleBackupScheduleDelete))
 	api.HandleFunc("POST /api/servers/{id}/sql-export", s.recordAction("sql-export", s.handleSQLExportTrigger))
 	api.HandleFunc("GET /api/servers/{id}/sql-export", s.handleSQLExportStatus)
 	api.HandleFunc("GET /api/servers/{id}/sql-export/download", s.handleSQLExportDownload)
@@ -598,6 +661,10 @@ func (s *Server) buildHandler() http.Handler {
 	// the loop that consumes it).
 	api.HandleFunc("GET /api/rotation", s.handleRotationGet)
 	api.HandleFunc("PUT /api/rotation", s.handleRotationUpdate)
+	// Global baseline-refresh policy. Same split as rotation: read the
+	// effective settings, PUT an override the running loop picks up next cycle.
+	api.HandleFunc("GET /api/baseline-refresh", s.handleBaselineRefreshGet)
+	api.HandleFunc("PUT /api/baseline-refresh", s.handleBaselineRefreshUpdate)
 	// Authenticated auth verbs. Registered on the inner mux so a forgotten
 	// root registration breaks login, never security (ServeMux specificity
 	// keeps them under the tokenMiddleware-wrapped /api/ catch-all).

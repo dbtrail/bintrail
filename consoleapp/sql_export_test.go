@@ -294,3 +294,51 @@ func TestSQLExportBootSweep(t *testing.T) {
 		t.Fatalf("stale sql-export staging survived construction (err=%v)", err)
 	}
 }
+
+// TestSQLExportFoldConfig_sharesTheDaemonBounds pins the SQL export build to
+// the same in-daemon posture as the refresh and restore folds.
+//
+// This build is operator-triggered, which is exactly why it is easy to reason
+// about wrongly: the click is attended, the fold that follows is not. It runs
+// in the background of the capture process and its warnings go to the daemon
+// log, so it needs the bound and the warning for the same reason the periodic
+// refresh does.
+//
+// Both wanted values are non-zero, which is what makes this discriminate:
+// deleting either assignment leaves the field at its zero value and fails here.
+func TestSQLExportFoldConfig_sharesTheDaemonBounds(t *testing.T) {
+	cfg := sqlExportFoldConfig(console.SQLExportRequest{
+		ServerID: "s1", IndexDSN: "dsn", At: time.Now(),
+	}, "/build", []string{"shop.orders"})
+
+	if cfg.Parallelism == 0 {
+		t.Error("Parallelism left at zero: the export would inherit runtime.NumCPU() " +
+			"and scale its peak memory with the host, inside the capture process")
+	}
+	if cfg.Parallelism != daemonFoldParallelism {
+		t.Errorf("Parallelism = %d, want %d (the shared in-daemon bound)",
+			cfg.Parallelism, daemonFoldParallelism)
+	}
+	if cfg.WarnEventThreshold == 0 {
+		t.Error("WarnEventThreshold left at zero: shouldWarnEvents is " +
+			"`threshold > 0 && n > threshold`, so this fold would never warn")
+	}
+	if cfg.WarnEventThreshold != daemonFoldWarnEventThreshold {
+		t.Errorf("WarnEventThreshold = %d, want %d (the shared in-daemon bound)",
+			cfg.WarnEventThreshold, daemonFoldWarnEventThreshold)
+	}
+	if cfg.RemediationHint == "" {
+		t.Error("RemediationHint left empty: the warning falls back to the CLI wording, " +
+			"which names --at / --parallelism / --warn-event-threshold. bintrail-console " +
+			"registers none of them, so the operator is sent after flags that do not exist")
+	}
+	if cfg.RemediationHint != daemonFoldRemediation {
+		t.Errorf("RemediationHint = %q, want the shared constant", cfg.RemediationHint)
+	}
+
+	// The engine's fail-closed contract for an artifact the operator will load.
+	if cfg.AllowGaps {
+		t.Error("AllowGaps = true: a dump built over a known capture gap would " +
+			"silently miss rows and still look like a complete backup")
+	}
+}

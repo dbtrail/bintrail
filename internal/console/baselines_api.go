@@ -53,6 +53,13 @@ type baselinesResponse struct {
 	// it answers — "is this snapshot list going to keep moving on its own?" — is
 	// only meaningful next to the list.
 	Refresh *BaselineStatus `json:"refresh,omitempty"`
+	// Schedule is the selected server's backup schedule (#1442) and what it
+	// last did, omitted when the server has none. Here for the same reason
+	// Refresh is: "will this list keep moving on its own" belongs next to the
+	// list. Present even on a daemon that cannot run it, with Runnable false
+	// and the reason, because a saved schedule that nothing executes is the
+	// silent failure this feature exists to prevent.
+	Schedule *backupScheduleDTO `json:"schedule,omitempty"`
 	// Staleness is the panel headline: the worst verdict across each table's
 	// NEWEST snapshot (#1193). An old superseded snapshot being past coverage
 	// is routine — grading every row red on a healthy retention cadence would
@@ -103,6 +110,9 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 		if st := s.baselineRefresh.RefreshStatus(s.selectedServerID(r)); st.State != "idle" {
 			resp.Refresh = &st
 		}
+	}
+	if e, ok := s.cm.reg.Get(s.selectedServerID(r)); ok && e.BackupSchedule != nil {
+		resp.Schedule = s.backupScheduleDTO(r.Context(), e, time.Now().UTC())
 	}
 	if b.baselineSrc == "" {
 		writeJSON(w, http.StatusOK, resp)

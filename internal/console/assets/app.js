@@ -3545,9 +3545,10 @@ async function renderStorage() {
   // instead of one error wiping the whole page. (A 401 inside api() raises the
   // sign-in gate and bumps serverGen, so the stale-render guard below bails.)
   const asErr = (err) => ({ error: (err && err.message) || String(err) });
-  const [serversRes, rotation, storage, baselines, telemetry] = await Promise.all([
+  const [serversRes, rotation, backupRefresh, storage, baselines, telemetry] = await Promise.all([
     api("/api/servers").catch(asErr),
     api("/api/rotation").catch(asErr),
+    api("/api/baseline-refresh").catch(asErr),
     api("/api/storage").catch(asErr),
     api("/api/baselines").catch(asErr),
     api("/api/telemetry").catch(asErr),
@@ -3556,13 +3557,13 @@ async function renderStorage() {
   // Same guard as renderOverview: a throw inside the build must show an
   // error, never leave the "Loading…" skeleton up forever.
   try {
-    buildStorage(serversRes, rotation, storage, baselines, telemetry);
+    buildStorage(serversRes, rotation, backupRefresh, storage, baselines, telemetry);
   } catch (err) {
     const v = VIEW(); clear(v); v.append(pageHead("Storage", null)); renderError(v, err);
   }
 }
 
-function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
+function buildStorage(serversRes, rotation, backupRefresh, storage, baselines, telemetry) {
   // serversRes is the raw /api/servers payload or {error} — archivingPanel
   // must be able to tell "failed to load" from "genuinely no sources", or a
   // transient 500 would render the affirmative "No monitored sources yet" lie.
@@ -3577,6 +3578,7 @@ function buildStorage(serversRes, rotation, storage, baselines, telemetry) {
   const cards = el("div", { class: "cards" });
   const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
   cards.append(rotationCard(rotation));
+  cards.append(backupRefreshCard(backupRefresh));
   cards.append(credentialsCard(storage));
   cards.append(telemetryCard(telemetry));
   if (capsCache.views) cards.append(duckdbCard());
@@ -3641,6 +3643,12 @@ async function renderBaselines() {
     // so the rows below can carry only what varies between snapshots.
     const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
     v.append(baselineContextStrip(baselines, cur));
+    // The backup schedule (#1442) sits right under the facts about the
+    // collection: it is the answer to "will this list keep growing on its
+    // own", and a failed scheduled run has to be visible without opening
+    // anything.
+    const scheduleCard = backupScheduleCard(cur, baselines);
+    if (scheduleCard) v.append(scheduleCard);
     // A visible in-progress region (mirrors the verification page): while a
     // backup is being created or restored, the page must look like a page
     // doing work, not a stale list.
@@ -3708,11 +3716,93 @@ function rotationCard(rot) {
   kvRow(card, "retention", rot.retain);
   kvRow(card, "interval", rot.interval);
   kvRow(card, "future partitions", rot.add_future);
-  kvRow(card, "policy", rot.source === "override" ? "console override (live)" : "daemon defaults");
+  kvRow(card, "policy", rot.source === "override"
+    ? ("console override" + (rot.enabled ? " (live)" : ""))
+    : "daemon defaults");
   if (!rot.enabled) card.append(el("p", { class: "form-hint", text: "Rotation is turned off. Changes you save here won't take effect until the daemon restarts." }));
   card.append(el("div", { class: "stg-cardfoot" },
     el("button", { class: "btn btn-sm", type: "button", text: "Edit rotation…", onclick: showRotationDialog })));
   return card;
+}
+
+// backupRefreshCard exposes the one setting the automatic backup refresh has
+// that is safe to change while it runs. The schedule itself stays a daemon
+// flag, because starting a loop that was never booted needs a restart.
+//
+// The saving is real but it is not free of consequences, so the card states
+// them where the decision is made rather than in a doc nobody opens: where the
+// filesystem allows it, reusing a file leaves two backups sharing the same
+// bytes on disk, and after that, deleting the older backup does not give the
+// space back while the newer one still points at it.
+function backupRefreshCard(br) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Automatic backup refresh" }));
+  if (!br || br.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not load the refresh settings" + (br && br.error ? ": " + br.error : ".") }));
+    return card;
+  }
+  const on = !!br.carry_forward_unchanged;
+  kvRow(card, "reuse files for unchanged tables", on ? "on" : "off");
+  // "(live)" is gated on enabled because the card also prints "nothing runs
+  // yet" three lines down, and one card must not make two opposite claims
+  // about the running system.
+  kvRow(card, "set by", br.source === "override"
+    ? (br.enabled ? "this page (live)" : "this page (not running yet)")
+    : "daemon default");
+  // Three states, not two. A daemon started with --baseline-trigger and no
+  // refresh schedule still applies this to restores, so calling it dormant
+  // there would let an operator hard link their files right after being told
+  // nothing runs.
+  card.append(el("p", { class: "form-hint", text: on
+    ? "A table with no changes keeps its previous file instead of being written again. Where the filesystem allows it the two backups then share the same bytes on disk, so deleting the older one frees nothing while the newer one still uses it."
+    : "Every table is written again on each refresh, even when nothing in it changed. Turning this on skips that work for unchanged tables. (CLI: --baseline-carry-forward-unchanged)" }));
+  if (!br.enabled) {
+    card.append(el("p", { class: "form-hint", text: "Nothing uses this setting yet. It applies once the daemon runs automatic refreshes, scheduled backups or point in time restores." }));
+  } else if (!br.scheduled) {
+    card.append(el("p", { class: "form-hint", text: "This applies to restores and to the backup schedules you set on the Backups page. No daemon-wide refresh interval is set. (CLI: --baseline-refresh-interval)" }));
+  }
+  const foot = el("div", { class: "stg-cardfoot" },
+    el("button", {
+      class: "btn btn-sm", type: "button",
+      text: on ? "Turn off reuse" : "Turn on reuse",
+      onclick: () => saveBackupRefresh({ carry_forward_unchanged: !on }),
+    }));
+  // Only offered once something is saved here, because that is the only state
+  // it changes. Without it the toggle is a one-way door: the first save wins
+  // over the daemon flag forever, and an operator who set the flag on the
+  // command line has no way to hand the decision back short of editing the
+  // registry file by hand.
+  if (br.source === "override") {
+    foot.append(el("button", {
+      class: "btn btn-sm btn-ghost", type: "button",
+      text: "Use the daemon setting",
+      onclick: () => saveBackupRefresh({ use_default: true }),
+    }));
+  }
+  card.append(foot);
+  return card;
+}
+
+// saveBackupRefresh writes the setting and re-renders, so the card always shows
+// what the daemon will actually do rather than what was clicked.
+//
+// The confirmation is built from the RESPONSE, not from what was clicked or
+// from what the card was holding when it rendered. Those two can disagree with
+// the daemon: "Use the daemon setting" does not know in advance what the flag
+// says, and a card rendered before a restart carries a stale schedule. The PUT
+// already echoes the effective state, so reading it costs nothing.
+async function saveBackupRefresh(body) {
+  let now;
+  try {
+    now = await api("/api/baseline-refresh", { method: "PUT", body });
+  } catch (err) {
+    toastError("Could not save: " + ((err && err.message) || err));
+    return;
+  }
+  const on = !!(now && now.carry_forward_unchanged);
+  toast((now && now.enabled)
+    ? (on ? "Unchanged tables will be reused" : "Every table will be written again")
+    : "Saved. Nothing uses this setting yet, so it applies once something does.");
+  renderRoute();
 }
 
 function credentialsCard(storage) {
@@ -3762,7 +3852,7 @@ function duckdbCard() {
     try {
       const sql = await apiText("/api/views.sql");
       downloadBlob("views.sql", sql, "text/plain");
-      toast("views.sql downloaded. Run it with: duckdb lake.db < views.sql");
+      toast("views.sql downloaded. In DuckDB run .read views.sql, once per session.");
     } catch (err) {
       toastError("could not generate views: " + ((err && err.message) || err));
     } finally {
@@ -3858,7 +3948,8 @@ async function runSQL(sql, ui) {
     }
     const data = JSON.parse(text);
     statusLine.textContent = data.row_count + " row" + (data.row_count === 1 ? "" : "s") +
-      " in " + data.elapsed_ms + " ms" + (data.truncated ? " (truncated)" : "");
+      " in " + data.elapsed_ms + " ms" + (data.truncated ? " (truncated)" : "") +
+      ((data.warnings && data.warnings.length) ? ". " + data.warnings.join(". ") : "");
     renderSQLResult(results, data);
   } catch (err) {
     if (err && err.name === "AbortError") { statusLine.textContent = "canceled"; return; }
@@ -4024,7 +4115,17 @@ function baselineRefreshNote(rf) {
       text = "Automatic refresh running" + (rf.since ? " since " + utcLabel(rf.since) : "") + "…";
       break;
     case "succeeded":
-      text = "Automatic refresh: " + (rf.tables || 0) + " table(s) refreshed" + (when ? " at " + when : "") + ".";
+      // The two numbers PARTITION the run: rf.tables is every table, rf.carried
+      // the subset that was reused, so "refreshed" has to be the difference.
+      // Printing the total next to the subset read as "5 refreshed, 5 of them
+      // reused", which asks the operator to subtract and contradicts the rule
+      // the CLI summary follows: a reused table is not a refreshed one, and
+      // which tables actually cost a rewrite is the number worth seeing.
+      const reused = rf.carried || 0;
+      const rewritten = Math.max(0, (rf.tables || 0) - reused);
+      text = "Automatic refresh" + (when ? " at " + when : "") + ": " +
+        rewritten + " table(s) refreshed" +
+        (reused ? ", " + reused + " unchanged and reused" : "") + ".";
       break;
     case "failed":
       text = "Automatic refresh published nothing" + (when ? " at " + when : "") +
@@ -4442,6 +4543,23 @@ async function watchBackupRuns(id, vgen, kinds) {
 // A fold failure is per-table and errors.Join'd, so last_error is usually
 // MULTI-LINE: the patterns are global and never cross a line, or one
 // table's remedy would eat the next table's identity.
+// backupsPer30Days mirrors ParsedBackupSchedule.BackupsPer30Days for the
+// grammar the form accepts (a whole number of m, h or d); 0 when it cannot
+// be read, and the server's refusal then says why.
+function backupsPer30Days(every) {
+  const m = /^\s*(\d+)\s*([mhd])\s*$/.exec(String(every || ""));
+  if (!m) return 0;
+  const minutes = Number(m[1]) * ({ m: 1, h: 60, d: 1440 })[m[2]];
+  return minutes > 0 ? Math.floor(30 * 1440 / minutes) : 0;
+}
+
+// plainWords is the copy rule for reasons the daemon assembles at runtime:
+// they never appear in this file, so the source guard cannot see an em dash
+// in them, and one does ride in on fold errors.
+function plainWords(msg) {
+  return String(msg == null ? "" : msg).replace(/\u2014/g, "-");
+}
+
 function backupFoldError(msg) {
   let out = String(msg)
     .replace(/;?[ \t]*pass --allow-gaps to proceed[^.;\n]*/g,
@@ -4450,6 +4568,212 @@ function backupFoldError(msg) {
     .replace(/\u2014/g, "-");
   if (!/[.!?]$/.test(out.trim())) out = out.trim() + ".";
   return out;
+}
+
+// backupScheduleCard (#1442): the per-server backup timer. The summary line
+// carries the schedule and the next run so the state reads without opening
+// the card; the body is the form plus what the schedule last did. A failed
+// or skipped scheduled run opens the card and says so in red: a schedule
+// that fails quietly is worse than none.
+//
+// The operator picks WHEN. How each run is made (a full backup from the
+// database, or updating the latest backup from the recorded changes) is the
+// daemon's call per run, and the card SAYS which one comes next and why, so
+// nobody has to understand the machinery to schedule a backup.
+//
+// Only the FORM is gated on the capability. A saved schedule is rendered
+// whenever the listing carries one, capability or not: a daemon restarted
+// with every backup feature off still has the schedule in its file, the API
+// reports it as not runnable with the reason, and hiding the card there
+// would hide exactly the message this feature exists to show.
+function backupScheduleCard(cur, b) {
+  if (!cur || !cur.id || cur.kind !== "registry") return null;
+  if (!b || b.error) return null;
+  const sch = b.schedule || null;
+  const canEdit = !!capsCache.backup_schedule;
+  if (!sch && !canEdit) return null;
+  const details = el("details", { class: "form-advanced bk-restore bk-schedule" });
+  const summary = el("summary", { class: "form-adv-summary" });
+  details.append(summary);
+  const body = el("div", { class: "bk-restore-body" });
+
+  // Summary: one line an operator can read in passing.
+  if (!sch) {
+    summary.textContent = "Scheduled backups: none";
+  } else {
+    let line = "Scheduled backups: every " + sch.every + " at " + sch.at + " UTC.";
+    if (sch.runnable && sch.next_run) line += " Next: " + utcLabel(sch.next_run) + ".";
+    if (!sch.runnable) line += " Cannot run: " + plainWords(sch.reason || "unknown reason");
+    summary.textContent = line;
+  }
+
+  body.append(el("p", { class: "form-hint", text:
+    "Takes a backup on a fixed timetable while the daemon runs, so the list below keeps growing without anyone running a command. " +
+    "When it can, the daemon updates the latest backup from the recorded changes, with no load on your database; " +
+    "when it cannot (no backup yet, backups kept in S3, a gap in the recorded changes) it takes a full backup from your database, the same job as Create backup. " +
+    "Missed times are not made up: a backup due while the daemon was stopped waits for the next one." }));
+
+  if (!canEdit) {
+    // The read-only console, or a daemon with every backup feature off:
+    // nothing here can change the schedule, and the summary already says
+    // why it is not running.
+    body.append(el("p", { class: "form-hint", text:
+      "This schedule can be changed from the watch daemon's console (bintrail-console watch) once its backup features are on." }));
+    details.open = true;
+    details.append(body);
+    return details;
+  }
+
+  // The form. Prefilled from the saved schedule, else a sane daily default.
+  const every = el("input", { class: "in", type: "text", spellcheck: "false", placeholder: "1d", "aria-label": "Every" });
+  every.value = sch ? sch.every : "1d";
+  every.style.maxWidth = "90px";
+  const at = el("input", { class: "in", type: "text", spellcheck: "false", placeholder: "03:00", "aria-label": "At (UTC)" });
+  at.value = sch ? sch.at : "03:00";
+  at.style.maxWidth = "90px";
+  const save = el("button", { class: "btn", type: "button", text: sch ? "Save schedule" : "Add schedule" });
+  const msg = el("p", { class: "form-msg err" });
+  msg.hidden = true;
+  save.onclick = () => saveBackupSchedule(cur.id, { every: every.value.trim(), at: at.value.trim() }, save, msg);
+  const row = el("div", { class: "bk-restore-row" },
+    el("span", { class: "form-hint", text: "every" }), every,
+    el("span", { class: "form-hint", text: "at" }), at,
+    el("span", { class: "form-hint", text: "UTC" }), save);
+  if (sch) {
+    const remove = el("button", { class: "btn btn-sm btn-ghost", type: "button", text: "Remove schedule" });
+    remove.onclick = () => removeBackupSchedule(cur.id, remove, msg);
+    row.append(remove);
+  }
+  body.append(row, el("p", { class: "form-hint", text:
+    "Every: minutes, hours or days (30m, 6h, 1d), at least 15m. At: the UTC time the timetable lines up on; for whole " +
+    "days (1d, 7d) it is the time of day the backup runs." }), msg);
+  // The rate, before the disk finds out: every run is a full copy of every
+  // table, and backups kept only on this machine are never removed on their
+  // own (the daemon prunes only what it confirmed durable in S3). Same
+  // number the daemon logs at save and at boot.
+  const rate = el("p", { class: "form-hint" });
+  const showRate = () => {
+    const n = backupsPer30Days(every.value);
+    if (!n) { rate.hidden = true; return; }
+    rate.hidden = false;
+    rate.textContent = "About " + n + " backup" + (n === 1 ? "" : "s") + " every 30 days at this rate, each a full copy of every table." +
+      (cur.baseline_s3 ? "" : " Backups kept only on this machine are never removed automatically; make sure the disk has room.");
+  };
+  every.addEventListener("input", showRate);
+  showRate();
+  body.append(rate);
+
+  // What the schedule will do next, and what it last did. The skip is
+  // shown when it is the newest fact: a slot that could not start after
+  // the last good run is exactly what the operator needs to see.
+  if (sch) {
+    let alarm = false;
+    if (sch.runnable && sch.next_method_error) {
+      // Runnable in principle, but the next slot will be skipped as things
+      // stand: said in red BEFORE the slot, not discovered after it.
+      alarm = true;
+      body.append(el("p", { class: "form-msg err", text:
+        "The next run cannot start: " + plainWords(sch.next_method_error) + (/[.!?]$/.test(sch.next_method_error) ? "" : ".") }));
+    } else if (sch.runnable && sch.next_method) {
+      const how = sch.next_method === "refresh" ? "will update the latest backup from the recorded changes" : "will take a full backup from your database";
+      body.append(el("p", { class: "form-hint", text:
+        "Next run " + how + (sch.next_method_why ? " (" + sch.next_method_why + ")." : ".") }));
+    }
+    if (sch.history_unavailable) {
+      // Without the run history only what this daemon started since boot is
+      // known; "it has not run yet" would be a guess, so say what is missing.
+      alarm = true;
+      body.append(el("p", { class: "form-msg err", text:
+        "The backup run history could not be opened, so runs from before this daemon started are not shown. Check the daemon log." }));
+    }
+    if (sch.running) {
+      body.append(el("p", { class: "form-hint", text: "A scheduled backup is running now." }));
+    }
+    const run = sch.last_run, skip = sch.last_skipped, fb = sch.last_fallback;
+    if (run) {
+      const when = utcLabel(run.finished_at || run.started_at || "");
+      const what = run.method === "refresh" ? "update from the recorded changes" : "full backup";
+      if (run.ok) {
+        const reused = run.carried || 0;
+        body.append(el("p", { class: "form-hint", text:
+          "Last scheduled backup finished " + when + " (" + what + "): " + (run.tables || 0) + " table(s)" +
+          (reused ? ", " + reused + " unchanged and reused" : "") +
+          (run.uploaded ? ", " + run.uploaded + " file(s) uploaded" : "") + "." }));
+      } else {
+        alarm = true;
+        body.append(el("p", { class: "form-msg err", text:
+          "Last scheduled backup failed " + when + " (" + what + "): " + backupFoldError(run.error || "unknown error") +
+          " Nothing was overwritten; the next scheduled run tries again." }));
+      }
+    }
+    if (fb) {
+      // Always shown while the daemon remembers it, in red: an update that
+      // is refused at every slot means the no-load half of this feature is
+      // dead and production is being read in full instead, and a green
+      // "last backup finished" line would hide exactly that. A crash is
+      // named as one, not as a refusal. The daemon records a fallback only
+      // once the full backup actually started, so "started" is a fact.
+      alarm = true;
+      const crashed = /^internal error/.test(fb.reason || "");
+      const why = backupFoldError(crashed ? fb.reason.replace(/^internal error:?\s*/, "") : fb.reason);
+      body.append(el("p", { class: "form-msg err", text:
+        "At " + utcLabel(fb.at) + " the update from the recorded changes " + (crashed ? "hit an internal error" : "was refused") +
+        " (" + why + ") so a full backup was started instead. If this repeats, the recorded changes cannot be used for this server; check the reason." }));
+    }
+    // >= not >: the stamps are whole seconds, and a skip recorded in the
+    // same second a run finished (the fallback's collision case) is the
+    // newer fact, not an older one.
+    if (skip && (!run || skip.at >= (run.finished_at || ""))) {
+      alarm = true;
+      // backupFoldError, not plainWords: a fold error rides in here too,
+      // with its bare --allow-gaps hint.
+      body.append(el("p", { class: "form-msg err", text:
+        "Did not run at " + utcLabel(skip.at) + ": " + backupFoldError(skip.reason) +
+        " It will try again at the next scheduled time." }));
+    }
+    if (!run && !skip && !sch.running && !sch.history_unavailable) {
+      body.append(el("p", { class: "form-hint", text: "It has not run yet." }));
+    }
+    if (!sch.runnable || alarm) details.open = true;
+  }
+  details.append(body);
+  return details;
+}
+
+async function saveBackupSchedule(id, sched, btn, msgEl) {
+  msgEl.hidden = true;
+  btn.disabled = true;
+  let saved;
+  try {
+    saved = await api("/api/servers/" + encodeURIComponent(id) + "/backup-schedule", { method: "PUT", body: sched });
+  } catch (err) {
+    msgEl.textContent = (err && err.message) || String(err);
+    msgEl.hidden = false;
+    btn.disabled = false;
+    return;
+  }
+  btn.disabled = false;
+  // The response already knows whether the next slot can start; a toast
+  // promising a run above a red line saying it cannot would be a lie.
+  const next = saved && saved.schedule;
+  toast(next && next.next_method_error ? "Backup schedule saved, but the next run cannot start yet. See the reason on the page."
+    : "Backup schedule saved. It runs at the next scheduled time.");
+  if (location.pathname === "/baselines") renderBaselines();
+}
+
+async function removeBackupSchedule(id, btn, msgEl) {
+  msgEl.hidden = true;
+  btn.disabled = true;
+  try {
+    await api("/api/servers/" + encodeURIComponent(id) + "/backup-schedule", { method: "DELETE" });
+  } catch (err) {
+    msgEl.textContent = (err && err.message) || String(err);
+    msgEl.hidden = false;
+    btn.disabled = false;
+    return;
+  }
+  toast("Backup schedule removed.");
+  if (location.pathname === "/baselines") renderBaselines();
 }
 
 // backupRestoreCard offers the point-in-time restore: pick a past moment, get
@@ -4484,8 +4808,12 @@ function backupRestoreCard(cur, b, restoreSt) {
       "Last restore published nothing: " + backupFoldError(rst.last_error || "unknown error") + " Nothing was overwritten." }));
     details.open = true;
   } else if (rst && rst.state === "succeeded") {
+    // The reused count belongs here for the same reason it belongs on the
+    // refresh note: a restore consumes the same reuse setting, and without the
+    // number nothing on this page confirms the setting did anything.
     body.append(el("p", { class: "form-hint", text:
-      "Last restore finished" + (rst.at ? ": the backup at " + utcLabel(rst.at) : "") + " is in the list below." }));
+      "Last restore finished" + (rst.at ? ": the backup at " + utcLabel(rst.at) : "") + " is in the list below." +
+      (rst.carried ? " " + rst.carried + " table(s) reused an unchanged file." : "") }));
   }
   details.append(body);
   return details;

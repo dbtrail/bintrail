@@ -85,9 +85,9 @@ func init() {
 }
 
 // resolveAuthPath applies flag > env > default for the auth-file location.
-// Every error path downstream prints the RESOLVED path: in containers the
-// default falls back to an unwritable relative ./.config when the process
-// user has no home, and the path is the only way to see that.
+// Every error path downstream prints the RESOLVED path: with no home
+// directory the default anchors beside the working directory instead of a
+// config directory, and the path is the only way to see that.
 func resolveAuthPath(cmd *cobra.Command) string {
 	cli.LoadEnvFile()
 	if usrAuthFile != "" {

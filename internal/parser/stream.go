@@ -483,7 +483,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			if ctx.Err() != nil {
 				return nil // context cancelled — graceful shutdown
 			}
-			return err
+			return WrapReplicationError(err)
 		}
 
 		// T1 (#1223): the moment the replication client delivered this event.

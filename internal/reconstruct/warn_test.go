@@ -31,7 +31,7 @@ func TestMaybeWarnEventVolume(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			t.Cleanup(func() { slog.SetDefault(prev) })
 
-			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, 1)
+			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, 1, "")
 			out := buf.String()
 
 			if !tc.wantWarn {
@@ -83,7 +83,7 @@ func TestMaybeWarnEventVolume_scaledByParallelism(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			t.Cleanup(func() { slog.SetDefault(prev) })
 
-			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, tc.parallelism)
+			maybeWarnEventVolume("db", "orders", int64(tc.n), tc.threshold, tc.parallelism, "")
 			out := buf.String()
 
 			if !tc.wantWarn {
@@ -183,4 +183,112 @@ func TestShouldWarnEvents(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMaybeWarnEventVolume_remediation pins WHOSE advice the warning carries.
+//
+// The default names --at / --parallelism / --warn-event-threshold, which is
+// correct for the attended CLI commands that register them and wrong on
+// bintrail-console, which registers none of the three. A warning that tells an
+// operator to lower a flag their binary does not have is worse than silence: it
+// sends them looking for something that is not there. So a caller on such a
+// surface supplies its own, and that substitution is what this pins.
+func TestMaybeWarnEventVolume_remediation(t *testing.T) {
+	capture := func(remediation string) string {
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+		// n over threshold at parallelism 1, so the warning always fires and
+		// the test discriminates on the hint rather than on whether it emitted.
+		maybeWarnEventVolume("db", "orders", 100, 10, 1, remediation)
+		return buf.String()
+	}
+
+	t.Run("empty falls back to the CLI wording", func(t *testing.T) {
+		out := capture("")
+		// Every knob, not just one: an assertion on a single flag stays green
+		// while the others are edited away, and the attended commands rely on
+		// the whole list. Each name below is registered by internal/cli or
+		// cliapp today; drop one there and drop it here in the same change.
+		for _, flag := range []string{"--at", "--parallelism", "--warn-event-threshold", "BINTRAIL_RECONSTRUCT_WARN_EVENTS"} {
+			if !strings.Contains(out, flag) {
+				t.Errorf("default hint no longer names %s; the attended commands rely on it.\ngot: %s", flag, out)
+			}
+		}
+	})
+
+	t.Run("a caller-supplied hint replaces it entirely", func(t *testing.T) {
+		out := capture("shorten the refresh interval, or refresh fewer tables")
+		if !strings.Contains(out, "shorten the refresh interval") {
+			t.Errorf("caller hint not used.\ngot: %s", out)
+		}
+		// The point of the field: the flags must be GONE, not merely joined by
+		// the caller's text. Asserting only that the new text appears would
+		// pass while still sending the operator after a flag that is absent.
+		for _, flag := range []string{"--at", "--parallelism", "--warn-event-threshold", "BINTRAIL_RECONSTRUCT_WARN_EVENTS"} {
+			if strings.Contains(out, flag) {
+				t.Errorf("hint still names %s, which bintrail-console does not register.\ngot: %s", flag, out)
+			}
+		}
+	})
+}
+
+// TestWithFoldBudgets pins the SEAM, which is where this repo's defects live.
+//
+// Every budget a caller sets on FullTableConfig has to survive the translation
+// into the foldConfig the fold actually runs with. Before this helper existed
+// those four assignments were written out at each foldEventWindow call site,
+// and deleting one line at EITHER site reverted the budget with the whole test
+// suite green, because nothing drives a FullTableConfig through foldConfig into
+// the warning. Setting the field and READING it are different claims; the
+// config-tier tests in consoleapp only ever made the first.
+//
+// Every wanted value below is distinct and non-zero, so a helper that copied
+// the wrong field, or none, cannot pass by coincidence.
+func TestWithFoldBudgets(t *testing.T) {
+	cfg := FullTableConfig{
+		FetchBatchSize:     4242,
+		WarnEventThreshold: 777_777,
+		Parallelism:        3,
+		Tables:             []string{"a.one", "a.two", "a.three", "a.four"},
+		RemediationHint:    "do the thing this binary can actually do",
+	}
+	// A non-empty starting foldConfig: the helper must OVERWRITE the budgets,
+	// not merely fill in blanks, or a caller that pre-set a stale value keeps it.
+	got := withFoldBudgets(cfg, foldConfig{
+		Schema: "shop", Table: "orders",
+		BatchSize: 1, WarnEventThreshold: 1, Parallelism: 1, RemediationHint: "stale",
+	})
+
+	if got.BatchSize != 4242 {
+		t.Errorf("BatchSize = %d, want 4242", got.BatchSize)
+	}
+	if got.WarnEventThreshold != 777_777 {
+		t.Errorf("WarnEventThreshold = %d, want 777777", got.WarnEventThreshold)
+	}
+	if got.RemediationHint != cfg.RemediationHint {
+		t.Errorf("RemediationHint = %q, want %q.\nThis is the field whose whole point is that the "+
+			"daemon's warning must not name CLI flags that binary does not register.",
+			got.RemediationHint, cfg.RemediationHint)
+	}
+	// The DIVISOR, not the raw field. 4 tables against Parallelism 3 leaves 3.
+	if got.Parallelism != 3 {
+		t.Errorf("Parallelism = %d, want 3 (effectiveParallelism, not cfg.Parallelism verbatim)", got.Parallelism)
+	}
+	// Fields the helper has no business touching must survive untouched.
+	if got.Schema != "shop" || got.Table != "orders" {
+		t.Errorf("helper clobbered non-budget fields: schema=%q table=%q", got.Schema, got.Table)
+	}
+
+	t.Run("clamps the divisor to the table count", func(t *testing.T) {
+		// One table cannot run concurrently with anything, so dividing the
+		// threshold by a parallelism it can never reach would warn early.
+		got := withFoldBudgets(FullTableConfig{
+			Parallelism: 8, Tables: []string{"a.one"}, WarnEventThreshold: 5_000_000,
+		}, foldConfig{})
+		if got.Parallelism != 1 {
+			t.Errorf("Parallelism = %d, want 1 for a single-table run", got.Parallelism)
+		}
+	})
 }

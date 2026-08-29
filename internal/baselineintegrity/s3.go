@@ -170,6 +170,14 @@ func ValidateS3File(ctx context.Context, s3Path string) error {
 				"snapshot", snapshotLabel, "error", err)
 			return nil
 		}
+		if errors.Is(err, storage.ErrS3EndpointConfig) {
+			// A malformed BINTRAIL_S3_ENDPOINT is a configuration fault, not a
+			// storage one: it is knowable before any byte moves and says
+			// nothing about whether the data is intact. Degrading here would
+			// switch integrity validation off for a TTL and blame sidecar rot
+			// for a typo, so this one refuses instead (#1453).
+			return err
+		}
 		// Unreadable / unparseable manifest = cannot verify, not data corruption
 		// (same degrade as the local path). This branch also absorbs an ABSENT
 		// manifest that S3 reports as AccessDenied (a GetObject-only policy

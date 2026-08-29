@@ -78,3 +78,27 @@ func TestRecordRun(t *testing.T) {
 		t.Fatalf("failed record = %+v, want error text and empty snapshot time", failed)
 	}
 }
+
+// TestRestoreFoldRequest_carriesTheReuseSetting: a restore is the same fold as
+// a refresh, into the same store, so it honours the same operator choice.
+//
+// This is the hop that had nothing. Deleting the field from the translation
+// compiled and passed every test, and silently made the restore the one Parquet
+// publisher that ignores the setting, on the surface where an operator is most
+// likely to be watching.
+func TestRestoreFoldRequest_carriesTheReuseSetting(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		got := restoreFoldRequest(console.BaselineRestoreRequest{
+			ServerID: "srv1", ServerName: "wp", IndexDSN: "dsn", BaselineDir: "/b",
+			CarryForwardUnchanged: want,
+		})
+		if got.CarryForwardUnchanged != want {
+			t.Errorf("CarryForwardUnchanged = %v, want %v", got.CarryForwardUnchanged, want)
+		}
+		// The rest of the translation, so a mutation that drops a field to
+		// reach the setting cannot pass by breaking something else quietly.
+		if got.ServerID != "srv1" || got.ServerName != "wp" || got.IndexDSN != "dsn" || got.BaselineDir != "/b" {
+			t.Errorf("the restore request did not translate: %+v", got)
+		}
+	}
+}

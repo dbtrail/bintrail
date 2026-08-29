@@ -78,9 +78,34 @@ func TestDocumentedFieldsMatchTheWireFormat(t *testing.T) {
 func TestDocumentedErrorClassesMatchTheTaxonomy(t *testing.T) {
 	body := section(t, readDoc(t), "What is sent")
 
+	// Both directions are checked against the FENCED LIST, as exact tokens:
+	// the prose around it also names classes, so a substring search over the
+	// whole section would stay green with a class missing from the list that
+	// claims to be "exactly these, and nothing else" (#1503 removed three
+	// classes nothing emitted; the reverse direction keeps the next one out).
+	const marker = "`error_class` is one of exactly these, and nothing else:"
+	_, afterMarker, ok := strings.Cut(body, marker)
+	if !ok {
+		t.Fatal("TELEMETRY.md no longer carries the error_class list marker")
+	}
+	_, afterFence, ok := strings.Cut(afterMarker, "```")
+	if !ok {
+		t.Fatal("TELEMETRY.md error_class list is not a fenced block")
+	}
+	listed, _, ok := strings.Cut(afterFence, "```")
+	if !ok {
+		t.Fatal("TELEMETRY.md error_class fenced block is not closed")
+	}
+	documented := map[string]bool{}
+	for _, token := range strings.Fields(listed) {
+		documented[token] = true
+		if !classes[token] {
+			t.Errorf("TELEMETRY.md lists error class %q, which nothing emits", token)
+		}
+	}
 	for class := range classes {
-		if !strings.Contains(body, class) {
-			t.Errorf("error class %q is emitted but not listed in TELEMETRY.md", class)
+		if !documented[class] {
+			t.Errorf("error class %q is emitted but not in TELEMETRY.md's list", class)
 		}
 	}
 }

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -41,7 +44,104 @@ func NewS3Client(ctx context.Context, region string) (*s3.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s3.NewFromConfig(awsCfg), nil
+	return NewS3ClientFromConfig(awsCfg), nil
+}
+
+// NewS3ClientFromConfig is the one constructor every S3 client in the tree
+// goes through (#1453). It carries the addressing style that goes with a
+// custom endpoint: the SDK config can hold the endpoint URL itself
+// (LoadAWSConfig sets BaseEndpoint), but path-style addressing is a client
+// option with no environment knob, so a caller that built its client with a
+// bare s3.NewFromConfig would reach MinIO at a virtual-hosted URL and fail on
+// DNS. extra options are applied AFTER the addressing option and win.
+func NewS3ClientFromConfig(cfg aws.Config, extra ...func(*s3.Options)) *s3.Client {
+	client := s3.NewFromConfig(cfg, append(S3ClientOptions(), extra...)...)
+	warnIfEndpointUnmirrored(client)
+	return client
+}
+
+// warnIfEndpointUnmirrored reports an endpoint the SDK resolved that bintrail
+// could not pass to DuckDB. It reads the CLIENT's endpoint, not the config's:
+// the SDK resolves a service-specific endpoint (AWS_ENDPOINT_URL_S3, or
+// services.<name>.s3.endpoint_url in ~/.aws/config) when the client is built,
+// so cfg.BaseEndpoint is nil for exactly the shape that most needs the
+// warning — S3 alone pointed at a compatible store, uploads landing there
+// while every Parquet read goes to AWS.
+func warnIfEndpointUnmirrored(client *s3.Client) {
+	opts := client.Options()
+	if opts.BaseEndpoint == nil || *opts.BaseEndpoint == "" {
+		return
+	}
+	if ep, err := S3EndpointFromEnv(); err != nil || ep.Set() {
+		return // mirrored, or the caller is about to fail on the config error
+	}
+	// Redacted: this branch is REACHED BY a value bintrail refused, and one of
+	// the refused shapes is a URL carrying credentials. The scheme and host are
+	// what identify the store; the rest is not ours to print.
+	warnUnmirroredEndpoint(redactURL(*opts.BaseEndpoint))
+}
+
+// S3ClientOptions returns the client options bintrail's own endpoint needs.
+// It takes no config on purpose: everything it decides comes from the
+// environment, and consulting cfg.BaseEndpoint is what made an earlier version
+// miss the service-specific endpoint the SDK resolves at client build time.
+//
+// The endpoint is pinned on the CLIENT, not only in cfg.BaseEndpoint, because
+// the SDK's service-specific AWS_ENDPOINT_URL_S3 overrides cfg.BaseEndpoint
+// when the client is built (verified against the pinned SDK version). Without
+// this pin, an operator with both variables set would have SDK writes go to
+// one store and DuckDB reads to the other — the split this whole change
+// exists to prevent. Client options are applied last and win.
+//
+// Path style is forced only for BINTRAIL_S3_ENDPOINT (defaulting to what MinIO
+// and LocalStack need) or when BINTRAIL_S3_PATH_STYLE names it. An endpoint
+// the SDK resolved on its own — its AWS_ENDPOINT_URL* variables, or
+// endpoint_url in ~/.aws/config — keeps the SDK's virtual-hosted addressing:
+// overriding it would break a setup that worked before this option existed.
+func S3ClientOptions() []func(*s3.Options) {
+	ep, err := S3EndpointFromEnv()
+	if err != nil {
+		// LoadAWSConfig validated this already, so the environment changed
+		// under us. Leave the SDK's own resolution alone rather than guess.
+		return nil
+	}
+	var opts []func(*s3.Options)
+	if ep.Managed() {
+		endpoint := ep.URL
+		opts = append(opts, func(o *s3.Options) { o.BaseEndpoint = aws.String(endpoint) })
+	}
+	// PathStyleExplicit applies with no endpoint of our own too: the SDK has no
+	// shared-config setting for addressing style, so BINTRAIL_S3_PATH_STYLE is
+	// the only lever an operator who configured endpoint_url in ~/.aws/config
+	// has, and dropping it sends uploads to bucket.host and fails on DNS.
+	if ep.Managed() || ep.PathStyleExplicit() {
+		pathStyle := ep.PathStyle
+		opts = append(opts, func(o *s3.Options) { o.UsePathStyle = pathStyle })
+	}
+	return opts
+}
+
+// redactURL keeps scheme://host and drops everything else, including any
+// userinfo. A value that does not parse is reported as a fixed placeholder
+// rather than echoed.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "(unparseable)"
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// warnUnmirroredEndpoint fires once per process for an endpoint the SDK
+// resolved and bintrail could not mirror: SDK writes reach the store while
+// DuckDB reads go to AWS, and nothing else in the system can notice.
+var warnUnmirroredOnce sync.Once
+
+func warnUnmirroredEndpoint(endpoint string) {
+	warnUnmirroredOnce.Do(func() {
+		slog.Warn("an S3 endpoint is configured for the AWS SDK that bintrail cannot pass to DuckDB (an ~/.aws/config endpoint_url, or a value it cannot parse): uploads will reach it while Parquet reads go to AWS; set "+EnvS3Endpoint+" to the same value so both halves agree",
+			"endpoint", endpoint)
+	})
 }
 
 // LoadAWSConfig loads the default AWS config (credential chain, region) for
@@ -59,7 +159,22 @@ func NewS3Client(ctx context.Context, region string) (*s3.Client, error) {
 // empty region to fall back to. So every caller that loads AWS config for S3
 // access should go through this shared helper, not awsconfig.LoadDefaultConfig
 // directly, to get the same IMDS fallback.
+//
+// BINTRAIL_S3_ENDPOINT (see S3EndpointFromEnv) is applied here as
+// cfg.BaseEndpoint, so every SDK client built from this config reaches the
+// S3-compatible store (#1453), and an invalid value fails the load rather
+// than falling back to AWS. With it set and no region anywhere, the region
+// defaults to us-east-1: SigV4 needs one, MinIO and friends accept any, and
+// the IMDS probe would only cost a 2s timeout on a host that is not an EC2
+// instance. The AWS SDK's own endpoint variables are deliberately NOT given
+// that treatment — the SDK already applies them, and suppressing the IMDS
+// region fallback for an operator who set AWS_ENDPOINT_URL against real AWS
+// would sign their requests for the wrong region.
 func LoadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
+	ep, err := S3EndpointFromEnv()
+	if err != nil {
+		return aws.Config{}, fmt.Errorf("load AWS config: %w", err)
+	}
 	opts := []func(*awsconfig.LoadOptions) error{}
 	if region != "" {
 		opts = append(opts, awsconfig.WithRegion(region))
@@ -67,6 +182,13 @@ func LoadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return awsCfg, fmt.Errorf("load AWS config: %w", err)
+	}
+	if ep.Managed() {
+		awsCfg.BaseEndpoint = aws.String(ep.URL)
+		if awsCfg.Region == "" {
+			awsCfg.Region = "us-east-1"
+		}
+		return awsCfg, nil
 	}
 	if region == "" && awsCfg.Region == "" {
 		if r := imdsRegion(ctx, awsCfg); r != "" {

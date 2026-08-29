@@ -3,6 +3,8 @@ package consoleapp
 import (
 	"context"
 	"errors"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -617,5 +619,173 @@ func TestMainSourceJobInfo(t *testing.T) {
 	want = ext.SourceJobInfo{SourceDSN: "src", IndexDSN: "idx", Flavor: "mariadb"}
 	if got != want {
 		t.Errorf("mariadb flavor: got %+v, want %+v", got, want)
+	}
+}
+
+// TestUpConsoleConfig_baselineRefreshDefaultsReachTheConsole pins the READ path
+// of the reuse setting: daemon flag and env -> console.Config -> the panel.
+//
+// The write path (console toggle -> fold) is pinned hop by hop; this direction
+// had nothing, and it is the one the panel's whole job depends on. Deleting the
+// BaselineRefreshDefaults block in upConsoleConfig, or hardcoding Enabled to
+// true, would leave the card reporting a setting the daemon is not running,
+// which is worse than no card: the operator's consent would be recorded against
+// the wrong behaviour.
+//
+// Enabled is asserted in BOTH directions on purpose. It is the difference
+// between "this applies now" and "this applies after a restart", and a mutation
+// that pins it to one value passes every test that only ever asks for that one.
+func TestUpConsoleConfig_baselineRefreshDefaultsReachTheConsole(t *testing.T) {
+	const dsn = "user:pass@tcp(127.0.0.1:3306)/binlog_index"
+	opts := consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"}
+
+	prevCarry, prevEvery, prevTrig := upBaselineCarryForward, upBaselineRefreshEvery, upConsoleBaselineTrigger
+	t.Cleanup(func() {
+		upBaselineCarryForward, upBaselineRefreshEvery, upConsoleBaselineTrigger = prevCarry, prevEvery, prevTrig
+	})
+
+	for _, tc := range []struct {
+		name          string
+		carry         bool
+		every         string
+		trigger       bool
+		wantCarry     bool
+		wantEnabled   bool
+		wantScheduled bool
+	}{
+		{"nothing on, reuse off", false, "", false, false, false, false},
+		// Reuse asked for with no consumer at all. The panel must report it
+		// dormant rather than live.
+		{"nothing on, reuse on", true, "", false, true, false, false},
+		{"scheduled, reuse off", false, "30m", false, false, true, true},
+		{"scheduled, reuse on", true, "30m", false, true, true, true},
+		// The case the second review found: --baseline-trigger alone wires the
+		// point-in-time restore, which consumes this setting, while no refresh
+		// loop runs. Enabled must be true (a restore WILL reuse files today)
+		// and Scheduled false (nothing is on a timer). Reading liveness off the
+		// interval alone told the operator nothing was live and then hard
+		// linked their files.
+		{"trigger only, reuse on", true, "", true, true, true, false},
+		{"trigger only, reuse off", false, "", true, false, true, false},
+		{"trigger and schedule", true, "30m", true, true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upBaselineCarryForward, upBaselineRefreshEvery = tc.carry, tc.every
+			upConsoleBaselineTrigger = tc.trigger
+			cfg, err := upConsoleConfig(nil, dsn, opts)
+			if err != nil {
+				t.Fatalf("upConsoleConfig: %v", err)
+			}
+			got := cfg.BaselineRefreshDefaults
+			if got.CarryForwardUnchanged != tc.wantCarry {
+				t.Errorf("CarryForwardUnchanged=%v, want %v: the daemon flag did not reach the console",
+					got.CarryForwardUnchanged, tc.wantCarry)
+			}
+			if got.Enabled != tc.wantEnabled {
+				t.Errorf("Enabled=%v, want %v: the panel would misreport whether ANY consumer of the setting is live",
+					got.Enabled, tc.wantEnabled)
+			}
+			if got.Scheduled != tc.wantScheduled {
+				t.Errorf("Scheduled=%v, want %v: the panel would misreport whether a refresh loop is on a timer",
+					got.Scheduled, tc.wantScheduled)
+			}
+		})
+	}
+}
+
+// TestResolveUpConsoleEnv_carryForwardPrecedence: an explicit flag beats the
+// environment, and an unreadable environment value beats nothing.
+//
+// Both halves are load-bearing and neither was covered. An env var that
+// overrode an explicit --baseline-carry-forward-unchanged=false would change
+// the on-disk shape of an operator's backups against their written instruction,
+// and a value like "yes" silently turning it on is the "unreadable value must
+// never be read as consent" rule this parse exists for.
+func TestResolveUpConsoleEnv_carryForwardPrecedence(t *testing.T) {
+	prev := upBaselineCarryForward
+	t.Cleanup(func() { upBaselineCarryForward = prev })
+
+	newCmd := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "watch"}
+		cmd.Flags().BoolVar(&upBaselineCarryForward, "baseline-carry-forward-unchanged", false, "")
+		return cmd
+	}
+
+	for _, tc := range []struct {
+		name    string
+		env     string
+		flagSet string // "" = not passed
+		want    bool
+	}{
+		{"env on, no flag", "true", "", true},
+		{"env off, no flag", "false", "", false},
+		{"unset, no flag", "", "", false},
+		// Not a true/false value: keeps the default, never read as consent.
+		{"env says yes, no flag", "yes", "", false},
+		{"env says on, no flag", "on", "", false},
+		{"env typo, no flag", "ture", "", false},
+		// An explicit flag is the operator's written instruction; the
+		// environment must not overrule it in either direction.
+		{"env on, flag says false", "true", "false", false},
+		{"env off, flag says true", "false", "true", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upBaselineCarryForward = false
+			t.Setenv("BINTRAIL_BASELINE_CARRY_FORWARD_UNCHANGED", tc.env)
+			cmd := newCmd()
+			if tc.flagSet != "" {
+				if err := cmd.Flags().Set("baseline-carry-forward-unchanged", tc.flagSet); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := resolveUpConsoleEnv(cmd); err != nil {
+				t.Fatalf("resolveUpConsoleEnv: %v", err)
+			}
+			if upBaselineCarryForward != tc.want {
+				t.Errorf("carry-forward = %v, want %v (env=%q flag=%q)",
+					upBaselineCarryForward, tc.want, tc.env, tc.flagSet)
+			}
+		})
+	}
+}
+
+// TestWatchCarryForwardFlagIsOffByDefault asserts the default on the REAL
+// watchCmd declaration.
+//
+// TestResolveUpConsoleEnv_carryForwardPrecedence builds its own cobra command
+// and re-declares the flag with a hardcoded false, which is right for testing
+// precedence and blind to the shipped default: it substitutes its fixture for
+// the production declaration rather than reading it. This reads the real one.
+func TestWatchCarryForwardFlagIsOffByDefault(t *testing.T) {
+	f := watchCmd.Flags().Lookup("baseline-carry-forward-unchanged")
+	if f == nil {
+		t.Fatal("--baseline-carry-forward-unchanged is gone from watch; this guard covers nothing")
+	}
+	if f.DefValue != "false" {
+		t.Fatalf("default = %q, want \"false\": the daemon would reuse files nobody asked it to", f.DefValue)
+	}
+}
+
+// TestStartBaselineRefreshLoopCallSitesAgree: both watch entry paths must pass
+// the same flag variable.
+//
+// The two calls are byte-identical including their context, which is exactly
+// where a copy-paste divergence hides: `watch` with a source would ignore the
+// flag while source-less `watch` honoured it, and each line can be mutated
+// alone with the whole suite green. A source read is the cheapest thing that
+// sees both.
+func TestStartBaselineRefreshLoopCallSitesAgree(t *testing.T) {
+	src, err := os.ReadFile("watch.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "upBaselineRefreshEvery, upBaselineCarryForward)"
+	n := strings.Count(string(src), "startBaselineRefreshLoop(")
+	if n != 2 {
+		t.Fatalf("found %d startBaselineRefreshLoop call sites, expected 2; re-point this guard", n)
+	}
+	if got := strings.Count(string(src), want); got != n {
+		t.Errorf("%d of %d call sites pass the daemon flag; the other passes something else, so one watch "+
+			"entry path would silently ignore --baseline-carry-forward-unchanged", got, n)
 	}
 }

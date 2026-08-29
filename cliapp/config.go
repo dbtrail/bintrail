@@ -211,6 +211,12 @@ var envSections = []envSection{
 		},
 	},
 	{
+		Header: "Iceberg export (bintrail export iceberg)",
+		Bindings: []envTemplateEntry{
+			{"BINTRAIL_ICEBERG_WAREHOUSE", ""},
+		},
+	},
+	{
 		Header: "Memory guards at scale (recover refuses oversized scripts; reconstruct warns on large windows, #654)",
 		Bindings: []envTemplateEntry{
 			// recover: refuse a reversal script whose row payload exceeds this (0 = unlimited).
@@ -239,6 +245,11 @@ func generateEnvTemplate() string {
 	sb.WriteString("# by all bintrail commands. CLI flags take precedence over env vars.\n")
 	sb.WriteString("#\n")
 	sb.WriteString("# Precedence: CLI flag > environment variable > default value\n")
+	sb.WriteString("#\n")
+	sb.WriteString("# Only variables that back a CLI flag are listed here. Process-wide ones\n")
+	sb.WriteString("# have no flag to override them and are documented instead: AWS_* for S3\n")
+	sb.WriteString("# credentials, BINTRAIL_S3_ENDPOINT / BINTRAIL_S3_PATH_STYLE for an\n")
+	sb.WriteString("# S3-compatible store (docs/upload.md).\n")
 
 	for _, sec := range envSections {
 		fmt.Fprintf(&sb, "\n# ── %s ──\n", sec.Header)

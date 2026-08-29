@@ -76,7 +76,7 @@ const (
 var sqlPanelTimeout = 60 * time.Second
 
 // sqlPanelSetupTimeout bounds the pre-query setup — the S3 baseline LIST in
-// buildViewsInput is the one unbounded step that runs under the single-flight
+// buildViewsInput holds the unbounded steps that run under the single-flight
 // latch, so a hung listing must not pin the panel at 429 for every other user.
 // The query itself is bounded separately by sqlPanelTimeout.
 var sqlPanelSetupTimeout = 30 * time.Second
@@ -138,7 +138,15 @@ type sqlPanelResult struct {
 	// result short — never silently.
 	Truncated bool  `json:"truncated"`
 	ElapsedMS int64 `json:"elapsed_ms"`
+	// Warnings carry what the session is missing and why (#1456): a query
+	// that succeeded against half a layout must say so next to its rows.
+	Warnings []string `json:"warnings,omitempty"`
 }
+
+// sqlPanelRegistryNote is the panel's wording for a session built without the
+// events view because archive_state could not be read. The error text stays
+// in the console log: it names the index host and the DB user.
+const sqlPanelRegistryNote = "the archive registry (archive_state) could not be read, so this session has no events view; the console log has the error"
 
 // handleSQLPanel serves POST /api/sql.
 func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
@@ -192,11 +200,11 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.sqlPanelBusy.Store(false)
 
-	// Bound the setup: buildViewsInput's S3 baseline LIST is the one unbounded
-	// step under the latch. r.Context() still propagates (Cancel works); the
+	// Bound the setup: buildViewsInput's S3 baseline LIST, and the region
+	// lookup beside it, are the unbounded steps under the latch. r.Context() still propagates (Cancel works); the
 	// deadline is what stops a hung listing from wedging the single-flight.
 	setupCtx, setupCancel := context.WithTimeout(r.Context(), sqlPanelSetupTimeout)
-	in, err := s.buildViewsInput(setupCtx, b)
+	in, err := s.buildViewsInput(setupCtx, b, false) // runs here: local-first routing
 	setupCancel()
 	switch {
 	case errors.Is(err, errNoViewSources):
@@ -207,6 +215,16 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A session built over half the layout (baseline views, no events view,
+	// because archive_state could not be read) is still worth serving: a
+	// state_* query is fully answerable. What it must not do is stay quiet
+	// about it, in either direction: a success carries the note as a warning,
+	// and a failed statement carries it AFTER the engine's message, so "table
+	// events does not exist" is not read as a typo in the operator's SQL. After,
+	// not ahead: *sqlUserError is the panel's whole user-error class (timeouts,
+	// read-policy refusals, scan failures), and a note leading the message
+	// would assert a cause for refusals that never touched the events view.
+	// The audit record keeps the engine message alone for the same reason.
 	res, err := runSandboxedSQL(r.Context(), in, req.SQL)
 	if err != nil {
 		var ue *sqlUserError
@@ -218,7 +236,11 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 			return
 		case errors.As(err, &ue):
 			recordSQLRun(r, req.SQL, "refused", ue.msg, 0, false)
-			writeJSONError(w, http.StatusUnprocessableEntity, ue.msg)
+			msg := ue.msg
+			if in.ArchiveDiscoveryFailed {
+				msg += ". Note: " + sqlPanelRegistryNote
+			}
+			writeJSONError(w, http.StatusUnprocessableEntity, msg)
 		default:
 			recordSQLRun(r, req.SQL, "error", err.Error(), 0, false)
 			writeJSONError(w, http.StatusBadGateway, err.Error())
@@ -226,6 +248,12 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if in.ArchiveDiscoveryFailed {
+		res.Warnings = append(res.Warnings, sqlPanelRegistryNote)
+	}
+	if note := sqlPanelDecimalNote(in); note != "" {
+		res.Warnings = append(res.Warnings, note)
+	}
 	recordSQLRun(r, req.SQL, "ok", "", res.RowCount, res.Truncated)
 	writeJSON(w, http.StatusOK, res)
 }
@@ -363,6 +391,16 @@ func openSandboxedSession(ctx context.Context, in views.Input) (*sql.DB, func(),
 		return nil, nil, err
 	}
 
+	// One predicate, shared with the generator: this used to be a private copy
+	// that also matched BaselineSource, and a copy of a question whose answer
+	// now decides whether a configuration fault is reported at all is the same
+	// drift hazard the settings list just stopped being. Narrowing to the
+	// generator's own answer is safe here because the FROM-clause allowlist
+	// below refuses every raw file reader, so the ONLY way this session can
+	// reach S3 is through a generated view — and a view carrying an s3:// path
+	// is exactly what NeedsS3 reports. An s3:// BaselineSource that yielded no
+	// snapshots emits no view, so there is nothing left to route.
+	//
 	// S3 credential setup, when the layout needs it, through bintrail's own
 	// tolerant helper — the SAME path parquetquery uses (httpfs + aws + a
 	// credential_chain secret). Deliberately NOT views.Generate's inline
@@ -370,11 +408,13 @@ func openSandboxedSession(ctx context.Context, in views.Input) (*sql.DB, func(),
 	// resolves, whereas EnableS3CredentialChain warns and continues — a read
 	// inside the allowed roots then fails at the S3 read (with a real auth
 	// error), not at session setup, and a local-only layout is unaffected.
-	if viewsInputNeedsS3(in) {
+	if in.NeedsS3() {
 		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return fail(fmt.Errorf("S3 archive sources are configured but the DuckDB httpfs extension could not be loaded: %w", err))
 		}
-		duckdbutil.EnableS3CredentialChainRegion(ctx, db, in.ArchiveRegion)
+		if err := duckdbutil.EnableS3CredentialChainRegion(ctx, db, in.ArchiveRegion); err != nil {
+			return fail(err)
+		}
 	}
 	// Withhold the paid forensics columns from the events view STRUCTURALLY —
 	// a property of the panel's session, not of the caller's input, so no future
@@ -568,23 +608,6 @@ func sqlPanelAllowedList(in views.Input) string {
 		quoted[i] = sqlQuoteString(r)
 	}
 	return "[" + strings.Join(quoted, ", ") + "]"
-}
-
-func viewsInputNeedsS3(in views.Input) bool {
-	for _, src := range in.ArchiveSources {
-		if strings.HasPrefix(src, "s3://") {
-			return true
-		}
-	}
-	if strings.HasPrefix(in.BaselineSource, "s3://") {
-		return true
-	}
-	for _, b := range in.Baselines {
-		if strings.HasPrefix(b.Path, "s3://") {
-			return true
-		}
-	}
-	return false
 }
 
 // sqlQuoteString renders a DuckDB single-quoted string literal.

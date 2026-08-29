@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/go-sql-driver/mysql"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
 var initCmd = &cobra.Command{
@@ -123,6 +123,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nSetting up S3 bucket...\n")
 		}
 		if err := setupS3Bucket(cmd.Context(), initS3Bucket, initS3Region); err != nil {
+			// A malformed S3 endpoint is a configuration fault, not a bucket
+			// one: creating the bucket by hand fixes nothing, and the
+			// remediation below would send the operator to do exactly that.
+			if errors.Is(err, storage.ErrS3EndpointConfig) {
+				return err
+			}
 			s3Err = err
 			if initFormat != "json" {
 				fmt.Fprintf(os.Stderr, "Warning: could not create S3 bucket %q: %v\n\n", initS3Bucket, err)
@@ -142,6 +148,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf("\nVerifying existing S3 bucket...\n")
 		}
 		if err := verifyS3Bucket(cmd.Context(), s3ARNBucket, initS3Region); err != nil {
+			// See above: an IAM policy is not what is wrong here.
+			if errors.Is(err, storage.ErrS3EndpointConfig) {
+				return err
+			}
 			s3Err = err
 			if initFormat != "json" {
 				fmt.Fprintf(os.Stderr, "Warning: could not verify S3 bucket %q: %v\n\n", s3ARNBucket, err)
@@ -204,11 +214,10 @@ func buildInitResult(dbName string, tables []string, s3Result *string, s3Err err
 // metadata service — whichever is available. If creation fails, the caller should print
 // s3Instructions so the user can set up the bucket manually.
 func setupS3Bucket(ctx context.Context, bucket, region string) error {
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	client, err := storage.NewS3Client(ctx, region)
 	if err != nil {
-		return fmt.Errorf("load AWS config: %w", err)
+		return err
 	}
-	client := s3.NewFromConfig(awsCfg)
 
 	// Create the bucket. us-east-1 rejects CreateBucketConfiguration; all other
 	// regions require it. BucketAlreadyOwnedByYou is treated as success so that
@@ -293,11 +302,10 @@ func parseS3ARN(arn string) (bucket, partition string, err error) {
 // verifyS3Bucket checks that an S3 bucket exists and is accessible by the
 // current AWS credentials using a HeadBucket request.
 func verifyS3Bucket(ctx context.Context, bucket, region string) error {
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	client, err := storage.NewS3Client(ctx, region)
 	if err != nil {
-		return fmt.Errorf("load AWS config: %w", err)
+		return err
 	}
-	client := s3.NewFromConfig(awsCfg)
 	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		return fmt.Errorf("head bucket: %w", err)
 	}

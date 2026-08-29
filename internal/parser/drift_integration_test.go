@@ -121,6 +121,16 @@ func TestParseFile_schemaDriftFailsLoud(t *testing.T) {
 	if parseErr == nil {
 		t.Fatal("expected ParseFile to fail loud on the renamed column, got nil (silent corruption)")
 	}
+	// The drift error crosses go-mysql's ParseFile (which wraps handler
+	// errors with pingcap errors.Trace) and must still be recognisable by
+	// type at the other end: usage telemetry classifies it as
+	// schema_mismatch through errors.As (#1503). A go-mysql or pingcap/errors
+	// bump whose errors.Trace stopped implementing Unwrap would break this —
+	// and index's errors.Is(parseErr, context.Canceled) on the same return.
+	var drift *parser.SchemaDriftError
+	if !errors.As(parseErr, &drift) {
+		t.Errorf("ParseFile returned %T, want a chain carrying *SchemaDriftError", parseErr)
+	}
 	for _, want := range []string{"schema drift", "client", "customer", "bintrail snapshot"} {
 		if !strings.Contains(parseErr.Error(), want) {
 			t.Errorf("drift error missing %q: %v", want, parseErr)

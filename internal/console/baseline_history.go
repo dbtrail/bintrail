@@ -20,14 +20,31 @@ const (
 	BaselineRunRestore = "restore" // operator-chosen point-in-time fold (#backups)
 )
 
+// BaselineRunTriggerScheduled marks a run (or a skip) the per-server backup
+// schedule started (#1442). Empty is everything else: the Create backup
+// button, a restore, the daemon-wide refresh interval. The literal is the
+// file/wire format and matches the verify history's vocabulary.
+const BaselineRunTriggerScheduled = "scheduled"
+
 // BaselineRunRecord is one completed baseline-producing run as this daemon
 // performed it. The files listing joins it to a snapshot by SnapshotTime to
 // report the run's exact duration; snapshots produced elsewhere (the CLI,
 // another daemon) have no record and fall back to the file write span.
+//
+// A record with SkipReason set is NOT a run: it is a scheduled slot that
+// could not start (another backup job held the server, or the schedule was
+// not runnable). It has no snapshot, so the files listing never joins it;
+// it exists so a schedule that never gets to run stays visible on the
+// Backups page instead of silent.
 type BaselineRunRecord struct {
 	ServerID   string `json:"server_id"`
 	ServerName string `json:"server_name,omitempty"`
 	Kind       string `json:"kind"`
+	// Trigger is BaselineRunTriggerScheduled for the backup schedule's own
+	// runs and skips, empty otherwise.
+	Trigger string `json:"trigger,omitempty"`
+	// SkipReason is set on a scheduled slot that did not start; see above.
+	SkipReason string `json:"skip_reason,omitempty"`
 	// SnapshotTime is the published snapshot's anchor instant — its directory
 	// name — in RFC3339 UTC. Empty when the run failed before publishing, or
 	// when the producer does not report it (PostgreSQL dumps stamp the
@@ -36,10 +53,16 @@ type BaselineRunRecord struct {
 	StartedAt    string `json:"started_at"`
 	FinishedAt   string `json:"finished_at"`
 	Tables       int    `json:"tables,omitempty"`
-	Rows         int64  `json:"rows,omitempty"`
-	Uploaded     int    `json:"uploaded,omitempty"`
-	Refused      int    `json:"refused,omitempty"`
-	Error        string `json:"error,omitempty"`
+	// Carried counts tables published by reusing the previous snapshot's file
+	// (refresh and restore). Persisted rather than left to the live status,
+	// which the next run overwrites: whether a run cost a full rewrite is
+	// exactly the thing an operator looks back at when sizing a disk or an
+	// interval, and by then the live status is gone.
+	Carried  int    `json:"carried,omitempty"`
+	Rows     int64  `json:"rows,omitempty"`
+	Uploaded int    `json:"uploaded,omitempty"`
+	Refused  int    `json:"refused,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 type baselineHistoryFile struct {
@@ -99,12 +122,46 @@ func OpenBaselineHistory(path string) (*BaselineRunHistory, error) {
 func (h *BaselineRunHistory) Append(rec BaselineRunRecord) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	recs := append(h.servers[rec.ServerID], rec)
-	if len(recs) > BaselineRunHistoryCap {
-		recs = recs[len(recs)-BaselineRunHistoryCap:]
-	}
-	h.servers[rec.ServerID] = recs
+	h.servers[rec.ServerID] = capRecords(append(h.servers[rec.ServerID], rec))
 	return h.save()
+}
+
+// capRecords trims a server's records to the cap, oldest first, keeping the
+// newest scheduled run and the newest scheduled skip whatever their age.
+//
+// Plain "drop the oldest" evicted the schedule's evidence: the daemon-wide
+// refresh loop appends a record every cycle for the same server, and at a
+// 30m interval that is the whole cap in twenty hours, so a daily scheduled
+// backup's last run was gone before the next one fired and the page fell
+// back to "it has not run yet". The two protected records are the ones
+// LastScheduled answers with; everything else is a durations ledger.
+func capRecords(recs []BaselineRunRecord) []BaselineRunRecord {
+	excess := len(recs) - BaselineRunHistoryCap
+	if excess <= 0 {
+		return recs
+	}
+	keepRun, keepSkip := -1, -1
+	for i := len(recs) - 1; i >= 0 && (keepRun < 0 || keepSkip < 0); i-- {
+		if recs[i].Trigger != BaselineRunTriggerScheduled {
+			continue
+		}
+		if recs[i].SkipReason != "" {
+			if keepSkip < 0 {
+				keepSkip = i
+			}
+		} else if keepRun < 0 {
+			keepRun = i
+		}
+	}
+	out := make([]BaselineRunRecord, 0, BaselineRunHistoryCap)
+	for i, r := range recs {
+		if excess > 0 && i != keepRun && i != keepSkip {
+			excess--
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // FindBySnapshot returns the newest record for serverID whose SnapshotTime
@@ -125,6 +182,54 @@ func (h *BaselineRunHistory) FindBySnapshot(serverID, snapshotTime string) *Base
 	return nil
 }
 
+// LastScheduled returns the newest scheduled RUN for serverID and the newest
+// scheduled SKIP, either nil when there is none. Both, because they answer
+// different questions on the Backups page: "when did the schedule last
+// produce a backup" and "is it currently unable to". A skip newer than the
+// last run is the case the page has to shout about.
+func (h *BaselineRunHistory) LastScheduled(serverID string) (run, skip *BaselineRunRecord) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	recs := h.servers[serverID]
+	for i := len(recs) - 1; i >= 0 && (run == nil || skip == nil); i-- {
+		if recs[i].Trigger != BaselineRunTriggerScheduled {
+			continue
+		}
+		rec := recs[i]
+		if rec.SkipReason != "" {
+			if skip == nil {
+				skip = &rec
+			}
+			continue
+		}
+		if run == nil {
+			run = &rec
+		}
+	}
+	return run, skip
+}
+
+// AppendSkip records a scheduled slot that did not start. When the newest
+// record for the server is already the same skip, that record's FinishedAt
+// moves to this slot instead of a new record being added: a wedged job plus
+// a short interval would otherwise append an identical skip every slot and
+// push the durations ledger out of the capped history, while a frozen
+// timestamp would have the page report the FIRST missed slot of a streak as
+// if the streak had ended there. Returns whether a NEW record was added.
+func (h *BaselineRunHistory) AppendSkip(rec BaselineRunRecord) (bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	recs := h.servers[rec.ServerID]
+	if n := len(recs); n > 0 && rec.SkipReason != "" && recs[n-1].Trigger == BaselineRunTriggerScheduled &&
+		recs[n-1].SkipReason == rec.SkipReason && recs[n-1].Kind == rec.Kind {
+		recs[n-1].FinishedAt = rec.FinishedAt
+		return false, h.save()
+	}
+	rec.Trigger = BaselineRunTriggerScheduled
+	h.servers[rec.ServerID] = capRecords(append(recs, rec))
+	return true, h.save()
+}
+
 // List returns a copy of serverID's records, oldest first.
 func (h *BaselineRunHistory) List(serverID string) []BaselineRunRecord {
 	h.mu.Lock()
@@ -138,9 +243,22 @@ func (h *BaselineRunHistory) List(serverID string) []BaselineRunRecord {
 func (h *BaselineRunHistory) save() error {
 	b, err := json.Marshal(baselineHistoryFile{Version: baselineHistoryVersion, Servers: h.servers})
 	if err != nil {
+		// The only step here whose failure names nothing on its own: every
+		// other one returns an *os.PathError/*os.LinkError already carrying
+		// the path, which is why they keep VerifyHistory.save's raw returns.
+		return fmt.Errorf("marshal baseline history %s: %w", h.path, err)
+	}
+	// Create the tree first, exactly as the sibling savers do (Registry.save,
+	// saveAuthFile, saveMCPTokenFile, VerifyHistory.save — this is
+	// VerifyHistory.save's shape, the closest relative). Nothing else creates
+	// ~/.config/bintrail on a fresh install, so without this the first refresh
+	// on a brand-new host loses its history to ENOENT (#1487). 0700 because
+	// the directory also holds the registry's DSN passwords.
+	dir := filepath.Dir(h.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(h.path), ".baseline-history-*")
+	tmp, err := os.CreateTemp(dir, ".baseline-history-*")
 	if err != nil {
 		return err
 	}

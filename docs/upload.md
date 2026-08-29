@@ -102,6 +102,59 @@ The AWS region is resolved in this order:
 3. `AWS_DEFAULT_REGION` environment variable
 4. `~/.aws/config` region setting for the active profile
 
+### S3-compatible stores (MinIO, Wasabi, LocalStack)
+
+Every S3 path in bintrail, the SDK uploads and the DuckDB reads alike, can
+point at an S3-compatible store instead of AWS. One variable does it:
+
+```sh
+export BINTRAIL_S3_ENDPOINT=http://minio:9000     # scheme://host[:port], no path
+export AWS_ACCESS_KEY_ID=...                       # the store's access key
+export AWS_SECRET_ACCESS_KEY=...
+```
+
+Bucket-in-path addressing (`http://host/bucket/key`, what MinIO and
+LocalStack need) is on by default with `BINTRAIL_S3_ENDPOINT`. A store that only
+serves virtual-hosted URLs turns it off:
+
+```sh
+export BINTRAIL_S3_ENDPOINT=https://s3.wasabisys.com
+export BINTRAIL_S3_PATH_STYLE=false
+```
+
+Notes:
+
+- The endpoint applies to every S3 path, including `upload`, rotation's S3
+  archiving, baseline upload and prune, `restore-index`, `archive reconcile`,
+  `doctor --archive-s3`, `init`, the agent's payload uploads, and every DuckDB
+  read of `s3://` paths (`query`/`recover` over archives, `reconstruct
+  --baseline-s3`, `verify`, `drill`, `baseline refresh`, the shim, the
+  console). The `views.sql` the console and `bintrail views` write names the
+  endpoint too, so it reads the same store from another machine.
+- `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL` are honored as fallbacks, so an
+  environment already set up for the AWS CLI keeps working: bintrail mirrors
+  their value to its DuckDB reads but otherwise leaves them to the SDK (no
+  syntax check, no forced addressing, no change to region resolution). Set
+  `BINTRAIL_S3_ENDPOINT` in new setups. An endpoint configured **only** as
+  `endpoint_url` in `~/.aws/config` routes the SDK half but cannot reach the
+  DuckDB half, which reads no AWS configuration at all: uploads land in your
+  store while Parquet reads go to AWS. bintrail warns when it sees that shape;
+  set `BINTRAIL_S3_ENDPOINT` to the same value.
+- With `BINTRAIL_S3_ENDPOINT` set and no region configured anywhere, the
+  region defaults to `us-east-1`; S3-compatible stores accept any. An
+  endpoint the SDK resolved keeps the SDK's own region resolution.
+- An invalid `BINTRAIL_S3_ENDPOINT` (no scheme, a path, credentials in the
+  URL) fails any command that reads or writes S3, on the SDK paths and the
+  DuckDB ones alike. A command whose data is entirely local is not refused
+  over a setting it never reads, so `bintrail views` over local archives
+  still renders. It never falls back to AWS: with uploads going to your store and reads going to an
+  AWS bucket of the same name, a baseline that exists reads as missing, which
+  is worse than an error. A value bintrail cannot parse in one of the AWS SDK
+  variables is not fatal (the SDK may well accept it); it is logged, and only
+  the DuckDB mirror is lost.
+- Object Lock and `s3:GetBucketLocation` behave as the store implements
+  them; `doctor --archive-s3` reports what it can query.
+
 ### Minimum IAM permissions
 
 > Want one policy that covers `upload` **and** archiving/baselines/queries

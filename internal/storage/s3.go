@@ -82,6 +82,9 @@ func newS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
 		return nil, fmt.Errorf("storage: %w", err)
 	}
 
+	// An explicit S3Config.Endpoint wins over the environment's; with none,
+	// NewS3ClientFromConfig applies the shared BINTRAIL_S3_ENDPOINT routing
+	// so this backend and every other client agree on where S3 is (#1453).
 	var s3Opts []func(*s3.Options)
 	if cfg.Endpoint != "" {
 		s3Opts = append(s3Opts, func(o *s3.Options) {
@@ -90,7 +93,7 @@ func newS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
 		})
 	}
 
-	return s3.NewFromConfig(awsCfg, s3Opts...), nil
+	return NewS3ClientFromConfig(awsCfg, s3Opts...), nil
 }
 
 // newS3BackendFromClient creates an S3Backend from an existing s3API client.

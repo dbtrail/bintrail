@@ -11,6 +11,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
+	"github.com/dbtrail/dbtrail/internal/storage"
 	"github.com/dbtrail/dbtrail/internal/views"
 )
 
@@ -25,12 +26,26 @@ var errNoViewSources = errors.New("this server has no archived partitions and no
 // baseline root that is configured but unlistable is an upstream fault worth
 // naming, not a degrade: silently dropping the baseline half would hand over a
 // layout missing every state view.
-func (s *Server) buildViewsInput(ctx context.Context, b *bundle) (views.Input, error) {
+//
+// portable selects which registered location names each archive. The download
+// runs on the operator's machine, where this host's local copy does not exist,
+// so it takes the S3 location whenever one is registered (#1456); the SQL panel
+// runs in this daemon and keeps the local-first routing every other console
+// read uses.
+func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) (views.Input, error) {
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
+		// The console has no --include-live and never sets LiveIndex, so the
+		// archives-only note must not tell this reader to "regenerate with a
+		// reachable index": they downloaded this file FROM a page served by
+		// that index, and regenerating gets them the same bytes.
+		LiveLegUnavailable: true,
 	}
-	in.ArchiveSources = consoleArchiveSources(ctx, b.db)
+	var archiveErr error
+	in.ArchiveSources, archiveErr = consoleArchiveSources(ctx, b.db, portable)
+	in.PortableRouting = portable
+	in.ArchiveDiscoveryFailed = archiveErr != nil
 	if b.baselineSrc != "" {
 		in.BaselineSource = b.baselineSrc
 		files, err := reconstruct.ListBaselines(ctx, b.baselineSrc)
@@ -48,10 +63,39 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle) (views.Input, e
 					Schema: f.Schema, Table: f.Table, Path: f.Path,
 				})
 			}
+			// Column types for the state views' decimal casts. Best-effort and
+			// memoized per snapshot; serves the download and the SQL panel
+			// alike, both of which reach the same Parquet through the same
+			// views.
+			s.resolveBaselineDecimals(ctx, &in)
 		}
 	}
 	if len(in.ArchiveSources) == 0 && len(in.Baselines) == 0 {
+		if archiveErr != nil {
+			// Not "nothing archived": the registry could not be read, and
+			// with no baseline half to carry the file there is nothing
+			// honest to serve. Same 502-for-upstream-fault rule as an
+			// unlistable baseline root.
+			return views.Input{}, fmt.Errorf("read archive_state: %w", archiveErr)
+		}
 		return views.Input{}, errNoViewSources
+	}
+	// After the layout is known: a server whose archives are all local reads
+	// nothing through httpfs, so an unrelated S3 variable must not 502 its
+	// page. Where the file does name s3:// paths, the store this daemon reads
+	// from is the store the file must name, and an invalid value is an
+	// upstream fault worth reporting rather than a file that points at AWS.
+	if in.NeedsS3() {
+		ep, err := storage.S3EndpointFromEnv()
+		if err != nil {
+			return views.Input{}, fmt.Errorf("S3 endpoint configuration: %w", err)
+		}
+		in.S3Endpoint = ep
+		// The region for this layout, when it was actually DETECTED (#1462).
+		// Not "the region our own reads use": those fall back to the ambient
+		// one and are right to, since they fail here and loudly. A file that
+		// leaves the host pins nothing rather than a guess.
+		in.ArchiveRegion, in.RegionAmbiguous = s.archiveRegion(ctx, in)
 	}
 	return in, nil
 }
@@ -97,7 +141,7 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	in, err := s.buildViewsInput(r.Context(), b)
+	in, err := s.buildViewsInput(r.Context(), b, true)
 	switch {
 	case errors.Is(err, errNoViewSources):
 		// Nothing to describe. A file of comments explaining that would be a
@@ -126,25 +170,32 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// consoleArchiveSources reads the selected server's archive registry,
-// best-effort.
+// consoleArchiveSources reads the selected server's archive registry. Returns
+// (nil, nil) for a server whose connection is not open.
 //
-// A registry read failure degrades to "no archive sources" rather than failing
-// the request: the baseline half of the file is still useful on its own, and the
-// generated header states which archive sources were resolved — so an empty list
-// shows up in the artifact itself rather than only in a log. Returns nil for a
-// server whose connection is not open.
-func consoleArchiveSources(ctx context.Context, db *sql.DB) []string {
+// A registry read failure is returned, not swallowed: the caller decides
+// whether the baseline half can still carry the file (then the header names
+// the failure where the operator reads it) or nothing honest is left to serve.
+// It is also logged, because the file is what leaves the host and the log is
+// what stays.
+//
+// portable picks query.PortableArchiveSources (S3 wherever registered, for a
+// file that leaves this host) over the local-first ResolveArchiveSources.
+func consoleArchiveSources(ctx context.Context, db *sql.DB, portable bool) ([]string, error) {
 	if db == nil {
-		return nil
+		return nil, nil
 	}
-	sources, err := query.ResolveArchiveSources(ctx, db)
+	resolve := query.ResolveArchiveSources
+	if portable {
+		resolve = query.PortableArchiveSources
+	}
+	sources, err := resolve(ctx, db)
 	if err != nil {
-		slog.Warn("console: could not resolve archive sources for views.sql; the file will describe baselines only",
+		slog.Warn("console: could not resolve archive sources for views.sql",
 			"error", err)
-		return nil
+		return nil, err
 	}
-	return sources
+	return sources, nil
 }
 
 // viewsAvailable reports whether the selected server has a Parquet layout worth
@@ -160,5 +211,11 @@ func (s *Server) viewsAvailable(r *http.Request, b *bundle) bool {
 	if b.baselineSrc != "" {
 		return true
 	}
-	return len(consoleArchiveSources(r.Context(), b.db)) > 0
+	// Either routing yields the same count; the portable read skips the
+	// per-source filesystem walk, so it is the cheaper gate. A registry read
+	// failure hides the button, as before: the handler would 502.
+	sources, err := consoleArchiveSources(r.Context(), b.db, true)
+	// sources is nil whenever err is set, so the err check is intent, not a
+	// distinct branch: the gate must never say yes on a failed read.
+	return err == nil && len(sources) > 0
 }

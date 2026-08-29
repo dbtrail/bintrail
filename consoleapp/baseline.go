@@ -142,10 +142,11 @@ func (s *baselineSupervisor) Status(serverID string) console.BaselineStatus {
 }
 
 func (s *baselineSupervisor) run(req console.BaselineRequest) {
+	defer s.recoverBaselineJob(baselineJobDump, req.ServerID, req.ServerName)
 	started := time.Now().UTC()
 	stats, uploaded, snapTime, err := s.execute(req)
 	rec := console.BaselineRunRecord{
-		Kind: console.BaselineRunDump, StartedAt: started.Format(time.RFC3339),
+		Kind: console.BaselineRunDump, Trigger: req.Trigger, StartedAt: started.Format(time.RFC3339),
 		Tables: stats.TablesProcessed, Rows: stats.RowsWritten, Uploaded: uploaded,
 	}
 	if err == nil && !snapTime.IsZero() {

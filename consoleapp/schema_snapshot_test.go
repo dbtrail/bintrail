@@ -35,7 +35,7 @@ func TestSchemaSnapshotSupervisor_reloadsTheStream(t *testing.T) {
 		reloaded = append(reloaded, id)
 		return true, nil
 	})
-	st, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0)
+	st, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0, nil)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestSchemaSnapshotSupervisor_reloadFailureIsReportedNotSwallowed(t *testing
 	s := testSnapshotSupervisor(t, okSnapshot, func(context.Context, string) (bool, error) {
 		return false, errors.New("stream did not stop within 15s")
 	})
-	st, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0)
+	st, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0, nil)
 	if err != nil {
 		t.Fatalf("a reload failure must not fail the job: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestSchemaSnapshotSupervisor_reloadFailureIsReportedNotSwallowed(t *testing
 // the point: silence would read as "capture is on the new snapshot".
 func TestSchemaSnapshotSupervisor_withoutReloadSaysCaptureIsUnchanged(t *testing.T) {
 	s := testSnapshotSupervisor(t, okSnapshot, nil)
-	st, _ := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0)
+	st, _ := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0, nil)
 	if st.StreamReloaded {
 		t.Error("stream_reloaded must be false with no supervised stream")
 	}
@@ -94,7 +94,7 @@ func TestSchemaSnapshotSupervisor_noStreamHereIsNotAReload(t *testing.T) {
 	s := testSnapshotSupervisor(t, okSnapshot, func(context.Context, string) (bool, error) {
 		return false, nil // supervised elsewhere (or not at all)
 	})
-	st, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0)
+	st, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0, nil)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestSchemaSnapshotSupervisor_snapshotFailureSkipsTheReload(t *testing.T) {
 			return metadata.SnapshotStats{}, errors.New("source unreachable")
 		},
 		func(context.Context, string) (bool, error) { reloads++; return true, nil })
-	_, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0)
+	_, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0, nil)
 	if err == nil {
 		t.Fatal("a failed snapshot must be reported as an error")
 	}
@@ -130,7 +130,7 @@ func TestSchemaSnapshotSupervisor_reportsExcludedTables(t *testing.T) {
 	s := testSnapshotSupervisor(t, func(console.SchemaSnapshotRequest) (metadata.SnapshotStats, error) {
 		return metadata.SnapshotStats{SnapshotID: 8, TableCount: 3, ExcludedTables: []string{"shop.audit_raw"}}, nil
 	}, func(context.Context, string) (bool, error) { return true, nil })
-	st, _ := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0)
+	st, _ := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 0, nil)
 	if len(st.ExcludedTables) != 1 || st.ExcludedTables[0] != "shop.audit_raw" {
 		t.Errorf("excluded tables not reported: %+v", st)
 	}
@@ -262,7 +262,7 @@ func TestSchemaSnapshotSupervisor_supersededRunNeitherReloadsNorPublishes(t *tes
 
 	// Generation 1 finishes late; a retry (generation 2) already owns the server.
 	s.gens["srv-1"] = 2
-	st, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 1)
+	st, err := s.execute(console.SchemaSnapshotRequest{ServerID: "srv-1"}, 1, nil)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}

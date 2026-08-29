@@ -512,6 +512,43 @@ See [Verify recoveries](verify.md) for both modes and the exit-code semantics,
 and [Rotation & Status](rotation-and-status.md#stream-continuity-no-data-lost)
 for the continuity signal.
 
+### Scenario O: Feed a reporting engine without touching production
+
+Reporting queries against the source hurt the source. dbtrail already keeps
+two things as plain Parquet, on disk or in S3: the archived change history
+(every hour that aged past retention) and the baseline snapshots. Both are
+readable by any DuckDB, Spark, Trino or Athena with no dbtrail involved.
+
+**Files, queried by name.** `bintrail views` writes a DuckDB schema over them:
+one `events` view across every archive and one `state_<schema>_<table>` view
+per table in the newest baseline (the console's **Storage → Query in DuckDB**
+card downloads the same file).
+
+```sh
+bintrail views --index-dsn "$IDX" --baseline-dir /data/baselines --out views.sql
+duckdb -init views.sql lake.db
+```
+
+The `state_*` views are the baseline, not the table right now; changes after
+it are in `events`, and joining the two is your query's job.
+
+**A table that stays current.** `bintrail export iceberg` does that join once
+per run and writes the result as an Apache Iceberg table per source table,
+appending only what changed since its last run, under a local warehouse:
+
+```sh
+bintrail export iceberg --index-dsn "$IDX" --baseline-dir /data/baselines --warehouse /data/iceberg
+```
+
+Run it from cron; every run that found changes is one Iceberg snapshot per
+table, and any
+Iceberg reader (`iceberg_scan('/data/iceberg/shop/orders')` in DuckDB) sees the
+table as of the last run. It refuses a table rather than publishing a wrong one
+(a capture gap, a TRUNCATE, a changed shape), with the same vocabulary as
+`baseline refresh`, and it never runs inside `watch`. Full flags, the type
+mapping and the refusals: [Iceberg export](iceberg-export.md); why the storage
+itself stays plain Parquet: [Parquet reference](parquet-debugging.md#the-archives-are-plain-parquet-on-purpose).
+
 ---
 
 ## 4. Keeping dbtrail Running (Day-to-Day)

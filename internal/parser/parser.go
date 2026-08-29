@@ -338,16 +338,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 	if err := bp.ParseFile(fullPath, 0, handleEvent); err != nil {
 		return err
 	}
-	if gaps.count > 0 {
-		return fmt.Errorf(
-			"schema gap: %d row event(s) in %s were skipped because the schema snapshot is stale "+
-				"(first: %s) — these rows were NOT indexed. Run `bintrail snapshot` against the current "+
-				"schema and re-index this file (a failed file re-indexes from the start). This commonly "+
-				"follows a CREATE/ALTER TABLE within the file whose auto-snapshot landed too late for the "+
-				"buffered rows",
-			gaps.count, filename, gaps.first)
-	}
-	return nil
+	return gaps.err(filename)
 }
 
 // rewriteInnerHeader stamps a Transaction_payload inner event's header with
@@ -387,6 +378,35 @@ func firstPartialImage(skipped [][]int) []int {
 	}
 	return nil
 }
+
+// err is the file's fail-loud verdict once parsing ends: nil when nothing was
+// skipped, else a *SchemaGapError so the file is marked failed and usage
+// telemetry sees the same schema_mismatch class as the hard drift error —
+// both mean "the snapshot is stale".
+func (g *schemaGapTracker) err(filename string) error {
+	if g.count == 0 {
+		return nil
+	}
+	return &SchemaGapError{msg: fmt.Sprintf(
+		"schema gap: %d row event(s) in %s were skipped because the schema snapshot is stale "+
+			"(first: %s) — these rows were NOT indexed. Run `bintrail snapshot` against the current "+
+			"schema and re-index this file (a failed file re-indexes from the start). This commonly "+
+			"follows a CREATE/ALTER TABLE within the file whose auto-snapshot landed too late for the "+
+			"buffered rows",
+		g.count, filename, g.first)}
+}
+
+// SchemaGapError is the file-mode sibling of SchemaDriftError (#778): rows
+// were skipped because their table was absent from a stale snapshot, so the
+// file is failed rather than indexed with holes. Same root cause, same
+// usage-telemetry class (schema_mismatch); the message is for the operator
+// and never leaves the process.
+type SchemaGapError struct{ msg string }
+
+func (e *SchemaGapError) Error() string { return e.msg }
+
+// TelemetryClass implements telemetry.Classed.
+func (e *SchemaGapError) TelemetryClass() string { return "schema_mismatch" }
 
 // schemaGapTracker records recoverable schema gaps: rows skipped because their
 // table is absent from the snapshot or its column count diverged, for an event
@@ -654,7 +674,7 @@ func handleRows(
 					"snapshot_time", snapTime)
 				break
 			}
-			return fmt.Errorf(
+			return &SchemaDriftError{msg: fmt.Sprintf(
 				"schema drift detected at %s:%d for %s.%s: binlog TABLE_MAP column %d is %q but schema snapshot %d has %q; "+
 					"the snapshot is stale (a column was renamed, or dropped and re-added, since it was taken) and indexing "+
 					"these events would attribute row values to the wrong columns — run `bintrail snapshot` against the "+
@@ -662,7 +682,7 @@ func handleRows(
 					"its checkpoint); if this event actually PREDATES the snapshot, check for clock skew between the "+
 					"bintrail host and the source server",
 				filename, binlogEv.Header.LogPos, schema, table,
-				i+1, names[i], schemaVersion, tm.Columns[i].Name)
+				i+1, names[i], schemaVersion, tm.Columns[i].Name)}
 		}
 	}
 
@@ -676,13 +696,13 @@ func handleRows(
 	// covers BOTH the file-index and stream paths. Fail loud rather than index
 	// NULL-filled rows.
 	if firstSkipped := firstPartialImage(rowsEv.SkippedColumns); firstSkipped != nil {
-		return fmt.Errorf(
+		return &PartialRowImageError{msg: fmt.Sprintf(
 			"partial binlog row image detected at %s:%d for %s.%s (%d column(s) absent: %v); "+
 				"bintrail requires binlog_row_image=FULL — set it server-wide (a session-level "+
 				"override produced this event) and re-generate the binlog, or these events would "+
 				"be indexed with absent columns stored as NULL",
 			filename, binlogEv.Header.LogPos, schema, table,
-			len(firstSkipped), firstSkipped)
+			len(firstSkipped), firstSkipped)}
 	}
 
 	// LogPos points to the byte AFTER the event. Subtract EventSize to get
@@ -1157,3 +1177,28 @@ func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp tim
 		SchemaVersion: schemaVersion,
 	}, true
 }
+
+// SchemaDriftError is the #700 hard error: a TABLE_MAP whose column names
+// disagree with the schema snapshot at or after the snapshot's own time, so
+// indexing would attribute row values to the wrong columns. The message names
+// the file, position, table and both column spellings; that text is for the
+// operator and never leaves the process — the only thing the type exposes to
+// usage telemetry is its class.
+type SchemaDriftError struct{ msg string }
+
+func (e *SchemaDriftError) Error() string { return e.msg }
+
+// TelemetryClass implements telemetry.Classed.
+func (e *SchemaDriftError) TelemetryClass() string { return "schema_mismatch" }
+
+// PartialRowImageError is the #493 guard: a row event whose image omits
+// columns (binlog_row_image=MINIMAL/NOBLOB, possibly a session override that
+// the one-shot startup check could not see). A server setting, so its
+// usage-telemetry class is config_invalid; the message names the file,
+// position and table for the operator and never leaves the process.
+type PartialRowImageError struct{ msg string }
+
+func (e *PartialRowImageError) Error() string { return e.msg }
+
+// TelemetryClass implements telemetry.Classed.
+func (e *PartialRowImageError) TelemetryClass() string { return "config_invalid" }

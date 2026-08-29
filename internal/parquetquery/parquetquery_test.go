@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	smithy "github.com/aws/smithy-go"
 
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -89,30 +88,6 @@ func TestParseS3Source(t *testing.T) {
 		if prefix != tc.wantPrefix {
 			t.Errorf("parseS3Source(%q) prefix = %q, want %q", tc.source, prefix, tc.wantPrefix)
 		}
-	}
-}
-
-// ─── isBucketLocationAccessDenied ───────────────────────────────────────────
-
-func TestIsBucketLocationAccessDenied(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"AccessDenied code", &smithy.GenericAPIError{Code: "AccessDenied", Message: "not authorized"}, true},
-		{"AccessDeniedException code", &smithy.GenericAPIError{Code: "AccessDeniedException", Message: "not authorized"}, true},
-		{"wrapped AccessDenied", fmt.Errorf("get bucket location: %w", &smithy.GenericAPIError{Code: "AccessDenied", Message: "denied"}), true},
-		{"NoSuchBucket code", &smithy.GenericAPIError{Code: "NoSuchBucket", Message: "not found"}, false},
-		{"non-API error", errors.New("connection reset"), false},
-		{"nil error", nil, false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isBucketLocationAccessDenied(tc.err); got != tc.want {
-				t.Errorf("isBucketLocationAccessDenied(%v) = %v, want %v", tc.err, got, tc.want)
-			}
-		})
 	}
 }
 

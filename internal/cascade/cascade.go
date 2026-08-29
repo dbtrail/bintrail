@@ -134,6 +134,26 @@ type BaselineProvider interface {
 	// — a plain error lands in the transient `baselinefail:` bucket and the
 	// engine proceeds to scan the exact candidates the refusal exists to
 	// avoid.
+	//
+	// Second permanent refusal (#1460): a table whose primary-key TYPE the
+	// baseline canonicalizer cannot handle must carry
+	// reconstruct.ErrUnsupportedPKType. Same reason to classify it — the
+	// transient bucket points the operator at flaky I/O instead of a property
+	// of their schema, and the engine repeats the doomed lookup for every
+	// parent key on the edge — but the engine's RESPONSE differs, and the
+	// difference is deliberate:
+	//
+	//   - generated PK: skip BOTH phases. The binlog candidates are unsafe
+	//     too (a versioned table logs history rows and row_end tombstones
+	//     under the surviving key), so scanning them would synthesize
+	//     restores from history-polluted state.
+	//   - unsupported PK type: skip only the BASELINE lookup, permanently,
+	//     and run Phase-1 as usual. Nothing about the type makes a binlog
+	//     row-image wrong; only the baseline-side join key cannot be built.
+	//     Skipping Phase-1 here would drop children this tool can recover.
+	//
+	// An implementation MUST NOT carry both sentinels on one error: the
+	// engine checks ErrGeneratedPK first and would skip a phase that is safe.
 	BaselineChildren(ctx context.Context, schema, table, fkCol, parentPK string, at time.Time, limit int) (lookup BaselineLookup, ok bool, err error)
 }
 
@@ -452,6 +472,65 @@ func SynthesizeVictims(
 				"an ON UPDATE root the parent key reversal in the emitted SQL is still applied, leaving such child "+
 				"rows referencing a key that no longer exists", fk.Schema, fk.Table, detail))
 	}
+	// pkTypeGated memoizes the #1460 Phase-2 refusal per child table. The
+	// verdict is a static fact of the schema (the PK's declared type), while
+	// scanChildren runs per (edge x parent key), so without the memo every
+	// later parent re-ran FindBaseline + the Parquet metadata read +
+	// ReadBaselineRows to be refused in exactly the same words.
+	//
+	// Deliberately a SEPARATE map from genPKGated, not a shared one: a gated
+	// entry here suppresses only the baseline lookup, while genPKGated
+	// suppresses the whole edge. Merging them would silently stop scanning
+	// binlog candidates that are perfectly safe to scan.
+	//
+	// One pre-#1460 behaviour is deliberately NOT preserved. Before the
+	// provider gate, a parent whose baseline scan happened to match ZERO rows
+	// took the `covered` arm (the per-row canonicalizer never ran, so nothing
+	// refused) and widened `since` to the snapshot time, while a parent that
+	// matched at least one row got the narrow window. Same table, same run,
+	// two different effective lookbacks decided by whether that parent had
+	// children in the baseline. Refusing the table up front makes the window
+	// uniformly the lookback one. That is narrower than the accident in the
+	// zero-match case, and the caveat above says so rather than papering over
+	// it; restoring the widening would mean silently changing the operator's
+	// --lookback for one table, on a path where no baseline row can be used
+	// anyway.
+	pkTypeGated := map[string]bool{}
+	// addPKTypeCaveat is the ONE caveat frame for the PK-type refusal, so the
+	// wording cannot drift if a second file path ever reaches it; detail
+	// carries reconstruct.PKTypeGateReason, the same sentence verify and both
+	// reconstruct surfaces render for this limit.
+	//
+	// The boundary it names is the LOOKBACK WINDOW, deliberately, and it must
+	// stay that way. `since` is widened to the baseline snapshot only in the
+	// `covered` arm below, so a refused edge scans [rootTS-Lookback, rootTS]
+	// and nothing else. On a baseline older than the lookback, "untouched
+	// since the snapshot" would be a strictly smaller set than what is
+	// actually missed, and the caveat would tell an operator a child touched
+	// 45 days ago against a 60-day-old baseline was recovered. The sibling
+	// `nobaseline:` caveat states the same boundary in the same words; keep
+	// them identical.
+	//
+	// Nor does it name a deleted parent: scanChildren serves the ON UPDATE
+	// root path as well as the ON DELETE one.
+	//
+	// No hoisted PKMetas gate, unlike #1273 — and not because a hoist is
+	// impossible (Options.PKMetas hands over exactly what
+	// FirstUnsupportedPKType takes), but because it would answer the wrong
+	// question. The provider refuses AFTER establishing that a baseline
+	// covers the table; a table with none returns ok=false first and earns
+	// the accurate `nobaseline:` caveat. A hoisted type gate cannot see that
+	// difference and would tell an operator their baseline could not be used
+	// for a table that has no baseline at all. The memo below already bounds
+	// the waste to one lookup per child table, which is what #1460 asked for.
+	addPKTypeCaveat := func(fk CascadeFK, detail string) {
+		addIncomplete("pktype:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+			"%s.%s cannot be augmented from its baseline: %s. This is a PERMANENT property of the "+
+				"table, not a transient failure, so retrying will not change it. Cascade-affected "+
+				"children are still recovered from the binlog, but children untouched within the "+
+				"lookback window are not reconstructed, so the recovery may be partial",
+			fk.Schema, fk.Table, detail))
+	}
 	// genPKGated memoizes the probe verdict per child table — a static fact of
 	// the schema snapshot, while scanChildren runs per (edge × parent key);
 	// same static-fact memo pattern as skewChecked. The memo also keeps the
@@ -577,7 +656,14 @@ func SynthesizeVictims(
 			baseSincePos *query.BinlogPos
 			baseStaleMsg string // reconstruct.StaleWarning.Message, if the provider fell back to an older snapshot (#618)
 		)
-		if opts.Baseline != nil {
+		// pkTypeGated skips the ENTIRE baseline block, not just the provider
+		// call: falling through to the switch's `default:` arm would emit
+		// "no baseline covers app.child", which is false — a baseline may
+		// cover it perfectly well; it is the join key that cannot be built.
+		// Everything downstream then behaves exactly as it does on the
+		// refusal's first occurrence (baseCovered false, the Phase-1 window
+		// left at rootTS-Lookback).
+		if opts.Baseline != nil && !pkTypeGated[fk.Schema+"."+fk.Table] {
 			bl, covered, berr := opts.Baseline.BaselineChildren(ctx, fk.Schema, fk.Table, fk.Column, parentKey, rootTS, opts.CandidateLimit)
 			switch {
 			case berr != nil:
@@ -601,8 +687,34 @@ func SynthesizeVictims(
 						"generated column (most commonly the MariaDB system-versioning shape)")
 					return childScan{failed: true}
 				}
-				addIncomplete("baselinefail:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
-					"baseline lookup failed for %s.%s (recovery may be partial): %v", fk.Schema, fk.Table, berr))
+				// A PK-type refusal (#1460) is the other PERMANENT table
+				// property. File it under its own caveat key and memoize the
+				// child table so no later parent on this edge repeats the
+				// lookup, but DO fall through to Phase-1: an unsupported PK
+				// type blocks the baseline-side join key, not the binlog
+				// row-images, so the candidates below are safe to scan and
+				// skipping them would drop recoverable children. This is the
+				// documented asymmetry with the generated-PK branch above.
+				if errors.Is(berr, reconstruct.ErrUnsupportedPKType) {
+					pkTypeGated[fk.Schema+"."+fk.Table] = true
+					// The provider's own message frames the reason with the
+					// table name, which the caveat names again; take the
+					// UNFRAMED reason so the two frames do not nest.
+					// PKTypeRefusalReason unwraps with errors.As, so a %w
+					// wrap still yields the inner reason; the fallback is for
+					// the two shapes that carry no reason at all — an error
+					// wrapping the bare sentinel, or one built with an empty
+					// reason. Both then render their full text rather than
+					// leaving the caveat with an empty clause.
+					detail := reconstruct.PKTypeRefusalReason(berr)
+					if detail == "" {
+						detail = berr.Error()
+					}
+					addPKTypeCaveat(fk, detail)
+				} else {
+					addIncomplete("baselinefail:"+fk.Schema+"."+fk.Table, fmt.Sprintf(
+						"baseline lookup failed for %s.%s (recovery may be partial): %v", fk.Schema, fk.Table, berr))
+				}
 			case covered:
 				baseCovered, baseSnap, baseRows, baseTrunc = true, bl.SnapshotTime, bl.Rows, bl.Truncated
 				since = bl.SnapshotTime

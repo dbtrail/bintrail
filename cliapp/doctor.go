@@ -138,7 +138,7 @@ func appendExtDoctorChecks(ctx context.Context, report *doctor.Report, sourceDSN
 	}
 	if panicked != nil {
 		report.Add(doctor.CheckResult{
-			Name:   "extension doctor checks",
+			Name:   doctor.ExtensionPanicCheckName,
 			Status: doctor.StatusFail,
 			Detail: fmt.Sprintf("registered check panicked: %v", panicked),
 		})

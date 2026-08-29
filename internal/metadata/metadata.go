@@ -29,7 +29,18 @@ const latestPerTableLoadTimeout = 15 * time.Second
 // run `bintrail snapshot` yet" from a genuine DB-side failure
 // (table dropped post-upgrade, permissions revoked, connection
 // lost) — which deserve a louder log channel.
-var ErrNoSnapshots = errors.New("no snapshots found; run `bintrail snapshot` first")
+//
+// It is a comparable value, not an errors.New sentinel, so it can declare its
+// usage-telemetry class (not_found: the snapshot the command needs does not
+// exist yet) while errors.Is(err, ErrNoSnapshots) keeps working.
+var ErrNoSnapshots error = noSnapshotsError{}
+
+type noSnapshotsError struct{}
+
+func (noSnapshotsError) Error() string { return "no snapshots found; run `bintrail snapshot` first" }
+
+// TelemetryClass implements telemetry.Classed.
+func (noSnapshotsError) TelemetryClass() string { return "not_found" }
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -1662,16 +1673,28 @@ func ValidateBinlogFormatContext(ctx context.Context, db *sql.DB) error {
 	var varName, val string
 	err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'binlog_format'").Scan(&varName, &val)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("binlog_format not found on source server")
+		return &BinlogFormatError{msg: "binlog_format not found on source server"}
 	}
 	if err != nil {
 		return fmt.Errorf("failed to query binlog_format: %w", err)
 	}
 	if !strings.EqualFold(val, "ROW") {
-		return fmt.Errorf("source server has binlog_format=%q; bintrail requires ROW", val)
+		return &BinlogFormatError{msg: fmt.Sprintf("source server has binlog_format=%q; bintrail requires ROW", val)}
 	}
 	return nil
 }
+
+// BinlogFormatError is the refusal to capture from a source whose
+// binlog_format is not ROW (or is absent). It runs ahead of the row-image
+// check at every call site (`stream`, `index --source-dsn`, `agent`) with no
+// doctor in front, so it declares its own usage-telemetry class: a server
+// setting, config_invalid. The message is unchanged from the untyped error.
+type BinlogFormatError struct{ msg string }
+
+func (e *BinlogFormatError) Error() string { return e.msg }
+
+// TelemetryClass implements telemetry.Classed.
+func (e *BinlogFormatError) TelemetryClass() string { return "config_invalid" }
 
 // ValidateBinlogRowImage checks that the source server has binlog_row_image=FULL.
 func ValidateBinlogRowImage(db *sql.DB) error {
@@ -1684,16 +1707,28 @@ func ValidateBinlogRowImageContext(ctx context.Context, db *sql.DB) error {
 	var varName, val string
 	err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'binlog_row_image'").Scan(&varName, &val)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("binlog_row_image not found on source server; MySQL 5.6+ with binlog_row_image=FULL is required")
+		return &RowImageError{msg: "binlog_row_image not found on source server; MySQL 5.6+ with binlog_row_image=FULL is required"}
 	}
 	if err != nil {
 		return fmt.Errorf("failed to query binlog_row_image: %w", err)
 	}
 	if !strings.EqualFold(val, "FULL") {
-		return fmt.Errorf("source server has binlog_row_image=%q; bintrail requires FULL", val)
+		return &RowImageError{msg: fmt.Sprintf("source server has binlog_row_image=%q; bintrail requires FULL", val)}
 	}
 	return nil
 }
+
+// RowImageError is the refusal to capture from a source whose
+// binlog_row_image is not FULL (or is absent). `stream`, `index --source-dsn`
+// and `agent` hit it without the doctor in front, so it declares its own
+// usage-telemetry class: a server setting, config_invalid. The message is
+// unchanged from the untyped error.
+type RowImageError struct{ msg string }
+
+func (e *RowImageError) Error() string { return e.msg }
+
+// TelemetryClass implements telemetry.Classed.
+func (e *RowImageError) TelemetryClass() string { return "config_invalid" }
 
 // DetectFlavor reports the source server flavor by inspecting VERSION():
 // "mariadb" when the version string contains "MariaDB" (case-insensitive),

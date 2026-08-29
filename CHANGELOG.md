@@ -7,6 +7,459 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`bintrail export iceberg`** (#1466). Writes each table's current state as
+  an Apache Iceberg table under `--warehouse`, incrementally: the first run
+  loads the newest baseline snapshot, every run after that folds the events
+  since the table's own cursor into ONE Iceberg snapshot (equality deletes for
+  every touched key plus the rows that still exist). The table is never
+  rewritten. The cursor is the run's binlog cut, stored in the table's
+  properties in the same commit as the data, so nothing is written to the index
+  and a run that dies before committing resumes from the previous snapshot.
+  Refuses per table, with `baseline refresh`'s vocabulary, on a capture gap,
+  skipped events, a cut behind the cursor, a schema or type change or a
+  destructive DDL in the window; refuses tables without a primary key or with
+  a BIT column, and an index that holds more than one source. Every commit is
+  audited as `cli/export.iceberg`. DuckDB and Spark read the directory
+  directly; Trino, Athena and Snowflake read it once registered in their
+  catalog. See docs/iceberg-export.md.
+- Guard `cliapp/icebergfree_test.go`: the Iceberg and Arrow libraries are
+  imported only by `internal/icebergexport`, and only that package, the
+  `cliapp` root and `cmd/bintrail` may link them. The guarded set is derived
+  from `go list` over the module minus that three-entry allowlist, so a new
+  package is guarded the day it appears; the console, MCP and pg binaries are
+  pinned free of both. Records the #1467 decision mechanically: Iceberg is an
+  output, not the storage layer.
+
+### Changed
+- **Usage telemetry classifies first-run failures** (#1503). A fresh install
+  that could not start reported every attempt as `error_class: unknown`, so
+  the one thing telemetry exists to show — why a first run fails — was
+  invisible. Errors now declare their own class through a small interface
+  (`telemetry.Classed`), with no message text involved: a refused preflight
+  (`doctor`, `bintrail-pg doctor`, or `up` / `bintrail-console watch`
+  refusing to boot) reports the class of what failed —
+  `db_connection` when the source or index could not be reached,
+  `db_permission` for grants, index write access or schema access,
+  `config_invalid` for a server setting (as do the `binlog_format` and
+  `binlog_row_image` refusals that `stream`, `index --source-dsn` and `agent`
+  run without the doctor) — the server's
+  "binlog purged" error
+  (1236, which only the replication client ever sees and which the classifier
+  used to miss because it arrives as go-mysql's error type, not the driver's)
+  and the `--no-gap-fill` refusal are `binlog_not_found`, the stale-snapshot
+  guard is `schema_mismatch`, a missing snapshot is `not_found`, a server
+  identity conflict is `config_invalid`, and "host not allowed" (1130) is
+  `db_permission`. Three classes no code path could ever emit
+  (`binlog_parse`, `flag_invalid`, `network`) are removed from the taxonomy
+  and from `docs/TELEMETRY.md`. The wire format and `schema_version` are
+  unchanged.
+
+## [0.70.0] - 2026-08-28
+
+### Added
+- **`bintrail views --include-live`** (#1480). The generated DuckDB views read
+  the Parquet tier, which only holds partitions `rotate` has already archived,
+  so the most recent window lived nowhere in the file and a query about it
+  returned no rows exactly as if nothing had happened. The new flag adds a
+  second leg over the index itself, making a DuckDB query fresh to capture lag
+  instead of to the archive retention window. Overlap between the two is
+  deduplicated by `event_id` with the **archives** winning: an archived row
+  knows its `bintrail_id`, `event_date` and `event_hour` from its storage path
+  and an index row has to derive or forgo them, so the leg that knows the source
+  is the one that survives the overlap. The index leg reads `event_timestamp` as
+  UTC explicitly, because the archives' Parquet column is timezone-aware and the
+  index's `DATETIME` is not, and a union of the two otherwise reads the index's
+  values in whatever timezone the reader's session happens to have. It names
+  only columns the index actually has, so an index migrated to an older schema
+  still yields a file that binds rather than a binder error and no view at all.
+  The file carries the index host, port, database and user and never its
+  password: fill the empty slot in your own session. It also says what a
+  loopback host means for a reader elsewhere, and what a query against the view
+  costs, where you will be looking when you measure it. Attribution of the live
+  rows states what was OBSERVED (one source, several, none registered, the
+  registry unreadable, or an id that disagrees with the archives') rather than
+  one sentence covering all five. With nothing archived yet the file is the
+  index leg alone rather than no `events` view at all (#1485). Without the flag
+  the file is unchanged except that it now states, in the `events` view's own
+  comment, which events it does not cover and how to add them.
+
+- **S3-compatible object stores (MinIO, Wasabi, LocalStack) for every S3
+  path** (#1453, #1454). `BINTRAIL_S3_ENDPOINT=scheme://host[:port]` points
+  the SDK clients (rotation archiving, `upload`, baseline upload and prune,
+  `restore-index`, `archive reconcile`, `doctor`, `init`) AND every DuckDB
+  httpfs read (`query`/`recover` over archives, `reconstruct --baseline-s3`,
+  `verify`, the shim, the console, `--ultrafast`) at the same store; before,
+  the SDK half could follow `AWS_ENDPOINT_URL_S3` by accident while the DuckDB
+  half always went to `s3.amazonaws.com`, so a baseline that verifiably
+  existed read as missing. Bucket-in-path addressing is on by default with
+  `BINTRAIL_S3_ENDPOINT` (`BINTRAIL_S3_PATH_STYLE=false` for virtual-hosted-only
+  stores). `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT_URL` are honored as fallbacks
+  and otherwise left to the SDK, so an environment already configured for the
+  AWS CLI keeps its behavior; an endpoint set only in `~/.aws/config` routes
+  the SDK half alone and now warns, since DuckDB reads no AWS configuration.
+  An invalid `BINTRAIL_S3_ENDPOINT` fails any command that reads or writes S3,
+  instead of falling back to AWS, on the baseline read paths too; a command
+  whose data is entirely local is not refused over a setting it never reads. Routing is applied with `SET GLOBAL`
+  rather than only inside the credentials secret, so it survives an air-gapped
+  host where the `aws` extension cannot be installed, and it reaches every
+  connection of a pool rather than the one that ran it. The
+  `views.sql` download and `bintrail views` name the endpoint in their routing
+  statements AND in their secret, so the file reads the same store from
+  another machine even when its secret fails (an interactive DuckDB continues
+  past a failed statement). Every S3 client in
+  the tree is now built by `storage.NewS3ClientFromConfig`, and CI runs the
+  round trip against a real MinIO.
+
+### Fixed
+- **A crash while refreshing a schema snapshot no longer stops capture**
+  (#1497). Under `bintrail-console watch` one process is both the console and
+  the capture plane, and neither of the two goroutines behind the Status page's
+  **Refresh schema snapshot** button had a panic guard, so an internal error
+  while re-reading a source's column layout ended replication capture for every
+  monitored server. A schema snapshot that did not refresh is a degradation, a
+  daemon that stopped capturing is an outage, and the first must never cause
+  the second. This is the defect #1494 fixed for the four backup jobs, in the
+  file that fix did not cover.
+  Both goroutines are guarded now, and the guard is deliberately not a quiet
+  swallow, which would trade a loud outage for a silent one: the stack is
+  logged at error level, which is the only place it is recorded now that the
+  process does not die printing it, and the run is reported as **failed**
+  carrying the error. That second half matters as much as the first, because a
+  new snapshot is refused for a server whose previous one still reads as
+  running, so a guard that only logged would leave that server's button
+  answering "already running" until the daemon was restarted.
+  The report names the half that broke rather than hedging over both. An error
+  while reading the source's columns says capture was not touched, which the
+  ordering makes a fact rather than a guess. An error during the stream restart
+  says the schema snapshot itself was taken and recorded, keeps its table
+  counts, and says that this server's capture may now be stopped, naming the
+  page and the button that fix it (Manage servers, Start). Warning about
+  capture on every panic instead would have been a false alarm on a surface an
+  operator has to trust during an incident.
+  Two related repairs. Starting a monitored source reserves its slot before it
+  provisions, and a crash in that window used to end the process; now that one
+  can be recovered, the reserved slot is marked failed first, because nothing
+  else ever clears it and a later Start on it would have reported success while
+  doing nothing. And a snapshot that outlives its ten minute bound and then
+  crashes no longer leaves the earlier "the source did not answer" text
+  standing, which blamed the source for something this daemon did.
+  One gap is contained but not undone, and it is worth knowing about because
+  the cost is not only the stopped stream: while the restart is interrupted
+  that server can be missing from the daemon's list of active sources, so its
+  index is not archived or pruned on the rotation schedule until capture is
+  started again.
+- **The managed MCP token survives a container restart** (#1493). The token
+  minted from **Settings → Connect AI** is stored as a SHA-256 hash in a file
+  that had no path override, so it always resolved under `$HOME` inside the
+  image while the compose stack redirected every other piece of console state
+  onto the persistent volume. It therefore lived in the container's writable
+  layer and was destroyed by any `docker compose up` that recreated the
+  container. Nothing reported it: a missing token file is also what a console
+  that never had one looks like, so the daemon came up quiet and the AI client
+  you had configured got a 401 on every call with no server-side explanation.
+  The file now takes a path the same way the registry and the auth file
+  already did, `--mcp-token-file` / `BINTRAIL_CONSOLE_MCP_TOKEN_FILE` on
+  `bintrail-console serve` and `--console-mcp-token-file` on `watch`, and the
+  shipped `docker-compose.yml` points it at
+  `/var/lib/bintrail/console-mcp-token.yaml` in the `bintrail-state` volume.
+  What this means for an upgrade: **the default path did not move**, so a
+  console that uses it keeps reading the same file and no existing token is
+  affected. **On the compose stack, generate a new token once** after taking
+  the updated compose file: the console reads the volume path from then on, so
+  a token minted before the change does not carry over, and the replacement is
+  the first one that is still there after the next restart. Paste the new value
+  into your AI client; the old one authenticates nothing.
+- **`sum()` works on a money column in the generated DuckDB views** (#1486).
+  MySQL `DECIMAL` and `NUMERIC` columns are stored as text in the baseline
+  Parquet, so the `state_<schema>_<table>` views handed DuckDB a `VARCHAR` and
+  the first aggregate anyone wrote against a money column died with
+  `No function matches the given name and argument types 'sum(VARCHAR)'`,
+  which reads like the data is wrong rather than like a storage choice. The
+  views now cast those columns back to `DECIMAL(p,s)`, using the precision and
+  scale read from the `CREATE TABLE` in each file's Parquet footer. This works
+  on baselines you already have: nothing about how a value is stored changed,
+  and nothing needs re-taking. Text remains the storage form on purpose, and
+  the reason is worth knowing before reaching for a wider type: MySQL allows
+  `DECIMAL(65,30)` while DuckDB stops at 38 digits, and the stored text is also
+  what the recovery paths join and compare on, byte for byte, against the value
+  read out of the binlog. Some columns still read as text, and the generated
+  file names each one and says why: a column wider than 38 digits has no DuckDB
+  `DECIMAL` to be cast to; a baseline taken before bintrail embedded the
+  `CREATE TABLE` in the footer carries no column types to read; and a
+  PostgreSQL-source baseline stores every value as text and never carries that
+  key, by design, so there is nothing to read. The console's SQL panel
+  executes these views and discards their
+  text, so when a file carries no column types it now says so next to the rows
+  instead of leaving a `sum(VARCHAR)` error unexplained. `docs/parquet-debugging.md`
+  covers casting by hand for anyone pointing DuckDB at the files without the
+  views.
+- **One primary-key limitation, one sentence, and `recover-cascade` no longer
+  calls it a transient failure** (#1460, #1461). A primary key whose type the
+  baseline canonicalizer cannot handle (`FLOAT`/`DOUBLE`, `TIME`, `BIT`,
+  `JSON`, the spatial family) is refused on several surfaces, and each one used to word it
+  differently: full-table `reconstruct` said the type "is not in the supported
+  PK type set", the shim's full-table `_snapshot` said "the baseline merge
+  cannot canonicalize" it, and `verify` and single-row `reconstruct` said it
+  is "unsupported by the baseline canonicalizer". An operator who met two of
+  those had no way to tell it was the same refusal. All of them now render the
+  same sentence, the last one, inside whatever frame the surface needs, so
+  full-table `reconstruct` and the `_snapshot` wire error read differently
+  only where they name the table or point at `_flashback`. Full-table
+  `reconstruct` no longer ends with "file a follow-up issue if you need this
+  type"; the per-row message underneath it still carries that advice.
+  `recover-cascade` gets the bigger change. Its Phase-2 baseline lookup can
+  hit the same limit on a child table, and it used to arrive as an ordinary
+  error, which the engine filed under "baseline lookup failed ... (recovery
+  may be partial)". That reads as bad luck worth retrying, when nothing about
+  a retry can change the type of a column, and the engine re-ran the whole
+  lookup for every parent key on the edge to be refused identically each time.
+  The refusal is now recognized, reported once as a permanent property of the
+  table, and the lookup is attempted once per child table instead of once per
+  parent key. The binlog half of the recovery is untouched: only the baseline
+  join is blocked, so the children with an event inside the lookback window
+  are still reconstructed, and the ones untouched within that window are not.
+  The new caveat says exactly that, and it now says it for both kinds of root
+  event rather than assuming a deleted parent.
+- **A backup job that hits an internal error no longer stops capture**
+  (#1472). Under `bintrail-console watch` one process is both the console and
+  the capture plane. The four background baseline jobs (the scheduled refresh,
+  the Create-baseline button, the point-in-time restore, the custom `.sql`
+  build) each ran in a goroutine with no crash guard, so an internal error in
+  any of them killed the daemon and stopped replication capture. The docs
+  promise the opposite: a backup that stopped refreshing is a degradation, a
+  daemon that stopped capturing is an outage. Two layers now contain it. An
+  internal error while rebuilding one table is recorded against that table, the
+  other tables carry on, and the run fails without publishing, exactly as it
+  would for any other unusable table. An internal error anywhere else in the
+  job marks the run failed on the Backups page. Either way the daemon keeps
+  capturing and the stack goes to the daemon log at error level, so the cause
+  is still there to read. It is contained, not hidden. A job that already
+  published its snapshot before the error is left reported as succeeded,
+  because the snapshot is on disk. The four jobs share one lock per server, so
+  the failed state also frees that lock, where a crashed goroutine used to
+  leave the server stuck as busy and refuse every later backup job for it.
+  Two things to know: a run whose error lands outside the table rebuild leaves
+  no row in the Backups page's run history, so read its status card and the
+  daemon log for it; and the manual Create-baseline button converts mydumper's
+  output table by table, where an internal error still stops the daemon.
+  Everything the CLI did before is unchanged apart from where the stack is
+  printed: `bintrail reconstruct` and `baseline refresh` still exit non-zero,
+  and now log the stack instead of dying on it.
+- **A slow index no longer ends capture** (#1482). `bintrail-console watch`
+  supervised the sources added from its console, restarting them with backoff,
+  but ran its own `--source-dsn` source as a single call: a batch INSERT that
+  ran past `--write-timeout` returned an error the daemon exited on, and
+  nothing restarted it. Read pressure on the index was enough to trigger it,
+  and capture then stayed down until an operator noticed, with the exposure
+  bounded only by how long the source keeps its binlogs. That exit also ran the
+  supervisor's shutdown, so the main source's failure stopped every supervised
+  source alongside it, and those recorded `stopped` rather than `failed`,
+  leaving nothing to show they had died of another source's error. The write
+  deadline is now its own failure class and the main source restarts on it,
+  under the policy the supervised sources already used: 15s doubling to a 5m
+  cap, reset by a run that streamed for more than 10 minutes, and a permanent
+  stop after 6h of continuous crash-looping that returns the original error
+  with its original advice. Every other error still ends the run on the first
+  failure, unchanged. This restarts the stream and deliberately does NOT retry
+  the INSERT in place, a distinction that must survive any later
+  simplification: the deadline is enforced by the client, which cancels by
+  closing the socket without a `KILL QUERY`, so a batch that was merely slow
+  usually goes on to commit on the server after the client stopped waiting, and
+  re-running that statement would write every row a second time, permanently,
+  into a table with no natural key to deduplicate on. A restart instead replays
+  from the last checkpoint through the dedup-on-resume step, which exists to
+  drop exactly those rows. Know three limits. The breaker bounds a fast crash
+  loop, not a slow flap: a source that fails only after runs longer than the
+  healthy-reset window restarts indefinitely, which is long-standing behaviour
+  and is what you want, since capture is up for all but the backoff of such a
+  cycle. The new failure class covers the batch INSERT only, so a deadline on
+  the checkpoint or the gap record still ends the daemon as before. And the
+  daemon no longer exiting means its Prometheus target no longer disappears, so
+  an `up == 0` alert will not fire and the stream gauges freeze at their last
+  healthy value rather than rising: alert on staleness of
+  `bintrail_stream_last_flush_timestamp_seconds` instead of on a lag gauge, and
+  note that `watch` exposes no metrics at all unless `--metrics-addr` is set.
+- **A connection attempt can no longer block forever** (#1482). `Connect` and
+  `ConnectWithTLS` verified a new connection with an unbounded ping, and the
+  `timeout=` DSN parameter is the dial timeout only, with no read or write
+  timeout set anywhere. A server that accepted the TCP connection and then
+  never completed the MySQL handshake, which is what a frozen VM or an
+  idle-dropped load balancer looks like, left the caller blocked with no way
+  out. Both paths now spend the DSN's own connect budget on the handshake as
+  well, so such a peer surfaces as a ping error. The bound covers the connect
+  phase only and never becomes a read deadline on an established connection, so
+  long-running statements are unaffected; raise `timeout=` in the DSN if a
+  server legitimately needs longer to complete a handshake.
+- **A supervised source no longer gives up after one failure that follows a
+  long healthy run** (#1482). The crash-loop circuit breaker measured the
+  failed run's own uptime instead of how long the source had been failing, so a
+  source that had streamed for longer than the 6h give-up threshold, which is
+  the normal state of a healthy daemon, was marked permanently `failed` on its
+  first failure without a single retry, reporting a crash loop that had never
+  happened. It now measures from the first failure. The retry delay also
+  overflowed after 30 consecutive failures and became no delay at all, hammering
+  a failing source roughly 2h13m into what should have been a 6h budget; it now
+  stops growing once it reaches the 5m cap.
+- **The console daemon keeps its baseline run history, and says when it cannot
+  find a home directory** (#1487). A daemon started without `HOME`, which is
+  how a service manager starts one, resolved its server registry, auth file,
+  MCP token, verify history and baseline run history through a fallback
+  written as `filepath.Join(".", ".config", ...)`. That reads as though it
+  anchors to the current directory and does not: `Join` runs `Clean`, which
+  deletes the leading `"."`, so the result was a bare relative path resolved
+  against the process working directory at each IO. The path now names the
+  working directory outright. Nothing moves as a result, since no code path
+  changes directory between resolving a path and writing it; what changes is
+  that a failure names a directory an operator can go and look at, instead of
+  one that depended on when the syscall happened. Separately, and this is what
+  actually lost the history: `BaselineRunHistory.save` was the only one of five
+  sibling atomic savers that did not create its directory first, so every
+  refresh failed with `ENOENT` whenever `~/.config/bintrail` did not exist yet.
+  That is the normal state of a fresh install with a perfectly good `HOME`,
+  since nothing creates the tree until something saves into it. Because that
+  repeated failure was in practice the only signal anywhere that `HOME` was
+  unset, fixing it would have removed the signal and left the cause, so a
+  daemon with no home that falls back to a default path now warns once, naming
+  the directory it anchored to and the settings that override it. It is a warning and not a refusal:
+  losing run history must never stop a refresh, and the console is a recovery
+  path that does not decline to boot over where its own state file landed. The
+  same relative fallback was shared verbatim by `generate-key`'s default key
+  path and is fixed there too.
+- **The console daemon's background folds are bounded, and their volume warning
+  works** (#1477). `bintrail-console watch` rebuilds snapshots in the same
+  process that captures binlogs, for the scheduled baseline refresh, the
+  point-in-time restore, and the SQL export build. All three left
+  `FullTableConfig.WarnEventThreshold` at zero, and zero DISABLES that warning
+  (`threshold > 0 && n > threshold`), so the one signal that a fold was about
+  to exhaust RAM could never fire. Two of the three also left `Parallelism` at
+  zero, which means `runtime.NumCPU()`: peak memory is the sum of the tables
+  folding at once, so the daemon's memory tracked the core count of whatever
+  host it landed on. Both are now fixed at shared constants (2 tables, the
+  5,000,000 the CLI ships), and the warning's advice no longer names `--at`,
+  `--parallelism` or `--warn-event-threshold`, which this binary does not
+  register. Refreshes on hosts with more than 2 cores will take longer; the
+  daemon already reports and skips a cycle that overruns its interval.
+- **A console-generated `views.sql` pins the S3 region when it is known**
+  (#1462). The console filled no region at all, while archive reads pin one
+  detected from the bucket, so a downloaded file described a different read
+  than the one this process performs: a store that checks the signing region
+  rejected what the recipient sent. The SQL panel's own DuckDB session gets the
+  same treatment, and is resolved separately because the download names
+  archives portably while the panel is local-first. Only a region actually
+  **detected** is pinned: `s3:GetBucketLocation` is deliberately outside
+  bintrail's documented minimal IAM policy, so falling back to the daemon's
+  ambient region is the common case, and writing that guess into a file would
+  override a correct configuration on a machine bintrail cannot see, where
+  pinning nothing lets the reader's own credential chain resolve it. Detection
+  is memoized per bucket, so it stays off the SQL panel's per-query path;
+  failures expire, since a blip is not a property of a bucket. When two buckets
+  are each detected in a different region, nothing is pinned (one secret cannot
+  name two) and the file says so.
+- **The generated DuckDB views say whose server the live leg reads, and that a
+  baseline refresh never reaches a file already generated** (#1483, #1484). Two
+  things the file left the reader to find out by measuring. First, `bintrail
+  views --include-live` adds a leg that opens a connection to the index and
+  scans `binlog_events`, while the other leg reads Parquet off disk or S3. The
+  file presented those as two halves of one view and neither the flag help nor
+  the generated header said the hot half is the index capture is writing to, so
+  a large analytical query contends with capture for the same disk and buffer
+  pool. In one measured run a query over a 15 million row live table was
+  followed minutes later by capture stopping on that server. The flag help and
+  a block next to the generated `ATTACH` now say it, along with what it costs
+  today: an index write that runs past its timeout ends the run in a standalone
+  capture process (`bintrail stream`, `bintrail up`, `bintrail-pg stream`),
+  which then stays down until something restarts it, while `bintrail-console
+  watch` restarts from its last checkpoint instead. Capture is behind either
+  way. The way out is in the same block, and it is deliberately not "filter the
+  view", which that same block has just said does not reach the index: query the
+  attached `binlog_events` directly with your own `WHERE`, or point `HOST` at a
+  read replica, at the cost of that replica's own lag on top of capture lag.
+  Second, each
+  `state_<schema>_<table>` view is written with one snapshot path, resolved
+  when `bintrail views` ran. The header already said to regenerate after taking
+  or refreshing a baseline, which covers someone who takes them by hand and
+  does not cover a daemon running `bintrail-console watch
+  --baseline-refresh-interval`, where the snapshot is published on a timer and
+  nobody regenerates anything: seven snapshots
+  in forty minutes were ignored that way, with no error and no warning and
+  numbers that simply stopped changing. The header and `docs/dump-and-baseline.md`
+  now name that case and say to regenerate on the same schedule the refresh
+  runs on. The pinning itself is unchanged and deliberate, since a fixed
+  snapshot is what reproducible analysis wants, and the file already names the
+  snapshot it is bound to in its header and in every view's path, so which one
+  you have is readable without running anything. Making the views resolve the
+  newest snapshot themselves was considered and rejected: the decimal casts are
+  built from each file's Parquet footer read at generation time, so a view that
+  silently moved to a newer file would cast a changed precision wrong or fail
+  to bind on a dropped column; snapshot completeness is a `_SUCCESS` marker
+  rather than something a path expresses, and snapshots taken before that
+  marker existed are complete without one; and per-view resolution would let a
+  join between two state views land on two different snapshots when a refresh
+  publishes mid-query, which is a state that never existed. Text only: no
+  generated view's behaviour changed, and files you already have keep working.
+- **A scheduled backup refresh that refuses no longer leaves a near-complete
+  snapshot on disk** (#1473). A refresh folds every table it can before it
+  reports a refusal, and each table that folds writes its Parquet into the new
+  snapshot directory as it finishes; only the marker written at the end says the
+  result is unusable. On a server where one table carries a permanent capture
+  gap, every cycle therefore left behind a fresh directory holding all the other
+  tables and a marker saying it cannot be used. Backup discovery correctly
+  ignores such a directory, and retention cannot reclaim it either, because a
+  prune needs a confirmed S3 copy and this loop never uploads. At the old one
+  hour interval floor that was 24 directories a day; the new one minute floor
+  makes it 1440. The scheduled refresh now removes the directory its own failed
+  run created, and the failure line names that directory either way. Three
+  guards decide, and all three have to agree before anything is removed: the
+  directory has to have held nothing but a previous failed run's marker when
+  this refresh started, so everything in it now is this run's; at least one
+  table has to have refused, so a run that failed only at the last step with
+  every table already folded is kept rather than deleted; and the directory has
+  to still carry the incomplete marker, so a published backup is never a
+  candidate. When any of them says no, the directory is kept and the line says
+  which one it is and why. The second guard stands down when the directory holds
+  nothing but the marker, which is what a run that fails before its first table
+  rebuilds leaves behind: an unreachable index, a missing schema snapshot, a
+  refused archive lookup. There is no data in those to protect, and they used to
+  accumulate one empty directory per interval, each one printing a skipped
+  incomplete snapshot warning on every later listing. The removal moves the
+  directory aside first and deletes it second, so a delete interrupted part way
+  can never leave table files behind with no marker on them, which is the one
+  shape a reader would take for a real backup; a daemon killed during that
+  delete leaves the moved-aside directory behind, and the next refresh cycle for
+  that same backup directory clears it, the same way the retention prune clears
+  its own staging directories. One left in a directory the refresh no longer
+  runs for (the server was removed, or the interval was turned off) stays until
+  you remove it. Nothing changes for `bintrail baseline refresh` on the command
+  line, or for a restore or a custom `.sql` build you started yourself: those
+  keep their fragments, because someone who typed a command is there to look at
+  them. A shutdown partway through a refresh usually reclaims: a table already
+  rebuilding reports the cancellation as an ordinary table failure, so only a
+  shutdown observed while no table is in flight keeps its fragment.
+
+- **`views.sql` names archives for another machine, and says how to keep S3 working**
+  (#1456). The console download and `bintrail views` named an archive by its
+  local path whenever a local copy with data existed on the generating host,
+  which is the normal shape after a rotation that archives locally and uploads
+  to S3; on the operator's own machine that path does not exist and every
+  `events` query failed. Both now name such an archive by its S3 location
+  (`query.PortableArchiveSources`); a local path appears only when the
+  registry holds no S3 location the file can use. The console's own reads,
+  including the SQL panel, keep the local-first routing. In the console
+  download, a registry that cannot be read is now named as such in the file's
+  header (or answers 502 when there is no backup half to serve) instead of
+  reading as "nothing archived yet"; `bintrail views` fails the command as
+  before. The SQL panel still serves the `state_*` views when `archive_state`
+  cannot be read, and says so: a `warnings` entry on success, and the same
+  note after the engine's error on a failed statement. The file's S3 preamble
+  now states that the credential-chain secret lives only in the session that
+  runs the file (views persist in a database file, secrets do not) and why it
+  must not be made
+  `PERSISTENT`: DuckDB would resolve the chain at creation and write the
+  resulting keys to disk. The CLI example, the docs and the console toast that
+  piped the file into `duckdb lake.db` now show `duckdb -init views.sql lake.db`
+  and `.read views.sql`.
+
 ## [0.69.0] - 2026-08-23
 
 ### Added

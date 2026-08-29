@@ -236,7 +236,10 @@ Security notes specific to the registry:
 - The registry file, the [auth file](#password-login) (written by
   set-password), and the [managed MCP token file](#mcp-endpoint)
   (`~/.config/bintrail/console-mcp-token.yaml`, SHA-256 only) are the only
-  things the console ever writes. Their write
+  things the console ever writes. Each has a path override
+  (`--servers-file`, `--auth-file`, `--mcp-token-file`, or the matching
+  `BINTRAIL_CONSOLE_*` variable); in a container, point all three at a mounted
+  volume or they are lost when the container is recreated. Their write
   endpoints sit behind the same bearer token and Host-header guard as
   everything else.
 
@@ -375,13 +378,59 @@ panel that answers whether a restore would work, far below the fold.
   empty states explain how to produce a first baseline (`bintrail dump` →
   `bintrail baseline`). When the **Create baseline** button is enabled it sits
   in this panel's header.
+- **Scheduled backups** (#1442) — a per-server timetable, set from this page:
+  every N minutes, hours or days (at least 15m), lined up on a UTC time of
+  day. The operator picks WHEN; HOW each run is made is the daemon's decision
+  per slot (`console.ChooseBackupMethod`), and the page says which one comes
+  next and why: backups that go to S3 are always **full backups** (the Create
+  backup job, reads the source, needs `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`;
+  only a full backup uploads); a server with no previous backup on local disk
+  gets a full backup too; otherwise the newest backup is **updated from the
+  recorded changes** (the baseline-refresh fold: reads nothing from the
+  source, needs the server's own local backup directory). An update that
+  fails (a capture gap, a schema change, an internal error) falls back to a
+  full backup at the same slot when the daemon may take one (the creation
+  opt-in); otherwise that slot is recorded as skipped with both reasons.
+  Every run is a full-table snapshot, and on a server without an S3
+  destination nothing removes them automatically: the card shows the 30-day
+  count under the form, and the daemon logs it at save and at boot. Stored on the server's registry
+  entry (`backup_schedule`), read by the watch daemon every minute, so it
+  applies without a restart. The grid is fixed (`every 1d at 03:00` is 03:00
+  UTC daily; `every 6h at 03:00` is 03/09/15/21; an interval that does not
+  divide a day evenly, `5h` or `36h`, drifts through the day; the page shows
+  where it lands next). It fires only on a slot boundary the daemon is up to
+  see: a slot missed while stopped is not made up, and saving a schedule, new
+  or edited, never starts a backup on the spot (the API tells the loop the
+  save instant, so a boundary inside the next minute is not lost either). A
+  scheduled run that collides with a manual backup, restore or export skips
+  that slot rather than queuing, and the skip, like every scheduled run, is
+  written to the baseline run history (a streak of identical skips is one
+  record whose time moves to the latest missed slot) so the page shows the
+  last run, its result and the last skip after a restart too; the daemon's
+  own view of the job it last started fills in when the history file is
+  unavailable or a job died without writing one (the daemon watches every
+  job it starts, so that view is complete). When an update from the
+  recorded changes fails and a full backup is started in its place, the
+  page says so in red until a later scheduled update goes through. A
+  schedule the daemon cannot serve at all (no producer possible: creation
+  opt-in not set AND no local directory, a lock-mode misconfiguration on a
+  server whose backups go to S3, no destination) is refused on save with
+  the reason, and one already saved is reported as not runnable on the
+  page, never silently skipped.
+  `PUT`/`DELETE /api/servers/{id}/backup-schedule`; state on `GET /api/baselines`
+  (`schedule`). The daemon-wide `--baseline-refresh-interval` below is
+  independent and can run alongside.
 - **Automatic baseline refresh** — when `--baseline-refresh-interval` is set,
   the panel reports the daemon's last automatic refresh for the selected
   server: how many tables it published, or that it published nothing and why.
   A refusal there is the fail-closed contract working (a capture gap, a schema
   change), not a broken daemon — nothing was overwritten and the next run
-  retries. The refresh is opt-in on its own: it does not require, and does not
-  enable, the **Create baseline** button.
+  retries. The partial files that run wrote are removed and the daemon log
+  names the directory either way, so a table that refuses every interval does
+  not fill the disk with unusable snapshot directories
+  ([details](dump-and-baseline.md#refreshing-on-a-schedule)). The refresh is
+  opt-in on its own: it does not require, and does not enable, the **Create
+  baseline** button.
 
 **Protect → Verification** carries the verification runner and the history of
 past runs for the selected server.
@@ -410,10 +459,20 @@ compact baseline summary card and links onward:
   You get a text file; your own DuckDB executes it, in your process, on your
   machine — which is why unrestricted SQL over your lake needs no sandbox, no
   timeout and no result cap here. No credentials appear in the file (S3 uses
-  your AWS credential chain), so it is safe to share or commit. The card is
-  hidden for a server with archives disabled, for one with nothing archived and
+  your AWS credential chain), so it is safe to share or commit. Archive
+  sources are named for another machine: an archive registered with both a
+  local path and an S3 location is listed by its S3 location (state views
+  point wherever the server's backup destination points). The S3 secret it
+  creates lasts one DuckDB session, so run the file again (`.read views.sql`)
+  in each session that reads S3. The card is hidden for a server with
+  archives disabled, for one with nothing archived and
   no baseline yet, and while an access-control profile is active — the file
   maps straight onto the unredacted Parquet a profile exists to withhold.
+  For an engine that wants a table rather than files (Spark, Trino, Athena, or
+  DuckDB without the merge step), `bintrail export iceberg` writes an Apache
+  Iceberg copy of each table from the same baseline plus the change history
+  (archives and live index), kept current run after run; it is a scheduler command, not a console feature, and it
+  never runs inside `watch`. See [Iceberg export](iceberg-export.md).
 - **Usage telemetry** — the current state of dbtrail's metadata-only usage
   telemetry and a one-click opt-out. Turning it off stops this `watch` daemon's
   beacons immediately (no restart) and records the machine-wide choice, exactly
@@ -643,6 +702,7 @@ see the metrics tables and example alert rules in
 | `--baseline-s3` | — | S3 prefix of baseline snapshots (`s3://bucket/prefix/`). Enables Time-travel. |
 | `--servers-file` | `~/.config/bintrail/console-servers.yaml` | Path to the server registry YAML managed from the UI. |
 | `--auth-file` | `~/.config/bintrail/console-auth.yaml` | Console credential file enabling password login (see below). Created with `bintrail-console user set-password`, never by the server on its own. |
+| `--mcp-token-file` | `~/.config/bintrail/console-mcp-token.yaml` | Managed MCP token file (SHA-256 hash only), written by **Settings → Connect AI**. Point it at persistent storage when the console runs in a container, or a restart revokes the token. |
 | `--tls-cert` / `--tls-key` | — | Serve the console over HTTPS (PEM files, both-or-neither). Rotation = restart; no ACME. |
 | `--allow-setup` | `false` | Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. host-loopback published). Loopback always allows setup. |
 
@@ -655,6 +715,7 @@ see the metrics tables and example alert rules in
 - `BINTRAIL_CONSOLE_BASELINE_S3` — same as `--baseline-s3`.
 - `BINTRAIL_CONSOLE_SERVERS` — same as `--servers-file`.
 - `BINTRAIL_CONSOLE_AUTH` — same as `--auth-file`.
+- `BINTRAIL_CONSOLE_MCP_TOKEN_FILE`: same as `--mcp-token-file`.
 - `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
 - `BINTRAIL_CONSOLE_ALLOWED_HOSTS` — comma-separated, same as `--allowed-hosts`.
 - `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
@@ -714,8 +775,8 @@ Precedence is the usual CLI flag > environment variable > default. The
 `BINTRAIL_CONSOLE_*` variables apply equally to `bintrail-console watch` (where
 the matching flags are `--console-listen`, `--console-token`, `--baseline-dir`,
 `--baseline-s3`, `--console-servers-file`, `--console-auth-file`,
-`--console-tls-cert`, `--console-tls-key`, `--console-allowed-hosts`,
-`--console-allow-setup`).
+`--console-mcp-token-file`, `--console-tls-cert`, `--console-tls-key`,
+`--console-allowed-hosts`, `--console-allow-setup`).
 
 ## Password login
 
@@ -1075,7 +1136,8 @@ Rules that differ from the standalone `bintrail-mcp` server:
   `--token` / `BINTRAIL_CONSOLE_TOKEN` **or a managed MCP token generated
   from Settings → Connect AI** (#1052) — one click from an authenticated
   browser session, no flags, no restart. The managed token is persisted as a
-  SHA-256 hash only (`~/.config/bintrail/console-mcp-token.yaml`, `0600`,
+  SHA-256 hash only (`~/.config/bintrail/console-mcp-token.yaml`, or the
+  path given to `--mcp-token-file` / `BINTRAIL_CONSOLE_MCP_TOKEN_FILE`; `0600`,
   atomic write, versioned envelope with the registry's read-only-if-newer
   contract), its plaintext is shown exactly once at generation, and it is
   **scoped to `/mcp` alone** — it cannot drive the browser API (registry
@@ -1163,7 +1225,7 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `PUT /api/rotation` | Supervisor only (403 on the standalone console): save a global rotation override `{retain, interval, add_future}` (validated; `off` rejected). Applies live on the next cycle. |
 | `GET /api/baselines` | Read-only listing of the **selected server's** baseline snapshots, grouped per snapshot: `{configured, source, kind, reconstruct, snapshots: [{time, age_hours, tables, binlog_file, binlog_pos, gtid_set}]}` (coordinates local-only, capped at 50 snapshots). `502` when the configured source is unreadable. |
 | `GET /api/views.sql` | **Not JSON** — a `text/plain` DuckDB schema over the selected server's Parquet (the same output as `bintrail views`), served as a `views.sql` attachment. Nothing is executed here; the file runs in your own DuckDB. 404 when archives are disabled or nothing is archived yet, 403 while an access-control profile is active. |
-| `POST /api/sql` | Runs a read-only `SELECT` over the selected server's Parquet **inside the daemon**, in a locked-down DuckDB sandbox, returning `{columns, rows, row_count, truncated, elapsed_ms}`. Opt-in (`BINTRAIL_CONSOLE_SQL_PANEL=1`) — `403` otherwise. `403` while a profile is active; `404` when archives are disabled or there is nothing to query; `422` for a non-`SELECT`, a statement error, or the timeout; `429` when another query is already running. Cancellation is by aborting the request. See [The SQL panel](#the-sql-panel-opt-in). |
+| `POST /api/sql` | Runs a read-only `SELECT` over the selected server's Parquet **inside the daemon**, in a locked-down DuckDB sandbox, returning `{columns, rows, row_count, truncated, elapsed_ms}` plus an optional `warnings` list (present when the session is missing the `events` view because `archive_state` could not be read; a failed statement carries the same note after the engine message). Opt-in (`BINTRAIL_CONSOLE_SQL_PANEL=1`) — `403` otherwise. `403` while a profile is active; `404` when archives are disabled or there is nothing to query; `422` for a non-`SELECT`, a statement error, or the timeout; `429` when another query is already running. Cancellation is by aborting the request. See [The SQL panel](#the-sql-panel-opt-in). |
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 | `GET /api/profiles` | RBAC data-profile **names** defined on the selected server's index: `{"profiles": ["..."]}`, sorted; empty on a legacy index without the table. Vocabulary for administration panels (e.g. a settings-surface profile picker) — never the rules or flagged tables/columns behind a name. |
 

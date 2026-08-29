@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/parquet-go/parquet-go"
@@ -56,18 +57,45 @@ type Column struct {
 	// string match — no type conversion, ever. MySQL callers never set it,
 	// so the mydumper paths are untouched.
 	RawText bool
+
+	// DecimalPrecision and DecimalScale carry the declared (p,s) of a
+	// decimal/numeric column, and are zero for every other type. They do NOT
+	// change how the value is stored — a DECIMAL is still written as text, for
+	// the reasons MysqlToParquetNode states — they exist so a consumer that
+	// wants the number back can say which number it is. `bintrail views` uses
+	// them to cast the column in the generated state views.
+	//
+	// MySQL's own defaults are applied here so the pair always describes a real
+	// column: a bare `decimal` is (10,0) and `decimal(p)` is (p,0), the same as
+	// the server's.
+	DecimalPrecision int
+	DecimalScale     int
+}
+
+// DecimalColumn names one decimal/numeric column of a baseline table and the
+// precision and scale it was declared with.
+type DecimalColumn struct {
+	Name      string
+	Precision int
+	Scale     int
 }
 
 // colRe matches a column definition line from mydumper's schema SQL output.
-// Groups: 1=name, 2=type token, 3="unsigned" iff present.
+// Groups: 1=name, 2=type token, 3=parenthesized type arguments, 4="unsigned"
+// iff present.
 // The unsigned attribute is matched only in the tail that immediately follows
 // the type token (plus an optional display width like int(10)), so a column
 // literally named `is_unsigned` or a COMMENT containing "unsigned" never trips
-// it — the name lives in group 1 inside backticks, separate from group 3.
+// it — the name lives in group 1 inside backticks, separate from group 4.
 // The unsigned group is case-insensitive (`(?i:...)` inside a capture group, so
-// group 3 is preserved): mydumper emits lowercase by contract, but an uppercase
+// group 4 is preserved): mydumper emits lowercase by contract, but an uppercase
 // UNSIGNED from a hand-rolled schema must not silently fall through to signed.
-var colRe = regexp.MustCompile("^\\s+`([^`]+)`\\s+(\\w+)(?:\\s*\\([^)]*\\))?\\s*((?i:unsigned))?")
+// Group 3 holds a display width for int(10), a length for varchar(255), the
+// value list for enum(...), and the precision and scale for decimal(6,2). It is
+// captured rather than skipped only so the decimal family can report its
+// declared (p,s); every other type ignores it, and the group is still OPTIONAL,
+// so nothing about which lines match changes.
+var colRe = regexp.MustCompile("^\\s+`([^`]+)`\\s+(\\w+)(?:\\s*\\(([^)]*)\\))?\\s*((?i:unsigned))?")
 
 // generatedRe matches a STORED/VIRTUAL/PERSISTENT generated column's defining
 // clause: MySQL's canonical "GENERATED ALWAYS AS (`price` * `qty`) STORED",
@@ -180,12 +208,15 @@ func parseSchemaFrom(r io.Reader) ([]Column, error) {
 		}
 		name := m[1]
 		typeToken := strings.ToLower(m[2])
-		unsigned := strings.EqualFold(m[3], "unsigned")
+		unsigned := strings.EqualFold(m[4], "unsigned")
+		precision, scale := decimalPrecisionScale(typeToken, m[3])
 		cols = append(cols, Column{
-			Name:        name,
-			MySQLType:   typeToken,
-			Unsigned:    unsigned,
-			ParquetType: mysqlToParquetNode(typeToken, unsigned),
+			Name:             name,
+			MySQLType:        typeToken,
+			Unsigned:         unsigned,
+			ParquetType:      mysqlToParquetNode(typeToken, unsigned),
+			DecimalPrecision: precision,
+			DecimalScale:     scale,
 		})
 	}
 	if err := scanner.Err(); err != nil {
@@ -195,6 +226,53 @@ func parseSchemaFrom(r io.Reader) ([]Column, error) {
 		return nil, errors.New("no columns found in schema SQL")
 	}
 	return cols, nil
+}
+
+// decimalPrecisionScale reads the (p,s) out of a decimal or numeric column's
+// type arguments, applying MySQL's own defaults for the spellings that OMIT
+// them: `decimal` is (10,0) and `decimal(p)` is (p,0). Every other type gets
+// (0,0) — the same parenthesized args carry a display width for int(10) and a
+// length for varchar(255), and reporting either as a precision would invite a
+// cast that means nothing.
+//
+// Arguments that are PRESENT but unparseable return (0,0), which callers read
+// as "no usable precision" and which keeps the column stored and read as text.
+// Falling back to the defaults there would be a guess, and not an inert one: a
+// consumer casting to a narrower scale gets SILENT ROUNDING, not an error
+// (DuckDB's CAST('1.239' AS DECIMAL(10,1)) is 1.2), so `decimal(10,2x)`
+// answered as (10,0) would report every value in the column rounded to whole
+// units. A refusal costs a cast; a guess corrupts the number.
+//
+// This never fails the schema parse. The column list is what callers came for,
+// and a decimal whose precision could not be read is still a decimal.
+//
+// The MySQL defaults are only correct because the sole producer of the footer
+// key these are read back out of is mydumper's canonical output. A future
+// non-MySQL producer of an embedded CREATE TABLE must not inherit them: an
+// unconstrained PostgreSQL `numeric`, for one, is not (10,0).
+func decimalPrecisionScale(typeToken, args string) (precision, scale int) {
+	if typeToken != "decimal" && typeToken != "numeric" {
+		return 0, 0
+	}
+	if args == "" {
+		return 10, 0
+	}
+	parts := strings.Split(args, ",")
+	if len(parts) > 2 {
+		return 0, 0
+	}
+	precision, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || precision <= 0 {
+		return 0, 0
+	}
+	if len(parts) == 1 {
+		return precision, 0
+	}
+	scale, err = strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || scale < 0 {
+		return 0, 0
+	}
+	return precision, scale
 }
 
 // BuildParquetSchema converts a slice of Columns into a parquet.Schema.

@@ -108,11 +108,14 @@ func TestDoctorReportErr(t *testing.T) {
 		t.Errorf("expected nil error with no failures, got %v", err)
 	}
 
-	// One failure → error.
-	r2 := &Report{Passed: 3, Failed: 1}
+	// One failure → error. Recorded through add, the only sanctioned mutator:
+	// PreflightError derives its count from the failing checks (#1503), so a
+	// Report whose Failed counter was set by hand is not a shape that exists.
+	r2 := &Report{Passed: 3}
+	r2.add(CheckResult{Name: "binlog_format=ROW", Status: StatusFail})
 	err := r2.Err()
 	if err == nil {
-		t.Error("expected error when Failed > 0")
+		t.Error("expected error when a check failed")
 	}
 	if err != nil && !strings.Contains(err.Error(), "1 preflight check") {
 		t.Errorf("error message does not mention check count: %v", err)
@@ -1095,9 +1098,13 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 		return sqlmock.NewRows([]string{"COUNT(*)"}).AddRow(n)
 	}
 
+	// wantName is a LITERAL on purpose: PreflightError.TelemetryClass keys on
+	// the check's name (#1503), so the producer's bytes are pinned here, not
+	// the constant it happens to share with the classifier.
 	cases := []struct {
 		name            string
 		setup           func(sqlmock.Sqlmock)
+		wantName        string
 		wantStatus      CheckStatus
 		wantDetail      string
 		wantRemediation string
@@ -1108,6 +1115,7 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(0, 0))
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(schemataRows(1))
 			},
+			wantName:        "Schema visibility",
 			wantStatus:      StatusFail,
 			wantDetail:      "no tables yet",
 			wantRemediation: "Create at least one table",
@@ -1118,18 +1126,23 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(0, 0))
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(schemataRows(0))
 			},
+			wantName:        "Schema access",
 			wantStatus:      StatusFail,
 			wantDetail:      "no tables visible",
 			wantRemediation: "GRANT SELECT",
 		},
 		{
+			// The probe error is NOT a verified grants problem: the name
+			// stays "Schema visibility" (config_invalid for telemetry, not
+			// db_permission) and the error is shown, not swallowed.
 			name: "SCHEMATA probe fails → degrade to grants, never crash",
 			setup: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(0, 0))
 				m.ExpectQuery("SELECT COUNT").WillReturnError(errors.New("denied"))
 			},
+			wantName:        "Schema visibility",
 			wantStatus:      StatusFail,
-			wantDetail:      "no tables visible",
+			wantDetail:      "schema probe failed: denied",
 			wantRemediation: "GRANT SELECT",
 		},
 		{
@@ -1137,6 +1150,7 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 			setup: func(m sqlmock.Sqlmock) {
 				m.ExpectQuery("SELECT COUNT").WillReturnRows(countRows(5, 2))
 			},
+			wantName:   "Schema visibility",
 			wantStatus: StatusPass,
 			wantDetail: "5 tables across 2 schemas",
 		},
@@ -1150,6 +1164,9 @@ func TestCheckSchemaVisibility_emptyVsInvisible(t *testing.T) {
 			defer db.Close()
 			c.setup(mock)
 			got := checkSchemaVisibility(ctx, db, []string{"shop"})
+			if got.Name != c.wantName {
+				t.Errorf("Name = %q, want %q", got.Name, c.wantName)
+			}
 			if got.Status != c.wantStatus {
 				t.Errorf("status = %q, want %q (detail=%q)", got.Status, c.wantStatus, got.Detail)
 			}

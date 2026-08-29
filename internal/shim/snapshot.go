@@ -178,11 +178,21 @@ func (h *Handler) runSnapshotFullTable(q TimeTravelQuery) (*mysql.Result, error)
 			// merge — same fail-loud reasoning as the unresolved-PK branch (#822):
 			// silently returning binlog-only rows would be a partial table the
 			// operator can't distinguish from a complete one.
+			//
+			// The REASON is reconstruct.PKTypeGateReason, the one sentence
+			// verify and both reconstruct surfaces render for this limit
+			// (#1461); only the frame is this wire surface's own, and it has
+			// to be — the table name and the _flashback steer are what the
+			// operator acts on. This branch used to phrase the same limit a
+			// third way ("has type float, which the baseline merge cannot
+			// canonicalize"), so an operator meeting two surfaces had no way
+			// to tell it was one refusal.
 			return nil, mysql.NewError(mysql.ER_NO_PARTITION_FOR_GIVEN_VALUE, fmt.Sprintf(
-				"resolve %s: primary key column %s of %s.%s has type %s, which the baseline merge cannot canonicalize; "+
+				"resolve %s: %s.%s: %s; "+
 					"_snapshot cannot return a complete table (never-touched rows would be omitted) — "+
 					"use _flashback for a binlog-only view",
-				q.Type, c.Name, q.Schema, q.Table, c.DataType))
+				q.Type, q.Schema, q.Table,
+				reconstruct.PKTypeGateReason(c, "full-table _snapshot", "materialize")))
 		}
 	}
 	// A generated PK member — the MariaDB system-versioning shape (#1266) —

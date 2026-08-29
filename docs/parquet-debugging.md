@@ -26,8 +26,34 @@ bintrail views \
   --baseline-dir /data/baselines \
   --out          views.sql
 
-duckdb lake.db < views.sql
+duckdb -init views.sql lake.db
 ```
+
+`-init` runs the file as the session opens, so the views and the S3 secret are both there when you get the prompt. In a session that is already open, `.read views.sql` does the same.
+
+### How fresh is what you get (`--include-live`)
+
+By default these views read the **Parquet only**. Parquet exists for a partition once `rotate` has archived it, so everything more recent than that lives solely in the index and is absent from the views. On one measured deployment that was the most recent 12 hours. The gap is silent: a query about this morning returns no rows, which reads exactly like nothing happened.
+
+`--include-live` adds a second leg so the `events` view also covers what the index still holds:
+
+```sh
+bintrail views \
+  --index-dsn "user:pass@tcp(index-db:3306)/bintrail_index" \
+  --include-live \
+  --out views.sql
+```
+
+The view then reads both and is fresh to capture lag, which is seconds when the index keeps up. A partition that has been archived but not yet dropped exists on both sides, so the index leg excludes any `event_id` the archives already returned: **the archives win the overlap.** They have to. An archived row knows its `bintrail_id`, `event_date` and `event_hour` from its storage path, and an index row has to derive or forgo them, so letting the index win would replace a known source with NULL for every event in the overlap window.
+
+Things to know before you use it:
+
+- **You fill in the password.** The generated file carries the index host, port, database and user, because a reader on another machine needs them, and it carries no password, because the file is meant to be shared. Open it, put your password in the empty `PASSWORD ''` slot, then run it. The attachment is read-only.
+- **It needs the index reachable from wherever you run DuckDB.** The Parquet-only file works from anywhere the object store does; this one also needs a route to the index. Give `--index-dsn` a TCP address a reader can resolve: a unix socket is refused (it names one machine only), and a DSN with no address at all gets the driver's `127.0.0.1` default, which the file flags as a loopback for exactly that reason.
+- **It reads the index capture is writing to.** This is the operational difference between the two legs, and the generated file's two-leg framing hides it: the Parquet leg opens files in an object store and competes with nothing, while this one opens a connection to the index a running bintrail is inserting captured events into. A large scan there contends with those inserts for the same disk and buffer pool. On one measured run an analytical query over a 15 million row `binlog_events` was followed minutes later by capture stopping on that server. An index write that runs past its timeout ends the run in a standalone capture process (`bintrail stream`, `bintrail up`, `bintrail-pg stream`), which then stays down until something restarts it, while `bintrail-console watch` restarts from its last checkpoint instead. Capture is behind either way. Two ways to keep it off capture: query `bintrail_live."binlog_events"` directly with your own `WHERE`, which does reach the index (the next bullet has the detail), or give `--index-dsn` a read replica of the index, at the cost of that replica's own lag on top of capture lag.
+- **A filter on `events` does not become a filter on the index.** The index leg derives `event_date` and `event_hour` from `event_timestamp`, so a predicate on them is applied after the rows are read, and the anti-join needs every archived `event_id` regardless of what you asked for. Every query streams the whole live `binlog_events`, `row_before`/`row_after`/`query_text` included. For a narrow read of recent events, query `bintrail_live."binlog_events"` directly with your own `WHERE`: that one does reach the index. The generated file says all this where you will be looking when you measure it.
+
+Live rows come back with `bintrail_id` as NULL unless bintrail could establish which single source the index serves. An index row carries no source of its own, while the archived rows get theirs from the storage path, so the file says which of these it observed rather than assuming: more than one source registered, no source id registered at all (a file-mode index registers none), the registry unreadable, or the registry's id disagreeing with the id the archives are written under. Pass `--bintrail-id` to name the source yourself: it wins over the registry, the way it already does for the archive paths, and it is still cross-checked against the id those paths carry.
 
 You get:
 
@@ -47,9 +73,34 @@ Three properties worth knowing:
 
 - **bintrail never runs this SQL.** The command writes text; your DuckDB executes it, in your process, with no result caps and no server involved. There is no new query surface to secure.
 - **No credentials are in the file.** S3 access uses DuckDB's credential chain — the same thing bintrail's own reads use — so `views.sql` is safe to commit or paste into a notebook. The generated file shows the explicit-key alternative in a comment if your environment has no chain.
-- **It is a snapshot of the layout, not a live binding.** The event globs keep picking up newly rotated partitions on their own, but the `state_` views point at one baseline snapshot. Regenerate after taking or refreshing a baseline.
+- **An S3-compatible store is named in the file.** When the generating process runs with `BINTRAIL_S3_ENDPOINT`, the file sets `s3_endpoint`, `s3_url_style` and `s3_use_ssl` and repeats them in its secret, so DuckDB on another machine reads the same store instead of AWS, and keeps doing so if the secret fails. A location, not a credential: the file stays shareable.
+- **The S3 secret lasts one session.** Views persist in a `.db` file; secrets do not. Reopen `lake.db` tomorrow and `SELECT * FROM events` fails with "No credentials are provided" until you run the file again (`.read views.sql`). Do not turn the secret into a `PERSISTENT` one: DuckDB resolves your credential chain at that moment and writes the resulting keys to `~/.duckdb/stored_secrets`.
+- **Archive sources are named for another machine.** An archive registered both on the generating host and in S3 is listed by its S3 location; a local path appears only when the registry holds no S3 location for it. State views point wherever `--baseline-dir`/`--baseline-s3` points, so a local baseline directory resolves only on the host that holds it. The console's own reads still prefer the local copy.
+- **It is a snapshot of the layout, not a live binding.** The event globs keep picking up newly rotated partitions on their own, but the `state_` views point at one baseline snapshot, resolved when `bintrail views` ran and written into each view as a fixed path. Regenerate after taking or refreshing a baseline. That includes the unattended case, which is the one that catches people: a daemon running `bintrail-console watch --baseline-refresh-interval` publishes a new snapshot every interval and nothing regenerates this file, so it goes on reading the snapshot it was generated against with no error and no warning, and its numbers stop changing. **If you set that interval, regenerate on the same schedule.** The pinning is deliberate, since a fixed snapshot is what reproducible analysis wants, and the file names the snapshot it is bound to in its header so you can see which one you have.
+- **Money columns are cast back to numbers.** MySQL `DECIMAL` and `NUMERIC` are stored as text in the Parquet, so that a value MySQL can hold is never rounded to fit a narrower type. The `state_` views cast them back to `DECIMAL(p,s)` using the precision and scale the column was declared with, so `sum()` and the rest work on them directly. See below for the two cases where a column stays text.
 
 `state_` views are the snapshot's rows, not the table's current state. To materialize a *later* point in time, use `bintrail reconstruct` — folding deltas back onto a baseline is what that command does, and it is not expressible as a view.
+
+### Decimal columns read as text without the views
+
+If you point DuckDB at a baseline Parquet yourself instead of using the generated views, every `DECIMAL` and `NUMERIC` column is a `VARCHAR`, and the first aggregate you write against a money column fails:
+
+```
+Binder Error: No function matches the given name and argument types 'sum(VARCHAR)'.
+```
+
+The data is fine. bintrail stores those columns as text on purpose. MySQL allows up to `DECIMAL(65,30)` while DuckDB stops at 38 digits of precision, so no single numeric type holds every value MySQL can, and picking a narrower one would silently drop digits from a value the operator chose that column to hold. The stored text is also what bintrail's own recovery paths join and compare on, byte for byte, against the value read out of the binlog.
+
+Cast it yourself, with the precision and scale from the source table:
+
+```sql
+SELECT sum(CAST(ol_amount AS DECIMAL(6,2))) FROM read_parquet('.../order_line.parquet');
+```
+
+Or generate the views and let them do it. Some columns still read as text even in the generated views, and the file names each affected table or column and says why:
+
+- **A column wider than 38 digits** has no DuckDB `DECIMAL` to be cast to. Cast it to `DOUBLE` if an approximate result answers your question.
+- **A file that carries no column types** casts nothing at all. The views read the precision out of the `CREATE TABLE` in each Parquet footer, and three kinds of file do not have one: a baseline taken before bintrail started embedding it, which gains the casts the next time it is taken or refreshed; a PostgreSQL-source baseline, which stores every value as text by design and will not gain them; and a footer that could not be read, which is the only one of the three that is a fault and the only one that puts an error in the bintrail log.
 
 ---
 
@@ -76,6 +127,34 @@ Archive Parquet files contain 17 columns (the `pk_hash` stored generated column 
 | `schema_version` | INT | Schema snapshot version at index time |
 | `query_text` | VARCHAR | Original SQL statement, when the source logs it (nullable; archives written before statement capture existed lack the column entirely — readers substitute NULL) |
 | `query_hash` | VARCHAR | `STATEMENT_DIGEST()` of `query_text` (nullable) |
+
+---
+
+## The archives are plain Parquet on purpose
+
+bintrail does not store its archives, baselines or index as an Apache Iceberg
+table, and that is a decision rather than a gap.
+
+The archive tier is a change log: the evidence that `recover`, `reconstruct`
+and the time-travel shim rebuild rows from. Iceberg describes the state of a
+table, which is a different object. Keeping the log as plain Parquet under
+`bintrail_id=/event_date=/event_hour=` lets DuckDB prune by path with no
+catalog service to run, and keeps every reader on the recovery path free of a
+table-format dependency. Moving the archives into a table format would be a
+one-way door for that path: every consumer (`query`, `recover`, `reconstruct`,
+the shim, `restore-index`, `archive reconcile`) would carry the format's
+assumptions from then on.
+
+An output can be added or dropped, so Iceberg is an output bintrail can
+write, not the storage it reads from. That output exists:
+[`bintrail export iceberg`](iceberg-export.md) writes each table's current
+state as an Iceberg table, incrementally, for DuckDB, Spark, Trino and
+Athena to read. It reads through the paths above and writes somewhere new;
+nothing on the recovery path links the Iceberg library, and a test fails if
+that changes. If you need Iceberg as the storage layer itself, open an issue
+with the concrete case. The decision is
+revisited on evidence: a use the export cannot serve, or a recovery-path
+benefit measured against the current layout.
 
 ---
 

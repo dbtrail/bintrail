@@ -36,20 +36,12 @@ func TestParseRetain_largeDays(t *testing.T) {
 }
 
 func TestParseRetain_invalid(t *testing.T) {
-	cases := []string{
-		"",    // too short
-		"d",   // no number
-		"7x",  // unknown unit
-		"7",   // no unit
-		"-1d",   // negative
-		"0d",    // zero
-		"0h",    // zero hours
-		"1.5d",  // fractional — Sscanf silently truncated to 1d (#817)
-		"30 0d", // embedded space — Sscanf silently truncated to 30d (#817)
-		"7dd",   // trailing garbage before unit
-		" 7d",   // leading whitespace
-	}
-	for _, c := range cases {
+	// badDurations lives in interval_test.go and is deliberately shared: the
+	// two entry points are allowed to disagree about UNITS and must not
+	// disagree about how the NUMBER is read. This test used to carry its own
+	// copy of that list, which is exactly the drift the shared
+	// corpus exists to prevent.
+	for _, c := range badDurations {
 		if _, err := ParseRetain(c); err == nil {
 			t.Errorf("expected error for %q, got nil", c)
 		}

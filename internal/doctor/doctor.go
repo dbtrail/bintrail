@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -82,6 +83,18 @@ func queryErrorRemediation(query string) string {
 		"  - Server overloaded — raise the per-check timeout or check server load"
 }
 
+// schemaGrantsRemediation is the "bintrail sees no tables at all" advice,
+// shared by the two outcomes checkSchemaVisibility reaches with it: a schema
+// that is verifiably invisible, and one where the probe that would have told
+// "empty" from "invisible" failed — still the likeliest cause, just not a
+// verified one.
+const schemaGrantsRemediation = "Bintrail needs at least SELECT on information_schema to read column metadata.\n" +
+	"Grant minimum read access:\n\n" +
+	"  GRANT SELECT ON *.* TO <bintrail-user>;\n\n" +
+	"Or scope to the schemas you want indexed:\n\n" +
+	"  GRANT SELECT ON <schema>.* TO <bintrail-user>;\n\n" +
+	"Also double-check the schema names for typos."
+
 // isUnknownDatabaseErr reports whether err (possibly wrapped) is MySQL error
 // 1049 (ER_BAD_DB, "Unknown database ..."): the DSN names a database that
 // doesn't exist yet. `bintrail init` (and therefore `up`) creates the index
@@ -122,7 +135,7 @@ func Build(parent context.Context, sourceDSN, indexDSN, schemasCSV string, index
 	sourceDB, err := config.Connect(sourceDSN)
 	if err != nil {
 		report.add(CheckResult{
-			Name:   "Source MySQL connection",
+			Name:   SourceConnectionCheckName,
 			Status: StatusFail,
 			Detail: err.Error(),
 			Remediation: "Verify --source-dsn is reachable: try `mysql -h<host> -P<port> -u<user> -p<pass>`.\n" +
@@ -184,7 +197,7 @@ func checkSourceConnection(ctx context.Context, db *sql.DB) CheckResult {
 	var version string
 	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
 		return CheckResult{
-			Name:   "Source MySQL connection",
+			Name:   SourceConnectionCheckName,
 			Status: StatusFail,
 			Detail: err.Error(),
 			Remediation: "The connection opened but SELECT VERSION() failed. Common causes:\n" +
@@ -194,7 +207,7 @@ func checkSourceConnection(ctx context.Context, db *sql.DB) CheckResult {
 		}
 	}
 	return CheckResult{
-		Name:   "Source MySQL connection",
+		Name:   SourceConnectionCheckName,
 		Status: StatusPass,
 		Detail: "MySQL " + version,
 	}
@@ -679,7 +692,7 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) CheckResult {
 	rows, err := db.QueryContext(ctx, "SHOW GRANTS")
 	if err != nil {
 		return CheckResult{
-			Name:        "REPLICATION SLAVE + CLIENT grants",
+			Name:        ReplicationGrantsCheckName,
 			Status:      StatusFail,
 			Detail:      err.Error(),
 			Remediation: queryErrorRemediation("SHOW GRANTS"),
@@ -692,7 +705,7 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) CheckResult {
 		var g string
 		if err := rows.Scan(&g); err != nil {
 			return CheckResult{
-				Name:        "REPLICATION SLAVE + CLIENT grants",
+				Name:        ReplicationGrantsCheckName,
 				Status:      StatusFail,
 				Detail:      err.Error(),
 				Remediation: queryErrorRemediation("SHOW GRANTS"),
@@ -704,7 +717,7 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) CheckResult {
 	slave, client := metadata.HasReplPrivileges(grants)
 	if slave && client {
 		return CheckResult{
-			Name:   "REPLICATION SLAVE + CLIENT grants",
+			Name:   ReplicationGrantsCheckName,
 			Status: StatusPass,
 			Detail: "REPLICATION SLAVE, REPLICATION CLIENT",
 		}
@@ -727,7 +740,7 @@ func checkReplicationGrants(ctx context.Context, db *sql.DB) CheckResult {
 	}
 
 	return CheckResult{
-		Name:   "REPLICATION SLAVE + CLIENT grants",
+		Name:   ReplicationGrantsCheckName,
 		Status: StatusFail,
 		Detail: "missing: " + strings.Join(missing, ", "),
 		Remediation: fmt.Sprintf("Run on the source MySQL as a privileged user (e.g. root):\n\n"+
@@ -844,7 +857,8 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) Ch
 		// all (fix: grants / schema-name typo). Telling the operator to
 		// GRANT when the schema is simply empty sends them down the wrong
 		// path (#402).
-		if n, err := countVisibleSchemas(ctx, db, schemas); err == nil && n > 0 {
+		n, probeErr := countVisibleSchemas(ctx, db, schemas)
+		if probeErr == nil && n > 0 {
 			return CheckResult{
 				Name:   "Schema visibility",
 				Status: StatusFail,
@@ -855,16 +869,24 @@ func checkSchemaVisibility(ctx context.Context, db *sql.DB, schemas []string) Ch
 					"Then start monitoring again.",
 			}
 		}
+		if probeErr != nil {
+			// The probe that tells "empty" from "invisible" failed, so this
+			// is NOT a verified grants problem: keep the visibility name (it
+			// grades config_invalid, not db_permission, for usage telemetry)
+			// and show the probe's error instead of swallowing it. The grants
+			// advice stays, since that is still the likeliest cause.
+			return CheckResult{
+				Name:        "Schema visibility",
+				Status:      StatusFail,
+				Detail:      "no tables visible in " + filter + " (schema probe failed: " + probeErr.Error() + ")",
+				Remediation: schemaGrantsRemediation,
+			}
+		}
 		return CheckResult{
-			Name:   "Schema visibility",
-			Status: StatusFail,
-			Detail: "no tables visible in " + filter,
-			Remediation: "Bintrail needs at least SELECT on information_schema to read column metadata.\n" +
-				"Grant minimum read access:\n\n" +
-				"  GRANT SELECT ON *.* TO <bintrail-user>;\n\n" +
-				"Or scope to the schemas you want indexed:\n\n" +
-				"  GRANT SELECT ON <schema>.* TO <bintrail-user>;\n\n" +
-				"Also double-check the schema names for typos.",
+			Name:        SchemaAccessCheckName,
+			Status:      StatusFail,
+			Detail:      "no tables visible in " + filter,
+			Remediation: schemaGrantsRemediation,
 		}
 	}
 	return CheckResult{
@@ -910,7 +932,7 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) CheckResult {
 				vErr := serverDB.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version)
 				if vErr == nil {
 					return CheckResult{
-						Name:   "Index MySQL connection",
+						Name:   IndexConnectionCheckName,
 						Status: StatusPass,
 						Detail: fmt.Sprintf("MySQL %s, database=%s (does not exist yet — `bintrail init` will create it)", version, dbName),
 					}
@@ -926,7 +948,7 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) CheckResult {
 			err = fmt.Errorf("%w (server-level probe also failed: %v)", err, serverErr)
 		}
 		return CheckResult{
-			Name:   "Index MySQL connection",
+			Name:   IndexConnectionCheckName,
 			Status: StatusFail,
 			Detail: err.Error(),
 			Remediation: "Verify --index-dsn is reachable. The database does not need to exist yet — " +
@@ -937,14 +959,14 @@ func checkIndexConnection(ctx context.Context, dsn, dbName string) CheckResult {
 	var version string
 	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
 		return CheckResult{
-			Name:        "Index MySQL connection",
+			Name:        IndexConnectionCheckName,
 			Status:      StatusFail,
 			Detail:      err.Error(),
 			Remediation: queryErrorRemediation("VERSION()"),
 		}
 	}
 	return CheckResult{
-		Name:   "Index MySQL connection",
+		Name:   IndexConnectionCheckName,
 		Status: StatusPass,
 		Detail: fmt.Sprintf("MySQL %s, database=%s", version, dbName),
 	}
@@ -970,7 +992,7 @@ func checkIndexWriteAccess(ctx context.Context, dsn, dbName string) CheckResult 
 			err = fmt.Errorf("%w (server-level probe also failed: %v)", err, serverErr)
 		}
 		return CheckResult{
-			Name:   "Index write access",
+			Name:   IndexWriteAccessCheckName,
 			Status: StatusFail,
 			Detail: err.Error(),
 			Remediation: "Could not connect to --index-dsn. Verify the host/port/user are correct " +
@@ -996,7 +1018,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 		_, createErr := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName))
 		if createErr != nil {
 			return CheckResult{
-				Name:   "Index write access",
+				Name:   IndexWriteAccessCheckName,
 				Status: StatusFail,
 				Detail: fmt.Sprintf("database %q does not exist and user cannot CREATE DATABASE: %v", dbName, createErr),
 				Remediation: fmt.Sprintf("Either create the database manually as a privileged user:\n\n"+
@@ -1019,7 +1041,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 		}()
 	} else if dbErr != nil {
 		return CheckResult{
-			Name:        "Index write access",
+			Name:        IndexWriteAccessCheckName,
 			Status:      StatusFail,
 			Detail:      dbErr.Error(),
 			Remediation: queryErrorRemediation("information_schema.SCHEMATA"),
@@ -1030,7 +1052,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 	probeTable := fmt.Sprintf("`%s`.`_bintrail_doctor_probe`", dbName)
 	if _, err := db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS "+probeTable+" (id INT)"); err != nil {
 		return CheckResult{
-			Name:   "Index write access",
+			Name:   IndexWriteAccessCheckName,
 			Status: StatusFail,
 			Detail: "cannot CREATE TABLE: " + err.Error(),
 			Remediation: fmt.Sprintf("Grant table-creation privileges on the index database:\n\n"+
@@ -1044,7 +1066,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 		// passes here and then fails at runtime during `rotate` — worse than
 		// failing now.
 		return CheckResult{
-			Name:   "Index write access",
+			Name:   IndexWriteAccessCheckName,
 			Status: StatusFail,
 			Detail: "user has CREATE but not DROP TABLE: " + err.Error(),
 			Remediation: fmt.Sprintf("Grant DROP — bintrail rotates partitions and needs it at runtime:\n\n"+
@@ -1062,7 +1084,7 @@ func checkIndexWriteAccessOn(ctx context.Context, db *sql.DB, dbName string) Che
 		detail = fmt.Sprintf("database %q does not exist yet — CREATE DATABASE privilege verified; CREATE/DROP TABLE OK", dbName)
 	}
 	return CheckResult{
-		Name:   "Index write access",
+		Name:   IndexWriteAccessCheckName,
 		Status: StatusPass,
 		Detail: detail,
 	}
@@ -1179,10 +1201,102 @@ func (r *Report) Write(w io.Writer, format string) error {
 // Err returns a non-nil error when any required check failed, so the CLI exits
 // non-zero for CI/scripting use cases. Warnings do not cause failure.
 func (r *Report) Err() error {
-	if r.Failed > 0 {
-		return fmt.Errorf("%d preflight check(s) failed", r.Failed)
+	return r.ErrExcluding()
+}
+
+// Names of the checks whose failure means something other than "a setting on
+// the server is wrong". PreflightError.TelemetryClass keys on them, so they
+// are constants shared with the producers (pgstreamrun's doctor included)
+// rather than literals that could drift apart.
+const (
+	SourceConnectionCheckName   = "Source MySQL connection"
+	IndexConnectionCheckName    = "Index MySQL connection"
+	PGSourceConnectionCheckName = "Source PostgreSQL connection"
+	ReplicationGrantsCheckName  = "REPLICATION SLAVE + CLIENT grants"
+	IndexWriteAccessCheckName   = "Index write access"
+	// SchemaAccessCheckName is the schema-visibility probe's grants branch:
+	// no tables visible at all, whose remediation is GRANT SELECT. The
+	// empty-schema branch keeps the "Schema visibility" name — it is not a
+	// permission problem, and telling the operator to GRANT there sends
+	// them down the wrong path (#402) — and so do the probe's query-error
+	// branches, which grade config_invalid; an unreachable source is caught
+	// by the connection check ahead of them. An extension check that reused
+	// one of these names would be classified as if it were the built-in.
+	SchemaAccessCheckName = "Schema access"
+	// ExtensionPanicCheckName is the FAIL cliapp records when a registered
+	// extension check panics: a bug, not a setting, so it classifies as
+	// internal.
+	ExtensionPanicCheckName = "extension doctor checks"
+)
+
+// PreflightError is the typed form of "N preflight check(s) failed", so a
+// consumer can recognise a preflight refusal with errors.As instead of by its
+// text. It carries the failing checks' NAMES only (the fixed check names such
+// as "binlog_format=ROW"; extensions registered through cliapp add their own)
+// — never a Detail, which quotes server variables, grants and hostnames. The
+// message bytes are the ones the untyped error used to print.
+type PreflightError struct {
+	// Checks lists the failing checks' names in report order, after the
+	// caller's exclusions (Err: all of them; ErrExcluding: minus the named
+	// advisory checks). The count in the message is derived from it, so the
+	// two cannot disagree.
+	Checks []string
+}
+
+func (e *PreflightError) Error() string {
+	return fmt.Sprintf("%d preflight check(s) failed", len(e.Checks))
+}
+
+// TelemetryClass implements telemetry.Classed, deriving the class from WHICH
+// checks failed rather than reporting every refusal as one bucket:
+// db_connection when the source or the index could not be reached,
+// db_permission for grants, index write access or schema access, internal
+// when a registered extension check panicked, and config_invalid for
+// everything else — binlog_format, row image, log_bin, a malformed index DSN,
+// an extension's own check, and on standalone `doctor` (which excludes
+// nothing) the disk-capacity check: a setting the operator has to change.
+// Keyed on the check NAME, so a check whose probe query itself failed grades
+// as that check (config_invalid), not as the query's cause; an unreachable
+// source is caught by the connection check ahead of it. Precedence when
+// several fail together: connection, then internal,
+// then permission, then configuration — a connection failure is the root of
+// whatever failed after it (the index checks run in that order, so a
+// connect failure fails both the connection and the write-access check).
+// One imprecision is deliberate: the connection checks record a wrong
+// password as a connection failure (the cause is stringified into Detail),
+// so db_connection here reads as "could not connect as configured".
+func (e *PreflightError) TelemetryClass() string {
+	best, bestRank := "config_invalid", 0
+	for _, name := range e.Checks {
+		class, rank := checkClass(name)
+		if rank > bestRank {
+			best, bestRank = class, rank
+		}
 	}
-	return nil
+	return best
+}
+
+// checkClass maps a failing check's name to its telemetry class and the
+// class's precedence (higher wins when several checks fail together).
+func checkClass(name string) (string, int) {
+	switch name {
+	case SourceConnectionCheckName, IndexConnectionCheckName, PGSourceConnectionCheckName:
+		return "db_connection", 3
+	case ExtensionPanicCheckName:
+		return "internal", 2
+	case ReplicationGrantsCheckName, IndexWriteAccessCheckName, SchemaAccessCheckName:
+		return "db_permission", 1
+	}
+	return "config_invalid", 0
+}
+
+// BootRefusal is the error a daemon exits with when the preflight refuses
+// boot; `up` and `bintrail-console watch` share it. The %w is load-bearing:
+// it keeps the *PreflightError reachable, so the refusal keeps its
+// usage-telemetry class (config_invalid, db_connection, ...) instead of
+// collapsing to unknown.
+func BootRefusal(fatal error) error {
+	return fmt.Errorf("preflight failed (use --skip-doctor to bypass at your own risk): %w", fatal)
 }
 
 // ErrExcluding is Err but ignoring failures of the named advisory checks.
@@ -1192,24 +1306,15 @@ func (r *Report) Err() error {
 // capturing while there is still room. The standalone `doctor` command keeps
 // full FAIL semantics (CI smoke tests SHOULD go red on a capacity overrun).
 func (r *Report) ErrExcluding(advisory ...string) error {
-	failed := 0
+	var failing []string
 	for _, c := range r.Checks {
-		if c.Status != StatusFail {
+		if c.Status != StatusFail || slices.Contains(advisory, c.Name) {
 			continue
 		}
-		isAdvisory := false
-		for _, name := range advisory {
-			if c.Name == name {
-				isAdvisory = true
-				break
-			}
-		}
-		if !isAdvisory {
-			failed++
-		}
+		failing = append(failing, c.Name)
 	}
-	if failed > 0 {
-		return fmt.Errorf("%d preflight check(s) failed", failed)
+	if len(failing) == 0 {
+		return nil
 	}
-	return nil
+	return &PreflightError{Checks: failing}
 }

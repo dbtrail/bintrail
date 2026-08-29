@@ -102,6 +102,12 @@ type ServerEntry struct {
 	// The supervisor reconciles running streams against it at boot and on
 	// every edit; nothing reads it until phase 3.
 	MonitorDesired bool `yaml:"monitor_desired,omitempty"`
+	// BackupSchedule is this server's unattended backup timer (#1442): a full
+	// backup from the source, or a rebuild from the change history, on a
+	// fixed grid. Nil = no schedule. Non-secret. Edited only through the
+	// schedule endpoints; the server edit form carries it over untouched.
+	// On binaries that predate it, it round-trips through Extra.
+	BackupSchedule *BackupSchedule `yaml:"backup_schedule,omitempty"`
 
 	// Extra is the forward-compat catch-all: unknown fields written by a NEWER
 	// bintrail (e.g. the phase-2 control plane's source_dsn / server_id /
@@ -125,6 +131,24 @@ type RotationConfig struct {
 	AddFuture int    `yaml:"add_future"`
 }
 
+// BaselineRefreshConfig is the console-editable half of the baseline refresh
+// loop's configuration. The interval itself stays a daemon flag: it decides
+// whether the loop runs at all, and starting a loop that was not booted takes a
+// restart. What is here applies to a loop already running, because every cycle
+// re-reads the registry.
+type BaselineRefreshConfig struct {
+	// CarryForwardUnchanged publishes a table with no events in the window by
+	// carrying its previous Parquet file forward instead of rewriting it. Off
+	// by default: the rows are identical either way, but the on-disk
+	// representation is not. Where the filesystem allows it the two snapshots
+	// end up sharing one inode, so a prune reports space it will not reclaim
+	// while the newer snapshot references the file. Separately, and for a
+	// different reason, the carried table stays anchored at its older binlog
+	// coordinate, which is correct rather than a cost: its deltas resume
+	// exactly there.
+	CarryForwardUnchanged bool `yaml:"carry_forward_unchanged"`
+}
+
 // registryFile is the versioned on-disk envelope.
 type registryFile struct {
 	Version int `yaml:"version"`
@@ -136,7 +160,18 @@ type registryFile struct {
 	// gate, not round-tripping, is the cross-version safety net, since that
 	// older binary has neither this field nor the inline catch-all.
 	Rotation *RotationConfig `yaml:"rotation,omitempty"`
-	Servers  []ServerEntry   `yaml:"servers"`
+	// BaselineRefresh is the optional global baseline-refresh override, same
+	// shape and same additive story as Rotation above: absent means the
+	// daemon's own flags are in force, and the Extra catch-all preserves it
+	// across a binary that does not model it.
+	//
+	// A POINTER, and that is what carries the tri-state. The setting inside is
+	// a bool, so "no override" and "an override that says false" would be
+	// indistinguishable in a value type, and the daemon could never tell a
+	// console that had never been touched from one that had explicitly turned
+	// the behaviour off.
+	BaselineRefresh *BaselineRefreshConfig `yaml:"baseline_refresh,omitempty"`
+	Servers         []ServerEntry          `yaml:"servers"`
 	// Extra preserves any FUTURE envelope-level key a (future) older binary
 	// doesn't model, exactly as ServerEntry.Extra does at the entry level — so
 	// the next additive envelope field is downgrade-safe from here on. (It does
@@ -158,14 +193,12 @@ type Registry struct {
 	readOnly bool
 }
 
-// DefaultRegistryPath returns ~/.config/bintrail/console-servers.yaml,
-// mirroring generate-key's defaultKeyPath fallback behavior.
+// DefaultRegistryPath returns ~/.config/bintrail/console-servers.yaml, with
+// configPath's working-directory fallback for homeless environments. The
+// verify and baseline run histories are named as siblings of this path, so
+// they inherit whatever it resolves to.
 func DefaultRegistryPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".", ".config", "bintrail", "console-servers.yaml")
-	}
-	return filepath.Join(home, ".config", "bintrail", "console-servers.yaml")
+	return configPath("console-servers.yaml")
 }
 
 // LoadRegistry reads the registry file at path. A missing or empty file is an
@@ -242,6 +275,40 @@ func (r *Registry) Rotation() (RotationConfig, bool) {
 		return RotationConfig{}, false
 	}
 	return *r.file.Rotation, true
+}
+
+// BaselineRefresh returns the saved override and whether one exists. Absent
+// means the daemon's own defaults are in force.
+func (r *Registry) BaselineRefresh() (BaselineRefreshConfig, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.file.BaselineRefresh == nil {
+		return BaselineRefreshConfig{}, false
+	}
+	return *r.file.BaselineRefresh, true
+}
+
+// SetBaselineRefresh persists a global baseline-refresh override, rolling back
+// the in-memory value if the write fails so the two never diverge.
+//
+// A nil argument CLEARS the override, which is what returns the daemon's own
+// flag and environment to force. Without it the panel would be a one-way door:
+// the tri-state that lets a saved "off" beat a flag saying "on" also means that
+// once anything is saved, the flag can never be heard again short of editing
+// the file by hand.
+func (r *Registry) SetBaselineRefresh(bc *BaselineRefreshConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.readOnly {
+		return ErrRegistryReadOnly
+	}
+	prev := r.file.BaselineRefresh
+	r.file.BaselineRefresh = bc
+	if err := r.save(); err != nil {
+		r.file.BaselineRefresh = prev // roll back
+		return err
+	}
+	return nil
 }
 
 // SetRotation persists the global rotation policy. Like every registry

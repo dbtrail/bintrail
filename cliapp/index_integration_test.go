@@ -4,6 +4,7 @@ package cliapp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,6 +68,12 @@ func TestRunIndex_failedFileReturnsNonZero(t *testing.T) {
 	// this pass for the wrong reason.
 	if !strings.Contains(err.Error(), "file(s) failed") {
 		t.Errorf("expected the per-file aggregation error, got: %v", err)
+	}
+	// The summary must carry the first per-file failure (%w), or a typed
+	// cause loses its usage-telemetry class behind the summary (#1503). This
+	// is the loop's firstErr wiring; the helper alone has a unit test.
+	if errors.Unwrap(err) == nil {
+		t.Errorf("summary lost the per-file cause: %v", err)
 	}
 }
 

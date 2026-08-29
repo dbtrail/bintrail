@@ -20,6 +20,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baselineintegrity"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/snapshotdir"
 )
 
 // ErrNoBaseline is returned by FindBaseline when no baseline snapshot exists
@@ -117,7 +118,9 @@ func ReadBaselineRows(ctx context.Context, path string, filter map[string]string
 		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return nil, fmt.Errorf("load httpfs extension: %w", err)
 		}
-		duckdbutil.EnableS3CredentialChain(ctx, db)
+		if err := duckdbutil.EnableS3CredentialChain(ctx, db); err != nil {
+			return nil, err
+		}
 	} else if err := baselineintegrity.ValidateLocalFile(path); err != nil {
 		// At-rest integrity (#636): fail loud on a corrupt local baseline before
 		// the cascade Phase-2 scan trusts it.
@@ -194,7 +197,9 @@ func ExecSQL(ctx context.Context, source, sqlStr string) ([]map[string]any, []st
 		if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 			return nil, nil, fmt.Errorf("load httpfs extension: %w", err)
 		}
-		duckdbutil.EnableS3CredentialChain(ctx, db)
+		if err := duckdbutil.EnableS3CredentialChain(ctx, db); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	rows, err := db.QueryContext(ctx, sqlStr)
@@ -390,7 +395,9 @@ func listBaselinesS3(ctx context.Context, s3URL string) ([]BaselineFile, error) 
 	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		return nil, fmt.Errorf("load httpfs extension: %w", err)
 	}
-	duckdbutil.EnableS3CredentialChain(ctx, db)
+	if err := duckdbutil.EnableS3CredentialChain(ctx, db); err != nil {
+		return nil, err
+	}
 
 	prefix := strings.TrimSuffix(s3URL, "/")
 
@@ -557,7 +564,9 @@ func findBaselineS3(ctx context.Context, s3URL, schema, table string, at time.Ti
 	if err := duckdbutil.LoadHTTPFS(ctx, db); err != nil {
 		return "", time.Time{}, StaleWarning{}, fmt.Errorf("load httpfs extension: %w", err)
 	}
-	duckdbutil.EnableS3CredentialChain(ctx, db)
+	if err := duckdbutil.EnableS3CredentialChain(ctx, db); err != nil {
+		return "", time.Time{}, StaleWarning{}, err
+	}
 
 	prefix := strings.TrimSuffix(s3URL, "/")
 
@@ -752,18 +761,11 @@ func extractTimestampFromS3Path(path, prefix, schema, table string) (time.Time, 
 // parseDirTimestamp converts a baseline directory name like "2026-02-28T00-00-00Z"
 // to a time.Time. The format is RFC3339 with colons in the time+offset portion
 // replaced by hyphens for filesystem compatibility.
+// parseDirTimestamp delegates to snapshotdir.ParseTime so the rule lives in one
+// place: query reads the same directory names, and two hand-written parsers of
+// one format is how they drift.
 func parseDirTimestamp(name string) (time.Time, bool) {
-	idx := strings.IndexByte(name, 'T')
-	if idx < 0 {
-		return time.Time{}, false
-	}
-	// Restore colons only in the portion after 'T'.
-	rfc := name[:idx+1] + strings.ReplaceAll(name[idx+1:], "-", ":")
-	t, err := time.Parse(time.RFC3339, rfc)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t.UTC(), true
+	return snapshotdir.ParseTime(name)
 }
 
 func quoteIdent(name string) string {
