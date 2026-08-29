@@ -1471,7 +1471,12 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		ArchivesError *jsonSectionError `json:"archives_error,omitempty"`
 		Coverage      *jsonCoverage     `json:"coverage,omitempty"`
 		CoverageError *jsonSectionError `json:"coverage_error,omitempty"`
-		Baselines     []jsonBaseline    `json:"baselines,omitempty"`
+		// Baselines names a table per entry. CollectStatus never populates it
+		// on the console path (the console lists baselines through
+		// /api/baselines, which refuses a restricted session outright), so
+		// tableVisible is not applied here today; anything that starts
+		// filling it for a scoped reader must pass it through the predicate.
+		Baselines []jsonBaseline `json:"baselines,omitempty"`
 		// BaselineStaleness is the worst per-table-newest verdict — the same
 		// headline the text banner keys on (#1193).
 		BaselineStaleness string `json:"baseline_staleness,omitempty"`

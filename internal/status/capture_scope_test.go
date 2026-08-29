@@ -78,17 +78,21 @@ func TestScopeCaptureSkips_nilPredicateIsVerbatim(t *testing.T) {
 	}
 }
 
-// The explanation is rebuilt from the scoped ledger: the withheld name is
+// The explanation is rebuilt from the scoped ledger: the withheld names are
 // absent from every line, and the sentence says how many tables it is not
-// naming instead of pretending the list is complete.
+// naming instead of pretending the list is complete. The ledger goes through
+// ScopeCaptureSkips here, so the withheld names exist and the absence
+// assertion has something to catch.
 func TestExplainCaptureSkips_withheldTablesAreCountedNotNamed(t *testing.T) {
-	out := explainJoined(map[string]CaptureSkipStat{
+	out := explainJoined(ScopeCaptureSkips(map[string]CaptureSkipStat{
 		CaptureSkipReasonTableNotInSnapshot: {
-			Count: 5, Tables: []string{"app.users"}, TablesWithheld: 2,
+			Count: 5, Tables: []string{"app.users", "hr.payroll", "hr.people"},
 		},
-	})
-	if strings.Contains(out, "hr.") {
-		t.Errorf("a withheld name reached the prose:\n%s", out)
+	}, onlyApp))
+	for _, withheld := range []string{"hr.payroll", "hr.people", "hr."} {
+		if strings.Contains(out, withheld) {
+			t.Errorf("withheld name %q reached the prose:\n%s", withheld, out)
+		}
 	}
 	if !strings.Contains(out, "app.users and 2 tables outside your access changed on the source but are missing") {
 		t.Errorf("the subject must name the visible table and count the withheld ones:\n%s", out)
@@ -195,18 +199,81 @@ func TestWriteStatusJSON_tableVisibleScopesNamesEverywhere(t *testing.T) {
 	}
 }
 
-// Without a predicate the wire is byte-for-byte the pre-#1452 rendering: no
+// Without a predicate the wire is byte-for-byte what WriteStatusJSON (the
+// CLI's renderer, which has no predicate) emits for the same stream: no
 // tables_withheld key, every name present.
 func TestWriteStatusJSON_noPredicateRendersVerbatim(t *testing.T) {
 	ledger := `{"table_not_in_snapshot":{"count":5,"last_at":"2026-08-04T19:49:33Z","tables":["app.users","hr.payroll"]}}`
-	var buf bytes.Buffer
-	if err := (&StatusData{Stream: captureStream(ledger)}).WriteJSON(&buf); err != nil {
+	stream := captureStream(ledger)
+	var scoped, cli bytes.Buffer
+	if err := (&StatusData{Stream: stream}).WriteJSON(&scoped); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(buf.String(), "tables_withheld") {
-		t.Errorf("an unscoped rendering must not carry tables_withheld:\n%s", buf.String())
+	if err := WriteStatusJSON(&cli, nil, nil, nil, nil, nil, stream); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), "hr.payroll") {
-		t.Errorf("an unscoped rendering must name every table:\n%s", buf.String())
+	if !bytes.Equal(scoped.Bytes(), cli.Bytes()) {
+		t.Errorf("a nil predicate must render exactly what the CLI renders:\nStatusData: %s\nCLI:        %s", scoped.String(), cli.String())
+	}
+	if strings.Contains(scoped.String(), "tables_withheld") {
+		t.Errorf("an unscoped rendering must not carry tables_withheld:\n%s", scoped.String())
+	}
+	if !strings.Contains(scoped.String(), "hr.payroll") {
+		t.Errorf("an unscoped rendering must name every table:\n%s", scoped.String())
+	}
+}
+
+// tables_withheld is a fact about THIS rendering, never about the ledger: a
+// persisted document that carries the key (a hostile or future writer) must
+// not be able to set it. Under a nil predicate the key is absent; under a
+// predicate the count is what the predicate withheld. This is the pin on
+// CaptureSkipStat.TablesWithheld's json:"-" tag, and the ledger carries the
+// key under BOTH spellings a weakened tag would decode: the wire name
+// (`tables_withheld`, what a `json:"tables_withheld"` tag reads) and the Go
+// field name (`TablesWithheld`, what NO tag reads, case-insensitively).
+// Seeding only the wire name lets the tag-dropped mutation survive, because
+// encoding/json's case-insensitive match does not bridge the underscore.
+func TestWriteStatusJSON_persistedTablesWithheldIsIgnored(t *testing.T) {
+	ledger := `{"table_not_in_snapshot":{"count":5,"last_at":"2026-08-04T19:49:33Z","tables":["app.users","hr.payroll"],"tables_withheld":9,"TablesWithheld":9}}`
+	render := func(visible func(schema, table string) bool) (string, map[string]any) {
+		var buf bytes.Buffer
+		if err := (&StatusData{Stream: captureStream(ledger), TableVisible: visible}).WriteJSON(&buf); err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		stat := out["stream"].(map[string]any)["capture_health"].(map[string]any)["skipped"].(map[string]any)["table_not_in_snapshot"].(map[string]any)
+		return buf.String(), stat
+	}
+	body, stat := render(nil)
+	if _, present := stat["tables_withheld"]; present || strings.Contains(body, "tables_withheld") {
+		t.Errorf("a persisted tables_withheld reached the wire under a nil predicate: %v", stat)
+	}
+	if stat["count"] != float64(5) {
+		t.Errorf("count = %v, want 5", stat["count"])
+	}
+	_, stat = render(onlyApp)
+	if stat["tables_withheld"] != float64(1) {
+		t.Errorf("tables_withheld = %v, want 1 (what THIS rendering withheld, not the persisted 9)", stat["tables_withheld"])
+	}
+}
+
+// A legacy ledger (no table names at all) under a predicate: nothing to
+// withhold, so no tables_withheld key, and the legacy wording stays, since
+// the index really cannot name the tables.
+func TestWriteStatusJSON_legacyLedgerUnderPredicate(t *testing.T) {
+	ledger := `{"table_not_in_snapshot":{"count":3,"last_at":"2026-08-04T19:49:33Z"}}`
+	var buf bytes.Buffer
+	if err := (&StatusData{Stream: captureStream(ledger), TableVisible: onlyApp}).WriteJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	body := buf.String()
+	if strings.Contains(body, "tables_withheld") || strings.Contains(body, "outside your access") {
+		t.Errorf("a legacy ledger has no names to withhold, so nothing may say it did:\n%s", body)
+	}
+	if !strings.Contains(body, "cannot name them") {
+		t.Errorf("the legacy wording must survive a predicate:\n%s", body)
 	}
 }

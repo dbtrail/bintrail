@@ -55,6 +55,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and from `docs/TELEMETRY.md`. The wire format and `schema_version` are
   unchanged.
 
+### Fixed
+- **The console's capture-health detail no longer names tables a restricted
+  session cannot read** (#1452). `GET /api/status` served
+  `capture_health.skipped[*].tables` and the explanation prose built from
+  them to every session that may see the health verdict, and those name the
+  tables whose capture stopped. Every other listing already withholds a table
+  name from a session with a data profile or with per-role access rules, so
+  this was the one inventory left: a session allowed only `app.users` could
+  read the name of every table with a capture skip.
+  The names now pass through the same rule the table pickers use, per name:
+  a denied table, or one outside the session's allow list, is dropped from
+  the list and from the explanation, which is rebuilt from the filtered
+  ledger rather than left carrying the names. The counts do not change (a
+  count is not a name), and the entry says how many names it is not showing:
+  `tables_withheld` on the wire, and "app.users and 2 tables outside your
+  access" in the prose. A reason whose every table is withheld still gets its
+  sentence, in the singular when it is one table. An unrestricted session, and
+  `bintrail status`, render the ledger exactly as before.
+  Two other fields of the same payload can still carry a table name and are
+  not filtered by this change: `stream.source_health.replica_identity_not_full`
+  (PostgreSQL sources) and `files[].error_message` (file-index mode).
+  One change beyond the names: to resolve the scope, `/api/status` now looks
+  the session's data profile up on the selected server, as the events and
+  schema listings do. A session whose profile is not defined on that server
+  gets a 403 there too (and a 500 if the lookup itself fails), where it used
+  to be served unscoped. On a console with several servers, a profile
+  defined on one server and not on another now refuses the status page for
+  the second one.
+
 ## [0.70.0] - 2026-08-28
 
 ### Added
@@ -112,23 +141,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   round trip against a real MinIO.
 
 ### Fixed
-- **The console's status page no longer names tables a restricted session
-  cannot read** (#1452). `GET /api/status` carried the capture-health detail
-  for every session that may see the health verdict, and that detail names the
-  tables whose capture stopped, in `capture_health.skipped[*].tables` and in
-  the explanation prose. Every other listing already withholds a table name
-  from a session with a data profile or with per-role access rules, so the
-  status page was the one inventory left: a session allowed only `app.users`
-  could read the name of every table with a capture skip.
-  The names now pass through the same rule the table pickers use, per name:
-  a denied table, or one outside the session's allow list, is dropped from
-  the list and from the explanation, which is rebuilt from the filtered
-  ledger rather than left carrying the names. The counts do not change (a
-  count is not a name), and the entry says how many names it is not showing:
-  `tables_withheld` on the wire, and "app.users and 2 tables outside your
-  access" in the prose. A reason whose every table is withheld still gets its
-  sentence, in the singular when it is one table. An unrestricted session, and
-  `bintrail status`, render the ledger exactly as before.
 - **A crash while refreshing a schema snapshot no longer stops capture**
   (#1497). Under `bintrail-console watch` one process is both the console and
   the capture plane, and neither of the two goroutines behind the Status page's

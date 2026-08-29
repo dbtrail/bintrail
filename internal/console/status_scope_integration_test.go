@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/dbtrail/dbtrail/ext"
+	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -160,4 +161,28 @@ func TestIntegrationStatusCaptureSkipsProfileScopesNames(t *testing.T) {
 	if rec := getPath(t, srv, "127.0.0.1:8090", "/api/status", scopedBearer(t, srv, "ghost")); rec.Code != 403 {
 		t.Errorf("a session with an undefined profile must be refused (403), got %d: %s", rec.Code, rec.Body.String())
 	}
+}
+
+// TestIntegrationStatusCaptureSkipsStartupFloorScopesNames: the startup
+// --profile floor (Config.DenyTables) is part of the scope too, exactly as it
+// is for the pickers, so a STATIC token on a floored console has the denied
+// name withheld. Every other case here starts floor-less; without this one a
+// tableVisible that read only session fields would pass them all.
+func TestIntegrationStatusCaptureSkipsStartupFloorScopesNames(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+	db, dbName := testutil.CreateTestDB(t)
+	testutil.InitIndexTables(t, db)
+	srv, err := New(Config{
+		DB:         db,
+		DBName:     dbName,
+		Listen:     "127.0.0.1:8090",
+		Token:      "static-tok",
+		DenyTables: []query.SchemaTable{{Schema: "app", Table: "secrets"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedStatusSkipLedger(t, srv)
+	body, ch := statusFor(t, srv, "static-tok")
+	assertScopedStatus(t, body, ch)
 }

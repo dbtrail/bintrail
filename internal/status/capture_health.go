@@ -217,7 +217,7 @@ func remedyLine(reason string) string {
 			"Overview → \"Refresh schema snapshot\". On the command line: `bintrail snapshot --source-dsn " +
 			"<source> --index-dsn <index>`, then restart the stream so it picks the new snapshot up."
 	case CaptureSkipReasonTableExcludedFromSnapshot:
-		return "Fix: give each table listed above an explicit PRIMARY KEY on an InnoDB engine at the source. " +
+		return "Fix: give each table this reason covers an explicit PRIMARY KEY on an InnoDB engine at the source. " +
 			"Re-snapshotting is NOT the fix here — validation excludes these tables again every time, so a " +
 			"fresh snapshot would leave capture exactly as it is now."
 	case CaptureSkipReasonStatementFormatDML:
