@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package is guarded the day it appears; the console, MCP and pg binaries are
   pinned free of both. Records the #1467 decision mechanically: Iceberg is an
   output, not the storage layer.
+- **Primary key ranges on `query` and `recover`** (#1440). `--pk-min` /
+  `--pk-max` (MCP: `pk_min` / `pk_max`), inclusive, either bound alone or
+  both, answer "every event on ids 1000 through 1999" without enumerating the
+  keys into `--pks`. Single-column integer keys only: the table's key is read
+  from the schema snapshot before anything runs, and a composite, DECIMAL,
+  FLOAT, string or binary key is refused with the table's actual key shape.
+  The stored key is text, so both engines cast it to a 64-bit integer whose
+  signedness matches the column (SIGNED/UNSIGNED on the live index, BIGINT/
+  UBIGINT over the Parquet archives), and a bound the column cannot hold is
+  refused up front; the live and archived result sets are pinned equal for
+  keys that expose string order (9, 10, 100), negatives and 64-bit width. The
+  range cannot use the key index, so it scans the partitions the time filters
+  keep: the help text says so and points at `--since`/`--until`. See
+  docs/query-and-recovery.md.
 
 ### Changed
 - **Usage telemetry classifies first-run failures** (#1503). A fresh install

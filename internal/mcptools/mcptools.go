@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"os"
 	"strconv"
 	"strings"
@@ -456,6 +457,8 @@ type QueryArgs struct {
 	Table         string   `json:"table,omitempty" jsonschema:"Filter by table name"`
 	PK            string   `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys e.g. 123 or 123|2)"`
 	PKs           []string `json:"pks,omitempty" jsonschema:"Filter by multiple primary key values (each pipe-delimited for composite keys); requires schema and table; mutually exclusive with pk"`
+	PKMin         string   `json:"pk_min,omitempty" jsonschema:"Inclusive lower bound on the primary key, as an integer string. Only for tables whose primary key is one integer column (signed or unsigned); a composite or non-integer key is refused with the table's actual key shape. Requires schema and table; cannot be combined with pk or pks. A range cannot use the key index, so it scans the partitions the time filters keep: pair it with since and until."`
+	PKMax         string   `json:"pk_max,omitempty" jsonschema:"Inclusive upper bound on the primary key, as an integer string; same rules as pk_min, and either bound works alone."`
 	LimitPerPK    int      `json:"limit_per_pk,omitempty" jsonschema:"Cap returned events per pk_values to the latest N (0 = unlimited); requires pk or pks"`
 	EventType     string   `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
 	GTID          string   `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
@@ -494,6 +497,8 @@ type RecoverArgs struct {
 	Table      string   `json:"table,omitempty" jsonschema:"Filter by table name"`
 	PK         string   `json:"pk,omitempty" jsonschema:"Filter by primary key value (pipe-delimited for composite keys)"`
 	PKs        []string `json:"pks,omitempty" jsonschema:"Filter by multiple primary key values (each pipe-delimited for composite keys); requires schema and table; mutually exclusive with pk"`
+	PKMin      string   `json:"pk_min,omitempty" jsonschema:"Inclusive lower bound on the primary key, as an integer string. Only for tables whose primary key is one integer column (signed or unsigned); a composite or non-integer key is refused with the table's actual key shape. Requires schema and table; cannot be combined with pk or pks. A range cannot use the key index, so it scans the partitions the time filters keep: pair it with since and until."`
+	PKMax      string   `json:"pk_max,omitempty" jsonschema:"Inclusive upper bound on the primary key, as an integer string; same rules as pk_min, and either bound works alone."`
 	LimitPerPK int      `json:"limit_per_pk,omitempty" jsonschema:"Cap reversed events per pk_values to the latest N (0 = unlimited); requires pk or pks"`
 	EventType  string   `json:"event_type,omitempty" jsonschema:"Filter by event type: INSERT UPDATE or DELETE"`
 	GTID       string   `json:"gtid,omitempty" jsonschema:"Filter by GTID (e.g. uuid:42)"`
@@ -574,6 +579,8 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 			Table:         args.Table,
 			PK:            args.PK,
 			PKs:           args.PKs,
+			PKMin:         args.PKMin,
+			PKMax:         args.PKMax,
 			LimitPerPK:    args.LimitPerPK,
 			EventType:     args.EventType,
 			GTID:          args.GTID,
@@ -585,6 +592,11 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 			Limit:         args.Limit,
 		}, DefaultQueryLimit)
 		if err != nil {
+			return ErrorResult(err), nil, nil
+		}
+		// pk_min/pk_max: check the table's key shape and pick the cast BEFORE
+		// any fetch (#1440). A refusal here names the table's actual key.
+		if err := t.resolvePKRange(&opts); err != nil {
 			return ErrorResult(err), nil, nil
 		}
 
@@ -764,6 +776,8 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 			Table:      args.Table,
 			PK:         args.PK,
 			PKs:        args.PKs,
+			PKMin:      args.PKMin,
+			PKMax:      args.PKMax,
 			LimitPerPK: args.LimitPerPK,
 			EventType:  args.EventType,
 			GTID:       args.GTID,
@@ -774,6 +788,11 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 			Limit:      args.Limit,
 		}, DefaultRecoverLimit)
 		if err != nil {
+			return ErrorResult(err), nil, nil
+		}
+		// Same shape check as the query tool (#1440), before any fetch: a
+		// reversal over a lexicographic "range" would undo rows nobody named.
+		if err := t.resolvePKRange(&opts); err != nil {
 			return ErrorResult(err), nil, nil
 		}
 		// The surface's hard cap on the reversal window (console: same cap as
@@ -1346,6 +1365,8 @@ type FilterParams struct {
 	Table         string
 	PK            string
 	PKs           []string
+	PKMin         string
+	PKMax         string
 	LimitPerPK    int
 	EventType     string
 	GTID          string
@@ -1382,6 +1403,69 @@ func cleanPKs(pks []string) ([]string, error) {
 	return out, nil
 }
 
+// buildPKRange is the pre-fetch half of pk_min/pk_max (#1440): the pairing
+// rules and the integer syntax of each bound. The range it returns is
+// UNRESOLVED (no cast yet); the handler completes it with
+// Target.resolvePKRange once it holds the schema snapshot, and every engine
+// refuses a range that skipped that step.
+func buildPKRange(p FilterParams) (*query.PKRange, error) {
+	if p.PKMin == "" && p.PKMax == "" {
+		return nil, nil
+	}
+	if p.Schema == "" || p.Table == "" {
+		return nil, fmt.Errorf("pk_min/pk_max require both schema and table")
+	}
+	if p.PK != "" || len(p.PKs) > 0 {
+		return nil, fmt.Errorf("pk_min/pk_max cannot be combined with pk or pks; use the range or the exact keys")
+	}
+	var lo, hi *big.Int
+	var err error
+	if p.PKMin != "" {
+		if lo, err = query.ParsePKBound(p.PKMin); err != nil {
+			return nil, fmt.Errorf("pk_min: %w", err)
+		}
+	}
+	if p.PKMax != "" {
+		if hi, err = query.ParsePKBound(p.PKMax); err != nil {
+			return nil, fmt.Errorf("pk_max: %w", err)
+		}
+	}
+	r, err := query.NewPKRange(lo, hi)
+	if err != nil {
+		return nil, fmt.Errorf("pk_min/pk_max: %w", err)
+	}
+	return r, nil
+}
+
+// resolvePKRange completes a pk_min/pk_max request against the schema
+// snapshot: the table's key must be one integer column, and the cast both
+// engines compare through is chosen from its signedness. A preloaded resolver
+// (console bundles) is used as is; otherwise one is loaded for the call. No
+// snapshot means a refusal, not a guessed cast.
+func (t *Target) resolvePKRange(opts *query.Options) error {
+	if opts.PKRange == nil {
+		return nil
+	}
+	resolver := t.Resolver
+	if !t.ResolverLoaded {
+		var err error
+		if resolver, err = metadata.NewResolver(t.DB, 0); err != nil {
+			return fmt.Errorf("pk_min/pk_max need the schema snapshot to check the primary key type: %w", err)
+		}
+	}
+	if resolver == nil {
+		return errors.New("pk_min/pk_max need the schema snapshot to check the primary key type, and this server has none loaded")
+	}
+	tm, err := resolver.Resolve(opts.Schema, opts.Table)
+	if err != nil {
+		return fmt.Errorf("pk_min/pk_max: %w", err)
+	}
+	if err := opts.PKRange.ResolveCast(tm); err != nil {
+		return fmt.Errorf("pk_min/pk_max: %w", err)
+	}
+	return nil
+}
+
 // BuildQueryOptions converts the shared tool filter parameters into a
 // query.Options, validating cross-field requirements and applying the default
 // limit to a non-positive request.
@@ -1404,6 +1488,10 @@ func BuildQueryOptions(p FilterParams, defaultLimit int) (query.Options, error) 
 	}
 	if p.LimitPerPK > 0 && p.PK == "" && len(pks) == 0 {
 		return query.Options{}, fmt.Errorf("limit_per_pk requires pk or pks")
+	}
+	pkRange, err := buildPKRange(p)
+	if err != nil {
+		return query.Options{}, err
 	}
 	if p.ChangedColumn != "" && (p.Schema == "" || p.Table == "") {
 		return query.Options{}, fmt.Errorf("changed_column requires both schema and table")
@@ -1439,6 +1527,7 @@ func BuildQueryOptions(p FilterParams, defaultLimit int) (query.Options, error) 
 		Table:         p.Table,
 		PKValues:      p.PK,
 		PKValuesIn:    pks,
+		PKRange:       pkRange,
 		LimitPerPK:    p.LimitPerPK,
 		EventType:     et,
 		GTID:          p.GTID,
