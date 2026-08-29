@@ -81,7 +81,7 @@ Three properties worth knowing:
 
 `state_` views are the snapshot's rows, not the table's current state. To materialize a *later* point in time, use `bintrail reconstruct` — folding deltas back onto a baseline is what that command does, and it is not expressible as a view.
 
-**Deleted rows are not in the `state_` views, and they are not lost.** A `state_<schema>_<table>` view is the table as it stood at the snapshot, so a row deleted before that instant is not in it, and a `baseline refresh` applies a DELETE by dropping the row, the same way the table did. There is no `_deleted` marker column, which is what a warehouse connector would give you instead. The row lives in the `events` view: every DELETE is kept with its full before-image in `row_before`, for as long as the archives are kept.
+**Deleted rows are not in the `state_` views, and they are not lost.** A `state_<schema>_<table>` view is the table as it stood at the snapshot, so a row deleted before that instant is not in it, and a `baseline refresh` applies a DELETE by dropping the row, the same way the table did. There is no `_deleted` marker column, which is what a warehouse connector would give you instead. The row lives in the `events` view: every DELETE is kept with its full before-image in `row_before`, for as long as the archives are kept. Generated without `--include-live`, `events` covers the archives only, so a DELETE from the last few hours is not in it until rotation archives its partition; generate with `--include-live` to read the index too.
 
 ```sql
 SELECT event_timestamp, pk_values, row_before
