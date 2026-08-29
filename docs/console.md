@@ -426,6 +426,11 @@ compact baseline summary card and links onward:
   archives disabled, for one with nothing archived and
   no baseline yet, and while an access-control profile is active — the file
   maps straight onto the unredacted Parquet a profile exists to withhold.
+  For an engine that wants a table rather than files (Spark, Trino, Athena, or
+  DuckDB without the merge step), `bintrail export iceberg` writes an Apache
+  Iceberg copy of each table from the same baseline and archives, kept current
+  run after run; it is a scheduler command, not a console feature, and it
+  never runs inside `watch`. See [Iceberg export](iceberg-export.md).
 - **Usage telemetry** — the current state of dbtrail's metadata-only usage
   telemetry and a one-click opt-out. Turning it off stops this `watch` daemon's
   beacons immediately (no restart) and records the machine-wide choice, exactly
