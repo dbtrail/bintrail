@@ -20,13 +20,23 @@ import (
 )
 
 // expectProfileLookup queues the SELECT AddProfile runs before its INSERT
-// (the case-insensitive collision check); existing == "" is "no such row".
+// (the collision check); existing == "" is "no such row".
 func expectProfileLookup(mock sqlmock.Sqlmock, existing string) {
 	rows := sqlmock.NewRows([]string{"name"})
 	if existing != "" {
 		rows.AddRow(existing)
 	}
 	mock.ExpectQuery("SELECT name FROM profiles").WillReturnRows(rows)
+}
+
+// expectFlagLookup queues the SELECT AddFlag runs before its INSERT; a nil
+// existing is "no such row".
+func expectFlagLookup(mock sqlmock.Sqlmock, existing *accessprofiles.Flag) {
+	rows := sqlmock.NewRows([]string{"schema_name", "table_name", "column_name", "flag"})
+	if existing != nil {
+		rows.AddRow(existing.Schema, existing.Table, existing.Column, existing.Name)
+	}
+	mock.ExpectQuery("FROM table_flags WHERE").WillReturnRows(rows)
 }
 
 // accessRoutes is every route of the surface: the GET and the six verbs,
@@ -215,11 +225,23 @@ func TestAccessProfilesRefusalsAreTheSharedMessages(t *testing.T) {
 // TestAccessProfilesTrimsNames: the page trims its inputs, and so does the
 // API, so "marketing " typed into another client is the same profile, and
 // a flag on "customers " is a flag on customers. Pinned on the arguments
-// that reach the database.
+// that reach the database AND on the audit event: the writer trims, so the
+// event must name the row as stored, not the bytes as typed.
 func TestAccessProfilesTrimsNames(t *testing.T) {
+	rec := audittest.Install(t)
+	oneEvent := func(t *testing.T, action string) ext.AuditEvent {
+		t.Helper()
+		evs := rec.Events()
+		if len(evs) != 1 || evs[0].Action != action {
+			t.Fatalf("audit events = %+v, want one %s", evs, action)
+		}
+		return evs[0]
+	}
 	t.Run("flag add", func(t *testing.T) {
+		rec.Reset()
 		db, mock, closeDB := newSQLMock(t)
 		defer closeDB()
+		expectFlagLookup(mock, nil)
 		mock.ExpectExec("INSERT INTO table_flags").WithArgs("app", "customers", "email", "pii").
 			WillReturnResult(sqlmock.NewResult(1, 1))
 		expectAccessDoc(mock)
@@ -228,11 +250,33 @@ func TestAccessProfilesTrimsNames(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
 		}
+		ev := oneEvent(t, "flag.add")
+		if ev.Schema != "app" || ev.Table != "customers" || ev.Detail["flag"] != "pii" || ev.Detail["column"] != "email" {
+			t.Errorf("audit names the untrimmed input: schema=%q table=%q detail=%v", ev.Schema, ev.Table, ev.Detail)
+		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Error(err)
 		}
 	})
+	t.Run("flag remove", func(t *testing.T) {
+		rec.Reset()
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		mock.ExpectExec("DELETE FROM table_flags").WithArgs("app", "customers", "", "pii").
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		expectAccessDoc(mock)
+		w := driveAccess(t, newBootServer(db), (*Server).handleAccessFlagRemove,
+			`{"flag":"pii ","schema":" app","table":"customers "}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+		}
+		ev := oneEvent(t, "flag.remove")
+		if ev.Schema != "app" || ev.Table != "customers" || ev.Detail["flag"] != "pii" {
+			t.Errorf("audit names the untrimmed input: schema=%q table=%q detail=%v", ev.Schema, ev.Table, ev.Detail)
+		}
+	})
 	t.Run("profile add", func(t *testing.T) {
+		rec.Reset()
 		db, mock, closeDB := newSQLMock(t)
 		defer closeDB()
 		mock.ExpectQuery("SELECT name FROM profiles").WithArgs("marketing").
@@ -245,11 +289,46 @@ func TestAccessProfilesTrimsNames(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
 		}
+		if ev := oneEvent(t, "profile.add"); ev.Detail["profile"] != "marketing" {
+			t.Errorf("audit names the untrimmed input: %v", ev.Detail)
+		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Error(err)
 		}
 	})
+	t.Run("profile remove", func(t *testing.T) {
+		rec.Reset()
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		mock.ExpectExec("DELETE FROM profiles").WithArgs("marketing").WillReturnResult(sqlmock.NewResult(0, 1))
+		expectAccessDoc(mock)
+		w := driveAccess(t, newBootServer(db), (*Server).handleAccessProfileRemove, `{"name":" marketing "}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+		}
+		if ev := oneEvent(t, "profile.remove"); ev.Detail["profile"] != "marketing" {
+			t.Errorf("audit names the untrimmed input: %v", ev.Detail)
+		}
+	})
+	t.Run("rule add", func(t *testing.T) {
+		rec.Reset()
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		mock.ExpectQuery("SELECT id FROM profiles").WithArgs("marketing").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(7)))
+		mock.ExpectExec("INSERT INTO access_rules").WithArgs(int64(7), "pii", "deny").WillReturnResult(sqlmock.NewResult(1, 1))
+		expectAccessDoc(mock)
+		w := driveAccess(t, newBootServer(db), (*Server).handleAccessRuleAdd,
+			`{"profile":"marketing ","flag":" pii","permission":" deny "}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+		}
+		ev := oneEvent(t, "access.add")
+		if ev.Detail["profile"] != "marketing" || ev.Detail["flag"] != "pii" || ev.Detail["permission"] != "deny" {
+			t.Errorf("audit names the untrimmed input: %v", ev.Detail)
+		}
+	})
 	t.Run("rule remove", func(t *testing.T) {
+		rec.Reset()
 		db, mock, closeDB := newSQLMock(t)
 		defer closeDB()
 		mock.ExpectExec("DELETE ar FROM access_rules").WithArgs("marketing", "pii").
@@ -259,29 +338,59 @@ func TestAccessProfilesTrimsNames(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
 		}
+		ev := oneEvent(t, "access.remove")
+		if ev.Detail["profile"] != "marketing" || ev.Detail["flag"] != "pii" {
+			t.Errorf("audit names the untrimmed input: %v", ev.Detail)
+		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Error(err)
 		}
 	})
 }
 
-// TestAccessProfilesCaseCollisionIs409: the unique key on profiles.name is
-// case-insensitive, so adding "Marketing" beside "marketing" would have
-// updated the existing row and answered as if a profile had been added.
-// It is refused, naming the row that is there, and nothing is written.
+// TestAccessProfilesCaseCollisionIs409: the unique keys fold case and
+// accents, so adding "Marketing" beside "marketing" would have updated the
+// existing row and answered as if a profile had been added, and "PII" on a
+// table that carries "pii" would have kept the stored spelling and
+// answered as if a flag had been added. Both are refused, naming the row
+// that is there, nothing is written and nothing is audited.
 func TestAccessProfilesCaseCollisionIs409(t *testing.T) {
-	db, mock, closeDB := newSQLMock(t)
-	defer closeDB()
-	expectProfileLookup(mock, "marketing")
-	w := driveAccess(t, newBootServer(db), (*Server).handleAccessProfileAdd, `{"name":"Marketing"}`)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("code=%d body=%s, want 409", w.Code, w.Body.String())
-	}
-	if got := decodeErr(t, w); got != `a profile named "marketing" already exists (names are case-insensitive)` {
-		t.Errorf("error = %q", got)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Error(err)
+	rec := audittest.Install(t)
+	t.Run("profile", func(t *testing.T) {
+		rec.Reset()
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		expectProfileLookup(mock, "marketing")
+		w := driveAccess(t, newBootServer(db), (*Server).handleAccessProfileAdd, `{"name":"Marketing"}`)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("code=%d body=%s, want 409", w.Code, w.Body.String())
+		}
+		if got := decodeErr(t, w); got != `a profile named "marketing" already exists (the index compares names without regard to case or accents)` {
+			t.Errorf("error = %q", got)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Run("flag", func(t *testing.T) {
+		rec.Reset()
+		db, mock, closeDB := newSQLMock(t)
+		defer closeDB()
+		expectFlagLookup(mock, &accessprofiles.Flag{Schema: "app", Table: "customers", Column: "email", Name: "pii"})
+		w := driveAccess(t, newBootServer(db), (*Server).handleAccessFlagAdd,
+			`{"flag":"PII","schema":"app","table":"customers","column":"email"}`)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("code=%d body=%s, want 409", w.Code, w.Body.String())
+		}
+		if got := decodeErr(t, w); got != `flag "pii" already exists on app.customers (email) (the index compares names without regard to case or accents)` {
+			t.Errorf("error = %q", got)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	})
+	if evs := rec.Events(); len(evs) != 0 {
+		t.Errorf("a refused add audited %+v", evs)
 	}
 }
 
@@ -534,39 +643,55 @@ func TestAccessProfilesRefusesDataProfileSession(t *testing.T) {
 }
 
 // TestAccessProfilesRefusedUnderStartupProfile: a console started under
-// --profile refuses the whole surface too, on the same floor recover-cascade
-// and verify use. It does not rewrite the rows that profile is built from.
-// No session is involved, so nothing is audited and the message names the
-// startup profile, not a session.
+// --profile refuses the whole surface too. The floor is the NAMED profile
+// (profileActiveFor), not the resolved rules: a profile with no rules yet
+// is a profile all the same, and a fresh index under `serve --profile` is
+// exactly where the first rule would be authored, so the zero-rule case is
+// the one that matters. No session is involved, so nothing is audited and
+// the message names the startup profile, not a session.
 func TestAccessProfilesRefusedUnderStartupProfile(t *testing.T) {
 	rec := audittest.Install(t)
-	db, mock, closeDB := newSQLMock(t)
-	defer closeDB()
-	srv, err := New(Config{
-		DB: db, DBName: "idx",
-		Listen: "127.0.0.1:8090", Token: "static-tok", NoArchive: true,
-		AuthPath:      filepath.Join(t.TempDir(), "auth.yaml"),
-		DenyTables:    []query.SchemaTable{{Schema: "app", Table: "invoices"}},
-		ProfileActive: true,
-	})
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name          string
+		deny          []query.SchemaTable
+		profileActive bool
+	}{
+		{"named profile with no rules", nil, true},
+		{"rules without the flag (older callers)", []query.SchemaTable{{Schema: "app", Table: "invoices"}}, false},
+		{"named profile with rules", []query.SchemaTable{{Schema: "app", Table: "invoices"}}, true},
 	}
-	for _, rt := range accessRoutes {
-		w := accessReq(t, srv, rt.method, rt.path, "static-tok", rt.body)
-		if w.Code != http.StatusForbidden {
-			t.Errorf("%s %s under a startup profile = %d body=%s, want 403", rt.method, rt.path, w.Code, w.Body.String())
-			continue
-		}
-		if got := decodeErr(t, w); got != accessProfilesStartupRefusal {
-			t.Errorf("%s %s error = %q", rt.method, rt.path, got)
-		}
-	}
-	if evs := rec.Events(); len(evs) != 0 {
-		t.Errorf("a startup-profile refusal audited %+v; only a session refusal is a profile.denied", evs)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Error(err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec.Reset()
+			db, mock, closeDB := newSQLMock(t)
+			defer closeDB()
+			srv, err := New(Config{
+				DB: db, DBName: "idx",
+				Listen: "127.0.0.1:8090", Token: "static-tok", NoArchive: true,
+				AuthPath:      filepath.Join(t.TempDir(), "auth.yaml"),
+				DenyTables:    tc.deny,
+				ProfileActive: tc.profileActive,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, rt := range accessRoutes {
+				w := accessReq(t, srv, rt.method, rt.path, "static-tok", rt.body)
+				if w.Code != http.StatusForbidden {
+					t.Errorf("%s %s under a startup profile = %d body=%s, want 403", rt.method, rt.path, w.Code, w.Body.String())
+					continue
+				}
+				if got := decodeErr(t, w); got != accessProfilesStartupRefusal {
+					t.Errorf("%s %s error = %q", rt.method, rt.path, got)
+				}
+			}
+			if evs := rec.Events(); len(evs) != 0 {
+				t.Errorf("a startup-profile refusal audited %+v; only a session refusal is a profile.denied", evs)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Error(err)
+			}
+		})
 	}
 }
 

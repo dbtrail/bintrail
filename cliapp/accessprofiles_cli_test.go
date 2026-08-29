@@ -122,7 +122,24 @@ func TestCLIRefusesLongAndCaseCollidingNames(t *testing.T) {
 		proIndexDSN, proDescription = "mock", ""
 		profileAddCmd.SetContext(ctx)
 		err := runProfileAdd(profileAddCmd, []string{"Marketing"})
-		if err == nil || err.Error() != `a profile named "marketing" already exists (names are case-insensitive)` {
+		if err == nil || err.Error() != `a profile named "marketing" already exists (the index compares names without regard to case or accents)` {
+			t.Errorf("got %v", err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	})
+	t.Run("flag add spelled like an existing one", func(t *testing.T) {
+		mock := mockIndex(t)
+		mock.ExpectQuery("FROM table_flags WHERE").WithArgs("app", "customers", "email", "PII").
+			WillReturnRows(sqlmock.NewRows([]string{"schema_name", "table_name", "column_name", "flag"}).
+				AddRow("app", "customers", "email", "pii"))
+		old := []string{flgIndexDSN, flgSchema, flgTable, flgColumn}
+		t.Cleanup(func() { flgIndexDSN, flgSchema, flgTable, flgColumn = old[0], old[1], old[2], old[3] })
+		flgIndexDSN, flgSchema, flgTable, flgColumn = "mock", "app", "customers", "email"
+		flagAddCmd.SetContext(ctx)
+		err := runFlagAdd(flagAddCmd, []string{"PII"})
+		if err == nil || err.Error() != `flag "pii" already exists on app.customers (email) (the index compares names without regard to case or accents)` {
 			t.Errorf("got %v", err)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {

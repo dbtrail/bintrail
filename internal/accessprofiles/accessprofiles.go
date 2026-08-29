@@ -115,16 +115,35 @@ func (e *RuleNotFoundError) Error() string {
 	return fmt.Sprintf("access rule not found: profile=%q flag=%q", e.Profile, e.Flag)
 }
 
-// ProfileExistsError is an AddProfile whose name differs only by letter case
-// (or whatever else the index's collation ignores) from a profile that
-// exists. The unique key on profiles.name is case-insensitive, so the
-// INSERT would silently update the existing row instead of creating a
-// second profile; both surfaces refuse instead, naming the row that is
-// there.
+// collationNote is the tail of the two "already exists" refusals: the
+// index's default collation (utf8mb4_0900_ai_ci) folds case AND accents, so
+// "Marketing", "marketing" and "márketing" are one row to its unique keys.
+const collationNote = " (the index compares names without regard to case or accents)"
+
+// ProfileExistsError is an AddProfile whose name differs only by what the
+// index's collation ignores (letter case, accents) from a profile that
+// exists. The unique key on profiles.name folds those, so the INSERT would
+// silently update the existing row instead of creating a second profile;
+// both surfaces refuse instead, naming the row that is there.
 type ProfileExistsError struct{ Existing, Requested string }
 
 func (e *ProfileExistsError) Error() string {
-	return fmt.Sprintf("a profile named %q already exists (names are case-insensitive)", e.Existing)
+	return fmt.Sprintf("a profile named %q already exists", e.Existing) + collationNote
+}
+
+// FlagExistsError is an AddFlag whose (flag, schema, table, column) differs
+// only by what the collation ignores from a row that exists: the INSERT's
+// ON DUPLICATE KEY would leave the stored spelling and report success, so
+// the caller would be told "PII" was added while the row still says "pii".
+// Existing is the stored row.
+type FlagExistsError struct{ Existing, Requested Flag }
+
+func (e *FlagExistsError) Error() string {
+	msg := fmt.Sprintf("flag %q already exists on %s.%s", e.Existing.Name, e.Existing.Schema, e.Existing.Table)
+	if e.Existing.Column != "" {
+		msg += " (" + e.Existing.Column + ")"
+	}
+	return msg + collationNote
 }
 
 // The column widths of the three tables (internal/indexer/schema.go):
@@ -167,18 +186,20 @@ func IsRefusal(err error) bool {
 	var ip *InvalidPermissionError
 	var tl *TooLongError
 	var pe *ProfileExistsError
+	var fe *FlagExistsError
 	var pnf *ProfileNotFoundError
 	var fnf *FlagNotFoundError
 	var rnf *RuleNotFoundError
 	return errors.As(err, &mf) || errors.As(err, &ip) || errors.As(err, &tl) || errors.As(err, &pe) ||
-		errors.As(err, &pnf) || errors.As(err, &fnf) || errors.As(err, &rnf)
+		errors.As(err, &fe) || errors.As(err, &pnf) || errors.As(err, &fnf) || errors.As(err, &rnf)
 }
 
 // IsConflict reports whether err says the row to add is already there under
-// another spelling (*ProfileExistsError).
+// another spelling (*ProfileExistsError, *FlagExistsError).
 func IsConflict(err error) bool {
 	var pe *ProfileExistsError
-	return errors.As(err, &pe)
+	var fe *FlagExistsError
+	return errors.As(err, &pe) || errors.As(err, &fe)
 }
 
 // IsNotFound reports whether err says the row to remove was not there.
@@ -229,13 +250,30 @@ func requireProfileName(name string) error {
 }
 
 // AddFlag labels f.Schema.f.Table (or its f.Column) with f.Name. Adding a
-// flag that already exists is a no-op, not an error.
+// flag that already exists with exactly this spelling is a no-op, not an
+// error. A row the unique key treats as the same but spelled differently
+// is refused with *FlagExistsError rather than silently kept under its
+// stored spelling: the key folds case and accents on all four columns, the
+// schema, table and column names included (the CLI verb always folded
+// those; now it says so instead of reporting an add). Same two-statement
+// shape and race note as AddProfile.
 func AddFlag(ctx context.Context, db DBExecer, f Flag) error {
 	f = f.Trimmed()
 	if err := requireFlagKey(f); err != nil {
 		return err
 	}
-	_, err := db.ExecContext(ctx, `
+	var existing Flag
+	err := db.QueryRowContext(ctx, `
+		SELECT schema_name, table_name, column_name, flag FROM table_flags
+		WHERE schema_name = ? AND table_name = ? AND column_name = ? AND flag = ?`,
+		f.Schema, f.Table, f.Column, f.Name).Scan(&existing.Schema, &existing.Table, &existing.Column, &existing.Name)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to look up flag: %w", err)
+	}
+	if err == nil && existing != f {
+		return &FlagExistsError{Existing: existing, Requested: f}
+	}
+	_, err = db.ExecContext(ctx, `
 		INSERT INTO table_flags (schema_name, table_name, column_name, flag)
 		VALUES (?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE flag = flag`,

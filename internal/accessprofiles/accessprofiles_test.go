@@ -33,6 +33,7 @@ func TestClassification(t *testing.T) {
 		{&InvalidPermissionError{Got: "rw"}, true, false, false},
 		{&TooLongError{Field: "schema", Got: 65, Max: 64, Unit: "characters"}, true, false, false},
 		{&ProfileExistsError{Existing: "marketing", Requested: "Marketing"}, true, false, true},
+		{&FlagExistsError{Existing: Flag{Name: "pii", Schema: "s", Table: "t"}, Requested: Flag{Name: "PII", Schema: "s", Table: "t"}}, true, false, true},
 		{&ProfileNotFoundError{Name: "ghost"}, true, true, false},
 		{&FlagNotFoundError{Flag: Flag{Name: "pii", Schema: "s", Table: "t"}}, true, true, false},
 		{&RuleNotFoundError{Profile: "p", Flag: "f"}, true, true, false},
@@ -141,6 +142,8 @@ func TestLengthBounds(t *testing.T) {
 			t.Errorf("a description at the limit was refused: %v", err)
 		}
 	}
+	mock.ExpectQuery("FROM table_flags WHERE").WithArgs("s", "t", wide(64), "f").
+		WillReturnRows(sqlmock.NewRows([]string{"schema_name", "table_name", "column_name", "flag"}))
 	mock.ExpectExec("INSERT INTO table_flags").WithArgs("s", "t", wide(64), "f").WillReturnResult(sqlmock.NewResult(1, 1))
 	if err := AddFlag(ctx, db, Flag{Name: "f", Schema: "s", Table: "t", Column: wide(64)}); err != nil {
 		t.Errorf("a 64-character column name was refused: %v", err)
@@ -157,6 +160,8 @@ func TestTrimming(t *testing.T) {
 	ctx := context.Background()
 	t.Run("flag", func(t *testing.T) {
 		mock, db := newMock(t)
+		mock.ExpectQuery("FROM table_flags WHERE").WithArgs("app", "customers", "email", "pii").
+			WillReturnRows(sqlmock.NewRows([]string{"schema_name", "table_name", "column_name", "flag"}))
 		mock.ExpectExec("INSERT INTO table_flags").WithArgs("app", "customers", "email", "pii").WillReturnResult(sqlmock.NewResult(1, 1))
 		if err := AddFlag(ctx, db, Flag{Name: " pii", Schema: "app ", Table: "\tcustomers", Column: "email \n"}); err != nil {
 			t.Fatal(err)
@@ -240,7 +245,7 @@ func TestAddProfileRefusesACaseCollision(t *testing.T) {
 	if !errors.As(err, &exists) || exists.Existing != "marketing" || exists.Requested != "Marketing" {
 		t.Fatalf("got %v, want ProfileExistsError{marketing, Marketing}", err)
 	}
-	if got := err.Error(); got != `a profile named "marketing" already exists (names are case-insensitive)` {
+	if got := err.Error(); got != `a profile named "marketing" already exists (the index compares names without regard to case or accents)` {
 		t.Errorf("message = %q", got)
 	}
 	// Same spelling: an update of the description, as before.
@@ -280,6 +285,52 @@ func TestRemoveOfMissingIsTheNotFoundType(t *testing.T) {
 	mock.ExpectQuery("SELECT id FROM profiles").WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	if err := AddRule(ctx, db, Rule{Profile: "ghost", Flag: "f", Permission: PermissionDeny}); !errors.As(err, &pnf) || pnf.Name != "ghost" {
 		t.Errorf("rule for an unknown profile: got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestAddFlagRefusesACollision: the unique key on table_flags folds case
+// and accents on all four columns, so "PII" on a table carrying "pii" (or
+// "pii" on "Customers" when the row says "customers") would have been kept
+// under the stored spelling while reporting success. It is refused, naming
+// the stored row, and writes nothing; the exact spelling is the no-op it
+// always was.
+func TestAddFlagRefusesACollision(t *testing.T) {
+	ctx := context.Background()
+	mock, db := newMock(t)
+	cols := []string{"schema_name", "table_name", "column_name", "flag"}
+	stored := Flag{Schema: "app", Table: "customers", Column: "email", Name: "pii"}
+	for _, req := range []Flag{
+		{Schema: "app", Table: "customers", Column: "email", Name: "PII"},
+		{Schema: "APP", Table: "customers", Column: "email", Name: "pii"},
+		{Schema: "app", Table: "customers", Column: "Email", Name: "pii"},
+	} {
+		mock.ExpectQuery("FROM table_flags WHERE").WithArgs(req.Schema, req.Table, req.Column, req.Name).
+			WillReturnRows(sqlmock.NewRows(cols).AddRow(stored.Schema, stored.Table, stored.Column, stored.Name))
+		err := AddFlag(ctx, db, req)
+		var exists *FlagExistsError
+		if !errors.As(err, &exists) || exists.Existing != stored || exists.Requested != req || !IsConflict(err) {
+			t.Fatalf("%+v: got %v, want FlagExistsError naming the stored row", req, err)
+		}
+		if got := err.Error(); got != `flag "pii" already exists on app.customers (email) (the index compares names without regard to case or accents)` {
+			t.Errorf("message = %q", got)
+		}
+	}
+	// Table-level: no column suffix.
+	mock.ExpectQuery("FROM table_flags WHERE").WithArgs("app", "invoices", "", "BILLING").
+		WillReturnRows(sqlmock.NewRows(cols).AddRow("app", "invoices", "", "billing"))
+	err := AddFlag(ctx, db, Flag{Schema: "app", Table: "invoices", Name: "BILLING"})
+	if err == nil || err.Error() != `flag "billing" already exists on app.invoices (the index compares names without regard to case or accents)` {
+		t.Errorf("table-level message = %v", err)
+	}
+	// Exact spelling: the INSERT runs and is the no-op it was.
+	mock.ExpectQuery("FROM table_flags WHERE").WithArgs("app", "customers", "email", "pii").
+		WillReturnRows(sqlmock.NewRows(cols).AddRow(stored.Schema, stored.Table, stored.Column, stored.Name))
+	mock.ExpectExec("INSERT INTO table_flags").WithArgs("app", "customers", "email", "pii").WillReturnResult(sqlmock.NewResult(0, 0))
+	if err := AddFlag(ctx, db, stored); err != nil {
+		t.Errorf("exact spelling refused: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)

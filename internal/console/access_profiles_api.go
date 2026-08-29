@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -28,12 +29,16 @@ import (
 //
 // One more, which the permission alone does not give: while an
 // access-control profile is active, the whole surface (the GET included) is
-// refused, on the same floor recover-cascade and verify use
-// (rbacActiveFor): a console started under --profile does not rewrite the
-// rows that profile is built from, and a session that carries a data
-// profile could lift its own redaction. The GET is refused too because the
-// flagged tables and columns are exactly what such a profile withholds
-// (GET /api/profiles hands out names only, at the same tier).
+// refused, keyed on profileActiveFor: a NAMED startup profile even when it
+// has no rules yet (rbacActiveFor, the cascade/verify floor, is false for
+// a zero-rule profile, and a fresh index under `serve --profile` is
+// exactly where the first rule would be authored), a startup profile with
+// rules, and a session that carries a data profile or restrictions. A
+// console started under --profile does not rewrite the rows that profile
+// is built from, and a profiled session could lift its own redaction. The
+// GET is refused too because the flagged tables and columns are exactly
+// what such a profile withholds (GET /api/profiles hands out names only,
+// at the same tier).
 
 // accessProfilesDoc is the whole configuration in one document: what GET
 // returns and what every mutation returns once it has applied, so the page
@@ -101,7 +106,7 @@ const (
 // file comment) and reports whether the handler may go on. A session
 // refusal is audited as profile.denied, like the other profile gates.
 func (s *Server) accessProfilesGate(w http.ResponseWriter, r *http.Request) bool {
-	if !s.rbacActiveFor(r) {
+	if !s.profileActiveFor(r) {
 		return true
 	}
 	if sessionRestricted(r) {
@@ -144,8 +149,8 @@ func loadAccessProfilesDoc(ctx context.Context, db accessprofiles.DBExecer) (acc
 }
 
 // writeAccessProfilesError maps a shared-package refusal onto a status: bad
-// input is 400, a row that is not there is 404, a profile that exists under
-// another spelling is 409, an index without the three tables is 422 (it
+// input is 400, a row that is not there is 404, a profile or flag that
+// exists under another spelling is 409, an index without the three tables is 422 (it
 // predates them; nothing here can create them), anything else is the
 // database's own error at 500.
 func writeAccessProfilesError(w http.ResponseWriter, err error) {
@@ -245,7 +250,9 @@ func (s *Server) handleAccessFlagAdd(w http.ResponseWriter, r *http.Request) {
 	if !decodeAccessBody(w, r, &req) {
 		return
 	}
-	f := accessprofiles.Flag{Schema: req.Schema, Table: req.Table, Column: req.Column, Name: req.Flag}
+	// Trimmed here as well as in the writer, so the audit detail and the
+	// Schema/Table on the event name the row as stored.
+	f := accessprofiles.Flag{Schema: req.Schema, Table: req.Table, Column: req.Column, Name: req.Flag}.Trimmed()
 	s.mutateAccessProfiles(w, r, "flag.add", func(ctx context.Context, db accessprofiles.DBExecer) (string, string, map[string]string, error) {
 		return f.Schema, f.Table, flagDetail(f), accessprofiles.AddFlag(ctx, db, f)
 	})
@@ -259,7 +266,7 @@ func (s *Server) handleAccessFlagRemove(w http.ResponseWriter, r *http.Request) 
 	if !decodeAccessBody(w, r, &req) {
 		return
 	}
-	f := accessprofiles.Flag{Schema: req.Schema, Table: req.Table, Column: req.Column, Name: req.Flag}
+	f := accessprofiles.Flag{Schema: req.Schema, Table: req.Table, Column: req.Column, Name: req.Flag}.Trimmed()
 	s.mutateAccessProfiles(w, r, "flag.remove", func(ctx context.Context, db accessprofiles.DBExecer) (string, string, map[string]string, error) {
 		return f.Schema, f.Table, flagDetail(f), accessprofiles.RemoveFlag(ctx, db, f)
 	})
@@ -271,7 +278,7 @@ func (s *Server) handleAccessProfileAdd(w http.ResponseWriter, r *http.Request) 
 	if !decodeAccessBody(w, r, &req) {
 		return
 	}
-	p := accessprofiles.Profile{Name: req.Name, Description: req.Description}
+	p := accessprofiles.Profile{Name: req.Name, Description: req.Description}.Trimmed()
 	s.mutateAccessProfiles(w, r, "profile.add", func(ctx context.Context, db accessprofiles.DBExecer) (string, string, map[string]string, error) {
 		return "", "", map[string]string{"profile": p.Name}, accessprofiles.AddProfile(ctx, db, p)
 	})
@@ -285,8 +292,9 @@ func (s *Server) handleAccessProfileRemove(w http.ResponseWriter, r *http.Reques
 	if !decodeAccessBody(w, r, &req) {
 		return
 	}
+	name := strings.TrimSpace(req.Name)
 	s.mutateAccessProfiles(w, r, "profile.remove", func(ctx context.Context, db accessprofiles.DBExecer) (string, string, map[string]string, error) {
-		return "", "", map[string]string{"profile": req.Name}, accessprofiles.RemoveProfile(ctx, db, req.Name)
+		return "", "", map[string]string{"profile": name}, accessprofiles.RemoveProfile(ctx, db, name)
 	})
 }
 
@@ -297,7 +305,7 @@ func (s *Server) handleAccessRuleAdd(w http.ResponseWriter, r *http.Request) {
 	if !decodeAccessBody(w, r, &req) {
 		return
 	}
-	rule := accessprofiles.Rule{Profile: req.Profile, Flag: req.Flag, Permission: req.Permission}
+	rule := accessprofiles.Rule{Profile: req.Profile, Flag: req.Flag, Permission: req.Permission}.Trimmed()
 	s.mutateAccessProfiles(w, r, "access.add", func(ctx context.Context, db accessprofiles.DBExecer) (string, string, map[string]string, error) {
 		return "", "", map[string]string{"profile": rule.Profile, "flag": rule.Flag, "permission": rule.Permission},
 			accessprofiles.AddRule(ctx, db, rule)
@@ -310,8 +318,9 @@ func (s *Server) handleAccessRuleRemove(w http.ResponseWriter, r *http.Request) 
 	if !decodeAccessBody(w, r, &req) {
 		return
 	}
+	profile, flag := strings.TrimSpace(req.Profile), strings.TrimSpace(req.Flag)
 	s.mutateAccessProfiles(w, r, "access.remove", func(ctx context.Context, db accessprofiles.DBExecer) (string, string, map[string]string, error) {
-		return "", "", map[string]string{"profile": req.Profile, "flag": req.Flag},
-			accessprofiles.RemoveRule(ctx, db, req.Profile, req.Flag)
+		return "", "", map[string]string{"profile": profile, "flag": flag},
+			accessprofiles.RemoveRule(ctx, db, profile, flag)
 	})
 }

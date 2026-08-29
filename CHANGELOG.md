@@ -18,17 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same rows and is refused with the same words. The page and its routes
   (`GET /api/access-profiles` plus six `POST` verbs under it) need
   `settings:read` to view and `settings:write` to change; while an
-  access-control profile is active (a startup `--profile` or the session's
-  own data profile) the whole page is refused, reading included, whatever
-  the permissions; each change is audited as `console/flag.add`,
+  access-control profile is active (a startup `--profile`, even one with no
+  rules yet, or the session's own data profile) the whole page is refused,
+  reading included, whatever the permissions; each change is audited as `console/flag.add`,
   `flag.remove`, `profile.add`, `profile.remove`, `access.add` or
   `access.remove`, naming what changed and the server it landed on; and a
   change reaches a profiled session on its next request (the console drops
   that server's cached rules when it writes). On both surfaces names are
   trimmed, a value longer than its column is refused with the limit in the
-  message rather than as a raw database error, and a profile name that
-  differs from an existing one only by letter case is refused instead of
-  silently re-describing the existing row.
+  message rather than as a raw database error, and a profile or flag whose
+  spelling differs from an existing row only by case or accents (the index
+  compares names without regard to either) is refused, naming the stored
+  row, instead of silently re-describing or keeping it.
 - **The console's telemetry card shows the exact sample event** (#1447). The
   Usage telemetry card (Settings > Storage) gains a folded "Show a sample
   event" section with the JSON one event would carry, byte for byte as

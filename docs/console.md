@@ -498,11 +498,14 @@ Three panels, top to bottom:
 - **Flags** label a table (`schema.table`, column left empty) or one of its
   columns with a name such as `pii` or `billing`. A flag on a whole table hides
   the table from a profile that denies the flag; a flag on one column blanks
-  that column and leaves the rest of the row.
+  that column and leaves the rest of the row. Adding a flag that exists with
+  the same spelling changes nothing; a spelling that differs only by case or
+  accents (in the flag, the schema, the table or the column) is refused,
+  naming the stored row.
 - **Profiles** are named groups of people (`marketing`, `support`). Adding a
   name that exists updates its description; a name that differs from an
-  existing profile only by letter case is refused (names are
-  case-insensitive on the index). Removing a profile removes its rules with
+  existing profile only by case or accents is refused (the index compares
+  names without regard to either). Removing a profile removes its rules with
   it (the page says how many before asking).
 - **Rules** say whether a profile may see what a flag covers. Only `deny`
   changes what a query returns; `allow` records intent. Adding a rule for a
@@ -517,8 +520,8 @@ settings), so it runs under rules the tests pin:
   administration, so a read-only auditor role sees the configuration and
   none of the buttons;
 - while an access-control profile is active the whole page is refused,
-  reading included: a console started under `--profile` does not edit the
-  rows that profile is built from, and a session that itself carries a data
+  reading included: a console started under `--profile` (a profile with no
+  rules yet included) does not edit the rows that profile is built from, and a session that itself carries a data
   profile could lift its own redaction (the flagged tables and columns are
   exactly what its profile withholds), whatever its permissions;
 - names are trimmed, and a value longer than its column (64 characters for
@@ -1285,9 +1288,9 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 | `GET /api/flashback` | Process-global: the embedded time-travel SQL port (`watch --flashback-listen`): `{enabled, listen, host, port}`. `enabled: false` alone on the standalone console and on a daemon that did not open the port; `host` is empty on a wildcard bind (the UI then uses the name it was opened with). Never the console token that authenticates the port. Backs the **Connect a SQL client** panel on Settings → Connect AI. |
 | `GET /api/profiles` | RBAC data-profile **names** defined on the selected server's index: `{"profiles": ["..."]}`, sorted; empty on a legacy index without the table. Vocabulary for administration panels (e.g. a settings-surface profile picker) — never the rules or flagged tables/columns behind a name. |
-| `GET /api/access-profiles` | The selected server's access-profile configuration in one document: `{flags: [{schema, table, column, flag, created_at}], profiles: [{name, description, created_at}], rules: [{profile, flag, permission, created_at}]}` (`column` empty = a table-level flag). `settings:read`. `403` while an access-control profile is active (a startup `--profile` or the session's own data profile: the flagged tables and columns are what that profile withholds). `422` on an index without the RBAC tables. |
-| `POST /api/access-profiles/flags`, `.../flags/remove` | Add / remove a flag: `{flag, schema, table, column}` (`column` optional). `settings:write`; `403` while an access-control profile is active, as for the GET. Names are trimmed. Answers with the full document. `400` with the CLI's own message on missing fields or a value past its column width, `404` when the flag to remove is not there. When the write landed but the readback failed, a `500` whose message begins `The change was saved but the page could not be re-read:`. |
-| `POST /api/access-profiles/profiles`, `.../profiles/remove` | Add (or re-describe) / remove a profile: `{name, description}`. `409` when the name differs from an existing profile only by letter case (the index's unique key is case-insensitive; the existing row is named). Removing cascades to the profile's rules. Same permission, refusals and response as the flag verbs. |
+| `GET /api/access-profiles` | The selected server's access-profile configuration in one document: `{flags: [{schema, table, column, flag, created_at}], profiles: [{name, description, created_at}], rules: [{profile, flag, permission, created_at}]}` (`column` empty = a table-level flag). `settings:read`. `403` while an access-control profile is active (a startup `--profile`, even one with no rules yet, or the session's own data profile: the flagged tables and columns are what that profile withholds). `422` on an index without the RBAC tables. |
+| `POST /api/access-profiles/flags`, `.../flags/remove` | Add / remove a flag: `{flag, schema, table, column}` (`column` optional). `settings:write`; `403` while an access-control profile is active, as for the GET. Names are trimmed. Answers with the full document. `400` with the CLI's own message on missing fields or a value past its column width, `404` when the flag to remove is not there, `409` when the flag exists under a spelling that differs only by case or accents (the stored row is named). When the write landed but the readback failed, a `500` whose message begins `The change was saved but the page could not be re-read:`. |
+| `POST /api/access-profiles/profiles`, `.../profiles/remove` | Add (or re-describe) / remove a profile: `{name, description}`. `409` when the name differs from an existing profile only by case or accents (the index compares names without regard to either; the existing row is named). Removing cascades to the profile's rules. Same permission, refusals and response as the flag verbs. |
 | `POST /api/access-profiles/rules`, `.../rules/remove` | Add (or replace the permission of) / remove a rule: `{profile, flag, permission}` with `permission` `allow` or `deny` (`400` otherwise, `404` for an unknown profile). Same permission, refusals and response as the flag verbs. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`,

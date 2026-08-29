@@ -234,8 +234,24 @@ func TestIntegrationAccessProfilesCLIConsoleParity(t *testing.T) {
 	cliErr = runProfileAdd(profileAddCmd, []string{"Marketing"})
 	code, apiErr = consolePost(t, srv, "/api/access-profiles/profiles", `{"name":"Marketing"}`)
 	if cliErr == nil || code != http.StatusConflict || cliErr.Error() != apiErr ||
-		apiErr != `a profile named "marketing" already exists (names are case-insensitive)` {
+		apiErr != `a profile named "marketing" already exists (the index compares names without regard to case or accents)` {
 		t.Errorf("case collision: cli=%v api=(%d, %q), want the same refusal", cliErr, code, apiErr)
+	}
+	// The same for a flag, on the real collation: "PII" beside "pii", and an
+	// accented spelling beside the plain one, are the stored row.
+	flgSchema, flgTable, flgColumn = "app", "customers", "email"
+	cliErr = runFlagAdd(flagAddCmd, []string{"PII"})
+	code, apiErr = consolePost(t, srv, "/api/access-profiles/flags", `{"flag":"PII","schema":"app","table":"customers","column":"email"}`)
+	if cliErr == nil || code != http.StatusConflict || cliErr.Error() != apiErr ||
+		apiErr != `flag "pii" already exists on app.customers (email) (the index compares names without regard to case or accents)` {
+		t.Errorf("flag case collision: cli=%v api=(%d, %q), want the same refusal naming the stored row", cliErr, code, apiErr)
+	}
+	flgSchema, flgTable, flgColumn = "app", "invoices", ""
+	cliErr = runFlagAdd(flagAddCmd, []string{"bílling"})
+	code, apiErr = consolePost(t, srv, "/api/access-profiles/flags", `{"flag":"bílling","schema":"app","table":"invoices"}`)
+	if cliErr == nil || code != http.StatusConflict || cliErr.Error() != apiErr ||
+		apiErr != `flag "billing" already exists on app.invoices (the index compares names without regard to case or accents)` {
+		t.Errorf("flag accent collision: cli=%v api=(%d, %q), want the same refusal", cliErr, code, apiErr)
 	}
 	flgSchema, flgTable, flgColumn = strings.Repeat("s", 65), "t", ""
 	cliErr = runFlagAdd(flagAddCmd, []string{"pii"})

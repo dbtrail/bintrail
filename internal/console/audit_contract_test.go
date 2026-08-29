@@ -176,6 +176,7 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 			call: func(t *testing.T) {
 				db, mock, closeDB := newSQLMock(t)
 				defer closeDB()
+				expectFlagLookup(mock, nil)
 				mock.ExpectExec("INSERT INTO table_flags").WillReturnResult(sqlmock.NewResult(1, 1))
 				expectAccessDoc(mock)
 				w := driveAccess(t, newBootServer(db), (*Server).handleAccessFlagAdd,
