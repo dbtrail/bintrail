@@ -328,7 +328,7 @@ func TestSchemaChangesTool_snapshotIDRoundTrip(t *testing.T) {
 	defer db.Close()
 
 	detected := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
-	mock.ExpectQuery("FROM schema_changes WHERE 1=1 ORDER BY detected_at DESC").
+	mock.ExpectQuery("FROM schema_changes WHERE 1=1 ORDER BY detected_at DESC, binlog_file DESC, binlog_pos DESC, id DESC LIMIT").
 		WillReturnRows(sqlmock.NewRows(schemaChangesMockCols).
 			// Covered DDL: auto-snapshot 7 was taken after it.
 			AddRow(1, detected, "shop", "orders", "ALTER TABLE",
@@ -365,7 +365,7 @@ func TestSchemaChangesTool_uncoveredOnlyFilter(t *testing.T) {
 
 	detected := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	// The expectation only matches when the SQL carries the IS NULL predicate.
-	mock.ExpectQuery("FROM schema_changes WHERE 1=1 AND snapshot_id IS NULL ORDER BY detected_at DESC").
+	mock.ExpectQuery("FROM schema_changes WHERE 1=1 AND snapshot_id IS NULL ORDER BY detected_at DESC, binlog_file DESC, binlog_pos DESC, id DESC LIMIT").
 		WillReturnRows(sqlmock.NewRows(schemaChangesMockCols).
 			AddRow(2, detected, "shop", "orders", "TRUNCATE TABLE",
 				"TRUNCATE TABLE orders", "binlog.000001", 900, nil, nil))

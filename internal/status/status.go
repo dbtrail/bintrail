@@ -155,6 +155,12 @@ type CaptureSkipStat struct {
 	Tables          []string `json:"tables,omitempty"`
 	TablesTruncated bool     `json:"tables_truncated,omitempty"`
 	LastDetail      string   `json:"last_detail,omitempty"`
+	// TablesWithheld counts the names ScopeCaptureSkips removed from Tables
+	// because the reader's data scope may not see them (#1452). It is a
+	// rendering fact, never a persisted one: json:"-" so no ledger, however
+	// written, can ever set it — the count is only ever what THIS rendering
+	// withheld, and the sentence built from it says "outside your access".
+	TablesWithheld int `json:"-"`
 }
 
 // CaptureSkipReasonStatementFormatDML mirrors parser.SkipStatementFormatDML —
@@ -657,6 +663,15 @@ type StatusData struct {
 	// data. When set, Coverage is nil and the output must carry a tombstone in
 	// both renderings.
 	CoverageErr error `json:"-"`
+	// TableVisible, when set, scopes the capture-health table NAMES WriteJSON
+	// emits (#1452): a name whose (schema, table) the predicate refuses is
+	// dropped from `skipped[*].tables` and from the explanation prose, and
+	// counted in `tables_withheld` instead, so the counts stay whole while a
+	// reader with restricted data access learns no name it may not read
+	// elsewhere. Nil renders the ledger verbatim. Only the web console sets
+	// it — a session is the thing that has a scope; `bintrail status` has
+	// none, and its text report never consults this field.
+	TableVisible func(schema, table string) bool `json:"-"`
 }
 
 // BaselineInfo holds metadata about a discovered baseline Parquet file.
@@ -823,7 +838,7 @@ func writeCoverageUnavailable(w io.Writer, err error) {
 
 // WriteJSON writes the status data as JSON to w.
 func (d *StatusData) WriteJSON(w io.Writer) error {
-	return writeStatusJSONFull(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream, d.Baselines, d.BaselinesUnavailable, d.StreamErr, d.ArchivesErr, d.CoverageErr)
+	return writeStatusJSONFull(w, d.Files, d.Parts, d.Archives, d.Coverage, d.Servers, d.Stream, d.Baselines, d.BaselinesUnavailable, d.StreamErr, d.ArchivesErr, d.CoverageErr, d.TableVisible)
 }
 
 // WriteStatus writes a multi-section status report (Servers, Stream, Indexed Files, Partitions, Archives, Coverage, Summary) to w.
@@ -1244,10 +1259,12 @@ func Truncate(s string, n int) string {
 
 // WriteStatusJSON writes the status data as a JSON object to w.
 func WriteStatusJSON(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo) error {
-	return writeStatusJSONFull(w, files, parts, archives, coverage, servers, stream, nil, false, nil, nil, nil)
+	return writeStatusJSONFull(w, files, parts, archives, coverage, servers, stream, nil, false, nil, nil, nil, nil)
 }
 
-func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo, baselines []BaselineInfo, baselinesUnavailable bool, streamErr, archivesErr, coverageErr error) error {
+// tableVisible scopes the capture-health table names (#1452); nil renders the
+// ledger verbatim. See StatusData.TableVisible.
+func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionStat, archives *ArchiveStats, coverage *CoverageInfo, servers []ServerInfo, stream *StreamStateInfo, baselines []BaselineInfo, baselinesUnavailable bool, streamErr, archivesErr, coverageErr error, tableVisible func(schema, table string) bool) error {
 	type jsonFile struct {
 		BinlogFile    string  `json:"binlog_file"`
 		Status        string  `json:"status"`
@@ -1348,6 +1365,10 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		Tables          []string `json:"tables,omitempty"`
 		TablesTruncated bool     `json:"tables_truncated,omitempty"`
 		LastDetail      string   `json:"last_detail,omitempty"`
+		// TablesWithheld counts names left out of Tables because the reader's
+		// data scope may not see them (#1452, console sessions only). The
+		// count above is still the whole tally: a count is not a name.
+		TablesWithheld int `json:"tables_withheld,omitempty"`
 	}
 	type jsonCaptureHealth struct {
 		Status       string                  `json:"status"`
@@ -1450,7 +1471,12 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 		ArchivesError *jsonSectionError `json:"archives_error,omitempty"`
 		Coverage      *jsonCoverage     `json:"coverage,omitempty"`
 		CoverageError *jsonSectionError `json:"coverage_error,omitempty"`
-		Baselines     []jsonBaseline    `json:"baselines,omitempty"`
+		// Baselines names a table per entry. CollectStatus never populates it
+		// on the console path (the console lists baselines through
+		// /api/baselines, which refuses a restricted session outright), so
+		// tableVisible is not applied here today; anything that starts
+		// filling it for a scoped reader must pass it through the predicate.
+		Baselines []jsonBaseline `json:"baselines,omitempty"`
 		// BaselineStaleness is the worst per-table-newest verdict — the same
 		// headline the text banner keys on (#1193).
 		BaselineStaleness string `json:"baseline_staleness,omitempty"`
@@ -1543,6 +1569,10 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 			jstr.SourceHealth = json.RawMessage(stream.SourceHealth.String)
 		}
 		if skips, ok := stream.ParseCaptureSkips(); ok {
+			// Scope the names BEFORE anything renders them, so the per-reason
+			// list and the explanation prose are built from the same filtered
+			// ledger and cannot disagree about what the reader may see.
+			skips = ScopeCaptureSkips(skips, tableVisible)
 			ch := &jsonCaptureHealth{Status: "ok"}
 			if total := totalCaptureSkips(skips); total > 0 {
 				ch.Status = "degraded"
@@ -1561,6 +1591,7 @@ func writeStatusJSONFull(w io.Writer, files []IndexStateRow, parts []PartitionSt
 							Tables:            st.Tables,
 							TablesTruncated:   st.TablesTruncated,
 							LastDetail:        st.LastDetail,
+							TablesWithheld:    st.TablesWithheld,
 						}
 					}
 				}
