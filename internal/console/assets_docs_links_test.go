@@ -1,29 +1,64 @@
 package console
 
 import (
+	"io"
+	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
-// One `route: "slug",` entry of the DOCS_PAGES literal. Keys are bare route
-// names (the ROUTES vocabulary: lowercase, no quotes), values are docs slugs.
-var docsPageEntryRE = regexp.MustCompile(`^([a-z]+):\s*"([a-z0-9-]+)",?$`)
+// docsPage is one page of the docs site: its slug under DOCS_BASE and the
+// title text the served page carries in its <title>.
+type docsPage struct {
+	slug  string
+	title string
+}
 
-// Every page-header Docs link (#1450) must name a page that exists.
+// expectedDocsPages is the route → page table the console must carry (#1450).
 //
-// The link is a plain <a> to www.dbtrail.com/docs/<slug>/, and the site serves
-// the repo's docs/<slug>.md at that path. Nothing at runtime checks the target
-// (air-gapped consoles are first class, so the link never fetches), which means
-// a renamed or deleted doc would ship as a 404 link with no error anywhere. The
-// repo file is the checkable proxy: this walks the table and fails when a file
-// is gone. It also pins the wiring, because a table nobody reads guards
+// The docs site, www.dbtrail.com/docs, is a separately authored tree and is
+// the SOURCE OF TRUTH for these slugs. It is NOT this repo's docs/*.md: the
+// site does not serve those files, and a first version of this guard that
+// checked docs/<slug>.md passed while every link shipped as a broken page.
+// Nor is a status code evidence: the site answers HTTP 200 with a small
+// catch-all shell (<title>dbtrail</title>) for ANY path under /docs/.
+//
+// So the offline half pins the table in app.js to this list exactly, and
+// TestDocsLinksResolveOnTheSite (BINTRAIL_CHECK_DOCS_LINKS=1) fetches each
+// page and requires its own title in the body, which the shell never has.
+// A page the site renames or removes is caught by that run, not by CI on
+// its own; run it when a docs slug changes or when the site is redeployed.
+var expectedDocsPages = map[string]docsPage{
+	"events":       {slug: "guides/recovery", title: "Recovery"},
+	"recover":      {slug: "guides/recovery", title: "Recovery"},
+	"baselines":    {slug: "guides/backup-strategy", title: "Backup Strategy"},
+	"verification": {slug: "guides/verify", title: "Verification"},
+	"storage":      {slug: "guides/capacity-planning", title: "Capacity Planning"},
+	"connect":      {slug: "claude/setup", title: "Claude Setup"},
+}
+
+const docsBaseURL = "https://www.dbtrail.com/docs/"
+
+// One `route: "slug",` entry of the DOCS_PAGES literal. Keys are bare route
+// names (the ROUTES vocabulary), values are slugs under DOCS_BASE.
+var docsPageEntryRE = regexp.MustCompile(`^([a-z]+):\s*"([a-z0-9/-]+)",?$`)
+
+// A slug is lowercase segments joined by "/", no leading or trailing slash:
+// DOCS_BASE ends in "/" and docsLink appends the trailing "/".
+var docsSlugShapeRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]+)*)*$`)
+
+// The page-header Docs link table must be exactly the expected set.
+//
+// Exactly, in both directions: an entry dropped from app.js fails (the old
+// guard passed with one entry left), an entry added fails (a new view's link
+// must be recorded here, where the network check can reach it), and a slug
+// changed fails. It also pins the wiring, because a table nobody reads guards
 // nothing: pageHead must build the link through docsLink, and docsLink must
 // read DOCS_PAGES and open a new tab without handing it the opener.
-func TestDocsLinksNameExistingPages(t *testing.T) {
+func TestDocsLinksTableIsExact(t *testing.T) {
 	raw, err := os.ReadFile("assets/app.js")
 	if err != nil {
 		t.Fatal(err)
@@ -32,21 +67,39 @@ func TestDocsLinksNameExistingPages(t *testing.T) {
 
 	pages := parseDocsPages(t, js)
 	routes := parseRoutesConst(t, js)
-	docsDir := repoDocsDir(t)
 
-	for route, slug := range pages {
-		if !routes[route] {
-			t.Errorf("DOCS_PAGES key %q is not in the ROUTES list — pageHead looks the link up by "+
-				"route, so this entry can never match and the view it was meant for gets no link", route)
+	if len(pages) < len(expectedDocsPages) {
+		t.Errorf("DOCS_PAGES has %d entries, expected at least %d — a view lost its Docs link",
+			len(pages), len(expectedDocsPages))
+	}
+	for route, want := range expectedDocsPages {
+		got, ok := pages[route]
+		if !ok {
+			t.Errorf("DOCS_PAGES has no entry for route %q (expected %q) — that view carries no Docs link",
+				route, want.slug)
+			continue
 		}
-		path := filepath.Join(docsDir, slug+".md")
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("DOCS_PAGES[%q] = %q, but %s does not exist (%v): the %s page header would "+
-				"link to https://www.dbtrail.com/docs/%s/, a 404", route, slug, path, err, route, slug)
+		if got != want.slug {
+			t.Errorf("DOCS_PAGES[%q] = %q, expected %q — update expectedDocsPages in the same change, "+
+				"then run BINTRAIL_CHECK_DOCS_LINKS=1 go test ./internal/console/ -run Docs to prove the "+
+				"site serves it", route, got, want.slug)
+		}
+	}
+	for route, slug := range pages {
+		if _, ok := expectedDocsPages[route]; !ok {
+			t.Errorf("DOCS_PAGES has an entry this guard does not know: %q → %q. Add it to "+
+				"expectedDocsPages with the page's title so the network check covers it", route, slug)
+		}
+		if !routes[route] {
+			t.Errorf("DOCS_PAGES key %q is not in the ROUTES list — pageHead looks the link up by route, "+
+				"so this entry can never match", route)
+		}
+		if !docsSlugShapeRE.MatchString(slug) {
+			t.Errorf("DOCS_PAGES[%q] = %q is not lowercase segments joined by \"/\" with no leading or "+
+				"trailing slash — DOCS_BASE ends in \"/\" and docsLink adds the trailing one", route, slug)
 		}
 	}
 
-	// Wiring. The table is only useful if the header actually consults it.
 	head := jsFunctionBody(t, js, "pageHead")
 	if !strings.Contains(head, "docsLink(") {
 		t.Error("pageHead no longer calls docsLink(): the DOCS_PAGES table is unread and no " +
@@ -59,9 +112,79 @@ func TestDocsLinksNameExistingPages(t *testing.T) {
 				"tab, and not hand the docs site a window.opener", want)
 		}
 	}
-	if !strings.Contains(js, `const DOCS_BASE = "https://www.dbtrail.com/docs/";`) {
-		t.Error("DOCS_BASE is not the /docs/ root of www.dbtrail.com; every slug in DOCS_PAGES " +
-			"is checked against docs/<slug>.md on the assumption that the site serves it there")
+	if !strings.Contains(js, `const DOCS_BASE = "`+docsBaseURL+`";`) {
+		t.Errorf("DOCS_BASE is not %q — the slugs above are checked against that root", docsBaseURL)
+	}
+}
+
+// Every Docs link resolves to its page on the live site.
+//
+// Network-gated: set BINTRAIL_CHECK_DOCS_LINKS=1 to run it. The site is the
+// source of truth for the slugs and nothing in this repo mirrors it, so this
+// is the only check that can see a renamed or removed page. A status code
+// cannot: the site returns 200 with a catch-all shell for any /docs/ path.
+// The fingerprint is the page's own <title>; the shell's is "dbtrail". A
+// control fetch of a path that does not exist proves the fingerprint
+// discriminates before any real page is judged by it.
+func TestDocsLinksResolveOnTheSite(t *testing.T) {
+	if os.Getenv("BINTRAIL_CHECK_DOCS_LINKS") != "1" {
+		t.Skip("set BINTRAIL_CHECK_DOCS_LINKS=1 to fetch every Docs link from www.dbtrail.com")
+	}
+	raw, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages := parseDocsPages(t, string(raw))
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	fetch := func(url string) string {
+		t.Helper()
+		resp, err := client.Get(url)
+		if err != nil {
+			t.Fatalf("GET %s: %v", url, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if err != nil {
+			t.Fatalf("GET %s: reading body: %v", url, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: HTTP %d", url, resp.StatusCode)
+		}
+		return string(body)
+	}
+	titleTag := func(p docsPage) string { return "<title>" + p.title }
+
+	control := fetch(docsBaseURL + "no-such-page-docs-links-guard/")
+	for _, p := range expectedDocsPages {
+		if strings.Contains(control, titleTag(p)) {
+			t.Fatalf("the site's catch-all shell contains %q, so a title fingerprint cannot tell a "+
+				"real page from the shell — this check would pass on a missing page", titleTag(p))
+		}
+	}
+
+	checked := map[string]bool{}
+	for route, slug := range pages {
+		want, ok := expectedDocsPages[route]
+		if !ok {
+			t.Errorf("route %q is not in expectedDocsPages; no title to check it against", route)
+			continue
+		}
+		url := docsBaseURL + slug + "/"
+		if checked[url] {
+			continue
+		}
+		checked[url] = true
+		body := fetch(url)
+		if !strings.Contains(body, titleTag(want)) {
+			got := "(no <title>)"
+			if m := regexp.MustCompile(`<title>[^<]*</title>`).FindString(body); m != "" {
+				got = m
+			}
+			t.Errorf("%s does not serve the %q page: expected %q in the body, got %s (%d bytes) — "+
+				"the console's %s header links to a page the site no longer has",
+				url, want.title, titleTag(want), got, len(body), route)
+		}
 	}
 }
 
@@ -117,29 +240,4 @@ func parseDocsPages(t *testing.T, js string) map[string]string {
 		t.Fatal("parsed zero entries from DOCS_PAGES — the parser broke, not the code")
 	}
 	return out
-}
-
-// repoDocsDir locates docs/ relative to THIS file, not the working directory:
-// `go test` runs the package from its own directory, but a runner that sets
-// -C or a wrapper that cds elsewhere would otherwise turn every slug into a
-// false "missing" finding.
-func repoDocsDir(t *testing.T) string {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller gave no file path for this test")
-	}
-	dir := filepath.Join(filepath.Dir(file), "..", "..", "docs")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("docs/ is not two levels above internal/console (%v) — the repo layout moved and "+
-			"this guard can no longer find the pages it checks", err)
-	}
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".md") {
-			return dir
-		}
-	}
-	t.Fatalf("%s holds no .md files — wrong directory, so every slug would read as missing", dir)
-	return ""
 }

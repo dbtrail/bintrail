@@ -2397,7 +2397,7 @@ try {
   ok("protect: /verification renders its three regions");
 
   // Scenario 15w — the page-header Docs link (#1450). One route → slug table
-  // in app.js; the Go asset guard proves every slug is a real docs/<slug>.md,
+  // in app.js; the Go asset guard pins that table to the site's real pages,
   // and this leg proves the link is actually painted, follows a ROUTE CHANGE
   // (pageHead reads the route per render, not once at boot), and opens in a
   // new tab without handing the docs site window.opener. Verification is on
@@ -2409,16 +2409,16 @@ try {
       rel: a && a.getAttribute("rel"), text: a && a.textContent.trim() };
   });
   const docsVfy = await docsLinkOf();
-  docsVfy.n === 1 && docsVfy.href === "https://www.dbtrail.com/docs/verify/" && docsVfy.target === "_blank"
+  docsVfy.n === 1 && docsVfy.href === "https://www.dbtrail.com/docs/guides/verify/" && docsVfy.target === "_blank"
     && /\bnoopener\b/.test(docsVfy.rel || "") && docsVfy.text === "Docs"
-    ? ok("docs link: Verification header links to /docs/verify/ in a new tab")
-    : bad("docs link: Verification header links to /docs/verify/ in a new tab", JSON.stringify(docsVfy));
+    ? ok("docs link: Verification header links to /docs/guides/verify/ in a new tab")
+    : bad("docs link: Verification header links to /docs/guides/verify/ in a new tab", JSON.stringify(docsVfy));
   await page.evaluate(() => navigate("events"));
   await page.waitForFunction(() => location.pathname === "/events"
     && Array.from(document.querySelectorAll("h1.page-title")).some((h) => /Events/.test(h.textContent)),
     { timeout: 10000 });
   const docsEvents = await docsLinkOf();
-  docsEvents.n === 1 && docsEvents.href === "https://www.dbtrail.com/docs/query-and-recovery/"
+  docsEvents.n === 1 && docsEvents.href === "https://www.dbtrail.com/docs/guides/recovery/"
     ? ok("docs link: follows the route change to Events")
     : bad("docs link: follows the route change to Events", JSON.stringify(docsEvents));
   // Put the page back: 15v below reads the Verification form as it found it.

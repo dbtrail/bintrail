@@ -57,25 +57,25 @@ const ROUTES = ["overview", "events", "timetravel", "recover", "sql", "status", 
   // restorable", roughly two screens below the fold.
   "baselines", "verification"];
 
-// DOCS_PAGES maps a route to the slug of its page on www.dbtrail.com (#1450).
-// The site serves the repo's docs/<slug>.md at /docs/<slug>/, and pageHead
-// renders one plain link to it beside the title. Nothing here fetches:
+// DOCS_PAGES maps a route to its page on www.dbtrail.com/docs (#1450), the
+// separately authored docs site. NOT this repo's docs/*.md: the site does not
+// serve those, and it answers HTTP 200 with a small shell for ANY /docs/
+// path, so neither a repo file nor a status code proves a link resolves.
+// assets_docs_links_test.go pins this table exactly and, with
+// BINTRAIL_CHECK_DOCS_LINKS=1, fetches each page and checks its title.
+// pageHead renders one plain link beside the title. Nothing here fetches:
 // air-gapped consoles are a first-class deployment, and a link is inert
-// offline. TestDocsLinksNameExistingPages walks this table and fails when the
-// file is gone, so a renamed doc breaks the build instead of shipping a 404.
-// A view without a page gets NO link on purpose: a link to the docs index
-// would teach people the button is noise. Extension views are out of scope.
+// offline. A view without a page of its own gets NO link on purpose
+// (Overview, Status, SQL): a link to the docs index would teach people the
+// button is noise. Extension views are out of scope.
 const DOCS_BASE = "https://www.dbtrail.com/docs/";
 const DOCS_PAGES = {
-  overview: "console",
-  events: "query-and-recovery",
-  recover: "query-and-recovery",
-  timetravel: "time-travel-sql",
-  status: "rotation-and-status",
-  storage: "rotation-and-status",
-  baselines: "dump-and-baseline",
-  verification: "verify",
-  connect: "connect-ai",
+  events: "guides/recovery",
+  recover: "guides/recovery",
+  baselines: "guides/backup-strategy",
+  verification: "guides/verify",
+  storage: "guides/capacity-planning",
+  connect: "claude/setup",
 };
 
 const MON_STATE_TITLES = {
