@@ -1,0 +1,243 @@
+package console
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/go-sql-driver/mysql"
+
+	"github.com/dbtrail/dbtrail/internal/cliutil"
+	"github.com/dbtrail/dbtrail/internal/query"
+)
+
+// GET /api/schema-changes — the DDL history view (#1443).
+//
+// The index records every CREATE / ALTER / DROP / RENAME / TRUNCATE the stream
+// sees in schema_changes, the MCP tool list_schema_changes serves it, and the
+// CLI can query it; the console had no surface for it, so "what ALTERs ran
+// last week?" was answerable everywhere except the browser. This endpoint
+// reads the selected server's schema_changes table with the same filters the
+// MCP tool takes (schema, table, ddl_type prefix-matched, since/until) and the
+// Events caps model (default 100, max 1000, one probe row for has_more).
+//
+// Ordering is `detected_at DESC, binlog_file DESC, binlog_pos DESC, id DESC`.
+// detected_at is second-granular and DDL arrives in same-second bursts (a
+// migration runs dozens of statements inside one second); with detected_at
+// alone the order within a second is whatever the storage engine returns, so
+// a CREATE can list before the DROP that followed it and the story reads
+// backwards exactly where it is densest. The binlog coordinate IS the true
+// per-source order, with id as the deterministic tail. Sibling issue #1441
+// applies the same tiebreak to the MCP tool; the two queries are written
+// separately on purpose (this package does not reach into internal/mcptools).
+//
+// Scope: the resolved deny/allow table scope (startup floor + session profile
+// + policy restrictions, #1449) is pushed into the WHERE clause with the same
+// two comparisons buildQuery uses for row events, so a session that cannot
+// read a table never sees its DDL either — and the cap stays exact, which a
+// post-fetch filter over the page could not promise.
+//
+// Open-core: this is the free query_explorer surface. No attribution fields
+// (no connection_id-style columns) belong here.
+//
+// Deliberately NOT audited, like list_schema_changes: ext.Record fires from
+// surfaces that serve historical ROW DATA, and a DDL statement carries none.
+const (
+	schemaChangesDefaultLimit = eventsDefaultLimit
+	schemaChangesMaxLimit     = eventsMaxLimit
+)
+
+// schemaChangeDDLTypes is the ddl_type filter vocabulary, matched as a PREFIX
+// of the stored ddl_type ("ALTER" matches "ALTER TABLE") exactly like the MCP
+// tool, so the two surfaces answer the same question the same way.
+var schemaChangeDDLTypes = []string{"CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE"}
+
+// schemaChangeDTO is one DDL detection on the wire. Field names follow the
+// MCP tool's output so a reader moving between the two surfaces sees one
+// vocabulary.
+type schemaChangeDTO struct {
+	ID         int64  `json:"id"`
+	DetectedAt string `json:"detected_at"`
+	Schema     string `json:"schema_name"`
+	Table      string `json:"table_name"`
+	DDLType    string `json:"ddl_type"`
+	Statement  string `json:"statement"`
+	BinlogFile string `json:"binlog_file"`
+	BinlogPos  uint64 `json:"binlog_pos"`
+}
+
+// schemaChangesResponse is the GET /api/schema-changes body. Count and Limit
+// describe the page, never the probe row (the same contract as eventsResponse).
+type schemaChangesResponse struct {
+	Changes []schemaChangeDTO `json:"changes"`
+	Count   int               `json:"count"`
+	Limit   int               `json:"limit"`
+	// HasMore reports that at least one further change matched beyond the
+	// cap. One probe row, never a COUNT(*).
+	HasMore bool `json:"has_more"`
+}
+
+// schemaChangesFilter is the parsed, validated request.
+type schemaChangesFilter struct {
+	Schema  string
+	Table   string
+	DDLType string // upper-cased, one of schemaChangeDDLTypes, or ""
+	Since   *time.Time
+	Until   *time.Time
+	// Deny and Allow are the resolved table scope (see buildSchemaChangesQuery).
+	Deny  []query.SchemaTable
+	Allow []query.SchemaTable
+	// Fetch is the row count asked of the database: the page cap plus the
+	// probe row.
+	Fetch int
+}
+
+// buildSchemaChangesQuery renders the SELECT for f. Pure, so the shape —
+// clauses, argument order and the ordering tiebreak — is testable without a
+// database.
+func buildSchemaChangesQuery(f schemaChangesFilter) (string, []any) {
+	var where []string
+	var args []any
+	if f.Schema != "" {
+		where = append(where, "schema_name = ?")
+		args = append(args, f.Schema)
+	}
+	if f.Table != "" {
+		where = append(where, "table_name = ?")
+		args = append(args, f.Table)
+	}
+	if f.DDLType != "" {
+		where = append(where, "ddl_type LIKE ?")
+		args = append(args, f.DDLType+"%")
+	}
+	if f.Since != nil {
+		where = append(where, "detected_at >= ?")
+		args = append(args, *f.Since)
+	}
+	if f.Until != nil {
+		where = append(where, "detected_at <= ?")
+		args = append(args, *f.Until)
+	}
+	// The scope clauses mirror internal/query's buildQuery exactly: allow
+	// matches with BINARY (a case-insensitive allow fails open on a
+	// lower_case_table_names=0 host), deny stays on the column collation
+	// (case-insensitive there withholds MORE, the safe direction). Deny
+	// composes over allow via AND, so deny always wins.
+	if len(f.Allow) > 0 {
+		ors := make([]string, len(f.Allow))
+		for i, at := range f.Allow {
+			ors[i] = "(BINARY schema_name = ? AND BINARY table_name = ?)"
+			args = append(args, at.Schema, at.Table)
+		}
+		where = append(where, "("+strings.Join(ors, " OR ")+")")
+	}
+	for _, dt := range f.Deny {
+		where = append(where, "NOT (schema_name = ? AND table_name = ?)")
+		args = append(args, dt.Schema, dt.Table)
+	}
+	q := "SELECT id, detected_at, schema_name, table_name, ddl_type, ddl_query, binlog_file, binlog_pos FROM schema_changes"
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	q += " ORDER BY detected_at DESC, binlog_file DESC, binlog_pos DESC, id DESC LIMIT ?"
+	args = append(args, f.Fetch)
+	return q, args
+}
+
+// handleSchemaChanges serves GET /api/schema-changes.
+func (s *Server) handleSchemaChanges(w http.ResponseWriter, r *http.Request) {
+	b := s.resolveOr(w, r)
+	if b == nil {
+		return
+	}
+	q := r.URL.Query()
+	ddlType := strings.ToUpper(strings.TrimSpace(q.Get("ddl_type")))
+	if ddlType != "" && !slices.Contains(schemaChangeDDLTypes, ddlType) {
+		writeJSONError(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid ddl_type %q; must be one of %s", q.Get("ddl_type"), strings.Join(schemaChangeDDLTypes, ", ")))
+		return
+	}
+	since, err := cliutil.ParseTime(q.Get("since"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid since: "+err.Error())
+		return
+	}
+	until, err := cliutil.ParseTime(q.Get("until"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid until: "+err.Error())
+		return
+	}
+	limit := clampLimit(atoiDefault(q.Get("limit"), 0), schemaChangesDefaultLimit, schemaChangesMaxLimit)
+
+	// The same scope resolution handleSchemas runs for its name listings:
+	// startup floor, then the session's profile and direct restrictions.
+	opts, err := s.applySessionProfile(r.Context(), r, b, query.Options{
+		DenyTables:    s.denyTables,
+		RedactColumns: s.redactCols,
+		ProfileActive: s.profileActive,
+	})
+	if err != nil {
+		writeSessionProfileError(w, r, err)
+		return
+	}
+
+	sqlText, args := buildSchemaChangesQuery(schemaChangesFilter{
+		Schema:  q.Get("schema"),
+		Table:   q.Get("table"),
+		DDLType: ddlType,
+		Since:   since,
+		Until:   until,
+		Deny:    opts.DenyTables,
+		Allow:   opts.AllowTables,
+		Fetch:   limit + 1,
+	})
+	rows, err := b.db.QueryContext(r.Context(), sqlText, args...)
+	if err != nil {
+		var me *mysql.MySQLError
+		if errors.As(err, &me) && me.Number == 1146 {
+			// ER_NO_SUCH_TABLE: an index provisioned before DDL tracking
+			// existed. Actionable rather than a bare server error — the
+			// table is created by init, which is safe to re-run.
+			writeJSONError(w, http.StatusUnprocessableEntity,
+				"This index has no schema_changes table, so no DDL history was recorded for it. "+
+					"Re-run init against the index to add the table (CLI: bintrail init); "+
+					"changes made before that cannot be recovered.")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	changes := []schemaChangeDTO{} // never null on the wire
+	for rows.Next() {
+		var c schemaChangeDTO
+		var detectedAt time.Time
+		var stmt sql.NullString
+		if err := rows.Scan(&c.ID, &detectedAt, &c.Schema, &c.Table, &c.DDLType, &stmt, &c.BinlogFile, &c.BinlogPos); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "scan schema_changes: "+err.Error())
+			return
+		}
+		c.DetectedAt = detectedAt.UTC().Format(consoleTSFormat)
+		c.Statement = stmt.String
+		changes = append(changes, c)
+	}
+	if err := rows.Err(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "read schema_changes: "+err.Error())
+		return
+	}
+	hasMore := len(changes) > limit
+	if hasMore {
+		changes = changes[:limit]
+	}
+	writeJSON(w, http.StatusOK, schemaChangesResponse{
+		Changes: changes,
+		Count:   len(changes),
+		Limit:   limit,
+		HasMore: hasMore,
+	})
+}

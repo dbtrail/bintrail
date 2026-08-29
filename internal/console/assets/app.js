@@ -49,7 +49,7 @@ const EVENT_EXPORT_MAX = 1000;
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "timetravel", "recover", "sql", "status", "storage", "connect",
+const ROUTES = ["overview", "events", "schema-changes", "timetravel", "recover", "sql", "status", "storage", "connect",
   // Protect (#1384): baselines and verification used to be two of three panels
   // on Settings > Storage. They are operations that produce and validate
   // recovery artifacts, not settings, and the snapshot list is unbounded in
@@ -870,6 +870,7 @@ function renderRoute() {
   switch (route) {
     case "overview": return renderOverview();
     case "events": return renderEvents(params);
+    case "schema-changes": return renderSchemaChanges(params);
     case "timetravel": return renderTimetravel(params);
     case "recover": return renderRecover(params);
     case "sql": return renderSQL();
@@ -5566,6 +5567,141 @@ function verifyDiffValue(v) {
   return document.createTextNode(v);
 }
 
+// ── schema changes (DDL history, #1443) ─────────────────────────────────────
+// A dedicated read-only view over the index's schema_changes table, under
+// Investigate beside Events. Its own view rather than a DDL mode of the
+// Events list: the result shape (statement, binlog coordinate, no row image)
+// is different, and mixing shapes into one table makes both harder to read.
+// Filters mirror the Events panel and the MCP list_schema_changes tool; the
+// cap model is the same (default 100, max 1000, has_more from one probe row).
+
+const SC_DDL_TYPES = ["CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE"];
+// Badge tint by what the statement does to the table: something new, a change
+// in place, or something gone. Anything else keeps the neutral tint.
+const SC_BADGE_CLASS = { CREATE: "b-insert", ALTER: "b-update", RENAME: "b-update", DROP: "b-delete", TRUNCATE: "b-delete" };
+function scBadge(ddlType) {
+  const word = String(ddlType || "").split(/\s+/)[0].toUpperCase();
+  return el("span", { class: "badge " + (SC_BADGE_CLASS[word] || "b-baseline"), text: word || "DDL", title: ddlType || null });
+}
+
+let scLastQuery = null;
+
+function renderSchemaChanges(params) {
+  const v = VIEW(); clear(v);
+  v.append(pageHead("Schema changes",
+    el("p", { class: "page-sub", text: "Every CREATE, ALTER, DROP, RENAME and TRUNCATE the stream recorded, newest first." })));
+
+  const form = el("form", { class: "filters", id: "sc-form" });
+  form.append(fieldSelect("Schema", "schema", "md", true));
+  form.append(fieldSelect("Table", "table", "md", false, true));
+  form.append(fieldSelect("Type", "ddl_type", "sm", false, false, [""].concat(SC_DDL_TYPES), "any"));
+  form.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
+  form.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
+  form.append(fieldInput("Limit", "limit", "sm", "100"));
+  if (params) {
+    ["schema", "table", "ddl_type", "since", "until"].forEach((k) => { if (params[k] && form.elements[k]) form.elements[k].value = params[k]; });
+  }
+  v.append(form);
+
+  const bar = el("div", { class: "result-bar" });
+  bar.append(el("span", { class: "result-count" }, el("b", { id: "sc-count", text: "…" }), el("span", { id: "sc-count-note", text: " change(s)" })));
+  bar.append(el("span", { class: "spacer" }));
+  v.append(bar);
+  v.append(el("div", { id: "sc-warnings", class: "warnings" }));
+
+  const list = el("div", { class: "events", id: "sc-list" });
+  const head = el("div", { class: "sc-head" });
+  ["time (UTC)", "table", "type", "binlog position"].forEach((h) => head.append(el("span", { text: h })));
+  list.append(head);
+  list.append(el("div", { id: "sc-rows" }));
+  v.append(list);
+
+  let t = null;
+  const run = () => runSchemaChangesQuery(form);
+  form.addEventListener("input", () => { clearTimeout(t); t = setTimeout(run, 200); });
+  form.addEventListener("change", run);
+  form.addEventListener("submit", (e) => { e.preventDefault(); run(); });
+  wireSchemaCascade(form);
+
+  populateSchemas(form);
+  run();
+  viewEnter();
+}
+
+async function runSchemaChangesQuery(form) {
+  const gen = serverGen;
+  const rowsEl = $("#sc-rows", VIEW());
+  const countEl = $("#sc-count", VIEW());
+  const noteEl = $("#sc-count-note", VIEW());
+  if (!rowsEl) return;
+
+  const f = Object.fromEntries(new FormData(form).entries());
+  const apiParams = {};
+  ["schema", "table", "ddl_type", "since", "until", "limit"].forEach((k) => {
+    if (f[k] && f[k].trim() && f[k] !== "any") apiParams[k] = f[k].trim();
+  });
+  const myQuery = apiParams;
+  scLastQuery = myQuery;
+
+  clear(rowsEl);
+  rowsEl.append(el("div", { class: "view-loading", role: "status", text: "Loading…" }));
+  if (countEl) countEl.textContent = "…";
+
+  let data;
+  try {
+    data = await api("/api/schema-changes?" + new URLSearchParams(apiParams).toString());
+  } catch (err) {
+    if (gen !== serverGen || scLastQuery !== myQuery) return;
+    clear(rowsEl); renderError(rowsEl, err);
+    renderWarnings($("#sc-warnings", VIEW()), []);
+    if (countEl) countEl.textContent = "0";
+    return;
+  }
+  if (gen !== serverGen || scLastQuery !== myQuery) return;
+
+  const changes = data.changes || [];
+  if (countEl) countEl.textContent = String(changes.length);
+  // The cap notice, in the same place Events puts its position line: a
+  // capped list must say it is a prefix, or an empty-looking tail reads as
+  // "nothing else happened".
+  let note = " change(s)";
+  if (data.has_more) note += " · the newest " + changes.length + " shown; narrow the time range or raise the limit (max 1000) to see more";
+  if (noteEl) noteEl.textContent = note;
+  renderWarnings($("#sc-warnings", VIEW()), data.warnings || []);
+  buildSchemaChangeRows(rowsEl, changes, Object.keys(apiParams).some((k) => k !== "limit"));
+}
+
+function buildSchemaChangeRows(container, changes, filtered) {
+  clear(container);
+  if (!changes.length) {
+    const box = el("div", { class: "empty" });
+    box.append(el("h3", { text: "No schema changes found" }));
+    box.append(el("p", { text: filtered
+      ? "No DDL matched these filters. Widen the time range or clear a filter to see more."
+      : "No CREATE, ALTER, DROP, RENAME or TRUNCATE has been recorded for this server yet. Changes are recorded as the stream sees them." }));
+    container.append(box);
+    return;
+  }
+  changes.forEach((c, i) => {
+    // Expandable: the statement is clamped to a few lines and opens in full
+    // on click, so a long ALTER does not push the next row off screen.
+    const row = el("div", { class: "sc-row", "data-sc": i, tabindex: "0", role: "button", "aria-expanded": "false" });
+    row.append(tsSpan("ev-time", c.detected_at));
+    row.append(el("span", { class: "ev-table", text: c.schema_name + "." + c.table_name }));
+    row.append(el("span", {}, scBadge(c.ddl_type)));
+    row.append(el("span", { class: "sc-pos", text: c.binlog_file + ":" + c.binlog_pos }));
+    row.append(el("pre", { class: "sc-stmt", text: c.statement || "" }));
+    row.addEventListener("click", () => {
+      const open = row.classList.toggle("open");
+      row.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    row.addEventListener("keydown", (ke) => {
+      if (ke.key === "Enter" || ke.key === " ") { ke.preventDefault(); row.click(); }
+    });
+    container.append(row);
+  });
+}
+
 // ── schemas / tables cascade ──────────────────────────────────────────────────
 
 async function loadSchemas() {
@@ -6816,6 +6952,7 @@ function cmdkCommands() {
   const cmds = [
     { group: "Navigate", label: "Overview", run: () => navigate("overview") },
     { group: "Navigate", label: "Events", run: () => navigate("events") },
+    { group: "Navigate", label: "Schema changes", run: () => navigate("schema-changes") },
     { group: "Navigate", label: "Recover", run: () => navigate("recover") },
     { group: "Navigate", label: "Status", run: () => navigate("status") },
   ];

@@ -123,12 +123,18 @@ and searching events:
    has more than that, the console says so instead of handing you a silent
    prefix. Rows and exports include `connection_id` (the transaction's
    originating thread number) but never `query_text`/`query_hash`.
-3. **Time-travel** — single-row point-in-time reconstruct, drawn as a timeline
+3. **Schema changes** lists every CREATE, ALTER, DROP, RENAME and TRUNCATE
+   the stream recorded for this server, newest first: time, table, type, the
+   statement and its binlog position. Filter by schema, table, type and time
+   range; the same result cap as Events applies, and the page says when more
+   exist. Changes detected in the same second list in binlog order. A session
+   whose access policy withholds a table does not see that table's DDL.
+4. **Time-travel** — single-row point-in-time reconstruct, drawn as a timeline
    (baseline snapshot → each change, with a **Restore to this state** jump to
    Recover). Appears **only when a baseline is configured**
    (`--baseline-dir`/`--baseline-s3`); otherwise it is hidden, never shown
    empty. See [Time-travel](#time-travel-reconstruct).
-4. **Recover** — filter schema / table / PK / time, preview the affected rows
+5. **Recover** — filter schema / table / PK / time, preview the affected rows
    with before→after diffs, then **Generate undo SQL** and copy/download the
    script. Arriving via an **Undo** action scopes it to that row and shows a
    context banner; it fills in **Until** from the event you clicked and leaves
@@ -145,13 +151,13 @@ and searching events:
    Recover **auto-detects** it and folds the invisible children into the same
    script — no separate tab, no extra step. **Nothing is ever executed.** See
    [Recover and cascade](#cascade-recovery).
-5. **Status** — index health: partitions, coverage, stream lag, archives, and a
+6. **Status** — index health: partitions, coverage, stream lag, archives, and a
    first-class **stream-continuity** signal — a green "✓ No gaps in captured
    stream" badge when the captured range is contiguous, or a red "⚠ Events
    permanently lost" record when an unfillable gap (or a lost PostgreSQL slot)
    was detected. Both fire for any source family. See
    [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
-6. **Protect** (under `watch` only) — **Backups** (the selected server's
+7. **Protect** (under `watch` only) — **Backups** (the selected server's
    snapshot listing; each row expands to its tables, sizes and how long the
    backup took, with a **Download (.tar.gz)** of the whole snapshot; plus
    **Create backup** and — for a server with its own local backup directory —
@@ -166,7 +172,7 @@ and searching events:
    `bintrail verify` and read past runs). These produce and validate the
    artifacts a restore depends on, so they are operations rather than
    settings; they lived on the Storage page until they outgrew it.
-7. **Settings** (under `watch` only) — **Storage** (rotation policy,
+8. **Settings** (under `watch` only) — **Storage** (rotation policy,
    per-source S3 archiving, a baseline summary card, AWS credential signals,
    and a usage-telemetry opt-out — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
@@ -1208,6 +1214,7 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `GET /api/activity` | Window aggregate behind the Overview tiles: counts by event type, distinct tables touched, and a per-table breakdown. The window **is the live retention** — derived from the oldest live `binlog_events` partition, so the counts cover exactly what the live index still holds and read the live tier only (no archive scan, and nothing archived can fall inside the window by construction). Returns `{label, since, until, refreshed_at, total, inserts, updates, deletes, other, tables, top_tables, complete, notes}`. The aggregate is a **server-side materialization** refreshed when older than ~30 minutes (a stale copy is served immediately while one recompute runs in the background); `refreshed_at` is when it was computed, and the UI renders it on the tiles ("as of …") so a cached number is never presented as live. `complete: false` means the counts are knowably a floor (an index with a pathological table count trips the grouping cap) and `notes` says so; the UI marks the affected tiles "partial". RBAC deny rules are applied, so a denied table contributes to neither the counts nor `top_tables`, and each deny profile gets its own materialization. |
 | `GET /api/schemas` | Schemas known to the index: those observed in `binlog_events` **plus** those in the latest schema snapshot, so a schema whose partitions have all been rotated out to Parquet/S3 is still listed (the archives still answer `/api/events` and `/api/recover`). `schemas` is that full union; `snapshot_only` (when present) is the subset with no live events observed — the UI labels these "snapshot only" since queries against them may return nothing; `snapshot_unavailable: true` means the snapshot half was skipped because the schema resolver failed to load (check the server log), so archive-only schemas may be missing from the list. The snapshot half is skipped under `--no-archive` or an active `--profile`, where archived data is unreachable anyway. Note this answers *which schemas this index knows of*, not *which have data in a given window* — for that, see `bintrail status`'s continuity verdict. `?schema=<name>` → that schema's tables. |
 | `GET /api/events` | Event browser. Query params: `schema, table, pk, event_type, gtid, since, until, changed_column, order, limit, limit_per_pk` plus the `after`/`before` keyset cursors. `limit_per_pk` keeps only the latest N events per row, requires `pk`, and is **refused alongside a cursor** — it is a whole-result-set cap, so paging would re-anchor it to each page's remainder. `scope=live` serves the **live index only** and answers immediately (the UI's phase 1: rows in `binlog_events` are milliseconds away, an archive scan can take tens of seconds); the response then carries `scope: "live"` and `archives_pending` (never omitted — `false` is a meaningful answer) — `true` means registered archives were **not** read and a follow-up full read is required before the list is complete (the warning says so, loudly); `false` means no follow-up read would add anything: either nothing is registered, or the archives are excluded for this console/session (a session profile always announces itself; a --no-archive console announces only when the window has gaps to point at). Anything else in `scope` is a 400, never a silent full read. |
+| `GET /api/schema-changes` | DDL history from the index's `schema_changes` table. Query params: `schema, table, ddl_type, since, until, limit`. `ddl_type` is one of `CREATE`, `ALTER`, `DROP`, `RENAME`, `TRUNCATE`, matched as a prefix of the stored type (`ALTER` matches `ALTER TABLE`), like the MCP `list_schema_changes` tool. Default limit 100, max 1000; `has_more` says whether the cap cut the list. Ordered by `detected_at, binlog_file, binlog_pos, id`, all descending, so DDLs detected in the same second keep their binlog order. Returns `{changes: [{id, detected_at, schema_name, table_name, ddl_type, statement, binlog_file, binlog_pos}], count, limit, has_more}`. The session's table deny and allow rules apply. `422` when the index has no `schema_changes` table (an index provisioned before DDL tracking; `bintrail init` adds it). |
 | `POST /api/recover` | Undo-SQL generation. JSON body with the same filter fields (requires at least `schema`; an `order` field is accepted but ignored — recover always processes oldest-first). `limit_per_pk` reverses only the latest N events for the matched row and **requires `pk`** — it is the only filter that can separate events sharing a timestamp, since `since`/`until` are second-granular (`/api/events` accepts it too, so Restore's preview can mirror the same window). Returns `{sql, statement_count, row_count, warnings, notes, generated_in_ms}`. `generated_in_ms` is the wall time from request-body decode to the finished script: filter parsing, session-profile resolution, the event fetch including any archive/Parquet leg, cascade victim synthesis when auto-detected, and SQL rendering. It **excludes** selecting and opening the target server's connection, which is a one-off cost of switching servers and can dominate a first request. Always present: `0` means the script was generated in under a millisecond, not that timing is unavailable. When the target is a foreign-key **parent** whose `DELETE` cascaded below the binlog (MySQL/MariaDB index only), cascade victims are **auto-detected** and folded into the same script; the response then also carries `{cascade_detected, victim_count, set_null_count}` (see [Recover and cascade](#cascade-recovery)). |
 | `POST /api/recover-cascade` | Cascade-recovery SQL generation (reverse FK `ON DELETE CASCADE` / `SET NULL` side effects). JSON body: `schema, table` (the **parent**), `pk, pks, since, until, lookback, max_depth, allow_incomplete`. Returns `{sql, statement_count, victim_count, set_null_count, complete, incomplete, generated_in_ms}` — text only, never executed. Returns `403` under an active RBAC redaction profile (see [Cascade recovery](#cascade-recovery)). |
 | `GET /api/capabilities` | Reports enabled optional surfaces for the **selected server**, e.g. `{"reconstruct": true, "recover_cascade": true, "recover_cascade_baseline": false, "source": "mysql", "auth": {"password_set": true, "auth_kind": "session"}}`. The frontend uses it to show/hide gated tabs on every switch (`reconstruct` → Time-travel) and to gate the logout affordance (`auth_kind` says how this request authenticated). `recover_cascade` reports whether cascade synthesis is available (false under an RBAC redaction profile) — it gates the standalone `POST /api/recover-cascade` endpoint; the **Recover** tab's auto-detection follows the same server-side rule. `source` (`"mysql"` or `"postgresql"`, read from the index's `stream_state.flavor`) drives **source-aware presentation** only — never a gate; see [PostgreSQL sources](#postgresql-sources). |
@@ -1229,7 +1236,7 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 | `GET /api/profiles` | RBAC data-profile **names** defined on the selected server's index: `{"profiles": ["..."]}`, sorted; empty on a legacy index without the table. Vocabulary for administration panels (e.g. a settings-surface profile picker) — never the rules or flagged tables/columns behind a name. |
 
-Every data endpoint (`status`, `schemas`, `events`, `recover`,
+Every data endpoint (`status`, `schemas`, `events`, `schema-changes`, `recover`,
 `recover-cascade`, `capabilities`, `reconstruct`, `baselines`) targets the
 server named by the `X-Bintrail-Server` request header; without the header they
 target the default entry (`storage` is the one process-global exception).

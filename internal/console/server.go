@@ -586,6 +586,9 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/activity", s.handleActivity)
 	api.HandleFunc("GET /api/schemas", s.handleSchemas)
 	api.HandleFunc("GET /api/events", s.handleEvents)
+	// DDL history (#1443): the schema_changes table of the selected server,
+	// read-only, same caps and scope rules as the events browser.
+	api.HandleFunc("GET /api/schema-changes", s.handleSchemaChanges)
 	api.HandleFunc("POST /api/recover", s.recordAction("recover", s.handleRecover))
 	api.HandleFunc("POST /api/recover-cascade", s.recordAction("recover-cascade", s.handleRecoverCascade))
 	api.HandleFunc("GET /api/capabilities", s.handleCapabilities)

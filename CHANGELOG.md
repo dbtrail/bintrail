@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package is guarded the day it appears; the console, MCP and pg binaries are
   pinned free of both. Records the #1467 decision mechanically: Iceberg is an
   output, not the storage layer.
+- **Schema changes view in the console** (#1443). A new read-only page under
+  Investigate lists every CREATE, ALTER, DROP, RENAME and TRUNCATE the stream
+  recorded for the selected server: time, table, type, the statement and its
+  binlog position, newest first, with the same schema, table, type and time
+  filters as Events and the same caps (100 by default, 1000 at most, and a
+  note when more exist). Backed by `GET /api/schema-changes`, which reads the
+  index's `schema_changes` table, takes the filters the MCP
+  `list_schema_changes` tool takes (`ddl_type` is a prefix, so `ALTER` matches
+  `ALTER TABLE`), and orders by `detected_at, binlog_file, binlog_pos, id`,
+  all descending, so DDLs detected in the same second list in their true
+  binlog order. A session whose access policy withholds a table never sees
+  that table's DDL.
 
 ### Changed
 - **Usage telemetry classifies first-run failures** (#1503). A fresh install

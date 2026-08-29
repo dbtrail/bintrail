@@ -67,6 +67,11 @@ var apiRoutePerms = []routePerm{
 	{"GET", "/api/coverage", ext.PermStatusRead},
 	{"GET", "/api/activity", ext.PermQueryExecute},
 	{"GET", "/api/events", ext.PermQueryExecute},
+	// DDL history (#1443) is tiered with the events browser: it names tables
+	// and serves the statements that shaped them, and its handler applies
+	// the same deny/allow table scope — a read that needs data-profile rules
+	// to be safe is not a status read.
+	{"GET", "/api/schema-changes", ext.PermQueryExecute},
 	{"GET", "/api/schemas", ext.PermQueryExecute},
 	{"GET", "/api/reconstruct", ext.PermReconstructExecute},
 	// The SQL panel reads the same indexed row data the events surface does —

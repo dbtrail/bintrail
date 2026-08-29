@@ -166,7 +166,8 @@ func TestSharedDateFieldIsTheOneTheConsoleUsesItself(t *testing.T) {
 	// in the extension") starts at the FIRST one, not the fifth. An exact pin
 	// makes a deliberate change a one-line acknowledged edit instead of
 	// something that slides past.
-	const wantOwn = 6
+	// 8 since #1443: the Schema changes view added its own Since/Until pair.
+	const wantOwn = 8
 	if own != wantOwn {
 		t.Errorf("app.js: fieldDateInput has %d call site(s) in the console's own views, expected %d. "+
 			"It is the widget handed to extension views through ui.dateField; if the console stops "+

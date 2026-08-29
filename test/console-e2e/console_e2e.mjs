@@ -4022,6 +4022,57 @@ try {
     ? ok("severity split: no elision note on a time-ranged read into the archives")
     : bad("severity split: no elision note on a time-ranged read into the archives", `noteCount=${arcWarn.noteCount}`);
 
+  // Scenario 12s — Schema changes view (#1443). Runs after the Events
+  // scenarios: they read the Events DOM in place, and this one navigates
+  // away from it. The sidebar entry routes to
+  // the DDL history, the seeded rows render newest-binlog-position first (the
+  // two DDLs share one second and CREATE was inserted first, so a listing
+  // ordered by detected_at alone would put it on top), the time column
+  // declares UTC, and the type filter narrows through the real API. Back on
+  // the byo-idx server first: the archive scenarios above leave the ARC
+  // index selected, and its schema_changes table is empty.
+  await page.evaluate(async (id) => { await switchServer(id); }, byoId);
+  await page.evaluate(() => navigate("schema-changes"));
+  await page.waitForSelector("#sc-rows .sc-row", { timeout: 10000 });
+  const scr = await page.evaluate(({ FIX }) => {
+    const rows = Array.from(document.querySelectorAll("#sc-rows .sc-row"));
+    const nav = document.querySelector('.nav-item[data-route="schema-changes"]');
+    const head = document.querySelector(".sc-head span");
+    const t = document.querySelector("#sc-rows .ev-time");
+    return {
+      rowCount: rows.length,
+      firstIsAlter: !!rows[0] && rows[0].textContent.includes("e2e-ddl-alter"),
+      secondIsCreate: !!rows[1] && rows[1].textContent.includes("e2e-ddl-create"),
+      table: rows[0] ? rows[0].textContent.includes(FIX + ".orders") : false,
+      navActive: !!nav && nav.classList.contains("active"),
+      headCol: head ? head.textContent : "",
+      tsTitle: t ? (t.getAttribute("title") || "") : "",
+      count: (document.querySelector("#sc-count") || {}).textContent,
+    };
+  }, { FIX });
+  scr.rowCount === 2 ? ok("schema changes: both seeded DDLs render") : bad("schema changes: both seeded DDLs render", `rowCount=${scr.rowCount}`);
+  (scr.firstIsAlter && scr.secondIsCreate)
+    ? ok("schema changes: same-second DDLs list in binlog order (ALTER above CREATE)")
+    : bad("schema changes: same-second DDLs list in binlog order (ALTER above CREATE)", JSON.stringify(scr));
+  scr.table ? ok("schema changes: rows name schema.table") : bad("schema changes: rows name schema.table", JSON.stringify(scr));
+  scr.navActive ? ok("schema changes: the sidebar entry is active on its route") : bad("schema changes: the sidebar entry is active on its route", "no active .nav-item[data-route=schema-changes]");
+  scr.headCol === "time (UTC)" ? ok("schema changes: the time column declares UTC") : bad("schema changes: the time column declares UTC", JSON.stringify(scr.headCol));
+  scr.tsTitle.startsWith("UTC; in your local time:") ? ok("schema changes: rows carry the local-time tooltip") : bad("schema changes: rows carry the local-time tooltip", JSON.stringify(scr.tsTitle));
+  scr.count === "2" ? ok("schema changes: the count line says 2") : bad("schema changes: the count line says 2", JSON.stringify(scr.count));
+  await page.selectOption('#sc-form select[name="ddl_type"]', "CREATE");
+  await page.waitForFunction(() => document.querySelectorAll("#sc-rows .sc-row").length === 1, { timeout: 10000 });
+  const scf = await page.evaluate(() => Array.from(document.querySelectorAll("#sc-rows .sc-row")).map((r) => r.textContent).join(" | "));
+  (scf.includes("e2e-ddl-create") && !scf.includes("e2e-ddl-alter"))
+    ? ok("schema changes: the type filter narrows to the CREATE through the API")
+    : bad("schema changes: the type filter narrows to the CREATE through the API", scf.slice(0, 200));
+  await page.selectOption('#sc-form select[name="ddl_type"]', "TRUNCATE");
+  await page.waitForSelector("#sc-rows .empty", { timeout: 10000 });
+  const sce = await page.evaluate(() => (document.querySelector("#sc-rows .empty") || {}).textContent || "");
+  /No schema changes found/.test(sce)
+    ? ok("schema changes: an empty result renders the empty state")
+    : bad("schema changes: an empty result renders the empty state", sce.slice(0, 200));
+  await page.selectOption('#sc-form select[name="ddl_type"]', "");
+
   // No uncaught JS errors over the whole run.
   jsErrors.length === 0 ? ok("no uncaught JS errors") : bad("no uncaught JS errors", JSON.stringify(jsErrors));
 } catch (err) {
