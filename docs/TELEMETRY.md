@@ -27,7 +27,9 @@ bintrail telemetry status   # is it on, and what decided that
 
 The web console shows the same event: on **Storage → Usage telemetry**, open
 **Show a sample event**. The daemon renders it through the same function the
-command uses, so the two cannot differ, and opening it sends nothing.
+command uses, so the fields and their form are the same; the values are the
+daemon's own (each render draws a fresh `run_id`), and opening it sends
+nothing.
 
 ## Why this document is longer than you expect
 

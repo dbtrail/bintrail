@@ -460,8 +460,10 @@ func SampleEvent() Event {
 // SampleEventJSON renders SampleEvent the way `bintrail telemetry show` prints
 // it: two-space indented, no trailing newline. It is the ONE renderer behind
 // every "inspect the payload" surface (the CLI command and the console's
-// telemetry card), so the bytes an operator sees cannot depend on which one
-// they opened. Each call draws a fresh run_id, exactly as each `show` run does.
+// telemetry card), so the fields and their form cannot differ between them.
+// The VALUES are the rendering process's own: each call draws a fresh run_id,
+// and a daemon's version, is_release or is_interactive can legitimately differ
+// from the operator's local CLI.
 func SampleEventJSON() ([]byte, error) {
 	return json.MarshalIndent(SampleEvent(), "", "  ")
 }
