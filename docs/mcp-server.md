@@ -212,7 +212,12 @@ HTTP, console-token auth, per-server routing by URL path) — if you already run
 `ALTER TABLE`), `since`, `until`, `limit` (default 100), and `uncovered_only`
 (only changes whose `snapshot_id` is `null` — the rows behind the `status`
 tool's "DDL(s) detected without auto-snapshot" warning); results come back
-newest-first.
+newest-first, and changes inside the same second are ordered by binlog
+coordinate (`binlog_file`, then `binlog_pos`), so a migration's burst of DDLs
+reads in the order it ran and a `limit` that cuts inside the burst keeps the
+same rows on every call. One caveat: `schema_changes` records no source
+identity, so in an index fed by more than one source, same-second changes from
+different sources have no true order between them, only a repeatable one.
 
 Prompts that work well:
 

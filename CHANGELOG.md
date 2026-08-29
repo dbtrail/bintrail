@@ -55,6 +55,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and from `docs/TELEMETRY.md`. The wire format and `schema_version` are
   unchanged.
 
+### Fixed
+- **`list_schema_changes` keeps same-second DDLs in the order they ran**
+  (#1441). `detected_at` has one-second resolution and a migration lands
+  dozens of statements inside one second, but the tool sorted by that column
+  alone, so inside a same-second group the rows came back in storage order:
+  oldest first, the opposite of the newest-first promise. A CREATE listed
+  before the DROP that followed it read as "dropped, then created". The order
+  now breaks ties by binlog coordinate (`binlog_file`, then `binlog_pos`) and
+  finally by `id`, which also makes a `limit` that cuts inside the group keep
+  the same rows on every call. The tool description and docs carry the one
+  caveat the stored data forces: `schema_changes` records no source identity,
+  so in an index fed by more than one source, same-second changes from
+  different sources have a repeatable order, not their true one.
+
 ## [0.70.0] - 2026-08-28
 
 ### Added

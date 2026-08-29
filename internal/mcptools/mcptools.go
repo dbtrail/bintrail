@@ -318,7 +318,9 @@ func NewServer(cfg Config) *mcp.Server {
 			"recorded during binlog indexing or streaming. " +
 			"Returns the full DDL statement, binlog coordinates, timestamp, and the " +
 			"covering snapshot_id (null = no schema snapshot was taken after the DDL) " +
-			"for each change; set uncovered_only to list just the changes without a snapshot.",
+			"for each change; set uncovered_only to list just the changes without a snapshot." +
+			" Results come back newest first; changes inside the same second are ordered by binlog position. " +
+			"When the index holds more than one source, same-second changes from different sources have no true order between them, only a repeatable one.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:          "List schema changes",
 			ReadOnlyHint:   true,
@@ -1070,7 +1072,15 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 		if args.UncoveredOnly {
 			q += " AND snapshot_id IS NULL"
 		}
-		q += " ORDER BY detected_at DESC LIMIT ?"
+		// detected_at has one-second resolution and a migration lands dozens of
+		// DDLs inside one second, so the timestamp alone leaves the group in
+		// storage order (oldest first, the opposite of the DESC promise). The
+		// binlog coordinate is the true order within a source (file names are
+		// zero-padded, so lexicographic is chronological); id is the final
+		// deterministic tail so a limit cutting inside the group is repeatable
+		// (#1441). Across sources the tie has no recoverable true order: the table
+		// carries no source identity and the file sequences are unrelated.
+		q += " ORDER BY detected_at DESC, binlog_file DESC, binlog_pos DESC, id DESC LIMIT ?"
 		params = append(params, limit)
 
 		rows, err := t.DB.QueryContext(ctx, q, params...)
