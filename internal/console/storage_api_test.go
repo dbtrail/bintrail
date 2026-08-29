@@ -95,8 +95,9 @@ func TestStorageAPI_stagingShare(t *testing.T) {
 	srv := newSQLExportServer(t, stub)
 	id := addRestoreEntry(t, srv, t.TempDir())
 	stub.staged = SQLExportStagingInfo{Dir: "/staging/sql-export", TTL: 4 * time.Hour, Builds: []SQLExportStagedBuild{
-		{ServerID: id, State: "succeeded", At: "2026-06-10T11:00:00Z", ExpiresAt: "2026-06-10T16:00:00Z", Bytes: 1500},
-		{ServerID: "gone", State: "running", Bytes: 500},
+		{ServerID: id, State: "succeeded", At: "2026-06-10T11:00:00Z", ExpiresAt: "2026-06-10T16:00:00Z", Bytes: 1500, BytesKnown: true},
+		{ServerID: "gone", State: "running", Bytes: 500, BytesKnown: true},
+		{ServerID: "stuck", State: "failed", Bytes: 7, BytesKnown: false, StagingError: "could not remove the staged files (build failed): permission denied"},
 	}}
 
 	rec, body := doServersReq(t, srv, "GET", "/api/storage", "")
@@ -113,8 +114,16 @@ func TestStorageAPI_stagingShare(t *testing.T) {
 	if got.Staging.Dir != "/staging/sql-export" || got.Staging.TTLHours != 4 || got.Staging.Bytes != 2000 {
 		t.Fatalf("staging = %+v, want the dir, 4h and the 2000-byte total", got.Staging)
 	}
-	if len(got.Staging.Builds) != 2 {
-		t.Fatalf("builds = %+v, want both", got.Staging.Builds)
+	if len(got.Staging.Builds) != 3 {
+		t.Fatalf("builds = %+v, want all three", got.Staging.Builds)
+	}
+	// An unmeasurable build is excluded from the total (2000, not 2007) and
+	// says so, never "0 B".
+	if b := got.Staging.Builds[2]; b.BytesKnown || b.StagingError == "" || b.State != "failed" {
+		t.Fatalf("build[2] = %+v, want bytes_known=false with its staging error and state", b)
+	}
+	if !strings.Contains(string(body), `"bytes_known":false`) {
+		t.Fatalf("bytes_known must be serialized even when false: %s", body)
 	}
 	if b := got.Staging.Builds[0]; b.ServerName != "wp" || b.State != "succeeded" || b.ExpiresAt != "2026-06-10T16:00:00Z" || b.Bytes != 1500 {
 		t.Fatalf("build[0] = %+v, want the registry name, state, deadline and size", b)

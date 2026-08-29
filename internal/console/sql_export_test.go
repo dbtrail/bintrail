@@ -25,10 +25,29 @@ type stubSQLExporter struct {
 	// delivered records every SQLExportDelivered call as "<server>|<dir>".
 	delivered []string
 	staged    SQLExportStagingInfo
+	// holds is the number of open holds; heldOnce counts every hold taken.
+	holds, heldOnce int
+	holdRefused     bool
 }
 
 func (s *stubSQLExporter) SQLExportDelivered(serverID, dir string) {
 	s.delivered = append(s.delivered, serverID+"|"+dir)
+}
+
+// holds counts open holds; holdRefused scripts SQLExportHold to say no.
+func (s *stubSQLExporter) SQLExportHold(string, string) (func(), bool) {
+	if s.holdRefused {
+		return func() {}, false
+	}
+	s.holds++
+	s.heldOnce++
+	released := false
+	return func() {
+		if !released {
+			released = true
+			s.holds--
+		}
+	}, true
 }
 func (s *stubSQLExporter) SQLExportStaged() SQLExportStagingInfo { return s.staged }
 
@@ -283,6 +302,11 @@ func TestSQLExportDownload_roundTrip(t *testing.T) {
 	if len(stub.delivered) != 1 || stub.delivered[0] != id+"|"+dir {
 		t.Fatalf("delivered = %v, want exactly [%s|%s]", stub.delivered, id, dir)
 	}
+	// The stream held the build (so no deadline could remove it underneath)
+	// and let go before reporting the delivery.
+	if stub.heldOnce != 1 || stub.holds != 0 {
+		t.Fatalf("holds: taken %d, open %d; want one taken and released", stub.heldOnce, stub.holds)
+	}
 }
 
 func TestSQLExportDownload_emptyBuild(t *testing.T) {
@@ -487,5 +511,80 @@ func TestCapabilitySQLExportGate(t *testing.T) {
 		if caps.SQLExport != enabled {
 			t.Errorf("sql_export capability = %v, want %v", caps.SQLExport, enabled)
 		}
+	}
+}
+
+// flushErrWriter is a ResponseWriter whose flush reports a broken
+// connection, the shape net/http shows when the client vanished during the
+// buffered tail of the body.
+type flushErrWriter struct {
+	*httptest.ResponseRecorder
+	err error
+}
+
+func (w *flushErrWriter) FlushError() error { return w.err }
+
+// TestSQLExportDownload_flushFailureAborts: the build is consumed only once
+// the last bytes were FLUSHED to the socket. A flush that fails after every
+// byte was written must abort, audit as aborted, deliver nothing and drop
+// the hold, so the build stays for a retry.
+func TestSQLExportDownload_flushFailureAborts(t *testing.T) {
+	rec := audittest.Install(t)
+	dir := newSQLDumpFixture(t)
+	stub := &stubSQLExporter{dir: dir, ready: true,
+		st: BaselineStatus{State: "succeeded", At: "2026-06-10T12:00:00Z"}}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+
+	req := httptest.NewRequest("GET", "/api/servers/"+id+"/sql-export/download", nil)
+	req.SetPathValue("id", id)
+	w := &flushErrWriter{ResponseRecorder: httptest.NewRecorder(), err: errors.New("write: broken pipe")}
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				if r != http.ErrAbortHandler {
+					t.Fatalf("panic = %v, want http.ErrAbortHandler", r)
+				}
+			}
+		}()
+		srv.handleSQLExportDownload(w, req)
+	}()
+	if !panicked {
+		t.Fatal("a failed flush after the last byte must abort, not declare the archive delivered")
+	}
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v after a failed flush, want none", stub.delivered)
+	}
+	if stub.heldOnce != 1 || stub.holds != 0 {
+		t.Fatalf("holds: taken %d, open %d; want one taken and released on abort", stub.heldOnce, stub.holds)
+	}
+	var ev *ext.AuditEvent
+	for _, e := range rec.Events() {
+		if e.Action == "baseline.download" {
+			c := e
+			ev = &c
+		}
+	}
+	if ev == nil || ev.Detail["aborted"] != "true" {
+		t.Fatalf("audit = %v, want the aborted handover recorded", ev)
+	}
+}
+
+// TestSQLExportDownload_holdRefused: a build that expired or was replaced
+// between the readiness read and the hold is refused, not streamed.
+func TestSQLExportDownload_holdRefused(t *testing.T) {
+	dir := newSQLDumpFixture(t)
+	stub := &stubSQLExporter{dir: dir, ready: true, holdRefused: true,
+		st: BaselineStatus{State: "succeeded", At: "2026-06-10T12:00:00Z"}}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+	w, body := doServersReq(t, srv, "GET", "/api/servers/"+id+"/sql-export/download", "")
+	if w.Code != 409 {
+		t.Fatalf("code=%d body=%s, want 409", w.Code, body)
+	}
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v, want none", stub.delivered)
 	}
 }

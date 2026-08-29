@@ -4,12 +4,14 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/console"
+	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
 
 // The staged-build lifecycle (#1448): a finished .sql build leaves the disk
@@ -55,7 +57,7 @@ func seedFinishedExport(t *testing.T, sup *baselineSupervisor, serverID string) 
 	sup.mu.Lock()
 	sup.exports[serverID] = &console.BaselineStatus{State: "running", Since: sup.clock().UTC().Format(time.RFC3339),
 		At: at.Format(time.RFC3339)}
-	sup.exportDirs[serverID] = dir
+	sup.exportRuns[serverID] = &sqlExportRun{dir: dir}
 	sup.mu.Unlock()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -298,7 +300,7 @@ func TestRemoveStagedBuild_guard(t *testing.T) {
 	}
 	refuse := func(name, dir string) {
 		t.Helper()
-		if _, err := removeStagedBuild(base, dir); err == nil {
+		if _, _, err := removeStagedBuild(base, dir); err == nil {
 			t.Fatalf("%s: removeStagedBuild(%q) = nil, want a refusal", name, dir)
 		}
 		if !onDisk(victim) {
@@ -346,7 +348,7 @@ func TestRemoveStagedBuild_guard(t *testing.T) {
 	if err := os.Symlink(outside, linkedBase); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := removeStagedBuild(linkedBase, filepath.Join(linkedBase, "run")); err == nil {
+	if _, _, err := removeStagedBuild(linkedBase, filepath.Join(linkedBase, "run")); err == nil {
 		t.Fatal("a base that is a symlink must refuse")
 	}
 	if !onDisk(filepath.Join(outside, "run", "b.sql")) {
@@ -356,15 +358,20 @@ func TestRemoveStagedBuild_guard(t *testing.T) {
 	// A real build is removed and its size reported; a missing one is a
 	// success with nothing freed.
 	real := mkBuild("srv1", "1")
-	n, err := removeStagedBuild(base, real)
-	if err != nil || n != 4 {
-		t.Fatalf("real build: (%d, %v), want (4, nil)", n, err)
+	n, sized, err := removeStagedBuild(base, real)
+	if err != nil || n != 4 || !sized {
+		t.Fatalf("real build: (%d, %v, %v), want (4, true, nil)", n, sized, err)
 	}
 	if onDisk(real) {
 		t.Fatal("real build still on disk")
 	}
-	if n, err := removeStagedBuild(base, filepath.Join(base, "srv1", "missing")); err != nil || n != 0 {
+	if n, _, err := removeStagedBuild(base, filepath.Join(base, "srv1", "missing")); err != nil || n != 0 {
 		t.Fatalf("missing build: (%d, %v), want (0, nil)", n, err)
+	}
+	// A relative base is refused outright: it would resolve against the
+	// working directory.
+	if _, _, err := removeStagedBuild("sql-export", "sql-export/srv1/1"); err == nil {
+		t.Fatal("a relative base must refuse")
 	}
 }
 
@@ -428,4 +435,334 @@ func TestSQLExportBootSweep_neverFollowsSymlinks(t *testing.T) {
 func onDisk(p string) bool {
 	_, err := os.Lstat(p)
 	return err == nil
+}
+
+// fakeFold replaces the reconstruct fold with one that writes a one-file
+// dump plus the #842 marker into the build dir, so TriggerSQLExport can be
+// driven through its REAL goroutine, status tail and deadline stamp.
+func fakeFold(t *testing.T) {
+	t.Helper()
+	prev := foldTables
+	t.Cleanup(func() { foldTables = prev })
+	foldTables = func(_ context.Context, cfg reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		if err := os.WriteFile(filepath.Join(cfg.OutputDir, "shop.orders.00000.sql"), []byte("INSERT INTO `orders` VALUES (1);"), 0o644); err != nil {
+			return nil, nil, err
+		}
+		if err := baseline.WriteSuccessMarker(cfg.OutputDir); err != nil {
+			return nil, nil, err
+		}
+		return []*reconstruct.TableReport{{Schema: "shop", Table: "orders", RowsWritten: 1}}, nil, nil
+	}
+}
+
+// triggerAndFinish runs a real build through TriggerSQLExport over the
+// fake fold and waits for it to settle. Returns the build dir.
+func triggerAndFinish(t *testing.T, sup *baselineSupervisor, serverID string) string {
+	t.Helper()
+	src := t.TempDir()
+	writeFakeSnapshot(t, src)
+	if err := sup.TriggerSQLExport(console.SQLExportRequest{ServerID: serverID, ServerName: "wp",
+		IndexDSN: "dsn", BaselineSrc: src, At: snapshotAnchor.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	st := waitForTerminalState(t, func() console.BaselineStatus { return sup.SQLExportStatus(serverID) })
+	if st.State != "succeeded" {
+		t.Fatalf("build = %+v, want succeeded", st)
+	}
+	sup.mu.Lock()
+	dir := sup.exportRuns[serverID].dir
+	sup.mu.Unlock()
+	return dir
+}
+
+// TestSQLExportRealBuild_stampsDeadlineAndDownloads drives the full path a
+// click takes (trigger, goroutine, fold, status tail) and pins that the
+// finished build carries the deadline and is downloadable until it.
+func TestSQLExportRealBuild_stampsDeadlineAndDownloads(t *testing.T) {
+	fakeFold(t)
+	sup, clk, cancel := newClockedSupervisor(t)
+	defer cancel()
+	dir := triggerAndFinish(t, sup, "srv1")
+	st := sup.SQLExportStatus("srv1")
+	if st.ExpiresAt != clk.now().Add(sqlExportTTL).Format(time.RFC3339) || st.Bytes == 0 {
+		t.Fatalf("status = %+v, want a deadline %s after finishing and a size", st, sqlExportTTL)
+	}
+	got, _, ok := sup.SQLExportDir("srv1")
+	if !ok || got != dir {
+		t.Fatalf("SQLExportDir = (%q, %v), want (%q, true)", got, ok, dir)
+	}
+	clk.advance(sqlExportTTL + time.Second)
+	if st := sup.SQLExportStatus("srv1"); st.State != "expired" || onDisk(dir) {
+		t.Fatalf("past the deadline: state = %s, dir present = %v", st.State, onDisk(dir))
+	}
+}
+
+// TestSQLExportRemovalFailure_staysVisibleAndRetries pins the rule that the
+// state follows the disk: a removal that fails leaves the build in its
+// state with the error on it, still counted on the Storage card with its
+// bytes, refused for download, and retried until it succeeds.
+func TestSQLExportRemovalFailure_staysVisibleAndRetries(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	sup, clk, cancel := newClockedSupervisor(t)
+	defer cancel()
+	dir := seedFinishedExport(t, sup, "srv1")
+	// A read-only build dir: its files cannot be unlinked, so RemoveAll
+	// fails while every byte stays readable.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	clk.advance(sqlExportTTL + time.Second)
+	st := sup.SQLExportStatus("srv1")
+	if st.State != "succeeded" {
+		t.Fatalf("state = %s after a failed removal, want succeeded (the state must not claim a removal that did not happen)", st.State)
+	}
+	if !strings.Contains(st.StagingError, "could not remove") {
+		t.Fatalf("staging_error = %q, want the removal failure", st.StagingError)
+	}
+	if !onDisk(filepath.Join(dir, "shop.orders.00000.sql")) {
+		t.Fatal("the dump file is gone; the fixture did not make the removal fail")
+	}
+	staged := sup.SQLExportStaged()
+	if len(staged.Builds) != 1 || !staged.Builds[0].BytesKnown || staged.Builds[0].Bytes == 0 || staged.Builds[0].StagingError == "" {
+		t.Fatalf("staged = %+v, want the stuck build with its bytes and its error", staged.Builds)
+	}
+	if _, _, ok := sup.SQLExportDir("srv1"); ok {
+		t.Fatal("a build owed a removal must not be downloadable")
+	}
+	if _, ok := sup.SQLExportHold("srv1", dir); ok {
+		t.Fatal("a build owed a removal must not accept a download hold")
+	}
+
+	// The operator fixes the permission; the next reaper tick succeeds.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sup.reapSQLExportsGuarded()
+	st = sup.SQLExportStatus("srv1")
+	if st.State != "expired" || st.StagingError != "" || onDisk(dir) {
+		t.Fatalf("after the retry: status = %+v, dir present = %v; want expired, no error, gone", st, onDisk(dir))
+	}
+}
+
+// TestSQLExportExpiry_skipsAnInFlightDownload: a deadline that lands while
+// a download streams the build must not turn it into an aborted archive;
+// the build expires once the hold is released.
+func TestSQLExportExpiry_skipsAnInFlightDownload(t *testing.T) {
+	sup, clk, cancel := newClockedSupervisor(t)
+	defer cancel()
+	dir := seedFinishedExport(t, sup, "srv1")
+	release, ok := sup.SQLExportHold("srv1", dir)
+	if !ok {
+		t.Fatal("a fresh finished build must accept a hold")
+	}
+	clk.advance(sqlExportTTL + time.Minute)
+	sup.reapSQLExportsGuarded()
+	if st := sup.SQLExportStatus("srv1"); st.State != "succeeded" || !onDisk(dir) {
+		t.Fatalf("held build past its deadline: state = %s, present = %v; want succeeded and present", st.State, onDisk(dir))
+	}
+	// Skipped ENTIRELY, not merely left on disk: the reaper must not owe
+	// the held build a removal either, or a second download that starts
+	// while the first streams would be refused (and the card would show a
+	// staging problem that is not one).
+	if _, _, ok := sup.SQLExportDir("srv1"); !ok {
+		t.Fatal("a held build past its deadline must stay downloadable while the stream runs")
+	}
+	release2, ok := sup.SQLExportHold("srv1", dir)
+	if !ok {
+		t.Fatal("a second download must be able to hold a build another stream holds")
+	}
+	release2()
+	release()
+	release() // idempotent: the handler releases explicitly and again in its defer
+	if st := sup.SQLExportStatus("srv1"); st.State != "expired" || onDisk(dir) {
+		t.Fatalf("after release: state = %s, present = %v; want expired and gone", st.State, onDisk(dir))
+	}
+	if _, ok := sup.SQLExportHold("srv1", dir); ok {
+		t.Fatal("an expired build must refuse a hold")
+	}
+}
+
+// TestSQLExportDelivered_overridesExpired: a build the deadline caught while
+// its stream was completing reads delivered, the truer verdict.
+func TestSQLExportDelivered_overridesExpired(t *testing.T) {
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	dir := seedFinishedExport(t, sup, "srv1")
+	sup.mu.Lock()
+	sup.exports["srv1"].State = "expired"
+	sup.mu.Unlock()
+	sup.SQLExportDelivered("srv1", dir)
+	if st := sup.SQLExportStatus("srv1"); st.State != "downloaded" || onDisk(dir) {
+		t.Fatalf("status = %+v, present = %v; want downloaded and gone", st, onDisk(dir))
+	}
+}
+
+// TestSQLExportDelivered_waitsForHolds: a delivery while a hold is still
+// open owes the removal instead of pulling the files from under the other
+// stream; the reaper removes it once the hold drops.
+func TestSQLExportDelivered_waitsForHolds(t *testing.T) {
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	dir := seedFinishedExport(t, sup, "srv1")
+	release, _ := sup.SQLExportHold("srv1", dir)
+	sup.SQLExportDelivered("srv1", dir)
+	if !onDisk(dir) {
+		t.Fatal("a held build was removed under its stream")
+	}
+	release()
+	sup.reapSQLExportsGuarded()
+	if st := sup.SQLExportStatus("srv1"); st.State != "downloaded" || onDisk(dir) {
+		t.Fatalf("after the hold dropped: status = %+v, present = %v; want downloaded and gone", st, onDisk(dir))
+	}
+}
+
+// TestSQLExportUnreadableStaging_isNotExpired: only "does not exist" means
+// the files are gone. A marker that cannot be read (EACCES here) keeps the
+// build and its state and puts the reason on the card; once readable again
+// the error clears.
+func TestSQLExportUnreadableStaging_isNotExpired(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	dir := seedFinishedExport(t, sup, "srv1")
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	st := sup.SQLExportStatus("srv1")
+	if st.State != "succeeded" || !strings.Contains(st.StagingError, "could not be read") {
+		t.Fatalf("status = %+v, want succeeded with a could-not-be-read error", st)
+	}
+	if !onDisk(dir) {
+		t.Fatal("an unreadable build was removed")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if st := sup.SQLExportStatus("srv1"); st.State != "succeeded" || st.StagingError != "" {
+		t.Fatalf("readable again: status = %+v, want succeeded with the error cleared", st)
+	}
+}
+
+// TestSQLExportStaged_unknownSizeIsNotZero: a build the walk cannot measure
+// is reported as unknown, never as the fraction that was counted.
+func TestSQLExportStaged_unknownSizeIsNotZero(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	dir := seedFinishedExport(t, sup, "srv1")
+	locked := filepath.Join(dir, "corner")
+	if err := os.Mkdir(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	staged := sup.SQLExportStaged()
+	if len(staged.Builds) != 1 || staged.Builds[0].BytesKnown {
+		t.Fatalf("staged = %+v, want one build of unknown size", staged.Builds)
+	}
+}
+
+// TestSQLExportPanic_removesTheBuild: a fold that dies leaves "failed" AND
+// no directory, the same as a fold that refused.
+func TestSQLExportPanic_removesTheBuild(t *testing.T) {
+	defer injectFoldPanic("induced panic in the export fold")()
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	src := t.TempDir()
+	writeFakeSnapshot(t, src)
+	if err := sup.TriggerSQLExport(console.SQLExportRequest{ServerID: "srv1", ServerName: "wp",
+		IndexDSN: "dsn", BaselineSrc: src, At: snapshotAnchor.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	st := waitForTerminalState(t, func() console.BaselineStatus { return sup.SQLExportStatus("srv1") })
+	if st.State != "failed" {
+		t.Fatalf("state = %s, want failed", st.State)
+	}
+	sup.mu.Lock()
+	dir := sup.exportRuns["srv1"].dir
+	sup.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for onDisk(dir) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if onDisk(dir) {
+		t.Fatalf("the panicked build's directory %s is still on disk", dir)
+	}
+	if staged := sup.SQLExportStaged(); len(staged.Builds) != 0 {
+		t.Fatalf("staged = %+v, want nothing after the failed build was removed", staged.Builds)
+	}
+}
+
+// TestSQLExportPreBuildWipe_warnsAndContinues: a sibling the guard refuses
+// under the server's staging dir must not fail every future build.
+func TestSQLExportPreBuildWipe_warnsAndContinues(t *testing.T) {
+	fakeFold(t)
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	outside := t.TempDir()
+	if err := os.MkdirAll(sup.sqlExportRoot("srv1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(sup.sqlExportRoot("srv1"), "stray")); err != nil {
+		t.Fatal(err)
+	}
+	triggerAndFinish(t, sup, "srv1")
+	if _, err := os.Lstat(filepath.Join(sup.sqlExportRoot("srv1"), "stray")); err != nil {
+		t.Fatalf("the refused sibling was removed after all: %v", err)
+	}
+}
+
+// TestSQLExportFailedBuildStuck_staysOnStorageCard: a failed build whose
+// partial files could not be removed is still bytes on the disk, so it
+// stays on the Storage card (state failed, with the error) until the
+// retried removal succeeds. Dropping it would recreate the invisible-space
+// condition for the one shape nobody would think to look for.
+func TestSQLExportFailedBuildStuck_staysOnStorageCard(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	req := console.SQLExportRequest{ServerID: "srv1", ServerName: "wp",
+		IndexDSN: "i:p@tcp(h:3306)/idx", BaselineSrc: t.TempDir(),
+		At: time.Date(2026, 6, 10, 11, 0, 0, 0, time.UTC)}
+	dir := filepath.Join(sup.sqlExportRoot("srv1"), "1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "shop.orders.00000.sql"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	seedExport(sup, "srv1", "running", dir)
+	sup.runSQLExport(req, dir) // the empty store makes the fold refuse
+	st := sup.SQLExportStatus("srv1")
+	if st.State != "failed" || !strings.Contains(st.StagingError, "could not remove") {
+		t.Fatalf("status = %+v, want failed with the removal failure recorded", st)
+	}
+	staged := sup.SQLExportStaged()
+	if len(staged.Builds) != 1 || staged.Builds[0].State != "failed" || staged.Builds[0].Bytes != 7 || !staged.Builds[0].BytesKnown {
+		t.Fatalf("staged = %+v, want the stuck failed build with its 7 bytes", staged.Builds)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sup.reapSQLExportsGuarded()
+	if st := sup.SQLExportStatus("srv1"); st.State != "failed" || st.StagingError != "" || onDisk(dir) {
+		t.Fatalf("after the retry: status = %+v, present = %v; want failed, no staging error, gone", st, onDisk(dir))
+	}
+	if staged := sup.SQLExportStaged(); len(staged.Builds) != 0 {
+		t.Fatalf("staged = %+v after the removal succeeded, want nothing", staged.Builds)
+	}
 }

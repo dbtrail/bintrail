@@ -34,10 +34,14 @@ type stagingDTO struct {
 type stagedBuildDTO struct {
 	ServerID   string `json:"server_id"`
 	ServerName string `json:"server_name,omitempty"` // resolved from the registry when the entry still exists
-	State      string `json:"state"`                 // running | succeeded
+	State      string `json:"state"`                 // running | succeeded | failed (removal still owed)
 	At         string `json:"at,omitempty"`
 	ExpiresAt  string `json:"expires_at,omitempty"`
-	Bytes      int64  `json:"bytes"`
+	// Bytes counts only when BytesKnown; an unmeasurable build is excluded
+	// from the total and shown as unknown, never as 0 B.
+	Bytes        int64  `json:"bytes"`
+	BytesKnown   bool   `json:"bytes_known"`
+	StagingError string `json:"staging_error,omitempty"`
 }
 
 type storageInfoResponse struct {
@@ -73,13 +77,16 @@ func (s *Server) stagingInfo() *stagingDTO {
 	info := s.sqlExport.SQLExportStaged()
 	out := &stagingDTO{Dir: info.Dir, TTLHours: info.TTL.Hours(), Builds: []stagedBuildDTO{}}
 	for _, b := range info.Builds {
-		d := stagedBuildDTO{ServerID: b.ServerID, State: b.State, At: b.At, ExpiresAt: b.ExpiresAt, Bytes: b.Bytes}
+		d := stagedBuildDTO{ServerID: b.ServerID, State: b.State, At: b.At, ExpiresAt: b.ExpiresAt,
+			Bytes: b.Bytes, BytesKnown: b.BytesKnown, StagingError: b.StagingError}
 		if s.cm != nil && s.cm.reg != nil {
 			if e, ok := s.cm.reg.Get(b.ServerID); ok {
 				d.ServerName = e.Name
 			}
 		}
-		out.Bytes += b.Bytes
+		if b.BytesKnown {
+			out.Bytes += b.Bytes
+		}
 		out.Builds = append(out.Builds, d)
 	}
 	return out

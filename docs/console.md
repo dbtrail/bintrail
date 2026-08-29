@@ -159,18 +159,21 @@ and searching events:
    discoverable snapshot in the same store, and **Build a .sql backup for
    any moment**, which folds a chosen instant into a mydumper-format dump
    downloaded as one `.tar.gz` — load it with `myloader`, nothing from
-   bintrail needed on the restore side. The build is a full plaintext copy
-   of every row, staged on the daemon's disk (under the system temp
-   directory unless `BINTRAIL_CONSOLE_BASELINE_STAGING` says otherwise). It
-   does not stay there: the file is removed as soon as a download completes,
-   4 hours after the build finished if nobody downloaded it (the Ready line
-   shows the deadline and the size), when a new build for the same server
-   starts, or when the daemon restarts (every build a previous process left
-   behind, finished or interrupted, is removed at startup). The Storage page
-   shows what is staged while it exists) and **Verification** (run
+   bintrail needed on the restore side; the build is a full plaintext copy
+   of every row, staged on the daemon's disk under the system temp
+   directory unless `BINTRAIL_CONSOLE_BASELINE_STAGING` says otherwise) and
+   **Verification** (run
    `bintrail verify` and read past runs). These produce and validate the
    artifacts a restore depends on, so they are operations rather than
    settings; they lived on the Storage page until they outgrew it.
+   A staged `.sql` build does not stay on disk: it is removed as soon as a
+   download completes, 4 hours after the build finished if nobody
+   downloaded it (the Ready line shows the deadline and the size), when a
+   new build for the same server starts, or when the daemon restarts (every
+   build a previous process left behind, finished or interrupted, is removed
+   at startup). If a removal fails, the build keeps its state, the card says
+   why, and the daemon retries every minute. The Storage page shows what is
+   staged while it exists.
 7. **Settings** (under `watch` only) — **Storage** (rotation policy,
    per-source S3 archiving, a baseline summary card, AWS credential signals,
    and a usage-telemetry opt-out — see

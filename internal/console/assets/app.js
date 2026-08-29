@@ -3851,13 +3851,17 @@ function stagingCard(storage, servers) {
   } else {
     card.append(el("p", { class: "stg-hint", text:
       humanBytes(stg.bytes || 0) + " on this machine in " + builds.length + (builds.length === 1 ? " build" : " builds") +
+      (builds.some((b) => !b.bytes_known) ? " (not counting builds whose size could not be measured)" : "") +
       ". Each is removed once downloaded, or " + hours + " hours after it finished." }));
     for (const b of builds) {
       const name = b.server_name || ((servers || []).find((s) => s.id === b.server_id) || {}).name || b.server_id;
-      const what = b.state === "running"
-        ? "building" + (b.at ? " as of " + utcLabel(b.at) : "")
-        : "ready" + (b.at ? " as of " + utcLabel(b.at) : "") + (b.expires_at ? ", removed at " + utcLabel(b.expires_at) + " if not downloaded" : "");
-      kvRow(card, name, humanBytes(b.bytes || 0) + ", " + what);
+      let what;
+      if (b.staging_error) what = "could not be removed or read: " + b.staging_error;
+      else if (b.state === "running") what = "building" + (b.at ? " as of " + utcLabel(b.at) : "");
+      else if (b.state === "failed") what = "failed build, being removed";
+      else what = "ready" + (b.at ? " as of " + utcLabel(b.at) : "") + (b.expires_at ? ", removed at " + utcLabel(b.expires_at) + " if not downloaded" : "");
+      const size = b.bytes_known ? humanBytes(b.bytes || 0) : "size unknown";
+      kvRow(card, name, size + ", " + what);
     }
   }
   kvRow(card, "location", stg.dir || "");
@@ -4905,9 +4909,11 @@ function backupSQLExportCard(cur, b, sqlSt) {
   } else if (st && st.state === "succeeded") {
     const dl = el("button", { class: "btn", type: "button", text: "Download .sql backup (.tar.gz)" });
     dl.onclick = () => downloadSQLExport(cur.id, dl, st.bytes || 0);
-    body.append(el("div", { class: "bk-restore-row" },
+    const row = el("div", { class: "bk-restore-row" },
       el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") +
-        (st.bytes ? " (" + humanBytes(st.bytes) + " on this machine)" : "") + "." }), dl));
+        (st.bytes ? " (" + humanBytes(st.bytes) + " on this machine)" : "") + "." }));
+    if (!st.staging_error) row.append(dl);
+    body.append(row);
     body.append(el("p", { class: "form-hint", text:
       (st.expires_at ? "The download stays available until " + utcLabel(st.expires_at) + ". " : "") +
       "The file is removed from this machine once you download it, when that time passes, or when a new build starts." }));
@@ -4920,6 +4926,14 @@ function backupSQLExportCard(cur, b, sqlSt) {
   } else if (st && st.state === "expired") {
     body.append(el("p", { class: "form-hint", text:
       "The backup built for " + utcLabel(st.at || "") + " is no longer on this machine: it was not downloaded before its deadline, or its files were removed. Build again for a fresh copy." }));
+    details.open = true;
+  }
+  // The state follows the disk: a removal that failed keeps the build in
+  // its previous state and says so here, over a download button that would
+  // only answer "not ready".
+  if (st && st.staging_error) {
+    body.append(el("p", { class: "form-msg err", text:
+      "Staging problem: " + st.staging_error + ". The daemon retries every minute; check the staging directory on the machine running it." }));
     details.open = true;
   }
   details.append(body);

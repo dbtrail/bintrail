@@ -61,9 +61,10 @@ type baselineSupervisor struct {
 	// exports tracks custom .sql backup builds, keyed by server id — the
 	// fourth job kind under the shared single-flight.
 	exports map[string]*console.BaselineStatus
-	// exportDirs is each server's CURRENT build directory (unique per build;
-	// see sqlExportRoot for why builds never share a path).
-	exportDirs map[string]string
+	// exportRuns is each server's CURRENT build: its directory (unique per
+	// build; see sqlExportRoot for why builds never share a path), the
+	// downloads streaming it, and the removal it is owed.
+	exportRuns map[string]*sqlExportRun
 	// now is the sql-export lifecycle's clock (nil = time.Now); tests inject
 	// one to cross the download TTL without waiting for it.
 	now func() time.Time
@@ -97,7 +98,7 @@ func newBaselineSupervisor(ctx context.Context, stagingDir string, lockMode base
 		refreshes:  make(map[string]*console.BaselineStatus),
 		restores:   make(map[string]*console.BaselineStatus),
 		exports:    make(map[string]*console.BaselineStatus),
-		exportDirs: make(map[string]string),
+		exportRuns: make(map[string]*sqlExportRun),
 	}
 }
 
