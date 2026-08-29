@@ -43,6 +43,14 @@ func callSchemaChanges(t *testing.T, cfg Config, args SchemaChangesArgs) []schem
 	return rows
 }
 
+func ids(rows []schemaChangeOut) []int64 {
+	out := make([]int64, len(rows))
+	for i, r := range rows {
+		out[i] = r.ID
+	}
+	return out
+}
+
 func positions(rows []schemaChangeOut) []int64 {
 	out := make([]int64, len(rows))
 	for i, r := range rows {
@@ -65,10 +73,14 @@ func equalInt64s(a, b []int64) bool {
 
 // TestIntegrationSchemaChangesTool_sameSecondOrder pins #1441: DDLs that
 // share one detected_at second must come back newest-first by binlog
-// coordinate, and a limit that cuts inside the group must keep the same rows
-// on every call. The rows are written through indexer.InsertSchemaChange, the
-// production writer, oldest first, so the storage order is the oldest-first
-// order the bare `ORDER BY detected_at DESC` was observed to walk.
+// coordinate (binlog_file, then binlog_pos), with id as the deterministic
+// tail. The rows are written through indexer.InsertSchemaChange, the
+// production writer, and deliberately NOT in coordinate order: insertion
+// order (= id order) must disagree with binlog order, or a sort on id alone
+// would pass for the wrong reason. The fixture also carries one row in a
+// LATER file with a LOWER position (so binlog_file must outrank binlog_pos)
+// and one duplicate-coordinate pair inserted last, the multi-source shape
+// the tool's caveat describes, which only the id tail can order.
 func TestIntegrationSchemaChangesTool_sameSecondOrder(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	db, _ := testutil.CreateTestDB(t)
@@ -77,28 +89,37 @@ func TestIntegrationSchemaChangesTool_sameSecondOrder(t *testing.T) {
 	burst := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
 	earlier := burst.Add(-time.Second)
 
-	// One DDL in the second before the burst, then a migration's four
-	// statements inside one second, in the order the binlog carries them.
+	// Insertion order → id 1..6. Coordinates on purpose out of order.
 	seed := []event.Event{
+		// id 1: the second before the burst.
 		{Timestamp: earlier, BinlogFile: "binlog.000007", EndPos: 50,
 			Schema: "shop", Table: "orders", DDLType: event.DDLAlterTable,
 			DDLQuery: "ALTER TABLE orders ADD COLUMN note TEXT"},
-		{Timestamp: burst, BinlogFile: "binlog.000007", EndPos: 100,
-			Schema: "shop", Table: "orders_new", DDLType: event.DDLCreateTable,
-			DDLQuery: "CREATE TABLE orders_new (id INT PRIMARY KEY)"},
-		{Timestamp: burst, BinlogFile: "binlog.000007", EndPos: 200,
-			Schema: "shop", Table: "orders", DDLType: event.DDLDropTable,
-			DDLQuery: "DROP TABLE orders"},
+		// id 2: burst, file 7, the highest position in that file.
 		{Timestamp: burst, BinlogFile: "binlog.000007", EndPos: 300,
 			Schema: "shop", Table: "orders_new", DDLType: event.DDLRenameTable,
 			DDLQuery: "RENAME TABLE orders_new TO orders"},
-		{Timestamp: burst, BinlogFile: "binlog.000007", EndPos: 400,
+		// id 3: burst, file 7, the lowest position.
+		{Timestamp: burst, BinlogFile: "binlog.000007", EndPos: 100,
+			Schema: "shop", Table: "orders_new", DDLType: event.DDLCreateTable,
+			DDLQuery: "CREATE TABLE orders_new (id INT PRIMARY KEY)"},
+		// id 4: burst, LATER file, LOW position: newer than every file-7 row.
+		{Timestamp: burst, BinlogFile: "binlog.000008", EndPos: 20,
 			Schema: "shop", Table: "orders", DDLType: event.DDLAlterTable,
 			DDLQuery: "ALTER TABLE orders ADD INDEX (note(32))"},
+		// id 5: burst, file 7, the middle position.
+		{Timestamp: burst, BinlogFile: "binlog.000007", EndPos: 200,
+			Schema: "shop", Table: "orders", DDLType: event.DDLDropTable,
+			DDLQuery: "DROP TABLE orders"},
+		// id 6: the same coordinate as id 4 (a second source's file 8):
+		// only the id tail separates the two.
+		{Timestamp: burst, BinlogFile: "binlog.000008", EndPos: 20,
+			Schema: "crm", Table: "leads", DDLType: event.DDLTruncateTable,
+			DDLQuery: "TRUNCATE TABLE leads"},
 	}
 	for _, ev := range seed {
 		if err := indexer.InsertSchemaChange(db, ev, nil); err != nil {
-			t.Fatalf("InsertSchemaChange pos %d: %v", ev.EndPos, err)
+			t.Fatalf("InsertSchemaChange %s@%d: %v", ev.BinlogFile, ev.EndPos, err)
 		}
 	}
 
@@ -108,35 +129,50 @@ func TestIntegrationSchemaChangesTool_sameSecondOrder(t *testing.T) {
 		},
 	}
 
-	wantAll := []int64{400, 300, 200, 100, 50}
+	// Burst first (detected_at DESC), file 8 before file 7 (binlog_file
+	// DESC), the file-8 duplicate pair by id DESC, file 7 by binlog_pos DESC,
+	// then the earlier second.
+	wantIDs := []int64{6, 4, 2, 5, 3, 1}
+	wantPos := []int64{20, 20, 300, 200, 100, 50}
 
-	// The filter variants steer the optimizer down different plans (index
-	// walk vs. filesort); the order must not depend on which one it picks.
+	// The filter variants steer the optimizer down different plans, and the
+	// order must not depend on which one it picks. On the unfixed query the
+	// unfiltered and schema-filtered shapes filesorted and came back oldest
+	// first; the since-filtered shape walked the detected_at index backward
+	// and was right by accident, so it is here to pin that plan too, not as
+	// a duplicate of the others.
 	variants := map[string]SchemaChangesArgs{
 		"unfiltered": {},
 		"schema":     {Schema: "shop"},
 		"since":      {Since: earlier.Format("2006-01-02 15:04:05")},
 	}
 	for name, args := range variants {
-		got := positions(callSchemaChanges(t, cfg, args))
-		if !equalInt64s(got, wantAll) {
-			t.Errorf("%s: newest-first by binlog coordinate broken: got positions %v, want %v", name, got, wantAll)
+		rows := callSchemaChanges(t, cfg, args)
+		want, wantP := wantIDs, wantPos
+		if name == "schema" {
+			// The crm row (id 6) is filtered out; the rest keep their order.
+			want, wantP = []int64{4, 2, 5, 3, 1}, []int64{20, 300, 200, 100, 50}
+		}
+		if got := ids(rows); !equalInt64s(got, want) {
+			t.Errorf("%s: newest-first by binlog coordinate broken: got ids %v, want %v", name, got, want)
+		}
+		if got := positions(rows); !equalInt64s(got, wantP) {
+			t.Errorf("%s: got positions %v, want %v", name, got, wantP)
 		}
 	}
 
-	// A limit that cuts inside the same-second group must keep the newest
-	// rows, and the same rows on a second call.
-	first := callSchemaChanges(t, cfg, SchemaChangesArgs{Limit: 2})
-	second := callSchemaChanges(t, cfg, SchemaChangesArgs{Limit: 2})
-	if got := positions(first); !equalInt64s(got, wantAll[:2]) {
-		t.Errorf("limit 2 must keep the two newest same-second rows: got positions %v, want %v", got, wantAll[:2])
+	// A limit of 1 cuts between the two duplicate-coordinate rows, where
+	// detected_at, binlog_file and binlog_pos all tie: only the id tail
+	// decides which one is kept, so this is the id DESC guard. The second
+	// call checks the cut is repeatable; it does not by itself prove a
+	// tiebreak (an arbitrary but stable plan would also repeat), the exact
+	// id assertion is what does.
+	first := callSchemaChanges(t, cfg, SchemaChangesArgs{Limit: 1})
+	second := callSchemaChanges(t, cfg, SchemaChangesArgs{Limit: 1})
+	if got := ids(first); !equalInt64s(got, wantIDs[:1]) {
+		t.Errorf("limit 1 must keep the higher id of the duplicate-coordinate pair: got ids %v, want %v", got, wantIDs[:1])
 	}
-	if !equalInt64s(positions(first), positions(second)) {
-		t.Errorf("limit 2 is not repeatable: first call %v, second call %v", positions(first), positions(second))
-	}
-	for i := range first {
-		if first[i].ID != second[i].ID {
-			t.Errorf("limit 2 returned different rows across calls at index %d: id %d vs %d", i, first[i].ID, second[i].ID)
-		}
+	if !equalInt64s(ids(first), ids(second)) {
+		t.Errorf("limit 1 is not repeatable: first call %v, second call %v", ids(first), ids(second))
 	}
 }
