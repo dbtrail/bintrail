@@ -594,12 +594,6 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		if err != nil {
 			return ErrorResult(err), nil, nil
 		}
-		// pk_min/pk_max: check the table's key shape and pick the cast BEFORE
-		// any fetch (#1440). A refusal here names the table's actual key.
-		if err := t.resolvePKRange(&opts); err != nil {
-			return ErrorResult(err), nil, nil
-		}
-
 		// Set after BuildQueryOptions rather than through it: the recover tool
 		// shares that builder and must NOT gain this filter (a digest names a
 		// statement shape, so a reversal scoped to one would undo executions
@@ -643,6 +637,13 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 			opts.DenyTables = denyTables
 			opts.RedactColumns = redactCols
 			opts.ProfileActive = true
+		}
+
+		// pk_min/pk_max: check the table's key shape and pick the cast BEFORE
+		// any fetch (#1440), and after the posture above so a denied table
+		// is refused without its key being described.
+		if err := t.resolvePKRange(&opts); err != nil {
+			return ErrorResult(err), nil, nil
 		}
 
 		format := args.Format
@@ -790,11 +791,6 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 		if err != nil {
 			return ErrorResult(err), nil, nil
 		}
-		// Same shape check as the query tool (#1440), before any fetch: a
-		// reversal over a lexicographic "range" would undo rows nobody named.
-		if err := t.resolvePKRange(&opts); err != nil {
-			return ErrorResult(err), nil, nil
-		}
 		// The surface's hard cap on the reversal window (console: same cap as
 		// the /api/recover endpoint). The truncation warning below fires when
 		// the capped limit is reached, so a clipped window is never silent.
@@ -819,6 +815,13 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 			opts.DenyTables = denyTables
 			opts.RedactColumns = redactCols
 			opts.ProfileActive = true
+		}
+
+		// Same shape check as the query tool (#1440), before any fetch and
+		// after the posture: a reversal over a lexicographic "range" would
+		// undo rows nobody named.
+		if err := t.resolvePKRange(&opts); err != nil {
+			return ErrorResult(err), nil, nil
 		}
 
 		// Schema resolver for PK-only WHERE clauses: preloaded by the surface
@@ -1439,22 +1442,29 @@ func buildPKRange(p FilterParams) (*query.PKRange, error) {
 
 // resolvePKRange completes a pk_min/pk_max request against the schema
 // snapshot: the table's key must be one integer column, and the cast both
-// engines compare through is chosen from its signedness. A preloaded resolver
-// (console bundles) is used as is; otherwise one is loaded for the call. No
-// snapshot means a refusal, not a guessed cast.
+// engines compare through is chosen from its signedness. It always loads the
+// LATEST snapshot, never the surface's preloaded Target.Resolver: the console
+// opens that one once per bundle and carries it across rebuilds, so on a
+// long-lived daemon it can be days old, and a table snapshotted since would
+// read "not found" while a BIGINT to BIGINT UNSIGNED change would pick the
+// signed cast (the same staleness the #957 note in internal/cli/query.go
+// refuses to trust). No snapshot means a refusal, not a guessed cast.
+//
+// Call it AFTER the surface's RBAC posture is on opts: a denied table is
+// refused without consulting the snapshot, so the refusal cannot describe
+// the key of a table the profile withholds.
 func (t *Target) resolvePKRange(opts *query.Options) error {
 	if opts.PKRange == nil {
 		return nil
 	}
-	resolver := t.Resolver
-	if !t.ResolverLoaded {
-		var err error
-		if resolver, err = metadata.NewResolver(t.DB, 0); err != nil {
-			return fmt.Errorf("pk_min/pk_max need the schema snapshot to check the primary key type: %w", err)
+	for _, dt := range opts.DenyTables {
+		if strings.EqualFold(dt.Schema, opts.Schema) && strings.EqualFold(dt.Table, opts.Table) {
+			return fmt.Errorf("pk_min/pk_max: the active profile does not allow reading %s.%s", opts.Schema, opts.Table)
 		}
 	}
-	if resolver == nil {
-		return errors.New("pk_min/pk_max need the schema snapshot to check the primary key type, and this server has none loaded")
+	resolver, err := metadata.NewResolver(t.DB, 0)
+	if err != nil {
+		return fmt.Errorf("pk_min/pk_max need the schema snapshot to check the primary key type: %w", err)
 	}
 	tm, err := resolver.Resolve(opts.Schema, opts.Table)
 	if err != nil {

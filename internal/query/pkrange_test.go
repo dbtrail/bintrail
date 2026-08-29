@@ -75,7 +75,7 @@ func TestPKRange_ResolveCast_shapeMatrix(t *testing.T) {
 		{"decimal", tableWith(pkCol("id", "decimal", "decimal(20,0)")), "1", "", 0, "this table's is (id decimal(20,0))"},
 		{"float", tableWith(pkCol("id", "float", "float")), "1", "", 0, "(id float)"},
 		{"binary", tableWith(pkCol("id", "binary", "binary(16)")), "1", "", 0, "(id binary(16))"},
-		{"pg snapshot (no data_type)", tableWith(pkCol("id", "", "")), "1", "", 0, "does not record the type of this table's key column (id)"},
+		{"pg snapshot (no data_type)", tableWith(pkCol("id", "", "")), "1", "", 0, "A PostgreSQL snapshot never records it, so there is nothing to re-run"},
 		{"pre-#212 snapshot (no column_type)", tableWith(pkCol("id", "bigint", "")), "1", "", 0, "does not record it for (id bigint)"},
 		{"tinyint signed", tableWith(pkCol("id", "tinyint", "tinyint(4)")), "-1", "5", PKCastSigned, ""},
 		{"smallint unsigned", tableWith(pkCol("id", "smallint", "smallint(5) unsigned")), "0", "5", PKCastUnsigned, ""},
@@ -204,13 +204,13 @@ func TestPKRange_Contains(t *testing.T) {
 
 // TestBuildQuery_pkRange pins the live-index predicate: the cast follows the
 // resolved signedness, the bounds are inlined as integer literals (no bind
-// args added), and the empty-key guard is present so a #318 drift row cannot
-// match a range that includes 0.
+// args added), and the round-trip guard is present so a drifted key MySQL's
+// CAST would coerce ('' to 0, '1|2' to 1) cannot match.
 func TestBuildQuery_pkRange(t *testing.T) {
 	q, args := buildQuery(Options{Schema: "s", Table: "t", Limit: 10,
 		PKRange: &PKRange{Cast: PKCastUnsigned, Min: bigStr(t, "10"), Max: bigStr(t, "18446744073709551610")}})
 	for _, want := range []string{
-		"pk_values <> ''",
+		"CAST(CAST(pk_values AS UNSIGNED) AS CHAR) = BINARY pk_values",
 		"CAST(pk_values AS UNSIGNED) >= 10",
 		"CAST(pk_values AS UNSIGNED) <= 18446744073709551610",
 	} {
@@ -227,6 +227,9 @@ func TestBuildQuery_pkRange(t *testing.T) {
 		PKRange: &PKRange{Cast: PKCastSigned, Min: big.NewInt(-5)}})
 	if !strings.Contains(q, "CAST(pk_values AS SIGNED) >= -5") {
 		t.Errorf("signed cast missing:\n%s", q)
+	}
+	if !strings.Contains(q, "CAST(CAST(pk_values AS SIGNED) AS CHAR) = BINARY pk_values") {
+		t.Errorf("round-trip guard must use the same cast as the range:\n%s", q)
 	}
 	if strings.Contains(q, "<=") {
 		t.Errorf("an open upper bound must emit no upper predicate:\n%s", q)

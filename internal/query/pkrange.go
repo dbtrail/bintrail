@@ -51,10 +51,17 @@ const (
 // since/until.
 //
 // Both engines exclude rows whose pk_values is not an integer of the chosen
-// width: MySQL through an explicit `pk_values <> ”` guard (CAST(” AS
-// UNSIGNED) is 0, which a range starting at 0 would otherwise match), DuckDB
-// through TRY_CAST (NULL compares false). On an integer-keyed table the only
-// such rows are the #318 drift rows with an empty key.
+// width. DuckDB does it through TRY_CAST (NULL compares false). MySQL's CAST
+// never fails, it coerces: '' and 'abc' become 0, '1|2' becomes 1, '12abc'
+// becomes 12, '-5' AS UNSIGNED wraps, an overlong digit run saturates. Such
+// keys exist in the retained window whenever the key drifted after capture
+// (composite to single column, VARCHAR to BIGINT, signed to unsigned) and in
+// the #318 drift rows with an empty key, so the live predicate adds a round
+// trip, CAST(CAST(pk_values AS T) AS CHAR) = BINARY pk_values, which admits only a
+// key the cast reproduces exactly. One asymmetry remains and is accepted: a
+// key spelled with leading zeros, a plus sign or spaces ('007', '+5', ' 12')
+// passes TRY_CAST and fails the round trip; no key formatted by
+// event.BuildPKValues is ever stored that way.
 type PKRange struct {
 	// Cast is the integer type both engines compare through. Set by
 	// ResolveCast from the resolved PK column; PKCastUnset is refused.
@@ -125,8 +132,9 @@ func (r *PKRange) ResolveCast(tm *metadata.TableMeta) error {
 	if dataType == "" {
 		// PostgreSQL snapshots never record data_type (the type lives in
 		// pg_type_oid, which the resolver does not load), and no MySQL
-		// snapshot omits it. Say which case this is not.
-		return fmt.Errorf("range filters need a single integer primary key; the schema snapshot does not record the type of this table's key column (%s), which a MySQL or MariaDB snapshot always does", col.Name)
+		// snapshot omits it. Name the case so nobody re-runs a snapshot
+		// that cannot help.
+		return fmt.Errorf("range filters need a single integer primary key; the schema snapshot does not record the type of this table's key column (%s). A PostgreSQL snapshot never records it, so there is nothing to re-run: primary key ranges are not available on a PostgreSQL-sourced index. A MySQL or MariaDB snapshot always records it", col.Name)
 	}
 	if !integerDataTypes[dataType] {
 		return fmt.Errorf("range filters need a single integer primary key; this table's is (%s %s)", col.Name, describeColumnType(col))
@@ -253,11 +261,12 @@ func (r *PKRange) Contains(pkValues string) bool {
 
 // mysqlPredicates renders the live-index WHERE fragments. The bounds are
 // inlined as integer literals rather than bound, for the same reason the
-// partition hint above inlines TO_SECONDS: the value is a validated digit run
-// (ParsePKBound), so inlining is safe, and the archive side has to inline
-// anyway (see DuckDBPredicates), so one rendering keeps the two predicates
-// comparable. MySQL types a literal above 2^63-1 as BIGINT UNSIGNED, so the
-// comparison against CAST(... AS UNSIGNED) stays exact.
+// partition hint in buildQuery inlines TO_SECONDS: the value is a validated
+// digit run (ParsePKBound), so inlining is safe, and one rendering on both
+// engines keeps the two predicates comparable in tests. (Binding would work
+// too: go-sql-driver accepts a uint64 with the high bit set.) MySQL types a
+// literal above 2^63-1 as BIGINT UNSIGNED, so the comparison against
+// CAST(... AS UNSIGNED) stays exact.
 func (r *PKRange) mysqlPredicates() []string {
 	var cast string
 	switch r.Cast {
@@ -273,11 +282,20 @@ func (r *PKRange) mysqlPredicates() []string {
 		slog.Error("query.buildQuery: primary key range reached the SQL builder with no resolved cast; emitting no-match clause")
 		return []string{"1=0"}
 	}
-	// CAST('' AS UNSIGNED) is 0 with a warning, so a #318 drift row (empty
-	// pk_values) would match any range that includes 0. Exclude it up front,
-	// which also keeps this side in step with DuckDB's TRY_CAST returning
-	// NULL for the same row.
-	preds := []string{"pk_values <> ''"}
+	// MySQL's CAST coerces instead of failing ('' and 'abc' are 0, '1|2' is
+	// 1, '12abc' is 12, '-5' AS UNSIGNED wraps to the top), so on its own it
+	// would admit drifted keys DuckDB's TRY_CAST excludes, and MergeResults
+	// keeps the live row. The round trip admits only a key the cast
+	// reproduces exactly, which is the same set TRY_CAST accepts for every
+	// key BuildPKValues can store (see the PKRange doc for the one accepted
+	// asymmetry). It subsumes the empty-key case: CAST('') is 0, and '0' is
+	// not ''. BINARY on the column: the CAST result carries the connection
+	// collation and pk_values its own (utf8mb4_general_ci vs
+	// utf8mb4_0900_ai_ci on a stock 8.0 index), which MySQL refuses to
+	// compare (Error 1267); BINARY makes it a byte comparison, the same
+	// device the AllowTables clause in buildQuery uses. Digits are the
+	// same bytes in every charset, so nothing is lost.
+	preds := []string{fmt.Sprintf("CAST(CAST(pk_values AS %s) AS CHAR) = BINARY pk_values", cast)}
 	if r.Min != nil {
 		preds = append(preds, fmt.Sprintf("CAST(pk_values AS %s) >= %s", cast, r.Min))
 	}
@@ -297,10 +315,13 @@ func (r *PKRange) mysqlPredicates() []string {
 // observed to apply the table filter before the cast, so a string key of
 // another table did not trip CAST in the test, but TRY_CAST removes the
 // dependence on that evaluation order. Bounds are
-// inlined because database/sql's default value converter, which the duckdb
-// driver relies on, refuses a uint64 with the high bit set as a bind value,
-// and an unsigned BIGINT key can sit exactly there; DuckDB types a literal
-// above 2^63-1 wide enough to compare exactly against UBIGINT.
+// inlined, not bound: a uint64 with the high bit set cannot travel as a
+// plain bind value (database/sql's default converter refuses it), and while
+// parquetquery.posArg shows the workaround (bind a *big.Int, which DuckDB
+// takes as HUGEINT), the value here is a validated digit run, and one
+// rendering on both engines keeps the two predicates comparable in tests.
+// DuckDB types a literal above 2^63-1 wide enough to compare exactly
+// against UBIGINT.
 func (r *PKRange) DuckDBPredicates() []string {
 	var typ string
 	switch r.Cast {

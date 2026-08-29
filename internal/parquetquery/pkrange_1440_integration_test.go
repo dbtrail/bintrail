@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -31,9 +32,15 @@ import (
 // (archive.ArchivePartition, the rotate writer) and both must equal an
 // oracle computed in Go by numeric comparison.
 
+// Besides the integer keys, each table carries DRIFTED keys: rows captured
+// before the key changed shape (composite "1|2", text "abc"/"12abc", an
+// overlong digit run, a negative under a now-unsigned column) and the empty
+// key of a #318 drift row. MySQL's CAST coerces every one of them to some
+// integer; the round-trip guard must exclude them exactly as TRY_CAST does,
+// or MergeResults keeps the live row and recover reverses it.
 var (
-	pkRangeSignedKeys   = []string{"-9223372036854775808", "-5", "9", "10", "100", "9223372036854775800", "9223372036854775807", ""}
-	pkRangeUnsignedKeys = []string{"9", "10", "100", "18446744073709551610", "18446744073709551615", ""}
+	pkRangeSignedKeys   = []string{"-9223372036854775808", "-5", "9", "10", "100", "9223372036854775800", "9223372036854775807", "", "abc", "1|2", "12abc", "99999999999999999999"}
+	pkRangeUnsignedKeys = []string{"9", "10", "100", "18446744073709551610", "18446744073709551615", "", "-5", "abc", "1|2"}
 	// A string-keyed row of another table in the SAME hour file. Neither
 	// engine may trip on it. Note what this row does and does not prove: a
 	// TRY_CAST -> CAST mutation is killed by the EMPTY drift key of the
@@ -130,15 +137,26 @@ func resolvedRange(t *testing.T, db *sql.DB, dbName, table, lo, hi string) *quer
 	return r
 }
 
-// numericOracle is the independent expectation: the seeded keys that fall in
-// [lo, hi] by big-integer comparison. The empty key is never in.
-func numericOracle(keys []string, lo, hi string) []string {
+// numericOracle is the independent expectation: the seeded keys that parse
+// as an integer of the cast's width (strconv, not the product's code) and
+// fall in [lo, hi] by big-integer comparison. Drifted keys never parse.
+func numericOracle(keys []string, cast query.PKCast, lo, hi string) []string {
 	var out []string
 	for _, k := range keys {
-		if k == "" {
-			continue
+		v := new(big.Int)
+		if cast == query.PKCastUnsigned {
+			u, err := strconv.ParseUint(k, 10, 64)
+			if err != nil {
+				continue
+			}
+			v.SetUint64(u)
+		} else {
+			i, err := strconv.ParseInt(k, 10, 64)
+			if err != nil {
+				continue
+			}
+			v.SetInt64(i)
 		}
-		v, _ := new(big.Int).SetString(k, 10)
 		if lo != "" {
 			l, _ := new(big.Int).SetString(lo, 10)
 			if v.Cmp(l) < 0 {
@@ -199,9 +217,16 @@ func TestIntegrationPKRange_liveAndArchiveAgree(t *testing.T) {
 		{"t_unsigned", pkRangeUnsignedKeys, "9223372036854775808", "", query.PKCastUnsigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "18446744073709551610", "18446744073709551615", query.PKCastUnsigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "18446744073709551615", "18446744073709551615", query.PKCastUnsigned},
-		// A range that includes 0: the empty drift key must not leak in as 0.
+		// Ranges that include the values MySQL's CAST coerces drifted keys
+		// to: 0 ('', 'abc'), 1 ('1|2'), 12 ('12abc'), the saturated top
+		// ('99999999999999999999' AS SIGNED) and the wrapped top ('-5' AS
+		// UNSIGNED). None may leak in.
 		{"t_signed", pkRangeSignedKeys, "0", "0", query.PKCastSigned},
+		{"t_signed", pkRangeSignedKeys, "0", "12", query.PKCastSigned},
+		{"t_signed", pkRangeSignedKeys, "9223372036854775807", "9223372036854775807", query.PKCastSigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "0", "9", query.PKCastUnsigned},
+		{"t_unsigned", pkRangeUnsignedKeys, "1", "9", query.PKCastUnsigned},
+		{"t_unsigned", pkRangeUnsignedKeys, "18446744073709551611", "18446744073709551615", query.PKCastUnsigned},
 	}
 	for _, tc := range cases {
 		name := fmt.Sprintf("%s[%s,%s]", tc.table, tc.lo, tc.hi)
@@ -222,7 +247,7 @@ func TestIntegrationPKRange_liveAndArchiveAgree(t *testing.T) {
 			}
 			// slices.Equal, not a joined string: Join([""]) == Join(nil),
 			// which would let a leaked empty drift key pass as no row.
-			want := numericOracle(tc.keys, tc.lo, tc.hi)
+			want := numericOracle(tc.keys, tc.cast, tc.lo, tc.hi)
 			if len(want) == 0 && (tc.lo != "0" || tc.hi != "0") {
 				t.Fatalf("oracle is empty for %s; the case proves nothing", name)
 			}

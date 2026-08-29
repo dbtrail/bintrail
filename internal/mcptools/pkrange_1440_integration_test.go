@@ -12,6 +12,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/metadata"
+	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -111,6 +112,32 @@ func TestQueryAndRecoverTools_pkRange(t *testing.T) {
 	res, _, _ = MakeQueryTool(cfg)(ctx, &mcp.CallToolRequest{}, QueryArgs{Schema: dbName, Table: "orders", PKMax: "-1"})
 	if !res.IsError || !strings.Contains(resultText(res), "is negative, but the primary key column is unsigned (id bigint unsigned)") {
 		t.Errorf("negative bound on an unsigned key must refuse: %s", resultText(res))
+	}
+
+	// A surface with a preloaded, STALE resolver (the console's bundle
+	// resolver, opened before this table was snapshotted) must still
+	// resolve: the range always reads the latest snapshot.
+	stale := Config{
+		Resolve: func(context.Context, string) (*Target, error) {
+			return &Target{DB: db, NoArchive: true,
+				Resolver: metadata.NewResolverFromTables(1, map[string]*metadata.TableMeta{}), ResolverLoaded: true}, nil
+		},
+	}
+	res, _, _ = MakeQueryTool(stale)(ctx, &mcp.CallToolRequest{}, QueryArgs{Schema: dbName, Table: "orders", PKMin: "100"})
+	if res.IsError || !strings.Contains(resultText(res), `"100"`) {
+		t.Errorf("a stale preloaded resolver must not decide the range: %s", resultText(res))
+	}
+
+	// A denied table is refused without its key shape being described.
+	denied := Config{
+		Resolve: func(context.Context, string) (*Target, error) {
+			return &Target{DB: db, NoArchive: true,
+				DenyTables: []query.SchemaTable{{Schema: dbName, Table: "order_lines"}}, ProfileActive: true}, nil
+		},
+	}
+	res, _, _ = MakeQueryTool(denied)(ctx, &mcp.CallToolRequest{}, QueryArgs{Schema: dbName, Table: "order_lines", PKMin: "1"})
+	if !res.IsError || !strings.Contains(resultText(res), "does not allow reading") || strings.Contains(resultText(res), "(a, b)") {
+		t.Errorf("denied table must refuse without describing its key: %s", resultText(res))
 	}
 
 	// recover: the range scopes the reversal; keys outside it are untouched.
