@@ -99,7 +99,7 @@ func TestRunQuery_pkRangeEndToEnd(t *testing.T) {
 		t.Errorf("composite key: %v", err)
 	}
 	qTable = "missing"
-	if _, err := run("1", ""); err == nil || !strings.Contains(err.Error(), "--pk-min/--pk-max:") {
+	if _, err := run("1", ""); err == nil || !strings.Contains(err.Error(), "--pk-min/--pk-max: table "+dbName+".missing not found in snapshot") {
 		t.Errorf("table absent from the snapshot: %v", err)
 	}
 }

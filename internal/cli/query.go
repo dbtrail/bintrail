@@ -284,19 +284,6 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		return indexer.WrapSchemaMigrationErr(err)
 	}
 
-	// ── Resolve --pk-min/--pk-max against the table's key shape ─────────────
-	// (#1440) The cast both engines compare through is chosen from the PK
-	// column's declared signedness, and a composite or non-integer key is
-	// refused here, BEFORE any query runs. Only loaded when a range was
-	// asked for: an exact --pk lookup never consults the snapshot (see the
-	// staleness note below).
-	if pkRange != nil {
-		resolver, resolverErr := metadata.NewResolver(db, 0)
-		if err := resolvePKRange(resolver, resolverErr, qSchema, qTable, pkRange); err != nil {
-			return err
-		}
-	}
-
 	// ── Re-encode --pk/--pks against the at-rest pk_values form ────────────────
 	// (#957) binlog_events.pk_values is stored PIPE/BACKSLASH-ESCAPED
 	// (event.BuildPKValues escapes each PK component before joining with "|"),
@@ -344,6 +331,19 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		opts.DenyTables = denyTables
 		opts.RedactColumns = redactCols
 		opts.ProfileActive = true
+	}
+
+	// ── Resolve --pk-min/--pk-max against the table's key shape ─────────────
+	// (#1440) The cast both engines compare through is chosen from the PK
+	// column's declared signedness, and a composite or non-integer key is
+	// refused here, BEFORE any query runs. Only loaded when a range was
+	// asked for: an exact --pk lookup never consults the snapshot (see the
+	// staleness note above). After the profile rules, as the MCP tools do.
+	if pkRange != nil {
+		resolver, resolverErr := metadata.NewResolver(db, 0)
+		if err := resolvePKRange(resolver, resolverErr, qSchema, qTable, pkRange); err != nil {
+			return err
+		}
 	}
 
 	engine := query.New(db)

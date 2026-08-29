@@ -57,11 +57,15 @@ const (
 // saturates. Such keys exist in the retained window whenever the key drifted
 // after capture (composite to single column, VARCHAR to BIGINT, signed to
 // unsigned) and in the #318 drift rows with an empty key, so the live
-// predicate adds a round trip, CAST(CAST(pk_values AS T) AS CHAR) = BINARY
-// pk_values, which admits only a key the cast reproduces exactly. One
-// asymmetry remains and is accepted: a key spelled with leading zeros, a plus
-// sign or spaces ('007', '+5', ' 12') passes TRY_CAST and fails the round
-// trip; no key formatted by event.BuildPKValues is ever stored that way.
+// predicate adds a round trip, CAST(CAST(pk_values AS T) AS CHAR) =
+// CAST(pk_values AS BINARY), which admits only a key the cast reproduces exactly. DuckDB's
+// TRY_CAST has its own coercions (it rounds '2.00' and '1.50' to 2, reads
+// '1e1' as 10, accepts '007' and '+5'), and go-mysql stores a DECIMAL or
+// FLOAT key exactly as '2.00' / '1.5', so the archive predicate round-trips
+// the same way: CAST(TRY_CAST(pk_values AS T) AS VARCHAR) = pk_values. Both
+// engines and the in-memory buffer therefore accept one set of spellings,
+// the canonical decimal rendering of a 64-bit integer, which is the only
+// form event.BuildPKValues stores for an integer key.
 type PKRange struct {
 	// Cast is the integer type both engines compare through. Set by
 	// ResolveCast from the resolved PK column; PKCastUnset is refused.
@@ -225,25 +229,27 @@ func (r *PKRange) Validate() error {
 }
 
 // Contains reports whether a stored pk_values string falls inside the range,
-// with the same semantics as the SQL predicates: the text is parsed as an
-// integer of the cast's width and anything that does not parse is out
-// (DuckDB's TRY_CAST returns NULL there). An unresolved cast matches nothing.
+// with the same semantics as the two SQL predicates: the text must be the
+// canonical decimal rendering of an integer of the cast's width, and
+// anything else is out. An unresolved cast matches nothing.
 // Used by the in-memory buffer, which has no SQL engine to cast for it.
 func (r *PKRange) Contains(pkValues string) bool {
 	if r == nil {
 		return true
 	}
+	// The render-back is the buffer's round trip: strconv accepts '+5' and
+	// '007', which neither SQL predicate admits.
 	var v *big.Int
 	switch r.Cast {
 	case PKCastUnsigned:
 		u, err := strconv.ParseUint(pkValues, 10, 64)
-		if err != nil {
+		if err != nil || strconv.FormatUint(u, 10) != pkValues {
 			return false
 		}
 		v = new(big.Int).SetUint64(u)
 	case PKCastSigned:
 		i, err := strconv.ParseInt(pkValues, 10, 64)
-		if err != nil {
+		if err != nil || strconv.FormatInt(i, 10) != pkValues {
 			return false
 		}
 		v = big.NewInt(i)
@@ -287,15 +293,18 @@ func (r *PKRange) mysqlPredicates() []string {
 	// would admit drifted keys DuckDB's TRY_CAST excludes, and MergeResults
 	// keeps the live row. The round trip admits only a key the cast
 	// reproduces exactly, which is the same set TRY_CAST accepts for every
-	// key BuildPKValues can store (see the PKRange doc for the one accepted
-	// asymmetry). It subsumes the empty-key case: CAST('') is 0, and '0' is
-	// not ''. BINARY on the column: the CAST result carries the connection
-	// collation and pk_values its own (utf8mb4_general_ci vs
-	// utf8mb4_0900_ai_ci on a stock 8.0 index), which MySQL refuses to
-	// compare (Error 1267); BINARY makes it a byte comparison, the same
-	// device the AllowTables clause in buildQuery uses. Digits are the
-	// same bytes in every charset, so nothing is lost.
-	preds := []string{fmt.Sprintf("CAST(CAST(pk_values AS %s) AS CHAR) = BINARY pk_values", cast)}
+	// key BuildPKValues can store (see the PKRange doc: the archive
+	// side round-trips the same way). It subsumes the
+	// empty-key case: CAST('') is 0, and '0' is not ''. The column is cast
+	// to BINARY: the CAST AS CHAR result carries the connection collation
+	// and pk_values its own (utf8mb4_general_ci vs utf8mb4_0900_ai_ci on a
+	// stock 8.0 index), which MySQL refuses to compare (Error 1267); a
+	// binary comparison is byte-wise, and digits are the same bytes in every
+	// charset. CAST(... AS BINARY) rather than the BINARY operator, which
+	// 8.0.46 reports as deprecated (warning 1287) on every query; the index
+	// argument that keeps the operator in buildQuery's AllowTables clause
+	// does not apply to a cast expression.
+	preds := []string{fmt.Sprintf("CAST(CAST(pk_values AS %s) AS CHAR) = CAST(pk_values AS BINARY)", cast)}
 	if r.Min != nil {
 		preds = append(preds, fmt.Sprintf("CAST(pk_values AS %s) >= %s", cast, r.Min))
 	}
@@ -314,13 +323,23 @@ func (r *PKRange) mysqlPredicates() []string {
 // hour's archive file also holds every other table's keys; DuckDB was
 // observed to apply the table filter before the cast, so a string key of
 // another table did not trip CAST in the test, but TRY_CAST removes the
-// dependence on that evaluation order. Bounds are
-// inlined, not bound: a uint64 with the high bit set cannot travel as a
-// plain bind value (database/sql's default converter refuses it), and while
-// parquetquery.posArg shows the workaround (bind a *big.Int, which DuckDB
-// takes as HUGEINT), the value here is a validated digit run, and one
-// rendering on both engines keeps the two predicates comparable in tests.
-// DuckDB types a literal above 2^63-1 wide enough to compare exactly
+// dependence on that evaluation order.
+//
+// TRY_CAST coerces too: '2.00' and '1.50' round to 2, '1e1' reads as 10,
+// '007' and '+5' are accepted. A DECIMAL or FLOAT key is stored exactly that
+// way by go-mysql, so a key altered to an integer type inside the retention
+// window leaves such rows in archived hours, where MergeResults keeps an
+// archive-only row. The round trip, CAST(TRY_CAST(pk_values AS T) AS
+// VARCHAR) = pk_values, admits only a key DuckDB renders back identically,
+// which is the same set the MySQL round trip admits (DuckDB renders integers
+// canonically), and NULL for an uncastable key compares false.
+//
+// Bounds are inlined, not bound: a uint64 with the high bit set cannot
+// travel as a plain bind value (database/sql's default converter refuses
+// it), and while parquetquery.posArg shows the workaround (bind a *big.Int,
+// which DuckDB takes as HUGEINT), the value here is a validated digit run,
+// and one rendering on both engines keeps the two predicates comparable in
+// tests. DuckDB types a literal above 2^63-1 wide enough to compare exactly
 // against UBIGINT.
 func (r *PKRange) DuckDBPredicates() []string {
 	var typ string
@@ -335,7 +354,7 @@ func (r *PKRange) DuckDBPredicates() []string {
 		slog.Error("parquetquery: primary key range reached the SQL builder with no resolved cast; emitting no-match clause")
 		return []string{"FALSE"}
 	}
-	var preds []string
+	preds := []string{fmt.Sprintf("CAST(TRY_CAST(pk_values AS %s) AS VARCHAR) = pk_values", typ)}
 	if r.Min != nil {
 		preds = append(preds, fmt.Sprintf("TRY_CAST(pk_values AS %s) >= %s", typ, r.Min))
 	}

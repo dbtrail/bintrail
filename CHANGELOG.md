@@ -46,14 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The stored key is text, so both engines cast it to a 64-bit integer whose
   signedness matches the column (SIGNED/UNSIGNED on the live index, BIGINT/
   UBIGINT over the Parquet archives), and a bound the column cannot hold is
-  refused up front. The live and archived result sets are pinned equal for
-  keys that expose string order (9, 10, 100), negatives, 64-bit width and
-  keys left behind by an earlier key shape (`1|2`, `abc`, an empty key),
-  which both engines exclude: a round trip through the cast on the live
-  index, `TRY_CAST` on the archives. The
-  range cannot use the key index, so it scans the partitions the time filters
-  keep: the help text says so and points at `--since`/`--until`. See
-  docs/query-and-recovery.md.
+  refused up front. Both engines accept the same spellings, the canonical
+  decimal rendering of an integer, through a round trip of the cast (a
+  `DECIMAL` key stored as `2.00`, a composite `1|2`, `abc`, `007`, `+5` or
+  an empty key is out on both sides), and the live and archived result sets
+  are pinned equal for keys that expose string order (9, 10, 100), negatives,
+  64-bit width and those left-behind spellings. The range cannot use the key
+  index, so it scans the partitions the time filters keep: the help text says
+  so and points at `--since`/`--until`. See docs/query-and-recovery.md.
 - **The Connect page shows the time-travel SQL port** (#1446). Settings →
   Connect AI gains a "Connect a SQL client" panel for the embedded
   MySQL-protocol port (`bintrail-console watch --flashback-listen`). With the

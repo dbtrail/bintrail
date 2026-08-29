@@ -34,13 +34,16 @@ import (
 
 // Besides the integer keys, each table carries DRIFTED keys: rows captured
 // before the key changed shape (composite "1|2", text "abc"/"12abc", an
-// overlong digit run, a negative under a now-unsigned column) and the empty
-// key of a #318 drift row. MySQL's CAST coerces every one of them to some
-// integer; the round-trip guard must exclude them exactly as TRY_CAST does,
-// or MergeResults keeps the live row and recover reverses it.
+// overlong digit run, a negative under a now-unsigned column, and the
+// spellings go-mysql stores for a DECIMAL or FLOAT key, "2.00"/"1.50", plus
+// "1e1", "007", "+5") and the empty key of a #318 drift row. MySQL's CAST
+// coerces every one of them to some integer and DuckDB's TRY_CAST rounds
+// "2.00" to 2 and accepts "007"/"+5"; both engines must exclude them, or
+// MergeResults keeps whichever side admitted the row and recover reverses
+// a row nobody named.
 var (
-	pkRangeSignedKeys   = []string{"-9223372036854775808", "-5", "9", "10", "100", "9223372036854775800", "9223372036854775807", "", "abc", "1|2", "12abc", "99999999999999999999"}
-	pkRangeUnsignedKeys = []string{"9", "10", "100", "18446744073709551610", "18446744073709551615", "", "-5", "abc", "1|2"}
+	pkRangeSignedKeys   = []string{"-9223372036854775808", "-5", "9", "10", "100", "9223372036854775800", "9223372036854775807", "", "abc", "1|2", "12abc", "99999999999999999999", "2.00", "1.50", "1e1", "007", "+5"}
+	pkRangeUnsignedKeys = []string{"9", "10", "100", "18446744073709551610", "18446744073709551615", "", "-5", "abc", "1|2", "2.00", "1e1", "007", "+5"}
 	// A string-keyed row of another table in the SAME hour file. Neither
 	// engine may trip on it. Note what this row does and does not prove: a
 	// TRY_CAST -> CAST mutation is killed by the EMPTY drift key of the
@@ -138,21 +141,23 @@ func resolvedRange(t *testing.T, db *sql.DB, dbName, table, lo, hi string) *quer
 }
 
 // numericOracle is the independent expectation: the seeded keys that parse
-// as an integer of the cast's width (strconv, not the product's code) and
-// fall in [lo, hi] by big-integer comparison. Drifted keys never parse.
+// as an integer of the cast's width AND render back to the same text
+// (strconv, not the product's code), then fall in [lo, hi] by big-integer
+// comparison. The render-back is what keeps "+5" and "007" out: strconv
+// accepts them, no engine may.
 func numericOracle(keys []string, cast query.PKCast, lo, hi string) []string {
 	var out []string
 	for _, k := range keys {
 		v := new(big.Int)
 		if cast == query.PKCastUnsigned {
 			u, err := strconv.ParseUint(k, 10, 64)
-			if err != nil {
+			if err != nil || strconv.FormatUint(u, 10) != k {
 				continue
 			}
 			v.SetUint64(u)
 		} else {
 			i, err := strconv.ParseInt(k, 10, 64)
-			if err != nil {
+			if err != nil || strconv.FormatInt(i, 10) != k {
 				continue
 			}
 			v.SetInt64(i)
@@ -217,15 +222,18 @@ func TestIntegrationPKRange_liveAndArchiveAgree(t *testing.T) {
 		{"t_unsigned", pkRangeUnsignedKeys, "9223372036854775808", "", query.PKCastUnsigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "18446744073709551610", "18446744073709551615", query.PKCastUnsigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "18446744073709551615", "18446744073709551615", query.PKCastUnsigned},
-		// Ranges that include the values MySQL's CAST coerces drifted keys
-		// to: 0 ('', 'abc'), 1 ('1|2'), 12 ('12abc'), the saturated top
-		// ('99999999999999999999' AS SIGNED) and the wrapped top ('-5' AS
-		// UNSIGNED). None may leak in.
+		// Ranges that include the values the casts turn drifted keys into:
+		// 0 ('', 'abc'), 1 ('1|2'), 2 ('2.00', '1.50' rounded by DuckDB), 5
+		// ('+5'), 7 ('007'), 10 ('1e1' in DuckDB), 12 ('12abc'), -1 (MySQL's
+		// CAST AS SIGNED of '99999999999999999999') and the wrapped top ('-5'
+		// AS UNSIGNED). None may leak in.
 		{"t_signed", pkRangeSignedKeys, "0", "0", query.PKCastSigned},
 		{"t_signed", pkRangeSignedKeys, "0", "12", query.PKCastSigned},
-		{"t_signed", pkRangeSignedKeys, "9223372036854775807", "9223372036854775807", query.PKCastSigned},
+		{"t_signed", pkRangeSignedKeys, "2", "2", query.PKCastSigned},
+		{"t_signed", pkRangeSignedKeys, "-1", "-1", query.PKCastSigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "0", "9", query.PKCastUnsigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "1", "9", query.PKCastUnsigned},
+		{"t_unsigned", pkRangeUnsignedKeys, "2", "9", query.PKCastUnsigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "18446744073709551611", "18446744073709551615", query.PKCastUnsigned},
 	}
 	for _, tc := range cases {
@@ -248,7 +256,9 @@ func TestIntegrationPKRange_liveAndArchiveAgree(t *testing.T) {
 			// slices.Equal, not a joined string: Join([""]) == Join(nil),
 			// which would let a leaked empty drift key pass as no row.
 			want := numericOracle(tc.keys, tc.cast, tc.lo, tc.hi)
-			if len(want) == 0 && (tc.lo != "0" || tc.hi != "0") {
+			// Only a point range may have an empty oracle (those exist to
+			// catch a leaked drift key); every other case must expect rows.
+			if len(want) == 0 && tc.lo != tc.hi {
 				t.Fatalf("oracle is empty for %s; the case proves nothing", name)
 			}
 			if got := keysOf(live); !slices.Equal(got, want) {

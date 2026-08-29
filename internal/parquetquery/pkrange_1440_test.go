@@ -32,6 +32,7 @@ func TestBuildFilters_pkRange(t *testing.T) {
 	for name, build := range builders {
 		q, args := build()
 		for _, want := range []string{
+			"CAST(TRY_CAST(pk_values AS UBIGINT) AS VARCHAR) = pk_values",
 			"TRY_CAST(pk_values AS UBIGINT) >= 10",
 			"TRY_CAST(pk_values AS UBIGINT) <= 18446744073709551610",
 		} {

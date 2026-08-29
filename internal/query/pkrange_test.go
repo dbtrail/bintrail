@@ -179,6 +179,8 @@ func TestPKRange_Contains(t *testing.T) {
 		"-5": true, "-6": false, "0": true, "9": true, "10": true, "11": false,
 		"100": false, // lexicographically "100" < "9"; numerically it is out
 		"":    false, "abc": false, "1|2": false, "9223372036854775808": false,
+		// strconv accepts these; the SQL predicates do not, so neither may this.
+		"+5": false, "007": false, " 9": false, "2.00": false, "1e1": false,
 	} {
 		if got := signed.Contains(pk); got != want {
 			t.Errorf("signed[-5,10].Contains(%q) = %v, want %v", pk, got, want)
@@ -187,7 +189,7 @@ func TestPKRange_Contains(t *testing.T) {
 	unsigned := &PKRange{Cast: PKCastUnsigned, Min: big.NewInt(10)}
 	for pk, want := range map[string]bool{
 		"9": false, "10": true, "100": true, "18446744073709551615": true,
-		"-5": false, "": false, "18446744073709551616": false,
+		"-5": false, "": false, "18446744073709551616": false, "+10": false, "010": false,
 	} {
 		if got := unsigned.Contains(pk); got != want {
 			t.Errorf("unsigned[10,).Contains(%q) = %v, want %v", pk, got, want)
@@ -210,7 +212,7 @@ func TestBuildQuery_pkRange(t *testing.T) {
 	q, args := buildQuery(Options{Schema: "s", Table: "t", Limit: 10,
 		PKRange: &PKRange{Cast: PKCastUnsigned, Min: bigStr(t, "10"), Max: bigStr(t, "18446744073709551610")}})
 	for _, want := range []string{
-		"CAST(CAST(pk_values AS UNSIGNED) AS CHAR) = BINARY pk_values",
+		"CAST(CAST(pk_values AS UNSIGNED) AS CHAR) = CAST(pk_values AS BINARY)",
 		"CAST(pk_values AS UNSIGNED) >= 10",
 		"CAST(pk_values AS UNSIGNED) <= 18446744073709551610",
 	} {
@@ -228,7 +230,7 @@ func TestBuildQuery_pkRange(t *testing.T) {
 	if !strings.Contains(q, "CAST(pk_values AS SIGNED) >= -5") {
 		t.Errorf("signed cast missing:\n%s", q)
 	}
-	if !strings.Contains(q, "CAST(CAST(pk_values AS SIGNED) AS CHAR) = BINARY pk_values") {
+	if !strings.Contains(q, "CAST(CAST(pk_values AS SIGNED) AS CHAR) = CAST(pk_values AS BINARY)") {
 		t.Errorf("round-trip guard must use the same cast as the range:\n%s", q)
 	}
 	if strings.Contains(q, "<=") {
@@ -286,12 +288,12 @@ func TestSnapshotFilters_refusesPKRange(t *testing.T) {
 
 func TestDuckDBPredicates_pkRange(t *testing.T) {
 	got := (&PKRange{Cast: PKCastSigned, Min: big.NewInt(-5), Max: big.NewInt(9)}).DuckDBPredicates()
-	want := []string{"TRY_CAST(pk_values AS BIGINT) >= -5", "TRY_CAST(pk_values AS BIGINT) <= 9"}
+	want := []string{"CAST(TRY_CAST(pk_values AS BIGINT) AS VARCHAR) = pk_values", "TRY_CAST(pk_values AS BIGINT) >= -5", "TRY_CAST(pk_values AS BIGINT) <= 9"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("signed predicates = %v, want %v", got, want)
 	}
 	got = (&PKRange{Cast: PKCastUnsigned, Max: bigStr(t, "18446744073709551615")}).DuckDBPredicates()
-	want = []string{"TRY_CAST(pk_values AS UBIGINT) <= 18446744073709551615"}
+	want = []string{"CAST(TRY_CAST(pk_values AS UBIGINT) AS VARCHAR) = pk_values", "TRY_CAST(pk_values AS UBIGINT) <= 18446744073709551615"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("unsigned predicates = %v, want %v", got, want)
 	}
