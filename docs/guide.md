@@ -540,7 +540,8 @@ appending only what changed since its last run, under a local warehouse:
 bintrail export iceberg --index-dsn "$IDX" --baseline-dir /data/baselines --warehouse /data/iceberg
 ```
 
-Run it from cron; every run is one Iceberg snapshot per table, and any
+Run it from cron; every run that found changes is one Iceberg snapshot per
+table, and any
 Iceberg reader (`iceberg_scan('/data/iceberg/shop/orders')` in DuckDB) sees the
 table as of the last run. It refuses a table rather than publishing a wrong one
 (a capture gap, a TRUNCATE, a changed shape), with the same vocabulary as
