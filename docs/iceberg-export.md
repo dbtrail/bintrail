@@ -196,6 +196,12 @@ Two things to know:
 - Memory: a run holds one entry per primary key touched in its window, like
   `baseline refresh`. Run it often enough that a window stays a fraction of the
   table.
+- A TEXT column that holds a JSON document is rendered two ways. The index
+  cannot tell a document in a TEXT column from a JSON column (MariaDB declares
+  JSON as LONGTEXT), so a document arriving through a delta is re-encoded
+  (keys sorted, no spaces) while the first load copies the dump's text as it
+  is. Compare such a column as JSON, not as text. A MySQL `JSON` column reads
+  one way on both paths.
 
 ## Where it runs
 

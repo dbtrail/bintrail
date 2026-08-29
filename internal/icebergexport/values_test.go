@@ -102,7 +102,9 @@ func TestAppendValue_bothSourcesAgree(t *testing.T) {
 		// re-encoded text both leave as the one canonical rendering; keys
 		// sorted, no spaces, `<` as is, numbers as written, scalars quoted.
 		{"json nested from image", baseline.Column{Name: "c", MySQLType: "json"}, map[string]any{"b": json.Number("1.50"), "a": []any{json.Number("1"), "<x>&y"}}, `{"a":[1,"<x>&y"],"b":1.50}`},
-		{"json string scalar from image is quoted", baseline.Column{Name: "c", MySQLType: "json"}, "abc", `"abc"`},
+		{"json scalar text from image (base64-stored, decoded to text) is re-emitted", baseline.Column{Name: "c", MySQLType: "json"}, `"abc"`, `"abc"`},
+		{"json bare legacy string from image (pre-#736) is quoted", baseline.Column{Name: "c", MySQLType: "json"}, "abc", `"abc"`},
+		{"json null text from image", baseline.Column{Name: "c", MySQLType: "json"}, "null", `null`},
 		{"json number scalar from image", baseline.Column{Name: "c", MySQLType: "json"}, json.Number("42"), `42`},
 		{"json bool scalar from image", baseline.Column{Name: "c", MySQLType: "json"}, true, `true`},
 		{"json canonical text from the baseline passes through", baseline.Column{Name: "c", MySQLType: "json"}, json.RawMessage(`{"a":1}`), `{"a":1}`},
@@ -147,7 +149,9 @@ func TestJSON_bothPathsAgreeByteForByte(t *testing.T) {
 		{"number scalar keeps its text", `1.50`, `1.50`, `1.50`},
 		{"big integer is not rounded", `12345678901234567890`, `12345678901234567890`, `12345678901234567890`},
 		{"bool scalar", `true`, `true`, `true`},
+		{"null scalar is a value on both sides", `null`, `null`, `null`},
 		{"empty object", `{}`, `{}`, `{}`},
+		{"array with a scalar under html escaping", `[1, "<a>"]`, `[1,"<a>"]`, `[1,"<a>"]`},
 		{"unicode as written", `{"k": "é"}`, `{"k":"é"}`, `{"k":"é"}`},
 	}
 	for _, tc := range cases {
@@ -160,8 +164,14 @@ func TestJSON_bothPathsAgreeByteForByte(t *testing.T) {
 			if err != nil {
 				t.Fatalf("baseline path: %v", err)
 			}
-			img := query.UnmarshalRowImage([]byte(`{"c":` + tc.image + `}`))
-			fromDelta, err := buildOne(t, col, img["c"])
+			// What the delta path hands appendValue: the indexer embeds a
+			// container (#736), so it arrives decoded; a top-level scalar is
+			// stored base64 and the epoch decoder returns its text.
+			var fromImage any = tc.image
+			if s := strings.TrimSpace(tc.image); strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[") {
+				fromImage = query.UnmarshalRowImage([]byte(`{"c":` + tc.image + `}`))["c"]
+			}
+			fromDelta, err := buildOne(t, col, fromImage)
 			if err != nil {
 				t.Fatalf("delta path: %v", err)
 			}
@@ -182,6 +192,12 @@ func TestCanonicalJSONText_refusesNonJSON(t *testing.T) {
 	raw, err := canonicalJSONText(`null`)
 	if err != nil || string(raw) != "null" {
 		t.Fatalf("null = %q, %v", raw, err)
+	}
+	// A shape neither source produces is an error, never base64 or an object.
+	for _, v := range []any{[]byte("x"), time.Now(), struct{ A int }{1}} {
+		if _, err := jsonText(v); err == nil {
+			t.Errorf("jsonText(%T): want an error", v)
+		}
 	}
 }
 

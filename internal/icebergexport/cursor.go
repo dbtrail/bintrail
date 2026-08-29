@@ -20,6 +20,10 @@ const (
 	propAt       = "bintrail.export.at"
 	propOrigin   = "bintrail.export.cursor_origin" // "baseline" after a load, "cut" after a delta
 	propBaseline = "bintrail.export.source_baseline"
+	// propJSONColumns lists the MySQL JSON columns the first load rendered
+	// (lower-case names, comma-separated, "" for none), so every later run
+	// renders the same ones whatever the schema snapshot says (#1508).
+	propJSONColumns = "bintrail.export.json_columns"
 
 	// exportVersion is the newest table layout this build writes and reads.
 	// A table stamped with a higher one was written by a newer bintrail, and

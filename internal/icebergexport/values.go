@@ -388,20 +388,45 @@ func toString(v any) (string, error) {
 
 // jsonText renders one JSON column value as the export's canonical text.
 //
-// The two sources hand a JSON column over in different shapes: the baseline
-// holds MySQL's own rendering of the document (keys in MySQL's order, a
-// space after every comma and colon), which writeBaselineRows has already
-// parsed and re-encoded into a json.RawMessage; the row image decodes the
-// document into Go values (maps, slices, json.Number, string, bool). Both
-// end here, and both leave as the ONE rendering encodeJSON produces, so a
-// reader that compares the column as text (GROUP BY, DISTINCT, a diff
-// between two exports) sees one value where the source has one. A Go
-// string is a JSON string scalar and is quoted: the baseline's text never
-// reaches this function as a string.
+// The two sources hand a JSON column over in different shapes, and both
+// leave here as the ONE rendering encodeJSON produces, so a reader that
+// compares the column as text (GROUP BY, DISTINCT, a diff between two
+// exports) sees one value where the source has one:
+//
+//   - the baseline holds MySQL's own rendering of the document (keys in
+//     MySQL's order, a space after every comma and colon); writeBaselineRows
+//     has already parsed and re-encoded it into a json.RawMessage;
+//   - a row image carries a document (an object or an array) decoded into Go
+//     values (maps, slices, json.Number, bool), because the indexer embeds
+//     only JSON containers (#736);
+//   - a row image carries a top-level SCALAR (`"abc"`, `42`, `true`, `null`)
+//     as the TEXT go-mysql rendered it, quotes included: the indexer stored
+//     it base64 and the epoch decoder returned that text. A Go string is
+//     therefore JSON text to parse, not a string scalar to quote. Text that
+//     does not parse is the pre-#736 shape, a string scalar stored bare, and
+//     only then is it quoted (a bare legacy string that happens to parse,
+//     such as "123", renders as the number; that index lost the distinction
+//     when it stored it).
+//
+// Anything else (bytes, times, structs) is an error: encoding/json would
+// render it without complaint, as base64 or as an object, and a JSON column
+// silently holding that is the corruption a reader cannot detect.
 func jsonText(v any) (string, error) {
-	if raw, ok := v.(json.RawMessage); ok {
-		return string(raw), nil
+	switch t := v.(type) {
+	case json.RawMessage:
+		return string(t), nil
+	case string:
+		if raw, err := canonicalJSONText(t); err == nil {
+			return string(raw), nil
+		}
+		return encodeJSONString(t)
+	case map[string]any, []any, json.Number, bool, float64:
+		return encodeJSONString(t)
 	}
+	return "", fmt.Errorf("cannot render %T as JSON", v)
+}
+
+func encodeJSONString(v any) (string, error) {
 	bs, err := encodeJSON(v)
 	if err != nil {
 		return "", err
@@ -409,27 +434,31 @@ func jsonText(v any) (string, error) {
 	return string(bs), nil
 }
 
-// canonicalJSONText parses MySQL's rendering of a JSON document and re-emits
-// it through encodeJSON. Numbers keep their literal text (UseNumber), so
-// `1.50` stays `1.50` and a 20-digit integer is not rounded through float64.
-// Text that is not JSON is an error: a JSON column never holds one, so it
-// is a corrupt baseline, not a value to pass through.
+// canonicalJSONText parses one JSON document (MySQL's rendering from the
+// baseline, or go-mysql's rendering of a scalar from a row image) and
+// re-emits it through encodeJSON. Numbers keep their literal text
+// (UseNumber), so `1.50` stays `1.50` and a 20-digit integer is not rounded
+// through float64. A JSON null re-emits as `null`; it is a value, and SQL
+// NULL never reaches here. Text that is not exactly one JSON document is an
+// error for the caller to attribute.
 func canonicalJSONText(text string) (json.RawMessage, error) {
 	dec := json.NewDecoder(strings.NewReader(text))
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
-		return nil, fmt.Errorf("baseline text is not JSON: %w", err)
+		return nil, fmt.Errorf("not JSON: %w", err)
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return nil, fmt.Errorf("baseline text is not one JSON document: trailing data after %q", text)
-	}
-	if v == nil {
-		// A JSON null. The row image cannot tell it from SQL NULL and
-		// writes NULL for both; the baseline keeps the literal it holds.
-		return json.RawMessage("null"), nil
+		return nil, fmt.Errorf("not one JSON document: trailing data after %q", truncate(text, 80))
 	}
 	return encodeJSON(v)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // encodeJSON is the export's one JSON rendering: encoding/json with keys

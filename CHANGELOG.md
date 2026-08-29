@@ -61,11 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the document (keys in MySQL's order, a space after every comma), while
   the deltas re-encoded the decoded row image (keys sorted, no spaces, `<`
   escaped), so one value read as two texts depending on which run wrote the
-  row, and a JSON string scalar arriving through a delta lost its quotes.
-  Both paths now emit one rendering: keys sorted, no whitespace, `<`, `>`,
-  `&` and numbers as written. The load parses and re-emits the baseline's
-  text; a JSON column whose text does not parse refuses the load instead of
-  copying it.
+  row. Both paths now emit one rendering: keys sorted, no whitespace, `<`,
+  `>`, `&` and numbers as written. The load parses and re-emits the
+  baseline's text; a JSON column whose text does not parse refuses the load
+  instead of copying it. The first load records which columns it rendered
+  as JSON in the table's properties, in the same commit as the data, so
+  every later run renders the same columns whatever the schema snapshot
+  says, and a column changed between JSON and TEXT since the load is
+  refused like any other type change.
 
 ## [0.70.0] - 2026-08-28
 
