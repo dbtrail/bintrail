@@ -20,7 +20,9 @@ func TestFetch_pkRange(t *testing.T) {
 	buf := New(Config{MaxAge: 6 * time.Hour})
 	now := time.Now().UTC()
 	var events []parser.Event
-	for i, pk := range []string{"-5", "9", "10", "100", "9223372036854775800", ""} {
+	// "007" and "+5" parse as numbers but are not the canonical spelling
+	// the index stores; the buffer must exclude them like both engines do.
+	for i, pk := range []string{"-5", "9", "10", "100", "9223372036854775800", "", "007", "+5"} {
 		events = append(events, parser.Event{
 			BinlogFile: "binlog.000001", StartPos: uint64(i * 100), EndPos: uint64(i*100 + 50),
 			Timestamp: now.Add(time.Duration(i) * time.Second),
@@ -47,7 +49,7 @@ func TestFetch_pkRange(t *testing.T) {
 	rows = buf.Fetch(context.Background(), query.Options{Schema: "db", Table: "t",
 		PKRange: &query.PKRange{Cast: query.PKCastSigned, Min: big.NewInt(-5), Max: big.NewInt(9)}})
 	if got, want := keys(rows), "-5,9"; got != want {
-		t.Errorf("[-5,9]: got %s, want %s", got, want)
+		t.Errorf("[-5,9]: got %s, want %s (007 and +5 are not canonical spellings and stay OUT)", got, want)
 	}
 	// Unresolved cast: the buffer cannot error, so it must match nothing.
 	rows = buf.Fetch(context.Background(), query.Options{Schema: "db", Table: "t",
