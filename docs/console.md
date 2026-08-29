@@ -172,6 +172,11 @@ and searching events:
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
    rotation dialog).
 
+Every view whose subject has a full page on www.dbtrail.com shows a small
+**Docs** link beside its title. It opens that page in a new tab and is a
+plain link: the console makes no request for it, so it costs nothing on an
+air-gapped host. Views with no page of their own show no link.
+
 ## Managing servers
 
 The header has a server switcher and a **Servers** button: add, edit, and

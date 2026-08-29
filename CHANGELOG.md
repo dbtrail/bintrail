@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Console pages link to their docs page** (#1450). Every view whose subject
+  has a full page on www.dbtrail.com now shows a small Docs link beside its
+  title, opening the page in a new tab: Overview, Events, Restore, Backups,
+  Verification, Status, Storage and Connect AI. It is a plain link, so an
+  air-gapped console makes no request for it. The route to page table lives
+  in one place in the console's app.js, and a Go test checks that every page
+  it names exists as `docs/<slug>.md` in the repo, so a renamed or removed
+  doc breaks the build instead of shipping a broken link. Views with no page
+  of their own show no link.
 - **`bintrail export iceberg`** (#1466). Writes each table's current state as
   an Apache Iceberg table under `--warehouse`, incrementally: the first run
   loads the newest baseline snapshot, every run after that folds the events

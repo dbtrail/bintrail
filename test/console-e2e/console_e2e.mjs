@@ -785,6 +785,9 @@ try {
     const onRoute = location.pathname === "/ext-demo";
     const mount = document.querySelector(".ext-view-mount");
     const mountedText = mount ? mount.textContent : "";
+    // #1450: extension views are out of scope for the header Docs link, and a
+    // view with no page must get NO link rather than one to the docs index.
+    const docsLinkAbsent = !document.querySelector(".page-head .page-docs");
     const rendered = window.__ext1;
     const renderedUI = window.__ext1_ui;
     const navActive = navItem ? navItem.classList.contains("active") : false;
@@ -830,7 +833,7 @@ try {
     // for the final no-errors assertion.
     await gateCapabilities();
     navigate("overview");
-    return { gatedFromCaps, gatedNav, navText, known, onRoute, mounted: !!mount, mountedText, rendered, renderedUI, setRendered, setRenderedUI, navActive, navGone, redirected, staleAborted };
+    return { gatedFromCaps, gatedNav, navText, known, onRoute, mounted: !!mount, mountedText, docsLinkAbsent, rendered, renderedUI, setRendered, setRenderedUI, navActive, navGone, redirected, staleAborted };
   });
   extv.gatedFromCaps ? ok("ext-view: gateCapabilities populates extViews from /api/capabilities.extension_views") : bad("ext-view: gateCapabilities populates extViews from /api/capabilities.extension_views", "extViews not set from the parsed caps response");
   extv.gatedNav ? ok("ext-view: gateCapabilities injects the nav item from the fetched caps") : bad("ext-view: gateCapabilities injects the nav item from the fetched caps", "no ext-gated nav item after gateCapabilities");
@@ -838,6 +841,7 @@ try {
   extv.known ? ok("ext-view: isKnownRoute accepts a live ext-<id> route") : bad("ext-view: isKnownRoute accepts a live ext-<id> route", "ext-demo not known");
   extv.onRoute ? ok("ext-view: navigate routes to /ext-<id>") : bad("ext-view: navigate routes to /ext-<id>", "wrong route");
   extv.mounted ? ok("ext-view: a mount node is created") : bad("ext-view: a mount node is created", "no .ext-view-mount");
+  extv.docsLinkAbsent ? ok("docs link: an extension view (no docs page) carries no header link") : bad("docs link: an extension view (no docs page) carries no header link", "a .page-docs link rendered on /ext-demo");
   extv.rendered ? ok("ext-view: the module render() runs with {apiBase, api, ui}") : bad("ext-view: the module render() runs with {apiBase, api, ui}", `rendered=${extv.rendered}`);
   // The widget half, asserted by USING it. The Go guards pin the binding's
   // spelling in app.js; only this can say the extension receives something
@@ -2391,6 +2395,36 @@ try {
     && document.querySelectorAll(".vfy-region").length >= 3,
     { timeout: 10000 });
   ok("protect: /verification renders its three regions");
+
+  // Scenario 15w — the page-header Docs link (#1450). One route → slug table
+  // in app.js; the Go asset guard proves every slug is a real docs/<slug>.md,
+  // and this leg proves the link is actually painted, follows a ROUTE CHANGE
+  // (pageHead reads the route per render, not once at boot), and opens in a
+  // new tab without handing the docs site window.opener. Verification is on
+  // screen right now, so it is the first probe.
+  const docsLinkOf = () => page.evaluate(() => {
+    const links = Array.from(document.querySelectorAll(".page-head .page-docs"));
+    const a = links[0];
+    return { n: links.length, href: a && a.getAttribute("href"), target: a && a.getAttribute("target"),
+      rel: a && a.getAttribute("rel"), text: a && a.textContent.trim() };
+  });
+  const docsVfy = await docsLinkOf();
+  docsVfy.n === 1 && docsVfy.href === "https://www.dbtrail.com/docs/verify/" && docsVfy.target === "_blank"
+    && /\bnoopener\b/.test(docsVfy.rel || "") && docsVfy.text === "Docs"
+    ? ok("docs link: Verification header links to /docs/verify/ in a new tab")
+    : bad("docs link: Verification header links to /docs/verify/ in a new tab", JSON.stringify(docsVfy));
+  await page.evaluate(() => navigate("events"));
+  await page.waitForFunction(() => location.pathname === "/events"
+    && Array.from(document.querySelectorAll("h1.page-title")).some((h) => /Events/.test(h.textContent)),
+    { timeout: 10000 });
+  const docsEvents = await docsLinkOf();
+  docsEvents.n === 1 && docsEvents.href === "https://www.dbtrail.com/docs/query-and-recovery/"
+    ? ok("docs link: follows the route change to Events")
+    : bad("docs link: follows the route change to Events", JSON.stringify(docsEvents));
+  // Put the page back: 15v below reads the Verification form as it found it.
+  await page.evaluate(() => navigate("verification"));
+  await page.waitForFunction(() => location.pathname === "/verification"
+    && document.querySelectorAll(".vfy-region").length >= 3, { timeout: 10000 });
 
   // Scenario 15v — the verification page rework (#1417/#1418/#1419/#1420),
   // driven END TO END against the real daemon: a real recover-inputs run over
