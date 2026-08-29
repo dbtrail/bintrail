@@ -41,6 +41,21 @@ import (
 // read a table never sees its DDL either — and the cap stays exact, which a
 // post-fetch filter over the page could not promise.
 //
+// What the scope does NOT do, and what covers the rest: the WHERE scopes the
+// row's schema_name/table_name, and the index attributes each statement to the
+// FIRST table it names (one row per statement, ddl_query stored verbatim), so
+// `DROP TABLE users, secrets` is one row under users and an ALTER can name a
+// denied table in a REFERENCES clause. That is why, under an active access
+// profile (opts.ProfileActive: a named profile, direct session restrictions,
+// or the startup --profile), the statement text is WITHHELD — the same posture
+// /api/events takes for query_text/query_hash (#699/#838): DDL text can carry
+// literals (`ADD COLUMN c VARCHAR(16) DEFAULT '<value>'`) and other tables'
+// names, and no per-column redaction can reach inside it. Time, table, type
+// and binlog position stay. The response says so (statement_withheld plus a
+// warning), and it also announces the table scoping the way /api/events
+// announces its own (#1311): a shorter list must never read as "nothing else
+// happened".
+//
 // Open-core: this is the free query_explorer surface. No attribution fields
 // (no connection_id-style columns) belong here.
 //
@@ -79,7 +94,24 @@ type schemaChangesResponse struct {
 	// HasMore reports that at least one further change matched beyond the
 	// cap. One probe row, never a COUNT(*).
 	HasMore bool `json:"has_more"`
+	// StatementWithheld is true when every Statement in this page is empty
+	// because an access profile is active (see the file comment). A flag
+	// rather than an omitted field, so a client can tell "withheld" from an
+	// index that stored an empty statement.
+	StatementWithheld bool `json:"statement_withheld,omitempty"`
+	// Warnings announce what this listing does not include: tables outside
+	// the session's access, and withheld statement text. Same register as
+	// eventsResponse.Warnings; the UI renders them above the list.
+	Warnings []string `json:"warnings,omitempty"`
 }
+
+// Scoping notices, worded for the person reading the list.
+const (
+	schemaChangesScopeWarning = "Your access policy limits which tables you can read, so DDL recorded for other " +
+		"tables is not listed here. Each statement is listed under the first table it names."
+	schemaChangesWithheldWarning = "Statement text is withheld while an access profile is active, because DDL text " +
+		"can carry values and name other tables. Time, table, type and binlog position are shown."
+)
 
 // schemaChangesFilter is the parsed, validated request.
 type schemaChangesFilter struct {
@@ -205,7 +237,7 @@ func (s *Server) handleSchemaChanges(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusUnprocessableEntity,
 				"This index has no schema_changes table, so no DDL history was recorded for it. "+
 					"Re-run init against the index to add the table (CLI: bintrail init); "+
-					"changes made before that cannot be recovered.")
+					"DDL that ran before that cannot be back-filled.")
 			return
 		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -213,6 +245,9 @@ func (s *Server) handleSchemaChanges(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
+	// Under an active profile the statement column is dropped from every row
+	// (see the file comment); the flag and the warning below say so.
+	withheld := opts.ProfileActive
 	changes := []schemaChangeDTO{} // never null on the wire
 	for rows.Next() {
 		var c schemaChangeDTO
@@ -223,7 +258,9 @@ func (s *Server) handleSchemaChanges(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		c.DetectedAt = detectedAt.UTC().Format(consoleTSFormat)
-		c.Statement = stmt.String
+		if !withheld {
+			c.Statement = stmt.String
+		}
 		changes = append(changes, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -234,10 +271,16 @@ func (s *Server) handleSchemaChanges(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		changes = changes[:limit]
 	}
+	var warnings []string
+	if withheld {
+		warnings = []string{schemaChangesScopeWarning, schemaChangesWithheldWarning}
+	}
 	writeJSON(w, http.StatusOK, schemaChangesResponse{
-		Changes: changes,
-		Count:   len(changes),
-		Limit:   limit,
-		HasMore: hasMore,
+		Changes:           changes,
+		Count:             len(changes),
+		Limit:             limit,
+		HasMore:           hasMore,
+		StatementWithheld: withheld,
+		Warnings:          warnings,
 	})
 }

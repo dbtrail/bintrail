@@ -40,8 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `list_schema_changes` tool takes (`ddl_type` is a prefix, so `ALTER` matches
   `ALTER TABLE`), and orders by `detected_at, binlog_file, binlog_pos, id`,
   all descending, so DDLs detected in the same second list in their true
-  binlog order. A session whose access policy withholds a table never sees
-  that table's DDL.
+  binlog order. Under an access policy the rows are scoped by the table the
+  index attributed each statement to (a statement naming several tables is
+  attributed to the first), and the statement text is withheld, as the Events
+  view withholds `query_text`: DDL text can carry values and name other
+  tables. The response says what it left out.
 
 ### Changed
 - **Usage telemetry classifies first-run failures** (#1503). A fresh install

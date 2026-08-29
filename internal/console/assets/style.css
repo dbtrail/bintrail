@@ -859,6 +859,7 @@ button { font-family: inherit; }
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
 }
 .sc-row.open .sc-stmt { display: block; -webkit-line-clamp: unset; overflow: visible; }
+.sc-stmt-withheld { color: var(--ink-4); font-style: italic; }
 
 /* events loading state (#1353): skeleton rows while the fetch is in flight —
    a blank list must never be the busy rendering. The note under the rows is

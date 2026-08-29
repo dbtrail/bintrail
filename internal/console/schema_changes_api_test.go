@@ -125,6 +125,10 @@ func TestSchemaChangesHandler(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "connection_id") {
 		t.Errorf("schema-changes must not carry connection_id: %s", rec.Body.String())
 	}
+	// An unrestricted session: nothing withheld, nothing to warn about.
+	if resp.StatementWithheld || len(resp.Warnings) != 0 || strings.Contains(rec.Body.String(), "statement_withheld") {
+		t.Errorf("unrestricted read must carry no withheld flag or warnings: %s", rec.Body.String())
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
 	}
@@ -244,6 +248,65 @@ func TestSchemaChangesRestrictedSessionScope(t *testing.T) {
 	s.handleSchemaChanges(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+	// Direct restrictions are an active profile too (applySessionProfile
+	// sets ProfileActive for them), so the statement column is withheld and
+	// both notices ride the response.
+	assertSchemaChangesWithheld(t, rec.Body.Bytes())
+}
+
+// assertSchemaChangesWithheld checks the withheld shape: the flag set, both
+// warnings present, and no statement text anywhere in the body.
+func assertSchemaChangesWithheld(t *testing.T, body []byte) {
+	t.Helper()
+	var resp schemaChangesResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.StatementWithheld {
+		t.Errorf("statement_withheld must be true under an active profile: %s", body)
+	}
+	if len(resp.Warnings) != 2 || resp.Warnings[0] != schemaChangesScopeWarning || resp.Warnings[1] != schemaChangesWithheldWarning {
+		t.Errorf("warnings = %q, want the scope and withheld notices", resp.Warnings)
+	}
+	for _, c := range resp.Changes {
+		if c.Statement != "" {
+			t.Errorf("statement leaked under an active profile: %q", c.Statement)
+		}
+	}
+}
+
+// TestSchemaChangesStatementWithheld pins the #699-style posture for DDL
+// text: with the startup profile active (the process-wide flag, no session
+// needed), the statement is absent from the WHOLE body — the canary literal
+// the mock returns must not appear anywhere — while the coordinates stay.
+func TestSchemaChangesStatementWithheld(t *testing.T) {
+	db, mock, closer := newSQLMock(t)
+	defer closer()
+	const canary = "ALTER TABLE users ADD COLUMN token VARCHAR(16) DEFAULT 'canary-literal-9f3'"
+	rows := sqlmock.NewRows(schemaChangesCols)
+	schemaChangeRow(rows, 3, time.Date(2026, 6, 1, 12, 0, 5, 0, time.UTC), "app", "users", "ALTER TABLE", canary, "bin.000001", 200)
+	mock.ExpectQuery("FROM schema_changes").WillReturnRows(rows)
+	s := newBootServer(db)
+	s.profileActive = true
+	rec := httptest.NewRecorder()
+	s.handleSchemaChanges(rec, httptest.NewRequest("GET", "/api/schema-changes", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "canary-literal") || strings.Contains(rec.Body.String(), "ADD COLUMN") {
+		t.Errorf("statement text reached the body under an active profile: %s", rec.Body.String())
+	}
+	assertSchemaChangesWithheld(t, rec.Body.Bytes())
+	var resp schemaChangesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Changes) != 1 || resp.Changes[0].Table != "users" || resp.Changes[0].DDLType != "ALTER TABLE" || resp.Changes[0].BinlogPos != 200 {
+		t.Errorf("coordinates must survive withholding: %+v", resp.Changes)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)

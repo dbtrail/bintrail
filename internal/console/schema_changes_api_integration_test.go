@@ -35,6 +35,9 @@ func seedSchemaChanges(t *testing.T) *Server {
 	insert("2026-06-01 12:00:05", "bin.000001", 300, "app", "users", "DROP TABLE", "DROP TABLE users")
 	insert("2026-06-01 12:00:05", "bin.000001", 100, "app", "users", "ALTER TABLE", "ALTER TABLE users ADD COLUMN name VARCHAR(64)")
 	insert("2026-06-01 12:00:05", "bin.000001", 250, "app", "secrets", "TRUNCATE TABLE", "TRUNCATE TABLE secrets")
+	// A later binlog FILE at a lower position, same second: file order beats
+	// position order, so this one lists first.
+	insert("2026-06-01 12:00:05", "bin.000002", 50, "app", "users", "ALTER TABLE", "ALTER TABLE users DROP COLUMN name")
 	srv, err := New(Config{DB: db, DBName: dbName, Listen: "127.0.0.1:8090", Token: "static-tok"})
 	if err != nil {
 		t.Fatal(err)
@@ -64,15 +67,15 @@ func positions(resp schemaChangesResponse) []uint64 {
 }
 
 // TestIntegrationSchemaChangesOrdering proves the tiebreak against a real
-// MySQL: newest second first, and within a second the binlog position
-// descending. Removing the binlog_file/binlog_pos/id tail from the ORDER BY
-// turns this red (verified while writing it).
+// MySQL: newest second first, within a second the newest binlog file first,
+// within a file the position descending. Removing the binlog_file/binlog_pos/
+// id tail from the ORDER BY turns this red (verified while writing it).
 func TestIntegrationSchemaChangesOrdering(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	srv := seedSchemaChanges(t)
 	resp := getSchemaChanges(t, srv, "?schema=app&table=users", "static-tok")
 	got := positions(resp)
-	want := []uint64{300, 200, 100, 900}
+	want := []uint64{50, 300, 200, 100, 900}
 	if len(got) != len(want) {
 		t.Fatalf("positions = %v, want %v", got, want)
 	}
@@ -81,14 +84,14 @@ func TestIntegrationSchemaChangesOrdering(t *testing.T) {
 			t.Fatalf("positions = %v, want %v (same-second DDLs must list newest binlog position first)", got, want)
 		}
 	}
-	if resp.Changes[0].DDLType != "DROP TABLE" || resp.Changes[3].DDLType != "CREATE TABLE" {
-		t.Errorf("types = %s … %s, want DROP TABLE first and CREATE TABLE last", resp.Changes[0].DDLType, resp.Changes[3].DDLType)
+	if resp.Changes[0].BinlogFile != "bin.000002" || resp.Changes[1].DDLType != "DROP TABLE" || resp.Changes[4].DDLType != "CREATE TABLE" {
+		t.Errorf("order = %+v, want the bin.000002 row first, DROP TABLE second and CREATE TABLE last", resp.Changes)
 	}
 	// Same rows, same order, when the cap cuts inside the burst: the cut is
 	// stable rather than an arbitrary subset of the tied group.
 	capped := getSchemaChanges(t, srv, "?schema=app&table=users&limit=2", "static-tok")
-	if p := positions(capped); len(p) != 2 || p[0] != 300 || p[1] != 200 || !capped.HasMore {
-		t.Errorf("limit=2: positions = %v has_more = %v, want [300 200] true", p, capped.HasMore)
+	if p := positions(capped); len(p) != 2 || p[0] != 50 || p[1] != 300 || !capped.HasMore {
+		t.Errorf("limit=2: positions = %v has_more = %v, want [50 300] true", p, capped.HasMore)
 	}
 }
 
@@ -97,12 +100,12 @@ func TestIntegrationSchemaChangesOrdering(t *testing.T) {
 func TestIntegrationSchemaChangesFilters(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	srv := seedSchemaChanges(t)
-	if resp := getSchemaChanges(t, srv, "", "static-tok"); resp.Count != 5 {
-		t.Errorf("unfiltered count = %d, want 5", resp.Count)
+	if resp := getSchemaChanges(t, srv, "", "static-tok"); resp.Count != 6 {
+		t.Errorf("unfiltered count = %d, want 6", resp.Count)
 	}
-	if resp := getSchemaChanges(t, srv, "?ddl_type=alter", "static-tok"); resp.Count != 2 ||
-		resp.Changes[0].DDLType != "ALTER TABLE" || resp.Changes[1].DDLType != "ALTER TABLE" {
-		t.Errorf("ddl_type=alter: %+v, want the two ALTER TABLE rows", resp.Changes)
+	if resp := getSchemaChanges(t, srv, "?ddl_type=alter", "static-tok"); resp.Count != 3 ||
+		resp.Changes[0].DDLType != "ALTER TABLE" || resp.Changes[1].DDLType != "ALTER TABLE" || resp.Changes[2].DDLType != "ALTER TABLE" {
+		t.Errorf("ddl_type=alter: %+v, want the three ALTER TABLE rows", resp.Changes)
 	}
 	if resp := getSchemaChanges(t, srv, "?table=secrets", "static-tok"); resp.Count != 1 || resp.Changes[0].Table != "secrets" {
 		t.Errorf("table=secrets: %+v, want the one TRUNCATE row", resp.Changes)
@@ -113,8 +116,8 @@ func TestIntegrationSchemaChangesFilters(t *testing.T) {
 	if resp := getSchemaChanges(t, srv, "?until=2026-06-01%2012:00:00", "static-tok"); resp.Count != 1 || resp.Changes[0].BinlogPos != 900 {
 		t.Errorf("until=12:00:00: %+v, want only the CREATE", resp.Changes)
 	}
-	if resp := getSchemaChanges(t, srv, "?since=2026-06-01%2012:00:01", "static-tok"); resp.Count != 4 {
-		t.Errorf("since=12:00:01: count = %d, want 4", resp.Count)
+	if resp := getSchemaChanges(t, srv, "?since=2026-06-01%2012:00:01", "static-tok"); resp.Count != 5 {
+		t.Errorf("since=12:00:01: count = %d, want 5", resp.Count)
 	}
 	// The wire time is the exact index value, so it pastes back into a filter.
 	if resp := getSchemaChanges(t, srv, "?table=secrets", "static-tok"); resp.Changes[0].DetectedAt != "2026-06-01 12:00:05" {
@@ -123,9 +126,11 @@ func TestIntegrationSchemaChangesFilters(t *testing.T) {
 }
 
 // TestIntegrationSchemaChangesRestrictedSession: a session whose policy
-// withholds a table never sees that table's DDL — by deny, and by an allow
-// list that does not name it — while the policy-less static token on the
-// same server still reads it (per-session, not process-global).
+// withholds a table never sees rows attributed to that table — by deny, and
+// by an allow list that does not name it — and, because an active policy
+// also withholds statement text, never sees any statement either; the
+// policy-less static token on the same server still reads both
+// (per-session, not process-global).
 func TestIntegrationSchemaChangesRestrictedSession(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 	srv := seedSchemaChanges(t)
@@ -140,8 +145,18 @@ func TestIntegrationSchemaChangesRestrictedSession(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "secrets") {
 		t.Errorf("policy-denied table app.secrets leaked its DDL to a restricted session: %s", rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "ALTER TABLE users") {
-		t.Errorf("the un-denied table's DDL must remain: %s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), "ADD COLUMN") || strings.Contains(rec.Body.String(), "PRIMARY KEY") {
+		t.Errorf("statement text leaked to a restricted session: %s", rec.Body.String())
+	}
+	var scoped schemaChangesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &scoped); err != nil {
+		t.Fatal(err)
+	}
+	if !scoped.StatementWithheld || len(scoped.Warnings) != 2 {
+		t.Errorf("restricted read must flag withheld statements and carry both notices: %s", rec.Body.String())
+	}
+	if scoped.Count != 5 || scoped.Changes[0].Table != "users" || scoped.Changes[0].DDLType != "ALTER TABLE" || scoped.Changes[0].Statement != "" {
+		t.Errorf("the un-denied table's rows must remain, statement empty: %+v", scoped.Changes)
 	}
 	// Asking for the denied table by name is not a way around the scope.
 	rec = getPath(t, srv, "127.0.0.1:8090", "/api/schema-changes?schema=app&table=secrets", denied)
@@ -158,8 +173,8 @@ func TestIntegrationSchemaChangesRestrictedSession(t *testing.T) {
 	}
 
 	rec = getPath(t, srv, "127.0.0.1:8090", "/api/schema-changes", "static-tok")
-	if !strings.Contains(rec.Body.String(), "TRUNCATE TABLE secrets") {
-		t.Errorf("policy-less credential should see the raw listing; per-session restriction leaked to the process: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "TRUNCATE TABLE secrets") || strings.Contains(rec.Body.String(), "statement_withheld") {
+		t.Errorf("policy-less credential should see the raw listing with statements; per-session restriction leaked to the process: %s", rec.Body.String())
 	}
 }
 

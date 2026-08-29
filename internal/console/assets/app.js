@@ -5668,10 +5668,13 @@ async function runSchemaChangesQuery(form) {
   if (data.has_more) note += " · the newest " + changes.length + " shown; narrow the time range or raise the limit (max 1000) to see more";
   if (noteEl) noteEl.textContent = note;
   renderWarnings($("#sc-warnings", VIEW()), data.warnings || []);
-  buildSchemaChangeRows(rowsEl, changes, Object.keys(apiParams).some((k) => k !== "limit"));
+  buildSchemaChangeRows(rowsEl, changes, Object.keys(apiParams).some((k) => k !== "limit"), !!data.statement_withheld);
 }
 
-function buildSchemaChangeRows(container, changes, filtered) {
+// withheld: the server dropped every statement because an access profile is
+// active (the response warning says why); the cell says so instead of
+// rendering as an empty statement.
+function buildSchemaChangeRows(container, changes, filtered, withheld) {
   clear(container);
   if (!changes.length) {
     const box = el("div", { class: "empty" });
@@ -5690,7 +5693,9 @@ function buildSchemaChangeRows(container, changes, filtered) {
     row.append(el("span", { class: "ev-table", text: c.schema_name + "." + c.table_name }));
     row.append(el("span", {}, scBadge(c.ddl_type)));
     row.append(el("span", { class: "sc-pos", text: c.binlog_file + ":" + c.binlog_pos }));
-    row.append(el("pre", { class: "sc-stmt", text: c.statement || "" }));
+    row.append(withheld
+      ? el("pre", { class: "sc-stmt sc-stmt-withheld", text: "(statement withheld under the active access profile)" })
+      : el("pre", { class: "sc-stmt", text: c.statement || "" }));
     row.addEventListener("click", () => {
       const open = row.classList.toggle("open");
       row.setAttribute("aria-expanded", open ? "true" : "false");
