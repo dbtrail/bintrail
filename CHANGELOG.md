@@ -32,6 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output, not the storage layer.
 
 ### Changed
+- **Staged `.sql` backups expire** (#1448). A backup built from the Backups
+  page used to stay in the daemon's staging directory until the next build
+  or a restart, parking a full plaintext copy of every table on the index
+  host with nothing on any page to show it. Now the build is removed the
+  moment a download completes, 4 hours after it finished if nobody
+  downloaded it, and at once when the build fails; a new build for the same
+  server still replaces the previous one. The Ready line shows the size and
+  the download deadline, and the status reports `expires_at`, then
+  `downloaded` or `expired` once the file is gone. Startup sweeps every
+  build a previous process left behind, one build at a time, and deleting a
+  staged run by hand now reads as `expired` on the next poll instead of a
+  download button that answers 409. Every removal is scoped to the
+  `sql-export` staging directory and refuses any path outside it or across
+  a symbolic link. The Storage page gains a **Staged downloads** card
+  (`staging` in `GET /api/storage`) with each build's server, size and
+  deadline, so the space is visible while it exists.
 - **Usage telemetry classifies first-run failures** (#1503). A fresh install
   that could not start reported every attempt as `error_class: unknown`, so
   the one thing telemetry exists to show — why a first run fails — was

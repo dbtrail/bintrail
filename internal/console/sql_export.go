@@ -38,6 +38,32 @@ type SQLExporter interface {
 	// build has succeeded and its directory affirmatively carries the
 	// completeness marker.
 	SQLExportDir(serverID string) (dir string, status BaselineStatus, ok bool)
+	// SQLExportDelivered tells the exporter the whole archive built in dir
+	// reached a client, so the staged copy can go now rather than at its
+	// download deadline. dir pins which build: a newer build that replaced
+	// it mid-stream must not be removed on the strength of the old one's
+	// download.
+	SQLExportDelivered(serverID, dir string)
+	// SQLExportStaged reports every build currently on disk (running or
+	// waiting for its download) with its live size, for the Storage page.
+	SQLExportStaged() SQLExportStagingInfo
+}
+
+// SQLExportStagingInfo is what the sql-export staging holds right now.
+type SQLExportStagingInfo struct {
+	Dir    string                 // the staging base every build lives under
+	TTL    time.Duration          // how long a finished build stays downloadable
+	Builds []SQLExportStagedBuild // sorted by server id
+}
+
+// SQLExportStagedBuild is one build on disk: in progress, or finished and
+// waiting for its download.
+type SQLExportStagedBuild struct {
+	ServerID  string
+	State     string // running | succeeded
+	At        string // the instant the dump represents (RFC3339 UTC)
+	ExpiresAt string // when a finished build is removed unless downloaded first
+	Bytes     int64  // live on-disk size
 }
 
 // SQLExportRequest identifies the server and the instant to build for.
@@ -158,7 +184,7 @@ func (s *Server) handleSQLExportDownload(w http.ResponseWriter, r *http.Request)
 	dir, st, ready := s.sqlExport.SQLExportDir(e.ID)
 	if !ready {
 		writeJSONError(w, http.StatusConflict,
-			"no finished .sql backup to download; build one first (it may still be running, the last build may have failed, or its files were removed from the staging directory; building again fixes all three)")
+			"no finished .sql backup to download; build one first (it may still be running, the last build may have failed, it may already have been downloaded or passed its download deadline, or its files were removed from the staging directory; building again fixes all of these)")
 		return
 	}
 	stamp := "backup"
@@ -263,4 +289,9 @@ func (s *Server) handleSQLExportDownload(w http.ResponseWriter, r *http.Request)
 		abort("sql backup download aborted: the build was replaced mid-stream", err)
 	}
 	completed = true
+	// The archive is whole and handed over: the staged copy has done its
+	// job, so it leaves the disk now instead of at its deadline (#1448).
+	// Only after the marker check, so an aborted or replaced stream never
+	// removes a build it did not deliver.
+	s.sqlExport.SQLExportDelivered(e.ID, dir)
 }

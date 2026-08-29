@@ -161,8 +161,13 @@ and searching events:
    downloaded as one `.tar.gz` — load it with `myloader`, nothing from
    bintrail needed on the restore side. The build is a full plaintext copy
    of every row, staged on the daemon's disk (under the system temp
-   directory unless `BINTRAIL_CONSOLE_BASELINE_STAGING` says otherwise) until the next
-   build replaces it or the daemon restarts) and **Verification** (run
+   directory unless `BINTRAIL_CONSOLE_BASELINE_STAGING` says otherwise). It
+   does not stay there: the file is removed as soon as a download completes,
+   4 hours after the build finished if nobody downloaded it (the Ready line
+   shows the deadline and the size), when a new build for the same server
+   starts, or when the daemon restarts (every build a previous process left
+   behind, finished or interrupted, is removed at startup). The Storage page
+   shows what is staged while it exists) and **Verification** (run
    `bintrail verify` and read past runs). These produce and validate the
    artifacts a restore depends on, so they are operations rather than
    settings; they lived on the Storage page until they outgrew it.
@@ -451,6 +456,12 @@ compact baseline summary card and links onward:
 - **S3 archiving per source** — every monitored server with its
   `Archive to S3` destination (or `drop-only` when none), with a shortcut into
   that server's edit form. The boot (cli) index always rotates drop-only.
+- **Staged downloads**: the `.sql` backups built from the Backups page that
+  are waiting on the daemon's disk for their download: each build's server,
+  size and download deadline, the total, and where they live. A build is
+  removed once downloaded or 4 hours after it finished, so this card is
+  usually empty; it exists so that space is never invisible. Shown only on a
+  daemon that can build `.sql` backups.
 - **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one

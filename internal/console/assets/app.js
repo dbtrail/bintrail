@@ -3580,6 +3580,8 @@ function buildStorage(serversRes, rotation, backupRefresh, storage, baselines, t
   cards.append(rotationCard(rotation));
   cards.append(backupRefreshCard(backupRefresh));
   cards.append(credentialsCard(storage));
+  const staging = stagingCard(storage, servers);
+  if (staging) cards.append(staging);
   cards.append(telemetryCard(telemetry));
   if (capsCache.views) cards.append(duckdbCard());
   cards.append(baselineSummaryCard(baselines, cur, { linkOnward: true }));
@@ -3828,6 +3830,37 @@ function credentialsCard(storage) {
   if (aws.web_identity) kvRow(adv, "EKS IRSA", "detected");
   card.append(adv);
   card.append(el("p", { class: "form-hint", text: "Note: an IAM role can still be active even if none of the signals above show as set." }));
+  return card;
+}
+
+// stagingCard shows the disk the sql-export staging holds right now (#1448):
+// every .sql backup built from the Backups page waits on the daemon's disk
+// for its download, and that space used to be invisible until someone ran
+// du. Null when this daemon cannot build .sql backups (no staging exists) or
+// when /api/storage failed (credentialsCard already reports that).
+function stagingCard(storage, servers) {
+  const stg = storage && storage.staging;
+  if (!stg) return null;
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Staged downloads" }));
+  const hours = Math.round(stg.ttl_hours || 0);
+  const builds = stg.builds || [];
+  if (!builds.length) {
+    card.append(el("p", { class: "stg-hint", text:
+      "Nothing staged. A .sql backup built from the Backups page waits here until it is downloaded or " +
+      hours + " hours pass, then it is removed." }));
+  } else {
+    card.append(el("p", { class: "stg-hint", text:
+      humanBytes(stg.bytes || 0) + " on this machine in " + builds.length + (builds.length === 1 ? " build" : " builds") +
+      ". Each is removed once downloaded, or " + hours + " hours after it finished." }));
+    for (const b of builds) {
+      const name = b.server_name || ((servers || []).find((s) => s.id === b.server_id) || {}).name || b.server_id;
+      const what = b.state === "running"
+        ? "building" + (b.at ? " as of " + utcLabel(b.at) : "")
+        : "ready" + (b.at ? " as of " + utcLabel(b.at) : "") + (b.expires_at ? ", removed at " + utcLabel(b.expires_at) + " if not downloaded" : "");
+      kvRow(card, name, humanBytes(b.bytes || 0) + ", " + what);
+    }
+  }
+  kvRow(card, "location", stg.dir || "");
   return card;
 }
 
@@ -4839,8 +4872,11 @@ async function startBackupRestore(id, at, btn, msgEl) {
 // backupSQLExportCard offers the made-to-measure .sql backup: pick any past
 // moment, the console folds the nearest earlier backup forward to it and
 // packages the result as plain SQL files. Unlike the point-in-time restore it
-// publishes NOTHING: the build lives in a staging directory until the next
-// build (or a daemon restart) replaces it.
+// publishes NOTHING: the build lives in a staging directory until it is
+// downloaded, until its download deadline passes (the status carries
+// expires_at), or until the next build or a daemon restart replaces it
+// (#1448). The two terminal states after that, "downloaded" and "expired",
+// both mean the same thing to the operator: the file is gone, build again.
 // S3-backed backups qualify too (the fold engine reads them directly), which
 // is why this card has no b.kind === "dir" gate.
 function backupSQLExportCard(cur, b, sqlSt) {
@@ -4871,7 +4907,19 @@ function backupSQLExportCard(cur, b, sqlSt) {
     dl.onclick = () => downloadSQLExport(cur.id, dl, st.bytes || 0);
     body.append(el("div", { class: "bk-restore-row" },
       el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") +
-        (st.bytes ? " (" + humanBytes(st.bytes) + ")" : "") + "." }), dl));
+        (st.bytes ? " (" + humanBytes(st.bytes) + " on this machine)" : "") + "." }), dl));
+    body.append(el("p", { class: "form-hint", text:
+      (st.expires_at ? "The download stays available until " + utcLabel(st.expires_at) + ". " : "") +
+      "The file is removed from this machine once you download it, when that time passes, or when a new build starts." }));
+    details.open = true;
+  } else if (st && st.state === "downloaded") {
+    body.append(el("p", { class: "form-hint", text:
+      "Downloaded" + (st.downloaded_at ? " at " + utcLabel(st.downloaded_at) : "") +
+      ": the backup as of " + utcLabel(st.at || "") + " was handed over and its file was removed from this machine. Build again for another copy." }));
+    details.open = true;
+  } else if (st && st.state === "expired") {
+    body.append(el("p", { class: "form-hint", text:
+      "The backup built for " + utcLabel(st.at || "") + " is no longer on this machine: it was not downloaded before its deadline, or its files were removed. Build again for a fresh copy." }));
     details.open = true;
   }
   details.append(body);

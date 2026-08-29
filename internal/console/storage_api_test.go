@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newStorageServer(t *testing.T) *Server {
@@ -81,5 +82,55 @@ func TestStorageAPI_nothingSet(t *testing.T) {
 	}
 	if got.AWS.AccessKeyEnv || got.AWS.Profile != "" || got.AWS.RegionEnv != "" || got.AWS.SharedConfig {
 		t.Fatalf("aws = %+v, want all signals absent", got.AWS)
+	}
+}
+
+// TestStorageAPI_stagingShare (#1448): a daemon that can build .sql backups
+// reports what its staging holds, with the total and each build's server
+// name resolved from the registry; a console without the exporter reports
+// no staging at all (there is none).
+func TestStorageAPI_stagingShare(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	stub := &stubSQLExporter{}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+	stub.staged = SQLExportStagingInfo{Dir: "/staging/sql-export", TTL: 4 * time.Hour, Builds: []SQLExportStagedBuild{
+		{ServerID: id, State: "succeeded", At: "2026-06-10T11:00:00Z", ExpiresAt: "2026-06-10T16:00:00Z", Bytes: 1500},
+		{ServerID: "gone", State: "running", Bytes: 500},
+	}}
+
+	rec, body := doServersReq(t, srv, "GET", "/api/storage", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, body)
+	}
+	var got storageInfoResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Staging == nil {
+		t.Fatalf("staging absent with an exporter wired: %s", body)
+	}
+	if got.Staging.Dir != "/staging/sql-export" || got.Staging.TTLHours != 4 || got.Staging.Bytes != 2000 {
+		t.Fatalf("staging = %+v, want the dir, 4h and the 2000-byte total", got.Staging)
+	}
+	if len(got.Staging.Builds) != 2 {
+		t.Fatalf("builds = %+v, want both", got.Staging.Builds)
+	}
+	if b := got.Staging.Builds[0]; b.ServerName != "wp" || b.State != "succeeded" || b.ExpiresAt != "2026-06-10T16:00:00Z" || b.Bytes != 1500 {
+		t.Fatalf("build[0] = %+v, want the registry name, state, deadline and size", b)
+	}
+	if b := got.Staging.Builds[1]; b.ServerName != "" || b.ServerID != "gone" {
+		t.Fatalf("build[1] = %+v: a deleted server keeps its id and no name", b)
+	}
+
+	// No exporter: the key is absent, not an empty object the card would
+	// render as "nothing staged".
+	off := newStorageServer(t)
+	rec, body = doServersReq(t, off, "GET", "/api/storage", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s", rec.Code, body)
+	}
+	if strings.Contains(string(body), `"staging"`) {
+		t.Fatalf("staging reported without an exporter: %s", body)
 	}
 }

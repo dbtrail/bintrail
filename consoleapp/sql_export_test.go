@@ -43,10 +43,12 @@ func TestSQLExportSingleFlight(t *testing.T) {
 }
 
 // seedExport puts a build state + dir into the supervisor the way Trigger
-// does, without running a fold.
+// does, without running a fold. The deadline is stamped as the success tail
+// would: a finished build without one counts as expired (#1448), on purpose.
 func seedExport(sup *baselineSupervisor, serverID, state, dir string) {
 	sup.mu.Lock()
-	sup.exports[serverID] = &console.BaselineStatus{State: state}
+	sup.exports[serverID] = &console.BaselineStatus{State: state,
+		ExpiresAt: sup.clock().UTC().Add(sqlExportTTL).Format(time.RFC3339)}
 	sup.exportDirs[serverID] = dir
 	sup.mu.Unlock()
 }

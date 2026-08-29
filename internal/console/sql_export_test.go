@@ -22,7 +22,15 @@ type stubSQLExporter struct {
 	st    BaselineStatus
 	dir   string
 	ready bool
+	// delivered records every SQLExportDelivered call as "<server>|<dir>".
+	delivered []string
+	staged    SQLExportStagingInfo
 }
+
+func (s *stubSQLExporter) SQLExportDelivered(serverID, dir string) {
+	s.delivered = append(s.delivered, serverID+"|"+dir)
+}
+func (s *stubSQLExporter) SQLExportStaged() SQLExportStagingInfo { return s.staged }
 
 func (s *stubSQLExporter) TriggerSQLExport(req SQLExportRequest) error {
 	s.last = &req
@@ -270,6 +278,11 @@ func TestSQLExportDownload_roundTrip(t *testing.T) {
 		ev.Detail["at"] != "2026-06-10T12:00:00Z" {
 		t.Fatalf("audit detail = %v, want format=sql, 3 files, the instant, and no aborted flag", ev.Detail)
 	}
+	// The whole archive left: the staged copy is consumed (#1448), and the
+	// exporter is told WHICH build so a replacement is never removed for it.
+	if len(stub.delivered) != 1 || stub.delivered[0] != id+"|"+dir {
+		t.Fatalf("delivered = %v, want exactly [%s|%s]", stub.delivered, id, dir)
+	}
 }
 
 func TestSQLExportDownload_emptyBuild(t *testing.T) {
@@ -373,6 +386,10 @@ func TestSQLExportDownload_midStreamAbort(t *testing.T) {
 	if ev.Detail["aborted"] != "true" || ev.Detail["bytes"] != "4" || ev.Detail["files"] != "1" {
 		t.Fatalf("audit detail = %v, want aborted=true with the 4 bytes and 1 file that left", ev.Detail)
 	}
+	// An aborted stream delivered nothing: the build must stay for a retry.
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v after an aborted stream, want none", stub.delivered)
+	}
 }
 
 // TestSQLExportDownload_unexpectedSubdir: the engine writes a flat dump; a
@@ -439,6 +456,9 @@ func TestSQLExportDownload_markerVanishedMidStream(t *testing.T) {
 	}
 	if ev == nil || ev.Detail["aborted"] != "true" {
 		t.Fatalf("audit = %v, want the aborted handover recorded", ev)
+	}
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v after a replaced build, want none", stub.delivered)
 	}
 }
 
