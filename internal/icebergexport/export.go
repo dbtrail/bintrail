@@ -556,8 +556,12 @@ func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrow
 				}
 			}
 			for _, name := range jsonCols {
+				key, present := lookupKey(row, name)
+				if !present {
+					continue
+				}
 				var text string
-				switch v := row[name].(type) {
+				switch v := row[key].(type) {
 				case nil:
 					continue
 				case string:
@@ -573,7 +577,7 @@ func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrow
 					yield(nil, fmt.Errorf("column %s (pk %v): baseline text is %w", name, canon, err))
 					return
 				}
-				row[name] = raw
+				row[key] = raw
 			}
 			if err := app.append(row); err != nil {
 				yield(nil, err)
@@ -1196,9 +1200,6 @@ func applyJSONColumns(cols []column, props iceberg.Properties, tm *metadata.Tabl
 	if !ok {
 		var untyped []string
 		for i := range cols {
-			if cols[i].MySQLType != "" {
-				continue
-			}
 			cols[i].MySQLType = current[strings.ToLower(cols[i].Name)]
 			if cols[i].MySQLType == "" && cols[i].Kind == kindString {
 				untyped = append(untyped, cols[i].Name)

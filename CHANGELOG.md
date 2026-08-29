@@ -68,7 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as JSON in the table's properties, in the same commit as the data, so
   every later run renders the same columns whatever the schema snapshot
   says, and a column changed between JSON and TEXT since the load is
-  refused like any other type change.
+  refused like any other type change. A table loaded by a build without
+  this property keeps MySQL's text in its loaded rows until the table
+  directory is removed and reloaded.
 
 ## [0.70.0] - 2026-08-28
 

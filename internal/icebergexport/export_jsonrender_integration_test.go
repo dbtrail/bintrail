@@ -103,7 +103,7 @@ func TestIntegrationExport_jsonColumnRendersOneWayOnBothPaths(t *testing.T) {
 		"4": `null`,  // loaded JSON null keeps its literal
 		"5": `"abc"`, // delta string scalar: the decoded text, re-emitted
 		"6": `{"k":null,"z":true}`,
-		"7": `true`, // delta bool scalar (an untyped column would write 1)
+		"7": `true`, // delta bool scalar: the decoded text, re-emitted
 		"8": `null`, // delta JSON null: a value, not SQL NULL
 	}
 	if len(got) != len(want) {

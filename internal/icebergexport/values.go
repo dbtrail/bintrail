@@ -94,6 +94,21 @@ func (a *rowAppender) append(row map[string]any) error {
 	return nil
 }
 
+// lookupKey returns the key under which row holds name, exact first and then
+// case-folded (the baseline's Parquet names and the CREATE TABLE spelling
+// can differ by case), or false when the row has neither.
+func lookupKey(row map[string]any, name string) (string, bool) {
+	if _, ok := row[name]; ok {
+		return name, true
+	}
+	for k := range row {
+		if strings.EqualFold(k, name) {
+			return k, true
+		}
+	}
+	return "", false
+}
+
 // lookupFold finds a key by case-insensitive match, for row images whose
 // column spelling differs from the CREATE TABLE's only in case.
 func lookupFold(row map[string]any, name string) (any, bool) {
@@ -420,9 +435,12 @@ func jsonText(v any) (string, error) {
 			return string(raw), nil
 		}
 		return encodeJSONString(t)
-	case map[string]any, []any, json.Number, bool, float64:
+	case map[string]any, []any, json.Number, bool:
 		return encodeJSONString(t)
 	}
+	// A float64 is refused with the rest: neither source produces one (both
+	// row decoders keep numbers as json.Number), and rendering it would round
+	// a 20-digit integer that the baseline wrote exactly.
 	return "", fmt.Errorf("cannot render %T as JSON", v)
 }
 
