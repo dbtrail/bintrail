@@ -963,7 +963,12 @@ func TestEndToEndDelivery(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{Dir: dir, Endpoint: srv.URL, Version: "0.40.0", Stderr: &bytes.Buffer{}, Interactive: boolPtr(false)}
 
-	c := Init(cfg)
+	// Drained before it spools: appendEvent creates the file and then writes
+	// it, and a bare Init's startup drain could scan in that gap, claim the
+	// still-empty file, read nothing and remove it, so the write would land on
+	// an unlinked inode and nothing would ever POST. With the first drain over
+	// before Finish appends, the second Init below is provably the deliverer.
+	c := initDrained(t, cfg)
 	c.RecordCommand("status").Finish()
 
 	// A later invocation drains what the first one spooled.
