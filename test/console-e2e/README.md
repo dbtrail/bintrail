@@ -51,6 +51,7 @@ down.
 | timetravel (×6) | the reconstruct gate + baseline+deltas over a real fixture baseline (#970): event fold, baseline-only row, deleted row |
 | overview: window honesty (×2) | `buildOverview` window line uses the fetched window's own bounds, never `status.coverage` (#679/#686) |
 | storage: Create-baseline gates (×5) | the button's double-gate (#686): live enabled arm, destination-missing arm, capability-off arm; the fixture snapshot listed |
+| access profiles (×6) | the Settings > Access profiles page (#1445): reachable from the sidebar on a fresh index, the real forms author a flag, a profile and a deny rule onto the index, a refusal shows the shared message, and the Remove buttons take everything back off |
 | no uncaught JS errors | any thrown error over the whole drive |
 
 Adding a scenario: append an `ok(...)`/`bad(...)` block in `console_e2e.mjs`.

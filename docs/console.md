@@ -480,6 +480,50 @@ compact baseline summary card and links onward:
   `BINTRAIL_TELEMETRY`) or the `--telemetry` flag already controls it, the card
   says so and defers to that. See [TELEMETRY.md](./TELEMETRY.md).
 
+### The Access profiles page
+
+**Settings > Access profiles** authors the flags, profiles and rules that
+`--profile` enforces, from the browser. It is the console path beside the
+CLI verbs (`bintrail flag`, `bintrail profile`, `bintrail access`; see
+[server-identity.md](server-identity.md#rbac-flags)): the same code runs the
+validation and the writes, so a profile authored here is the rows the CLI
+would write, refused for the same reasons with the same words. The page is
+available on `serve` and on `watch` alike (it is not a daemon feature) and
+edits the **selected server's index**, the command-line entry included.
+
+Three panels, top to bottom:
+
+- **Flags** label a table (`schema.table`, column left empty) or one of its
+  columns with a name such as `pii` or `billing`. A flag on a whole table hides
+  the table from a profile that denies the flag; a flag on one column blanks
+  that column and leaves the rest of the row.
+- **Profiles** are named groups of people (`marketing`, `support`). Adding a
+  name that exists updates its description. Removing a profile removes its
+  rules with it (the page says how many before asking).
+- **Rules** say whether a profile may see what a flag covers. Only `deny`
+  changes what a query returns; `allow` records intent. Adding a rule for a
+  profile and flag that already have one replaces its permission.
+
+This is the one console write that lands in an index database (everything
+else the console writes is the local registry file and the daemon's live
+settings), so it runs under rules the tests pin:
+
+- reading the page needs `settings:read`; every change needs
+  `settings:write`, the permission that already governs console
+  administration, so a read-only auditor role sees the configuration and
+  none of the buttons;
+- a session that itself carries a data profile is refused every change,
+  whatever its permissions: it could lift its own redaction;
+- every change is recorded on the audit seam as `console/flag.add`,
+  `flag.remove`, `profile.add`, `profile.remove`, `access.add` or
+  `access.remove`, with the flag, profile or rule it named and the server it
+  targeted;
+- a change takes effect on a profiled session's next request: the console
+  drops that server's cached profile rules when it writes.
+
+An index created before the RBAC tables existed answers `422` here: the
+console cannot create tables on an index.
+
 ### The SQL panel (opt-in)
 
 The **Query in DuckDB** card above hands you a file to run in your *own* DuckDB.
@@ -1228,9 +1272,14 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `POST /api/sql` | Runs a read-only `SELECT` over the selected server's Parquet **inside the daemon**, in a locked-down DuckDB sandbox, returning `{columns, rows, row_count, truncated, elapsed_ms}` plus an optional `warnings` list (present when the session is missing the `events` view because `archive_state` could not be read; a failed statement carries the same note after the engine message). Opt-in (`BINTRAIL_CONSOLE_SQL_PANEL=1`) — `403` otherwise. `403` while a profile is active; `404` when archives are disabled or there is nothing to query; `422` for a non-`SELECT`, a statement error, or the timeout; `429` when another query is already running. Cancellation is by aborting the request. See [The SQL panel](#the-sql-panel-opt-in). |
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 | `GET /api/profiles` | RBAC data-profile **names** defined on the selected server's index: `{"profiles": ["..."]}`, sorted; empty on a legacy index without the table. Vocabulary for administration panels (e.g. a settings-surface profile picker) — never the rules or flagged tables/columns behind a name. |
+| `GET /api/access-profiles` | The selected server's access-profile configuration in one document: `{flags: [{schema, table, column, flag, created_at}], profiles: [{name, description, created_at}], rules: [{profile, flag, permission, created_at}]}` (`column` empty = a table-level flag). `settings:read`. `422` on an index without the RBAC tables. |
+| `POST /api/access-profiles/flags`, `.../flags/remove` | Add / remove a flag: `{flag, schema, table, column}` (`column` optional). `settings:write`; refused (`403`) for a session that carries a data profile. Answers with the full document. `400` with the CLI's own message on missing fields, `404` when the flag to remove is not there. |
+| `POST /api/access-profiles/profiles`, `.../profiles/remove` | Add (or re-describe) / remove a profile: `{name, description}`. Removing cascades to the profile's rules. Same permission, refusals and response as the flag verbs. |
+| `POST /api/access-profiles/rules`, `.../rules/remove` | Add (or replace the permission of) / remove a rule: `{profile, flag, permission}` with `permission` `allow` or `deny` (`400` otherwise, `404` for an unknown profile). Same permission, refusals and response as the flag verbs. |
 
 Every data endpoint (`status`, `schemas`, `events`, `recover`,
-`recover-cascade`, `capabilities`, `reconstruct`, `baselines`) targets the
+`recover-cascade`, `capabilities`, `reconstruct`, `baselines`,
+`access-profiles`) targets the
 server named by the `X-Bintrail-Server` request header; without the header they
 target the default entry (`storage` is the one process-global exception).
 Selection is stateless — concurrent clients can each target a different server.

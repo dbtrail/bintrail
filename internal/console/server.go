@@ -603,6 +603,18 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("POST /api/sql", s.recordAction("sql", s.handleSQLPanel))
 	api.HandleFunc("GET /api/storage", s.handleStorageInfo)
 	api.HandleFunc("GET /api/profiles", s.handleProfiles)
+	// Access profiles (#1445): author the flags, profiles and rules that a
+	// data profile enforces, on the selected server's index. The one console
+	// write that lands in an index database; see access_profiles_api.go for
+	// the rules it runs under. Every verb is a POST with a JSON body (a
+	// flag's key is four values, which have no place in a path).
+	api.HandleFunc("GET /api/access-profiles", s.handleAccessProfilesGet)
+	api.HandleFunc("POST /api/access-profiles/flags", s.recordAction("access-profiles", s.handleAccessFlagAdd))
+	api.HandleFunc("POST /api/access-profiles/flags/remove", s.recordAction("access-profiles", s.handleAccessFlagRemove))
+	api.HandleFunc("POST /api/access-profiles/profiles", s.recordAction("access-profiles", s.handleAccessProfileAdd))
+	api.HandleFunc("POST /api/access-profiles/profiles/remove", s.recordAction("access-profiles", s.handleAccessProfileRemove))
+	api.HandleFunc("POST /api/access-profiles/rules", s.recordAction("access-profiles", s.handleAccessRuleAdd))
+	api.HandleFunc("POST /api/access-profiles/rules/remove", s.recordAction("access-profiles", s.handleAccessRuleRemove))
 	// Usage-telemetry opt-out: read the machine-wide state, and toggle it (a
 	// local config write, not a data write). Every console daemon beacons
 	// (#1362), so every embedding binary wires a live TelemetryController —

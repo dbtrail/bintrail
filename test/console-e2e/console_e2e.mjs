@@ -888,6 +888,103 @@ try {
   // Time-travel-capable).
   await page.evaluate(async (id) => { await switchServer(id); }, byoId);
 
+  // Scenario 11ap — Access profiles (#1445): the flags/profiles/rules that a
+  // data profile enforces, authored through the REAL forms against byo-idx
+  // (its index was provisioned by `bintrail init`, so the three RBAC tables
+  // exist). Adds one column flag, one profile and one deny rule, reads the
+  // rows the page repaints from the server's document, then removes all
+  // three through their buttons (each asks first; the dialog is accepted
+  // here) so nothing is left behind for the scenarios after it. The page is
+  // NOT monitor-gated: it must be reachable through the sidebar, not only
+  // by navigate().
+  const acceptDialog = (d) => d.accept();
+  page.on("dialog", acceptDialog);
+  try {
+    const apNav = await page.evaluate(() => {
+      const a = document.querySelector('.nav-item[data-route="access-profiles"]');
+      if (!a) return { present: false };
+      const cs = getComputedStyle(a);
+      a.click();
+      return { present: true, visible: cs.display !== "none" && cs.visibility !== "hidden" };
+    });
+    (apNav.present && apNav.visible)
+      ? ok("access profiles: sidebar entry present and visible")
+      : bad("access profiles: sidebar entry present and visible", JSON.stringify(apNav));
+    await page.waitForSelector("#ap-flags", { timeout: 10000 });
+    const apEmpty = await page.evaluate(() => ({
+      flags: document.querySelectorAll("#ap-flags .ap-row").length,
+      profiles: document.querySelectorAll("#ap-profiles .ap-row").length,
+      rules: document.querySelectorAll("#ap-rules .ap-row").length,
+      ruleAddDisabled: !!document.querySelector('#ap-rule-form button[type="submit"]').disabled,
+    }));
+    (apEmpty.flags === 0 && apEmpty.profiles === 0 && apEmpty.rules === 0 && apEmpty.ruleAddDisabled)
+      ? ok("access profiles: fresh index renders three empty panels, Add rule disabled until a profile exists")
+      : bad("access profiles: fresh index renders three empty panels, Add rule disabled until a profile exists", JSON.stringify(apEmpty));
+
+    await page.fill('#ap-flag-form input[name="flag"]', "pii");
+    await page.fill('#ap-flag-form input[name="schema"]', FIX);
+    await page.fill('#ap-flag-form input[name="table"]', "customers");
+    await page.fill('#ap-flag-form input[name="column"]', "email");
+    await page.click('#ap-flag-form button[type="submit"]');
+    await page.waitForSelector("#ap-flags .ap-row", { timeout: 10000 });
+    await page.fill('#ap-profile-form input[name="name"]', "e2e-marketing");
+    await page.fill('#ap-profile-form input[name="description"]', "E2E profile");
+    await page.click('#ap-profile-form button[type="submit"]');
+    await page.waitForSelector("#ap-profiles .ap-row", { timeout: 10000 });
+    await page.selectOption('#ap-rule-form select[name="profile"]', "e2e-marketing");
+    await page.fill('#ap-rule-form input[name="flag"]', "pii");
+    await page.selectOption('#ap-rule-form select[name="permission"]', "deny");
+    await page.click('#ap-rule-form button[type="submit"]');
+    await page.waitForSelector("#ap-rules .ap-row", { timeout: 10000 });
+    const apRows = await page.evaluate(async (FIX) => {
+      const text = (sel) => Array.from(document.querySelectorAll(sel)).map((n) => n.textContent.replace(/\s+/g, " ").trim());
+      const doc = await api("/api/access-profiles");
+      return {
+        flagRows: text("#ap-flags .ap-row"),
+        profileRows: text("#ap-profiles .ap-row"),
+        ruleRows: text("#ap-rules .ap-row"),
+        wire: doc,
+        flagOK: doc.flags.length === 1 && doc.flags[0].schema === FIX && doc.flags[0].table === "customers" && doc.flags[0].column === "email" && doc.flags[0].flag === "pii",
+        ruleOK: doc.rules.length === 1 && doc.rules[0].profile === "e2e-marketing" && doc.rules[0].flag === "pii" && doc.rules[0].permission === "deny",
+      };
+    }, FIX);
+    (apRows.flagOK && apRows.ruleOK && apRows.wire.profiles.length === 1)
+      ? ok("access profiles: flag, profile and deny rule authored through the forms land on the index")
+      : bad("access profiles: flag, profile and deny rule authored through the forms land on the index", JSON.stringify(apRows.wire));
+    (apRows.flagRows.length === 1 && /customers/.test(apRows.flagRows[0]) && /email/.test(apRows.flagRows[0]) && /pii/.test(apRows.flagRows[0])
+      && apRows.profileRows.length === 1 && /e2e-marketing/.test(apRows.profileRows[0]) && /1 rule/.test(apRows.profileRows[0])
+      && apRows.ruleRows.length === 1 && /may not see/.test(apRows.ruleRows[0]) && /DENY/.test(apRows.ruleRows[0]))
+      ? ok("access profiles: the rows say what was authored (table, column, flag; rule count; may not see + DENY)")
+      : bad("access profiles: the rows say what was authored (table, column, flag; rule count; may not see + DENY)", JSON.stringify([apRows.flagRows, apRows.profileRows, apRows.ruleRows]));
+
+    // A refusal shows the server's own words (the shared package's, the
+    // words the command line refuses with) and writes nothing.
+    await page.fill('#ap-flag-form input[name="flag"]', "orphan");
+    await page.click('#ap-flag-form button[type="submit"]');
+    await page.waitForFunction(() => !document.getElementById("toast-error").hidden, { timeout: 5000 });
+    const apRefusal = await page.evaluate(async () => ({
+      toast: document.getElementById("toast-error").textContent,
+      flags: (await api("/api/access-profiles")).flags.length,
+    }));
+    (/schema is required/.test(apRefusal.toast) && apRefusal.flags === 1)
+      ? ok("access profiles: a refused add shows the shared message and writes nothing")
+      : bad("access profiles: a refused add shows the shared message and writes nothing", JSON.stringify(apRefusal));
+
+    // Tear down through the buttons: the rule, the profile, then the flag.
+    await page.click("#ap-rules .ap-row button");
+    await page.waitForFunction(() => document.querySelectorAll("#ap-rules .ap-row").length === 0, { timeout: 10000 });
+    await page.click("#ap-profiles .ap-row button");
+    await page.waitForFunction(() => document.querySelectorAll("#ap-profiles .ap-row").length === 0, { timeout: 10000 });
+    await page.click("#ap-flags .ap-row button");
+    await page.waitForFunction(() => document.querySelectorAll("#ap-flags .ap-row").length === 0, { timeout: 10000 });
+    const apAfter = await page.evaluate(() => api("/api/access-profiles"));
+    (apAfter.flags.length === 0 && apAfter.profiles.length === 0 && apAfter.rules.length === 0)
+      ? ok("access profiles: the Remove buttons take the rule, the profile and the flag back off the index")
+      : bad("access profiles: the Remove buttons take the rule, the profile and the flag back off the index", JSON.stringify(apAfter));
+  } finally {
+    page.off("dialog", acceptDialog);
+  }
+
   // Scenario 12 — Events renders real rows, and the redaction contract holds
   // end-to-end (#970): query_text/query_hash are captured index data that must
   // NEVER reach the browser (#699 — the canary is IN the seeded UPDATE row),

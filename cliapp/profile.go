@@ -1,12 +1,13 @@
 package cliapp
 
 import (
+	"errors"
 	"fmt"
 	"text/tabwriter"
-	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/accessprofiles"
 	"github.com/dbtrail/dbtrail/internal/config"
 )
 
@@ -57,14 +58,9 @@ func runProfileAdd(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	_, err = db.ExecContext(cmd.Context(), `
-		INSERT INTO profiles (name, description)
-		VALUES (?, ?)
-		ON DUPLICATE KEY UPDATE description = VALUES(description)`,
-		name, proDescription,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to add profile: %w", err)
+	// The same code the console's Access profiles page runs (#1445).
+	if err := accessprofiles.AddProfile(cmd.Context(), db, accessprofiles.Profile{Name: name, Description: proDescription}); err != nil {
+		return err
 	}
 
 	fmt.Printf("Profile %q added.\n", name)
@@ -89,15 +85,14 @@ func runProfileRemove(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	res, err := db.ExecContext(cmd.Context(), `DELETE FROM profiles WHERE name = ?`, name)
-	if err != nil {
-		return fmt.Errorf("failed to remove profile: %w", err)
-	}
-
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	err = accessprofiles.RemoveProfile(cmd.Context(), db, name)
+	var notFound *accessprofiles.ProfileNotFoundError
+	if errors.As(err, &notFound) {
 		fmt.Printf("Profile %q not found.\n", name)
 		return nil
+	}
+	if err != nil {
+		return err
 	}
 
 	fmt.Printf("Profile %q removed.\n", name)
@@ -120,34 +115,20 @@ func runProfileList(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	rows, err := db.QueryContext(cmd.Context(), `
-		SELECT name, COALESCE(description, ''), created_at
-		FROM profiles
-		ORDER BY name`)
+	profiles, err := accessprofiles.ListProfiles(cmd.Context(), db)
 	if err != nil {
-		return fmt.Errorf("failed to list profiles: %w", err)
+		return err
 	}
-	defer rows.Close()
 
 	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 	defer tw.Flush()
 	fmt.Fprintln(tw, "NAME\tDESCRIPTION\tCREATED")
 	fmt.Fprintln(tw, "────\t───────────\t───────")
 
-	n := 0
-	for rows.Next() {
-		var name, description string
-		var created time.Time
-		if err := rows.Scan(&name, &description, &created); err != nil {
-			return fmt.Errorf("failed to scan row: %w", err)
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\n", name, description, created.UTC().Format("2006-01-02 15:04:05"))
-		n++
+	for _, p := range profiles {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", p.Name, p.Description, p.CreatedAt.UTC().Format("2006-01-02 15:04:05"))
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("row iteration error: %w", err)
-	}
-	if n == 0 {
+	if len(profiles) == 0 {
 		fmt.Fprintln(cmd.OutOrStdout(), "No profiles found.")
 	}
 	return nil

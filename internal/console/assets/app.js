@@ -50,6 +50,10 @@ const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete"
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
 const ROUTES = ["overview", "events", "timetravel", "recover", "sql", "status", "storage", "connect",
+  // Access profiles (#1445): author the flags/profiles/rules a data profile
+  // enforces. Not monitor-gated: the standalone serve can author too, the
+  // write goes to the selected server's index, not to daemon state.
+  "access-profiles",
   // Protect (#1384): baselines and verification used to be two of three panels
   // on Settings > Storage. They are operations that produce and validate
   // recovery artifacts, not settings, and the snapshot list is unbounded in
@@ -878,6 +882,7 @@ function renderRoute() {
     case "baselines": return renderBaselines();
     case "verification": return renderVerification();
     case "connect": return renderConnect();
+    case "access-profiles": return renderAccessProfiles();
     default: return renderOverview();
   }
 }
@@ -5789,6 +5794,208 @@ function buildConnect(servers, tokStatus, minted) {
   viewEnter();
 }
 
+// ── Access profiles (#1445) ──────────────────────────────────────────────────
+//
+// The flags, profiles and rules that `--profile` (and a session's data
+// profile) enforce, authored here instead of only from the command line.
+// Every mutation POSTs to the selected server's index and answers with the
+// whole document, which is what the page repaints from: it never shows what
+// it thinks it just did, only what the server now holds. Mutation controls
+// carry data-perm="settings:write" so a session without that permission does
+// not see buttons that would only 403.
+
+async function renderAccessProfiles() {
+  const gen = serverGen, vgen = viewGen;
+  viewLoading();
+  let doc;
+  try {
+    doc = await api("/api/access-profiles");
+  } catch (err) {
+    if (gen !== serverGen || vgen !== viewGen) return;
+    const v = VIEW(); clear(v); v.append(accessProfilesHead()); renderError(v, err);
+    return;
+  }
+  if (gen !== serverGen || vgen !== viewGen) return;
+  try {
+    buildAccessProfiles(doc);
+  } catch (err) {
+    const v = VIEW(); clear(v); v.append(accessProfilesHead()); renderError(v, err);
+  }
+}
+
+function accessProfilesHead() {
+  const sub = el("p", { class: "page-sub" },
+    "Decide who sees what. Label tables and columns with flags, group people into profiles, and deny a profile the flags it must not see. ",
+    "Queries run under that profile then skip those tables and blank those columns. ",
+    "These are the same settings the command line manages (CLI: bintrail flag, bintrail profile, bintrail access), stored in this server's index.");
+  return pageHead("Access profiles", sub);
+}
+
+function buildAccessProfiles(doc) {
+  const v = VIEW(); clear(v);
+  v.append(accessProfilesHead());
+  const stack = el("div", { class: "ap-stack", id: "ap-stack" });
+  stack.append(accessFlagsPanel(doc));
+  stack.append(accessProfilesPanel(doc));
+  stack.append(accessRulesPanel(doc));
+  v.append(stack);
+  // Nodes built after the capabilities fetch are not gated by it; gate them
+  // now, the same way a server switch re-gates the sidebar.
+  gatePermissions();
+  viewEnter();
+}
+
+// accessMutate posts one verb and repaints from the document it returns.
+// The server's own error text is shown as-is: it is the shared package's
+// message, the words the command line would refuse with.
+async function accessMutate(path, body, okMsg) {
+  let doc;
+  try {
+    doc = await api(path, { method: "POST", body });
+  } catch (err) {
+    toastError((err && err.message) || String(err));
+    return false;
+  }
+  if (okMsg) toast(okMsg);
+  buildAccessProfiles(doc);
+  return true;
+}
+
+function accessRemoveButton(label, onclick) {
+  return el("button", { class: "btn btn-sm btn-ghost", type: "button", text: label, "data-perm": "settings:write", onclick });
+}
+
+function accessField(label, input) {
+  return el("label", { class: "field" }, el("span", { class: "field-label", text: label }), input);
+}
+
+function accessInput(name, placeholder, opts) {
+  return el("input", Object.assign({ class: "input", name, placeholder, spellcheck: "false", autocomplete: "off" }, opts || {}));
+}
+
+// accessPanel is the shared frame: a titled panel with a count, a list of
+// rows (or an empty line), an add form and a one-line hint.
+function accessPanel(id, title, count, rows, emptyText, form, hint) {
+  const panel = el("section", { class: "ov-panel", id });
+  panel.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: title }),
+    el("span", { class: "chip chip-age", text: String(count) })));
+  const list = el("div", { class: "stg-list" });
+  if (!rows.length) list.append(el("div", { class: "ev-empty ap-empty", text: emptyText }));
+  rows.forEach((r) => list.append(r));
+  panel.append(list);
+  if (form) panel.append(form);
+  panel.append(el("p", { class: "form-hint stg-foot", text: hint }));
+  return panel;
+}
+
+function accessFlagsPanel(doc) {
+  const flags = doc.flags || [];
+  const rows = flags.map((f) => {
+    const row = el("div", { class: "stg-row ap-row" });
+    row.append(el("span", { class: "stg-name mono", text: f.schema + "." + f.table }));
+    row.append(el("span", { class: "stg-dest" + (f.column ? " mono" : " muted"), text: f.column || "whole table" }));
+    row.append(el("span", { class: "chip chip-tt", text: f.flag }));
+    row.append(accessRemoveButton("Remove", () => {
+      const where = f.schema + "." + f.table + (f.column ? " (" + f.column + ")" : "");
+      if (!window.confirm("Remove the flag " + f.flag + " from " + where + "? Every deny on " + f.flag + " stops covering it.")) return;
+      accessMutate("/api/access-profiles/flags/remove",
+        { flag: f.flag, schema: f.schema, table: f.table, column: f.column || "" },
+        "Flag " + f.flag + " removed from " + where + ".");
+    }));
+    return row;
+  });
+  const form = el("form", { class: "ap-form", id: "ap-flag-form", "data-perm": "settings:write" });
+  const name = accessInput("flag", "pii");
+  const schema = accessInput("schema", "shop");
+  const table = accessInput("table", "customers");
+  const column = accessInput("column", "leave empty for the whole table");
+  form.append(accessField("Flag", name), accessField("Schema", schema), accessField("Table", table), accessField("Column (optional)", column));
+  form.append(el("button", { class: "btn btn-sm btn-primary", type: "submit", text: "Add flag" }));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = { flag: name.value.trim(), schema: schema.value.trim(), table: table.value.trim(), column: column.value.trim() };
+    const where = body.schema + "." + body.table + (body.column ? " (" + body.column + ")" : "");
+    await accessMutate("/api/access-profiles/flags", body, "Flag " + body.flag + " added to " + where + ".");
+  });
+  return accessPanel("ap-flags", "Flags", flags.length, rows,
+    "No flags yet. A flag is a label like pii or billing on a table or on one column.", form,
+    "A flag on a whole table hides that table from any profile that denies the flag. A flag on one column blanks that column and leaves the rest of the row. (CLI: bintrail flag add)");
+}
+
+function accessProfilesPanel(doc) {
+  const profiles = doc.profiles || [];
+  const rules = doc.rules || [];
+  const rows = profiles.map((p) => {
+    const n = rules.filter((r) => r.profile === p.name).length;
+    const row = el("div", { class: "stg-row ap-row" });
+    row.append(el("span", { class: "stg-name", text: p.name }));
+    row.append(el("span", { class: "stg-dest" + (p.description ? "" : " muted"), text: p.description || "no description" }));
+    row.append(el("span", { class: "stg-age", text: n + (n === 1 ? " rule" : " rules") }));
+    row.append(accessRemoveButton("Remove", () => {
+      const tail = n ? " Its " + n + (n === 1 ? " rule goes" : " rules go") + " with it." : "";
+      if (!window.confirm("Remove the profile " + p.name + "?" + tail)) return;
+      accessMutate("/api/access-profiles/profiles/remove", { name: p.name }, "Profile " + p.name + " removed.");
+    }));
+    return row;
+  });
+  const form = el("form", { class: "ap-form", id: "ap-profile-form", "data-perm": "settings:write" });
+  const name = accessInput("name", "marketing");
+  const desc = accessInput("description", "Marketing analysts");
+  form.append(accessField("Profile", name), accessField("Description (optional)", desc));
+  form.append(el("button", { class: "btn btn-sm btn-primary", type: "submit", text: "Add profile" }));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = { name: name.value.trim(), description: desc.value.trim() };
+    await accessMutate("/api/access-profiles/profiles", body, "Profile " + body.name + " added.");
+  });
+  return accessPanel("ap-profiles", "Profiles", profiles.length, rows,
+    "No profiles yet. A profile is a named group of people, like marketing or support.", form,
+    "Queries run under a profile see only what its rules allow. Adding a profile that exists updates its description. (CLI: bintrail profile add)");
+}
+
+function accessRulesPanel(doc) {
+  const rules = doc.rules || [];
+  const profiles = doc.profiles || [];
+  const flagNames = Array.from(new Set((doc.flags || []).map((f) => f.flag))).sort();
+  const rows = rules.map((r) => {
+    const row = el("div", { class: "stg-row ap-row" });
+    row.append(el("span", { class: "stg-name", text: r.profile }));
+    row.append(el("span", { class: "stg-dest", text: r.permission === "deny" ? "may not see" : "may see" }));
+    row.append(el("span", { class: "chip chip-tt", text: r.flag }));
+    row.append(el("span", { class: "chip " + (r.permission === "deny" ? "chip-fail" : "chip-done"), text: r.permission.toUpperCase() }));
+    row.append(accessRemoveButton("Remove", () => {
+      const warn = r.permission === "deny" ? " People using that profile will see it again." : "";
+      if (!window.confirm("Remove the " + r.permission + " rule on " + r.flag + " for " + r.profile + "?" + warn)) return;
+      accessMutate("/api/access-profiles/rules/remove", { profile: r.profile, flag: r.flag },
+        "Rule on " + r.flag + " removed from " + r.profile + ".");
+    }));
+    return row;
+  });
+  const form = el("form", { class: "ap-form", id: "ap-rule-form", "data-perm": "settings:write" });
+  const profile = el("select", { class: "select", name: "profile" });
+  if (!profiles.length) profile.append(opt("", "add a profile first"));
+  profiles.forEach((p) => profile.append(opt(p.name, p.name)));
+  // Known flag names are offered; a rule may still name a flag no table
+  // carries yet, as the command line allows, so this stays a text field.
+  const flag = accessInput("flag", flagNames[0] || "pii", { list: "ap-flag-names" });
+  const datalist = el("datalist", { id: "ap-flag-names" });
+  flagNames.forEach((n) => datalist.append(opt(n, n)));
+  const perm = el("select", { class: "select", name: "permission" });
+  perm.append(opt("deny", "deny"), opt("allow", "allow"));
+  form.append(accessField("Profile", profile), accessField("Flag", flag), datalist, accessField("Permission", perm));
+  form.append(el("button", { class: "btn btn-sm btn-primary", type: "submit", text: "Add rule", disabled: !profiles.length }));
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = { profile: profile.value, flag: flag.value.trim(), permission: perm.value };
+    await accessMutate("/api/access-profiles/rules", body,
+      "Rule added: " + body.profile + (body.permission === "deny" ? " may not see " : " may see ") + body.flag + ".");
+  });
+  return accessPanel("ap-rules", "Rules", rules.length, rows,
+    "No rules yet. A rule says whether a profile may see the tables and columns that carry a flag.", form,
+    "Only deny changes what a profile sees. An allow rule records intent and changes nothing. Adding a rule for a pair that has one replaces its permission. (CLI: bintrail access add)");
+}
+
 // mintMCPToken generates (or rotates) the managed token, refreshes the
 // capability gate (the endpoint may have just become usable), and re-renders
 // the view with the plaintext displayed once.
@@ -6824,6 +7031,7 @@ function cmdkCommands() {
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Backups", run: () => navigate("baselines") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Verification", run: () => navigate("verification") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Storage", run: () => navigate("storage") });
+  cmds.push({ group: "Navigate", label: "Access profiles", run: () => navigate("access-profiles") });
   cmds.push({ group: "Navigate", label: "Connect AI", run: () => navigate("connect") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });
   if (capsCache.monitor) cmds.push({ group: "Actions", label: "Configure rotation…", run: () => { closeCmdk(); showRotationDialog(); } });

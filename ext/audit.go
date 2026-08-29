@@ -41,11 +41,17 @@ import (
 //     the routing target, prefixed so a sink cannot mistake it for
 //     a person.
 //   - "console" — query.run, recover.generate, recover.cascade,
-//     reconstruct.run, verify.explain, plus two refusals that
-//     are not data reads: authz.denied (the session's policy —
-//     or a managed MCP token's recorded mint-time grants —
-//     lacks a permission) and profile.denied (an unknown data
-//     profile, or a surface that cannot honor redaction).
+//     reconstruct.run, verify.explain, sql.run, baseline.download,
+//     plus two refusals that are not data reads: authz.denied
+//     (the session's policy — or a managed MCP token's recorded
+//     mint-time grants — lacks a permission) and profile.denied
+//     (an unknown data profile, or a surface that cannot honor
+//     redaction), plus the six access-profile authoring verbs,
+//     which change what a data profile withholds rather than
+//     read data: flag.add, flag.remove, profile.add,
+//     profile.remove, access.add, access.remove (each names the
+//     flag/profile/rule in Detail; flag.* also carry Schema and
+//     Table).
 //
 // Deliberately NOT audited, so the contract and the wiring agree:
 //

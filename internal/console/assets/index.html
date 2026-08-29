@@ -120,6 +120,13 @@
             <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3M15 7V3"/><path d="M6 7h12v5a6 6 0 0 1-12 0z"/><path d="M12 18v3"/></svg></span>
             <span>Connect AI</span>
           </a>
+          <!-- Access profiles (#1445) is NOT monitor-gated: it writes to the
+               selected server's index, which the standalone serve reaches as
+               well as the watch daemon does. -->
+          <a class="nav-item" data-route="access-profiles" href="/access-profiles">
+            <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 11h-6"/><path d="M19 8v6"/></svg></span>
+            <span>Access profiles</span>
+          </a>
           <a class="nav-item" data-route="storage" href="/storage" data-capability="monitor">
             <span class="ni-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/><path d="M4 12c0 1.66 3.58 3 8 3s8-1.34 8-3"/></svg></span>
             <span>Storage</span>

@@ -150,6 +150,18 @@ var apiRoutePerms = []routePerm{
 	// Data-profile NAMES on the selected server — access-control vocabulary
 	// for administration panels (settings-surface pickers), not row data.
 	{"GET", "/api/profiles", ext.PermSettingsRead},
+	// Authoring the access profiles themselves (#1445): reading the
+	// configuration is the settings surface; changing it is settings:write,
+	// the permission split off settings:read precisely so an auditor who may
+	// inspect administration cannot rewrite it. Literal-segment routes only,
+	// so order among them does not matter.
+	{"GET", "/api/access-profiles", ext.PermSettingsRead},
+	{"POST", "/api/access-profiles/flags", ext.PermSettingsWrite},
+	{"POST", "/api/access-profiles/flags/remove", ext.PermSettingsWrite},
+	{"POST", "/api/access-profiles/profiles", ext.PermSettingsWrite},
+	{"POST", "/api/access-profiles/profiles/remove", ext.PermSettingsWrite},
+	{"POST", "/api/access-profiles/rules", ext.PermSettingsWrite},
+	{"POST", "/api/access-profiles/rules/remove", ext.PermSettingsWrite},
 	// views.sql is a Settings/Storage artifact: it names paths and column
 	// names, never row data, so it reads like the storage panel it is offered
 	// from rather than like an events read.

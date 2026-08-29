@@ -1,13 +1,13 @@
 package cliapp
 
 import (
-	"database/sql"
+	"errors"
 	"fmt"
 	"text/tabwriter"
-	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dbtrail/dbtrail/internal/accessprofiles"
 	"github.com/dbtrail/dbtrail/internal/config"
 )
 
@@ -59,8 +59,11 @@ func init() {
 }
 
 func runAccessAdd(cmd *cobra.Command, args []string) error {
-	if aclPermission != "allow" && aclPermission != "deny" {
-		return fmt.Errorf("--permission must be \"allow\" or \"deny\", got %q", aclPermission)
+	// Validated by the shared code before any connection is opened, so a bad
+	// --permission is refused without a database (and without one in tests).
+	rule := accessprofiles.Rule{Profile: aclProfile, Flag: aclFlag, Permission: aclPermission}
+	if err := accessprofiles.ValidateRule(rule); err != nil {
+		return cliRuleError(err)
 	}
 
 	db, err := config.Connect(aclIndexDSN)
@@ -69,27 +72,24 @@ func runAccessAdd(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	var profileID int64
-	err = db.QueryRowContext(cmd.Context(), `SELECT id FROM profiles WHERE name = ?`, aclProfile).Scan(&profileID)
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("profile %q not found", aclProfile)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to look up profile: %w", err)
-	}
-
-	_, err = db.ExecContext(cmd.Context(), `
-		INSERT INTO access_rules (profile_id, flag, permission)
-		VALUES (?, ?, ?)
-		ON DUPLICATE KEY UPDATE permission = VALUES(permission)`,
-		profileID, aclFlag, aclPermission,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to add access rule: %w", err)
+	// The same code the console's Access profiles page runs (#1445).
+	if err := accessprofiles.AddRule(cmd.Context(), db, rule); err != nil {
+		return cliRuleError(err)
 	}
 
 	fmt.Printf("Access rule added: profile=%q flag=%q permission=%s\n", aclProfile, aclFlag, aclPermission)
 	return nil
+}
+
+// cliRuleError spells the shared permission refusal the way the command line
+// names the field: "--permission must be ...". The message is the shared one;
+// only the dashes are the CLI's.
+func cliRuleError(err error) error {
+	var bad *accessprofiles.InvalidPermissionError
+	if errors.As(err, &bad) {
+		return fmt.Errorf("--%w", err)
+	}
+	return err
 }
 
 // ─── access remove ────────────────────────────────────────────────────────────
@@ -115,20 +115,14 @@ func runAccessRemove(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	res, err := db.ExecContext(cmd.Context(), `
-		DELETE ar FROM access_rules ar
-		JOIN profiles p ON ar.profile_id = p.id
-		WHERE p.name = ? AND ar.flag = ?`,
-		aclProfile, aclFlag,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to remove access rule: %w", err)
-	}
-
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	err = accessprofiles.RemoveRule(cmd.Context(), db, aclProfile, aclFlag)
+	var notFound *accessprofiles.RuleNotFoundError
+	if errors.As(err, &notFound) {
 		fmt.Printf("Access rule not found: profile=%q flag=%q\n", aclProfile, aclFlag)
 		return nil
+	}
+	if err != nil {
+		return err
 	}
 
 	fmt.Printf("Access rule removed: profile=%q flag=%q\n", aclProfile, aclFlag)
@@ -155,41 +149,20 @@ func runAccessList(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	q := `SELECT p.name, ar.flag, ar.permission, ar.created_at
-	      FROM access_rules ar
-	      JOIN profiles p ON ar.profile_id = p.id`
-	var qargs []any
-	if aclListProfile != "" {
-		q += " WHERE p.name = ?"
-		qargs = append(qargs, aclListProfile)
-	}
-	q += " ORDER BY p.name, ar.flag"
-
-	rows, err := db.QueryContext(cmd.Context(), q, qargs...)
+	rules, err := accessprofiles.ListRules(cmd.Context(), db, aclListProfile)
 	if err != nil {
-		return fmt.Errorf("failed to list access rules: %w", err)
+		return err
 	}
-	defer rows.Close()
 
 	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 	defer tw.Flush()
 	fmt.Fprintln(tw, "PROFILE\tFLAG\tPERMISSION\tCREATED")
 	fmt.Fprintln(tw, "───────\t────\t──────────\t───────")
 
-	n := 0
-	for rows.Next() {
-		var profile, flag, permission string
-		var created time.Time
-		if err := rows.Scan(&profile, &flag, &permission, &created); err != nil {
-			return fmt.Errorf("failed to scan row: %w", err)
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", profile, flag, permission, created.UTC().Format("2006-01-02 15:04:05"))
-		n++
+	for _, r := range rules {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", r.Profile, r.Flag, r.Permission, r.CreatedAt.UTC().Format("2006-01-02 15:04:05"))
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("row iteration error: %w", err)
-	}
-	if n == 0 {
+	if len(rules) == 0 {
 		fmt.Fprintln(cmd.OutOrStdout(), "No access rules found.")
 	}
 	return nil

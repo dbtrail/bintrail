@@ -213,6 +213,41 @@ var Required = []Requirement{
 		Owner: OwnerConsoleUnit,
 		Why:   "handing the operator a full copy of a baseline snapshot's row data (the backup tar download)",
 	},
+	// Access-profile authoring from the console (#1445): not data reads but
+	// changes to WHAT a data profile withholds, written to the selected
+	// server's index. Who removed the deny rule on the pii flag is exactly
+	// the question an auditor asks after a redacted column shows up in a
+	// scoped user's results.
+	{
+		Pair:  Pair{Surface: "console", Action: "flag.add"},
+		Owner: OwnerConsoleUnit,
+		Why:   "labeling a table or column with a flag from the console",
+	},
+	{
+		Pair:  Pair{Surface: "console", Action: "flag.remove"},
+		Owner: OwnerConsoleUnit,
+		Why:   "removing a flag from a table or column: every deny rule on that flag stops covering it",
+	},
+	{
+		Pair:  Pair{Surface: "console", Action: "profile.add"},
+		Owner: OwnerConsoleUnit,
+		Why:   "creating (or re-describing) a data profile from the console",
+	},
+	{
+		Pair:  Pair{Surface: "console", Action: "profile.remove"},
+		Owner: OwnerConsoleUnit,
+		Why:   "deleting a data profile and, with it, every rule it carried",
+	},
+	{
+		Pair:  Pair{Surface: "console", Action: "access.add"},
+		Owner: OwnerConsoleUnit,
+		Why:   "adding or flipping a profile's allow/deny rule on a flag",
+	},
+	{
+		Pair:  Pair{Surface: "console", Action: "access.remove"},
+		Owner: OwnerConsoleUnit,
+		Why:   "removing a profile's rule on a flag: a removed deny stops redacting",
+	},
 }
 
 // RequiredFor returns the pairs owner must exercise.

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Access profiles from the console** (#1445). A Settings > Access profiles
+  page authors the flags on tables and columns, the named profiles and the
+  allow/deny rules that `--profile` enforces, against the server selected in
+  the sidebar (the command-line entry included), on `serve` and `watch`
+  alike. The validation and the writes are one shared package,
+  `internal/accessprofiles`, which the `bintrail flag`, `profile` and
+  `access` verbs now call too, so a profile authored in either place is the
+  same rows and is refused with the same words. The page and its routes
+  (`GET /api/access-profiles` plus six `POST` verbs under it) need
+  `settings:read` to view and `settings:write` to change; a session that
+  carries a data profile is refused every change, whatever its permissions;
+  each change is audited as `console/flag.add`, `flag.remove`,
+  `profile.add`, `profile.remove`, `access.add` or `access.remove`; and a
+  change reaches a profiled session on its next request (the console drops
+  that server's cached rules when it writes).
 - **`bintrail export iceberg`** (#1466). Writes each table's current state as
   an Apache Iceberg table under `--warehouse`, incrementally: the first run
   loads the newest baseline snapshot, every run after that folds the events

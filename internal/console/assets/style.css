@@ -1947,6 +1947,20 @@ button { font-family: inherit; }
 .stg-hint { margin-bottom: 0; }
 .stg-cardfoot { margin-top: 12px; }
 
+/* ── Access profiles (#1445): three stacked panels, each a list plus an
+   inline add form. The form is a flex row of fields that wraps on narrow
+   viewports; the submit button sits on the fields' baseline. ── */
+.ap-stack { display: grid; gap: 18px; }
+.ap-row .stg-dest { flex: 1; }
+.ap-empty { padding: 18px 0; text-align: left; }
+.ap-form {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+  padding: 8px 14px 4px; border-top: 1px solid var(--line-soft);
+}
+.ap-form .field { width: 168px; }
+.ap-form .field .input, .ap-form .field .select { width: 100%; height: 34px; padding: 6px 10px; }
+.ap-form .btn { height: 34px; }
+
 /* Storage empty states: lead + short steps, not paragraphs. Same brand-moment
    treatment as .empty (these are the onboarding surfaces), lighter-weight
    because they sit inside a panel rather than standing alone. */
