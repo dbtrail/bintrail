@@ -52,13 +52,14 @@ import (
 //     pre-formatted string when useDecimal is false, which is the
 //     bintrail default; baseline stores DECIMAL as parquet.String, so
 //     both sides agree byte-for-byte)
+//   - binary, varbinary, blob family — bytes; BINARY(n) padding trimmed (#1155)
 //
-// PK columns with any other type (FLOAT, DOUBLE, BINARY, VARBINARY, BLOB,
-// BIT, JSON, spatial types) are rejected at ReconstructTable entry with a
-// hard error. Fixing those types requires modifying event.BuildPKValues
-// or internal/baseline/reader_sql.go — both are non-additive changes to
-// data already on disk — so they're deferred behind separate follow-up
-// issues.
+// PK columns with any other type (FLOAT, DOUBLE, TIME, BIT, JSON, spatial
+// types) are rejected at ReconstructTable entry with a hard error;
+// supportedPKType in pk_canonicalize.go is the authoritative list. Adding a
+// type means verifying its round-trip between event.BuildPKValues and the
+// baseline Parquet end to end, so each is deferred behind its own follow-up
+// issue.
 //
 // UPDATE events that mutate the primary key itself cannot be folded safely:
 // the change map is keyed by the before-image PK, so a changed PK would emit

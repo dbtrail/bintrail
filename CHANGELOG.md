@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The console's telemetry card shows the exact sample event** (#1447). The
+  Usage telemetry card (Settings > Storage) gains a folded "Show a sample
+  event" section with the JSON one event would carry, byte for byte as
+  `bintrail telemetry show` prints it. Both surfaces render it through one
+  function (`telemetry.SampleEventJSON`), pinned by a test that compares the
+  console payload with the command's output, so the card can never drift into
+  a hand-maintained copy. Read-only; opening it sends nothing.
 - **`bintrail export iceberg`** (#1466). Writes each table's current state as
   an Apache Iceberg table under `--warehouse`, incrementally: the first run
   loads the newest baseline snapshot, every run after that folds the events
@@ -47,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   range cannot use the key index, so it scans the partitions the time filters
   keep: the help text says so and points at `--since`/`--until`. See
   docs/query-and-recovery.md.
+- **The Connect page shows the time-travel SQL port** (#1446). Settings →
+  Connect AI gains a "Connect a SQL client" panel for the embedded
+  MySQL-protocol port (`bintrail-console watch --flashback-listen`). With the
+  port open it shows the listen address, the user rule (the server picked in
+  the sidebar, by its registry name or id), the password rule (the console
+  token, never displayed) and a ready-to-copy `mysql` line for that server.
+  With the port off it says so and names the flag and environment variable
+  that open it, as daemon configuration; the standalone `serve` console says
+  the port belongs to `watch`. Backed by a new read-only `GET /api/flashback`
+  (`{enabled, listen, host, port}`, `settings:read`; `host` is empty on a
+  wildcard bind, so the page fills in the name it was opened with). Display
+  only: the console never opens or closes the port.
 
 ### Changed
 - **Usage telemetry classifies first-run failures** (#1503). A fresh install
@@ -71,6 +90,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`binlog_parse`, `flag_invalid`, `network`) are removed from the taxonomy
   and from `docs/TELEMETRY.md`. The wire format and `schema_version` are
   unchanged.
+
+### Fixed
+- **The console's capture-health detail no longer names tables a restricted
+  session cannot read** (#1452). `GET /api/status` served
+  `capture_health.skipped[*].tables` and the explanation prose built from
+  them to every session that may see the health verdict, and those name the
+  tables whose capture stopped. Every other listing already withholds a table
+  name from a session with a data profile or with per-role access rules, so
+  this was the one inventory left: a session allowed only `app.users` could
+  read the name of every table with a capture skip.
+  The names now pass through the same rule the table pickers use, per name:
+  a denied table, or one outside the session's allow list, is dropped from
+  the list and from the explanation, which is rebuilt from the filtered
+  ledger rather than left carrying the names. The counts do not change (a
+  count is not a name), and the entry says how many names it is not showing:
+  `tables_withheld` on the wire, and "app.users and 2 tables outside your
+  access" in the prose. A reason whose every table is withheld still gets its
+  sentence, in the singular when it is one table. An unrestricted session, and
+  `bintrail status`, render the ledger exactly as before.
+  Two other fields of the same payload can still carry a table name and are
+  not filtered by this change: `stream.source_health.replica_identity_not_full`
+  (PostgreSQL sources) and `files[].error_message` (file-index mode).
+  One change beyond the names: to resolve the scope, `/api/status` now looks
+  the session's data profile up on the selected server, as the events and
+  schema listings do. A session whose profile is not defined on that server
+  gets a 403 there too (and a 500 if the lookup itself fails), where it used
+  to be served unscoped. On a console with several servers, a profile
+  defined on one server and not on another now refuses the status page for
+  the second one.
 
 ## [0.70.0] - 2026-08-28
 
