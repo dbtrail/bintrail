@@ -12,7 +12,8 @@ by default**; pass `--order DESC` for newest-first. With no filters it returns
 the first `--limit` events in that order. The same filter set powers
 `bintrail recover` and the MCP `query` tool.
 
-Filters: `--schema`, `--table`, `--pk`, `--event-type`, `--gtid`,
+Filters: `--schema`, `--table`, `--pk`, `--pk-min` / `--pk-max` (an inclusive
+key range, see below), `--event-type`, `--gtid`,
 `--since` / `--until`, `--changed-column` (events that touched a given column),
 `--column-eq` (events where a column has a given value — see below), and
 `--flag` (tables/columns labeled via [RBAC flags](server-identity.md)). A
@@ -112,6 +113,46 @@ Internally this translates to `JSON_TYPE(JSON_EXTRACT(..., '$.deleted_at')) = 'N
 The literal value `NULL` is reserved as the JSON-null sentinel — there is currently no escape for matching a column whose value is the four-character string `"NULL"`. If you need that, file an issue.
 
 The same filter is applied to DuckDB when archive auto-discovery routes the query through Parquet files (`json_extract_string` / `json_type`), so merged (live + archive) results stay consistent.
+
+### Primary key ranges: `--pk-min` / `--pk-max`
+
+`--pk` and `--pks` match exact keys. To ask for "every event on ids 1000
+through 1999" (a burst of inserted ids, everything after a known cutoff row),
+pass an inclusive range instead:
+
+```sh
+bintrail query --schema mydb --table orders --pk-min 1000 --pk-max 1999 \
+  --since "2026-02-19 14:00:00" --until "2026-02-19 15:00:00"
+```
+
+Either bound works alone. The same flags exist on `recover`, where they scope
+the reversal to the keys in the range, and the MCP `query` and `recover` tools
+take them as `pk_min` / `pk_max`.
+
+Three rules keep the answer honest:
+
+- **Single-column integer keys only.** The command reads the table's key from
+  the schema snapshot before it runs anything. A composite key, or a
+  `DECIMAL`, `FLOAT`, string or binary key, is refused with the table's
+  actual key shape (`range filters need a single integer primary key; this
+  table's is (a, b)`), never answered by string order. `--schema` and
+  `--table` are required for that lookup, and the range cannot be combined
+  with `--pk` or `--pks`.
+- **Signedness comes from the column.** `pk_values` is stored as text, so a
+  bare comparison would say `9 > 10`. Both engines cast it to a 64-bit
+  integer whose signedness matches the column (`CAST(... AS SIGNED)` or
+  `UNSIGNED` on the live index, `BIGINT` or `UBIGINT` over the Parquet
+  archives), so a negative key on a signed column and a key above 2^63 on an
+  unsigned one both compare correctly, and live and archived results agree.
+  A bound the column cannot hold (a negative bound on an unsigned key, a
+  bound above 2^63-1 on a signed one) is refused before the query.
+- **It scans.** The cast cannot use the key index, so within the partitions
+  `--since`/`--until` keep it reads every event of the table. That is fine
+  for an incident window and expensive across a whole retention period, so
+  pair a range with a time window.
+
+PostgreSQL snapshots do not record the column type the check needs, so the
+range is refused on a PostgreSQL-sourced index.
 
 ### Output Formats
 
@@ -491,7 +532,10 @@ bintrail recover-cascade --index-dsn "..." \
 
 To reverse a specific set of primary keys, pass `--pks` (comma-separated) instead
 of a single `--pk`, and cap how many events are undone per key with
-`--limit-per-pk`. These compose with the shared event filters
+`--limit-per-pk`. To reverse every event on a contiguous run of integer keys,
+pass `--pk-min` / `--pk-max` instead (see
+[Primary key ranges](#primary-key-ranges---pk-min----pk-max); the same shape
+check and scan cost apply). These compose with the shared event filters
 (`--schema`/`--table`/`--event-type`/`--since`/`--until`/`--column-eq`/`--gtid`/`--flag`).
 For binary primary keys, each entry must use the stored `0x` uppercase-hex
 spelling — see [the `0x` hex spelling](#binary-primary-keys-the-0x-hex-spelling).

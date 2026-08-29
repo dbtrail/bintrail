@@ -57,6 +57,27 @@ const ROUTES = ["overview", "events", "timetravel", "recover", "sql", "status", 
   // restorable", roughly two screens below the fold.
   "baselines", "verification"];
 
+// DOCS_PAGES maps a route to its page on www.dbtrail.com/docs (#1450), the
+// separately authored docs site. NOT this repo's docs/*.md: the site does not
+// serve those, and it answers HTTP 200 with a small shell for ANY /docs/
+// path, so neither a repo file nor a status code proves a link resolves.
+// assets_docs_links_test.go pins this table exactly and, with
+// BINTRAIL_CHECK_DOCS_LINKS=1, fetches each page and checks its title.
+// pageHead renders one plain link beside the title. Nothing here fetches:
+// air-gapped consoles are a first-class deployment, and a link is inert
+// offline. A view without a page of its own gets NO link on purpose
+// (Overview, Status, SQL): a link to the docs index would teach people the
+// button is noise. Extension views are out of scope.
+const DOCS_BASE = "https://www.dbtrail.com/docs/";
+const DOCS_PAGES = {
+  events: "guides/recovery",
+  recover: "guides/recovery",
+  baselines: "guides/backup-strategy",
+  verification: "guides/verify",
+  storage: "guides/capacity-planning",
+  connect: "claude/setup",
+};
+
 const MON_STATE_TITLES = {
   failed: "connection is failing and retrying automatically; press Start for details",
   stalled: "connected, but hasn't made progress for several minutes",
@@ -71,6 +92,7 @@ const ICONS = {
   warn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
   calendar: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg>`,
   ext: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>`,
+  external: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"></path><path d="M20 4l-9 9"></path><path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4"></path></svg>`,
   refresh: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>`,
 };
 
@@ -784,8 +806,25 @@ function renderNotes(node, notes) {
 
 function badge(type) { return el("span", { class: "badge " + badgeClass(type), text: type }); }
 
+// docsLink is the page-header Docs link for a route (#1450), or null when
+// DOCS_PAGES has no page for it. A plain anchor: no request, no probe.
+function docsLink(route) {
+  const slug = DOCS_PAGES[route];
+  if (!slug) return null;
+  const a = el("a", { class: "page-docs", href: DOCS_BASE + slug + "/", target: "_blank", rel: "noopener",
+    title: "Open the docs for this page in a new tab" });
+  a.append(el("span", { text: "Docs" }), icon("external"));
+  return a;
+}
+
 function pageHead(title, subNode) {
-  const head = el("div", { class: "page-head" }, el("h1", { class: "page-title", text: title }));
+  // The route is read from the location on every call, so the link follows
+  // every route change and re-render, not only the first paint. It sits
+  // BESIDE the h1, not inside it: the title wears a clipped text gradient and
+  // is read as a heading, and "Events Docs" is not the page's name.
+  const row = el("div", { class: "page-title-row" },
+    el("h1", { class: "page-title", text: title }), docsLink(routeFromLocation()));
+  const head = el("div", { class: "page-head" }, row);
   if (subNode) head.append(subNode);
   return head;
 }
@@ -3723,6 +3762,8 @@ function buildStorage(serversRes, rotation, backupRefresh, storage, baselines, t
   cards.append(rotationCard(rotation));
   cards.append(backupRefreshCard(backupRefresh));
   cards.append(credentialsCard(storage));
+  const staging = stagingCard(storage, servers);
+  if (staging) cards.append(staging);
   cards.append(telemetryCard(telemetry));
   if (capsCache.views) cards.append(duckdbCard());
   cards.append(baselineSummaryCard(baselines, cur, { linkOnward: true }));
@@ -3971,6 +4012,41 @@ function credentialsCard(storage) {
   if (aws.web_identity) kvRow(adv, "EKS IRSA", "detected");
   card.append(adv);
   card.append(el("p", { class: "form-hint", text: "Note: an IAM role can still be active even if none of the signals above show as set." }));
+  return card;
+}
+
+// stagingCard shows the disk the sql-export staging holds right now (#1448):
+// every .sql backup built from the Backups page waits on the daemon's disk
+// for its download, and that space used to be invisible until someone ran
+// du. Null when this daemon cannot build .sql backups (no staging exists) or
+// when /api/storage failed (credentialsCard already reports that).
+function stagingCard(storage, servers) {
+  const stg = storage && storage.staging;
+  if (!stg) return null;
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Staged downloads" }));
+  const hours = Math.round(stg.ttl_hours || 0);
+  const builds = stg.builds || [];
+  if (!builds.length) {
+    card.append(el("p", { class: "stg-hint", text:
+      "Nothing staged. A .sql backup built from the Backups page waits here until it is downloaded or " +
+      hours + " hours pass, then it is removed." }));
+  } else {
+    card.append(el("p", { class: "stg-hint", text:
+      humanBytes(stg.bytes || 0) + " on this machine in " + builds.length + (builds.length === 1 ? " build" : " builds") +
+      (builds.some((b) => !b.bytes_known) ? " (not counting builds whose size could not be measured)" : "") +
+      ". Each is removed once downloaded, or " + hours + " hours after it finished." }));
+    for (const b of builds) {
+      const name = b.server_name || ((servers || []).find((s) => s.id === b.server_id) || {}).name || b.server_id;
+      let what;
+      if (b.staging_error) what = "could not be removed or read: " + b.staging_error;
+      else if (b.state === "running") what = "building" + (b.at ? " as of " + utcLabel(b.at) : "");
+      else if (b.state === "failed") what = "failed build, being removed";
+      else what = "ready" + (b.at ? " as of " + utcLabel(b.at) : "") + (b.expires_at ? ", removed at " + utcLabel(b.expires_at) + " if not downloaded" : "");
+      const size = b.bytes_known ? humanBytes(b.bytes || 0) : "size unknown";
+      kvRow(card, name, size + ", " + what);
+    }
+  }
+  kvRow(card, "location", stg.dir || "");
   return card;
 }
 
@@ -5005,8 +5081,11 @@ async function startBackupRestore(id, at, btn, msgEl) {
 // backupSQLExportCard offers the made-to-measure .sql backup: pick any past
 // moment, the console folds the nearest earlier backup forward to it and
 // packages the result as plain SQL files. Unlike the point-in-time restore it
-// publishes NOTHING: the build lives in a staging directory until the next
-// build (or a daemon restart) replaces it.
+// publishes NOTHING: the build lives in a staging directory until it is
+// downloaded, until its download deadline passes (the status carries
+// expires_at), or until the next build or a daemon restart replaces it
+// (#1448). The two terminal states after that, "downloaded" and "expired",
+// both mean the same thing to the operator: the file is gone, build again.
 // S3-backed backups qualify too (the fold engine reads them directly), which
 // is why this card has no b.kind === "dir" gate.
 function backupSQLExportCard(cur, b, sqlSt) {
@@ -5035,9 +5114,31 @@ function backupSQLExportCard(cur, b, sqlSt) {
   } else if (st && st.state === "succeeded") {
     const dl = el("button", { class: "btn", type: "button", text: "Download .sql backup (.tar.gz)" });
     dl.onclick = () => downloadSQLExport(cur.id, dl, st.bytes || 0);
-    body.append(el("div", { class: "bk-restore-row" },
+    const row = el("div", { class: "bk-restore-row" },
       el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") +
-        (st.bytes ? " (" + humanBytes(st.bytes) + ")" : "") + "." }), dl));
+        (st.bytes ? " (" + humanBytes(st.bytes) + " on this machine)" : "") + "." }));
+    if (!st.removal_owed) row.append(dl);
+    body.append(row);
+    body.append(el("p", { class: "form-hint", text:
+      (st.expires_at ? "The download stays available until " + utcLabel(st.expires_at) + ". " : "") +
+      "The file is removed from this machine once you download it, when that time passes, or when a new build starts." }));
+    details.open = true;
+  } else if (st && st.state === "downloaded") {
+    body.append(el("p", { class: "form-hint", text:
+      "Downloaded" + (st.downloaded_at ? " at " + utcLabel(st.downloaded_at) : "") +
+      ": the backup as of " + utcLabel(st.at || "") + " was handed over and its file was removed from this machine. Build again for another copy." }));
+    details.open = true;
+  } else if (st && st.state === "expired") {
+    body.append(el("p", { class: "form-hint", text:
+      "The backup built for " + utcLabel(st.at || "") + " is no longer on this machine: it was not downloaded before its deadline, or its files were removed. Build again for a fresh copy." }));
+    details.open = true;
+  }
+  // The state follows the disk: a removal that failed keeps the build in
+  // its previous state and says so here, over a download button that would
+  // only answer "not ready".
+  if (st && st.staging_error) {
+    body.append(el("p", { class: "form-msg err", text:
+      "Staging problem: " + st.staging_error + ". The daemon retries every minute; check the staging directory on the machine running it." }));
     details.open = true;
   }
   details.append(body);

@@ -155,7 +155,11 @@ type BaselineRestoreRequest struct {
 }
 
 type BaselineStatus struct {
-	State      string `json:"state"` // idle | running | succeeded | failed
+	// State: idle | running | succeeded | failed, plus two terminal states
+	// only a sql-export build reaches once its staged files are gone —
+	// downloaded (the archive reached a client) and expired (the download
+	// deadline passed, or the files were removed from under it).
+	State      string `json:"state"`
 	Since      string `json:"since,omitempty"`
 	FinishedAt string `json:"finished_at,omitempty"`
 	LastError  string `json:"last_error,omitempty"`
@@ -177,6 +181,23 @@ type BaselineStatus struct {
 	// represents; it publishes no snapshot). Empty on dump jobs (the anchor
 	// is chosen mid-run).
 	At string `json:"at,omitempty"`
+	// ExpiresAt (sql-export builds only, RFC3339 UTC) is when a finished
+	// build is removed from the daemon's disk unless downloaded first; the
+	// Backups page shows it as the download deadline.
+	ExpiresAt string `json:"expires_at,omitempty"`
+	// DownloadedAt (sql-export builds only, RFC3339 UTC) stamps the
+	// download that consumed the build.
+	DownloadedAt string `json:"downloaded_at,omitempty"`
+	// StagingError (sql-export builds only) says why the staged files are
+	// still on disk when they should not be (a removal that failed and is
+	// retried every minute) or why they could not be read. Empty when fine.
+	StagingError string `json:"staging_error,omitempty"`
+	// RemovalOwed (sql-export builds only) is true while THIS build's own
+	// removal has been decided and has not succeeded yet: its files are
+	// still on disk but it is no longer downloadable. A StagingError about
+	// a previous build (one this build's start could not clear) leaves it
+	// false, and the build stays downloadable.
+	RemovalOwed bool `json:"removal_owed,omitempty"`
 	// Refused counts tables a refresh declined to fold (gap / schema change).
 	// A refresh that refuses every table is not a failure of the daemon — it is
 	// a correct fail-closed verdict — so it reports succeeded=false with this
