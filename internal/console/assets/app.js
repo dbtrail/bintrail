@@ -5717,7 +5717,7 @@ function buildSchemaChangeRows(container, changes, filtered, withheld) {
     // (USE app; ALTER TABLE users ...) records none, so show the table alone
     // rather than ".users".
     row.append(el("span", { class: "ev-table", text: c.schema_name ? c.schema_name + "." + c.table_name : c.table_name,
-      title: c.schema_name ? "" : "Schema not recorded: the statement did not name it" }));
+      title: c.schema_name ? null : "Schema not recorded: the statement did not name it" }));
     row.append(el("span", {}, scBadge(c.ddl_type)));
     row.append(el("span", { class: "sc-pos", text: c.binlog_file + ":" + c.binlog_pos }));
     row.append(withheld
