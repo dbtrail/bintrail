@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 
 	"github.com/dbtrail/dbtrail/internal/telemetry"
@@ -91,6 +92,12 @@ type telemetryStateDTO struct {
 	// the config file from here would not change what happens. The UI disables
 	// the toggle and explains which control is in charge.
 	Overridden bool `json:"overridden"`
+	// SampleEvent is the exact JSON one event would carry, pretty-printed, as
+	// `bintrail telemetry show` prints it (#1447). Both surfaces render it
+	// through telemetry.SampleEventJSON, so the card can never drift from the
+	// CLI into a hand-maintained illustration. Empty only if rendering failed,
+	// which the UI reports instead of showing a blank block.
+	SampleEvent string `json:"sample_event"`
 }
 
 func (s *Server) telemetryState() telemetryStateDTO {
@@ -112,6 +119,14 @@ func (s *Server) telemetryState() telemetryStateDTO {
 		dec = telemetry.Resolve("", "")
 	}
 
+	// The event struct holds only ints, bools and strings, so this cannot
+	// fail in practice; the branch exists because the encoder's contract has
+	// an error and swallowing one here would blank the section silently.
+	sample, err := telemetry.SampleEventJSON()
+	if err != nil {
+		slog.Warn("console: could not render the telemetry sample event", "error", err)
+	}
+
 	return telemetryStateDTO{
 		Reporting:   reporting,
 		Consent:     dec.Enabled,
@@ -121,6 +136,7 @@ func (s *Server) telemetryState() telemetryStateDTO {
 		Overridden: dec.Source == telemetry.SourceDoNotTrack ||
 			dec.Source == telemetry.SourceEnv ||
 			dec.Source == telemetry.SourceFlag,
+		SampleEvent: string(sample),
 	}
 }
 
