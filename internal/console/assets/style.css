@@ -2087,6 +2087,14 @@ button { font-family: inherit; }
 .cn-links { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
 .cn-snippet { display: block; margin: 8px 0 10px; white-space: pre; }
 .cn-other .form-hint { margin-top: 8px; }
+.cn-sql-body { padding: 0 14px 14px; }
+.cn-sql-row { margin: 0 0 8px; font-size: 13px; color: var(--ink-2); }
+.cn-sql-row code { font-family: var(--f-mono); font-size: 12px; }
+.cn-sql .cn-fine { margin-top: 4px; }
+
+/* Telemetry sample event (#1447): the daemon's bytes, shown as they are. */
+.tel-sample { margin-top: 12px; }
+.tel-sample-pre { display: block; margin: 8px 0 0; white-space: pre; }
 
 /* ============================================================
    date/time picker (Since/Until/At filters)

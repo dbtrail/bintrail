@@ -14,8 +14,9 @@ import (
 // overview card (#1194): "any point between delta_from and delta_to is
 // restorable", plus how far behind capture is and whether the range has
 // holes. The DELTA half is metadata-only (timestamps and verdicts, no row
-// data) and carries no profile gate, like /api/status. The FULL-TABLE half
-// is derived from the baseline listing — the surface /api/baselines refuses
+// data) and carries no profile gate (/api/status keeps its verdict for every
+// session and scopes only its capture-health table names, #1452). The
+// FULL-TABLE half is derived from the baseline listing — the surface /api/baselines refuses
 // to a profiled session (#1075: baseline reads aren't redacted, and
 // broken_tables is a table-name inventory) — so it is gated by the SAME
 // sessionRestricted rule. Capture-health drops (#1034) are deliberately not

@@ -602,7 +602,8 @@ func (h *Handler) fullTableTextCell(schema, table, column string, v any) any {
 // fixed BINARY(n)'s trailing-0x00 storage padding; this matcher cannot (a
 // string-bound WHERE has no width to pad to), so binary keys stay out and keep
 // falling back to the binlog-only path. Types reconstruct rejects outright
-// (FLOAT, BIT, JSON, spatial) are likewise not listed and fall back too —
+// (FLOAT, DOUBLE, TIME, BIT, JSON, spatial — see reconstruct.SupportedPKType)
+// are likewise not listed and fall back too —
 // for MySQL-family sources. A PostgreSQL source bypasses this matcher entirely
 // (its data_type is "" and its baseline is raw text — see runSnapshotPointInTime).
 func baselinePKStringMatchable(dataType string) bool {

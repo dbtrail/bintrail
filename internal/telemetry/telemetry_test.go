@@ -933,16 +933,29 @@ func TestNilSafety(t *testing.T) {
 	s.Finish()
 }
 
+// deliveryCeiling bounds how long TestEndToEndDelivery waits for the background
+// drain to reach the endpoint. It is deliberately generous: the test waits on
+// the delivery itself, so on a loaded runner this costs latency, never a
+// failure, and only a genuine hang trips it (#1502). It is not a performance
+// assertion; the drain's own budget is drainDeadline, and a local round trip
+// that outruns THAT is what the failure message points at.
+const deliveryCeiling = 30 * time.Second
+
 // TestEndToEndDelivery exercises the whole path: a first run spools, a second
 // run drains and delivers over HTTP.
 func TestEndToEndDelivery(t *testing.T) {
 	clearEnv(t)
-	var mu sync.Mutex
-	var body []byte
+	// The handler hands the body over on a channel so the test blocks on the
+	// delivery rather than polling the clock. Buffered and non-blocking: claim-
+	// by-rename delivers each batch once, but the handler must never stall a
+	// drainer if a second POST ever arrives after the test has stopped reading.
+	delivered := make(chan []byte, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		body, _ = readAll(r)
+		b, _ := readAll(r)
+		select {
+		case delivered <- b:
+		default:
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -950,25 +963,24 @@ func TestEndToEndDelivery(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{Dir: dir, Endpoint: srv.URL, Version: "0.40.0", Stderr: &bytes.Buffer{}, Interactive: boolPtr(false)}
 
-	c := Init(cfg)
+	// Drained before it spools: appendEvent creates the file and then writes
+	// it, and a bare Init's startup drain could scan in that gap, claim the
+	// still-empty file, read nothing and remove it, so the write would land on
+	// an unlinked inode and nothing would ever POST. With the first drain over
+	// before Finish appends, the second Init below is provably the deliverer.
+	c := initDrained(t, cfg)
 	c.RecordCommand("status").Finish()
 
 	// A later invocation drains what the first one spooled.
 	Init(cfg)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		got := len(body)
-		mu.Unlock()
-		if got > 0 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	var body []byte
+	select {
+	case body = <-delivered:
+	case <-time.After(deliveryCeiling):
+		t.Fatalf("nothing delivered to the endpoint within %v: the startup drain never reached it (a hang, or the POST outran drainDeadline=%v and was abandoned)", deliveryCeiling, drainDeadline)
 	}
-	mu.Lock()
-	defer mu.Unlock()
 	if len(body) == 0 {
-		t.Fatal("nothing delivered to the endpoint")
+		t.Fatal("endpoint received an empty body")
 	}
 	var e Event
 	if err := json.Unmarshal([]byte(strings.SplitN(strings.TrimSpace(string(body)), "\n", 2)[0]), &e); err != nil {

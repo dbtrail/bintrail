@@ -645,9 +645,11 @@ func TestRunReconstruct_fullTableRoundTrip_decimalPK(t *testing.T) {
 
 // TestRunReconstruct_rejectsRemainingUnsupportedPKTypes pins the hard-error
 // path at ReconstructTable entry for the PK types that #214 did NOT land and
-// #1155 did not either: BIT and JSON. Each has a real on-disk representation
-// mismatch between the indexer's pk_values format and the baseline Parquet
-// column (see pk_canonicalize.go doc comment).
+// #1155 did not either: FLOAT, DOUBLE, TIME, BIT and JSON. Their round-trip
+// between the indexer's pk_values format and the baseline Parquet column is
+// unverified (see the pk_canonicalize.go doc comment), which is reason enough
+// to refuse: a silent wrong match on a primary-key join is worse than a
+// refusal.
 //
 // This test is the regression guard against a future drive-by "add one
 // more type to supportedPKType" PR that would silently produce wrong
@@ -665,6 +667,9 @@ func TestRunReconstruct_rejectsRemainingUnsupportedPKTypes(t *testing.T) {
 	}{
 		{"bit", "bit", "bit(8)"},
 		{"json", "json", "json"},
+		{"float", "float", "float"},
+		{"double", "double", "double"},
+		{"time", "time", "time"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -750,8 +755,20 @@ func TestRunReconstruct_rejectsRemainingUnsupportedPKTypes(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error for %s PK, got nil", tc.dataType)
 			}
-			if !strings.Contains(err.Error(), tc.dataType) {
-				t.Errorf("expected error to mention %q, got: %v", tc.dataType, err)
+			// Match the QUOTED type in the refusal, not the bare token: the
+			// schema name derives from tc.name, so a bare Contains is
+			// satisfied by "pkfloat.t" alone and would pass even if the
+			// message named a different type (#1455).
+			if !strings.Contains(err.Error(), `has type "`+tc.dataType+`"`) {
+				t.Errorf("expected error to name the column's type %q, got: %v", tc.dataType, err)
+			}
+			for _, other := range []string{"bit", "json", "float", "double", "time"} {
+				if other == tc.dataType {
+					continue
+				}
+				if strings.Contains(err.Error(), `has type "`+other+`"`) {
+					t.Errorf("error names a different refused type (%s), got: %v", other, err)
+				}
 			}
 			// #1461: the full-table refusal now renders the SHARED
 			// reconstruct.PKTypeGateReason sentence, so this asserts the
