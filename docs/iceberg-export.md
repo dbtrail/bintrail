@@ -205,10 +205,11 @@ defaults to the conservative 2 threads and 4 GB; `--ultrafast` is available
 here because the process is yours. The budget covers the baseline scan and
 the archive reads of the event window.
 
-Every commit that wrote rows (a first load, or a delta with at least one
-change) is recorded in the audit trail as `cli/export.iceberg`, after the
-commit is durable. A properties-only commit and an `unchanged` table record
-nothing.
+Every commit is recorded in the audit trail as `cli/export.iceberg`, after
+the commit is durable: a first load (including one of a baseline with zero
+rows, which creates the table and its cursor and has no snapshot to name, so
+the event carries `rows: 0` and no `snapshot_id`) and a delta with at least
+one change. An `unchanged` table commits nothing and records nothing.
 
 ## Flags
 

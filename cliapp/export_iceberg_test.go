@@ -108,7 +108,7 @@ func TestWriteExportJSON_shape(t *testing.T) {
 	// A zero-row load is a loaded table with a cursor and a location and
 	// no snapshot: the key is absent, not 0 (#1509).
 	third := tables[2].(map[string]any)
-	if third["verdict"] != "loaded" || third["rows_loaded"].(float64) != 0 || third["cursor"] == "" || third["location"] == "" {
+	if third["verdict"] != "loaded" || third["rows_loaded"].(float64) != 0 || third["cursor"] != "binlog.000001:100 at 2026-08-28T11:00:00Z" || third["location"] != "/w/shop/empty" {
 		t.Fatalf("third = %v", third)
 	}
 	if _, ok := third["snapshot_id"]; ok {
