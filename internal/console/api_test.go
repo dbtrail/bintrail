@@ -698,3 +698,31 @@ func TestFilterTablesAndSchemas(t *testing.T) {
 		t.Error("a fully-filtered schema list must never be nil on the wire")
 	}
 }
+
+// TestTableVisibleIsFilterTables pins that the capture-health name predicate
+// (#1452) IS the picker filter applied per name — same asymmetry, same
+// answers — and that an empty scope yields nil so the ledger renders verbatim.
+func TestTableVisibleIsFilterTables(t *testing.T) {
+	if tableVisible(nil, nil) != nil {
+		t.Fatal("an empty scope must yield a nil predicate (verbatim rendering, no tables_withheld)")
+	}
+	deny := []query.SchemaTable{{Schema: "App", Table: "Secrets"}}
+	allow := []query.SchemaTable{{Schema: "app", Table: "users"}}
+	for _, tc := range []struct {
+		deny, allow   []query.SchemaTable
+		schema, table string
+		want          bool
+	}{
+		{deny, nil, "app", "secrets", false}, // deny is case-insensitive
+		{deny, nil, "app", "users", true},
+		{nil, allow, "app", "users", true},
+		{nil, allow, "app", "Users", false}, // allow is exact
+		{nil, allow, "hr", "users", false},
+	} {
+		got := tableVisible(tc.deny, tc.allow)(tc.schema, tc.table)
+		want := len(filterTables(tc.schema, []string{tc.table}, tc.deny, tc.allow)) == 1
+		if got != tc.want || got != want {
+			t.Errorf("tableVisible(%s.%s) = %v, want %v (filterTables says %v)", tc.schema, tc.table, got, tc.want, want)
+		}
+	}
+}

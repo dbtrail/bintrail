@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -454,6 +455,17 @@ func SampleEvent() Event {
 		IsInteractive:  isInteractive(os.Stderr),
 		RunID:          uuid.NewString(),
 	}
+}
+
+// SampleEventJSON renders SampleEvent the way `bintrail telemetry show` prints
+// it: two-space indented, no trailing newline. It is the ONE renderer behind
+// every "inspect the payload" surface (the CLI command and the console's
+// telemetry card), so the fields and their form cannot differ between them.
+// The VALUES are the rendering process's own: each call draws a fresh run_id,
+// and a daemon's version, is_release or is_interactive can legitimately differ
+// from the operator's local CLI.
+func SampleEventJSON() ([]byte, error) {
+	return json.MarshalIndent(SampleEvent(), "", "  ")
 }
 
 // Span measures one command invocation. A nil *Span is safe and inert.

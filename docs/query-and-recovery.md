@@ -78,7 +78,7 @@ Three things to know:
   ([#1159](https://github.com/dbtrail/dbtrail/issues/1159)). The one surface
   without the reconciler is `--baseline-only`, which never opens the index and
   so has no declared width to pad to — pass the full-width `HEX()` form there.
-  `FLOAT`/`DOUBLE`, `BIT`, `JSON` and spatial primary keys remain unsupported.
+  `FLOAT`/`DOUBLE`, `TIME`, `BIT`, `JSON` and spatial primary keys remain unsupported.
 
 ### `--column-eq` Filter
 
