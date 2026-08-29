@@ -159,6 +159,10 @@ var apiRoutePerms = []routePerm{
 	{"GET", "/api/mcp-token", ext.PermSettingsRead},
 	{"POST", "/api/mcp-token", ext.PermSettingsRead},
 	{"DELETE", "/api/mcp-token", ext.PermSettingsRead},
+	// The time-travel port's address is daemon configuration shown on the
+	// Connect page, beside the MCP token status: settings vocabulary, no row
+	// data, and never the token that authenticates the port.
+	{"GET", "/api/flashback", ext.PermSettingsRead},
 
 	// The capabilities oracle and the session's own auth self-management: any
 	// authenticated session, regardless of policy.

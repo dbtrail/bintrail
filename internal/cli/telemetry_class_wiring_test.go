@@ -12,6 +12,10 @@ import (
 	"github.com/dbtrail/dbtrail/internal/telemetry/telemetrytest"
 )
 
+// deliveryCeiling bounds how long the wiring test waits for a background
+// delivery. Only a genuine hang trips it; a slow machine costs latency.
+const deliveryCeiling = 30 * time.Second
+
 // classedErr stands in for a producer's typed refusal.
 type classedErr struct{}
 
@@ -48,7 +52,13 @@ func TestTelemetryHookRecordsTheCommandsClass(t *testing.T) {
 		t.Fatal("Execute must return the command's error")
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
+	// The poll returns the moment the body lands; the ceiling only bounds a
+	// genuine hang. It is generous on purpose: a daemon tick, a drain and a
+	// POST all run in the background, and a fixed few-second budget for them
+	// is what fails a loaded release runner (#1502). The collecting handler
+	// lives in the shared telemetrytest helper, which is why this waits on
+	// bodies() rather than on a channel of its own.
+	deadline := time.Now().Add(deliveryCeiling)
 	for time.Now().Before(deadline) {
 		for _, b := range bodies() {
 			if strings.Contains(b, `"error_class":"config_invalid"`) && strings.Contains(b, `"command":"stream"`) {
@@ -57,5 +67,5 @@ func TestTelemetryHookRecordsTheCommandsClass(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("no delivered event carried error_class=config_invalid for stream; bodies: %v", bodies())
+	t.Fatalf("no delivered event carried error_class=config_invalid for stream within %v; bodies: %v", deliveryCeiling, bodies())
 }
