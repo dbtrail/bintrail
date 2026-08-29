@@ -100,6 +100,12 @@ jobs:
         continue-on-error: true
 
       - name: Unit tests
+        # BINTRAIL_REQUIRE_DUCKDB_ICEBERG=1: the Iceberg export tests read
+        # their tables back with DuckDB's iceberg extension, which the
+        # embedded engine installs from the network on first use. Required
+        # here so that leg never silently skips in CI.
+        env:
+          BINTRAIL_REQUIRE_DUCKDB_ICEBERG: "1"
         run: go test ./... -race -count=1
 
   integration:
@@ -129,6 +135,9 @@ jobs:
       # coverage of the flagship capture->index->query->recover pipeline.
       # Mirrors BINTRAIL_REQUIRE_MARIADB / BINTRAIL_REQUIRE_POSTGRES (#949).
       BINTRAIL_REQUIRE_MYSQL: "1"
+      # The Iceberg export's integration leg reads its tables back with
+      # DuckDB's iceberg extension; require it so the read-back never skips.
+      BINTRAIL_REQUIRE_DUCKDB_ICEBERG: "1"
 
     steps:
       # Step-level (not job-level) `if:` — see the note on the `changes` job.
