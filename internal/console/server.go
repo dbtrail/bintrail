@@ -189,6 +189,17 @@ type Config struct {
 	// for the layered posture). Off by default; the callers wire it from
 	// BINTRAIL_CONSOLE_SQL_PANEL=1, mirroring the baseline-trigger opt-in.
 	SQLPanel bool
+	// FlashbackListen is the address the embedded MySQL-protocol time-travel
+	// port (#996) is bound on, reported by GET /api/flashback so the Connect
+	// page can show how to reach it (#1446). Set ONLY by `bintrail-console
+	// watch --flashback-listen`, which refuses to start when that bind fails,
+	// so a non-empty value is an address that was bound at startup. It is
+	// NOT a liveness signal: a mid-run serve failure on that port is logged
+	// and swallowed (startFlashbackPort), and nothing here re-probes it.
+	// Empty on the standalone serve (which owns no such port) and on a watch
+	// that did not opt in; the page then reports the port as off. Display
+	// only: the console never opens or closes the port itself.
+	FlashbackListen string
 }
 
 // RotationDefaults is the daemon-side built-in-rotation policy, surfaced to the
@@ -322,6 +333,9 @@ type Server struct {
 	// servers need no initialization).
 	sqlPanel     bool
 	sqlPanelBusy atomic.Bool
+	// flashbackListen: the embedded time-travel port's bind address
+	// (Config.FlashbackListen); empty = the port is off (or this is serve).
+	flashbackListen string
 }
 
 // serverHeader selects the target server per request. Selection is stateless —
@@ -500,6 +514,7 @@ func New(cfg Config) (*Server, error) {
 		mcpTokenPath:            mcpTokenPath,
 		sessionProfiles:         newProfileRuleCache(),
 		sqlPanel:                cfg.SQLPanel,
+		flashbackListen:         cfg.FlashbackListen,
 		archiveFetcher:          parquetquery.Fetch,
 	}
 	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
@@ -676,6 +691,10 @@ func (s *Server) buildHandler() http.Handler {
 	api.HandleFunc("GET /api/mcp-token", s.handleMCPTokenGet)
 	api.HandleFunc("POST /api/mcp-token", s.handleMCPTokenGenerate)
 	api.HandleFunc("DELETE /api/mcp-token", s.handleMCPTokenRevoke)
+	// Embedded time-travel port (#1446): where it listens and whether it is
+	// on, so the Connect page can show a ready-to-copy mysql line. Read-only;
+	// the token that authenticates the port is never serialized.
+	api.HandleFunc("GET /api/flashback", s.handleFlashbackGet)
 
 	root := http.NewServeMux()
 	root.HandleFunc("GET /api/healthz", s.handleHealthz) // unauthenticated liveness

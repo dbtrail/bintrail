@@ -28,10 +28,22 @@ func assertStr(t *testing.T, name, got, want string) {
 }
 
 func TestUpConsoleConfig(t *testing.T) {
-	cfg, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok", BaselineDir: "/baselines", BaselineS3: "s3://bucket/prefix/", AuthFile: "/auth.yaml", TLSCert: "/c.pem", TLSKey: "/k.pem", AllowedHosts: []string{"console.internal"}})
+	cfg, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok", BaselineDir: "/baselines", BaselineS3: "s3://bucket/prefix/", AuthFile: "/auth.yaml", TLSCert: "/c.pem", TLSKey: "/k.pem", AllowedHosts: []string{"console.internal"}, FlashbackListen: "127.0.0.1:3308"})
 	if err != nil {
 		t.Fatalf("upConsoleConfig: %v", err)
 	}
+	// The time-travel port's address reaches the console verbatim (#1446), so
+	// GET /api/flashback reports the bind the daemon is serving; and the
+	// resolved flag global is what upConsoleOpts snapshots into it.
+	if cfg.FlashbackListen != "127.0.0.1:3308" {
+		t.Errorf("FlashbackListen=%q, want verbatim pass-through", cfg.FlashbackListen)
+	}
+	prevFB := upConsoleFlashbackListen
+	upConsoleFlashbackListen = "[::]:13308"
+	if got := upConsoleOpts().FlashbackListen; got != "[::]:13308" {
+		t.Errorf("upConsoleOpts().FlashbackListen=%q, want the --flashback-listen value", got)
+	}
+	upConsoleFlashbackListen = prevFB
 	if cfg.DBName != "binlog_index" {
 		t.Errorf("DBName = %q, want binlog_index", cfg.DBName)
 	}

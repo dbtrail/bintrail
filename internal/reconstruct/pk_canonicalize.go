@@ -104,8 +104,14 @@ import (
 // one — a false match on a primary-key lookup, which is strictly worse than
 // the miss it would be curing.
 //
-// BIT, JSON and the spatial family remain unsupported: they are not part of
-// #1155's shape and each has its own upstream representation question.
+// Every other type is refused — FLOAT/DOUBLE, TIME, BIT, JSON and the spatial
+// family among them. supportedPKTypes is the authoritative list; the switch
+// below mirrors it arm for arm, and
+// TestCanonicalizePKValue_everySupportedTypeHasAnArm walks that same slice so
+// a type admitted by the gates can never fall into the default branch. None
+// of the refused types was part of #1155's shape; their round-trip between
+// the indexer's pk_values and the baseline Parquet is unverified, not
+// known-bad.
 func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("canonicalizePKValue: nil PK value for column %q (MySQL forbids NULL in PK columns; baseline row may be missing the column after schema drift)", col.Name)
@@ -164,7 +170,26 @@ func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 		return canonicalizeDate(raw, col)
 
 	default:
-		return nil, fmt.Errorf("canonicalizePKValue: column %q has unsupported PK type %q (BIT/JSON/spatial PK types are not supported because the indexer and baseline-writer representations diverge on disk; file a follow-up issue if you need one)", col.Name, col.DataType)
+		// Render through PKTypeGateReason, the renderer verify and single-row
+		// reconstruct gate with, rather than a message of this switch's own:
+		// the one it used to carry drifted (#1455), hardcoding
+		// "BIT/JSON/spatial" as the refused set while FLOAT/DOUBLE/TIME were
+		// refused too, so those keys were blamed on a family they are not in.
+		// Nothing here claims WHY a type is refused — the round-trip is
+		// unverified for it, which is not the same as known-bad.
+		//
+		// An EMPTY DataType keeps PKTypeGateReason's wrong-index-database
+		// verdict on purpose (#1009/#1198): it is the PostgreSQL snapshot
+		// shape. Of the callers that can carry one, cascade Phase-2 refuses a
+		// PG-shaped table upstream at fkFilterSafe, which rejects the same
+		// empty type token on the FK column. The Iceberg export gates with
+		// FirstUnsupportedPKType, which skips the empty type on purpose, and
+		// reads no source flavor either, so it is the one path where this
+		// verdict names a check that did not run; the export does not claim
+		// PostgreSQL support (docs/iceberg-export.md), so that stays a
+		// wording gap, not a wrong refusal.
+		return nil, fmt.Errorf("canonicalizePKValue: %s; file a follow-up issue if you need this type",
+			PKTypeGateReason(col, "the baseline merge", "canonicalize"))
 	}
 }
 
@@ -504,6 +529,37 @@ func CanonicalizePKMap(row map[string]any, pkCols []metadata.ColumnMeta) (map[st
 	return canonicalizePKMap(row, pkCols)
 }
 
+// supportedPKTypes is THE list of PK column types canonicalizePKValue
+// handles, and the only place it is written down (#1455 — the refusal message
+// used to keep a second copy of its complement, and that copy drifted). Tests
+// iterate this slice rather than restating it, so a token added here without
+// a matching arm in canonicalizePKValue's switch fails
+// TestCanonicalizePKValue_everySupportedTypeHasAnArm instead of shipping a
+// type every gate admits and the merge then refuses per row.
+//
+// #1155. BLOB-family PKs reach here as prefix keys (MySQL requires a prefix
+// length on a BLOB/TEXT index), which does not change the canonicalization:
+// both the index and the baseline carry the FULL column value, and only the
+// index definition is truncated.
+var supportedPKTypes = []string{
+	"int", "integer", "smallint", "tinyint", "mediumint", "bigint",
+	"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
+	"enum", "set",
+	"datetime", "timestamp", "date",
+	"year",
+	"decimal", "numeric",
+	"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob",
+}
+
+// supportedPKTypeSet is supportedPKTypes as a lookup set, built once.
+var supportedPKTypeSet = func() map[string]struct{} {
+	m := make(map[string]struct{}, len(supportedPKTypes))
+	for _, t := range supportedPKTypes {
+		m[t] = struct{}{}
+	}
+	return m
+}()
+
 // supportedPKType returns true if dataType is in the set of PK column types
 // that canonicalizePKValue handles correctly. Callers use this at the start
 // of a reconstruct run to warn operators about edge cases.
@@ -513,21 +569,6 @@ func CanonicalizePKMap(row map[string]any, pkCols []metadata.ColumnMeta) (map[st
 // full COLUMN_TYPE. MySQL's DATA_TYPE never contains the "unsigned"
 // qualifier — that lives in COLUMN_TYPE.
 func supportedPKType(dataType string) bool {
-	dt := strings.ToLower(strings.TrimSpace(dataType))
-	switch dt {
-	case "int", "integer", "smallint", "tinyint", "mediumint", "bigint",
-		"char", "varchar", "text", "tinytext", "mediumtext", "longtext",
-		"enum", "set",
-		"datetime", "timestamp", "date",
-		"year",
-		"decimal", "numeric",
-		// #1155. BLOB-family PKs reach here as prefix keys (MySQL requires a
-		// prefix length on a BLOB/TEXT index), which does not change the
-		// canonicalization: both the index and the baseline carry the FULL
-		// column value, and only the index definition is truncated.
-		"binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob":
-		return true
-	default:
-		return false
-	}
+	_, ok := supportedPKTypeSet[strings.ToLower(strings.TrimSpace(dataType))]
+	return ok
 }

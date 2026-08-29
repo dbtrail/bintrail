@@ -116,8 +116,9 @@ func (p *Provider) BaselineChildren(ctx context.Context, schema, table, fkCol, p
 	// PostgreSQL snapshot signature, #533). Nothing on the cascade path reads
 	// the recorded source flavor, so the wrong-path verdict PKTypeGateReason
 	// renders for an empty type would name a cause this code cannot know. A
-	// PG-shaped snapshot therefore keeps reaching the per-row canonicalizer
-	// and its transient caveat, exactly as before.
+	// PG-shaped snapshot does not reach the per-row canonicalizer from here
+	// anyway: fkFilterSafe below rejects the same empty type token on the FK
+	// column first.
 	if c, found := reconstruct.FirstUnsupportedPKType(tm.PKColumnMetas()); found {
 		return cascade.BaselineLookup{}, false, reconstruct.PKTypeRefusalError(
 			fmt.Sprintf("baseline scan of %s.%s", schema, table),
