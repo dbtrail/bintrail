@@ -172,19 +172,22 @@ func canonicalizePKValue(raw any, col metadata.ColumnMeta) (any, error) {
 	default:
 		// Render through PKTypeGateReason, the renderer verify and single-row
 		// reconstruct gate with, rather than a message of this switch's own:
-		// the one
-		// it used to carry drifted (#1455), hardcoding "BIT/JSON/spatial" as
-		// the refused set while FLOAT/DOUBLE/TIME were refused too, so those
-		// keys were blamed on a family they are not in. Nothing here claims
-		// WHY a type is refused — the round-trip is unverified for it, which
-		// is not the same as known-bad.
+		// the one it used to carry drifted (#1455), hardcoding
+		// "BIT/JSON/spatial" as the refused set while FLOAT/DOUBLE/TIME were
+		// refused too, so those keys were blamed on a family they are not in.
+		// Nothing here claims WHY a type is refused — the round-trip is
+		// unverified for it, which is not the same as known-bad.
 		//
 		// An EMPTY DataType keeps PKTypeGateReason's wrong-index-database
 		// verdict on purpose (#1009/#1198): it is the PostgreSQL snapshot
-		// shape, and every caller that can carry one gates before this point
-		// — cascade Phase-2, the only ungated caller, refuses a PG-shaped
-		// table upstream at fkFilterSafe, which rejects the same empty type
-		// token on the FK column.
+		// shape. Of the callers that can carry one, cascade Phase-2 refuses a
+		// PG-shaped table upstream at fkFilterSafe, which rejects the same
+		// empty type token on the FK column. The Iceberg export gates with
+		// FirstUnsupportedPKType, which skips the empty type on purpose, and
+		// reads no source flavor either, so it is the one path where this
+		// verdict names a check that did not run; the export does not claim
+		// PostgreSQL support (docs/iceberg-export.md), so that stays a
+		// wording gap, not a wrong refusal.
 		return nil, fmt.Errorf("canonicalizePKValue: %s; file a follow-up issue if you need this type",
 			PKTypeGateReason(col, "the baseline merge", "canonicalize"))
 	}

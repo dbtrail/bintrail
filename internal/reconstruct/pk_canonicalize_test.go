@@ -328,11 +328,6 @@ func TestCanonicalizePKValue_unsupportedTypeErrors(t *testing.T) {
 	}
 }
 
-// TestCanonicalizePKValue_emptyTypeIsNotTheWrongPathVerdict pins the PG-shaped
-// column (#1455 follow-up): an empty DataType reaches this switch on a
-// LEGITIMATE path — cascade Phase-2 has no SupportedPKType gate in front of it
-// and internal/cli hosts recover-cascade for bintrail-pg too — so the refusal
-// must not borrow PKTypeGateReason's wrong-index-database verdict, whose
 // TestCanonicalizePKValue_emptyTypeKeepsTheWrongPathVerdict pins the PG-shaped
 // column: an empty DataType is not a per-type limitation but the PostgreSQL
 // snapshot shape, and #1009/#1198 chose the wrong-index-database verdict for
