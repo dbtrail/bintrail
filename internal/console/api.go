@@ -889,11 +889,29 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if b == nil {
 		return
 	}
+	// The resolved deny/allow scope (startup floor + session profile + policy
+	// restrictions, #1449) decides which table NAMES the capture-health
+	// detail may carry (#1452): `capture_health.skipped[*].tables` and the
+	// explanation prose name the tables whose capture stopped, and a name is
+	// exactly what every other listing withholds from a restricted session.
+	// The counts stay whole — the health verdict is the floor a viewer-tier
+	// session exists for — only the names are scoped, through the same
+	// predicate the table pickers use, so there is one rule.
+	opts, err := s.applySessionProfile(r.Context(), r, b, query.Options{
+		DenyTables:    s.denyTables,
+		RedactColumns: s.redactCols,
+		ProfileActive: s.profileActive,
+	})
+	if err != nil {
+		writeSessionProfileError(w, r, err)
+		return
+	}
 	data, err := status.CollectStatus(r.Context(), b.db, b.dbName)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	data.TableVisible = tableVisible(opts.DenyTables, opts.AllowTables)
 	// Encode into a buffer first: status data is already in memory, so this is
 	// free and avoids committing a 200 then emitting a truncated body if the
 	// encode fails partway (mirrors handleRecover).
@@ -1016,6 +1034,22 @@ func filterTables(schema string, tables []string, deny, allow []query.SchemaTabl
 		out = append(out, t)
 	}
 	return out
+}
+
+// tableVisible turns the resolved deny/allow scope into the per-name predicate
+// status.ScopeCaptureSkips consumes (#1452), or nil when the scope withholds
+// nothing (the ledger then renders verbatim, with no tables_withheld key). It
+// is filterTables applied to one name at a time, NOT a second matcher: the
+// status page and the table pickers must agree on what a session may see,
+// including the asymmetry (exact allow, case-insensitive deny) that
+// filterTables documents.
+func tableVisible(deny, allow []query.SchemaTable) func(schema, table string) bool {
+	if len(deny) == 0 && len(allow) == 0 {
+		return nil
+	}
+	return func(schema, table string) bool {
+		return len(filterTables(schema, []string{table}, deny, allow)) == 1
+	}
 }
 
 // handleHealthz serves GET /api/healthz — an unauthenticated liveness probe.

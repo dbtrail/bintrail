@@ -135,7 +135,8 @@ func acknowledgementLine(skips map[string]CaptureSkipStat, snapshotAt time.Time)
 	if snapshotAt.IsZero() {
 		return "This warning does not clear on its own: the tally counts skips that happened, not skips " +
 			"still happening, so it stays after a successful fix. Confirm the fix by watching the count " +
-			"stop rising, then " + ackAdvice}
+			"stop rising, then " + ackAdvice
+	}
 	if SkipsPredateSnapshot(skips, snapshotAt) {
 		return "Nothing has been skipped since the current schema snapshot was taken (" +
 			snapshotAt.Format(TSFmt) + "). That is not proof the fix took hold — capture does not record " +
@@ -216,7 +217,7 @@ func remedyLine(reason string) string {
 			"Overview → \"Refresh schema snapshot\". On the command line: `bintrail snapshot --source-dsn " +
 			"<source> --index-dsn <index>`, then restart the stream so it picks the new snapshot up."
 	case CaptureSkipReasonTableExcludedFromSnapshot:
-		return "Fix: give each table listed above an explicit PRIMARY KEY on an InnoDB engine at the source. " +
+		return "Fix: give each table this reason covers an explicit PRIMARY KEY on an InnoDB engine at the source. " +
 			"Re-snapshotting is NOT the fix here — validation excludes these tables again every time, so a " +
 			"fresh snapshot would leave capture exactly as it is now."
 	case CaptureSkipReasonStatementFormatDML:
@@ -248,32 +249,88 @@ func logLine(reason string) string {
 	return s + "."
 }
 
+// ScopeCaptureSkips returns the ledger with every table name the reader may
+// not see removed and counted (#1452): for each reason, Tables keeps only the
+// "schema.table" names visible accepts, and TablesWithheld records how many
+// were dropped. Counts, timestamps and attribution are untouched — a count is
+// not a name. A nil predicate returns the input as is, so an unrestricted
+// reader renders the ledger verbatim with no copy made.
+//
+// The name is split at its first dot, which is how the capture daemon joined
+// it (parser.addLedgerTable). A name that does not split is withheld: this
+// filter decides what a restricted reader learns, and withholding more is the
+// safe direction.
+//
+// Every renderer consumes the RETURNED map: the explanation must be rebuilt
+// from the scoped ledger, never from the original, or the prose carries the
+// names the list was just cleared of.
+func ScopeCaptureSkips(skips map[string]CaptureSkipStat, visible func(schema, table string) bool) map[string]CaptureSkipStat {
+	if visible == nil {
+		return skips
+	}
+	out := make(map[string]CaptureSkipStat, len(skips))
+	for reason, st := range skips {
+		var kept []string
+		for _, name := range st.Tables {
+			schema, table, ok := strings.Cut(name, ".")
+			if ok && visible(schema, table) {
+				kept = append(kept, name)
+			}
+		}
+		st.TablesWithheld = len(st.Tables) - len(kept)
+		st.Tables = kept
+		out[reason] = st
+	}
+	return out
+}
+
 // namedTables renders the ledger's table names as the subject of a sentence, or
 // a neutral subject when the ledger has none. A ledger written before per-table
 // attribution has an EMPTY list, which must never render as "no tables" — the
 // tables exist, this index just cannot name them.
+//
+// Names withheld by the reader's data scope (TablesWithheld, #1452) are
+// rendered as a count, so the sentence stays honest about how many tables the
+// skip covers without naming one the reader may not read: "app.users and 2
+// tables outside your access". A reason whose every table is withheld is
+// still a fact worth a sentence — "1 table outside your access is missing
+// from the schema snapshot" — and must never fall into the legacy-ledger
+// wording, which claims the INDEX cannot name them.
 func namedTables(st CaptureSkipStat) string {
-	if len(st.Tables) == 0 {
+	if len(st.Tables) == 0 && st.TablesWithheld == 0 {
 		return "Rows of one or more tables (this index's ledger predates per-table attribution, so it cannot name them)"
 	}
-	names := strings.Join(st.Tables, ", ")
-	if st.TablesTruncated {
-		names += " and others"
+	subject := strings.Join(st.Tables, ", ")
+	if st.TablesWithheld > 0 {
+		withheld := fmt.Sprintf("%d tables outside your access", st.TablesWithheld)
+		if st.TablesWithheld == 1 {
+			withheld = "1 table outside your access"
+		}
+		if subject == "" {
+			subject = withheld
+		} else {
+			subject += " and " + withheld
+		}
 	}
-	return names
+	if st.TablesTruncated {
+		subject += " and others"
+	}
+	return subject
 }
 
 // isAre / hasHave keep the sentences grammatical for one table vs several, and
-// for the unnamed-tables subject (always plural).
+// for the unnamed-tables subject (always plural). A withheld table still
+// counts as a table for number agreement: the sentence is about it even when
+// it is not named.
 func isAre(st CaptureSkipStat) string {
-	if len(st.Tables) == 1 {
+	if len(st.Tables)+st.TablesWithheld == 1 {
 		return "is"
 	}
 	return "are"
 }
 
 func hasHave(st CaptureSkipStat) string {
-	if len(st.Tables) == 1 {
+	if len(st.Tables)+st.TablesWithheld == 1 {
 		return "has"
 	}
 	return "have"

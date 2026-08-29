@@ -3989,6 +3989,7 @@ function telemetryCard(t) {
   }
   if (!t.endpoint_set) {
     card.append(el("p", { class: "stg-hint", text: "This build sends no telemetry; no endpoint is compiled in." }));
+    card.append(telemetrySampleSection(t));
     return card;
   }
   card.append(el("p", { class: "stg-hint", text: t.reporting
@@ -4000,13 +4001,35 @@ function telemetryCard(t) {
       : t.decided_by === "BINTRAIL_TELEMETRY" ? "the BINTRAIL_TELEMETRY environment variable"
       : "the --telemetry flag";
     card.append(el("p", { class: "form-hint", text: "Set by " + by + " on the daemon, which overrides this toggle. Change it there." }));
+    card.append(telemetrySampleSection(t));
     return card;
   }
+  card.append(telemetrySampleSection(t));
   card.append(el("div", { class: "stg-cardfoot" },
     el("button", { class: "btn btn-sm", type: "button",
       text: t.consent ? "Turn telemetry off" : "Turn telemetry on",
       onclick: () => setTelemetry(!t.consent) })));
   return card;
+}
+
+// telemetrySampleSection folds the exact JSON one event would carry (#1447).
+// The text comes from the daemon verbatim (`sample_event`, rendered by the same
+// function the CLI's `telemetry show` prints through), so the card never
+// re-draws or re-orders it: it is a read-only <pre>, and JSON.stringify would
+// be a second renderer that could drift from the CLI. Opening it sends nothing.
+function telemetrySampleSection(t) {
+  const d = el("details", { class: "form-advanced tel-sample" },
+    el("summary", { class: "form-adv-summary", text: "Show a sample event" }));
+  if (!t.sample_event) {
+    d.append(el("p", { class: "form-hint", text:
+      "The daemon could not render the sample event. The command line prints the same event (CLI: bintrail telemetry show)." }));
+    return d;
+  }
+  d.append(el("p", { class: "form-hint", text:
+    "The exact event this machine would send, byte for byte, built by the same code the command line prints " +
+    "(CLI: bintrail telemetry show). Opening this sends nothing." }));
+  d.append(el("pre", { class: "stg-code tel-sample-pre", text: t.sample_event }));
+  return d;
 }
 
 async function setTelemetry(enabled) {
@@ -5874,6 +5897,10 @@ async function renderConnect() {
   // failure — the card degrades to a reload hint instead of blanking the page.
   let tokStatus = null;
   try { tokStatus = await api("/api/mcp-token"); } catch (_) {}
+  // Time-travel port status (#1446): on/off plus its address, never the token.
+  // null on failure — the SQL client panel says it could not check.
+  let fbStatus = null;
+  try { fbStatus = await api("/api/flashback"); } catch (_) {}
   if (gen !== serverGen) {
     // The consumed plaintext cannot be re-shown; say so instead of losing it
     // silently (the user must rotate to get a usable value).
@@ -5881,7 +5908,7 @@ async function renderConnect() {
     return;
   }
   try {
-    buildConnect(servers, tokStatus, minted);
+    buildConnect(servers, tokStatus, minted, fbStatus);
   } catch (err) {
     if (minted) toastError("Token display interrupted; the plain token is gone. Click New token to get a fresh one");
     const v = VIEW(); clear(v); v.append(pageHead("Connect AI", null)); renderError(v, err);
@@ -5915,7 +5942,7 @@ function copyText(text, what) {
   navigator.clipboard.writeText(text).then(() => toast(what + " copied to clipboard"), () => toastError("Copy failed."));
 }
 
-function buildConnect(servers, tokStatus, minted) {
+function buildConnect(servers, tokStatus, minted, fbStatus) {
   const v = VIEW(); clear(v);
   const sub = el("p", { class: "page-sub" },
     "Three steps and Claude can answer questions about your database history. It can only read; it can never change anything.");
@@ -5927,6 +5954,7 @@ function buildConnect(servers, tokStatus, minted) {
   cards.append(bundleCard());
   v.append(cards);
   if (capsCache.mcp) v.append(otherClientsPanel(servers));
+  v.append(sqlClientPanel(servers, fbStatus));
   viewEnter();
 }
 
@@ -6167,6 +6195,98 @@ function otherClientsPanel(servers) {
   adv.append(el("p", { class: "form-hint", text:
     "If this console is reachable over public HTTPS, the same URL also works directly as a claude.ai custom connector; no bridge needed." }));
   panel.append(adv);
+  return panel;
+}
+
+// ── Connect a SQL client (#1446) ─────────────────────────────────────────────
+//
+// The embedded time-travel port (`watch --flashback-listen`, #996) serves the
+// _flashback / _snapshot / _diff schemas for every monitored server over the
+// MySQL protocol, routed by the connection USERNAME (the server's registry
+// name or id, "default" for the boot entry: the same selector /mcp uses, so
+// mcpSelector is reused) and authenticated with the console token. Display
+// only: the port is daemon configuration, so this panel can say where it is,
+// or that it is off and what turns it on, and never toggle it. Status comes
+// from GET /api/flashback; a null status means the call failed, and the panel
+// says so instead of guessing an address.
+
+// shellWord quotes a value for the copy-paste mysql line when it carries
+// anything a shell would split or expand (a display name with a space).
+function shellWord(s) {
+  return /^[A-Za-z0-9_.:@-]+$/.test(s) ? s : "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+// flashbackHost picks the host for the mysql line: the bind host when the
+// daemon named one; on a wildcard bind (host empty) the name this page was
+// opened on, which is the one name known to reach the daemon's machine.
+function flashbackHost(fb) {
+  // location.hostname keeps the brackets of an IPv6 literal ("[::1]"), while
+  // a named bind comes through Go's SplitHostPort bare ("::1"); strip them so
+  // both shapes print the same way.
+  return fb.host || (location.hostname || "").replace(/^\[|\]$/g, "") || "127.0.0.1";
+}
+
+// sqlClientPanel renders the port's state in one of four shapes: could not
+// check, off on a read-only console (the port belongs to watch), off on a
+// watch daemon (name the flag and env var, as daemon configuration), or on
+// (address, user rule, password rule, and the ready-to-copy mysql line for
+// the server picked in the sidebar). Not a .cn-card: the three numbered cards
+// are the Connect AI how-to, and this is a different client.
+function sqlClientPanel(servers, fb) {
+  const panel = el("section", { class: "ov-panel cn-sql", style: "margin-top:18px" });
+  panel.append(el("div", { class: "ov-panel-head" }, el("h2", { class: "ov-panel-title", text: "Connect a SQL client" })));
+  const body = el("div", { class: "cn-sql-body" });
+  panel.append(body);
+  if (!fb) {
+    body.append(el("p", { class: "cn-sql-row", text: "We could not check whether the time-travel port is on. Reload the page to try again." }));
+    return panel;
+  }
+  if (!fb.enabled) {
+    if (!capsCache.monitor) {
+      // serve: there is no daemon here to carry the port, so naming the
+      // watch flag as "how to turn it on" would send the reader to a flag
+      // this process does not have.
+      body.append(el("p", { class: "cn-sql-row" },
+        "Not available from this read-only console. The time-travel port is part of the watch daemon (CLI: ",
+        el("code", { text: "bintrail-console watch --flashback-listen" }),
+        "). Run that daemon and your usual MySQL client can read any table as it was at a chosen moment."));
+      return panel;
+    }
+    body.append(el("p", { class: "cn-sql-row", text: "Off. The port is set when the daemon starts, not from this page." }));
+    body.append(cnFine("How to turn it on",
+      el("p", { class: "form-hint" },
+        "Start the daemon with a port address (CLI: ", el("code", { text: "--flashback-listen 127.0.0.1:3308" }),
+        ", or the environment variable ", el("code", { text: "BINTRAIL_CONSOLE_FLASHBACK_LISTEN" }),
+        ") and a console token (CLI: ", el("code", { text: "--console-token" }), " or ", el("code", { text: "BINTRAIL_CONSOLE_TOKEN" }),
+        "). This panel then shows the address and a ready to copy mysql line, and your usual MySQL client can read any table as it was at a chosen moment.")));
+    return panel;
+  }
+  const cur = (servers || []).find((s) => s.id === (currentServer || defaultServerId));
+  const user = mcpSelector(cur);
+  // A wildcard bind (":3308") reads as a typo to a non-technical reader; say
+  // what it means and let the mysql line carry the name this page uses.
+  body.append(el("p", { class: "cn-sql-row" }, "Address ",
+    el("code", { text: fb.host ? fb.listen : "port " + (fb.port || fb.listen) }),
+    fb.host ? "" : " on every network address of the daemon's machine"));
+  body.append(el("p", { class: "cn-sql-row" }, "User ",
+    user ? el("code", { text: user }) : el("code", { text: "<server name>" }),
+    user ? ", the server picked in the left sidebar" : ", the name of a server in the left sidebar (none yet)"));
+  body.append(el("p", { class: "cn-sql-row" },
+    "Password: the console token (CLI: ", el("code", { text: "--console-token" }), " or ", el("code", { text: "BINTRAIL_CONSOLE_TOKEN" }), "), never shown here"));
+  if (fb.port) {
+    const line = "mysql -h " + shellWord(flashbackHost(fb)) + " -P " + fb.port + " -u " + (user ? shellWord(user) : "<server-name>") + " -p";
+    body.append(el("div", { class: "cn-urlrow" },
+      el("code", { class: "stg-code cn-url", text: line }),
+      el("button", { class: "btn btn-sm", type: "button", text: "Copy", onclick: () => copyText(line, "mysql command") })));
+    body.append(el("p", { class: "cn-sql-row", text: "Paste the token at the password prompt." }));
+  }
+  body.append(cnFine("What to run, and other machines",
+    el("p", { class: "form-hint" }, "Ask for a table as it was: ",
+      el("code", { text: "SELECT * FROM _flashback.orders AS OF '10 minutes ago' WHERE id = 1;" }),
+      " Use _snapshot for the whole table (needs a backup) and _diff for what changed between two moments. The user picks the server, so each server has its own line; pick another in the sidebar and copy again."),
+    el("p", { class: "form-hint", text: fb.host
+      ? "The port answers on that address only. Run mysql where it can reach it (on the daemon's machine when it is 127.0.0.1), or open a tunnel to it."
+      : "The port answers on every network address of the daemon's machine; the command uses the name this page was opened with. If that name is a reverse proxy in front of the console, it does not pass this port through, so use the daemon machine's own name or address instead." })));
   return panel;
 }
 

@@ -1405,21 +1405,28 @@ type consoleOpts struct {
 	TLSKey       string
 	AllowedHosts []string
 	AllowSetup   bool
+	// FlashbackListen is the --flashback-listen address, reported to the
+	// console so the Connect page can show the port (#1446). Empty = off.
+	// startFlashbackPort binds it after console.New and aborts the daemon on
+	// a bind failure, so a value the console reports was bound at startup;
+	// a mid-run serve failure is logged and swallowed, not reflected here.
+	FlashbackListen string
 }
 
 // upConsoleOpts snapshots the resolved upConsole* globals.
 func upConsoleOpts() consoleOpts {
 	return consoleOpts{
-		Listen:       upConsoleListen,
-		Token:        upConsoleToken,
-		BaselineDir:  upConsoleBaselineDir,
-		BaselineS3:   upConsoleBaselineS3,
-		AuthFile:     upConsoleAuthFile,
-		MCPTokenFile: upConsoleMCPTokenFile,
-		TLSCert:      upConsoleTLSCert,
-		TLSKey:       upConsoleTLSKey,
-		AllowedHosts: upConsoleAllowedHost,
-		AllowSetup:   upConsoleAllowSetup,
+		Listen:          upConsoleListen,
+		Token:           upConsoleToken,
+		BaselineDir:     upConsoleBaselineDir,
+		BaselineS3:      upConsoleBaselineS3,
+		AuthFile:        upConsoleAuthFile,
+		MCPTokenFile:    upConsoleMCPTokenFile,
+		TLSCert:         upConsoleTLSCert,
+		TLSKey:          upConsoleTLSKey,
+		AllowedHosts:    upConsoleAllowedHost,
+		AllowSetup:      upConsoleAllowSetup,
+		FlashbackListen: upConsoleFlashbackListen,
 	}
 }
 
@@ -1439,19 +1446,20 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 		return console.Config{}, fmt.Errorf("--index-dsn must include a database name (e.g. user:pass@tcp(host:3306)/binlog_index)")
 	}
 	return console.Config{
-		DB:           db,
-		DBName:       cfg.DBName,
-		BootDSN:      indexDSN,
-		Listen:       opts.Listen,
-		Token:        opts.Token,
-		SQLPanel:     sqlPanelEnabled(),
-		BaselineDir:  opts.BaselineDir,
-		BaselineS3:   opts.BaselineS3,
-		AuthPath:     opts.AuthFile,
-		MCPTokenPath: opts.MCPTokenFile,
-		TLSCert:      opts.TLSCert,
-		TLSKey:       opts.TLSKey,
-		AllowedHosts: opts.AllowedHosts,
+		DB:              db,
+		DBName:          cfg.DBName,
+		BootDSN:         indexDSN,
+		Listen:          opts.Listen,
+		Token:           opts.Token,
+		SQLPanel:        sqlPanelEnabled(),
+		BaselineDir:     opts.BaselineDir,
+		BaselineS3:      opts.BaselineS3,
+		AuthPath:        opts.AuthFile,
+		MCPTokenPath:    opts.MCPTokenFile,
+		TLSCert:         opts.TLSCert,
+		TLSKey:          opts.TLSKey,
+		AllowedHosts:    opts.AllowedHosts,
+		FlashbackListen: opts.FlashbackListen,
 		// The daemon's --rotate-* defaults, so GET /api/rotation can report the
 		// effective policy (and the console panel prefill it) before the
 		// operator saves an override.

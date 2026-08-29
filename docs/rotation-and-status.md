@@ -524,7 +524,12 @@ carry `last_file`, `last_pos`, `last_statement_type`, `last_connection_id`
 (omitted when absent). Table-attributed reasons also carry `tables` (capped, with
 `tables_truncated` when more were skipped than are listed) and `last_detail`;
 the verdict carries `explanation`, the rendered prose above. The
-[web console](console.md) Overview shows an orange "Capture incomplete" box in
+[web console](console.md) serves the same payload from `GET /api/status`, with
+one difference for a session whose data access is restricted (a data profile,
+or per-role access rules): `tables` keeps only the names that session may read,
+`tables_withheld` counts the rest, and the explanation is built from that
+shorter list ("app.users and 2 tables outside your access"). The counts are
+unchanged. The console's Overview shows an orange "Capture incomplete" box in
 the same states, with a **Refresh schema snapshot** button for a monitored
 server: it re-reads the source's column layout and restarts that server's
 capture onto it (a schema snapshot is not a baseline — it records columns, not
