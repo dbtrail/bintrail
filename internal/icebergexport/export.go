@@ -469,12 +469,14 @@ func (d *deps) committed(c Commit) {
 // Iceberg data files, batch by batch, so memory is bounded by the batch and
 // not by the table.
 //
-// Two normalizations make the first load spell values exactly as the row
+// Three normalizations make the first load spell values exactly as the row
 // events will, which is what an equality delete needs to match and what keeps
 // one column from carrying two representations depending on which run wrote
-// the row: primary key columns go through CanonicalizePKMap, and every fixed
+// the row: primary key columns go through CanonicalizePKMap, every fixed
 // BINARY(n) column is trimmed of the storage padding the ROW image never
-// carries (#1155), key or not.
+// carries (#1155), key or not, and every JSON column's text (MySQL's own
+// rendering, as the dump printed it) is parsed and re-emitted through the
+// encoder the delta path uses (#1508).
 func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrowSchema *arrow.Schema, cols []column,
 	pkCols []metadata.ColumnMeta, local string) ([]iceberg.DataFile, int64, error) {
 
@@ -499,10 +501,13 @@ func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrow
 	if err := sameNames(dcols, cols); err != nil {
 		return nil, 0, fmt.Errorf("baseline Parquet columns %w", err)
 	}
-	var fixedBinary []string
+	var fixedBinary, jsonCols []string
 	for _, c := range cols {
 		if c.MySQLType == "binary" {
 			fixedBinary = append(fixedBinary, c.Name)
+		}
+		if c.isJSON() {
+			jsonCols = append(jsonCols, c.Name)
 		}
 	}
 
@@ -546,6 +551,16 @@ func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrow
 			for _, name := range fixedBinary {
 				if b, ok := row[name].([]byte); ok {
 					row[name] = reconstruct.TrimFixedBinaryPad(b)
+				}
+			}
+			for _, name := range jsonCols {
+				if s, ok := row[name].(string); ok {
+					raw, err := canonicalJSONText(s)
+					if err != nil {
+						yield(nil, fmt.Errorf("column %s: %w", name, err))
+						return
+					}
+					row[name] = raw
 				}
 			}
 			if err := app.append(row); err != nil {
@@ -623,6 +638,7 @@ func (d *deps) increment(ctx context.Context, schema, tbl string, tm *metadata.T
 	if err := sameTableTypes(cols, tm, schema, tbl); err != nil {
 		return nil, err
 	}
+	fillMySQLTypes(cols, tm)
 
 	if !at.After(cur.At) {
 		// Checked BEFORE the cut: the same --at resolves to the same cut as
@@ -1124,6 +1140,27 @@ func sameTableTypes(cols []column, tm *metadata.TableMeta, schema, tbl string) e
 		}
 	}
 	return nil
+}
+
+// fillMySQLTypes gives the columns rebuilt from an Iceberg schema the MySQL
+// base type the current snapshot declares. The Iceberg schema keeps the
+// exported SHAPE (string) and not the MySQL type behind it, and the delta
+// path needs the type for the one string column whose value is rendered,
+// not copied: a JSON column, whose row image is decoded into Go values and
+// must leave as the same text the first load wrote (#1508). Called after
+// sameTableTypes, so the type named here maps to the exported kind. A
+// snapshot without data_type (pre-#212) fills nothing, and toString then
+// renders a decoded document by its shape alone.
+func fillMySQLTypes(cols []column, tm *metadata.TableMeta) {
+	current := make(map[string]string, len(tm.Columns))
+	for _, c := range tm.Columns {
+		current[strings.ToLower(c.Name)] = strings.ToLower(strings.TrimSpace(c.DataType))
+	}
+	for i := range cols {
+		if cols[i].MySQLType == "" {
+			cols[i].MySQLType = current[strings.ToLower(cols[i].Name)]
+		}
+	}
 }
 
 // columnFromMeta turns a schema-snapshot column into the declaration shape

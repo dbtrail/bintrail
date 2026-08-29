@@ -1,8 +1,10 @@
 package icebergexport
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 	"strings"
@@ -181,7 +183,13 @@ func appendValue(b array.Builder, c column, v any) error {
 		}
 		b.(*array.BinaryBuilder).Append(bs)
 	case kindString:
-		s, err := toString(v)
+		var s string
+		var err error
+		if c.isJSON() {
+			s, err = jsonText(v)
+		} else {
+			s, err = toString(v)
+		}
 		if err != nil {
 			return err
 		}
@@ -367,18 +375,75 @@ func toString(v any) (string, error) {
 	case float64:
 		return strconv.FormatFloat(t, 'f', -1, 64), nil
 	case map[string]any, []any, json.RawMessage:
-		// A JSON column: the row image decodes it into a value; re-encode it
-		// as the text the baseline holds.
-		bs, err := json.Marshal(t)
-		if err != nil {
-			return "", err
-		}
-		return string(bs), nil
+		// A JSON value in a column whose MySQL type is not known to be JSON
+		// (a schema snapshot without data_type): the canonical rendering,
+		// so it at least agrees with what a typed column would write.
+		return jsonText(t)
 	}
 	if n, err := toInt64(v); err == nil {
 		return strconv.FormatInt(n, 10), nil
 	}
 	return "", fmt.Errorf("cannot read %T as text", v)
+}
+
+// jsonText renders one JSON column value as the export's canonical text.
+//
+// The two sources hand a JSON column over in different shapes: the baseline
+// holds MySQL's own rendering of the document (keys in MySQL's order, a
+// space after every comma and colon), which writeBaselineRows has already
+// parsed and re-encoded into a json.RawMessage; the row image decodes the
+// document into Go values (maps, slices, json.Number, string, bool). Both
+// end here, and both leave as the ONE rendering encodeJSON produces, so a
+// reader that compares the column as text (GROUP BY, DISTINCT, a diff
+// between two exports) sees one value where the source has one. A Go
+// string is a JSON string scalar and is quoted: the baseline's text never
+// reaches this function as a string.
+func jsonText(v any) (string, error) {
+	if raw, ok := v.(json.RawMessage); ok {
+		return string(raw), nil
+	}
+	bs, err := encodeJSON(v)
+	if err != nil {
+		return "", err
+	}
+	return string(bs), nil
+}
+
+// canonicalJSONText parses MySQL's rendering of a JSON document and re-emits
+// it through encodeJSON. Numbers keep their literal text (UseNumber), so
+// `1.50` stays `1.50` and a 20-digit integer is not rounded through float64.
+// Text that is not JSON is an error: a JSON column never holds one, so it
+// is a corrupt baseline, not a value to pass through.
+func canonicalJSONText(text string) (json.RawMessage, error) {
+	dec := json.NewDecoder(strings.NewReader(text))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, fmt.Errorf("baseline text is not JSON: %w", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("baseline text is not one JSON document: trailing data after %q", text)
+	}
+	if v == nil {
+		// A JSON null. The row image cannot tell it from SQL NULL and
+		// writes NULL for both; the baseline keeps the literal it holds.
+		return json.RawMessage("null"), nil
+	}
+	return encodeJSON(v)
+}
+
+// encodeJSON is the export's one JSON rendering: encoding/json with keys
+// sorted, no whitespace, and `<`, `>`, `&` left as they are (the HTML
+// escaping encoding/json applies by default would make `"<x>"` read as
+// `"<x>"`, which is the same value and a different text).
+func encodeJSON(v any) (json.RawMessage, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return json.RawMessage(bytes.TrimSuffix(buf.Bytes(), []byte("\n"))), nil
 }
 
 func toBytes(v any) ([]byte, error) {

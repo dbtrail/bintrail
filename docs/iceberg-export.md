@@ -144,7 +144,8 @@ registry attributes an event to a source, so two sources with the same
 | DATETIME, TIMESTAMP | timestamp (no zone) | the value the index stores: TIMESTAMP as UTC, DATETIME as written |
 | DATE | date | |
 | TIME | string | |
-| CHAR, VARCHAR, TEXT family, ENUM, SET, JSON | string | ENUM and SET are exported as their labels |
+| CHAR, VARCHAR, TEXT family, ENUM, SET | string | ENUM and SET are exported as their labels |
+| JSON | string | one rendering whichever run wrote the row: keys sorted, no whitespace, `<` `>` `&` and numbers as written. The first load parses the dump's text (MySQL's own rendering) and re-emits it the same way |
 | BINARY, VARBINARY, BLOB family | binary | |
 | BIT | refused | |
 
