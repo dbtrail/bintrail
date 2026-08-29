@@ -25,6 +25,10 @@ bintrail telemetry show
 bintrail telemetry status   # is it on, and what decided that
 ```
 
+The web console shows the same event: on **Storage → Usage telemetry**, open
+**Show a sample event**. The daemon renders it through the same function the
+command uses, so the two cannot differ, and opening it sends nothing.
+
 ## Why this document is longer than you expect
 
 bintrail reads your binary logs. It sees your schemas, your table names, your

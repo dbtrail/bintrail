@@ -3608,6 +3608,56 @@ try {
     ? ok("tropical: config cards rotate through the home's tint palette")
     : bad("tropical: config cards rotate through the home's tint palette", JSON.stringify(tints));
 
+  // ── Scenario 17h — the telemetry card shows the exact sample event (#1447) ──
+  // Still on /storage. The "Show a sample event" fold must be closed by
+  // default, open on click, and carry the daemon's `sample_event` string
+  // VERBATIM in a read-only <pre>: the daemon renders it through the same
+  // function `bintrail telemetry show` prints through, and a JSON.stringify
+  // in the frontend would be a second renderer free to drift. Each fetch
+  // draws a fresh run_id (as each `show` run does), so that one line is
+  // normalised before the bytes are compared, and its presence is asserted so
+  // an empty normalisation cannot pass. run.sh builds without -ldflags, so
+  // this photographs the no-endpoint arm, where the fold still renders.
+  const telSample = await page.evaluate(async () => {
+    const card = Array.from(document.querySelectorAll(".cards .card"))
+      .find((c) => (c.querySelector(".card-title") || {}).textContent === "Usage telemetry");
+    if (!card) return { found: false };
+    const d = card.querySelector("details.tel-sample");
+    if (!d) return { found: true, details: false };
+    const closedBefore = !d.open;
+    // checkVisibility, not a rect: Chromium folds a closed <details> with
+    // content-visibility rather than display:none, so the <pre> keeps its
+    // box (15px measured while folded) and only checkVisibility sees the fold.
+    const preBefore = d.querySelector("pre");
+    const hiddenBefore = preBefore ? !preBefore.checkVisibility() : false;
+    d.querySelector("summary").click();
+    const pre = d.querySelector("pre");
+    const shown = pre ? pre.textContent : "";
+    const state = await api("/api/telemetry");
+    let parsed = null;
+    try { parsed = JSON.parse(shown); } catch (_) {}
+    return {
+      found: true, details: true, closedBefore, hiddenBefore, openAfter: d.open,
+      visible: pre ? pre.checkVisibility() : false,
+      shown, fromApi: state.sample_event || "",
+      parsedType: parsed && parsed.event_type,
+      readOnly: pre ? !pre.isContentEditable && pre.querySelectorAll("input,textarea").length === 0 : false,
+    };
+  });
+  const runIDLine = /"run_id": "[0-9a-f-]{36}"/g;
+  const normRunID = (s) => s.replace(runIDLine, '"run_id": "<run_id>"');
+  (telSample.found && telSample.details && telSample.closedBefore && telSample.hiddenBefore)
+    ? ok("telemetry: the sample event is folded by default")
+    : bad("telemetry: the sample event is folded by default", JSON.stringify(telSample));
+  (telSample.openAfter && telSample.visible && telSample.readOnly && telSample.parsedType === "command_run")
+    ? ok("telemetry: opening the fold shows the daemon's event as read-only JSON")
+    : bad("telemetry: opening the fold shows the daemon's event as read-only JSON", JSON.stringify(telSample));
+  (telSample.shown && (telSample.shown.match(runIDLine) || []).length === 1
+    && (telSample.fromApi.match(runIDLine) || []).length === 1
+    && normRunID(telSample.shown) === normRunID(telSample.fromApi))
+    ? ok("telemetry: the shown bytes are the daemon's sample_event verbatim")
+    : bad("telemetry: the shown bytes are the daemon's sample_event verbatim", JSON.stringify({ shown: telSample.shown, fromApi: telSample.fromApi }));
+
   // ── Scenario 17g — Connect AI is three short steps with a drawn dialog ──
   // The audience is Claude users, mostly non-technical. The first rewrite
   // (#1430) made the steps explicit but drowned them in prose; the verdict on

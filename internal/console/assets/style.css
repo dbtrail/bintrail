@@ -2088,6 +2088,10 @@ button { font-family: inherit; }
 .cn-snippet { display: block; margin: 8px 0 10px; white-space: pre; }
 .cn-other .form-hint { margin-top: 8px; }
 
+/* Telemetry sample event (#1447): the daemon's bytes, shown as they are. */
+.tel-sample { margin-top: 12px; }
+.tel-sample-pre { display: block; margin: 8px 0 0; white-space: pre; }
+
 /* ============================================================
    date/time picker (Since/Until/At filters)
    ============================================================ */

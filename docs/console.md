@@ -478,7 +478,9 @@ compact baseline summary card and links onward:
   beacons immediately (no restart) and records the machine-wide choice, exactly
   like `bintrail telemetry off`. When an environment variable (`DO_NOT_TRACK`,
   `BINTRAIL_TELEMETRY`) or the `--telemetry` flag already controls it, the card
-  says so and defers to that. See [TELEMETRY.md](./TELEMETRY.md).
+  says so and defers to that. Open **Show a sample event** to see the exact
+  JSON one event would carry, the same bytes `bintrail telemetry show` prints;
+  opening it sends nothing. See [TELEMETRY.md](./TELEMETRY.md).
 
 ### The SQL panel (opt-in)
 

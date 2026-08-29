@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -230,7 +229,7 @@ This command performs no network access. It exists so the payload can be
 inspected without trusting the documentation: what you see here is the
 complete set of fields the wire format permits.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		out, err := json.MarshalIndent(telemetry.SampleEvent(), "", "  ")
+		out, err := telemetry.SampleEventJSON()
 		if err != nil {
 			return fmt.Errorf("render sample event: %w", err)
 		}

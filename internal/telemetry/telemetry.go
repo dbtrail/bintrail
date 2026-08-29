@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -454,6 +455,15 @@ func SampleEvent() Event {
 		IsInteractive:  isInteractive(os.Stderr),
 		RunID:          uuid.NewString(),
 	}
+}
+
+// SampleEventJSON renders SampleEvent the way `bintrail telemetry show` prints
+// it: two-space indented, no trailing newline. It is the ONE renderer behind
+// every "inspect the payload" surface (the CLI command and the console's
+// telemetry card), so the bytes an operator sees cannot depend on which one
+// they opened. Each call draws a fresh run_id, exactly as each `show` run does.
+func SampleEventJSON() ([]byte, error) {
+	return json.MarshalIndent(SampleEvent(), "", "  ")
 }
 
 // Span measures one command invocation. A nil *Span is safe and inert.

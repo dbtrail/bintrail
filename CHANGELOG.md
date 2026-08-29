@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The console's telemetry card shows the exact sample event** (#1447). The
+  Usage telemetry card (Settings > Storage) gains a folded "Show a sample
+  event" section with the JSON one event would carry, byte for byte as
+  `bintrail telemetry show` prints it. Both surfaces render it through one
+  function (`telemetry.SampleEventJSON`), pinned by a test that compares the
+  console payload with the command's output, so the card can never drift into
+  a hand-maintained copy. Read-only; opening it sends nothing.
 - **`bintrail export iceberg`** (#1466). Writes each table's current state as
   an Apache Iceberg table under `--warehouse`, incrementally: the first run
   loads the newest baseline snapshot, every run after that folds the events

@@ -3988,6 +3988,7 @@ function telemetryCard(t) {
   }
   if (!t.endpoint_set) {
     card.append(el("p", { class: "stg-hint", text: "This build sends no telemetry; no endpoint is compiled in." }));
+    card.append(telemetrySampleSection(t));
     return card;
   }
   card.append(el("p", { class: "stg-hint", text: t.reporting
@@ -3999,13 +4000,35 @@ function telemetryCard(t) {
       : t.decided_by === "BINTRAIL_TELEMETRY" ? "the BINTRAIL_TELEMETRY environment variable"
       : "the --telemetry flag";
     card.append(el("p", { class: "form-hint", text: "Set by " + by + " on the daemon, which overrides this toggle. Change it there." }));
+    card.append(telemetrySampleSection(t));
     return card;
   }
+  card.append(telemetrySampleSection(t));
   card.append(el("div", { class: "stg-cardfoot" },
     el("button", { class: "btn btn-sm", type: "button",
       text: t.consent ? "Turn telemetry off" : "Turn telemetry on",
       onclick: () => setTelemetry(!t.consent) })));
   return card;
+}
+
+// telemetrySampleSection folds the exact JSON one event would carry (#1447).
+// The text comes from the daemon verbatim (`sample_event`, rendered by the same
+// function the CLI's `telemetry show` prints through), so the card never
+// re-draws or re-orders it: it is a read-only <pre>, and JSON.stringify would
+// be a second renderer that could drift from the CLI. Opening it sends nothing.
+function telemetrySampleSection(t) {
+  const d = el("details", { class: "form-advanced tel-sample" },
+    el("summary", { class: "form-adv-summary", text: "Show a sample event" }));
+  if (!t.sample_event) {
+    d.append(el("p", { class: "form-hint", text:
+      "The daemon could not render the sample event. The command line prints the same event (CLI: bintrail telemetry show)." }));
+    return d;
+  }
+  d.append(el("p", { class: "form-hint", text:
+    "The exact event this machine would send, byte for byte, built by the same code the command line prints " +
+    "(CLI: bintrail telemetry show). Opening this sends nothing." }));
+  d.append(el("pre", { class: "stg-code tel-sample-pre", text: t.sample_event }));
+  return d;
 }
 
 async function setTelemetry(enabled) {
