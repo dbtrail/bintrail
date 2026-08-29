@@ -209,6 +209,7 @@ func (cm *connManager) Resolve(ctx context.Context, id string) (*bundle, error) 
 			// baseline/no-archive-only edit during the open keeps this db but
 			// must not publish the stale entry's reconstruct gate.
 			nb := newBundleDerived(b.db, b.dbName, cm.withBaselineDefaults(cur), cm.profileActive)
+			nb.dsn = b.dsn
 			nb.resolver = b.resolver
 			nb.resolverUnavailable = b.resolverUnavailable
 			cm.bundles[id] = nb

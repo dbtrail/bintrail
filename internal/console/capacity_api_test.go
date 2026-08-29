@@ -204,23 +204,50 @@ func TestCapacityAPI_watch(t *testing.T) {
 		}
 	})
 
-	t.Run("index not initialized", func(t *testing.T) {
+	t.Run("index not initialized: free space the probe measured is still reported", func(t *testing.T) {
 		srv := newCapacityWatchServer(t)
-		stubCapacityProbe(srv, doctor.CapacityProbe{TableVisible: false}, nil)
+		stubCapacityProbe(srv, doctor.CapacityProbe{TableVisible: false, FreeBytes: 1 << 30, FreeKnown: true}, nil)
 		got := capacityGet(t, srv)
 		if got.Status != "skip" || got.Reason != "not_initialized" {
 			t.Fatalf("status/reason = %s/%s, want skip/not_initialized", got.Status, got.Reason)
 		}
+		// The volume was measured; a missing TABLE must not turn that into
+		// "not measurable from here" on the card.
+		if !got.FreeKnown || got.FreeBytes != 1<<30 {
+			t.Fatalf("free = %v known=%v, want the measured 1 GiB carried through", got.FreeBytes, got.FreeKnown)
+		}
 	})
 
-	t.Run("probe failure is a 502, never a green page", func(t *testing.T) {
+	t.Run("invalid saved override: projects over the daemon default the loop actually runs", func(t *testing.T) {
+		srv := newCapacityWatchServer(t)
+		// SetRotation validates nothing; the PUT handler does. A file edited
+		// by hand or written by a newer build can hold a value this build
+		// cannot parse, and the watch loop then runs its defaults.
+		if err := srv.cm.reg.SetRotation(RotationConfig{Retain: "fortnight", Interval: "1h"}); err != nil {
+			t.Fatal(err)
+		}
+		stubCapacityProbe(srv, capacityFixture(0, 2_000_000_000, true), nil)
+		got := capacityGet(t, srv)
+		if !got.Retention.Known || got.Retention.Retain != "30d" || got.Retention.Source != "default" {
+			t.Fatalf("retention = %+v, want the 30d daemon default reported as such", got.Retention)
+		}
+		if got.ProjectedBytes != 720_000_000 || got.Status != "pass" {
+			t.Fatalf("projected=%v status=%s, want the 30d projection graded", got.ProjectedBytes, got.Status)
+		}
+	})
+
+	t.Run("probe failure is a 502, never a green page, and never the DSN", func(t *testing.T) {
 		srv := newCapacityWatchServer(t)
 		stubCapacityProbe(srv, doctor.CapacityProbe{}, &doctor.CapacityQueryError{
-			What: "cannot read partition statistics", Table: "information_schema.PARTITIONS", Err: errors.New("denied"),
+			What: "cannot read partition statistics", Table: "information_schema.PARTITIONS",
+			Err: errors.New("dial tcp 127.0.0.1:3306: denied for root:pw@tcp(127.0.0.1:3306)/binlog_index"),
 		})
 		rec, body := doServersReq(t, srv, "GET", "/api/capacity", "")
 		if rec.Code != 502 || !strings.Contains(string(body), "partition statistics") {
 			t.Fatalf("code=%d body=%s, want 502 naming the failed read", rec.Code, body)
+		}
+		if strings.Contains(string(body), "root:pw@") {
+			t.Fatalf("502 body leaked the DSN: %s", body)
 		}
 	})
 }

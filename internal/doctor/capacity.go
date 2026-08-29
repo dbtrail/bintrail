@@ -196,7 +196,13 @@ type CapacityMeasurement struct {
 // free-space floor can warn.
 func EvaluateCapacity(probe CapacityProbe, retain time.Duration, retainKnown bool, now time.Time) CapacityMeasurement {
 	if len(probe.Partitions) == 0 && !probe.TableVisible {
-		return CapacityMeasurement{Status: StatusSkip, Reason: CapacityNotInitialized, Retain: retain, RetainKnown: retainKnown}
+		// The probe still measured the volume; a surface that reports free
+		// space must not call it unmeasurable because the TABLE is missing.
+		return CapacityMeasurement{
+			Status: StatusSkip, Reason: CapacityNotInitialized,
+			Retain: retain, RetainKnown: retainKnown,
+			FreeBytes: probe.FreeBytes, FreeKnown: probe.FreeKnown,
+		}
 	}
 	if !retainKnown {
 		retain = 0

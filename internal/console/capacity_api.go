@@ -16,9 +16,10 @@ import (
 // connection (#1444).
 type capacityProbeFunc func(ctx context.Context, db *sql.DB, dsn, dbName string) (doctor.CapacityProbe, error)
 
-// capacityProbeTimeout bounds the three reads behind the projection
-// (partition statistics, hostname, datadir) so a slow index server cannot
-// hold the Status page open indefinitely.
+// capacityProbeTimeout bounds the probe's SQL reads (partition statistics,
+// hostname, datadir path) so a slow index server cannot hold the Status
+// page open indefinitely. The statfs on the datadir takes no context; it
+// is a local syscall, outside this bound.
 const capacityProbeTimeout = 10 * time.Second
 
 // capacityRetentionDTO is the retention window the projection was made
@@ -95,9 +96,9 @@ func (s *Server) handleCapacity(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	in, err := probe(ctx, b.db, b.dsn, b.dbName)
 	if err != nil {
-		// The doctor's probe error names what it could not read; the DSN
-		// never appears in it (information_schema reads carry no address).
-		writeJSONError(w, http.StatusBadGateway, "could not measure the index: "+err.Error())
+		// Scrubbed like every other error that leaves this package: the
+		// driver's message can carry the address, never let the DSN out.
+		writeJSONError(w, http.StatusBadGateway, "could not measure the index: "+scrubDSNError(err, b.dsn))
 		return
 	}
 	m := doctor.EvaluateCapacity(in, retain, retention.Known, time.Now())
@@ -121,9 +122,16 @@ func (s *Server) capacityRetention() (time.Duration, capacityRetentionDTO) {
 		return 0, dto
 	}
 	d, err := cliutil.ParseRetain(rot.Retain)
+	if err != nil && rot.Source == "override" {
+		// The loop itself ignores an invalid saved override and runs the
+		// daemon defaults (rotationSettingsProvider in the watch command),
+		// so project over what actually rotates, not over the bad value.
+		d, err = cliutil.ParseRetain(s.rotationDefaults.Retain)
+		dto.Retain, dto.Source = s.rotationDefaults.Retain, "default"
+	}
 	if err != nil {
-		// An unparsable effective window cannot be projected over; say so
-		// rather than grading it as "off".
+		// Nothing parsable to project over: report the window as unknown
+		// rather than grading a live loop as "off".
 		return 0, capacityRetentionDTO{Enabled: rot.Enabled}
 	}
 	return d, dto
