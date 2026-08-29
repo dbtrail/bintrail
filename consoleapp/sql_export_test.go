@@ -43,11 +43,13 @@ func TestSQLExportSingleFlight(t *testing.T) {
 }
 
 // seedExport puts a build state + dir into the supervisor the way Trigger
-// does, without running a fold.
+// does, without running a fold. The deadline is stamped as the success tail
+// would: a finished build without one counts as expired (#1448), on purpose.
 func seedExport(sup *baselineSupervisor, serverID, state, dir string) {
 	sup.mu.Lock()
-	sup.exports[serverID] = &console.BaselineStatus{State: state}
-	sup.exportDirs[serverID] = dir
+	sup.exports[serverID] = &console.BaselineStatus{State: state,
+		ExpiresAt: sup.clock().UTC().Add(sqlExportTTL).Format(time.RFC3339)}
+	sup.exportRuns[serverID] = &sqlExportRun{dir: dir}
 	sup.mu.Unlock()
 }
 
@@ -126,7 +128,7 @@ func TestSQLExportRun_failure(t *testing.T) {
 	sup.mu.Lock()
 	sup.exports["srv1"] = &console.BaselineStatus{State: "running", At: "2026-06-10T11:00:00Z"}
 	dir := filepath.Join(sup.sqlExportRoot("srv1"), "1")
-	sup.exportDirs["srv1"] = dir
+	sup.exportRuns["srv1"] = &sqlExportRun{dir: dir}
 	sup.mu.Unlock()
 	sup.runSQLExport(req, dir)
 
@@ -188,7 +190,7 @@ func TestSQLExportRun_failureAfterDiscovery(t *testing.T) {
 	sup.mu.Lock()
 	sup.exports["srv1"] = &console.BaselineStatus{State: "running", At: "2026-06-10T11:00:00Z"}
 	dir := filepath.Join(sup.sqlExportRoot("srv1"), "1")
-	sup.exportDirs["srv1"] = dir
+	sup.exportRuns["srv1"] = &sqlExportRun{dir: dir}
 	sup.mu.Unlock()
 	sup.runSQLExport(req, dir)
 
@@ -238,7 +240,7 @@ func TestSQLExportTrigger_stampsInstant(t *testing.T) {
 	}
 	waitSettled()
 	sup.mu.Lock()
-	dir1 := sup.exportDirs["srv1"]
+	dir1 := sup.exportRuns["srv1"].dir
 	sup.mu.Unlock()
 	// A second build gets its OWN directory: a shared path reused across
 	// builds is the silent half of the wipe race (two instants interleaved
@@ -248,7 +250,7 @@ func TestSQLExportTrigger_stampsInstant(t *testing.T) {
 	}
 	waitSettled()
 	sup.mu.Lock()
-	dir2 := sup.exportDirs["srv1"]
+	dir2 := sup.exportRuns["srv1"].dir
 	sup.mu.Unlock()
 	if dir1 == dir2 {
 		t.Fatalf("both builds share %q; every build must get a fresh directory", dir1)

@@ -20,8 +20,33 @@ type awsCredsDTO struct {
 	WebIdentity    bool   `json:"web_identity"`         // EKS IRSA token file configured
 }
 
+// stagingDTO is the sql-export staging's share of the disk (#1448): the
+// builds waiting on the daemon's disk for their download, so the Storage
+// page can show space that used to be invisible until someone ran du.
+// Present only on a daemon that can build .sql backups.
+type stagingDTO struct {
+	Dir      string           `json:"dir"`       // where the builds live
+	TTLHours float64          `json:"ttl_hours"` // how long a finished build stays downloadable
+	Bytes    int64            `json:"bytes"`     // total over every build below
+	Builds   []stagedBuildDTO `json:"builds"`
+}
+
+type stagedBuildDTO struct {
+	ServerID   string `json:"server_id"`
+	ServerName string `json:"server_name,omitempty"` // resolved from the registry when the entry still exists
+	State      string `json:"state"`                 // running | succeeded | failed (removal still owed) | replaced (a previous build a newer one could not remove)
+	At         string `json:"at,omitempty"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
+	// Bytes counts only when BytesKnown; an unmeasurable build is excluded
+	// from the total and shown as unknown, never as 0 B.
+	Bytes        int64  `json:"bytes"`
+	BytesKnown   bool   `json:"bytes_known"`
+	StagingError string `json:"staging_error,omitempty"`
+}
+
 type storageInfoResponse struct {
-	AWS awsCredsDTO `json:"aws"`
+	AWS     awsCredsDTO `json:"aws"`
+	Staging *stagingDTO `json:"staging,omitempty"`
 }
 
 // handleStorageInfo serves GET /api/storage: process-global storage context
@@ -40,7 +65,31 @@ func (s *Server) handleStorageInfo(w http.ResponseWriter, r *http.Request) {
 		ContainerCreds: os.Getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != "" ||
 			os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "",
 		WebIdentity: os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "",
-	}})
+	}, Staging: s.stagingInfo()})
+}
+
+// stagingInfo builds the staging share of /api/storage; nil when this
+// daemon cannot build .sql backups (there is no staging to report).
+func (s *Server) stagingInfo() *stagingDTO {
+	if s.sqlExport == nil {
+		return nil
+	}
+	info := s.sqlExport.SQLExportStaged()
+	out := &stagingDTO{Dir: info.Dir, TTLHours: info.TTL.Hours(), Builds: []stagedBuildDTO{}}
+	for _, b := range info.Builds {
+		d := stagedBuildDTO{ServerID: b.ServerID, State: b.State, At: b.At, ExpiresAt: b.ExpiresAt,
+			Bytes: b.Bytes, BytesKnown: b.BytesKnown, StagingError: b.StagingError}
+		if s.cm != nil && s.cm.reg != nil {
+			if e, ok := s.cm.reg.Get(b.ServerID); ok {
+				d.ServerName = e.Name
+			}
+		}
+		if b.BytesKnown {
+			out.Bytes += b.Bytes
+		}
+		out.Builds = append(out.Builds, d)
+	}
+	return out
 }
 
 // hasSharedAWSConfig reports whether a shared AWS credentials/config file

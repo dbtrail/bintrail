@@ -13,6 +13,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/query"
 )
 
 // buildOne appends one value to a one-column batch and returns the column's
@@ -97,6 +98,17 @@ func TestAppendValue_bothSourcesAgree(t *testing.T) {
 		{"varchar", baseline.Column{Name: "c", MySQLType: "varchar"}, "hello", "hello"},
 		{"varchar from bytes", baseline.Column{Name: "c", MySQLType: "varchar"}, []byte("hello"), "hello"},
 		{"json column from decoded image", baseline.Column{Name: "c", MySQLType: "json"}, map[string]any{"a": json.Number("1")}, `{"a":1}`},
+		// json (#1508): the row image's decoded value and the baseline's
+		// re-encoded text both leave as the one canonical rendering; keys
+		// sorted, no spaces, `<` as is, numbers as written, scalars quoted.
+		{"json nested from image", baseline.Column{Name: "c", MySQLType: "json"}, map[string]any{"b": json.Number("1.50"), "a": []any{json.Number("1"), "<x>&y"}}, `{"a":[1,"<x>&y"],"b":1.50}`},
+		{"json scalar text from image (base64-stored, decoded to text) is re-emitted", baseline.Column{Name: "c", MySQLType: "json"}, `"abc"`, `"abc"`},
+		{"json bare legacy string from image (pre-#736) is quoted", baseline.Column{Name: "c", MySQLType: "json"}, "abc", `"abc"`},
+		{"json null text from image", baseline.Column{Name: "c", MySQLType: "json"}, "null", `null`},
+		{"json number scalar from image", baseline.Column{Name: "c", MySQLType: "json"}, json.Number("42"), `42`},
+		{"json bool scalar from image", baseline.Column{Name: "c", MySQLType: "json"}, true, `true`},
+		{"json canonical text from the baseline passes through", baseline.Column{Name: "c", MySQLType: "json"}, json.RawMessage(`{"a":1}`), `{"a":1}`},
+		{"json value in a column of unknown type", baseline.Column{Name: "c"}, map[string]any{"b": json.Number("1"), "a": "<x>"}, `{"a":"<x>","b":1}`},
 		{"enum label passes through", baseline.Column{Name: "c", MySQLType: "enum"}, "paid", "paid"},
 		{"time as text", baseline.Column{Name: "c", MySQLType: "time"}, "12:34:56", "12:34:56"},
 		// binary
@@ -116,6 +128,76 @@ func TestAppendValue_bothSourcesAgree(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestJSON_bothPathsAgreeByteForByte drives the same JSON value down the two
+// roads one column has: the baseline's text (MySQL's rendering, parsed by
+// canonicalJSONText the way writeBaselineRows does) and the row image (the
+// bytes binlog_events holds, decoded by query.UnmarshalRowImage the way the
+// delta path does). The two cells must be the same bytes (#1508).
+func TestJSON_bothPathsAgreeByteForByte(t *testing.T) {
+	col := baseline.Column{Name: "c", MySQLType: "json"}
+	cases := []struct {
+		name  string
+		mysql string // what SELECT prints, and the dump holds
+		image string // the value inside the row image
+		want  string
+	}{
+		{"nested object", `{"b": 1, "a": [1, 2], "s": "<x>&y", "n": 1.50}`, `{"b":1,"a":[1,2],"s":"<x>&y","n":1.50}`, `{"a":[1,2],"b":1,"n":1.50,"s":"<x>&y"}`},
+		{"string scalar", `"abc"`, `"abc"`, `"abc"`},
+		{"number scalar keeps its text", `1.50`, `1.50`, `1.50`},
+		{"big integer is not rounded", `12345678901234567890`, `12345678901234567890`, `12345678901234567890`},
+		{"bool scalar", `true`, `true`, `true`},
+		{"null scalar is a value on both sides", `null`, `null`, `null`},
+		{"empty object", `{}`, `{}`, `{}`},
+		{"array with a scalar under html escaping", `[1, "<a>"]`, `[1,"<a>"]`, `[1,"<a>"]`},
+		{"unicode as written", `{"k": "é"}`, `{"k":"é"}`, `{"k":"é"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := canonicalJSONText(tc.mysql)
+			if err != nil {
+				t.Fatalf("canonicalJSONText: %v", err)
+			}
+			fromBaseline, err := buildOne(t, col, raw)
+			if err != nil {
+				t.Fatalf("baseline path: %v", err)
+			}
+			// What the delta path hands appendValue: the indexer embeds a
+			// container (#736), so it arrives decoded; a top-level scalar is
+			// stored base64 and the epoch decoder returns its text.
+			var fromImage any = tc.image
+			if s := strings.TrimSpace(tc.image); strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[") {
+				fromImage = query.UnmarshalRowImage([]byte(`{"c":` + tc.image + `}`))["c"]
+			}
+			fromDelta, err := buildOne(t, col, fromImage)
+			if err != nil {
+				t.Fatalf("delta path: %v", err)
+			}
+			if fromBaseline != tc.want || fromDelta != tc.want {
+				t.Fatalf("baseline %q, delta %q, want both %q", fromBaseline, fromDelta, tc.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalJSONText_refusesNonJSON(t *testing.T) {
+	for _, text := range []string{`{"a": 1`, `abc`, `{"a":1} {"b":2}`, ``} {
+		if _, err := canonicalJSONText(text); err == nil {
+			t.Errorf("%q: want an error, a JSON column never holds it", text)
+		}
+	}
+	// A JSON null is a value the column can hold; it keeps its literal.
+	raw, err := canonicalJSONText(`null`)
+	if err != nil || string(raw) != "null" {
+		t.Fatalf("null = %q, %v", raw, err)
+	}
+	// A shape neither source produces is an error, never base64 or an object.
+	for _, v := range []any{[]byte("x"), time.Now(), struct{ A int }{1}} {
+		if _, err := jsonText(v); err == nil {
+			t.Errorf("jsonText(%T): want an error", v)
+		}
 	}
 }
 

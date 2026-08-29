@@ -239,6 +239,14 @@ both accept:
 
 - `pks` — multiple primary key values (each pipe-delimited for composite
   keys); requires `schema` and `table`, mutually exclusive with `pk`
+- `pk_min` / `pk_max`: an inclusive primary key range, either bound alone or
+  both, as integer strings. Only for tables whose primary key is one integer
+  column: the tool checks the key against the schema snapshot first and
+  refuses a composite or non-integer key with the table's actual key shape.
+  Requires `schema` and `table`, mutually exclusive with `pk`/`pks`. The
+  range cannot use the key index, so it scans the partitions the time filters
+  keep: pair it with `since`/`until`. See
+  [Primary key ranges](query-and-recovery.md#primary-key-ranges---pk-min----pk-max)
 - `limit_per_pk` — cap events per `pk_values` to the latest N (0 = unlimited);
   requires `pk` or `pks`
 - `column_eq` — repeatable `column=value` equality filters

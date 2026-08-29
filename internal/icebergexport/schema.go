@@ -36,13 +36,17 @@ const maxDecimalPrecision = 38
 // creation and then owned by the table forever.
 type column struct {
 	Name      string
-	MySQLType string // lower-case base type; read for the fixed BINARY(n) trim
+	MySQLType string // lower-case base type; read for the fixed BINARY(n) trim and the JSON rendering
 	Kind      kind
 	Precision int
 	Scale     int
 	FieldID   int
 	PK        bool
 }
+
+// isJSON reports whether the column is a MySQL JSON column: exported as a
+// string, but one whose text the export renders itself (see jsonText).
+func (c column) isJSON() bool { return c.MySQLType == "json" }
 
 // columnKind maps one MySQL column declaration to its Iceberg shape.
 //

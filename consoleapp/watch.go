@@ -875,6 +875,9 @@ func mainSourceJobInfo(sourceDSN, indexDSN, streamFlavor string) ext.SourceJobIn
 func newBaselineSupervisorFromConfig(ctx context.Context, stagingDir string) *baselineSupervisor {
 	sup := newBaselineSupervisor(ctx, stagingDir, upConsoleBaselineLockMode)
 	sup.configErr = upConsoleBaselineLockModeErr
+	// The download TTL for staged .sql builds (#1448) needs a clock nobody
+	// is polling: the Backups page expires lazily only while it is open.
+	go sup.runSQLExportReaper()
 	return sup
 }
 

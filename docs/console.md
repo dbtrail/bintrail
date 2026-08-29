@@ -159,18 +159,35 @@ and searching events:
    discoverable snapshot in the same store, and **Build a .sql backup for
    any moment**, which folds a chosen instant into a mydumper-format dump
    downloaded as one `.tar.gz` — load it with `myloader`, nothing from
-   bintrail needed on the restore side. The build is a full plaintext copy
-   of every row, staged on the daemon's disk (under the system temp
-   directory unless `BINTRAIL_CONSOLE_BASELINE_STAGING` says otherwise) until the next
-   build replaces it or the daemon restarts) and **Verification** (run
+   bintrail needed on the restore side; the build is a full plaintext copy
+   of every row, staged on the daemon's disk under the system temp
+   directory unless `BINTRAIL_CONSOLE_BASELINE_STAGING` says otherwise) and
+   **Verification** (run
    `bintrail verify` and read past runs). These produce and validate the
    artifacts a restore depends on, so they are operations rather than
    settings; they lived on the Storage page until they outgrew it.
+   A staged `.sql` build does not stay on disk: it is removed as soon as a
+   download completes, 4 hours after the build finished if nobody
+   downloaded it (the Ready line shows the deadline and the size), when a
+   new build for the same server starts, or when the daemon restarts (every
+   build a previous process left behind, finished or interrupted, is removed
+   at startup). If a removal fails, the build keeps its state, the card says
+   why, and the daemon retries every minute. If a new build starts and the
+   previous one cannot be removed, the new build still runs and stays
+   downloadable; its status names the previous build's directory until that
+   removal succeeds. The Storage page shows what is staged while it exists,
+   previous builds that could not be removed included.
 7. **Settings** (under `watch` only) — **Storage** (rotation policy,
    per-source S3 archiving, a baseline summary card, AWS credential signals,
    and a usage-telemetry opt-out — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
    rotation dialog).
+
+Every view whose subject has a page on www.dbtrail.com/docs (Events, Restore,
+Backups, Verification, Storage, Connect AI) shows a small **Docs** link beside
+its title. It opens that page in a new tab and is a plain link: the console
+makes no request for it, so it costs nothing on an air-gapped host. Views with
+no page of their own show no link.
 
 ## Managing servers
 
@@ -451,6 +468,14 @@ compact baseline summary card and links onward:
 - **S3 archiving per source** — every monitored server with its
   `Archive to S3` destination (or `drop-only` when none), with a shortcut into
   that server's edit form. The boot (cli) index always rotates drop-only.
+- **Staged downloads**: the `.sql` backups built from the Backups page that
+  are waiting on the daemon's disk for their download: each build's server,
+  size and download deadline, the total, and where they live. A build is
+  removed once downloaded or 4 hours after it finished, so this card is
+  usually empty; it exists so that space is never invisible. A build that
+  could not be removed stays listed with the reason (a previous build a
+  newer one could not clear included) and is retried every minute. Shown
+  only on a daemon that can build `.sql` backups.
 - **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one

@@ -68,6 +68,8 @@ var (
 	rTable          string
 	rPK             string
 	rPKs            []string
+	rPKMin          string
+	rPKMax          string
 	rLimitPerPK     int
 	rEventType      string
 	rGTID           string
@@ -94,6 +96,8 @@ func init() {
 	recoverCmd.Flags().StringVar(&rTable, "table", "", "Filter by table name")
 	recoverCmd.Flags().StringVar(&rPK, "pk", "", "Filter by primary key value(s), pipe-delimited for composite PKs")
 	recoverCmd.Flags().StringSliceVar(&rPKs, "pks", nil, "Filter by multiple primary key values (comma-separated, or repeat the flag); requires --schema and --table; mutually exclusive with --pk")
+	recoverCmd.Flags().StringVar(&rPKMin, "pk-min", "", pkMinFlagHelp)
+	recoverCmd.Flags().StringVar(&rPKMax, "pk-max", "", pkMaxFlagHelp)
 	recoverCmd.Flags().IntVar(&rLimitPerPK, "limit-per-pk", 0, "Cap reversed events per pk_values to the latest N (0 = unlimited); requires --pk or --pks")
 	recoverCmd.Flags().StringVar(&rEventType, "event-type", "", "Filter by event type: INSERT, UPDATE, or DELETE")
 	recoverCmd.Flags().StringVar(&rGTID, "gtid", "", "Filter by GTID (e.g. uuid:42)")
@@ -148,6 +152,10 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	if rLimitPerPK > 0 && rPK == "" && len(rPKs) == 0 {
 		return fmt.Errorf("--limit-per-pk requires --pk or --pks")
 	}
+	pkRange, err := validatePKRangeFlags(rPKMin, rPKMax, rSchema, rTable, rPK, rPKs)
+	if err != nil {
+		return err
+	}
 	if len(rColumnEq) > 0 && (rSchema == "" || rTable == "") {
 		return fmt.Errorf("--column-eq requires both --schema and --table")
 	}
@@ -179,6 +187,7 @@ func runRecover(cmd *cobra.Command, args []string) error {
 		Table:      rTable,
 		PKValues:   rPK,
 		PKValuesIn: rPKs,
+		PKRange:    pkRange,
 		EventType:  eventType,
 		GTID:       rGTID,
 		Since:      since,
@@ -277,10 +286,17 @@ func runRecover(cmd *cobra.Command, args []string) error {
 	// The resolver enables PK-only WHERE clauses in recovery SQL.
 	// If unavailable, the generator falls back to all-columns WHERE — verbose
 	// but always correct for tables without duplicate rows.
-	resolver, err := metadata.NewResolver(db, 0) // 0 = latest snapshot
-	if err != nil {
-		slog.Warn("could not load schema snapshot; WHERE clauses will use all columns", "error", err)
+	resolver, resolverErr := metadata.NewResolver(db, 0) // 0 = latest snapshot
+	if resolverErr != nil {
+		slog.Warn("could not load schema snapshot; WHERE clauses will use all columns", "error", resolverErr)
 		resolver = nil
+	}
+	// --pk-min/--pk-max are NOT best-effort (#1440): the cast is chosen from
+	// the key column's signedness, so with no snapshot the range is refused
+	// rather than guessed, and a composite or non-integer key is refused
+	// here, before any event is fetched.
+	if err := resolvePKRange(resolver, resolverErr, rSchema, rTable, pkRange); err != nil {
+		return err
 	}
 
 	// ── Re-encode --pk/--pks against the at-rest pk_values form ────────────────
