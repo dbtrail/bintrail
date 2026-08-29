@@ -52,16 +52,16 @@ const (
 //
 // Both engines exclude rows whose pk_values is not an integer of the chosen
 // width. DuckDB does it through TRY_CAST (NULL compares false). MySQL's CAST
-// never fails, it coerces: '' and 'abc' become 0, '1|2' becomes 1, '12abc'
-// becomes 12, '-5' AS UNSIGNED wraps, an overlong digit run saturates. Such
-// keys exist in the retained window whenever the key drifted after capture
-// (composite to single column, VARCHAR to BIGINT, signed to unsigned) and in
-// the #318 drift rows with an empty key, so the live predicate adds a round
-// trip, CAST(CAST(pk_values AS T) AS CHAR) = BINARY pk_values, which admits only a
-// key the cast reproduces exactly. One asymmetry remains and is accepted: a
-// key spelled with leading zeros, a plus sign or spaces ('007', '+5', ' 12')
-// passes TRY_CAST and fails the round trip; no key formatted by
-// event.BuildPKValues is ever stored that way.
+// never fails, it coerces: an empty key and 'abc' become 0, '1|2' becomes 1,
+// '12abc' becomes 12, '-5' AS UNSIGNED wraps, an overlong digit run
+// saturates. Such keys exist in the retained window whenever the key drifted
+// after capture (composite to single column, VARCHAR to BIGINT, signed to
+// unsigned) and in the #318 drift rows with an empty key, so the live
+// predicate adds a round trip, CAST(CAST(pk_values AS T) AS CHAR) = BINARY
+// pk_values, which admits only a key the cast reproduces exactly. One
+// asymmetry remains and is accepted: a key spelled with leading zeros, a plus
+// sign or spaces ('007', '+5', ' 12') passes TRY_CAST and fails the round
+// trip; no key formatted by event.BuildPKValues is ever stored that way.
 type PKRange struct {
 	// Cast is the integer type both engines compare through. Set by
 	// ResolveCast from the resolved PK column; PKCastUnset is refused.

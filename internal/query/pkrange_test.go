@@ -205,7 +205,7 @@ func TestPKRange_Contains(t *testing.T) {
 // TestBuildQuery_pkRange pins the live-index predicate: the cast follows the
 // resolved signedness, the bounds are inlined as integer literals (no bind
 // args added), and the round-trip guard is present so a drifted key MySQL's
-// CAST would coerce ('' to 0, '1|2' to 1) cannot match.
+// CAST would coerce (an empty key to 0, '1|2' to 1) cannot match.
 func TestBuildQuery_pkRange(t *testing.T) {
 	q, args := buildQuery(Options{Schema: "s", Table: "t", Limit: 10,
 		PKRange: &PKRange{Cast: PKCastUnsigned, Min: bigStr(t, "10"), Max: bigStr(t, "18446744073709551610")}})
