@@ -6056,7 +6056,10 @@ function shellWord(s) {
 // daemon named one; on a wildcard bind (host empty) the name this page was
 // opened on, which is the one name known to reach the daemon's machine.
 function flashbackHost(fb) {
-  return fb.host || location.hostname || "127.0.0.1";
+  // location.hostname keeps the brackets of an IPv6 literal ("[::1]"), while
+  // a named bind comes through Go's SplitHostPort bare ("::1"); strip them so
+  // both shapes print the same way.
+  return fb.host || (location.hostname || "").replace(/^\[|\]$/g, "") || "127.0.0.1";
 }
 
 // sqlClientPanel renders the port's state in one of four shapes: could not
@@ -6079,7 +6082,10 @@ function sqlClientPanel(servers, fb) {
       // serve: there is no daemon here to carry the port, so naming the
       // watch flag as "how to turn it on" would send the reader to a flag
       // this process does not have.
-      body.append(el("p", { class: "cn-sql-row", text: "Not available from this read-only console. The time-travel port is part of the watch daemon (CLI: bintrail-console watch --flashback-listen)." }));
+      body.append(el("p", { class: "cn-sql-row" },
+        "Not available from this read-only console. The time-travel port is part of the watch daemon (CLI: ",
+        el("code", { text: "bintrail-console watch --flashback-listen" }),
+        "). Run that daemon and your usual MySQL client can read any table as it was at a chosen moment."));
       return panel;
     }
     body.append(el("p", { class: "cn-sql-row", text: "Off. The port is set when the daemon starts, not from this page." }));
@@ -6116,7 +6122,7 @@ function sqlClientPanel(servers, fb) {
       " Use _snapshot for the whole table (needs a backup) and _diff for what changed between two moments. The user picks the server, so each server has its own line; pick another in the sidebar and copy again."),
     el("p", { class: "form-hint", text: fb.host
       ? "The port answers on that address only. Run mysql where it can reach it (on the daemon's machine when it is 127.0.0.1), or open a tunnel to it."
-      : "The port answers on every network address of the daemon's machine; the command uses the name this page was opened with." })));
+      : "The port answers on every network address of the daemon's machine; the command uses the name this page was opened with. If that name is a reverse proxy in front of the console, it does not pass this port through, so use the daemon machine's own name or address instead." })));
   return panel;
 }
 

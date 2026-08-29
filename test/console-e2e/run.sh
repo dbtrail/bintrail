@@ -19,6 +19,7 @@
 #   MYSQL_CONTAINER     docker container running test MySQL, default bintrail-test-mysql
 #   CONSOLE_BIN         path to a prebuilt bintrail-console (else it is built)
 #   PW_CHANNEL          playwright browser channel (e.g. "chrome"); default bundled chromium
+#   E2E_FLASHBACK_PORT  port for the daemon's embedded time-travel SQL port, default 13308
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

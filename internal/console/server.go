@@ -193,10 +193,12 @@ type Config struct {
 	// port (#996) is bound on, reported by GET /api/flashback so the Connect
 	// page can show how to reach it (#1446). Set ONLY by `bintrail-console
 	// watch --flashback-listen`, which refuses to start when that bind fails,
-	// so a non-empty value means the port is up. Empty on the standalone
-	// serve (which owns no such port) and on a watch that did not opt in;
-	// the page then reports the port as off. Display only: the console never
-	// opens or closes the port itself.
+	// so a non-empty value is an address that was bound at startup. It is
+	// NOT a liveness signal: a mid-run serve failure on that port is logged
+	// and swallowed (startFlashbackPort), and nothing here re-probes it.
+	// Empty on the standalone serve (which owns no such port) and on a watch
+	// that did not opt in; the page then reports the port as off. Display
+	// only: the console never opens or closes the port itself.
 	FlashbackListen string
 }
 

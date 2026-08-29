@@ -1408,7 +1408,8 @@ type consoleOpts struct {
 	// FlashbackListen is the --flashback-listen address, reported to the
 	// console so the Connect page can show the port (#1446). Empty = off.
 	// startFlashbackPort binds it after console.New and aborts the daemon on
-	// failure, so a value the console reports is one the port is serving.
+	// a bind failure, so a value the console reports was bound at startup;
+	// a mid-run serve failure is logged and swallowed, not reflected here.
 	FlashbackListen string
 }
 
