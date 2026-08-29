@@ -3,6 +3,7 @@ package query
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/big"
 	"regexp"
@@ -258,9 +259,19 @@ func (r *PKRange) Contains(pkValues string) bool {
 // comparable. MySQL types a literal above 2^63-1 as BIGINT UNSIGNED, so the
 // comparison against CAST(... AS UNSIGNED) stays exact.
 func (r *PKRange) mysqlPredicates() []string {
-	cast := "SIGNED"
-	if r.Cast == PKCastUnsigned {
+	var cast string
+	switch r.Cast {
+	case PKCastSigned:
+		cast = "SIGNED"
+	case PKCastUnsigned:
 		cast = "UNSIGNED"
+	default:
+		// Options.ValidatePKRange refuses this before buildQuery runs; this
+		// is the structural belt for a builder with no error path (the same
+		// shape as the unsafe ColumnEq column above): never default to a
+		// cast, emit a no-match clause and say so.
+		slog.Error("query.buildQuery: primary key range reached the SQL builder with no resolved cast; emitting no-match clause")
+		return []string{"1=0"}
 	}
 	// CAST('' AS UNSIGNED) is 0 with a warning, so a #318 drift row (empty
 	// pk_values) would match any range that includes 0. Exclude it up front,
@@ -277,18 +288,31 @@ func (r *PKRange) mysqlPredicates() []string {
 }
 
 // DuckDBPredicates renders the archive-side WHERE fragments, the mirror of the
-// live predicate over the Parquet pk_values column. TRY_CAST, not CAST: an
-// hour's archive file holds every table's events, and a plain CAST would
-// abort the whole scan on the first string key of some OTHER table, while
-// TRY_CAST yields NULL there and the comparison excludes the row. Bounds are
+// live predicate over the Parquet pk_values column. TRY_CAST, not CAST: a
+// plain CAST turns any non-integer key it is evaluated on into a conversion
+// error that aborts the whole scan, while TRY_CAST yields NULL there and the
+// comparison excludes the row. The case that is pinned by test is a #318
+// drift row (empty pk_values) in the SAME table, which CAST fails on. An
+// hour's archive file also holds every other table's keys; DuckDB was
+// observed to apply the table filter before the cast, so a string key of
+// another table did not trip CAST in the test, but TRY_CAST removes the
+// dependence on that evaluation order. Bounds are
 // inlined because database/sql's default value converter, which the duckdb
 // driver relies on, refuses a uint64 with the high bit set as a bind value,
 // and an unsigned BIGINT key can sit exactly there; DuckDB types a literal
 // above 2^63-1 wide enough to compare exactly against UBIGINT.
 func (r *PKRange) DuckDBPredicates() []string {
-	typ := "BIGINT"
-	if r.Cast == PKCastUnsigned {
+	var typ string
+	switch r.Cast {
+	case PKCastSigned:
+		typ = "BIGINT"
+	case PKCastUnsigned:
 		typ = "UBIGINT"
+	default:
+		// Same structural belt as mysqlPredicates: FetchWithTuning refuses
+		// an unresolved range first, and the builder never defaults a cast.
+		slog.Error("parquetquery: primary key range reached the SQL builder with no resolved cast; emitting no-match clause")
+		return []string{"FALSE"}
 	}
 	var preds []string
 	if r.Min != nil {

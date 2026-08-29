@@ -13,10 +13,10 @@ import (
 // ─── #1440: the archive mirror of the pk_min/pk_max predicate ───────────────
 
 // TestBuildFilters_pkRange pins the DuckDB predicate on every builder: the
-// cast type follows the resolved signedness, TRY_CAST (a plain CAST would
-// abort the scan on another table's string key in the same hour file), and
-// the bounds are inlined so a UBIGINT bound above 2^63-1 never has to travel
-// as a bind value database/sql refuses.
+// cast type follows the resolved signedness, TRY_CAST (a plain CAST aborts
+// the scan on a non-integer key, the empty key of a #318 drift row being the
+// pinned case), and the bounds are inlined so a UBIGINT bound above 2^63-1
+// never has to travel as a bind value database/sql refuses.
 func TestBuildFilters_pkRange(t *testing.T) {
 	top := new(big.Int)
 	top.SetString("18446744073709551610", 10)

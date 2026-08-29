@@ -67,6 +67,35 @@ func TestQueryAndRecoverTools_pkRange(t *testing.T) {
 		t.Errorf("pk_min 10 returned %s; 9 must be out and 100 in", got)
 	}
 
+	// query: pk_max must NARROW the result, alone and with pk_min.
+	queryKeys := func(args QueryArgs) string {
+		t.Helper()
+		res, _, err := MakeQueryTool(cfg)(ctx, &mcp.CallToolRequest{}, args)
+		if err != nil {
+			t.Fatalf("query handler: %v", err)
+		}
+		if res.IsError {
+			t.Fatalf("query refused: %s", resultText(res))
+		}
+		var rows []struct {
+			PKValues string `json:"pk_values"`
+		}
+		if err := json.Unmarshal([]byte(resultText(res)), &rows); err != nil {
+			t.Fatalf("query result is not JSON: %v\n%s", err, resultText(res))
+		}
+		var keys []string
+		for _, r := range rows {
+			keys = append(keys, r.PKValues)
+		}
+		return strings.Join(keys, ",")
+	}
+	if got := queryKeys(QueryArgs{Schema: dbName, Table: "orders", PKMin: "10", PKMax: "100"}); got != "10,100" {
+		t.Errorf("pk_min 10 pk_max 100 returned %q, want 10,100", got)
+	}
+	if got := queryKeys(QueryArgs{Schema: dbName, Table: "orders", PKMax: "9"}); got != "9" {
+		t.Errorf("pk_max 9 returned %q, want 9", got)
+	}
+
 	// query: the 64-bit unsigned key sits above 2^63, which a signed cast
 	// cannot hold; the snapshot's "bigint unsigned" must pick UNSIGNED.
 	res, _, _ = MakeQueryTool(cfg)(ctx, &mcp.CallToolRequest{}, QueryArgs{Schema: dbName, Table: "orders", PKMin: "9223372036854775808"})

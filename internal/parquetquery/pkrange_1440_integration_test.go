@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -31,8 +32,15 @@ import (
 // oracle computed in Go by numeric comparison.
 
 var (
-	pkRangeSignedKeys   = []string{"-5", "9", "10", "100", "9223372036854775800", ""}
-	pkRangeUnsignedKeys = []string{"9", "10", "100", "18446744073709551610", ""}
+	pkRangeSignedKeys   = []string{"-9223372036854775808", "-5", "9", "10", "100", "9223372036854775800", "9223372036854775807", ""}
+	pkRangeUnsignedKeys = []string{"9", "10", "100", "18446744073709551610", "18446744073709551615", ""}
+	// A string-keyed row of another table in the SAME hour file. Neither
+	// engine may trip on it. Note what this row does and does not prove: a
+	// TRY_CAST -> CAST mutation is killed by the EMPTY drift key of the
+	// queried table, not by this row (DuckDB applied the table filter before
+	// the cast when tried), so this row pins that the predicate stays total
+	// over a foreign string key, not that CAST would have failed on it.
+	pkRangeTextKeys = []string{"sku-abc"}
 )
 
 // seedPKRangeIndex creates two integer-keyed source tables in the test
@@ -70,6 +78,7 @@ func seedPKRangeIndex(t *testing.T) (db *sql.DB, dbName, archiveBase string) {
 	}
 	insert("t_signed", pkRangeSignedKeys)
 	insert("t_unsigned", pkRangeUnsignedKeys)
+	insert("t_text", pkRangeTextKeys)
 
 	archiveBase = filepath.Join(t.TempDir(), "bintrail_id=pkrange-1440")
 	hourDir := filepath.Join(archiveBase, "event_date=2026-06-01", "event_hour=12")
@@ -81,7 +90,7 @@ func seedPKRangeIndex(t *testing.T) (db *sql.DB, dbName, archiveBase string) {
 	if err != nil {
 		t.Fatalf("ArchivePartition: %v", err)
 	}
-	if want := int64(len(pkRangeSignedKeys) + len(pkRangeUnsignedKeys)); stats.Rows != want {
+	if want := int64(len(pkRangeSignedKeys) + len(pkRangeUnsignedKeys) + len(pkRangeTextKeys)); stats.Rows != want {
 		t.Fatalf("archived %d rows, want %d", stats.Rows, want)
 	}
 	return db, dbName, archiveBase
@@ -182,11 +191,14 @@ func TestIntegrationPKRange_liveAndArchiveAgree(t *testing.T) {
 		// top of the range and exclude it.
 		{"t_signed", pkRangeSignedKeys, "-5", "9", query.PKCastSigned},
 		{"t_signed", pkRangeSignedKeys, "", "-1", query.PKCastSigned},
-		// 64-bit width: the top signed key, and an unsigned key above 2^63
-		// that a signed cast cannot hold.
+		// 64-bit width: the top signed keys, and unsigned keys above 2^63
+		// that a signed cast cannot hold, up to the exact limits.
 		{"t_signed", pkRangeSignedKeys, "9223372036854775000", "", query.PKCastSigned},
+		{"t_signed", pkRangeSignedKeys, "9223372036854775807", "9223372036854775807", query.PKCastSigned},
+		{"t_signed", pkRangeSignedKeys, "-9223372036854775808", "-9223372036854775808", query.PKCastSigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "9223372036854775808", "", query.PKCastUnsigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "18446744073709551610", "18446744073709551615", query.PKCastUnsigned},
+		{"t_unsigned", pkRangeUnsignedKeys, "18446744073709551615", "18446744073709551615", query.PKCastUnsigned},
 		// A range that includes 0: the empty drift key must not leak in as 0.
 		{"t_signed", pkRangeSignedKeys, "0", "0", query.PKCastSigned},
 		{"t_unsigned", pkRangeUnsignedKeys, "0", "9", query.PKCastUnsigned},
@@ -208,15 +220,20 @@ func TestIntegrationPKRange_liveAndArchiveAgree(t *testing.T) {
 			if err != nil {
 				t.Fatalf("archive fetch: %v", err)
 			}
+			// slices.Equal, not a joined string: Join([""]) == Join(nil),
+			// which would let a leaked empty drift key pass as no row.
 			want := numericOracle(tc.keys, tc.lo, tc.hi)
-			if got := keysOf(live); strings.Join(got, ",") != strings.Join(want, ",") {
-				t.Errorf("live index returned %v, want %v", got, want)
+			if len(want) == 0 && (tc.lo != "0" || tc.hi != "0") {
+				t.Fatalf("oracle is empty for %s; the case proves nothing", name)
 			}
-			if got := keysOf(arch); strings.Join(got, ",") != strings.Join(want, ",") {
-				t.Errorf("archive returned %v, want %v", got, want)
+			if got := keysOf(live); !slices.Equal(got, want) {
+				t.Errorf("live index returned %d row(s) %q, want %d %q", len(got), got, len(want), want)
 			}
-			if strings.Join(keysOf(live), ",") != strings.Join(keysOf(arch), ",") {
-				t.Errorf("engines disagree: live %v vs archive %v", keysOf(live), keysOf(arch))
+			if got := keysOf(arch); !slices.Equal(got, want) {
+				t.Errorf("archive returned %d row(s) %q, want %d %q", len(got), got, len(want), want)
+			}
+			if !slices.Equal(keysOf(live), keysOf(arch)) {
+				t.Errorf("engines disagree: live %q vs archive %q", keysOf(live), keysOf(arch))
 			}
 		})
 	}

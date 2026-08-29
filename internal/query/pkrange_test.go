@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"math/big"
 	"strings"
 	"testing"
@@ -232,6 +233,51 @@ func TestBuildQuery_pkRange(t *testing.T) {
 	}
 	if strings.Contains(q, "UNSIGNED") {
 		t.Errorf("a signed key must never be cast UNSIGNED (negatives would wrap):\n%s", q)
+	}
+}
+
+// TestEngineFetch_refusesUnresolvedPKRange is the live-index mirror of the
+// archive engine's belt: Engine.Fetch must refuse an unresolved range before
+// building SQL. The engine has no database here on purpose: validation runs
+// first, so a nil db proves nothing was queried.
+func TestEngineFetch_refusesUnresolvedPKRange(t *testing.T) {
+	_, err := New(nil).Fetch(context.Background(), Options{Schema: "s", Table: "t",
+		PKRange: &PKRange{Min: big.NewInt(1)}})
+	if err == nil || !strings.Contains(err.Error(), "not resolved") {
+		t.Fatalf("unresolved range reached the live engine: %v", err)
+	}
+	_, err = New(nil).Fetch(context.Background(), Options{PKRange: &PKRange{Cast: PKCastSigned, Min: big.NewInt(1)}})
+	if err == nil || !strings.Contains(err.Error(), "schema and table") {
+		t.Fatalf("range without schema/table reached the live engine: %v", err)
+	}
+}
+
+// TestPredicates_unresolvedCastNeverDefaults pins the structural belt in the
+// builders themselves: with the engine check gone, an unresolved cast must
+// still not become SIGNED (or BIGINT) by default. It emits a no-match clause.
+func TestPredicates_unresolvedCastNeverDefaults(t *testing.T) {
+	q, _ := buildQuery(Options{Schema: "s", Table: "t", Limit: 10, PKRange: &PKRange{Min: big.NewInt(1)}})
+	if strings.Contains(q, "CAST(") {
+		t.Errorf("an unresolved range was cast by default:\n%s", q)
+	}
+	if !strings.Contains(q, "1=0") {
+		t.Errorf("an unresolved range must emit a no-match clause:\n%s", q)
+	}
+	got := (&PKRange{Min: big.NewInt(1)}).DuckDBPredicates()
+	if len(got) != 1 || got[0] != "FALSE" {
+		t.Errorf("DuckDB unresolved range = %v, want [FALSE]", got)
+	}
+}
+
+// TestSnapshotFilters_refusesPKRange pins the --include-snapshot belt: the
+// baseline reader has no pk_values to range over and must say so.
+func TestSnapshotFilters_refusesPKRange(t *testing.T) {
+	_, _, err := snapshotFilters(Options{Schema: "s", Table: "t", PKRange: &PKRange{Cast: PKCastSigned, Min: big.NewInt(1)}})
+	if err == nil || !strings.Contains(err.Error(), "cannot be applied to snapshot rows") {
+		t.Fatalf("snapshotFilters accepted a range: %v", err)
+	}
+	if _, _, err := snapshotFilters(Options{Schema: "s", Table: "t"}); err != nil {
+		t.Fatalf("no range must pass: %v", err)
 	}
 }
 

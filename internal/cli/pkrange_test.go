@@ -27,6 +27,30 @@ func TestPKRangeFlagHelp_plainCopy(t *testing.T) {
 	}
 }
 
+// TestPKRangeFlags_bindToTheirOwnVariables: a flag bound to the wrong
+// variable (--pk-max writing qPKMin) passes every validation test that sets
+// the globals directly, so parse the flags the way cobra does.
+func TestPKRangeFlags_bindToTheirOwnVariables(t *testing.T) {
+	saved := struct{ qmin, qmax, rmin, rmax string }{qPKMin, qPKMax, rPKMin, rPKMax}
+	t.Cleanup(func() {
+		qPKMin, qPKMax, rPKMin, rPKMax = saved.qmin, saved.qmax, saved.rmin, saved.rmax
+		_ = queryCmd.ParseFlags([]string{"--pk-min", "", "--pk-max", ""})
+		_ = recoverCmd.ParseFlags([]string{"--pk-min", "", "--pk-max", ""})
+	})
+	if err := queryCmd.ParseFlags([]string{"--pk-min", "1", "--pk-max", "2"}); err != nil {
+		t.Fatal(err)
+	}
+	if qPKMin != "1" || qPKMax != "2" {
+		t.Errorf("query: --pk-min/--pk-max bound to (%q, %q), want (1, 2)", qPKMin, qPKMax)
+	}
+	if err := recoverCmd.ParseFlags([]string{"--pk-min", "3", "--pk-max", "4"}); err != nil {
+		t.Fatal(err)
+	}
+	if rPKMin != "3" || rPKMax != "4" {
+		t.Errorf("recover: --pk-min/--pk-max bound to (%q, %q), want (3, 4)", rPKMin, rPKMax)
+	}
+}
+
 func TestRunQuery_pkRangeRequiresSchemaTable(t *testing.T) {
 	saved := struct{ min, max, s, tbl string }{qPKMin, qPKMax, qSchema, qTable}
 	t.Cleanup(func() { qPKMin, qPKMax, qSchema, qTable = saved.min, saved.max, saved.s, saved.tbl })
