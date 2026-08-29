@@ -1,8 +1,10 @@
 package consoleapp
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -946,5 +948,64 @@ func TestSQLExportDelivered_lateVanishedRemovalKeepsDownloaded(t *testing.T) {
 	sup.mu.Unlock()
 	if pending != "" {
 		t.Fatalf("pending = %q after the late removal, want nothing owed", pending)
+	}
+}
+
+// TestSQLExportOrphanRetry_neverRemovesTheCurrentBuild: an orphan record
+// that names the directory the current run owns is dropped, not removed.
+// The wipe cannot record one under an advancing clock; the retry must not
+// depend on that.
+func TestSQLExportOrphanRetry_neverRemovesTheCurrentBuild(t *testing.T) {
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	d1 := seedFinishedExport(t, sup, "srv1")
+	sup.noteOrphan("srv1", d1, errors.New("stale record"))
+	sup.removeOrphan("srv1", d1)
+	if !onDisk(filepath.Join(d1, "shop.orders.00000.sql")) {
+		t.Fatal("the orphan retry removed the directory the current run owns")
+	}
+	sup.mu.Lock()
+	_, still := sup.exportOrphans["srv1"][d1]
+	sup.mu.Unlock()
+	if still {
+		t.Fatal("the stale orphan record must be dropped once it names the current build")
+	}
+	if st := sup.SQLExportStatus("srv1"); st.StagingError != "" {
+		t.Fatalf("staging_error = %q, want empty after the stale record is dropped", st.StagingError)
+	}
+}
+
+// TestSQLExportOrphanRetry_warnsOnlyWhenTheErrorChanges: the retry runs
+// every minute and on every poll, so a build the guard refuses forever
+// would otherwise fill the log with one identical warning per attempt.
+func TestSQLExportOrphanRetry_warnsOnlyWhenTheErrorChanges(t *testing.T) {
+	sup, _, cancel := newClockedSupervisor(t)
+	defer cancel()
+	seedFinishedExport(t, sup, "srv1")
+	orphan := filepath.Join(sup.sqlExportBase(), "srv1", "0")
+	prevFn := removeStagedBuildFn
+	t.Cleanup(func() { removeStagedBuildFn = prevFn })
+	fail := errors.New("permission denied")
+	removeStagedBuildFn = func(base, dir string) (int64, bool, error) { return 0, false, fail }
+
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	sup.noteOrphan("srv1", orphan, fail) // the wipe's record; it warned once itself
+	sup.removeOrphan("srv1", orphan)
+	sup.removeOrphan("srv1", orphan)
+	if n := strings.Count(buf.String(), "could not remove a previous build"); n != 0 {
+		t.Fatalf("warned %d times on an unchanged error, want 0:\n%s", n, buf.String())
+	}
+	fail = errors.New("read-only file system")
+	sup.removeOrphan("srv1", orphan)
+	sup.removeOrphan("srv1", orphan)
+	if n := strings.Count(buf.String(), "could not remove a previous build"); n != 1 {
+		t.Fatalf("warned %d times after the error changed once, want 1:\n%s", n, buf.String())
+	}
+	if st := sup.SQLExportStatus("srv1"); !strings.Contains(st.StagingError, "read-only file system") {
+		t.Fatalf("staging_error = %q, want the latest error", st.StagingError)
 	}
 }

@@ -434,7 +434,11 @@ func (s *baselineSupervisor) syncStagingErrorLocked(serverID string) {
 // noteOrphan records a previous build under serverID's staging root that a
 // removal could not clear, with the error, and puts it on the server's
 // status. Idempotent: a retry that fails again only refreshes the error.
-func (s *baselineSupervisor) noteOrphan(serverID, path string, err error) {
+// Reports whether the record CHANGED (a new path, or a different error
+// text), which is what decides whether the caller logs it: the retry runs
+// every minute and on every poll, and a sibling the guard will refuse
+// forever must not warn on each of them.
+func (s *baselineSupervisor) noteOrphan(serverID, path string, err error) (changed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.exportOrphans == nil {
@@ -443,8 +447,10 @@ func (s *baselineSupervisor) noteOrphan(serverID, path string, err error) {
 	if s.exportOrphans[serverID] == nil {
 		s.exportOrphans[serverID] = make(map[string]string)
 	}
+	prev, had := s.exportOrphans[serverID][path]
 	s.exportOrphans[serverID][path] = err.Error()
 	s.syncStagingErrorLocked(serverID)
+	return !had || prev != err.Error()
 }
 
 // forgetOrphan drops a previous build whose removal succeeded, and takes it
@@ -467,12 +473,28 @@ func (s *baselineSupervisor) forgetOrphan(serverID, path string) {
 // clear. Through the same guard as every removal; no hold is consulted
 // because the run that could have held it was replaced by the trigger
 // (the same posture as the wipe itself).
+//
+// Never the directory the CURRENT run owns: an orphan can only enter the
+// map from the wipe, which skips the build that is starting, so under an
+// advancing clock the two never coincide; this check is what makes that a
+// property of the code rather than of the clock.
 func (s *baselineSupervisor) removeOrphan(serverID, path string) {
+	s.mu.Lock()
+	run := s.exportRuns[serverID]
+	owned := run != nil && run.dir == path
+	s.mu.Unlock()
+	if owned {
+		s.forgetOrphan(serverID, path)
+		return
+	}
 	freed, sized, err := removeStagedBuildFn(s.sqlExportBase(), path)
 	if err != nil {
-		s.noteOrphan(serverID, path, err)
-		slog.Warn("sql export: could not remove a previous build; it stays on disk and the removal is retried every minute",
-			"id", serverID, "path", path, "error", err)
+		if s.noteOrphan(serverID, path, err) {
+			slog.Warn("sql export: could not remove a previous build; it stays on disk and the removal is retried every minute (this line repeats only when the error changes)",
+				"id", serverID, "path", path, "error", err)
+		} else {
+			slog.Debug("sql export: a previous build still could not be removed", "id", serverID, "path", path, "error", err)
+		}
 		return
 	}
 	s.forgetOrphan(serverID, path)
