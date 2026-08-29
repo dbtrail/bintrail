@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The console's Status page shows the index disk-capacity projection**
+  (#1444). An **Index disk** card carries what `bintrail doctor` already
+  computes, for the selected server: index size, write rate, the size the
+  index settles at for the configured retention, free space on the index
+  volume and how long it lasts at the current rate. The grade is the
+  doctor's (`GET /api/capacity` runs the doctor's own probe and verdict over
+  the console's connection, with no thresholds of its own); a warn or fail
+  grade also renders a box above the cards with the plain reading and what
+  fixes it, so a filling index volume is seen where operators look, before
+  capture stalls. Honest where a piece is missing: free space the process
+  cannot measure (the index on another host or container) reads "not
+  measurable from here", never a number, and the standalone read-only
+  console, which runs no rotation, reports the retention as not known
+  instead of grading an index another process rotates as unbounded; only
+  the free-space floor still warns there. Under `watch` the window is the
+  effective rotation policy, override or daemon default, and rotation off
+  grades as unbounded growth.
 - **`bintrail export iceberg`** (#1466). Writes each table's current state as
   an Apache Iceberg table under `--warehouse`, incrementally: the first run
   loads the newest baseline snapshot, every run after that folds the events

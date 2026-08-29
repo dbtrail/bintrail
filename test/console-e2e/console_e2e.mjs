@@ -429,6 +429,57 @@ try {
   cont.missingNeither ? ok("continuity: missing continuity (legacy backend) shows no green") : bad("continuity: missing continuity (legacy backend) shows no green", "rendered green without continuity");
   cont.nilNeither ? ok("continuity: nil stream shows neither box") : bad("continuity: nil stream shows neither box", "rendered a box for nil stream");
 
+  // Scenario 8c — index disk (#1444). capacityCard/capacityBox are pure and
+  // fixture-drivable like continuityBox: the doctor's grade arrives as
+  // `status`/`reason` and the copy keys on the reason. Pinned here, in a real
+  // browser: the fail grade renders the red error-box (color applied, not just
+  // the class), a warn grade the warn-box, pass/skip no box at all; free space
+  // the backend could not measure is WORDED, never shown as a number; the
+  // standalone console's unknown retention is worded too; a failed fetch
+  // renders a note inside the card, not a blank; and no rendered string
+  // carries an em dash (copy rule).
+  const idxDisk = await page.evaluate(() => {
+    const base = { measured: true, sample_hours: 6, current_bytes: 6000000, events_per_day: 24000, bytes_per_event: 1000,
+      growth_bytes_per_day: 24000000, projected_bytes: 720000000, remaining_bytes: 714000000,
+      retention: { known: true, retain: "30d", source: "default", enabled: true } };
+    const fail = { ...base, status: "fail", reason: "growth_exceeds_free", free_known: true, free_bytes: 10000000, days_until_full: 0.42 };
+    const warn = { ...base, status: "warn", reason: "free_under_floor", remaining_bytes: 0, free_known: true, free_bytes: 50000000, days_until_full: 2.1 };
+    const pass = { ...base, status: "pass", reason: "ok", free_known: true, free_bytes: 2000000000, days_until_full: 83.3 };
+    const freeUnknown = { ...base, status: "skip", reason: "free_unknown", free_known: false, free_bytes: 0 };
+    const serve = { ...base, status: "skip", reason: "retention_unknown", projected_bytes: 0, remaining_bytes: 0,
+      retention: { known: false, enabled: false }, free_known: true, free_bytes: 2000000000, days_until_full: 83.3 };
+    const failBox = capacityBox(fail), warnBox = capacityBox(warn), passBox = capacityBox(pass), unknownBox = capacityBox(freeUnknown), serveBox = capacityBox(serve);
+    const failCard = capacityCard(fail), passCard = capacityCard(pass), unknownCard = capacityCard(freeUnknown), serveCard = capacityCard(serve), errCard = capacityCard({ error: "boom" });
+    let failBorder = "";
+    document.body.appendChild(failBox); failBorder = getComputedStyle(failBox).borderColor; failBox.remove();
+    const texts = [failBox, warnBox, failCard, passCard, unknownCard, serveCard, errCard].map((n) => n.textContent).join("\n");
+    const unknownState = unknownCard.querySelector(".hstat");
+    return {
+      failRed: failBox.classList.contains("error-box") && /will fill before rotation/.test(failBox.textContent) && /under a day/.test(failBox.textContent),
+      failBorder,
+      warnOrange: warnBox.classList.contains("warn-box") && /Little free space/.test(warnBox.textContent),
+      passNone: passBox === null && unknownBox === null && serveBox === null,
+      failState: !!failCard.querySelector(".hstat-err") && /will fill/.test(failCard.textContent),
+      passNote: /Rotation caps the index/.test(passCard.textContent) && /1\.9 GB/.test(passCard.textContent),
+      unknownWorded: /not measurable from here/.test(unknownCard.textContent) && !/0 B/.test(unknownCard.textContent) && !!unknownState && unknownState.classList.contains("hstat-muted"),
+      serveWorded: /not known here/.test(serveCard.textContent) && !/steady size/.test(serveCard.textContent),
+      errNote: /Could not measure the index disk: boom/.test(errCard.textContent),
+      noEmDash: !/—/.test(texts),
+    };
+  });
+  idxDisk.failRed ? ok("index disk: fail renders the red error-box with days until full") : bad("index disk: fail renders the red error-box with days until full", "no .error-box or wording missing");
+  (idxDisk.failBorder && idxDisk.failBorder !== "rgba(0, 0, 0, 0)" && idxDisk.failBorder !== "rgb(0, 0, 0)")
+    ? ok("index disk: red error-box actually renders (CSS applied)")
+    : bad("index disk: red error-box actually renders (CSS applied)", `borderColor=${idxDisk.failBorder}`);
+  idxDisk.warnOrange ? ok("index disk: warn renders the warn-box") : bad("index disk: warn renders the warn-box", "no .warn-box");
+  idxDisk.passNone ? ok("index disk: pass and skip grades render no box") : bad("index disk: pass and skip grades render no box", "a box rendered for pass/skip");
+  idxDisk.failState ? ok("index disk: card state chip is red on fail") : bad("index disk: card state chip is red on fail", "no .hstat-err");
+  idxDisk.passNote ? ok("index disk: pass card reads the free space and the cap") : bad("index disk: pass card reads the free space and the cap", "note or free figure missing");
+  idxDisk.unknownWorded ? ok("index disk: unmeasurable free space is worded, never a number") : bad("index disk: unmeasurable free space is worded, never a number", "showed 0 B or no muted chip");
+  idxDisk.serveWorded ? ok("index disk: standalone console says the window is not known here") : bad("index disk: standalone console says the window is not known here", "claimed a window or a steady size");
+  idxDisk.errNote ? ok("index disk: a failed fetch renders a note inside the card") : bad("index disk: a failed fetch renders a note inside the card", "card blank on error");
+  idxDisk.noEmDash ? ok("index disk: rendered copy carries no em dash") : bad("index disk: rendered copy carries no em dash", "em dash in rendered text");
+
   // Scenario 8b — capture-degraded banner (#1296). captureHealthBox is pure
   // like continuityBox. What it must NOT do again: render advice written in
   // this file. The cause/remedy/scope prose is built by the backend

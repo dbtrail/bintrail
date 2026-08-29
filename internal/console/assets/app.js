@@ -3135,8 +3135,12 @@ function renderTimeline(container, data, onDone) {
 async function renderStatus() {
   const gen = serverGen, vgen = viewGen;
   viewLoading();
-  let data;
-  try { data = await api("/api/status"); }
+  let data, capacity;
+  // The index-disk read degrades independently (as the Storage panels do): a
+  // failed /api/capacity renders its own note inside the card, never blanking
+  // the health page it sits on.
+  const asErr = (err) => ({ error: (err && err.message) || String(err) });
+  try { [data, capacity] = await Promise.all([api("/api/status"), api("/api/capacity").catch(asErr)]); }
   catch (err) { if (gen !== serverGen || vgen !== viewGen) return; const v = VIEW(); clear(v); v.append(pageHead("Status", null)); renderError(v, err); return; }
   if (gen !== serverGen || vgen !== viewGen) return;
   updateSideMeta(data);
@@ -3183,6 +3187,7 @@ async function renderStatus() {
     ["rows", arch.total_rows],
     ["size", arch.total_size_human],
   ]));
+  cards.append(capacityCard(capacity));
   // Replication-health panel (#599): the streaming daemon polls the PostgreSQL source
   // (slot wal_status/lag + REPLICA IDENTITY coverage) and persists a snapshot to the
   // index; this renders it. Gated on source==postgresql AND a snapshot existing.
@@ -3197,6 +3202,10 @@ async function renderStatus() {
   // second green box.
   const captureHealth = captureHealthBox(stream);
   if (captureHealth) v.append(captureHealth);
+  // Index-disk surface (#1444): only the warn/fail grades render a box, so a
+  // filling index volume is read before the cards, next to the other alarms.
+  const capBox = capacityBox(capacity);
+  if (capBox) v.append(capBox);
   v.append(cards);
   viewEnter();
 }
@@ -3209,6 +3218,140 @@ function statusCard(title, rows) {
       el("span", { class: "kv-v" + (big ? " big" : ""), text: val === null || val === undefined ? "—" : String(val) })));
   });
   return card;
+}
+
+// ── Index disk (#1444) ──
+//
+// capacityCard and capacityBox render GET /api/capacity: the projection
+// `bintrail doctor` computes (write rate from the last 24 hours of partition
+// statistics, steady-state size over the retention window, free space on the
+// index volume when this process can measure it). The GRADE is the doctor's,
+// carried in `status`; the copy keys on `reason` and never re-derives a
+// threshold, so the console and the CLI cannot disagree about the same disk.
+// Two honesty rules the backend enforces and the copy must keep: free space
+// that is not measurable from here is said so, never shown as a number; and
+// the read-only console, which does not run rotation, gets no "grows without
+// limit" verdict (retention.known is false there). Both pure and
+// fixture-drivable, like continuityBox.
+
+function daysText(d) {
+  if (d === null || d === undefined || !isFinite(d)) return "";
+  if (d < 1) return "under a day";
+  if (d < 10) return "about " + d.toFixed(1) + " days";
+  return "about " + Math.round(d) + " days";
+}
+
+function capacityStateClass(status) {
+  switch (status) {
+    case "pass": return "hstat-ok";
+    case "warn": return "hstat-warn";
+    case "fail": return "hstat-err";
+    default: return "hstat-muted";
+  }
+}
+
+function capacityStateText(cap) {
+  switch (cap.reason) {
+    case "ok": return "ok";
+    case "headroom_low": return "tight headroom";
+    case "free_under_floor": return "little free space";
+    case "growth_exceeds_free": return "will fill";
+    case "no_retention": return "grows without limit";
+    case "free_unknown": return "free space unknown";
+    case "retention_unknown": return "no window known here";
+    case "not_enough_history": return "measuring";
+    case "not_initialized": return "no index yet";
+    default: return cap.status || "unknown";
+  }
+}
+
+// capacityNote is the one-line reading under the numbers: what the grade
+// means for this server, or why there is no grade.
+function capacityNote(cap) {
+  switch (cap.reason) {
+    case "ok":
+      return "Fits with room to spare: about " + humanBytes(cap.remaining_bytes) + " of growth ahead, " + humanBytes(cap.free_bytes) + " free. Rotation caps the index before the disk fills.";
+    case "free_unknown":
+      return "The index runs on another host or container, so free space is not measurable from this console. Watch the index volume there and keep about 30% headroom above the steady size.";
+    case "retention_unknown":
+      return "This read-only console does not run rotation, so it cannot tell how long the index keeps history or what size it settles at. Run the check where rotation runs (CLI: bintrail doctor --retain).";
+    case "not_enough_history":
+      return "A write rate needs at least 3 recent hours with events (" + (cap.sample_hours || 0) + " so far). Check back after a few hours of capture.";
+    case "not_initialized":
+      return "The index has no events table yet. It appears once capture starts.";
+    default:
+      return "";
+  }
+}
+
+function capacityCard(cap) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Index disk" }));
+  if (!cap || cap.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not measure the index disk" + (cap && cap.error ? ": " + cap.error : ".") }));
+    return card;
+  }
+  const ret = cap.retention || {};
+  const rows = [["index size", humanBytes(cap.current_bytes), true]];
+  rows.push(["write rate", cap.measured
+    ? humanBytes(cap.growth_bytes_per_day) + " a day (" + Math.round(cap.events_per_day).toLocaleString() + " events)"
+    : "not enough history yet"]);
+  rows.push(["keeps for", !ret.known ? "not known here" : (ret.enabled ? ret.retain + (ret.source === "override" ? "" : " (daemon default)") : "rotation is off")]);
+  if (cap.measured && cap.projected_bytes > 0) rows.push(["steady size", humanBytes(cap.projected_bytes)]);
+  rows.push(["free on disk", cap.free_known ? humanBytes(cap.free_bytes) : "not measurable from here"]);
+  if (cap.days_until_full !== null && cap.days_until_full !== undefined) rows.push(["free space lasts", daysText(cap.days_until_full) + " at this rate"]);
+  rows.forEach(([k, val, big]) => {
+    card.append(el("div", { class: "kv" },
+      el("span", { class: "kv-k", text: k }),
+      el("span", { class: "kv-v" + (big ? " big" : ""), text: val })));
+  });
+  card.append(healthKV("state", el("span", { class: "hstat " + capacityStateClass(cap.status), text: capacityStateText(cap) })));
+  const note = capacityNote(cap);
+  if (note) card.append(el("div", { class: "hlist", text: note }));
+  return card;
+}
+
+// capacityBox is the alarm: rendered only for the doctor's warn and fail
+// grades, with the plain reading of the numbers and what fixes it.
+function capacityBox(cap) {
+  if (!cap || cap.error || (cap.status !== "warn" && cap.status !== "fail")) return null;
+  const growth = humanBytes(cap.growth_bytes_per_day) + " a day";
+  const free = humanBytes(cap.free_bytes);
+  const days = daysText(cap.days_until_full);
+  const ahead = humanBytes(cap.remaining_bytes);
+  const window = (cap.retention && cap.retention.retain) || "";
+  const stops = " A full disk stops capture, and once the source deletes its binlogs those changes are gone for good.";
+  const shrink = "Grow the index volume, or shorten how long the index keeps history (CLI: --rotate-retain), so capture keeps running.";
+  let head, body, help;
+  switch (cap.reason) {
+    case "growth_exceeds_free":
+      head = "⚠ The index disk will fill before rotation caps the index";
+      body = "The index still grows by about " + ahead + " before the " + window + " window holds it steady, but only " + free + " is free. At " + growth + " that is " + days + "." + stops;
+      help = "Free space now: shorten the window and rotate right away (CLI: bintrail rotate --retain 7d), then grow the volume or keep the shorter window. Archive to Parquet first to keep the history.";
+      break;
+    case "free_under_floor":
+      head = "⚠ Little free space left on the index disk";
+      body = "Only " + free + " is free: " + days + " of writes at " + growth + ". Rotation normally frees space in time, but a stalled rotation or a burst of writes fills the disk and stops capture.";
+      help = shrink;
+      break;
+    case "headroom_low":
+      head = "⚠ The index disk is getting tight";
+      body = "The index still grows by about " + ahead + " before it settles, which uses over 70% of the " + free + " free. A burst of writes could fill the disk and stop capture.";
+      help = shrink;
+      break;
+    case "no_retention":
+      head = "⚠ Nothing caps the index: it grows without limit";
+      body = "This daemon runs with rotation off, so the index grows by " + growth + " at the current rate" +
+        (cap.free_known ? ", and the disk fills in " + days + " (" + free + " free)" : "") + "." + stops;
+      help = "Turn rotation on (CLI: --rotate-retain 30d) so old partitions are dropped and the index stays bounded. Archive to Parquet first to keep the history.";
+      break;
+    default:
+      return null;
+  }
+  const box = el("div", { class: cap.status === "fail" ? "error-box" : "warn-box" });
+  box.append(el("b", { text: head }));
+  box.append(el("div", { text: body }));
+  box.append(el("div", { class: "warn-line", text: help }));
+  return box;
 }
 
 // continuityBox renders the stream-continuity surface, or null when there is
