@@ -55,6 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and from `docs/TELEMETRY.md`. The wire format and `schema_version` are
   unchanged.
 
+### Fixed
+- **`export iceberg` no longer records `snapshot_id: 0` for a zero-row first
+  load** (#1509). A baseline with zero rows commits the table and its cursor
+  and no data file, so the table has no Iceberg snapshot; the audit event and
+  the `--format json` outcome named snapshot `0`, an id no snapshot has. The
+  audit event still fires (a table and a cursor were written) with `rows: 0`
+  and no `snapshot_id`; the JSON outcome omits the field. `Outcome.SnapshotID`
+  and `Commit.SnapshotID` are now `*int64`, nil when absent.
+
 ## [0.70.0] - 2026-08-28
 
 ### Added
