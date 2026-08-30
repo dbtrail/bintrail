@@ -381,10 +381,12 @@ func jsArmSummary(t *testing.T, body, anchor string) string {
 	//
 	// satisfies the check, and so does a `summary += " ..."` on the NEXT line
 	// (this helper never looks past the anchor's own line). app.js appends to a
-	// half-built sentence in eleven places, including an else-if chain shaped
+	// half-built sentence in eleven places — 13 `+=` sites minus one numeric
+	// counter and one URL-path append — including an else-if chain shaped
 	// exactly like this one. So this scope proves the hedge is in the RIGHT ARM
-	// and nothing more; the retired sentences are kept out of the function by a
-	// body-scoped ban in the caller, which is what actually closes the class.
+	// and nothing more. Keeping the retired sentences OUT is a separate,
+	// span-scoped ban in the caller; see the comment there for what that ban
+	// does and does not reach.
 	tail := strings.TrimLeft(rest[k+1:], " \t")
 	if !strings.HasPrefix(tail, ";") {
 		t.Fatalf("the arm at %q does not assign ONE plain string literal, so everything after the first "+
@@ -468,21 +470,40 @@ func TestCredentialsCard_armsReportWhatWasProbed(t *testing.T) {
 
 	// And the two retired sentences must not appear ANYWHERE in the function.
 	//
-	// The arm-scoped bans above cover the assignment this PR rewrote; they do
-	// not cover the shapes that put the claim back somewhere else in the same
-	// arm — a second statement after the `;`, a `summary +=` on the next line, a
-	// new `else if` below. Pass 4 built all four and every one of them stayed
-	// green with the arm scope alone. Scope is what makes the POSITIVE
-	// assertions meaningful (the hedge has to be in that arm, not merely
-	// present); for the negative, the smaller scope is the hole, so it is
-	// checked over the whole body.
+	// The arm-scoped bans above are SUBSUMED by this one — jsArmSummary returns
+	// a sub-slice of the same body, so anything they can see this sees too.
+	// They survive only to name WHICH arm regressed; both are t.Error and both
+	// fire together. Scope is what makes the POSITIVE assertions meaningful
+	// (the hedge has to be in that arm, not merely present somewhere on the
+	// card); for a negative, the smaller scope is the hole. Pass 4 built four
+	// shapes — a second statement after the `;`, a `summary +=` on the next
+	// line, a plain reassignment, a new `else if` below — and every one stayed
+	// green under the arm scope alone.
 	//
-	// jsFunctionBody blanks comment lines, so the comments in this file and in
-	// credentialsCard that quote these phrases are invisible here. Neither
-	// string collides with the deliberate "Using an IAM role" in the ECS and EKS
-	// arms — those are dbtrail#1534, not retired.
+	// Read from jsFunctionSpan, NOT jsFunctionBody. jsFunctionBody cuts each
+	// line at its first `//` without knowing whether it is inside a string, and
+	// app.js has several code lines with a URL in a literal. Under that view a
+	// line like `summary = "https://x — Using credentials from ...";` is
+	// truncated before the phrase and this ban passes with the sentence on
+	// screen (pass 5 built exactly that). A negative assertion fails OPEN under
+	// truncation; a positive one fails closed, which is why the assertions above
+	// were never exposed to it.
+	//
+	// The span still blanks WHOLE-LINE comments, which is what keeps the
+	// pristine tree green: the one live occurrence of "Using access keys" is a
+	// comment line inside credentialsCard explaining what the arm used to
+	// render. A TRAILING comment quoting either phrase would now trip this —
+	// noise, not a false pass, and the right direction for a ban.
+	//
+	// What it does not cover, said plainly so nobody reads it as more: a
+	// reworded claim, one assembled from concatenated fragments, or one
+	// returned by a helper defined outside this function. No string guard
+	// closes those; what it closes is the phrase itself coming back verbatim.
+	// Neither string collides with the deliberate "Using an IAM role" in the
+	// ECS and EKS arms — those are dbtrail#1534, not retired.
+	span := jsFunctionSpan(t, readAsset(t, "app.js"), "credentialsCard")
 	for _, retired := range []string{"Using credentials from", "Using access keys"} {
-		if strings.Contains(body, retired) {
+		if strings.Contains(span, retired) {
 			t.Errorf("credentialsCard says %q somewhere in its body. That claim was retired in #1528: the "+
 				"daemon probes presence, never use, and this is the card an operator opens precisely "+
 				"because S3 is not working", retired)
