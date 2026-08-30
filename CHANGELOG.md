@@ -72,6 +72,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filesystem — so those runs take the ordinary merge path: correct, and the
   same rows, just not free.
 
+### Fixed
+- **views.sql: an index this machine cannot reach no longer costs you the whole
+  file** (#1536). `duckdb -init` aborts the session at the first error, and the
+  `ATTACH` was emitted ahead of every view, so an unreachable index host left
+  the reader with nothing: no `events` view and no `state_*` views, even though
+  all of them read Parquet and needed nothing from the index. The Parquet-only
+  views are now defined first, then the `ATTACH`, then the two-leg `events` view
+  that replaces the archives-only one. DuckDB keeps what ran before the aborting
+  statement, so a failed `ATTACH` now costs the hot leg and nothing else.
+- **views.sql warns when the index host is a bare name** (#1536). A console
+  running under Docker Compose emits its compose service name (`index-mysql`),
+  which resolves for containers on that network and nowhere else, so a
+  downloaded file failed with `Unknown server host` the first time it was run.
+  The existing warning covered only loopback addresses. A single-label host now
+  gets its own note, kept separate because the two fail differently: loopback
+  resolves everywhere and quietly answers from a different index, while a bare
+  name usually does not resolve at all.
+
 ## [0.73.0] - 2026-08-30
 
 ### Added

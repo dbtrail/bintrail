@@ -99,11 +99,36 @@ func slicesContains(s []string, v string) bool {
 // stood up by liveStandIn and this executes the half that describes the data.
 func viewsHalf(t *testing.T, out string) string {
 	t.Helper()
+	// The live preamble is CUT OUT rather than skipped past. Since #1536 it no
+	// longer sits at the top of the file: the Parquet-only views are emitted
+	// first and the ATTACH comes between them and the two-leg events view. A
+	// suffix from the first "-- events:" would therefore carry the ATTACH into
+	// the session and try to dial a real MySQL, which is exactly what
+	// liveStandIn exists to avoid.
+	out = stripLivePreamble(out)
 	i := strings.Index(out, "-- events:")
 	if i < 0 {
 		t.Fatalf("no events view in the generated file:\n%s", out)
 	}
 	return out[i:]
+}
+
+// stripLivePreamble removes the INSTALL/SECRET/ATTACH block, wherever in the
+// file it sits, leaving every view definition around it intact.
+func stripLivePreamble(out string) string {
+	start := strings.Index(out, "-- Live index setup")
+	if start < 0 {
+		return out
+	}
+	att := strings.Index(out[start:], "\nATTACH ")
+	if att < 0 {
+		return out
+	}
+	end := strings.Index(out[start+att+1:], "\n")
+	if end < 0 {
+		return out
+	}
+	return out[:start] + out[start+att+1+end+1:]
 }
 
 func twoLegInput(t *testing.T, id string) Input {

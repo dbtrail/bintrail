@@ -260,11 +260,37 @@ func Generate(in Input) string {
 		}
 		writeS3Preamble(&b, region, in.S3Endpoint, in.RegionAmbiguous)
 	}
-	if in.LiveIndex != nil {
-		writeLivePreamble(&b, in.LiveIndex)
+	// The cold half FIRST, then the ATTACH, then the events view that needs it.
+	//
+	// `duckdb -init` aborts the session at the first error, and the ATTACH is
+	// the one statement in this file that depends on reaching another machine:
+	// a host that does not resolve, a password left blank, an index that is
+	// down. Emitted ahead of the views, as it used to be, that single failure
+	// cost the reader the whole file — no events view, no state views, nothing
+	// — even though every one of them reads Parquet and needed nothing from the
+	// index. DuckDB commits what ran before the aborting statement, so putting
+	// the Parquet-only views first turns that total loss into a degrade: the
+	// reader gets an archives-only database and a message naming what it could
+	// not reach.
+	//
+	// The cold pass renders with no LiveIndex so it emits the archives-only
+	// events view; the live pass then CREATE OR REPLACEs it with the two-leg
+	// definition. State views never read the index at all, so they always
+	// belong on this side of the ATTACH.
+	cold := in
+	cold.LiveIndex = nil
+	liveFollows := in.LiveIndex != nil
+	// With no archive source there is no cold events view to emit, and the
+	// skip comment explaining that would sit directly above a live-only view
+	// that does define it. The live pass owns the message in that case.
+	if !liveFollows || cold.definesEvents() {
+		writeEventsView(&b, cold, liveFollows)
 	}
-	writeEventsView(&b, in)
-	writeStateViews(&b, in)
+	writeStateViews(&b, cold)
+	if liveFollows {
+		writeLivePreamble(&b, in.LiveIndex)
+		writeEventsView(&b, in, false)
+	}
 	return b.String()
 }
 
@@ -285,7 +311,7 @@ func GenerateViews(in Input) string {
 	// the same Input; the caller gets the archives-only view, which is what
 	// this entry point can actually back.
 	in.LiveIndex = nil
-	events := writeEventsView(&b, in)
+	events := writeEventsView(&b, in, false)
 	state := writeStateViews(&b, in)
 	if !events && !state {
 		// Not one view was emitted, so whatever is in the builder is comments.
@@ -584,6 +610,23 @@ func writeLivePreamble(b *strings.Builder, li *LiveIndex) {
 		b.WriteString("-- whatever that machine runs on the same port. That may answer, with\n")
 		b.WriteString("-- entirely plausible rows from a different index. Change HOST to a name that\n")
 		b.WriteString("-- resolves from where you run this.\n")
+	} else if isSingleLabelHost(li.Host) {
+		// Observed: the host is a bare name with no domain. NOT stated: why
+		// (a Docker Compose service, a Kubernetes service, a /etc/hosts entry,
+		// a search-domain suffix that happens to be configured here). Each of
+		// those resolves inside one network and nowhere else, and this file is
+		// built to be carried out of it.
+		//
+		// A separate branch from the loopback one rather than a widened
+		// predicate: loopback resolves everywhere and silently answers with the
+		// WRONG index, while this one usually fails to resolve at all. The
+		// costs differ, so the sentences do.
+		b.WriteString("-- HOST above is a bare name with no domain, which usually resolves only\n")
+		b.WriteString("-- inside the network this file was generated in — a Docker Compose or\n")
+		b.WriteString("-- Kubernetes service name resolves for containers on that network and for\n")
+		b.WriteString("-- nothing outside it. Run this file elsewhere and the ATTACH below fails\n")
+		b.WriteString("-- with an unknown-host error. Change HOST to an address that resolves\n")
+		b.WriteString("-- from where you run this, or open a tunnel to it first.\n")
 	}
 	writeLiveCaptureNote(b)
 	fmt.Fprintf(b, "ATTACH '' AS %s (TYPE mysql, SECRET %s, READ_ONLY);\n\n",
@@ -648,9 +691,32 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// isSingleLabelHost reports whether the generated ATTACH names a host with no
+// domain part: `index-mysql`, not `index.example.com` and not an address.
+//
+// Callers must ask isLoopbackHost FIRST — `localhost` is single-label too, and
+// it has its own warning because it fails in the opposite way (it resolves, and
+// answers with the wrong index).
+//
+// An IP literal is not single-label whatever it looks like, so it is excluded
+// by parse rather than by counting dots: an IPv6 address has no dots at all,
+// and a bracketed one is still an address.
+func isSingleLabelHost(host string) bool {
+	h := strings.TrimSuffix(strings.Trim(host, "[]"), ".")
+	if h == "" || net.ParseIP(h) != nil {
+		return false
+	}
+	return !strings.Contains(h, ".")
+}
+
 // writeEventsView returns whether it emitted a view definition (as opposed to
 // nothing, or a comment explaining why there is none).
-func writeEventsView(b *strings.Builder, in Input) bool {
+// liveFollows tells the archives-only render that a live preamble and a
+// two-leg CREATE OR REPLACE come further down the same file. It changes only
+// what the comment ADVISES: without it the cold render tells the reader to
+// regenerate with --include-live, which in that position is advice to redo
+// something the next twenty lines already do.
+func writeEventsView(b *strings.Builder, in Input, liveFollows bool) bool {
 	// Not wanted: emit NOTHING, comments included. A filtered render is executed
 	// by its caller, and a script of only comments is an error there.
 	if !in.OnlyViews.wants(eventsViewName) {
@@ -735,7 +801,16 @@ func writeEventsView(b *strings.Builder, in Input) bool {
 		b.WriteString("-- SCOPE: these are the ARCHIVED events only. Partitions rotation has not\n")
 		b.WriteString("-- archived yet exist solely in the index, so the most recent window is\n")
 		b.WriteString("-- absent here and reads as if nothing happened.\n")
-		if in.LiveLegUnavailable {
+		if liveFollows {
+			// This definition is REPLACED further down, once the index is
+			// attached. Said here because a reader who stops at this statement
+			// would otherwise take an archives-only view as the final one, and
+			// a reader whose ATTACH failed needs to know this is what they are
+			// left holding.
+			b.WriteString("-- A leg over the index is added below, after the ATTACH: this view is\n")
+			b.WriteString("-- REPLACED there. It is defined first on purpose, so that an index this\n")
+			b.WriteString("-- machine cannot reach costs you the hot leg and nothing else.\n")
+		} else if in.LiveLegUnavailable {
 			b.WriteString("-- This download covers the archives; it has no way to reach the index.\n")
 			b.WriteString("-- To add a leg over the index, run `bintrail views --index-dsn ...\n")
 			b.WriteString("-- --include-live` from a host that can connect to it.\n")
