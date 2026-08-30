@@ -369,10 +369,22 @@ func jsArmSummary(t *testing.T, body, anchor string) string {
 	//	summary = "...hedged... \"Using credentials from that file.\"";
 	//
 	// Neither is contrived: stagingCard, the next function in this file, builds
-	// its hint as "lit" + expr + "lit". So the literal must be the WHOLE
-	// assignment: the next non-space byte after the closing quote has to end the
-	// statement. An arm that legitimately needs concatenation gets told this
-	// guard cannot read it, which is the safe direction to fail.
+	// its hint as "lit" + expr + "lit". So the first literal must be the whole
+	// right-hand side: the next non-space byte after the closing quote has to be
+	// the `;`. An arm that legitimately needs concatenation gets told this guard
+	// cannot read it, which is the safe direction to fail.
+	//
+	// What that does NOT buy, and pass 4 measured it: `;` is exactly what
+	// separates two statements, so
+	//
+	//	summary = "...hedged..."; summary = "Using credentials from ...";
+	//
+	// satisfies the check, and so does a `summary += " ..."` on the NEXT line
+	// (this helper never looks past the anchor's own line). app.js appends to a
+	// half-built sentence in eleven places, including an else-if chain shaped
+	// exactly like this one. So this scope proves the hedge is in the RIGHT ARM
+	// and nothing more; the retired sentences are kept out of the function by a
+	// body-scoped ban in the caller, which is what actually closes the class.
 	tail := strings.TrimLeft(rest[k+1:], " \t")
 	if !strings.HasPrefix(tail, ";") {
 		t.Fatalf("the arm at %q does not assign ONE plain string literal, so everything after the first "+
@@ -452,6 +464,29 @@ func TestCredentialsCard_armsReportWhatWasProbed(t *testing.T) {
 	}
 	if !strings.Contains(body, `"access key ID (env)"`) {
 		t.Error(`the Raw signals row does not name the one variable that was read (AWS_ACCESS_KEY_ID)`)
+	}
+
+	// And the two retired sentences must not appear ANYWHERE in the function.
+	//
+	// The arm-scoped bans above cover the assignment this PR rewrote; they do
+	// not cover the shapes that put the claim back somewhere else in the same
+	// arm — a second statement after the `;`, a `summary +=` on the next line, a
+	// new `else if` below. Pass 4 built all four and every one of them stayed
+	// green with the arm scope alone. Scope is what makes the POSITIVE
+	// assertions meaningful (the hedge has to be in that arm, not merely
+	// present); for the negative, the smaller scope is the hole, so it is
+	// checked over the whole body.
+	//
+	// jsFunctionBody blanks comment lines, so the comments in this file and in
+	// credentialsCard that quote these phrases are invisible here. Neither
+	// string collides with the deliberate "Using an IAM role" in the ECS and EKS
+	// arms — those are dbtrail#1534, not retired.
+	for _, retired := range []string{"Using credentials from", "Using access keys"} {
+		if strings.Contains(body, retired) {
+			t.Errorf("credentialsCard says %q somewhere in its body. That claim was retired in #1528: the "+
+				"daemon probes presence, never use, and this is the card an operator opens precisely "+
+				"because S3 is not working", retired)
+		}
 	}
 }
 
