@@ -29,6 +29,44 @@ import (
 // function; scoping to the body is what makes the checks mean anything.
 func jsFunctionBody(t *testing.T, js, name string) string {
 	t.Helper()
+	body := jsFunctionSpan(t, js, name)
+	// Then each line is cut at its first `//`, which is what removes a TRAILING
+	// comment's words from the needles below.
+	//
+	// This step is string-context-unaware, and the direction it fails in is not
+	// symmetric. A `//` inside a string literal (app.js has several — DOCS_BASE
+	// and the release links) truncates a line of real code, so:
+	//
+	//   - a POSITIVE assertion fails CLOSED: the text it requires is gone, the
+	//     must-contain fails, and somebody looks.
+	//   - a NEGATIVE assertion fails OPEN: the text it forbids is gone too, and
+	//     the must-not-contain passes while the string is on screen.
+	//
+	// So a must-not-contain check over this body is only as good as the absence
+	// of a `//` earlier on that line. jsFunctionSpan is the view to use for one.
+	var out []string
+	for _, ln := range strings.Split(body, "\n") {
+		if c := strings.Index(ln, "//"); c >= 0 {
+			ln = ln[:c]
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
+}
+
+// jsFunctionSpan is jsFunctionBody without the per-line `//` truncation: it
+// blanks WHOLE-LINE comments (which the brace walk needs anyway) and returns
+// everything else verbatim.
+//
+// Use it for assertions that a string must NOT appear. Under jsFunctionBody, a
+// `//` anywhere earlier on the line hides the rest of that line from the check
+// — a URL inside a string literal is enough — and a hidden forbidden string
+// reads as a passing guard. Here nothing on a code line is hidden, so the
+// check fails closed: a trailing comment that quotes the forbidden phrase now
+// trips it. That is noise, not a false negative, and it is the right direction
+// for a ban.
+func jsFunctionSpan(t *testing.T, js, name string) string {
+	t.Helper()
 	// Whole-line comments go BEFORE the brace walk, not after. The walk counts
 	// braces in raw source, so a `{` inside a comment in the body unbalances it
 	// and the extracted region ends in the wrong place — and this change added
@@ -64,15 +102,7 @@ func jsFunctionBody(t *testing.T, js, name string) string {
 	if end < 0 {
 		t.Fatalf("app.js:%d: unbalanced braces in %s", lineOf(js, i), name)
 	}
-	body := js[i+open : end+1]
-	var out []string
-	for _, ln := range strings.Split(body, "\n") {
-		if c := strings.Index(ln, "//"); c >= 0 {
-			ln = ln[:c]
-		}
-		out = append(out, ln)
-	}
-	return strings.Join(out, "\n")
+	return js[i+open : end+1]
 }
 
 // The validation refusal is deliberately NOT in the dialog: "schema, table and

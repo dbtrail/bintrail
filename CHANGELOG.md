@@ -70,8 +70,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry across still exist when they get there. `install.sh` no longer just
   says it kept an existing compose file: it says an existing file is never
   upgraded, and what to do about it.
+- **Console: the reuse setting is named for what it does, and two cards stop
+  explaining themselves** (#1528). The Storage card titled **Automatic backup
+  refresh** controlled exactly one thing, whether a table with no changes keeps
+  its previous Parquet file instead of being written again, and it had neither
+  automation nor a timetable in it. One route away, **Scheduled backups** on the
+  Backups page IS the timetable, so two unrelated settings both promised
+  "backups, automatically". The card is now **File reuse for unchanged tables**,
+  its two paragraphs are one line per state, and its buttons read **Turn on** /
+  **Turn off**. It stays on Storage rather than moving beside the schedule it was
+  confused with, because `/api/baseline-refresh` is process-global while the
+  schedule is per server, and a global toggle inside a per-server fold would
+  claim something false. The **Scheduled backups** fold loses the paragraph that
+  explained the producer choice in general directly above the line that names it
+  for the next run. The consequence of a reused file, two backups sharing the
+  same bytes on disk, moved to [docs/console.md](docs/console.md), which also
+  gains the card's own entry. The Storage cards are reordered so what the daemon
+  does with your data comes first and usage telemetry, which is about neither
+  storage nor this page, comes last. Smaller cuts to the same rule on the AWS
+  credentials, Staged downloads and telemetry sample cards. The **Query in
+  DuckDB** card is now **Download a DuckDB schema**: no query runs there, the
+  file it hands you runs in your own DuckDB, and the page that does run DuckDB
+  server-side is the SQL panel. The two are not merged, because they are gated
+  by different capabilities (`views` vs `sql`) and merging would make the
+  download unreachable on a daemon with one on and the other off. The generated
+  `views.sql` names the card by title, so both sides moved together.
+  No setting, route, API, permission or capability gate changes; 124 words leave
+  the screen. Storage is still a drawer, and the split is proposed on the issue.
 
 ### Fixed
+- **Console: two arms of the AWS credentials card report the signals they
+  probed instead of naming a credential source they never observed** (#1528).
+  Two of the card's five arms asserted use from presence. The shared-config arm is selected by `hasSharedAWSConfig()`
+  (a file stat) **or** `AWS_PROFILE`, and it sits below the env-key, ECS and
+  IRSA arms, so it caught both an EC2 host with an instance role and a
+  region-only `~/.aws/config` (what `aws configure set region` writes) and a
+  container with `AWS_PROFILE` exported and no `~/.aws` mounted; it said "Using
+  credentials from a shared ~/.aws config file", which named only one of the two
+  probes and, in the second shape, contradicted the card's own
+  `~/.aws config: absent` row two lines below it. The access-key arm said "Using
+  access keys set in an environment variable" from `AWS_ACCESS_KEY_ID` alone,
+  which is false whenever the ID is exported without its secret. Both arms now
+  name the signal they saw, say what was not checked, and say an IAM role on the
+  machine can still be what signs the requests. The card's question is whether
+  this daemon can reach S3 at all, so a confident wrong answer was worse than a
+  hedged right one; these two arms are the reason the card's word count went up
+  rather than down. The Raw signals row under them is relabelled `access key ID
+  (env)`, since `access keys (env): set` contradicted the summary two lines
+  above it. **The ECS and EKS arms are deliberately not part of this**: both
+  still read "Using an IAM role" from an environment variable being non-empty,
+  with no stat and no `AWS_ROLE_ARN` check, which is weaker evidence than the
+  file stat behind the shared-config arm. Hedging their copy would paper over a
+  signal the daemon could check properly instead, so they are tracked in #1534
+  and named as unhedged in the code. The **Scheduled backups** fold
+  regains, on its unconditional intro line, the clause saying a run is built
+  from the recorded changes and does not read your database: with no schedule
+  saved yet every per-run line is gated behind a saved schedule, leaving "each a
+  full copy of every table" (true of what a run writes) as the only description
+  of what a run costs. The **Staged downloads** empty state says again that a
+  build is removed, rather than implying it.
 - **The Index disk card says why free space is not measurable, and what
   would make it measurable, instead of guessing where the index runs**
   (#1527). "Free on disk: not measurable from here" came with the sentence

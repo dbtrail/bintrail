@@ -521,7 +521,7 @@ readable by any DuckDB, Spark, Trino or Athena with no dbtrail involved.
 
 **Files, queried by name.** `bintrail views` writes a DuckDB schema over them:
 one `events` view across every archive and one `state_<schema>_<table>` view
-per table in the newest baseline (the console's **Storage → Query in DuckDB**
+per table in the newest baseline (the console's **Storage → Download a DuckDB schema**
 card downloads the same file).
 
 ```sh
