@@ -852,6 +852,33 @@ button { font-family: inherit; }
 .ev-row:hover .ev-caret { opacity: 1; }
 .ev-row.open .ev-caret { transform: translateY(-50%) rotate(90deg); color: var(--accent); opacity: 1; }
 
+/* schema changes (#1443): the events grid minus pk/columns, plus the
+   statement as a full-width clamped line under each row (click opens it). */
+.sc-head, .sc-row {
+  display: grid;
+  grid-template-columns: 200px 1fr 116px 200px;
+  align-items: center; gap: 12px;
+}
+.sc-head {
+  font-family: var(--f-mono); font-size: 11px; letter-spacing: 0.04em;
+  color: var(--ink-4); text-transform: lowercase;
+  padding: 0 14px 10px; border-bottom: 1px solid var(--line);
+}
+.sc-row {
+  padding: 13px 14px; border-bottom: 1px solid var(--line-soft);
+  cursor: pointer; transition: background .14s;
+}
+.sc-row:hover, .sc-row.open { background: var(--surface-2); }
+.sc-pos { font-family: var(--f-mono); font-size: 12px; color: var(--ink-3); }
+.sc-stmt {
+  grid-column: 1 / -1; margin: 6px 0 0;
+  font-family: var(--f-mono); font-size: 12px; line-height: 1.5; color: var(--ink-2);
+  white-space: pre-wrap; word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.sc-row.open .sc-stmt { display: block; -webkit-line-clamp: unset; overflow: visible; }
+.sc-stmt-withheld { color: var(--ink-4); font-style: italic; }
+
 /* events loading state (#1353): skeleton rows while the fetch is in flight —
    a blank list must never be the busy rendering. The note under the rows is
    revealed by .ev-loading.slow (fetch ran past ~2s, see runEventsQuery). */

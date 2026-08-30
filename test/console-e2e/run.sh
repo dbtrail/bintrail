@@ -98,6 +98,9 @@ echo "==> seed row events + cascade fixture into $IDX_DB"
 # they are redacted at the DTO layer) and connection_id=777 (which MUST pass
 # through since #701 D1). The cascade child deletes are deliberately NOT
 # indexed — that blind spot is what /api/recover's cascade synthesis repairs.
+# The two schema_changes rows share ONE second, CREATE inserted first with the
+# lower binlog position: the Schema changes view must list the ALTER on top
+# (the #1441 tiebreak), which a detected_at-only order would not.
 mysql_exec "$IDX_DB" <<SQL
 INSERT INTO schema_snapshots (snapshot_id, snapshot_time, schema_name, table_name, column_name, ordinal_position, column_key, data_type, is_nullable) VALUES
   (1,'$P_HOUR','$FIX_SCHEMA','orders','id',1,'PRI','int','NO'),
@@ -115,6 +118,9 @@ INSERT INTO binlog_events (binlog_file, start_pos, end_pos, event_timestamp, con
   ('binlog.000001',400,500,'$TS_INS',NULL,'$FIX_SCHEMA','child',1,'10',NULL,NULL,'{"id":10,"pid":1}',NULL,NULL),
   ('binlog.000001',500,600,'$TS_INS',NULL,'$FIX_SCHEMA','child',1,'11',NULL,NULL,'{"id":11,"pid":1}',NULL,NULL),
   ('binlog.000001',600,700,'$TS_UPD',NULL,'$FIX_SCHEMA','parent',3,'1',NULL,'{"id":1}',NULL,NULL,NULL);
+INSERT INTO schema_changes (detected_at, binlog_file, binlog_pos, schema_name, table_name, ddl_type, ddl_query) VALUES
+  ('$TS_INS','binlog.000001',120,'$FIX_SCHEMA','orders','CREATE TABLE','CREATE TABLE orders (id INT PRIMARY KEY) /* e2e-ddl-create */'),
+  ('$TS_INS','binlog.000001',150,'$FIX_SCHEMA','orders','ALTER TABLE','ALTER TABLE orders ADD COLUMN note VARCHAR(64) /* e2e-ddl-alter */');
 INSERT INTO fk_constraints (snapshot_id, constraint_name, schema_name, table_name, column_name, ordinal_position, referenced_schema_name, referenced_table_name, referenced_column_name, delete_rule, update_rule) VALUES
   (1,'fk_child_parent','$FIX_SCHEMA','child','pid',1,'$FIX_SCHEMA','parent','id','CASCADE','RESTRICT');
 SQL

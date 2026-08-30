@@ -21,9 +21,11 @@ import (
 var registeredAPIPatterns = []struct{ method, pattern string }{
 	{"GET", "/api/status"},
 	{"GET", "/api/coverage"},
+	{"GET", "/api/capacity"},
 	{"GET", "/api/activity"},
 	{"GET", "/api/schemas"},
 	{"GET", "/api/events"},
+	{"GET", "/api/schema-changes"},
 	{"POST", "/api/recover"},
 	{"POST", "/api/recover-cascade"},
 	{"GET", "/api/capabilities"},

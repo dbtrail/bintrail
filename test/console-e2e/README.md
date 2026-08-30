@@ -48,6 +48,7 @@ down.
 | export: JSON/CSV blobs (×6) | the real download buttons, blobs captured at `URL.createObjectURL`: query_text-free, connection_id kept, CSV header in lockstep with `EVENT_CSV_COLUMNS` |
 | recover: submit renders SQL (×3) | Recover actually submits and paints the reversal SQL panel — scenario 6 only checks the form DOM exists |
 | cascade: banner + counts (×3) | the `cascade_detected` positive-half rendering (#619) — the banner block whose missing `)` once broke the whole SPA |
+| schema changes (×9) | the DDL history view (#1443): seeded rows render, same-second DDLs list in binlog order, UTC column, the type filter narrows through the API, the empty state |
 | timetravel (×6) | the reconstruct gate + baseline+deltas over a real fixture baseline (#970): event fold, baseline-only row, deleted row |
 | overview: window honesty (×2) | `buildOverview` window line uses the fetched window's own bounds, never `status.coverage` (#679/#686) |
 | storage: Create-baseline gates (×5) | the button's double-gate (#686): live enabled arm, destination-missing arm, capability-off arm; the fixture snapshot listed |

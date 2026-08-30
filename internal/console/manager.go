@@ -25,8 +25,12 @@ var errNoServers = errors.New("no servers configured: pass --index-dsn or add a 
 // Server when the console spoke to exactly one index. One bundle per selected
 // server, built lazily and cached by connManager.
 type bundle struct {
-	db       *sql.DB
-	dbName   string
+	db     *sql.DB
+	dbName string
+	// dsn is the connection's own DSN, kept for the capacity probe's
+	// locality check (is the index datadir on THIS host?) and never
+	// serialized — the masked DTOs are built elsewhere (#1444).
+	dsn      string
 	engine   *query.Engine
 	resolver *metadata.Resolver
 	// resolverUnavailable records that loadResolver failed for a reason OTHER
@@ -205,6 +209,7 @@ func (cm *connManager) Resolve(ctx context.Context, id string) (*bundle, error) 
 			// baseline/no-archive-only edit during the open keeps this db but
 			// must not publish the stale entry's reconstruct gate.
 			nb := newBundleDerived(b.db, b.dbName, cm.withBaselineDefaults(cur), cm.profileActive)
+			nb.dsn = b.dsn
 			nb.resolver = b.resolver
 			nb.resolverUnavailable = b.resolverUnavailable
 			cm.bundles[id] = nb
@@ -241,6 +246,7 @@ func (cm *connManager) buildBundle(entry ServerEntry) (*bundle, error) {
 		return nil, fmt.Errorf("server %q: %s", entry.Name, scrubDSNError(err, entry.DSN))
 	}
 	b := newBundleDerived(db, cfg.DBName, cm.withBaselineDefaults(entry), cm.profileActive)
+	b.dsn = entry.DSN
 	b.resolver, b.resolverUnavailable = loadResolver(db)
 	return b, nil
 }
@@ -331,6 +337,7 @@ func loadResolver(db *sql.DB) (r *metadata.Resolver, unavailable bool) {
 func (cm *connManager) seedBoot(b *bundle, dsn string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	b.dsn = dsn
 	cm.boot = b
 	cm.bootDSN = dsn
 }
@@ -371,6 +378,7 @@ func (cm *connManager) rebuildDerived(entry ServerEntry) {
 		return
 	}
 	nb := newBundleDerived(old.db, old.dbName, cm.withBaselineDefaults(entry), cm.profileActive)
+	nb.dsn = old.dsn
 	nb.engine = old.engine
 	nb.resolver = old.resolver
 	nb.resolverUnavailable = old.resolverUnavailable

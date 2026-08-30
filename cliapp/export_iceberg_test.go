@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/audittest"
 	"github.com/dbtrail/dbtrail/internal/icebergexport"
 )
 
@@ -70,8 +71,9 @@ func TestWriteExportJSON_shape(t *testing.T) {
 	at := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
 	err := writeExportJSON(&buf, []icebergexport.Outcome{
-		{Schema: "shop", Table: "orders", Verdict: icebergexport.VerdictExported, Detail: "3 events", Events: 3, Upserts: 2, Deletes: 1, SnapshotID: 42, Cursor: "binlog.000001:700 at 2026-08-28T12:00:00Z", Location: "/w/shop/orders"},
+		{Schema: "shop", Table: "orders", Verdict: icebergexport.VerdictExported, Detail: "3 events", Events: 3, Upserts: 2, Deletes: 1, SnapshotID: i64(42), Cursor: "binlog.000001:700 at 2026-08-28T12:00:00Z", Location: "/w/shop/orders"},
 		{Schema: "shop", Table: "customers", Verdict: icebergexport.VerdictRefusedGap, Detail: "gap"},
+		{Schema: "shop", Table: "empty", Verdict: icebergexport.VerdictLoaded, Detail: "0 rows", Cursor: "binlog.000001:100 at 2026-08-28T11:00:00Z", Location: "/w/shop/empty"},
 	}, "/w", at)
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +86,7 @@ func TestWriteExportJSON_shape(t *testing.T) {
 		t.Fatalf("top level = %v", got)
 	}
 	tables := got["tables"].([]any)
-	if len(tables) != 2 {
+	if len(tables) != 3 {
 		t.Fatalf("tables = %d", len(tables))
 	}
 	first := tables[0].(map[string]any)
@@ -102,6 +104,44 @@ func TestWriteExportJSON_shape(t *testing.T) {
 	}
 	if _, ok := second["snapshot_id"]; ok {
 		t.Fatal("a refused table must not carry a snapshot_id")
+	}
+	// A zero-row load is a loaded table with a cursor and a location and
+	// no snapshot: the key is absent, not 0 (#1509).
+	third := tables[2].(map[string]any)
+	if third["verdict"] != "loaded" || third["rows_loaded"].(float64) != 0 || third["cursor"] != "binlog.000001:100 at 2026-08-28T11:00:00Z" || third["location"] != "/w/shop/empty" {
+		t.Fatalf("third = %v", third)
+	}
+	if _, ok := third["snapshot_id"]; ok {
+		t.Fatalf("a loaded table without a snapshot must not carry a snapshot_id: %v", third)
+	}
+}
+
+func i64(n int64) *int64 { return &n }
+
+// TestAuditIcebergCommit_snapshotIDOnlyWhenPresent: the audit detail names
+// the snapshot when the commit left one and carries no snapshot_id key at
+// all when it did not. A zero-row first load is the case: it still audits
+// (a table and a cursor were written) with rows 0 (#1509).
+func TestAuditIcebergCommit_snapshotIDOnlyWhenPresent(t *testing.T) {
+	rec := audittest.Install(t)
+	ctx := context.Background()
+	auditIcebergCommit(ctx, icebergexport.Commit{Schema: "shop", Table: "empty", Kind: icebergexport.CommitLoad, Rows: 0,
+		Cursor: "binlog.000001:100 at 2026-08-28T11:00:00Z", Location: "/w/shop/empty"})
+	auditIcebergCommit(ctx, icebergexport.Commit{Schema: "shop", Table: "orders", Kind: icebergexport.CommitLoad, Rows: 2,
+		SnapshotID: i64(7), Cursor: "binlog.000001:100 at 2026-08-28T11:00:00Z", Location: "/w/shop/orders"})
+	evs := rec.Events()
+	if len(evs) != 2 {
+		t.Fatalf("events = %d, want 2: %+v", len(evs), evs)
+	}
+	empty, orders := evs[0].Detail, evs[1].Detail
+	if _, ok := empty["snapshot_id"]; ok {
+		t.Fatalf("zero-row load detail carries snapshot_id: %v", empty)
+	}
+	if empty["commit"] != "load" || empty["rows"] != "0" || empty["cursor"] == "" || empty["location"] == "" {
+		t.Fatalf("zero-row load detail = %v, want commit load, rows 0, a cursor and a location", empty)
+	}
+	if orders["snapshot_id"] != "7" {
+		t.Fatalf("load with a snapshot detail = %v, want snapshot_id 7", orders)
 	}
 }
 

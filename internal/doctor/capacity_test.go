@@ -18,9 +18,9 @@ func capHour(now time.Time, hoursAgo int) time.Time {
 func TestProjectCapacity_math(t *testing.T) {
 	now := time.Date(2026, 6, 7, 12, 30, 0, 0, time.UTC)
 	// 6 completed hours, 1000 rows / 1 MB each → 24k events/day, 1000 B/event.
-	var parts []capPartitionSample
+	var parts []CapacityPartition
 	for i := 1; i <= 6; i++ {
-		parts = append(parts, capPartitionSample{hour: capHour(now, i), rows: 1000, bytes: 1_000_000})
+		parts = append(parts, CapacityPartition{Hour: capHour(now, i), Rows: 1000, Bytes: 1_000_000})
 	}
 	p, ok := projectCapacity(parts, 30*24*time.Hour, now)
 	if !ok {
@@ -46,9 +46,9 @@ func TestProjectCapacity_math(t *testing.T) {
 
 func TestProjectCapacity_zeroRetainProjectsNothing(t *testing.T) {
 	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
-	var parts []capPartitionSample
+	var parts []CapacityPartition
 	for i := 1; i <= 4; i++ {
-		parts = append(parts, capPartitionSample{hour: capHour(now, i), rows: 1000, bytes: 1_000_000})
+		parts = append(parts, CapacityPartition{Hour: capHour(now, i), Rows: 1000, Bytes: 1_000_000})
 	}
 	p, ok := projectCapacity(parts, 0, now)
 	if !ok {
@@ -64,13 +64,13 @@ func TestProjectCapacity_zeroRetainProjectsNothing(t *testing.T) {
 
 func TestProjectCapacity_windowFiltering(t *testing.T) {
 	now := time.Date(2026, 6, 7, 12, 30, 0, 0, time.UTC)
-	parts := []capPartitionSample{
-		{hour: capHour(now, 0), rows: 9999, bytes: 9_999_999},  // current partial hour — excluded
-		{hour: capHour(now, 1), rows: 1000, bytes: 1_000_000},  // in window
-		{hour: capHour(now, 2), rows: 1000, bytes: 1_000_000},  // in window
-		{hour: capHour(now, 3), rows: 1000, bytes: 1_000_000},  // in window
-		{hour: capHour(now, 4), rows: 0, bytes: 65536},         // empty — excluded from rate
-		{hour: capHour(now, 48), rows: 8888, bytes: 8_888_888}, // older than 24h — excluded
+	parts := []CapacityPartition{
+		{Hour: capHour(now, 0), Rows: 9999, Bytes: 9_999_999},  // current partial hour — excluded
+		{Hour: capHour(now, 1), Rows: 1000, Bytes: 1_000_000},  // in window
+		{Hour: capHour(now, 2), Rows: 1000, Bytes: 1_000_000},  // in window
+		{Hour: capHour(now, 3), Rows: 1000, Bytes: 1_000_000},  // in window
+		{Hour: capHour(now, 4), Rows: 0, Bytes: 65536},         // empty — excluded from rate
+		{Hour: capHour(now, 48), Rows: 8888, Bytes: 8_888_888}, // older than 24h — excluded
 	}
 	p, ok := projectCapacity(parts, 30*24*time.Hour, now)
 	if !ok {
@@ -93,19 +93,19 @@ func TestProjectCapacity_insufficientHistory(t *testing.T) {
 	now := time.Date(2026, 6, 7, 12, 0, 0, 0, time.UTC)
 
 	// Too few sampled hours.
-	few := []capPartitionSample{
-		{hour: capHour(now, 1), rows: 5000, bytes: 5_000_000},
-		{hour: capHour(now, 2), rows: 5000, bytes: 5_000_000},
+	few := []CapacityPartition{
+		{Hour: capHour(now, 1), Rows: 5000, Bytes: 5_000_000},
+		{Hour: capHour(now, 2), Rows: 5000, Bytes: 5_000_000},
 	}
 	if _, ok := projectCapacity(few, time.Hour, now); ok {
 		t.Error("2 sampled hours must be insufficient (capMinSampleHours=3)")
 	}
 
 	// Enough hours, too few rows.
-	sparse := []capPartitionSample{
-		{hour: capHour(now, 1), rows: 100, bytes: 100_000},
-		{hour: capHour(now, 2), rows: 100, bytes: 100_000},
-		{hour: capHour(now, 3), rows: 100, bytes: 100_000},
+	sparse := []CapacityPartition{
+		{Hour: capHour(now, 1), Rows: 100, Bytes: 100_000},
+		{Hour: capHour(now, 2), Rows: 100, Bytes: 100_000},
+		{Hour: capHour(now, 3), Rows: 100, Bytes: 100_000},
 	}
 	if _, ok := projectCapacity(sparse, time.Hour, now); ok {
 		t.Error("300 total rows must be insufficient (capMinSampleRows=1000)")

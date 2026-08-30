@@ -49,7 +49,7 @@ const EVENT_EXPORT_MAX = 1000;
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "timetravel", "recover", "sql", "status", "storage", "connect",
+const ROUTES = ["overview", "events", "schema-changes", "timetravel", "recover", "sql", "status", "storage", "connect",
   // Access profiles (#1445): author the flags/profiles/rules a data profile
   // enforces. Not monitor-gated: the standalone serve can author too, the
   // write goes to the selected server's index, not to daemon state.
@@ -913,6 +913,7 @@ function renderRoute() {
   switch (route) {
     case "overview": return renderOverview();
     case "events": return renderEvents(params);
+    case "schema-changes": return renderSchemaChanges(params);
     case "timetravel": return renderTimetravel(params);
     case "recover": return renderRecover(params);
     case "sql": return renderSQL();
@@ -3179,8 +3180,12 @@ function renderTimeline(container, data, onDone) {
 async function renderStatus() {
   const gen = serverGen, vgen = viewGen;
   viewLoading();
-  let data;
-  try { data = await api("/api/status"); }
+  let data, capacity;
+  // The index-disk read degrades independently (as the Storage panels do): a
+  // failed /api/capacity renders its own note inside the card, never blanking
+  // the health page it sits on.
+  const asErr = (err) => ({ error: (err && err.message) || String(err) });
+  try { [data, capacity] = await Promise.all([api("/api/status"), api("/api/capacity").catch(asErr)]); }
   catch (err) { if (gen !== serverGen || vgen !== viewGen) return; const v = VIEW(); clear(v); v.append(pageHead("Status", null)); renderError(v, err); return; }
   if (gen !== serverGen || vgen !== viewGen) return;
   updateSideMeta(data);
@@ -3227,6 +3232,7 @@ async function renderStatus() {
     ["rows", arch.total_rows],
     ["size", arch.total_size_human],
   ]));
+  cards.append(capacityCard(capacity));
   // Replication-health panel (#599): the streaming daemon polls the PostgreSQL source
   // (slot wal_status/lag + REPLICA IDENTITY coverage) and persists a snapshot to the
   // index; this renders it. Gated on source==postgresql AND a snapshot existing.
@@ -3241,6 +3247,10 @@ async function renderStatus() {
   // second green box.
   const captureHealth = captureHealthBox(stream);
   if (captureHealth) v.append(captureHealth);
+  // Index-disk surface (#1444): only the warn/fail grades render a box, so a
+  // filling index volume is read before the cards, next to the other alarms.
+  const capBox = capacityBox(capacity);
+  if (capBox) v.append(capBox);
   v.append(cards);
   viewEnter();
 }
@@ -3253,6 +3263,140 @@ function statusCard(title, rows) {
       el("span", { class: "kv-v" + (big ? " big" : ""), text: val === null || val === undefined ? "—" : String(val) })));
   });
   return card;
+}
+
+// ── Index disk (#1444) ──
+//
+// capacityCard and capacityBox render GET /api/capacity: the projection
+// `bintrail doctor` computes (write rate from the last 24 hours of partition
+// statistics, steady-state size over the retention window, free space on the
+// index volume when this process can measure it). The GRADE is the doctor's,
+// carried in `status`; the copy keys on `reason` and never re-derives a
+// threshold, so the console and the CLI cannot disagree about the same disk.
+// Two honesty rules the backend enforces and the copy must keep: free space
+// that is not measurable from here is said so, never shown as a number; and
+// the read-only console, which does not run rotation, gets no "grows without
+// limit" verdict (retention.known is false there). Both pure and
+// fixture-drivable, like continuityBox.
+
+function daysText(d) {
+  if (d === null || d === undefined || !isFinite(d)) return "";
+  if (d < 1) return "under a day";
+  if (d < 10) return "about " + d.toFixed(1) + " days";
+  return "about " + Math.round(d) + " days";
+}
+
+function capacityStateClass(status) {
+  switch (status) {
+    case "pass": return "hstat-ok";
+    case "warn": return "hstat-warn";
+    case "fail": return "hstat-err";
+    default: return "hstat-muted";
+  }
+}
+
+function capacityStateText(cap) {
+  switch (cap.reason) {
+    case "ok": return "ok";
+    case "headroom_low": return "tight headroom";
+    case "free_under_floor": return "little free space";
+    case "growth_exceeds_free": return "will fill";
+    case "no_retention": return "grows without limit";
+    case "free_unknown": return "free space unknown";
+    case "retention_unknown": return "no window known here";
+    case "not_enough_history": return "measuring";
+    case "not_initialized": return "no index yet";
+    default: return cap.status || "unknown";
+  }
+}
+
+// capacityNote is the one-line reading under the numbers: what the grade
+// means for this server, or why there is no grade.
+function capacityNote(cap) {
+  switch (cap.reason) {
+    case "ok":
+      return "Fits with room to spare: about " + humanBytes(cap.remaining_bytes) + " of growth ahead, " + humanBytes(cap.free_bytes) + " free. Rotation caps the index before the disk fills.";
+    case "free_unknown":
+      return "The index runs on another host or container, so free space is not measurable from this console. Watch the index volume there and keep about 30% headroom above the steady size.";
+    case "retention_unknown":
+      return "This read-only console does not run rotation, so it cannot tell how long the index keeps history or what size it settles at. Run the check where rotation runs (CLI: bintrail doctor --retain).";
+    case "not_enough_history":
+      return "A write rate needs at least 3 recent hours with events (" + (cap.sample_hours || 0) + " so far). Check back after a few hours of capture.";
+    case "not_initialized":
+      return "The index has no events table yet. It appears once capture starts.";
+    default:
+      return "";
+  }
+}
+
+function capacityCard(cap) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Index disk" }));
+  if (!cap || cap.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not measure the index disk" + (cap && cap.error ? ": " + cap.error : ".") }));
+    return card;
+  }
+  const ret = cap.retention || {};
+  const rows = [["index size", humanBytes(cap.current_bytes), true]];
+  rows.push(["write rate", cap.measured
+    ? humanBytes(cap.growth_bytes_per_day) + " a day (" + Math.round(cap.events_per_day).toLocaleString() + " events)"
+    : "not enough history yet"]);
+  rows.push(["keeps for", !ret.known ? "not known here" : (ret.enabled ? ret.retain + (ret.source === "override" ? "" : " (daemon default)") : "rotation is off")]);
+  if (cap.measured && cap.projected_bytes > 0) rows.push(["steady size", humanBytes(cap.projected_bytes)]);
+  rows.push(["free on disk", cap.free_known ? humanBytes(cap.free_bytes) : "not measurable from here"]);
+  if (cap.days_until_full !== null && cap.days_until_full !== undefined) rows.push(["free space lasts", daysText(cap.days_until_full) + " at this rate"]);
+  rows.forEach(([k, val, big]) => {
+    card.append(el("div", { class: "kv" },
+      el("span", { class: "kv-k", text: k }),
+      el("span", { class: "kv-v" + (big ? " big" : ""), text: val })));
+  });
+  card.append(healthKV("state", el("span", { class: "hstat " + capacityStateClass(cap.status), text: capacityStateText(cap) })));
+  const note = capacityNote(cap);
+  if (note) card.append(el("div", { class: "hlist", text: note }));
+  return card;
+}
+
+// capacityBox is the alarm: rendered only for the doctor's warn and fail
+// grades, with the plain reading of the numbers and what fixes it.
+function capacityBox(cap) {
+  if (!cap || cap.error || (cap.status !== "warn" && cap.status !== "fail")) return null;
+  const growth = humanBytes(cap.growth_bytes_per_day) + " a day";
+  const free = humanBytes(cap.free_bytes);
+  const days = daysText(cap.days_until_full);
+  const ahead = humanBytes(cap.remaining_bytes);
+  const window = (cap.retention && cap.retention.retain) || "";
+  const stops = " A full disk stops capture, and once the source deletes its binlogs those changes are gone for good.";
+  const shrink = "Grow the index volume, or shorten how long the index keeps history (CLI: --rotate-retain), so capture keeps running.";
+  let head, body, help;
+  switch (cap.reason) {
+    case "growth_exceeds_free":
+      head = "⚠ The index disk will fill before rotation caps the index";
+      body = "The index still grows by about " + ahead + " before the " + window + " window holds it steady, but only " + free + " is free. At " + growth + " that is " + days + "." + stops;
+      help = "Free space now: shorten the window and rotate right away (CLI: bintrail rotate --retain 7d), then grow the volume or keep the shorter window. Archive to Parquet first to keep the history.";
+      break;
+    case "free_under_floor":
+      head = "⚠ Little free space left on the index disk";
+      body = "Only " + free + " is free: " + days + " of writes at " + growth + ". Rotation normally frees space in time, but a stalled rotation or a burst of writes fills the disk and stops capture.";
+      help = shrink;
+      break;
+    case "headroom_low":
+      head = "⚠ The index disk is getting tight";
+      body = "The index still grows by about " + ahead + " before it settles, which uses over 70% of the " + free + " free. A burst of writes could fill the disk and stop capture.";
+      help = shrink;
+      break;
+    case "no_retention":
+      head = "⚠ Nothing caps the index: it grows without limit";
+      body = "This daemon runs with rotation off, so the index grows by " + growth + " at the current rate" +
+        (cap.free_known ? ", and the disk fills in " + days + " (" + free + " free)" : "") + "." + stops;
+      help = "Turn rotation on (CLI: --rotate-retain 30d) so old partitions are dropped and the index stays bounded. Archive to Parquet first to keep the history.";
+      break;
+    default:
+      return null;
+  }
+  const box = el("div", { class: cap.status === "fail" ? "error-box" : "warn-box" });
+  box.append(el("b", { text: head }));
+  box.append(el("div", { text: body }));
+  box.append(el("div", { class: "warn-line", text: help }));
+  return box;
 }
 
 // continuityBox renders the stream-continuity surface, or null when there is
@@ -5695,6 +5839,150 @@ function verifyDiffValue(v) {
   return document.createTextNode(v);
 }
 
+// ── schema changes (DDL history, #1443) ─────────────────────────────────────
+// A dedicated read-only view over the index's schema_changes table, under
+// Investigate beside Events. Its own view rather than a DDL mode of the
+// Events list: the result shape (statement, binlog coordinate, no row image)
+// is different, and mixing shapes into one table makes both harder to read.
+// Filters mirror the Events panel and the MCP list_schema_changes tool; the
+// cap model is the same (default 100, max 1000, has_more from one probe row).
+
+const SC_DDL_TYPES = ["CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE"];
+// Badge tint by what the statement does to the table: something new, a change
+// in place, or something gone. Anything else keeps the neutral tint.
+const SC_BADGE_CLASS = { CREATE: "b-insert", ALTER: "b-update", RENAME: "b-update", DROP: "b-delete", TRUNCATE: "b-delete" };
+function scBadge(ddlType) {
+  const word = String(ddlType || "").split(/\s+/)[0].toUpperCase();
+  return el("span", { class: "badge " + (SC_BADGE_CLASS[word] || "b-baseline"), text: word || "DDL", title: ddlType || null });
+}
+
+let scLastQuery = null;
+
+function renderSchemaChanges(params) {
+  const v = VIEW(); clear(v);
+  v.append(pageHead("Schema changes",
+    el("p", { class: "page-sub", text: "Every CREATE, ALTER, DROP, RENAME and TRUNCATE the stream recorded, newest first." })));
+
+  const form = el("form", { class: "filters", id: "sc-form" });
+  form.append(fieldSelect("Schema", "schema", "md", true));
+  form.append(fieldSelect("Table", "table", "md", false, true));
+  form.append(fieldSelect("Type", "ddl_type", "sm", false, false, [""].concat(SC_DDL_TYPES), "any"));
+  form.append(fieldDateInput("Since (UTC)", "since", "md", "YYYY-MM-DD HH:MM:SS"));
+  form.append(fieldDateInput("Until (UTC)", "until", "md", "YYYY-MM-DD HH:MM:SS"));
+  form.append(fieldInput("Limit", "limit", "sm", "100"));
+  if (params) {
+    ["schema", "table", "ddl_type", "since", "until"].forEach((k) => { if (params[k] && form.elements[k]) form.elements[k].value = params[k]; });
+  }
+  v.append(form);
+
+  const bar = el("div", { class: "result-bar" });
+  bar.append(el("span", { class: "result-count" }, el("b", { id: "sc-count", text: "…" }), el("span", { id: "sc-count-note", text: " change(s)" })));
+  bar.append(el("span", { class: "spacer" }));
+  v.append(bar);
+  v.append(el("div", { id: "sc-warnings", class: "warnings" }));
+
+  const list = el("div", { class: "events", id: "sc-list" });
+  const head = el("div", { class: "sc-head" });
+  ["time (UTC)", "table", "type", "binlog position"].forEach((h) => head.append(el("span", { text: h })));
+  list.append(head);
+  list.append(el("div", { id: "sc-rows" }));
+  v.append(list);
+
+  let t = null;
+  const run = () => runSchemaChangesQuery(form);
+  form.addEventListener("input", () => { clearTimeout(t); t = setTimeout(run, 200); });
+  form.addEventListener("change", run);
+  form.addEventListener("submit", (e) => { e.preventDefault(); run(); });
+  wireSchemaCascade(form);
+
+  populateSchemas(form);
+  run();
+  viewEnter();
+}
+
+async function runSchemaChangesQuery(form) {
+  const gen = serverGen;
+  const rowsEl = $("#sc-rows", VIEW());
+  const countEl = $("#sc-count", VIEW());
+  const noteEl = $("#sc-count-note", VIEW());
+  if (!rowsEl) return;
+
+  const f = Object.fromEntries(new FormData(form).entries());
+  const apiParams = {};
+  ["schema", "table", "ddl_type", "since", "until", "limit"].forEach((k) => {
+    if (f[k] && f[k].trim() && f[k] !== "any") apiParams[k] = f[k].trim();
+  });
+  const myQuery = apiParams;
+  scLastQuery = myQuery;
+
+  clear(rowsEl);
+  rowsEl.append(el("div", { class: "view-loading", role: "status", text: "Loading…" }));
+  if (countEl) countEl.textContent = "…";
+
+  let data;
+  try {
+    data = await api("/api/schema-changes?" + new URLSearchParams(apiParams).toString());
+  } catch (err) {
+    if (gen !== serverGen || scLastQuery !== myQuery) return;
+    clear(rowsEl); renderError(rowsEl, err);
+    renderWarnings($("#sc-warnings", VIEW()), []);
+    if (countEl) countEl.textContent = "0";
+    return;
+  }
+  if (gen !== serverGen || scLastQuery !== myQuery) return;
+
+  const changes = data.changes || [];
+  if (countEl) countEl.textContent = String(changes.length);
+  // The cap notice, in the same place Events puts its position line: a
+  // capped list must say it is a prefix, or an empty-looking tail reads as
+  // "nothing else happened".
+  let note = " change(s)";
+  if (data.has_more) note += " · the newest " + changes.length + " shown; narrow the time range or raise the limit (max 1000) to see more";
+  if (noteEl) noteEl.textContent = note;
+  renderWarnings($("#sc-warnings", VIEW()), data.warnings || []);
+  buildSchemaChangeRows(rowsEl, changes, Object.keys(apiParams).some((k) => k !== "limit"), !!data.statement_withheld);
+}
+
+// withheld: the server dropped every statement because an access profile is
+// active (the response warning says why); the cell says so instead of
+// rendering as an empty statement.
+function buildSchemaChangeRows(container, changes, filtered, withheld) {
+  clear(container);
+  if (!changes.length) {
+    const box = el("div", { class: "empty" });
+    box.append(el("h3", { text: "No schema changes found" }));
+    box.append(el("p", { text: filtered
+      ? "No DDL matched these filters. Widen the time range or clear a filter to see more."
+      : "No CREATE, ALTER, DROP, RENAME or TRUNCATE has been recorded for this server yet. Changes are recorded as the stream sees them." }));
+    container.append(box);
+    return;
+  }
+  changes.forEach((c, i) => {
+    // Expandable: the statement is clamped to a few lines and opens in full
+    // on click, so a long ALTER does not push the next row off screen.
+    const row = el("div", { class: "sc-row", "data-sc": i, tabindex: "0", role: "button", "aria-expanded": "false" });
+    row.append(tsSpan("ev-time", c.detected_at));
+    // The schema comes from the statement text; an unqualified statement
+    // (USE app; ALTER TABLE users ...) records none, so show the table alone
+    // rather than ".users".
+    row.append(el("span", { class: "ev-table", text: c.schema_name ? c.schema_name + "." + c.table_name : c.table_name,
+      title: c.schema_name ? null : "Schema not recorded: the statement did not name it" }));
+    row.append(el("span", {}, scBadge(c.ddl_type)));
+    row.append(el("span", { class: "sc-pos", text: c.binlog_file + ":" + c.binlog_pos }));
+    row.append(withheld
+      ? el("pre", { class: "sc-stmt sc-stmt-withheld", text: "(statement withheld under the active access profile)" })
+      : el("pre", { class: "sc-stmt", text: c.statement || "" }));
+    row.addEventListener("click", () => {
+      const open = row.classList.toggle("open");
+      row.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    row.addEventListener("keydown", (ke) => {
+      if (ke.key === "Enter" || ke.key === " ") { ke.preventDefault(); row.click(); }
+    });
+    container.append(row);
+  });
+}
+
 // ── schemas / tables cascade ──────────────────────────────────────────────────
 
 async function loadSchemas() {
@@ -7250,6 +7538,7 @@ function cmdkCommands() {
   const cmds = [
     { group: "Navigate", label: "Overview", run: () => navigate("overview") },
     { group: "Navigate", label: "Events", run: () => navigate("events") },
+    { group: "Navigate", label: "Schema changes", run: () => navigate("schema-changes") },
     { group: "Navigate", label: "Recover", run: () => navigate("recover") },
     { group: "Navigate", label: "Status", run: () => navigate("status") },
   ];

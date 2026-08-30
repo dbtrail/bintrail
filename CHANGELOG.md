@@ -30,6 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spelling differs from an existing row only by case or accents (the index
   compares names without regard to either) is refused, naming the stored
   row, instead of silently re-describing or keeping it.
+- **The console's Status page shows the index disk-capacity projection**
+  (#1444). An **Index disk** card carries what `bintrail doctor` already
+  computes, for the selected server: index size, write rate, the size the
+  index settles at for the configured retention, free space on the index
+  volume and how long it lasts at the current rate. The grade is the
+  doctor's (`GET /api/capacity` runs the doctor's own probe and verdict over
+  the console's connection, with no thresholds of its own); a warn or fail
+  grade also renders a box above the cards with the plain reading and what
+  fixes it, so a filling index volume is seen where operators look, before
+  capture stalls. Honest where a piece is missing: free space the process
+  cannot measure (the index on another host or container) reads "not
+  measurable from here", never a number, and the standalone read-only
+  console, which runs no rotation, reports the retention as not known
+  instead of grading an index another process rotates as unbounded; only
+  the free-space floor still warns there. Under `watch` the window is the
+  effective rotation policy, override or daemon default, and rotation off
+  grades as unbounded growth.
 - **Console pages link to their docs page** (#1450). Every view whose subject
   has a page on www.dbtrail.com/docs now shows a small Docs link beside its
   title, opening the page in a new tab: Events and Restore (the recovery
@@ -69,6 +86,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package is guarded the day it appears; the console, MCP and pg binaries are
   pinned free of both. Records the #1467 decision mechanically: Iceberg is an
   output, not the storage layer.
+- **Schema changes view in the console** (#1443). A new read-only page under
+  Investigate lists every CREATE, ALTER, DROP, RENAME and TRUNCATE the stream
+  recorded for the selected server: time, table, type, the statement and its
+  binlog position, newest first, with the same schema, table, type and time
+  filters as Events and the same caps (100 by default, 1000 at most, and a
+  note when more exist). Backed by `GET /api/schema-changes`, which reads the
+  index's `schema_changes` table, takes the filters the MCP
+  `list_schema_changes` tool takes (`ddl_type` is a prefix, so `ALTER` matches
+  `ALTER TABLE`), and orders by `detected_at, binlog_file, binlog_pos, id`,
+  all descending, so DDLs detected in the same second list in their true
+  binlog order. Under an access policy the rows are scoped by the table the
+  index attributed each statement to (a statement naming several tables is
+  attributed to the first), and the statement text is withheld, as the Events
+  view withholds `query_text`: DDL text can carry values and name other
+  tables. A statement that did not name its schema (`USE app; ALTER TABLE
+  users ...`) is recorded with an empty schema, so a deny on a table also
+  withholds unqualified DDL on a table of that name, and the page shows such
+  rows by table alone. The response says what it left out.
 - **Primary key ranges on `query` and `recover`** (#1440). `--pk-min` /
   `--pk-max` (MCP: `pk_min` / `pk_max`), inclusive, either bound alone or
   both, answer "every event on ids 1000 through 1999" without enumerating the
@@ -146,6 +181,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Fixed
+- **`export iceberg` no longer records `snapshot_id: 0` for a zero-row first
+  load** (#1509). A baseline with zero rows commits the table and its cursor
+  and no data file, so the table has no Iceberg snapshot; the audit event
+  named snapshot `0`, an id no snapshot has. The event still fires (a table
+  and a cursor were written) with `rows: 0` and no `snapshot_id`. The
+  `--format json` outcome already left the field out, but only because 0 is
+  the zero value; it now leaves it out on absence. `Outcome.SnapshotID` and
+  `Commit.SnapshotID` are `*int64`, nil when absent.
 - **`export iceberg` renders a JSON column one way on both paths** (#1508).
   The first load copied the baseline's text, which is MySQL's own rendering
   of the document (keys in MySQL's order, a space after every comma), while

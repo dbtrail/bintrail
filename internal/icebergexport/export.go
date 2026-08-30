@@ -88,7 +88,13 @@ type Outcome struct {
 	Events     int64
 	Upserts    int64
 	Deletes    int64
-	SnapshotID int64
+	// SnapshotID names the Iceberg snapshot the table stands at after the
+	// run, or is nil when there is none: a first load of a baseline with
+	// zero rows commits the table and its cursor but no data file, and a
+	// table without data has no snapshot. Absent, not 0: no snapshot has
+	// that id, and a reader correlating this with iceberg_snapshots()
+	// would look for one.
+	SnapshotID *int64
 	Cursor     string
 	Location   string
 }
@@ -108,9 +114,20 @@ type Commit struct {
 	Rows          int64 // rows loaded (load) or upserted (delta)
 	Deletes       int64
 	Events        int64
-	SnapshotID    int64
+	SnapshotID    *int64 // nil for a load that wrote no data file (see Outcome.SnapshotID)
 	Cursor        string
 	Location      string
+}
+
+// snapshotIDOf returns the table's current snapshot id, or nil when the
+// table has no snapshot yet.
+func snapshotIDOf(tbl *table.Table) *int64 {
+	snap := tbl.CurrentSnapshot()
+	if snap == nil {
+		return nil
+	}
+	id := snap.SnapshotID
+	return &id
 }
 
 // deps is what every table run shares.
@@ -348,7 +365,7 @@ func (d *deps) runTable(ctx context.Context, schema, tbl string) Outcome {
 // loadResult is what firstLoad committed.
 type loadResult struct {
 	rows       int64
-	snapshotID int64
+	snapshotID *int64 // nil when no data file was written (zero baseline rows)
 	detail     string // "" or a note about the seed, appended to the outcome
 }
 
@@ -451,9 +468,10 @@ func (d *deps) firstLoad(ctx context.Context, schema, tbl string, tm *metadata.T
 		return nil, nil, none, fmt.Errorf("commit the first load of %s.%s: %w", schema, tbl, err)
 	}
 	res.rows = rows
-	if snap := icetbl.CurrentSnapshot(); snap != nil {
-		res.snapshotID = snap.SnapshotID
-	}
+	// A zero-row baseline commits the table and its cursor and no data
+	// file, so the table has no snapshot: the id stays nil and the audit
+	// event below still fires (a table was created, a cursor written).
+	res.snapshotID = snapshotIDOf(icetbl)
 	slog.Info("iceberg export: first load committed", "schema", schema, "table", tbl, "rows", rows, "cursor", cur.String(), "location", icetbl.Location())
 	d.committed(Commit{Schema: schema, Table: tbl, Kind: CommitLoad, Rows: rows, SnapshotID: res.snapshotID,
 		Cursor: cur.String(), Location: icetbl.Location()})
@@ -615,7 +633,7 @@ func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrow
 // incrementResult is what one delta window produced.
 type incrementResult struct {
 	events, upserts, deletes int64
-	snapshotID               int64
+	snapshotID               *int64 // nil while the table has no snapshot
 	cursor                   cursor
 	location                 string
 	note                     string // "" or a hedge appended to the outcome's detail
@@ -638,10 +656,7 @@ type incrementResult struct {
 func (d *deps) increment(ctx context.Context, schema, tbl string, tm *metadata.TableMeta, pkCols []metadata.ColumnMeta,
 	icetbl *table.Table, cur *cursor) (*incrementResult, error) {
 
-	res := &incrementResult{cursor: *cur, location: icetbl.Location()}
-	if snap := icetbl.CurrentSnapshot(); snap != nil {
-		res.snapshotID = snap.SnapshotID
-	}
+	res := &incrementResult{cursor: *cur, location: icetbl.Location(), snapshotID: snapshotIDOf(icetbl)}
 	at := d.cfg.At
 
 	cols, err := columnsFromSchema(icetbl.Schema())
@@ -795,9 +810,7 @@ func (d *deps) increment(ctx context.Context, schema, tbl string, tm *metadata.T
 	}
 	res.cursor = newCur
 	res.location = committed.Location()
-	if snap := committed.CurrentSnapshot(); snap != nil {
-		res.snapshotID = snap.SnapshotID
-	}
+	res.snapshotID = snapshotIDOf(committed)
 	slog.Info("iceberg export: deltas committed", "schema", schema, "table", tbl,
 		"events", res.events, "upserts", res.upserts, "deletes", res.deletes, "cursor", newCur.String())
 	if len(ops) > 0 {
