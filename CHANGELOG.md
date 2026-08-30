@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upload succeeds, and a failed upload keeps the finished local snapshot and
   says the fold itself worked. The daemon-wide `--baseline-refresh-interval`
   is unchanged: it names no destination, so its snapshots stay local.
+  Two consequences worth knowing. Retention improves: `PruneLocal` reclaims a
+  local snapshot once it can confirm its `_SUCCESS` in S3, so the snapshots a
+  scheduled update publishes on an S3-backed server are now prunable, where
+  before nothing this fold produced ever was. And carry-forward of unchanged
+  tables does not apply when the previous snapshot is read from a bucket — it
+  publishes a table by hard-linking the previous file, which needs both on a
+  filesystem — so those runs take the ordinary merge path: correct, and the
+  same rows, just not free.
 
 ## [0.73.0] - 2026-08-30
 

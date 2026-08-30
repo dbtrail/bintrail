@@ -717,8 +717,14 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 	// RETENTION INTERPLAY (#616), stated at startup on purpose. A refreshed
 	// snapshot is written locally and is NOT uploaded, and baseline.PruneLocal
 	// only reclaims a snapshot whose _SUCCESS marker it can confirm in S3 — so
-	// nothing this loop publishes is prunable, with or without an S3 destination
-	// configured. Unattended that is one full-table snapshot per interval,
+	// nothing THIS loop publishes is prunable, with or without an S3 destination
+	// configured.
+	//
+	// Scoped to this loop, and since #1539 that scope is load-bearing: a
+	// PER-SERVER schedule on a server with an S3 destination uploads what it
+	// folds, so those snapshots ARE prunable (baselinePruneTargets already
+	// covers any entry with both a directory and a bucket). This flag names no
+	// destination, which is exactly why its own output stays local. Unattended that is one full-table snapshot per interval,
 	// forever. An operator who discovers this from a full disk discovers it far
 	// too late, and the loop has no business quietly deciding to upload on their
 	// behalf.
