@@ -94,18 +94,57 @@ func caseBody(js, label string) string {
 	return rest
 }
 
+// goFunctionBody returns the text of one top-level Go function, from its
+// signature to the start of the next one.
+//
+// Scope, not a whole-file search: capacity.go holds a SECOND switch over
+// capacity constants (capacityCheckResult), so `strings.Contains(src, "case
+// X:")` would be satisfied by a case in a function that renders something else
+// entirely — a guard passing for an unrelated reason. It Fatals on a rename
+// rather than returning "", because an empty haystack would turn every
+// assertion below into a failure whose message blames the wrong thing.
+func goFunctionBody(t *testing.T, src, signature string) string {
+	t.Helper()
+	i := strings.Index(src, signature)
+	if i < 0 {
+		t.Fatalf("%s is gone from the doctor package; this guard covers nothing", signature)
+	}
+	rest := src[i+len(signature):]
+	if j := strings.Index(rest, "\nfunc "); j > 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
 // A reason value has now been added twice and both times an enumeration of
 // them lagged behind (the wire DTO's comment, the card's switch). Derive the
 // set from where it is defined instead of restating it: every value in the
 // doctor's const block must appear in the DTO comment, and every value that
-// means "not measured" must have its own arm in capacityFreeNote, or that
-// state silently falls to the default and loses its fix.
+// means "not measured" must have its own arm in BOTH renderings — the
+// console's capacityFreeNote and the CLI's freeUnmeasurableDetail — or that
+// state silently falls to a default and loses its fix.
+//
+// There are three consumers and the CLI one was missed for a full review pass,
+// which is the same lag this guard exists to stop. `doctor` prints its own
+// text; a reason that reaches it with no arm renders the advice-free fallback
+// on a terminal where nobody sees the console card that would have explained it.
+//
+// The declaration pattern is deliberately loose about spacing. The first draft
+// required exactly one space, and a constant added WITHOUT a doc comment above
+// it was invisible: gofmt pads such a line to align with its neighbour, and the
+// guard skipped it while `len(found) < 4` stayed satisfied by the constants
+// that were already there. Every existing constant in that block carries a
+// comment, so the conventional addition was caught and only the unconventional
+// one slipped — the worst shape for a guard, since it is silent exactly when
+// the author was not following the pattern this file teaches. `const X ... = `
+// on its own line is matched for the same reason: capacity.go uses that form
+// elsewhere in the file.
 func TestEveryFreeReasonIsAccountedFor(t *testing.T) {
 	src, err := os.ReadFile("../doctor/capacity.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	decl := regexp.MustCompile(`(?m)^\t(Capacity\w+) CapacityFreeReason = "(\w+)"`)
+	decl := regexp.MustCompile(`(?m)^(?:\t|const )(Capacity\w+)\s+CapacityFreeReason\s*=\s*"(\w+)"`)
 	found := decl.FindAllStringSubmatch(string(src), -1)
 	if len(found) < 4 {
 		t.Fatalf("found %d CapacityFreeReason constants in the doctor package; this guard covers nothing", len(found))
@@ -119,6 +158,7 @@ func TestEveryFreeReasonIsAccountedFor(t *testing.T) {
 		t.Fatal(err)
 	}
 	note := functionBody(t, string(js), "function capacityFreeNote(")
+	cliArms := goFunctionBody(t, string(src), "func freeUnmeasurableDetail(")
 
 	for _, m := range found {
 		name, value := m[1], m[2]
@@ -139,6 +179,12 @@ func TestEveryFreeReasonIsAccountedFor(t *testing.T) {
 		}
 		if !strings.Contains(note, `case "`+value+`"`) {
 			t.Errorf("%s (%q) has no arm in capacityFreeNote: that state falls to the default and loses its fix", name, value)
+		}
+		// The CLI renders the same states from the same constants. Matched by
+		// NAME, not value: that switch is Go and cases the constant.
+		if !strings.Contains(cliArms, "case "+name+":") {
+			t.Errorf("%s (%q) has no arm in freeUnmeasurableDetail: `dbtrail doctor` prints the advice-free "+
+				"fallback for a state the console explains", name, value)
 		}
 	}
 	if !strings.Contains(note, "default:") {
