@@ -445,14 +445,18 @@ try {
     const fail = { ...base, status: "fail", reason: "growth_exceeds_free", free_known: true, free_bytes: 10000000, days_until_full: 0.42 };
     const warn = { ...base, status: "warn", reason: "free_under_floor", remaining_bytes: 0, free_known: true, free_bytes: 50000000, days_until_full: 2.1 };
     const pass = { ...base, status: "pass", reason: "ok", free_known: true, free_bytes: 2000000000, days_until_full: 83.3 };
-    const freeUnknown = { ...base, status: "skip", reason: "free_unknown", free_known: false, free_bytes: 0 };
+    const freeUnknown = { ...base, status: "skip", reason: "free_unknown", free_known: false, free_bytes: 0, free_reason: "mount_unset" };
+    const freeRemote = { ...base, status: "skip", reason: "free_unknown", free_known: false, free_bytes: 0, free_reason: "index_not_local" };
+    const freeTunnel = { ...base, status: "skip", reason: "free_unknown", free_known: false, free_bytes: 0, free_reason: "host_unconfirmed" };
+    const freeLegacy = { ...base, status: "skip", reason: "free_unknown", free_known: false, free_bytes: 0 };
     const serve = { ...base, status: "skip", reason: "retention_unknown", projected_bytes: 0, remaining_bytes: 0,
       retention: { known: false, enabled: false }, free_known: true, free_bytes: 2000000000, days_until_full: 83.3 };
     const failBox = capacityBox(fail), warnBox = capacityBox(warn), passBox = capacityBox(pass), unknownBox = capacityBox(freeUnknown), serveBox = capacityBox(serve);
     const failCard = capacityCard(fail), passCard = capacityCard(pass), unknownCard = capacityCard(freeUnknown), serveCard = capacityCard(serve), errCard = capacityCard({ error: "boom" });
+    const remoteCard = capacityCard(freeRemote), legacyCard = capacityCard(freeLegacy), tunnelCard = capacityCard(freeTunnel);
     let failBorder = "";
     document.body.appendChild(failBox); failBorder = getComputedStyle(failBox).borderColor; failBox.remove();
-    const texts = [failBox, warnBox, failCard, passCard, unknownCard, serveCard, errCard].map((n) => n.textContent).join("\n");
+    const texts = [failBox, warnBox, failCard, passCard, unknownCard, serveCard, errCard, remoteCard, legacyCard, tunnelCard].map((n) => n.textContent).join("\n");
     const unknownState = unknownCard.querySelector(".hstat");
     return {
       failRed: failBox.classList.contains("error-box") && /will fill before rotation/.test(failBox.textContent) && /under a day/.test(failBox.textContent),
@@ -462,6 +466,16 @@ try {
       failState: !!failCard.querySelector(".hstat-err") && /will fill/.test(failCard.textContent),
       passNote: /Rotation caps the index/.test(passCard.textContent) && /1\.9 GB/.test(passCard.textContent),
       unknownWorded: /not measurable from here/.test(unknownCard.textContent) && !/0 B/.test(unknownCard.textContent) && !!unknownState && unknownState.classList.contains("hstat-muted"),
+      // #1527: the reason the doctor landed on, said as a fix when there is
+      // one, and never as a guess about where the index runs.
+      unknownNamesTheFix: /BINTRAIL_INDEX_DATADIR_RO/.test(unknownCard.textContent) && !/another host or container/.test(unknownCard.textContent),
+      remoteOffersNoFix: /another address/.test(remoteCard.textContent) && !/BINTRAIL_INDEX_DATADIR_RO/.test(remoteCard.textContent),
+      legacyStaysHonest: /not measured/.test(legacyCard.textContent) && !/another host or container/.test(legacyCard.textContent),
+      // A local address whose server is not confirmed to be this machine (a
+      // port-forward looks exactly like this): the mount is offered WITH the
+      // precondition, or an operator points it at a local mysqld that is not
+      // the index and gets a measured number for the wrong volume.
+      tunnelQualifiesTheMount: /cannot confirm/.test(tunnelCard.textContent) && /BINTRAIL_INDEX_DATADIR_RO/.test(tunnelCard.textContent) && /nothing else/.test(tunnelCard.textContent),
       serveWorded: /not known here/.test(serveCard.textContent) && !/steady size/.test(serveCard.textContent),
       errNote: /Could not measure the index disk: boom/.test(errCard.textContent),
       noEmDash: !/—/.test(texts),
@@ -476,6 +490,10 @@ try {
   idxDisk.failState ? ok("index disk: card state chip is red on fail") : bad("index disk: card state chip is red on fail", "no .hstat-err");
   idxDisk.passNote ? ok("index disk: pass card reads the free space and the cap") : bad("index disk: pass card reads the free space and the cap", "note or free figure missing");
   idxDisk.unknownWorded ? ok("index disk: unmeasurable free space is worded, never a number") : bad("index disk: unmeasurable free space is worded, never a number", "showed 0 B or no muted chip");
+  idxDisk.unknownNamesTheFix ? ok("index disk: a missing datadir mount names the mount, not a topology") : bad("index disk: a missing datadir mount names the mount, not a topology", "no BINTRAIL_INDEX_DATADIR_RO, or still asserts another host");
+  idxDisk.remoteOffersNoFix ? ok("index disk: an index at another address offers no local mount fix") : bad("index disk: an index at another address offers no local mount fix", "offered a mount that would measure the wrong volume");
+  idxDisk.legacyStaysHonest ? ok("index disk: a response with no free_reason still says what happened") : bad("index disk: a response with no free_reason still says what happened", "blank or guessed reason");
+  idxDisk.tunnelQualifiesTheMount ? ok("index disk: an unconfirmed local host gets the mount fix with its precondition") : bad("index disk: an unconfirmed local host gets the mount fix with its precondition", "advice missing, or offered without the warning");
   idxDisk.serveWorded ? ok("index disk: standalone console says the window is not known here") : bad("index disk: standalone console says the window is not known here", "claimed a window or a steady size");
   idxDisk.errNote ? ok("index disk: a failed fetch renders a note inside the card") : bad("index disk: a failed fetch renders a note inside the card", "card blank on error");
   idxDisk.noEmDash ? ok("index disk: rendered copy carries no em dash") : bad("index disk: rendered copy carries no em dash", "em dash in rendered text");

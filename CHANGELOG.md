@@ -67,6 +67,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full copy of every table" (true of what a run writes) as the only description
   of what a run costs. The **Staged downloads** empty state says again that a
   build is removed, rather than implying it.
+- **The Index disk card says why free space is not measurable, and what
+  would make it measurable, instead of guessing where the index runs**
+  (#1527). "Free on disk: not measurable from here" came with the sentence
+  "The index runs on another host or container", which the check never
+  learned: it is what the code assumed after a measurement did not land, and
+  it reads as plainly false on a single machine that runs everything. The
+  capacity check now reports the branch it landed on next to the verdict
+  (`free_reason` on `GET /api/capacity`, and the same wording in `bintrail
+  doctor`), and the card reads it. An index this process can reach locally,
+  including the bundled stack's `index-mysql`, is told the fix: mount the
+  index data directory into the console read-only and set
+  `BINTRAIL_INDEX_DATADIR_RO` to the mount point, the way the bundled
+  `docker-compose.yml` wires both. A mount that is set but unreadable says
+  so, rather than blaming the topology. An index answering at another
+  address is told that free space cannot be seen from here and is offered no
+  local mount at all, because a volume that is not the index's would report
+  the wrong free space, which is worse than reporting none. An index on a
+  local address whose server cannot be confirmed to be this machine, which is
+  what a port-forward or an ssh tunnel looks like, is its own state: the mount
+  is still offered, with the warning to point it at the index's own data
+  directory and nothing else, because a local database's data directory may
+  well be sitting right there and pointing at it would show a measured number,
+  with the thresholds live, for a volume that is not the index's. Nothing new is
+  measured and no path is ever guessed: the only directory this check stats
+  is still one the operator named, or the server's own data directory behind
+  the existing locality gate, so the shipped compose file's guarantee that
+  the mount and the index DSN cannot drift apart is untouched. The check
+  stays advisory, and the reason never moves a grade.
 
 ## [0.72.0] - 2026-08-30
 
