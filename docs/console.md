@@ -167,9 +167,17 @@ and searching events:
    long that free space lasts at the current rate. The grade is the
    doctor's; a warn or fail grade also renders a box above the cards saying
    what fills the disk and what fixes it. Two things it says rather than
-   guesses: free space that this process cannot measure (the index on
-   another host or container) reads "not measurable from here", never a
-   number; and the standalone read-only console, which runs no rotation of
+   guesses: free space that this process cannot measure reads "not
+   measurable from here", never a number, and the card names why it could
+   not measure it plus the fix when there is one (mount the index data
+   directory into the console read-only and set `BINTRAIL_INDEX_DATADIR_RO`
+   to the mount point, the way the bundled `docker-compose.yml` does; an
+   index reached at another address gets no such suggestion, because a
+   mount that is not the index's would report the wrong volume's free
+   space, and an index on a local address whose server the console cannot
+   confirm is this machine, which is what a port-forward or a tunnel looks
+   like, gets the suggestion with that warning attached); and the
+   standalone read-only console, which runs no rotation of
    its own, reports the retention as "not known here" instead of grading an
    index another process rotates as unbounded. See
    [capacity planning](capacity.md#monitoring).

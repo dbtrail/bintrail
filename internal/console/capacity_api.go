@@ -67,10 +67,17 @@ type capacityResponse struct {
 	ProjectedBytes float64 `json:"projected_bytes,omitempty"`
 	RemainingBytes float64 `json:"remaining_bytes,omitempty"`
 	// FreeKnown is false when the index datadir's free space is not
-	// measurable from this process (the index runs on another host or
-	// container); FreeBytes is meaningful only when it is true.
+	// measurable from this process; FreeBytes is meaningful only when it is
+	// true.
 	FreeKnown bool   `json:"free_known"`
 	FreeBytes uint64 `json:"free_bytes"`
+	// FreeReason names how free space was measured, or why it was not, so the
+	// card can say what would make it measurable instead of asserting where
+	// the index runs (#1527): mount | local_datadir | mount_unset |
+	// mount_unusable | host_unconfirmed | index_not_local | unknown. Absent
+	// from an older backend's response, and unrecognised values from a newer
+	// one, both fall to the card's default arm, which offers no mount advice.
+	FreeReason string `json:"free_reason,omitempty"`
 	// DaysUntilFull is the free space divided by the daily growth: how long
 	// the free space lasts at the measured rate if nothing frees it.
 	// Present only when free space is known and the rate is positive.
@@ -147,6 +154,7 @@ func capacityResponseFrom(m doctor.CapacityMeasurement, retention capacityRetent
 		CurrentBytes: m.CurrentBytes,
 		FreeKnown:    m.FreeKnown,
 		FreeBytes:    m.FreeBytes,
+		FreeReason:   string(m.FreeReason),
 	}
 	if m.Measured {
 		resp.EventsPerDay = m.EventsPerDay

@@ -60,6 +60,10 @@ func TestCheckIndexCapacity_projectsAndSkipsUnmeasurableDisk(t *testing.T) {
 	// check reads (they are dictionary-cached estimates otherwise).
 	testutil.MustExec(t, db, fmt.Sprintf("ANALYZE TABLE `%s`.`binlog_events`", dbName))
 
+	// No read-only datadir mount is declared for the test container, and the
+	// ambient environment must not decide the branch this case asserts.
+	t.Setenv(datadirMountEnv, "")
+
 	r := checkIndexCapacity(context.Background(), testutil.IntegrationDSN(dbName), dbName, 30*24*time.Hour)
 	// #948: the index MySQL is a separate container here, so the disk-free volume
 	// is not measurable from this host — the check SKIPs rather than reporting a
@@ -69,10 +73,30 @@ func TestCheckIndexCapacity_projectsAndSkipsUnmeasurableDisk(t *testing.T) {
 	// #948 this path returned a misleading PASS, so this test passed without ever
 	// exercising a real measurement.
 	if r.Status != StatusSkip {
-		t.Fatalf("status = %s, want skip (index is a separate container; disk unmeasurable) (detail: %s)", r.Status, r.Detail)
+		t.Fatalf("status = %s, want skip (disk unmeasurable from here) (detail: %s)", r.Status, r.Detail)
 	}
 	if !strings.Contains(r.Detail, "projected steady-state") {
 		t.Errorf("detail should carry the projection, got: %s", r.Detail)
+	}
+	// #1527: the index answers on loopback but from a container whose
+	// @@hostname is not this host's, which is the exact shape a port-forward
+	// or a tunnel also has. The fix is named (a read-only mount of the index's
+	// data directory) and so is its precondition, because a local mysqld's
+	// datadir could be sitting right here and is not this index's. What the
+	// check must NOT do is assert where the index runs, which it never
+	// learned.
+	if !strings.Contains(r.Detail, datadirMountEnv) {
+		t.Errorf("detail should name the mount that would make free space measurable, got: %s", r.Detail)
+	}
+	for _, want := range []string{"cannot confirm", "OWN data directory"} {
+		if !strings.Contains(r.Detail, want) {
+			t.Errorf("detail is missing %q: the mount advice must carry its precondition here, got: %s", want, r.Detail)
+		}
+	}
+	for _, guess := range []string{"separate host", "another host"} {
+		if strings.Contains(r.Detail, guess) {
+			t.Errorf("detail asserts a topology the check never learned (%q): %s", guess, r.Detail)
+		}
 	}
 }
 

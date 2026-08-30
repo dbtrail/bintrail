@@ -74,7 +74,62 @@ type CapacityProbe struct {
 	// it is not measurable from this process (see indexDatadirFree).
 	FreeBytes uint64
 	FreeKnown bool
+	// FreeReason names HOW free space was measured, or WHY it was not, so a
+	// surface reporting "not measurable" can say what would make it
+	// measurable instead of asserting a topology it inferred (#1527).
+	FreeReason CapacityFreeReason
 }
+
+// CapacityFreeReason names the branch indexDatadirFree landed on. The two
+// measured values say which path produced the number; the rest say what stood
+// in the way, in the operator's terms. Reported alongside the verdict and
+// never consulted by it: this check is advisory, and no reason here may move
+// a grade (see classifyCapacity).
+type CapacityFreeReason string
+
+const (
+	// CapacityFreeFromMount: measured through the read-only datadir mount the
+	// operator declared in BINTRAIL_INDEX_DATADIR_RO.
+	CapacityFreeFromMount CapacityFreeReason = "mount"
+	// CapacityFreeFromDatadir: measured through the index server's own
+	// @@datadir, after the loopback + hostname check proved the server is
+	// this host's.
+	CapacityFreeFromDatadir CapacityFreeReason = "local_datadir"
+	// CapacityFreeMountUnset: no read-only datadir mount is declared, and the
+	// index is known to be reachable on this machine — either the DSN names
+	// the bundled compose host (whose volume that compose file mounts), or it
+	// is loopback/unix AND the server's @@hostname was CONFIRMED to be this
+	// host's. Declaring the mount is then what would make the volume
+	// measurable, and the advice can be unqualified. Every path that leaves
+	// locality unconfirmed downgrades to CapacityFreeHostUnconfirmed instead
+	// (unconfirmedLocality) — the promise in this sentence is exactly what
+	// that guard keeps true.
+	CapacityFreeMountUnset CapacityFreeReason = "mount_unset"
+	// CapacityFreeMountUnusable: BINTRAIL_INDEX_DATADIR_RO is set to a path
+	// this process cannot read (missing, not a directory, statfs failed). Said
+	// ahead of every topology reason: an operator who declared a mount needs
+	// to hear that the declaration is broken, not a guess about where the
+	// index runs.
+	CapacityFreeMountUnusable CapacityFreeReason = "mount_unusable"
+	// CapacityFreeIndexNotLocal: the index DSN points at another address, so
+	// no filesystem on this host is the index's and a local statfs would
+	// measure the wrong volume. The one reason that must NOT carry a mount
+	// suggestion.
+	CapacityFreeIndexNotLocal CapacityFreeReason = "index_not_local"
+	// CapacityFreeHostUnconfirmed: the index answers on a local address, but
+	// the server could not be confirmed to run on this machine (@@hostname
+	// differs, or this host's name could not be read). A port-forward or an
+	// ssh tunnel presents a REMOTE MySQL at 127.0.0.1 while a local mysqld's
+	// datadir sits right there on disk, so the mount suggestion has to name
+	// its own precondition: pointed at that local datadir it would report a
+	// volume that is not the index's, as a measured number, with the
+	// thresholds live on it. Split from CapacityFreeMountUnset for exactly
+	// that reason.
+	CapacityFreeHostUnconfirmed CapacityFreeReason = "host_unconfirmed"
+	// CapacityFreeReasonUnknown: the DSN could not be read, so the check
+	// cannot even say which of the above applies.
+	CapacityFreeReasonUnknown CapacityFreeReason = "unknown"
+)
 
 // CapacityQueryError is the error ProbeCapacity returns when one of its
 // information_schema reads fails. What names the read in operator words,
@@ -112,7 +167,7 @@ func ProbeCapacity(ctx context.Context, db *sql.DB, dsn, dbName string) (Capacit
 		}
 		probe.TableVisible = visible
 	}
-	probe.FreeBytes, probe.FreeKnown = indexDatadirFree(ctx, db, dsn)
+	probe.FreeBytes, probe.FreeKnown, probe.FreeReason = indexDatadirFree(ctx, db, dsn)
 	return probe, nil
 }
 
@@ -180,6 +235,9 @@ type CapacityMeasurement struct {
 	RemainingBytes float64
 	FreeBytes      uint64
 	FreeKnown      bool
+	// FreeReason is the probe's free-space branch, carried through untouched
+	// so a surface can say what would make the volume measurable (#1527).
+	FreeReason CapacityFreeReason
 	// DaysUntilFull is FreeBytes over the daily growth: how long the free
 	// space lasts at the measured rate if nothing frees it. Present
 	// (DaysUntilFullKnown) only when free space is known and the rate is
@@ -201,14 +259,14 @@ func EvaluateCapacity(probe CapacityProbe, retain time.Duration, retainKnown boo
 		return CapacityMeasurement{
 			Status: StatusSkip, Reason: CapacityNotInitialized,
 			Retain: retain, RetainKnown: retainKnown,
-			FreeBytes: probe.FreeBytes, FreeKnown: probe.FreeKnown,
+			FreeBytes: probe.FreeBytes, FreeKnown: probe.FreeKnown, FreeReason: probe.FreeReason,
 		}
 	}
 	if !retainKnown {
 		retain = 0
 	}
 	p, ok := projectCapacity(probe.Partitions, retain, now)
-	return classifyCapacity(p, ok, retain, retainKnown, probe.FreeBytes, probe.FreeKnown)
+	return classifyCapacity(p, ok, retain, retainKnown, probe.FreeBytes, probe.FreeKnown, probe.FreeReason)
 }
 
 // capacityProjection is projectCapacity's measured outcome.
@@ -268,7 +326,11 @@ func projectCapacity(parts []CapacityPartition, retain time.Duration, now time.T
 //     volume has no margin for a rotation stall or a spike.
 //   - remaining growth >= capWarnFraction of free space: WARN.
 //   - otherwise PASS.
-func classifyCapacity(p capacityProjection, ok bool, retain time.Duration, retainKnown bool, free uint64, freeKnown bool) CapacityMeasurement {
+//
+// freeReason is carried, never consulted: it names why free space is or is
+// not known, and a check that graded on it could turn a working console into
+// a failing one over a mount that was never configured.
+func classifyCapacity(p capacityProjection, ok bool, retain time.Duration, retainKnown bool, free uint64, freeKnown bool, freeReason CapacityFreeReason) CapacityMeasurement {
 	m := CapacityMeasurement{
 		Measured:     ok,
 		SampleHours:  p.sampleHours,
@@ -277,6 +339,7 @@ func classifyCapacity(p capacityProjection, ok bool, retain time.Duration, retai
 		RetainKnown:  retainKnown,
 		FreeBytes:    free,
 		FreeKnown:    freeKnown,
+		FreeReason:   freeReason,
 	}
 	if !ok {
 		m.Status, m.Reason = StatusSkip, CapacityNotEnoughHistory
@@ -313,9 +376,10 @@ func classifyCapacity(p capacityProjection, ok bool, retain time.Duration, retai
 
 	switch {
 	case !freeKnown:
-		// #948: the index is on a separate host/container (the docker-compose
-		// stack, or a managed/remote index), so statfs can't reach its volume and
+		// #948: this process cannot see the index volume (no read-only mount
+		// of it, or an index at another address), so statfs cannot reach it and
 		// the FAIL/WARN thresholds below are unreachable. Report SKIP, not PASS.
+		// m.FreeReason says which, for the surface that renders it (#1527).
 		// Rotation still bounds the volume (#420); the operator monitors the
 		// index disk externally.
 		m.Status, m.Reason = StatusSkip, CapacityFreeUnknown
@@ -333,8 +397,8 @@ func classifyCapacity(p capacityProjection, ok bool, retain time.Duration, retai
 
 // capacityVerdict turns a measurement into the check outcome — the
 // classification above rendered as the CLI check's text.
-func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, freeKnown bool) CheckResult {
-	return capacityCheckResult(classifyCapacity(p, true, retain, true, free, freeKnown), "")
+func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, freeKnown bool, freeReason CapacityFreeReason) CheckResult {
+	return capacityCheckResult(classifyCapacity(p, true, retain, true, free, freeKnown, freeReason), "")
 }
 
 // capacityCheckResult renders a measurement as the doctor's CheckResult.
@@ -386,7 +450,8 @@ func capacityCheckResult(m CapacityMeasurement, dbName string) CheckResult {
 		return CheckResult{
 			Name:   CapacityCheckName,
 			Status: StatusSkip,
-			Detail: projected + " — free space is not measurable from this host (the index runs on a separate host/container), so the disk-capacity thresholds are skipped, not passed; monitor the index volume externally and keep >=30% headroom above the projection (docs/capacity.md)",
+			Detail: projected + "; " + freeUnmeasurableDetail(m.FreeReason) +
+				", so the disk-capacity thresholds are skipped, not passed; keep >=30% headroom above the projection (docs/capacity.md)",
 		}
 	case CapacityGrowthExceedsFree:
 		return CheckResult{
@@ -423,6 +488,34 @@ func capacityCheckResult(m CapacityMeasurement, dbName string) CheckResult {
 			Status: StatusPass,
 			Detail: fmt.Sprintf("%s; %s free", projected, free),
 		}
+	}
+}
+
+// freeUnmeasurableDetail is the CLI's clause for a free-space measurement
+// that did not land: what this process could not see, and what would make it
+// measurable when that is knowable. It states only what the check observed
+// (#1527) — the old text asserted "the index runs on a separate
+// host/container", which is a guess, and is wrong on the single-host install
+// where the datadir is simply not mounted here. The index_not_local branch
+// deliberately carries NO mount suggestion: a mount that is not the index's
+// would measure the wrong filesystem, which is worse than measuring nothing.
+func freeUnmeasurableDetail(reason CapacityFreeReason) string {
+	switch reason {
+	case CapacityFreeMountUnset:
+		return "free space is not measurable from here: this process cannot see the index volume, and no read-only copy of the index data directory is configured. " +
+			"Mount that directory read-only into this process and set BINTRAIL_INDEX_DATADIR_RO to the mount point (the bundled docker-compose.yml wires both)"
+	case CapacityFreeMountUnusable:
+		return "free space is not measurable from here: BINTRAIL_INDEX_DATADIR_RO points at a path this process cannot read, so nothing was measured. " +
+			"Check that the index data directory is still mounted there"
+	case CapacityFreeIndexNotLocal:
+		return "free space is not measurable from here: the index DSN points at another address, so no filesystem on this host is the index's and measuring one would report the wrong volume. " +
+			"Watch free space where the index runs"
+	case CapacityFreeHostUnconfirmed:
+		return "free space is not measurable from here: the index answers on a local address, but this process cannot confirm the server runs on this machine (a port-forward or a tunnel looks the same), " +
+			"so it cannot tell whether the index data directory is here. If it is, mount it read-only and set BINTRAIL_INDEX_DATADIR_RO to the mount point. " +
+			"Point that at the index's OWN data directory and nothing else: any other volume would be reported as the index's free space"
+	default:
+		return "free space is not measurable from here: this process cannot see the index volume"
 	}
 }
 
@@ -533,29 +626,91 @@ func loadPartitionSamples(ctx context.Context, db *sql.DB, dbName string) ([]Cap
 //     exist on this host's filesystem — statfs would then confidently
 //     measure the wrong volume.
 //
-// Any doubt in either path degrades to "not measurable" (the
-// PASS-with-guidance path in capacityVerdict), never to a wrong number.
-func indexDatadirFree(ctx context.Context, db *sql.DB, dsn string) (uint64, bool) {
+// Any doubt in either path degrades to "not measurable" (the SKIP-with-
+// guidance path in capacityVerdict), never to a wrong number — and the third
+// return value says WHICH doubt it was, so the surface reporting it can name
+// the fix instead of guessing a topology (#1527).
+func indexDatadirFree(ctx context.Context, db *sql.DB, dsn string) (uint64, bool, CapacityFreeReason) {
+	// Decided from the operator's declaration and the DSN's SHAPE, before any
+	// query runs, so every branch that gives up below returns the same
+	// considered answer.
+	unmeasured := unmeasurableFreeReason(dsn)
 	if free, ok := indexDatadirFreeFromEnv(); ok {
-		return free, true
+		return free, true, CapacityFreeFromMount
 	}
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil || !dsnTargetsLocalhost(cfg) {
-		return 0, false
+		return 0, false, unmeasured
 	}
+	// Every exit from here to the hostname comparison leaves locality
+	// UNCONFIRMED, and each one must say so: a probe that erred or timed out
+	// proves no more than a mismatch does. The slowest link a reader can have
+	// is the port-forward or tunnel this reason exists for, and this check is
+	// the last one inside doctor.Build's shared budget, so the deadline lands
+	// here in exactly the case that must not get unqualified mount advice.
 	var serverHost string
 	if err := db.QueryRowContext(ctx, "SELECT @@hostname").Scan(&serverHost); err != nil {
-		return 0, false
+		return 0, false, unconfirmedLocality(unmeasured)
 	}
 	localHost, err := os.Hostname()
 	if err != nil || !sameHostname(serverHost, localHost) {
-		return 0, false
+		return 0, false, unconfirmedLocality(unmeasured)
 	}
+	// Locality is confirmed below this line: the server is this machine, so
+	// mount_unset's unqualified advice is earned.
 	var varName, datadir string
 	if err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'datadir'").Scan(&varName, &datadir); err != nil {
-		return 0, false
+		return 0, false, unmeasured
 	}
-	return statfsDir(datadir)
+	if free, ok := statfsDir(datadir); ok {
+		return free, true, CapacityFreeFromDatadir
+	}
+	return 0, false, unmeasured
+}
+
+// unmeasurableFreeReason names what stands in the way of a measurement, from
+// the two things this process knows for certain before it asks anything: what
+// the operator declared, and the SHAPE of the index DSN. It selects no path
+// and measures nothing — the discovery here produces message text only, which
+// is what keeps #948's invariant intact: the only directory this check ever
+// stats is one the operator named (or the server's own datadir, behind the
+// locality gate).
+func unmeasurableFreeReason(dsn string) CapacityFreeReason {
+	if os.Getenv(datadirMountEnv) != "" {
+		// A mount was declared and the measurement did not land, so the
+		// declaration is what is broken. Said ahead of any DSN reading: an
+		// operator who wired the mount needs to hear that it is not readable.
+		return CapacityFreeMountUnusable
+	}
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return CapacityFreeReasonUnknown
+	}
+	if dsnTargetsLocalhost(cfg) || dsnTargetsBundledIndex(cfg) {
+		// The index answers somewhere this process can reach locally, so a
+		// read-only mount of its data directory is a fix the operator can
+		// actually make. Naming it is the whole point of #1527.
+		return CapacityFreeMountUnset
+	}
+	return CapacityFreeIndexNotLocal
+}
+
+// unconfirmedLocality downgrades a pending reason for an exit taken BEFORE
+// the server was confirmed to run on this machine. mount_unset promises the
+// operator that a read-only mount of the index datadir measures the INDEX, and
+// that promise is only earned once the hostname matched (or the DSN named the
+// bundled index container, which the compose file mounts itself). Unearned, it
+// can steer a host that runs its own local mysqld at /var/lib/mysql, and reads
+// the real index through a tunnel, straight into a measured free-space number
+// for the wrong volume, with the thresholds live on it.
+//
+// A broken declaration still wins: the operator wired a mount and has to hear
+// that it does not resolve before anything about topology.
+func unconfirmedLocality(unmeasured CapacityFreeReason) CapacityFreeReason {
+	if unmeasured == CapacityFreeMountUnset {
+		return CapacityFreeHostUnconfirmed
+	}
+	return unmeasured
 }
 
 // indexDatadirFreeFromEnv is indexDatadirFree's compose short-circuit — see
@@ -577,11 +732,39 @@ func indexDatadirFree(ctx context.Context, db *sql.DB, dsn string) (uint64, bool
 // invariant this exists to preserve: mount and DSN set together, in one
 // branch, by one script).
 func indexDatadirFreeFromEnv() (uint64, bool) {
-	dir := os.Getenv("BINTRAIL_INDEX_DATADIR_RO")
+	dir := os.Getenv(datadirMountEnv)
 	if dir == "" {
 		return 0, false
 	}
 	return statfsDir(dir)
+}
+
+// datadirMountEnv is the operator's declaration that a read-only copy of the
+// index's data directory is reachable at this path. Named in the "not
+// measurable" guidance, so the name lives in one place.
+const datadirMountEnv = "BINTRAIL_INDEX_DATADIR_RO"
+
+// bundledIndexHost is the index MySQL's hostname in the bundled
+// docker-compose.yml stack (service `index-mysql`, reached as
+// tcp(index-mysql:3306)). Used ONLY to word the "not measurable" reason: a
+// DSN pointing there is a layout whose datadir volume CAN be mounted into
+// this container, which is exactly what that compose file does. It never
+// selects a directory to measure, so the mount and the DSN still cannot
+// drift apart — the env var remains the only thing this check trusts.
+// Pinned against the compose file by TestBundledIndexHostMatchesCompose.
+const bundledIndexHost = "index-mysql"
+
+// dsnTargetsBundledIndex reports whether the DSN names the bundled stack's
+// index container.
+func dsnTargetsBundledIndex(cfg *mysql.Config) bool {
+	if cfg.Net == "unix" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(cfg.Addr)
+	if err != nil {
+		host = cfg.Addr
+	}
+	return strings.EqualFold(host, bundledIndexHost)
 }
 
 // statfsDir is the shared "is this a real, statfs-able directory" tail used
