@@ -3,6 +3,7 @@ package doctor
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,6 +147,54 @@ func TestIndexDatadirFree_namesTheBranchItLandedOn(t *testing.T) {
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Error(err)
+		}
+	})
+
+	// The same shape, reached through the OTHER exits that run BEFORE locality
+	// is confirmed. A slow or dead link is exactly what a port-forward or a
+	// tunnel gives you, and checkIndexCapacity is the last check inside
+	// doctor.Build's shared 30s budget, so this is where the deadline lands.
+	// Falling back to mount_unset here would hand the unqualified mount advice
+	// to the one topology it must never be unqualified for.
+	t.Run("loopback DSN, the hostname probe fails: still says the host is unconfirmed", func(t *testing.T) {
+		t.Setenv(datadirMountEnv, "")
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.ExpectQuery("SELECT @@hostname").WillReturnError(errors.New("driver: bad connection"))
+		if _, ok, reason := indexDatadirFree(ctx, db, "root:x@tcp(127.0.0.1:3306)/bintrail_index"); ok || reason != CapacityFreeHostUnconfirmed {
+			t.Errorf("known=%v reason=%q, want %q: locality was never confirmed", ok, reason, CapacityFreeHostUnconfirmed)
+		}
+	})
+
+	t.Run("loopback DSN, the probe deadline expired: still says the host is unconfirmed", func(t *testing.T) {
+		t.Setenv(datadirMountEnv, "")
+		db, _, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		dead, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, ok, reason := indexDatadirFree(dead, db, "root:x@tcp(127.0.0.1:3306)/bintrail_index"); ok || reason != CapacityFreeHostUnconfirmed {
+			t.Errorf("known=%v reason=%q, want %q: a timed-out probe confirmed nothing", ok, reason, CapacityFreeHostUnconfirmed)
+		}
+	})
+
+	// A declaration that is broken still outranks the unconfirmed host on
+	// those exits too.
+	t.Run("declared mount unusable and the hostname probe fails: the declaration is named", func(t *testing.T) {
+		t.Setenv(datadirMountEnv, filepath.Join(t.TempDir(), "gone"))
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		mock.ExpectQuery("SELECT @@hostname").WillReturnError(errors.New("driver: bad connection"))
+		if _, ok, reason := indexDatadirFree(ctx, db, "root:x@tcp(127.0.0.1:3306)/bintrail_index"); ok || reason != CapacityFreeMountUnusable {
+			t.Errorf("known=%v reason=%q, want %q", ok, reason, CapacityFreeMountUnusable)
 		}
 	})
 

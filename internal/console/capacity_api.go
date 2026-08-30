@@ -74,8 +74,9 @@ type capacityResponse struct {
 	// FreeReason names how free space was measured, or why it was not, so the
 	// card can say what would make it measurable instead of asserting where
 	// the index runs (#1527): mount | local_datadir | mount_unset |
-	// mount_unusable | index_not_local | unknown. Absent from an older
-	// backend's response, which the card reads as "unknown".
+	// mount_unusable | host_unconfirmed | index_not_local | unknown. Absent
+	// from an older backend's response, and unrecognised values from a newer
+	// one, both fall to the card's default arm, which offers no mount advice.
 	FreeReason string `json:"free_reason,omitempty"`
 	// DaysUntilFull is the free space divided by the daily growth: how long
 	// the free space lasts at the measured rate if nothing frees it.

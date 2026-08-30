@@ -2,6 +2,7 @@ package console
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -92,3 +93,64 @@ func caseBody(js, label string) string {
 	}
 	return rest
 }
+
+// A reason value has now been added twice and both times an enumeration of
+// them lagged behind (the wire DTO's comment, the card's switch). Derive the
+// set from where it is defined instead of restating it: every value in the
+// doctor's const block must appear in the DTO comment, and every value that
+// means "not measured" must have its own arm in capacityFreeNote, or that
+// state silently falls to the default and loses its fix.
+func TestEveryFreeReasonIsAccountedFor(t *testing.T) {
+	src, err := os.ReadFile("../doctor/capacity.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decl := regexp.MustCompile(`(?m)^\t(Capacity\w+) CapacityFreeReason = "(\w+)"`)
+	found := decl.FindAllStringSubmatch(string(src), -1)
+	if len(found) < 4 {
+		t.Fatalf("found %d CapacityFreeReason constants in the doctor package; this guard covers nothing", len(found))
+	}
+	dto, err := os.ReadFile("capacity_api.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	note := functionBody(t, string(js), "function capacityFreeNote(")
+
+	for _, m := range found {
+		name, value := m[1], m[2]
+		if !strings.Contains(string(dto), value) {
+			t.Errorf("%s (%q) is missing from capacity_api.go: the wire contract's own list of values is stale", name, value)
+		}
+		// CapacityFreeFrom* are the MEASURED paths; the card shows the number
+		// and has nothing to explain, so they need no arm.
+		if strings.HasPrefix(name, "CapacityFreeFrom") {
+			continue
+		}
+		// "unknown" is the one value the default arm is FOR: it means the
+		// check could not say which state applies, which is also what a
+		// missing field from an older backend and an unrecognised value from
+		// a newer one mean. Everything else must name itself.
+		if value == defaultArmValue {
+			continue
+		}
+		if !strings.Contains(note, `case "`+value+`"`) {
+			t.Errorf("%s (%q) has no arm in capacityFreeNote: that state falls to the default and loses its fix", name, value)
+		}
+	}
+	if !strings.Contains(note, "default:") {
+		t.Fatal("capacityFreeNote has no default arm, so an unrecognised reason renders nothing at all")
+	}
+	// And the default must stay advice-free: it covers states the console
+	// cannot identify, where a mount suggestion could point anywhere.
+	if strings.Contains(caseBody(note, "default:"), "BINTRAIL_INDEX_DATADIR_RO") {
+		t.Error("the default arm offers a mount fix for a state the console could not identify")
+	}
+}
+
+// defaultArmValue is the reason whose meaning IS capacityFreeNote's default
+// arm; every other unmeasured reason must name itself.
+const defaultArmValue = "unknown"

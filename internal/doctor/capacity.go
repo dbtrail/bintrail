@@ -96,9 +96,14 @@ const (
 	// this host's.
 	CapacityFreeFromDatadir CapacityFreeReason = "local_datadir"
 	// CapacityFreeMountUnset: no read-only datadir mount is declared, and the
-	// index answers at an address this process can reach locally (loopback,
-	// unix socket, or the bundled compose host) — so declaring one is what
-	// would make the volume measurable.
+	// index is known to be reachable on this machine — either the DSN names
+	// the bundled compose host (whose volume that compose file mounts), or it
+	// is loopback/unix AND the server's @@hostname was CONFIRMED to be this
+	// host's. Declaring the mount is then what would make the volume
+	// measurable, and the advice can be unqualified. Every path that leaves
+	// locality unconfirmed downgrades to CapacityFreeHostUnconfirmed instead
+	// (unconfirmedLocality) — the promise in this sentence is exactly what
+	// that guard keeps true.
 	CapacityFreeMountUnset CapacityFreeReason = "mount_unset"
 	// CapacityFreeMountUnusable: BINTRAIL_INDEX_DATADIR_RO is set to a path
 	// this process cannot read (missing, not a directory, statfs failed). Said
@@ -637,21 +642,22 @@ func indexDatadirFree(ctx context.Context, db *sql.DB, dsn string) (uint64, bool
 	if err != nil || !dsnTargetsLocalhost(cfg) {
 		return 0, false, unmeasured
 	}
+	// Every exit from here to the hostname comparison leaves locality
+	// UNCONFIRMED, and each one must say so: a probe that erred or timed out
+	// proves no more than a mismatch does. The slowest link a reader can have
+	// is the port-forward or tunnel this reason exists for, and this check is
+	// the last one inside doctor.Build's shared budget, so the deadline lands
+	// here in exactly the case that must not get unqualified mount advice.
 	var serverHost string
 	if err := db.QueryRowContext(ctx, "SELECT @@hostname").Scan(&serverHost); err != nil {
-		return 0, false, unmeasured
+		return 0, false, unconfirmedLocality(unmeasured)
 	}
 	localHost, err := os.Hostname()
 	if err != nil || !sameHostname(serverHost, localHost) {
-		// The address is local but the server is not confirmed to be. A
-		// broken declaration still wins (the operator has to hear that
-		// first); otherwise say what could not be confirmed, so the mount
-		// suggestion arrives with its precondition attached.
-		if unmeasured == CapacityFreeMountUnset {
-			return 0, false, CapacityFreeHostUnconfirmed
-		}
-		return 0, false, unmeasured
+		return 0, false, unconfirmedLocality(unmeasured)
 	}
+	// Locality is confirmed below this line: the server is this machine, so
+	// mount_unset's unqualified advice is earned.
 	var varName, datadir string
 	if err := db.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'datadir'").Scan(&varName, &datadir); err != nil {
 		return 0, false, unmeasured
@@ -687,6 +693,24 @@ func unmeasurableFreeReason(dsn string) CapacityFreeReason {
 		return CapacityFreeMountUnset
 	}
 	return CapacityFreeIndexNotLocal
+}
+
+// unconfirmedLocality downgrades a pending reason for an exit taken BEFORE
+// the server was confirmed to run on this machine. mount_unset promises the
+// operator that a read-only mount of the index datadir measures the INDEX, and
+// that promise is only earned once the hostname matched (or the DSN named the
+// bundled index container, which the compose file mounts itself). Unearned, it
+// can steer a host that runs its own local mysqld at /var/lib/mysql, and reads
+// the real index through a tunnel, straight into a measured free-space number
+// for the wrong volume, with the thresholds live on it.
+//
+// A broken declaration still wins: the operator wired a mount and has to hear
+// that it does not resolve before anything about topology.
+func unconfirmedLocality(unmeasured CapacityFreeReason) CapacityFreeReason {
+	if unmeasured == CapacityFreeMountUnset {
+		return CapacityFreeHostUnconfirmed
+	}
+	return unmeasured
 }
 
 // indexDatadirFreeFromEnv is indexDatadirFree's compose short-circuit — see
