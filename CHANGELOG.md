@@ -33,20 +33,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by different capabilities (`views` vs `sql`) and merging would make the
   download unreachable on a daemon with one on and the other off. The generated
   `views.sql` names the card by title, so both sides moved together.
-  No setting, route, API, permission or capability gate changes; 148 words leave
+  No setting, route, API, permission or capability gate changes; 125 words leave
   the screen. Storage is still a drawer, and the split is proposed on the issue.
 
 ### Fixed
-- **Console: the AWS credentials card no longer claims a shared `~/.aws` file is
-  what signs S3 requests** (#1528). `hasSharedAWSConfig` reports file PRESENCE,
-  and its arm sits below the env-key, ECS and IRSA arms, so an EC2 host with an
-  instance role and a region-only `~/.aws/config` (what `aws configure set
-  region` writes) landed on "Using credentials from a shared ~/.aws config
-  file", which was false exactly there. The arm now reports what was observed,
-  that the file exists and may hold credentials or only a region, and says an
-  IAM role on the machine can still be what signs the requests. The card's
-  question is whether this daemon can reach S3 at all, so a confident wrong
-  answer was worse than a hedged right one. The **Scheduled backups** fold
+- **Console: the AWS credentials card reports the signals it probed instead of
+  naming a credential source it never observed** (#1528). Two arms asserted use
+  from presence. The shared-config arm is selected by `hasSharedAWSConfig()`
+  (a file stat) **or** `AWS_PROFILE`, and it sits below the env-key, ECS and
+  IRSA arms, so it caught both an EC2 host with an instance role and a
+  region-only `~/.aws/config` (what `aws configure set region` writes) and a
+  container with `AWS_PROFILE` exported and no `~/.aws` mounted; it said "Using
+  credentials from a shared ~/.aws config file", which named only one of the two
+  probes and, in the second shape, contradicted the card's own
+  `~/.aws config: absent` row two lines below it. The access-key arm said "Using
+  access keys set in an environment variable" from `AWS_ACCESS_KEY_ID` alone,
+  which is false whenever the ID is exported without its secret. Both arms now
+  name the signal they saw, say what was not checked, and say an IAM role on the
+  machine can still be what signs the requests. The card's question is whether
+  this daemon can reach S3 at all, so a confident wrong answer was worse than a
+  hedged right one; these two arms are the reason the card's word count went up
+  rather than down. The **Scheduled backups** fold
   regains, on its unconditional intro line, the clause saying a run is built
   from the recorded changes and does not read your database: with no schedule
   saved yet every per-run line is gated behind a saved schedule, leaving "each a

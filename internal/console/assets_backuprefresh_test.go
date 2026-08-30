@@ -323,33 +323,97 @@ func TestBackupScheduleCard_saysWhatARunCosts(t *testing.T) {
 	}
 }
 
-// TestCredentialsCard_sharedConfigIsPresenceNotUse (#1528, review pass 1).
+// jsLineContaining returns the ONE source line of body that holds anchor.
 //
-// hasSharedAWSConfig is FILE PRESENCE only (storage_api.go), and this arm sits
-// after the env-key, ECS and IRSA arms. An EC2 box with an instance role and a
-// region-only ~/.aws/config, which is what `aws configure set region` writes,
-// sets none of the first three and lands here. Asserting "Using credentials
-// from a shared ~/.aws config file" there is simply false, and the card's job
-// is to answer whether this daemon can reach S3 at all.
+// This exists because a byte window around a needle is not a scope. The first
+// version of the guard below read body[i-200:i+260] and asked whether "IAM
+// role" appeared anywhere in it. It always did: jsFunctionBody BLANKS
+// whole-line comments before the brace walk, so the five comment lines above
+// the shared-config arm collapse to five empty lines and pull the PRECEDING
+// arm ("Using an IAM role (found an EKS service-account role)") into the
+// window. Deleting the hedge from the arm under test left the guard green, on
+// the pristine tree as well as the mutated one. A guard satisfied by a
+// different arm is not a guard.
 //
-// The note removed earlier in this PR did not cover it either: it read "an IAM
-// role can still be active even if none of the signals above show as set", and
-// in this arm a signal IS shown as set. The arm itself has to be hedged.
-func TestCredentialsCard_sharedConfigIsPresenceNotUse(t *testing.T) {
+// Even one line is too wide, though, and the second draft of this guard proved
+// it: `strings.Contains(line, "profile")` was satisfied by `aws.profile` in the
+// arm's own CONDITION, so the assertion that the copy names both probes passed
+// while the copy named one. The claim under test is the STRING the arm assigns,
+// so that is the scope: everything between `summary = "` and its closing quote.
+func jsArmSummary(t *testing.T, body, anchor string) string {
+	t.Helper()
+	i := strings.Index(body, anchor)
+	if i < 0 {
+		t.Fatalf("no line contains %q; the arm was renamed or removed, so every assertion below checks nothing:\n%s", anchor, body)
+	}
+	end := strings.IndexByte(body[i:], '\n')
+	if end < 0 {
+		end = len(body) - i
+	}
+	line := body[i : i+end]
+	const assign = `summary = "`
+	j := strings.Index(line, assign)
+	if j < 0 {
+		t.Fatalf("the arm at %q assigns no string literal to summary, so there is no claim to check:\n%s", anchor, line)
+	}
+	rest := line[j+len(assign):]
+	k := strings.IndexByte(rest, '"')
+	if k < 0 {
+		t.Fatalf("unterminated summary literal at %q:\n%s", anchor, line)
+	}
+	return rest[:k]
+}
+
+// TestCredentialsCard_armsReportWhatWasProbed (#1528, review passes 1 and 2).
+//
+// The card answers one question: can this daemon reach S3 at all. Two of its
+// arms used to answer it with a confident claim the daemon never observed.
+//
+//   - shared config: selected by `aws.shared_config || aws.profile`, which is
+//     TWO independent probes (a file stat and an env var), and it sits below
+//     the env-key, ECS and IRSA arms. An EC2 host with an instance role and a
+//     region-only ~/.aws/config lands there with no credentials in that file;
+//     so does a container with AWS_PROFILE exported and no ~/.aws mounted, and
+//     for that one a sentence naming only the file contradicts the card's own
+//     "~/.aws config: absent" row two lines below it.
+//   - access keys: AccessKeyEnv is AWS_ACCESS_KEY_ID alone. The secret key is
+//     never probed, so "Using access keys" is false whenever the ID is
+//     exported without it.
+//
+// Each assertion is scoped to the STRING that arm assigns. See jsArmSummary
+// for why neither a byte window nor the whole line is narrow enough.
+func TestCredentialsCard_armsReportWhatWasProbed(t *testing.T) {
 	body := jsFunctionBody(t, readAsset(t, "app.js"), "credentialsCard")
 
-	if strings.Contains(body, "Using credentials from a shared") {
+	shared := jsArmSummary(t, body, "else if (aws.shared_config")
+	if strings.Contains(shared, "Using credentials from") {
 		t.Error("the shared-config arm still asserts the file is what signs the requests; the daemon only " +
 			"observed that the file exists, and an instance role may be doing the work")
 	}
-	// The e2e photographs this arm by that phrase; it must survive any rewording.
-	i := strings.Index(body, "shared ~/.aws config file")
-	if i < 0 {
-		t.Fatal("the shared-config arm no longer names the file, so nothing distinguishes it from the no-signals arm")
+	// Both probes named, or the sentence contradicts the Raw signals rows for
+	// the shape it does not mention.
+	if !strings.Contains(shared, "shared ~/.aws config file") {
+		t.Error("the shared-config arm no longer names the file, which is also the string the Playwright " +
+			"suite matches this arm by")
 	}
-	arm := body[max(0, i-200):min(len(body), i+260)]
-	if !strings.Contains(arm, "IAM role") {
-		t.Errorf("the shared-config arm does not say an IAM role can still be what signs the requests:\n%s", arm)
+	if !strings.Contains(shared, "profile") {
+		t.Errorf("the arm is selected by aws.profile too, and names only the file, so with AWS_PROFILE set "+
+			"and no ~/.aws present the card contradicts its own \"~/.aws config: absent\" row:\n%s", shared)
+	}
+	if !strings.Contains(shared, "IAM role") {
+		t.Errorf("the shared-config arm does not say an IAM role can still be what signs the requests:\n%s", shared)
+	}
+
+	keys := jsArmSummary(t, body, "if (aws.access_key_env)")
+	if strings.Contains(keys, "Using access keys") {
+		t.Error("the access-key arm asserts the keys are in use; only AWS_ACCESS_KEY_ID was probed")
+	}
+	if !strings.Contains(keys, "access key ID") {
+		t.Errorf("the access-key arm does not say WHICH signal was seen:\n%s", keys)
+	}
+	if !strings.Contains(keys, "secret") {
+		t.Errorf("the access-key arm does not say the secret key was not checked, which is the whole "+
+			"difference between what was observed and what it used to claim:\n%s", keys)
 	}
 }
 

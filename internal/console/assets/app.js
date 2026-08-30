@@ -4020,15 +4020,24 @@ function credentialsCard(storage) {
     return card;
   }
   let summary = "No credentials set directly; dbtrail relies on your AWS environment (for example, an EC2 instance role) to provide them automatically.";
-  if (aws.access_key_env) summary = "Using access keys set in an environment variable.";
+  // Presence, not use, in every arm below: each reports the signal it saw and
+  // nothing about whether that signal is what the AWS chain actually resolves
+  // to. AccessKeyEnv is AWS_ACCESS_KEY_ID ALONE (storage_api.go), so an ID
+  // exported without its secret used to render "Using access keys" while the
+  // SDK's env provider yields nothing and the chain walks on past it.
+  if (aws.access_key_env) summary = "Found an access key ID set in an environment variable. Its secret key is not checked here, so this may not be what signs the requests.";
   else if (aws.container_creds) summary = "Using an IAM role (found an ECS task role).";
   else if (aws.web_identity) summary = "Using an IAM role (found an EKS service-account role).";
-  // Presence, not use. hasSharedAWSConfig() stats the file and nothing more,
-  // and this arm sits below the env-key, ECS and IRSA ones, so an EC2 box with
-  // an instance role and a region-only ~/.aws/config (what `aws configure set
-  // region` writes) lands here with no credentials in that file at all.
-  // Claiming the file signs the requests is false exactly there.
-  else if (aws.shared_config || aws.profile) summary = "Found a shared ~/.aws config file, which may hold credentials or only a region. An IAM role on this machine can still be what signs the requests.";
+  // TWO independent probes select this arm, and the sentence has to name both.
+  // hasSharedAWSConfig() stats a file; aws.profile is AWS_PROFILE in the
+  // environment. Naming only the file contradicted the card's own
+  // "~/.aws config: absent" row two lines below whenever AWS_PROFILE was
+  // exported into a container with no ~/.aws mounted, which is precisely when
+  // somebody opens this page to ask whether S3 works. And since the arm sits
+  // below the env-key, ECS and IRSA ones, an EC2 box with an instance role and
+  // a region-only ~/.aws/config (what `aws configure set region` writes) lands
+  // here with no credentials in either place.
+  else if (aws.shared_config || aws.profile) summary = "Found an AWS profile name or a shared ~/.aws config file, which may hold credentials or only a region. An IAM role on this machine can still be what signs the requests.";
   card.append(el("p", { class: "stg-hint", text: summary }));
   const adv = el("details", { class: "form-advanced" },
     el("summary", { class: "form-adv-summary", text: "Raw signals" }));
