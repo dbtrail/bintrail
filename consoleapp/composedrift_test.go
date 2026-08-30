@@ -225,8 +225,11 @@ func TestComposeDriftStaysSilentWhereItCannotTell(t *testing.T) {
 		in := wiredStack(t)
 		// A bare `docker run` with no volumes at all: every path is on the
 		// writable layer, and that is as likely a throwaway evaluation
-		// container as a stale stack. Only the config directory, which
-		// something has written to, is reported.
+		// container as a stale stack, so the mixed-mount shape reports
+		// nothing. dirIsUsed stays false here on purpose, to isolate that
+		// shape: the config-directory shape is the OTHER half and is driven
+		// by TestConsoleStateFindingReadsTheConfigDirectory below. With it
+		// true, this subtest would report and could never see its own bug.
 		in.mounts = []mountEntry{{point: "/", fstype: "overlay"}}
 		in.dirIsUsed = func(string) bool { return false }
 		for _, f := range composeDriftFindings(in) {
@@ -400,4 +403,155 @@ func removeMount(mounts []mountEntry, point string) []mountEntry {
 		}
 	}
 	return out
+}
+
+// The upgrade recipe must not overwrite the operator's own compose file.
+//
+// Every copy of it (two docs, the compose header, and the runtime `fix` line
+// this package logs) says to re-download the file and merge your own edits
+// back into it. `curl -fsSLO` writes docker-compose.yml in place, so by the
+// time the reader gets to the merge step their edits are gone: a published
+// port, the build toggle, a service they added. That is the same silent
+// configuration loss #1529 is about, on the path #1529 wrote, so it is pinned
+// where all four copies can be read at once.
+//
+// The scan is bounded to the UPGRADE spans. A first install downloads straight
+// to docker-compose.yml and is right to: there is nothing there to lose.
+func TestUpgradeRecipeNeverOverwritesTheOperatorsFile(t *testing.T) {
+	for _, tc := range []struct {
+		file, from, to string
+	}{
+		{file: "../docs/docker.md", from: "### Upgrading the stack", to: "\n### "},
+		{file: "../docs/install.md", from: "**Upgrading later takes three commands", to: "\n## "},
+		{file: composePath, from: "# === UPGRADING", to: "x-bintrail-compose-version"},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			data, err := os.ReadFile(tc.file)
+			if err != nil {
+				t.Fatalf("read %s: %v", tc.file, err)
+			}
+			span, ok := textSpan(string(data), tc.from, tc.to)
+			if !ok {
+				t.Fatalf("%s has no upgrade section starting %q; this guard reads that span and would otherwise pass vacuously", tc.file, tc.from)
+			}
+			assertNonDestructiveFetch(t, tc.file, span)
+		})
+	}
+	// The runtime line the daemon logs carries the same recipe.
+	t.Run("composeDownload", func(t *testing.T) {
+		assertNonDestructiveFetch(t, "composeDownload", composeDownload)
+	})
+}
+
+// textSpan returns the text from the first occurrence of from up to the next
+// occurrence of to after it.
+func textSpan(text, from, to string) (string, bool) {
+	i := strings.Index(text, from)
+	if i < 0 {
+		return "", false
+	}
+	rest := text[i+len(from):]
+	if j := strings.Index(rest, to); j >= 0 {
+		return text[i : i+len(from)+j], true
+	}
+	return text[i:], true
+}
+
+// assertNonDestructiveFetch fails when a curl of the compose file in this text
+// would land on docker-compose.yml itself.
+func assertNonDestructiveFetch(t *testing.T, where, text string) {
+	t.Helper()
+	found := 0
+	for _, line := range strings.Split(text, "\n") {
+		if !strings.Contains(line, "curl") || !strings.Contains(line, "docker-compose.yml") {
+			continue
+		}
+		found++
+		if out := curlOutputPath(line); out == "docker-compose.yml" {
+			t.Errorf("%s: %q writes docker-compose.yml in place, so the edits the reader is then told to merge are already gone",
+				where, strings.TrimSpace(line))
+		}
+	}
+	if found == 0 {
+		t.Errorf("%s names no curl of the compose file, so this guard read nothing", where)
+	}
+}
+
+// curlOutputPath returns the file a curl command line writes, or "" when it
+// writes to stdout. `-o NAME` names it; a flag cluster carrying O (`-fsSLO`)
+// means the URL's own basename.
+func curlOutputPath(line string) string {
+	fields := strings.Fields(line)
+	for i, f := range fields {
+		if f == "-o" || f == "--output" {
+			if i+1 < len(fields) {
+				return fields[i+1]
+			}
+			return ""
+		}
+	}
+	for _, f := range fields {
+		if strings.HasPrefix(f, "-") && !strings.HasPrefix(f, "--") && strings.Contains(f, "O") {
+			for _, g := range fields {
+				if strings.HasPrefix(g, "http") {
+					return g[strings.LastIndex(g, "/")+1:]
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// TestIndexDatadirRemedyFollowsTheEntrypointsOwnCondition.
+//
+// The entrypoint exports BINTRAIL_INDEX_DATADIR_RO inside `[ -z "$INDEX_DSN" ]`
+// only, the same branch that builds the bundled DSN. So an operator who sets
+// INDEX_DSN in .env and points it at the bundled index skips the export even on
+// a CURRENT file: the finding's fact is still true (free space is not
+// measurable) but "download the current file" is the wrong remedy, and sending
+// someone to re-download a file they already have is how a warning stops being
+// read. The remedy has to split on the same condition the script does.
+func TestIndexDatadirRemedyFollowsTheEntrypointsOwnCondition(t *testing.T) {
+	base := wiredStack(t)
+	dsn := base.indexDSN
+	for _, tc := range []struct {
+		name     string
+		indexDSN string
+		wants    string
+		rejects  string
+	}{
+		{
+			name:    "the stack built the DSN, so the file is what is behind",
+			wants:   "docker-compose.yml.new",
+			rejects: "INDEX_DSN",
+		},
+		{
+			name:     "the operator's own INDEX_DSN names the bundled index",
+			indexDSN: dsn,
+			wants:    "INDEX_DSN",
+			rejects:  "docker-compose.yml.new",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := base
+			in.getenv = func(k string) string {
+				if k == "INDEX_DSN" {
+					return tc.indexDSN
+				}
+				return "" // the export never ran
+			}
+			in.isDir = func(string) bool { return false }
+			f, ok := indexDatadirFinding(in)
+			if !ok {
+				t.Fatal("free disk space is not measurable here and nothing was reported")
+			}
+			fix := fmt.Sprint(f.attrs)
+			if !strings.Contains(fix, tc.wants) {
+				t.Errorf("the remedy never mentions %q: %s", tc.wants, fix)
+			}
+			if strings.Contains(fix, tc.rejects) {
+				t.Errorf("the remedy mentions %q, which is not what this shape needs: %s", tc.rejects, fix)
+			}
+		})
+	}
 }

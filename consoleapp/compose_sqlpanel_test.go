@@ -55,10 +55,16 @@ func TestSQLPanelDefaultsOnInTheDaemon(t *testing.T) {
 	if !sqlPanelEnabled() {
 		t.Error("the SQL page is off with no environment variable set; the daemon's default is what an image upgrade delivers, so it has to be ON here")
 	}
-	for _, off := range []string{"0", "false", "FALSE", "f"} {
+	// Fail CLOSED on anything this does not understand. The variable is now an
+	// opt-OUT, so an operator types it when they want the page gone: reading
+	// "off" or "no" as ON would keep serving a server-side SQL surface to
+	// someone who believes they closed it, and the only signal would be a log
+	// line nobody re-reads. Under the old opt-in body every one of these
+	// spellings meant off, so this is the direction that was already true.
+	for _, off := range []string{"0", "false", "FALSE", "f", "off", "OFF", "no", "n", "disabled", "nope"} {
 		t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", off)
 		if sqlPanelEnabled() {
-			t.Errorf("BINTRAIL_CONSOLE_SQL_PANEL=%q left the SQL page on; the opt-out is the only way to hide it", off)
+			t.Errorf("BINTRAIL_CONSOLE_SQL_PANEL=%q left the SQL page on; an operator who typed it meant to hide the page", off)
 		}
 	}
 	for _, on := range []string{"1", "true", "TRUE"} {

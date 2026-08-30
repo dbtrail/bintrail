@@ -873,7 +873,8 @@ function navigate(route, params, push = true) {
   // snapshot listing and the verification runner). Same treatment, so a
   // bookmark to either lands on Overview rather than an empty page.
   if ((route === "baselines" || route === "verification") && !capsCache.monitor) route = "overview";
-  // The SQL panel is opt-in (BINTRAIL_CONSOLE_SQL_PANEL) and per-server gated.
+  // The SQL panel is on unless BINTRAIL_CONSOLE_SQL_PANEL is 0, and per-server
+  // gated (a server with no archive or baseline layout to query has no page).
   if (route === "sql" && !capsCache.sql) route = "overview";
   const qs = params && Object.keys(params).length
     ? "?" + new URLSearchParams(params).toString() : "";

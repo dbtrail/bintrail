@@ -59,9 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both now spell out the third command, and docker.md gains an "Upgrading the
   stack" section with a table of what a stale compose file costs, starting
   with the console user store, because that one is silent loss rather than a
-  missing feature. `install.sh` no longer just says it kept an existing
-  compose file: it says an existing file is never upgraded, and what to do
-  about it.
+  missing feature. The download lands on `docker-compose.yml.new`, beside the
+  operator's file rather than over it, so the edits the next step asks them to
+  carry across still exist when they get there. `install.sh` no longer just
+  says it kept an existing compose file: it says an existing file is never
+  upgraded, and what to do about it.
 
 ## [0.72.0] - 2026-08-30
 

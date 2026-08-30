@@ -36,7 +36,11 @@ package console
 //     #1529 — a default that lives in a file the operator downloaded once
 //     reaches new installs only. It is layers 1-5, plus console sign-in, that
 //     make the page safe to reach; the switch decides whether it is offered,
-//     not whether it is guarded.
+//     not whether it is guarded. Availability, which those layers do not
+//     cover: under `watch` this is also the capture process, so a query here
+//     competes with capture for memory and CPU. Bounded by 3 above plus an
+//     authenticated caller, and the default extends that from the bundled
+//     stack to every bare `watch` (see consoleapp.sqlPanelEnabled).
 //
 // Cancellation is the HTTP request's own lifetime: the browser aborts the
 // fetch, r.Context() dies, and the DuckDB query is interrupted through
@@ -157,7 +161,7 @@ const sqlPanelRegistryNote = "the archive registry (archive_state) could not be 
 func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	if !s.sqlPanel {
 		writeJSONError(w, http.StatusForbidden,
-			"the SQL page is turned off on this console; it is on unless BINTRAIL_CONSOLE_SQL_PANEL is set to 0")
+			"the SQL page is turned off on this console by BINTRAIL_CONSOLE_SQL_PANEL; it is on by default")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, sqlPanelMaxStatementBytes)

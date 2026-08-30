@@ -105,11 +105,14 @@ stack around them does not. Re-download it as part of every upgrade:
 
 ```sh
 docker compose pull
-curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
+curl -fsSL -o docker-compose.yml.new https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
+diff docker-compose.yml docker-compose.yml.new   # carry your edits into the new file
+mv docker-compose.yml.new docker-compose.yml
 docker compose up -d
 ```
 
-Merge back any edits of your own into the new file before the last command.
+The download lands beside your file, not on top of it, so any edits of your own
+(a published port, an extra service) are still there to carry across.
 Your `.env` and every data volume carry over untouched. The one to know
 about: without the current file's console state paths, your console username
 and password, the servers you added, and the AI connection token live inside

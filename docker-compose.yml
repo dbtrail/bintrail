@@ -43,9 +43,12 @@
 # === UPGRADING: PULL THE IMAGES AND RE-DOWNLOAD THIS FILE ===
 # `docker compose pull && docker compose up -d` upgrades the images and NOT
 # this file, which is yours. Wiring that ships here (volumes, mounts, ports,
-# profiles) is not something a newer image can add for you, so re-download
-# this file on every upgrade and merge your own edits back in:
-#   curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
+# profiles) is not something a newer image can add for you, so take the current
+# file on every upgrade. Download it BESIDE yours, never over it, or the edits
+# you are about to carry across are gone before you look at them:
+#   curl -fsSL -o docker-compose.yml.new https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
+#   diff docker-compose.yml docker-compose.yml.new
+#   mv docker-compose.yml.new docker-compose.yml
 # See docs/docker.md, "Upgrading the stack", for what a stale file costs.
 
 # The version of this file, so the daemon can tell you what it is missing

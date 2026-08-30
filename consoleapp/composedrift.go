@@ -14,6 +14,13 @@ package consoleapp
 // So the daemon says it once, at startup, on stderr, and never again: no card
 // in the UI, no timer, no repeat. Quiet when everything is wired.
 //
+// `watch` only. The report is wired at upConsoleConfig, which `serve` does not
+// call, so a read-only console reports nothing about its stack. That is the
+// right scope for what this checks and not an oversight: the bundled compose
+// stack runs `watch`, the index findings are about a capture daemon's own
+// index, and `serve` is commonly run by hand against someone else's index,
+// where a line about a compose file names nothing the reader has.
+//
 // Every finding here is evidence-based. Nothing is inferred from "this looks
 // like Docker": each one names a fact the process can observe about itself,
 // and each one stays silent when the fact cannot be established. The cost of a
@@ -56,9 +63,13 @@ var composeVersionAdded = map[int]string{}
 // the bundled index, in the operator's own words.
 const composeIndexHost = "index-mysql"
 
-// composeDownload is the one-line fix every finding ends with.
-const composeDownload = "re-download docker-compose.yml and merge your own edits back in: " +
-	"curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml"
+// composeDownload is the one-line fix every finding ends with. It fetches
+// BESIDE the operator's file, never over it: the same line tells them to merge
+// their own edits into the new file, and an in-place download has already
+// deleted those edits by the time they read that.
+const composeDownload = "download the current docker-compose.yml next to yours, merge your own edits into it, " +
+	"then move it into place: curl -fsSL -o docker-compose.yml.new " +
+	"https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml"
 
 // mountEntry is one line of /proc/self/mountinfo, reduced to the two fields
 // this file reads.
@@ -275,17 +286,28 @@ func composeVersionFinding(in driftInputs) (driftFinding, bool) {
 // indexDatadirFinding fires when the bundled index is in effect and the
 // read-only mount that measures its free disk space is not.
 //
-// The condition is the SAME one internal/doctor/capacity.go applies
+// The condition tracks the one internal/doctor/capacity.go applies
 // (indexDatadirFreeFromEnv plus statfsDir): the variable must be set AND name
 // an existing directory. Re-deriving it loosely would let this line claim disk
 // space is unmeasurable while the capacity check measures it fine, and a
-// warning contradicted by the page next to it is worse than no warning.
+// warning contradicted by the page next to it is worse than no warning. One
+// difference, in the silent direction: statfsDir also requires the statfs
+// syscall itself to succeed, which this does not attempt. A directory that
+// exists but cannot be statfs'd is measured by neither and reported by neither.
 //
 // The bundled index is evidence, not a guess: the DSN in effect names the
 // compose file's own service, and the fix (a mount of that service's volume)
-// only exists in that topology. A bring-your-own INDEX_DSN never reaches here,
-// which matches capacity.go, where the variable is deliberately not set for
-// BYO so no unrelated volume's free space is reported as the index's.
+// only exists in that topology. An INDEX_DSN pointing somewhere ELSE never
+// reaches here, which matches capacity.go, where the variable is deliberately
+// not set for a bring-your-own index so no unrelated volume's free space is
+// reported as the index's.
+//
+// The REMEDY then splits on the entrypoint's own condition, because the fact
+// and the fix are not the same question. That script exports the variable
+// inside `[ -z "$INDEX_DSN" ]` only, so an operator who sets INDEX_DSN in .env
+// and points it at the bundled index skips the export on a CURRENT file too:
+// free space really is unmeasurable, and telling them to download a file they
+// already have is how a warning stops being read.
 func indexDatadirFinding(in driftInputs) (driftFinding, bool) {
 	cfg, err := mysql.ParseDSN(in.indexDSN)
 	if err != nil || cfg.Net != "tcp" {
@@ -302,10 +324,15 @@ func indexDatadirFinding(in driftInputs) (driftFinding, bool) {
 	if dir != "" && in.isDir(dir) {
 		return driftFinding{}, false
 	}
-	attrs := []any{
-		"fix", "the current docker-compose.yml mounts the index volume read-only at " +
-			"/var/lib/bintrail-index-ro and points BINTRAIL_INDEX_DATADIR_RO at it, so " + composeDownload,
+	fix := "the current docker-compose.yml mounts the index volume read-only at " +
+		"/var/lib/bintrail-index-ro and points BINTRAIL_INDEX_DATADIR_RO at it, so " + composeDownload
+	if strings.TrimSpace(in.getenv("INDEX_DSN")) != "" {
+		fix = "your own INDEX_DSN points at the bundled index, and the stack only sets " +
+			"BINTRAIL_INDEX_DATADIR_RO when it builds that address itself. Set it too, to the read-only " +
+			"index mount (/var/lib/bintrail-index-ro in the bundled stack), or drop INDEX_DSN and let the " +
+			"stack build the address"
 	}
+	attrs := []any{"fix", fix}
 	if dir != "" {
 		attrs = append([]any{"BINTRAIL_INDEX_DATADIR_RO", dir, "problem", "not a directory in this container"}, attrs...)
 	}

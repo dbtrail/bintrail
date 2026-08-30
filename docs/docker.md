@@ -220,9 +220,11 @@ never touches the second. All three steps:
 # 1. the images
 docker compose pull
 
-# 2. the compose file, which nothing else updates for you
-curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
-#    then merge your own edits back into the new file
+# 2. the compose file, which nothing else updates for you. It downloads NEXT
+#    to yours, never over it, so your own edits are still there to carry over
+curl -fsSL -o docker-compose.yml.new https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
+diff docker-compose.yml docker-compose.yml.new     # carry your edits into the new file
+mv docker-compose.yml.new docker-compose.yml
 
 # 3. the containers, now running both
 docker compose up -d
@@ -231,9 +233,11 @@ docker compose up -d
 Step 2 is the one people miss. `docker-compose.yml` is yours: you downloaded it
 once. Volumes, mounts, published ports and profiles can only come from that
 file, so a newer image cannot add them, and the guarantees you get are the ones
-your file wires up. Merge your own edits back in as you go (a `build:` toggle,
-an extra port, a service you added). Your `.env` and every data volume carry
-over untouched: re-downloading the compose file moves no data.
+your file wires up. The download lands on `docker-compose.yml.new` on purpose,
+so whatever you changed in your own file (a published port, the `build:`
+toggle, a service you added) is still in front of you when you carry it across.
+Your `.env` and every data volume carry over untouched: taking the new compose
+file moves no data.
 
 What a stale compose file costs:
 
@@ -251,7 +255,9 @@ Two things make this easier to catch:
   problem at startup, with the fix, in `docker compose logs bintrail`. It says
   nothing when the stack is wired, it never repeats, and it never guesses: a
   check that cannot establish a fact stays quiet rather than sending you after
-  a problem you do not have.
+  a problem you do not have. This is the `watch` daemon, which is what this
+  stack runs; a read-only `bintrail-console serve` reports nothing about the
+  stack around it.
 - **The file carries a version.** `x-bintrail-compose-version` at the top of
   `docker-compose.yml` is passed to the console service, so a newer daemon can
   tell you your file is behind and name what is not in effect, instead of
