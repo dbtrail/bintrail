@@ -22,10 +22,15 @@ func TestCapacityCardNamesWhyFreeSpaceIsUnmeasurable(t *testing.T) {
 	note := functionBody(t, src, "function capacityNote(")
 	free := functionBody(t, src, "function capacityFreeNote(")
 	card := functionBody(t, src, "function capacityCard(")
+	// capacityBox is in the sweep too: it is the other place this card's copy
+	// is written, and the claim could come back there just as easily.
+	box := functionBody(t, src, "function capacityBox(")
 
 	for _, guess := range []string{"another host or container", "runs on another host"} {
-		if strings.Contains(note, guess) || strings.Contains(free, guess) {
-			t.Errorf("the card still asserts a topology the check cannot know: %q", guess)
+		for where, js := range map[string]string{"capacityNote": note, "capacityFreeNote": free, "capacityBox": box} {
+			if strings.Contains(js, guess) {
+				t.Errorf("%s still asserts a topology the check cannot know: %q", where, guess)
+			}
 		}
 	}
 
