@@ -70,18 +70,47 @@ func TestUpConsoleConfig(t *testing.T) {
 		t.Errorf("watch console config must not set NoArchive: %+v", cfg)
 	}
 
-	// The SQL panel opt-in reaches the config from the env — proving the wire,
-	// not just the function (deleting the SQLPanel assignment in upConsoleConfig
-	// must fail a test). Env-driven, so set it around this one call.
-	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "1")
+	// The SQL page's state reaches the config — proving the wire, not just the
+	// function (deleting the SQLPanel assignment in upConsoleConfig must fail a
+	// test, and since #1529 the default is ON, the zero value it would leave
+	// behind is the wrong answer). Env-driven, so set it around these calls.
+	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "")
 	cfgSQL, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"})
 	if err != nil {
 		t.Fatalf("upConsoleConfig (sql panel): %v", err)
 	}
 	if !cfgSQL.SQLPanel {
-		t.Error("BINTRAIL_CONSOLE_SQL_PANEL=1 did not reach console.Config.SQLPanel via watch")
+		t.Error("the SQL page default did not reach console.Config.SQLPanel via watch")
+	}
+	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "0")
+	cfgSQL, err = upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"})
+	if err != nil {
+		t.Fatalf("upConsoleConfig (sql panel off): %v", err)
+	}
+	if cfgSQL.SQLPanel {
+		t.Error("BINTRAIL_CONSOLE_SQL_PANEL=0 did not reach console.Config.SQLPanel via watch")
 	}
 	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "")
+
+	// The stack-drift check is wired into the same function, for the same
+	// reason: it is silent on a healthy stack, so nothing else would notice the
+	// call going missing.
+	var gotDSN string
+	var gotOpts consoleOpts
+	prevReporter := composeDriftReporter
+	composeDriftReporter = func(dsn string, opts consoleOpts) { gotDSN, gotOpts = dsn, opts }
+	_, err = upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index",
+		consoleOpts{Listen: "127.0.0.1:8090", AuthFile: "/auth.yaml", ServersFile: "/servers.yaml"})
+	composeDriftReporter = prevReporter
+	if err != nil {
+		t.Fatalf("upConsoleConfig (drift): %v", err)
+	}
+	if gotDSN != "user:pass@tcp(127.0.0.1:3306)/binlog_index" {
+		t.Errorf("the stack-drift check was not run with the index DSN in effect: %q", gotDSN)
+	}
+	if gotOpts.AuthFile != "/auth.yaml" || gotOpts.ServersFile != "/servers.yaml" {
+		t.Errorf("the stack-drift check was not given the console state paths in effect: %+v", gotOpts)
+	}
 
 	// Without baseline flags the Phase 1 default is preserved: empty baselines
 	// keep the reconstruct surface gated off.

@@ -159,7 +159,8 @@ mkdir -p "$DIR"
 cd "$DIR"
 
 if [ -f docker-compose.yml ]; then
-  warn "docker-compose.yml already exists here — keeping it (delete it to re-fetch)."
+  warn "docker-compose.yml already exists here, so it was left alone (delete it to re-fetch)."
+  warn "An existing file is never upgraded, and volumes and mounts can only come from it. If this is an upgrade, save your edits, delete the file, and re-run: docs/docker.md 'Upgrading the stack'."
   [ "$PORT" != "8090" ] && warn \
     "DBTRAIL_PORT=${PORT} ignored — reusing the existing docker-compose.yml (edit its ports: line by hand)."
 else

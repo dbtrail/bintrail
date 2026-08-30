@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The daemon reports a compose stack the images have outgrown** (#1529).
+  `docker compose pull && up -d` upgrades the images and leaves
+  `docker-compose.yml` alone, because that file belongs to the operator and was
+  downloaded once. Volumes, mounts, ports and profiles can only come from it,
+  so a stack keeps whatever it was wired with the day it was downloaded, and
+  the worst case is silent: with no durable home, console state lands in the
+  container and every recreate deletes it, and a console that starts with no
+  state looks exactly like a fresh install. `bintrail-console watch` now says
+  it once, at startup, on stderr: one line per problem, each naming the fix.
+  Two checks ship, both evidence-based and both silent when they cannot
+  establish a fact rather than guessing at one. The first fires when the
+  index DSN in effect is the bundled index and the read-only mount that
+  measures its free disk space is not there, using the same condition the
+  capacity check itself applies so the two can never contradict each other.
+  The second fires when console state files this daemon will open are on the
+  container's writable layer while others are on a volume, or when the console
+  settings folder is on the writable layer and something has written to it.
+  Everything is gated on the process observing that its own root filesystem is
+  a container image layer, so a bare-metal daemon, a machine with no mount
+  table to read, and a bring-your-own index are all silent. No card in the UI,
+  no timer, no repeat.
+- **`docker-compose.yml` carries a version** (#1529). A new
+  `x-bintrail-compose-version` key at the top of the file, passed to the
+  console service, so a newer daemon can say a file is behind and name what is
+  not in effect instead of leaving the operator to diff two files. Optional by
+  design: a stack that passes no version gets exactly today's behaviour and
+  never a false alarm.
+
+### Changed
+- **The console's SQL page is on by default in the daemon** (#1529). The
+  default used to live in the bundled `docker-compose.yml`
+  (`BINTRAIL_CONSOLE_SQL_PANEL: ${SQL_PANEL:-1}`) while the binary defaulted
+  off, so the decision reached new installs only: pulling a newer image
+  delivered the page to nobody. The default now lives in the daemon and the
+  compose file does not mention the variable at all. `serve` and `watch` both
+  show the page unless `BINTRAIL_CONSOLE_SQL_PANEL` is set to `0`. Everything
+  that makes the page safe is unchanged: it is behind console sign-in, it
+  carries `query:execute`, it is refused outright while an access-control
+  profile is active, and it answers one `SELECT` at a time in a sandboxed
+  DuckDB session that can read nothing but the selected server's archive and
+  backup folders. **If you hide the page with `SQL_PANEL=0` in `.env`**, note
+  that the shortcut only worked through the line the compose file no longer
+  carries: after re-downloading the file, add
+  `BINTRAIL_CONSOLE_SQL_PANEL: "0"` to the `bintrail` service instead.
+- **The upgrade documentation says to re-download the compose file** (#1529).
+  [docs/install.md](docs/install.md) and
+  [docs/docker.md](docs/docker.md) described the upgrade as `pull` plus
+  `up -d`, which is true of the binaries and not of the stack around them.
+  Both now spell out the third command, and docker.md gains an "Upgrading the
+  stack" section with a table of what a stale compose file costs, starting
+  with the console user store, because that one is silent loss rather than a
+  missing feature. `install.sh` no longer just says it kept an existing
+  compose file: it says an existing file is never upgraded, and what to do
+  about it.
+
 ## [0.72.0] - 2026-08-30
 
 ### Added

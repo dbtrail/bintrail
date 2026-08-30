@@ -289,13 +289,23 @@ func runServe(cmd *cobra.Command, args []string) error {
 // the console's mode. The URL never carries a ?token= unless an explicit token
 // is the only credential (URL() handles that); a live credential does not
 // belong in logs or shell history.
-// sqlPanelEnabled reads the SQL panel opt-in (#1177). Env-only and off by
-// default, mirroring BINTRAIL_CONSOLE_BASELINE_TRIGGER: an explicit operator
-// assertion, not something a stray flag in a wrapper script flips on. Shared
-// by serve and watch.
+// sqlPanelEnabled resolves the SQL page's state (#1177). Env-only, ON by
+// default, and shared by serve and watch.
+//
+// The default lives here rather than in the bundled docker-compose.yml
+// (#1529). It used to be the other way round: the binary defaulted off and the
+// compose file turned it on. The compose file belongs to the operator and is
+// downloaded once, so pulling a newer image delivered the page to nobody, and
+// the product decision "this is on" sat in a file we cannot update.
+//
+// On by default is defensible because the page's other five layers do not move
+// (internal/console/sqlpanel.go): POST /api/sql is behind console auth, carries
+// PermQueryExecute, is refused outright while an access-control profile is
+// active, answers SELECT only inside a sandboxed DuckDB session with no
+// filesystem access outside the resolved archive and baseline roots, and never
+// serves the paid forensics columns. It reads what the console already serves.
 func sqlPanelEnabled() bool {
-	v := os.Getenv("BINTRAIL_CONSOLE_SQL_PANEL")
-	return v == "1" || v == "true"
+	return envBoolOr("BINTRAIL_CONSOLE_SQL_PANEL", true)
 }
 
 func printConsoleBanner(srv *console.Server, headline string) {

@@ -203,11 +203,60 @@ Notes:
   `/var/lib/bintrail/console-mcp-token.yaml` in the same volume, so an AI
   client you connected keeps working across restarts. An older copy of this
   compose file kept it inside the container, where recreating the container
-  wiped it: take the updated file and generate the token once more, and it
-  survives from then on.
+  wiped it: take the updated file (see
+  [Upgrading the stack](#upgrading-the-stack)) and generate the token once
+  more, and it survives from then on.
 - `BINTRAIL_TAG` in `.env` pins the image version (default `latest`);
   building from a source checkout instead is a comment-toggle in the
   compose file (`build:` with `dockerfile: build/Dockerfile.bintrail-console`).
+
+### Upgrading the stack
+
+Your stack is two things: the images, and the compose file that wires them
+together. `docker compose pull && docker compose up -d` upgrades the first and
+never touches the second. All three steps:
+
+```bash
+# 1. the images
+docker compose pull
+
+# 2. the compose file, which nothing else updates for you
+curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
+#    then merge your own edits back into the new file
+
+# 3. the containers, now running both
+docker compose up -d
+```
+
+Step 2 is the one people miss. `docker-compose.yml` is yours: you downloaded it
+once. Volumes, mounts, published ports and profiles can only come from that
+file, so a newer image cannot add them, and the guarantees you get are the ones
+your file wires up. Merge your own edits back in as you go (a `build:` toggle,
+an extra port, a service you added). Your `.env` and every data volume carry
+over untouched: re-downloading the compose file moves no data.
+
+What a stale compose file costs:
+
+| What your file is missing | What it costs | How it looks |
+|---|---|---|
+| the console state paths on the `bintrail-state` volume | your console username and password, the servers you added, and the AI connection token live inside the container, so the next `up -d` that recreates it deletes them | **Silent.** The console comes back asking you to create a password, exactly like a fresh install, and reports no loss. Fix this one first |
+| the read-only index mount plus `BINTRAIL_INDEX_DATADIR_RO` | free disk space for the index cannot be measured | The preflight and the Storage page report it as not measurable |
+| the `iceberg-export` profile and its volume | there is no one-shot Iceberg export to run | `docker compose --profile iceberg-export run ...` says the service does not exist |
+| `BINTRAIL_CONSOLE_SQL_PANEL` (the current file does not set it) | nothing: the SQL page is on by default in the daemon | If you kept `SQL_PANEL=0` in `.env` to hide the page, the current file ignores it. Add `BINTRAIL_CONSOLE_SQL_PANEL: "0"` to the `bintrail` service instead |
+
+Two things make this easier to catch:
+
+- **The daemon says it once.** When it can see that it is running in a
+  container and that wiring it would use is not there, it prints one line per
+  problem at startup, with the fix, in `docker compose logs bintrail`. It says
+  nothing when the stack is wired, it never repeats, and it never guesses: a
+  check that cannot establish a fact stays quiet rather than sending you after
+  a problem you do not have.
+- **The file carries a version.** `x-bintrail-compose-version` at the top of
+  `docker-compose.yml` is passed to the console service, so a newer daemon can
+  tell you your file is behind and name what is not in effect, instead of
+  leaving you to diff two files. A file old enough to have no version number
+  gets no such line.
 
 ### Metrics and the healthcheck
 
@@ -306,9 +355,10 @@ source's binlogs (the bundled index was always "volume loss = re-index").
 daemon is now `bintrail-console watch`, in its own image), so a
 `docker compose pull && up -d` on the OLD file crash-loops with
 `unknown flag: --console`. The fix is to re-download `docker-compose.yml`
-(the curl in the Quick start) — image and command changed, but your `.env`
-and all data volumes (`bintrail-index-data`, `bintrail-index-secret`,
-`bintrail-state`, including saved console servers) carry over unchanged.
+(see [Upgrading the stack](#upgrading-the-stack)) — image and command changed,
+but your `.env` and all data volumes (`bintrail-index-data`,
+`bintrail-index-secret`, `bintrail-state`, including saved console servers)
+carry over unchanged.
 
 ### Backing up / restoring the bundled index
 
@@ -434,11 +484,15 @@ inconclusive results land, and drill into a mismatch — see
 [console.md](console.md#running-verification-from-the-console).
 
 **SQL** (in the sidebar, for a server that has archived Parquet or a backup) is
-on by default in this stack too: a read-only `SELECT` box answered by the daemon
-in a locked-down DuckDB session. Set `SQL_PANEL=0` in `.env` to hide the page.
-The console here is published on the host loopback only, which is why it is on;
-read [The SQL panel](console.md#the-sql-panel-opt-in) before you widen that
-mapping.
+on by default: a read-only `SELECT` box answered by the daemon in a locked-down
+DuckDB session. That default lives in the daemon, not in this compose file, so
+pulling a newer image delivers it. To hide the page, add
+`BINTRAIL_CONSOLE_SQL_PANEL: "0"` to the `bintrail` service's `environment:`
+(the older `SQL_PANEL=0` in `.env` only works while your compose file still
+carries the `BINTRAIL_CONSOLE_SQL_PANEL: ${SQL_PANEL:-1}` line, which the
+current file does not). Read
+[The SQL panel](console.md#the-sql-panel) before you publish the console
+beyond the host loopback.
 
 Notes:
 
@@ -593,7 +647,7 @@ surface, use the demo image ([demo.md](./demo.md)).
 | `BASELINE_DIR` | compose (optional) | Baseline dir for the boot `SOURCE_DSN` entry — set `/var/lib/bintrail/baselines` after the first `baseline` profile run to enable Time-travel on it. Also enables full-table `_snapshot.*` on the `flashback` profile shim |
 | `BASELINE_TRIGGER` | compose (optional) | Enables the console's in-process **Create baseline** button (dump→convert→upload) for a monitored server; **on by default** — set `BASELINE_TRIGGER=0` to disable |
 | `VERIFY_TRIGGER` | compose (optional) | Enables the console's Storage **Verification** panel (runs `bintrail verify` in-process) for a monitored server; **on by default** — set `VERIFY_TRIGGER=0` to disable |
-| `SQL_PANEL` | compose (optional) | Enables the console's **SQL** page (a read-only `SELECT` box over the selected server's Parquet, answered inside the daemon); **on by default** in this stack, whose console is published on the host loopback only. Set `SQL_PANEL=0` to hide it |
+| `BINTRAIL_CONSOLE_SQL_PANEL` | service environment (optional) | The console's **SQL** page (a read-only `SELECT` box over the selected server's Parquet, answered inside the daemon). **On by default in the daemon**, so the compose file does not set it; add `BINTRAIL_CONSOLE_SQL_PANEL: "0"` to the `bintrail` service to hide the page |
 | `WAREHOUSE_DIR` | compose `iceberg-export` profile (optional) | Directory the Iceberg tables are written under (default `/var/lib/bintrail-iceberg`, in the `bintrail-iceberg` volume) |
 | `BASELINE_S3` | compose `iceberg-export` profile (optional) | S3 prefix holding the baseline snapshots to export from; wins over `BASELINE_DIR` |
 | `ICEBERG_TABLES` | compose `iceberg-export` profile (optional) | Comma-separated `schema.table` list to export (default: every table in the newest snapshot) |

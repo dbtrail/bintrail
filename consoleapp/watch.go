@@ -1404,6 +1404,11 @@ type consoleOpts struct {
 	BaselineS3   string
 	AuthFile     string
 	MCPTokenFile string
+	// ServersFile is the console server registry path. It reaches
+	// upConsoleConfig only so the stack-drift check reports the file this
+	// daemon will actually open (#1529); the registry itself is loaded at the
+	// call sites, which is why nothing else here reads it.
+	ServersFile  string
 	TLSCert      string
 	TLSKey       string
 	AllowedHosts []string
@@ -1425,6 +1430,7 @@ func upConsoleOpts() consoleOpts {
 		BaselineS3:      upConsoleBaselineS3,
 		AuthFile:        upConsoleAuthFile,
 		MCPTokenFile:    upConsoleMCPTokenFile,
+		ServersFile:     upConsoleServersFile,
 		TLSCert:         upConsoleTLSCert,
 		TLSKey:          upConsoleTLSKey,
 		AllowedHosts:    upConsoleAllowedHost,
@@ -1448,6 +1454,10 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 	if cfg.DBName == "" {
 		return console.Config{}, fmt.Errorf("--index-dsn must include a database name (e.g. user:pass@tcp(host:3306)/binlog_index)")
 	}
+	// Report a stack whose compose file is behind the images (#1529). Here
+	// because both watch entry points reach this function and neither reaches
+	// the other, and once per process: it is a startup line, not a monitor.
+	composeDriftReporter(indexDSN, opts)
 	return console.Config{
 		DB:              db,
 		DBName:          cfg.DBName,

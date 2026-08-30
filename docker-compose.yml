@@ -39,6 +39,20 @@
 #
 # For the full interactive demo (traffic generator, Grafana, Prometheus),
 # see demo/compose.yml instead.
+#
+# === UPGRADING: PULL THE IMAGES AND RE-DOWNLOAD THIS FILE ===
+# `docker compose pull && docker compose up -d` upgrades the images and NOT
+# this file, which is yours. Wiring that ships here (volumes, mounts, ports,
+# profiles) is not something a newer image can add for you, so re-download
+# this file on every upgrade and merge your own edits back in:
+#   curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
+# See docs/docker.md, "Upgrading the stack", for what a stale file costs.
+
+# The version of this file, so the daemon can tell you what it is missing
+# instead of leaving you to diff two files (#1529). It is passed to the
+# console service below through the YAML anchor, so there is one number to
+# bump: raise it whenever this file gains wiring a running stack would need.
+x-bintrail-compose-version: &compose_version 1
 
 volumes:
   bintrail-index-data:    # MySQL 8.4 datadir — the forensic record (NEW volume:
@@ -307,16 +321,11 @@ services:
       # a baseline dir/S3 configured (baseline-anchored) or a source DSN
       # (live-source) before the button does anything.
       BINTRAIL_CONSOLE_VERIFY_TRIGGER: ${VERIFY_TRIGGER:-1}
-      # The SQL page (#1177): a read-only SELECT box over the selected
-      # server's archived Parquet and newest backup, answered by this daemon
-      # in a locked-down DuckDB session (one SELECT at a time, only the
-      # generated views, only that server's archive and backup folders,
-      # capped rows, a query timeout, and never the paid forensics columns).
-      # On in this stack so the page is there to find, the same way the two
-      # buttons above are; set SQL_PANEL=0 in .env to hide it. A bare
-      # `bintrail-console serve` or `watch` keeps it off until the variable
-      # is set, because there the operator has not chosen the bind.
-      BINTRAIL_CONSOLE_SQL_PANEL: ${SQL_PANEL:-1}
+      # The SQL page (#1177) is deliberately NOT wired here (#1529): it is on
+      # by default in the daemon itself, so pulling a newer image delivers it.
+      # A default that lives in this file only reaches installs that download
+      # this file. To hide the page, add:
+      #   BINTRAIL_CONSOLE_SQL_PANEL: "0"
       # Password login (persists next to the registry). On first run the
       # console serves a "create your password" screen; later visits sign in.
       # There is deliberately NO password env var: docker inspect must never
@@ -339,6 +348,10 @@ services:
       # console (e.g. "8090:8090"), set the password from the host shell FIRST
       # (docker compose exec … user set-password) before exposing it.
       BINTRAIL_CONSOLE_ALLOW_SETUP: "1"
+      # The version of this file (the x- key at the top). The daemon reads it
+      # to name what a stale file is missing; without it the daemon says
+      # nothing about the file's age, so an older stack raises no false alarm.
+      BINTRAIL_COMPOSE_VERSION: *compose_version
     volumes:
       - bintrail-state:/var/lib/bintrail
       - bintrail-index-secret:/run/secret:ro

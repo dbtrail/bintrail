@@ -97,6 +97,26 @@ live in
 [`.env.example`](https://github.com/dbtrail/dbtrail/blob/main/.env.example);
 the full walkthrough is in [docker.md](./docker.md).
 
+**Upgrading later takes three commands, not two.** `docker compose pull` and
+`docker compose up -d` bring new images and run them against the compose file
+you already have, which nothing updates for you. Volumes, mounts, ports and
+profiles can only come from that file, so the binaries move forward and the
+stack around them does not. Re-download it as part of every upgrade:
+
+```sh
+docker compose pull
+curl -fsSLO https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
+docker compose up -d
+```
+
+Merge back any edits of your own into the new file before the last command.
+Your `.env` and every data volume carry over untouched. The one to know
+about: without the current file's console state paths, your console username
+and password, the servers you added, and the AI connection token live inside
+the container and are deleted the next time it is recreated, with nothing
+saying so. [Upgrading the stack](./docker.md#upgrading-the-stack) lists what
+else a stale file costs.
+
 ## Try it without installing anything (30 seconds)
 
 Want to *feel* time-travel SQL before wiring anything up? The demo image
