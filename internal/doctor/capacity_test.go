@@ -223,9 +223,10 @@ func TestDoctorReportErrExcluding(t *testing.T) {
 func TestCapacityVerdict_freeUnknownSkipsWithGuidance(t *testing.T) {
 	p := capacityProjection{eventsPerDay: 24000, bytesPerEvent: 1000, projectedBytes: 720_000_000}
 	r := capacityVerdict(p, 30*24*time.Hour, 0, false, CapacityFreeMountUnset)
-	// #948: an unmeasurable volume (separate host/container — e.g. the compose
-	// stack) must SKIP, not PASS, so the check does not read green when its
-	// FAIL/WARN thresholds could never fire.
+	// #948: a volume this process cannot see (no read-only mount of the index
+	// datadir, as on a compose stack that predates that wiring) must SKIP, not
+	// PASS, so the check does not read green when its FAIL/WARN thresholds
+	// could never fire.
 	if r.Status != StatusSkip {
 		t.Fatalf("status = %s, want skip when free space is unknown", r.Status)
 	}

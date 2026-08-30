@@ -159,6 +159,7 @@ func TestCapacityAPI_watch(t *testing.T) {
 			doctor.CapacityFreeMountUnset,
 			doctor.CapacityFreeMountUnusable,
 			doctor.CapacityFreeIndexNotLocal,
+			doctor.CapacityFreeHostUnconfirmed,
 			doctor.CapacityFreeReasonUnknown,
 		} {
 			srv := newCapacityWatchServer(t)

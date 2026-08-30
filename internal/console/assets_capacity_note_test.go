@@ -36,7 +36,7 @@ func TestCapacityCardNamesWhyFreeSpaceIsUnmeasurable(t *testing.T) {
 
 	// One branch per fallback the doctor reports, and the two that name a fix
 	// name the same variable and file the bundled stack wires.
-	for _, want := range []string{`case "mount_unset"`, `case "mount_unusable"`, `case "index_not_local"`, "BINTRAIL_INDEX_DATADIR_RO", "docker-compose.yml"} {
+	for _, want := range []string{`case "mount_unset"`, `case "mount_unusable"`, `case "index_not_local"`, `case "host_unconfirmed"`, "BINTRAIL_INDEX_DATADIR_RO", "docker-compose.yml"} {
 		if !strings.Contains(free, want) {
 			t.Errorf("capacityFreeNote is missing %q, so that state stays a dead end", want)
 		}
@@ -45,12 +45,21 @@ func TestCapacityCardNamesWhyFreeSpaceIsUnmeasurable(t *testing.T) {
 	// The remote branch must offer NO mount fix: a mount that is not the
 	// index's would report the wrong volume's free space, which is worse than
 	// reporting nothing.
-	remote := free[strings.Index(free, `case "index_not_local"`):]
-	if i := strings.Index(remote, "default:"); i > 0 {
-		remote = remote[:i]
-	}
-	if strings.Contains(remote, "BINTRAIL_INDEX_DATADIR_RO") {
+	if strings.Contains(caseBody(free, `case "index_not_local"`), "BINTRAIL_INDEX_DATADIR_RO") {
 		t.Error("the index_not_local branch offers a mount fix that would measure the wrong filesystem")
+	}
+	// The tunnel-shaped state (a local address whose server is not confirmed
+	// to be this machine) DOES offer the mount, so it must carry the
+	// precondition: a local mysqld's datadir may be sitting right there, and
+	// pointing at it would show a measured number for the wrong volume.
+	unconfirmed := caseBody(free, `case "host_unconfirmed"`)
+	if !strings.Contains(unconfirmed, "BINTRAIL_INDEX_DATADIR_RO") {
+		t.Error("the host_unconfirmed branch does not name the mount, so that state stays a dead end")
+	}
+	for _, want := range []string{"cannot confirm", "and nothing else"} {
+		if !strings.Contains(unconfirmed, want) {
+			t.Errorf("the host_unconfirmed branch is missing %q: the mount advice must carry its precondition", want)
+		}
 	}
 
 	// Keyed on free_known, not on the free_unknown grade: the "free on disk"
@@ -65,4 +74,21 @@ func TestCapacityCardNamesWhyFreeSpaceIsUnmeasurable(t *testing.T) {
 	if strings.Contains(free, "—") {
 		t.Error("em dash in card copy")
 	}
+}
+
+// caseBody returns one switch case's text, from its label to the next case or
+// the default. A slice that ran to "default:" would swallow the branches in
+// between and let a sibling's wording satisfy a guard about this one.
+func caseBody(js, label string) string {
+	i := strings.Index(js, label)
+	if i < 0 {
+		return ""
+	}
+	rest := js[i+len(label):]
+	for _, stop := range []string{"\n    case ", "\n    default:"} {
+		if j := strings.Index(rest, stop); j > 0 {
+			rest = rest[:j]
+		}
+	}
+	return rest
 }

@@ -174,7 +174,10 @@ and searching events:
    to the mount point, the way the bundled `docker-compose.yml` does; an
    index reached at another address gets no such suggestion, because a
    mount that is not the index's would report the wrong volume's free
-   space); and the standalone read-only console, which runs no rotation of
+   space, and an index on a local address whose server the console cannot
+   confirm is this machine, which is what a port-forward or a tunnel looks
+   like, gets the suggestion with that warning attached); and the
+   standalone read-only console, which runs no rotation of
    its own, reports the retention as "not known here" instead of grading an
    index another process rotates as unbounded. See
    [capacity planning](capacity.md#monitoring).

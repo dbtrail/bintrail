@@ -279,7 +279,10 @@ guidance, never a green PASS). That guidance names what is missing: the
 read-only mount and `BINTRAIL_INDEX_DATADIR_RO`, when your index answers
 somewhere this process can reach locally. For an index at another address it
 suggests no mount at all, since one that is not your index's would report the
-wrong volume's free space.
+wrong volume's free space; and when the address is local but the server can't
+be confirmed to be this machine (a port-forward or a tunnel looks exactly like
+that), it says to point the variable at the index's own data directory and
+nothing else, for the same reason.
 
 On **Docker Desktop** (macOS/Windows), named volumes are typically backed by
 one shared VM disk, so the free-space number this check reports is that VM

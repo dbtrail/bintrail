@@ -78,11 +78,20 @@ func TestCheckIndexCapacity_projectsAndSkipsUnmeasurableDisk(t *testing.T) {
 	if !strings.Contains(r.Detail, "projected steady-state") {
 		t.Errorf("detail should carry the projection, got: %s", r.Detail)
 	}
-	// #1527: the index answers on loopback, so the fix is a read-only mount of
-	// its data directory, named. What the check must NOT do is assert where
-	// the index runs, which it never learned.
+	// #1527: the index answers on loopback but from a container whose
+	// @@hostname is not this host's, which is the exact shape a port-forward
+	// or a tunnel also has. The fix is named (a read-only mount of the index's
+	// data directory) and so is its precondition, because a local mysqld's
+	// datadir could be sitting right here and is not this index's. What the
+	// check must NOT do is assert where the index runs, which it never
+	// learned.
 	if !strings.Contains(r.Detail, datadirMountEnv) {
 		t.Errorf("detail should name the mount that would make free space measurable, got: %s", r.Detail)
+	}
+	for _, want := range []string{"cannot confirm", "OWN data directory"} {
+		if !strings.Contains(r.Detail, want) {
+			t.Errorf("detail is missing %q: the mount advice must carry its precondition here, got: %s", want, r.Detail)
+		}
 	}
 	for _, guess := range []string{"separate host", "another host"} {
 		if strings.Contains(r.Detail, guess) {

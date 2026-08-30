@@ -111,6 +111,16 @@ const (
 	// measure the wrong volume. The one reason that must NOT carry a mount
 	// suggestion.
 	CapacityFreeIndexNotLocal CapacityFreeReason = "index_not_local"
+	// CapacityFreeHostUnconfirmed: the index answers on a local address, but
+	// the server could not be confirmed to run on this machine (@@hostname
+	// differs, or this host's name could not be read). A port-forward or an
+	// ssh tunnel presents a REMOTE MySQL at 127.0.0.1 while a local mysqld's
+	// datadir sits right there on disk, so the mount suggestion has to name
+	// its own precondition: pointed at that local datadir it would report a
+	// volume that is not the index's, as a measured number, with the
+	// thresholds live on it. Split from CapacityFreeMountUnset for exactly
+	// that reason.
+	CapacityFreeHostUnconfirmed CapacityFreeReason = "host_unconfirmed"
 	// CapacityFreeReasonUnknown: the DSN could not be read, so the check
 	// cannot even say which of the above applies.
 	CapacityFreeReasonUnknown CapacityFreeReason = "unknown"
@@ -495,6 +505,10 @@ func freeUnmeasurableDetail(reason CapacityFreeReason) string {
 	case CapacityFreeIndexNotLocal:
 		return "free space is not measurable from here: the index DSN points at another address, so no filesystem on this host is the index's and measuring one would report the wrong volume. " +
 			"Watch free space where the index runs"
+	case CapacityFreeHostUnconfirmed:
+		return "free space is not measurable from here: the index answers on a local address, but this process cannot confirm the server runs on this machine (a port-forward or a tunnel looks the same), " +
+			"so it cannot tell whether the index data directory is here. If it is, mount it read-only and set BINTRAIL_INDEX_DATADIR_RO to the mount point. " +
+			"Point that at the index's OWN data directory and nothing else: any other volume would be reported as the index's free space"
 	default:
 		return "free space is not measurable from here: this process cannot see the index volume"
 	}
@@ -629,6 +643,13 @@ func indexDatadirFree(ctx context.Context, db *sql.DB, dsn string) (uint64, bool
 	}
 	localHost, err := os.Hostname()
 	if err != nil || !sameHostname(serverHost, localHost) {
+		// The address is local but the server is not confirmed to be. A
+		// broken declaration still wins (the operator has to hear that
+		// first); otherwise say what could not be confirmed, so the mount
+		// suggestion arrives with its precondition attached.
+		if unmeasured == CapacityFreeMountUnset {
+			return 0, false, CapacityFreeHostUnconfirmed
+		}
 		return 0, false, unmeasured
 	}
 	var varName, datadir string

@@ -24,7 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so, rather than blaming the topology. An index answering at another
   address is told that free space cannot be seen from here and is offered no
   local mount at all, because a volume that is not the index's would report
-  the wrong free space, which is worse than reporting none. Nothing new is
+  the wrong free space, which is worse than reporting none. An index on a
+  local address whose server cannot be confirmed to be this machine, which is
+  what a port-forward or an ssh tunnel looks like, is its own state: the mount
+  is still offered, with the warning to point it at the index's own data
+  directory and nothing else, because a local database's data directory may
+  well be sitting right there and pointing at it would show a measured number,
+  with the thresholds live, for a volume that is not the index's. Nothing new is
   measured and no path is ever guessed: the only directory this check stats
   is still one the operator named, or the server's own data directory behind
   the existing locality gate, so the shipped compose file's guarantee that

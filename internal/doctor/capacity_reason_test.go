@@ -47,7 +47,9 @@ func TestIndexDatadirFree_namesTheBranchItLandedOn(t *testing.T) {
 		unrelated := filepath.Join(t.TempDir(), "not-the-index-datadir")
 		// A loopback DSN still tries the local path after the declaration
 		// fails, so that case gets a server that answers from another host;
-		// the other two return before any query (nil db proves it).
+		// the other two return before any query (nil db proves it). The
+		// loopback row doubles as the precedence proof: a broken declaration
+		// must be named ahead of host_unconfirmed too.
 		local, mock, err := sqlmock.New()
 		if err != nil {
 			t.Fatal(err)
@@ -116,7 +118,15 @@ func TestIndexDatadirFree_namesTheBranchItLandedOn(t *testing.T) {
 		}
 	})
 
-	t.Run("loopback DSN, server is not this host: invites the mount", func(t *testing.T) {
+	// The tunnel shape: a local ADDRESS whose server is not this machine. The
+	// mount suggestion still applies (the operator may well have the index's
+	// datadir here), but only with its precondition attached, so this state is
+	// its own reason and not folded into mount_unset. A host running a local
+	// mysqld AND reaching the real index through a port-forward would
+	// otherwise be steered at /var/lib/mysql, and the card would then show a
+	// measured number, with live thresholds, for a volume that is not the
+	// index's.
+	t.Run("loopback DSN, server is not this host: says so, and qualifies the mount", func(t *testing.T) {
 		t.Setenv(datadirMountEnv, "")
 		db, mock, err := sqlmock.New()
 		if err != nil {
@@ -129,11 +139,10 @@ func TestIndexDatadirFree_namesTheBranchItLandedOn(t *testing.T) {
 		if ok {
 			t.Fatal("a hostname mismatch must not produce a measurement")
 		}
-		// The address is one this process can reach locally, so a read-only
-		// mount is a fix the operator can make; the datadir was never stat'd
-		// (the SHOW VARIABLES query is not even expected below).
-		if reason != CapacityFreeMountUnset {
-			t.Errorf("reason = %q, want %q", reason, CapacityFreeMountUnset)
+		// The datadir was never stat'd either: the SHOW VARIABLES query is not
+		// even expected below.
+		if reason != CapacityFreeHostUnconfirmed {
+			t.Errorf("reason = %q, want %q", reason, CapacityFreeHostUnconfirmed)
 		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Error(err)
@@ -193,7 +202,7 @@ func TestClassifyCapacity_freeReasonNeverMovesTheGrade(t *testing.T) {
 	p := capacityProjection{eventsPerDay: 24000, bytesPerEvent: 1000, projectedBytes: 720_000_000, currentBytes: 6_000_000, sampleHours: 6}
 	retain := 30 * 24 * time.Hour
 
-	for _, r := range []CapacityFreeReason{CapacityFreeMountUnset, CapacityFreeMountUnusable, CapacityFreeIndexNotLocal, CapacityFreeReasonUnknown, ""} {
+	for _, r := range []CapacityFreeReason{CapacityFreeMountUnset, CapacityFreeMountUnusable, CapacityFreeIndexNotLocal, CapacityFreeHostUnconfirmed, CapacityFreeReasonUnknown, ""} {
 		m := classifyCapacity(p, true, retain, true, 0, false, r)
 		if m.Status != StatusSkip || m.Reason != CapacityFreeUnknown {
 			t.Errorf("reason %q graded %s/%s, want skip/free_unknown", r, m.Status, m.Reason)
@@ -232,6 +241,11 @@ func TestCapacityCheckResult_freeUnknownNamesTheFixNotATopology(t *testing.T) {
 			// measure the wrong filesystem, which is worse than measuring
 			// nothing.
 			[]string{datadirMountEnv, "another host", "separate host"}},
+		{CapacityFreeHostUnconfirmed,
+			// Names the fix AND its precondition: this is the one state where
+			// following the advice blindly could measure the wrong volume.
+			[]string{"cannot confirm", datadirMountEnv, "OWN data directory"},
+			[]string{"another host", "separate host"}},
 		{CapacityFreeReasonUnknown,
 			[]string{"cannot see the index volume"},
 			[]string{datadirMountEnv, "another host", "separate host"}},

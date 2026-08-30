@@ -3336,7 +3336,12 @@ function capacityNote(cap) {
 // host or container" and read as plainly false on a single-machine install
 // whose index data directory is simply not mounted into the console. The
 // index_not_local branch carries no mount fix on purpose, since a mount that
-// is not the index's would report the wrong volume's free space.
+// is not the index's would report the wrong volume's free space, and the
+// host_unconfirmed branch (a local address whose server is not confirmed to
+// be this machine, which is what a port-forward or a tunnel looks like)
+// carries the fix WITH its precondition: a local mysqld's datadir may be
+// sitting right there, and pointed at it the card would show a measured
+// number for a volume that is not the index's.
 function capacityFreeNote(cap) {
   if (!cap || cap.free_known) return "";
   switch (cap.free_reason) {
@@ -3344,6 +3349,8 @@ function capacityFreeNote(cap) {
       return "The console cannot see the index volume from here, and no read-only copy of the index data directory is set up. To measure free space, mount that directory into the console read-only and set BINTRAIL_INDEX_DATADIR_RO to the mount point. The bundled docker-compose.yml wires both.";
     case "mount_unusable":
       return "BINTRAIL_INDEX_DATADIR_RO points at a path the console cannot read, so free space was not measured. Check that the index data directory is still mounted there.";
+    case "host_unconfirmed":
+      return "The index answers on a local address, but the console cannot confirm the server runs on this machine, so it cannot tell whether the index data directory is here. If it is, mount that directory into the console read-only and set BINTRAIL_INDEX_DATADIR_RO to the mount point. Point it at the index's own data directory and nothing else: any other volume would be shown as the index's free space.";
     case "index_not_local":
       return "The index answers at another address, so the console cannot see its volume, and measuring a disk here would report the wrong one. Watch free space where the index runs.";
     default:
