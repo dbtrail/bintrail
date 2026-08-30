@@ -99,6 +99,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the screen. Storage is still a drawer, and the split is proposed on the issue.
 
 ### Fixed
+- **The console's SQL panel reports the whole wait, and builds only the views
+  your statement names** (#1526). The number on screen used to be the
+  statement's own time, measured after the session was already built, so
+  `SELECT 1` reported 0 ms after about 16 seconds on a console whose backups
+  live in S3, and sent the reader looking at their query for a cost that was
+  never in it. The result line now says both: the whole wait, and how much of it
+  the statement took. The wait itself is smaller, because a session no longer
+  defines every view in the layout before running anything. Defining a view over
+  Parquet binds its columns, which opens the file, and on an S3 layout that is a
+  network round trip per file, so a query that named one table was paying for
+  every table in the newest backup. The panel now parses the statement first, on
+  a throwaway DuckDB session that is sealed from its first statement and reads
+  nothing, and then builds only the views that statement names, plus none at all
+  for one that names none. Measured against a stand-in for S3 latency, with 20
+  tables in the backup: `SELECT 1` went from 1.85 s and 40 network requests to
+  32 ms and none, and a query over one `state_` view from 40 requests to 2. A
+  statement naming something the layout does not define still builds everything,
+  so DuckDB's own "did you mean" answer stays as useful as it was, and so does a
+  catalog listing, which has to list what is really there. Those two are the
+  longest waits the panel has, so a failed statement now reports its wait as
+  well, instead of leaving the line blank. Warnings describe the session that
+  answered: a query that opens no baseline file is no longer told what those
+  files are missing. Nothing about the panel's posture moves: still one
+  `SELECT` at a time, still the same
+  allowlist, sandbox, budget and audit trail, and still refused while an
+  access-control profile is active.
 - **Console: two arms of the AWS credentials card report the signals they
   probed instead of naming a credential source they never observed** (#1528).
   Two of the card's five arms asserted use from presence. The shared-config arm is selected by `hasSharedAWSConfig()`

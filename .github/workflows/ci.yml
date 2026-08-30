@@ -110,8 +110,15 @@ jobs:
         # coverage that runs that renderer rather than matching strings over
         # it, and node is here only because the runner image ships it, so
         # require it explicitly instead of skipping on its absence.
+        #
+        # BINTRAIL_REQUIRE_DUCKDB_HTTPFS=1: the SQL panel's setup-budget tests
+        # put a Parquet footer read behind an HTTP server, which needs the
+        # httpfs extension (installed from the same network as iceberg above).
+        # They are the only coverage that bound has, so a silent skip here
+        # would leave it unguarded in the one environment that must guard it.
         env:
           BINTRAIL_REQUIRE_DUCKDB_ICEBERG: "1"
+          BINTRAIL_REQUIRE_DUCKDB_HTTPFS: "1"
           BINTRAIL_REQUIRE_NODE: "1"
         run: go test ./... -race -count=1
 

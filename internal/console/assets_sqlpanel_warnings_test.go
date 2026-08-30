@@ -39,3 +39,32 @@ func functionBody(t *testing.T, js, decl string) string {
 	}
 	return rest
 }
+
+// TestRunSQLRendersTheTimingSplit guards the reader-facing half of #1526. The
+// server sends the whole wait and the statement's share of it; a panel that
+// prints only one of them puts the operator back where they started, looking at
+// a query for a cost that is in the layout. Scoped to runSQL's body for the
+// reason the guard above is.
+func TestRunSQLRendersTheTimingSplit(t *testing.T) {
+	js, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := functionBody(t, string(js), "async function runSQL(")
+	for _, want := range []string{"data.elapsed_ms", "data.query_ms"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("runSQL does not render %s: the SQL panel reports one number where it needs two", want)
+		}
+	}
+	// And on the path that waits LONGEST: a statement naming a relation the
+	// layout does not define builds every view before it fails. The server
+	// carries elapsed_ms on that body; a page that ignores it blanks the status
+	// line after the slowest thing the panel does.
+	if !strings.Contains(body, "j.elapsed_ms") {
+		t.Error("runSQL drops the wait on a failed statement: the operator is told nothing " +
+			"about the longest wait the panel has")
+	}
+	if !strings.Contains(body, "failed after ") {
+		t.Error("runSQL parses the failure's elapsed_ms but never puts it on the status line")
+	}
+}

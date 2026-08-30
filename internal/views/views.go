@@ -208,6 +208,38 @@ type Input struct {
 	// Empty for the downloadable `bintrail views` file, which describes the
 	// operator's OWN Parquet in full.
 	ExcludeEventColumns []string
+
+	// OnlyViews limits the render to the views it names. Mechanical, like
+	// ExcludeEventColumns above: this package decides nothing about WHICH views
+	// a caller wants, it only leaves out the ones the caller did not ask for.
+	// The console SQL panel (#1526) sets it to what one statement references,
+	// because defining a view over Parquet binds its columns — a file read, and
+	// a network round trip per file on an S3 layout — so a statement that names
+	// none of them should pay for none of them.
+	OnlyViews ViewSet
+}
+
+// ViewSet names a subset of the views an Input defines.
+//
+// The nil/empty distinction is the whole type: a NIL set means every view,
+// which is what the downloadable file has always emitted and what any caller
+// that never heard of this field gets; a non-nil set means exactly the names it
+// holds, and an EMPTY non-nil set therefore means NO views at all, which is
+// what `SELECT 1` needs. A bare []string could not tell those two apart.
+type ViewSet map[string]bool
+
+// wants reports whether name is in the set.
+//
+// The lookup is lowercased because DuckDB identifiers are case-insensitive and
+// a set is built from a statement a human typed; the set's KEYS are therefore
+// expected lowercase, which is how its one producer builds them. An
+// unrecognized name is simply not wanted: this is a filter, never a validator,
+// so it neither errors nor logs on one.
+func (v ViewSet) wants(name string) bool {
+	if v == nil {
+		return true
+	}
+	return v[strings.ToLower(name)]
 }
 
 // Generate renders the complete .sql file: the explanatory header, the S3
@@ -253,8 +285,16 @@ func GenerateViews(in Input) string {
 	// the same Input; the caller gets the archives-only view, which is what
 	// this entry point can actually back.
 	in.LiveIndex = nil
-	writeEventsView(&b, in)
-	writeStateViews(&b, in)
+	events := writeEventsView(&b, in)
+	state := writeStateViews(&b, in)
+	if !events && !state {
+		// Not one view was emitted, so whatever is in the builder is comments.
+		// The caller EXECUTES this text and DuckDB answers a comment-only script
+		// with "empty query", which would turn "this statement needs no view"
+		// into an error. An empty string is the honest instruction to run
+		// nothing.
+		return ""
+	}
 	return b.String()
 }
 
@@ -263,18 +303,69 @@ func GenerateViews(in Input) string {
 // refusing over: a layout that is entirely local reads nothing through httpfs,
 // so failing it on an unrelated environment variable blocks a render that
 // would have been correct.
+//
+// It answers for what will actually be RENDERED, so a set OnlyViews narrows it
+// the same way it narrows the output: a session built for a statement that
+// names only a local state view needs no S3 credentials, even though the layout
+// around it has S3 in it. With OnlyViews nil this is the whole layout, which is
+// every caller outside the SQL panel.
 func (in Input) NeedsS3() bool {
-	for _, s := range in.ArchiveSources {
-		if isS3(s) {
-			return true
+	if in.OnlyViews.wants(eventsViewName) {
+		for _, s := range in.ArchiveSources {
+			if isS3(s) {
+				return true
+			}
 		}
 	}
-	for _, t := range in.Baselines {
-		if isS3(t.Path) {
+	for _, p := range stateViewPlan(in) {
+		if isS3(p.table.Path) && in.OnlyViews.wants(p.name) {
 			return true
 		}
 	}
 	return false
+}
+
+// DefinedViews names every view this Input defines, ignoring OnlyViews: it
+// answers "what could this layout define", which is what a caller filtering by
+// name needs in order to tell a name it can build from one it cannot.
+//
+// LiveIndex is read as Generate reads it. GenerateViews nils it before
+// rendering, so a caller that pairs this with THAT entry point must not set it
+// either, or this would claim an events view a live-only render would emit and
+// GenerateViews would not.
+func (in Input) DefinedViews() []string {
+	var names []string
+	if in.definesEvents() {
+		names = append(names, eventsViewName)
+	}
+	for _, p := range stateViewPlan(in) {
+		names = append(names, p.name)
+	}
+	return names
+}
+
+// SelectedBaselines returns the baseline tables whose state view this Input
+// would render, honoring OnlyViews. It answers "which baseline files does this
+// render actually read", which is what a caller that reports on those files has
+// to count over: a session built for `SELECT 1` opens none of them, so a note
+// about their column types would be describing files that query never touched.
+func (in Input) SelectedBaselines() []BaselineTable {
+	var out []BaselineTable
+	for _, p := range stateViewPlan(in) {
+		if in.OnlyViews.wants(p.name) {
+			out = append(out, p.table)
+		}
+	}
+	return out
+}
+
+// definesEvents reports whether the events view is emitted at all: it needs a
+// leg, and a failed discovery leaves no usable archive list whatever
+// ArchiveSources holds. One predicate, shared by writeEventsView and
+// DefinedViews, so the two cannot disagree about whether the view exists.
+func (in Input) definesEvents() bool {
+	cold := !in.ArchiveDiscoveryFailed && len(in.ArchiveSources) > 0
+	return cold || in.LiveIndex != nil
 }
 
 func isS3(p string) bool { return strings.HasPrefix(p, "s3://") }
@@ -447,6 +538,11 @@ const eventTypeCase = "CASE \"event_type\"\n" +
 // parse error, and a distinctive name makes the hot leg obvious in a plan.
 const liveAttachAlias = "bintrail_live"
 
+// eventsViewName is the one fixed view name in the output; every other name is
+// derived from a baseline table. Named so the filter and the generator agree on
+// its spelling.
+const eventsViewName = "events"
+
 // liveSecretName is the DuckDB secret the ATTACH reads credentials from.
 const liveSecretName = "bintrail_index"
 
@@ -552,10 +648,19 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func writeEventsView(b *strings.Builder, in Input) {
+// writeEventsView returns whether it emitted a view definition (as opposed to
+// nothing, or a comment explaining why there is none).
+func writeEventsView(b *strings.Builder, in Input) bool {
+	// Not wanted: emit NOTHING, comments included. A filtered render is executed
+	// by its caller, and a script of only comments is an error there.
+	if !in.OnlyViews.wants(eventsViewName) {
+		return false
+	}
+	// Whether the view EXISTS is definesEvents' question, asked below. These two
+	// are the wording inputs: which legs it has decides what the comment says,
+	// and a failed discovery leaves no usable archive list whatever
+	// ArchiveSources holds, so it decides the cold leg here too.
 	live := in.LiveIndex != nil
-	// A failed discovery leaves no usable archive list whatever ArchiveSources
-	// holds, so it decides the cold leg here rather than in a second switch.
 	cold := !in.ArchiveDiscoveryFailed && len(in.ArchiveSources) > 0
 
 	switch {
@@ -567,7 +672,7 @@ func writeEventsView(b *strings.Builder, in Input) {
 		b.WriteString("-- events: every archived binlog event, across all archive sources.\n")
 	}
 
-	if !cold && !live {
+	if !in.definesEvents() {
 		if in.ArchiveDiscoveryFailed {
 			// The header already names the failure; the body must not
 			// contradict it with a cause nobody verified.
@@ -575,7 +680,7 @@ func writeEventsView(b *strings.Builder, in Input) {
 		} else {
 			b.WriteString("-- (skipped: no archive sources are registered in archive_state)\n\n")
 		}
-		return
+		return false
 	}
 
 	if cold {
@@ -647,6 +752,7 @@ func writeEventsView(b *strings.Builder, in Input) {
 		writeEventSelect(b, in, false, "  ")
 		b.WriteString(";\n\n")
 	}
+	return true
 }
 
 // writeLiveCostNote states what a query against the two-leg view actually
@@ -903,8 +1009,51 @@ func archiveGlob(base string) string {
 	return strings.TrimRight(base, "/") + "/event_date=*/event_hour=*/*.parquet"
 }
 
-// writeStateViews emits one view per table in the newest baseline snapshot.
-func writeStateViews(b *strings.Builder, in Input) {
+// statePlan pairs one baseline table with the view name it is emitted under.
+type statePlan struct {
+	table BaselineTable
+	name  string
+}
+
+// stateViewPlan assigns a view name to EVERY table of the snapshot, in emission
+// order.
+//
+// Names are assigned over every table even when only some are rendered: a
+// name's collision suffix depends on which names came before it, so choosing
+// the tables first and naming them second would rename a view the moment its
+// colliding sibling is left out — and a name that moves with the statement is a
+// name nobody can write a query against.
+func stateViewPlan(in Input) []statePlan {
+	tables := append([]BaselineTable(nil), in.Baselines...)
+	sort.Slice(tables, func(i, j int) bool {
+		if tables[i].Schema != tables[j].Schema {
+			return tables[i].Schema < tables[j].Schema
+		}
+		return tables[i].Table < tables[j].Table
+	})
+	used := map[string]bool{}
+	plan := make([]statePlan, 0, len(tables))
+	for _, t := range tables {
+		plan = append(plan, statePlan{table: t, name: stateViewName(t.Schema, t.Table, used)})
+	}
+	return plan
+}
+
+// writeStateViews emits one view per table in the newest baseline snapshot, and
+// returns whether it emitted any.
+func writeStateViews(b *strings.Builder, in Input) bool {
+	plan := stateViewPlan(in)
+	wanted := make([]statePlan, 0, len(plan))
+	for _, p := range plan {
+		if in.OnlyViews.wants(p.name) {
+			wanted = append(wanted, p)
+		}
+	}
+	// A filtered render that selected no state view emits NOTHING, comments
+	// included, for the reason GenerateViews states: its caller executes this.
+	if in.OnlyViews != nil && len(wanted) == 0 {
+		return false
+	}
 	b.WriteString("-- state_<schema>_<table>: each table's full contents as of the baseline snapshot.\n")
 	b.WriteString("--\n")
 	b.WriteString("-- These are the SNAPSHOT's rows, not the table's current state: changes after\n")
@@ -913,21 +1062,12 @@ func writeStateViews(b *strings.Builder, in Input) {
 	b.WriteString("-- that command does, and it is not expressible as a view.\n")
 	if len(in.Baselines) == 0 {
 		b.WriteString("-- (skipped: no baseline snapshot was discovered)\n")
-		return
+		return false
 	}
 	writeDecimalNote(b, in)
 
-	tables := append([]BaselineTable(nil), in.Baselines...)
-	sort.Slice(tables, func(i, j int) bool {
-		if tables[i].Schema != tables[j].Schema {
-			return tables[i].Schema < tables[j].Schema
-		}
-		return tables[i].Table < tables[j].Table
-	})
-
-	used := map[string]bool{}
-	for _, t := range tables {
-		name := stateViewName(t.Schema, t.Table, used)
+	for _, p := range wanted {
+		t, name := p.table, p.name
 		for _, line := range decimalComments(t) {
 			fmt.Fprintf(b, "-- %s: %s\n", name, line)
 		}
@@ -940,6 +1080,7 @@ func writeStateViews(b *strings.Builder, in Input) {
 		fmt.Fprintf(b, "  SELECT * FROM read_parquet(%s);\n", sqlString(t.Path))
 	}
 	b.WriteString("\n")
+	return len(wanted) > 0
 }
 
 // stateViewName builds the view identifier for a table and guarantees it is

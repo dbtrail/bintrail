@@ -4264,14 +4264,29 @@ async function runSQL(sql, ui) {
     if (!res.ok) {
       if (res.status === 401) { handleUnauthorized(); return; }
       let msg = text || "HTTP " + res.status;
-      try { const j = JSON.parse(text); if (j && j.error) msg = j.error; } catch (_) {}
-      statusLine.textContent = "";
+      let waited = null;
+      try {
+        const j = JSON.parse(text);
+        if (j && j.error) msg = j.error;
+        // The wait counts on this path too (#1526), and this is where it is
+        // longest: a mistyped view name cannot be answered out of a narrow
+        // catalog, so the server builds every view in the layout before the
+        // engine can suggest the one the reader meant. Blanking the line here
+        // told them nothing about the slowest thing the panel does.
+        if (j && typeof j.elapsed_ms === "number") waited = j.elapsed_ms;
+      } catch (_) {}
+      statusLine.textContent = waited === null ? "" : "failed after " + waited + " ms";
       renderError(results, new Error(msg));
       return;
     }
     const data = JSON.parse(text);
+    // Both numbers, always (#1526). elapsed_ms is the whole wait, query_ms the
+    // statement's share of it; the gap between them is opening the files this
+    // query reads, which on a backup kept in S3 is a network round trip per
+    // file. One number could not say which of the two to go and look at.
     statusLine.textContent = data.row_count + " row" + (data.row_count === 1 ? "" : "s") +
-      " in " + data.elapsed_ms + " ms" + (data.truncated ? " (truncated)" : "") +
+      " in " + data.elapsed_ms + " ms total, " + data.query_ms + " ms in the query" +
+      (data.truncated ? " (truncated)" : "") +
       ((data.warnings && data.warnings.length) ? ". " + data.warnings.join(". ") : "");
     renderSQLResult(results, data);
   } catch (err) {

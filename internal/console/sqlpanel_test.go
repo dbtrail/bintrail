@@ -127,7 +127,7 @@ func TestSQLPanel_readsArchiveAndBaseline(t *testing.T) {
 	baselineRoot, baselinePath := writeSQLPanelBaseline(t)
 	in := panelInput([]string{filepath.Join(archiveRoot, "bintrail_id="+id)}, baselineRoot, baselinePath)
 
-	res, err := runSandboxedSQL(context.Background(), in, `SELECT event_type, schema_name FROM events`)
+	res, err := runSandboxedSQL(context.Background(), in, `SELECT event_type, schema_name FROM events`, time.Now())
 	if err != nil {
 		t.Fatalf("query events view: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSQLPanel_readsArchiveAndBaseline(t *testing.T) {
 		t.Errorf("events row = %v, want [UPDATE shop]", res.Rows[0])
 	}
 
-	res, err = runSandboxedSQL(context.Background(), in, `SELECT count(*) FROM state_shop_orders WHERE status = 'paid'`)
+	res, err = runSandboxedSQL(context.Background(), in, `SELECT count(*) FROM state_shop_orders WHERE status = 'paid'`, time.Now())
 	if err != nil {
 		t.Fatalf("query state view: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestSQLPanel_gateBlocksRawFileAccess(t *testing.T) {
 		{"reader in JOIN", fmt.Sprintf("SELECT e.schema_name FROM events e JOIN read_parquet('%s') r ON true", archiveFile)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			res, err := runSandboxedSQL(context.Background(), in, tc.stmt)
+			res, err := runSandboxedSQL(context.Background(), in, tc.stmt, time.Now())
 			var ue *sqlUserError
 			if !errors.As(err, &ue) {
 				t.Fatalf("raw file access was not refused by the gate (rows leaked: %+v): %v", res, err)
@@ -213,12 +213,13 @@ func TestSQLPanel_gateBlocksRawFileAccess(t *testing.T) {
 // the walk denies everything else. It runs the REAL gate (sqlPanelGate), so it
 // also proves the AST shape assumption holds for every function at once.
 func TestSQLPanel_onlyAllowlistedTableFunctionsReachable(t *testing.T) {
-	db, cleanup, err := openSandboxedSession(context.Background(),
-		func() views.Input { r, p := writeSQLPanelBaseline(t); return panelInput(nil, r, p) }())
+	// The session the gate ACTUALLY runs on in production since #1526: the
+	// sealed parse session, opened before any view exists.
+	db, err := openParseSession(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cleanup()
+	defer db.Close()
 
 	// duckdb_functions() is itself a table function — read it on a plain
 	// session, before the sandbox would (correctly) refuse it.
@@ -252,7 +253,7 @@ func TestSQLPanel_onlyAllowlistedTableFunctionsReachable(t *testing.T) {
 		// A bare zero-arg call parses (argument errors are a bind-time concern,
 		// after json_serialize_sql), so the gate can classify every one.
 		stmt := fmt.Sprintf(`SELECT * FROM "%s"()`, name)
-		err := sqlPanelGate(context.Background(), db, stmt)
+		_, err := sqlPanelGate(context.Background(), db, stmt)
 		var ue *sqlUserError
 		if err == nil {
 			t.Errorf("gate ALLOWED non-allowlisted table function %q — potential file/SQL read", name)
@@ -315,7 +316,7 @@ func TestSQLPanel_allowlistPinnedToExactlyTwo(t *testing.T) {
 // sandbox to everything in /tmp.
 func TestSQLPanel_sandboxDeniesOutOfRootReads(t *testing.T) {
 	baselineRoot, baselinePath := writeSQLPanelBaseline(t)
-	db, cleanup, err := openSandboxedSession(context.Background(), panelInput(nil, baselineRoot, baselinePath))
+	db, cleanup, err := openSandboxedSession(context.Background(), panelInput(nil, baselineRoot, baselinePath), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,18 +402,18 @@ func TestSQLPanel_withholdsForensicsColumns(t *testing.T) {
 	in := panelInput([]string{filepath.Join(archiveRoot, "bintrail_id="+id)}, "", "")
 
 	for _, col := range []string{"connection_id", "query_text", "query_hash"} {
-		_, err := runSandboxedSQL(context.Background(), in, "SELECT "+col+" FROM events")
+		_, err := runSandboxedSQL(context.Background(), in, "SELECT "+col+" FROM events", time.Now())
 		var ue *sqlUserError
 		if !errors.As(err, &ue) {
 			t.Errorf("SELECT %s FROM events did not refuse (forensics column leaked): %v", col, err)
 		}
 	}
 	// A free column is unaffected.
-	if _, err := runSandboxedSQL(context.Background(), in, "SELECT schema_name FROM events"); err != nil {
+	if _, err := runSandboxedSQL(context.Background(), in, "SELECT schema_name FROM events", time.Now()); err != nil {
 		t.Errorf("a non-forensics column was wrongly withheld: %v", err)
 	}
 	// SELECT * must not carry them either.
-	res, err := runSandboxedSQL(context.Background(), in, "SELECT * FROM events")
+	res, err := runSandboxedSQL(context.Background(), in, "SELECT * FROM events", time.Now())
 	if err != nil {
 		t.Fatalf("SELECT *: %v", err)
 	}
@@ -439,7 +440,7 @@ func TestSQLPanel_gateRefusesSecretIntrospection(t *testing.T) {
 		"SELECT * FROM which_secret('s3://x/y', 's3')",
 		"SELECT * FROM duckdb_secrets() /* comment */",
 	} {
-		_, err := runSandboxedSQL(context.Background(), in, stmt)
+		_, err := runSandboxedSQL(context.Background(), in, stmt, time.Now())
 		var ue *sqlUserError
 		if !errors.As(err, &ue) || !strings.Contains(ue.msg, "not available") {
 			t.Errorf("%q: expected the denied-function refusal, got: %v", stmt, err)
@@ -447,7 +448,7 @@ func TestSQLPanel_gateRefusesSecretIntrospection(t *testing.T) {
 	}
 	// An allowlisted generator, by contrast, runs — the gate is a FROM-clause
 	// allowlist, not a blanket ban on all table-shaped syntax.
-	if _, err := runSandboxedSQL(context.Background(), in, "SELECT count(*) FROM range(10)"); err != nil {
+	if _, err := runSandboxedSQL(context.Background(), in, "SELECT count(*) FROM range(10)", time.Now()); err != nil {
 		t.Errorf("range() should be allowed: %v", err)
 	}
 }
@@ -478,7 +479,7 @@ func TestSQLPanel_gateRefusesNonSelect(t *testing.T) {
 		{"two SELECTs", "SELECT 1; SELECT 2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := runSandboxedSQL(context.Background(), in, tc.stmt)
+			_, err := runSandboxedSQL(context.Background(), in, tc.stmt, time.Now())
 			var ue *sqlUserError
 			if !errors.As(err, &ue) {
 				t.Fatalf("expected the statement gate to refuse, got: %v", err)
@@ -488,7 +489,7 @@ func TestSQLPanel_gateRefusesNonSelect(t *testing.T) {
 
 	// A syntax error surfaces the parser's own message — usable feedback, not
 	// a generic refusal.
-	_, err := runSandboxedSQL(context.Background(), in, "SELEC 1")
+	_, err := runSandboxedSQL(context.Background(), in, "SELEC 1", time.Now())
 	var ue *sqlUserError
 	if !errors.As(err, &ue) || !strings.Contains(strings.ToLower(ue.msg), "error") {
 		t.Fatalf("syntax error should surface the parser message, got: %v", err)
@@ -500,7 +501,7 @@ func TestSQLPanel_gateRefusesNonSelect(t *testing.T) {
 // regressed, no statement may widen the sandbox after it is locked.
 func TestSQLPanel_lockedConfigurationHolds(t *testing.T) {
 	baselineRoot, baselinePath := writeSQLPanelBaseline(t)
-	db, cleanup, err := openSandboxedSession(context.Background(), panelInput(nil, baselineRoot, baselinePath))
+	db, cleanup, err := openSandboxedSession(context.Background(), panelInput(nil, baselineRoot, baselinePath), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +528,7 @@ func TestSQLPanel_capsRowsAndBytes(t *testing.T) {
 	baselineRoot, baselinePath := writeSQLPanelBaseline(t)
 	in := panelInput(nil, baselineRoot, baselinePath)
 
-	res, err := runSandboxedSQL(context.Background(), in, "SELECT * FROM range(2000)")
+	res, err := runSandboxedSQL(context.Background(), in, "SELECT * FROM range(2000)", time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +537,7 @@ func TestSQLPanel_capsRowsAndBytes(t *testing.T) {
 	}
 
 	// Wide rows must trip the byte budget long before the row cap.
-	res, err = runSandboxedSQL(context.Background(), in, "SELECT repeat('x', 5000000) FROM range(5)")
+	res, err = runSandboxedSQL(context.Background(), in, "SELECT repeat('x', 5000000) FROM range(5)", time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -557,7 +558,7 @@ func TestSQLPanel_timeoutInterrupts(t *testing.T) {
 	defer func() { sqlPanelTimeout = old }()
 
 	start := time.Now()
-	_, err := runSandboxedSQL(context.Background(), in, "SELECT count(*) FROM range(200000000000)")
+	_, err := runSandboxedSQL(context.Background(), in, "SELECT count(*) FROM range(200000000000)", time.Now())
 	elapsed := time.Since(start)
 	var ue *sqlUserError
 	if !errors.As(err, &ue) || !strings.Contains(ue.msg, "exceeded") {
@@ -581,7 +582,7 @@ func TestSQLPanel_cancelInterrupts(t *testing.T) {
 		cancel()
 	}()
 	start := time.Now()
-	_, err := runSandboxedSQL(ctx, in, "SELECT count(*) FROM range(200000000000)")
+	_, err := runSandboxedSQL(ctx, in, "SELECT count(*) FROM range(200000000000)", time.Now())
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got: %v", err)

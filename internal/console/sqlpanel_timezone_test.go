@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 )
@@ -55,7 +56,7 @@ func TestSQLPanel_readsAndRendersInUTC(t *testing.T) {
 	res, err := runSandboxedSQL(context.Background(), in,
 		`SELECT strftime(event_timestamp, '%Y-%m-%d %H:%M:%S') AS printed,
 		        date_trunc('day', event_timestamp) AS day
-		   FROM events`)
+		   FROM events`, time.Now())
 	if err != nil {
 		t.Fatalf("query events view: %v", err)
 	}
