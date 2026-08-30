@@ -246,7 +246,12 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 		// baseline root, so it is the long wait that used to report nothing at
 		// all, which is where #1526 starts. The 404 above is on this side of
 		// the listing too and stays plain on purpose: "nothing to query yet" is
-		// a fact about the server that no elapsed time qualifies.
+		// a fact about the server that no elapsed time qualifies. The one
+		// refusal above that this reasoning does not cover is the bundle
+		// resolution (s.resolveOr): config.Connect Pings eagerly, so an
+		// unreachable server refuses after a dial rather than about zero, and
+		// it stays plain because it is the resolution EVERY endpoint shares,
+		// not because it is fast.
 		writeSQLPanelError(w, http.StatusBadGateway, err.Error(), time.Since(reqStart))
 		return
 	}
@@ -502,6 +507,10 @@ func wantedViews(in views.Input, refs *statementRefs) views.ViewSet {
 	// inside the clause that shadows it. Asking "is this a view?" first can only
 	// cost a view nobody reads; asking "is this a CTE?" first drops that
 	// reference and turns a working query into "table does not exist".
+	// Pinned by TestSQLPanel_shadowingCTEStillReadsTheView and its row in
+	// TestSQLPanel_wantedViews — and it takes a WITH name that IS a view name:
+	// a `WITH q AS (SELECT * FROM events)` yields {events} under either order,
+	// so it cannot tell them apart.
 	want := views.ViewSet{}
 	for name := range refs.tables {
 		switch {

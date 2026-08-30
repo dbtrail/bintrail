@@ -25,6 +25,7 @@ import (
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/go-sql-driver/mysql"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/views"
@@ -170,6 +171,15 @@ func TestSQLPanel_wantedViews(t *testing.T) {
 			want: []string{"events", "state_shop_orders"}},
 		{name: "a WITH name is not a view", stmt: "WITH q AS (SELECT * FROM events) SELECT * FROM q",
 			want: []string{"events"}},
+		// The row that separates the two orderings inside wantedViews. The one
+		// above cannot: `q` is not a view, so it is dropped either way and the
+		// answer is {events} under both. Here the WITH name IS a view name, and
+		// the walk collects names with no scope, so a ctes-first switch drops
+		// the only entry there is and builds nothing — see
+		// TestSQLPanel_shadowingCTEStillReadsTheView for the same statement run.
+		{name: "a WITH name that shadows a view still reads the view",
+			stmt: "WITH events AS (SELECT * FROM events) SELECT count(*) FROM events",
+			want: []string{"events"}},
 		{name: "a WITH name that shadows nothing", stmt: "WITH q AS (SELECT 1) SELECT * FROM q"},
 		{name: "a recursive WITH", want: nil,
 			stmt: "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 3) SELECT * FROM t"},
@@ -220,6 +230,39 @@ func TestSQLPanel_wantedViews(t *testing.T) {
 				t.Fatalf("wantedViews = %v, want %v", names, tc.want)
 			}
 		})
+	}
+}
+
+// TestSQLPanel_shadowingCTEStillReadsTheView is the running half of the
+// wantedViews row above, and what makes the defined-before-ctes ordering a
+// behaviour rather than a preference: a non-recursive WITH is not in scope
+// inside its own definition, so the inner `FROM events` binds to the VIEW while
+// the outer one binds to the CTE. The reference walk has no scope and leaves
+// ONE entry standing for both, so asking "is this a CTE?" first drops it, the
+// session builds no view, and this working statement fails with "Table with
+// name events does not exist".
+func TestSQLPanel_shadowingCTEStillReadsTheView(t *testing.T) {
+	archiveRoot := t.TempDir()
+	const id = "11111111-2222-3333-4444-555555555555"
+	writeSQLPanelArchive(t, archiveRoot, id)
+	baselineRoot, baselinePath := writeSQLPanelBaseline(t)
+	in := panelInput([]string{filepath.Join(archiveRoot, "bintrail_id="+id)}, baselineRoot, baselinePath)
+
+	// The view read plainly, so the comparison below is against what this
+	// layout actually holds rather than a literal.
+	base, err := runSandboxedSQL(context.Background(), in, "SELECT count(*) FROM events", time.Now())
+	if err != nil {
+		t.Fatalf("the plain statement over the events view: %v", err)
+	}
+	res, err := runSandboxedSQL(context.Background(), in,
+		"WITH events AS (SELECT * FROM events) SELECT count(*) FROM events", time.Now())
+	if err != nil {
+		t.Fatalf("a WITH name that shadows a view: no view was built for it, so a statement "+
+			"that runs answered with an error: %v", err)
+	}
+	if fmt.Sprint(res.Rows) != fmt.Sprint(base.Rows) {
+		t.Fatalf("the shadowing statement counted %v against %v for the view itself: the "+
+			"reference inside the WITH clause did not resolve to the view", res.Rows, base.Rows)
 	}
 }
 
@@ -279,21 +322,93 @@ func TestSQLPanel_reportsTheWholeWait(t *testing.T) {
 	}
 }
 
-// TestSQLPanel_elapsedCoversSessionSetup is the same claim with the setup made
-// SLOW on purpose: the baseline Parquet is served over HTTP with a fixed delay
-// per request, which is the shape an S3 layout has (a listing and a footer read
-// per file, over the network). The reported total must cover that; the query's
-// own number must not.
-func TestSQLPanel_elapsedCoversSessionSetup(t *testing.T) {
+// requireHTTPFSEnv turns the httpfs skip below into a failure. Set on the CI
+// unit-test step, asserted by TestCIRequiresHTTPFSForTheSetupBudget.
+const requireHTTPFSEnv = "BINTRAIL_REQUIRE_DUCKDB_HTTPFS"
+
+// requireDuckDBHTTPFS makes sure the embedded engine can read an http:// path,
+// which is how the tests below put a Parquet footer read behind the network —
+// the shape an S3 layout has, and the only way to make the panel's setup slow
+// on purpose. It also PROVISIONS it: the panel's own path never calls
+// LoadHTTPFS for an http:// layout (NeedsS3 answers for s3:// only), so those
+// reads rely on DuckDB autoloading an extension this call has installed.
+//
+// The tests it guards are the only coverage the setup budget has, so a silent
+// skip would let that claim disappear from a run that still exits 0. With the
+// variable set — CI sets it, beside the Iceberg extension it already requires
+// off the same network — a missing httpfs is a FAILURE; elsewhere it stays a
+// named skip, because an offline machine genuinely cannot run them.
+func requireDuckDBHTTPFS(t *testing.T) {
+	t.Helper()
 	probe, err := sql.Open("duckdb", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	loadErr := duckdbutil.LoadHTTPFS(context.Background(), probe)
 	probe.Close()
-	if loadErr != nil {
-		t.Skipf("httpfs unavailable (offline host?): %v", loadErr)
+	if loadErr == nil {
+		return
 	}
+	if os.Getenv(requireHTTPFSEnv) != "" {
+		t.Fatalf("%s is set and the DuckDB httpfs extension will not load (%v): these are the "+
+			"only tests that put the panel's setup behind the network, and skipping them here "+
+			"leaves the setup budget with no coverage at all", requireHTTPFSEnv, loadErr)
+	}
+	t.Skipf("httpfs unavailable (offline host?): %v — set %s=1 to make this a failure",
+		loadErr, requireHTTPFSEnv)
+}
+
+// TestCIRequiresHTTPFSForTheSetupBudget: the variable above only means
+// something if CI sets it, and a variable nobody wires in enables nothing. It
+// has to be on the step that RUNS the unit tests, not merely somewhere in the
+// file.
+func TestCIRequiresHTTPFSForTheSetupBudget(t *testing.T) {
+	const path = "../../.github/workflows/ci.yml"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var doc struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Run string            `yaml:"run"`
+				Env map[string]string `yaml:"env"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	var ran, required bool
+	for _, job := range doc.Jobs {
+		for _, step := range job.Steps {
+			// The step that runs the whole unit suite, found by what it RUNS
+			// rather than by its name: a rename must not quietly empty this.
+			if !strings.Contains(step.Run, "go test ./...") {
+				continue
+			}
+			ran = true
+			if step.Env[requireHTTPFSEnv] != "" {
+				required = true
+			}
+		}
+	}
+	if !ran {
+		t.Fatalf("no step in %s runs `go test ./...`; this guard covers nothing", path)
+	}
+	if !required {
+		t.Errorf("no step running the unit suite in %s sets %s, so the setup-budget tests can "+
+			"skip in CI and leave that bound with no coverage anywhere", path, requireHTTPFSEnv)
+	}
+}
+
+// TestSQLPanel_elapsedCoversSessionSetup is the same claim with the setup made
+// SLOW on purpose: the baseline Parquet is served over HTTP with a fixed delay
+// per request, which is the shape an S3 layout has (a listing and a footer read
+// per file, over the network). The reported total must cover that; the query's
+// own number must not.
+func TestSQLPanel_elapsedCoversSessionSetup(t *testing.T) {
+	requireDuckDBHTTPFS(t)
 	_, baselinePath := writeSQLPanelBaseline(t)
 	const delay = 60 * time.Millisecond
 	var reqs atomic.Int64
@@ -504,16 +619,15 @@ func TestSQLPanel_registryNoteIsAboutTheSessionThatAnswered(t *testing.T) {
 // What the budget does is stop the setup from starting the next read. Spent
 // before the first one is the shape that pins that down: with the budget
 // already gone, nothing is read at all.
+//
+// On its own this case proves LESS than it reads: a budget of one nanosecond
+// is already gone when the PARSE session runs its first statement, so the run
+// ends before the view build is reached and the read count is zero whichever
+// context that build receives. TestSQLPanel_setupBudgetExpiresInsideTheViewBuild
+// below is the case that reaches the build; this one is kept because "an
+// expired budget reads nothing at all" is a separate fact about the setup.
 func TestSQLPanel_setupRunsUnderTheSetupBudget(t *testing.T) {
-	probe, err := sql.Open("duckdb", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	loadErr := duckdbutil.LoadHTTPFS(context.Background(), probe)
-	probe.Close()
-	if loadErr != nil {
-		t.Skipf("httpfs unavailable (offline host?): %v", loadErr)
-	}
+	requireDuckDBHTTPFS(t)
 	_, baselinePath := writeSQLPanelBaseline(t)
 	var reqs atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -533,6 +647,83 @@ func TestSQLPanel_setupRunsUnderTheSetupBudget(t *testing.T) {
 	if n := reqs.Load(); n != 0 {
 		t.Fatalf("the setup made %d network reads after its budget was gone: the deadline does "+
 			"not reach the view build", n)
+	}
+}
+
+// TestSQLPanel_setupBudgetExpiresInsideTheViewBuild is the half the case above
+// cannot make: here the budget SURVIVES the parse and runs out DURING the view
+// build, which is the step it exists to bound. Neither the parse session nor
+// the gate touches the network, so this deadline can only be reached by the
+// build itself — and the discriminator is the error TEXT, since "set up views
+// over the Parquet layout" is the only step that reports it. The read count
+// backs that up from both sides: this run reached the network at all (the
+// nanosecond case reaches nothing), and it stopped short of a whole build.
+//
+// What it deliberately does NOT assert is that the abort is FAST. An httpfs
+// read already in flight is not interrupted by an expired context (measured:
+// the run takes the whole stall), so what the budget buys is that the setup
+// does not start the NEXT read. A wall-clock assertion here would be asserting
+// something the engine does not do.
+func TestSQLPanel_setupBudgetExpiresInsideTheViewBuild(t *testing.T) {
+	requireDuckDBHTTPFS(t)
+	_, baselinePath := writeSQLPanelBaseline(t)
+
+	// The budget has to outlast the parse (openParseSession plus the gate:
+	// ~5-20 ms, no network), and the stall has to outlast the budget, so the
+	// deadline can land nowhere but inside the build.
+	const budget = 1 * time.Second
+	const stallFor = 3 * time.Second
+
+	var reqs atomic.Int64
+	var stall atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Counted on ARRIVAL, so the stalled read counts while it is still in
+		// flight — that is the read the budget expires underneath.
+		reqs.Add(1)
+		if stall.CompareAndSwap(true, false) {
+			time.Sleep(stallFor)
+		}
+		http.ServeFile(w, r, baselinePath)
+	}))
+	defer srv.Close()
+
+	in := panelInput(nil, srv.URL, srv.URL+"/orders.parquet")
+	const stmt = "SELECT count(*) FROM state_shop_orders"
+
+	// A control run first, on the real budget with nothing stalled: it measures
+	// what a whole build-and-query costs in reads over THIS fixture, so the
+	// budgeted run below is compared against a measured number rather than a
+	// literal a fixture change would quietly invalidate. It is also the
+	// positive control — without it, "the query failed" could mean the layout
+	// was never queryable.
+	if _, err := runSandboxedSQL(context.Background(), in, stmt, time.Now()); err != nil {
+		t.Fatalf("control run over the HTTP-backed layout: %v", err)
+	}
+	full := reqs.Load()
+	if full < 2 {
+		t.Fatalf("the control run made %d HTTP reads: the fixture no longer puts the setup "+
+			"behind the network", full)
+	}
+
+	defer func(old time.Duration) { sqlPanelSetupTimeout = old }(sqlPanelSetupTimeout)
+	sqlPanelSetupTimeout = budget
+	reqs.Store(0)
+	stall.Store(true)
+
+	_, err := runSandboxedSQL(context.Background(), in, stmt, time.Now())
+	if err == nil {
+		t.Fatal("the view build ran to completion after its budget was spent")
+	}
+	if !strings.Contains(err.Error(), "views over the Parquet layout") {
+		t.Fatalf("the budget was spent somewhere other than the view build: %v", err)
+	}
+	switch n := reqs.Load(); {
+	case n == 0:
+		t.Fatalf("the budget was gone before the build made a single read, so this is the "+
+			"nanosecond case again and not a new one: the parse did not fit inside %s", budget)
+	case n >= full:
+		t.Fatalf("the build made %d reads against %d for a whole build-and-query: the deadline "+
+			"did not stop it", n, full)
 	}
 }
 
