@@ -39,3 +39,21 @@ func functionBody(t *testing.T, js, decl string) string {
 	}
 	return rest
 }
+
+// TestRunSQLRendersTheTimingSplit guards the reader-facing half of #1526. The
+// server sends the whole wait and the statement's share of it; a panel that
+// prints only one of them puts the operator back where they started, looking at
+// a query for a cost that is in the layout. Scoped to runSQL's body for the
+// reason the guard above is.
+func TestRunSQLRendersTheTimingSplit(t *testing.T) {
+	js, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := functionBody(t, string(js), "async function runSQL(")
+	for _, want := range []string{"data.elapsed_ms", "data.query_ms"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("runSQL does not render %s: the SQL panel reports one number where it needs two", want)
+		}
+	}
+}

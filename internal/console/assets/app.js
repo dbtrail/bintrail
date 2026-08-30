@@ -4187,8 +4187,13 @@ async function runSQL(sql, ui) {
       return;
     }
     const data = JSON.parse(text);
+    // Both numbers, always (#1526). elapsed_ms is the whole wait, query_ms the
+    // statement's share of it; the gap between them is opening the files this
+    // query reads, which on a backup kept in S3 is a network round trip per
+    // file. One number could not say which of the two to go and look at.
     statusLine.textContent = data.row_count + " row" + (data.row_count === 1 ? "" : "s") +
-      " in " + data.elapsed_ms + " ms" + (data.truncated ? " (truncated)" : "") +
+      " in " + data.elapsed_ms + " ms total, " + data.query_ms + " ms in the query" +
+      (data.truncated ? " (truncated)" : "") +
       ((data.warnings && data.warnings.length) ? ". " + data.warnings.join(". ") : "");
     renderSQLResult(results, data);
   } catch (err) {
