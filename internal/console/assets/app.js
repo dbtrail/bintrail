@@ -4020,12 +4020,21 @@ function credentialsCard(storage) {
     return card;
   }
   let summary = "No credentials set directly; dbtrail relies on your AWS environment (for example, an EC2 instance role) to provide them automatically.";
-  // Presence, not use, in every arm below: each reports the signal it saw and
-  // nothing about whether that signal is what the AWS chain actually resolves
-  // to. AccessKeyEnv is AWS_ACCESS_KEY_ID ALONE (storage_api.go), so an ID
-  // exported without its secret used to render "Using access keys" while the
-  // SDK's env provider yields nothing and the chain walks on past it.
+  // Presence, not use: this arm reports the signal it saw and nothing about
+  // whether that signal is what the AWS chain resolves to. AccessKeyEnv is
+  // AWS_ACCESS_KEY_ID ALONE (storage_api.go), so an ID exported without its
+  // secret used to render "Using access keys" while the SDK's env provider
+  // yields nothing and the chain walks on past it.
   if (aws.access_key_env) summary = "Found an access key ID set in an environment variable. Its secret key is not checked here, so this may not be what signs the requests.";
+  // The next TWO arms are NOT hedged, and that is known rather than overlooked:
+  // ContainerCreds and WebIdentity are env-var presence with no stat and no
+  // AWS_ROLE_ARN check, so they are weaker evidence than the file stat behind
+  // the shared-config arm below while claiming more. A token path that does not
+  // exist, a rotated-away token, or a FULL_URI endpoint that answers 403 all
+  // render "Using an IAM role" while nothing signs. Tracked in #1534; fixing
+  // them is a change to what /api/storage probes, not a wording change, which
+  // is why #1528 left them alone instead of hedging the copy over a signal the
+  // daemon could have checked properly.
   else if (aws.container_creds) summary = "Using an IAM role (found an ECS task role).";
   else if (aws.web_identity) summary = "Using an IAM role (found an EKS service-account role).";
   // TWO independent probes select this arm, and the sentence has to name both.
@@ -4041,7 +4050,10 @@ function credentialsCard(storage) {
   card.append(el("p", { class: "stg-hint", text: summary }));
   const adv = el("details", { class: "form-advanced" },
     el("summary", { class: "form-adv-summary", text: "Raw signals" }));
-  kvRow(adv, "access keys (env)", aws.access_key_env ? "set" : "not set");
+  // The row names the ONE variable that was read. "access keys (env): set",
+  // two lines under a summary saying the secret key was not checked, was the
+  // same self-contradiction the shared-config arm was rewritten to remove.
+  kvRow(adv, "access key ID (env)", aws.access_key_env ? "set" : "not set");
   kvRow(adv, "profile (env)", aws.profile || "not set");
   kvRow(adv, "region (env)", aws.region_env || "not set");
   kvRow(adv, "~/.aws config", aws.shared_config ? "present" : "absent");

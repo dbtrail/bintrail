@@ -361,6 +361,24 @@ func jsArmSummary(t *testing.T, body, anchor string) string {
 	if k < 0 {
 		t.Fatalf("unterminated summary literal at %q:\n%s", anchor, line)
 	}
+	// The returned span is only the FIRST string literal on the line, so
+	// anything after its closing quote is invisible to the negative assertions
+	// below. Two shapes exploited that and stayed green:
+	//
+	//	summary = "...hedged..." + " Using credentials from that file.";
+	//	summary = "...hedged... \"Using credentials from that file.\"";
+	//
+	// Neither is contrived: stagingCard, the next function in this file, builds
+	// its hint as "lit" + expr + "lit". So the literal must be the WHOLE
+	// assignment: the next non-space byte after the closing quote has to end the
+	// statement. An arm that legitimately needs concatenation gets told this
+	// guard cannot read it, which is the safe direction to fail.
+	tail := strings.TrimLeft(rest[k+1:], " \t")
+	if !strings.HasPrefix(tail, ";") {
+		t.Fatalf("the arm at %q does not assign ONE plain string literal, so everything after the first "+
+			"literal would escape every check below. Give the arm a single literal, or teach this helper "+
+			"the new shape:\n%s", anchor, line)
+	}
 	return rest[:k]
 }
 
@@ -379,6 +397,14 @@ func jsArmSummary(t *testing.T, body, anchor string) string {
 //   - access keys: AccessKeyEnv is AWS_ACCESS_KEY_ID alone. The secret key is
 //     never probed, so "Using access keys" is false whenever the ID is
 //     exported without it.
+//
+// Exactly TWO arms are covered here, and saying so is the point: the ECS and
+// EKS arms still read "Using an IAM role" from environment-variable presence
+// alone, which is weaker evidence than the file stat behind the shared-config
+// arm. That is dbtrail#1534, deliberately out of scope for #1528, and the
+// comment in credentialsCard has to keep pointing at it. A guard or a comment
+// that describes "every arm" as hedged would be the same over-claim the card
+// itself is being fixed for.
 //
 // Each assertion is scoped to the STRING that arm assigns. See jsArmSummary
 // for why neither a byte window nor the whole line is narrow enough.
@@ -414,6 +440,49 @@ func TestCredentialsCard_armsReportWhatWasProbed(t *testing.T) {
 	if !strings.Contains(keys, "secret") {
 		t.Errorf("the access-key arm does not say the secret key was not checked, which is the whole "+
 			"difference between what was observed and what it used to claim:\n%s", keys)
+	}
+
+	// The Raw signals row under the summary is part of the same claim. Saying
+	// access keys PLURAL are "set", two lines below a sentence that says the
+	// secret key was not checked, reproduces inside one card the contradiction
+	// the shared-config arm was rewritten to remove.
+	if strings.Contains(body, `"access keys (env)"`) {
+		t.Error(`the Raw signals row is still labelled "access keys (env)" but only AWS_ACCESS_KEY_ID is ` +
+			`probed, so it contradicts the summary two lines above it`)
+	}
+	if !strings.Contains(body, `"access key ID (env)"`) {
+		t.Error(`the Raw signals row does not name the one variable that was read (AWS_ACCESS_KEY_ID)`)
+	}
+}
+
+// TestCredentialsCard_commentDoesNotOverclaim (#1528 pass 3). The "presence,
+// not use" note was hoisted above the whole if/else chain and generalized to
+// "every arm below". Two arms below say "Using an IAM role" from env-var
+// presence alone. A comment that describes unhedged arms as hedged is the same
+// defect as the copy this PR is fixing, one layer down, and it is the thing a
+// later reader trusts instead of re-deriving.
+//
+// Read from the RAW asset on purpose: jsFunctionBody blanks comment lines, so
+// the body view cannot see a comment at all.
+func TestCredentialsCard_commentDoesNotOverclaim(t *testing.T) {
+	js := readAsset(t, "app.js")
+	start := strings.Index(js, "function credentialsCard(")
+	if start < 0 {
+		t.Fatal("credentialsCard is gone; this guard covers nothing")
+	}
+	end := strings.Index(js[start:], "function stagingCard(")
+	if end < 0 {
+		t.Fatal("cannot bound credentialsCard's source region")
+	}
+	region := js[start : start+end]
+
+	if strings.Contains(region, "in every arm below") {
+		t.Error("the note claims every arm reports presence rather than use; the ECS and EKS arms still " +
+			"say \"Using an IAM role\" from an env var being non-empty")
+	}
+	if !strings.Contains(region, "#1534") {
+		t.Error("the note does not point at the issue tracking the two arms that are still unhedged, so " +
+			"the next reader has to rediscover which arms this PR did and did not fix")
 	}
 }
 

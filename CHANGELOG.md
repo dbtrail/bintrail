@@ -33,13 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by different capabilities (`views` vs `sql`) and merging would make the
   download unreachable on a daemon with one on and the other off. The generated
   `views.sql` names the card by title, so both sides moved together.
-  No setting, route, API, permission or capability gate changes; 125 words leave
+  No setting, route, API, permission or capability gate changes; 124 words leave
   the screen. Storage is still a drawer, and the split is proposed on the issue.
 
 ### Fixed
-- **Console: the AWS credentials card reports the signals it probed instead of
-  naming a credential source it never observed** (#1528). Two arms asserted use
-  from presence. The shared-config arm is selected by `hasSharedAWSConfig()`
+- **Console: two arms of the AWS credentials card report the signals they
+  probed instead of naming a credential source they never observed** (#1528).
+  Two of the card's five arms asserted use from presence. The shared-config arm is selected by `hasSharedAWSConfig()`
   (a file stat) **or** `AWS_PROFILE`, and it sits below the env-key, ECS and
   IRSA arms, so it caught both an EC2 host with an instance role and a
   region-only `~/.aws/config` (what `aws configure set region` writes) and a
@@ -53,7 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   machine can still be what signs the requests. The card's question is whether
   this daemon can reach S3 at all, so a confident wrong answer was worse than a
   hedged right one; these two arms are the reason the card's word count went up
-  rather than down. The **Scheduled backups** fold
+  rather than down. The Raw signals row under them is relabelled `access key ID
+  (env)`, since `access keys (env): set` contradicted the summary two lines
+  above it. **The ECS and EKS arms are deliberately not part of this**: both
+  still read "Using an IAM role" from an environment variable being non-empty,
+  with no stat and no `AWS_ROLE_ARN` check, which is weaker evidence than the
+  file stat behind the shared-config arm. Hedging their copy would paper over a
+  signal the daemon could check properly instead, so they are tracked in #1534
+  and named as unhedged in the code. The **Scheduled backups** fold
   regains, on its unconditional intro line, the clause saying a run is built
   from the recorded changes and does not read your database: with no schedule
   saved yet every per-run line is gated behind a saved schedule, leaving "each a
