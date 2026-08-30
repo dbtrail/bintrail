@@ -180,9 +180,10 @@ func carryForward(ctx context.Context, srcPath, snapshotDir, schema, table strin
 // re-emitted and the stamp is written.
 //
 // S3 sources are excluded deliberately rather than incidentally. A refresh
-// reads and writes snapshot files on disk (an S3-only baseline destination
-// cannot be refreshed in place), so the loop this exists for is always
-// local-to-local; an S3 source would have to be downloaded, which buys the
+// writes Parquet to a filesystem, and the daemon-wide interval loop is always
+// local-to-local; since #1539 a per-server scheduled fold on an S3-backed
+// server reads its previous snapshot from the BUCKET, where carrying a file
+// forward would mean downloading it — an S3 source would have to be downloaded, which buys the
 // re-encode back and reintroduces the cost this avoids. Those runs take the
 // ordinary merge path, which is correct, just not free.
 func carryForwardEligible(enabled bool, format, srcPath string, changes int, capGap *CaptureGap) bool {

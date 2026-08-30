@@ -501,7 +501,11 @@ func (s *baselineSupervisor) recordRun(serverID, serverName string, rec console.
 // success, empty on failure — publication is all-or-nothing, so a failed fold
 // has no snapshot for the history to name.
 func publishedSnapshotTime(at time.Time, err error) string {
-	if err != nil {
+	// foldPublished, not err == nil: an upload failure leaves the snapshot on
+	// disk at this very anchor (#1539), and a history record that named none
+	// would describe the run as having produced nothing when the operator can
+	// still restore from it.
+	if !foldPublished(err) {
 		return ""
 	}
 	return at.UTC().Format(time.RFC3339)

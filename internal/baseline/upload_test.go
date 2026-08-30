@@ -249,3 +249,42 @@ func TestUploadWithOps_singleSnapshotDir(t *testing.T) {
 		}
 	}
 }
+
+// A directory with no completed snapshot in it or under it must be REFUSED,
+// not uploaded.
+//
+// Steps 1 and 4 are the only readers of the snapshot list; the walk that
+// uploads the data and the deferred _SUCCESS are not gated on it. So an empty
+// list does not upload nothing, it uploads everything except the crash-safety
+// bracket — and a remote snapshot carrying neither marker is complete by
+// default (#467), so an upload interrupted partway would be discoverable,
+// readable and wrong. This is the shape a stat failure on the marker used to
+// fall through to.
+func TestUploadWithOps_refusesWhenNoSnapshotIsComplete(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "2025-01-01T00-00-00Z", "shop"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "2025-01-01T00-00-00Z", "shop", "orders.parquet"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []string
+	ops := s3UploadOps{
+		putEmpty:     func(_ context.Context, k string) error { calls = append(calls, "put "+k); return nil },
+		uploadFile:   func(_ context.Context, _, k string) error { calls = append(calls, "upload "+k); return nil },
+		objectExists: func(_ context.Context, _ string) (bool, error) { return false, nil },
+		deleteObject: func(_ context.Context, k string) error { calls = append(calls, "delete "+k); return nil },
+	}
+
+	n, err := uploadWithOps(context.Background(), dir, "p", false, ops)
+	if err == nil {
+		t.Fatal("the upload was allowed with no completed snapshot, so nothing would have written _INCOMPLETE")
+	}
+	if !strings.Contains(err.Error(), IncompleteMarker) {
+		t.Errorf("err = %v, want it to name the marker that cannot be written", err)
+	}
+	if n != 0 || len(calls) != 0 {
+		t.Errorf("uploaded %d objects via %v, want the refusal to happen before any S3 call", n, calls)
+	}
+}

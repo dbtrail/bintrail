@@ -261,10 +261,16 @@ func FullBackupPossible(e ServerEntry, gates BackupScheduleGates) error {
 //
 // The two diverge exactly when backups go to S3 (#1539): the previous snapshot
 // lives in the bucket, so a fold that read the local directory would find an
-// empty directory on a server whose backups have only ever been uploaded, and
-// report "no previous backup to update" beside a listing showing dozens.
-// FindBaseline and ListBaselines both dispatch on the s3:// prefix, so the
-// remote source needs no separate code path here.
+// empty one on a server whose backups have only ever been uploaded, and report
+// "no previous backup to update" while the bucket holds dozens. FindBaseline
+// and ListBaselines both dispatch on the s3:// prefix, so the remote source
+// needs no separate code path here.
+//
+// Note this is NOT the source the console's own listing uses: newBundleDerived
+// prefers the local directory and treats the bucket only as a per-table
+// fallback, so on this shape the Backups page can show nothing while the fold
+// correctly finds the previous snapshot. That divergence predates #1539 and is
+// tracked separately; do not "fix" it by making the fold read local.
 //
 // The OUTPUT stays local whatever this returns: the fold writes Parquet to a
 // filesystem, and the upload is a separate step afterwards.
@@ -282,9 +288,10 @@ func rebuildPossible(e ServerEntry) error {
 		return errors.New("this server has no index connection to read the recorded changes from")
 	}
 	if e.BaselineDir == "" {
-		// Same constraint as the refresh loop and the point-in-time restore:
-		// the fold reads the previous snapshot and writes the new one on
-		// disk, so it needs the server's own local directory.
+		// The fold WRITES Parquet to a filesystem, so it needs the server's
+		// own local directory. Its READ may be remote (see BaselineFoldSource);
+		// only the write is the constraint. The refresh loop refuses on the
+		// same condition.
 		return errors.New("an update from the recorded changes needs a local backup directory")
 	}
 	return nil
@@ -365,16 +372,27 @@ func ChooseBackupMethod(ctx context.Context, e ServerEntry, gates BackupSchedule
 	tables, listErr := newestSnapshotTables(ctx, source)
 	if listErr != nil && errors.Is(listErr, fs.ErrNotExist) {
 		// A directory the first full backup has not created yet IS "no
-		// backup yet".
+		// backup yet". Local sources only: an S3 listing answers with an
+		// empty result or an S3 error, never fs.ErrNotExist, so an empty
+		// bucket reaches the len(tables) == 0 branch below instead.
 		listErr, tables = nil, nil
 	}
 	if listErr != nil {
-		// Its own verdict, never "no backup yet": an unreadable directory is
-		// a permission or IO problem that a full backup into the same
-		// directory would hit too, and calling it absent would quietly turn
-		// a no-load rebuild into a nightly full read of production while the
-		// page named a reason that is false.
-		return BackupMethodFull, "", fmt.Errorf("the backup directory %s could not be read: %w", source, listErr)
+		// Never "no backup yet" — that reason would be false, and it would
+		// quietly turn a no-load update into a nightly full read of production
+		// with the page naming a cause that did not happen. But it must not
+		// cost the slot either: this probe now reaches the NETWORK on an
+		// S3-backed server (a DuckDB httpfs listing), and before #1539 those
+		// servers were guaranteed a full backup every slot without touching
+		// it. Losing the night's backup to a throttled ListObjectsV2 would be
+		// a worse trade than an expensive backup, so the producer that does
+		// not need the previous snapshot takes over, saying exactly why.
+		if fullErr != nil {
+			return BackupMethodFull, "", fmt.Errorf("the backup location %s could not be read (%v), and a full backup cannot start: %w",
+				source, listErr, fullErr)
+		}
+		return BackupMethodFull, "the previous backup could not be read from " + source + " (" + listErr.Error() +
+			"), so a full backup is taken instead", nil
 	}
 	if len(tables) == 0 {
 		if fullErr != nil {

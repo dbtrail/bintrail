@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -45,8 +46,8 @@ func stubS3Fold(t *testing.T, bucketTables []string, uploadErr error) (*[]upload
 }
 
 // runRefreshFor drives one whole refresh for a request and returns what it
-// logged at Warn.
-func runRefreshFor(t *testing.T, req refreshRequest) string {
+// logged at Warn, plus the status the console would poll.
+func runRefreshFor(t *testing.T, req refreshRequest) (string, console.BaselineStatus) {
 	t.Helper()
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -58,7 +59,7 @@ func runRefreshFor(t *testing.T, req refreshRequest) string {
 	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
 	sup.refreshes[req.ServerID] = &console.BaselineStatus{State: "running"}
 	sup.runRefresh(req, refreshAt, time.Minute)
-	return buf.String()
+	return buf.String(), sup.RefreshStatus(req.ServerID)
 }
 
 // The whole of #1539 end to end: on a server whose backups go to S3, one
@@ -75,13 +76,16 @@ func TestRunRefresh_S3BackedServerFoldsFromTheBucketAndUploads(t *testing.T) {
 	uploads, listed := stubS3Fold(t, []string{"shop.orders"}, nil)
 	injectFold(t, 0, nil)
 
-	out := runRefreshFor(t, refreshRequest{
+	out, st := runRefreshFor(t, refreshRequest{
 		ServerID: "s", ServerName: "s", IndexDSN: "d",
 		BaselineDir: local, BaselineS3: "s3://bucket/backups/",
 	})
 
 	if out != "" {
 		t.Fatalf("the refresh warned: %s", out)
+	}
+	if !st.Published || st.State != "succeeded" {
+		t.Fatalf("status = %+v, want a published success", st)
 	}
 	if len(*listed) != 1 || (*listed)[0] != "s3://bucket/backups/" {
 		t.Fatalf("looked for the previous snapshot in %v, want the bucket once", *listed)
@@ -101,12 +105,15 @@ func TestRunRefresh_withoutAnS3DestinationUploadsNothing(t *testing.T) {
 	uploads, _ := stubS3Fold(t, nil, nil)
 	injectFold(t, 0, nil)
 
-	out := runRefreshFor(t, refreshRequest{
+	out, st := runRefreshFor(t, refreshRequest{
 		ServerID: "s", ServerName: "s", IndexDSN: "d", BaselineDir: stageBaselineRoot(t),
 	})
 
 	if out != "" {
 		t.Fatalf("the refresh warned: %s", out)
+	}
+	if !st.Published {
+		t.Fatalf("status = %+v, want a published run: a local-only refresh publishes on disk", st)
 	}
 	if len(*uploads) != 0 {
 		t.Fatalf("uploaded %+v, want nothing", *uploads)
@@ -122,11 +129,26 @@ func TestRunRefresh_failedUploadFailsTheRunAndKeepsTheSnapshot(t *testing.T) {
 	_, _ = stubS3Fold(t, []string{"shop.orders"}, errors.New("AccessDenied"))
 	injectFold(t, 0, nil)
 
-	out := runRefreshFor(t, refreshRequest{
+	out, st := runRefreshFor(t, refreshRequest{
 		ServerID: "s", ServerName: "s", IndexDSN: "d",
 		BaselineDir: local, BaselineS3: "s3://bucket/backups/",
 	})
 
+	// Published is what stops the scheduled watcher answering this with a full
+	// read of production, so the link from THIS failure to that flag is pinned
+	// here: the watcher's own test stages the status directly.
+	if st.State != "failed" {
+		t.Fatalf("state = %q, want the run reported failed: the backup did not reach the destination", st.State)
+	}
+	if !st.Published {
+		t.Fatalf("status = %+v, want Published: the fold finished and marked the snapshot", st)
+	}
+	if !strings.Contains(out, "published_snapshot=") {
+		t.Fatalf("the finished snapshot is logged under the partial-snapshot key, which cleanup scripts delete: %s", out)
+	}
+	if strings.Contains(out, "published nothing") {
+		t.Fatalf("the headline says nothing was published over a finished snapshot: %s", out)
+	}
 	if !strings.Contains(out, "AccessDenied") {
 		t.Fatalf("the failed upload was not reported: %s", out)
 	}
@@ -136,5 +158,31 @@ func TestRunRefresh_failedUploadFailsTheRunAndKeepsTheSnapshot(t *testing.T) {
 	snap := filepath.Join(local, reconstruct.SnapshotDirName(refreshAt))
 	if _, err := os.Stat(filepath.Join(snap, baseline.SuccessMarker)); err != nil {
 		t.Fatalf("the finished snapshot was reclaimed after the upload failed: %v", err)
+	}
+}
+
+// The run history has to name the snapshot an upload failure left behind.
+//
+// The report tells the operator that snapshot is their remaining result, so a
+// history row carrying no time would describe the same run as having produced
+// nothing, and the two surfaces would contradict each other about a backup
+// that is on disk.
+func TestPublishedSnapshotTime_namesTheSnapshotAnUploadFailureLeftBehind(t *testing.T) {
+	at := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
+	want := "2026-08-28T10:00:00Z"
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"a clean run", nil, want},
+		{"only the upload failed", fmt.Errorf("%w: AccessDenied", errSnapshotNotUploaded), want},
+		{"the fold refused", errors.New("capture gap in the reconstruction window"), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := publishedSnapshotTime(at, tc.err); got != tc.want {
+				t.Fatalf("publishedSnapshotTime = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

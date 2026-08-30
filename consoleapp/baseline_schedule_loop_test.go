@@ -1103,3 +1103,87 @@ func TestNewBackupScheduleReporter_nilSupervisorIsANilInterface(t *testing.T) {
 		t.Fatal("the two flags were not carried through in order")
 	}
 }
+
+// The failure this whole PR must not create: an S3 permission error answered
+// with a full lock-and-read of production.
+//
+// The scheduled watcher takes a full backup whenever an update fails, on the
+// reasoning that the update produced nothing so a backup is still owed. An
+// upload failure breaks that reasoning in both halves: the update DID produce
+// a snapshot, and the full backup that would stand in has to clear the very
+// upload gate that just refused. So one throttled PutObject would cost a full
+// read of the source and publish nothing new (#1539).
+//
+// Driven at the watcher rather than through a whole scheduled slot on purpose:
+// the producer DECISION reads a seam in internal/console and the fold reads one
+// in consoleapp, so no test in either package can stub both. What has to hold
+// is one thing anyway, and it is here: the watcher must consult Published, not
+// State, and both statuses below are ones runRefresh really produces
+// (applyFoldStatus sets Published from foldPublished on both branches).
+func TestWatchScheduled_fallsBackOnlyWhenNothingWasPublished(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		last         console.BaselineStatus
+		wantFallback bool
+	}{
+		// The fold refused: nothing exists, a backup is still owed.
+		{"a refused fold", console.BaselineStatus{State: "failed", LastError: "capture gap"}, true},
+		// The fold finished and only the upload failed: the snapshot exists,
+		// and a full backup would have to clear the same gate.
+		{"only the upload failed", console.BaselineStatus{State: "failed", Published: true,
+			LastError: errSnapshotNotUploaded.Error() + ": AccessDenied"}, false},
+		{"a clean run", console.BaselineStatus{State: "succeeded", Published: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, reg, sup := newScheduleFixture(t, true)
+			e := addScheduled(t, reg, true)
+			e.SourceDSN = "not a dsn" // any fallback full backup fails fast
+			if err := reg.Update(e); err != nil {
+				t.Fatal(err)
+			}
+			// Stage the terminal status the watcher will read back, under the
+			// Since the loop recorded, which is how ScheduleState decides the
+			// job in the slot is the one it started.
+			since := "2026-08-28T09:00:05Z"
+			st := tc.last
+			st.Since = since
+			sup.mu.Lock()
+			sup.refreshes[e.ID] = &st
+			sup.mu.Unlock()
+			b.mu.Lock()
+			b.started[e.ID] = scheduledStart{method: console.BackupMethodRefresh, at: since, since: since}
+			// fallBack refuses for a schedule this loop has not observed, so
+			// the refused-fold case would take no fallback for a reason that
+			// has nothing to do with what is under test.
+			b.seen[e.ID] = seenSlot{identity: e.BackupSchedule.Identity()}
+			b.mu.Unlock()
+
+			b.watchScheduled(e, since, console.BackupMethodRefresh)
+			b.watchers.Wait()
+
+			got := b.ScheduleState(e.ID).LastFallbackAt != ""
+			if got != tc.wantFallback {
+				t.Fatalf("fallback taken = %v, want %v (status %+v)", got, tc.wantFallback, tc.last)
+			}
+		})
+	}
+}
+
+// The mirror, so the fix above cannot be "never fall back": a fold that
+// genuinely published nothing still owes a full backup.
+func TestBackupScheduler_aRefusedFoldStillFallsBack(t *testing.T) {
+	holdFold(t, func(context.Context, reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		return nil, nil, errors.New("capture gap in the reconstruction window")
+	})
+	b, reg, _ := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, true)
+	e.SourceDSN = "not a dsn" // the fallback full backup fails fast
+	if err := reg.Update(e); err != nil {
+		t.Fatal(err)
+	}
+	fireAt(b, time.Date(2026, 8, 28, 9, 0, 5, 0, time.UTC))
+	st := waitTerminalMethod(t, b, e.ID, console.BackupMethodFull)
+	if st.LastFallbackAt == "" {
+		t.Fatalf("a fold that published nothing took no fallback: %+v", st)
+	}
+}

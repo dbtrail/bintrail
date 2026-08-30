@@ -502,9 +502,11 @@ var fallbackPoll = time.Second
 // full backup that panicked (no history record, by the guard's contract)
 // is on the page even if a manual job takes the slot before anyone loads
 // it. And for an update from the recorded changes that failed, it takes a
-// full backup at the same slot (fallBack). Any failure of the update
-// qualifies, a crash included: the output is the same as a full backup's,
-// and a backup is what the operator scheduled. Nothing is started when the
+// full backup at the same slot (fallBack). Any failure that PUBLISHED
+// NOTHING qualifies, a crash included: the output is the same as a full
+// backup's, and a backup is what the operator scheduled. An update whose
+// fold finished and whose upload failed is the exception and takes no
+// fallback (see the Published check below). Nothing is started when the
 // daemon is shutting down, when the schedule was forgotten or a newer
 // scheduled slot superseded this one (logged), or when another job took the
 // supervisor slot before this job's end was seen (a recorded skip: the
@@ -542,7 +544,12 @@ func (b *backupScheduler) watchScheduled(e console.ServerEntry, stamp, method st
 		if st.Running {
 			continue
 		}
-		if method == console.BackupMethodRefresh && st.Last.State == "failed" {
+		// Published, not State: an update whose fold finished and whose UPLOAD
+		// failed already produced the snapshot a backup would have produced,
+		// and a full backup would have to clear the same upload gate that just
+		// refused it. Falling back there answers one S3 permission error with a
+		// full lock-and-read of production that publishes nothing new (#1539).
+		if method == console.BackupMethodRefresh && st.Last.State == "failed" && !st.Last.Published {
 			b.fallBack(e, st.Last.LastError)
 		}
 		return

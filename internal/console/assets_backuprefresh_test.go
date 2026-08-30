@@ -3,6 +3,7 @@ package console
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -321,6 +322,9 @@ func TestBackupScheduleCard_saysWhatARunCosts(t *testing.T) {
 		// any more, because an operator who reads it configures a nightly
 		// full read of production to get an off-box copy.
 		"a server with no local backup directory gets a **full backup**",
+		// The whole of #1539 in the docs. Without this line the page still
+		// reads as if an S3 destination meant a nightly full read.
+		"reads its previous snapshot straight from the bucket and uploads its result back to the same place",
 	} {
 		if !strings.Contains(docs, want) {
 			t.Errorf("docs/console.md does not carry the producer rule (missing %q), so the cut lost it from both places", want)
@@ -329,9 +333,30 @@ func TestBackupScheduleCard_saysWhatARunCosts(t *testing.T) {
 	// And the rule it REPLACED must be gone. Stating both would be worse than
 	// stating the old one alone: an operator has no way to tell which of two
 	// contradicting sentences describes the build they are running.
-	if strings.Contains(docs, "only a full backup uploads") {
-		t.Error("docs/console.md still says only a full backup uploads, which #1539 made false: the scheduled " +
-			"update reads the bucket and uploads its result there")
+	// And the rule it REPLACED must be gone from every page that states the
+	// producer rule, not only this one: the surviving copies were in
+	// dump-and-baseline.md, which the loop above does not read. Paraphrases
+	// count, because an operator acts on the meaning.
+	//
+	// Scoped to docs/ on purpose: CHANGELOG.md narrates the old rule as
+	// history, correctly, and a repo-wide grep would ban that too.
+	for _, page := range []string{"console.md", "dump-and-baseline.md"} {
+		body, err := os.ReadFile(filepath.Join("..", "..", "docs", page))
+		if err != nil {
+			t.Fatalf("read docs/%s: %v", page, err)
+		}
+		flat := strings.Join(strings.Fields(string(body)), " ")
+		for _, banned := range []string{
+			"only a full backup uploads",
+			"only a full backup can upload",
+			"backups that go to S3 are always full backups",
+			"backups that go to S3 are full backups",
+		} {
+			if strings.Contains(flat, banned) {
+				t.Errorf("docs/%s still says %q, which #1539 made false: the scheduled update reads the "+
+					"bucket and uploads its result there", page, banned)
+			}
+		}
 	}
 }
 

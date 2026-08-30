@@ -21,14 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result to the same destination a full backup would have written to, with the
   same crash-safe ordering (`_INCOMPLETE` first, `_SUCCESS` last), so a run
   interrupted mid-upload leaves the remote copy excluded from discovery rather
-  than half-visible and readable. A local backup directory is still required,
+  than half-visible and readable. An upload that finds no completed snapshot to
+  bracket is now refused outright rather than sending the data unmarked, which
+  is the shape that would have read as a complete backup. A local backup directory is still required,
   because the fold writes Parquet to a filesystem, and a server that has only
   an S3 destination still gets a full backup: the reason the page now shows
-  names that setting, which is the one an operator can change, instead of the
-  destination, which is not. Publishing is not counted as finished until the
+  names that setting, which is the one that unlocks the cheap path, rather than
+  the destination, which is not the thing to change. Publishing is not counted as finished until the
   upload succeeds, and a failed upload keeps the finished local snapshot and
   says the fold itself worked. The daemon-wide `--baseline-refresh-interval`
   is unchanged: it names no destination, so its snapshots stay local.
+  Two failures had to stop meaning what they used to. A failed upload does NOT
+  trigger the stand-in full backup: that fallback exists because a failed
+  update produced nothing, and here it produced a snapshot, so falling back
+  would answer one S3 permission error with a full lock-and-read of production
+  that publishes nothing new. And a previous backup that cannot be READ (a
+  throttled bucket, an expired credential) no longer costs the slot: it takes a
+  full backup, naming the real cause, because before this change those servers
+  were guaranteed one without touching the network.
   Two consequences worth knowing. Retention improves: `PruneLocal` reclaims a
   local snapshot once it can confirm its `_SUCCESS` in S3, so the snapshots a
   scheduled update publishes on an S3-backed server are now prunable, where

@@ -163,7 +163,14 @@ type BaselineStatus struct {
 	Since      string `json:"since,omitempty"`
 	FinishedAt string `json:"finished_at,omitempty"`
 	LastError  string `json:"last_error,omitempty"`
-	Tables     int    `json:"tables,omitempty"`
+	// Published: this run left a complete snapshot in the server's local
+	// directory. Normally that is just State == "succeeded", but the two
+	// diverge on one failure — the fold finished and marked the snapshot and
+	// only the upload to the backup destination failed (#1539) — and that is
+	// exactly the case where asking "did it fail?" gives the wrong answer to
+	// "is a backup still owed?".
+	Published bool `json:"published,omitempty"`
+	Tables    int  `json:"tables,omitempty"`
 	// Carried counts tables published by reusing the previous snapshot's file
 	// rather than folding them again (refresh and restore only). It is the
 	// ONLY confirmation the operator gets that the reuse setting did anything:
