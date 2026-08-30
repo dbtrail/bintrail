@@ -150,6 +150,43 @@ func TestCapacityAPI_watch(t *testing.T) {
 		}
 	})
 
+	// #1527: the card used to say "The index runs on another host or
+	// container" for every unmeasurable volume, a topology the check only
+	// inferred. The doctor now names the branch it landed on, and the route is
+	// the only way that reason reaches the card.
+	t.Run("free space not measurable: the reason travels to the card, and never moves the grade", func(t *testing.T) {
+		for _, r := range []doctor.CapacityFreeReason{
+			doctor.CapacityFreeMountUnset,
+			doctor.CapacityFreeMountUnusable,
+			doctor.CapacityFreeIndexNotLocal,
+			doctor.CapacityFreeHostUnconfirmed,
+			doctor.CapacityFreeReasonUnknown,
+		} {
+			srv := newCapacityWatchServer(t)
+			probe := capacityFixture(0, 0, false)
+			probe.FreeReason = r
+			stubCapacityProbe(srv, probe, nil)
+			got := capacityGet(t, srv)
+			if got.FreeReason != string(r) {
+				t.Errorf("free_reason = %q, want %q: the card cannot say what would make it measurable", got.FreeReason, r)
+			}
+			if got.Status != "skip" || got.Reason != "free_unknown" {
+				t.Errorf("reason %q graded %s/%s, want skip/free_unknown: this check is advisory", r, got.Status, got.Reason)
+			}
+		}
+	})
+
+	t.Run("free space measured: the card is told which path measured it", func(t *testing.T) {
+		srv := newCapacityWatchServer(t)
+		probe := capacityFixture(0, 2_000_000_000, true)
+		probe.FreeReason = doctor.CapacityFreeFromMount
+		stubCapacityProbe(srv, probe, nil)
+		got := capacityGet(t, srv)
+		if got.FreeReason != "mount" || got.Status != "pass" {
+			t.Fatalf("free_reason=%q status=%s, want mount/pass", got.FreeReason, got.Status)
+		}
+	})
+
 	t.Run("rotation off: grows without limit", func(t *testing.T) {
 		srv := newCapacityWatchServer(t)
 		srv.rotationDefaults = RotationDefaults{Retain: "off", Enabled: false}

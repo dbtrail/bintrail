@@ -3317,7 +3317,7 @@ function capacityNote(cap) {
     case "ok":
       return "Fits with room to spare: about " + humanBytes(cap.remaining_bytes) + " of growth ahead, " + humanBytes(cap.free_bytes) + " free. Rotation caps the index before the disk fills.";
     case "free_unknown":
-      return "The index runs on another host or container, so free space is not measurable from this console. Watch the index volume there and keep about 30% headroom above the steady size.";
+      return "Without free space this console cannot grade the disk. Keep about 30% headroom above the steady size on the index volume.";
     case "retention_unknown":
       return "This read-only console does not run rotation, so it cannot tell how long the index keeps history or what size it settles at. Run the check where rotation runs (CLI: bintrail doctor --retain).";
     case "not_enough_history":
@@ -3326,6 +3326,35 @@ function capacityNote(cap) {
       return "The index has no events table yet. It appears once capture starts.";
     default:
       return "";
+  }
+}
+
+// capacityFreeNote explains a free-space figure the backend could not
+// measure: which fallback the check landed on (free_reason) and what would
+// make it measurable, when that is knowable (#1527). It never says where the
+// index runs, which the check cannot know: the old copy asserted "another
+// host or container" and read as plainly false on a single-machine install
+// whose index data directory is simply not mounted into the console. The
+// index_not_local branch carries no mount fix on purpose, since a mount that
+// is not the index's would report the wrong volume's free space, and the
+// host_unconfirmed branch (a local address whose server is not confirmed to
+// be this machine, which is what a port-forward or a tunnel looks like)
+// carries the fix WITH its precondition: a local mysqld's datadir may be
+// sitting right there, and pointed at it the card would show a measured
+// number for a volume that is not the index's.
+function capacityFreeNote(cap) {
+  if (!cap || cap.free_known) return "";
+  switch (cap.free_reason) {
+    case "mount_unset":
+      return "The console cannot see the index volume from here, and no read-only copy of the index data directory is set up. To measure free space, mount that directory into the console read-only and set BINTRAIL_INDEX_DATADIR_RO to the mount point. The bundled docker-compose.yml wires both.";
+    case "mount_unusable":
+      return "BINTRAIL_INDEX_DATADIR_RO points at a path the console cannot read, so free space was not measured. Check that the index data directory is still mounted there.";
+    case "host_unconfirmed":
+      return "The index answers on a local address, but the console cannot confirm the server runs on this machine, so it cannot tell whether the index data directory is here. If it is, mount that directory into the console read-only and set BINTRAIL_INDEX_DATADIR_RO to the mount point. Point it at the index's own data directory and nothing else: any other volume would be shown as the index's free space.";
+    case "index_not_local":
+      return "The index answers at another address, so the console cannot see its volume, and measuring a disk here would report the wrong one. Watch free space where the index runs.";
+    default:
+      return "The console cannot see the index volume from here, so free space was not measured.";
   }
 }
 
@@ -3352,6 +3381,11 @@ function capacityCard(cap) {
   card.append(healthKV("state", el("span", { class: "hstat " + capacityStateClass(cap.status), text: capacityStateText(cap) })));
   const note = capacityNote(cap);
   if (note) card.append(el("div", { class: "hlist", text: note }));
+  // Unmeasurable free space is explained under every grade, not just the
+  // free_unknown one: the row above reads "not measurable from here" for a
+  // fresh index and a short history too.
+  const freeNote = capacityFreeNote(cap);
+  if (freeNote) card.append(el("div", { class: "hlist", text: freeNote }));
   return card;
 }
 

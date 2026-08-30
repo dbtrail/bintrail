@@ -120,7 +120,7 @@ func TestProjectCapacity_insufficientHistory(t *testing.T) {
 func TestCapacityVerdict_noRetention(t *testing.T) {
 	p := capacityProjection{eventsPerDay: 24000, bytesPerEvent: 1000, currentBytes: 10_000_000}
 
-	r := capacityVerdict(p, 0, 0, false)
+	r := capacityVerdict(p, 0, 0, false, CapacityFreeMountUnset)
 	if r.Status != StatusWarn {
 		t.Fatalf("status = %s, want warn for retain=0", r.Status)
 	}
@@ -133,7 +133,7 @@ func TestCapacityVerdict_noRetention(t *testing.T) {
 
 	// With free space known, the detail carries days-until-full:
 	// 24 MB/day against 240 MB free ≈ 10 days.
-	r = capacityVerdict(p, 0, 240_000_000, true)
+	r = capacityVerdict(p, 0, 240_000_000, true, CapacityFreeFromDatadir)
 	if !strings.Contains(r.Detail, "days until the volume fills") {
 		t.Errorf("detail should estimate days until full, got: %s", r.Detail)
 	}
@@ -172,7 +172,7 @@ func TestCapacityVerdict_thresholds(t *testing.T) {
 	for _, tc := range cases {
 		// Projection: 24000 events/day × 1000 B × 30d = 720 MB total.
 		p := capacityProjection{eventsPerDay: 24000, bytesPerEvent: 1000, projectedBytes: 720_000_000, currentBytes: tc.current}
-		r := capacityVerdict(p, retain, tc.free, true)
+		r := capacityVerdict(p, retain, tc.free, true, CapacityFreeFromDatadir)
 		if r.Status != tc.want {
 			t.Errorf("%s: status = %s, want %s (detail: %s)", tc.desc, r.Status, tc.want, r.Detail)
 		}
@@ -222,10 +222,11 @@ func TestDoctorReportErrExcluding(t *testing.T) {
 
 func TestCapacityVerdict_freeUnknownSkipsWithGuidance(t *testing.T) {
 	p := capacityProjection{eventsPerDay: 24000, bytesPerEvent: 1000, projectedBytes: 720_000_000}
-	r := capacityVerdict(p, 30*24*time.Hour, 0, false)
-	// #948: an unmeasurable volume (separate host/container — e.g. the compose
-	// stack) must SKIP, not PASS, so the check does not read green when its
-	// FAIL/WARN thresholds could never fire.
+	r := capacityVerdict(p, 30*24*time.Hour, 0, false, CapacityFreeMountUnset)
+	// #948: a volume this process cannot see (no read-only mount of the index
+	// datadir, as on a compose stack that predates that wiring) must SKIP, not
+	// PASS, so the check does not read green when its FAIL/WARN thresholds
+	// could never fire.
 	if r.Status != StatusSkip {
 		t.Fatalf("status = %s, want skip when free space is unknown", r.Status)
 	}
@@ -308,7 +309,7 @@ func TestIndexDatadirFreeFromEnv(t *testing.T) {
 // never loopback).
 func TestIndexDatadirFree_envShortCircuitsHostnameCheck(t *testing.T) {
 	t.Setenv("BINTRAIL_INDEX_DATADIR_RO", t.TempDir())
-	free, ok := indexDatadirFree(context.Background(), nil, "root:x@tcp(index-mysql:3306)/bintrail_index")
+	free, ok, _ := indexDatadirFree(context.Background(), nil, "root:x@tcp(index-mysql:3306)/bintrail_index")
 	if !ok {
 		t.Fatal("expected freeKnown=true via the env-var short-circuit, independent of the DSN/db")
 	}

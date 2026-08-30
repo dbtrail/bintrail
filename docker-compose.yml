@@ -373,8 +373,9 @@ services:
           # would for the `cat`-derived INDEX_DSN above. A BYO INDEX_DSN
           # (operator-supplied, unrelated MySQL) skips this branch entirely,
           # so this var stays unset for BYO — capacity.go then falls back to
-          # its loopback/hostname check and, failing that, the "not
-          # measurable" guidance PASS. Never let this var leak into the BYO
+          # its loopback/hostname check and, failing that, reports free space
+          # as not measurable (a SKIP with guidance that names what is
+          # missing, never a green PASS). Never let this var leak into the BYO
           # path: that would report a random volume's free space as if it
           # were the real index's.
           export BINTRAIL_INDEX_DATADIR_RO=/var/lib/bintrail-index-ro

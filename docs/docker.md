@@ -274,7 +274,15 @@ BYO `INDEX_DSN`. You shouldn't need to touch this; it's mentioned here so the
 mount doesn't look mysterious in `docker compose config`. If you bring your
 own index (below), the whole mechanism is inert: your `INDEX_DSN` skips the
 branch that sets the env var, and `doctor` falls back to the loopback/hostname
-check and then the "not measurable" PASS-with-guidance.
+check and then to reporting free space as not measurable (a SKIP with
+guidance, never a green PASS). That guidance names what is missing: the
+read-only mount and `BINTRAIL_INDEX_DATADIR_RO`, when your index answers
+somewhere this process can reach locally. For an index at another address it
+suggests no mount at all, since one that is not your index's would report the
+wrong volume's free space; and when the address is local but the server can't
+be confirmed to be this machine (a port-forward or a tunnel looks exactly like
+that), it says to point the variable at the index's own data directory and
+nothing else, for the same reason.
 
 On **Docker Desktop** (macOS/Windows), named volumes are typically backed by
 one shared VM disk, so the free-space number this check reports is that VM
