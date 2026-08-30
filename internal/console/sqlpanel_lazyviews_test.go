@@ -362,6 +362,14 @@ func requireDuckDBHTTPFS(t *testing.T) {
 // something if CI sets it, and a variable nobody wires in enables nothing. It
 // has to be on the step that RUNS the unit tests, not merely somewhere in the
 // file.
+//
+// EVERY such step, not one of them. The first version accumulated with an OR
+// ("some matching step sets it"), which is green the moment one does — so a
+// second `go test ./...` step added later without the variable would leave half
+// the unit surface skipping in silence while this guard still passed. Only one
+// step matches today, so that shape does not exist yet; the accumulator is
+// inverted anyway, because the version that would go blind and the version that
+// would not cost the same to write, and only one of them has to be remembered.
 func TestCIRequiresHTTPFSForTheSetupBudget(t *testing.T) {
 	const path = "../../.github/workflows/ci.yml"
 	data, err := os.ReadFile(path)
@@ -379,26 +387,28 @@ func TestCIRequiresHTTPFSForTheSetupBudget(t *testing.T) {
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		t.Fatalf("parse %s: %v", path, err)
 	}
-	var ran, required bool
-	for _, job := range doc.Jobs {
+	var ran int
+	var unguarded []string
+	for name, job := range doc.Jobs {
 		for _, step := range job.Steps {
 			// The step that runs the whole unit suite, found by what it RUNS
 			// rather than by its name: a rename must not quietly empty this.
 			if !strings.Contains(step.Run, "go test ./...") {
 				continue
 			}
-			ran = true
-			if step.Env[requireHTTPFSEnv] != "" {
-				required = true
+			ran++
+			if step.Env[requireHTTPFSEnv] == "" {
+				unguarded = append(unguarded, name)
 			}
 		}
 	}
-	if !ran {
+	if ran == 0 {
 		t.Fatalf("no step in %s runs `go test ./...`; this guard covers nothing", path)
 	}
-	if !required {
-		t.Errorf("no step running the unit suite in %s sets %s, so the setup-budget tests can "+
-			"skip in CI and leave that bound with no coverage anywhere", path, requireHTTPFSEnv)
+	if len(unguarded) > 0 {
+		t.Errorf("%d of %d steps running the unit suite in %s do not set %s (jobs: %s), so the "+
+			"setup-budget tests can skip in CI and leave that bound with no coverage there",
+			len(unguarded), ran, path, requireHTTPFSEnv, strings.Join(unguarded, ", "))
 	}
 }
 

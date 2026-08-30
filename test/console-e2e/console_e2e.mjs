@@ -752,7 +752,7 @@ try {
     const adv = none.querySelector("details.form-advanced");
     return {
       noneSummary: /No credentials set directly/.test(none.textContent),
-      keysSummary: /access keys set in an environment variable/.test(keys.textContent),
+      keysSummary: /access key ID set in an environment variable/.test(keys.textContent),
       ecsSummary: /found an ECS task role/.test(ecs.textContent),
       irsaSummary: /EKS service-account role/.test(irsa.textContent),
       sharedSummary: /shared ~\/\.aws config file/.test(shared.textContent),
@@ -763,7 +763,7 @@ try {
     };
   });
   cred.noneSummary ? ok("aws-creds: no signals renders the ambient-chain summary") : bad("aws-creds: no signals renders the ambient-chain summary", "wording missing");
-  cred.keysSummary ? ok("aws-creds: static env keys take priority in the summary") : bad("aws-creds: static env keys take priority in the summary", "wording missing");
+  cred.keysSummary ? ok("aws-creds: static env keys take priority in the summary, reported as the ID that was probed") : bad("aws-creds: static env keys take priority in the summary, reported as the ID that was probed", "wording missing");
   cred.ecsSummary ? ok("aws-creds: ECS task role reads as an IAM role, not an error") : bad("aws-creds: ECS task role reads as an IAM role, not an error", "wording missing");
   cred.irsaSummary ? ok("aws-creds: EKS IRSA reads as an IAM role, not an error") : bad("aws-creds: EKS IRSA reads as an IAM role, not an error", "wording missing");
   cred.sharedSummary ? ok("aws-creds: shared ~/.aws config/profile never reads as 'no credentials'") : bad("aws-creds: shared ~/.aws config/profile never reads as 'no credentials'", "wording missing/contradicts raw signal");

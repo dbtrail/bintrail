@@ -391,10 +391,10 @@ func TestNoLiveIndex_unavailableSaysSomethingTrue(t *testing.T) {
 // looking at a page to a command line they may not have.
 func TestNoLiveIndex_producerRouteReplacesTheFlag(t *testing.T) {
 	in := liveInput(nil)
-	in.LiveLegHowTo = `Tick "Include the live index" on the Query in DuckDB card and download again.`
+	in.LiveLegHowTo = `Tick "Include the live index" on the Download a DuckDB schema card and download again.`
 	out := Generate(in)
 
-	if !strings.Contains(out, `-- Tick "Include the live index" on the Query in DuckDB card and download again.`) {
+	if !strings.Contains(out, `-- Tick "Include the live index" on the Download a DuckDB schema card and download again.`) {
 		t.Errorf("the producer's own route is not in the file:\n%s", out)
 	}
 	if strings.Contains(out, "--include-live") {
