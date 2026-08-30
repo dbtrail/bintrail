@@ -191,6 +191,12 @@ func onImageLayer(mounts []mountEntry) (bool, bool) {
 // ephemeral reports whether a path is destroyed when the container is
 // recreated: it is on the writable layer (no mount of its own) or on memory
 // (tmpfs). Only meaningful once onImageLayer says yes.
+//
+// The match is LEXICAL, so a config directory that is a symlink into a mounted
+// volume reads as ephemeral and would be reported although it survives. That
+// cannot happen on the shipped stack, whose mount targets are absolute paths,
+// and resolving symlinks here would mean stat'ing a directory that may not
+// exist yet, which answers a different question.
 func ephemeral(path string, mounts []mountEntry) bool {
 	m, ok := coveringMount(path, mounts)
 	if !ok {
@@ -465,13 +471,16 @@ func consoleStateFinding(in driftInputs) (driftFinding, bool) {
 // consoleStateFileName reports whether a file in the config directory is
 // console state.
 //
-// The console names every file it keeps there `console-<what>.yaml`
-// (console-servers, console-auth, console-mcp-token), and that convention is
-// what this reads, so a build that keeps a console-*.yaml this package never
-// names is still recognised as state whose loss matters. Everything else in
-// that directory belongs to something other than the console (the telemetry
-// spool and consent file, a global config.env, a generated dump key) and is
-// either rebuildable or not the console's to warn about.
+// The console names every file it keeps there `console-<what>`:
+// console-servers.yaml, console-auth.yaml, console-mcp-token.yaml, plus the
+// console-verify-history.json / console-baseline-history.json pair it writes
+// beside the registry. The PREFIX is what this reads, not that list, so the
+// histories are covered without being named and so is a console-* file a build
+// this package cannot name keeps there, which is the case shape 2 exists for.
+// Everything else in that directory belongs to something other than the
+// console (the telemetry spool and consent file, a global config.env, a
+// generated dump key) and is either rebuildable or not the console's to warn
+// about.
 func consoleStateFileName(name string) bool {
 	return strings.HasPrefix(name, "console-")
 }

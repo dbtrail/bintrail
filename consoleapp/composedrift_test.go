@@ -220,11 +220,17 @@ func TestComposeDriftFindsAStaleStack(t *testing.T) {
 			t.Errorf("the report never mentions %q: %s", want, joined)
 		}
 	}
-	// Named ONCE. The token is both a state path this package resolves and a
-	// file sitting in the config directory, so the two shapes see the same
-	// file; a line that lists it twice reads like two problems.
+	// Named ONCE, and by the state-path shape. The token is both a path this
+	// package resolves and a file sitting in the config directory, so the two
+	// shapes see the same file; a line that lists it twice reads like two
+	// problems. Counting alone cannot tell WHICH shape named it (with the
+	// state-path shape gone the directory shape still yields one), so the
+	// wording that only that shape produces is asserted too.
 	if n := strings.Count(joined, "console-mcp-token.yaml"); n != 1 {
 		t.Errorf("the token file is named %d times in one line: %s", n, joined)
+	}
+	if !strings.Contains(joined, "the AI connection token (") {
+		t.Errorf("the token is not named as a resolved state path, so only the directory shape saw it: %s", joined)
 	}
 	// The two files that ARE on the volume must not be reported as lost.
 	if strings.Contains(joined, "console-auth.yaml") || strings.Contains(joined, "console-servers.yaml") {
@@ -575,10 +581,20 @@ func assertNonDestructiveFetch(t *testing.T, where, text string) {
 }
 
 // curlOutputPath returns the file a curl command line writes, or "" when it
-// writes to stdout. Three forms land a file on disk and all three count:
-// `-o NAME`, a flag cluster carrying O (`-fsSLO`, which writes the URL's own
-// basename), and a SHELL REDIRECT, which curl knows nothing about and which
-// overwrites just as completely.
+// writes to stdout. The forms it reads:
+//
+//   - `-o NAME` / `--output NAME` / `--output=NAME`
+//   - a flag cluster carrying O (`-fsSLO`), which writes the URL's basename
+//   - a cluster carrying lowercase o (`-fsSLo NAME`), which takes the next
+//     argument exactly like a bare -o
+//   - a SHELL REDIRECT (`> NAME`, `>NAME`, `>> NAME`), which curl knows
+//     nothing about and which overwrites just as completely
+//
+// NOT read, and worth saying plainly rather than implying this is complete:
+// `| tee NAME`, a numbered redirect (`1> NAME`), and anything hidden behind a
+// wrapper (`sh -c "..."`, a variable holding the filename). None of those
+// appear in the tree today; a recipe written in one of them would pass this
+// guard, so the guard is a floor, not a proof.
 func curlOutputPath(line string) string {
 	fields := strings.Fields(line)
 	for i, f := range fields {
@@ -599,14 +615,23 @@ func curlOutputPath(line string) string {
 			}
 			return ""
 		}
+		if v, ok := strings.CutPrefix(f, "--output="); ok {
+			return v
+		}
 	}
-	for _, f := range fields {
-		if strings.HasPrefix(f, "-") && !strings.HasPrefix(f, "--") && strings.Contains(f, "O") {
+	for i, f := range fields {
+		if !strings.HasPrefix(f, "-") || strings.HasPrefix(f, "--") {
+			continue
+		}
+		if strings.ContainsRune(f, 'O') {
 			for _, g := range fields {
 				if strings.HasPrefix(g, "http") {
 					return g[strings.LastIndex(g, "/")+1:]
 				}
 			}
+		}
+		if strings.ContainsRune(f, 'o') && i+1 < len(fields) {
+			return fields[i+1]
 		}
 	}
 	return ""
@@ -682,6 +707,11 @@ func TestCurlOutputPath(t *testing.T) {
 		{line: "curl -fsSL " + url + " >docker-compose.yml", want: "docker-compose.yml"},
 		{line: "curl -fsSL " + url + " >> docker-compose.yml", want: "docker-compose.yml"},
 		{line: "curl -fsSL " + url + " > docker-compose.yml.new", want: "docker-compose.yml.new"},
+		// Lowercase o inside a cluster takes the NEXT argument, the way -o
+		// does; the cluster loop used to test for capital O only.
+		{line: "curl -fsSLo docker-compose.yml " + url, want: "docker-compose.yml"},
+		{line: "curl -fsSLo docker-compose.yml.new " + url, want: "docker-compose.yml.new"},
+		{line: "curl -fsSL --output=docker-compose.yml " + url, want: "docker-compose.yml"},
 		{line: "curl -fsSL " + url, want: ""},
 	} {
 		t.Run(tc.line, func(t *testing.T) {
@@ -749,4 +779,33 @@ func TestIndexDatadirFindingConsultsTheMountTable(t *testing.T) {
 			t.Errorf("the remedy sends the operator to a path their file does not mount, with no way to get it: %v", f.attrs)
 		}
 	})
+}
+
+// TestConsoleStateFindingReportsAResolvedPathWithNoFileYet is shape 1 on its
+// own, and it needed its own test: every other case here writes the file into
+// the config directory, so shape 2 names it too and deleting shape 1 outright
+// left the suite green.
+//
+// This is the docs table's own top row, not a corner: a compose file that
+// predates the token override, on a stack where nobody has generated a token
+// yet. There is no file for shape 2 to see, and the finding still has to name
+// the token, because the loss it is about has not happened yet. Reporting only
+// what already exists would mean warning after the state is gone.
+func TestConsoleStateFindingReportsAResolvedPathWithNoFileYet(t *testing.T) {
+	in := wiredStack(t)
+	in.state[2].path = filepath.Join(in.configDir, "console-mcp-token.yaml")
+	// Deliberately NOT written. The config directory holds what a released
+	// image puts there and no console state at all.
+	if held := consoleStateInDir(in.configDir); len(held) != 0 {
+		t.Fatalf("the config directory already holds console state %v; this test is about the case where it holds none", held)
+	}
+
+	got := composeDriftFindings(in)
+	if len(got) != 1 {
+		t.Fatalf("want exactly the console-state finding, got %d: %v", len(got), got)
+	}
+	attrs := fmt.Sprint(got[0].attrs)
+	if !strings.Contains(attrs, "the AI connection token") || !strings.Contains(attrs, "console-mcp-token.yaml") {
+		t.Errorf("the finding does not name the state path that will not survive: %s", attrs)
+	}
 }

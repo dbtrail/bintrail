@@ -5408,7 +5408,7 @@ function verifyRegions(servers, opts) {
       el("div", { class: "stg-empty" },
         el("p", { class: "stg-empty-lead", text: "Verification from the console is turned off." }),
         el("p", { class: "stg-empty-sub", text:
-          "Ask whoever manages this server to turn it on (set BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 and restart). Already on the default setup? Re-download docker-compose.yml, because \"docker compose pull\" alone does not add new settings to a file you already have." })));
+          "Ask whoever manages this server to turn it on (set BINTRAIL_CONSOLE_VERIFY_TRIGGER=1 and restart). Already on the default setup? Take the current docker-compose.yml beside yours and merge your edits in, because \"docker compose pull\" alone does not add new settings to a file you already have." })));
     return [card];
   }
   if (!cur || !cur.id) {

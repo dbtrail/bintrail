@@ -24,11 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capacity check itself applies so the two can never contradict each other.
   The second fires when console state files this daemon will open are on the
   container's writable layer while others are on a volume, or when the console
-  settings folder is on the writable layer and something has written to it.
-  Everything is gated on the process observing that its own root filesystem is
-  a container image layer, so a bare-metal daemon, a machine with no mount
-  table to read, and a bring-your-own index are all silent. No card in the UI,
-  no timer, no repeat.
+  settings folder is on the writable layer and holds console state. Everything
+  is gated on the process observing that its own root filesystem is a
+  container image layer, so a bare-metal daemon and a machine with no mount
+  table to read are both silent. A bring-your-own index silences the
+  disk-space finding specifically, by the same rule the capacity check
+  follows; the console-state finding does not depend on which index is in
+  use. No card in the UI, no timer, no repeat.
 - **`docker-compose.yml` carries a version** (#1529). A new
   `x-bintrail-compose-version` key at the top of the file, passed to the
   console service, so a newer daemon can say a file is behind and name what is

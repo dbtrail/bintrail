@@ -629,8 +629,8 @@ a **SQL** item in the sidebar for any server that has an archive or baseline
 layout to query. To hide it, set `BINTRAIL_CONSOLE_SQL_PANEL=0`. It hides on
 anything that is not a clear yes: `0` and `false` turn it off, and so does a
 value the daemon cannot read either way (`off`, `no`, a typo), which is logged
-with the values that work. Only an unset variable or a clear true leaves the
-page on, so a mistyped opt-out can never leave it open.
+with the values that work. Only an unset or empty variable, or a clear true,
+leaves the page on, so a mistyped opt-out can never leave it open.
 
 The SQL runs server-side, so the page keeps every guard below: it sits behind
 console sign-in like the rest of the console, it is refused outright while an

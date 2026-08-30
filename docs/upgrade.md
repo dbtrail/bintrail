@@ -176,9 +176,11 @@ ticker/shutdown interval, so a clean stop-upgrade-restart loses nothing:
    checkpoint automatically — no `--start-file`/`--start-gtid` needed on a
    resume, only on a true first run.
 
-For the compose stack this is just `docker compose pull && docker compose up
--d` (Compose stops-and-recreates the container, preserving the mounted
-volumes the checkpoint lives in).
+For the compose stack this is `docker compose pull && docker compose up -d`
+(Compose stops-and-recreates the container, preserving the mounted volumes the
+checkpoint lives in), plus the compose-file step in
+[section 3](#3-docker-compose-the-bundled-default) if you have not taken it
+yet.
 
 ## 8. Downgrading
 
