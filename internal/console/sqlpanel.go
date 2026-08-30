@@ -705,6 +705,22 @@ func walkRefs(node any, refs *statementRefs) {
 			}
 			refs.tables[strings.ToLower(name)] = true
 		}
+		// A catalog LISTING (`SHOW TABLES`, `SHOW ALL TABLES`) is a SHOW_REF
+		// with no nested query. It names no relation because it is asking for
+		// the list of them, so there is nothing here to select on, and answering
+		// it out of a catalog built for some other statement returns zero rows
+		// with NO error — the one failure shape worse than a missing view. It is
+		// also how an operator finds the state_* names, which are derived and
+		// suffixed on a collision and are not written anywhere else. Unreadable,
+		// therefore, in exactly the sense this flag means: build everything and
+		// let it list what is really there.
+		//
+		// `DESCRIBE x`, `SUMMARIZE x` and `SHOW x` are the same node WITH a
+		// query, whose BASE_TABLE this walk already finds, so they stay selective.
+		if v["type"] == "SHOW_REF" && v["query"] == nil {
+			refs.readable = false
+			return
+		}
 		// A WITH clause is serialized as {"cte_map":{"map":[{"key":"q",...}]}}.
 		// The key is the name the body of the statement refers to.
 		if cm, ok := v["cte_map"].(map[string]any); ok {

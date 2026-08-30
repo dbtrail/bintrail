@@ -183,6 +183,13 @@ func TestSQLPanel_wantedViews(t *testing.T) {
 		{name: "a positional join", stmt: "SELECT * FROM events POSITIONAL JOIN state_shop_orders",
 			want: []string{"events", "state_shop_orders"}},
 		{name: "a quoted identifier", stmt: `SELECT * FROM "events"`, want: []string{"events"}},
+		// Catalog listings name no relation, so they need the whole catalog.
+		{name: "a catalog listing", stmt: "SHOW TABLES", all: true},
+		{name: "a catalog listing, all databases", stmt: "SHOW ALL TABLES", all: true},
+		{name: "a catalog listing in a subquery", stmt: "SELECT * FROM (SHOW TABLES)", all: true},
+		// The same node WITH a query keeps naming its relation.
+		{name: "DESCRIBE a view", stmt: "DESCRIBE events", want: []string{"events"}},
+		{name: "SUMMARIZE a view", stmt: "SUMMARIZE state_shop_orders", want: []string{"state_shop_orders"}},
 		// An unknown relation takes the whole catalog: see the suggestion guard.
 		{name: "a relation this layout does not define", stmt: "SELECT * FROM stat_shop_orders", all: true},
 	} {
@@ -351,5 +358,37 @@ func TestSQLPanel_parseSessionReadsNothing(t *testing.T) {
 	}
 	if !strings.Contains(out, "SELECT_NODE") {
 		t.Fatalf("classification returned %q", out)
+	}
+}
+
+// TestSQLPanel_catalogListingListsTheViews is the discovery path, and the one
+// place a lazily built catalog could answer with silence instead of an error:
+// `SHOW TABLES` names no relation, so a session built from "what this statement
+// names" would hold nothing and the listing would come back empty and
+// successful. It is also how an operator learns the state_* names, which are
+// derived from the table names and suffixed when two of them collide, so this
+// is not a corner: it is the first thing to type into an empty query box.
+func TestSQLPanel_catalogListingListsTheViews(t *testing.T) {
+	archiveRoot := t.TempDir()
+	const id = "11111111-2222-3333-4444-555555555555"
+	writeSQLPanelArchive(t, archiveRoot, id)
+	baselineRoot, baselinePath := writeSQLPanelBaseline(t)
+	in := panelInput([]string{filepath.Join(archiveRoot, "bintrail_id="+id)}, baselineRoot, baselinePath)
+
+	for _, stmt := range []string{"SHOW TABLES", "SHOW ALL TABLES", "SELECT * FROM (SHOW TABLES)"} {
+		t.Run(stmt, func(t *testing.T) {
+			res, err := runSandboxedSQL(context.Background(), in, stmt, time.Now())
+			if err != nil {
+				t.Fatalf("%s: %v", stmt, err)
+			}
+			listed := fmt.Sprint(res.Rows)
+			for _, want := range []string{"events", "state_shop_orders"} {
+				if !strings.Contains(listed, want) {
+					t.Fatalf("%s returned %d rows and did not list %q: a catalog listing answered "+
+						"out of a catalog built for someone else's statement, with no error to read. Got %s",
+						stmt, res.RowCount, want, listed)
+				}
+			}
+		})
 	}
 }
