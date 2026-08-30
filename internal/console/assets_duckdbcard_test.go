@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// The Query in DuckDB card is the only caller of GET /api/views.sql, so the
+// The Download a DuckDB schema card is the only caller of GET /api/views.sql, so the
 // include_live parameter the handler grew (#1480) reaches the operator only if
 // this card sends it. The server-side tests all pass with a card that has no
 // checkbox at all.

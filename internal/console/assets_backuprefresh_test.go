@@ -241,11 +241,9 @@ func TestBackupRefreshCard_prose(t *testing.T) {
 	if strings.Contains(body, "—") {
 		t.Error("backupRefreshCard copy contains an em dash")
 	}
-	docs, err := os.ReadFile("../../docs/console.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(docs), "share the same bytes on disk") {
+	// docsNoWrap: the first version of this read the file raw and went red
+	// because the sentence wrapped between two lines.
+	if !strings.Contains(docsNoWrap(t), "share the same bytes on disk") {
 		t.Error("docs/console.md does not carry the shared-bytes consequence, so removing it from the card lost it")
 	}
 }
@@ -262,5 +260,137 @@ func TestBackupScheduleCard_introIsNotAnEssay(t *testing.T) {
 	// The specific half must survive the cut.
 	if !strings.Contains(body, "will update the latest backup from the recorded changes") {
 		t.Fatal("the per-run producer line is gone, so nothing says how the next run will be made")
+	}
+}
+
+// docsNoWrap returns docs/console.md with every whitespace run collapsed to one
+// space, so a needle cannot fail merely because the sentence wrapped between
+// two lines. The first version of the guard below broke exactly that way.
+func docsNoWrap(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("../../docs/console.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Join(strings.Fields(string(b)), " ")
+}
+
+// TestBackupScheduleCard_saysWhatARunCosts (#1528, review pass 1). Cutting the
+// intro paragraph went one clause too far.
+//
+// With NO schedule saved yet, every per-run line lives inside `if (sch)` and
+// renders nothing, so the only thing describing a run was the rate line: "each
+// a full copy of every table". True of the OUTPUT and misleading about the
+// INPUT, because when a previous local backup exists the run reads the recorded
+// changes and never touches the database. An operator typing 30m into an empty
+// form was systematically overestimating what they were about to switch on.
+//
+// So the clause has to sit on the UNCONDITIONAL intro, above the canEdit
+// branch, and the full producer rule has to be in the docs. Both halves are
+// asserted: the reuse cut is pinned on the docs side too, and an unpinned half
+// is what lets a later edit delete the explanation from both places.
+func TestBackupScheduleCard_saysWhatARunCosts(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "backupScheduleCard")
+
+	const clause = "When it can, a run is built from the recorded changes"
+	i := strings.Index(body, clause)
+	if i < 0 {
+		t.Fatalf("the intro does not say a run is usually built from the recorded changes, so an empty "+
+			"form describes every run as a full copy read from the database:\n%s", body)
+	}
+	// Unconditional: above the canEdit branch, and therefore above every
+	// `if (sch)` line, so it renders on a page with no schedule saved.
+	gate := strings.Index(body, "if (!canEdit)")
+	if gate < 0 {
+		t.Fatal("the canEdit branch is gone; this guard can no longer tell an unconditional line from a gated one")
+	}
+	if i > gate {
+		t.Error("the clause is below the canEdit branch, so the state it exists for (no schedule yet) does not show it")
+	}
+	if !strings.Contains(body[i:min(len(body), i+220)], "your database") {
+		t.Error("the clause does not say what is spared, which is the whole point of stating it")
+	}
+	// The full rule (which producer runs when, and why) is docs work, and it
+	// has to actually be there.
+	docs := docsNoWrap(t)
+	for _, want := range []string{
+		"otherwise the newest backup is **updated from the recorded changes**",
+		"only a full backup uploads)",
+	} {
+		if !strings.Contains(docs, want) {
+			t.Errorf("docs/console.md does not carry the producer rule (missing %q), so the cut lost it from both places", want)
+		}
+	}
+}
+
+// TestCredentialsCard_sharedConfigIsPresenceNotUse (#1528, review pass 1).
+//
+// hasSharedAWSConfig is FILE PRESENCE only (storage_api.go), and this arm sits
+// after the env-key, ECS and IRSA arms. An EC2 box with an instance role and a
+// region-only ~/.aws/config, which is what `aws configure set region` writes,
+// sets none of the first three and lands here. Asserting "Using credentials
+// from a shared ~/.aws config file" there is simply false, and the card's job
+// is to answer whether this daemon can reach S3 at all.
+//
+// The note removed earlier in this PR did not cover it either: it read "an IAM
+// role can still be active even if none of the signals above show as set", and
+// in this arm a signal IS shown as set. The arm itself has to be hedged.
+func TestCredentialsCard_sharedConfigIsPresenceNotUse(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "credentialsCard")
+
+	if strings.Contains(body, "Using credentials from a shared") {
+		t.Error("the shared-config arm still asserts the file is what signs the requests; the daemon only " +
+			"observed that the file exists, and an instance role may be doing the work")
+	}
+	// The e2e photographs this arm by that phrase; it must survive any rewording.
+	i := strings.Index(body, "shared ~/.aws config file")
+	if i < 0 {
+		t.Fatal("the shared-config arm no longer names the file, so nothing distinguishes it from the no-signals arm")
+	}
+	arm := body[max(0, i-200):min(len(body), i+260)]
+	if !strings.Contains(arm, "IAM role") {
+		t.Errorf("the shared-config arm does not say an IAM role can still be what signs the requests:\n%s", arm)
+	}
+}
+
+// TestCredentialsCard_noEmDashPlaceholders: the console's copy rule is plain
+// words and no em dashes. kvRow's own empty fallback is a shared helper, but
+// these two call sites pass the character in themselves.
+func TestCredentialsCard_noEmDashPlaceholders(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "credentialsCard")
+	if strings.Contains(body, "—") {
+		t.Error("credentialsCard passes an em dash as a placeholder; say \"not set\", like the row above it")
+	}
+}
+
+// TestDuckDBCard_titleDoesNotPromiseAQuery (#1528, review pass 1). The card
+// hands the operator a file that explicitly does NOT run here; /sql is the page
+// that runs DuckDB server-side. Two surfaces named for querying, one of which
+// only downloads, is the same defect as the backup-refresh title.
+//
+// The card is NOT merged into /sql: the two are gated by different capabilities
+// (views vs sql), so on a daemon with views on and sql off the card would
+// become unreachable. Rename only.
+//
+// The second half is the cross-file pin: the generated views.sql tells a reader
+// which control to tick, by NAME. Renaming either side alone points that file
+// at a card that does not exist.
+func TestDuckDBCard_titleDoesNotPromiseAQuery(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "duckdbCard")
+	m := regexp.MustCompile(`card-title", text: "([^"]*)"`).FindStringSubmatch(body)
+	if m == nil {
+		t.Fatal("duckdbCard renders no card title; this guard covers nothing")
+	}
+	title := m[1]
+	if strings.Contains(title, "Query in") {
+		t.Errorf("the card title %q promises a query that happens somewhere else; it downloads a schema file", title)
+	}
+	if !strings.Contains(title, "Download") {
+		t.Errorf("the card title %q does not name what the control does (download a file)", title)
+	}
+	if !strings.Contains(liveLegHowTo, title) {
+		t.Errorf("the generated views.sql points a reader at %q, which is not this card's title (%q); "+
+			"renaming one side alone sends them looking for a control that does not exist",
+			liveLegHowTo, title)
 	}
 }

@@ -26,9 +26,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gains the card's own entry. The Storage cards are reordered so what the daemon
   does with your data comes first and usage telemetry, which is about neither
   storage nor this page, comes last. Smaller cuts to the same rule on the AWS
-  credentials, Staged downloads, Query in DuckDB and telemetry sample cards.
-  No setting, route, API, permission or capability gate changes; 193 words leave
+  credentials, Staged downloads and telemetry sample cards. The **Query in
+  DuckDB** card is now **Download a DuckDB schema**: no query runs there, the
+  file it hands you runs in your own DuckDB, and the page that does run DuckDB
+  server-side is the SQL panel. The two are not merged, because they are gated
+  by different capabilities (`views` vs `sql`) and merging would make the
+  download unreachable on a daemon with one on and the other off. The generated
+  `views.sql` names the card by title, so both sides moved together.
+  No setting, route, API, permission or capability gate changes; 148 words leave
   the screen. Storage is still a drawer, and the split is proposed on the issue.
+
+### Fixed
+- **Console: the AWS credentials card no longer claims a shared `~/.aws` file is
+  what signs S3 requests** (#1528). `hasSharedAWSConfig` reports file PRESENCE,
+  and its arm sits below the env-key, ECS and IRSA arms, so an EC2 host with an
+  instance role and a region-only `~/.aws/config` (what `aws configure set
+  region` writes) landed on "Using credentials from a shared ~/.aws config
+  file", which was false exactly there. The arm now reports what was observed,
+  that the file exists and may hold credentials or only a region, and says an
+  IAM role on the machine can still be what signs the requests. The card's
+  question is whether this daemon can reach S3 at all, so a confident wrong
+  answer was worse than a hedged right one. The **Scheduled backups** fold
+  regains, on its unconditional intro line, the clause saying a run is built
+  from the recorded changes and does not read your database: with no schedule
+  saved yet every per-run line is gated behind a saved schedule, leaving "each a
+  full copy of every table" (true of what a run writes) as the only description
+  of what a run costs. The **Staged downloads** empty state says again that a
+  build is removed, rather than implying it.
 
 ## [0.72.0] - 2026-08-30
 

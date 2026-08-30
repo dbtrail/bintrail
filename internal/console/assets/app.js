@@ -4023,13 +4023,18 @@ function credentialsCard(storage) {
   if (aws.access_key_env) summary = "Using access keys set in an environment variable.";
   else if (aws.container_creds) summary = "Using an IAM role (found an ECS task role).";
   else if (aws.web_identity) summary = "Using an IAM role (found an EKS service-account role).";
-  else if (aws.shared_config || aws.profile) summary = "Using credentials from a shared ~/.aws config file.";
+  // Presence, not use. hasSharedAWSConfig() stats the file and nothing more,
+  // and this arm sits below the env-key, ECS and IRSA ones, so an EC2 box with
+  // an instance role and a region-only ~/.aws/config (what `aws configure set
+  // region` writes) lands here with no credentials in that file at all.
+  // Claiming the file signs the requests is false exactly there.
+  else if (aws.shared_config || aws.profile) summary = "Found a shared ~/.aws config file, which may hold credentials or only a region. An IAM role on this machine can still be what signs the requests.";
   card.append(el("p", { class: "stg-hint", text: summary }));
   const adv = el("details", { class: "form-advanced" },
     el("summary", { class: "form-adv-summary", text: "Raw signals" }));
   kvRow(adv, "access keys (env)", aws.access_key_env ? "set" : "not set");
-  kvRow(adv, "profile (env)", aws.profile || "—");
-  kvRow(adv, "region (env)", aws.region_env || "—");
+  kvRow(adv, "profile (env)", aws.profile || "not set");
+  kvRow(adv, "region (env)", aws.region_env || "not set");
   kvRow(adv, "~/.aws config", aws.shared_config ? "present" : "absent");
   if (aws.container_creds) kvRow(adv, "ECS task role", "detected");
   if (aws.web_identity) kvRow(adv, "EKS IRSA", "detected");
@@ -4051,7 +4056,7 @@ function stagingCard(storage, servers) {
   if (!builds.length) {
     card.append(el("p", { class: "stg-hint", text:
       "Nothing staged. A .sql backup from the Backups page waits here until it is downloaded, or " +
-      hours + " hours pass." }));
+      hours + " hours pass, then it is removed." }));
   } else {
     card.append(el("p", { class: "stg-hint", text:
       humanBytes(stg.bytes || 0) + " on this machine in " + builds.length + (builds.length === 1 ? " build" : " builds") +
@@ -4080,8 +4085,17 @@ function stagingCard(storage, servers) {
 // layout. The console does not run the SQL and gains no query engine: the file
 // is executed by the operator's own DuckDB, on their machine, which is why
 // "unrestricted SQL over your lake" needs no sandbox, timeout or result cap here.
+//
+// It was titled "Query in DuckDB" (#1528). No query happens here, and /sql is
+// the page that DOES run DuckDB, server-side. The two are NOT merged: they are
+// gated by different capabilities (views vs sql), so on a daemon with views on
+// and sql off the merge would make this card unreachable. Rename only.
+//
+// The title is load-bearing beyond this card: liveLegHowTo (views_live.go)
+// names it inside the generated views.sql, so the two are pinned together by a
+// guard.
 function duckdbCard() {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Query in DuckDB" }));
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Download a DuckDB schema" }));
   card.append(el("p", { class: "form-hint", text:
     "Download a ready-made schema over your archived Parquet: an events view across every archive source, " +
     "plus one view per table in the newest backup. Run it in your own DuckDB; nothing runs here." }));
@@ -5009,11 +5023,19 @@ function backupScheduleCard(cur, b) {
     summary.textContent = line;
   }
 
-  // One line, not a lecture (#1528). How each run is made was explained here
-  // in general, directly above the line that names it for the NEXT run
-  // specifically; the general half is docs/console.md's job.
+  // Two lines, not a lecture (#1528). The general explanation of the producer
+  // choice sat directly above the line that names it for the NEXT run, so the
+  // rule itself is docs/console.md's job now.
+  //
+  // The COST clause stays here, though, and the first cut took it away with
+  // the rest: with no schedule saved every per-run line is inside `if (sch)`
+  // and renders nothing, leaving the rate line ("each a full copy of every
+  // table", true of the output) as the only description of a run. An operator
+  // filling in an empty form would read that as a full read of the database
+  // every time.
   body.append(el("p", { class: "form-hint", text:
-    "Takes a backup on a fixed timetable while the daemon runs. A time missed while it was stopped is not made up." }));
+    "Takes a backup on a fixed timetable while the daemon runs. When it can, a run is built from the recorded changes and does not read your database. " +
+    "A time missed while it was stopped is not made up." }));
 
   if (!canEdit) {
     // The read-only console, or a daemon with every backup feature off:

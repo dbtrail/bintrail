@@ -34,7 +34,7 @@ import (
 // liveLegHowTo is the archives-only note's remediation for a reader who
 // downloaded the file from this page. It replaces the CLI flag the generator
 // would otherwise name (views.Input.LiveLegHowTo).
-const liveLegHowTo = `Add a leg over the live index by ticking "Include the live index" on the Query in DuckDB card, then downloading again.`
+const liveLegHowTo = `Add a leg over the live index by ticking "Include the live index" on the Download a DuckDB schema card, then downloading again.`
 
 // liveLegConfigError is a live leg this server cannot carry however it is
 // asked for: no open connection, or an index DSN that names no reachable

@@ -529,7 +529,7 @@ compact baseline summary card and links onward:
   could not be removed stays listed with the reason (a previous build a
   newer one could not clear included) and is retried every minute. Shown
   only on a daemon that can build `.sql` backups.
-- **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
+- **Download a DuckDB schema** (#1528, formerly *Query in DuckDB*) — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one
   `state_<schema>_<table>` view per table in the newest baseline snapshot. It
@@ -630,7 +630,7 @@ console cannot create tables on an index.
 
 ### The SQL panel (opt-in)
 
-The **Query in DuckDB** card above hands you a file to run in your *own* DuckDB.
+The **Download a DuckDB schema** card above hands you a file to run in your *own* DuckDB.
 The **SQL panel** is the other half of that trade: a query box that runs the SQL
 **inside the console daemon** and returns the rows, so you never leave the
 browser. Because that SQL now executes server-side, it is **off by default** and
