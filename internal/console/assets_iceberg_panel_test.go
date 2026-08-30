@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.yaml.in/yaml/v2"
 )
 
 // The Iceberg panel on the Backups page (#1466) is rendered entirely in the
@@ -69,6 +71,20 @@ func TestIcebergExportPanel(t *testing.T) {
 	if !strings.Contains(panel, "nothing else about the connection") {
 		t.Error("the panel does not say that connection settings are not carried into the command")
 	}
+	// The compose note is in the VISIBLE body, above the collapsed block: the
+	// Docker route can export a different dataset than the command printed
+	// here, and it does that successfully.
+	bodyHalf, fineHalf, split := strings.Cut(panel, `cnFine("How to run it"`)
+	if !split {
+		t.Fatal("the panel no longer has a How to run it block; this guard reads the split")
+	}
+	if !strings.Contains(bodyHalf, "icebergComposeNote(cur)") {
+		if strings.Contains(fineHalf, "icebergComposeNote(cur)") {
+			t.Error("the compose note is inside the collapsed block; a reader who never opens it can export the wrong dataset")
+		} else {
+			t.Error("the panel never renders the compose note, so nothing says the Docker route may export a different dataset")
+		}
+	}
 	if !strings.Contains(panel, "copyText(cmd") {
 		t.Error("the command cannot be copied, which is the whole point of printing it")
 	}
@@ -119,12 +135,23 @@ func TestIcebergExportPanelCallsNoAPI(t *testing.T) {
 //
 // It runs the REAL source sliced out of app.js (the renderer plus the shell
 // quoter it calls), so a change to either is what this sees.
+// requireNodeEnv turns this test's node skip into a failure. Set in the CI
+// unit-test step (asserted by TestCIRequiresNodeForTheRenderedCommand below).
+const requireNodeEnv = "BINTRAIL_REQUIRE_NODE"
+
 func TestIcebergExportCommandRendersRunnableLines(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
-		// Present on the CI runners and on any machine set up for the
-		// Playwright suite. Named rather than silent: without node the
-		// behaviour below is covered by nothing.
+		// This is the ONLY executing coverage of icebergExportCommand, and it
+		// runs today because the CI runner happens to ship node. That is not
+		// a guarantee: the same treatment as the DuckDB/Iceberg leg, whose
+		// CI step sets BINTRAIL_REQUIRE_DUCKDB_ICEBERG so it can never
+		// silently skip there. With the variable set, a missing node is a
+		// FAILURE; elsewhere it is a named skip.
+		if os.Getenv(requireNodeEnv) != "" {
+			t.Fatalf("%s is set and node is not on PATH: this is the only test that RUNS "+
+				"icebergExportCommand, and skipping it here would leave the rendered command uncovered", requireNodeEnv)
+		}
 		t.Skip("node is not installed; the rendered-command cases are not covered on this machine")
 	}
 	raw, err := os.ReadFile("assets/app.js")
@@ -133,9 +160,12 @@ func TestIcebergExportCommandRendersRunnableLines(t *testing.T) {
 	}
 	js := string(raw)
 	script := functionBody(t, js, "function shellWord(") + "\n" +
-		functionBody(t, js, "function icebergExportCommand(") + `
+		functionBody(t, js, "function icebergExportCommand(") + "\n" +
+		functionBody(t, js, "function icebergComposeNote(") + `
 const cases = JSON.parse(process.argv[2]);
-console.log(JSON.stringify(cases.map((c) => icebergExportCommand(c.server, c.baselines))));
+console.log(JSON.stringify(cases.map((c) => (
+  c.note ? icebergComposeNote(c.server) : icebergExportCommand(c.server, c.baselines)
+))));
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "case.js")
@@ -152,6 +182,7 @@ console.log(JSON.stringify(cases.map((c) => icebergExportCommand(c.server, c.bas
 		want     []string // substrings that must be present
 		absent   []string
 		null     bool
+		note     bool // render icebergComposeNote instead of the command
 	}
 	cases := []tc{
 		{
@@ -187,10 +218,34 @@ console.log(JSON.stringify(cases.map((c) => icebergExportCommand(c.server, c.bas
 			absent:   []string{`--index-dsn re`},
 		},
 		{
+			// The one character shellWord exists for. A name holding a single
+			// quote has to close the quoting, escape the quote and reopen it
+			// ('\''), or everything after it is outside the quotes.
+			name:     "a single quote in a name",
+			server:   map[string]any{"host": "db.internal", "port": "3306", "user": "reader", "dbname": "idx'or'1", "has_password": true},
+			baseline: local,
+			want:     []string{`'reader:***@tcp(db.internal:3306)/idx'\''or'\''1'`},
+		},
+		{
 			name: "s3 destination", server: tcp,
 			baseline: map[string]any{"source": "s3://bkt/baselines/", "kind": "s3"},
 			want:     []string{"--baseline-s3 's3://bkt/baselines/'"},
 			absent:   []string{"--baseline-dir"},
+		},
+		{
+			// The Docker route exports the STACK's index and backups. For a
+			// registry server that is a different dataset, exported
+			// successfully and with nothing to see, which is why the note is
+			// in the visible body rather than the collapsed block.
+			name: "compose note for a registry server", note: true,
+			server: map[string]any{"kind": "registry", "host": "db.internal", "port": "3306", "dbname": "idx"},
+			want:   []string{"not the server picked here", "at this server", "INDEX_DSN", "BASELINE_S3"},
+		},
+		{
+			name: "compose note for the stack's own index", note: true,
+			server: map[string]any{"kind": "ephemeral", "host": "index-mysql", "port": "3306", "dbname": "bintrail_index"},
+			want:   []string{"this stack's own index", "somewhere else", "INDEX_DSN", "BASELINE_DIR"},
+			absent: []string{"not the server picked here"},
 		},
 		{name: "no destination", server: tcp, baseline: map[string]any{}, null: true},
 		{name: "no server", server: nil, baseline: local, null: true},
@@ -198,7 +253,7 @@ console.log(JSON.stringify(cases.map((c) => icebergExportCommand(c.server, c.bas
 
 	payload := make([]map[string]any, len(cases))
 	for i, c := range cases {
-		payload[i] = map[string]any{"server": c.server, "baselines": c.baseline}
+		payload[i] = map[string]any{"server": c.server, "baselines": c.baseline, "note": c.note}
 	}
 	arg, err := json.Marshal(payload)
 	if err != nil {
@@ -256,5 +311,50 @@ func TestCopyTextHandlesAnInsecureContext(t *testing.T) {
 	}
 	if !strings.Contains(body, "toastError") {
 		t.Error("copyText fails silently when it cannot copy; the operator has to be told")
+	}
+}
+
+// TestCIRequiresNodeForTheRenderedCommand: the variable above only means
+// something if CI sets it, and a variable nobody wires in enables nothing. It
+// has to be on the step that RUNS the unit tests, not merely somewhere in the
+// file.
+func TestCIRequiresNodeForTheRenderedCommand(t *testing.T) {
+	const path = "../../.github/workflows/ci.yml"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var doc struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Name string            `yaml:"name"`
+				Run  string            `yaml:"run"`
+				Env  map[string]string `yaml:"env"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	var ran, required bool
+	for _, job := range doc.Jobs {
+		for _, step := range job.Steps {
+			// The step that runs the whole unit suite, found by what it RUNS
+			// rather than by its name: a rename must not quietly empty this.
+			if !strings.Contains(step.Run, "go test ./...") {
+				continue
+			}
+			ran = true
+			if step.Env[requireNodeEnv] != "" {
+				required = true
+			}
+		}
+	}
+	if !ran {
+		t.Fatalf("no step in %s runs `go test ./...`; this guard covers nothing", path)
+	}
+	if !required {
+		t.Errorf("no step running the unit suite in %s sets %s, so the rendered-command test can skip in CI "+
+			"and leave icebergExportCommand with no executing coverage", path, requireNodeEnv)
 	}
 }

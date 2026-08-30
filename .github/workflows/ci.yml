@@ -104,8 +104,15 @@ jobs:
         # their tables back with DuckDB's iceberg extension, which the
         # embedded engine installs from the network on first use. Required
         # here so that leg never silently skips in CI.
+        #
+        # BINTRAIL_REQUIRE_NODE=1: one console test EXECUTES the JavaScript
+        # that renders the Iceberg export command, under node. It is the only
+        # coverage that runs that renderer rather than matching strings over
+        # it, and node is here only because the runner image ships it, so
+        # require it explicitly instead of skipping on its absence.
         env:
           BINTRAIL_REQUIRE_DUCKDB_ICEBERG: "1"
+          BINTRAIL_REQUIRE_NODE: "1"
         run: go test ./... -race -count=1
 
   integration:

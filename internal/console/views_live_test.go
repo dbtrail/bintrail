@@ -395,3 +395,37 @@ func TestViewsAPI_includeLiveRejectsAnUnknownValue(t *testing.T) {
 		}
 	}
 }
+
+// TestViewsAPI_includeLiveRefusesAnAddressWithNoHost: ":3306" parses, and the
+// driver reads the empty host as localhost on its own machine. The FILE cannot
+// do that: it would carry HOST ” to a reader who is somewhere else, and the
+// generator's loopback warning does not recognize "" as a local address, so
+// nothing anywhere would say the address is unusable.
+func TestViewsAPI_includeLiveRefusesAnAddressWithNoHost(t *testing.T) {
+	srv, mock := newLiveViewsServer(t, "reader:hunter2@tcp(:3306)/idx")
+	expectArchiveSource(mock, "aaaa")
+	expectArchiveSource(mock, "aaaa")
+
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	if rec.Code != 422 {
+		t.Fatalf("code = %d, body = %s; want 422", rec.Code, body)
+	}
+	if !strings.Contains(string(body), "no host") {
+		t.Errorf("the refusal does not say what is missing: %s", body)
+	}
+
+	// And the archives-only file for that server offers no route, exactly as
+	// it does for a socket: the checkbox would refuse.
+	rec, body = doServersReq(t, srv, "GET", "/api/views.sql", "")
+	if rec.Code != 200 {
+		t.Fatalf("plain download: code = %d, body = %s", rec.Code, body)
+	}
+	if strings.Contains(string(body), `ticking "Include the live index"`) {
+		t.Errorf("the file offers a route this server cannot take:\n%s", body)
+	}
+	// Positive evidence that the file did not simply render the leg with an
+	// empty host somewhere else in it.
+	if strings.Contains(string(body), "HOST ''") {
+		t.Errorf("the file names an empty index host:\n%s", body)
+	}
+}

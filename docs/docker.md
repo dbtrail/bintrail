@@ -499,7 +499,12 @@ Notes:
   is an **output**, not a system of record: it is rebuilt from the index and
   the baselines, so losing it costs a re-export and nothing else.
 - The index DSN is the bundled one unless you set `INDEX_DSN`, exactly like
-  the other services.
+  the other services. That is worth knowing next to the console's **Keep it
+  current with Iceberg** panel: this profile always runs against the stack's
+  own index and backups, so if the server you picked there is a different one
+  (its own `baseline_s3`, say), set `INDEX_DSN` and `BASELINE_DIR` /
+  `BASELINE_S3` here to match, or run the command the panel prints instead.
+  Without that, the run succeeds and exports the wrong tables.
 - Set `ICEBERG_TABLES` to a comma-separated `schema.table` list to export only
   some tables (default: every table in the newest snapshot).
 - A run that dies before committing leaves the previous copy in place and

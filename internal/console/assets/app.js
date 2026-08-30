@@ -4483,8 +4483,14 @@ function icebergExportCommand(cur, baselines) {
   // one by the time the server describes it, so an empty port means the
   // console reaches its index over a path, which names only its own machine
   // and cannot go in this command. Defaulting to 3306 there printed
-  // tcp(/var/run/mysqld/mysqld.sock:3306): it parses, then dies at dial. The
-  // views.sql download refuses the same server for the same reason.
+  // tcp(/var/run/mysqld/mysqld.sock:3306): it parses, then dies at dial.
+  //
+  // The views.sql download refuses a socket-reached index too, but it reads
+  // the DSN itself, so the two tests are not the same test: this one sees a
+  // decomposed address and infers the socket from the missing port. A socket
+  // path that happens to end in ":<digits>" would slip past here and be
+  // refused there. Not worth a DTO field: socket paths are not written that
+  // way, and the failure is a command that does not connect.
   if (!cur || !src || !cur.host || !cur.port || !cur.dbname) return null;
   // The RESOLVED destination decides the flag, not the two fields on the
   // server: local wins over S3 when both are set, and a server that inherits
@@ -4501,6 +4507,28 @@ function icebergExportCommand(cur, baselines) {
   // a shell.
   return "bintrail export iceberg --index-dsn " + shellWord(dsn) + " " +
     flag + " " + shellWord(src) + " --warehouse /path/to/warehouse";
+}
+
+// icebergComposeNote says what the Docker route exports, which is not always
+// what this panel prints.
+//
+// The panel is per selected server: the command above carries THAT server's
+// index and THAT server's resolved backup destination. The compose one-shot
+// carries neither. It defaults to the stack's own bundled index and
+// /var/lib/bintrail/baselines, so for a server whose backups live in S3 the
+// panel prints --baseline-s3 and the Docker line would export the local
+// directory instead, successfully and with nothing to see. The service reads
+// INDEX_DSN, BASELINE_DIR and BASELINE_S3, so pointing it is a matter of
+// naming them.
+//
+// "ephemeral" is the entry seeded from the command line, which in the shipped
+// stack IS the bundled index; every other entry comes from the registry.
+function icebergComposeNote(cur) {
+  const bundled = cur && cur.kind === "ephemeral";
+  return "The Docker route below runs against this stack's own index and backups" +
+    (bundled ? ". " : ", not the server picked here. ") +
+    "To point it " + (bundled ? "somewhere else" : "at this server") +
+    ", set INDEX_DSN and BASELINE_DIR or BASELINE_S3 in the stack's .env file.";
 }
 
 function icebergExportPanel(cur, baselines) {
@@ -4528,6 +4556,10 @@ function icebergExportPanel(cur, baselines) {
   body.append(el("p", { class: "cn-sql-row", text:
     "The line carries the index host, port, database and user, and nothing else about the connection. " +
     "If your index needs settings this console was given, such as TLS or a timeout, add them yourself." }));
+  // In the visible body, not inside the collapsed block: for a server that is
+  // not the stack's own, the Docker route exports a DIFFERENT dataset and
+  // succeeds while doing it, which is the one failure here nobody would see.
+  body.append(el("p", { class: "cn-sql-row", text: icebergComposeNote(cur) }));
   body.append(cnFine("How to run it",
     // The address and the path are as THIS process sees them, and in the
     // bundled stack both are container-scoped (index-mysql:3306,
@@ -4544,8 +4576,9 @@ function icebergExportPanel(cur, baselines) {
       "you want the tables brought forward; it picks up where it left off, and a run that dies partway leaves " +
       "the last good copy in place." }),
     el("p", { class: "form-hint", text:
-      "Hourly from cron. Prefer the Docker line when this console runs in Docker: the container reads the " +
-      "index password from the stack, so it never has to sit in your crontab." }),
+      "Hourly from cron. The Docker line keeps the index password out of your crontab, since the container " +
+      "reads it from the stack; use it when the stack holds the index and backups you want exported, per the " +
+      "note above." }),
     el("code", { class: "stg-code cn-snippet", text:
       "17 * * * * cd /path/to/stack && docker compose --profile iceberg-export run --rm iceberg-export" }),
     el("p", { class: "form-hint", text:

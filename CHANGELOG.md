@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already holds, and never its password: the slot is written empty for the
   reader to fill in their own session. A server whose index this console
   reaches over a unix socket, or whose database has no `binlog_events`
-  table, refuses with that reason (422) instead of quietly downloading the
-  half that works, and an index that could not be asked answers 502. The
+  table, or an address with a port and no host, refuses with that reason
+  (422) instead of quietly downloading the half that works, and an index that
+  could not be asked answers 502. The
   tier and the audit posture do not move: `settings:read`, unaudited (view
   definitions are not row data), and refused outright while an
   access-control profile is active, the parameter included. An `include_live`
@@ -41,10 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what the page already knows (the resolved destination decides between
   `--baseline-dir` and `--baseline-s3`), a Copy button, the hourly cron line,
   and a collapsed "How to run it" block. The index password is elided as
-  `***`, the way the SQL-client panel elides the console token. The block
+  `***`, the way the SQL-client panel elides the console token. The panel
   says the address and folder in the command are the ones this console uses,
   which in the bundled stack are inside Docker, and offers the compose
-  profile below for that case. It is a
+  profile for that case, naming what that profile actually exports: the
+  stack's own index and backups, which for any other server is a different
+  dataset exported successfully and with nothing to see, so it names the
+  variables that point it (`INDEX_DSN`, `BASELINE_DIR`, `BASELINE_S3`). It is a
   command and not a button on purpose, and the panel says so: the export
   writes a new copy of your data and is deliberately kept out of the process
   that captures changes, so a long export can never slow capture down. No new

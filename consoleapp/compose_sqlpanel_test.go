@@ -128,15 +128,83 @@ func TestComposePublishesTheConsoleOnLoopbackOnly(t *testing.T) {
 		t.Fatalf("the %q service publishes no ports; this guard reads that list and would otherwise pass vacuously", composeService)
 	}
 	for _, p := range svc.Ports {
-		host, rest, found := strings.Cut(p, ":")
-		if !found || !strings.Contains(rest, ":") {
+		host, ok := composePublishedHost(p)
+		if !ok {
 			t.Errorf("port mapping %q publishes on every interface; the SQL page defaults ON in this stack "+
 				"because the console is reachable from the host only", p)
 			continue
 		}
-		if host != "127.0.0.1" && host != "[::1]" {
+		if !composeLoopback(host) {
 			t.Errorf("port mapping %q publishes on %s, not the host loopback; the SQL page defaults ON in this stack "+
 				"because the console is reachable from the host only", p, host)
 		}
+	}
+}
+
+// composePublishedHost returns the HOST part of a compose short-syntax port
+// mapping, and whether the mapping names one at all.
+//
+// Splitting on the first colon does not work, which is the bug this replaces:
+// an IPv6 host is bracketed ("[::1]:8090:8090"), so the first colon falls
+// INSIDE the address and the guard read the host as "[", matched neither
+// loopback form, and reported the wrong reason for a mapping that was in fact
+// fine. The bracketed form has to be read before any splitting.
+//
+// A mapping with no host part ("8090", "8090:8090", "8090:8090/tcp")
+// publishes on every interface of the machine, which is exactly the edit this
+// guards against, so it returns false rather than an empty host that could be
+// mistaken for one.
+func composePublishedHost(mapping string) (string, bool) {
+	m := strings.TrimSpace(mapping)
+	if strings.HasPrefix(m, "[") {
+		end := strings.Index(m, "]")
+		if end < 0 {
+			return "", false // malformed; not a host this guard can vouch for
+		}
+		return m[1:end], true
+	}
+	// host:hostPort:containerPort is the only short form that names a host.
+	if parts := strings.Split(m, ":"); len(parts) >= 3 {
+		return parts[0], true
+	}
+	return "", false
+}
+
+// composeLoopback reports whether a published host reaches only this machine.
+// The two literals, not a name: "localhost" resolves through the host's own
+// configuration, and this guard is about what the mapping guarantees.
+func composeLoopback(host string) bool {
+	return host == "127.0.0.1" || host == "::1"
+}
+
+// TestComposePublishedHost pins the parser above on the forms compose accepts,
+// including the bracketed IPv6 one the guard's own comment allows and the old
+// implementation could never have matched.
+func TestComposePublishedHost(t *testing.T) {
+	for _, tc := range []struct {
+		mapping  string
+		host     string
+		hasHost  bool
+		loopback bool
+	}{
+		{mapping: "127.0.0.1:8090:8090", host: "127.0.0.1", hasHost: true, loopback: true},
+		{mapping: "[::1]:8090:8090", host: "::1", hasHost: true, loopback: true},
+		{mapping: "127.0.0.1::8090", host: "127.0.0.1", hasHost: true, loopback: true},
+		{mapping: "0.0.0.0:8090:8090", host: "0.0.0.0", hasHost: true},
+		{mapping: "[::]:8090:8090", host: "::", hasHost: true},
+		{mapping: "192.168.1.10:8090:8090", host: "192.168.1.10", hasHost: true},
+		{mapping: "8090:8090"},
+		{mapping: "8090:8090/tcp"},
+		{mapping: "8090"},
+	} {
+		t.Run(tc.mapping, func(t *testing.T) {
+			host, ok := composePublishedHost(tc.mapping)
+			if ok != tc.hasHost || host != tc.host {
+				t.Fatalf("composePublishedHost(%q) = (%q, %v), want (%q, %v)", tc.mapping, host, ok, tc.host, tc.hasHost)
+			}
+			if got := ok && composeLoopback(host); got != tc.loopback {
+				t.Errorf("%q reads as loopback = %v, want %v", tc.mapping, got, tc.loopback)
+			}
+		})
 	}
 }

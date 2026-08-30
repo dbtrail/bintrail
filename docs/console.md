@@ -417,6 +417,20 @@ panel that answers whether a restore would work, far below the fold.
   empty states explain how to produce a first baseline (`bintrail dump` →
   `bintrail baseline`). When the **Create baseline** button is enabled it sits
   in this panel's header.
+- **Keep it current with Iceberg** (#1466) — a display-only panel at the
+  bottom of the page that prints the exact `bintrail export iceberg` command
+  for the selected server, with its index connection and its resolved backup
+  destination filled in, a Copy button, and an hourly cron line. Nothing runs
+  from here: the export writes a new copy of your data and is kept out of the
+  process that captures changes. The password is shown as `***` for you to
+  replace, and the command carries the index host, port, database and user
+  and nothing else about the connection, so an index that needs TLS or a
+  timeout needs those added by hand. The panel also names the compose route
+  (`docker compose --profile iceberg-export run --rm iceberg-export`), which
+  runs against the **bundled stack's own** index and backups: for any other
+  server, point it with `INDEX_DSN` and `BASELINE_DIR` / `BASELINE_S3` in the
+  stack's `.env`, or run the printed command where bintrail is installed. See
+  [Iceberg export](iceberg-export.md) and [docker.md](docker.md).
 - **Scheduled backups** (#1442) — a per-server timetable, set from this page:
   every N minutes, hours or days (at least 15m), lined up on a UTC time of
   day. The operator picks WHEN; HOW each run is made is the daemon's decision
@@ -523,9 +537,10 @@ compact baseline summary card and links onward:
   refuses the box, because the file locates the index by host and port so it
   can run on another machine. When the index's registered sources cannot be
   read, the file says so and the daemon logs the reason, so a revoked `SELECT`
-  on `bintrail_servers` is diagnosable rather than one sentence in a file. The card is hidden for a server with
-  archives disabled, for one with nothing archived and
-  no baseline yet, and while an access-control profile is active — the file
+  on `bintrail_servers` is diagnosable rather than one sentence in a file.
+  The card is hidden for a server with archives disabled, for one with
+  nothing archived and no baseline yet, and while an access-control profile
+  is active — the file
   maps straight onto the unredacted Parquet a profile exists to withhold.
   For an engine that wants a table rather than files (Spark, Trino, Athena, or
   DuckDB without the merge step), `bintrail export iceberg` writes an Apache
@@ -847,8 +862,9 @@ see the metrics tables and example alert rules in
   [The SQL panel](#the-sql-panel-opt-in)). Off by default for a bare invocation;
   works on both `serve` and `watch`. The bundled compose stack enables it
   (`SQL_PANEL=0` in `.env` opts out). Unlike the `views.sql` download, this
-  executes SQL **inside the daemon**, so it runs in a locked-down DuckDB sandbox — read [The SQL panel](#the-sql-panel-opt-in)
-  before enabling it on a shared or public bind.
+  executes SQL **inside the daemon**, so it runs in a locked-down DuckDB
+  sandbox: read [The SQL panel](#the-sql-panel-opt-in) before enabling it on
+  a shared or public bind.
 - `BINTRAIL_CONSOLE_ARCHIVE_STAGING` (`watch` only) — local staging dir for the
   Archive-to-S3 feature, same as `--archive-staging-dir`. AWS credentials for
   the upload come from the ambient chain (`AWS_*` / `~/.aws` / role).

@@ -69,6 +69,15 @@ func consoleLiveTarget(b *bundle) (*views.LiveIndex, error) {
 	if err != nil {
 		return nil, &liveLegConfigError{msg: "this server's index address has no host and port to put in the file, so the live index cannot be included"}
 	}
+	if host == "" {
+		// ":3306" parses, and the driver reads the empty host as localhost on
+		// its own machine. The file cannot: it would carry HOST '', which
+		// names nothing to a reader anywhere, and which the generator's
+		// loopback warning does not recognize as a local address either. A
+		// refusal that says to name the host is the only honest answer.
+		return nil, &liveLegConfigError{msg: "this server's index address names a port but no host, and the file locates the index by host and port " +
+			"so it can be run from another machine. Give this server's connection a host name or address to include the live index"}
+	}
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		return nil, &liveLegConfigError{msg: "this server's index address has an unusable port, so the live index cannot be included"}
