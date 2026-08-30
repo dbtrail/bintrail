@@ -60,6 +60,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -100,6 +101,38 @@ var sqlPanelTimeout = 60 * time.Second
 // So the setup gives up at the first statement boundary after the budget runs
 // out rather than at the instant it does.
 var sqlPanelSetupTimeout = 30 * time.Second
+
+// sqlPanelBindThreads is the DuckDB thread count to hold WHILE the view DDL
+// binds, and only while it binds — the sandbox restores the daemon budget a few
+// statements later, before lock_configuration freezes it.
+//
+// The daemon budget (2 threads, #510) is a CPU bound, and it is the right bound
+// for executing a statement: that reads row groups and this process may co-host
+// the stream supervisor. Binding is not that work. `union_by_name = true` makes
+// DuckDB open one Parquet footer per file in the layout to compute the unified
+// schema, and over an S3 layout each of those is a network round trip. Measured
+// on one archive source of 164 files, varying only this setting: 1 thread
+// 124.9s, 2 threads 60.2s, 8 threads 15.8s, 16 threads 8.1s, 32 threads 4.5s —
+// while user CPU stayed between 2.2s and 3.3s across the whole range. The wait
+// is latency, so widening it buys wall-clock without buying CPU, and holding
+// the CPU bound over it spends minutes to protect nothing.
+//
+// This is a constant factor, NOT a fix: the bind is still O(archived files) and
+// returns to a timeout as the archive grows. #1535 carries the measurements and
+// the design that bounds it by distinct schemas instead.
+//
+// A func var so tests can pin the value and observe that it was consulted at
+// all — the setting is deliberately restored, so its effect cannot be read back
+// off the finished session.
+var sqlPanelBindThreads = defaultBindThreads
+
+// defaultBindThreads scales the bind-time concurrency with the host rather than
+// pinning a number measured on one laptop. The ceiling matters more than the
+// slope: these threads are waiting on S3, so a one-core container has no reason
+// to hold only one in flight, and no host has a reason to open 64.
+func defaultBindThreads() int {
+	return min(16, 8*runtime.NumCPU())
+}
 
 // forensicsEventColumns are the paid-tier forensics columns the console must
 // NOT serve as row data: the SAME set eventDTO omits (connection_id is the free
@@ -669,6 +702,22 @@ func openSandboxedSession(ctx context.Context, in views.Input, only views.ViewSe
 	// Empty means the statement needs no view; DuckDB answers an empty script
 	// with "empty query", so there is nothing to run rather than nothing to say.
 	if ddl != "" {
+		// Bind-time concurrency, held only across the DDL — see
+		// sqlPanelBindThreads. Unconditional rather than scoped to an S3
+		// layout: the bind opens one footer per file either way, so the thread
+		// count does not change how much CPU that costs, only how much of the
+		// waiting overlaps. The sustained parallel scan is the QUERY, and the
+		// sandbox below puts it back under the daemon budget before it runs.
+		//
+		// Best-effort on purpose, and the ONE statement here that is: every
+		// other one is a sandbox bound, where a silent failure would leave a
+		// carve-out open. This is a speed knob, and a session that binds slowly
+		// is strictly better than a request that fails because a SET did not
+		// apply.
+		n := sqlPanelBindThreads()
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("SET threads = %d", n)); err != nil {
+			slog.Warn("sql panel: could not widen threads for the view bind; it will bind at the daemon budget and may exceed the setup timeout on a large archive", "threads", n, "error", err)
+		}
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
 			return fail(fmt.Errorf("set up views over the Parquet layout: %w", err))
 		}

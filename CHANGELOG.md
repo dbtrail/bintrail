@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **SQL panel: the view build no longer runs one S3 round trip at a time**
+  (#1535). A statement over the `events` view is bound before it runs, and
+  `union_by_name = true` makes DuckDB open one Parquet footer per file in the
+  layout to compute the unified schema. Over an S3 archive each of those is a
+  network round trip, and the panel bound them at the daemon's 2-thread CPU
+  budget, so `select * from events limit 1` could spend its whole 30s setup
+  budget binding and fail with `set up views over the Parquet layout: context
+  deadline exceeded` without ever running. The bind now holds a wider thread
+  count and the sandbox restores the daemon budget before the statement
+  executes. Measured on one archive source of 164 files, varying only this
+  setting: 2 threads 60.2s, 8 threads 15.8s, 16 threads 8.1s, while user CPU
+  stayed between 2.2s and 3.3s across the range. The wait is latency, not
+  compute, so the widening buys wall-clock without buying CPU on a process that
+  may also be capturing. This is a constant factor and not a cure: the bind is
+  still O(archived files) and #1535 carries the design that bounds it by
+  distinct schemas instead.
+
 ## [0.73.0] - 2026-08-30
 
 ### Added
