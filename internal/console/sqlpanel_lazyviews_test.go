@@ -23,6 +23,9 @@ import (
 	"testing"
 	"time"
 
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-sql-driver/mysql"
+
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/views"
 )
@@ -530,5 +533,43 @@ func TestSQLPanel_setupRunsUnderTheSetupBudget(t *testing.T) {
 	if n := reqs.Load(); n != 0 {
 		t.Fatalf("the setup made %d network reads after its budget was gone: the deadline does "+
 			"not reach the view build", n)
+	}
+}
+
+// TestSQLPanel_layoutFailureCarriesTheWait: the step that resolves the layout
+// is the one that LISTS an S3 baseline root, so a fault reported by it is the
+// long wait that reported nothing at all, which is where #1526 starts. Same
+// claim as TestSQLPanel_refusalCarriesTheWait, one step earlier in the request.
+func TestSQLPanel_layoutFailureCarriesTheWait(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectQuery("FROM archive_state").WillReturnError(
+		&mysql.MySQLError{Number: 1142, Message: "SELECT command denied"})
+
+	// No baseline: the unreadable registry is then the whole layout, which is
+	// an upstream fault (502) rather than an empty server (404).
+	srv := newSQLPanelServer(t, "", true)
+	srv.cm.boot.db = db
+
+	rec, body := doServersReq(t, srv, "POST", "/api/sql", `{"sql":"SELECT 1"}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%s; want 502", rec.Code, body)
+	}
+	var res struct {
+		Error     string `json:"error"`
+		ElapsedMS *int64 `json:"elapsed_ms"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == "" {
+		t.Fatalf("a 502 with no message: %s", body)
+	}
+	if res.ElapsedMS == nil {
+		t.Fatalf("the layout failed after listing the layout and the answer carries no "+
+			"elapsed_ms: the one wait #1526 is about reports nothing: %s", body)
 	}
 }

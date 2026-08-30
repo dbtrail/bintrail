@@ -238,7 +238,16 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, errNoViewSources.Error()+"; nothing to query")
 		return
 	case err != nil:
-		writeJSONError(w, http.StatusBadGateway, err.Error())
+		// This one carries the wait; the refusals ABOVE it (panel off, profile
+		// active, archives disabled, another query already running, a body too
+		// large or malformed) are settled before any layout work and keep the
+		// plain {error} body, deliberately: a number that is always about zero
+		// says nothing. This fault is reported by the step that LISTS an S3
+		// baseline root, so it is the long wait that used to report nothing at
+		// all, which is where #1526 starts. The 404 above is on this side of
+		// the listing too and stays plain on purpose: "nothing to query yet" is
+		// a fact about the server that no elapsed time qualifies.
+		writeSQLPanelError(w, http.StatusBadGateway, err.Error(), time.Since(reqStart))
 		return
 	}
 
