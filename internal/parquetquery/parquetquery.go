@@ -57,6 +57,13 @@ func Fetch(ctx context.Context, opts query.Options, source string) ([]query.Resu
 // the conservative DefaultTuning (threads=2, memory_limit=4GB) is for small
 // containers; duckdbutil.Ultrafast lets DuckDB self-tune to the host.
 func FetchWithTuning(ctx context.Context, opts query.Options, source string, tuning duckdbutil.Tuning) ([]query.ResultRow, error) {
+	// Mirror internal/query's engine-side range check (#1440): the predicate
+	// below is emitted from a cast the schema snapshot chose, and a range
+	// that reaches this engine unresolved must be refused, never guessed.
+	// Here rather than in Fetch because the tuned CLI path enters directly.
+	if err := opts.ValidatePKRange(); err != nil {
+		return nil, fmt.Errorf("parquetquery: %w", err)
+	}
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("open duckdb: %w", err)
@@ -988,6 +995,12 @@ func buildFilters(opts query.Options, cols map[string]bool) ([]string, []any) {
 			args = append(args, v)
 		}
 		where = append(where, "pk_values IN ("+strings.Join(placeholders, ",")+")")
+	}
+	if opts.PKRange != nil {
+		// The archive mirror of internal/query's range predicate (#1440):
+		// TRY_CAST over the Parquet pk_values column, bounds inlined. See
+		// query.PKRange.DuckDBPredicates for why TRY_CAST and why inlined.
+		where = append(where, opts.PKRange.DuckDBPredicates()...)
 	}
 	if opts.EventType != nil {
 		where = append(where, "event_type = ?")

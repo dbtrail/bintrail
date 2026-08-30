@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/dbtrail/dbtrail/ext"
+	"github.com/dbtrail/dbtrail/internal/doctor"
 	"github.com/dbtrail/dbtrail/internal/parquetquery"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -308,8 +309,13 @@ type Server struct {
 	// "scope=live read the archives anyway" is invisible at the SQL layer
 	// and only a counting stub here can observe it (#1414).
 	archiveFetcher query.ArchiveFetcher
-	cm             *connManager
-	mux            http.Handler
+	// capacityProbe reads the index disk-capacity inputs for GET
+	// /api/capacity — doctor.ProbeCapacity in production, injectable so a
+	// test can drive the real verdict over a fixture (#1444). nil falls back
+	// to the production probe.
+	capacityProbe capacityProbeFunc
+	cm            *connManager
+	mux           http.Handler
 	// Password login: authPath is the credential file (re-read per login so a
 	// live `user set-password` applies without restart); passwordCfg is its
 	// boot-time existence, which drives the bind gate and the printed banner.
@@ -516,6 +522,7 @@ func New(cfg Config) (*Server, error) {
 		sqlPanel:                cfg.SQLPanel,
 		flashbackListen:         cfg.FlashbackListen,
 		archiveFetcher:          parquetquery.Fetch,
+		capacityProbe:           doctor.ProbeCapacity,
 	}
 	s.managedTok.initFromDisk(mcpTokenPath, mcpTokFile)
 	s.cm.hideBoot = cfg.HideBoot
@@ -597,6 +604,7 @@ func (s *Server) selectedEntry(r *http.Request) (ServerEntry, bool) {
 func (s *Server) buildHandler() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/status", s.handleStatus)
+	api.HandleFunc("GET /api/capacity", s.handleCapacity)
 	api.HandleFunc("GET /api/coverage", s.handleCoverage)
 	api.HandleFunc("GET /api/activity", s.handleActivity)
 	api.HandleFunc("GET /api/schemas", s.handleSchemas)

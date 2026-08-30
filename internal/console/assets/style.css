@@ -597,6 +597,24 @@ button { font-family: inherit; }
 }
 .page-sub { color: var(--ink-2); font-size: 14.5px; max-width: 62ch; margin: 0; }
 .page-sub b { color: var(--ink); font-weight: 600; }
+/* The title row holds the h1 and, on pages that have a docs page, the Docs
+   link (#1450). The row carries the h1's old bottom margin so the sub line
+   keeps its distance whether or not a link is present. */
+.page-title-row { display: flex; align-items: center; gap: 14px; margin: 0 0 10px; }
+.page-title-row .page-title { margin: 0; }
+/* Quiet on purpose: it is a fixture of the header, not a call to action. */
+.page-docs {
+  display: inline-flex; align-items: center; gap: 5px; flex: none;
+  font-family: var(--f-ui); font-size: 12px; font-weight: 500; line-height: 1;
+  color: var(--ink-3); text-decoration: none;
+  border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px 5px 11px;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.page-docs svg { width: 12px; height: 12px; color: var(--ink-4); }
+.page-docs:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }
+.page-docs:hover svg { color: var(--accent); }
+[data-accent="warm"] .page-docs:hover { color: var(--orange-2); border-color: var(--orange-2); }
+[data-accent="warm"] .page-docs:hover svg { color: var(--orange-2); }
 
 /* enter animation for views — transform-only so content is ALWAYS visible
    (the preview's animation clock can freeze at t=0; opacity-from-0 would blank it) */

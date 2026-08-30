@@ -161,6 +161,18 @@ and searching events:
    permanently lost" record when an unfillable gap (or a lost PostgreSQL slot)
    was detected. Both fire for any source family. See
    [the continuity signal](rotation-and-status.md#stream-continuity-no-data-lost).
+   An **Index disk** card carries the projection `bintrail doctor` computes
+   for the selected server: index size, write rate, the size it settles at
+   for the configured retention, free space on the index volume, and how
+   long that free space lasts at the current rate. The grade is the
+   doctor's; a warn or fail grade also renders a box above the cards saying
+   what fills the disk and what fixes it. Two things it says rather than
+   guesses: free space that this process cannot measure (the index on
+   another host or container) reads "not measurable from here", never a
+   number; and the standalone read-only console, which runs no rotation of
+   its own, reports the retention as "not known here" instead of grading an
+   index another process rotates as unbounded. See
+   [capacity planning](capacity.md#monitoring).
 7. **Protect** (under `watch` only) — **Backups** (the selected server's
    snapshot listing; each row expands to its tables, sizes and how long the
    backup took, with a **Download (.tar.gz)** of the whole snapshot; plus
@@ -169,18 +181,35 @@ and searching events:
    discoverable snapshot in the same store, and **Build a .sql backup for
    any moment**, which folds a chosen instant into a mydumper-format dump
    downloaded as one `.tar.gz` — load it with `myloader`, nothing from
-   bintrail needed on the restore side. The build is a full plaintext copy
-   of every row, staged on the daemon's disk (under the system temp
-   directory unless `BINTRAIL_CONSOLE_BASELINE_STAGING` says otherwise) until the next
-   build replaces it or the daemon restarts) and **Verification** (run
+   bintrail needed on the restore side; the build is a full plaintext copy
+   of every row, staged on the daemon's disk under the system temp
+   directory unless `BINTRAIL_CONSOLE_BASELINE_STAGING` says otherwise) and
+   **Verification** (run
    `bintrail verify` and read past runs). These produce and validate the
    artifacts a restore depends on, so they are operations rather than
    settings; they lived on the Storage page until they outgrew it.
+   A staged `.sql` build does not stay on disk: it is removed as soon as a
+   download completes, 4 hours after the build finished if nobody
+   downloaded it (the Ready line shows the deadline and the size), when a
+   new build for the same server starts, or when the daemon restarts (every
+   build a previous process left behind, finished or interrupted, is removed
+   at startup). If a removal fails, the build keeps its state, the card says
+   why, and the daemon retries every minute. If a new build starts and the
+   previous one cannot be removed, the new build still runs and stays
+   downloadable; its status names the previous build's directory until that
+   removal succeeds. The Storage page shows what is staged while it exists,
+   previous builds that could not be removed included.
 8. **Settings** (under `watch` only) — **Storage** (rotation policy,
    per-source S3 archiving, a baseline summary card, AWS credential signals,
    and a usage-telemetry opt-out — see
    [The Storage page](#the-storage-page)) and **Rotation** (opens the
    rotation dialog).
+
+Every view whose subject has a page on www.dbtrail.com/docs (Events, Restore,
+Backups, Verification, Storage, Connect AI) shows a small **Docs** link beside
+its title. It opens that page in a new tab and is a plain link: the console
+makes no request for it, so it costs nothing on an air-gapped host. Views with
+no page of their own show no link.
 
 ## Managing servers
 
@@ -461,6 +490,14 @@ compact baseline summary card and links onward:
 - **S3 archiving per source** — every monitored server with its
   `Archive to S3` destination (or `drop-only` when none), with a shortcut into
   that server's edit form. The boot (cli) index always rotates drop-only.
+- **Staged downloads**: the `.sql` backups built from the Backups page that
+  are waiting on the daemon's disk for their download: each build's server,
+  size and download deadline, the total, and where they live. A build is
+  removed once downloaded or 4 hours after it finished, so this card is
+  usually empty; it exists so that space is never invisible. A build that
+  could not be removed stays listed with the reason (a previous build a
+  newer one could not clear included) and is retried every minute. Shown
+  only on a daemon that can build `.sql` backups.
 - **Query in DuckDB** — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one
@@ -1218,6 +1255,7 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `POST /api/auth/logout` | Revoke the presented session (static token → 204 no-op). |
 | `POST /api/auth/password` | Set (first time; requires static-token auth) or rotate (`current_password` verified) the console password. Revokes all sessions and returns a fresh one. |
 | `GET /api/status` | Index status (same payload as `bintrail status --format json`). For a session with restricted data access, the capture-health detail names only the tables that session may read; `tables_withheld` counts the rest and the counts stay whole. |
+| `GET /api/capacity` | The doctor's index disk-capacity check for the selected server: `{status, reason, retention: {known, retain, source, enabled}, measured, sample_hours, current_bytes, events_per_day, bytes_per_event, growth_bytes_per_day, projected_bytes, remaining_bytes, free_known, free_bytes, days_until_full}`. `status` is `pass`/`warn`/`fail`/`skip` as `bintrail doctor` grades it; `reason` names the branch (`ok`, `headroom_low`, `free_under_floor`, `growth_exceeds_free`, `no_retention`, `free_unknown`, `retention_unknown`, `not_enough_history`, `not_initialized`). Rate and projection fields are absent while `measured` is false; `free_bytes` is meaningful only when `free_known`; `retention.known` is false on the standalone console. `502` when the partition statistics cannot be read. |
 | `GET /api/coverage` | Live RPO summary: restorable delta window `[delta_from, delta_to]`, `lag_seconds`, `continuity`; with a baseline source, `full_table_status` (`ok`/`unknown`), `full_table_from` and `broken_tables` (profile-restricted sessions get the delta half only). |
 | `GET /api/activity` | Window aggregate behind the Overview tiles: counts by event type, distinct tables touched, and a per-table breakdown. The window **is the live retention** — derived from the oldest live `binlog_events` partition, so the counts cover exactly what the live index still holds and read the live tier only (no archive scan, and nothing archived can fall inside the window by construction). Returns `{label, since, until, refreshed_at, total, inserts, updates, deletes, other, tables, top_tables, complete, notes}`. The aggregate is a **server-side materialization** refreshed when older than ~30 minutes (a stale copy is served immediately while one recompute runs in the background); `refreshed_at` is when it was computed, and the UI renders it on the tiles ("as of …") so a cached number is never presented as live. `complete: false` means the counts are knowably a floor (an index with a pathological table count trips the grouping cap) and `notes` says so; the UI marks the affected tiles "partial". RBAC deny rules are applied, so a denied table contributes to neither the counts nor `top_tables`, and each deny profile gets its own materialization. |
 | `GET /api/schemas` | Schemas known to the index: those observed in `binlog_events` **plus** those in the latest schema snapshot, so a schema whose partitions have all been rotated out to Parquet/S3 is still listed (the archives still answer `/api/events` and `/api/recover`). `schemas` is that full union; `snapshot_only` (when present) is the subset with no live events observed — the UI labels these "snapshot only" since queries against them may return nothing; `snapshot_unavailable: true` means the snapshot half was skipped because the schema resolver failed to load (check the server log), so archive-only schemas may be missing from the list. The snapshot half is skipped under `--no-archive` or an active `--profile`, where archived data is unreachable anyway. Note this answers *which schemas this index knows of*, not *which have data in a given window* — for that, see `bintrail status`'s continuity verdict. `?schema=<name>` → that schema's tables. |
@@ -1245,7 +1283,7 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `GET /api/flashback` | Process-global: the embedded time-travel SQL port (`watch --flashback-listen`): `{enabled, listen, host, port}`. `enabled: false` alone on the standalone console and on a daemon that did not open the port; `host` is empty on a wildcard bind (the UI then uses the name it was opened with). Never the console token that authenticates the port. Backs the **Connect a SQL client** panel on Settings → Connect AI. |
 | `GET /api/profiles` | RBAC data-profile **names** defined on the selected server's index: `{"profiles": ["..."]}`, sorted; empty on a legacy index without the table. Vocabulary for administration panels (e.g. a settings-surface profile picker) — never the rules or flagged tables/columns behind a name. |
 
-Every data endpoint (`status`, `schemas`, `events`, `schema-changes`, `recover`,
+Every data endpoint (`status`, `capacity`, `schemas`, `events`, `schema-changes`, `recover`,
 `recover-cascade`, `capabilities`, `reconstruct`, `baselines`) targets the
 server named by the `X-Bintrail-Server` request header; without the header they
 target the default entry (`storage` and `flashback` are the process-global

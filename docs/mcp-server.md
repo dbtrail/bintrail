@@ -212,7 +212,14 @@ HTTP, console-token auth, per-server routing by URL path) — if you already run
 `ALTER TABLE`), `since`, `until`, `limit` (default 100), and `uncovered_only`
 (only changes whose `snapshot_id` is `null` — the rows behind the `status`
 tool's "DDL(s) detected without auto-snapshot" warning); results come back
-newest-first.
+newest-first, and changes inside the same second are ordered by binlog
+coordinate (`binlog_file`, then `binlog_pos`), so a migration's burst of DDLs
+reads in the order it ran and a `limit` that cuts inside the burst keeps the
+same rows on every call. One caveat: `schema_changes` records no source
+identity, so in an index fed by more than one source, or by a Postgres source
+(whose LSN file names are not zero-padded), same-second changes have a
+repeatable order, not their true one. The sort runs over the filtered rows, so
+narrow with `since`/`until` on a large table.
 
 Prompts that work well:
 
@@ -232,6 +239,14 @@ both accept:
 
 - `pks` — multiple primary key values (each pipe-delimited for composite
   keys); requires `schema` and `table`, mutually exclusive with `pk`
+- `pk_min` / `pk_max`: an inclusive primary key range, either bound alone or
+  both, as integer strings. Only for tables whose primary key is one integer
+  column: the tool checks the key against the schema snapshot first and
+  refuses a composite or non-integer key with the table's actual key shape.
+  Requires `schema` and `table`, mutually exclusive with `pk`/`pks`. The
+  range cannot use the key index, so it scans the partitions the time filters
+  keep: pair it with `since`/`until`. See
+  [Primary key ranges](query-and-recovery.md#primary-key-ranges---pk-min----pk-max)
 - `limit_per_pk` — cap events per `pk_values` to the latest N (0 = unlimited);
   requires `pk` or `pks`
 - `column_eq` — repeatable `column=value` equality filters

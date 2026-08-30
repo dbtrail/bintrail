@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -38,6 +39,44 @@ type SQLExporter interface {
 	// build has succeeded and its directory affirmatively carries the
 	// completeness marker.
 	SQLExportDir(serverID string) (dir string, status BaselineStatus, ok bool)
+	// SQLExportHold registers a download of the build in dir so the
+	// exporter neither expires nor removes it under the stream; release
+	// drops the hold (idempotent). ok is false when dir is no longer the
+	// server's finished build, in which case the caller answers not-ready.
+	SQLExportHold(serverID, dir string) (release func(), ok bool)
+	// SQLExportDelivered tells the exporter the whole archive built in dir
+	// was written to the client, so the staged copy can go now rather than
+	// at its download deadline. dir pins which build: a newer build that
+	// replaced it mid-stream must not be removed on the strength of the old
+	// one's download.
+	SQLExportDelivered(serverID, dir string)
+	// SQLExportStaged reports every build currently on disk (running or
+	// waiting for its download) with its live size, for the Storage page.
+	SQLExportStaged() SQLExportStagingInfo
+}
+
+// SQLExportStagingInfo is what the sql-export staging holds right now.
+type SQLExportStagingInfo struct {
+	Dir    string                 // the staging base every build lives under
+	TTL    time.Duration          // how long a finished build stays downloadable
+	Builds []SQLExportStagedBuild // sorted by server id
+}
+
+// SQLExportStagedBuild is one build on disk: in progress, finished and
+// waiting for its download, or owed a removal that has not succeeded yet.
+type SQLExportStagedBuild struct {
+	ServerID  string
+	State     string // running | succeeded | failed (only while its removal is still owed) | replaced (a previous build a newer one could not remove)
+	At        string // the instant the dump represents (RFC3339 UTC)
+	ExpiresAt string // when a finished build is removed unless downloaded first
+	// Bytes is the live on-disk size; meaningful only when BytesKnown. A
+	// walk that failed part-way reports unknown, never the fraction it
+	// managed to count.
+	Bytes      int64
+	BytesKnown bool
+	// StagingError is why the build is still on disk when it should not be
+	// (a removal that failed) or why it cannot be read; empty when fine.
+	StagingError string
 }
 
 // SQLExportRequest identifies the server and the instant to build for.
@@ -158,9 +197,19 @@ func (s *Server) handleSQLExportDownload(w http.ResponseWriter, r *http.Request)
 	dir, st, ready := s.sqlExport.SQLExportDir(e.ID)
 	if !ready {
 		writeJSONError(w, http.StatusConflict,
-			"no finished .sql backup to download; build one first (it may still be running, the last build may have failed, or its files were removed from the staging directory; building again fixes all three)")
+			"no finished .sql backup to download; build one first (it may still be running, the last build may have failed, it may already have been downloaded or passed its download deadline, or its files were removed from the staging directory; building again fixes all of these)")
 		return
 	}
+	// The hold keeps the TTL and the reaper off this build for as long as
+	// the stream runs (#1448); a build that expired or was replaced between
+	// the read above and here is refused the same way, not streamed.
+	release, held := s.sqlExport.SQLExportHold(e.ID, dir)
+	if !held {
+		writeJSONError(w, http.StatusConflict,
+			"no finished .sql backup to download; build one first (it may still be running, the last build may have failed, it may already have been downloaded or passed its download deadline, or its files were removed from the staging directory; building again fixes all of these)")
+		return
+	}
+	defer release()
 	stamp := "backup"
 	if t, err := time.Parse(time.RFC3339, st.At); err == nil {
 		stamp = t.UTC().Format("2006-01-02T15-04-05Z")
@@ -255,12 +304,41 @@ func (s *Server) handleSQLExportDownload(w http.ResponseWriter, r *http.Request)
 	if err := gz.Close(); err != nil {
 		abort("sql backup download: gzip finalize failed", err)
 	}
+	// net/http buffers the tail of the body; a connection that broke during
+	// the last chunk surfaces only when that buffer is flushed. Flush before
+	// deciding the archive left, or the build could be removed on the
+	// strength of bytes that never reached the socket. A writer that cannot
+	// flush at all (a middleware wrapper without Flush or Unwrap) leaves
+	// that question unanswerable, and an unanswerable question must not
+	// consume the build: it aborts too, and says which writer type broke
+	// the chain, because that is a wiring bug to fix rather than a client
+	// that went away. The deadline still bounds the build either way.
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		if errors.Is(err, http.ErrNotSupported) {
+			slog.Error("sql backup download: the response writer cannot flush, so the delivery cannot be confirmed and the staged build is kept; every ResponseWriter wrapper on this route must implement Flush or Unwrap",
+				"server", e.ID, "writer", fmt.Sprintf("%T", w))
+		}
+		abort("sql backup download aborted: the connection dropped before the last bytes were sent", err)
+	}
+	if err := r.Context().Err(); err != nil {
+		abort("sql backup download aborted: the connection dropped before the last bytes were sent", err)
+	}
 	// A rebuild's teardown racing this stream can hand the ReadDir above a
 	// subset whose every surviving file then streams cleanly — the one shape
 	// the per-file guards cannot see. If the wipe happened, the _SUCCESS
 	// marker is gone with it: re-check before declaring the archive whole.
 	if _, err := os.Stat(filepath.Join(dir, baseline.SuccessMarker)); err != nil {
-		abort("sql backup download aborted: the build was replaced mid-stream", err)
+		abort("sql backup download aborted: the build was replaced or expired mid-stream", err)
 	}
 	completed = true
+	// The archive is whole and written to the socket: the staged copy has
+	// done its job, so it leaves the disk now instead of at its deadline
+	// (#1448). Only after the marker check, so an aborted or replaced
+	// stream never removes a build it did not deliver; the hold is released
+	// first so the removal is not deferred to the reaper. "Delivered" is
+	// the server's view (every byte written and flushed): only the client
+	// knows the archive arrived whole, which is why the deadline exists and
+	// a rebuild stays one click away.
+	release()
+	s.sqlExport.SQLExportDelivered(e.ID, dir)
 }

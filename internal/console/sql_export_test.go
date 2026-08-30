@@ -1,9 +1,11 @@
 package console
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,7 +24,34 @@ type stubSQLExporter struct {
 	st    BaselineStatus
 	dir   string
 	ready bool
+	// delivered records every SQLExportDelivered call as "<server>|<dir>".
+	delivered []string
+	staged    SQLExportStagingInfo
+	// holds is the number of open holds; heldOnce counts every hold taken.
+	holds, heldOnce int
+	holdRefused     bool
 }
+
+func (s *stubSQLExporter) SQLExportDelivered(serverID, dir string) {
+	s.delivered = append(s.delivered, serverID+"|"+dir)
+}
+
+// holds counts open holds; holdRefused scripts SQLExportHold to say no.
+func (s *stubSQLExporter) SQLExportHold(string, string) (func(), bool) {
+	if s.holdRefused {
+		return func() {}, false
+	}
+	s.holds++
+	s.heldOnce++
+	released := false
+	return func() {
+		if !released {
+			released = true
+			s.holds--
+		}
+	}, true
+}
+func (s *stubSQLExporter) SQLExportStaged() SQLExportStagingInfo { return s.staged }
 
 func (s *stubSQLExporter) TriggerSQLExport(req SQLExportRequest) error {
 	s.last = &req
@@ -270,6 +299,16 @@ func TestSQLExportDownload_roundTrip(t *testing.T) {
 		ev.Detail["at"] != "2026-06-10T12:00:00Z" {
 		t.Fatalf("audit detail = %v, want format=sql, 3 files, the instant, and no aborted flag", ev.Detail)
 	}
+	// The whole archive left: the staged copy is consumed (#1448), and the
+	// exporter is told WHICH build so a replacement is never removed for it.
+	if len(stub.delivered) != 1 || stub.delivered[0] != id+"|"+dir {
+		t.Fatalf("delivered = %v, want exactly [%s|%s]", stub.delivered, id, dir)
+	}
+	// The stream held the build (so no deadline could remove it underneath)
+	// and let go before reporting the delivery.
+	if stub.heldOnce != 1 || stub.holds != 0 {
+		t.Fatalf("holds: taken %d, open %d; want one taken and released", stub.heldOnce, stub.holds)
+	}
 }
 
 func TestSQLExportDownload_emptyBuild(t *testing.T) {
@@ -373,6 +412,10 @@ func TestSQLExportDownload_midStreamAbort(t *testing.T) {
 	if ev.Detail["aborted"] != "true" || ev.Detail["bytes"] != "4" || ev.Detail["files"] != "1" {
 		t.Fatalf("audit detail = %v, want aborted=true with the 4 bytes and 1 file that left", ev.Detail)
 	}
+	// An aborted stream delivered nothing: the build must stay for a retry.
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v after an aborted stream, want none", stub.delivered)
+	}
 }
 
 // TestSQLExportDownload_unexpectedSubdir: the engine writes a flat dump; a
@@ -440,6 +483,9 @@ func TestSQLExportDownload_markerVanishedMidStream(t *testing.T) {
 	if ev == nil || ev.Detail["aborted"] != "true" {
 		t.Fatalf("audit = %v, want the aborted handover recorded", ev)
 	}
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v after a replaced build, want none", stub.delivered)
+	}
 }
 
 // TestCapabilitySQLExportGate: only a daemon with the exporter wired
@@ -467,5 +513,148 @@ func TestCapabilitySQLExportGate(t *testing.T) {
 		if caps.SQLExport != enabled {
 			t.Errorf("sql_export capability = %v, want %v", caps.SQLExport, enabled)
 		}
+	}
+}
+
+// flushErrWriter is a ResponseWriter whose flush reports a broken
+// connection, the shape net/http shows when the client vanished during the
+// buffered tail of the body.
+type flushErrWriter struct {
+	*httptest.ResponseRecorder
+	err error
+}
+
+func (w *flushErrWriter) FlushError() error { return w.err }
+
+// TestSQLExportDownload_flushFailureAborts: the build is consumed only once
+// the last bytes were FLUSHED to the socket. A flush that fails after every
+// byte was written must abort, audit as aborted, deliver nothing and drop
+// the hold, so the build stays for a retry.
+func TestSQLExportDownload_flushFailureAborts(t *testing.T) {
+	rec := audittest.Install(t)
+	dir := newSQLDumpFixture(t)
+	stub := &stubSQLExporter{dir: dir, ready: true,
+		st: BaselineStatus{State: "succeeded", At: "2026-06-10T12:00:00Z"}}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+
+	req := httptest.NewRequest("GET", "/api/servers/"+id+"/sql-export/download", nil)
+	req.SetPathValue("id", id)
+	w := &flushErrWriter{ResponseRecorder: httptest.NewRecorder(), err: errors.New("write: broken pipe")}
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				if r != http.ErrAbortHandler {
+					t.Fatalf("panic = %v, want http.ErrAbortHandler", r)
+				}
+			}
+		}()
+		srv.handleSQLExportDownload(w, req)
+	}()
+	if !panicked {
+		t.Fatal("a failed flush after the last byte must abort, not declare the archive delivered")
+	}
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v after a failed flush, want none", stub.delivered)
+	}
+	if stub.heldOnce != 1 || stub.holds != 0 {
+		t.Fatalf("holds: taken %d, open %d; want one taken and released on abort", stub.heldOnce, stub.holds)
+	}
+	var ev *ext.AuditEvent
+	for _, e := range rec.Events() {
+		if e.Action == "baseline.download" {
+			c := e
+			ev = &c
+		}
+	}
+	if ev == nil || ev.Detail["aborted"] != "true" {
+		t.Fatalf("audit = %v, want the aborted handover recorded", ev)
+	}
+}
+
+// bareWriter is a ResponseWriter with neither Flush nor Unwrap: the shape a
+// middleware wrapper takes when it forwards neither, which leaves
+// http.ResponseController unable to reach the connection.
+type bareWriter struct{ rec *httptest.ResponseRecorder }
+
+func (w *bareWriter) Header() http.Header         { return w.rec.Header() }
+func (w *bareWriter) Write(b []byte) (int, error) { return w.rec.Write(b) }
+func (w *bareWriter) WriteHeader(code int)        { w.rec.WriteHeader(code) }
+
+// TestSQLExportDownload_unflushableWriterKeepsTheBuild: a writer that
+// cannot flush leaves "did the last bytes reach the socket" unanswerable,
+// and an unanswerable delivery must not consume the build. The handler
+// aborts, says which writer type broke the chain (a wiring bug, not a
+// client that left), delivers nothing, and the build stays succeeded.
+func TestSQLExportDownload_unflushableWriterKeepsTheBuild(t *testing.T) {
+	rec := audittest.Install(t)
+	var logs bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	dir := newSQLDumpFixture(t)
+	stub := &stubSQLExporter{dir: dir, ready: true,
+		st: BaselineStatus{State: "succeeded", At: "2026-06-10T12:00:00Z"}}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+
+	req := httptest.NewRequest("GET", "/api/servers/"+id+"/sql-export/download", nil)
+	req.SetPathValue("id", id)
+	w := &bareWriter{rec: httptest.NewRecorder()}
+	panicked := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+				if r != http.ErrAbortHandler {
+					t.Fatalf("panic = %v, want http.ErrAbortHandler", r)
+				}
+			}
+		}()
+		srv.handleSQLExportDownload(w, req)
+	}()
+	if !panicked {
+		t.Fatal("a delivery that could not be flushed must abort, not declare the archive delivered")
+	}
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v over a writer that cannot flush, want none (the build must not be removed)", stub.delivered)
+	}
+	if st := stub.SQLExportStatus(""); st.State != "succeeded" {
+		t.Fatalf("state = %s, want succeeded (never downloaded)", st.State)
+	}
+	if stub.heldOnce != 1 || stub.holds != 0 {
+		t.Fatalf("holds: taken %d, open %d; want one taken and released on abort", stub.heldOnce, stub.holds)
+	}
+	if got := logs.String(); !strings.Contains(got, "level=ERROR") || !strings.Contains(got, "*console.bareWriter") {
+		t.Fatalf("log = %q, want an ERROR naming the writer type", got)
+	}
+	var ev *ext.AuditEvent
+	for _, e := range rec.Events() {
+		if e.Action == "baseline.download" {
+			c := e
+			ev = &c
+		}
+	}
+	if ev == nil || ev.Detail["aborted"] != "true" {
+		t.Fatalf("audit = %v, want the aborted handover recorded", ev)
+	}
+}
+
+// TestSQLExportDownload_holdRefused: a build that expired or was replaced
+// between the readiness read and the hold is refused, not streamed.
+func TestSQLExportDownload_holdRefused(t *testing.T) {
+	dir := newSQLDumpFixture(t)
+	stub := &stubSQLExporter{dir: dir, ready: true, holdRefused: true,
+		st: BaselineStatus{State: "succeeded", At: "2026-06-10T12:00:00Z"}}
+	srv := newSQLExportServer(t, stub)
+	id := addRestoreEntry(t, srv, t.TempDir())
+	w, body := doServersReq(t, srv, "GET", "/api/servers/"+id+"/sql-export/download", "")
+	if w.Code != 409 {
+		t.Fatalf("code=%d body=%s, want 409", w.Code, body)
+	}
+	if len(stub.delivered) != 0 {
+		t.Fatalf("delivered = %v, want none", stub.delivered)
 	}
 }

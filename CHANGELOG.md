@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The console's Status page shows the index disk-capacity projection**
+  (#1444). An **Index disk** card carries what `bintrail doctor` already
+  computes, for the selected server: index size, write rate, the size the
+  index settles at for the configured retention, free space on the index
+  volume and how long it lasts at the current rate. The grade is the
+  doctor's (`GET /api/capacity` runs the doctor's own probe and verdict over
+  the console's connection, with no thresholds of its own); a warn or fail
+  grade also renders a box above the cards with the plain reading and what
+  fixes it, so a filling index volume is seen where operators look, before
+  capture stalls. Honest where a piece is missing: free space the process
+  cannot measure (the index on another host or container) reads "not
+  measurable from here", never a number, and the standalone read-only
+  console, which runs no rotation, reports the retention as not known
+  instead of grading an index another process rotates as unbounded; only
+  the free-space floor still warns there. Under `watch` the window is the
+  effective rotation policy, override or daemon default, and rotation off
+  grades as unbounded growth.
+- **Console pages link to their docs page** (#1450). Every view whose subject
+  has a page on www.dbtrail.com/docs now shows a small Docs link beside its
+  title, opening the page in a new tab: Events and Restore (the recovery
+  guide), Backups (backup strategy), Verification, Storage (capacity
+  planning) and Connect AI (Claude setup). It is a plain link, so an
+  air-gapped console makes no request for it. The route to page table lives
+  in one place in the console's app.js; a Go test pins it to that exact set
+  of pages, and `BINTRAIL_CHECK_DOCS_LINKS=1 go test ./internal/console/
+  -run Docs` fetches each page and checks it is the real page, not the
+  site's catch-all shell. Views with no page of their own show no link.
 - **The console's telemetry card shows the exact sample event** (#1447). The
   Usage telemetry card (Settings > Storage) gains a folded "Show a sample
   event" section with the JSON one event would carry, byte for byte as
@@ -55,6 +82,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   users ...`) is recorded with an empty schema, so a deny on a table also
   withholds unqualified DDL on a table of that name, and the page shows such
   rows by table alone. The response says what it left out.
+- **Primary key ranges on `query` and `recover`** (#1440). `--pk-min` /
+  `--pk-max` (MCP: `pk_min` / `pk_max`), inclusive, either bound alone or
+  both, answer "every event on ids 1000 through 1999" without enumerating the
+  keys into `--pks`. Single-column integer keys only: the table's key is read
+  from the schema snapshot before anything runs, and a composite, DECIMAL,
+  FLOAT, string or binary key is refused with the table's actual key shape.
+  The stored key is text, so both engines cast it to a 64-bit integer whose
+  signedness matches the column (SIGNED/UNSIGNED on the live index, BIGINT/
+  UBIGINT over the Parquet archives), and a bound the column cannot hold is
+  refused up front. Both engines accept the same spellings, the canonical
+  decimal rendering of an integer, through a round trip of the cast (a
+  `DECIMAL` key stored as `2.00`, a composite `1|2`, `abc`, `007`, `+5` or
+  an empty key is out on both sides), and the live and archived result sets
+  are pinned equal for keys that expose string order (9, 10, 100), negatives,
+  64-bit width and those left-behind spellings. The range cannot use the key
+  index, so it scans the partitions the time filters keep: the help text says
+  so and points at `--since`/`--until`. See docs/query-and-recovery.md.
 - **The Connect page shows the time-travel SQL port** (#1446). Settings →
   Connect AI gains a "Connect a SQL client" panel for the embedded
   MySQL-protocol port (`bintrail-console watch --flashback-listen`). With the
@@ -69,6 +113,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only: the console never opens or closes the port.
 
 ### Changed
+- **Staged `.sql` backups expire** (#1448). A backup built from the Backups
+  page used to stay in the daemon's staging directory until the next build
+  or a restart, parking a full plaintext copy of every table on the index
+  host with nothing on any page to show it. Now the build is removed the
+  moment a download completes, 4 hours after it finished if nobody
+  downloaded it, and at once when the build fails; a new build for the same
+  server still replaces the previous one. The Ready line shows the size and
+  the download deadline, and the status reports `expires_at`, then
+  `downloaded` or `expired` once the file is gone. Startup sweeps every
+  build a previous process left behind, one build at a time, and deleting a
+  staged run by hand now reads as `expired` on the next poll instead of a
+  download button that answers 409. Every removal is scoped to the
+  `sql-export` staging directory and refuses any path outside it or across
+  a symbolic link. The Storage page gains a **Staged downloads** card
+  (`staging` in `GET /api/storage`) with each build's server, size and
+  deadline, so the space is visible while it exists. A previous build that
+  a new build could not remove stays on that card (state `replaced`, with
+  the reason), is named in the new build's `staging_error` until its removal
+  succeeds, and is retried every minute; the new build stays downloadable
+  (`removal_owed` in the status says when a build's OWN removal is what is
+  pending). A download whose response writer cannot flush aborts and logs
+  the writer type instead of consuming the build.
 - **Usage telemetry classifies first-run failures** (#1503). A fresh install
   that could not start reported every attempt as `error_class: unknown`, so
   the one thing telemetry exists to show — why a first run fails — was
@@ -93,6 +159,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged.
 
 ### Fixed
+- **`export iceberg` no longer records `snapshot_id: 0` for a zero-row first
+  load** (#1509). A baseline with zero rows commits the table and its cursor
+  and no data file, so the table has no Iceberg snapshot; the audit event
+  named snapshot `0`, an id no snapshot has. The event still fires (a table
+  and a cursor were written) with `rows: 0` and no `snapshot_id`. The
+  `--format json` outcome already left the field out, but only because 0 is
+  the zero value; it now leaves it out on absence. `Outcome.SnapshotID` and
+  `Commit.SnapshotID` are `*int64`, nil when absent.
+- **`export iceberg` renders a JSON column one way on both paths** (#1508).
+  The first load copied the baseline's text, which is MySQL's own rendering
+  of the document (keys in MySQL's order, a space after every comma), while
+  the deltas re-encoded the decoded row image (keys sorted, no spaces, `<`
+  escaped), so one value read as two texts depending on which run wrote the
+  row. Both paths now emit one rendering: keys sorted, no whitespace, `<`,
+  `>`, `&` and numbers as written. The load parses and re-emits the
+  baseline's text; a JSON column whose text does not parse refuses the load
+  instead of copying it. The first load records which columns it rendered
+  as JSON in the table's properties, in the same commit as the data, so
+  every later run renders the same columns whatever the schema snapshot
+  says, and a column changed between JSON and TEXT since the load is
+  refused like any other type change. A table loaded by a build without
+  this property keeps MySQL's text in its loaded rows until the table
+  directory is removed and reloaded.
+- **`list_schema_changes` keeps same-second DDLs in the order they ran**
+  (#1441). `detected_at` has one-second resolution and a migration lands
+  dozens of statements inside one second, but the tool sorted by that column
+  alone, so inside a same-second group the rows came back in storage order:
+  oldest first, the opposite of the newest-first promise. A CREATE listed
+  before the DROP that followed it read as "dropped, then created". The order
+  now breaks ties by binlog coordinate (`binlog_file`, then `binlog_pos`) and
+  finally by `id`, which also makes a `limit` that cuts inside the group keep
+  the same rows on every call. The tool description and docs carry the one
+  caveat the stored data forces: `schema_changes` records no source identity,
+  so in an index fed by more than one source, or by a Postgres source (whose
+  LSN file names are not zero-padded), same-second changes have a repeatable
+  order, not their true one. The unfiltered listing used to walk the
+  `detected_at` index backward and stop at the limit; it now costs a sort over
+  the filtered rows, so narrow with `since`/`until` on a large table.
 - **The console's capture-health detail no longer names tables a restricted
   session cannot read** (#1452). `GET /api/status` served
   `capture_health.skipped[*].tables` and the explanation prose built from

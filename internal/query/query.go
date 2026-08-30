@@ -194,11 +194,18 @@ type Options struct {
 	// be stale relative to the live table — callers set both candidates here
 	// so a stale snapshot never regresses a previously-correct lookup.
 	PKValuesAlt string
-	PKValuesIn  []string         // multi-PK lookup (mutually exclusive with PKValues)
-	EventType   *event.EventType // nil = all types
-	GTID        string
-	Since       *time.Time
-	Until       *time.Time
+	PKValuesIn  []string // multi-PK lookup (mutually exclusive with PKValues)
+	// PKRange restricts results to a single-column integer primary key
+	// within an inclusive window (#1440). Mutually exclusive with
+	// PKValues/PKValuesIn, requires Schema and Table, and must be resolved
+	// against the schema snapshot (PKRange.ResolveCast) before the fetch:
+	// every engine refuses an unresolved one. See the PKRange doc for scope
+	// and cost.
+	PKRange   *PKRange
+	EventType *event.EventType // nil = all types
+	GTID      string
+	Since     *time.Time
+	Until     *time.Time
 	// UntilPos, when set, bounds events to those at-or-before an exact binlog
 	// coordinate (file + end position) — independent of wall-clock time. It is
 	// the precise upper bound for "reconstruct the table to exactly this point"
@@ -425,6 +432,9 @@ func (e *Engine) Fetch(ctx context.Context, opts Options) ([]ResultRow, error) {
 		return nil, err
 	}
 	if err := opts.ValidateStatementFilter(); err != nil {
+		return nil, err
+	}
+	if err := opts.ValidatePKRange(); err != nil {
 		return nil, err
 	}
 	q, args := buildQuery(opts)
@@ -674,6 +684,12 @@ func buildQuery(opts Options) (string, []any) {
 			args = append(args, v)
 		}
 		where = append(where, "pk_values IN ("+strings.Join(placeholders, ",")+")")
+	}
+	if opts.PKRange != nil {
+		// Numeric window over a single-column integer key (#1440). The cast
+		// cannot use pk_hash, so within the time-pruned partitions this is a
+		// scan; the bounds are inlined integer literals, see mysqlPredicates.
+		where = append(where, opts.PKRange.mysqlPredicates()...)
 	}
 	if opts.EventType != nil {
 		where = append(where, "event_type = ?")

@@ -65,6 +65,7 @@ var apiRoutePerms = []routePerm{
 	// it also reads /api/events.
 	{"GET", "/api/status", ext.PermStatusRead},
 	{"GET", "/api/coverage", ext.PermStatusRead},
+	{"GET", "/api/capacity", ext.PermStatusRead},
 	{"GET", "/api/activity", ext.PermQueryExecute},
 	{"GET", "/api/events", ext.PermQueryExecute},
 	// DDL history (#1443) is tiered with the events browser: it names tables

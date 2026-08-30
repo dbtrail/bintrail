@@ -86,7 +86,7 @@ func TestQueryCmd_emptyStringDefaults(t *testing.T) {
 
 func TestQueryCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
-		"index-dsn", "schema", "table", "pk", "pks", "limit-per-pk", "event-type",
+		"index-dsn", "schema", "table", "pk", "pks", "pk-min", "pk-max", "limit-per-pk", "event-type",
 		"gtid", "since", "until", "changed-column", "flag", "format", "limit",
 		"no-archive",
 	} {

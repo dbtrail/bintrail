@@ -57,6 +57,27 @@ const ROUTES = ["overview", "events", "schema-changes", "timetravel", "recover",
   // restorable", roughly two screens below the fold.
   "baselines", "verification"];
 
+// DOCS_PAGES maps a route to its page on www.dbtrail.com/docs (#1450), the
+// separately authored docs site. NOT this repo's docs/*.md: the site does not
+// serve those, and it answers HTTP 200 with a small shell for ANY /docs/
+// path, so neither a repo file nor a status code proves a link resolves.
+// assets_docs_links_test.go pins this table exactly and, with
+// BINTRAIL_CHECK_DOCS_LINKS=1, fetches each page and checks its title.
+// pageHead renders one plain link beside the title. Nothing here fetches:
+// air-gapped consoles are a first-class deployment, and a link is inert
+// offline. A view without a page of its own gets NO link on purpose
+// (Overview, Status, SQL): a link to the docs index would teach people the
+// button is noise. Extension views are out of scope.
+const DOCS_BASE = "https://www.dbtrail.com/docs/";
+const DOCS_PAGES = {
+  events: "guides/recovery",
+  recover: "guides/recovery",
+  baselines: "guides/backup-strategy",
+  verification: "guides/verify",
+  storage: "guides/capacity-planning",
+  connect: "claude/setup",
+};
+
 const MON_STATE_TITLES = {
   failed: "connection is failing and retrying automatically; press Start for details",
   stalled: "connected, but hasn't made progress for several minutes",
@@ -71,6 +92,7 @@ const ICONS = {
   warn: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>`,
   calendar: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg>`,
   ext: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>`,
+  external: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"></path><path d="M20 4l-9 9"></path><path d="M19 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h4"></path></svg>`,
   refresh: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>`,
 };
 
@@ -784,8 +806,25 @@ function renderNotes(node, notes) {
 
 function badge(type) { return el("span", { class: "badge " + badgeClass(type), text: type }); }
 
+// docsLink is the page-header Docs link for a route (#1450), or null when
+// DOCS_PAGES has no page for it. A plain anchor: no request, no probe.
+function docsLink(route) {
+  const slug = DOCS_PAGES[route];
+  if (!slug) return null;
+  const a = el("a", { class: "page-docs", href: DOCS_BASE + slug + "/", target: "_blank", rel: "noopener",
+    title: "Open the docs for this page in a new tab" });
+  a.append(el("span", { text: "Docs" }), icon("external"));
+  return a;
+}
+
 function pageHead(title, subNode) {
-  const head = el("div", { class: "page-head" }, el("h1", { class: "page-title", text: title }));
+  // The route is read from the location on every call, so the link follows
+  // every route change and re-render, not only the first paint. It sits
+  // BESIDE the h1, not inside it: the title wears a clipped text gradient and
+  // is read as a heading, and "Events Docs" is not the page's name.
+  const row = el("div", { class: "page-title-row" },
+    el("h1", { class: "page-title", text: title }), docsLink(routeFromLocation()));
+  const head = el("div", { class: "page-head" }, row);
   if (subNode) head.append(subNode);
   return head;
 }
@@ -3136,8 +3175,12 @@ function renderTimeline(container, data, onDone) {
 async function renderStatus() {
   const gen = serverGen, vgen = viewGen;
   viewLoading();
-  let data;
-  try { data = await api("/api/status"); }
+  let data, capacity;
+  // The index-disk read degrades independently (as the Storage panels do): a
+  // failed /api/capacity renders its own note inside the card, never blanking
+  // the health page it sits on.
+  const asErr = (err) => ({ error: (err && err.message) || String(err) });
+  try { [data, capacity] = await Promise.all([api("/api/status"), api("/api/capacity").catch(asErr)]); }
   catch (err) { if (gen !== serverGen || vgen !== viewGen) return; const v = VIEW(); clear(v); v.append(pageHead("Status", null)); renderError(v, err); return; }
   if (gen !== serverGen || vgen !== viewGen) return;
   updateSideMeta(data);
@@ -3184,6 +3227,7 @@ async function renderStatus() {
     ["rows", arch.total_rows],
     ["size", arch.total_size_human],
   ]));
+  cards.append(capacityCard(capacity));
   // Replication-health panel (#599): the streaming daemon polls the PostgreSQL source
   // (slot wal_status/lag + REPLICA IDENTITY coverage) and persists a snapshot to the
   // index; this renders it. Gated on source==postgresql AND a snapshot existing.
@@ -3198,6 +3242,10 @@ async function renderStatus() {
   // second green box.
   const captureHealth = captureHealthBox(stream);
   if (captureHealth) v.append(captureHealth);
+  // Index-disk surface (#1444): only the warn/fail grades render a box, so a
+  // filling index volume is read before the cards, next to the other alarms.
+  const capBox = capacityBox(capacity);
+  if (capBox) v.append(capBox);
   v.append(cards);
   viewEnter();
 }
@@ -3210,6 +3258,140 @@ function statusCard(title, rows) {
       el("span", { class: "kv-v" + (big ? " big" : ""), text: val === null || val === undefined ? "—" : String(val) })));
   });
   return card;
+}
+
+// ── Index disk (#1444) ──
+//
+// capacityCard and capacityBox render GET /api/capacity: the projection
+// `bintrail doctor` computes (write rate from the last 24 hours of partition
+// statistics, steady-state size over the retention window, free space on the
+// index volume when this process can measure it). The GRADE is the doctor's,
+// carried in `status`; the copy keys on `reason` and never re-derives a
+// threshold, so the console and the CLI cannot disagree about the same disk.
+// Two honesty rules the backend enforces and the copy must keep: free space
+// that is not measurable from here is said so, never shown as a number; and
+// the read-only console, which does not run rotation, gets no "grows without
+// limit" verdict (retention.known is false there). Both pure and
+// fixture-drivable, like continuityBox.
+
+function daysText(d) {
+  if (d === null || d === undefined || !isFinite(d)) return "";
+  if (d < 1) return "under a day";
+  if (d < 10) return "about " + d.toFixed(1) + " days";
+  return "about " + Math.round(d) + " days";
+}
+
+function capacityStateClass(status) {
+  switch (status) {
+    case "pass": return "hstat-ok";
+    case "warn": return "hstat-warn";
+    case "fail": return "hstat-err";
+    default: return "hstat-muted";
+  }
+}
+
+function capacityStateText(cap) {
+  switch (cap.reason) {
+    case "ok": return "ok";
+    case "headroom_low": return "tight headroom";
+    case "free_under_floor": return "little free space";
+    case "growth_exceeds_free": return "will fill";
+    case "no_retention": return "grows without limit";
+    case "free_unknown": return "free space unknown";
+    case "retention_unknown": return "no window known here";
+    case "not_enough_history": return "measuring";
+    case "not_initialized": return "no index yet";
+    default: return cap.status || "unknown";
+  }
+}
+
+// capacityNote is the one-line reading under the numbers: what the grade
+// means for this server, or why there is no grade.
+function capacityNote(cap) {
+  switch (cap.reason) {
+    case "ok":
+      return "Fits with room to spare: about " + humanBytes(cap.remaining_bytes) + " of growth ahead, " + humanBytes(cap.free_bytes) + " free. Rotation caps the index before the disk fills.";
+    case "free_unknown":
+      return "The index runs on another host or container, so free space is not measurable from this console. Watch the index volume there and keep about 30% headroom above the steady size.";
+    case "retention_unknown":
+      return "This read-only console does not run rotation, so it cannot tell how long the index keeps history or what size it settles at. Run the check where rotation runs (CLI: bintrail doctor --retain).";
+    case "not_enough_history":
+      return "A write rate needs at least 3 recent hours with events (" + (cap.sample_hours || 0) + " so far). Check back after a few hours of capture.";
+    case "not_initialized":
+      return "The index has no events table yet. It appears once capture starts.";
+    default:
+      return "";
+  }
+}
+
+function capacityCard(cap) {
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Index disk" }));
+  if (!cap || cap.error) {
+    card.append(el("p", { class: "form-hint", text: "Could not measure the index disk" + (cap && cap.error ? ": " + cap.error : ".") }));
+    return card;
+  }
+  const ret = cap.retention || {};
+  const rows = [["index size", humanBytes(cap.current_bytes), true]];
+  rows.push(["write rate", cap.measured
+    ? humanBytes(cap.growth_bytes_per_day) + " a day (" + Math.round(cap.events_per_day).toLocaleString() + " events)"
+    : "not enough history yet"]);
+  rows.push(["keeps for", !ret.known ? "not known here" : (ret.enabled ? ret.retain + (ret.source === "override" ? "" : " (daemon default)") : "rotation is off")]);
+  if (cap.measured && cap.projected_bytes > 0) rows.push(["steady size", humanBytes(cap.projected_bytes)]);
+  rows.push(["free on disk", cap.free_known ? humanBytes(cap.free_bytes) : "not measurable from here"]);
+  if (cap.days_until_full !== null && cap.days_until_full !== undefined) rows.push(["free space lasts", daysText(cap.days_until_full) + " at this rate"]);
+  rows.forEach(([k, val, big]) => {
+    card.append(el("div", { class: "kv" },
+      el("span", { class: "kv-k", text: k }),
+      el("span", { class: "kv-v" + (big ? " big" : ""), text: val })));
+  });
+  card.append(healthKV("state", el("span", { class: "hstat " + capacityStateClass(cap.status), text: capacityStateText(cap) })));
+  const note = capacityNote(cap);
+  if (note) card.append(el("div", { class: "hlist", text: note }));
+  return card;
+}
+
+// capacityBox is the alarm: rendered only for the doctor's warn and fail
+// grades, with the plain reading of the numbers and what fixes it.
+function capacityBox(cap) {
+  if (!cap || cap.error || (cap.status !== "warn" && cap.status !== "fail")) return null;
+  const growth = humanBytes(cap.growth_bytes_per_day) + " a day";
+  const free = humanBytes(cap.free_bytes);
+  const days = daysText(cap.days_until_full);
+  const ahead = humanBytes(cap.remaining_bytes);
+  const window = (cap.retention && cap.retention.retain) || "";
+  const stops = " A full disk stops capture, and once the source deletes its binlogs those changes are gone for good.";
+  const shrink = "Grow the index volume, or shorten how long the index keeps history (CLI: --rotate-retain), so capture keeps running.";
+  let head, body, help;
+  switch (cap.reason) {
+    case "growth_exceeds_free":
+      head = "⚠ The index disk will fill before rotation caps the index";
+      body = "The index still grows by about " + ahead + " before the " + window + " window holds it steady, but only " + free + " is free. At " + growth + " that is " + days + "." + stops;
+      help = "Free space now: shorten the window and rotate right away (CLI: bintrail rotate --retain 7d), then grow the volume or keep the shorter window. Archive to Parquet first to keep the history.";
+      break;
+    case "free_under_floor":
+      head = "⚠ Little free space left on the index disk";
+      body = "Only " + free + " is free: " + days + " of writes at " + growth + ". Rotation normally frees space in time, but a stalled rotation or a burst of writes fills the disk and stops capture.";
+      help = shrink;
+      break;
+    case "headroom_low":
+      head = "⚠ The index disk is getting tight";
+      body = "The index still grows by about " + ahead + " before it settles, which uses over 70% of the " + free + " free. A burst of writes could fill the disk and stop capture.";
+      help = shrink;
+      break;
+    case "no_retention":
+      head = "⚠ Nothing caps the index: it grows without limit";
+      body = "This daemon runs with rotation off, so the index grows by " + growth + " at the current rate" +
+        (cap.free_known ? ", and the disk fills in " + days + " (" + free + " free)" : "") + "." + stops;
+      help = "Turn rotation on (CLI: --rotate-retain 30d) so old partitions are dropped and the index stays bounded. Archive to Parquet first to keep the history.";
+      break;
+    default:
+      return null;
+  }
+  const box = el("div", { class: cap.status === "fail" ? "error-box" : "warn-box" });
+  box.append(el("b", { text: head }));
+  box.append(el("div", { text: body }));
+  box.append(el("div", { class: "warn-line", text: help }));
+  return box;
 }
 
 // continuityBox renders the stream-continuity surface, or null when there is
@@ -3581,6 +3763,8 @@ function buildStorage(serversRes, rotation, backupRefresh, storage, baselines, t
   cards.append(rotationCard(rotation));
   cards.append(backupRefreshCard(backupRefresh));
   cards.append(credentialsCard(storage));
+  const staging = stagingCard(storage, servers);
+  if (staging) cards.append(staging);
   cards.append(telemetryCard(telemetry));
   if (capsCache.views) cards.append(duckdbCard());
   cards.append(baselineSummaryCard(baselines, cur, { linkOnward: true }));
@@ -3829,6 +4013,41 @@ function credentialsCard(storage) {
   if (aws.web_identity) kvRow(adv, "EKS IRSA", "detected");
   card.append(adv);
   card.append(el("p", { class: "form-hint", text: "Note: an IAM role can still be active even if none of the signals above show as set." }));
+  return card;
+}
+
+// stagingCard shows the disk the sql-export staging holds right now (#1448):
+// every .sql backup built from the Backups page waits on the daemon's disk
+// for its download, and that space used to be invisible until someone ran
+// du. Null when this daemon cannot build .sql backups (no staging exists) or
+// when /api/storage failed (credentialsCard already reports that).
+function stagingCard(storage, servers) {
+  const stg = storage && storage.staging;
+  if (!stg) return null;
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Staged downloads" }));
+  const hours = Math.round(stg.ttl_hours || 0);
+  const builds = stg.builds || [];
+  if (!builds.length) {
+    card.append(el("p", { class: "stg-hint", text:
+      "Nothing staged. A .sql backup built from the Backups page waits here until it is downloaded or " +
+      hours + " hours pass, then it is removed." }));
+  } else {
+    card.append(el("p", { class: "stg-hint", text:
+      humanBytes(stg.bytes || 0) + " on this machine in " + builds.length + (builds.length === 1 ? " build" : " builds") +
+      (builds.some((b) => !b.bytes_known) ? " (not counting builds whose size could not be measured)" : "") +
+      ". Each is removed once downloaded, or " + hours + " hours after it finished." }));
+    for (const b of builds) {
+      const name = b.server_name || ((servers || []).find((s) => s.id === b.server_id) || {}).name || b.server_id;
+      let what;
+      if (b.staging_error) what = "could not be removed or read: " + b.staging_error;
+      else if (b.state === "running") what = "building" + (b.at ? " as of " + utcLabel(b.at) : "");
+      else if (b.state === "failed") what = "failed build, being removed";
+      else what = "ready" + (b.at ? " as of " + utcLabel(b.at) : "") + (b.expires_at ? ", removed at " + utcLabel(b.expires_at) + " if not downloaded" : "");
+      const size = b.bytes_known ? humanBytes(b.bytes || 0) : "size unknown";
+      kvRow(card, name, size + ", " + what);
+    }
+  }
+  kvRow(card, "location", stg.dir || "");
   return card;
 }
 
@@ -4863,8 +5082,11 @@ async function startBackupRestore(id, at, btn, msgEl) {
 // backupSQLExportCard offers the made-to-measure .sql backup: pick any past
 // moment, the console folds the nearest earlier backup forward to it and
 // packages the result as plain SQL files. Unlike the point-in-time restore it
-// publishes NOTHING: the build lives in a staging directory until the next
-// build (or a daemon restart) replaces it.
+// publishes NOTHING: the build lives in a staging directory until it is
+// downloaded, until its download deadline passes (the status carries
+// expires_at), or until the next build or a daemon restart replaces it
+// (#1448). The two terminal states after that, "downloaded" and "expired",
+// both mean the same thing to the operator: the file is gone, build again.
 // S3-backed backups qualify too (the fold engine reads them directly), which
 // is why this card has no b.kind === "dir" gate.
 function backupSQLExportCard(cur, b, sqlSt) {
@@ -4893,9 +5115,31 @@ function backupSQLExportCard(cur, b, sqlSt) {
   } else if (st && st.state === "succeeded") {
     const dl = el("button", { class: "btn", type: "button", text: "Download .sql backup (.tar.gz)" });
     dl.onclick = () => downloadSQLExport(cur.id, dl, st.bytes || 0);
-    body.append(el("div", { class: "bk-restore-row" },
+    const row = el("div", { class: "bk-restore-row" },
       el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") +
-        (st.bytes ? " (" + humanBytes(st.bytes) + ")" : "") + "." }), dl));
+        (st.bytes ? " (" + humanBytes(st.bytes) + " on this machine)" : "") + "." }));
+    if (!st.removal_owed) row.append(dl);
+    body.append(row);
+    body.append(el("p", { class: "form-hint", text:
+      (st.expires_at ? "The download stays available until " + utcLabel(st.expires_at) + ". " : "") +
+      "The file is removed from this machine once you download it, when that time passes, or when a new build starts." }));
+    details.open = true;
+  } else if (st && st.state === "downloaded") {
+    body.append(el("p", { class: "form-hint", text:
+      "Downloaded" + (st.downloaded_at ? " at " + utcLabel(st.downloaded_at) : "") +
+      ": the backup as of " + utcLabel(st.at || "") + " was handed over and its file was removed from this machine. Build again for another copy." }));
+    details.open = true;
+  } else if (st && st.state === "expired") {
+    body.append(el("p", { class: "form-hint", text:
+      "The backup built for " + utcLabel(st.at || "") + " is no longer on this machine: it was not downloaded before its deadline, or its files were removed. Build again for a fresh copy." }));
+    details.open = true;
+  }
+  // The state follows the disk: a removal that failed keeps the build in
+  // its previous state and says so here, over a download button that would
+  // only answer "not ready".
+  if (st && st.staging_error) {
+    body.append(el("p", { class: "form-msg err", text:
+      "Staging problem: " + st.staging_error + ". The daemon retries every minute; check the staging directory on the machine running it." }));
     details.open = true;
   }
   details.append(body);

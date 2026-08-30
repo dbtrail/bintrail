@@ -3,6 +3,7 @@ package doctor
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -47,13 +48,167 @@ const capFreeFloorDays = 3.0
 // preflight, which treats this check as advisory (see runUp).
 const CapacityCheckName = "Index disk capacity"
 
-// capPartitionSample is one named hourly partition's measured footprint.
+// CapacityPartition is one named hourly partition's measured footprint.
 // Rows and bytes come from information_schema — InnoDB ESTIMATES, good for
 // capacity planning, not exact (docs/capacity.md).
-type capPartitionSample struct {
-	hour  time.Time
-	rows  uint64
-	bytes uint64
+type CapacityPartition struct {
+	Hour  time.Time
+	Rows  uint64
+	Bytes uint64
+}
+
+// CapacityProbe is everything the capacity check reads from the index
+// server, separated from the verdict so another surface (the console, #1444)
+// can run the SAME projection and thresholds over its own connection — or a
+// test can feed a fixture — without re-deriving either.
+type CapacityProbe struct {
+	// Partitions are binlog_events' named hourly partitions (p_future and
+	// unrecognised names carry no hour and are dropped at read time).
+	Partitions []CapacityPartition
+	// TableVisible reports whether binlog_events exists AND is visible to
+	// this user. Only probed when Partitions is empty (the one case where
+	// "not initialized yet" and "no history yet" need telling apart); true
+	// whenever partitions were read.
+	TableVisible bool
+	// FreeBytes is the index datadir's free space; FreeKnown is false when
+	// it is not measurable from this process (see indexDatadirFree).
+	FreeBytes uint64
+	FreeKnown bool
+}
+
+// CapacityQueryError is the error ProbeCapacity returns when one of its
+// information_schema reads fails. What names the read in operator words,
+// Table the system table it needed — the CLI check builds its remediation
+// from it.
+type CapacityQueryError struct {
+	What  string
+	Table string
+	Err   error
+}
+
+func (e *CapacityQueryError) Error() string { return e.What + ": " + e.Err.Error() }
+func (e *CapacityQueryError) Unwrap() error { return e.Err }
+
+// ProbeCapacity reads the capacity check's inputs over an open connection
+// to the index server: partition statistics, table visibility when there
+// are none, and the datadir's free space (best-effort: unknown, never a
+// wrong number). dsn is the connection's DSN, used only to decide whether
+// the datadir can be measured from this host. The connection may or may not
+// have dbName selected — every query qualifies the schema explicitly.
+func ProbeCapacity(ctx context.Context, db *sql.DB, dsn, dbName string) (CapacityProbe, error) {
+	samples, err := loadPartitionSamples(ctx, db, dbName)
+	if err != nil {
+		return CapacityProbe{}, &CapacityQueryError{What: "cannot read partition statistics", Table: "information_schema.PARTITIONS", Err: err}
+	}
+	probe := CapacityProbe{Partitions: samples, TableVisible: true}
+	if len(samples) == 0 {
+		// Zero partitions has two very different causes (the #402 lesson):
+		// binlog_events not visible (pre-init, or a privilege gap) vs a
+		// freshly-initialized empty index. Disambiguate so the SKIP advice
+		// is never "re-run later" for a table that will never appear.
+		visible, err := tableVisible(ctx, db, dbName, "binlog_events")
+		if err != nil {
+			return CapacityProbe{}, &CapacityQueryError{What: "cannot check binlog_events visibility", Table: "information_schema.TABLES", Err: err}
+		}
+		probe.TableVisible = visible
+	}
+	probe.FreeBytes, probe.FreeKnown = indexDatadirFree(ctx, db, dsn)
+	return probe, nil
+}
+
+// CapacityReason names the branch of the verdict that fired, so a surface
+// that writes its own copy (the console) keys on the decision, never on the
+// CLI's detail text.
+type CapacityReason string
+
+const (
+	// CapacityNotInitialized: binlog_events is not visible (skip).
+	CapacityNotInitialized CapacityReason = "not_initialized"
+	// CapacityNotEnoughHistory: fewer than capMinSampleHours recent hours or
+	// capMinSampleRows rows to measure a write rate (skip).
+	CapacityNotEnoughHistory CapacityReason = "not_enough_history"
+	// CapacityRetentionUnknown: the caller does not know the retention
+	// window, so no steady-state projection is made (skip). Only the free
+	// floor can still WARN in this mode.
+	CapacityRetentionUnknown CapacityReason = "retention_unknown"
+	// CapacityNoRetention: no rotation configured, the index grows without
+	// bound (warn).
+	CapacityNoRetention CapacityReason = "no_retention"
+	// CapacityFreeUnknown: the projection is known but the datadir's free
+	// space is not measurable from this host, so the thresholds are skipped,
+	// not passed (skip).
+	CapacityFreeUnknown CapacityReason = "free_unknown"
+	// CapacityGrowthExceedsFree: the growth still ahead exceeds the free
+	// space, the disk fills before rotation bounds the index (fail).
+	CapacityGrowthExceedsFree CapacityReason = "growth_exceeds_free"
+	// CapacityFreeUnderFloor: free space is under capFreeFloorDays of the
+	// measured write rate (warn).
+	CapacityFreeUnderFloor CapacityReason = "free_under_floor"
+	// CapacityHeadroomLow: the growth still ahead consumes over
+	// capWarnFraction of the free space (warn).
+	CapacityHeadroomLow CapacityReason = "headroom_low"
+	// CapacityOK: the growth ahead fits with headroom (pass).
+	CapacityOK CapacityReason = "ok"
+)
+
+// CapacityMeasurement is the capacity check's structured outcome: the
+// numbers behind the verdict plus the verdict itself. Status and Reason are
+// the CLI check's decision, taken by classifyCapacity; the CLI renders its
+// text from this same struct, so a second surface cannot drift from it.
+type CapacityMeasurement struct {
+	Status CheckStatus
+	Reason CapacityReason
+	// Measured is true when there was enough recent history for a write
+	// rate; the rate fields below are zero otherwise. CurrentBytes is
+	// summed regardless.
+	Measured    bool
+	SampleHours int
+	// CurrentBytes is binlog_events' total footprint right now.
+	CurrentBytes  uint64
+	EventsPerDay  float64
+	BytesPerEvent float64
+	// GrowthBytesPerDay = EventsPerDay × BytesPerEvent.
+	GrowthBytesPerDay float64
+	// Retain is the retention window the projection was made over;
+	// RetainKnown false means the caller could not say (no projection).
+	Retain      time.Duration
+	RetainKnown bool
+	// ProjectedBytes is the steady-state size over Retain (0 when Retain is
+	// 0 or unknown); RemainingBytes the growth still ahead of CurrentBytes
+	// to reach it (floored at 0).
+	ProjectedBytes float64
+	RemainingBytes float64
+	FreeBytes      uint64
+	FreeKnown      bool
+	// DaysUntilFull is FreeBytes over the daily growth: how long the free
+	// space lasts at the measured rate if nothing frees it. Present
+	// (DaysUntilFullKnown) only when free space is known and the rate is
+	// positive. Under a retention window rotation frees space before then,
+	// so it reads as headroom there and as a forecast only without one.
+	DaysUntilFull      float64
+	DaysUntilFullKnown bool
+}
+
+// EvaluateCapacity runs the projection and the verdict over a probe.
+// retainKnown false is the console's standalone-serve case: the process
+// that rotates the index is not this one, so the window is unknown and the
+// check must not claim "unbounded" — it projects nothing and only the
+// free-space floor can warn.
+func EvaluateCapacity(probe CapacityProbe, retain time.Duration, retainKnown bool, now time.Time) CapacityMeasurement {
+	if len(probe.Partitions) == 0 && !probe.TableVisible {
+		// The probe still measured the volume; a surface that reports free
+		// space must not call it unmeasurable because the TABLE is missing.
+		return CapacityMeasurement{
+			Status: StatusSkip, Reason: CapacityNotInitialized,
+			Retain: retain, RetainKnown: retainKnown,
+			FreeBytes: probe.FreeBytes, FreeKnown: probe.FreeKnown,
+		}
+	}
+	if !retainKnown {
+		retain = 0
+	}
+	p, ok := projectCapacity(probe.Partitions, retain, now)
+	return classifyCapacity(p, ok, retain, retainKnown, probe.FreeBytes, probe.FreeKnown)
 }
 
 // capacityProjection is projectCapacity's measured outcome.
@@ -69,18 +224,18 @@ type capacityProjection struct {
 // partitions (the current partial hour would understate the rate) and
 // projects the steady-state size over retain. ok=false when there is not
 // enough recent history to measure.
-func projectCapacity(parts []capPartitionSample, retain time.Duration, now time.Time) (capacityProjection, bool) {
+func projectCapacity(parts []CapacityPartition, retain time.Duration, now time.Time) (capacityProjection, bool) {
 	var p capacityProjection
 	currentHour := now.UTC().Truncate(time.Hour)
 	windowStart := currentHour.Add(-24 * time.Hour)
 	var rows, bytes uint64
 	for _, s := range parts {
-		p.currentBytes += s.bytes
-		if s.rows == 0 || s.hour.Before(windowStart) || !s.hour.Before(currentHour) {
+		p.currentBytes += s.Bytes
+		if s.Rows == 0 || s.Hour.Before(windowStart) || !s.Hour.Before(currentHour) {
 			continue
 		}
-		rows += s.rows
-		bytes += s.bytes
+		rows += s.Rows
+		bytes += s.Bytes
 		p.sampleHours++
 	}
 	if p.sampleHours < capMinSampleHours || rows < capMinSampleRows {
@@ -94,25 +249,123 @@ func projectCapacity(parts []capPartitionSample, retain time.Duration, now time.
 	return p, true
 }
 
-// capacityVerdict turns a measurement into the check outcome:
+// classifyCapacity is the verdict: the pure decision every capacity surface
+// shares (the CLI text below and the console's own copy, #1444).
+//   - not ok (too little history): SKIP.
+//   - retention unknown: SKIP, unless the free-space floor fires — that
+//     rule does not depend on the window, and a nearly-full volume should
+//     be heard regardless of who rotates the index.
 //   - retain == 0 (no rotation configured): WARN — the index grows unbounded
 //     at the measured rate, with days-until-full when free space is known.
+//   - free space unknown: SKIP — an unmeasurable check must not read green.
 //   - REMAINING growth (projection minus what the table already occupies)
-//     >= free space: FAIL with the emergency-rotate remediation. Comparing
-//     the TOTAL projection against free space would double-count
-//     currentBytes — a healthy mature index at steady state (current ≈
-//     projected) would spuriously FAIL on every restart.
+//     >= free space: FAIL. Comparing the TOTAL projection against free
+//     space would double-count currentBytes — a healthy mature index at
+//     steady state (current ≈ projected) would spuriously FAIL on every
+//     restart.
+//   - free space under capFreeFloorDays of the gross write rate: WARN.
+//     Steady state quiets the remaining-growth thresholds, but a nearly-full
+//     volume has no margin for a rotation stall or a spike.
 //   - remaining growth >= capWarnFraction of free space: WARN.
-//   - otherwise PASS; when free space is not measurable from this host the
-//     PASS detail carries the projection and the headroom guidance instead.
-func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, freeKnown bool) CheckResult {
-	growthPerDay := p.eventsPerDay * p.bytesPerEvent
+//   - otherwise PASS.
+func classifyCapacity(p capacityProjection, ok bool, retain time.Duration, retainKnown bool, free uint64, freeKnown bool) CapacityMeasurement {
+	m := CapacityMeasurement{
+		Measured:     ok,
+		SampleHours:  p.sampleHours,
+		CurrentBytes: p.currentBytes,
+		Retain:       retain,
+		RetainKnown:  retainKnown,
+		FreeBytes:    free,
+		FreeKnown:    freeKnown,
+	}
+	if !ok {
+		m.Status, m.Reason = StatusSkip, CapacityNotEnoughHistory
+		return m
+	}
+	m.EventsPerDay = p.eventsPerDay
+	m.BytesPerEvent = p.bytesPerEvent
+	m.GrowthBytesPerDay = p.eventsPerDay * p.bytesPerEvent
+	m.ProjectedBytes = p.projectedBytes
+	if freeKnown && m.GrowthBytesPerDay > 0 {
+		m.DaysUntilFull = float64(free) / m.GrowthBytesPerDay
+		m.DaysUntilFullKnown = true
+	}
+	underFloor := freeKnown && float64(free) < capFreeFloorDays*m.GrowthBytesPerDay
 
+	if !retainKnown {
+		if underFloor {
+			m.Status, m.Reason = StatusWarn, CapacityFreeUnderFloor
+		} else {
+			m.Status, m.Reason = StatusSkip, CapacityRetentionUnknown
+		}
+		return m
+	}
 	if retain == 0 {
+		m.Status, m.Reason = StatusWarn, CapacityNoRetention
+		return m
+	}
+
+	remaining := p.projectedBytes - float64(p.currentBytes)
+	if remaining < 0 {
+		remaining = 0 // rate dropped: rotation will shrink the table into the projection
+	}
+	m.RemainingBytes = remaining
+
+	switch {
+	case !freeKnown:
+		// #948: the index is on a separate host/container (the docker-compose
+		// stack, or a managed/remote index), so statfs can't reach its volume and
+		// the FAIL/WARN thresholds below are unreachable. Report SKIP, not PASS.
+		// Rotation still bounds the volume (#420); the operator monitors the
+		// index disk externally.
+		m.Status, m.Reason = StatusSkip, CapacityFreeUnknown
+	case remaining > 0 && remaining >= float64(free):
+		m.Status, m.Reason = StatusFail, CapacityGrowthExceedsFree
+	case underFloor:
+		m.Status, m.Reason = StatusWarn, CapacityFreeUnderFloor
+	case remaining >= capWarnFraction*float64(free):
+		m.Status, m.Reason = StatusWarn, CapacityHeadroomLow
+	default:
+		m.Status, m.Reason = StatusPass, CapacityOK
+	}
+	return m
+}
+
+// capacityVerdict turns a measurement into the check outcome — the
+// classification above rendered as the CLI check's text.
+func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, freeKnown bool) CheckResult {
+	return capacityCheckResult(classifyCapacity(p, true, retain, true, free, freeKnown), "")
+}
+
+// capacityCheckResult renders a measurement as the doctor's CheckResult.
+// dbName is only needed for the not-initialized message.
+func capacityCheckResult(m CapacityMeasurement, dbName string) CheckResult {
+	switch m.Reason {
+	case CapacityNotInitialized:
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusSkip,
+			Detail: fmt.Sprintf("binlog_events is not visible in %q — the index is not initialized yet (run `bintrail init`/`up`), or this user lacks SELECT on it", dbName),
+		}
+	case CapacityNotEnoughHistory:
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusSkip,
+			Detail: fmt.Sprintf("not enough recent history to measure a write rate (%d sampled hours, need >=%d with >=%d rows) — re-run after a few hours of streaming",
+				m.SampleHours, capMinSampleHours, capMinSampleRows),
+		}
+	case CapacityRetentionUnknown:
+		return CheckResult{
+			Name:   CapacityCheckName,
+			Status: StatusSkip,
+			Detail: fmt.Sprintf("retention window unknown — measured ~%s/day (%.0f events/day × %s/event, InnoDB estimates); current size %s",
+				humanBytes(m.GrowthBytesPerDay), m.EventsPerDay, humanBytes(m.BytesPerEvent), humanBytes(float64(m.CurrentBytes))),
+		}
+	case CapacityNoRetention:
 		detail := fmt.Sprintf("no retention window configured — the index grows unbounded at ~%s/day measured (%.0f events/day × %s/event, InnoDB estimates); current size %s",
-			humanBytes(growthPerDay), p.eventsPerDay, humanBytes(p.bytesPerEvent), humanBytes(float64(p.currentBytes)))
-		if freeKnown && growthPerDay > 0 {
-			detail += fmt.Sprintf("; ~%.0f days until the volume fills (%s free)", float64(free)/growthPerDay, humanBytes(float64(free)))
+			humanBytes(m.GrowthBytesPerDay), m.EventsPerDay, humanBytes(m.BytesPerEvent), humanBytes(float64(m.CurrentBytes)))
+		if m.DaysUntilFullKnown {
+			detail += fmt.Sprintf("; ~%.0f days until the volume fills (%s free)", m.DaysUntilFull, humanBytes(float64(m.FreeBytes)))
 		}
 		return CheckResult{
 			Name:   CapacityCheckName,
@@ -124,55 +377,43 @@ func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, fr
 		}
 	}
 
-	remaining := p.projectedBytes - float64(p.currentBytes)
-	if remaining < 0 {
-		remaining = 0 // rate dropped: rotation will shrink the table into the projection
-	}
 	projected := fmt.Sprintf("projected steady-state %s over the %s retention window (measured %.0f events/day × %s/event, InnoDB estimates); current size %s",
-		humanBytes(p.projectedBytes), retain, p.eventsPerDay, humanBytes(p.bytesPerEvent), humanBytes(float64(p.currentBytes)))
+		humanBytes(m.ProjectedBytes), m.Retain, m.EventsPerDay, humanBytes(m.BytesPerEvent), humanBytes(float64(m.CurrentBytes)))
+	free := humanBytes(float64(m.FreeBytes))
 
-	if !freeKnown {
-		// #948: the index is on a separate host/container (the docker-compose
-		// stack, or a managed/remote index), so statfs can't reach its volume and
-		// the FAIL/WARN thresholds below are unreachable. Report SKIP, not PASS —
-		// an unmeasurable check must not read green. Rotation still bounds the
-		// volume (#420); the operator monitors the index disk externally.
+	switch m.Reason {
+	case CapacityFreeUnknown:
 		return CheckResult{
 			Name:   CapacityCheckName,
 			Status: StatusSkip,
 			Detail: projected + " — free space is not measurable from this host (the index runs on a separate host/container), so the disk-capacity thresholds are skipped, not passed; monitor the index volume externally and keep >=30% headroom above the projection (docs/capacity.md)",
 		}
-	}
-
-	switch {
-	case remaining > 0 && remaining >= float64(free):
+	case CapacityGrowthExceedsFree:
 		return CheckResult{
 			Name:   CapacityCheckName,
 			Status: StatusFail,
 			Detail: fmt.Sprintf("%s; the ~%s of growth still ahead EXCEEDS the %s free on the index volume — the disk will fill before rotation bounds the index, stalling the stream (a permanent forensic gap once the source purges its binlogs)",
-				projected, humanBytes(remaining), humanBytes(float64(free))),
+				projected, humanBytes(m.RemainingBytes), free),
 			Remediation: "Free space now: shorten retention and rotate immediately —\n" +
 				"  bintrail rotate --index-dsn \"...\" --retain 7d --no-replace   # DROP PARTITION reclaims space instantly\n" +
 				"(archive first with --archive-dir to keep the history). Then grow the volume or lower --rotate-retain.\n" +
 				"Emergency recipe: docs/deployment.md §12; sizing math: docs/capacity.md",
 		}
-	case float64(free) < capFreeFloorDays*growthPerDay:
-		// Steady state quiets the remaining-growth thresholds, but a
-		// nearly-full volume has no margin for a rotation stall or a spike.
+	case CapacityFreeUnderFloor:
 		return CheckResult{
 			Name:   CapacityCheckName,
 			Status: StatusWarn,
 			Detail: fmt.Sprintf("%s; only %s free — under ~%.0f days of the measured write rate (~%s/day): a rotation stall or a write spike fills the disk",
-				projected, humanBytes(float64(free)), capFreeFloorDays, humanBytes(growthPerDay)),
+				projected, free, capFreeFloorDays, humanBytes(m.GrowthBytesPerDay)),
 			Remediation: "Grow the index volume or shorten the retention window (--rotate-retain / `bintrail rotate --retain`).\n" +
 				"Sizing math: docs/capacity.md",
 		}
-	case remaining >= capWarnFraction*float64(free):
+	case CapacityHeadroomLow:
 		return CheckResult{
 			Name:   CapacityCheckName,
 			Status: StatusWarn,
 			Detail: fmt.Sprintf("%s; the ~%s of growth still ahead consumes over %.0f%% of the %s free on the index volume — little headroom for growth spikes",
-				projected, humanBytes(remaining), capWarnFraction*100, humanBytes(float64(free))),
+				projected, humanBytes(m.RemainingBytes), capWarnFraction*100, free),
 			Remediation: "Grow the index volume or shorten the retention window (--rotate-retain / `bintrail rotate --retain`).\n" +
 				"Sizing math: docs/capacity.md",
 		}
@@ -180,7 +421,7 @@ func capacityVerdict(p capacityProjection, retain time.Duration, free uint64, fr
 		return CheckResult{
 			Name:   CapacityCheckName,
 			Status: StatusPass,
-			Detail: fmt.Sprintf("%s; %s free", projected, humanBytes(float64(free))),
+			Detail: fmt.Sprintf("%s; %s free", projected, free),
 		}
 	}
 }
@@ -198,50 +439,22 @@ func checkIndexCapacity(ctx context.Context, dsn, dbName string, retain time.Dur
 	}
 	defer db.Close()
 
-	samples, err := loadPartitionSamples(ctx, db, dbName)
+	probe, err := ProbeCapacity(ctx, db, dsn, dbName)
 	if err != nil {
 		// A real query error FAILs like every sibling check — a SKIP would
 		// let the operator believe capacity was covered when it wasn't.
-		return CheckResult{
-			Name:        CapacityCheckName,
-			Status:      StatusFail,
-			Detail:      "cannot read partition statistics: " + err.Error(),
-			Remediation: queryErrorRemediation("information_schema.PARTITIONS"),
-		}
-	}
-	if len(samples) == 0 {
-		// Zero partitions has two very different causes (the #402 lesson):
-		// binlog_events not visible (pre-init, or a privilege gap) vs a
-		// freshly-initialized empty index. Disambiguate so the SKIP advice
-		// is never "re-run later" for a table that will never appear.
-		visible, err := tableVisible(ctx, db, dbName, "binlog_events")
-		if err != nil {
+		var qe *CapacityQueryError
+		if errors.As(err, &qe) {
 			return CheckResult{
 				Name:        CapacityCheckName,
 				Status:      StatusFail,
-				Detail:      "cannot check binlog_events visibility: " + err.Error(),
-				Remediation: queryErrorRemediation("information_schema.TABLES"),
+				Detail:      qe.Error(),
+				Remediation: queryErrorRemediation(qe.Table),
 			}
 		}
-		if !visible {
-			return CheckResult{
-				Name:   CapacityCheckName,
-				Status: StatusSkip,
-				Detail: fmt.Sprintf("binlog_events is not visible in %q — the index is not initialized yet (run `bintrail init`/`up`), or this user lacks SELECT on it", dbName),
-			}
-		}
+		return CheckResult{Name: CapacityCheckName, Status: StatusFail, Detail: err.Error()}
 	}
-	proj, ok := projectCapacity(samples, retain, time.Now())
-	if !ok {
-		return CheckResult{
-			Name:   CapacityCheckName,
-			Status: StatusSkip,
-			Detail: fmt.Sprintf("not enough recent history to measure a write rate (%d sampled hours, need >=%d with >=%d rows) — re-run after a few hours of streaming",
-				proj.sampleHours, capMinSampleHours, capMinSampleRows),
-		}
-	}
-	free, freeKnown := indexDatadirFree(ctx, db, dsn)
-	return capacityVerdict(proj, retain, free, freeKnown)
+	return capacityCheckResult(EvaluateCapacity(probe, retain, true, time.Now()), dbName)
 }
 
 // tableVisible reports whether the table exists AND is visible to this user
@@ -263,7 +476,7 @@ func tableVisible(ctx context.Context, db *sql.DB, dbName, table string) (bool, 
 // loadPartitionSamples reads per-partition row/size estimates for
 // binlog_events. A missing table simply yields no rows (the projection then
 // SKIPs with the not-enough-history message).
-func loadPartitionSamples(ctx context.Context, db *sql.DB, dbName string) ([]capPartitionSample, error) {
+func loadPartitionSamples(ctx context.Context, db *sql.DB, dbName string) ([]CapacityPartition, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT PARTITION_NAME, IFNULL(TABLE_ROWS, 0), IFNULL(DATA_LENGTH + INDEX_LENGTH, 0)
 		FROM information_schema.PARTITIONS
@@ -274,18 +487,18 @@ func loadPartitionSamples(ctx context.Context, db *sql.DB, dbName string) ([]cap
 	}
 	defer rows.Close()
 
-	var samples []capPartitionSample
+	var samples []CapacityPartition
 	for rows.Next() {
 		var name string
-		var s capPartitionSample
-		if err := rows.Scan(&name, &s.rows, &s.bytes); err != nil {
+		var s CapacityPartition
+		if err := rows.Scan(&name, &s.Rows, &s.Bytes); err != nil {
 			return nil, err
 		}
 		d, ok := indexer.PartitionDate(name)
 		if !ok {
 			continue // p_future and unrecognised names carry no hour
 		}
-		s.hour = d
+		s.Hour = d
 		samples = append(samples, s)
 	}
 	return samples, rows.Err()

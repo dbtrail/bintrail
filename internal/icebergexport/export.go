@@ -88,7 +88,13 @@ type Outcome struct {
 	Events     int64
 	Upserts    int64
 	Deletes    int64
-	SnapshotID int64
+	// SnapshotID names the Iceberg snapshot the table stands at after the
+	// run, or is nil when there is none: a first load of a baseline with
+	// zero rows commits the table and its cursor but no data file, and a
+	// table without data has no snapshot. Absent, not 0: no snapshot has
+	// that id, and a reader correlating this with iceberg_snapshots()
+	// would look for one.
+	SnapshotID *int64
 	Cursor     string
 	Location   string
 }
@@ -108,9 +114,20 @@ type Commit struct {
 	Rows          int64 // rows loaded (load) or upserted (delta)
 	Deletes       int64
 	Events        int64
-	SnapshotID    int64
+	SnapshotID    *int64 // nil for a load that wrote no data file (see Outcome.SnapshotID)
 	Cursor        string
 	Location      string
+}
+
+// snapshotIDOf returns the table's current snapshot id, or nil when the
+// table has no snapshot yet.
+func snapshotIDOf(tbl *table.Table) *int64 {
+	snap := tbl.CurrentSnapshot()
+	if snap == nil {
+		return nil
+	}
+	id := snap.SnapshotID
+	return &id
 }
 
 // deps is what every table run shares.
@@ -348,7 +365,7 @@ func (d *deps) runTable(ctx context.Context, schema, tbl string) Outcome {
 // loadResult is what firstLoad committed.
 type loadResult struct {
 	rows       int64
-	snapshotID int64
+	snapshotID *int64 // nil when no data file was written (zero baseline rows)
 	detail     string // "" or a note about the seed, appended to the outcome
 }
 
@@ -441,7 +458,9 @@ func (d *deps) firstLoad(ctx context.Context, schema, tbl string, tm *metadata.T
 			return nil, nil, none, fmt.Errorf("stage the first load of %s.%s: %w", schema, tbl, err)
 		}
 	}
-	if err := tx.SetProperties(cur.loadProperties(path)); err != nil {
+	props := cur.loadProperties(path)
+	props[propJSONColumns] = jsonColumnsProperty(cols)
+	if err := tx.SetProperties(props); err != nil {
 		return nil, nil, none, err
 	}
 	icetbl, err = tx.Commit(ctx)
@@ -449,9 +468,10 @@ func (d *deps) firstLoad(ctx context.Context, schema, tbl string, tm *metadata.T
 		return nil, nil, none, fmt.Errorf("commit the first load of %s.%s: %w", schema, tbl, err)
 	}
 	res.rows = rows
-	if snap := icetbl.CurrentSnapshot(); snap != nil {
-		res.snapshotID = snap.SnapshotID
-	}
+	// A zero-row baseline commits the table and its cursor and no data
+	// file, so the table has no snapshot: the id stays nil and the audit
+	// event below still fires (a table was created, a cursor written).
+	res.snapshotID = snapshotIDOf(icetbl)
 	slog.Info("iceberg export: first load committed", "schema", schema, "table", tbl, "rows", rows, "cursor", cur.String(), "location", icetbl.Location())
 	d.committed(Commit{Schema: schema, Table: tbl, Kind: CommitLoad, Rows: rows, SnapshotID: res.snapshotID,
 		Cursor: cur.String(), Location: icetbl.Location()})
@@ -469,12 +489,14 @@ func (d *deps) committed(c Commit) {
 // Iceberg data files, batch by batch, so memory is bounded by the batch and
 // not by the table.
 //
-// Two normalizations make the first load spell values exactly as the row
+// Three normalizations make the first load spell values exactly as the row
 // events will, which is what an equality delete needs to match and what keeps
 // one column from carrying two representations depending on which run wrote
-// the row: primary key columns go through CanonicalizePKMap, and every fixed
+// the row: primary key columns go through CanonicalizePKMap, every fixed
 // BINARY(n) column is trimmed of the storage padding the ROW image never
-// carries (#1155), key or not.
+// carries (#1155), key or not, and every JSON column's text (MySQL's own
+// rendering, as the dump printed it) is parsed and re-emitted through the
+// encoder the delta path uses (#1508).
 func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrowSchema *arrow.Schema, cols []column,
 	pkCols []metadata.ColumnMeta, local string) ([]iceberg.DataFile, int64, error) {
 
@@ -499,10 +521,13 @@ func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrow
 	if err := sameNames(dcols, cols); err != nil {
 		return nil, 0, fmt.Errorf("baseline Parquet columns %w", err)
 	}
-	var fixedBinary []string
+	var fixedBinary, jsonCols []string
 	for _, c := range cols {
 		if c.MySQLType == "binary" {
 			fixedBinary = append(fixedBinary, c.Name)
+		}
+		if c.isJSON() {
+			jsonCols = append(jsonCols, c.Name)
 		}
 	}
 
@@ -548,6 +573,30 @@ func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrow
 					row[name] = reconstruct.TrimFixedBinaryPad(b)
 				}
 			}
+			for _, name := range jsonCols {
+				key, present := lookupKey(row, name)
+				if !present {
+					continue
+				}
+				var text string
+				switch v := row[key].(type) {
+				case nil:
+					continue
+				case string:
+					text = v
+				case []byte:
+					text = string(v)
+				default:
+					yield(nil, fmt.Errorf("column %s (pk %v): baseline holds %T, not JSON text", name, canon, v))
+					return
+				}
+				raw, err := canonicalJSONText(text)
+				if err != nil {
+					yield(nil, fmt.Errorf("column %s (pk %v): baseline text is %w", name, canon, err))
+					return
+				}
+				row[key] = raw
+			}
 			if err := app.append(row); err != nil {
 				yield(nil, err)
 				return
@@ -584,7 +633,7 @@ func (d *deps) writeBaselineRows(ctx context.Context, icetbl *table.Table, arrow
 // incrementResult is what one delta window produced.
 type incrementResult struct {
 	events, upserts, deletes int64
-	snapshotID               int64
+	snapshotID               *int64 // nil while the table has no snapshot
 	cursor                   cursor
 	location                 string
 	note                     string // "" or a hedge appended to the outcome's detail
@@ -607,10 +656,7 @@ type incrementResult struct {
 func (d *deps) increment(ctx context.Context, schema, tbl string, tm *metadata.TableMeta, pkCols []metadata.ColumnMeta,
 	icetbl *table.Table, cur *cursor) (*incrementResult, error) {
 
-	res := &incrementResult{cursor: *cur, location: icetbl.Location()}
-	if snap := icetbl.CurrentSnapshot(); snap != nil {
-		res.snapshotID = snap.SnapshotID
-	}
+	res := &incrementResult{cursor: *cur, location: icetbl.Location(), snapshotID: snapshotIDOf(icetbl)}
 	at := d.cfg.At
 
 	cols, err := columnsFromSchema(icetbl.Schema())
@@ -621,6 +667,9 @@ func (d *deps) increment(ctx context.Context, schema, tbl string, tm *metadata.T
 		return nil, err
 	}
 	if err := sameTableTypes(cols, tm, schema, tbl); err != nil {
+		return nil, err
+	}
+	if err := applyJSONColumns(cols, icetbl.Properties(), tm, schema, tbl); err != nil {
 		return nil, err
 	}
 
@@ -761,9 +810,7 @@ func (d *deps) increment(ctx context.Context, schema, tbl string, tm *metadata.T
 	}
 	res.cursor = newCur
 	res.location = committed.Location()
-	if snap := committed.CurrentSnapshot(); snap != nil {
-		res.snapshotID = snap.SnapshotID
-	}
+	res.snapshotID = snapshotIDOf(committed)
 	slog.Info("iceberg export: deltas committed", "schema", schema, "table", tbl,
 		"events", res.events, "upserts", res.upserts, "deletes", res.deletes, "cursor", newCur.String())
 	if len(ops) > 0 {
@@ -1124,6 +1171,87 @@ func sameTableTypes(cols []column, tm *metadata.TableMeta, schema, tbl string) e
 		}
 	}
 	return nil
+}
+
+// jsonColumnsProperty renders the names of the JSON columns for the table
+// property the first load records, in column order, lower-cased.
+func jsonColumnsProperty(cols []column) string {
+	var names []string
+	for _, c := range cols {
+		if c.isJSON() {
+			names = append(names, strings.ToLower(c.Name))
+		}
+	}
+	return strings.Join(names, ",")
+}
+
+// applyJSONColumns tells the columns rebuilt from an Iceberg schema which of
+// them are MySQL JSON columns. The Iceberg schema keeps the exported SHAPE
+// (string) and not the MySQL type behind it, and the delta path needs the
+// type for the one string column whose value is rendered, not copied: a JSON
+// column, whose row image is decoded and must leave as the same text the
+// first load wrote (#1508).
+//
+// The source of truth is the table itself: the first load records the JSON
+// columns it saw in the baseline's CREATE TABLE as a property, in the same
+// commit as the data, so every later run renders exactly the columns the
+// load rendered, whatever the schema snapshot says. The snapshot is then a
+// cross-check: a column that is JSON on one side and not on the other was
+// ALTERed between the dump and now (JSON to TEXT or back), which
+// sameTableTypes cannot see (both are strings), and is refused with
+// ErrSchemaChanged like any other type change. A table loaded before the
+// property existed falls back to the snapshot's data_type, and says so for
+// every string column the snapshot leaves untyped (a pre-#212 snapshot),
+// because toString then renders a decoded document by its shape alone and a
+// top-level scalar bare.
+func applyJSONColumns(cols []column, props iceberg.Properties, tm *metadata.TableMeta, schema, tbl string) error {
+	current := make(map[string]string, len(tm.Columns))
+	for _, c := range tm.Columns {
+		current[strings.ToLower(c.Name)] = strings.ToLower(strings.TrimSpace(c.DataType))
+	}
+	recorded, ok := props[propJSONColumns]
+	if !ok {
+		var untyped []string
+		for i := range cols {
+			cols[i].MySQLType = current[strings.ToLower(cols[i].Name)]
+			if cols[i].MySQLType == "" && cols[i].Kind == kindString {
+				untyped = append(untyped, cols[i].Name)
+			}
+		}
+		if len(untyped) > 0 {
+			slog.Warn("iceberg export: the table records no JSON column list and the schema snapshot has no data_type for some columns, so a JSON value in them is rendered by its shape",
+				"schema", schema, "table", tbl, "columns", strings.Join(untyped, ","))
+		}
+		return nil
+	}
+	isJSON := make(map[string]bool)
+	for _, name := range strings.Split(recorded, ",") {
+		if name != "" {
+			isJSON[name] = true
+		}
+	}
+	for i := range cols {
+		name := strings.ToLower(cols[i].Name)
+		if isJSON[name] {
+			cols[i].MySQLType = "json"
+		}
+		now, known := current[name]
+		if !known || now == "" {
+			continue
+		}
+		if (now == "json") != isJSON[name] {
+			return fmt.Errorf("%s.%s column %s is now %s but was exported as %s; the export does not change a column's type in place, so remove the table directory to reload it from a fresh baseline: %w",
+				schema, tbl, cols[i].Name, now, exportedTypeName(isJSON[name]), reconstruct.ErrSchemaChanged)
+		}
+	}
+	return nil
+}
+
+func exportedTypeName(json bool) string {
+	if json {
+		return "json"
+	}
+	return "text"
 }
 
 // columnFromMeta turns a schema-snapshot column into the declaration shape

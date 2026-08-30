@@ -21,6 +21,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/config"
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/indexer"
+	"github.com/dbtrail/dbtrail/internal/metadata"
 	"github.com/dbtrail/dbtrail/internal/parser"
 	"github.com/dbtrail/dbtrail/internal/query"
 )
@@ -37,6 +38,10 @@ Examples:
 
   # Composite PK (pipe-delimited, ordinal order)
   bintrail query --index-dsn "..." --schema mydb --table order_items --pk '12345|2'
+
+  # Every event on ids 1000 through 1999 (single-column integer PKs only; pair with a time window)
+  bintrail query --index-dsn "..." --schema mydb --table orders --pk-min 1000 --pk-max 1999 \
+    --since "2026-02-19 14:00:00" --until "2026-02-19 15:00:00"
 
   # DELETEs in a time window
   bintrail query --index-dsn "..." --schema mydb --table orders \
@@ -60,6 +65,8 @@ var (
 	qTable           string
 	qPK              string
 	qPKs             []string
+	qPKMin           string
+	qPKMax           string
 	qLimitPerPK      int
 	qEventType       string
 	qGTID            string
@@ -87,6 +94,8 @@ func init() {
 	queryCmd.Flags().StringVar(&qTable, "table", "", "Filter by table name")
 	queryCmd.Flags().StringVar(&qPK, "pk", "", "Filter by primary key value(s), pipe-delimited for composite PKs")
 	queryCmd.Flags().StringSliceVar(&qPKs, "pks", nil, "Filter by multiple primary key values (comma-separated, or repeat the flag); requires --schema and --table; mutually exclusive with --pk")
+	queryCmd.Flags().StringVar(&qPKMin, "pk-min", "", pkMinFlagHelp)
+	queryCmd.Flags().StringVar(&qPKMax, "pk-max", "", pkMaxFlagHelp)
 	queryCmd.Flags().IntVar(&qLimitPerPK, "limit-per-pk", 0, "Cap returned events per pk_values to the latest N (0 = unlimited); requires --pk or --pks")
 	queryCmd.Flags().StringVar(&qEventType, "event-type", "", "Filter by event type: INSERT, UPDATE, or DELETE")
 	queryCmd.Flags().StringVar(&qGTID, "gtid", "", "Filter by GTID (e.g. uuid:42)")
@@ -147,6 +156,10 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 	if qLimitPerPK > 0 && qPK == "" && len(qPKs) == 0 {
 		return fmt.Errorf("--limit-per-pk requires --pk or --pks")
+	}
+	pkRange, err := validatePKRangeFlags(qPKMin, qPKMax, qSchema, qTable, qPK, qPKs)
+	if err != nil {
+		return err
 	}
 	if w := limitWarning(qLimit); w != "" {
 		fmt.Fprintln(os.Stderr, w)
@@ -209,6 +222,9 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		if qPK != "" || len(qPKs) > 0 {
 			return fmt.Errorf("--pk and --pks are not supported with --include-snapshot (snapshot rows have no pk_values in this release)")
 		}
+		if pkRange != nil {
+			return fmt.Errorf("--pk-min and --pk-max are not supported with --include-snapshot (snapshot rows have no pk_values in this release)")
+		}
 	} else if qBaseline != "" {
 		return fmt.Errorf("--baseline requires --include-snapshot")
 	}
@@ -235,6 +251,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		Table:         qTable,
 		PKValues:      qPK,
 		PKValuesIn:    qPKs,
+		PKRange:       pkRange,
 		EventType:     eventType,
 		GTID:          qGTID,
 		Since:         since,
@@ -314,6 +331,19 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		opts.DenyTables = denyTables
 		opts.RedactColumns = redactCols
 		opts.ProfileActive = true
+	}
+
+	// ── Resolve --pk-min/--pk-max against the table's key shape ─────────────
+	// (#1440) The cast both engines compare through is chosen from the PK
+	// column's declared signedness, and a composite or non-integer key is
+	// refused here, BEFORE any query runs. Only loaded when a range was
+	// asked for: an exact --pk lookup never consults the snapshot (see the
+	// staleness note above). After the profile rules, as the MCP tools do.
+	if pkRange != nil {
+		resolver, resolverErr := metadata.NewResolver(db, 0)
+		if err := resolvePKRange(resolver, resolverErr, qSchema, qTable, pkRange); err != nil {
+			return err
+		}
 	}
 
 	engine := query.New(db)

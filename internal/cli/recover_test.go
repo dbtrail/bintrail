@@ -73,7 +73,7 @@ func TestRecoverCmd_emptyStringDefaults(t *testing.T) {
 
 func TestRecoverCmd_allFlagsRegistered(t *testing.T) {
 	for _, name := range []string{
-		"index-dsn", "schema", "table", "pk", "event-type",
+		"index-dsn", "schema", "table", "pk", "pks", "pk-min", "pk-max", "event-type",
 		"gtid", "since", "until", "flag", "output", "dry-run", "limit",
 		"no-archive", "column-eq", "allow-gaps",
 	} {

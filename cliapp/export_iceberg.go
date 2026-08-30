@@ -237,22 +237,31 @@ func resolveExportTables(cmd *cobra.Command, source string) ([]string, error) {
 // run killed between two tables has still written the first, and only a
 // per-commit emission says so; an unchanged table commits no rows and is not
 // an event.
+//
+// snapshot_id is present only when the commit left the table at an Iceberg
+// snapshot. A first load of a zero-row baseline commits the table and its
+// cursor and no data file, so there is no snapshot to name; writing "0"
+// there would send a reader to iceberg_snapshots() for an id that does not
+// exist (#1509).
 func auditIcebergCommit(ctx context.Context, c icebergexport.Commit) {
+	detail := map[string]string{
+		"commit":   string(c.Kind),
+		"rows":     strconv.FormatInt(c.Rows, 10),
+		"deletes":  strconv.FormatInt(c.Deletes, 10),
+		"events":   strconv.FormatInt(c.Events, 10),
+		"cursor":   c.Cursor,
+		"location": c.Location,
+	}
+	if c.SnapshotID != nil {
+		detail["snapshot_id"] = strconv.FormatInt(*c.SnapshotID, 10)
+	}
 	ext.Record(ctx, ext.AuditEvent{
 		Surface: "cli",
 		Action:  "export.iceberg",
 		Actor:   ext.ProcessActor(""),
 		Schema:  c.Schema,
 		Table:   c.Table,
-		Detail: map[string]string{
-			"commit":      string(c.Kind),
-			"rows":        strconv.FormatInt(c.Rows, 10),
-			"deletes":     strconv.FormatInt(c.Deletes, 10),
-			"events":      strconv.FormatInt(c.Events, 10),
-			"snapshot_id": strconv.FormatInt(c.SnapshotID, 10),
-			"cursor":      c.Cursor,
-			"location":    c.Location,
-		},
+		Detail:  detail,
 	})
 }
 
@@ -293,7 +302,7 @@ type exportTableJSON struct {
 	Events     int64  `json:"events"`
 	Upserts    int64  `json:"upserts"`
 	Deletes    int64  `json:"deletes"`
-	SnapshotID int64  `json:"snapshot_id,omitempty"`
+	SnapshotID *int64 `json:"snapshot_id,omitempty"` // absent when the table has no snapshot (a zero-row load)
 	Cursor     string `json:"cursor,omitempty"`
 	Location   string `json:"location,omitempty"`
 }
