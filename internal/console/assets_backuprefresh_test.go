@@ -315,11 +315,23 @@ func TestBackupScheduleCard_saysWhatARunCosts(t *testing.T) {
 	docs := docsNoWrap(t)
 	for _, want := range []string{
 		"otherwise the newest backup is **updated from the recorded changes**",
-		"only a full backup uploads)",
+		// The condition that actually decides the producer since #1539. It
+		// used to be the S3 destination, which is why this guard asked for
+		// "only a full backup uploads" — a sentence the docs must NOT carry
+		// any more, because an operator who reads it configures a nightly
+		// full read of production to get an off-box copy.
+		"a server with no local backup directory gets a **full backup**",
 	} {
 		if !strings.Contains(docs, want) {
 			t.Errorf("docs/console.md does not carry the producer rule (missing %q), so the cut lost it from both places", want)
 		}
+	}
+	// And the rule it REPLACED must be gone. Stating both would be worse than
+	// stating the old one alone: an operator has no way to tell which of two
+	// contradicting sentences describes the build they are running.
+	if strings.Contains(docs, "only a full backup uploads") {
+		t.Error("docs/console.md still says only a full backup uploads, which #1539 made false: the scheduled " +
+			"update reads the bucket and uploads its result there")
 	}
 }
 

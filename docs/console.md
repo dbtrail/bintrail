@@ -443,12 +443,15 @@ panel that answers whether a restore would work, far below the fold.
   every N minutes, hours or days (at least 15m), lined up on a UTC time of
   day. The operator picks WHEN; HOW each run is made is the daemon's decision
   per slot (`console.ChooseBackupMethod`), and the page says which one comes
-  next and why: backups that go to S3 are always **full backups** (the Create
-  backup job, reads the source, needs `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`;
-  only a full backup uploads); a server with no previous backup on local disk
-  gets a full backup too; otherwise the newest backup is **updated from the
-  recorded changes** (the baseline-refresh fold: reads nothing from the
-  source, needs the server's own local backup directory). An update that
+  next and why: a server with no local backup directory gets a **full backup**
+  (the Create backup job, reads the source, needs
+  `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`), and so does one with no previous
+  backup yet; otherwise the newest backup is **updated from the recorded
+  changes** (the baseline-refresh fold: reads nothing from the source, needs
+  the server's own local backup directory to write into). When the backups go
+  to S3 that update reads its previous snapshot straight from the bucket and
+  uploads its result back to the same place (#1539), so an S3 destination no
+  longer forces a nightly full read of the source. An update that
   fails (a capture gap, a schema change, an internal error) falls back to a
   full backup at the same slot when the daemon may take one (the creation
   opt-in); otherwise that slot is recorded as skipped with both reasons.
@@ -475,7 +478,7 @@ panel that answers whether a restore would work, far below the fold.
   page says so in red until a later scheduled update goes through. A
   schedule the daemon cannot serve at all (no producer possible: creation
   opt-in not set AND no local directory, a lock-mode misconfiguration on a
-  server whose backups go to S3, no destination) is refused on save with
+  server that has no local directory either, no destination) is refused on save with
   the reason, and one already saved is reported as not runnable on the
   page, never silently skipped.
   `PUT`/`DELETE /api/servers/{id}/backup-schedule`; state on `GET /api/baselines`

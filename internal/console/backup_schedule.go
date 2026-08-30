@@ -25,9 +25,9 @@ import (
 // the source and a rebuild of the newest backup from the recorded change
 // history, publish the same thing, a new backup in the list, and which one is
 // right depends on facts the operator should not have to track: whether a
-// previous backup exists to rebuild from, whether the backups go to S3 (only
-// a full backup uploads), whether the recorded history has a gap or a schema
-// change in the window. The first cut put that choice in a dropdown; the
+// previous backup exists to rebuild from, whether this server has a local
+// directory for the fold to write into, whether the recorded history has a
+// gap or a schema change in the window. The first cut put that choice in a dropdown; the
 // product owner's verdict was that it asked the user to understand the fold
 // to do something they think of as "backups every night".
 //
@@ -48,15 +48,17 @@ const (
 	BackupMethodFull = "backup"
 	// BackupMethodRefresh rebuilds the newest backup from the recorded change
 	// history alone (the same fold as --baseline-refresh-interval), reading
-	// nothing from the source. It needs a previous backup on local disk and
-	// publishes locally only.
+	// nothing from the source. It needs the server's own local directory to
+	// write into; the previous backup it reads may be in the bucket, and on
+	// a server whose backups go to S3 the scheduled path uploads its result
+	// there afterwards (#1539).
 	BackupMethodRefresh = "refresh"
 )
 
 // BackupScheduleMinEvery is the shortest interval a schedule accepts. A full
 // backup every few minutes is a footgun on the source, and a rebuild that
-// often is one on the disk (a rebuild's output is never uploaded, so
-// retention cannot reclaim it); the floor is generous enough for every real
+// often is one on the disk of a server with no S3 destination, where nothing
+// uploads and so retention cannot reclaim it; the floor is generous enough for every real
 // cadence and low enough to try the feature out.
 const BackupScheduleMinEvery = 15 * time.Minute
 
@@ -254,6 +256,25 @@ func FullBackupPossible(e ServerEntry, gates BackupScheduleGates) error {
 	return baselineTriggerPrecheck(e)
 }
 
+// BaselineFoldSource is where a fold for e reads its PREVIOUS snapshot from,
+// which is not always where it writes the new one.
+//
+// The two diverge exactly when backups go to S3 (#1539): the previous snapshot
+// lives in the bucket, so a fold that read the local directory would find an
+// empty directory on a server whose backups have only ever been uploaded, and
+// report "no previous backup to update" beside a listing showing dozens.
+// FindBaseline and ListBaselines both dispatch on the s3:// prefix, so the
+// remote source needs no separate code path here.
+//
+// The OUTPUT stays local whatever this returns: the fold writes Parquet to a
+// filesystem, and the upload is a separate step afterwards.
+func BaselineFoldSource(e ServerEntry) string {
+	if e.BaselineS3 != "" {
+		return e.BaselineS3
+	}
+	return e.BaselineDir
+}
+
 // rebuildPossible reports whether a rebuild from the change history can be
 // attempted for e (the fold itself may still refuse), and why not.
 func rebuildPossible(e ServerEntry) error {
@@ -289,12 +310,6 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 	if fullErr == nil {
 		return nil
 	}
-	if e.BaselineS3 != "" {
-		// Backups that go to S3 are always full backups (ChooseBackupMethod),
-		// so a rebuild is not a candidate producer here and cannot make the
-		// schedule runnable.
-		return notRunnable("this server's backups go to S3, which only a full backup can upload, and " + fullErr.Error())
-	}
 	if rebuildErr := rebuildPossible(e); rebuildErr != nil {
 		return notRunnable(strings.TrimSuffix(fullErr.Error(), " (Edit → Advanced)") + "; " + rebuildErr.Error() + " (Edit → Advanced)")
 	}
@@ -304,18 +319,22 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 	return nil
 }
 
+// newestSnapshotTables is reconstruct.NewestSnapshotTables, indirected so the
+// decision can be tested without a bucket: since #1539 the probe runs against
+// BaselineFoldSource, which is an s3:// URL on an S3-backed server, and a unit
+// test that reached the network would be neither hermetic nor offline-safe.
+var newestSnapshotTables = reconstruct.NewestSnapshotTables
+
 // ChooseBackupMethod decides how the next scheduled run for e will be made,
 // and why, on a daemon with these gates. The rule, in order:
 //
-//   - backups that go to S3 are FULL backups: only a full backup uploads, so
-//     an update would leave the off-box copy stale while unprunable local
-//     snapshots pile up;
 //   - a server an update cannot serve (no index DSN, no local backup
 //     directory) gets a FULL backup, with that refusal as the why;
-//   - a server with no previous backup on local disk gets a FULL backup:
-//     there is nothing to update. A directory that does not exist yet is
-//     that case; one that cannot be READ is its own error, never "no
-//     backup yet";
+//   - a server with no previous backup gets a FULL backup: there is nothing
+//     to update. A directory that does not exist yet is that case; one that
+//     cannot be READ is its own error, never "no backup yet". The previous
+//     backup is looked for where the fold would READ it (BaselineFoldSource),
+//     which is the bucket on an S3-backed server;
 //   - otherwise the newest backup is UPDATED from the recorded changes, with
 //     no load on the source. If that update fails (a capture gap, a schema
 //     change, a crash), the loop takes a full backup at the same slot when
@@ -326,19 +345,24 @@ func CheckBackupSchedule(e ServerEntry, sched BackupSchedule, gates BackupSchedu
 func ChooseBackupMethod(ctx context.Context, e ServerEntry, gates BackupScheduleGates) (method, why string, err error) {
 	fullErr := FullBackupPossible(e, gates)
 	rebuildErr := rebuildPossible(e)
-	switch {
-	case e.BaselineS3 != "":
-		if fullErr != nil {
-			return BackupMethodFull, "", fmt.Errorf("this server's backups go to S3, which only a full backup can upload: %w", fullErr)
-		}
-		return BackupMethodFull, "backups go to S3", nil
-	case rebuildErr != nil:
+	if rebuildErr != nil {
 		if fullErr != nil {
 			return BackupMethodFull, "", fmt.Errorf("%v; %v", fullErr, rebuildErr)
 		}
 		return BackupMethodFull, rebuildErr.Error(), nil
 	}
-	tables, listErr := reconstruct.NewestSnapshotTables(ctx, e.BaselineDir)
+	// An S3 destination used to force a full backup unconditionally, on the
+	// reasoning that only a full backup can upload. That is no longer true
+	// (#1539): the fold reads the previous snapshot straight from the s3://
+	// source, writes the new one into the server's local directory, and the
+	// scheduled path uploads it to the same destination a full backup would.
+	//
+	// The local directory is still REQUIRED and rebuildPossible above still
+	// refuses without one, because the fold writes Parquet to a filesystem. On
+	// an S3-only server that refusal is what keeps the old behaviour, and its
+	// message is what tells the operator which setting unlocks the cheap path.
+	source := BaselineFoldSource(e)
+	tables, listErr := newestSnapshotTables(ctx, source)
 	if listErr != nil && errors.Is(listErr, fs.ErrNotExist) {
 		// A directory the first full backup has not created yet IS "no
 		// backup yet".
@@ -350,11 +374,11 @@ func ChooseBackupMethod(ctx context.Context, e ServerEntry, gates BackupSchedule
 		// directory would hit too, and calling it absent would quietly turn
 		// a no-load rebuild into a nightly full read of production while the
 		// page named a reason that is false.
-		return BackupMethodFull, "", fmt.Errorf("the backup directory %s could not be read: %w", e.BaselineDir, listErr)
+		return BackupMethodFull, "", fmt.Errorf("the backup directory %s could not be read: %w", source, listErr)
 	}
 	if len(tables) == 0 {
 		if fullErr != nil {
-			return BackupMethodFull, "", fmt.Errorf("no previous backup to update under %s, and a full backup cannot start: %w", e.BaselineDir, fullErr)
+			return BackupMethodFull, "", fmt.Errorf("no previous backup to update under %s, and a full backup cannot start: %w", source, fullErr)
 		}
 		return BackupMethodFull, "no previous backup to update", nil
 	}

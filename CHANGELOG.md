@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A scheduled backup on a server whose backups go to S3 no longer forces a
+  full read of your database every slot** (#1539). The daemon has two ways to
+  produce a backup: a full one it dumps from the source, and an update of the
+  newest backup folded from the recorded changes, which touches the source not
+  at all. An S3 destination used to force the full one at every slot, on the
+  reasoning that only a full backup uploads, so the cheapest producer was
+  unreachable on exactly the servers most likely to run nightly: a schedule
+  that was supposed to be free became a nightly full read of production.
+  The scheduled update now reads its previous snapshot straight from the
+  bucket, folds into the server's local backup directory, and uploads the
+  result to the same destination a full backup would have written to, with the
+  same crash-safe ordering (`_INCOMPLETE` first, `_SUCCESS` last), so a run
+  interrupted mid-upload leaves the remote copy excluded from discovery rather
+  than half-visible and readable. A local backup directory is still required,
+  because the fold writes Parquet to a filesystem, and a server that has only
+  an S3 destination still gets a full backup: the reason the page now shows
+  names that setting, which is the one an operator can change, instead of the
+  destination, which is not. Publishing is not counted as finished until the
+  upload succeeds, and a failed upload keeps the finished local snapshot and
+  says the fold itself worked. The daemon-wide `--baseline-refresh-interval`
+  is unchanged: it names no destination, so its snapshots stay local.
+
 ## [0.73.0] - 2026-08-30
 
 ### Added

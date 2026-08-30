@@ -247,8 +247,9 @@ func TestBackupScheduleAPI_needsTheLoop(t *testing.T) {
 	if got == nil || got.Runnable || !strings.Contains(got.Reason, scheduleRefusalNoLoop) {
 		t.Fatalf("dormant schedule = %+v, want reported as not runnable with the PUT refusal's words", got)
 	}
-	// The creation opt-in going away on a server whose backups go to S3
-	// (only a full backup uploads) flips it to not runnable, with the reason.
+	// The creation opt-in going away on a server with no local directory
+	// (nothing for the fold to write into) flips it to not runnable, with the
+	// reason.
 	s3Only(t, live, id2)
 	live.backupSchedules = &stubScheduleReporter{full: false}
 	_, body = doServersReqHeader(t, live, "GET", "/api/baselines", "", id2)

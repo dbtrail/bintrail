@@ -162,10 +162,21 @@ func uploadWithOps(ctx context.Context, outputDir, prefix string, retry bool, op
 	return count, nil
 }
 
-// snapshotDirsWithSuccess returns the immediate child snapshot directories of
-// outputDir that carry a local _SUCCESS marker (i.e. completed snapshots). The
-// baseline layout is <output>/<timestamp>/..., so only one level is scanned.
+// snapshotDirsWithSuccess returns the completed snapshot directories under
+// outputDir. The baseline layout is <output>/<timestamp>/..., so only one
+// level of children is scanned.
+//
+// outputDir may also BE a single snapshot directory, which is how the
+// scheduled refresh uploads the one snapshot it just folded (#1539) instead of
+// re-walking every snapshot the server ever wrote. Without this branch that
+// call found no snapshot, so steps 1 and 4 silently did nothing: the data and
+// _SUCCESS still landed in the right keys, and only the crash-safety marker
+// went missing — an interrupted upload would then read as COMPLETE, because a
+// snapshot with neither marker is complete-by-default (#467).
 func snapshotDirsWithSuccess(outputDir string) ([]string, error) {
+	if _, err := os.Stat(filepath.Join(outputDir, SuccessMarker)); err == nil {
+		return []string{outputDir}, nil
+	}
 	entries, err := os.ReadDir(outputDir)
 	if err != nil {
 		return nil, fmt.Errorf("read output directory %q: %w", outputDir, err)

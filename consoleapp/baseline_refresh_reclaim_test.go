@@ -217,28 +217,37 @@ func TestKeepPartialSnapshotBecause(t *testing.T) {
 		refused   int
 		unclaimed string
 		holdsData bool
+		published bool
 		want      string // "" = the directory may be reclaimed
 	}{
-		{"one table refused", 1, "", true, ""},
-		{"every table folded", 0, "", true, "may be a complete snapshot"},
+		{"one table refused", 1, "", true, false, ""},
+		{"every table folded", 0, "", true, false, "may be a complete snapshot"},
+		// #1539: an upload that failed after a fold that did not. The
+		// snapshot is finished AND marked, so the heuristic below it ("may be
+		// complete", "failed to be marked") would be false twice over on the
+		// one shape where the local copy is all the operator has left.
+		{"folded and marked, only the upload failed", 0, "", true, true, "only sending it to the backup destination failed"},
+		// Ownership still wins: a directory that was not this run's stays
+		// reported as not ours, whatever markers it carries.
+		{"not ours, and marked complete", 0, "the directory already held files", true, true, "the directory already held files"},
 		// A run that failed BEFORE the first table folded also reports zero
 		// refusals, and leaves the directory holding nothing but the marker.
 		// The guard exists to protect data, and there is none, so keeping it
 		// would accumulate one empty directory per interval for the whole
 		// unreachable-index failure family.
-		{"nothing folded at all", 0, "", false, ""},
+		{"nothing folded at all", 0, "", false, false, ""},
 		// A directory that already held files is refused by the fold BEFORE any
 		// table folds, so it also arrives with refused == 0. The unclaimed
 		// reason is the true one and has to win, or the line names the wrong
 		// cause for the right decision.
-		{"not ours, and no table folded", 0, "the directory already held files", true, "the directory already held files"},
-		{"not ours", 3, "the directory already held files", true, "the directory already held files"},
+		{"not ours, and no table folded", 0, "the directory already held files", true, false, "the directory already held files"},
+		{"not ours", 3, "the directory already held files", true, false, "the directory already held files"},
 		// Not ours AND holding no data: still not ours. The data check must not
 		// override the ownership one.
-		{"not ours, and empty", 0, "the directory already held files", false, "the directory already held files"},
+		{"not ours, and empty", 0, "the directory already held files", false, false, "the directory already held files"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := keepPartialSnapshotBecause(tc.refused, tc.unclaimed, tc.holdsData)
+			got := keepPartialSnapshotBecause(tc.refused, tc.unclaimed, tc.holdsData, tc.published)
 			if tc.want == "" {
 				if got != "" {
 					t.Errorf("keepPartialSnapshotBecause(%d, %q, %v) = %q, want the directory reclaimable",

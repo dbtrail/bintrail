@@ -438,6 +438,10 @@ func (b *backupScheduler) gates() console.BackupScheduleGates {
 func (b *backupScheduler) startRebuild(e console.ServerEntry, p console.ParsedBackupSchedule, stamp string) error {
 	req := refreshRequest{
 		ServerID: e.ID, ServerName: e.Name, IndexDSN: e.DSN, BaselineDir: e.BaselineDir,
+		// The destination this server's backups already go to. Set ONLY here:
+		// it is what lets the fold reach S3 (#1539), and the daemon-wide
+		// interval loop must keep leaving it empty. See refreshRequest.
+		BaselineS3:            e.BaselineS3,
 		CarryForwardUnchanged: effectiveCarryForward(b.reg, b.carryDefault),
 		Trigger:               console.BaselineRunTriggerScheduled,
 	}
