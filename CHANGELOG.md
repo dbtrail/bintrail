@@ -43,7 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off, so the decision reached new installs only: pulling a newer image
   delivered the page to nobody. The default now lives in the daemon and the
   compose file does not mention the variable at all. `serve` and `watch` both
-  show the page unless `BINTRAIL_CONSOLE_SQL_PANEL` is set to `0`. Everything
+  show the page unless `BINTRAIL_CONSOLE_SQL_PANEL` turns it off. That
+  variable is an opt-out now, so it fails closed: `0` and `false` hide the
+  page, and so does any value the daemon cannot read either way (`off`, `no`,
+  a typo), which is logged with the values that work rather than serving the
+  page to someone who believes they closed it. Everything
   that makes the page safe is unchanged: it is behind console sign-in, it
   carries `query:execute`, it is refused outright while an access-control
   profile is active, and it answers one `SELECT` at a time in a sandboxed

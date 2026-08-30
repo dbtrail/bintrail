@@ -32,6 +32,13 @@ entries.
 
 ```sh
 docker compose pull
+
+# The compose file is yours and nothing updates it for you. Take the current
+# one BESIDE it, carry your own edits across, then move it into place.
+curl -fsSL -o docker-compose.yml.new https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml
+diff docker-compose.yml docker-compose.yml.new
+mv docker-compose.yml.new docker-compose.yml
+
 docker compose up -d
 docker compose logs -f bintrail-console   # or `bintrail` on an older split-console file
 ```
@@ -49,10 +56,12 @@ default (e.g. the `VERIFY_TRIGGER` default-on wiring in 0.26.0) only takes
 effect if your copy of `docker-compose.yml` actually has that line — an
 older file on disk keeps running with whatever it already had, silently,
 with no error. If a newer feature seems missing or a documented default
-doesn't match what you see, re-download `docker-compose.yml` (the curl in
-[Quick start](../README.md)) and diff it against your customized copy before
-`up -d`, or add the specific new line by hand if you've heavily customized
-the file.
+doesn't match what you see, take the current `docker-compose.yml` with the
+three lines above and diff it against your customized copy before `up -d`, or
+add the specific new line by hand if you've heavily customized the file. The
+`watch` daemon also reports the two gaps it can prove at startup (see
+[Upgrading the stack](./docker.md#upgrading-the-stack) for the full list of
+what a stale file costs).
 
 Data volumes (`bintrail-index-data`, `bintrail-index-secret`,
 `bintrail-state`, including saved console servers) carry over unchanged
@@ -61,8 +70,8 @@ change. Two known transitions that need more than `pull`:
 
 - **A compose file from before the console split** (pre-#374) ran
   `bintrail up --console` from the single `ghcr.io/dbtrail/bintrail` image;
-  that flag no longer exists. Re-download `docker-compose.yml` (the curl in
-  [Quick start](../README.md)) rather than just `pull`-ing — see
+  that flag no longer exists. Take the current `docker-compose.yml` (the three
+  lines above) rather than just `pull`-ing — see
   [docker.md](./docker.md#the-bundled-index-mysql-84) for the exact symptom
   (`unknown flag: --console`, crash-loop) and confirmation that volumes and
   `.env` survive the swap untouched.

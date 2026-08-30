@@ -3,12 +3,15 @@ package consoleapp
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 
 	"go.yaml.in/yaml/v2"
+
+	"github.com/dbtrail/dbtrail/internal/telemetry"
 )
 
 // The stack-drift check (#1529), tested from both ends.
@@ -131,19 +134,49 @@ func wiredStack(t *testing.T) driftInputs {
 		getenv:   func(k string) string { return env[k] },
 		indexDSN: fmt.Sprintf("root:pw@tcp(%s:3306)/bintrail_index", composeEntrypointIndexHost(t)),
 		isDir:    func(p string) bool { return p == datadirRO },
-		// The console's config directory is empty in a wired stack: every OSS
-		// state file is redirected onto the volume and nothing writes there.
-		dirIsUsed: func(string) bool { return false },
-		mounts:    composeStackMounts(t),
+		// The config directory as a RELEASED image leaves it, and the REAL
+		// predicate over it. Hardcoding "nothing writes there" is what let the
+		// false alarm in: telemetry is compiled into every release build, its
+		// consent defaults on, neither this compose file nor .env.example
+		// turns it off, and its spool lives in this very directory. So the
+		// fixture writes what the image writes and lets the code decide.
+		stateInDir: consoleStateInDir,
+		mounts:     composeStackMounts(t),
 		state: []statePath{
 			{what: "your console username and password", path: composeStateEnv(t, "BINTRAIL_CONSOLE_AUTH")},
 			{what: "the servers you added", path: composeStateEnv(t, "BINTRAIL_CONSOLE_SERVERS")},
 			{what: "the AI connection token", path: composeStateEnv(t, "BINTRAIL_CONSOLE_MCP_TOKEN_FILE")},
 		},
-		configDir:      "/home/bintrail/.config/bintrail",
+		configDir:      imageConfigDir(t),
 		shippedVersion: bundledComposeVersion,
 		versionAdded:   composeVersionAdded,
 	}
+}
+
+// imageConfigDir builds the console's config directory as a RELEASED image
+// leaves it on a fully wired stack: the telemetry spool and consent file, and
+// no console state, because the compose file redirects all three console state
+// files onto the volume.
+//
+// Those two entries are not hypothetical and not this test's invention. The
+// release build compiles telemetry in, its consent defaults on, and it writes
+// under telemetry.ConfigDir(), which is the same ~/.config/bintrail this
+// package's state falls back to. The paths come from the telemetry package
+// rather than from string literals here, so renaming them there moves this
+// fixture with them instead of quietly making it fiction.
+func imageConfigDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(telemetry.SpoolDir(dir), 0o755); err != nil {
+		t.Fatalf("seed spool dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(telemetry.SpoolDir(dir), "events.ndjson"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("seed spool file: %v", err)
+	}
+	if err := os.WriteFile(telemetry.StatePath(dir), []byte(`{"notice_shown":true}`), 0o600); err != nil {
+		t.Fatalf("seed consent file: %v", err)
+	}
+	return dir
 }
 
 func TestComposeDriftIsSilentOnTheWiredStack(t *testing.T) {
@@ -164,9 +197,13 @@ func TestComposeDriftFindsAStaleStack(t *testing.T) {
 	in.isDir = func(string) bool { return false }
 	in.mounts = removeMount(in.mounts, composeEntrypointDatadirRO(t))
 	// The token override does not exist in this file, so the token falls back
-	// into the console's config directory, which nothing keeps.
-	in.state[2].path = in.configDir + "/console-mcp-token.yaml"
-	in.dirIsUsed = func(p string) bool { return p == in.configDir }
+	// into the console's config directory, which nothing keeps. Written for
+	// real, so the config-directory shape reads it the way it will in
+	// production instead of being told the answer.
+	in.state[2].path = filepath.Join(in.configDir, "console-mcp-token.yaml")
+	if err := os.WriteFile(in.state[2].path, []byte("token: x\n"), 0o600); err != nil {
+		t.Fatalf("seed the token file: %v", err)
+	}
 
 	got := composeDriftFindings(in)
 	if len(got) != 2 {
@@ -183,6 +220,12 @@ func TestComposeDriftFindsAStaleStack(t *testing.T) {
 			t.Errorf("the report never mentions %q: %s", want, joined)
 		}
 	}
+	// Named ONCE. The token is both a state path this package resolves and a
+	// file sitting in the config directory, so the two shapes see the same
+	// file; a line that lists it twice reads like two problems.
+	if n := strings.Count(joined, "console-mcp-token.yaml"); n != 1 {
+		t.Errorf("the token file is named %d times in one line: %s", n, joined)
+	}
 	// The two files that ARE on the volume must not be reported as lost.
 	if strings.Contains(joined, "console-auth.yaml") || strings.Contains(joined, "console-servers.yaml") {
 		t.Errorf("the report names state that is on the volume and is not at risk: %s", joined)
@@ -194,8 +237,10 @@ func TestComposeDriftStaysSilentWhereItCannotTell(t *testing.T) {
 		in := wiredStack(t)
 		in.getenv = func(string) string { return "" }
 		in.isDir = func(string) bool { return false }
-		in.dirIsUsed = func(string) bool { return true }
-		in.state[2].path = in.configDir + "/console-mcp-token.yaml"
+		in.state[2].path = filepath.Join(in.configDir, "console-mcp-token.yaml")
+		if err := os.WriteFile(in.state[2].path, []byte("token: x\n"), 0o600); err != nil {
+			t.Fatalf("seed the token file: %v", err)
+		}
 		return in
 	}
 	t.Run("no mount table to read", func(t *testing.T) {
@@ -226,12 +271,13 @@ func TestComposeDriftStaysSilentWhereItCannotTell(t *testing.T) {
 		// A bare `docker run` with no volumes at all: every path is on the
 		// writable layer, and that is as likely a throwaway evaluation
 		// container as a stale stack, so the mixed-mount shape reports
-		// nothing. dirIsUsed stays false here on purpose, to isolate that
-		// shape: the config-directory shape is the OTHER half and is driven
-		// by TestConsoleStateFindingReadsTheConfigDirectory below. With it
-		// true, this subtest would report and could never see its own bug.
+		// nothing. The config directory is emptied here on purpose, to
+		// isolate that shape: the config-directory shape is the OTHER half
+		// and is driven by TestConsoleStateFindingReadsTheConfigDirectory
+		// below. With state left in it, this subtest would report for that
+		// other reason and could never see its own bug.
 		in.mounts = []mountEntry{{point: "/", fstype: "overlay"}}
-		in.dirIsUsed = func(string) bool { return false }
+		in.configDir = t.TempDir()
 		for _, f := range composeDriftFindings(in) {
 			if strings.Contains(f.msg, "console settings are stored") {
 				t.Errorf("reported console state loss with no durable mount anywhere to compare against: %s", f.msg)
@@ -240,26 +286,64 @@ func TestComposeDriftStaysSilentWhereItCannotTell(t *testing.T) {
 	})
 }
 
-// TestConsoleStateFindingReadsTheConfigDirectory pins the second shape: state
-// that no environment variable relocates (an add-on's own settings file) is
-// only reachable through the directory it lands in. A file there is the
-// evidence; an empty directory is silence.
+// TestConsoleStateFindingReadsTheConfigDirectory pins the second shape over
+// real directory contents: state that no environment variable relocates is
+// only reachable through the directory it lands in, so a console-*.yaml there
+// is the evidence.
+//
+// The telemetry row is the one that matters. Every release build writes that
+// spool and consent file into this same directory, so "the directory holds
+// anything" reported a fully wired stack as broken, and told the operator to
+// mount a volume they already have or download a compose file already current.
 func TestConsoleStateFindingReadsTheConfigDirectory(t *testing.T) {
-	base := wiredStack(t)
 	for _, tc := range []struct {
-		name string
-		used bool
-		want bool
+		name  string
+		files []string
+		dirs  []string
+		want  bool
+		names string
 	}{
-		{name: "something writes there", used: true, want: true},
-		{name: "nothing writes there", used: false},
+		{name: "empty"},
+		{
+			name:  "what a released image writes there on a wired stack",
+			files: []string{"telemetry.json"},
+			dirs:  []string{"telemetry-spool"},
+		},
+		{
+			name:  "other tools' files",
+			files: []string{"config.env", "dump.key"},
+		},
+		{
+			name:  "console state this package names",
+			files: []string{"console-auth.yaml", "telemetry.json"},
+			want:  true, names: "console-auth.yaml",
+		},
+		{
+			name:  "console state a newer build keeps there",
+			files: []string{"console-users.yaml", "telemetry.json"},
+			want:  true, names: "console-users.yaml",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			in := base
-			in.dirIsUsed = func(string) bool { return tc.used }
-			_, got := consoleStateFinding(in)
+			in := wiredStack(t)
+			dir := t.TempDir()
+			for _, f := range tc.files {
+				if err := os.WriteFile(filepath.Join(dir, f), []byte("x\n"), 0o600); err != nil {
+					t.Fatalf("seed %s: %v", f, err)
+				}
+			}
+			for _, d := range tc.dirs {
+				if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+					t.Fatalf("seed %s: %v", d, err)
+				}
+			}
+			in.configDir = dir
+			f, got := consoleStateFinding(in)
 			if got != tc.want {
-				t.Errorf("config directory used=%v reported=%v, want %v", tc.used, got, tc.want)
+				t.Fatalf("a config directory holding %v reported=%v, want %v (%v)", append(tc.files, tc.dirs...), got, tc.want, f)
+			}
+			if tc.names != "" && !strings.Contains(fmt.Sprint(f.attrs), tc.names) {
+				t.Errorf("the line does not name the file at risk (%s): %v", tc.names, f.attrs)
 			}
 		})
 	}
@@ -405,7 +489,7 @@ func removeMount(mounts []mountEntry, point string) []mountEntry {
 	return out
 }
 
-// The upgrade recipe must not overwrite the operator's own compose file.
+// The upgrade recipe must FETCH beside the operator's compose file.
 //
 // Every copy of it (two docs, the compose header, and the runtime `fix` line
 // this package logs) says to re-download the file and merge your own edits
@@ -417,12 +501,17 @@ func removeMount(mounts []mountEntry, point string) []mountEntry {
 //
 // The scan is bounded to the UPGRADE spans. A first install downloads straight
 // to docker-compose.yml and is right to: there is nothing there to lose.
-func TestUpgradeRecipeNeverOverwritesTheOperatorsFile(t *testing.T) {
+// The recipe does end by moving the reviewed file into place, which is an
+// overwrite and the intended one; what must never happen is the DOWNLOAD
+// landing there, before the reader has seen what they were about to keep. So
+// this is named for the fetch, like the helper it calls.
+func TestUpgradeRecipeFetchesBesideTheOperatorsFile(t *testing.T) {
 	for _, tc := range []struct {
 		file, from, to string
 	}{
 		{file: "../docs/docker.md", from: "### Upgrading the stack", to: "\n### "},
 		{file: "../docs/install.md", from: "**Upgrading later takes three commands", to: "\n## "},
+		{file: "../docs/upgrade.md", from: "## 3. Docker Compose", to: "\n## "},
 		{file: composePath, from: "# === UPGRADING", to: "x-bintrail-compose-version"},
 	} {
 		t.Run(tc.file, func(t *testing.T) {
@@ -457,13 +546,20 @@ func textSpan(text, from, to string) (string, bool) {
 	return text[i:], true
 }
 
+// composeFileURL is what a real fetch of the compose file names. Matching on
+// the URL rather than on the word "curl" is what keeps this from passing on
+// PROSE: "re-download docker-compose.yml (the curl in Quick start)" contains
+// both words, names no command, and once satisfied the found counter it let a
+// whole page with no recipe in it read as covered.
+const composeFileURL = "https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml"
+
 // assertNonDestructiveFetch fails when a curl of the compose file in this text
 // would land on docker-compose.yml itself.
 func assertNonDestructiveFetch(t *testing.T, where, text string) {
 	t.Helper()
 	found := 0
 	for _, line := range strings.Split(text, "\n") {
-		if !strings.Contains(line, "curl") || !strings.Contains(line, "docker-compose.yml") {
+		if !strings.Contains(line, "curl") || !strings.Contains(line, composeFileURL) {
 			continue
 		}
 		found++
@@ -473,15 +569,29 @@ func assertNonDestructiveFetch(t *testing.T, where, text string) {
 		}
 	}
 	if found == 0 {
-		t.Errorf("%s names no curl of the compose file, so this guard read nothing", where)
+		t.Errorf("%s carries no command that downloads the compose file, so an operator reading it either "+
+			"never re-downloads or invents their own recipe, and this guard read nothing", where)
 	}
 }
 
 // curlOutputPath returns the file a curl command line writes, or "" when it
-// writes to stdout. `-o NAME` names it; a flag cluster carrying O (`-fsSLO`)
-// means the URL's own basename.
+// writes to stdout. Three forms land a file on disk and all three count:
+// `-o NAME`, a flag cluster carrying O (`-fsSLO`, which writes the URL's own
+// basename), and a SHELL REDIRECT, which curl knows nothing about and which
+// overwrites just as completely.
 func curlOutputPath(line string) string {
 	fields := strings.Fields(line)
+	for i, f := range fields {
+		if f == ">" || f == ">>" {
+			if i+1 < len(fields) {
+				return fields[i+1]
+			}
+			return ""
+		}
+		if strings.HasPrefix(f, ">") {
+			return strings.TrimPrefix(strings.TrimPrefix(f, ">"), ">")
+		}
+	}
 	for i, f := range fields {
 		if f == "-o" || f == "--output" {
 			if i+1 < len(fields) {
@@ -554,4 +664,89 @@ func TestIndexDatadirRemedyFollowsTheEntrypointsOwnCondition(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCurlOutputPath pins the parser the guard above rests on, including the
+// form it used to be blind to: a shell redirect. `curl -fsSL <url> >
+// docker-compose.yml` destroys the operator's file exactly like `-fsSLO` does,
+// and reading it as "writes to stdout" let the whole suite stay green over a
+// recipe that eats the edits it then tells the reader to merge.
+func TestCurlOutputPath(t *testing.T) {
+	const url = "https://raw.githubusercontent.com/dbtrail/dbtrail/main/docker-compose.yml"
+	for _, tc := range []struct{ line, want string }{
+		{line: "curl -fsSLO " + url, want: "docker-compose.yml"},
+		{line: "curl -O " + url, want: "docker-compose.yml"},
+		{line: "curl -fsSL -o docker-compose.yml.new " + url, want: "docker-compose.yml.new"},
+		{line: "curl -fsSL --output docker-compose.yml.new " + url, want: "docker-compose.yml.new"},
+		{line: "curl -fsSL " + url + " > docker-compose.yml", want: "docker-compose.yml"},
+		{line: "curl -fsSL " + url + " >docker-compose.yml", want: "docker-compose.yml"},
+		{line: "curl -fsSL " + url + " >> docker-compose.yml", want: "docker-compose.yml"},
+		{line: "curl -fsSL " + url + " > docker-compose.yml.new", want: "docker-compose.yml.new"},
+		{line: "curl -fsSL " + url, want: ""},
+	} {
+		t.Run(tc.line, func(t *testing.T) {
+			if got := curlOutputPath(tc.line); got != tc.want {
+				t.Errorf("curlOutputPath(%q) = %q, want %q", tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIndexDatadirFindingConsultsTheMountTable.
+//
+// The line used to end "and this one has no read-only mount of its data
+// volume" while the code had only looked at an environment variable. The mount
+// table was one field away and never read, so the sentence asserted something
+// the process had not established, in a package whose whole argument is that
+// it never guesses. The two states are also different problems with different
+// fixes, so they are worth telling apart.
+func TestIndexDatadirFindingConsultsTheMountTable(t *testing.T) {
+	if got := composeEntrypointDatadirRO(t); got != composeIndexDatadirRO {
+		t.Fatalf("the compose entrypoint exports BINTRAIL_INDEX_DATADIR_RO=%s and this package names %s; "+
+			"the finding would report a path the stack does not mount", got, composeIndexDatadirRO)
+	}
+	base := wiredStack(t)
+	for _, tc := range []struct{ name, wants string }{
+		{name: "mounted", wants: "is mounted"},
+		{name: "not mounted", wants: "not mounted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := base
+			in.getenv = func(string) string { return "" }
+			in.isDir = func(string) bool { return false }
+			if tc.name == "not mounted" {
+				in.mounts = removeMount(in.mounts, composeIndexDatadirRO)
+			}
+			f, ok := indexDatadirFinding(in)
+			if !ok {
+				t.Fatal("free disk space is not measurable here and nothing was reported")
+			}
+			if !strings.Contains(fmt.Sprint(f.attrs), tc.wants) {
+				t.Errorf("the report does not say whether the mount is there (%q): %v", tc.wants, f.attrs)
+			}
+			if strings.Contains(f.msg, "has no read-only mount") {
+				t.Errorf("the message asserts the mount is absent; only the attributes establish that: %s", f.msg)
+			}
+		})
+	}
+	t.Run("the operator's own INDEX_DSN still needs the mount", func(t *testing.T) {
+		in := base
+		in.getenv = func(k string) string {
+			if k == "INDEX_DSN" {
+				return base.indexDSN
+			}
+			return ""
+		}
+		in.isDir = func(string) bool { return false }
+		in.mounts = removeMount(in.mounts, composeIndexDatadirRO)
+		f, ok := indexDatadirFinding(in)
+		if !ok {
+			t.Fatal("nothing reported")
+		}
+		// Pointing a variable at a path the operator's file does not mount
+		// fixes nothing, so the remedy has to name the mount as well.
+		if !strings.Contains(fmt.Sprint(f.attrs), "docker-compose.yml.new") {
+			t.Errorf("the remedy sends the operator to a path their file does not mount, with no way to get it: %v", f.attrs)
+		}
+	})
 }

@@ -257,7 +257,10 @@ Two things make this easier to catch:
   check that cannot establish a fact stays quiet rather than sending you after
   a problem you do not have. This is the `watch` daemon, which is what this
   stack runs; a read-only `bintrail-console serve` reports nothing about the
-  stack around it.
+  stack around it. One ordering to know: the settings-folder case needs a file
+  to be there to see, so right after the upgrade that deleted one it has
+  nothing to report and only speaks up on a later start. The table above is
+  what to check before the upgrade, not after.
 - **The file carries a version.** `x-bintrail-compose-version` at the top of
   `docker-compose.yml` is passed to the console service, so a newer daemon can
   tell you your file is behind and name what is not in effect, instead of

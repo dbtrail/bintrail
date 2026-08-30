@@ -25,7 +25,13 @@ package consoleapp
 // like Docker": each one names a fact the process can observe about itself,
 // and each one stays silent when the fact cannot be established. The cost of a
 // false alarm is higher than the cost of silence, because an operator who
-// learns to ignore one line ignores the next one too.
+// learns to ignore one line ignores the next one too. That is not an
+// aspiration: the first version of the console-state check false-alarmed on
+// the reference stack in this repo, because it read "the config directory
+// holds anything" as evidence and every release build writes its telemetry
+// spool there. What caught it was making the fixture derive from what the
+// image actually writes; what fixed it was making the evidence specific to
+// the claim. Both are worth keeping.
 
 import (
 	"bufio"
@@ -62,6 +68,13 @@ var composeVersionAdded = map[int]string{}
 // docker-compose.yml. A DSN pointing at it is this process saying it is using
 // the bundled index, in the operator's own words.
 const composeIndexHost = "index-mysql"
+
+// composeIndexDatadirRO is where the bundled stack mounts the index data
+// volume read-only, and what its entrypoint points BINTRAIL_INDEX_DATADIR_RO
+// at. Named here so the report can say whether that mount is actually present
+// rather than assuming it from the variable being unset; the compose file is
+// the source of truth and a test asserts the two agree.
+const composeIndexDatadirRO = "/var/lib/bintrail-index-ro"
 
 // composeDownload is the one-line fix every finding ends with. It fetches
 // BESIDE the operator's file, never over it: the same line tells them to merge
@@ -201,11 +214,12 @@ type statePath struct {
 // tests build both the wired stack and the stale one and assert the two
 // answers, on a machine that is neither.
 type driftInputs struct {
-	getenv    func(string) string
-	indexDSN  string
-	isDir     func(string) bool
-	dirIsUsed func(string) bool
-	mounts    []mountEntry
+	getenv   func(string) string
+	indexDSN string
+	isDir    func(string) bool
+	// stateInDir lists the console state files a directory holds.
+	stateInDir func(string) []string
+	mounts     []mountEntry
 	// state are the console state files this daemon will actually use, with
 	// every override already applied.
 	state []statePath
@@ -324,24 +338,51 @@ func indexDatadirFinding(in driftInputs) (driftFinding, bool) {
 	if dir != "" && in.isDir(dir) {
 		return driftFinding{}, false
 	}
-	fix := "the current docker-compose.yml mounts the index volume read-only at " +
-		"/var/lib/bintrail-index-ro and points BINTRAIL_INDEX_DATADIR_RO at it, so " + composeDownload
-	if strings.TrimSpace(in.getenv("INDEX_DSN")) != "" {
-		fix = "your own INDEX_DSN points at the bundled index, and the stack only sets " +
-			"BINTRAIL_INDEX_DATADIR_RO when it builds that address itself. Set it too, to the read-only " +
-			"index mount (/var/lib/bintrail-index-ro in the bundled stack), or drop INDEX_DSN and let the " +
-			"stack build the address"
+	// What was actually observed about the mount, rather than inferred from the
+	// variable. The two states are different problems: a mount that is there
+	// needs the variable, a mount that is not needs the compose file first.
+	mounted := mountExists(composeIndexDatadirRO, in.mounts)
+	mountState := composeIndexDatadirRO + " is not mounted in this container"
+	if mounted {
+		mountState = composeIndexDatadirRO + " is mounted, but BINTRAIL_INDEX_DATADIR_RO does not name a directory this process can read"
 	}
-	attrs := []any{"fix", fix}
+
+	fix := "the current docker-compose.yml mounts the index volume read-only at " +
+		composeIndexDatadirRO + " and points BINTRAIL_INDEX_DATADIR_RO at it, so " + composeDownload
+	if strings.TrimSpace(in.getenv("INDEX_DSN")) != "" {
+		// The entrypoint exports the variable only when it builds the address
+		// itself, so this operator has to. Naming the path is not enough: on a
+		// file older than that mount it points at nothing, and a remedy that
+		// cannot work is worse than none.
+		fix = "your own INDEX_DSN points at the bundled index, and the stack sets BINTRAIL_INDEX_DATADIR_RO " +
+			"only when it builds that address itself. Set it too, to a read-only mount of the index data " +
+			"volume (" + composeIndexDatadirRO + " in the current stack), or drop INDEX_DSN and let the " +
+			"stack build the address."
+		if !mounted {
+			fix += " Your compose file does not mount that path, so it needs the current file first: " + composeDownload
+		}
+	}
+	attrs := []any{"read_only_index_mount", mountState, "fix", fix}
 	if dir != "" {
 		attrs = append([]any{"BINTRAIL_INDEX_DATADIR_RO", dir, "problem", "not a directory in this container"}, attrs...)
 	}
 	return driftFinding{
 		msg: "free disk space for the index cannot be measured, so the preflight and the Storage page " +
-			"both report it as not measurable. The bundled index runs in its own container and this one " +
-			"has no read-only mount of its data volume",
+			"both report it as not measurable. The bundled index runs in its own container, so measuring " +
+			"it needs a read-only mount of that container's data volume and BINTRAIL_INDEX_DATADIR_RO " +
+			"pointing at it",
 		attrs: attrs,
 	}, true
+}
+
+// mountExists reports whether a path is itself a mount point.
+func mountExists(path string, mounts []mountEntry) bool {
+	for _, m := range mounts {
+		if filepath.Clean(m.point) == filepath.Clean(path) {
+			return true
+		}
+	}
+	return false
 }
 
 // consoleStateFinding fires when console state is stored where a container
@@ -356,26 +397,56 @@ func indexDatadirFinding(in driftInputs) (driftFinding, bool) {
 //     throwaway `docker run` as a stale stack, and guessing is what this file
 //     refuses to do.)
 //
-//  2. The default config directory is ephemeral AND something has written
-//     there. An empty directory is silence, because in a fully wired stack
-//     every OSS state file is redirected onto the volume and nothing OSS
-//     writes there at all. A FILE there is proof that something does, and that
-//     it is one recreate away from being deleted.
+//  2. The default config directory is ephemeral AND holds CONSOLE STATE. This
+//     is the shape that reaches state no environment variable relocates: a
+//     build that keeps its own console-*.yaml there is one recreate away from
+//     losing it, and this package cannot name a file it does not write.
+//
+//     It is an ALLOW-list (console-*), and that is load-bearing rather than
+//     tidy. "The directory holds anything" was the first spelling and it
+//     false-alarmed on the shipped stack: telemetry is compiled into every
+//     release build, its consent defaults on, and it writes its spool and
+//     consent file into this very directory, so a wired stack that is merely
+//     restarted (not recreated) grew an entry and got told to mount a volume
+//     it already has. A deny-list of that one name would have closed the case
+//     and reopened it on the next writer that lands there, of which there are
+//     already others (`config init --global`, `generate-key`). The claim being
+//     made is "console state is at risk", so the evidence has to be console
+//     state.
+//
+//     Ordering limit, deliberately not fixed: right after the recreate that
+//     destroyed such a store the directory is EMPTY, so this is silent on the
+//     event itself and can only fire on a later start within that container's
+//     life (a restart, a reboot, a crash under `restart: unless-stopped`).
+//     Reporting an empty directory instead would warn every correctly wired
+//     stack about a file that does not exist, which is the trade this refuses.
 func consoleStateFinding(in driftInputs) (driftFinding, bool) {
-	var lost []string
+	var lost, named []string
 	durable := false
 	for _, s := range in.state {
 		if ephemeral(s.path, in.mounts) {
 			lost = append(lost, fmt.Sprintf("%s (%s)", s.what, s.path))
+			named = append(named, filepath.Base(s.path))
 			continue
 		}
 		durable = true
 	}
 	if !durable {
-		lost = nil
+		lost, named = nil, nil
 	}
-	if in.configDir != "" && ephemeral(in.configDir, in.mounts) && in.dirIsUsed(in.configDir) {
-		lost = append(lost, "the console settings folder ("+in.configDir+")")
+	if in.configDir != "" && ephemeral(in.configDir, in.mounts) {
+		// Skip what the loop above already named. A state file whose override
+		// is missing lands in this very directory, so both shapes see the same
+		// file, and naming it twice in one line reads as two problems.
+		var held []string
+		for _, name := range in.stateInDir(in.configDir) {
+			if !slices.Contains(named, name) {
+				held = append(held, name)
+			}
+		}
+		if len(held) > 0 {
+			lost = append(lost, "console settings in "+in.configDir+" ("+strings.Join(held, ", ")+")")
+		}
 	}
 	if len(lost) == 0 {
 		return driftFinding{}, false
@@ -391,12 +462,36 @@ func consoleStateFinding(in driftInputs) (driftFinding, bool) {
 	}, true
 }
 
-// dirIsUsed reports whether a directory holds anything. An unreadable or
-// missing directory is "no", so a permission problem cannot manufacture a
-// finding.
-func dirIsUsed(dir string) bool {
+// consoleStateFileName reports whether a file in the config directory is
+// console state.
+//
+// The console names every file it keeps there `console-<what>.yaml`
+// (console-servers, console-auth, console-mcp-token), and that convention is
+// what this reads, so a build that keeps a console-*.yaml this package never
+// names is still recognised as state whose loss matters. Everything else in
+// that directory belongs to something other than the console (the telemetry
+// spool and consent file, a global config.env, a generated dump key) and is
+// either rebuildable or not the console's to warn about.
+func consoleStateFileName(name string) bool {
+	return strings.HasPrefix(name, "console-")
+}
+
+// consoleStateInDir lists the console state files a directory holds, sorted.
+// An unreadable or missing directory holds none, so a permission problem
+// cannot manufacture a finding.
+func consoleStateInDir(dir string) []string {
 	entries, err := os.ReadDir(dir)
-	return err == nil && len(entries) > 0
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() && consoleStateFileName(e.Name()) {
+			out = append(out, e.Name())
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 func isExistingDir(path string) bool {
@@ -435,11 +530,11 @@ func liveDriftInputs(indexDSN string, opts consoleOpts) driftInputs {
 		return def()
 	}
 	return driftInputs{
-		getenv:    os.Getenv,
-		indexDSN:  indexDSN,
-		isDir:     isExistingDir,
-		dirIsUsed: dirIsUsed,
-		mounts:    readMountinfo(),
+		getenv:     os.Getenv,
+		indexDSN:   indexDSN,
+		isDir:      isExistingDir,
+		stateInDir: consoleStateInDir,
+		mounts:     readMountinfo(),
 		state: []statePath{
 			{what: "your console username and password", path: pick(opts.AuthFile, console.DefaultAuthPath)},
 			{what: "the servers you added", path: pick(opts.ServersFile, console.DefaultRegistryPath)},

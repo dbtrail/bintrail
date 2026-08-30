@@ -618,7 +618,11 @@ The **SQL panel** is the other half of that trade: a query box that runs the SQL
 **inside the console daemon** and returns the rows, so you never leave the
 browser. It is **on by default** on `serve` and `watch` alike, and it appears as
 a **SQL** item in the sidebar for any server that has an archive or baseline
-layout to query. To hide it, set `BINTRAIL_CONSOLE_SQL_PANEL=0`.
+layout to query. To hide it, set `BINTRAIL_CONSOLE_SQL_PANEL=0`. It hides on
+anything that is not a clear yes: `0` and `false` turn it off, and so does a
+value the daemon cannot read either way (`off`, `no`, a typo), which is logged
+with the values that work. Only an unset variable or a clear true leaves the
+page on, so a mistyped opt-out can never leave it open.
 
 The SQL runs server-side, so the page keeps every guard below: it sits behind
 console sign-in like the rest of the console, it is refused outright while an
@@ -866,7 +870,10 @@ see the metrics tables and example alert rules in
 - `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
 - `BINTRAIL_CONSOLE_SQL_PANEL` — `0`/`false` hides the **SQL** page: a
   server-side, read-only SQL query box over the selected server's Parquet (see
-  [The SQL panel](#the-sql-panel)). On by default on both `serve` and `watch`.
+  [The SQL panel](#the-sql-panel)). On by default on both `serve` and `watch`,
+  and it fails closed: a value that is neither a clear true nor a clear false
+  (`off`, `no`, a typo) hides the page and logs the values that work, so a
+  mistyped opt-out never leaves the page open.
   Unlike the `views.sql` download, this executes SQL **inside the daemon**, so
   it runs in a locked-down DuckDB sandbox: read
   [The SQL panel](#the-sql-panel) before exposing the console on a shared or
