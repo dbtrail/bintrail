@@ -511,7 +511,17 @@ compact baseline summary card and links onward:
   local path and an S3 location is listed by its S3 location (state views
   point wherever the server's backup destination points). The S3 secret it
   creates lasts one DuckDB session, so run the file again (`.read views.sql`)
-  in each session that reads S3. The card is hidden for a server with
+  in each session that reads S3. Tick **Include the live index** before
+  downloading to add a second leg over the index itself, covering the recent
+  changes rotation has not archived yet (the same thing `bintrail views
+  --include-live` adds). It is off by default for two reasons the card states:
+  that leg reads the live capture index and cannot narrow the read, so every
+  query over it scans the whole table and competes with capture on that
+  server; and the file then carries the index host, port, database and user.
+  Never its password: the slot is written empty for you to fill in your own
+  session. A server whose index this console reaches over a unix socket
+  refuses the box, because the file locates the index by host and port so it
+  can run on another machine. The card is hidden for a server with
   archives disabled, for one with nothing archived and
   no baseline yet, and while an access-control profile is active — the file
   maps straight onto the unredacted Parquet a profile exists to withhold.
@@ -590,9 +600,16 @@ The **Query in DuckDB** card above hands you a file to run in your *own* DuckDB.
 The **SQL panel** is the other half of that trade: a query box that runs the SQL
 **inside the console daemon** and returns the rows, so you never leave the
 browser. Because that SQL now executes server-side, it is **off by default** and
-guarded — start the console with `BINTRAIL_CONSOLE_SQL_PANEL=1` to expose it. It
+guarded — start the console with `BINTRAIL_CONSOLE_SQL_PANEL=1` to expose it. The
+bundled compose stack turns it **on**, because there the console is published on
+the host loopback only; set `SQL_PANEL=0` in `.env` to hide the page. It
 appears as a **SQL** item in the sidebar for any server that has an archive or
 baseline layout to query.
+
+Every panel session runs in UTC, which is what bintrail stores, so `event_timestamp`
+prints and groups by the instant the change was captured whatever timezone the
+daemon's machine is set to. You do not need to set it, and cannot: the panel
+takes one `SELECT` and refuses every other statement, `SET` included.
 
 What you can query is exactly what the `views.sql` schema defines: an `events`
 view across every archive source, plus one `state_<schema>_<table>` view per
@@ -825,9 +842,10 @@ see the metrics tables and example alert rules in
 - `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
 - `BINTRAIL_CONSOLE_SQL_PANEL` — `1`/`true` enables the **SQL** page: a
   server-side, read-only SQL query box over the selected server's Parquet (see
-  [The SQL panel](#the-sql-panel-opt-in)). Off by default; works on both `serve`
-  and `watch`. Unlike the `views.sql` download, this executes SQL **inside the
-  daemon**, so it runs in a locked-down DuckDB sandbox — read [The SQL panel](#the-sql-panel-opt-in)
+  [The SQL panel](#the-sql-panel-opt-in)). Off by default for a bare invocation;
+  works on both `serve` and `watch`. The bundled compose stack enables it
+  (`SQL_PANEL=0` in `.env` opts out). Unlike the `views.sql` download, this
+  executes SQL **inside the daemon**, so it runs in a locked-down DuckDB sandbox — read [The SQL panel](#the-sql-panel-opt-in)
   before enabling it on a shared or public bind.
 - `BINTRAIL_CONSOLE_ARCHIVE_STAGING` (`watch` only) — local staging dir for the
   Archive-to-S3 feature, same as `--archive-staging-dir`. AWS credentials for
@@ -1332,7 +1350,7 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `GET /api/rotation` | Effective global rotation policy: `{retain, interval, add_future, source, enabled}` — `source` is `"override"` (console-saved) or `"default"` (daemon `--rotate-*`). |
 | `PUT /api/rotation` | Supervisor only (403 on the standalone console): save a global rotation override `{retain, interval, add_future}` (validated; `off` rejected). Applies live on the next cycle. |
 | `GET /api/baselines` | Read-only listing of the **selected server's** baseline snapshots, grouped per snapshot: `{configured, source, kind, reconstruct, snapshots: [{time, age_hours, tables, binlog_file, binlog_pos, gtid_set}]}` (coordinates local-only, capped at 50 snapshots). `502` when the configured source is unreadable. |
-| `GET /api/views.sql` | **Not JSON** — a `text/plain` DuckDB schema over the selected server's Parquet (the same output as `bintrail views`), served as a `views.sql` attachment. Nothing is executed here; the file runs in your own DuckDB. 404 when archives are disabled or nothing is archived yet, 403 while an access-control profile is active. |
+| `GET /api/views.sql` | **Not JSON** — a `text/plain` DuckDB schema over the selected server's Parquet (the same output as `bintrail views`), served as a `views.sql` attachment. Nothing is executed here; the file runs in your own DuckDB. `?include_live=1` adds the leg over the live index (`bintrail views --include-live`), with the index host, port, database and user in the file and never its password. 404 when archives are disabled or nothing is archived yet, 403 while an access-control profile is active, 422 when this server cannot carry the live leg (an index reached over a unix socket, or one with no `binlog_events` table), 502 when the index could not be asked. |
 | `POST /api/sql` | Runs a read-only `SELECT` over the selected server's Parquet **inside the daemon**, in a locked-down DuckDB sandbox, returning `{columns, rows, row_count, truncated, elapsed_ms}` plus an optional `warnings` list (present when the session is missing the `events` view because `archive_state` could not be read; a failed statement carries the same note after the engine message). Opt-in (`BINTRAIL_CONSOLE_SQL_PANEL=1`) — `403` otherwise. `403` while a profile is active; `404` when archives are disabled or there is nothing to query; `422` for a non-`SELECT`, a statement error, or the timeout; `429` when another query is already running. Cancellation is by aborting the request. See [The SQL panel](#the-sql-panel-opt-in). |
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 | `GET /api/flashback` | Process-global: the embedded time-travel SQL port (`watch --flashback-listen`): `{enabled, listen, host, port}`. `enabled: false` alone on the standalone console and on a daemon that did not open the port; `host` is empty on a wildcard bind (the UI then uses the name it was opened with). Never the console token that authenticates the port. Backs the **Connect a SQL client** panel on Settings → Connect AI. |

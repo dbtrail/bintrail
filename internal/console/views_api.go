@@ -36,11 +36,15 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
-		// The console has no --include-live and never sets LiveIndex, so the
-		// archives-only note must not tell this reader to "regenerate with a
-		// reachable index": they downloaded this file FROM a page served by
-		// that index, and regenerating gets them the same bytes.
-		LiveLegUnavailable: true,
+	}
+	// The download CAN carry the hot leg now (the "Include the live index"
+	// box), so the archives-only note names that box rather than a flag the
+	// reader is not at a command line to pass. A server this console cannot
+	// reach by host and port has no route at all, and says so instead.
+	if consoleCanOfferLiveLeg(b) {
+		in.LiveLegHowTo = liveLegHowTo
+	} else {
+		in.LiveLegUnavailable = true
 	}
 	var archiveErr error
 	in.ArchiveSources, archiveErr = consoleArchiveSources(ctx, b.db, portable)
@@ -155,6 +159,31 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		// the same 502 the baseline listing returns for it.
 		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
+	}
+
+	// The hot leg, only when the reader asked for it (#1480). Opt-in and never
+	// the default: it names the index by host and port in a file meant to be
+	// shared, and a query against the two-leg view reads the live capture
+	// index. Resolved AFTER the layout, so a server with nothing to describe
+	// still 404s on the cheaper answer.
+	if isTrue(r.URL.Query().Get("include_live")) {
+		li, err := resolveConsoleLiveIndex(r.Context(), b)
+		var cfgErr *liveLegConfigError
+		switch {
+		case errors.As(err, &cfgErr):
+			// This server cannot carry the leg however it is asked for.
+			writeJSONError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		case err != nil:
+			// The index could not be asked. Same upstream-fault answer the
+			// baseline listing gives, and never a file that silently drops
+			// the half the reader ticked a box for.
+			writeJSONError(w, http.StatusBadGateway, scrubDSNError(err, b.dsn))
+			return
+		}
+		in.LiveIndex = li
+		// A file that HAS the leg needs no note about how to add one.
+		in.LiveLegHowTo = ""
 	}
 
 	sqlText := views.Generate(in)

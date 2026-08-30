@@ -378,7 +378,9 @@ volumes, the `bintrail-index-secret` mount, the `bintrail-index-data`
 read-only mount (`/var/lib/bintrail-index-ro`, used only by `doctor`'s
 disk-capacity check against the *bundled* index — see above; harmless to
 leave but pointless once you delete the volume it points at), and the
-`depends_on: index-mysql` on the `bintrail` service. dbtrail installs only its schema on your server;
+`depends_on: index-mysql` on the `bintrail` service (the opt-in `flashback`
+and `iceberg-export` services carry the same mount and dependency, so do the
+same there if you use those profiles). dbtrail installs only its schema on your server;
 its sizing, backups, and upgrades are yours — see
 [Capacity Planning](./capacity.md), [deployment.md](./deployment.md), and
 [SUPPORT.md](./SUPPORT.md). (The BYO contract floor stays MySQL **8.0+** —
@@ -431,6 +433,13 @@ for the selected server — trigger a run, watch per-table match/mismatch/
 inconclusive results land, and drill into a mismatch — see
 [console.md](console.md#running-verification-from-the-console).
 
+**SQL** (in the sidebar, for a server that has archived Parquet or a backup) is
+on by default in this stack too: a read-only `SELECT` box answered by the daemon
+in a locked-down DuckDB session. Set `SQL_PANEL=0` in `.env` to hide the page.
+The console here is published on the host loopback only, which is why it is on;
+read [The SQL panel](console.md#the-sql-panel-opt-in) before you widen that
+mapping.
+
 Notes:
 
 - The dump is **point-consistent** by default (`--sync-thread-lock-mode FTWRL
@@ -460,6 +469,46 @@ Notes:
   schema to match the deltas), and periodically so the binlog window between
   baseline and "now" stays short. Old snapshots are plain directories — prune
   them by deleting `<timestamp>` dirs in the volume.
+
+### Iceberg tables from your backups (the `iceberg-export` profile)
+
+Once you have baselines, the compose file can turn them into Apache Iceberg
+tables that Spark, Trino, Athena, Snowflake and DuckDB read directly. It is
+another opt-in one-shot, on the **core** image (the console image ships
+without the export commands):
+
+```bash
+docker compose --profile iceberg-export run --rm iceberg-export
+```
+
+The first run loads the newest snapshot; every run after that adds only what
+changed since, so bringing the tables forward is cheap enough to schedule.
+Hourly from the host's crontab:
+
+```
+17 * * * * cd /path/to/stack && docker compose --profile iceberg-export run --rm iceberg-export >> /var/log/bintrail-iceberg.log 2>&1
+```
+
+Notes:
+
+- It needs a baseline: run the `baseline` profile first, or set `BASELINE_S3`
+  to a prefix that already holds snapshots. With neither, the service exits
+  with a `FATAL` naming the directory it looked in.
+- Tables are written to `<schema>/<table>/` under `WAREHOUSE_DIR` (default
+  `/var/lib/bintrail-iceberg`) in the `bintrail-iceberg` volume. That volume
+  is an **output**, not a system of record: it is rebuilt from the index and
+  the baselines, so losing it costs a re-export and nothing else.
+- The index DSN is the bundled one unless you set `INDEX_DSN`, exactly like
+  the other services.
+- Set `ICEBERG_TABLES` to a comma-separated `schema.table` list to export only
+  some tables (default: every table in the newest snapshot).
+- A run that dies before committing leaves the previous copy in place and
+  resumes from it. A run refuses to advance a table whose columns changed, or
+  whose history has a gap, and says which; to load such a table again from a
+  fresh baseline, remove its directory from the warehouse.
+- It never runs inside the capture daemon. The export writes a new copy of the
+  data, and keeping it out of `watch` is what makes sure a long export cannot
+  slow capture down. See [Iceberg export](iceberg-export.md).
 
 ### Time-travel SQL (`AS OF`) and the compose stack
 
@@ -539,6 +588,10 @@ surface, use the demo image ([demo.md](./demo.md)).
 | `BASELINE_DIR` | compose (optional) | Baseline dir for the boot `SOURCE_DSN` entry — set `/var/lib/bintrail/baselines` after the first `baseline` profile run to enable Time-travel on it. Also enables full-table `_snapshot.*` on the `flashback` profile shim |
 | `BASELINE_TRIGGER` | compose (optional) | Enables the console's in-process **Create baseline** button (dump→convert→upload) for a monitored server; **on by default** — set `BASELINE_TRIGGER=0` to disable |
 | `VERIFY_TRIGGER` | compose (optional) | Enables the console's Storage **Verification** panel (runs `bintrail verify` in-process) for a monitored server; **on by default** — set `VERIFY_TRIGGER=0` to disable |
+| `SQL_PANEL` | compose (optional) | Enables the console's **SQL** page (a read-only `SELECT` box over the selected server's Parquet, answered inside the daemon); **on by default** in this stack, whose console is published on the host loopback only. Set `SQL_PANEL=0` to hide it |
+| `WAREHOUSE_DIR` | compose `iceberg-export` profile (optional) | Directory the Iceberg tables are written under (default `/var/lib/bintrail-iceberg`, in the `bintrail-iceberg` volume) |
+| `BASELINE_S3` | compose `iceberg-export` profile (optional) | S3 prefix holding the baseline snapshots to export from; wins over `BASELINE_DIR` |
+| `ICEBERG_TABLES` | compose `iceberg-export` profile (optional) | Comma-separated `schema.table` list to export (default: every table in the newest snapshot) |
 | `SHIM_USER` | compose `flashback` profile | Login the time-travel `mysql` terminal authenticates with (required to start the `shim` service) |
 | `SHIM_PASSWORD` | compose `flashback` profile | Cleartext password for `SHIM_USER` (required) |
 | `SHIM_AUTH_METHOD` | compose `flashback` profile (optional) | Client auth plugin for the shim (default `mysql_native_password`; set `caching_sha2_password` for drivers that require it) |

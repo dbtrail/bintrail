@@ -186,11 +186,19 @@ type Input struct {
 	LiveIndex *LiveIndex
 
 	// LiveLegUnavailable is set by a producer that has no way to offer the hot
-	// leg at all, so the archives-only note does not send its reader to a flag
-	// that surface cannot pass. The console download is that producer: it has
-	// no --include-live, and telling an operator to "regenerate" from a page
-	// served BY the index gets them a byte-identical file.
+	// leg at all, so the archives-only note does not send its reader to a
+	// route that surface cannot take. The console download sets it per SERVER:
+	// one whose index connection is not open, or whose index DSN names a unix
+	// socket, cannot carry the leg however the reader asks.
 	LiveLegUnavailable bool
+
+	// LiveLegHowTo replaces the archives-only note's "regenerate with
+	// --include-live" line with the route THIS producer's reader can take. The
+	// console sets it because that reader has a checkbox, not a command line,
+	// and a flag they cannot pass is not remediation. One line of plain text,
+	// rendered as a comment; empty keeps the CLI wording, and it is ignored
+	// when LiveLegUnavailable is set (a producer with no route names none).
+	LiveLegHowTo string
 
 	// ExcludeEventColumns drops the named columns (matched case-insensitively
 	// against archive.BinlogEventColumns) from the `events` view. Purely
@@ -626,6 +634,11 @@ func writeEventsView(b *strings.Builder, in Input) {
 			b.WriteString("-- This download covers the archives; it has no way to reach the index.\n")
 			b.WriteString("-- To add a leg over the index, run `bintrail views --index-dsn ...\n")
 			b.WriteString("-- --include-live` from a host that can connect to it.\n")
+		} else if in.LiveLegHowTo != "" {
+			// The producer's own route. Rendered verbatim as one comment line
+			// so this package states no route it cannot see (a page's control
+			// is not something the generator can know about).
+			b.WriteString("-- " + commentSafe(in.LiveLegHowTo) + "\n")
 		} else {
 			b.WriteString("-- Add a leg over the index by regenerating with --include-live:\n")
 			b.WriteString("--   bintrail views --index-dsn ... --include-live\n")

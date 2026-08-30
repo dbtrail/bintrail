@@ -435,6 +435,18 @@ func openSandboxedSession(ctx context.Context, in views.Input) (*sql.DB, func(),
 	sandbox := []string{
 		"SET allowed_directories = " + sqlPanelAllowedList(in),
 		"SET temp_directory = " + sqlQuoteString(spill),
+		// Every panel session reads and renders in UTC, which is the timezone
+		// bintrail stores in. DuckDB's default TimeZone is the HOST's, so
+		// without this the archives' TIMESTAMP WITH TIME ZONE columns come
+		// back shifted by whatever zone the daemon's machine is set to:
+		// date_trunc('day', event_timestamp) lands on a local midnight and
+		// strftime prints a local hour, both silently. The statement gate
+		// refuses a user-typed SET (deliberately), so this is the only place
+		// the panel's timezone can be set at all: a reader who would type
+		// `SET TimeZone = 'UTC'` in their own DuckDB has no way to say it
+		// here. Ahead of enable_external_access/lock_configuration below:
+		// the config freezes there, and a timezone is not a sandbox carve-out.
+		"SET TimeZone = 'UTC'",
 	}
 	// The conservative daemon budget (#510) — never ultrafast: this process may
 	// co-host the stream supervisor. Applied by hand rather than Tuning.Apply

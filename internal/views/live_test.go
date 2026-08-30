@@ -365,10 +365,11 @@ func TestNoLiveIndex_saysWhatIsMissing(t *testing.T) {
 	}
 }
 
-// TestNoLiveIndex_consoleDownloadSaysSomethingTrue: the console never sets
-// LiveIndex and has no --include-live, so the CLI's remediation is not
-// actionable on a file downloaded from a page the index itself is serving.
-func TestNoLiveIndex_consoleDownloadSaysSomethingTrue(t *testing.T) {
+// TestNoLiveIndex_unavailableSaysSomethingTrue: a producer with no route to
+// the index at all (the console download for a server whose index connection
+// is not open, or whose DSN names a unix socket) must say why, not point at a
+// flag its reader cannot pass.
+func TestNoLiveIndex_unavailableSaysSomethingTrue(t *testing.T) {
 	in := liveInput(nil)
 	in.LiveLegUnavailable = true
 	out := Generate(in)
@@ -377,7 +378,55 @@ func TestNoLiveIndex_consoleDownloadSaysSomethingTrue(t *testing.T) {
 		t.Error("the scope statement must survive: it is what #1480 is about")
 	}
 	if !strings.Contains(out, "it has no way to reach the index") {
-		t.Error("the console file must say why it has no live leg, not point at a flag it cannot pass")
+		t.Error("the file must say why it has no live leg, not point at a flag it cannot pass")
+	}
+	if strings.Contains(out, "--include-live` from a host") && strings.Contains(out, "Add a leg over the index by") {
+		t.Error("both remediations rendered; the reader gets two different instructions")
+	}
+}
+
+// TestNoLiveIndex_producerRouteReplacesTheFlag: the console CAN offer the hot
+// leg (#1480 + the download checkbox), so its archives-only file must name the
+// control that adds it. Naming the CLI flag instead sends a reader who is
+// looking at a page to a command line they may not have.
+func TestNoLiveIndex_producerRouteReplacesTheFlag(t *testing.T) {
+	in := liveInput(nil)
+	in.LiveLegHowTo = `Tick "Include the live index" on the Query in DuckDB card and download again.`
+	out := Generate(in)
+
+	if !strings.Contains(out, `-- Tick "Include the live index" on the Query in DuckDB card and download again.`) {
+		t.Errorf("the producer's own route is not in the file:\n%s", out)
+	}
+	if strings.Contains(out, "--include-live") {
+		t.Error("the CLI flag is still named alongside the producer's route")
+	}
+	if !strings.Contains(out, "ARCHIVED events only") {
+		t.Error("the scope statement must survive whichever route is named")
+	}
+}
+
+// A hint carrying a newline must not end its comment and turn the rest into
+// statement text. Same rule as every other interpolated string in this file.
+func TestLiveLegHowTo_staysInsideItsComment(t *testing.T) {
+	in := liveInput(nil)
+	in.LiveLegHowTo = "tick the box\nDROP TABLE orders;"
+	out := Generate(in)
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "DROP TABLE") {
+			t.Fatalf("a newline in the hint escaped its comment:\n%s", out)
+		}
+	}
+}
+
+// LiveLegUnavailable wins: a producer that cannot reach the index has no route
+// to name, and rendering both would contradict the sentence above it.
+func TestLiveLegHowTo_ignoredWhenUnavailable(t *testing.T) {
+	in := liveInput(nil)
+	in.LiveLegUnavailable = true
+	in.LiveLegHowTo = "tick the box"
+	out := Generate(in)
+	if strings.Contains(out, "-- tick the box") {
+		t.Error("a route was named for a producer that has none")
 	}
 }
 

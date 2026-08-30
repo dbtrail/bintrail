@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The console's DuckDB schema download can include the live index**
+  (#1480). The **Query in DuckDB** card on the Storage page grows an
+  **Include the live index** checkbox, and `GET /api/views.sql` an
+  `include_live=1` parameter, so the downloaded `views.sql` can carry the
+  same second leg `bintrail views --include-live` adds: the recent changes
+  rotation has not archived yet. Off by default, and the card says why in
+  plain words before you tick it, because that leg reads the live capture
+  index and cannot narrow the read, so every query over it scans the whole
+  table and competes with capture on that server. The file carries the index
+  host, port, database and user, resolved from the connection the console
+  already holds, and never its password: the slot is written empty for the
+  reader to fill in their own session. A server whose index this console
+  reaches over a unix socket, or whose database has no `binlog_events`
+  table, refuses with that reason (422) instead of quietly downloading the
+  half that works, and an index that could not be asked answers 502. The
+  tier and the audit posture do not move: `settings:read`, unaudited (view
+  definitions are not row data), and refused outright while an
+  access-control profile is active, the parameter included. When the leg is
+  not included, the archives-only note in the file now names the checkbox
+  rather than a command-line flag the reader is not at a command line to
+  pass.
+- **A "Keep it current with Iceberg" panel on the console's Backups page**
+  (#1466). For the selected server it prints the exact `bintrail export
+  iceberg` command, with the index DSN and backup destination filled in from
+  what the page already knows (the resolved destination decides between
+  `--baseline-dir` and `--baseline-s3`), a Copy button, the hourly cron line,
+  and a collapsed "How to run it" block. The index password is elided as
+  `***`, the way the SQL-client panel elides the console token. The block
+  says the address and folder in the command are the ones this console uses,
+  which in the bundled stack are inside Docker, and offers the compose
+  profile below for that case. It is a
+  command and not a button on purpose, and the panel says so: the export
+  writes a new copy of your data and is deliberately kept out of the process
+  that captures changes, so a long export can never slow capture down. No new
+  API route, nothing executed, and nothing in the console links the Iceberg
+  writer.
+- **An `iceberg-export` profile in the bundled compose stack** (#1466). A
+  one-shot service that runs `bintrail export iceberg` against the bundled
+  index and the baselines in the state volume, writing Iceberg tables into a
+  new `bintrail-iceberg` volume:
+  `docker compose --profile iceberg-export run --rm iceberg-export`, with the
+  cron line in the file and in [docs/docker.md](docs/docker.md). It uses the
+  CORE image, like the `baseline` profile, because the console image ships
+  without the export commands, and it is behind its own profile so it never
+  starts with the stack. `WAREHOUSE_DIR`, `BASELINE_S3` and `ICEBERG_TABLES`
+  tune it; with no snapshots to export from it exits with a message naming
+  the directory it looked in and the command that makes one.
+
+### Changed
+- **The console's SQL panel reads and renders in UTC** (#1177). DuckDB's
+  default timezone is the host's, so on a daemon whose machine is not set to
+  UTC an archived `event_timestamp` printed shifted and
+  `date_trunc('day', event_timestamp)` bucketed events by a local midnight,
+  both silently. Every panel session now sets UTC, which is what bintrail
+  stores. The operator could not have fixed it themselves: the panel takes
+  one `SELECT` and refuses every other statement, `SET` included, which is
+  deliberate and unchanged.
+- **The bundled compose stack enables the console's SQL page** (#1177). The
+  page is still off for a bare `bintrail-console serve` or `watch`, where the
+  operator chose the bind; in the stack, whose console is published on the
+  host loopback only, it is on so the page is there to find. Set
+  `SQL_PANEL=0` in `.env` to hide it.
+
 ## [0.71.0] - 2026-08-29
 
 ### Added

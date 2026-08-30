@@ -51,6 +51,10 @@ volumes:
   bintrail-dump:          # transient mydumper output for the `baseline`
                           # profile (its snapshot/ dir is recreated from
                           # scratch every run — never store anything here).
+  bintrail-iceberg:       # Iceberg tables written by the `iceberg-export`
+                          # profile. An OUTPUT, never a system of record: it is
+                          # rebuilt from the index and the baselines, so losing
+                          # it costs a re-export and nothing else.
   drill-scratch-data:     # THROWAWAY datadir for the `drill` profile's scratch
                           # MySQL. Never holds anything worth keeping — wipe it
                           # between drills with:
@@ -303,6 +307,16 @@ services:
       # a baseline dir/S3 configured (baseline-anchored) or a source DSN
       # (live-source) before the button does anything.
       BINTRAIL_CONSOLE_VERIFY_TRIGGER: ${VERIFY_TRIGGER:-1}
+      # The SQL page (#1177): a read-only SELECT box over the selected
+      # server's archived Parquet and newest backup, answered by this daemon
+      # in a locked-down DuckDB session (one SELECT at a time, only the
+      # generated views, only that server's archive and backup folders,
+      # capped rows, a query timeout, and never the paid forensics columns).
+      # On in this stack so the page is there to find, the same way the two
+      # buttons above are; set SQL_PANEL=0 in .env to hide it. A bare
+      # `bintrail-console serve` or `watch` keeps it off until the variable
+      # is set, because there the operator has not chosen the bind.
+      BINTRAIL_CONSOLE_SQL_PANEL: ${SQL_PANEL:-1}
       # Password login (persists next to the registry). On first run the
       # console serves a "create your password" screen; later visits sign in.
       # There is deliberately NO password env var: docker inspect must never
@@ -660,6 +674,96 @@ services:
     depends_on:
       baseline-dump:
         condition: service_completed_successfully
+
+  # ── Iceberg export (one-shot, opt-in `iceberg-export` profile) ──────────
+  # Writes each table's state as an Apache Iceberg table, from the newest
+  # baseline snapshot plus every change the index has recorded since. Spark,
+  # Trino, Athena, Snowflake and DuckDB read the result directly. Run on
+  # demand:
+  #
+  #   docker compose --profile iceberg-export run --rm iceberg-export
+  #
+  # or from the host's crontab, hourly (cd to the directory holding this file):
+  #
+  #   17 * * * * cd /path/to/stack && docker compose --profile iceberg-export run --rm iceberg-export >> /var/log/bintrail-iceberg.log 2>&1
+  #
+  # The first run loads the newest snapshot; every run after that appends only
+  # what changed, and a run that dies before committing leaves the previous
+  # copy in place and resumes from it. It needs a baseline, so run the
+  # `baseline` profile first (or point BASELINE_S3 at snapshots you already
+  # have). Tables land in <WAREHOUSE_DIR>/<schema>/<table>/ in the
+  # bintrail-iceberg volume.
+  #
+  # A SEPARATE one-shot on purpose: the export writes a new copy of the data
+  # and never runs inside the capture daemon, so a long export cannot slow
+  # capture down. Uses the CORE image, because the console image deliberately
+  # ships without the export commands.
+  iceberg-export:
+    profiles: ["iceberg-export"]
+    image: ghcr.io/dbtrail/bintrail:${BINTRAIL_TAG:-latest}
+    # Root, for the same reason index-init is: a freshly created named volume
+    # is root-owned, and there is no earlier step here to hand it to the
+    # image's non-root uid. The tables it writes are therefore root-owned,
+    # which matters only if you point WAREHOUSE_DIR at a bind mount.
+    user: "0:0"
+    environment:
+      # Bring your own index (default: the bundled MySQL, DSN built from the
+      # generated password in the secret volume).
+      INDEX_DSN: ${INDEX_DSN:-}
+      # Where the baseline snapshots are. The default is where the `baseline`
+      # profile writes them, in the state volume mounted read-only below.
+      BASELINE_DIR: ${BASELINE_DIR:-/var/lib/bintrail/baselines}
+      # Set this instead to read snapshots from S3; it wins over BASELINE_DIR.
+      BASELINE_S3: ${BASELINE_S3:-}
+      # Where the Iceberg tables are written, inside the volume below.
+      WAREHOUSE_DIR: ${WAREHOUSE_DIR:-/var/lib/bintrail-iceberg}
+      # Optional comma-separated schema.table list (empty = every table in the
+      # newest baseline snapshot).
+      ICEBERG_TABLES: ${ICEBERG_TABLES:-}
+      # Needed when the baselines or the archived partitions this export folds
+      # live in S3. Same passthrough as the console service.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-}
+      BINTRAIL_S3_ENDPOINT: ${BINTRAIL_S3_ENDPOINT:-}
+      BINTRAIL_S3_PATH_STYLE: ${BINTRAIL_S3_PATH_STYLE:-}
+    volumes:
+      # Read-only: this reads baselines and writes nowhere but the warehouse.
+      - bintrail-state:/var/lib/bintrail:ro
+      - bintrail-iceberg:/var/lib/bintrail-iceberg
+      - bintrail-index-secret:/run/secret:ro
+    depends_on:
+      index-mysql:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Build the bundled-index DSN from the generated password unless the
+        # operator brought their own. Plain assignment under `set -e` so an
+        # unreadable secret aborts loud (see the bintrail service for why).
+        if [ -z "$$INDEX_DSN" ]; then
+          INDEX_DSN="root:$$(cat /run/secret/index_password)@tcp(index-mysql:3306)/bintrail_index"
+        fi
+        if [ -n "$$BASELINE_S3" ]; then
+          set -- --baseline-s3 "$$BASELINE_S3"
+        else
+          # An empty or missing directory is not "nothing to do": the export
+          # loads its first copy of every table from a snapshot, so without
+          # one it can only fail. Say which directory, and what makes one.
+          if [ ! -d "$$BASELINE_DIR" ]; then
+            echo "FATAL: no baseline snapshots at $$BASELINE_DIR." >&2
+            echo "  Take one first:  docker compose --profile baseline run --rm baseline" >&2
+            echo "  Or set BASELINE_S3 to a prefix that already holds snapshots." >&2
+            exit 1
+          fi
+          set -- --baseline-dir "$$BASELINE_DIR"
+        fi
+        [ -n "$$ICEBERG_TABLES" ] && set -- "$$@" --tables "$$ICEBERG_TABLES"
+        mkdir -p "$$WAREHOUSE_DIR"
+        exec bintrail export iceberg --index-dsn "$$INDEX_DSN" \
+          "$$@" --warehouse "$$WAREHOUSE_DIR"
 
   # ── `drill` profile: scratch MySQL for `bintrail drill` (#1195) ──────────
   # An opt-in THROWAWAY server the restore rehearsal loads into. Same pinned

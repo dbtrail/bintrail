@@ -3857,6 +3857,10 @@ async function renderBaselines() {
     const sqlCard = backupSQLExportCard(cur, baselines, sqlSt);
     if (sqlCard) v.append(sqlCard);
     v.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
+    // Below the list: what these backups can become, for a reader who has
+    // one and wants it in front of a reporting engine (#1466).
+    const iceberg = icebergExportPanel(cur, baselines);
+    if (iceberg) v.append(iceberg);
     viewEnter();
   } catch (err) {
     const v = VIEW(); clear(v); v.append(pageHead("Backups", null)); renderError(v, err);
@@ -4071,11 +4075,22 @@ function duckdbCard() {
     "plus one view per table in the newest backup. Run it in your own DuckDB; nothing runs here." }));
   card.append(el("p", { class: "form-hint", text:
     "No credentials are in the file: S3 access uses your AWS credential chain, so it is safe to share." }));
+  // The live leg (#1480). Opt-in, and the cost is on the label rather than in
+  // a tooltip: this one adds a leg that reads the index capture is writing to,
+  // and a query over it scans the whole table on that server every time.
+  const live = el("input", { type: "checkbox", name: "include_live" });
+  card.append(el("label", { class: "check" }, live,
+    el("span", { text: "Include the live index" })));
+  card.append(el("p", { class: "form-hint", text:
+    "Adds the most recent changes, the ones not archived yet. That part reads the live capture index " +
+    "directly and cannot narrow the read, so every query over it scans the whole table and competes " +
+    "with capture on that server. The file will hold the index host and user, never its password: " +
+    "fill that in when you run it. (CLI: bintrail views --include-live)" }));
   const btn = el("button", { class: "btn btn-sm", type: "button", text: "Open in DuckDB…" });
   btn.onclick = async () => {
     btn.disabled = true;
     try {
-      const sql = await apiText("/api/views.sql");
+      const sql = await apiText("/api/views.sql" + (live.checked ? "?include_live=1" : ""));
       downloadBlob("views.sql", sql, "text/plain");
       toast("views.sql downloaded. In DuckDB run .read views.sql, once per session.");
     } catch (err) {
@@ -4447,6 +4462,80 @@ function baselineContextStrip(b, cur) {
 // the empty state advises adding a server that exists, and the `owner`
 // fallback below attributes the snapshots to the daemon when the selected
 // server may have its own baseline_s3.
+// ── Keep it current with Iceberg (#1466) ─────────────────────────────────────
+//
+// The export turns these backups, plus every change recorded since, into
+// Apache Iceberg tables. It is shown as a command rather than a button on
+// purpose: it writes a new copy of the data, and it is deliberately kept out
+// of the process that captures changes, so nothing here can start one. The
+// panel is display only and needs no API of its own: everything in the
+// command comes from /api/servers and /api/baselines, which this page already
+// has. The password is elided the same way the SQL-client panel elides the
+// console token.
+
+// icebergExportCommand renders the command for the selected server, or null
+// when this page cannot write a correct one: no server, no backup destination,
+// or an index this console cannot name by host (a unix socket connection).
+// A command with a hole in it is worse than no panel.
+function icebergExportCommand(cur, baselines) {
+  const src = baselines && baselines.source;
+  if (!cur || !src || !cur.host || !cur.dbname) return null;
+  // The RESOLVED destination decides the flag, not the two fields on the
+  // server: local wins over S3 when both are set, and a server that inherits
+  // the daemon's destination carries neither of its own.
+  const flag = baselines.kind === "s3" ? "--baseline-s3" : "--baseline-dir";
+  const dsn = (cur.user || "user") + (cur.has_password ? ":***" : "") +
+    "@tcp(" + cur.host + ":" + (cur.port || "3306") + ")/" + cur.dbname;
+  return 'bintrail export iceberg --index-dsn "' + dsn + '" ' +
+    flag + " " + shellWord(src) + " --warehouse /path/to/warehouse";
+}
+
+function icebergExportPanel(cur, baselines) {
+  const cmd = icebergExportCommand(cur, baselines);
+  if (!cmd) return null;
+  const panel = el("section", { class: "ov-panel cn-sql", style: "margin-top:18px" });
+  panel.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Keep it current with Iceberg" })));
+  const body = el("div", { class: "cn-sql-body" });
+  panel.append(body);
+  body.append(el("p", { class: "cn-sql-row", text:
+    "Write these backups, and every change recorded since, as Apache Iceberg tables. Spark, Trino, Athena, " +
+    "Snowflake and DuckDB read them directly. The first run loads the newest backup; every run after that " +
+    "adds only what changed, so a report can be as fresh as you schedule it." }));
+  body.append(el("p", { class: "cn-sql-row", text:
+    "It is a command and not a button because the export writes a new copy of your data, and it is kept out " +
+    "of the process that captures changes so a long export can never slow capture down." }));
+  body.append(el("div", { class: "cn-urlrow" },
+    el("code", { class: "stg-code cn-url", text: cmd }),
+    el("button", { class: "btn btn-sm", type: "button", text: "Copy",
+      onclick: () => copyText(cmd, "Export command") })));
+  body.append(el("p", { class: "cn-sql-row", text:
+    "Put the index password in place of *** and choose a folder in place of /path/to/warehouse. " +
+    "Nothing is sent anywhere: the tables are written where you point it." }));
+  body.append(cnFine("How to run it",
+    // The address and the path are as THIS process sees them, and in the
+    // bundled stack both are container-scoped (index-mysql:3306,
+    // /var/lib/bintrail/baselines): pasted into a host shell they resolve to
+    // nothing. Same hazard the generated views.sql warns about for a loopback
+    // index host, and the compose profile is the answer for that operator.
+    el("p", { class: "form-hint", text:
+      "The address and folder above are the ones this console uses. Run the command somewhere that can reach " +
+      "both. If this console runs in Docker, run it there too, with the command below." }),
+    el("code", { class: "stg-code cn-snippet", text:
+      "docker compose --profile iceberg-export run --rm iceberg-export" }),
+    el("p", { class: "form-hint", text:
+      "Run it where bintrail is installed and can reach this index and these backups. Run it again whenever " +
+      "you want the tables brought forward; it picks up where it left off, and a run that dies partway leaves " +
+      "the last good copy in place." }),
+    el("p", { class: "form-hint", text: "Hourly from cron:" }),
+    el("code", { class: "stg-code cn-snippet", text: "17 * * * * " + cmd }),
+    el("p", { class: "form-hint", text:
+      "Each table is written to <warehouse>/<schema>/<table>/. The export refuses to advance a table whose " +
+      "columns changed, or whose history has a gap, and says which; to load one again from a fresh backup, " +
+      "remove its folder." })));
+  return panel;
+}
+
 function baselinesPanel(b, servers, opts) {
   // Full-width (#1415): this list is the page. The Create-baseline action
   // moved to the context strip — at page level it is a page action; inside
