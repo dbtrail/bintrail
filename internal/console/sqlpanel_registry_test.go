@@ -30,7 +30,12 @@ func TestSQLPanel_registryReadFailure(t *testing.T) {
 	srv.cm.boot.db = db
 	audit := audittest.Install(t)
 
-	rec, body := doServersReq(t, srv, "POST", "/api/sql", `{"sql":"SELECT 1"}`)
+	// A state_* query, as the paragraph above says: it is fully answerable out
+	// of the half that built, and it is the success that has to carry the note.
+	// (`SELECT 1` used to stand in here; after #1526 it builds no view at all,
+	// so it is no longer an answer served out of half a layout.)
+	rec, body := doServersReq(t, srv, "POST", "/api/sql",
+		`{"sql":"SELECT count(*) FROM state_shop_orders"}`)
 	if rec.Code != 200 {
 		t.Fatalf("state-only query: code = %d, body = %s; want 200", rec.Code, body)
 	}

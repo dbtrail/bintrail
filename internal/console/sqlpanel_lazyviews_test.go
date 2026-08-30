@@ -392,3 +392,143 @@ func TestSQLPanel_catalogListingListsTheViews(t *testing.T) {
 		})
 	}
 }
+
+// TestSQLPanel_refusalCarriesTheWait is the timing claim on the path that takes
+// the LONGEST: a mistyped relation name. That statement cannot be answered
+// selectively (the engine's "Did you mean" needs the whole catalog), so it pays
+// for every view in the layout and then fails. If the refusal carries no
+// elapsed_ms, the panel blanks its status line and the operator is told nothing
+// about the longest wait it has.
+func TestSQLPanel_refusalCarriesTheWait(t *testing.T) {
+	baselineRoot, _ := writeSQLPanelBaseline(t)
+	srv := newSQLPanelServer(t, baselineRoot, true)
+	rec, body := doServersReq(t, srv, "POST", "/api/sql", `{"sql":"SELECT * FROM state_shop_order"}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("code=%d body=%s", rec.Code, body)
+	}
+	var res struct {
+		Error     string `json:"error"`
+		ElapsedMS *int64 `json:"elapsed_ms"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Error == "" {
+		t.Fatalf("a refusal with no message: %s", body)
+	}
+	if res.ElapsedMS == nil {
+		t.Fatalf("the refusal carries no elapsed_ms, so the panel can only blank its status "+
+			"line after the slowest path it has: %s", body)
+	}
+}
+
+// TestSQLPanel_notesDescribeOnlyWhatTheSessionBuilt: a warning has to be about
+// the session that answered. `SELECT 1` builds no view and reads no baseline
+// file, so a note about baseline column types is describing files this query
+// never opened.
+func TestSQLPanel_notesDescribeOnlyWhatTheSessionBuilt(t *testing.T) {
+	archiveRoot := t.TempDir()
+	const id = "11111111-2222-3333-4444-555555555555"
+	writeSQLPanelArchive(t, archiveRoot, id)
+	baselineRoot, baselinePath := writeSQLPanelBaseline(t)
+	in := panelInput([]string{filepath.Join(archiveRoot, "bintrail_id="+id)}, baselineRoot, baselinePath)
+	if in.Baselines[0].SchemaKnown {
+		t.Fatal("the fixture's baseline now carries column types, so the decimal note cannot fire at all")
+	}
+
+	res, err := runSandboxedSQL(context.Background(), in, "SELECT 1", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("`SELECT 1` built no view and read no baseline file, yet the answer carries %v",
+			res.Warnings)
+	}
+	// The same layout, a statement that DOES read the baseline: the note is the
+	// point of this fixture, so it must still be there.
+	res, err = runSandboxedSQL(context.Background(), in, "SELECT count(*) FROM state_shop_orders", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "no column types") {
+		t.Fatalf("a query that reads the untyped baseline lost its note: %v", res.Warnings)
+	}
+}
+
+// TestSQLPanel_registryNoteIsAboutTheSessionThatAnswered: the note says this
+// session was built over half a layout. That is a true and useful thing to say
+// on an answer that READ that layout, which is the contract
+// TestSQLPanel_registryReadFailure pins. It is not something to say about
+// `SELECT 1`, which opened nothing and is complete on its own terms.
+func TestSQLPanel_registryNoteIsAboutTheSessionThatAnswered(t *testing.T) {
+	baselineRoot, baselinePath := writeSQLPanelBaseline(t)
+	in := panelInput([]string{"/nonexistent"}, baselineRoot, baselinePath)
+	in.ArchiveDiscoveryFailed = true
+
+	res, err := runSandboxedSQL(context.Background(), in, "SELECT 1", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("`SELECT 1` built no view, yet its answer explains what a catalog it never "+
+			"opened is missing: %v", res.Warnings)
+	}
+	for _, stmt := range []string{"SELECT count(*) FROM state_shop_orders", "SHOW TABLES"} {
+		res, err := runSandboxedSQL(context.Background(), in, stmt, time.Now())
+		if err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+		var found bool
+		for _, w := range res.Warnings {
+			if strings.Contains(w, "archive registry") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s was served out of half a layout and never said so: %v", stmt, res.Warnings)
+		}
+	}
+}
+
+// TestSQLPanel_setupRunsUnderTheSetupBudget: the view build reads a Parquet
+// footer per view, on an S3 layout that is a network read, and it runs under
+// the single-flight latch — it used to run under no deadline at all, so one
+// hung read would answer every other reader with 429 for as long as it lasted.
+//
+// The claim is deliberately narrow, because the wider one is not true: a
+// cancelled context does NOT interrupt an httpfs read already in flight
+// (measured against the pinned engine, twice, watching the request count).
+// What the budget does is stop the setup from starting the next read. Spent
+// before the first one is the shape that pins that down: with the budget
+// already gone, nothing is read at all.
+func TestSQLPanel_setupRunsUnderTheSetupBudget(t *testing.T) {
+	probe, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadErr := duckdbutil.LoadHTTPFS(context.Background(), probe)
+	probe.Close()
+	if loadErr != nil {
+		t.Skipf("httpfs unavailable (offline host?): %v", loadErr)
+	}
+	_, baselinePath := writeSQLPanelBaseline(t)
+	var reqs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		http.ServeFile(w, r, baselinePath)
+	}))
+	defer srv.Close()
+
+	defer func(old time.Duration) { sqlPanelSetupTimeout = old }(sqlPanelSetupTimeout)
+	sqlPanelSetupTimeout = time.Nanosecond
+
+	in := panelInput(nil, srv.URL, srv.URL+"/orders.parquet")
+	if _, err := runSandboxedSQL(context.Background(), in,
+		"SELECT count(*) FROM state_shop_orders", time.Now()); err == nil {
+		t.Fatal("the setup ran to completion on a budget that was already spent")
+	}
+	if n := reqs.Load(); n != 0 {
+		t.Fatalf("the setup made %d network reads after its budget was gone: the deadline does "+
+			"not reach the view build", n)
+	}
+}

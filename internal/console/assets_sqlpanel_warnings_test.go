@@ -56,4 +56,15 @@ func TestRunSQLRendersTheTimingSplit(t *testing.T) {
 			t.Errorf("runSQL does not render %s: the SQL panel reports one number where it needs two", want)
 		}
 	}
+	// And on the path that waits LONGEST: a statement naming a relation the
+	// layout does not define builds every view before it fails. The server
+	// carries elapsed_ms on that body; a page that ignores it blanks the status
+	// line after the slowest thing the panel does.
+	if !strings.Contains(body, "j.elapsed_ms") {
+		t.Error("runSQL drops the wait on a failed statement: the operator is told nothing " +
+			"about the longest wait the panel has")
+	}
+	if !strings.Contains(body, "failed after ") {
+		t.Error("runSQL parses the failure's elapsed_ms but never puts it on the status line")
+	}
 }

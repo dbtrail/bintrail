@@ -79,10 +79,17 @@ const (
 // shrink it to exercise the interrupt without a 60-second test.
 var sqlPanelTimeout = 60 * time.Second
 
-// sqlPanelSetupTimeout bounds the pre-query setup — the S3 baseline LIST in
-// buildViewsInput holds the unbounded steps that run under the single-flight
-// latch, so a hung listing must not pin the panel at 429 for every other user.
-// The query itself is bounded separately by sqlPanelTimeout.
+// sqlPanelSetupTimeout bounds the pre-query setup, in both places it happens:
+// the S3 baseline LIST in buildViewsInput, and the view build in
+// runSandboxedSQL, which reads a Parquet footer per view. Both run under the
+// single-flight latch, so a hung read must not pin the panel at 429 for every
+// other user. The query itself is bounded separately by sqlPanelTimeout.
+//
+// It stops the NEXT read, not the current one: cancelling a context does not
+// interrupt an httpfs read already in flight (measured against the pinned
+// engine; DuckDB bounds that one itself, with http_timeout and its retries).
+// So the setup gives up at the first statement boundary after the budget runs
+// out rather than at the instant it does.
 var sqlPanelSetupTimeout = 30 * time.Second
 
 // forensicsEventColumns are the paid-tier forensics columns the console must
@@ -238,8 +245,10 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	// A session built over half the layout (baseline views, no events view,
 	// because archive_state could not be read) is still worth serving: a
 	// state_* query is fully answerable. What it must not do is stay quiet
-	// about it, in either direction: a success carries the note as a warning,
-	// and a failed statement carries it AFTER the engine's message, so "table
+	// about it, in either direction: a success carries the note as a warning
+	// (composed in sqlPanelSessionNotes, where the set of views this session
+	// actually built is known), and a failed statement carries it here, AFTER
+	// the engine's message, so "table
 	// events does not exist" is not read as a typo in the operator's SQL. After,
 	// not ahead: *sqlUserError is the panel's whole user-error class (timeouts,
 	// read-policy refusals, scan failures), and a note leading the message
@@ -260,22 +269,56 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 			if in.ArchiveDiscoveryFailed {
 				msg += ". Note: " + sqlPanelRegistryNote
 			}
-			writeJSONError(w, http.StatusUnprocessableEntity, msg)
+			writeSQLPanelError(w, http.StatusUnprocessableEntity, msg, time.Since(reqStart))
 		default:
 			recordSQLRun(r, req.SQL, "error", err.Error(), 0, false)
-			writeJSONError(w, http.StatusBadGateway, err.Error())
+			writeSQLPanelError(w, http.StatusBadGateway, err.Error(), time.Since(reqStart))
 		}
 		return
 	}
 
-	if in.ArchiveDiscoveryFailed {
-		res.Warnings = append(res.Warnings, sqlPanelRegistryNote)
-	}
-	if note := sqlPanelDecimalNote(in); note != "" {
-		res.Warnings = append(res.Warnings, note)
-	}
 	recordSQLRun(r, req.SQL, "ok", "", res.RowCount, res.Truncated)
 	writeJSON(w, http.StatusOK, res)
+}
+
+// writeSQLPanelError answers a statement the panel could not serve, with the
+// wait attached. A refusal is on the same clock as an answer, and the longest
+// wait this panel has is a MISTYPED relation name: that statement cannot be
+// answered out of a selective catalog (the engine's "Did you mean" is computed
+// from what is in it), so it builds every view in the layout and then fails. A
+// body carrying only "error" leaves the page nothing to say about that wait.
+func writeSQLPanelError(w http.ResponseWriter, status int, msg string, elapsed time.Duration) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error":      msg,
+		"elapsed_ms": elapsed.Milliseconds(),
+	})
+}
+
+// sqlPanelSessionNotes is what a session says about ITSELF: the layout it was
+// built over, narrowed to the views this statement asked for. in.OnlyViews must
+// already be the set the session was built with.
+//
+// The narrowing is the point. A note describes what the answer is missing, so a
+// note about files the query never opened is noise on an answer that is
+// entirely correct — and after #1526 `SELECT 1` opens none of them.
+func sqlPanelSessionNotes(in views.Input) []string {
+	var out []string
+	// Gated on the session having built ANY view. An answer that read a view is
+	// an answer served out of half a layout, and the note is what says so; an
+	// answer that read none (`SELECT 1`) is complete on its own terms, and
+	// telling it what a catalog it never opened is missing is noise. A nil set
+	// is every view, so the readers this note matters most to — a catalog
+	// listing, and the "table events does not exist" that follows a typo — are
+	// both inside it.
+	if in.ArchiveDiscoveryFailed && (in.OnlyViews == nil || len(in.OnlyViews) > 0) {
+		out = append(out, sqlPanelRegistryNote)
+	}
+	if note := sqlPanelDecimalNote(in); note != "" {
+		out = append(out, note)
+	}
+	return out
 }
 
 // recordSQLRun emits the panel's audit event. Every statement that reaches the
@@ -323,17 +366,32 @@ func (s *Server) sqlPanelAvailable(r *http.Request, b *bundle) bool {
 // to build, and a statement that names none (`SELECT 1`) builds none. Nothing
 // the user typed executes on that first session — see openParseSession.
 func runSandboxedSQL(ctx context.Context, in views.Input, stmt string, started time.Time) (*sqlPanelResult, error) {
-	pdb, err := openParseSession(ctx)
+	// Bound the SETUP, both halves of it: parsing the statement, and building
+	// the views it names. That build reads a Parquet footer per view, which on
+	// an S3 layout is a network read, and it runs under the single-flight latch
+	// — so one hung read there answers every other reader with 429 for as long
+	// as it lasts. The statement gets its own budget below (sqlPanelTimeout);
+	// ctx, the request, still cancels both.
+	setupCtx, setupCancel := context.WithTimeout(ctx, sqlPanelSetupTimeout)
+	defer setupCancel()
+
+	pdb, err := openParseSession(setupCtx)
 	if err != nil {
 		return nil, err
 	}
-	refs, gateErr := sqlPanelGate(ctx, pdb, stmt)
+	// Deferred AND closed by hand below. The explicit Close frees the parse
+	// session before the query session opens, so the two DuckDB budgets never
+	// overlap; the defer is what keeps a panic in the gate from orphaning an
+	// instance in a daemon that may also be capturing. Close is idempotent.
+	defer pdb.Close()
+	refs, gateErr := sqlPanelGate(setupCtx, pdb, stmt)
 	pdb.Close()
 	if gateErr != nil {
 		return nil, gateErr
 	}
 
-	db, cleanup, err := openSandboxedSession(ctx, in, wantedViews(in, refs))
+	only := wantedViews(in, refs)
+	db, cleanup, err := openSandboxedSession(setupCtx, in, only)
 	if err != nil {
 		return nil, err
 	}
@@ -391,6 +449,10 @@ func runSandboxedSQL(ctx context.Context, in views.Input, stmt string, started t
 	}
 	res.QueryMS = time.Since(start).Milliseconds()
 	res.ElapsedMS = time.Since(started).Milliseconds()
+	// The session's own view of the layout: what it built, not what the layout
+	// holds. Anything this answer warns about has to be about that.
+	in.OnlyViews = only
+	res.Warnings = sqlPanelSessionNotes(in)
 	return res, nil
 }
 
@@ -403,9 +465,11 @@ func runSandboxedSQL(ctx context.Context, in views.Input, stmt string, started t
 // DuckDB answers an unknown relation with "Table with name x does not exist!
 // Did you mean ...?", computed from what is in the catalog, so a typo'd view
 // name answered out of an EMPTY catalog would suggest a system table instead of
-// the view the reader meant. Building everything there keeps that message
-// exactly what it was before any of this was lazy — and it costs nothing on the
-// paths that matter, since it only happens on a statement that is about to fail.
+// the view the reader meant. Building everything there puts the same catalog
+// behind that message as before any of this was lazy, on a layout whose views
+// all build; where one does not, the session fails on THAT, which is what every
+// statement did before this was lazy. It costs nothing on the paths that
+// matter, since it only happens on a statement that is about to fail.
 //
 // A name the statement binds itself with WITH is not an unknown relation: it is
 // resolved inside the statement, so it neither selects a view nor forces the
@@ -423,6 +487,12 @@ func wantedViews(in views.Input, refs *statementRefs) views.ViewSet {
 	for _, n := range in.DefinedViews() {
 		defined[strings.ToLower(n)] = true
 	}
+	// defined BEFORE ctes, deliberately. The walk collects names with no scope,
+	// so a WITH whose name shadows a view leaves ONE entry that can stand for
+	// both: `WITH events AS (SELECT * FROM events WHERE ...)` reads the view
+	// inside the clause that shadows it. Asking "is this a view?" first can only
+	// cost a view nobody reads; asking "is this a CTE?" first drops that
+	// reference and turns a working query into "table does not exist".
 	want := views.ViewSet{}
 	for name := range refs.tables {
 		switch {
@@ -694,6 +764,21 @@ func collectRefs(tree any) *statementRefs {
 	return refs
 }
 
+// walkRefs records BASE_TABLE names and WITH keys, and gives up (readable =
+// false) on anything it is not sure about.
+//
+// The from-clause node types the pinned DuckDB can produce were enumerated
+// against it, since a shape this walk passes over IN SILENCE is the failure
+// that matters (it yields a smaller set, not a wrong one): BASE_TABLE, recorded
+// here; JOIN and SUBQUERY, walked through to the BASE_TABLEs inside them;
+// TABLE_FUNCTION, which the gate has already refused unless it is `range` or
+// `generate_series`, and neither names a relation; EXPRESSION_LIST (`VALUES`)
+// and EMPTY (`SELECT 1`), which name none; PIVOT, which carries the BASE_TABLE
+// it pivots; and SHOW_REF, split below. A file-literal read (`FROM 'x.parquet'`)
+// parses as a BASE_TABLE and never reaches here — the gate refuses it. So every
+// shape either names a relation this walk records, or is walked through to one,
+// and a query-less SHOW_REF is the only one that depends on the catalog while
+// naming nothing.
 func walkRefs(node any, refs *statementRefs) {
 	switch v := node.(type) {
 	case map[string]any:

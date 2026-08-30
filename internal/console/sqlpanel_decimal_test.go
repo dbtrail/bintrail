@@ -75,7 +75,10 @@ func TestSQLPanel_warnsWhenCastsAreMissing(t *testing.T) {
 	writeUntypedBaseline(t, root)
 
 	srv := newSQLPanelServer(t, root, true)
-	rec, body := doServersReq(t, srv, "POST", "/api/sql", `{"sql":"SELECT 1"}`)
+	// Over the untyped baseline itself: after #1526 the session builds only the
+	// views a statement names, and the note is about the file THIS view reads.
+	rec, body := doServersReq(t, srv, "POST", "/api/sql",
+		`{"sql":"SELECT id FROM state_shop_orders"}`)
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}

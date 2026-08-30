@@ -4181,8 +4181,18 @@ async function runSQL(sql, ui) {
     if (!res.ok) {
       if (res.status === 401) { handleUnauthorized(); return; }
       let msg = text || "HTTP " + res.status;
-      try { const j = JSON.parse(text); if (j && j.error) msg = j.error; } catch (_) {}
-      statusLine.textContent = "";
+      let waited = null;
+      try {
+        const j = JSON.parse(text);
+        if (j && j.error) msg = j.error;
+        // The wait counts on this path too (#1526), and this is where it is
+        // longest: a mistyped view name cannot be answered out of a narrow
+        // catalog, so the server builds every view in the layout before the
+        // engine can suggest the one the reader meant. Blanking the line here
+        // told them nothing about the slowest thing the panel does.
+        if (j && typeof j.elapsed_ms === "number") waited = j.elapsed_ms;
+      } catch (_) {}
+      statusLine.textContent = waited === null ? "" : "failed after " + waited + " ms";
       renderError(results, new Error(msg));
       return;
     }

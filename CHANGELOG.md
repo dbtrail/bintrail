@@ -25,8 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tables in the backup: `SELECT 1` went from 1.85 s and 40 network requests to
   32 ms and none, and a query over one `state_` view from 40 requests to 2. A
   statement naming something the layout does not define still builds everything,
-  so DuckDB's own "did you mean" answer stays as useful as it was. Nothing about
-  the panel's posture moves: still one `SELECT` at a time, still the same
+  so DuckDB's own "did you mean" answer stays as useful as it was, and so does a
+  catalog listing, which has to list what is really there. Those two are the
+  longest waits the panel has, so a failed statement now reports its wait as
+  well, instead of leaving the line blank. Warnings describe the session that
+  answered: a query that opens no baseline file is no longer told what those
+  files are missing. Nothing about the panel's posture moves: still one
+  `SELECT` at a time, still the same
   allowlist, sandbox, budget and audit trail, and still refused while an
   access-control profile is active.
 

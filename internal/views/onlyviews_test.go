@@ -170,3 +170,66 @@ func TestGeneratedViewsAreIndependent(t *testing.T) {
 		}
 	}
 }
+
+// TestNeedsS3_honorsOnlyViews: NeedsS3 answers "does this render reach S3", and
+// a filtered render reaches only what it defines. Over-reporting is latency
+// rather than a wrong answer (the caller resolves a credential chain nothing
+// uses), which is exactly why it needs a guard: nothing else would notice.
+func TestNeedsS3_honorsOnlyViews(t *testing.T) {
+	s3Both := Input{
+		ArchiveSources: []string{"s3://bucket/bintrail_id=x"},
+		Baselines:      []BaselineTable{{Schema: "shop", Table: "orders", Path: "s3://bucket/state/orders.parquet"}},
+	}
+	s3ArchiveOnly := Input{
+		ArchiveSources: []string{"s3://bucket/bintrail_id=x"},
+		Baselines:      []BaselineTable{{Schema: "shop", Table: "orders", Path: "/local/state/orders.parquet"}},
+	}
+	s3BaselineOnly := Input{
+		ArchiveSources: []string{"/local/bintrail_id=x"},
+		Baselines:      []BaselineTable{{Schema: "shop", Table: "orders", Path: "s3://bucket/state/orders.parquet"}},
+	}
+	for _, tc := range []struct {
+		name string
+		in   Input
+		only ViewSet
+		want bool
+	}{
+		{"unfiltered, S3 everywhere", s3Both, nil, true},
+		{"no view at all", s3Both, ViewSet{}, false},
+		{"only the events view, archives on S3", s3ArchiveOnly, ViewSet{"events": true}, true},
+		{"only a state view, archives on S3", s3ArchiveOnly, ViewSet{"state_shop_orders": true}, false},
+		{"only the events view, baseline on S3", s3BaselineOnly, ViewSet{"events": true}, false},
+		{"only a state view, baseline on S3", s3BaselineOnly, ViewSet{"state_shop_orders": true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := tc.in
+			in.OnlyViews = tc.only
+			if got := in.NeedsS3(); got != tc.want {
+				t.Fatalf("NeedsS3 = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSelectedBaselines reports the baseline tables a filtered render actually
+// reads, which is what a caller warning about those files has to count over.
+func TestSelectedBaselines(t *testing.T) {
+	in := goldenInput()
+	if got, want := len(in.SelectedBaselines()), len(in.Baselines); got != want {
+		t.Fatalf("unfiltered render reads %d baseline tables, want all %d", got, want)
+	}
+	in.OnlyViews = ViewSet{}
+	if got := in.SelectedBaselines(); len(got) != 0 {
+		t.Fatalf("a render that defines no view still reads %d baseline tables", len(got))
+	}
+	in.OnlyViews = ViewSet{"state_shop_orders": true}
+	got := in.SelectedBaselines()
+	if len(got) != 1 || got[0].Schema != "shop" || got[0].Table != "orders" {
+		t.Fatalf("SelectedBaselines = %+v, want just shop.orders", got)
+	}
+	// It reports the tables of the views that are RENDERED, so it has to agree
+	// with the render itself.
+	if names := createdViews(t, GenerateViews(in)); len(names) != len(got) {
+		t.Fatalf("the render defines %v but SelectedBaselines reports %d tables", names, len(got))
+	}
+}

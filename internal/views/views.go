@@ -344,6 +344,21 @@ func (in Input) DefinedViews() []string {
 	return names
 }
 
+// SelectedBaselines returns the baseline tables whose state view this Input
+// would render, honoring OnlyViews. It answers "which baseline files does this
+// render actually read", which is what a caller that reports on those files has
+// to count over: a session built for `SELECT 1` opens none of them, so a note
+// about their column types would be describing files that query never touched.
+func (in Input) SelectedBaselines() []BaselineTable {
+	var out []BaselineTable
+	for _, p := range stateViewPlan(in) {
+		if in.OnlyViews.wants(p.name) {
+			out = append(out, p.table)
+		}
+	}
+	return out
+}
+
 // definesEvents reports whether the events view is emitted at all: it needs a
 // leg, and a failed discovery leaves no usable archive list whatever
 // ArchiveSources holds. One predicate, shared by writeEventsView and
@@ -641,9 +656,11 @@ func writeEventsView(b *strings.Builder, in Input) bool {
 	if !in.OnlyViews.wants(eventsViewName) {
 		return false
 	}
+	// Whether the view EXISTS is definesEvents' question, asked below. These two
+	// are the wording inputs: which legs it has decides what the comment says,
+	// and a failed discovery leaves no usable archive list whatever
+	// ArchiveSources holds, so it decides the cold leg here too.
 	live := in.LiveIndex != nil
-	// A failed discovery leaves no usable archive list whatever ArchiveSources
-	// holds, so it decides the cold leg here rather than in a second switch.
 	cold := !in.ArchiveDiscoveryFailed && len(in.ArchiveSources) > 0
 
 	switch {
@@ -655,7 +672,7 @@ func writeEventsView(b *strings.Builder, in Input) bool {
 		b.WriteString("-- events: every archived binlog event, across all archive sources.\n")
 	}
 
-	if !cold && !live {
+	if !in.definesEvents() {
 		if in.ArchiveDiscoveryFailed {
 			// The header already names the failure; the body must not
 			// contradict it with a cause nobody verified.

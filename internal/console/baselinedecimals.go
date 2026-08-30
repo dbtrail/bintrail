@@ -109,8 +109,12 @@ func (s *Server) rememberBaselineDecimals(key string, decimals map[string][]base
 // with a real credentials fault that nothing is wrong, so the sentence ends by
 // pointing at the log, which is where that one and only that one shows up.
 func sqlPanelDecimalNote(in views.Input) string {
+	// The files this SESSION reads, not the files the layout holds: after #1526
+	// a statement builds only the state views it names, and a query that opened
+	// none of them is not the place to report on their column types.
+	tables := in.SelectedBaselines()
 	var untyped int
-	for _, t := range in.Baselines {
+	for _, t := range tables {
 		if !t.SchemaKnown {
 			untyped++
 		}
@@ -119,7 +123,7 @@ func sqlPanelDecimalNote(in views.Input) string {
 		return ""
 	}
 	noun, verb := "files", "carry"
-	if len(in.Baselines) == 1 {
+	if len(tables) == 1 {
 		noun = "file"
 	}
 	if untyped == 1 {
@@ -129,5 +133,5 @@ func sqlPanelDecimalNote(in views.Input) string {
 		"text and an aggregate over one needs an explicit CAST. A PostgreSQL source never stores "+
 		"column types, and neither did baselines taken before bintrail began recording them; if a "+
 		"footer could not be read instead, the console log has the error",
-		untyped, len(in.Baselines), noun, verb)
+		untyped, len(tables), noun, verb)
 }
