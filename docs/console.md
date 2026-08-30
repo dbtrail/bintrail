@@ -501,6 +501,23 @@ compact baseline summary card and links onward:
 
 - **Rotation** — the effective policy (override vs daemon defaults) with an
   edit shortcut to the rotation dialog.
+- **File reuse for unchanged tables** (#1528, formerly *Automatic backup
+  refresh*) — the one storage behaviour behind
+  `--baseline-carry-forward-unchanged`: whether a table with no changes in the
+  window keeps its previous Parquet file instead of being written again. It has
+  no timetable in it, which the old name promised and which **Scheduled
+  backups** on the Backups page actually is. The saving is real and it is not
+  free: where the filesystem allows a hard link, two backups then
+  share the same bytes on disk, so deleting the older one frees nothing while
+  the newer one still points at it, and a `du` per snapshot directory
+  double-counts it (one `du` over the baseline root reports the truth). The setting is
+  **process-global** (`GET`/`PUT /api/baseline-refresh`), which is why it stays
+  on this page rather than moving beside the per-server schedule it used to be
+  confused with. It is consumed by the daemon-wide refresh interval, by the
+  per-server backup schedules, and by point-in-time restores; the card says
+  which of those are live. Saving here overrides the daemon flag without a
+  restart, and a **Use the daemon setting** button then clears the override.
+  See [dump-and-baseline.md](dump-and-baseline.md#refreshing-on-a-schedule).
 - **S3 archiving per source** — every monitored server with its
   `Archive to S3` destination (or `drop-only` when none), with a shortcut into
   that server's edit form. The boot (cli) index always rotates drop-only.
@@ -820,7 +837,8 @@ see the metrics tables and example alert rules in
   *reads* use the AWS default credential chain of the daemon (environment,
   shared profile incl. SSO, or an IAM role; EC2/ECS/EKS roles work even when
   nothing shows as set, since instance roles are not detectable without a
-  metadata call). Baseline listings/reads from `s3://` ride DuckDB httpfs with
+  metadata call: an IAM role can be active with every signal on the card
+  reading as unset). Baseline listings/reads from `s3://` ride DuckDB httpfs with
   AWS-SDK-chain credentials via the `aws` extension's `credential_chain`
   secret (set up automatically; SSO-session profiles have known upstream
   gaps, and hosts where the extension cannot install fall back to static

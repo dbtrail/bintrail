@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Console: the reuse setting is named for what it does, and two cards stop
+  explaining themselves** (#1528). The Storage card titled **Automatic backup
+  refresh** controlled exactly one thing, whether a table with no changes keeps
+  its previous Parquet file instead of being written again, and it had neither
+  automation nor a timetable in it. One route away, **Scheduled backups** on the
+  Backups page IS the timetable, so two unrelated settings both promised
+  "backups, automatically". The card is now **File reuse for unchanged tables**,
+  its two paragraphs are one line per state, and its buttons read **Turn on** /
+  **Turn off**. It stays on Storage rather than moving beside the schedule it was
+  confused with, because `/api/baseline-refresh` is process-global while the
+  schedule is per server, and a global toggle inside a per-server fold would
+  claim something false. The **Scheduled backups** fold loses the paragraph that
+  explained the producer choice in general directly above the line that names it
+  for the next run. The consequence of a reused file, two backups sharing the
+  same bytes on disk, moved to [docs/console.md](docs/console.md), which also
+  gains the card's own entry. The Storage cards are reordered so what the daemon
+  does with your data comes first and usage telemetry, which is about neither
+  storage nor this page, comes last. Smaller cuts to the same rule on the AWS
+  credentials, Staged downloads, Query in DuckDB and telemetry sample cards.
+  No setting, route, API, permission or capability gate changes; 193 words leave
+  the screen. Storage is still a drawer, and the split is proposed on the issue.
+
 ## [0.72.0] - 2026-08-30
 
 ### Added

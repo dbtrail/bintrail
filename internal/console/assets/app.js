@@ -3765,14 +3765,21 @@ function buildStorage(serversRes, rotation, backupRefresh, storage, baselines, t
 
   const cards = el("div", { class: "cards" });
   const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
+  // Order (#1528): what this daemon does with your data first (rotation,
+  // file reuse), then where it reaches and what it is holding (credentials,
+  // staged downloads), then the pointer onward, then the two cards that are
+  // about neither storage nor this page. This page is still a drawer; the
+  // split is proposed in the issue, and the order is what is safe to change
+  // without moving a route. The tint rotation is positional, so the first two
+  // cards must stay two DIFFERENT unconditional cards.
   cards.append(rotationCard(rotation));
   cards.append(backupRefreshCard(backupRefresh));
   cards.append(credentialsCard(storage));
   const staging = stagingCard(storage, servers);
   if (staging) cards.append(staging);
-  cards.append(telemetryCard(telemetry));
-  if (capsCache.views) cards.append(duckdbCard());
   cards.append(baselineSummaryCard(baselines, cur, { linkOnward: true }));
+  if (capsCache.views) cards.append(duckdbCard());
+  cards.append(telemetryCard(telemetry));
   v.append(cards);
 
   // Storage keeps storage POLICY. Baselines and verification moved to their
@@ -3919,23 +3926,29 @@ function rotationCard(rot) {
   return card;
 }
 
-// backupRefreshCard exposes the one setting the automatic backup refresh has
-// that is safe to change while it runs. The schedule itself stays a daemon
-// flag, because starting a loop that was never booted needs a restart.
+// backupRefreshCard exposes ONE storage behaviour: whether a table with no
+// changes keeps its previous file instead of being written again. The refresh
+// schedule itself stays a daemon flag, because starting a loop that was never
+// booted needs a restart.
 //
-// The saving is real but it is not free of consequences, so the card states
-// them where the decision is made rather than in a doc nobody opens: where the
-// filesystem allows it, reusing a file leaves two backups sharing the same
-// bytes on disk, and after that, deleting the older backup does not give the
-// space back while the newer one still points at it.
+// The title used to be "Automatic backup refresh" (#1528), which named neither
+// of those and read as a sibling of Scheduled backups on the Backups page,
+// which IS the timetable. It stays HERE rather than moving beside that
+// schedule for a reason the inventory records: /api/baseline-refresh is
+// process-global, the schedule is per server, and a global toggle inside a
+// per-server fold would assert something false.
+//
+// The consequence of a reused file (two backups sharing the same bytes on
+// disk, where the filesystem allows it) is a thing a reader wants while
+// reading docs, not while flipping the switch: docs/console.md carries it.
 function backupRefreshCard(br) {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Automatic backup refresh" }));
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "File reuse for unchanged tables" }));
   if (!br || br.error) {
-    card.append(el("p", { class: "form-hint", text: "Could not load the refresh settings" + (br && br.error ? ": " + br.error : ".") }));
+    card.append(el("p", { class: "form-hint", text: "Could not load the reuse setting" + (br && br.error ? ": " + br.error : ".") }));
     return card;
   }
   const on = !!br.carry_forward_unchanged;
-  kvRow(card, "reuse files for unchanged tables", on ? "on" : "off");
+  kvRow(card, "reuse", on ? "on" : "off");
   // "(live)" is gated on enabled because the card also prints "nothing runs
   // yet" three lines down, and one card must not make two opposite claims
   // about the running system.
@@ -3947,17 +3960,17 @@ function backupRefreshCard(br) {
   // there would let an operator hard link their files right after being told
   // nothing runs.
   card.append(el("p", { class: "form-hint", text: on
-    ? "A table with no changes keeps its previous file instead of being written again. Where the filesystem allows it the two backups then share the same bytes on disk, so deleting the older one frees nothing while the newer one still uses it."
-    : "Every table is written again on each refresh, even when nothing in it changed. Turning this on skips that work for unchanged tables. (CLI: --baseline-carry-forward-unchanged)" }));
+    ? "A table with no changes keeps its previous file instead of being written again."
+    : "Every table is written again, even when nothing in it changed. (CLI: --baseline-carry-forward-unchanged)" }));
   if (!br.enabled) {
-    card.append(el("p", { class: "form-hint", text: "Nothing uses this setting yet. It applies once the daemon runs automatic refreshes, scheduled backups or point in time restores." }));
+    card.append(el("p", { class: "form-hint", text: "Nothing uses this yet. It applies to refreshes, scheduled backups and restores." }));
   } else if (!br.scheduled) {
-    card.append(el("p", { class: "form-hint", text: "This applies to restores and to the backup schedules you set on the Backups page. No daemon-wide refresh interval is set. (CLI: --baseline-refresh-interval)" }));
+    card.append(el("p", { class: "form-hint", text: "Used by restores and by the schedules on the Backups page. No daemon-wide refresh interval is set. (CLI: --baseline-refresh-interval)" }));
   }
   const foot = el("div", { class: "stg-cardfoot" },
     el("button", {
       class: "btn btn-sm", type: "button",
-      text: on ? "Turn off reuse" : "Turn on reuse",
+      text: on ? "Turn off" : "Turn on",
       onclick: () => saveBackupRefresh({ carry_forward_unchanged: !on }),
     }));
   // Only offered once something is saved here, because that is the only state
@@ -4021,7 +4034,6 @@ function credentialsCard(storage) {
   if (aws.container_creds) kvRow(adv, "ECS task role", "detected");
   if (aws.web_identity) kvRow(adv, "EKS IRSA", "detected");
   card.append(adv);
-  card.append(el("p", { class: "form-hint", text: "Note: an IAM role can still be active even if none of the signals above show as set." }));
   return card;
 }
 
@@ -4038,8 +4050,8 @@ function stagingCard(storage, servers) {
   const builds = stg.builds || [];
   if (!builds.length) {
     card.append(el("p", { class: "stg-hint", text:
-      "Nothing staged. A .sql backup built from the Backups page waits here until it is downloaded or " +
-      hours + " hours pass, then it is removed." }));
+      "Nothing staged. A .sql backup from the Backups page waits here until it is downloaded, or " +
+      hours + " hours pass." }));
   } else {
     card.append(el("p", { class: "stg-hint", text:
       humanBytes(stg.bytes || 0) + " on this machine in " + builds.length + (builds.length === 1 ? " build" : " builds") +
@@ -4074,7 +4086,7 @@ function duckdbCard() {
     "Download a ready-made schema over your archived Parquet: an events view across every archive source, " +
     "plus one view per table in the newest backup. Run it in your own DuckDB; nothing runs here." }));
   card.append(el("p", { class: "form-hint", text:
-    "No credentials are in the file: S3 access uses your AWS credential chain, so it is safe to share." }));
+    "No credentials are in the file, so it is safe to share." }));
   // The live leg (#1480). Opt-in, and the cost is on the label rather than in
   // a tooltip: this one adds a leg that reads the index capture is writing to,
   // and a query over it scans the whole table on that server every time.
@@ -4082,8 +4094,7 @@ function duckdbCard() {
   card.append(el("label", { class: "check" }, live,
     el("span", { text: "Include the live index" })));
   card.append(el("p", { class: "form-hint", text:
-    "Adds the most recent changes, the ones not archived yet. That part reads the live capture index " +
-    "directly and cannot narrow the read, so every query over it scans the whole table and competes " +
+    "Adds the most recent changes, the ones not archived yet. Every query over that leg scans the whole live capture index and competes " +
     "with capture on that server. The file will hold the index host and user, never its password: " +
     "fill that in when you run it. (CLI: bintrail views --include-live)" }));
   const btn = el("button", { class: "btn btn-sm", type: "button", text: "Open in DuckDB…" });
@@ -4265,8 +4276,7 @@ function telemetrySampleSection(t) {
     return d;
   }
   d.append(el("p", { class: "form-hint", text:
-    "The exact event this machine would send, byte for byte, built by the same code the command line prints " +
-    "(CLI: bintrail telemetry show). Opening this sends nothing." }));
+    "The exact event this machine would send. Opening this sends nothing. (CLI: bintrail telemetry show)" }));
   d.append(el("pre", { class: "stg-code tel-sample-pre", text: t.sample_event }));
   return d;
 }
@@ -4999,11 +5009,11 @@ function backupScheduleCard(cur, b) {
     summary.textContent = line;
   }
 
+  // One line, not a lecture (#1528). How each run is made was explained here
+  // in general, directly above the line that names it for the NEXT run
+  // specifically; the general half is docs/console.md's job.
   body.append(el("p", { class: "form-hint", text:
-    "Takes a backup on a fixed timetable while the daemon runs, so the list below keeps growing without anyone running a command. " +
-    "When it can, the daemon updates the latest backup from the recorded changes, with no load on your database; " +
-    "when it cannot (no backup yet, backups kept in S3, a gap in the recorded changes) it takes a full backup from your database, the same job as Create backup. " +
-    "Missed times are not made up: a backup due while the daemon was stopped waits for the next one." }));
+    "Takes a backup on a fixed timetable while the daemon runs. A time missed while it was stopped is not made up." }));
 
   if (!canEdit) {
     // The read-only console, or a daemon with every backup feature off:
@@ -5037,8 +5047,7 @@ function backupScheduleCard(cur, b) {
     row.append(remove);
   }
   body.append(row, el("p", { class: "form-hint", text:
-    "Every: minutes, hours or days (30m, 6h, 1d), at least 15m. At: the UTC time the timetable lines up on; for whole " +
-    "days (1d, 7d) it is the time of day the backup runs." }), msg);
+    "Every: minutes, hours or days (30m, 6h, 1d), at least 15m. At: the UTC time the timetable lines up on." }), msg);
   // The rate, before the disk finds out: every run is a full copy of every
   // table, and backups kept only on this machine are never removed on their
   // own (the daemon prunes only what it confirmed durable in S3). Same

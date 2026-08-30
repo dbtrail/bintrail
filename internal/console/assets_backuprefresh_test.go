@@ -2,6 +2,8 @@ package console
 
 import (
 	"encoding/json"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -190,5 +192,75 @@ func TestStoragePanelStillMountsTheRefreshCard(t *testing.T) {
 	js := readAsset(t, "app.js")
 	if !strings.Contains(js, `api("/api/baseline-refresh")`) {
 		t.Error("nothing fetches /api/baseline-refresh, so the card can only ever render its error branch")
+	}
+}
+
+// TestBackupRefreshCard_titleSaysWhatItDoes (#1528). This card controls one
+// thing: whether an unchanged table reuses its previous file instead of being
+// written again. It is a storage behaviour with no timetable in it, and it
+// used to be titled "Automatic backup refresh" one route away from "Scheduled
+// backups", which IS the timetable. Two names both promising "backups,
+// automatically", for two unrelated settings.
+//
+// The third assertion is what makes this a guard rather than a spelling check:
+// it fails if the collision is "fixed" by renaming the schedule instead.
+func TestBackupRefreshCard_titleSaysWhatItDoes(t *testing.T) {
+	js := readAsset(t, "app.js")
+	body := jsFunctionBody(t, js, "backupRefreshCard")
+
+	m := regexp.MustCompile(`card-title", text: "([^"]*)"`).FindStringSubmatch(body)
+	if m == nil {
+		t.Fatal("backupRefreshCard renders no card title; this guard covers nothing")
+	}
+	title := m[1]
+	for _, banned := range []string{"Automatic", "automatic", "Schedul", "schedul", "Refresh", "refresh"} {
+		if strings.Contains(title, banned) {
+			t.Errorf("the card title %q contains %q: this setting has no timetable in it, and the word "+
+				"puts it back beside Scheduled backups, which is the timetable", title, banned)
+		}
+	}
+	if !strings.Contains(strings.ToLower(title), "reuse") {
+		t.Errorf("the card title %q does not name what the control does (reuse a file)", title)
+	}
+	if !strings.Contains(js, `"Scheduled backups: none"`) {
+		t.Fatal("the schedule summary is no longer called Scheduled backups; the collision was resolved from " +
+			"the wrong side, and this guard would have passed on a renamed timetable")
+	}
+}
+
+// TestBackupRefreshCard_prose (#1528): a line of help under a control is fine,
+// a paragraph means the control explains itself instead of being clear. The
+// on-state used to carry the shared-bytes consequence of a hard link in the
+// card; that is a thing a reader wants while reading docs, not while flipping
+// the switch, so it lives in docs/console.md now.
+func TestBackupRefreshCard_prose(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "backupRefreshCard")
+	if strings.Contains(body, "share the same bytes on disk") {
+		t.Error("the hard-link consequence is back in the card; it belongs in docs/console.md")
+	}
+	if strings.Contains(body, "—") {
+		t.Error("backupRefreshCard copy contains an em dash")
+	}
+	docs, err := os.ReadFile("../../docs/console.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(docs), "share the same bytes on disk") {
+		t.Error("docs/console.md does not carry the shared-bytes consequence, so removing it from the card lost it")
+	}
+}
+
+// TestBackupScheduleCard_introIsNotAnEssay (#1528): the fold's opening
+// paragraph explained the producer choice in general terms directly above the
+// line that names the producer for the NEXT run specifically. The general half
+// is docs material; the specific half is the state the operator acts on.
+func TestBackupScheduleCard_introIsNotAnEssay(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "backupScheduleCard")
+	if strings.Contains(body, "with no load on your database") {
+		t.Error("the fold explains the producer choice in general above the line that names it for the next run")
+	}
+	// The specific half must survive the cut.
+	if !strings.Contains(body, "will update the latest backup from the recorded changes") {
+		t.Fatal("the per-run producer line is gone, so nothing says how the next run will be made")
 	}
 }
