@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
@@ -156,6 +157,13 @@ func consoleLiveAttribution(ctx context.Context, db *sql.DB, li *views.LiveIndex
 			li.Attribution = views.AttributionUnregistered
 			return
 		}
+		// Undetermined is what the FILE says, and it deliberately names no
+		// cause: a revoked SELECT, a dropped connection and a timeout are
+		// one sentence there. They are not one thing to fix, so the cause
+		// goes where it can be acted on. Same split the archive-source read
+		// makes: the file is what leaves the host, the log is what stays.
+		slog.Warn("console: could not read the index's registered sources for the live leg of views.sql; "+
+			"the file will say the sources could not be read", "error", err)
 		li.Attribution = views.AttributionUndetermined
 		return
 	}

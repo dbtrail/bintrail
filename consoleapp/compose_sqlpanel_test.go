@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 
 	"go.yaml.in/yaml/v2"
@@ -86,5 +87,56 @@ func TestSQLPanelStaysOptInWithoutTheEnvVar(t *testing.T) {
 	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "")
 	if sqlPanelEnabled() {
 		t.Error("the SQL panel is on with no environment variable set; a bare invocation must stay off")
+	}
+}
+
+// composePortsFile decodes the one field the loopback guard below reads.
+type composePortsFile struct {
+	Services map[string]struct {
+		Ports []string `yaml:"ports"`
+	} `yaml:"services"`
+}
+
+// TestComposePublishesTheConsoleOnLoopbackOnly is the OTHER half of the
+// default-on decision above, and the reason it is defensible at all.
+//
+// The SQL page answers a DuckDB SELECT inside the daemon. Turning it on by
+// default is justified in docker-compose.yml and docs/docker.md by one fact
+// about this stack and nothing else: the console is published on the host
+// loopback only. Change that mapping to "8090:8090" and the justification is
+// gone while every other test here stays green, so the fact is asserted where
+// it lives.
+//
+// Loopback here means the PUBLISHING side. The console binds 0.0.0.0 inside
+// the container on purpose (the mapping is what controls exposure), so a
+// short-syntax entry with no host part publishes on every interface and is
+// exactly the edit this guards against.
+func TestComposePublishesTheConsoleOnLoopbackOnly(t *testing.T) {
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", composePath, err)
+	}
+	var doc composePortsFile
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse %s: %v", composePath, err)
+	}
+	svc, ok := doc.Services[composeService]
+	if !ok {
+		t.Fatalf("no %q service in %s", composeService, composePath)
+	}
+	if len(svc.Ports) == 0 {
+		t.Fatalf("the %q service publishes no ports; this guard reads that list and would otherwise pass vacuously", composeService)
+	}
+	for _, p := range svc.Ports {
+		host, rest, found := strings.Cut(p, ":")
+		if !found || !strings.Contains(rest, ":") {
+			t.Errorf("port mapping %q publishes on every interface; the SQL page defaults ON in this stack "+
+				"because the console is reachable from the host only", p)
+			continue
+		}
+		if host != "127.0.0.1" && host != "[::1]" {
+			t.Errorf("port mapping %q publishes on %s, not the host loopback; the SQL page defaults ON in this stack "+
+				"because the console is reachable from the host only", p, host)
+		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dbtrail/dbtrail/internal/query"
@@ -104,6 +105,27 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 	return in, nil
 }
 
+// parseIncludeLive reads the include_live parameter.
+//
+// isTrue is the house convention for a boolean query parameter and stays that
+// everywhere else, but it treats every unrecognized value as false, and here
+// false is not a harmless default: the reader gets a 200 and an archives-only
+// file whose own note tells them to tick the box they believe they ticked.
+// "on" is what a bare HTML checkbox posts, so it is a value a client really
+// sends. An unrecognized value is refused with the ones that work.
+func parseIncludeLive(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "":
+		return false, nil
+	case "1", "true":
+		return true, nil
+	case "0", "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("include_live=%q is not a value this route understands; "+
+		"use include_live=1 to add the live index leg, or leave it out", v)
+}
+
 // handleViewsSQL serves GET /api/views.sql: the same DuckDB view definitions
 // `bintrail views` generates, with the paths resolved from the selected
 // server's bundle.
@@ -145,6 +167,12 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	includeLive, err := parseIncludeLive(r.URL.Query().Get("include_live"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	in, err := s.buildViewsInput(r.Context(), b, true)
 	switch {
 	case errors.Is(err, errNoViewSources):
@@ -166,7 +194,7 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 	// shared, and a query against the two-leg view reads the live capture
 	// index. Resolved AFTER the layout, so a server with nothing to describe
 	// still 404s on the cheaper answer.
-	if isTrue(r.URL.Query().Get("include_live")) {
+	if includeLive {
 		li, err := resolveConsoleLiveIndex(r.Context(), b)
 		var cfgErr *liveLegConfigError
 		switch {

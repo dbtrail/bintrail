@@ -25,10 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   half that works, and an index that could not be asked answers 502. The
   tier and the audit posture do not move: `settings:read`, unaudited (view
   definitions are not row data), and refused outright while an
-  access-control profile is active, the parameter included. When the leg is
-  not included, the archives-only note in the file now names the checkbox
-  rather than a command-line flag the reader is not at a command line to
-  pass.
+  access-control profile is active, the parameter included. An `include_live`
+  value the route does not understand is refused with a 400 naming the ones
+  that work, rather than read as "off" and answered with an archives-only
+  file whose own note tells the reader to tick the box they believe they
+  ticked. When the leg is not included, that note names the checkbox rather
+  than a command-line flag the reader is not at a command line to pass. If
+  the index's registered sources cannot be read, the file says so, and the
+  daemon now logs the reason: the file states one outcome where a revoked
+  `SELECT`, a dropped connection and a timeout are three different things to
+  fix.
 - **A "Keep it current with Iceberg" panel on the console's Backups page**
   (#1466). For the selected server it prints the exact `bintrail export
   iceberg` command, with the index DSN and backup destination filled in from
@@ -70,6 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator chose the bind; in the stack, whose console is published on the
   host loopback only, it is on so the page is there to find. Set
   `SQL_PANEL=0` in `.env` to hide it.
+
+### Fixed
+- **The console's Copy buttons say when they cannot copy.** The clipboard API
+  does not exist outside a secure context (plain HTTP on anything but
+  localhost), where every Copy button threw and looked as if it had worked.
+  They now tell you to copy the text by hand, and say why.
 
 ## [0.71.0] - 2026-08-29
 

@@ -4475,18 +4475,31 @@ function baselineContextStrip(b, cur) {
 
 // icebergExportCommand renders the command for the selected server, or null
 // when this page cannot write a correct one: no server, no backup destination,
-// or an index this console cannot name by host (a unix socket connection).
-// A command with a hole in it is worse than no panel.
+// or an index this console reaches over a unix socket. A command with a hole
+// in it is worse than no panel.
 function icebergExportCommand(cur, baselines) {
   const src = baselines && baselines.source;
-  if (!cur || !src || !cur.host || !cur.dbname) return null;
+  // The PORT is the socket test, not the host. A TCP connection always carries
+  // one by the time the server describes it, so an empty port means the
+  // console reaches its index over a path, which names only its own machine
+  // and cannot go in this command. Defaulting to 3306 there printed
+  // tcp(/var/run/mysqld/mysqld.sock:3306): it parses, then dies at dial. The
+  // views.sql download refuses the same server for the same reason.
+  if (!cur || !src || !cur.host || !cur.port || !cur.dbname) return null;
   // The RESOLVED destination decides the flag, not the two fields on the
   // server: local wins over S3 when both are set, and a server that inherits
   // the daemon's destination carries neither of its own.
   const flag = baselines.kind === "s3" ? "--baseline-s3" : "--baseline-dir";
+  // An IPv6 address arrives without its brackets (the server splits host from
+  // port and keeps the host bare), and 2001:db8::1:3306 is a different
+  // address, not the same one with a port.
+  const host = cur.host.includes(":") ? "[" + cur.host + "]" : cur.host;
   const dsn = (cur.user || "user") + (cur.has_password ? ":***" : "") +
-    "@tcp(" + cur.host + ":" + (cur.port || "3306") + ")/" + cur.dbname;
-  return 'bintrail export iceberg --index-dsn "' + dsn + '" ' +
+    "@tcp(" + host + ":" + cur.port + ")/" + cur.dbname;
+  // Quoted like every other value here: a database or user name may legally
+  // hold a $, a backtick or a quote, and this line is meant to be pasted into
+  // a shell.
+  return "bintrail export iceberg --index-dsn " + shellWord(dsn) + " " +
     flag + " " + shellWord(src) + " --warehouse /path/to/warehouse";
 }
 
@@ -4512,6 +4525,9 @@ function icebergExportPanel(cur, baselines) {
   body.append(el("p", { class: "cn-sql-row", text:
     "Put the index password in place of *** and choose a folder in place of /path/to/warehouse. " +
     "Nothing is sent anywhere: the tables are written where you point it." }));
+  body.append(el("p", { class: "cn-sql-row", text:
+    "The line carries the index host, port, database and user, and nothing else about the connection. " +
+    "If your index needs settings this console was given, such as TLS or a timeout, add them yourself." }));
   body.append(cnFine("How to run it",
     // The address and the path are as THIS process sees them, and in the
     // bundled stack both are container-scoped (index-mysql:3306,
@@ -4527,8 +4543,14 @@ function icebergExportPanel(cur, baselines) {
       "Run it where bintrail is installed and can reach this index and these backups. Run it again whenever " +
       "you want the tables brought forward; it picks up where it left off, and a run that dies partway leaves " +
       "the last good copy in place." }),
-    el("p", { class: "form-hint", text: "Hourly from cron:" }),
-    el("code", { class: "stg-code cn-snippet", text: "17 * * * * " + cmd }),
+    el("p", { class: "form-hint", text:
+      "Hourly from cron. Prefer the Docker line when this console runs in Docker: the container reads the " +
+      "index password from the stack, so it never has to sit in your crontab." }),
+    el("code", { class: "stg-code cn-snippet", text:
+      "17 * * * * cd /path/to/stack && docker compose --profile iceberg-export run --rm iceberg-export" }),
+    el("p", { class: "form-hint", text:
+      "Running bintrail yourself instead? Use the same schedule with the command above. Keep the password " +
+      "out of the crontab line: put it in a file only you can read and have the job read it from there." }),
     el("p", { class: "form-hint", text:
       "Each table is written to <warehouse>/<schema>/<table>/. The export refuses to advance a table whose " +
       "columns changed, or whose history has a gap, and says which; to load one again from a fresh backup, " +
@@ -6281,7 +6303,15 @@ function mcpURL(servers) {
 }
 
 function copyText(text, what) {
-  navigator.clipboard.writeText(text).then(() => toast(what + " copied to clipboard"), () => toastError("Copy failed."));
+  // navigator.clipboard does not exist outside a secure context (plain http on
+  // anything but localhost), where this threw and the button looked like it
+  // had worked. Say what to do instead, rather than failing in the console.
+  const clip = navigator.clipboard;
+  if (!clip || !clip.writeText) {
+    toastError("Copying needs https or localhost. Select the text and copy it by hand.");
+    return;
+  }
+  clip.writeText(text).then(() => toast(what + " copied to clipboard"), () => toastError("Copy failed."));
 }
 
 function buildConnect(servers, tokStatus, minted, fbStatus) {

@@ -171,6 +171,14 @@ var apiRoutePerms = []routePerm{
 	// views.sql is a Settings/Storage artifact: it names paths and column
 	// names, never row data, so it reads like the storage panel it is offered
 	// from rather than like an events read.
+	//
+	// With include_live=1 (#1480) it also names the INDEX ENDPOINT: host,
+	// port, database and user, never the password. That is configuration, not
+	// row data, so the tier and the unaudited posture do not move. Worth
+	// stating plainly, though: GET /api/servers needs servers:read to show
+	// the same facts, and this route needs settings:read, so a role holding
+	// settings:read alone can learn the index endpoint here. Both are
+	// admin-shaped tiers, and neither yields a credential.
 	{"GET", "/api/views.sql", ext.PermSettingsRead},
 	{"GET", "/api/telemetry", ext.PermSettingsRead},
 	{"POST", "/api/telemetry", ext.PermSettingsRead},

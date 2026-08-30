@@ -1,11 +1,15 @@
 package console
 
 import (
+	"bytes"
+	"fmt"
+	"log/slog"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	drivermysql "github.com/go-sql-driver/mysql"
 
 	"github.com/dbtrail/dbtrail/ext"
 )
@@ -225,5 +229,169 @@ func TestViewsAPI_includeLiveNamesOnlyObservedColumns(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "not a column of this index's binlog_events") {
 		t.Errorf("the hot leg does not mark the columns this index lacks:\n%s", body)
+	}
+}
+
+// TestViewsAPI_liveLegAttributionOutcomes covers the three things the file can
+// say about WHOSE rows the hot leg carries. They are one sentence each in the
+// artifact and they are not interchangeable: "several sources are registered"
+// was once printed for a file-mode index that serves exactly one, for an index
+// too old to have the table, and for a dropped connection.
+//
+// The archives here are registered under a DIFFERENT id from the one the
+// registry reports, on purpose for the attributed case: the generator refuses
+// to assert either identity when the two disagree, and a test whose ids match
+// would never exercise that.
+func TestViewsAPI_liveLegAttributionOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		servers func(sqlmock.Sqlmock)
+		want    string
+	}{
+		{
+			name: "no such table",
+			servers: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("FROM bintrail_servers").WillReturnError(&drivermysql.MySQLError{
+					Number: 1146, Message: "Table 'idx.bintrail_servers' doesn't exist"})
+			},
+			// An index that never ran the migration registers no source. It is
+			// NOT evidence of several, which is the inversion this pins.
+			want: "this index registers no source id",
+		},
+		{
+			name: "several sources",
+			servers: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("FROM bintrail_servers").WillReturnRows(
+					sqlmock.NewRows([]string{"n", "id"}).AddRow(2, "aaaa"))
+			},
+			want: "more than one source is registered",
+		},
+		{
+			name: "the list could not be read",
+			servers: func(m sqlmock.Sqlmock) {
+				m.ExpectQuery("FROM bintrail_servers").WillReturnError(&drivermysql.MySQLError{
+					Number: 1142, Message: "SELECT command denied to user 'reader'@'%' for table 'bintrail_servers'"})
+			},
+			want: "could not be read",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, mock := newLiveViewsServer(t, liveTestDSN)
+			expectArchiveSource(mock, "aaaa")
+			mock.ExpectQuery("information_schema.COLUMNS").WillReturnRows(
+				sqlmock.NewRows([]string{"COLUMN_NAME"}).AddRow("event_id"))
+			tc.servers(mock)
+
+			rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+			if rec.Code != 200 {
+				t.Fatalf("code = %d, body = %s", rec.Code, body)
+			}
+			if !strings.Contains(string(body), tc.want) {
+				t.Errorf("the file does not state what was observed (%q):\n%s", tc.want, body)
+			}
+			// The leg is still there: an unattributed leg is a leg, and
+			// dropping it would turn a missing sentence into missing data.
+			if !strings.Contains(string(body), "bintrail_live") {
+				t.Errorf("the live leg is gone because attribution was inconclusive:\n%s", body)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+}
+
+// An unreadable source list leaves ONE sentence in the file, and that sentence
+// deliberately names no cause: a revoked SELECT, a dropped connection and a
+// timeout read the same there. They are not one thing to fix, so the cause has
+// to reach the log, which is what stays on the host.
+func TestViewsAPI_liveLegAttributionFailureIsLogged(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	srv, mock := newLiveViewsServer(t, liveTestDSN)
+	expectArchiveSource(mock, "aaaa")
+	mock.ExpectQuery("information_schema.COLUMNS").WillReturnRows(
+		sqlmock.NewRows([]string{"COLUMN_NAME"}).AddRow("event_id"))
+	mock.ExpectQuery("FROM bintrail_servers").WillReturnError(&drivermysql.MySQLError{
+		Number: 1142, Message: "SELECT command denied to user 'reader'@'%' for table 'bintrail_servers'"})
+
+	rec, _ := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if !strings.Contains(logs.String(), "SELECT command denied") {
+		t.Errorf("the cause of the unreadable source list never reached the log; the operator has nothing to act on:\n%s", logs.String())
+	}
+}
+
+// The column probe is the half that decides whether the file binds, so a
+// driver failure there is an upstream fault (502), not a file quietly missing
+// the leg. And the answer goes through scrubDSNError: a driver error can echo
+// the DSN it dialed, and this body reaches a browser.
+func TestViewsAPI_includeLiveColumnProbeFailureIs502(t *testing.T) {
+	srv, mock := newLiveViewsServer(t, liveTestDSN)
+	expectArchiveSource(mock, "aaaa")
+	mock.ExpectQuery("information_schema.COLUMNS").WillReturnError(
+		fmt.Errorf("dial tcp: lookup db.internal: no such host (dsn %s)", liveTestDSN))
+
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	if rec.Code != 502 {
+		t.Fatalf("code = %d, body = %s; want 502", rec.Code, body)
+	}
+	if strings.Contains(string(body), liveTestPassword) {
+		t.Errorf("the 502 body carries the index password: %s", body)
+	}
+	if !strings.Contains(string(body), "binlog_events columns") {
+		t.Errorf("the 502 does not say which read failed: %s", body)
+	}
+}
+
+// An unrecognized include_live value is refused, not silently read as "off".
+// "on" is what a bare HTML checkbox posts, and answering it with 200 and an
+// archives-only file whose own note says to tick the box is the worst of the
+// three possible answers.
+func TestViewsAPI_includeLiveRejectsAnUnknownValue(t *testing.T) {
+	for _, v := range []string{"on", "yes", "TRUE!", "2"} {
+		srv, mock := newLiveViewsServer(t, liveTestDSN)
+		rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live="+v, "")
+		if rec.Code != 400 {
+			t.Errorf("include_live=%s: code = %d, body = %s; want 400", v, rec.Code, body)
+			continue
+		}
+		if !strings.Contains(string(body), "include_live=1") {
+			t.Errorf("include_live=%s: the refusal does not name a value that works: %s", v, body)
+		}
+		// Refused before the layout is resolved: nothing was asked of the index.
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("include_live=%s: %v", v, err)
+		}
+	}
+	// The values that DO work still work, in both spellings and both cases.
+	for _, v := range []string{"true", "TRUE", "1"} {
+		srv, mock := newLiveViewsServer(t, liveTestDSN)
+		expectArchiveSource(mock, "aaaa")
+		mock.ExpectQuery("information_schema.COLUMNS").WillReturnRows(
+			sqlmock.NewRows([]string{"COLUMN_NAME"}).AddRow("event_id"))
+		mock.ExpectQuery("FROM bintrail_servers").WillReturnRows(
+			sqlmock.NewRows([]string{"n", "id"}).AddRow(1, "aaaa"))
+		rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live="+v, "")
+		if rec.Code != 200 || !strings.Contains(string(body), "bintrail_live") {
+			t.Errorf("include_live=%s: code = %d, and the leg is %v", v, rec.Code, strings.Contains(string(body), "bintrail_live"))
+		}
+	}
+	// And "off" spellings stay off, without a refusal.
+	for _, v := range []string{"0", "false", ""} {
+		srv, mock := newLiveViewsServer(t, liveTestDSN)
+		expectArchiveSource(mock, "aaaa")
+		rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live="+v, "")
+		if rec.Code != 200 || strings.Contains(string(body), "bintrail_live") {
+			t.Errorf("include_live=%q: code = %d, and the leg is present = %v", v, rec.Code, strings.Contains(string(body), "bintrail_live"))
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("include_live=%q: %v", v, err)
+		}
 	}
 }
