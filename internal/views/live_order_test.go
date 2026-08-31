@@ -87,12 +87,63 @@ func TestLiveLeg_saysWhatAFailedAttachCosts(t *testing.T) {
 	}
 	for _, want := range []string{
 		"cannot reach",
-		"state_ view still usable",
+		"the state_ views above already created",
+		// The degrade is CONDITIONAL on how the file is run, and this is the
+		// invocation that breaks it: `duckdb -init file.sql` with no database
+		// file exits on the error and the in-memory catalog dies with it, so
+		// nothing survives. Verified against DuckDB v1.5.5. `bintrail views
+		// --help` names that invocation, so a file that promised the state
+		// views survive would be lying to the reader who followed the help.
+		"in-memory database goes with it",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the file never says %q, so a reader whose ATTACH failed cannot "+
 				"tell what they are left holding:\n%s", want, out)
 		}
+	}
+}
+
+// TestAttachDegrade_saysNothingSurvivesWhenNoStateViewExist: archives + an index
+// + no baseline location is a shape both producers reach (`bintrail views
+// --include-live` with no --baseline-dir; the console serves it whenever a
+// server has archived partitions and no baseline root). It defines NO state
+// view, so the reassurance the other shape earns would send this reader hunting
+// for views that were never written.
+func TestAttachDegrade_saysNothingSurvivesWhenNoStateViewsExist(t *testing.T) {
+	in := orderedInput()
+	in.Baselines, in.BaselineSource = nil, ""
+	out := Generate(in)
+
+	if strings.Contains(out, `CREATE OR REPLACE VIEW "state_`) {
+		t.Fatalf("fixture defines a state view, so it cannot test the no-state degrade:\n%s", out)
+	}
+	if !strings.Contains(out, "no view at all") {
+		t.Errorf("a file with no state view still tells the reader something survives "+
+			"a failed ATTACH:\n%s", out)
+	}
+	if strings.Contains(out, "already created") {
+		t.Error("the file claims state views survive a failed ATTACH while defining none")
+	}
+}
+
+// TestAttachDegrade_liveOnlyBranchSaysItToo: the live-only events view is
+// defined after the same ATTACH and loses the same way, so it needs the same
+// note. It was written for the two-leg branch only, which is exactly the kind
+// of omission a per-branch switch invites.
+func TestAttachDegrade_liveOnlyBranchSaysItToo(t *testing.T) {
+	in := orderedInput()
+	in.ArchiveSources = nil
+	out := Generate(in)
+
+	if !strings.Contains(out, "Defined AFTER the ATTACH above") {
+		t.Errorf("the live-only events view does not say what a failed ATTACH costs:\n%s", out)
+	}
+	// No cold leg exists, so regenerating without the live index would define
+	// no events view at all. Offering it as a remedy would be advice to
+	// generate an empty file.
+	if strings.Contains(out, "Regenerating WITHOUT the live index") {
+		t.Error("a file with no archive source offers an archives-only fallback that " +
+			"would define nothing")
 	}
 }
 
@@ -122,21 +173,35 @@ func TestLiveOnly_definesEventsOnce(t *testing.T) {
 // resolves for containers on that network and nowhere else.
 func TestLiveLeg_singleLabelHostWarns(t *testing.T) {
 	const marker = "bare name with no domain"
+	const loopbackMarker = "is a loopback address"
 	cases := []struct {
-		name string
-		host string
-		want bool
+		name         string
+		host         string
+		want         bool
+		wantLoopback bool
 	}{
-		{"compose service name", "index-mysql", true},
-		{"kubernetes short name", "bintrail-index", true},
-		{"fully qualified", "index.example.com", false},
-		{"trailing dot is still qualified", "index.example.com.", false},
-		{"ipv4 literal", "10.0.0.5", false},
-		{"ipv6 literal has no dots but is an address", "[2001:db8::1]", false},
+		{"compose service name", "index-mysql", true, false},
+		{"kubernetes short name", "bintrail-index", true, false},
+		{"fully qualified", "index.example.com", false, false},
+		{"trailing dot is still qualified", "index.example.com.", false, false},
+		{"ipv4 literal", "10.0.0.5", false, false},
+		{"ipv6 literal has no dots but is an address", "[2001:db8::1]", false, false},
 		// localhost is single-label too, and it gets the LOUDER warning: it
-		// resolves everywhere and answers with a different index.
-		{"localhost keeps the loopback warning", "localhost", false},
-		{"loopback literal keeps the loopback warning", "127.0.0.1", false},
+		// resolves everywhere and answers with a different index. wantLoopback
+		// is asserted POSITIVELY here: with only the want:false above, emptying
+		// the loopback branch leaves this test passing while the file warns
+		// about nothing at all.
+		{"localhost keeps the loopback warning", "localhost", false, true},
+		{"loopback literal keeps the loopback warning", "127.0.0.1", false, true},
+		// The DNS root-anchored forms. Only isSingleLabelHost trimmed the
+		// trailing dot, so "localhost." used to be told it resolves in one
+		// network and nowhere else -- about a name that resolves EVERYWHERE, to
+		// the wrong index. "127.0.0.1." got no warning at all.
+		{"root-anchored localhost is still loopback", "localhost.", false, true},
+		{"root-anchored loopback literal is still loopback", "127.0.0.1.", false, true},
+		// An empty host reaches the driver as localhost, so it earns the
+		// loopback warning rather than none.
+		{"empty host is loopback to the driver", "", false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,9 +212,13 @@ func TestLiveLeg_singleLabelHostWarns(t *testing.T) {
 				t.Errorf("single-label warning present = %v, want %v for host %q",
 					got, tc.want, tc.host)
 			}
+			if got := strings.Contains(out, loopbackMarker); got != tc.wantLoopback {
+				t.Errorf("loopback warning present = %v, want %v for host %q",
+					got, tc.wantLoopback, tc.host)
+			}
 			// Exactly one warning, never both: they name different failures and
 			// a reader handed both cannot tell which one they are in.
-			if strings.Contains(out, marker) && strings.Contains(out, "is a loopback address") {
+			if strings.Contains(out, marker) && strings.Contains(out, loopbackMarker) {
 				t.Errorf("host %q got both the loopback and the single-label warning", tc.host)
 			}
 		})
@@ -174,5 +243,45 @@ func TestIsSingleLabelHost(t *testing.T) {
 		if got := isSingleLabelHost(host); got != want {
 			t.Errorf("isSingleLabelHost(%q) = %v, want %v", host, got, want)
 		}
+	}
+}
+
+// TestOnlyViews_noOrphanAttach: OnlyViews narrows the render to the views a
+// caller asked for. The ATTACH exists solely to back the events view's hot leg,
+// so emitting it for a render that defines no events view leaves a connection
+// to another machine — one that can abort the whole script — with nothing
+// reading through it, under a preamble introducing a leg that is not there.
+func TestOnlyViews_noOrphanAttach(t *testing.T) {
+	in := orderedInput()
+	in.OnlyViews = ViewSet{"state_shop_orders": true}
+	out := Generate(in)
+
+	if !strings.Contains(out, `CREATE OR REPLACE VIEW "state_shop_orders"`) {
+		t.Fatalf("the view that WAS asked for is missing, so this proves nothing:\n%s", out)
+	}
+	if strings.Contains(out, `CREATE OR REPLACE VIEW "events"`) {
+		t.Fatalf("OnlyViews did not narrow the render:\n%s", out)
+	}
+	if strings.Contains(out, "ATTACH ") {
+		t.Errorf("an ATTACH is emitted for a render that defines no events view:\n%s", out)
+	}
+}
+
+// TestStateViewSkip_keepsItsSeparator: the skip line used to be the last thing
+// in the file, so nothing followed it. Since the reorder it is followed by the
+// live preamble and the events block, and without a blank line it butts
+// straight against them and reads as part of the next section.
+func TestStateViewSkip_keepsItsSeparator(t *testing.T) {
+	in := orderedInput()
+	in.Baselines, in.BaselineSource = nil, ""
+	out := Generate(in)
+
+	const skip = "-- (skipped: no baseline snapshot was discovered)\n"
+	if !strings.Contains(out, skip) {
+		t.Fatalf("no skip line to check:\n%s", out)
+	}
+	if !strings.Contains(out, skip+"\n") {
+		t.Errorf("the skip line runs straight into the next section with no blank "+
+			"line between them:\n%s", out)
 	}
 }

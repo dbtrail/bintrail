@@ -23,8 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same data. The Backups summary card is gone: Backups has its own sidebar
   entry, and the pointer existed only because the page it pointed away from
   was a drawer. Existing `/storage` links still work and land on Retention.
-
-### Changed
 - **A scheduled backup on a server whose backups go to S3 no longer forces a
   full read of your database every slot** (#1539). The daemon has two ways to
   produce a backup: a full one it dumps from the source, and an update of the
@@ -79,8 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reader with nothing: no `events` view and no `state_*` views, even though
   all of them read Parquet and needed nothing from the index. The `state_*`
   views are now defined first, then the `ATTACH`, then the `events` view that
-  reads through it. DuckDB keeps what ran before the aborting statement, so
-  every table's snapshot survives an index this machine cannot reach.
+  reads through it. DuckDB keeps what ran before the aborting statement, so the
+  table snapshots survive an index this machine cannot reach — in a session
+  that outlives the error: `.read views.sql` from an open DuckDB, or
+  `duckdb -init views.sql your.db` and then reopen `your.db`. A bare
+  `duckdb -init views.sql` exits and its in-memory database goes with it, so
+  nothing is kept; the generated file says which is which, and says plainly
+  that nothing survives when the file defines no `state_*` view at all.
   The deliberate trade: under `--include-live` a failed `ATTACH` costs the
   `events` view entirely, not just its hot leg. Defining it archives-only
   beforehand and replacing it afterwards would bind the archive file list twice,

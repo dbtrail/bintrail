@@ -42,9 +42,9 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 -- state_<schema>_<table>: each table's full contents as of the baseline snapshot.
 --
 -- These are the SNAPSHOT's rows, not the table's current state: changes after
--- the snapshot live in `events` below. To materialize a later point in time,
--- use `bintrail reconstruct`. Folding the deltas back onto a baseline is what
--- that command does, and it is not expressible as a view.
+-- the snapshot live in the `events` view. To materialize a later point in
+-- time, use `bintrail reconstruct`. Folding the deltas back onto a baseline
+-- is what that command does, and it is not expressible as a view.
 --
 -- DECIMAL and NUMERIC columns are stored as text, so that a value MySQL can
 -- hold is never rounded to fit a narrower type. The views below cast them
@@ -122,11 +122,18 @@ ATTACH '' AS "bintrail_live" (TYPE mysql, SECRET "bintrail_index", READ_ONLY);
 -- replace a known source with NULL for every event in the overlap, and a
 -- WHERE bintrail_id = ... would then miss rows the archives hold.
 --
--- Defined after the ATTACH above, so an index this machine cannot reach
--- leaves this view undefined and every state_ view still usable. It is
--- deliberately NOT also defined over the archives alone beforehand:
+-- Defined AFTER the ATTACH above, so an index this machine cannot reach
+-- leaves this view undefined and the state_ views above already created.
+-- Keeping them takes a session that outlives the error: `.read` this file
+-- from an open DuckDB, or run `duckdb -init <this file> your.db` and then
+-- reopen your.db. A bare `duckdb -init <this file>` exits on the error and
+-- the in-memory database goes with it, so nothing is left.
+-- Regenerating WITHOUT the live index gives an events view over the
+-- archives alone, which needs nothing from the index.
+--
+-- It is deliberately not ALSO defined over the archives alone beforehand:
 -- union_by_name opens one Parquet footer per archived file at CREATE VIEW
--- time, so defining it twice would pay that cost twice in every generated
+-- time, so a second definition pays that bind again in every generated
 -- file, whether or not the index turns out to be reachable.
 --
 -- COST: a filter on this view does not become a filter on the index. The

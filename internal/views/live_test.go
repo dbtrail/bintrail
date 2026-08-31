@@ -510,14 +510,14 @@ func TestLivePreamble_declaresEveryExtensionItUses(t *testing.T) {
 
 // eventsComment returns the events view's comment block, so an assertion about
 // what the file SAYS cannot pass on a sentence somewhere else in it.
-// It takes the LAST events block, not the first. Since the cold half is
-// emitted ahead of the ATTACH (#1536) a two-leg file defines "events" twice:
-// an archives-only view, then a CREATE OR REPLACE that adds the index. The
-// second is the definition that survives, so it is the one whose comment has to
-// describe what a reader will actually query. Where only one is emitted, last
-// and first are the same block.
+//
+// strings.Index, deliberately: the events view is defined exactly ONCE per file
+// (see Generate), so there is only one block to find — and if a change ever
+// reintroduces a second definition, taking the FIRST makes the wording tests
+// fail rather than quietly re-aim at the survivor. Pointing this at the last
+// block would hide exactly the regression live_order_test.go's count guards.
 func eventsComment(out string) string {
-	start := strings.LastIndex(out, "-- events:")
+	start := strings.Index(out, "-- events:")
 	if start < 0 {
 		return out
 	}
