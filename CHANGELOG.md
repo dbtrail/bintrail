@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **The Storage page is split in two, and two of its cards moved to the pages
+  they belong to** (#1543, part of #1528). Storage had become a drawer: seven
+  cards from five unrelated concerns, on a page you had to read rather than
+  use. It is now **Retention** (the rotation policy and per-source S3
+  archiving: what happens to your data as it ages) and **This daemon** (AWS
+  credential signals, staged downloads and the telemetry opt-out: what this
+  process can reach, is holding, and sends). *File reuse for unchanged tables*
+  is now **Backups & disk space** and lives on the Backups page directly under
+  **Scheduled backups** — the two names both promised "backups,
+  automatically" from different pages for unrelated settings, and side by side
+  under names that say what each does, the difference needs no paragraph. The
+  *Download a DuckDB schema* card moved to the SQL page, which queries the
+  same data. The Backups summary card is gone: Backups has its own sidebar
+  entry, and the pointer existed only because the page it pointed away from
+  was a drawer. Existing `/storage` links still work and land on Retention.
+
+### Changed
 - **A scheduled backup on a server whose backups go to S3 no longer forces a
   full read of your database every slot** (#1539). The daemon has two ways to
   produce a backup: a full one it dumps from the source, and an update of the

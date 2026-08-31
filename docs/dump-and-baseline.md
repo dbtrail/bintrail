@@ -438,7 +438,7 @@ These properties are deliberate:
   | `bintrail baseline refresh` | `--carry-forward-unchanged` |
   | `bintrail reconstruct --output-format parquet` | `--carry-forward-unchanged` |
   | `bintrail-console watch` | `--baseline-carry-forward-unchanged`, or `BINTRAIL_BASELINE_CARRY_FORWARD_UNCHANGED` (a true/false value: `1`, `true`, `0`, `false`) |
-  | Console | Settings, Storage, the **File reuse for unchanged tables** card |
+  | Console | Backups, the **Backups & disk space** card, beside the schedule |
 
   The console setting overrides the daemon flag and applies on the next cycle without a restart. Once you have saved one there, the card grows a **Use the daemon setting** button that clears it again.
 

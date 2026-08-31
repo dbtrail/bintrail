@@ -195,7 +195,7 @@ and searching events:
    **Verification** (run
    `bintrail verify` and read past runs). These produce and validate the
    artifacts a restore depends on, so they are operations rather than
-   settings; they lived on the Storage page until they outgrew it.
+   settings; they lived on the old Storage page until they outgrew it.
    A staged `.sql` build does not stay on disk: it is removed as soon as a
    download completes, 4 hours after the build finished if nobody
    downloaded it (the Ready line shows the deadline and the size), when a
@@ -205,13 +205,13 @@ and searching events:
    why, and the daemon retries every minute. If a new build starts and the
    previous one cannot be removed, the new build still runs and stays
    downloadable; its status names the previous build's directory until that
-   removal succeeds. The Storage page shows what is staged while it exists,
-   previous builds that could not be removed included.
-8. **Settings** (under `watch` only) — **Storage** (rotation policy,
-   per-source S3 archiving, a baseline summary card, AWS credential signals,
-   and a usage-telemetry opt-out — see
-   [The Storage page](#the-storage-page)) and **Rotation** (opens the
-   rotation dialog).
+   removal succeeds. The This daemon page shows what is staged while it
+   exists, previous builds that could not be removed included.
+8. **Settings** (under `watch` only) — **Retention** (rotation policy and
+   per-source S3 archiving), **This daemon** (AWS credential signals, staged
+   downloads and a usage-telemetry opt-out — see
+   [The Retention and This daemon pages](#the-retention-and-this-daemon-pages))
+   and **Rotation** (opens the rotation dialog).
 
 Every view whose subject has a page on www.dbtrail.com/docs (Events, Restore,
 Backups, Verification, Storage, Connect AI) shows a small **Docs** link beside
@@ -412,7 +412,7 @@ editing flags or restarting:
 ### The Protect pages
 
 Under `watch` the sidebar carries a **Protect** group with two pages. They were
-part of the Storage page until they outgrew it: both are operations that
+part of the old Storage page until they outgrew it: both are operations that
 produce and validate the artifacts a restore depends on, rather than settings,
 and the snapshot listing is unbounded in practice — it pushed verification, the
 panel that answers whether a restore would work, far below the fold.
@@ -499,39 +499,59 @@ panel that answers whether a restore would work, far below the fold.
 **Protect → Verification** carries the verification runner and the history of
 past runs for the selected server.
 
-The Storage page keeps a compact **Baselines** summary card (count and age)
-alongside the rest of the storage picture.
+The Backups summary card that used to point here from Storage is gone (#1543):
+Backups has its own entry in the same sidebar, and the pointer only existed
+because the page it pointed away from was a drawer.
 
-### The Storage page
+### The Retention and This daemon pages
 
-Under `watch` the sidebar grows a **Settings → Storage** page that gathers
-storage policy in one place (it was previously scattered across the rotation
-dialog and the per-server edit form). The full baseline listing and the
-verification runner moved to their own **Protect** group; Storage keeps a
-compact baseline summary card and links onward:
+Under `watch` the sidebar grows two settings pages. They were one page,
+Storage, which had become a drawer: seven cards from five unrelated concerns
+(#1543). They are split by the question each answers.
+
+**Retention** — what happens to your data as it ages:
 
 - **Rotation** — the effective policy (override vs daemon defaults) with an
   edit shortcut to the rotation dialog.
-- **File reuse for unchanged tables** (#1528, formerly *Automatic backup
-  refresh*) — the one storage behaviour behind
+- **S3 archiving per source** — every monitored server with its
+  `Archive to S3` destination (or `drop-only` when none), with a shortcut into
+  that server's edit form. The boot (cli) index always rotates drop-only.
+
+**This daemon** — what this process can reach, is holding, and sends:
+
+- **AWS credentials** — which credential signals this process sees. Presence
+  and the non-secret profile and region names only; no value is ever shown or
+  stored.
+- **Staged downloads**, and **Usage telemetry**, both described below.
+
+Two cards left the page entirely. **Backups & disk space** moved to the
+Backups page, beside the **Scheduled backups** it was being confused with:
+those two names both promised "backups, automatically" from different pages,
+for unrelated settings, and side by side the difference needs no paragraph.
+**Download a DuckDB schema** moved to the SQL page, which queries the same
+data. The old `/storage` link still works and lands on Retention.
+
+- **Backups & disk space** (#1528/#1543, formerly *File reuse for unchanged
+  tables*, and before that *Automatic backup refresh*) — the one behaviour
+  behind
   `--baseline-carry-forward-unchanged`: whether a table with no changes in the
   window keeps its previous Parquet file instead of being written again. It has
-  no timetable in it, which the old name promised and which **Scheduled
-  backups** on the Backups page actually is. The saving is real and it is not
-  free: where the filesystem allows a hard link, two backups then
-  share the same bytes on disk, so deleting the older one frees nothing while
-  the newer one still points at it, and a `du` per snapshot directory
-  double-counts it (one `du` over the baseline root reports the truth). The setting is
-  **process-global** (`GET`/`PUT /api/baseline-refresh`), which is why it stays
-  on this page rather than moving beside the per-server schedule it used to be
-  confused with. It is consumed by the daemon-wide refresh interval, by the
+  no timetable in it, which the first name promised and which **Scheduled
+  backups**, now directly above it, actually is. The saving is real and it is
+  not free, which is what the name says: where the filesystem allows a hard
+  link, two backups then share the same bytes on disk, so deleting the older
+  one frees nothing while the newer one still points at it, and a `du` per
+  snapshot directory double-counts it (one `du` over the baseline root reports
+  the truth). It does not apply when the previous snapshot is read from S3,
+  which is what a per-server schedule on an S3-backed server does: linking a
+  file needs both ends on a filesystem, so those runs take the ordinary path
+  and the daemon log says so. The setting is
+  **process-global** (`GET`/`PUT /api/baseline-refresh`) even though it sits
+  beside a per-server schedule; the card says so. It is consumed by the daemon-wide refresh interval, by the
   per-server backup schedules, and by point-in-time restores; the card says
   which of those are live. Saving here overrides the daemon flag without a
   restart, and a **Use the daemon setting** button then clears the override.
   See [dump-and-baseline.md](dump-and-baseline.md#refreshing-on-a-schedule).
-- **S3 archiving per source** — every monitored server with its
-  `Archive to S3` destination (or `drop-only` when none), with a shortcut into
-  that server's edit form. The boot (cli) index always rotates drop-only.
 - **Staged downloads**: the `.sql` backups built from the Backups page that
   are waiting on the daemon's disk for their download: each build's server,
   size and download deadline, the total, and where they live. A build is
@@ -540,7 +560,7 @@ compact baseline summary card and links onward:
   could not be removed stays listed with the reason (a previous build a
   newer one could not clear included) and is retried every minute. Shown
   only on a daemon that can build `.sql` backups.
-- **Download a DuckDB schema** (#1528, formerly *Query in DuckDB*) — a one-click download of `views.sql`: a ready-made
+- **Download a DuckDB schema** (#1528, formerly *Query in DuckDB*; on the SQL page since #1543) — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — an `events` view
   across every archive source registered in `archive_state`, plus one
   `state_<schema>_<table>` view per table in the newest baseline snapshot. It

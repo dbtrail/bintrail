@@ -177,22 +177,81 @@ func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
 	}
 }
 
-// TestStoragePanelStillMountsTheRefreshCard: the card can be unmounted, or its
+// TestBackupsPageStillMountsTheRefreshCard: the card can be unmounted, or its
 // fetch removed, with the whole suite green.
 //
 // The two guards above check what the card renders once it is called. Neither
-// notices if nothing calls it: dropping the append makes the settings panel
-// vanish, and dropping the fetch makes it render its error branch forever. A
-// setting an operator cannot reach is the same as a setting that does not
-// exist.
-func TestStoragePanelStillMountsTheRefreshCard(t *testing.T) {
-	body := jsFunctionBody(t, readAsset(t, "app.js"), "buildStorage")
-	if !strings.Contains(body, "backupRefreshCard(") {
-		t.Error("buildStorage no longer mounts backupRefreshCard, so the reuse setting has no UI at all")
-	}
+// notices if nothing calls it: dropping the append makes the setting vanish,
+// and dropping the fetch makes it render its error branch forever. A setting
+// an operator cannot reach is the same as a setting that does not exist.
+//
+// It moved from Storage to Backups (#1543), beside the schedule it was being
+// confused with, which is the pairing #1528 asked for. The guard follows the
+// card rather than the page, and it checks the page it is ON so the move
+// cannot be half-done: a card mounted on neither page passes a guard that
+// only asks "does some function call it".
+func TestBackupsPageStillMountsTheRefreshCard(t *testing.T) {
 	js := readAsset(t, "app.js")
-	if !strings.Contains(js, `api("/api/baseline-refresh")`) {
-		t.Error("nothing fetches /api/baseline-refresh, so the card can only ever render its error branch")
+	body := jsFunctionBody(t, js, "renderBaselines")
+	if !strings.Contains(body, "backupRefreshCard(") {
+		t.Error("the Backups page no longer mounts backupRefreshCard, so the reuse setting has no UI at all")
+	}
+	// Beside the schedule, not somewhere else on the page: the whole reason
+	// for the move is that the two controls have to be read together.
+	sched, reuse := strings.Index(body, "backupScheduleCard("), strings.Index(body, "backupRefreshCard(")
+	if sched < 0 {
+		t.Fatal("the schedule card is gone from the Backups page; this guard can no longer check the pairing")
+	}
+	if reuse < sched && reuse >= 0 {
+		t.Error("file reuse is mounted above the schedule; #1528 pairs them in that order so the timetable reads first")
+	}
+	if !strings.Contains(body, `api("/api/baseline-refresh")`) {
+		t.Error("the Backups page does not fetch /api/baseline-refresh, so the card can only ever render its error branch")
+	}
+}
+
+// The split itself (#1543): Storage held seven cards from five concerns, and
+// the two halves answer different questions. A card that drifts back, or a
+// half that quietly absorbs the other, is the failure this guards.
+func TestStorageSplit_eachHalfHoldsOnlyItsOwnConcern(t *testing.T) {
+	js := readAsset(t, "app.js")
+	if strings.Contains(js, "function buildStorage(") {
+		t.Fatal("buildStorage is back; Storage was split into Retention and This daemon (#1543)")
+	}
+	for _, tc := range []struct {
+		fn    string
+		want  []string
+		never []string
+	}{
+		// What happens to your data over time. Nothing about this process.
+		{"buildRetention", []string{"rotationCard(", "archivingPanel("},
+			[]string{"credentialsCard(", "stagingCard(", "telemetryCard(", "backupRefreshCard(", "duckdbCard("}},
+		// What this process is reaching, holding and sending. Nothing about
+		// the data lifecycle.
+		{"buildDaemon", []string{"credentialsCard(", "stagingCard(", "telemetryCard("},
+			[]string{"rotationCard(", "archivingPanel(", "backupRefreshCard(", "duckdbCard("}},
+	} {
+		body := jsFunctionBody(t, js, tc.fn)
+		for _, w := range tc.want {
+			if !strings.Contains(body, w) {
+				t.Errorf("%s does not mount %s, so that card is unreachable", tc.fn, w)
+			}
+		}
+		for _, n := range tc.never {
+			if strings.Contains(body, n) {
+				t.Errorf("%s mounts %s, which belongs to the other half; the page is a drawer again", tc.fn, n)
+			}
+		}
+	}
+	// The old route must keep resolving, or every existing link and bookmark
+	// lands on Overview with no explanation.
+	if !strings.Contains(js, `route === "storage"`) {
+		t.Error("nothing handles the old /storage route, so existing links break")
+	}
+	// And the DuckDB schema download has to be ON the page that queries the
+	// same data, not merely absent from the two halves above.
+	if !strings.Contains(jsFunctionBody(t, js, "renderSQL"), "duckdbCard(") {
+		t.Error("the SQL page does not mount duckdbCard, so it moved off Storage to nowhere")
 	}
 }
 
@@ -220,8 +279,17 @@ func TestBackupRefreshCard_titleSaysWhatItDoes(t *testing.T) {
 				"puts it back beside Scheduled backups, which is the timetable", title, banned)
 		}
 	}
-	if !strings.Contains(strings.ToLower(title), "reuse") {
-		t.Errorf("the card title %q does not name what the control does (reuse a file)", title)
+	// It sits on the Backups page beside the schedule (#1543), so the title
+	// says which of the two it is and what it costs or saves. Disk is the
+	// whole trade: reusing a file means two snapshots share one, so a prune
+	// reports space it will not reclaim while the newer one references it.
+	low := strings.ToLower(title)
+	if !strings.HasPrefix(low, "backups") {
+		t.Errorf("the card title %q does not start with Backups, so on the Backups page it does not say "+
+			"which control it is", title)
+	}
+	if !strings.Contains(low, "disk") {
+		t.Errorf("the card title %q does not name what the control trades (disk space)", title)
 	}
 	if !strings.Contains(js, `"Scheduled backups: none"`) {
 		t.Fatal("the schedule summary is no longer called Scheduled backups; the collision was resolved from " +

@@ -244,7 +244,7 @@ What a stale compose file costs:
 | What your file is missing | What it costs | How it looks |
 |---|---|---|
 | the console state paths on the `bintrail-state` volume | your console username and password, the servers you added, and the AI connection token live inside the container, so the next `up -d` that recreates it deletes them | **Silent.** The console comes back asking you to create a password, exactly like a fresh install, and reports no loss. Fix this one first |
-| the read-only index mount plus `BINTRAIL_INDEX_DATADIR_RO` | free disk space for the index cannot be measured | The preflight and the Storage page report it as not measurable |
+| the read-only index mount plus `BINTRAIL_INDEX_DATADIR_RO` | free disk space for the index cannot be measured | The preflight and the Retention page report it as not measurable |
 | the `iceberg-export` profile and its volume | there is no one-shot Iceberg export to run | `docker compose --profile iceberg-export run ...` says the service does not exist |
 | `BINTRAIL_CONSOLE_SQL_PANEL` (the current file does not set it) | nothing: the SQL page is on by default in the daemon | If you kept `SQL_PANEL=0` in `.env` to hide the page, the current file ignores it. Add `BINTRAIL_CONSOLE_SQL_PANEL: "0"` to the `bintrail` service instead |
 

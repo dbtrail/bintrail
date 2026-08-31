@@ -49,7 +49,12 @@ const EVENT_EXPORT_MAX = 1000;
 const BADGE_CLASS = { UPDATE: "b-update", INSERT: "b-insert", DELETE: "b-delete" };
 function badgeClass(t) { return BADGE_CLASS[t] || "b-baseline"; }
 
-const ROUTES = ["overview", "events", "schema-changes", "timetravel", "recover", "sql", "status", "storage", "connect",
+const ROUTES = ["overview", "events", "schema-changes", "timetravel", "recover", "sql", "status", "storage",
+  // Storage was a drawer: seven cards from five unrelated concerns (#1543).
+  // Split by the question each half answers — what happens to your data over
+  // time, and what this daemon is touching. "storage" stays a KNOWN route so
+  // old bookmarks and Back entries land on Retention instead of Overview.
+  "retention", "daemon", "connect",
   // Access profiles (#1445): author the flags/profiles/rules a data profile
   // enforces. Not monitor-gated: the standalone serve can author too, the
   // write goes to the selected server's index, not to daemon state.
@@ -867,8 +872,12 @@ function navigate(route, params, push = true) {
   // Time-travel merged into Restore (#1298). The route stays known so old
   // bookmarks and Back entries land somewhere useful instead of on Overview.
   if (route === "timetravel") route = "recover";
-  // Storage is a watch-daemon surface (rotation + archiving live there).
-  if (route === "storage" && !capsCache.monitor) route = "overview";
+  // Storage split into Retention and This daemon (#1543). The old route is
+  // rewritten rather than merely aliased, so the address bar stops naming a
+  // page that no longer exists.
+  if (route === "storage") { route = "retention"; history.replaceState({}, "", "/retention"); }
+  // Both halves are watch-daemon surfaces (rotation, archiving, staging).
+  if ((route === "retention" || route === "daemon") && !capsCache.monitor) route = "overview";
   // Protect shares that gate: both routes read watch-daemon state (the
   // snapshot listing and the verification runner). Same treatment, so a
   // bookmark to either lands on Overview rather than an empty page.
@@ -921,7 +930,8 @@ function renderRoute() {
     case "recover": return renderRecover(params);
     case "sql": return renderSQL();
     case "status": return renderStatus();
-    case "storage": return renderStorage();
+    case "retention": return renderRetention();
+    case "daemon": return renderDaemon();
     case "baselines": return renderBaselines();
     case "verification": return renderVerification();
     case "connect": return renderConnect();
@@ -3760,7 +3770,7 @@ function updateSideMeta(status) {
 
 // ── Storage (rotation · S3 archiving · credentials · telemetry) ──────────────
 
-async function renderStorage() {
+async function renderRetention() {
   // Gated like Time-travel: a direct URL / Back with the capability off must
   // REWRITE the URL (replaceState) before re-dispatching — see renderTimetravel.
   if (!capsCache.monitor) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
@@ -3770,64 +3780,79 @@ async function renderStorage() {
   // instead of one error wiping the whole page. (A 401 inside api() raises the
   // sign-in gate and bumps serverGen, so the stale-render guard below bails.)
   const asErr = (err) => ({ error: (err && err.message) || String(err) });
-  const [serversRes, rotation, backupRefresh, storage, baselines, telemetry] = await Promise.all([
+  const [serversRes, rotation] = await Promise.all([
     api("/api/servers").catch(asErr),
     api("/api/rotation").catch(asErr),
-    api("/api/baseline-refresh").catch(asErr),
-    api("/api/storage").catch(asErr),
-    api("/api/baselines").catch(asErr),
-    api("/api/telemetry").catch(asErr),
   ]);
   if (gen !== serverGen || vgen !== viewGen) return;
   // Same guard as renderOverview: a throw inside the build must show an
   // error, never leave the "Loading…" skeleton up forever.
   try {
-    buildStorage(serversRes, rotation, backupRefresh, storage, baselines, telemetry);
+    buildRetention(serversRes, rotation);
   } catch (err) {
-    const v = VIEW(); clear(v); v.append(pageHead("Storage", null)); renderError(v, err);
+    const v = VIEW(); clear(v); v.append(pageHead("Retention", null)); renderError(v, err);
   }
 }
 
-function buildStorage(serversRes, rotation, backupRefresh, storage, baselines, telemetry) {
+// Retention answers one question: what happens to your data as it ages. The
+// rotation policy decides when index partitions are archived and dropped, and
+// the archiving panel says where each source's archives go. Nothing else on
+// the old Storage page answered that (#1543).
+function buildRetention(serversRes, rotation) {
   // serversRes is the raw /api/servers payload or {error} — archivingPanel
   // must be able to tell "failed to load" from "genuinely no sources", or a
   // transient 500 would render the affirmative "No monitored sources yet" lie.
   const servers = (serversRes && serversRes.servers) || [];
   const serversErr = serversRes && serversRes.error;
   const v = VIEW(); clear(v);
-  const sub = el("p", { class: "page-sub" },
-    "Where old data goes, how long it's kept, and the snapshots Time-travel uses. ",
-    el("b", { text: "No credentials are stored here." }));
-  v.append(pageHead("Storage", sub));
+  v.append(pageHead("Retention", el("p", { class: "page-sub" },
+    "How long indexed data is kept, and where it goes when it ages out.")));
 
   const cards = el("div", { class: "cards" });
-  const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
-  // Order (#1528): what this daemon does with your data first (rotation,
-  // file reuse), then where it reaches and what it is holding (credentials,
-  // staged downloads), then the pointer onward, then the two cards that are
-  // about neither storage nor this page. This page is still a drawer; the
-  // split is proposed in the issue, and the order is what is safe to change
-  // without moving a route. The tint rotation is positional, so the first two
-  // cards must stay two DIFFERENT unconditional cards.
   cards.append(rotationCard(rotation));
-  cards.append(backupRefreshCard(backupRefresh));
-  cards.append(credentialsCard(storage));
-  const staging = stagingCard(storage, servers);
-  if (staging) cards.append(staging);
-  cards.append(baselineSummaryCard(baselines, cur, { linkOnward: true }));
-  if (capsCache.views) cards.append(duckdbCard());
-  cards.append(telemetryCard(telemetry));
   v.append(cards);
 
-  // Storage keeps storage POLICY. Baselines and verification moved to their
-  // own routes (#1384): the snapshot list is unbounded, so it used to push
-  // verification off the fold inside a grid built for two panels (the
-  // verification builder is verifyRegions since #1419). baselineSummaryCard
-  // stays as the pointer — the count and age belong on a storage overview,
-  // the full list does not.
   const grid = el("div", { class: "ov-grid", style: "margin-top:18px" });
   grid.append(archivingPanel(servers, serversErr));
   v.append(grid);
+  viewEnter();
+}
+
+async function renderDaemon() {
+  if (!capsCache.monitor) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
+  const gen = serverGen, vgen = viewGen;
+  viewLoading();
+  const asErr = (err) => ({ error: (err && err.message) || String(err) });
+  const [serversRes, storage, telemetry] = await Promise.all([
+    api("/api/servers").catch(asErr),
+    api("/api/storage").catch(asErr),
+    api("/api/telemetry").catch(asErr),
+  ]);
+  if (gen !== serverGen || vgen !== viewGen) return;
+  try {
+    buildDaemon(serversRes, storage, telemetry);
+  } catch (err) {
+    const v = VIEW(); clear(v); v.append(pageHead("This daemon", null)); renderError(v, err);
+  }
+}
+
+// This daemon answers the other question the old Storage page mixed in: what
+// is THIS process reaching, holding and sending. All three are properties of
+// the machine, not of your data, which is why they read as noise beside a
+// retention policy and as a coherent page here (#1543).
+function buildDaemon(serversRes, storage, telemetry) {
+  const servers = (serversRes && serversRes.servers) || [];
+  const v = VIEW(); clear(v);
+  v.append(pageHead("This daemon", el("p", { class: "page-sub" },
+    "What this daemon can reach, what it is holding on disk, and what it sends. ",
+    el("b", { text: "No credentials are stored here." }))));
+
+  const cards = el("div", { class: "cards" });
+  cards.append(credentialsCard(storage));
+  const staging = stagingCard(storage, servers);
+  if (staging) cards.append(staging);
+  cards.append(telemetryCard(telemetry));
+  v.append(cards);
   viewEnter();
 }
 
@@ -3845,9 +3870,13 @@ async function renderBaselines() {
   // Independent degradation, as on Storage: a panel renders its own failure
   // note rather than one error blanking the page.
   const asErr = (err) => ({ error: (err && err.message) || String(err) });
-  const [serversRes, baselines] = await Promise.all([
+  const [serversRes, baselines, backupRefresh] = await Promise.all([
     api("/api/servers").catch(asErr),
     api("/api/baselines").catch(asErr),
+    // File reuse moved here from Storage (#1528/#1543): it decides how a
+    // backup is PRODUCED, so it belongs beside the schedule it was being
+    // confused with, not on a page about where old data goes.
+    api("/api/baseline-refresh").catch(asErr),
   ]);
   if (gen !== serverGen || vgen !== viewGen) return;
   // Run states for the selected server: only the endpoints this daemon
@@ -3883,6 +3912,12 @@ async function renderBaselines() {
     // anything.
     const scheduleCard = backupScheduleCard(cur, baselines);
     if (scheduleCard) v.append(scheduleCard);
+    // Directly under the schedule, because the two were the pair #1528 named:
+    // "Automatic backup refresh" and "Scheduled backups" both promised
+    // "backups, automatically" from different pages, for unrelated settings.
+    // Side by side, under names that say what each does, the difference needs
+    // no paragraph.
+    v.append(el("div", { class: "cards" }, backupRefreshCard(backupRefresh)));
     // A visible in-progress region (mirrors the verification page): while a
     // backup is being created or restored, the page must look like a page
     // doing work, not a stale list.
@@ -3979,7 +4014,7 @@ function rotationCard(rot) {
 // disk, where the filesystem allows it) is a thing a reader wants while
 // reading docs, not while flipping the switch: docs/console.md carries it.
 function backupRefreshCard(br) {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "File reuse for unchanged tables" }));
+  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Backups & disk space" }));
   if (!br || br.error) {
     card.append(el("p", { class: "form-hint", text: "Could not load the reuse setting" + (br && br.error ? ": " + br.error : ".") }));
     return card;
@@ -4228,6 +4263,10 @@ async function renderSQL() {
 
   const results = el("div", { id: "sql-results" });
   v.append(results);
+  // Moved from Storage (#1543): it generates the view definitions for the
+  // SAME data this page queries, for a client that is not this page. It read
+  // as a storage setting only because Storage was where unplaced cards went.
+  if (capsCache.views) v.append(el("div", { class: "cards", style: "margin-top:18px" }, duckdbCard()));
   viewEnter();
 
   const run = () => runSQL(input.value, { runBtn, cancelBtn, statusLine, results });
@@ -4376,41 +4415,7 @@ async function setTelemetry(enabled) {
     return;
   }
   toast(enabled ? "Telemetry turned on." : "Telemetry turned off. This daemon stops sending now.");
-  renderStorage();
-}
-
-// On Storage this card is the POINTER to Protect > Baselines, so it carries a
-// link there — docs/console.md says it "links onward" and, before this, it did
-// not. On the Baselines page itself the link would point at the current page,
-// so the caller omits it.
-function baselineSummaryCard(b, cur, opts) {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Backups" }));
-  // Appended at every exit, so the link is the card's FOOT rather than sitting
-  // above an error message. Every branch returns through here.
-  const done = () => {
-    if (opts && opts.linkOnward) {
-      card.append(el("div", { class: "stg-cardfoot" },
-        el("button", { class: "btn btn-sm", type: "button", text: "All snapshots \u2192",
-          onclick: () => navigate("baselines") })));
-    }
-    return card;
-  };
-  if (!b || b.error) {
-    card.append(el("p", { class: "form-hint", text: "Could not list backups: " + ((b && b.error) || "unavailable") }));
-    return done();
-  }
-  if (!b.configured) {
-    kvRow(card, "source", "not configured");
-    kvRow(card, "time-travel", "off");
-    return done();
-  }
-  const snaps = b.snapshots || [];
-  kvRow(card, "source", b.source);
-  kvRow(card, "snapshots", String(snaps.length) + (b.truncated ? "+" : ""));
-  kvRow(card, "latest (UTC)", snaps.length ? snaps[0].time : "none yet");
-  if (snaps.length) kvRow(card, "age", formatAge(snaps[0].age_hours));
-  kvRow(card, "time-travel", b.reconstruct ? "enabled" : "off (archives disabled)");
-  return done();
+  renderDaemon();
 }
 
 // baselineConfigHint: the boot (cli) entry is not editable from the UI — its
@@ -7818,7 +7823,8 @@ function cmdkCommands() {
   if (capsCache.sql) cmds.push({ group: "Navigate", label: "SQL", run: () => navigate("sql") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Backups", run: () => navigate("baselines") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Verification", run: () => navigate("verification") });
-  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Storage", run: () => navigate("storage") });
+  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Retention", run: () => navigate("retention") });
+  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "This daemon", run: () => navigate("daemon") });
   cmds.push({ group: "Navigate", label: "Access profiles", run: () => navigate("access-profiles") });
   cmds.push({ group: "Navigate", label: "Connect AI", run: () => navigate("connect") });
   cmds.push({ group: "Actions", label: "Manage servers", run: () => { closeCmdk(); openServersModal(); } });

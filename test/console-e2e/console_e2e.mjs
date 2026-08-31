@@ -2781,15 +2781,35 @@ try {
     ? ok("verification: LAST VERIFIED wears the age treatment, distinct from RUNNING")
     : bad("verification: LAST VERIFIED wears the age treatment, distinct from RUNNING", JSON.stringify(vfyHist));
 
+  // Storage became Retention (#1543). Navigating to the OLD route is the
+  // check: it must land on the new page with the URL rewritten, or every
+  // existing link and bookmark drops the operator on Overview.
   await page.evaluate(() => navigate("storage"));
-  await page.waitForFunction(() => location.pathname === "/storage"
+  await page.waitForFunction(() => location.pathname === "/retention"
     && Array.from(document.querySelectorAll(".ov-panel-title")).some((h) => /S3 archiving/.test(h.textContent)),
     { timeout: 10000 });
   const storageTitles = await page.evaluate(() =>
     Array.from(document.querySelectorAll(".ov-panel-title")).map((h) => h.textContent));
   (!storageTitles.some((t) => /Baseline snapshots|Backups|Verification/.test(t)))
-    ? ok("protect: Storage no longer carries the moved panels")
-    : bad("protect: Storage no longer carries the moved panels", JSON.stringify(storageTitles));
+    ? ok("protect: the old /storage link lands on Retention, without the moved panels")
+    : bad("protect: the old /storage link lands on Retention, without the moved panels", JSON.stringify(storageTitles));
+
+  // The split itself: each half holds only its own concern, photographed
+  // rather than grepped. Retention must NOT carry the daemon's cards.
+  const halves = await page.evaluate(async () => {
+    const titles = () => Array.from(document.querySelectorAll(".card-title")).map((h) => h.textContent);
+    const retention = titles();
+    navigate("daemon");
+    await new Promise((r) => setTimeout(r, 1200));
+    return { retention: retention, daemon: titles(), path: location.pathname };
+  });
+  (halves.path === "/daemon"
+    && !halves.retention.some((t) => /AWS credentials|Usage telemetry|File reuse/.test(t))
+    && halves.daemon.some((t) => /AWS credentials/.test(t))
+    && halves.daemon.some((t) => /Usage telemetry/.test(t))
+    && !halves.daemon.some((t) => /Rotation/.test(t)))
+    ? ok("storage split: Retention holds the data lifecycle, This daemon holds the process")
+    : bad("storage split: Retention holds the data lifecycle, This daemon holds the process", JSON.stringify(halves));
 
   // Scenario 15e — motion that cannot be seen from Go (#1385).
   //
@@ -3798,8 +3818,10 @@ try {
   // The card tint rotation, on the page from the user's own screenshot. Two
   // distinct tinted grounds prove rotation; "not white" alone would pass a
   // single flat tint.
-  await page.evaluate(() => navigate("storage"));
-  await page.waitForFunction(() => location.pathname === "/storage" && document.querySelectorAll(".cards .card").length >= 2, { timeout: 10000 });
+  // On This daemon, which is the half that still carries two or more
+  // unconditional cards after the split (#1543); Retention has one.
+  await page.evaluate(() => navigate("daemon"));
+  await page.waitForFunction(() => location.pathname === "/daemon" && document.querySelectorAll(".cards .card").length >= 2, { timeout: 10000 });
   const tints = await page.evaluate(() => {
     const cards = Array.from(document.querySelectorAll(".cards .card")).slice(0, 2);
     return cards.map((c) => getComputedStyle(c).backgroundColor);
@@ -3809,7 +3831,7 @@ try {
     : bad("tropical: config cards rotate through the home's tint palette", JSON.stringify(tints));
 
   // ── Scenario 17h — the telemetry card shows the exact sample event (#1447) ──
-  // Still on /storage. The "Show a sample event" fold must be closed by
+  // Still on /daemon. The "Show a sample event" fold must be closed by
   // default, open on click, and carry the daemon's `sample_event` string
   // VERBATIM in a read-only <pre>: the daemon renders it through the same
   // function `bintrail telemetry show` prints through, and a JSON.stringify
