@@ -1187,3 +1187,53 @@ func TestBackupScheduler_aRefusedFoldStillFallsBack(t *testing.T) {
 		t.Fatalf("a fold that published nothing took no fallback: %+v", st)
 	}
 }
+
+// The passthrough that joins the two halves: the producer DECISION resolves
+// the fold source in internal/console, and the fold reads it from the request
+// the schedule builds here. Deleting `BaselineS3: e.BaselineS3` in startRebuild
+// passed the entire suite, and the result is not a small regression: the
+// decision still says "update, the previous backup is in the bucket" while the
+// fold looks in the empty local directory, refuses, and the watcher answers
+// that with a full lock-and-read of production. Every slot, silently.
+func TestStartRebuild_carriesTheDestinationIntoTheFold(t *testing.T) {
+	realList := newestSnapshotTables
+	t.Cleanup(func() { newestSnapshotTables = realList })
+	newestSnapshotTables = func(ctx context.Context, src string) ([]string, error) {
+		if !strings.HasPrefix(src, "s3://") {
+			return realList(ctx, src)
+		}
+		return []string{"shop.orders"}, nil
+	}
+	got := make(chan string, 1)
+	holdFold(t, func(_ context.Context, cfg reconstruct.FullTableConfig) ([]*reconstruct.TableReport, []reconstruct.TableFailure, error) {
+		select {
+		case got <- cfg.BaselineSrc:
+		default:
+		}
+		return nil, nil, errors.New("stop here; the source is what this pins")
+	})
+
+	b, reg, _ := newScheduleFixture(t, true)
+	e := addScheduled(t, reg, true)
+	e.BaselineS3 = "s3://bucket/backups/"
+	if err := reg.Update(e); err != nil {
+		t.Fatal(err)
+	}
+	p, err := e.BackupSchedule.Parse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.startRebuild(e, p, "2026-08-28T09:00:00Z"); err != nil {
+		t.Fatalf("startRebuild: %v", err)
+	}
+	waitTerminalMethod(t, b, e.ID, console.BackupMethodRefresh)
+
+	select {
+	case src := <-got:
+		if src != "s3://bucket/backups/" {
+			t.Fatalf("the fold read %q, want the bucket: the destination never reached it", src)
+		}
+	default:
+		t.Fatal("the fold never ran, so nothing pins where it would have read")
+	}
+}

@@ -4488,10 +4488,19 @@ function baselineRefreshNote(rf) {
         (reused ? ", " + reused + " unchanged and reused" : "") + ".";
       break;
     case "failed":
-      text = "Automatic refresh published nothing" + (when ? " at " + when : "") +
-        (rf.refused ? "; " + rf.refused + " table(s) refused" : "") +
-        (rf.last_error ? ": " + backupFoldError(rf.last_error) : "") +
-        " Nothing was overwritten; the next run retries.";
+      // published means the fold finished and marked the snapshot, and only
+      // sending it to the backup destination failed. Saying "published
+      // nothing" there is false, and so is "the next run retries": the next
+      // run folds a NEW snapshot rather than re-sending this one.
+      text = rf.published
+        ? "Automatic refresh" + (when ? " at " + when : "") +
+          " wrote the backup on this machine but could not send it to the backup destination" +
+          (rf.last_error ? ": " + backupFoldError(rf.last_error) : ".") +
+          " The backup is on disk and can be restored from. The next run folds a new one."
+        : "Automatic refresh published nothing" + (when ? " at " + when : "") +
+          (rf.refused ? "; " + rf.refused + " table(s) refused" : "") +
+          (rf.last_error ? ": " + backupFoldError(rf.last_error) : "") +
+          " Nothing was overwritten; the next run retries.";
       break;
     default:
       return el("p", { class: "form-hint", text: "Automatic refresh is enabled; it has not run yet." });
@@ -5197,9 +5206,16 @@ function backupScheduleCard(cur, b) {
           (run.uploaded ? ", " + run.uploaded + " file(s) uploaded" : "") + "." }));
       } else {
         alarm = true;
-        body.append(el("p", { class: "form-msg err", text:
-          "Last scheduled backup failed " + when + " (" + what + "): " + backupFoldError(run.error || "unknown error") +
-          " Nothing was overwritten; the next scheduled run tries again." }));
+        // A failed run that still names a snapshot is the one shape where the
+        // backup exists: the fold finished and only the upload failed. Telling
+        // that operator nothing was written would send them looking for a
+        // backup they already have.
+        body.append(el("p", { class: "form-msg err", text: run.snapshot_time
+          ? "Last scheduled backup " + when + " (" + what + ") wrote the backup on this machine but could not " +
+            "send it to the backup destination: " + backupFoldError(run.error || "unknown error") +
+            " The backup is on disk and can be restored from. The next scheduled run folds a new one."
+          : "Last scheduled backup failed " + when + " (" + what + "): " + backupFoldError(run.error || "unknown error") +
+            " Nothing was overwritten; the next scheduled run tries again." }));
       }
     }
     if (fb) {

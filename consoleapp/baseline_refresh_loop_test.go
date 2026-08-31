@@ -833,3 +833,36 @@ func TestRefreshFoldConfig_restoreSharesTheBounds(t *testing.T) {
 			cfg.WarnEventThreshold, daemonFoldWarnEventThreshold)
 	}
 }
+
+// The single load-bearing line of #1539: the fold READS where the previous
+// snapshot is and WRITES where this server keeps its local copy, and on an
+// S3-backed server those are different places.
+//
+// It gets its own assertion because nothing else can reach it. The end-to-end
+// tests stub the fold, and the stub reads only OutputDir and At, so pointing
+// BaselineSrc back at the local directory passed the entire suite while the
+// fold would have looked in the empty directory on exactly the shape this
+// exists for.
+func TestRefreshFoldConfig_readsTheBucketAndWritesTheLocalDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		req     refreshRequest
+		wantSrc string
+	}{
+		{"no destination: both are the local directory",
+			refreshRequest{IndexDSN: "dsn", BaselineDir: "/b"}, "/b"},
+		{"backups go to S3: read the bucket, write the local directory",
+			refreshRequest{IndexDSN: "dsn", BaselineDir: "/b", BaselineS3: "s3://bucket/backups/"}, "s3://bucket/backups/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := refreshFoldConfig(tc.req, time.Now(), []string{"shop.orders"})
+			if cfg.BaselineSrc != tc.wantSrc {
+				t.Errorf("BaselineSrc = %q, want %q", cfg.BaselineSrc, tc.wantSrc)
+			}
+			if cfg.OutputDir != tc.req.BaselineDir {
+				t.Errorf("OutputDir = %q, want the local directory %q: the fold writes Parquet to a filesystem",
+					cfg.OutputDir, tc.req.BaselineDir)
+			}
+		})
+	}
+}

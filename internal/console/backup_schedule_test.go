@@ -307,8 +307,8 @@ func TestChooseBackupMethod(t *testing.T) {
 		// these servers were guaranteed a full backup without touching the
 		// network, and a throttled listing that skipped the night would be a
 		// worse trade than an expensive backup.
-		{"S3 listing fails, a full backup is possible: full, with the real cause", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty, BaselineS3: "s3://b/"}, live, BackupMethodFull, "could not be read from s3://b/", "", nil, errors.New("throttled"), "s3://b/"},
-		{"S3 listing fails and no full backup is possible: both halves named", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty, BaselineS3: "s3://b/"}, off, BackupMethodFull, "", "a full backup cannot start", nil, errors.New("throttled"), "s3://b/"},
+		{"S3 listing fails, a full backup is possible: full, with the real cause", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty, BaselineS3: "s3://b/"}, live, BackupMethodFull, "could not be read from the backup destination", "", nil, errors.New("throttled"), "s3://b/"},
+		{"S3 listing fails and no full backup is possible: the slot is refused", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty, BaselineS3: "s3://b/"}, off, BackupMethodFull, "", "could not be read", nil, errors.New("throttled"), "s3://b/"},
 		{"S3 and a local dir, creation off, empty bucket: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: empty, BaselineS3: "s3://b/"}, off, BackupMethodFull, "", "no previous backup to update under s3://b/", nil, nil, "s3://b/"},
 		{"no destination at all: nothing can run", ServerEntry{DSN: "idx", SourceDSN: "src"}, live, BackupMethodFull, "", "no baseline location", nil, nil, ""},
 		{"lock mode misconfigured with a backup on disk: rebuild", ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: withSnap}, BackupScheduleGates{LoopRunning: true, FullBackups: true, FullBackupsErr: "bad lock"}, BackupMethodRefresh, "no load", "", nil, nil, ""},
@@ -358,10 +358,12 @@ func TestChooseBackupMethod(t *testing.T) {
 // calling it absent would turn the no-load rebuild into a nightly full read
 // of production while the page named a false reason.
 //
-// It must not cost the slot either (#1539). Since the probe reaches the
-// NETWORK on an S3-backed server, refusing the slot on a listing failure would
-// mean a throttled bucket cancels the night's backup on a server that could
-// have taken one. So the verdict is: a full backup, with the real cause named.
+// A LOCAL one still refuses, and the scope matters: an unreadable directory is
+// persistent, and the full backup that would stand in writes into that same
+// directory, so degrading would trade a precise alarm for an expensive dump
+// that fails on the way out. Only a REMOTE source degrades (#1539), because a
+// bucket error is usually transient and those servers were guaranteed a full
+// backup before this change without touching the network.
 func TestChooseBackupMethod_unreadableDirIsNotNoBackup(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0); err != nil {
@@ -371,41 +373,17 @@ func TestChooseBackupMethod_unreadableDirIsNotNoBackup(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("root reads a mode-000 directory")
 	}
-	method, why, err := ChooseBackupMethod(context.Background(), ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: dir},
+	_, why, err := ChooseBackupMethod(context.Background(), ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: dir},
 		BackupScheduleGates{LoopRunning: true, FullBackups: true})
-	if err != nil {
-		t.Fatalf("err = %v, want a runnable full backup so the slot is not lost", err)
+	if err == nil || !strings.Contains(err.Error(), "could not be read") || !strings.Contains(err.Error(), dir) {
+		t.Fatalf("err = %v (why=%q), want the unreadable directory named", err, why)
 	}
-	if method != BackupMethodFull {
-		t.Fatalf("method = %q, want a full backup: the update cannot read what it would fold", method)
-	}
-	if !strings.Contains(why, "could not be read") || !strings.Contains(why, dir) {
-		t.Fatalf("why = %q, want the unreadable directory named", why)
-	}
-	if strings.Contains(why, "no previous backup") {
-		t.Fatalf("why = %q, want the real cause, not the absent-backup one", why)
+	if strings.Contains(err.Error(), "no previous backup") {
+		t.Fatalf("err = %v, want the real cause, not the absent-backup one", err)
 	}
 }
 
-// The same location unreadable AND no full backup possible is the one shape
-// that still costs the slot, and the message has to carry both halves: the
-// operator cannot act on either one alone.
-func TestChooseBackupMethod_unreadableAndNoFullBackupNamesBoth(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "backups")
-	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, _, err := ChooseBackupMethod(context.Background(), ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: file},
-		BackupScheduleGates{LoopRunning: true})
-	if err == nil {
-		t.Fatal("err = nil, want a refusal: neither producer can run")
-	}
-	for _, want := range []string{"could not be read", "a full backup cannot start"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("err = %v, want it to mention %q", err, want)
-		}
-	}
-}
+
 
 // Same verdict for a path that is a FILE (ENOTDIR): this one runs as root
 // too, where a mode-000 directory reads fine and the test above skips.
@@ -414,10 +392,10 @@ func TestChooseBackupMethod_fileAsDirIsNotNoBackup(t *testing.T) {
 	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	method, why, err := ChooseBackupMethod(context.Background(), ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: file},
+	_, _, err := ChooseBackupMethod(context.Background(), ServerEntry{DSN: "idx", SourceDSN: "src", BaselineDir: file},
 		BackupScheduleGates{LoopRunning: true, FullBackups: true})
-	if err != nil || method != BackupMethodFull || !strings.Contains(why, "could not be read") {
-		t.Fatalf("method=%q why=%q err=%v, want a full backup naming the unreadable path", method, why, err)
+	if err == nil || !strings.Contains(err.Error(), "could not be read") {
+		t.Fatalf("err = %v, want the unreadable path named", err)
 	}
 }
 

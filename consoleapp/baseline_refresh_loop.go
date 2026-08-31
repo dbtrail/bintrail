@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -134,8 +135,9 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	// destination. baseline.Upload writes the _INCOMPLETE marker first and
 	// _SUCCESS last, so a crash mid-upload leaves the remote copy excluded from
 	// discovery rather than half-visible.
+	var uploaded int
 	if err == nil && req.BaselineS3 != "" {
-		err = uploadRefreshedSnapshot(s.ctx, req, at)
+		uploaded, err = uploadRefreshedSnapshot(s.ctx, req, at)
 	}
 	// Measured HERE, on the far side of the `go` in TriggerRefresh, because
 	// this is where the fold actually happens. Timing the dispatch loop
@@ -145,6 +147,11 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
 		Kind: console.BaselineRunRefresh, Trigger: req.Trigger, StartedAt: started.Format(time.RFC3339),
 		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused, Carried: carried,
+		// Zero means "nothing was sent" for a server with no destination AND
+		// "these files reached the bucket" otherwise, so the count is what
+		// makes a successful upload visible at all: without it the only
+		// evidence the snapshot got there is the absence of a failure line.
+		Uploaded: uploaded,
 	}, err)
 	if err != nil {
 		// Reported and reclaimed OUTSIDE s.mu. Deleting a directory is
@@ -232,18 +239,20 @@ func foldPublished(err error) bool {
 // SNAPSHOT directory would drop the timestamp level and write one table's
 // Parquet where the snapshot directory belongs, which discovery reads as a
 // snapshot with no tables.
-func uploadRefreshedSnapshot(ctx context.Context, req refreshRequest, at time.Time) error {
+func uploadRefreshedSnapshot(ctx context.Context, req refreshRequest, at time.Time) (int, error) {
 	name := reconstruct.SnapshotDirName(at)
 	dest := strings.TrimSuffix(req.BaselineS3, "/") + "/" + name
-	if _, err := uploadSnapshot(ctx, refreshSnapshotDir(req, at), dest, "", false); err != nil {
+	n, err := uploadSnapshot(ctx, refreshSnapshotDir(req, at), dest, "", false)
+	if err != nil {
 		// Names the local path on purpose: the snapshot itself is intact and
 		// complete, and an operator reading this needs to know the run's work
 		// still exists rather than that a backup was lost.
-		return fmt.Errorf("%w: it was written to %s but could not be uploaded to %s, and nothing re-sends it "+
-			"automatically (the next run folds a new snapshot): %w",
+		return 0, fmt.Errorf("%w: it was written to %s but could not be uploaded to %s. The next update folds a NEW "+
+			"snapshot rather than re-sending this one; a full backup uploads the whole directory, so one of those "+
+			"sweeps it up: %w",
 			errSnapshotNotUploaded, refreshSnapshotDir(req, at), dest, err)
 	}
-	return nil
+	return n, nil
 }
 
 // refreshSnapshotDir names the directory one refresh cycle folds into: the
@@ -477,6 +486,16 @@ func keepPartialSnapshotBecause(refused int, unclaimed string, holdsData, publis
 // caller must keep for a different reason and under a different key.
 func snapshotPublished(dir string) bool {
 	_, err := os.Stat(filepath.Join(dir, baseline.SuccessMarker))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		// Not "not published": an unreadable marker is a real IO answer, and
+		// answering false would send a finished snapshot down the heuristic
+		// below, which reports it as possibly-partial under the key a cleanup
+		// script deletes. Same treatment as snapshotDirsWithSuccess, which
+		// refuses the same swallow for the same reason.
+		slog.Warn("baseline refresh: could not read the completeness marker, so the snapshot is kept rather than "+
+			"judged", "dir", dir, "error", err)
+		return true
+	}
 	return err == nil
 }
 

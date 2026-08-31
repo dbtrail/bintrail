@@ -380,19 +380,26 @@ func ChooseBackupMethod(ctx context.Context, e ServerEntry, gates BackupSchedule
 	if listErr != nil {
 		// Never "no backup yet" — that reason would be false, and it would
 		// quietly turn a no-load update into a nightly full read of production
-		// with the page naming a cause that did not happen. But it must not
-		// cost the slot either: this probe now reaches the NETWORK on an
-		// S3-backed server (a DuckDB httpfs listing), and before #1539 those
-		// servers were guaranteed a full backup every slot without touching
-		// it. Losing the night's backup to a throttled ListObjectsV2 would be
-		// a worse trade than an expensive backup, so the producer that does
-		// not need the previous snapshot takes over, saying exactly why.
-		if fullErr != nil {
-			return BackupMethodFull, "", fmt.Errorf("the backup location %s could not be read (%v), and a full backup cannot start: %w",
-				source, listErr, fullErr)
+		// with the page naming a cause that did not happen.
+		//
+		// A REMOTE source must not cost the slot either: this probe reaches the
+		// network on an S3-backed server (a DuckDB httpfs listing), and before
+		// #1539 those servers were guaranteed a full backup every slot without
+		// touching it. Losing the night's backup to a throttled ListObjectsV2
+		// would be a worse trade than an expensive backup, so the producer that
+		// does not need the previous snapshot takes over, saying exactly why.
+		//
+		// A LOCAL one still refuses, and the scope is the whole point: an
+		// unreadable directory is a permission or IO fault that a full backup
+		// writing into that same directory would hit too, and it is persistent
+		// where a bucket error is usually not. Degrading there would trade a
+		// precise red alarm for a full read of production that then fails on
+		// the way out, reporting something else.
+		if fullErr != nil || !strings.HasPrefix(source, "s3://") {
+			return BackupMethodFull, "", fmt.Errorf("the backup location %s could not be read: %w", source, listErr)
 		}
-		return BackupMethodFull, "the previous backup could not be read from " + source + " (" + listErr.Error() +
-			"), so a full backup is taken instead", nil
+		return BackupMethodFull, "the previous backup could not be read from the backup destination (" +
+			listErr.Error() + "), so a full backup is taken instead", nil
 	}
 	if len(tables) == 0 {
 		if fullErr != nil {

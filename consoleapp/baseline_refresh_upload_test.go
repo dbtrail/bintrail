@@ -186,3 +186,70 @@ func TestPublishedSnapshotTime_namesTheSnapshotAnUploadFailureLeftBehind(t *test
 		})
 	}
 }
+
+// A successful upload has to leave positive evidence. Without the count the
+// only sign the snapshot reached the destination is the absence of a failure
+// line, and the page's "N file(s) uploaded" clause never fires for this
+// producer.
+func TestRunRefresh_recordsHowManyFilesReachedTheDestination(t *testing.T) {
+	realList, realUpload := newestSnapshotTables, uploadSnapshot
+	t.Cleanup(func() { newestSnapshotTables, uploadSnapshot = realList, realUpload })
+	newestSnapshotTables = func(ctx context.Context, src string) ([]string, error) {
+		if !strings.HasPrefix(src, "s3://") {
+			return realList(ctx, src)
+		}
+		return []string{"shop.orders"}, nil
+	}
+	uploadSnapshot = func(context.Context, string, string, string, bool) (int, error) { return 7, nil }
+	injectFold(t, 0, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sup := newBaselineSupervisor(ctx, t.TempDir(), baseline.DefaultLockMode)
+	hist, err := console.OpenBaselineHistory(filepath.Join(t.TempDir(), "h.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sup.history = hist
+	sup.refreshes["s"] = &console.BaselineStatus{State: "running"}
+	sup.runRefresh(refreshRequest{ServerID: "s", ServerName: "s", IndexDSN: "d",
+		BaselineDir: t.TempDir(), BaselineS3: "s3://bucket/backups/"}, refreshAt, time.Minute)
+
+	runs := hist.List("s")
+	if len(runs) != 1 {
+		t.Fatalf("runs = %d, want the refresh recorded", len(runs))
+	}
+	if runs[0].Uploaded != 7 {
+		t.Fatalf("Uploaded = %d, want 7: a successful upload must be visible", runs[0].Uploaded)
+	}
+}
+
+// The upload gate is `err == nil && req.BaselineS3 != ""`, and the `err == nil`
+// half is the only thing standing between a refused fold and a false success.
+//
+// The assignment OVERWRITES the fold's error, so without it a refusal whose
+// upload happened to succeed reports state "succeeded", Published true, an
+// empty error and a history row naming a snapshot that was never marked. Every
+// surface would show a good backup over a refused one.
+func TestRunRefresh_arefusedFoldUploadsNothingAndStaysRefused(t *testing.T) {
+	uploads, _ := stubS3Fold(t, []string{"shop.orders"}, nil)
+	injectFold(t, 1, errors.New("capture gap in the reconstruction window"))
+
+	out, st := runRefreshFor(t, refreshRequest{
+		ServerID: "s", ServerName: "s", IndexDSN: "d",
+		BaselineDir: t.TempDir(), BaselineS3: "s3://bucket/backups/",
+	})
+
+	if len(*uploads) != 0 {
+		t.Fatalf("a refused fold uploaded %+v; an incomplete snapshot must never reach the destination", *uploads)
+	}
+	if st.State != "failed" || st.Published {
+		t.Fatalf("status = %+v, want a failed run that published nothing", st)
+	}
+	if st.LastError == "" || !strings.Contains(st.LastError, "capture gap") {
+		t.Fatalf("last error = %q, want the fold's own refusal, not an upload verdict over it", st.LastError)
+	}
+	if !strings.Contains(out, "published nothing") {
+		t.Fatalf("the refusal was not reported as publishing nothing: %s", out)
+	}
+}

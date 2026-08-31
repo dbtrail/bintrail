@@ -186,10 +186,15 @@ func scheduleRunFromStatus(st BackupScheduleState) *backupScheduleRunDTO {
 	cur := st.Last
 	ok := cur.State == "succeeded"
 	var snapshot string
-	if ok {
+	if ok || cur.Published {
 		// At is stamped when a rebuild STARTS and survives a failure, so it
-		// names a snapshot only once the run published one. The history
-		// path applies the same rule (publishedSnapshotTime).
+		// names a snapshot only once the run published one. `ok ||
+		// cur.Published`, not ok alone: an update whose fold finished and
+		// whose upload failed DID publish one locally (#1539), and the
+		// history path names it too (publishedSnapshotTime), so reading
+		// State alone gave the same run two answers depending on whether the
+		// history file opened. Published cannot replace ok either — the dump
+		// path does not set it.
 		snapshot = cur.At
 	}
 	return &backupScheduleRunDTO{

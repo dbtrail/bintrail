@@ -1317,6 +1317,22 @@ func runBaselinePruneCycle(ctx context.Context, targets []baselinePruneTarget, r
 			slog.Info("baseline prune cycle complete",
 				"dir", t.dir, "pruned", len(res.Pruned), "reclaimed_bytes", res.ReclaimedBytes)
 		}
+		// Reported even when nothing was pruned, and that is the point: a
+		// snapshot old enough to reclaim whose copy is NOT in the bucket stays
+		// on this disk forever, and since #1539 a scheduled update whose upload
+		// failed produces exactly that. Logging only successful prunes made the
+		// accumulation invisible after the one line at the moment of failure,
+		// while the page suppresses its disk warning for any server that HAS a
+		// destination.
+		if res.KeptNotDurable > 0 {
+			slog.Warn("baseline prune: snapshots are old enough to reclaim but have no confirmed copy at the backup "+
+				"destination, so they stay on this disk. Send them, or remove them by hand.",
+				"dir", t.dir, "kept", res.KeptNotDurable, "destination", t.s3)
+		}
+		if res.ProbeErrors > 0 {
+			slog.Warn("baseline prune: could not check whether some snapshots are at the backup destination, so they "+
+				"were kept", "dir", t.dir, "unchecked", res.ProbeErrors)
+		}
 	}
 }
 

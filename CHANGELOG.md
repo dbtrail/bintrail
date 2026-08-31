@@ -38,7 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that publishes nothing new. And a previous backup that cannot be READ (a
   throttled bucket, an expired credential) no longer costs the slot: it takes a
   full backup, naming the real cause, because before this change those servers
-  were guaranteed one without touching the network.
+  were guaranteed one without touching the network. That degrade is scoped to a
+  REMOTE source: an unreadable local directory still refuses the slot, because
+  it is persistent and the full backup that would stand in writes into that
+  same directory. Both the console and the run history now say when a scheduled
+  update wrote its backup but could not send it, rather than reporting that
+  nothing was published, a successful upload records how many files it sent,
+  and the prune pass reports the snapshots it could not reclaim instead of only
+  the ones it did.
   Two consequences worth knowing. Retention improves: `PruneLocal` reclaims a
   local snapshot once it can confirm its `_SUCCESS` in S3, so the snapshots a
   scheduled update publishes on an S3-backed server are now prunable, where

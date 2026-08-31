@@ -391,10 +391,22 @@ func (b *backupScheduler) fire(e console.ServerEntry, p console.ParsedBackupSche
 		b.skip(e, now, console.RefusalReason(err))
 		return
 	}
-	method, _, err := console.ChooseBackupMethod(b.sup.ctx, e, gates)
+	method, why, err := console.ChooseBackupMethod(b.sup.ctx, e, gates)
 	if err != nil {
 		b.skip(e, now, err.Error())
 		return
+	}
+	// A full backup chosen because the previous one could not be READ is not
+	// the plan the operator set, and it is the expensive producer. Carried into
+	// the run record so the history says why, and logged because the page's own
+	// reason is recomputed live: by the time anyone looks, a transient bucket
+	// error is gone and the page would show the cheap producer as if that is
+	// what ran.
+	degraded := ""
+	if method == console.BackupMethodFull && strings.Contains(why, "could not be read") {
+		degraded = why
+		slog.Warn("backup schedule: taking a full backup because the previous one could not be read",
+			"server", e.Name, "id", e.ID, "reason", why)
 	}
 	stamp := now.Format(time.RFC3339)
 	if method == console.BackupMethodRefresh {
@@ -410,7 +422,7 @@ func (b *backupScheduler) fire(e console.ServerEntry, p console.ParsedBackupSche
 		}
 		return
 	}
-	if b.startFull(e, stamp, now, "") {
+	if b.startFull(e, stamp, now, degraded) {
 		b.watch(e, stamp, method)
 	}
 }

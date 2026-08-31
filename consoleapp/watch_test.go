@@ -1,8 +1,10 @@
 package consoleapp
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -828,5 +830,35 @@ func TestStartBaselineRefreshLoopCallSitesAgree(t *testing.T) {
 	if got := strings.Count(string(src), want); got != n {
 		t.Errorf("%d of %d call sites pass the daemon flag; the other passes something else, so one watch "+
 			"entry path would silently ignore --baseline-carry-forward-unchanged", got, n)
+	}
+}
+
+// A snapshot old enough to reclaim whose copy is not at the destination stays
+// on this disk forever, and since #1539 a scheduled update whose upload failed
+// produces exactly that. The prune cycle used to log only what it reclaimed,
+// so the accumulation was invisible after the single line at the moment of
+// failure — while the Backups page suppresses its disk warning for any server
+// that HAS a destination.
+func TestRunBaselinePruneCycle_reportsWhatItCouldNotReclaim(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	targets := []baselinePruneTarget{{dir: "/b", s3: "s3://bucket/backups/"}}
+	runBaselinePruneCycle(context.Background(), targets, 7*24*time.Hour,
+		func(context.Context, baseline.PruneOptions) (baseline.PruneResult, error) {
+			return baseline.PruneResult{KeptNotDurable: 3, ProbeErrors: 1}, nil
+		})
+
+	out := buf.String()
+	if !strings.Contains(out, "kept=3") {
+		t.Errorf("the snapshots that could not be reclaimed were not reported: %s", out)
+	}
+	if !strings.Contains(out, "unchecked=1") {
+		t.Errorf("the snapshots whose durability could not be checked were not reported: %s", out)
+	}
+	if !strings.Contains(out, "s3://bucket/backups/") {
+		t.Errorf("the report does not name the destination the copies are missing from: %s", out)
 	}
 }
