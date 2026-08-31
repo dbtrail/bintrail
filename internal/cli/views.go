@@ -110,6 +110,7 @@ var (
 	vNoBaselines   bool
 	vIncludeLive   bool
 	vIncludeEvents bool
+	vPinSnapshot   bool
 )
 
 func init() {
@@ -117,6 +118,7 @@ func init() {
 	viewsCmd.Flags().StringVar(&vArchiveDir, "archive-dir", "", "Local root directory of Parquet archives (requires --bintrail-id)")
 	viewsCmd.Flags().StringVar(&vArchiveS3, "archive-s3", "", "S3 root URL prefix of Parquet archives (requires --bintrail-id; e.g. s3://bucket/prefix/)")
 	viewsCmd.Flags().StringVar(&vBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir or --archive-s3 is set)")
+	viewsCmd.Flags().BoolVar(&vPinSnapshot, "pin-snapshot", false, "Bind the state views to the snapshot discovered now, so they keep returning today's rows after a baseline refresh (default: follow the newest snapshot)")
 	viewsCmd.Flags().StringVar(&vRegion, "region", "", "AWS region to pin in the generated S3 secret (default: resolved by the credential chain)")
 	viewsCmd.Flags().StringVar(&vBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots")
 	viewsCmd.Flags().StringVar(&vBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/)")
@@ -318,8 +320,43 @@ func resolveBaselineViews(ctx context.Context, in *views.Input) error {
 			Path:   f.Path,
 		})
 	}
+	followCurrentPointer(in, vBaselineDir, vPinSnapshot)
+	// AFTER the rewrite, so the column types come out of the same files the
+	// views open. Reading a footer from the snapshot directory while the view
+	// reads it through the pointer would let a later snapshot that widened a
+	// DECIMAL be read at the old precision from the very first query.
 	resolveBaselineDecimals(ctx, in)
 	return nil
+}
+
+// followCurrentPointer repoints the resolved state view paths at the baselines
+// root's `current` symlink, so a snapshot published later reaches an
+// already-generated file (#1484). It reports what it did through
+// in.FollowsSnapshot, which is what makes the generated file describe itself.
+//
+// --pin-snapshot is the only decision made here: the operator asked for today's
+// rows to stay today's. Every other reason to pin belongs to the rule itself
+// and lives in baseline.RewriteToPointer, so the console download cannot end up
+// following under conditions this command would not.
+//
+// root is the LOCAL baselines directory, and is "" under --baseline-s3: an S3
+// root has no pointer to follow.
+func followCurrentPointer(in *views.Input, root string, pin bool) {
+	if pin {
+		return
+	}
+	paths := make([]string, len(in.Baselines))
+	for i, t := range in.Baselines {
+		paths[i] = t.Path
+	}
+	rewritten, ok := baseline.RewriteToPointer(root, paths)
+	if !ok {
+		return
+	}
+	for i := range in.Baselines {
+		in.Baselines[i].Path = rewritten[i]
+	}
+	in.FollowsSnapshot = true
 }
 
 // resolveBaselineDecimals reads each table's column types out of its Parquet

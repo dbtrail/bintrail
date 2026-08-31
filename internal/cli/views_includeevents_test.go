@@ -40,7 +40,7 @@ func saveViewsFlags(t *testing.T) {
 	for i, p := range strs {
 		strVals[i] = *p
 	}
-	bools := []*bool{&vNoBaselines, &vIncludeLive, &vIncludeEvents}
+	bools := []*bool{&vNoBaselines, &vIncludeLive, &vIncludeEvents, &vPinSnapshot}
 	boolVals := make([]bool, len(bools))
 	for i, p := range bools {
 		boolVals[i] = *p

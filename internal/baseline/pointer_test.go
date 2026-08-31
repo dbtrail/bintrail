@@ -284,3 +284,101 @@ func TestResolveCurrentPointer_reportsUnusableShapes(t *testing.T) {
 		}
 	})
 }
+
+// TestRewriteToPointer_refusesAURLRoot pins the behaviour the console relies on
+// for an S3 baseline destination. The console hands its configured root through
+// verbatim, so this function is the only thing standing between an s3:// URL
+// and a rewritten path that resolves nowhere. Asserted here rather than with a
+// prefix check at the call site: a check that cannot change the outcome reads
+// as a guard without being one.
+func TestRewriteToPointer_refusesAURLRoot(t *testing.T) {
+	paths := []string{"s3://bucket/baselines/2026-08-31T03-00-00Z/shop/orders.parquet"}
+	if got, ok := RewriteToPointer("s3://bucket/baselines/", paths); ok {
+		t.Fatalf("rewrote an S3 root to %v", got)
+	}
+}
+
+// TestRewriteToPointer_refusesAPathOutsideTheRoot covers the other way a caller
+// can hand in something that is not a table of this snapshot. Rewriting it
+// would silently move a view to a file nobody asked for.
+func TestRewriteToPointer_refusesAPathOutsideTheRoot(t *testing.T) {
+	root := t.TempDir()
+	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	if err := PublishCurrentPointer(snap); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{
+		filepath.Join(snap, "shop", "orders.parquet"),
+		filepath.Join(t.TempDir(), "2026-08-31T03-00-00Z", "shop", "elsewhere.parquet"),
+	}
+	if got, ok := RewriteToPointer(root, paths); ok {
+		t.Fatalf("rewrote paths spanning two roots to %v", got)
+	}
+}
+
+// TestSplitSnapshotPath_contract pins the helper's refusals directly. They are
+// not reachable through RewriteToPointer's callers today, because a path that
+// escapes the root also fails the pointer-name comparison a line later. That
+// makes them exactly the kind of check that rots: it reads as a guard, nothing
+// exercises it, and the day a caller passes a different shape it turns out to
+// have been decorative. Specifying it here is what keeps it real.
+func TestSplitSnapshotPath_contract(t *testing.T) {
+	root := "/data/baselines"
+	cases := []struct {
+		name           string
+		path           string
+		snapshot, rest string
+	}{
+		{"a table of a snapshot", root + "/2026-08-31T03-00-00Z/shop/orders.parquet",
+			"2026-08-31T03-00-00Z", "shop/orders.parquet"},
+		{"outside the root", "/elsewhere/2026-08-31T03-00-00Z/shop/orders.parquet", "", ""},
+		{"the snapshot directory itself", root + "/2026-08-31T03-00-00Z", "", ""},
+		{"the snapshot directory with a trailing separator", root + "/2026-08-31T03-00-00Z/", "", ""},
+		{"the root itself", root, "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			snapshot, rest := splitSnapshotPath(root, c.path)
+			if snapshot != c.snapshot || rest != c.rest {
+				t.Fatalf("splitSnapshotPath(%q, %q) = %q, %q; want %q, %q",
+					root, c.path, snapshot, rest, c.snapshot, c.rest)
+			}
+		})
+	}
+}
+
+// TestPublishCurrentPointer_advancesToAFewerTableSnapshot pins a DECISION, not
+// a convenience. Publishing a snapshot that carries fewer tables moves the
+// pointer, so a views file following it loses the view for a table the new
+// snapshot does not hold -- loudly, by an unresolvable path.
+//
+// The alternative, refusing to advance unless the new snapshot is a superset,
+// is the change someone will reach for on reading that. It must not be made
+// without also reading why: a dropped table would freeze the pointer forever,
+// since no later snapshot could satisfy the rule again, and every generated
+// file would quietly serve older and older rows. This test is the tripwire.
+func TestPublishCurrentPointer_advancesToAFewerTableSnapshot(t *testing.T) {
+	root := t.TempDir()
+	wide := mkSnapshot(t, root, "2026-08-30T03-00-00Z")
+	if err := os.WriteFile(filepath.Join(wide, "shop", "customers.parquet"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSuccessMarker(wide); err != nil {
+		t.Fatal(err)
+	}
+
+	// The newer snapshot holds only one of the two tables.
+	narrow := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	if err := WriteSuccessMarker(narrow); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := readPointer(t, root); got != "2026-08-31T03-00-00Z" {
+		t.Fatalf("pointer = %q; it must advance to the newest complete snapshot "+
+			"even when that snapshot carries fewer tables (read this test's comment before changing it)", got)
+	}
+	// The consequence, stated so it cannot be introduced by accident later.
+	if _, err := os.Stat(filepath.Join(root, CurrentLinkName, "shop", "customers.parquet")); err == nil {
+		t.Fatal("test premise: the narrower snapshot was expected not to hold customers")
+	}
+}

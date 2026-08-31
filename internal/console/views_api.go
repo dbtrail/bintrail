@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 	"github.com/dbtrail/dbtrail/internal/storage"
@@ -39,7 +40,12 @@ var errNoViewSources = errors.New("this server has no archived partitions and no
 // gate ran with the zero value and a default download 502'd over an S3 variable
 // its file never touches -- while the CLI, which knows before it asks, did not.
 // The SQL panel passes false: it decides through OnlyViews.
-func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitEvents bool) (views.Input, error) {
+// pinSnapshot binds the state views to the snapshot discovered now instead of
+// letting them follow the baselines root's `current` pointer (#1484). The SQL
+// panel passes false like the download: the panel executes the views
+// immediately, so following costs it nothing, and one rule across both
+// producers is what keeps them from drifting apart.
+func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitEvents, pinSnapshot bool) (views.Input, error) {
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
@@ -75,10 +81,12 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitE
 					Schema: f.Schema, Table: f.Table, Path: f.Path,
 				})
 			}
+			followBaselinePointer(&in, b.baselineSrc, pinSnapshot)
 			// Column types for the state views' decimal casts. Best-effort and
 			// memoized per snapshot; serves the download and the SQL panel
 			// alike, both of which reach the same Parquet through the same
-			// views.
+			// views. AFTER the rewrite, so the footers read are the files the
+			// views open.
 			s.resolveBaselineDecimals(ctx, &in)
 		}
 	}
@@ -201,6 +209,12 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 	// route cannot honour. Refused rather than quietly upgraded — the events
 	// view is the expensive one and turning it on unasked is a cost the reader
 	// pays on every query.
+	pinSnapshot, err := parseStrictInclude("pin_snapshot",
+		"bind the state views to the snapshot that exists now", r.URL.Query().Get("pin_snapshot"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if includeLive && !includeEvents {
 		writeJSONError(w, http.StatusBadRequest,
 			"include_live adds a leg to the events view, which this file would not define: "+
@@ -208,7 +222,7 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	in, err := s.buildViewsInput(r.Context(), b, true, !includeEvents)
+	in, err := s.buildViewsInput(r.Context(), b, true, !includeEvents, pinSnapshot)
 	switch {
 	case errors.Is(err, errNoViewSources):
 		// Nothing to describe. A file of comments explaining that would be a
@@ -324,4 +338,31 @@ func (s *Server) viewsAvailable(r *http.Request, b *bundle) bool {
 	// sources is nil whenever err is set, so the err check is intent, not a
 	// distinct branch: the gate must never say yes on a failed read.
 	return err == nil && len(sources) > 0
+}
+
+// followBaselinePointer is the console's half of "follow the newest snapshot".
+// It mirrors the `bintrail views` wrapper exactly, and both defer the rule
+// itself to baseline.RewriteToPointer, so the two producers of a views file
+// cannot disagree about when following is safe.
+//
+// src may be an s3:// URL, which RewriteToPointer refuses on its own: there is
+// no pointer object in S3 to follow, and it looks for one on the filesystem. A
+// prefix check here would read as the guard while changing nothing, so the rule
+// is left in the one place that enforces it.
+func followBaselinePointer(in *views.Input, src string, pin bool) {
+	if pin {
+		return
+	}
+	paths := make([]string, len(in.Baselines))
+	for i, t := range in.Baselines {
+		paths[i] = t.Path
+	}
+	rewritten, ok := baseline.RewriteToPointer(src, paths)
+	if !ok {
+		return
+	}
+	for i := range in.Baselines {
+		in.Baselines[i].Path = rewritten[i]
+	}
+	in.FollowsSnapshot = true
 }

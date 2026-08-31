@@ -574,7 +574,16 @@ data. The old `/storage` link still works and lands on Retention.
   local path and an S3 location is listed by its S3 location (state views
   point wherever the server's backup destination points). The S3 secret it
   creates lasts one DuckDB session, so run the file again (`.read views.sql`)
-  in each session that reads S3. The download gives you one view per table by
+  in each session that reads S3. The state views follow the newest backup: they
+  read through the backup folder's `current` pointer, which every completed
+  backup updates, so a scheduled backup reaches an already-downloaded file with
+  nothing to download again, and all the views move to it together. What does
+  not follow is which views exist and how each `DECIMAL` column is read, both
+  decided from the backup named in the file's header, so download again after a
+  table is added or dropped or a column changes type. Tick **Pin to the backup
+  that exists now** for a fixed point in time instead; a backup destination in
+  S3 has no pointer to follow and is always pinned, and the generated file says
+  which of the two it did. The download gives you one view per table by
   default; tick **Include the change log** for a view over every archived
   change, which takes longer to open the further back your archive goes because
   it reads a piece of every archived file first. Tick **…and the live index**
