@@ -139,11 +139,7 @@ func TestPGBaseline_Integration(t *testing.T) {
 	}
 
 	// ── Snapshot directory, markers, manifest ──
-	entries, err := os.ReadDir(outDir)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("expected exactly one snapshot dir in %s: %v (%d entries)", outDir, err, len(entries))
-	}
-	snapDir := filepath.Join(outDir, entries[0].Name())
+	snapDir := singleSnapshotDir(t, outDir)
 	if _, err := os.Stat(filepath.Join(snapDir, baseline.SuccessMarker)); err != nil {
 		t.Errorf("_SUCCESS marker missing: %v", err)
 	}

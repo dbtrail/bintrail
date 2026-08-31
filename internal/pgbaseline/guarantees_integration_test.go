@@ -22,6 +22,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/event"
 	"github.com/dbtrail/dbtrail/internal/pgbaseline"
 	"github.com/dbtrail/dbtrail/internal/pgcapture"
+	"github.com/dbtrail/dbtrail/internal/snapshotdir"
 	"github.com/dbtrail/dbtrail/internal/testutil"
 )
 
@@ -523,13 +524,35 @@ func parseLSNText(t *testing.T, s string) pglogrepl.LSN {
 	return lsn
 }
 
+// singleSnapshotDir returns the one snapshot directory a baseline run wrote
+// under outDir.
+//
+// It SELECTS by name rather than asserting the directory holds exactly one
+// entry. A baselines root carries pointer machinery beside its snapshots since
+// #1484 -- the `current` symlink and its flock file -- so a count is no longer
+// a statement about how many snapshots were written, which is the thing these
+// tests actually mean. Selecting on the timestamp name is the same predicate
+// every discovery path uses, so this cannot drift from what the product reads.
 func singleSnapshotDir(t *testing.T, outDir string) string {
 	t.Helper()
 	entries, err := os.ReadDir(outDir)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("expected exactly one snapshot dir in %s: err=%v entries=%d", outDir, err, len(entries))
+	if err != nil {
+		t.Fatalf("read %s: %v", outDir, err)
 	}
-	return filepath.Join(outDir, entries[0].Name())
+	var snapshots []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, ok := snapshotdir.ParseTime(e.Name()); ok {
+			snapshots = append(snapshots, e.Name())
+		}
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("expected exactly one snapshot dir in %s, got %v (all entries: %v)",
+			outDir, snapshots, entries)
+	}
+	return filepath.Join(outDir, snapshots[0])
 }
 
 // limitedDSN rewrites the test DSN's credentials to the restricted role.
