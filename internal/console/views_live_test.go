@@ -122,13 +122,16 @@ func TestViewsAPI_liveLegIsOptIn(t *testing.T) {
 	if strings.Contains(sql, "bintrail_live") || strings.Contains(sql, "ATTACH ''") {
 		t.Errorf("the live leg is in a file nobody asked it for:\n%s", sql)
 	}
-	// And the archives-only note names the control THIS reader has. The CLI
-	// flag is not something a browser can pass.
-	if !strings.Contains(sql, `"…and the live index"`) {
-		t.Errorf("the archives-only note does not name the console's own route:\n%s", sql)
+	// And the archives-only note names the route this reader HAS, which is now
+	// the CLI. It used to be a checkbox, and the note named it verbatim; the
+	// card no longer offers the live leg, so the console stops overriding
+	// LiveLegHowTo and the generator's own wording becomes the true one.
+	// Inverted deliberately: the rule did not change, the reader's controls did.
+	if !strings.Contains(sql, "--include-live") {
+		t.Errorf("the archives-only note names no route at all for the live leg:\n%s", sql)
 	}
-	if strings.Contains(sql, "--include-live") {
-		t.Errorf("the note sends a console reader to a command-line flag:\n%s", sql)
+	if strings.Contains(sql, "and the live index") {
+		t.Errorf("the note still points at a checkbox this card no longer has:\n%s", sql)
 	}
 	// The probe queries must not have run either: this download asked the
 	// index nothing.

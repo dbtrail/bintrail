@@ -671,17 +671,16 @@ func TestCredentialsCard_noEmDashPlaceholders(t *testing.T) {
 }
 
 // TestDuckDBCard_titleDoesNotPromiseAQuery (#1528, review pass 1). The card
-// hands the operator a file that explicitly does NOT run here; /sql is the page
-// that runs DuckDB server-side. Two surfaces named for querying, one of which
-// only downloads, is the same defect as the backup-refresh title.
+// hands the operator a file that explicitly does NOT run here. A title naming a
+// query, for a control that only downloads, is the same defect as the
+// backup-refresh title.
 //
-// The card is NOT merged into /sql: the two are gated by different capabilities
-// (views vs sql), so on a daemon with views on and sql off the card would
-// become unreachable. Rename only.
-//
-// The second half is the cross-file pin: the generated views.sql tells a reader
-// which control to tick, by NAME. Renaming either side alone points that file
-// at a card that does not exist.
+// The cross-file pin this used to carry is GONE, and deliberately. It asserted
+// that the generated views.sql names this card's title, because the file's
+// remediation pointed at a checkbox on it. The card no longer offers the live
+// leg, so the console stops overriding LiveLegHowTo and the file names the CLI
+// flag instead — nothing in it refers to this card, and a pin against a
+// reference that does not exist would only be a test asserting its own fixture.
 func TestDuckDBCard_titleDoesNotPromiseAQuery(t *testing.T) {
 	body := jsFunctionBody(t, readAsset(t, "app.js"), "duckdbCard")
 	m := regexp.MustCompile(`card-title", text: "([^"]*)"`).FindStringSubmatch(body)
@@ -694,10 +693,5 @@ func TestDuckDBCard_titleDoesNotPromiseAQuery(t *testing.T) {
 	}
 	if !strings.Contains(title, "Download") {
 		t.Errorf("the card title %q does not name what the control does (download a file)", title)
-	}
-	if !strings.Contains(liveLegHowTo, title) {
-		t.Errorf("the generated views.sql points a reader at %q, which is not this card's title (%q); "+
-			"renaming one side alone sends them looking for a control that does not exist",
-			liveLegHowTo, title)
 	}
 }

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The Download a DuckDB schema card draws what the file will hold, instead of
+  describing it.** It carried three checkboxes, each trailed by a multi-line
+  caveat, on a page whose job is to be legible to someone who has read nothing.
+  The one decision a reader actually makes is whether to include the change log,
+  and its whole cost is a shape: your tables are one Parquet file each, the
+  change log is one file per archived hour and grows forever. Ticking the box
+  lights the strip, so the difference is seen rather than read.
+
+  `--pin-snapshot` and `--include-live` are no longer offered here. Both remain
+  CLI flags and route parameters; neither is a decision to put in front of a
+  first-time reader, and the live leg in particular can compete with capture on
+  the source server. A file downloaded from the console can no longer carry the
+  live leg, so its archives-only note names `bintrail views --include-live`
+  rather than a checkbox that no longer exists.
+
+  The card is now under 300 rendered characters, pinned by an e2e budget of its
+  own. That guard checks the drawing is on screen as well as the count, because
+  folding prose out of sight passes a character budget while leaving the same
+  wall one click away.
+
 ### Removed
 - **The console's SQL page and `POST /api/sql`** (#1549). The page answered
   free-form `SELECT`s with DuckDB running inside the daemon, which is why it

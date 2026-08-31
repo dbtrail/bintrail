@@ -3944,6 +3944,19 @@ try {
       // The 404-honesty rule's photographable half: this run is the
       // unversioned arm, where a direct release-asset link can only 404.
       downloadLinks: document.querySelectorAll('.view a[href*="/releases/download/"]').length,
+      // The DuckDB card carries its OWN budget (300), tighter than the view's,
+      // because it is the card that explains itself by drawing rather than by
+      // prose. Located by its title so a restyle does not silently unhook the
+      // measurement; a card that cannot be found reads as -1, never as 0,
+      // which would pass the budget by measuring nothing.
+      duckCardChars: (() => {
+        const c = Array.from(document.querySelectorAll(".view .card"))
+          .find((n) => /Download a DuckDB schema/.test(n.textContent || ""));
+        return c ? c.innerText.length : -1;
+      })(),
+      duckDrawn: document.querySelectorAll(".view .dk-shape .dk-tile").length,
+      duckBars: document.querySelectorAll(".view .dk-shape .dk-bar").length,
+      duckLit: document.querySelectorAll(".view .dk-shape .dk-part:not(.dk-off)").length,
     };
   });
   (cn.badges === "123")
@@ -3955,6 +3968,20 @@ try {
   (cn.visibleChars > 0 && cn.visibleChars < 1500 && cn.fine >= 1)
     ? ok("connect: visible text stays under budget with fine print folded")
     : bad("connect: visible text stays under budget with fine print folded", "chars " + cn.visibleChars + " fine " + cn.fine);
+  // The card's own budget. 300 characters is roughly fifty words: enough for a
+  // title, one control and a button, and not enough to start explaining. The
+  // card used to carry three checkboxes and three multi-line caveats.
+  (cn.duckCardChars > 0 && cn.duckCardChars <= 300)
+    ? ok("connect: the DuckDB card stays under 300 visible characters")
+    : bad("connect: the DuckDB card stays under 300 visible characters", "chars " + cn.duckCardChars);
+  // And it is under budget because it DRAWS, not because the prose was folded
+  // out of sight. Folding passes a character count while leaving the same wall
+  // one click away, so the drawing has to be on screen for the budget to mean
+  // anything. The change-log strip starts dark: exactly one half is lit.
+  (cn.duckDrawn > 0 && cn.duckBars > cn.duckDrawn && cn.duckLit === 1)
+    ? ok("connect: the DuckDB card draws the shape, with the change log unlit until asked for")
+    : bad("connect: the DuckDB card draws the shape, with the change log unlit until asked for",
+        JSON.stringify({ tiles: cn.duckDrawn, bars: cn.duckBars, lit: cn.duckLit }));
   // "shown only once" is carried by the fresh state and the managed state
   // (except managed read_only, which drops the Lost-it clause and the phrase
   // with it); this run exercises the fresh one (no scenario mints a token).

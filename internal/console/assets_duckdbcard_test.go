@@ -1,99 +1,124 @@
 package console
 
 import (
-	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
 
-// The Download a DuckDB schema card is the only caller of GET /api/views.sql, so the
-// include_live parameter the handler grew (#1480) reaches the operator only if
-// this card sends it. The server-side tests all pass with a card that has no
-// checkbox at all.
+// The Download a DuckDB schema card is the only caller of GET /api/views.sql,
+// so what it can ask for IS the console's whole surface over that endpoint.
 //
-// Scoped to duckdbCard's body: a file-wide search for "include_live" would be
-// satisfied by any other mention, this one included in a comment.
-// TestDuckDBCard_disabledStateIsStyled: the class toggles are inert unless
-// something styles the class, and a rule with no reader is invisible to every
-// JS-level assertion.
-func TestDuckDBCard_disabledStateIsStyled(t *testing.T) {
-	css, err := os.ReadFile("assets/style.css")
-	if err != nil {
-		t.Fatal(err)
+// It carried three checkboxes and three multi-line caveats until #1549's
+// follow-up. The caveats are what these guards used to pin, one string at a
+// time. They pin the SHAPE now, because the card explains itself by drawing
+// what the file will hold instead of describing it, and a drawing fails
+// differently: wrong prose reads wrong, a wrong picture looks fine.
+
+// TestDuckDBCardOffersOneDecision. --pin-snapshot and --include-live remain
+// route parameters and CLI flags; they are not decisions to put in front of a
+// first-time reader, and the live leg in particular can compete with capture on
+// the source server. So exactly one box, and it is the change log.
+func TestDuckDBCardOffersOneDecision(t *testing.T) {
+	body := functionBody(t, readAsset(t, "app.js"), "function duckdbCard(")
+
+	boxes := strings.Count(body, `type: "checkbox"`)
+	if boxes != 1 {
+		t.Errorf("duckdbCard renders %d checkboxes, want exactly 1 (the change log); "+
+			"pin-snapshot and include-live are CLI flags and route parameters, not first-visit decisions", boxes)
 	}
-	for _, want := range []string{".check.is-disabled", ".check-sub", ".form-hint-sub"} {
-		if !strings.Contains(string(css), want) {
-			t.Errorf("no style for %s, so the nested option renders identically to a "+
-				"top-level one whether it is usable or not", want)
+	if !strings.Contains(body, "include_events=1") {
+		t.Error("the card never sends include_events=1, so the change log cannot be asked for at all")
+	}
+	// Conditional, not always: the change log binds every archived file, so a
+	// download nobody asked for it must not carry it.
+	if !strings.Contains(body, `events.checked ? "?include_events=1" : ""`) {
+		t.Error("the change log is not conditional on the box, so the default download is not the cheap one")
+	}
+	// The two retired controls must not come back as silent always-on
+	// parameters, which would be worse than the checkboxes were.
+	for _, gone := range []string{"include_live", "pin_snapshot"} {
+		if strings.Contains(body, gone) {
+			t.Errorf("duckdbCard names %s again; it was removed from this surface, not moved into a default", gone)
 		}
 	}
 }
 
-func TestDuckDBCardOffersTheLiveLeg(t *testing.T) {
-	js, err := os.ReadFile("assets/app.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := functionBody(t, string(js), "function duckdbCard(")
+// TestDuckDBCardDrawsTheCostInsteadOfStatingIt is the guard for the drawing.
+//
+// The card used to carry "It takes longer to open the further back your archive
+// goes, because it reads a piece of every archived file". That sentence is the
+// shape of the data, and the shape is drawable: your tables are one file each,
+// the change log is one file per archived hour. Ticking the box lights the
+// strip, so the cost is seen.
+//
+// A picture can lie in a way prose cannot: nobody reports a diagram that merely
+// looks plausible. So the two halves are pinned to the one parameter the card
+// can send. If the strip stops being tied to the change-log box, the drawing
+// starts claiming something the download does not do.
+func TestDuckDBCardDrawsTheCostInsteadOfStatingIt(t *testing.T) {
+	js := readAsset(t, "app.js")
+	shape := functionBody(t, js, "function duckdbShape(")
+	card := functionBody(t, js, "function duckdbCard(")
 
-	if !strings.Contains(body, `type: "checkbox"`) {
-		t.Error("the card has no checkbox, so the live leg cannot be asked for from the UI")
+	// Both halves exist, and the change log is drawn as MANY units against the
+	// tables' few. That contrast is the whole explanation; equal counts would
+	// render a picture that says the two cost the same.
+	tiles := regexp.MustCompile(`tiles\((\d+), "dk-tile"\)`).FindStringSubmatch(shape)
+	bars := regexp.MustCompile(`tiles\((\d+), "dk-bar"\)`).FindStringSubmatch(shape)
+	if tiles == nil || bars == nil {
+		t.Fatal("duckdbShape no longer draws both a tile row (your tables) and a bar row (the change log)")
 	}
-	if !strings.Contains(body, "include_live=1") {
-		t.Error("the card never sends include_live=1, so ticking the box would download the archives-only file")
+	if len(bars[1]) <= len(tiles[1]) {
+		t.Errorf("the change log is drawn with %s units against the tables' %s; the picture has to show that "+
+			"one is a file per table and the other a file per archived hour", bars[1], tiles[1])
 	}
-	// The change log is opt-in since #1535, so the card has to offer it or the
-	// only file anyone can download from here is state-views-only.
-	if !strings.Contains(body, "include_events=1") {
-		t.Error("the card never sends include_events=1, so the change log cannot be asked for from the UI")
+
+	// The strip is dimmed until the box is ticked, and the card is what wires
+	// them together. Either half alone leaves a drawing that never changes.
+	if !strings.Contains(shape, "dk-off") {
+		t.Error("duckdbShape never applies dk-off, so the change-log half is drawn as if it were always included")
 	}
-	// The live leg hangs on the change-log view. Ticked on its own it earns a
-	// 400 from the route, so the UI must not let that state exist: the box
-	// starts disabled and is CLEARED when the change log is turned back off (a
-	// disabled checkbox keeps its checked state, and the request reads it).
-	if !strings.Contains(body, "disabled: true") {
-		t.Error("the live-leg box is not disabled to begin with, so it can be ticked " +
-			"without the view it is a leg of")
+	if !strings.Contains(card, `shape.events.classList.toggle("dk-off"`) {
+		t.Error("the change-log box does not light the strip, so ticking it explains nothing")
 	}
-	if !strings.Contains(body, "live.checked = false") {
-		t.Error("turning the change log back off leaves the live box checked, so the " +
-			"next download sends include_live=1 without include_events and is refused")
+	if !strings.Contains(card, "events.onchange();") {
+		t.Error("the initial state is never synced, so the strip renders lit before the box is ticked")
 	}
-	if !strings.Contains(body, "events.checked && live.checked") {
-		t.Error("the live parameter is not conditional on the change log being on too")
+
+	// Built with el(), not svgEl: that helper DOMParses STATIC icon constants
+	// only, and routing a drawing through it is how a string-to-DOM path grows
+	// an interpolated argument later.
+	if strings.Contains(shape, "svgEl(") {
+		t.Error("duckdbShape builds through svgEl, which is for static icon constants; draw with el()")
 	}
-	// The cost of the change log belongs on the PAGE. By the time the operator
-	// reads the generated file, the bind is already running. Deleting this
-	// paragraph left every other assertion here green.
-	for _, want := range []string{"takes longer to open", "every archived file"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("the card does not state the cost of the change log (missing %q)", want)
+}
+
+// TestDuckDBCardStaysNearlyTextless is the Go half of the 300-character budget
+// the e2e enforces on the rendered card. It cannot count rendered text, so it
+// counts what the source can produce, and exists to fail on the desk rather
+// than in CI when someone starts explaining again.
+func TestDuckDBCardStaysNearlyTextless(t *testing.T) {
+	js := readAsset(t, "app.js")
+	body := functionBody(t, js, "function duckdbCard(")
+	// Only text OUTSIDE the fold: cnFine's contents are one click away and are
+	// not what a first-time reader meets. Everything up to the fold is visible.
+	visible := body
+	if i := strings.Index(body, "cnFine("); i >= 0 {
+		visible = body[:i]
+	}
+	total := 0
+	for _, m := range regexp.MustCompile(`text:\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+)`).FindAllStringSubmatch(visible, -1) {
+		for _, lit := range regexp.MustCompile(`"((?:[^"\\]|\\.)*)"`).FindAllStringSubmatch(m[1], -1) {
+			total += len(lit[1])
 		}
 	}
-	// The VISUAL half of the nesting. `disabled: true` covers the functional
-	// half and was the only thing pinned, so deleting the whole disabled
-	// treatment — both class toggles AND the initial sync — stayed green while
-	// the inert sub-option rendered at full opacity, indistinguishable from a
-	// live control.
-	for _, want := range []string{`classList.toggle("is-disabled"`, "events.onchange();"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("the nested option has no visible disabled state (missing %q)", want)
-		}
+	if total == 0 {
+		t.Fatal("no visible text found in duckdbCard; this guard covers nothing")
 	}
-	// Conditional, not always: the leg reads the live capture index and the
-	// change log binds every archived file, so a download nobody asked either
-	// of them for must carry neither. The two `events.checked` guards above are
-	// what enforce it now; a bare-URL assertion keeps the default honest.
-	if !strings.Contains(body, `"/api/views.sql" + (params.length`) {
-		t.Error("the card does not send a bare URL when nothing is ticked, so the " +
-			"default download is not the cheap one")
-	}
-	// The cost belongs on the page, not only in the generated file's comments:
-	// by the time an operator reads those, the query is already running.
-	for _, want := range []string{"live capture index", "competes"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("the card does not state the cost of the live leg (missing %q)", want)
-		}
+	if total > 200 {
+		t.Errorf("duckdbCard's visible text is %d characters. The card explains itself by drawing; "+
+			"if something needs saying, either draw it or put it behind cnFine", total)
 	}
 }
 

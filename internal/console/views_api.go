@@ -51,13 +51,19 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitE
 		Version:     s.version,
 		OmitEvents:  omitEvents,
 	}
-	// The download CAN carry the hot leg now (the "Include the live index"
-	// box), so the archives-only note names that box rather than a flag the
-	// reader is not at a command line to pass. A server this console cannot
-	// reach by host and port has no route at all, and says so instead.
-	if consoleCanOfferLiveLeg(b) {
-		in.LiveLegHowTo = liveLegHowTo
-	} else {
+	// LiveLegHowTo is deliberately NOT set any more. It existed because this
+	// reader had a checkbox and "a flag they cannot pass is not remediation"
+	// (see the field's own doc). The card no longer offers the live leg, so
+	// that reader has no control, and the generator's own wording — regenerate
+	// with `bintrail views --include-live` — became the truthful route rather
+	// than the fallback. Leaving the override in place would point at a box
+	// that does not exist, which is the exact failure the constant was added
+	// to prevent, in the other direction.
+	//
+	// LiveLegUnavailable still matters and is still per-server: a server this
+	// console cannot reach by host and port cannot carry the leg from ANY
+	// surface, so the note must not send its reader to the CLI either.
+	if !consoleCanOfferLiveLeg(b) {
 		in.LiveLegUnavailable = true
 	}
 	var archiveErr error
