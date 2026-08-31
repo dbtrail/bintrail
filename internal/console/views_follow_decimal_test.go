@@ -79,7 +79,7 @@ func TestSQLPanelInput_pins(t *testing.T) {
 	}
 	srv := newViewsServer(t, dir, false)
 
-	in, err := srv.buildViewsInput(t.Context(), srv.cm.boot, false, false, true)
+	in, err := srv.buildViewsInput(t.Context(), srv.cm.boot, viewsRequest{PinSnapshot: true})
 	if err != nil {
 		t.Fatalf("buildViewsInput: %v", err)
 	}

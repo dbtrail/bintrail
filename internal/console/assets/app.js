@@ -4239,6 +4239,20 @@ function duckdbPanel() {
   events.onchange = () => shape.events.classList.toggle("dk-off", !events.checked);
   events.onchange();
 
+  // The second box, and only for a server whose backups are in two places
+  // (#1551). With one location there is nothing to decide, and a box that
+  // changes nothing to a file is worse than no box at all.
+  //
+  // Phrased as where the file will be OPENED, not as which storage it names:
+  // the reader downloading through a browser knows which machine they are
+  // taking it to, and does not necessarily know where their backups live.
+  let portable = null;
+  if (capsCache.views_portable_baseline) {
+    portable = el("input", { type: "checkbox", name: "portable_baseline" });
+    body.append(el("label", { class: "check" }, portable,
+      el("span", { text: "Works on another machine" })));
+  }
+
   body.append(cnFine("More about this file",
     el("p", { class: "form-hint", text:
       "Runs in your own DuckDB. Nothing runs here, and no credentials are in the file." }),
@@ -4249,9 +4263,16 @@ function duckdbPanel() {
   btn.onclick = async () => {
     btn.disabled = true;
     try {
-      const sql = await apiText("/api/views.sql" + (events.checked ? "?include_events=1" : ""));
-      downloadBlob("views.sql", sql, "text/plain");
-      toast("views.sql downloaded. In DuckDB run .read views.sql, once per session.");
+      const q = [];
+      if (events.checked) q.push("include_events=1");
+      if (portable && portable.checked) q.push("portable_baseline=1");
+      // Its own name. The browser saves into one folder and overwrites a
+      // repeated name without asking, so downloading both would leave the
+      // reader with whichever came last and no way to tell which.
+      const name = portable && portable.checked ? "views-portable.sql" : "views.sql";
+      const sql = await apiText("/api/views.sql" + (q.length ? "?" + q.join("&") : ""));
+      downloadBlob(name, sql, "text/plain");
+      toast(name + " downloaded. In DuckDB run .read " + name + ", once per session.");
     } catch (err) {
       toastError("could not generate views: " + ((err && err.message) || err));
     } finally {

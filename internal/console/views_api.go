@@ -25,26 +25,44 @@ var errNoViewSources = errors.New("this server has no archived partitions and no
 // sources from archive_state plus the NEWEST baseline snapshot's tables — into
 // the generator input shared by GET /api/views.sql and the SQL panel. A
 // baseline root that is configured but unlistable is an upstream fault worth
+// viewsRequest is what the reader asked the download for, kept apart from what
+// this server can actually offer. Every field defaults to the cheap, local,
+// nothing-extra answer, so a zero value is the file a first-time reader gets.
+type viewsRequest struct {
+	// PortableArchives names each archive by its registered S3 location where
+	// one exists, instead of this host's local copy. The download runs on the
+	// operator's machine, where the local copy is not there (#1456).
+	PortableArchives bool
+	// OmitEvents leaves out the events view. A PARAMETER rather than something
+	// the caller sets afterwards: NeedsS3 asks whether the rendered file reads
+	// any s3:// path, and the events view is the half that reads the archives.
+	// Set after buildViewsInput returns, that gate ran with the zero value and
+	// a default download 502'd over an S3 variable its file never touches,
+	// while the CLI, which knows before it asks, did not.
+	OmitEvents bool
+	// PinSnapshot binds the state views to the snapshot discovered now instead
+	// of letting them follow a later one (#1484).
+	PinSnapshot bool
+	// PortableBaseline reads the state views out of this server's S3 backup
+	// prefix instead of its local backup directory (#1551).
+	//
+	// Only meaningful when the server has BOTH, which is exactly when
+	// bundle.baselineFallbackSrc is set: with one location there is no choice
+	// to make, and emitting a location the snapshots were never written to
+	// produces a file whose every state view fails to resolve.
+	PortableBaseline bool
+}
+
 // naming, not a degrade: silently dropping the baseline half would hand over a
 // layout missing every state view.
 //
-// portable selects which registered location names each archive. The download
-// runs on the operator's machine, where this host's local copy does not exist,
-// so it takes the S3 location whenever one is registered (#1456); the SQL panel
-// runs in this daemon and keeps the local-first routing every other console
-// read uses.
-// omitEvents is a PARAMETER rather than something the caller sets afterwards:
-// NeedsS3 below asks whether the rendered file reads any s3:// path, and the
-// events view is the half that reads the archives. Set after this returns, the
-// gate ran with the zero value and a default download 502'd over an S3 variable
-// its file never touches -- while the CLI, which knows before it asks, did not.
-// The SQL panel passes false: it decides through OnlyViews.
-// pinSnapshot binds the state views to the snapshot discovered now instead of
-// letting them follow the baselines root's `current` pointer (#1484). The SQL
-// panel passes false like the download: the panel executes the views
-// immediately, so following costs it nothing, and one rule across both
-// producers is what keeps them from drifting apart.
-func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitEvents, pinSnapshot bool) (views.Input, error) {
+// req is what the reader asked for. Its two "portable" fields are DIFFERENT
+// axes over different halves of the file, and the names are spelled out rather
+// than shared because conflating them silently emits the wrong paths: archives
+// feed the events view, baselines feed the state views, and a server can have
+// its archives in S3 while its backups are on local disk or the reverse.
+func (s *Server) buildViewsInput(ctx context.Context, b *bundle, req viewsRequest) (views.Input, error) {
+	portable, omitEvents, pinSnapshot := req.PortableArchives, req.OmitEvents, req.PinSnapshot
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
@@ -69,9 +87,16 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitE
 	in.ArchiveSources, archiveErr = consoleArchiveSources(ctx, b.db, portable)
 	in.PortableRouting = portable
 	in.ArchiveDiscoveryFailed = archiveErr != nil
-	if b.baselineSrc != "" {
-		in.BaselineSource = b.baselineSrc
-		files, err := reconstruct.ListBaselines(ctx, b.baselineSrc)
+	baseSrc := b.baselineSrc
+	if req.PortableBaseline && b.baselineFallbackSrc != "" {
+		// Read from the bundle, never from the request: the two locations this
+		// server actually has are the only two it can be asked for, so a
+		// request cannot name a prefix nothing was written to.
+		baseSrc = b.baselineFallbackSrc
+	}
+	if baseSrc != "" {
+		in.BaselineSource = baseSrc
+		files, err := reconstruct.ListBaselines(ctx, baseSrc)
 		if err != nil {
 			return views.Input{}, fmt.Errorf("list baselines: %w", err)
 		}
@@ -99,7 +124,7 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitE
 			// file, since following only happens when the pointer names this
 			// snapshot, so reading the pinned one costs nothing.
 			s.resolveBaselineDecimals(ctx, &in)
-			views.ApplyFollow(&in, b.baselineSrc, pinSnapshot)
+			views.ApplyFollow(&in, baseSrc, pinSnapshot)
 		}
 	}
 	if len(in.ArchiveSources) == 0 && len(in.Baselines) == 0 {
@@ -227,6 +252,23 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	portableBaseline, err := parseStrictInclude("portable_baseline",
+		"read the state views from this server's S3 backup prefix", r.URL.Query().Get("portable_baseline"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Refused rather than quietly ignored. Silently falling back to the local
+	// directory hands a laptop a file whose every state view names a path that
+	// machine does not have, which is the failure this parameter exists to
+	// avoid, delivered as a successful download.
+	if portableBaseline && b.baselineFallbackSrc == "" {
+		writeJSONError(w, http.StatusUnprocessableEntity,
+			"this server has no S3 backup prefix to read from: portable_baseline needs a server "+
+				"configured with BOTH a local backup directory and an S3 one, so there are two "+
+				"locations to choose between")
+		return
+	}
 	if includeLive && !includeEvents {
 		writeJSONError(w, http.StatusBadRequest,
 			"include_live adds a leg to the events view, which this file would not define: "+
@@ -234,7 +276,12 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	in, err := s.buildViewsInput(r.Context(), b, true, !includeEvents, pinSnapshot)
+	in, err := s.buildViewsInput(r.Context(), b, viewsRequest{
+		PortableArchives: true,
+		OmitEvents:       !includeEvents,
+		PinSnapshot:      pinSnapshot,
+		PortableBaseline: portableBaseline,
+	})
 	switch {
 	case errors.Is(err, errNoViewSources):
 		// Nothing to describe. A file of comments explaining that would be a
@@ -291,7 +338,15 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 
 	sqlText := views.Generate(in)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="views.sql"`)
+	// A distinct name for the portable file. Both are downloads of "the schema
+	// for this server", and a browser saving views.sql twice into one folder
+	// overwrites without asking, leaving the reader with whichever they fetched
+	// last and no way to tell which that was.
+	name := "views.sql"
+	if portableBaseline {
+		name = "views-portable.sql"
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	// The file names paths, not data, and it is regenerated from live state on
 	// every request — a cached copy would quietly describe a layout that has
 	// since rotated.

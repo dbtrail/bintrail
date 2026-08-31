@@ -23,18 +23,38 @@ import (
 func TestDuckDBCardOffersOneDecision(t *testing.T) {
 	body := functionBody(t, readAsset(t, "app.js"), "function duckdbPanel(")
 
+	// Two, and the second one is CONDITIONAL. The card is a first visit for
+	// most readers, so the bar for a control is that skipping it would produce
+	// the wrong file: the change log is left out by default and has to be
+	// asked for, and the backup location only has an answer to give when this
+	// server has two of them (#1551). Everything else stays a CLI flag.
 	boxes := strings.Count(body, `type: "checkbox"`)
-	if boxes != 1 {
-		t.Errorf("duckdbPanel renders %d checkboxes, want exactly 1 (the change log); "+
-			"pin-snapshot and include-live are CLI flags and route parameters, not first-visit decisions", boxes)
+	if boxes != 2 {
+		t.Errorf("duckdbPanel renders %d checkboxes, want exactly 2 (the change log, and the "+
+			"backup location when the server has two); pin-snapshot and include-live are CLI "+
+			"flags and route parameters, not first-visit decisions", boxes)
+	}
+	// The point of the pair above: unconditional, it is a control that changes
+	// nothing for every server with one backup location, which is most of them.
+	if !strings.Contains(body, "if (capsCache.views_portable_baseline) {") {
+		t.Error("the backup-location box is not gated on the capability, so it is offered for " +
+			"servers with only one location, where it changes nothing")
 	}
 	if !strings.Contains(body, "include_events=1") {
 		t.Error("the card never sends include_events=1, so the change log cannot be asked for at all")
 	}
+	if !strings.Contains(body, "portable_baseline=1") {
+		t.Error("the card never sends portable_baseline=1, so its box changes nothing")
+	}
 	// Conditional, not always: the change log binds every archived file, so a
 	// download nobody asked for it must not carry it.
-	if !strings.Contains(body, `events.checked ? "?include_events=1" : ""`) {
+	if !strings.Contains(body, `if (events.checked) q.push("include_events=1")`) {
 		t.Error("the change log is not conditional on the box, so the default download is not the cheap one")
+	}
+	// Its own filename. Saved as views.sql, the second download silently
+	// replaces the first in the reader's downloads folder.
+	if !strings.Contains(body, `"views-portable.sql"`) {
+		t.Error("both downloads are saved under one filename, so one silently overwrites the other")
 	}
 	// The two retired controls must not come back as silent always-on
 	// parameters, which would be worse than the checkboxes were.

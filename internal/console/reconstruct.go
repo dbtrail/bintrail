@@ -67,6 +67,13 @@ type capabilitiesResponse struct {
 	// (archives enabled, no active data profile, and something to describe), so
 	// the UI never offers a button that only 404s.
 	Views bool `json:"views"`
+	// ViewsPortableBaseline: this server's backups exist in TWO places, so the
+	// download has a choice to offer between a file that opens fastest here and
+	// one that opens on another machine (#1551). False is the ordinary case of
+	// one location, where there is nothing to decide and the UI shows no
+	// control. Never advertised without Views: a choice about a file the reader
+	// cannot download at all is not a choice.
+	ViewsPortableBaseline bool `json:"views_portable_baseline"`
 	// BaselineTrigger: this process can create baseline snapshots in-process from
 	// the console (the watch daemon opted in with BINTRAIL_CONSOLE_BASELINE_TRIGGER=1).
 	// Process-global, like Monitor — the endpoint does the per-server validation
@@ -219,6 +226,10 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		restricted := sessionRestricted(r)
 		resp.Reconstruct = b.baselineConfigured && !restricted
 		resp.Views = s.viewsAvailable(r, b)
+		// Gated on Views for the reason the field's doc gives, and read off the
+		// same bundle field the handler refuses on, so the control cannot be
+		// offered for a server the route would then reject.
+		resp.ViewsPortableBaseline = resp.Views && b.baselineFallbackSrc != ""
 		// Match the recover-cascade handler's Phase-2 gate exactly so the advertised
 		// capability can't over-promise (handler builds the provider only when both
 		// a baseline source and a resolver are present).
