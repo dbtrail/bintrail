@@ -246,7 +246,7 @@ What a stale compose file costs:
 | the console state paths on the `bintrail-state` volume | your console username and password, the servers you added, and the AI connection token live inside the container, so the next `up -d` that recreates it deletes them | **Silent.** The console comes back asking you to create a password, exactly like a fresh install, and reports no loss. Fix this one first |
 | the read-only index mount plus `BINTRAIL_INDEX_DATADIR_RO` | free disk space for the index cannot be measured | The preflight and the Retention page report it as not measurable |
 | the `iceberg-export` profile and its volume | there is no one-shot Iceberg export to run | `docker compose --profile iceberg-export run ...` says the service does not exist |
-| `BINTRAIL_CONSOLE_SQL_PANEL` (the current file does not set it) | nothing: the SQL page is on by default in the daemon | If you kept `SQL_PANEL=0` in `.env` to hide the page, the current file ignores it. Add `BINTRAIL_CONSOLE_SQL_PANEL: "0"` to the `bintrail` service instead |
+| `BINTRAIL_CONSOLE_SQL_PANEL` (the current file does not set it) | nothing: the SQL page was removed in 0.75.0 | Remove the variable. It is read for one release and warns; download a DuckDB schema from **Connect** and query the same Parquet yourself |
 
 Two things make this easier to catch:
 
@@ -500,16 +500,12 @@ for the selected server — trigger a run, watch per-table match/mismatch/
 inconclusive results land, and drill into a mismatch — see
 [console.md](console.md#running-verification-from-the-console).
 
-**SQL** (in the sidebar, for a server that has archived Parquet or a backup) is
-on by default: a read-only `SELECT` box answered by the daemon in a locked-down
-DuckDB session. That default lives in the daemon, not in this compose file, so
-pulling a newer image delivers it. To hide the page, add
-`BINTRAIL_CONSOLE_SQL_PANEL: "0"` to the `bintrail` service's `environment:`
-(the older `SQL_PANEL=0` in `.env` only works while your compose file still
-carries the `BINTRAIL_CONSOLE_SQL_PANEL: ${SQL_PANEL:-1}` line, which the
-current file does not). Read
-[The SQL panel](console.md#the-sql-panel) before you publish the console
-beyond the host loopback.
+**SQL over your Parquet** is not answered by the daemon. The console's SQL page
+was removed in 0.75.0 (see [The SQL panel
+(removed)](console.md#the-sql-panel-removed)). Open **Connect**, click **Open in
+DuckDB...** on the **Download a DuckDB schema** card, and run the file in your
+own DuckDB: no row cap, no time limit, and nothing executing inside the process
+that captures.
 
 Notes:
 
@@ -664,7 +660,7 @@ surface, use the demo image ([demo.md](./demo.md)).
 | `BASELINE_DIR` | compose (optional) | Baseline dir for the boot `SOURCE_DSN` entry — set `/var/lib/bintrail/baselines` after the first `baseline` profile run to enable Time-travel on it. Also enables full-table `_snapshot.*` on the `flashback` profile shim |
 | `BASELINE_TRIGGER` | compose (optional) | Enables the console's in-process **Create baseline** button (dump→convert→upload) for a monitored server; **on by default** — set `BASELINE_TRIGGER=0` to disable |
 | `VERIFY_TRIGGER` | compose (optional) | Enables the console's Storage **Verification** panel (runs `bintrail verify` in-process) for a monitored server; **on by default** — set `VERIFY_TRIGGER=0` to disable |
-| `BINTRAIL_CONSOLE_SQL_PANEL` | service environment (optional) | The console's **SQL** page (a read-only `SELECT` box over the selected server's Parquet, answered inside the daemon). **On by default in the daemon**, so the compose file does not set it; add `BINTRAIL_CONSOLE_SQL_PANEL: "0"` to the `bintrail` service to hide the page |
+| `BINTRAIL_CONSOLE_SQL_PANEL` | retired | The console's SQL page and `POST /api/sql` were removed in 0.75.0. Read for one release, and warns that it does nothing |
 | `WAREHOUSE_DIR` | compose `iceberg-export` profile (optional) | Directory the Iceberg tables are written under (default `/var/lib/bintrail-iceberg`, in the `bintrail-iceberg` volume) |
 | `BASELINE_S3` | compose `iceberg-export` profile (optional) | S3 prefix holding the baseline snapshots to export from; wins over `BASELINE_DIR` |
 | `ICEBERG_TABLES` | compose `iceberg-export` profile (optional) | Comma-separated `schema.table` list to export (default: every table in the newest snapshot) |

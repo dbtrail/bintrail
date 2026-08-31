@@ -204,11 +204,6 @@ var Required = []Requirement{
 		Why:   "cascade reversal (with synthesized child rows) served by the console",
 	},
 	{
-		Pair:  Pair{Surface: "console", Action: "sql.run"},
-		Owner: OwnerConsoleUnit,
-		Why:   "a free-form SQL statement executed over the archive/baseline Parquet by the console's SQL panel (#1177)",
-	},
-	{
 		Pair:  Pair{Surface: "console", Action: "baseline.download"},
 		Owner: OwnerConsoleUnit,
 		Why:   "handing the operator a full copy of a baseline snapshot's row data (the backup tar download)",

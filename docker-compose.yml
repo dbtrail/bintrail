@@ -324,11 +324,6 @@ services:
       # a baseline dir/S3 configured (baseline-anchored) or a source DSN
       # (live-source) before the button does anything.
       BINTRAIL_CONSOLE_VERIFY_TRIGGER: ${VERIFY_TRIGGER:-1}
-      # The SQL page (#1177) is deliberately NOT wired here (#1529): it is on
-      # by default in the daemon itself, so pulling a newer image delivers it.
-      # A default that lives in this file only reaches installs that download
-      # this file. To hide the page, add:
-      #   BINTRAIL_CONSOLE_SQL_PANEL: "0"
       # Password login (persists next to the registry). On first run the
       # console serves a "create your password" screen; later visits sign in.
       # There is deliberately NO password env var: docker inspect must never

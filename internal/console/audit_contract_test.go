@@ -129,39 +129,6 @@ func TestAuditContract_ConsoleUnit(t *testing.T) {
 				}
 			},
 		},
-		{
-			name:      "sql panel",
-			action:    "sql.run",
-			wantActor: tokenActor,
-			call: func(t *testing.T) {
-				baselineRoot, _ := writeSQLPanelBaseline(t)
-				srv := newSQLPanelServer(t, baselineRoot, true)
-				w := httptest.NewRecorder()
-				srv.handleSQLPanel(w, httptest.NewRequest("POST", "/api/sql",
-					strings.NewReader(`{"sql":"SELECT count(*) FROM state_shop_orders"}`)))
-				if w.Code != http.StatusOK {
-					t.Fatalf("sql panel: code=%d body=%s", w.Code, w.Body.String())
-				}
-			},
-		},
-		{
-			name:      "sql panel refused",
-			action:    "sql.run",
-			wantActor: tokenActor,
-			call: func(t *testing.T) {
-				// A gate-refused statement is audited too (outcome=refused): the
-				// refused probe is exactly what an auditor needs. Delete the
-				// recordSQLRun on the refusal branch and this case goes red.
-				baselineRoot, _ := writeSQLPanelBaseline(t)
-				srv := newSQLPanelServer(t, baselineRoot, true)
-				w := httptest.NewRecorder()
-				srv.handleSQLPanel(w, httptest.NewRequest("POST", "/api/sql",
-					strings.NewReader(`{"sql":"SELECT * FROM glob('/etc/*')"}`)))
-				if w.Code != http.StatusUnprocessableEntity {
-					t.Fatalf("refused sql panel: code=%d body=%s, want 422", w.Code, w.Body.String())
-				}
-			},
-		},
 		// The six access-profile verbs (#1445): each drives its real handler
 		// over a sqlmock index whose Exec succeeds, then the readback the
 		// handler answers with. The emission sits after the write and before

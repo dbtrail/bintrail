@@ -258,10 +258,13 @@ func TestStorageSplit_eachHalfHoldsOnlyItsOwnConcern(t *testing.T) {
 	if !strings.Contains(jsFunctionBody(t, js, "buildConnect"), "duckdbCard(") {
 		t.Error("buildConnect does not mount duckdbCard, so the schema download is unreachable")
 	}
-	// It must NOT go back to the SQL page: that is what made it disappear when
-	// the panel was turned off, and #1549 removes that page entirely.
-	if strings.Contains(jsFunctionBody(t, js, "renderSQL"), "duckdbCard(") {
-		t.Error("renderSQL mounts duckdbCard again; the sql capability would gate a download that does not need it")
+	// And it must not go back to the SQL page, which #1549 removed entirely.
+	// Asserted as the page's ABSENCE rather than as "renderSQL does not mount
+	// the card": jsFunctionBody fatals on a function it cannot find, so the
+	// body form would fail for the wrong reason today and would only start
+	// checking anything again if the page came back.
+	if strings.Contains(js, "function renderSQL(") {
+		t.Error("renderSQL is back in app.js; the SQL page was removed in #1549, and it is what gated this card behind the sql capability")
 	}
 }
 

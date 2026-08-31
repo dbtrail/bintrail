@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/dbtrail/dbtrail/ext"
@@ -184,12 +183,6 @@ type Config struct {
 	// link release artifacts (the .mcpb bundle) matching the running binary.
 	// Optional; empty reads as an unversioned build.
 	Version string
-	// SQLPanel enables the sandboxed server-side SQL panel (#1177): POST
-	// /api/sql runs free-form DuckDB SELECTs over the selected server's
-	// archive/baseline Parquet inside a locked-down session (see sqlpanel.go
-	// for the layered posture). Off by default; the callers wire it from
-	// BINTRAIL_CONSOLE_SQL_PANEL=1, mirroring the baseline-trigger opt-in.
-	SQLPanel bool
 	// FlashbackListen is the address the embedded MySQL-protocol time-travel
 	// port (#996) is bound on, reported by GET /api/flashback so the Connect
 	// page can show how to reach it (#1446). Set ONLY by `bintrail-console
@@ -334,11 +327,6 @@ type Server struct {
 	// data-profile enforcement (#1075). Inert in OSS (no session ever carries a
 	// profile); populated lazily on the first profiled request.
 	sessionProfiles *profileRuleCache
-	// sqlPanel: the SQL panel opt-in (Config.SQLPanel); sqlPanelBusy is its
-	// one-query-in-flight latch (zero value ready, so struct-literal test
-	// servers need no initialization).
-	sqlPanel     bool
-	sqlPanelBusy atomic.Bool
 	// flashbackListen: the embedded time-travel port's bind address
 	// (Config.FlashbackListen); empty = the port is off (or this is serve).
 	flashbackListen string
@@ -519,7 +507,6 @@ func New(cfg Config) (*Server, error) {
 		tlsConf:                 tlsConf,
 		mcpTokenPath:            mcpTokenPath,
 		sessionProfiles:         newProfileRuleCache(),
-		sqlPanel:                cfg.SQLPanel,
 		flashbackListen:         cfg.FlashbackListen,
 		archiveFetcher:          parquetquery.Fetch,
 		capacityProbe:           doctor.ProbeCapacity,
@@ -626,7 +613,6 @@ func (s *Server) buildHandler() http.Handler {
 	// The sandboxed SQL panel (#1177). Registered unconditionally so the
 	// route's refusal (403 with the opt-in hint) is actionable; the real gate
 	// is inside the handler, like the monitor/baseline-trigger verbs.
-	api.HandleFunc("POST /api/sql", s.recordAction("sql", s.handleSQLPanel))
 	api.HandleFunc("GET /api/storage", s.handleStorageInfo)
 	api.HandleFunc("GET /api/profiles", s.handleProfiles)
 	// Access profiles (#1445): author the flags, profiles and rules that a

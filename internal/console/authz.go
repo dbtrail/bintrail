@@ -78,7 +78,6 @@ var apiRoutePerms = []routePerm{
 	// The SQL panel reads the same indexed row data the events surface does —
 	// free-form, so it is tiered with query execution, and its own handler
 	// additionally refuses profiled sessions (redaction cannot reach it).
-	{"POST", "/api/sql", ext.PermQueryExecute},
 
 	// Recovery (reversal-SQL generation; never executes).
 	{"POST", "/api/recover", ext.PermRecoverExecute},

@@ -679,262 +679,27 @@ settings), so it runs under rules the tests pin:
 An index created before the RBAC tables existed answers `422` here: the
 console cannot create tables on an index.
 
-### The SQL panel
+### The SQL panel (removed)
 
-The **Download a DuckDB schema** card above hands you a file to run in your *own* DuckDB.
-The **SQL panel** is the other half of that trade: a query box that runs the SQL
-**inside the console daemon** and returns the rows, so you never leave the
-browser. It is **on by default** on `serve` and `watch` alike, and it appears as
-a **SQL** item in the sidebar for any server that has an archive or baseline
-layout to query. To hide it, set `BINTRAIL_CONSOLE_SQL_PANEL=0`. It hides on
-anything that is not a clear yes: `0` and `false` turn it off, and so does a
-value the daemon cannot read either way (`off`, `no`, a typo), which is logged
-with the values that work. Only an unset or empty variable, or a clear true,
-leaves the page on, so a mistyped opt-out can never leave it open.
+The console used to serve a **SQL** page: a read-only `SELECT` box answered by
+DuckDB inside the daemon, over the selected server's Parquet. It was removed in
+0.75.0, together with `POST /api/sql`.
 
-The SQL runs server-side, so the page keeps every guard below: it sits behind
-console sign-in like the rest of the console, it is refused outright while an
-access-control profile is active, and it answers one `SELECT` at a time in a
-sandboxed DuckDB session that can read nothing but the selected server's
-archive and backup folders. It serves what the console already serves, in
-another shape. (Earlier versions defaulted it off and let the bundled compose
-file turn it on. The default moved into the binary so that upgrading the
-images delivers it; a compose file that still sets
-`BINTRAIL_CONSOLE_SQL_PANEL` keeps deciding for that stack.)
+Two reasons. It executed SQL in the same process that captures, which is why it
+needed a sandbox, a statement gate, two timeout budgets and a single-query
+latch. And it was not usable on a real archive: defining the `events` view
+opens one Parquet footer per archived file before returning a row, measured at
+114.2s over 1886 files, against a 30s setup budget. `SHOW TABLES` — the only
+way to learn the derived `state_*` names — built the whole catalog and hit that
+budget, and the page's own example named `events`.
 
-Every panel session runs in UTC, which is what bintrail stores, so `event_timestamp`
-prints and groups by the instant the change was captured whatever timezone the
-daemon's machine is set to. You do not need to set it, and cannot: the panel
-takes one `SELECT` and refuses every other statement, `SET` included.
+Query the same Parquet in your own DuckDB instead. **Download a DuckDB schema**
+on the **Connect** page writes a `views.sql` over the same files, with no row
+cap, no time limit and nothing running in the daemon. See
+[Query in DuckDB](https://www.dbtrail.com/docs/guides/query-in-duckdb/).
 
-What you can query is exactly what the `views.sql` schema defines: an `events`
-view across every archive source, plus one `state_<schema>_<table>` view per
-table in the newest baseline snapshot. Type a `SELECT`, press **Run** (or
-`⌘/Ctrl+Enter`), and the results come back in a capped table. A long query is
-**cancelable** — the **Cancel** button aborts it and interrupts the query in the
-daemon; closing the tab or navigating away does the same.
-
-The result line reports two numbers: the whole wait, and how much of it the
-statement itself took. The difference between them is the session the daemon
-builds for your query, which opens the Parquet files that query reads. On a
-layout kept in S3 that is a network round trip per file, so a large total with a
-small query time points at the layout rather than at the SQL. Only the views
-your statement names are built, so a query over one `state_<schema>_<table>`
-view does not pay for the rest of the snapshot, and a query over neither view
-(`SELECT 1`) pays for nothing. Two statements do pay for the whole layout: a
-catalog listing (`SHOW TABLES`), which has to list what is really there, and a
-statement naming a view that does not exist, so the engine can still tell you
-which name you meant. A statement that fails reports its wait too.
-
-The panel is deliberately constrained, and every constraint is enforced
-server-side (the UI only mirrors it):
-
-- **Read-only.** Only a single `SELECT` runs. Writes, `COPY`, `ATTACH`,
-  `INSTALL`, `CREATE SECRET`, `SET`, and multi-statement input are refused —
-  classified by DuckDB's own parser, not a text filter.
-- **Views only.** Query the pre-built `events` and `state_<schema>_<table>`
-  views. The `FROM` clause accepts those views (and a few pure generators like
-  `range`) and nothing else: every file reader (`read_parquet`, `read_csv`,
-  `FROM '…/file.parquet'`, …) and every dynamic-SQL function (`query`,
-  `query_table`, …) is refused by an allowlist that fails closed. So the views —
-  which omit the paid forensics columns, exactly as the rest of the console
-  does — are the one data path.
-- **Filesystem-sandboxed.** Under the views, the DuckDB session may touch *only*
-  the resolved archive/baseline roots for the selected server (local paths and
-  `s3://` prefixes alike); everything else — other buckets, arbitrary URLs,
-  local files outside the roots — is denied, and the sandbox configuration is
-  locked so no query can widen it.
-- **Bounded.** Conservative memory/thread budget (never the `--ultrafast`
-  profile — the daemon may also be capturing your stream), a hard 60-second
-  query timeout, a result-row cap matching the events API, and **one query at a
-  time** per process (a second concurrent request gets `429`).
-- **Access-control aware.** Refused outright while a data profile is active:
-  free-form SQL reads the unredacted Parquet directly and cannot honor
-  per-column redaction, so the whole surface is withheld (the same stance the
-  `views.sql` download takes).
-- **Audited.** Every statement that reaches the engine is recorded on the audit
-  seam (`console` / `sql.run`) with the SQL text, its outcome (`ok` / `refused` /
-  `error`) and row count — including one the read-only gate refuses. Only a
-  statement the client aborts mid-flight is not recorded.
-
-No AWS credentials are ever exposed to the query; S3 reads use the daemon's
-ambient credential chain, scoped to the allowed prefixes.
-
-#### Creating a baseline from the console
-
-By default the console only *lists* baselines — you produce them with the
-`bintrail dump` → `bintrail baseline` CLI (or the compose `baseline` profile).
-A **Create baseline** button can run that pipeline for a monitored server
-straight from the **Protect → Baselines** page, and it only runs on the `watch` daemon:
-
-- A bare `watch` invocation (no compose) has this **opt-in** and off by
-  default — start it with `BINTRAIL_CONSOLE_BASELINE_TRIGGER=1`. The bundled
-  compose stack flips this to **on by default**; set `BASELINE_TRIGGER=0` in
-  `.env` to opt out there.
-- The server must have **both** a source DSN and a baseline destination
-  (`baseline_dir` or `baseline_s3`) configured; the button 400s otherwise.
-- Clicking it runs **dump → convert → upload entirely in-process**: the console
-  image bundles `mydumper` and runs it as a **local subprocess** — it never
-  mounts the docker socket, so a console compromise can never escalate to
-  host-root. The source DSN stays inside the process (never written to disk or
-  any HTTP response). One baseline at a time per server (409 while one runs).
-- For an `s3://` destination the dump is staged under
-  `BINTRAIL_CONSOLE_BASELINE_STAGING` (default a temp dir), uploaded, then
-  discarded; for a local `baseline_dir` it is written there. Region and
-  credentials come from the daemon's ambient AWS chain, like every other S3
-  access. When it finishes the new snapshot appears in the listing.
-- **For MySQL/MariaDB sources, this button's dump IS point-consistent across
-  tables by default** (`--sync-thread-lock-mode FTWRL`), which needs `RELOAD`
-  (or `FLUSH_TABLES`) plus `BACKUP_ADMIN` on MySQL/Percona 8.0+. The daemon
-  checks those privileges before launching mydumper and refuses with an
-  actionable error if any are missing — it never silently falls back to a
-  weaker mode. On managed MySQL such as RDS, `BACKUP_ADMIN` cannot be
-  granted at all, so use `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE=lock-all` — equally
-  point-consistent, needs only `LOCK TABLES`. Or `=safe-no-lock` to dump
-  without any of them (it aborts rather than write a snapshot stitched from several
-  instants, so expect it to refuse on a write-active source) or `=no-lock` to
-  accept such a snapshot; only under `no-lock` does the daemon log a warning
-  when a dump spans more than one table. See
-  [Cross-table consistency](dump-and-baseline.md#cross-table-consistency).
-- Like the Create-baseline button, this only runs on the `watch` daemon; a
-  bare invocation needs `BINTRAIL_CONSOLE_VERIFY_TRIGGER=1`, while the bundled
-  compose stack enables it **by default** (`VERIFY_TRIGGER=0` in `.env` opts
-  out). Unlike baseline creation it starts no subprocess and, in its default
-  mode, reads no live source — the same in-process baseline/index reads the
-  console already does for Time-travel — so it skips the opt-in-then-flip
-  cycle baseline-trigger went through.
-- **Baseline-anchored** (the default) compares the two most recent baseline
-  snapshots, drift-free — no live source read. It needs a baseline
-  destination configured (same precondition as Time-travel) and at least two
-  snapshots; with only one, the run reports a benign "nothing to compare yet"
-  note rather than an error.
-- **Live-source** reconstructs each table to a consistent snapshot of the
-  actual source and compares — it needs the server's source DSN and reads the
-  *whole table* off production, so the panel warns to run it off-peak (see
-  [verify.md](verify.md)'s own warning). It only appears in the mode selector
-  when the server has a source DSN configured.
-- Per-table results are colored match / mismatch / inconclusive / error, the
-  same four outcomes `bintrail verify` reports — except that a recover-inputs
-  inconclusive whose kind is benign (`no-activity` / `nothing-to-assert`)
-  renders as a neutral grey note instead of amber, and the summary splits
-  those out as "nothing to check". A mismatch found by a
-  baseline-anchored run gets an **Explain** button — an on-demand,
-  never-precomputed row-level drill-down (`--explain`'s console equivalent),
-  re-run only when clicked. Live-source mismatches have no explain support
-  (mirroring the CLI). Because it REBUILDS the table to diff it, the work
-  runs on the daemon and the console polls for it — minutes on a large
-  table — behind a busy dialog that says so. Closing that dialog only stops
-  the waiting: the drill-down keeps computing, and reopening **Explain**
-  picks up the finished result if it is still held. It is not held
-  indefinitely: the first reopen consumes it, and a finished result may be
-  dropped to make room once many tables have been explained — in both cases
-  reopening simply recomputes, and nothing is lost but the wait. A new verify
-  run is different: it discards (and cancels) the previous run's drill-downs,
-  because each explains the snapshot pair its own run compared, and Explain
-  reports no explainable mismatch until a *baseline-anchored* run reports the
-  table as a mismatch again — a live-source or check-recovery-inputs run
-  clears the drill-downs without being able to replace them. Failures are
-  logged by the daemon whether or not anyone is still polling.
-- **Check recovery inputs** is the console face of
-  [`bintrail verify --check recover`](verify.md): index-only — no baseline
-  and no source read — walking each primary key's event chain over the last
-  30 days. It is the one mode that works on a server with no baseline
-  location configured.
-- One run at a time per server (409 while one is in flight). The live,
-  pollable result is in-memory, but every finished run also lands in a
-  persisted **run history** (`console-verify-history.json` next to the server
-  registry file, last 20 runs per server, served at
-  `GET /api/servers/{id}/verify/history`) — the panel shows "last verified"
-  and the recent trend from it across restarts.
-- Verify's baseline/live-source reads carry no RBAC redaction (like Time-travel's),
-  so the panel and its endpoints are unavailable whenever an RBAC profile
-  (`--profile`) is active.
-
-**Scheduled verification** runs the same engine on a timer, so backups
-re-prove themselves without external cron glue: start the daemon with
-`--verify-interval 24h` (or `BINTRAIL_CONSOLE_VERIFY_INTERVAL`) and every
-cycle verifies each registry server, sequentially — baseline-anchored where a
-baseline location is configured (the server's own, or the process-wide
-`--baseline-dir`/`--baseline-s3`), the index-only recovery-inputs check
-otherwise, so no server is silently skipped. `--verify-tables a.b,c.d`
-narrows every scheduled run to those tables. Setting an interval implies the
-Verification panel (no separate `BINTRAIL_CONSOLE_VERIFY_TRIGGER` needed),
-and one cycle also runs shortly after startup. Every outcome — including
-cycles skipped because a run was already in flight — lands in the run
-history above. The schedule covers **registry servers** (added from the
-console UI); a source configured only through command-line flags/env is not
-in the registry and is not covered — the daemon warns every cycle it finds
-nothing to verify.
-
-#### Webhook notifications
-
-`--notify-webhook <url>` (or `BINTRAIL_CONSOLE_NOTIFY_WEBHOOK`) makes the
-`watch` daemon POST a small JSON payload when something means "your safety
-net has a hole", so the operator hears about it instead of discovering it at
-restore time:
-
-- `continuity_gap_lost` (**critical**) — a stream stamped `gap_lost`: events
-  in the gap are permanently unrecoverable. Checked every few minutes for the
-  command-line index **and** every registry server.
-- `verify_problem` — a verify run (manual or scheduled) found mismatches
-  (**critical**) or errors / failed to run (**warning**).
-- `rotation_unhealthy` (**warning**) — a built-in rotation cycle failed or
-  kept deferring unarchived partitions; either way the index is not
-  shrinking when it should.
-- `baseline_stale` (**critical**) — a table's newest baseline predates the
-  oldest available delta coverage: full-table restore through the missing
-  window is impossible until a fresh baseline is taken. Checked hourly for
-  every server with a baseline location configured.
-
-The payload is `{event, severity, server, summary, details, timestamp}` —
-generic JSON, no per-vendor adapters: Slack, PagerDuty, ntfy etc. all accept
-it through their inbound-webhook integrations. Notifications are
-**edge-triggered**: one POST on the transition into a bad state, a reminder
-at most every 24 h while it persists (for verify problems: on the next run
-that still finds them), and one `resolved: true` event (severity
-`info`) on recovery. Delivery is best-effort — bounded retries off the hot
-path, never blocking capture. A dead or wrong endpoint surfaces as
-rate-limited log warnings, and an event that could not be delivered is not
-re-queued: the next 24 h edge repeat re-sends a still-active condition. Edge
-state is in-memory — after a daemon restart a still-active condition
-re-fires (loud side errs safe), but a recovery that happened *across* the
-restart produces no `resolved` event. The same three conditions are also
-exported as Prometheus gauges under `--metrics-addr`
-(`bintrail_continuity_*` / `bintrail_verify_*` / `bintrail_rotation_*`) —
-see the metrics tables and example alert rules in
-[observability.md](observability.md).
-
-- **AWS credentials** — which ambient credential signals the daemon process
-  can see: env keys (presence only, never values), `AWS_PROFILE`,
-  `AWS_REGION`, a shared `~/.aws` config, ECS task-role / EKS IRSA markers.
-  **The console never stores AWS keys.** S3 *uploads* and archived-event
-  *reads* use the AWS default credential chain of the daemon (environment,
-  shared profile incl. SSO, or an IAM role; EC2/ECS/EKS roles work even when
-  nothing shows as set, since instance roles are not detectable without a
-  metadata call: an IAM role can be active with every signal on the card
-  reading as unset). Baseline listings/reads from `s3://` ride DuckDB httpfs with
-  AWS-SDK-chain credentials via the `aws` extension's `credential_chain`
-  secret (set up automatically; SSO-session profiles have known upstream
-  gaps, and hosts where the extension cannot install fall back to static
-  environment keys).
-
-## Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `--index-dsn` | — | DSN for the index MySQL database. Becomes the ephemeral `default` entry. Required only when the server registry is empty. |
-| `--listen` | `127.0.0.1:8090` | Bind address. `:8090` avoids the MCP server's `:8080`. |
-| `--token` | — (none) | Opt-in static token for API automation. **Never generated** — humans sign in with the console password. One of the credentials that makes a non-loopback bind legal. |
-| `--no-archive` | `false` | Disable Parquet archive auto-discovery (MySQL-only results). Also **disables Time-travel** — reconstruct needs archive access to verify coverage. |
-| `--profile` | — | RBAC profile: deny tables / redact columns. Forces `--no-archive` and **disables Time-travel** (baseline reads bypass redaction). |
-| `--allowed-hosts` | — | Extra hostnames accepted in the `Host` header (for reverse-proxy setups). IP literals and `localhost` are always allowed. |
-| `--baseline-dir` | — | Local directory of baseline Parquet snapshots. Enables the Time-travel (reconstruct) surface. |
-| `--baseline-s3` | — | S3 prefix of baseline snapshots (`s3://bucket/prefix/`). Enables Time-travel. |
-| `--servers-file` | `~/.config/bintrail/console-servers.yaml` | Path to the server registry YAML managed from the UI. |
-| `--auth-file` | `~/.config/bintrail/console-auth.yaml` | Console credential file enabling password login (see below). Created with `bintrail-console user set-password`, never by the server on its own. |
-| `--mcp-token-file` | `~/.config/bintrail/console-mcp-token.yaml` | Managed MCP token file (SHA-256 hash only), written by **Settings → Connect AI**. Point it at persistent storage when the console runs in a container, or a restart revokes the token. |
-| `--tls-cert` / `--tls-key` | — | Serve the console over HTTPS (PEM files, both-or-neither). Rotation = restart; no ACME. |
-| `--allow-setup` | `false` | Allow browser first-run password setup on a non-loopback bind (assert the bind is access-controlled, e.g. host-loopback published). Loopback always allows setup. |
+`BINTRAIL_CONSOLE_SQL_PANEL` is still read for one release and warns that it no
+longer does anything. Remove it.
 
 ### Environment variables
 
@@ -949,16 +714,10 @@ see the metrics tables and example alert rules in
 - `BINTRAIL_CONSOLE_TLS_CERT` / `BINTRAIL_CONSOLE_TLS_KEY` — same as `--tls-cert` / `--tls-key`.
 - `BINTRAIL_CONSOLE_ALLOWED_HOSTS` — comma-separated, same as `--allowed-hosts`.
 - `BINTRAIL_CONSOLE_ALLOW_SETUP` — `1`/`true`, same as `--allow-setup`.
-- `BINTRAIL_CONSOLE_SQL_PANEL` — `0`/`false` hides the **SQL** page: a
-  server-side, read-only SQL query box over the selected server's Parquet (see
-  [The SQL panel](#the-sql-panel)). On by default on both `serve` and `watch`,
-  and it fails closed: a value that is neither a clear true nor a clear false
-  (`off`, `no`, a typo) hides the page and logs the values that work, so a
-  mistyped opt-out never leaves the page open.
-  Unlike the `views.sql` download, this executes SQL **inside the daemon**, so
-  it runs in a locked-down DuckDB sandbox: read
-  [The SQL panel](#the-sql-panel) before exposing the console on a shared or
-  public bind.
+- `BINTRAIL_CONSOLE_SQL_PANEL` — retired. The SQL page and `POST /api/sql` were
+  removed in 0.75.0 (see [The SQL panel (removed)](#the-sql-panel-removed)). The
+  variable is still read for one release and warns that it does nothing; a later
+  release stops reading it.
 - `BINTRAIL_CONSOLE_ARCHIVE_STAGING` (`watch` only) — local staging dir for the
   Archive-to-S3 feature, same as `--archive-staging-dir`. AWS credentials for
   the upload come from the ambient chain (`AWS_*` / `~/.aws` / role).
@@ -1463,7 +1222,6 @@ All endpoints return JSON except `GET /api/views.sql`, which serves a SQL file. 
 | `PUT /api/rotation` | Supervisor only (403 on the standalone console): save a global rotation override `{retain, interval, add_future}` (validated; `off` rejected). Applies live on the next cycle. |
 | `GET /api/baselines` | Read-only listing of the **selected server's** baseline snapshots, grouped per snapshot: `{configured, source, kind, reconstruct, snapshots: [{time, age_hours, tables, binlog_file, binlog_pos, gtid_set}]}` (coordinates local-only, capped at 50 snapshots). `502` when the configured source is unreadable. |
 | `GET /api/views.sql` | **Not JSON** — a `text/plain` DuckDB schema over the selected server's Parquet (the same output as `bintrail views`), served as a `views.sql` attachment. Nothing is executed here; the file runs in your own DuckDB. `?include_events=1` adds the `events` view over the archived change log, which is left out by default because defining it opens one Parquet footer per archived file (`bintrail views --include-events`). `?include_live=1` adds the leg over the live index (`bintrail views --include-live`), with the index host, port, database and user in the file and never its password; it requires `include_events=1`, since the leg hangs on that view, and 400s without it. 404 when archives are disabled or nothing is archived yet, 403 while an access-control profile is active, 422 when this server cannot carry the live leg (an index reached over a unix socket, or one with no `binlog_events` table), 502 when the index could not be asked, and 400 for an `include_live` or `include_events` value other than `1`/`true`/`0`/`false` (so a request that meant to ask never comes back as an archives-only file). |
-| `POST /api/sql` | Runs a read-only `SELECT` over the selected server's Parquet **inside the daemon**, in a locked-down DuckDB sandbox, returning `{columns, rows, row_count, truncated, elapsed_ms, query_ms}` (`elapsed_ms` is the whole request, `query_ms` the statement's share of it; a request that got as far as resolving the layout carries `elapsed_ms` beside `error` when it fails, so a refusal reports its wait too) plus an optional `warnings` list (present when the session is missing the `events` view because `archive_state` could not be read, or when a baseline file this statement reads carries no column types; a failed statement carries the registry note after the engine message). Warnings describe the session that answered, so a statement that builds no view carries none. On by default; `403` when `BINTRAIL_CONSOLE_SQL_PANEL=0` hides the page. `403` while a profile is active; `404` when archives are disabled or there is nothing to query; `422` for a non-`SELECT`, a statement error, or the timeout; `429` when another query is already running. Cancellation is by aborting the request. See [The SQL panel](#the-sql-panel). |
 | `GET /api/storage` | Process-global storage context: `{aws: {access_key_env, profile, region_env, shared_config, container_creds, web_identity}}` — presence booleans and non-secret names only, never credential values. |
 | `GET /api/flashback` | Process-global: the embedded time-travel SQL port (`watch --flashback-listen`): `{enabled, listen, host, port}`. `enabled: false` alone on the standalone console and on a daemon that did not open the port; `host` is empty on a wildcard bind (the UI then uses the name it was opened with). Never the console token that authenticates the port. Backs the **Connect a SQL client** panel on Settings → Connect AI. |
 | `GET /api/profiles` | RBAC data-profile **names** defined on the selected server's index: `{"profiles": ["..."]}`, sorted; empty on a legacy index without the table. Vocabulary for administration panels (e.g. a settings-surface profile picker) — never the rules or flagged tables/columns behind a name. |

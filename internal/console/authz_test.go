@@ -30,7 +30,6 @@ var registeredAPIPatterns = []struct{ method, pattern string }{
 	{"POST", "/api/recover-cascade"},
 	{"GET", "/api/capabilities"},
 	{"GET", "/api/reconstruct"},
-	{"POST", "/api/sql"},
 	{"GET", "/api/baselines"},
 	{"GET", "/api/baselines/files"},
 	{"GET", "/api/baselines/download"},

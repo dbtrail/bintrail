@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **The console's SQL page and `POST /api/sql`** (#1549). The page answered
+  free-form `SELECT`s with DuckDB running inside the daemon, which is why it
+  needed a sandbox, a statement gate, a table-function allowlist, a
+  forensics-column filter, two timeout budgets and a single-query latch. The
+  download it sat next to needs none of that: it hands you a schema over files
+  you already own and executes nothing.
+
+  It was also not usable on a real archive. Defining the `events` view opens one
+  Parquet footer per archived file before returning a row (`union_by_name` is
+  load-bearing for correctness, so the read cannot be skipped) — 114.2s over
+  1886 files, against a 30s setup budget. `SHOW TABLES`, the only way to learn
+  the derived `state_*` names, built the whole catalog and hit that budget; and
+  the page's one on-screen example named `events`, so it failed the same way.
+  The page could not answer its own example, and the way out of that was the
+  query that timed out.
+
+  Query the same Parquet in your own DuckDB instead: **Download a DuckDB
+  schema** on **Connect** writes a `views.sql` over the same files, with no row
+  cap and no time limit. `BINTRAIL_CONSOLE_SQL_PANEL` is still read for one
+  release and warns that it no longer does anything; a later release stops
+  reading it. `GET /api/views.sql` is unaffected.
+
 ### Changed
 - **The Download a DuckDB schema card moved from the SQL page to Connect**
   (#1549). `GET /api/views.sql` requires `settings:read`, but its only route in

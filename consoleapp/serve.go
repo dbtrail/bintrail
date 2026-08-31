@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -85,6 +84,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// this standalone binary loads it here, then reads the relevant vars below
 	// with flag > env > default precedence.
 	cli.LoadEnvFile()
+	// After the env file, not before: the retired variable is as likely to sit
+	// in .bintrail.env as in the environment, and warning before the load would
+	// stay silent for the operator whose copy is in the file.
+	warnSQLPanelRetired()
 
 	// index-dsn falls back to BINTRAIL_INDEX_DSN, the one shared binding the
 	// console uses (core bintrail wires this via bindCommandEnv/cli.EnvBindings).
@@ -241,7 +244,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		Registry:      registry,
 		Listen:        conListen,
 		Token:         conToken,
-		SQLPanel:      sqlPanelEnabled(),
+
 		NoArchive:     conNoArchive || conProfile != "",
 		DenyTables:    denyTables,
 		RedactColumns: redactCols,
@@ -290,49 +293,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 // the console's mode. The URL never carries a ?token= unless an explicit token
 // is the only credential (URL() handles that); a live credential does not
 // belong in logs or shell history.
-// sqlPanelEnabled resolves the SQL page's state (#1177). Env-only, ON by
-// default, and shared by serve and watch.
-//
-// The default lives here rather than in the bundled docker-compose.yml
-// (#1529). It used to be the other way round: the binary defaulted off and the
-// compose file turned it on. The compose file belongs to the operator and is
-// downloaded once, so pulling a newer image delivered the page to nobody, and
-// the product decision "this is on" sat in a file we cannot update.
-//
-// On by default is defensible because the page's other layers do not move
-// (internal/console/sqlpanel.go): POST /api/sql is behind console auth, carries
-// PermQueryExecute, is refused outright while an access-control profile is
-// active, answers SELECT only inside a sandboxed DuckDB session with no
-// filesystem access outside the resolved archive and baseline roots, and never
-// serves the paid forensics columns. It reads what the console already serves.
-//
-// The availability side, which those layers do not cover: under `watch` this
-// process is also the capture plane, so a panel query competes with capture for
-// the daemon's memory and CPU. What bounds it is the same for every install:
-// one query at a time per process, the conservative DuckDB budget (never
-// ultrafast), a hard timeout, and an authenticated caller. Turning the page on
-// by default extends that from the bundled stack to every bare `watch`, which
-// is the trade this default makes.
-//
-// It fails CLOSED, and NOT through envBoolOr. The variable is an opt-OUT now:
-// an operator types it when they want the page gone, and strconv.ParseBool
-// rejects "off", "no" and "disabled". Reading those as ON would keep a
-// server-side SQL surface open for someone who believes they closed it, with a
-// log line as the only signal. Under the old opt-in body every one of those
-// spellings meant off, so this keeps the direction that was already true.
-func sqlPanelEnabled() bool {
-	raw := strings.TrimSpace(os.Getenv("BINTRAIL_CONSOLE_SQL_PANEL"))
-	if raw == "" {
-		return true
-	}
-	v, err := strconv.ParseBool(raw)
-	if err != nil {
-		slog.Warn("BINTRAIL_CONSOLE_SQL_PANEL is not a true or false value, so the SQL page is hidden. Use 1 or 0",
-			"value", raw)
-		return false
-	}
-	return v
-}
 
 func printConsoleBanner(srv *console.Server, headline string) {
 	fmt.Fprintf(os.Stderr, "\n%s\n\n    %s\n\n", headline, srv.URL())
@@ -368,3 +328,22 @@ func (serveTelemetry) Enabled() bool                              { return tel.C
 func (serveTelemetry) Decision() telemetry.Decision               { return tel.Client().Decision() }
 func (serveTelemetry) SetRuntimeConsent(enabled bool)             { tel.Client().SetRuntimeConsent(enabled) }
 func (serveTelemetry) RecordDaemonCommand(string) *telemetry.Span { return nil }
+
+// warnSQLPanelRetired reports BINTRAIL_CONSOLE_SQL_PANEL as accepted and
+// ignored. The page and POST /api/sql were removed in #1549; the variable is
+// kept readable for one release so an operator who set it learns that it no
+// longer does anything, instead of the setting silently becoming a no-op.
+//
+// The warning fires for ANY non-empty value, including "0". Someone who typed
+// 0 asked for the page to be hidden and got that outcome, so it is not a fault
+// — but it is the same stale line in a compose file or a unit, and leaving it
+// unmentioned is what makes it survive to the release that stops reading it.
+func warnSQLPanelRetired() {
+	if strings.TrimSpace(os.Getenv("BINTRAIL_CONSOLE_SQL_PANEL")) == "" {
+		return
+	}
+	slog.Warn("BINTRAIL_CONSOLE_SQL_PANEL is set but no longer does anything: " +
+		"the console SQL page and POST /api/sql were removed. Download a DuckDB schema " +
+		"from the Connect page and query the same Parquet in your own DuckDB. " +
+		"Remove the variable; a future release stops reading it")
+}

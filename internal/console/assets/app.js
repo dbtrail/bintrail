@@ -882,11 +882,13 @@ function navigate(route, params, push = true) {
   // snapshot listing and the verification runner). Same treatment, so a
   // bookmark to either lands on Overview rather than an empty page.
   if ((route === "baselines" || route === "verification") && !capsCache.monitor) route = "overview";
-  // The SQL panel is on unless BINTRAIL_CONSOLE_SQL_PANEL turns it off (0,
-  // false, or any value the daemon cannot read as true or false, which fails
-  // closed), and per-server gated (a server with no archive or baseline
-  // layout to query has no page).
-  if (route === "sql" && !capsCache.sql) route = "overview";
+  // The SQL page was removed (#1549). Rewritten to Connect rather than to
+  // Overview, and rewritten rather than aliased, for the same reasons /storage
+  // is: the address bar stops naming a page that no longer exists, and the
+  // reader who bookmarked it wanted SQL over this Parquet — Connect is where
+  // the schema for their own DuckDB now lives, which Overview would not tell
+  // them.
+  if (route === "sql") { route = "connect"; history.replaceState({}, "", "/connect"); }
   const qs = params && Object.keys(params).length
     ? "?" + new URLSearchParams(params).toString() : "";
   if (push) history.pushState({ route }, "", "/" + route + qs);
@@ -896,11 +898,8 @@ function navigate(route, params, push = true) {
 function renderRoute() {
   // The date-picker popover lives in document.body (position:fixed), outside
   // the #view subtree route changes normally clear — there's no per-view
-  // teardown hook in this codebase to hang that cleanup on otherwise. An
-  // in-flight SQL panel query is abandoned here for the same reason: leaving
-  // the page must release the daemon's single-query latch.
+  // teardown hook in this codebase to hang that cleanup on otherwise.
   closeDatePicker();
-  abortSQLRun();
   // Route-level staleness: the full-view async renderers (overview / status /
   // storage) fetch before painting, so navigating away while their fetches are
   // in flight would let the OLD view's completion clear and repaint over the
@@ -928,7 +927,6 @@ function renderRoute() {
     case "schema-changes": return renderSchemaChanges(params);
     case "timetravel": return renderTimetravel(params);
     case "recover": return renderRecover(params);
-    case "sql": return renderSQL();
     case "status": return renderStatus();
     case "retention": return renderRetention();
     case "daemon": return renderDaemon();
@@ -4263,151 +4261,6 @@ function duckdbCard() {
   return card;
 }
 
-// ── SQL panel (#1177) ────────────────────────────────────────────────────────
-//
-// Free-form DuckDB SELECTs over this server's archived Parquet, executed
-// server-side in a locked-down sandbox (see internal/console/sqlpanel.go). The
-// panel is opt-in and per-server gated; navigate() already redirected here only
-// when capsCache.sql is true. The Cancel button IS the cancellation mechanism:
-// it aborts the fetch, which kills the request context, which interrupts the
-// DuckDB query — there is no server-side cancel endpoint to call.
-
-let sqlRunController = null; // AbortController for the in-flight query, if any
-
-// abortSQLRun cancels an in-flight SQL panel query. Called on navigation away
-// and on server switch so a long query never keeps holding the daemon's
-// single-in-flight latch after the operator has left the page (they would come
-// back to a 429 with no running query to cancel). Safe to call when idle.
-function abortSQLRun() { if (sqlRunController) sqlRunController.abort(); }
-
-async function renderSQL() {
-  if (!capsCache.sql) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
-  const v = VIEW();
-  clear(v);
-  v.append(pageHead("SQL", null));
-
-  const card = el("div", { class: "card" });
-  card.append(el("p", { class: "form-hint", text:
-    "Run a read-only SQL query over this server's archived Parquet: an \"events\" view across every archive source, " +
-    "plus one \"state_<schema>_<table>\" view per table in the newest backup. Only SELECT runs; results are capped." }));
-
-  const input = el("textarea", {
-    class: "sql-input", id: "sql-input", spellcheck: "false", rows: "6",
-    placeholder: "SELECT event_type, schema_name, table_name FROM events ORDER BY commit_time DESC LIMIT 100",
-  });
-  card.append(input);
-
-  const runBtn = el("button", { class: "btn btn-primary btn-sm", type: "button", text: "Run" });
-  const cancelBtn = el("button", { class: "btn btn-sm", type: "button", text: "Cancel", hidden: true });
-  const statusLine = el("span", { class: "sql-status", id: "sql-status" });
-  card.append(el("div", { class: "sql-actions" }, runBtn, cancelBtn, statusLine));
-  v.append(card);
-
-  const results = el("div", { id: "sql-results" });
-  v.append(results);
-  // The card itself moved to Connect (#1549) so it stops being gated by a
-  // capability and a permission that are not its own. A line, not a second
-  // card: someone querying here is the likeliest person to want the same
-  // views in their own DuckDB, and they should not have to find out that the
-  // page exists.
-  if (capsCache.views) {
-    const p = el("p", { class: "form-hint", style: "margin-top:18px" },
-      el("span", { text: "Want these views in your own DuckDB? Download the schema on " }));
-    p.append(el("a", { href: "/connect", text: "Connect",
-      onclick: (e) => { e.preventDefault(); navigate("connect"); } }));
-    p.append(el("span", { text: "." }));
-    v.append(p);
-  }
-  viewEnter();
-
-  const run = () => runSQL(input.value, { runBtn, cancelBtn, statusLine, results });
-  runBtn.onclick = run;
-  cancelBtn.onclick = () => { if (sqlRunController) sqlRunController.abort(); };
-  // Cmd/Ctrl+Enter submits from the textarea — the expected shortcut for a
-  // query box, and it keeps Enter free for newlines in a multi-line statement.
-  input.addEventListener("keydown", (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); run(); }
-  });
-  input.focus();
-}
-
-async function runSQL(sql, ui) {
-  const { runBtn, cancelBtn, statusLine, results } = ui;
-  if (!sql || !sql.trim()) { statusLine.textContent = "enter a SELECT statement"; return; }
-  const gen = serverGen;
-  sqlRunController = new AbortController();
-  runBtn.disabled = true;
-  cancelBtn.hidden = false;
-  statusLine.textContent = "running…";
-  clear(results);
-  try {
-    // Content-Type doubles as the cookie-auth CSRF marker; no Authorization
-    // header in a cookie-bootstrapped tab (TOKEN empty), same as api().
-    const headers = { "Content-Type": "application/json" };
-    if (TOKEN) headers.Authorization = "Bearer " + TOKEN;
-    if (currentServer) headers["X-Bintrail-Server"] = currentServer;
-    const res = await fetch("/api/sql", {
-      method: "POST", headers, body: JSON.stringify({ sql }), signal: sqlRunController.signal,
-    });
-    const text = await res.text();
-    if (gen !== serverGen) return; // a server switch abandoned this query
-    if (!res.ok) {
-      if (res.status === 401) { handleUnauthorized(); return; }
-      let msg = text || "HTTP " + res.status;
-      let waited = null;
-      try {
-        const j = JSON.parse(text);
-        if (j && j.error) msg = j.error;
-        // The wait counts on this path too (#1526), and this is where it is
-        // longest: a mistyped view name cannot be answered out of a narrow
-        // catalog, so the server builds every view in the layout before the
-        // engine can suggest the one the reader meant. Blanking the line here
-        // told them nothing about the slowest thing the panel does.
-        if (j && typeof j.elapsed_ms === "number") waited = j.elapsed_ms;
-      } catch (_) {}
-      statusLine.textContent = waited === null ? "" : "failed after " + waited + " ms";
-      renderError(results, new Error(msg));
-      return;
-    }
-    const data = JSON.parse(text);
-    // Both numbers, always (#1526). elapsed_ms is the whole wait, query_ms the
-    // statement's share of it; the gap between them is opening the files this
-    // query reads, which on a backup kept in S3 is a network round trip per
-    // file. One number could not say which of the two to go and look at.
-    statusLine.textContent = data.row_count + " row" + (data.row_count === 1 ? "" : "s") +
-      " in " + data.elapsed_ms + " ms total, " + data.query_ms + " ms in the query" +
-      (data.truncated ? " (truncated)" : "") +
-      ((data.warnings && data.warnings.length) ? ". " + data.warnings.join(". ") : "");
-    renderSQLResult(results, data);
-  } catch (err) {
-    if (err && err.name === "AbortError") { statusLine.textContent = "canceled"; return; }
-    if (gen !== serverGen) return;
-    statusLine.textContent = "";
-    renderError(results, err);
-  } finally {
-    sqlRunController = null;
-    runBtn.disabled = false;
-    cancelBtn.hidden = true;
-  }
-}
-
-function renderSQLResult(mount, data) {
-  clear(mount);
-  const cols = data.columns || [];
-  const rows = data.rows || [];
-  if (!rows.length) { mount.append(el("div", { class: "empty" }, el("p", { text: "No rows." }))); return; }
-  const wrap = el("div", { class: "sql-table-wrap" });
-  const table = el("table", { class: "statetable sql-table" });
-  table.append(el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", { text: c })))));
-  const tbody = el("tbody");
-  for (const r of rows) {
-    tbody.append(el("tr", {}, ...r.map((cell) => el("td", { text: valueToString(cell) }))));
-  }
-  table.append(tbody);
-  wrap.append(table);
-  mount.append(wrap);
-}
-
 function telemetryCard(t) {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Usage telemetry" }));
   if (!t || t.error) {
@@ -6543,11 +6396,12 @@ function buildConnect(servers, tokStatus, minted, fbStatus) {
   // carries no data-perm, and every endpoint it already calls (/api/mcp-token,
   // /api/flashback) requires the same settings:read.
   //
-  // And the card was mounted inside renderSQL, which the sql capability gates.
-  // Turning the panel off left `views` on with no UI route at all — punishing
-  // exactly the operator who declined server-side execution, whose file
-  // executes nothing. Appended LAST so the .cards nth-child(4n+1) tint keeps
-  // landing on the same card it does today.
+  // And the card was mounted inside the SQL page, which the `sql` capability
+  // gated. Turning that page off left `views` on with no UI route at all —
+  // punishing exactly the operator who declined server-side execution, whose
+  // file executes nothing. That page is now gone entirely, so this is the only
+  // route to the download. Appended LAST so the .cards nth-child(4n+1) tint
+  // keeps landing on the same card it does today.
   if (capsCache.views) cards.append(duckdbCard());
   v.append(cards);
   if (capsCache.mcp) v.append(otherClientsPanel(servers));
@@ -7355,11 +7209,9 @@ async function switchServer(id) {
   schemaCache = null;
   tablesCache.clear();
   // A switch is a fresh context: drop any carried undo-context and SQL so they
-  // can never be auto-applied against a different server's index, and abort any
-  // in-flight panel query (it targeted the old server, and holds its latch).
+  // can never be auto-applied against a different server's index.
   pendingRecover = null;
   lastSQL = "";
-  abortSQLRun();
   try { await gateCapabilities(); } catch (err) {
     if (err && err.status === 401) return; // chokepoint already raised the sign-in gate
     throw err;
@@ -7887,7 +7739,6 @@ function cmdkCommands() {
     { group: "Navigate", label: "Status", run: () => navigate("status") },
   ];
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
-  if (capsCache.sql) cmds.push({ group: "Navigate", label: "SQL", run: () => navigate("sql") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Backups", run: () => navigate("baselines") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Verification", run: () => navigate("verification") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Retention", run: () => navigate("retention") });

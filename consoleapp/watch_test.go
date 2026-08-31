@@ -72,28 +72,6 @@ func TestUpConsoleConfig(t *testing.T) {
 		t.Errorf("watch console config must not set NoArchive: %+v", cfg)
 	}
 
-	// The SQL page's state reaches the config — proving the wire, not just the
-	// function (deleting the SQLPanel assignment in upConsoleConfig must fail a
-	// test, and since #1529 the default is ON, the zero value it would leave
-	// behind is the wrong answer). Env-driven, so set it around these calls.
-	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "")
-	cfgSQL, err := upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"})
-	if err != nil {
-		t.Fatalf("upConsoleConfig (sql panel): %v", err)
-	}
-	if !cfgSQL.SQLPanel {
-		t.Error("the SQL page default did not reach console.Config.SQLPanel via watch")
-	}
-	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "0")
-	cfgSQL, err = upConsoleConfig(nil, "user:pass@tcp(127.0.0.1:3306)/binlog_index", consoleOpts{Listen: "127.0.0.1:8090", Token: "tok"})
-	if err != nil {
-		t.Fatalf("upConsoleConfig (sql panel off): %v", err)
-	}
-	if cfgSQL.SQLPanel {
-		t.Error("BINTRAIL_CONSOLE_SQL_PANEL=0 did not reach console.Config.SQLPanel via watch")
-	}
-	t.Setenv("BINTRAIL_CONSOLE_SQL_PANEL", "")
-
 	// The stack-drift check is wired into the same function, for the same
 	// reason: it is silent on a healthy stack, so nothing else would notice the
 	// call going missing.
