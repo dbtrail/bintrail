@@ -5,18 +5,25 @@
 -- keep picking up newly rotated partitions, and the baseline state views
 -- follow the `current` pointer, so a refreshed baseline reaches them
 -- on its own. What does NOT follow is this file's idea of the SHAPE of the
--- data: which views exist, and how each DECIMAL column is read, were both
--- decided from the snapshot named below. Re-run `bintrail views` (or download
--- the file again from the console) after a table is added or dropped, or a
--- column changes type. A view whose table is not in the newest snapshot stops
--- resolving, and DuckDB names the path it could not find, so that case is
--- loud rather than a view quietly serving older rows than its neighbours.
+-- data: which views exist, and how each DECIMAL column is read, were decided
+-- from the snapshot named below. Re-run `bintrail views` (or download the file
+-- again from the console) after a table is added or dropped, after a column
+-- changes type, and whenever archive sources are added or removed.
+--
+-- Two of those are quiet, so they are worth knowing by name. A DECIMAL column
+-- whose scale GREW is still read at the old scale, and the extra digits are
+-- rounded away with no error (a scale that shrank, or a value too wide for the
+-- old precision, does fail loudly). And an archive source added after this file
+-- was written is simply not in it. A table that leaves the newest snapshot is
+-- the loud one: its view stops resolving and DuckDB names the missing path.
 --
 -- A daemon running `bintrail-console watch --baseline-refresh-interval`
 -- publishes a new snapshot every interval, and the state views below move to
--- it when it completes. All of them move together: the pointer is replaced in
--- one step, so no query can read one table from the new snapshot and another
--- from the old. A query already running finishes against the files it opened.
+-- it when it completes. Replacing the pointer is a single step, so no path
+-- ever resolves into a half-published snapshot, and a query already running
+-- finishes against the files it opened. Two views resolved either side of that
+-- one step can still land on different snapshots; the window is the swap
+-- itself, not the hours a file left behind would span.
 --
 -- Nothing here writes: every view is a read over Parquet files you already own.
 --
@@ -45,7 +52,8 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 --   CREATE OR REPLACE SECRET bintrail_s3_chain (
 --     TYPE s3, KEY_ID '…', SECRET '…', REGION '…');
 
--- state_<schema>_<table>: each table's full contents as of the baseline snapshot.
+-- state_<schema>_<table>: each table's full contents as of the snapshot the
+-- `current` pointer names, which is whichever one completed most recently.
 --
 -- These are the SNAPSHOT's rows, not the table's current state: changes after
 -- the snapshot live in the `events` view.

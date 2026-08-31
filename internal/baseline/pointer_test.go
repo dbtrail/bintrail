@@ -5,7 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/dbtrail/dbtrail/internal/snapshotdir"
 )
 
 // mkSnapshot creates <root>/<name>/<db>/<table>.parquet and returns the
@@ -380,5 +384,331 @@ func TestPublishCurrentPointer_advancesToAFewerTableSnapshot(t *testing.T) {
 	// The consequence, stated so it cannot be introduced by accident later.
 	if _, err := os.Stat(filepath.Join(root, CurrentLinkName, "shop", "customers.parquet")); err == nil {
 		t.Fatal("test premise: the narrower snapshot was expected not to hold customers")
+	}
+}
+
+// TestPublishCurrentPointer_stagingNamesAreUnique guards the fix for a race
+// with a quiet outcome. Two producers writing into one baselines root staged
+// under a SHARED name: A created its link, B removed it and created its own,
+// and A's rename then published B's target while A returned success. With a
+// snapshot legitimately produced for a past instant (`reconstruct
+// --output-format parquet --at`), that lands the pointer on the OLDER snapshot
+// and forward-only keeps it there until something newer than A completes.
+//
+// The race itself is not deterministically reproducible; the property that
+// removes it is, so that is what is pinned.
+func TestPublishCurrentPointer_stagingNamesAreUnique(t *testing.T) {
+	seen := make(map[string]bool, 64)
+	for range 64 {
+		n := stagingName()
+		if seen[n] {
+			t.Fatalf("stagingName returned %q twice; two producers in one root would collide", n)
+		}
+		seen[n] = true
+		if !strings.HasPrefix(n, ".") {
+			t.Fatalf("staging name %q is not hidden from discovery", n)
+		}
+		if _, ok := snapshotdir.ParseTime(n); ok {
+			t.Fatalf("staging name %q parses as a snapshot timestamp", n)
+		}
+	}
+}
+
+// TestPublishCurrentPointer_leavesNoStagingLeftover pairs with it: a successful
+// publish must not accumulate one dangling link per run now that the name
+// changes every time.
+func TestPublishCurrentPointer_leavesNoStagingLeftover(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"2026-08-30T03-00-00Z", "2026-08-31T03-00-00Z"} {
+		if err := PublishCurrentPointer(mkSnapshot(t, root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), currentLinkTmp) {
+			t.Fatalf("staging leftover %q survived a successful publish", e.Name())
+		}
+	}
+
+	// The half that matters. A successful publish consumes its own staging link
+	// by renaming it, so the loop above passes with no sweep at all. What the
+	// sweep is FOR is the link a publish that died between the symlink and the
+	// rename left behind: those are uniquely named, so nothing overwrites them
+	// and they accumulate one per crash.
+	crashed := filepath.Join(root, stagingName())
+	if err := os.Symlink("2026-08-30T03-00-00Z", crashed); err != nil {
+		t.Fatal(err)
+	}
+	if err := PublishCurrentPointer(mkSnapshot(t, root, "2026-09-01T03-00-00Z")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(crashed); !os.IsNotExist(err) {
+		t.Fatalf("a leftover from an interrupted publish was not swept (Lstat err = %v)", err)
+	}
+}
+
+// TestPublishCurrentPointer_anIncompleteNewerSnapshotDoesNotBlockPublishing
+// covers the completeness half of the forward-only rule. A newer snapshot that
+// is still being WRITTEN carries _INCOMPLETE, and it must not stop an older
+// snapshot that just finished from taking the pointer: it does not hold data
+// anyone can read yet, and treating it as the newest would leave the pointer
+// stuck on whatever preceded both for as long as the write takes.
+func TestPublishCurrentPointer_anIncompleteNewerSnapshotDoesNotBlockPublishing(t *testing.T) {
+	root := t.TempDir()
+	inProgress := mkSnapshot(t, root, "2026-09-01T03-00-00Z")
+	if err := WriteIncompleteMarker(inProgress); err != nil {
+		t.Fatal(err)
+	}
+	finished := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	if err := WriteSuccessMarker(finished); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := readPointer(t, root); got != "2026-08-31T03-00-00Z" {
+		t.Fatalf("pointer = %q; an unfinished newer snapshot blocked a completed one", got)
+	}
+
+	// And once the newer one finishes, it takes the pointer.
+	if err := WriteSuccessMarker(inProgress); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPointer(t, root); got != "2026-09-01T03-00-00Z" {
+		t.Fatalf("pointer = %q after the newer snapshot completed", got)
+	}
+}
+
+// TestRewriteToPointer_refusesAURLRootWithoutTouchingTheCwd is the discriminating
+// version of the S3 refusal. filepath.Rel succeeds on an s3:// pair and
+// filepath.Join produces "s3:/bucket/.../current", a RELATIVE path -- so without
+// a structural guard the only thing refusing the rewrite is os.Lstat failing,
+// which depends on what sits next to the process working directory. This test
+// builds exactly that: a working directory where the probe SUCCEEDS.
+func TestRewriteToPointer_refusesAURLRootWithoutTouchingTheCwd(t *testing.T) {
+	cwd := t.TempDir()
+	// The path filepath.Join(root, CurrentLinkName) yields for this root, made
+	// resolvable relative to the working directory.
+	probe := filepath.Join(cwd, "s3:", "bucket", "baselines")
+	if err := os.MkdirAll(probe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mkSnapshot(t, probe, "2026-08-30T03-00-00Z")
+	if err := os.Symlink("2026-08-30T03-00-00Z", filepath.Join(probe, CurrentLinkName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(cwd)
+
+	root := "s3://bucket/baselines"
+	paths := []string{root + "/2026-08-30T03-00-00Z/shop/orders.parquet"}
+	if got, ok := RewriteToPointer(root, paths); ok {
+		t.Fatalf("rewrote an S3 root to %v by resolving a pointer against the working directory", got)
+	}
+}
+
+// TestUploadWithOps_uploadsASymlinkedTableFile guards against the fix for the
+// pointer becoming a data-loss bug of its own. Skipping every non-regular entry
+// is the obvious way to keep `current` out of the walk, and it silently drops a
+// table an operator symlinked onto another volume -- while _SUCCESS still
+// publishes, so the remote snapshot is discoverable, marked complete, and
+// missing a table. That loss would surface mid-recovery.
+//
+// The mock READS the file, as storage.UploadFile does, so a skip shows up as a
+// missing key rather than as a passing test over a path nobody opened.
+func TestUploadWithOps_uploadsASymlinkedTableFile(t *testing.T) {
+	root := t.TempDir()
+	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	elsewhere := t.TempDir()
+	big := filepath.Join(elsewhere, "big.parquet")
+	if err := os.WriteFile(big, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(big, filepath.Join(snap, "shop", "big.parquet")); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSuccessMarker(snap); err != nil {
+		t.Fatal(err)
+	}
+
+	var keys []string
+	ops := s3UploadOps{
+		putEmpty: func(_ context.Context, _ string) error { return nil },
+		uploadFile: func(_ context.Context, path, k string) error {
+			if _, err := os.ReadFile(path); err != nil {
+				return err
+			}
+			keys = append(keys, k)
+			return nil
+		},
+		objectExists: func(_ context.Context, _ string) (bool, error) { return false, nil },
+		deleteObject: func(_ context.Context, _ string) error { return nil },
+	}
+	if _, err := uploadWithOps(context.Background(), root, "p", false, ops); err != nil {
+		t.Fatalf("uploadWithOps: %v", err)
+	}
+	var found bool
+	for _, k := range keys {
+		if strings.HasSuffix(k, "shop/big.parquet") {
+			found = true
+		}
+		if strings.Contains(k, CurrentLinkName) {
+			t.Fatalf("the pointer was uploaded as %q", k)
+		}
+	}
+	if !found {
+		t.Fatalf("the symlinked table file was not uploaded; keys = %v", keys)
+	}
+}
+
+// TestUploadWithOps_survivesAStagingLeftover pairs with it from the other side.
+// A crash between the staged symlink and the rename leaves a dangling
+// `.current.tmp.*`; refusing the upload over it would make an operator hunt a
+// hidden link they never created, on a snapshot that is genuinely complete.
+func TestUploadWithOps_survivesAStagingLeftover(t *testing.T) {
+	root := t.TempDir()
+	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	if err := WriteSuccessMarker(snap); err != nil {
+		t.Fatal(err)
+	}
+	// Exactly what an interrupted publish leaves: a dangling staging link.
+	if err := os.Symlink("2026-08-31T03-00-00Z", filepath.Join(root, stagingName())); err != nil {
+		t.Fatal(err)
+	}
+
+	ops := s3UploadOps{
+		putEmpty: func(_ context.Context, _ string) error { return nil },
+		uploadFile: func(_ context.Context, path, _ string) error {
+			_, err := os.ReadFile(path)
+			return err
+		},
+		objectExists: func(_ context.Context, _ string) (bool, error) { return false, nil },
+		deleteObject: func(_ context.Context, _ string) error { return nil },
+	}
+	if _, err := uploadWithOps(context.Background(), root, "p", false, ops); err != nil {
+		t.Fatalf("a staging leftover failed the upload: %v", err)
+	}
+}
+
+// TestUploadWithOps_refusesAnUnreadableSnapshotFile is the third arm: something
+// that is neither the pointer nor a regular file must be LOUD, not skipped.
+// Publishing _SUCCESS over a snapshot that could not be uploaded whole is the
+// failure the other two tests exist to prevent.
+func TestUploadWithOps_refusesAnUnreadableSnapshotFile(t *testing.T) {
+	root := t.TempDir()
+	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	// A symlinked SCHEMA directory: resolves, but not to a file.
+	if err := os.Symlink(t.TempDir(), filepath.Join(snap, "warehouse")); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteSuccessMarker(snap); err != nil {
+		t.Fatal(err)
+	}
+
+	var published []string
+	ops := s3UploadOps{
+		putEmpty:     func(_ context.Context, _ string) error { return nil },
+		uploadFile:   func(_ context.Context, _, k string) error { published = append(published, k); return nil },
+		objectExists: func(_ context.Context, _ string) (bool, error) { return false, nil },
+		deleteObject: func(_ context.Context, _ string) error { return nil },
+	}
+	_, err := uploadWithOps(context.Background(), root, "p", false, ops)
+	if err == nil {
+		t.Fatal("uploaded a snapshot holding something that is not a file, without complaining")
+	}
+	for _, k := range published {
+		if strings.HasSuffix(k, SuccessMarker) {
+			t.Fatal("_SUCCESS was published over a snapshot that could not be uploaded whole")
+		}
+	}
+}
+
+// TestPruneLocal_neverPrunesThePointerTarget guards the invariant the pointer
+// rests on. It is redundant while publication succeeds, because the pointer
+// follows the newest snapshot, which is already a keeper. It stops being
+// redundant the moment a publish FAILS: the pointer then lags, and a lagging
+// snapshot whose tables all appear in a newer one is otherwise prunable -- so
+// retention would delete it and break every followed views file at once.
+func TestPruneLocal_neverPrunesThePointerTarget(t *testing.T) {
+	root := t.TempDir()
+	old := mkSnapshot(t, root, "2026-06-01T00-00-00Z")
+	if err := WriteSuccessMarker(old); err != nil {
+		t.Fatal(err)
+	}
+	// The pointer is now at the old snapshot. A newer one completes but its
+	// publish fails, which is what leaves the pointer behind; simulate that end
+	// state directly by marking the newer one complete without republishing.
+	newer := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	if err := os.WriteFile(filepath.Join(newer, SuccessMarker), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPointer(t, root); got != "2026-06-01T00-00-00Z" {
+		t.Fatalf("test premise: pointer = %q, want it lagging at the old snapshot", got)
+	}
+
+	// Everything is durable and past retention, so nothing but the keeper rules
+	// stands between the old snapshot and deletion.
+	res, err := pruneWithProbe(context.Background(), PruneOptions{
+		LocalDir: root, Retain: time.Hour, S3URL: "s3://b/p",
+		Now: time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC),
+	}, func(context.Context, string) (bool, error) { return true, nil })
+	if err != nil {
+		t.Fatalf("pruneWithProbe: %v", err)
+	}
+	for _, name := range res.Pruned {
+		if name == "2026-06-01T00-00-00Z" {
+			t.Fatal("retention pruned the snapshot the `current` pointer names, leaving it dangling")
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, CurrentLinkName, "shop", "orders.parquet")); err != nil {
+		t.Fatalf("the pointer dangles after prune: %v", err)
+	}
+}
+
+// TestPublishCurrentPointer_concurrentPublishersConvergeOnTheNewest is the
+// guard for the race a review MEASURED: with a unique staging name but no
+// re-read, 3 in 400 concurrent pairs left the pointer on the OLDER snapshot.
+// Both publishers read the same old pointer, both decide they may advance, and
+// the last rename wins regardless of which snapshot is newer. Publishing a past
+// instant is legitimate (`reconstruct --output-format parquet --at`), so this
+// is reachable, and forward-only then pins the mistake in place.
+//
+// Many rounds on purpose: one round passes by luck most of the time, which is
+// exactly why the bug was invisible until someone counted.
+func TestPublishCurrentPointer_concurrentPublishersConvergeOnTheNewest(t *testing.T) {
+	const (
+		rounds = 120
+		older  = "2026-06-01T00-00-00Z"
+		newer  = "2026-08-31T03-00-00Z"
+	)
+	var landedOld int
+	for range rounds {
+		root := t.TempDir()
+		oldSnap := mkSnapshot(t, root, older)
+		newSnap := mkSnapshot(t, root, newer)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		for _, snap := range []string{newSnap, oldSnap} {
+			go func() {
+				defer wg.Done()
+				// An error is allowed (a peer may keep winning); landing on the
+				// older snapshot is not.
+				_ = PublishCurrentPointer(snap)
+			}()
+		}
+		wg.Wait()
+
+		got, ok := ResolveCurrentPointer(root)
+		if !ok {
+			t.Fatalf("no pointer published at all")
+		}
+		if got == older {
+			landedOld++
+		}
+	}
+	if landedOld > 0 {
+		t.Fatalf("%d of %d concurrent publishes left the pointer on the OLDER snapshot", landedOld, rounds)
 	}
 }

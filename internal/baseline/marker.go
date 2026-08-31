@@ -70,7 +70,13 @@ func WriteSuccessMarker(snapshotDir string) error {
 	// an already-generated views file following along is lost, so say exactly
 	// that rather than failing a finished snapshot.
 	if err := PublishCurrentPointer(snapshotDir); err != nil {
-		slog.Warn("could not update the `current` baseline pointer (the snapshot is complete and recovery is unaffected; generated DuckDB views that follow the pointer will keep reading the previous snapshot until this is fixed)",
+		// Error, not Warn. The snapshot IS complete and recovery is unaffected,
+		// so this does not fail the run -- but an already-generated views file
+		// that follows the pointer told its reader it would move, and it now
+		// will not. Nothing at query time says so: every path still resolves
+		// and the rows simply stop changing. This log line is the only signal
+		// that exists, so it must not sit at the level routine bookkeeping does.
+		slog.Error("could not update the `current` baseline pointer; the snapshot is complete and recovery is unaffected, but DuckDB views generated to follow the pointer will go on reading the PREVIOUS snapshot, with no error at query time, until this is fixed",
 			"dir", snapshotDir, "pointer", CurrentLinkName, "error", err)
 	}
 	return nil

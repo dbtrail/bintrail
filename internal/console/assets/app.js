@@ -4196,16 +4196,18 @@ function duckdbCard() {
     "No credentials are in the file, so it is safe to share." }));
   // Following the newest backup is the default (#1484), so the box offers the
   // opposite: an operator who wants a fixed point in time asks for it. The
-  // hint does not assert that this file WILL follow, because a backup folder
-  // written by an older build carries no pointer to follow until its next
-  // backup completes. The generated file states which of the two it did.
+  // hint describes what leaving the box off ASKS FOR, not what the file will
+  // necessarily do: a backup folder written by an older build carries no
+  // pointer to follow until its next backup completes, and an S3 destination
+  // has none at all. The generated file states which of the two it did, which
+  // is why the hint says to read it there rather than hedging every case here.
   const pin = el("input", { type: "checkbox", name: "pin_snapshot" });
   card.append(el("label", { class: "check" }, pin,
     el("span", { text: "Pin to the backup that exists now" })));
   card.append(el("p", { class: "form-hint", text:
-    "Left off, the views follow the newest backup, so a scheduled backup reaches this file " +
-    "without downloading it again. Tick it to keep the rows as they are today. " +
-    "(CLI: bintrail views --pin-snapshot)" }));
+    "Left off, the views follow the newest backup where the backup folder supports it, so a " +
+    "scheduled backup reaches this file without downloading it again. Tick it to keep the rows " +
+    "as they are today. The file says which one it did. (CLI: bintrail views --pin-snapshot)" }));
   // The change log (#1535). Opt-in since it stopped being the default: defining
   // that view opens one Parquet footer per archived file before it returns a row,
   // so a reader who only wanted their tables used to pay for the whole archive to

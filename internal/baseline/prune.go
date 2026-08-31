@@ -187,6 +187,7 @@ func pruneWithProbe(ctx context.Context, opts PruneOptions, probe durableProbe) 
 		return PruneResult{}, fmt.Errorf("baseline prune: %w", err)
 	}
 	keepers := computeKeepers(snaps, now)
+	keepPointerTarget(opts.LocalDir, keepers)
 
 	// Confirm durability only for snapshots that could actually be pruned —
 	// complete, readable, not a keeper, and already past the retention/min-age
@@ -395,6 +396,22 @@ func computeKeepers(snaps []localSnapshot, now time.Time) map[string]bool {
 		keepers[name] = true
 	}
 	return keepers
+}
+
+// keepPointerTarget adds the snapshot <root>/current names to keepers, so
+// retention can never leave the pointer dangling.
+//
+// Usually redundant: the pointer follows the newest complete snapshot, which is
+// already the keeper for every table it holds. It stops being redundant exactly
+// when publication FAILED -- a read-only root, a `current` an operator replaced
+// with a real directory -- because the pointer then lags behind the newest
+// snapshot, and a lagging snapshot whose tables all appear in a newer one is
+// prunable. Deleting it would turn a quiet staleness into every followed views
+// file failing at once, on a deployment where nothing else had gone wrong.
+func keepPointerTarget(dir string, keepers map[string]bool) {
+	if name, ok := ResolveCurrentPointer(dir); ok {
+		keepers[name] = true
+	}
 }
 
 // removeSnapshot deletes a snapshot directory atomically-then-lazily: it renames

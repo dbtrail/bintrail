@@ -575,8 +575,9 @@ data. The old `/storage` link still works and lands on Retention.
   point wherever the server's backup destination points). The S3 secret it
   creates lasts one DuckDB session, so run the file again (`.read views.sql`)
   in each session that reads S3. The state views follow the newest backup: they
-  read through the backup folder's `current` pointer, which every completed
-  backup updates, so a scheduled backup reaches an already-downloaded file with
+  read through the backup folder's `current` pointer, which a NEWER backup
+  updates (a point-in-time restore publishes a backup dated in the past, and
+  deliberately does not take the pointer), so a scheduled backup reaches an already-downloaded file with
   nothing to download again, and all the views move to it together. What does
   not follow is which views exist and how each `DECIMAL` column is read, both
   decided from the backup named in the file's header, so download again after a

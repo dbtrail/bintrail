@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
@@ -143,15 +144,31 @@ func uploadWithOps(ctx context.Context, outputDir, prefix string, retry bool, op
 		if walkErr != nil || d.IsDir() {
 			return walkErr
 		}
-		// Regular files only. WalkDir does not follow symlinks, so a link to a
-		// directory arrives here with IsDir() false and would be opened as a
-		// file — the read fails with "is a directory" and takes the whole
-		// upload down with it. A baselines root carries exactly such a link:
-		// `current` (see pointer.go). Nothing else in a snapshot is anything
-		// but a regular file, so this only ever skips things that were never
-		// uploadable.
-		if !d.Type().IsRegular() {
+		// The baselines root's `current` pointer (see pointer.go) is a symlink
+		// to a directory. WalkDir does not follow symlinks, so it arrives here
+		// with IsDir() false and would be handed to the file uploader, which
+		// opens the path, follows it, and fails with "is a directory" — taking
+		// the whole upload down. It is a local convenience that means nothing
+		// in S3, so skip it by name.
+		if isPointerArtifact(outputDir, path, d) {
 			return nil
+		}
+		// Every OTHER non-regular entry is RESOLVED, not skipped. An operator
+		// who symlinks one large table's Parquet onto another volume had it
+		// uploaded correctly before the pointer existed, and must keep having
+		// it: skipping silently would publish _SUCCESS over a snapshot missing
+		// a table, and the loss would surface mid-recovery. A link to a
+		// directory stays a refusal, as it always was, but now says so.
+		if !d.Type().IsRegular() {
+			info, serr := os.Stat(path) // follows the link
+			if serr != nil {
+				return fmt.Errorf("cannot resolve %s in the snapshot: %w "+
+					"(refusing to publish this snapshot as complete while a file it holds is unreadable)", path, serr)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("%s in the snapshot resolves to a %s, not a file; "+
+					"refusing to publish the snapshot as complete while it cannot be uploaded whole", path, info.Mode().Type())
+			}
 		}
 		if d.Name() == SuccessMarker {
 			successMarkers = append(successMarkers, path) // defer to the end
@@ -225,4 +242,21 @@ func snapshotDirsWithSuccess(outputDir string) ([]string, error) {
 		}
 	}
 	return dirs, nil
+}
+
+// isPointerArtifact reports whether path is the baselines root's `current`
+// pointer or a staging link left by an interrupted publish (see pointer.go).
+// Both are symlinks directly under the root, both are local conveniences that
+// mean nothing in S3, and neither is part of any snapshot.
+//
+// The staging half matters as much as the pointer: a crash between the symlink
+// and the rename leaves a dangling `.current.tmp.<pid>.<nanos>`, and treating
+// that as a broken snapshot file would make every later upload refuse until an
+// operator found and deleted a hidden link they never created.
+func isPointerArtifact(root, path string, d fs.DirEntry) bool {
+	if d.Type()&fs.ModeSymlink == 0 || filepath.Dir(path) != filepath.Clean(root) {
+		return false
+	}
+	name := d.Name()
+	return name == CurrentLinkName || strings.HasPrefix(name, currentLinkTmp)
 }

@@ -69,7 +69,7 @@ func TestGenerate_followingDropsTheStaleWarning(t *testing.T) {
 	// One LINE of the generated prose: the generator wraps at a fixed width and
 	// prefixes every line with "-- ", so a phrase that reads as continuous is not
 	// a substring of the output.
-	const moves = "All of them move together"
+	const moves = "Replacing the pointer is a single step"
 
 	following := Generate(followInput())
 	if strings.Contains(following, stale) {

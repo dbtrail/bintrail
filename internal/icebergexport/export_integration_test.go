@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -206,9 +207,20 @@ func TestIntegrationExport_matchesReconstructAtTheSameCut(t *testing.T) {
 	if err != nil || len(failures) > 0 {
 		t.Fatalf("reconstruct oracle: %v %v", err, failures)
 	}
+	// A baselines root carries a `current` pointer beside its snapshot
+	// directories, and a glob DESCENDS through a symlink (unlike ReadDir, which
+	// reports IsDir() false and skips it). So this pattern matches the same
+	// file twice: once by its snapshot name, once through the link. Drop the
+	// pointer's copy and assert on the real one.
 	matches, err := filepath.Glob(filepath.Join(oracleDir, "*", f.schema, "orders.parquet"))
-	if err != nil || len(matches) != 1 {
-		t.Fatalf("oracle parquet: %v %v", matches, err)
+	if err != nil {
+		t.Fatalf("oracle parquet: %v", err)
+	}
+	matches = slices.DeleteFunc(matches, func(p string) bool {
+		return filepath.Base(filepath.Dir(filepath.Dir(p))) == baseline.CurrentLinkName
+	})
+	if len(matches) != 1 {
+		t.Fatalf("oracle parquet: %v", matches)
 	}
 	q := func(sql string) {
 		t.Helper()

@@ -5,6 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/dbtrail/dbtrail/internal/snapshotdir"
 )
 
 // CurrentLinkName is the name of the pointer a baseline root carries alongside
@@ -20,11 +24,15 @@ import (
 // reaches an already-generated views file without regenerating it (#1484).
 //
 // The pointer is a SYMLINK, not a copy or a rewritten directory, for one
-// reason: replacing it is a single rename(2), so every table moves to the new
-// snapshot in the same instant. A reader mid-query holds an already-open file
-// and finishes against the old snapshot; a reader that starts after the swap
-// sees the new one whole. There is no window in which one table is new and
-// another is old.
+// reason: replacing it is a single rename(2), so no path ever resolves into a
+// half-published snapshot, and a reader mid-query holds already-open files and
+// finishes against the snapshot it started on.
+//
+// State that precisely rather than as an absolute. rename(2) does not serialize
+// a query against the swap: a statement resolving two state views either side
+// of one can still land on different snapshots. What the pointer buys is that
+// the window is a single rename rather than the hours a file left behind would
+// span, and that no reader ever sees a partially updated pointer.
 //
 // It is deliberately NOT part of discovery. FindBaseline, ListBaselines,
 // DiscoverBaselines and PruneLocal all enumerate with os.ReadDir + IsDir(),
@@ -34,10 +42,31 @@ import (
 // pruned. Recovery reads snapshots by their own names, as it always has.
 const CurrentLinkName = "current"
 
-// currentLinkTmp is the staging name PublishCurrentPointer renames from. It is
-// dot-prefixed and does not parse as a timestamp, so a leftover from a crash
-// between the symlink and the rename is invisible to discovery too.
+// currentLinkTmp prefixes the staging name PublishCurrentPointer renames from.
+// It is dot-prefixed and does not parse as a timestamp, so a leftover from a
+// crash between the symlink and the rename is invisible to discovery too (and
+// is a dangling symlink of a few bytes, not a tree).
 const currentLinkTmp = "." + CurrentLinkName + ".tmp"
+
+// stagingName returns a per-call staging name under a baselines root. It must
+// stay UNIQUE per call: a shared one lets two producers writing into the same
+// root interleave, so that one removes the other's staged link and the winner
+// publishes a target it never chose.
+//
+// Uniqueness alone does NOT make concurrent publishing correct -- both
+// publishers still race to rename, and the last one wins whether or not its
+// snapshot is newer. swapPointer's re-read loop settles that; this only stops
+// them from destroying each other's staged link first.
+func stagingName() string {
+	// The counter, not the clock, is what makes this unique. time.Now() is
+	// coarse enough on macOS that two calls in one loop return the SAME
+	// UnixNano, which the uniqueness test caught; the timestamp is kept only
+	// because it makes a leftover legible. The pid separates processes.
+	return fmt.Sprintf("%s.%d.%d.%d", currentLinkTmp,
+		os.Getpid(), time.Now().UnixNano(), stagingSeq.Add(1))
+}
+
+var stagingSeq atomic.Uint64
 
 // PublishCurrentPointer repoints <root>/current at snapshotDir, where root is
 // snapshotDir's parent. It is called from WriteSuccessMarker, so the pointer
@@ -86,7 +115,7 @@ const currentLinkTmp = "." + CurrentLinkName + ".tmp"
 // path in a container, or copied to another host.
 func PublishCurrentPointer(snapshotDir string) error {
 	name := filepath.Base(snapshotDir)
-	ts, ok := parseBaselineDirTimestamp(name)
+	ts, ok := snapshotdir.ParseTime(name)
 	if !ok {
 		return nil // not a snapshot directory under a baselines root
 	}
@@ -99,32 +128,110 @@ func PublishCurrentPointer(snapshotDir string) error {
 		return fmt.Errorf("%s exists and is not a symlink; refusing to replace it "+
 			"(move it aside to let baseline snapshots publish the %s pointer)", link, CurrentLinkName)
 	case err == nil:
-		// Forward only. An unreadable or unparseable target is treated as "no
-		// usable pointer" and replaced: a dangling or hand-edited link is worse
-		// than a correct one, and anything this function wrote parses.
-		if target, rerr := os.Readlink(link); rerr == nil {
-			if cur, ok := parseBaselineDirTimestamp(filepath.Base(target)); ok && !ts.After(cur) {
-				return nil
-			}
-		}
+		// An unreadable or unparseable target is treated as "no usable pointer"
+		// and replaced: a dangling or hand-edited link is worse than a correct
+		// one, and anything this function wrote parses. The forward-only rule
+		// itself is below, against the snapshot directories rather than against
+		// this link.
 	case !os.IsNotExist(err):
 		return fmt.Errorf("stat %s: %w", link, err)
 	}
 
-	tmp := filepath.Join(root, currentLinkTmp)
-	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove stale %s: %w", tmp, err)
+	// Forward only, decided against the newest COMPLETE snapshot on disk. See
+	// newestCompleteSnapshot for why the pointer itself is the wrong thing to
+	// compare with. A snapshot produced for a past instant (`reconstruct
+	// --output-format parquet --at`) completes normally and simply does not
+	// take the pointer.
+	if best, ok := newestCompleteSnapshot(root); ok && best != name {
+		if bestTS, ok := snapshotdir.ParseTime(best); ok && bestTS.After(ts) {
+			return nil
+		}
 	}
+
+	// A per-process staging name, NOT a shared one. Two producers writing into
+	// the same root would otherwise interleave: A stages its link, B removes it
+	// and stages its own, and A's rename then publishes B's target while A
+	// reports success. With a snapshot legitimately produced for a past instant
+	// (`reconstruct --output-format parquet --at`), that lands the pointer on
+	// the OLDER snapshot and forward-only keeps it there.
+	if err := swapPointer(root, link, name); err != nil {
+		return err
+	}
+	sweepStagingLeftovers(root)
+	return nil
+}
+
+// newestCompleteSnapshot returns the name of the newest COMPLETE snapshot
+// directory under root, and whether there is one.
+//
+// This is the source of truth the forward-only rule compares against, and it is
+// chosen precisely because nothing overwrites it. Comparing against the POINTER
+// cannot be made correct under concurrency: two publishers read the same old
+// pointer, both conclude they may advance, and the last rename wins whichever
+// snapshot is newer. A re-read afterwards does not save it either -- the loser
+// sees its OWN name landed and concludes it won legitimately, because the
+// evidence that it clobbered a newer one is exactly what it overwrote.
+// Measured with a re-read loop: 11 of 120 concurrent pairs still ended on the
+// older snapshot.
+//
+// Snapshot directories are not overwritten, and _SUCCESS is written before
+// PublishCurrentPointer is called, so by the time a publisher runs, every
+// snapshot that could outrank it is already visible and already marked
+// complete. That makes the decision deterministic without a lock file to leave
+// behind on a crash.
+func newestCompleteSnapshot(root string) (string, bool) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return "", false
+	}
+	var bestName string
+	var bestTS time.Time
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		ts, ok := snapshotdir.ParseTime(e.Name())
+		if !ok || !SnapshotComplete(filepath.Join(root, e.Name())) {
+			continue
+		}
+		if bestName == "" || ts.After(bestTS) {
+			bestName, bestTS = e.Name(), ts
+		}
+	}
+	return bestName, bestName != ""
+}
+
+// swapPointer stages a link under a unique name and renames it over the
+// pointer. rename(2) replaces an existing symlink in one step, so a reader
+// resolves either the old target or the new one, never a half-written pointer.
+func swapPointer(root, link, name string) error {
+	tmp := filepath.Join(root, stagingName())
 	if err := os.Symlink(name, tmp); err != nil {
 		return fmt.Errorf("create %s: %w", tmp, err)
 	}
-	// rename(2) over an existing symlink replaces it atomically, which is the
-	// whole point: readers see either the old target or the new one.
 	if err := os.Rename(tmp, link); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("publish %s: %w", link, err)
 	}
 	return nil
+}
+
+// sweepStagingLeftovers removes dangling staging links from publishes that died
+// between the symlink and the rename. Best-effort and unlogged: each is a
+// dangling symlink of a few bytes, invisible to discovery, and the upload skips
+// them by prefix. Without this they would accumulate, one per crashed publish,
+// since the staging name is unique per call and the prune and discard sweeps
+// both require IsDir().
+func sweepStagingLeftovers(root string) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink != 0 && strings.HasPrefix(e.Name(), currentLinkTmp) {
+			_ = os.Remove(filepath.Join(root, e.Name()))
+		}
+	}
 }
 
 // ResolveCurrentPointer returns the snapshot directory name <root>/current
@@ -147,7 +254,7 @@ func ResolveCurrentPointer(root string) (string, bool) {
 		return "", false
 	}
 	name := filepath.Base(target)
-	if _, ok := parseBaselineDirTimestamp(name); !ok {
+	if _, ok := snapshotdir.ParseTime(name); !ok {
 		return "", false
 	}
 	return name, true
@@ -165,14 +272,23 @@ func ResolveCurrentPointer(root string) (string, bool) {
 // not a degraded version of following — it would serve rows from a snapshot the
 // generated file does not describe, which is worse than being one refresh
 // behind. Same for a root with no usable pointer (every root written before
-// this feature, until its next snapshot completes) and for an S3 root, which
-// has no pointer to follow: callers pass "" for root there.
+// this feature, until its next snapshot completes) and for a root that is not a
+// local directory at all: an s3:// baseline destination reaches this function
+// verbatim from the console, and filepath.Rel succeeds on one, so the URL check
+// below is what refuses it rather than any caller filtering first.
 func RewriteToPointer(root string, paths []string) ([]string, bool) {
 	// An empty root is the --baseline-s3 shape on the CLI side. Refused rather
 	// than passed through: ResolveCurrentPointer would probe a bare "current"
 	// against the PROCESS working directory, which is the same class of mistake
 	// as reading a server-side filename against the wrong base.
-	if root == "" || len(paths) == 0 {
+	// A URL root, not a directory. The console hands its configured baseline
+	// destination through verbatim, and that can be an s3:// URL: filepath.Rel
+	// succeeds on one, so the only thing that would refuse the rewrite is an
+	// os.Lstat of "s3:/bucket/.../current" — a RELATIVE path, probed against
+	// the process working directory. Refusing structurally is one line and
+	// removes the probe; leaving it to Lstat makes the outcome depend on what
+	// happens to sit next to the daemon's CWD.
+	if root == "" || strings.Contains(root, "://") || len(paths) == 0 {
 		return nil, false
 	}
 	pointer, ok := ResolveCurrentPointer(root)

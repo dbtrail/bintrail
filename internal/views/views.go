@@ -519,12 +519,17 @@ func writeHeader(b *strings.Builder, in Input) {
 			b.WriteString("-- views follow the `" + baseline.CurrentLinkName + "` pointer, so a refreshed baseline reaches them\n")
 		}
 		b.WriteString("-- on its own. What does NOT follow is this file's idea of the SHAPE of the\n")
-		b.WriteString("-- data: which views exist, and how each DECIMAL column is read, were both\n")
-		b.WriteString("-- decided from the snapshot named below. Re-run `bintrail views` (or download\n")
-		b.WriteString("-- the file again from the console) after a table is added or dropped, or a\n")
-		b.WriteString("-- column changes type. A view whose table is not in the newest snapshot stops\n")
-		b.WriteString("-- resolving, and DuckDB names the path it could not find, so that case is\n")
-		b.WriteString("-- loud rather than a view quietly serving older rows than its neighbours.\n")
+		b.WriteString("-- data: which views exist, and how each DECIMAL column is read, were decided\n")
+		b.WriteString("-- from the snapshot named below. Re-run `bintrail views` (or download the file\n")
+		b.WriteString("-- again from the console) after a table is added or dropped, after a column\n")
+		b.WriteString("-- changes type, and whenever archive sources are added or removed.\n")
+		b.WriteString("--\n")
+		b.WriteString("-- Two of those are quiet, so they are worth knowing by name. A DECIMAL column\n")
+		b.WriteString("-- whose scale GREW is still read at the old scale, and the extra digits are\n")
+		b.WriteString("-- rounded away with no error (a scale that shrank, or a value too wide for the\n")
+		b.WriteString("-- old precision, does fail loudly). And an archive source added after this file\n")
+		b.WriteString("-- was written is simply not in it. A table that leaves the newest snapshot is\n")
+		b.WriteString("-- the loud one: its view stops resolving and DuckDB names the missing path.\n")
 	} else if in.rendersEvents() {
 		// The one self-following half of the file, and only the events view
 		// has it: its globs are evaluated per query. Claimed only when that
@@ -547,11 +552,12 @@ func writeHeader(b *strings.Builder, in Input) {
 	// to (#1484). Naming the flag WITH its binary is what separates the two
 	// readers, and `bintrail views` is not that binary.
 	//
-	// Unconditional, and phrased so it stays true with no state views at all
-	// ("ANY state view below"): gating it would add a branch whose only effect
-	// is to withhold the warning, and the paragraph directly above is
-	// unconditional about the same views for the same reason. Neither asserts
-	// that a state view exists.
+	// Two renderings, one for each behaviour, rather than one paragraph plus a
+	// caveat: the pinned half warns that the rows stop changing, and under
+	// following that warning is simply false. The pinned arm stays phrased so
+	// it holds with no state views at all ("ANY state view below"); the
+	// following arm may assert they exist, because FollowsSnapshot is only ever
+	// set alongside a non-empty Baselines.
 	//
 	// "nothing regenerates this file", NOT "nothing re-runs this command": the
 	// console download is produced by a page, not a command, which is the same
@@ -565,9 +571,11 @@ func writeHeader(b *strings.Builder, in Input) {
 		// reader is now told the one thing still on their plate.
 		b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
 		b.WriteString("-- publishes a new snapshot every interval, and the state views below move to\n")
-		b.WriteString("-- it when it completes. All of them move together: the pointer is replaced in\n")
-		b.WriteString("-- one step, so no query can read one table from the new snapshot and another\n")
-		b.WriteString("-- from the old. A query already running finishes against the files it opened.\n")
+		b.WriteString("-- it when it completes. Replacing the pointer is a single step, so no path\n")
+		b.WriteString("-- ever resolves into a half-published snapshot, and a query already running\n")
+		b.WriteString("-- finishes against the files it opened. Two views resolved either side of that\n")
+		b.WriteString("-- one step can still land on different snapshots; the window is the swap\n")
+		b.WriteString("-- itself, not the hours a file left behind would span.\n")
 	} else {
 		b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
 		b.WriteString("-- publishes a new snapshot every interval, and nothing regenerates this file.\n")
@@ -1348,7 +1356,12 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 	if in.OnlyViews != nil && len(wanted) == 0 {
 		return false
 	}
-	b.WriteString("-- state_<schema>_<table>: each table's full contents as of the baseline snapshot.\n")
+	if in.FollowsSnapshot {
+		b.WriteString("-- state_<schema>_<table>: each table's full contents as of the snapshot the\n")
+		b.WriteString("-- `" + baseline.CurrentLinkName + "` pointer names, which is whichever one completed most recently.\n")
+	} else {
+		b.WriteString("-- state_<schema>_<table>: each table's full contents as of the baseline snapshot.\n")
+	}
 	b.WriteString("--\n")
 	b.WriteString("-- These are the SNAPSHOT's rows, not the table's current state: changes after\n")
 	if in.rendersEvents() {

@@ -118,7 +118,7 @@ func init() {
 	viewsCmd.Flags().StringVar(&vArchiveDir, "archive-dir", "", "Local root directory of Parquet archives (requires --bintrail-id)")
 	viewsCmd.Flags().StringVar(&vArchiveS3, "archive-s3", "", "S3 root URL prefix of Parquet archives (requires --bintrail-id; e.g. s3://bucket/prefix/)")
 	viewsCmd.Flags().StringVar(&vBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir or --archive-s3 is set)")
-	viewsCmd.Flags().BoolVar(&vPinSnapshot, "pin-snapshot", false, "Bind the state views to the snapshot discovered now, so they keep returning today's rows after a baseline refresh (default: follow the newest snapshot)")
+	viewsCmd.Flags().BoolVar(&vPinSnapshot, "pin-snapshot", false, "Bind the state views to the snapshot discovered now, so they keep returning today's rows after a baseline refresh (default: follow the newest snapshot, where the baseline root has a pointer to follow)")
 	viewsCmd.Flags().StringVar(&vRegion, "region", "", "AWS region to pin in the generated S3 secret (default: resolved by the credential chain)")
 	viewsCmd.Flags().StringVar(&vBaselineDir, "baseline-dir", "", "Local directory of baseline Parquet snapshots")
 	viewsCmd.Flags().StringVar(&vBaselineS3, "baseline-s3", "", "S3 URL prefix of baseline Parquet snapshots (e.g. s3://bucket/baselines/)")
