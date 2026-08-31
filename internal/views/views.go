@@ -258,39 +258,49 @@ func Generate(in Input) string {
 			// looks to understand why their read failed.
 			region = ""
 		}
+		// Stays ahead of every view, and is the one statement the reordering
+		// below does NOT protect anyone from: baselines can live on S3 too, so
+		// a secret emitted after the state views would break the layout this
+		// preamble exists to serve. Its CREATE SECRET aborts the session when
+		// no credential resolves, and on an all-S3 layout that still costs the
+		// reader the whole file. The degrade documented below is about the
+		// ATTACH, not about credentials.
 		writeS3Preamble(&b, region, in.S3Endpoint, in.RegionAmbiguous)
 	}
-	// The cold half FIRST, then the ATTACH, then the events view that needs it.
+	// The state views FIRST, then the ATTACH, then the events view that needs
+	// it.
 	//
 	// `duckdb -init` aborts the session at the first error, and the ATTACH is
 	// the one statement in this file that depends on reaching another machine:
 	// a host that does not resolve, a password left blank, an index that is
 	// down. Emitted ahead of the views, as it used to be, that single failure
 	// cost the reader the whole file — no events view, no state views, nothing
-	// — even though every one of them reads Parquet and needed nothing from the
-	// index. DuckDB commits what ran before the aborting statement, so putting
-	// the Parquet-only views first turns that total loss into a degrade: the
-	// reader gets an archives-only database and a message naming what it could
-	// not reach.
+	// — even though the state views read one Parquet file per table and needed
+	// nothing from the index. DuckDB commits what ran before the aborting
+	// statement, so moving them ahead of the ATTACH turns that total loss into
+	// a degrade: every table's snapshot survives, and the reader loses only the
+	// events view plus a message naming what could not be reached.
 	//
-	// The cold pass renders with no LiveIndex so it emits the archives-only
-	// events view; the live pass then CREATE OR REPLACEs it with the two-leg
-	// definition. State views never read the index at all, so they always
-	// belong on this side of the ATTACH.
-	cold := in
-	cold.LiveIndex = nil
-	liveFollows := in.LiveIndex != nil
-	// With no archive source there is no cold events view to emit, and the
-	// skip comment explaining that would sit directly above a live-only view
-	// that does define it. The live pass owns the message in that case.
-	if !liveFollows || cold.definesEvents() {
-		writeEventsView(&b, cold, liveFollows)
-	}
-	writeStateViews(&b, cold)
-	if liveFollows {
+	// The events view is defined ONCE, here at the end, rather than
+	// archives-only above the ATTACH and CREATE OR REPLACEd below it. Two
+	// definitions would bind the archive file list twice, and that bind is the
+	// expensive statement in this file: `union_by_name` opens one Parquet
+	// footer per archived file before the view returns a row (#1535). Measured
+	// over 120 files, the second bind costs about half the first (7.1s then
+	// 3.6s), and writing it as a reference to the first view instead of
+	// repeating the literal costs the same 3.6s — DuckDB re-binds a view per
+	// statement, so there is no cheap way to say it twice.
+	//
+	// The deliberate trade: under --include-live an unreachable index costs the
+	// events view ENTIRELY, not just its hot leg. The state views are what
+	// survive. A leg over the archives alone would have to be paid for with a
+	// second full bind on every generated file, including the ones whose index
+	// is reachable.
+	writeStateViews(&b, in)
+	if in.LiveIndex != nil {
 		writeLivePreamble(&b, in.LiveIndex)
-		writeEventsView(&b, in, false)
 	}
+	writeEventsView(&b, in)
 	return b.String()
 }
 
@@ -311,7 +321,7 @@ func GenerateViews(in Input) string {
 	// the same Input; the caller gets the archives-only view, which is what
 	// this entry point can actually back.
 	in.LiveIndex = nil
-	events := writeEventsView(&b, in, false)
+	events := writeEventsView(&b, in)
 	state := writeStateViews(&b, in)
 	if !events && !state {
 		// Not one view was emitted, so whatever is in the builder is comments.
@@ -710,13 +720,9 @@ func isSingleLabelHost(host string) bool {
 }
 
 // writeEventsView returns whether it emitted a view definition (as opposed to
-// nothing, or a comment explaining why there is none).
-// liveFollows tells the archives-only render that a live preamble and a
-// two-leg CREATE OR REPLACE come further down the same file. It changes only
-// what the comment ADVISES: without it the cold render tells the reader to
-// regenerate with --include-live, which in that position is advice to redo
-// something the next twenty lines already do.
-func writeEventsView(b *strings.Builder, in Input, liveFollows bool) bool {
+// nothing, or a comment explaining why there is none). It is called ONCE per
+// rendered file — see Generate for why the view is never redefined.
+func writeEventsView(b *strings.Builder, in Input) bool {
 	// Not wanted: emit NOTHING, comments included. A filtered render is executed
 	// by its caller, and a script of only comments is an error there.
 	if !in.OnlyViews.wants(eventsViewName) {
@@ -772,6 +778,13 @@ func writeEventsView(b *strings.Builder, in Input, liveFollows bool) bool {
 		b.WriteString("-- index row has to derive or forgo them. Letting the index win would\n")
 		b.WriteString("-- replace a known source with NULL for every event in the overlap, and a\n")
 		b.WriteString("-- WHERE bintrail_id = ... would then miss rows the archives hold.\n")
+		b.WriteString("--\n")
+		b.WriteString("-- Defined after the ATTACH above, so an index this machine cannot reach\n")
+		b.WriteString("-- leaves this view undefined and every state_ view still usable. It is\n")
+		b.WriteString("-- deliberately NOT also defined over the archives alone beforehand:\n")
+		b.WriteString("-- union_by_name opens one Parquet footer per archived file at CREATE VIEW\n")
+		b.WriteString("-- time, so defining it twice would pay that cost twice in every generated\n")
+		b.WriteString("-- file, whether or not the index turns out to be reachable.\n")
 		writeLiveCostNote(b, true)
 		b.WriteString("CREATE OR REPLACE VIEW \"events\" AS\n")
 		b.WriteString("  WITH cold AS (\n")
@@ -801,16 +814,7 @@ func writeEventsView(b *strings.Builder, in Input, liveFollows bool) bool {
 		b.WriteString("-- SCOPE: these are the ARCHIVED events only. Partitions rotation has not\n")
 		b.WriteString("-- archived yet exist solely in the index, so the most recent window is\n")
 		b.WriteString("-- absent here and reads as if nothing happened.\n")
-		if liveFollows {
-			// This definition is REPLACED further down, once the index is
-			// attached. Said here because a reader who stops at this statement
-			// would otherwise take an archives-only view as the final one, and
-			// a reader whose ATTACH failed needs to know this is what they are
-			// left holding.
-			b.WriteString("-- A leg over the index is added below, after the ATTACH: this view is\n")
-			b.WriteString("-- REPLACED there. It is defined first on purpose, so that an index this\n")
-			b.WriteString("-- machine cannot reach costs you the hot leg and nothing else.\n")
-		} else if in.LiveLegUnavailable {
+		if in.LiveLegUnavailable {
 			b.WriteString("-- This download covers the archives; it has no way to reach the index.\n")
 			b.WriteString("-- To add a leg over the index, run `bintrail views --index-dsn ...\n")
 			b.WriteString("-- --include-live` from a host that can connect to it.\n")
@@ -1132,7 +1136,7 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 	b.WriteString("-- state_<schema>_<table>: each table's full contents as of the baseline snapshot.\n")
 	b.WriteString("--\n")
 	b.WriteString("-- These are the SNAPSHOT's rows, not the table's current state: changes after\n")
-	b.WriteString("-- the snapshot live in `events` above. To materialize a later point in time,\n")
+	b.WriteString("-- the snapshot live in `events` below. To materialize a later point in time,\n")
 	b.WriteString("-- use `bintrail reconstruct`. Folding the deltas back onto a baseline is what\n")
 	b.WriteString("-- that command does, and it is not expressible as a view.\n")
 	if len(in.Baselines) == 0 {

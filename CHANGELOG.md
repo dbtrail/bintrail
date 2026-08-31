@@ -77,10 +77,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file** (#1536). `duckdb -init` aborts the session at the first error, and the
   `ATTACH` was emitted ahead of every view, so an unreachable index host left
   the reader with nothing: no `events` view and no `state_*` views, even though
-  all of them read Parquet and needed nothing from the index. The Parquet-only
-  views are now defined first, then the `ATTACH`, then the two-leg `events` view
-  that replaces the archives-only one. DuckDB keeps what ran before the aborting
-  statement, so a failed `ATTACH` now costs the hot leg and nothing else.
+  all of them read Parquet and needed nothing from the index. The `state_*`
+  views are now defined first, then the `ATTACH`, then the `events` view that
+  reads through it. DuckDB keeps what ran before the aborting statement, so
+  every table's snapshot survives an index this machine cannot reach.
+  The deliberate trade: under `--include-live` a failed `ATTACH` costs the
+  `events` view entirely, not just its hot leg. Defining it archives-only
+  beforehand and replacing it afterwards would bind the archive file list twice,
+  and that bind is the expensive statement in the file — `union_by_name` opens
+  one Parquet footer per archived file at `CREATE VIEW` time (#1535), measured
+  at ~7s over 120 files with the second definition costing ~3.6s more, whether
+  it repeats the literal or just references the first view.
 - **views.sql warns when the index host is a bare name** (#1536). A console
   running under Docker Compose emits its compose service name (`index-mysql`),
   which resolves for containers on that network and nowhere else, so a

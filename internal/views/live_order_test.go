@@ -30,27 +30,31 @@ func TestLiveLeg_parquetOnlyViewsPrecedeTheAttach(t *testing.T) {
 	if attach < 0 {
 		t.Fatalf("no ATTACH in a file generated with an index:\n%s", out)
 	}
-	firstEvents := strings.Index(out, `CREATE OR REPLACE VIEW "events"`)
-	lastEvents := strings.LastIndex(out, `CREATE OR REPLACE VIEW "events"`)
+	events := strings.Index(out, `CREATE OR REPLACE VIEW "events"`)
 	state := strings.Index(out, `CREATE OR REPLACE VIEW "state_`)
 
-	if firstEvents < 0 || state < 0 {
+	if events < 0 || state < 0 {
 		t.Fatalf("expected both an events view and a state view:\n%s", out)
-	}
-	if firstEvents > attach {
-		t.Error("the archives-only events view is defined after the ATTACH, so an " +
-			"index this machine cannot reach costs the reader the cold leg too")
 	}
 	if state > attach {
 		t.Error("a state view is defined after the ATTACH. State views read baseline " +
 			"Parquet and never touch the index, so a failed ATTACH must not take them")
 	}
-	if lastEvents == firstEvents {
-		t.Fatal("only one events view: the two-leg definition that replaces the " +
-			"archives-only one is missing")
-	}
-	if lastEvents < attach {
+	if events < attach {
 		t.Error("the two-leg events view is defined before the ATTACH it reads through")
+	}
+
+	// EXACTLY ONE definition, counted rather than located. The events view is
+	// the expensive statement in the file — union_by_name opens a Parquet
+	// footer per archived file at CREATE VIEW time (#1535), measured at ~7s
+	// over 120 files with a second definition costing ~3.6s more whether it
+	// repeats the literal or references the first view. A change that reverts
+	// to defining it archives-only and CREATE OR REPLACEing it after the ATTACH
+	// still satisfies every ordering assertion above, so only the count catches
+	// it.
+	if n := strings.Count(out, `CREATE OR REPLACE VIEW "events"`); n != 1 {
+		t.Errorf("the events view is defined %d times, want 1: each definition binds "+
+			"the whole archive file list", n)
 	}
 
 	// The catalog name must appear only on the far side of the ATTACH that
@@ -61,11 +65,16 @@ func TestLiveLeg_parquetOnlyViewsPrecedeTheAttach(t *testing.T) {
 	}
 }
 
-// TestLiveLeg_coldPassDoesNotAdviseWhatFollows: the archives-only render is the
-// same code path that serves a file with no index, where it tells the reader to
-// regenerate with --include-live. In a two-leg file that advice sits twenty
-// lines above the thing it asks for.
-func TestLiveLeg_coldPassDoesNotAdviseWhatFollows(t *testing.T) {
+// TestLiveLeg_saysWhatAFailedAttachCosts: the file is the only thing a reader
+// whose ATTACH failed still has. It must state the trade the ordering makes —
+// the state views survive, the events view does not — because that reader
+// cannot otherwise tell an intended degrade from a truncated download.
+//
+// The second half is the older guarantee: this render is the same code path
+// that serves a file with NO index, where it tells the reader to regenerate
+// with --include-live. In a file that already has a live leg, that advice asks
+// for something already done.
+func TestLiveLeg_saysWhatAFailedAttachCosts(t *testing.T) {
 	in := orderedInput()
 	in.LiveLegHowTo = "tick the Include the live index box"
 	out := Generate(in)
@@ -76,9 +85,35 @@ func TestLiveLeg_coldPassDoesNotAdviseWhatFollows(t *testing.T) {
 				"already has one", unwanted)
 		}
 	}
-	if !strings.Contains(out, "REPLACED there") {
-		t.Error("the archives-only view does not say it is replaced below, so a reader " +
-			"whose ATTACH failed cannot tell what they are left holding")
+	for _, want := range []string{
+		"cannot reach",
+		"state_ view still usable",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the file never says %q, so a reader whose ATTACH failed cannot "+
+				"tell what they are left holding:\n%s", want, out)
+		}
+	}
+}
+
+// TestLiveOnly_definesEventsOnce guards the OTHER shape the single definition
+// has to hold for: an index with nothing archived, where the archives-only
+// render would emit a "(skipped: no archive sources are registered)" comment.
+// Emitted alongside a live-only definition, that comment sits directly above a
+// CREATE OR REPLACE VIEW "events" and flatly contradicts it.
+func TestLiveOnly_definesEventsOnce(t *testing.T) {
+	in := orderedInput()
+	in.ArchiveSources = nil
+	out := Generate(in)
+
+	if n := strings.Count(out, "-- events:"); n != 1 {
+		t.Errorf("a live-only file has %d events blocks, want 1:\n%s", n, out)
+	}
+	if n := strings.Count(out, `CREATE OR REPLACE VIEW "events"`); n != 1 {
+		t.Errorf("a live-only file defines the events view %d times, want 1", n)
+	}
+	if strings.Contains(out, "skipped:") {
+		t.Errorf("a file that DOES define the events view also says it was skipped:\n%s", out)
 	}
 }
 
@@ -123,8 +158,11 @@ func TestLiveLeg_singleLabelHostWarns(t *testing.T) {
 
 func TestIsSingleLabelHost(t *testing.T) {
 	for host, want := range map[string]bool{
-		"index-mysql":        true,
-		"db":                 true,
+		"index-mysql": true,
+		"db":          true,
+		// The trailing dot is the only case TrimSuffix discriminates: without it
+		// "db." reads as qualified because it contains a dot.
+		"db.":                true,
 		"index.example.com":  false,
 		"index.example.com.": false,
 		"10.0.0.5":           false,

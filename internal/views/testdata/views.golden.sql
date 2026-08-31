@@ -39,6 +39,38 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 --   CREATE OR REPLACE SECRET bintrail_s3_chain (
 --     TYPE s3, KEY_ID '…', SECRET '…', REGION '…');
 
+-- state_<schema>_<table>: each table's full contents as of the baseline snapshot.
+--
+-- These are the SNAPSHOT's rows, not the table's current state: changes after
+-- the snapshot live in `events` below. To materialize a later point in time,
+-- use `bintrail reconstruct`. Folding the deltas back onto a baseline is what
+-- that command does, and it is not expressible as a view.
+--
+-- DECIMAL and NUMERIC columns are stored as text, so that a value MySQL can
+-- hold is never rounded to fit a narrower type. The views below cast them
+-- back to DECIMAL with the precision and scale the column was declared with,
+-- so sum() and the rest work on them directly.
+-- Columns wider than 38 digits have no DuckDB DECIMAL to be cast to, so they
+-- stay text. They are named below. Cast them yourself when you need
+-- arithmetic; DOUBLE works if an approximate result is acceptable.
+-- Some files carry no column types, so their views cast nothing and every
+-- decimal column in them reads as text. Those tables are named below. A
+-- baseline older than this feature gains the casts when it is next taken or
+-- refreshed; a PostgreSQL-source baseline stores all its values as text and
+-- will not gain them. If a footer could not be read at all, the bintrail log
+-- has the error.
+-- state_legacy_db_audit_log: this file carries no column types, so nothing is cast; decimal columns read as text
+CREATE OR REPLACE VIEW "state_legacy_db_audit_log" AS
+  SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/Legacy-DB/Audit Log.parquet');
+CREATE OR REPLACE VIEW "state_shop_order_items" AS
+  SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/order_items.parquet');
+CREATE OR REPLACE VIEW "state_shop_orders" AS
+  SELECT * REPLACE (CAST("total" AS DECIMAL(10,2)) AS "total", CAST("tax_rate" AS DECIMAL(6,4)) AS "tax_rate")
+  FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/orders.parquet');
+-- state_shop_order_items_2: weight is DECIMAL(65,30), wider than DuckDB's 38 digits (left as text)
+CREATE OR REPLACE VIEW "state_shop_order_items_2" AS
+  SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop_order/items.parquet');
+
 -- events: every archived binlog event, across all archive sources.
 --
 -- union_by_name is required, not cosmetic: archives written before a column
@@ -88,36 +120,4 @@ CREATE OR REPLACE VIEW "events" AS
     hive_partitioning = true,
     union_by_name = true
   );
-
--- state_<schema>_<table>: each table's full contents as of the baseline snapshot.
---
--- These are the SNAPSHOT's rows, not the table's current state: changes after
--- the snapshot live in `events` above. To materialize a later point in time,
--- use `bintrail reconstruct`. Folding the deltas back onto a baseline is what
--- that command does, and it is not expressible as a view.
---
--- DECIMAL and NUMERIC columns are stored as text, so that a value MySQL can
--- hold is never rounded to fit a narrower type. The views below cast them
--- back to DECIMAL with the precision and scale the column was declared with,
--- so sum() and the rest work on them directly.
--- Columns wider than 38 digits have no DuckDB DECIMAL to be cast to, so they
--- stay text. They are named below. Cast them yourself when you need
--- arithmetic; DOUBLE works if an approximate result is acceptable.
--- Some files carry no column types, so their views cast nothing and every
--- decimal column in them reads as text. Those tables are named below. A
--- baseline older than this feature gains the casts when it is next taken or
--- refreshed; a PostgreSQL-source baseline stores all its values as text and
--- will not gain them. If a footer could not be read at all, the bintrail log
--- has the error.
--- state_legacy_db_audit_log: this file carries no column types, so nothing is cast; decimal columns read as text
-CREATE OR REPLACE VIEW "state_legacy_db_audit_log" AS
-  SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/Legacy-DB/Audit Log.parquet');
-CREATE OR REPLACE VIEW "state_shop_order_items" AS
-  SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/order_items.parquet');
-CREATE OR REPLACE VIEW "state_shop_orders" AS
-  SELECT * REPLACE (CAST("total" AS DECIMAL(10,2)) AS "total", CAST("tax_rate" AS DECIMAL(6,4)) AS "tax_rate")
-  FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop/orders.parquet');
--- state_shop_order_items_2: weight is DECIMAL(65,30), wider than DuckDB's 38 digits (left as text)
-CREATE OR REPLACE VIEW "state_shop_order_items_2" AS
-  SELECT * FROM read_parquet('s3://my-bucket/baselines/2026-04-30T03-00-00Z/shop_order/items.parquet');
 
