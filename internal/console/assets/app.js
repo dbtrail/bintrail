@@ -4199,10 +4199,17 @@ function duckdbCard() {
   // pointer to follow until its next backup completes, and an S3 destination
   // has none at all. The generated file states which of the two it did, which
   // is why the hint says to read it there rather than hedging every case here.
+  // The three options are FOLDED (#1549). They moved onto Connect, a page whose
+  // e2e budget caps visible text because #1430 established that spelling every
+  // contingency out in the open reads as a wall: the card arrived at 2052 chars
+  // against a 1500 budget and failed that guard. cnFine is the page's own
+  // mechanism for exactly this, so the facts stay on the page and stop being
+  // the first thing a first-time reader meets.
+  const opts = [];
   const pin = el("input", { type: "checkbox", name: "pin_snapshot" });
-  card.append(el("label", { class: "check" }, pin,
+  opts.push(el("label", { class: "check" }, pin,
     el("span", { text: "Pin to the backup that exists now" })));
-  card.append(el("p", { class: "form-hint", text:
+  opts.push(el("p", { class: "form-hint", text:
     "Left off, the views follow the newest backup where the backup folder supports it, so a " +
     "scheduled backup reaches this file without downloading it again. Tick it to keep the rows " +
     "as they are today. The file says which one it did. (CLI: bintrail views --pin-snapshot)" }));
@@ -4212,9 +4219,9 @@ function duckdbCard() {
   // get them. The cost is stated on the page, not only in the generated file:
   // by the time they read the file, the bind is already running.
   const events = el("input", { type: "checkbox", name: "include_events" });
-  card.append(el("label", { class: "check" }, events,
+  opts.push(el("label", { class: "check" }, events,
     el("span", { text: "Include the change log" })));
-  card.append(el("p", { class: "form-hint", text:
+  opts.push(el("p", { class: "form-hint", text:
     "Adds a view over every archived change. It takes longer to open the further back your " +
     "archive goes, because it reads a piece of every archived file before answering anything. " +
     "(CLI: bintrail views --include-events)" }));
@@ -4224,12 +4231,12 @@ function duckdbCard() {
   const live = el("input", { type: "checkbox", name: "include_live", disabled: true });
   const liveLabel = el("label", { class: "check check-sub" }, live,
     el("span", { text: "…and the live index" }));
-  card.append(liveLabel);
+  opts.push(liveLabel);
   const liveHint = el("p", { class: "form-hint form-hint-sub", text:
     "Adds the most recent changes, the ones not archived yet. Every query over that leg scans the whole live capture index and competes " +
     "with capture on that server. The file will hold the index host and user, never its password: " +
     "fill that in when you run it. (CLI: bintrail views --include-live)" });
-  card.append(liveHint);
+  opts.push(liveHint);
   events.onchange = () => {
     live.disabled = !events.checked;
     // Cleared, not merely disabled: a disabled box KEEPS its checked state and
@@ -4239,6 +4246,7 @@ function duckdbCard() {
     liveLabel.classList.toggle("is-disabled", !events.checked);
     liveHint.classList.toggle("is-disabled", !events.checked);
   };
+  card.append(cnFine("Change what the file covers", ...opts));
   events.onchange();
   const btn = el("button", { class: "btn btn-sm", type: "button", text: "Open in DuckDB…" });
   btn.onclick = async () => {
