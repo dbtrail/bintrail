@@ -72,6 +72,11 @@ Archive sources come from the index's archive_state registry by default. Pass
 --archive-dir/--archive-s3 with --bintrail-id to name one explicitly instead;
 in that case --index-dsn is not needed at all.
 
+Only the events view reads an archive source, so a baselines-only file needs
+neither: --baseline-dir/--baseline-s3 on its own is enough. That is what a
+snapshot downloaded from the console arrives as, and it can be queried on a
+machine that cannot reach the index at all.
+
 The file is a snapshot of the layout, not a live binding. The state views point
 at one snapshot: regenerate after taking or refreshing a baseline. A daemon
 running bintrail-console watch --baseline-refresh-interval publishes a new
@@ -114,7 +119,7 @@ var (
 )
 
 func init() {
-	viewsCmd.Flags().StringVar(&vIndexDSN, "index-dsn", "", "DSN for the index MySQL database (used to discover archive sources; not needed with --archive-dir/--archive-s3)")
+	viewsCmd.Flags().StringVar(&vIndexDSN, "index-dsn", "", "DSN for the index MySQL database (used to discover archive sources; not needed with --archive-dir/--archive-s3, nor for a baselines-only file)")
 	viewsCmd.Flags().StringVar(&vArchiveDir, "archive-dir", "", "Local root directory of Parquet archives (requires --bintrail-id)")
 	viewsCmd.Flags().StringVar(&vArchiveS3, "archive-s3", "", "S3 root URL prefix of Parquet archives (requires --bintrail-id; e.g. s3://bucket/prefix/)")
 	viewsCmd.Flags().StringVar(&vBintrailID, "bintrail-id", "", "Server identity UUID (required when --archive-dir or --archive-s3 is set)")
@@ -149,9 +154,22 @@ func runViews(cmd *cobra.Command, _ []string) error {
 			"define: pass --include-events with it")
 	}
 	explicitArchives := vArchiveDir != "" || vArchiveS3 != ""
-	if vIndexDSN == "" && !explicitArchives {
-		return fmt.Errorf("--index-dsn is required (it is where archive sources are discovered); " +
-			"or name a source directly with --archive-dir/--archive-s3 plus --bintrail-id")
+	// An archive source is required only by the view that READS one. Since
+	// #1546 the events view is opt-in, so the default file defines state views
+	// over a baseline location and nothing else: demanding the index for it
+	// asks for a host the reader may not reach, to discover paths the file
+	// will never name. That is the shape a downloaded snapshot arrives in
+	// (GET /api/baselines/download), and the old check sent that reader to
+	// invent an --archive-dir to get the file it had just been refused.
+	//
+	// Keyed on --include-events rather than on "did anything get discovered":
+	// the operator asked for the view, so the refusal names what they asked
+	// for. A file that ends up defining nothing at all is still caught below
+	// by RendersAnyView, which reports the reason that actually applies.
+	if vIncludeEvents && vIndexDSN == "" && !explicitArchives {
+		return fmt.Errorf("--include-events needs an archive source: pass --index-dsn (it is where " +
+			"archive sources are discovered), or name one directly with --archive-dir/--archive-s3 " +
+			"plus --bintrail-id")
 	}
 
 	in := views.Input{
@@ -163,15 +181,20 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		OmitEvents:    !vIncludeEvents,
 	}
 
-	if explicitArchives {
+	switch {
+	case explicitArchives:
 		in.ArchiveSources = explicitArchiveSources()
-	} else {
+	case vIndexDSN != "":
 		sources, err := discoverArchiveSources(cmd.Context(), vIndexDSN)
 		if err != nil {
 			return err
 		}
 		in.ArchiveSources = sources
 		in.PortableRouting = true
+	default:
+		// No index and nothing named: a baselines-only file. Discovery is
+		// SKIPPED rather than run against an empty DSN, which would fail on
+		// the connection and report it as an index fault.
 	}
 
 	if vIncludeLive {

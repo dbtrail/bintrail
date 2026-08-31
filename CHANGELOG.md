@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`bintrail views` no longer demands `--index-dsn` for a baselines-only
+  file** (#1552). Only the `events` view reads an archive source, and since
+  0.74.0 that view is opt-in, so the default file defines `state_*` views over
+  a baseline location and names no archive path at all. The check was not
+  revisited when the default flipped, so it went on asking for the index in
+  order to discover sources the file would never use — and refused the exact
+  shape a snapshot downloaded from the console arrives in, on a machine that
+  may not reach the index at all. The documented way around it was to invent
+  an `--archive-dir`, which produced the file that had just been refused.
+
+  `--baseline-dir`/`--baseline-s3` on its own is now enough. `--include-events`
+  without `--index-dsn` and without `--archive-dir`/`--archive-s3` is still
+  refused, and names the view that needs the source rather than the flag that
+  supplies it. A file that would define nothing at all is still refused, by the
+  check keyed on what the file would contain, so the reason names the file
+  rather than a flag combination.
+
 ## [0.74.0] - 2026-08-31
 
 ### Changed

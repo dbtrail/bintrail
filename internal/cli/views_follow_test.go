@@ -31,11 +31,16 @@ func baselineDirWithTwoSnapshots(t *testing.T) (root, older, newer string) {
 
 // runViewsOverBaselines runs the command with only a baseline root configured
 // and returns the generated SQL.
+//
+// "Only" is literal now (#1552). This used to pass a throwaway --archive-dir,
+// because runViews refused a file with no archive source even when the file
+// defined no view that reads one — so the helper's own name was wrong, and the
+// dummy quietly gave these tests an archive source the scenario never had.
 func runViewsOverBaselines(t *testing.T, root string, pin bool) string {
 	t.Helper()
 	saveViewsFlags(t)
-	vIndexDSN, vArchiveDir, vArchiveS3, vBaselineS3 = "", t.TempDir(), "", ""
-	vBintrailID, vBaselineDir, vOut = "aaaa", root, "-"
+	vIndexDSN, vArchiveDir, vArchiveS3, vBaselineS3 = "", "", "", ""
+	vBintrailID, vBaselineDir, vOut = "", root, "-"
 	vNoBaselines, vIncludeLive, vIncludeEvents, vPinSnapshot = false, false, false, pin
 	out, err := runViewsToString(t)
 	if err != nil {
