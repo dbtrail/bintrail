@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/dbtrail/dbtrail/internal/baseline"
+	"github.com/dbtrail/dbtrail/internal/views"
 )
 
 // TestViewsAPI_bothShapesOfOneSnapshotKeepTheirCasts is the guard for a bug the
@@ -82,8 +83,9 @@ func TestSQLPanelInput_pins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildViewsInput: %v", err)
 	}
-	if in.FollowsSnapshot {
-		t.Fatal("the SQL panel's input follows the pointer; it executes its views, so it must pin")
+	if in.Follow != views.FollowNone {
+		t.Fatalf("a pin_snapshot=true download still follows (Follow=%v); pinning is the one "+
+			"request that must reach neither mechanism", in.Follow)
 	}
 	for _, b := range in.Baselines {
 		if strings.Contains(b.Path, baseline.CurrentLinkName) {

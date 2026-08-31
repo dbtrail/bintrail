@@ -30,16 +30,33 @@ func TestIncludeLiveHelp_saysWhatItQueries(t *testing.T) {
 	}
 }
 
-// TestViewsLongHelp_namesTheRefreshInterval is the command-help half of #1484.
+// TestViewsLongHelp_saysTheStateViewsFollow replaces the #1484 guard, whose
+// premise this command has now outgrown.
 //
-// The Long help said to regenerate "after taking or refreshing a baseline",
-// which reads as an action the operator takes. With the refresh on a timer
-// nobody takes it, and nothing regenerates the file.
-func TestViewsLongHelp_namesTheRefreshInterval(t *testing.T) {
-	for _, want := range []string{"--baseline-refresh-interval", "regenerate"} {
-		if !strings.Contains(strings.ToLower(viewsCmd.Long), strings.ToLower(want)) {
-			t.Errorf("the views help does not say %q:\n%s", want, viewsCmd.Long)
+// That guard required the Long help to name --baseline-refresh-interval,
+// because a timer-published snapshot left the file behind and the operator had
+// to regenerate on the same schedule. The state views now reach a later
+// snapshot on their own from either root shape (#1547 local, #1550 S3), so
+// repeating that advice would not merely be redundant, it would send an
+// operator to do work the product already does. What still needs saying is
+// which half does NOT follow, and how to opt out of the half that does.
+func TestViewsLongHelp_saysTheStateViewsFollow(t *testing.T) {
+	long := viewsCmd.Long
+	for _, want := range []string{
+		"current/",       // how a local root follows
+		"_SUCCESS",       // how an S3 root follows, having no pointer
+		"--pin-snapshot", // the opt-out, which is the only reason to mention either
+		"Regenerate after a table is added or dropped", // the half that never follows
+	} {
+		if !strings.Contains(long, want) {
+			t.Errorf("the views help does not say %q:\n%s", want, long)
 		}
+	}
+	// Named rather than left to the positive checks above: the sentence this
+	// replaces is a specific false claim, and a rewrite that reinstated it
+	// alongside the new ones would satisfy every check above.
+	if strings.Contains(long, "does not follow it") {
+		t.Error("the views help still claims the file does not follow a refreshed baseline")
 	}
 }
 

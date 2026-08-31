@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/query"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 	"github.com/dbtrail/dbtrail/internal/storage"
@@ -100,7 +99,7 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitE
 			// file, since following only happens when the pointer names this
 			// snapshot, so reading the pinned one costs nothing.
 			s.resolveBaselineDecimals(ctx, &in)
-			followBaselinePointer(&in, b.baselineSrc, pinSnapshot)
+			views.ApplyFollow(&in, b.baselineSrc, pinSnapshot)
 		}
 	}
 	if len(in.ArchiveSources) == 0 && len(in.Baselines) == 0 {
@@ -351,31 +350,4 @@ func (s *Server) viewsAvailable(r *http.Request, b *bundle) bool {
 	// sources is nil whenever err is set, so the err check is intent, not a
 	// distinct branch: the gate must never say yes on a failed read.
 	return err == nil && len(sources) > 0
-}
-
-// followBaselinePointer is the console's half of "follow the newest snapshot".
-// It mirrors the `bintrail views` wrapper exactly, and both defer the rule
-// itself to baseline.RewriteToPointer, so the two producers of a views file
-// cannot disagree about when following is safe.
-//
-// src may be an s3:// URL, which RewriteToPointer refuses on its own: there is
-// no pointer object in S3 to follow, and it looks for one on the filesystem. A
-// prefix check here would read as the guard while changing nothing, so the rule
-// is left in the one place that enforces it.
-func followBaselinePointer(in *views.Input, src string, pin bool) {
-	if pin {
-		return
-	}
-	paths := make([]string, len(in.Baselines))
-	for i, t := range in.Baselines {
-		paths[i] = t.Path
-	}
-	rewritten, ok := baseline.RewriteToPointer(src, paths)
-	if !ok {
-		return
-	}
-	for i := range in.Baselines {
-		in.Baselines[i].Path = rewritten[i]
-	}
-	in.FollowsSnapshot = true
 }

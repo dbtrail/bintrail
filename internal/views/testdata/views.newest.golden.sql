@@ -3,7 +3,7 @@
 --
 -- THIS FILE IS A SNAPSHOT OF THE LAYOUT, NOT A LIVE BINDING. The globs below
 -- keep picking up newly rotated partitions, and the baseline state views
--- follow the `current` pointer, so a refreshed baseline reaches them
+-- select the newest completed snapshot, so a refreshed baseline reaches them
 -- on its own. What does NOT follow is this file's idea of the SHAPE of the
 -- data: which views exist, and how each DECIMAL column is read, were decided
 -- from the snapshot named below. Re-run `bintrail views` (or download the file
@@ -23,11 +23,11 @@
 --
 -- A daemon running `bintrail-console watch --baseline-refresh-interval`
 -- publishes a new snapshot every interval, and the state views below move to
--- it when it completes. Replacing the pointer is a single step, so no path
--- ever resolves into a half-published snapshot, and a query already running
--- finishes against the files it opened. Two views resolved either side of that
--- one step can still land on different snapshots; the window is the swap
--- itself, not the hours a file left behind would span.
+-- it once it completes. They resolve which one ONCE, when this file is read,
+-- so every state view shows the same snapshot and none of them can drift
+-- apart mid-session. A refresh published while you are working is picked up
+-- by reading this file again, which is already what an S3 session needs to do
+-- for the secret above.
 --
 -- Nothing here writes: every view is a read over Parquet files you already own.
 --
@@ -38,8 +38,8 @@
 --   /data/archives/bintrail_id=11111111-2222-3333-4444-555555555555
 --   s3://my-bucket/archives/bintrail_id=66666666-7777-8888-9999-000000000000
 -- Baseline snapshot:
---   /data/baselines at 2026-04-30T03:00:00Z (4 table(s))
---   read through /data/baselines/current, which is that snapshot right now
+--   s3://my-bucket/baselines/ at 2026-04-30T03:00:00Z (4 table(s))
+--   read through the newest `_SUCCESS` snapshot, which is that one right now
 
 -- S3 setup, mirroring what bintrail's own DuckDB sessions configure.
 INSTALL httpfs; LOAD httpfs;
@@ -56,8 +56,8 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 --   CREATE OR REPLACE SECRET bintrail_s3_chain (
 --     TYPE s3, KEY_ID '…', SECRET '…', REGION '…');
 
--- state_<schema>_<table>: each table's full contents as of the snapshot the
--- `current` pointer names, which is whichever one completed most recently.
+-- state_<schema>_<table>: each table's full contents as of the newest snapshot
+-- carrying a `_SUCCESS` marker, chosen when the view is read.
 --
 -- These are the SNAPSHOT's rows, not the table's current state: changes after
 -- the snapshot live in the `events` view.
@@ -78,17 +78,27 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 -- refreshed; a PostgreSQL-source baseline stores all its values as text and
 -- will not gain them. If a footer could not be read at all, the bintrail log
 -- has the error.
+-- The snapshot every state view below reads through, resolved once, when this
+-- file is read. Re-run this statement to pick up a refresh without reopening
+-- the session; every view follows it, so they never disagree about which
+-- snapshot they are showing.
+SET VARIABLE bintrail_newest_snapshot = (
+  SELECT CASE WHEN max(file) IS NULL
+    THEN error('bintrail views: no completed snapshot under s3://my-bucket/baselines/ (nothing there carries a _SUCCESS marker). Take or refresh a baseline, then read this file again.')
+    ELSE max(regexp_replace(file, '_SUCCESS$', '')) END
+  FROM glob('s3://my-bucket/baselines/*/_SUCCESS'));
+
 -- state_legacy_db_audit_log: this file carries no column types, so nothing is cast; decimal columns read as text
 CREATE OR REPLACE VIEW "state_legacy_db_audit_log" AS
-  SELECT * FROM read_parquet('/data/baselines/current/Legacy-DB/Audit Log.parquet');
+  SELECT * FROM read_parquet(getvariable('bintrail_newest_snapshot') || 'Legacy-DB/Audit Log.parquet');
 CREATE OR REPLACE VIEW "state_shop_order_items" AS
-  SELECT * FROM read_parquet('/data/baselines/current/shop/order_items.parquet');
+  SELECT * FROM read_parquet(getvariable('bintrail_newest_snapshot') || 'shop/order_items.parquet');
 CREATE OR REPLACE VIEW "state_shop_orders" AS
   SELECT * REPLACE (CAST("total" AS DECIMAL(10,2)) AS "total", CAST("tax_rate" AS DECIMAL(6,4)) AS "tax_rate")
-  FROM read_parquet('/data/baselines/current/shop/orders.parquet');
+  FROM read_parquet(getvariable('bintrail_newest_snapshot') || 'shop/orders.parquet');
 -- state_shop_order_items_2: weight is DECIMAL(65,30), wider than DuckDB's 38 digits (left as text)
 CREATE OR REPLACE VIEW "state_shop_order_items_2" AS
-  SELECT * FROM read_parquet('/data/baselines/current/shop_order/items.parquet');
+  SELECT * FROM read_parquet(getvariable('bintrail_newest_snapshot') || 'shop_order/items.parquet');
 
 -- events: every archived binlog event, across all archive sources.
 --

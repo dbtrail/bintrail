@@ -149,22 +149,58 @@ func TestRunViews_doesNotFollowWhenTheRootHasNoPointer(t *testing.T) {
 	}
 }
 
-// TestFollowCurrentPointer_declinesForS3 pins that an S3 baseline root is never
-// followed. There is no pointer object to follow there: publishing one would
-// mean copying every table to a second prefix, which is not atomic across
-// tables, so a query could read half of one snapshot and half of another.
-func TestFollowCurrentPointer_declinesForS3(t *testing.T) {
+// TestApplyFollow_s3FollowsByMarkerNotByPointer pins WHICH mechanism an S3
+// baseline root gets (#1550).
+//
+// Never the pointer, and the original reason still holds: there is no pointer
+// object in S3, and publishing one would mean copying every table to a second
+// prefix, which is not atomic across tables, so a query could read half of one
+// snapshot and half of another. What changed is that refusing the pointer is no
+// longer the end of it — the views select the newest marked snapshot when they
+// are READ, which needs no second prefix and no rewritten path.
+//
+// The path staying put is half the assertion: under FollowNewest the following
+// lives in the emitted SQL, so a rewritten path here would mean two mechanisms
+// were applied to one table.
+func TestApplyFollow_s3FollowsByMarkerNotByPointer(t *testing.T) {
 	in := &views.Input{
 		BaselineSource: "s3://bucket/baselines/",
 		Baselines: []views.BaselineTable{
 			{Schema: "shop", Table: "orders", Path: "s3://bucket/baselines/2026-06-10T12-00-00Z/shop/orders.parquet"},
 		},
 	}
-	followCurrentPointer(in, "", false) // --baseline-s3 leaves the local root empty
-	if in.FollowsSnapshot {
-		t.Fatal("an S3 baseline root was marked as following a pointer")
+	views.ApplyFollow(in, in.BaselineSource, false)
+	if in.Follow != views.FollowNewest {
+		t.Fatalf("an S3 baseline root got Follow=%v, want FollowNewest", in.Follow)
 	}
 	if !strings.Contains(in.Baselines[0].Path, "2026-06-10T12-00-00Z") {
 		t.Fatalf("S3 path was rewritten: %q", in.Baselines[0].Path)
+	}
+	if strings.Contains(in.Baselines[0].Path, baseline.CurrentLinkName) {
+		t.Fatalf("S3 path was pointed at a pointer that cannot exist: %q", in.Baselines[0].Path)
+	}
+	if got := in.Baselines[0].Rel; got != "shop/orders.parquet" {
+		t.Errorf("Rel is %q, want the path below the snapshot directory", got)
+	}
+}
+
+// TestApplyFollow_pinRefusesEveryMechanism keeps --pin-snapshot ahead of the
+// mechanism choice. It is the operator asking for today's rows to stay today's,
+// and an answer of "not the pointer, so the marker instead" would honour the
+// letter of the refusal while following anyway.
+func TestApplyFollow_pinRefusesEveryMechanism(t *testing.T) {
+	in := &views.Input{
+		BaselineSource: "s3://bucket/baselines/",
+		Baselines: []views.BaselineTable{
+			{Schema: "shop", Table: "orders", Path: "s3://bucket/baselines/2026-06-10T12-00-00Z/shop/orders.parquet"},
+		},
+	}
+	views.ApplyFollow(in, in.BaselineSource, true)
+	if in.Follow != views.FollowNone {
+		t.Fatalf("--pin-snapshot still followed, with Follow=%v", in.Follow)
+	}
+	if in.Baselines[0].Rel != "" {
+		t.Errorf("a pinned table carries Rel=%q; nothing should have been prepared to follow with",
+			in.Baselines[0].Rel)
 	}
 }

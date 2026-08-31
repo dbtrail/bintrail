@@ -77,13 +77,18 @@ neither: --baseline-dir/--baseline-s3 on its own is enough. That is what a
 snapshot downloaded from the console arrives as, and it can be queried on a
 machine that cannot reach the index at all.
 
-The file is a snapshot of the layout, not a live binding. The state views point
-at one snapshot: regenerate after taking or refreshing a baseline. A daemon
-running bintrail-console watch --baseline-refresh-interval publishes a new
-snapshot every interval and this file does not follow it, with no error and no
-warning, so regenerate on that same schedule. (With --include-events, that
-view's globs DO keep picking up newly rotated partitions on their own -- it is
-the one self-following part of the file.)
+The file is a snapshot of the LAYOUT, not of the rows. The state views reach a
+baseline published later on their own, by whichever route the root allows: a
+--baseline-dir file reads through the current/ pointer, and a --baseline-s3
+file, which has no pointer object to read through, has each view select the
+newest snapshot carrying a _SUCCESS marker at the moment it is read. Pass
+--pin-snapshot to bind them to the snapshot that exists now instead.
+
+What does NOT follow is the shape: which views exist, and how each DECIMAL
+column is read, were both decided from the snapshot named in the file.
+Regenerate after a table is added or dropped, after a column changes type, and
+whenever archive sources are added or removed. (With --include-events, that
+view's globs also keep picking up newly rotated partitions on their own.)
 
 Examples:
   # One view per table, as of the newest baseline snapshot
@@ -352,38 +357,8 @@ func resolveBaselineViews(ctx context.Context, in *views.Input) error {
 	// nothing, so every DECIMAL column ships uncast while the file blames an
 	// unreadable footer that was never read.
 	resolveBaselineDecimals(ctx, in)
-	followCurrentPointer(in, vBaselineDir, vPinSnapshot)
+	views.ApplyFollow(in, in.BaselineSource, vPinSnapshot)
 	return nil
-}
-
-// followCurrentPointer repoints the resolved state view paths at the baselines
-// root's `current` symlink, so a snapshot published later reaches an
-// already-generated file (#1484). It reports what it did through
-// in.FollowsSnapshot, which is what makes the generated file describe itself.
-//
-// --pin-snapshot is the only decision made here: the operator asked for today's
-// rows to stay today's. Every other reason to pin belongs to the rule itself
-// and lives in baseline.RewriteToPointer, so the console download cannot end up
-// following under conditions this command would not.
-//
-// root is the LOCAL baselines directory, and is "" under --baseline-s3: an S3
-// root has no pointer to follow.
-func followCurrentPointer(in *views.Input, root string, pin bool) {
-	if pin {
-		return
-	}
-	paths := make([]string, len(in.Baselines))
-	for i, t := range in.Baselines {
-		paths[i] = t.Path
-	}
-	rewritten, ok := baseline.RewriteToPointer(root, paths)
-	if !ok {
-		return
-	}
-	for i := range in.Baselines {
-		in.Baselines[i].Path = rewritten[i]
-	}
-	in.FollowsSnapshot = true
 }
 
 // resolveBaselineDecimals reads each table's column types out of its Parquet

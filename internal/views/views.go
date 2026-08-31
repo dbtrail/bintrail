@@ -29,10 +29,48 @@ import (
 )
 
 // BaselineTable names one table's Parquet file inside a baseline snapshot.
+// FollowMode says how the state views reach a snapshot published after this
+// file was generated. The two following modes buy the same thing by different
+// means, and they do NOT cost the reader the same, which is why they are
+// distinct values rather than one bool.
+type FollowMode int
+
+const (
+	// FollowNone pins the views to the snapshot discovered at generation time.
+	// Rows stop changing; regenerating the file is what moves them.
+	FollowNone FollowMode = iota
+	// FollowPointer names the baselines root's `current` symlink in every
+	// path. One rename(2) moves every table at once, so no query can resolve
+	// into a half-published snapshot and no two views can disagree about which
+	// snapshot they are reading.
+	FollowPointer
+	// FollowNewest resolves the newest `_SUCCESS`-marked snapshot into a session
+	// variable that every state view reads through. It is the only following
+	// available on an S3 root, which has no pointer to rewrite.
+	//
+	// One variable, so the views agree with each other the way the pointer makes
+	// them agree. What differs is WHEN: the pointer is followed per query, this
+	// is resolved when the file is read. In practice that is the same session
+	// boundary an S3 file already has, since its credentials do not persist
+	// either.
+	FollowNewest
+)
+
+// follows reports whether the state views move on their own, for the wording
+// both following modes share.
+func (m FollowMode) follows() bool { return m != FollowNone }
+
 type BaselineTable struct {
 	Schema string
 	Table  string
 	Path   string // local path or s3:// URL of the table's .parquet file
+	// Rel is Path relative to its snapshot directory ("schema/table.parquet"),
+	// set by the producer only under FollowNewest. The following there is a SQL
+	// shape rather than a path, and it needs the tail on its own to rebuild the
+	// file name against whichever snapshot the query picks. Deriving it back
+	// out of Path in the generator would be a second opinion about the layout;
+	// the producer already split it once to decide it could follow at all.
+	Rel string
 
 	// Decimals are the table's DECIMAL and NUMERIC columns, which the baseline
 	// writer stores as text (internal/baseline.MysqlToParquetNode says why).
@@ -176,16 +214,10 @@ type Input struct {
 	// the header. BaselineSnapshot is that snapshot's timestamp.
 	BaselineSource   string
 	BaselineSnapshot time.Time
-	// FollowsSnapshot records that the state view paths name the baselines
-	// root's `current` pointer instead of a snapshot directory, so a later
-	// snapshot reaches this file without regenerating it (#1484).
-	//
-	// It changes only what the file SAYS; the following itself is in the paths
-	// the producer put in Baselines. A producer sets it when it rewrote those
-	// paths AND the pointer names the snapshot it selected — following a
-	// pointer that names something else would serve rows the header does not
-	// describe. S3 roots never set it: there is no pointer there to follow.
-	FollowsSnapshot bool
+	// Follow records how, if at all, the state views reach a snapshot published
+	// after this file was generated (#1484, #1550). ApplyFollow is what sets
+	// it; see FollowMode for what each mode costs the reader.
+	Follow FollowMode
 	// Baselines are the tables of the NEWEST discoverable snapshot only. An
 	// older snapshot's rows are a different point in time, and a view union-ing
 	// two of them would silently mix states that never coexisted.
@@ -505,18 +537,26 @@ func writeHeader(b *strings.Builder, in Input) {
 		orUnknown(in.Version), in.GeneratedAt.UTC().Format(time.RFC3339))
 	b.WriteString("--\n")
 	b.WriteString("-- THIS FILE IS A SNAPSHOT OF THE LAYOUT, NOT A LIVE BINDING. ")
-	if in.FollowsSnapshot {
+	if in.Follow.follows() {
 		// The state views follow too, so the sentence above is now only about
 		// SHAPE. Say which shape, concretely: a reader who knows a new table
 		// will not appear on its own can schedule a regeneration; one told
 		// only "not a live binding" cannot tell what still needs doing.
+		//
+		// Which MECHANISM follows is named rather than glossed as "follow":
+		// the two do not fail the same way, and the reader who has to reason
+		// about a mid-session refresh needs to know which one is in the file.
+		how := "follow the `" + baseline.CurrentLinkName + "` pointer"
+		if in.Follow == FollowNewest {
+			how = "select the newest completed snapshot"
+		}
 		if in.rendersEvents() {
 			b.WriteString("The globs below\n")
 			b.WriteString("-- keep picking up newly rotated partitions, and the baseline state views\n")
-			b.WriteString("-- follow the `" + baseline.CurrentLinkName + "` pointer, so a refreshed baseline reaches them\n")
+			b.WriteString("-- " + how + ", so a refreshed baseline reaches them\n")
 		} else {
 			b.WriteString("The baseline state\n")
-			b.WriteString("-- views follow the `" + baseline.CurrentLinkName + "` pointer, so a refreshed baseline reaches them\n")
+			b.WriteString("-- views " + how + ", so a refreshed baseline reaches them\n")
 		}
 		b.WriteString("-- on its own. What does NOT follow is this file's idea of the SHAPE of the\n")
 		b.WriteString("-- data: which views exist, and how each DECIMAL column is read, were decided\n")
@@ -526,8 +566,8 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("--\n")
 		b.WriteString("-- Which of those you will notice follows one rule: this file names only the\n")
 		b.WriteString("-- PATHS and the DECIMAL columns, so only those two can fail. A table that\n")
-		b.WriteString("-- leaves the newest snapshot stops resolving and DuckDB names the missing\n")
-		b.WriteString("-- path; a DECIMAL column that is renamed or dropped fails the whole script.\n")
+		b.WriteString("-- leaves the newest snapshot stops resolving and reading this file fails,\n")
+		b.WriteString("-- naming the path; a DECIMAL column renamed or dropped fails the script.\n")
 		b.WriteString("-- Everything else is QUIET, because `SELECT *` passes it through untouched:\n")
 		b.WriteString("-- a table added to the source has no view here, a DECIMAL whose scale grew is\n")
 		b.WriteString("-- read at the old scale with the extra digits rounded away, a column that\n")
@@ -560,15 +600,29 @@ func writeHeader(b *strings.Builder, in Input) {
 	// caveat: the pinned half warns that the rows stop changing, and under
 	// following that warning is simply false. The pinned arm stays phrased so
 	// it holds with no state views at all ("ANY state view below"); the
-	// following arm may assert they exist, because FollowsSnapshot is only ever
-	// set alongside a non-empty Baselines.
+	// following arms may assert they exist, because ApplyFollow only ever
+	// leaves Follow set alongside a non-empty Baselines.
 	//
 	// "nothing regenerates this file", NOT "nothing re-runs this command": the
 	// console download is produced by a page, not a command, which is the same
 	// distinction Input.LiveLegUnavailable exists to make. The paragraph above
 	// already names both routes.
 	b.WriteString("--\n")
-	if in.FollowsSnapshot {
+	switch {
+	case in.Follow == FollowNewest:
+		// The same paragraph as the pointer arm up to the last two sentences,
+		// which is where the two mechanisms actually differ. Stating the
+		// weaker guarantee is not optional: a reader who was told "a single
+		// step" would reasonably assume the whole file moves together, and
+		// here it does not.
+		b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
+		b.WriteString("-- publishes a new snapshot every interval, and the state views below move to\n")
+		b.WriteString("-- it once it completes. They resolve which one ONCE, when this file is read,\n")
+		b.WriteString("-- so every state view shows the same snapshot and none of them can drift\n")
+		b.WriteString("-- apart mid-session. A refresh published while you are working is picked up\n")
+		b.WriteString("-- by reading this file again, which is already what an S3 session needs to do\n")
+		b.WriteString("-- for the secret above.\n")
+	case in.Follow == FollowPointer:
 		// The paragraph this replaces exists because a timer-published
 		// snapshot has no operator action to attach "regenerate" to. Following
 		// removes that need for ROWS and leaves it for SHAPE, so the same
@@ -580,7 +634,7 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("-- finishes against the files it opened. Two views resolved either side of that\n")
 		b.WriteString("-- one step can still land on different snapshots; the window is the swap\n")
 		b.WriteString("-- itself, not the hours a file left behind would span.\n")
-	} else {
+	default:
 		b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
 		b.WriteString("-- publishes a new snapshot every interval, and nothing regenerates this file.\n")
 		b.WriteString("-- Any state view below stays bound to the snapshot it was generated against,\n")
@@ -625,13 +679,19 @@ func writeHeader(b *strings.Builder, in Input) {
 	default:
 		fmt.Fprintf(b, "--   %s at %s (%d table(s))\n",
 			in.BaselineSource, in.BaselineSnapshot.UTC().Format(time.RFC3339), len(in.Baselines))
-		if in.FollowsSnapshot {
+		switch in.Follow {
+		case FollowPointer:
 			// Name the timestamp AND the pointer: the timestamp is what the
 			// column types were read from, the pointer is what the views
 			// actually open. Reporting only one of the two would make a
 			// followed file indistinguishable from a pinned one.
 			fmt.Fprintf(b, "--   read through %s/%s, which is that snapshot right now\n",
 				strings.TrimSuffix(in.BaselineSource, "/"), baseline.CurrentLinkName)
+		case FollowNewest:
+			// Same job as the pointer line, and the same reason: the timestamp
+			// above is where the column types came from, not what the views
+			// open. What they open is decided per read.
+			b.WriteString("--   read through the newest `_SUCCESS` snapshot, which is that one right now\n")
 		}
 	}
 	b.WriteString("\n")
@@ -1360,10 +1420,14 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 	if in.OnlyViews != nil && len(wanted) == 0 {
 		return false
 	}
-	if in.FollowsSnapshot {
+	switch in.Follow {
+	case FollowPointer:
 		b.WriteString("-- state_<schema>_<table>: each table's full contents as of the snapshot the\n")
 		b.WriteString("-- `" + baseline.CurrentLinkName + "` pointer names, which is whichever one completed most recently.\n")
-	} else {
+	case FollowNewest:
+		b.WriteString("-- state_<schema>_<table>: each table's full contents as of the newest snapshot\n")
+		b.WriteString("-- carrying a `" + baseline.SuccessMarker + "` marker, chosen when the view is read.\n")
+	default:
 		b.WriteString("-- state_<schema>_<table>: each table's full contents as of the baseline snapshot.\n")
 	}
 	b.WriteString("--\n")
@@ -1393,6 +1457,9 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 		return false
 	}
 	writeDecimalNote(b, in)
+	if in.Follow == FollowNewest {
+		writeNewestSnapshotVar(b, in)
+	}
 
 	for _, p := range wanted {
 		t, name := p.table, p.name
@@ -1400,6 +1467,10 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 			fmt.Fprintf(b, "-- %s: %s\n", name, line)
 		}
 		fmt.Fprintf(b, "CREATE OR REPLACE VIEW %s AS\n", quoteIdent(name))
+		if in.Follow == FollowNewest {
+			writeNewestStateBody(b, t)
+			continue
+		}
 		if replace := decimalReplaceClause(t); replace != "" {
 			fmt.Fprintf(b, "  SELECT * REPLACE (%s)\n", replace)
 			fmt.Fprintf(b, "  FROM read_parquet(%s);\n", sqlString(t.Path))
@@ -1409,6 +1480,62 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 	}
 	b.WriteString("\n")
 	return len(wanted) > 0
+}
+
+// newestVar is the session variable holding the snapshot directory every state
+// view reads through, under FollowNewest.
+//
+// ONE variable for the whole file, which is what makes this mechanism cost what
+// pinning costs. The obvious shape -- each view scanning every snapshot's copy
+// of its table and filtering down to one -- was written, measured and rejected:
+// DuckDB binds a view when it is CREATED, so a glob in the view body pays a
+// storage listing per view, and that listing grows with the root. Against a real
+// S3 root of 24 snapshots it opened a 47-view file in 170s where pinning took
+// 31s, and the gap widens with every refresh published.
+//
+// Resolving once also restores what the `current` pointer gives and the rejected
+// shape could not: every view agrees on one snapshot, because there is one value
+// to disagree about.
+const newestVar = "bintrail_newest_snapshot"
+
+// writeNewestSnapshotVar emits the lookup that picks the snapshot, for a root
+// with no `current` pointer to rewrite (#1550).
+//
+// The CASE is not decoration. With no marker under the root, max() is NULL, and
+// a NULL variable reaches read_parquet as "cannot take NULL list as parameter",
+// which is true and tells the reader nothing about baselines. Raising here names
+// the root and the marker instead, and does it when the FILE IS READ rather than
+// at the first query.
+func writeNewestSnapshotVar(b *strings.Builder, in Input) {
+	root := strings.TrimSuffix(in.BaselineSource, "/")
+	b.WriteString("-- The snapshot every state view below reads through, resolved once, when this\n")
+	b.WriteString("-- file is read. Re-run this statement to pick up a refresh without reopening\n")
+	b.WriteString("-- the session; every view follows it, so they never disagree about which\n")
+	b.WriteString("-- snapshot they are showing.\n")
+	fmt.Fprintf(b, "SET VARIABLE %s = (\n", newestVar)
+	b.WriteString("  SELECT CASE WHEN max(file) IS NULL\n")
+	fmt.Fprintf(b, "    THEN error(%s)\n", sqlString(
+		"bintrail views: no completed snapshot under "+root+"/ (nothing there carries a "+
+			baseline.SuccessMarker+" marker). Take or refresh a baseline, then read this file again."))
+	fmt.Fprintf(b, "    ELSE max(regexp_replace(file, %s, '')) END\n", sqlString(baseline.SuccessMarker+"$"))
+	fmt.Fprintf(b, "  FROM glob(%s));\n\n", sqlString(root+"/*/"+baseline.SuccessMarker))
+}
+
+// writeNewestStateBody emits one state view's body under FollowNewest: a read of
+// ONE Parquet file, whose directory comes from the session variable.
+//
+// A table that has left the newest snapshot fails here, loudly, with DuckDB's
+// own "No files found that match the pattern" naming the exact path it looked
+// for. That is the guarantee this mechanism exists to keep: reading as EMPTY a
+// table that should have had rows is a worse answer than reading a stale one.
+func writeNewestStateBody(b *strings.Builder, t BaselineTable) {
+	read := fmt.Sprintf("read_parquet(getvariable('%s') || %s)", newestVar, sqlString(t.Rel))
+	if replace := decimalReplaceClause(t); replace != "" {
+		fmt.Fprintf(b, "  SELECT * REPLACE (%s)\n", replace)
+		fmt.Fprintf(b, "  FROM %s;\n", read)
+		return
+	}
+	fmt.Fprintf(b, "  SELECT * FROM %s;\n", read)
 }
 
 // stateViewName builds the view identifier for a table and guarantees it is
