@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The Download a DuckDB schema card moved from the SQL page to Connect**
+  (#1549). `GET /api/views.sql` requires `settings:read`, but its only route in
+  the UI was a nav item gated `data-perm="query:execute"` and on the `sql`
+  capability. So a `settings:read` role could not reach a download the server
+  would have authorized, a `query:execute` role without `settings:read` got a
+  button that only 403s, and `BINTRAIL_CONSOLE_SQL_PANEL=0` removed the card
+  altogether while `views` stayed on — taking it from the operator who declined
+  server-side query execution and whose file executes nothing. Connect carries
+  no capability or permission gate of its own and already calls `settings:read`
+  endpoints. The SQL page keeps a line pointing at it.
+
 ### Fixed
 - **`bintrail views` no longer demands `--index-dsn` for a baselines-only
   file** (#1552). Only the `events` view reads an archive source, and since

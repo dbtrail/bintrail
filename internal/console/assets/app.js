@@ -4305,10 +4305,19 @@ async function renderSQL() {
 
   const results = el("div", { id: "sql-results" });
   v.append(results);
-  // Moved from Storage (#1543): it generates the view definitions for the
-  // SAME data this page queries, for a client that is not this page. It read
-  // as a storage setting only because Storage was where unplaced cards went.
-  if (capsCache.views) v.append(el("div", { class: "cards", style: "margin-top:18px" }, duckdbCard()));
+  // The card itself moved to Connect (#1549) so it stops being gated by a
+  // capability and a permission that are not its own. A line, not a second
+  // card: someone querying here is the likeliest person to want the same
+  // views in their own DuckDB, and they should not have to find out that the
+  // page exists.
+  if (capsCache.views) {
+    const p = el("p", { class: "form-hint", style: "margin-top:18px" },
+      el("span", { text: "Want these views in your own DuckDB? Download the schema on " }));
+    p.append(el("a", { href: "/connect", text: "Connect",
+      onclick: (e) => { e.preventDefault(); navigate("connect"); } }));
+    p.append(el("span", { text: "." }));
+    v.append(p);
+  }
   viewEnter();
 
   const run = () => runSQL(input.value, { runBtn, cancelBtn, statusLine, results });
@@ -6524,6 +6533,22 @@ function buildConnect(servers, tokStatus, minted, fbStatus) {
   cards.append(mcpTokenCard(tokStatus, minted));
   cards.append(mcpEndpointCard(servers));
   cards.append(bundleCard());
+  // The DuckDB schema download lives here (#1549), not on /sql where #1543 put
+  // it. Two reasons, both mechanical rather than editorial:
+  //
+  // GET /api/views.sql requires settings:read, and its only door there was a
+  // nav item gated data-perm="query:execute" — so a settings:read role could
+  // not reach the download the server would have authorized, and a
+  // query:execute role without settings:read got a button that 403s. This page
+  // carries no data-perm, and every endpoint it already calls (/api/mcp-token,
+  // /api/flashback) requires the same settings:read.
+  //
+  // And the card was mounted inside renderSQL, which the sql capability gates.
+  // Turning the panel off left `views` on with no UI route at all — punishing
+  // exactly the operator who declined server-side execution, whose file
+  // executes nothing. Appended LAST so the .cards nth-child(4n+1) tint keeps
+  // landing on the same card it does today.
+  if (capsCache.views) cards.append(duckdbCard());
   v.append(cards);
   if (capsCache.mcp) v.append(otherClientsPanel(servers));
   v.append(sqlClientPanel(servers, fbStatus));

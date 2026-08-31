@@ -528,8 +528,13 @@ Two cards left the page entirely. **Backups & disk space** moved to the
 Backups page, beside the **Scheduled backups** it was being confused with:
 those two names both promised "backups, automatically" from different pages,
 for unrelated settings, and side by side the difference needs no paragraph.
-**Download a DuckDB schema** moved to the SQL page, which queries the same
-data. The old `/storage` link still works and lands on Retention.
+**Download a DuckDB schema** moved to the SQL page, and from there to
+**Connect** (#1549): `GET /api/views.sql` requires `settings:read`, while the
+SQL page is gated on `query:execute` and on the `sql` capability, so the
+download was unreachable for a role the endpoint would have authorized, and
+gone entirely on a daemon started with `BINTRAIL_CONSOLE_SQL_PANEL=0`. Connect
+carries neither gate and already serves `settings:read` endpoints. The old
+`/storage` link still works and lands on Retention.
 
 - **Backups & disk space** (#1528/#1543, formerly *File reuse for unchanged
   tables*, and before that *Automatic backup refresh*) — the one behaviour
@@ -560,7 +565,7 @@ data. The old `/storage` link still works and lands on Retention.
   could not be removed stays listed with the reason (a previous build a
   newer one could not clear included) and is retried every minute. Shown
   only on a daemon that can build `.sql` backups.
-- **Download a DuckDB schema** (#1528, formerly *Query in DuckDB*; on the SQL page since #1543) — a one-click download of `views.sql`: a ready-made
+- **Download a DuckDB schema** (#1528, formerly *Query in DuckDB*; on Connect since #1549) — a one-click download of `views.sql`: a ready-made
   DuckDB schema over the selected server's own Parquet — one
   `state_<schema>_<table>` view per table in the newest baseline snapshot, plus
   an `events` view across every archive source registered in `archive_state`
