@@ -3950,7 +3950,7 @@ try {
       // measurement; a card that cannot be found reads as -1, never as 0,
       // which would pass the budget by measuring nothing.
       duckCardChars: (() => {
-        const c = Array.from(document.querySelectorAll(".view .card"))
+        const c = Array.from(document.querySelectorAll(".view .card, .view .ov-panel"))
           .find((n) => /Download a DuckDB schema/.test(n.textContent || ""));
         return c ? c.innerText.length : -1;
       })(),

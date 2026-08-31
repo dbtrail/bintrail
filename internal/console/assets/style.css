@@ -2628,12 +2628,30 @@ button { font-family: inherit; }
    described. Three tiles are your tables, one file each; the strip is the
    archived change log, one file per hour. dk-off is the unticked state, so
    ticking the box lights the strip and the cost is seen instead of read. */
-.dk-shape { display: flex; flex-direction: column; gap: 10px; margin: 12px 0 14px; }
-.dk-part.dk-off { opacity: 0.28; }
-.dk-row { display: flex; align-items: flex-end; gap: 4px; flex-wrap: wrap; }
-.dk-tile { width: 26px; height: 26px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--line); flex: none; }
-.dk-bar { width: 5px; height: 20px; border-radius: 2px; background: var(--surface-2); border: 1px solid var(--line); flex: none; }
+/* Capped so the strip below has an edge to run off. Without a boundary the
+   mask fades nothing and the row reads as a countable set. */
+.dk-shape { display: flex; flex-direction: column; gap: 10px; margin: 12px 0 14px; max-width: 320px; }
+.dk-row { display: flex; align-items: flex-end; gap: 4px; }
+/* SOLID fills, and that is the whole correction. These marks were drawn in
+   --surface-2, which is what --panel-bg resolves to: the fill measured 1.000
+   against its own ground and only the hairline ever drew them. On the tinted
+   card that went unnoticed, because the tint gave the fill a ground to differ
+   from; moving to the neutral panel is what exposed it. */
+.dk-tile { width: 26px; height: 26px; border-radius: 5px; background: var(--ink-4); flex: none; }
+/* Must stay AFTER .dk-row: both are 0-1-0, so source order decides the gap. */
+.dk-strip {
+  flex-wrap: nowrap; overflow: hidden; gap: 3px;
+  -webkit-mask-image: linear-gradient(90deg, #000 60%, transparent);
+  mask-image: linear-gradient(90deg, #000 60%, transparent);
+}
+/* --accent is the checkbox's own accent-color, so ticking the box paints the
+   strip the exact colour of the tick: the control and the drawing say the same
+   thing in the same colour, in every theme. The tiles stay neutral because
+   they are the constant; the only hue marks the only decision. */
+.dk-bar { width: 5px; height: 14px; border-radius: 2px; background: var(--accent); flex: none; }
+.dk-off .dk-bar { background: var(--line); }
 .dk-cap { font-size: 11.5px; color: var(--ink-3); margin-top: 5px; }
+.cn-dk-body { padding: 0 14px 14px; }
 
 .cn-mock { border: 1px solid oklch(0.5 0.05 320 / 0.22); border-radius: 10px; background: var(--surface); margin: 10px 0; max-width: 430px; box-shadow: 0 1px 2px rgb(0 0 0 / 0.04); }
 .cn-mock-bar { display: flex; align-items: center; padding: 7px 12px; border-bottom: 1px solid var(--line-soft); color: var(--ink-4); font-size: 11.5px; }

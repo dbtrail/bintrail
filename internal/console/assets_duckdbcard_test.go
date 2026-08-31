@@ -2,6 +2,7 @@ package console
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -20,11 +21,11 @@ import (
 // first-time reader, and the live leg in particular can compete with capture on
 // the source server. So exactly one box, and it is the change log.
 func TestDuckDBCardOffersOneDecision(t *testing.T) {
-	body := functionBody(t, readAsset(t, "app.js"), "function duckdbCard(")
+	body := functionBody(t, readAsset(t, "app.js"), "function duckdbPanel(")
 
 	boxes := strings.Count(body, `type: "checkbox"`)
 	if boxes != 1 {
-		t.Errorf("duckdbCard renders %d checkboxes, want exactly 1 (the change log); "+
+		t.Errorf("duckdbPanel renders %d checkboxes, want exactly 1 (the change log); "+
 			"pin-snapshot and include-live are CLI flags and route parameters, not first-visit decisions", boxes)
 	}
 	if !strings.Contains(body, "include_events=1") {
@@ -39,7 +40,7 @@ func TestDuckDBCardOffersOneDecision(t *testing.T) {
 	// parameters, which would be worse than the checkboxes were.
 	for _, gone := range []string{"include_live", "pin_snapshot"} {
 		if strings.Contains(body, gone) {
-			t.Errorf("duckdbCard names %s again; it was removed from this surface, not moved into a default", gone)
+			t.Errorf("duckdbPanel names %s again; it was removed from this surface, not moved into a default", gone)
 		}
 	}
 }
@@ -59,19 +60,28 @@ func TestDuckDBCardOffersOneDecision(t *testing.T) {
 func TestDuckDBCardDrawsTheCostInsteadOfStatingIt(t *testing.T) {
 	js := readAsset(t, "app.js")
 	shape := functionBody(t, js, "function duckdbShape(")
-	card := functionBody(t, js, "function duckdbCard(")
+	card := functionBody(t, js, "function duckdbPanel(")
 
 	// Both halves exist, and the change log is drawn as MANY units against the
 	// tables' few. That contrast is the whole explanation; equal counts would
 	// render a picture that says the two cost the same.
-	tiles := regexp.MustCompile(`tiles\((\d+), "dk-tile"\)`).FindStringSubmatch(shape)
-	bars := regexp.MustCompile(`tiles\((\d+), "dk-bar"\)`).FindStringSubmatch(shape)
+	tiles := regexp.MustCompile(`tiles\((\d+), "dk-tile"`).FindStringSubmatch(shape)
+	bars := regexp.MustCompile(`tiles\((\d+), "dk-bar"`).FindStringSubmatch(shape)
 	if tiles == nil || bars == nil {
 		t.Fatal("duckdbShape no longer draws both a tile row (your tables) and a bar row (the change log)")
 	}
-	if len(bars[1]) <= len(tiles[1]) {
-		t.Errorf("the change log is drawn with %s units against the tables' %s; the picture has to show that "+
-			"one is a file per table and the other a file per archived hour", bars[1], tiles[1])
+	// Compared as NUMBERS. This read len() of the digit strings, which is not
+	// quantity: it passed 24-vs-3 for the wrong reason and would have failed a
+	// perfectly good 9-vs-3. A picture guard that cannot compare the two
+	// quantities it exists to compare is decoration.
+	nTiles, err1 := strconv.Atoi(tiles[1])
+	nBars, err2 := strconv.Atoi(bars[1])
+	if err1 != nil || err2 != nil {
+		t.Fatalf("could not read the drawn counts (tiles=%q bars=%q)", tiles[1], bars[1])
+	}
+	if nBars < nTiles*4 {
+		t.Errorf("the change log is drawn with %d units against the tables' %d; the picture has to read as a "+
+			"different order of quantity, not as slightly more", nBars, nTiles)
 	}
 
 	// The strip is dimmed until the box is ticked, and the card is what wires
@@ -100,7 +110,7 @@ func TestDuckDBCardDrawsTheCostInsteadOfStatingIt(t *testing.T) {
 // than in CI when someone starts explaining again.
 func TestDuckDBCardStaysNearlyTextless(t *testing.T) {
 	js := readAsset(t, "app.js")
-	body := functionBody(t, js, "function duckdbCard(")
+	body := functionBody(t, js, "function duckdbPanel(")
 	// Only text OUTSIDE the fold: cnFine's contents are one click away and are
 	// not what a first-time reader meets. Everything up to the fold is visible.
 	visible := body
@@ -114,10 +124,10 @@ func TestDuckDBCardStaysNearlyTextless(t *testing.T) {
 		}
 	}
 	if total == 0 {
-		t.Fatal("no visible text found in duckdbCard; this guard covers nothing")
+		t.Fatal("no visible text found in duckdbPanel; this guard covers nothing")
 	}
 	if total > 200 {
-		t.Errorf("duckdbCard's visible text is %d characters. The card explains itself by drawing; "+
+		t.Errorf("duckdbPanel's visible text is %d characters. The card explains itself by drawing; "+
 			"if something needs saying, either draw it or put it behind cnFine", total)
 	}
 }

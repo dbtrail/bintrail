@@ -225,11 +225,11 @@ func TestStorageSplit_eachHalfHoldsOnlyItsOwnConcern(t *testing.T) {
 	}{
 		// What happens to your data over time. Nothing about this process.
 		{"buildRetention", []string{"rotationCard(", "archivingPanel("},
-			[]string{"credentialsCard(", "stagingCard(", "telemetryCard(", "backupRefreshCard(", "duckdbCard("}},
+			[]string{"credentialsCard(", "stagingCard(", "telemetryCard(", "backupRefreshCard(", "duckdbPanel("}},
 		// What this process is reaching, holding and sending. Nothing about
 		// the data lifecycle.
 		{"buildDaemon", []string{"credentialsCard(", "stagingCard(", "telemetryCard("},
-			[]string{"rotationCard(", "archivingPanel(", "backupRefreshCard(", "duckdbCard("}},
+			[]string{"rotationCard(", "archivingPanel(", "backupRefreshCard(", "duckdbPanel("}},
 	} {
 		body := jsFunctionBody(t, js, tc.fn)
 		for _, w := range tc.want {
@@ -255,7 +255,7 @@ func TestStorageSplit_eachHalfHoldsOnlyItsOwnConcern(t *testing.T) {
 	//
 	// Named explicitly rather than searched file-wide, because the failure
 	// this guards is the card existing while nothing calls it.
-	if !strings.Contains(jsFunctionBody(t, js, "buildConnect"), "duckdbCard(") {
+	if !strings.Contains(jsFunctionBody(t, js, "buildConnect"), "duckdbPanel(") {
 		t.Error("buildConnect does not mount duckdbCard, so the schema download is unreachable")
 	}
 	// And it must not go back to the SQL page, which #1549 removed entirely.
@@ -682,10 +682,10 @@ func TestCredentialsCard_noEmDashPlaceholders(t *testing.T) {
 // flag instead — nothing in it refers to this card, and a pin against a
 // reference that does not exist would only be a test asserting its own fixture.
 func TestDuckDBCard_titleDoesNotPromiseAQuery(t *testing.T) {
-	body := jsFunctionBody(t, readAsset(t, "app.js"), "duckdbCard")
-	m := regexp.MustCompile(`card-title", text: "([^"]*)"`).FindStringSubmatch(body)
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "duckdbPanel")
+	m := regexp.MustCompile(`ov-panel-title", text: "([^"]*)"`).FindStringSubmatch(body)
 	if m == nil {
-		t.Fatal("duckdbCard renders no card title; this guard covers nothing")
+		t.Fatal("duckdbPanel renders no title; this guard covers nothing")
 	}
 	title := m[1]
 	if strings.Contains(title, "Query in") {

@@ -23,10 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live leg, so its archives-only note names `bintrail views --include-live`
   rather than a checkbox that no longer exists.
 
-  The card is now under 300 rendered characters, pinned by an e2e budget of its
-  own. That guard checks the drawing is on screen as well as the count, because
-  folding prose out of sight passes a character budget while leaving the same
-  wall one click away.
+  It is a full-width panel below the three numbered steps, beside "Other AI
+  tools" and "Connect a SQL client", not a fourth card inside the steps grid.
+  A schema file for your own DuckDB is not a step in connecting Claude, and the
+  grid tints every child by position, so in there it took a colour and a
+  treatment that read as step four on a page that promises three.
+
+  Under 300 rendered characters, pinned by an e2e budget of its own. That guard
+  checks the drawing is on screen as well as the count, because folding prose
+  out of sight passes a character budget while leaving the same wall one click
+  away.
 
 ### Removed
 - **The console's SQL page and `POST /api/sql`** (#1549). The page answered
