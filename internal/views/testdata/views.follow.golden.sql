@@ -10,12 +10,16 @@
 -- again from the console) after a table is added or dropped, after a column
 -- changes type, and whenever archive sources are added or removed.
 --
--- Two of those are quiet, so they are worth knowing by name. A DECIMAL column
--- whose scale GREW is still read at the old scale, and the extra digits are
--- rounded away with no error (a scale that shrank, or a value too wide for the
--- old precision, does fail loudly). And an archive source added after this file
--- was written is simply not in it. A table that leaves the newest snapshot is
--- the loud one: its view stops resolving and DuckDB names the missing path.
+-- Which of those you will notice follows one rule: this file names only the
+-- PATHS and the DECIMAL columns, so only those two can fail. A table that
+-- leaves the newest snapshot stops resolving and DuckDB names the missing
+-- path; a DECIMAL column that is renamed or dropped fails the whole script.
+-- Everything else is QUIET, because `SELECT *` passes it through untouched:
+-- a table added to the source has no view here, a DECIMAL whose scale grew is
+-- read at the old scale with the extra digits rounded away, a column that
+-- changes to some other type arrives as whatever the new file holds (an
+-- ORDER BY can start sorting text), and an archive source added later is
+-- simply not here. None of those raise an error.
 --
 -- A daemon running `bintrail-console watch --baseline-refresh-interval`
 -- publishes a new snapshot every interval, and the state views below move to

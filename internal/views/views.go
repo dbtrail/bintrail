@@ -524,12 +524,16 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("-- again from the console) after a table is added or dropped, after a column\n")
 		b.WriteString("-- changes type, and whenever archive sources are added or removed.\n")
 		b.WriteString("--\n")
-		b.WriteString("-- Two of those are quiet, so they are worth knowing by name. A DECIMAL column\n")
-		b.WriteString("-- whose scale GREW is still read at the old scale, and the extra digits are\n")
-		b.WriteString("-- rounded away with no error (a scale that shrank, or a value too wide for the\n")
-		b.WriteString("-- old precision, does fail loudly). And an archive source added after this file\n")
-		b.WriteString("-- was written is simply not in it. A table that leaves the newest snapshot is\n")
-		b.WriteString("-- the loud one: its view stops resolving and DuckDB names the missing path.\n")
+		b.WriteString("-- Which of those you will notice follows one rule: this file names only the\n")
+		b.WriteString("-- PATHS and the DECIMAL columns, so only those two can fail. A table that\n")
+		b.WriteString("-- leaves the newest snapshot stops resolving and DuckDB names the missing\n")
+		b.WriteString("-- path; a DECIMAL column that is renamed or dropped fails the whole script.\n")
+		b.WriteString("-- Everything else is QUIET, because `SELECT *` passes it through untouched:\n")
+		b.WriteString("-- a table added to the source has no view here, a DECIMAL whose scale grew is\n")
+		b.WriteString("-- read at the old scale with the extra digits rounded away, a column that\n")
+		b.WriteString("-- changes to some other type arrives as whatever the new file holds (an\n")
+		b.WriteString("-- ORDER BY can start sorting text), and an archive source added later is\n")
+		b.WriteString("-- simply not here. None of those raise an error.\n")
 	} else if in.rendersEvents() {
 		// The one self-following half of the file, and only the events view
 		// has it: its globs are evaluated per query. Claimed only when that

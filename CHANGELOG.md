@@ -41,7 +41,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prune both enumerate with `ReadDir`+`IsDir`, which reports false for a
   symlink, and additionally require a timestamp name, so it can never be
   selected as a baseline. Retention also keeps whatever it names, so it cannot be
-  left dangling by a publish that failed and left the pointer behind.
+  left dangling by a publish that failed and left the pointer behind, and a
+  snapshot dated in the FUTURE never takes it (`--timestamp` has no upper bound,
+  and one future-dated snapshot would otherwise outrank every real one after it
+  and freeze the pointer permanently).
+
+  Publishing is serialized by an flock on the baselines root. Deciding whether a
+  snapshot outranks the newest complete one and then renaming the link are two
+  syscalls, and a peer completing a newer snapshot in between made the older one
+  win: measured at 118 in 400 concurrent pairs comparing against the pointer,
+  and still 12 in 400 after moving the comparison to the directory listing.
+  flock rather than a sentinel file, as elsewhere in this project, because the
+  kernel releases it when the process dies.
+
+  The SQL panel pins rather than follows. It executes the views it builds, so
+  following buys it nothing and costs it per-statement consistency: a join over
+  two state views resolves two paths, and a pointer swap between them would
+  return a join of two snapshots that never coexisted. The downloadable file
+  discloses that window in its header; the panel has no header to disclose it
+  in.
 
 - **`bintrail views` no longer emits the `events` view by default; add
   `--include-events`** (#1535). Defining that view makes DuckDB open one Parquet
@@ -145,7 +163,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table's Parquet onto another volume had it uploaded before and must keep
   having it, since skipping quietly would publish `_SUCCESS` over a snapshot
   missing a table and the loss would only surface mid-recovery. Something that
-  is neither the pointer nor a file is now a loud refusal instead.
+  is neither the pointer nor a file is now a loud refusal instead. The pointer's
+  lock file is skipped by name: it is a regular file, so the symlink test cannot
+  see it and it would otherwise be published as snapshot data.
 
 - **views.sql: an index this machine cannot reach no longer costs you the whole
   file** (#1536). `duckdb -init` aborts the session at the first error, and the

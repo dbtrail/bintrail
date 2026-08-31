@@ -150,7 +150,7 @@ func uploadWithOps(ctx context.Context, outputDir, prefix string, retry bool, op
 		// opens the path, follows it, and fails with "is a directory" — taking
 		// the whole upload down. It is a local convenience that means nothing
 		// in S3, so skip it by name.
-		if isPointerArtifact(outputDir, path, d) {
+		if isPointerArtifact(outputDir, path, d) || isPointerLock(outputDir, path) {
 			return nil
 		}
 		// Every OTHER non-regular entry is RESOLVED, not skipped. An operator
@@ -259,4 +259,12 @@ func isPointerArtifact(root, path string, d fs.DirEntry) bool {
 	}
 	name := d.Name()
 	return name == CurrentLinkName || strings.HasPrefix(name, currentLinkTmp)
+}
+
+// isPointerLock reports whether path is the pointer's flock file. Unlike the
+// pointer and its staging links it is a REGULAR file directly under the root,
+// so the symlink test above cannot see it and it would otherwise be uploaded as
+// snapshot data. It is a local mutex; it means nothing in S3.
+func isPointerLock(root, path string) bool {
+	return filepath.Dir(path) == filepath.Clean(root) && filepath.Base(path) == pointerLockName
 }

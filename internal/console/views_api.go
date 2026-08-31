@@ -81,13 +81,20 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitE
 					Schema: f.Schema, Table: f.Table, Path: f.Path,
 				})
 			}
-			followBaselinePointer(&in, b.baselineSrc, pinSnapshot)
 			// Column types for the state views' decimal casts. Best-effort and
 			// memoized per snapshot; serves the download and the SQL panel
 			// alike, both of which reach the same Parquet through the same
-			// views. AFTER the rewrite, so the footers read are the files the
-			// views open.
+			// views.
+			//
+			// BEFORE the rewrite, and that order is the whole reason this is
+			// not a bug: the memo is keyed by snapshot and matched back by
+			// exact PATH, so a followed request and a pinned one would poison
+			// each other's entry and ship every DECIMAL column uncast, blaming
+			// a footer read that never failed. Both spellings name the same
+			// file, since following only happens when the pointer names this
+			// snapshot, so reading the pinned one costs nothing.
 			s.resolveBaselineDecimals(ctx, &in)
+			followBaselinePointer(&in, b.baselineSrc, pinSnapshot)
 		}
 	}
 	if len(in.ArchiveSources) == 0 && len(in.Baselines) == 0 {

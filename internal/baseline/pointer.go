@@ -54,9 +54,10 @@ const currentLinkTmp = "." + CurrentLinkName + ".tmp"
 // publishes a target it never chose.
 //
 // Uniqueness alone does NOT make concurrent publishing correct -- both
-// publishers still race to rename, and the last one wins whether or not its
-// snapshot is newer. swapPointer's re-read loop settles that; this only stops
-// them from destroying each other's staged link first.
+// publishers would still race to rename, and the last one would win whether or
+// not its snapshot is newer. lockPointer is what settles that; the unique name
+// only stops two publishers from destroying each other's staged link, which is
+// a separate failure it would be wrong to leave open.
 func stagingName() string {
 	// The counter, not the clock, is what makes this unique. time.Now() is
 	// coarse enough on macOS that two calls in one loop return the SAME
@@ -119,6 +120,16 @@ func PublishCurrentPointer(snapshotDir string) error {
 	if !ok {
 		return nil // not a snapshot directory under a baselines root
 	}
+	// A snapshot dated in the FUTURE never takes the pointer. `bintrail baseline
+	// --timestamp` accepts any ISO 8601 with no upper bound, and a host clock
+	// that jumps forward produces the same shape. Letting one take the pointer
+	// froze it forever: every later real snapshot then found the future one as
+	// the newest and declined, so every followed file served that snapshot's
+	// rows indefinitely with no error at query time. computeKeepers already
+	// skips future-dated snapshots for the same reason.
+	if ts.After(time.Now().UTC()) {
+		return nil
+	}
 	root := filepath.Dir(snapshotDir)
 	link := filepath.Join(root, CurrentLinkName)
 
@@ -142,7 +153,23 @@ func PublishCurrentPointer(snapshotDir string) error {
 	// compare with. A snapshot produced for a past instant (`reconstruct
 	// --output-format parquet --at`) completes normally and simply does not
 	// take the pointer.
-	if best, ok := newestCompleteSnapshot(root); ok && best != name {
+	// Serialize the read-then-write. Each half is correct alone; the PAIR is
+	// what a peer can interleave with, and narrowing the gap never closed it.
+	unlock, err := lockPointer(root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	best, err := newestCompleteSnapshot(root)
+	if err != nil {
+		// Refuse, do not fall through. Reaching the swap with the rule skipped
+		// is the guard disarming itself: a snapshot produced for a past instant
+		// would take the pointer, every followed file would start serving that
+		// day's rows, and forward-only would pin the mistake in place.
+		return fmt.Errorf("cannot decide whether %s may take the pointer: %w", name, err)
+	}
+	if best != "" && best != name {
 		if bestTS, ok := snapshotdir.ParseTime(best); ok && bestTS.After(ts) {
 			return nil
 		}
@@ -177,13 +204,21 @@ func PublishCurrentPointer(snapshotDir string) error {
 // Snapshot directories are not overwritten, and _SUCCESS is written before
 // PublishCurrentPointer is called, so by the time a publisher runs, every
 // snapshot that could outrank it is already visible and already marked
-// complete. That makes the decision deterministic without a lock file to leave
-// behind on a crash.
-func newestCompleteSnapshot(root string) (string, bool) {
+// complete.
+//
+// This listing is what the decision is MADE from; it is not what makes the
+// decision safe. Read and rename are two syscalls, and a peer can complete a
+// newer snapshot between them however fresh the listing is -- measured at 12 in
+// 400 concurrent pairs under load. lockPointer serializes the pair. Comparing
+// against the directories rather than the pointer still matters: it is the only
+// source neither publisher overwrites, so the rule stays correct for a peer that
+// crashed while holding nothing.
+func newestCompleteSnapshot(root string) (string, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return "", false
+		return "", fmt.Errorf("read the baselines root: %w", err)
 	}
+	now := time.Now().UTC()
 	var bestName string
 	var bestTS time.Time
 	for _, e := range entries {
@@ -191,14 +226,14 @@ func newestCompleteSnapshot(root string) (string, bool) {
 			continue
 		}
 		ts, ok := snapshotdir.ParseTime(e.Name())
-		if !ok || !SnapshotComplete(filepath.Join(root, e.Name())) {
+		if !ok || ts.After(now) || !SnapshotComplete(filepath.Join(root, e.Name())) {
 			continue
 		}
 		if bestName == "" || ts.After(bestTS) {
 			bestName, bestTS = e.Name(), ts
 		}
 	}
-	return bestName, bestName != ""
+	return bestName, nil
 }
 
 // swapPointer stages a link under a unique name and renames it over the
@@ -227,8 +262,13 @@ func sweepStagingLeftovers(root string) {
 	if err != nil {
 		return
 	}
+	mine := fmt.Sprintf("%s.%d.", currentLinkTmp, os.Getpid())
 	for _, e := range entries {
-		if e.Type()&os.ModeSymlink != 0 && strings.HasPrefix(e.Name(), currentLinkTmp) {
+		// OUR leftovers only. A bare prefix match would remove a peer's staged
+		// link in the window between its Symlink and its Rename, turning a
+		// benign race into a publish failure. A peer sweeps its own on its next
+		// publish, and a dead process's are a dangling symlink of a few bytes.
+		if e.Type()&os.ModeSymlink != 0 && strings.HasPrefix(e.Name(), mine) {
 			_ = os.Remove(filepath.Join(root, e.Name()))
 		}
 	}
@@ -253,11 +293,18 @@ func ResolveCurrentPointer(root string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	name := filepath.Base(target)
-	if _, ok := snapshotdir.ParseTime(name); !ok {
+	// A BARE name, not filepath.Base of an arbitrary target. PublishCurrentPointer
+	// only ever writes a bare directory name, so anything with a separator in it
+	// was made by hand -- and taking its Base would let `current ->
+	// ../../other-root/<same timestamp>` pass RewriteToPointer's equality check
+	// and redirect every state view outside this root.
+	if target != filepath.Base(target) {
 		return "", false
 	}
-	return name, true
+	if _, ok := snapshotdir.ParseTime(target); !ok {
+		return "", false
+	}
+	return target, true
 }
 
 // RewriteToPointer rewrites baseline table paths under root so they read

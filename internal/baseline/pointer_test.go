@@ -16,6 +16,11 @@ import (
 // snapshot directory. It does NOT write a completeness marker: tests that care
 // about markers write them through WriteSuccessMarker so the wiring is what is
 // under test, not a hand-placed file.
+// Every fixture timestamp here is deliberately in the PAST and stays there. A
+// snapshot dated in the future never takes the pointer (see
+// PublishCurrentPointer), so a fixture named for "tomorrow" silently stops
+// exercising what its test claims -- which is exactly what happened when these
+// were written a day before the date they used.
 func mkSnapshot(t *testing.T, root, name string) string {
 	t.Helper()
 	snap := filepath.Join(root, name)
@@ -43,11 +48,11 @@ func readPointer(t *testing.T, root string) string {
 // simply moved — which is the whole situation the pointer exists to survive.
 func TestPublishCurrentPointer_targetIsTheBareSnapshotName(t *testing.T) {
 	root := t.TempDir()
-	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	if err := PublishCurrentPointer(snap); err != nil {
 		t.Fatalf("PublishCurrentPointer: %v", err)
 	}
-	if got := readPointer(t, root); got != "2026-08-31T03-00-00Z" {
+	if got := readPointer(t, root); got != "2025-08-31T03-00-00Z" {
 		t.Fatalf("pointer target = %q, want the bare snapshot name", got)
 	}
 	// And it must actually resolve to the snapshot's data.
@@ -62,8 +67,8 @@ func TestPublishCurrentPointer_targetIsTheBareSnapshotName(t *testing.T) {
 // snapshot is a legitimate operation; it just must not win the pointer.
 func TestPublishCurrentPointer_movesForwardOnly(t *testing.T) {
 	root := t.TempDir()
-	newer := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
-	older := mkSnapshot(t, root, "2026-08-30T03-00-00Z")
+	newer := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
+	older := mkSnapshot(t, root, "2025-08-30T03-00-00Z")
 
 	if err := PublishCurrentPointer(newer); err != nil {
 		t.Fatalf("publish newer: %v", err)
@@ -71,16 +76,16 @@ func TestPublishCurrentPointer_movesForwardOnly(t *testing.T) {
 	if err := PublishCurrentPointer(older); err != nil {
 		t.Fatalf("publish older: %v", err)
 	}
-	if got := readPointer(t, root); got != "2026-08-31T03-00-00Z" {
+	if got := readPointer(t, root); got != "2025-08-31T03-00-00Z" {
 		t.Fatalf("pointer moved backwards to %q", got)
 	}
 
 	// Forward still works after the declined move.
-	newest := mkSnapshot(t, root, "2026-09-01T03-00-00Z")
+	newest := mkSnapshot(t, root, "2025-09-01T03-00-00Z")
 	if err := PublishCurrentPointer(newest); err != nil {
 		t.Fatalf("publish newest: %v", err)
 	}
-	if got := readPointer(t, root); got != "2026-09-01T03-00-00Z" {
+	if got := readPointer(t, root); got != "2025-09-01T03-00-00Z" {
 		t.Fatalf("pointer = %q, want the newest snapshot", got)
 	}
 }
@@ -119,7 +124,7 @@ func TestPublishCurrentPointer_refusesToReplaceRealData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	err := PublishCurrentPointer(snap)
 	if err == nil {
 		t.Fatal("PublishCurrentPointer replaced a real directory without complaining")
@@ -138,11 +143,11 @@ func TestPublishCurrentPointer_refusesToReplaceRealData(t *testing.T) {
 // perfectly but is never called is the failure this guards.
 func TestWriteSuccessMarker_publishesThePointer(t *testing.T) {
 	root := t.TempDir()
-	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	if err := WriteSuccessMarker(snap); err != nil {
 		t.Fatalf("WriteSuccessMarker: %v", err)
 	}
-	if got := readPointer(t, root); got != "2026-08-31T03-00-00Z" {
+	if got := readPointer(t, root); got != "2025-08-31T03-00-00Z" {
 		t.Fatalf("pointer = %q after WriteSuccessMarker", got)
 	}
 }
@@ -177,7 +182,7 @@ func TestWriteSuccessMarker_onADumpDirectoryPublishesNoPointer(t *testing.T) {
 // failed, which is the trap that made the bug invisible in the first place.
 func TestUploadWithOps_skipsTheCurrentPointer(t *testing.T) {
 	root := t.TempDir()
-	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	if err := WriteSuccessMarker(snap); err != nil { // also publishes the pointer
 		t.Fatal(err)
 	}
@@ -220,7 +225,7 @@ func TestUploadWithOps_skipsTheCurrentPointer(t *testing.T) {
 // rather than the two mechanisms.
 func TestCurrentPointerIsInvisibleToPruneAndDiscovery(t *testing.T) {
 	root := t.TempDir()
-	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	if err := WriteSuccessMarker(snap); err != nil {
 		t.Fatal(err)
 	}
@@ -232,14 +237,14 @@ func TestCurrentPointerIsInvisibleToPruneAndDiscovery(t *testing.T) {
 	if len(snaps) != 1 {
 		t.Fatalf("enumerated %d snapshots, want 1 (the pointer must not be one)", len(snaps))
 	}
-	if snaps[0].name != "2026-08-31T03-00-00Z" {
+	if snaps[0].name != "2025-08-31T03-00-00Z" {
 		t.Fatalf("enumerated %q", snaps[0].name)
 	}
 
 	// And the snapshot the pointer names is a keeper, so prune can never leave
 	// the pointer dangling: it holds the newest copy of every table it carries.
 	keepers := computeKeepers(snaps, snaps[0].ts.Add(1))
-	if !keepers["2026-08-31T03-00-00Z"] {
+	if !keepers["2025-08-31T03-00-00Z"] {
 		t.Fatal("the pointed-at snapshot is not a keeper; prune could dangle the pointer")
 	}
 }
@@ -278,12 +283,12 @@ func TestResolveCurrentPointer_reportsUnusableShapes(t *testing.T) {
 
 	t.Run("usable", func(t *testing.T) {
 		root := t.TempDir()
-		snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+		snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 		if err := PublishCurrentPointer(snap); err != nil {
 			t.Fatal(err)
 		}
 		name, ok := ResolveCurrentPointer(root)
-		if !ok || name != "2026-08-31T03-00-00Z" {
+		if !ok || name != "2025-08-31T03-00-00Z" {
 			t.Fatalf("ResolveCurrentPointer = %q, %v", name, ok)
 		}
 	})
@@ -296,7 +301,7 @@ func TestResolveCurrentPointer_reportsUnusableShapes(t *testing.T) {
 // prefix check at the call site: a check that cannot change the outcome reads
 // as a guard without being one.
 func TestRewriteToPointer_refusesAURLRoot(t *testing.T) {
-	paths := []string{"s3://bucket/baselines/2026-08-31T03-00-00Z/shop/orders.parquet"}
+	paths := []string{"s3://bucket/baselines/2025-08-31T03-00-00Z/shop/orders.parquet"}
 	if got, ok := RewriteToPointer("s3://bucket/baselines/", paths); ok {
 		t.Fatalf("rewrote an S3 root to %v", got)
 	}
@@ -307,13 +312,13 @@ func TestRewriteToPointer_refusesAURLRoot(t *testing.T) {
 // would silently move a view to a file nobody asked for.
 func TestRewriteToPointer_refusesAPathOutsideTheRoot(t *testing.T) {
 	root := t.TempDir()
-	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	if err := PublishCurrentPointer(snap); err != nil {
 		t.Fatal(err)
 	}
 	paths := []string{
 		filepath.Join(snap, "shop", "orders.parquet"),
-		filepath.Join(t.TempDir(), "2026-08-31T03-00-00Z", "shop", "elsewhere.parquet"),
+		filepath.Join(t.TempDir(), "2025-08-31T03-00-00Z", "shop", "elsewhere.parquet"),
 	}
 	if got, ok := RewriteToPointer(root, paths); ok {
 		t.Fatalf("rewrote paths spanning two roots to %v", got)
@@ -333,11 +338,11 @@ func TestSplitSnapshotPath_contract(t *testing.T) {
 		path           string
 		snapshot, rest string
 	}{
-		{"a table of a snapshot", root + "/2026-08-31T03-00-00Z/shop/orders.parquet",
-			"2026-08-31T03-00-00Z", "shop/orders.parquet"},
-		{"outside the root", "/elsewhere/2026-08-31T03-00-00Z/shop/orders.parquet", "", ""},
-		{"the snapshot directory itself", root + "/2026-08-31T03-00-00Z", "", ""},
-		{"the snapshot directory with a trailing separator", root + "/2026-08-31T03-00-00Z/", "", ""},
+		{"a table of a snapshot", root + "/2025-08-31T03-00-00Z/shop/orders.parquet",
+			"2025-08-31T03-00-00Z", "shop/orders.parquet"},
+		{"outside the root", "/elsewhere/2025-08-31T03-00-00Z/shop/orders.parquet", "", ""},
+		{"the snapshot directory itself", root + "/2025-08-31T03-00-00Z", "", ""},
+		{"the snapshot directory with a trailing separator", root + "/2025-08-31T03-00-00Z/", "", ""},
 		{"the root itself", root, "", ""},
 	}
 	for _, c := range cases {
@@ -363,7 +368,7 @@ func TestSplitSnapshotPath_contract(t *testing.T) {
 // file would quietly serve older and older rows. This test is the tripwire.
 func TestPublishCurrentPointer_advancesToAFewerTableSnapshot(t *testing.T) {
 	root := t.TempDir()
-	wide := mkSnapshot(t, root, "2026-08-30T03-00-00Z")
+	wide := mkSnapshot(t, root, "2025-08-30T03-00-00Z")
 	if err := os.WriteFile(filepath.Join(wide, "shop", "customers.parquet"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -372,12 +377,12 @@ func TestPublishCurrentPointer_advancesToAFewerTableSnapshot(t *testing.T) {
 	}
 
 	// The newer snapshot holds only one of the two tables.
-	narrow := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	narrow := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	if err := WriteSuccessMarker(narrow); err != nil {
 		t.Fatal(err)
 	}
 
-	if got := readPointer(t, root); got != "2026-08-31T03-00-00Z" {
+	if got := readPointer(t, root); got != "2025-08-31T03-00-00Z" {
 		t.Fatalf("pointer = %q; it must advance to the newest complete snapshot "+
 			"even when that snapshot carries fewer tables (read this test's comment before changing it)", got)
 	}
@@ -419,7 +424,7 @@ func TestPublishCurrentPointer_stagingNamesAreUnique(t *testing.T) {
 // changes every time.
 func TestPublishCurrentPointer_leavesNoStagingLeftover(t *testing.T) {
 	root := t.TempDir()
-	for _, name := range []string{"2026-08-30T03-00-00Z", "2026-08-31T03-00-00Z"} {
+	for _, name := range []string{"2025-08-30T03-00-00Z", "2025-08-31T03-00-00Z"} {
 		if err := PublishCurrentPointer(mkSnapshot(t, root, name)); err != nil {
 			t.Fatal(err)
 		}
@@ -440,10 +445,10 @@ func TestPublishCurrentPointer_leavesNoStagingLeftover(t *testing.T) {
 	// rename left behind: those are uniquely named, so nothing overwrites them
 	// and they accumulate one per crash.
 	crashed := filepath.Join(root, stagingName())
-	if err := os.Symlink("2026-08-30T03-00-00Z", crashed); err != nil {
+	if err := os.Symlink("2025-08-30T03-00-00Z", crashed); err != nil {
 		t.Fatal(err)
 	}
-	if err := PublishCurrentPointer(mkSnapshot(t, root, "2026-09-01T03-00-00Z")); err != nil {
+	if err := PublishCurrentPointer(mkSnapshot(t, root, "2025-09-01T03-00-00Z")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(crashed); !os.IsNotExist(err) {
@@ -459,16 +464,16 @@ func TestPublishCurrentPointer_leavesNoStagingLeftover(t *testing.T) {
 // stuck on whatever preceded both for as long as the write takes.
 func TestPublishCurrentPointer_anIncompleteNewerSnapshotDoesNotBlockPublishing(t *testing.T) {
 	root := t.TempDir()
-	inProgress := mkSnapshot(t, root, "2026-09-01T03-00-00Z")
+	inProgress := mkSnapshot(t, root, "2025-09-01T03-00-00Z")
 	if err := WriteIncompleteMarker(inProgress); err != nil {
 		t.Fatal(err)
 	}
-	finished := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	finished := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	if err := WriteSuccessMarker(finished); err != nil {
 		t.Fatal(err)
 	}
 
-	if got := readPointer(t, root); got != "2026-08-31T03-00-00Z" {
+	if got := readPointer(t, root); got != "2025-08-31T03-00-00Z" {
 		t.Fatalf("pointer = %q; an unfinished newer snapshot blocked a completed one", got)
 	}
 
@@ -476,7 +481,7 @@ func TestPublishCurrentPointer_anIncompleteNewerSnapshotDoesNotBlockPublishing(t
 	if err := WriteSuccessMarker(inProgress); err != nil {
 		t.Fatal(err)
 	}
-	if got := readPointer(t, root); got != "2026-09-01T03-00-00Z" {
+	if got := readPointer(t, root); got != "2025-09-01T03-00-00Z" {
 		t.Fatalf("pointer = %q after the newer snapshot completed", got)
 	}
 }
@@ -495,14 +500,14 @@ func TestRewriteToPointer_refusesAURLRootWithoutTouchingTheCwd(t *testing.T) {
 	if err := os.MkdirAll(probe, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	mkSnapshot(t, probe, "2026-08-30T03-00-00Z")
-	if err := os.Symlink("2026-08-30T03-00-00Z", filepath.Join(probe, CurrentLinkName)); err != nil {
+	mkSnapshot(t, probe, "2025-08-30T03-00-00Z")
+	if err := os.Symlink("2025-08-30T03-00-00Z", filepath.Join(probe, CurrentLinkName)); err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(cwd)
 
 	root := "s3://bucket/baselines"
-	paths := []string{root + "/2026-08-30T03-00-00Z/shop/orders.parquet"}
+	paths := []string{root + "/2025-08-30T03-00-00Z/shop/orders.parquet"}
 	if got, ok := RewriteToPointer(root, paths); ok {
 		t.Fatalf("rewrote an S3 root to %v by resolving a pointer against the working directory", got)
 	}
@@ -519,7 +524,7 @@ func TestRewriteToPointer_refusesAURLRootWithoutTouchingTheCwd(t *testing.T) {
 // missing key rather than as a passing test over a path nobody opened.
 func TestUploadWithOps_uploadsASymlinkedTableFile(t *testing.T) {
 	root := t.TempDir()
-	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	elsewhere := t.TempDir()
 	big := filepath.Join(elsewhere, "big.parquet")
 	if err := os.WriteFile(big, []byte("payload"), 0o644); err != nil {
@@ -568,12 +573,12 @@ func TestUploadWithOps_uploadsASymlinkedTableFile(t *testing.T) {
 // hidden link they never created, on a snapshot that is genuinely complete.
 func TestUploadWithOps_survivesAStagingLeftover(t *testing.T) {
 	root := t.TempDir()
-	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	if err := WriteSuccessMarker(snap); err != nil {
 		t.Fatal(err)
 	}
 	// Exactly what an interrupted publish leaves: a dangling staging link.
-	if err := os.Symlink("2026-08-31T03-00-00Z", filepath.Join(root, stagingName())); err != nil {
+	if err := os.Symlink("2025-08-31T03-00-00Z", filepath.Join(root, stagingName())); err != nil {
 		t.Fatal(err)
 	}
 
@@ -597,7 +602,7 @@ func TestUploadWithOps_survivesAStagingLeftover(t *testing.T) {
 // failure the other two tests exist to prevent.
 func TestUploadWithOps_refusesAnUnreadableSnapshotFile(t *testing.T) {
 	root := t.TempDir()
-	snap := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	// A symlinked SCHEMA directory: resolves, but not to a file.
 	if err := os.Symlink(t.TempDir(), filepath.Join(snap, "warehouse")); err != nil {
 		t.Fatal(err)
@@ -632,18 +637,18 @@ func TestUploadWithOps_refusesAnUnreadableSnapshotFile(t *testing.T) {
 // retention would delete it and break every followed views file at once.
 func TestPruneLocal_neverPrunesThePointerTarget(t *testing.T) {
 	root := t.TempDir()
-	old := mkSnapshot(t, root, "2026-06-01T00-00-00Z")
+	old := mkSnapshot(t, root, "2025-06-01T00-00-00Z")
 	if err := WriteSuccessMarker(old); err != nil {
 		t.Fatal(err)
 	}
 	// The pointer is now at the old snapshot. A newer one completes but its
 	// publish fails, which is what leaves the pointer behind; simulate that end
 	// state directly by marking the newer one complete without republishing.
-	newer := mkSnapshot(t, root, "2026-08-31T03-00-00Z")
+	newer := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
 	if err := os.WriteFile(filepath.Join(newer, SuccessMarker), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := readPointer(t, root); got != "2026-06-01T00-00-00Z" {
+	if got := readPointer(t, root); got != "2025-06-01T00-00-00Z" {
 		t.Fatalf("test premise: pointer = %q, want it lagging at the old snapshot", got)
 	}
 
@@ -657,7 +662,7 @@ func TestPruneLocal_neverPrunesThePointerTarget(t *testing.T) {
 		t.Fatalf("pruneWithProbe: %v", err)
 	}
 	for _, name := range res.Pruned {
-		if name == "2026-06-01T00-00-00Z" {
+		if name == "2025-06-01T00-00-00Z" {
 			t.Fatal("retention pruned the snapshot the `current` pointer names, leaving it dangling")
 		}
 	}
@@ -679,25 +684,41 @@ func TestPruneLocal_neverPrunesThePointerTarget(t *testing.T) {
 func TestPublishCurrentPointer_concurrentPublishersConvergeOnTheNewest(t *testing.T) {
 	const (
 		rounds = 120
-		older  = "2026-06-01T00-00-00Z"
-		newer  = "2026-08-31T03-00-00Z"
+		older  = "2025-06-01T00-00-00Z"
+		newer  = "2025-08-31T03-00-00Z"
 	)
 	var landedOld int
 	for range rounds {
 		root := t.TempDir()
 		oldSnap := mkSnapshot(t, root, older)
 		newSnap := mkSnapshot(t, root, newer)
+		// PRODUCTION SHAPE, and this is the whole point of the fixture. An
+		// earlier version created both directories up front, and since a
+		// marker-less directory is complete-by-default, the older publisher saw
+		// the newer one and declined BEFORE staging every single time: 120
+		// rounds of a single-writer non-race that still caught a revert but
+		// could never see the interleaving it is named for. Stamping
+		// _INCOMPLETE first and completing inside the goroutine reproduces the
+		// window a peer actually races through.
+		for _, snap := range []string{oldSnap, newSnap} {
+			if err := WriteIncompleteMarker(snap); err != nil {
+				t.Fatal(err)
+			}
+		}
 
+		start := make(chan struct{})
 		var wg sync.WaitGroup
 		wg.Add(2)
 		for _, snap := range []string{newSnap, oldSnap} {
 			go func() {
 				defer wg.Done()
-				// An error is allowed (a peer may keep winning); landing on the
-				// older snapshot is not.
-				_ = PublishCurrentPointer(snap)
+				<-start
+				// An error is allowed (a peer may hold the lock too long);
+				// landing on the older snapshot is not.
+				_ = WriteSuccessMarker(snap)
 			}()
 		}
+		close(start)
 		wg.Wait()
 
 		got, ok := ResolveCurrentPointer(root)
@@ -710,5 +731,142 @@ func TestPublishCurrentPointer_concurrentPublishersConvergeOnTheNewest(t *testin
 	}
 	if landedOld > 0 {
 		t.Fatalf("%d of %d concurrent publishes left the pointer on the OLDER snapshot", landedOld, rounds)
+	}
+}
+
+// TestPublishCurrentPointer_aFutureDatedSnapshotNeverFreezesThePointer guards a
+// shape that turns the whole feature inside out. `bintrail baseline
+// --timestamp` accepts any ISO 8601 with no upper bound, and a host clock that
+// jumps forward produces the same thing. Before this rule, one future-dated
+// snapshot took the pointer and then outranked every real snapshot that
+// followed, so the pointer froze there PERMANENTLY: every followed views file
+// served that snapshot's rows forever, every path resolving, nothing logged.
+func TestPublishCurrentPointer_aFutureDatedSnapshotNeverFreezesThePointer(t *testing.T) {
+	root := t.TempDir()
+	future := time.Now().UTC().AddDate(1, 0, 0).Format("2006-01-02T15-04-05Z")
+	if err := WriteSuccessMarker(mkSnapshot(t, root, future)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ResolveCurrentPointer(root); ok {
+		t.Fatal("a snapshot dated in the future took the pointer")
+	}
+
+	// And a real snapshot completing afterwards still takes it.
+	if err := WriteSuccessMarker(mkSnapshot(t, root, "2025-08-31T03-00-00Z")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPointer(t, root); got != "2025-08-31T03-00-00Z" {
+		t.Fatalf("pointer = %q; a future-dated snapshot blocked a real one", got)
+	}
+}
+
+// TestSweepStagingLeftovers_leavesAPeersInFlightLink is the other half of the
+// sweep. A staged link belonging to ANOTHER process may be microseconds from
+// its own rename; removing it turns a benign race into a publish failure that
+// logs at Error and tells the operator their views are frozen, on a run where
+// the pointer is perfectly correct.
+func TestSweepStagingLeftovers_leavesAPeersInFlightLink(t *testing.T) {
+	root := t.TempDir()
+	peer := filepath.Join(root, currentLinkTmp+".999999.1.1") // another pid
+	if err := os.Symlink("2025-08-31T03-00-00Z", peer); err != nil {
+		t.Fatal(err)
+	}
+	if err := PublishCurrentPointer(mkSnapshot(t, root, "2025-08-31T03-00-00Z")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(peer); err != nil {
+		t.Fatalf("the sweep removed another process's staged link: %v", err)
+	}
+}
+
+// TestResolveCurrentPointer_refusesATargetOutsideTheRoot closes a redirection
+// this code would otherwise accept. PublishCurrentPointer only ever writes a
+// bare directory name, so a target with a separator was made by hand -- and
+// taking filepath.Base of it let `current -> ../../other-root/<same timestamp>`
+// satisfy RewriteToPointer's equality check and point every state view at
+// another root's data, silently.
+func TestResolveCurrentPointer_refusesATargetOutsideTheRoot(t *testing.T) {
+	root := t.TempDir()
+	other := t.TempDir()
+	mkSnapshot(t, other, "2025-08-31T03-00-00Z")
+	rel, err := filepath.Rel(root, filepath.Join(other, "2025-08-31T03-00-00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(rel, filepath.Join(root, CurrentLinkName)); err != nil {
+		t.Fatal(err)
+	}
+	if name, ok := ResolveCurrentPointer(root); ok {
+		t.Fatalf("accepted a pointer into another root as %q", name)
+	}
+}
+
+// TestUploadWithOps_skipsThePointerLock keeps the flock file out of S3. It is a
+// REGULAR file directly under the baselines root, so the symlink test that
+// catches the pointer and its staging links cannot see it, and it would be
+// published as though it were snapshot data.
+func TestUploadWithOps_skipsThePointerLock(t *testing.T) {
+	root := t.TempDir()
+	snap := mkSnapshot(t, root, "2025-08-31T03-00-00Z")
+	if err := WriteSuccessMarker(snap); err != nil { // creates the lock file
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, pointerLockName)); err != nil {
+		t.Fatalf("test premise: no lock file was created: %v", err)
+	}
+
+	var keys []string
+	ops := s3UploadOps{
+		putEmpty: func(_ context.Context, _ string) error { return nil },
+		uploadFile: func(_ context.Context, path, k string) error {
+			if _, err := os.ReadFile(path); err != nil {
+				return err
+			}
+			keys = append(keys, k)
+			return nil
+		},
+		objectExists: func(_ context.Context, _ string) (bool, error) { return false, nil },
+		deleteObject: func(_ context.Context, _ string) error { return nil },
+	}
+	if _, err := uploadWithOps(context.Background(), root, "p", false, ops); err != nil {
+		t.Fatalf("uploadWithOps: %v", err)
+	}
+	for _, k := range keys {
+		if strings.Contains(k, pointerLockName) {
+			t.Fatalf("the pointer lock was uploaded as %q", k)
+		}
+	}
+}
+
+// TestPublishCurrentPointer_refusesWhenTheRootCannotBeListed covers the guard's
+// own error path, which is where a guard most often fails open. The
+// forward-only rule is decided from a directory listing; when that listing
+// fails, skipping the rule does not mean "no opinion", it means the rule is
+// GONE -- and a snapshot produced for a past instant then takes the pointer,
+// every followed file starts serving that day's rows, and forward-only pins it
+// there.
+//
+// The permission split is exact, and getting it wrong tests another branch
+// entirely: listing needs r, creating the lock file needs wx, resolving a
+// symlink needs x. 0o311 is the one shape that lets every earlier step succeed
+// and fails only os.ReadDir.
+func TestPublishCurrentPointer_refusesWhenTheRootCannotBeListed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	root := t.TempDir()
+	snap := mkSnapshot(t, root, "2025-06-01T00-00-00Z")
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+	if err := os.Chmod(root, 0o311); err != nil {
+		t.Fatal(err)
+	}
+
+	err := PublishCurrentPointer(snap)
+	if err == nil {
+		t.Fatal("published without being able to decide whether this snapshot outranks the newest")
+	}
+	// Not the staging write failing later: the refusal must be the DECISION.
+	if !strings.Contains(err.Error(), "may take the pointer") {
+		t.Fatalf("refusal does not name the decision it could not make: %v", err)
 	}
 }

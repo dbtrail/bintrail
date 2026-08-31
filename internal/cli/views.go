@@ -320,12 +320,16 @@ func resolveBaselineViews(ctx context.Context, in *views.Input) error {
 			Path:   f.Path,
 		})
 	}
-	followCurrentPointer(in, vBaselineDir, vPinSnapshot)
-	// AFTER the rewrite, so the column types come out of the same files the
-	// views open. Reading a footer from the snapshot directory while the view
-	// reads it through the pointer would let a later snapshot that widened a
-	// DECIMAL be read at the old precision from the very first query.
+	// Decimals BEFORE the rewrite, and the ordering is load-bearing in the
+	// opposite direction from how it first looked. Following only happens when
+	// the pointer names the snapshot just discovered, so both spellings resolve
+	// to the SAME file and reading either is equivalent. What is not equivalent
+	// is the console's memo, which is keyed by snapshot and matched back by
+	// exact PATH: populate it with one spelling and the other silently matches
+	// nothing, so every DECIMAL column ships uncast while the file blames an
+	// unreadable footer that was never read.
 	resolveBaselineDecimals(ctx, in)
+	followCurrentPointer(in, vBaselineDir, vPinSnapshot)
 	return nil
 }
 
