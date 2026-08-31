@@ -57,6 +57,22 @@ func WriteSuccessMarker(snapshotDir string) error {
 		slog.Warn("could not remove stale incomplete-snapshot marker (harmless; _SUCCESS decides completeness)",
 			"dir", snapshotDir, "marker", IncompleteMarker, "error", err)
 	}
+	// Move the `current` pointer AFTER _SUCCESS lands, never before: the pointer
+	// must not name a snapshot that is still being written. This is the single
+	// place a snapshot becomes complete, which is why the pointer lives here
+	// rather than in each producer — `bintrail baseline`, the Postgres baseline
+	// and `reconstruct --output-format parquet` (the engine behind `baseline
+	// refresh` and the console's periodic refresh) all arrive through this
+	// function, and so will any producer added later.
+	//
+	// Best-effort, like the _INCOMPLETE removal above: the snapshot IS complete
+	// and every recovery path finds it by its own name. Only the convenience of
+	// an already-generated views file following along is lost, so say exactly
+	// that rather than failing a finished snapshot.
+	if err := PublishCurrentPointer(snapshotDir); err != nil {
+		slog.Warn("could not update the `current` baseline pointer (the snapshot is complete and recovery is unaffected; generated DuckDB views that follow the pointer will keep reading the previous snapshot until this is fixed)",
+			"dir", snapshotDir, "pointer", CurrentLinkName, "error", err)
+	}
 	return nil
 }
 

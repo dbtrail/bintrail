@@ -143,6 +143,16 @@ func uploadWithOps(ctx context.Context, outputDir, prefix string, retry bool, op
 		if walkErr != nil || d.IsDir() {
 			return walkErr
 		}
+		// Regular files only. WalkDir does not follow symlinks, so a link to a
+		// directory arrives here with IsDir() false and would be opened as a
+		// file — the read fails with "is a directory" and takes the whole
+		// upload down with it. A baselines root carries exactly such a link:
+		// `current` (see pointer.go). Nothing else in a snapshot is anything
+		// but a regular file, so this only ever skips things that were never
+		// uploadable.
+		if !d.Type().IsRegular() {
+			return nil
+		}
 		if d.Name() == SuccessMarker {
 			successMarkers = append(successMarkers, path) // defer to the end
 			return nil
