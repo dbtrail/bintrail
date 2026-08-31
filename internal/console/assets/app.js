@@ -4190,25 +4190,52 @@ function stagingCard(storage, servers) {
 function duckdbCard() {
   const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Download a DuckDB schema" }));
   card.append(el("p", { class: "form-hint", text:
-    "Download a ready-made schema over your archived Parquet: an events view across every archive source, " +
-    "plus one view per table in the newest backup. Run it in your own DuckDB; nothing runs here." }));
+    "Download a ready-made schema over your backups: one view per table, as of the newest " +
+    "backup. Run it in your own DuckDB; nothing runs here." }));
   card.append(el("p", { class: "form-hint", text:
     "No credentials are in the file, so it is safe to share." }));
-  // The live leg (#1480). Opt-in, and the cost is on the label rather than in
-  // a tooltip: this one adds a leg that reads the index capture is writing to,
-  // and a query over it scans the whole table on that server every time.
-  const live = el("input", { type: "checkbox", name: "include_live" });
-  card.append(el("label", { class: "check" }, live,
-    el("span", { text: "Include the live index" })));
+  // The change log (#1535). Opt-in since it stopped being the default: defining
+  // that view opens one Parquet footer per archived file before it returns a row,
+  // so a reader who only wanted their tables used to pay for the whole archive to
+  // get them. The cost is stated on the page, not only in the generated file:
+  // by the time they read the file, the bind is already running.
+  const events = el("input", { type: "checkbox", name: "include_events" });
+  card.append(el("label", { class: "check" }, events,
+    el("span", { text: "Include the change log" })));
   card.append(el("p", { class: "form-hint", text:
+    "Adds a view over every archived change. It takes longer to open the further back your " +
+    "archive goes, because it reads a piece of every archived file before answering anything. " +
+    "(CLI: bintrail views --include-events)" }));
+  // The live leg (#1480) is a leg OF the change-log view, so it is nested under
+  // it rather than offered beside it: ticked alone it would ask for a leg of a
+  // view this file would not define, which the route refuses.
+  const live = el("input", { type: "checkbox", name: "include_live", disabled: true });
+  const liveLabel = el("label", { class: "check check-sub" }, live,
+    el("span", { text: "…and the live index" }));
+  card.append(liveLabel);
+  const liveHint = el("p", { class: "form-hint form-hint-sub", text:
     "Adds the most recent changes, the ones not archived yet. Every query over that leg scans the whole live capture index and competes " +
     "with capture on that server. The file will hold the index host and user, never its password: " +
-    "fill that in when you run it. (CLI: bintrail views --include-live)" }));
+    "fill that in when you run it. (CLI: bintrail views --include-live)" });
+  card.append(liveHint);
+  events.onchange = () => {
+    live.disabled = !events.checked;
+    // Cleared, not merely disabled: a disabled box KEEPS its checked state and
+    // the request reads .checked, so leaving it set would send include_live=1
+    // for a file with no change log, which the route refuses.
+    if (!events.checked) live.checked = false;
+    liveLabel.classList.toggle("is-disabled", !events.checked);
+    liveHint.classList.toggle("is-disabled", !events.checked);
+  };
+  events.onchange();
   const btn = el("button", { class: "btn btn-sm", type: "button", text: "Open in DuckDB…" });
   btn.onclick = async () => {
     btn.disabled = true;
     try {
-      const sql = await apiText("/api/views.sql" + (live.checked ? "?include_live=1" : ""));
+      const params = [];
+      if (events.checked) params.push("include_events=1");
+      if (events.checked && live.checked) params.push("include_live=1");
+      const sql = await apiText("/api/views.sql" + (params.length ? "?" + params.join("&") : ""));
       downloadBlob("views.sql", sql, "text/plain");
       toast("views.sql downloaded. In DuckDB run .read views.sql, once per session.");
     } catch (err) {

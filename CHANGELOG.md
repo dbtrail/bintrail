@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`bintrail views` no longer emits the `events` view by default; add
+  `--include-events`** (#1535). Defining that view makes DuckDB open one Parquet
+  footer per archived file before it returns a single row — `union_by_name` is
+  load-bearing for correctness there, so the read cannot be avoided — and the
+  cost is O(archived files) and grows forever. Measured on a real source of 1886
+  files it was 114s to define, against 3.2s without. Everyone reading the file
+  paid it, including an operator who only wanted their tables: the `state_*`
+  views read one file each. The console download grew a matching **Include the
+  change log** checkbox (`include_events=1`), with **…and the live index**
+  nested under it, since that leg is part of the `events` view.
+  `--include-live` without `--include-events` is refused rather than silently
+  turning the expensive view on, and `--no-baselines` alone is now refused too
+  because it would define nothing. The generated file says which views it left
+  out and how to ask for them, and no longer claims a self-following behaviour
+  it only has when the `events` view is present.
+
+  **This does not make the `state_*` views follow a periodic baseline refresh**
+  (#1484): they still name one snapshot path, resolved when the file was
+  generated. Regenerate on the same schedule the refresh runs on. The change
+  makes the default file cheap, not self-updating.
+
+### Changed
 - **The Storage page is split in two, and two of its cards moved to the pages
   they belong to** (#1543, part of #1528). Storage had become a drawer: seven
   cards from five unrelated concerns, on a page you had to read rather than

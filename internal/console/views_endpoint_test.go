@@ -32,7 +32,7 @@ func TestViewsAPI_namesTheS3Endpoint(t *testing.T) {
 	srv := newViewsServer(t, "", false)
 	srv.cm.boot.db = db
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}
@@ -123,7 +123,7 @@ func TestViewsAPI_pinsTheDetectedRegion(t *testing.T) {
 	// resolver's answer reaches the file, not how the answer is obtained.
 	srv.bucketRegions = map[string]bucketRegionEntry{"bkt": detected("eu-central-1")}
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}

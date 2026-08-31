@@ -23,18 +23,20 @@ func TestRunViews_explicitRootsCarryNoRoutingSentence(t *testing.T) {
 	for i, p := range saved {
 		vals[i] = *p
 	}
-	savedNoBaselines := vNoBaselines
+	savedNoBaselines, savedIncludeEvents := vNoBaselines, vIncludeEvents
 	t.Cleanup(func() {
 		for i, p := range saved {
 			*p = vals[i]
 		}
-		vNoBaselines = savedNoBaselines
+		vNoBaselines, vIncludeEvents = savedNoBaselines, savedIncludeEvents
 	})
 	t.Setenv(storage.EnvS3PathStyle, "")
 	t.Setenv(storage.EnvS3Endpoint, "http://minio:9000")
 	vIndexDSN, vBaselineDir, vBaselineS3 = "", "", ""
 	vArchiveDir, vArchiveS3, vBintrailID = t.TempDir(), "s3://bkt/events/", "aaaa"
-	vNoBaselines, vOut = true, "-"
+	// This test is about the ARCHIVE half, so it asks for the view that reads
+	// it: --no-baselines alone now defines nothing and is refused.
+	vNoBaselines, vIncludeEvents, vOut = true, true, "-"
 
 	var out bytes.Buffer
 	cmd := &cobra.Command{}
@@ -69,18 +71,20 @@ func TestRunViews_localOnlyLayoutIgnoresEndpointTypo(t *testing.T) {
 	for i, p := range saved {
 		vals[i] = *p
 	}
-	savedNoBaselines := vNoBaselines
+	savedNoBaselines, savedIncludeEvents := vNoBaselines, vIncludeEvents
 	t.Cleanup(func() {
 		for i, p := range saved {
 			*p = vals[i]
 		}
-		vNoBaselines = savedNoBaselines
+		vNoBaselines, vIncludeEvents = savedNoBaselines, savedIncludeEvents
 	})
 	t.Setenv(storage.EnvS3PathStyle, "")
 	t.Setenv(storage.EnvS3Endpoint, "minio:9000") // no scheme: rejected when it matters
 	vIndexDSN, vArchiveS3, vBaselineDir, vBaselineS3 = "", "", "", ""
 	vArchiveDir, vBintrailID = t.TempDir(), "aaaa"
-	vNoBaselines, vOut = true, "-"
+	// This test is about the ARCHIVE half, so it asks for the view that reads
+	// it: --no-baselines alone now defines nothing and is refused.
+	vNoBaselines, vIncludeEvents, vOut = true, true, "-"
 
 	var out bytes.Buffer
 	cmd := &cobra.Command{}
@@ -102,18 +106,20 @@ func TestRunViews_invalidEndpointRefusedWhenS3IsInPlay(t *testing.T) {
 	for i, p := range saved {
 		vals[i] = *p
 	}
-	savedNoBaselines := vNoBaselines
+	savedNoBaselines, savedIncludeEvents := vNoBaselines, vIncludeEvents
 	t.Cleanup(func() {
 		for i, p := range saved {
 			*p = vals[i]
 		}
-		vNoBaselines = savedNoBaselines
+		vNoBaselines, vIncludeEvents = savedNoBaselines, savedIncludeEvents
 	})
 	t.Setenv(storage.EnvS3PathStyle, "")
 	t.Setenv(storage.EnvS3Endpoint, "minio:9000")
 	vIndexDSN, vArchiveDir, vBaselineDir, vBaselineS3 = "", "", "", ""
 	vArchiveS3, vBintrailID = "s3://bkt/events/", "aaaa"
-	vNoBaselines, vOut = true, "-"
+	// This test is about the ARCHIVE half, so it asks for the view that reads
+	// it: --no-baselines alone now defines nothing and is refused.
+	vNoBaselines, vIncludeEvents, vOut = true, true, "-"
 
 	var out bytes.Buffer
 	cmd := &cobra.Command{}

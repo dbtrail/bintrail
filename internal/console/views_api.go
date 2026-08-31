@@ -114,6 +114,18 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) 
 // "on" is what a bare HTML checkbox posts, so it is a value a client really
 // sends. An unrecognized value is refused with the ones that work.
 func parseIncludeLive(v string) (bool, error) {
+	return parseStrictInclude("include_live", "add the live index leg", v)
+}
+
+// parseIncludeEvents reads the include_events parameter (#1535). Same strictness
+// and for the same reason as include_live: a silently-false unrecognized value
+// hands back a 200 and a file missing the very view the reader asked for, and
+// the file's own note then tells them to ask for it.
+func parseIncludeEvents(v string) (bool, error) {
+	return parseStrictInclude("include_events", "add the events view", v)
+}
+
+func parseStrictInclude(name, does, v string) (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "":
 		return false, nil
@@ -122,8 +134,8 @@ func parseIncludeLive(v string) (bool, error) {
 	case "0", "false":
 		return false, nil
 	}
-	return false, fmt.Errorf("include_live=%q is not a value this route understands; "+
-		"use include_live=1 to add the live index leg, or leave it out", v)
+	return false, fmt.Errorf("%s=%q is not a value this route understands; "+
+		"use %s=1 to %s, or leave it out", name, v, name, does)
 }
 
 // handleViewsSQL serves GET /api/views.sql: the same DuckDB view definitions
@@ -172,6 +184,22 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	includeEvents, err := parseIncludeEvents(r.URL.Query().Get("include_events"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// The same refusal the CLI gives, for the same reason: the live leg hangs
+	// on the events view, so asking for it without the view is a request the
+	// route cannot honour. Refused rather than quietly upgraded — the events
+	// view is the expensive one and turning it on unasked is a cost the reader
+	// pays on every query.
+	if includeLive && !includeEvents {
+		writeJSONError(w, http.StatusBadRequest,
+			"include_live adds a leg to the events view, which this file would not define: "+
+				"pass include_events=1 with it")
+		return
+	}
 
 	in, err := s.buildViewsInput(r.Context(), b, true)
 	switch {
@@ -214,6 +242,7 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		in.LiveLegHowTo = ""
 	}
 
+	in.OmitEvents = !includeEvents
 	sqlText := views.Generate(in)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="views.sql"`)

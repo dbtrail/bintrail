@@ -1247,6 +1247,12 @@ button { font-family: inherit; }
 .form-grid.two { grid-template-columns: repeat(2, 1fr); }
 .check { display: flex; align-items: center; gap: 10px; font-size: 13.5px; color: var(--ink); cursor: pointer; }
 .check input { width: 18px; height: 18px; accent-color: var(--accent); }
+/* A sub-option: indented under the checkbox it belongs to, and visibly inert
+   while that one is off. `is-disabled` is a class rather than :has() on the
+   input, because the hint paragraph is a SIBLING of the label, not inside it. */
+.check-sub { margin-left: 28px; }
+.form-hint-sub { margin-left: 28px; }
+.check.is-disabled, .form-hint.is-disabled { opacity: 0.5; cursor: default; }
 .modal-foot { display: flex; gap: 10px; margin-top: 22px; align-items: center; }
 
 /* ============================================================

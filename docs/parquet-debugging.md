@@ -29,18 +29,33 @@ bintrail views \
 duckdb -init views.sql lake.db
 ```
 
+That gives you one view per table, as of the newest baseline snapshot. The
+`events` view over the archived change log is **opt-in**, because defining it
+is expensive: DuckDB opens one Parquet footer per archived file before the view
+returns a single row, so the cost grows with your archive and every reader of
+the file pays it, including one who only wanted their tables. Add it when you
+want it:
+
+```sh
+bintrail views \
+  --index-dsn    "user:pass@tcp(index-db:3306)/bintrail_index" \
+  --baseline-dir /data/baselines \
+  --include-events \
+  --out          views.sql
+```
+
 `-init` runs the file as the session opens, so the views and the S3 secret are both there when you get the prompt. In a session that is already open, `.read views.sql` does the same.
 
 ### How fresh is what you get (`--include-live`)
 
 By default these views read the **Parquet only**. Parquet exists for a partition once `rotate` has archived it, so everything more recent than that lives solely in the index and is absent from the views. On one measured deployment that was the most recent 12 hours. The gap is silent: a query about this morning returns no rows, which reads exactly like nothing happened.
 
-`--include-live` adds a second leg so the `events` view also covers what the index still holds:
+`--include-live` adds a second leg so the `events` view also covers what the index still holds. It is a leg **of that view**, so it needs `--include-events` with it; asked for alone, the command refuses rather than turning the expensive view on for you:
 
 ```sh
 bintrail views \
   --index-dsn "user:pass@tcp(index-db:3306)/bintrail_index" \
-  --include-live \
+  --include-events --include-live \
   --out views.sql
 ```
 
@@ -76,7 +91,7 @@ Three properties worth knowing:
 - **An S3-compatible store is named in the file.** When the generating process runs with `BINTRAIL_S3_ENDPOINT`, the file sets `s3_endpoint`, `s3_url_style` and `s3_use_ssl` and repeats them in its secret, so DuckDB on another machine reads the same store instead of AWS, and keeps doing so if the secret fails. A location, not a credential: the file stays shareable.
 - **The S3 secret lasts one session.** Views persist in a `.db` file; secrets do not. Reopen `lake.db` tomorrow and `SELECT * FROM events` fails with "No credentials are provided" until you run the file again (`.read views.sql`). Do not turn the secret into a `PERSISTENT` one: DuckDB resolves your credential chain at that moment and writes the resulting keys to `~/.duckdb/stored_secrets`.
 - **Archive sources are named for another machine.** An archive registered both on the generating host and in S3 is listed by its S3 location; a local path appears only when the registry holds no S3 location for it. State views point wherever `--baseline-dir`/`--baseline-s3` points, so a local baseline directory resolves only on the host that holds it. The console's own reads still prefer the local copy.
-- **It is a snapshot of the layout, not a live binding.** The event globs keep picking up newly rotated partitions on their own, but the `state_` views point at one baseline snapshot, resolved when `bintrail views` ran and written into each view as a fixed path. Regenerate after taking or refreshing a baseline. That includes the unattended case, which is the one that catches people: a daemon running `bintrail-console watch --baseline-refresh-interval` publishes a new snapshot every interval and nothing regenerates this file, so it goes on reading the snapshot it was generated against with no error and no warning, and its numbers stop changing. **If you set that interval, regenerate on the same schedule.** The pinning is deliberate, since a fixed snapshot is what reproducible analysis wants, and the file names the snapshot it is bound to in its header so you can see which one you have.
+- **It is a snapshot of the layout, not a live binding.** With `--include-events`, that view's globs keep picking up newly rotated partitions on their own — the one self-following part of the file. The `state_` views point at one baseline snapshot, resolved when `bintrail views` ran and written into each view as a fixed path. Regenerate after taking or refreshing a baseline. That includes the unattended case, which is the one that catches people: a daemon running `bintrail-console watch --baseline-refresh-interval` publishes a new snapshot every interval and nothing regenerates this file, so it goes on reading the snapshot it was generated against with no error and no warning, and its numbers stop changing. **If you set that interval, regenerate on the same schedule.** The pinning is deliberate, since a fixed snapshot is what reproducible analysis wants, and the file names the snapshot it is bound to in its header so you can see which one you have.
 - **Money columns are cast back to numbers.** MySQL `DECIMAL` and `NUMERIC` are stored as text in the Parquet, so that a value MySQL can hold is never rounded to fit a narrower type. The `state_` views cast them back to `DECIMAL(p,s)` using the precision and scale the column was declared with, so `sum()` and the rest work on them directly. See below for the two cases where a column stays text.
 
 `state_` views are the snapshot's rows, not the table's current state. To materialize a *later* point in time, use `bintrail reconstruct` — folding deltas back onto a baseline is what that command does, and it is not expressible as a view.

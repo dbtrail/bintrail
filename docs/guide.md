@@ -520,9 +520,11 @@ two things as plain Parquet, on disk or in S3: the archived change history
 readable by any DuckDB, Spark, Trino or Athena with no dbtrail involved.
 
 **Files, queried by name.** `bintrail views` writes a DuckDB schema over them:
-one `events` view across every archive and one `state_<schema>_<table>` view
-per table in the newest baseline (the console's **Storage → Download a DuckDB schema**
-card downloads the same file).
+one `state_<schema>_<table>` view per table in the newest baseline, plus — with
+`--include-events` — an `events` view across every archive (the console's
+**SQL → Download a DuckDB schema** card downloads the same file). The change log
+is opt-in because defining that view opens one Parquet footer per archived file
+before it returns a row, a cost that grows with the archive.
 
 ```sh
 bintrail views --index-dsn "$IDX" --baseline-dir /data/baselines --out views.sql

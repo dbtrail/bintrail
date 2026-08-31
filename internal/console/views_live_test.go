@@ -61,7 +61,7 @@ func TestViewsAPI_includeLiveAddsTheHotLeg(t *testing.T) {
 	mock.ExpectQuery("FROM bintrail_servers").WillReturnRows(
 		sqlmock.NewRows([]string{"n", "id"}).AddRow(1, id))
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}
@@ -94,7 +94,7 @@ func TestViewsAPI_includeLiveNeverCarriesThePassword(t *testing.T) {
 	mock.ExpectQuery("FROM bintrail_servers").WillReturnRows(
 		sqlmock.NewRows([]string{"n", "id"}).AddRow(1, "aaaa"))
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}
@@ -114,7 +114,7 @@ func TestViewsAPI_liveLegIsOptIn(t *testing.T) {
 	srv, mock := newLiveViewsServer(t, liveTestDSN)
 	expectArchiveSource(mock, "aaaa")
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}
@@ -144,7 +144,7 @@ func TestViewsAPI_liveLegIsOptIn(t *testing.T) {
 func TestViewsAPI_includeLiveStillRefusesAProfiledSession(t *testing.T) {
 	srv, _ := newLiveViewsServer(t, liveTestDSN)
 
-	for _, path := range []string{"/api/views.sql", "/api/views.sql?include_live=1"} {
+	for _, path := range []string{"/api/views.sql", "/api/views.sql?include_events=1&include_live=1"} {
 		req := httptest.NewRequest("GET", "http://127.0.0.1:8090"+path, nil)
 		req.Host = "127.0.0.1:8090"
 		req.Header.Set("Authorization", "Bearer t")
@@ -170,7 +170,7 @@ func TestViewsAPI_includeLiveRefusesASocketIndex(t *testing.T) {
 	expectArchiveSource(mock, "aaaa")
 	expectArchiveSource(mock, "aaaa")
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live=1", "")
 	if rec.Code != 422 {
 		t.Fatalf("code = %d, body = %s; want 422", rec.Code, body)
 	}
@@ -182,7 +182,7 @@ func TestViewsAPI_includeLiveRefusesASocketIndex(t *testing.T) {
 	}
 	// The archives-only download for that same server names no route at all,
 	// rather than pointing at a box that would refuse.
-	rec, body = doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body = doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("plain download: code = %d, body = %s", rec.Code, body)
 	}
@@ -201,7 +201,7 @@ func TestViewsAPI_includeLiveRefusesAnIndexWithoutBinlogEvents(t *testing.T) {
 	expectArchiveSource(mock, "aaaa")
 	mock.ExpectQuery("information_schema.COLUMNS").WillReturnRows(sqlmock.NewRows([]string{"COLUMN_NAME"}))
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live=1", "")
 	if rec.Code != 422 {
 		t.Fatalf("code = %d, body = %s; want 422", rec.Code, body)
 	}
@@ -223,7 +223,7 @@ func TestViewsAPI_includeLiveNamesOnlyObservedColumns(t *testing.T) {
 	mock.ExpectQuery("FROM bintrail_servers").WillReturnRows(
 		sqlmock.NewRows([]string{"n", "id"}).AddRow(1, "aaaa"))
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}
@@ -282,7 +282,7 @@ func TestViewsAPI_liveLegAttributionOutcomes(t *testing.T) {
 				sqlmock.NewRows([]string{"COLUMN_NAME"}).AddRow("event_id"))
 			tc.servers(mock)
 
-			rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+			rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live=1", "")
 			if rec.Code != 200 {
 				t.Fatalf("code = %d, body = %s", rec.Code, body)
 			}
@@ -318,7 +318,7 @@ func TestViewsAPI_liveLegAttributionFailureIsLogged(t *testing.T) {
 	mock.ExpectQuery("FROM bintrail_servers").WillReturnError(&drivermysql.MySQLError{
 		Number: 1142, Message: "SELECT command denied to user 'reader'@'%' for table 'bintrail_servers'"})
 
-	rec, _ := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	rec, _ := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d", rec.Code)
 	}
@@ -337,7 +337,7 @@ func TestViewsAPI_includeLiveColumnProbeFailureIs502(t *testing.T) {
 	mock.ExpectQuery("information_schema.COLUMNS").WillReturnError(
 		fmt.Errorf("dial tcp: lookup db.internal: no such host (dsn %s)", liveTestDSN))
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live=1", "")
 	if rec.Code != 502 {
 		t.Fatalf("code = %d, body = %s; want 502", rec.Code, body)
 	}
@@ -356,7 +356,7 @@ func TestViewsAPI_includeLiveColumnProbeFailureIs502(t *testing.T) {
 func TestViewsAPI_includeLiveRejectsAnUnknownValue(t *testing.T) {
 	for _, v := range []string{"on", "yes", "TRUE!", "2"} {
 		srv, mock := newLiveViewsServer(t, liveTestDSN)
-		rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live="+v, "")
+		rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live="+v, "")
 		if rec.Code != 400 {
 			t.Errorf("include_live=%s: code = %d, body = %s; want 400", v, rec.Code, body)
 			continue
@@ -377,7 +377,7 @@ func TestViewsAPI_includeLiveRejectsAnUnknownValue(t *testing.T) {
 			sqlmock.NewRows([]string{"COLUMN_NAME"}).AddRow("event_id"))
 		mock.ExpectQuery("FROM bintrail_servers").WillReturnRows(
 			sqlmock.NewRows([]string{"n", "id"}).AddRow(1, "aaaa"))
-		rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live="+v, "")
+		rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live="+v, "")
 		if rec.Code != 200 || !strings.Contains(string(body), "bintrail_live") {
 			t.Errorf("include_live=%s: code = %d, and the leg is %v", v, rec.Code, strings.Contains(string(body), "bintrail_live"))
 		}
@@ -386,7 +386,7 @@ func TestViewsAPI_includeLiveRejectsAnUnknownValue(t *testing.T) {
 	for _, v := range []string{"0", "false", ""} {
 		srv, mock := newLiveViewsServer(t, liveTestDSN)
 		expectArchiveSource(mock, "aaaa")
-		rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live="+v, "")
+		rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live="+v, "")
 		if rec.Code != 200 || strings.Contains(string(body), "bintrail_live") {
 			t.Errorf("include_live=%q: code = %d, and the leg is present = %v", v, rec.Code, strings.Contains(string(body), "bintrail_live"))
 		}
@@ -406,7 +406,7 @@ func TestViewsAPI_includeLiveRefusesAnAddressWithNoHost(t *testing.T) {
 	expectArchiveSource(mock, "aaaa")
 	expectArchiveSource(mock, "aaaa")
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_live=1", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1&include_live=1", "")
 	if rec.Code != 422 {
 		t.Fatalf("code = %d, body = %s; want 422", rec.Code, body)
 	}
