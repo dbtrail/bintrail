@@ -561,9 +561,10 @@ data. The old `/storage` link still works and lands on Retention.
   newer one could not clear included) and is retried every minute. Shown
   only on a daemon that can build `.sql` backups.
 - **Download a DuckDB schema** (#1528, formerly *Query in DuckDB*; on the SQL page since #1543) — a one-click download of `views.sql`: a ready-made
-  DuckDB schema over the selected server's own Parquet — an `events` view
-  across every archive source registered in `archive_state`, plus one
-  `state_<schema>_<table>` view per table in the newest baseline snapshot. It
+  DuckDB schema over the selected server's own Parquet — one
+  `state_<schema>_<table>` view per table in the newest baseline snapshot, plus
+  an `events` view across every archive source registered in `archive_state`
+  when you tick **Include the change log**. It
   is the same file `bintrail views` writes. **The console does not run it.**
   You get a text file; your own DuckDB executes it, in your process, on your
   machine — which is why unrestricted SQL over your lake needs no sandbox, no

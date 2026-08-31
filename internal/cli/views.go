@@ -186,6 +186,21 @@ func runViews(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	// Keyed on what the file WOULD contain, not on the flags that got here: the
+	// flag refusals above catch --no-baselines, and this catches the identical
+	// empty file reached by simply not naming a baseline location. Before the
+	// S3 probe, so a render with nothing in it is refused for the reason that
+	// matters rather than over a bucket it would never read.
+	if !in.RendersAnyView() {
+		if in.OmitEvents {
+			return fmt.Errorf("this would define no view at all: no baseline snapshot was " +
+				"found to build state views from. Name one with --baseline-dir/--baseline-s3, " +
+				"or pass --include-events for a file over the archived change log")
+		}
+		return fmt.Errorf("this would define no view at all: no baseline snapshot was found " +
+			"and there is no archive source to build the events view from")
+	}
+
 	// After the layout is known, so a purely local one is not refused over an
 	// S3 variable it will never read. When the file DOES carry s3:// paths, a
 	// broken endpoint is fatal: the alternative is a file that silently sends
@@ -208,8 +223,16 @@ func runViews(cmd *cobra.Command, _ []string) error {
 	// names, no row ever read — which puts it in the same metadata-only class as
 	// `status`. Auditing it would report a data access that did not happen.
 	if vOut != "-" {
-		fmt.Fprintf(cmd.OutOrStdout(), "wrote %s (%d archive source(s), %d state view(s))\n",
-			vOut, len(in.ArchiveSources), len(in.Baselines))
+		// The events view is named either way. Reporting the archive-source
+		// COUNT for a file that reads no archive path was the shape that made
+		// the flip invisible to an unchanged scripted invocation: same exit
+		// code, same-looking line, a view silently gone.
+		events := "omitted (pass --include-events)"
+		if in.RendersEventsView() {
+			events = fmt.Sprintf("over %d archive source(s)", len(in.ArchiveSources))
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "wrote %s (%d state view(s), events view: %s)\n",
+			vOut, len(in.Baselines), events)
 	}
 	return nil
 }

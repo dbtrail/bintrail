@@ -66,7 +66,7 @@ func TestViewsAPI_invalidEndpointIs502(t *testing.T) {
 	srv := newViewsServer(t, "", false)
 	srv.cm.boot.db = db
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 502 {
 		t.Fatalf("code = %d, body = %s; want 502", rec.Code, body)
 	}
@@ -159,7 +159,7 @@ func TestViewsAPI_pinsNothingForAGuessedRegion(t *testing.T) {
 	srv.cm.boot.db = db
 	srv.bucketRegions = map[string]bucketRegionEntry{"bkt": fellBack("us-east-1")}
 
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}

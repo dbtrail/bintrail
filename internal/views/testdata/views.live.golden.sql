@@ -42,9 +42,10 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 -- state_<schema>_<table>: each table's full contents as of the baseline snapshot.
 --
 -- These are the SNAPSHOT's rows, not the table's current state: changes after
--- the snapshot live in the `events` view. To materialize a later point in
--- time, use `bintrail reconstruct`. Folding the deltas back onto a baseline
--- is what that command does, and it is not expressible as a view.
+-- the snapshot live in the `events` view.
+-- To materialize a later point in time, use `bintrail reconstruct`. Folding
+-- the deltas back onto a baseline is what that command does, and it is not
+-- expressible as a view.
 --
 -- DECIMAL and NUMERIC columns are stored as text, so that a value MySQL can
 -- hold is never rounded to fit a narrower type. The views below cast them

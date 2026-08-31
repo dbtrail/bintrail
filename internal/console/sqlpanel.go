@@ -240,7 +240,7 @@ func (s *Server) handleSQLPanel(w http.ResponseWriter, r *http.Request) {
 	// lookup beside it, are the unbounded steps under the latch. r.Context() still propagates (Cancel works); the
 	// deadline is what stops a hung listing from wedging the single-flight.
 	setupCtx, setupCancel := context.WithTimeout(r.Context(), sqlPanelSetupTimeout)
-	in, err := s.buildViewsInput(setupCtx, b, false) // runs here: local-first routing
+	in, err := s.buildViewsInput(setupCtx, b, false, false) // runs here: local-first routing; OnlyViews decides the events view
 	setupCancel()
 	switch {
 	case errors.Is(err, errNoViewSources):

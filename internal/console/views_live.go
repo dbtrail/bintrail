@@ -34,7 +34,14 @@ import (
 // liveLegHowTo is the archives-only note's remediation for a reader who
 // downloaded the file from this page. It replaces the CLI flag the generator
 // would otherwise name (views.Input.LiveLegHowTo).
-const liveLegHowTo = `Add a leg over the live index by ticking "Include the live index" on the Download a DuckDB schema card, then downloading again.`
+// The labels are quoted VERBATIM from the card, and the prerequisite is named:
+// the live box is nested under the change-log one and inert until that is
+// ticked, so a reader told only about the sub-option would hunt for a control
+// they cannot use yet. This text is rendered into the generated file, and
+// remediation naming a control that does not exist is the exact failure the
+// constant exists to prevent -- which is what happened when the card's label
+// changed and this did not.
+const liveLegHowTo = `Add a leg over the live index by ticking "Include the change log" and then "…and the live index" under it, on the Download a DuckDB schema card, then downloading again.`
 
 // liveLegConfigError is a live leg this server cannot carry however it is
 // asked for: no open connection, or an index DSN that names no reachable

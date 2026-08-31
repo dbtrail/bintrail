@@ -24,12 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   out and how to ask for them, and no longer claims a self-following behaviour
   it only has when the `events` view is present.
 
+  A render that would define **no view at all** is now refused outright, on both
+  surfaces: `--no-baselines` was refused by name, but the identical empty file
+  was reached by simply not naming a baseline location — a shape that used to
+  produce the `events` view, so the flip turned a useful command into one that
+  exited 0 and wrote a file with nothing in it. The `bintrail views` summary
+  line names the events view either way, so an unchanged scripted invocation
+  says what it left out instead of looking exactly as it did before.
+
   **This does not make the `state_*` views follow a periodic baseline refresh**
   (#1484): they still name one snapshot path, resolved when the file was
   generated. Regenerate on the same schedule the refresh runs on. The change
   makes the default file cheap, not self-updating.
-
-### Changed
 - **The Storage page is split in two, and two of its cards moved to the pages
   they belong to** (#1543, part of #1528). Storage had become a drawer: seven
   cards from five unrelated concerns, on a page you had to read rather than

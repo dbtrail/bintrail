@@ -124,7 +124,7 @@ func TestViewsAPI_liveLegIsOptIn(t *testing.T) {
 	}
 	// And the archives-only note names the control THIS reader has. The CLI
 	// flag is not something a browser can pass.
-	if !strings.Contains(sql, `ticking "Include the live index"`) {
+	if !strings.Contains(sql, `"…and the live index"`) {
 		t.Errorf("the archives-only note does not name the console's own route:\n%s", sql)
 	}
 	if strings.Contains(sql, "--include-live") {
@@ -416,11 +416,11 @@ func TestViewsAPI_includeLiveRefusesAnAddressWithNoHost(t *testing.T) {
 
 	// And the archives-only file for that server offers no route, exactly as
 	// it does for a socket: the checkbox would refuse.
-	rec, body = doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body = doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("plain download: code = %d, body = %s", rec.Code, body)
 	}
-	if strings.Contains(string(body), `ticking "Include the live index"`) {
+	if strings.Contains(string(body), `"…and the live index"`) {
 		t.Errorf("the file offers a route this server cannot take:\n%s", body)
 	}
 	// Positive evidence that the file did not simply render the leg with an

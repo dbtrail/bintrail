@@ -3,11 +3,32 @@ package cli
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 )
+
+// baselineDirWithATable is a real discoverable snapshot, not an empty
+// directory. The distinction is load-bearing: an EMPTY baseline dir defines no
+// state view either, so a "default file has no events view" assertion driven
+// from one passes without ever showing that the state views survived the flip
+// -- and now it does not even get that far, since a render with no view at all
+// is refused.
+func baselineDirWithATable(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "2026-06-10T12-00-00Z", "shop", "orders.parquet")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
 
 // saveViewsFlags restores every package-level flag var this file touches. They
 // are globals cobra binds to, so a test that sets one and does not put it back
@@ -69,10 +90,16 @@ func TestRunViews_eventsViewIsOptIn(t *testing.T) {
 	// Same layout, without the flag. --no-baselines has to go with it, or the
 	// file would define nothing and the command refuses.
 	vNoBaselines, vIncludeEvents = false, false
-	vBaselineDir = t.TempDir()
+	vBaselineDir = baselineDirWithATable(t)
 	byDefault, err := runViewsToString(t)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The state views are what the default file is FOR. Without this the
+	// assertion below would pass on a file with nothing in it.
+	if !strings.Contains(byDefault, `CREATE OR REPLACE VIEW "state_shop_orders"`) {
+		t.Fatalf("the default file defines no state view, so it proves nothing about "+
+			"the events view being the only thing left out:\n%s", byDefault)
 	}
 	if strings.Contains(byDefault, `CREATE OR REPLACE VIEW "events"`) {
 		t.Errorf("the DEFAULT file still defines the events view, so every reader pays "+
@@ -100,7 +127,7 @@ func TestRunViews_refusesTheCombinationsThatDefineNothing(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			saveViewsFlags(t)
-			vIndexDSN, vBaselineDir, vBaselineS3 = "", t.TempDir(), ""
+			vIndexDSN, vBaselineDir, vBaselineS3 = "", baselineDirWithATable(t), ""
 			vArchiveDir, vArchiveS3, vBintrailID = t.TempDir(), "", "aaaa"
 			vNoBaselines, vIncludeLive, vIncludeEvents, vOut = tc.noBaselines, tc.includeLive, false, "-"
 
@@ -130,4 +157,77 @@ func TestRunViews_refusesTheCombinationsThatDefineNothing(t *testing.T) {
 			t.Errorf("--no-baselines --include-events was refused: %v", err)
 		}
 	})
+}
+
+// TestRunViews_refusesAFileWithNoViewInIt is the guard for the regression the
+// flip introduced and the flag refusals could not catch.
+//
+// `--no-baselines` is refused by name, but the IDENTICAL empty file is reached
+// by simply not naming a baseline location — and before the flip that shape
+// rendered the events view, so it was a useful command. After it, and before
+// this refusal, it exited 0, printed "wrote views.sql", and left a file with
+// nothing in it. The refusal is keyed on the OUTCOME for that reason: a
+// flag-shaped one is only ever right about the paths someone thought of.
+func TestRunViews_refusesAFileWithNoViewInIt(t *testing.T) {
+	saveViewsFlags(t)
+	vIndexDSN, vBaselineDir, vBaselineS3 = "", "", ""
+	vArchiveDir, vArchiveS3, vBintrailID = t.TempDir(), "", "aaaa"
+	vNoBaselines, vIncludeLive, vIncludeEvents, vOut = false, false, false, "-"
+
+	out, err := runViewsToString(t)
+	if err == nil {
+		t.Fatalf("a file with no view in it was written successfully:\n%s", out)
+	}
+	for _, want := range []string{"no view at all", "--baseline-dir", "--include-events"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal never mentions %q, so it names neither the problem "+
+				"nor either way out: %v", want, err)
+		}
+	}
+
+	// The positive control: the SAME invocation with a real baseline succeeds.
+	// Without it this test would pass on a command that refuses everything.
+	vBaselineDir = baselineDirWithATable(t)
+	if _, err := runViewsToString(t); err != nil {
+		t.Errorf("a layout that DOES define a state view was refused too: %v", err)
+	}
+}
+
+// TestRunViews_summaryNamesTheOmittedView: an unchanged scripted invocation
+// keeps working after the flip and quietly loses the events view. The one line
+// the operator sees has to say so, or the flip is invisible until DuckDB
+// reports a table that does not exist. Reporting the archive-source COUNT for a
+// file that reads no archive path was the shape that hid it.
+func TestRunViews_summaryNamesTheOmittedView(t *testing.T) {
+	saveViewsFlags(t)
+	dir := t.TempDir()
+	vIndexDSN, vBaselineDir, vBaselineS3 = "", baselineDirWithATable(t), ""
+	vArchiveDir, vArchiveS3, vBintrailID = dir, "", "aaaa"
+	vNoBaselines, vIncludeLive, vIncludeEvents = false, false, false
+	vOut = filepath.Join(t.TempDir(), "views.sql")
+
+	out, err := runViewsToString(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "events view: omitted") {
+		t.Errorf("the summary does not say the events view was left out:\n%s", out)
+	}
+	if !strings.Contains(out, "--include-events") {
+		t.Errorf("the summary does not name how to get it back:\n%s", out)
+	}
+
+	// With the view IN the file the same line must say so, or "omitted" would
+	// be a constant rather than a report.
+	vIncludeEvents = true
+	out, err = runViewsToString(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "omitted") {
+		t.Errorf("the summary says the events view was omitted from a file that has it:\n%s", out)
+	}
+	if !strings.Contains(out, "archive source(s)") {
+		t.Errorf("the summary does not report what the events view reads:\n%s", out)
+	}
 }

@@ -438,10 +438,6 @@ func (in Input) SelectedBaselines() []BaselineTable {
 	return out
 }
 
-// definesEvents reports whether the events view is emitted at all: it needs a
-// leg, and a failed discovery leaves no usable archive list whatever
-// ArchiveSources holds. One predicate, shared by writeEventsView and
-// DefinedViews, so the two cannot disagree about whether the view exists.
 // rendersEvents reports whether THIS render will contain an events view: the
 // view has to be defined at all (definesEvents) and the caller must not have
 // left it out. Every sentence elsewhere in the file that points at that view
@@ -451,6 +447,40 @@ func (in Input) rendersEvents() bool {
 	return in.definesEvents() && !in.OmitEvents && in.OnlyViews.wants(eventsViewName)
 }
 
+// RendersEventsView is rendersEvents for callers outside this package: a
+// producer that reports what it wrote needs the same answer the renderer used,
+// or its summary line describes a different file from the one on disk.
+func (in Input) RendersEventsView() bool { return in.rendersEvents() }
+
+// RendersAnyView reports whether this Input would produce a file with at least
+// one view definition in it.
+//
+// The two FILE producers ask it and refuse when it is false. A refusal keyed on
+// the OUTCOME rather than on a flag combination is the point: `bintrail views`
+// already refuses `--no-baselines` without `--include-events`, but the
+// identical empty file is reached by simply not naming a baseline location, and
+// that path used to render the events view, so the flip turned a useful command
+// into a silently useless one (exit 0, "wrote views.sql", nothing in it).
+//
+// GenerateViews has its own empty-string answer for the same situation and does
+// NOT go through here: its caller executes the text, so "run nothing" is a
+// legitimate result there, not a mistake to report.
+func (in Input) RendersAnyView() bool {
+	if in.rendersEvents() {
+		return true
+	}
+	for _, p := range stateViewPlan(in) {
+		if in.OnlyViews.wants(p.name) {
+			return true
+		}
+	}
+	return false
+}
+
+// definesEvents reports whether the events view is emitted at all: it needs a
+// leg, and a failed discovery leaves no usable archive list whatever
+// ArchiveSources holds. One predicate, shared by writeEventsView and
+// DefinedViews, so the two cannot disagree about whether the view exists.
 func (in Input) definesEvents() bool {
 	cold := !in.ArchiveDiscoveryFailed && len(in.ArchiveSources) > 0
 	return cold || in.LiveIndex != nil
@@ -851,7 +881,13 @@ func writeEventsView(b *strings.Builder, in Input, stateSurvives bool) bool {
 	// registered" would send an operator to check a registry that is fine.
 	// A comment, not silence, because the reader is looking at a file with no
 	// events view in it and the file is the only thing that can tell them why.
-	if in.OmitEvents {
+	//
+	// definesEvents is asked HERE, not only below: with no archive source there
+	// would be no view to define anyway, and claiming a cost ("one footer per
+	// archived file") plus a remedy ("--include-events") for a layout with no
+	// archived files is advice that regenerates the same file. That shape falls
+	// through to the skip branch, which states the real reason.
+	if in.OmitEvents && in.definesEvents() {
 		b.WriteString("-- events: not included in this file.\n")
 		b.WriteString("--\n")
 		b.WriteString("-- Defining it opens one Parquet footer per archived file before it returns\n")

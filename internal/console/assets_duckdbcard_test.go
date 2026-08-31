@@ -13,6 +13,22 @@ import (
 //
 // Scoped to duckdbCard's body: a file-wide search for "include_live" would be
 // satisfied by any other mention, this one included in a comment.
+// TestDuckDBCard_disabledStateIsStyled: the class toggles are inert unless
+// something styles the class, and a rule with no reader is invisible to every
+// JS-level assertion.
+func TestDuckDBCard_disabledStateIsStyled(t *testing.T) {
+	css, err := os.ReadFile("assets/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{".check.is-disabled", ".check-sub", ".form-hint-sub"} {
+		if !strings.Contains(string(css), want) {
+			t.Errorf("no style for %s, so the nested option renders identically to a "+
+				"top-level one whether it is usable or not", want)
+		}
+	}
+}
+
 func TestDuckDBCardOffersTheLiveLeg(t *testing.T) {
 	js, err := os.ReadFile("assets/app.js")
 	if err != nil {
@@ -45,6 +61,24 @@ func TestDuckDBCardOffersTheLiveLeg(t *testing.T) {
 	}
 	if !strings.Contains(body, "events.checked && live.checked") {
 		t.Error("the live parameter is not conditional on the change log being on too")
+	}
+	// The cost of the change log belongs on the PAGE. By the time the operator
+	// reads the generated file, the bind is already running. Deleting this
+	// paragraph left every other assertion here green.
+	for _, want := range []string{"takes longer to open", "every archived file"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the card does not state the cost of the change log (missing %q)", want)
+		}
+	}
+	// The VISUAL half of the nesting. `disabled: true` covers the functional
+	// half and was the only thing pinned, so deleting the whole disabled
+	// treatment — both class toggles AND the initial sync — stayed green while
+	// the inert sub-option rendered at full opacity, indistinguishable from a
+	// live control.
+	for _, want := range []string{`classList.toggle("is-disabled"`, "events.onchange();"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the nested option has no visible disabled state (missing %q)", want)
+		}
 	}
 	// Conditional, not always: the leg reads the live capture index and the
 	// change log binds every archived file, so a download nobody asked either

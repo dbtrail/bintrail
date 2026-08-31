@@ -33,10 +33,17 @@ var errNoViewSources = errors.New("this server has no archived partitions and no
 // so it takes the S3 location whenever one is registered (#1456); the SQL panel
 // runs in this daemon and keeps the local-first routing every other console
 // read uses.
-func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable bool) (views.Input, error) {
+// omitEvents is a PARAMETER rather than something the caller sets afterwards:
+// NeedsS3 below asks whether the rendered file reads any s3:// path, and the
+// events view is the half that reads the archives. Set after this returns, the
+// gate ran with the zero value and a default download 502'd over an S3 variable
+// its file never touches -- while the CLI, which knows before it asks, did not.
+// The SQL panel passes false: it decides through OnlyViews.
+func (s *Server) buildViewsInput(ctx context.Context, b *bundle, portable, omitEvents bool) (views.Input, error) {
 	in := views.Input{
 		GeneratedAt: time.Now().UTC(),
 		Version:     s.version,
+		OmitEvents:  omitEvents,
 	}
 	// The download CAN carry the hot leg now (the "Include the live index"
 	// box), so the archives-only note names that box rather than a flag the
@@ -201,7 +208,7 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	in, err := s.buildViewsInput(r.Context(), b, true)
+	in, err := s.buildViewsInput(r.Context(), b, true, !includeEvents)
 	switch {
 	case errors.Is(err, errNoViewSources):
 		// Nothing to describe. A file of comments explaining that would be a
@@ -242,7 +249,20 @@ func (s *Server) handleViewsSQL(w http.ResponseWriter, r *http.Request) {
 		in.LiveLegHowTo = ""
 	}
 
-	in.OmitEvents = !includeEvents
+	// AFTER the live leg is resolved, since that leg can be the only thing
+	// defining the events view. errNoViewSources above answers "this server has
+	// nothing to describe"; this answers the narrower and newer case: sources
+	// exist, but with the events view left out and no baseline snapshot to
+	// build state views from, the file would carry no view at all. Served as a
+	// 200 it looked like a successful download of an empty schema.
+	if !in.RendersAnyView() {
+		writeJSONError(w, http.StatusNotFound,
+			"this would define no view at all: no baseline snapshot was found to build "+
+				"state views from, and the change log is not included. Take a backup, or "+
+				"tick \"Include the change log\" to get a view over the archived changes")
+		return
+	}
+
 	sqlText := views.Generate(in)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="views.sql"`)

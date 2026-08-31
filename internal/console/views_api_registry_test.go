@@ -46,7 +46,7 @@ func TestViewsAvailable_readsTheRegistry(t *testing.T) {
 	if !srv.viewsAvailable(r, srv.cm.boot) {
 		t.Fatal("gate hides the button for a local-only archive the handler would serve")
 	}
-	rec, body := doServersReq(t, srv, "GET", "/api/views.sql", "")
+	rec, body := doServersReq(t, srv, "GET", "/api/views.sql?include_events=1", "")
 	if rec.Code != 200 {
 		t.Fatalf("handler code = %d, body = %s; the gate said yes", rec.Code, body)
 	}
