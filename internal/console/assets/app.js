@@ -4225,6 +4225,23 @@ function duckdbViewNames(sql) {
   return out;
 }
 
+// duckdbCommandLine renders the one command the reader has to reproduce, with a
+// Copy button.
+//
+// Real text, not a drawing. A picture of a terminal was built here first and
+// thrown away: at card width it wrapped under the command and read as a loading
+// skeleton, and unlike claudeAskMock it depicted nothing the server sends, so
+// there was nothing to pin it against. The command itself is the part that has
+// to be exact, and it is the part a drawing cannot carry.
+function duckdbCommandLine(file) {
+  const cmd = "duckdb -init " + file + " lake.db";
+  const box = el("div", { class: "dk-run" },
+    el("code", { class: "dk-cmd", text: cmd }),
+    el("button", { class: "dk-copy", type: "button", text: "Copy" }));
+  box.querySelector(".dk-copy").onclick = () => copyText(cmd, "command");
+  return box;
+}
+
 // duckdbNameList renders what the reader can now query, by name.
 //
 // After the download, not before: on first visit the names are noise, and the
@@ -4232,10 +4249,13 @@ function duckdbViewNames(sql) {
 // moment they are the one thing the reader needs and cannot guess, since the
 // only documented way to recover them is SHOW TABLES, the query that took 63
 // seconds on the surface this card replaced.
-function duckdbNameList(names, file) {
+function duckdbNameList(names) {
   const box = el("div", { class: "dk-names" });
+  // The count only. The command box above already says how to load the file,
+  // and naming a second way to do it (.read, for a session already open) beside
+  // the first put two loading instructions on screen with nothing to tell them
+  // apart.
   box.append(el("div", { class: "dk-names-head" },
-    el("code", { text: ".read " + file }),
     el("span", { class: "dk-names-count", text: names.length + " views" })));
   const list = el("div", { class: "dk-names-list" });
   for (const n of names) {
@@ -4319,13 +4339,16 @@ function duckdbPanel() {
       // The instruction used to be a toast, which is the wrong container for the
       // only handoff in this flow: it names a command for a session the reader
       // has not opened yet, and then disappears. This stays on the card.
-      const older = body.querySelector(".dk-names");
-      if (older) older.remove();
+      for (const sel of [".dk-names", ".dk-run"]) {
+        const older = body.querySelector(sel);
+        if (older) older.remove();
+      }
       // Above the button, not appended after it. The button is the action and
       // stays at the foot of the card; a list that lands below it pushes the
       // action into the middle of its own result.
-      body.insertBefore(duckdbNameList(duckdbViewNames(sql), name),
-        body.querySelector(".stg-cardfoot"));
+      const foot = body.querySelector(".stg-cardfoot");
+      body.insertBefore(duckdbCommandLine(name), foot);
+      body.insertBefore(duckdbNameList(duckdbViewNames(sql)), foot);
     } catch (err) {
       toastError("could not generate views: " + ((err && err.message) || err));
     } finally {

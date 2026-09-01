@@ -310,6 +310,7 @@ func (v ViewSet) wants(name string) bool {
 func Generate(in Input) string {
 	var b strings.Builder
 	writeHeader(&b, in)
+	writeTimeZone(&b)
 	if in.NeedsS3() {
 		region := in.ArchiveRegion
 		if in.RegionAmbiguous {
@@ -722,6 +723,28 @@ func orUnknown(s string) string {
 // paste into a notebook or share with a colleague: it resolves whatever the
 // environment already has (instance role, SSO profile, env vars) and puts NO key
 // material in the generated text.
+// writeTimeZone pins the session to UTC, which is the one statement in this file
+// that is neither a view nor a way to reach storage.
+//
+// It is here because leaving it out is wrong QUIETLY. The archives store
+// event_timestamp as TIMESTAMP WITH TIME ZONE, so the session's zone decides
+// both how it prints and where date_trunc puts a day boundary; DuckDB defaults
+// to the machine's zone, and a reader west of UTC gets buckets that disagree
+// with the console, with the MCP tools and with every timestamp dbtrail records,
+// without anything failing. The guide used to carry this as a step the reader
+// performed by hand, which made a silent wrong answer the default for anyone who
+// skipped it.
+//
+// Emitted, not enforced: the comment says what it did so a reader who would
+// rather work in their own zone can change one line.
+func writeTimeZone(b *strings.Builder) {
+	b.WriteString("-- Timestamps are recorded in UTC, and the archives carry the zone, so the\n")
+	b.WriteString("-- session's setting decides how they print and where date_trunc puts a day\n")
+	b.WriteString("-- boundary. Pinned to UTC here so the numbers match the console. Change it if\n")
+	b.WriteString("-- you would rather read in your own zone.\n")
+	b.WriteString("SET TimeZone = 'UTC';\n\n")
+}
+
 func writeS3Preamble(b *strings.Builder, region string, ep storage.S3Endpoint, ambiguousRegion bool) {
 	b.WriteString("-- S3 setup, mirroring what bintrail's own DuckDB sessions configure.\n")
 	if ep.Set() {

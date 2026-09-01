@@ -2677,8 +2677,7 @@ button { font-family: inherit; }
    with its own scroll: a server with fifty tables must not push the button off
    screen, and the list is a lookup rather than something anyone reads through. */
 .dk-names { margin: 12px 14px 0; border-top: 1px solid var(--line); padding-top: 10px; }
-.dk-names-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
-.dk-names-head code { font-size: 12px; color: var(--ink-2); }
+.dk-names-head { display: flex; align-items: baseline; justify-content: flex-end; margin-bottom: 8px; }
 .dk-names-count { font-size: 11px; color: var(--ink-4); flex: none; }
 .dk-names-list { display: flex; flex-wrap: wrap; gap: 4px; max-height: 132px; overflow-y: auto; }
 .dk-name {
@@ -2687,3 +2686,20 @@ button { font-family: inherit; }
   background: var(--surface-1); color: var(--ink-2); cursor: pointer;
 }
 .dk-name:hover { border-color: var(--accent); color: var(--ink-1); }
+
+/* The one command the reader has to reproduce, with a Copy button. Real text
+   rather than a drawing: a terminal mock was built here and dropped, because at
+   card width it read as a loading skeleton and depicted nothing the server
+   sends, so nothing could pin it. */
+.dk-run {
+  display: flex; align-items: center; gap: 8px; margin: 12px 14px 0;
+  padding: 9px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--surface-1);
+}
+.dk-cmd { font-size: 11px; font-family: var(--mono, ui-monospace, monospace); color: var(--ink-2); word-break: break-all; flex: 1; }
+.dk-copy {
+  font: inherit; font-size: 11px; flex: none; cursor: pointer;
+  padding: 3px 8px; border: 1px solid var(--line); border-radius: 5px;
+  background: var(--surface-2); color: var(--ink-3);
+}
+.dk-copy:hover { border-color: var(--accent); color: var(--ink-1); }

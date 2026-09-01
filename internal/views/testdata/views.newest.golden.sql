@@ -41,6 +41,12 @@
 --   s3://my-bucket/baselines/ at 2026-04-30T03:00:00Z (4 table(s))
 --   read through the newest `_SUCCESS` snapshot, which is that one right now
 
+-- Timestamps are recorded in UTC, and the archives carry the zone, so the
+-- session's setting decides how they print and where date_trunc puts a day
+-- boundary. Pinned to UTC here so the numbers match the console. Change it if
+-- you would rather read in your own zone.
+SET TimeZone = 'UTC';
+
 -- S3 setup, mirroring what bintrail's own DuckDB sessions configure.
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws; LOAD aws;

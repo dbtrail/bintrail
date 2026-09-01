@@ -43,6 +43,12 @@
 --   a directory, so the state views resolve only where it is mounted,
 --   at exactly this path
 
+-- Timestamps are recorded in UTC, and the archives carry the zone, so the
+-- session's setting decides how they print and where date_trunc puts a day
+-- boundary. Pinned to UTC here so the numbers match the console. Change it if
+-- you would rather read in your own zone.
+SET TimeZone = 'UTC';
+
 -- S3 setup, mirroring what bintrail's own DuckDB sessions configure.
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws; LOAD aws;
