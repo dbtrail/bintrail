@@ -4877,6 +4877,48 @@ function backupIncompleteNotice(b) {
   return box;
 }
 
+// BACKUPS_PAGE_SIZE caps how many backups a page shows.
+//
+// The list is a recency view, not an inventory: what an operator comes here for
+// is the newest few and whether they are fresh. Twenty-five rows pushed the
+// per-row Download and the restore controls below the fold, so the panel read
+// as a wall with nothing to do in it.
+const BACKUPS_PAGE_SIZE = 5;
+
+// backupsPage survives a re-render on purpose. The panel repaints every ~10s
+// while a backup run is in flight (watchBackupRuns), and page state held in the
+// DOM would snap back to the first page under a reader who had paged away.
+// Keyed by server so switching does not land you on page 4 of a list that has
+// two.
+let backupsPage = { server: null, index: 0 };
+
+function backupsPageIndex(serverId, pages) {
+  if (backupsPage.server !== serverId) backupsPage = { server: serverId, index: 0 };
+  // Clamped on READ rather than on write: the list shrinks under you when
+  // retention prunes, and a stored index past the end would render an empty
+  // page with no way back.
+  if (backupsPage.index > pages - 1) backupsPage.index = Math.max(0, pages - 1);
+  return backupsPage.index;
+}
+
+// backupsPager draws the two controls and the position. Rendered only when
+// there is more than one page: a pager under five rows is furniture.
+function backupsPager(total, page, pages, onGo) {
+  if (pages < 2) return null;
+  const from = page * BACKUPS_PAGE_SIZE + 1;
+  const to = Math.min(total, (page + 1) * BACKUPS_PAGE_SIZE);
+  const btn = (label, target, disabled) => {
+    const el2 = el("button", { class: "btn btn-sm", type: "button", text: label });
+    if (disabled) el2.disabled = true;
+    else el2.onclick = () => onGo(target);
+    return el2;
+  };
+  return el("div", { class: "bk-pager" },
+    btn("Newer", page - 1, page === 0),
+    el("span", { class: "bk-pager-n", text: from + "–" + to + " of " + total }),
+    btn("Older", page + 1, page >= pages - 1));
+}
+
 function baselinesPanel(b, servers, opts) {
   // Full-width (#1415): this list is the page. The Create-baseline action
   // moved to the context strip — at page level it is a page action; inside
@@ -4939,7 +4981,14 @@ function baselinesPanel(b, servers, opts) {
     // appears per-row only when it VARIES — a value identical in every row
     // is a fact about the collection and lives in the context strip.
     const uniformTables = snapshotTablesUniform(b.snapshots, b.truncated);
-    b.snapshots.forEach((sn, idx) => {
+    const total = b.snapshots.length;
+    const pages = Math.max(1, Math.ceil(total / BACKUPS_PAGE_SIZE));
+    const page = backupsPageIndex(currentServer || defaultServerId, pages);
+    const start = page * BACKUPS_PAGE_SIZE;
+    // idx is the index in the WHOLE list, not in the page: it decides the
+    // "Newest" treatment, and paging must not promote the first row of page two.
+    b.snapshots.slice(start, start + BACKUPS_PAGE_SIZE).forEach((sn, i) => {
+      const idx = start + i;
       const row = el("div", { class: "stg-row" + (idx === 0 ? " stg-row-latest" : "") });
       if (idx === 0) row.append(el("span", { class: "tag-pill", text: "Newest" }));
       row.append(tsSpan("stg-name mono", sn.time));
@@ -4957,6 +5006,10 @@ function baselinesPanel(b, servers, opts) {
       // once per row, on first open.
       const detail = el("div", { class: "bk-detail" });
       detail.hidden = true;
+      // A chevron, because the only thing that said "this opens" was a hover
+      // background and a pointer cursor. The per-row Download lives inside
+      // this fold, so an invisible affordance hid the whole feature.
+      row.append(el("span", { class: "bk-chev", text: "›" }));
       row.classList.add("bk-expandable");
       row.setAttribute("role", "button");
       row.setAttribute("aria-expanded", "false");
@@ -4970,6 +5023,11 @@ function baselinesPanel(b, servers, opts) {
       };
       list.append(row, detail);
     });
+    const pager = backupsPager(total, page, pages, (target) => {
+      backupsPage = { server: currentServer || defaultServerId, index: target };
+      renderRoute();
+    });
+    if (pager) list.append(pager);
     if (b.truncated) list.append(el("div", { class: "ev-empty", text: "…older backups not shown." }));
   }
   panel.append(list);

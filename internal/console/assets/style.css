@@ -2737,3 +2737,11 @@ button { font-family: inherit; }
 .bk-made { font-size: 11.5px; color: var(--ink-3); }
 .bk-made-from { color: var(--ink-4); }
 .bk-made-none { color: var(--ink-4); }
+
+/* Backups list paging (#1572). The pager sits under the rows, and the chevron
+   is what says a row opens at all: the per-row Download lives inside that fold,
+   so a hover background was hiding the feature rather than hinting at it. */
+.bk-pager { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-top: 1px solid var(--line-soft); }
+.bk-pager-n { font-size: 11.5px; color: var(--ink-4); }
+.bk-chev { margin-left: auto; color: var(--ink-4); font-size: 15px; line-height: 1; flex: none; transition: transform .12s ease; }
+.bk-expandable[aria-expanded="true"] .bk-chev { transform: rotate(90deg); }
