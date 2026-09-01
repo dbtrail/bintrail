@@ -5487,7 +5487,10 @@ function backupRestoreCard(cur, b, restoreSt) {
   // shared store the endpoint refuses (the fold would mix servers).
   if (!cur.baseline_dir) return null;
   if (!b || b.error || !b.configured || b.kind !== "dir") return null;
-  if (!(b.snapshots || []).length) return null;
+  // The LOCAL ones: the card is already gated on the server having its own
+  // baseline_dir, so that is the directory executeRestore will read.
+  const usable = backupSnapshotsFor(b, "dir");
+  if (!usable.length) return null;
   const rst = restoreSt && restoreSt.restore;
   if (rst && rst.state === "running") return null; // the run region owns it
   const details = el("details", { class: "form-advanced bk-restore" },
@@ -5497,12 +5500,14 @@ function backupRestoreCard(cur, b, restoreSt) {
     "Pick a past moment. The console rebuilds every table as it was then, from your backups plus the recorded changes, and saves the result as a new backup in the list below. Your database is not touched." }));
   const input = el("input", { class: "in", type: "text", spellcheck: "false",
     placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
-  input.value = (b.snapshots[0] && b.snapshots[0].time) || "";
+  input.value = (usable[0] && usable[0].time) || "";
   const go = el("button", { class: "btn", type: "button", text: "Restore" });
   const msg = el("p", { class: "form-msg err" });
   msg.hidden = true;
   go.onclick = () => startBackupRestore(cur.id, input.value.trim(), go, msg);
   body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
+  const elsewhere = backupElsewhereNote(b, usable);
+  if (elsewhere) body.append(elsewhere);
   if (rst && rst.state === "failed") {
     body.append(el("p", { class: "form-msg err", text:
       "Last restore published nothing: " + backupFoldError(rst.last_error || "unknown error") + " Nothing was overwritten." }));
@@ -5546,10 +5551,41 @@ async function startBackupRestore(id, at, btn, msgEl) {
 // both mean the same thing to the operator: the file is gone, build again.
 // S3-backed backups qualify too (the fold engine reads them directly), which
 // is why this card has no b.kind === "dir" gate.
+// backupSnapshotsFor narrows the listing to the snapshots a JOB can actually
+// fold from (#1542).
+//
+// The Backups list now merges every location, but the restore and .sql-export
+// jobs still read ONE: executeRestore calls SnapshotTablesAt(req.BaselineDir),
+// and the export picks the local directory whenever the server has one. So a
+// card prefilled with the newest row can now name a snapshot that exists only
+// in the bucket, and the job would refuse it while the page above says it is
+// right there. Listing more must not mean offering more than the job can do.
+//
+// The full answer is folding from S3 (#1541); until then the cards offer what
+// works and say what they left out.
+function backupSnapshotsFor(b, kind) {
+  return ((b && b.snapshots) || []).filter((s) => !s.kinds || !s.kinds.length || s.kinds.includes(kind));
+}
+
+// backupElsewhereNote names the snapshots a card had to skip, so a shorter
+// dropdown than the list above it is explained rather than merely odd.
+function backupElsewhereNote(b, usable) {
+  const all = ((b && b.snapshots) || []).length;
+  if (!all || usable.length >= all) return null;
+  const n = all - usable.length;
+  return el("p", { class: "form-hint", text:
+    n + " backup" + (n === 1 ? " is" : "s are") + " kept only in S3. This builds from the local folder, so it cannot start from " +
+    (n === 1 ? "that one" : "those") + " yet." });
+}
+
 function backupSQLExportCard(cur, b, sqlSt) {
   if (!capsCache.sql_export || !cur || !cur.id || cur.kind !== "registry") return null;
   if (!b || b.error || !b.configured) return null;
-  if (!(b.snapshots || []).length) return null;
+  // Whichever location the build will read: the server's own directory when it
+  // has one, the bucket otherwise. The comment above is right that an S3-backed
+  // server qualifies; it is a server with BOTH that needed narrowing.
+  const usable = backupSnapshotsFor(b, cur.baseline_dir ? "dir" : "s3");
+  if (!usable.length) return null;
   const st = sqlSt && sqlSt.sql_export;
   if (st && st.state === "running") return null; // the run region owns it
   const details = el("details", { class: "form-advanced bk-restore" },
@@ -5559,12 +5595,16 @@ function backupSQLExportCard(cur, b, sqlSt) {
     "Pick a past moment. The console takes the backup from just before it, replays the recorded changes up to it, and packages the result as plain SQL files (mydumper format), ready for myloader. Restoring needs nothing from dbtrail. Your database is not touched." }));
   const input = el("input", { class: "in", type: "text", spellcheck: "false",
     placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
-  input.value = (b.snapshots[0] && b.snapshots[0].time) || "";
+  input.value = (usable[0] && usable[0].time) || "";
   const go = el("button", { class: "btn", type: "button", text: "Build" });
   const msg = el("p", { class: "form-msg err" });
   msg.hidden = true;
   go.onclick = () => startSQLExport(cur.id, input.value.trim(), go, msg);
   body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
+  if (cur.baseline_dir) {
+    const elsewhere = backupElsewhereNote(b, usable);
+    if (elsewhere) body.append(elsewhere);
+  }
   if (st && st.state === "failed") {
     body.append(el("p", { class: "form-msg err", text:
       "Last build failed: " + backupFoldError(st.last_error || "unknown error") + " Nothing was built." }));

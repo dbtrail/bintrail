@@ -2,11 +2,26 @@ package console
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 )
+
+// baselineListTimeout bounds ONE location's listing.
+//
+// A local directory answers off the filesystem; an S3 one opens DuckDB, loads
+// httpfs and globs a bucket, and this runs inside `bintrail-console watch`,
+// which is also the capture process. The Backups page polls every ~10s while a
+// run is in flight and the server sets no WriteTimeout, so an endpoint that
+// accepts and never answers would hold a request open indefinitely.
+//
+// Generous rather than tight: a slow bucket that eventually answers must not be
+// reported as unreadable, which would be this endpoint claiming an incomplete
+// listing on a healthy configuration.
+const baselineListTimeout = 15 * time.Second
 
 // baselineSourceDTO is one location the listing read, and what came of reading
 // it. Present for every configured location, including one that failed: a
@@ -95,10 +110,21 @@ func listBaselinesMerged(ctx context.Context, sources []string, list baselineLis
 		}
 		kind := baselineKindOf(src)
 		report := baselineSourceDTO{Source: src, Kind: kind}
-		files, err := list(ctx, src)
+		srcCtx, cancel := context.WithTimeout(ctx, baselineListTimeout)
+		files, err := list(srcCtx, src)
+		cancel()
 		if err != nil {
 			report.Error = err.Error()
 			out.Sources = append(out.Sources, report)
+			// Logged as well as returned. The response body is the ONLY other
+			// copy, so without this a bucket that has been failing since a
+			// credential expiry is visible to whoever has the tab open and to
+			// nobody else — not cron, not alerting, not the journal. The
+			// coverage endpoint already warns on the identical failure from the
+			// identical call, and this handler already warns about the far
+			// smaller failure of one unreadable Parquet footer.
+			slog.Warn("console: a backup location could not be listed; the listing beside it is incomplete",
+				"source", src, "kind", kind, "error", err)
 			continue
 		}
 		out.Listed++

@@ -1,9 +1,11 @@
 package console
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -213,5 +215,64 @@ func TestBaselinesAPI_failsOnlyWhenNoLocationAnswers(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("the failure does not name %s; the operator is left guessing which location broke:\n%s", want, body)
 		}
+	}
+}
+
+// TestBaselineFilesAPI_reachesASnapshotOnlyInTheFallback is the half of #1542
+// that the listing fix created.
+//
+// Before the merge this could not be asked: a snapshot held only in the second
+// location had no row, so nothing linked to it. Now it has one, and opening the
+// primary alone answers "no backup found" for a row the same page just said is
+// there — and the Download button, which the frontend builds inside the success
+// path, never appears for exactly the snapshots this feature exists to reveal.
+func TestBaselineFilesAPI_reachesASnapshotOnlyInTheFallback(t *testing.T) {
+	primary, fallback := t.TempDir(), t.TempDir()
+	writeBaselineFixture(t, primary, "2026-06-10T12-00-00Z", "shop", "orders.parquet")
+	writeBaselineFixture(t, fallback, "2026-06-03T12-00-00Z", "shop", "orders.parquet")
+
+	srv := newBaselineServerWithFallback(t, primary, fallback)
+	rec, body := doServersReq(t, srv, "GET",
+		"/api/baselines/files?at=2026-06-03T12:00:00Z", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s — the listing shows this snapshot; its detail must not deny it", rec.Code, body)
+	}
+	var got baselineFilesResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tables) != 1 || got.Tables[0].Table != "orders" {
+		t.Errorf("tables = %+v, want the one table of the fallback-only snapshot", got.Tables)
+	}
+
+	// And the primary still wins for a snapshot it holds, so the fallback is a
+	// fallback and not a replacement.
+	rec, body = doServersReq(t, srv, "GET", "/api/baselines/files?at=2026-06-10T12:00:00Z", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d for the primary's own snapshot: %s", rec.Code, body)
+	}
+}
+
+// A location that cannot be read has to reach the log, not only the response
+// body. The body is seen by whoever has the tab open and by nobody else — not
+// cron, not alerting, not the journal — and a bucket that has been failing since
+// a credential expiry is exactly the case that outlives a browser tab.
+func TestMergedBaselines_logsAFailedLocation(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	const dir, s3 = "/data/baselines", "s3://bucket/baselines"
+	listBaselinesMerged(context.Background(), []string{dir, s3}, fakeLister(
+		map[string][]reconstruct.BaselineFile{dir: {bf("2026-06-10T12:00:00Z", "shop", "orders", dir+"/x.parquet")}},
+		map[string]error{s3: errors.New("AccessDenied")}))
+
+	out := buf.String()
+	if !strings.Contains(out, s3) || !strings.Contains(out, "AccessDenied") {
+		t.Errorf("the failing location was not logged with its source and error:\n%s", out)
+	}
+	if strings.Contains(out, dir) {
+		t.Errorf("the location that WORKED was logged as a failure:\n%s", out)
 	}
 }

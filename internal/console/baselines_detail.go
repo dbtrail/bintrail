@@ -223,22 +223,43 @@ func (s *Server) resolveSnapshotRequest(w http.ResponseWriter, r *http.Request, 
 			"at must be a snapshot time as the listing returned it (YYYY-MM-DD HH:MM:SS, UTC)")
 		return nil, "", nil
 	}
-	ss, err := openSnapshotSource(r.Context(), b.baselineSrc)
-	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, "open backup storage: "+err.Error())
-		return nil, "", nil
-	}
 	dirName := reconstruct.SnapshotDirName(ts)
-	files, err := ss.files(r.Context(), dirName)
-	if errors.Is(err, fs.ErrNotExist) {
-		writeJSONError(w, http.StatusNotFound, "no backup found at "+ts.Format(consoleTSFormat))
+	// Every configured location, in the same order the listing consults them
+	// (#1542). Before the listing merged them this could only ever be asked
+	// about a snapshot the primary held, because no other row existed. Now that
+	// an S3-only snapshot has a row, opening the primary alone would answer
+	// "no backup found" for a row the same page just said is there — and the
+	// download button, which is built inside the success path, would never
+	// appear for exactly the snapshots #1542 exists to reveal.
+	//
+	// The same fallback bundle.findBaseline already performs, for the same
+	// reason: local retention prunes while the durable copy remains.
+	var firstErr error
+	for _, src := range baselineSourcesOf(b) {
+		ss, err := openSnapshotSource(r.Context(), src)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("open backup storage: %w", err)
+			}
+			continue
+		}
+		files, err := ss.files(r.Context(), dirName)
+		if err == nil {
+			return ss, dirName, files
+		}
+		// Not-found is not an error yet: a later location may hold it. Anything
+		// else IS reported, but only after every location has been tried, so an
+		// unreachable bucket cannot hide a snapshot sitting on local disk.
+		if !errors.Is(err, fs.ErrNotExist) && firstErr == nil {
+			firstErr = fmt.Errorf("list backup files: %w", err)
+		}
+	}
+	if firstErr != nil {
+		writeJSONError(w, http.StatusBadGateway, firstErr.Error())
 		return nil, "", nil
 	}
-	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, "list backup files: "+err.Error())
-		return nil, "", nil
-	}
-	return ss, dirName, files
+	writeJSONError(w, http.StatusNotFound, "no backup found at "+ts.Format(consoleTSFormat))
+	return nil, "", nil
 }
 
 // handleBaselineFiles serves GET /api/baselines/files?at=…: one snapshot's
