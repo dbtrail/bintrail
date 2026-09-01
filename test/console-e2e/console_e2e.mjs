@@ -3987,6 +3987,43 @@ try {
     ? ok("layout: a page with fewer cards than tracks still fills its row")
     : bad("layout: a page with fewer cards than tracks still fills its row", JSON.stringify(rowFill));
 
+  // The other half, and the one auto-fit does NOT give for free: between the
+  // 880px breakpoint and the width where three tracks fit again, a three-card
+  // page wraps to two columns and its third card is alone on the last row.
+  // Without the span rule that leaves 287 to 387px of nothing beside it, which
+  // is the same hole moved to a laptop width. Measured on the LAST row, at a
+  // width inside the band, on the page that carries three cards.
+  //
+  // The suite's viewport is restored before moving on: every scenario after
+  // this one assumes 1300.
+  await page.setViewportSize({ width: 1000, height: 1000 });
+  await page.evaluate(() => navigate("connect"));
+  await page.waitForFunction(() => location.pathname === "/connect"
+    && document.querySelectorAll(".cards .card").length >= 3, { timeout: 10000 });
+  const bandRow = await page.evaluate(() => {
+    const g = document.querySelector(".cards");
+    const gw = g.getBoundingClientRect().width;
+    const boxes = Array.from(g.children).map((c) => c.getBoundingClientRect());
+    const tops = [...new Set(boxes.map((b) => Math.round(b.top)))].sort((a, z) => a - z);
+    const last = boxes.filter((b) => Math.round(b.top) === tops[tops.length - 1]);
+    const gap = parseFloat(getComputedStyle(g).columnGap) || 0;
+    const used = last.reduce((s, b) => s + b.width, 0) + gap * (last.length - 1);
+    return { cards: boxes.length, rows: tops.length, onLast: last.length, left: Math.round(gw - used) };
+  });
+  await page.setViewportSize({ width: 1300, height: 1000 });
+  // Back to /daemon, and WAIT for it: Scenario 17h below picks up "still on
+  // /daemon" and looks for a card by title there. Leaving the page on /connect
+  // failed it with {"found":false}, which reads as a telemetry bug and is not
+  // one.
+  await page.evaluate(() => navigate("daemon"));
+  await page.waitForFunction(() => location.pathname === "/daemon"
+    && document.querySelectorAll(".cards .card").length >= 2, { timeout: 10000 });
+  // rows > 1 asserts the band is actually the wrapped case, so a future width
+  // change that stops wrapping here cannot pass this vacuously.
+  (bandRow.rows > 1 && bandRow.left <= 2)
+    ? ok("layout: a card left alone on the last row spans it")
+    : bad("layout: a card left alone on the last row spans it", JSON.stringify(bandRow));
+
   // ── Scenario 17g3 — the disk-space card, every state it can be in ──
   // Calls the REAL backupRefreshCard with each of the 16 DTOs the daemon can
   // serve and reads the rendered element. A Go guard over the source can only

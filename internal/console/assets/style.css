@@ -988,6 +988,24 @@ button { font-family: inherit; }
    Card tints rotate on :nth-child (see the four rules further down), which is
    DOM order, so wrapping cannot change which card gets which colour. */
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
+/* auto-fit fills a row only while there are FEWER cards than tracks. A page
+   with more of them still ends on a partial row, so between the 880px
+   breakpoint and the width where three tracks fit again, a three-card page
+   wrapped to two columns and left its third card alone beside 287 to 387px of
+   nothing. That is the same hole this rule was written to close, moved to a
+   laptop width instead of removed.
+
+   The band is arithmetic, not a guess: the shell is 248px and .view adds 48px
+   of padding a side, so grid = viewport - 344; three 260px tracks plus two
+   18px gaps need 816, hence three columns from 1160px up. Below 881px the
+   media query further down forces a single column.
+
+   :last-child:nth-child(odd) is "last, and at an odd position". At two columns
+   an odd position always starts a row, so the card is alone on it: true for
+   the third of three and the fifth of five, false for the second of two. */
+@media (min-width: 881px) and (max-width: 1159px) {
+  .cards > .card:last-child:nth-child(odd) { grid-column: 1 / -1; }
+}
 .card {
   background: var(--panel-bg);
   border: 1px solid var(--panel-border);
