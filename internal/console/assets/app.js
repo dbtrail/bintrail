@@ -4680,9 +4680,18 @@ function icebergFlow() {
     el("div", { class: "ice-eng" },
       ...ICEBERG_ENGINES.map((n) => el("span", { class: "ice-eng-n", text: n }))));
   return el("div", { class: "ice-flow" },
-    stage("This server's history", "a snapshot, plus every change since"),
+    // "newest backup", not "the whole snapshot": the old paragraph said WHICH
+    // backup the first run consumes, and a reader looking at a list of them on
+    // this very page cannot work that out from "snapshot". One word for one
+    // object, too — the fold below and the rest of this page say "backup".
+    stage("This server's history", "the newest backup, plus every change since"),
     arrow(),
-    stage("Iceberg tables", "in a folder you pick"),
+    // The egress answer, kept in the open. It was a sentence under the command
+    // ("Nothing is sent anywhere: the tables are written where you point it")
+    // and drawing the panel dropped it. For an EXPORT feature it is the one
+    // thing a cautious operator asks while standing here, so it belongs in the
+    // picture rather than in the docs it also appears in.
+    stage("Iceberg tables", "written where you point it, nowhere else"),
     arrow(),
     engines);
 }
@@ -4691,6 +4700,14 @@ function icebergFlow() {
 // IS the message: the first run is the expensive one and every run after it is
 // small. That is what makes "as fresh as you schedule it" believable, and it
 // was the clause of the old paragraph most likely to be skipped.
+//
+// The two widths are SCHEMATIC. Nothing measures them and nothing should: the
+// ratio between a first run and an incremental one is a property of the
+// operator's data, not of this page, and a drawn ratio that looked derived
+// would be the drawing lying in the way this panel's own comments warn about.
+// They are painted in one neutral ink for the same reason — the widths carry
+// the whole comparison, and style.css's brand rule is explicit that the warm
+// palette never encodes data.
 function icebergRuns() {
   const row = (label, barClass, note) => [
     el("span", { class: "ice-run-l", text: label }),
@@ -4699,7 +4716,7 @@ function icebergRuns() {
       el("span", { class: "ice-run-n", text: note })),
   ];
   return el("div", { class: "ice-runs" },
-    ...row("First run", "ice-bar-full", "loads the whole snapshot"),
+    ...row("First run", "ice-bar-full", "loads the newest backup"),
     ...row("Every run after", "ice-bar-delta", "adds only what changed"));
 }
 

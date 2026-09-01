@@ -2719,8 +2719,8 @@ button { font-family: inherit; }
 .ice-run-l { font-size: 11.5px; color: var(--ink-3); white-space: nowrap; }
 .ice-run-b { display: flex; align-items: center; gap: 9px; }
 .ice-bar { height: 7px; border-radius: 4px; flex: none; }
-.ice-bar-full { width: 148px; background: linear-gradient(90deg, oklch(0.53 0.2 3), oklch(0.54 0.14 51)); }
-.ice-bar-delta { width: 26px; background: oklch(0.54 0.14 51); }
+.ice-bar-full { width: 148px; background: var(--ink-4); }
+.ice-bar-delta { width: 26px; background: var(--ink-4); }
 .ice-run-n { font-size: 11.5px; color: var(--ink-4); }
 .ice-keys { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: -2px 0 12px; }
 .ice-key { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--ink-4); }

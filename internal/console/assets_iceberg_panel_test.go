@@ -444,8 +444,19 @@ func icebergPlaceholderKeys(t *testing.T, js string) []string {
 		t.Fatal("ICEBERG_PLACEHOLDERS is not closed; cannot read its keys")
 	}
 	var keys []string
+	var candidates int
 	for _, line := range strings.Split(block[:end], "\n") {
 		line = strings.TrimSpace(line)
+		// Every entry of the literal opens with a bracket. Counted separately
+		// from the ones this scanner can READ, because a floor ("at least two
+		// keys survived") passes on a THIRD entry written in a shape the
+		// scanner skips — a constant reference, two entries on one line, one
+		// wrapped across two — and that third label would then be exactly the
+		// unguarded fail-open this test exists to close, one entry later.
+		if !strings.HasPrefix(line, "[") {
+			continue
+		}
+		candidates++
 		if !strings.HasPrefix(line, `["`) {
 			continue
 		}
@@ -456,5 +467,65 @@ func icebergPlaceholderKeys(t *testing.T, js string) []string {
 		}
 		keys = append(keys, rest[:j])
 	}
+	if len(keys) != candidates {
+		t.Fatalf("ICEBERG_PLACEHOLDERS holds %d entries but this test could only read %d of them; "+
+			"the ones it skipped go unchecked, which is the silent failure it exists to prevent. "+
+			"Write every entry as [\"key\", \"label\"] on its own line, or teach this scanner the new shape.",
+			candidates, len(keys))
+	}
 	return keys
+}
+
+// TestAppendedPanelCSSPaintsNoBrandWarmth covers a range the brand guard cannot.
+//
+// assets_brandpaint_test.go scans only the marker-delimited #1385 block, so any
+// rule appended at the END of style.css is structurally invisible to it. The
+// rule those tests enforce is stated in style.css itself: the warm palette is
+// worn across the chrome and "never encode[s] data ... pink never lands on a
+// surface that carries a row".
+//
+// The Iceberg run bars are exactly the shape that rule is about: two widths
+// standing for two magnitudes. They are painted in one neutral ink instead, and
+// this keeps them that way.
+func TestAppendedPanelCSSPaintsNoBrandWarmth(t *testing.T) {
+	raw, err := os.ReadFile("assets/style.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(raw)
+	const marker = "/* Iceberg export panel (#1467)."
+	i := strings.Index(css, marker)
+	if i < 0 {
+		t.Fatal("the Iceberg panel CSS block is gone from style.css; this guard covers nothing")
+	}
+	block := css[i:]
+	if j := strings.Index(block[len(marker):], "\n/* "); j >= 0 {
+		block = block[:len(marker)+j]
+	}
+	if !strings.Contains(block, ".ice-bar-full") {
+		t.Fatal("the run bars are not in the block this guard reads")
+	}
+	// Declarations only. The block's own comments carry issue numbers, and a
+	// bare "#" scan would match those and fail on prose.
+	var decls strings.Builder
+	for _, line := range strings.Split(block, "\n") {
+		if t := strings.TrimSpace(line); strings.HasPrefix(t, "/*") || strings.HasPrefix(t, "*") ||
+			strings.HasPrefix(t, "//") || t == "" {
+			continue
+		}
+		decls.WriteString(line)
+		decls.WriteString("\n")
+	}
+	body := decls.String()
+	// A raw colour literal is the tell. Every legitimate value here is a token
+	// the console already defines, so a rule that spells a colour out is either
+	// brand warmth or a value that will not follow the palette.
+	for _, lit := range []string{"oklch(", "rgb(", "hsl(", "#0", "#1", "#2", "#3", "#4",
+		"#5", "#6", "#7", "#8", "#9", "#a", "#b", "#c", "#d", "#e", "#f"} {
+		if strings.Contains(strings.ToLower(body), lit) {
+			t.Errorf("the Iceberg panel CSS spells a colour literally (%q). Its run bars encode a "+
+				"magnitude with their WIDTHS, and style.css's own rule is that the warm palette "+
+				"never encodes data; use a var(--ink-*) / var(--line*) / var(--surface*) token.", lit)
+		}
+	}
 }
