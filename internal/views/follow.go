@@ -27,8 +27,17 @@ func ApplyFollow(in *Input, root string, pin bool) {
 		paths[i] = t.Path
 	}
 	if rewritten, ok := baseline.RewriteToPointer(root, paths); ok {
+		// Rel BEFORE the rewrite, off the paths that still name their snapshot
+		// directory. Both modes carry it now: the preflight that checks a table
+		// is still in the snapshot needs the same tail whichever way the file
+		// follows, and deriving it twice from two different path shapes is how
+		// the two renders would come to disagree about the layout.
+		rels := snapshotRels(root, paths)
 		for i := range in.Baselines {
 			in.Baselines[i].Path = rewritten[i]
+			if rels != nil {
+				in.Baselines[i].Rel = rels[i]
+			}
 		}
 		in.Follow = FollowPointer
 		return
@@ -41,21 +50,34 @@ func ApplyFollow(in *Input, root string, pin bool) {
 	if !isS3(root) {
 		return
 	}
-	rels := make([]string, len(in.Baselines))
-	for i, t := range in.Baselines {
-		rel, ok := snapshotRel(root, t.Path)
-		if !ok {
-			// All or nothing. A file where some state views follow and others
-			// are pinned reads exactly like one where they all do, and the two
-			// halves would drift apart at the first refresh.
-			return
-		}
-		rels[i] = rel
+	rels := snapshotRels(root, paths)
+	if rels == nil {
+		// All or nothing. A file where some state views follow and others
+		// are pinned reads exactly like one where they all do, and the two
+		// halves would drift apart at the first refresh.
+		return
 	}
 	for i := range in.Baselines {
 		in.Baselines[i].Rel = rels[i]
 	}
 	in.Follow = FollowNewest
+}
+
+// snapshotRels cuts every path down to its position inside a snapshot
+// directory, or returns nil if any one of them will not cut.
+//
+// All or nothing on purpose: the callers use these to describe the whole file,
+// and a half-filled slice would describe half of it while looking complete.
+func snapshotRels(root string, paths []string) []string {
+	out := make([]string, len(paths))
+	for i, path := range paths {
+		rel, ok := snapshotRel(root, path)
+		if !ok {
+			return nil
+		}
+		out[i] = rel
+	}
+	return out
 }
 
 // snapshotRel cuts a table's path down to its position inside a snapshot

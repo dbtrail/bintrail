@@ -65,11 +65,15 @@ type BaselineTable struct {
 	Table  string
 	Path   string // local path or s3:// URL of the table's .parquet file
 	// Rel is Path relative to its snapshot directory ("schema/table.parquet"),
-	// set by the producer only under FollowNewest. The following there is a SQL
-	// shape rather than a path, and it needs the tail on its own to rebuild the
-	// file name against whichever snapshot the query picks. Deriving it back
-	// out of Path in the generator would be a second opinion about the layout;
-	// the producer already split it once to decide it could follow at all.
+	// set by the producer under BOTH following modes. FollowNewest needs it to
+	// build its view bodies at all: the following there is a SQL shape rather
+	// than a path, so it rebuilds the file name against whichever snapshot the
+	// query picks. FollowPointer's bodies do not need it, but the preflight
+	// (#1558) does, and it asks the same question of both files, so deriving
+	// the tail one way here and another way there is how the two renders would
+	// come to disagree about the layout. Deriving it back out of Path in the
+	// generator would be a second opinion for the same reason: the producer
+	// already split it once to decide it could follow at all.
 	Rel string
 
 	// Decimals are the table's DECIMAL and NUMERIC columns, which the baseline
@@ -567,8 +571,9 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("--\n")
 		b.WriteString("-- Which of those you will notice follows one rule: this file names only the\n")
 		b.WriteString("-- PATHS and the DECIMAL columns, so only those two can fail. A table that\n")
-		b.WriteString("-- leaves the newest snapshot stops resolving and reading this file fails,\n")
-		b.WriteString("-- naming the path; a DECIMAL column renamed or dropped fails the script.\n")
+		b.WriteString("-- leaves the newest snapshot is caught by the check below, which names the\n")
+		b.WriteString("-- table and stops before any view is created; a DECIMAL column renamed or\n")
+		b.WriteString("-- dropped fails the script at its own view.\n")
 		b.WriteString("-- Everything else is QUIET, because `SELECT *` passes it through untouched:\n")
 		b.WriteString("-- a table added to the source has no view here, a DECIMAL whose scale grew is\n")
 		b.WriteString("-- read at the old scale with the extra digits rounded away, a column that\n")
@@ -1493,6 +1498,7 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 	if in.Follow == FollowNewest {
 		writeNewestSnapshotVar(b, in)
 	}
+	writeSnapshotPreflight(b, in, wanted)
 
 	for _, p := range wanted {
 		t, name := p.table, p.name
@@ -1531,6 +1537,14 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 // to disagree about.
 const newestVar = "bintrail_newest_snapshot"
 
+// missingVar and checkVar carry the preflight below. Two variables rather than
+// one expression so the message can NAME the tables it found, and so a clean
+// file prints nothing at all.
+const (
+	missingVar = "bintrail_missing_tables"
+	checkVar   = "bintrail_tables_checked"
+)
+
 // writeNewestSnapshotVar emits the lookup that picks the snapshot, for a root
 // with no `current` pointer to rewrite (#1550).
 //
@@ -1552,6 +1566,103 @@ func writeNewestSnapshotVar(b *strings.Builder, in Input) {
 			baseline.SuccessMarker+" marker). Take or refresh a baseline, then read this file again."))
 	fmt.Fprintf(b, "    ELSE max(regexp_replace(file, %s, '')) END\n", sqlString(baseline.SuccessMarker+"$"))
 	fmt.Fprintf(b, "  FROM glob(%s));\n\n", sqlString(root+"/*/"+baseline.SuccessMarker))
+}
+
+// writeSnapshotPreflight emits one check, ahead of every state view, that the
+// tables this file names are still in the snapshot it will read (#1558).
+//
+// It exists because the alternative is the worst failure this file has. DuckDB
+// binds a view when it is CREATED, so a table DROPped at the source takes the
+// whole script down at its own statement: the views emitted before it exist, the
+// ones after it never do, and against a persistent database what remains is a
+// silently partial schema whose size depends on emission order. The error names
+// a Parquet path, which reads as a corrupt snapshot rather than as a table
+// somebody dropped on purpose.
+//
+// DuckDB has no tolerant read to lean on: union_by_name, filename and a
+// zero-match glob all raise the same way, so "define the other views anyway" is
+// not on the table. The choice is between failing confusingly and partially, and
+// failing legibly and first. This is the second.
+//
+// Only for a file that FOLLOWS. A pinned file names a snapshot that already held
+// every one of these tables when it was written, so the check would be asking
+// whether someone deleted files by hand.
+func writeSnapshotPreflight(b *strings.Builder, in Input, wanted []statePlan) {
+	dir, ok := snapshotDirExpr(in)
+	if !ok || len(wanted) == 0 {
+		return
+	}
+	rels := make([]string, 0, len(wanted))
+	for _, p := range wanted {
+		if p.table.Rel == "" {
+			// A producer that did not fill Rel cannot be described, and a
+			// preflight over SOME of the tables would pass while the file still
+			// broke on one it never checked.
+			return
+		}
+		rels = append(rels, p.table.Rel)
+	}
+
+	b.WriteString("-- Every table below has to still be in that snapshot. A table dropped at the\n")
+	b.WriteString("-- source leaves it, and DuckDB binds a view when it is created, so without\n")
+	b.WriteString("-- this the script would stop at that one view and never define the rest.\n")
+	b.WriteString("SET VARIABLE " + missingVar + " = (\n")
+	b.WriteString("  SELECT string_agg(t, ', ' ORDER BY t) FROM (VALUES\n")
+	for i, rel := range rels {
+		sep := ","
+		if i == len(rels)-1 {
+			sep = ""
+		}
+		fmt.Fprintf(b, "    (%s)%s\n", sqlString(rel), sep)
+	}
+	b.WriteString("  ) AS x(t)\n")
+	// `**` and not `*/`, even though every Rel in this layout is exactly
+	// schema/table.parquet. The two would agree today and the recursion costs
+	// nothing at this depth, but snapshotRel returns EVERYTHING after the
+	// snapshot directory, so a layout that ever nested one level deeper would
+	// leave the glob listing less than the list it is compared against. That
+	// does not lose the check, it inverts it: every table looks missing and a
+	// perfectly healthy file is refused before it creates anything, which is
+	// the worst outcome this code has. `**` is a superset at every depth
+	// (verified: it matches one, two and three levels), so it cannot.
+	fmt.Fprintf(b, "  WHERE %s || t NOT IN (SELECT file FROM glob(%s || '**/*.parquet')));\n", dir, dir)
+	// Raised through a SET rather than a bare SELECT so a clean file prints
+	// nothing. A SELECT here puts a one-row NULL table in front of every reader
+	// who has nothing wrong.
+	//
+	// The condition is on missingVar and NOT inside error()'s argument, because
+	// error() is a scalar function and PROPAGATES NULL: error('x ' || NULL)
+	// returns NULL instead of raising, so a guard assembled by concatenation
+	// disarms itself the moment any piece of it is NULL. That also decides what
+	// happens under FollowNewest when nothing is marked and the directory is
+	// NULL: the whole check evaluates to NULL and raises nothing. It fails OPEN
+	// there on purpose, because the emitter above has already raised its own
+	// refusal naming the root, and a second message about missing tables would
+	// only describe the same absent snapshot in worse words.
+	fmt.Fprintf(b, "SET VARIABLE %s = (SELECT CASE WHEN getvariable('%s') IS NOT NULL\n", checkVar, missingVar)
+	fmt.Fprintf(b, "  THEN error(%s || getvariable('%s') ||\n",
+		sqlString("bintrail views: these tables are not in the newest snapshot any more: "), missingVar)
+	// Naming where it looked is what DuckDB's own "No files found" gave the
+	// reader before this check existed, and it is the half that says whether the
+	// table moved or the whole snapshot is the wrong one. Under FollowNewest the
+	// file cannot know the directory until the query runs, so it has to come
+	// from the variable rather than from a literal here.
+	fmt.Fprintf(b, "    %s || %s ||\n", sqlString(". Looked in "), dir)
+	fmt.Fprintf(b, "    %s) END);\n\n",
+		sqlString(". If they were dropped or renamed, download this file again."))
+}
+
+// snapshotDirExpr is the SQL expression naming the snapshot directory the state
+// views read, with its trailing separator, or ok=false for a file that does not
+// follow one.
+func snapshotDirExpr(in Input) (string, bool) {
+	switch in.Follow {
+	case FollowNewest:
+		return "getvariable('" + newestVar + "')", true
+	case FollowPointer:
+		return sqlString(strings.TrimSuffix(in.BaselineSource, "/") + "/" + baseline.CurrentLinkName + "/"), true
+	}
+	return "", false
 }
 
 // writeNewestStateBody emits one state view's body under FollowNewest: a read of

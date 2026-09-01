@@ -21,6 +21,7 @@ func followInput() Input {
 		t := in.Baselines[i]
 		in.Baselines[i].Path = filepath.Join(root, baseline.CurrentLinkName,
 			t.Schema, filepath.Base(t.Path))
+		in.Baselines[i].Rel = t.Schema + "/" + filepath.Base(t.Path)
 	}
 	in.Follow = FollowPointer
 	return in

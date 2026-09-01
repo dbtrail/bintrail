@@ -49,19 +49,28 @@ func writeSnapshot(t *testing.T, root, stamp string, marked bool, statuses ...st
 // this mode only for an s3:// root. What is under test here is the SQL the mode
 // EMITS, and DuckDB reads a local glob and an S3 one through the same code path;
 // that ApplyFollow reaches the mode at all is what the golden covers.
-func newestFixture(t *testing.T, root, tableRel string) string {
+//
+// Variadic because a test that asserts NOTHING was created needs at least one
+// table that would otherwise have been.
+func newestFixture(t *testing.T, root string, tableRels ...string) string {
 	t.Helper()
+	tables := make([]BaselineTable, 0, len(tableRels))
+	for _, rel := range tableRels {
+		schema, table, _ := strings.Cut(filepath.ToSlash(rel), "/")
+		tables = append(tables, BaselineTable{
+			Schema: schema,
+			Table:  strings.TrimSuffix(table, ".parquet"),
+			Path:   filepath.Join(root, "2026-04-30T03-00-00Z", rel),
+			Rel:    filepath.ToSlash(rel),
+		})
+	}
 	return Generate(Input{
 		GeneratedAt:      time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
 		Version:          "test",
 		BaselineSource:   root,
 		BaselineSnapshot: time.Date(2026, 4, 30, 3, 0, 0, 0, time.UTC),
 		Follow:           FollowNewest,
-		Baselines: []BaselineTable{{
-			Schema: "shop", Table: "orders",
-			Path: filepath.Join(root, "2026-04-30T03-00-00Z", tableRel),
-			Rel:  tableRel,
-		}},
+		Baselines:        tables,
 	})
 }
 
@@ -138,30 +147,62 @@ func TestNewestStateView_ignoresAnUnmarkedNewerSnapshot(t *testing.T) {
 // matched nothing, and an empty table that should have had rows is a worse
 // answer than a stale one. Reading one named file cannot fail that way: the
 // path is either there or DuckDB refuses it. This asserts the refusal.
+// TestNewestStateView_raisesWhenTheTableLeftTheNewestSnapshot pins the refusal a
+// DROPped table gets (#1558).
+//
+// Before the preflight, this asserted DuckDB's own "No files found" naming a
+// Parquet path. That message was not wrong, it was the wrong SHAPE: it arrives
+// at the view for the missing table, so every view emitted before it already
+// exists and every view after it never does. Against a persistent database that
+// leaves a partial schema whose contents depend on emission order, and it reads
+// as a corrupt snapshot rather than as a table somebody dropped on purpose.
+//
+// So the assertions are about WHEN and WHAT, not merely that it failed: nothing
+// may be created, and the message has to name the table, where it looked, and
+// what to do next.
 func TestNewestStateView_raisesWhenTheTableLeftTheNewestSnapshot(t *testing.T) {
 	root := t.TempDir()
 	writeSnapshot(t, root, "2026-04-30T03-00-00Z", true, "here")
-	// A newer complete snapshot that does NOT carry shop.orders. Another table
-	// is what makes it a real snapshot rather than an empty directory.
+
 	writeSnapshot(t, root, "2026-05-30T03-00-00Z", true, "elsewhere")
 	if err := os.Rename(filepath.Join(root, "2026-05-30T03-00-00Z", "shop"),
-		filepath.Join(root, "2026-05-30T03-00-00Z", "warehouse")); err != nil {
+		filepath.Join(root, "2026-05-30T03-00-00Z", "audit")); err != nil {
 		t.Fatalf("rename: %v", err)
 	}
 
-	_, err := loadViews(t, newestFixture(t, root, filepath.Join("shop", "orders.parquet")))
+	// The rename left audit/orders.parquet sitting there, so this file names
+	// one table that is gone and one that is present. Without the preflight the
+	// present one WOULD get its view, which is what the count below measures.
+	db, err := loadViews(t, newestFixture(t, root,
+		filepath.Join("shop", "orders.parquet"),
+		filepath.Join("audit", "orders.parquet")))
 	if err == nil {
 		t.Fatal("the generated file loaded cleanly with shop.orders absent from the newest " +
 			"snapshot; a table that left must fail loudly, not read as empty")
 	}
-	// DuckDB's own refusal, which already names the exact path it looked for:
-	// the snapshot the variable resolved to, plus the table. Wrapping that in a
-	// message of our own would restate it and could fall out of step with it.
-	if !strings.Contains(err.Error(), "No files found") {
-		t.Errorf("failed with %v; want the refusal naming the path that is not there", err)
+
+	if !strings.Contains(err.Error(), "shop/orders.parquet") {
+		t.Errorf("failed with %v; want the refusal naming the table that is not there", err)
 	}
 	if !strings.Contains(err.Error(), "2026-05-30T03-00-00Z") {
 		t.Errorf("failed with %v; the message must name the snapshot it looked in", err)
+	}
+	if !strings.Contains(err.Error(), "download this file again") {
+		t.Errorf("failed with %v; the message must say what to do about it", err)
+	}
+
+	// The reason for doing this ahead of the views rather than at one of them.
+	// A check placed after even one CREATE would leave that one behind, and
+	// this fixture has a second table present precisely so "nothing created"
+	// cannot pass by there being nothing to create.
+	var n int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM duckdb_views() WHERE NOT internal`).Scan(&n); err != nil {
+		t.Fatalf("count views: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("the refused file left %d view(s) defined; a partial schema is the "+
+			"failure this check exists to prevent", n)
 	}
 }
 

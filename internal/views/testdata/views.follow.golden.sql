@@ -12,8 +12,9 @@
 --
 -- Which of those you will notice follows one rule: this file names only the
 -- PATHS and the DECIMAL columns, so only those two can fail. A table that
--- leaves the newest snapshot stops resolving and reading this file fails,
--- naming the path; a DECIMAL column renamed or dropped fails the script.
+-- leaves the newest snapshot is caught by the check below, which names the
+-- table and stops before any view is created; a DECIMAL column renamed or
+-- dropped fails the script at its own view.
 -- Everything else is QUIET, because `SELECT *` passes it through untouched:
 -- a table added to the source has no view here, a DECIMAL whose scale grew is
 -- read at the old scale with the extra digits rounded away, a column that
@@ -86,6 +87,22 @@ CREATE OR REPLACE SECRET bintrail_s3_chain (TYPE s3, PROVIDER credential_chain, 
 -- refreshed; a PostgreSQL-source baseline stores all its values as text and
 -- will not gain them. If a footer could not be read at all, the bintrail log
 -- has the error.
+-- Every table below has to still be in that snapshot. A table dropped at the
+-- source leaves it, and DuckDB binds a view when it is created, so without
+-- this the script would stop at that one view and never define the rest.
+SET VARIABLE bintrail_missing_tables = (
+  SELECT string_agg(t, ', ' ORDER BY t) FROM (VALUES
+    ('Legacy-DB/Audit Log.parquet'),
+    ('shop/order_items.parquet'),
+    ('shop/orders.parquet'),
+    ('shop_order/items.parquet')
+  ) AS x(t)
+  WHERE '/data/baselines/current/' || t NOT IN (SELECT file FROM glob('/data/baselines/current/' || '**/*.parquet')));
+SET VARIABLE bintrail_tables_checked = (SELECT CASE WHEN getvariable('bintrail_missing_tables') IS NOT NULL
+  THEN error('bintrail views: these tables are not in the newest snapshot any more: ' || getvariable('bintrail_missing_tables') ||
+    '. Looked in ' || '/data/baselines/current/' ||
+    '. If they were dropped or renamed, download this file again.') END);
+
 -- state_legacy_db_audit_log: this file carries no column types, so nothing is cast; decimal columns read as text
 CREATE OR REPLACE VIEW "state_legacy_db_audit_log" AS
   SELECT * FROM read_parquet('/data/baselines/current/Legacy-DB/Audit Log.parquet');

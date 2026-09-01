@@ -91,9 +91,11 @@ var stagingSeq atomic.Uint64
 // What it deliberately does NOT check is that the new snapshot carries every
 // table the current one does. The pointer names the newest COMPLETE snapshot,
 // whatever tables that snapshot holds, and a followed views file can therefore
-// lose a view when the table set shrinks: the view keeps naming
-// <root>/current/<schema>/<table>.parquet, which stops resolving, and DuckDB
-// says so by path.
+// lose a view when the table set shrinks: the file keeps naming
+// <root>/current/<schema>/<table>.parquet, which stops resolving. The generated
+// file checks for exactly that up front and refuses by TABLE NAME before it
+// creates anything (#1558), rather than letting the read break at whichever
+// view happens to be the one that moved.
 //
 // That is the chosen failure, not an oversight. A superset rule would freeze
 // the pointer FOREVER the first time a table is legitimately dropped, since no
