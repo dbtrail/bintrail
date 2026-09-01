@@ -18,11 +18,12 @@ func TestProvenanceOf(t *testing.T) {
 	older := ts("2026-06-03T12:00:00Z")
 
 	cases := []struct {
-		name string
-		dir  time.Time
-		md   DumpMetadata
-		want string
-		from time.Time
+		name     string
+		dir      time.Time
+		md       DumpMetadata
+		want     string
+		from     time.Time
+		fromPath string
 	}{
 		{
 			name: "dump stamps itself",
@@ -35,8 +36,12 @@ func TestProvenanceOf(t *testing.T) {
 			dir:  ts(snap),
 			md: DumpMetadata{Producer: ProducerReconstruct, SnapshotTimestamp: ts(snap),
 				DerivedFrom: older, DerivedFromPath: "/b/2026-06-03T12-00-00Z/shop/orders.parquet"},
-			want: ProducedByFold,
-			from: older,
+			// A fold DOES name its ancestor's file, and it is the same snapshot
+			// From names. That pairing is what makes the carried case below a
+			// real assertion rather than "nothing is ever set".
+			want:     ProducedByFold,
+			from:     older,
+			fromPath: "/b/2026-06-03T12-00-00Z/shop/orders.parquet",
 		},
 		{
 			// The case the footer CANNOT be stamped for: carry-forward hard
@@ -111,6 +116,14 @@ func TestProvenanceOf(t *testing.T) {
 			if tc.want == ProducedByDump && !got.From.IsZero() {
 				t.Errorf("From = %v on a dump, which is derived from nothing", got.From)
 			}
+			// FromPath must name FROM's file or nothing. On a carried table the
+			// footer's derived_from_path belongs to whoever wrote the bytes,
+			// which for a folded ancestor is one link FURTHER back than From —
+			// so returning it would hand an operator a timestamp and a path that
+			// describe two different snapshots.
+			if got.FromPath != tc.fromPath {
+				t.Errorf("FromPath = %q, want %q", got.FromPath, tc.fromPath)
+			}
 		})
 	}
 }
@@ -130,5 +143,11 @@ func TestProvenanceKeysAndValuesAreFrozen(t *testing.T) {
 		if k != want {
 			t.Errorf("a footer key/value moved: got %q, want %q — files already on disk carry the old spelling", k, want)
 		}
+	}
+	// Separately, because ProducedByDump shares its spelling and Go rejects a
+	// duplicate constant map key. Once shipped this value is on disk like the
+	// rest of them.
+	if ProducerDump != "dump" {
+		t.Errorf("ProducerDump = %q, want \"dump\" — it is stamped into every new snapshot", ProducerDump)
 	}
 }

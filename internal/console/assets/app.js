@@ -5052,7 +5052,11 @@ const MADE_BY = {
   dump: ["read from source", "A full copy taken from the database itself."],
   fold: ["built from changes", "The previous copy brought forward over the recorded changes. The source was not read."],
   carried_forward: ["reused unchanged", "Nothing changed in this table, so the previous copy was reused as is."],
-  unknown: ["not recorded", "Taken before backups recorded how they were made."],
+  // No cause named. This verdict is reached by a backup old enough to predate
+  // the record, by a newer version writing a value this build does not know,
+  // and by a footer field that would not parse. Picking one of them for the
+  // tooltip would be the reader told something nobody checked.
+  unknown: ["not recorded", "This backup does not say how it was made."],
 };
 
 function madeByCell(t) {

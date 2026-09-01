@@ -58,10 +58,13 @@ const (
 	// the window, so its previous file was reused verbatim (#1471) — usually as
 	// a HARD LINK, meaning these are literally the older snapshot's bytes.
 	ProducedByCarriedForward = "carried_forward"
-	// ProducedByUnknown: a snapshot old enough to carry none of the signals
-	// below. Never guessed as one of the others — the whole point is that an
-	// operator can tell which they have, and a confident wrong answer is worse
-	// than none.
+	// ProducedByUnknown: none of the signals below are present. Several causes
+	// reach it and this verdict does NOT distinguish them: a snapshot written
+	// before any of them existed, a producer value a newer build wrote that this
+	// one does not know, and a corrupt LSN or mydumper format that parsed away.
+	// Anything reporting it must not name a cause it cannot see. Never guessed
+	// as one of the others — the whole point is that an operator can tell which
+	// they have, and a confident wrong answer is worse than none.
 	ProducedByUnknown = "unknown"
 )
 
@@ -75,7 +78,12 @@ type TableProvenance struct {
 	// the ancestor that was folded (ProducedByFold) or the snapshot whose file
 	// was reused (ProducedByCarriedForward). Zero for a dump.
 	From time.Time
-	// FromPath is that ancestor's file, when the footer recorded one.
+	// FromPath is From's own file, when the footer recorded one. EMPTY on a
+	// carried table, and deliberately: derived_from_path in a carried file is
+	// the footer of the snapshot the bytes came from, which for a folded
+	// ancestor names ITS source — one link further back than From. Returning
+	// the pair would hand an operator two timestamps that do not describe the
+	// same snapshot. The footer simply does not record the carried-from file.
 	FromPath string
 }
 
@@ -102,10 +110,11 @@ type TableProvenance struct {
 func ProvenanceOf(snapshotTime time.Time, md DumpMetadata) TableProvenance {
 	if !md.SnapshotTimestamp.IsZero() && !snapshotTime.IsZero() &&
 		!md.SnapshotTimestamp.Equal(snapshotTime.UTC()) {
+		// No FromPath: see the field's doc. md.DerivedFromPath here belongs to
+		// whoever wrote these bytes, not to the snapshot they were written for.
 		return TableProvenance{
 			ProducedBy: ProducedByCarriedForward,
 			From:       md.SnapshotTimestamp,
-			FromPath:   md.DerivedFromPath,
 		}
 	}
 	switch md.Producer {
