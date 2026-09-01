@@ -247,6 +247,18 @@ type Input struct {
 	// the header. BaselineSnapshot is that snapshot's timestamp.
 	BaselineSource   string
 	BaselineSnapshot time.Time
+	// NewerElsewhere names a snapshot that is more recent than the one this
+	// file pins, found in the server's OTHER backup location (#1571).
+	//
+	// It is a warning and deliberately NOT a correction. This file names ONE
+	// root, and every state view resolves a path under it: a reader who has
+	// the local directory cannot open an s3:// path and the reverse is just
+	// as true, so merging the two locations would produce views that half of
+	// the readers cannot resolve. What silence cost instead was worse in a
+	// quieter way — a file pinned to a week-old snapshot because the newest
+	// one had already aged out of local retention, reading as current.
+	NewerElsewhere       time.Time
+	NewerElsewhereSource string
 	// Follow records how, if at all, the state views reach a snapshot published
 	// after this file was generated (#1484, #1550). ApplyFollow is what sets
 	// it; see FollowMode for what each mode costs the reader.
@@ -806,6 +818,11 @@ func writeHeader(b *strings.Builder, in Input) {
 	default:
 		fmt.Fprintf(b, "--   %s at %s (%d table(s))\n",
 			in.BaselineSource, in.BaselineSnapshot.UTC().Format(time.RFC3339), len(in.Baselines))
+		if !in.NewerElsewhere.IsZero() {
+			fmt.Fprintf(b, "--   NOTE: a newer snapshot (%s) exists under %s, which this file does\n"+
+				"--   not read. A file names one location, and its paths only resolve there.\n",
+				in.NewerElsewhere.UTC().Format(time.RFC3339), in.NewerElsewhereSource)
+		}
 		switch in.Follow {
 		case FollowPointer:
 			// Name the timestamp AND the pointer: the timestamp is what the
