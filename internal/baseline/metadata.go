@@ -111,6 +111,23 @@ type DumpMetadata struct {
 	RowCount       int64  // rows ingested into this table's baseline; valid only when ContentDigest != ""
 	LSN            uint64 // PostgreSQL WAL LSN delta-replay floor, inclusive (MetaKeyLSN, see its doc comment / #771); 0 = absent (MySQL baseline, or pre-#593 PG baseline)
 	RenderGUCs     string // pinned rendering-GUC stamp (MetaKeyRenderGUCs, #593 slice D); "" = pre-pin PG baseline or MySQL baseline
+	// Producer is MetaKeySnapshotProducer: which code path wrote these bytes
+	// ("dump" | "reconstruct"). Empty on any snapshot written before #1545
+	// stamped it on the dump path; see ProvenanceOf, which does not guess.
+	Producer string
+	// DerivedFrom / DerivedFromPath are the ancestor a FOLD was built from
+	// (MetaKeyDerivedFrom / MetaKeyDerivedFromPath). Zero on a dump.
+	DerivedFrom     time.Time
+	DerivedFromPath string
+	// SnapshotTimestamp is MetaKeySnapshotTimestamp, the instant the writing
+	// run stamped. NOT which snapshot the file belongs to — the directory name
+	// is that (internal/snapshotdir) — and the disagreement between the two is
+	// how a carried-forward table is recognised. See ProvenanceOf.
+	SnapshotTimestamp time.Time
+	// MydumperFormat is MetaKeyMydumperFormat, written only by the mydumper
+	// dump path. Carried here as the one positive signal that dates a
+	// pre-#1545 MySQL dump.
+	MydumperFormat string
 	// CaptureGap is MetaKeyCaptureGap: non-empty means this snapshot is KNOWINGLY
 	// incomplete — it was folded across a permanent capture gap under
 	// --allow-gaps, or inherited that state from the snapshot it was derived
@@ -293,6 +310,7 @@ func ReadParquetMetadata(path string) (DumpMetadata, error) {
 	if v, ok := pf.Lookup(MetaKeyCaptureGap); ok {
 		m.CaptureGap = v
 	}
+	readProvenance(path, &m, func(k string) (string, bool) { return pf.Lookup(k) })
 	if v, ok := pf.Lookup(MetaKeyRowCount); ok {
 		n, parseErr := strconv.ParseInt(v, 10, 64)
 		if parseErr != nil {
@@ -389,6 +407,16 @@ func ReadParquetMetadataAny(ctx context.Context, path string) (DumpMetadata, err
 			m.RenderGUCs = val
 		case MetaKeyCaptureGap:
 			m.CaptureGap = val
+		case MetaKeySnapshotProducer:
+			m.Producer = val
+		case MetaKeyDerivedFromPath:
+			m.DerivedFromPath = val
+		case MetaKeyMydumperFormat:
+			m.MydumperFormat = val
+		case MetaKeyDerivedFrom:
+			m.DerivedFrom = parseFooterTime(path, MetaKeyDerivedFrom, val)
+		case MetaKeySnapshotTimestamp:
+			m.SnapshotTimestamp = parseFooterTime(path, MetaKeySnapshotTimestamp, val)
 		case MetaKeyRowCount:
 			if n, parseErr := strconv.ParseInt(val, 10, 64); parseErr == nil {
 				m.RowCount = n

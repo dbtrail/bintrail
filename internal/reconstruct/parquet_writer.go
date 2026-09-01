@@ -148,19 +148,24 @@ type baselineMeta struct {
 	Metadata baseline.DumpMetadata
 }
 
-// Parquet file-metadata keys unique to a RECONSTRUCTED snapshot. They are pure
-// provenance: no existing reader looks them up, so their presence cannot change
-// how a consumer treats the snapshot (which is the #1169 requirement), but they
-// make "was this snapshot dumped from a source, or folded out of the index?"
-// answerable forever from the file itself.
+// Parquet file-metadata keys unique to a RECONSTRUCTED snapshot.
+//
+// The definitions moved to internal/baseline in #1545, where the rest of the
+// footer vocabulary lives and where the dump writers and every reader can reach
+// them. These aliases stay so existing call sites and tests keep compiling, and
+// because this is the package whose writer stamps them.
+//
+// Written since #1169 as pure provenance — nothing looked them up, so their
+// presence could not change how a consumer treated the snapshot. #1545 gave
+// them readers; the string values did not move, because every snapshot already
+// on disk carries them.
 const (
-	MetaKeySnapshotProducer = "bintrail.snapshot_producer"
-	MetaKeyDerivedFrom      = "bintrail.derived_from_snapshot"
-	MetaKeyDerivedFromPath  = "bintrail.derived_from_path"
+	MetaKeySnapshotProducer = baseline.MetaKeySnapshotProducer
+	MetaKeyDerivedFrom      = baseline.MetaKeyDerivedFrom
+	MetaKeyDerivedFromPath  = baseline.MetaKeyDerivedFromPath
 	// SnapshotProducerReconstruct is the MetaKeySnapshotProducer value this
-	// package stamps. A snapshot written by `bintrail baseline` carries no
-	// producer key at all.
-	SnapshotProducerReconstruct = "reconstruct"
+	// package stamps. A dump stamps baseline.ProducerDump.
+	SnapshotProducerReconstruct = baseline.ProducerReconstruct
 )
 
 // mergeBaselineIntoParquet is the OutputFormatParquet sibling of
@@ -217,14 +222,14 @@ func mergeBaselineIntoParquet(ctx context.Context, in mergeInput, rep *TableRepo
 	}
 
 	md := map[string]string{
-		"bintrail.snapshot_timestamp":  in.SnapshotAt.UTC().Format(time.RFC3339),
-		"bintrail.source_database":     in.Schema,
-		"bintrail.source_table":        in.Table,
-		"bintrail.bintrail_version":    baseline.Version,
-		baseline.MetaKeyCreateTableSQL: in.CreateTableSQL,
-		MetaKeySnapshotProducer:        SnapshotProducerReconstruct,
-		MetaKeyDerivedFrom:             in.SourceBaseline.Time.UTC().Format(time.RFC3339),
-		MetaKeyDerivedFromPath:         in.SourceBaseline.Path,
+		baseline.MetaKeySnapshotTimestamp: in.SnapshotAt.UTC().Format(time.RFC3339),
+		"bintrail.source_database":        in.Schema,
+		"bintrail.source_table":           in.Table,
+		"bintrail.bintrail_version":       baseline.Version,
+		baseline.MetaKeyCreateTableSQL:    in.CreateTableSQL,
+		MetaKeySnapshotProducer:           SnapshotProducerReconstruct,
+		MetaKeyDerivedFrom:                in.SourceBaseline.Time.UTC().Format(time.RFC3339),
+		MetaKeyDerivedFromPath:            in.SourceBaseline.Path,
 	}
 	if line := captureGapLines(in); line != "" {
 		md[baseline.MetaKeyCaptureGap] = line

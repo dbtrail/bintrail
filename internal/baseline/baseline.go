@@ -189,11 +189,14 @@ func Run(ctx context.Context, cfg Config) (Stats, error) {
 			}
 
 			md := map[string]string{
-				"bintrail.snapshot_timestamp": tsStr,
-				"bintrail.source_database":    tf.Database,
-				"bintrail.source_table":       tf.Table,
-				"bintrail.mydumper_format":    tf.Format,
-				"bintrail.bintrail_version":   Version,
+				MetaKeySnapshotTimestamp:    tsStr,
+				"bintrail.source_database":  tf.Database,
+				"bintrail.source_table":     tf.Table,
+				MetaKeyMydumperFormat:       tf.Format,
+				"bintrail.bintrail_version": Version,
+				// #1545: say so, rather than leaving every reader to infer a
+				// dump from the ABSENCE of the fold's keys.
+				MetaKeySnapshotProducer: ProducerDump,
 			}
 			if meta.BinlogFile != "" {
 				md[MetaKeyBinlogFile] = meta.BinlogFile

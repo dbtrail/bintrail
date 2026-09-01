@@ -5040,6 +5040,31 @@ const BACKUP_KIND_LABEL = { dump: "full copy of the source", refresh: "automatic
 // loadBackupDetail fills a row's expansion: tables with sizes, total weight,
 // and duration. The recorded run (this daemon performed it) gives the exact
 // duration; otherwise the file timestamps bound it, labeled as such.
+// MADE_BY says, in the operator's terms, how a table's rows got into a backup
+// (#1545). The three routes have different trust, which is the whole reason to
+// show it: a full copy is independent evidence read from the source; the other
+// two never touched it.
+//
+// Plain words rather than the wire values. "fold" and "carried_forward" are
+// this codebase's names for its own mechanics, and nobody reading a backup page
+// knows them.
+const MADE_BY = {
+  dump: ["read from source", "A full copy taken from the database itself."],
+  fold: ["built from changes", "The previous copy brought forward over the recorded changes. The source was not read."],
+  carried_forward: ["reused unchanged", "Nothing changed in this table, so the previous copy was reused as is."],
+  unknown: ["not recorded", "Taken before backups recorded how they were made."],
+};
+
+function madeByCell(t) {
+  const entry = MADE_BY[t.produced_by];
+  if (!entry) return el("span", { class: "bk-made-none", text: "—" });
+  const cell = el("span", { class: "bk-made", title: entry[1], text: entry[0] });
+  // The ancestor is what makes the two derived verdicts actionable: it answers
+  // "how far back is the last copy that actually read the source".
+  if (t.from) cell.append(el("span", { class: "bk-made-from", text: " · " + t.from }));
+  return cell;
+}
+
 async function loadBackupDetail(at, box) {
   box.textContent = "Loading…";
   let d;
@@ -5069,11 +5094,22 @@ async function loadBackupDetail(at, box) {
   box.append(facts);
   if (d.incomplete) box.append(el("p", { class: "form-msg err", text: "This backup is marked incomplete (a failed or unfinished run); it cannot be downloaded or restored from." }));
   const tbl = el("table", { class: "bk-table" });
-  tbl.append(el("thead", {}, el("tr", {}, el("th", { text: "Table" }), el("th", { text: "Size" }))));
+  // The "Made by" column is only rendered when a row actually carries a verdict
+  // (#1545). An S3 source does not look it up, and a header over a column of
+  // dashes reads as "we checked and there is nothing", which is a different
+  // answer from "we did not check".
+  const anyProv = (d.tables || []).some((t) => t.produced_by);
+  const head = el("tr", {}, el("th", { text: "Table" }), el("th", { text: "Size" }));
+  if (anyProv) head.append(el("th", { text: "Made by" }));
+  tbl.append(el("thead", {}, head));
   const tb = el("tbody");
-  (d.tables || []).forEach((t) => tb.append(el("tr", {},
-    el("td", { class: "mono", text: t.schema + "." + t.table }),
-    el("td", { text: humanBytes(t.size_bytes || 0) }))));
+  (d.tables || []).forEach((t) => {
+    const row = el("tr", {},
+      el("td", { class: "mono", text: t.schema + "." + t.table }),
+      el("td", { text: humanBytes(t.size_bytes || 0) }));
+    if (anyProv) row.append(el("td", {}, madeByCell(t)));
+    tb.append(row);
+  });
   tbl.append(tb);
   box.append(tbl);
 }

@@ -414,10 +414,14 @@ func processTable(ctx context.Context, conn *pgx.Conn, t tableInfo, outputDir, t
 	outPath := filepath.Join(outputDir, tsDir, t.Schema, t.Table+".parquet")
 
 	md := map[string]string{
-		"bintrail.snapshot_timestamp": tsStr,
-		"bintrail.source_database":    t.Schema,
-		"bintrail.source_table":       t.Table,
-		"bintrail.bintrail_version":   baseline.Version,
+		baseline.MetaKeySnapshotTimestamp: tsStr,
+		"bintrail.source_database":        t.Schema,
+		"bintrail.source_table":           t.Table,
+		"bintrail.bintrail_version":       baseline.Version,
+		// #1545: a PostgreSQL baseline is a real read of the source, same as
+		// mydumper's. Without this it carries no producer key and only its LSN
+		// dates it.
+		baseline.MetaKeySnapshotProducer: baseline.ProducerDump,
 		// The LSN delta-replay floor (#593 slice A, corrected by #771): deltas
 		// for this table replay from AT OR AFTER this point — the slot's own
 		// confirmed_flush_lsn/restart_lsn (pgcapture.SlotFloorLSN), NOT the

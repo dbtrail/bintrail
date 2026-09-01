@@ -38,6 +38,14 @@ type baselineTableSizeDTO struct {
 	Schema    string `json:"schema"`
 	Table     string `json:"table"`
 	SizeBytes int64  `json:"size_bytes"`
+	// ProducedBy is how THIS table's rows got into THIS snapshot (#1545):
+	// dump | fold | carried_forward | unknown. Per table, not per snapshot,
+	// because carry-forward makes one snapshot a mix. Empty on an S3 source,
+	// where it would cost one object read per table; the field being absent is
+	// "not looked up", never "unknown".
+	ProducedBy string `json:"produced_by,omitempty"`
+	// From is the snapshot these rows came out of, for the two derived cases.
+	From string `json:"from,omitempty"`
 }
 
 type baselineFilesResponse struct {
@@ -279,7 +287,7 @@ func (s *Server) resolveSnapshotRequest(w http.ResponseWriter, r *http.Request, 
 // Deliberately NOT audited: like the listing, this is metadata (names, sizes,
 // timestamps) — no row data leaves the store. The download below is audited.
 func (s *Server) handleBaselineFiles(w http.ResponseWriter, r *http.Request) {
-	_, _, files := s.resolveSnapshotRequest(w, r, "baseline-files")
+	src, _, files := s.resolveSnapshotRequest(w, r, "baseline-files")
 	if files == nil {
 		return
 	}
@@ -307,8 +315,15 @@ func (s *Server) handleBaselineFiles(w http.ResponseWriter, r *http.Request) {
 		if len(parts) != 3 || !strings.HasSuffix(parts[2], ".parquet") {
 			continue
 		}
-		resp.Tables = append(resp.Tables, baselineTableSizeDTO{
-			Schema: parts[1], Table: strings.TrimSuffix(parts[2], ".parquet"), SizeBytes: f.Size})
+		row := baselineTableSizeDTO{
+			Schema: parts[1], Table: strings.TrimSuffix(parts[2], ".parquet"), SizeBytes: f.Size}
+		// Local only. Over S3 this is one object read per table, which is the
+		// same latency the listing already declines to spend on footers, and a
+		// row with no verdict reads as "not looked up" rather than as unknown.
+		if src != nil && src.localRoot != "" {
+			row.ProducedBy, row.From = tableProvenance(filepath.Join(src.localRoot, filepath.FromSlash(f.RelPath)), ts)
+		}
+		resp.Tables = append(resp.Tables, row)
 	}
 	sort.Slice(resp.Tables, func(i, j int) bool {
 		if resp.Tables[i].Schema != resp.Tables[j].Schema {
@@ -430,4 +445,27 @@ func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) 
 		abort("backup download: gzip finalize failed", "", err)
 	}
 	completed = true
+}
+
+// tableProvenance reads one table's footer and derives how its rows reached
+// this snapshot (#1545).
+//
+// Best-effort, and quiet about it: a footer that will not open leaves the row
+// with NO verdict rather than "unknown". The two are different answers — one is
+// "we did not find out", the other is "the file carries no signal" — and a
+// listing that turned an unreadable file into a confident verdict would be the
+// same class of mistake the audit reader was fixed for (ee#115).
+func tableProvenance(path string, snapshotAt time.Time) (string, string) {
+	md, err := baseline.ReadParquetMetadata(path)
+	if err != nil {
+		slog.Warn("console: could not read a backup table's footer for provenance",
+			"path", path, "error", err)
+		return "", ""
+	}
+	p := baseline.ProvenanceOf(snapshotAt, md)
+	from := ""
+	if !p.From.IsZero() {
+		from = p.From.UTC().Format(consoleTSFormat)
+	}
+	return p.ProducedBy, from
 }
