@@ -4551,7 +4551,16 @@ function baselineContextStrip(b, cur) {
   const snaps = b.snapshots || [];
   // The source path is code, and it gets the width to render as one line —
   // the dark code-ink treatment the recipe reserves for SQL/DSNs/paths.
-  strip.append(item("SOURCE", el("code", { class: "code-ink ctx-source", text: b.source }), "ctx-grow"));
+  // With two locations the strip names them BOTH. Printing only the primary
+  // is what made an S3-backed server look empty: the path on screen was the
+  // local directory, and the bucket holding the snapshots was never mentioned.
+  const srcs = b.sources || [];
+  if (srcs.length > 1) {
+    strip.append(item("SOURCES", el("div", { class: "ctx-srcs" },
+      ...srcs.map((s) => el("code", { class: "code-ink ctx-source", text: s.source }))), "ctx-grow"));
+  } else {
+    strip.append(item("SOURCE", el("code", { class: "code-ink ctx-source", text: b.source }), "ctx-grow"));
+  }
   strip.append(item("BACKUPS", String(snaps.length) + (b.truncated ? "+" : "")));
   if (snaps.length) {
     // One fact, one place: absolute and relative side by side, instead of the
@@ -4813,6 +4822,61 @@ function icebergExportPanel(cur, baselines) {
   return panel;
 }
 
+// backupSourceList renders every location the listing read, which is more than
+// one whenever a server has a local directory AND an S3 destination (#1542).
+// The bucket is the bundle's per-table fallback, so it always held snapshots the
+// page could resolve through Time-travel and never showed.
+function backupSourceList(b) {
+  const srcs = (b && b.sources) || [];
+  if (srcs.length < 2) return el("code", { class: "stg-code", text: (b && b.source) || "" });
+  return el("div", { class: "bk-srcs" }, ...srcs.map((s) => el("div", { class: "bk-src" },
+    el("span", { class: "bk-src-k", text: backupKindWord(s.kind) }),
+    el("code", { class: "stg-code", text: s.source }),
+    s.error
+      ? el("span", { class: "chip chip-mon", text: "unreadable" })
+      : el("span", { class: "bk-src-n", text: s.count + " file(s)" }))));
+}
+
+function backupKindWord(kind) { return kind === "s3" ? "S3" : "disk"; }
+
+// firstLine trims a backend error to its opening line. An S3 listing failure
+// arrives as a DuckDB error carrying the whole generated SQL statement across
+// several lines; pasted into the page it is a wall, and the wall is what a
+// reader skips. The first line is the cause ("HTTP 404", "AccessDenied"); the
+// server keeps the rest.
+function firstLine(msg) {
+  const s = String(msg || "").split("\n")[0].trim();
+  return s.length > 180 ? s.slice(0, 177) + "\u2026" : s;
+}
+
+// backupWhereChip says which of the two locations a snapshot was found in.
+// Rendered only when there IS more than one, since a chip repeating the single
+// configured source on every row is noise, not information.
+function backupWhereChip(b, sn) {
+  const srcs = (b && b.sources) || [];
+  if (srcs.length < 2) return null;
+  const kinds = (sn && sn.kinds) || [];
+  if (!kinds.length) return null;
+  return el("span", { class: "bk-where", text: kinds.map(backupKindWord).join(" + ") });
+}
+
+// backupIncompleteNotice is a HAZARD, not a status line: the list under it is a
+// subset, and the failure this endpoint had was a short list read as the whole
+// set. Named per location, because "one of your sources failed" sends the
+// operator to check both.
+function backupIncompleteNotice(b) {
+  if (!b || !b.incomplete) return null;
+  const bad = ((b.sources) || []).filter((s) => s.error);
+  const box = el("div", { class: "error-box" },
+    el("div", { text: "Some backups are not listed: " + bad.length +
+      " of " + ((b.sources) || []).length + " locations could not be read." }));
+  bad.forEach((s) => box.append(el("div", { class: "bk-src" },
+    el("span", { class: "bk-src-k", text: backupKindWord(s.kind) }),
+    el("code", { class: "stg-code", text: s.source }),
+    el("span", { class: "bk-src-n", text: firstLine(s.error) }))));
+  return box;
+}
+
 function baselinesPanel(b, servers, opts) {
   // Full-width (#1415): this list is the page. The Create-baseline action
   // moved to the context strip — at page level it is a page action; inside
@@ -4848,14 +4912,20 @@ function baselinesPanel(b, servers, opts) {
       el("code", { class: "stg-code", text: "docker compose --profile baseline run --rm baseline" }),
       el("p", { class: "stg-empty-sub", text: "2. " + baselineConfigHint(cur, opts && opts.serversErr) })));
   } else if (!(b.snapshots || []).length) {
+    // A source that failed reaches HERE too, and "no backups found" would be a
+    // flat lie about a bucket nobody could read.
+    const emptyWarn = backupIncompleteNotice(b);
+    if (emptyWarn) list.append(emptyWarn);
     list.append(el("div", { class: "stg-empty" },
       el("p", { class: "stg-empty-lead", text: "Source configured, no backups found." }),
-      el("code", { class: "stg-code", text: b.source }),
+      backupSourceList(b),
       el("p", { class: "stg-empty-sub", text: "Run bintrail dump and bintrail baseline to create your first backup. The path must point at the folder that contains the backups, not a specific file (<timestamp>/<schema>/<table>.parquet)." })));
   } else {
     // Panel headline: the newest-per-table rollup. Older snapshots being past
     // coverage is routine (superseded) — only the headline and the newest
     // row's verdict are actionable, so only those get a chip.
+    const incomplete = backupIncompleteNotice(b);
+    if (incomplete) list.append(incomplete);
     if (b.staleness && b.staleness !== "ok") {
       list.append(el("div", { class: "vfy-summary" },
         el("span", { class: "chip chip-mon", text: b.staleness === "broken"
@@ -4881,6 +4951,8 @@ function baselinesPanel(b, servers, opts) {
         row.append(el("span", { class: "chip chip-mon", text:
           sn.staleness === "broken" ? "⚠ STALE: restore broken" : sn.staleness.toUpperCase() }));
       }
+      const where = backupWhereChip(b, sn);
+      if (where) row.append(where);
       // Click to expand: tables, sizes and how long the backup took. Loaded
       // once per row, on first open.
       const detail = el("div", { class: "bk-detail" });

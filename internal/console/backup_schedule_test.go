@@ -383,8 +383,6 @@ func TestChooseBackupMethod_unreadableDirIsNotNoBackup(t *testing.T) {
 	}
 }
 
-
-
 // Same verdict for a path that is a FILE (ENOTDIR): this one runs as root
 // too, where a mode-000 directory reads fine and the test above skips.
 func TestChooseBackupMethod_fileAsDirIsNotNoBackup(t *testing.T) {

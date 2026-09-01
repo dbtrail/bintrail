@@ -34,6 +34,11 @@ type baselineSnapshotDTO struct {
 	// ok | aging | broken | unknown. "unknown" when the coverage floor could
 	// not be read — never reported as ok.
 	Staleness string `json:"staleness,omitempty"`
+	// Kinds names every location this snapshot was found in, sorted: "dir",
+	// "s3", or both (#1542). The union over the snapshot's files, which is
+	// exactly what it claims and no more — a snapshot listing both was seen in
+	// both places, not necessarily with every table in each.
+	Kinds []string `json:"kinds,omitempty"`
 }
 
 type baselinesResponse struct {
@@ -41,9 +46,20 @@ type baselinesResponse struct {
 	// all (dir or s3). Reconstruct additionally requires archives enabled and
 	// no RBAC profile (the bundle's gate) — a server can list baselines that
 	// Time-travel still refuses to use.
-	Configured  bool                  `json:"configured"`
-	Source      string                `json:"source,omitempty"`
-	Kind        string                `json:"kind,omitempty"` // "dir" | "s3"
+	Configured bool   `json:"configured"`
+	Source     string `json:"source,omitempty"`
+	Kind       string `json:"kind,omitempty"` // "dir" | "s3"
+	// Sources reports EVERY location that was read, in consult order, with a
+	// per-location count and error (#1542). Source/Kind above still name the
+	// primary; they were the whole answer when the listing only ever read one
+	// place, and a server with a local directory and an S3 destination has two.
+	Sources []baselineSourceDTO `json:"sources,omitempty"`
+	// Incomplete says at least one configured location could not be read, so
+	// the snapshots below are a SUBSET. The listing is still served, because a
+	// briefly unreachable bucket must not blank a page whose local half works,
+	// but a shorter list rendered as if it were the whole set is the exact bug
+	// this endpoint had.
+	Incomplete  bool                  `json:"incomplete,omitempty"`
 	Reconstruct bool                  `json:"reconstruct"`
 	Snapshots   []baselineSnapshotDTO `json:"snapshots"`
 	Truncated   bool                  `json:"truncated,omitempty"`
@@ -125,14 +141,26 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 		resp.Kind = "s3"
 	}
 
-	files, err := reconstruct.ListBaselines(r.Context(), b.baselineSrc)
-	if err != nil {
-		// The source is configured but unreadable (missing dir, unreachable
-		// bucket) — an upstream fault from the console's point of view, and an
-		// actionable message for the operator.
-		writeJSONError(w, http.StatusBadGateway, "list baselines: "+err.Error())
+	// Every configured location, not just the primary (#1542). A server with a
+	// local directory AND an S3 destination keeps the bucket as the bundle's
+	// per-table fallback, which findBaseline consults and this listing did not:
+	// once retention pruned the local copies, the page showed nothing while the
+	// bucket held dozens, and Time-travel resolved tables from a bucket the page
+	// behind it did not list.
+	merged := listBaselinesMerged(r.Context(), baselineSourcesOf(b), reconstruct.ListBaselines)
+	resp.Sources = merged.Sources
+	if merged.Listed == 0 {
+		// Nothing could be read anywhere. Still a hard failure, and the message
+		// names every location so the operator is not left guessing which one.
+		var parts []string
+		for _, src := range merged.Sources {
+			parts = append(parts, src.Source+": "+src.Error)
+		}
+		writeJSONError(w, http.StatusBadGateway, "list baselines: "+strings.Join(parts, "; "))
 		return
 	}
+	resp.Incomplete = merged.Listed < len(merged.Sources)
+	files := merged.Files
 
 	now := time.Now().UTC()
 	// Staleness floor (#1193): best-effort but never silent and never a
@@ -161,7 +189,12 @@ func (s *Server) handleBaselines(w http.ResponseWriter, r *http.Request) {
 				AgeHours: now.Sub(f.SnapshotTime).Hours(),
 			}
 			dto.Staleness = string(floor.Grade(f.SnapshotTime, now))
-			if resp.Kind == "dir" {
+			dto.Kinds = merged.Kinds[f.SnapshotTime.UnixNano()]
+			// Keyed on the file's OWN path, not on the primary source's kind:
+			// with two locations merged, the primary being S3 says nothing about
+			// whether THIS snapshot came off local disk, and the reverse would
+			// try to open an s3:// URL as a file.
+			if baselineKindOf(f.Path) == "dir" {
 				if meta, err := baseline.ReadParquetMetadata(f.Path); err == nil {
 					dto.BinlogFile = meta.BinlogFile
 					dto.BinlogPos = meta.BinlogPos
