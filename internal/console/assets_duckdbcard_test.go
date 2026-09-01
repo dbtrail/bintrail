@@ -2,9 +2,13 @@ package console
 
 import (
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/dbtrail/dbtrail/internal/views"
 )
 
 // The Download a DuckDB schema card is the only caller of GET /api/views.sql,
@@ -172,4 +176,76 @@ func functionBody(t *testing.T, js, decl string) string {
 		}
 	}
 	return rest
+}
+
+// TestDuckDBCardNamesMatchTheFileItParses is the anti-lying guard for the view
+// list the card shows after a download (#1551 follow-up).
+//
+// The card reads the names out of the file's own bytes rather than asking for
+// them, so a second source cannot drift from the first. What CAN drift is the
+// shape it greps for. This drives views.Generate and extracts with a port of the
+// JavaScript regex, so a change to how the generator writes a CREATE statement
+// fails here instead of silently rendering an empty list.
+func TestDuckDBCardNamesMatchTheFileItParses(t *testing.T) {
+	in := views.Input{
+		GeneratedAt:      time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
+		BaselineSource:   "/data/baselines",
+		BaselineSnapshot: time.Date(2026, 4, 30, 3, 0, 0, 0, time.UTC),
+		Baselines: []views.BaselineTable{
+			{Schema: "shop", Table: "orders", Path: "/data/baselines/s/shop/orders.parquet"},
+			// Sanitizes to the same name as shop.order_items, so the generator
+			// suffixes it. A hand-derived list would get this pair wrong, which
+			// is half the reason the card does not derive one.
+			{Schema: "shop", Table: "order_items", Path: "/data/baselines/s/shop/order_items.parquet"},
+			{Schema: "shop_order", Table: "items", Path: "/data/baselines/s/shop_order/items.parquet"},
+			// Neither a hyphen nor a space is legal bare in an identifier.
+			{Schema: "Legacy-DB", Table: "Audit Log", Path: "/data/baselines/s/Legacy-DB/Audit Log.parquet"},
+		},
+	}
+	sqlText := views.Generate(in)
+	want := in.DefinedViews()
+	if len(want) == 0 {
+		t.Fatal("the fixture defines no view, so this asserts nothing")
+	}
+
+	// The same expression app.js uses. Kept as a literal rather than read out of
+	// the asset: the point is that these two agree, and reading one to test
+	// itself would agree with anything.
+	re := regexp.MustCompile(`(?m)^CREATE OR REPLACE VIEW "([^"]+)"`)
+	var got []string
+	for _, m := range re.FindAllStringSubmatch(sqlText, -1) {
+		got = append(got, m[1])
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("the card would list %v; the file defines %v", got, want)
+	}
+
+	// The character set the simple pattern above relies on. sanitizeIdent folds
+	// everything outside [a-z0-9_], so a name can carry no quote of its own; if
+	// that ever changes, the pattern needs the quote-doubling case back and this
+	// says so before the list starts truncating names.
+	safe := regexp.MustCompile(`^[a-z0-9_]+$`)
+	for _, n := range want {
+		if !safe.MatchString(n) {
+			t.Errorf("view name %q is outside [a-z0-9_]; the card's pattern assumes it is not", n)
+		}
+	}
+
+	// And the asset really does carry that expression.
+	body := functionBody(t, readAsset(t, "app.js"), "function duckdbViewNames(")
+	if !strings.Contains(body, `/^CREATE OR REPLACE VIEW "([^"]+)"/gm`) {
+		t.Error("app.js no longer greps for the statement shape this test pinned")
+	}
+
+	// Placement, which fails OPEN if it breaks: insertBefore appends when its
+	// reference node is null, so moving the foot off `body` would put the list
+	// below the button with nothing raised and nothing to see in a diff.
+	panel := functionBody(t, readAsset(t, "app.js"), "function duckdbPanel(")
+	if !strings.Contains(panel, "body.insertBefore(duckdbNameList") {
+		t.Error("the view list is no longer placed relative to the card foot")
+	}
+	if !strings.Contains(panel, `body.append(el("div", { class: "stg-cardfoot" }`) {
+		t.Error("the card foot is not appended to `body`, so insertBefore's reference is null " +
+			"and the list silently lands below the button instead of above it")
+	}
 }

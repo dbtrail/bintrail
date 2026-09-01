@@ -4203,6 +4203,50 @@ function duckdbShape() {
   return { el: el("div", { class: "dk-shape" }, state, events), events };
 }
 
+// duckdbViewNames pulls the view names out of a generated views.sql.
+//
+// Read off the file the user just downloaded, rather than asked for separately.
+// The names are sanitized and collision-suffixed by the generator, so a second
+// source for them is a second opinion that can drift; these ARE the names in the
+// file, or there is no file. It also costs nothing: the bytes are already here,
+// where asking the server would have re-listed storage to answer.
+//
+// The generator writes every one as CREATE OR REPLACE VIEW "<name>". A name can
+// hold no quote of its own to confuse the match, because the generator builds it
+// through sanitizeIdent, which keeps only [a-z0-9_] and folds everything else to
+// an underscore. assets_duckdbcard_test.go pins BOTH halves of that against
+// views.Generate, so neither the statement shape nor the character set can
+// quietly stop matching.
+function duckdbViewNames(sql) {
+  const out = [];
+  const re = /^CREATE OR REPLACE VIEW "([^"]+)"/gm;
+  let m;
+  while ((m = re.exec(sql)) !== null) out.push(m[1]);
+  return out;
+}
+
+// duckdbNameList renders what the reader can now query, by name.
+//
+// After the download, not before: on first visit the names are noise, and the
+// card has a text budget it keeps by drawing rather than explaining. At this
+// moment they are the one thing the reader needs and cannot guess, since the
+// only documented way to recover them is SHOW TABLES, the query that took 63
+// seconds on the surface this card replaced.
+function duckdbNameList(names, file) {
+  const box = el("div", { class: "dk-names" });
+  box.append(el("div", { class: "dk-names-head" },
+    el("code", { text: ".read " + file }),
+    el("span", { class: "dk-names-count", text: names.length + " views" })));
+  const list = el("div", { class: "dk-names-list" });
+  for (const n of names) {
+    const row = el("button", { class: "dk-name", type: "button", text: n, title: "Copy" });
+    row.onclick = () => copyText(n, "view name");
+    list.append(row);
+  }
+  box.append(list);
+  return box;
+}
+
 // duckdbPanel offers the generated DuckDB schema for this server's Parquet.
 //
 // It is NOT the console SQL page, which #1549 removed: nothing here executes.
@@ -4272,7 +4316,16 @@ function duckdbPanel() {
       const name = portable && portable.checked ? "views-portable.sql" : "views.sql";
       const sql = await apiText("/api/views.sql" + (q.length ? "?" + q.join("&") : ""));
       downloadBlob(name, sql, "text/plain");
-      toast(name + " downloaded. In DuckDB run .read " + name + ", once per session.");
+      // The instruction used to be a toast, which is the wrong container for the
+      // only handoff in this flow: it names a command for a session the reader
+      // has not opened yet, and then disappears. This stays on the card.
+      const older = body.querySelector(".dk-names");
+      if (older) older.remove();
+      // Above the button, not appended after it. The button is the action and
+      // stays at the foot of the card; a list that lands below it pushes the
+      // action into the middle of its own result.
+      body.insertBefore(duckdbNameList(duckdbViewNames(sql), name),
+        body.querySelector(".stg-cardfoot"));
     } catch (err) {
       toastError("could not generate views: " + ((err && err.message) || err));
     } finally {
