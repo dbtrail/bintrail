@@ -2345,11 +2345,10 @@ try {
   const sqlxGate = await page.evaluate(async () => {
     const out = { cap: !!capsCache.sql_export };
     const v = document.querySelector(".view");
-    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+      /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
     out.card = !!card;
     if (!card) return out;
-    card.open = true;
     const input = card.querySelector("input");
     out.prefilled = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(input.value);
     // Before any build the download must refuse with words, not stream bytes.
@@ -2388,23 +2387,22 @@ try {
     const st = { sql_export: { state: "idle" } };
     const keep = capsCache.sql_export;
     capsCache.sql_export = false;
-    const off = backupSQLExportCard(cur, b, st);
+    const off = backupSQLLane(cur, b, st);
     capsCache.sql_export = keep;
-    return { off: !!off, on: !!backupSQLExportCard(cur, b, st) };
+    return { off: !!off, on: !!backupSQLLane(cur, b, st) };
   });
   (!sqlxGateOff.off && sqlxGateOff.on)
-    ? ok("sqlx: the capability gates the card (off absent, on present)")
-    : bad("sqlx: the capability gates the card (off absent, on present)", JSON.stringify(sqlxGateOff));
+    ? ok("sqlx: the capability gates the lane (off absent, on present)")
+    : bad("sqlx: the capability gates the lane (off absent, on present)", JSON.stringify(sqlxGateOff));
 
   // The real build. TT_AT sits after every fixture event; the fold reads the
   // baseline AND the index. Poll the status endpoint, not the DOM — the page
   // re-renders itself while the run region is up.
   const sqlxRun = await page.evaluate(async (TT_AT) => {
     const v = document.querySelector(".view");
-    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
-    if (!card) return { err: "card vanished" };
-    card.open = true;
+    const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+      /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
+    if (!card) return { err: "the .sql lane vanished" };
     const input = card.querySelector("input");
     input.value = TT_AT;
     Array.from(card.querySelectorAll("button")).find((b) => b.textContent === "Build").click();
@@ -2426,8 +2424,8 @@ try {
   await page.waitForFunction(() => {
     const v = document.querySelector(".view");
     if (!v) return false;
-    const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-      /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+    const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+      /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
     return !!card && /Ready: every table as of/.test(card.textContent) &&
       Array.from(card.querySelectorAll("button")).some((b) => /Download \.sql backup/.test(b.textContent));
   }, { timeout: 30000 });
@@ -2509,14 +2507,14 @@ try {
       await page.waitForFunction(() => {
         const v = document.querySelector(".view");
         if (!v) return false;
-        const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-          /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+        const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+          /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
         return !!card && /Last build failed/.test(card.textContent);
       }, { timeout: 15000 });
       const gapMsg = await page.evaluate(() => {
         const v = document.querySelector(".view");
-        const card = Array.from(v.querySelectorAll(".bk-restore")).find((c) =>
-          /Build a \.sql backup/.test((c.querySelector(".form-adv-summary") || {}).textContent || ""));
+        const card = Array.from(v.querySelectorAll(".bk-lane")).find((c) =>
+          /To load into MySQL/.test((c.querySelector(".bk-lane-t") || {}).textContent || ""));
         return card.textContent;
       });
       (/capture gap/.test(gapMsg) && !/--allow-gaps/.test(gapMsg))
