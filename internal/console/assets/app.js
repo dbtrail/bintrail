@@ -4101,7 +4101,7 @@ function backupRefreshCard(br) {
     say("Every backup writes every table again, even the ones that did not change.");
     say("Turn this on and a table with no changes keeps its file from the last backup instead. The backup is still complete.");
   }
-  say("It saves disk only when the last backup is read from this machine. A scheduled backup on a server that has a Backup S3 reads it from there, so it writes every table.");
+  say("It saves disk only when the last backup is read from this machine. A scheduled backup on a server that has a Backup S3 reuses nothing, so it writes every table.");
   say("This one setting covers every server.");
   // Three situations, not two. A daemon started with the backup trigger and no
   // refresh schedule still applies this to restores, so calling it dormant
@@ -4160,7 +4160,7 @@ async function saveBackupRefresh(body) {
     // rendering the OLD value on top of the wrong sentence. Re-render so the
     // card shows whatever the daemon actually holds.
     toastError("Could not confirm the change: " + ((err && err.message) || err) +
-      ". The card below shows what the daemon holds now.");
+      ". The card now shows what the daemon holds.");
     renderRoute();
     return;
   }

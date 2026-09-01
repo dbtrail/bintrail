@@ -2691,8 +2691,15 @@ button { font-family: inherit; }
    because this grid holds one card and the tints rotate on :nth-child, white
    lands at exactly 1.15. So it also takes the hairline the inset code chip
    takes a few rules up, for the same reason: an edge that does not depend on
-   the fill winning. Text on the pill measures 6.75 and body text on the card
-   5.80, both clear of the 4.5 body floor. */
+   the fill winning. Text on the pill measures 16.01 and body text on the card
+   6.37, both clear of the 4.5 body floor.
+
+   Those two were first written as 6.75 and 5.80, from a probe that read
+   getComputedStyle().color and parsed it as sRGB. Chrome returns these as the
+   authored oklch(), so the three oklch components were being read as three
+   sRGB channels. Resolve a colour through a canvas fillStyle before comparing
+   it; the 1.15 survived only because both sides of THAT one come back as
+   rgb(). */
 .bkr-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .bkr-state {
   background: var(--surface); color: var(--ink);

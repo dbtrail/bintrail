@@ -28,9 +28,11 @@ import (
 // before the provenance line is outside the window, so a state pill reading
 // "On, live and running now" passes here. The whole-card version is the e2e
 // scenario "backups: the disk-space card reports every state it can be in",
-// which renders the real function across all 16 DTOs and asserts no rendered
-// text carries a liveness word. This guard is the cheap unit-level half; do
-// not delete the e2e believing this one covers it.
+// which renders the real function across all 16 DTOs and matches a liveness
+// WORD against the rendered text. The difference matters: the check below is
+// the literal "(live", which the old kv row used, and a pill reading "On,
+// running now" carries no parentheses and passes it. This guard is the cheap
+// unit-level half; do not delete the e2e believing this one covers it.
 func TestBackupRefreshCard_neverClaimsLiveWhileDormant(t *testing.T) {
 	// jsFunctionBody, not functionBody: it strips comment lines before walking.
 	// These guards search for the rendered LABELS, and this function documents

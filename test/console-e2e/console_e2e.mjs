@@ -4052,7 +4052,12 @@ try {
               middle: t.includes("Nothing refreshes all servers on one timer"),
               chose: t.includes("You chose this here"),
               saving: t.includes("only when the last backup is read from this machine"),
-              live: t.includes("(live"),
+              // A WORD test, not the literal "(live". The old shape put the
+              // word in parentheses, so a check for that string passes on a pill
+              // reading "On, running now" beside "Nothing uses this yet", which
+              // is the contradiction this exists to catch. The card says "the
+              // next time dbtrail runs", so \brunning\b does not match it.
+              live: /\b(live|running)\b/i.test(t),
               buttons: Array.from(el.querySelectorAll("button")).map((b) => b.textContent),
             });
           }
