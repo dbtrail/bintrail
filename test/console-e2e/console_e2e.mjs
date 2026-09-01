@@ -2380,6 +2380,85 @@ try {
     ? ok("take-away: the views file is offered only when Connect AI can produce it")
     : bad("take-away: the views file is offered only when Connect AI can produce it", JSON.stringify({ caps: lanes.views, duck: duck }));
 
+  // The GATED arm, fixture-driven through the real builder. The assertions
+  // above run on a stack whose views capability is ON, so the one-tile arm --
+  // its sentence, its missing button -- is drawn by nothing otherwise. Same
+  // shape as sqlxGateOff below: flip the capability, call the builder,
+  // restore. Without this, inverting the gate is caught only by the assertion
+  // above, and the arm itself is never rendered at all.
+  const duckOff = await page.evaluate(() => {
+    const b = { configured: true, snapshots: [{ time: "2026-06-10 12:00:00" }] };
+    const keep = capsCache.views;
+    capsCache.views = false;
+    const off = backupDuckLane(b);
+    capsCache.views = true;
+    const on = backupDuckLane(b);
+    capsCache.views = keep;
+    const read = (lane) => lane && ({
+      tiles: lane.querySelectorAll(".bk-file").length,
+      lead: (lane.querySelector(".bk-lane-lead") || {}).textContent || "",
+      views: Array.from(lane.querySelectorAll("button")).some((x) => /views\.sql/.test(x.textContent)),
+      text: lane.textContent,
+    });
+    return { off: read(off), on: read(on) };
+  });
+  (duckOff.off && duckOff.off.tiles === 1 && !duckOff.off.views && duckOff.off.lead.startsWith("One download"))
+    ? ok("take-away: with no views capability the lane draws one download and offers no views file")
+    : bad("take-away: with no views capability the lane draws one download and offers no views file", JSON.stringify(duckOff.off));
+  // And it must say WHY, rather than dressing a console setting as a property
+  // of the data: the same folder still yields the file from the command line.
+  (duckOff.off && /not offered here/.test(duckOff.off.text) && /decimal columns arrive as text/.test(duckOff.off.text))
+    ? ok("take-away: the withheld views file is explained, not implied away")
+    : bad("take-away: the withheld views file is explained, not implied away", JSON.stringify(duckOff.off && duckOff.off.text));
+  // The on-arm is the vacuousness control: a builder that always drew one
+  // tile would pass the off-arm alone.
+  (duckOff.on && duckOff.on.tiles === 2 && duckOff.on.views)
+    ? ok("take-away: with the capability on, the same builder draws both downloads")
+    : bad("take-away: with the capability on, the same builder draws both downloads", JSON.stringify(duckOff.on));
+
+  // Paging, EXECUTED through the real panel. The Go guards test the window
+  // function and the clamp in isolation and read the call site as text; their
+  // COMPOSITION is what a literal page argument breaks, and only rendering
+  // catches that. The fixture index carries one snapshot, so the list is
+  // handed eight synthetic ones instead.
+  const paged = await page.evaluate(() => {
+    const snaps = [];
+    for (let i = 0; i < 8; i++) snaps.push({ time: "2026-06-1" + i + " 12:00:00", age_hours: i });
+    const keep = backupsPage;
+    const read = (idx) => {
+      backupsPage = { server: currentServer, index: idx };
+      const panel = baselinesPanel({ configured: true, snapshots: snaps }, [], {});
+      return {
+        rows: Array.from(panel.querySelectorAll(".stg-row .stg-name")).map((n) => n.textContent),
+        latest: panel.querySelectorAll(".stg-row-latest").length,
+        pager: (panel.querySelector(".bk-pager-n") || {}).textContent || "",
+      };
+    };
+    const p0 = read(0), p1 = read(1);
+    backupsPage = keep;
+    return { p0: p0, p1: p1 };
+  });
+  (paged.p0.rows.length === 5 && paged.p1.rows.length === 3)
+    ? ok("backups paging: five rows a page, and the last page holds the remainder")
+    : bad("backups paging: five rows a page, and the last page holds the remainder",
+        JSON.stringify({ p0: paged.p0.rows.length, p1: paged.p1.rows.length }));
+  // The composition is what a literal page argument breaks: the window has to
+  // MOVE. Page two showing page one's rows is the shape that passed every
+  // source assertion and both isolated node tests.
+  (paged.p1.rows[0] && paged.p1.rows[0] !== paged.p0.rows[0])
+    ? ok("backups paging: page two continues the list instead of restarting it")
+    : bad("backups paging: page two continues the list instead of restarting it",
+        JSON.stringify({ p0first: paged.p0.rows[0], p1first: paged.p1.rows[0] }));
+  // The treatment marks the backup a restore reads, so it belongs to the
+  // whole list, not to a page.
+  (paged.p0.latest === 1 && paged.p1.latest === 0)
+    ? ok("backups paging: only the real newest backup wears the treatment")
+    : bad("backups paging: only the real newest backup wears the treatment",
+        JSON.stringify({ p0: paged.p0.latest, p1: paged.p1.latest }));
+  (/^1.5 of 8$/.test(paged.p0.pager) && /^6.8 of 8$/.test(paged.p1.pager))
+    ? ok("backups paging: the pager says which rows are on screen")
+    : bad("backups paging: the pager says which rows are on screen",
+        JSON.stringify({ p0: paged.p0.pager, p1: paged.p1.pager }));
   const sqlxGate = await page.evaluate(async () => {
     const out = { cap: !!capsCache.sql_export };
     const v = document.querySelector(".view");

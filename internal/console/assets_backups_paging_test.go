@@ -28,8 +28,25 @@ func TestBackupsListPagesAndSaysItOpens(t *testing.T) {
 	panel := stripJSLineComments(functionBody(t, js, "function baselinesPanel("))
 	js = stripJSLineComments(js)
 
-	if !strings.Contains(panel, "backupsPageSlice(") {
-		t.Error("the list is not paged; every backup renders and the per-row Download goes below the fold")
+	// The ARGUMENT, not just the call. Both halves are pure and both are
+	// executed by tests, but their composition is not: passing a literal 0
+	// here keeps every other assertion green while Older goes dead, page two
+	// renders page one's rows, and every page crowns its first row "Newest".
+	if !strings.Contains(panel, "backupsPageSlice(b.snapshots, page)") {
+		t.Error("the list does not window itself by the CLAMPED page. Either it is not paged at " +
+			"all, or it is sliced from a page index that did not come from backupsPageIndex, which " +
+			"is what keeps a reader off a page the list no longer has")
+	}
+	if !strings.Contains(panel, "backupsPageIndex(") {
+		t.Error("the page index is not clamped on read, so a list that shrinks under a viewer " +
+			"leaves them on an empty page with no way back")
+	}
+	// truncated reaches the pager or its count lies: /api/baselines caps the
+	// listing and says so, and "46-50 of 50" for a server with 200 backups is
+	// the one line on the page asserting an inventory the API disclaimed.
+	if !strings.Contains(panel, "!!b.truncated") {
+		t.Error("the pager is not told the listing was capped, so its count reads as a complete " +
+			"inventory of a list the API explicitly truncated")
 	}
 	if !strings.Contains(panel, "backupsPager(") {
 		t.Error("the panel renders no pager, so a reader on page one cannot reach page two")
@@ -37,7 +54,11 @@ func TestBackupsListPagesAndSaysItOpens(t *testing.T) {
 	// The row treatment is decided by position in the WHOLE list. Taking it
 	// from the page would crown the first row of every page "Newest", which is
 	// a claim about which backup a restore uses.
-	if !strings.Contains(panel, "window.start + i") {
+	// Matched on the SHAPE, not on the local's name: pinning the identifier
+	// coupled this guard to a variable that had to be renamed (it was called
+	// `window`, which shadows the browser global inside the block the row
+	// handlers close over).
+	if !regexp.MustCompile(`\.start \+ i\b`).MatchString(panel) {
 		t.Error("the row index is not offset by the page; the first row of page two would be " +
 			"labelled Newest and given the treatment reserved for the backup restores use")
 	}

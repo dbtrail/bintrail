@@ -3911,15 +3911,6 @@ async function renderBaselines() {
     // so the rows below can carry only what varies between snapshots.
     const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
     v.append(baselineContextStrip(baselines, cur));
-    // The backup schedule (#1442), below the answer and the list. It used to
-    // sit directly under the context strip; the two download lanes took that
-    // spot, because a reader who came to fetch a copy should not scroll past
-    // scheduling to find one. Still ABOVE the fold line for a failed
-    // scheduled run, which has to be visible without opening anything.
-    // Reads, with the facts about the
-    // collection: it is the answer to "will this list keep growing on its
-    // own", and a failed scheduled run has to be visible without opening
-    // anything.
     // A visible in-progress region (mirrors the verification page): while a
     // backup is being created or restored, the page must look like a page
     // doing work, not a stale list.
@@ -3939,6 +3930,12 @@ async function renderBaselines() {
     // lane hands a running build off to it with "its progress is above".
     const takeAway = backupTakeAway(cur, baselines, sqlSt);
     if (takeAway) v.append(takeAway);
+    // The backup schedule (#1442). It used to sit directly under the context
+    // strip; the two download lanes took that spot, because a reader who came
+    // to fetch a copy should not scroll past scheduling to find one. Still
+    // ABOVE the list, because it answers "will this list keep growing on its
+    // own" and a failed scheduled run has to be visible without opening
+    // anything.
     const scheduleCard = backupScheduleCard(cur, baselines);
     if (scheduleCard) v.append(scheduleCard);
     // Directly under the schedule, because the two were the pair #1528 named:
@@ -5016,11 +5013,11 @@ function baselinesPanel(b, servers, opts) {
     const total = b.snapshots.length;
     const pages = Math.max(1, Math.ceil(total / BACKUPS_PAGE_SIZE));
     const page = backupsPageIndex(currentServer || defaultServerId, pages);
-    const window = backupsPageSlice(b.snapshots, page);
+    const pageWindow = backupsPageSlice(b.snapshots, page);
     // idx is the index in the WHOLE list, not in the page: it decides the
     // "Newest" treatment, and paging must not promote the first row of page two.
-    window.rows.forEach((sn, i) => {
-      const idx = window.start + i;
+    pageWindow.rows.forEach((sn, i) => {
+      const idx = pageWindow.start + i;
       const row = el("div", { class: "stg-row" + (idx === 0 ? " stg-row-latest" : "") });
       if (idx === 0) row.append(el("span", { class: "tag-pill", text: "Newest" }));
       row.append(tsSpan("stg-name mono", sn.time));
@@ -5215,17 +5212,29 @@ async function loadBackupDetail(at, box) {
   box.append(tbl);
 }
 
+let backupDownloadBusy = false;
+
 // downloadBackup streams the whole snapshot as one tar.gz. Fetch + blob
 // because the API authenticates via header; a plain link would arrive
 // tokenless on token-auth consoles. The blob buffers the WHOLE archive in
 // browser memory before the save starts — fine for the common case, and the
 // confirm below makes the operator choose it knowingly for a huge one.
 async function downloadBackup(at, btn, totalBytes) {
+  // One at a time, process-wide, and checked before the size prompt: a
+  // repaint (a settling run, or paging) replaces the lane while a download
+  // is still buffering, which leaves the NEW button enabled and a second
+  // click starting a second full archive, both held whole in browser memory.
+  // The flag outlives the node the click came from.
+  if (backupDownloadBusy) {
+    toastError("A backup is already downloading. Wait for that one to finish before starting another.");
+    return;
+  }
   if (totalBytes > 1 << 30 &&
       !window.confirm("This backup weighs " + humanBytes(totalBytes) +
         ". The browser holds all of it in memory before saving. Download anyway?")) {
     return;
   }
+  backupDownloadBusy = true;
   // Restore the caller's OWN label. This used to re-assert the per-row
   // button's text, which is right for that button and renames every other
   // one: the DuckDB lane's "Download the data" became "Download (.tar.gz) ·
@@ -5259,7 +5268,10 @@ async function downloadBackup(at, btn, totalBytes) {
   } catch (err) {
     toastError("Download failed: " + ((err && err.message) || err));
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = btnLabel; }
+    backupDownloadBusy = false;
+    // Never revive a detached button: it belongs to a repainted lane and
+    // nobody will ever see it again.
+    if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = btnLabel; }
   }
 }
 
@@ -5713,8 +5725,9 @@ function backupTakeAway(cur, b, sqlSt) {
   return panel;
 }
 
-// backupFilesShape draws the count instead of stating it: two tiles on the
-// DuckDB lane, one on the MySQL lane. A reader who takes nothing else off
+// backupFilesShape draws the count instead of stating it: on the DuckDB lane
+// two tiles when Connect AI can produce the views file and one when it
+// cannot, one on the MySQL lane. A reader who takes nothing else off
 // this panel should still leave knowing that much. Built with el() and CSS
 // like duckdbShape(), never svgEl -- that path is for static icon constants.
 function backupFilesShape(files) {
@@ -5768,7 +5781,7 @@ function backupDuckLane(b) {
   if (hasViews) files.push({ name: DUCKDB_VIEWS_FILE, cap: "how to read them" });
   const lane = backupLane("To open in DuckDB", files, hasViews
     ? ". The data, and the file that tells DuckDB how to read it."
-    : ". The data. DuckDB reads the Parquet files directly.");
+    : ". The data, on its own.");
   const msg = el("p", { class: "form-msg err" });
   msg.hidden = true;
   const dl = el("button", { class: "btn", type: "button", text: "Download the data" });
@@ -5793,6 +5806,16 @@ function backupDuckLane(b) {
   lane.append(el("p", { class: "form-hint", text:
     (b.incomplete ? "This takes the newest backup that could be read, from " : "This takes the newest backup, from ") +
     utcLabel(snaps[0].time) + ". Any other one in the list downloads the same way." }));
+  // Say WHY the second file is missing, and do not dress it as a property of
+  // the data. It is withheld by this console's own setting, not by the
+  // backup: the same folder still yields the file from the command line. And
+  // it is not a convenience -- money columns are stored as text in Parquet,
+  // so without it the first SUM a reader writes fails to bind.
+  if (!hasViews) {
+    lane.append(el("p", { class: "form-hint", text:
+      "The file that describes these tables is not offered here, because this console is set not to read archived data. " +
+      "DuckDB still opens the Parquet files, but decimal columns arrive as text, so totals will not add up until you cast them." }));
+  }
   return lane;
 }
 
@@ -5908,9 +5931,17 @@ function backupSQLLane(cur, b, sqlSt) {
   } else if (st && st.state === "succeeded") {
     const dl = el("button", { class: "btn", type: "button", text: "Download .sql backup (.tar.gz)" });
     dl.onclick = () => downloadSQLExport(cur.id, dl, st.bytes || 0);
+    // The lead has to agree with whether the button is there. Adding the
+    // explanation below was not enough: this line still opened with "Ready"
+    // and the paragraph after it still quoted a download deadline, so a build
+    // that cannot be fetched was announced by three sentences, two of which
+    // said it could.
+    const lead = st.removal_owed
+      ? "Built for " + utcLabel(st.at || "") + ", and already being cleaned up."
+      : "Ready: every table as of " + utcLabel(st.at || "") +
+        (st.bytes ? " (" + humanBytes(st.bytes) + " on this machine)" : "") + ".";
     const row = el("div", { class: "bk-restore-row" },
-      el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") +
-        (st.bytes ? " (" + humanBytes(st.bytes) + " on this machine)" : "") + "." }));
+      el("span", { class: "stg-age", text: lead }));
     // removal_owed means the staged files are owed a removal, so the build is
     // no longer handed out. Withholding the button under a line that still
     // leads with "Ready" left the reader with a deadline for a file they
@@ -5922,9 +5953,11 @@ function backupSQLLane(cur, b, sqlSt) {
       row.append(dl);
     }
     body.append(row);
-    body.append(el("p", { class: "form-hint", text:
-      (st.expires_at ? "The download stays available until " + utcLabel(st.expires_at) + ". " : "") +
-      "The file is removed from this machine once you download it, when that time passes, or when a new build starts." }));
+    if (!st.removal_owed) {
+      body.append(el("p", { class: "form-hint", text:
+        (st.expires_at ? "The download stays available until " + utcLabel(st.expires_at) + ". " : "") +
+        "The file is removed from this machine once you download it, when that time passes, or when a new build starts." }));
+    }
   } else if (st && st.state === "downloaded") {
     body.append(el("p", { class: "form-hint", text:
       "Downloaded" + (st.downloaded_at ? " at " + utcLabel(st.downloaded_at) : "") +

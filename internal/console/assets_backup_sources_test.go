@@ -201,3 +201,32 @@ func stripJSLineComments(body string) string {
 	}
 	return b.String()
 }
+
+// downloadBackup is shared by the per-row button and the DuckDB lane's, and
+// it re-enables whichever one it was given when the transfer ends. It used to
+// re-assert the PER-ROW label there, so one click renamed the lane's
+// "Download the data" to "Download (.tar.gz) · 210 MB" for good -- and the
+// next click captured the clobbered text as its own label.
+//
+// Source-level on purpose: no test renders a button, clicks it through a real
+// transfer and reads the label back, so this is what stands between that bug
+// and a second appearance.
+func TestDownloadBackupRestoresTheLabelItWasGiven(t *testing.T) {
+	body := stripJSLineComments(functionBody(t, readAsset(t, "app.js"), "async function downloadBackup("))
+	if !strings.Contains(body, "const btnLabel = btn ? btn.textContent") {
+		t.Error("downloadBackup no longer captures the caller's own button label")
+	}
+	if strings.Contains(body, `btn.textContent = "Download (.tar.gz) · "`) {
+		t.Error("downloadBackup re-asserts the per-row button's label. That is right for that one " +
+			"button and renames every other caller's: the DuckDB lane's button loses its name " +
+			"after a single click, and the click after that adopts the wrong one")
+	}
+	if !strings.Contains(body, "btn.isConnected") {
+		t.Error("downloadBackup revives a button that may have been detached by a repaint. The " +
+			"node belongs to a lane nobody will see again, and the visible button is a different one")
+	}
+	if !strings.Contains(body, "backupDownloadBusy") {
+		t.Error("nothing serialises whole-archive downloads. A repaint mid-transfer leaves the new " +
+			"button enabled, and a second click buffers a second full archive in browser memory")
+	}
+}

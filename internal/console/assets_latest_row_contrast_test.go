@@ -44,11 +44,19 @@ func TestNewestBackupRowClearsItsFloorOnTheTint(t *testing.T) {
 	for _, class := range latestRowChildren {
 		tok := effectiveDecl(css, class, "color")
 		if tok == "" {
-			// Genuinely inherits: it declares no colour of its own anywhere.
-			// This used to be reached by .chip-mon too, not because it
-			// inherits (it sets --orange-2) but because its rule is written
-			// as the compound .chip.chip-mon and the lookup missed it. See
-			// selectorTargets.
+			// Two very different things reach here and only one is benign.
+			// Benign: the class declares no colour anywhere and inherits.
+			// Not benign: it declares one this reader cannot resolve -- a
+			// literal hex, or a rule behind a combinator or an at-rule -- in
+			// which case the child is listed as covered and measured never.
+			// (.chip-mon used to land here for a third reason, a compound
+			// selector; see selectorTargets.)
+			if declaresUnreadableColor(css, class) {
+				t.Errorf(".%s declares a colour this test cannot resolve (not a var(--token)). It "+
+					"would be listed as covered and never measured, which is the failure this file "+
+					"exists to prevent. Teach the reader that notation rather than leaving the "+
+					"child silently skipped.", class)
+			}
 			continue
 		}
 		// A child may bring its own ground (the pill does, and must: see the
@@ -57,6 +65,17 @@ func TestNewestBackupRowClearsItsFloorOnTheTint(t *testing.T) {
 		ground, groundName := ground, latestRowGround
 		if bg := effectiveDecl(css, class, "background"); bg != "" {
 			ground, groundName = anyToken(t, css, bg), bg
+		}
+		// A border is what draws a chip against the row. .bk-where lost its
+		// shape at 1.01:1 for a whole release and no assertion noticed,
+		// because this file only ever measured ink. 1.15 is the separation
+		// floor the token block documents (--violet-line clears it at 1.20).
+		if bt := effectiveBorderToken(css, class); bt != "" {
+			if r := wcagRatioHex(anyToken(t, css, bt), ground); r < 1.15 {
+				t.Errorf(".stg-row-latest .%s draws its border in var(--%s), %.2f:1 against --%s. "+
+					"Below 1.15 the outline is gone and the chip has no shape; --violet-line is "+
+					"the token that exists for this ground.", class, bt, r, groundName)
+			}
 		}
 		if r := wcagRatioHex(anyToken(t, css, tok), ground); r < 4.5 {
 			why := "The tint is not optional (it marks the copy in use), so the fix is to override " +
@@ -267,4 +286,62 @@ func definedClasses(css string) map[string]bool {
 		out[m[1]] = true
 	}
 	return out
+}
+
+// declaresUnreadableColor reports whether a rule for class sets a colour that
+// effectiveDecl cannot read. Its whole purpose is to turn a silent skip into
+// a failure: "declares nothing" and "declares something I cannot parse" look
+// identical to the caller, and only one of them is safe.
+func declaresUnreadableColor(css, class string) bool {
+	for _, sel := range []string{".stg-row-latest ." + class, "." + class} {
+		body := ruleBody(css, sel)
+		if body == "" {
+			continue
+		}
+		if regexp.MustCompile(`(^|[;{\s])color:`).MatchString(body) {
+			return true // a colour is set here; effectiveDecl already failed to read it
+		}
+	}
+	return false
+}
+
+// The pager's position line is not a child of the newest row, so the walk
+// above cannot see it -- and it was shipped at 3.15:1 in the very change that
+// lifted three siblings off the floor. It is the only thing on the page that
+// tells a reader where they are in the list.
+func TestBackupsPagerNumberClearsTheBodyFloor(t *testing.T) {
+	css := string(readStyleCSS(t))
+	tok := effectiveDecl(css, "bk-pager-n", "color")
+	if tok == "" {
+		t.Fatal("no .bk-pager-n colour rule: if the pager's position line moved, re-point this " +
+			"rather than deleting it")
+	}
+	// --surface-2 is --panel-bg, the ground .stg-list sits on inside .ov-panel.
+	if r := wcagRatioHex(anyToken(t, css, tok), anyToken(t, css, "surface-2")); r < 4.5 {
+		t.Errorf(".bk-pager-n is var(--%s) on --surface-2 = %.2f:1, below the 4.5:1 body floor. "+
+			"This line is the only thing saying which page the reader is on", tok, r)
+	}
+}
+
+// effectiveBorderToken resolves a child's border colour, reading BOTH the
+// longhand and the shorthand. Reading only `border-color:` was a survivor:
+// .bk-where declares `border: 1px solid var(--line-soft)`, so dropping the
+// row's override left the check with nothing to read and it skipped -- the
+// same silent-skip shape as an unreadable colour, one property over.
+func effectiveBorderToken(css, class string) string {
+	longhand := regexp.MustCompile(`border-color:\s*var\(--([a-z0-9-]+)\)`)
+	shorthand := regexp.MustCompile(`border:[^;}]*var\(--([a-z0-9-]+)\)`)
+	for _, sel := range []string{".stg-row-latest ." + class, "." + class} {
+		body := ruleBody(css, sel)
+		if body == "" {
+			continue
+		}
+		if m := longhand.FindStringSubmatch(body); m != nil {
+			return m[1]
+		}
+		if m := shorthand.FindStringSubmatch(body); m != nil {
+			return m[1]
+		}
+	}
+	return ""
 }

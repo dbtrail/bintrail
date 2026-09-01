@@ -2793,8 +2793,14 @@ button { font-family: inherit; }
 /* auto-fit, not a fixed 1fr 1fr: the MySQL lane is absent whenever the
    selected server is the ephemeral --index-dsn entry or sql_export is off,
    and a fixed pair left the surviving lane at half width beside an empty
-   column on every desktop viewport. */
-.bk-lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; padding: 14px; }
+   column on every desktop viewport.
+
+   300px, not 340: the track budget here is the viewport minus the 248px
+   shell, 96px of view padding and 14px of panel padding, so 340 made a
+   1024px window stack two lanes that 1fr 1fr kept side by side. 300 holds
+   the pair down to about 970px, and the 860px rule below still covers the
+   narrow band. */
+.bk-lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; padding: 14px; }
 @media (max-width: 860px) { .bk-lanes { grid-template-columns: 1fr; } }
 .bk-lane {
   background: var(--surface); border: 1px solid var(--line);
