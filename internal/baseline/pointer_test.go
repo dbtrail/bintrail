@@ -302,7 +302,7 @@ func TestResolveCurrentPointer_reportsUnusableShapes(t *testing.T) {
 // as a guard without being one.
 func TestRewriteToPointer_refusesAURLRoot(t *testing.T) {
 	paths := []string{"s3://bucket/baselines/2025-08-31T03-00-00Z/shop/orders.parquet"}
-	if got, ok := RewriteToPointer("s3://bucket/baselines/", paths); ok {
+	if got, _, ok := RewriteToPointer("s3://bucket/baselines/", paths); ok {
 		t.Fatalf("rewrote an S3 root to %v", got)
 	}
 }
@@ -320,7 +320,7 @@ func TestRewriteToPointer_refusesAPathOutsideTheRoot(t *testing.T) {
 		filepath.Join(snap, "shop", "orders.parquet"),
 		filepath.Join(t.TempDir(), "2025-08-31T03-00-00Z", "shop", "elsewhere.parquet"),
 	}
-	if got, ok := RewriteToPointer(root, paths); ok {
+	if got, _, ok := RewriteToPointer(root, paths); ok {
 		t.Fatalf("rewrote paths spanning two roots to %v", got)
 	}
 }
@@ -508,7 +508,7 @@ func TestRewriteToPointer_refusesAURLRootWithoutTouchingTheCwd(t *testing.T) {
 
 	root := "s3://bucket/baselines"
 	paths := []string{root + "/2025-08-30T03-00-00Z/shop/orders.parquet"}
-	if got, ok := RewriteToPointer(root, paths); ok {
+	if got, _, ok := RewriteToPointer(root, paths); ok {
 		t.Fatalf("rewrote an S3 root to %v by resolving a pointer against the working directory", got)
 	}
 }

@@ -175,3 +175,104 @@ func TestPointerStateView_acceptsATableNestedDeeper(t *testing.T) {
 		t.Errorf("state view read %q; want \"here\"", status)
 	}
 }
+
+// TestPointerFollow_carriesRelForARootThatIsNotAlreadyClean pins the fix for the
+// one shape that made a following file promise a check it did not carry (#1558).
+//
+// The pointer branch sets Follow, and the preflight needs Rel. Those two used to
+// come from DIFFERENT derivations of the same path: baseline.RewriteToPointer
+// resolves with filepath.Rel, which cleans both sides, while views cut a raw
+// byte prefix. They agree only for a root that is already clean, so
+// `--baseline-dir ./baselines`, a trailing `//` from an expanded variable, or
+// `/data/./baselines` produced a file that followed, printed "caught by the
+// check below" in its own header, and contained no check.
+//
+// The roots here are the flag spellings, not exotica: the repo's own docs write
+// this flag as `./baselines`.
+func TestPointerFollow_carriesRelForARootThatIsNotAlreadyClean(t *testing.T) {
+	clean, paths := pointerRoot(t)
+
+	for _, root := range []string{clean, clean + "/", clean + "//", clean + "/.", filepath.Join(clean, "x", "..")} {
+		t.Run(root, func(t *testing.T) {
+			in := Input{
+				GeneratedAt:      time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
+				Version:          "test",
+				BaselineSource:   root,
+				BaselineSnapshot: time.Date(2026, 5, 30, 3, 0, 0, 0, time.UTC),
+				Baselines: []BaselineTable{
+					{Schema: "audit", Table: "events", Path: paths[0]},
+					{Schema: "shop", Table: "orders", Path: paths[1]},
+				},
+			}
+			ApplyFollow(&in, root, false)
+			if in.Follow != FollowPointer {
+				t.Fatalf("root %q did not follow; want FollowPointer", root)
+			}
+			for _, b := range in.Baselines {
+				if b.Rel == "" {
+					t.Fatalf("root %q follows but left %s.%s without a Rel, so the preflight is "+
+						"skipped while the header still promises it", root, b.Schema, b.Table)
+				}
+			}
+			sqlText := Generate(in)
+			if !strings.Contains(sqlText, missingVar) {
+				t.Fatalf("root %q produced a following file with NO preflight:\n%s", root, sqlText)
+			}
+			// And the file still loads: a Rel derived from a cleaned root must
+			// still match what glob reports for the path the views read.
+			execViews(t, sqlText)
+		})
+	}
+}
+
+// TestPointerFollow_acceptsARootWithGlobMetacharacters pins the OTHER direction
+// of the preflight's one dangerous failure: refusing a healthy file.
+//
+// The check compares each table against `glob(<dir> || '**/*.parquet')`, and
+// under FollowPointer that dir is an operator-supplied path concatenated into a
+// PATTERN. Measured against a real directory: a `[` makes the listing return
+// nothing, so every table grades missing and a file whose every table is present
+// is refused before it creates anything; `*` and `?` make it match siblings, so
+// a table that really is gone can grade present. Both are wrong, and only one of
+// them is loud.
+//
+// The paths in the view bodies are unaffected — read_parquet takes a literal —
+// which is exactly why nothing else in this package would notice.
+func TestPointerFollow_acceptsARootWithGlobMetacharacters(t *testing.T) {
+	for _, name := range []string{"meta[1]", "meta*x", "meta?x", "meta{a"} {
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), name)
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			const stamp = "2026-05-30T03-00-00Z"
+			src := writeSnapshot(t, root, stamp, true, "here")
+			if err := baseline.PublishCurrentPointer(filepath.Join(root, stamp)); err != nil {
+				t.Fatalf("publish pointer: %v", err)
+			}
+			in := Input{
+				GeneratedAt:      time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
+				Version:          "test",
+				BaselineSource:   root,
+				BaselineSnapshot: time.Date(2026, 5, 30, 3, 0, 0, 0, time.UTC),
+				Baselines:        []BaselineTable{{Schema: "shop", Table: "orders", Path: src}},
+			}
+			ApplyFollow(&in, root, false)
+			if in.Follow != FollowPointer {
+				t.Fatalf("root %q did not follow", root)
+			}
+			sqlText := Generate(in)
+			if !strings.Contains(sqlText, missingVar) {
+				t.Fatalf("no preflight emitted for %q", root)
+			}
+			db := execViews(t, sqlText)
+			var status string
+			if err := db.QueryRow(`SELECT "status" FROM state_shop_orders`).Scan(&status); err != nil {
+				t.Fatalf("query state view: %v", err)
+			}
+			if status != "here" {
+				t.Errorf("state view read %q; want \"here\"", status)
+			}
+		})
+	}
+}

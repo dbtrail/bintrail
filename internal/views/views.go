@@ -17,6 +17,7 @@ package views
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -1588,7 +1589,7 @@ func writeNewestSnapshotVar(b *strings.Builder, in Input) {
 // every one of these tables when it was written, so the check would be asking
 // whether someone deleted files by hand.
 func writeSnapshotPreflight(b *strings.Builder, in Input, wanted []statePlan) {
-	dir, ok := snapshotDirExpr(in)
+	dir, globDir, ok := snapshotDirExpr(in)
 	if !ok || len(wanted) == 0 {
 		return
 	}
@@ -1625,7 +1626,7 @@ func writeSnapshotPreflight(b *strings.Builder, in Input, wanted []statePlan) {
 	// perfectly healthy file is refused before it creates anything, which is
 	// the worst outcome this code has. `**` is a superset at every depth
 	// (verified: it matches one, two and three levels), so it cannot.
-	fmt.Fprintf(b, "  WHERE %s || t NOT IN (SELECT file FROM glob(%s || '**/*.parquet')));\n", dir, dir)
+	fmt.Fprintf(b, "  WHERE %s || t NOT IN (SELECT file FROM glob(%s || '**/*.parquet')));\n", dir, globDir)
 	// Raised through a SET rather than a bare SELECT so a clean file prints
 	// nothing. A SELECT here puts a one-row NULL table in front of every reader
 	// who has nothing wrong.
@@ -1652,17 +1653,64 @@ func writeSnapshotPreflight(b *strings.Builder, in Input, wanted []statePlan) {
 		sqlString(". If they were dropped or renamed, download this file again."))
 }
 
-// snapshotDirExpr is the SQL expression naming the snapshot directory the state
-// views read, with its trailing separator, or ok=false for a file that does not
-// follow one.
-func snapshotDirExpr(in Input) (string, bool) {
+// snapshotDirExpr returns TWO SQL expressions for the snapshot directory the
+// state views read, both with a trailing separator, or ok=false for a file that
+// does not follow one.
+//
+// They differ, and the difference is load-bearing. The first is compared
+// against glob's OUTPUT, so it must be the LITERAL path. The second is
+// concatenated into glob's PATTERN, where `[`, `*` and `?` are syntax: measured
+// against a real directory, a `[` in the root makes the listing return NOTHING
+// (so every table grades missing and a healthy file is refused before it creates
+// anything) and a `*` or `?` makes it match sibling directories (so a table that
+// really is gone can grade present). Both directions are wrong.
+//
+// DuckDB does not honour a backslash escape here; a single-character class does,
+// which is what globLiteral builds. FollowNewest needs no escaping: its value is
+// itself a glob RESULT, so a root that glob cannot express never reaches it —
+// writeNewestSnapshotVar's own glob raises first, naming the root.
+func snapshotDirExpr(in Input) (dir, globDir string, ok bool) {
 	switch in.Follow {
 	case FollowNewest:
-		return "getvariable('" + newestVar + "')", true
+		v := "getvariable('" + newestVar + "')"
+		return v, v, true
 	case FollowPointer:
-		return sqlString(strings.TrimSuffix(in.BaselineSource, "/") + "/" + baseline.CurrentLinkName + "/"), true
+		// filepath.Join, not a hand-built string off the raw BaselineSource.
+		// Join CLEANS, which is what the paths in the view bodies were built
+		// with, and trimming one trailing slash off the flag as typed does not:
+		// a root ending "//" produced ".../001//current/" here while the bodies
+		// read ".../001/current/...", so every table compared unequal and a
+		// perfectly healthy file was refused. Same class as the Rel divergence
+		// this file's preflight exists behind — one derivation, not two.
+		lit := filepath.ToSlash(filepath.Join(in.BaselineSource, baseline.CurrentLinkName)) + "/"
+		return sqlString(lit), sqlString(globLiteral(lit)), true
 	}
-	return "", false
+	return "", "", false
+}
+
+// globLiteral makes s match itself under DuckDB's glob, by wrapping every
+// pattern metacharacter in a single-character class.
+//
+// Verified against DuckDB rather than assumed: a backslash does NOT escape
+// (`meta\[1\]` matches nothing), a class DOES (`meta[[]1]` matches), `[` alone
+// under-matches to zero, and `*` and `?` over-match to siblings. `{` is wrapped
+// too: alone it is inert, but a second one turns the pair into brace expansion.
+//
+// Built in ONE pass. Escaping `[` first and then the others would re-process the
+// brackets this function just introduced.
+func globLiteral(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '[', '*', '?', '{':
+			b.WriteByte('[')
+			b.WriteRune(r)
+			b.WriteByte(']')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // writeNewestStateBody emits one state view's body under FollowNewest: a read of

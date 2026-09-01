@@ -26,18 +26,19 @@ func ApplyFollow(in *Input, root string, pin bool) {
 	for i, t := range in.Baselines {
 		paths[i] = t.Path
 	}
-	if rewritten, ok := baseline.RewriteToPointer(root, paths); ok {
-		// Rel BEFORE the rewrite, off the paths that still name their snapshot
-		// directory. Both modes carry it now: the preflight that checks a table
-		// is still in the snapshot needs the same tail whichever way the file
-		// follows, and deriving it twice from two different path shapes is how
-		// the two renders would come to disagree about the layout.
-		rels := snapshotRels(root, paths)
+	if rewritten, rels, ok := baseline.RewriteToPointer(root, paths); ok {
+		// Rel comes back from the rewrite rather than being cut off the paths a
+		// second time. This branch used to set Follow UNCONDITIONALLY while
+		// setting Rel only when a local re-derivation happened to agree, and the
+		// two disagreed for every root that is not already filepath.Clean-shaped
+		// ("./baselines", "/data/bl//", "/data/./bl"): RewriteToPointer resolves
+		// with filepath.Rel, which CLEANS both sides, and the local helper cut a
+		// raw byte prefix. The result was a file that followed, promised the
+		// dropped-table check in its own header, and carried no check at all
+		// (#1558).
 		for i := range in.Baselines {
 			in.Baselines[i].Path = rewritten[i]
-			if rels != nil {
-				in.Baselines[i].Rel = rels[i]
-			}
+			in.Baselines[i].Rel = rels[i]
 		}
 		in.Follow = FollowPointer
 		return
