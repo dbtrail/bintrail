@@ -157,12 +157,25 @@ func (s *Server) handleCoverage(w http.ResponseWriter, r *http.Request) {
 	case sum.Floor.Hour.IsZero():
 		resp.FullTableStatus = "unknown"
 	default:
-		files, err := reconstruct.ListBaselines(r.Context(), b.baselineSrc)
-		if err != nil {
-			slog.Warn("console: coverage card could not list baselines", "server", serverID(r), "source", b.baselineSrc, "error", err)
+		// EVERY configured location, not b.baselineSrc alone (#1571). This is
+		// a verdict about what can be restored, so deriving it from one of two
+		// places answers about a subset: on a server with a local directory
+		// and an S3 destination, a snapshot that survives only in the bucket
+		// would be graded as if it were gone, and the panel would report a
+		// shorter restorable window than the one that exists.
+		merged := listBaselinesMerged(r.Context(), baselineSourcesOf(b), reconstruct.ListBaselines)
+		// ANY location that did not answer makes the verdict unknown, not just
+		// all of them. A partial listing can only understate coverage, and an
+		// understated coverage window names healthy tables as broken -- the
+		// cry-wolf failure status.DeltaFloor already refuses when archives
+		// cannot be attributed. Unknown is the honest third state.
+		if merged.Listed < len(merged.Sources) || merged.Listed == 0 {
+			slog.Warn("console: coverage card could not list every backup location; the verdict is unknown rather than graded against a partial view",
+				"server", serverID(r), "listed", merged.Listed, "configured", len(merged.Sources))
 			resp.FullTableStatus = "unknown"
 			break
 		}
+		files := merged.Files
 		resp.FullTableStatus = "ok"
 		anchors := make(map[string]*tableAnchors, len(files))
 		for _, f := range files {
