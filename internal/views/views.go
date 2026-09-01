@@ -693,6 +693,16 @@ func writeHeader(b *strings.Builder, in Input) {
 			// open. What they open is decided per read.
 			b.WriteString("--   read through the newest `_SUCCESS` snapshot, which is that one right now\n")
 		}
+		// A local root resolves on ONE machine, and this file travels: the
+		// console serves it to a browser, and a generated file is meant to be
+		// copied around. Said here, beside the path, because without it the
+		// mismatch surfaces as DuckDB's "No files found", which reads as a
+		// missing or corrupt backup rather than as the right file on the wrong
+		// host. An s3:// root needs no such line; that is what it is for.
+		if !isS3(in.BaselineSource) {
+			b.WriteString("--   a directory, so the state views resolve only where it is mounted,\n")
+			b.WriteString("--   at exactly this path\n")
+		}
 	}
 	b.WriteString("\n")
 }

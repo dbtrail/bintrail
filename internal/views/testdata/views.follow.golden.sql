@@ -40,6 +40,8 @@
 -- Baseline snapshot:
 --   /data/baselines at 2026-04-30T03:00:00Z (4 table(s))
 --   read through /data/baselines/current, which is that snapshot right now
+--   a directory, so the state views resolve only where it is mounted,
+--   at exactly this path
 
 -- S3 setup, mirroring what bintrail's own DuckDB sessions configure.
 INSTALL httpfs; LOAD httpfs;
