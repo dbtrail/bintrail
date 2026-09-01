@@ -236,14 +236,24 @@ func (s *Server) resolveSnapshotRequest(w http.ResponseWriter, r *http.Request, 
 	// reason: local retention prunes while the durable copy remains.
 	var firstErr error
 	for _, src := range baselineSourcesOf(b) {
-		ss, err := openSnapshotSource(r.Context(), src)
+		// Bounded, for the reason the listing is: an s3:// source builds an
+		// object store (which HEADs the bucket) and then lists it, inside the
+		// process that is also capturing, and the server sets no WriteTimeout
+		// on purpose. Before this loop the detail tier only ever opened the
+		// primary, so on a dir+S3 server it never touched the bucket at all;
+		// extending it without a deadline would have traded a 404 for a handler
+		// pinned indefinitely.
+		srcCtx, cancel := context.WithTimeout(r.Context(), baselineListTimeout)
+		ss, err := openSnapshotSource(srcCtx, src)
 		if err != nil {
+			cancel()
 			if firstErr == nil {
 				firstErr = fmt.Errorf("open backup storage: %w", err)
 			}
 			continue
 		}
-		files, err := ss.files(r.Context(), dirName)
+		files, err := ss.files(srcCtx, dirName)
+		cancel()
 		if err == nil {
 			return ss, dirName, files
 		}

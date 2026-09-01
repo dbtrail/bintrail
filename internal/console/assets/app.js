@@ -5581,10 +5581,17 @@ function backupElsewhereNote(b, usable) {
 function backupSQLExportCard(cur, b, sqlSt) {
   if (!capsCache.sql_export || !cur || !cur.id || cur.kind !== "registry") return null;
   if (!b || b.error || !b.configured) return null;
-  // Whichever location the build will read: the server's own directory when it
-  // has one, the bucket otherwise. The comment above is right that an S3-backed
-  // server qualifies; it is a server with BOTH that needed narrowing.
-  const usable = backupSnapshotsFor(b, cur.baseline_dir ? "dir" : "s3");
+  // b.kind, NOT cur.baseline_dir. cur is the RAW registry entry; the export
+  // resolves through withBaselineDefaults (#1010), so an entry that inherits
+  // the daemon-wide backup location has an empty baseline_dir and still builds
+  // from a directory. b.kind comes off the bundle, which applies the same
+  // defaulting and the same dir-over-S3 preference the export does, so it is
+  // exactly "the build will read a directory".
+  //
+  // Borrowing the restore card's gate was the mistake: cur.baseline_dir is
+  // right THERE, because the restore endpoint refuses the shared daemon store
+  // on purpose (the fold would mix servers). This one accepts it, and says so.
+  const usable = backupSnapshotsFor(b, b.kind === "dir" ? "dir" : "s3");
   if (!usable.length) return null;
   const st = sqlSt && sqlSt.sql_export;
   if (st && st.state === "running") return null; // the run region owns it
@@ -5601,7 +5608,7 @@ function backupSQLExportCard(cur, b, sqlSt) {
   msg.hidden = true;
   go.onclick = () => startSQLExport(cur.id, input.value.trim(), go, msg);
   body.append(el("div", { class: "bk-restore-row" }, input, go), msg);
-  if (cur.baseline_dir) {
+  if (b.kind === "dir") {
     const elsewhere = backupElsewhereNote(b, usable);
     if (elsewhere) body.append(elsewhere);
   }
