@@ -2113,11 +2113,22 @@ button { font-family: inherit; }
 .stg-row-latest { background: var(--violet-tint); border-radius: var(--radius-sm); }
 .stg-rel { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); white-space: nowrap; }
 /* The newest row is the one tint on this page, so everything it carries has
-   to survive the ground it sits on. Measured with this file's own converter
-   (assets_tint_contrast_test.go), on --violet-tint: --ink-3 is 4.20:1 and
-   --ink-4 is 2.80:1. That put the row's age, its location chip and its
-   chevron all under their floor the moment the tint went on, and the tint
-   is not optional: it marks the copy a restore actually reads.
+   to survive the ground it sits on. Measured with the converter in
+   assets_tint_contrast_test.go; the rules below are guarded by
+   assets_latest_row_contrast_test.go, which walks what the row RENDERS. On
+   --violet-tint: --ink-3 is 4.20:1 and --ink-4 is 2.80:1.
+
+   The row's age and its location chip had been under their floor since the
+   tint went on. The chevron never was: it arrives in this same change, so it
+   was born under the floor rather than falling below it. The tint itself is
+   not optional -- it marks the copy a restore actually reads.
+
+   The location chip needed its BORDER moved too, not just its ink: it is
+   drawn with --line-soft, which the token block already records as 1.01:1 on
+   violet, invisible. --violet-line is the token that exists for this and
+   measures 1.20:1. The staleness chip next to it needs nothing -- its own
+   --ochre border is 2.14:1 on the tint, so its shape survives the ground its
+   --ochre-bg fill does not.
 
    The pill is a different case and is NOT a contrast fix, so do not read it
    as one. Its default ink-2 on surface-3 measures 6.74:1 and was always
@@ -2126,7 +2137,7 @@ button { font-family: inherit; }
    ground because .tcard-violet .tag-pill already does, and one pill on one
    tint should not have two looks. */
 .stg-row-latest .stg-rel  { color: var(--ink-2); }
-.stg-row-latest .bk-where { color: var(--ink-2); }
+.stg-row-latest .bk-where { color: var(--ink-2); border-color: var(--violet-line); }
 .stg-row-latest .bk-chev  { color: var(--ink-2); }
 .stg-row-latest .tag-pill { background: var(--surface); color: var(--violet-deep); }
 /* Hover must not erase the mark. --surface-2 is LIGHTER than the tint, so
@@ -2766,7 +2777,11 @@ button { font-family: inherit; }
    is what says a row opens at all: the per-row Download lives inside that fold,
    so a hover background was hiding the feature rather than hinting at it. */
 .bk-pager { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-top: 1px solid var(--line-soft); }
-.bk-pager-n { font-size: 11.5px; color: var(--ink-4); }
+/* --ink-3, not --ink-4: this is the only thing on the page telling a reader
+   where they are in the list, and --ink-4 on --surface-2 is 3.15:1 (the hint
+   floor, not the body one). --ink-3 is 4.74:1. Raised in the same change that
+   lifted three siblings off the floor for the same reason. */
+.bk-pager-n { font-size: 11.5px; color: var(--ink-3); }
 .bk-chev { margin-left: auto; color: var(--ink-4); font-size: 15px; line-height: 1; flex: none; transition: transform .12s ease; }
 .bk-expandable[aria-expanded="true"] .bk-chev { transform: rotate(90deg); }
 
@@ -2775,7 +2790,11 @@ button { font-family: inherit; }
    a region of the panel. Worth knowing when the Iceberg panel below is next
    touched: its .ice-stage cards are --surface-2 on a --surface-2 ground, so
    they are separated by a hairline and nothing else. */
-.bk-lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px; }
+/* auto-fit, not a fixed 1fr 1fr: the MySQL lane is absent whenever the
+   selected server is the ephemeral --index-dsn entry or sql_export is off,
+   and a fixed pair left the surviving lane at half width beside an empty
+   column on every desktop viewport. */
+.bk-lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 14px; padding: 14px; }
 @media (max-width: 860px) { .bk-lanes { grid-template-columns: 1fr; } }
 .bk-lane {
   background: var(--surface); border: 1px solid var(--line);
@@ -2790,7 +2809,10 @@ button { font-family: inherit; }
 .bk-lane-go { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .bk-lane .bk-restore-body { padding: 0; }
 
-/* The drawing: one tile per file. TWO on the DuckDB lane and ONE on the
+/* The drawing: one tile per DOWNLOAD, not per file -- the Parquet tile is a
+   whole folder arriving as one .tar.gz, so counting files would be wrong by
+   hundreds. TWO on the DuckDB lane (when Connect AI can produce the views
+   file) and ONE on the
    MySQL lane, and that count is the whole message -- it says "this takes two
    files" before any sentence does. Drawn with el() and these classes, never
    svgEl (that path is for static icon constants). */

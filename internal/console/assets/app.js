@@ -3911,7 +3911,12 @@ async function renderBaselines() {
     // so the rows below can carry only what varies between snapshots.
     const cur = servers.find((s) => s.id === (currentServer || defaultServerId));
     v.append(baselineContextStrip(baselines, cur));
-    // The backup schedule (#1442) sits right under the facts about the
+    // The backup schedule (#1442), below the answer and the list. It used to
+    // sit directly under the context strip; the two download lanes took that
+    // spot, because a reader who came to fetch a copy should not scroll past
+    // scheduling to find one. Still ABOVE the fold line for a failed
+    // scheduled run, which has to be visible without opening anything.
+    // Reads, with the facts about the
     // collection: it is the answer to "will this list keep growing on its
     // own", and a failed scheduled run has to be visible without opening
     // anything.
@@ -4914,10 +4919,26 @@ function backupsPageIndex(serverId, pages) {
 
 // backupsPager draws the two controls and the position. Rendered only when
 // there is more than one page: a pager under five rows is furniture.
-function backupsPager(total, page, pages, onGo) {
+// truncated: /api/baselines caps its listing (baselinesMaxSnapshots) and says
+// so. The pager's one job is to tell a reader where they are, so it must not
+// render "46-50 of 50" for a server with 200 backups -- that is the one line
+// on the page asserting an inventory the API explicitly disclaimed.
+// backupsPageSlice is the page's window into the list, pulled out of the
+// panel so a test can EXECUTE it. The guard it replaces asserted the source
+// text contained ".slice(start," and "const idx = start + i" -- both of which
+// survive rewriting `start` to a constant 0, which leaves Older a dead
+// control, the pager still reporting "6-10 of 25", and every page re-crowning
+// its first row "Newest". Spelling is not behaviour.
+function backupsPageSlice(snapshots, page) {
+  const start = page * BACKUPS_PAGE_SIZE;
+  return { start: start, rows: snapshots.slice(start, start + BACKUPS_PAGE_SIZE) };
+}
+
+function backupsPager(total, page, pages, onGo, truncated) {
   if (pages < 2) return null;
   const from = page * BACKUPS_PAGE_SIZE + 1;
   const to = Math.min(total, (page + 1) * BACKUPS_PAGE_SIZE);
+  const of = truncated ? " of the newest " + total : " of " + total;
   const btn = (label, target, disabled) => {
     const el2 = el("button", { class: "btn btn-sm", type: "button", text: label });
     if (disabled) el2.disabled = true;
@@ -4926,7 +4947,7 @@ function backupsPager(total, page, pages, onGo) {
   };
   return el("div", { class: "bk-pager" },
     btn("Newer", page - 1, page === 0),
-    el("span", { class: "bk-pager-n", text: from + "–" + to + " of " + total }),
+    el("span", { class: "bk-pager-n", text: from + "–" + to + of }),
     btn("Older", page + 1, page >= pages - 1));
 }
 
@@ -4995,11 +5016,11 @@ function baselinesPanel(b, servers, opts) {
     const total = b.snapshots.length;
     const pages = Math.max(1, Math.ceil(total / BACKUPS_PAGE_SIZE));
     const page = backupsPageIndex(currentServer || defaultServerId, pages);
-    const start = page * BACKUPS_PAGE_SIZE;
+    const window = backupsPageSlice(b.snapshots, page);
     // idx is the index in the WHOLE list, not in the page: it decides the
     // "Newest" treatment, and paging must not promote the first row of page two.
-    b.snapshots.slice(start, start + BACKUPS_PAGE_SIZE).forEach((sn, i) => {
-      const idx = start + i;
+    window.rows.forEach((sn, i) => {
+      const idx = window.start + i;
       const row = el("div", { class: "stg-row" + (idx === 0 ? " stg-row-latest" : "") });
       if (idx === 0) row.append(el("span", { class: "tag-pill", text: "Newest" }));
       row.append(tsSpan("stg-name mono", sn.time));
@@ -5036,10 +5057,17 @@ function baselinesPanel(b, servers, opts) {
     });
     const pager = backupsPager(total, page, pages, (target) => {
       backupsPage = { server: currentServer || defaultServerId, index: target };
-      renderRoute();
-    });
+      // renderBaselines(), not renderRoute(): the route path bumps viewGen and
+      // runs viewLoading(), which blanks the view and drops the reader at the
+      // top of the page whose bottom they were reading. This is the same
+      // repaint watchBackupRuns uses.
+      renderBaselines();
+    }, !!b.truncated);
     if (pager) list.append(pager);
-    if (b.truncated) list.append(el("div", { class: "ev-empty", text: "…older backups not shown." }));
+    // Only when there is no pager to carry it: with one, "of the newest 50"
+    // already says it, and this line sitting under page 1 read as "backups 6
+    // and up are not shown" when they are on page 2.
+    if (b.truncated && !pager) list.append(el("div", { class: "ev-empty", text: "…older backups not shown." }));
   }
   panel.append(list);
   return panel;
@@ -5198,6 +5226,12 @@ async function downloadBackup(at, btn, totalBytes) {
         ". The browser holds all of it in memory before saving. Download anyway?")) {
     return;
   }
+  // Restore the caller's OWN label. This used to re-assert the per-row
+  // button's text, which is right for that button and renames every other
+  // one: the DuckDB lane's "Download the data" became "Download (.tar.gz) ·
+  // 210 MB" after a single click, and the next click captured the clobbered
+  // name as its own.
+  const btnLabel = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = "Preparing…"; }
   try {
     const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};
@@ -5225,7 +5259,7 @@ async function downloadBackup(at, btn, totalBytes) {
   } catch (err) {
     toastError("Download failed: " + ((err && err.message) || err));
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "Download (.tar.gz) · " + humanBytes(totalBytes || 0); }
+    if (btn) { btn.disabled = false; btn.textContent = btnLabel; }
   }
 }
 
@@ -5694,37 +5728,71 @@ function backupFilesShape(files) {
   return shape;
 }
 
-function backupLane(title, files, lead) {
+// backupLane DERIVES the count word from the tiles it is handed, so the
+// drawing and the sentence cannot disagree. They did: an earlier cut passed
+// the lead as a whole string, and gating the views tile below would have left
+// one tile under the words "Two files."
+//
+// "downloads", not "files": a tile is one thing you fetch, and the Parquet
+// tile is a whole folder arriving as one .tar.gz. Counting files would be
+// wrong by hundreds.
+const LANE_COUNT_WORD = ["No", "One", "Two", "Three"];
+function backupLane(title, files, tail) {
+  const n = files.length;
+  const word = (LANE_COUNT_WORD[n] || String(n)) + " download" + (n === 1 ? "" : "s");
   return el("div", { class: "bk-lane" },
     el("h3", { class: "bk-lane-t", text: title }),
     backupFilesShape(files),
-    el("p", { class: "bk-lane-lead", text: lead }));
+    el("p", { class: "bk-lane-lead", text: word + tail }));
 }
 
-// The DuckDB lane. Gated on there being a backup at all and nothing else:
-// downloading what is already stored asks for no capability, unlike the
-// build the other lane drives.
+// The DuckDB lane. Downloading what is already stored asks for no capability,
+// so the DATA half is gated on there being a backup and nothing else.
+//
+// The VIEWS half is a different promise and needs its own gate. It is not
+// produced here: the button sends the reader to Connect AI, where the panel
+// is gated on capsCache.views, and viewsAvailable() is false whenever the
+// selected server has archived data turned off (a checkbox on this console's
+// own server form), among other reasons. Ungated, this lane drew a views.sql
+// tile and a button leading to a page where that filename does not appear --
+// no error, no toast. views_api.go puts it plainly: "a button that only 404s
+// is a lie, and this codebase already refuses that trade for reconstruct and
+// verify." Naming the file from a shared constant pinned its NAME; only this
+// pins its EXISTENCE.
 function backupDuckLane(b) {
   if (!b || b.error || !b.configured) return null;
   const snaps = (b.snapshots || []);
   if (!snaps.length) return null;
-  const lane = backupLane("To open in DuckDB",
-    [{ name: "Parquet files", cap: "your tables" },
-     { name: DUCKDB_VIEWS_FILE, cap: "how to read them" }],
-    "Two files. The data, and the file that tells DuckDB how to read it.");
+  const hasViews = !!capsCache.views;
+  const files = [{ name: "Parquet files", cap: "your tables" }];
+  if (hasViews) files.push({ name: DUCKDB_VIEWS_FILE, cap: "how to read them" });
+  const lane = backupLane("To open in DuckDB", files, hasViews
+    ? ". The data, and the file that tells DuckDB how to read it."
+    : ". The data. DuckDB reads the Parquet files directly.");
   const msg = el("p", { class: "form-msg err" });
   msg.hidden = true;
   const dl = el("button", { class: "btn", type: "button", text: "Download the data" });
   dl.onclick = async () => {
     const err = await downloadNewestBackup(snaps[0].time, dl);
+    // The lane may have been repainted while the request was in flight, which
+    // leaves msg detached and the error written nowhere. Fall back to the
+    // toast the rest of the page already uses for exactly that.
+    if (err && !msg.isConnected) { toastError(err); return; }
     msg.textContent = err;
     msg.hidden = !err;
   };
-  const views = el("button", { class: "btn btn-ghost", type: "button", text: "Get " + DUCKDB_VIEWS_FILE });
-  views.onclick = () => navigate("connect");
-  lane.append(el("div", { class: "bk-lane-go" }, dl, views), msg);
+  const go = el("div", { class: "bk-lane-go" }, dl);
+  if (hasViews) {
+    const views = el("button", { class: "btn btn-ghost", type: "button", text: "Get " + DUCKDB_VIEWS_FILE });
+    views.onclick = () => navigate("connect");
+    go.append(views);
+  }
+  lane.append(go, msg);
+  // b.incomplete means at least one configured location would not answer, so
+  // the list is a SUBSET and "the newest" is only the newest of what was read.
   lane.append(el("p", { class: "form-hint", text:
-    "This takes the newest backup, from " + utcLabel(snaps[0].time) + ". Any other one in the list below downloads the same way." }));
+    (b.incomplete ? "This takes the newest backup that could be read, from " : "This takes the newest backup, from ") +
+    utcLabel(snaps[0].time) + ". Any other one in the list downloads the same way." }));
   return lane;
 }
 
@@ -5763,7 +5831,7 @@ async function downloadNewestBackup(at, btn) {
 // (#1448). The two terminal states after that, "downloaded" and "expired",
 // both mean the same thing to the operator: the file is gone, build again.
 // S3-backed backups qualify too (the fold engine reads them directly), which
-// is why this card has no b.kind === "dir" gate.
+// is why this lane has no b.kind === "dir" gate.
 // backupSnapshotsFor narrows the listing to the snapshots a JOB can actually
 // fold from (#1542).
 //
@@ -5774,13 +5842,14 @@ async function downloadNewestBackup(at, btn) {
 // in the bucket, and the job would refuse it while the page above says it is
 // right there. Listing more must not mean offering more than the job can do.
 //
-// The full answer is folding from S3 (#1541); until then the cards offer what
+// The full answer is folding from S3 (#1541); until then the restore card and
+// the .sql lane offer what
 // works and say what they left out.
 function backupSnapshotsFor(b, kind) {
   return ((b && b.snapshots) || []).filter((s) => !s.kinds || !s.kinds.length || s.kinds.includes(kind));
 }
 
-// backupElsewhereNote names the snapshots a card had to skip, so a shorter
+// backupElsewhereNote names the snapshots a caller had to skip, so a shorter
 // dropdown than the list above it is explained rather than merely odd.
 function backupElsewhereNote(b, usable) {
   const all = ((b && b.snapshots) || []).length;
@@ -5809,7 +5878,7 @@ function backupSQLLane(cur, b, sqlSt) {
   const st = sqlSt && sqlSt.sql_export;
   const lane = backupLane("To load into MySQL",
     [{ name: ".sql files", cap: "your tables" }],
-    "One file, built for whatever moment you pick.");
+    ", built for whatever moment you pick.");
   const body = el("div", { class: "bk-restore-body" });
   // Running used to return null and take the whole card off the page. In a
   // two-lane panel that leaves a hole where an answer was, so the lane stays
@@ -5842,7 +5911,16 @@ function backupSQLLane(cur, b, sqlSt) {
     const row = el("div", { class: "bk-restore-row" },
       el("span", { class: "stg-age", text: "Ready: every table as of " + utcLabel(st.at || "") +
         (st.bytes ? " (" + humanBytes(st.bytes) + " on this machine)" : "") + "." }));
-    if (!st.removal_owed) row.append(dl);
+    // removal_owed means the staged files are owed a removal, so the build is
+    // no longer handed out. Withholding the button under a line that still
+    // leads with "Ready" left the reader with a deadline for a file they
+    // cannot fetch, and the held-download case reaches here with no
+    // staging_error to explain it either.
+    if (st.removal_owed) {
+      row.append(el("span", { class: "form-hint", text: "This build is being cleaned up and can no longer be downloaded. Build again for a fresh copy." }));
+    } else {
+      row.append(dl);
+    }
     body.append(row);
     body.append(el("p", { class: "form-hint", text:
       (st.expires_at ? "The download stays available until " + utcLabel(st.expires_at) + ". " : "") +

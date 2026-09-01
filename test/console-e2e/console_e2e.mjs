@@ -2342,6 +2342,44 @@ try {
   // baseline rows 1,2,4 + INSERT id 3 + UPDATE id 1 (-> shipped) + DELETE
   // id 2, built at TT_AT (after all three), so the dump must carry the folded
   // state — not the baseline, not the raw events.
+  // The two download lanes (#1572). The Go guards read the SOURCE: they can
+  // see that backupLane derives its count word and that backupFilesShape
+  // draws one tile per file, but not that a reader ends up looking at two
+  // tiles. This is the only check that renders them.
+  const lanes = await page.evaluate(() => {
+    const out = { views: !!capsCache.views, lanes: [] };
+    document.querySelectorAll(".bk-take .bk-lane").forEach((l) => {
+      const t = l.querySelector(".bk-lane-t");
+      out.lanes.push({
+        title: t ? t.textContent : "",
+        tiles: l.querySelectorAll(".bk-file").length,
+        lead: (l.querySelector(".bk-lane-lead") || {}).textContent || "",
+        views: Array.from(l.querySelectorAll("button")).some((b) => /views\.sql/.test(b.textContent)),
+      });
+    });
+    return out;
+  });
+  const duck = lanes.lanes.find((l) => /DuckDB/.test(l.title));
+  const mysql = lanes.lanes.find((l) => /MySQL/.test(l.title));
+  (duck && mysql)
+    ? ok("take-away: both download lanes render")
+    : bad("take-away: both download lanes render", JSON.stringify(lanes));
+  // The drawing and the sentence come from one source, so the rendered tile
+  // count must match the word the lane prints. A drawing that outlived its
+  // lane is the failure this pins.
+  const counts = { 1: "One download", 2: "Two downloads" };
+  (duck && counts[duck.tiles] && duck.lead.startsWith(counts[duck.tiles]))
+    ? ok("take-away: the DuckDB lane's drawing and its sentence agree")
+    : bad("take-away: the DuckDB lane's drawing and its sentence agree", JSON.stringify(duck));
+  (mysql && mysql.tiles === 1 && mysql.lead.startsWith("One download"))
+    ? ok("take-away: the MySQL lane draws one download and says so")
+    : bad("take-away: the MySQL lane draws one download and says so", JSON.stringify(mysql));
+  // The views half is a promise this page cannot keep alone: the file comes
+  // from the Connect AI panel, which is gated on the same capability.
+  (duck && duck.views === lanes.views && duck.tiles === (lanes.views ? 2 : 1))
+    ? ok("take-away: the views file is offered only when Connect AI can produce it")
+    : bad("take-away: the views file is offered only when Connect AI can produce it", JSON.stringify({ caps: lanes.views, duck: duck }));
+
   const sqlxGate = await page.evaluate(async () => {
     const out = { cap: !!capsCache.sql_export };
     const v = document.querySelector(".view");
@@ -2350,6 +2388,10 @@ try {
     out.card = !!card;
     if (!card) return out;
     const input = card.querySelector("input");
+    // The lane renders neither input nor Build while a build is running (it
+    // hands off to the run region). Say so, rather than dereferencing null
+    // and turning a named failure into a stack trace.
+    if (!input) { out.running = true; return out; }
     out.prefilled = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(input.value);
     // Before any build the download must refuse with words, not stream bytes.
     const headers = TOKEN ? { Authorization: ["Bearer", TOKEN].join(" ") } : {};

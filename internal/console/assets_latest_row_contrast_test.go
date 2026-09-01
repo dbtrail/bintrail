@@ -24,18 +24,18 @@ const latestRowGround = "violet-tint"
 
 // What the newest row renders. Kept explicit because one of these is NOT
 // visible from the row builder: .bk-where is produced by backupWhereChip(),
-// several hundred lines away, and a regex over the builder block would miss
+// well over a hundred lines away, and a regex over the builder block would miss
 // exactly the child that was worst off. latestRowChildrenAreAllListed below
 // is the anti-rot half -- a class appended directly to the row fails until
 // it is named here.
 var latestRowChildren = []string{
-	"tag-pill",  // "Newest"
-	"stg-name",  // the timestamp
-	"stg-rel",   // the age
-	"stg-dest",  // tables / binlog coordinates
-	"chip-mon",  // staleness, newest row only
-	"bk-where",  // from backupWhereChip()
-	"bk-chev",   // the expand affordance
+	"tag-pill", // "Newest"
+	"stg-name", // the timestamp
+	"stg-rel",  // the age
+	"stg-dest", // tables / binlog coordinates
+	"chip-mon", // staleness, newest row only
+	"bk-where", // from backupWhereChip()
+	"bk-chev",  // the expand affordance
 }
 
 func TestNewestBackupRowClearsItsFloorOnTheTint(t *testing.T) {
@@ -44,7 +44,12 @@ func TestNewestBackupRowClearsItsFloorOnTheTint(t *testing.T) {
 	for _, class := range latestRowChildren {
 		tok := effectiveDecl(css, class, "color")
 		if tok == "" {
-			continue // inherits from the row; the row's own ink is covered by the tint-token test
+			// Genuinely inherits: it declares no colour of its own anywhere.
+			// This used to be reached by .chip-mon too, not because it
+			// inherits (it sets --orange-2) but because its rule is written
+			// as the compound .chip.chip-mon and the lookup missed it. See
+			// selectorTargets.
+			continue
 		}
 		// A child may bring its own ground (the pill does, and must: see the
 		// .tcard-violet precedent). Measure against whatever it actually sits
@@ -54,9 +59,13 @@ func TestNewestBackupRowClearsItsFloorOnTheTint(t *testing.T) {
 			ground, groundName = anyToken(t, css, bg), bg
 		}
 		if r := wcagRatioHex(anyToken(t, css, tok), ground); r < 4.5 {
-			t.Errorf(".stg-row-latest .%s renders var(--%s) on --%s = %.2f:1, below the 4.5:1 "+
-				"floor. The tint is not optional (it marks the copy in use), so the fix is to "+
-				"override this child under .stg-row-latest, not to drop the tint.", class, tok, groundName, r)
+			why := "The tint is not optional (it marks the copy in use), so the fix is to override " +
+				"this child under .stg-row-latest, not to drop the tint."
+			if groundName != latestRowGround {
+				why = "That is this child's OWN ground, so the row is not what put it under the floor."
+			}
+			t.Errorf(".stg-row-latest .%s renders var(--%s) on --%s = %.2f:1, below the 4.5:1 floor. %s",
+				class, tok, groundName, r, why)
 		}
 	}
 }
@@ -96,10 +105,38 @@ func TestNewestBackupRowChildrenAreAllListed(t *testing.T) {
 	for _, c := range latestRowChildren {
 		known[c] = true
 	}
-	for _, m := range regexp.MustCompile(`class: "([^"]+)"`).FindAllStringSubmatch(js[start:end], -1) {
-		for _, c := range strings.Fields(m[1]) {
-			if c == "stg-row" || c == "stg-row-latest" || c == "bk-detail" ||
-				c == "mono" || c == "chip" || c == "bk-expandable" || known[c] {
+	defined := definedClasses(string(readStyleCSS(t)))
+	skip := map[string]bool{"stg-row": true, "stg-row-latest": true, "bk-detail": true,
+		"mono": true, "chip": true, "bk-expandable": true}
+	// Every quoted string in the span, not just class: "...". The row builds
+	// one child as tsSpan("stg-name mono", ...) -- a class list passed
+	// POSITIONALLY, which a class:-anchored regex cannot see, and .stg-name is
+	// one of the very children this check exists to keep honest. A string
+	// counts as a class list when every one of its tokens is a class the
+	// stylesheet defines, which no prose string satisfies.
+	for _, m := range regexp.MustCompile(`"([^"\n]+)"`).FindAllStringSubmatch(js[start:end], -1) {
+		fields := strings.Fields(m[1])
+		if len(fields) == 0 {
+			continue
+		}
+		// A single bare word is rejected even when it names a class: the row
+		// compares sn.staleness against "ok", and .ok exists, so accepting it
+		// made the guard fail on a literal that renders nothing. Requiring a
+		// hyphen or a second token separates this file's class vocabulary
+		// (stg-name, bk-chev) from English. The gap that leaves: a positional
+		// single-word un-hyphenated class would still be missed.
+		looksLikeClasses := len(fields) > 1 || strings.Contains(fields[0], "-")
+		for _, f := range fields {
+			if !defined[f] {
+				looksLikeClasses = false
+				break
+			}
+		}
+		if !looksLikeClasses {
+			continue
+		}
+		for _, c := range fields {
+			if skip[c] || known[c] {
 				continue
 			}
 			t.Errorf("the newest backup row renders .%s, which no contrast check covers. Add it to "+
@@ -124,7 +161,13 @@ func effectiveDecl(css, class, prop string) string {
 }
 
 // ruleBody returns the declarations of the first rule whose selector list
-// contains sel as a whole selector.
+// contains sel.
+//
+// "Contains" is compound-aware, and that is not a nicety: the staleness chip's
+// rule is written `.chip.chip-mon`, so an exact string comparison found
+// nothing, effectiveDecl returned "" and the caller skipped the child while
+// still listing it as covered. A guard that reports six of seven measured is
+// worse than one that measures six, because the seventh looks guarded.
 func ruleBody(css, sel string) string {
 	// Comments are stripped first: splitting raw CSS on "}" leaves the comment
 	// that documents a rule glued to the front of its selector, so every
@@ -136,8 +179,8 @@ func ruleBody(css, sel string) string {
 		if open < 0 {
 			continue
 		}
-		for _, s := range strings.Split(block[:open], ",") {
-			if strings.TrimSpace(s) == sel {
+		for _, cand := range strings.Split(block[:open], ",") {
+			if selectorTargets(strings.TrimSpace(cand), sel) {
 				return block[open+1:]
 			}
 		}
@@ -179,4 +222,49 @@ func TestNewestBackupRowPillMatchesTheOtherVioletPill(t *testing.T) {
 
 func norm(decls string) string {
 	return strings.Join(strings.Fields(strings.ReplaceAll(decls, "\n", " ")), " ")
+}
+
+// selectorTargets reports whether CSS selector cand styles the element that
+// sel names. Both are compared descendant-part by descendant-part, and the
+// LAST part is compared as a SET of classes: `.chip.chip-mon` targets
+// `.chip-mon`, and `.stg-row-latest .chip.chip-mon` targets
+// `.stg-row-latest .chip-mon`. Anything with a pseudo, an attribute or a
+// combinator is left alone -- those style a state, not the resting element
+// this file measures.
+func selectorTargets(cand, sel string) bool {
+	if strings.ContainsAny(cand, ":[>+~*") {
+		return cand == sel
+	}
+	cp, sp := strings.Fields(cand), strings.Fields(sel)
+	if len(cp) != len(sp) {
+		return false
+	}
+	for i := range cp {
+		if i < len(cp)-1 {
+			if cp[i] != sp[i] {
+				return false
+			}
+			continue
+		}
+		have := map[string]bool{}
+		for _, c := range strings.Split(strings.TrimPrefix(cp[i], "."), ".") {
+			have[c] = true
+		}
+		for _, want := range strings.Split(strings.TrimPrefix(sp[i], "."), ".") {
+			if !have[want] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// definedClasses collects every class name the stylesheet defines, which is
+// what lets the scan above tell a class list from any other string literal.
+func definedClasses(css string) map[string]bool {
+	out := map[string]bool{}
+	for _, m := range regexp.MustCompile(`\.([a-zA-Z][a-zA-Z0-9_-]*)`).FindAllStringSubmatch(css, -1) {
+		out[m[1]] = true
+	}
+	return out
 }

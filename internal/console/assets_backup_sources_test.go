@@ -105,7 +105,7 @@ func TestBackupJobCardsOfferOnlyWhatTheirJobCanRead(t *testing.T) {
 	exportCard := stripJSLineComments(functionBody(t, js, "function backupSQLLane("))
 	if strings.Contains(exportCard, "cur.baseline_dir") {
 		t.Error("the .sql lane gates on cur.baseline_dir, which is the RAW registry entry. " +
-			"A server inheriting the daemon-wide backup location has none, so the card either " +
+			"A server inheriting the daemon-wide backup location has none, so the lane either " +
 			"vanishes or defaults to a snapshot the build cannot read")
 	}
 	if !strings.Contains(exportCard, `backupSnapshotsFor(b, b.kind === "dir" ? "dir" : "s3")`) {
