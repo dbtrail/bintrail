@@ -2112,6 +2112,30 @@ button { font-family: inherit; }
    treatment; relative age rides beside the absolute time */
 .stg-row-latest { background: var(--violet-tint); border-radius: var(--radius-sm); }
 .stg-rel { font-family: var(--f-mono); font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+/* The newest row is the one tint on this page, so everything it carries has
+   to survive the ground it sits on. Measured with this file's own converter
+   (assets_tint_contrast_test.go), on --violet-tint: --ink-3 is 4.20:1 and
+   --ink-4 is 2.80:1. That put the row's age, its location chip and its
+   chevron all under their floor the moment the tint went on, and the tint
+   is not optional: it marks the copy a restore actually reads.
+
+   The pill is a different case and is NOT a contrast fix, so do not read it
+   as one. Its default ink-2 on surface-3 measures 6.74:1 and was always
+   legible; what it lost on this ground was its EDGE (surface-3 against the
+   tint is 1.09:1). White barely moves that (1.18:1). It takes the white
+   ground because .tcard-violet .tag-pill already does, and one pill on one
+   tint should not have two looks. */
+.stg-row-latest .stg-rel  { color: var(--ink-2); }
+.stg-row-latest .bk-where { color: var(--ink-2); }
+.stg-row-latest .bk-chev  { color: var(--ink-2); }
+.stg-row-latest .tag-pill { background: var(--surface); color: var(--violet-deep); }
+/* Hover must not erase the mark. --surface-2 is LIGHTER than the tint, so
+   pointing at the newest row used to remove the one thing distinguishing
+   it. Keep the ground, add a ring. */
+.stg-row-latest.bk-expandable:hover {
+  background: var(--violet-tint);
+  box-shadow: inset 0 0 0 1px var(--violet-line);
+}
 .vfy-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 /* Verify explain modal: a wider modal + doctor-cards for each diverging row,
