@@ -4644,6 +4644,84 @@ function icebergComposeNote(cur) {
     ", set INDEX_DSN and BASELINE_DIR or BASELINE_S3 in the stack's .env file.";
 }
 
+// ICEBERG_ENGINES is the payoff, drawn as the names an analyst already knows
+// rather than claimed in a sentence. Prose, not derived from anything: the
+// export writes standard Iceberg, so this is which readers we say it out loud
+// for, and it is edited by hand when that answer changes.
+const ICEBERG_ENGINES = ["Spark", "Trino", "Athena", "Snowflake", "DuckDB"];
+
+// ICEBERG_PLACEHOLDERS labels the two blanks in the command instead of
+// describing them in a paragraph under it.
+//
+// Each key must appear VERBATIM in what icebergExportCommand builds, and a
+// test asserts exactly that: a legend pointing at text that is not on the line
+// above it is worse than no legend, because the reader hunts for it. This is
+// the "a drawing can lie in a way prose cannot" discipline that claudeAskMock
+// carries against the bundle manifest.
+//
+// Filtered by what the rendered command actually holds, because the password
+// blank is absent for an index that needs none, and a legend for a blank that
+// is not there describes somebody else's command.
+const ICEBERG_PLACEHOLDERS = [
+  ["***", "your index password"],
+  ["/path/to/warehouse", "a folder you pick"],
+];
+
+// icebergFlow draws what the export makes and who reads it: three stages, left
+// to right. It replaces the opening paragraph, which said the same thing in
+// three sentences that a reader skimming a settings page does not read.
+function icebergFlow() {
+  const stage = (title, sub) => el("div", { class: "ice-stage" },
+    el("div", { class: "ice-stage-t", text: title }),
+    el("div", { class: "ice-stage-s", text: sub }));
+  const arrow = () => el("div", { class: "ice-arrow", text: "\u2192" });
+  const engines = el("div", { class: "ice-stage" },
+    el("div", { class: "ice-stage-t", text: "Read directly by" }),
+    el("div", { class: "ice-eng" },
+      ...ICEBERG_ENGINES.map((n) => el("span", { class: "ice-eng-n", text: n }))));
+  return el("div", { class: "ice-flow" },
+    stage("This server's history", "a snapshot, plus every change since"),
+    arrow(),
+    stage("Iceberg tables", "in a folder you pick"),
+    arrow(),
+    engines);
+}
+
+// icebergRuns draws the incremental behaviour as two bars, because the shape
+// IS the message: the first run is the expensive one and every run after it is
+// small. That is what makes "as fresh as you schedule it" believable, and it
+// was the clause of the old paragraph most likely to be skipped.
+function icebergRuns() {
+  const row = (label, barClass, note) => [
+    el("span", { class: "ice-run-l", text: label }),
+    el("span", { class: "ice-run-b" },
+      el("span", { class: "ice-bar " + barClass }),
+      el("span", { class: "ice-run-n", text: note })),
+  ];
+  return el("div", { class: "ice-runs" },
+    ...row("First run", "ice-bar-full", "loads the whole snapshot"),
+    ...row("Every run after", "ice-bar-delta", "adds only what changed"));
+}
+
+// icebergKeys labels the blanks in the command that was just printed.
+function icebergKeys(cmd) {
+  const keys = ICEBERG_PLACEHOLDERS.filter(([k]) => cmd.includes(k));
+  if (!keys.length) return null;
+  return el("div", { class: "ice-keys" },
+    ...keys.map(([k, what]) => el("span", { class: "ice-key" },
+      el("code", { class: "stg-code", text: k }),
+      el("span", { text: what }))));
+}
+
+// icebergExportPanel: a drawing, the command, and one warning.
+//
+// It used to open with four paragraphs before the command and keep two more
+// after it. Everything that was an EXPLANATION is now either drawn (what it
+// makes, who reads it, what a run costs) or moved into "How to run it", where
+// a reader who is actually about to run it will look. Only one paragraph stays
+// in the open, and it is the only one that is a HAZARD rather than a
+// description: the Docker route can export a different dataset than the one
+// this panel just described, and succeed while doing it.
 function icebergExportPanel(cur, baselines) {
   const cmd = icebergExportCommand(cur, baselines);
   if (!cmd) return null;
@@ -4652,28 +4730,29 @@ function icebergExportPanel(cur, baselines) {
     el("h2", { class: "ov-panel-title", text: "Keep it current with Iceberg" })));
   const body = el("div", { class: "cn-sql-body" });
   panel.append(body);
-  body.append(el("p", { class: "cn-sql-row", text:
-    "Write these backups, and every change recorded since, as Apache Iceberg tables. Spark, Trino, Athena, " +
-    "Snowflake and DuckDB read them directly. The first run loads the newest backup; every run after that " +
-    "adds only what changed, so a report can be as fresh as you schedule it." }));
-  body.append(el("p", { class: "cn-sql-row", text:
-    "It is a command and not a button because the export writes a new copy of your data, and it is kept out " +
-    "of the process that captures changes so a long export can never slow capture down." }));
+  body.append(icebergFlow());
+  body.append(icebergRuns());
   body.append(el("div", { class: "cn-urlrow" },
     el("code", { class: "stg-code cn-url", text: cmd }),
     el("button", { class: "btn btn-sm", type: "button", text: "Copy",
       onclick: () => copyText(cmd, "Export command") })));
-  body.append(el("p", { class: "cn-sql-row", text:
-    "Put the index password in place of *** and choose a folder in place of /path/to/warehouse. " +
-    "Nothing is sent anywhere: the tables are written where you point it." }));
-  body.append(el("p", { class: "cn-sql-row", text:
-    "The line carries the index host, port, database and user, and nothing else about the connection. " +
-    "If your index needs settings this console was given, such as TLS or a timeout, add them yourself." }));
+  const keys = icebergKeys(cmd);
+  if (keys) body.append(keys);
   // In the visible body, not inside the collapsed block: for a server that is
   // not the stack's own, the Docker route exports a DIFFERENT dataset and
   // succeeds while doing it, which is the one failure here nobody would see.
   body.append(el("p", { class: "cn-sql-row", text: icebergComposeNote(cur) }));
   body.append(cnFine("How to run it",
+    // Moved down from the open body. Both are answers to questions a reader
+    // has only once they are about to run the line, and one of them ("why is
+    // this not a button") is a justification, which is the first thing to go
+    // when the page is too dense to read.
+    el("p", { class: "form-hint", text:
+      "It is a command and not a button because the export writes a new copy of your data, and it is kept out " +
+      "of the process that captures changes so a long export can never slow capture down." }),
+    el("p", { class: "form-hint", text:
+      "The line carries the index host, port, database and user, and nothing else about the connection. " +
+      "If your index needs settings this console was given, such as TLS or a timeout, add them yourself." }),
     // The address and the path are as THIS process sees them, and in the
     // bundled stack both are container-scoped (index-mysql:3306,
     // /var/lib/bintrail/baselines): pasted into a host shell they resolve to

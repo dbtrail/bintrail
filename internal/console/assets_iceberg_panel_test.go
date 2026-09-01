@@ -358,3 +358,103 @@ func TestCIRequiresNodeForTheRenderedCommand(t *testing.T) {
 			"and leave icebergExportCommand with no executing coverage", path, requireNodeEnv)
 	}
 }
+
+// TestIcebergLegendMatchesTheCommandItLabels pins the drawing to its source.
+//
+// The legend under the command is FILTERED by what the command holds
+// (`cmd.includes(k)`), which is right — the password blank is absent for an
+// index that needs none — and which fails OPEN in exactly one way: change the
+// placeholder in icebergExportCommand and every label quietly stops rendering.
+// Nothing on screen looks broken, the panel just goes back to printing an
+// unexplained line, and no assertion in this file would notice.
+//
+// So the guard is not "the keys are consistent with themselves" but "a command
+// that should show BOTH of them does". This is the claudeAskMock discipline:
+// a drawing can be wrong in a way prose cannot, so it is tied to the thing it
+// depicts.
+func TestIcebergLegendMatchesTheCommandItLabels(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		if os.Getenv(requireNodeEnv) != "" {
+			t.Fatalf("%s is set and node is not on PATH: the legend would go unchecked", requireNodeEnv)
+		}
+		t.Skip("node is not installed; the legend is not covered on this machine")
+	}
+	raw, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+
+	keys := icebergPlaceholderKeys(t, js)
+	if len(keys) < 2 {
+		t.Fatalf("ICEBERG_PLACEHOLDERS holds %d key(s); the legend exists to label the "+
+			"password and the warehouse path, so this guard covers nothing", len(keys))
+	}
+
+	script := functionBody(t, js, "function shellWord(") + "\n" +
+		functionBody(t, js, "function icebergExportCommand(") + `
+console.log(icebergExportCommand(
+  {host: "db.internal", port: "3307", user: "reader", dbname: "idx", has_password: true},
+  {source: "/data/baselines", kind: "dir"}));
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legend.js")
+	if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(node, path).Output()
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	cmd := strings.TrimSpace(string(out))
+
+	for _, k := range keys {
+		if !strings.Contains(cmd, k) {
+			t.Errorf("the legend labels %q, which the command does not contain:\n  %s\n"+
+				"the label is filtered out by cmd.includes(), so it silently stops rendering", k, cmd)
+		}
+	}
+
+	// And the legend is actually reached. Every check above passes on a panel
+	// that never calls it.
+	panel := functionBody(t, js, "function icebergExportPanel(")
+	if !strings.Contains(panel, "icebergKeys(cmd)") {
+		t.Error("the panel never builds the legend, so the command's blanks go unlabelled")
+	}
+	if !strings.Contains(panel, "icebergFlow()") || !strings.Contains(panel, "icebergRuns()") {
+		t.Error("the panel does not draw the flow and the run shapes; without them it is " +
+			"a bare command with no statement of what it produces")
+	}
+}
+
+// icebergPlaceholderKeys reads the first element of each ICEBERG_PLACEHOLDERS
+// pair straight out of app.js, so the test cannot drift from the constant by
+// carrying its own copy.
+func icebergPlaceholderKeys(t *testing.T, js string) []string {
+	t.Helper()
+	const marker = "const ICEBERG_PLACEHOLDERS = ["
+	i := strings.Index(js, marker)
+	if i < 0 {
+		t.Fatal("ICEBERG_PLACEHOLDERS is gone from app.js; the legend has no source to check")
+	}
+	block := js[i+len(marker):]
+	end := strings.Index(block, "];")
+	if end < 0 {
+		t.Fatal("ICEBERG_PLACEHOLDERS is not closed; cannot read its keys")
+	}
+	var keys []string
+	for _, line := range strings.Split(block[:end], "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, `["`) {
+			continue
+		}
+		rest := line[2:]
+		j := strings.Index(rest, `"`)
+		if j < 0 {
+			t.Fatalf("cannot read the key out of %q", line)
+		}
+		keys = append(keys, rest[:j])
+	}
+	return keys
+}
