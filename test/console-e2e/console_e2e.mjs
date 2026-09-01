@@ -3949,6 +3949,40 @@ try {
     ? ok("tropical: config cards rotate through the home's tint palette")
     : bad("tropical: config cards rotate through the home's tint palette", JSON.stringify(tints));
 
+  // ── Scenario 17g2 — a .cards row leaves no empty track ──
+  // The grid was repeat(3, 1fr), which is right only for the pages that carry
+  // three cards. After the #1543 split Retention and Backups carry one and
+  // This daemon two, so a third of the row was card and the rest was nothing.
+  //
+  // Measured on the RENDERED boxes, not on the rule: a stylesheet that reads
+  // auto-fit still leaves a hole when its min track is wider than the space a
+  // lone card can stretch into, and only the geometry can tell those apart.
+  // The property is the one a reader sees: the cards on the first row, plus
+  // the gaps between them, add up to the grid they sit in.
+  //
+  // Retention runs FIRST and daemon LAST, because Scenario 17h below picks up
+  // "still on /daemon".
+  const rowFill = [];
+  for (const route of ["retention", "daemon"]) {
+    await page.evaluate((r) => navigate(r), route);
+    await page.waitForFunction(() => document.querySelectorAll(".cards .card").length >= 1, { timeout: 10000 });
+    rowFill.push(await page.evaluate((r) => {
+      const g = document.querySelector(".cards");
+      const gw = g.getBoundingClientRect().width;
+      const boxes = Array.from(g.children).map((c) => c.getBoundingClientRect());
+      const top = Math.min(...boxes.map((b) => Math.round(b.top)));
+      const row = boxes.filter((b) => Math.round(b.top) === top);
+      const gap = parseFloat(getComputedStyle(g).columnGap) || 0;
+      const used = row.reduce((s, b) => s + b.width, 0) + gap * (row.length - 1);
+      return { route: r, cards: row.length, left: Math.round(gw - used) };
+    }, route));
+  }
+  // 2px of slack for sub-pixel track rounding; the failure this catches is a
+  // whole empty track (361px on a 1084px grid), not a rounding remainder.
+  rowFill.every((r) => r.cards >= 1 && r.left <= 2)
+    ? ok("layout: a row of config cards fills its grid, whatever the count")
+    : bad("layout: a row of config cards fills its grid, whatever the count", JSON.stringify(rowFill));
+
   // ── Scenario 17h — the telemetry card shows the exact sample event (#1447) ──
   // Still on /daemon. The "Show a sample event" fold must be closed by
   // default, open on click, and carry the daemon's `sample_event` string

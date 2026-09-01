@@ -971,7 +971,23 @@ button { font-family: inherit; }
 /* ============================================================
    status cards
    ============================================================ */
-.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+/* auto-fit, not a fixed 3, because the pages that use this grid no longer all
+   carry three cards: the #1543 split left Retention and Backups with exactly
+   one, so a third of the row was card and two thirds were nothing, and This
+   daemon carries two when its staging card does not render. auto-fit (never auto-fill) is what closes that: empty tracks
+   collapse, so a lone card takes the whole row instead of a third of it.
+
+   The 260px floor is measured, not chosen. The content column caps at 1084px,
+   where three cards are 349px each, and the existing 880px breakpoint below
+   already forces a single column. Between those, three fixed columns squeezed
+   each card to 207px at a 1000px viewport and 167px at 881px. 260 keeps three
+   across at every width where they were readable (1084 and 936 grids are
+   unchanged, three cards at 349 and 300) and wraps only below that, where the
+   fixed grid was producing cards too narrow to read.
+
+   Card tints rotate on :nth-child (see the four rules further down), which is
+   DOM order, so wrapping cannot change which card gets which colour. */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; }
 .card {
   background: var(--panel-bg);
   border: 1px solid var(--panel-border);
