@@ -4644,11 +4644,19 @@ function icebergComposeNote(cur) {
     ", set INDEX_DSN and BASELINE_DIR or BASELINE_S3 in the stack's .env file.";
 }
 
-// ICEBERG_ENGINES is the payoff, drawn as the names an analyst already knows
-// rather than claimed in a sentence. Prose, not derived from anything: the
-// export writes standard Iceberg, so this is which readers we say it out loud
-// for, and it is edited by hand when that answer changes.
-const ICEBERG_ENGINES = ["Spark", "Trino", "Athena", "Snowflake", "DuckDB"];
+// The payoff, drawn as the names an analyst already knows rather than claimed
+// in a sentence — and SPLIT, because "read them directly" is true of two of the
+// five. docs/iceberg-export.md says it plainly: "DuckDB and Spark read such a
+// directory directly. Trino, Athena and Snowflake read Iceberg through a
+// catalog, so with them you register the table's current metadata file ...
+// rather than pointing at the path."
+//
+// The old prose said all five read them directly and got away with it as a
+// hedgeable sentence. Rendered as five chips under a heading that IS the claim,
+// it stops being hedgeable. A guard ties both lists to that doc paragraph, so
+// the drawing cannot drift away from what we tell people elsewhere.
+const ICEBERG_ENGINES_DIRECT = ["DuckDB", "Spark"];
+const ICEBERG_ENGINES_CATALOG = ["Trino", "Athena", "Snowflake"];
 
 // ICEBERG_PLACEHOLDERS labels the two blanks in the command instead of
 // describing them in a paragraph under it.
@@ -4675,10 +4683,14 @@ function icebergFlow() {
     el("div", { class: "ice-stage-t", text: title }),
     el("div", { class: "ice-stage-s", text: sub }));
   const arrow = () => el("div", { class: "ice-arrow", text: "\u2192" });
+  const chips = (names) => el("div", { class: "ice-eng" },
+    ...names.map((n) => el("span", { class: "ice-eng-n", text: n })));
   const engines = el("div", { class: "ice-stage" },
-    el("div", { class: "ice-stage-t", text: "Read directly by" }),
-    el("div", { class: "ice-eng" },
-      ...ICEBERG_ENGINES.map((n) => el("span", { class: "ice-eng-n", text: n }))));
+    el("div", { class: "ice-stage-t", text: "Read by" }),
+    el("div", { class: "ice-eng-l", text: "straight off the folder" }),
+    chips(ICEBERG_ENGINES_DIRECT),
+    el("div", { class: "ice-eng-l", text: "through a catalog" }),
+    chips(ICEBERG_ENGINES_CATALOG));
   return el("div", { class: "ice-flow" },
     // "newest backup", not "the whole snapshot": the old paragraph said WHICH
     // backup the first run consumes, and a reader looking at a list of them on
@@ -4732,8 +4744,9 @@ function icebergKeys(cmd) {
 
 // icebergExportPanel: a drawing, the command, and one warning.
 //
-// It used to open with four paragraphs before the command and keep two more
-// after it. Everything that was an EXPLANATION is now either drawn (what it
+// It used to open with two paragraphs before the command and keep three after
+// it, the last of them the compose note. Everything that was an EXPLANATION is
+// now either drawn (what it
 // makes, who reads it, what a run costs) or moved into "How to run it", where
 // a reader who is actually about to run it will look. Only one paragraph stays
 // in the open, and it is the only one that is a HAZARD rather than a

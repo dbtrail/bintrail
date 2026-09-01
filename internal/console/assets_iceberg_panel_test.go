@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -457,6 +458,12 @@ func icebergPlaceholderKeys(t *testing.T, js string) []string {
 			continue
 		}
 		candidates++
+		// More than one entry on a line is the shape a per-line scanner reads
+		// as ONE. Counted here rather than parsed, because the fix is to write
+		// them one per line, not to teach this more grammar.
+		if n := strings.Count(line, `["`); n > 1 {
+			candidates += n - 1
+		}
 		if !strings.HasPrefix(line, `["`) {
 			continue
 		}
@@ -478,8 +485,11 @@ func icebergPlaceholderKeys(t *testing.T, js string) []string {
 
 // TestAppendedPanelCSSPaintsNoBrandWarmth covers a range the brand guard cannot.
 //
-// assets_brandpaint_test.go scans only the marker-delimited #1385 block, so any
-// rule appended at the END of style.css is structurally invisible to it. The
+// The brand-COLOUR guards in assets_brandpaint_test.go read only the
+// marker-delimited #1385 block (brandSection), so a rule appended at the END of
+// style.css is structurally invisible to them. Not every test in that file is
+// so scoped — TestTransparentInkStaysBehindABackgroundClipSupportsTest reads the
+// whole file — but the ones enforcing this rule are. The
 // rule those tests enforce is stated in style.css itself: the warm palette is
 // worn across the chrome and "never encode[s] data ... pink never lands on a
 // surface that carries a row".
@@ -505,21 +515,39 @@ func TestAppendedPanelCSSPaintsNoBrandWarmth(t *testing.T) {
 	if !strings.Contains(block, ".ice-bar-full") {
 		t.Fatal("the run bars are not in the block this guard reads")
 	}
-	// Declarations only. The block's own comments carry issue numbers, and a
-	// bare "#" scan would match those and fail on prose.
+	// Declarations only: the block's own comments carry issue numbers, and a bare
+	// "#" scan would match those and fail on prose. Tracked as a STATE rather
+	// than per-line prefixes, because a /* */ comment's continuation lines start
+	// with ordinary words and a prefix filter keeps them — which is the failure
+	// this filter exists to avoid, one line down.
 	var decls strings.Builder
+	inComment := false
 	for _, line := range strings.Split(block, "\n") {
-		if t := strings.TrimSpace(line); strings.HasPrefix(t, "/*") || strings.HasPrefix(t, "*") ||
-			strings.HasPrefix(t, "//") || t == "" {
+		trimmed := strings.TrimSpace(line)
+		if inComment {
+			if strings.Contains(line, "*/") {
+				inComment = false
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "//") || trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "/*") {
+			if !strings.Contains(line, "*/") {
+				inComment = true
+			}
 			continue
 		}
 		decls.WriteString(line)
 		decls.WriteString("\n")
 	}
 	body := decls.String()
-	// A raw colour literal is the tell. Every legitimate value here is a token
-	// the console already defines, so a rule that spells a colour out is either
-	// brand warmth or a value that will not follow the palette.
+	// Two checks, because brand warmth reaches a rule two ways and a denylist of
+	// colour LITERALS only closes one of them. style.css:137 defines
+	// --brand-warm as the very pink-to-peach gradient that was removed from the
+	// run bars, so `background: var(--brand-warm)` restores the exact visual
+	// while spelling no colour at all.
 	for _, lit := range []string{"oklch(", "rgb(", "hsl(", "#0", "#1", "#2", "#3", "#4",
 		"#5", "#6", "#7", "#8", "#9", "#a", "#b", "#c", "#d", "#e", "#f"} {
 		if strings.Contains(strings.ToLower(body), lit) {
@@ -528,4 +556,101 @@ func TestAppendedPanelCSSPaintsNoBrandWarmth(t *testing.T) {
 				"never encodes data; use a var(--ink-*) / var(--line*) / var(--surface*) token.", lit)
 		}
 	}
+	// An ALLOWLIST for the tokens, which is what the message above already
+	// tells the author. A denylist of brand names would need updating every
+	// time the palette grows a colour.
+	for _, m := range regexp.MustCompile(`var\(\s*(--[a-z0-9-]+)`).FindAllStringSubmatch(body, -1) {
+		name := m[1]
+		if strings.HasPrefix(name, "--ink") || strings.HasPrefix(name, "--line") ||
+			strings.HasPrefix(name, "--surface") {
+			continue
+		}
+		t.Errorf("the Iceberg panel CSS uses %s. Its run bars encode a magnitude with their "+
+			"WIDTHS, and style.css's own rule is that the warm palette never encodes data; "+
+			"only --ink-* / --line* / --surface* belong here.", name)
+	}
+}
+
+// TestIcebergFlowStatesWhatTheExportActuallyProduces pins the two claims the
+// drawing pass dropped and 3c5a6f2 put back, plus the engine split.
+//
+// Nothing pinned them before: the legend guard checks only that icebergFlow is
+// CALLED, never what it renders, so the same edit that lost them once could
+// lose them again with the suite green. The compose note next door is guarded
+// down to body-vs-fold placement; these are the panel's other two load-bearing
+// claims and they had nothing.
+func TestIcebergFlowStatesWhatTheExportActuallyProduces(t *testing.T) {
+	raw, err := os.ReadFile("assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+	flow := functionBody(t, js, "function icebergFlow(")
+	runs := functionBody(t, js, "function icebergRuns(")
+
+	if !strings.Contains(flow, "newest backup") || !strings.Contains(runs, "newest backup") {
+		t.Error("the panel no longer says WHICH backup the first run loads; a reader looking at " +
+			"a list of them on this very page cannot work that out from \"the whole snapshot\"")
+	}
+	if !strings.Contains(flow, "nowhere else") {
+		t.Error("the panel no longer answers where the tables go. For an EXPORT feature that is " +
+			"the one thing a cautious operator asks while standing here")
+	}
+
+	// The engine split against the paragraph it paraphrases. A drawing can be
+	// wrong in a way prose cannot, and "read them directly" is true of two of
+	// the five.
+	docs, err := os.ReadFile("../../docs/iceberg-export.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := string(docs)
+	direct, catalog := "read such a directory directly", "read Iceberg through a catalog"
+	di, ci := strings.Index(d, direct), strings.Index(d, catalog)
+	if di < 0 || ci < 0 || di >= ci {
+		t.Fatalf("docs/iceberg-export.md no longer carries the two sentences this guard reads "+
+			"(direct at %d, catalog at %d); the engine split has no source to check against", di, ci)
+	}
+	// Windowed, not searched. These names appear all over the document, so a
+	// plain Index finds an unrelated earlier mention and grades every engine
+	// against the wrong sentence.
+	dEnd := di + len(direct)
+	dStart := strings.LastIndex(d[:di], ".") + 1
+	directSentence, catalogSentence := d[dStart:dEnd], d[dEnd:ci+len(catalog)]
+	for _, name := range icebergEngineNames(t, js, "ICEBERG_ENGINES_DIRECT") {
+		if !strings.Contains(directSentence, name) {
+			t.Errorf("the panel says %s reads the folder straight off, but the docs sentence that "+
+				"says so does not name it:\n  %s", name, strings.TrimSpace(directSentence))
+		}
+	}
+	for _, name := range icebergEngineNames(t, js, "ICEBERG_ENGINES_CATALOG") {
+		if !strings.Contains(catalogSentence, name) {
+			t.Errorf("the panel says %s reads through a catalog, but the docs sentence that says "+
+				"so does not name it:\n  %s", name, strings.TrimSpace(catalogSentence))
+		}
+	}
+}
+
+func icebergEngineNames(t *testing.T, js, constName string) []string {
+	t.Helper()
+	marker := "const " + constName + " = ["
+	i := strings.Index(js, marker)
+	if i < 0 {
+		t.Fatalf("%s is gone from app.js; the engine split has nothing to check", constName)
+	}
+	rest := js[i+len(marker):]
+	end := strings.Index(rest, "]")
+	if end < 0 {
+		t.Fatalf("%s is not closed", constName)
+	}
+	var out []string
+	for _, part := range strings.Split(rest[:end], ",") {
+		if v := strings.Trim(strings.TrimSpace(part), `"`); v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("%s is empty; this guard covers nothing", constName)
+	}
+	return out
 }
