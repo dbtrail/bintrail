@@ -20,10 +20,17 @@ import (
 // consent for that is taken.
 //
 // The old shape put liveness in a kv row, as "this page (live)", and this
-// guard pinned that ternary. The rewrite deleted the rows, so the guard now
-// pins the property instead of the mechanism: liveness is produced by the
-// br.enabled / br.scheduled line and NOWHERE else, and the provenance line
-// answers only who chose the value.
+// guard pinned that ternary. The rewrite deleted the rows, so this guard now
+// covers ONE half of the property: the provenance line answers who chose the
+// value and says nothing about whether it runs.
+//
+// It is deliberately NOT the whole property. Everything the card renders
+// before the provenance line is outside the window, so a state pill reading
+// "On, live and running now" passes here. The whole-card version is the e2e
+// scenario "backups: the disk-space card reports every state it can be in",
+// which renders the real function across all 16 DTOs and asserts no rendered
+// text carries a liveness word. This guard is the cheap unit-level half; do
+// not delete the e2e believing this one covers it.
 func TestBackupRefreshCard_neverClaimsLiveWhileDormant(t *testing.T) {
 	// jsFunctionBody, not functionBody: it strips comment lines before walking.
 	// These guards search for the rendered LABELS, and this function documents
@@ -40,8 +47,16 @@ func TestBackupRefreshCard_neverClaimsLiveWhileDormant(t *testing.T) {
 	if i < 0 {
 		t.Fatal("backupRefreshCard renders no provenance line; this guard covers nothing")
 	}
+	// End at the statement, not at a raw character budget: 300 chars ran past
+	// the say() call into the primary button's label and cut off mid-string, so
+	// a future button reading "Live now" would fail a guard whose message
+	// blames the provenance line. ("now" is a bare substring, so "know" trips
+	// it too.)
 	rest := body[i:]
-	arm := rest[:min(len(rest), 300)]
+	arm := rest
+	if e := strings.Index(rest, ");"); e >= 0 {
+		arm = rest[:e]
+	}
 	for _, w := range []string{"live", "running", "yet", "now"} {
 		if strings.Contains(strings.ToLower(arm), w) {
 			t.Errorf("the provenance line says %q. Whether the setting is running belongs to the "+
@@ -49,8 +64,13 @@ func TestBackupRefreshCard_neverClaimsLiveWhileDormant(t *testing.T) {
 				"setting live and tell the operator nothing runs, in the same card:\n%s", w, arm)
 		}
 	}
-	// The old mechanism, pinned so it cannot come back through a row.
-	if strings.Contains(body, "(live") {
+	// The old mechanism, pinned so it cannot come back through a row. Over the
+	// SPAN, not the body: jsFunctionBody truncates each line at its first "//",
+	// so a must-not-contain over it fails OPEN. A string carrying a URL removes
+	// everything after the scheme's slashes from the body this guard would see
+	// while the browser still renders it, which is how `say("… (live)")` passed
+	// this check when it was written against the body.
+	if strings.Contains(jsFunctionSpan(t, readAsset(t, "app.js"), "backupRefreshCard"), "(live") {
 		t.Error("a `(live` label is back. Liveness in a label next to the value reintroduces the " +
 			"contradiction this guard exists for; keep it in the sentence that owns it")
 	}
@@ -721,6 +741,17 @@ func TestDuckDBCard_titleDoesNotPromiseAQuery(t *testing.T) {
 // and it fails if the exclusion is LIFTED in reconstruct while the card still
 // carries it, because a card that understates what a setting does sends an
 // operator looking for a saving they already have.
+//
+// What it does NOT cover, so nobody reads more into it than it does:
+//
+//   - the WORDING. This side only asserts that some visible string names both
+//     S3 and the machine-local condition, so it passes on a sentence that says
+//     the OPPOSITE about them. The e2e renders the real function across every
+//     state and asserts the sentences; that is where the claim is pinned.
+//   - the exclusion being defeated at the CALLER rather than in the rule, for
+//     instance baselineFoldSource returning the local directory. Nothing here
+//     sees that. internal/reconstruct's own TestCarryForwardEligible covers
+//     the rule itself.
 func TestBackupRefreshCard_saysReuseCannotHappenOnS3(t *testing.T) {
 	body := jsFunctionBody(t, readAsset(t, "app.js"), "backupRefreshCard")
 
@@ -744,8 +775,17 @@ func TestBackupRefreshCard_saysReuseCannotHappenOnS3(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read carryforward.go: %v", err)
 	}
-	const rule = `!strings.HasPrefix(srcPath, "s3://")`
-	if !strings.Contains(string(src), rule) {
+	// Comments stripped first. Reading the raw file let a comment SAYING the
+	// rule was removed ("it used to read !strings.HasPrefix(srcPath, ...) right
+	// here") satisfy the check that the rule is still there, which is the exact
+	// inversion this side of the guard exists to catch.
+	// Anchored BEFORE the literal's own slashes: "s3://" contains a "//", so
+	// the comment strip truncates the real line of code at exactly this point.
+	// That is what makes the anchor work on both sides. A comment quoting the
+	// rule starts with "//" and is removed whole, so it cannot supply it, while
+	// the code line always survives up to here.
+	const rule = `!strings.HasPrefix(srcPath, "s3:`
+	if !strings.Contains(stripGoLineComments(string(src)), rule) {
 		t.Errorf("carryForwardEligible no longer excludes an s3:// previous snapshot (%s is gone), so the "+
 			"card's sentence %q now understates what the setting does. Update the card in the same "+
 			"change that lifts the exclusion", rule, said)
@@ -753,20 +793,42 @@ func TestBackupRefreshCard_saysReuseCannotHappenOnS3(t *testing.T) {
 }
 
 // visibleStrings returns the user-facing strings a card function renders: the
-// text: values and the arguments of its say() helper. Comments are already
-// stripped by jsFunctionBody, so prose quoting a string cannot be mistaken for
-// the string itself.
+// text: values, the arguments of its say() helper, and BOTH arms of a string
+// ternary. The false arm needed its own pattern: a `: "Off" }))` and a
+// `: "Turn on",` are on screen, and a rule anchored on a following paren
+// dropped them, which would let a must-not-contain built on this helper pass
+// on exactly the off and turn-on labels.
+//
+// It is still a best effort over source, not a render. A string assembled by
+// concatenation or held in a variable is invisible to it, so use it for
+// must-CONTAIN checks, which fail closed when it misses one. The e2e renders
+// the real function when the assertion has to be must-NOT-contain.
 func visibleStrings(body string) []string {
 	var out []string
 	for _, re := range []*regexp.Regexp{
 		regexp.MustCompile(`text: "([^"]*)"`),
 		regexp.MustCompile(`say\("([^"]*)"`),
 		regexp.MustCompile(`\? "([^"]*)"`),
-		regexp.MustCompile(`: "([^"]*)"\)`),
+		regexp.MustCompile(`\? "[^"]*"\s*:\s*"([^"]*)"`),
 	} {
 		for _, m := range re.FindAllStringSubmatch(body, -1) {
 			out = append(out, m[1])
 		}
 	}
 	return out
+}
+
+// stripGoLineComments removes // comments so a must-contain over Go source
+// cannot be satisfied by prose quoting the thing it looks for. Crude on
+// purpose: a "//" inside a string literal truncates that line, which can only
+// make a must-contain stricter, never looser.
+func stripGoLineComments(src string) string {
+	var out []string
+	for _, ln := range strings.Split(src, "\n") {
+		if c := strings.Index(ln, "//"); c >= 0 {
+			ln = ln[:c]
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
 }

@@ -440,7 +440,7 @@ These properties are deliberate:
   | `bintrail-console watch` | `--baseline-carry-forward-unchanged`, or `BINTRAIL_BASELINE_CARRY_FORWARD_UNCHANGED` (a true/false value: `1`, `true`, `0`, `false`) |
   | Console | Backups, the **Backups & disk space** card, beside the schedule |
 
-  The console setting overrides the daemon flag and applies on the next cycle without a restart. Once you have saved one there, the card grows a **Use the daemon setting** button that clears it again.
+  The console setting overrides the daemon flag and applies on the next cycle without a restart. Once you have saved one there, the card grows a **Use the default** button that clears it again.
 
 - **An interval shorter than a refresh is a request, not a schedule.** A refresh rewrites every table that changed in full, however little of it changed, so it has a cost the interval cannot go below. Asking for less does not queue refreshes up: a server whose previous refresh is still folding is skipped for that tick, and the tick says so. Each refresh also logs its own duration, and one that outran the configured interval says so explicitly, naming the server. That duration is the honest measure of what a refresh costs on your data, which is the number to size a shorter interval against.
 

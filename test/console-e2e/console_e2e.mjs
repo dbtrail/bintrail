@@ -3979,9 +3979,71 @@ try {
   }
   // 2px of slack for sub-pixel track rounding; the failure this catches is a
   // whole empty track (361px on a 1084px grid), not a rounding remainder.
+  // Scoped to what auto-fit actually promises. It collapses a track only when
+  // the track is empty across the whole grid, so a page with MORE cards than
+  // tracks still ends on a ragged last row exactly as before. These two routes
+  // are the ones the #1543 split left under-filled, at one card and two.
   rowFill.every((r) => r.cards >= 1 && r.left <= 2)
-    ? ok("layout: a row of config cards fills its grid, whatever the count")
-    : bad("layout: a row of config cards fills its grid, whatever the count", JSON.stringify(rowFill));
+    ? ok("layout: a page with fewer cards than tracks still fills its row")
+    : bad("layout: a page with fewer cards than tracks still fills its row", JSON.stringify(rowFill));
+
+  // ── Scenario 17g3 — the disk-space card, every state it can be in ──
+  // Calls the REAL backupRefreshCard with each of the 16 DTOs the daemon can
+  // serve and reads the rendered element. A Go guard over the source can only
+  // see that both `br.enabled` and `br.scheduled` appear somewhere in the
+  // function, so inverting either condition survives it while the card tells
+  // the operator the opposite of the truth. Rendering is the only view that
+  // separates those.
+  //
+  // It also pins the sentence about WHERE the saving applies, which the Go
+  // guard deliberately leaves alone: that one asserts the claim is tied to the
+  // rule in reconstruct, not what the claim says. Keyed to the PRODUCER, since
+  // only the per-server schedule passes BaselineS3 to the fold; the interval
+  // loop and every restore read the local directory and do reuse files.
+  const cardStates = await page.evaluate(() => {
+    const rows = [];
+    for (const on of [false, true]) {
+      for (const enabled of [false, true]) {
+        for (const scheduled of [false, true]) {
+          for (const source of ["default", "override"]) {
+            const el = backupRefreshCard({ carry_forward_unchanged: on, enabled, scheduled, source });
+            const t = el.innerText || el.textContent || "";
+            rows.push({
+              on, enabled, scheduled, source,
+              pill: (el.querySelector(".bkr-state") || {}).textContent || "",
+              dormant: t.includes("Nothing uses this yet"),
+              middle: t.includes("Nothing refreshes all servers on one timer"),
+              chose: t.includes("You chose this here"),
+              saving: t.includes("only when the last backup is read from this machine"),
+              live: t.includes("(live"),
+              buttons: Array.from(el.querySelectorAll("button")).map((b) => b.textContent),
+            });
+          }
+        }
+      }
+    }
+    return rows;
+  });
+  const cardBad = cardStates.filter((r) =>
+    // the value is on screen, and it is the value
+    r.pill !== (r.on ? "On" : "Off")
+    // dormant is said when nothing consumes the setting, and only then
+    || r.dormant !== !r.enabled
+    // the middle state is the --baseline-trigger daemon: live for restores,
+    // nothing on a timer. Collapsing it into either neighbour is the misreport
+    // the card exists to avoid.
+    || r.middle !== (r.enabled && !r.scheduled)
+    // provenance answers who chose, never whether it runs
+    || r.chose !== (r.source === "override")
+    || r.live
+    // the saving never appears without the condition it actually has
+    || !r.saving
+    // the hand-it-back button appears only where there is something to hand back
+    || (r.buttons.length === 2) !== (r.source === "override"));
+  cardStates.length === 16 && cardBad.length === 0
+    ? ok("backups: the disk-space card reports every state it can be in")
+    : bad("backups: the disk-space card reports every state it can be in",
+        JSON.stringify({ n: cardStates.length, wrong: cardBad.slice(0, 4) }));
 
   // ── Scenario 17h — the telemetry card shows the exact sample event (#1447) ──
   // Still on /daemon. The "Show a sample event" fold must be closed by

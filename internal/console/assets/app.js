@@ -4039,12 +4039,34 @@ function rotationCard(rot) {
 //     contradiction can no longer form, so the "(live)" gating is gone rather
 //     than fixed.
 //
-// The S3 sentence is a CORRECTNESS fix, not a hedge. carryForwardEligible
-// refuses any s3:// previous snapshot (consoleapp/baseline_refresh_loop.go),
-// because carrying a file forward means hard-linking it and a link needs both
-// ends on a filesystem. The card promised the saving unconditionally, so on
-// every S3-backed server it advertised a saving that CANNOT happen; the daemon
-// log already says so on each published refresh and the console did not.
+// The sentence about where the saving applies is a CORRECTNESS fix, not a
+// hedge, and it is keyed to the PRODUCER rather than to where the backups are
+// stored. carryForwardEligible refuses any s3:// previous snapshot, because
+// carrying a file forward means hard-linking it and a link needs both ends on
+// a filesystem. But srcPath is baselineFoldSource(req), and only ONE of the
+// three producers ever sets BaselineS3:
+//
+//   consoleapp/baseline_refresh_loop.go  interval loop   BaselineDir only
+//   consoleapp/baseline_schedule_loop.go per-server job  BaselineS3 set
+//   consoleapp/baseline_restore.go       restore         BaselineDir only
+//
+// The field is "Backup S3" (baseline_s3) in the Servers form, NOT "Archive to
+// S3" (archive_s3), which is the binlog archive tier and has nothing to do
+// with this. Naming the wrong one tells a reader who has archive_s3 set and
+// baseline_s3 empty that the saving does not reach them, when it does.
+//
+// So on a server carrying BOTH a local directory and a bucket, which is a
+// supported configuration, the interval loop and every restore DO reuse files
+// while the scheduled backup does not. A sentence keyed to storage ("backups
+// in S3 are written in full") is false in both directions on that server: it
+// denies a saving two producers are making, and the setting is changing the
+// on-disk representation of their backups while the card says it is not.
+//
+// The saving also stopped being stated unconditionally. carryForward falls
+// back to a COPY when os.Link fails, and fulltable.go marks the table carried
+// either way, so the console reports "reused" for a run that saved nothing;
+// only the daemon log dissents. The guarantee the reader needs, that the
+// backup is still complete, is what stays absolute.
 //
 // No command, flag or path appears in any visible string here. A reader
 // clicking buttons who is shown a flag is being told the real answer lives
@@ -4074,12 +4096,13 @@ function backupRefreshCard(br) {
   // the old file" reads as a partial backup otherwise, and that is the one
   // thing a recovery tool must never let a reader believe.
   if (on) {
-    say("A table with no changes keeps its file from the last backup. The backup is still complete and takes less disk.");
+    say("A table with no changes keeps its file from the last backup instead of being written again. The backup is still complete.");
   } else {
     say("Every backup writes every table again, even the ones that did not change.");
-    say("Turn this on and a table with no changes keeps its file from the last backup. The backup is still complete and takes less disk.");
+    say("Turn this on and a table with no changes keeps its file from the last backup instead. The backup is still complete.");
   }
-  say("One setting for every server. It only saves disk for backups kept on this machine; ones stored in S3 are always written in full.");
+  say("It saves disk only when the last backup is read from this machine. A scheduled backup on a server that has a Backup S3 reads it from there, so it writes every table.");
+  say("This one setting covers every server.");
   // Three situations, not two. A daemon started with the backup trigger and no
   // refresh schedule still applies this to restores, so calling it dormant
   // there would let an operator reuse files right after being told nothing
@@ -4129,7 +4152,16 @@ async function saveBackupRefresh(body) {
   try {
     now = await api("/api/baseline-refresh", { method: "PUT", body });
   } catch (err) {
-    toastError("Could not save: " + ((err && err.message) || err));
+    // NOT "could not save". The handler writes the registry before it writes
+    // the response, so a body that is truncated or a connection dropped after
+    // that point lands here with the change already made. Saying it failed is
+    // the one direction that must not be silent for a setting that governs how
+    // the operator's backups are stored, and returning early left the card
+    // rendering the OLD value on top of the wrong sentence. Re-render so the
+    // card shows whatever the daemon actually holds.
+    toastError("Could not confirm the change: " + ((err && err.message) || err) +
+      ". The card below shows what the daemon holds now.");
+    renderRoute();
     return;
   }
   const on = !!(now && now.carry_forward_unchanged);
@@ -4137,7 +4169,7 @@ async function saveBackupRefresh(body) {
   // server, which is the same over-promise the card carried; the toast states
   // what changes and lets the card carry the condition.
   toast((now && now.enabled)
-    ? (on ? "Unchanged tables will keep their last file" : "Every table will be written again")
+    ? (on ? "Saved. Unchanged tables can now keep their last file" : "Every table will be written again")
     : "Saved. Nothing uses it yet, so it starts working the next time dbtrail runs with backups or restores turned on.");
   renderRoute();
 }
