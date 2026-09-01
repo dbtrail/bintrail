@@ -543,6 +543,14 @@ func writeHeader(b *strings.Builder, in Input) {
 		orUnknown(in.Version), in.GeneratedAt.UTC().Format(time.RFC3339))
 	b.WriteString("--\n")
 	b.WriteString("-- THIS FILE IS A SNAPSHOT OF THE LAYOUT, NOT A LIVE BINDING. ")
+	// checksSnapshot, not Follow.follows(), for the sentence below that names
+	// the dropped-table check. The two are the same today for every render a
+	// producer makes, and they come apart for a filtered one: writeStateViews
+	// returns before the preflight when OnlyViews selected no state view, so a
+	// file could promise a check it does not contain. Deriving the promise from
+	// the same plan the writer uses is what keeps them coextensive rather than
+	// merely equal today.
+	checks := in.checksSnapshot()
 	if in.Follow.follows() {
 		// The state views follow too, so the sentence above is now only about
 		// SHAPE. Say which shape, concretely: a reader who knows a new table
@@ -571,10 +579,17 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("-- changes type, and whenever archive sources are added or removed.\n")
 		b.WriteString("--\n")
 		b.WriteString("-- Which of those you will notice follows one rule: this file names only the\n")
-		b.WriteString("-- PATHS and the DECIMAL columns, so only those two can fail. A table that\n")
-		b.WriteString("-- leaves the newest snapshot is caught by the check below, which names the\n")
-		b.WriteString("-- table and stops before any view is created; a DECIMAL column renamed or\n")
-		b.WriteString("-- dropped fails the script at its own view.\n")
+		b.WriteString("-- PATHS and the DECIMAL columns, so only those two can fail. ")
+		if checks {
+			b.WriteString("A table that\n")
+			b.WriteString("-- leaves the newest snapshot is caught by the check below, which names the\n")
+			b.WriteString("-- table and stops before any view is created; a DECIMAL column renamed or\n")
+			b.WriteString("-- dropped fails the script at its own view.\n")
+		} else {
+			b.WriteString("A table that\n")
+			b.WriteString("-- leaves the newest snapshot stops resolving, and the read fails at its own\n")
+			b.WriteString("-- view; so does a DECIMAL column renamed or dropped.\n")
+		}
 		b.WriteString("-- Everything else is QUIET, because `SELECT *` passes it through untouched:\n")
 		b.WriteString("-- a table added to the source has no view here, a DECIMAL whose scale grew is\n")
 		b.WriteString("-- read at the old scale with the extra digits rounded away, a column that\n")
@@ -1447,13 +1462,7 @@ func stateViewPlan(in Input) []statePlan {
 // writeStateViews emits one view per table in the newest baseline snapshot, and
 // returns whether it emitted any.
 func writeStateViews(b *strings.Builder, in Input) bool {
-	plan := stateViewPlan(in)
-	wanted := make([]statePlan, 0, len(plan))
-	for _, p := range plan {
-		if in.OnlyViews.wants(p.name) {
-			wanted = append(wanted, p)
-		}
-	}
+	wanted := selectedStatePlans(in)
 	// A filtered render that selected no state view emits NOTHING, comments
 	// included, for the reason GenerateViews states: its caller executes this.
 	if in.OnlyViews != nil && len(wanted) == 0 {
@@ -1569,6 +1578,49 @@ func writeNewestSnapshotVar(b *strings.Builder, in Input) {
 	fmt.Fprintf(b, "  FROM glob(%s));\n\n", sqlString(root+"/*/"+baseline.SuccessMarker))
 }
 
+// selectedStatePlans is the state views this render will actually emit: the
+// full plan, narrowed by OnlyViews.
+//
+// One function because two callers ask the same question — the writer, to emit
+// them, and checksSnapshot, to decide whether the header may promise the
+// dropped-table check. Narrowing the plan in one and re-deriving it in the
+// other is how a file would come to advertise a guarantee it does not carry,
+// which is the failure this whole PR is about.
+func selectedStatePlans(in Input) []statePlan {
+	plan := stateViewPlan(in)
+	out := make([]statePlan, 0, len(plan))
+	for _, p := range plan {
+		if in.OnlyViews.wants(p.name) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// checksSnapshot reports whether this render will emit the dropped-table check.
+//
+// It answers by running the writer's own conditions, not by restating them: the
+// header's promise and the check's presence have to agree, and two lists of
+// conditions maintained apart is how they would stop agreeing.
+func (in Input) checksSnapshot() bool {
+	if !in.Follow.follows() {
+		return false
+	}
+	wanted := selectedStatePlans(in)
+	if len(wanted) == 0 {
+		return false
+	}
+	if _, _, ok := snapshotDirExpr(in); !ok {
+		return false
+	}
+	for _, p := range wanted {
+		if p.table.Rel == "" {
+			return false
+		}
+	}
+	return true
+}
+
 // writeSnapshotPreflight emits one check, ahead of every state view, that the
 // tables this file names are still in the snapshot it will read (#1558).
 //
@@ -1659,11 +1711,18 @@ func writeSnapshotPreflight(b *strings.Builder, in Input, wanted []statePlan) {
 //
 // They differ, and the difference is load-bearing. The first is compared
 // against glob's OUTPUT, so it must be the LITERAL path. The second is
-// concatenated into glob's PATTERN, where `[`, `*` and `?` are syntax: measured
-// against a real directory, a `[` in the root makes the listing return NOTHING
-// (so every table grades missing and a healthy file is refused before it creates
-// anything) and a `*` or `?` makes it match sibling directories (so a table that
-// really is gone can grade present). Both directions are wrong.
+// concatenated into glob's PATTERN, where `[`, `*` and `?` are syntax.
+//
+// One of those is a real failure and the rest are hygiene, which is worth
+// stating so nobody credits this with a guard it does not have. A `[` in the
+// root makes the listing return NOTHING, so every table grades missing and a
+// healthy file is refused before it creates anything — the worst outcome this
+// code has. A `*` or `?` makes it match SIBLING directories, which cannot
+// produce a wrong verdict: the comparison side is the literal, and an
+// over-matched sibling is spelled with its own directory name, so it never
+// equals the literal and the real file is still matched. They are escaped
+// anyway because a pattern that means something other than its own path is a
+// trap waiting for the next reader, not because a bug is behind them.
 //
 // DuckDB does not honour a backslash escape here; a single-character class does,
 // which is what globLiteral builds. FollowNewest needs no escaping: its value is

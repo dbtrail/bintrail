@@ -22,6 +22,25 @@ func ApplyFollow(in *Input, root string, pin bool) {
 	if pin || len(in.Baselines) == 0 {
 		return
 	}
+	// A backslash in the root is not followable, and it is measured rather than
+	// assumed: DuckDB's glob treats `\` as a path SEPARATOR, not an escape, so
+	// a pattern under `/data/back\up/baselines` is globbed as
+	// `/data/back/up/baselines` and matches nothing. read_parquet reads the same
+	// literal path perfectly well, which is why the view bodies would work while
+	// the dropped-table check refused every table of a healthy snapshot — the
+	// worst outcome this file has.
+	//
+	// There is no escape to reach for: as-is, doubled, and a single-character
+	// class were all tried against the pinned engine and all match nothing. So
+	// the honest answer is not to follow. The file is pinned, its header says
+	// so, and no check is promised that is not there.
+	//
+	// On Linux, where this ships, a backslash is an ordinary legal filename
+	// character. On Windows it is the separator, so following would be broken
+	// for every root; refusing is right in both.
+	if strings.Contains(root, `\`) {
+		return
+	}
 	paths := make([]string, len(in.Baselines))
 	for i, t := range in.Baselines {
 		paths[i] = t.Path

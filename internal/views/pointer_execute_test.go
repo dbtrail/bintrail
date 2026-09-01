@@ -239,6 +239,12 @@ func TestPointerFollow_carriesRelForARootThatIsNotAlreadyClean(t *testing.T) {
 // The paths in the view bodies are unaffected — read_parquet takes a literal —
 // which is exactly why nothing else in this package would notice.
 func TestPointerFollow_acceptsARootWithGlobMetacharacters(t *testing.T) {
+	// Only `[` DISCRIMINATES: measured with the escaping removed, `*`, `?` and
+	// `{` all still match here, because each root sits alone in a fresh
+	// TempDir with no sibling to over-match and a lone `{` is inert. They are
+	// kept as cases because they are the characters the escaping handles and a
+	// future DuckDB could change its mind about any of them; the one that fails
+	// today without the fix is meta[1].
 	for _, name := range []string{"meta[1]", "meta*x", "meta?x", "meta{a"} {
 		t.Run(name, func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), name)
@@ -274,5 +280,87 @@ func TestPointerFollow_acceptsARootWithGlobMetacharacters(t *testing.T) {
 				t.Errorf("state view read %q; want \"here\"", status)
 			}
 		})
+	}
+}
+
+// TestPointerFollow_refusesToFollowABackslashRoot pins a refusal, not a feature.
+//
+// DuckDB's glob treats `\` as a path SEPARATOR: measured, a pattern under a root
+// containing one matches NOTHING, while read_parquet reads the same literal path
+// fine. So a followed file would build working view bodies and a dropped-table
+// check that refused every table of a healthy snapshot. No escape reaches it —
+// as-is, doubled, and a single-character class were all tried.
+//
+// The answer is to stop following. The file is pinned, its header says pinned,
+// and it promises no check it does not carry. This asserts all three, because a
+// refusal that left the header still promising would be the worse bug.
+func TestPointerFollow_refusesToFollowABackslashRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), `back\up`)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const stamp = "2026-05-30T03-00-00Z"
+	src := writeSnapshot(t, root, stamp, true, "here")
+	if err := baseline.PublishCurrentPointer(filepath.Join(root, stamp)); err != nil {
+		t.Fatalf("publish pointer: %v", err)
+	}
+	in := Input{
+		GeneratedAt:      time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
+		Version:          "test",
+		BaselineSource:   root,
+		BaselineSnapshot: time.Date(2026, 5, 30, 3, 0, 0, 0, time.UTC),
+		Baselines:        []BaselineTable{{Schema: "shop", Table: "orders", Path: src}},
+	}
+	ApplyFollow(&in, root, false)
+	if in.Follow != FollowNone {
+		t.Fatalf("Follow = %v for a root DuckDB's glob cannot express; the check would refuse "+
+			"every table of a healthy snapshot", in.Follow)
+	}
+	sqlText := Generate(in)
+	if strings.Contains(sqlText, "caught by the check below") {
+		t.Error("the header promises the dropped-table check on a file that does not follow")
+	}
+	// And the pinned file still WORKS: the bodies read a literal path, which is
+	// the half glob disagrees with.
+	db := execViews(t, sqlText)
+	var status string
+	if err := db.QueryRow(`SELECT "status" FROM state_shop_orders`).Scan(&status); err != nil {
+		t.Fatalf("query state view: %v", err)
+	}
+	if status != "here" {
+		t.Errorf("state view read %q; want \"here\"", status)
+	}
+}
+
+// TestHeaderPromisesTheCheckOnlyWhenItIsThere closes the one path where the two
+// could still come apart: a filtered render that selects no state view returns
+// before the preflight, while the header has already been written.
+func TestHeaderPromisesTheCheckOnlyWhenItIsThere(t *testing.T) {
+	root, paths := pointerRoot(t)
+	sqlText := pointerFixture(t, root, paths)
+	if !strings.Contains(sqlText, "caught by the check below") || !strings.Contains(sqlText, missingVar) {
+		t.Fatal("the ordinary following render lost either the promise or the check; " +
+			"this guard reads both")
+	}
+
+	in := Input{
+		GeneratedAt:      time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC),
+		Version:          "test",
+		BaselineSource:   root,
+		BaselineSnapshot: time.Date(2026, 5, 30, 3, 0, 0, 0, time.UTC),
+		Baselines: []BaselineTable{
+			{Schema: "audit", Table: "events", Path: paths[0]},
+			{Schema: "shop", Table: "orders", Path: paths[1]},
+		},
+		OnlyViews: map[string]bool{"events": true},
+	}
+	ApplyFollow(&in, root, false)
+	filtered := Generate(in)
+	if strings.Contains(filtered, missingVar) {
+		t.Fatal("the filtered render emitted a preflight; this guard reads the case where it does not")
+	}
+	if strings.Contains(filtered, "caught by the check below") {
+		t.Error("a render with no state views still promises the dropped-table check. A file that " +
+			"advertises a guarantee it does not carry is worse than one that carries neither")
 	}
 }
