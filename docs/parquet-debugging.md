@@ -93,9 +93,11 @@ Three properties worth knowing:
 - **Archive sources are named for another machine.** An archive registered both on the generating host and in S3 is listed by its S3 location; a local path appears only when the registry holds no S3 location for it. State views point wherever `--baseline-dir`/`--baseline-s3` points, so a local baseline directory resolves only on the host that holds it. The console's own reads still prefer the local copy.
 - **The state views follow the newest baseline; the rest is a snapshot of the layout.** With `--include-events`, that view's globs keep picking up newly rotated partitions on their own. The `state_` views read through `<baseline root>/current`, a pointer that a NEWER completed snapshot updates (a snapshot produced for a past instant, such as a point-in-time restore, completes normally and deliberately does not take it), so a snapshot published after this file was written reaches it with nothing to re-run. That covers the case that used to catch people: a daemon running `bintrail-console watch --baseline-refresh-interval` publishes a new snapshot every interval, and the views move to it when it completes. All of them move together, because the pointer is replaced in one step, so no query can read one table from the new snapshot and another from the old, and a query already running finishes against the files it opened.
 
-  What does *not* follow is the file's idea of the **shape** of the data: which views exist, and the precision each `DECIMAL` column is read at, were both decided from the snapshot named in the header. Regenerate after a table is added or dropped, after a column changes type, and whenever archive sources are added or removed. **Which of those you notice follows one rule**: the generated file names only the paths and the `DECIMAL` columns, so only those two can fail. A table that leaves the newest snapshot stops resolving and DuckDB names the missing path, and a `DECIMAL` column renamed or dropped fails the whole script. Everything else is quiet, because `SELECT *` passes it through: a table *added* to the source simply has no view, a `DECIMAL` whose scale grew is read at the old scale, a column that changes to some other type arrives as whatever the new file holds (an `ORDER BY` can start sorting text), and an archive source added later is not there. The loud half is deliberate: the pointer names the newest complete snapshot whatever tables it holds, and refusing to advance unless every table is still present would freeze it forever on the first dropped table, leaving every generated file quietly serving older and older rows. Only an operator action reaches this — `--tables` on a hand-run baseline, or narrowing a server's schemas — since the periodic refresh folds exactly the tables of the snapshot it read.
+  What does *not* follow is the file's idea of the **shape** of the data: which views exist, and the precision each `DECIMAL` column is read at, were both decided from the snapshot named in the header. Regenerate after a table is added or dropped, after a column changes type, and whenever archive sources are added or removed. **Which of those you notice follows one rule**: the generated file names only the paths and the `DECIMAL` columns, so only those two can fail. A table that leaves the newest snapshot stops resolving and DuckDB names the missing path when the file is READ, before any view that follows it is created, and a `DECIMAL` column renamed or dropped fails the whole script. Everything else is quiet, because `SELECT *` passes it through: a table *added* to the source simply has no view, a `DECIMAL` whose scale grew is read at the old scale, a column that changes to some other type arrives as whatever the new file holds (an `ORDER BY` can start sorting text), and an archive source added later is not there. The loud half is deliberate: the pointer names the newest complete snapshot whatever tables it holds, and refusing to advance unless every table is still present would freeze it forever on the first dropped table, leaving every generated file quietly serving older and older rows. Only an operator action reaches this — `--tables` on a hand-run baseline, or narrowing a server's schemas — since the periodic refresh folds exactly the tables of the snapshot it read.
 
-  Several cases pin to one snapshot instead, and the generated file always says which it did. `--pin-snapshot` is the deliberate one, for reproducible analysis against a fixed instant. An **S3 baseline root** has no pointer to follow: publishing one would mean copying every table object to a second prefix, which is not atomic across tables, so a query could read half of one snapshot and half of another. A baseline root written by an older bintrail carries no pointer until its next snapshot completes. And a `current` an operator replaced with a real directory is never touched, so that root pins too.
+  An **S3 baseline root** follows too, by a different route. There is no pointer object to publish there: doing so would mean copying every table to a second prefix, which is not atomic across tables, so a query could read half of one snapshot and half of another. Instead the file resolves the newest `_SUCCESS`-marked snapshot into a session variable when it is read, and every `state_` view reads through that one value. One lookup for the whole file, so it costs what pinning costs, and the views agree with each other the way the pointer makes them agree. A refresh published while you are working is picked up by reading the file again, which an S3 session already does for its credentials.
+
+  Several cases pin to one snapshot instead, and the generated file always says which it did. `--pin-snapshot` is the deliberate one, for reproducible analysis against a fixed instant. A local baseline root written by an older bintrail carries no pointer until its next snapshot completes. And a `current` an operator replaced with a real directory is never touched, so that root pins too.
 - **Money columns are cast back to numbers.** MySQL `DECIMAL` and `NUMERIC` are stored as text in the Parquet, so that a value MySQL can hold is never rounded to fit a narrower type. One caveat belongs with a *following* file: the precision and scale are read when the file is generated, and they do not follow. Widen a `DECIMAL` column's scale and the view goes on reading it at the old scale, rounding the extra digits away with no error. Regenerate after a column changes type. The `state_` views cast them back to `DECIMAL(p,s)` using the precision and scale the column was declared with, so `sum()` and the rest work on them directly. See below for the two cases where a column stays text.
 
 `state_` views are the snapshot's rows, not the table's current state. To materialize a *later* point in time, use `bintrail reconstruct` — folding deltas back onto a baseline is what that command does, and it is not expressible as a view.
@@ -112,6 +114,60 @@ ORDER BY event_timestamp DESC;
 ```
 
 To get a table back as it stood before a purge, use `bintrail reconstruct --at` with a baseline taken before it. An archival purge (rows moved out of the operational database on purpose) leaves through the binlog as ordinary DELETEs, so the refresh cannot tell it from a business delete and drops those rows from the snapshot too; the event log is where they remain.
+
+### Every flag
+
+| Flag | What it does |
+|---|---|
+| `--baseline-dir` | Local backup directory. Source of the `state_` views |
+| `--baseline-s3` | S3 backup prefix. Mutually exclusive with `--baseline-dir` |
+| `--pin-snapshot` | Freeze the `state_` views on the snapshot that exists now, instead of following the newest |
+| `--include-events` | Add the `events` view. Off by default; see the cost above |
+| `--index-dsn` | The index, where archive locations are discovered. Needed with `--include-events` unless you name a location directly |
+| `--archive-dir` | Local archive root, named directly. Needs `--bintrail-id` |
+| `--archive-s3` | S3 archive prefix, named directly. Needs `--bintrail-id` |
+| `--bintrail-id` | The server's identity UUID. Required with the two flags above |
+| `--include-live` | Add the live index leg to `events`. Needs `--index-dsn`, and read its section above first |
+| `--no-baselines` | Emit `events` only, no `state_` views. Needs `--include-events` |
+| `--region` | AWS region to pin in the generated S3 secret |
+| `--out` | Output file, or `-` for stdout. Default `views.sql` |
+
+A baselines-only file needs no index at all: `--baseline-dir` or `--baseline-s3`
+on its own is enough, and the result reads on a machine that cannot reach your
+database.
+
+### Backups in a folder, on a machine you are not on
+
+A file over a local backup directory names that directory, and those paths
+resolve only where it is mounted, at exactly that path. The generated header says
+so. Open it elsewhere and DuckDB answers `No files found`, which looks like a
+broken backup and is not one.
+
+On the Compose stack the path is a path **inside the container**
+(`/var/lib/bintrail/baselines` in the `bintrail-state` volume), so it resolves
+neither on a laptop nor in a shell on the host. Copy the file up and run DuckDB
+in a container mounting the same volume at the same place:
+
+```sh
+scp views.sql you@server:~/
+```
+
+```sh
+# on the server, from the directory holding docker-compose.yml
+docker run --rm -it \
+  -v "$(basename "$PWD")_bintrail-state:/var/lib/bintrail:ro" \
+  -v "$HOME:/work" \
+  duckdb/duckdb -init /work/views.sql /work/lake.db
+```
+
+Read-only on purpose, and the mount has to land on `/var/lib/bintrail` so the
+paths in the file resolve unchanged. This is the fastest way to query: a 47-view
+file opens in well under a second against local Parquet, where the same file over
+S3 takes about thirty.
+
+If the server keeps its backups in both places, the console download offers
+**Works on another machine**, which emits the S3 paths instead and saves under a
+different name.
 
 ### Decimal columns read as text without the views
 
