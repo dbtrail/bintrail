@@ -33,6 +33,13 @@ const TOKEN_KEY = "bintrail_console_token";
 const SERVER_KEY = "bintrail_console_server";
 const ONBOARD_KEY = "bintrail_console_onboarded";
 
+// The generated DuckDB views file, named in two places that must not drift:
+// the Connect AI panel that produces it, and the Backups lane that sends a
+// reader there to get it. Shared rather than guarded -- a constant cannot
+// disagree with itself, and a test comparing two literals only reports the
+// drift after someone ships it.
+const DUCKDB_VIEWS_FILE = "views.sql";
+
 // Export columns. connection_id is INCLUDED (epic #701 D1 — no longer a
 // gated field on the events API; CSV mirrors the JSON view exactly).
 const EVENT_CSV_COLUMNS = [
@@ -3908,14 +3915,6 @@ async function renderBaselines() {
     // collection: it is the answer to "will this list keep growing on its
     // own", and a failed scheduled run has to be visible without opening
     // anything.
-    const scheduleCard = backupScheduleCard(cur, baselines);
-    if (scheduleCard) v.append(scheduleCard);
-    // Directly under the schedule, because the two were the pair #1528 named:
-    // "Automatic backup refresh" and "Scheduled backups" both promised
-    // "backups, automatically" from different pages, for unrelated settings.
-    // Side by side, under names that say what each does, the difference needs
-    // no paragraph.
-    v.append(el("div", { class: "cards" }, backupRefreshCard(backupRefresh)));
     // A visible in-progress region (mirrors the verification page): while a
     // backup is being created or restored, the page must look like a page
     // doing work, not a stale list.
@@ -3929,10 +3928,22 @@ async function renderBaselines() {
       // live watcher.
       watchBackupRuns(cur && cur.id, vgen, running.map((r) => r.kind));
     }
+    // Above the list, because it is the answer to why a reader opened this
+    // page: what do I download to open this in DuckDB, what do I download to
+    // load it into MySQL. It sits BELOW the run region on purpose -- the SQL
+    // lane hands a running build off to it with "its progress is above".
+    const takeAway = backupTakeAway(cur, baselines, sqlSt);
+    if (takeAway) v.append(takeAway);
+    const scheduleCard = backupScheduleCard(cur, baselines);
+    if (scheduleCard) v.append(scheduleCard);
+    // Directly under the schedule, because the two were the pair #1528 named:
+    // "Automatic backup refresh" and "Scheduled backups" both promised
+    // "backups, automatically" from different pages, for unrelated settings.
+    // Side by side, under names that say what each does, the difference needs
+    // no paragraph.
+    v.append(el("div", { class: "cards" }, backupRefreshCard(backupRefresh)));
     const restoreCard = backupRestoreCard(cur, baselines, restoreSt);
     if (restoreCard) v.append(restoreCard);
-    const sqlCard = backupSQLExportCard(cur, baselines, sqlSt);
-    if (sqlCard) v.append(sqlCard);
     v.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
     // Below the list: what these backups can become, for a reader who has
     // one and wants it in front of a reporting engine (#1466).
@@ -4323,7 +4334,7 @@ function duckdbPanel() {
     el("p", { class: "form-hint", text:
       "The views follow your newest backup where the backup folder supports it. (CLI: bintrail views)" })));
 
-  const btn = el("button", { class: "btn btn-sm", type: "button", text: "Download views.sql" });
+  const btn = el("button", { class: "btn btn-sm", type: "button", text: "Download " + DUCKDB_VIEWS_FILE });
   btn.onclick = async () => {
     btn.disabled = true;
     try {
@@ -4333,7 +4344,7 @@ function duckdbPanel() {
       // Its own name. The browser saves into one folder and overwrites a
       // repeated name without asking, so downloading both would leave the
       // reader with whichever came last and no way to tell which.
-      const name = portable && portable.checked ? "views-portable.sql" : "views.sql";
+      const name = portable && portable.checked ? "views-portable.sql" : DUCKDB_VIEWS_FILE;
       const sql = await apiText("/api/views.sql" + (q.length ? "?" + q.join("&") : ""));
       downloadBlob(name, sql, "text/plain");
       // The instruction used to be a toast, which is the wrong container for the
@@ -5639,7 +5650,111 @@ async function startBackupRestore(id, at, btn, msgEl) {
   if (location.pathname === "/baselines") renderBaselines();
 }
 
-// backupSQLExportCard offers the made-to-measure .sql backup: pick any past
+// ── Take a copy with you ───────────────────────────────────────────────────
+//
+// This page had two downloads and neither could be found. The Parquet
+// .tar.gz sat inside a row's expand with nothing saying the row opened, and
+// the .sql builder was a <details> summary in small caps below three other
+// folds. A reader who wants a copy arrives with one question -- what do I
+// download to open this in DuckDB, what do I download to load it into MySQL
+// -- and had to open two folds to learn there was an answer at all.
+//
+// The two lanes are deliberately NOT symmetrical, and the drawing is what
+// says so before any text does. DuckDB takes two files and one of them is
+// not on this page (the views file moved to Connect AI in #1549), so that
+// lane points at both. MySQL takes one file that does not exist until you
+// pick a moment, so that lane asks for the moment. Dressing them as a
+// matched pair would be a lie about the work each one is.
+function backupTakeAway(cur, b, sqlSt) {
+  const duck = backupDuckLane(b);
+  const sql = backupSQLLane(cur, b, sqlSt);
+  if (!duck && !sql) return null;
+  const panel = el("section", { class: "ov-panel bk-take" });
+  panel.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Take a copy with you" })));
+  const lanes = el("div", { class: "bk-lanes" });
+  if (duck) lanes.append(duck);
+  if (sql) lanes.append(sql);
+  panel.append(lanes);
+  return panel;
+}
+
+// backupFilesShape draws the count instead of stating it: two tiles on the
+// DuckDB lane, one on the MySQL lane. A reader who takes nothing else off
+// this panel should still leave knowing that much. Built with el() and CSS
+// like duckdbShape(), never svgEl -- that path is for static icon constants.
+function backupFilesShape(files) {
+  const shape = el("div", { class: "bk-shape" });
+  files.forEach((f, i) => {
+    if (i) shape.append(el("span", { class: "bk-shape-plus", text: "+" }));
+    shape.append(el("div", { class: "bk-file" },
+      el("span", { class: "bk-file-n", text: f.name }),
+      el("span", { class: "bk-file-c", text: f.cap })));
+  });
+  return shape;
+}
+
+function backupLane(title, files, lead) {
+  return el("div", { class: "bk-lane" },
+    el("h3", { class: "bk-lane-t", text: title }),
+    backupFilesShape(files),
+    el("p", { class: "bk-lane-lead", text: lead }));
+}
+
+// The DuckDB lane. Gated on there being a backup at all and nothing else:
+// downloading what is already stored asks for no capability, unlike the
+// build the other lane drives.
+function backupDuckLane(b) {
+  if (!b || b.error || !b.configured) return null;
+  const snaps = (b.snapshots || []);
+  if (!snaps.length) return null;
+  const lane = backupLane("To open in DuckDB",
+    [{ name: "Parquet files", cap: "your tables" },
+     { name: DUCKDB_VIEWS_FILE, cap: "how to read them" }],
+    "Two files. The data, and the file that tells DuckDB how to read it.");
+  const msg = el("p", { class: "form-msg err" });
+  msg.hidden = true;
+  const dl = el("button", { class: "btn", type: "button", text: "Download the data" });
+  dl.onclick = async () => {
+    const err = await downloadNewestBackup(snaps[0].time, dl);
+    msg.textContent = err;
+    msg.hidden = !err;
+  };
+  const views = el("button", { class: "btn btn-ghost", type: "button", text: "Get " + DUCKDB_VIEWS_FILE });
+  views.onclick = () => navigate("connect");
+  lane.append(el("div", { class: "bk-lane-go" }, dl, views), msg);
+  lane.append(el("p", { class: "form-hint", text:
+    "This takes the newest backup, from " + utcLabel(snaps[0].time) + ". Any other one in the list below downloads the same way." }));
+  return lane;
+}
+
+// downloadNewestBackup resolves the size before handing off, because
+// downloadBackup warns above 1 GB (the browser holds the whole archive in
+// memory before the save starts) and that warning is driven by a number the
+// LISTING does not carry. Calling it with a zero would drop the warning
+// silently, which is the failure a shortcut like this invites.
+async function downloadNewestBackup(at, btn) {
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Checking size…";
+  let d;
+  try {
+    d = await api("/api/baselines/files?at=" + encodeURIComponent(at));
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = label;
+    return "Could not read that backup: " + ((err && err.message) || err);
+  }
+  btn.disabled = false;
+  btn.textContent = label;
+  if (d.incomplete) {
+    return "The newest backup is marked incomplete, so it cannot be downloaded. Open another one in the list below.";
+  }
+  downloadBackup(at, btn, d.total_bytes || 0);
+  return "";
+}
+
+// backupSQLLane offers the made-to-measure .sql backup: pick any past
 // moment, the console folds the nearest earlier backup forward to it and
 // packages the result as plain SQL files. Unlike the point-in-time restore it
 // publishes NOTHING: the build lives in a staging directory until it is
@@ -5676,7 +5791,7 @@ function backupElsewhereNote(b, usable) {
     (n === 1 ? "that one" : "those") + " yet." });
 }
 
-function backupSQLExportCard(cur, b, sqlSt) {
+function backupSQLLane(cur, b, sqlSt) {
   if (!capsCache.sql_export || !cur || !cur.id || cur.kind !== "registry") return null;
   if (!b || b.error || !b.configured) return null;
   // b.kind, NOT cur.baseline_dir. cur is the RAW registry entry; the export
@@ -5692,12 +5807,20 @@ function backupSQLExportCard(cur, b, sqlSt) {
   const usable = backupSnapshotsFor(b, b.kind === "dir" ? "dir" : "s3");
   if (!usable.length) return null;
   const st = sqlSt && sqlSt.sql_export;
-  if (st && st.state === "running") return null; // the run region owns it
-  const details = el("details", { class: "form-advanced bk-restore" },
-    el("summary", { class: "form-adv-summary", text: "Build a .sql backup for any moment" }));
+  const lane = backupLane("To load into MySQL",
+    [{ name: ".sql files", cap: "your tables" }],
+    "One file, built for whatever moment you pick.");
   const body = el("div", { class: "bk-restore-body" });
+  // Running used to return null and take the whole card off the page. In a
+  // two-lane panel that leaves a hole where an answer was, so the lane stays
+  // and hands off to the run region above instead of vanishing.
+  if (st && st.state === "running") {
+    body.append(el("p", { class: "form-hint", text: "A build is running. Its progress is above." }));
+    lane.append(body);
+    return lane;
+  }
   body.append(el("p", { class: "form-hint", text:
-    "Pick a past moment. The console takes the backup from just before it, replays the recorded changes up to it, and packages the result as plain SQL files (mydumper format), ready for myloader. Restoring needs nothing from dbtrail. Your database is not touched." }));
+    "Plain SQL files in mydumper format, ready for myloader. Loading them back needs nothing from dbtrail, and your database is never touched: the console starts from the backup before that moment and replays the changes it already recorded." }));
   const input = el("input", { class: "in", type: "text", spellcheck: "false",
     placeholder: "YYYY-MM-DD HH:MM:SS (UTC)" });
   input.value = (usable[0] && usable[0].time) || "";
@@ -5713,7 +5836,6 @@ function backupSQLExportCard(cur, b, sqlSt) {
   if (st && st.state === "failed") {
     body.append(el("p", { class: "form-msg err", text:
       "Last build failed: " + backupFoldError(st.last_error || "unknown error") + " Nothing was built." }));
-    details.open = true;
   } else if (st && st.state === "succeeded") {
     const dl = el("button", { class: "btn", type: "button", text: "Download .sql backup (.tar.gz)" });
     dl.onclick = () => downloadSQLExport(cur.id, dl, st.bytes || 0);
@@ -5725,16 +5847,13 @@ function backupSQLExportCard(cur, b, sqlSt) {
     body.append(el("p", { class: "form-hint", text:
       (st.expires_at ? "The download stays available until " + utcLabel(st.expires_at) + ". " : "") +
       "The file is removed from this machine once you download it, when that time passes, or when a new build starts." }));
-    details.open = true;
   } else if (st && st.state === "downloaded") {
     body.append(el("p", { class: "form-hint", text:
       "Downloaded" + (st.downloaded_at ? " at " + utcLabel(st.downloaded_at) : "") +
       ": the backup as of " + utcLabel(st.at || "") + " was handed over and its file was removed from this machine. Build again for another copy." }));
-    details.open = true;
   } else if (st && st.state === "expired") {
     body.append(el("p", { class: "form-hint", text:
       "The backup built for " + utcLabel(st.at || "") + " is no longer on this machine: it was not downloaded before its deadline, or its files were removed. Build again for a fresh copy." }));
-    details.open = true;
   }
   // The state follows the disk: a removal that failed keeps the build in
   // its previous state and says so here, over a download button that would
@@ -5742,10 +5861,9 @@ function backupSQLExportCard(cur, b, sqlSt) {
   if (st && st.staging_error) {
     body.append(el("p", { class: "form-msg err", text:
       "Staging problem: " + st.staging_error + ". The daemon retries every minute; check the staging directory on the machine running it." }));
-    details.open = true;
   }
-  details.append(body);
-  return details;
+  lane.append(body);
+  return lane;
 }
 
 async function startSQLExport(id, at, btn, msgEl) {

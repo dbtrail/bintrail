@@ -102,14 +102,14 @@ func TestBackupJobCardsOfferOnlyWhatTheirJobCanRead(t *testing.T) {
 	// Comments stripped first. This function's own comment explains why
 	// cur.baseline_dir is the wrong field here, and a raw substring check reads
 	// that explanation as the mistake it warns about.
-	exportCard := stripJSLineComments(functionBody(t, js, "function backupSQLExportCard("))
+	exportCard := stripJSLineComments(functionBody(t, js, "function backupSQLLane("))
 	if strings.Contains(exportCard, "cur.baseline_dir") {
-		t.Error("the .sql-export card gates on cur.baseline_dir, which is the RAW registry entry. " +
+		t.Error("the .sql lane gates on cur.baseline_dir, which is the RAW registry entry. " +
 			"A server inheriting the daemon-wide backup location has none, so the card either " +
 			"vanishes or defaults to a snapshot the build cannot read")
 	}
 	if !strings.Contains(exportCard, `backupSnapshotsFor(b, b.kind === "dir" ? "dir" : "s3")`) {
-		t.Error("the .sql-export card does not choose its default from the location the build " +
+		t.Error("the .sql lane does not choose its default from the location the build " +
 			"will actually read")
 	}
 
@@ -122,7 +122,7 @@ func TestBackupJobCardsOfferOnlyWhatTheirJobCanRead(t *testing.T) {
 		t.Error("the restore card does not narrow to the snapshots its fold can read")
 	}
 
-	for _, fn := range []string{"function backupSQLExportCard(", "function backupRestoreCard("} {
+	for _, fn := range []string{"function backupSQLLane(", "function backupRestoreCard("} {
 		if strings.Contains(stripJSLineComments(functionBody(t, js, fn)), "b.snapshots[0]") {
 			t.Errorf("%s still defaults to the merged newest snapshot, which its job may not be "+
 				"able to read", fn)

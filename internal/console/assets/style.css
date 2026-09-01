@@ -2769,3 +2769,44 @@ button { font-family: inherit; }
 .bk-pager-n { font-size: 11.5px; color: var(--ink-4); }
 .bk-chev { margin-left: auto; color: var(--ink-4); font-size: 15px; line-height: 1; flex: none; transition: transform .12s ease; }
 .bk-expandable[aria-expanded="true"] .bk-chev { transform: rotate(90deg); }
+
+/* ── Take a copy with you: the two lanes ───────────────────────────────────
+   White lanes on the panel's --surface-2, so each reads as a card and not as
+   a region of the panel. Worth knowing when the Iceberg panel below is next
+   touched: its .ice-stage cards are --surface-2 on a --surface-2 ground, so
+   they are separated by a hairline and nothing else. */
+.bk-lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px; }
+@media (max-width: 860px) { .bk-lanes { grid-template-columns: 1fr; } }
+.bk-lane {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 18px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.bk-lane-t {
+  margin: 0; font-family: var(--f-display); font-size: 15px;
+  font-weight: 600; letter-spacing: -0.01em; color: var(--ink);
+}
+.bk-lane-lead { margin: 0; font-size: 13px; color: var(--ink-2); }
+.bk-lane-go { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.bk-lane .bk-restore-body { padding: 0; }
+
+/* The drawing: one tile per file. TWO on the DuckDB lane and ONE on the
+   MySQL lane, and that count is the whole message -- it says "this takes two
+   files" before any sentence does. Drawn with el() and these classes, never
+   svgEl (that path is for static icon constants). */
+.bk-shape { display: flex; align-items: flex-start; gap: 10px; padding: 2px 0; }
+.bk-file {
+  position: relative; display: flex; flex-direction: column; gap: 3px;
+  min-width: 104px; padding: 10px 12px 9px;
+  background: var(--surface-3); border: 1px solid var(--line); border-radius: 8px;
+}
+/* the folded corner, so a rectangle reads as a file */
+.bk-file::after {
+  content: ""; position: absolute; top: -1px; right: -1px;
+  border-width: 0 11px 11px 0; border-style: solid;
+  border-color: var(--surface) var(--surface) var(--line) var(--line);
+  border-top-right-radius: 8px;
+}
+.bk-file-n { font-family: var(--f-mono); font-size: 12.5px; font-weight: 500; color: var(--ink); }
+.bk-file-c { font-size: 12px; color: var(--ink-3); }
+.bk-shape-plus { align-self: center; font-size: 15px; color: var(--ink-4); }
