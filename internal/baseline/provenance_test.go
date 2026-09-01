@@ -110,11 +110,13 @@ func TestProvenanceOf(t *testing.T) {
 			if got.ProducedBy != tc.want {
 				t.Errorf("ProducedBy = %q, want %q", got.ProducedBy, tc.want)
 			}
-			if !tc.from.IsZero() && !got.From.Equal(tc.from) {
+			// Unconditional, like FromPath below. A guard that only fires when a
+			// non-zero From is EXPECTED cannot see a verdict that grew one it
+			// must not have: `unknown` says the file records nothing, and
+			// rendering an ancestor date beside that is the confident wrong
+			// answer this whole type exists to refuse.
+			if !got.From.Equal(tc.from) {
 				t.Errorf("From = %v, want %v — the ancestor is what makes the verdict actionable", got.From, tc.from)
-			}
-			if tc.want == ProducedByDump && !got.From.IsZero() {
-				t.Errorf("From = %v on a dump, which is derived from nothing", got.From)
 			}
 			// FromPath must name FROM's file or nothing. On a carried table the
 			// footer's derived_from_path belongs to whoever wrote the bytes,
@@ -144,10 +146,59 @@ func TestProvenanceKeysAndValuesAreFrozen(t *testing.T) {
 			t.Errorf("a footer key/value moved: got %q, want %q — files already on disk carry the old spelling", k, want)
 		}
 	}
-	// Separately, because ProducedByDump shares its spelling and Go rejects a
-	// duplicate constant map key. Once shipped this value is on disk like the
-	// rest of them.
-	if ProducerDump != "dump" {
-		t.Errorf("ProducerDump = %q, want \"dump\" — it is stamped into every new snapshot", ProducerDump)
+	// Pairs, not a map. ProducerDump and ProducedByDump share the spelling
+	// "dump" and Go rejects a duplicate constant key in a map literal, so the
+	// map above structurally cannot hold all of them — which is how the four
+	// ProducedBy values ended up unpinned.
+	//
+	// Those four are WIRE values: app.js keys MADE_BY by the literals and looks
+	// up MADE_BY[t.produced_by]. Rename one and every Go assertion still passes
+	// (they all compare constant to constant) while the backup row renders
+	// nothing at all.
+	for _, p := range []struct{ got, want string }{
+		{ProducerDump, "dump"},
+		{ProducedByDump, "dump"},
+		{ProducedByFold, "fold"},
+		{ProducedByCarriedForward, "carried_forward"},
+		{ProducedByUnknown, "unknown"},
+	} {
+		if p.got != p.want {
+			t.Errorf("a value moved: got %q, want %q — the console keys its labels by these "+
+				"literals, so a rename renders an empty cell with every test green", p.got, p.want)
+		}
+	}
+}
+
+// TestProvenanceOf_unrecognisedProducerIsUnknown covers the forward-compat
+// region the table above leaves open: a value a NEWER build stamped.
+//
+// The switch has two cases and falls through to the legacy sniff, so a future
+// "refresh" or "carry" producer would grade a confident `dump` on any file that
+// also carries a mydumper format or an LSN. Unknown is the answer: this build
+// genuinely does not know.
+func TestProvenanceOf_unrecognisedProducerIsUnknown(t *testing.T) {
+	at := ts("2026-06-10T12:00:00Z")
+	for _, md := range []DumpMetadata{
+		{Producer: "refresh", SnapshotTimestamp: at, MydumperFormat: "csv"},
+		{Producer: "refresh", SnapshotTimestamp: at, LSN: 42},
+	} {
+		if got := ProvenanceOf(at, md); got.ProducedBy != ProducedByUnknown {
+			t.Errorf("producer %q with %+v graded %q; a value this build does not know is not "+
+				"evidence of a dump", md.Producer, md, got.ProducedBy)
+		}
+	}
+}
+
+// TestParseFooterTime_corruptIsZeroNotNow pins the failure mode of a damaged
+// stamp.
+//
+// The carried check is direction-blind (a footer disagreeing with its directory
+// is carried, either way), so a corrupt stamp resolving to "now" would grade an
+// ordinary file carried_forward with a present-day ancestor. Zero is what makes
+// the guard above skip it and fall through to the producer.
+func TestParseFooterTime_corruptIsZeroNotNow(t *testing.T) {
+	if got := parseFooterTime("/b/x.parquet", MetaKeySnapshotTimestamp, "not-a-time"); !got.IsZero() {
+		t.Errorf("a corrupt stamp parsed to %v; anything but the zero time makes the carried "+
+			"check fire on a file whose stamp was merely damaged", got)
 	}
 }

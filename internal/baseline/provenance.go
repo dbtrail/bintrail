@@ -123,6 +123,15 @@ func ProvenanceOf(snapshotTime time.Time, md DumpMetadata) TableProvenance {
 	case ProducerDump:
 		return TableProvenance{ProducedBy: ProducedByDump}
 	}
+	// A producer this build does not recognise is UNKNOWN, and it must not reach
+	// the legacy sniff below. That block dates a file that carries no producer
+	// key at all; a value a newer version stamped is a positive statement this
+	// build cannot read, and grading it `dump` because the file also happens to
+	// carry a mydumper format would be a confident answer about an operation
+	// nobody here knows the name of.
+	if md.Producer != "" {
+		return TableProvenance{ProducedBy: ProducedByUnknown}
+	}
 	// No producer key: written before #1545 stamped one. Two positive signals
 	// still date it as a dump, and both are keys the fold never writes —
 	// mydumper's format for MySQL, the WAL floor for PostgreSQL. Guessing from

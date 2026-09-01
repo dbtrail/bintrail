@@ -103,3 +103,54 @@ func TestBaselineFilesAPI_reportsHowEachTableWasMade(t *testing.T) {
 		}
 	}
 }
+
+// TestBaselineFilesAPI_unreadableFooterIsNotAVerdict keeps "we could not find
+// out" distinct from "the file records nothing" (#1545).
+//
+// Collapsing them hands the operator a verdict nobody checked, which is the
+// ee#115 class this endpoint's comment cites by name. An empty produced_by
+// renders as a dash; `unknown` renders as a claim about the file.
+func TestBaselineFilesAPI_unreadableFooterIsNotAVerdict(t *testing.T) {
+	root := t.TempDir()
+	const snap = "2026-06-10T12-00-00Z"
+	writeProvenanceTable(t, root, snap, "shop", "orders", baseline.ProducerDump, "2026-06-10T12:00:00Z")
+	// Not Parquet at all: the reader will refuse it.
+	if err := os.WriteFile(filepath.Join(root, snap, "shop", "broken.parquet"),
+		[]byte("this is not a parquet file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, snap, baseline.SuccessMarker), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newBaselineServer(t, root, true)
+	rec, body := doServersReq(t, srv, "GET", "/api/baselines/files?at=2026-06-10T12:00:00Z", "")
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, body = %s — one unreadable file must not take the listing down", rec.Code, body)
+	}
+	var got baselineFilesResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	var seen int
+	for _, row := range got.Tables {
+		switch row.Table {
+		case "broken":
+			seen++
+			if row.ProducedBy != "" {
+				t.Errorf("an unreadable footer reported %q; nothing was found out about that file, "+
+					"and a verdict here is a claim nobody checked", row.ProducedBy)
+			}
+		case "orders":
+			seen++
+			// The readable one beside it still answers, so "empty" above is not
+			// the whole endpoint having given up.
+			if row.ProducedBy != baseline.ProducedByDump {
+				t.Errorf("the readable table reported %q, want %q", row.ProducedBy, baseline.ProducedByDump)
+			}
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("tables = %+v, want both the readable and the unreadable one", got.Tables)
+	}
+}

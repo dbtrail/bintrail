@@ -460,6 +460,10 @@ func tableProvenance(path string, snapshotAt time.Time) (string, string) {
 	if err != nil {
 		slog.Warn("console: could not read a backup table's footer for provenance",
 			"path", path, "error", err)
+		// NOT ProducedByUnknown. "we could not find out" and "the file records
+		// nothing" are different answers, and collapsing them is the ee#115
+		// class this comment cites: the reader is handed a verdict nobody
+		// checked. An empty verdict renders as a dash.
 		return "", ""
 	}
 	p := baseline.ProvenanceOf(snapshotAt, md)

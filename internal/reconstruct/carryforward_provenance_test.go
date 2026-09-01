@@ -2,7 +2,9 @@ package reconstruct
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,9 +36,16 @@ func writeProvenanceSnapshot(t *testing.T, root, stamp, producer string) string 
 	w, werr := baseline.NewWriter(path, cols, baseline.WriterConfig{
 		Compression:  "none",
 		RowGroupSize: 10,
+		// Every provenance key, not just the two the verdict turns on. Three of
+		// them reached ProvenanceOf only as hand-set struct fields, so a reader
+		// that stopped looking one of them up off a REAL file changed nothing
+		// any test could see.
 		Metadata: map[string]string{
 			baseline.MetaKeySnapshotTimestamp: at.Format(time.RFC3339),
 			baseline.MetaKeySnapshotProducer:  producer,
+			baseline.MetaKeyDerivedFrom:       at.Add(-7 * 24 * time.Hour).Format(time.RFC3339),
+			baseline.MetaKeyDerivedFromPath:   "/b/ancestor/demo/orders.parquet",
+			baseline.MetaKeyMydumperFormat:    "csv",
 		},
 	})
 	if werr != nil {
@@ -82,6 +91,21 @@ func TestCarryForward_readsBackAsCarriedNotAsItsAncestor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the carried file's footer: %v", err)
 	}
+	// The reader, off a REAL file, not off a struct a test filled in. Three of
+	// these keys are handled in two places (a closure over pf.Lookup locally, a
+	// switch for S3) and reached ProvenanceOf only as hand-set fields, so a
+	// reader that quietly stopped looking one of them up broke nothing visible.
+	if md.DerivedFromPath == "" {
+		t.Error("derived_from_path did not survive the footer read; a fold's ancestor file is " +
+			"silently dropped from every real snapshot")
+	}
+	if md.DerivedFrom.IsZero() {
+		t.Error("derived_from_snapshot did not survive the footer read")
+	}
+	if md.MydumperFormat == "" {
+		t.Error("mydumper_format did not survive the footer read; it is the one signal that " +
+			"dates every pre-#1545 MySQL dump, so losing it regrades them all to unknown")
+	}
 	newAt, _ := snapshotdir.ParseTime(newStamp)
 	got := baseline.ProvenanceOf(newAt, md)
 	if got.ProducedBy != baseline.ProducedByCarriedForward {
@@ -113,5 +137,32 @@ func TestParquetWriter_stampsItsProducer(t *testing.T) {
 	}
 	if md.Producer != baseline.ProducerReconstruct {
 		t.Errorf("producer = %q, want %q", md.Producer, baseline.ProducerReconstruct)
+	}
+}
+
+// TestDumpWritersStampTheirProducer guards the two stamps that make a NEW dump
+// self-identifying.
+//
+// A source guard, deliberately, and the limitation is the point: driving
+// baseline.Run needs mydumper output and pgbaseline needs a live PostgreSQL, so
+// neither stamp has an executing test. Worse, deleting either is SILENT in
+// production too — a real mydumper file still carries mydumper_format and grades
+// `dump` through the legacy fallback, so the loss shows up only years later on a
+// PostgreSQL snapshot whose LSN happens to be absent.
+//
+// Text is what is available; the alternative was no guard at all.
+func TestDumpWritersStampTheirProducer(t *testing.T) {
+	for path, want := range map[string]string{
+		"../baseline/baseline.go":     "MetaKeySnapshotProducer: ProducerDump",
+		"../pgbaseline/pgbaseline.go": "baseline.MetaKeySnapshotProducer: baseline.ProducerDump",
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("%s no longer stamps %q into the footers it writes; new snapshots from it "+
+				"stop saying they came from the source, and nothing else reports the loss", path, want)
+		}
 	}
 }
