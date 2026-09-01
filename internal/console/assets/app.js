@@ -4021,35 +4021,79 @@ function rotationCard(rot) {
 // process-global, the schedule is per server, and a global toggle inside a
 // per-server fold would assert something false.
 //
+// Rewritten because its own reader could not read it: "reuse que? que cosa
+// setea el daemon? no se entiende". Three things came out of that, and undoing
+// any of them puts the card back where it was:
+//
+//   - The two kv rows are GONE. A kv row is for a set of parallel values you
+//     scan, which is what Rotation above genuinely has. This card has exactly
+//     one value, and the second row was not a value at all, it was provenance.
+//     A one-row table is a sentence pretending to be data, and the pretence is
+//     what forced both unreadable keys: "reuse" is a verb with no object, and
+//     "set by" reads like a form field. One state pill plus sentences wins.
+//   - Provenance moved LAST. It used to be line two, above the meaning. A
+//     reader cannot care who chose a setting until he knows what it does, and
+//     it now sits directly above the button that changes it.
+//   - Liveness left the rows. Row two could render "this page (live)" while a
+//     hint below said "Nothing uses this yet"; splitting the jobs means the
+//     contradiction can no longer form, so the "(live)" gating is gone rather
+//     than fixed.
+//
+// The S3 sentence is a CORRECTNESS fix, not a hedge. carryForwardEligible
+// refuses any s3:// previous snapshot (consoleapp/baseline_refresh_loop.go),
+// because carrying a file forward means hard-linking it and a link needs both
+// ends on a filesystem. The card promised the saving unconditionally, so on
+// every S3-backed server it advertised a saving that CANNOT happen; the daemon
+// log already says so on each published refresh and the console did not.
+//
+// No command, flag or path appears in any visible string here. A reader
+// clicking buttons who is shown a flag is being told the real answer lives
+// somewhere else.
+//
 // The consequence of a reused file (two backups sharing the same bytes on
 // disk, where the filesystem allows it) is a thing a reader wants while
 // reading docs, not while flipping the switch: docs/console.md carries it.
 function backupRefreshCard(br) {
-  const card = el("div", { class: "card" }, el("div", { class: "card-title", text: "Backups & disk space" }));
+  const card = el("div", { class: "card" });
+  const head = el("div", { class: "card-title bkr-head" },
+    el("span", { text: "Backups & disk space" }));
+  card.append(head);
   if (!br || br.error) {
-    card.append(el("p", { class: "form-hint", text: "Could not load the reuse setting" + (br && br.error ? ": " + br.error : ".") }));
+    card.append(el("p", { class: "form-hint", text: "Could not load this setting" + (br && br.error ? ": " + br.error : ".") }));
     return card;
   }
   const on = !!br.carry_forward_unchanged;
-  kvRow(card, "reuse", on ? "on" : "off");
-  // "(live)" is gated on enabled because the card also prints "nothing runs
-  // yet" three lines down, and one card must not make two opposite claims
-  // about the running system.
-  kvRow(card, "set by", br.source === "override"
-    ? (br.enabled ? "this page (live)" : "this page (not running yet)")
-    : "daemon default");
-  // Three states, not two. A daemon started with --baseline-trigger and no
-  // refresh schedule still applies this to restores, so calling it dormant
-  // there would let an operator hard link their files right after being told
-  // nothing runs.
-  card.append(el("p", { class: "form-hint", text: on
-    ? "A table with no changes keeps its previous file instead of being written again."
-    : "Every table is written again, even when nothing in it changed. (CLI: --baseline-carry-forward-unchanged)" }));
-  if (!br.enabled) {
-    card.append(el("p", { class: "form-hint", text: "Nothing uses this yet. It applies to refreshes, scheduled backups and restores." }));
-  } else if (!br.scheduled) {
-    card.append(el("p", { class: "form-hint", text: "Used by restores and by the schedules on the Backups page. No daemon-wide refresh interval is set. (CLI: --baseline-refresh-interval)" }));
+  // The state is the first thing read, because checking it or flipping it is
+  // why the card was opened. It rides the title rather than a row so nothing
+  // sits between the reader and it.
+  head.append(el("span", { class: "tag-pill bkr-state", text: on ? "On" : "Off" }));
+  const say = (t) => card.append(el("p", { class: "form-hint", text: t }));
+  // Off leads with what is happening now and then makes the offer, because the
+  // question a reader asks at an off switch is what he gets by turning it on.
+  // Both arms promise completeness in the same breath as the saving: "keeps
+  // the old file" reads as a partial backup otherwise, and that is the one
+  // thing a recovery tool must never let a reader believe.
+  if (on) {
+    say("A table with no changes keeps its file from the last backup. The backup is still complete and takes less disk.");
+  } else {
+    say("Every backup writes every table again, even the ones that did not change.");
+    say("Turn this on and a table with no changes keeps its file from the last backup. The backup is still complete and takes less disk.");
   }
+  say("One setting for every server. It only saves disk for backups kept on this machine; ones stored in S3 are always written in full.");
+  // Three situations, not two. A daemon started with the backup trigger and no
+  // refresh schedule still applies this to restores, so calling it dormant
+  // there would let an operator reuse files right after being told nothing
+  // runs. The dormant arm names a restart because liveness is decided at boot:
+  // with no consumer there is no restore path either, so waiting changes
+  // nothing.
+  if (!br.enabled) {
+    say("Nothing uses this yet. Your choice is saved, and it starts working the next time dbtrail runs with backups or restores turned on.");
+  } else if (!br.scheduled) {
+    say("Restores use this, and so do any backup schedules you set above. Nothing refreshes all servers on one timer.");
+  }
+  say(br.source === "override"
+    ? "You chose this here. It replaces the setting dbtrail started with."
+    : "This is the setting dbtrail started with.");
   const foot = el("div", { class: "stg-cardfoot" },
     el("button", {
       class: "btn btn-sm", type: "button",
@@ -4064,7 +4108,7 @@ function backupRefreshCard(br) {
   if (br.source === "override") {
     foot.append(el("button", {
       class: "btn btn-sm btn-ghost", type: "button",
-      text: "Use the daemon setting",
+      text: "Use the default",
       onclick: () => saveBackupRefresh({ use_default: true }),
     }));
   }
@@ -4089,9 +4133,12 @@ async function saveBackupRefresh(body) {
     return;
   }
   const on = !!(now && now.carry_forward_unchanged);
+  // "will be reused" was an absolute the daemon cannot honour on an S3-backed
+  // server, which is the same over-promise the card carried; the toast states
+  // what changes and lets the card carry the condition.
   toast((now && now.enabled)
-    ? (on ? "Unchanged tables will be reused" : "Every table will be written again")
-    : "Saved. Nothing uses this setting yet, so it applies once something does.");
+    ? (on ? "Unchanged tables will keep their last file" : "Every table will be written again")
+    : "Saved. Nothing uses it yet, so it starts working the next time dbtrail runs with backups or restores turned on.");
   renderRoute();
 }
 

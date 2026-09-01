@@ -555,7 +555,7 @@ carries neither gate and already serves `settings:read` endpoints. The old
   beside a per-server schedule; the card says so. It is consumed by the daemon-wide refresh interval, by the
   per-server backup schedules, and by point-in-time restores; the card says
   which of those are live. Saving here overrides the daemon flag without a
-  restart, and a **Use the daemon setting** button then clears the override.
+  restart, and a **Use the default** button then clears the override.
   See [dump-and-baseline.md](dump-and-baseline.md#refreshing-on-a-schedule).
 - **Staged downloads**: the `.sql` backups built from the Backups page that
   are waiting on the daemon's disk for their download: each build's server,

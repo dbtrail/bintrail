@@ -12,12 +12,18 @@ import (
 // TestBackupRefreshCard_neverClaimsLiveWhileDormant pins the one thing this
 // card must not do: state two opposite things about the running system.
 //
-// The card prints "No refresh schedule is set, so nothing runs yet" whenever
-// br.enabled is false. If the provenance row says "(live)" purely because an
-// override exists, the same card simultaneously tells the operator the setting
-// is running and that nothing runs. That is not a wording preference: the
-// setting changes the on-disk representation of their backups, and the panel is
-// where consent for that is taken.
+// The card says "Nothing uses this yet" whenever br.enabled is false. If the
+// provenance line ALSO claims the setting is live purely because an override
+// exists, the same card simultaneously tells the operator the setting is
+// running and that nothing runs. That is not a wording preference: the setting
+// changes the on-disk representation of their backups, and the panel is where
+// consent for that is taken.
+//
+// The old shape put liveness in a kv row, as "this page (live)", and this
+// guard pinned that ternary. The rewrite deleted the rows, so the guard now
+// pins the property instead of the mechanism: liveness is produced by the
+// br.enabled / br.scheduled line and NOWHERE else, and the provenance line
+// answers only who chose the value.
 func TestBackupRefreshCard_neverClaimsLiveWhileDormant(t *testing.T) {
 	// jsFunctionBody, not functionBody: it strips comment lines before walking.
 	// These guards search for the rendered LABELS, and this function documents
@@ -25,26 +31,28 @@ func TestBackupRefreshCard_neverClaimsLiveWhileDormant(t *testing.T) {
 	// the prose instead of the code and reports a pass on a deleted gate.
 	body := jsFunctionBody(t, readAsset(t, "app.js"), "backupRefreshCard")
 
-	if !strings.Contains(body, "(live)") {
-		t.Fatal("backupRefreshCard no longer distinguishes a live setting at all; this guard covers nothing")
+	// The provenance line is the one that used to carry liveness. Anchor on the
+	// say() call rather than on `br.source === "override"` alone, which also
+	// gates the Use-the-default button and would let a liveness word sneak back
+	// into the line this guard is about.
+	const prov = `say(br.source === "override"`
+	i := strings.Index(body, prov)
+	if i < 0 {
+		t.Fatal("backupRefreshCard renders no provenance line; this guard covers nothing")
 	}
-	// Assert on the CONDITION, not on adjacency. "br.enabled appears somewhere
-	// before (live)" is satisfied by `br.enabled && br.source === "override" ?
-	// "this page (live)" : "daemon default"`, which renders a dormant override
-	// as "daemon default" while the Use-the-daemon-setting button is still on
-	// screen, and by "this page (live, not running yet)", which says both
-	// things at once. Both of those survived the adjacency check.
-	const gate = `br.enabled ? "this page (live)"`
-	if !strings.Contains(body, gate) {
-		t.Fatalf("the (live) label is not produced by a %s ternary, so the card can call a dormant setting "+
-			"live or drop the override label entirely:\n%s", gate, body)
+	rest := body[i:]
+	arm := rest[:min(len(rest), 300)]
+	for _, w := range []string{"live", "running", "yet", "now"} {
+		if strings.Contains(strings.ToLower(arm), w) {
+			t.Errorf("the provenance line says %q. Whether the setting is running belongs to the "+
+				"br.enabled / br.scheduled line alone; said in both places the card can call a dormant "+
+				"setting live and tell the operator nothing runs, in the same card:\n%s", w, arm)
+		}
 	}
-	// And the dormant arm must not smuggle the word back in.
-	k := strings.Index(body, gate) + len(gate)
-	rest := body[k:]
-	arm := rest[:min(len(rest), 120)]
-	if strings.Contains(arm, "(live") {
-		t.Errorf("the dormant arm of the ternary also says live:\n%s", arm)
+	// The old mechanism, pinned so it cannot come back through a row.
+	if strings.Contains(body, "(live") {
+		t.Error("a `(live` label is back. Liveness in a label next to the value reintroduces the " +
+			"contradiction this guard exists for; keep it in the sentence that owns it")
 	}
 	if !strings.Contains(body, "!br.enabled") {
 		t.Fatal("the dormancy note is gone; a setting nothing consumes would look active")
@@ -281,7 +289,10 @@ func TestBackupRefreshCard_titleSaysWhatItDoes(t *testing.T) {
 	js := readAsset(t, "app.js")
 	body := jsFunctionBody(t, js, "backupRefreshCard")
 
-	m := regexp.MustCompile(`card-title", text: "([^"]*)"`).FindStringSubmatch(body)
+	// Tolerates both shapes: the title as a `text:` on the card-title div, and
+	// the title as a nested span once the div grew a second class to carry the
+	// state pill beside it.
+	m := regexp.MustCompile(`card-title[^"]*"[\s\S]{0,80}?text: "([^"]*)"`).FindStringSubmatch(body)
 	if m == nil {
 		t.Fatal("backupRefreshCard renders no card title; this guard covers nothing")
 	}
@@ -694,4 +705,68 @@ func TestDuckDBCard_titleDoesNotPromiseAQuery(t *testing.T) {
 	if !strings.Contains(title, "Download") {
 		t.Errorf("the card title %q does not name what the control does (download a file)", title)
 	}
+}
+
+// TestBackupRefreshCard_saysReuseCannotHappenOnS3 ties the card's one factual
+// claim about where the saving applies to the code that makes it true.
+//
+// carryForwardEligible refuses any s3:// previous snapshot, because carrying a
+// file forward means hard-linking it and a link needs both ends on a
+// filesystem. Before this sentence existed the card promised the saving
+// unconditionally, so on every S3-backed server it advertised a disk saving
+// that CANNOT happen: the refresh loop already logs "not applicable" on each
+// published run, and the console was the surface contradicting it.
+//
+// The guard is two-sided on purpose. It fails if the card drops the sentence,
+// and it fails if the exclusion is LIFTED in reconstruct while the card still
+// carries it, because a card that understates what a setting does sends an
+// operator looking for a saving they already have.
+func TestBackupRefreshCard_saysReuseCannotHappenOnS3(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "backupRefreshCard")
+
+	// Assert the CLAIM, not its spelling: any sentence naming S3 in the same
+	// visible string as the machine-local condition satisfies this.
+	var said string
+	for _, s := range visibleStrings(body) {
+		if strings.Contains(s, "S3") && strings.Contains(strings.ToLower(s), "this machine") {
+			said = s
+			break
+		}
+	}
+	if said == "" {
+		t.Error("no visible string on the card says the saving applies only to backups kept on this " +
+			"machine and not to ones in S3. Without it the card promises a disk saving that an " +
+			"S3-backed server can never get, which is what it did before this sentence existed")
+	}
+
+	// The other side: the rule the sentence describes.
+	src, err := os.ReadFile(filepath.Join("..", "reconstruct", "carryforward.go"))
+	if err != nil {
+		t.Fatalf("read carryforward.go: %v", err)
+	}
+	const rule = `!strings.HasPrefix(srcPath, "s3://")`
+	if !strings.Contains(string(src), rule) {
+		t.Errorf("carryForwardEligible no longer excludes an s3:// previous snapshot (%s is gone), so the "+
+			"card's sentence %q now understates what the setting does. Update the card in the same "+
+			"change that lifts the exclusion", rule, said)
+	}
+}
+
+// visibleStrings returns the user-facing strings a card function renders: the
+// text: values and the arguments of its say() helper. Comments are already
+// stripped by jsFunctionBody, so prose quoting a string cannot be mistaken for
+// the string itself.
+func visibleStrings(body string) []string {
+	var out []string
+	for _, re := range []*regexp.Regexp{
+		regexp.MustCompile(`text: "([^"]*)"`),
+		regexp.MustCompile(`say\("([^"]*)"`),
+		regexp.MustCompile(`\? "([^"]*)"`),
+		regexp.MustCompile(`: "([^"]*)"\)`),
+	} {
+		for _, m := range re.FindAllStringSubmatch(body, -1) {
+			out = append(out, m[1])
+		}
+	}
+	return out
 }
