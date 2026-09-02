@@ -4358,7 +4358,10 @@ try {
       if (!rows || !(rows.querySelector(".ev-row") || rows.querySelector(".ev-empty"))) return false;
       return !Array.from(document.querySelectorAll("#ev-warnings .warn-item"))
         .some((n) => /Reading archived history in the background/.test(n.textContent));
-    }, { timeout: 20000 });
+      // Options are the THIRD parameter (waitForFunction(fn, arg, options));
+      // an options object in the arg slot is serialized to the predicate and
+      // silently discarded, leaving the 30s default in force.
+    }, undefined, { timeout: 30000 });
     return page.evaluate(() => {
       const rows = document.querySelector("#ev-rows");
       renderEventsLoading(rows);
@@ -4535,6 +4538,13 @@ try {
     const f = document.getElementById("ev-form");
     f.elements.since.value = ""; f.elements.until.value = "";
     f.elements.limit.value = "5";
+    // The submit's synchronous prefix clears only #ev-rows; notes and
+    // warnings are repainted by paint() AFTER the fetch resolves, so the
+    // PREVIOUS query's note could satisfy the loop below and every
+    // assertion would then inspect the wrong query's DOM. Clear both here
+    // so the loop can only match what THIS query paints.
+    document.getElementById("ev-notes").textContent = "";
+    document.getElementById("ev-warnings").textContent = "";
     f.requestSubmit();
     // The note this scenario is about, not any note, and a budget sized for
     // a loaded box (#1580): the old three-second cap was of the same class
