@@ -15,6 +15,7 @@
 import { chromium } from "playwright";
 import zlib from "node:zlib";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 
 const URL = process.env.CONSOLE_URL || "http://127.0.0.1:8090";
@@ -64,7 +65,9 @@ const bad = (name, detail) => results.push({ name, pass: false, detail });
 // of quietly waiting 30s. waitForSelector is deliberately not scanned: its
 // options ARE the second parameter.
 {
-  const src = readFileSync(new URL(import.meta.url), "utf8");
+  // fileURLToPath, not `new URL`: this file shadows the global URL with the
+  // console's address (line 20), so the constructor form throws here.
+  const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
   // Assembled rather than written whole: the scan reads this very file, and a
   // literal here would be a call site of its own to parse.
   const NEEDLE = "waitFor" + "Function(";
