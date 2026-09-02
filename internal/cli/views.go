@@ -335,6 +335,14 @@ func resolveArchiveGroups(ctx context.Context, dsn string, in *views.Input) erro
 		return fmt.Errorf("connect to index DB: %w", err)
 	}
 	defer db.Close()
+	return resolveArchiveGroupsFrom(ctx, db, in)
+}
+
+// resolveArchiveGroupsFrom is the DB-taking half, split out so the all-or-
+// nothing rule is pinned by a test rather than by the comment above it. The
+// console half has its own; a revert on either surface would otherwise ship
+// unnoticed, exactly as with discoverArchiveSourcesFrom.
+func resolveArchiveGroupsFrom(ctx context.Context, db *sql.DB, in *views.Input) error {
 	groups, ungrouped, err := query.ArchiveGroups(ctx, db, in.ArchiveSources)
 	if err != nil {
 		return fmt.Errorf("read archived column sets from archive_state: %w", err)

@@ -20,6 +20,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/archive"
 	"github.com/dbtrail/dbtrail/internal/cliutil"
 	"github.com/dbtrail/dbtrail/internal/config"
+	"github.com/dbtrail/dbtrail/internal/indexer"
 	"github.com/dbtrail/dbtrail/internal/duckdbutil"
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
@@ -200,6 +201,18 @@ func runArchiveReconcile(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("connect index database: %w", err)
 	}
 	defer db.Close()
+
+	// reconcile reads and writes archive_state columns this build knows about,
+	// so it migrates first — the same rule the read paths adopted when
+	// query_text/query_hash were added (#699): a SELECT naming a column the
+	// index has not been migrated to is a hard 1054, not a degraded read.
+	// column_set (#1535) is the current instance: without this, `archive
+	// reconcile` against an index whose rotation is older than this binary
+	// fails outright, which is exactly the operator most likely to run it.
+	// Idempotent, and it never touches data.
+	if err := indexer.EnsureSchema(db); err != nil {
+		return fmt.Errorf("migrate index schema: %w", err)
+	}
 
 	rows, err := loadArchiveStateRows(ctx, db)
 	if err != nil {
@@ -523,6 +536,7 @@ func loadArchiveStateRows(ctx context.Context, db *sql.DB) ([]archive.StateRow, 
 var reconcileColumns = map[string]bool{
 	"local_path": true, "file_size_bytes": true, "row_count": true,
 	"s3_bucket": true, "s3_key": true, "s3_uploaded_at": true,
+	"column_set": true,
 }
 
 // executeReconcileActions applies insert/update actions under --repair and

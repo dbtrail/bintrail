@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The `events` view binds one Parquet footer per SCHEMA, not per archived
+  file** (#1535). `archive_state` gains `column_set`, the archived file's own
+  column set, and `bintrail views` / the console SQL panel now emit one
+  `read_parquet` per distinct set — each with an explicit file list and
+  `union_by_name = false`, padding the columns a group lacks with `NULL` and
+  joining the groups with `UNION ALL BY NAME`. A view re-binds on every
+  statement, so what used to cost one footer read per archived file, forever
+  growing, now costs one per group; the S3 LIST the glob needed goes away with
+  it. Explicit paths still carry `hive_partitioning`, so `bintrail_id`,
+  `event_date` and `event_hour` are still synthesized and a filter on them
+  still prunes files.
+  Rotation records the set for archives it writes. For archives already on
+  disk, `bintrail archive reconcile --repair` records it from the footer it
+  already reads for `row_count` — no extra file opens, and not gated on
+  `--deep`. Until every registered partition has one, the generated SQL keeps
+  the globbed form and says so, naming the command: the file list comes from
+  the registry, so grouping a partial one would leave the unrecorded
+  partitions out of the view rather than merely slow to bind. `archive
+  reconcile` now migrates the index schema before reading, like the other
+  archive_state readers.
+
 ## [0.76.0] - 2026-09-01
 
 ### Added
@@ -46,7 +68,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ## [0.75.0] - 2026-09-01
-
 ### Fixed
 - **A DuckDB schema file now refuses a dropped table up front, by name, before
   it creates any view.** When a table is dropped at the source it leaves the
