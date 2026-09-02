@@ -4139,11 +4139,16 @@ function backupRefreshCard(br) {
   // daemon whose loop truly covers nothing.
   if (br.scheduled && br.targets === 0) {
     card.append(el("p", { class: "form-msg err", text:
-      "The refresh timer is running, but no server can be refreshed: a refresh needs an index connection " +
-      "and a local Backup dir. Nothing will refresh until a server has both (Backups & snapshots page)." }));
+      "The refresh timer is on, but no server can be refreshed: a refresh needs an index connection " +
+      "and a local Backup dir. Nothing will refresh until a server has both; set one in the servers list below." }));
   }
+  // What the skipped servers CAN do, not what a reader would like them to do:
+  // an update from the recorded changes writes Parquet to a local directory,
+  // which is the very field these servers lack, so the bucket is never read
+  // back into a cheaper backup. Promising one here would put this card's own
+  // false-coverage failure two lines below its fix.
   if (br.skipped_s3_only > 0) {
-    say(br.skipped_s3_only + " server(s) keep backups only in S3, so the timer skips them; their scheduled backups read the bucket instead.");
+    say(br.skipped_s3_only + " server(s) keep backups only in S3, so the timer skips them. A backup on those servers is always a full backup.");
   }
   // Three situations, not two. A daemon started with the backup trigger and no
   // refresh schedule still applies this to restores, so calling it dormant
