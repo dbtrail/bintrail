@@ -37,18 +37,16 @@ var ErrDestructiveDDL = errors.New("destructive DDL in reconstruction window")
 // than a hard failure: this is an additive safety net on top of the existing
 // reconstruct contract, not a new hard dependency.
 func CheckDestructiveDDL(ctx context.Context, db *sql.DB, schema, table string, since, until time.Time) error {
-	// schema_name = '' is matched too: parseDDL (internal/parser/parser.go)
-	// derives schema/table from the DDL statement text alone via a regex, and
-	// an unqualified statement — "TRUNCATE TABLE orders" after a session
-	// "USE mydb" — has no schema in the text, so schema_changes.schema_name is
-	// recorded empty for it even though the table itself is unambiguous. Since
-	// go-mysql's QUERY_EVENT does carry the session's default database
-	// (QueryEvent.Schema) but parseDDL doesn't consult it, matching schema_name
-	// = '' as a fallback is the safe direction here: it can only widen a match
-	// (favoring an over-cautious refusal) never narrow one, so a genuine
-	// TRUNCATE/DROP/RENAME can never be missed because of this gap. A future
-	// fix to plumb the session database through parseDDL would make this
-	// fallback redundant, not wrong.
+	// schema_name = '' is matched too, and the arm is NOT removable. Since
+	// #1435 parseDDL resolves an unqualified statement ("TRUNCATE TABLE
+	// orders" after "USE mydb") against the QUERY_EVENT's session default
+	// database, so NEW rows carry a real schema — but every row indexed
+	// before that fix has schema_name = '' (the original session's default
+	// is unrecoverable, so no backfill exists), and deleting this arm as
+	// "redundant now" would silently stop destructive-DDL detection for
+	// exactly the historical windows people reconstruct after an incident
+	// (#764's return path). The '' match can only widen a match (favoring an
+	// over-cautious refusal on historical rows), never narrow one.
 	const q = `SELECT ddl_type, detected_at FROM schema_changes
 		WHERE (schema_name = ? OR schema_name = '') AND table_name = ?
 		AND ddl_type IN ('TRUNCATE TABLE', 'DROP TABLE', 'RENAME TABLE')

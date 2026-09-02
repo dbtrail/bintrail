@@ -160,14 +160,17 @@ func buildSchemaChangesQuery(f schemaChangesFilter) (string, []any) {
 	// (case-insensitive there withholds MORE, the safe direction). Deny
 	// composes over allow via AND, so deny always wins.
 	//
-	// One thing binlog_events never has: schema_name can be EMPTY here. The
-	// parser derives it from the statement text alone, so `USE app; TRUNCATE
-	// TABLE secrets` is stored with schema_name = '' (the session's default
-	// database is not recorded). A deny keyed on the pair would let that row
-	// through, so the deny also withholds an unqualified row whose TABLE
-	// matches: it may be the denied table, and the safe direction is to
-	// withhold. The allow list already excludes such rows (BINARY '' never
-	// matches a named schema).
+	// One thing binlog_events never has: schema_name can be EMPTY here — on
+	// rows indexed before #1435, which recorded unqualified DDL (`USE app;
+	// TRUNCATE TABLE secrets`) with no schema. New rows carry the session's
+	// default database, so under an allow-list profile an unqualified DDL
+	// row goes from invisible-to-everyone to visible-to-users-allowed on
+	// that schema+table — the correct attribution, not a widening. The
+	// empty-row handling stays for the historical rows: a deny keyed on the
+	// pair would let them through, so the deny also withholds an unqualified
+	// row whose TABLE matches (it may be the denied table, and the safe
+	// direction is to withhold), and the allow list already excludes them
+	// (BINARY '' never matches a named schema).
 	if len(f.Allow) > 0 {
 		ors := make([]string, len(f.Allow))
 		for i, at := range f.Allow {

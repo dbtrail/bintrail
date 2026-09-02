@@ -30,9 +30,10 @@ func seedSchemaChanges(t *testing.T) *Server {
 			(detected_at, binlog_file, binlog_pos, schema_name, table_name, ddl_type, ddl_query)
 			VALUES (?, ?, ?, ?, ?, ?, ?)`, at, file, pos, schema, table, ddlType, stmt)
 	}
-	// Unqualified DDL: the parser derives schema_name from the statement
-	// text alone, so `USE app; TRUNCATE TABLE secrets` lands with an EMPTY
-	// schema. A deny on app.secrets has to withhold it too.
+	// A pre-#1435 unqualified-DDL row: those landed with an EMPTY schema
+	// (new rows carry the session default; this fixture INSERTs directly,
+	// standing in for the historical shape). A deny on app.secrets has to
+	// withhold it too.
 	insert("2026-06-01 11:59:00", "bin.000001", 800, "", "secrets", "TRUNCATE TABLE", "TRUNCATE TABLE secrets")
 	insert("2026-06-01 12:00:00", "bin.000001", 900, "app", "users", "CREATE TABLE", "CREATE TABLE users (id INT PRIMARY KEY)")
 	insert("2026-06-01 12:00:05", "bin.000001", 200, "app", "users", "ALTER TABLE", "ALTER TABLE users ADD COLUMN email VARCHAR(255)")
