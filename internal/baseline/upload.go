@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/dbtrail/dbtrail/internal/snapshotdir"
 	"github.com/dbtrail/dbtrail/internal/storage"
 )
 
@@ -151,14 +152,6 @@ func uploadWithOps(ctx context.Context, outputDir, prefix string, retry bool, op
 	incompleteKey := func(snapDir string) (string, error) {
 		return storage.BuildS3Key(outputDir, filepath.Join(snapDir, IncompleteMarker), prefix)
 	}
-	// Membership by CLEANED path, for the views-file branch below: WalkDir
-	// hands back paths built from outputDir as given, and snapDirs is built
-	// the same way, so cleaning both sides is what keeps "./out" and "out"
-	// from disagreeing about the same directory.
-	snapDirSet := make(map[string]bool, len(snapDirs))
-	for _, d := range snapDirs {
-		snapDirSet[filepath.Clean(d)] = true
-	}
 
 	// 1. Publish _INCOMPLETE FIRST so an interrupted upload reads as incomplete.
 	for _, snapDir := range snapDirs {
@@ -217,11 +210,31 @@ func uploadWithOps(ctx context.Context, outputDir, prefix string, retry bool, op
 		// wrong one. Skips are warnings, not errors: the snapshot's DATA is
 		// what _SUCCESS vouches for, and `bintrail views` can always produce
 		// the file later.
-		if d.Name() == SnapshotViewsName && snapDirSet[filepath.Clean(filepath.Dir(path))] {
-			if err := uploadRespelledViews(ctx, path, outputDir, prefix, retry, ops); err != nil {
-				return err
+		//
+		// Gated by NAME plus a snapshot-shaped PARENT, not by the snapDirs
+		// membership: that set holds only _SUCCESS-marked directories, and a
+		// crash between the views publish and the _SUCCESS write leaves a
+		// snapshot outside it whose views.sql would fall through to the plain
+		// copy — the exact wrong-paths artifact this branch exists to stop.
+		// Name-shaped fails closed; a views.sql at the baselines ROOT (an
+		// operator's own `bintrail views --out`) has a non-timestamp parent
+		// and still uploads verbatim, which is theirs to spell.
+		if base := filepath.Base(filepath.Dir(path)); d.Name() == SnapshotViewsName {
+			if _, isSnap := snapshotdir.ParseTime(base); isSnap {
+				uploaded, err := uploadRespelledViews(ctx, path, outputDir, prefix, retry, ops)
+				if err != nil {
+					return err
+				}
+				if uploaded {
+					count++
+				}
+				return nil
 			}
-			count++
+		}
+		// A crashed publish's staging leftover is not snapshot data; the
+		// writer sweeps them on its next run, and the walk must not ship one
+		// meanwhile (its content is the same wrong-paths artifact as above).
+		if strings.HasPrefix(d.Name(), snapshotViewsTempPrefix) {
 			return nil
 		}
 		if err := upload(path); err != nil {
@@ -255,67 +268,97 @@ func uploadWithOps(ctx context.Context, outputDir, prefix string, retry bool, op
 	return count, nil
 }
 
+// snapshotViewsTempPrefix mirrors the views writer's staging-file prefix so
+// the upload walk can skip leftovers of a crashed publish. A literal rather
+// than an alias, for the same import-direction reason as SnapshotViewsName —
+// pinned against drift by TestSnapshotViewsTempPrefixMatchesTheUploadSkip in
+// the views package, which reads it through SnapshotViewsStagingPrefix.
+const snapshotViewsTempPrefix = "." + SnapshotViewsName + ".tmp"
+
+// SnapshotViewsStagingPrefix exposes the prefix the upload walk skips, for
+// the views package's drift pin. Read-only; the walk is the consumer.
+func SnapshotViewsStagingPrefix() string { return snapshotViewsTempPrefix }
+
 // uploadRespelledViews publishes one snapshot's views file to S3 by
 // REGENERATING it against the destination's own spelling. localPath is the
 // snapshot's local views.sql; the key it lands under is the same one a plain
 // copy would have taken, so retry's exists-check and the layout are unchanged.
+// uploaded reports whether an object actually landed, so the caller's count
+// stays a count of objects in the bucket, never of intentions.
 //
 // Every refusal here is a skip with a warning, never an error: the file is a
 // convenience beside the data, and failing the upload over it would hold the
 // _SUCCESS marker hostage to an artifact `bintrail views` can rebuild.
-func uploadRespelledViews(ctx context.Context, localPath, outputDir, prefix string, retry bool, ops s3UploadOps) error {
+func uploadRespelledViews(ctx context.Context, localPath, outputDir, prefix string, retry bool, ops s3UploadOps) (uploaded bool, err error) {
 	key, err := storage.BuildS3Key(outputDir, localPath, prefix)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if retry {
 		exists, err := ops.objectExists(ctx, key)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if exists {
 			slog.Info("skipping existing S3 object (--retry)", "key", key)
-			return nil
+			return false, nil
 		}
 	}
-	if snapshotViewsRespeller == nil || ops.objectURL == nil {
+	// Two unarmed shapes, named apart: one is an import-graph fact about this
+	// binary, the other a caller that built its ops without objectURL. An
+	// operator sent to audit the wrong one chases nothing.
+	if snapshotViewsRespeller == nil {
 		slog.Warn("skipping the snapshot's views file: no generator is linked into this binary "+
 			"to respell it for S3, and the local copy names this machine's paths "+
 			"(regenerate with `bintrail views` against the bucket)", "key", key)
-		return nil
+		return false, nil
+	}
+	if ops.objectURL == nil {
+		slog.Warn("skipping the snapshot's views file: this upload path carries no destination "+
+			"URL spelling for the respell (regenerate with `bintrail views` against the bucket)", "key", key)
+		return false, nil
 	}
 	dirKey := ""
 	if i := strings.LastIndex(key, "/"); i >= 0 {
 		dirKey = key[:i]
 	}
-	content, ok, err := snapshotViewsRespeller(ctx, filepath.Dir(localPath), ops.objectURL(dirKey))
-	if err != nil || !ok {
+	content, ok, genErr := snapshotViewsRespeller(ctx, filepath.Dir(localPath), ops.objectURL(dirKey))
+	switch {
+	case genErr != nil:
 		slog.Warn("skipping the snapshot's views file: could not regenerate it for S3 "+
-			"(regenerate with `bintrail views` against the bucket)", "key", key, "error", err)
-		return nil
+			"(regenerate with `bintrail views` against the bucket)", "key", key, "error", genErr)
+		return false, nil
+	case !ok:
+		// A decline, not a failure: the directory holds nothing the generator
+		// describes. Reaching here with a real views.sql beside real tables
+		// would be a generator bug, so it stays visible, but without a nil
+		// error dressed as a cause.
+		slog.Warn("skipping the snapshot's views file: the directory holds no describable snapshot "+
+			"(regenerate with `bintrail views` against the bucket)", "key", key)
+		return false, nil
 	}
 	tmp, err := os.CreateTemp("", "bintrail-views-s3-*.sql")
 	if err != nil {
 		slog.Warn("skipping the snapshot's views file: no temp file for the respelled copy", "key", key, "error", err)
-		return nil
+		return false, nil
 	}
 	defer os.Remove(tmp.Name())
 	if _, err := tmp.WriteString(content); err != nil {
 		tmp.Close()
 		slog.Warn("skipping the snapshot's views file: could not stage the respelled copy", "key", key, "error", err)
-		return nil
+		return false, nil
 	}
 	if err := tmp.Close(); err != nil {
 		slog.Warn("skipping the snapshot's views file: could not stage the respelled copy", "key", key, "error", err)
-		return nil
+		return false, nil
 	}
 	// From here the failure is the TRANSPORT, same as any data file: let it
 	// fail the upload, or a flaky bucket would down-grade to a silent skip.
 	if err := ops.uploadFile(ctx, tmp.Name(), key); err != nil {
-		return err
+		return false, err
 	}
 	slog.Debug("uploaded respelled views file", "key", key)
-	return nil
+	return true, nil
 }
 
 // snapshotDirsWithSuccess returns the completed snapshot directories under

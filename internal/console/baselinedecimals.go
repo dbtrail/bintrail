@@ -60,11 +60,22 @@ func (s *Server) resolveBaselineDecimals(ctx context.Context, in *views.Input) {
 	// by the panel's setup deadline. Two callers racing the same snapshot just
 	// do the same read twice, which is harmless.
 	decimals, err := baseline.DecimalColumnsFor(ctx, in.BaselinePaths())
+	if err == nil {
+		in.ApplyDecimals(decimals)
+	}
+	// A canceled or expired context is the CALLER's state, never a fact about
+	// the snapshot, and this cache never forgets a "successful" answer. One
+	// browser hitting Stop mid-download (#1583 put a cancelable caller in
+	// front of this) would otherwise memoize either a negative entry or a
+	// PARTIAL positive one — five minutes, or forever, of silently uncast
+	// decimals for every later file of this snapshot — under a warning that
+	// sends the operator chasing a storage fault that never happened.
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil {
 		slog.Warn("console: could not read baseline column types from the Parquet footers; "+
 			"the state views will not cast decimal columns", "error", err)
-	} else {
-		in.ApplyDecimals(decimals)
 	}
 	s.rememberBaselineDecimals(key, decimals, err != nil)
 }

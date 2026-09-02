@@ -98,6 +98,83 @@ func TestUploadWithOps_skipsTheViewsFileUnarmed(t *testing.T) {
 	}
 }
 
+// A snapshot that never got its _SUCCESS (crash between the views publish and
+// the marker) sits OUTSIDE snapshotDirsWithSuccess — and its views.sql still
+// spells local paths. The respell gate is name-shaped, not membership-shaped,
+// precisely so this file cannot fall through to the plain copy.
+func TestUploadWithOps_neverPlainCopiesAMarkerlessSnapshotsViewsFile(t *testing.T) {
+	outputDir := uploadViewsFixture(t) // 2025-01-01: complete, with views.sql
+	crashed := filepath.Join(outputDir, "2025-02-01T00-00-00Z")
+	if err := os.MkdirAll(filepath.Join(crashed, "shop"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		filepath.Join("shop", "orders.parquet"): "y",
+		SnapshotViewsName:                       "-- LOCAL spelling, no marker",
+	} {
+		if err := os.WriteFile(filepath.Join(crashed, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	SetSnapshotViewsRespeller(func(_ context.Context, _, root string) (string, bool, error) {
+		return "-- RESPELLED under " + root, true, nil
+	})
+	t.Cleanup(func() { SetSnapshotViewsRespeller(nil) })
+
+	uploaded := map[string]string{}
+	ops := s3UploadOps{
+		putEmpty: func(_ context.Context, _ string) error { return nil },
+		uploadFile: func(_ context.Context, path, key string) error {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			uploaded[key] = string(b)
+			return nil
+		},
+		objectExists: func(_ context.Context, _ string) (bool, error) { return false, nil },
+		deleteObject: func(_ context.Context, _ string) error { return nil },
+		objectURL:    func(key string) string { return "s3://bkt/" + key },
+	}
+	if _, err := uploadWithOps(context.Background(), outputDir, "p", false, ops); err != nil {
+		t.Fatalf("uploadWithOps: %v", err)
+	}
+	got := uploaded["p/2025-02-01T00-00-00Z/"+SnapshotViewsName]
+	if strings.Contains(got, "LOCAL spelling") {
+		t.Fatalf("the markerless snapshot's views file was plain-copied to S3: %q", got)
+	}
+}
+
+// A crashed publish's staging leftover is the same wrong-paths content under
+// a temp name; the walk must not ship it as snapshot data.
+func TestUploadWithOps_skipsViewsStagingLeftovers(t *testing.T) {
+	outputDir := uploadViewsFixture(t)
+	leftover := filepath.Join(outputDir, "2025-01-01T00-00-00Z", snapshotViewsTempPrefix+"123")
+	if err := os.WriteFile(leftover, []byte("-- half-written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	SetSnapshotViewsRespeller(func(_ context.Context, _, root string) (string, bool, error) {
+		return "-- RESPELLED", true, nil
+	})
+	t.Cleanup(func() { SetSnapshotViewsRespeller(nil) })
+	uploaded := map[string]bool{}
+	ops := s3UploadOps{
+		putEmpty:     func(_ context.Context, _ string) error { return nil },
+		uploadFile:   func(_ context.Context, _, key string) error { uploaded[key] = true; return nil },
+		objectExists: func(_ context.Context, _ string) (bool, error) { return false, nil },
+		deleteObject: func(_ context.Context, _ string) error { return nil },
+		objectURL:    func(key string) string { return "s3://bkt/" + key },
+	}
+	if _, err := uploadWithOps(context.Background(), outputDir, "p", false, ops); err != nil {
+		t.Fatalf("uploadWithOps: %v", err)
+	}
+	for key := range uploaded {
+		if strings.Contains(key, ".tmp") {
+			t.Fatalf("a staging leftover was uploaded as snapshot data: %s", key)
+		}
+	}
+}
+
 func keys(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

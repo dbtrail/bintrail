@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -40,8 +41,27 @@ const SnapshotFileName = baseline.SnapshotViewsName
 // WriteSuccessMarker carries no context, so the hook makes its own.
 const snapshotViewsTimeout = 60 * time.Second
 
+// producerVersion stamps the published file's header. Pushed in by each main
+// package (cli.SetBuildVersion chains here; consoleapp.Main calls directly)
+// because the hooks below run with no caller context to carry it. Empty
+// renders as "(unknown version)"; never load-bearing.
+var producerVersion string
+
+// SetProducerVersion records the running binary's version for the
+// snapshot-published views file.
+func SetProducerVersion(v string) { producerVersion = v }
+
 func init() {
+	// Both hooks are panic-isolated. The generator's cost center is DuckDB
+	// (cgo), the codebase's known panic source, and these run INSIDE the
+	// publish path: unrecovered, a deterministic panic makes a COMPLETE
+	// snapshot permanently unpublishable — WriteSuccessMarker dies before
+	// _SUCCESS on every retry, or an upload aborts mid-walk with _INCOMPLETE
+	// standing. Unlike the job-slot recovers the v0.70.0 notes warn about,
+	// recover-warn-continue is safe here: the hook is synchronous and its
+	// caller proceeds to publish; the artifact is the only loss.
 	baseline.SetSnapshotViewsWriter(func(snapshotDir string) {
+		defer recoverSnapshotViews("publish", snapshotDir)
 		ctx, cancel := context.WithTimeout(context.Background(), snapshotViewsTimeout)
 		defer cancel()
 		if err := WriteSnapshotViews(ctx, snapshotDir); err != nil {
@@ -53,7 +73,29 @@ func init() {
 				"regenerate the file with `bintrail views`)", "dir", snapshotDir, "error", err)
 		}
 	})
-	baseline.SetSnapshotViewsRespeller(GenerateSnapshotViews)
+	baseline.SetSnapshotViewsRespeller(func(ctx context.Context, snapshotDir, root string) (content string, ok bool, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				recoverLogSnapshotViews("respell", snapshotDir, r)
+				content, ok, err = "", false, fmt.Errorf("views generator panicked: %v", r)
+			}
+		}()
+		return GenerateSnapshotViews(ctx, snapshotDir, root)
+	})
+}
+
+// recoverSnapshotViews is the writer hook's deferred recover; split from the
+// logging so the respeller's value-returning recover shares the message.
+func recoverSnapshotViews(what, dir string) {
+	if r := recover(); r != nil {
+		recoverLogSnapshotViews(what, dir, r)
+	}
+}
+
+func recoverLogSnapshotViews(what, dir string, r any) {
+	slog.Error("snapshot views.sql "+what+" panicked; the snapshot itself is unaffected "+
+		"(regenerate the file with `bintrail views`)",
+		"dir", dir, "panic", r, "stack", string(debug.Stack()))
 }
 
 // WriteSnapshotViews publishes SnapshotFileName into snapshotDir, spelling
@@ -64,6 +106,7 @@ func init() {
 // same marker path with a dump directory this file has no business in, the
 // exact shape PublishCurrentPointer already declines.
 func WriteSnapshotViews(ctx context.Context, snapshotDir string) error {
+	sweepSnapshotViewsTemp(snapshotDir)
 	abs, err := filepath.Abs(snapshotDir)
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", snapshotDir, err)
@@ -76,7 +119,7 @@ func WriteSnapshotViews(ctx context.Context, snapshotDir string) error {
 	// crash mid-write must not leave half a script for someone to paste into
 	// DuckDB. The temp file lives in the snapshot directory so the rename
 	// cannot cross filesystems.
-	tmp, err := os.CreateTemp(snapshotDir, "."+SnapshotFileName+".tmp*")
+	tmp, err := os.CreateTemp(snapshotDir, snapshotViewsTempPrefix+"*")
 	if err != nil {
 		return err
 	}
@@ -136,6 +179,7 @@ func GenerateSnapshotViews(ctx context.Context, snapshotDir, root string) (strin
 func SnapshotScopedInput(ts time.Time, tables []BaselineTable) Input {
 	return Input{
 		GeneratedAt:      time.Now().UTC(),
+		Version:          producerVersion,
 		BaselineSnapshot: ts,
 		Follow:           FollowNone,
 		SnapshotScoped:   true,
@@ -156,6 +200,30 @@ func (in *Input) RespellBaselines(root string) {
 		in.Baselines[i].Path = base + "/" + in.Baselines[i].Rel
 	}
 }
+
+// sweepSnapshotViewsTemp removes staging leftovers from a publish that died
+// between CreateTemp and the rename. Without it the junk file — full of this
+// machine's absolute paths — rides every later upload and tarball as snapshot
+// data (the upload walk skips it by prefix as a belt; this is the cleanup).
+// Best-effort and unlogged, like the pointer's own staging sweep.
+func sweepSnapshotViewsTemp(snapshotDir string) {
+	matches, err := filepath.Glob(filepath.Join(snapshotDir, snapshotViewsTempPrefix+"*"))
+	if err != nil {
+		return
+	}
+	for _, m := range matches {
+		_ = os.Remove(m)
+	}
+}
+
+// SnapshotFileTempPrefix names the atomic-publish staging files. Exported for
+// the console's tar stream, which must not ship a crashed publish's leftover
+// as snapshot data; internal/baseline cannot import this package (the arrow
+// points the other way), so its upload walk carries the same literal, pinned
+// against drift by TestSnapshotViewsTempPrefixMatchesTheUploadSkip.
+const SnapshotFileTempPrefix = "." + SnapshotFileName + ".tmp"
+
+const snapshotViewsTempPrefix = SnapshotFileTempPrefix
 
 // snapshotTables walks a snapshot directory's <schema>/<table>.parquet layout.
 // Path is the LOCAL path (the caller respells it); Rel is the tail below the

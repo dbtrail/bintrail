@@ -26,6 +26,7 @@ import (
 
 	"github.com/dbtrail/dbtrail/internal/cli"
 	"github.com/dbtrail/dbtrail/internal/telemetry"
+	"github.com/dbtrail/dbtrail/internal/views"
 
 	"github.com/spf13/cobra"
 
@@ -83,6 +84,11 @@ func Main(version, commitSHA, buildDate string) int {
 	appVersion = version
 	rootCmd.Version = fmt.Sprintf("%s (commit %s, built %s)", version, commitSHA, buildDate)
 	telemetry.SetVersion(version)
+	// The snapshot-published views.sql (#1583) stamps its producer's version;
+	// the daemon's dump/refresh/restore jobs publish through hooks with no
+	// caller context, so the version is pushed in once here, the same road
+	// telemetry takes.
+	views.SetProducerVersion(version)
 	if err := tel.Execute(rootCmd); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

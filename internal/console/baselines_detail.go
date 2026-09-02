@@ -428,9 +428,15 @@ func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) 
 	// Rendered BEFORE the first byte: the footer reads behind the decimal
 	// casts can be slow (or hang on a bad store), and a stall belongs ahead
 	// of the 200, where the client still sees an honest failure, not
-	// mid-stream where curl saves a truncated archive.
+	// mid-stream where curl saves a truncated archive. Bounded for the reason
+	// resolveSnapshotRequest bounds its listings: this runs in the process
+	// that is also capturing, the server sets no WriteTimeout, and DuckDB's
+	// per-file httpfs fallback is O(tables) network reads — a hung store must
+	// cost the reader their casts, never pin the handler.
 	ts, _ := parseSnapshotAt(r.URL.Query().Get("at"))
-	viewsSQL := s.snapshotViewsRelative(r.Context(), ss, ts, files)
+	vctx, vcancel := context.WithTimeout(r.Context(), baselineListTimeout)
+	viewsSQL := s.snapshotViewsRelative(vctx, ss, ts, files)
+	vcancel()
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", `attachment; filename="dbtrail-backup-`+dirName+`.tar.gz"`)
 
@@ -478,8 +484,11 @@ func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) 
 		// wherever the snapshot lives, which is the one place an unpacked
 		// tarball is not. Its replacement is appended after the loop — always
 		// skipped, even if rendering the replacement produced nothing, because
-		// a file whose every path is wrong is worse than no file.
-		if f.RelPath == dirName+"/"+views.SnapshotFileName {
+		// a file whose every path is wrong is worse than no file. A crashed
+		// publish's staging leftover carries the same wrong-paths content and
+		// is skipped by its prefix.
+		if f.RelPath == dirName+"/"+views.SnapshotFileName ||
+			strings.HasPrefix(path.Base(f.RelPath), views.SnapshotFileTempPrefix) {
 			continue
 		}
 		hdr := &tar.Header{Name: f.RelPath, Mode: 0o644, Size: f.Size, ModTime: f.ModTime}
