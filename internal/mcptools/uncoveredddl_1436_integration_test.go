@@ -36,9 +36,9 @@ func TestIntegrationUncoveredOnlyMatchesTheStatusCount(t *testing.T) {
 			pos, table, ddlType, stmt, snapshotID))
 	}
 	insert(100, "orders", "ALTER TABLE", "ALTER TABLE orders ADD COLUMN note TEXT", "7") // covered
-	insert(200, "users", "ALTER TABLE", "ALTER TABLE users DROP COLUMN tmp", "NULL")    // uncovered
-	insert(300, "orders", "TRUNCATE TABLE", "TRUNCATE TABLE orders", "NULL")            // null by design
-	insert(400, "users", "TRUNCATE TABLE", "TRUNCATE users", "NULL")                    // null by design
+	insert(200, "users", "ALTER TABLE", "ALTER TABLE users DROP COLUMN tmp", "NULL")     // uncovered
+	insert(300, "orders", "TRUNCATE TABLE", "TRUNCATE TABLE orders", "NULL")             // null by design
+	insert(400, "users", "TRUNCATE TABLE", "TRUNCATE users", "NULL")                     // null by design
 
 	cov, err := status.LoadCoverage(context.Background(), db)
 	if err != nil {
@@ -88,4 +88,3 @@ func TestIntegrationUncoveredOnlyMatchesTheStatusCount(t *testing.T) {
 		t.Errorf("both TRUNCATE rows must carry the snapshot_note, got:\n%s", allText)
 	}
 }
-

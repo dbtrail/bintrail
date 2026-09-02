@@ -326,10 +326,6 @@ func LoadArchiveStats(ctx context.Context, db *sql.DB) (*ArchiveStats, error) {
 	return &a, nil
 }
 
-// LoadCoverage loads restore coverage info from binlog_events, schema_changes,
-// and archive_state. Archive coverage is derived from partition names stored in
-// archive_state (e.g. "p_2026021914" → 2026-02-19 14:00 UTC) without reading
-// Parquet files.
 // UncoveredDDLWhere is the ONE definition of "a DDL with no covering
 // snapshot", shared by this package's UncoveredDDLs count and the
 // list_schema_changes tool's uncovered_only filter (#1436) — the two were
@@ -340,8 +336,16 @@ func LoadArchiveStats(ctx context.Context, db *sql.DB) (*ArchiveStats, error) {
 // capture path records it with snapshot_id = NULL on purpose ("DDL detected
 // (no snapshot needed)") — a NULL there is not a coverage gap, and counting
 // it would permanently inflate the warning.
-const UncoveredDDLWhere = `snapshot_id IS NULL AND ddl_type <> 'TRUNCATE TABLE'`
+//
+// Parenthesized so both consumers compose it safely: status appends it to
+// WHERE, the tool to an existing clause with AND — an OR added here later
+// would otherwise bind correctly in one site and silently wrong in the other.
+const UncoveredDDLWhere = `(snapshot_id IS NULL AND ddl_type <> 'TRUNCATE TABLE')`
 
+// LoadCoverage loads restore coverage info from binlog_events, schema_changes,
+// and archive_state. Archive coverage is derived from partition names stored in
+// archive_state (e.g. "p_2026021914" → 2026-02-19 14:00 UTC) without reading
+// Parquet files.
 func LoadCoverage(ctx context.Context, db *sql.DB) (*CoverageInfo, error) {
 	var c CoverageInfo
 	err := db.QueryRowContext(ctx, `

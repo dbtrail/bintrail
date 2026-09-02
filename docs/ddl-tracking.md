@@ -94,11 +94,13 @@ This table is created by `bintrail init` and must exist in the index database. O
 The MCP server exposes this table as the `list_schema_changes` tool, so an AI
 assistant can answer "what ALTERs hit the orders table this month?" directly.
 Filters: `schema`, `table`, `ddl_type` (prefix-matched — `ALTER` matches
-`ALTER TABLE`), `since`, `until`, `limit`, and `uncovered_only` (only rows
-where `snapshot_id` is NULL). Each result carries the full DDL statement,
-binlog coordinates, detection timestamp, and the covering `snapshot_id`
-(`null` = uncovered), so an agent can go from the status warning about
-uncovered DDLs straight to the exact rows. See
+`ALTER TABLE`), `since`, `until`, `limit`, and `uncovered_only` — exactly the
+rows behind the `status` warning: `snapshot_id` null AND the DDL is not a
+`TRUNCATE TABLE`, whose null is by design (see below). Each result carries
+the full DDL statement, binlog coordinates, detection timestamp, and the
+covering `snapshot_id`; a `null` there means uncovered except on a TRUNCATE
+row, which says so itself via `snapshot_note`. An agent can go from the
+status warning about uncovered DDLs straight to the exact rows. See
 [mcp-server.md](./mcp-server.md).
 
 ---
