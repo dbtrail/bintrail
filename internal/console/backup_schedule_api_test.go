@@ -290,7 +290,7 @@ func TestBackupScheduleAPI_lastRunAndSkipComeFromTheHistory(t *testing.T) {
 	h := srv.baselineHistory
 	if err := h.Append(BaselineRunRecord{ServerID: id, Kind: BaselineRunRefresh, Trigger: BaselineRunTriggerScheduled,
 		StartedAt: "2026-08-28T09:00:00Z", FinishedAt: "2026-08-28T09:04:00Z", SnapshotTime: "2026-08-28T09:00:00Z",
-		Tables: 12, Carried: 3}); err != nil {
+		Tables: 12, Carried: 3, CarriedCopied: 2}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.AppendSkip(BaselineRunRecord{ServerID: id, Kind: BaselineRunDump, SkipReason: "busy",
@@ -302,7 +302,8 @@ func TestBackupScheduleAPI_lastRunAndSkipComeFromTheHistory(t *testing.T) {
 	_, body := doServersReqHeader(t, srv, "GET", "/api/baselines", "", id)
 	got := scheduleOf(t, body)
 	if got == nil || got.LastRun == nil || got.LastRun.Method != BackupMethodRefresh || !got.LastRun.OK ||
-		got.LastRun.Tables != 12 || got.LastRun.Carried != 3 || got.LastRun.SnapshotTime != "2026-08-28T09:00:00Z" {
+		got.LastRun.Tables != 12 || got.LastRun.Carried != 3 || got.LastRun.CarriedCopied != 2 ||
+		got.LastRun.SnapshotTime != "2026-08-28T09:00:00Z" {
 		t.Fatalf("last_run = %+v", got)
 	}
 	if got.LastSkipped == nil || got.LastSkipped.Reason != "busy" || got.LastSkipped.At != "2026-08-28T15:00:00Z" {

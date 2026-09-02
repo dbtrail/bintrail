@@ -515,7 +515,7 @@ func dirExists(path string) bool {
 // both callers sit behind a `go` and a live fold, so nothing at the unit tier
 // could reach them, and dropping the reused count from either copy compiled and
 // passed the whole suite. It is also the deduplication: two copies of a
-// four-field assignment is exactly how one of them silently loses a field.
+// five-count assignment is exactly how one of them silently loses a field.
 func applyFoldStatus(st *console.BaselineStatus, tables, refused int, reuse reuseTally, err error) {
 	st.FinishedAt = nowStamp()
 	st.Tables = tables

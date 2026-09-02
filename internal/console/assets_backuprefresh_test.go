@@ -354,6 +354,28 @@ func TestBackupRefreshCard_titleSaysWhatItDoes(t *testing.T) {
 	}
 }
 
+// TestReusedCopiedNote_saysWhatACopyCost pins the only user-visible half of
+// #1578: every layer under the render (carryForward's bool, the fold wiring,
+// countReuse, applyFoldStatus, the wire names) is guarded, but the string the
+// reporter actually reads was not — emptying reusedCopiedNote restored the
+// exact bug (a copied reuse rendering as a disk saving) with the whole Go
+// suite green, because the wire-name guard only checks the fields are READ.
+func TestReusedCopiedNote_saysWhatACopyCost(t *testing.T) {
+	body := jsFunctionBody(t, readAsset(t, "app.js"), "reusedCopiedNote")
+	// The zero arm: no copies, no qualifier — the unqualified "reused" note
+	// is then the correct claim.
+	if !strings.Contains(body, `if (!copied) return "";`) {
+		t.Error("reusedCopiedNote no longer returns empty for zero copies; every reuse would carry a false qualifier")
+	}
+	// The non-empty arm carries the counter and the two load-bearing claims:
+	// no disk was saved, and the cause is in the daemon log.
+	for _, want := range []string{`+ copied +`, "which saved no disk", "the daemon log says why"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("reusedCopiedNote lost %q; a copied reuse would render as a disk saving again (#1578)", want)
+		}
+	}
+}
+
 // TestBackupRefreshCard_prose (#1528): a line of help under a control is fine,
 // a paragraph means the control explains itself instead of being clear. The
 // on-state used to carry the shared-bytes consequence of a hard link in the

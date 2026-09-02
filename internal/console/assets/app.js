@@ -4595,7 +4595,7 @@ function archivingPanel(servers, serversErr) {
 // away (#1578).
 function reusedCopiedNote(copied) {
   if (!copied) return "";
-  return " (" + copied + " of them written as full copies, which saved no disk; the daemon log says why)";
+  return " (" + copied + " of them written in full, which saved no disk; the daemon log says why)";
 }
 
 // baselineRefreshNote renders the last automatic refresh for the selected
