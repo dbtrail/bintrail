@@ -592,13 +592,12 @@ func jsArmSummary(t *testing.T, body, anchor string) string {
 //     never probed, so "Using access keys" is false whenever the ID is
 //     exported without it.
 //
-// Exactly TWO arms are covered here, and saying so is the point: the ECS and
-// EKS arms still read "Using an IAM role" from environment-variable presence
-// alone, which is weaker evidence than the file stat behind the shared-config
-// arm. That is dbtrail#1534, deliberately out of scope for #1528, and the
-// comment in credentialsCard has to keep pointing at it. A guard or a comment
-// that describes "every arm" as hedged would be the same over-claim the card
-// itself is being fixed for.
+// The role arms are covered here too since #1534 closed them, and each one
+// says what its own evidence supports rather than one shared hedge: ECS is
+// still env-var presence (probing the endpoint is a network call, a separate
+// decision), so its sentence claims only that the variable is there, while the
+// EKS arms report the token-file probe and AWS_ROLE_ARN separately — an
+// unreadable token and a missing role ARN are different repairs.
 //
 // Each assertion is scoped to the STRING that arm assigns. See jsArmSummary
 // for why neither a byte window nor the whole line is narrow enough.
@@ -712,12 +711,13 @@ func TestCredentialsCard_armsReportWhatWasProbed(t *testing.T) {
 	}
 }
 
-// TestCredentialsCard_commentDoesNotOverclaim (#1528 pass 3). The "presence,
-// not use" note was hoisted above the whole if/else chain and generalized to
-// "every arm below". Two arms below say "Using an IAM role" from env-var
-// presence alone. A comment that describes unhedged arms as hedged is the same
-// defect as the copy this PR is fixing, one layer down, and it is the thing a
-// later reader trusts instead of re-deriving.
+// TestCredentialsCard_commentDoesNotOverclaim (#1528 pass 3, flipped by
+// #1534). The comment above the if/else chain is what a later reader trusts
+// instead of re-deriving, so it has to track the arms. It once had to say the
+// role arms were NOT hedged; now that they are, the stale claim is the danger
+// — it would send a reader to re-fix fixed code, and its own message named the
+// worst way to quiet it (drop the hedging). This guard bans that text and
+// requires the #1534 citation the arms' shapes need.
 //
 // Read from the RAW asset on purpose: jsFunctionBody blanks comment lines, so
 // the body view cannot see a comment at all.

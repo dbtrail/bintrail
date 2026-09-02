@@ -31,10 +31,21 @@ type awsCredsDTO struct {
 }
 
 // webIdentityTokenReadable reports whether the IRSA token file can actually
-// be opened for reading — a stat is not enough (mode-000 files stat fine),
-// and reading is what the SDK's provider will do.
+// be opened for reading. Both checks are load-bearing and neither replaces the
+// other: os.Open SUCCEEDS on a directory (an operator who points the variable
+// at the projected-volume mount instead of the token inside it would be told
+// the token is readable while the SDK's read fails with EISDIR) and it BLOCKS
+// forever on a FIFO with no writer, which would leak this handler's goroutine
+// per request; a stat alone passes a mode-000 file the SDK cannot read. Stat,
+// not Lstat: a Kubernetes projected token is a symlink farm
+// (token -> ..data/token), and Lstat would report a healthy IRSA mount as
+// unreadable.
 func webIdentityTokenReadable(path string) bool {
 	if path == "" {
+		return false
+	}
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() {
 		return false
 	}
 	f, err := os.Open(path)

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -109,6 +110,50 @@ func TestStorageAPI_webIdentityIsProbedNotAsserted(t *testing.T) {
 	t.Setenv("AWS_ROLE_ARN", "")
 	if aws := read(); !aws.WebIdentityTokenReadable || aws.WebIdentityRoleArn {
 		t.Fatalf("no role arn = %+v, want readable token and role_arn false", aws)
+	}
+
+	// The projected-volume mount pointed at instead of the token inside it.
+	// os.Open succeeds on a directory, so a probe built on Open alone reports
+	// this as readable while the SDK's own read fails with EISDIR — the same
+	// unearned claim #1534 exists to retire.
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tmp)
+	if aws := read(); !aws.WebIdentity || aws.WebIdentityTokenReadable {
+		t.Fatalf("directory = %+v, want web_identity set and token NOT readable", aws)
+	}
+
+	// A Kubernetes projected token is a symlink farm (token -> ..data/token),
+	// so the probe must follow symlinks: Lstat here would report a healthy
+	// IRSA mount as unreadable.
+	link := filepath.Join(tmp, "linked-token")
+	if err := os.Symlink(token, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", link)
+	if aws := read(); !aws.WebIdentityTokenReadable {
+		t.Fatalf("symlinked token = %+v, want readable (projected tokens are symlinks)", aws)
+	}
+}
+
+// TestStorageAPI_webIdentityFifoDoesNotBlock: os.Open on a FIFO with no writer
+// blocks forever, which would strand this handler's goroutine (and its
+// response) on every GET /api/storage. The probe stats first, so a FIFO is
+// answered immediately. Asserted with a deadline because the regression is a
+// HANG, not a wrong answer — a bare call would wedge the test binary instead
+// of failing it.
+func TestStorageAPI_webIdentityFifoDoesNotBlock(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo unsupported here: %v", err)
+	}
+	done := make(chan bool, 1)
+	go func() { done <- webIdentityTokenReadable(fifo) }()
+	select {
+	case got := <-done:
+		if got {
+			t.Fatal("a FIFO is not a readable token file")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("webIdentityTokenReadable blocked on a FIFO with no writer")
 	}
 }
 
