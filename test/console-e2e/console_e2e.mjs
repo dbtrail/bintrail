@@ -4097,12 +4097,15 @@ try {
               // says "server(s)" without the number tells an operator nothing
               // about how much is uncovered.
               skipNote: t.includes(skipped + " server(s) keep backups only in S3"),
-              // The claim the skip note must NOT make: these servers cannot
-              // rebuild from the bucket, because the fold writes its Parquet
-              // to the local directory they do not have. Read from the skip
-              // PARAGRAPH, not the card: the saving sentence above legitimately
-              // says "reuses nothing" about the same servers.
-              skipPromisesReuse: /read the bucket|reus|recorded changes/i.test(
+              // The skip note may MENTION the cheaper update, but only to DENY
+              // it: these servers cannot get one, because the fold writes its
+              // Parquet to the local directory they do not have. An unnegated
+              // mention is the promise the first version of this note made
+              // ("their scheduled backups read the bucket instead"). Read from
+              // the skip PARAGRAPH, not the card: the saving sentence above
+              // legitimately says "reuses nothing" about the same servers.
+              skipPromisesReuse: ((line) => /read the bucket/i.test(line)
+                || (/(reus|recorded changes)/i.test(line) && !/\b(never|cannot|no)\b/i.test(line)))(
                 Array.from(el.querySelectorAll("p")).map((p) => p.textContent)
                   .find((x) => x.includes("keep backups only in S3")) || ""),
               pill: (el.querySelector(".bkr-state") || {}).textContent || "",
