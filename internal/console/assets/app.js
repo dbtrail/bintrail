@@ -82,7 +82,10 @@ const ROUTES = ["overview", "events", "schema-changes", "timetravel", "recover",
   // recovery artifacts, not settings, and the snapshot list is unbounded in
   // practice — it pushed verification, the panel that answers "are my backups
   // restorable", roughly two screens below the fold.
-  "baselines", "verification"];
+  "baselines", "verification",
+  // The Backups & snapshots settings page (#1582): every parameter that
+  // shapes a backup or a snapshot, with its provenance.
+  "backup-settings"];
 
 // DOCS_PAGES maps a route to its page on www.dbtrail.com/docs (#1450), the
 // separately authored docs site. NOT this repo's docs/*.md: the site does not
@@ -899,7 +902,7 @@ function navigate(route, params, push = true) {
   // Protect shares that gate: both routes read watch-daemon state (the
   // snapshot listing and the verification runner). Same treatment, so a
   // bookmark to either lands on Overview rather than an empty page.
-  if ((route === "baselines" || route === "verification") && !capsCache.monitor) route = "overview";
+  if ((route === "baselines" || route === "verification" || route === "backup-settings") && !capsCache.monitor) route = "overview";
   // The SQL page was removed (#1549). A stale route string handed to
   // navigate() lands where the DuckDB schema card actually is (#1581):
   // Backups when that page exists, Connect on the serve-only fallback — a
@@ -953,6 +956,7 @@ function renderRoute() {
     case "status": return renderStatus();
     case "retention": return renderRetention();
     case "daemon": return renderDaemon();
+    case "backup-settings": return renderBackupSettings();
     case "baselines": return renderBaselines();
     case "verification": return renderVerification();
     case "connect": return renderConnect();
@@ -3891,13 +3895,9 @@ async function renderBaselines() {
   // Independent degradation, as on Storage: a panel renders its own failure
   // note rather than one error blanking the page.
   const asErr = (err) => ({ error: (err && err.message) || String(err) });
-  const [serversRes, baselines, backupRefresh] = await Promise.all([
+  const [serversRes, baselines] = await Promise.all([
     api("/api/servers").catch(asErr),
     api("/api/baselines").catch(asErr),
-    // File reuse moved here from Storage (#1528/#1543): it decides how a
-    // backup is PRODUCED, so it belongs beside the schedule it was being
-    // confused with, not on a page about where old data goes.
-    api("/api/baseline-refresh").catch(asErr),
   ]);
   if (gen !== serverGen || vgen !== viewGen) return;
   // Run states for the selected server: only the endpoints this daemon
@@ -3954,12 +3954,9 @@ async function renderBaselines() {
     // anything.
     const scheduleCard = backupScheduleCard(cur, baselines);
     if (scheduleCard) v.append(scheduleCard);
-    // Directly under the schedule, because the two were the pair #1528 named:
-    // "Automatic backup refresh" and "Scheduled backups" both promised
-    // "backups, automatically" from different pages, for unrelated settings.
-    // Side by side, under names that say what each does, the difference needs
-    // no paragraph.
-    v.append(el("div", { class: "cards" }, backupRefreshCard(backupRefresh)));
+    // The carry-forward card ("Backups & disk space") moved to the Backups &
+    // snapshots settings page (#1582): it is a setting, and this page keeps
+    // the WORK — schedules, runs, downloads — beside the data it reports on.
     const restoreCard = backupRestoreCard(cur, baselines, restoreSt);
     if (restoreCard) v.append(restoreCard);
     v.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
@@ -4195,6 +4192,180 @@ async function saveBackupRefresh(body) {
     ? (on ? "Saved. Unchanged tables can now keep their last file" : "Every table will be written again")
     : "Saved. Nothing uses it yet, so it starts working the next time dbtrail runs with backups or restores turned on.");
   renderRoute();
+}
+
+// ── Backups & snapshots settings (#1582) ────────────────────────────────────
+//
+// The one page that owns backup and snapshot parameters. Its job is
+// PROVENANCE: the precedence (per server, then daemon flag, then nothing) is
+// real and used to be invisible — a server backed by the daemon's backup
+// folder showed an empty field, indistinguishable from a server with no
+// backup location at all. Daemon-wide values render read-only with the exact
+// name to change and a restart chip ON the row, never as a prose paragraph;
+// per-server values edit in place.
+
+async function renderBackupSettings() {
+  if (!capsCache.monitor) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
+  const gen = serverGen, vgen = viewGen;
+  viewLoading();
+  const asErr = (err) => ({ error: (err && err.message) || String(err) });
+  const [settings, refresh] = await Promise.all([
+    api("/api/backup-settings").catch(asErr),
+    api("/api/baseline-refresh").catch(asErr),
+  ]);
+  if (gen !== serverGen || vgen !== viewGen) return;
+  try {
+    buildBackupSettings(settings, refresh);
+  } catch (err) {
+    const v = VIEW(); clear(v); v.append(pageHead("Backups & snapshots", null)); renderError(v, err);
+  }
+}
+
+function buildBackupSettings(settings, refresh) {
+  const v = VIEW(); clear(v);
+  v.append(pageHead("Backups & snapshots", el("p", { class: "page-sub" },
+    "Every setting that shapes a backup or a snapshot, and where each value comes from.")));
+  const broken = settings && settings.error;
+  if (broken) v.append(el("div", { class: "error-box", text: "Could not load settings: " + settings.error }));
+  const cards = el("div", { class: "cards" });
+  // The carry-forward card moved here from the Backups page: it is a setting,
+  // and this page is where settings live; the Backups page keeps the work
+  // (schedules, runs, downloads) beside the data it reports on.
+  cards.append(backupRefreshCard(refresh));
+  if (!broken) cards.append(backupDaemonCard(settings.daemon || []));
+  v.append(cards);
+  if (!broken) v.append(backupServersPanel(settings));
+  viewEnter();
+}
+
+// What each daemon-wide key means, in words a reader who never saw the flag
+// can act on. The flag itself rides beside the value in the (CLI: ...) form.
+const BACKUP_DAEMON_ROWS = {
+  baseline_dir: "Backup folder for servers without their own",
+  baseline_s3: "Backup S3 for servers without their own",
+  baseline_retain: "Delete local snapshots older than",
+  refresh_every: "Rebuild the newest backup every",
+  lock_mode: "How a dump holds the database still",
+  trigger: "Create-backup button",
+  staging_dir: "Staging folder for .sql builds",
+  verify_interval: "Verify every",
+  verify_tables: "Verify only these tables",
+};
+
+// backupDaemonCard renders the values this process was started with. All of
+// them need a restart to change, and each row says so itself — a chip on the
+// control, not a sentence above it — beside the exact flag or variable name.
+function backupDaemonCard(rows) {
+  const card = el("div", { class: "card" });
+  card.append(el("div", { class: "card-title", text: "This daemon" }));
+  card.append(el("p", { class: "stg-hint", text:
+    "What this process was started with. These change on the command line or in the environment, and take effect when it restarts." }));
+  for (const row of rows) {
+    const label = BACKUP_DAEMON_ROWS[row.key] || row.key;
+    let value = row.value;
+    if (row.on != null) value = row.on ? "On" : "Off";
+    const r = el("div", { class: "bks-row" },
+      el("span", { class: "bks-label", text: label }),
+      el("span", { class: "bks-value" + (value ? "" : " muted"), text: value || "not set" }));
+    // The restart split lives ON the control, not in prose: a chip per row.
+    if (row.needs_restart) r.append(el("span", { class: "tag-pill bks-restart", text: "restart to change" }));
+    r.append(el("span", { class: "bks-cli", text: "(CLI: " + row.cli + ")" }));
+    card.append(r);
+  }
+  return card;
+}
+
+// backupServersPanel is the per-server half: the editable backup location and
+// archive toggle, each with the provenance the servers API never showed.
+function backupServersPanel(settings) {
+  const panel = el("section", { class: "ov-panel" });
+  panel.append(el("div", { class: "ov-panel-head" },
+    el("h2", { class: "ov-panel-title", text: "Per server" })));
+  const servers = settings.servers || [];
+  if (!servers.length) {
+    panel.append(el("p", { class: "form-hint", text: "No servers in the registry yet. Add one on the Servers page." }));
+    return panel;
+  }
+  if (settings.registry_read_only) {
+    panel.append(el("p", { class: "form-msg err", text:
+      "The server registry was written by a newer version and is read-only here; values are shown but cannot be saved." }));
+  }
+  for (const srv of servers) panel.append(backupServerRow(srv, settings.registry_read_only));
+  return panel;
+}
+
+function backupServerRow(srv, readOnly) {
+  const box = el("div", { class: "bks-server" });
+  box.append(el("h3", { class: "bks-server-name", text: srv.name || srv.id }));
+  const grid = el("div", { class: "form-grid" });
+  const dir = el("input", { class: "input", name: "baseline_dir", value: srv.baseline_dir || "", placeholder: "(none)" });
+  const s3 = el("input", { class: "input", name: "baseline_s3", value: srv.baseline_s3 || "", placeholder: "s3://bucket/prefix/" });
+  grid.append(
+    el("label", { class: "field" }, el("span", { class: "field-label", text: "Backup dir" }), dir),
+    el("label", { class: "field" }, el("span", { class: "field-label", text: "Backup S3" }), s3));
+  box.append(grid);
+  const noArch = el("input", { type: "checkbox", name: "no_archive" });
+  noArch.checked = !!srv.no_archive;
+  box.append(el("label", { class: "check" }, noArch,
+    el("span", { text: "Don't automatically include archived data in queries" })));
+
+  // Provenance, the row's reason to exist: which location is actually in
+  // force, and whose choice it was.
+  const src = srv.source;
+  let where;
+  if (src === "server") {
+    where = "This server names its own backup location.";
+  } else if (src === "default") {
+    const eff = srv.resolved_dir || srv.resolved_s3;
+    where = "Using the daemon default: " + eff + ". A value saved here replaces it for this server.";
+  } else {
+    where = "No backup location. Time-travel, restores and scheduled backups have nothing to read or write.";
+  }
+  box.append(el("p", { class: "form-hint", text: where }));
+
+  if (srv.schedule_every) {
+    box.append(el("p", { class: "form-hint", text:
+      "Scheduled backups: every " + srv.schedule_every + (srv.schedule_at ? " at " + srv.schedule_at : "") +
+      ". The schedule is managed on the Backups page." }));
+    // The motivating case, said where the setting lives: with no local
+    // folder the scheduled run cannot update from the recorded changes, so
+    // every run reads the database in full. Derived from the same shape the
+    // Backups page's next-run line reports; config-only here, because a
+    // settings listing must not dial every server to predict a run.
+    if (!srv.resolved_dir && srv.resolved_s3) {
+      box.append(el("p", { class: "form-hint", text:
+        "As set up, each scheduled run takes a full backup from your database: updating from the recorded changes writes files, which needs a Backup dir." }));
+    }
+  } else {
+    box.append(el("p", { class: "form-hint", text: "No scheduled backups. Set one on the Backups page." }));
+  }
+
+  const msg = el("p", { class: "form-msg err" });
+  msg.hidden = true;
+  const save = el("button", { class: "btn btn-sm", type: "button", text: "Save" });
+  save.disabled = !!readOnly;
+  if (readOnly) { dir.disabled = s3.disabled = noArch.disabled = true; }
+  save.onclick = async () => {
+    save.disabled = true;
+    msg.hidden = true;
+    try {
+      await api("/api/backup-settings/servers/" + encodeURIComponent(srv.id), {
+        method: "PUT",
+        body: { baseline_dir: dir.value.trim(), baseline_s3: s3.value.trim(), no_archive: noArch.checked },
+      });
+    } catch (err) {
+      msg.textContent = (err && err.message) || String(err);
+      msg.hidden = false;
+      save.disabled = false;
+      return;
+    }
+    toast("Saved for " + (srv.name || srv.id));
+    // Repaint from the server's answer, not from what was clicked: the
+    // provenance line depends on the resolution the daemon just recomputed.
+    renderRoute();
+  };
+  box.append(el("div", { class: "stg-cardfoot" }, save), msg);
+  return box;
 }
 
 function credentialsCard(storage) {
@@ -8256,11 +8427,16 @@ function buildServerForm() {
   idxGrid.append(srvField("User", "user", { placeholder: "bintrail" }));
   idxGrid.append(srvField("Password", "password", { type: "password", autocomplete: "new-password" }));
   idxGrid.append(srvField("Index database", "dbname", { placeholder: "binlog_index" }));
-  idxGrid.append(srvField("Backup dir", "baseline_dir", { placeholder: "(optional) enables Time-travel" }));
-  idxGrid.append(srvField("Backup S3", "baseline_s3", { placeholder: "s3://bucket/prefix/" }));
   idx.append(idxGrid);
-  idx.append(el("label", { class: "check", style: "margin-top:10px" },
-    el("input", { type: "checkbox", name: "no_archive" }), el("span", { text: "Don't automatically include archived data in queries" })));
+  // The backup location and the archive toggle are EDITED on the Backups &
+  // snapshots settings page (#1582); this form carries them as hidden
+  // passthroughs because PUT /api/servers/{id} REPLACES the entry — dropping
+  // the fields from the request would silently wipe a server's backup
+  // configuration on every unrelated edit. The prefill list below fills them
+  // like any other field.
+  idx.append(el("input", { type: "hidden", name: "baseline_dir" }));
+  idx.append(el("input", { type: "hidden", name: "baseline_s3" }));
+  idx.append(el("input", { type: "checkbox", name: "no_archive", hidden: true }));
   adv.append(idx);
   form.append(adv);
 
@@ -8293,7 +8469,10 @@ function showServerForm(prefill) {
   // round-trips as host/dbname in the DTO), so "collapsed by default"
   // means a fresh add; editing any saved entry shows its index.
   const adv = $("#server-advanced", form);
-  const hasIndexFields = !!(prefill && (prefill.host || prefill.dbname || prefill.baseline_dir || prefill.baseline_s3 || prefill.no_archive));
+  // baseline_dir/baseline_s3/no_archive left this form for the Backups &
+  // snapshots settings page (#1582); they no longer open the fold, which
+  // now only shows connection fields.
+  const hasIndexFields = !!(prefill && (prefill.host || prefill.dbname));
   // Keep "bring your own index (optional)" COLLAPSED for a monitored source:
   // its index DSN is auto-derived and round-trips as host/dbname, so expanding
   // it — e.g. when a failed-preflight error card opens the form — would show
@@ -8494,6 +8673,7 @@ function cmdkCommands() {
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Backups", run: () => navigate("baselines") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Verification", run: () => navigate("verification") });
+  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Backups & snapshots settings", run: () => navigate("backup-settings") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Retention", run: () => navigate("retention") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "This daemon", run: () => navigate("daemon") });
   cmds.push({ group: "Navigate", label: "Access profiles", run: () => navigate("access-profiles") });

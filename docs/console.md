@@ -210,7 +210,10 @@ and searching events:
    downloadable; its status names the previous build's directory until that
    removal succeeds. The This daemon page shows what is staged while it
    exists, previous builds that could not be removed included.
-8. **Settings** (under `watch` only) — **Retention** (rotation policy and
+8. **Settings** (under `watch` only) — **Backups & snapshots** (every
+   parameter that shapes a backup or a snapshot, with its provenance — see
+   [The Backups & snapshots settings page](#the-backups--snapshots-settings-page)),
+   **Retention** (rotation policy and
    per-source S3 archiving), **This daemon** (AWS credential signals, staged
    downloads and a usage-telemetry opt-out — see
    [The Retention and This daemon pages](#the-retention-and-this-daemon-pages))
@@ -506,6 +509,34 @@ The Backups summary card that used to point here from Storage is gone (#1543):
 Backups has its own entry in the same sidebar, and the pointer only existed
 because the page it pointed away from was a drawer.
 
+### The Backups & snapshots settings page
+
+One page owns every parameter that shapes a backup or a snapshot (#1582),
+because no two of them were configured the same way: some are daemon flags,
+some are environment variables, some live per server in the registry, and the
+precedence between them — per server, then daemon flag, then nothing — was
+real and invisible. A server backed by the daemon's `--baseline-dir` showed
+an empty Backup dir field, indistinguishable from a server with no backup
+location at all.
+
+- **This daemon** — the nine daemon-wide values (`--baseline-dir`,
+  `--baseline-s3`, `--baseline-retain`, `--baseline-refresh-interval`,
+  `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE`, `BINTRAIL_CONSOLE_BASELINE_TRIGGER`,
+  `BINTRAIL_CONSOLE_BASELINE_STAGING`, `--verify-interval`,
+  `--verify-tables`), each shown verbatim with the exact flag or variable
+  name and a "restart to change" chip on the row. Read-only on purpose: the
+  console never edits the process's command line or environment.
+- **Backups & disk space** — the carry-forward toggle, moved here from the
+  Backups page; it applies live, which is why it is a card with buttons and
+  not a chipped row.
+- **Per server** — each registry server's Backup dir, Backup S3 and archive
+  toggle, editable in place, with a provenance line: its own location, the
+  daemon default it falls back to, or nothing. The per-server fields left the
+  server edit form for this page (the form still round-trips them, so an
+  unrelated edit cannot wipe them). A server whose scheduled backups can only
+  run as full reads (an S3 prefix and no local folder — folding writes files)
+  says so on its row.
+
 ### The Retention and This daemon pages
 
 Under `watch` the sidebar grows two settings pages. They were one page,
@@ -528,9 +559,10 @@ Storage, which had become a drawer: seven cards from five unrelated concerns
 - **Staged downloads**, and **Usage telemetry**, both described below.
 
 Two cards left the page entirely. **Backups & disk space** moved to the
-Backups page, beside the **Scheduled backups** it was being confused with:
-those two names both promised "backups, automatically" from different pages,
-for unrelated settings, and side by side the difference needs no paragraph.
+Backups page beside **Scheduled backups** (#1543), and from there to the
+**Backups & snapshots** settings page (#1582), which owns settings the way
+the Backups page owns the work — schedules, runs and downloads stay beside
+the data they report on.
 **Download a DuckDB schema** moved to the SQL page, from there to
 **Connect** (#1549) — `GET /api/views.sql` requires `settings:read`, while the
 SQL page is gated on `query:execute` and on the `sql` capability, so the
@@ -545,12 +577,12 @@ not exist) the card still renders on Connect. The old `/storage` link still
 works and lands on Retention.
 
 - **Backups & disk space** (#1528/#1543, formerly *File reuse for unchanged
-  tables*, and before that *Automatic backup refresh*) — the one behaviour
-  behind
+  tables*, and before that *Automatic backup refresh*; on the **Backups &
+  snapshots** settings page since #1582) — the one behaviour behind
   `--baseline-carry-forward-unchanged`: whether a table with no changes in the
   window keeps its previous Parquet file instead of being written again. It has
   no timetable in it, which the first name promised and which **Scheduled
-  backups**, now directly above it, actually is. The saving is real and it is
+  backups** on the Backups page actually is. The saving is real and it is
   not free, which is what the name says: where the filesystem allows a hard
   link, two backups then share the same bytes on disk, so deleting the older
   one frees nothing while the newer one still points at it, and a `du` per

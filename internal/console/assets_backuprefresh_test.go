@@ -207,7 +207,7 @@ func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
 	}
 }
 
-// TestBackupsPageStillMountsTheRefreshCard: the card can be unmounted, or its
+// TestSettingsPageMountsTheRefreshCard: the card can be unmounted, or its
 // fetch removed, with the whole suite green.
 //
 // The two guards above check what the card renders once it is called. Neither
@@ -215,28 +215,24 @@ func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
 // and dropping the fetch makes it render its error branch forever. A setting
 // an operator cannot reach is the same as a setting that does not exist.
 //
-// It moved from Storage to Backups (#1543), beside the schedule it was being
-// confused with, which is the pairing #1528 asked for. The guard follows the
-// card rather than the page, and it checks the page it is ON so the move
-// cannot be half-done: a card mounted on neither page passes a guard that
-// only asks "does some function call it".
-func TestBackupsPageStillMountsTheRefreshCard(t *testing.T) {
+// The card moved from Storage to Backups (#1543) and from there to the
+// Backups & snapshots settings page (#1582), which owns settings the way the
+// Backups page owns the work. The guard follows the card rather than the
+// page, and it checks BOTH halves of a move so it cannot be half-done: the
+// new page mounts and feeds it, and the old page no longer does — a control
+// that renders twice saves to one store from two places, and one of them is
+// always stale.
+func TestSettingsPageMountsTheRefreshCard(t *testing.T) {
 	js := readAsset(t, "app.js")
-	body := jsFunctionBody(t, js, "renderBaselines")
+	body := jsFunctionBody(t, js, "renderBackupSettings") + jsFunctionBody(t, js, "buildBackupSettings")
 	if !strings.Contains(body, "backupRefreshCard(") {
-		t.Error("the Backups page no longer mounts backupRefreshCard, so the reuse setting has no UI at all")
-	}
-	// Beside the schedule, not somewhere else on the page: the whole reason
-	// for the move is that the two controls have to be read together.
-	sched, reuse := strings.Index(body, "backupScheduleCard("), strings.Index(body, "backupRefreshCard(")
-	if sched < 0 {
-		t.Fatal("the schedule card is gone from the Backups page; this guard can no longer check the pairing")
-	}
-	if reuse < sched && reuse >= 0 {
-		t.Error("file reuse is mounted above the schedule; #1528 pairs them in that order so the timetable reads first")
+		t.Error("the Backups & snapshots settings page no longer mounts backupRefreshCard, so the reuse setting has no UI at all")
 	}
 	if !strings.Contains(body, `api("/api/baseline-refresh")`) {
-		t.Error("the Backups page does not fetch /api/baseline-refresh, so the card can only ever render its error branch")
+		t.Error("the settings page does not fetch /api/baseline-refresh, so the card can only ever render its error branch")
+	}
+	if strings.Contains(jsFunctionBody(t, js, "renderBaselines"), "backupRefreshCard(") {
+		t.Error("the Backups page still mounts backupRefreshCard; the card moved to the settings page, one surface at a time")
 	}
 }
 

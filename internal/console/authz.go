@@ -132,6 +132,11 @@ var apiRoutePerms = []routePerm{
 	// the settings surface.
 	{"GET", "/api/rotation", ext.PermSettingsRead},
 	{"PUT", "/api/rotation", ext.PermServersWrite},
+	// The Backups & snapshots settings page (#1582): the GET is the same
+	// settings tier as /api/rotation; the PUT edits a registry entry, so it
+	// carries the servers-write tier the entry's own editor does.
+	{"GET", "/api/backup-settings", ext.PermSettingsRead},
+	{"PUT", "/api/backup-settings/servers/{}", ext.PermServersWrite},
 	// Baseline refresh, graded exactly like rotation: reading the effective
 	// policy is a settings read, changing what the daemon's loop does is a
 	// control-plane write.

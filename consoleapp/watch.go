@@ -1506,6 +1506,19 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 		// told, reported when no console override is saved. Enabled is the
 		// loop's boot-time liveness, so the panel can say a saved setting is
 		// dormant instead of implying it is live.
+		// The Backups & snapshots settings page's read-only rows (#1582):
+		// what this daemon was told, verbatim, each under the exact flag or
+		// env name the page shows beside it. Values, not re-derivations — the
+		// page's whole job is saying where the effective value came from.
+		BackupSettingsDefaults: console.BackupSettingsDefaults{
+			BaselineRetain: upConsoleBaselineRetain,
+			RefreshEvery:   upBaselineRefreshEvery,
+			LockMode:       string(upConsoleBaselineLockMode),
+			TriggerOn:      upConsoleBaselineTrigger,
+			StagingDir:     upBaselineStageDir,
+			VerifyInterval: upVerifyInterval,
+			VerifyTables:   upVerifyTables,
+		},
 		BaselineRefreshDefaults: console.BaselineRefreshDefaults{
 			CarryForwardUnchanged: upBaselineCarryForward,
 			// Enabled is the OR because the restore consumes this setting too

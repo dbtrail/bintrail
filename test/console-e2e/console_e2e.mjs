@@ -4171,6 +4171,47 @@ try {
     ? ok("telemetry: the shown bytes are the daemon's sample_event verbatim")
     : bad("telemetry: the shown bytes are the daemon's sample_event verbatim", JSON.stringify({ shown: telSample.shown, fromApi: telSample.fromApi }));
 
+  // ── Scenario 17i — the Backups & snapshots settings page (#1582) ──
+  // The page's job is provenance. Driven LIVE against the watch daemon: nine
+  // daemon rows, each carrying the exact flag or variable name and a restart
+  // chip on the control (the split between applies-now and needs-restart,
+  // said on the row rather than in prose), plus the carry-forward card that
+  // moved here from the Backups page — one surface at a time, so the old
+  // page must no longer mount it.
+  await page.evaluate(() => navigate("backup-settings"));
+  await page.waitForFunction(() => location.pathname === "/backup-settings"
+    && document.querySelectorAll(".bks-row").length >= 5, { timeout: 10000 });
+  const bks = await page.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll(".bks-row")).map((r) => ({
+      chip: (r.querySelector(".bks-restart") || {}).textContent || "",
+      cli: (r.querySelector(".bks-cli") || {}).textContent || "",
+      value: (r.querySelector(".bks-value") || {}).textContent || "",
+    }));
+    return {
+      rows: rows.length,
+      allChipped: rows.every((r) => r.chip === "restart to change"),
+      allNamed: rows.every((r) => /^\(CLI: (--|BINTRAIL_)/.test(r.cli)),
+      noBlanks: rows.every((r) => r.value !== ""),
+      refreshCardHere: !!document.querySelector(".view .bkr-head"),
+    };
+  });
+  (bks.rows === 9 && bks.allChipped && bks.allNamed && bks.noBlanks)
+    ? ok("backup-settings: nine daemon rows, each named, valued, and chipped on the control")
+    : bad("backup-settings: nine daemon rows, each named, valued, and chipped on the control", JSON.stringify(bks));
+  (bks.refreshCardHere)
+    ? ok("backup-settings: the carry-forward card moved here")
+    : bad("backup-settings: the carry-forward card moved here", "no .bkr-head on /backup-settings");
+  // Settled on the LISTING panel, not a timer: the whole page builds in one
+  // pass, so once the panel title is up, a mounted card would be too — a
+  // sleep could pass this vacuously against a half-rendered page.
+  await page.evaluate(() => navigate("baselines"));
+  await page.waitForFunction(() => location.pathname === "/baselines"
+    && document.querySelector(".view .ov-panel-title"), { timeout: 10000 });
+  const dupCard = await page.evaluate(() => !!document.querySelector(".view .bkr-head"));
+  (!dupCard)
+    ? ok("backups: the carry-forward card is not duplicated on the Backups page")
+    : bad("backups: the carry-forward card is not duplicated on the Backups page", "found .bkr-head on /baselines");
+
   // ── Scenario 17g — Connect AI is three short steps with a drawn dialog ──
   // The audience is Claude users, mostly non-technical. The first rewrite
   // (#1430) made the steps explicit but drowned them in prose; the verdict on

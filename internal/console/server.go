@@ -178,6 +178,12 @@ type Config struct {
 	// values, the fallback the settings panel reports when no console override
 	// is saved. Same role as RotationDefaults above.
 	BaselineRefreshDefaults BaselineRefreshDefaults
+
+	// BackupSettingsDefaults carries the daemon-wide backup/snapshot flag and
+	// env values the Backups & snapshots settings page (#1582) reports
+	// read-only: what the process was told, verbatim, with the exact name to
+	// change each one under. Same role as RotationDefaults above.
+	BackupSettingsDefaults BackupSettingsDefaults
 	// Version is the running build's version string ("0.36.0", or "dev" on
 	// unversioned builds), reported in /api/capabilities so the frontend can
 	// link release artifacts (the .mcpb bundle) matching the running binary.
@@ -290,7 +296,8 @@ type Server struct {
 	telemetry TelemetryController
 	// rotationDefaults are the daemon's --rotate-* values, the fallback GET
 	// /api/rotation reports when no console override is saved.
-	rotationDefaults RotationDefaults
+	rotationDefaults       RotationDefaults
+	backupSettingsDefaults BackupSettingsDefaults
 	// baselineRefreshDefaults is the fallback GET /api/baseline-refresh reports
 	// when no console override is saved.
 	baselineRefreshDefaults BaselineRefreshDefaults
@@ -496,6 +503,7 @@ func New(cfg Config) (*Server, error) {
 		baselineHistory:         cfg.BaselineHistory,
 		telemetry:               cfg.Telemetry,
 		rotationDefaults:        cfg.RotationDefaults,
+		backupSettingsDefaults:  cfg.BackupSettingsDefaults,
 		baselineRefreshDefaults: cfg.BaselineRefreshDefaults,
 		version:                 cfg.Version,
 		cm:                      newConnManager(cfg.Registry, profileActive),
@@ -685,6 +693,8 @@ func (s *Server) buildHandler() http.Handler {
 	// the loop that consumes it).
 	api.HandleFunc("GET /api/rotation", s.handleRotationGet)
 	api.HandleFunc("PUT /api/rotation", s.handleRotationUpdate)
+	api.HandleFunc("GET /api/backup-settings", s.handleBackupSettingsGet)
+	api.HandleFunc("PUT /api/backup-settings/servers/{id}", s.handleBackupSettingsServerUpdate)
 	// Global baseline-refresh policy. Same split as rotation: read the
 	// effective settings, PUT an override the running loop picks up next cycle.
 	api.HandleFunc("GET /api/baseline-refresh", s.handleBaselineRefreshGet)
