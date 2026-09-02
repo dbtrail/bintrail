@@ -87,6 +87,33 @@ func (s *Server) buildViewsInput(ctx context.Context, b *bundle, req viewsReques
 	in.ArchiveSources, archiveErr = consoleArchiveSources(ctx, b.db, portable)
 	in.PortableRouting = portable
 	in.ArchiveDiscoveryFailed = archiveErr != nil
+	if archiveErr == nil {
+		// Per-column-set groups (#1535): whether a statement over the events
+		// view waits on EVERY archived file's footer or on one per schema.
+		// The console no longer runs this SQL itself (#1554 removed the panel),
+		// so the wait this saves is entirely the operator's, in whatever DuckDB
+		// they open the downloaded file in.
+		//
+		// A failure to read the column sets is NOT fatal and NOT reported as
+		// discovery failure: the sources resolved, so the file is honest with
+		// the globbed leg it has always carried. Only the speed is lost.
+		groups, ungrouped, err := query.ArchiveGroups(ctx, b.db, in.ArchiveSources)
+		if err != nil {
+			slog.Warn("console: could not read archived column sets; the events view keeps the globbed bind",
+				"error", err)
+		} else {
+			in.UngroupedPartitions = ungrouped
+			if ungrouped == 0 {
+				// Its own loop rather than a shared helper, deliberately: the
+				// CLI half has one too, and a test on each surface is what
+				// keeps one of them from silently losing the grouping.
+				in.ArchiveGroups = make([]views.ArchiveGroup, len(groups))
+				for i, g := range groups {
+					in.ArchiveGroups[i] = views.ArchiveGroup{Columns: g.Columns, Files: g.Files}
+				}
+			}
+		}
+	}
 	baseSrc := b.baselineSrc
 	if req.PortableBaseline && b.baselineFallbackSrc != "" {
 		// Read from the bundle, never from the request: the two locations this

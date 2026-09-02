@@ -707,6 +707,23 @@ func EnsureSchema(db *sql.DB) error {
 	); err != nil {
 		return err
 	}
+	// column_set is the archived file's own column set (#1535): lowercase names,
+	// sorted, comma-joined. It is a GROUPING KEY, not a description — the
+	// DuckDB views generator emits one read_parquet per distinct set so the
+	// bind opens one footer per SCHEMA instead of one per file, and
+	// union_by_name (which is what makes the bind O(files)) is no longer
+	// needed within a group.
+	//
+	// NULL on every row written before this column existed. Absent means
+	// UNKNOWN, never "the same as the others": a partition with no recorded
+	// set cannot join a group, and the generator falls back to the globbed
+	// union_by_name leg rather than silently leaving it out of the view.
+	// `archive reconcile --repair` records it from the footer, offline.
+	if err := ensureColumn(db, "archive_state", "column_set",
+		`ALTER TABLE archive_state ADD COLUMN column_set VARCHAR(4096) DEFAULT NULL COMMENT 'the archived Parquet file own column set: lowercase, sorted, comma-joined (#1535). NULL = unknown (written before this column, or registered by upload); archive reconcile --repair records it from the footer' AFTER max_event_ts`,
+	); err != nil {
+		return err
+	}
 	// gap_lost_at/_detail record an unfillable-gap auto-advance durably
 	// (#402): the advanced checkpoint is persisted, so without these columns
 	// the only trace of the permanently lost events would be an in-memory
