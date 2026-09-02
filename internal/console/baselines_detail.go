@@ -21,6 +21,7 @@ import (
 	"github.com/dbtrail/dbtrail/internal/baseline"
 	"github.com/dbtrail/dbtrail/internal/reconstruct"
 	"github.com/dbtrail/dbtrail/internal/storage"
+	"github.com/dbtrail/dbtrail/internal/views"
 )
 
 // This file serves the per-snapshot surfaces of the Backups page (#TBD):
@@ -113,6 +114,7 @@ var newBaselineObjectStore = func(ctx context.Context, src string) (baselineObje
 type snapshotSource struct {
 	localRoot string              // set for a local directory source
 	store     baselineObjectStore // set for an s3:// source
+	srcURL    string              // the s3:// root as configured, for realPath
 }
 
 func openSnapshotSource(ctx context.Context, src string) (*snapshotSource, error) {
@@ -121,9 +123,20 @@ func openSnapshotSource(ctx context.Context, src string) (*snapshotSource, error
 		if err != nil {
 			return nil, err
 		}
-		return &snapshotSource{store: store}, nil
+		return &snapshotSource{store: store, srcURL: strings.TrimSuffix(src, "/")}, nil
 	}
 	return &snapshotSource{localRoot: src}, nil
+}
+
+// realPath spells one enumerated file the way a reader of the SOURCE would
+// address it — a local filesystem path or an s3:// URL. It is what the
+// decimals resolver keys by (#1583); the tarball's views file respells the
+// same tables relative afterwards.
+func (ss *snapshotSource) realPath(relPath string) string {
+	if ss.store != nil {
+		return ss.srcURL + "/" + relPath
+	}
+	return filepath.Join(ss.localRoot, filepath.FromSlash(relPath))
 }
 
 // files enumerates every stored file of the snapshot directory dirName,
@@ -350,9 +363,51 @@ func (s *Server) handleBaselineFiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// snapshotViewsRelative renders the tarball's own views.sql (#1583): the same
+// snapshot-scoped file the producers publish beside _SUCCESS, respelled with
+// "./" relative paths so it works from inside the unpacked folder wherever
+// that folder lands. Empty when the snapshot holds no tables.
+//
+// The decimals go through the server memo keyed by the SOURCE root — the same
+// key the /api/views.sql tier uses — so a download after a schema download
+// (or the reverse) pays the footer reads once. Respelling happens after, per
+// RespellBaselines' contract.
+func (s *Server) snapshotViewsRelative(ctx context.Context, ss *snapshotSource, ts time.Time, files []baselineSnapshotFile) string {
+	src := ss.srcURL
+	if src == "" {
+		src = ss.localRoot
+	}
+	var tables []views.BaselineTable
+	for _, f := range files {
+		parts := strings.Split(f.RelPath, "/")
+		if len(parts) != 3 || !strings.HasSuffix(parts[2], ".parquet") {
+			continue
+		}
+		tables = append(tables, views.BaselineTable{
+			Schema: parts[1],
+			Table:  strings.TrimSuffix(parts[2], ".parquet"),
+			Path:   ss.realPath(f.RelPath),
+			Rel:    parts[1] + "/" + parts[2],
+		})
+	}
+	if len(tables) == 0 {
+		return ""
+	}
+	in := views.SnapshotScopedInput(ts, tables)
+	in.BaselineSource = strings.TrimSuffix(src, "/")
+	s.resolveBaselineDecimals(ctx, &in)
+	in.RespellBaselines(".")
+	return views.Generate(in)
+}
+
 // handleBaselineDownload serves GET /api/baselines/download?at=…: the whole
 // snapshot directory as one tar.gz stream, markers and manifest included, so
 // what lands on the operator's disk is a complete, discoverable snapshot.
+//
+// One stored file is REPLACED rather than copied: the snapshot's own
+// views.sql names the paths of wherever the snapshot lives (that is its job,
+// #1583), and every one of those paths is wrong inside an unpacked tarball.
+// The stream carries a freshly rendered relative copy under the same name.
 //
 // Mid-stream errors panic with http.ErrAbortHandler: the status is already
 // written, and cutting the connection is what makes the CLIENT fail loudly.
@@ -370,6 +425,12 @@ func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) 
 			"this backup is marked incomplete (a failed or unfinished run); refusing to download it")
 		return
 	}
+	// Rendered BEFORE the first byte: the footer reads behind the decimal
+	// casts can be slow (or hang on a bad store), and a stall belongs ahead
+	// of the 200, where the client still sees an honest failure, not
+	// mid-stream where curl saves a truncated archive.
+	ts, _ := parseSnapshotAt(r.URL.Query().Get("at"))
+	viewsSQL := s.snapshotViewsRelative(r.Context(), ss, ts, files)
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", `attachment; filename="dbtrail-backup-`+dirName+`.tar.gz"`)
 
@@ -413,6 +474,14 @@ func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) 
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	for _, f := range files {
+		// The stored views file never rides along (#1583): its paths name
+		// wherever the snapshot lives, which is the one place an unpacked
+		// tarball is not. Its replacement is appended after the loop — always
+		// skipped, even if rendering the replacement produced nothing, because
+		// a file whose every path is wrong is worse than no file.
+		if f.RelPath == dirName+"/"+views.SnapshotFileName {
+			continue
+		}
 		hdr := &tar.Header{Name: f.RelPath, Mode: 0o644, Size: f.Size, ModTime: f.ModTime}
 		if err := tw.WriteHeader(hdr); err != nil {
 			abort("backup download aborted: tar header write failed", f.RelPath, err)
@@ -437,6 +506,21 @@ func (s *Server) handleBaselineDownload(w http.ResponseWriter, r *http.Request) 
 			abort("backup download aborted: file shorter than listed", f.RelPath,
 				fmt.Errorf("read %d bytes, listing said %d", n, f.Size))
 		}
+	}
+	if viewsSQL != "" {
+		hdr := &tar.Header{
+			Name: dirName + "/" + views.SnapshotFileName, Mode: 0o644,
+			Size: int64(len(viewsSQL)), ModTime: time.Now().UTC(),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			abort("backup download aborted: tar header write failed", hdr.Name, err)
+		}
+		n, err := io.Copy(tw, strings.NewReader(viewsSQL))
+		sent += n
+		if err != nil {
+			abort("backup download aborted mid-file", hdr.Name, err)
+		}
+		sentFiles++
 	}
 	if err := tw.Close(); err != nil {
 		abort("backup download: tar finalize failed", "", err)

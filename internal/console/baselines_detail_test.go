@@ -21,6 +21,7 @@ import (
 	"github.com/dbtrail/dbtrail/ext"
 	"github.com/dbtrail/dbtrail/internal/audittest"
 	"github.com/dbtrail/dbtrail/internal/storage"
+	"github.com/dbtrail/dbtrail/internal/views"
 )
 
 // writeBaselineFile writes <dir>/<parts...> with the given content and mtime.
@@ -108,6 +109,13 @@ func TestBaselineFiles_refusals(t *testing.T) {
 
 func TestBaselineDownload_localTarRoundTrip(t *testing.T) {
 	dir := newDetailFixture(t)
+	// A stored views file, as the producers publish since #1583 — its paths
+	// name wherever the snapshot lives, so the stream must REPLACE it, never
+	// copy it: inside an unpacked tarball every one of those paths is wrong.
+	storedViews := "-- stored copy naming " + dir + "\n"
+	if err := os.WriteFile(filepath.Join(dir, detailSnapDir, views.SnapshotFileName), []byte(storedViews), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	srv := newBaselineServer(t, dir, true)
 	rec, body := doServersReq(t, srv, "GET", "/api/baselines/download"+detailQuery(detailSnapAt), "")
 	if rec.Code != 200 {
@@ -126,13 +134,26 @@ func TestBaselineDownload_localTarRoundTrip(t *testing.T) {
 		detailSnapDir + "/shop/orders.parquet": "aaaa",
 		detailSnapDir + "/shop/users.parquet":  "bbbbbbbb",
 	}
-	if len(got) != len(want) {
-		t.Fatalf("entries = %v, want %v", keysOf(got), keysOf(want))
+	if len(got) != len(want)+1 {
+		t.Fatalf("entries = %v, want those of %v plus the generated %s", keysOf(got), keysOf(want), views.SnapshotFileName)
 	}
 	for name, content := range want {
 		if got[name] != content {
 			t.Fatalf("entry %s = %q, want %q", name, got[name], content)
 		}
+	}
+	// The tarball's own views file (#1583): relative, "./"-prefixed, and
+	// never the stored copy or its absolute paths.
+	vsql := got[detailSnapDir+"/"+views.SnapshotFileName]
+	switch {
+	case vsql == "":
+		t.Fatalf("no generated %s in the archive; entries = %v", views.SnapshotFileName, keysOf(got))
+	case vsql == storedViews:
+		t.Fatal("the archive carries the STORED views file, whose paths name the server's disk")
+	case !strings.Contains(vsql, "read_parquet('./shop/orders.parquet')"):
+		t.Errorf("views file does not read './shop/orders.parquet' relative:\n%s", vsql)
+	case strings.Contains(vsql, dir):
+		t.Errorf("views file leaks the server-local path %s:\n%s", dir, vsql)
 	}
 }
 
@@ -214,13 +235,26 @@ func TestBaselineDownload_s3RoundTrip(t *testing.T) {
 	t.Cleanup(func() { newBaselineObjectStore = orig })
 
 	srv := newBaselineServer(t, "s3://bkt/baselines", true)
+	// Pre-seed the decimals memo the download's views file consults: there is
+	// no bucket here, and letting DuckDB discover that costs this test ten
+	// seconds of httpfs retries. A successful empty answer is the "no embedded
+	// schema" shape a real S3 read of these fake bytes would settle on anyway.
+	srv.rememberBaselineDecimals("s3://bkt/baselines@2026-06-10T12:00:00Z", nil, false)
 	rec, body := doServersReq(t, srv, "GET", "/api/baselines/download"+detailQuery(detailSnapAt), "")
 	if rec.Code != 200 {
 		t.Fatalf("code = %d, body = %s", rec.Code, body)
 	}
 	got := untarAll(t, body)
-	if len(got) != 2 || got[detailSnapDir+"/shop/orders.parquet"] != "aaaa" {
-		t.Fatalf("entries = %v, want exactly the requested snapshot's two files", keysOf(got))
+	if len(got) != 3 || got[detailSnapDir+"/shop/orders.parquet"] != "aaaa" {
+		t.Fatalf("entries = %v, want exactly the requested snapshot's two files plus the generated %s",
+			keysOf(got), views.SnapshotFileName)
+	}
+	// Relative here too: an S3 snapshot's tarball unpacks onto somebody's
+	// laptop, where "s3://bkt/..." spellings would demand credentials the
+	// unpacked copy no longer needs.
+	if vsql := got[detailSnapDir+"/"+views.SnapshotFileName]; !strings.Contains(vsql, "read_parquet('./shop/orders.parquet')") ||
+		strings.Contains(vsql, "s3://bkt") {
+		t.Fatalf("views file should read relative paths, never the bucket:\n%s", vsql)
 	}
 
 	// And the detail endpoint over the same fake.
@@ -336,6 +370,9 @@ func TestBaselineDownload_midStreamAbort(t *testing.T) {
 	t.Cleanup(func() { newBaselineObjectStore = orig })
 
 	srv := newBaselineServer(t, "s3://bkt/baselines", true)
+	// Same memo seed as the round-trip test, same reason: there is no bucket
+	// for the views file's footer read to reach.
+	srv.rememberBaselineDecimals("s3://bkt/baselines@2026-06-10T12:00:00Z", nil, false)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/api/baselines/download"+detailQuery(detailSnapAt), nil)
 	panicked := false

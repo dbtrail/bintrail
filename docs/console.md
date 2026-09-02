@@ -183,7 +183,10 @@ and searching events:
    [capacity planning](capacity.md#monitoring).
 7. **Protect** (under `watch` only) — **Backups** (the selected server's
    snapshot listing; each row expands to its tables, sizes and how long the
-   backup took, with a **Download (.tar.gz)** of the whole snapshot; plus
+   backup took, with a **Download (.tar.gz)** of the whole snapshot — the
+   archive includes a `views.sql` with relative paths, so unpacking it and
+   running `duckdb -init views.sql` from inside the folder opens every table
+   ([#1583](https://github.com/dbtrail/dbtrail/issues/1583)); plus
    **Create backup** and — for a server with its own local backup directory —
    **Restore to a moment**, which folds a chosen past instant into a NEW
    discoverable snapshot in the same store, and **Build a .sql backup for

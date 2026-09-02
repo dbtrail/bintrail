@@ -40,6 +40,34 @@ const (
 	IncompleteMarker = "_INCOMPLETE"
 )
 
+// SnapshotViewsName is the DuckDB schema file published INSIDE a snapshot,
+// next to its markers (#1583): a pinned views.sql naming the files that sit
+// beside it, so the file cannot be out of step with the data it describes.
+// The NAME lives here rather than in internal/views because upload.go and the
+// hook below need it and views imports this package; internal/views aliases
+// it (views.SnapshotFileName) rather than spelling a second literal.
+const SnapshotViewsName = "views.sql"
+
+// snapshotViewsWriter publishes SnapshotViewsName into a completing snapshot.
+// It is a hook, not an import, because the generator lives in internal/views,
+// which imports THIS package for the markers and the pointer — the arrow
+// cannot point both ways. internal/views arms it from its init(), so every
+// binary that links the generator (all three producers' binaries do) gets the
+// artifact through the same single door as the pointer: WriteSuccessMarker.
+//
+// Contract: best-effort. The hook logs its own failures and never fails a
+// completed snapshot — same rule as the pointer publish below.
+var snapshotViewsWriter func(snapshotDir string)
+
+// SetSnapshotViewsWriter arms the publish-time views.sql writer. Nil disarms
+// (tests). See snapshotViewsWriter for why this is a hook.
+func SetSnapshotViewsWriter(f func(snapshotDir string)) { snapshotViewsWriter = f }
+
+// SnapshotViewsWriterArmed reports whether a writer is installed, for the
+// per-binary wiring tests: arming rides the import graph, and an import that
+// silently falls away would take this artifact with it, with nothing red.
+func SnapshotViewsWriterArmed() bool { return snapshotViewsWriter != nil }
+
 // WriteSuccessMarker writes the _SUCCESS marker into snapshotDir and removes any
 // stale _INCOMPLETE marker left by an earlier failed attempt (the --retry path
 // can complete a snapshot that a previous run flagged incomplete).
@@ -50,6 +78,17 @@ const (
 // genuinely-completed snapshot read as "could not write _SUCCESS". So we log
 // that case rather than return it.
 func WriteSuccessMarker(snapshotDir string) error {
+	// The snapshot's own views file goes in BEFORE the marker (#1583), so
+	// _SUCCESS keeps meaning "everything in place" and the S3 upload — which
+	// defers _SUCCESS to the very end — carries the file inside the same
+	// crash-safety bracket as the data. This is the single place a snapshot
+	// becomes complete (the doc below says why), which makes it the single
+	// place the artifact is published from too. Best-effort by the hook's own
+	// contract: the writer logs and a missing views.sql costs a convenience,
+	// never the snapshot.
+	if snapshotViewsWriter != nil {
+		snapshotViewsWriter(snapshotDir)
+	}
 	if err := os.WriteFile(filepath.Join(snapshotDir, SuccessMarker), nil, 0o644); err != nil {
 		return fmt.Errorf("write %s marker: %w", SuccessMarker, err)
 	}

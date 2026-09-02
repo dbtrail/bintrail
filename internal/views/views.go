@@ -266,6 +266,17 @@ type Input struct {
 	// none of them should pay for none of them.
 	OnlyViews ViewSet
 
+	// SnapshotScoped marks the file that is PUBLISHED INSIDE a snapshot,
+	// beside its _SUCCESS marker (#1583). Such a file describes the one
+	// snapshot it sits in and nothing else: its producer never read
+	// archive_state, so the header must not claim anything about it, and the
+	// events section names the wider file instead of a registry nobody
+	// checked — the ArchiveDiscoveryFailed rule ("never state a cause the
+	// caller does not know") applied to a producer that never asked.
+	// Producers set it with Follow == FollowNone and no ArchiveSources; it
+	// changes wording, never mechanism.
+	SnapshotScoped bool
+
 	// OmitEvents leaves the events view out even when archive sources ARE
 	// available. It is the DEFAULT for both file producers since #1535: binding
 	// that view opens one Parquet footer per archived file at CREATE VIEW time,
@@ -606,6 +617,12 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("-- state views point at ONE snapshot. Re-run `bintrail views` (or download the\n")
 		b.WriteString("-- file again from the console) after taking or refreshing a baseline, and\n")
 		b.WriteString("-- whenever archive sources are added or removed.\n")
+	} else if in.SnapshotScoped {
+		b.WriteString("The baseline state\n")
+		b.WriteString("-- views point at the snapshot this file was published with, and that is the\n")
+		b.WriteString("-- point of this copy: it sits beside the files it names, so it cannot\n")
+		b.WriteString("-- disagree with them. A newer snapshot carries its own copy of this file,\n")
+		b.WriteString("-- beside its own data.\n")
 	} else {
 		b.WriteString("The baseline state\n")
 		b.WriteString("-- views point at ONE snapshot. Re-run `bintrail views` (or download the file\n")
@@ -644,6 +661,10 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("-- apart mid-session. A refresh published while you are working is picked up\n")
 		b.WriteString("-- by reading this file again, which is already what an S3 session needs to do\n")
 		b.WriteString("-- for the secret above.\n")
+		b.WriteString("-- That choice lives in a SESSION variable, and views persist while a session\n")
+		b.WriteString("-- variable does not: a database file that saved these views lists them all in\n")
+		b.WriteString("-- a new session, and every read raises until this file's SET VARIABLE\n")
+		b.WriteString("-- statement is run again in that session.\n")
 	case in.Follow == FollowPointer:
 		// The paragraph this replaces exists because a timer-published
 		// snapshot has no operator action to attach "regenerate" to. Following
@@ -656,6 +677,12 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("-- finishes against the files it opened. Two views resolved either side of that\n")
 		b.WriteString("-- one step can still land on different snapshots; the window is the swap\n")
 		b.WriteString("-- itself, not the hours a file left behind would span.\n")
+	case in.SnapshotScoped:
+		b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
+		b.WriteString("-- publishes a new snapshot every interval, and each one is published with\n")
+		b.WriteString("-- its own copy of this file. This copy stays bound to the snapshot it sits\n")
+		b.WriteString("-- in: its rows never change, and the newer rows are beside the newer\n")
+		b.WriteString("-- snapshot's own copy.\n")
 	default:
 		b.WriteString("-- A daemon running `bintrail-console watch --baseline-refresh-interval`\n")
 		b.WriteString("-- publishes a new snapshot every interval, and nothing regenerates this file.\n")
@@ -684,6 +711,13 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("-- Archive sources:\n")
 	}
 	switch {
+	case in.SnapshotScoped:
+		// This producer never asked archive_state, so the two claims below are
+		// not available to it — the same never-state-a-cause-you-do-not-know
+		// rule ArchiveDiscoveryFailed keeps, from the other side.
+		b.WriteString("--   (out of scope: this file describes the one snapshot it was published\n")
+		b.WriteString("--   with; `bintrail views` writes the file that also reads the archived\n")
+		b.WriteString("--   change log)\n")
 	case in.ArchiveDiscoveryFailed:
 		b.WriteString("--   (could not be read from archive_state; the console log has the error)\n")
 	case len(in.ArchiveSources) == 0:
@@ -698,6 +732,17 @@ func writeHeader(b *strings.Builder, in Input) {
 		b.WriteString("--   (no baseline source given: pass --baseline-dir or --baseline-s3)\n")
 	case len(in.Baselines) == 0:
 		fmt.Fprintf(b, "--   (none discoverable under %s)\n", in.BaselineSource)
+	case in.BaselineSource == ".":
+		// The tarball's copy (#1583): paths spelled "./schema/table.parquet".
+		// Relative is the point — it survives being unpacked anywhere, moved
+		// later, or handed to someone else, because nothing inside names a
+		// place — and the price is stated with it: DuckDB resolves relative
+		// paths against the PROCESS working directory, not against this file.
+		fmt.Fprintf(b, "--   this archive, taken at %s (%d table(s))\n",
+			in.BaselineSnapshot.UTC().Format(time.RFC3339), len(in.Baselines))
+		b.WriteString("--   Paths are relative: run DuckDB from inside the unpacked folder (the one\n")
+		b.WriteString("--   holding the schema directories). From anywhere else the reads fail with\n")
+		b.WriteString("--   DuckDB's own \"No files found\" naming the exact relative path.\n")
 	default:
 		fmt.Fprintf(b, "--   %s at %s (%d table(s))\n",
 			in.BaselineSource, in.BaselineSnapshot.UTC().Format(time.RFC3339), len(in.Baselines))
@@ -1051,6 +1096,17 @@ func writeEventsView(b *strings.Builder, in Input, stateSurvives bool) bool {
 	// Not wanted: emit NOTHING, comments included. A filtered render is executed
 	// by its caller, and a script of only comments is an error there.
 	if !in.OnlyViews.wants(eventsViewName) {
+		return false
+	}
+	// The in-snapshot file (#1583): the change log is a different tier, and
+	// this producer never looked at the registry that lists it, so neither of
+	// the skip sentences below may be borrowed — both name archive_state.
+	if in.SnapshotScoped {
+		b.WriteString("-- events: not part of this file.\n")
+		b.WriteString("--\n")
+		b.WriteString("-- This file describes the snapshot it sits in. The archived change log is a\n")
+		b.WriteString("-- different tier; `bintrail views` (or the console's DuckDB schema download)\n")
+		b.WriteString("-- writes the file that reads both.\n\n")
 		return false
 	}
 	// Left out on purpose, which is a DIFFERENT fact from the skip branches
@@ -1547,6 +1603,12 @@ func writeStateViews(b *strings.Builder, in Input) bool {
 // to disagree about.
 const newestVar = "bintrail_newest_snapshot"
 
+// newestVarUnsetMsg is what a state view raises when it is read in a session
+// that never ran the SET VARIABLE statement above — the persisted-views case:
+// lake.db keeps the views, the session variable dies with the session (#1583).
+const newestVarUnsetMsg = "bintrail views: this file sets a session variable; " +
+	"run its SET VARIABLE statement in this session first"
+
 // missingVar and checkVar carry the preflight below. Two variables rather than
 // one expression so the message can NAME the tables it found, and so a clean
 // file prints nothing at all.
@@ -1779,8 +1841,19 @@ func globLiteral(s string) string {
 // own "No files found that match the pattern" naming the exact path it looked
 // for. That is the guarantee this mechanism exists to keep: reading as EMPTY a
 // table that should have had rows is a worse answer than reading a stale one.
+//
+// The CASE around the variable is the other loud failure (#1583). Views
+// PERSIST in a database file; the session variable does not. Reopening a
+// lake.db in a new session (duckdb -ui included) lists every view and fails
+// the first read with DuckDB's own "read_parquet cannot take NULL list as
+// parameter", which names nothing the reader can act on. The CASE makes that
+// read name its own cause instead. It costs nothing at CREATE time only
+// because the generated file SETs the variable before it creates any view —
+// error() raises when the CASE is BOUND with the variable still null, so a
+// producer must never emit these bodies ahead of writeNewestSnapshotVar.
 func writeNewestStateBody(b *strings.Builder, t BaselineTable) {
-	read := fmt.Sprintf("read_parquet(getvariable('%s') || %s)", newestVar, sqlString(t.Rel))
+	read := fmt.Sprintf("read_parquet(CASE WHEN getvariable('%s') IS NULL\n    THEN error(%s)\n    ELSE getvariable('%s') || %s END)",
+		newestVar, sqlString(newestVarUnsetMsg), newestVar, sqlString(t.Rel))
 	if replace := decimalReplaceClause(t); replace != "" {
 		fmt.Fprintf(b, "  SELECT * REPLACE (%s)\n", replace)
 		fmt.Fprintf(b, "  FROM %s;\n", read)

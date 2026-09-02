@@ -29,6 +29,10 @@
 -- apart mid-session. A refresh published while you are working is picked up
 -- by reading this file again, which is already what an S3 session needs to do
 -- for the secret above.
+-- That choice lives in a SESSION variable, and views persist while a session
+-- variable does not: a database file that saved these views lists them all in
+-- a new session, and every read raises until this file's SET VARIABLE
+-- statement is run again in that session.
 --
 -- Nothing here writes: every view is a read over Parquet files you already own.
 --
@@ -113,15 +117,23 @@ SET VARIABLE bintrail_tables_checked = (SELECT CASE WHEN getvariable('bintrail_m
 
 -- state_legacy_db_audit_log: this file carries no column types, so nothing is cast; decimal columns read as text
 CREATE OR REPLACE VIEW "state_legacy_db_audit_log" AS
-  SELECT * FROM read_parquet(getvariable('bintrail_newest_snapshot') || 'Legacy-DB/Audit Log.parquet');
+  SELECT * FROM read_parquet(CASE WHEN getvariable('bintrail_newest_snapshot') IS NULL
+    THEN error('bintrail views: this file sets a session variable; run its SET VARIABLE statement in this session first')
+    ELSE getvariable('bintrail_newest_snapshot') || 'Legacy-DB/Audit Log.parquet' END);
 CREATE OR REPLACE VIEW "state_shop_order_items" AS
-  SELECT * FROM read_parquet(getvariable('bintrail_newest_snapshot') || 'shop/order_items.parquet');
+  SELECT * FROM read_parquet(CASE WHEN getvariable('bintrail_newest_snapshot') IS NULL
+    THEN error('bintrail views: this file sets a session variable; run its SET VARIABLE statement in this session first')
+    ELSE getvariable('bintrail_newest_snapshot') || 'shop/order_items.parquet' END);
 CREATE OR REPLACE VIEW "state_shop_orders" AS
   SELECT * REPLACE (CAST("total" AS DECIMAL(10,2)) AS "total", CAST("tax_rate" AS DECIMAL(6,4)) AS "tax_rate")
-  FROM read_parquet(getvariable('bintrail_newest_snapshot') || 'shop/orders.parquet');
+  FROM read_parquet(CASE WHEN getvariable('bintrail_newest_snapshot') IS NULL
+    THEN error('bintrail views: this file sets a session variable; run its SET VARIABLE statement in this session first')
+    ELSE getvariable('bintrail_newest_snapshot') || 'shop/orders.parquet' END);
 -- state_shop_order_items_2: weight is DECIMAL(65,30), wider than DuckDB's 38 digits (left as text)
 CREATE OR REPLACE VIEW "state_shop_order_items_2" AS
-  SELECT * FROM read_parquet(getvariable('bintrail_newest_snapshot') || 'shop_order/items.parquet');
+  SELECT * FROM read_parquet(CASE WHEN getvariable('bintrail_newest_snapshot') IS NULL
+    THEN error('bintrail views: this file sets a session variable; run its SET VARIABLE statement in this session first')
+    ELSE getvariable('bintrail_newest_snapshot') || 'shop_order/items.parquet' END);
 
 -- events: every archived binlog event, across all archive sources.
 --

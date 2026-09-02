@@ -206,6 +206,81 @@ func TestNewestStateView_raisesWhenTheTableLeftTheNewestSnapshot(t *testing.T) {
 	}
 }
 
+// TestNewestStateView_persistedViewsNameTheMissingVariable pins the CASE in
+// every state view body (#1583), driven through the exact scenario it exists
+// for: views PERSIST in a database file, the session variable does not.
+//
+// A reader who opens the same lake.db in a new session (duckdb -ui, or a
+// prompt that never ran this file) sees every view listed and, before this,
+// got "read_parquet cannot take NULL list as parameter" on the first read —
+// true, and naming nothing they can act on. The read must instead name its
+// own cause, and the message's own remediation (run the SET VARIABLE
+// statement, alone) must heal the session — asserted by running exactly that
+// statement, never the whole file, so the message cannot drift into advice
+// that does not work.
+func TestNewestStateView_persistedViewsNameTheMissingVariable(t *testing.T) {
+	root := t.TempDir()
+	writeSnapshot(t, root, "2026-04-30T03-00-00Z", true, "kept")
+	sqlText := newestFixture(t, root, filepath.Join("shop", "orders.parquet"))
+
+	lake := filepath.Join(t.TempDir(), "lake.db")
+	first, err := sql.Open("duckdb", lake)
+	if err != nil {
+		t.Fatalf("open lake.db: %v", err)
+	}
+	if _, err := first.Exec(sqlText); err != nil {
+		first.Close()
+		t.Fatalf("DuckDB rejected the generated views:\n%v", err)
+	}
+	// The CASE must cost nothing in the session that ran the file: the SET
+	// VARIABLE precedes every CREATE, so error() never binds against NULL.
+	var status string
+	if err := first.QueryRow(`SELECT "status" FROM state_shop_orders`).Scan(&status); err != nil {
+		first.Close()
+		t.Fatalf("state view unreadable in the session that created it: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first session: %v", err)
+	}
+
+	second, err := sql.Open("duckdb", lake)
+	if err != nil {
+		t.Fatalf("reopen lake.db: %v", err)
+	}
+	t.Cleanup(func() { second.Close() })
+	err = second.QueryRow(`SELECT "status" FROM state_shop_orders`).Scan(&status)
+	if err == nil {
+		t.Fatal("a persisted state view read rows in a session that never set the variable; " +
+			"there is no snapshot choice for it to have read through")
+	}
+	if !strings.Contains(err.Error(), "run its SET VARIABLE statement in this session first") {
+		t.Errorf("failed with %v; want the read naming its own cause (the unset session variable)", err)
+	}
+	if strings.Contains(err.Error(), "NULL list as parameter") {
+		t.Errorf("failed with DuckDB's raw NULL refusal, which names nothing the reader can act on: %v", err)
+	}
+
+	// The remediation the message names, verbatim: the file's own SET VARIABLE
+	// statement, extracted from the generated text rather than rebuilt here.
+	i := strings.Index(sqlText, "SET VARIABLE "+newestVar)
+	if i < 0 {
+		t.Fatalf("generated file carries no SET VARIABLE %s statement", newestVar)
+	}
+	j := strings.Index(sqlText[i:], ";")
+	if j < 0 {
+		t.Fatalf("could not find the end of the SET VARIABLE statement")
+	}
+	if _, err := second.Exec(sqlText[i : i+j+1]); err != nil {
+		t.Fatalf("the SET VARIABLE statement the message points at failed on its own: %v", err)
+	}
+	if err := second.QueryRow(`SELECT "status" FROM state_shop_orders`).Scan(&status); err != nil {
+		t.Fatalf("after the SET VARIABLE statement the persisted view still fails: %v", err)
+	}
+	if status != "kept" {
+		t.Errorf("healed view read %q; want \"kept\"", status)
+	}
+}
+
 // TestNewestStateView_refusesToLoadWhenNothingIsMarked pins the CASE in the
 // variable lookup, and it asserts a refusal to LOAD rather than to query.
 //
