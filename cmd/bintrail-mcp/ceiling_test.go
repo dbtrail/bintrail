@@ -9,7 +9,7 @@ func TestQueryResultNotice(t *testing.T) {
 	t.Run("ceiling supersedes the generic truncation notice", func(t *testing.T) {
 		// After a cap, n == limit (== ceiling), so the generic arm would also
 		// match; the ceiling message must win and must NOT say "increase the limit".
-		got := queryResultNotice(true, 5_000_000, 1_000_000, 1_000_000, 1_000_000, "")
+		got := queryResultNotice(true, 5_000_000, 1_000_000, 1_000_000, 1_000_000, 0, "")
 		if !strings.Contains(got, "exceeds the MCP query ceiling") {
 			t.Errorf("want ceiling message, got %q", got)
 		}
@@ -22,7 +22,7 @@ func TestQueryResultNotice(t *testing.T) {
 	})
 
 	t.Run("generic truncation notice when not capped and full", func(t *testing.T) {
-		got := queryResultNotice(false, 100, 1_000_000, 100, 100, "")
+		got := queryResultNotice(false, 100, 1_000_000, 100, 100, 0, "")
 		if !strings.Contains(got, "increase the limit") {
 			t.Errorf("want generic truncation notice, got %q", got)
 		}
@@ -36,22 +36,37 @@ func TestQueryResultNotice(t *testing.T) {
 	// events survived the cut. Both directions asserted, and asserted
 	// disjoint, so swapping the arms cannot pass.
 	t.Run("truncation names the kept end per direction", func(t *testing.T) {
-		asc := queryResultNotice(false, 100, 1_000_000, 100, 100, "ASC")
+		asc := queryResultNotice(false, 100, 1_000_000, 100, 100, 0, "ASC")
 		if !strings.Contains(asc, "OLDEST") || strings.Contains(asc, "NEWEST") {
 			t.Errorf("ASC truncation must say it kept the OLDEST events: %q", asc)
 		}
-		empty := queryResultNotice(false, 100, 1_000_000, 100, 100, "")
+		empty := queryResultNotice(false, 100, 1_000_000, 100, 100, 0, "")
 		if !strings.Contains(empty, "OLDEST") {
 			t.Errorf("the empty default is ASC and must say OLDEST: %q", empty)
 		}
-		desc := queryResultNotice(false, 100, 1_000_000, 100, 100, "desc")
+		desc := queryResultNotice(false, 100, 1_000_000, 100, 100, 0, "desc")
 		if !strings.Contains(desc, "NEWEST") || strings.Contains(desc, "OLDEST") {
 			t.Errorf("DESC truncation (case-insensitive) must say it kept the NEWEST events: %q", desc)
 		}
 	})
 
+	// Under limit_per_pk the kept-end claim is false in BOTH directions (the
+	// per-PK cap's inner ordering is pinned DESC, so events fell off both
+	// ends); the notice must say that instead of naming an end.
+	t.Run("limit_per_pk suppresses the kept-end claim", func(t *testing.T) {
+		for _, order := range []string{"", "ASC", "DESC"} {
+			got := queryResultNotice(false, 100, 1_000_000, 100, 100, 5, order)
+			if strings.Contains(got, "OLDEST") || strings.Contains(got, "NEWEST") {
+				t.Errorf("order=%q: a per-PK-capped truncation named a kept end: %q", order, got)
+			}
+			if !strings.Contains(got, "both ends") || !strings.Contains(got, "latest 5 events per row") {
+				t.Errorf("order=%q: the per-PK arm does not state the double cut: %q", order, got)
+			}
+		}
+	})
+
 	t.Run("no notice below the limit", func(t *testing.T) {
-		if got := queryResultNotice(false, 100, 1_000_000, 42, 100, "DESC"); got != "" {
+		if got := queryResultNotice(false, 100, 1_000_000, 42, 100, 0, "DESC"); got != "" {
 			t.Errorf("want empty notice for a partial result, got %q", got)
 		}
 	})

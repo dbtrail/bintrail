@@ -430,7 +430,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 		}
 		if n >= qLimit {
-			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, keeping the %s matching events. Use a narrower time range or --limit to adjust.\n", qLimit, truncationKeptEnd(qOrder))
+			truncationWarn(qLimit, qLimitPerPK, qOrder)
 		}
 		return nil
 	}
@@ -512,7 +512,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "\n%d row(s)\n", n)
 	}
 	if n >= qLimit {
-		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, keeping the %s matching events. Use a narrower time range or --limit to adjust.\n", qLimit, truncationKeptEnd(qOrder))
+		truncationWarn(qLimit, qLimitPerPK, qOrder)
 	}
 	// An empty digest-filtered result means one of two opposite things. Probe
 	// only here — after the answer came back empty — so the cost lands on the
@@ -534,6 +534,28 @@ func runQuery(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
+}
+
+// truncationWarn prints the stderr warning for a result cut by --limit,
+// naming which end of the matched window survived (#1439): under DESC the
+// newest events, under ASC (or the empty default) the oldest — "truncated"
+// alone left the reader unable to tell which. Under --limit-per-pk the claim
+// is false in BOTH directions (the per-PK cap's inner ordering is pinned
+// DESC, so the result is a slice of a per-PK-newest subset and events fell
+// off both ends), so that shape says so instead.
+func truncationWarn(limit, limitPerPK int, order string) {
+	if limitPerPK > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, and --limit-per-pk kept only the latest %d "+
+			"events per row, so events were dropped at both ends of the window. Use a narrower time range or --limit to adjust.\n",
+			limit, limitPerPK)
+		return
+	}
+	kept := "OLDEST"
+	if query.OrderDirection(order) == "DESC" {
+		kept = "NEWEST"
+	}
+	fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, keeping the %s matching events. "+
+		"Use a narrower time range or --limit to adjust.\n", limit, kept)
 }
 
 // queryArchiveSources is the single choke point for issue #203: it fetches
@@ -586,17 +608,6 @@ func runQuery(cmd *cobra.Command, args []string) error {
 // tests drive the real loop body with a fake fetcher — no DuckDB, no real
 // database, and the exact same code path that production hits. Similarly
 // stderr is an io.Writer so tests capture into a bytes.Buffer without
-// truncationKeptEnd names which end of the matched window a truncating
-// --limit kept, for the stderr warning (#1439): under DESC the newest events
-// survive the cut, under ASC (or the empty default) the oldest do, and
-// "truncated" alone left the reader unable to tell which.
-func truncationKeptEnd(order string) string {
-	if query.OrderDirection(order) == "DESC" {
-		return "NEWEST"
-	}
-	return "OLDEST"
-}
-
 // touching os.Stderr.
 //
 // Stderr messages are sanitized against every line-terminator character via

@@ -740,7 +740,7 @@ func MakeQueryTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Query
 		if n > 0 && format != "json" {
 			text += fmt.Sprintf("\n%d row(s)\n", n)
 		}
-		text += QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit, opts.Order)
+		text += QueryResultNotice(ceilingApplied, requestedLimit, ceiling, n, opts.Limit, opts.LimitPerPK, opts.Order)
 		text += ArchiveSkipNotice(discoveryFailed, skippedArchives)
 		text += EventDivergenceNotice(divergedEvents)
 		if misfiledScanFailed {
@@ -982,7 +982,9 @@ func MakeRecoverTool(cfg Config) func(context.Context, *mcp.CallToolRequest, Rec
 			text += fmt.Sprintf("\n-- %d reversal statement(s) generated.\n", n)
 		}
 		if n >= opts.Limit {
-			text += fmt.Sprintf("\n-- Warning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
+			// The fetch ran Order=DESC (#785/#927), so the cut kept the newest
+			// events — say so, matching the CLI recover warning (#1439).
+			text += fmt.Sprintf("\n-- Warning: results truncated at %d rows; only the most recent events of the window are reversed. Use a narrower since/until range or increase the limit to see more.\n", opts.Limit)
 		}
 		if divergedEvents > 0 {
 			// SQL-comment form so the warning survives inside the script text an
@@ -1184,7 +1186,9 @@ func MakeSchemaChangesTool(cfg Config) func(context.Context, *mcp.CallToolReques
 			text = "No schema changes found."
 		}
 		if n >= limit {
-			text += fmt.Sprintf("\nWarning: results truncated at %d rows. Use a narrower since/until range or increase the limit to see more.", limit)
+			// Results come back newest-first, so the cut kept the newest
+			// changes (#1439).
+			text += fmt.Sprintf("\nWarning: results truncated at %d rows, keeping the NEWEST changes; older ones were dropped. Use a narrower since/until range or increase the limit to see more.", limit)
 		}
 
 		return &mcp.CallToolResult{
@@ -1304,11 +1308,19 @@ func ApplyQueryCeiling(limit, max int) (int, bool) {
 // telling an agent to "increase the limit" would be wrong, since the limit it
 // asked for is exactly the one that was capped (and after a cap n == limit makes
 // the generic arm true too, so order matters). Returns "" when no notice applies.
-func QueryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit int, order string) string {
+func QueryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit, limitPerPK int, order string) string {
 	switch {
 	case ceilingApplied:
 		return fmt.Sprintf("\nWarning: requested limit %d exceeds the MCP query ceiling of %d rows; capped to %d. "+
 			"Narrow your filters/time range, or run the `bintrail query` CLI for an unbounded export.\n", requestedLimit, ceiling, ceiling)
+	case n >= limit && limitPerPK > 0:
+		// Under a per-PK cap the "kept end" claim is false in BOTH
+		// directions: the cap's inner ordering is pinned DESC (latest N per
+		// pk_values, whatever the final direction), so the returned rows are
+		// a slice of a per-PK-newest subset and events fell off both ends.
+		return fmt.Sprintf("\nWarning: results truncated at %d rows, and limit_per_pk kept only the latest %d "+
+			"events per row, so events were dropped at both ends of the window. "+
+			"Use a narrower since/until range or increase the limit to see more.\n", limit, limitPerPK)
 	case n >= limit:
 		// The direction names which END the trim kept (#1439): "truncated"
 		// alone left a client that asked for the last N unable to tell
