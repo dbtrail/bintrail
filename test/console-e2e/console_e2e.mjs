@@ -747,14 +747,26 @@ try {
     const none = mk({ access_key_env: false, profile: "", region_env: "", shared_config: false, container_creds: false, web_identity: false });
     const keys = mk({ access_key_env: true, profile: "", region_env: "", shared_config: false, container_creds: false, web_identity: false });
     const ecs = mk({ access_key_env: false, profile: "", region_env: "", shared_config: false, container_creds: true, web_identity: false });
-    const irsa = mk({ access_key_env: false, profile: "", region_env: "", shared_config: false, container_creds: false, web_identity: true });
+    // The healthy IRSA shape (#1534): token readable AND a role named. The
+    // broken shapes (unreadable token, missing role ARN) are pinned at the
+    // unit tier; this scenario keeps the register check — a healthy role
+    // setup must never read as "no credentials".
+    const irsa = mk({ access_key_env: false, profile: "", region_env: "", shared_config: false, container_creds: false, web_identity: true, web_identity_token_readable: true, web_identity_role_arn: true });
+    // The two broken IRSA shapes run through the REAL branches here on
+    // purpose: the unit tier pins their strings, and a string survives a
+    // dead branch — `if (false)` around either arm keeps the Go guard green
+    // while the card falls back to the healthy sentence.
+    const irsaBroken = mk({ access_key_env: false, profile: "", region_env: "", shared_config: false, container_creds: false, web_identity: true, web_identity_token_readable: false });
+    const irsaNoArn = mk({ access_key_env: false, profile: "", region_env: "", shared_config: false, container_creds: false, web_identity: true, web_identity_token_readable: true, web_identity_role_arn: false });
     const shared = mk({ access_key_env: false, profile: "default", region_env: "", shared_config: true, container_creds: false, web_identity: false });
     const adv = none.querySelector("details.form-advanced");
     return {
       noneSummary: /No credentials set directly/.test(none.textContent),
       keysSummary: /access key ID set in an environment variable/.test(keys.textContent),
-      ecsSummary: /found an ECS task role/.test(ecs.textContent),
-      irsaSummary: /EKS service-account role/.test(irsa.textContent),
+      ecsSummary: /ECS task-role endpoint/.test(ecs.textContent),
+      irsaSummary: /EKS service-account role/.test(irsa.textContent) && !/cannot sign/.test(irsa.textContent),
+      irsaBrokenSummary: /cannot be read/.test(irsaBroken.textContent) && /cannot sign/.test(irsaBroken.textContent),
+      irsaNoArnSummary: /AWS_ROLE_ARN is not set/.test(irsaNoArn.textContent),
       sharedSummary: /shared ~\/\.aws config file/.test(shared.textContent),
       hasDisclosure: !!adv,
       disclosureCollapsed: !!adv && !adv.open,
@@ -764,8 +776,10 @@ try {
   });
   cred.noneSummary ? ok("aws-creds: no signals renders the ambient-chain summary") : bad("aws-creds: no signals renders the ambient-chain summary", "wording missing");
   cred.keysSummary ? ok("aws-creds: static env keys take priority in the summary, reported as the ID that was probed") : bad("aws-creds: static env keys take priority in the summary, reported as the ID that was probed", "wording missing");
-  cred.ecsSummary ? ok("aws-creds: ECS task role reads as an IAM role, not an error") : bad("aws-creds: ECS task role reads as an IAM role, not an error", "wording missing");
-  cred.irsaSummary ? ok("aws-creds: EKS IRSA reads as an IAM role, not an error") : bad("aws-creds: EKS IRSA reads as an IAM role, not an error", "wording missing");
+  cred.ecsSummary ? ok("aws-creds: ECS arm names the endpoint variable it saw") : bad("aws-creds: ECS arm names the endpoint variable it saw", "wording missing");
+  cred.irsaSummary ? ok("aws-creds: a healthy EKS role reads as a role, never as no credentials") : bad("aws-creds: a healthy EKS role reads as a role, never as no credentials", "wording missing or a broken-shape sentence leaked");
+  cred.irsaBrokenSummary ? ok("aws-creds: an unreadable IRSA token says so instead of claiming a role") : bad("aws-creds: an unreadable IRSA token says so instead of claiming a role", "the branch did not render");
+  cred.irsaNoArnSummary ? ok("aws-creds: a token without AWS_ROLE_ARN names the missing half") : bad("aws-creds: a token without AWS_ROLE_ARN names the missing half", "the branch did not render");
   cred.sharedSummary ? ok("aws-creds: shared ~/.aws config/profile never reads as 'no credentials'") : bad("aws-creds: shared ~/.aws config/profile never reads as 'no credentials'", "wording missing/contradicts raw signal");
   cred.hasDisclosure ? ok("aws-creds: raw signals are folded behind a details disclosure") : bad("aws-creds: raw signals are folded behind a details disclosure", "no details.form-advanced");
   cred.disclosureCollapsed ? ok("aws-creds: raw-signals disclosure is collapsed by default") : bad("aws-creds: raw-signals disclosure is collapsed by default", "rendered open");

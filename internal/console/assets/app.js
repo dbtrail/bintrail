@@ -4417,17 +4417,24 @@ function credentialsCard(storage) {
   // secret used to render "Using access keys" while the SDK's env provider
   // yields nothing and the chain walks on past it.
   if (aws.access_key_env) summary = "Found an access key ID set in an environment variable. Its secret key is not checked here, so this may not be what signs the requests.";
-  // The next TWO arms are NOT hedged, and that is known rather than overlooked:
-  // ContainerCreds and WebIdentity are env-var presence with no stat and no
-  // AWS_ROLE_ARN check, so they are weaker evidence than the file stat behind
-  // the shared-config arm below while claiming more. A token path that does not
-  // exist, a rotated-away token, or a FULL_URI endpoint that answers 403 all
-  // render "Using an IAM role" while nothing signs. Tracked in #1534; fixing
-  // them is a change to what /api/storage probes, not a wording change, which
-  // is why #1528 left them alone instead of hedging the copy over a signal the
-  // daemon could have checked properly.
-  else if (aws.container_creds) summary = "Using an IAM role (found an ECS task role).";
-  else if (aws.web_identity) summary = "Using an IAM role (found an EKS service-account role).";
+  // The ECS arm stays env-var presence: probing the endpoint is a network
+  // call and a separate decision (#1534), so the copy claims exactly what
+  // was seen and no more.
+  else if (aws.container_creds) summary = "Found the ECS task-role endpoint in the environment. Whether the endpoint answers is not checked here, so this may not be what signs the requests.";
+  // The web-identity arm is PROBED since #1534: the provider needs the token
+  // file readable AND AWS_ROLE_ARN, and asserting a role from the variable
+  // alone rendered "Using an IAM role" over a stale or unmounted token — on
+  // the page an operator opens precisely because S3 is not working. The two
+  // broken shapes speak first, because they are the ones with a fix to name.
+  else if (aws.web_identity) {
+    if (!aws.web_identity_token_readable) {
+      summary = "An EKS service-account role is configured, but its token file cannot be read (missing, unmounted, or rotated away), so it cannot sign anything.";
+    } else if (!aws.web_identity_role_arn) {
+      summary = "An EKS service-account token is readable, but AWS_ROLE_ARN is not set. The provider needs both, so this cannot sign requests.";
+    } else {
+      summary = "Found an EKS service-account role: the token file is readable and a role is named. Whether AWS accepts it is not checked here.";
+    }
+  }
   // TWO independent probes select this arm, and the sentence has to name both.
   // hasSharedAWSConfig() stats a file; aws.profile is AWS_PROFILE in the
   // environment. Naming only the file contradicted the card's own
@@ -4448,8 +4455,11 @@ function credentialsCard(storage) {
   kvRow(adv, "profile (env)", aws.profile || "not set");
   kvRow(adv, "region (env)", aws.region_env || "not set");
   kvRow(adv, "~/.aws config", aws.shared_config ? "present" : "absent");
-  if (aws.container_creds) kvRow(adv, "ECS task role", "detected");
-  if (aws.web_identity) kvRow(adv, "EKS IRSA", "detected");
+  if (aws.container_creds) kvRow(adv, "ECS task role", "endpoint variable set");
+  if (aws.web_identity) {
+    kvRow(adv, "EKS IRSA token", aws.web_identity_token_readable ? "readable" : "unreadable");
+    kvRow(adv, "role ARN (env)", aws.web_identity_role_arn ? "set" : "not set");
+  }
   card.append(adv);
   return card;
 }

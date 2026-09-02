@@ -59,6 +59,59 @@ func TestStorageAPI_reportsPresenceNeverValues(t *testing.T) {
 	}
 }
 
+// TestStorageAPI_webIdentityIsProbedNotAsserted pins the #1534 shapes: the
+// variable alone used to render "Using an IAM role" while a typo'd path, an
+// unmounted projected-token volume, or a missing AWS_ROLE_ARN meant nothing
+// signs — on the page an operator opens precisely because S3 is not working.
+func TestStorageAPI_webIdentityIsProbedNotAsserted(t *testing.T) {
+	tmp := t.TempDir()
+	token := filepath.Join(tmp, "token")
+	if err := os.WriteFile(token, []byte("jwt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, env := range []string{"AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI"} {
+		t.Setenv(env, "")
+	}
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(tmp, "missing"))
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(tmp, "missing2"))
+
+	srv := newStorageServer(t)
+	read := func() awsCredsDTO {
+		t.Helper()
+		rec, body := doServersReq(t, srv, "GET", "/api/storage", "")
+		if rec.Code != 200 {
+			t.Fatalf("code = %d, body = %s", rec.Code, body)
+		}
+		var got storageInfoResponse
+		if err := json.Unmarshal(body, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got.AWS
+	}
+
+	// The healthy shape: token readable, role named.
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", token)
+	t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/app")
+	if aws := read(); !aws.WebIdentity || !aws.WebIdentityTokenReadable || !aws.WebIdentityRoleArn {
+		t.Fatalf("healthy IRSA = %+v, want all three signals", aws)
+	}
+
+	// The typo'd/unmounted path: variable set, file absent. This is the shape
+	// that used to read as "Using an IAM role".
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(tmp, "nope"))
+	if aws := read(); !aws.WebIdentity || aws.WebIdentityTokenReadable {
+		t.Fatalf("missing token = %+v, want web_identity set and token NOT readable", aws)
+	}
+
+	// A token without a role: the provider needs both.
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", token)
+	t.Setenv("AWS_ROLE_ARN", "")
+	if aws := read(); !aws.WebIdentityTokenReadable || aws.WebIdentityRoleArn {
+		t.Fatalf("no role arn = %+v, want readable token and role_arn false", aws)
+	}
+}
+
 func TestStorageAPI_nothingSet(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("AWS_ACCESS_KEY_ID", "")

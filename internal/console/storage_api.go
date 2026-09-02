@@ -12,12 +12,37 @@ import (
 // without an IMDS network call, so "nothing set" here does NOT mean uploads
 // will fail — the Storage panel says so.
 type awsCredsDTO struct {
-	AccessKeyEnv   bool   `json:"access_key_env"`       // AWS_ACCESS_KEY_ID is set
-	Profile        string `json:"profile,omitempty"`    // AWS_PROFILE (a name, non-secret)
-	RegionEnv      string `json:"region_env,omitempty"` // AWS_REGION / AWS_DEFAULT_REGION
-	SharedConfig   bool   `json:"shared_config"`        // ~/.aws/credentials or config exists
-	ContainerCreds bool   `json:"container_creds"`      // ECS task-role endpoint configured
-	WebIdentity    bool   `json:"web_identity"`         // EKS IRSA token file configured
+	AccessKeyEnv bool   `json:"access_key_env"`       // AWS_ACCESS_KEY_ID is set
+	Profile      string `json:"profile,omitempty"`    // AWS_PROFILE (a name, non-secret)
+	RegionEnv    string `json:"region_env,omitempty"` // AWS_REGION / AWS_DEFAULT_REGION
+	SharedConfig bool   `json:"shared_config"`        // ~/.aws/credentials or config exists
+	// ContainerCreds is env-var presence ONLY: probing the ECS endpoint is a
+	// network call and a separate decision (#1534) — the card's copy says so
+	// instead of claiming the role signs anything.
+	ContainerCreds bool `json:"container_creds"` // ECS task-role endpoint variable set
+	// The web-identity arm is PROBED rather than presence-asserted (#1534):
+	// the SDK's provider needs the token file readable AND AWS_ROLE_ARN, and
+	// a stale projected token, an unmounted volume, or a lone env var used to
+	// render "Using an IAM role" while nothing signs — on the page an
+	// operator opens precisely because S3 is not working.
+	WebIdentity              bool `json:"web_identity"`                          // AWS_WEB_IDENTITY_TOKEN_FILE is set
+	WebIdentityTokenReadable bool `json:"web_identity_token_readable,omitempty"` // the token file opened for read
+	WebIdentityRoleArn       bool `json:"web_identity_role_arn,omitempty"`       // AWS_ROLE_ARN is also set
+}
+
+// webIdentityTokenReadable reports whether the IRSA token file can actually
+// be opened for reading — a stat is not enough (mode-000 files stat fine),
+// and reading is what the SDK's provider will do.
+func webIdentityTokenReadable(path string) bool {
+	if path == "" {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
 }
 
 // stagingDTO is the sql-export staging's share of the disk (#1448): the
@@ -64,7 +89,9 @@ func (s *Server) handleStorageInfo(w http.ResponseWriter, r *http.Request) {
 		SharedConfig: hasSharedAWSConfig(),
 		ContainerCreds: os.Getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != "" ||
 			os.Getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != "",
-		WebIdentity: os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "",
+		WebIdentity:              os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "",
+		WebIdentityTokenReadable: webIdentityTokenReadable(os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")),
+		WebIdentityRoleArn:       os.Getenv("AWS_ROLE_ARN") != "",
 	}, Staging: s.stagingInfo()})
 }
 
