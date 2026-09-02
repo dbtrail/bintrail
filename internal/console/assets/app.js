@@ -4428,7 +4428,7 @@ function credentialsCard(storage) {
   // broken shapes speak first, because they are the ones with a fix to name.
   else if (aws.web_identity) {
     if (!aws.web_identity_token_readable) {
-      summary = "An EKS service-account role is configured, but its token file cannot be read (missing, unmounted, or rotated away), so it cannot sign anything.";
+      summary = "An EKS service-account role is configured, but its token file cannot be read (missing, not a file, or not readable by the daemon), so it cannot sign anything.";
     } else if (!aws.web_identity_role_arn) {
       summary = "An EKS service-account token is readable, but AWS_ROLE_ARN is not set. The provider needs both, so this cannot sign requests.";
     } else {

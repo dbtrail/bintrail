@@ -44,8 +44,7 @@ func webIdentityTokenReadable(path string) bool {
 	if path == "" {
 		return false
 	}
-	st, err := os.Stat(path)
-	if err != nil || !st.Mode().IsRegular() {
+	if !regularFileExists(path) {
 		return false
 	}
 	f, err := os.Open(path)

@@ -121,6 +121,23 @@ func TestStorageAPI_webIdentityIsProbedNotAsserted(t *testing.T) {
 		t.Fatalf("directory = %+v, want web_identity set and token NOT readable", aws)
 	}
 
+	// A token the daemon may not read. It stats fine (stat comes from the
+	// directory's execute bit), so this is the case the OPEN half of the probe
+	// exists for: without it the function reduces to a stat and every other
+	// case here still passes.
+	locked := filepath.Join(tmp, "locked-token")
+	if err := os.WriteFile(locked, []byte("jwt"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		t.Log("running as root: skipping the unreadable-mode case (root opens a mode-000 file)")
+	} else {
+		t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", locked)
+		if aws := read(); !aws.WebIdentity || aws.WebIdentityTokenReadable {
+			t.Fatalf("mode-000 token = %+v, want web_identity set and token NOT readable", aws)
+		}
+	}
+
 	// A Kubernetes projected token is a symlink farm (token -> ..data/token),
 	// so the probe must follow symlinks: Lstat here would report a healthy
 	// IRSA mount as unreadable.
