@@ -4338,16 +4338,33 @@ try {
   await page.emulateMedia({ reducedMotion: "reduce" });
   // Repainted before every shot, not once for the run: renderEvents ends by
   // firing its own query, and that resolve calls buildEventRows, which clears
-  // #ev-rows. Asserting the skeleton survived an await would be a flake in the
-  // one scenario whose stated design is determinism.
-  const skelPaint = () => page.evaluate(async () => {
-    navigate("events");
-    await new Promise((r) => setTimeout(r, 300));
-    const rows = document.querySelector("#ev-rows");
-    if (!rows) return 0;
-    renderEventsLoading(rows);
-    return document.querySelectorAll(".ev-skel-bar").length;
-  });
+  // #ev-rows. The paint therefore waits for the view's OWN query to SETTLE —
+  // both progressive phases, the background archive read included — before
+  // painting the skeleton by hand (#1580). The earlier fixed 300ms sleep was
+  // a bet on machine speed: under load the archive phase resolved between
+  // the hand paint and the photograph, cleared the bars, and four scenarios
+  // failed together on a box that re-ran green. Settled means the rows are
+  // painted and no background-read transient remains, which is a state, not
+  // a moment: once true it stays true, so nothing can clear the skeleton
+  // painted after it.
+  const skelPaint = async () => {
+    await page.evaluate(() => navigate("events"));
+    await page.waitForFunction(() => {
+      if (location.pathname !== "/events") return false;
+      const rows = document.querySelector("#ev-rows");
+      // Painted rows OR a painted empty state — either is a finished query;
+      // requiring rows alone would hang this wait on a server with nothing
+      // in the window.
+      if (!rows || !(rows.querySelector(".ev-row") || rows.querySelector(".ev-empty"))) return false;
+      return !Array.from(document.querySelectorAll("#ev-warnings .warn-item"))
+        .some((n) => /Reading archived history in the background/.test(n.textContent));
+    }, { timeout: 20000 });
+    return page.evaluate(() => {
+      const rows = document.querySelector("#ev-rows");
+      renderEventsLoading(rows);
+      return document.querySelectorAll(".ev-skel-bar").length;
+    });
+  };
   const skelSetDir = (dir) => page.evaluate((d) => {
     const root = document.documentElement;
     d === null ? root.removeAttribute("data-dir") : root.setAttribute("data-dir", d);
@@ -4519,9 +4536,13 @@ try {
     f.elements.since.value = ""; f.elements.until.value = "";
     f.elements.limit.value = "5";
     f.requestSubmit();
-    for (let i = 0; i < 60; i++) {
-      await new Promise((r) => setTimeout(r, 50));
-      if (document.querySelectorAll("#ev-notes .note-item").length) break;
+    // The note this scenario is about, not any note, and a budget sized for
+    // a loaded box (#1580): the old three-second cap was of the same class
+    // as the gap-warning race next door.
+    for (let i = 0; i < 150; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const n = document.querySelector("#ev-notes .note-item");
+      if (n && /answered from the live index/.test(n.textContent)) break;
     }
     const note = document.querySelector("#ev-notes .note-item");
     const cs = note ? getComputedStyle(note) : null;
@@ -4567,13 +4588,21 @@ try {
     // own TRANSIENT scope=live partial warning before phase 2 replaces it
     // with the final set. Breaking on ANY .warn-item samples whichever phase
     // got there first — a race this scenario lost twice in one session — so
-    // wait for the warning the assertions below are actually about.
+    // wait for the TERMINAL state the assertions below are about: the gap
+    // warning up AND no transient left beside it. Waiting for the warning
+    // alone was still a race (#1580): on a loaded box the archive phase
+    // outlived the old six-second budget, the loop expired mid-phase-1, and
+    // four scenarios failed on a snapshot of the transient. The terminal
+    // state is stable — once phase 2 lands it cannot regress — so a long
+    // budget costs nothing on a healthy run.
     let w = null;
-    for (let i = 0; i < 120; i++) {
-      await new Promise((r) => setTimeout(r, 50));
-      w = Array.from(document.querySelectorAll("#ev-warnings .warn-item"))
-        .find((n) => /rotated and not archived/.test(n.textContent)) || null;
-      if (w) break;
+    for (let i = 0; i < 300; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      const items = Array.from(document.querySelectorAll("#ev-warnings .warn-item"));
+      const transient = items.some((n) =>
+        /Reading archived history in the background|scope=live/.test(n.textContent));
+      w = items.find((n) => /rotated and not archived/.test(n.textContent)) || null;
+      if (w && !transient) break;
     }
     const cs = w ? getComputedStyle(w) : null;
     return {
