@@ -208,6 +208,64 @@ func TestParseFile_realBinlog(t *testing.T) {
 	}
 }
 
+// TestParseFile_unqualifiedDDLTakesTheSessionDefaultSchema pins the #1435
+// wiring at the FILE-path call site against a real binlog: MustExec's
+// connection has the test schema as its default database, so the unqualified
+// TRUNCATE below is exactly the `USE db; TRUNCATE TABLE t` shape — the
+// QUERY_EVENT carries the default in ev.Schema and the statement does not.
+// Replace the call site's string(ev.Schema) with "" and only this notices
+// (the stream sibling has its own unit pin).
+func TestParseFile_unqualifiedDDLTakesTheSessionDefaultSchema(t *testing.T) {
+	testutil.SkipIfNoMySQL(t)
+
+	sourceDB, sourceName := testutil.CreateTestDB(t)
+	testutil.MustExec(t, sourceDB, "CREATE TABLE dbt_burst_referrers (id INT PRIMARY KEY)")
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+	currentBinlog, _, err := config.CurrentBinlogPosition(sourceDB)
+	if err != nil {
+		t.Fatalf("CurrentBinlogPosition: %v", err)
+	}
+	testutil.MustExec(t, sourceDB, "TRUNCATE TABLE dbt_burst_referrers")
+	testutil.MustExec(t, sourceDB, "FLUSH BINARY LOGS")
+
+	tmpDir := t.TempDir()
+	cpCmd := exec.Command("docker", "cp",
+		fmt.Sprintf("bintrail-test-mysql:/var/lib/mysql/%s", currentBinlog),
+		filepath.Join(tmpDir, currentBinlog))
+	if out, err := cpCmd.CombinedOutput(); err != nil {
+		t.Fatalf("docker cp %s failed: %v\n%s", currentBinlog, err, out)
+	}
+
+	p := parser.New(tmpDir, nil, parser.Filters{Schemas: map[string]bool{sourceName: true}}, nil)
+	events := make(chan parser.Event, 100)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(events)
+		errCh <- p.ParseFile(context.Background(), currentBinlog, events)
+	}()
+	all := drainEvents(events)
+	if err := <-errCh; err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+
+	// The shared container's window may hold other packages' DDL; find OURS
+	// by table (unique enough for this fixture) rather than counting.
+	var found bool
+	for _, ev := range all {
+		if ev.EventType != parser.EventDDL || ev.Table != "dbt_burst_referrers" {
+			continue
+		}
+		found = true
+		if ev.Schema != sourceName {
+			t.Errorf("unqualified TRUNCATE recorded schema %q, want the session default %q (#1435): "+
+				"the row would be unfindable by the schema filter", ev.Schema, sourceName)
+		}
+	}
+	if !found {
+		t.Fatal("the TRUNCATE's EventDDL never arrived; the fixture proved nothing")
+	}
+}
+
 func TestParseFile_withFilters(t *testing.T) {
 	testutil.SkipIfNoMySQL(t)
 

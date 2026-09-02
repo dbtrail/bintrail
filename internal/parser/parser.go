@@ -252,7 +252,7 @@ func (p *Parser) ParseFile(ctx context.Context, filename string, events chan<- E
 			// is stale. The statement's own ROWS_QUERY_EVENT arrives AFTER this.
 			currentQueryText = ""
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
-			if ddlEv, ok := parseDDL(p.logger, filename, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), p.schemaVersion.Load()); ok {
+			if ddlEv, ok := parseDDL(p.logger, filename, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), string(ev.Schema), p.schemaVersion.Load()); ok {
 				if err := em.send(ctx, ddlEv); err != nil {
 					return err
 				}
@@ -1117,7 +1117,17 @@ func isSQLSpace(b byte) bool {
 // Returns zero Event and false if the query is not a DDL statement.
 // TRUNCATE is included for audit purposes but does not invalidate the snapshot
 // (callers should skip auto-snapshot for DDLTruncateTable).
-func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp time.Time, gtid, queryStr string, schemaVersion uint32) (Event, bool) {
+//
+// defaultSchema is the QUERY_EVENT's session default database (#1435): the
+// unqualified form (`USE wordpress; TRUNCATE TABLE t`) is what people and
+// ORMs actually type, and recording it with an empty schema_name made most
+// DDL rows unfindable by the schema filter. A schema qualified in the
+// statement always wins — the fallback is exactly the database MySQL itself
+// resolved the unqualified name against. It can be empty (a client with no
+// default database running qualified DDL); then schema_name stays empty, as
+// before. Historical rows are NOT backfilled: the original session's default
+// is unrecoverable, and matching empty rows against any filter would lie.
+func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp time.Time, gtid, queryStr, defaultSchema string, schemaVersion uint32) (Event, bool) {
 	upper := strings.ToUpper(strings.TrimSpace(queryStr))
 
 	var ddlType DDLKind
@@ -1150,6 +1160,9 @@ func parseDDL(logger *slog.Logger, filename string, logPos uint32, timestamp tim
 		case m[6] != "": // table (unquoted, no schema)
 			table = m[6]
 		}
+	}
+	if schema == "" {
+		schema = defaultSchema
 	}
 
 	startPos := uint64(0) // DDL events have no row-level start position

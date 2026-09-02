@@ -435,28 +435,44 @@ func TestParseDDL_ddlStatements(t *testing.T) {
 	ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
 	tests := []struct {
-		query   string
-		ddlType DDLKind
-		schema  string
-		table   string
+		query string
+		// defaultSchema is the QUERY_EVENT's session default database
+		// (#1435): the schema MySQL itself resolved an unqualified name
+		// against. Empty on the pre-#1435 rows, whose expectations must not
+		// move — no default, no attribution.
+		defaultSchema string
+		ddlType       DDLKind
+		schema        string
+		table         string
 	}{
-		{"ALTER TABLE orders ADD COLUMN foo INT", DDLAlterTable, "", "orders"},
-		{"CREATE TABLE new_tbl (id INT)", DDLCreateTable, "", "new_tbl"},
-		{"DROP TABLE old_tbl", DDLDropTable, "", "old_tbl"},
-		{"RENAME TABLE a TO b", DDLRenameTable, "", "a"},
-		{"ALTER TABLE mydb.orders ADD COLUMN foo INT", DDLAlterTable, "mydb", "orders"},
-		{"ALTER TABLE `mydb`.`orders` ADD COLUMN foo INT", DDLAlterTable, "mydb", "orders"},
-		{"DROP TABLE IF EXISTS old_tbl", DDLDropTable, "", "old_tbl"},
-		{"CREATE TABLE IF NOT EXISTS `mydb`.`new_tbl` (id INT)", DDLCreateTable, "mydb", "new_tbl"},
-		{"TRUNCATE orders", DDLTruncateTable, "", "orders"},
-		{"TRUNCATE TABLE orders", DDLTruncateTable, "", "orders"},
-		{"TRUNCATE TABLE mydb.orders", DDLTruncateTable, "mydb", "orders"},
-		{"TRUNCATE `mydb`.`orders`", DDLTruncateTable, "mydb", "orders"},
+		{"ALTER TABLE orders ADD COLUMN foo INT", "", DDLAlterTable, "", "orders"},
+		{"CREATE TABLE new_tbl (id INT)", "", DDLCreateTable, "", "new_tbl"},
+		{"DROP TABLE old_tbl", "", DDLDropTable, "", "old_tbl"},
+		{"RENAME TABLE a TO b", "", DDLRenameTable, "", "a"},
+		{"ALTER TABLE mydb.orders ADD COLUMN foo INT", "", DDLAlterTable, "mydb", "orders"},
+		{"ALTER TABLE `mydb`.`orders` ADD COLUMN foo INT", "", DDLAlterTable, "mydb", "orders"},
+		{"DROP TABLE IF EXISTS old_tbl", "", DDLDropTable, "", "old_tbl"},
+		{"CREATE TABLE IF NOT EXISTS `mydb`.`new_tbl` (id INT)", "", DDLCreateTable, "mydb", "new_tbl"},
+		{"TRUNCATE orders", "", DDLTruncateTable, "", "orders"},
+		{"TRUNCATE TABLE orders", "", DDLTruncateTable, "", "orders"},
+		{"TRUNCATE TABLE mydb.orders", "", DDLTruncateTable, "mydb", "orders"},
+		{"TRUNCATE `mydb`.`orders`", "", DDLTruncateTable, "mydb", "orders"},
+		// #1435: an unqualified statement resolves against the session's
+		// default database — one case per statement kind, since each rides a
+		// different regex arm.
+		{"TRUNCATE TABLE dbt_burst_referrers", "wordpress", DDLTruncateTable, "wordpress", "dbt_burst_referrers"},
+		{"ALTER TABLE orders ADD COLUMN foo INT", "shop", DDLAlterTable, "shop", "orders"},
+		{"CREATE TABLE new_tbl (id INT)", "shop", DDLCreateTable, "shop", "new_tbl"},
+		{"DROP TABLE old_tbl", "shop", DDLDropTable, "shop", "old_tbl"},
+		{"RENAME TABLE a TO b", "shop", DDLRenameTable, "shop", "a"},
+		// A schema qualified in the statement always beats the default.
+		{"ALTER TABLE mydb.orders ADD COLUMN foo INT", "shop", DDLAlterTable, "mydb", "orders"},
+		{"TRUNCATE `mydb`.`orders`", "shop", DDLTruncateTable, "mydb", "orders"},
 	}
 
 	for _, tt := range tests {
 		buf.Reset()
-		ev, ok := parseDDL(logger, "binlog.000001", 100, ts, "uuid:1", tt.query, 0)
+		ev, ok := parseDDL(logger, "binlog.000001", 100, ts, "uuid:1", tt.query, tt.defaultSchema, 0)
 		if !ok {
 			t.Errorf("parseDDL(%q) returned false, want true", tt.query)
 			continue
@@ -496,7 +512,7 @@ func TestParseDDL_nonDDL(t *testing.T) {
 	}
 	for _, stmt := range nonDDL {
 		buf.Reset()
-		_, ok := parseDDL(logger, "binlog.000001", 100, ts, "", stmt, 0)
+		_, ok := parseDDL(logger, "binlog.000001", 100, ts, "", stmt, "", 0)
 		if ok {
 			t.Errorf("parseDDL(%q) returned true, want false", stmt)
 		}
@@ -508,7 +524,7 @@ func TestParseDDL_caseInsensitive(t *testing.T) {
 	logger := newTestLogger(&buf)
 	ts := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
-	ev, ok := parseDDL(logger, "binlog.000001", 100, ts, "", "alter table orders add column x int", 0)
+	ev, ok := parseDDL(logger, "binlog.000001", 100, ts, "", "alter table orders add column x int", "", 0)
 	if !ok {
 		t.Errorf("parseDDL(lowercase ALTER TABLE) returned false, want true")
 	}

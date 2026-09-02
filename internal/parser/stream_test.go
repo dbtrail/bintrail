@@ -707,6 +707,35 @@ func TestStreamParser_ddlBypassesSchemaFilter(t *testing.T) {
 	}
 }
 
+// TestStreamParser_unqualifiedDDLTakesTheSessionDefaultSchema pins the #1435
+// WIRING at the stream call site: parseDDL's fallback is unit-tested on its
+// own, but the call site handing it string(ev.Schema) is what makes `USE
+// wordpress; TRUNCATE TABLE t` findable by schema — replace that argument
+// with "" and only this test notices.
+func TestStreamParser_unqualifiedDDLTakesTheSessionDefaultSchema(t *testing.T) {
+	sp := NewStreamParser(nil, Filters{}, nil)
+	streamer := replication.NewBinlogStreamer()
+	out := make(chan Event, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	feedThenCancel(t, streamer, cancel, makeQueryEventWithSchema("wordpress", "TRUNCATE TABLE dbt_burst_referrers"))
+
+	if err := sp.Run(ctx, streamer, out); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 EventDDL, got %d", len(out))
+	}
+	ev := <-out
+	if ev.EventType != EventDDL || ev.Table != "dbt_burst_referrers" {
+		t.Fatalf("expected the TRUNCATE's EventDDL, got type=%d table=%q", ev.EventType, ev.Table)
+	}
+	if ev.Schema != "wordpress" {
+		t.Errorf("Schema = %q, want the session default 'wordpress'; the unqualified form is what "+
+			"people and ORMs type, and an empty schema_name makes the row unfindable by filter (#1435)", ev.Schema)
+	}
+}
+
 // ─── RowsEvent filtering ──────────────────────────────────────────────────────
 
 // TestStreamParser_filteredRowsEvent verifies that a RowsEvent for a schema

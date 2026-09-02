@@ -351,7 +351,7 @@ func (sp *StreamParser) Run(ctx context.Context, streamer *replication.BinlogStr
 			// the previous statement's ROWS_QUERY text is stale.
 			currentQueryText = ""
 			ts := time.Unix(int64(binlogEv.Header.Timestamp), 0).UTC()
-			if ddlEv, ok := parseDDL(sp.logger, currentFile, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), sp.schemaVersion.Load()); ok {
+			if ddlEv, ok := parseDDL(sp.logger, currentFile, binlogEv.Header.LogPos, ts, currentGTID, string(ev.Query), string(ev.Schema), sp.schemaVersion.Load()); ok {
 				// Synchronous DDL hook runs BEFORE ddlEv is emitted (#760,
 				// reordered from emit-then-hook). The consumer (streamLoop)
 				// advances the durable checkpoint's binlogPos/GTID off events
