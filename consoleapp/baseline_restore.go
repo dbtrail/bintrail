@@ -52,11 +52,10 @@ func (s *baselineSupervisor) runRestore(req console.BaselineRestoreRequest) {
 	defer s.recoverBaselineJob(baselineJobRestore, req.ServerID, req.ServerName)
 	started := time.Now().UTC()
 	tables, refused, reuse, err := s.executeRestore(req)
-	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
+	s.recordRun(req.ServerID, req.ServerName, foldRunCounts(console.BaselineRunRecord{
 		Kind: console.BaselineRunRestore, StartedAt: started.Format(time.RFC3339),
-		SnapshotTime: publishedSnapshotTime(req.At, err), Tables: tables, Refused: refused,
-		Carried: reuse.reused, CarriedCopied: reuse.copied,
-	}, err)
+		SnapshotTime: publishedSnapshotTime(req.At, err),
+	}, tables, refused, reuse), err)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

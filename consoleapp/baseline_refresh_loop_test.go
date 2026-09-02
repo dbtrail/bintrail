@@ -730,6 +730,29 @@ func TestFoldOutcome(t *testing.T) {
 	})
 }
 
+// TestFoldRunCounts: the DURABLE half of a fold's outcome — the history
+// record the Backups page reads long after the live status is overwritten.
+// Both callers sit behind a `go` and a live fold, so this mapping is the one
+// hop of the reuseTally chain the unit tier can reach; zeroing CarriedCopied
+// in either record literal used to pass the whole suite.
+func TestFoldRunCounts(t *testing.T) {
+	base := console.BaselineRunRecord{Kind: console.BaselineRunRefresh, Uploaded: 4}
+	got := foldRunCounts(base, 7, 2, reuseTally{reused: 3, copied: 1})
+	if got.Tables != 7 || got.Refused != 2 || got.Carried != 3 || got.CarriedCopied != 1 {
+		t.Errorf("counts = tables:%d refused:%d carried:%d copied:%d, want 7/2/3/1",
+			got.Tables, got.Refused, got.Carried, got.CarriedCopied)
+	}
+	if got.Kind != console.BaselineRunRefresh || got.Uploaded != 4 {
+		t.Errorf("the mapping disturbed fields it does not own: %+v", got)
+	}
+	// Zeroes are written, not skipped: the fields are omitempty on the wire
+	// and the record is built fresh, but the mapping must not depend on that.
+	zero := foldRunCounts(console.BaselineRunRecord{Tables: 9, Carried: 5, CarriedCopied: 5}, 0, 0, reuseTally{})
+	if zero.Tables != 0 || zero.Carried != 0 || zero.CarriedCopied != 0 {
+		t.Errorf("zero counts did not overwrite: %+v", zero)
+	}
+}
+
 // TestApplyFoldStatus: what the console polls after a fold finishes.
 //
 // Both callers sit behind a `go` and a live fold, so this was unreachable at

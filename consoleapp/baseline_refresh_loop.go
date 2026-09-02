@@ -144,16 +144,15 @@ func (s *baselineSupervisor) runRefresh(req refreshRequest, at time.Time, interv
 	// instead measures how long it takes to spawn a goroutine, which is
 	// microseconds no matter what the refresh costs.
 	took := time.Since(elapsed)
-	s.recordRun(req.ServerID, req.ServerName, console.BaselineRunRecord{
+	s.recordRun(req.ServerID, req.ServerName, foldRunCounts(console.BaselineRunRecord{
 		Kind: console.BaselineRunRefresh, Trigger: req.Trigger, StartedAt: started.Format(time.RFC3339),
-		SnapshotTime: publishedSnapshotTime(at, err), Tables: tables, Refused: refused,
-		Carried: reuse.reused, CarriedCopied: reuse.copied,
+		SnapshotTime: publishedSnapshotTime(at, err),
 		// Zero means "nothing was sent" for a server with no destination AND
 		// "these files reached the bucket" otherwise, so the count is what
 		// makes a successful upload visible at all: without it the only
 		// evidence the snapshot got there is the absence of a failure line.
 		Uploaded: uploaded,
-	}, err)
+	}, tables, refused, reuse), err)
 	if err != nil {
 		// Reported and reclaimed OUTSIDE s.mu. Deleting a directory is
 		// filesystem work of unbounded duration, and s.mu is the lock every
@@ -505,6 +504,18 @@ func snapshotPublished(dir string) bool {
 func dirExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
+}
+
+// foldRunCounts writes a finished fold's counts onto its history record —
+// applyFoldStatus's sibling for the DURABLE copy, and split out for the same
+// reason stated on it below: both callers (runRefresh, runRestore) sit behind
+// a `go` and a live fold, so zeroing CarriedCopied in either record literal
+// compiled and passed the whole suite while the run-history note quietly went
+// back to rendering copied reuses as disk savings (#1578).
+func foldRunCounts(rec console.BaselineRunRecord, tables, refused int, reuse reuseTally) console.BaselineRunRecord {
+	rec.Tables, rec.Refused = tables, refused
+	rec.Carried, rec.CarriedCopied = reuse.reused, reuse.copied
+	return rec
 }
 
 // applyFoldStatus writes a finished fold's outcome onto the status the console
