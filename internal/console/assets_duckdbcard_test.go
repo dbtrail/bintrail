@@ -156,6 +156,36 @@ func TestDuckDBCardStaysNearlyTextless(t *testing.T) {
 	}
 }
 
+// The card mounts on Backups (#1581): the .tar.gz is the data and views.sql
+// is how you open it, so the two halves of one task share a page — below the
+// list, where it reads as "and this is how you open them". Connect AI keeps
+// it ONLY when the Backups page does not exist: /baselines is
+// capability-gated on monitor, so a serve-only console with views on would
+// otherwise have no UI route to the download at all, the regression #1549
+// fixed when the SQL page took the card down with it.
+func TestDuckDBCardMountsOnBackupsWithConnectFallback(t *testing.T) {
+	js := readAsset(t, "app.js")
+	backups := stripJSLineComments(functionBody(t, js, "async function renderBaselines("))
+	mount := strings.Index(backups, "if (capsCache.views) v.append(duckdbPanel())")
+	list := strings.Index(backups, "baselinesPanel(")
+	switch {
+	case mount < 0:
+		t.Fatal("renderBaselines does not mount duckdbPanel gated on capsCache.views; the views " +
+			"download has left the page that lists the snapshots its file describes")
+	case list < 0:
+		t.Fatal("renderBaselines no longer mounts baselinesPanel")
+	case mount < list:
+		t.Error("the DuckDB card renders ABOVE the backups list. It is the follow-through for a " +
+			"reader who just took a copy, and belongs under the listing, not at the top of the page")
+	}
+	connect := stripJSLineComments(functionBody(t, js, "function buildConnect("))
+	if !strings.Contains(connect, "if (capsCache.views && !capsCache.monitor) v.append(duckdbPanel())") {
+		t.Error("buildConnect no longer keeps the serve-only fallback (views on, monitor off). On a " +
+			"console without /baselines the views capability has no UI route at all — the exact " +
+			"regression #1549 fixed")
+	}
+}
+
 // functionBody returns the text of one top-level function in app.js, from its
 // declaration to the next top-level declaration.
 //

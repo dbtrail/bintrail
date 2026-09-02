@@ -502,10 +502,10 @@ inconclusive results land, and drill into a mismatch — see
 
 **SQL over your Parquet** is not answered by the daemon. The console's SQL page
 was removed in 0.75.0 (see [The SQL panel
-(removed)](console.md#the-sql-panel-removed)). Open **Connect**, click **Open in
-DuckDB...** on the **Download a DuckDB schema** card, and run the file in your
-own DuckDB: no row cap, no time limit, and nothing executing inside the process
-that captures.
+(removed)](console.md#the-sql-panel-removed)). Open **Backups**, click
+**Download views.sql** on the **Download a DuckDB schema** card below the
+snapshot listing, and run the file in your own DuckDB: no row cap, no time
+limit, and nothing executing inside the process that captures.
 
 Notes:
 

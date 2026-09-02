@@ -2416,6 +2416,40 @@ try {
     ? ok("take-away: with the capability on, the same builder draws both downloads")
     : bad("take-away: with the capability on, the same builder draws both downloads", JSON.stringify(duckOff.on));
 
+  // The Download-a-DuckDB-schema card itself, which #1581 moved to this page
+  // from Connect AI. These are the drawing and budget checks that ran on the
+  // Connect scenario while the card lived there; the page changed, the
+  // contract did not. Placement is part of the contract: below the list, the
+  // card reads as "and this is how you open them" — above it, it shoves the
+  // listing (the page's answer) below the fold.
+  const dk = await page.evaluate(() => {
+    const c = document.querySelector(".view .cn-dk");
+    if (!c) return { present: false };
+    const kids = Array.from(document.querySelector(".view").children);
+    const list = kids.findIndex((n) => /^Backups\b/.test((n.querySelector(".ov-panel-title") || {}).textContent || ""));
+    return {
+      present: true,
+      // The card's own budget (300): enough for a title, one control and a
+      // button, and not enough to start explaining. It holds on THIS page or
+      // the move quietly re-opened the prose door #1549 closed.
+      chars: c.innerText.length,
+      tiles: c.querySelectorAll(".dk-shape .dk-tile").length,
+      bars: c.querySelectorAll(".dk-shape .dk-bar").length,
+      lit: c.querySelectorAll(".dk-shape .dk-part:not(.dk-off)").length,
+      belowList: list >= 0 && kids.indexOf(c) > list,
+    };
+  });
+  (dk.present && dk.chars > 0 && dk.chars <= 300)
+    ? ok("backups: the DuckDB schema card renders here under its 300-character budget")
+    : bad("backups: the DuckDB schema card renders here under its 300-character budget", JSON.stringify(dk));
+  (dk.present && dk.tiles > 0 && dk.bars > dk.tiles && dk.lit === 1)
+    ? ok("backups: the DuckDB card draws the shape, with the change log unlit until asked for")
+    : bad("backups: the DuckDB card draws the shape, with the change log unlit until asked for",
+        JSON.stringify({ tiles: dk.tiles, bars: dk.bars, lit: dk.lit }));
+  (dk.present && dk.belowList)
+    ? ok("backups: the DuckDB card sits below the snapshot listing")
+    : bad("backups: the DuckDB card sits below the snapshot listing", JSON.stringify(dk));
+
   // Paging, EXECUTED through the real panel. The Go guards test the window
   // function and the clamp in isolation and read the call site as text; their
   // COMPOSITION is what a literal page argument breaks, and only rendering
@@ -4201,19 +4235,10 @@ try {
       // The 404-honesty rule's photographable half: this run is the
       // unversioned arm, where a direct release-asset link can only 404.
       downloadLinks: document.querySelectorAll('.view a[href*="/releases/download/"]').length,
-      // The DuckDB card carries its OWN budget (300), tighter than the view's,
-      // because it is the card that explains itself by drawing rather than by
-      // prose. Located by its title so a restyle does not silently unhook the
-      // measurement; a card that cannot be found reads as -1, never as 0,
-      // which would pass the budget by measuring nothing.
-      duckCardChars: (() => {
-        const c = Array.from(document.querySelectorAll(".view .card, .view .ov-panel"))
-          .find((n) => /Download a DuckDB schema/.test(n.textContent || ""));
-        return c ? c.innerText.length : -1;
-      })(),
-      duckDrawn: document.querySelectorAll(".view .dk-shape .dk-tile").length,
-      duckBars: document.querySelectorAll(".view .dk-shape .dk-bar").length,
-      duckLit: document.querySelectorAll(".view .dk-shape .dk-part:not(.dk-off)").length,
+      // The DuckDB schema card moved to Backups (#1581). On this stack the
+      // monitor capability is on, so the serve-only fallback must NOT render
+      // here — one surface at a time, never a duplicate.
+      duckHere: !!document.querySelector(".view .cn-dk"),
     };
   });
   (cn.badges === "123")
@@ -4225,20 +4250,12 @@ try {
   (cn.visibleChars > 0 && cn.visibleChars < 1500 && cn.fine >= 1)
     ? ok("connect: visible text stays under budget with fine print folded")
     : bad("connect: visible text stays under budget with fine print folded", "chars " + cn.visibleChars + " fine " + cn.fine);
-  // The card's own budget. 300 characters is roughly fifty words: enough for a
-  // title, one control and a button, and not enough to start explaining. The
-  // card used to carry three checkboxes and three multi-line caveats.
-  (cn.duckCardChars > 0 && cn.duckCardChars <= 300)
-    ? ok("connect: the DuckDB card stays under 300 visible characters")
-    : bad("connect: the DuckDB card stays under 300 visible characters", "chars " + cn.duckCardChars);
-  // And it is under budget because it DRAWS, not because the prose was folded
-  // out of sight. Folding passes a character count while leaving the same wall
-  // one click away, so the drawing has to be on screen for the budget to mean
-  // anything. The change-log strip starts dark: exactly one half is lit.
-  (cn.duckDrawn > 0 && cn.duckBars > cn.duckDrawn && cn.duckLit === 1)
-    ? ok("connect: the DuckDB card draws the shape, with the change log unlit until asked for")
-    : bad("connect: the DuckDB card draws the shape, with the change log unlit until asked for",
-        JSON.stringify({ tiles: cn.duckDrawn, bars: cn.duckBars, lit: cn.duckLit }));
+  // The DuckDB schema card lives on Backups since #1581; with monitor on,
+  // the Connect fallback must stay unmounted. Asserted here, photographed on
+  // the Backups scenario (which carries the drawing and budget checks).
+  (!cn.duckHere)
+    ? ok("connect: the DuckDB schema card is on Backups, not duplicated here")
+    : bad("connect: the DuckDB schema card is on Backups, not duplicated here", "the .cn-dk card rendered on /connect with monitor on");
   // "shown only once" is carried by the fresh state and the managed state
   // (except managed read_only, which drops the Lost-it clause and the phrase
   // with it); this run exercises the fresh one (no scenario mints a token).

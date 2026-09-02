@@ -53,26 +53,27 @@ func TestTakeAwayLaneCountIsDerivedNotWritten(t *testing.T) {
 	}
 }
 
-// The views half is a promise this page cannot keep on its own: the file is
-// produced by the Connect AI panel, which is gated on capsCache.views.
-// Ungated here, the lane drew a views.sql tile and a button leading to a page
-// where that filename does not appear -- exactly the trade views_api.go says
-// this codebase refuses ("a button that only 404s is a lie").
+// The views half is a promise this lane does not keep on its own: the file is
+// produced by the card renderBaselines mounts below the list (#1581), gated
+// on capsCache.views. Ungated here, the lane drew a views.sql tile and a
+// button pointing at a card that is not rendered -- exactly the trade
+// views_api.go says this codebase refuses ("a button that only 404s is a
+// lie").
 func TestDuckLaneGatesTheFileItDoesNotProduce(t *testing.T) {
 	js := readAsset(t, "app.js")
 	lane := stripJSLineComments(functionBody(t, js, "function backupDuckLane("))
 	if !strings.Contains(lane, "capsCache.views") {
 		t.Fatal("the DuckDB lane no longer checks capsCache.views, so it can promise a views file " +
-			"that Connect AI will not render")
+			"that no card on the page will produce")
 	}
 	// Both halves must sit behind it, and "behind" means INSIDE the branch,
 	// not merely later in the file. Comparing byte offsets was the first cut
 	// and it passed a mutation that gated the tile and left the button loose:
 	// the button still came after `const hasViews = ...`.
-	for _, half := range []string{"DUCKDB_VIEWS_FILE, cap:", `navigate("connect")`} {
+	for _, half := range []string{"DUCKDB_VIEWS_FILE, cap:", "scrollIntoView"} {
 		if !guardedByHasViews(lane, half) {
 			t.Errorf("%q is not inside an `if (hasViews)` branch. A gated tile beside an ungated "+
-				"button still sends the reader to a page with no views file on it", half)
+				"button still points the reader at a card that is not on the page", half)
 		}
 	}
 }
@@ -102,15 +103,15 @@ func guardedByHasViews(body, needle string) bool {
 	return seen
 }
 
-// The views file is named on two surfaces: the Connect AI panel that builds
-// it, and the Backups lane that sends a reader there to get it. They share a
+// The views file is named on two surfaces: the card that builds it, and the
+// take-away lane that points a reader down the page to get it. They share a
 // constant so they cannot drift; this pins that neither re-hardcodes it.
 func TestViewsFileIsNamedFromOneConstant(t *testing.T) {
 	js := stripJSLineComments(readAsset(t, "app.js"))
 	decl := regexp.MustCompile(`const DUCKDB_VIEWS_FILE = "([^"]+)"`).FindStringSubmatch(js)
 	if decl == nil {
-		t.Fatal("DUCKDB_VIEWS_FILE is gone: the Backups lane sends readers to Connect AI for that " +
-			"file by name, and two literals in two panels drift the moment one is renamed")
+		t.Fatal("DUCKDB_VIEWS_FILE is gone: the take-away lane names that file when it points at " +
+			"the card, and two literals in two panels drift the moment one is renamed")
 	}
 	// Counted as a bare substring, not as a standalone "views.sql" literal: a
 	// real re-hardcode embeds the name in a longer string (text: "Get

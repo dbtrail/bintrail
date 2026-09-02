@@ -3947,6 +3947,13 @@ async function renderBaselines() {
     const restoreCard = backupRestoreCard(cur, baselines, restoreSt);
     if (restoreCard) v.append(restoreCard);
     v.append(baselinesPanel(baselines, servers, { serversErr: serversErr }));
+    // Directly under the list, reading as "and this is how you open them"
+    // (#1581): views.sql describes the snapshots listed above, and the
+    // .tar.gz of those same files downloads from this page, so the two
+    // halves of one task sit together. Below the list, not at the top -- on
+    // first visit the list is the page's answer, and this card is the
+    // follow-through for a reader who just took a copy.
+    if (capsCache.views) v.append(duckdbPanel());
     // Below the list: what these backups can become, for a reader who has
     // one and wants it in front of a reporting engine (#1466).
     const iceberg = icebergExportPanel(cur, baselines);
@@ -4363,19 +4370,19 @@ function duckdbNameList(names) {
 //
 // It is NOT the console SQL page, which #1549 removed: nothing here executes.
 // The title is load-bearing beyond this panel and must not be renamed casually
-// (it was "Query in DuckDB" until #1528).
+// (it was "Query in DuckDB" until #1528). Mounted on Backups since #1581,
+// under the snapshot listing the file describes; buildConnect keeps it as the
+// fallback route when /baselines does not exist (serve, no monitor).
 function duckdbPanel() {
-  // A section, not a .cn-card. sqlClientPanel already drew this line for the
-  // identical case: "the three numbered cards are the Connect AI how-to, and
-  // this is a different client". A schema file for the reader's own DuckDB is
-  // one step further out — it never talks to this console at all.
-  //
-  // Staying in the grid was not a styling choice to undo later: .cards tints
-  // every child by position, so the card took amber and read as a fourth step
-  // in a page that promises three. And the tint was eating the drawing —
-  // style.css records --surface-3 at 1.021 against orange-tint, under the 1.02
-  // identity floor, which is exactly the fill the tiles and bars are drawn in.
-  // Out here they get their hairline back.
+  // A section, not a .cn-card, wherever it mounts. On Connect, sqlClientPanel
+  // already drew this line for the identical case: "the three numbered cards
+  // are the Connect AI how-to, and this is a different client" — and .cards
+  // tints every child by position, so inside the grid the card took amber and
+  // its tint ate the drawing (style.css records --surface-3 at 1.021 against
+  // orange-tint, under the 1.02 identity floor, exactly the fill the tiles
+  // and bars are drawn in). On Backups every sibling panel is the same bare
+  // section, so the shape needs no translation. The cn- class prefix is a
+  // birthmark, not a location: style.css addresses the card by it.
   const card = el("section", { class: "ov-panel cn-dk", style: "margin-top:18px" });
   card.append(el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "Download a DuckDB schema" })));
@@ -5785,9 +5792,9 @@ async function startBackupRestore(id, at, btn, msgEl) {
 // -- and had to open two folds to learn there was an answer at all.
 //
 // The two lanes are deliberately NOT symmetrical, and the drawing is what
-// says so before any text does. DuckDB takes two files and one of them is
-// not on this page (the views file moved to Connect AI in #1549), so that
-// lane points at both. MySQL takes one file that does not exist until you
+// says so before any text does. DuckDB takes two files — the data here, and
+// the views file the card below the list produces (#1581) — so that lane
+// points at both. MySQL takes one file that does not exist until you
 // pick a moment, so that lane asks for the moment. Dressing them as a
 // matched pair would be a lie about the work each one is.
 function backupTakeAway(cur, b, sqlSt) {
@@ -5842,15 +5849,15 @@ function backupLane(title, files, tail) {
 // so the DATA half is gated on there being a backup and nothing else.
 //
 // The VIEWS half is a different promise and needs its own gate. It is not
-// produced here: the button sends the reader to Connect AI, where the panel
-// is gated on capsCache.views, and viewsAvailable() is false whenever the
-// selected server has archived data turned off (a checkbox on this console's
-// own server form), among other reasons. Ungated, this lane drew a views.sql
-// tile and a button leading to a page where that filename does not appear --
-// no error, no toast. views_api.go puts it plainly: "a button that only 404s
-// is a lie, and this codebase already refuses that trade for reconstruct and
-// verify." Naming the file from a shared constant pinned its NAME; only this
-// pins its EXISTENCE.
+// produced by this lane: the button jumps to the card below the list, which
+// renderBaselines mounts under the same capsCache.views, and viewsAvailable()
+// is false whenever the selected server has archived data turned off (a
+// checkbox on this console's own server form), among other reasons. Ungated,
+// this lane drew a views.sql tile and a button pointing at a card that is not
+// rendered -- no error, no toast. views_api.go puts it plainly: "a button
+// that only 404s is a lie, and this codebase already refuses that trade for
+// reconstruct and verify." Naming the file from a shared constant pinned its
+// NAME; only this pins its EXISTENCE.
 function backupDuckLane(b) {
   if (!b || b.error || !b.configured) return null;
   const snaps = (b.snapshots || []);
@@ -5876,7 +5883,12 @@ function backupDuckLane(b) {
   const go = el("div", { class: "bk-lane-go" }, dl);
   if (hasViews) {
     const views = el("button", { class: "btn btn-ghost", type: "button", text: "Get " + DUCKDB_VIEWS_FILE });
-    views.onclick = () => navigate("connect");
+    // A jump, not a navigation: the card that produces the file sits on THIS
+    // page since #1581, below the list. Instant on purpose -- smooth scrolling
+    // is motion, and this codebase spends motion only under the
+    // prefers-reduced-motion discipline (#1392); a jump the reader asked for
+    // needs no easing to be understood.
+    views.onclick = () => { const c = $(".cn-dk"); if (c) c.scrollIntoView(); };
     go.append(views);
   }
   lane.append(go, msg);
@@ -7118,24 +7130,16 @@ function buildConnect(servers, tokStatus, minted, fbStatus) {
   cards.append(mcpTokenCard(tokStatus, minted));
   cards.append(mcpEndpointCard(servers));
   cards.append(bundleCard());
-  // The DuckDB schema download lives here (#1549), not on /sql where #1543 put
-  // it. Two reasons, both mechanical rather than editorial:
-  //
-  // GET /api/views.sql requires settings:read, and its only door there was a
-  // nav item gated data-perm="query:execute" — so a settings:read role could
-  // not reach the download the server would have authorized, and a
-  // query:execute role without settings:read got a button that 403s. This page
-  // carries no data-perm, and every endpoint it already calls (/api/mcp-token,
-  // /api/flashback) requires the same settings:read.
-  //
-  // And the card was mounted inside the SQL page, which the `sql` capability
-  // gated. Turning that page off left `views` on with no UI route at all —
-  // punishing exactly the operator who declined server-side execution, whose
-  // file executes nothing. That page is now gone entirely, so this is the only
-  // route to the download. Appended LAST so the .cards nth-child(4n+1) tint
-  // keeps landing on the same card it does today.
+  // The DuckDB schema card lives on Backups since #1581, beside the snapshot
+  // listing it describes. It renders HERE only when that page does not exist:
+  // /baselines is capability-gated on monitor, so on a serve-only console the
+  // `views` capability would otherwise have no UI route at all — the exact
+  // regression #1549 fixed when the SQL page took the card down with it. The
+  // perm story that once anchored it here holds on both pages: GET
+  // /api/views.sql and GET /api/baselines require the same settings:read,
+  // and neither nav item carries a data-perm gate.
   v.append(cards);
-  if (capsCache.views) v.append(duckdbPanel());
+  if (capsCache.views && !capsCache.monitor) v.append(duckdbPanel());
   if (capsCache.mcp) v.append(otherClientsPanel(servers));
   v.append(sqlClientPanel(servers, fbStatus));
   viewEnter();
