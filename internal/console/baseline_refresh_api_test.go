@@ -48,6 +48,48 @@ func TestBaselineRefreshGet_defaultThenOverride(t *testing.T) {
 	}
 }
 
+// TestBaselineRefreshGet_targetsAreLiveAndOmittedOffWatch pins the #1579
+// shape: enabled+scheduled both true was reachable while the loop covered
+// ZERO servers, and the DTO had no way to say so. With the counter wired the
+// counts are computed at REQUEST time (the loop recomputes per tick, so a
+// boot snapshot goes stale the moment a server is added); without it — serve,
+// or no loop — the keys are omitted entirely, so the page cannot alarm on a
+// zero that means "nobody is counting".
+func TestBaselineRefreshGet_targetsAreLiveAndOmittedOffWatch(t *testing.T) {
+	srv, _ := newSupervisorServer(t)
+	srv.baselineRefreshDefaults = BaselineRefreshDefaults{Enabled: true, Scheduled: true}
+
+	// No counter wired: both keys absent, not zero.
+	_, body := doServersReq(t, srv, "GET", "/api/baseline-refresh", "")
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["targets"]; ok {
+		t.Fatalf("targets serialised without a counter wired: %s (a real zero and \"nobody is counting\" must differ)", body)
+	}
+
+	// Wired: live values, re-read per request.
+	n := 0
+	srv.baselineRefreshTargets = func() (int, int) { n++; return n, 2 }
+	var got baselineRefreshDTO
+	_, body = doServersReq(t, srv, "GET", "/api/baseline-refresh", "")
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Targets == nil || *got.Targets != 1 || got.SkippedS3Only != 2 {
+		t.Fatalf("first read: %+v, want targets=1 skipped=2", got)
+	}
+	_, body = doServersReq(t, srv, "GET", "/api/baseline-refresh", "")
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Targets == nil || *got.Targets != 2 {
+		t.Fatalf("second read: %+v; the count is a boot snapshot, not live — a server added later would "+
+			"keep the stale zero and the alarm would cry wolf forever", got)
+	}
+}
+
 // Enabled is the loop's boot-time liveness and must NOT be implied by the
 // presence of an override: a daemon started with no refresh schedule runs no
 // loop, so a saved setting is dormant until a restart and the panel has to keep

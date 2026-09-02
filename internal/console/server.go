@@ -174,6 +174,15 @@ type Config struct {
 	// hides the panel).
 	RotationDefaults RotationDefaults
 
+	// BaselineRefreshTargets reports, LIVE, how many servers the next refresh
+	// tick will cover and how many were skipped for keeping their baselines
+	// only in S3. Wired by the watch daemon only when the refresh loop is
+	// scheduled; nil everywhere else, and the DTO then omits the counts. Live
+	// rather than a boot snapshot because the loop recomputes its target set
+	// every tick — a snapshot would go stale the moment a server is added,
+	// which is exactly the fresh-install shape #1579 is about (enabled and
+	// scheduled both true, zero servers refreshable, and the page silent).
+	BaselineRefreshTargets func() (targets, skippedS3Only int)
 	// BaselineRefreshDefaults carries the daemon's baseline-refresh flag/env
 	// values, the fallback the settings panel reports when no console override
 	// is saved. Same role as RotationDefaults above.
@@ -301,6 +310,8 @@ type Server struct {
 	// baselineRefreshDefaults is the fallback GET /api/baseline-refresh reports
 	// when no console override is saved.
 	baselineRefreshDefaults BaselineRefreshDefaults
+	// baselineRefreshTargets is Config.BaselineRefreshTargets (nil off watch).
+	baselineRefreshTargets func() (targets, skippedS3Only int)
 	// version is the running build's version string (Config.Version).
 	version string
 	// archiveFetcher reads one archive source for the browsing endpoints —
@@ -505,6 +516,7 @@ func New(cfg Config) (*Server, error) {
 		rotationDefaults:        cfg.RotationDefaults,
 		backupSettingsDefaults:  cfg.BackupSettingsDefaults,
 		baselineRefreshDefaults: cfg.BaselineRefreshDefaults,
+		baselineRefreshTargets:  cfg.BaselineRefreshTargets,
 		version:                 cfg.Version,
 		cm:                      newConnManager(cfg.Registry, profileActive),
 		authPath:                authPath,

@@ -29,7 +29,7 @@ func TestBaselineRefreshTargets(t *testing.T) {
 		{ID: "d", Name: "viewonly", BaselineDir: "/b/d"},
 	}
 
-	got := baselineRefreshTargets(entries, "boot-dsn", "/b/boot")
+	got, skipped := baselineRefreshTargets(entries, "boot-dsn", "/b/boot")
 	want := map[string]string{"default": "/b/boot", "a": "/b/a"}
 	if len(got) != len(want) {
 		t.Fatalf("got %d target(s) %+v, want %d", len(got), got, len(want))
@@ -39,16 +39,24 @@ func TestBaselineRefreshTargets(t *testing.T) {
 			t.Errorf("target %q = %q, want %q", r.ServerID, r.BaselineDir, want[r.ServerID])
 		}
 	}
+	// The skip is REPORTED, not just absent (#1579): the same computation
+	// answers GET /api/baseline-refresh, and "covers every server" was wrong
+	// exactly because this server vanished without a count. The no-baseline
+	// and no-DSN entries are NOT in it: they are unconfigured, not skipped
+	// for a reason the card should name.
+	if len(skipped) != 1 || skipped[0] != "s3only" {
+		t.Errorf("skippedS3Only = %v, want exactly [s3only]", skipped)
+	}
 }
 
 // TestBaselineRefreshTargets_bootNeedsBoth: the boot entry is only a target when
 // the daemon has both halves — a --baseline-dir with no --index-dsn (or the
 // reverse) has nothing to fold.
 func TestBaselineRefreshTargets_bootNeedsBoth(t *testing.T) {
-	if got := baselineRefreshTargets(nil, "", "/b/boot"); len(got) != 0 {
+	if got, _ := baselineRefreshTargets(nil, "", "/b/boot"); len(got) != 0 {
 		t.Errorf("targets without an index DSN = %+v, want none", got)
 	}
-	if got := baselineRefreshTargets(nil, "boot-dsn", ""); len(got) != 0 {
+	if got, _ := baselineRefreshTargets(nil, "boot-dsn", ""); len(got) != 0 {
 		t.Errorf("targets without a baseline dir = %+v, want none", got)
 	}
 }

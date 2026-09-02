@@ -22,6 +22,18 @@ type baselineRefreshDTO struct {
 	// running. Enabled without Scheduled is the --baseline-trigger daemon: the
 	// setting governs restores today and nothing is on a timer.
 	Scheduled bool `json:"scheduled"`
+	// Targets is how many servers the NEXT refresh tick will cover, computed
+	// live at request time (the loop recomputes per tick, so a boot snapshot
+	// would go stale the moment a server is added). A pointer so it is
+	// OMITTED where the daemon wired no counter (serve, or no loop) and a
+	// real zero where the loop runs over nothing — the enabled+scheduled+
+	// zero-targets shape the page previously reported as everything-running
+	// (#1579).
+	Targets *int `json:"targets,omitempty"`
+	// SkippedS3Only counts servers the tick skips for keeping baselines only
+	// in S3: a refresh writes Parquet to a filesystem, so it needs a local
+	// directory to fold into. The reason "covers every server" was false.
+	SkippedS3Only int `json:"skipped_s3_only,omitempty"`
 }
 
 // baselineRefreshRequest is the PUT /api/baseline-refresh body.
@@ -50,20 +62,22 @@ func (s *Server) handleBaselineRefreshGet(w http.ResponseWriter, r *http.Request
 // the presence of an override.
 func (s *Server) effectiveBaselineRefresh() baselineRefreshDTO {
 	d := s.baselineRefreshDefaults
-	if bc, ok := s.cm.reg.BaselineRefresh(); ok {
-		return baselineRefreshDTO{
-			CarryForwardUnchanged: bc.CarryForwardUnchanged,
-			Source:                "override",
-			Enabled:               d.Enabled,
-			Scheduled:             d.Scheduled,
-		}
-	}
-	return baselineRefreshDTO{
+	dto := baselineRefreshDTO{
 		CarryForwardUnchanged: d.CarryForwardUnchanged,
 		Source:                "default",
 		Enabled:               d.Enabled,
 		Scheduled:             d.Scheduled,
 	}
+	if bc, ok := s.cm.reg.BaselineRefresh(); ok {
+		dto.CarryForwardUnchanged = bc.CarryForwardUnchanged
+		dto.Source = "override"
+	}
+	if s.baselineRefreshTargets != nil {
+		targets, skipped := s.baselineRefreshTargets()
+		dto.Targets = &targets
+		dto.SkippedS3Only = skipped
+	}
+	return dto
 }
 
 // handleBaselineRefreshUpdate serves PUT /api/baseline-refresh: persist a

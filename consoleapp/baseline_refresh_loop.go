@@ -798,7 +798,8 @@ func startBaselineRefreshLoop(ctx context.Context, reg *console.Registry, sup *b
 		// instead of running a console with a flag that is silently inert.
 		return fmt.Errorf("internal: --baseline-refresh-interval was set without a baseline supervisor")
 	}
-	targets := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
+	targets, skipped := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
+	logSkippedRefreshTargets(skipped)
 	// Name the effective reuse setting AND where it came from, once, at the one
 	// moment an operator is reading the log to see whether their configuration
 	// took. A console override beats the command line silently by design, so
@@ -963,7 +964,8 @@ func refreshTargetsFor(reg *console.Registry, globalDSN, globalBaselineDir strin
 // refreshTargetsWith is the same thing with the setting ALREADY resolved, so
 // one cycle resolves it once and logs exactly the value it dispatched with.
 func refreshTargetsWith(reg *console.Registry, globalDSN, globalBaselineDir string, carry bool) []refreshRequest {
-	reqs := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
+	reqs, skipped := baselineRefreshTargets(registryEntries(reg), globalDSN, globalBaselineDir)
+	logSkippedRefreshTargets(skipped)
 	for i := range reqs {
 		reqs[i].CarryForwardUnchanged = carry
 	}
@@ -1094,15 +1096,17 @@ func registryEntries(reg *console.Registry) []console.ServerEntry {
 	return reg.List()
 }
 
-// baselineRefreshTargets collects the servers a refresh can run for: an index
-// DSN to fold from and a LOCAL baseline directory to fold into.
+// baselineRefreshTargets collects the servers a refresh can run for — an index
+// DSN to fold from and a LOCAL baseline directory to fold into — plus the
+// names of servers skipped for having only an S3 destination.
 //
-// A server with only an S3 baseline destination is skipped WITH a warning rather
-// than silently: the refresh writes files, so an in-place S3 refresh is not
-// something this loop can do, and an operator who configured S3-only baselines
-// and set the interval would otherwise see nothing happen and no reason why.
-func baselineRefreshTargets(entries []console.ServerEntry, globalDSN, globalBaselineDir string) []refreshRequest {
+// PURE on purpose (#1579): it used to slog.Warn the S3-only skip itself, and
+// the same computation now also answers GET /api/baseline-refresh live, where
+// a warning per page load would be log spam. The callers that dispatch work
+// log the skip via logSkippedRefreshTargets, preserving the old visibility.
+func baselineRefreshTargets(entries []console.ServerEntry, globalDSN, globalBaselineDir string) ([]refreshRequest, []string) {
 	var out []refreshRequest
+	var skippedS3Only []string
 	seen := map[string]bool{}
 	add := func(id, name, dsn, dir string) {
 		if dsn == "" || dir == "" || seen[id] {
@@ -1114,11 +1118,23 @@ func baselineRefreshTargets(entries []console.ServerEntry, globalDSN, globalBase
 	add("default", "boot", globalDSN, globalBaselineDir)
 	for _, e := range entries {
 		if e.DSN != "" && e.BaselineDir == "" && e.BaselineS3 != "" {
-			slog.Warn("baseline refresh: server has an S3-only baseline destination and will not be refreshed "+
-				"(a refresh writes Parquet to a filesystem, so it needs a local directory to fold into)", "server", e.Name)
+			skippedS3Only = append(skippedS3Only, e.Name)
 			continue
 		}
 		add(e.ID, e.Name, e.DSN, e.BaselineDir)
 	}
-	return out
+	return out, skippedS3Only
+}
+
+// logSkippedRefreshTargets is the warning half baselineRefreshTargets no
+// longer carries: a server with only an S3 baseline destination is skipped
+// WITH a warning rather than silently — the refresh writes files, so an
+// in-place S3 refresh is not something the loop can do, and an operator who
+// configured S3-only baselines and set the interval would otherwise see
+// nothing happen and no reason why.
+func logSkippedRefreshTargets(skipped []string) {
+	for _, name := range skipped {
+		slog.Warn("baseline refresh: server has an S3-only baseline destination and will not be refreshed "+
+			"(a refresh writes Parquet to a filesystem, so it needs a local directory to fold into)", "server", name)
+	}
 }

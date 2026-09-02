@@ -473,6 +473,13 @@ func runUpConsoleOnly(cmd *cobra.Command) error {
 	}
 	if upBaselineRefreshEvery != "" {
 		cfg.BaselineRefresh = baselineSup
+		// Live target count for GET /api/baseline-refresh (#1579): the loop
+		// recomputes its set per tick, so the page must too, or a fresh
+		// install reports everything-running over zero refreshable servers.
+		cfg.BaselineRefreshTargets = func() (int, int) {
+			reqs, skipped := baselineRefreshTargets(registryEntries(registry), upIndexDSN, upConsoleBaselineDir)
+			return len(reqs), len(skipped)
+		}
 	}
 	wireBaselineExtras(&cfg, baselineSup, serversPath)
 	// The per-server backup schedule (#1442) needs only the supervisor: the
@@ -688,6 +695,13 @@ func runUpStreamWithConsole(cmd *cobra.Command, args []string) error {
 	}
 	if upBaselineRefreshEvery != "" {
 		cfg.BaselineRefresh = baselineSup
+		// Live target count for GET /api/baseline-refresh (#1579): the loop
+		// recomputes its set per tick, so the page must too, or a fresh
+		// install reports everything-running over zero refreshable servers.
+		cfg.BaselineRefreshTargets = func() (int, int) {
+			reqs, skipped := baselineRefreshTargets(registryEntries(registry), upIndexDSN, upConsoleBaselineDir)
+			return len(reqs), len(skipped)
+		}
 	}
 	wireBaselineExtras(&cfg, baselineSup, serversPath)
 	// The per-server backup schedule (#1442) needs only the supervisor: the

@@ -195,7 +195,11 @@ func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
 		}
 	}
 
-	dto, err := json.Marshal(baselineRefreshDTO{CarryForwardUnchanged: true, Source: "override", Enabled: true, Scheduled: true})
+	// Targets non-nil and SkippedS3Only non-zero, or their omitempty hides
+	// the very keys this pin exists for.
+	zero := 0
+	dto, err := json.Marshal(baselineRefreshDTO{CarryForwardUnchanged: true, Source: "override",
+		Enabled: true, Scheduled: true, Targets: &zero, SkippedS3Only: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,13 +207,20 @@ func TestBackupRefreshWireNamesMatchTheFrontend(t *testing.T) {
 	if err := json.Unmarshal(dto, &d); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"carry_forward_unchanged", "source", "enabled", "scheduled"} {
+	for _, key := range []string{"carry_forward_unchanged", "source", "enabled", "scheduled", "targets", "skipped_s3_only"} {
 		if _, ok := d[key]; !ok {
 			t.Errorf("baselineRefreshDTO does not serialise %q (got %s)", key, dto)
 		}
 		if !strings.Contains(js, "br."+key) && !strings.Contains(js, key) {
 			t.Errorf("app.js never reads %q from the refresh DTO", key)
 		}
+	}
+	// The zero-targets alarm keys on the exact shape #1579 names: scheduled
+	// AND a REAL zero. `br.targets === 0` (strict) so an omitted field
+	// (serve, no loop) can never fire it.
+	if !strings.Contains(js, "br.targets === 0") {
+		t.Error("the zero-targets alarm is gone or no longer strict; a running timer over zero " +
+			"refreshable servers would fall back to silence (#1579)")
 	}
 }
 
