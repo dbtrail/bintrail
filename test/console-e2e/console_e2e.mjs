@@ -4237,8 +4237,11 @@ try {
       downloadLinks: document.querySelectorAll('.view a[href*="/releases/download/"]').length,
       // The DuckDB schema card moved to Backups (#1581). On this stack the
       // monitor capability is on, so the serve-only fallback must NOT render
-      // here — one surface at a time, never a duplicate.
+      // here — one surface at a time, never a duplicate. views is the anchor
+      // that keeps the negative assertion honest: absent because the gate
+      // withheld it, not because the capability was off all along.
       duckHere: !!document.querySelector(".view .cn-dk"),
+      duckViewsCap: !!capsCache.views,
     };
   });
   (cn.badges === "123")
@@ -4253,9 +4256,10 @@ try {
   // The DuckDB schema card lives on Backups since #1581; with monitor on,
   // the Connect fallback must stay unmounted. Asserted here, photographed on
   // the Backups scenario (which carries the drawing and budget checks).
-  (!cn.duckHere)
+  (cn.duckViewsCap && !cn.duckHere)
     ? ok("connect: the DuckDB schema card is on Backups, not duplicated here")
-    : bad("connect: the DuckDB schema card is on Backups, not duplicated here", "the .cn-dk card rendered on /connect with monitor on");
+    : bad("connect: the DuckDB schema card is on Backups, not duplicated here",
+        JSON.stringify({ views: cn.duckViewsCap, rendered: cn.duckHere }));
   // "shown only once" is carried by the fresh state and the managed state
   // (except managed read_only, which drops the Lost-it clause and the phrase
   // with it); this run exercises the fresh one (no scenario mints a token).

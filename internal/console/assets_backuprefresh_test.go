@@ -279,11 +279,13 @@ func TestStorageSplit_eachHalfHoldsOnlyItsOwnConcern(t *testing.T) {
 		t.Error("nothing handles the old /storage route, so existing links break")
 	}
 	// And the DuckDB schema download has to be mounted SOMEWHERE, not merely
-	// absent from the two halves above. Its home is Backups since #1581 (see
-	// TestDuckDBCardMountsOnBackupsWithConnectFallback); what THIS pins is the
-	// serve-only fallback buildConnect keeps, the #1549 lesson: /sql gated it
-	// on a capability and a permission that are not the download's own, so
-	// BINTRAIL_CONSOLE_SQL_PANEL=0 left `views` on with no route to it.
+	// absent from the two halves above. Its home is Backups since #1581; this
+	// only pins that buildConnect still CALLS duckdbPanel at all — the gate on
+	// that call (`views && !monitor`, the serve-only fallback) is pinned
+	// exact-string by TestDuckDBCardMountsOnBackupsWithConnectFallback, not
+	// here. The #1549 lesson behind keeping any Connect mount: /sql gated the
+	// card on a capability and a permission that are not the download's own,
+	// so BINTRAIL_CONSOLE_SQL_PANEL=0 left `views` on with no route to it.
 	//
 	// Named explicitly rather than searched file-wide, because the failure
 	// this guards is the card existing while nothing calls it.

@@ -80,9 +80,12 @@ func TestSQLPanelEnvIsReportedAsRetired(t *testing.T) {
 				t.Fatalf("value %q: warned=%v, want %v (log: %s)", tc.value, got, tc.wantWarn, buf.String())
 			}
 			// The warning has to say what to do instead, or it is only an
-			// obituary. Connect is where the DuckDB schema download went.
-			if tc.wantWarn && !strings.Contains(buf.String(), "Connect") {
-				t.Errorf("the warning does not point at the Connect page: %s", buf.String())
+			// obituary. Backups is where the DuckDB schema download lives
+			// (#1581); Connect only serves the read-only console, so an
+			// assertion on "Connect" alone would be satisfied by the
+			// parenthetical while every watch operator is misdirected.
+			if tc.wantWarn && !strings.Contains(buf.String(), "Backups") {
+				t.Errorf("the warning does not point at the Backups page: %s", buf.String())
 			}
 		})
 	}

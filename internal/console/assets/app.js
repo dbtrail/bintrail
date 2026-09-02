@@ -45,9 +45,10 @@ const DUCKDB_VIEWS_FILE = "views.sql";
 // take-away lane's jump (which resolves it) -- the LOCATION analog of the
 // filename constant above, and for the same reason: two literals drift the
 // first time the card is restyled, and the jump's `if (c)` null-guard would
-// turn that drift into a dead button with no error and no toast. style.css
-// addresses the card by this class too, so renaming it is a three-surface
-// change however it is spelled.
+// turn that drift into a dead button with no error and no toast. The bare
+// class is a pure JS/e2e query hook; what style.css addresses is the DERIVED
+// `-body` class (the card body's padding), so a rename also walks through
+// there and through the e2e's selectors.
 const DUCKDB_CARD_CLASS = "cn-dk";
 
 // Export columns. connection_id is INCLUDED (epic #701 D1 — no longer a
@@ -899,12 +900,14 @@ function navigate(route, params, push = true) {
   // snapshot listing and the verification runner). Same treatment, so a
   // bookmark to either lands on Overview rather than an empty page.
   if ((route === "baselines" || route === "verification") && !capsCache.monitor) route = "overview";
-  // The SQL page was removed (#1549). Rewritten rather than aliased, for the
-  // same reasons /storage is: the address bar stops naming a page that no
-  // longer exists, and the reader who bookmarked it wanted SQL over this
-  // Parquet — so land where the DuckDB schema card actually is (#1581):
-  // Backups when that page exists, Connect on the serve-only fallback. A
+  // The SQL page was removed (#1549). A stale route string handed to
+  // navigate() lands where the DuckDB schema card actually is (#1581):
+  // Backups when that page exists, Connect on the serve-only fallback — a
   // fixed /connect target would send a watch reader to a page the card left.
+  // Scope honesty: this covers navigate() callers only. A direct load or
+  // popstate of /sql goes through renderRoute(), whose switch has no "sql"
+  // arm and falls back to Overview with the URL untouched — the same
+  // pre-#1581 shape /storage has. Retargeted here, not extended.
   if (route === "sql") {
     route = capsCache.monitor ? "baselines" : "connect";
     history.replaceState({}, "", "/" + route);
@@ -4395,7 +4398,8 @@ function duckdbPanel() {
   // orange-tint, under the 1.02 identity floor, exactly the fill the tiles
   // and bars are drawn in). On Backups every sibling panel is the same bare
   // section, so the shape needs no translation. The cn- class prefix is a
-  // birthmark, not a location: style.css addresses the card by it.
+  // birthmark, not a location: style.css styles the derived -body class, and
+  // the bare class is the query hook the lane's jump and the e2e resolve.
   const card = el("section", { class: "ov-panel " + DUCKDB_CARD_CLASS, style: "margin-top:18px" });
   card.append(el("div", { class: "ov-panel-head" },
     el("h2", { class: "ov-panel-title", text: "Download a DuckDB schema" })));
