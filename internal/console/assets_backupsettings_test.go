@@ -19,15 +19,19 @@ func TestBackupSettingsWireNamesMatchTheFrontend(t *testing.T) {
 		jsFunctionBody(t, js, "backupDaemonCard") +
 		jsFunctionBody(t, js, "backupServersPanel") +
 		jsFunctionBody(t, js, "backupServerRow")
-	for _, tag := range []string{
-		"daemon", "servers", "registry_read_only",
-		"key", "value", "cli", "needs_restart",
-		"baseline_dir", "baseline_s3", "no_archive",
-		"resolved_dir", "resolved_s3", "source",
-		"schedule_every", "schedule_at",
+	// Dotted READS, not bare tokens: "value" also matches dir.value.trim()
+	// and "baseline_dir" matches the input's name: attribute, so a renamed
+	// JSON tag stayed green while the page rendered blanks. The dotted form
+	// is the actual dereference of the wire field.
+	for _, read := range []string{
+		"settings.daemon", "settings.servers", "settings.registry_read_only",
+		"row.key", "row.value", "row.on", "row.cli", "row.needs_restart", "row.err",
+		"srv.baseline_dir", "srv.baseline_s3", "srv.no_archive",
+		"srv.resolved_dir", "srv.resolved_s3", "srv.source",
+		"srv.schedule_every", "srv.schedule_at", "srv.schedule_refusal",
 	} {
-		if !strings.Contains(page, tag) {
-			t.Errorf("the page never reads %q; the server emits it and the page renders a blank instead", tag)
+		if !strings.Contains(page, read) {
+			t.Errorf("the page never reads %q; the server emits it and the page renders a blank instead", read)
 		}
 	}
 }
@@ -99,15 +103,29 @@ func TestBackupSettingsPageIsWired(t *testing.T) {
 	if !strings.Contains(js, `case "backup-settings": return renderBackupSettings();`) {
 		t.Error("renderRoute has no arm for backup-settings; the URL falls through to Overview")
 	}
-	if !strings.Contains(js, `route === "backup-settings") && !capsCache.monitor`) {
-		t.Error("backup-settings is not behind the monitor gate; a serve-only console would render a page about loops it does not run")
+	// NOT monitor-gated, deliberately (the Access profiles precedent): the
+	// server Edit form's backup fields became passthroughs, so this page is
+	// the ONLY editor of the registry's backup location — and the registry
+	// is state the standalone serve edits too. Gating the page left serve
+	// with no UI path to a backup location at all. The daemon-side cards
+	// inside the page carry the monitor gate instead.
+	if strings.Contains(js, `route === "backup-settings") && !capsCache.monitor`) ||
+		strings.Contains(js, `"backup-settings" || route`) {
+		t.Error("backup-settings is behind the monitor gate again; on serve the per-server backup " +
+			"location would have NO editor anywhere in the UI")
+	}
+	body := jsFunctionBody(t, js, "buildBackupSettings")
+	if !strings.Contains(body, "capsCache.monitor") {
+		t.Error("buildBackupSettings no longer gates the daemon-side cards on monitor; on serve the " +
+			"daemon card renders empty rows and reads as an unconfigured install")
 	}
 	html := readAsset(t, "index.html")
 	if !strings.Contains(html, `data-route="backup-settings"`) {
 		t.Error("index.html has no nav item for backup-settings")
 	}
 	navRE := regexp.MustCompile(`(?s)data-route="backup-settings"[^>]*>`)
-	if nav := navRE.FindString(html); !strings.Contains(nav, `data-capability="monitor"`) {
-		t.Error("the backup-settings nav item is not capability-gated on monitor, unlike its Settings siblings")
+	if nav := navRE.FindString(html); strings.Contains(nav, `data-capability="monitor"`) {
+		t.Error("the backup-settings nav item is capability-gated on monitor; serve users could not " +
+			"reach the only editor of the per-server backup location")
 	}
 }

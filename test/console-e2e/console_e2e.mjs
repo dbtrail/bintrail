@@ -4179,8 +4179,11 @@ try {
   // moved here from the Backups page — one surface at a time, so the old
   // page must no longer mount it.
   await page.evaluate(() => navigate("backup-settings"));
+  // Options are the THIRD waitForFunction parameter; an options object in
+  // the arg slot is serialized to the predicate and silently discarded
+  // (#1589), leaving the 30s default in force. Stated as 30s explicitly.
   await page.waitForFunction(() => location.pathname === "/backup-settings"
-    && document.querySelectorAll(".bks-row").length >= 5, { timeout: 10000 });
+    && document.querySelectorAll(".bks-row").length >= 5, undefined, { timeout: 30000 });
   const bks = await page.evaluate(() => {
     const rows = Array.from(document.querySelectorAll(".bks-row")).map((r) => ({
       chip: (r.querySelector(".bks-restart") || {}).textContent || "",
@@ -4191,13 +4194,17 @@ try {
       rows: rows.length,
       allChipped: rows.every((r) => r.chip === "restart to change"),
       allNamed: rows.every((r) => /^\(CLI: (--|BINTRAIL_)/.test(r.cli)),
-      noBlanks: rows.every((r) => r.value !== ""),
+      // "not set" is the card's own fallback, so every row always has SOME
+      // text; the discriminating assertion is that the values the harness
+      // configured came through. run.sh starts watch with --baseline-dir,
+      // so the first row must carry a real path, not the fallback.
+      configuredValued: rows.length > 0 && rows[0].value.startsWith("/"),
       refreshCardHere: !!document.querySelector(".view .bkr-head"),
     };
   });
-  (bks.rows === 9 && bks.allChipped && bks.allNamed && bks.noBlanks)
-    ? ok("backup-settings: nine daemon rows, each named, valued, and chipped on the control")
-    : bad("backup-settings: nine daemon rows, each named, valued, and chipped on the control", JSON.stringify(bks));
+  (bks.rows === 9 && bks.allChipped && bks.allNamed && bks.configuredValued)
+    ? ok("backup-settings: nine daemon rows, each named and chipped, the configured one valued")
+    : bad("backup-settings: nine daemon rows, each named and chipped, the configured one valued", JSON.stringify(bks));
   (bks.refreshCardHere)
     ? ok("backup-settings: the carry-forward card moved here")
     : bad("backup-settings: the carry-forward card moved here", "no .bkr-head on /backup-settings");

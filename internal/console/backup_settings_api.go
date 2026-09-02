@@ -26,11 +26,16 @@ import (
 // BackupSettingsDefaults carries the daemon-wide flag/env values the page
 // reports, injected by the watch daemon exactly like RotationDefaults: what
 // the process was TOLD, verbatim, so the page never re-derives it. Zero on
-// the standalone serve, whose nav hides the page (no monitor capability).
+// the standalone serve, whose page hides the daemon card (no monitor
+// capability); the per-server half of the page renders there regardless.
 type BackupSettingsDefaults struct {
 	BaselineRetain string // --baseline-retain
 	RefreshEvery   string // --baseline-refresh-interval
 	LockMode       string // BINTRAIL_CONSOLE_BASELINE_LOCK_MODE
+	// LockModeErr: the env value was rejected, so LockMode holds the
+	// fallback default, which is NOT in force — MySQL dumps are refused
+	// while it stands. The page must show the rejection, not the fallback.
+	LockModeErr    string
 	TriggerOn      bool   // BINTRAIL_CONSOLE_BASELINE_TRIGGER
 	StagingDir     string // BINTRAIL_CONSOLE_BASELINE_STAGING
 	VerifyInterval string // --verify-interval
@@ -48,6 +53,12 @@ type backupSettingRow struct {
 	On           *bool  `json:"on,omitempty"` // set for boolean rows; Value stays empty
 	CLI          string `json:"cli"`
 	NeedsRestart bool   `json:"needs_restart"`
+	// Err is a per-row rejection: the configured value was refused and the
+	// shown Value is NOT in force (today: an invalid lock mode, which
+	// disables MySQL dumps while the daemon keeps running). Without it this
+	// page rendered the fallback default on the one row whose real state is
+	// "your value was rejected", which is the opposite of provenance.
+	Err string `json:"err,omitempty"`
 }
 
 // backupSettingsServerDTO is one server's backup configuration with its
@@ -71,12 +82,29 @@ type backupSettingsServerDTO struct {
 	// source database, and a settings listing must not dial every server.
 	ScheduleEvery string `json:"schedule_every,omitempty"`
 	ScheduleAt    string `json:"schedule_at,omitempty"`
+	// ScheduleRefusal is why the configured schedule cannot run as things
+	// stand (this process, this entry), empty when it can. CheckBackupSchedule
+	// is IO-free, so listing it here does not violate the no-dialing rule the
+	// prediction (next-method) obeys by staying off this DTO — and without it
+	// the row read `resolved` values while the schedule reads the raw entry,
+	// so clearing a dir here left a row promising runs that will all refuse.
+	ScheduleRefusal string `json:"schedule_refusal,omitempty"`
 }
 
 type backupSettingsDTO struct {
 	Daemon           []backupSettingRow        `json:"daemon"`
 	Servers          []backupSettingsServerDTO `json:"servers"`
 	RegistryReadOnly bool                      `json:"registry_read_only"`
+}
+
+// lockModeRowErr appends the operational consequence to a lock-mode
+// rejection: the page renders row errors generically, so the row that
+// disables dumps must say so itself.
+func lockModeRowErr(err string) string {
+	if err == "" {
+		return ""
+	}
+	return err + "; MySQL dumps are refused until it is fixed"
 }
 
 // handleBackupSettingsGet serves GET /api/backup-settings: the consolidated
@@ -91,7 +119,7 @@ func (s *Server) handleBackupSettingsGet(w http.ResponseWriter, r *http.Request)
 			{Key: "baseline_s3", Value: s.cm.defaultBaselineS3, CLI: "--baseline-s3", NeedsRestart: true},
 			{Key: "baseline_retain", Value: d.BaselineRetain, CLI: "--baseline-retain", NeedsRestart: true},
 			{Key: "refresh_every", Value: d.RefreshEvery, CLI: "--baseline-refresh-interval", NeedsRestart: true},
-			{Key: "lock_mode", Value: d.LockMode, CLI: "BINTRAIL_CONSOLE_BASELINE_LOCK_MODE", NeedsRestart: true},
+			{Key: "lock_mode", Value: d.LockMode, Err: lockModeRowErr(d.LockModeErr), CLI: "BINTRAIL_CONSOLE_BASELINE_LOCK_MODE", NeedsRestart: true},
 			{Key: "trigger", On: on(d.TriggerOn), CLI: "BINTRAIL_CONSOLE_BASELINE_TRIGGER", NeedsRestart: true},
 			{Key: "staging_dir", Value: d.StagingDir, CLI: "BINTRAIL_CONSOLE_BASELINE_STAGING", NeedsRestart: true},
 			{Key: "verify_interval", Value: d.VerifyInterval, CLI: "--verify-interval", NeedsRestart: true},
@@ -133,6 +161,11 @@ func (s *Server) backupSettingsServerDTO(e ServerEntry) backupSettingsServerDTO 
 	if e.BackupSchedule != nil {
 		dto.ScheduleEvery = e.BackupSchedule.Every
 		dto.ScheduleAt = e.BackupSchedule.At
+		// The RAW entry, matching what the loop checks (backup_schedule.go
+		// reads e.BaselineDir/e.BaselineS3, never the resolved fallback).
+		if err := CheckBackupSchedule(e, *e.BackupSchedule, s.scheduleGates()); err != nil {
+			dto.ScheduleRefusal = RefusalReason(err)
+		}
 	}
 	return dto
 }

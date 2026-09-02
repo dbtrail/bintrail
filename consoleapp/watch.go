@@ -1466,6 +1466,14 @@ func upConsoleOpts() consoleOpts {
 // (baselineConfigured in internal/console/server.go, which owns dir-over-s3
 // precedence) reduces to baseline presence. Extracted for testability (dbName
 // extraction + DSN validation).
+// errString renders a possibly-nil error for a wire field.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Config, error) {
 	cfg, err := mysql.ParseDSN(indexDSN)
 	if err != nil {
@@ -1514,6 +1522,7 @@ func upConsoleConfig(db *sql.DB, indexDSN string, opts consoleOpts) (console.Con
 			BaselineRetain: upConsoleBaselineRetain,
 			RefreshEvery:   upBaselineRefreshEvery,
 			LockMode:       string(upConsoleBaselineLockMode),
+			LockModeErr:    errString(upConsoleBaselineLockModeErr),
 			TriggerOn:      upConsoleBaselineTrigger,
 			StagingDir:     upBaselineStageDir,
 			VerifyInterval: upVerifyInterval,

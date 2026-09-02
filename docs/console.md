@@ -210,9 +210,11 @@ and searching events:
    downloadable; its status names the previous build's directory until that
    removal succeeds. The This daemon page shows what is staged while it
    exists, previous builds that could not be removed included.
-8. **Settings** (under `watch` only) — **Backups & snapshots** (every
-   parameter that shapes a backup or a snapshot, with its provenance — see
-   [The Backups & snapshots settings page](#the-backups--snapshots-settings-page)),
+8. **Settings** — **Backups & snapshots** (every parameter that shapes a
+   backup or a snapshot, with its provenance — see
+   [The Backups & snapshots settings page](#the-backups--snapshots-settings-page);
+   on `serve` only the editable per-server half renders, since this page is
+   the one editor of a server's backup location), and under `watch` only:
    **Retention** (rotation policy and
    per-source S3 archiving), **This daemon** (AWS credential signals, staged
    downloads and a usage-telemetry opt-out — see
@@ -535,7 +537,13 @@ location at all.
   server edit form for this page (the form still round-trips them, so an
   unrelated edit cannot wipe them). A server whose scheduled backups can only
   run as full reads (an S3 prefix and no local folder — folding writes files)
-  says so on its row.
+  says so on its row, and a stored schedule that cannot run at all (say, its
+  backup location was cleared after the schedule was saved) shows the refusal
+  instead of the promise.
+
+The per-server half is the whole page on the standalone `serve` console: the
+daemon cards describe loops only `watch` runs, but the backup location is
+registry state, and this page is its only editor.
 
 ### The Retention and This daemon pages
 

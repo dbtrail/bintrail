@@ -130,6 +130,59 @@ func TestBackupSettings_daemonRowsCarryTheirNames(t *testing.T) {
 	}
 }
 
+// TestBackupSettings_scheduleRefusalReachesTheWire: a stored schedule that
+// cannot run on this process must say so on the row (the schedule reads the
+// RAW entry, so this page's own PUT can strand one). The refusal semantics
+// live in CheckBackupSchedule's own tests; this pins the wiring — with a
+// schedule the field carries the reason, without one it stays empty.
+func TestBackupSettings_scheduleRefusalReachesTheWire(t *testing.T) {
+	srv := newBackupSettingsServer(t, BackupSettingsDefaults{}, "", "")
+	sched, err := srv.cm.reg.Add(ServerEntry{Name: "sch", DSN: "u:p@tcp(h:3306)/idx",
+		SourceDSN: "u:p@tcp(s:3306)/", BackupSchedule: &BackupSchedule{Every: "1d"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := srv.cm.reg.Add(ServerEntry{Name: "plain", DSN: "u:p@tcp(h:3306)/idx2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dto := backupSettingsGet(t, srv)
+	byID := map[string]backupSettingsServerDTO{}
+	for _, s := range dto.Servers {
+		byID[s.ID] = s
+	}
+	if got := byID[sched.ID]; got.ScheduleRefusal == "" {
+		t.Error("a schedule this process cannot run carries no refusal; the row promises runs that will not happen")
+	}
+	if got := byID[plain.ID]; got.ScheduleRefusal != "" {
+		t.Errorf("a server with no schedule carries a refusal %q; the field must mean the schedule, not the server", got.ScheduleRefusal)
+	}
+}
+
+// TestBackupSettings_lockModeRejectionOutranksTheFallback: when the env value
+// was rejected, the row must carry the rejection and its consequence, not
+// just the fallback default the page would otherwise present as chosen.
+func TestBackupSettings_lockModeRejectionOutranksTheFallback(t *testing.T) {
+	srv := newBackupSettingsServer(t, BackupSettingsDefaults{
+		LockMode: "ftwrl", LockModeErr: `BINTRAIL_CONSOLE_BASELINE_LOCK_MODE: unknown lock mode "nope"`,
+	}, "", "")
+	dto := backupSettingsGet(t, srv)
+	for _, r := range dto.Daemon {
+		if r.Key != "lock_mode" {
+			if r.Err != "" {
+				t.Errorf("row %s carries an err %q; only the rejected row may", r.Key, r.Err)
+			}
+			continue
+		}
+		if !strings.Contains(r.Err, `unknown lock mode "nope"`) {
+			t.Errorf("lock_mode row err = %q; the rejection never reached the page", r.Err)
+		}
+		if !strings.Contains(r.Err, "dumps are refused") {
+			t.Errorf("lock_mode row err = %q; it does not state the consequence", r.Err)
+		}
+	}
+}
+
 // TestBackupSettings_updatePatchesOnlyTheBackupFields is the PUT's contract:
 // pointer semantics, and everything else on the entry survives untouched —
 // unlike PUT /api/servers/{id}, which replaces the entry whole.

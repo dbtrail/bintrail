@@ -902,7 +902,11 @@ function navigate(route, params, push = true) {
   // Protect shares that gate: both routes read watch-daemon state (the
   // snapshot listing and the verification runner). Same treatment, so a
   // bookmark to either lands on Overview rather than an empty page.
-  if ((route === "baselines" || route === "verification" || route === "backup-settings") && !capsCache.monitor) route = "overview";
+  if ((route === "baselines" || route === "verification") && !capsCache.monitor) route = "overview";
+  // backup-settings stays reachable without monitor: the per-server backup
+  // location is registry state serve edits too, and this page is its only
+  // editor since the server form's fields became passthroughs (#1582). The
+  // daemon cards inside it are gated instead.
   // The SQL page was removed (#1549). A stale route string handed to
   // navigate() lands where the DuckDB schema card actually is (#1581):
   // Backups when that page exists, Connect on the serve-only fallback — a
@@ -4205,13 +4209,14 @@ async function saveBackupRefresh(body) {
 // per-server values edit in place.
 
 async function renderBackupSettings() {
-  if (!capsCache.monitor) { history.replaceState({}, "", "/overview"); renderRoute(); return; }
   const gen = serverGen, vgen = viewGen;
   viewLoading();
   const asErr = (err) => ({ error: (err && err.message) || String(err) });
+  // The refresh card describes the watch daemon's loop; on serve there is no
+  // loop, no card, and nothing to fetch.
   const [settings, refresh] = await Promise.all([
     api("/api/backup-settings").catch(asErr),
-    api("/api/baseline-refresh").catch(asErr),
+    capsCache.monitor ? api("/api/baseline-refresh").catch(asErr) : Promise.resolve(null),
   ]);
   if (gen !== serverGen || vgen !== viewGen) return;
   try {
@@ -4227,13 +4232,19 @@ function buildBackupSettings(settings, refresh) {
     "Every setting that shapes a backup or a snapshot, and where each value comes from.")));
   const broken = settings && settings.error;
   if (broken) v.append(el("div", { class: "error-box", text: "Could not load settings: " + settings.error }));
-  const cards = el("div", { class: "cards" });
-  // The carry-forward card moved here from the Backups page: it is a setting,
-  // and this page is where settings live; the Backups page keeps the work
-  // (schedules, runs, downloads) beside the data it reports on.
-  cards.append(backupRefreshCard(refresh));
-  if (!broken) cards.append(backupDaemonCard(settings.daemon || []));
-  v.append(cards);
+  // The daemon-side cards are monitor-gated, not the page: serve runs no
+  // refresh loop and its daemon rows would render as an unconfigured
+  // install. The per-server panel below is the page's serve-reachable half —
+  // the only editor of the registry's backup fields.
+  if (capsCache.monitor) {
+    const cards = el("div", { class: "cards" });
+    // The carry-forward card moved here from the Backups page: it is a setting,
+    // and this page is where settings live; the Backups page keeps the work
+    // (schedules, runs, downloads) beside the data it reports on.
+    cards.append(backupRefreshCard(refresh));
+    if (!broken) cards.append(backupDaemonCard(settings.daemon || []));
+    v.append(cards);
+  }
   if (!broken) v.append(backupServersPanel(settings));
   viewEnter();
 }
@@ -4271,6 +4282,14 @@ function backupDaemonCard(rows) {
     if (row.needs_restart) r.append(el("span", { class: "tag-pill bks-restart", text: "restart to change" }));
     r.append(el("span", { class: "bks-cli", text: "(CLI: " + row.cli + ")" }));
     card.append(r);
+    // A rejected value outranks the fallback the row shows: rendering only
+    // the default on the one row whose real state is "your value was
+    // refused" is the opposite of provenance. The consequence rides in the
+    // server's err string, so this stays honest for any row that gains one.
+    if (row.err) {
+      card.append(el("p", { class: "form-msg err", text:
+        "The configured value was rejected and is not in force: " + row.err }));
+    }
   }
   return card;
 }
@@ -4335,12 +4354,19 @@ function backupServerRow(srv, readOnly) {
     box.append(el("p", { class: "form-hint", text:
       "Scheduled backups: every " + srv.schedule_every + (srv.schedule_at ? " at " + srv.schedule_at : "") +
       ". The schedule is managed on the Backups page." }));
-    // The motivating case, said where the setting lives: with no local
-    // folder the scheduled run cannot update from the recorded changes, so
-    // every run reads the database in full. Derived from the same shape the
-    // Backups page's next-run line reports; config-only here, because a
-    // settings listing must not dial every server to predict a run.
-    if (!srv.resolved_dir && srv.resolved_s3) {
+    if (srv.schedule_refusal) {
+      // The refusal beats the prediction: the schedule reads the RAW entry,
+      // so clearing the dir on this very page leaves a stored schedule that
+      // will refuse every slot — saying "every 6h" alone promises runs that
+      // will not happen.
+      box.append(el("p", { class: "form-msg err", text:
+        "The schedule cannot run as things stand: " + srv.schedule_refusal }));
+    } else if (!srv.resolved_dir && srv.resolved_s3) {
+      // The motivating case, said where the setting lives: with no local
+      // folder the scheduled run cannot update from the recorded changes, so
+      // every run reads the database in full. Derived from the same shape the
+      // Backups page's next-run line reports; config-only here, because a
+      // settings listing must not dial every server to predict a run.
       box.append(el("p", { class: "form-hint", text:
         "As set up, each scheduled run takes a full backup from your database: updating from the recorded changes writes files, which needs a Backup dir." }));
     }
@@ -8681,7 +8707,7 @@ function cmdkCommands() {
   if (capsCache.reconstruct) cmds.push({ group: "Navigate", label: "Time-travel", run: () => navigate("timetravel") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Backups", run: () => navigate("baselines") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Verification", run: () => navigate("verification") });
-  if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Backups & snapshots settings", run: () => navigate("backup-settings") });
+  cmds.push({ group: "Navigate", label: "Backups & snapshots settings", run: () => navigate("backup-settings") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "Retention", run: () => navigate("retention") });
   if (capsCache.monitor) cmds.push({ group: "Navigate", label: "This daemon", run: () => navigate("daemon") });
   cmds.push({ group: "Navigate", label: "Access profiles", run: () => navigate("access-profiles") });
