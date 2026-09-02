@@ -1314,10 +1314,20 @@ func QueryResultNotice(ceilingApplied bool, requestedLimit, ceiling, n, limit, l
 		return fmt.Sprintf("\nWarning: requested limit %d exceeds the MCP query ceiling of %d rows; capped to %d. "+
 			"Narrow your filters/time range, or run the `bintrail query` CLI for an unbounded export.\n", requestedLimit, ceiling, ceiling)
 	case n >= limit && limitPerPK > 0:
-		// Under a per-PK cap the "kept end" claim is false in BOTH
-		// directions: the cap's inner ordering is pinned DESC (latest N per
-		// pk_values, whatever the final direction), so the returned rows are
-		// a slice of a per-PK-newest subset and events fell off both ends.
+		// The per-PK cap's inner ordering is pinned DESC (latest N per
+		// pk_values, whatever the final direction), so what the cap can drop
+		// depends on the outer direction. Under DESC the globally newest
+		// event is always bt_rn=1 in its own partition and row 0 of the
+		// page — the newest end is provably intact, and claiming it was
+		// dropped is the same defect class this notice exists to remove.
+		// Under ASC (or empty) the outer limit cuts the newest end while the
+		// cap cuts old events per row: both ends.
+		if query.OrderDirection(order) == "DESC" {
+			return fmt.Sprintf("\nWarning: results truncated at %d rows, keeping the NEWEST matching events, "+
+				"and limit_per_pk kept only the latest %d events per row, so older events were dropped from "+
+				"inside the window as well. Use a narrower since/until range or increase the limit to see more.\n",
+				limit, limitPerPK)
+		}
 		return fmt.Sprintf("\nWarning: results truncated at %d rows, and limit_per_pk kept only the latest %d "+
 			"events per row, so events were dropped at both ends of the window. "+
 			"Use a narrower since/until range or increase the limit to see more.\n", limit, limitPerPK)

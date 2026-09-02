@@ -248,7 +248,11 @@ both accept:
   keep: pair it with `since`/`until`. See
   [Primary key ranges](query-and-recovery.md#primary-key-ranges---pk-min----pk-max)
 - `limit_per_pk` — cap events per `pk_values` to the latest N (0 = unlimited);
-  requires `pk` or `pks`
+  requires `pk` or `pks`. The cap always keeps each row's *latest* N whatever
+  `order` says, so with it active a truncated `ASC` answer loses events at
+  both ends of the window (the warning says so instead of naming a kept end);
+  under `DESC` the newest events are still intact and older ones drop from
+  inside the window
 - `column_eq` — repeatable `column=value` equality filters
 - `flag` — table/column flag filter
 - `profile` — RBAC table-deny + column-redaction

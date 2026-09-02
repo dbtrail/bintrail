@@ -545,6 +545,15 @@ func runQuery(cmd *cobra.Command, args []string) error {
 // off both ends), so that shape says so instead.
 func truncationWarn(limit, limitPerPK int, order string) {
 	if limitPerPK > 0 {
+		// Same direction split as the MCP notice: under DESC the newest end
+		// is provably intact (the cap's inner ordering is itself DESC), so
+		// "both ends" would be false there.
+		if query.OrderDirection(order) == "DESC" {
+			fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, keeping the NEWEST matching events, "+
+				"and --limit-per-pk kept only the latest %d events per row, so older events were dropped from "+
+				"inside the window as well. Use a narrower time range or --limit to adjust.\n", limit, limitPerPK)
+			return
+		}
 		fmt.Fprintf(os.Stderr, "Warning: results truncated at %d rows, and --limit-per-pk kept only the latest %d "+
 			"events per row, so events were dropped at both ends of the window. Use a narrower time range or --limit to adjust.\n",
 			limit, limitPerPK)

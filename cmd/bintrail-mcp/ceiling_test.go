@@ -50,18 +50,33 @@ func TestQueryResultNotice(t *testing.T) {
 		}
 	})
 
-	// Under limit_per_pk the kept-end claim is false in BOTH directions (the
-	// per-PK cap's inner ordering is pinned DESC, so events fell off both
-	// ends); the notice must say that instead of naming an end.
-	t.Run("limit_per_pk suppresses the kept-end claim", func(t *testing.T) {
-		for _, order := range []string{"", "ASC", "DESC"} {
+	// Under limit_per_pk the cut depends on the direction. ASC (or empty):
+	// the outer limit cuts the newest end while the per-PK cap cuts old
+	// events per row, so both ends — naming a kept end would lie. DESC: the
+	// globally newest event is always bt_rn=1 in its own partition and row 0
+	// of the page, so the newest end is provably INTACT and the notice must
+	// keep saying so (claiming it was dropped is the same defect class).
+	t.Run("limit_per_pk states the double cut under ASC", func(t *testing.T) {
+		for _, order := range []string{"", "ASC"} {
 			got := queryResultNotice(false, 100, 1_000_000, 100, 100, 5, order)
 			if strings.Contains(got, "OLDEST") || strings.Contains(got, "NEWEST") {
-				t.Errorf("order=%q: a per-PK-capped truncation named a kept end: %q", order, got)
+				t.Errorf("order=%q: a per-PK-capped ASC truncation named a kept end: %q", order, got)
 			}
 			if !strings.Contains(got, "both ends") || !strings.Contains(got, "latest 5 events per row") {
 				t.Errorf("order=%q: the per-PK arm does not state the double cut: %q", order, got)
 			}
+		}
+	})
+	t.Run("limit_per_pk under DESC keeps the NEWEST claim and names the interior drop", func(t *testing.T) {
+		got := queryResultNotice(false, 100, 1_000_000, 100, 100, 5, "DESC")
+		if !strings.Contains(got, "NEWEST") {
+			t.Errorf("DESC + per-PK cap must still claim the newest end (it is provably intact): %q", got)
+		}
+		if strings.Contains(got, "both ends") {
+			t.Errorf("DESC + per-PK cap claimed a cut at the newest end that never happens: %q", got)
+		}
+		if !strings.Contains(got, "latest 5 events per row") || !strings.Contains(got, "inside the window") {
+			t.Errorf("DESC + per-PK cap does not name the interior drop: %q", got)
 		}
 	})
 
